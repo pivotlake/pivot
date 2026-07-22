@@ -6,6 +6,7 @@ use super::{
     RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet, VariantToJson,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
+use crate::expression::Expression;
 use crate::types::Type;
 use arrow_array::{Int64Array, RecordBatch, TimestampSecondArray};
 use std::fmt::{self, Display};
@@ -97,6 +98,42 @@ pub enum Function {
     /// A variant value rendered as JSON text, wrapped around variant-typed
     /// output columns by plan build.
     VariantToJson(VariantToJson),
+}
+
+impl Function {
+    /// Visit every child expression of this function, in argument order. An
+    /// exhaustive match with no wildcard, so adding a variant forces the
+    /// author to declare its children here.
+    pub fn for_each_argument(&self, visit: &mut impl FnMut(&Expression)) {
+        match self {
+            Function::Contains(c) => {
+                visit(&c.needle);
+                visit(&c.haystack);
+            }
+            Function::Prefix(p) => {
+                visit(&p.haystack);
+                visit(&p.prefix);
+            }
+            Function::Arithmetic(a) => {
+                visit(&a.left);
+                visit(&a.right);
+            }
+            Function::Length(l) => visit(&l.input),
+            Function::RegexpReplace(r) => visit(&r.input),
+            Function::RegexpJitReplace(r) => visit(&r.input),
+            Function::Divide(d) => {
+                visit(&d.left);
+                visit(&d.right);
+            }
+            Function::DateTrunc(d) => visit(&d.source),
+            Function::DatePart(d) => visit(&d.source),
+            Function::IntervalArithmetic(i) => visit(&i.operand),
+            Function::TemporalConvert(t) => visit(&t.source),
+            Function::DropCache | Function::Now => {}
+            Function::VariantGet(v) => visit(&v.input),
+            Function::VariantToJson(v) => visit(&v.input),
+        }
+    }
 }
 
 impl Display for Function {

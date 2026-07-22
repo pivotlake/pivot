@@ -143,6 +143,53 @@ impl Expression {
         }
     }
 
+    /// Collect the column indices this expression reads into `out`. Exact
+    /// for every expression shape: columns are only ever read through `Ref`
+    /// leaves, so visiting all children covers everything.
+    pub fn collect_column_refs(&self, out: &mut Vec<usize>) {
+        match self {
+            Expression::Ref(r) => out.push(r.column_idx),
+            Expression::Constant(_) => {}
+            Expression::Compare(c) => {
+                c.left.collect_column_refs(out);
+                c.right.collect_column_refs(out);
+            }
+            Expression::Between(b) => {
+                b.input.collect_column_refs(out);
+                b.lower.collect_column_refs(out);
+                b.upper.collect_column_refs(out);
+            }
+            Expression::AggregateFunc(a) => {
+                for argument in a.arguments() {
+                    argument.collect_column_refs(out);
+                }
+            }
+            Expression::Function(f) => {
+                f.for_each_argument(&mut |argument| argument.collect_column_refs(out));
+            }
+            Expression::InList(l) => {
+                l.input.collect_column_refs(out);
+                for value in &l.values {
+                    value.collect_column_refs(out);
+                }
+            }
+            Expression::Conjunction(c) => {
+                for child in &c.children {
+                    child.collect_column_refs(out);
+                }
+            }
+            Expression::Case(c) => {
+                for check in &c.checks {
+                    check.when.collect_column_refs(out);
+                    check.then.collect_column_refs(out);
+                }
+                c.else_expr.collect_column_refs(out);
+            }
+            Expression::Not(n) => n.input.collect_column_refs(out),
+            Expression::Cast(c) => c.source.collect_column_refs(out),
+        }
+    }
+
     /// Static result type of a computed expression. Used to pick a group-key
     /// extractor when grouping on it (e.g. `GROUP BY CASE …`) and to derive
     /// each operator's output types (see `PlanNode::output_types`).

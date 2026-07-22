@@ -420,9 +420,10 @@ impl RecordBatchOperatorSpec {
     ///
     /// Takes an **outer builder closure** (`FB`) that is called once per worker thread
     /// during setup. The builder returns an **inner closure** (`F`) that is called once
-    /// per `RecordBatch` during execution, returning the batch with only the rows to
-    /// keep. Evaluating the condition and applying it is left to the closure, so it can
-    /// narrow the batch progressively instead of always materializing a full mask.
+    /// per `RecordBatch` during execution, returning the batch of surviving rows. The
+    /// inner closure also receives the operator'"'"'s [`SlabAllocator`](crate::memory::SlabAllocator)
+    /// so survivors can be compacted into slab-backed buffers via
+    /// [`take`](crate::arrays::take::take).
     ///
     /// This two-level pattern lets each worker own private mutable state (allocated in
     /// the builder):
@@ -452,7 +453,13 @@ impl RecordBatchOperatorSpec {
     /// ```
     pub fn filter<F, FB>(self, builder: FB) -> Self
     where
-        F: FnMut(RecordBatch) -> RecordBatch + Send + 'static,
+        F: FnMut(
+                &RecordBatch,
+                &mut crate::memory::SlabAllocator,
+                &mut Vec<u32>,
+            ) -> crate::RowSelection
+            + Send
+            + 'static,
         FB: Fn() -> F,
     {
         let worker_count = self.worker_count();
