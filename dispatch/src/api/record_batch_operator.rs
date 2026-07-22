@@ -47,21 +47,22 @@ use std::any::Any;
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 use arrow_array::RecordBatch;
 use crossbeam_deque::Worker;
 
-use crate::api::Chain;
+use crate::api::OperatorGraphBuilder;
 use crate::api::operator_spec::{OperatorFactory, OperatorSpec};
 use crate::operations::channels::{
     ChannelFactory, MpscSender, Sender, StealableChannelFactory, stealable,
 };
 use crate::operations::{
     AggregateFactory, AggregationSlot, AggregationValue, CopyOutFactory, Distinct,
-    DynamicFilterSlot, F64Cell, FilterFactory, GroupFactory, GroupLimit, IntCell, KeyExtractor,
-    LimitFactory, MapFactory, NoOpNullaryFactory, NullaryFactory, NullaryOperatorFactory, OrderBy,
-    OrderByLimitFactory, UnaryFactory, UnaryOperator, UnaryOperatorFactory, WideCell,
+    DynamicFilterSlot, F64Cell, FilterFactory, GroupFactory, GroupLimit, IntCell,
+    JoinOutputColumns, KeyExtractor, LimitFactory, MapFactory, NoOpNullaryFactory, NullaryFactory,
+    NullaryOperatorFactory, OrderBy, OrderByLimitFactory, UnaryFactory, UnaryOperator,
+    UnaryOperatorFactory, WideCell, create_join_factories,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle, DataFlowStats};
 pub const RECORD_BATCH_SIZE: usize = 8192;
@@ -83,18 +84,18 @@ pub const RECORD_BATCH_SIZE: usize = 8192;
 pub trait RecordBatchOperatorFactory: Send {
     /// Build the operator chain, outputting to a work-stealing channel.
     /// Called when this factory is an intermediate stage (the head of another operator).
-    fn build_stealable(self: Box<Self>, sender: Rc<Worker<RecordBatch>>) -> Chain;
+    fn build_stealable(self: Box<Self>, sender: Rc<Worker<RecordBatch>>) -> OperatorGraphBuilder;
 
     /// Build the operator chain, outputting to an mpsc channel.
     /// Called for the final stage by [`DataFlowBuilder::build`](crate::api::DataFlowBuilder::build).
-    fn build_collect(self: Box<Self>, sender: MpscSender<RecordBatch>) -> Chain;
+    fn build_collect(self: Box<Self>, sender: MpscSender<RecordBatch>) -> OperatorGraphBuilder;
 }
 
 impl<T: OperatorFactory<RecordBatch>> RecordBatchOperatorFactory for T {
-    fn build_stealable(self: Box<Self>, sender: Rc<Worker<RecordBatch>>) -> Chain {
+    fn build_stealable(self: Box<Self>, sender: Rc<Worker<RecordBatch>>) -> OperatorGraphBuilder {
         self.build(sender)
     }
-    fn build_collect(self: Box<Self>, sender: MpscSender<RecordBatch>) -> Chain {
+    fn build_collect(self: Box<Self>, sender: MpscSender<RecordBatch>) -> OperatorGraphBuilder {
         self.build(sender)
     }
 }
@@ -117,7 +118,7 @@ pub struct RecordBatchUnaryOperatorFactory<UF: UnaryFactory<RecordBatch, RecordB
 impl<UF: UnaryFactory<RecordBatch, RecordBatch>> RecordBatchOperatorFactory
     for RecordBatchUnaryOperatorFactory<UF>
 {
-    fn build_stealable(self: Box<Self>, sender: Rc<Worker<RecordBatch>>) -> Chain {
+    fn build_stealable(self: Box<Self>, sender: Rc<Worker<RecordBatch>>) -> OperatorGraphBuilder {
         let (tx, rx) = self.channel_factory.build();
         let chain = self.head.build_stealable(tx);
         chain.with(Box::new(UnaryOperator::new(
@@ -128,7 +129,7 @@ impl<UF: UnaryFactory<RecordBatch, RecordBatch>> RecordBatchOperatorFactory
         )))
     }
 
-    fn build_collect(self: Box<Self>, sender: MpscSender<RecordBatch>) -> Chain {
+    fn build_collect(self: Box<Self>, sender: MpscSender<RecordBatch>) -> OperatorGraphBuilder {
         let (tx, rx) = self.channel_factory.build();
         let chain = self.head.build_stealable(tx);
         chain.with(Box::new(UnaryOperator::new(
@@ -137,6 +138,75 @@ impl<UF: UnaryFactory<RecordBatch, RecordBatch>> RecordBatchOperatorFactory
             sender,
             self.siblings_left,
         )))
+    }
+}
+
+struct DiscardSender;
+
+impl Sender<()> for DiscardSender {
+    fn send(&mut self, _item: ()) -> crate::operations::channels::Result<()> {
+        Ok(())
+    }
+}
+
+/// Builds the probe result path and the disconnected build path into one
+/// per-worker operator graph.
+struct JoinRecordBatchOperatorFactory<BF, PF> {
+    probe_head: Box<dyn RecordBatchOperatorFactory>,
+    build_head: Box<dyn RecordBatchOperatorFactory>,
+    build_factory: BF,
+    probe_factory: PF,
+    build_channel_factory: StealableChannelFactory<RecordBatch>,
+    probe_channel_factory: StealableChannelFactory<RecordBatch>,
+    build_siblings_left: Arc<AtomicUsize>,
+    probe_siblings_left: Arc<AtomicUsize>,
+    build_ready: Arc<AtomicBool>,
+}
+
+impl<BF, PF> JoinRecordBatchOperatorFactory<BF, PF>
+where
+    BF: UnaryFactory<RecordBatch, ()>,
+    PF: UnaryFactory<RecordBatch, RecordBatch>,
+{
+    fn build_graph<S: Sender<RecordBatch> + 'static>(self, sender: S) -> OperatorGraphBuilder {
+        let (probe_tx, probe_rx) = self.probe_channel_factory.build();
+        let probe_graph = self
+            .probe_head
+            .build_stealable(probe_tx)
+            .gated_by(self.build_ready)
+            .with(Box::new(UnaryOperator::new(
+                self.probe_factory.build_unary(),
+                probe_rx,
+                sender,
+                self.probe_siblings_left,
+            )));
+
+        let (build_tx, build_rx) = self.build_channel_factory.build();
+        let build_graph =
+            self.build_head
+                .build_stealable(build_tx)
+                .with(Box::new(UnaryOperator::new(
+                    self.build_factory.build_unary(),
+                    build_rx,
+                    DiscardSender,
+                    self.build_siblings_left,
+                )));
+
+        probe_graph.with_side_graph(build_graph)
+    }
+}
+
+impl<BF, PF> RecordBatchOperatorFactory for JoinRecordBatchOperatorFactory<BF, PF>
+where
+    BF: UnaryFactory<RecordBatch, ()>,
+    PF: UnaryFactory<RecordBatch, RecordBatch>,
+{
+    fn build_stealable(self: Box<Self>, sender: Rc<Worker<RecordBatch>>) -> OperatorGraphBuilder {
+        self.build_graph(sender)
+    }
+
+    fn build_collect(self: Box<Self>, sender: MpscSender<RecordBatch>) -> OperatorGraphBuilder {
+        self.build_graph(sender)
     }
 }
 
@@ -158,7 +228,7 @@ impl RecordBatchFactoryBridge {
 }
 
 impl OperatorFactory<RecordBatch> for RecordBatchFactoryBridge {
-    fn build<S: Sender<RecordBatch> + 'static>(self: Box<Self>, sender: S) -> Chain {
+    fn build<S: Sender<RecordBatch> + 'static>(self: Box<Self>, sender: S) -> OperatorGraphBuilder {
         let sender_any: Box<dyn Any> = Box::new(sender);
         match sender_any.downcast::<Rc<Worker<RecordBatch>>>() {
             Ok(s) => self.0.build_stealable(*s),
@@ -578,6 +648,85 @@ impl RecordBatchOperatorSpec {
             topology,
             buffers,
         ))
+    }
+
+    /// Inner hash equi-join: build a hash table from `build`'s rows keyed on
+    /// `build_key_column` (`Int64`), then probe it with `self`'s rows keyed on
+    /// `probe_key_column`, emitting one output row per matching pair. Each
+    /// output row is the probe columns listed in `output_columns` (in list
+    /// order) followed by the listed build columns. Rows with a null key on
+    /// either side never match.
+    ///
+    /// Both sides are roots in one dataflow. Probe input may be produced while
+    /// the build runs, but the probe operator does not consume it until the
+    /// completed build table is published.
+    pub fn join(
+        self,
+        build: RecordBatchOperatorSpec,
+        build_key_column: usize,
+        probe_key_column: usize,
+        output_columns: JoinOutputColumns,
+    ) -> Self {
+        let worker_count = self.worker_count();
+        assert_eq!(
+            worker_count,
+            build.worker_count(),
+            "join inputs must use the same worker count"
+        );
+        assert!(
+            self.dispatcher
+                .waker_set
+                .wakes_same_pool(&build.dispatcher.waker_set),
+            "join inputs must use the same worker pool"
+        );
+
+        let (build_factories, probe_factories, build_ready) = create_join_factories(
+            build_key_column,
+            probe_key_column,
+            output_columns,
+            worker_count,
+        );
+
+        let (_, build_heads) = build.into_parts();
+        let build_siblings_left = Arc::new(AtomicUsize::new(worker_count));
+        let probe_siblings_left = Arc::new(AtomicUsize::new(worker_count));
+        let build_channels = stealable::<RecordBatch>(self.dispatcher.topology());
+        let probe_channels = stealable::<RecordBatch>(self.dispatcher.topology());
+        let factories = self
+            .factories
+            .into_iter()
+            .zip(build_heads)
+            .zip(build_factories)
+            .zip(probe_factories)
+            .zip(build_channels)
+            .zip(probe_channels)
+            .map(
+                |(
+                    (
+                        (((probe_head, build_head), build_factory), probe_factory),
+                        build_channel_factory,
+                    ),
+                    probe_channel_factory,
+                )| {
+                    Box::new(JoinRecordBatchOperatorFactory {
+                        probe_head,
+                        build_head,
+                        build_factory,
+                        probe_factory,
+                        build_channel_factory,
+                        probe_channel_factory,
+                        build_siblings_left: build_siblings_left.clone(),
+                        probe_siblings_left: probe_siblings_left.clone(),
+                        build_ready: build_ready.clone(),
+                    }) as Box<dyn RecordBatchOperatorFactory>
+                },
+            )
+            .collect();
+
+        Self {
+            dispatcher: self.dispatcher,
+            factories,
+        }
     }
 
     /// Execute the dataflow and collect all output batches.

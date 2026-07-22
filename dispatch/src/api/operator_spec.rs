@@ -5,7 +5,7 @@ use crate::operations::{
     DefaultUnaryFactory, Forward, InjectorSourceFactory, MapFactory, RootUnaryOperatorFactory,
     UnaryFactory, UnaryOperatorFactory,
 };
-use crate::{Chain, DataFlowBuilder, DataFlowDispatcher, DataFlowHandle};
+use crate::{DataFlowBuilder, DataFlowDispatcher, DataFlowHandle, OperatorGraphBuilder};
 use arrow_array::RecordBatch;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -215,7 +215,7 @@ impl<OF: OperatorFactory<RecordBatch> + 'static> OperatorSpec<RecordBatch, OF> {
 ///
 /// Called on the worker thread during [`DataFlowBuilder::build`](crate::api::DataFlowBuilder::build).
 /// The `build` method consumes the factory, creates channels between stages, and returns
-/// a [`Chain`] of operators ready to execute.
+/// an [`OperatorGraphBuilder`] ready to finalize and execute.
 ///
 /// `build` is generic over `S: Sender<O>` because different stages connect via different
 /// sender types (work-stealing, mpsc, worker-aware). This makes the trait **not object-safe**
@@ -223,5 +223,5 @@ impl<OF: OperatorFactory<RecordBatch> + 'static> OperatorSpec<RecordBatch, OF> {
 /// for the object-safe equivalent at the `RecordBatch` boundary.
 pub trait OperatorFactory<O>: Send {
     /// Build the operator chain, outputting to `sender`.
-    fn build<S: Sender<O> + 'static>(self: Box<Self>, sender: S) -> Chain;
+    fn build<S: Sender<O> + 'static>(self: Box<Self>, sender: S) -> OperatorGraphBuilder;
 }

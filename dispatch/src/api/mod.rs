@@ -71,14 +71,14 @@
 //!   pipelines (e.g. `catalog`'s Parquet reader) before erasing into
 //!   `RecordBatchOperatorSpec` via `from_spec`.
 //!
-//! - [`Chain`] — Accumulates `Box<dyn Operator>` during the build step, then converts
-//!   to a `DataFlow`.
+//! - [`OperatorGraphBuilder`] — Accumulates operators and edges during the build step,
+//!   then converts them to a `DataFlow`.
 //!
 //! - [`DataFlowBuilder`] — Pairs a `Box<dyn RecordBatchOperatorFactory>` with the output
 //!   `MpscSender`. Sent to a worker thread, which calls `.build()` to produce a `DataFlow`.
 
 mod builder;
-pub use builder::{Chain, DataFlowBuilder};
+pub use builder::{DataFlowBuilder, OperatorGraphBuilder};
 
 mod operator_spec;
 pub use operator_spec::{OperatorFactory, OperatorSpec};
