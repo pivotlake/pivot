@@ -5,7 +5,6 @@
 
 mod common;
 
-use arrow::compute::filter_record_batch;
 use arrow_array::{BooleanArray, Int64Array, RecordBatch};
 use arrow_buffer::BooleanBuffer;
 use arrow_schema::DataType;
@@ -25,7 +24,10 @@ fn panic_in_filter_returns_error() {
     let result = values_input(&dispatch, vec![batch])
         .record_batches()
         .filter(|| {
-            move |_batch: RecordBatch| -> RecordBatch { panic!("intentional panic in filter") }
+            move |_: &RecordBatch,
+                  _: &mut dispatch::memory::SlabAllocator,
+                  _: &mut Vec<u32>|
+                  -> dispatch::RowSelection { panic!("intentional panic in filter") }
         })
         .aggregate::<i64>(vec![AggregationSlot::new(
             AggregationKind::CountStar,
@@ -68,14 +70,17 @@ fn cancelled_query_returns_without_hanging() {
     let handle = values_input(&dispatch, batches)
         .record_batches()
         .filter(|| {
-            move |batch: RecordBatch| {
+            move |batch: &RecordBatch,
+                  _: &mut dispatch::memory::SlabAllocator,
+                  indices: &mut Vec<u32>| {
                 let col = batch
                     .column(1)
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .unwrap();
                 let mask = BooleanArray::from(BooleanBuffer::collect_bool(col.len(), |_| true));
-                filter_record_batch(&batch, &mask).unwrap()
+                dispatch::collect_selected_indices(&mask, indices);
+                dispatch::RowSelection::Indices
             }
         })
         .execute();

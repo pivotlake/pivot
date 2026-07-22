@@ -4,7 +4,6 @@
 
 mod common;
 
-use arrow::compute::filter_record_batch;
 use arrow_array::{Array, BooleanArray, RecordBatch, StringViewArray};
 use arrow_buffer::BooleanBuffer;
 use arrow_schema::DataType;
@@ -24,7 +23,9 @@ fn filter_then_project() {
         .record_batches()
         .filter(|| {
             let mut c = Contains::new("alice");
-            move |batch: RecordBatch| {
+            move |batch: &RecordBatch,
+                  _: &mut dispatch::memory::SlabAllocator,
+                  indices: &mut Vec<u32>| {
                 let mask = c.run(
                     batch
                         .column(0)
@@ -32,7 +33,8 @@ fn filter_then_project() {
                         .downcast_ref::<StringViewArray>()
                         .unwrap(),
                 );
-                filter_record_batch(&batch, &mask).unwrap()
+                dispatch::collect_selected_indices(&mask, indices);
+                dispatch::RowSelection::Indices
             }
         })
         .project(|| {
@@ -59,7 +61,9 @@ fn filter_then_count() {
         .record_batches()
         .filter(|| {
             let mut c = Contains::new("alice");
-            move |batch: RecordBatch| {
+            move |batch: &RecordBatch,
+                  _: &mut dispatch::memory::SlabAllocator,
+                  indices: &mut Vec<u32>| {
                 let mask = c.run(
                     batch
                         .column(0)
@@ -67,7 +71,8 @@ fn filter_then_count() {
                         .downcast_ref::<StringViewArray>()
                         .unwrap(),
                 );
-                filter_record_batch(&batch, &mask).unwrap()
+                dispatch::collect_selected_indices(&mask, indices);
+                dispatch::RowSelection::Indices
             }
         })
         .aggregate::<i64>(vec![AggregationSlot::new(
@@ -102,7 +107,9 @@ fn filter_then_group_by_then_order_by() {
     let results = values_input(&dispatch, vec![batch])
         .record_batches()
         .filter(|| {
-            move |batch: RecordBatch| {
+            move |batch: &RecordBatch,
+                  _: &mut dispatch::memory::SlabAllocator,
+                  indices: &mut Vec<u32>| {
                 let col = batch
                     .column(0)
                     .as_any()
@@ -111,7 +118,8 @@ fn filter_then_group_by_then_order_by() {
                 let mask = BooleanArray::from(BooleanBuffer::collect_bool(col.len(), |i| {
                     col.value(i) != "other.com"
                 }));
-                filter_record_batch(&batch, &mask).unwrap()
+                dispatch::collect_selected_indices(&mask, indices);
+                dispatch::RowSelection::Indices
             }
         })
         .group_by_aggregate::<StringKeyExtractor, Compiled<(CountSlot,)>>(

@@ -5,7 +5,6 @@
 
 mod common;
 
-use arrow::compute::filter_record_batch;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
@@ -52,7 +51,9 @@ fn filter_string_contains() {
         .record_batches()
         .filter(|| {
             let mut c = Contains::new("alice");
-            move |batch: RecordBatch| {
+            move |batch: &RecordBatch,
+                  _: &mut dispatch::memory::SlabAllocator,
+                  indices: &mut Vec<u32>| {
                 let mask = c.run(
                     batch
                         .column(0)
@@ -60,7 +61,8 @@ fn filter_string_contains() {
                         .downcast_ref::<StringViewArray>()
                         .unwrap(),
                 );
-                filter_record_batch(&batch, &mask).unwrap()
+                dispatch::collect_selected_indices(&mask, indices);
+                dispatch::RowSelection::Indices
             }
         })
         .aggregate::<i64>(vec![AggregationSlot::new(
@@ -83,7 +85,9 @@ fn filter_no_matches_returns_zero() {
         .record_batches()
         .filter(|| {
             let mut c = Contains::new("zzz_no_match");
-            move |batch: RecordBatch| {
+            move |batch: &RecordBatch,
+                  _: &mut dispatch::memory::SlabAllocator,
+                  indices: &mut Vec<u32>| {
                 let mask = c.run(
                     batch
                         .column(0)
@@ -91,7 +95,8 @@ fn filter_no_matches_returns_zero() {
                         .downcast_ref::<StringViewArray>()
                         .unwrap(),
                 );
-                filter_record_batch(&batch, &mask).unwrap()
+                dispatch::collect_selected_indices(&mask, indices);
+                dispatch::RowSelection::Indices
             }
         })
         .aggregate::<i64>(vec![AggregationSlot::new(
@@ -113,7 +118,9 @@ fn filter_integer_column() {
     let results = values_input(&dispatch, vec![batch])
         .record_batches()
         .filter(|| {
-            move |batch: RecordBatch| {
+            move |batch: &RecordBatch,
+                  _: &mut dispatch::memory::SlabAllocator,
+                  indices: &mut Vec<u32>| {
                 let col = batch
                     .column(1)
                     .as_any()
@@ -122,7 +129,8 @@ fn filter_integer_column() {
                 let mask = BooleanArray::from(BooleanBuffer::collect_bool(col.len(), |i| {
                     col.value(i) > 20
                 }));
-                filter_record_batch(&batch, &mask).unwrap()
+                dispatch::collect_selected_indices(&mask, indices);
+                dispatch::RowSelection::Indices
             }
         })
         .aggregate::<i64>(vec![AggregationSlot::new(
@@ -346,9 +354,9 @@ fn limit_abandons_upstream_after_reaching_count() {
         .record_batches()
         .filter(move || {
             let counter = counter.clone();
-            move |batch: RecordBatch| {
+            move |_: &RecordBatch, _: &mut dispatch::memory::SlabAllocator, _: &mut Vec<u32>| {
                 counter.fetch_add(1, Ordering::Relaxed);
-                batch
+                dispatch::RowSelection::All
             }
         })
         .limit(1, 0)

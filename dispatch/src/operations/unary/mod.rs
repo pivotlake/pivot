@@ -75,7 +75,7 @@ pub use pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
 mod aggregate;
 pub use aggregate::AggregateFactory;
 
-mod filter;
+pub mod filter;
 pub use filter::FilterFactory;
 
 mod map;
