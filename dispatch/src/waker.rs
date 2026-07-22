@@ -241,6 +241,12 @@ impl WakerSet {
         self.workers_per_node
     }
 
+    /// Whether `other` wakes the same workers, i.e. both sets came from the
+    /// same worker pool.
+    pub fn wakes_same_pool(&self, other: &WakerSet) -> bool {
+        Arc::ptr_eq(&self.node_wakers, &other.node_wakers)
+    }
+
     /// Wake `worker`, expressed as a global worker index, if it is parked.
     pub fn notify_worker(&self, worker: usize) {
         self.node_wakers[worker / self.workers_per_node]

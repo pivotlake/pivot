@@ -22,30 +22,71 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// A linear sequence of operators built during the factory `build` step on a worker thread.
+/// A build-time operator graph assembled by factories on a worker thread.
 ///
-/// Factories produce a `Chain` by recursively building their head, then appending their own
-/// operator via [`Chain::with`]. Once complete, [`Chain::into_data_flow`] converts it into
-/// a `DataFlow` that the worker can execute.
-pub struct Chain {
+/// `output` identifies the leaf to which ordinary unary stages append. Disconnected
+/// side graphs can be merged without changing that output, allowing one dataflow to
+/// contain multiple roots while preserving the fluent pipeline's primary result path.
+pub struct OperatorGraphBuilder {
     operators: Vec<Box<dyn Operator>>,
+    publisher_to_subscriber: HashMap<Identifier, Identifier>,
+    roots: Vec<Identifier>,
+    gates: HashMap<Identifier, Vec<Arc<AtomicBool>>>,
+    output: Identifier,
 }
 
-impl Chain {
-    /// Start a new chain with a root operator (one that has no upstream head).
+impl OperatorGraphBuilder {
+    /// Start a graph with one root, which is also its designated output.
     pub fn root(operator: Box<dyn Operator>) -> Self {
         Self {
             operators: vec![operator],
+            publisher_to_subscriber: HashMap::default(),
+            roots: vec![0],
+            gates: HashMap::default(),
+            output: 0,
         }
     }
 
-    /// Append an operator to the end of the chain.
+    /// Append an operator to the graph's designated output path.
     pub fn with(mut self, operator: Box<dyn Operator>) -> Self {
+        let next = self.operators.len();
+        self.publisher_to_subscriber.insert(self.output, next);
         self.operators.push(operator);
+        self.output = next;
         self
     }
 
-    /// Convert this chain into an executable `DataFlow`.
+    /// Prevent every current root from running until `gate` is published.
+    ///
+    /// Gates compose: when a graph is used as the input to nested joins, a root
+    /// runs only after all gates attached to it have opened.
+    pub fn gated_by(mut self, gate: Arc<AtomicBool>) -> Self {
+        for &root in &self.roots {
+            self.gates.entry(root).or_default().push(gate.clone());
+        }
+        self
+    }
+
+    /// Merge a disconnected side graph while preserving this graph's output path.
+    pub fn with_side_graph(mut self, mut side: Self) -> Self {
+        let offset = self.operators.len();
+        self.operators.append(&mut side.operators);
+        self.publisher_to_subscriber.extend(
+            side.publisher_to_subscriber
+                .into_iter()
+                .map(|(publisher, subscriber)| (publisher + offset, subscriber + offset)),
+        );
+        self.roots
+            .extend(side.roots.into_iter().map(|root| root + offset));
+        self.gates.extend(
+            side.gates
+                .into_iter()
+                .map(|(root, gates)| (root + offset, gates)),
+        );
+        self
+    }
+
+    /// Convert this build-time graph into an executable `DataFlow`.
     pub fn into_data_flow(
         self,
         cancelled: Arc<AtomicBool>,
@@ -53,14 +94,13 @@ impl Chain {
         stats_tx: mpsc::Sender<DataFlowStats>,
         collect_stats: bool,
     ) -> DataFlow {
-        let map: HashMap<Identifier, Identifier> =
-            (0..self.operators.len() - 1).map(|i| (i, i + 1)).collect();
         DataFlow::new(
             next_dataflow_id(),
             cancelled,
             err_tx,
             self.operators,
-            map,
+            self.publisher_to_subscriber,
+            self.gates,
             stats_tx,
             collect_stats,
         )
@@ -86,13 +126,13 @@ pub struct DataFlowBuilder {
     /// launching dispatcher was marked (see [`with_profiling`](Self::with_profiling)).
     #[cfg(feature = "perf")]
     profiled: bool,
-    /// The last operator in the dataflow
-    build: Box<dyn FnOnce() -> Chain + Send>,
+    /// Builds the per-worker operator graph.
+    build: Box<dyn FnOnce() -> OperatorGraphBuilder + Send>,
 }
 
 impl DataFlowBuilder {
     pub fn new(
-        build: Box<dyn FnOnce() -> Chain + Send>,
+        build: Box<dyn FnOnce() -> OperatorGraphBuilder + Send>,
         cancelled: Arc<AtomicBool>,
         err_tx: mpsc::Sender<crate::data_flow::Error>,
         stats_tx: mpsc::Sender<DataFlowStats>,
@@ -117,10 +157,10 @@ impl DataFlowBuilder {
         self
     }
 
-    /// Build the full operator chain and convert it into an executable `DataFlow`.
+    /// Build the full operator graph and convert it into an executable `DataFlow`.
     /// Called on the worker thread.
     pub fn build(self) -> Result<DataFlow> {
-        let chain = catch_unwind(AssertUnwindSafe(|| (self.build)())).map_err(|e| {
+        let graph = catch_unwind(AssertUnwindSafe(|| (self.build)())).map_err(|e| {
             let msg = e
                 .downcast_ref::<String>()
                 .map(|s| s.as_str())
@@ -129,7 +169,7 @@ impl DataFlowBuilder {
             Error::PanicOnBuild(msg.to_string())
         })?;
 
-        let data_flow = chain.into_data_flow(
+        let data_flow = graph.into_data_flow(
             self.cancelled,
             self.err_tx,
             self.stats_tx,
@@ -138,5 +178,38 @@ impl DataFlowBuilder {
         #[cfg(feature = "perf")]
         let data_flow = data_flow.with_profiling(self.profiled);
         Ok(data_flow)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operations::AbandonedOperator;
+
+    fn root() -> OperatorGraphBuilder {
+        OperatorGraphBuilder::root(Box::new(AbandonedOperator))
+    }
+
+    #[test]
+    fn nested_join_gates_all_probe_roots_but_not_its_build_root() {
+        let inner_gate = Arc::new(AtomicBool::new(false));
+        let outer_gate = Arc::new(AtomicBool::new(false));
+
+        let inner_join = root()
+            .gated_by(inner_gate.clone())
+            .with(Box::new(AbandonedOperator))
+            .with_side_graph(root());
+        let graph = inner_join
+            .gated_by(outer_gate.clone())
+            .with(Box::new(AbandonedOperator))
+            .with_side_graph(root());
+
+        assert_eq!(graph.roots, vec![0, 2, 4]);
+        let probe_gates = &graph.gates[&0];
+        assert_eq!(probe_gates.len(), 2);
+        assert!(Arc::ptr_eq(&probe_gates[0], &inner_gate));
+        assert!(Arc::ptr_eq(&probe_gates[1], &outer_gate));
+        assert!(Arc::ptr_eq(&graph.gates[&2][0], &outer_gate));
+        assert!(!graph.gates.contains_key(&4));
     }
 }

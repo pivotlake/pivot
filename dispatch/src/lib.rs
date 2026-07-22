@@ -92,6 +92,7 @@ pub use memory::BUFFER_SIZE;
 pub use memory::ReadBuffer;
 pub use memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 pub use numa::{Topology, default_worker_count};
+pub use operations::JoinOutputColumns;
 pub use operations::channels::{MpscSender, Sender};
 pub use operations::nullary::Result as NullaryResult;
 #[cfg(feature = "perf")]
