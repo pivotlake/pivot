@@ -85,10 +85,13 @@ mod default_unary_factory;
 pub use default_unary_factory::DefaultUnaryFactory;
 
 mod copy_out;
+mod join;
 mod limit;
 mod order_by_limit;
 
 pub use copy_out::CopyOutFactory;
+pub use join::JoinOutputColumns;
+pub(crate) use join::create_join_factories;
 pub use limit::LimitFactory;
 pub use order_by_limit::{DynamicFilterSlot, OrderBy, OrderByLimitFactory};
 
