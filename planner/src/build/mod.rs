@@ -190,11 +190,11 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         }
     };
 
-    let node = PlanNode {
+    let node = merge_stacked_filters(PlanNode {
         name: op.name(),
         inputs,
         operator,
-    };
+    });
 
     // Reattach the scan's static pushed-down filters as a Filter above it, so the
     // Rust side keeps seeing `Filter -> Input` exactly as with filter_pushdown off.
@@ -225,6 +225,44 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
     }
 
     Ok(node)
+}
+
+/// Merge a Filter whose input is another Filter into one node, the child's
+/// conditions first (they sit closer to the scan, where DuckDB put the
+/// pushed-down, typically most selective predicates). One filter evaluates
+/// its conditions progressively and materializes survivors once, so a stack
+/// of filters would re-materialize at every level — the first level at its
+/// own (much weaker) selectivity.
+fn merge_stacked_filters(node: PlanNode) -> PlanNode {
+    let is_stack = matches!(node.operator, Operator::Filter(_))
+        && node.inputs.len() == 1
+        && matches!(node.inputs[0].operator, Operator::Filter(_));
+    if !is_stack {
+        return node;
+    }
+    let PlanNode {
+        name,
+        mut inputs,
+        operator,
+    } = node;
+    let Operator::Filter(filter) = operator else {
+        unreachable!("matched as a filter above");
+    };
+    let child = inputs.remove(0);
+    let PlanNode {
+        inputs: child_inputs,
+        operator: child_operator,
+        ..
+    } = child;
+    let Operator::Filter(mut child_filter) = child_operator else {
+        unreachable!("matched as a filter above");
+    };
+    child_filter.conditions.extend(filter.conditions);
+    PlanNode {
+        name,
+        inputs: child_inputs,
+        operator: Operator::Filter(child_filter),
+    }
 }
 
 /// Translate a general comparison join into pivot's [`Join`]. The supported
