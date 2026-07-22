@@ -89,6 +89,26 @@ async fn create_table_and_query(#[future] conn: Conn) {
     assert_eq!(rows, vec![vec![Some("2".into()), Some("bob".into())]]);
 }
 
+/// pivot has no multi-statement transactions, but a JDBC client with autocommit
+/// off brackets each batch with `BEGIN`/`COMMIT`. Those are accepted as no-ops
+/// so the statement between them still lands.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn transaction_control_statements_are_accepted_as_no_ops(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_txn", dir.path()).await;
+
+    conn.simple_query("BEGIN").await.unwrap();
+    conn.simple_query("INSERT INTO people_txn VALUES (4, 'dave')")
+        .await
+        .unwrap();
+    conn.simple_query("COMMIT").await.unwrap();
+
+    let rows = select_rows(&conn, "SELECT id FROM people_txn ORDER BY id").await;
+    assert_eq!(rows.len(), 4);
+}
+
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]

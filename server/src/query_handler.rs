@@ -615,6 +615,12 @@ impl SimpleQueryHandler for PivotQueryHandler {
         let with_perf = false;
 
         info!(sql = %query, "query received");
+        // pivot has no multi-statement transactions; accept the client's
+        // transaction-control statements as no-ops rather than planning them
+        // (DuckDB rejects them outright).
+        if let Some(control) = classify_transaction_control(query) {
+            return Ok(vec![transaction_control_response(control)]);
+        }
         let outcome = self
             .run_query(query, with_stats, with_perf)
             .await
@@ -643,6 +649,50 @@ impl SimpleQueryHandler for PivotQueryHandler {
 
         info!(sql = %query, "query succeeded");
         Ok(vec![res])
+    }
+}
+
+/// A transaction-control statement. pivot runs one implicit transaction per
+/// statement and has no multi-statement transactions, so it accepts these as
+/// no-ops (with a warning) rather than failing: the client stays in sync (each
+/// statement still commits on its own), it just doesn't get real atomicity.
+/// JDBC clients (e.g. the Kafka Connect sink) turn off autocommit and bracket
+/// each batch with `BEGIN`/`COMMIT`, so this keeps them working.
+#[derive(Clone, Copy)]
+enum TransactionControl {
+    Begin,
+    Commit,
+    Rollback,
+}
+
+/// Classify a statement as transaction control, or `None` if it isn't one. Only
+/// the leading keyword is inspected, which is all a client ever sends for these
+/// (`BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, `ABORT`).
+fn classify_transaction_control(sql: &str) -> Option<TransactionControl> {
+    let keyword = sql
+        .trim_start()
+        .split(|c: char| c.is_whitespace() || c == ';')
+        .next()?;
+    match keyword.to_ascii_uppercase().as_str() {
+        "BEGIN" | "START" => Some(TransactionControl::Begin),
+        "COMMIT" | "END" => Some(TransactionControl::Commit),
+        "ROLLBACK" | "ABORT" => Some(TransactionControl::Rollback),
+        _ => None,
+    }
+}
+
+/// The (no-op) response for a transaction-control statement. Uses pgwire's
+/// transaction start/end responses so the client's transaction-status indicator
+/// tracks the statements it sent, even though pivot does nothing.
+fn transaction_control_response(control: TransactionControl) -> Response {
+    warn!(
+        "transaction control statement accepted as a no-op; pivot has no \
+         multi-statement transactions"
+    );
+    match control {
+        TransactionControl::Begin => Response::TransactionStart(Tag::new("BEGIN")),
+        TransactionControl::Commit => Response::TransactionEnd(Tag::new("COMMIT")),
+        TransactionControl::Rollback => Response::TransactionEnd(Tag::new("ROLLBACK")),
     }
 }
 

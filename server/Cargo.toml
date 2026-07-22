@@ -50,3 +50,7 @@ rstest = { workspace = true }
 # Pull catalog's `test_support` (MinIO / fake-gcs object-store harness) in for
 # the bucket-backed end-to-end tests; the bin build keeps the plain catalog dep.
 catalog = { workspace = true, features = ["test-support"] }
+# Brings up Kafka + Kafka Connect for the (Docker-gated, `#[ignore]`d) Kafka
+# Connect JDBC-sink end-to-end test. `blocking` gives the `SyncRunner` the
+# existing container harness already uses.
+testcontainers = { version = "0.24", features = ["blocking"] }
