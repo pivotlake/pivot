@@ -155,6 +155,7 @@ uint8_t expr_type(const Expression &expr);
 uint8_t expr_return_type(const Expression &expr);
 bool expr_has_alias(const Expression &expr);
 rust::String expr_alias(const Expression &expr);
+rust::String expr_parameter_identifier(const Expression &expr);
 
 const Value &expr_constant(const Expression &expr);
 

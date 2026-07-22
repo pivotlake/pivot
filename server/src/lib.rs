@@ -48,6 +48,7 @@ mod arrow_to_pgwire;
 mod http;
 #[cfg(feature = "perf")]
 mod perf;
+mod prepared;
 mod query_handler;
 mod server;
 

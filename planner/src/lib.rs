@@ -148,6 +148,8 @@ pub use duckdb_planner::{
 pub enum Error {
     #[error(transparent)]
     Planning(#[from] duckdb_planner::Error),
+    #[error(transparent)]
+    Type(#[from] types::Error),
     #[error("Error converting plan: {0}")]
     PlanConversion(#[from] plan::Error),
 }
@@ -191,6 +193,12 @@ impl Planner {
     ) -> Result<Plan, Error> {
         let adapter = Arc::new(DuckDBTransactionAdapter { transaction });
         let planned = self.planner_context.plan(query, adapter)?;
+        let parameter_types = planned
+            .parameter_types()
+            .iter()
+            .cloned()
+            .map(types::type_from_logical)
+            .collect::<Result<Vec<_>, _>>()?;
         let mut root = build::build_plan(planned.root())?;
         // Push a top-k limit into a grouped aggregate that feeds ORDER BY DESC.
         root.annotate_group_topn();
@@ -200,6 +208,7 @@ impl Planner {
             catalog: self.catalog.clone(),
             root,
             output_names: planned.into_output_names(),
+            parameter_types,
         })
     }
 }

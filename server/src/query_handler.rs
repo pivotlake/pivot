@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::arrow_to_pgwire::PGRowBatch;
+use crate::prepared::{PreparedStatement, decode_parameters};
 use arrow_array::{Array, Int64Array, RecordBatch};
 use async_trait::async_trait;
 use dispatch::{CancelToken, DataFlowHandle, DataFlowStats};
@@ -34,11 +35,13 @@ use futures::{Sink, SinkExt, stream};
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
-use pgwire::api::query::SimpleQueryHandler;
+use pgwire::api::portal::{Format, Portal};
+use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{QueryResponse, Response, Tag};
+use pgwire::api::stmt::QueryParser;
 use pgwire::api::store::PortalStore;
 use pgwire::api::{
-    ClientInfo, ClientPortalStore, ConnectionManager, NoopHandler, PgWireServerHandlers,
+    ClientInfo, ClientPortalStore, ConnectionManager, NoopHandler, PgWireServerHandlers, Type,
 };
 use pgwire::error::PgWireResult;
 use pgwire::error::{ErrorInfo, PgWireError};
@@ -221,9 +224,13 @@ enum WorkerOutput {
     AffectedRows(std::result::Result<usize, String>),
 }
 
-fn build_worker_output(batch: RecordBatch, is_insert: bool) -> WorkerOutput {
+fn build_worker_output(
+    batch: RecordBatch,
+    is_insert: bool,
+    result_format: Option<&Format>,
+) -> WorkerOutput {
     if !is_insert {
-        return WorkerOutput::QueryRows(PGRowBatch::from(batch));
+        return WorkerOutput::QueryRows(PGRowBatch::new(batch, result_format));
     }
     let count = (|| {
         if batch.num_rows() != 1 || batch.num_columns() != 1 {
@@ -328,6 +335,7 @@ pub struct PivotQueryHandler {
     /// query's transaction reads that transaction's view. DDL flushes the
     /// cache (it may change the schema cached plans were bound against).
     plan_cache: Arc<Mutex<HashMap<String, Arc<planner::Plan>>>>,
+    query_parser: Arc<PivotQueryParser>,
 }
 
 impl PivotQueryHandler {
@@ -336,10 +344,87 @@ impl PivotQueryHandler {
         dispatcher: dispatch::DataFlowDispatcher,
     ) -> Self {
         Self {
+            query_parser: Arc::new(PivotQueryParser {
+                catalog: catalog.clone(),
+            }),
             catalog,
             dispatcher,
             plan_cache: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    async fn finish_transaction<T>(
+        &self,
+        transaction: Arc<dyn planner::catalog::CatalogTransaction>,
+        result: Result<T>,
+    ) -> Result<T> {
+        match result {
+            Ok(value) => {
+                let catalog = self.catalog.clone();
+                tokio::task::spawn_blocking(move || catalog.commit_transaction(transaction))
+                    .await
+                    .map_err(Error::CommitPanic)??;
+                Ok(value)
+            }
+            Err(error) => {
+                self.catalog.rollback_transaction(transaction);
+                Err(error)
+            }
+        }
+    }
+
+    /// Compile and execute a plan with one set of Bind values. Simple queries
+    /// pass an empty set; prepared portals pass their decoded parameters and
+    /// requested result format.
+    async fn execute_plan(
+        &self,
+        dispatcher: dispatch::DataFlowDispatcher,
+        plan: Arc<planner::Plan>,
+        transaction: Arc<dyn planner::catalog::CatalogTransaction>,
+        parameters: Vec<arrow_array::Scalar<arrow_array::ArrayRef>>,
+        result_format: Option<Format>,
+        collect_stats: bool,
+        plan_time: Duration,
+    ) -> Result<Outcome> {
+        let is_insert = matches!(&plan.root.operator, planner::Operator::Insert(_));
+        let compile_transaction = transaction.clone();
+        let started = Instant::now();
+        let handle = tokio::task::spawn_blocking(move || -> Result<DataFlowHandle<_>> {
+            let output_format = result_format;
+            let outputs = plan
+                .compile_with_parameters(&dispatcher, compile_transaction.as_ref(), &parameters)?
+                .map(move || {
+                    let output_format = output_format.clone();
+                    move |batch| build_worker_output(batch, is_insert, output_format.as_ref())
+                });
+            Ok(if collect_stats {
+                outputs.execute_with_stats()
+            } else {
+                outputs.execute()
+            })
+        })
+        .await
+        .map_err(Error::PlannerPanic)??;
+        let compile_time = started.elapsed();
+
+        // Dropping the query future on cancel/disconnect cancels the dataflow.
+        let guard = CancelOnDrop::new(handle.cancel_token());
+        let started = Instant::now();
+        let (outputs, flow) = tokio::task::spawn_blocking(move || handle.collect_with_stats())
+            .await
+            .map_err(Error::WorkerPanic)??;
+        let exec_time = started.elapsed();
+        guard.defuse();
+
+        Ok(Outcome::Response(
+            build_pgwire_response(outputs, is_insert)?,
+            QueryStats {
+                plan: plan_time,
+                compile: compile_time,
+                exec: exec_time,
+                flow,
+            },
+        ))
     }
 
     /// Plan `query`, then either run it (timing each phase, tallying the
@@ -408,7 +493,6 @@ impl PivotQueryHandler {
                     value: set.value.clone(),
                 });
             }
-            let is_insert = matches!(&plan.root.operator, planner::Operator::Insert(_));
 
             // When the session ran `SET perf = 1`, start a `perf record` scoped to the
             // worker threads and mark this query's dataflows profiled. Marking them
@@ -436,36 +520,17 @@ impl PivotQueryHandler {
             #[cfg(not(feature = "perf"))]
             let _ = with_perf;
 
-            // Compile the plan into a fresh dataflow and launch it. `compile` is pure
-            // pivot work (no DuckDB), so it runs on any blocking thread without the
-            // planner thread-local. `execute_with_stats` turns on the dataflow's
-            // IO/CPU tally only when the client asked for it.
-            let started = Instant::now();
-            let compile_transaction = transaction.clone();
-            let handle = tokio::task::spawn_blocking(move || -> Result<DataFlowHandle<_>> {
-                let outputs = plan
-                    .compile(&dispatcher, compile_transaction.as_ref())?
-                    .map(move || move |batch| build_worker_output(batch, is_insert));
-                Ok(if collect_stats {
-                    outputs.execute_with_stats()
-                } else {
-                    outputs.execute()
-                })
-            })
-            .await
-            .map_err(Error::PlannerPanic)??;
-            let compile_time = started.elapsed();
-
-            // Cancel the dataflow if our future is dropped before drain finishes —
-            // covers both psql Ctrl-C (pgwire's `_on_query` select drops us) and
-            // raw disconnects (whole connection task dropped).
-            let guard = CancelOnDrop::new(handle.cancel_token());
-            let started = Instant::now();
-            let (outputs, flow) = tokio::task::spawn_blocking(move || handle.collect_with_stats())
-                .await
-                .map_err(Error::WorkerPanic)??;
-            let exec_time = started.elapsed();
-            guard.defuse();
+            let outcome = self
+                .execute_plan(
+                    dispatcher,
+                    plan,
+                    transaction.clone(),
+                    Vec::new(),
+                    None,
+                    collect_stats,
+                    plan_time,
+                )
+                .await;
 
             // Stop perf off the reactor: `child.wait()` blocks until the report is
             // flushed (seconds for a large capture), which would otherwise stall this
@@ -475,31 +540,97 @@ impl PivotQueryHandler {
                 let _ = tokio::task::spawn_blocking(move || drop(perf)).await;
             }
 
-            let response = build_pgwire_response(outputs, is_insert)?;
-            Ok(Outcome::Response(
-                response,
-                QueryStats {
-                    plan: plan_time,
-                    compile: compile_time,
-                    exec: exec_time,
-                    flow,
-                },
-            ))
+            outcome
         }
         .await;
-        match result {
-            Ok(outcome) => {
-                let catalog = self.catalog.clone();
-                tokio::task::spawn_blocking(move || catalog.commit_transaction(transaction))
-                    .await
-                    .map_err(Error::CommitPanic)??;
-                Ok(outcome)
+        self.finish_transaction(transaction, result).await
+    }
+
+    /// Compile and execute an already-planned statement with this portal's Bind
+    /// values. Parse/optimize is deliberately absent: the `Arc<Plan>` stored by
+    /// pgwire is the prepared-statement reuse boundary.
+    async fn run_prepared(
+        &self,
+        statement: &PreparedStatement,
+        parameters: Vec<arrow_array::Scalar<arrow_array::ArrayRef>>,
+        result_format: Format,
+        collect_stats: bool,
+    ) -> Result<Outcome> {
+        let transaction = self.catalog.begin_transaction();
+        let result: Result<Outcome> = async {
+            if let Some(set) = statement.plan.as_set_variable() {
+                return Ok(Outcome::Set {
+                    name: set.name.clone(),
+                    value: set.value.clone(),
+                });
             }
-            Err(error) => {
-                self.catalog.rollback_transaction(transaction);
-                Err(error)
-            }
+
+            self.execute_plan(
+                self.dispatcher.clone(),
+                statement.plan.clone(),
+                transaction.clone(),
+                parameters,
+                Some(result_format),
+                collect_stats,
+                Duration::ZERO,
+            )
+            .await
         }
+        .await;
+        self.finish_transaction(transaction, result).await
+    }
+}
+
+/// pgwire's Parse callback. It plans exactly once and stores the resulting
+/// reusable Pivot plan in the connection's statement store.
+pub struct PivotQueryParser {
+    catalog: Arc<dyn planner::catalog::Catalog>,
+}
+
+#[async_trait]
+impl QueryParser for PivotQueryParser {
+    type Statement = PreparedStatement;
+
+    async fn parse_sql<C>(
+        &self,
+        _client: &C,
+        sql: &str,
+        _types: &[Option<Type>],
+    ) -> PgWireResult<Self::Statement>
+    where
+        C: ClientInfo + Unpin + Send + Sync,
+    {
+        let transaction = self.catalog.begin_transaction();
+        let catalog = self.catalog.clone();
+        let query = sql.to_string();
+        let planning_transaction = transaction.clone();
+        let planned = tokio::task::spawn_blocking(move || -> Result<Arc<planner::Plan>> {
+            with_planner(&catalog, |planner| {
+                Ok(Arc::new(planner.plan(&query, planning_transaction)?))
+            })
+        })
+        .await
+        .map_err(Error::PlannerPanic)
+        .and_then(|result| result);
+        // Parse only reads catalog state. Release its snapshot now; every
+        // Execute opens a fresh transaction for compilation and execution.
+        self.catalog.rollback_transaction(transaction);
+        let plan = planned.map_err(Error::into_pgwire)?;
+        PreparedStatement::new(sql.to_string(), plan)
+            .map_err(Error::Compile)
+            .map_err(Error::into_pgwire)
+    }
+
+    fn get_parameter_types(&self, stmt: &Self::Statement) -> PgWireResult<Vec<Type>> {
+        Ok(stmt.pg_parameter_types())
+    }
+
+    fn get_result_schema(
+        &self,
+        stmt: &Self::Statement,
+        column_format: Option<&Format>,
+    ) -> PgWireResult<Vec<pgwire::api::results::FieldInfo>> {
+        Ok(stmt.result_fields(column_format))
     }
 }
 
@@ -646,6 +777,66 @@ impl SimpleQueryHandler for PivotQueryHandler {
     }
 }
 
+#[async_trait]
+impl ExtendedQueryHandler for PivotQueryHandler {
+    type Statement = PreparedStatement;
+    type QueryParser = PivotQueryParser;
+
+    fn query_parser(&self) -> Arc<Self::QueryParser> {
+        self.query_parser.clone()
+    }
+
+    async fn do_query<C>(
+        &self,
+        client: &mut C,
+        portal: &Portal<Self::Statement>,
+        _max_rows: usize,
+    ) -> PgWireResult<Response>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let statement = &portal.statement.statement;
+        let parameters = decode_parameters(portal)?;
+        let with_stats = stats_on(client);
+
+        info!(sql = %statement.sql, "prepared query received");
+        let outcome = self
+            .run_prepared(
+                statement,
+                parameters,
+                portal.result_column_format.clone(),
+                with_stats,
+            )
+            .await
+            .map_err(|error| {
+                warn!(error = %error, sql = %statement.sql, "prepared query failed");
+                error.into_pgwire()
+            })?;
+
+        let response = match outcome {
+            Outcome::Set { name, value } => apply_set(client, &name, value.as_deref()),
+            Outcome::Response(response, stats) => {
+                if with_stats {
+                    let notice = NoticeResponse::from(ErrorInfo::new(
+                        "INFO".to_string(),
+                        "00000".to_string(),
+                        stats.summary(),
+                    ));
+                    client
+                        .send(PgWireBackendMessage::NoticeResponse(notice))
+                        .await?;
+                }
+                response
+            }
+        };
+        info!(sql = %statement.sql, "prepared query succeeded");
+        Ok(response)
+    }
+}
+
 /// Startup handler that registers each new connection with the shared
 /// [`ConnectionManager`] so that subsequent `CancelRequest` packets can be
 /// routed back to the running query. Otherwise behaves as a noop (no auth).
@@ -708,7 +899,7 @@ impl PgWireServerHandlers for PivotHandlers {
     }
 
     fn extended_query_handler(&self) -> Arc<impl pgwire::api::query::ExtendedQueryHandler> {
-        Arc::new(NoopHandler)
+        self.query_handler.clone()
     }
 
     fn copy_handler(&self) -> Arc<impl pgwire::api::copy::CopyHandler> {

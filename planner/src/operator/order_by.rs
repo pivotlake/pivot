@@ -89,7 +89,7 @@ impl OrderBy {
                 let descending = matches!(node.direction, OrderByDirection::Desc);
                 Ok(DispatchOrderBy::new(col, descending, false))
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, Error>>()?;
         // No standalone ORDER BY (without LIMIT) yet, so emulate it with a sentinel limit.
         Ok(input.order_by_limit(orders, 1_000_000_000))
     }

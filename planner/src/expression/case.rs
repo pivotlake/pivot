@@ -34,7 +34,7 @@ impl Display for Case {
 }
 
 impl Case {
-    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
+    pub fn compile(&self, parameters: &compile::BoundParameters) -> Result<ExprFn, compile::Error> {
         // Compile the ELSE branch and each (WHEN, THEN) arm once. Per batch we
         // start from the ELSE value and fold the arms back-to-front with arrow's
         // `zip` (selecting `then` where the WHEN mask is true, else the running
@@ -43,11 +43,11 @@ impl Case {
         //
         // `zip` requires `then` and the running result share a data type; DuckDB
         // unifies all branch types when binding the CASE, so they always do.
-        let else_builder = self.else_expr.compile()?;
+        let else_builder = self.else_expr.compile(parameters)?;
         let arm_builders = self
             .checks
             .iter()
-            .map(|c| Ok((c.when.compile()?, c.then.compile()?)))
+            .map(|c| Ok((c.when.compile(parameters)?, c.then.compile(parameters)?)))
             .collect::<Result<Vec<_>, compile::Error>>()?;
         Ok(Box::new(move || {
             let mut else_eval = else_builder();

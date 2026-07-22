@@ -36,7 +36,7 @@ impl Display for Conjunction {
 }
 
 impl Conjunction {
-    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
+    pub fn compile(&self, parameters: &compile::BoundParameters) -> Result<ExprFn, compile::Error> {
         // Compile each child predicate once, then per batch reduce their boolean
         // masks with the conjunction's kernel (`AND`/`OR`).
         type BoolKernel = fn(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>;
@@ -47,7 +47,7 @@ impl Conjunction {
         let child_builders = self
             .children
             .iter()
-            .map(|c| c.compile())
+            .map(|c| c.compile(parameters))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Box::new(move || {
             let mut child_exprs: Vec<ExprEvalFn> = child_builders.iter().map(|b| b()).collect();

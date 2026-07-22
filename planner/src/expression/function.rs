@@ -150,21 +150,21 @@ impl Function {
         }
     }
 
-    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
+    pub fn compile(&self, parameters: &compile::BoundParameters) -> Result<ExprFn, compile::Error> {
         match self {
-            Function::Contains(c) => c.compile(),
-            Function::Prefix(p) => p.compile(),
-            Function::Arithmetic(a) => a.compile(),
-            Function::Length(l) => l.compile(),
-            Function::RegexpReplace(r) => r.compile(),
-            Function::RegexpJitReplace(r) => r.compile(),
-            Function::Divide(d) => d.compile(),
-            Function::DateTrunc(dt) => dt.compile(),
-            Function::DatePart(d) => d.compile(),
-            Function::IntervalArithmetic(i) => i.compile(),
-            Function::TemporalConvert(c) => c.compile(),
-            Function::VariantGet(v) => v.compile(),
-            Function::VariantToJson(v) => v.compile(),
+            Function::Contains(c) => c.compile(parameters),
+            Function::Prefix(p) => p.compile(parameters),
+            Function::Arithmetic(a) => a.compile(parameters),
+            Function::Length(l) => l.compile(parameters),
+            Function::RegexpReplace(r) => r.compile(parameters),
+            Function::RegexpJitReplace(r) => r.compile(parameters),
+            Function::Divide(d) => d.compile(parameters),
+            Function::DateTrunc(dt) => dt.compile(parameters),
+            Function::DatePart(d) => d.compile(parameters),
+            Function::IntervalArithmetic(i) => i.compile(parameters),
+            Function::TemporalConvert(c) => c.compile(parameters),
+            Function::VariantGet(v) => v.compile(parameters),
+            Function::VariantToJson(v) => v.compile(parameters),
             // `drop_cache()` evicts pivot's in-memory compressed cache *and* the on-disk
             // cache (so remote reads go cold to the network) as a side effect, then
             // returns the total entries dropped. Evaluated over the single

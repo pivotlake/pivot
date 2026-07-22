@@ -26,6 +26,7 @@ mod in_list;
 mod interval;
 mod length;
 mod not;
+mod parameter;
 mod prefix;
 mod reference;
 mod regexp;
@@ -49,6 +50,7 @@ pub use in_list::InList;
 pub use interval::IntervalArithmetic;
 pub use length::Length;
 pub use not::Not;
+pub use parameter::Parameter;
 pub use prefix::Prefix;
 pub use reference::Ref;
 pub use regexp::RegexpReplace;
@@ -101,6 +103,7 @@ fn format_constant(s: &Scalar<ArrayRef>) -> String {
 #[derive(Debug, Clone)]
 pub enum Expression {
     Ref(Ref),
+    Parameter(Parameter),
     Compare(Compare),
     Between(Between),
     Constant(Scalar<ArrayRef>),
@@ -119,7 +122,7 @@ impl Expression {
     /// evaluating it pays for the row gather (see the `Filter` operator).
     pub fn count_kernels(&self) -> usize {
         match self {
-            Expression::Ref(_) | Expression::Constant(_) => 0,
+            Expression::Ref(_) | Expression::Parameter(_) | Expression::Constant(_) => 0,
             Expression::Compare(c) => 1 + c.left.count_kernels() + c.right.count_kernels(),
             Expression::Between(b) => 2 + b.input.count_kernels(),
             Expression::AggregateFunc(_) => 1,
@@ -151,6 +154,7 @@ impl Expression {
     pub fn result_type(&self) -> Result<Type, compile::Error> {
         match self {
             Expression::Ref(r) => Ok(r.return_type.clone()),
+            Expression::Parameter(p) => Ok(p.return_type.clone()),
             Expression::Constant(s) => types::type_from_physical(s.get().0.data_type())
                 .ok_or_else(|| compile::Error::IndeterminateResultType(self.clone())),
             // Comparisons and the boolean combinators all yield booleans.
@@ -170,23 +174,32 @@ impl Expression {
         }
     }
 
-    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
+    pub fn compile(&self, parameters: &[Scalar<ArrayRef>]) -> Result<ExprFn, compile::Error> {
         match self {
             Expression::Ref(r) => r.compile(),
-            Expression::Compare(c) => c.compile(),
+            Expression::Parameter(p) => {
+                let scalar = parameters
+                    .get(p.index)
+                    .cloned()
+                    .ok_or(compile::Error::MissingParameter(p.index + 1))?;
+                Ok(stateless_expr(move |_batch: &RecordBatch| {
+                    ExprResult::Scalar(scalar.clone())
+                }))
+            }
+            Expression::Compare(c) => c.compile(parameters),
             Expression::Constant(c) => {
                 let scalar = c.clone();
                 Ok(stateless_expr(move |_batch: &RecordBatch| {
                     ExprResult::Scalar(scalar.clone())
                 }))
             }
-            Expression::Function(f) => f.compile(),
-            Expression::Between(b) => b.compile(),
-            Expression::InList(i) => i.compile(),
-            Expression::Conjunction(c) => c.compile(),
-            Expression::Case(c) => c.compile(),
-            Expression::Not(n) => n.compile(),
-            Expression::Cast(c) => c.compile(),
+            Expression::Function(f) => f.compile(parameters),
+            Expression::Between(b) => b.compile(parameters),
+            Expression::InList(i) => i.compile(parameters),
+            Expression::Conjunction(c) => c.compile(parameters),
+            Expression::Case(c) => c.compile(parameters),
+            Expression::Not(n) => n.compile(parameters),
+            Expression::Cast(c) => c.compile(parameters),
             _ => Err(compile::Error::UnsupportedExpression(self.clone())),
         }
     }
@@ -196,6 +209,7 @@ impl Display for Expression {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Expression::Ref(r) => write!(f, "{r}"),
+            Expression::Parameter(p) => write!(f, "{p}"),
             Expression::Compare(c) => write!(f, "{c}"),
             Expression::Between(b) => write!(f, "{b}"),
             Expression::Constant(c) => f.write_str(&format_constant(c)),

@@ -48,7 +48,7 @@ impl Display for RegexpReplace {
 }
 
 impl RegexpReplace {
-    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
+    pub fn compile(&self, parameters: &compile::BoundParameters) -> Result<ExprFn, compile::Error> {
         build_regex(&self.pattern).map_err(|source| compile::Error::InvalidRegexPattern {
             pattern: self.pattern.clone(),
             source,
@@ -56,7 +56,7 @@ impl RegexpReplace {
 
         let pattern = self.pattern.clone();
         let replacement = Arc::new(translate_replacement(&self.replacement));
-        let input_builder = self.input.compile()?;
+        let input_builder = self.input.compile(parameters)?;
 
         Ok(Box::new(move || {
             let replacement = replacement.clone();

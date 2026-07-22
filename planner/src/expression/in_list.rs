@@ -24,15 +24,15 @@ impl Display for InList {
 }
 
 impl InList {
-    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
+    pub fn compile(&self, parameters: &compile::BoundParameters) -> Result<ExprFn, compile::Error> {
         // `x IN (a, b, …)` is the disjunction `x = a OR x = b OR …`. We compile
         // the tested expression and every list value once, then per batch
         // OR-reduce the equality masks.
-        let input_builder = self.input.compile()?;
+        let input_builder = self.input.compile(parameters)?;
         let value_builders = self
             .values
             .iter()
-            .map(|v| v.compile())
+            .map(|v| v.compile(parameters))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Box::new(move || {
             let mut input_expr = input_builder();
@@ -82,7 +82,7 @@ mod tests {
             values: vec![constant(-1), constant(6)],
         };
 
-        let mut eval = in_list.compile().unwrap()();
+        let mut eval = in_list.compile(&[]).unwrap()();
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("ts", DataType::Int16, false)])),
             vec![Arc::new(Int16Array::from(vec![-1i16, 6, 3, 6])) as ArrayRef],

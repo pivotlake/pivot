@@ -30,7 +30,7 @@ pub struct IntervalArithmetic {
 }
 
 impl IntervalArithmetic {
-    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
+    pub fn compile(&self, parameters: &compile::BoundParameters) -> Result<ExprFn, compile::Error> {
         let result_arrow = physical_arrow_type(&self.result);
         // The physical int the temporal result reinterprets through.
         let int_arrow = match self.result {
@@ -40,7 +40,7 @@ impl IntervalArithmetic {
         };
         let op = self.op;
         let offset = self.offset;
-        let operand = self.operand.compile()?;
+        let operand = self.operand.compile(parameters)?;
         Ok(Box::new(move || {
             let mut eval = operand();
             let result_arrow = result_arrow.clone();

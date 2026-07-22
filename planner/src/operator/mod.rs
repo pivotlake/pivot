@@ -43,7 +43,7 @@ pub use projection::Projection;
 pub use set_variable::SetVariable;
 pub use table_function::{TableFunction, TableFunctionScan, TableFunctionSignature};
 pub use top_n::TopN;
-pub use values::Values;
+pub use values::{ValuePointer, Values, ValuesData};
 
 use crate::compile::{self, DynamicFilterSlots};
 use crate::expression::{self, Expression};
@@ -59,6 +59,8 @@ pub enum Error {
     Expression(#[from] expression::Error),
     #[error("{0}")]
     Type(#[from] crate::types::Error),
+    #[error("{0}")]
+    Compile(#[from] compile::Error),
     /// A plan shape pivot doesn't support yet (an unmapped operator, a
     /// non-constant LIMIT, a table function with named parameters, ...).
     #[error("{0}")]
@@ -139,9 +141,7 @@ impl Operator {
             }
             // A VALUES source emits its expression columns; every row shares
             // the same types, so the first row speaks for all.
-            Operator::Values(values) => {
-                expression_types(values.rows.first().map_or(&[][..], Vec::as_slice))
-            }
+            Operator::Values(values) => Ok(values.output_types()),
             // An INSERT emits one row: the inserted-row count.
             Operator::Insert(_) => Ok(vec![Type::Int64]),
             // A FROM-less SELECT's one-row source has no columns of its own.

@@ -27,8 +27,8 @@ impl Display for Length {
 }
 
 impl Length {
-    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
-        let input_builder = self.input.compile()?;
+    pub fn compile(&self, parameters: &compile::BoundParameters) -> Result<ExprFn, compile::Error> {
+        let input_builder = self.input.compile(parameters)?;
         Ok(Box::new(move || {
             let mut input_expr = input_builder();
             Box::new(move |batch: &RecordBatch| {

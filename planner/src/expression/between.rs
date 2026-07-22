@@ -32,14 +32,14 @@ impl Display for Between {
 }
 
 impl Between {
-    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
+    pub fn compile(&self, parameters: &compile::BoundParameters) -> Result<ExprFn, compile::Error> {
         // `input BETWEEN lower AND upper` == `input >= lower AND input <= upper`
         // (the inclusive/exclusive flags swap >=/> and <=/<).
         let lower_kernel: CmpKernel = if self.lower_inclusive { gt_eq } else { gt };
         let upper_kernel: CmpKernel = if self.upper_inclusive { lt_eq } else { lt };
-        let input_builder = self.input.compile()?;
-        let lower_builder = self.lower.compile()?;
-        let upper_builder = self.upper.compile()?;
+        let input_builder = self.input.compile(parameters)?;
+        let lower_builder = self.lower.compile(parameters)?;
+        let upper_builder = self.upper.compile(parameters)?;
         Ok(Box::new(move || {
             let mut input_expr = input_builder();
             let mut lower_expr = lower_builder();

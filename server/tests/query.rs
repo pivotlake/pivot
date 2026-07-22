@@ -21,7 +21,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use rstest::rstest;
 use tempfile::TempDir;
-use tokio_postgres::{Client, SimpleQueryMessage};
+use tokio_postgres::{Client, SimpleQueryMessage, types::Type as PgType};
 
 /// Run `sql` and decode every `DataRow` in the response into
 /// `Vec<Option<String>>` (text format). Non-row messages (e.g. `RowDescription`,
@@ -87,6 +87,77 @@ async fn create_table_and_query(#[future] conn: Conn) {
     let rows = select_rows(&conn, "SELECT id, name FROM people_filter WHERE id = 2").await;
 
     assert_eq!(rows, vec![vec![Some("2".into()), Some("bob".into())]]);
+}
+
+/// `prepare` drives Parse/Describe once without client type hints, so Pivot
+/// must infer INT8 from the comparison. Each `query_one` then sends a fresh
+/// Bind/Execute with PostgreSQL's binary representation. This covers a scalar
+/// parameter retained inside a cached filter expression.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn prepared_filter_reuses_plan_with_fresh_values(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_prepared_filter", dir.path()).await;
+
+    let statement = conn
+        .prepare("SELECT id, name FROM people_prepared_filter WHERE id = $1")
+        .await
+        .unwrap();
+
+    assert_eq!(statement.params(), &[PgType::INT8]);
+    assert_eq!(statement.columns()[0].type_(), &PgType::INT8);
+    assert_eq!(statement.columns()[1].type_(), &PgType::TEXT);
+
+    for (id, expected_name) in [(2_i64, "bob"), (3_i64, "carol")] {
+        let row = conn.query_one(&statement, &[&id]).await.unwrap();
+        assert_eq!(row.get::<_, i64>(0), id);
+        assert_eq!(row.get::<_, &str>(1), expected_name);
+    }
+}
+
+/// Multi-row prepared VALUES is represented in the plan column-wise:
+/// [parameters 0, 2] feed `id` and [1, 3] feed `name`. Running the same
+/// statement twice verifies that Bind values do not leak between Executes.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn prepared_insert_gathers_bulk_values_and_reuses_plan(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_prepared_insert", dir.path()).await;
+
+    let statement = conn
+        .prepare_typed(
+            "INSERT INTO people_prepared_insert VALUES ($1, $2), ($3, $4)",
+            &[PgType::INT8, PgType::TEXT, PgType::INT8, PgType::TEXT],
+        )
+        .await
+        .unwrap();
+
+    let first = conn
+        .execute(&statement, &[&4_i64, &"dave", &5_i64, &"eve"])
+        .await
+        .unwrap();
+    let second = conn
+        .execute(&statement, &[&6_i64, &"frank", &7_i64, &"grace"])
+        .await
+        .unwrap();
+    assert_eq!((first, second), (2, 2));
+
+    let rows = select_rows(
+        &conn,
+        "SELECT id, name FROM people_prepared_insert WHERE id >= 4 ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("4".into()), Some("dave".into())],
+            vec![Some("5".into()), Some("eve".into())],
+            vec![Some("6".into()), Some("frank".into())],
+            vec![Some("7".into()), Some("grace".into())],
+        ]
+    );
 }
 
 #[rstest]

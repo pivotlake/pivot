@@ -65,13 +65,19 @@ fn scalar_from_value(v: &ffi::Value) -> ScalarValue {
 pub struct Plan {
     handle: UniquePtr<ffi::PlanHandle>,
     output_names: Vec<String>,
+    parameter_types: Vec<LogicalTypeId>,
 }
 
 impl Plan {
-    pub(crate) fn new(handle: UniquePtr<ffi::PlanHandle>, output_names: Vec<String>) -> Self {
+    pub(crate) fn new(
+        handle: UniquePtr<ffi::PlanHandle>,
+        output_names: Vec<String>,
+        parameter_types: Vec<LogicalTypeId>,
+    ) -> Self {
         Self {
             handle,
             output_names,
+            parameter_types,
         }
     }
 
@@ -87,6 +93,12 @@ impl Plan {
     /// them.
     pub fn output_names(&self) -> &[String] {
         &self.output_names
+    }
+
+    /// Binder-resolved prepared-parameter types in `$1`, `$2`, ... order. The
+    /// values themselves remain holes in the owned logical plan.
+    pub fn parameter_types(&self) -> &[LogicalTypeId] {
+        &self.parameter_types
     }
 
     /// Consume the plan, returning the resolved output names.
@@ -583,6 +595,7 @@ impl<'plan> Expr<'plan> {
             | T::COMPARE_GREATERTHANOREQUALTO => Expression::Compare(Compare { raw: self.raw }),
             T::COMPARE_BETWEEN => Expression::Between(Between { raw: self.raw }),
             T::VALUE_CONSTANT => Expression::Constant(Constant { raw: self.raw }),
+            T::VALUE_PARAMETER => Expression::Parameter(Parameter { raw: self.raw }),
             T::BOUND_AGGREGATE => Expression::AggregateFunc(AggregateFunc { raw: self.raw }),
             T::BOUND_FUNCTION => Expression::Function(Function { raw: self.raw }),
             T::COMPARE_IN => Expression::InList(InList { raw: self.raw }),
@@ -608,6 +621,8 @@ pub enum Expression<'plan> {
     Compare(Compare<'plan>),
     Between(Between<'plan>),
     Constant(Constant<'plan>),
+    /// A prepared-statement value supplied later by a protocol Bind message.
+    Parameter(Parameter<'plan>),
     /// An aggregate function call (`SUM`, `COUNT`, …).
     AggregateFunc(AggregateFunc<'plan>),
     /// A scalar function call (`BOUND_FUNCTION`).
@@ -634,6 +649,8 @@ define_handles! { ffi::Expression;
     Between,
     /// A constant value.
     Constant,
+    /// A bound prepared-statement parameter (`$1`, `$2`, ...).
+    Parameter,
     /// An aggregate function call.
     AggregateFunc,
     /// A scalar function call.
@@ -669,6 +686,22 @@ impl<'plan> Ref<'plan> {
     /// The column's source name from DuckDB's binding, or `None`. Display-only.
     pub fn alias(self) -> Option<String> {
         ffi::expr_has_alias(self.raw).then(|| ffi::expr_alias(self.raw))
+    }
+}
+
+impl<'plan> Parameter<'plan> {
+    /// Zero-based protocol parameter index (`$1` becomes `0`).
+    pub fn index(self) -> usize {
+        ffi::expr_parameter_identifier(self.raw)
+            .parse::<usize>()
+            .expect("DuckDB positional parameter identifier is numeric")
+            .checked_sub(1)
+            .expect("DuckDB positional parameters are one-based")
+    }
+
+    /// The type DuckDB inferred from the parameter's use in the statement.
+    pub fn return_type(self) -> LogicalTypeId {
+        LogicalTypeId::from_u8(ffi::expr_return_type(self.raw))
     }
 }
 

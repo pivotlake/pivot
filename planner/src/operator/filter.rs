@@ -31,11 +31,12 @@ impl Filter {
     pub(crate) fn compile(
         &self,
         input: RecordBatchOperatorSpec,
+        parameters: &crate::compile::BoundParameters,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let filters = Arc::new(
             self.conditions
                 .iter()
-                .map(|e| e.compile())
+                .map(|e| e.compile(parameters))
                 .collect::<Result<Vec<_>, _>>()?,
         );
         assert!(!filters.is_empty());

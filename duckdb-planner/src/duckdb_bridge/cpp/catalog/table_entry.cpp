@@ -74,6 +74,19 @@ static void PivotScanPushdownComplexFilter(ClientContext &context, LogicalGet &g
 	// Complex filters: offer each one to Rust. If the table pushes it down,
 	// drop it from the vector so DuckDB doesn't re-apply it on top.
 	for (auto it = filters.begin(); it != filters.end();) {
+		// A prepared predicate depends on future Bind values and therefore cannot
+		// contribute plan-time pruning. DuckDB has also temporarily invalidated
+		// its parameter type to request an execution-time rebind; the bridge
+		// restores that type after optimization for Pivot's cached plan.
+		if ((*it)->HasParameter()) {
+			// Prevent DuckDB's subsequent generic table-filter pass from moving
+			// this invalidated expression into LogicalGet::table_filters, which is
+			// intentionally outside its logical-expression visitor. Keeping it as
+			// a LogicalFilter lets the bridge restore and retain the typed hole.
+			get.function.filter_pushdown = false;
+			++it;
+			continue;
+		}
 		auto remapped = (*it)->Copy();
 		RewriteRefsToStorage(*remapped, column_ids);
 		// Hand the (storage-remapped) DuckDB expression straight to Rust, which

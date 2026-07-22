@@ -23,7 +23,7 @@ impl Display for Contains {
 }
 
 impl Contains {
-    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
+    pub fn compile(&self, parameters: &compile::BoundParameters) -> Result<ExprFn, compile::Error> {
         match self.haystack.as_ref() {
             Expression::Ref(r) if r.return_type == Type::Utf8 => {}
             expr => {
@@ -33,7 +33,7 @@ impl Contains {
             }
         }
 
-        let haystack_builder = self.haystack.compile()?;
+        let haystack_builder = self.haystack.compile(parameters)?;
 
         // Extract the needle string from the constant expression
         let needle_str: String = match self.needle.as_ref() {

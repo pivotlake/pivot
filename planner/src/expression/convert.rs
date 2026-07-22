@@ -38,10 +38,10 @@ pub struct TemporalConvert {
 }
 
 impl TemporalConvert {
-    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
+    pub fn compile(&self, parameters: &compile::BoundParameters) -> Result<ExprFn, compile::Error> {
         let target = self.target.clone();
         let via = self.via.clone();
-        let source_builder = self.source.compile()?;
+        let source_builder = self.source.compile(parameters)?;
         Ok(Box::new(move || {
             let target = target.clone();
             let via = via.clone();

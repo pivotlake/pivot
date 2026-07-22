@@ -244,6 +244,8 @@ pub struct Plan {
     /// schema. Empty when unavailable, in which case the operators' own field
     /// names stand.
     pub output_names: Vec<String>,
+    /// DuckDB-inferred types for `$1`, `$2`, ... in protocol order.
+    pub parameter_types: Vec<Type>,
 }
 
 impl Plan {

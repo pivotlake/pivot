@@ -29,9 +29,9 @@ impl Display for Cast {
 }
 
 impl Cast {
-    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
+    pub fn compile(&self, parameters: &compile::BoundParameters) -> Result<ExprFn, compile::Error> {
         let target = self.target_arrow.clone();
-        let source_builder = self.source.compile()?;
+        let source_builder = self.source.compile(parameters)?;
         Ok(Box::new(move || {
             let target = target.clone();
             let mut source_expr = source_builder();

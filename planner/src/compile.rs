@@ -57,6 +57,10 @@ pub enum Error {
     UnsupportedAggregateExpressionAmount(usize),
     #[error("Unsupported expression: {0:?}")]
     UnsupportedExpression(Expression),
+    #[error("No value was bound for prepared parameter ${0}")]
+    MissingParameter(usize),
+    #[error("building an Arrow batch: {0}")]
+    Arrow(#[from] arrow_schema::ArrowError),
     #[error("Unsupported type for group by{}: {data_type:?}", .column.as_deref().map(|c| format!(" of column \"{c}\"")).unwrap_or_default())]
     DataTypeNotSupportedForGroupBy {
         column: Option<String>,
@@ -121,15 +125,29 @@ impl Plan {
         dispatcher: &DataFlowDispatcher,
         transaction: &dyn CatalogTransaction,
     ) -> Result<RecordBatchOperatorSpec, Error> {
+        self.compile_with_parameters(dispatcher, transaction, &[])
+    }
+
+    /// Compile a cached plan with a fresh set of prepared Bind values.
+    pub fn compile_with_parameters(
+        &self,
+        dispatcher: &DataFlowDispatcher,
+        transaction: &dyn CatalogTransaction,
+        parameters: &BoundParameters,
+    ) -> Result<RecordBatchOperatorSpec, Error> {
         // Every table access resolves through `transaction`, so the whole
         // query reads one frozen view of the catalog and no live catalog
         // state is consulted here. The plan itself carries no snapshot: it can
         // be cached and compiled again under a later transaction, reading that
         // transaction's view.
         let mut slots = DynamicFilterSlots::new();
-        let compiled = self
-            .root
-            .compile(dispatcher, &self.catalog, transaction, &mut slots)?;
+        let compiled = self.root.compile(
+            dispatcher,
+            &self.catalog,
+            transaction,
+            &mut slots,
+            parameters,
+        )?;
         Ok(stamp_output_names(compiled, &self.output_names))
     }
 }
@@ -199,6 +217,7 @@ impl PlanNode {
         catalog: &Arc<dyn Catalog>,
         transaction: &dyn CatalogTransaction,
         slots: &mut DynamicFilterSlots,
+        parameters: &BoundParameters,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         // Peephole: an unfiltered global MIN/MAX or COUNT(*) over a bare scan is
         // fully determined by table metadata (e.g. parquet row-group
@@ -225,16 +244,16 @@ impl PlanNode {
 
         let mut inputs = Vec::with_capacity(self.inputs.len());
         for input in &self.inputs {
-            inputs.push(input.compile(dispatcher, catalog, transaction, slots)?);
+            inputs.push(input.compile(dispatcher, catalog, transaction, slots, parameters)?);
         }
 
         match &self.operator {
             crate::Operator::Input(o) => o.compile(dispatcher, transaction, slots),
-            crate::Operator::Values(o) => o.compile(dispatcher),
+            crate::Operator::Values(o) => o.compile(dispatcher, parameters),
             crate::Operator::TableFunctionScan(o) => o.compile(dispatcher, transaction),
-            crate::Operator::Projection(o) => o.compile(inputs.remove(0)),
-            crate::Operator::Filter(o) => o.compile(inputs.remove(0)),
-            crate::Operator::Aggregate(o) => o.compile(inputs.remove(0)),
+            crate::Operator::Projection(o) => o.compile(inputs.remove(0), parameters),
+            crate::Operator::Filter(o) => o.compile(inputs.remove(0), parameters),
+            crate::Operator::Aggregate(o) => o.compile(inputs.remove(0), parameters),
             crate::Operator::OrderBy(o) => o.compile(inputs.remove(0)),
             crate::Operator::TopN(o) => o.compile(inputs.remove(0), slots),
             crate::Operator::Limit(o) => o.compile(inputs.remove(0)),
@@ -265,6 +284,10 @@ pub enum ExprResult {
     Array(ArrayRef),
     Scalar(Scalar<ArrayRef>),
 }
+
+/// Values supplied by a protocol Bind message, in `$1`, `$2`, ... order.
+/// Every entry is a typed, length-one Arrow scalar.
+pub type BoundParameters = [Scalar<ArrayRef>];
 
 impl ExprResult {
     pub fn as_datum(&self) -> &dyn Datum {

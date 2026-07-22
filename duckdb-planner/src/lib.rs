@@ -83,7 +83,7 @@ pub enum Error {
     Bridge(String),
 }
 
-/// Error returned by DuckDB when it cannot produce a plan for a query.
+/// Error returned by DuckDB when it cannot produce a logical plan for a query.
 #[derive(Debug, Error)]
 pub struct PlanningError {
     pub exception_message: String,
@@ -148,8 +148,18 @@ impl PlannerContext {
         }
 
         let ffi::ExtractPlanResult {
-            plan, output_names, ..
+            plan,
+            output_names,
+            parameter_type_ids,
+            ..
         } = result;
-        Ok(Plan::new(plan, output_names))
+        Ok(Plan::new(
+            plan,
+            output_names,
+            parameter_type_ids
+                .into_iter()
+                .map(LogicalTypeId::from_u8)
+                .collect(),
+        ))
     }
 }

@@ -74,7 +74,7 @@ impl Display for Compare {
 }
 
 impl Compare {
-    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
+    pub fn compile(&self, parameters: &compile::BoundParameters) -> Result<ExprFn, compile::Error> {
         let kernel: CmpKernel = match self.compare_type {
             CompareType::Equal => eq,
             CompareType::NotEqual => neq,
@@ -83,8 +83,8 @@ impl Compare {
             CompareType::LessEqual => lt_eq,
             CompareType::GreaterEqual => gt_eq,
         };
-        let left_builder = self.left.compile()?;
-        let right_builder = self.right.compile()?;
+        let left_builder = self.left.compile(parameters)?;
+        let right_builder = self.right.compile(parameters)?;
         Ok(Box::new(move || {
             let mut left_expr = left_builder();
             let mut right_expr = right_builder();

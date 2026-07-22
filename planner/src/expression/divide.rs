@@ -27,9 +27,9 @@ impl Display for Divide {
 }
 
 impl Divide {
-    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
-        let left_builder = self.left.compile()?;
-        let right_builder = self.right.compile()?;
+    pub fn compile(&self, parameters: &compile::BoundParameters) -> Result<ExprFn, compile::Error> {
+        let left_builder = self.left.compile(parameters)?;
+        let right_builder = self.right.compile(parameters)?;
         Ok(Box::new(move || {
             let mut left_expr = left_builder();
             let mut right_expr = right_builder();

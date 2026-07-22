@@ -538,7 +538,7 @@ fn in_list_compare_in_compiles_to_membership_mask() {
         values: vec![constant(-1), constant(6)],
     };
 
-    let mut eval = in_list.compile().unwrap()();
+    let mut eval = in_list.compile(&[]).unwrap()();
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new("ts", DataType::Int16, false)])),
         vec![Arc::new(Int16Array::from(vec![-1i16, 6, 3, 6])) as ArrayRef],

@@ -1,6 +1,15 @@
 use crate::common::*;
 use insta::assert_snapshot;
+use planner::operator::{ValuePointer, ValuesData};
+use planner::{Operator, PlanNode};
 use rstest::rstest;
+
+fn find_values(node: &PlanNode) -> Option<&ValuesData> {
+    if let Operator::Values(values) = &node.operator {
+        return Some(&values.data);
+    }
+    node.inputs.iter().find_map(find_values)
+}
 
 // A user `IN`/`EXISTS` subquery lowers to a semi-join, which pivot can't
 // execute. It must NOT be mistaken for the row-id semi-join DuckDB's late
@@ -156,6 +165,11 @@ fn values_produces_values_operator(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
         .plan("VALUES (1, 'one'), (2, 'two')")
         .unwrap();
+    let ValuesData::Literal { batch, .. } = find_values(&plan.root).expect("Values operator")
+    else {
+        panic!("literal VALUES should be cached as a RecordBatch")
+    };
+    assert_eq!((batch.num_rows(), batch.num_columns()), (2, 2));
     assert_snapshot!(plan.to_string(), @"
     Projection(col0:Int32, col1:Utf8)
       Values(rows: 2)
@@ -174,6 +188,42 @@ fn insert_values_produces_insert_and_values_operators(mut testing_planner: Testi
         Values(rows: 2)
           DummyScan
     ");
+}
+
+#[rstest]
+fn prepared_insert_values_are_column_major_parameter_pointers(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .plan(
+            "INSERT INTO example_table VALUES \
+             ($1, $2, $3, $4), ($5, $6, $7, $8)",
+        )
+        .unwrap();
+
+    assert_eq!(
+        plan.parameter_types,
+        vec![
+            planner::types::Type::Int32,
+            planner::types::Type::Int32,
+            planner::types::Type::Int32,
+            planner::types::Type::Utf8,
+            planner::types::Type::Int32,
+            planner::types::Type::Int32,
+            planner::types::Type::Int32,
+            planner::types::Type::Utf8,
+        ]
+    );
+    let ValuesData::Pointers { columns, .. } = find_values(&plan.root).expect("Values operator")
+    else {
+        panic!("prepared VALUES should retain direct parameter pointers")
+    };
+    assert_eq!(columns.len(), 4);
+    for (column_index, column) in columns.iter().enumerate() {
+        assert!(matches!(
+            column.as_slice(),
+            [ValuePointer::Parameter(first), ValuePointer::Parameter(second)]
+                if (*first, *second) == (column_index, column_index + 4)
+        ));
+    }
 }
 
 #[rstest]

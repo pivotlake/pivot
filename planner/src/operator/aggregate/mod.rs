@@ -69,6 +69,7 @@ impl Aggregate {
     pub fn compile(
         &self,
         input: RecordBatchOperatorSpec,
+        parameters: &crate::compile::BoundParameters,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         // Materialise every computed group key and aggregate argument (e.g. the
         // `column1 * column2` in `SUM(column1 * column2)`) into a leading
@@ -77,7 +78,7 @@ impl Aggregate {
         // ever read column indices, never run an expression. When nothing needs
         // materialising (the common all-plain-column case) the input and `self`
         // are reused as-is, with no projection and no clone.
-        match self.materialize_inputs(input)? {
+        match self.materialize_inputs(input, parameters)? {
             (input, Some(resolved)) => resolved.compile_resolved(input),
             (input, None) => self.compile_resolved(input),
         }

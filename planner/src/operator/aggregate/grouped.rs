@@ -100,6 +100,7 @@ impl Aggregate {
     pub(super) fn materialize_inputs(
         &self,
         input: RecordBatchOperatorSpec,
+        parameters: &crate::compile::BoundParameters,
     ) -> Result<(RecordBatchOperatorSpec, Option<Aggregate>), Error> {
         // The computed sub-expressions to materialise and their canonical column
         // types, group keys first then aggregate arguments.
@@ -140,7 +141,7 @@ impl Aggregate {
         }
 
         let shift = computed.len();
-        let input = project_leading_columns(input, &computed, &types)?;
+        let input = project_leading_columns(input, &computed, &types, parameters)?;
 
         // Draw the leading materialised columns in the same order they were
         // pushed: group keys first, then aggregate arguments. `next` walks them.
@@ -365,11 +366,12 @@ fn project_leading_columns(
     input: RecordBatchOperatorSpec,
     exprs: &[&Expression],
     types: &[Type],
+    parameters: &crate::compile::BoundParameters,
 ) -> Result<RecordBatchOperatorSpec, Error> {
     let builders: Arc<Vec<ExprFn>> = Arc::new(
         exprs
             .iter()
-            .map(|k| k.compile())
+            .map(|k| k.compile(parameters))
             .collect::<Result<_, _>>()?,
     );
     let targets: Arc<Vec<DataType>> = Arc::new(

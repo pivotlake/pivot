@@ -40,7 +40,7 @@ impl Display for RegexpJitReplace {
 }
 
 impl RegexpJitReplace {
-    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
+    pub fn compile(&self, parameters: &compile::BoundParameters) -> Result<ExprFn, compile::Error> {
         // Require JIT compilation up front: a pattern PCRE2 can't JIT-compile
         // fails the plan rather than running on a slower engine.
         build_jit_regex(&self.pattern).map_err(|source| {
@@ -52,7 +52,7 @@ impl RegexpJitReplace {
 
         let pattern = self.pattern.clone();
         let template = Arc::new(parse_replacement(&self.replacement));
-        let input_builder = self.input.compile()?;
+        let input_builder = self.input.compile(parameters)?;
 
         Ok(Box::new(move || {
             let template = template.clone();

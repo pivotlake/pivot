@@ -24,7 +24,7 @@ impl Display for Prefix {
 }
 
 impl Prefix {
-    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
+    pub fn compile(&self, parameters: &compile::BoundParameters) -> Result<ExprFn, compile::Error> {
         match self.haystack.as_ref() {
             Expression::Ref(r) if r.return_type == Type::Utf8 => {}
             expr => {
@@ -34,7 +34,7 @@ impl Prefix {
             }
         }
 
-        let haystack_builder = self.haystack.compile()?;
+        let haystack_builder = self.haystack.compile(parameters)?;
 
         // Extract the prefix string from the constant expression
         let prefix_str: String = match self.prefix.as_ref() {

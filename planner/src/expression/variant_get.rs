@@ -40,8 +40,8 @@ impl VariantGet {
         !matches!(t, Type::Variant)
     }
 
-    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
-        let input_builder = self.input.compile()?;
+    pub fn compile(&self, parameters: &compile::BoundParameters) -> Result<ExprFn, compile::Error> {
+        let input_builder = self.input.compile(parameters)?;
         let segments: Arc<[String]> = self.path.clone().into();
         // A typed read asks the kernel directly for the pivot type's physical
         // arrow column.
@@ -102,8 +102,8 @@ pub struct VariantToJson {
 }
 
 impl VariantToJson {
-    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
-        let input_builder = self.input.compile()?;
+    pub fn compile(&self, parameters: &compile::BoundParameters) -> Result<ExprFn, compile::Error> {
+        let input_builder = self.input.compile(parameters)?;
         Ok(Box::new(move || {
             let mut input_expr = input_builder();
             Box::new(move |batch: &RecordBatch| {

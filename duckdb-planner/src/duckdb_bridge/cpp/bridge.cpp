@@ -23,6 +23,7 @@
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_parameter_expression.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
@@ -147,7 +148,8 @@ PlanHandle::~PlanHandle() {
 // captured without patching the bundled DuckDB.
 static duckdb::unique_ptr<duckdb::LogicalOperator>
 extract_plan_with_names(duckdb::Connection &con, const std::string &query,
-                        duckdb::vector<std::string> &result_names) {
+                        duckdb::vector<std::string> &result_names,
+                        duckdb::vector<duckdb::LogicalType> &parameter_types) {
 	auto statements = con.ExtractStatements(query);
 	if (statements.size() != 1) {
 		throw duckdb::InvalidInputException("ExtractPlan can only prepare a single statement");
@@ -157,14 +159,52 @@ extract_plan_with_names(duckdb::Connection &con, const std::string &query,
 	context.RunFunctionInTransaction([&]() {
 		duckdb::Planner planner(context);
 		planner.CreatePlan(std::move(statements[0]));
+		if (!planner.plan || !planner.properties.bound_all_parameters) {
+			throw duckdb::ParameterNotResolvedException();
+		}
 		// The binder resolves the client-facing result column names before
 		// optimization rewrites the plan; capture them while still intact.
 		result_names = planner.names;
+		parameter_types.reserve(planner.properties.parameter_count);
+		for (duckdb::idx_t i = 0; i < planner.properties.parameter_count; i++) {
+			auto entry = planner.value_map.find(std::to_string(i + 1));
+			parameter_types.push_back(entry == planner.value_map.end()
+			                              ? duckdb::LogicalType(duckdb::LogicalTypeId::UNKNOWN)
+			                              : entry->second->return_type);
+		}
 		plan = std::move(planner.plan);
 		if (context.config.enable_optimizer) {
 			duckdb::Optimizer optimizer(*planner.binder, context);
 			plan = optimizer.Optimize(std::move(plan));
 		}
+		// DuckDB invalidates parameters in scan predicates when a table advertises
+		// filter pushdown, because its own executor would rebind the statement.
+		// Pivot deliberately retains this optimized tree instead. Restore the
+		// already-inferred types so the parameter holes remain executable in the
+		// cached plan (the pushdown callback declines parameterized predicates).
+		class RestoreParameterTypes : public duckdb::LogicalOperatorVisitor {
+		public:
+			explicit RestoreParameterTypes(const duckdb::vector<duckdb::LogicalType> &types) : types(types) {
+			}
+
+		protected:
+			duckdb::unique_ptr<duckdb::Expression>
+			VisitReplace(duckdb::BoundParameterExpression &expr,
+			             duckdb::unique_ptr<duckdb::Expression> *) override {
+				auto index = std::stoull(expr.identifier);
+				if (index == 0 || index > types.size()) {
+					throw duckdb::InternalException("Invalid prepared parameter identifier: %s", expr.identifier);
+				}
+				expr.return_type = types[index - 1];
+				expr.parameter_data->return_type = types[index - 1];
+				return nullptr;
+			}
+
+		private:
+			const duckdb::vector<duckdb::LogicalType> &types;
+		};
+		RestoreParameterTypes restore_parameters(parameter_types);
+		restore_parameters.VisitOperator(*plan);
 		plan->ResolveOperatorTypes();
 		duckdb::ColumnBindingResolver resolver;
 		resolver.Verify(*plan);
@@ -193,6 +233,7 @@ ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
                                const TransactionContext &transaction) {
 	duckdb::unique_ptr<duckdb::LogicalOperator> plan;
 	duckdb::vector<std::string> name_list;
+	duckdb::vector<duckdb::LogicalType> parameter_types;
 	std::optional<ExtractPlanResult> error;
 	CurrentTransactionScope transaction_scope(PivotStorageInfo::Get(*ctx.db.instance), transaction);
 
@@ -200,7 +241,7 @@ ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
 		std::string query_str(query.data(), query.size());
 		// The result column names DuckDB would hand a client, in select order
 		// (e.g. `["hour", "count_star()"]` for `SELECT f(t) AS hour, COUNT(*)`).
-		plan = extract_plan_with_names(ctx.con, query_str, name_list);
+		plan = extract_plan_with_names(ctx.con, query_str, name_list, parameter_types);
 		// Rewrite DuckDB's column *bindings* (table_index, column_index) into
 		// positional BoundReference indices against each operator's actual child
 		// output. This is the standard resolution DuckDB runs before execution;
@@ -231,6 +272,9 @@ ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
 	result.plan = std::move(handle);
 	for (auto &name : name_list) {
 		result.output_names.push_back(rust::String::lossy(name));
+	}
+	for (auto &type : parameter_types) {
+		result.parameter_type_ids.push_back(static_cast<uint8_t>(type.id()));
 	}
 	return result;
 }
@@ -753,6 +797,10 @@ bool expr_has_alias(const Expression &expr) {
 
 rust::String expr_alias(const Expression &expr) {
 	return rust::String::lossy(expr.GetAlias());
+}
+
+rust::String expr_parameter_identifier(const Expression &expr) {
+	return rust::String::lossy(as_expr<duckdb::BoundParameterExpression>(expr).identifier);
 }
 
 const Value &expr_constant(const Expression &expr) {

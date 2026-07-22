@@ -79,6 +79,8 @@ pub mod ffi {
         /// in select order (e.g. `["hour", "count_star()"]`). Empty when the
         /// bridge could not recover them.
         pub output_names: Vec<String>,
+        /// Binder-resolved parameter types in `$1`, `$2`, ... order.
+        pub parameter_type_ids: Vec<u8>,
     }
 
     extern "Rust" {
@@ -270,6 +272,9 @@ pub mod ffi {
         fn expr_return_type(expr: &Expression) -> u8;
         fn expr_has_alias(expr: &Expression) -> bool;
         fn expr_alias(expr: &Expression) -> String;
+
+        // BoundParameterExpression
+        fn expr_parameter_identifier(expr: &Expression) -> String;
 
         // BoundReferenceExpression / BoundColumnRefExpression
         fn expr_ref_index(expr: &Expression) -> usize;

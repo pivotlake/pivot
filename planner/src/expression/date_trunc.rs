@@ -25,7 +25,7 @@ impl Display for DateTrunc {
 }
 
 impl DateTrunc {
-    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
+    pub fn compile(&self, parameters: &compile::BoundParameters) -> Result<ExprFn, compile::Error> {
         // A timestamp is stored as Int64 epoch *seconds*, so truncating to a unit
         // is flooring to that many seconds. `M = (t / secs) * secs`.
         let secs: i64 = match self.unit.as_str() {
@@ -42,7 +42,7 @@ impl DateTrunc {
                 )));
             }
         };
-        let source_builder = self.source.compile()?;
+        let source_builder = self.source.compile(parameters)?;
         Ok(Box::new(move || {
             let mut source_expr = source_builder();
             Box::new(move |batch: &RecordBatch| {

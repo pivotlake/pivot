@@ -6,7 +6,10 @@
 //! [`expression`](super::expression).
 
 use std::any::Any;
+use std::sync::Arc;
 
+use arrow_array::{Array, RecordBatch, RecordBatchOptions, Scalar};
+use arrow_schema::{Field, Schema};
 use duckdb_planner::DuckDBTable;
 use duckdb_planner::catalog_provider::OptionalTableWrapper;
 use duckdb_planner::duckdb_bridge::duckdb_types::LimitNodeType;
@@ -23,7 +26,8 @@ use crate::catalog::{Column, CreateTableRequest, DuckDBTableAdapter, Table};
 use crate::expression::{Error as ExpressionError, Expression};
 use crate::operator::{
     Aggregate, CreateTable, Error as OperatorError, Filter, Input, Insert, Limit, OrderBy,
-    OrderByNode, Projection, SetVariable, TableFunctionScan, TopN, Values,
+    OrderByNode, Projection, SetVariable, TableFunctionScan, TopN, ValuePointer, Values,
+    ValuesData,
 };
 use crate::types::type_from_logical;
 
@@ -47,8 +51,131 @@ impl Values {
                     .collect::<Result<Vec<_>, _>>()
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Values { rows })
+        let types = rows
+            .first()
+            .map(|row| {
+                row.iter()
+                    .map(Expression::result_type)
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+
+        if rows.iter().flatten().all(is_literal_value) {
+            return Ok(Values {
+                data: ValuesData::Literal {
+                    batch: build_literal_values(&rows)?,
+                    types,
+                },
+            });
+        }
+
+        // The bulk prepared path accepts parameters (possibly under DuckDB's
+        // target cast) and constants. Anything more general keeps the regular
+        // expression path.
+        let input = static_input()?;
+        let cells = rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|expression| value_pointer(expression, &input))
+                    .collect::<Result<Option<Vec<_>>, _>>()
+            })
+            .collect::<Result<Option<Vec<_>>, _>>()?;
+        if let Some(cells) = cells.filter(|cells| {
+            cells
+                .iter()
+                .flatten()
+                .any(|cell| matches!(cell, ValuePointer::Parameter(_)))
+        }) {
+            let mut columns = (0..types.len())
+                .map(|_| Vec::with_capacity(cells.len()))
+                .collect::<Vec<_>>();
+            for row in cells {
+                for (column, cell) in columns.iter_mut().zip(row) {
+                    column.push(cell);
+                }
+            }
+            return Ok(Values {
+                data: ValuesData::Pointers { columns, types },
+            });
+        }
+
+        Ok(Values {
+            data: ValuesData::Expressions { rows, types },
+        })
     }
+}
+
+fn value_pointer(
+    expression: &Expression,
+    input: &RecordBatch,
+) -> Result<Option<ValuePointer>, OperatorError> {
+    Ok(match expression {
+        Expression::Parameter(parameter) => Some(ValuePointer::Parameter(parameter.index)),
+        Expression::Cast(cast) => match value_pointer(&cast.source, input)? {
+            Some(ValuePointer::Parameter(index)) => Some(ValuePointer::Parameter(index)),
+            Some(ValuePointer::Constant(_)) => Some(ValuePointer::Constant(Scalar::new(
+                evaluate_static_value(expression, input)?,
+            ))),
+            None => None,
+        },
+        Expression::Constant(value) => Some(ValuePointer::Constant(value.clone())),
+        _ => None,
+    })
+}
+
+fn is_literal_value(expression: &Expression) -> bool {
+    match expression {
+        Expression::Constant(_) => true,
+        Expression::Cast(cast) => is_literal_value(&cast.source),
+        _ => false,
+    }
+}
+
+fn static_input() -> Result<RecordBatch, OperatorError> {
+    Ok(RecordBatch::try_new_with_options(
+        Arc::new(Schema::empty()),
+        Vec::new(),
+        &RecordBatchOptions::new().with_row_count(Some(1)),
+    )
+    .map_err(crate::compile::Error::from)?)
+}
+
+fn evaluate_static_value(
+    expression: &Expression,
+    input: &RecordBatch,
+) -> Result<arrow_array::ArrayRef, OperatorError> {
+    Ok(expression.compile(&[])?.as_ref()()(&input).into_array(1))
+}
+
+fn build_literal_values(rows: &[Vec<Expression>]) -> Result<RecordBatch, OperatorError> {
+    let input = static_input()?;
+    let column_count = rows.first().map_or(0, Vec::len);
+    let mut columns = (0..column_count)
+        .map(|_| Vec::with_capacity(rows.len()))
+        .collect::<Vec<_>>();
+    for row in rows {
+        for (column, expression) in columns.iter_mut().zip(row) {
+            column.push(evaluate_static_value(expression, &input)?);
+        }
+    }
+    let columns = columns
+        .iter()
+        .map(|values| {
+            let refs = values
+                .iter()
+                .map(|value| value.as_ref())
+                .collect::<Vec<&dyn Array>>();
+            arrow::compute::concat(&refs).map_err(crate::compile::Error::from)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let fields = columns
+        .iter()
+        .map(|column| Field::new("", column.data_type().clone(), true))
+        .collect::<Vec<_>>();
+    Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(crate::compile::Error::from)?)
 }
 
 impl Insert {

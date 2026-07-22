@@ -25,6 +25,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 sysinfo = { workspace = true }
+chrono = "0.4"
+rust_decimal = "1"
 # Only pulled in by the `perf` feature, for SIGINT-ing the `perf record` child
 # so it flushes its report (a plain `Child::kill` would SIGKILL and lose it).
 libc = { workspace = true, optional = true }

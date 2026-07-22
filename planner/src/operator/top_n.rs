@@ -52,7 +52,7 @@ impl TopN {
                 let descending = matches!(node.direction, OrderByDirection::Desc);
                 Ok(DispatchOrderBy::new(col, descending, false))
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, Error>>()?;
         // If DuckDB's Top-N optimizer marked this node as a dynamic-filter
         // producer, hand it the shared slot (minted fresh per compile, shared
         // with the consumer scan by `slot_id`) so it publishes its running

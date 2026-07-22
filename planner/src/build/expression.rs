@@ -16,15 +16,15 @@ use duckdb_planner::handle::{
     AggregateFunc as AggregateFuncHandle, Between as BetweenHandle, Case as CaseHandle,
     Cast as CastHandle, Compare as CompareHandle, Conjunction as ConjunctionHandle,
     Expression as DuckExpression, Function as FunctionHandle, InList as InListHandle,
-    Not as NotHandle, Ref as RefHandle,
+    Not as NotHandle, Parameter as ParameterHandle, Ref as RefHandle,
 };
 use duckdb_planner::{Expr, LogicalTypeId, ScalarValue};
 
 use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Conjunction,
     ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide, Error,
-    Expression, Function, InList, IntervalArithmetic, Length, Not, NumericAggregate, Prefix, Ref,
-    RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
+    Expression, Function, InList, IntervalArithmetic, Length, Not, NumericAggregate, Parameter,
+    Prefix, Ref, RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
 
@@ -36,6 +36,7 @@ impl Expression {
     pub(crate) fn from_handle(e: Expr<'_>) -> Result<Expression, Error> {
         Ok(match e.expression() {
             DuckExpression::Ref(r) => Expression::Ref(Ref::from_handle(r)?),
+            DuckExpression::Parameter(p) => Expression::Parameter(Parameter::from_handle(p)?),
             DuckExpression::Compare(c) => Expression::Compare(Compare::from_handle(c)?),
             DuckExpression::Between(b) => Expression::Between(Between::from_handle(b)?),
             DuckExpression::Constant(c) => Expression::Constant(build_scalar_value(c.value())?),
@@ -49,6 +50,15 @@ impl Expression {
             DuckExpression::Not(n) => Expression::Not(Not::from_handle(n)?),
             DuckExpression::Cast(c) => Cast::from_handle(c)?,
             DuckExpression::Unsupported(t) => return Err(Error::UnsupportedExpressionType(t)),
+        })
+    }
+}
+
+impl Parameter {
+    pub(crate) fn from_handle(view: ParameterHandle<'_>) -> Result<Parameter, Error> {
+        Ok(Parameter {
+            index: view.index(),
+            return_type: type_from_logical(view.return_type())?,
         })
     }
 }

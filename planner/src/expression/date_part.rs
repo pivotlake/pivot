@@ -179,13 +179,13 @@ impl Display for DatePart {
 }
 
 impl DatePart {
-    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
+    pub fn compile(&self, parameters: &compile::BoundParameters) -> Result<ExprFn, compile::Error> {
         // A timestamp is stored as Int64 epoch *seconds* (UTC), so every part is a
         // pure integer computation. Euclidean div/rem keep the time-of-day and
         // calendar fields well-defined for pre-epoch (negative) timestamps,
         // matching DuckDB's `extract(<part> FROM ...)`.
         let kind = self.kind;
-        let source_builder = self.source.compile()?;
+        let source_builder = self.source.compile(parameters)?;
         Ok(Box::new(move || {
             let mut source_expr = source_builder();
             Box::new(move |batch: &RecordBatch| {
