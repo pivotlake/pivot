@@ -155,6 +155,20 @@ impl<T: ArrowPrimitiveType> ArrayBuilder for PrimitiveBuilder<T> {
     }
 }
 
+pub mod accumulator;
+pub mod take;
+
+/// Hand a slab's first `byte_len` bytes to Arrow as a zero-copy [`Buffer`].
+/// The slab rides in the buffer's allocation `Arc`, so the memory returns to
+/// the pool when the last downstream reference drops.
+pub(crate) fn slab_into_buffer<T>(slab: SlabBuffer<T>, byte_len: usize) -> Buffer {
+    let slab = slab.into_slab();
+    let ptr = NonNull::new(slab.ptr).unwrap();
+    // SAFETY: the slab owns at least `byte_len` bytes at `ptr` and lives as
+    // long as the returned buffer via the custom-allocation `Arc`.
+    unsafe { Buffer::from_custom_allocation(ptr, byte_len, Arc::new(slab)) }
+}
+
 /// A validity bitmap (`1` = present/valid) built run-wise on slab memory, the
 /// slab-array analog of arrow's `BooleanBufferBuilder`. A nullable decoded
 /// column's null buffer lives on the same pre-faulted, accounted slab memory as
@@ -204,10 +218,7 @@ impl ValidityBuilder {
 
     /// Hand the bitmap to Arrow as a zero-copy slab-backed [`Buffer`].
     pub fn into_buffer(self) -> Buffer {
-        let byte_len = self.len.div_ceil(8);
-        let slab = self.bits.into_slab();
-        let ptr = NonNull::new(slab.ptr).unwrap();
-        unsafe { Buffer::from_custom_allocation(ptr, byte_len, Arc::new(slab)) }
+        slab_into_buffer(self.bits, self.len.div_ceil(8))
     }
 }
 
