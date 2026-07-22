@@ -149,6 +149,17 @@ bool lo_is_late_materialization_join(const LogicalOperator &op);
 size_t lo_late_materialization_column_count(const LogicalOperator &op);
 size_t lo_late_materialization_column(const LogicalOperator &op, size_t index);
 
+// ---- ComparisonJoin: general accessors ----
+uint8_t lo_join_type(const LogicalOperator &op);
+size_t lo_join_condition_count(const LogicalOperator &op);
+const Expression &lo_join_condition_left(const LogicalOperator &op, size_t index);
+const Expression &lo_join_condition_right(const LogicalOperator &op, size_t index);
+uint8_t lo_join_condition_comparison(const LogicalOperator &op, size_t index);
+size_t lo_join_left_projection_map_count(const LogicalOperator &op);
+size_t lo_join_left_projection_map_index(const LogicalOperator &op, size_t index);
+size_t lo_join_right_projection_map_count(const LogicalOperator &op);
+size_t lo_join_right_projection_map_index(const LogicalOperator &op, size_t index);
+
 // ---- ExpressionList ----
 size_t expr_list_count(const ExpressionList &list);
 const Expression &expr_list_get(const ExpressionList &list, size_t index);

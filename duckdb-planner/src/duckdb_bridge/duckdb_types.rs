@@ -10,6 +10,7 @@ include_cpp! {
     #include "duckdb/common/types.hpp"
     #include "duckdb/common/enums/expression_type.hpp"
     #include "duckdb/common/enums/order_type.hpp"
+    #include "duckdb/common/enums/join_type.hpp"
     #include "duckdb/planner/table_filter.hpp"
     #include "duckdb/planner/bound_result_modifier.hpp"
     safety!(unsafe)
@@ -20,9 +21,11 @@ include_cpp! {
     generate!("duckdb::LogicalTypeId")
     generate!("duckdb::TableFilterType")
     generate!("duckdb::LimitNodeType")
+    generate!("duckdb::JoinType")
 }
 
 pub use ffi::duckdb::ExpressionType;
+pub use ffi::duckdb::JoinType;
 pub use ffi::duckdb::LimitNodeType;
 pub use ffi::duckdb::LogicalOperatorType;
 pub use ffi::duckdb::LogicalTypeId;
@@ -64,6 +67,7 @@ macro_rules! impl_duckdb_enum {
 impl_duckdb_enum!(
     LogicalOperatorType,
     ExpressionType,
+    JoinType,
     LimitNodeType,
     LogicalTypeId,
     OrderType,

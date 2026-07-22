@@ -18,6 +18,7 @@ use std::collections::HashMap;
 
 use duckdb_planner::BoundLogicalType;
 use duckdb_planner::LogicalOp;
+use duckdb_planner::duckdb_bridge::duckdb_types::{ExpressionType, JoinType};
 use duckdb_planner::handle::{
     ComparisonJoin as ComparisonJoinView, DynamicFilterRef, Operator as DuckOperator,
     TableScan as TableScanView, rowid_column_id,
@@ -28,7 +29,7 @@ use crate::dynamic_filter::DynamicFilter;
 use crate::expression::{Error as ExpressionError, Expression, Function, Ref, VariantToJson};
 use crate::operator::{
     Aggregate, CreateTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Insert,
-    Limit, Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan, TopN,
+    Join, Limit, Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan, TopN,
     Values,
 };
 use crate::plan::{self, PlanNode};
@@ -178,7 +179,10 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         // No view to construct from: these carry no kind-specific payload.
         DuckOperator::DummyScan => Operator::DummyScan(DummyScan),
         DuckOperator::Explain => Operator::Explain(Explain),
-        DuckOperator::ComparisonJoin(_) | DuckOperator::Unsupported => {
+        DuckOperator::ComparisonJoin(join) => {
+            return build_join(op, join, inputs);
+        }
+        DuckOperator::Unsupported => {
             return Err(OperatorError::Unsupported(format!(
                 "Unsupported operator type: {}",
                 op.name()
@@ -221,6 +225,97 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
     }
 
     Ok(node)
+}
+
+/// Translate a general comparison join into pivot's [`Join`]. The supported
+/// shape is an INNER join with a single equality condition whose sides are
+/// plain column refs of a key type the dispatch join handles (`Int64`);
+/// anything else reports the specific gap. The probe is DuckDB's left child
+/// and the build its right, matching its hash-join convention (the cost model
+/// puts the smaller relation on the right).
+///
+/// DuckDB's join projection maps (which trim the join's output to the columns
+/// actually used above it) are folded into the join's own output lists, so
+/// the dispatch probe never materializes trimmed columns. An empty map means
+/// every column of that side is kept. (DuckDB also emits an empty map when NO
+/// column of a side is referenced above the join, so a bare `COUNT(*)` join
+/// still materializes both keys; distinguishing that case needs information
+/// the plan does not carry.)
+fn build_join(
+    op: LogicalOp<'_>,
+    join: ComparisonJoinView<'_>,
+    inputs: Vec<PlanNode>,
+) -> Result<PlanNode, OperatorError> {
+    if join.join_type() != JoinType::INNER {
+        return Err(OperatorError::Unsupported(format!(
+            "Unsupported join type: {:?}",
+            join.join_type()
+        )));
+    }
+    let mut conditions = join.conditions();
+    let condition = match (conditions.next(), conditions.next()) {
+        (Some(condition), None) => condition,
+        _ => {
+            return Err(OperatorError::Unsupported(
+                "joins must have exactly one equality condition".to_string(),
+            ));
+        }
+    };
+    if condition.comparison != ExpressionType::COMPARE_EQUAL {
+        return Err(OperatorError::Unsupported(format!(
+            "Unsupported join comparison type: {:?}",
+            condition.comparison
+        )));
+    }
+
+    let probe_key = join_key_ref(Expression::from_handle(condition.left)?)?;
+    let build_key = join_key_ref(Expression::from_handle(condition.right)?)?;
+
+    let probe_types = inputs[0].output_types()?;
+    let build_types = inputs[1].output_types()?;
+    let left_map: Vec<usize> = join.left_projection_map().collect();
+    let right_map: Vec<usize> = join.right_projection_map().collect();
+
+    // Refs above the join were resolved against the trimmed output (kept left
+    // columns, then kept right columns), which is exactly the layout the join
+    // emits with these lists.
+    let probe_output = if left_map.is_empty() {
+        (0..probe_types.len()).collect()
+    } else {
+        left_map
+    };
+    let build_output = if right_map.is_empty() {
+        (0..build_types.len()).collect()
+    } else {
+        right_map
+    };
+    Ok(PlanNode {
+        name: op.name(),
+        inputs,
+        operator: Operator::Join(Join {
+            probe_key,
+            build_key,
+            probe_output,
+            build_output,
+        }),
+    })
+}
+
+/// The column ref a join key must be, with the key type restriction the
+/// dispatch join imposes.
+fn join_key_ref(key: Expression) -> Result<usize, OperatorError> {
+    let Expression::Ref(key) = key else {
+        return Err(OperatorError::Unsupported(format!(
+            "join keys must be plain columns, got: {key:?}"
+        )));
+    };
+    if key.return_type != Type::Int64 {
+        return Err(OperatorError::Unsupported(format!(
+            "Unsupported join key type: {:?}",
+            key.return_type
+        )));
+    }
+    Ok(key.column_idx)
 }
 
 /// A scan's projected output columns (and a filter's `projection_map`), each a
