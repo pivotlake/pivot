@@ -336,3 +336,146 @@ async fn query_against_unknown_table_errors(#[future] conn: Conn) {
         "expected a structured pgwire error, got: {err}",
     );
 }
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn extended_select_binds_a_parameter(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_extended", dir.path()).await;
+
+    let rows = conn
+        .query(
+            "SELECT id, name FROM people_extended WHERE id = $1",
+            &[&2i64],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i64>(0), 2);
+    assert_eq!(rows[0].get::<_, String>(1), "bob");
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn extended_statement_describes_and_reuses_one_plan(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_prepared", dir.path()).await;
+
+    let statement = conn
+        .prepare("SELECT name FROM people_prepared WHERE id = $1")
+        .await
+        .unwrap();
+    let first = conn.query(&statement, &[&1i64]).await.unwrap();
+    let second = conn.query(&statement, &[&3i64]).await.unwrap();
+
+    assert_eq!(statement.params(), &[tokio_postgres::types::Type::INT8]);
+    assert_eq!(statement.columns().len(), 1);
+    assert_eq!(statement.columns()[0].name(), "name");
+    assert_eq!(first[0].get::<_, String>(0), "alice");
+    assert_eq!(second[0].get::<_, String>(0), "carol");
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn extended_insert_binds_value_rows(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_param_insert", dir.path()).await;
+
+    let inserted = conn
+        .execute(
+            "INSERT INTO people_param_insert VALUES ($1, $2), ($3, $4)",
+            &[&6i64, &"frank", &7i64, &"grace"],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(inserted, 2);
+    let rows = select_rows(
+        &conn,
+        "SELECT id, name FROM people_param_insert WHERE id > 5 ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("6".into()), Some("frank".into())],
+            vec![Some("7".into()), Some("grace".into())],
+        ],
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn extended_insert_rejects_a_null_parameter(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_null_insert", dir.path()).await;
+
+    let error = conn
+        .execute(
+            "INSERT INTO people_null_insert VALUES ($1, $2)",
+            &[&8i64, &Option::<&str>::None],
+        )
+        .await
+        .unwrap_err();
+
+    // Columns are non-nullable, so the NULL is rejected at bind time with a
+    // clean error, and the session (and worker pool) stays usable.
+    let message = error
+        .as_db_error()
+        .expect("a structured pgwire error")
+        .message();
+    assert!(message.contains("NULL"), "got: {message}");
+    let rows = select_rows(&conn, "SELECT COUNT(*) FROM people_null_insert").await;
+    assert_eq!(rows, vec![vec![Some("3".into())]]);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn extended_query_without_parameters_encodes_binary_results(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_binary", dir.path()).await;
+
+    let rows = conn
+        .query("SELECT COUNT(*) FROM people_binary", &[])
+        .await
+        .unwrap();
+
+    assert_eq!(rows[0].get::<_, i64>(0), 3);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn extended_timestamp_result_decodes_in_binary(#[future] conn: Conn) {
+    let rows = conn
+        .query("SELECT make_timestamp($1)", &[&90i64])
+        .await
+        .unwrap();
+
+    let ts: chrono::NaiveDateTime = rows[0].get(0);
+    assert_eq!(ts.to_string(), "1970-01-01 00:01:30");
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn extended_parse_of_invalid_sql_errors(#[future] conn: Conn) {
+    let err = conn
+        .prepare("SELECT id FROM table_that_is_not_there")
+        .await
+        .unwrap_err();
+
+    assert!(
+        err.to_string()
+            .to_lowercase()
+            .contains("table_that_is_not_there")
+            || err.code().is_some(),
+        "expected a structured pgwire error, got: {err}",
+    );
+}

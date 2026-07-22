@@ -270,6 +270,18 @@ pub mod ffi {
         fn expr_return_type(expr: &Expression) -> u8;
         fn expr_has_alias(expr: &Expression) -> bool;
         fn expr_alias(expr: &Expression) -> String;
+        /// Whether the expression tree contains a `$n` placeholder anywhere
+        /// (DuckDB's own `Expression::HasParameter`).
+        fn expr_has_parameter(expr: &Expression) -> bool;
+
+        // BoundParameterExpression
+        /// The placeholder's identifier: `"1"` for a positional `$1`, the name
+        /// for a named parameter.
+        fn expr_parameter_identifier(expr: &Expression) -> String;
+        /// The type the binder resolved for the placeholder (read from its
+        /// shared parameter data, where resolution lands; the expression's own
+        /// return type can stay SQLNULL).
+        fn expr_parameter_type(expr: &Expression) -> u8;
 
         // BoundReferenceExpression / BoundColumnRefExpression
         fn expr_ref_index(expr: &Expression) -> usize;

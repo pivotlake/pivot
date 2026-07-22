@@ -155,6 +155,7 @@ uint8_t expr_type(const Expression &expr);
 uint8_t expr_return_type(const Expression &expr);
 bool expr_has_alias(const Expression &expr);
 rust::String expr_alias(const Expression &expr);
+bool expr_has_parameter(const Expression &expr);
 
 const Value &expr_constant(const Expression &expr);
 
@@ -176,6 +177,9 @@ int64_t value_timestamp(const Value &v);
 int32_t value_interval_months(const Value &v);
 int32_t value_interval_days(const Value &v);
 int64_t value_interval_micros(const Value &v);
+
+rust::String expr_parameter_identifier(const Expression &expr);
+uint8_t expr_parameter_type(const Expression &expr);
 
 size_t expr_ref_index(const Expression &expr);
 size_t expr_columnref_index(const Expression &expr);

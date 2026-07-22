@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The single-row source under a `FROM`-less `SELECT`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DummyScan;
 
 impl fmt::Display for DummyScan {

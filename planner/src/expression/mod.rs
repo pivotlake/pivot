@@ -26,6 +26,7 @@ mod in_list;
 mod interval;
 mod length;
 mod not;
+mod parameter;
 mod prefix;
 mod reference;
 mod regexp;
@@ -49,6 +50,7 @@ pub use in_list::InList;
 pub use interval::IntervalArithmetic;
 pub use length::Length;
 pub use not::Not;
+pub use parameter::Parameter;
 pub use prefix::Prefix;
 pub use reference::Ref;
 pub use regexp::RegexpReplace;
@@ -83,6 +85,8 @@ pub enum Error {
     UnsupportedInterval(String),
     #[error("Unsupported expression type: {0:?}")]
     UnsupportedExpressionType(ExpressionType),
+    #[error("Unsupported parameter identifier: ${0} (only positional parameters are supported)")]
+    UnsupportedParameterIdentifier(String),
 }
 
 /// Format an arrow `Scalar<ArrayRef>` constant as `value:Type` for plan
@@ -104,6 +108,9 @@ pub enum Expression {
     Compare(Compare),
     Between(Between),
     Constant(Scalar<ArrayRef>),
+    /// A prepared-statement placeholder (`$1`): a typed hole filled with a
+    /// constant by [`Plan::bind_parameters`](crate::Plan::bind_parameters).
+    Parameter(Parameter),
     AggregateFunc(AggregateFunc),
     Function(Function),
     InList(InList),
@@ -119,7 +126,7 @@ impl Expression {
     /// evaluating it pays for the row gather (see the `Filter` operator).
     pub fn count_kernels(&self) -> usize {
         match self {
-            Expression::Ref(_) | Expression::Constant(_) => 0,
+            Expression::Ref(_) | Expression::Constant(_) | Expression::Parameter(_) => 0,
             Expression::Compare(c) => 1 + c.left.count_kernels() + c.right.count_kernels(),
             Expression::Between(b) => 2 + b.input.count_kernels(),
             Expression::AggregateFunc(_) => 1,
@@ -153,6 +160,8 @@ impl Expression {
             Expression::Ref(r) => Ok(r.return_type.clone()),
             Expression::Constant(s) => types::type_from_physical(s.get().0.data_type())
                 .ok_or_else(|| compile::Error::IndeterminateResultType(self.clone())),
+            // A parameter carries the type the binder inferred for it.
+            Expression::Parameter(p) => Ok(p.return_type.clone()),
             // Comparisons and the boolean combinators all yield booleans.
             Expression::Compare(_)
             | Expression::Between(_)
@@ -181,6 +190,7 @@ impl Expression {
                 }))
             }
             Expression::Function(f) => f.compile(),
+            Expression::Parameter(p) => p.compile(),
             Expression::Between(b) => b.compile(),
             Expression::InList(i) => i.compile(),
             Expression::Conjunction(c) => c.compile(),
@@ -192,6 +202,74 @@ impl Expression {
     }
 }
 
+/// Generates [`Expression::children`] and [`Expression::children_mut`] from one
+/// body, so the per-variant child structure is declared exactly once. Every
+/// child is either a `Box<Expression>` (read via `$as_box`: `as_ref`/`as_mut`)
+/// or a `Vec<Expression>` (read via `$iter`: `iter`/`iter_mut`).
+macro_rules! expression_children {
+    ($self:expr, $as_box:ident, $iter:ident) => {{
+        use $crate::expression::{AggregateFunc, Function};
+        match $self {
+            Expression::Ref(_) | Expression::Constant(_) | Expression::Parameter(_) => Vec::new(),
+            Expression::Compare(c) => vec![c.left.$as_box(), c.right.$as_box()],
+            Expression::Between(b) => {
+                vec![b.input.$as_box(), b.lower.$as_box(), b.upper.$as_box()]
+            }
+            Expression::InList(l) => std::iter::once(l.input.$as_box())
+                .chain(l.values.$iter())
+                .collect(),
+            Expression::Conjunction(c) => c.children.$iter().collect(),
+            Expression::Case(c) => c
+                .checks
+                .$iter()
+                .flat_map(|check| [check.when.$as_box(), check.then.$as_box()])
+                .chain(std::iter::once(c.else_expr.$as_box()))
+                .collect(),
+            Expression::Not(n) => vec![n.input.$as_box()],
+            Expression::Cast(c) => vec![c.source.$as_box()],
+            Expression::AggregateFunc(aggregate) => match aggregate {
+                AggregateFunc::CountStar(c) => c.params.$iter().collect(),
+                AggregateFunc::Sum(a)
+                | AggregateFunc::Avg(a)
+                | AggregateFunc::Min(a)
+                | AggregateFunc::Max(a)
+                | AggregateFunc::Count(a)
+                | AggregateFunc::CountDistinct(a) => vec![a.argument.$as_box()],
+            },
+            Expression::Function(function) => match function {
+                Function::Contains(c) => vec![c.needle.$as_box(), c.haystack.$as_box()],
+                Function::Prefix(p) => vec![p.haystack.$as_box(), p.prefix.$as_box()],
+                Function::Arithmetic(a) => vec![a.left.$as_box(), a.right.$as_box()],
+                Function::Divide(d) => vec![d.left.$as_box(), d.right.$as_box()],
+                Function::Length(l) => vec![l.input.$as_box()],
+                Function::RegexpReplace(r) => vec![r.input.$as_box()],
+                Function::RegexpJitReplace(r) => vec![r.input.$as_box()],
+                Function::DateTrunc(d) => vec![d.source.$as_box()],
+                Function::DatePart(d) => vec![d.source.$as_box()],
+                Function::IntervalArithmetic(i) => vec![i.operand.$as_box()],
+                Function::TemporalConvert(c) => vec![c.source.$as_box()],
+                Function::VariantGet(v) => vec![v.input.$as_box()],
+                Function::VariantToJson(v) => vec![v.input.$as_box()],
+                Function::DropCache | Function::Now => Vec::new(),
+            },
+        }
+    }};
+}
+
+impl Expression {
+    /// Every direct child expression, in declaration order. The one place that
+    /// knows each variant's children; structural passes (parameter binding and
+    /// collection, future rewrites) recurse through it.
+    pub fn children(&self) -> Vec<&Expression> {
+        expression_children!(self, as_ref, iter)
+    }
+
+    /// [`children`](Self::children), mutably.
+    pub fn children_mut(&mut self) -> Vec<&mut Expression> {
+        expression_children!(self, as_mut, iter_mut)
+    }
+}
+
 impl Display for Expression {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -199,6 +277,7 @@ impl Display for Expression {
             Expression::Compare(c) => write!(f, "{c}"),
             Expression::Between(b) => write!(f, "{b}"),
             Expression::Constant(c) => f.write_str(&format_constant(c)),
+            Expression::Parameter(p) => write!(f, "{p}"),
             Expression::AggregateFunc(a) => write!(f, "{a}"),
             Expression::Function(fun) => write!(f, "{fun}"),
             Expression::InList(i) => write!(f, "{i}"),

@@ -29,7 +29,7 @@ pub enum Error {
 
 /// One node in a [`Plan`] tree: an [`Operator`] plus its child nodes. `name`
 /// carries the DuckDB-side label, useful for debugging.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PlanNode {
     pub name: String,
     pub inputs: Vec<PlanNode>,

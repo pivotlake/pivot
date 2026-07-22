@@ -64,6 +64,8 @@ pub enum Error {
     },
     #[error("Cannot statically determine the result type of expression: {0:?}")]
     IndeterminateResultType(Expression),
+    #[error("Parameter ${} was not bound before compilation", .0 + 1)]
+    UnboundParameter(usize),
     #[error("Unsupported expression for contains: {0:?}")]
     UnsupportedExpressionForContainsNeedle(Expression),
     #[error("Unsupported haystack expression for contains: {0:?}")]

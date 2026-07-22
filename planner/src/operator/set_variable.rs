@@ -9,7 +9,7 @@ use std::fmt;
 /// [`Plan::as_set_variable`](crate::Plan::as_set_variable)) and acts on the names
 /// it recognises. `value` is DuckDB's serialized constant (a boolean reads back
 /// as `"true"`/`"false"`); `None` is a `RESET`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SetVariable {
     pub name: String,
     pub value: Option<String>,

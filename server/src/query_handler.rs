@@ -21,19 +21,19 @@
 //! [`dispatch::CancelToken::cancel`] on the running dataflow.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fmt::Debug;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::arrow_to_pgwire::PGRowBatch;
-use arrow_array::{Array, Int64Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch};
 use async_trait::async_trait;
 use dispatch::{CancelToken, DataFlowHandle, DataFlowStats};
 use futures::{Sink, SinkExt, stream};
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
+use pgwire::api::portal::Format;
 use pgwire::api::query::SimpleQueryHandler;
 use pgwire::api::results::{QueryResponse, Response, Tag};
 use pgwire::api::store::PortalStore;
@@ -68,27 +68,7 @@ thread_local! {
     static PLANNER: RefCell<Option<planner::Planner>> = const { RefCell::new(None) };
 }
 
-/// Whether a planned query is a read-only (SELECT) plan whose `Plan` is safe to
-/// cache. Identified *positively* from the plan's root operator: only the
-/// read-only operators are cacheable, so any statement we don't explicitly
-/// allow — `CreateTable` today, or any operator variant added later — defaults
-/// to not-cached (and flushes the cache, since it may change the schema cached
-/// plans were built against).
-fn plan_is_cacheable(plan: &planner::Plan) -> bool {
-    use planner::Operator;
-    matches!(
-        plan.root.operator,
-        Operator::Input(_)
-            | Operator::Projection(_)
-            | Operator::Filter(_)
-            | Operator::Aggregate(_)
-            | Operator::OrderBy(_)
-            | Operator::TopN(_)
-            | Operator::Explain(_)
-    )
-}
-
-fn with_planner<R>(
+pub(crate) fn with_planner<R>(
     catalog: &Arc<dyn planner::catalog::Catalog>,
     f: impl FnOnce(&mut planner::Planner) -> R,
 ) -> R {
@@ -118,16 +98,9 @@ pub(crate) async fn execute_sql(
     // (the async block scopes the `?` early-returns so both paths land below).
     let transaction = catalog.begin_transaction();
     let result = async {
-        let plan = {
-            let catalog = catalog.clone();
-            let transaction = transaction.clone();
-            tokio::task::spawn_blocking(move || {
-                with_planner(&catalog, |p| p.plan(&sql, transaction))
-            })
+        let plan = plan_on_blocking_pool(&catalog, sql, transaction.clone())
             .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())?
-        };
+            .map_err(|e| e.to_string())?;
         // A SET/RESET compiles to no dataflow; nothing to return.
         if plan.as_set_variable().is_some() {
             return Ok(Vec::new());
@@ -177,9 +150,11 @@ pub(crate) async fn execute_sql(
 }
 
 #[derive(Debug, Error)]
-enum Error {
+pub(crate) enum Error {
     #[error(transparent)]
     Plan(#[from] planner::Error),
+    #[error(transparent)]
+    Bind(#[from] planner::bind::Error),
     #[error("compile error: {0}")]
     Compile(#[from] planner::compile::Error),
     #[error(transparent)]
@@ -196,22 +171,41 @@ enum Error {
     InvalidInsertResult(String),
 }
 
+/// Serialise a message as a normal wire error response (severity `ERROR`,
+/// internal-error SQLSTATE). The one place the wire error shape is built.
+pub(crate) fn user_error(message: String) -> PgWireError {
+    const INTERNAL_ERROR: &str = "XX000";
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_string(),
+        INTERNAL_ERROR.to_string(),
+        message,
+    )))
+}
+
 impl Error {
     /// Convert into a `PgWireError::UserError` so it serialises as a normal
     /// error response on the wire (severity `ERROR`, populated SQLSTATE).
     pub fn into_pgwire(self) -> PgWireError {
-        const INTERNAL_ERROR: &str = "XX000";
-
-        let info = ErrorInfo::new(
-            "ERROR".to_string(),
-            INTERNAL_ERROR.to_string(),
-            self.to_string(),
-        );
-        PgWireError::UserError(Box::new(info))
+        user_error(self.to_string())
     }
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Plan `sql` on the blocking pool (the thread-local DuckDB planner), inside
+/// `transaction`'s snapshot. The one planning entry point every path (simple
+/// query, HTTP console, extended Parse) shares.
+pub(crate) async fn plan_on_blocking_pool(
+    catalog: &Arc<dyn planner::catalog::Catalog>,
+    sql: String,
+    transaction: Arc<dyn planner::catalog::CatalogTransaction>,
+) -> Result<planner::Plan> {
+    let catalog = catalog.clone();
+    tokio::task::spawn_blocking(move || with_planner(&catalog, |p| p.plan(&sql, transaction)))
+        .await
+        .map_err(Error::PlannerPanic)?
+        .map_err(Error::Plan)
+}
 
 /// Output converted before it leaves the dispatch worker. Query
 /// batches become pgwire rows; INSERT's internal one-row result becomes an
@@ -221,9 +215,9 @@ enum WorkerOutput {
     AffectedRows(std::result::Result<usize, String>),
 }
 
-fn build_worker_output(batch: RecordBatch, is_insert: bool) -> WorkerOutput {
+fn build_worker_output(batch: RecordBatch, is_insert: bool, format: &Format) -> WorkerOutput {
     if !is_insert {
-        return WorkerOutput::QueryRows(PGRowBatch::from(batch));
+        return WorkerOutput::QueryRows(PGRowBatch::encode(batch, format));
     }
     let count = (|| {
         if batch.num_rows() != 1 || batch.num_columns() != 1 {
@@ -316,18 +310,6 @@ impl Drop for CancelOnDrop {
 pub struct PivotQueryHandler {
     catalog: Arc<dyn planner::catalog::Catalog>,
     dispatcher: dispatch::DataFlowDispatcher,
-    /// Cache of planned (but not yet compiled) query plans, keyed by SQL text.
-    /// Planning a statement (DuckDB optimize + bridge round-trip + plan
-    /// translation) is a fixed few-millisecond cost paid on every query, a
-    /// large fraction of a small query's latency. Repeated SELECTs (the common
-    /// case for dashboards/benchmarks) reuse the cached `Plan` and only re-run
-    /// the cheap `compile` + execute. Shared across connections; only SELECTs
-    /// are cached and any non-SELECT statement flushes it (see `run_query`).
-    ///
-    /// Plans carry no catalog state, so a cache hit compiled under the current
-    /// query's transaction reads that transaction's view. DDL flushes the
-    /// cache (it may change the schema cached plans were bound against).
-    plan_cache: Arc<Mutex<HashMap<String, Arc<planner::Plan>>>>,
 }
 
 impl PivotQueryHandler {
@@ -338,7 +320,6 @@ impl PivotQueryHandler {
         Self {
             catalog,
             dispatcher,
-            plan_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -359,134 +340,67 @@ impl PivotQueryHandler {
         // The async block scopes the body's `?` early-returns so success and
         // failure both land on the commit/rollback at the end.
         let result: Result<Outcome> = async {
-            let dispatcher = self.dispatcher.clone();
             let query = query.to_string();
 
-            // Reuse a cached plan if we've planned this exact SQL before. Only
-            // read-only SELECT plans are ever inserted, so a cache hit is always a
-            // SELECT regardless of what `query` is. Plans carry no snapshot, so a
-            // hit still reads this transaction's view at compile. Planning is a
-            // fixed few-ms cost; skipping it on repeated SELECTs shaves that off
-            // every query after the first, which the `plan` phase time below makes
-            // visible (near-zero on a hit, the full planner round-trip on a miss).
             let started = Instant::now();
-            let cached = self.plan_cache.lock().unwrap().get(&query).cloned();
-            let plan = match cached {
-                Some(plan) => plan,
-                None => {
-                    let catalog = self.catalog.clone();
-                    let q = query.clone();
-                    let planning_transaction = transaction.clone();
-                    let plan =
-                        tokio::task::spawn_blocking(move || -> Result<Arc<planner::Plan>> {
-                            with_planner(&catalog, |planner| {
-                                Ok(Arc::new(planner.plan(&q, planning_transaction)?))
-                            })
-                        })
-                        .await
-                        .map_err(Error::PlannerPanic)??;
-                    // Cache SELECTs; treat anything else (DDL/DML/…) as a cache
-                    // flush (it may invalidate the schema cached plans were built
-                    // against) and don't cache it.
-                    let mut cache = self.plan_cache.lock().unwrap();
-                    if plan_is_cacheable(&plan) {
-                        cache.insert(query.clone(), plan.clone());
-                    } else {
-                        cache.clear();
-                    }
-                    plan
-                }
-            };
+            let plan = Arc::new(
+                plan_on_blocking_pool(&self.catalog, query.clone(), transaction.clone()).await?,
+            );
             let plan_time = started.elapsed();
 
-            // A `SET`/`RESET` is a session command, not a query — DuckDB parsed and
-            // typed it for us, so there's no string-munging here. It compiles to no
-            // dataflow; hand it back for `do_query` to apply to the connection.
-            if let Some(set) = plan.as_set_variable() {
-                return Ok(Outcome::Set {
-                    name: set.name.clone(),
-                    value: set.value.clone(),
-                });
-            }
-            let is_insert = matches!(&plan.root.operator, planner::Operator::Insert(_));
-
-            // When the session ran `SET perf = 1`, start a `perf record` scoped to the
-            // worker threads and mark this query's dataflows profiled. Marking them
-            // makes the workers run *only* this dataflow for its duration (other
-            // queries on the pool pause), so the capture is just this
-            // dataflow, and exclusive mode lifts as the dataflows finish. `start`
-            // runs on a blocking thread (it sleeps waiting for perf to attach); the
-            // guard is stopped off the reactor after drain (its `child.wait()` blocks
-            // until the report flushes). On error/cancel the guard instead drops in
-            // this async frame, which is rare. Compiled out without the feature.
-            #[cfg(feature = "perf")]
-            let (dispatcher, mut perf_guard) = if with_perf {
-                let sql = query.clone();
-                let guard = tokio::task::spawn_blocking(move || crate::perf::start(&sql))
-                    .await
-                    .ok()
-                    .flatten();
-                match guard {
-                    Some(guard) => (dispatcher.with_profiling(true), Some(guard)),
-                    None => (dispatcher, None),
-                }
-            } else {
-                (dispatcher, None)
-            };
-            #[cfg(not(feature = "perf"))]
-            let _ = with_perf;
-
-            // Compile the plan into a fresh dataflow and launch it. `compile` is pure
-            // pivot work (no DuckDB), so it runs on any blocking thread without the
-            // planner thread-local. `execute_with_stats` turns on the dataflow's
-            // IO/CPU tally only when the client asked for it.
-            let started = Instant::now();
-            let compile_transaction = transaction.clone();
-            let handle = tokio::task::spawn_blocking(move || -> Result<DataFlowHandle<_>> {
-                let outputs = plan
-                    .compile(&dispatcher, compile_transaction.as_ref())?
-                    .map(move || move |batch| build_worker_output(batch, is_insert));
-                Ok(if collect_stats {
-                    outputs.execute_with_stats()
-                } else {
-                    outputs.execute()
-                })
-            })
+            self.execute_plan(
+                plan,
+                Vec::new(),
+                transaction.clone(),
+                Format::UnifiedText,
+                plan_time,
+                collect_stats,
+                with_perf,
+                query.clone(),
+            )
             .await
-            .map_err(Error::PlannerPanic)??;
-            let compile_time = started.elapsed();
-
-            // Cancel the dataflow if our future is dropped before drain finishes —
-            // covers both psql Ctrl-C (pgwire's `_on_query` select drops us) and
-            // raw disconnects (whole connection task dropped).
-            let guard = CancelOnDrop::new(handle.cancel_token());
-            let started = Instant::now();
-            let (outputs, flow) = tokio::task::spawn_blocking(move || handle.collect_with_stats())
-                .await
-                .map_err(Error::WorkerPanic)??;
-            let exec_time = started.elapsed();
-            guard.defuse();
-
-            // Stop perf off the reactor: `child.wait()` blocks until the report is
-            // flushed (seconds for a large capture), which would otherwise stall this
-            // tokio worker thread.
-            #[cfg(feature = "perf")]
-            if let Some(perf) = perf_guard.take() {
-                let _ = tokio::task::spawn_blocking(move || drop(perf)).await;
-            }
-
-            let response = build_pgwire_response(outputs, is_insert)?;
-            Ok(Outcome::Response(
-                response,
-                QueryStats {
-                    plan: plan_time,
-                    compile: compile_time,
-                    exec: exec_time,
-                    flow,
-                },
-            ))
         }
         .await;
+        self.commit_or_rollback(result, transaction).await
+    }
+
+    /// Run one execute of an already-planned prepared statement through the
+    /// same path a simple query takes; `execute_plan` binds `params` into the
+    /// plan's holes on the blocking pool. `result_format` is the portal's
+    /// requested per-column wire format for the result rows; `sql` is the
+    /// statement's original text, used for logging and profiling labels.
+    pub(crate) async fn run_prepared(
+        &self,
+        plan: Arc<planner::Plan>,
+        params: Vec<ArrayRef>,
+        result_format: Format,
+        collect_stats: bool,
+        with_perf: bool,
+        sql: String,
+    ) -> Result<Outcome> {
+        let transaction = self.catalog.begin_transaction();
+        let result = self
+            .execute_plan(
+                plan,
+                params,
+                transaction.clone(),
+                result_format,
+                Duration::ZERO,
+                collect_stats,
+                with_perf,
+                sql,
+            )
+            .await;
+        self.commit_or_rollback(result, transaction).await
+    }
+
+    /// Commit `transaction` when the statement succeeded, roll it back when it
+    /// failed (or was cancelled). The tail of every statement execution.
+    async fn commit_or_rollback(
+        &self,
+        result: Result<Outcome>,
+        transaction: Arc<dyn planner::catalog::CatalogTransaction>,
+    ) -> Result<Outcome> {
         match result {
             Ok(outcome) => {
                 let catalog = self.catalog.clone();
@@ -501,10 +415,136 @@ impl PivotQueryHandler {
             }
         }
     }
+
+    /// Compile and run a plan inside `transaction` (which the caller commits
+    /// or rolls back), timing each phase. When `params` is non-empty they are
+    /// bound into the plan's holes first, on the same blocking-pool hop that
+    /// compiles (both are pure CPU work that doesn't belong on the reactor);
+    /// the bind cost lands in the `compile` phase of the stats breakdown.
+    /// `plan_time` is the caller's planning time.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_plan(
+        &self,
+        plan: Arc<planner::Plan>,
+        params: Vec<ArrayRef>,
+        transaction: Arc<dyn planner::catalog::CatalogTransaction>,
+        result_format: Format,
+        plan_time: Duration,
+        collect_stats: bool,
+        with_perf: bool,
+        perf_label: String,
+    ) -> Result<Outcome> {
+        let dispatcher = self.dispatcher.clone();
+        #[cfg(not(feature = "perf"))]
+        let _ = perf_label;
+
+        // A `SET`/`RESET` is a session command, not a query - DuckDB parsed and
+        // typed it for us, so there's no string-munging here. It compiles to no
+        // dataflow; hand it back for `do_query` to apply to the connection.
+        if let Some(set) = plan.as_set_variable() {
+            return Ok(Outcome::Set {
+                name: set.name.clone(),
+                value: set.value.clone(),
+            });
+        }
+        let is_insert = matches!(&plan.root.operator, planner::Operator::Insert(_));
+
+        // When the session ran `SET perf = 1`, start a `perf record` scoped to the
+        // worker threads and mark this query's dataflows profiled. Marking them
+        // makes the workers run *only* this dataflow for its duration (other
+        // queries on the pool pause), so the capture is just this
+        // dataflow, and exclusive mode lifts as the dataflows finish. `start`
+        // runs on a blocking thread (it sleeps waiting for perf to attach); the
+        // guard is stopped off the reactor after drain (its `child.wait()` blocks
+        // until the report flushes). On error/cancel the guard instead drops in
+        // this async frame, which is rare. Compiled out without the feature.
+        #[cfg(feature = "perf")]
+        let (dispatcher, mut perf_guard) = if with_perf {
+            let sql = perf_label;
+            let guard = tokio::task::spawn_blocking(move || crate::perf::start(&sql))
+                .await
+                .ok()
+                .flatten();
+            match guard {
+                Some(guard) => (dispatcher.with_profiling(true), Some(guard)),
+                None => (dispatcher, None),
+            }
+        } else {
+            (dispatcher, None)
+        };
+        #[cfg(not(feature = "perf"))]
+        let _ = with_perf;
+
+        // Compile the plan into a fresh dataflow and launch it. `compile` is pure
+        // pivot work (no DuckDB), so it runs on any blocking thread without the
+        // planner thread-local. `execute_with_stats` turns on the dataflow's
+        // IO/CPU tally only when the client asked for it.
+        let started = Instant::now();
+        let compile_transaction = transaction.clone();
+        let handle = tokio::task::spawn_blocking(move || -> Result<DataFlowHandle<_>> {
+            // A parameterless statement (or one prepared without holes) runs
+            // the shared plan as-is; binding would only clone it for nothing.
+            let plan = if params.is_empty() {
+                plan
+            } else {
+                Arc::new(plan.bind_parameters(&params)?)
+            };
+            let outputs = plan
+                .compile(&dispatcher, compile_transaction.as_ref())?
+                .map(move || {
+                    let format = result_format.clone();
+                    move |batch| build_worker_output(batch, is_insert, &format)
+                });
+            Ok(if collect_stats {
+                outputs.execute_with_stats()
+            } else {
+                outputs.execute()
+            })
+        })
+        .await
+        .map_err(Error::PlannerPanic)??;
+        let compile_time = started.elapsed();
+
+        // Cancel the dataflow if our future is dropped before drain finishes -
+        // covers both psql Ctrl-C (pgwire's `_on_query` select drops us) and
+        // raw disconnects (whole connection task dropped).
+        let guard = CancelOnDrop::new(handle.cancel_token());
+        let started = Instant::now();
+        let (outputs, flow) = tokio::task::spawn_blocking(move || handle.collect_with_stats())
+            .await
+            .map_err(Error::WorkerPanic)??;
+        let exec_time = started.elapsed();
+        guard.defuse();
+
+        // Stop perf off the reactor: `child.wait()` blocks until the report is
+        // flushed (seconds for a large capture), which would otherwise stall this
+        // tokio worker thread.
+        #[cfg(feature = "perf")]
+        if let Some(perf) = perf_guard.take() {
+            let _ = tokio::task::spawn_blocking(move || drop(perf)).await;
+        }
+
+        let response = build_pgwire_response(outputs, is_insert)?;
+        Ok(Outcome::Response(
+            response,
+            QueryStats {
+                plan: plan_time,
+                compile: compile_time,
+                exec: exec_time,
+                flow,
+            },
+        ))
+    }
+
+    /// The catalog this handler resolves statements against, for the extended
+    /// protocol's Parse-time snapshot transactions.
+    pub(crate) fn catalog(&self) -> &Arc<dyn planner::catalog::Catalog> {
+        &self.catalog
+    }
 }
 
 /// What [`run_query`](PivotQueryHandler::run_query) resolved a statement to.
-enum Outcome {
+pub(crate) enum Outcome {
     /// A completed statement response plus where its time went.
     Response(Response, QueryStats),
     /// A `SET`/`RESET` of a session variable (DuckDB-parsed). `value` is `None`
@@ -514,7 +554,7 @@ enum Outcome {
 
 /// Where a query's time went — phase wall-clocks plus the dataflow's IO/CPU
 /// tally — formatted into a one-line client `NOTICE` when stats are on.
-struct QueryStats {
+pub(crate) struct QueryStats {
     plan: Duration,
     compile: Duration,
     exec: Duration,
@@ -522,7 +562,7 @@ struct QueryStats {
 }
 
 impl QueryStats {
-    fn summary(&self) -> String {
+    pub(crate) fn summary(&self) -> String {
         let ms = |d: Duration| d.as_secs_f64() * 1e3;
         let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
         // The IO/cpu figures are sums over workers and in-flight operations, so
@@ -555,7 +595,11 @@ impl QueryStats {
 /// every other name is accepted as a no-op, since clients routinely set GUCs
 /// (`client_encoding`, `application_name`, …) we don't model. Acks with the verb
 /// the client used (`SET`/`RESET`).
-fn apply_set<C: ClientInfo>(client: &mut C, name: &str, value: Option<&str>) -> Response {
+pub(crate) fn apply_set<C: ClientInfo>(
+    client: &mut C,
+    name: &str,
+    value: Option<&str>,
+) -> Response {
     if name.eq_ignore_ascii_case(STATS_FLAG) {
         // RESET (no value) or any non-truthy value turns it off.
         if value.is_some_and(is_truthy) {
@@ -589,13 +633,13 @@ fn is_truthy(value: &str) -> bool {
 }
 
 /// Whether this connection has `pivot_stats` on.
-fn stats_on<C: ClientInfo>(client: &C) -> bool {
+pub(crate) fn stats_on<C: ClientInfo>(client: &C) -> bool {
     client.metadata().get(STATS_FLAG).is_some_and(|v| v == "on")
 }
 
 /// Whether this connection has `perf` on (set via `SET perf = 1`).
 #[cfg(feature = "perf")]
-fn perf_on<C: ClientInfo>(client: &C) -> bool {
+pub(crate) fn perf_on<C: ClientInfo>(client: &C) -> bool {
     client.metadata().get(PERF_FLAG).is_some_and(|v| v == "on")
 }
 
@@ -609,10 +653,7 @@ impl SimpleQueryHandler for PivotQueryHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let with_stats = stats_on(client);
-        #[cfg(feature = "perf")]
-        let with_perf = perf_on(client);
-        #[cfg(not(feature = "perf"))]
-        let with_perf = false;
+        let with_perf = perf_enabled(client);
 
         info!(sql = %query, "query received");
         let outcome = self
@@ -623,27 +664,54 @@ impl SimpleQueryHandler for PivotQueryHandler {
                 e.into_pgwire()
             })?;
 
-        let res = match outcome {
-            Outcome::Set { name, value } => apply_set(client, &name, value.as_deref()),
-            Outcome::Response(res, stats) => {
-                // Send the breakdown as an INFO notice before the rows.
-                if with_stats {
-                    let notice = NoticeResponse::from(ErrorInfo::new(
-                        "INFO".to_string(),
-                        "00000".to_string(),
-                        stats.summary(),
-                    ));
-                    client
-                        .send(PgWireBackendMessage::NoticeResponse(notice))
-                        .await?;
-                }
-                res
-            }
-        };
-
+        let res = respond_with_outcome(client, outcome, with_stats).await?;
         info!(sql = %query, "query succeeded");
         Ok(vec![res])
     }
+}
+
+/// Whether this connection profiles its queries (`SET perf = 1`); always off
+/// without the `perf` feature.
+pub(crate) fn perf_enabled<C: ClientInfo>(client: &C) -> bool {
+    #[cfg(feature = "perf")]
+    return perf_on(client);
+    #[cfg(not(feature = "perf"))]
+    {
+        let _ = client;
+        false
+    }
+}
+
+/// Turn a finished [`Outcome`] into the wire response, applying a `SET` to the
+/// connection and sending the stats breakdown as an INFO notice before the
+/// rows when the session asked for it. Shared by the simple and extended
+/// query handlers.
+pub(crate) async fn respond_with_outcome<C>(
+    client: &mut C,
+    outcome: Outcome,
+    with_stats: bool,
+) -> PgWireResult<Response>
+where
+    C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    Ok(match outcome {
+        Outcome::Set { name, value } => apply_set(client, &name, value.as_deref()),
+        Outcome::Response(res, stats) => {
+            if with_stats {
+                let notice = NoticeResponse::from(ErrorInfo::new(
+                    "INFO".to_string(),
+                    "00000".to_string(),
+                    stats.summary(),
+                ));
+                client
+                    .send(PgWireBackendMessage::NoticeResponse(notice))
+                    .await?;
+            }
+            res
+        }
+    })
 }
 
 /// Startup handler that registers each new connection with the shared
@@ -676,6 +744,7 @@ impl NoopStartupHandler for PivotStartupHandler {
 /// reach into the dispatch layer from a cancel handler.
 pub struct PivotHandlers {
     query_handler: Arc<PivotQueryHandler>,
+    extended_query_handler: Arc<crate::extended::PivotExtendedQueryHandler>,
     startup_handler: Arc<PivotStartupHandler>,
     cancel_handler: Arc<DefaultCancelHandler>,
 }
@@ -686,8 +755,12 @@ impl PivotHandlers {
         dispatcher: dispatch::DataFlowDispatcher,
     ) -> Self {
         let manager = Arc::new(ConnectionManager::new());
+        let query_handler = Arc::new(PivotQueryHandler::new(catalog, dispatcher));
         Self {
-            query_handler: Arc::new(PivotQueryHandler::new(catalog, dispatcher)),
+            extended_query_handler: Arc::new(crate::extended::PivotExtendedQueryHandler::new(
+                query_handler.clone(),
+            )),
+            query_handler,
             startup_handler: Arc::new(PivotStartupHandler::new(manager.clone())),
             cancel_handler: Arc::new(DefaultCancelHandler::new(manager)),
         }
@@ -708,7 +781,7 @@ impl PgWireServerHandlers for PivotHandlers {
     }
 
     fn extended_query_handler(&self) -> Arc<impl pgwire::api::query::ExtendedQueryHandler> {
-        Arc::new(NoopHandler)
+        self.extended_query_handler.clone()
     }
 
     fn copy_handler(&self) -> Arc<impl pgwire::api::copy::CopyHandler> {

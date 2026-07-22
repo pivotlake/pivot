@@ -26,7 +26,7 @@ const PLAN_COLUMN: &str = "QUERY PLAN";
 /// statement). Carries no payload: the plan it explains is its child input,
 /// which `compile` formats rather than lowers, so the explained
 /// query never runs.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Explain;
 
 impl Explain {

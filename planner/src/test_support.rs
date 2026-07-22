@@ -73,6 +73,10 @@ impl Nullary<RecordBatch> for Replay {
 struct TestTable {
     batch: RecordBatch,
     columns: Vec<Column>,
+    /// Display forms of every filter offered to [`Table::pushdown_filter`],
+    /// shared across clones (and thus across plan bindings), so tests can
+    /// observe plan-time and bind-time pushdown.
+    filter_log: Arc<Mutex<Vec<String>>>,
 }
 
 impl TestTable {
@@ -106,6 +110,7 @@ impl TestTable {
         TestTable {
             batch,
             columns: cols,
+            filter_log: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -135,6 +140,14 @@ impl Table for TestTable {
 
     fn clone_box(&self) -> Box<dyn Table> {
         Box::new(self.clone())
+    }
+
+    fn pushdown_filter(
+        &mut self,
+        filter: crate::expression::TableFilter,
+    ) -> crate::catalog::Result<bool> {
+        self.filter_log.lock().unwrap().push(filter.to_string());
+        Ok(false)
     }
 
     fn materialize(
@@ -277,6 +290,19 @@ impl TestingPlanner {
         self.catalog.add_table(name, columns);
     }
 
+    /// The named table's shared pushdown log: one entry per filter ever
+    /// offered to it, across every binding cloned from the catalog entry.
+    pub fn filter_log(&self, name: &str) -> Arc<Mutex<Vec<String>>> {
+        self.catalog
+            .tables
+            .lock()
+            .unwrap()
+            .get(name)
+            .expect("table is registered")
+            .filter_log
+            .clone()
+    }
+
     /// Plan `sql` inside a fresh transaction on this fixture's catalog.
     pub fn plan(&mut self, sql: &str) -> Result<crate::Plan, crate::Error> {
         let transaction = self.catalog.begin_transaction();
@@ -347,6 +373,22 @@ pub fn run_batches(planner: &mut TestingPlanner, sql: &str) -> Vec<RecordBatch> 
         .unwrap()
         .collect()
         .unwrap()
+}
+
+/// Bind `params` into an already-planned prepared statement, compile the bound
+/// plan, run it, and return the rows as JSON. The prepared-statement analogue
+/// of [`run`]: call it repeatedly on one plan to exercise per-execute binding.
+pub fn run_bound(planner: &TestingPlanner, plan: &crate::Plan, params: &[ArrayRef]) -> Vec<Value> {
+    let bound = plan.bind_parameters(params).unwrap();
+    let batches = bound
+        .compile(
+            planner.dispatch.dispatcher(),
+            planner.transaction().as_ref(),
+        )
+        .unwrap()
+        .collect()
+        .unwrap();
+    batches_to_json(&batches)
 }
 
 /// The value of a row's single column, by position rather than name. For tests

@@ -27,7 +27,7 @@ mod projection;
 mod set_variable;
 mod table_function;
 mod top_n;
-mod values;
+pub(crate) mod values;
 
 pub use aggregate::Aggregate;
 pub use create_table::CreateTable;
@@ -79,7 +79,7 @@ pub(super) fn slot_for(slots: &mut DynamicFilterSlots, slot_id: usize) -> Arc<Dy
 }
 
 /// An operator in the query plan.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Operator {
     Input(Input),
     Values(Values),
@@ -151,6 +151,79 @@ impl Operator {
             // Statements, not queries: no result columns.
             Operator::CreateTable(_) | Operator::SetVariable(_) => Ok(Vec::new()),
         }
+    }
+
+    /// Whether this operator, as a plan root, streams result rows to the
+    /// client. Statements that only report a command tag (INSERT's count, DDL,
+    /// a session SET) do not; the wire protocol answers Describe with "no
+    /// data" for them and ignores result formats. Exhaustive on purpose so a
+    /// new operator must decide.
+    pub fn returns_rows(&self) -> bool {
+        match self {
+            Operator::Insert(_) | Operator::CreateTable(_) | Operator::SetVariable(_) => false,
+            Operator::Input(_)
+            | Operator::Values(_)
+            | Operator::TableFunctionScan(_)
+            | Operator::Projection(_)
+            | Operator::OrderBy(_)
+            | Operator::Aggregate(_)
+            | Operator::Filter(_)
+            | Operator::TopN(_)
+            | Operator::Limit(_)
+            | Operator::DummyScan(_)
+            | Operator::Materialize(_)
+            | Operator::Explain(_) => true,
+        }
+    }
+}
+
+/// Generates [`Operator::expressions`] and [`Operator::expressions_mut`] from
+/// one body: the top-level expression slots each operator owns, listed
+/// exhaustively (no wildcard) so a new expression-bearing operator fails to
+/// compile until it declares its slots.
+macro_rules! operator_expressions {
+    ($self:expr, $iter:ident $(, $mut_:tt)?) => {
+        match $self {
+            Operator::Input(input) => input.columns.$iter().collect(),
+            Operator::TableFunctionScan(scan) => scan.columns.$iter().collect(),
+            Operator::Projection(projection) => projection.projections.$iter().collect(),
+            Operator::Filter(filter) => filter.conditions.$iter().collect(),
+            Operator::Aggregate(aggregate) => aggregate
+                .groups
+                .$iter()
+                .chain(aggregate.expressions.$iter())
+                .collect(),
+            Operator::OrderBy(order_by) => order_by
+                .order_bys
+                .$iter()
+                .map(|key| & $($mut_)? key.expression)
+                .collect(),
+            Operator::TopN(top_n) => top_n
+                .order_bys
+                .$iter()
+                .map(|key| & $($mut_)? key.expression)
+                .collect(),
+            Operator::Values(values) => values.rows.$iter().flatten().collect(),
+            Operator::Insert(_)
+            | Operator::CreateTable(_)
+            | Operator::DummyScan(_)
+            | Operator::SetVariable(_)
+            | Operator::Materialize(_)
+            | Operator::Explain(_)
+            | Operator::Limit(_) => Vec::new(),
+        }
+    };
+}
+
+impl Operator {
+    /// The operator's top-level expressions, in declaration order.
+    pub fn expressions(&self) -> Vec<&Expression> {
+        operator_expressions!(self, iter)
+    }
+
+    /// [`expressions`](Self::expressions), mutably.
+    pub fn expressions_mut(&mut self) -> Vec<&mut Expression> {
+        operator_expressions!(self, iter_mut, mut)
     }
 }
 

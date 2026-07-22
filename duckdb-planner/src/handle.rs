@@ -568,6 +568,11 @@ impl<'plan> Expr<'plan> {
         Expr { raw }
     }
 
+    /// Whether the expression tree contains a `$n` placeholder anywhere.
+    pub fn has_parameter(self) -> bool {
+        ffi::expr_has_parameter(self.raw)
+    }
+
     /// Dispatch on the expression's [`ExpressionType`] into a typed [`Expression`]
     /// view that exposes only that kind's accessors. Any kind the consumer doesn't
     /// handle is [`Expression::Unsupported`], carrying the raw type.
@@ -583,6 +588,7 @@ impl<'plan> Expr<'plan> {
             | T::COMPARE_GREATERTHANOREQUALTO => Expression::Compare(Compare { raw: self.raw }),
             T::COMPARE_BETWEEN => Expression::Between(Between { raw: self.raw }),
             T::VALUE_CONSTANT => Expression::Constant(Constant { raw: self.raw }),
+            T::VALUE_PARAMETER => Expression::Parameter(Parameter { raw: self.raw }),
             T::BOUND_AGGREGATE => Expression::AggregateFunc(AggregateFunc { raw: self.raw }),
             T::BOUND_FUNCTION => Expression::Function(Function { raw: self.raw }),
             T::COMPARE_IN => Expression::InList(InList { raw: self.raw }),
@@ -608,6 +614,8 @@ pub enum Expression<'plan> {
     Compare(Compare<'plan>),
     Between(Between<'plan>),
     Constant(Constant<'plan>),
+    /// A prepared-statement placeholder (`$1`), bound to a value at execute time.
+    Parameter(Parameter<'plan>),
     /// An aggregate function call (`SUM`, `COUNT`, …).
     AggregateFunc(AggregateFunc<'plan>),
     /// A scalar function call (`BOUND_FUNCTION`).
@@ -634,6 +642,8 @@ define_handles! { ffi::Expression;
     Between,
     /// A constant value.
     Constant,
+    /// A prepared-statement placeholder (`$1`).
+    Parameter,
     /// An aggregate function call.
     AggregateFunc,
     /// A scalar function call.
@@ -733,6 +743,20 @@ impl<'plan> Constant<'plan> {
     /// The constant's logical type, without decoding its value.
     pub fn return_type(self) -> LogicalTypeId {
         LogicalTypeId::from_u8(ffi::expr_return_type(self.raw))
+    }
+}
+
+impl<'plan> Parameter<'plan> {
+    /// The placeholder's identifier: `"1"` for a positional `$1`, the name for
+    /// a named parameter.
+    pub fn identifier(self) -> String {
+        ffi::expr_parameter_identifier(self.raw)
+    }
+
+    /// The type the binder inferred for the placeholder from its context (the
+    /// compared column, the INSERT target column, an explicit cast).
+    pub fn return_type(self) -> LogicalTypeId {
+        LogicalTypeId::from_u8(ffi::expr_parameter_type(self.raw))
     }
 }
 

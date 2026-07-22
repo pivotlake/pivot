@@ -11,7 +11,7 @@ use std::fmt;
 /// Scans a [`Table`] from the catalog. `columns` lists the requested output
 /// columns (each as a [`Ref`](crate::expression::Ref) into the table schema)
 /// and `filters` are predicates pushed down into the scan.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Input {
     pub table: Box<dyn Table>,
     pub columns: Vec<Expression>,

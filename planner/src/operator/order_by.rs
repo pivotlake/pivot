@@ -10,7 +10,7 @@ use duckdb_planner::duckdb_bridge::duckdb_types::OrderType;
 use std::fmt;
 
 /// Sort direction specification for an ORDER BY clause.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum OrderByDirection {
     Default,
     Asc,
@@ -43,7 +43,7 @@ impl fmt::Display for OrderByDirection {
 }
 
 /// A single sort key within an ORDER BY or TopN operator.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OrderByNode {
     pub direction: OrderByDirection,
     pub expression: Expression,
@@ -56,7 +56,7 @@ impl fmt::Display for OrderByNode {
 }
 
 /// Sorts its input by one or more keys.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct OrderBy {
     pub order_bys: Vec<OrderByNode>,
 }

@@ -16,7 +16,7 @@ use std::fmt;
 /// them in `columns` order — which matches the order DuckDB's full-column Get
 /// produced, so the projection kept above it lines up positionally without
 /// remapping.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Materialize {
     pub table: Box<dyn Table>,
     /// Table-schema (storage) column indices to fetch, in output order.

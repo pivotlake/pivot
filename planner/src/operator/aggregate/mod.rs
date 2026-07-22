@@ -36,7 +36,7 @@ use std::fmt;
 use std::sync::Arc;
 
 /// GROUP BY + aggregate functions.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Aggregate {
     pub groups: Vec<Expression>,
     pub expressions: Vec<Expression>,

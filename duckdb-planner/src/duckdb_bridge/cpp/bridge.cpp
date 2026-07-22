@@ -23,6 +23,7 @@
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_parameter_expression.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
@@ -157,6 +158,15 @@ extract_plan_with_names(duckdb::Connection &con, const std::string &query,
 	context.RunFunctionInTransaction([&]() {
 		duckdb::Planner planner(context);
 		planner.CreatePlan(std::move(statements[0]));
+		// A statement may carry parameter placeholders (`$1`) whose types the
+		// binder infers from context (the compared column, the INSERT target
+		// column). When a placeholder's type could not be resolved the plan is
+		// unusable as-is (DuckDB would re-bind with concrete values, which the
+		// bridge does not do), so fail with an actionable message.
+		if (!planner.properties.bound_all_parameters) {
+			throw UnsupportedPlanError(
+			    "could not infer the type of a query parameter; add an explicit CAST around it");
+		}
 		// The binder resolves the client-facing result column names before
 		// optimization rewrites the plan; capture them while still intact.
 		result_names = planner.names;
@@ -751,6 +761,10 @@ bool expr_has_alias(const Expression &expr) {
 	return !expr.GetAlias().empty();
 }
 
+bool expr_has_parameter(const Expression &expr) {
+	return expr.HasParameter();
+}
+
 rust::String expr_alias(const Expression &expr) {
 	return rust::String::lossy(expr.GetAlias());
 }
@@ -819,6 +833,32 @@ int32_t value_interval_days(const Value &v) {
 }
 int64_t value_interval_micros(const Value &v) {
 	return v.GetValue<duckdb::interval_t>().micros;
+}
+
+rust::String expr_parameter_identifier(const Expression &expr) {
+	return rust::String::lossy(as_expr<duckdb::BoundParameterExpression>(expr).identifier);
+}
+
+// The type the binder resolved for a parameter, looking past DuckDB's own
+// prepared-statement bookkeeping. The shared BoundParameterData carries the
+// resolved type; when the filter-pushdown optimizer has *invalidated* the
+// parameter (it does so under any pushdown-capable scan, to force DuckDB's own
+// rebind-at-execute, which the bridge does not do), the resolved type still
+// survives in the null Value the planner stamped into the data at bind time.
+// The expression's own return_type is the last resort (e.g. a parameter typed
+// only by an enclosing cast, where the shared data was never resolved).
+uint8_t expr_parameter_type(const Expression &expr) {
+	auto &param = as_expr<duckdb::BoundParameterExpression>(expr);
+	if (param.parameter_data) {
+		auto &data = *param.parameter_data;
+		if (data.return_type.IsValid()) {
+			return static_cast<uint8_t>(data.return_type.id());
+		}
+		if (data.GetValue().type().id() != duckdb::LogicalTypeId::INVALID) {
+			return static_cast<uint8_t>(data.GetValue().type().id());
+		}
+	}
+	return static_cast<uint8_t>(param.return_type.id());
 }
 
 size_t expr_ref_index(const Expression &expr) {

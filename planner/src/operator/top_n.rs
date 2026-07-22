@@ -8,7 +8,7 @@ use dispatch::{OrderBy as DispatchOrderBy, RecordBatchOperatorSpec};
 use std::fmt;
 
 /// Combined ORDER BY + LIMIT (returns the top N rows).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TopN {
     pub order_bys: Vec<OrderByNode>,
     pub limit: usize,

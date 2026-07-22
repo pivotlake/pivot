@@ -45,6 +45,7 @@
 //! ```
 
 mod arrow_to_pgwire;
+mod extended;
 mod http;
 #[cfg(feature = "perf")]
 mod perf;

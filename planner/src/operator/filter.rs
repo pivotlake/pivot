@@ -10,7 +10,7 @@ use std::fmt;
 use std::sync::Arc;
 
 /// Filters rows by one or more boolean conditions (implicitly ANDed).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Filter {
     pub conditions: Vec<Expression>,
 }

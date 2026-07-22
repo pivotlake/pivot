@@ -87,11 +87,11 @@ fn builtin(name: &str) -> Option<Box<dyn TableFunction>> {
 /// A scan over a table-valued function. Holds the function name, its bound
 /// constant arguments, and the output columns this scan must emit (each a
 /// positional [`Ref`](crate::expression::Ref) into the function's full output).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TableFunctionScan {
     function_name: String,
     args: Vec<ScalarValue>,
-    columns: Vec<Expression>,
+    pub(crate) columns: Vec<Expression>,
 }
 
 impl TableFunctionScan {

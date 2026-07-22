@@ -15,7 +15,7 @@ use crate::expression::CompareType;
 /// comparison, and the `slot_id` correlating it with the other end of the
 /// producer↔consumer pair. The shared slot is resolved at compile time (see
 /// [`Plan::compile`](crate::Plan::compile)).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DynamicFilter {
     pub slot_id: usize,
     pub column_idx: usize,

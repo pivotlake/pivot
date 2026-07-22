@@ -210,6 +210,15 @@ pub trait Table: Debug + Send + Sync {
     }
 }
 
+/// Cloning a boxed table delegates to [`Table::clone_box`], so plan IR holding
+/// a table (a scan, an insert) can derive `Clone` and a cached plan can be
+/// duplicated for per-execute parameter binding.
+impl Clone for Box<dyn Table> {
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
+}
+
 /// Convert Pivot columns into the DuckDB-typed columns the binder consumes
 /// (logical type as a `u8` discriminant). Shared by base-table and table-function
 /// binding.
@@ -246,8 +255,15 @@ impl DuckDBTable for DuckDBTableAdapter {
         &mut self,
         filter: Expr<'_>,
     ) -> duckdb_planner::catalog_provider::Result<bool> {
-        // Translate the borrowed DuckDB filter expression into a Pivot one (the
-        // only filter shape the bridge pushes is a bound expression).
+        // A filter holding a `$n` placeholder is not consumed: this callback
+        // fires mid-bind, where the placeholder's type may still be
+        // unresolved, and a hole carries no constant to prune with anyway.
+        // "Not consumed" only means DuckDB keeps the filter in the plan; the
+        // bind step re-offers it once its constant exists (see the bind
+        // module). Every other conversion failure stays a hard error.
+        if filter.has_parameter() {
+            return Ok(false);
+        }
         let filter = TableFilter::Expression(Box::new(crate::expression::Expression::from_handle(
             filter,
         )?));

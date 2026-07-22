@@ -9,7 +9,7 @@ use std::fmt;
 use std::sync::Arc;
 
 /// Computes a list of output expressions from its child's columns.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Projection {
     pub projections: Vec<Expression>,
 }

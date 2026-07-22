@@ -7,7 +7,7 @@ use dispatch::{DataFlowDispatcher, RecordBatchOperatorSpec};
 use crate::catalog::{CatalogTransaction, Table};
 use crate::compile::Error;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Insert {
     pub table: Box<dyn Table>,
 }

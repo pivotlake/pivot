@@ -9,7 +9,7 @@ use dispatch::RecordBatchOperatorSpec;
 use std::fmt;
 
 /// `LIMIT … OFFSET …` with no ORDER BY.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Limit {
     /// `None` for an offset-only query (`OFFSET n` with no upper bound).
     pub limit: Option<usize>,

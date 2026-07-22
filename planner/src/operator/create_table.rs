@@ -7,7 +7,7 @@ use std::fmt;
 use std::sync::Arc;
 
 /// CREATE TABLE with an explicit column list.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CreateTable {
     pub request: CreateTableRequest,
     pub or_replace: bool,

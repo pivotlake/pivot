@@ -121,6 +121,7 @@
 //! - [`compile`] — Lowering from a [`Plan`] into a
 //!   [`RecordBatchOperatorSpec`](dispatch::RecordBatchOperatorSpec).
 
+pub mod bind;
 mod build;
 pub mod catalog;
 pub mod compile;

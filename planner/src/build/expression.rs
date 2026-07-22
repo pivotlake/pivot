@@ -16,15 +16,15 @@ use duckdb_planner::handle::{
     AggregateFunc as AggregateFuncHandle, Between as BetweenHandle, Case as CaseHandle,
     Cast as CastHandle, Compare as CompareHandle, Conjunction as ConjunctionHandle,
     Expression as DuckExpression, Function as FunctionHandle, InList as InListHandle,
-    Not as NotHandle, Ref as RefHandle,
+    Not as NotHandle, Parameter as ParameterHandle, Ref as RefHandle,
 };
 use duckdb_planner::{Expr, LogicalTypeId, ScalarValue};
 
 use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Conjunction,
     ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide, Error,
-    Expression, Function, InList, IntervalArithmetic, Length, Not, NumericAggregate, Prefix, Ref,
-    RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
+    Expression, Function, InList, IntervalArithmetic, Length, Not, NumericAggregate, Parameter,
+    Prefix, Ref, RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
 
@@ -39,6 +39,7 @@ impl Expression {
             DuckExpression::Compare(c) => Expression::Compare(Compare::from_handle(c)?),
             DuckExpression::Between(b) => Expression::Between(Between::from_handle(b)?),
             DuckExpression::Constant(c) => Expression::Constant(build_scalar_value(c.value())?),
+            DuckExpression::Parameter(p) => Expression::Parameter(Parameter::from_handle(p)?),
             DuckExpression::AggregateFunc(a) => {
                 Expression::AggregateFunc(AggregateFunc::from_handle(a)?)
             }
@@ -64,6 +65,35 @@ impl Ref {
             name: view
                 .alias()
                 .filter(|n| !n.is_empty() && !n.bytes().all(|b| b.is_ascii_digit())),
+        })
+    }
+}
+
+impl Parameter {
+    pub(crate) fn from_handle(view: ParameterHandle<'_>) -> Result<Parameter, Error> {
+        Self::from_handle_typed(view, type_from_logical(view.return_type())?)
+    }
+
+    /// Build the hole with an externally supplied type: how a
+    /// `CAST($n AS type)` folds into a hole of the cast's target type (see
+    /// [`Cast::from_handle`]).
+    pub(crate) fn from_handle_typed(
+        view: ParameterHandle<'_>,
+        return_type: Type,
+    ) -> Result<Parameter, Error> {
+        // Positional parameters carry their 1-based position as the identifier
+        // (`$1` → "1"); anything non-numeric is a named parameter, which pivot
+        // doesn't support.
+        let identifier = view.identifier();
+        let position: usize = identifier
+            .parse()
+            .map_err(|_| Error::UnsupportedParameterIdentifier(identifier.clone()))?;
+        if position == 0 {
+            return Err(Error::UnsupportedParameterIdentifier(identifier));
+        }
+        Ok(Parameter {
+            index: position - 1,
+            return_type,
         })
     }
 }
@@ -153,7 +183,30 @@ impl Cast {
     pub(crate) fn from_handle(view: CastHandle<'_>) -> Result<Expression, Error> {
         // A `BoundCastExpression`'s target is its own result type.
         let target = type_from_logical(view.return_type())?;
+
+        // A cast over a `$n` placeholder is how the binder types a hole it
+        // couldn't resolve otherwise (the parameter itself can stay SQLNULL,
+        // which is why the raw handle is checked before converting the child).
+        // Fold the cast into the hole: the parameter adopts the cast's target
+        // as its planned type, and binding casts the bound value straight to
+        // it.
+        if let DuckExpression::Parameter(parameter) = view.child().expression() {
+            return Ok(Expression::Parameter(Parameter::from_handle_typed(
+                parameter, target,
+            )?));
+        }
+
         let source = Expression::from_handle(view.child())?;
+
+        // A nested cast (`CAST(CAST($1 AS a) AS b)`) folds its inner layer via
+        // the check above, leaving this cast over an already-built hole; fold
+        // again so a `Cast(Parameter)` never survives the build.
+        if let Expression::Parameter(parameter) = &source {
+            return Ok(Expression::Parameter(Parameter {
+                index: parameter.index,
+                return_type: target,
+            }));
+        }
 
         // Fold a cast and its `->` chain into one typed read. This lets the
         // kernel read a shredded leaf without building intermediate variants.
