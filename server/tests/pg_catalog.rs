@@ -100,6 +100,41 @@ async fn sink_create_not_null_and_column_list_insert(#[future] conn: Conn) {
     assert_eq!(rows, Ok(vec![vec![Some("1".into()), Some("alice".into())]]));
 }
 
+/// pgjdbc's real getTables query and its `name`-type connection-setup probe
+/// both execute (the `::name`/`::regclass` casts DuckDB lacks are normalized).
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn jdbc_gettables_and_name_setup_execute(#[future] conn: Conn) {
+    let _dir = create_people(&conn, "gt").await;
+
+    let name_setup = "SELECT length(repeat('1234567890', 1000)::NAME)";
+    assert!(
+        select_rows(&conn, name_setup).await.is_ok(),
+        "name-type setup query"
+    );
+
+    let gettables = "SELECT NULL AS TABLE_CAT, n.nspname AS TABLE_SCHEM, c.relname AS TABLE_NAME, \
+      CASE n.nspname ~ '^pg_' OR n.nspname = 'information_schema' \
+        WHEN true THEN CASE WHEN n.nspname = 'pg_catalog' OR n.nspname = 'information_schema' \
+          THEN CASE c.relkind WHEN 'r' THEN 'SYSTEM TABLE' WHEN 'v' THEN 'SYSTEM VIEW' ELSE NULL END \
+          ELSE CASE c.relkind WHEN 'r' THEN 'TEMPORARY TABLE' WHEN 'v' THEN 'TEMPORARY VIEW' ELSE NULL END END \
+        WHEN false THEN CASE c.relkind WHEN 'r' THEN 'TABLE' WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' ELSE NULL END \
+        ELSE NULL END AS TABLE_TYPE, d.description AS REMARKS \
+      FROM pg_catalog.pg_namespace n, pg_catalog.pg_class c \
+        LEFT JOIN pg_catalog.pg_description d ON (c.oid = d.objoid AND d.objsubid = 0 AND d.classoid = 'pg_class'::regclass) \
+      WHERE c.relnamespace = n.oid AND c.relname LIKE 'gt' \
+        AND (false OR (c.relkind = 'r' AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema')) \
+      ORDER BY TABLE_TYPE, TABLE_SCHEM, TABLE_NAME";
+    let rows = select_rows(&conn, gettables).await;
+    assert_eq!(
+        rows.as_ref()
+            .map(|r| r.iter().map(|row| row[2].clone()).collect::<Vec<_>>()),
+        Ok(vec![Some("gt".into())]),
+        "getTables should list the 'gt' table: {rows:?}"
+    );
+}
+
 /// `pg_attribute` lists a table's columns with a `pg_class` join.
 #[rstest]
 #[awt]

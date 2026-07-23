@@ -108,6 +108,14 @@ fn rewrite_system_catalog_refs(sql: &str) -> String {
     for table in TABLES {
         out = out.replace(&format!("pg_catalog.{table}"), table);
     }
+    // The JDBC driver casts to Postgres pseudo-types DuckDB doesn't have. `name`
+    // is just a text type — treat the cast as varchar. `'pg_class'::regclass`
+    // only filters pg_description (always empty here) by table oid, so its exact
+    // value is irrelevant; reduce it to a constant so it needs no regclass type.
+    out = out
+        .replace("::NAME", "::VARCHAR")
+        .replace("::name", "::varchar");
+    out = out.replace("'pg_class'::regclass", "0");
     out
 }
 
