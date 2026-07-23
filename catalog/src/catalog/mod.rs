@@ -31,6 +31,7 @@
 mod binding;
 mod insert_sink;
 mod metadata_function;
+mod pg_catalog;
 mod table;
 
 pub use binding::TableBinding;
@@ -666,6 +667,26 @@ impl ParquetTransaction {
         self.snapshot.table(name)
     }
 
+    /// Every user table in the snapshot as `(name, columns)`, sorted by name so
+    /// the synthesized oids the `pg_catalog` tables assign are stable across
+    /// their separate scans. Used only to build those virtual tables.
+    pub fn snapshot_tables(&self) -> Vec<(String, Vec<planner::catalog::Column>)> {
+        let mut names: Vec<String> = self.snapshot.tables.names().map(str::to_string).collect();
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| {
+                let columns = self
+                    .snapshot
+                    .tables
+                    .get_by_name(&name)
+                    .map(CatalogTable::columns)
+                    .unwrap_or_default();
+                (name, columns)
+            })
+            .collect()
+    }
+
     fn drain_uploaded_files(&self) -> Vec<insert_sink::UploadedFile> {
         let mut files = Vec::new();
         loop {
@@ -680,7 +701,13 @@ impl ParquetTransaction {
 
 impl CatalogTransaction for ParquetTransaction {
     fn table(&self, name: &str) -> Option<Box<dyn Table>> {
-        Some(Box::new(ParquetTransaction::table(self, name)?))
+        if let Some(binding) = ParquetTransaction::table(self, name) {
+            return Some(Box::new(binding));
+        }
+        // No user table by this name: a client's catalog introspection may be
+        // asking for a `pg_catalog` system table, which we synthesize.
+        pg_catalog::resolve(name)
+            .map(|table| Box::new(pg_catalog::VirtualMetadataTable::new(table)) as Box<dyn Table>)
     }
 
     fn table_function(&self, name: &str) -> Option<Box<dyn TableFunction>> {

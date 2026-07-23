@@ -88,6 +88,29 @@ fn plan_is_cacheable(plan: &planner::Plan) -> bool {
     )
 }
 
+/// Strip the `pg_catalog.` schema qualifier from references to the virtual
+/// system tables pivot synthesizes (`pg_class`, `pg_attribute`, …). A JDBC
+/// client's catalog introspection writes them schema-qualified; unqualified,
+/// they resolve to pivot's virtual tables, while qualified they would hit
+/// DuckDB's built-in `pg_catalog` views (which scan table functions pivot can't
+/// run). Functions and casts like `pg_catalog.pg_get_expr(…)` / `::regclass`
+/// keep their qualifier and still resolve from the system catalog.
+fn rewrite_system_catalog_refs(sql: &str) -> String {
+    const TABLES: [&str; 6] = [
+        "pg_class",
+        "pg_namespace",
+        "pg_attribute",
+        "pg_type",
+        "pg_attrdef",
+        "pg_description",
+    ];
+    let mut out = sql.to_string();
+    for table in TABLES {
+        out = out.replace(&format!("pg_catalog.{table}"), table);
+    }
+    out
+}
+
 fn with_planner<R>(
     catalog: &Arc<dyn planner::catalog::Catalog>,
     f: impl FnOnce(&mut planner::Planner) -> R,
@@ -113,6 +136,7 @@ pub(crate) async fn execute_sql(
     dispatcher: dispatch::DataFlowDispatcher,
     sql: String,
 ) -> Result<Vec<arrow_array::RecordBatch>, String> {
+    let sql = rewrite_system_catalog_refs(&sql);
     // One transaction per statement: the query binds and compiles against this
     // snapshot of the catalog. Committed on success, rolled back on failure
     // (the async block scopes the `?` early-returns so both paths land below).
@@ -360,7 +384,7 @@ impl PivotQueryHandler {
         // failure both land on the commit/rollback at the end.
         let result: Result<Outcome> = async {
             let dispatcher = self.dispatcher.clone();
-            let query = query.to_string();
+            let query = rewrite_system_catalog_refs(query);
 
             // Reuse a cached plan if we've planned this exact SQL before. Only
             // read-only SELECT plans are ever inserted, so a cache hit is always a
