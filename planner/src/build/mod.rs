@@ -29,7 +29,7 @@ use crate::expression::{Error as ExpressionError, Expression, Function, Ref, Var
 use crate::operator::{
     Aggregate, CreateTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Insert,
     Join, Limit, Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan, TopN,
-    Values,
+    Values, Window,
 };
 use crate::plan::{self, PlanNode};
 use crate::types::{Type, type_from_logical};
@@ -161,6 +161,7 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         DuckOperator::Filter(f) => Operator::Filter(Filter::from_handle(f)?),
         DuckOperator::Aggregate(a) => Operator::Aggregate(Aggregate::from_handle(a)?),
         DuckOperator::OrderBy(o) => Operator::OrderBy(OrderBy::from_handle(o)?),
+        DuckOperator::Window(w) => Operator::Window(Window::from_handle(w)?),
         DuckOperator::TopN(t) => Operator::TopN(TopN::from_handle(t, ctx)?),
         DuckOperator::Limit(l) => Operator::Limit(Limit::from_handle(l)?),
         DuckOperator::TableScan(scan) => {

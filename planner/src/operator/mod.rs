@@ -29,6 +29,7 @@ mod set_variable;
 mod table_function;
 mod top_n;
 mod values;
+mod window;
 
 pub use aggregate::Aggregate;
 pub use create_table::CreateTable;
@@ -46,6 +47,7 @@ pub use set_variable::SetVariable;
 pub use table_function::{TableFunction, TableFunctionScan, TableFunctionSignature};
 pub use top_n::TopN;
 pub use values::Values;
+pub use window::Window;
 
 use crate::compile::{self, DynamicFilterSlots};
 use crate::expression::{self, Expression};
@@ -94,6 +96,7 @@ pub enum Operator {
     TableFunctionScan(TableFunctionScan),
     Projection(Projection),
     OrderBy(OrderBy),
+    Window(Window),
     Aggregate(Aggregate),
     Filter(Filter),
     TopN(TopN),
@@ -145,6 +148,12 @@ impl Operator {
             Operator::Filter(_) | Operator::OrderBy(_) | Operator::TopN(_) | Operator::Limit(_) => {
                 Ok(inputs[0].clone())
             }
+            // A row_number window appends one Int64 column after the input.
+            Operator::Window(_) => {
+                let mut types = inputs[0].clone();
+                types.push(Type::Int64);
+                Ok(types)
+            }
             // A VALUES source emits its expression columns; every row shares
             // the same types, so the first row speaks for all.
             Operator::Values(values) => {
@@ -184,6 +193,7 @@ impl fmt::Display for Operator {
             Operator::TableFunctionScan(t) => write!(f, "{t}"),
             Operator::Projection(p) => write!(f, "{p}"),
             Operator::OrderBy(o) => write!(f, "{o}"),
+            Operator::Window(w) => write!(f, "{w}"),
             Operator::Aggregate(a) => write!(f, "{a}"),
             Operator::Filter(fl) => write!(f, "{fl}"),
             Operator::TopN(t) => write!(f, "{t}"),

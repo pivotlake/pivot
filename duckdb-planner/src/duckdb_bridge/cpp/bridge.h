@@ -81,6 +81,14 @@ size_t lo_orderby_count(const LogicalOperator &op);
 uint8_t lo_orderby_direction(const LogicalOperator &op, size_t index);
 const Expression &lo_orderby_expr(const LogicalOperator &op, size_t index);
 
+size_t lo_window_expr_count(const LogicalOperator &op);
+uint8_t lo_window_expr_type(const LogicalOperator &op, size_t index);
+size_t lo_window_partition_count(const LogicalOperator &op, size_t index);
+const Expression &lo_window_partition_expr(const LogicalOperator &op, size_t index, size_t partition);
+size_t lo_window_order_count(const LogicalOperator &op, size_t index);
+const Expression &lo_window_order_expr(const LogicalOperator &op, size_t index, size_t order);
+uint8_t lo_window_order_direction(const LogicalOperator &op, size_t index, size_t order);
+
 // ---- Aggregate ----
 size_t lo_aggregate_group_count(const LogicalOperator &op);
 const Expression &lo_aggregate_group(const LogicalOperator &op, size_t index);

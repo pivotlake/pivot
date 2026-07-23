@@ -9,13 +9,13 @@ use std::any::Any;
 
 use duckdb_planner::DuckDBTable;
 use duckdb_planner::catalog_provider::OptionalTableWrapper;
-use duckdb_planner::duckdb_bridge::duckdb_types::LimitNodeType;
+use duckdb_planner::duckdb_bridge::duckdb_types::{ExpressionType, LimitNodeType};
 use duckdb_planner::handle::{
-    Aggregate as AggregateView, CreateTable as CreateTableView, Filter as FilterView,
+    Aggregate as AggregateView, CreateTable as CreateTableView, Expr, Filter as FilterView,
     Insert as InsertView, Limit as LimitView, OrderBy as OrderByView, OrderKey,
     Projection as ProjectionView, Reset as ResetView, Set as SetView,
     TableFunctionScan as TableFunctionScanView, TableScan as TableScanView, TopN as TopNView,
-    Values as ValuesView,
+    Values as ValuesView, Window as WindowView,
 };
 
 use super::{BuildCtx, build_scan_columns};
@@ -23,7 +23,8 @@ use crate::catalog::{Column, CreateTableRequest, DuckDBTableAdapter, Table};
 use crate::expression::{Error as ExpressionError, Expression};
 use crate::operator::{
     Aggregate, CreateTable, Error as OperatorError, Filter, Input, Insert, Limit, OrderBy,
-    OrderByNode, Projection, SetVariable, TableFunctionScan, TopN, Values,
+    OrderByDirection, OrderByNode, Projection, SetVariable, TableFunctionScan, TopN, Values,
+    Window,
 };
 use crate::types::type_from_logical;
 
@@ -223,6 +224,57 @@ fn build_orders<'a>(
         })
     })
     .collect()
+}
+
+impl Window {
+    pub(crate) fn from_handle(view: WindowView<'_>) -> Result<Window, OperatorError> {
+        let mut expressions = view.expressions();
+        let expr = expressions
+            .next()
+            .ok_or_else(|| OperatorError::Unsupported("window with no expressions".to_string()))?;
+        if expressions.next().is_some() {
+            return Err(OperatorError::Unsupported(
+                "only a single window function is supported".to_string(),
+            ));
+        }
+        if expr.expr_type() != ExpressionType::WINDOW_ROW_NUMBER {
+            return Err(OperatorError::Unsupported(format!(
+                "Unsupported window function: {:?}",
+                expr.expr_type()
+            )));
+        }
+        let partition_keys = expr
+            .partitions()
+            .map(window_key)
+            .collect::<Result<Vec<usize>, OperatorError>>()?;
+        let order_keys = expr
+            .orders()
+            .map(|key| -> Result<(usize, bool), OperatorError> {
+                Ok((
+                    window_key(key.expression)?,
+                    matches!(
+                        OrderByDirection::from(key.direction),
+                        OrderByDirection::Desc
+                    ),
+                ))
+            })
+            .collect::<Result<Vec<(usize, bool)>, OperatorError>>()?;
+        Ok(Window {
+            partition_keys,
+            order_keys,
+        })
+    }
+}
+
+/// The column a window partition/order key must be: after DuckDB's binding
+/// resolver, a plain column reference into the window's input.
+fn window_key(expr: Expr<'_>) -> Result<usize, OperatorError> {
+    match Expression::from_handle(expr)? {
+        Expression::Ref(reference) => Ok(reference.column_idx),
+        other => Err(OperatorError::Unsupported(format!(
+            "window partition/order key must be a column, got: {other:?}"
+        ))),
+    }
 }
 
 /// Resolve a bound catalog entry into the Pivot [`Table`] it wraps: the DuckDB

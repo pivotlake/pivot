@@ -99,15 +99,31 @@ async fn pg_attribute_lists_columns(#[future] conn: Conn) {
     );
 }
 
-/// Diagnostic: run increasingly complete slices of pgjdbc's real getColumns so
-/// one run reveals every still-missing engine feature (LEFT joins, the
-/// row_number window, pg_get_expr, nullif) at once.
+/// Slices of pgjdbc's real getColumns, up to the whole query, all execute:
+/// virtual pg_catalog tables + joins + LEFT joins + the row_number window +
+/// pg_get_expr/nullif, and the IN-list that would otherwise materialize.
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
-async fn getcolumns_feature_probe(#[future] conn: Conn) {
+async fn jdbc_getcolumns_slices_all_execute(#[future] conn: Conn) {
     let _dir = create_people(&conn, "probe").await;
-    let variants: [(&str, &str); 5] = [
+    let variants: [(&str, &str); 9] = [
+        (
+            "relkind-eq",
+            "SELECT relname FROM pg_class WHERE relkind = 'r'",
+        ),
+        (
+            "in-2vals",
+            "SELECT relname FROM pg_class WHERE relkind IN ('r', 'p')",
+        ),
+        (
+            "in-5vals",
+            "SELECT relname FROM pg_class WHERE relkind IN ('r', 'p', 'v', 'f', 'm')",
+        ),
+        (
+            "in-5vals-different-col",
+            "SELECT relname FROM pg_class WHERE relname IN ('a', 'b', 'c', 'd', 'e')",
+        ),
         (
             "inner-joins",
             "SELECT n.nspname, c.relname, a.attname, a.atttypid, t.typtype \
@@ -170,5 +186,10 @@ async fn getcolumns_feature_probe(#[future] conn: Conn) {
             Err(e) => report.push(format!("{label}: ERR {e}")),
         }
     }
-    panic!("getColumns feature probe:\n{}", report.join("\n"));
+    let failed: Vec<&String> = report.iter().filter(|r| r.contains("ERR")).collect();
+    assert!(
+        failed.is_empty(),
+        "getColumns feature gaps:\n{}",
+        report.join("\n")
+    );
 }

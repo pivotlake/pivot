@@ -142,6 +142,7 @@ impl<'plan> LogicalOp<'plan> {
             L::LOGICAL_FILTER => Operator::Filter(Filter { raw: self.raw }),
             L::LOGICAL_AGGREGATE_AND_GROUP_BY => Operator::Aggregate(Aggregate { raw: self.raw }),
             L::LOGICAL_ORDER_BY => Operator::OrderBy(OrderBy { raw: self.raw }),
+            L::LOGICAL_WINDOW => Operator::Window(Window { raw: self.raw }),
             L::LOGICAL_TOP_N => Operator::TopN(TopN { raw: self.raw }),
             L::LOGICAL_LIMIT => Operator::Limit(Limit { raw: self.raw }),
             L::LOGICAL_GET if ffi::lo_get_has_table(self.raw) => {
@@ -173,6 +174,7 @@ pub enum Operator<'plan> {
     Filter(Filter<'plan>),
     Aggregate(Aggregate<'plan>),
     OrderBy(OrderBy<'plan>),
+    Window(Window<'plan>),
     TopN(TopN<'plan>),
     Limit(Limit<'plan>),
     /// A base-table scan (`LOGICAL_GET` over a table).
@@ -223,6 +225,8 @@ define_handles! { ffi::LogicalOperator;
     Aggregate,
     /// A `LogicalOrder`: a list of sort keys.
     OrderBy,
+    /// A `LogicalWindow`: window expressions (e.g. `row_number()`) over its child.
+    Window,
     /// A `LogicalTopN`: ORDER BY + LIMIT, optionally a dynamic-filter producer.
     TopN,
     /// A `LogicalLimit`: a bare `LIMIT`/`OFFSET` with no ORDER BY.
@@ -324,6 +328,45 @@ impl<'plan> OrderBy<'plan> {
             expression: Expr {
                 raw: ffi::lo_orderby_expr(self.raw, i),
             },
+        })
+    }
+}
+
+/// One window expression of a [`Window`] operator (e.g. one `row_number()`),
+/// with its `PARTITION BY` keys and `ORDER BY` keys.
+#[derive(Clone, Copy)]
+pub struct WindowExpr<'plan> {
+    raw: &'plan ffi::LogicalOperator,
+    index: usize,
+}
+
+impl<'plan> WindowExpr<'plan> {
+    /// The window function's [`ExpressionType`] (e.g. `WINDOW_ROW_NUMBER`).
+    pub fn expr_type(self) -> ExpressionType {
+        ExpressionType::from_u8(ffi::lo_window_expr_type(self.raw, self.index))
+    }
+
+    pub fn partitions(self) -> impl Iterator<Item = Expr<'plan>> {
+        (0..ffi::lo_window_partition_count(self.raw, self.index)).map(move |p| Expr {
+            raw: ffi::lo_window_partition_expr(self.raw, self.index, p),
+        })
+    }
+
+    pub fn orders(self) -> impl Iterator<Item = OrderKey<'plan>> {
+        (0..ffi::lo_window_order_count(self.raw, self.index)).map(move |o| OrderKey {
+            direction: OrderType::from_u8(ffi::lo_window_order_direction(self.raw, self.index, o)),
+            expression: Expr {
+                raw: ffi::lo_window_order_expr(self.raw, self.index, o),
+            },
+        })
+    }
+}
+
+impl<'plan> Window<'plan> {
+    pub fn expressions(self) -> impl Iterator<Item = WindowExpr<'plan>> {
+        (0..ffi::lo_window_expr_count(self.raw)).map(move |i| WindowExpr {
+            raw: self.raw,
+            index: i,
         })
     }
 }

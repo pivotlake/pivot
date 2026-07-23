@@ -173,6 +173,18 @@ pub mod ffi {
         fn lo_orderby_direction(op: &LogicalOperator, index: usize) -> u8;
         fn lo_orderby_expr(op: &LogicalOperator, index: usize) -> &Expression;
 
+        fn lo_window_expr_count(op: &LogicalOperator) -> usize;
+        fn lo_window_expr_type(op: &LogicalOperator, index: usize) -> u8;
+        fn lo_window_partition_count(op: &LogicalOperator, index: usize) -> usize;
+        fn lo_window_partition_expr(
+            op: &LogicalOperator,
+            index: usize,
+            partition: usize,
+        ) -> &Expression;
+        fn lo_window_order_count(op: &LogicalOperator, index: usize) -> usize;
+        fn lo_window_order_expr(op: &LogicalOperator, index: usize, order: usize) -> &Expression;
+        fn lo_window_order_direction(op: &LogicalOperator, index: usize, order: usize) -> u8;
+
         // ---- Aggregate ----
         fn lo_aggregate_group_count(op: &LogicalOperator) -> usize;
         fn lo_aggregate_group(op: &LogicalOperator, index: usize) -> &Expression;

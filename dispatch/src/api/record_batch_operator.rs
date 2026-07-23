@@ -62,7 +62,7 @@ use crate::operations::{
     DynamicFilterSlot, F64Cell, FilterFactory, GroupFactory, GroupLimit, IntCell,
     JoinOutputColumns, KeyExtractor, LimitFactory, MapFactory, NullaryFactory,
     NullaryOperatorFactory, OrderBy, OrderByLimitFactory, UnaryFactory, UnaryOperator,
-    UnaryOperatorFactory, create_join_factories,
+    UnaryOperatorFactory, WindowRowNumberFactory, create_join_factories,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle, DataFlowStats};
 pub const RECORD_BATCH_SIZE: usize = 8192;
@@ -551,6 +551,20 @@ impl RecordBatchOperatorSpec {
     /// ```
     pub fn order_by_limit(self, order_by: Vec<OrderBy>, limit: usize) -> Self {
         self.order_by_limit_offset(order_by, limit, 0, None)
+    }
+
+    /// `row_number() OVER (PARTITION BY … ORDER BY …)`: gather all rows, sort by
+    /// `order_by` (the partition keys, then the ordering keys), and append an
+    /// `Int64` `row_number` column that restarts at 1 for each partition.
+    /// `partition_key_count` is how many leading `order_by` entries are the
+    /// partition keys.
+    pub fn window_row_number(self, order_by: Vec<OrderBy>, partition_key_count: usize) -> Self {
+        let worker_count = self.worker_count();
+        self.unary(WindowRowNumberFactory::create_for_workers(
+            order_by,
+            partition_key_count,
+            worker_count,
+        ))
     }
 
     /// Like [`order_by_limit`](Self::order_by_limit) but skips the first

@@ -7,6 +7,8 @@
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
+#include "duckdb/planner/operator/logical_window.hpp"
+#include "duckdb/planner/expression/bound_window_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
@@ -346,6 +348,40 @@ uint8_t lo_orderby_direction(const LogicalOperator &op, size_t index) {
 
 const Expression &lo_orderby_expr(const LogicalOperator &op, size_t index) {
 	return *as<duckdb::LogicalOrder>(op).orders[index].expression;
+}
+
+// ---- Window ----
+
+static duckdb::BoundWindowExpression &window_expr(const LogicalOperator &op, size_t index) {
+	return as<duckdb::LogicalWindow>(op).expressions[index]->Cast<duckdb::BoundWindowExpression>();
+}
+
+size_t lo_window_expr_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalWindow>(op).expressions.size();
+}
+
+uint8_t lo_window_expr_type(const LogicalOperator &op, size_t index) {
+	return static_cast<uint8_t>(window_expr(op, index).GetExpressionType());
+}
+
+size_t lo_window_partition_count(const LogicalOperator &op, size_t index) {
+	return window_expr(op, index).partitions.size();
+}
+
+const Expression &lo_window_partition_expr(const LogicalOperator &op, size_t index, size_t partition) {
+	return *window_expr(op, index).partitions[partition];
+}
+
+size_t lo_window_order_count(const LogicalOperator &op, size_t index) {
+	return window_expr(op, index).orders.size();
+}
+
+const Expression &lo_window_order_expr(const LogicalOperator &op, size_t index, size_t order) {
+	return *window_expr(op, index).orders[order].expression;
+}
+
+uint8_t lo_window_order_direction(const LogicalOperator &op, size_t index, size_t order) {
+	return static_cast<uint8_t>(window_expr(op, index).orders[order].type);
 }
 
 // ---- Aggregate ----
