@@ -3,10 +3,26 @@ fn main() {
         .map(|n| n.get().to_string())
         .unwrap_or_else(|_| "4".to_string());
 
-    let duckdb = cmake::Config::new("duckdb-sources")
+    let mut duckdb_config = cmake::Config::new("duckdb-sources");
+    duckdb_config
         .profile("Release")
-        .build_target("duckdb_static")
-        .build();
+        .build_target("duckdb_static");
+
+    // Route DuckDB's C/C++ compiles through the same content-addressed build
+    // cache that wraps rustc, so a fresh checkout restores the object files
+    // instead of recompiling all of DuckDB from scratch. cmake spawns the
+    // compiler directly, so without a launcher the cache never sees these.
+    // Builds that want fresh, uncached output clear RUSTC_WRAPPER and so skip
+    // the launcher automatically.
+    if let Ok(wrapper) = std::env::var("RUSTC_WRAPPER") {
+        if !wrapper.is_empty() {
+            duckdb_config
+                .define("CMAKE_C_COMPILER_LAUNCHER", &wrapper)
+                .define("CMAKE_CXX_COMPILER_LAUNCHER", &wrapper);
+        }
+    }
+
+    let duckdb = duckdb_config.build();
 
     // Build parquet and core_functions extensions
     let build_dir = duckdb.join("build");
