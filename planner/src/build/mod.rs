@@ -295,32 +295,101 @@ fn build_join(
                 }),
             })
         }
-        // A LEFT/RIGHT join whose null-producing side is known-empty keeps the
-        // other side's rows and null-fills the empty side's columns — no outer
-        // join needed, and the join conditions don't matter (nothing matches an
-        // empty side). DuckDB may rewrite `A LEFT JOIN B` as `B RIGHT JOIN A`,
-        // so both directions appear.
-        JoinType::LEFT if node_produces_no_rows(&inputs[1]) => Ok(null_extended_join(
-            op,
-            inputs,
-            &probe_types,
-            &probe_output,
-            &build_types,
-            &build_output,
-            PreservedSide::Left,
-        )),
-        JoinType::RIGHT if node_produces_no_rows(&inputs[0]) => Ok(null_extended_join(
-            op,
-            inputs,
-            &probe_types,
-            &probe_output,
-            &build_types,
-            &build_output,
-            PreservedSide::Right,
-        )),
+        // A LEFT/RIGHT join keeps one side's rows and null-fills the other side's
+        // columns whenever nothing on that side can ever match — either the side
+        // is known-empty, or an equality key on it is provably always NULL (a NULL
+        // key matches nothing), which happens when it chains off an already
+        // null-extended empty table. Then the outer join degenerates to a
+        // projection: no outer join operator needed, and the conditions no longer
+        // matter. DuckDB may rewrite `A LEFT JOIN B` as `B RIGHT JOIN A`, so both
+        // directions appear.
+        JoinType::LEFT
+            if node_produces_no_rows(&inputs[1])
+                || outer_join_never_matches(&join, &inputs[0], JoinKeySide::Probe) =>
+        {
+            Ok(null_extended_join(
+                op,
+                inputs,
+                &probe_types,
+                &probe_output,
+                &build_types,
+                &build_output,
+                PreservedSide::Left,
+            ))
+        }
+        JoinType::RIGHT
+            if node_produces_no_rows(&inputs[0])
+                || outer_join_never_matches(&join, &inputs[1], JoinKeySide::Build) =>
+        {
+            Ok(null_extended_join(
+                op,
+                inputs,
+                &probe_types,
+                &probe_output,
+                &build_types,
+                &build_output,
+                PreservedSide::Right,
+            ))
+        }
         other => Err(OperatorError::Unsupported(format!(
             "Unsupported join type: {other:?}"
         ))),
+    }
+}
+
+/// Which key of an equality condition to inspect: the probe (left) side or the
+/// build (right) side.
+enum JoinKeySide {
+    Probe,
+    Build,
+}
+
+/// Whether an outer join can never produce a match, so it reduces to
+/// null-extending the preserved side: any equality condition compares against a
+/// plain column on the given side that is provably always NULL (a NULL key never
+/// equals anything).
+fn outer_join_never_matches(
+    join: &ComparisonJoinView<'_>,
+    keyed_node: &PlanNode,
+    side: JoinKeySide,
+) -> bool {
+    join.conditions().any(|condition| {
+        if condition.comparison != ExpressionType::COMPARE_EQUAL {
+            return false;
+        }
+        let key = match side {
+            JoinKeySide::Probe => condition.left,
+            JoinKeySide::Build => condition.right,
+        };
+        matches!(
+            Expression::from_handle(key),
+            Ok(Expression::Ref(reference))
+                if column_is_always_null(keyed_node, reference.column_idx)
+        )
+    })
+}
+
+/// Whether a built subtree's column at `index` is provably always NULL without
+/// reading the snapshot: a typed-NULL constant (as a null-extended empty side
+/// emits), or a reference chain that lands on one.
+fn column_is_always_null(node: &PlanNode, index: usize) -> bool {
+    match &node.operator {
+        Operator::Projection(projection) => match projection.projections.get(index) {
+            Some(Expression::Constant(value)) => {
+                let (array, _) = arrow_array::Datum::get(value);
+                array.is_null(0)
+            }
+            Some(Expression::Ref(reference)) => node
+                .inputs
+                .first()
+                .is_some_and(|child| column_is_always_null(child, reference.column_idx)),
+            _ => false,
+        },
+        Operator::Filter(_) => node
+            .inputs
+            .first()
+            .is_some_and(|child| column_is_always_null(child, index)),
+        _ => false,
     }
 }
 

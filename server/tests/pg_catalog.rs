@@ -154,6 +154,40 @@ async fn jdbc_getprimarykeys_returns_empty(#[future] conn: Conn) {
     assert_eq!(rows, Ok(vec![]), "getPrimaryKeys should be empty: {rows:?}");
 }
 
+/// pgjdbc's full getColumns, including the trailing description LEFT JOINs to
+/// the non-empty `pg_class`/`pg_namespace` whose keys chain off the empty
+/// `pg_description` (so they never match and null-extend).
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn jdbc_full_getcolumns_with_description_joins(#[future] conn: Conn) {
+    let _dir = create_people(&conn, "gc").await;
+
+    let getcolumns = "SELECT * FROM (SELECT n.nspname,c.relname,a.attname,a.atttypid, \
+      a.attnotnull OR (t.typtype = 'd' AND t.typnotnull) AS attnotnull,a.atttypmod,a.attlen,t.typtypmod, \
+      row_number() OVER (PARTITION BY a.attrelid ORDER BY a.attnum) AS attnum, \
+      nullif(a.attidentity, '') as attidentity,nullif(a.attgenerated, '') as attgenerated, \
+      pg_catalog.pg_get_expr(def.adbin, def.adrelid) AS adsrc,dsc.description,t.typbasetype,t.typtype \
+      FROM pg_catalog.pg_namespace n \
+        JOIN pg_catalog.pg_class c ON (c.relnamespace = n.oid) \
+        JOIN pg_catalog.pg_attribute a ON (a.attrelid=c.oid) \
+        JOIN pg_catalog.pg_type t ON (a.atttypid = t.oid) \
+        LEFT JOIN pg_catalog.pg_attrdef def ON (a.attrelid=def.adrelid AND a.attnum = def.adnum) \
+        LEFT JOIN pg_catalog.pg_description dsc ON (c.oid=dsc.objoid AND a.attnum = dsc.objsubid) \
+        LEFT JOIN pg_catalog.pg_class dc ON (dc.oid=dsc.classoid AND dc.relname='pg_class') \
+        LEFT JOIN pg_catalog.pg_namespace dn ON (dc.relnamespace=dn.oid AND dn.nspname='pg_catalog') \
+        WHERE c.relkind in ('r','p','v','f','m') and a.attnum > 0 AND NOT a.attisdropped \
+        AND c.relname LIKE 'gc') c WHERE true ORDER BY nspname,c.relname,attnum";
+
+    let rows = select_rows(&conn, getcolumns).await;
+    assert_eq!(
+        rows.as_ref()
+            .map(|r| r.iter().map(|row| row[2].clone()).collect::<Vec<_>>()),
+        Ok(vec![Some("id".into()), Some("name".into())]),
+        "full getColumns should list the two columns: {rows:?}"
+    );
+}
+
 /// `pg_attribute` lists a table's columns with a `pg_class` join.
 #[rstest]
 #[awt]
