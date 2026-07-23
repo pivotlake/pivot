@@ -47,6 +47,7 @@ use crate::manifest::{
 };
 use crate::parquet::ParquetTableError;
 use crate::store::{self, DataFile, FileRef, LocalStore, ObjectPath, ObjectStore, open_store};
+use async_trait::async_trait;
 use crossbeam_deque::{Injector, Steal};
 use dispatch::{DataFlowDispatcher, DataFlowError, RecordBatchOperatorSpec};
 use metadata_function::MetadataTableFunction;
@@ -162,6 +163,7 @@ impl TableIndex {
 /// them (compaction), which CAS a new version into the store. Copies drift; every query resolve refreshes its copy
 /// to the latest committed version, so a commit by another process (or this one)
 /// becomes visible to the next query.
+#[derive(Clone)]
 pub struct ParquetCatalog {
     /// The in-memory table set. The lock guards the *set* (add on `CREATE`,
     /// swap-in on a resolve's refresh); each [`CatalogTable`] is itself a
@@ -540,6 +542,7 @@ impl ParquetCatalog {
     }
 }
 
+#[async_trait]
 impl Catalog for ParquetCatalog {
     /// Open a transaction: freeze the table set as it stands right now. Every
     /// table the transaction binds resolves from that frozen
@@ -559,7 +562,36 @@ impl Catalog for ParquetCatalog {
         Ok(self.create(request, dispatcher)?)
     }
 
-    fn commit_transaction(&self, transaction: Arc<dyn CatalogTransaction>) -> CatalogResult<()> {
+    async fn commit_transaction(
+        &self,
+        transaction: Arc<dyn CatalogTransaction>,
+    ) -> CatalogResult<()> {
+        // A read-only transaction has no uploaded files, so its commit is an
+        // in-memory no-op and runs inline. Only a commit that must write
+        // manifest state for uploaded files does blocking store I/O, and that
+        // one hops to the blocking pool here rather than making every caller
+        // pay the thread round trip.
+        let has_uploads = transaction
+            .as_any()
+            .downcast_ref::<ParquetTransaction>()
+            .is_some_and(|parquet| !parquet.uploaded_files.is_empty());
+        if !has_uploads {
+            return self.finish_transaction(transaction);
+        }
+        let catalog = self.clone();
+        tokio::task::spawn_blocking(move || catalog.finish_transaction(transaction))
+            .await
+            .map_err(|e| {
+                CatalogError::Other(format!("transaction commit thread panicked: {e}").into())
+            })?
+    }
+}
+
+impl ParquetCatalog {
+    /// Apply `transaction`'s uploaded files to their tables and publish the
+    /// committed versions. The blocking tail of
+    /// [`commit_transaction`](Catalog::commit_transaction).
+    fn finish_transaction(&self, transaction: Arc<dyn CatalogTransaction>) -> CatalogResult<()> {
         let transaction = transaction
             .as_any()
             .downcast_ref::<ParquetTransaction>()

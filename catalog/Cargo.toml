@@ -5,6 +5,10 @@ edition.workspace = true
 
 [dependencies]
 planner = { workspace = true }
+async-trait = "0.1"
+# `rt` for `spawn_blocking`: a transaction commit with uploaded files hops its
+# blocking store I/O off the caller's async thread itself.
+tokio = { workspace = true, features = ["rt"] }
 dispatch = { workspace = true }
 thriftparquet = { workspace = true }
 arrow-array = { workspace = true }
