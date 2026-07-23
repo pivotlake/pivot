@@ -114,12 +114,18 @@ impl From<Error> for CatalogError {
 
 /// The catalog's table set. A table's durable identity is its [`Uuid`], so the
 /// tables are owned by `by_uuid`; `name_to_uuid` is a lightweight lookup index
-/// on top. Keeping them separate means only one map owns each [`CatalogTable`]
+/// on top. Keeping them separate means only one map owns each table entry
 /// (no aliasing), a rename touches only the name index, and a commit/publish
 /// touches only `by_uuid` - the two never fight over the same value.
+///
+/// Each table sits behind an `Arc`: a published [`CatalogTable`] is immutable
+/// (writers clone one out, evolve their copy, and publish the result as a new
+/// entry), so snapshots and bindings share the published value by handle. That
+/// keeps cloning the index (one per transaction snapshot) proportional to the
+/// table count, never to the tables' columns and row-group lists.
 #[derive(Clone, Default)]
 struct TableIndex {
-    by_uuid: HashMap<Uuid, CatalogTable>,
+    by_uuid: HashMap<Uuid, Arc<CatalogTable>>,
     name_to_uuid: HashMap<String, Uuid>,
 }
 
@@ -128,14 +134,14 @@ impl TableIndex {
     fn insert(&mut self, table: CatalogTable) {
         self.name_to_uuid
             .insert(table.name().to_string(), table.id());
-        self.by_uuid.insert(table.id(), table);
+        self.by_uuid.insert(table.id(), Arc::new(table));
     }
 
-    fn get_by_name(&self, name: &str) -> Option<&CatalogTable> {
+    fn get_by_name(&self, name: &str) -> Option<&Arc<CatalogTable>> {
         self.by_uuid.get(self.name_to_uuid.get(name)?)
     }
 
-    fn get_by_id(&self, id: &Uuid) -> Option<&CatalogTable> {
+    fn get_by_id(&self, id: &Uuid) -> Option<&Arc<CatalogTable>> {
         self.by_uuid.get(id)
     }
 
@@ -143,7 +149,7 @@ impl TableIndex {
         self.name_to_uuid.contains_key(name)
     }
 
-    fn values(&self) -> impl Iterator<Item = &CatalogTable> {
+    fn values(&self) -> impl Iterator<Item = &Arc<CatalogTable>> {
         self.by_uuid.values()
     }
 
@@ -368,7 +374,11 @@ impl ParquetCatalog {
     /// lag until its next resolve refreshes it (which is fine — the store is the
     /// source of truth). `None` if no such table exists.
     pub fn table_handle(&self, name: &str) -> Option<CatalogTable> {
-        self.tables.read().unwrap().get_by_name(name).cloned()
+        self.tables
+            .read()
+            .unwrap()
+            .get_by_name(name)
+            .map(|table| (**table).clone())
     }
 
     /// Whether a table named `name` exists in the catalog (a cheap membership
@@ -381,14 +391,23 @@ impl ParquetCatalog {
     /// A snapshot clone of every table the catalog currently holds — for a sweep
     /// (e.g. the compacter) that refreshes and evolves each one independently.
     pub fn tables(&self) -> Vec<CatalogTable> {
-        self.tables.read().unwrap().values().cloned().collect()
+        self.tables
+            .read()
+            .unwrap()
+            .values()
+            .map(|table| (**table).clone())
+            .collect()
     }
 
     /// A clone of the table with identity `id`, or `None` if it's gone (dropped,
     /// or a stale reference outliving the table). Used by INSERT commit to resolve
     /// the *live* table its files belong to, regardless of any concurrent rename.
     pub fn table_handle_by_id(&self, id: &Uuid) -> Option<CatalogTable> {
-        self.tables.read().unwrap().get_by_id(id).cloned()
+        self.tables
+            .read()
+            .unwrap()
+            .get_by_id(id)
+            .map(|table| (**table).clone())
     }
 
     /// A human-readable description of where this database is rooted (local
@@ -655,10 +674,10 @@ impl CatalogSnapshot {
         Some(TableBinding::new(table.id(), table.columns()))
     }
 
-    /// A clone of the table with identity `id`, or `None` if this snapshot has no
-    /// such table. Used by [`TableBinding::compile_insert`](binding::TableBinding::compile_insert)
-    /// to resolve the table it writes into by its durable id.
-    pub(super) fn catalog_table_by_id(&self, id: &Uuid) -> Option<CatalogTable> {
+    /// A shared handle to the table with identity `id`, or `None` if this
+    /// snapshot has no such table. Published tables are immutable, so handing
+    /// out the `Arc` shares the snapshot's entry instead of copying it.
+    pub(super) fn catalog_table_by_id(&self, id: &Uuid) -> Option<Arc<CatalogTable>> {
         self.tables.get_by_id(id).cloned()
     }
 
