@@ -238,7 +238,7 @@ fn connector_config(pivot_port: u16) -> String {
             "connector.class": "io.confluent.connect.jdbc.JdbcSinkConnector",
             "tasks.max": "1",
             "topics": "{TOPIC}",
-            "connection.url": "jdbc:postgresql://{PIVOT_HOST}:{pivot_port}/test",
+            "connection.url": "jdbc:postgresql://{PIVOT_HOST}:{pivot_port}/test?preferQueryMode=simple",
             "connection.user": "test",
             "connection.password": "test",
             "dialect.name": "PostgreSqlDatabaseDialect",

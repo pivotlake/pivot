@@ -54,9 +54,13 @@ impl Values {
 
 impl Insert {
     pub(crate) fn from_handle(view: InsertView<'_>) -> Result<Insert, OperatorError> {
-        if view.has_column_map() {
+        // A full-table, in-declared-order column list resolves to an identity
+        // column map, so the values arrive in storage order — accept it as a
+        // positional insert. A reordered or partial list would misroute columns.
+        if view.has_column_map() && !view.column_map_is_identity() {
             return Err(OperatorError::Unsupported(
-                "INSERT with an explicit target-column list is not supported".to_string(),
+                "INSERT with a reordered or partial target-column list is not supported"
+                    .to_string(),
             ));
         }
         if view.returns_rows() {

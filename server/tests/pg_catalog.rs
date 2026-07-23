@@ -78,6 +78,28 @@ async fn qualified_pg_catalog_pg_class(#[future] conn: Conn) {
     );
 }
 
+/// The DDL/DML shape the Kafka Connect sink emits: an auto-created table with
+/// `NOT NULL` columns, then a `INSERT INTO t (cols) VALUES (…)` naming its
+/// columns in table order.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn sink_create_not_null_and_column_list_insert(#[future] conn: Conn) {
+    let dir = tempfile::TempDir::new().unwrap();
+    conn.simple_query(&format!(
+        "CREATE TABLE sink (id BIGINT NOT NULL, name TEXT NOT NULL) WITH (path = '{}')",
+        dir.path().to_str().unwrap()
+    ))
+    .await
+    .unwrap();
+    conn.simple_query("INSERT INTO sink (id, name) VALUES (1, 'alice')")
+        .await
+        .unwrap();
+
+    let rows = select_rows(&conn, "SELECT id, name FROM sink").await;
+    assert_eq!(rows, Ok(vec![vec![Some("1".into()), Some("alice".into())]]));
+}
+
 /// `pg_attribute` lists a table's columns with a `pg_class` join.
 #[rstest]
 #[awt]

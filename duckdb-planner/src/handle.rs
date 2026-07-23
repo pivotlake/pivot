@@ -281,6 +281,15 @@ impl<'plan> Insert<'plan> {
         ffi::lo_insert_column_map_count(self.raw) != 0
     }
 
+    /// Whether the target-column list is the full table in declared order (the
+    /// column map is the identity `[0, 1, …]`), so the values already arrive in
+    /// storage order and the insert is effectively positional. A reordered or
+    /// partial list is not.
+    pub fn column_map_is_identity(self) -> bool {
+        (0..ffi::lo_insert_column_map_count(self.raw))
+            .all(|i| ffi::lo_insert_column_map_at(self.raw, i) == i)
+    }
+
     pub fn returns_rows(self) -> bool {
         ffi::lo_insert_returns_rows(self.raw)
     }

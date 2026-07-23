@@ -155,6 +155,7 @@ pub mod ffi {
         // ---- Insert ----
         fn lo_insert_take_table(op: &LogicalOperator) -> Box<OptionalTableWrapper>;
         fn lo_insert_column_map_count(op: &LogicalOperator) -> usize;
+        fn lo_insert_column_map_at(op: &LogicalOperator, index: usize) -> usize;
         fn lo_insert_returns_rows(op: &LogicalOperator) -> bool;
 
         // ---- Filter ----

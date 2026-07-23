@@ -67,6 +67,7 @@ const Expression &lo_values_expr(const LogicalOperator &op, size_t row, size_t c
 // ---- Insert ----
 rust::Box<OptionalTableWrapper> lo_insert_take_table(const LogicalOperator &op);
 size_t lo_insert_column_map_count(const LogicalOperator &op);
+size_t lo_insert_column_map_at(const LogicalOperator &op, size_t index);
 bool lo_insert_returns_rows(const LogicalOperator &op);
 
 // ---- Filter ----

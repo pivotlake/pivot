@@ -21,6 +21,7 @@
 #include "duckdb/planner/operator/logical_reset.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/parser/constraint.hpp"
+#include "duckdb/common/index_vector.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -309,6 +310,14 @@ rust::Box<OptionalTableWrapper> lo_insert_take_table(const LogicalOperator &op) 
 
 size_t lo_insert_column_map_count(const LogicalOperator &op) {
 	return as<duckdb::LogicalInsert>(op).column_index_map.size();
+}
+
+// The insert's `column_index_map[i]`: which source (VALUES) column fills storage
+// column `i`, or a huge sentinel for a defaulted column. An identity map means
+// the column list is the full table in declared order, so the values arrive in
+// storage order and the insert is effectively positional.
+size_t lo_insert_column_map_at(const LogicalOperator &op, size_t index) {
+	return as<duckdb::LogicalInsert>(op).column_index_map[duckdb::PhysicalIndex(index)];
 }
 
 bool lo_insert_returns_rows(const LogicalOperator &op) {
