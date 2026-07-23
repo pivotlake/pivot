@@ -2,7 +2,8 @@
 //! reader type per *value width*, each downcasting its column family once and
 //! yielding one row's value:
 //!
-//! - [`I64Reader`] — an integer column (Int16/Int32/Int64), widened to `i64`.
+//! - [`I64Reader`] — an integer column (Int16/Int32/Int64) widened to `i64`, or a
+//!   `Decimal64` column's raw unscaled `i64` values read as-is.
 //! - [`F64Reader`] — a float column (Float32/Float64), widened to `f64`.
 //! - [`U128Reader`] — a `Decimal128` column, read as a full `i128`.
 //!
@@ -14,18 +15,21 @@
 use crate::operations::unary::group::values::read::{IntRead, Read};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+    Decimal64Type, Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
 };
 use arrow_array::{PrimitiveArray, RecordBatch};
 use arrow_schema::DataType;
 
 /// An integer column bound at one of the supported widths, read as `i64`. The width
 /// is a payload, not a cross-product with the op: adding a width is one more variant
-/// here, shared by every integer op.
+/// here, shared by every integer op. A `Decimal64` column is one such width: its raw
+/// unscaled `i64` values fold exactly like an integer column's (every value of a
+/// column shares its scale, so the raw ordering and sums are the decimal ones).
 pub enum I64Reader<'b> {
     I16(&'b PrimitiveArray<Int16Type>),
     I32(&'b PrimitiveArray<Int32Type>),
     I64(&'b PrimitiveArray<Int64Type>),
+    Dec64(&'b PrimitiveArray<Decimal64Type>),
 }
 
 impl<'b> I64Reader<'b> {
@@ -35,6 +39,7 @@ impl<'b> I64Reader<'b> {
             DataType::Int16 => I64Reader::I16(col.as_primitive::<Int16Type>()),
             DataType::Int32 => I64Reader::I32(col.as_primitive::<Int32Type>()),
             DataType::Int64 => I64Reader::I64(col.as_primitive::<Int64Type>()),
+            DataType::Decimal64(_, _) => I64Reader::Dec64(col.as_primitive::<Decimal64Type>()),
             other => panic!("integer aggregate over unsupported column type {other:?}"),
         }
     }
@@ -44,6 +49,7 @@ impl<'b> I64Reader<'b> {
             I64Reader::I16(a) => IntRead::<Int16Type>::read(a, idx),
             I64Reader::I32(a) => IntRead::<Int32Type>::read(a, idx),
             I64Reader::I64(a) => IntRead::<Int64Type>::read(a, idx),
+            I64Reader::Dec64(a) => IntRead::<Decimal64Type>::read(a, idx),
         }
     }
 }

@@ -117,6 +117,10 @@ impl<'a> PlainSizes<'a> {
         Ok(match values.data_type() {
             DataType::Int32 | DataType::Float32 => Self::Fixed(4),
             DataType::Int64 | DataType::Float64 => Self::Fixed(8),
+            // A decimal's width follows its precision-chosen storage.
+            DataType::Decimal64(precision, _) | DataType::Decimal128(precision, _) => {
+                Self::Fixed(crate::parquet::decimal_write_storage(*precision).byte_width())
+            }
             DataType::Utf8 => Self::Utf8(values.as_string()),
             DataType::Utf8View => Self::Utf8View(values.as_string_view()),
             DataType::BinaryView => Self::BinaryView(values.as_binary_view()),

@@ -23,16 +23,23 @@
 //!   Date32            INT32              Date                    read only
 //!   Timestamp(Second) INT64              Timestamp{..}           read only
 //!   BinaryView        BYTE_ARRAY         unannotated             read+write
+//!   Decimal64(p,s)    INT32              Decimal (p <= 9)        read+write
+//!   Decimal64(p,s)    INT64              Decimal (p <= 18)       read+write
+//!   Decimal64/128     FIXED_LEN_B_A(n)   Decimal (p <= 38)       read, write p > 18
 //! ```
+//!
+//! A decimal's arrow carrier follows its declared precision: `Decimal64` up
+//! to 18 digits, `Decimal128` beyond, matching the planner's
+//! `physical_arrow_type` so a file-derived schema and a declared schema agree.
 //!
 //! The "read only" rows resolve files written elsewhere; pivot's own writer only
 //! emits the column set its encoder supports (Int32/Int64/Float32/Float64/
-//! strings/binary), so [`arrow_to_parquet_physical`] errors on the rest.
+//! strings/binary/decimals), so [`arrow_to_parquet_physical`] errors on the rest.
 
 use arrow_schema::{DataType, TimeUnit};
 
 use super::table::{Error, Result};
-use super::thrift::footer::LogicalType;
+use super::thrift::footer::{LogicalType, SchemaElement};
 use super::thrift::general::Type;
 
 // Parquet physical type ids, named off the same thrift enum the writer emits,
@@ -43,6 +50,72 @@ const INT64: i32 = Type::INT64 as i32;
 const FLOAT: i32 = Type::FLOAT as i32;
 const DOUBLE: i32 = Type::DOUBLE as i32;
 const BYTE_ARRAY: i32 = Type::BYTE_ARRAY as i32;
+const FIXED_LEN_BYTE_ARRAY: i32 = Type::FIXED_LEN_BYTE_ARRAY as i32;
+
+/// The fixed-length array width pivot writes a wide decimal with: the full 16
+/// bytes of the unscaled 128-bit integer, big-endian, per the Parquet spec.
+pub const DECIMAL_FIXED_LEN: i32 = 16;
+
+/// The physical storage pivot writes a decimal column with, chosen by its
+/// declared precision: the narrowest of the spec's three decimal storages
+/// that holds every value of that precision.
+///
+/// INT32 and INT64 store the unscaled integer little-endian like every other
+/// primitive (and decode through the same contiguous fast paths); only the
+/// wide FIXED_LEN_BYTE_ARRAY form is big-endian.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DecimalWriteStorage {
+    /// Up to 9 digits: 4 little-endian bytes.
+    Int32,
+    /// Up to 18 digits: 8 little-endian bytes.
+    Int64,
+    /// Beyond 18 digits: [`DECIMAL_FIXED_LEN`] big-endian bytes.
+    FixedLen,
+}
+
+/// The largest decimal precision an INT32-stored unscaled integer holds.
+pub const DECIMAL_INT32_MAX_PRECISION: u8 = 9;
+/// The largest decimal precision an INT64-stored unscaled integer holds.
+pub const DECIMAL_INT64_MAX_PRECISION: u8 = 18;
+
+/// The storage for a decimal of `precision` digits (see [`DecimalWriteStorage`]).
+pub fn decimal_write_storage(precision: u8) -> DecimalWriteStorage {
+    if precision <= DECIMAL_INT32_MAX_PRECISION {
+        DecimalWriteStorage::Int32
+    } else if precision <= DECIMAL_INT64_MAX_PRECISION {
+        DecimalWriteStorage::Int64
+    } else {
+        DecimalWriteStorage::FixedLen
+    }
+}
+
+impl DecimalWriteStorage {
+    /// The Parquet physical type id this storage writes.
+    pub fn physical_type(self) -> i32 {
+        match self {
+            DecimalWriteStorage::Int32 => INT32,
+            DecimalWriteStorage::Int64 => INT64,
+            DecimalWriteStorage::FixedLen => FIXED_LEN_BYTE_ARRAY,
+        }
+    }
+
+    /// Bytes one value occupies on disk.
+    pub fn byte_width(self) -> usize {
+        match self {
+            DecimalWriteStorage::Int32 => 4,
+            DecimalWriteStorage::Int64 => 8,
+            DecimalWriteStorage::FixedLen => DECIMAL_FIXED_LEN as usize,
+        }
+    }
+
+    /// The schema element's `type_length`, set only for the fixed-length form.
+    pub fn type_length(self) -> Option<i32> {
+        match self {
+            DecimalWriteStorage::FixedLen => Some(DECIMAL_FIXED_LEN),
+            DecimalWriteStorage::Int32 | DecimalWriteStorage::Int64 => None,
+        }
+    }
+}
 
 // Parquet `ConvertedType` ids: the legacy width/temporal annotation, read
 // alongside the modern `LogicalType`.
@@ -57,6 +130,9 @@ const CONVERTED_INT_32: i32 = 17;
 const CONVERTED_DATE: i32 = 6;
 const CONVERTED_TIMESTAMP_MILLIS: i32 = 9;
 const CONVERTED_TIMESTAMP_MICROS: i32 = 10;
+/// Legacy decimal annotation (superseded by `LogicalType::Decimal`), read
+/// together with the schema element's own `precision`/`scale` fields.
+const CONVERTED_DECIMAL: i32 = 5;
 
 /// Read path: a Parquet leaf's physical type (plus optional logical/converted
 /// annotations) -> the arrow [`DataType`] the executor decodes it into.
@@ -67,14 +143,25 @@ const CONVERTED_TIMESTAMP_MICROS: i32 = 10;
 /// in the file: it comes from the table's declared schema, and
 /// `apply_declared_types` (in `table.rs`) retypes such columns to string when
 /// the table declares them VARCHAR.
-pub fn parquet_to_arrow(
-    physical_type: Option<i32>,
-    converted_type: Option<i32>,
-    logical_type: Option<&LogicalType>,
-) -> Result<DataType> {
-    let pt = physical_type.ok_or_else(|| {
+pub fn parquet_to_arrow(elem: &SchemaElement) -> Result<DataType> {
+    let pt = elem.physical_type.ok_or_else(|| {
         Error::UnsupportedType("leaf schema element missing physical type".to_string())
     })?;
+    let converted_type = elem.converted_type;
+    let logical_type = elem.logical_type.as_ref();
+
+    if let Some((precision, scale)) = decimal_annotation(elem)? {
+        return match pt {
+            INT32 => decimal_arrow(precision, scale, DECIMAL_INT32_MAX_PRECISION as i32),
+            INT64 => decimal_arrow(precision, scale, DECIMAL_INT64_MAX_PRECISION as i32),
+            FIXED_LEN_BYTE_ARRAY => {
+                decimal_arrow(precision, scale, flba_decimal_max_precision(elem)?)
+            }
+            _ => Err(Error::UnsupportedType(format!(
+                "DECIMAL on parquet physical type {pt}"
+            ))),
+        };
+    }
 
     match pt {
         BOOLEAN => Ok(DataType::Boolean),
@@ -97,11 +184,65 @@ pub fn parquet_to_arrow(
     }
 }
 
+/// The precision and scale of a leaf's DECIMAL annotation, or `None` when the
+/// leaf is not a decimal. The modern `LogicalType` wins; the legacy
+/// `ConvertedType` reads the schema element's own precision/scale fields.
+fn decimal_annotation(elem: &SchemaElement) -> Result<Option<(i32, i32)>> {
+    if let Some(LogicalType::Decimal { scale, precision }) = elem.logical_type {
+        return Ok(Some((precision, scale)));
+    }
+    if elem.converted_type == Some(CONVERTED_DECIMAL) {
+        let (Some(precision), Some(scale)) = (elem.precision, elem.scale) else {
+            return Err(Error::UnsupportedType(
+                "DECIMAL converted type without precision/scale".to_string(),
+            ));
+        };
+        return Ok(Some((precision, scale)));
+    }
+    Ok(None)
+}
+
+/// The arrow type for a decimal leaf, after checking the annotation fits its
+/// physical storage (`max_precision` decimal digits). The carrier follows
+/// the declared precision: `Decimal64` up to 18 digits, `Decimal128` beyond.
+fn decimal_arrow(precision: i32, scale: i32, max_precision: i32) -> Result<DataType> {
+    if precision < 1 || precision > max_precision || scale < 0 || scale > precision {
+        return Err(Error::UnsupportedType(format!(
+            "DECIMAL({precision},{scale}) does not fit its physical storage \
+             (max precision {max_precision})"
+        )));
+    }
+    if precision <= planner::types::MAX_DECIMAL64_PRECISION as i32 {
+        Ok(DataType::Decimal64(precision as u8, scale as i8))
+    } else {
+        Ok(DataType::Decimal128(precision as u8, scale as i8))
+    }
+}
+
+/// The largest decimal precision a FIXED_LEN_BYTE_ARRAY of the element's
+/// `type_length` bytes can hold (the spec's `floor(log10(2^(8*len - 1) - 1))`
+/// table). Lengths beyond 16 bytes exceed the 128-bit unscaled integer the
+/// executor carries and are rejected.
+fn flba_decimal_max_precision(elem: &SchemaElement) -> Result<i32> {
+    const MAX_PRECISION_BY_LEN: [i32; 16] =
+        [2, 4, 6, 9, 11, 14, 16, 18, 21, 23, 26, 28, 31, 33, 36, 38];
+    match elem.type_length {
+        Some(len @ 1..=16) => Ok(MAX_PRECISION_BY_LEN[(len - 1) as usize]),
+        Some(len) => Err(Error::UnsupportedType(format!(
+            "DECIMAL with FIXED_LEN_BYTE_ARRAY length {len}"
+        ))),
+        None => Err(Error::UnsupportedType(
+            "FIXED_LEN_BYTE_ARRAY without a type_length".to_string(),
+        )),
+    }
+}
+
 /// The arrow type of an INT32 leaf, resolved from its annotation: a `DATE` is
 /// `Date32` (an INT32 day count), the integer annotations give the narrow widths,
 /// and a bare INT32 is `Int32`. The modern `LogicalType` wins; the legacy
-/// `ConvertedType` is the fallback. Errors on an annotation we don't support
-/// (e.g. a DECIMAL/TIME width) rather than silently reading raw `Int32`.
+/// `ConvertedType` is the fallback. Decimals are resolved before this is
+/// reached. Errors on an annotation we don't support (e.g. a TIME width)
+/// rather than silently reading raw `Int32`.
 fn int32_arrow(
     converted_type: Option<i32>,
     logical_type: Option<&LogicalType>,
@@ -162,10 +303,15 @@ fn int64_arrow(
 /// [`parquet_to_arrow`] over the writable subset; errors on a type the encoder
 /// doesn't emit.
 ///
-/// A `BinaryView` writes as an unannotated BYTE_ARRAY — the spec's own
+/// A `BinaryView` writes as an unannotated BYTE_ARRAY, the spec's own
 /// definition of binary, and what a variant's `metadata`/`value` leaves are.
 /// Leaving off the UTF8 annotation is what keeps [`parquet_to_arrow`] reading it
 /// back as binary rather than as text.
+///
+/// A decimal writes with the narrowest storage its precision allows
+/// ([`decimal_write_storage`]); the schema element's `type_length`, decimal
+/// annotation, and precision/scale complete the description on the writer
+/// side.
 pub fn arrow_to_parquet_physical(data_type: &DataType) -> Result<i32> {
     Ok(match data_type {
         DataType::Int32 => INT32,
@@ -173,6 +319,9 @@ pub fn arrow_to_parquet_physical(data_type: &DataType) -> Result<i32> {
         DataType::Float32 => FLOAT,
         DataType::Float64 => DOUBLE,
         DataType::Utf8 | DataType::Utf8View | DataType::BinaryView => BYTE_ARRAY,
+        DataType::Decimal64(precision, _) | DataType::Decimal128(precision, _) => {
+            decimal_write_storage(*precision).physical_type()
+        }
         other => {
             return Err(Error::UnsupportedType(format!("arrow type {other:?}")));
         }

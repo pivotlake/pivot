@@ -5,7 +5,8 @@ use super::schema::RowKeySchema;
 use ahash::RandomState;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+    Decimal64Type, Decimal128Type, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type,
+    UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch, StringViewArray};
 use arrow_schema::DataType;
@@ -13,7 +14,10 @@ use arrow_schema::DataType;
 /// Generates [`ColumnEncoder`] (the encode-side per-column binder) and its
 /// methods from the shared `int_key_types!` list, so its integer arms stay in
 /// lockstep with the decode side. The `Str` arm is spelled out because it is
-/// genuinely different (a `u32` length prefix, not a fixed-width value).
+/// genuinely different (a `u32` length prefix, not a fixed-width value); the
+/// `Dec64`/`Dec128` arms because a decimal carries a precision/scale the
+/// unit-variant pattern can't name (its raw bytes encode exactly like an
+/// integer of the same width).
 ///
 /// Per-type (rather than a single width-parameterised path) so each integer
 /// encodes a *const*-width little-endian copy via `to_le_bytes`, which the
@@ -22,12 +26,14 @@ use arrow_schema::DataType;
 macro_rules! define_column_encoder {
     ( $( ($variant:ident, $dt:ident, $arrow:ty, $native:ty) ),+ $(,)? ) => {
         /// Encodes one key column into the row blob: a downcast primitive array per
-        /// integer type, or a string array, bound once per batch. [`encode`] appends a
-        /// cell's canonical bytes.
+        /// fixed-width type, or a string array, bound once per batch. [`encode`]
+        /// appends a cell's canonical bytes.
         ///
         /// [`encode`]: ColumnEncoder::encode
         enum ColumnEncoder<'b> {
             $( $variant(&'b PrimitiveArray<$arrow>), )+
+            Dec64(&'b PrimitiveArray<Decimal64Type>),
+            Dec128(&'b PrimitiveArray<Decimal128Type>),
             Str(&'b StringViewArray),
         }
 
@@ -35,6 +41,8 @@ macro_rules! define_column_encoder {
             fn new(array: &'b ArrayRef) -> Self {
                 match array.data_type() {
                     $( DataType::$dt => ColumnEncoder::$variant(array.as_primitive()), )+
+                    DataType::Decimal64(_, _) => ColumnEncoder::Dec64(array.as_primitive()),
+                    DataType::Decimal128(_, _) => ColumnEncoder::Dec128(array.as_primitive()),
                     DataType::Utf8View => ColumnEncoder::Str(array.as_string_view()),
                     dt => panic!("row key column type not supported: {dt}"),
                 }
@@ -44,8 +52,10 @@ macro_rules! define_column_encoder {
             /// the batch row count, so the unchecked reads are sound.
             #[inline(always)]
             fn encode(&self, idx: usize, out: &mut Vec<u8>) {
-                // Every integer arm is the same: append the value's little-endian bytes
-                // (a const-width copy, see the type doc).
+                // Every fixed-width arm is the same: append the value's little-endian
+                // bytes (a const-width copy, see the type doc). A decimal appends its
+                // raw unscaled integer's bytes at its width; every value of a column
+                // shares its scale, so byte equality is value equality.
                 macro_rules! le {
                     ($a:expr) => {
                         out.extend_from_slice(&$a.value_unchecked(idx).to_le_bytes())
@@ -54,6 +64,8 @@ macro_rules! define_column_encoder {
                 unsafe {
                     match self {
                         $( ColumnEncoder::$variant(a) => le!(a), )+
+                        ColumnEncoder::Dec64(a) => le!(a),
+                        ColumnEncoder::Dec128(a) => le!(a),
                         ColumnEncoder::Str(a) => {
                             let s = a.value_unchecked(idx).as_bytes();
                             out.extend_from_slice(&(s.len() as u32).to_le_bytes());
@@ -106,6 +118,18 @@ impl<'b> RowReader<'b> {
                 if array.data_type() == want {
                     array.clone()
                 } else {
+                    // A decimal key must always arrive at its exact schema shape
+                    // (the planner threads the column's own precision/scale
+                    // through): a decimal-to-decimal arrow cast would rescale
+                    // the values, so a mismatch is a planning bug, not a cast.
+                    assert!(
+                        !matches!(
+                            array.data_type(),
+                            DataType::Decimal64(_, _) | DataType::Decimal128(_, _)
+                        ),
+                        "decimal row key column arrived as {} but the schema declares {want}",
+                        array.data_type()
+                    );
                     arrow::compute::cast(array, want).expect("row key column cast failed")
                 }
             })

@@ -280,7 +280,7 @@ impl Function {
             // `date`/`timestamp` ± `INTERVAL` carries an INTERVAL constant operand;
             // plain numeric `+`/`-` does not and stays `Arithmetic`.
             "+" | "-" => match func.children().position(|p| {
-                matches!(p.expression(), DuckExpression::Constant(c) if c.return_type() == LogicalTypeId::INTERVAL)
+                matches!(p.expression(), DuckExpression::Constant(c) if c.return_type().id == LogicalTypeId::INTERVAL)
             }) {
                 Some(idx) => Ok(Function::IntervalArithmetic(
                     IntervalArithmetic::from_handle(func, idx)?,

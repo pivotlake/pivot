@@ -319,8 +319,22 @@ size_t lo_filter_projection_map_index(const LogicalOperator &op, size_t index) {
 	return as<duckdb::LogicalFilter>(op).projection_map[index];
 }
 
-uint8_t lo_filter_type_id(const LogicalOperator &op, size_t index) {
-	return static_cast<uint8_t>(as<duckdb::LogicalFilter>(op).types[index].id());
+// Read a DuckDB LogicalType into the FFI struct: the id discriminant plus the
+// width/scale that complete a DECIMAL (zero for every other id).
+static BridgeLogicalType bridge_logical_type(const duckdb::LogicalType &type) {
+	BridgeLogicalType out;
+	out.id = static_cast<uint8_t>(type.id());
+	out.decimal_width = 0;
+	out.decimal_scale = 0;
+	if (type.id() == duckdb::LogicalTypeId::DECIMAL) {
+		out.decimal_width = duckdb::DecimalType::GetWidth(type);
+		out.decimal_scale = duckdb::DecimalType::GetScale(type);
+	}
+	return out;
+}
+
+BridgeLogicalType lo_filter_type_id(const LogicalOperator &op, size_t index) {
+	return bridge_logical_type(as<duckdb::LogicalFilter>(op).types[index]);
 }
 
 // ---- OrderBy ----
@@ -447,9 +461,9 @@ size_t lo_get_output_column(const LogicalOperator &op, size_t index) {
 	return get.GetColumnIds()[get_output_source(get, index)].GetPrimaryIndex();
 }
 
-uint8_t lo_get_output_type(const LogicalOperator &op, size_t index) {
+BridgeLogicalType lo_get_output_type(const LogicalOperator &op, size_t index) {
 	auto &get = as<duckdb::LogicalGet>(op);
-	return static_cast<uint8_t>(get.types[get_output_source(get, index)].id());
+	return bridge_logical_type(get.types[get_output_source(get, index)]);
 }
 
 // Find a DynamicFilter inside a TableFilter, peeling off a single OPTIONAL_FILTER
@@ -595,9 +609,9 @@ rust::String lo_create_column_name(const LogicalOperator &op, size_t index) {
 	return rust::String::lossy(col.GetName());
 }
 
-uint8_t lo_create_column_type(const LogicalOperator &op, size_t index) {
+BridgeLogicalType lo_create_column_type(const LogicalOperator &op, size_t index) {
 	auto &col = create_table_info(op).columns.GetColumn(duckdb::LogicalIndex(index));
-	return static_cast<uint8_t>(col.Type().id());
+	return bridge_logical_type(col.Type());
 }
 
 static string create_table_option_to_string(duckdb::ParsedExpression &expr) {
@@ -743,8 +757,8 @@ uint8_t expr_type(const Expression &expr) {
 	return static_cast<uint8_t>(expr.type);
 }
 
-uint8_t expr_return_type(const Expression &expr) {
-	return static_cast<uint8_t>(expr.return_type.id());
+BridgeLogicalType expr_return_type(const Expression &expr) {
+	return bridge_logical_type(expr.return_type);
 }
 
 bool expr_has_alias(const Expression &expr) {
@@ -801,6 +815,42 @@ double value_f64(const Value &v) {
 }
 rust::String value_string(const Value &v) {
 	return rust::String::lossy(v.GetValue<std::string>());
+}
+// A DECIMAL Value stores its unscaled integer in the physical width its
+// precision requires; widen the raw (unrescaled) integer to 128 bits.
+BridgeDecimalValue value_decimal(const Value &v) {
+	uint8_t width, scale;
+	v.type().GetDecimalProperties(width, scale);
+	duckdb::hugeint_t raw;
+	switch (v.type().InternalType()) {
+	case duckdb::PhysicalType::INT16:
+		raw = duckdb::hugeint_t(v.GetValueUnsafe<int16_t>());
+		break;
+	case duckdb::PhysicalType::INT32:
+		raw = duckdb::hugeint_t(v.GetValueUnsafe<int32_t>());
+		break;
+	case duckdb::PhysicalType::INT64:
+		raw = duckdb::hugeint_t(v.GetValueUnsafe<int64_t>());
+		break;
+	case duckdb::PhysicalType::INT128:
+		raw = v.GetValueUnsafe<duckdb::hugeint_t>();
+		break;
+	default:
+		throw duckdb::InternalException("DECIMAL value with unexpected physical type");
+	}
+	BridgeDecimalValue out;
+	out.hi = raw.upper;
+	out.lo = raw.lower;
+	out.width = width;
+	out.scale = scale;
+	return out;
+}
+BridgeHugeint value_hugeint(const Value &v) {
+	auto raw = v.GetValueUnsafe<duckdb::hugeint_t>();
+	BridgeHugeint out;
+	out.hi = raw.upper;
+	out.lo = raw.lower;
+	return out;
 }
 // DATE is days since the Unix epoch; TIMESTAMP is microseconds since the epoch.
 int32_t value_date(const Value &v) {

@@ -20,6 +20,9 @@
 mod bytes_view;
 pub use bytes_view::BytesViewDecoder;
 
+mod decimal;
+pub use decimal::decimal_decoder;
+
 mod levels;
 
 mod primitive;
@@ -45,6 +48,19 @@ pub enum Error {
     DictPageEmpty,
     #[error("Unsupported encoding: {0}")]
     UnsupportedEncoding(Encoding),
+    /// A decimal column whose chunk uses a physical storage the decoders do
+    /// not read. The column's arrow type itself is supported; footer parsing
+    /// only admits the storages the decoders handle, so this can only be
+    /// reached by metadata that is inconsistent with the schema.
+    #[error(
+        "decimal column {data_type} stored as parquet physical type \
+         {physical_type} with type_length {type_length:?} is not supported"
+    )]
+    UnsupportedDecimalStorage {
+        data_type: arrow_schema::DataType,
+        physical_type: i32,
+        type_length: Option<i32>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

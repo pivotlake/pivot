@@ -212,16 +212,12 @@ pub trait Table: Debug + Send + Sync {
     }
 }
 
-/// Convert Pivot columns into the DuckDB-typed columns the binder consumes
-/// (logical type as a `u8` discriminant). Shared by base-table and table-function
-/// binding.
+/// Convert Pivot columns into the DuckDB-typed columns the binder consumes.
+/// Shared by base-table and table-function binding.
 fn duckdb_columns(columns: &[Column]) -> Vec<DuckDBColumn> {
     columns
         .iter()
-        .map(|column| DuckDBColumn {
-            name: column.name.clone(),
-            duckdb_logical_type_id: logical_from_type(&column.col_type) as u8,
-        })
+        .map(|column| logical_from_type(&column.col_type).to_duckdb_column(column.name.clone()))
         .collect()
 }
 
@@ -338,7 +334,7 @@ impl DuckDBTransaction for DuckDBTransactionAdapter {
             arg_type_ids: signature
                 .arguments
                 .iter()
-                .map(|arg_type| logical_from_type(arg_type) as u8)
+                .map(|arg_type| logical_from_type(arg_type).id as u8)
                 .collect(),
             columns: duckdb_columns(&signature.columns),
         })
@@ -355,9 +351,9 @@ impl DuckDBBind for DuckDBCatalogAdapter {
             arg_type_ids: signature
                 .arguments
                 .iter()
-                .map(|arg_type| logical_from_type(arg_type) as u8)
+                .map(|arg_type| logical_from_type(arg_type).id as u8)
                 .collect(),
-            return_type_id: logical_from_type(&signature.return_type) as u8,
+            return_type_id: logical_from_type(&signature.return_type).id as u8,
             is_volatile: signature.volatile,
         })
     }

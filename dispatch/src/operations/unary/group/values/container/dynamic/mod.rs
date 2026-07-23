@@ -88,9 +88,10 @@ impl<'b> BoundSlot<'b> {
         }
     }
 
-    /// Pick the reader for a `SUM` column by its width family — an integer column
-    /// reads as `i64`, a float as `f64`, a `Decimal128` (a re-read wide partial) as
-    /// `i128` — and wrap it in the caller's matching op variant.
+    /// Pick the reader for a `SUM` column by its width family — an integer or
+    /// `Decimal64` column reads as `i64` (a decimal's raw unscaled values fold like
+    /// an integer's), a float as `f64`, a `Decimal128` (a decimal column or a re-read
+    /// wide partial) as `i128` — and wrap it in the caller's matching op variant.
     fn bind_numeric(
         batch: &'b RecordBatch,
         column: usize,
@@ -99,7 +100,7 @@ impl<'b> BoundSlot<'b> {
         on_u128: fn(U128Reader<'b>) -> Self,
     ) -> Self {
         match batch.column(column).data_type() {
-            DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+            DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Decimal64(_, _) => {
                 on_i64(I64Reader::bind(batch, column))
             }
             DataType::Float32 | DataType::Float64 => on_f64(F64Reader::bind(batch, column)),

@@ -45,6 +45,13 @@ pub struct ColumnChunkMeta {
     pub total_compressed_size: i64,
     /// Maximum definition level for this column (indicates nesting / nullability depth).
     pub max_def_level: i16,
+    /// The chunk's Parquet physical type id, disambiguating storages that
+    /// share an arrow type (e.g. a decimal chunk may be INT32, INT64, or
+    /// FIXED_LEN_BYTE_ARRAY).
+    pub physical_type: i32,
+    /// The schema's `type_length` for a FIXED_LEN_BYTE_ARRAY leaf: the byte
+    /// width of each value.
+    pub fixed_len_byte_width: Option<i32>,
     /// Decoded min/max for this chunk, when the writer recorded statistics
     /// and the column's Arrow type is one we know how to decode.
     pub statistics: Option<ColumnStatistics>,

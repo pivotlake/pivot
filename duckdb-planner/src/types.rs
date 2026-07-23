@@ -1,14 +1,79 @@
 use std::fmt;
 
 use crate::duckdb_bridge::duckdb_types::LogicalTypeId;
+use crate::duckdb_bridge::ffi;
+
+/// The payload that completes a parameterized DuckDB type, mirroring
+/// DuckDB's own `ExtraTypeInfo`. Most ids fully describe their type and
+/// carry [`ExtraTypeInfo::None`]; a parameterized id (today only `DECIMAL`)
+/// carries its parameters here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtraTypeInfo {
+    None,
+    /// `DECIMAL(width, scale)`: total digits and fractional digits.
+    Decimal {
+        width: u8,
+        scale: u8,
+    },
+}
+
+/// A DuckDB logical type as read off a bound plan: the type id plus the
+/// extra info that completes a parameterized id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundLogicalType {
+    pub id: LogicalTypeId,
+    pub extra: ExtraTypeInfo,
+}
+
+impl BoundLogicalType {
+    /// A type made of the id alone, for the ids that need nothing else.
+    pub fn plain(id: LogicalTypeId) -> Self {
+        BoundLogicalType {
+            id,
+            extra: ExtraTypeInfo::None,
+        }
+    }
+
+    /// Decode the flat FFI type struct. CXX cannot pass an enum with a
+    /// payload across the bridge, so the struct carries every parameter
+    /// field flat and the id decides which of them are meaningful; this is
+    /// the one place that mapping is interpreted.
+    pub(crate) fn from_bridge(raw: ffi::BridgeLogicalType) -> Self {
+        let id = LogicalTypeId::from_u8(raw.id);
+        let extra = match id {
+            LogicalTypeId::DECIMAL => ExtraTypeInfo::Decimal {
+                width: raw.decimal_width,
+                scale: raw.decimal_scale,
+            },
+            _ => ExtraTypeInfo::None,
+        };
+        BoundLogicalType { id, extra }
+    }
+
+    /// Encode into the flat FFI column descriptor the DuckDB catalog glue
+    /// consumes, the inverse of `from_bridge`: every parameter field is
+    /// written flat, zeroed when the id has none.
+    pub fn to_duckdb_column(&self, name: String) -> ffi::DuckDBColumn {
+        let (decimal_width, decimal_scale) = match self.extra {
+            ExtraTypeInfo::Decimal { width, scale } => (width, scale),
+            ExtraTypeInfo::None => (0, 0),
+        };
+        ffi::DuckDBColumn {
+            name,
+            duckdb_logical_type_id: self.id.clone() as u8,
+            decimal_width,
+            decimal_scale,
+        }
+    }
+}
 
 /// A constant value from the query (or a table-function argument), extracted from
 /// DuckDB as a typed value rather than a string.
 ///
 /// Each variant holds the value already decoded into the corresponding Rust type;
 /// [`Other`](ScalarValue::Other) covers DuckDB types the bridge doesn't decode
-/// into a typed variant (e.g. `HUGEINT`, `DECIMAL`) and carries the logical type
-/// so the consumer can report it.
+/// into a typed variant and carries the logical type so the consumer can
+/// report it.
 #[derive(Debug, Clone)]
 pub enum ScalarValue {
     Boolean(bool),
@@ -20,8 +85,17 @@ pub enum ScalarValue {
     UInt16(u16),
     UInt32(u32),
     UInt64(u64),
+    /// `HUGEINT`: a 128-bit integer.
+    Int128(i128),
     Float32(f32),
     Float64(f64),
+    /// `DECIMAL(width, scale)`: the unscaled 128-bit integer, so the numeric
+    /// value is `value / 10^scale`.
+    Decimal {
+        value: i128,
+        width: u8,
+        scale: u8,
+    },
     Utf8(String),
     /// `DATE`: days since the Unix epoch (1970-01-01).
     Date(i32),
@@ -49,8 +123,14 @@ impl fmt::Display for ScalarValue {
             ScalarValue::UInt16(v) => write!(f, "{v}"),
             ScalarValue::UInt32(v) => write!(f, "{v}"),
             ScalarValue::UInt64(v) => write!(f, "{v}"),
+            ScalarValue::Int128(v) => write!(f, "{v}"),
             ScalarValue::Float32(v) => write!(f, "{v}"),
             ScalarValue::Float64(v) => write!(f, "{v}"),
+            ScalarValue::Decimal {
+                value,
+                width,
+                scale,
+            } => write!(f, "{value} as DECIMAL({width},{scale})"),
             ScalarValue::Utf8(v) => write!(f, "{v}"),
             ScalarValue::Date(v) => write!(f, "{v}"),
             ScalarValue::Timestamp(v) => write!(f, "{v}"),

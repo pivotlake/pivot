@@ -91,10 +91,11 @@ impl ReadLeBytes for f64 {
     }
 }
 
-/// Lets [`read_primitives`] write into either backing without a per-element slab
+/// Lets bulk decode loops ([`read_primitives`] here, the decimal decoder's
+/// `read_decimals`) write into either backing without a per-element slab
 /// lookup in the common case: the single [`SlabBuffer`] of a [`PrimitiveBuilder`]
 /// or the [`MultiSlabBuffer`] of a dictionary.
-trait ElemPtr<T> {
+pub(super) trait ElemPtr<T> {
     fn elem_ptr(&self, index: usize) -> *mut T;
 }
 

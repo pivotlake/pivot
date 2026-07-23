@@ -9,19 +9,19 @@
 use crate::parquet::reading::decoding::ScanEqualityPredicate;
 use crate::parquet::reading::decoding::column_decoders;
 use crate::parquet::reading::decoding::column_decoders::{
-    BytesViewDecoder, ColumnDecoder, PrimitiveColumnDecoder,
+    BytesViewDecoder, ColumnDecoder, PrimitiveColumnDecoder, decimal_decoder,
 };
 use crate::parquet::reading::record_batch_metadata::with_row_group_metadata;
 use crate::parquet::types::leaves::{
     first_leaf, leaf_count, leaf_fields, nest_leaves_into_columns,
 };
-use crate::parquet::types::metadata::QueryRowGroupMetadata;
+use crate::parquet::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata};
 use crate::parquet::types::page::DecompressedPage;
 use crate::parquet::types::projection::Projection;
 use arrow_array::RecordBatch;
 use arrow_array::types::{
-    BinaryViewType, Date32Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
-    StringViewType, TimestampSecondType, UInt16Type,
+    BinaryViewType, Date32Type, Decimal64Type, Decimal128Type, Float32Type, Float64Type, Int16Type,
+    Int32Type, Int64Type, StringViewType, TimestampSecondType, UInt16Type,
 };
 use arrow_schema::{ArrowError, DataType, Fields, Schema, SchemaRef, TimeUnit};
 use dispatch::memory::SlabAllocator;
@@ -42,11 +42,13 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Get a column decoder for a given data type.
+/// Get a column decoder for a given data type. The chunk metadata
+/// disambiguates a decimal's physical storage.
 fn column_decoder_for_type(
     data_type: &DataType,
-    max_def_level: i16,
+    chunk: &ColumnChunkMeta,
 ) -> Result<Box<dyn ColumnDecoder>> {
+    let max_def_level = chunk.max_def_level;
     macro_rules! primitive {
         ($t:ty) => {
             Box::new(PrimitiveColumnDecoder::<$t>::new(max_def_level)) as Box<dyn ColumnDecoder>
@@ -61,6 +63,12 @@ fn column_decoder_for_type(
         DataType::Timestamp(TimeUnit::Second, None) => Ok(primitive!(TimestampSecondType)),
         DataType::Float32 => Ok(primitive!(Float32Type)),
         DataType::Float64 => Ok(primitive!(Float64Type)),
+        DataType::Decimal64(precision, scale) => {
+            Ok(decimal_decoder::<Decimal64Type>(chunk, *precision, *scale)?)
+        }
+        DataType::Decimal128(precision, scale) => Ok(decimal_decoder::<Decimal128Type>(
+            chunk, *precision, *scale,
+        )?),
         // The byte-view decoder's flavour matches the leaf's declared type, so
         // the finished column is a string or binary array directly.
         DataType::Utf8View | DataType::Utf8 | DataType::LargeUtf8 => Ok(Box::new(
@@ -160,7 +168,7 @@ impl RowGroupDecoder {
                     prunable_columns.push(column_decoders.len());
                 }
                 let mut decoder =
-                    column_decoder_for_type(leaves[leaf].data_type(), columns[leaf].max_def_level)?;
+                    column_decoder_for_type(leaves[leaf].data_type(), &columns[leaf])?;
                 // Install the equality constant only when the column is prunable.
                 // The decoder uses it to skip building a dictionary that excludes
                 // the constant, which is sound only when an excluded dictionary

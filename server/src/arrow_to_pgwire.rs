@@ -11,8 +11,8 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, RecordBatch, StringArray, StringViewArray,
+    Array, BooleanArray, Date32Array, Decimal64Array, Decimal128Array, Float32Array, Float64Array,
+    Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray, StringViewArray,
     TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, SchemaRef};
@@ -89,7 +89,7 @@ macro_rules! arrow_pg_types {
                 $( DataType::$udt => Type::$upg, )+
                 // UInt64 can't fit any signed type, so it ships as TEXT.
                 DataType::UInt64 => Type::TEXT,
-                DataType::Decimal128(_, _) => Type::NUMERIC,
+                DataType::Decimal64(_, _) | DataType::Decimal128(_, _) => Type::NUMERIC,
                 // Temporal types reinterpreted from the executor's int columns at
                 // the output boundary (see `encode_cell`).
                 DataType::Date32 => Type::DATE,
@@ -118,9 +118,13 @@ macro_rules! arrow_pg_types {
                     .encode_field(&(arr.as_any().downcast_ref::<$uarray>().unwrap().value(row) as $signed)), )+
                 DataType::UInt64 => encoder
                     .encode_field(&arr.as_any().downcast_ref::<UInt64Array>().unwrap().value(row).to_string()),
-                // Decimal128 (e.g. the SUM aggregate output). `value_as_string`
-                // renders the integer/decimal with its scale applied; scale 0
-                // yields a plain integer like "12345".
+                // Decimals in either carrier width (Decimal128 is e.g. the SUM
+                // aggregate output). `value_as_string` renders the
+                // integer/decimal with its scale applied; scale 0 yields a
+                // plain integer like "12345".
+                DataType::Decimal64(_, _) => encoder.encode_field(
+                    &arr.as_any().downcast_ref::<Decimal64Array>().unwrap().value_as_string(row),
+                ),
                 DataType::Decimal128(_, _) => encoder.encode_field(
                     &arr.as_any().downcast_ref::<Decimal128Array>().unwrap().value_as_string(row),
                 ),
@@ -341,6 +345,27 @@ mod tests {
     #[test]
     fn decimal128_maps_to_numeric() {
         let fields = build_field_info(&schema(vec![("s", DataType::Decimal128(38, 0))]));
+        assert_eq!(fields[0].datatype(), &Type::NUMERIC);
+    }
+
+    #[test]
+    fn encode_batch_encodes_decimal64_with_scale_applied() {
+        let col: ArrayRef = Arc::new(
+            Decimal64Array::from(vec![12345_i64, -250])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        );
+        let b = batch(vec![("v", DataType::Decimal64(10, 2))], vec![col]);
+
+        let decoded = rows(&b);
+
+        assert_eq!(decoded[0], vec![Some("123.45".to_string())]);
+        assert_eq!(decoded[1], vec![Some("-2.50".to_string())]);
+    }
+
+    #[test]
+    fn decimal64_maps_to_numeric() {
+        let fields = build_field_info(&schema(vec![("v", DataType::Decimal64(10, 2))]));
         assert_eq!(fields[0].datatype(), &Type::NUMERIC);
     }
 
