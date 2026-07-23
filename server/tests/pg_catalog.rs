@@ -135,6 +135,25 @@ async fn jdbc_gettables_and_name_setup_execute(#[future] conn: Conn) {
     );
 }
 
+/// pgjdbc's getPrimaryKeys (the `_pg_expandarray` over `pg_index` form) returns
+/// empty: pivot tables have no indexes, so a table has no primary keys.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn jdbc_getprimarykeys_returns_empty(#[future] conn: Conn) {
+    let _dir = create_people(&conn, "pk").await;
+
+    let getprimarykeys = "SELECT result.TABLE_CAT, result.TABLE_NAME, result.COLUMN_NAME, \
+        result.KEY_SEQ, result.PK_NAME FROM ( \
+          SELECT NULL AS TABLE_CAT, ct.relname AS TABLE_NAME, a.attname AS COLUMN_NAME, \
+            (information_schema._pg_expandarray(i.indkey)).n AS KEY_SEQ, ci.relname AS PK_NAME \
+          FROM pg_catalog.pg_class ct JOIN pg_catalog.pg_index i ON (ct.oid = i.indrelid) \
+          WHERE ct.relname = 'pk' AND i.indisprimary) result ORDER BY result.KEY_SEQ";
+
+    let rows = select_rows(&conn, getprimarykeys).await;
+    assert_eq!(rows, Ok(vec![]), "getPrimaryKeys should be empty: {rows:?}");
+}
+
 /// `pg_attribute` lists a table's columns with a `pg_class` join.
 #[rstest]
 #[awt]

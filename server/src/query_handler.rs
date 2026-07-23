@@ -96,6 +96,16 @@ fn plan_is_cacheable(plan: &planner::Plan) -> bool {
 /// run). Functions and casts like `pg_catalog.pg_get_expr(…)` / `::regclass`
 /// keep their qualifier and still resolve from the system catalog.
 fn rewrite_system_catalog_refs(sql: &str) -> String {
+    // pgjdbc's getPrimaryKeys expands an index's key array with the set-returning
+    // information_schema._pg_expandarray over pg_index. Pivot has no indexes, so a
+    // table never has primary keys; answer with an empty result carrying the six
+    // columns the driver reads by name, sourced from the always-empty
+    // pg_description so no unsupported function has to bind.
+    if sql.contains("_pg_expandarray") {
+        return "SELECT NULL AS TABLE_CAT, NULL AS TABLE_SCHEM, NULL AS TABLE_NAME, \
+                NULL AS COLUMN_NAME, NULL AS KEY_SEQ, NULL AS PK_NAME FROM pg_description"
+            .to_string();
+    }
     const TABLES: [&str; 6] = [
         "pg_class",
         "pg_namespace",
