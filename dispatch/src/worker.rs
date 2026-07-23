@@ -228,29 +228,33 @@ impl Worker {
     }
 
     /// Submit disk reads from dataflows until the disk queue is busy or no more
-    /// requests remain.
-    fn saturate_io(&mut self) -> Result<()> {
+    /// requests remain. Returns whether the pass visited every dataflow and
+    /// found nothing - only such a pass proves no disk request is waiting.
+    fn saturate_io(&mut self) -> Result<bool> {
+        let mut clean = true;
         for flow in self.data_flows.values_mut() {
             #[cfg(feature = "perf")]
             if Self::paused_for_profiling(flow) {
+                clean = false;
                 continue;
             }
             if self.io.has_file_pending() {
-                break;
+                return Ok(false);
             }
 
             while let Some(mut requests) = flow.get_next_fs_request() {
+                clean = false;
                 flow.stats().record_issued_disk(&mut requests);
                 for r in requests {
                     self.io.request(r)?;
                 }
 
                 if self.io.has_file_pending() {
-                    break;
+                    return Ok(false);
                 }
             }
         }
-        Ok(())
+        Ok(clean)
     }
 
     /// Submit HTTP operations from dataflows onto the same ring until this worker
@@ -261,21 +265,24 @@ impl Worker {
     /// hides the latency. Stopping at the *first* outstanding read serialises a
     /// scan to one read at a time per worker — catastrophic over a table of many
     /// small files, where the whole query becomes round-trip bound.
-    fn saturate_http(&mut self) -> Result<()> {
+    fn saturate_http(&mut self) -> Result<bool> {
         // Per-worker remote read-ahead ceiling, tunable via `PIVOT_HTTP_INFLIGHT`.
         static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let http_inflight_target =
             *VALUE.get_or_init(|| crate::env::get_env_var_with_default("PIVOT_HTTP_INFLIGHT", 100));
+        let mut clean = true;
         'flows: for flow in self.data_flows.values_mut() {
             #[cfg(feature = "perf")]
             if Self::paused_for_profiling(flow) {
+                clean = false;
                 continue;
             }
             if self.io.http_in_flight() >= http_inflight_target {
-                break;
+                return Ok(false);
             }
 
             while let Some(mut requests) = flow.get_next_http_request() {
+                clean = false;
                 flow.stats().stamp_issued(&mut requests);
                 for r in requests {
                     // Submitting an HTTP operation can fail (socket exhaustion,
@@ -297,7 +304,7 @@ impl Worker {
                 }
             }
         }
-        Ok(())
+        Ok(clean)
     }
 
     /// Run one unit of CPU work from the first dataflow that has work ready.
@@ -518,8 +525,18 @@ impl Worker {
             self.cancel_upstream_in_dataflows();
 
             self.process_io_completions()?;
-            self.saturate_io()?;
-            self.saturate_http()?;
+            // Walk the operator graphs for IO submissions only while some
+            // operator has flagged staged IO; on an IO-free hot path the walks
+            // are the whole cost. Clearing only after both passes came back
+            // clean keeps a request that was skipped by an early break (busy
+            // disk queue, full HTTP window) flagged for the next pass.
+            if crate::io::has_pending_io() {
+                let disk_clean = self.saturate_io()?;
+                let http_clean = self.saturate_http()?;
+                if disk_clean && http_clean {
+                    crate::io::clear_pending_io();
+                }
+            }
 
             self.step_run_ready_cpu_work();
 
