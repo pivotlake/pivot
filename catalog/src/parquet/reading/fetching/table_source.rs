@@ -495,6 +495,8 @@ mod tests {
                 data_page_offset: 0,
                 total_compressed_size: compressed_size,
                 max_def_level: 0,
+                physical_type: 0,
+                fixed_len_byte_width: None,
                 statistics: None,
                 data_pages_all_dictionary: false,
             }],

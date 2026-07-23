@@ -22,12 +22,22 @@ use crate::duckdb_bridge::duckdb_types::{
     ExpressionType, LimitNodeType, LogicalOperatorType, LogicalTypeId, OrderType,
 };
 use crate::duckdb_bridge::ffi;
-use crate::types::ScalarValue;
+use crate::types::{BoundLogicalType, ScalarValue};
 
 /// DuckDB's virtual row-id column identifier, used by late-materialization
 /// row-id stripping to recognise the threaded-up row-id column.
 pub fn rowid_column_id() -> usize {
     ffi::rowid_column_id()
+}
+
+/// Rebuild a 128-bit integer from the two halves the FFI carries it as.
+fn i128_from_halves(hi: i64, lo: u64) -> i128 {
+    ((hi as i128) << 64) | (lo as i128)
+}
+
+/// Decode the FFI type struct into a [`BoundLogicalType`].
+fn bound_type_from(raw: ffi::BridgeLogicalType) -> BoundLogicalType {
+    BoundLogicalType::from_bridge(raw)
 }
 
 /// Decode a DuckDB [`Value`](ffi::Value) into a typed [`ScalarValue`]: read its
@@ -46,8 +56,20 @@ fn scalar_from_value(v: &ffi::Value) -> ScalarValue {
         L::USMALLINT => ScalarValue::UInt16(ffi::value_u16(v)),
         L::UINTEGER => ScalarValue::UInt32(ffi::value_u32(v)),
         L::UBIGINT => ScalarValue::UInt64(ffi::value_u64(v)),
+        L::HUGEINT => {
+            let raw = ffi::value_hugeint(v);
+            ScalarValue::Int128(i128_from_halves(raw.hi, raw.lo))
+        }
         L::FLOAT => ScalarValue::Float32(ffi::value_f32(v)),
         L::DOUBLE => ScalarValue::Float64(ffi::value_f64(v)),
+        L::DECIMAL => {
+            let raw = ffi::value_decimal(v);
+            ScalarValue::Decimal {
+                value: i128_from_halves(raw.hi, raw.lo),
+                width: raw.width,
+                scale: raw.scale,
+            }
+        }
         L::VARCHAR => ScalarValue::Utf8(ffi::value_string(v)),
         L::DATE => ScalarValue::Date(ffi::value_date(v)),
         L::TIMESTAMP => ScalarValue::Timestamp(ffi::value_timestamp(v)),
@@ -293,11 +315,11 @@ impl<'plan> Filter<'plan> {
     /// The filter's `projection_map`: each entry is the child-output column index
     /// it keeps, paired with that column's type. Empty when the filter passes all
     /// child columns through.
-    pub fn projection_map(self) -> impl Iterator<Item = (usize, LogicalTypeId)> {
+    pub fn projection_map(self) -> impl Iterator<Item = (usize, BoundLogicalType)> {
         (0..ffi::lo_filter_projection_map_count(self.raw)).map(move |i| {
             (
                 ffi::lo_filter_projection_map_index(self.raw, i),
-                LogicalTypeId::from_u8(ffi::lo_filter_type_id(self.raw, i)),
+                bound_type_from(ffi::lo_filter_type_id(self.raw, i)),
             )
         })
     }
@@ -380,11 +402,11 @@ impl<'plan> Limit<'plan> {
 /// each a storage column index paired with its type.
 fn scan_output_columns(
     raw: &ffi::LogicalOperator,
-) -> impl Iterator<Item = (usize, LogicalTypeId)> + '_ {
+) -> impl Iterator<Item = (usize, BoundLogicalType)> + '_ {
     (0..ffi::lo_get_output_count(raw)).map(move |i| {
         (
             ffi::lo_get_output_column(raw, i),
-            LogicalTypeId::from_u8(ffi::lo_get_output_type(raw, i)),
+            bound_type_from(ffi::lo_get_output_type(raw, i)),
         )
     })
 }
@@ -398,7 +420,7 @@ impl<'plan> TableScan<'plan> {
 
     /// The scan's projected output columns, each a storage column index paired
     /// with its type.
-    pub fn output_columns(self) -> impl Iterator<Item = (usize, LogicalTypeId)> + 'plan {
+    pub fn output_columns(self) -> impl Iterator<Item = (usize, BoundLogicalType)> + 'plan {
         scan_output_columns(self.raw)
     }
 
@@ -438,7 +460,7 @@ impl<'plan> TableFunctionScan<'plan> {
 
     /// The scan's projected output columns, each a generated column index paired
     /// with its type.
-    pub fn output_columns(self) -> impl Iterator<Item = (usize, LogicalTypeId)> + 'plan {
+    pub fn output_columns(self) -> impl Iterator<Item = (usize, BoundLogicalType)> + 'plan {
         scan_output_columns(self.raw)
     }
 }
@@ -448,11 +470,11 @@ impl<'plan> CreateTable<'plan> {
         ffi::lo_create_table_name(self.raw)
     }
 
-    pub fn columns(self) -> impl Iterator<Item = (String, LogicalTypeId)> {
+    pub fn columns(self) -> impl Iterator<Item = (String, BoundLogicalType)> {
         (0..ffi::lo_create_column_count(self.raw)).map(move |i| {
             (
                 ffi::lo_create_column_name(self.raw, i),
-                LogicalTypeId::from_u8(ffi::lo_create_column_type(self.raw, i)),
+                bound_type_from(ffi::lo_create_column_type(self.raw, i)),
             )
         })
     }
@@ -662,8 +684,8 @@ impl<'plan> Ref<'plan> {
     }
 
     /// The column's logical type.
-    pub fn return_type(self) -> LogicalTypeId {
-        LogicalTypeId::from_u8(ffi::expr_return_type(self.raw))
+    pub fn return_type(self) -> BoundLogicalType {
+        bound_type_from(ffi::expr_return_type(self.raw))
     }
 
     /// The column's source name from DuckDB's binding, or `None`. Display-only.
@@ -691,8 +713,8 @@ impl<'plan> Compare<'plan> {
     }
 
     /// The comparison's result type.
-    pub fn return_type(self) -> LogicalTypeId {
-        LogicalTypeId::from_u8(ffi::expr_return_type(self.raw))
+    pub fn return_type(self) -> BoundLogicalType {
+        bound_type_from(ffi::expr_return_type(self.raw))
     }
 }
 
@@ -731,8 +753,8 @@ impl<'plan> Constant<'plan> {
     }
 
     /// The constant's logical type, without decoding its value.
-    pub fn return_type(self) -> LogicalTypeId {
-        LogicalTypeId::from_u8(ffi::expr_return_type(self.raw))
+    pub fn return_type(self) -> BoundLogicalType {
+        bound_type_from(ffi::expr_return_type(self.raw))
     }
 }
 
@@ -752,8 +774,8 @@ impl<'plan> AggregateFunc<'plan> {
     }
 
     /// DuckDB's declared result type for the call.
-    pub fn return_type(self) -> LogicalTypeId {
-        LogicalTypeId::from_u8(ffi::expr_return_type(self.raw))
+    pub fn return_type(self) -> BoundLogicalType {
+        bound_type_from(ffi::expr_return_type(self.raw))
     }
 }
 
@@ -769,8 +791,8 @@ impl<'plan> Function<'plan> {
     }
 
     /// The function's result type.
-    pub fn return_type(self) -> LogicalTypeId {
-        LogicalTypeId::from_u8(ffi::expr_return_type(self.raw))
+    pub fn return_type(self) -> BoundLogicalType {
+        bound_type_from(ffi::expr_return_type(self.raw))
     }
 }
 
@@ -833,8 +855,8 @@ impl<'plan> Cast<'plan> {
     }
 
     /// The cast's target type (a `BoundCastExpression`'s own result type).
-    pub fn return_type(self) -> LogicalTypeId {
-        LogicalTypeId::from_u8(ffi::expr_return_type(self.raw))
+    pub fn return_type(self) -> BoundLogicalType {
+        bound_type_from(ffi::expr_return_type(self.raw))
     }
 }
 

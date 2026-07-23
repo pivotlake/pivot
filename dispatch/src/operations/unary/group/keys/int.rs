@@ -19,7 +19,7 @@ macro_rules! impl_persisted_key {
     }
 }
 
-impl_persisted_key!(i8, i16, i32, i64, u8, u16, u32, u64, u128);
+impl_persisted_key!(i8, i16, i32, i64, i128, u8, u16, u32, u64, u128);
 
 /// A [`KeyExtractor`] for a single Arrow primitive (integer) column.
 ///

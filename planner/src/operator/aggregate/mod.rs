@@ -147,7 +147,7 @@ impl Aggregate {
             // a single computed key) lowers through the general grouped path.
             self.compile_grouped(input)?
         };
-        Ok(self.restore_temporal_output(grouped))
+        Ok(self.restore_declared_output(grouped))
     }
 
     /// Reinterpret every temporal column of the aggregate input to the int it
@@ -168,15 +168,20 @@ impl Aggregate {
         })
     }
 
-    /// Restore the temporal arrow type on the grouped/global output's columns:
+    /// Restore the declared arrow type on the grouped/global output's columns:
     /// the group-key columns lead (one per `self.groups`, typed by its
     /// `result_type`), followed by one value column per `self.expressions` (typed
-    /// only for a `MIN`/`MAX` of a date). Zero-copy where the widths match.
-    fn restore_temporal_output(&self, op: RecordBatchOperatorSpec) -> RecordBatchOperatorSpec {
+    /// only for a `MIN`/`MAX` of a date). A temporal key/value gets its
+    /// `Date32`/`Timestamp` back; a decimal key gets its declared
+    /// `Decimal64(p, s)`/`Decimal128(p, s)` restamped over the raw values the
+    /// group operator emits (a metadata-only restamp inside
+    /// [`reinterpret_columns`], never a rescaling arrow cast). Zero-copy where
+    /// the widths match.
+    fn restore_declared_output(&self, op: RecordBatchOperatorSpec) -> RecordBatchOperatorSpec {
         let mut targets: Vec<Option<DataType>> = self
             .groups
             .iter()
-            .map(|g| g.result_type().ok().and_then(|t| temporal_output_type(&t)))
+            .map(|g| g.result_type().ok().and_then(|t| key_output_type(&t)))
             .collect();
         targets.extend(self.expressions.iter().map(aggregate_value_temporal));
         if !targets.iter().any(Option::is_some) {
@@ -210,7 +215,7 @@ impl Aggregate {
 /// a sum, the input type for a `MIN`/`MAX`). The accumulator may store it at a
 /// different width; the output phase casts to this. A `MIN`/`MAX` of a date keeps
 /// its physical int here and is restored to the temporal type by
-/// [`Aggregate::restore_temporal_output`], the one place dates are coerced.
+/// [`Aggregate::restore_declared_output`], the one place dates are coerced.
 fn aggregation_slots(exprs: &[Expression]) -> Result<Vec<AggregationSlot>, Error> {
     exprs
         .iter()
@@ -248,9 +253,12 @@ fn aggregation_slots(exprs: &[Expression]) -> Result<Vec<AggregationSlot>, Error
 /// by the column type at bind, not encoded in the kind: a `Utf8` column folds the
 /// byte extreme through the value arena, an integer/temporal one the numeric extreme
 /// (`Date`/`Timestamp` seen as the int they store, after
-/// [`Aggregate::int_ify_temporal_values`]), a float one in `f64`. `None` for any
-/// other type, so the caller reports a clean `UnsupportedAggregateExpression` rather
-/// than a worker panic in the reader.
+/// [`Aggregate::int_ify_temporal_values`]), a float one in `f64`, a decimal one at
+/// its carrier width (`i64` for `Decimal64`, the wide `i128` for `Decimal128`; its
+/// raw unscaled values order exactly as the decimal values, since every value of a
+/// column shares its scale). `None` for any other type, so
+/// the caller reports a clean `UnsupportedAggregateExpression` rather than a worker
+/// panic in the reader.
 fn extreme_kind(ty: &Type, kind: AggregationKind) -> Option<AggregationKind> {
     match ty {
         // UInt8/16/32 fold losslessly through the reader's i64 accumulator;
@@ -267,7 +275,8 @@ fn extreme_kind(ty: &Type, kind: AggregationKind) -> Option<AggregationKind> {
         | Type::Float32
         | Type::Float64
         | Type::Date
-        | Type::Timestamp => Some(kind),
+        | Type::Timestamp
+        | Type::Decimal { .. } => Some(kind),
         _ => None,
     }
 }
@@ -279,6 +288,18 @@ fn extreme_kind(ty: &Type, kind: AggregationKind) -> Option<AggregationKind> {
 pub(super) fn temporal_output_type(t: &Type) -> Option<DataType> {
     let arrow = crate::types::physical_arrow_type(t);
     temporal_to_int(&arrow).is_some().then_some(arrow)
+}
+
+/// The arrow type a group-key column must be restored to on output, or `None`
+/// when the group operator already emits the declared type. A temporal key is
+/// restored to its `Date32`/`Timestamp`; a decimal key to its declared
+/// `Decimal64(p, s)`/`Decimal128(p, s)`, because the single-key extractor emits
+/// it at the extractor's default decimal shape with correct raw values.
+fn key_output_type(t: &Type) -> Option<DataType> {
+    match t {
+        Type::Decimal { .. } => Some(crate::types::physical_arrow_type(t)),
+        _ => temporal_output_type(t),
+    }
 }
 
 /// The temporal arrow type a `MIN`/`MAX` aggregate emits, or `None` for any other
@@ -312,37 +333,51 @@ pub(super) fn row_key_schema<'a>(
 /// The arrow type the row encoder uses for one group-key column, or `None` for a
 /// type it can't encode.
 ///
-/// Only the integer widths and `Utf8View` are byte-packable into a row key,
-/// exactly the rule [`RowKeySchema::new`](dispatch::RowKeySchema) enforces. A
-/// `DATE`/`TIMESTAMP` key drops to its backing int ([`temporal_to_int`]) and
-/// rides along for free; the row reader casts each key column to this type, so
-/// grouping on the integer day/second count is lossless (the temporal type is
-/// restored on the output). `Boolean`/`Float64`/`Decimal`/`Int128` can't pack,
-/// so they return `None` for a clean "unsupported" rather than a panic in
-/// `RowKeySchema::new`.
+/// Only the fixed-width types (integer widths and `Decimal128`) and `Utf8View`
+/// are byte-packable into a row key, exactly the rule
+/// [`RowKeySchema::new`](dispatch::RowKeySchema) enforces. A `DATE`/`TIMESTAMP`
+/// key drops to its backing int ([`temporal_to_int`]) and rides along for free;
+/// the row reader casts each key column to this type, so grouping on the integer
+/// day/second count is lossless (the temporal type is restored on the output). A
+/// decimal key keeps its exact `Decimal64(p, s)`/`Decimal128(p, s)` shape, so the
+/// row reader never casts it (a decimal-to-decimal arrow cast would rescale the
+/// values). `Boolean`/`Float64` can't pack, so they return `None` for a clean
+/// "unsupported" rather than a panic in `RowKeySchema::new`.
 fn row_key_arrow_type(t: &Type) -> Option<DataType> {
     let dt = crate::types::physical_arrow_type(t);
     let dt = temporal_to_int(&dt).unwrap_or(dt);
-    (dt.is_integer() || dt == DataType::Utf8View).then_some(dt)
+    (dt.is_integer()
+        || matches!(dt, DataType::Decimal64(_, _) | DataType::Decimal128(_, _))
+        || dt == DataType::Utf8View)
+        .then_some(dt)
 }
 
 /// Whether any key extractor can group on this type. The dedicated single/pair/
-/// int-string extractors handle exactly the integer widths and `Utf8`; every
-/// other groupable type (`Date`/`Timestamp`) rides the row encoder. A type this
-/// rejects (`Float`/`Boolean`/`Decimal`/`Int128`) has no grouping path at all,
+/// int-string extractors handle exactly the integer widths, the decimals, and
+/// `Utf8`; every other groupable type (`Date`/`Timestamp`) rides the row
+/// encoder. A type this rejects (`Float`/`Boolean`) has no grouping path at all,
 /// so the caller can reject it up front and name the offending column.
 pub(super) fn is_groupable_key_type(t: &Type) -> bool {
     row_key_arrow_type(t).is_some()
 }
 
-/// The accumulator-width rule shared by the global and grouped paths: `i128`
-/// only when a `SUM` reads a 64-bit column (whose total can overflow `i64`),
-/// else `i64`.
-fn sum_reads_wide_column(exprs: &[Expression]) -> bool {
-    exprs.iter().any(|e| {
-        matches!(
-            e,
-            Expression::AggregateFunc(AggregateFunc::Sum(a)) if a.column().return_type == Type::Int64
-        )
+/// The accumulator-width rule shared by the global and grouped paths: `i128` when
+/// a `SUM` reads a 64-bit column (whose total can overflow `i64`, and any decimal
+/// `SUM` declares a `DECIMAL(38, s)` result), or when a `MIN`/`MAX` reads a wide
+/// (`Decimal128`-carried) decimal column whose raw unscaled `i128` values must be
+/// held losslessly; else `i64`. A `MIN`/`MAX` over a `Decimal64`-carried column
+/// stays narrow: its raw values are `i64` and its extreme is one of them.
+fn needs_wide_accumulator(exprs: &[Expression]) -> bool {
+    exprs.iter().any(|e| match e {
+        Expression::AggregateFunc(AggregateFunc::Sum(a)) => {
+            matches!(a.column().return_type, Type::Int64 | Type::Decimal { .. })
+        }
+        Expression::AggregateFunc(AggregateFunc::Min(a) | AggregateFunc::Max(a)) => {
+            matches!(
+                a.column().return_type,
+                Type::Decimal { precision, .. } if precision > crate::types::MAX_DECIMAL64_PRECISION
+            )
+        }
+        _ => false,
     })
 }

@@ -25,6 +25,8 @@
 //!         vec![DuckDBColumn {
 //!             name: "name".to_string(),
 //!             duckdb_logical_type_id: LogicalTypeId::VARCHAR as u8,
+//!             decimal_width: 0,
+//!             decimal_scale: 0,
 //!         }]
 //!     }
 //! }
@@ -70,7 +72,7 @@ pub use catalog_provider::{DuckDBBind, DuckDBTable, DuckDBTransaction};
 pub use duckdb_bridge::duckdb_types::LogicalTypeId;
 pub use duckdb_bridge::ffi::DuckDBColumn;
 pub use handle::{Expr, LogicalOp, Plan};
-pub use types::ScalarValue;
+pub use types::{BoundLogicalType, ExtraTypeInfo, ScalarValue};
 
 /// Top-level error type for the planner.
 #[derive(Error, Debug)]

@@ -11,9 +11,9 @@ use crate::parquet::types::thrift::general::{Encoding, PageType};
 use crate::parquet::types::thrift::parquet_thrift::{ReadThrift, ThriftSliceInputProtocol};
 use crate::store::DataFile;
 use arrow_array::{
-    ArrayRef, BooleanArray, Date32Array, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, Scalar, StringViewArray, TimestampSecondArray, UInt8Array, UInt16Array,
-    UInt32Array,
+    ArrayRef, BooleanArray, Date32Array, Decimal64Array, Decimal128Array, Float32Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Scalar, StringViewArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use dispatch::DataFlowDispatcher;
@@ -213,7 +213,7 @@ pub(crate) fn row_groups_from_metadata(
     open_file: dispatch::io::OpenFile,
     declared_columns: &[Column],
 ) -> Result<Vec<RowGroupMetadata>> {
-    let (schema, def_levels) = schema_elements_to_arrow(&file_meta.schema)?;
+    let (schema, leaf_infos) = schema_elements_to_arrow(&file_meta.schema)?;
     // Use reconciled types for statistics, decoders, and output fields.
     let schema = Arc::new(apply_declared_types(schema, declared_columns)?);
     // Statistics belong to leaf chunks, not top-level columns.
@@ -240,16 +240,19 @@ pub(crate) fn row_groups_from_metadata(
                 .enumerate()
                 .map(|(j, cc)| {
                     let meta = cc.meta_data.expect("missing column metadata");
+                    let physical_type = meta.physical_type;
                     let statistics = meta
                         .statistics
-                        .and_then(|s| decode_statistics(s, leaves[j].data_type()));
+                        .and_then(|s| decode_statistics(s, leaves[j].data_type(), physical_type));
                     let data_pages_all_dictionary = meta.dictionary_page_offset.is_some()
                         && data_pages_all_dictionary(meta.encoding_stats.as_deref());
                     ColumnChunkMeta {
                         dictionary_page_offset: meta.dictionary_page_offset,
                         data_page_offset: meta.data_page_offset,
                         total_compressed_size: meta.total_compressed_size,
-                        max_def_level: def_levels[j],
+                        max_def_level: leaf_infos[j].def_level,
+                        physical_type,
+                        fixed_len_byte_width: leaf_infos[j].type_length,
                         statistics,
                         data_pages_all_dictionary,
                     }
@@ -296,12 +299,18 @@ fn data_pages_all_dictionary(encoding_stats: Option<&[PageEncodingStats]>) -> bo
 
 /// Decode a Parquet `Statistics` blob into our [`ColumnStatistics`], using
 /// `data_type` to choose the right physical-bytes -> Arrow scalar conversion.
+/// `physical_type` disambiguates a decimal's byte encoding, which follows the
+/// column's physical storage rather than its arrow type.
 ///
 /// Prefer the modern `min_value` / `max_value` fields and fall back to the
 /// legacy `min` / `max` only when those aren't populated. Unsupported types
 /// (or stats whose bytes don't match the expected width) yield `None` for
 /// that side rather than failing the parse.
-fn decode_statistics(stats: Statistics, data_type: &DataType) -> Option<ColumnStatistics> {
+fn decode_statistics(
+    stats: Statistics,
+    data_type: &DataType,
+    physical_type: i32,
+) -> Option<ColumnStatistics> {
     let max_bytes = stats.max_value.or(stats.max);
     let min_bytes = stats.min_value.or(stats.min);
     if max_bytes.is_none()
@@ -312,14 +321,18 @@ fn decode_statistics(stats: Statistics, data_type: &DataType) -> Option<ColumnSt
         return None;
     }
     Some(ColumnStatistics {
-        min: min_bytes.and_then(|bytes| decode_scalar(&bytes, data_type)),
-        max: max_bytes.and_then(|bytes| decode_scalar(&bytes, data_type)),
+        min: min_bytes.and_then(|bytes| decode_scalar(&bytes, data_type, physical_type)),
+        max: max_bytes.and_then(|bytes| decode_scalar(&bytes, data_type, physical_type)),
         null_count: stats.null_count,
         distinct_count: stats.distinct_count,
     })
 }
 
-fn decode_scalar(bytes: &[u8], data_type: &DataType) -> Option<Scalar<ArrayRef>> {
+fn decode_scalar(
+    bytes: &[u8],
+    data_type: &DataType,
+    physical_type: i32,
+) -> Option<Scalar<ArrayRef>> {
     /// Read `N` bytes as a little-endian fixed-width primitive. Returns `None`
     /// if the byte slice doesn't have exactly `N` bytes.
     fn read_le<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {
@@ -376,8 +389,62 @@ fn decode_scalar(bytes: &[u8], data_type: &DataType) -> Option<Scalar<ArrayRef>>
         DataType::Timestamp(TimeUnit::Second, None) => read_le::<8>(bytes)
             .map(i64::from_le_bytes)
             .map(|v| erase_type(TimestampSecondArray::new_scalar(v))),
+        // A decimal's unscaled integer follows the column's physical storage;
+        // the scalar's carrier follows the column's arrow type.
+        DataType::Decimal64(precision, scale) => {
+            let value = decimal_stat_value(bytes, physical_type)?;
+            let array = Decimal64Array::new_scalar(i64::try_from(value).ok()?)
+                .into_inner()
+                .with_precision_and_scale(*precision, *scale)
+                .ok()?;
+            Some(Scalar::new(Arc::new(array) as ArrayRef))
+        }
+        DataType::Decimal128(precision, scale) => {
+            let value = decimal_stat_value(bytes, physical_type)?;
+            let array = Decimal128Array::new_scalar(value)
+                .into_inner()
+                .with_precision_and_scale(*precision, *scale)
+                .ok()?;
+            Some(Scalar::new(Arc::new(array) as ArrayRef))
+        }
         _ => None,
     }
+}
+
+/// A decimal statistic's unscaled integer, decoded per the column's physical
+/// storage: INT32/INT64 stats are little-endian, FIXED_LEN_BYTE_ARRAY stats
+/// are big-endian two's complement in the declared length.
+fn decimal_stat_value(bytes: &[u8], physical_type: i32) -> Option<i128> {
+    use crate::parquet::types::thrift::general::Type as PhysicalType;
+    if physical_type == PhysicalType::INT32 as i32 {
+        bytes
+            .try_into()
+            .ok()
+            .map(i32::from_le_bytes)
+            .map(i128::from)
+    } else if physical_type == PhysicalType::INT64 as i32 {
+        bytes
+            .try_into()
+            .ok()
+            .map(i64::from_le_bytes)
+            .map(i128::from)
+    } else if physical_type == PhysicalType::FIXED_LEN_BYTE_ARRAY as i32 {
+        i128_from_be_bytes(bytes)
+    } else {
+        None
+    }
+}
+
+/// Sign-extend a big-endian two's-complement integer of up to 16 bytes into
+/// an `i128`. Returns `None` for byte lengths a `Decimal128` cannot hold.
+fn i128_from_be_bytes(bytes: &[u8]) -> Option<i128> {
+    if bytes.is_empty() || bytes.len() > 16 {
+        return None;
+    }
+    let fill = if bytes[0] & 0x80 != 0 { 0xff } else { 0 };
+    let mut buf = [fill; 16];
+    buf[16 - bytes.len()..].copy_from_slice(bytes);
+    Some(i128::from_be_bytes(buf))
 }
 
 /// Deserialises raw Thrift bytes into a [`FileMetaData`].
@@ -387,26 +454,37 @@ fn parse_footer_thrift(buf: &[u8]) -> Result<FileMetaData> {
         .map_err(|e| Error::IO(io::Error::new(io::ErrorKind::InvalidData, e.to_string())))
 }
 
-/// Converts footer schema elements into an Arrow schema and per-leaf
-/// definition levels.
+/// Per-leaf schema facts collected while walking the footer's schema
+/// elements, in depth-first (column-chunk) order.
+#[derive(Debug)]
+struct LeafSchemaInfo {
+    /// Maximum definition level (one per optional ancestor plus the leaf).
+    def_level: i16,
+    /// The element's `type_length` (the byte width of a FIXED_LEN_BYTE_ARRAY
+    /// value).
+    type_length: Option<i32>,
+}
+
+/// Converts footer schema elements into an Arrow schema and per-leaf schema
+/// facts.
 fn schema_elements_to_arrow(
     elements: &[crate::parquet::types::thrift::footer::SchemaElement],
-) -> Result<(Schema, Vec<i16>)> {
+) -> Result<(Schema, Vec<LeafSchemaInfo>)> {
     if elements.is_empty() {
         return Err(Error::IO(io::Error::new(
             io::ErrorKind::InvalidData,
             "empty schema",
         )));
     }
-    let mut def_levels = Vec::new();
+    let mut leaf_infos = Vec::new();
     let mut cursor = 1; // element 0 is the root group
     let mut fields = Vec::new();
     for _ in 0..elements[0].num_children.unwrap_or(0) {
-        let (field, next) = parse_schema_element(elements, cursor, 0, 0, &mut def_levels)?;
+        let (field, next) = parse_schema_element(elements, cursor, 0, 0, &mut leaf_infos)?;
         fields.push(field);
         cursor = next;
     }
-    Ok((Schema::new(fields), def_levels))
+    Ok((Schema::new(fields), leaf_infos))
 }
 
 /// Deepest schema nesting accepted. Real schemas stay far below this (a
@@ -484,13 +562,13 @@ fn apply_declared_types(schema: Schema, declared_columns: &[Column]) -> Result<S
 /// Parse the subtree rooted at `elements[idx]`. `parent_def` is the definition
 /// level contributed by ancestors (each optional ancestor adds one). Returns
 /// the Arrow field and the index just past this subtree, appending one entry
-/// per leaf to `def_levels` in depth-first (column-chunk) order.
+/// per leaf to `leaf_infos` in depth-first (column-chunk) order.
 fn parse_schema_element(
     elements: &[crate::parquet::types::thrift::footer::SchemaElement],
     idx: usize,
     parent_def: i16,
     depth: usize,
-    def_levels: &mut Vec<i16>,
+    leaf_infos: &mut Vec<LeafSchemaInfo>,
 ) -> Result<(Field, usize)> {
     use crate::parquet::types::thrift::footer::LogicalType;
     // The cursor is driven by each group's *claimed* child count, so a
@@ -533,7 +611,7 @@ fn parse_schema_element(
             let mut cursor = idx + 1;
             for _ in 0..n {
                 let (child, next) =
-                    parse_schema_element(elements, cursor, def_level, depth + 1, def_levels)?;
+                    parse_schema_element(elements, cursor, def_level, depth + 1, leaf_infos)?;
                 children.push(child);
                 cursor = next;
             }
@@ -548,12 +626,11 @@ fn parse_schema_element(
             Ok((field, cursor))
         }
         _ => {
-            def_levels.push(def_level);
-            let data_type = super::arrow_map::parquet_to_arrow(
-                elem.physical_type,
-                elem.converted_type,
-                elem.logical_type.as_ref(),
-            )?;
+            leaf_infos.push(LeafSchemaInfo {
+                def_level,
+                type_length: elem.type_length,
+            });
+            let data_type = super::arrow_map::parquet_to_arrow(elem)?;
             Ok((Field::new(&elem.name, data_type, nullable), idx + 1))
         }
     }
@@ -772,10 +849,13 @@ mod tests {
     ) -> crate::parquet::types::thrift::footer::SchemaElement {
         crate::parquet::types::thrift::footer::SchemaElement {
             physical_type,
+            type_length: None,
             repetition_type,
             name: name.to_string(),
             num_children,
             converted_type: None,
+            scale: None,
+            precision: None,
             logical_type: None,
         }
     }

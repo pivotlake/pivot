@@ -6,7 +6,8 @@
 //! set. Each row's key columns are serialised, in GROUP BY order, into one
 //! contiguous byte string:
 //!
-//! - fixed-width integers as their little-endian bytes,
+//! - fixed-width integers (and a decimal's raw unscaled `i64`/`i128`) as their
+//!   little-endian bytes,
 //! - strings as a `u32` length prefix followed by the raw bytes — except a
 //!   *trailing* string, whose bytes simply run to the end of the blob (its
 //!   length is the blob's remaining length, so the prefix is redundant). This
@@ -48,7 +49,10 @@
 /// row is `(enum variant, arrow DataType, arrow primitive type, native int)`.
 /// The `Utf8View` string case is deliberately *not* here: it is genuinely
 /// special on both sides (length-prefixing, zero-copy arena views), so each
-/// module spells that one arm out explicitly.
+/// module spells that one arm out explicitly. So are `Decimal64` and
+/// `Decimal128`: their arrow `DataType`s carry a precision/scale the
+/// unit-variant pattern can't name, so each module spells out those arms
+/// beside the string one.
 ///
 /// Defined before the `mod` declarations below so both child modules see it by
 /// bare name (macro_rules textual scope); it is not used anywhere else.

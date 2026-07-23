@@ -25,15 +25,15 @@
 use crate::operations::channels::Sender;
 use crate::operations::unary::group::{
     AggregationKind, AggregationSlot, F64Cell, F64Max, F64Min, F64Sum, Fold, IntCell, Max, Min,
-    Sum, cast_value_column,
+    Sum, U128Max, U128Min, U128Sum, WideCell, cast_value_column,
 };
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
 use crate::operations::unary::{self, UnaryFactory};
 use crate::waker::waker_set;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    ArrowPrimitiveType, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type, Int64Type,
-    UInt8Type, UInt16Type, UInt32Type,
+    ArrowPrimitiveType, Decimal64Type, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type,
+    Int64Type, UInt8Type, UInt16Type, UInt32Type,
 };
 use arrow_array::{
     Array, ArrayRef, Float64Array, Int64Array, PrimitiveArray, RecordBatch, StringViewArray,
@@ -65,8 +65,12 @@ impl NumOp {
 
     /// Reduce one batch's integer column by this op, or `None` if the column is
     /// empty. Dispatches the column width here, once per batch, into a
-    /// monomorphic loop.
-    fn reduce_int_column<A: IntCell>(self, arr: &dyn Array) -> Option<A> {
+    /// monomorphic loop. A `Decimal64` column folds its raw unscaled `i64`s
+    /// through the integer ops like any other 64-bit width. A `Decimal128`
+    /// column (a wide decimal's raw unscaled values, or a re-read wide partial)
+    /// folds its full `i128`s through the wide ops into the wide cell the
+    /// planner picked.
+    fn reduce_int_column<A: IntCell + WideCell>(self, arr: &dyn Array) -> Option<A> {
         match arr.data_type() {
             DataType::Int8 => self.reduce_int_primitive::<A, Int8Type>(arr.as_primitive()),
             DataType::Int16 => self.reduce_int_primitive::<A, Int16Type>(arr.as_primitive()),
@@ -75,6 +79,10 @@ impl NumOp {
             DataType::UInt8 => self.reduce_int_primitive::<A, UInt8Type>(arr.as_primitive()),
             DataType::UInt16 => self.reduce_int_primitive::<A, UInt16Type>(arr.as_primitive()),
             DataType::UInt32 => self.reduce_int_primitive::<A, UInt32Type>(arr.as_primitive()),
+            DataType::Decimal64(_, _) => {
+                self.reduce_int_primitive::<A, Decimal64Type>(arr.as_primitive())
+            }
+            DataType::Decimal128(_, _) => self.reduce_wide_primitive::<A>(arr.as_primitive()),
             other => panic!("aggregate: unsupported column type {other:?}"),
         }
     }
@@ -95,6 +103,25 @@ impl NumOp {
             NumOp::Sum => fold_primitive_column(arr, Sum::<A>::seed, Sum::<A>::update),
             NumOp::Min => fold_primitive_column(arr, Min::<A>::seed, Min::<A>::update),
             NumOp::Max => fold_primitive_column(arr, Max::<A>::seed, Max::<A>::update),
+        }
+    }
+
+    /// Fold a `Decimal128` column's raw `i128` values through the wide
+    /// [`U128Sum`]/[`U128Min`]/[`U128Max`] ops into the wide cell, hoisting the op
+    /// match out of the row loop exactly as
+    /// [`reduce_int_primitive`](NumOp::reduce_int_primitive) does. The values stay
+    /// unscaled integers throughout; the cell holds the full `i128`, so a total
+    /// past `i64` stays exact. Reaching this with a narrow `A` is a planning bug
+    /// ([`WideCell`]'s `i64` arms panic): the planner widens every signature that
+    /// aggregates a decimal.
+    fn reduce_wide_primitive<A: WideCell>(
+        self,
+        arr: &PrimitiveArray<arrow_array::types::Decimal128Type>,
+    ) -> Option<A> {
+        match self {
+            NumOp::Sum => fold_primitive_column(arr, U128Sum::<A>::seed, U128Sum::<A>::update),
+            NumOp::Min => fold_primitive_column(arr, U128Min::<A>::seed, U128Min::<A>::update),
+            NumOp::Max => fold_primitive_column(arr, U128Max::<A>::seed, U128Max::<A>::update),
         }
     }
 
@@ -219,7 +246,7 @@ enum Slot<A: IntCell> {
     },
 }
 
-impl<A: IntCell + F64Cell> Slot<A> {
+impl<A: IntCell + F64Cell + WideCell> Slot<A> {
     /// The empty accumulator for `spec`. A `SUM`/`MIN`/`MAX`'s value family is
     /// decided by the column's declared `output_type`, not the kind: a `Utf8View`
     /// extreme keeps an owned `String`, a floating column an `f64` punned into `A`,
@@ -414,7 +441,9 @@ impl<A: IntCell> AggregateFactory<A> {
     }
 }
 
-impl<A: IntCell + F64Cell> UnaryFactory<RecordBatch, RecordBatch> for AggregateFactory<A> {
+impl<A: IntCell + F64Cell + WideCell> UnaryFactory<RecordBatch, RecordBatch>
+    for AggregateFactory<A>
+{
     type Unary = PipelineBreaker<RecordBatch, RecordBatch, Aggregate<A>>;
 
     fn build_unary(mut self) -> Self::Unary {
@@ -435,7 +464,7 @@ pub struct Aggregate<A: IntCell> {
     receiver: Option<mpsc::Receiver<Vec<Slot<A>>>>,
 }
 
-impl<A: IntCell + F64Cell> Aggregate<A> {
+impl<A: IntCell + F64Cell + WideCell> Aggregate<A> {
     fn new(
         specs: Arc<Vec<AggregationSlot>>,
         sender: mpsc::Sender<Vec<Slot<A>>>,
@@ -451,7 +480,7 @@ impl<A: IntCell + F64Cell> Aggregate<A> {
     }
 }
 
-impl<A: IntCell + F64Cell> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
+impl<A: IntCell + F64Cell + WideCell> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
     type Outputter = AggregateOutputter<A>;
 
     fn consume<OP: Sender<RecordBatch>>(
@@ -493,7 +522,7 @@ pub struct AggregateOutputter<A: IntCell> {
     totals: Vec<Slot<A>>,
 }
 
-impl<A: IntCell + F64Cell> Outputter<RecordBatch> for AggregateOutputter<A> {
+impl<A: IntCell + F64Cell + WideCell> Outputter<RecordBatch> for AggregateOutputter<A> {
     fn output<OP: Sender<RecordBatch>>(&mut self, output: &mut OP) -> unary::Result<bool> {
         loop {
             match self.rx.try_recv() {
@@ -528,7 +557,7 @@ impl<A: IntCell + F64Cell> Outputter<RecordBatch> for AggregateOutputter<A> {
 mod tests {
     use super::*;
     use crate::operations::unary::test_utils::run_consumers;
-    use arrow_array::{Decimal128Array, Int32Array};
+    use arrow_array::{Decimal64Array, Decimal128Array, Int32Array};
 
     fn make_batch(values: &[i32]) -> RecordBatch {
         let array = Int32Array::from(values.to_vec());
@@ -554,7 +583,10 @@ mod tests {
 
     /// Build `n` channel-wired aggregate consumers sharing one slots channel
     /// (the first holds the receiver), mirroring the factory's wiring.
-    fn build<A: IntCell + F64Cell>(n: usize, specs: Vec<AggregationSlot>) -> Vec<Aggregate<A>> {
+    fn build<A: IntCell + F64Cell + WideCell>(
+        n: usize,
+        specs: Vec<AggregationSlot>,
+    ) -> Vec<Aggregate<A>> {
         let specs = Arc::new(specs);
         let (tx, rx) = mpsc::channel();
         let mut rx_opt = Some(rx);
@@ -662,6 +694,114 @@ mod tests {
         let out = run_consumers(ops, vec![vec![batch]]);
 
         assert_eq!(col_i128(&out.items[0], 0), 3 * i64::MAX as i128);
+    }
+
+    /// A DECIMAL(10,2) column of [10.50, 2.50, 4.00] as raw unscaled i64s in a
+    /// single-column batch (a precision of 10 rides the Decimal64 carrier).
+    fn make_decimal64_batch() -> RecordBatch {
+        let array = Decimal64Array::from(vec![1050i64, 250, 400])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "price",
+                DataType::Decimal64(10, 2),
+                false,
+            )])),
+            vec![Arc::new(array)],
+        )
+        .unwrap()
+    }
+
+    fn col_dec64(batch: &RecordBatch, i: usize) -> i64 {
+        batch
+            .column(i)
+            .as_any()
+            .downcast_ref::<Decimal64Array>()
+            .unwrap()
+            .value(0)
+    }
+
+    #[test]
+    fn decimal_sum_min_max_restamp_not_rescale() {
+        // The sum's declared type is DECIMAL(38,2) (a Decimal128 column), the
+        // extremes keep the input's Decimal64(10,2); the raw values must come
+        // through untouched (a rescaling cast would multiply them by 100). The
+        // SUM forces the wide i128 accumulator, so the extremes render wide and
+        // narrow back to Decimal64 on output.
+        let ops = build::<i128>(
+            1,
+            vec![
+                AggregationSlot::new(AggregationKind::Sum, 0, DataType::Decimal128(38, 2)),
+                AggregationSlot::new(AggregationKind::Min, 0, DataType::Decimal64(10, 2)),
+                AggregationSlot::new(AggregationKind::Max, 0, DataType::Decimal64(10, 2)),
+            ],
+        );
+
+        let out = run_consumers(ops, vec![vec![make_decimal64_batch()]]);
+
+        let batch = &out.items[0];
+        assert_eq!(batch.column(0).data_type(), &DataType::Decimal128(38, 2));
+        assert_eq!(batch.column(1).data_type(), &DataType::Decimal64(10, 2));
+        assert_eq!(col_i128(batch, 0), 1700); // 17.00
+        assert_eq!(col_dec64(batch, 1), 250); // 2.50
+        assert_eq!(col_dec64(batch, 2), 1050); // 10.50
+    }
+
+    #[test]
+    fn decimal64_min_max_ride_the_narrow_lane() {
+        // With no SUM forcing the wide accumulator, Decimal64 extremes fold in
+        // plain i64 cells; the Int64 they render as is restamped (same buffer,
+        // never cast) to the declared Decimal64(10,2).
+        let ops = build::<i64>(
+            1,
+            vec![
+                AggregationSlot::new(AggregationKind::Min, 0, DataType::Decimal64(10, 2)),
+                AggregationSlot::new(AggregationKind::Max, 0, DataType::Decimal64(10, 2)),
+            ],
+        );
+
+        let out = run_consumers(ops, vec![vec![make_decimal64_batch()]]);
+
+        let batch = &out.items[0];
+        assert_eq!(batch.column(0).data_type(), &DataType::Decimal64(10, 2));
+        assert_eq!(col_dec64(batch, 0), 250); // 2.50
+        assert_eq!(col_dec64(batch, 1), 1050); // 10.50
+    }
+
+    #[test]
+    fn wide_decimal_sum_min_max_stay_decimal128() {
+        // A precision past 18 rides the Decimal128 carrier end to end: the
+        // extremes keep the declared (20,2) and the raw i128s are untouched.
+        let array = Decimal128Array::from(vec![1050i128, 250, 400])
+            .with_precision_and_scale(20, 2)
+            .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "price",
+                DataType::Decimal128(20, 2),
+                false,
+            )])),
+            vec![Arc::new(array)],
+        )
+        .unwrap();
+        let ops = build::<i128>(
+            1,
+            vec![
+                AggregationSlot::new(AggregationKind::Sum, 0, DataType::Decimal128(38, 2)),
+                AggregationSlot::new(AggregationKind::Min, 0, DataType::Decimal128(20, 2)),
+                AggregationSlot::new(AggregationKind::Max, 0, DataType::Decimal128(20, 2)),
+            ],
+        );
+
+        let out = run_consumers(ops, vec![vec![batch]]);
+
+        let batch = &out.items[0];
+        assert_eq!(batch.column(0).data_type(), &DataType::Decimal128(38, 2));
+        assert_eq!(batch.column(1).data_type(), &DataType::Decimal128(20, 2));
+        assert_eq!(col_i128(batch, 0), 1700); // 17.00
+        assert_eq!(col_i128(batch, 1), 250); // 2.50
+        assert_eq!(col_i128(batch, 2), 1050); // 10.50
     }
 
     #[test]

@@ -53,6 +53,10 @@ const PARQUET_VERSION: i32 = 1;
 /// Parquet `ConvertedType::UTF8` — marks a BYTE_ARRAY column as a string so
 /// readers surface it as text rather than opaque bytes.
 const CONVERTED_UTF8: i32 = 0;
+/// Parquet `ConvertedType::DECIMAL` — the legacy decimal annotation, written
+/// alongside the modern `LogicalType::Decimal` so older readers resolve the
+/// column too.
+const CONVERTED_DECIMAL: i32 = 5;
 
 pub(super) type FileAssemblerFactory = DefaultUnaryFactory<FileAssembler>;
 
@@ -291,10 +295,13 @@ fn write_leaf_chunk(out: &mut Vec<u8>, leaf: EncodedLeaf) -> WriteResult<ColumnC
 fn build_schema_elements(schema: &SchemaRef) -> WriteResult<Vec<SchemaElement>> {
     let mut elements = vec![SchemaElement {
         physical_type: None,
+        type_length: None,
         repetition_type: None,
         name: "schema".to_string(),
         num_children: Some(schema.fields().len() as i32),
         converted_type: None,
+        scale: None,
+        precision: None,
         logical_type: None,
     }];
     for field in schema.fields() {
@@ -316,10 +323,13 @@ fn push_schema_element(field: &FieldRef, elements: &mut Vec<SchemaElement>) -> W
         DataType::Struct(children) => {
             elements.push(SchemaElement {
                 physical_type: None,
+                type_length: None,
                 repetition_type,
                 name: field.name().clone(),
                 num_children: Some(children.len() as i32),
                 converted_type: None,
+                scale: None,
+                precision: None,
                 // The VARIANT annotation is the whole difference between a
                 // variant column and a plain struct of binary leaves: it is what
                 // a reader keys off to treat the group as semi-structured.
@@ -330,17 +340,39 @@ fn push_schema_element(field: &FieldRef, elements: &mut Vec<SchemaElement>) -> W
                 push_schema_element(child, elements)?;
             }
         }
-        data_type => elements.push(SchemaElement {
-            physical_type: Some(crate::parquet::arrow_to_parquet_physical(data_type)?),
-            repetition_type,
-            name: field.name().clone(),
-            num_children: None,
-            converted_type: match data_type {
-                DataType::Utf8 | DataType::Utf8View => Some(CONVERTED_UTF8),
+        data_type => {
+            // A decimal leaf stores its unscaled integer as a
+            // FIXED_LEN_BYTE_ARRAY of DECIMAL_FIXED_LEN bytes, and its schema
+            // element carries the full decimal description: the fixed length,
+            // precision and scale, the modern Decimal logical type, and the
+            // legacy DECIMAL converted type for older readers.
+            let decimal_shape = match data_type {
+                DataType::Decimal64(precision, scale) | DataType::Decimal128(precision, scale) => {
+                    Some((*precision as i32, *scale as i32))
+                }
                 _ => None,
-            },
-            logical_type: None,
-        }),
+            };
+            elements.push(SchemaElement {
+                physical_type: Some(crate::parquet::arrow_to_parquet_physical(data_type)?),
+                type_length: decimal_shape.and_then(|(precision, _)| {
+                    crate::parquet::decimal_write_storage(precision as u8).type_length()
+                }),
+                repetition_type,
+                name: field.name().clone(),
+                num_children: None,
+                converted_type: match data_type {
+                    DataType::Utf8 | DataType::Utf8View => Some(CONVERTED_UTF8),
+                    DataType::Decimal64(_, _) | DataType::Decimal128(_, _) => {
+                        Some(CONVERTED_DECIMAL)
+                    }
+                    _ => None,
+                },
+                scale: decimal_shape.map(|(_, scale)| scale),
+                precision: decimal_shape.map(|(precision, _)| precision),
+                logical_type: decimal_shape
+                    .map(|(precision, scale)| LogicalType::Decimal { scale, precision }),
+            })
+        }
     }
     Ok(())
 }
@@ -360,11 +392,16 @@ mod tests {
     use super::*;
     use crate::parquet::writing::encoder::encode_column_chunk;
     use crate::parquet::writing::types::{EncodedColumnChunk, PartitionTag};
+    use crate::parquet::{ParquetTable, table_input};
     use arrow_array::cast::AsArray;
-    use arrow_array::types::Int64Type;
-    use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray, StructArray};
+    use arrow_array::types::{Decimal64Type, Decimal128Type, Int64Type};
+    use arrow_array::{
+        Array, ArrayRef, Datum, Decimal64Array, Decimal128Array, Int64Array, RecordBatch,
+        StringArray, StructArray,
+    };
     use arrow_buffer::NullBuffer;
     use arrow_schema::{Field, Fields, Schema};
+    use dispatch::{Dispatch, Projection};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::sync::Arc;
 
@@ -488,6 +525,125 @@ mod tests {
             structs.column(0).as_primitive::<Int64Type>(),
             &Int64Array::from(vec![Some(10), None, None])
         );
+    }
+
+    /// A decimal leaf's schema element carries the full decimal description:
+    /// the precision-chosen storage (INT64 here, with no type_length),
+    /// precision/scale, the Decimal logical type, and the legacy DECIMAL
+    /// converted type. A wide decimal stores as a fixed 16-byte array instead.
+    #[test]
+    fn a_decimal_column_annotates_its_schema_element() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("amount", DataType::Decimal64(10, 2), false),
+            Field::new("total", DataType::Decimal128(20, 2), false),
+        ]));
+
+        let elements = build_schema_elements(&schema).unwrap();
+
+        let narrow = &elements[1];
+        assert_eq!(
+            narrow.physical_type,
+            Some(thriftparquet::general::Type::INT64 as i32)
+        );
+        assert_eq!(narrow.type_length, None);
+        assert_eq!(narrow.converted_type, Some(CONVERTED_DECIMAL));
+        assert_eq!(narrow.precision, Some(10));
+        assert_eq!(narrow.scale, Some(2));
+        assert_eq!(
+            narrow.logical_type,
+            Some(LogicalType::Decimal {
+                scale: 2,
+                precision: 10
+            })
+        );
+        let wide = &elements[2];
+        assert_eq!(
+            wide.physical_type,
+            Some(thriftparquet::general::Type::FIXED_LEN_BYTE_ARRAY as i32)
+        );
+        assert_eq!(wide.type_length, Some(16));
+    }
+
+    /// A decimal column round-trips through pivot's own catalog reader: the
+    /// loader resolves `Decimal64(10, 2)` from the footer annotations, the
+    /// decoder restores the values (negative ones included), and the row-group
+    /// statistics decode into usable bounds.
+    #[test]
+    fn a_decimal_column_round_trips_through_the_catalog_reader() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal64(10, 2),
+            false,
+        )]));
+        let values = Decimal64Array::from(vec![12345_i64, -67890, 100])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(values.clone()) as ArrayRef]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data.parquet"), encode(&batch)).unwrap();
+        let dispatch = Dispatch::spin_up(2, 64, None);
+
+        let table =
+            Arc::new(ParquetTable::from_directory(dispatch.dispatcher(), dir.path(), &[]).unwrap());
+        let read = table_input(dispatch.dispatcher(), &table, Projection::all(1), false)
+            .collect()
+            .unwrap();
+
+        assert_eq!(
+            table.schema().field(0).data_type(),
+            &DataType::Decimal64(10, 2)
+        );
+        let read = arrow_select::concat::concat_batches(&read[0].schema(), &read).unwrap();
+        assert_eq!(read.column(0).as_primitive::<Decimal64Type>(), &values);
+        let stats = table.row_groups()[0].column_statistics(0).unwrap();
+        let (min, _) = stats.min.as_ref().unwrap().get();
+        let (max, _) = stats.max.as_ref().unwrap().get();
+        assert_eq!(min.as_primitive::<Decimal64Type>().value(0), -67890);
+        assert_eq!(max.as_primitive::<Decimal64Type>().value(0), 12345);
+        dispatch.exit();
+    }
+
+    /// A low-cardinality decimal column takes the dictionary path (a PLAIN
+    /// dictionary page of 16-byte big-endian entries behind RLE indices) and
+    /// still round-trips through a strict reader.
+    #[test]
+    fn dictionary_encoded_decimals_round_trip() {
+        let values: Vec<i64> = (0..300).map(|i| [100, -250, 999][i % 3]).collect();
+        let array = Decimal64Array::from(values.clone())
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal64(10, 2),
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(array.clone()) as ArrayRef]).unwrap();
+
+        let bytes = encode(&batch);
+
+        let reader =
+            ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(&bytes))
+                .unwrap();
+        let encodings: Vec<_> = reader
+            .metadata()
+            .row_group(0)
+            .column(0)
+            .encodings()
+            .collect();
+        assert!(
+            encodings.contains(&parquet::basic::Encoding::RLE_DICTIONARY),
+            "expected a dictionary-encoded chunk, got {encodings:?}"
+        );
+        let got: Vec<RecordBatch> = reader.build().unwrap().map(|b| b.unwrap()).collect();
+        let got = arrow_select::concat::concat_batches(&got[0].schema(), &got).unwrap();
+        // The strict external reader resolves an FLBA-stored decimal as
+        // `Decimal128`, so the expected values widen accordingly.
+        let widened = Decimal128Array::from(values.iter().map(|&v| v as i128).collect::<Vec<_>>())
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        assert_eq!(got.column(0).as_primitive::<Decimal128Type>(), &widened);
     }
 
     /// A many-row, few-distinct column exercises the dictionary path's RLE runs
