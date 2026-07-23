@@ -3,6 +3,7 @@
 #include "duckdb-planner/src/duckdb_bridge/cpp/storage_info.h"
 #include "duckdb-planner/src/duckdb_bridge/cpp/catalog/table_entry.h"
 #include "duckdb/main/config.hpp"
+#include "duckdb/common/enums/optimizer_type.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
@@ -108,7 +109,17 @@ DuckPlannerContext::DuckPlannerContext(rust::Box<CatalogContext> catalog)
     : catalog(std::move(catalog)),
       db(nullptr, &this->config),
       con(db) {
-        con.Query("SET disabled_optimizers='compressed_materialization,empty_result_pullup'");
+        // Disable optimizers whose output pivot can't compile. Set directly on
+        // the instance's DBConfig (which the optimizer reads) — a bare `SET
+        // disabled_optimizers` is session-scoped and this setting is global-only,
+        // so the SET silently no-ops. `in_clause`: a 6+-element IN list is
+        // otherwise rewritten into a materialized ColumnDataGet + MARK join,
+        // which pivot can't compile; disabled, it stays a plain IN expression.
+        duckdb::DBConfig::GetConfig(*db.instance).options.disabled_optimizers = {
+            duckdb::OptimizerType::COMPRESSED_MATERIALIZATION,
+            duckdb::OptimizerType::EMPTY_RESULT_PULLUP,
+            duckdb::OptimizerType::IN_CLAUSE,
+        };
 
 	// Set catalog context on the storage extension and attach the pivot catalog as default
 	auto ext = duckdb::StorageExtension::Find(
