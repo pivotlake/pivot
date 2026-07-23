@@ -306,6 +306,25 @@ fn check_or_update_expected(query: &Query, actual: &str, update: bool) -> Result
     }
 }
 
+/// Remove the Delta logs a previous run's CREATE TABLEs committed into the
+/// dataset's table directories. The log only re-registers the same parquet
+/// files, but its presence makes a re-run's CREATE TABLE fail ("version 0
+/// already exists"), so a benchmark could never run twice against one
+/// dataset copy. Looks one level deep: the suite convention is one directory
+/// per table under `source`.
+fn clear_stale_table_logs(source: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(source) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let log = entry.path().join("_delta_log");
+        if log.is_dir() {
+            std::fs::remove_dir_all(&log)
+                .unwrap_or_else(|e| panic!("removing stale table log {}: {e}", log.display()));
+        }
+    }
+}
+
 /// Run every query in `suite` (filtered by `opts.query_filter`).
 ///
 /// `setup_template` reads the suite's `setup.sql`, substitutes `{source}`
@@ -323,6 +342,8 @@ pub async fn run_suite(port: u16, suite: &Suite, opts: &RunOptions) -> Result<Su
         .connect(NoTls)
         .await?;
     let conn_handle = tokio::spawn(connection);
+
+    clear_stale_table_logs(&opts.source);
 
     let setup_template = read_to_string(&suite.setup_sql_path)?;
     let setup_sql = setup_template.replace("{source}", &opts.source.display().to_string());
