@@ -245,31 +245,6 @@ fn build_join(
     join: ComparisonJoinView<'_>,
     inputs: Vec<PlanNode>,
 ) -> Result<PlanNode, OperatorError> {
-    if join.join_type() != JoinType::INNER {
-        return Err(OperatorError::Unsupported(format!(
-            "Unsupported join type: {:?}",
-            join.join_type()
-        )));
-    }
-    let mut conditions = join.conditions();
-    let condition = match (conditions.next(), conditions.next()) {
-        (Some(condition), None) => condition,
-        _ => {
-            return Err(OperatorError::Unsupported(
-                "joins must have exactly one equality condition".to_string(),
-            ));
-        }
-    };
-    if condition.comparison != ExpressionType::COMPARE_EQUAL {
-        return Err(OperatorError::Unsupported(format!(
-            "Unsupported join comparison type: {:?}",
-            condition.comparison
-        )));
-    }
-
-    let probe_key = join_key_ref(Expression::from_handle(condition.left)?)?;
-    let build_key = join_key_ref(Expression::from_handle(condition.right)?)?;
-
     let probe_types = inputs[0].output_types()?;
     let build_types = inputs[1].output_types()?;
     let left_map: Vec<usize> = join.left_projection_map().collect();
@@ -278,26 +253,139 @@ fn build_join(
     // Refs above the join were resolved against the trimmed output (kept left
     // columns, then kept right columns), which is exactly the layout the join
     // emits with these lists.
-    let probe_output = if left_map.is_empty() {
+    let probe_output: Vec<usize> = if left_map.is_empty() {
         (0..probe_types.len()).collect()
     } else {
         left_map
     };
-    let build_output = if right_map.is_empty() {
+    let build_output: Vec<usize> = if right_map.is_empty() {
         (0..build_types.len()).collect()
     } else {
         right_map
     };
-    Ok(PlanNode {
+
+    match join.join_type() {
+        JoinType::INNER => {
+            let mut conditions = join.conditions();
+            let condition = match (conditions.next(), conditions.next()) {
+                (Some(condition), None) => condition,
+                _ => {
+                    return Err(OperatorError::Unsupported(
+                        "joins must have exactly one equality condition".to_string(),
+                    ));
+                }
+            };
+            if condition.comparison != ExpressionType::COMPARE_EQUAL {
+                return Err(OperatorError::Unsupported(format!(
+                    "Unsupported join comparison type: {:?}",
+                    condition.comparison
+                )));
+            }
+            let probe_key = join_key_ref(Expression::from_handle(condition.left)?)?;
+            let build_key = join_key_ref(Expression::from_handle(condition.right)?)?;
+            Ok(PlanNode {
+                name: op.name(),
+                inputs,
+                operator: Operator::Join(Join {
+                    probe_key,
+                    build_key,
+                    probe_output,
+                    build_output,
+                }),
+            })
+        }
+        // A LEFT/RIGHT join whose null-producing side is known-empty keeps the
+        // other side's rows and null-fills the empty side's columns — no outer
+        // join needed, and the join conditions don't matter (nothing matches an
+        // empty side). DuckDB may rewrite `A LEFT JOIN B` as `B RIGHT JOIN A`,
+        // so both directions appear.
+        JoinType::LEFT if node_produces_no_rows(&inputs[1]) => Ok(null_extended_join(
+            op,
+            inputs,
+            &probe_types,
+            &probe_output,
+            &build_types,
+            &build_output,
+            PreservedSide::Left,
+        )),
+        JoinType::RIGHT if node_produces_no_rows(&inputs[0]) => Ok(null_extended_join(
+            op,
+            inputs,
+            &probe_types,
+            &probe_output,
+            &build_types,
+            &build_output,
+            PreservedSide::Right,
+        )),
+        other => Err(OperatorError::Unsupported(format!(
+            "Unsupported join type: {other:?}"
+        ))),
+    }
+}
+
+/// Which side of a null-extended join keeps its real rows.
+enum PreservedSide {
+    Left,
+    Right,
+}
+
+/// Emit a `LEFT`/`RIGHT` join against a known-empty side as a `Projection` over
+/// the surviving side: its kept columns as references, the empty side's kept
+/// columns as typed `NULL`s, in the join's `[left cols, right cols]` order.
+fn null_extended_join(
+    op: LogicalOp<'_>,
+    mut inputs: Vec<PlanNode>,
+    probe_types: &[Type],
+    probe_output: &[usize],
+    build_types: &[Type],
+    build_output: &[usize],
+    preserved: PreservedSide,
+) -> PlanNode {
+    let right = inputs.remove(1);
+    let left = inputs.remove(0);
+    let col_ref = |index: usize, types: &[Type]| {
+        Expression::Ref(Ref {
+            column_idx: index,
+            return_type: types[index].clone(),
+            name: None,
+        })
+    };
+    let null = |ty: &Type| {
+        Expression::Constant(arrow_array::Scalar::new(arrow_array::new_null_array(
+            &crate::types::physical_arrow_type(ty),
+            1,
+        )))
+    };
+    let mut projections = Vec::with_capacity(probe_output.len() + build_output.len());
+    let preserved_node = match preserved {
+        PreservedSide::Left => {
+            projections.extend(probe_output.iter().map(|&i| col_ref(i, probe_types)));
+            projections.extend(build_output.iter().map(|&j| null(&build_types[j])));
+            left
+        }
+        PreservedSide::Right => {
+            projections.extend(probe_output.iter().map(|&i| null(&probe_types[i])));
+            projections.extend(build_output.iter().map(|&j| col_ref(j, build_types)));
+            right
+        }
+    };
+    PlanNode {
         name: op.name(),
-        inputs,
-        operator: Operator::Join(Join {
-            probe_key,
-            build_key,
-            probe_output,
-            build_output,
-        }),
-    })
+        inputs: vec![preserved_node],
+        operator: Operator::Projection(Projection { projections }),
+    }
+}
+
+/// Whether a built subtree provably yields no rows without reading the snapshot:
+/// a scan of a known-empty table, or a row-preserving-or-fewer op over one.
+fn node_produces_no_rows(node: &PlanNode) -> bool {
+    match &node.operator {
+        Operator::Input(input) => input.table.produces_no_rows(),
+        Operator::Filter(_) | Operator::Projection(_) => {
+            node.inputs.first().is_some_and(node_produces_no_rows)
+        }
+        _ => false,
+    }
 }
 
 /// The column ref a join key must be, with the key type restriction the

@@ -151,6 +151,15 @@ impl Table for VirtualMetadataTable {
     fn clone_box(&self) -> Box<dyn Table> {
         Box::new(self.clone())
     }
+
+    fn produces_no_rows(&self) -> bool {
+        // `pg_attrdef` (column defaults) and `pg_description` (comments) are
+        // always empty here; the introspection queries only LEFT JOIN them.
+        matches!(
+            self.table,
+            PgCatalogTable::Attrdef | PgCatalogTable::Description
+        )
+    }
 }
 
 impl VirtualMetadataTable {

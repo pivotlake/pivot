@@ -24,7 +24,11 @@ async fn select_rows(conn: &Conn, sql: &str) -> Result<Vec<Vec<Option<String>>>,
                 })
                 .collect()
         })
-        .map_err(|e| e.to_string())
+        .map_err(|e| {
+            e.as_db_error()
+                .map(|db| db.message().to_string())
+                .unwrap_or_else(|| e.to_string())
+        })
 }
 
 async fn create_people(conn: &Conn, name: &str) -> TempDir {
@@ -93,4 +97,78 @@ async fn pg_attribute_lists_columns(#[future] conn: Conn) {
         Ok(vec![vec![Some("id".into())], vec![Some("name".into())]]),
         "pg_attribute columns via join"
     );
+}
+
+/// Diagnostic: run increasingly complete slices of pgjdbc's real getColumns so
+/// one run reveals every still-missing engine feature (LEFT joins, the
+/// row_number window, pg_get_expr, nullif) at once.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn getcolumns_feature_probe(#[future] conn: Conn) {
+    let _dir = create_people(&conn, "probe").await;
+    let variants: [(&str, &str); 5] = [
+        (
+            "inner-joins",
+            "SELECT n.nspname, c.relname, a.attname, a.atttypid, t.typtype \
+             FROM pg_catalog.pg_namespace n \
+               JOIN pg_catalog.pg_class c ON (c.relnamespace = n.oid) \
+               JOIN pg_catalog.pg_attribute a ON (a.attrelid = c.oid) \
+               JOIN pg_catalog.pg_type t ON (a.atttypid = t.oid) \
+             WHERE c.relname = 'probe' AND a.attnum > 0",
+        ),
+        (
+            "left-joins",
+            "SELECT a.attname, def.adbin, dsc.description \
+             FROM pg_catalog.pg_class c \
+               JOIN pg_catalog.pg_attribute a ON (a.attrelid = c.oid) \
+               LEFT JOIN pg_catalog.pg_attrdef def ON (a.attrelid = def.adrelid AND a.attnum = def.adnum) \
+               LEFT JOIN pg_catalog.pg_description dsc ON (c.oid = dsc.objoid AND a.attnum = dsc.objsubid) \
+             WHERE c.relname = 'probe'",
+        ),
+        (
+            "row_number-window",
+            "SELECT a.attname, row_number() OVER (PARTITION BY a.attrelid ORDER BY a.attnum) AS attnum \
+             FROM pg_catalog.pg_class c JOIN pg_catalog.pg_attribute a ON (a.attrelid = c.oid) \
+             WHERE c.relname = 'probe'",
+        ),
+        (
+            "pg_get_expr+nullif",
+            "SELECT a.attname, nullif(a.attidentity, '') AS attidentity, \
+             pg_catalog.pg_get_expr(def.adbin, def.adrelid) AS adsrc \
+             FROM pg_catalog.pg_class c JOIN pg_catalog.pg_attribute a ON (a.attrelid = c.oid) \
+             LEFT JOIN pg_catalog.pg_attrdef def ON (a.attrelid = def.adrelid AND a.attnum = def.adnum) \
+             WHERE c.relname = 'probe'",
+        ),
+        (
+            "full-getColumns",
+            "SELECT * FROM ( \
+               SELECT n.nspname, c.relname, a.attname, a.atttypid, \
+                 a.attnotnull OR (t.typtype = 'd' AND t.typnotnull) AS attnotnull, \
+                 a.atttypmod, a.attlen, t.typtypmod, \
+                 row_number() OVER (PARTITION BY a.attrelid ORDER BY a.attnum) AS attnum, \
+                 nullif(a.attidentity, '') AS attidentity, nullif(a.attgenerated, '') AS attgenerated, \
+                 pg_catalog.pg_get_expr(def.adbin, def.adrelid) AS adsrc, \
+                 dsc.description, t.typbasetype, t.typtype \
+               FROM pg_catalog.pg_namespace n \
+                 JOIN pg_catalog.pg_class c ON (c.relnamespace = n.oid) \
+                 JOIN pg_catalog.pg_attribute a ON (a.attrelid = c.oid) \
+                 JOIN pg_catalog.pg_type t ON (a.atttypid = t.oid) \
+                 LEFT JOIN pg_catalog.pg_attrdef def ON (a.attrelid = def.adrelid AND a.attnum = def.adnum) \
+                 LEFT JOIN pg_catalog.pg_description dsc ON (c.oid = dsc.objoid AND a.attnum = dsc.objsubid) \
+               WHERE c.relkind in ('r','p','v','f','m') AND a.attnum > 0 AND NOT a.attisdropped \
+                 AND c.relname = 'probe' \
+               ORDER BY nspname, c.relname, attnum \
+             ) c WHERE true",
+        ),
+    ];
+
+    let mut report = Vec::new();
+    for (label, sql) in variants {
+        match select_rows(&conn, sql).await {
+            Ok(rows) => report.push(format!("{label}: OK ({} rows)", rows.len())),
+            Err(e) => report.push(format!("{label}: ERR {e}")),
+        }
+    }
+    panic!("getColumns feature probe:\n{}", report.join("\n"));
 }

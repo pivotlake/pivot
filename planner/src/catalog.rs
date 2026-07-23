@@ -208,6 +208,14 @@ pub trait Table: Debug + Send + Sync {
     fn row_count(&self, _transaction: &dyn CatalogTransaction) -> Option<i64> {
         None
     }
+
+    /// Whether this table is known — without reading the transaction snapshot —
+    /// to have no rows. Lets a `LEFT`/`RIGHT` join against it collapse to a
+    /// null-extended projection instead of an outer join (a virtual
+    /// always-empty catalog table like `pg_attrdef`). Default: not known empty.
+    fn produces_no_rows(&self) -> bool {
+        false
+    }
 }
 
 /// Convert Pivot columns into the DuckDB-typed columns the binder consumes
