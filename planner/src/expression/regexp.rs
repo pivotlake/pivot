@@ -19,7 +19,7 @@ use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use arrow_array::builder::StringViewBuilder;
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, ArrayRef, RecordBatch, StringViewArray};
+use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, StringViewArray};
 use regex::bytes::{Captures, Regex as BytesRegex, RegexBuilder as BytesRegexBuilder};
 use std::borrow::Cow;
 use std::fmt::{self, Display};
@@ -77,6 +77,56 @@ impl RegexpReplace {
                     }
                 });
                 ExprResult::Array(result)
+            }) as ExprEvalFn
+        }))
+    }
+}
+
+/// SQL `regexp_full_match(input, pattern)` — DuckDB's `~` operator. True when
+/// `pattern` matches the **entire** `input` row (an unmatched null stays null).
+/// `pattern` must be a constant so the regex compiles once at plan-compile time.
+#[derive(Debug, Clone)]
+pub struct RegexpFullMatch {
+    pub input: Box<Expression>,
+    pub pattern: String,
+}
+
+impl Display for RegexpFullMatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "regexp_full_match({}, '{}')", self.input, self.pattern)
+    }
+}
+
+impl RegexpFullMatch {
+    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
+        build_regex(&self.pattern).map_err(|source| compile::Error::InvalidRegexPattern {
+            pattern: self.pattern.clone(),
+            source,
+        })?;
+
+        let pattern = self.pattern.clone();
+        let input_builder = self.input.compile()?;
+
+        Ok(Box::new(move || {
+            let regex = build_regex(&pattern).expect("pattern validated at plan compile");
+            let mut input_expr = input_builder();
+            Box::new(move |batch: &RecordBatch| {
+                let input = input_expr(batch);
+                let (arr, _) = input.as_datum().get();
+                let strings = arr.as_string_view();
+                let result: BooleanArray = strings
+                    .iter()
+                    .map(|row| {
+                        row.map(|value| {
+                            let bytes = value.as_bytes();
+                            // Full match: the match must span the whole row.
+                            regex
+                                .find(bytes)
+                                .is_some_and(|m| m.start() == 0 && m.end() == bytes.len())
+                        })
+                    })
+                    .collect();
+                ExprResult::Array(Arc::new(result))
             }) as ExprEvalFn
         }))
     }

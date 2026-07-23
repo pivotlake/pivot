@@ -330,6 +330,11 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 #[test]
 #[ignore = "pivot lacks the extended query protocol the JDBC sink requires; see module docs"]
 fn kafka_connect_jdbc_sink_lands_rows() {
+    // Print pivot's per-query logs so a sink failure shows which SQL reached it.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .try_init();
+
     let root = TempDir::new().unwrap();
     let pivot_port = start_pivot_server(root.path().to_str().unwrap());
 
@@ -343,6 +348,21 @@ fn kafka_connect_jdbc_sink_lands_rows() {
         let client = connect_client(pivot_port).await;
         wait_for_row(&client, Instant::now() + Duration::from_secs(120)).await
     });
+
+    if rows.is_empty() {
+        // Dump the sink's own error (the failing SQL + pivot's response).
+        let logs = String::from_utf8_lossy(&connect.stdout_to_vec().unwrap_or_default())
+            .lines()
+            .filter(|l| {
+                l.contains("ERROR")
+                    || l.contains("Exception")
+                    || l.contains("SQLState")
+                    || l.contains("JdbcSinkTask")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        eprintln!("=== CONNECT SINK ERRORS ===\n{logs}\n=== END ===");
+    }
 
     assert_eq!(rows, vec![("1".to_string(), "alice".to_string())]);
 }

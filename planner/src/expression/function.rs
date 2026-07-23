@@ -3,7 +3,7 @@
 
 use super::{
     Arithmetic, Contains, DatePart, DateTrunc, Divide, IntervalArithmetic, Length, Prefix,
-    RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet, VariantToJson,
+    RegexpFullMatch, RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet, VariantToJson,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::types::Type;
@@ -71,6 +71,8 @@ pub enum Function {
     Arithmetic(Arithmetic),
     Length(Length),
     RegexpReplace(RegexpReplace),
+    /// `regexp_full_match` / the `~` operator.
+    RegexpFullMatch(RegexpFullMatch),
     /// `regexp_jit_replace` — like `RegexpReplace` but always PCRE2 JIT-compiled.
     RegexpJitReplace(RegexpJitReplace),
     Divide(Divide),
@@ -107,6 +109,7 @@ impl Display for Function {
             Function::Arithmetic(a) => write!(f, "{a}"),
             Function::Length(l) => write!(f, "{l}"),
             Function::RegexpReplace(r) => write!(f, "{r}"),
+            Function::RegexpFullMatch(r) => write!(f, "{r}"),
             Function::RegexpJitReplace(r) => write!(f, "{r}"),
             Function::Divide(d) => write!(f, "{d}"),
             Function::DateTrunc(dt) => write!(f, "{dt}"),
@@ -133,6 +136,7 @@ impl Function {
             Function::DatePart(d) => d.return_type.clone(),
             // The regex replacers rewrite strings.
             Function::RegexpReplace(_) | Function::RegexpJitReplace(_) => Type::Utf8,
+            Function::RegexpFullMatch(_) => Type::Boolean,
             // `/` computes a float quotient, single- or double-precision.
             Function::Divide(d) => d.return_type.clone(),
             // `date_trunc` and `now()` yield a timestamp.
@@ -157,6 +161,7 @@ impl Function {
             Function::Arithmetic(a) => a.compile(),
             Function::Length(l) => l.compile(),
             Function::RegexpReplace(r) => r.compile(),
+            Function::RegexpFullMatch(r) => r.compile(),
             Function::RegexpJitReplace(r) => r.compile(),
             Function::Divide(d) => d.compile(),
             Function::DateTrunc(dt) => dt.compile(),

@@ -24,7 +24,7 @@ use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Conjunction,
     ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide, Error,
     Expression, Function, InList, IntervalArithmetic, Length, Not, NumericAggregate, Prefix, Ref,
-    RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
+    RegexpFullMatch, RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
 
@@ -290,6 +290,7 @@ impl Function {
             "*" => Ok(Function::Arithmetic(Arithmetic::from_handle(func)?)),
             "length" | "strlen" | "len" => Ok(Function::Length(Length::from_handle(func)?)),
             "regexp_replace" => Ok(Function::RegexpReplace(RegexpReplace::from_handle(func)?)),
+            "regexp_full_match" => Ok(Function::RegexpFullMatch(RegexpFullMatch::from_handle(func)?)),
             "regexp_jit_replace" => Ok(Function::RegexpJitReplace(RegexpJitReplace::from_handle(
                 func,
             )?)),
@@ -577,6 +578,18 @@ impl RegexpReplace {
             pattern,
             replacement,
         })
+    }
+}
+
+impl RegexpFullMatch {
+    pub(crate) fn from_handle(func: FunctionHandle<'_>) -> Result<RegexpFullMatch, Error> {
+        let params = function_args(func, 2)?;
+        let pattern = constant_string(
+            Expression::from_handle(params[1])?,
+            "regexp_full_match: pattern",
+        )?;
+        let input = Box::new(Expression::from_handle(params[0])?);
+        Ok(RegexpFullMatch { input, pattern })
     }
 }
 
