@@ -23,11 +23,14 @@
 //!   string, or mixed; branch-free `+` when all-additive), in `i128` when a slot
 //!   needs the width (see [`Aggregate`]'s rule) else the narrow `i64`.
 
-use super::{Aggregate, aggregation_slots, row_key_schema, sum_reads_wide_column};
+use super::{Aggregate, aggregation_slots, needs_wide_accumulator, row_key_schema};
 use crate::compile::{Error, ExprEvalFn, ExprFn};
 use crate::expression::{AggregateFunc, Expression, Ref};
+use crate::types::MAX_DECIMAL64_PRECISION;
 use crate::types::Type;
-use arrow_array::types::{Int8Type, Int16Type, Int32Type, Int64Type};
+use arrow_array::types::{
+    Decimal64Type, Decimal128Type, Int8Type, Int16Type, Int32Type, Int64Type,
+};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use dispatch::{
@@ -261,8 +264,9 @@ pub(super) fn build_group_by_operator(
     };
 
     // Cell width: i128 when a string extreme needs its 128-bit `ArenaKey` cell, or
-    // when a SUM reads a 64-bit column; else the narrow i64 entry.
-    let wide = slots.iter().any(|s| s.is_string_extreme()) || sum_reads_wide_column(&unique_exprs);
+    // when an aggregate reads a column whose values need the wide accumulator (a
+    // 64-bit SUM, or any aggregate over a decimal); else the narrow i64 entry.
+    let wide = slots.iter().any(|s| s.is_string_extreme()) || needs_wide_accumulator(&unique_exprs);
 
     let grouped = dispatch_group_by(input, keys, slots, &sig, wide, output_limit)?;
 
@@ -352,6 +356,10 @@ fn canonical_input_type(result_type: &Type) -> Option<Type> {
         // A computed float aggregate argument (`SUM(a * b)`) materialises as the
         // Float64 the float readers consume.
         Type::Float32 | Type::Float64 => Some(Type::Float64),
+        // A computed decimal keeps its exact declared shape: its raw unscaled
+        // values are read as-is at their carrier width, and any
+        // decimal-to-decimal cast would rescale them.
+        Type::Decimal { .. } => Some(result_type.clone()),
         _ => None,
     }
 }
@@ -472,6 +480,15 @@ macro_rules! select_key_extractor {
                 Type::Int16 => return $with_key!(IntKeyExtractor<Int16Type>, ()),
                 Type::Int32 => return $with_key!(IntKeyExtractor<Int32Type>, ()),
                 Type::Int64 => return $with_key!(IntKeyExtractor<Int64Type>, ()),
+                // A decimal keys on its raw unscaled integer at its carrier
+                // width (equal values share a scale, so raw equality is value
+                // equality); the emitted key column gets its declared
+                // precision/scale restamped on by the aggregate's output
+                // restore.
+                Type::Decimal { precision, .. } if *precision <= MAX_DECIMAL64_PRECISION => {
+                    return $with_key!(IntKeyExtractor<Decimal64Type>, ());
+                }
+                Type::Decimal { .. } => return $with_key!(IntKeyExtractor<Decimal128Type>, ()),
                 Type::Utf8 => return $with_key!(StringKeyExtractor, ()),
                 // Other single-key types fall through to the row encoder below.
                 _ => {}
@@ -669,8 +686,8 @@ mod tests {
     use crate::test_support::*;
     use crate::types::Type;
     use arrow_array::cast::AsArray;
-    use arrow_array::types::{Date32Type, Float64Type};
-    use arrow_array::{ArrayRef, Float32Array, Float64Array, Int32Array};
+    use arrow_array::types::{Date32Type, Float64Type, Int64Type};
+    use arrow_array::{ArrayRef, Float32Array, Float64Array, Int32Array, RecordBatch};
     use arrow_schema::DataType;
     use rstest::rstest;
     use std::sync::Arc;
@@ -801,6 +818,325 @@ mod tests {
             batches[0].column(0).as_primitive::<Float64Type>().value(0),
             3.0
         );
+    }
+
+    /// A `Decimal64` column (the carrier for a declared precision up to 18).
+    fn decimal_col(values: Vec<i64>, precision: u8, scale: i8) -> ArrayRef {
+        use arrow_array::Decimal64Array;
+        Arc::new(
+            Decimal64Array::from(values)
+                .with_precision_and_scale(precision, scale)
+                .unwrap(),
+        )
+    }
+
+    /// A `Decimal128` column (the carrier for a declared precision of 19+).
+    fn wide_decimal_col(values: Vec<i128>, precision: u8, scale: i8) -> ArrayRef {
+        use arrow_array::Decimal128Array;
+        Arc::new(
+            Decimal128Array::from(values)
+                .with_precision_and_scale(precision, scale)
+                .unwrap(),
+        )
+    }
+
+    /// g [1, 1, 2] alongside price DECIMAL(10,2) [10.50, 2.50, 4.00].
+    fn add_sales_table(testing_planner: &TestingPlanner) {
+        testing_planner.add_table(
+            "sales",
+            &[
+                (
+                    "g",
+                    Type::Int32,
+                    Arc::new(Int32Array::from(vec![1, 1, 2])) as ArrayRef,
+                ),
+                (
+                    "price",
+                    Type::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    decimal_col(vec![1050, 250, 400], 10, 2),
+                ),
+            ],
+        );
+    }
+
+    fn col_decimal(batches: &[RecordBatch], col: usize, row: usize) -> i128 {
+        use arrow_array::types::Decimal128Type;
+        batches[0]
+            .column(col)
+            .as_primitive::<Decimal128Type>()
+            .value(row)
+    }
+
+    fn col_decimal64(batches: &[RecordBatch], col: usize, row: usize) -> i64 {
+        use arrow_array::types::Decimal64Type;
+        batches[0]
+            .column(col)
+            .as_primitive::<Decimal64Type>()
+            .value(row)
+    }
+
+    #[rstest]
+    fn grouped_sum_min_max_over_decimal(mut testing_planner: TestingPlanner) {
+        add_sales_table(&testing_planner);
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT g, SUM(price), MIN(price), MAX(price) FROM sales GROUP BY g ORDER BY g",
+        );
+
+        // SUM(DECIMAL(10,2)) is DECIMAL(38,2) (a Decimal128 column); MIN/MAX
+        // keep the input's Decimal64(10,2). The unscaled values must come
+        // through untouched (17.00 sums to raw 1700).
+        let schema = batches[0].schema();
+        assert_eq!(schema.field(1).data_type(), &DataType::Decimal128(38, 2));
+        assert_eq!(schema.field(2).data_type(), &DataType::Decimal64(10, 2));
+        assert_eq!(schema.field(3).data_type(), &DataType::Decimal64(10, 2));
+        assert_eq!(col_decimal(&batches, 1, 0), 1300); // 10.50 + 2.50
+        assert_eq!(col_decimal64(&batches, 2, 0), 250); // MIN of group 1
+        assert_eq!(col_decimal64(&batches, 3, 0), 1050); // MAX of group 1
+        assert_eq!(col_decimal(&batches, 1, 1), 400); // group 2
+    }
+
+    #[rstest]
+    fn global_sum_min_max_over_decimal(mut testing_planner: TestingPlanner) {
+        add_sales_table(&testing_planner);
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT SUM(price), MIN(price), MAX(price) FROM sales",
+        );
+
+        let schema = batches[0].schema();
+        assert_eq!(schema.field(0).data_type(), &DataType::Decimal128(38, 2));
+        assert_eq!(schema.field(1).data_type(), &DataType::Decimal64(10, 2));
+        assert_eq!(schema.field(2).data_type(), &DataType::Decimal64(10, 2));
+        assert_eq!(col_decimal(&batches, 0, 0), 1700); // 17.00
+        assert_eq!(col_decimal64(&batches, 1, 0), 250); // 2.50
+        assert_eq!(col_decimal64(&batches, 2, 0), 1050); // 10.50
+    }
+
+    #[rstest]
+    fn grouped_sum_min_max_over_wide_decimal(mut testing_planner: TestingPlanner) {
+        // A declared precision of 20 rides the Decimal128 carrier end to end;
+        // the raw values are chosen past i64::MAX so only a real i128 path can
+        // hold them.
+        let huge: i128 = 15_000_000_000_000_000_000;
+        testing_planner.add_table(
+            "big_sales",
+            &[
+                (
+                    "g",
+                    Type::Int32,
+                    Arc::new(Int32Array::from(vec![1, 1, 2])) as ArrayRef,
+                ),
+                (
+                    "price",
+                    Type::Decimal {
+                        precision: 20,
+                        scale: 2,
+                    },
+                    wide_decimal_col(vec![huge, 5_000_000_000_000_000_000, 400], 20, 2),
+                ),
+            ],
+        );
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT g, SUM(price), MIN(price), MAX(price) FROM big_sales GROUP BY g ORDER BY g",
+        );
+
+        let schema = batches[0].schema();
+        assert_eq!(schema.field(1).data_type(), &DataType::Decimal128(38, 2));
+        assert_eq!(schema.field(2).data_type(), &DataType::Decimal128(20, 2));
+        assert_eq!(schema.field(3).data_type(), &DataType::Decimal128(20, 2));
+        assert_eq!(col_decimal(&batches, 1, 0), 20_000_000_000_000_000_000); // past i64::MAX
+        assert_eq!(col_decimal(&batches, 2, 0), 5_000_000_000_000_000_000);
+        assert_eq!(col_decimal(&batches, 3, 0), huge);
+        assert_eq!(col_decimal(&batches, 1, 1), 400); // group 2
+    }
+
+    #[rstest]
+    fn group_by_wide_decimal_key(mut testing_planner: TestingPlanner) {
+        let huge: i128 = 15_000_000_000_000_000_000;
+        testing_planner.add_table(
+            "big_orders",
+            &[(
+                "price",
+                Type::Decimal {
+                    precision: 20,
+                    scale: 2,
+                },
+                wide_decimal_col(vec![huge, 400, huge], 20, 2),
+            )],
+        );
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT price, count(*) FROM big_orders GROUP BY price ORDER BY price",
+        );
+
+        // The key column keeps the declared Decimal128(20,2) with its raw i128
+        // keys restamped, never rescaled.
+        let schema = batches[0].schema();
+        assert_eq!(schema.field(0).data_type(), &DataType::Decimal128(20, 2));
+        assert_eq!(col_decimal(&batches, 0, 0), 400);
+        assert_eq!(col_decimal(&batches, 0, 1), huge);
+        let counts = batches[0].column(1).as_primitive::<Int64Type>();
+        assert_eq!(counts.value(0), 1);
+        assert_eq!(counts.value(1), 2);
+    }
+
+    #[rstest]
+    fn avg_over_decimal_is_double(mut testing_planner: TestingPlanner) {
+        add_sales_table(&testing_planner);
+
+        let batches = run_batches(&mut testing_planner, "SELECT AVG(price) FROM sales");
+
+        // AVG lowers to sum/count with a float divide; the DECIMAL(38,2) sum is
+        // cast to DOUBLE (a real division by 10^2), so the average is 17.00 / 3.
+        assert_eq!(batches[0].column(0).data_type(), &DataType::Float64);
+        let avg = batches[0].column(0).as_primitive::<Float64Type>().value(0);
+        assert!((avg - 17.0 / 3.0).abs() < 1e-12);
+    }
+
+    #[rstest]
+    fn grouped_avg_over_decimal_is_double(mut testing_planner: TestingPlanner) {
+        add_sales_table(&testing_planner);
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT g, AVG(price) FROM sales GROUP BY g ORDER BY g",
+        );
+
+        assert_eq!(batches[0].column(1).data_type(), &DataType::Float64);
+        let avg = batches[0].column(1).as_primitive::<Float64Type>();
+        assert!((avg.value(0) - 6.5).abs() < 1e-12); // (10.50 + 2.50) / 2
+        assert!((avg.value(1) - 4.0).abs() < 1e-12);
+    }
+
+    #[rstest]
+    fn group_by_decimal_key_with_sum(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "orders",
+            &[
+                (
+                    "price",
+                    Type::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    decimal_col(vec![1050, 400, 1050], 10, 2),
+                ),
+                (
+                    "qty",
+                    Type::Int32,
+                    Arc::new(Int32Array::from(vec![2, 5, 3])) as ArrayRef,
+                ),
+            ],
+        );
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT price, SUM(qty) FROM orders GROUP BY price ORDER BY price",
+        );
+
+        // The key column must carry the declared DECIMAL(10,2) shape (a restamp
+        // of the raw keys, never a rescale) and the sums fold per distinct key.
+        use arrow_array::types::Decimal64Type;
+        let schema = batches[0].schema();
+        assert_eq!(schema.field(0).data_type(), &DataType::Decimal64(10, 2));
+        let keys = batches[0].column(0).as_primitive::<Decimal64Type>();
+        assert_eq!(keys.value(0), 400);
+        assert_eq!(keys.value(1), 1050);
+        assert_eq!(col_decimal(&batches, 1, 0), 5); // SUM(qty) for 4.00
+        assert_eq!(col_decimal(&batches, 1, 1), 5); // 2 + 3 for 10.50
+    }
+
+    #[rstest]
+    fn group_by_decimal_and_int_keys(mut testing_planner: TestingPlanner) {
+        // A decimal beside an int takes the row-encoded key path.
+        testing_planner.add_table(
+            "orders",
+            &[
+                (
+                    "price",
+                    Type::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    decimal_col(vec![1050, 1050, 400], 10, 2),
+                ),
+                (
+                    "g",
+                    Type::Int32,
+                    Arc::new(Int32Array::from(vec![1, 1, 2])) as ArrayRef,
+                ),
+            ],
+        );
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT price, g, count(*) FROM orders GROUP BY price, g ORDER BY price",
+        );
+
+        use arrow_array::types::Decimal64Type;
+        let schema = batches[0].schema();
+        assert_eq!(schema.field(0).data_type(), &DataType::Decimal64(10, 2));
+        let keys = batches[0].column(0).as_primitive::<Decimal64Type>();
+        assert_eq!(keys.value(0), 400);
+        assert_eq!(keys.value(1), 1050);
+        let counts = batches[0].column(2).as_primitive::<Int64Type>();
+        assert_eq!(counts.value(0), 1);
+        assert_eq!(counts.value(1), 2);
+    }
+
+    #[rstest]
+    fn sum_of_decimal_arithmetic(mut testing_planner: TestingPlanner) {
+        add_sales_table(&testing_planner);
+
+        let batches = run_batches(&mut testing_planner, "SELECT SUM(price * 2) FROM sales");
+
+        // price * 2 keeps scale 2, so the sum's raw value is 2 * 1700 = 34.00.
+        assert!(matches!(
+            batches[0].column(0).data_type(),
+            DataType::Decimal128(_, 2)
+        ));
+        assert_eq!(col_decimal(&batches, 0, 0), 3400);
+    }
+
+    #[rstest]
+    fn filtered_sum_over_decimal(mut testing_planner: TestingPlanner) {
+        add_sales_table(&testing_planner);
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT SUM(price) FROM sales WHERE price > 9.99",
+        );
+
+        assert_eq!(col_decimal(&batches, 0, 0), 1050); // only 10.50 passes
+    }
+
+    #[rstest]
+    fn order_by_decimal_limit(mut testing_planner: TestingPlanner) {
+        add_sales_table(&testing_planner);
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT price FROM sales ORDER BY price DESC LIMIT 2",
+        );
+
+        let rows: Vec<i64> = batches
+            .iter()
+            .flat_map(|b| {
+                use arrow_array::types::Decimal64Type;
+                let col = b.column(0).as_primitive::<Decimal64Type>();
+                (0..b.num_rows()).map(|i| col.value(i)).collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(rows, vec![1050, 400]);
     }
 
     #[rstest]

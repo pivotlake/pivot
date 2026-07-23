@@ -16,8 +16,8 @@
 
 use std::collections::HashMap;
 
+use duckdb_planner::BoundLogicalType;
 use duckdb_planner::LogicalOp;
-use duckdb_planner::duckdb_bridge::duckdb_types::LogicalTypeId;
 use duckdb_planner::handle::{
     ComparisonJoin as ComparisonJoinView, DynamicFilterRef, Operator as DuckOperator,
     TableScan as TableScanView, rowid_column_id,
@@ -227,13 +227,13 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
 /// positional `BOUND_REF` over storage column indices. Shared by the walk's
 /// `projection_map` replay and the scan constructors in [`operator`].
 fn build_scan_columns(
-    columns: impl Iterator<Item = (usize, LogicalTypeId)>,
+    columns: impl Iterator<Item = (usize, BoundLogicalType)>,
 ) -> Result<Vec<Expression>, ExpressionError> {
     columns
-        .map(|(column_idx, type_id)| {
+        .map(|(column_idx, col_type)| {
             Ok(Expression::Ref(Ref {
                 column_idx,
-                return_type: type_from_logical(type_id)?,
+                return_type: type_from_logical(col_type)?,
                 name: None,
             }))
         })

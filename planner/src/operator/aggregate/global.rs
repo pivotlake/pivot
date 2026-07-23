@@ -1,6 +1,6 @@
 //! Global aggregates (no GROUP BY).
 
-use super::{Aggregate, aggregation_slots, sum_reads_wide_column};
+use super::{Aggregate, aggregation_slots, needs_wide_accumulator};
 use crate::catalog::CatalogTransaction;
 use crate::compile::Error;
 use crate::expression::{AggregateFunc, Expression};
@@ -21,8 +21,8 @@ impl Aggregate {
         input: RecordBatchOperatorSpec,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let slots = aggregation_slots(&self.expressions)?;
-        // Pick the accumulator width by column type (see `sum_reads_wide_column`).
-        Ok(if sum_reads_wide_column(&self.expressions) {
+        // Pick the accumulator width by column type (see `needs_wide_accumulator`).
+        Ok(if needs_wide_accumulator(&self.expressions) {
             input.aggregate::<i128>(slots)
         } else {
             input.aggregate::<i64>(slots)
@@ -97,9 +97,9 @@ impl Aggregate {
             };
             // Only the integer/temporal columns the scan-based global path emits
             // as Int64 are sound here: their stats cast losslessly to Int64.
-            // Float/decimal/boolean/Int128 would silently truncate or overflow
-            // (and the scan path doesn't support them either), so decline and
-            // let the ordinary path handle, or reject, them.
+            // Float/decimal/boolean/Int128 would silently truncate, overflow, or
+            // rescale under that cast, so decline and let the ordinary scan-based
+            // path handle, or reject, them.
             match column.return_type {
                 Type::Int8
                 | Type::Int16

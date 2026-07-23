@@ -6,8 +6,10 @@ use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::keys::{ArenaKey, KeyColumns};
 use arrow_array::builder::make_view;
+use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+    Decimal64Type, Decimal128Type, Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type,
+    UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow_array::{ArrayRef, StringViewArray};
 use arrow_buffer::ScalarBuffer;
@@ -26,13 +28,26 @@ macro_rules! pop_le {
 /// Generates [`FieldBuilder`] (the decode-side column builder) and its three
 /// methods from the shared `int_key_types!` list, so its integer arms can't
 /// drift from the encode side. The `Str` arm is spelled out in each method
-/// because it is genuinely different (length handling, zero-copy arena views).
+/// because it is genuinely different (length handling, zero-copy arena views);
+/// the `Dec64`/`Dec128` arms because they must carry, and stamp back on, the
+/// declared precision/scale the unit-variant pattern can't name.
 macro_rules! define_field_builder {
     ( $( ($variant:ident, $dt:ident, $arrow:ty, $native:ty) ),+ $(,)? ) => {
-        /// One output key column under construction. Integers decode into a typed
-        /// primitive builder; strings into view headers pointing back into the arena.
+        /// One output key column under construction. Fixed-width values decode into
+        /// a typed primitive builder; strings into view headers pointing back into
+        /// the arena.
         enum FieldBuilder {
             $( $variant(PrimitiveBuilder<$arrow>), )+
+            Dec64 {
+                builder: PrimitiveBuilder<Decimal64Type>,
+                precision: u8,
+                scale: i8,
+            },
+            Dec128 {
+                builder: PrimitiveBuilder<Decimal128Type>,
+                precision: u8,
+                scale: i8,
+            },
             Str(SlabColumn<u128>),
         }
 
@@ -41,6 +56,16 @@ macro_rules! define_field_builder {
                 match dt {
                     $( DataType::$dt =>
                         FieldBuilder::$variant(PrimitiveBuilder::with_capacity(allocator, rows)), )+
+                    DataType::Decimal64(precision, scale) => FieldBuilder::Dec64 {
+                        builder: PrimitiveBuilder::with_capacity(allocator, rows),
+                        precision: *precision,
+                        scale: *scale,
+                    },
+                    DataType::Decimal128(precision, scale) => FieldBuilder::Dec128 {
+                        builder: PrimitiveBuilder::with_capacity(allocator, rows),
+                        precision: *precision,
+                        scale: *scale,
+                    },
                     DataType::Utf8View => FieldBuilder::Str(SlabColumn::with_capacity(allocator, rows)),
                     dt => unreachable!("row key column type not supported: {dt}"),
                 }
@@ -54,6 +79,8 @@ macro_rules! define_field_builder {
             fn decode(&mut self, blob: &mut &[u8], full_len: usize, key: &ArenaKey, trailing: bool) {
                 match self {
                     $( FieldBuilder::$variant(b) => b.col.push(pop_le!(blob, $native)), )+
+                    FieldBuilder::Dec64 { builder, .. } => builder.col.push(pop_le!(blob, i64)),
+                    FieldBuilder::Dec128 { builder, .. } => builder.col.push(pop_le!(blob, i128)),
                     FieldBuilder::Str(views) => {
                         let s = if trailing {
                             std::mem::take(blob)
@@ -83,6 +110,32 @@ macro_rules! define_field_builder {
             ) -> (Field, ArrayRef) {
                 let (dt, array): (DataType, ArrayRef) = match self {
                     $( FieldBuilder::$variant(b) => (DataType::$dt, b.into_array(None)), )+
+                    // Restamp the schema's exact precision/scale over the raw
+                    // decoded unscaled integers: the builder renders arrow's
+                    // default decimal shape, and only a metadata restamp (never
+                    // a rescaling arrow cast) keeps the values intact.
+                    FieldBuilder::Dec64 { builder, precision, scale } => {
+                        let array = builder.into_array(None);
+                        let array: ArrayRef = Arc::new(
+                            array
+                                .as_primitive::<Decimal64Type>()
+                                .clone()
+                                .with_precision_and_scale(precision, scale)
+                                .expect("row key schema decimal shape is valid"),
+                        );
+                        (DataType::Decimal64(precision, scale), array)
+                    }
+                    FieldBuilder::Dec128 { builder, precision, scale } => {
+                        let array = builder.into_array(None);
+                        let array: ArrayRef = Arc::new(
+                            array
+                                .as_primitive::<Decimal128Type>()
+                                .clone()
+                                .with_precision_and_scale(precision, scale)
+                                .expect("row key schema decimal shape is valid"),
+                        );
+                        (DataType::Decimal128(precision, scale), array)
+                    }
                     FieldBuilder::Str(views) => {
                         let len = views.len();
                         let views = ScalarBuffer::<u128>::new(views.into_buffer(), 0, len);

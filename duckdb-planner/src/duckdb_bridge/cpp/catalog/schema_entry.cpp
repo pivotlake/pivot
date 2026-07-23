@@ -26,10 +26,22 @@ namespace {
 // structure, so it must be built through its factory.
 LogicalType logical_type_from(uint8_t type_id) {
 	auto id = static_cast<LogicalTypeId>(type_id);
+	if (id == LogicalTypeId::DECIMAL) {
+		throw InternalException("a DECIMAL column needs a width and scale, not just a type id");
+	}
 	if (id == LogicalTypeId::VARIANT) {
 		return LogicalType::VARIANT();
 	}
 	return LogicalType(id);
+}
+
+// Materialize a column's type, completing a DECIMAL with the width and scale
+// the Rust provider carried alongside the id.
+LogicalType logical_type_from_column(const DuckDBColumn &col) {
+	if (static_cast<LogicalTypeId>(col.duckdb_logical_type_id) == LogicalTypeId::DECIMAL) {
+		return LogicalType::DECIMAL(col.decimal_width, col.decimal_scale);
+	}
+	return logical_type_from(col.duckdb_logical_type_id);
 }
 
 // Carries a table function's output schema from the lookup (where Rust supplied
@@ -105,7 +117,7 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
 		}
 		for (const auto &col : function.columns) {
 			info->names.emplace_back(std::string(col.name));
-			info->return_types.emplace_back(logical_type_from(col.duckdb_logical_type_id));
+			info->return_types.emplace_back(logical_type_from_column(col));
 		}
 
 		TableFunction func(std::string(table_name), std::move(arguments), nullptr,
@@ -165,7 +177,7 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
 	for (const auto &col : result.columns) {
 		auto col_name = std::string(col.name);
 		table_info.columns.AddColumn(
-		    ColumnDefinition(col_name, logical_type_from(col.duckdb_logical_type_id)));
+		    ColumnDefinition(col_name, logical_type_from_column(col)));
 	}
 
 	auto &db_instance = ParentCatalog().GetAttached().GetDatabase();

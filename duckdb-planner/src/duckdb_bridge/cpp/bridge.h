@@ -10,6 +10,9 @@ struct CatalogContext;
 struct TransactionContext;
 struct OptionalTableWrapper;
 struct ExtractPlanResult;
+struct BridgeLogicalType;
+struct BridgeDecimalValue;
+struct BridgeHugeint;
 
 // The Rust plan builder reads DuckDB's own objects directly, so expose them to
 // CXX as opaque types by their real names.
@@ -74,7 +77,7 @@ size_t lo_filter_expr_count(const LogicalOperator &op);
 const Expression &lo_filter_expr(const LogicalOperator &op, size_t index);
 size_t lo_filter_projection_map_count(const LogicalOperator &op);
 size_t lo_filter_projection_map_index(const LogicalOperator &op, size_t index);
-uint8_t lo_filter_type_id(const LogicalOperator &op, size_t index);
+BridgeLogicalType lo_filter_type_id(const LogicalOperator &op, size_t index);
 
 // ---- OrderBy ----
 size_t lo_orderby_count(const LogicalOperator &op);
@@ -109,7 +112,7 @@ bool lo_get_has_table(const LogicalOperator &op);
 rust::Box<OptionalTableWrapper> lo_get_take_table(const LogicalOperator &op);
 size_t lo_get_output_count(const LogicalOperator &op);
 size_t lo_get_output_column(const LogicalOperator &op, size_t index);
-uint8_t lo_get_output_type(const LogicalOperator &op, size_t index);
+BridgeLogicalType lo_get_output_type(const LogicalOperator &op, size_t index);
 std::unique_ptr<ExpressionList> lo_get_pushed_conditions(const LogicalOperator &op);
 size_t lo_get_dynamic_filter_count(const LogicalOperator &op);
 size_t lo_get_dynamic_filter_data_id(const LogicalOperator &op, size_t index);
@@ -126,7 +129,7 @@ const Value &lo_get_param(const LogicalOperator &op, size_t index);
 rust::String lo_create_table_name(const LogicalOperator &op);
 size_t lo_create_column_count(const LogicalOperator &op);
 rust::String lo_create_column_name(const LogicalOperator &op, size_t index);
-uint8_t lo_create_column_type(const LogicalOperator &op, size_t index);
+BridgeLogicalType lo_create_column_type(const LogicalOperator &op, size_t index);
 size_t lo_create_option_count(const LogicalOperator &op);
 rust::String lo_create_option_key(const LogicalOperator &op, size_t index);
 rust::String lo_create_option_value(const LogicalOperator &op, size_t index);
@@ -152,7 +155,7 @@ const Expression &expr_list_get(const ExpressionList &list, size_t index);
 
 // ---- Expression: shared ----
 uint8_t expr_type(const Expression &expr);
-uint8_t expr_return_type(const Expression &expr);
+BridgeLogicalType expr_return_type(const Expression &expr);
 bool expr_has_alias(const Expression &expr);
 rust::String expr_alias(const Expression &expr);
 
@@ -171,6 +174,8 @@ uint64_t value_u64(const Value &v);
 float value_f32(const Value &v);
 double value_f64(const Value &v);
 rust::String value_string(const Value &v);
+BridgeDecimalValue value_decimal(const Value &v);
+BridgeHugeint value_hugeint(const Value &v);
 int32_t value_date(const Value &v);
 int64_t value_timestamp(const Value &v);
 int32_t value_interval_months(const Value &v);
