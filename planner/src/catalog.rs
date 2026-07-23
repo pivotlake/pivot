@@ -15,6 +15,8 @@
 use std::any::Any;
 use std::collections::HashMap;
 
+use async_trait::async_trait;
+
 use crate::expression::{CompareType, TableFilter};
 use crate::operator::TableFunction;
 use crate::types::{Type, logical_from_type};
@@ -266,6 +268,7 @@ impl DuckDBTable for DuckDBTableAdapter {
 /// (e.g. reading every data file's footer, in parallel, into a materialized
 /// table) on the coordinator and returns the dataflow plan that *writes* the
 /// result into the catalog when executed.
+#[async_trait]
 pub trait Catalog: Debug + Send + Sync {
     /// Open a transaction: snapshot the catalog as it stands right now. All
     /// binding for one query resolves through the returned snapshot, so the
@@ -292,7 +295,11 @@ pub trait Catalog: Debug + Send + Sync {
     /// default does nothing; the snapshot is simply released when the caller's
     /// last reference drops. A backend with real transactional state hooks its
     /// finalization here and returns any commit failure to the query.
-    fn commit_transaction(&self, _transaction: Arc<dyn CatalogTransaction>) -> Result<()> {
+    ///
+    /// Async so the implementation decides where its work runs: a commit that
+    /// does blocking store I/O hops to a blocking thread itself, while the
+    /// default and read-only commits resolve immediately.
+    async fn commit_transaction(&self, _transaction: Arc<dyn CatalogTransaction>) -> Result<()> {
         Ok(())
     }
 
