@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #
 # run-duckdb.sh — run the TPC-H suite through DuckDB for a side-by-side
-# comparison with pivot-bench, over the SAME normalized parquet directories
-# (see setup.sql / prep-tpch-data.sh). Each base table is exposed as a view, so
-# the unmodified official qNN.sql files run as-is.
+# comparison with pivot-bench, either over the SAME normalized parquet
+# directories pivot reads (see setup.sql / prep-tpch-data.sh; each base table
+# is exposed as a view, so the unmodified official qNN.sql files run as-is),
+# or over a native DuckDB database of the same data.
 #
 # Usage:
 #   ./run-duckdb.sh --source ~/tpch-sf100                    # all queries, 1 run
@@ -11,15 +12,21 @@
 #   ./run-duckdb.sh --source ~/tpch-sf100 --iterations 3     # 3 timed runs each
 #   ./run-duckdb.sh --source ~/tpch-sf100 --no-drop-caches   # skip the cache drop
 #   ./run-duckdb.sh --source ~/tpch-sf100 --query 12 --write-expected  # write q12.tsv
-#   ./run-duckdb.sh --source ~/tpch-sf100 --duckdb-process single
+#   ./run-duckdb.sh --data native --source /mnt/nvme/tpch-native.duckdb --query 12
 #
 # We always report DuckDB's own `.timer` "Run Time" (query execution only).
 #
-# --duckdb-process per-iteration|single  (default per-iteration)
+# --data parquet|native  (default parquet)
+#   parquet: --source is the dataset root directory; each table is a view over
+#     its parquet files.
+#   native:  --source is a .duckdb database file holding the base tables (see
+#     fetch-native-dbs.sh); opened read-only.
+#
+# --duckdb-process per-iteration|single  (default single)
+#   single: all of a query's iterations in ONE duckdb process, so iterations
+#     2+ reuse DuckDB's warm buffer pool - symmetric with pivot's warm server.
 #   per-iteration: a FRESH duckdb process per timed iteration (engine-cold,
 #     page cache warm after iteration 1).
-#   single: all of a query's iterations in ONE duckdb process, so iterations
-#     2+ reuse DuckDB's warm buffer pool — symmetric with pivot's warm server.
 #
 # The OS page cache is dropped once before each query (needs root, via sudo),
 # so iteration 1 is a true cold read; --no-drop-caches skips that.
@@ -39,10 +46,11 @@ iterations=1
 drop_caches=1
 write_expected=0
 sleep_ms=0
-duckdb_process="per-iteration"
+duckdb_process="single"
+data="parquet"
 
 usage() {
-    sed -n '3,31p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,37p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -52,6 +60,7 @@ while [[ $# -gt 0 ]]; do
         --query)      queries="$2"; shift 2 ;;
         --iterations) iterations="$2"; shift 2 ;;
         --sleep)      sleep_ms="$2"; shift 2 ;;
+        --data)       data="$2"; shift 2 ;;
         --duckdb-process) duckdb_process="$2"; shift 2 ;;
         --no-drop-caches) drop_caches=0; shift ;;
         --write-expected) write_expected=1; shift ;;
@@ -65,8 +74,17 @@ case "$duckdb_process" in
     *) echo "error: --duckdb-process must be per-iteration|single (got '$duckdb_process')" >&2; usage 1 ;;
 esac
 
+case "$data" in
+    parquet|native) ;;
+    *) echo "error: --data must be parquet|native (got '$data')" >&2; usage 1 ;;
+esac
+
 [[ -n "$source_path" ]] || { echo "error: --source is required" >&2; usage 1; }
-[[ -d "$source_path" ]] || { echo "error: --source must be the dataset root directory" >&2; exit 1; }
+if [[ "$data" == "parquet" ]]; then
+    [[ -d "$source_path" ]] || { echo "error: --source must be the dataset root directory" >&2; exit 1; }
+else
+    [[ -f "$source_path" ]] || { echo "error: --source must be a .duckdb database file" >&2; exit 1; }
+fi
 
 command -v duckdb >/dev/null 2>&1 || {
     echo "error: duckdb not found on PATH" >&2
@@ -79,12 +97,15 @@ flush_page_cache() {
     echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
 }
 
-# One view per base table over its parquet directory.
-tables=(lineitem orders customer part partsupp supplier nation region)
+# One view per base table over its parquet directory; a native database
+# already holds the base tables and needs no setup.
 setup=""
-for t in "${tables[@]}"; do
-    setup+="CREATE VIEW $t AS SELECT * FROM read_parquet('${source_path%/}/$t/*.parquet');"$'\n'
-done
+if [[ "$data" == "parquet" ]]; then
+    tables=(lineitem orders customer part partsupp supplier nation region)
+    for t in "${tables[@]}"; do
+        setup+="CREATE VIEW $t AS SELECT * FROM read_parquet('${source_path%/}/$t/*.parquet');"$'\n'
+    done
+fi
 
 # Build the list of qNN.sql files to run.
 declare -a query_files=()
@@ -113,14 +134,19 @@ else
 fi
 echo
 
-# Persist the views into a throwaway .db once, then open it fresh each
-# iteration with parquet metadata caching on, so a timed run doesn't pay the
-# view re-creation.
+# Parquet mode persists the views into a throwaway .db once, then opens it
+# fresh each iteration with parquet metadata caching on, so a timed run
+# doesn't pay the view re-creation. Native mode opens the database itself,
+# read-only so a run can never dirty it.
 if [[ "$write_expected" != "1" ]]; then
-    query_db="$(mktemp -u)-tpch.db"
-    trap 'rm -f "$query_db" "$query_db".wal' EXIT
-    duckdb "$query_db" -c "$setup" >/dev/null 2>&1
-    iter_cmd=(duckdb "$query_db" -c "SET parquet_metadata_cache=true" -c ".timer on")
+    if [[ "$data" == "parquet" ]]; then
+        query_db="$(mktemp -u)-tpch.db"
+        trap 'rm -f "$query_db" "$query_db".wal' EXIT
+        duckdb "$query_db" -c "$setup" >/dev/null 2>&1
+        iter_cmd=(duckdb "$query_db" -c "SET parquet_metadata_cache=true" -c ".timer on")
+    else
+        iter_cmd=(duckdb -readonly "$source_path" -c ".timer on")
+    fi
 fi
 
 for f in "${query_files[@]}"; do
@@ -131,9 +157,11 @@ for f in "${query_files[@]}"; do
 
     if [[ "$write_expected" == "1" ]]; then
         out_file="$suite_dir/$stem.tsv"
+        expected_cmd=(duckdb)
+        [[ "$data" == "native" ]] && expected_cmd=(duckdb -readonly "$source_path")
         printf '%s\n.headers off\n.nullvalue '\'''\''\n.mode tabs\n.output %s\n%s\n' \
             "$setup" "$out_file" "$sql" \
-            | duckdb
+            | "${expected_cmd[@]}"
         echo "  wrote $out_file ($(wc -l < "$out_file" | tr -d ' ') rows)"
         echo
         continue
