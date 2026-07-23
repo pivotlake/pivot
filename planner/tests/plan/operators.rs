@@ -253,7 +253,6 @@ fn count_star_join_keeps_all_columns(mut testing_planner: TestingPlanner) {
     add_join_tables(&testing_planner);
 
     let plan = testing_planner
-        .planner
         .plan("SELECT count(*) FROM items JOIN orders ON i_order = o_key")
         .unwrap();
 
@@ -271,7 +270,6 @@ fn join_output_folds_projection_maps(mut testing_planner: TestingPlanner) {
     add_join_tables(&testing_planner);
 
     let plan = testing_planner
-        .planner
         .plan("SELECT i_qty, o_total FROM items JOIN orders ON i_order = o_key")
         .unwrap();
 
@@ -288,7 +286,6 @@ fn join_with_unread_build_side_keeps_it_anyway(mut testing_planner: TestingPlann
     add_join_tables(&testing_planner);
 
     let plan = testing_planner
-        .planner
         .plan("SELECT sum(i_order) FROM items JOIN orders ON i_order = o_key")
         .unwrap();
 

@@ -647,12 +647,27 @@ mod tests {
         fn next_fs_requests(&mut self) -> crate::operations::Result<Vec<FsRequest>> {
             Ok(vec![])
         }
-        fn process_fs_response(&mut self, _request: FsRequest) -> crate::operations::Result<()> {
+        fn process_fs_read_response(
+            &mut self,
+            _request: FsReadRequest,
+        ) -> crate::operations::Result<()> {
             Ok(())
         }
-        fn process_http_response(
+        fn process_fs_write_response(
             &mut self,
-            _request: HttpRequest,
+            _request: FsWriteRequest,
+        ) -> crate::operations::Result<()> {
+            Ok(())
+        }
+        fn process_http_get_response(
+            &mut self,
+            _request: HttpGetRequest,
+        ) -> crate::operations::Result<()> {
+            Ok(())
+        }
+        fn process_http_upload_response(
+            &mut self,
+            _request: HttpUploadRequest,
         ) -> crate::operations::Result<()> {
             Ok(())
         }
@@ -670,12 +685,27 @@ mod tests {
         fn next_fs_requests(&mut self) -> crate::operations::Result<Vec<FsRequest>> {
             Ok(vec![])
         }
-        fn process_fs_response(&mut self, _request: FsRequest) -> crate::operations::Result<()> {
+        fn process_fs_read_response(
+            &mut self,
+            _request: FsReadRequest,
+        ) -> crate::operations::Result<()> {
             Ok(())
         }
-        fn process_http_response(
+        fn process_fs_write_response(
             &mut self,
-            _request: HttpRequest,
+            _request: FsWriteRequest,
+        ) -> crate::operations::Result<()> {
+            Ok(())
+        }
+        fn process_http_get_response(
+            &mut self,
+            _request: HttpGetRequest,
+        ) -> crate::operations::Result<()> {
+            Ok(())
+        }
+        fn process_http_upload_response(
+            &mut self,
+            _request: HttpUploadRequest,
         ) -> crate::operations::Result<()> {
             Ok(())
         }

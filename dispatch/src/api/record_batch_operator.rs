@@ -662,10 +662,6 @@ impl RecordBatchOperatorSpec {
             build.worker_count(),
             "join inputs must use the same worker count"
         );
-        assert!(
-            Arc::ptr_eq(self.dispatcher.waker(), build.dispatcher.waker()),
-            "join inputs must use the same worker pool"
-        );
 
         let (build_factories, probe_factories, build_ready) = create_join_factories(
             build_key_column,
@@ -677,8 +673,8 @@ impl RecordBatchOperatorSpec {
         let (_, build_heads) = build.into_parts();
         let build_siblings_left = Arc::new(AtomicUsize::new(worker_count));
         let probe_siblings_left = Arc::new(AtomicUsize::new(worker_count));
-        let build_channels = stealable::<RecordBatch>(worker_count);
-        let probe_channels = stealable::<RecordBatch>(worker_count);
+        let build_channels = stealable::<RecordBatch>(self.dispatcher.topology());
+        let probe_channels = stealable::<RecordBatch>(self.dispatcher.topology());
         let factories = self
             .factories
             .into_iter()

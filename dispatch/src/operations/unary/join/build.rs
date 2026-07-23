@@ -3,7 +3,7 @@ use crate::operations::channels::Sender;
 use crate::operations::unary::join::JoinCell;
 use crate::operations::unary::join::directory::{Directory, JoinDirectory};
 use crate::operations::{Consumer, Outputter, unary};
-use crate::worker::worker_waker;
+use crate::waker::worker_waker;
 use ahash::RandomState;
 use arrow::compute::{concat_batches, filter_record_batch};
 use arrow_array::cast::AsArray;

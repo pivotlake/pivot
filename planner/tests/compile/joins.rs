@@ -164,7 +164,6 @@ fn non_equality_join_reports_unsupported(mut testing_planner: TestingPlanner) {
     add_orders_and_items(&testing_planner);
 
     let error = testing_planner
-        .planner
         .plan("SELECT i_qty FROM items JOIN orders ON i_order < o_key")
         .unwrap_err();
 

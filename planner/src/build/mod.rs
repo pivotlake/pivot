@@ -27,8 +27,8 @@ use crate::catalog::Table;
 use crate::dynamic_filter::DynamicFilter;
 use crate::expression::{Error as ExpressionError, Expression, Function, Ref, VariantToJson};
 use crate::operator::{
-    Aggregate, CreateTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Insert, Join,
-    Limit, Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan, TopN,
+    Aggregate, CreateTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Insert,
+    Join, Limit, Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan, TopN,
     Values,
 };
 use crate::plan::{self, PlanNode};
