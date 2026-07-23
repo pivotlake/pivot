@@ -20,6 +20,7 @@
 #include "duckdb/planner/operator/logical_set.hpp"
 #include "duckdb/planner/operator/logical_reset.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/parser/constraint.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -697,7 +698,15 @@ bool lo_create_has_query(const LogicalOperator &op) {
 }
 
 size_t lo_create_constraint_count(const LogicalOperator &op) {
-	return as<duckdb::LogicalCreateTable>(op).info->constraints.size();
+	// Count only constraints pivot can't honor. NOT NULL is accepted and ignored
+	// (pivot columns are nullable; JDBC clients emit it on auto-created tables).
+	size_t count = 0;
+	for (auto &constraint : as<duckdb::LogicalCreateTable>(op).info->constraints) {
+		if (constraint->type != duckdb::ConstraintType::NOT_NULL) {
+			count++;
+		}
+	}
+	return count;
 }
 
 // ---- Set / Reset ----
