@@ -113,7 +113,7 @@ pub use operations::{
     IntKeyExtractor, IntPairKeyExtractor, IntRead, IntStrKeyExtractor, Max, MaxSlot, Min, MinSlot,
     NoRead, Nullary, NullaryFactory, NullaryOperatorFactory, OpTuple, Operator, OrderBy, Read,
     Result as OperatorResult, RowKeyExtractor, RowKeySchema, StrMax, StrMin, StrRead,
-    StringKeyExtractor, Sum, SumSlot, WideSum,
+    StringKeyExtractor, Sum, SumSlot, Variable, WideSum,
 };
 pub use operations::{
     Consumer, DefaultUnaryFactory, MapFactory, Outputter, PipelineBreaker,

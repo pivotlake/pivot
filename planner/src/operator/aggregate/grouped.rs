@@ -5,10 +5,9 @@
 //! divide, so the node here only ever holds count/sum/min/max slots.
 //!
 //! Lowering is pure monomorphisation dispatch over two independent axes — the
-//! group **key** and the **value** — neither of which can be chosen at runtime
-//! (the group operator stores its cells inline as `[Acc; N]` and takes the key
-//! extractor as a type parameter), so the code is a tree of small `match`es each
-//! selecting one concrete type:
+//! group **key** and the **value** — both taken as type parameters by the group
+//! operator, so the code is a tree of small `match`es each selecting one
+//! concrete type:
 //!
 //! * **key** — a single integer/string column gets its dedicated extractor
 //!   ([`IntKeyExtractor`]/[`StringKeyExtractor`]); two integer keys pack into
@@ -21,7 +20,10 @@
 //! * **value** — recognised signatures lower to a branch-free [`Compiled`]
 //!   tuple; every other shape folds each slot by kind in `Dynamic<N>` (numeric,
 //!   string, or mixed; branch-free `+` when all-additive), in `i128` when a slot
-//!   needs the width (see [`Aggregate`]'s rule) else the narrow `i64`.
+//!   needs the width (see [`Aggregate`]'s rule) else the narrow `i64`. A slot
+//!   count beyond the monomorphised `Dynamic` arities takes the runtime-arity
+//!   [`Variable`], which folds identically with the cell count fixed at query
+//!   build instead of compile time.
 
 use super::{Aggregate, aggregation_slots, row_key_schema, sum_reads_wide_column};
 use crate::compile::{Error, ExprEvalFn, ExprFn};
@@ -33,7 +35,7 @@ use arrow_schema::{DataType, Field, Schema};
 use dispatch::{
     AggregationKind, AggregationSlot, Compiled, CountSlot, Distinct, Dynamic, GroupLimit,
     IntKeyExtractor, IntPairKeyExtractor, IntStrKeyExtractor, RecordBatchOperatorSpec,
-    RowKeyExtractor, StringKeyExtractor, SumSlot,
+    RowKeyExtractor, StringKeyExtractor, SumSlot, Variable,
 };
 use std::sync::Arc;
 
@@ -577,10 +579,14 @@ pub(super) fn dispatch_group_by(
     // Fold each slot by kind (or branch-free `+` when `$add`) in
     // `Dynamic<N, acc, ADDITIVE>`, dispatched on the slot count N (the inline
     // cell-array length). Numeric, string (`acc = i128`), and mixed alike, since
-    // `Dynamic` dispatches per slot.
+    // `Dynamic` dispatches per slot. A slot count with no monomorphised arity
+    // takes `Variable`, which folds the same signature with its cells out of
+    // line in the value arena, so any count lowers without compiling more
+    // arities.
     macro_rules! arity {
         ($K:ty, $acc:ty, $add:literal, $cfg:expr) => {
             match slots.len() {
+                0 => Err(Error::UnsupportedAggregateExpressionAmount(0)),
                 1 => build_group_by!($K, Dynamic<1, $acc, $add>, $cfg),
                 2 => build_group_by!($K, Dynamic<2, $acc, $add>, $cfg),
                 3 => build_group_by!($K, Dynamic<3, $acc, $add>, $cfg),
@@ -589,7 +595,7 @@ pub(super) fn dispatch_group_by(
                 6 => build_group_by!($K, Dynamic<6, $acc, $add>, $cfg),
                 7 => build_group_by!($K, Dynamic<7, $acc, $add>, $cfg),
                 8 => build_group_by!($K, Dynamic<8, $acc, $add>, $cfg),
-                n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
+                _ => build_group_by!($K, Variable<$acc, $add>, $cfg),
             }
         };
     }
@@ -897,6 +903,212 @@ mod tests {
         let col = batches[0].column(0);
         assert_eq!(col.data_type(), &DataType::Date32);
         assert_eq!(col.as_primitive::<Date32Type>().value(0), 10);
+    }
+
+    #[rstest]
+    fn nine_mixed_aggregates_group_correctly(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "wide",
+            &[
+                (
+                    "g",
+                    Type::Int32,
+                    Arc::new(Int32Array::from(vec![1, 1, 2])) as ArrayRef,
+                ),
+                (
+                    "a",
+                    Type::Int32,
+                    Arc::new(Int32Array::from(vec![3, 5, 7])) as ArrayRef,
+                ),
+                (
+                    "b",
+                    Type::Float64,
+                    Arc::new(Float64Array::from(vec![1.5, 2.5, 4.0])) as ArrayRef,
+                ),
+            ],
+        );
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT g, COUNT(*), SUM(a), MIN(a), MAX(a), SUM(b), MIN(b), MAX(b), MIN(g), MAX(g) \
+             FROM wide GROUP BY g ORDER BY g",
+        );
+
+        use arrow_array::types::{Decimal128Type, Int32Type, Int64Type};
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 2);
+        let counts = batch.column(1).as_primitive::<Int64Type>();
+        assert_eq!((counts.value(0), counts.value(1)), (2, 1));
+        let sums = batch.column(2).as_primitive::<Decimal128Type>();
+        assert_eq!((sums.value(0), sums.value(1)), (8, 7));
+        let mins = batch.column(3).as_primitive::<Int32Type>();
+        assert_eq!((mins.value(0), mins.value(1)), (3, 7));
+        let float_sums = batch.column(5).as_primitive::<Float64Type>();
+        assert_eq!((float_sums.value(0), float_sums.value(1)), (4.0, 4.0));
+        let float_maxes = batch.column(7).as_primitive::<Float64Type>();
+        assert_eq!((float_maxes.value(0), float_maxes.value(1)), (2.5, 4.0));
+        let key_maxes = batch.column(9).as_primitive::<Int32Type>();
+        assert_eq!((key_maxes.value(0), key_maxes.value(1)), (1, 2));
+    }
+
+    #[rstest]
+    fn nine_additive_aggregates_group_correctly(mut testing_planner: TestingPlanner) {
+        let group = Arc::new(Int32Array::from(vec![1, 1, 2])) as ArrayRef;
+        let values = Arc::new(Int32Array::from(vec![3, 5, 7])) as ArrayRef;
+        let columns: Vec<(&str, Type, ArrayRef)> = std::iter::once(("g", Type::Int32, group))
+            .chain(
+                ["c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7"]
+                    .map(|name| (name, Type::Int32, values.clone())),
+            )
+            .collect();
+        testing_planner.add_table("adds", &columns);
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT g, COUNT(*), SUM(c0), SUM(c1), SUM(c2), SUM(c3), SUM(c4), SUM(c5), SUM(c6), SUM(c7) \
+             FROM adds GROUP BY g ORDER BY g",
+        );
+
+        use arrow_array::types::{Decimal128Type, Int64Type};
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 2);
+        let counts = batch.column(1).as_primitive::<Int64Type>();
+        assert_eq!((counts.value(0), counts.value(1)), (2, 1));
+        for column in 2..10 {
+            let sums = batch.column(column).as_primitive::<Decimal128Type>();
+            assert_eq!((sums.value(0), sums.value(1)), (8, 7));
+        }
+    }
+
+    #[rstest]
+    fn nine_aggregates_with_string_extremes_group_correctly(mut testing_planner: TestingPlanner) {
+        use arrow_array::{Int64Array, StringViewArray};
+        testing_planner.add_table(
+            "mixed",
+            &[
+                (
+                    "g",
+                    Type::Int32,
+                    Arc::new(Int32Array::from(vec![1, 1, 2])) as ArrayRef,
+                ),
+                (
+                    "i",
+                    Type::Int64,
+                    Arc::new(Int64Array::from(vec![10i64, 20, 7])) as ArrayRef,
+                ),
+                (
+                    "s",
+                    Type::Utf8,
+                    Arc::new(StringViewArray::from(vec![
+                        "a longer string beyond inlining",
+                        "banana",
+                        "cherry",
+                    ])) as ArrayRef,
+                ),
+            ],
+        );
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT g, COUNT(*), SUM(i), MIN(i), MAX(i), MIN(g), MAX(g), SUM(g), MIN(s), MAX(s) \
+             FROM mixed GROUP BY g ORDER BY g",
+        );
+
+        use arrow_array::types::Decimal128Type;
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 2);
+        let sums = batch.column(2).as_primitive::<Decimal128Type>();
+        assert_eq!((sums.value(0), sums.value(1)), (30, 7));
+        let string_mins = batch.column(8).as_string_view();
+        assert_eq!(string_mins.value(0), "a longer string beyond inlining");
+        assert_eq!(string_mins.value(1), "cherry");
+        let string_maxes = batch.column(9).as_string_view();
+        assert_eq!(string_maxes.value(0), "banana");
+        assert_eq!(string_maxes.value(1), "cherry");
+    }
+
+    #[rstest]
+    fn nine_aggregates_over_many_groups(mut testing_planner: TestingPlanner) {
+        // Enough distinct groups to grow the consume tables past their initial
+        // capacity and split the merge across partitions.
+        let n = 10_000i32;
+        let keys = Arc::new(Int32Array::from((0..n).collect::<Vec<_>>())) as ArrayRef;
+        let values = Arc::new(Int32Array::from((0..n).collect::<Vec<_>>())) as ArrayRef;
+        let floats = Arc::new(Float64Array::from(
+            (0..n).map(f64::from).collect::<Vec<_>>(),
+        )) as ArrayRef;
+        testing_planner.add_table(
+            "big",
+            &[
+                ("g", Type::Int32, keys),
+                ("a", Type::Int32, values),
+                ("b", Type::Float64, floats),
+            ],
+        );
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT g, COUNT(*), SUM(a), MIN(a), MAX(a), SUM(b), MIN(b), MAX(b), MIN(g), MAX(g) \
+             FROM big GROUP BY g",
+        );
+
+        use arrow_array::types::{Decimal128Type, Int64Type};
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, n as usize);
+        let total_count: i64 = batches
+            .iter()
+            .flat_map(|b| b.column(1).as_primitive::<Int64Type>().iter())
+            .flatten()
+            .sum();
+        assert_eq!(total_count, n as i64);
+        let total_sum: i128 = batches
+            .iter()
+            .flat_map(|b| b.column(2).as_primitive::<Decimal128Type>().iter())
+            .flatten()
+            .sum();
+        assert_eq!(total_sum, i128::from(n) * i128::from(n - 1) / 2);
+    }
+
+    #[rstest]
+    fn nine_aggregates_with_pushed_top_k(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "ranked",
+            &[
+                (
+                    "g",
+                    Type::Int32,
+                    Arc::new(Int32Array::from(vec![1, 1, 2, 3, 4])) as ArrayRef,
+                ),
+                (
+                    "a",
+                    Type::Int32,
+                    Arc::new(Int32Array::from(vec![5, 6, 20, 9, 1])) as ArrayRef,
+                ),
+                (
+                    "b",
+                    Type::Float64,
+                    Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0, 5.0])) as ArrayRef,
+                ),
+            ],
+        );
+
+        // ORDER BY an integer SUM slot with LIMIT pushes a per-partition top-k
+        // into the group operator.
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT g, SUM(a), COUNT(*), MIN(a), MAX(a), SUM(b), MIN(b), MAX(b), MIN(g), MAX(g) \
+             FROM ranked GROUP BY g ORDER BY SUM(a) DESC LIMIT 2",
+        );
+
+        use arrow_array::types::{Decimal128Type, Int32Type, Int64Type};
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 2);
+        let keys = batch.column(0).as_primitive::<Int32Type>();
+        assert_eq!((keys.value(0), keys.value(1)), (2, 1));
+        let sums = batch.column(1).as_primitive::<Decimal128Type>();
+        assert_eq!((sums.value(0), sums.value(1)), (20, 11));
+        let counts = batch.column(2).as_primitive::<Int64Type>();
+        assert_eq!((counts.value(0), counts.value(1)), (1, 2));
     }
 
     #[rstest]

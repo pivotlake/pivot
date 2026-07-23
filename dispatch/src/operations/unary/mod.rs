@@ -46,7 +46,7 @@ pub use group::{
     Dynamic, F64Cell, Fold, GroupFactory, GroupLimit, HashOnlyIntKeyExtractor, IntCell,
     IntKeyExtractor, IntPairKeyExtractor, IntRead, IntStrKeyExtractor, KeyExtractor, Max, MaxSlot,
     Min, MinSlot, NoRead, OpTuple, Read, RowKeyExtractor, RowKeySchema, StrMax, StrMin, StrRead,
-    StringKeyExtractor, Sum, SumSlot, WideSum,
+    StringKeyExtractor, Sum, SumSlot, Variable, WideSum,
 };
 
 #[cfg(any(test, feature = "test-util"))]

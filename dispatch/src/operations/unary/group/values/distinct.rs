@@ -6,7 +6,7 @@
 //! Used for the dedup stage of `COUNT(DISTINCT x)` (and, later, `SELECT DISTINCT`):
 //! only the *set* of distinct keys matters, so it emits no value columns.
 
-use super::{AggregationSlot, AggregationValue, ValueColumns};
+use super::{AggregationSlot, OwnedValue, ValueColumns};
 use crate::memory::SlabAllocator;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
@@ -20,7 +20,7 @@ pub struct Distinct;
 /// value columns, so this builds nothing.
 pub struct DistinctColumns;
 
-impl AggregationValue for Distinct {
+impl OwnedValue for Distinct {
     type Reader<'b> = ();
     type SharedContext = ();
     type Columns = DistinctColumns;
@@ -52,12 +52,15 @@ impl ValueColumns for DistinctColumns {
     type Value = Distinct;
     type Context = ();
 
-    fn with_capacity(_allocator: &mut SlabAllocator, _rows: usize) -> Self {
+    fn with_capacity(_allocator: &mut SlabAllocator, _rows: usize, _context: &()) -> Self {
         DistinctColumns
     }
 
     #[inline(always)]
     fn push(&mut self, _value: &Distinct) {}
+
+    #[inline(always)]
+    fn push_stored(&mut self, _stored: &Distinct) {}
 
     fn finish(self, _context: &()) -> (Vec<Field>, Vec<ArrayRef>) {
         (Vec::new(), Vec::new())

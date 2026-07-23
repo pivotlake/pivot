@@ -22,9 +22,11 @@ use crate::memory::{
 };
 use crate::operations::channels::Sender;
 use crate::operations::unary::group::arena::SharedArena;
-use crate::operations::unary::group::hashtables::{Table, TableStorage};
+use crate::operations::unary::group::hashtables::Table;
 use crate::operations::unary::group::keys::{KeyColumns, KeyExtractor};
-use crate::operations::unary::group::values::{AggregationValue, ValueColumns, cast_value_column};
+use crate::operations::unary::group::values::{
+    AggregationValue, ValueColumns, WorkerContext, cast_value_column,
+};
 
 use super::{GroupLimit, Result};
 
@@ -86,20 +88,32 @@ impl<K: KeyExtractor, V: AggregationValue> TopKHeap<K, V> {
 
 /// Offer every group in `table` into `heap`, keyed by the sort key of aggregate
 /// `slot`. The heap retains the top rows by that key.
-fn offer_all<K, V, A, S>(
+///
+/// The heap must hold *owned* values (its rows outlive the table), so a
+/// retained entry's stored value is copied out via
+/// [`AggregationValue::to_owned`]. The retention check runs first so only rows
+/// the heap actually keeps pay the copy: for a fixed-arity value the copy is
+/// free, but a runtime-arity value copies its cells into the value arena
+/// (through `owned_wc`, spawned on first use and flushed by the accumulator
+/// after the heap drains).
+fn offer_all<K, V, A>(
     heap: &mut SlabTopK<V::SortKey, (K::Persisted, V), A>,
     slot: usize,
-    table: &Table<K, V, S>,
+    table: &Table<K, V>,
     allocator: &mut SlabAllocator,
+    ctx: &V::SharedContext,
+    owned_wc: &mut Option<V::WorkerContext>,
 ) where
     K: KeyExtractor,
     V: AggregationValue,
     A: HeapBuffer<Ranked<V::SortKey, (K::Persisted, V)>>,
-    S: TableStorage<K, V>,
 {
     for entry in table.iter(0) {
-        let sort = entry.value().sort_key(slot);
-        heap.offer(allocator, sort, (*entry.key(), *entry.value()));
+        let sort = V::sort_key_stored(entry.stored, slot);
+        if heap.would_retain(sort) {
+            let value = V::to_owned(entry.stored, ctx, owned_wc);
+            heap.offer(allocator, sort, (*entry.key, value));
+        }
     }
 }
 
@@ -166,6 +180,11 @@ pub(crate) struct OutputAccumulator<K: KeyExtractor, V: AggregationValue> {
     /// Declared output type per value column, in slot order; each finished value
     /// column is cast to its type (see [`emit`](Self::emit)).
     value_output_types: Arc<[DataType]>,
+    /// The per-worker write handle a top-k offer's [`AggregationValue::to_owned`]
+    /// copies runtime-arity cells through. Spawned lazily by the first copy that
+    /// needs it, flushed (returned to the arena, never dropped: the arena's ring
+    /// buffers must stay owned) right after the heap drains.
+    owned_copy_context: Option<V::WorkerContext>,
 }
 
 impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
@@ -185,7 +204,7 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
         });
         Self {
             keys: K::Columns::with_capacity(allocator, builder_cap, &key_config),
-            values: V::Columns::with_capacity(allocator, builder_cap),
+            values: V::Columns::with_capacity(allocator, builder_cap, &shared_context),
             builder_cap,
             len: 0,
             mode: OutputMode::new(allocator, output_limit),
@@ -194,13 +213,23 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
             key_config,
             shared_context,
             value_output_types,
+            owned_copy_context: None,
         }
     }
 
+    /// Append one group straight from its table entry.
     #[inline]
-    fn push(&mut self, key: &K::Persisted, value: V) {
+    fn push_entry(&mut self, key: &K::Persisted, stored: &V::Stored) {
         self.keys.push(key);
-        self.values.push(&value);
+        self.values.push_stored(stored);
+        self.len += 1;
+    }
+
+    /// Append one group from an owned value (the top-k heap drain).
+    #[inline]
+    fn push_owned(&mut self, key: &K::Persisted, value: &V) {
+        self.keys.push(key);
+        self.values.push(value);
         self.len += 1;
     }
 
@@ -208,27 +237,54 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
     /// LIMIT, only the rows that could survive the worker-wide limit are kept;
     /// otherwise every row streams into the column builders, flushing a full batch
     /// whenever the chunk fills.
-    pub(crate) fn extend_from_table<S, Snd>(
+    pub(crate) fn extend_from_table<Snd>(
         &mut self,
-        table: Table<K, V, S>,
+        table: Table<K, V>,
         allocator: &mut SlabAllocator,
         sender: &mut Snd,
     ) -> Result<()>
     where
-        S: TableStorage<K, V>,
         Snd: Sender<RecordBatch>,
     {
+        // `ORDER BY … DESC LIMIT`: keep only the worker-wide top-`limit`
+        // (emitted at flush). No mid-stream flush: the heap is bounded by
+        // `limit`. The backing kind is matched here, once, so each row's
+        // `offer` runs monomorphised. Destructured so the heap (in `mode`), the
+        // shared context, and the copy context borrow disjoint fields.
+        {
+            let Self {
+                mode,
+                shared_context,
+                owned_copy_context,
+                ..
+            } = self;
+            match mode {
+                OutputMode::TopK(TopKHeap::Single { slot, heap }) => {
+                    offer_all::<K, V, _>(
+                        heap,
+                        *slot,
+                        &table,
+                        allocator,
+                        shared_context,
+                        owned_copy_context,
+                    );
+                    return Ok(());
+                }
+                OutputMode::TopK(TopKHeap::Multi { slot, heap }) => {
+                    offer_all::<K, V, _>(
+                        heap,
+                        *slot,
+                        &table,
+                        allocator,
+                        shared_context,
+                        owned_copy_context,
+                    );
+                    return Ok(());
+                }
+                OutputMode::First { .. } | OutputMode::Unlimited => {}
+            }
+        }
         match &mut self.mode {
-            // `ORDER BY … DESC LIMIT`: keep only the worker-wide top-`limit`
-            // (emitted at flush). No mid-stream flush: the heap is bounded by
-            // `limit`. The backing kind is matched here, once, so each row's
-            // `offer` runs monomorphised.
-            OutputMode::TopK(TopKHeap::Single { slot, heap }) => {
-                offer_all(heap, *slot, &table, allocator)
-            }
-            OutputMode::TopK(TopKHeap::Multi { slot, heap }) => {
-                offer_all(heap, *slot, &table, allocator)
-            }
             // Plain `LIMIT`: take rows until this worker's budget is spent, then
             // write the budget back so the next partition resumes from it.
             OutputMode::First { remaining } => {
@@ -238,7 +294,7 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
                         break;
                     }
                     remaining -= 1;
-                    self.push(entry.key(), *entry.value());
+                    self.push_entry(entry.key, entry.stored);
                     self.flush_if_full(allocator, sender)?;
                 }
                 self.mode = OutputMode::First { remaining };
@@ -246,10 +302,11 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
             // No pushdown: every group streams into the builders.
             OutputMode::Unlimited => {
                 for entry in table.iter(0) {
-                    self.push(entry.key(), *entry.value());
+                    self.push_entry(entry.key, entry.stored);
                     self.flush_if_full(allocator, sender)?;
                 }
             }
+            OutputMode::TopK(_) => unreachable!("top-k handled above"),
         }
         Ok(())
     }
@@ -279,16 +336,23 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
             match topk {
                 TopKHeap::Single { mut heap, .. } => {
                     for (key, value) in heap.values() {
-                        self.push(&key, value);
+                        self.push_owned(&key, &value);
                         self.flush_if_full(allocator, sender)?;
                     }
                 }
                 TopKHeap::Multi { mut heap, .. } => {
                     for (key, value) in heap.values() {
-                        self.push(&key, value);
+                        self.push_owned(&key, &value);
                         self.flush_if_full(allocator, sender)?;
                     }
                 }
+            }
+            // The drained values were pushed (copied) into the column builders,
+            // so the copy context's arena buffer can go back to the shared
+            // arena. Returned, never dropped: a dropped `WorkerArena` buffer
+            // would release its ring slot while the arena still lists it.
+            if let Some(wc) = self.owned_copy_context.take() {
+                wc.flush();
             }
         }
         if self.len == 0 {
@@ -302,7 +366,7 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
         );
         let values = std::mem::replace(
             &mut self.values,
-            V::Columns::with_capacity(allocator, self.builder_cap),
+            V::Columns::with_capacity(allocator, self.builder_cap, &self.shared_context),
         );
         self.len = 0;
         self.emit(keys, values, allocator, sender)

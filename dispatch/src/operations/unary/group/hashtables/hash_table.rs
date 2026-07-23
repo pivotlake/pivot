@@ -2,13 +2,12 @@
 //!
 //! See [`BaseHashTable`] for the full design rationale.
 
-use crate::memory::MultiSlabBuffer;
-use crate::memory::SlabAllocator;
+use crate::memory::{BUFFER_SIZE, Slab, SlabAllocator};
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::values::AggregationValue;
 use std::marker::PhantomData;
 use std::mem;
-use std::ops::{Index, IndexMut};
+use std::ptr;
 use tracing::debug;
 
 /// Maximum fraction of slots that can be occupied before the table is
@@ -60,40 +59,68 @@ impl<P: PersistedKey + PartialEq> LiveKey for P {
     }
 }
 
-/// A single slot in the hash table, storing the full hash, key, and value.
-///
-/// `hash == 0` marks an empty slot. Real zero hashes are remapped to 1
-/// by [`BaseHashTable::merge`] to preserve this invariant.
-#[derive(Copy, Clone, Default)]
-pub struct Entry<K: PersistedKey, V: AggregationValue> {
-    hash: u64,
-    key: K,
-    value: V,
-}
-
-impl<K: PersistedKey, V: AggregationValue> Entry<K, V> {
-    /// The stored hash (0 = empty slot).
-    #[inline]
-    pub fn hash(&self) -> u64 {
-        self.hash
-    }
-
+/// A borrowed read of one occupied table entry: its hash, persisted key, and
+/// stored value. What [`BaseHashTable::iter`] yields and
+/// [`BaseHashTable::view_at`] returns. A view rather than a struct reference
+/// because an entry is a byte region at a per-table stride, not a Rust struct
+/// (the stride is a runtime value; see [`BaseHashTable`]).
+pub struct EntryView<'a, K, S: ?Sized> {
+    /// The stored hash (never 0 for an occupied entry).
+    pub hash: u64,
     /// The persisted group key.
-    #[inline]
-    pub fn key(&self) -> &K {
-        &self.key
-    }
-
-    /// The aggregation value (e.g. count).
-    #[inline]
-    pub fn value(&self) -> &V {
-        &self.value
-    }
+    pub key: &'a K,
+    /// The group's stored aggregation value.
+    pub stored: &'a S,
 }
 
 /// Maximum number of entries allowed for a table with `len` total slots.
 fn max_load_for_len(len: usize) -> usize {
     (len as f64 * MAX_LOAD_FACTOR).round() as usize
+}
+
+fn align_up(x: usize, align: usize) -> usize {
+    (x + align - 1) & !(align - 1)
+}
+
+/// The runtime layout of one entry: where each field starts, the entry stride,
+/// and the strictest field alignment. Fields are placed in descending alignment
+/// order (ties keep hash, key, value order), mirroring the padding-minimising
+/// layout the compiler gives a sized entry struct, so a fixed-arity value's
+/// entry is exactly as large as it always was.
+struct EntryLayout {
+    hash_offset: usize,
+    key_offset: usize,
+    value_offset: usize,
+    stride: usize,
+    align: usize,
+}
+
+fn entry_layout<K, V: AggregationValue>(meta: V::StoredMeta) -> EntryLayout {
+    // (alignment, size) per field, in hash, key, value order.
+    let fields = [
+        (align_of::<u64>(), size_of::<u64>()),
+        (align_of::<K>(), size_of::<K>()),
+        (V::stored_align(meta), V::stored_size(meta)),
+    ];
+    let mut order = [0usize, 1, 2];
+    order.sort_by_key(|&f| std::cmp::Reverse(fields[f].0));
+    let mut offsets = [0usize; 3];
+    let mut cursor = 0;
+    for &f in &order {
+        cursor = align_up(cursor, fields[f].0);
+        offsets[f] = cursor;
+        cursor += fields[f].1;
+    }
+    let align = fields.iter().map(|&(a, _)| a).max().unwrap();
+    let stride = align_up(cursor, align);
+    assert!(stride <= BUFFER_SIZE, "entry stride exceeds one slab");
+    EntryLayout {
+        hash_offset: offsets[0],
+        key_offset: offsets[1],
+        value_offset: offsets[2],
+        stride,
+        align,
+    }
 }
 
 /// Prefetch the cache line at `ptr` into L1 (x86 `T0` / ARM `pldl1keep`).
@@ -136,27 +163,35 @@ fn prefetch_l2_line(ptr: *const u8) {
 ///
 /// # Memory Layout
 ///
-/// Uses a single contiguous buffer of `Entry<K, V>` structs, generic over the
-/// backing allocation (Vec, mmap, etc.):
+/// Entries live in one or more 2MB slabs as raw byte regions at a fixed
+/// per-table `stride`, each holding the hash, the persisted key, and the
+/// group's stored aggregation value:
 ///
 /// ```text
 /// ┌─────────────────────────────────────────────────────────────────────────┐
-/// │                         Buffer: Allocation<Entry<K,V>>                  │
+/// │                    Slabs: entries at `stride` bytes each                │
 /// ├─────────────┬─────────────┬─────────────┬─────────────┬────────────────┤
-/// │  Entry[0]   │  Entry[1]   │             │  Entry[3]   │      ...       │
+/// │  entry 0    │  entry 1    │             │  entry 3    │      ...       │
 /// │ hash|key|val│ hash|key|val│             │ hash|key|val│                │
-/// │  8B | xB|xB │  8B | xB|xB │             │  8B | xB|xB │                │
 /// └─────────────┴─────────────┴─────────────┴─────────────┴────────────────┘
-///  8 bytes + Key + Value per entry (e.g., for `ArenaKey` and `Count` this would be 32 bytes-
-///  2 entries per 64-byte cache line)
+///  stride = 8 bytes + key + stored value, fields in descending-alignment
+///  order (e.g. 24 bytes for an `Int64` key with one `i64` cell)
 /// ```
 ///
-/// Each `Entry` contains:
-/// - `hash: u64` - Full 64-bit hash (0 = empty slot sentinel)
-/// - `value: V` - The aggregation value (e.g., count)
-/// - `key: K` - The persisted key (e.g., ArenaKey with pointer + length)
+/// The stride is a *runtime* value computed at construction rather than a
+/// compile-time `size_of`, because a stored value's size may itself be fixed
+/// only at query build time: a runtime-arity signature ([`Variable`]) stores
+/// `n` cells inline per entry, `n` constant per query but unknown to the
+/// compiler. Fixed-arity values get the same field offsets and stride a sized
+/// entry struct had; they simply pay the stride multiply at probe time.
 ///
-/// The buffer is allocated with 64-byte alignment to ensure cache-line-aligned access.
+/// Each entry contains:
+/// - `hash: u64` - Full 64-bit hash (0 = empty slot sentinel)
+/// - `key: K` - The persisted key (e.g., ArenaKey with pointer + length)
+/// - value - The stored aggregation value (see [`AggregationValue::Stored`])
+///
+/// Entries never straddle a slab boundary: each slab holds
+/// `BUFFER_SIZE / stride` whole entries, with the leftover tail bytes unused.
 /// Capacity is always a power of 2, which allows wrapping via `& mask` during
 /// linear probing and efficient top-bit slot placement via `hash >> shift`.
 ///
@@ -169,14 +204,14 @@ fn prefetch_l2_line(ptr: *const u8) {
 ///    bits) is a prefix of the slot index, enabling the merge phase to scan
 ///    tables of different sizes by partition (see module-level docs in `group`).
 ///    If occupied and different key, probe linearly (slot+1, slot+2, ...) until
-///    finding an empty slot (hash == 0) or matching key. On match, merge values
+///    finding an empty slot (hash == 0) or matching key. On match, fold values
 ///    instead of inserting.
 ///
 /// 2. **Empty detection**: `hash == 0` marks empty slots. Real zero hashes are
 ///    converted to 1 to preserve this invariant.
 ///
 /// 3. **Resize**: Handled externally — callers check load pressure and call
-///    [`resize_with`](BaseHashTable::resize_with) to replace the buffer.
+///    [`resize`](BaseHashTable::resize) to rehash into fresh slabs.
 ///
 /// # Why Not Swiss Tables (hashbrown / std HashMap)
 ///
@@ -229,22 +264,12 @@ fn prefetch_l2_line(ptr: *const u8) {
 ///
 /// ## 3. Inline entries give single-access probing
 ///
-/// Each `Entry` packs hash + key + value into one struct (e.g. 32 bytes
-/// for `ArenaKey` + `Count` = 2 entries per 64-byte cache line). A single
+/// Each entry packs hash + key + value into one region (e.g. 32 bytes
+/// for `ArenaKey` + a count = 2 entries per 64-byte cache line). A single
 /// cache-line fetch gives the hash for comparison AND the next linear-probe
 /// candidate. Swiss Tables require two separate memory accesses per probe:
 /// one for the ctrl byte and one for the slot data.
-///
-/// # Generic Allocation
-///
-/// The type parameter `A` allows swapping the backing storage:
-/// - `SlabBuffer<Entry<K,V>>`: Single slab from the slab allocator (for small tables)
-/// - `MultiSlabBuffer<Entry<K,V>>`: Multiple slabs for tables exceeding a single buffer
-pub struct BaseHashTable<
-    K: PersistedKey,
-    V: AggregationValue,
-    A: Index<usize, Output = Entry<K, V>> + IndexMut<usize>,
-> {
+pub struct BaseHashTable<K: PersistedKey, V: AggregationValue> {
     mask: usize,
     shift: u32,
     collisions: usize,
@@ -252,40 +277,55 @@ pub struct BaseHashTable<
     /// Set to `PARTITIONS.trailing_zeros()` for merge maps so that the partition
     /// bits (top N) are stripped and the next top bits drive slot placement.
     pre_shift: u32,
-    buffer: A,
+    /// Whole entries per 2MB slab (`BUFFER_SIZE / stride`); entries never
+    /// straddle a slab boundary.
+    entries_per_slab: usize,
+    /// Bytes per entry; see the layout docs above.
+    stride: usize,
+    hash_offset: usize,
+    key_offset: usize,
+    value_offset: usize,
+    /// Strictest field alignment, for allocating replacement slabs on resize.
+    align: usize,
+    /// The value's runtime view metadata (slot count for a runtime-arity
+    /// signature); held once here, never per entry.
+    meta: V::StoredMeta,
+    slabs: Vec<Slab>,
     length: usize,
     max_load: usize,
     _phantom: PhantomData<(K, V)>,
 }
 
-unsafe impl<
-    K: PersistedKey,
-    V: AggregationValue,
-    A: Index<usize, Output = Entry<K, V>> + IndexMut<usize>,
-> Send for BaseHashTable<K, V, A>
-{
-}
+unsafe impl<K: PersistedKey, V: AggregationValue> Send for BaseHashTable<K, V> {}
 
-impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V, MultiSlabBuffer<Entry<K, V>>> {
-    /// Creates a new HashTable backed by a multi-slab buffer.
-    ///
-    /// `expected_capacity` must be a power of 2 and is used directly as the
-    /// number of slots. The buffer is zero-initialized so that all slots
-    /// start empty (`hash == 0`).
-    pub fn multi_slab(
+impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
+    /// Creates a new table with `expected_capacity` slots (must be a power of
+    /// 2), its entry layout derived from the key type and the value's runtime
+    /// metadata off `ctx`. The slabs are zeroed so all slots start empty
+    /// (`hash == 0`).
+    pub fn new(
         allocator: &mut SlabAllocator,
         expected_capacity: usize,
         pre_shift: u32,
+        ctx: &V::SharedContext,
     ) -> Self {
-        let buffer = allocator.create_multi_slab_buffer(expected_capacity, true);
-
+        let meta = V::stored_meta(ctx);
+        let layout = entry_layout::<K, V>(meta);
+        let slabs = allocator.create_strided_slabs(expected_capacity, layout.stride, layout.align);
         BaseHashTable {
             mask: expected_capacity - 1,
             length: 0,
             max_load: max_load_for_len(expected_capacity),
-            buffer,
             pre_shift,
             shift: u64::BITS - expected_capacity.trailing_zeros(),
+            entries_per_slab: BUFFER_SIZE / layout.stride,
+            stride: layout.stride,
+            hash_offset: layout.hash_offset,
+            key_offset: layout.key_offset,
+            value_offset: layout.value_offset,
+            align: layout.align,
+            meta,
+            slabs,
             _phantom: PhantomData,
             collisions: 0,
         }
@@ -296,15 +336,13 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V, MultiSlabBuffer<E
     /// table's aggregated entries have been drained into the scatter buffers, the
     /// same storage is reused for the next window instead of reallocating.
     pub fn clear(&mut self) {
-        self.buffer.zero_out();
+        for slab in &mut self.slabs {
+            slab.zero_out();
+        }
         self.length = 0;
         self.collisions = 0;
     }
-}
 
-impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>> + IndexMut<usize>>
-    BaseHashTable<K, V, A>
-{
     /// Total number of slots (occupied + empty). Always a power of 2.
     pub fn capacity(&self) -> usize {
         self.mask + 1
@@ -326,10 +364,41 @@ impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>>
         ((hash << self.pre_shift) >> self.shift) as usize
     }
 
-    /// Direct slot access by index (no bounds checking beyond the buffer's own).
+    /// The address of the entry at `index` in `slabs` (with this table's
+    /// layout). Entries never straddle slabs: entry `i` lives in slab
+    /// `i / entries_per_slab` at byte offset `(i % entries_per_slab) * stride`.
     #[inline(always)]
-    pub fn entry_at(&self, index: usize) -> &Entry<K, V> {
-        &self.buffer[index]
+    fn entry_ptr_in(&self, slabs: &[Slab], index: usize) -> *mut u8 {
+        let slab_idx = index / self.entries_per_slab;
+        let offset = (index % self.entries_per_slab) * self.stride;
+        unsafe { slabs[slab_idx].ptr.add(offset) }
+    }
+
+    /// The address of this table's entry at `index`.
+    #[inline(always)]
+    fn entry_ptr(&self, index: usize) -> *mut u8 {
+        self.entry_ptr_in(&self.slabs, index)
+    }
+
+    /// The stored hash at slot `index` (0 = empty slot).
+    #[inline(always)]
+    pub fn hash_at(&self, index: usize) -> u64 {
+        unsafe { *(self.entry_ptr(index).add(self.hash_offset) as *const u64) }
+    }
+
+    /// A borrowed view of the entry at slot `index`. The caller must only read
+    /// `key`/`stored` of an occupied slot (`hash != 0`); an empty slot's view is
+    /// zeroed bytes.
+    #[inline(always)]
+    pub fn view_at(&self, index: usize) -> EntryView<'_, K, V::Stored> {
+        let entry = self.entry_ptr(index);
+        unsafe {
+            EntryView {
+                hash: *(entry.add(self.hash_offset) as *const u64),
+                key: &*(entry.add(self.key_offset) as *const K),
+                stored: V::stored_ref(entry.add(self.value_offset), self.meta),
+            }
+        }
     }
 
     /// Prefetch the hash table slot where `hash` would land, plus the next cache line
@@ -337,8 +406,7 @@ impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>>
     /// use this *near* the access (small lookahead).
     #[inline]
     pub fn prefetch(&self, hash: u64) {
-        let idx = self.slot_for(hash);
-        let ptr = &self.buffer[idx] as *const Entry<K, V> as *const u8;
+        let ptr = self.entry_ptr(self.slot_for(hash)) as *const u8;
         prefetch_l1_line(ptr);
         prefetch_l1_line(ptr.wrapping_add(64));
         prefetch_l1_line(ptr.wrapping_add(128));
@@ -351,8 +419,7 @@ impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>>
     /// single L1 prefetch at a short distance can't cover on a multi-GB table.
     #[inline]
     pub fn prefetch_l2(&self, hash: u64) {
-        let idx = self.slot_for(hash);
-        let ptr = &self.buffer[idx] as *const Entry<K, V> as *const u8;
+        let ptr = self.entry_ptr(self.slot_for(hash)) as *const u8;
         prefetch_l2_line(ptr);
     }
 
@@ -360,7 +427,7 @@ impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>>
     ///
     /// Iteration order is arbitrary (based on slot positions, not insertion order).
     /// Empty slots (hash == 0) are skipped automatically.
-    pub fn iter(&self, start_offset: usize) -> HashTableIterator<'_, K, V, A> {
+    pub fn iter(&self, start_offset: usize) -> HashTableIterator<'_, K, V> {
         HashTableIterator {
             hash_table: self,
             idx: start_offset,
@@ -372,19 +439,72 @@ impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>>
         self.len() > self.max_load
     }
 
-    /// Inserts or merges an entry into the hash table.
+    /// Insert or fold an *owned* value — the radix scatter rows' aggregation
+    /// pass. A new key stores the value; an existing one folds it in via the
+    /// value's own scatter-row fold. Thin wrapper over
+    /// [`probe_fold`](Self::probe_fold), carrying the value in as the context.
+    #[inline(always)]
+    pub fn merge<const COUNT_COLLISIONS: bool, L>(
+        &mut self,
+        hash: u64,
+        key: L,
+        value: V,
+        ctx: &V::SharedContext,
+    ) where
+        L: LiveKey<Persisted = K>,
+    {
+        self.probe_fold::<COUNT_COLLISIONS, L, V, _, _>(
+            hash,
+            key,
+            value,
+            |value, stored| V::store(stored, value),
+            |value, stored| V::merge_value(stored, value, ctx),
+        );
+    }
+
+    /// Insert or fold a *stored* value read from another table's entry — the
+    /// partition merge and the node merge. A new key copies the partial in; an
+    /// existing one combines the two partials in place.
+    #[inline(always)]
+    pub fn merge_from<const COUNT_COLLISIONS: bool, L>(
+        &mut self,
+        hash: u64,
+        key: L,
+        src: &V::Stored,
+        ctx: &V::SharedContext,
+    ) where
+        L: LiveKey<Persisted = K>,
+    {
+        self.probe_fold::<COUNT_COLLISIONS, L, &V::Stored, _, _>(
+            hash,
+            key,
+            src,
+            |src, stored| V::clone_stored(stored, src),
+            |src, stored| V::merge_stored(stored, src, ctx),
+        );
+    }
+
+    /// Probe for `hash`/`key`, then initialise or fold the value at the matched
+    /// slot — one probe-and-fold pass, the stored-value reference handed straight
+    /// from the matched entry (no second slot lookup). A freshly inserted slot
+    /// calls `seed` (its value bytes are zeroed until then); an existing one calls
+    /// `update`. Splitting the two avoids a per-row `is_new` branch and lets each
+    /// do only its own work (a string extreme's `update` can skip persisting a
+    /// loser).
+    ///
+    /// `ctx` is the one per-call value both arms might need — moved into whichever
+    /// arm runs, so they needn't both capture it: the merge phase passes the
+    /// already-materialised value; the consume path passes `&mut value_arena`.
+    /// Because the key is persisted here before either arm runs, and keys/values
+    /// live in separate memory, the closure's value-arena borrow never aliases the
+    /// key's.
     ///
     /// # Behavior
     ///
-    /// - If `key` does not exist: persists the key and inserts a new entry with `value`
-    /// - If `key` already exists: merges `value` into the existing entry via `Value::merge`
-    ///
-    /// # Algorithm
-    ///
     /// 1. Compute initial slot via `slot_for(hash)` (top bits of the hash)
     /// 2. Linear probe until we find either:
-    ///    - Empty slot (hash == 0): insert new entry here
-    ///    - Matching entry (same hash AND same key): merge values
+    ///    - Empty slot (hash == 0): persist the key and `seed` the value
+    ///    - Matching entry (same hash AND same key): `update` the value
     ///
     /// # Hash Zero Handling
     ///
@@ -402,43 +522,6 @@ impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>>
     /// - Best case: O(1) - slot is empty or immediate match
     /// - Average case: O(1) - at 70% load, expected probe length is ~1.8
     /// - Worst case: O(n) - pathological hash collisions
-    ///
-    /// A new entry just stores the value; an existing one folds via the value's
-    /// own [`merge`](AggregationValue::merge) (so two finished partials combine —
-    /// the partition-merge and radix paths). Thin wrapper over
-    /// [`probe_fold`](Self::probe_fold), carrying the value in as the context.
-    #[inline(always)]
-    pub fn merge<const COUNT_COLLISIONS: bool, L>(
-        &mut self,
-        hash: u64,
-        key: L,
-        value: V,
-        ctx: &V::SharedContext,
-    ) where
-        L: LiveKey<Persisted = K>,
-    {
-        self.probe_fold::<COUNT_COLLISIONS, L, V, _, _>(
-            hash,
-            key,
-            value,
-            |value, cell| *cell = value,
-            |value, cell| *cell = cell.merge(value, ctx),
-        );
-    }
-
-    /// Probe for `hash`/`key`, then initialise or fold the value at the matched
-    /// slot — one probe-and-fold pass, the value reference handed straight from
-    /// the matched entry (no second slot lookup). A freshly inserted slot calls
-    /// `seed` (its value is `Default` until then); an existing one calls `update`.
-    /// Splitting the two avoids a per-row `is_new` branch and lets each do only
-    /// its own work (a string extreme's `update` can skip persisting a loser).
-    ///
-    /// `ctx` is the one per-call value both arms might need — moved into whichever
-    /// arm runs, so they needn't both capture it: the merge phase passes the
-    /// already-materialised value; the consume path passes `&mut value_arena`.
-    /// Because the key is persisted here before either arm runs, and keys/values
-    /// live in separate arenas, the closure's value-arena borrow never aliases the
-    /// key's.
     #[inline(always)]
     pub fn probe_fold<const COUNT_COLLISIONS: bool, L, X, S, U>(
         &mut self,
@@ -449,8 +532,8 @@ impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>>
         update: U,
     ) where
         L: LiveKey<Persisted = K>,
-        S: FnOnce(X, &mut V),
-        U: FnOnce(X, &mut V),
+        S: FnOnce(X, &mut V::Stored),
+        U: FnOnce(X, &mut V::Stored),
     {
         // hash == 0 is our empty sentinel, so remap actual zero hashes to 1.
         if hash == 0 {
@@ -458,17 +541,21 @@ impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>>
         }
         let mut idx = self.slot_for(hash);
         loop {
-            let entry = &mut self.buffer[idx];
-            if entry.hash == 0 {
-                entry.hash = hash;
-                entry.key = key.persist();
-                self.length += 1;
-                seed(ctx, &mut entry.value);
-                return;
-            }
-            if entry.hash == hash && key.eq_persisted(&entry.key) {
-                update(ctx, &mut entry.value);
-                return;
+            let entry = self.entry_ptr(idx);
+            unsafe {
+                let hash_ptr = entry.add(self.hash_offset) as *mut u64;
+                if *hash_ptr == 0 {
+                    *hash_ptr = hash;
+                    (entry.add(self.key_offset) as *mut K).write(key.persist());
+                    self.length += 1;
+                    seed(ctx, V::stored_mut(entry.add(self.value_offset), self.meta));
+                    return;
+                }
+                if *hash_ptr == hash && key.eq_persisted(&*(entry.add(self.key_offset) as *const K))
+                {
+                    update(ctx, V::stored_mut(entry.add(self.value_offset), self.meta));
+                    return;
+                }
             }
             if COUNT_COLLISIONS {
                 self.collisions += 1;
@@ -477,11 +564,10 @@ impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>>
         }
     }
 
-    /// Rehash all entries into a new buffer of `new_size` slots.
+    /// Rehash all entries into fresh zeroed slabs of `new_size` slots.
     ///
-    /// Replaces the current buffer with `buffer` (which must be zeroed and
-    /// have `new_size` slots), then re-inserts every occupied entry from the
-    /// old buffer using linear probing in the new, larger table.
+    /// Every occupied entry is re-probed into the larger table and copied whole
+    /// (`stride` bytes: hash, key, and stored value alike).
     ///
     /// The collision counter is reset to `self.length` so that post-resize
     /// collision tracking reflects only new probing pressure, not historical
@@ -491,22 +577,24 @@ impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>>
     ///
     /// The underlying allocation may panic if memory allocation fails.
     #[cold]
-    pub fn resize_with(&mut self, buffer: A, new_size: usize) {
+    pub fn resize(&mut self, allocator: &mut SlabAllocator, new_size: usize) {
         debug!("Resizing map to {:?}...", new_size);
+        let new_slabs = allocator.create_strided_slabs(new_size, self.stride, self.align);
+        let old_slabs = mem::replace(&mut self.slabs, new_slabs);
         let old_mask = self.mask;
         self.collisions = self.length;
         self.mask = new_size - 1;
         self.shift = u64::BITS - new_size.trailing_zeros();
 
-        let old_buffer = mem::replace(&mut self.buffer, buffer);
-
         for idx in 0..=old_mask {
-            let entry = &old_buffer[idx];
-            if entry.hash != 0 {
-                let mut new_idx = self.slot_for(entry.hash);
+            let old_entry = self.entry_ptr_in(&old_slabs, idx);
+            let hash = unsafe { *(old_entry.add(self.hash_offset) as *const u64) };
+            if hash != 0 {
+                let mut new_idx = self.slot_for(hash);
                 loop {
-                    if self.buffer[new_idx].hash == 0 {
-                        self.buffer[new_idx] = *entry;
+                    let new_entry = self.entry_ptr(new_idx);
+                    if unsafe { *(new_entry.add(self.hash_offset) as *const u64) } == 0 {
+                        unsafe { ptr::copy_nonoverlapping(old_entry, new_entry, self.stride) };
                         break;
                     }
                     new_idx = (new_idx + 1) & self.mask;
@@ -520,33 +608,22 @@ impl<K: PersistedKey, V: AggregationValue, A: Index<usize, Output = Entry<K, V>>
 
 /// An iterator over the non-empty entries in a `BaseHashTable`.
 ///
-/// Created by [`BaseHashTable::iter`]. Yields references to entries where
+/// Created by [`BaseHashTable::iter`]. Yields [`EntryView`]s of entries where
 /// `hash != 0` in arbitrary order (based on slot positions, not insertion order).
-pub struct HashTableIterator<
-    'a,
-    K: PersistedKey,
-    V: AggregationValue,
-    A: Index<usize, Output = Entry<K, V>> + IndexMut<usize>,
-> {
-    hash_table: &'a BaseHashTable<K, V, A>,
+pub struct HashTableIterator<'a, K: PersistedKey, V: AggregationValue> {
+    hash_table: &'a BaseHashTable<K, V>,
     idx: usize,
 }
 
-impl<
-    'a,
-    K: PersistedKey,
-    V: AggregationValue,
-    A: Index<usize, Output = Entry<K, V>> + IndexMut<usize>,
-> Iterator for HashTableIterator<'a, K, V, A>
-{
-    type Item = &'a Entry<K, V>;
+impl<'a, K: PersistedKey, V: AggregationValue> Iterator for HashTableIterator<'a, K, V> {
+    type Item = EntryView<'a, K, V::Stored>;
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.idx < self.hash_table.mask + 1 {
-            let entry = &self.hash_table.buffer[self.idx];
+            let idx = self.idx;
             self.idx += 1;
-            if entry.hash != 0 {
-                return Some(entry);
+            if self.hash_table.hash_at(idx) != 0 {
+                return Some(self.hash_table.view_at(idx));
             }
         }
         None
@@ -556,16 +633,17 @@ impl<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operations::unary::group::values::{AggregationSlot, ValueColumns};
+    use crate::memory::init_test_free_pool;
+    use crate::operations::unary::group::values::{AggregationSlot, OwnedValue, ValueColumns};
     use arrow_array::{ArrayRef, RecordBatch};
     use arrow_schema::Field;
 
-    /// A minimal additive [`AggregationValue`] for exercising the probe mechanics:
-    /// merging two of these sums their counts.
+    /// A minimal additive value for exercising the probe mechanics: merging two
+    /// of these sums their counts.
     #[derive(Copy, Clone, Default, Debug, PartialEq)]
     struct Count(usize);
 
-    impl AggregationValue for Count {
+    impl OwnedValue for Count {
         type Reader<'b> = ();
         type SharedContext = ();
         type Columns = CountColumns;
@@ -590,46 +668,41 @@ mod tests {
     impl ValueColumns for CountColumns {
         type Value = Count;
         type Context = ();
-        fn with_capacity(_allocator: &mut SlabAllocator, _rows: usize) -> Self {
+        fn with_capacity(_allocator: &mut SlabAllocator, _rows: usize, _context: &()) -> Self {
             CountColumns
         }
         fn push(&mut self, _value: &Count) {}
+        fn push_stored(&mut self, _stored: &Count) {}
         fn finish(self, _context: &()) -> (Vec<Field>, Vec<ArrayRef>) {
             (Vec::new(), Vec::new())
         }
     }
 
-    type TestTable = BaseHashTable<u64, Count, Vec<Entry<u64, Count>>>;
+    type TestTable = BaseHashTable<u64, Count>;
 
-    fn new_table(capacity: usize) -> TestTable {
-        let buffer = vec![Entry::default(); capacity];
-        BaseHashTable {
-            mask: capacity - 1,
-            shift: u64::BITS - capacity.trailing_zeros(),
-            collisions: 0,
-            pre_shift: 0,
-            buffer,
-            length: 0,
-            max_load: max_load_for_len(capacity),
-            _phantom: PhantomData,
-        }
+    fn new_table(allocator: &mut SlabAllocator, capacity: usize) -> TestTable {
+        BaseHashTable::new(allocator, capacity, 0, &())
     }
 
     #[test]
     fn insert_single_entry() {
-        let mut table = new_table(16);
+        init_test_free_pool(16);
+        let mut allocator = SlabAllocator::new(true);
+        let mut table = new_table(&mut allocator, 16);
 
         table.merge::<false, _>(42, 100u64, Count(1), &());
 
         assert_eq!(table.len(), 1);
         let entry = table.iter(0).next().unwrap();
-        assert_eq!(*entry.key(), 100);
-        assert_eq!(*entry.value(), Count(1));
+        assert_eq!(*entry.key, 100);
+        assert_eq!(*entry.stored, Count(1));
     }
 
     #[test]
     fn merge_duplicate_keys_sums_values() {
-        let mut table = new_table(16);
+        init_test_free_pool(16);
+        let mut allocator = SlabAllocator::new(true);
+        let mut table = new_table(&mut allocator, 16);
 
         table.merge::<false, _>(42, 100u64, Count(1), &());
         table.merge::<false, _>(42, 100u64, Count(1), &());
@@ -637,38 +710,43 @@ mod tests {
 
         assert_eq!(table.len(), 1);
         let entry = table.iter(0).next().unwrap();
-        assert_eq!(*entry.value(), Count(3));
+        assert_eq!(*entry.stored, Count(3));
     }
 
     #[test]
     fn distinct_keys_same_hash_both_stored() {
-        let mut table = new_table(16);
+        init_test_free_pool(16);
+        let mut allocator = SlabAllocator::new(true);
+        let mut table = new_table(&mut allocator, 16);
 
         table.merge::<false, _>(42, 1u64, Count(1), &());
         table.merge::<false, _>(42, 2u64, Count(1), &());
 
         assert_eq!(table.len(), 2);
-        let entries: Vec<_> = table.iter(0).collect();
-        let keys: Vec<u64> = entries.iter().map(|e| *e.key()).collect();
+        let keys: Vec<u64> = table.iter(0).map(|e| *e.key).collect();
         assert!(keys.contains(&1));
         assert!(keys.contains(&2));
     }
 
     #[test]
     fn hash_zero_is_remapped_and_retrievable() {
-        let mut table = new_table(16);
+        init_test_free_pool(16);
+        let mut allocator = SlabAllocator::new(true);
+        let mut table = new_table(&mut allocator, 16);
 
         table.merge::<false, _>(0, 99u64, Count(1), &());
 
         assert_eq!(table.len(), 1);
         let entry = table.iter(0).next().unwrap();
-        assert_eq!(*entry.key(), 99);
-        assert_ne!(entry.hash(), 0);
+        assert_eq!(*entry.key, 99);
+        assert_ne!(entry.hash, 0);
     }
 
     #[test]
     fn undersized_triggers_at_load_factor() {
-        let mut table = new_table(16);
+        init_test_free_pool(16);
+        let mut allocator = SlabAllocator::new(true);
+        let mut table = new_table(&mut allocator, 16);
         let max_load = (16.0 * MAX_LOAD_FACTOR).round() as usize;
 
         for i in 0..max_load {
@@ -683,7 +761,9 @@ mod tests {
 
     #[test]
     fn collision_counting() {
-        let mut table = new_table(16);
+        init_test_free_pool(16);
+        let mut allocator = SlabAllocator::new(true);
+        let mut table = new_table(&mut allocator, 16);
 
         table.merge::<true, _>(42, 1u64, Count(1), &());
         assert_eq!(table.collisions(), 0);
@@ -694,7 +774,9 @@ mod tests {
 
     #[test]
     fn collision_counting_disabled() {
-        let mut table = new_table(16);
+        init_test_free_pool(16);
+        let mut allocator = SlabAllocator::new(true);
+        let mut table = new_table(&mut allocator, 16);
 
         table.merge::<false, _>(42, 1u64, Count(1), &());
         table.merge::<false, _>(42, 2u64, Count(1), &());
@@ -704,51 +786,57 @@ mod tests {
 
     #[test]
     fn iter_skips_empty_slots() {
-        let mut table = new_table(128);
+        init_test_free_pool(16);
+        let mut allocator = SlabAllocator::new(true);
+        let mut table = new_table(&mut allocator, 128);
 
         table.merge::<false, _>(1, 10u64, Count(1), &());
         table.merge::<false, _>(2, 20u64, Count(1), &());
 
         let entries: Vec<_> = table.iter(0).collect();
         assert_eq!(entries.len(), 2);
-        assert!(entries.iter().all(|e| e.hash() != 0));
+        assert!(entries.iter().all(|e| e.hash != 0));
     }
 
     #[test]
     fn resize_preserves_all_entries() {
-        let mut table = new_table(16);
+        init_test_free_pool(16);
+        let mut allocator = SlabAllocator::new(true);
+        let mut table = new_table(&mut allocator, 16);
         for i in 0..8u64 {
             table.merge::<false, _>(i + 1, i, Count(1), &());
         }
 
-        let new_buf = vec![Entry::default(); 32];
-        table.resize_with(new_buf, 32);
+        table.resize(&mut allocator, 32);
 
         assert_eq!(table.len(), 8);
         assert_eq!(table.capacity(), 32);
         for i in 0..8u64 {
-            let found = table.iter(0).any(|e| *e.key() == i);
+            let found = table.iter(0).any(|e| *e.key == i);
             assert!(found, "key {} missing after resize", i);
         }
     }
 
     #[test]
     fn resize_resets_collision_counter() {
-        let mut table = new_table(16);
+        init_test_free_pool(16);
+        let mut allocator = SlabAllocator::new(true);
+        let mut table = new_table(&mut allocator, 16);
         table.merge::<true, _>(42, 1u64, Count(1), &());
         table.merge::<true, _>(42, 2u64, Count(1), &());
         let pre_resize_collisions = table.collisions();
         assert!(pre_resize_collisions > 0);
 
-        let new_buf = vec![Entry::default(); 32];
-        table.resize_with(new_buf, 32);
+        table.resize(&mut allocator, 32);
 
         assert_eq!(table.collisions(), table.len());
     }
 
     #[test]
     fn many_entries_all_retrievable() {
-        let mut table = new_table(256);
+        init_test_free_pool(16);
+        let mut allocator = SlabAllocator::new(true);
+        let mut table = new_table(&mut allocator, 256);
 
         for i in 0..100u64 {
             table.merge::<false, _>(i + 1, i, Count(1), &());
@@ -756,14 +844,16 @@ mod tests {
 
         assert_eq!(table.len(), 100);
         for i in 0..100u64 {
-            let found = table.iter(0).any(|e| *e.key() == i && e.value().0 == 1);
+            let found = table.iter(0).any(|e| *e.key == i && e.stored.0 == 1);
             assert!(found, "key {} missing or wrong value", i);
         }
     }
 
     #[test]
     fn wrap_around_probing() {
-        let mut table = new_table(16);
+        init_test_free_pool(16);
+        let mut allocator = SlabAllocator::new(true);
+        let mut table = new_table(&mut allocator, 16);
         let last_slot_hash = u64::MAX;
 
         table.merge::<false, _>(last_slot_hash, 1u64, Count(1), &());
@@ -771,7 +861,7 @@ mod tests {
         table.merge::<false, _>(last_slot_hash, 3u64, Count(1), &());
 
         assert_eq!(table.len(), 3);
-        let keys: Vec<u64> = table.iter(0).map(|e| *e.key()).collect();
+        let keys: Vec<u64> = table.iter(0).map(|e| *e.key).collect();
         assert!(keys.contains(&1));
         assert!(keys.contains(&2));
         assert!(keys.contains(&3));
@@ -779,7 +869,9 @@ mod tests {
 
     #[test]
     fn empty_table_iteration() {
-        let table = new_table(16);
+        init_test_free_pool(16);
+        let mut allocator = SlabAllocator::new(true);
+        let table = new_table(&mut allocator, 16);
 
         let entries: Vec<_> = table.iter(0).collect();
 
@@ -788,37 +880,42 @@ mod tests {
 
     #[test]
     fn merge_after_resize() {
-        let mut table = new_table(16);
+        init_test_free_pool(16);
+        let mut allocator = SlabAllocator::new(true);
+        let mut table = new_table(&mut allocator, 16);
         table.merge::<false, _>(42, 1u64, Count(1), &());
         table.merge::<false, _>(99, 2u64, Count(1), &());
 
-        let new_buf = vec![Entry::default(); 32];
-        table.resize_with(new_buf, 32);
+        table.resize(&mut allocator, 32);
         table.merge::<false, _>(42, 1u64, Count(1), &());
         table.merge::<false, _>(200, 3u64, Count(1), &());
 
         assert_eq!(table.len(), 3);
-        let merged = table.iter(0).find(|e| *e.key() == 1).unwrap();
-        assert_eq!(*merged.value(), Count(2));
-        assert!(table.iter(0).any(|e| *e.key() == 3));
+        let merged = table.iter(0).find(|e| *e.key == 1).unwrap();
+        assert_eq!(*merged.stored, Count(2));
+        assert!(table.iter(0).any(|e| *e.key == 3));
     }
 
     #[test]
-    fn entry_at_returns_correct_slot() {
-        let mut table = new_table(16);
+    fn view_at_returns_correct_slot() {
+        init_test_free_pool(16);
+        let mut allocator = SlabAllocator::new(true);
+        let mut table = new_table(&mut allocator, 16);
         table.merge::<false, _>(42, 100u64, Count(1), &());
 
         let occupied: Vec<usize> = (0..table.capacity())
-            .filter(|&i| table.entry_at(i).hash() != 0)
+            .filter(|&i| table.hash_at(i) != 0)
             .collect();
 
         assert_eq!(occupied.len(), 1);
-        assert_eq!(*table.entry_at(occupied[0]).key(), 100);
+        assert_eq!(*table.view_at(occupied[0]).key, 100);
     }
 
     #[test]
     fn iter_with_start_offset() {
-        let mut table = new_table(128);
+        init_test_free_pool(16);
+        let mut allocator = SlabAllocator::new(true);
+        let mut table = new_table(&mut allocator, 128);
         for i in 0..20u64 {
             table.merge::<false, _>(i + 1, i, Count(1), &());
         }

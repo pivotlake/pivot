@@ -106,6 +106,10 @@ pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue> {
 /// switch, the per-partition scatter buffers plus a distinct-count sketch.
 pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue> {
     hash_state: RandomState,
+    /// The value's shared context, held here because table construction derives
+    /// the entry layout from it (a runtime-arity value's slot count) and the
+    /// abandon path copies stored values out through it.
+    shared_context: V::SharedContext,
     /// String *key* storage. Separate from the value's write state so a live
     /// string key (which holds `&mut key_arena` until persisted) and a
     /// string-extreme value fold (which needs `&mut worker_context`) never alias —
@@ -143,13 +147,15 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
     pub fn new(
         state: RandomState,
         key_arena: Arc<SharedArena>,
+        shared_context: V::SharedContext,
         worker_context: V::WorkerContext,
         radix: RadixConfig,
     ) -> Self {
         let mut allocator = SlabAllocator::new(true);
-        let table = BaseHashTable::multi_slab(&mut allocator, DEFAULT_CAPACITY, 0);
+        let table = BaseHashTable::new(&mut allocator, DEFAULT_CAPACITY, 0, &shared_context);
         Self {
             hash_state: state,
+            shared_context,
             key_arena: WorkerArena::new(key_arena),
             worker_context,
             allocator,
@@ -290,8 +296,8 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
                     hash,
                     key,
                     &mut self.worker_context,
-                    |wc, cell| *cell = V::value(value_reader, i, wc),
-                    |wc, cell| *cell = cell.update_from_reader(value_reader, i, wc, shared_context),
+                    |wc, stored| V::seed_stored(stored, value_reader, i, wc),
+                    |wc, stored| V::update_stored(stored, value_reader, i, wc, shared_context),
                 );
                 table.undersized()
             };
@@ -323,8 +329,12 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
         // A key with real bytes (`!DEDUP_BY_HASH`) is radix-eligible; a hash-only
         // key has nothing to scatter and always grows in place.
         if K::DEDUP_BY_HASH || next_size <= self.radix_cfg.switch_threshold {
-            self.tables
-                .push(BaseHashTable::multi_slab(&mut self.allocator, next_size, 0));
+            self.tables.push(BaseHashTable::new(
+                &mut self.allocator,
+                next_size,
+                0,
+                &self.shared_context,
+            ));
             return false;
         }
         if self.buffers.is_none() {
@@ -389,15 +399,20 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
             buffers,
             allocator,
             hll,
+            shared_context,
             ..
         } = self;
         let table = tables.last_mut().unwrap();
         let buffers = buffers.as_mut().unwrap();
         for entry in table.iter(0) {
-            let hash = entry.hash();
+            let hash = entry.hash;
             hll.add(hash);
             let p = (hash >> shift) as usize;
-            buffers[p].push(allocator, (hash, *entry.key(), *entry.value()));
+            // The abandon route is radix, so only a radix-compatible value (one
+            // whose owned form is the stored form) reaches it; `to_owned` is a
+            // plain copy and spawns no worker context.
+            let value = V::to_owned(entry.stored, shared_context, &mut None);
+            buffers[p].push(allocator, (hash, *entry.key, value));
         }
         table.clear();
     }
@@ -411,7 +426,7 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
             // pre-switch stack's distinct so the merge sizing sees the total.
             for table in &self.tables {
                 for entry in table.iter(0) {
-                    self.hll.add(entry.hash());
+                    self.hll.add(entry.hash);
                 }
             }
         }

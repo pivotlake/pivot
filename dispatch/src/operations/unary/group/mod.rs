@@ -105,7 +105,7 @@ pub(crate) use values::cast_value_column;
 pub use values::{
     AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot, Distinct,
     Dynamic, F64Cell, F64Max, F64Min, F64Sum, Fold, IntCell, IntRead, Max, MaxSlot, Min, MinSlot,
-    NoRead, OpTuple, Read, SharedContext, StrMax, StrMin, StrRead, Sum, SumSlot, WideSum,
+    NoRead, OpTuple, Read, SharedContext, StrMax, StrMin, StrRead, Sum, SumSlot, Variable, WideSum,
     WorkerContext,
 };
 
@@ -267,16 +267,23 @@ impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
         // A string extreme persists its winner lazily during the in-place fold, so
         // it must not take the radix scatter path (which materialises — and thus
         // persists — every row's string before any comparison). Disable the switch
-        // when any value slot is a string extreme; numeric signatures keep radix.
-        let radix = if value_slots.iter().any(|s| s.is_string_extreme()) {
+        // when any value slot is a string extreme, or when the value itself
+        // declares per-row materialisation unaffordable (see
+        // `AggregationValue::RADIX_COMPATIBLE`); other signatures keep radix.
+        let radix = if !V::RADIX_COMPATIBLE || value_slots.iter().any(|s| s.is_string_extreme()) {
             radix.without_radix()
         } else {
             radix
         };
         // The per-worker write context is spawned from the shared one (a fresh
         // `WorkerArena` for a string value, `()` for numeric).
-        let aggregated_table =
-            AggregatedTable::new(state, key_arena.clone(), shared_context.worker(), radix);
+        let aggregated_table = AggregatedTable::new(
+            state,
+            key_arena.clone(),
+            shared_context.clone(),
+            shared_context.worker(),
+            radix,
+        );
         Self {
             key_cols,
             value_slots,
@@ -582,9 +589,15 @@ impl<K: KeyExtractor, V: AggregationValue> GroupOutputter<K, V> {
         // entry width, a wide multi-column key (fat entries) targets fewer groups
         // per job than a bare integer key.
         const TARGET_MERGE_PARTITION_BYTES: usize = 256 * 1024; // ~one core's L2
-        let target_groups_per_partition = (TARGET_MERGE_PARTITION_BYTES
-            / std::mem::size_of::<(u64, K::Persisted, V)>().max(1))
-        .max(1);
+        // Approximate bytes per table entry: hash + key + the stored value
+        // (whose size may be a query-time fact, e.g. a runtime-arity
+        // signature's cell run). Padding is ignored; this is a sizing
+        // heuristic, not a layout.
+        let entry_bytes = size_of::<u64>()
+            + size_of::<K::Persisted>()
+            + V::stored_size(V::stored_meta(&self.shared_context));
+        let target_groups_per_partition =
+            (TARGET_MERGE_PARTITION_BYTES / entry_bytes.max(1)).max(1);
         let (num_partitions, partition_capacity) = if !any_switched {
             // No worker switched to radix, so every group still sits in an in-place
             // table. Run a partition_floor-way merge, each job sized to its share of

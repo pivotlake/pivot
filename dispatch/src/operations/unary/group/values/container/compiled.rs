@@ -30,7 +30,7 @@
 use super::super::cell::Cell;
 use super::super::fold::{Count, Fold, Max, Min, Sum};
 use super::super::read::{IntRead, NoRead, Read};
-use super::super::{AggregationSlot, AggregationValue, ValueColumns};
+use super::super::{AggregationSlot, OwnedValue, ValueColumns};
 use crate::arrays::SlabColumn;
 use crate::memory::SlabAllocator;
 use arrow_array::{ArrayRef, RecordBatch};
@@ -130,7 +130,7 @@ macro_rules! impl_compiled {
         // both its value contexts are concretely `()`: the `&mut ()` consume passes
         // and the `&()` merge/finish pass are inert (the fold ops take no context).
         // A signature with a string extreme takes the `Dynamic` path instead.
-        impl<$($R, $F),+> AggregationValue for Compiled<($(Pair<$R, $F>,)+)>
+        impl<$($R, $F),+> OwnedValue for Compiled<($(Pair<$R, $F>,)+)>
         where
             $($R: Read, $F: Fold, for<'b> $R: Read<Val<'b> = $F::Val>, $F::Acc: Into<i128>,)+
         {
@@ -186,13 +186,18 @@ macro_rules! impl_compiled {
             type Value = Compiled<($(Pair<$R, $F>,)+)>;
             type Context = ();
 
-            fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self {
+            fn with_capacity(allocator: &mut SlabAllocator, rows: usize, _context: &()) -> Self {
                 Self { cols: ($(SlabColumn::<$F::Acc>::with_capacity(allocator, rows),)+) }
             }
 
             #[inline(always)]
             fn push(&mut self, value: &Self::Value) {
                 $(self.cols.$idx.push(value.accs.$idx);)+
+            }
+
+            #[inline(always)]
+            fn push_stored(&mut self, stored: &Self::Value) {
+                self.push(stored);
             }
 
             fn finish(self, _context: &()) -> (Vec<Field>, Vec<ArrayRef>) {
