@@ -13,34 +13,28 @@
 //! `INSERT` the row; the test then reads the row back out of pivot with a plain
 //! Postgres client.
 //!
-//! It is `#[ignore]`d because pivot does not support what the sink needs yet, so
-//! it cannot pass today. It is checked in as an executable definition of "done":
-//! drop the `#[ignore]` once the gaps below are closed and it should go green.
+//! The sink runs in `insert.mode=insert` with `pk.mode=none`, and the connection
+//! uses `preferQueryMode=simple` so the driver inlines parameters into simple
+//! query strings rather than driving the extended (Parse/Bind/Execute) protocol
+//! pivot does not implement. In that mode pivot now handles everything the sink
+//! needs to land a row:
+//!   - the driver's `DatabaseMetaData` introspection (`getTables`, `getColumns`,
+//!     `getPrimaryKeys`) against the virtual `pg_catalog` tables, including the
+//!     `~`/`!~` regex casts, NULL constants, `::name`/`::regclass` casts, the
+//!     row_number window, and the never-matching description outer joins;
+//!   - `CREATE TABLE "people" (... NOT NULL)` from `auto.create=true`;
+//!   - `INSERT INTO "people" (cols) VALUES (...)` with an explicit column list;
+//!   - `BEGIN`/`COMMIT` around each batch, accepted as no-ops (each statement
+//!     still commits on its own).
 //!
-//! What the connector needs that pivot is missing today:
-//!   1. **Extended query protocol** (Parse/Bind/Execute). The JDBC driver drives
-//!      everything through prepared statements; pivot registers a `NoopHandler`
-//!      for extended queries, so the connection never gets past its first
-//!      prepared statement. This is the hard blocker.
-//!   2. **`INSERT` with an explicit column list** (`INSERT INTO t (a, b) VALUES
-//!      (?, ?)`). The sink always names its columns; pivot only accepts
-//!      positional `INSERT INTO t VALUES (...)`.
-//!   3. **Server-side parameter binding** for the `?` placeholders the sink binds
-//!      per row (part of the extended protocol above).
-//!   4. **Catalog introspection** the JDBC driver's `DatabaseMetaData` issues to
-//!      check whether the target table exists (`information_schema` / `pg_catalog`
-//!      lookups) before `auto.create` fires.
-//!   5. **Transactions** (`BEGIN`/`COMMIT`): the sink turns off autocommit and
-//!      commits each batch. pivot has no multi-statement transactions, but now
-//!      accepts `BEGIN`/`COMMIT`/`ROLLBACK` as no-ops (each statement still
-//!      commits on its own), so this no longer blocks the connection.
-//!   6. Only reached in richer configs, but worth noting: `ON CONFLICT ... DO
-//!      UPDATE` for `insert.mode=upsert`, and `ALTER TABLE ... ADD COLUMN` for
-//!      `auto.evolve=true`.
+//! It stays `#[ignore]`d only because it needs a working Docker daemon (Kafka +
+//! Kafka Connect containers) and pulls the JDBC sink connector from Confluent Hub
+//! at container start, so it also needs network egress the first time. Run it
+//! explicitly with `cargo test -p server --test kafka_connect_e2e -- --ignored`.
 //!
-//! Requires a working Docker daemon (Kafka + Kafka Connect containers) and pulls
-//! the JDBC sink connector from Confluent Hub at container start, so it also
-//! needs network egress the first time.
+//! Still out of scope (richer configs): the extended query protocol, `ON CONFLICT
+//! ... DO UPDATE` for `insert.mode=upsert`, and `ALTER TABLE ... ADD COLUMN` for
+//! `auto.evolve=true`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -328,7 +322,7 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 // --- the test --------------------------------------------------------------
 
 #[test]
-#[ignore = "pivot lacks the extended query protocol the JDBC sink requires; see module docs"]
+#[ignore = "needs a Docker daemon (Kafka + Kafka Connect containers); run with --ignored"]
 fn kafka_connect_jdbc_sink_lands_rows() {
     // Print pivot's per-query logs so a sink failure shows which SQL reached it.
     let _ = tracing_subscriber::fmt()
