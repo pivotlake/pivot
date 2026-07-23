@@ -36,6 +36,11 @@ pub fn rowid_column_id() -> usize {
 /// [`ScalarValue::Other`].
 fn scalar_from_value(v: &ffi::Value) -> ScalarValue {
     use LogicalTypeId as L;
+    // Reading a typed value out of a NULL (via `GetValue<T>`) throws in DuckDB,
+    // so decode null-ness first and keep the logical type for the arrow null.
+    if ffi::value_is_null(v) {
+        return ScalarValue::Null(LogicalTypeId::from_u8(ffi::value_type(v)));
+    }
     match LogicalTypeId::from_u8(ffi::value_type(v)) {
         L::BOOLEAN => ScalarValue::Boolean(ffi::value_bool(v)),
         L::TINYINT => ScalarValue::Int8(ffi::value_i8(v)),

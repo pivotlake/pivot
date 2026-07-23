@@ -221,6 +221,16 @@ pub fn build_scalar_value(value: ScalarValue) -> Result<Scalar<ArrayRef>, Error>
         ScalarValue::Timestamp(micros) => {
             Arc::new(TimestampSecondArray::new_scalar(micros / 1_000_000).into_inner())
         }
+        // A NULL constant (e.g. `NULL AS col`, a CASE `ELSE NULL`): a single-row
+        // null array of its best-effort physical type. An untyped SQL NULL has no
+        // pivot type; a null string stands in, since the value only carries "null"
+        // downstream and the driver reads it as null regardless.
+        ScalarValue::Null(type_id) => {
+            let data_type = type_from_logical(type_id)
+                .map(|ty| physical_arrow_type(&ty))
+                .unwrap_or(DataType::Utf8View);
+            arrow_array::new_null_array(&data_type, 1)
+        }
         // SUM/AVG result types, INTERVAL, and types the bridge doesn't decode never
         // appear as query *constants* we materialise (INTERVAL is consumed by
         // interval arithmetic; HUGEINT/DECIMAL constants aren't supported).

@@ -872,6 +872,9 @@ const Value &expr_constant(const Expression &expr) {
 uint8_t value_type(const Value &v) {
 	return static_cast<uint8_t>(v.type().id());
 }
+bool value_is_null(const Value &v) {
+	return v.IsNull();
+}
 bool value_bool(const Value &v) {
 	return v.GetValue<bool>();
 }

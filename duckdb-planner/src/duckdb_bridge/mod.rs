@@ -320,6 +320,7 @@ pub mod ffi {
         // ---- Value: typed accessors (shared by constants and table-function
         // arguments). Read `value_type` first, then the matching accessor.
         fn value_type(v: &Value) -> u8;
+        fn value_is_null(v: &Value) -> bool;
         fn value_bool(v: &Value) -> bool;
         fn value_i8(v: &Value) -> i8;
         fn value_i16(v: &Value) -> i16;
