@@ -176,6 +176,9 @@ impl<T: PendingRequest> RequestTracker<T> {
                 self.http_in_flight += 1;
             }
         }
+        if !self.pending_fs.is_empty() || !self.pending_http.is_empty() {
+            dispatch::io::note_pending_io();
+        }
     }
 
     /// Register `slot` as a waiter on `read`, and report whether `read` is a *new*

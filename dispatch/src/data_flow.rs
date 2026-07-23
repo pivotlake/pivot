@@ -59,7 +59,14 @@ struct OperatorNode {
 impl OperatorNode {
     #[inline]
     fn is_gated(&mut self) -> bool {
+        let gated_before = self.gates.len();
         self.gates.retain(|gate| !gate.load(Ordering::Acquire));
+        // A gate opened since the last look. While gated, this operator was
+        // skipped by every IO collection pass, so IO it staged may sit behind
+        // a cleared pending-IO flag; re-flag so the next pass walks to it.
+        if self.gates.len() != gated_before {
+            crate::io::note_pending_io();
+        }
         !self.gates.is_empty()
     }
 }

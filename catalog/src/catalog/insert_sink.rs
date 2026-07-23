@@ -337,6 +337,7 @@ impl Unary<EncodedFile, RecordBatch> for Upload {
                     }));
             }
         }
+        dispatch::io::note_pending_io();
         self.in_flight.insert(
             id,
             PendingUpload {
