@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Datum, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, Scalar, StringViewArray, TimestampSecondArray,
-    new_null_array,
+    Array, ArrayRef, BooleanArray, Date32Array, Datum, Decimal64Array, Decimal128Array,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Scalar,
+    StringViewArray, TimestampSecondArray, new_null_array,
 };
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use delta_kernel::Snapshot;
@@ -488,11 +488,26 @@ fn delta_scalar_to_pivot(column: &str, scalar: DeltaScalar) -> Result<Scalar<Arr
         DeltaScalar::Timestamp(value) | DeltaScalar::TimestampNtz(value) => {
             erased(TimestampSecondArray::from(vec![value / 1_000_000]))
         }
-        // Pivot executes DECIMAL as Float64; retain that physical
-        // representation while preserving the logical type in the table schema.
+        // A decimal partition value lands on the declared type's carrier,
+        // matching `physical_arrow_type`: `Decimal64` up to 18 digits (where
+        // the unscaled integer is guaranteed to fit), `Decimal128` beyond.
+        // Delta Kernel enforces a valid precision/scale, so restamping the
+        // unscaled integer cannot fail.
         DeltaScalar::Decimal(value) => {
-            let divisor = 10_f64.powi(i32::from(value.scale()));
-            erased(Float64Array::from(vec![value.bits() as f64 / divisor]))
+            if value.precision() <= planner::types::MAX_DECIMAL64_PRECISION {
+                let narrow = i64::try_from(value.bits()).expect("an 18-digit decimal fits in i64");
+                erased(
+                    Decimal64Array::from(vec![narrow])
+                        .with_precision_and_scale(value.precision(), value.scale() as i8)
+                        .expect("Delta Kernel enforces a valid decimal shape"),
+                )
+            } else {
+                erased(
+                    Decimal128Array::from(vec![value.bits()])
+                        .with_precision_and_scale(value.precision(), value.scale() as i8)
+                        .expect("Delta Kernel enforces a valid decimal shape"),
+                )
+            }
         }
         unsupported => {
             return Err(Error::UnsupportedType {
@@ -502,40 +517,6 @@ fn delta_scalar_to_pivot(column: &str, scalar: DeltaScalar) -> Result<Scalar<Arr
         }
     };
     Ok(scalar)
-}
-
-/// Errors carry an empty column name; the caller fills it in, since it knows
-/// which column the type came from.
-fn pivot_type(data_type: &DeltaDataType) -> Result<Type, Error> {
-    if let DeltaDataType::Variant(_) = data_type {
-        return Ok(Type::Variant);
-    }
-    let DeltaDataType::Primitive(primitive) = data_type else {
-        return Err(Error::UnsupportedType {
-            column: String::new(),
-            data_type: format!("{data_type:?}"),
-        });
-    };
-    let data_type = match primitive {
-        PrimitiveType::String => Type::Utf8,
-        PrimitiveType::Long => Type::Int64,
-        PrimitiveType::Integer => Type::Int32,
-        PrimitiveType::Short => Type::Int16,
-        PrimitiveType::Byte => Type::Int8,
-        PrimitiveType::Float => Type::Float32,
-        PrimitiveType::Double => Type::Float64,
-        PrimitiveType::Boolean => Type::Boolean,
-        PrimitiveType::Date => Type::Date,
-        PrimitiveType::Timestamp | PrimitiveType::TimestampNtz => Type::Timestamp,
-        PrimitiveType::Decimal(_) => Type::Decimal,
-        PrimitiveType::Binary | PrimitiveType::Void => {
-            return Err(Error::UnsupportedType {
-                column: String::new(),
-                data_type: primitive.to_string(),
-            });
-        }
-    };
-    Ok(data_type)
 }
 
 fn delta_type(column: &str, data_type: &Type) -> Result<DeltaDataType, Error> {
@@ -561,7 +542,7 @@ fn delta_type(column: &str, data_type: &Type) -> Result<DeltaDataType, Error> {
         Type::Utf8 => PrimitiveType::String,
         Type::Date => PrimitiveType::Date,
         Type::Timestamp => PrimitiveType::Timestamp,
-        Type::Decimal => PrimitiveType::decimal(38, 18)?,
+        Type::Decimal { precision, scale } => PrimitiveType::decimal(*precision, *scale as u8)?,
         Type::Int128 | Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64 => {
             return Err(Error::UnsupportedType {
                 column: column.to_string(),
@@ -622,13 +603,38 @@ fn pivot_type_from_field(field: &StructField) -> Result<Type, Error> {
             data_type: tag.clone(),
         });
     }
-    pivot_type(field.data_type()).map_err(|error| match error {
-        Error::UnsupportedType { data_type, .. } => Error::UnsupportedType {
-            column: field.name().clone(),
-            data_type,
+    let unsupported = |data_type: String| Error::UnsupportedType {
+        column: field.name().clone(),
+        data_type,
+    };
+    if let DeltaDataType::Variant(_) = field.data_type() {
+        return Ok(Type::Variant);
+    }
+    let DeltaDataType::Primitive(primitive) = field.data_type() else {
+        return Err(unsupported(format!("{:?}", field.data_type())));
+    };
+    let data_type = match primitive {
+        PrimitiveType::String => Type::Utf8,
+        PrimitiveType::Long => Type::Int64,
+        PrimitiveType::Integer => Type::Int32,
+        PrimitiveType::Short => Type::Int16,
+        PrimitiveType::Byte => Type::Int8,
+        PrimitiveType::Float => Type::Float32,
+        PrimitiveType::Double => Type::Float64,
+        PrimitiveType::Boolean => Type::Boolean,
+        PrimitiveType::Date => Type::Date,
+        PrimitiveType::Timestamp | PrimitiveType::TimestampNtz => Type::Timestamp,
+        // Delta Kernel already enforces precision 1..=38 and scale <= precision,
+        // exactly the shapes Pivot's decimal supports.
+        PrimitiveType::Decimal(decimal) => Type::Decimal {
+            precision: decimal.precision(),
+            scale: decimal.scale() as i8,
         },
-        other => other,
-    })
+        PrimitiveType::Binary | PrimitiveType::Void => {
+            return Err(unsupported(primitive.to_string()));
+        }
+    };
+    Ok(data_type)
 }
 
 /// Parse a [`PIVOT_LOGICAL_TYPE_KEY`] tag back into its unsigned Pivot type.
@@ -767,10 +773,13 @@ mod tests {
             Err(Error::UnsupportedType { column, data_type })
                 if column == "total" && data_type == "Int128"
         ));
-        let decimal = DeltaDataType::Primitive(PrimitiveType::decimal(38, 0).unwrap());
+        let decimal = StructField::new("total", PrimitiveType::decimal(38, 0).unwrap(), false);
         assert_eq!(
-            pivot_type(&decimal).unwrap(),
-            Type::Decimal,
+            pivot_type_from_field(&decimal).unwrap(),
+            Type::Decimal {
+                precision: 38,
+                scale: 0
+            },
             "a genuine Delta decimal must remain Decimal"
         );
     }

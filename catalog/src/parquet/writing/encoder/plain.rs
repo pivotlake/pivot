@@ -7,11 +7,13 @@
 //! distinct values.
 
 use arrow_array::{
-    Array, BinaryViewArray, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
-    StringViewArray,
+    Array, BinaryViewArray, Decimal64Array, Decimal128Array, Float32Array, Float64Array,
+    Int32Array, Int64Array, StringArray, StringViewArray,
 };
 use arrow_schema::DataType;
 use thriftparquet::general::Encoding;
+
+use crate::parquet::DecimalWriteStorage;
 
 use super::super::error::{WriteError, WriteResult};
 use super::super::types::EncodedPage;
@@ -48,7 +50,8 @@ fn encode_data_page(leaf: &Leaf, range: PageRange) -> WriteResult<EncodedPage> {
 }
 
 /// Append `array`'s PLAIN-encoded values to `out`: fixed-width values
-/// little-endian, BYTE_ARRAY values a length-prefixed copy.
+/// little-endian (except wide decimals, whose fixed-length bytes are
+/// big-endian), BYTE_ARRAY values a length-prefixed copy.
 ///
 /// Parquet stores only the values that are present, so a leaf's absent rows are
 /// already dropped by the time they reach here (see
@@ -86,6 +89,38 @@ pub(super) fn encode_into(array: &dyn Array, out: &mut Vec<u8>) -> WriteResult<(
         DataType::Int64 => fixed!(Int64Array),
         DataType::Float32 => fixed!(Float32Array),
         DataType::Float64 => fixed!(Float64Array),
+        // A decimal writes the narrowest storage its precision allows (see
+        // `decimal_write_storage`): INT32/INT64 little-endian like the
+        // primitives above, or the wide form's 16 big-endian two's-complement
+        // bytes. Every value fits the narrowed integer because the column's
+        // precision bounds it.
+        DataType::Decimal64(precision, _) => {
+            let a = downcast::<Decimal64Array>(array)?;
+            match crate::parquet::decimal_write_storage(*precision) {
+                DecimalWriteStorage::Int32 => {
+                    (0..len).for_each(|i| out.extend_from_slice(&(a.value(i) as i32).to_le_bytes()))
+                }
+                DecimalWriteStorage::Int64 => {
+                    (0..len).for_each(|i| out.extend_from_slice(&a.value(i).to_le_bytes()))
+                }
+                DecimalWriteStorage::FixedLen => (0..len)
+                    .for_each(|i| out.extend_from_slice(&(a.value(i) as i128).to_be_bytes())),
+            }
+        }
+        DataType::Decimal128(precision, _) => {
+            let a = downcast::<Decimal128Array>(array)?;
+            match crate::parquet::decimal_write_storage(*precision) {
+                DecimalWriteStorage::Int32 => {
+                    (0..len).for_each(|i| out.extend_from_slice(&(a.value(i) as i32).to_le_bytes()))
+                }
+                DecimalWriteStorage::Int64 => {
+                    (0..len).for_each(|i| out.extend_from_slice(&(a.value(i) as i64).to_le_bytes()))
+                }
+                DecimalWriteStorage::FixedLen => {
+                    (0..len).for_each(|i| out.extend_from_slice(&a.value(i).to_be_bytes()))
+                }
+            }
+        }
         DataType::Utf8 => byte_array!(StringArray, |value| value.as_bytes()),
         DataType::Utf8View => byte_array!(StringViewArray, |value| value.as_bytes()),
         DataType::BinaryView => byte_array!(BinaryViewArray, |value| value),
@@ -125,6 +160,69 @@ mod tests {
             expected.extend_from_slice(s.as_bytes());
         }
         assert_eq!(out, expected);
+    }
+
+    /// A wide decimal value encodes as its unscaled integer's 16 big-endian
+    /// two's-complement bytes, with no length prefix; a negative value is
+    /// sign-filled from the left.
+    #[test]
+    fn encodes_wide_decimals_as_16_big_endian_bytes() {
+        let array = Decimal128Array::from(vec![12345_i128, -2_i128])
+            .with_precision_and_scale(20, 2)
+            .unwrap();
+
+        let mut out = Vec::new();
+        encode_into(&array, &mut out).unwrap();
+
+        // 12345 = 0x3039 right-aligned in 16 bytes; -2 = 0xff..fe.
+        let mut expected = vec![0u8; 14];
+        expected.extend_from_slice(&[0x30, 0x39]);
+        expected.extend_from_slice(&[0xff; 15]);
+        expected.push(0xfe);
+        assert_eq!(out, expected);
+    }
+
+    /// A narrow decimal value encodes little-endian in the integer width its
+    /// precision selects: 8 bytes up to 18 digits, 4 bytes up to 9.
+    #[test]
+    fn encodes_narrow_decimals_as_little_endian_ints() {
+        let int64_form = Decimal64Array::from(vec![12345_i64, -2_i64])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let int32_form = Decimal64Array::from(vec![12345_i64, -2_i64])
+            .with_precision_and_scale(5, 2)
+            .unwrap();
+
+        let mut int64_out = Vec::new();
+        encode_into(&int64_form, &mut int64_out).unwrap();
+        let mut int32_out = Vec::new();
+        encode_into(&int32_form, &mut int32_out).unwrap();
+
+        let mut expected64 = 12345_i64.to_le_bytes().to_vec();
+        expected64.extend_from_slice(&(-2_i64).to_le_bytes());
+        assert_eq!(int64_out, expected64);
+        let mut expected32 = 12345_i32.to_le_bytes().to_vec();
+        expected32.extend_from_slice(&(-2_i32).to_le_bytes());
+        assert_eq!(int32_out, expected32);
+    }
+
+    /// The precision picks the storage, not the carrier: a `Decimal128` array
+    /// at a narrow precision writes the same bytes as the `Decimal64` form.
+    #[test]
+    fn precision_decides_the_decimal_storage_regardless_of_carrier() {
+        let narrow = Decimal64Array::from(vec![12345_i64, -2_i64])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let wide = Decimal128Array::from(vec![12345_i128, -2_i128])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+
+        let mut narrow_out = Vec::new();
+        encode_into(&narrow, &mut narrow_out).unwrap();
+        let mut wide_out = Vec::new();
+        encode_into(&wide, &mut wide_out).unwrap();
+
+        assert_eq!(narrow_out, wide_out);
     }
 
     /// A variant's `metadata`/`value` leaves are binary, and encode as

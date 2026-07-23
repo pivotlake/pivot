@@ -84,7 +84,7 @@ impl<'a, 'b> MultiBufferReader<'a, 'b> {
     /// Read exactly `N` bytes into a fixed-size array, crossing buffer
     /// boundaries if needed.
     #[inline(always)]
-    fn read_fixed_slice<const N: usize>(&mut self) -> [u8; N] {
+    pub fn read_fixed_slice<const N: usize>(&mut self) -> [u8; N] {
         let mut slice: [u8; N] = [0u8; N];
 
         let copy_from_cur = std::cmp::min(self.remaining_in_cur(), N);

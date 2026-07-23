@@ -18,7 +18,9 @@
 
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::cast::AsArray;
+use arrow_array::types::{Decimal64Type, Decimal128Type, Int64Type};
+use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch};
 use arrow_schema::{DataType, Field};
 use std::sync::Arc;
 
@@ -28,7 +30,7 @@ pub mod distinct;
 pub mod fold;
 pub mod read;
 
-pub use cell::{Cell, F64Cell, IntCell};
+pub use cell::{Cell, F64Cell, IntCell, WideCell};
 pub use container::{Compiled, CountSlot, Dynamic, MaxSlot, MinSlot, OpTuple, SumSlot};
 pub use distinct::Distinct;
 pub use fold::{
@@ -107,6 +109,22 @@ impl AggregationSlot {
 /// already equals the declared one, so a slot whose accumulator width is its
 /// output type pays nothing; a `COUNT` rendered from an `i128` cell narrows to
 /// `Int64` here, a narrow `SUM` widens to `Decimal128`.
+///
+/// A conversion to a declared decimal type is a metadata restamp (or a lossless
+/// width change on the raw values), never an arrow cast: the cells hold the raw
+/// unscaled integers, and those are already at the declared type's scale (an
+/// aggregate over a decimal column folds the column's unscaled integers as-is).
+/// An arrow decimal cast would multiply them by ten to the declared scale,
+/// silently corrupting every decimal aggregate result. The four decimal arms:
+///
+/// - `Decimal128 -> Decimal128` / `Decimal64 -> Decimal64`: restamp the declared
+///   precision/scale over the same value buffer.
+/// - `Int64 -> Decimal64`: an `i64` cell rendered as `Int64` whose slot declares
+///   `Decimal64(p, s)` — rebuild a `Decimal64` array over the very same `i64`
+///   buffer (metadata only, no value is touched).
+/// - `Decimal128 -> Decimal64`: an `i128` cell (a signature another slot forced
+///   wide) whose slot declares `Decimal64(p, s)` — narrow each raw value to
+///   `i64`, exact because a declared precision of at most 18 digits fits.
 pub(crate) fn cast_value_column(
     field: Field,
     column: ArrayRef,
@@ -115,9 +133,49 @@ pub(crate) fn cast_value_column(
     if field.data_type() == output_type {
         return (field, column);
     }
-    let casted = arrow::compute::cast(&column, output_type).expect("aggregate output column cast");
+    let converted: ArrayRef = match (field.data_type(), output_type) {
+        (DataType::Decimal128(_, _), DataType::Decimal128(precision, scale)) => Arc::new(
+            column
+                .as_primitive::<Decimal128Type>()
+                .clone()
+                .with_precision_and_scale(*precision, *scale)
+                .expect("declared decimal shape is valid"),
+        ),
+        (DataType::Decimal64(_, _), DataType::Decimal64(precision, scale)) => Arc::new(
+            column
+                .as_primitive::<Decimal64Type>()
+                .clone()
+                .with_precision_and_scale(*precision, *scale)
+                .expect("declared decimal shape is valid"),
+        ),
+        (DataType::Int64, DataType::Decimal64(precision, scale)) => {
+            let ints = column.as_primitive::<Int64Type>();
+            let restamped =
+                PrimitiveArray::<Decimal64Type>::new(ints.values().clone(), ints.nulls().cloned())
+                    .with_precision_and_scale(*precision, *scale)
+                    .expect("declared decimal shape is valid");
+            Arc::new(restamped)
+        }
+        (DataType::Decimal128(_, _), DataType::Decimal64(precision, scale)) => {
+            let wide = column.as_primitive::<Decimal128Type>();
+            let narrowed: PrimitiveArray<Decimal64Type> = wide
+                .iter()
+                .map(|v| {
+                    v.map(|v| {
+                        i64::try_from(v).expect("a value of a Decimal64-declared slot fits in i64")
+                    })
+                })
+                .collect();
+            Arc::new(
+                narrowed
+                    .with_precision_and_scale(*precision, *scale)
+                    .expect("declared decimal shape is valid"),
+            )
+        }
+        _ => arrow::compute::cast(&column, output_type).expect("aggregate output column cast"),
+    };
     let field = Field::new(field.name(), output_type.clone(), field.is_nullable());
-    (field, casted)
+    (field, converted)
 }
 
 /// The shared, read-side context the merge + output phase resolves through — the

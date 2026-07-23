@@ -5,13 +5,18 @@ use std::io::Write;
 
 // LogicalType is a thrift union where most variants are empty structs. We model
 // the ones whose arrow type pivot decodes natively: String, Integer, Date,
-// Timestamp, and Variant; everything else is `Other`.
+// Timestamp, Decimal, and Variant; everything else is `Other`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LogicalType {
     String,
     Integer {
         bit_width: i8,
         is_signed: bool,
+    },
+    /// `DECIMAL`: a fixed-point number of the given precision and scale.
+    Decimal {
+        scale: i32,
+        precision: i32,
     },
     /// `DATE`: an `INT32` of days since the epoch.
     Date,
@@ -60,6 +65,33 @@ impl<'a, R: ThriftCompactInputProtocol<'a>> ReadThrift<'a, R> for LogicalType {
                     bit_width,
                     is_signed,
                 }
+            }
+            // DECIMAL: struct { 1: i32 scale, 2: i32 precision }, both required.
+            5 => {
+                let mut scale: Option<i32> = None;
+                let mut precision: Option<i32> = None;
+                let mut last_field_id = 0i16;
+                loop {
+                    let fi = prot.read_field_begin(last_field_id)?;
+                    if fi.field_type == FieldType::Stop {
+                        break;
+                    }
+                    match fi.id {
+                        1 => scale = Some(prot.read_i32()?),
+                        2 => precision = Some(prot.read_i32()?),
+                        _ => prot.skip(fi.field_type)?,
+                    }
+                    last_field_id = fi.id;
+                }
+                let Some(scale) = scale else {
+                    return Err(general_err!("DecimalType is missing required field scale"));
+                };
+                let Some(precision) = precision else {
+                    return Err(general_err!(
+                        "DecimalType is missing required field precision"
+                    ));
+                };
+                LogicalType::Decimal { scale, precision }
             }
             // DATE: empty struct
             6 => {
@@ -123,6 +155,14 @@ impl WriteThrift for LogicalType {
 
     fn write_thrift<W: Write>(&self, writer: &mut ThriftCompactOutputProtocol<W>) -> Result<()> {
         match self {
+            // DECIMAL union member: field 5, a DecimalType struct with required
+            // scale (field 1) and precision (field 2).
+            LogicalType::Decimal { scale, precision } => {
+                writer.write_field_begin(FieldType::Struct, 5, 0)?;
+                let last_field_id = scale.write_thrift_field(writer, 1, 0)?;
+                precision.write_thrift_field(writer, 2, last_field_id)?;
+                writer.write_struct_end()?;
+            }
             // VARIANT union member: field 16, an (empty) VariantType struct.
             LogicalType::Variant => {
                 writer.write_empty_struct(16, 0)?;
@@ -149,10 +189,13 @@ impl WriteThriftField for LogicalType {
 thrift_struct!(
     pub struct SchemaElement {
         1: optional i32 physical_type;
+        2: optional i32 type_length;
         3: optional i32 repetition_type;
         4: required string name;
         5: optional i32 num_children;
         6: optional i32 converted_type;
+        7: optional i32 scale;
+        8: optional i32 precision;
         10: optional LogicalType logical_type;
     }
 );
@@ -220,3 +263,47 @@ thrift_struct!(
         6: optional string created_by;
     }
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parquet_thrift::tests::test_roundtrip;
+
+    #[test]
+    fn decimal_schema_element_round_trips() {
+        let element = SchemaElement {
+            physical_type: Some(7),
+            type_length: Some(16),
+            repetition_type: Some(1),
+            name: "amount".to_string(),
+            num_children: None,
+            converted_type: Some(5),
+            scale: Some(2),
+            precision: Some(38),
+            logical_type: Some(LogicalType::Decimal {
+                scale: 2,
+                precision: 38,
+            }),
+        };
+
+        test_roundtrip(element);
+    }
+
+    #[test]
+    fn decimal_union_member_parses_to_decimal_variant() {
+        // A DECIMAL union member as encoded by other writers: struct field 5
+        // holding scale 2 (field 1) and precision 38 (field 2) as zig-zag i32s.
+        let bytes = [0x5c, 0x15, 0x04, 0x15, 0x4c, 0x00, 0x00];
+        let mut prot = ThriftSliceInputProtocol::new(&bytes);
+
+        let logical_type = LogicalType::read_thrift(&mut prot).unwrap();
+
+        assert_eq!(
+            logical_type,
+            LogicalType::Decimal {
+                scale: 2,
+                precision: 38
+            }
+        );
+    }
+}

@@ -23,10 +23,37 @@ use crate::catalog_provider::{
 #[cxx::bridge]
 pub mod ffi {
     /// Column definition for FFI, carrying the type as a `u8` discriminant
-    /// because CXX cannot pass Rust enums across the bridge.
+    /// because CXX cannot pass Rust enums across the bridge. When the type is
+    /// `DECIMAL` the width and scale complete it; they are zero otherwise.
     struct DuckDBColumn {
         pub name: String,
         pub duckdb_logical_type_id: u8,
+        pub decimal_width: u8,
+        pub decimal_scale: u8,
+    }
+
+    /// A DuckDB `LogicalType` read off a bound plan object: the
+    /// `LogicalTypeId` discriminant, plus the width and scale that complete a
+    /// `DECIMAL` (zero for every other id, which the id alone fully describes).
+    struct BridgeLogicalType {
+        pub id: u8,
+        pub decimal_width: u8,
+        pub decimal_scale: u8,
+    }
+
+    /// A `DECIMAL` constant: the unscaled 128-bit integer split into halves
+    /// (CXX has no 128-bit type), plus the value's width and scale.
+    struct BridgeDecimalValue {
+        pub hi: i64,
+        pub lo: u64,
+        pub width: u8,
+        pub scale: u8,
+    }
+
+    /// A `HUGEINT` constant split into halves (CXX has no 128-bit type).
+    struct BridgeHugeint {
+        pub hi: i64,
+        pub lo: u64,
     }
 
     /// Result of a catalog table lookup, allowing C++ to inspect the outcome.
@@ -164,9 +191,9 @@ pub mod ffi {
         /// columns through). Each entry is a child-output column index to keep.
         fn lo_filter_projection_map_count(op: &LogicalOperator) -> usize;
         fn lo_filter_projection_map_index(op: &LogicalOperator, index: usize) -> usize;
-        /// The `LogicalTypeId` of the filter's `index`th output column, paired
-        /// with `lo_filter_projection_map_index` for the replay projection.
-        fn lo_filter_type_id(op: &LogicalOperator, index: usize) -> u8;
+        /// The type of the filter's `index`th output column, paired with
+        /// `lo_filter_projection_map_index` for the replay projection.
+        fn lo_filter_type_id(op: &LogicalOperator, index: usize) -> BridgeLogicalType;
 
         // ---- OrderBy ----
         fn lo_orderby_count(op: &LogicalOperator) -> usize;
@@ -210,10 +237,10 @@ pub mod ffi {
         /// Called once per base-table scan during the walk.
         fn lo_get_take_table(op: &LogicalOperator) -> Box<OptionalTableWrapper>;
         /// The scan's projected output columns (respecting `projection_ids`),
-        /// each a storage column index + its `LogicalTypeId`.
+        /// each a storage column index + its type.
         fn lo_get_output_count(op: &LogicalOperator) -> usize;
         fn lo_get_output_column(op: &LogicalOperator, index: usize) -> usize;
-        fn lo_get_output_type(op: &LogicalOperator, index: usize) -> u8;
+        fn lo_get_output_type(op: &LogicalOperator, index: usize) -> BridgeLogicalType;
         /// The static `col op const` predicates DuckDB pushed into `table_filters`,
         /// rebuilt as expressions (owned by the returned list). Empty list when
         /// there are none.
@@ -234,7 +261,7 @@ pub mod ffi {
         fn lo_create_table_name(op: &LogicalOperator) -> String;
         fn lo_create_column_count(op: &LogicalOperator) -> usize;
         fn lo_create_column_name(op: &LogicalOperator, index: usize) -> String;
-        fn lo_create_column_type(op: &LogicalOperator, index: usize) -> u8;
+        fn lo_create_column_type(op: &LogicalOperator, index: usize) -> BridgeLogicalType;
         fn lo_create_option_count(op: &LogicalOperator) -> usize;
         fn lo_create_option_key(op: &LogicalOperator, index: usize) -> String;
         fn lo_create_option_value(op: &LogicalOperator, index: usize) -> String;
@@ -266,8 +293,8 @@ pub mod ffi {
         // ---- Expression: shared ----
         /// DuckDB `ExpressionType` discriminant.
         fn expr_type(expr: &Expression) -> u8;
-        /// `LogicalTypeId` of the expression's result.
-        fn expr_return_type(expr: &Expression) -> u8;
+        /// The type of the expression's result.
+        fn expr_return_type(expr: &Expression) -> BridgeLogicalType;
         fn expr_has_alias(expr: &Expression) -> bool;
         fn expr_alias(expr: &Expression) -> String;
 
@@ -304,6 +331,8 @@ pub mod ffi {
         fn value_f32(v: &Value) -> f32;
         fn value_f64(v: &Value) -> f64;
         fn value_string(v: &Value) -> String;
+        fn value_decimal(v: &Value) -> BridgeDecimalValue;
+        fn value_hugeint(v: &Value) -> BridgeHugeint;
         fn value_date(v: &Value) -> i32;
         fn value_timestamp(v: &Value) -> i64;
         fn value_interval_months(v: &Value) -> i32;

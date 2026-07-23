@@ -285,6 +285,115 @@ async fn grouped_float_aggregates(#[future] conn: Conn) {
     assert_eq!(parse(&rows[1][1]), 4.0); // SUM(d) group 2
 }
 
+/// A DECIMAL column scans, filters against a decimal constant, and renders
+/// scale-correct NUMERIC text on the wire. The file is written by arrow-rs,
+/// which stores the decimal as FIXED_LEN_BYTE_ARRAY.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn decimal_scan_filter_and_wire_format(#[future] conn: Conn) {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "v",
+        DataType::Decimal128(10, 2),
+        false,
+    )]));
+    let v: ArrayRef = Arc::new(
+        arrow_array::Decimal128Array::from(vec![1234i128, -500, 1050])
+            .with_precision_and_scale(10, 2)
+            .unwrap(),
+    );
+    let dir = write_parquet(&RecordBatch::try_new(schema, vec![v]).unwrap());
+    conn.simple_query(&format!(
+        "CREATE TABLE prices (v DECIMAL(10,2)) WITH (path = '{}')",
+        dir.path().to_str().unwrap()
+    ))
+    .await
+    .unwrap();
+
+    let rows = select_rows(&conn, "SELECT v FROM prices WHERE v > 10.00 ORDER BY v").await;
+
+    assert_eq!(
+        rows,
+        vec![vec![Some("10.50".into())], vec![Some("12.34".into())]]
+    );
+}
+
+/// Global SUM/MIN/MAX over a DECIMAL column keep the exact fixed-point values
+/// and the bound output scale; AVG comes back as a double.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn decimal_aggregates(#[future] conn: Conn) {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "v",
+        DataType::Decimal128(10, 2),
+        false,
+    )]));
+    let v: ArrayRef = Arc::new(
+        arrow_array::Decimal128Array::from(vec![1234i128, -500, 1050])
+            .with_precision_and_scale(10, 2)
+            .unwrap(),
+    );
+    let dir = write_parquet(&RecordBatch::try_new(schema, vec![v]).unwrap());
+    conn.simple_query(&format!(
+        "CREATE TABLE decimal_metrics (v DECIMAL(10,2)) WITH (path = '{}')",
+        dir.path().to_str().unwrap()
+    ))
+    .await
+    .unwrap();
+
+    let rows = select_rows(
+        &conn,
+        "SELECT SUM(v), MIN(v), MAX(v), AVG(v) FROM decimal_metrics",
+    )
+    .await;
+
+    assert_eq!(rows[0][0].as_deref(), Some("17.84"));
+    assert_eq!(rows[0][1].as_deref(), Some("-5.00"));
+    assert_eq!(rows[0][2].as_deref(), Some("12.34"));
+    let avg: f64 = rows[0][3].as_deref().unwrap().parse().unwrap();
+    assert!((avg - 17.84 / 3.0).abs() < 1e-9);
+}
+
+/// GROUP BY a DECIMAL key: groups form on the exact fixed-point value and the
+/// key column renders at its declared scale.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn group_by_decimal_key(#[future] conn: Conn) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("g", DataType::Decimal128(4, 1), false),
+        Field::new("x", DataType::Int64, false),
+    ]));
+    let g: ArrayRef = Arc::new(
+        arrow_array::Decimal128Array::from(vec![15i128, 15, 20])
+            .with_precision_and_scale(4, 1)
+            .unwrap(),
+    );
+    let x: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2, 3]));
+    let dir = write_parquet(&RecordBatch::try_new(schema, vec![g, x]).unwrap());
+    conn.simple_query(&format!(
+        "CREATE TABLE decimal_groups (g DECIMAL(4,1), x BIGINT) WITH (path = '{}')",
+        dir.path().to_str().unwrap()
+    ))
+    .await
+    .unwrap();
+
+    let rows = select_rows(
+        &conn,
+        "SELECT g, SUM(x) FROM decimal_groups GROUP BY g ORDER BY g",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1.5".into()), Some("3".into())],
+            vec![Some("2.0".into()), Some("3".into())],
+        ]
+    );
+}
+
 /// An unfiltered global COUNT(*) is answered from the sum of parquet row-group
 /// row counts, with no scan.
 #[rstest]
