@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+# `Catalog::commit_transaction` is async on a dyn-compatible trait.
+async-trait = "0.1"
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-ord = { workspace = true }

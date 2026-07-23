@@ -163,9 +163,9 @@ pub(crate) async fn execute_sql(
     .await;
     match result {
         Ok(batches) => {
-            tokio::task::spawn_blocking(move || catalog.commit_transaction(transaction))
+            catalog
+                .commit_transaction(transaction)
                 .await
-                .map_err(|e| e.to_string())?
                 .map_err(|e| e.to_string())?;
             Ok(batches)
         }
@@ -190,8 +190,6 @@ enum Error {
     WorkerPanic(JoinError),
     #[error("waiter thread panicked: {0}")]
     PlannerPanic(JoinError),
-    #[error("transaction commit thread panicked: {0}")]
-    CommitPanic(JoinError),
     #[error("invalid INSERT row-count result: {0}")]
     InvalidInsertResult(String),
 }
@@ -489,10 +487,7 @@ impl PivotQueryHandler {
         .await;
         match result {
             Ok(outcome) => {
-                let catalog = self.catalog.clone();
-                tokio::task::spawn_blocking(move || catalog.commit_transaction(transaction))
-                    .await
-                    .map_err(Error::CommitPanic)??;
+                self.catalog.commit_transaction(transaction).await?;
                 Ok(outcome)
             }
             Err(error) => {

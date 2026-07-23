@@ -20,12 +20,26 @@ use catalog::{ParquetCatalog, PartitionEqFilter, TableBinding};
 use common::current_parquet;
 use planner::Planner;
 use planner::catalog::{
-    Catalog as PlannerCatalog, Column, CreateTableRequest, Result as CatalogResult, Table,
+    Catalog as PlannerCatalog, CatalogTransaction, Column, CreateTableRequest,
+    Result as CatalogResult, Table,
 };
 use planner::expression::{
     Compare, CompareType, Expression, Function, Ref, TableFilter, VariantGet,
 };
 use planner::types::Type;
+
+/// Drive a transaction commit to completion. A commit that wrote files hops
+/// to the blocking pool, so it needs a Tokio runtime to run under.
+fn commit_transaction_blocking(
+    catalog: &dyn PlannerCatalog,
+    transaction: Arc<dyn CatalogTransaction>,
+) {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(catalog.commit_transaction(transaction))
+        .unwrap();
+}
 
 /// A shared single-worker dispatch pool for the whole test binary, handed to
 /// each `ParquetCatalog` so `create_table` can read footers once (via the
@@ -390,7 +404,7 @@ fn run_sql(catalog: &Arc<ParquetCatalog>, sql: &str) -> Vec<RecordBatch> {
         .unwrap()
         .collect()
         .unwrap();
-    planner_catalog.commit_transaction(transaction).unwrap();
+    commit_transaction_blocking(planner_catalog.as_ref(), transaction);
     batches
 }
 
@@ -409,7 +423,7 @@ fn run_sql_with_stats(
         .unwrap()
         .collect_with_stats()
         .unwrap();
-    planner_catalog.commit_transaction(transaction).unwrap();
+    commit_transaction_blocking(planner_catalog.as_ref(), transaction);
     result
 }
 
@@ -515,7 +529,7 @@ fn insert_files_publish_only_when_transaction_commits() {
     let before_commit = run_sql(&catalog, "SELECT COUNT(*) FROM pending_insert");
     assert_eq!(common::extract_count(&before_commit), 0);
 
-    planner_catalog.commit_transaction(transaction).unwrap();
+    commit_transaction_blocking(planner_catalog.as_ref(), transaction);
     let after_commit = run_sql(&catalog, "SELECT COUNT(*) FROM pending_insert");
     assert_eq!(common::extract_count(&after_commit), 2);
 
