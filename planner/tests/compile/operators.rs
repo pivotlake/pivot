@@ -1,5 +1,7 @@
 use std::sync::{Arc, Mutex};
 
+use arrow_array::cast::AsArray;
+use arrow_array::types::Int32Type;
 use arrow_array::{
     ArrayRef, Date32Array, Float64Array, Int16Array, Int32Array, Int64Array, RecordBatch,
     StringViewArray,
@@ -366,6 +368,36 @@ fn order_by_descending(mut testing_planner: TestingPlanner) {
         .unwrap()
         .clone()
     );
+}
+
+#[rstest]
+fn order_by_without_limit_sorts_every_row(mut testing_planner: TestingPlanner) {
+    let row_count = 20_000;
+    let reversed: Vec<i32> = (0..row_count).rev().collect();
+    testing_planner.add_table("reversed_table", &[("a", Type::Int32, int_col(reversed))]);
+
+    let results = testing_planner
+        .plan("SELECT a FROM reversed_table ORDER BY a ASC")
+        .unwrap()
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let sorted: Vec<i32> = results
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_primitive::<Int32Type>()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(sorted, (0..row_count).collect::<Vec<_>>());
 }
 
 #[rstest]

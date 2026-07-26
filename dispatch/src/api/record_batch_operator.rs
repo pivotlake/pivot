@@ -483,6 +483,23 @@ impl RecordBatchOperatorSpec {
         self.order_by_limit_offset(order_by, limit, 0, None)
     }
 
+    /// Sort by the given columns, keeping every row (SQL `ORDER BY` with no
+    /// `LIMIT`).
+    ///
+    /// Workers forward their input to a single collector, which sorts the whole
+    /// result at once. There is no window to prune rows against, so this holds
+    /// the entire input in memory.
+    pub fn order_by(self, order_by: Vec<OrderBy>) -> Self {
+        let worker_count = self.worker_count();
+        self.unary(OrderByLimitFactory::create_for_workers(
+            order_by,
+            None,
+            0,
+            worker_count,
+            None,
+        ))
+    }
+
     /// Like [`order_by_limit`](Self::order_by_limit) but skips the first
     /// `offset` rows of the globally sorted result (SQL `LIMIT … OFFSET`), and
     /// optionally publishes the running boundary into a shared
@@ -497,7 +514,7 @@ impl RecordBatchOperatorSpec {
         let worker_count = self.worker_count();
         self.unary(OrderByLimitFactory::create_for_workers(
             order_by,
-            limit,
+            Some(limit),
             offset,
             worker_count,
             dynamic_filter,

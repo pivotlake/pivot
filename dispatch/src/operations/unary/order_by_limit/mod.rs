@@ -1,21 +1,33 @@
-//! ORDER BY … LIMIT k operator.
+//! ORDER BY … LIMIT k operator, and standalone ORDER BY.
 //!
-//! A pipeline breaker that keeps only the top-k rows per sort key across all
-//! input batches, where k = `limit + offset` ("fetch").
+//! A pipeline breaker that sorts its input by one or more keys. With a `limit`
+//! it keeps only the top-k rows across all input batches, where k =
+//! `limit + offset` ("fetch"); without one (`limit: None`, a standalone SQL
+//! `ORDER BY`) it keeps every row.
 //!
 //! ## Consume
 //!
-//! Each worker merges every incoming batch into a single running top-k
-//! ([`running_top_k`](OrderByLimit::running_top_k)), so it holds at most `fetch`
-//! rows at a time. On finalization it sends that to a shared mpsc channel.
+//! With a limit, each worker merges every incoming batch into a single running
+//! top-k ([`running_top_k`](OrderByLimit::running_top_k)), so it holds at most
+//! `fetch` rows at a time. On finalization it sends that to a shared mpsc
+//! channel.
+//!
+//! Without one there is no window to shrink the input against: every row is
+//! part of the result, so a worker forwards each batch to that same channel
+//! as it arrives and never sorts anything itself. Sorting per batch would only
+//! be redone by the global sort below.
 //!
 //! ## Output
 //!
-//! The worker holding the receiver concatenates the per-worker top-ks and does
-//! the final global top-k sort, emitting one [`RecordBatch`] of at most `limit`
-//! rows in sorted order (after skipping `offset`).
+//! The worker holding the receiver concatenates what it collected and does the
+//! final global sort, emitting one [`RecordBatch`] in sorted order: the whole
+//! input for a standalone ORDER BY, or at most `limit` rows (after skipping
+//! `offset`) for a top-k.
 //!
 //! ## Rejecting batches before sorting
+//!
+//! Everything below is about the top-k mode: a standalone ORDER BY has no
+//! window, so no row can ever be rejected.
 //!
 //! Once a full window has been witnessed we test each new batch against its
 //! fetch-th-best *leading* key, so rows that can't reach the global top-k are
@@ -223,15 +235,16 @@ impl OrderBy {
     }
 }
 
-/// Merge multiple already-sorted top-k batches into a single global top-k.
+/// Merge multiple batches into a single globally sorted result.
 ///
 /// Concatenates all batches, then sorts, skips `skip` rows, and keeps the next
-/// `fetch - skip` rows. Local stages pass `skip = 0`; the final global stage
-/// passes `skip = offset` to implement `LIMIT … OFFSET`.
+/// `fetch - skip` rows (all remaining rows when `fetch` is `None`). Local stages
+/// pass `skip = 0`; the final global stage passes `skip = offset` to implement
+/// `LIMIT … OFFSET`.
 fn get_top_k_from_top_ks(
     batches: Vec<RecordBatch>,
     order_by: &[OrderBy],
-    fetch: usize,
+    fetch: Option<usize>,
     skip: usize,
 ) -> Result<RecordBatch> {
     if batches.is_empty() {
@@ -244,13 +257,14 @@ fn get_top_k_from_top_ks(
     get_top_k_from_single(&final_pool, order_by, fetch, skip)
 }
 
-/// Sort a single batch by `order_by` keys, take the first `fetch` rows, then
-/// drop the leading `skip` of them (so the result has at most `fetch - skip`
-/// rows). `skip` is non-zero only at the final global stage, to honour OFFSET.
+/// Sort a single batch by `order_by` keys, take the first `fetch` rows (all of
+/// them when `fetch` is `None`), then drop the leading `skip` of them (so the
+/// result has at most `fetch - skip` rows). `skip` is non-zero only at the final
+/// global stage, to honour OFFSET.
 fn get_top_k_from_single(
     batch: &RecordBatch,
     order_by: &[OrderBy],
-    fetch: usize,
+    fetch: Option<usize>,
     skip: usize,
 ) -> Result<RecordBatch> {
     // No sort keys → a plain LIMIT/OFFSET: any rows satisfy it, so keep the
@@ -259,7 +273,7 @@ fn get_top_k_from_single(
     // column list anyway). Downstream consumers handle logically-sliced arrays
     // (e.g. the materializer walks `RunEndBuffer::sliced_values()`).
     if order_by.is_empty() {
-        let end = batch.num_rows().min(fetch);
+        let end = fetch.map_or(batch.num_rows(), |fetch| batch.num_rows().min(fetch));
         let skip = skip.min(end);
         return Ok(batch.slice(skip, end - skip));
     }
@@ -278,7 +292,7 @@ fn get_top_k_from_single(
         })
         .collect();
 
-    let indices = lexsort_to_indices(&sort_columns, Some(fetch))?;
+    let indices = lexsort_to_indices(&sort_columns, fetch)?;
     let len = indices.len();
     let skip = skip.min(len);
     let kept = indices.slice(skip, len - skip);
@@ -296,9 +310,12 @@ fn get_top_k_from_single(
 ///
 /// Merges each incoming batch into one running top-k, rejecting batches that
 /// can't reach it once the window is full (see the module docs), then sends the
-/// running top-k to the shared channel on finalization.
+/// running top-k to the shared channel on finalization. Without a limit it
+/// keeps nothing back and forwards every batch to that channel instead.
 pub struct OrderByLimit {
-    limit: usize,
+    /// Rows to keep after the sort, or `None` for a standalone ORDER BY that
+    /// keeps all of them.
+    limit: Option<usize>,
     offset: usize,
     order_by: Vec<OrderBy>,
     sender: mpsc::Sender<RecordBatch>,
@@ -328,14 +345,18 @@ pub struct OrderByLimit {
 impl OrderByLimit {
     pub fn new(
         order_by: Vec<OrderBy>,
-        limit: usize,
+        limit: Option<usize>,
         offset: usize,
         sender: mpsc::Sender<RecordBatch>,
         receiver: Option<Receiver<RecordBatch>>,
         dynamic_filter: Option<Arc<DynamicFilterSlot>>,
     ) -> Self {
+        // A standalone ORDER BY keeps every row, so it never witnesses a full
+        // window and has no boundary to publish.
+        let dynamic_filter = dynamic_filter.filter(|_| limit.is_some());
         let nulls_last_leading = order_by.first().is_some_and(|leading| !leading.nulls_first);
-        let pool = nulls_last_leading && (1..=SHARED_WINDOW_MAX_FETCH).contains(&(limit + offset));
+        let pool = nulls_last_leading
+            && limit.is_some_and(|limit| (1..=SHARED_WINDOW_MAX_FETCH).contains(&(limit + offset)));
         let (pooled_slot, publish_slot) = match dynamic_filter {
             Some(slot) if pool => (Some(slot), None),
             other => (None, other),
@@ -386,7 +407,7 @@ impl OrderByLimit {
             return Ok(Some(get_top_k_from_single(
                 batch,
                 &self.order_by,
-                fetch,
+                Some(fetch),
                 0,
             )?));
         };
@@ -413,7 +434,7 @@ impl OrderByLimit {
         Ok(Some(get_top_k_from_single(
             batch,
             &self.order_by,
-            fetch.min(n_keep),
+            Some(fetch.min(n_keep)),
             0,
         )?))
     }
@@ -424,16 +445,16 @@ impl OrderByLimit {
     /// leading key); small fetches pool per-batch keys through the slot's
     /// arming window in `consume` instead.
     ///
-    /// The window keeps `limit + offset` rows, so the last (worst) of them is a
-    /// valid bound on the *global* boundary: this worker alone already witnesses
-    /// that many rows at least as good as it. We prune on the leading key only,
-    /// so multi-key sorts publish `order_by[0]`'s value (ties on it are resolved
-    /// by keeping the row group - see the consumer's comparison).
-    fn publish_boundary(&self, batch_top_k: &RecordBatch) {
+    /// The window keeps `window` (= `limit + offset`) rows, so the last (worst)
+    /// of them is a valid bound on the *global* boundary: this worker alone
+    /// already witnesses that many rows at least as good as it. We prune on the
+    /// leading key only, so multi-key sorts publish `order_by[0]`'s value (ties
+    /// on it are resolved by keeping the row group - see the consumer's
+    /// comparison).
+    fn publish_boundary(&self, batch_top_k: &RecordBatch, window: usize) {
         let Some(slot) = &self.publish_slot else {
             return;
         };
-        let window = self.limit + self.offset;
         if batch_top_k.num_rows() < window || self.order_by.is_empty() {
             return;
         }
@@ -476,10 +497,18 @@ impl Consumer<RecordBatch, RecordBatch> for OrderByLimit {
         _sender: &mut S,
     ) -> unary::Result<()> {
         debug!("Received batch of length {:?}", batch.num_rows());
+        let Some(limit) = self.limit else {
+            // Standalone ORDER BY: every row is part of the result, so there is
+            // no window to prune or merge against. Hand the batch to the
+            // collector as it is, and let the final global sort do the work
+            // (see the module docs).
+            self.sender.send(batch).expect("Receiver dropped!");
+            return Ok(());
+        };
         // Local stages keep `limit + offset` candidates (skip = 0); only the
         // final global merge skips `offset`, since which rows fall in the
         // offset window can only be decided once all workers' tops are merged.
-        let fetch = self.limit + self.offset;
+        let fetch = limit + self.offset;
         if fetch == 0 {
             // LIMIT 0 keeps nothing; consuming would only build empty windows.
             return Ok(());
@@ -528,12 +557,14 @@ impl Consumer<RecordBatch, RecordBatch> for OrderByLimit {
         // batch's top-k, exactly as a plain per-batch top-k would be.
         let merged = match self.running_top_k.take() {
             None => candidates,
-            Some(prev) => get_top_k_from_top_ks(vec![prev, candidates], &self.order_by, fetch, 0)?,
+            Some(prev) => {
+                get_top_k_from_top_ks(vec![prev, candidates], &self.order_by, Some(fetch), 0)?
+            }
         };
 
         if self.pooled_slot.is_none() {
             // Without a pooled slot, publish this worker's full-window boundary.
-            self.publish_boundary(&merged);
+            self.publish_boundary(&merged, fetch);
             // Refresh the cached local reject boundary now the top-k has
             // changed (a pooled slot reads the tighter global boundary per
             // batch instead). Only surviving batches pay this.
@@ -588,39 +619,41 @@ impl Consumer<RecordBatch, RecordBatch> for OrderByLimit {
     }
 }
 
-/// Output phase: collects per-worker top-k batches from the channel, then
-/// performs the final global top-k sort once all senders have disconnected.
+/// Output phase: collects the other workers' batches from the channel, then
+/// performs the final global sort once all senders have disconnected.
 pub struct OrderByLimitOutputter {
     rx: Receiver<RecordBatch>,
     batches: Vec<RecordBatch>,
     order_by: Vec<OrderBy>,
-    limit: usize,
+    limit: Option<usize>,
     offset: usize,
 }
 
 impl Outputter<RecordBatch> for OrderByLimitOutputter {
     fn output<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> unary::Result<bool> {
-        match self.rx.try_recv() {
-            Ok(c) => {
-                self.batches.push(c);
-                Ok(false)
-            }
-            Err(TryRecvError::Empty) => Ok(false),
-            Err(TryRecvError::Disconnected) => {
-                if !self.batches.is_empty() {
-                    debug!("from {:?} batches", self.batches.len());
-                    let start = Instant::now();
-                    sender.send(get_top_k_from_top_ks(
-                        mem::take(&mut self.batches),
-                        &self.order_by,
-                        self.limit + self.offset,
-                        self.offset,
-                    )?)?;
-                    debug!("took {:?}", start.elapsed());
-                }
-                Ok(true)
+        // Drain everything queued in one go: a top-k sends one batch per worker,
+        // but a standalone ORDER BY sends every batch it consumed, and taking
+        // one per call would bounce through the worker loop for each of them.
+        loop {
+            match self.rx.try_recv() {
+                Ok(c) => self.batches.push(c),
+                Err(TryRecvError::Empty) => return Ok(false),
+                Err(TryRecvError::Disconnected) => break,
             }
         }
+
+        if !self.batches.is_empty() {
+            debug!("from {:?} batches", self.batches.len());
+            let start = Instant::now();
+            sender.send(get_top_k_from_top_ks(
+                mem::take(&mut self.batches),
+                &self.order_by,
+                self.limit.map(|limit| limit + self.offset),
+                self.offset,
+            )?)?;
+            debug!("took {:?}", start.elapsed());
+        }
+        Ok(true)
     }
 }
 
@@ -672,7 +705,7 @@ mod tests {
         // far, which is at least as tight as any single batch's boundary.
         let mut op = OrderByLimit::new(
             vec![OrderBy::new(0, true, false)],
-            2,
+            Some(2),
             0,
             tx,
             None,
@@ -696,7 +729,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let mut op = OrderByLimit::new(
             vec![OrderBy::new(0, true, false)],
-            3,
+            Some(3),
             0,
             tx,
             None,
@@ -715,8 +748,9 @@ mod tests {
         let slot = Arc::new(DynamicFilterSlot::new());
         let (tx, _rx) = mpsc::channel();
         let order_by = || vec![OrderBy::new(0, false, false)];
-        let mut first = OrderByLimit::new(order_by(), 3, 0, tx.clone(), None, Some(slot.clone()));
-        let mut second = OrderByLimit::new(order_by(), 3, 0, tx, None, Some(slot.clone()));
+        let mut first =
+            OrderByLimit::new(order_by(), Some(3), 0, tx.clone(), None, Some(slot.clone()));
+        let mut second = OrderByLimit::new(order_by(), Some(3), 0, tx, None, Some(slot.clone()));
         let mut sink = CollectSender::new();
 
         // Neither worker alone sees 3 rows, but the pooled window does.
@@ -737,7 +771,7 @@ mod tests {
         let nullable = RecordBatch::try_new(schema, vec![col]).unwrap();
         let mut op = OrderByLimit::new(
             vec![OrderBy::new(0, false, false)],
-            2,
+            Some(2),
             0,
             tx,
             None,
@@ -762,7 +796,7 @@ mod tests {
         let fetch = SHARED_WINDOW_MAX_FETCH + 1;
         let mut op = OrderByLimit::new(
             vec![OrderBy::new(0, false, false)],
-            fetch,
+            Some(fetch),
             0,
             tx,
             None,
@@ -797,7 +831,7 @@ mod tests {
         let slot = Arc::new(DynamicFilterSlot::new());
         let (tx, _rx) = mpsc::channel();
         let order_by = vec![OrderBy::new(0, false, false), OrderBy::new(1, false, false)];
-        let mut op = OrderByLimit::new(order_by, 2, 0, tx, None, Some(slot.clone()));
+        let mut op = OrderByLimit::new(order_by, Some(2), 0, tx, None, Some(slot.clone()));
         let mut sink = CollectSender::new();
 
         op.consume(two_key_batch(&[(5, 2), (1, 9), (3, 4)]), &mut sink)
@@ -812,7 +846,7 @@ mod tests {
         let slot = Arc::new(DynamicFilterSlot::new());
         let (tx, rx) = mpsc::channel();
         let order_by = vec![OrderBy::new(0, false, false), OrderBy::new(1, false, false)];
-        let op = OrderByLimit::new(order_by, 2, 0, tx, Some(rx), Some(slot.clone()));
+        let op = OrderByLimit::new(order_by, Some(2), 0, tx, Some(rx), Some(slot.clone()));
 
         // The first batch arms the boundary at leading key 3. The second's
         // (3, 1) ties the boundary on the leading key but wins on the second,
@@ -832,7 +866,7 @@ mod tests {
 
     fn run_order_by(
         worker_batches: Vec<Vec<RecordBatch>>,
-        limit: usize,
+        limit: Option<usize>,
         descending: bool,
     ) -> CollectSender {
         let worker_count = worker_batches.len();
@@ -858,7 +892,7 @@ mod tests {
 
     #[test]
     fn top_3_ascending() {
-        let sender = run_order_by(vec![vec![batch(&[5, 3, 1, 4, 2])]], 3, false);
+        let sender = run_order_by(vec![vec![batch(&[5, 3, 1, 4, 2])]], Some(3), false);
 
         assert_eq!(sender.total_rows(), 3);
         assert_eq!(sender.i32_column(0), vec![1, 2, 3]);
@@ -866,7 +900,7 @@ mod tests {
 
     #[test]
     fn top_3_descending() {
-        let sender = run_order_by(vec![vec![batch(&[5, 3, 1, 4, 2])]], 3, true);
+        let sender = run_order_by(vec![vec![batch(&[5, 3, 1, 4, 2])]], Some(3), true);
 
         assert_eq!(sender.total_rows(), 3);
         assert_eq!(sender.i32_column(0), vec![5, 4, 3]);
@@ -874,7 +908,7 @@ mod tests {
 
     #[test]
     fn limit_larger_than_input() {
-        let sender = run_order_by(vec![vec![batch(&[3, 1, 2])]], 100, false);
+        let sender = run_order_by(vec![vec![batch(&[3, 1, 2])]], Some(100), false);
 
         assert_eq!(sender.total_rows(), 3);
         assert_eq!(sender.i32_column(0), vec![1, 2, 3]);
@@ -884,7 +918,7 @@ mod tests {
     fn multiple_batches_single_worker() {
         let sender = run_order_by(
             vec![vec![batch(&[10, 20]), batch(&[5, 15]), batch(&[1, 25])]],
-            3,
+            Some(3),
             false,
         );
 
@@ -896,7 +930,7 @@ mod tests {
     fn two_workers_ascending() {
         let sender = run_order_by(
             vec![vec![batch(&[10, 30, 50])], vec![batch(&[20, 40, 60])]],
-            4,
+            Some(4),
             false,
         );
 
@@ -908,7 +942,7 @@ mod tests {
     fn two_workers_descending() {
         let sender = run_order_by(
             vec![vec![batch(&[10, 30, 50])], vec![batch(&[20, 40, 60])]],
-            4,
+            Some(4),
             true,
         );
 
@@ -918,15 +952,38 @@ mod tests {
 
     #[test]
     fn limit_one() {
-        let sender = run_order_by(vec![vec![batch(&[5, 3, 1, 4, 2])]], 1, false);
+        let sender = run_order_by(vec![vec![batch(&[5, 3, 1, 4, 2])]], Some(1), false);
 
         assert_eq!(sender.total_rows(), 1);
         assert_eq!(sender.i32_column(0), vec![1]);
     }
 
     #[test]
+    fn no_limit_sorts_every_row() {
+        let sender = run_order_by(vec![vec![batch(&[5, 3, 1, 4, 2])]], None, false);
+
+        assert_eq!(sender.total_rows(), 5);
+        assert_eq!(sender.i32_column(0), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn no_limit_sorts_every_row_across_workers_and_batches() {
+        let sender = run_order_by(
+            vec![
+                vec![batch(&[10, 30]), batch(&[50, 70])],
+                vec![batch(&[20, 60]), batch(&[40, 80])],
+            ],
+            None,
+            true,
+        );
+
+        assert_eq!(sender.total_rows(), 8);
+        assert_eq!(sender.i32_column(0), vec![80, 70, 60, 50, 40, 30, 20, 10]);
+    }
+
+    #[test]
     fn duplicates_preserved() {
-        let sender = run_order_by(vec![vec![batch(&[3, 1, 1, 2, 2])]], 4, false);
+        let sender = run_order_by(vec![vec![batch(&[3, 1, 1, 2, 2])]], Some(4), false);
 
         assert_eq!(sender.total_rows(), 4);
         assert_eq!(sender.i32_column(0), vec![1, 1, 2, 2]);
@@ -950,7 +1007,7 @@ mod tests {
         // Freshly built, nothing consumed -> `running_top_k` is None.
         let obl = OrderByLimit::new(
             vec![OrderBy::new(0, false, false)],
-            10,
+            Some(10),
             0,
             tx,
             Some(rx),

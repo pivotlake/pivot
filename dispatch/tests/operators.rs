@@ -186,6 +186,50 @@ fn order_by_descending_with_limit() {
 }
 
 #[test]
+fn order_by_without_limit_sorts_every_row() {
+    let dispatch = dispatch(1);
+    let batch = strings_and_ints(&["e", "a", "d", "b", "c"], &[50, 10, 40, 20, 30]);
+
+    let results = values_input(&dispatch, vec![batch])
+        .record_batches()
+        .order_by(vec![OrderBy::new(1, false, false)])
+        .collect()
+        .unwrap();
+
+    assert_eq!(collect_i64s(&results, 1), vec![10, 20, 30, 40, 50]);
+    assert_eq!(collect_strings(&results, 0), vec!["a", "b", "c", "d", "e"]);
+}
+
+#[test]
+fn order_by_without_limit_sorts_many_batches_across_workers() {
+    let dispatch = dispatch(4);
+    let row_count = 50_000i64;
+    let batches: Vec<_> = (0..row_count)
+        .rev()
+        .collect::<Vec<_>>()
+        .chunks(1_000)
+        .map(|values| {
+            let names: Vec<String> = values.iter().map(|v| v.to_string()).collect();
+            strings_and_ints(
+                &names.iter().map(String::as_str).collect::<Vec<_>>(),
+                values,
+            )
+        })
+        .collect();
+
+    let results = values_input(&dispatch, batches)
+        .record_batches()
+        .order_by(vec![OrderBy::new(1, false, false)])
+        .collect()
+        .unwrap();
+
+    assert_eq!(
+        collect_i64s(&results, 1),
+        (0..row_count).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn order_by_limit_exceeds_row_count() {
     let dispatch = dispatch(1);
     let batch = strings_and_ints(&["c", "a", "b"], &[30, 10, 20]);

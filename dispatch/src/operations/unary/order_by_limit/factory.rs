@@ -14,7 +14,8 @@ use std::sync::mpsc::Receiver;
 /// its running boundary into it.
 pub struct OrderByLimitFactory {
     order_by: Vec<OrderBy>,
-    limit: usize,
+    /// Rows to keep, or `None` for a standalone ORDER BY over every row.
+    limit: Option<usize>,
     offset: usize,
     sender: mpsc::Sender<RecordBatch>,
     receiver: Option<Receiver<RecordBatch>>,
@@ -26,7 +27,7 @@ impl OrderByLimitFactory {
     /// optional shared dynamic-filter slot.
     pub fn create_for_workers(
         order_by: Vec<OrderBy>,
-        limit: usize,
+        limit: Option<usize>,
         offset: usize,
         worker_count: usize,
         dynamic_filter: Option<Arc<DynamicFilterSlot>>,
