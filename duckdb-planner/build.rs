@@ -14,12 +14,12 @@ fn main() {
     // compiler directly, so without a launcher the cache never sees these.
     // Builds that want fresh, uncached output clear RUSTC_WRAPPER and so skip
     // the launcher automatically.
-    if let Ok(wrapper) = std::env::var("RUSTC_WRAPPER") {
-        if !wrapper.is_empty() {
-            duckdb_config
-                .define("CMAKE_C_COMPILER_LAUNCHER", &wrapper)
-                .define("CMAKE_CXX_COMPILER_LAUNCHER", &wrapper);
-        }
+    if let Ok(wrapper) = std::env::var("RUSTC_WRAPPER")
+        && !wrapper.is_empty()
+    {
+        duckdb_config
+            .define("CMAKE_C_COMPILER_LAUNCHER", &wrapper)
+            .define("CMAKE_CXX_COMPILER_LAUNCHER", &wrapper);
     }
 
     let duckdb = duckdb_config.build();
