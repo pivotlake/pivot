@@ -105,6 +105,19 @@ fn fast_div(n: usize, m: u64) -> usize {
     (((n as u128) * (m as u128)) >> 64) as usize
 }
 
+/// Each slab's base address minus its first slot's global byte offset
+/// (`s * entries_per_slab * stride`), so an entry address is
+/// `bases[slab] + index * stride` with no per-access subtract (see
+/// [`BaseHashTable::entry_ptr_in`]). Wrapping: an adjusted base may
+/// arithmetically precede its mapping; only the re-added sum is dereferenced.
+fn adjusted_bases(slabs: &[Slab], entries_per_slab: usize, stride: usize) -> Vec<usize> {
+    slabs
+        .iter()
+        .enumerate()
+        .map(|(s, slab)| (slab.ptr as usize).wrapping_sub(s * entries_per_slab * stride))
+        .collect()
+}
+
 /// The runtime layout of one entry: where each field starts, the entry stride,
 /// and the strictest field alignment. Fields are placed in descending alignment
 /// order (ties keep hash, key, value order), mirroring the padding-minimising
@@ -320,6 +333,12 @@ pub struct BaseHashTable<K: PersistedKey, V: AggregationValue> {
     /// The value's runtime view metadata (slot count for a runtime-arity
     /// signature); held once here, never per entry.
     meta: V::StoredMeta,
+    /// Each slab's base address pre-adjusted by its first slot's byte offset
+    /// (`slabs[s].ptr - s * entries_per_slab * stride`), so an entry address is
+    /// `bases[slab] + index * stride`: the slab-index multiply and the byte
+    /// multiply are independent and run in parallel, with no subtract on the
+    /// dependency chain, matching the latency of a compile-time stride.
+    bases: Vec<usize>,
     slabs: Vec<Slab>,
     length: usize,
     max_load: usize,
@@ -341,6 +360,7 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
     ) -> Self {
         let meta = V::stored_meta(ctx);
         let layout = entry_layout::<K, V>(meta);
+        let entries_per_slab = BUFFER_SIZE / layout.stride;
         let slabs = allocator.create_strided_slabs(expected_capacity, layout.stride, layout.align);
         BaseHashTable {
             mask: expected_capacity - 1,
@@ -348,14 +368,15 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
             max_load: max_load_for_len(expected_capacity),
             pre_shift,
             shift: u64::BITS - expected_capacity.trailing_zeros(),
-            entries_per_slab: BUFFER_SIZE / layout.stride,
-            entries_per_slab_magic: reciprocal((BUFFER_SIZE / layout.stride) as u64),
+            entries_per_slab,
+            entries_per_slab_magic: reciprocal(entries_per_slab as u64),
             stride: layout.stride,
             hash_offset: layout.hash_offset,
             key_offset: layout.key_offset,
             value_offset: layout.value_offset,
             align: layout.align,
             meta,
+            bases: adjusted_bases(&slabs, entries_per_slab, layout.stride),
             slabs,
             _phantom: PhantomData,
             collisions: 0,
@@ -395,22 +416,23 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
         ((hash << self.pre_shift) >> self.shift) as usize
     }
 
-    /// The address of the entry at `index` in `slabs` (with this table's
-    /// layout). Entries never straddle slabs: entry `i` lives in slab
-    /// `i / entries_per_slab` at byte offset `(i % entries_per_slab) * stride`.
-    /// The division runs through the precomputed reciprocal; a hardware divide
-    /// here serializes every probe's address computation.
+    /// The address of the entry at `index` in the slabs behind `bases` (with
+    /// this table's layout). Entries never straddle slabs: entry `i` lives in
+    /// slab `i / entries_per_slab` at byte offset
+    /// `(i % entries_per_slab) * stride`, but through the pre-adjusted bases
+    /// this is one reciprocal multiply and one independent byte multiply — no
+    /// hardware divide and no subtract on the address dependency chain, which
+    /// every probe's entry load waits on.
     #[inline(always)]
-    fn entry_ptr_in(&self, slabs: &[Slab], index: usize) -> *mut u8 {
+    fn entry_ptr_in(&self, bases: &[usize], index: usize) -> *mut u8 {
         let slab_idx = fast_div(index, self.entries_per_slab_magic);
-        let offset = (index - slab_idx * self.entries_per_slab) * self.stride;
-        unsafe { slabs[slab_idx].ptr.add(offset) }
+        bases[slab_idx].wrapping_add(index * self.stride) as *mut u8
     }
 
     /// The address of this table's entry at `index`.
     #[inline(always)]
     fn entry_ptr(&self, index: usize) -> *mut u8 {
-        self.entry_ptr_in(&self.slabs, index)
+        self.entry_ptr_in(&self.bases, index)
     }
 
     /// The stored hash at slot `index` (0 = empty slot).
@@ -613,14 +635,20 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
     pub fn resize(&mut self, allocator: &mut SlabAllocator, new_size: usize) {
         debug!("Resizing map to {:?}...", new_size);
         let new_slabs = allocator.create_strided_slabs(new_size, self.stride, self.align);
-        let old_slabs = mem::replace(&mut self.slabs, new_slabs);
+        // Keep the replaced slabs alive until the copy loop below has read
+        // every old entry; `old_bases` points into them.
+        let _old_slabs = mem::replace(&mut self.slabs, new_slabs);
+        let old_bases = mem::replace(
+            &mut self.bases,
+            adjusted_bases(&self.slabs, self.entries_per_slab, self.stride),
+        );
         let old_mask = self.mask;
         self.collisions = self.length;
         self.mask = new_size - 1;
         self.shift = u64::BITS - new_size.trailing_zeros();
 
         for idx in 0..=old_mask {
-            let old_entry = self.entry_ptr_in(&old_slabs, idx);
+            let old_entry = self.entry_ptr_in(&old_bases, idx);
             let hash = unsafe { *(old_entry.add(self.hash_offset) as *const u64) };
             if hash != 0 {
                 let mut new_idx = self.slot_for(hash);
@@ -652,11 +680,21 @@ impl<'a, K: PersistedKey, V: AggregationValue> Iterator for HashTableIterator<'a
     type Item = EntryView<'a, K, V::Stored>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.idx < self.hash_table.mask + 1 {
-            let idx = self.idx;
+        let table = self.hash_table;
+        while self.idx < table.mask + 1 {
+            // One address computation per slot: the hash check and the yielded
+            // view read the same entry pointer.
+            let entry = table.entry_ptr(self.idx);
             self.idx += 1;
-            if self.hash_table.hash_at(idx) != 0 {
-                return Some(self.hash_table.view_at(idx));
+            unsafe {
+                let hash = *(entry.add(table.hash_offset) as *const u64);
+                if hash != 0 {
+                    return Some(EntryView {
+                        hash,
+                        key: &*(entry.add(table.key_offset) as *const K),
+                        stored: V::stored_ref(entry.add(table.value_offset), table.meta),
+                    });
+                }
             }
         }
         None
