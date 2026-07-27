@@ -27,7 +27,9 @@ use arrow_schema::{DataType, Field, Schema};
 use rstest::fixture;
 use serde_json::Value;
 
-use crate::catalog::{BoundTable, CatalogTransaction, Column, DynamicScanPredicate};
+use crate::catalog::{
+    BoundTable, CatalogTransaction, Column, DynamicScanPredicate, TableReference, TableRevision,
+};
 use crate::types::{Type, physical_arrow_type};
 use crate::{DEFAULT_DATASTORE_NAME, Planner};
 use dispatch::{
@@ -71,12 +73,13 @@ impl Nullary<RecordBatch> for Replay {
 
 #[derive(Clone, Debug)]
 struct TestTable {
+    reference: TableReference,
     batch: RecordBatch,
     columns: Vec<Column>,
 }
 
 impl TestTable {
-    fn new(columns: &[(&str, Type, ArrayRef)]) -> Self {
+    fn new(name: &str, columns: &[(&str, Type, ArrayRef)]) -> Self {
         // Surface each column as the real arrow type its pivot `Type` decodes
         // into, mirroring the reader: a temporal column becomes Date32/Timestamp,
         // others keep the array they were given.
@@ -106,6 +109,10 @@ impl TestTable {
             })
             .collect();
         TestTable {
+            reference: TableReference {
+                datastore: crate::DEFAULT_DATASTORE_NAME.to_string(),
+                table: name.to_string(),
+            },
             batch,
             columns: cols,
         }
@@ -113,6 +120,17 @@ impl TestTable {
 }
 
 impl BoundTable for TestTable {
+    fn table_reference(&self) -> TableReference {
+        self.reference.clone()
+    }
+
+    fn table_revision(&self) -> TableRevision {
+        TableRevision {
+            identity: format!("{}:{}", self.reference.datastore, self.reference.table),
+            version: 0,
+        }
+    }
+
     fn compile_scan(
         &self,
         dispatcher: &DataFlowDispatcher,
@@ -231,7 +249,7 @@ impl TestCatalog {
         self.tables
             .lock()
             .unwrap()
-            .insert(name.to_string(), TestTable::new(columns));
+            .insert(name.to_string(), TestTable::new(name, columns));
     }
 }
 
@@ -245,6 +263,13 @@ struct TestTransaction {
 impl CatalogTransaction for TestTransaction {
     fn bind_table(&self, _datastore: &str, name: &str) -> Option<Box<dyn BoundTable>> {
         self.tables.get(name).cloned().map(|t| Box::new(t) as _)
+    }
+
+    fn table_revision(&self, datastore: &str, name: &str) -> Option<TableRevision> {
+        self.tables.contains_key(name).then(|| TableRevision {
+            identity: format!("{datastore}:{name}"),
+            version: 0,
+        })
     }
 }
 

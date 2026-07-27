@@ -123,10 +123,14 @@ fn collect_tables(datastore: &DeltaDatastore) -> Vec<TableMeta> {
 /// cheap to poll. `None` if the query fails (e.g. the table was just dropped).
 async fn count_rows(state: &IntrospectState, table: &str) -> Option<i64> {
     let sql = format!("SELECT COUNT(*) FROM \"{}\"", table.replace('"', "\"\""));
-    let batches =
-        crate::query_handler::execute_sql(state.catalog.clone(), state.dispatcher.clone(), sql)
-            .await
-            .ok()?;
+    let batches = crate::query_handler::execute_sql(
+        state.catalog.clone(),
+        state.dispatcher.clone(),
+        state.plan_cache.clone(),
+        sql,
+    )
+    .await
+    .ok()?;
     let batch = batches.first()?;
     if batch.num_rows() == 0 {
         return None;

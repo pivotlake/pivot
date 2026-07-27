@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use insta::assert_snapshot;
-use planner::catalog::{BoundTable, CatalogTransaction, Column};
+use planner::catalog::{BoundTable, CatalogTransaction, Column, TableReference, TableRevision};
 use planner::expression::TableFilter;
 use planner::types::Type;
 use planner::{DEFAULT_DATASTORE_NAME, Planner};
@@ -34,6 +34,20 @@ impl RecordingTable {
 }
 
 impl BoundTable for RecordingTable {
+    fn table_reference(&self) -> TableReference {
+        TableReference {
+            datastore: DEFAULT_DATASTORE_NAME.to_string(),
+            table: "t".to_string(),
+        }
+    }
+
+    fn table_revision(&self) -> TableRevision {
+        TableRevision {
+            identity: format!("{DEFAULT_DATASTORE_NAME}:t"),
+            version: 0,
+        }
+    }
+
     fn compile_scan(
         &self,
         _dispatcher: &DataFlowDispatcher,
@@ -70,6 +84,13 @@ struct SingleTableCatalog {
 impl CatalogTransaction for SingleTableCatalog {
     fn bind_table(&self, _datastore: &str, name: &str) -> Option<Box<dyn BoundTable>> {
         (name == self.name).then(|| Box::new(self.table.clone()) as Box<dyn BoundTable>)
+    }
+
+    fn table_revision(&self, datastore: &str, name: &str) -> Option<TableRevision> {
+        (name == self.name).then(|| TableRevision {
+            identity: format!("{datastore}:{name}"),
+            version: 0,
+        })
     }
 }
 

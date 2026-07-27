@@ -4,12 +4,11 @@
 //! `build`) into Pivot's own structs. Each [`PlanNode`] holds an
 //! [`Operator`] and its child plan nodes.
 //!
-//! The [`Plan`] carries no catalog: every table and DDL access resolves through
-//! the [`CatalogTransaction`](crate::catalog::CatalogTransaction) passed to
-//! [`compile`], so a plan can be cached and re-compiled under a later
-//! transaction. The dispatcher, likewise passed in at [`compile`] time,
-//! represents "what worker pool runs this plan" and isn't a property of the plan
-//! itself.
+//! A read plan carries the snapshot-bound [`BoundTable`](crate::catalog::BoundTable)
+//! objects DuckDB resolved into its scans. Each scan records that table's
+//! identity and version, so a later transaction can reuse the plan only when a
+//! walk of the plan finds that every revision still matches.
+use crate::catalog::CatalogTransaction;
 use crate::compile;
 use crate::expression::Expression;
 use crate::operator::{self, Operator, OrderByDirection, SetVariable};
@@ -58,6 +57,44 @@ impl PlanNode {
             .map(PlanNode::output_nullability)
             .collect();
         self.operator.output_nullability(&inputs)
+    }
+
+    /// Whether this node and all of its inputs are safe to reuse after their
+    /// table revisions have been validated. Mutating and session statements
+    /// retain state tied to the transaction that planned them. Table functions
+    /// resolve again at compile time and do not expose revision dependencies.
+    pub(crate) fn is_cacheable(&self) -> bool {
+        !matches!(
+            self.operator,
+            Operator::Insert(_)
+                | Operator::CreateTable(_)
+                | Operator::SetVariable(_)
+                | Operator::TableFunctionScan(_)
+        ) && self.inputs.iter().all(PlanNode::is_cacheable)
+    }
+
+    /// Whether every table scan still has the same identity and version in
+    /// `transaction`.
+    pub(crate) fn has_matching_table_revisions(
+        &self,
+        transaction: &dyn CatalogTransaction,
+    ) -> bool {
+        let operator_matches = match &self.operator {
+            Operator::Input(input) => {
+                let table_reference = input.table.table_reference();
+                let table_revision = input.table.table_revision();
+                transaction
+                    .table_revision(&table_reference.datastore, &table_reference.table)
+                    .as_ref()
+                    == Some(&table_revision)
+            }
+            _ => true,
+        };
+        operator_matches
+            && self
+                .inputs
+                .iter()
+                .all(|input| input.has_matching_table_revisions(transaction))
     }
 
     fn fmt_indented(&self, f: &mut fmt::Formatter<'_>, indent: usize) -> fmt::Result {
@@ -295,6 +332,14 @@ pub struct Plan {
 }
 
 impl Plan {
+    pub fn is_cacheable(&self) -> bool {
+        self.root.is_cacheable()
+    }
+
+    pub fn has_matching_table_revisions(&self, transaction: &dyn CatalogTransaction) -> bool {
+        self.root.has_matching_table_revisions(transaction)
+    }
+
     /// If this plan is a bare `SET`/`RESET`, return it. Such a statement is a
     /// session command, not a query — it compiles to nothing — so the server
     /// checks this first and acts on the variables it recognises instead of

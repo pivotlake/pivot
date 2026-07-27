@@ -29,6 +29,45 @@ fn simple_select(mut testing_planner: TestingPlanner) {
 }
 
 #[rstest]
+fn select_is_cacheable_when_its_table_revision_matches(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner.plan("SELECT a FROM example_table").unwrap();
+    let transaction = testing_planner.transaction();
+
+    assert!(plan.is_cacheable());
+    assert!(plan.has_matching_table_revisions(transaction.as_ref()));
+}
+
+#[rstest]
+fn table_free_query_is_cacheable(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner.plan("SELECT 1").unwrap();
+    let transaction = testing_planner.transaction();
+
+    assert!(plan.is_cacheable());
+    assert!(plan.has_matching_table_revisions(transaction.as_ref()));
+}
+
+#[rstest]
+fn mutating_session_and_table_function_plans_are_not_cacheable(
+    mut testing_planner: TestingPlanner,
+) {
+    let insert = testing_planner
+        .plan("INSERT INTO example_table VALUES (6, 60, 600, 'eve')")
+        .unwrap();
+    let create = testing_planner
+        .plan("CREATE TABLE cacheability_test (id INTEGER)")
+        .unwrap();
+    let set = testing_planner.plan("SET pivot_stats = true").unwrap();
+    let table_function = testing_planner
+        .plan("SELECT * FROM generate_series(1, 2)")
+        .unwrap();
+
+    assert!(!insert.is_cacheable());
+    assert!(!create.is_cacheable());
+    assert!(!set.is_cacheable());
+    assert!(!table_function.is_cacheable());
+}
+
+#[rstest]
 fn explain_wraps_the_explained_plan(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
         .plan("EXPLAIN SELECT a, b FROM example_table")

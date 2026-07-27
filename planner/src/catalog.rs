@@ -58,6 +58,26 @@ pub struct Column {
     pub col_type: Type,
 }
 
+/// One table name as DuckDB resolved it: the datastore/database plus the table
+/// name inside that datastore. Plan-cache dependencies use the fully-qualified
+/// pair so equal table names in different datastores never collide.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TableReference {
+    pub datastore: String,
+    pub table: String,
+}
+
+/// The immutable identity and snapshot version of one table.
+///
+/// `identity` distinguishes a dropped/recreated table from its predecessor even
+/// when both are at version zero. It is deliberately opaque to the planner; a
+/// backend chooses a stable representation (Delta uses its metadata UUID).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRevision {
+    pub identity: String,
+    pub version: u64,
+}
+
 /// Description of a table to be created, produced by translating a
 /// `CREATE TABLE` statement, consumed by a transaction's `bind_create_table`
 /// ([`CatalogTransaction::bind_create_table`], which routes to the target
@@ -86,6 +106,11 @@ pub trait CatalogTransaction: Debug + Send + Sync {
     /// Resolve `name` in datastore `datastore` to a fresh, independently-mutable
     /// [`BoundTable`], or `None` if that datastore holds no such table.
     fn bind_table(&self, datastore: &str, name: &str) -> Option<Box<dyn BoundTable>>;
+
+    /// The identity and version of `name` in this transaction's frozen
+    /// `datastore` snapshot, or `None` if no such table exists. This must return
+    /// `Some` for every table returned by [`bind_table`](Self::bind_table).
+    fn table_revision(&self, datastore: &str, name: &str) -> Option<TableRevision>;
 
     /// A backend-specific table-valued function `name` in datastore `datastore`,
     /// or `None`.
@@ -136,11 +161,16 @@ pub trait TableCreation: Send + Sync {
 
 /// A table that the planner can read from.
 ///
-/// Implementations expose two pieces of information: the column list (used
-/// during planning, both for our own translation and to feed DuckDB through
-/// [`DuckDBTableAdapter`]) and a way to compile a scan into a dispatch
-/// [`RecordBatchOperatorSpec`].
+/// Implementations expose their catalog identity and frozen revision, the
+/// column list used during planning, and a way to compile a scan into a
+/// dispatch [`RecordBatchOperatorSpec`].
 pub trait BoundTable: Debug + Send + Sync {
+    /// The fully-qualified catalog name resolved for this binding.
+    fn table_reference(&self) -> TableReference;
+
+    /// The exact table snapshot captured by this binding.
+    fn table_revision(&self) -> TableRevision;
+
     /// Build a dispatch scan spec that reads this table.
     ///
     /// `dynamic_filters` are logical single-column predicates whose constants are

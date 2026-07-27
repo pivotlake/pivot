@@ -32,7 +32,8 @@
 //! use dispatch::{DataFlowDispatcher, Dispatch, Projection, RecordBatchOperatorSpec};
 //! use planner::Planner;
 //! use planner::catalog::{
-//!     CatalogTransaction, Column, DynamicScanPredicate, BoundTable,
+//!     CatalogTransaction, Column, DynamicScanPredicate, BoundTable, TableReference,
+//!     TableRevision,
 //! };
 //! use planner::types::Type;
 //!
@@ -43,6 +44,12 @@
 //! }
 //!
 //! impl BoundTable for MyTable {
+//!     fn table_reference(&self) -> TableReference {
+//!         TableReference { datastore: "default".into(), table: "hits".into() }
+//!     }
+//!     fn table_revision(&self) -> TableRevision {
+//!         TableRevision { identity: "hits".into(), version: 0 }
+//!     }
 //!     fn compile(&self, dispatcher: &DataFlowDispatcher, projection: Projection, _filters: Vec<DynamicScanPredicate>, _emit_row_group_metadata: bool) -> planner::catalog::Result<RecordBatchOperatorSpec> {
 //!         Ok(table_input(dispatcher, &self.parquet, projection, false))
 //!     }
@@ -76,6 +83,12 @@
 //!             .get(name)
 //!             .cloned()
 //!             .map(|t| Box::new(MyTable { parquet: t.parquet, columns: t.columns }) as Box<dyn BoundTable>)
+//!     }
+//!     fn table_revision(&self, datastore: &str, name: &str) -> Option<TableRevision> {
+//!         self.tables.contains_key(name).then(|| TableRevision {
+//!             identity: format!("{datastore}:{name}"),
+//!             version: 0,
+//!         })
 //!     }
 //! }
 //!
