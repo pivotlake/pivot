@@ -65,6 +65,7 @@ fn make_datastore() -> (TempDir, Arc<DeltaDatastore>) {
         dir.path().to_string_lossy().into_owned(),
     );
     datastore
+        .clone()
         .begin_transaction()
         .bind_create_table(CreateTableRequest {
             datastore_name: None,

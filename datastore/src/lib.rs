@@ -85,8 +85,10 @@ pub trait Datastore: Debug + Send + Sync {
     /// binding for one query resolves through the returned snapshot, so the
     /// query reads a single consistent view regardless of concurrent refreshes
     /// or commits. The caller holds the transaction for the query's lifetime and
-    /// passes it to commit or rollback when the query finishes.
-    fn begin_transaction(&self) -> Arc<dyn DatastoreTransaction>;
+    /// passes it to commit or rollback when the query finishes. The `Arc<Self>`
+    /// receiver lets the transaction hold the datastore alive, so a `CREATE TABLE`
+    /// it commits can publish the new table straight back into the datastore.
+    fn begin_transaction(self: Arc<Self>) -> Arc<dyn DatastoreTransaction>;
 
     /// Start this datastore's background maintenance (e.g. periodic refresh and
     /// compaction), spawning its tasks onto the ambient async runtime. Called

@@ -153,7 +153,7 @@ impl PivotTransaction {
         if let Some(existing) = sub_transactions.get(datastore) {
             return Some(existing.clone());
         }
-        let sub_transaction = self.datastores.get(datastore)?.begin_transaction();
+        let sub_transaction = self.datastores.get(datastore)?.clone().begin_transaction();
         sub_transactions.insert(datastore.to_string(), sub_transaction.clone());
         Some(sub_transaction)
     }

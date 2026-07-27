@@ -8,6 +8,7 @@ use common::*;
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
@@ -89,10 +90,11 @@ fn rooted_request(name: &str, columns: Vec<Column>) -> CreateTableRequest {
 /// coordinator) and returns the plan that writes the table, which we execute.
 fn create(
     dispatch: &DispatchGuard,
-    datastore: &DeltaDatastore,
+    datastore: &Arc<DeltaDatastore>,
     request: CreateTableRequest,
 ) -> CatalogResult<()> {
     datastore
+        .clone()
         .begin_transaction()
         .bind_create_table(request)?
         .compile(dispatch)?
@@ -121,6 +123,7 @@ fn create_table_with_path_scans_rows() {
     .unwrap();
 
     let table = datastore
+        .clone()
         .begin_transaction()
         .table("events")
         .expect("table created");
@@ -160,6 +163,7 @@ fn tables_persist_across_reopen() {
     // Reopening (as a restart would) reloads the table and its data.
     let reopened = DeltaDatastore::open(db_uri, &dispatch).unwrap();
     let table = reopened
+        .clone()
         .begin_transaction()
         .table("events")
         .expect("table reloaded from the manifest");
@@ -235,7 +239,7 @@ fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
 
         // A data-less table: registered, with no row groups (its data lives under
         // `<root>/t`, which fills in once a file is registered there).
-        assert!(datastore.begin_transaction().table("t").is_some());
+        assert!(datastore.clone().begin_transaction().table("t").is_some());
         assert!(current_parquet(&datastore, "t").row_groups().is_empty());
 
         let commit =
@@ -260,7 +264,7 @@ fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
 
     // And it survives a reopen.
     let reopened = DeltaDatastore::open(db_uri, &dispatch).unwrap();
-    assert!(reopened.begin_transaction().table("t").is_some());
+    assert!(reopened.clone().begin_transaction().table("t").is_some());
 }
 
 #[test]
@@ -305,7 +309,13 @@ fn create_runs_the_fetch_and_commit_dataflow_across_workers() {
     // The no-data case drives the same fan-in with nothing to fetch: every
     // worker's sink finishes empty and worker 0 still commits.
     create(&dispatch, &datastore, rooted_request("empty", columns())).unwrap();
-    assert!(datastore.begin_transaction().table("empty").is_some());
+    assert!(
+        datastore
+            .clone()
+            .begin_transaction()
+            .table("empty")
+            .is_some()
+    );
     assert!(current_parquet(&datastore, "empty").row_groups().is_empty());
 }
 
