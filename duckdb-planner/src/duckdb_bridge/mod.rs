@@ -117,7 +117,7 @@ pub mod ffi {
         /// current database, read by the C++ context constructor.
         fn catalog_context_names(ctx: &CatalogContext) -> Vec<String>;
         fn catalog_context_default(ctx: &CatalogContext) -> String;
-        /// Table / table-function lookups are routed by `datastore` (the datastore
+        /// BoundTable / table-function lookups are routed by `datastore` (the datastore
         /// / database name) to that datastore's snapshot in the transaction.
         fn catalog_get_table(
             transaction: &TransactionContext,

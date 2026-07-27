@@ -19,7 +19,7 @@ use duckdb_planner::handle::{
 };
 
 use super::{BuildCtx, build_scan_columns};
-use crate::catalog::{Column, CreateTableRequest, DuckDBTableAdapter, Table};
+use crate::catalog::{BoundTable, Column, CreateTableRequest, DuckDBTableAdapter};
 use crate::expression::{Error as ExpressionError, Expression};
 use crate::operator::{
     Aggregate, CreateTable, Error as OperatorError, Filter, Input, Insert, Limit, OrderBy,
@@ -226,9 +226,9 @@ fn build_orders<'a>(
     .collect()
 }
 
-/// Resolve a bound catalog entry into the Pivot [`Table`] it wraps: the DuckDB
-/// table is a [`DuckDBTableAdapter`] holding the `Box<dyn Table>`.
-fn bind_table(wrapper: OptionalTableWrapper) -> Box<dyn Table> {
+/// Resolve a bound catalog entry into the Pivot [`BoundTable`] it wraps: the DuckDB
+/// table is a [`DuckDBTableAdapter`] holding the `Box<dyn BoundTable>`.
+fn bind_table(wrapper: OptionalTableWrapper) -> Box<dyn BoundTable> {
     let duck: Box<dyn DuckDBTable> = wrapper.table.expect("planner returned an unbound table");
     let any: Box<dyn Any> = duck;
     let adapter: Box<DuckDBTableAdapter> = any

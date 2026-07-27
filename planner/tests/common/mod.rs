@@ -14,7 +14,7 @@ use tempfile::TempDir;
 use datastore_delta::parquet::{ParquetTable, row_group_filter_from, table_input_with_filter};
 use dispatch::{DataFlowDispatcher, Dispatch, Projection, RecordBatchOperatorSpec};
 use planner::Planner;
-use planner::catalog::{Catalog, CatalogTransaction, Column, DynamicScanPredicate, Table};
+use planner::catalog::{BoundTable, CatalogTransaction, Column, DynamicScanPredicate};
 use planner::types::Type;
 
 #[derive(Clone, Debug)]
@@ -88,7 +88,7 @@ impl TestTable {
     }
 }
 
-impl Table for TestTable {
+impl BoundTable for TestTable {
     fn compile_scan(
         &self,
         dispatcher: &DataFlowDispatcher,
@@ -109,7 +109,7 @@ impl Table for TestTable {
         self.columns.clone()
     }
 
-    fn clone_box(&self) -> Box<dyn Table> {
+    fn clone_box(&self) -> Box<dyn BoundTable> {
         Box::new(self.clone())
     }
 
@@ -176,16 +176,12 @@ struct TestTransaction {
 }
 
 impl CatalogTransaction for TestTransaction {
-    fn bind_table(&self, _datastore: &str, name: &str) -> Option<Box<dyn Table>> {
+    fn bind_table(&self, _datastore: &str, name: &str) -> Option<Box<dyn BoundTable>> {
         self.tables.get(name).cloned().map(|t| Box::new(t) as _)
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 
-impl Catalog for TestCatalog {
+impl TestCatalog {
     fn begin_transaction(&self) -> Arc<dyn CatalogTransaction> {
         Arc::new(TestTransaction {
             tables: self.tables.lock().unwrap().clone(),
@@ -305,7 +301,7 @@ pub fn testing_planner() -> TestingPlanner {
             ),
         ],
     );
-    let planner = Planner::new();
+    let planner = Planner::from_datastore_names(vec!["default".to_string()], "default".to_string());
     TestingPlanner {
         planner,
         catalog,

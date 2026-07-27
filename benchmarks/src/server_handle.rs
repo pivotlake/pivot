@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
+use catalog::{Datastore, PivotCatalog};
 use datastore_delta::DeltaDatastore;
 use dispatch::{BUFFER_SIZE, Dispatch};
 use server::Server;
@@ -86,8 +86,8 @@ pub fn start(workers: usize) -> std::io::Result<ServerHandle> {
             .map_err(std::io::Error::other)?;
     let catalog = Arc::new(
         PivotCatalog::new(
-            HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),
-            DEFAULT_DATASTORE_NAME.to_string(),
+            HashMap::from([("default".to_string(), datastore)]),
+            "default".to_string(),
         )
         .map_err(std::io::Error::other)?,
     );

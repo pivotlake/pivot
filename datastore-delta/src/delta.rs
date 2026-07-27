@@ -69,7 +69,7 @@ pub enum Error {
 /// parses them back): `yyyy-MM-dd HH:mm:ss[.SSSSSS]`.
 const DELTA_TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S%.f";
 
-/// Table-metadata configuration key holding the table's ordered sort columns,
+/// BoundTable-metadata configuration key holding the table's ordered sort columns,
 /// comma-separated. Delta has no native sort spec, so it rides in the
 /// `metaData` action's free-form `configuration` map.
 const SORT_BY_CONFIGURATION_KEY: &str = "pivot.sortBy";

@@ -6,7 +6,7 @@
 //!
 //! 1. **Translate** — Convert DuckDB's logical plan into a Pivot-native
 //!    [`Plan`] tree, wiring each table reference to a concrete
-//!    [`Table`](catalog::Table) from the user's [`Catalog`]
+//!    [`BoundTable`](catalog::BoundTable) from the user's catalog
 //!    and replacing foreign types (expressions, operators, scalars) with the
 //!    ones in [`operator`] and [`expression`].
 //! 2. **Compile** — Walk the Pivot plan and build a
@@ -32,7 +32,7 @@
 //! use dispatch::{DataFlowDispatcher, Dispatch, Projection, RecordBatchOperatorSpec};
 //! use planner::Planner;
 //! use planner::catalog::{
-//!     Catalog, CatalogTransaction, Column, DynamicScanPredicate, Table,
+//!     CatalogTransaction, Column, DynamicScanPredicate, BoundTable,
 //! };
 //! use planner::types::Type;
 //!
@@ -42,12 +42,12 @@
 //!     columns: Vec<Column>,
 //! }
 //!
-//! impl Table for MyTable {
+//! impl BoundTable for MyTable {
 //!     fn compile(&self, dispatcher: &DataFlowDispatcher, projection: Projection, _filters: Vec<DynamicScanPredicate>, _emit_row_group_metadata: bool) -> planner::catalog::Result<RecordBatchOperatorSpec> {
 //!         Ok(table_input(dispatcher, &self.parquet, projection, false))
 //!     }
 //!     fn columns(&self) -> Vec<Column> { self.columns.clone() }
-//!     fn clone_box(&self) -> Box<dyn Table> { Box::new(MyTable { parquet: self.parquet.clone(), columns: self.columns.clone() }) }
+//!     fn clone_box(&self) -> Box<dyn BoundTable> { Box::new(MyTable { parquet: self.parquet.clone(), columns: self.columns.clone() }) }
 //! }
 //!
 //! #[derive(Clone, Debug)]
@@ -71,16 +71,15 @@
 //! // A single read-only database presented to the planner as a one-entry
 //! // catalog: it ignores the datastore qualifier and resolves by table name.
 //! impl CatalogTransaction for MyTransaction {
-//!     fn bind_table(&self, _datastore: &str, name: &str) -> Option<Box<dyn Table>> {
+//!     fn bind_table(&self, _datastore: &str, name: &str) -> Option<Box<dyn BoundTable>> {
 //!         self.tables
 //!             .get(name)
 //!             .cloned()
-//!             .map(|t| Box::new(MyTable { parquet: t.parquet, columns: t.columns }) as Box<dyn Table>)
+//!             .map(|t| Box::new(MyTable { parquet: t.parquet, columns: t.columns }) as Box<dyn BoundTable>)
 //!     }
-//!     fn as_any(&self) -> &dyn std::any::Any { self }
 //! }
 //!
-//! impl Catalog for MyCatalog {
+//! impl MyCatalog {
 //!     fn begin_transaction(&self) -> Arc<dyn CatalogTransaction> {
 //!         Arc::new(MyTransaction { tables: self.tables.clone() })
 //!     }
@@ -95,9 +94,9 @@
 //!
 //! let mut tables = HashMap::new();
 //! tables.insert("hits".to_string(), template);
-//! let catalog: Arc<dyn Catalog> = Arc::new(MyCatalog { tables });
+//! let catalog = MyCatalog { tables };
 //!
-//! let mut planner = Planner::new();
+//! let mut planner = Planner::from_datastore_names(vec!["default".to_string()], "default".to_string());
 //!
 //! // One transaction per query: SQL -> Pivot Plan -> dispatch spec -> execution.
 //! let transaction = catalog.begin_transaction();
@@ -108,7 +107,7 @@
 //!
 //! # Module map
 //!
-//! - [`catalog`] — [`Catalog`] / [`Table`](catalog::Table)
+//! - [`catalog`] — [`CatalogTransaction`](catalog::CatalogTransaction) / [`BoundTable`](catalog::BoundTable)
 //!   traits the caller implements, plus the DuckDB adapters required to plug
 //!   them into `duckdb-planner`.
 //! - [`types`] — The small set of column types Pivot supports, plus
@@ -141,13 +140,6 @@ pub use duckdb_planner::{
     DuckDBBind, DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, ScalarValue,
 };
 
-/// The datastore name a datastore opened without an explicit one takes: the
-/// database DuckDB attaches it as by default and the key it registers under. A
-/// single-datastore [`Planner`] attaches under this name and makes it DuckDB's
-/// current database, so unqualified names resolve against it. Owned here, the
-/// lowest crate that names it; `catalog` re-exports it.
-pub const DEFAULT_DATASTORE_NAME: &str = "default";
-
 /// Errors surfaced by [`Planner::plan`].
 #[derive(Debug, Error)]
 pub enum Error {
@@ -169,24 +161,13 @@ pub struct Planner {
 }
 
 impl Planner {
-    /// Create a `Planner` for a single datastore, attached to DuckDB as the
-    /// [`DEFAULT_DATASTORE_NAME`] database (its current database, so unqualified
-    /// names resolve against it). The degenerate one-datastore case of
-    /// [`with_datastore_names`](Self::with_datastore_names).
-    pub fn new() -> Self {
-        Self::with_datastore_names(
-            vec![DEFAULT_DATASTORE_NAME.to_string()],
-            DEFAULT_DATASTORE_NAME.to_string(),
-        )
-    }
-
     /// Create a `Planner` over several named datastores, each attached to DuckDB
     /// as its own database so a query can name it (`db.schema.t`). `default_name`
     /// is the current database. The planner holds no catalog: the per-query
     /// [`CatalogTransaction`] passed to [`plan`](Self::plan) must span these
     /// datastores and routes each table to the right one's snapshot by the attach
     /// name.
-    pub fn with_datastore_names(database_names: Vec<String>, default_name: String) -> Self {
+    pub fn from_datastore_names(database_names: Vec<String>, default_name: String) -> Self {
         Self {
             // The static provider only answers generic scalar functions, shared
             // across every attached datastore.
@@ -221,11 +202,5 @@ impl Planner {
             root,
             output_names: planned.into_output_names(),
         })
-    }
-}
-
-impl Default for Planner {
-    fn default() -> Self {
-        Self::new()
     }
 }

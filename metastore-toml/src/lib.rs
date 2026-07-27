@@ -18,17 +18,16 @@
 //! [datastore.warm]
 //! kind = "delta"
 //! location = "s3://my-bucket/pivot/" # s3:// -> S3 store
-//! region = "us-east-1"
-//! access_key_id = "AKIA..."
-//! secret_access_key = "..."
+//! region = "us-east-1"               # required for s3://
+//! access_key_id = "AKIA..."          # required for s3://
+//! secret_access_key = "..."          # required for s3://
 //! # session_token = "..."    # optional
 //! # endpoint = "http://localhost:9000" # optional (MinIO / S3-compatible)
-//! # source = "env"           # optional: use AWS_* environment variables
+//! # compact = true           # optional: this datastore compacts itself
 //! ```
 //!
-//! Inline credentials mean the file holds secrets, so it should be readable
-//! only by the PivotDB process. `source = "env"` avoids storing credentials in
-//! the file by deferring to the ambient environment.
+//! An S3 datastore's credentials are inline, so the file holds secrets and should
+//! be readable only by the PivotDB process.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -44,9 +43,6 @@ use datastore_delta::{
 use dispatch::DataFlowDispatcher;
 use metastore::Metastore;
 use serde::Deserialize;
-
-/// AWS region assumed for an S3 datastore that does not name one.
-const DEFAULT_S3_REGION: &str = "us-east-1";
 
 /// A metastore backed by a parsed TOML file.
 ///
@@ -205,8 +201,6 @@ struct DatastoreConfig {
     secret_access_key: Option<String>,
     session_token: Option<String>,
     endpoint: Option<String>,
-    #[serde(default)]
-    source: CredentialSource,
 }
 
 impl DatastoreConfig {
@@ -265,41 +259,25 @@ enum DatastoreKind {
     Delta,
 }
 
-/// Where a remote datastore's credentials come from.
-#[derive(Deserialize, Default, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum CredentialSource {
-    /// Given inline in this datastore's configuration (the default).
-    #[default]
-    Inline,
-    /// Taken from the ambient environment (`AWS_*` for S3).
-    Env,
-}
-
 impl DatastoreConfig {
     /// Build this datastore's object store. The backend is chosen from
     /// `location`: an `s3://` (or `s3a://`) URI opens an S3 store with the
-    /// configured credentials; anything else is a local path (an optional
-    /// `file://` scheme is stripped).
+    /// datastore's inline credentials (`region`, `access_key_id`,
+    /// `secret_access_key` are required); anything else is a local path (an
+    /// optional `file://` scheme is stripped).
     fn open_store(&self, name: &str) -> Result<Arc<dyn ObjectStore>> {
         if is_s3_location(&self.location) {
-            let store = match self.source {
-                CredentialSource::Env => S3Store::from_uri(&self.location)?,
-                CredentialSource::Inline => {
-                    let credentials = S3Credentials {
-                        region: self
-                            .region
-                            .clone()
-                            .unwrap_or_else(|| DEFAULT_S3_REGION.to_string()),
-                        access_key: require(name, &self.access_key_id, "access_key_id")?,
-                        secret_key: require(name, &self.secret_access_key, "secret_access_key")?,
-                        session_token: self.session_token.clone(),
-                        endpoint: self.endpoint.clone(),
-                    };
-                    S3Store::with_credentials(&self.location, credentials)?
-                }
+            let credentials = S3Credentials {
+                region: require(name, &self.region, "region")?,
+                access_key: require(name, &self.access_key_id, "access_key_id")?,
+                secret_key: require(name, &self.secret_access_key, "secret_access_key")?,
+                session_token: self.session_token.clone(),
+                endpoint: self.endpoint.clone(),
             };
-            Ok(Arc::new(store))
+            Ok(Arc::new(S3Store::with_credentials(
+                &self.location,
+                credentials,
+            )?))
         } else {
             let path = self
                 .location
@@ -321,7 +299,7 @@ fn is_s3_location(location: &str) -> bool {
 fn require(name: &str, value: &Option<String>, field: &str) -> Result<String> {
     value.clone().ok_or_else(|| Error::Datastore {
         name: name.to_string(),
-        message: format!("`{field}` is required (or set `source = \"env\"`)"),
+        message: format!("`{field}` is required"),
     })
 }
 

@@ -4,7 +4,7 @@
 //! A [`Datastore`] is a single named source the planner can resolve tables
 //! against; it opens a [`DatastoreTransaction`], a consistent snapshot held for
 //! one query's lifetime. A composite over several datastores is a
-//! [`planner::catalog::Catalog`], whose per-query
+//! [`planner::catalog::CatalogTransaction`] per query, whose
 //! [`planner::catalog::CatalogTransaction`] routes each resolution to the right
 //! datastore's transaction by name.
 
@@ -14,12 +14,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use planner::TableFunction;
-use planner::catalog::{CreateTableRequest, Result, Table, TableCreation};
+use planner::catalog::{BoundTable, CreateTableRequest, Result, TableCreation};
 
 /// One query's transaction against a **single datastore**: a consistent
 /// snapshot of that datastore, opened by [`Datastore::begin_transaction`] before
-/// the query is planned and held until [`Datastore::commit_transaction`] or
-/// [`Datastore::rollback_transaction`]. Every table the query binds resolves
+/// the query is planned and held until its own [`commit`](Self::commit) or
+/// [`rollback`](Self::rollback). Every table the query binds resolves
 /// through this snapshot (never through the live datastore, which a background
 /// refresh may be updating concurrently), so a plan's scans, its late
 /// materialize, and its metadata peepholes all see one frozen view. A backend
@@ -28,14 +28,15 @@ use planner::catalog::{CreateTableRequest, Result, Table, TableCreation};
 /// This is the per-datastore half of the pair: it resolves tables by bare name,
 /// with no datastore qualifier. A [`planner::catalog::CatalogTransaction`]
 /// composes several of these and routes to them by name.
+#[async_trait]
 pub trait DatastoreTransaction: Debug + Send + Sync {
-    /// Resolve a table name to a fresh, independently-mutable [`Table`] bound
+    /// Resolve a table name to a fresh, independently-mutable [`BoundTable`] bound
     /// to this transaction's snapshot, or `None` if no such table exists in the
     /// snapshot. Each call returns a unique `Box`, so per-query filter pushdown
     /// can mutate the table without affecting concurrent queries. The returned
     /// binding captures the snapshot's copy of the table, so its compile needs
     /// no transaction handle.
-    fn bind_table(&self, name: &str) -> Option<Box<dyn Table>>;
+    fn bind_table(&self, name: &str) -> Option<Box<dyn BoundTable>>;
 
     /// A backend-specific table-valued function by `name`, or `None`. This is
     /// how a backend contributes functions only it can answer (e.g. `metadata`,
@@ -61,10 +62,17 @@ pub trait DatastoreTransaction: Debug + Send + Sync {
         .into())
     }
 
-    /// Downcast hook: a backend recovers its concrete transaction (e.g. to drain
-    /// the files an INSERT injected) from the `Arc<dyn DatastoreTransaction>` a
-    /// commit hands back.
-    fn as_any(&self) -> &dyn Any;
+    /// Commit this transaction: publish whatever it staged against this datastore
+    /// (the files an INSERT injected). A read-only transaction is a no-op. Async
+    /// so the backend can hop the blocking store I/O of a writing commit to the
+    /// blocking pool and finish a read-only one inline.
+    async fn commit(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Roll back this transaction: discard whatever it staged. Default: nothing,
+    /// the snapshot is released when the last reference drops.
+    fn rollback(&self) {}
 }
 
 /// One named data source the planner can resolve tables against.
@@ -80,14 +88,6 @@ pub trait Datastore: Debug + Send + Sync {
     /// passes it to commit or rollback when the query finishes.
     fn begin_transaction(&self) -> Arc<dyn DatastoreTransaction>;
 
-    /// Bring the in-memory table set up to date with the backing store, returning
-    /// whether anything changed. A server calls this on a background interval so
-    /// queries bind against an already-materialized set. Default: read-only
-    /// in-memory datastores never change (`false`).
-    fn refresh(&self) -> Result<bool> {
-        Ok(false)
-    }
-
     /// Start this datastore's background maintenance (e.g. periodic refresh and
     /// compaction), spawning its tasks onto the ambient async runtime. Called
     /// once, when the server begins serving. The `Arc<Self>` receiver lets the
@@ -100,29 +100,9 @@ pub trait Datastore: Debug + Send + Sync {
     /// stop.
     fn abort(&self) {}
 
-    /// Commit `transaction`: the query it served finished successfully. The
-    /// default does nothing; the snapshot is simply released when the caller's
-    /// last reference drops. A backend with real transactional state hooks its
-    /// finalization here and returns any commit failure to the query.
-    ///
-    /// Async so a backend can decide for itself whether a commit does blocking
-    /// store I/O (and hop to the blocking pool) or is an in-memory no-op it can
-    /// finish inline. The composite just awaits each datastore's commit.
-    async fn commit_transaction(&self, _transaction: Arc<dyn DatastoreTransaction>) -> Result<()> {
-        Ok(())
-    }
-
-    /// Roll back `transaction`: the query it served failed or was cancelled.
-    /// Default: nothing, as with [`commit_transaction`](Self::commit_transaction).
-    fn rollback_transaction(&self, _transaction: Arc<dyn DatastoreTransaction>) {}
-
-    /// Downcast hook (borrowed): server features specific to one datastore
-    /// format (introspection) recover the concrete backend from an
-    /// `&dyn Datastore`.
-    fn as_any(&self) -> &dyn Any;
-
-    /// Downcast hook (owned): recover the concrete backend as an owned `Arc`,
-    /// for a feature that needs to hold it (e.g. a compacter owning the
-    /// datastore it compacts). Implemented as `fn into_any_arc(self: Arc<Self>) { self }`.
+    /// Downcast hook (owned): recover the concrete backend as an owned `Arc`, for
+    /// a server feature specific to one datastore format (the web dashboard's
+    /// Parquet-level introspection). Implemented as
+    /// `fn into_any_arc(self: Arc<Self>) { self }`.
     fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>;
 }

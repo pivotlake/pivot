@@ -72,9 +72,9 @@ Start the server with:
 pivotdb-server --metastore config.toml
 ```
 
-For S3 credentials supplied through `AWS_*` environment variables, use
-`source = "env"` instead of inline keys. Protect files containing inline
-credentials appropriately.
+An S3 datastore's `region`, `access_key_id`, and `secret_access_key` are
+required and given inline. Protect files containing inline credentials
+appropriately.
 
 Logging is controlled by `RUST_LOG` (defaults to `info`):
 

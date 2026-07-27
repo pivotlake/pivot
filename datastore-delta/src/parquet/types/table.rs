@@ -1,4 +1,4 @@
-//! Table above parquet files
+//! BoundTable above parquet files
 //!
 //! A [`ParquetTable`] is the engine's handle to one or more Parquet files that
 //! together form a logical table. Construction reads and parses each file's

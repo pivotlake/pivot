@@ -12,7 +12,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
+use catalog::{Datastore, PivotCatalog};
 use datastore_delta::DeltaDatastore;
 use dispatch::Dispatch;
 use rstest::fixture;
@@ -115,8 +115,8 @@ pub fn server_port() -> u16 {
                 DeltaDatastore::open_local(data_dir.path(), dispatch.dispatcher()).unwrap();
             let catalog = Arc::new(
                 PivotCatalog::new(
-                    HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),
-                    DEFAULT_DATASTORE_NAME.to_string(),
+                    HashMap::from([("default".to_string(), datastore)]),
+                    "default".to_string(),
                 )
                 .unwrap(),
             );

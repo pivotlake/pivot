@@ -35,7 +35,7 @@
 //!
 //! impl DuckDBBind for MyCatalog {}
 //!
-//! // Table names resolve through a per-plan transaction (a snapshot of the
+//! // BoundTable names resolve through a per-plan transaction (a snapshot of the
 //! // catalog), not through the provider itself.
 //! struct MyTransaction;
 //!
