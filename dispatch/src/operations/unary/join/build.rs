@@ -7,9 +7,10 @@ use crate::waker::worker_waker;
 use ahash::RandomState;
 use arrow::compute::{concat_batches, filter_record_batch};
 use arrow_array::cast::AsArray;
-use arrow_array::types::Int64Type;
+use arrow_array::types::ArrowPrimitiveType;
 use arrow_array::{Array, BooleanArray, RecordBatch};
 use crossbeam_deque::{Injector, Steal};
+use std::hash::Hash;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use tracing::debug;
@@ -22,50 +23,50 @@ const PARTITION_SHIFT: u32 = 64 - NUM_PARTITIONS.trailing_zeros();
 /// into this worker's payload batches (globalized with the worker's base
 /// offset at scatter time).
 #[derive(Clone, Copy)]
-pub(crate) struct BuildTuple {
+pub(crate) struct BuildTuple<K> {
     hash: u64,
-    key: u64,
+    key: K,
     row: u32,
 }
 
-pub(crate) type PartitionBuffers = Vec<SlabVec<BuildTuple>>;
+pub(crate) type PartitionBuffers<K> = Vec<SlabVec<BuildTuple<K>>>;
 
 /// Everything one build worker hands to the single [`JoinBuilder`] that
 /// assembles the join table: which worker it was (payload row indices are
 /// globalized in worker-id order), its partitioned tuples, and the payload
 /// batches those tuples' row indices point into.
-pub(crate) struct BuildWorkerOutput {
+pub(crate) struct BuildWorkerOutput<K: Copy> {
     worker_id: usize,
-    tuples: PartitionBuffers,
+    tuples: PartitionBuffers<K>,
     payload: Vec<RecordBatch>,
 }
 
-pub struct JoinBuildConsumer {
+pub struct JoinBuildConsumer<T: ArrowPrimitiveType<Native: Hash + Eq>> {
     key_column: usize,
     worker_id: usize,
     hash_state: RandomState,
-    values: PartitionBuffers,
+    values: PartitionBuffers<T::Native>,
     payload: Vec<RecordBatch>,
     rows_consumed: usize,
     slab_allocator: SlabAllocator,
     partition_sizes: Arc<Vec<AtomicUsize>>,
-    sender: mpsc::Sender<BuildWorkerOutput>,
-    outputter: JoinBuilder,
+    sender: mpsc::Sender<BuildWorkerOutput<T::Native>>,
+    outputter: JoinBuilder<T::Native>,
 }
 
-unsafe impl Send for JoinBuildConsumer {}
+unsafe impl<T: ArrowPrimitiveType<Native: Hash + Eq>> Send for JoinBuildConsumer<T> {}
 
-impl JoinBuildConsumer {
+impl<T: ArrowPrimitiveType<Native: Hash + Eq>> JoinBuildConsumer<T> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         key_column: usize,
         worker_id: usize,
         hash_state: RandomState,
-        sender: mpsc::Sender<BuildWorkerOutput>,
-        receiver: Option<mpsc::Receiver<BuildWorkerOutput>>,
+        sender: mpsc::Sender<BuildWorkerOutput<T::Native>>,
+        receiver: Option<mpsc::Receiver<BuildWorkerOutput<T::Native>>>,
         partition_sizes: Arc<Vec<AtomicUsize>>,
-        table: JoinTable,
-        injector: Arc<Injector<JoinPartitionJob>>,
+        table: JoinTable<T::Native>,
+        injector: Arc<Injector<JoinPartitionJob<T::Native>>>,
         jobs_injected: Arc<AtomicBool>,
         build_ready: Arc<AtomicBool>,
         remaining_jobs: Arc<AtomicUsize>,
@@ -104,13 +105,13 @@ pub(crate) fn filter_null_keys(batch: RecordBatch, key_column: usize) -> RecordB
     filter_record_batch(&batch, &mask).expect("null-key filter mask matches batch length")
 }
 
-impl Consumer<RecordBatch, ()> for JoinBuildConsumer {
-    type Outputter = JoinBuilder;
+impl<T: ArrowPrimitiveType<Native: Hash + Eq>> Consumer<RecordBatch, ()> for JoinBuildConsumer<T> {
+    type Outputter = JoinBuilder<T::Native>;
 
     fn consume<S: Sender<()>>(&mut self, batch: RecordBatch, _sender: &mut S) -> unary::Result<()> {
         debug!("Consuming build");
         let batch = filter_null_keys(batch, self.key_column);
-        let col = batch.column(self.key_column).as_primitive::<Int64Type>();
+        let col = batch.column(self.key_column).as_primitive::<T>();
         let n = col.len();
         assert!(
             self.rows_consumed + n <= u32::MAX as usize,
@@ -125,7 +126,7 @@ impl Consumer<RecordBatch, ()> for JoinBuildConsumer {
                 &mut self.slab_allocator,
                 BuildTuple {
                     hash,
-                    key: key as u64,
+                    key,
                     row: (self.rows_consumed + i) as u32,
                 },
             );
@@ -152,32 +153,32 @@ impl Consumer<RecordBatch, ()> for JoinBuildConsumer {
     }
 }
 
-pub struct JoinBuilder {
-    table: JoinTable,
-    receiver: Option<mpsc::Receiver<BuildWorkerOutput>>,
+pub struct JoinBuilder<K: Copy + Send> {
+    table: JoinTable<K>,
+    receiver: Option<mpsc::Receiver<BuildWorkerOutput<K>>>,
     partition_sizes: Arc<Vec<AtomicUsize>>,
-    injector: Arc<Injector<JoinPartitionJob>>,
+    injector: Arc<Injector<JoinPartitionJob<K>>>,
     jobs_injected: Arc<AtomicBool>,
     build_ready: Arc<AtomicBool>,
     remaining_jobs: Arc<AtomicUsize>,
 }
 
-unsafe impl Send for JoinBuilder {}
+unsafe impl<K: Copy + Send> Send for JoinBuilder<K> {}
 
-pub struct JoinPartitionJob {
+pub struct JoinPartitionJob<K: Copy + Send> {
     /// This partition's tuples, one entry per build worker, paired with that
     /// worker's global payload row base (added to each tuple's local row).
-    tuples: Vec<(u32, SlabVec<BuildTuple>)>,
-    table: JoinTable,
+    tuples: Vec<(u32, SlabVec<BuildTuple<K>>)>,
+    table: JoinTable<K>,
     arena_offset: usize,
 
     slot_start: usize,
     remaining_jobs: Arc<AtomicUsize>,
 }
 
-unsafe impl Send for JoinPartitionJob {}
+unsafe impl<K: Copy + Send> Send for JoinPartitionJob<K> {}
 
-impl JoinPartitionJob {
+impl<K: Copy + Send> JoinPartitionJob<K> {
     fn run(self) {
         debug!("Running partition job");
         let directory = unsafe { &*self.table.directory.get() };
@@ -240,10 +241,10 @@ impl JoinPartitionJob {
     }
 }
 
-impl Outputter<()> for JoinBuilder {
+impl<K: Copy + Send> Outputter<()> for JoinBuilder<K> {
     fn output<S: Sender<()>>(&mut self, _sender: &mut S) -> unary::Result<bool> {
         if let Some(rx) = self.receiver.take() {
-            let mut worker_outputs: Vec<BuildWorkerOutput> = rx.into_iter().collect();
+            let mut worker_outputs: Vec<BuildWorkerOutput<K>> = rx.into_iter().collect();
             // Payload row indices are globalized in worker-id order, so the
             // concatenated payload batch must follow the same order.
             worker_outputs.sort_by_key(|output| output.worker_id);
@@ -296,7 +297,7 @@ impl Outputter<()> for JoinBuilder {
 
             let mut arena_alloc = SlabAllocator::new(false);
             let keys = unsafe { &mut *self.table.keys.get() };
-            *keys = arena_alloc.create_multi_slab_buffer::<u64>(total.max(1), false);
+            *keys = arena_alloc.create_multi_slab_buffer::<K>(total.max(1), false);
             let rows = unsafe { &mut *self.table.rows.get() };
             *rows = arena_alloc.create_multi_slab_buffer::<u32>(total.max(1), false);
 
@@ -308,7 +309,7 @@ impl Outputter<()> for JoinBuilder {
 
             let slots_per_partition = dir_capacity / NUM_PARTITIONS;
             for (i, &arena_offset) in offsets.iter().enumerate() {
-                let tuples: Vec<(u32, SlabVec<BuildTuple>)> = worker_outputs
+                let tuples: Vec<(u32, SlabVec<BuildTuple<K>>)> = worker_outputs
                     .iter_mut()
                     .zip(&row_bases)
                     .map(|(output, &row_base)| (row_base, std::mem::take(&mut output.tuples[i])))

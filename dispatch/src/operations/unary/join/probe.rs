@@ -20,10 +20,11 @@ use crate::operations::unary::join::directory::{JoinDirectory, prefetch_ptr_l2};
 use crate::operations::unary::join::{JoinOutputColumns, JoinTable};
 use ahash::RandomState;
 use arrow_array::cast::AsArray;
-use arrow_array::types::Int64Type;
-use arrow_array::{Int64Array, RecordBatch};
+use arrow_array::types::ArrowPrimitiveType;
+use arrow_array::{PrimitiveArray, RecordBatch};
 use arrow_schema::{Field, Schema, SchemaRef};
 use std::cmp::min;
+use std::hash::Hash;
 use std::sync::Arc;
 
 const PROBE_BATCH_SIZE: usize = 2048;
@@ -31,8 +32,8 @@ const RING_SIZE: usize = 64;
 const MASK: usize = RING_SIZE - 1;
 const PREFETCH_LENGTH: usize = 63;
 
-pub struct Probe {
-    table: JoinTable,
+pub struct Probe<T: ArrowPrimitiveType<Native: Hash + Eq>> {
+    table: JoinTable<T::Native>,
     hash_state: RandomState,
     key_column: usize,
     output_columns: Arc<JoinOutputColumns>,
@@ -48,9 +49,9 @@ pub struct Probe {
     sides: Option<OutputSides>,
 }
 
-impl Probe {
+impl<T: ArrowPrimitiveType<Native: Hash + Eq>> Probe<T> {
     pub(crate) fn new(
-        table: JoinTable,
+        table: JoinTable<T::Native>,
         hash_state: RandomState,
         key_column: usize,
         output_columns: Arc<JoinOutputColumns>,
@@ -67,30 +68,6 @@ impl Probe {
         }
     }
 
-    /// Emit one combined batch from the two sides' accumulated rows.
-    fn emit<S: Sender<RecordBatch>>(
-        sides: &mut OutputSides,
-        allocator: &mut SlabAllocator,
-        sender: &mut S,
-    ) -> unary::Result<()> {
-        let probe_part = sides.probe.take_batch(allocator)?;
-        let build_part = sides.build.take_batch(allocator)?;
-        let columns = probe_part
-            .columns()
-            .iter()
-            .chain(build_part.columns())
-            .cloned()
-            .collect();
-        let options =
-            arrow_array::RecordBatchOptions::new().with_row_count(Some(probe_part.num_rows()));
-        sender.send(RecordBatch::try_new_with_options(
-            sides.output_schema.clone(),
-            columns,
-            &options,
-        )?)?;
-        Ok(())
-    }
-
     fn probe_window<S: Sender<RecordBatch>>(
         &mut self,
         window: &RecordBatch,
@@ -98,7 +75,7 @@ impl Probe {
         probe_source: &RecordBatch,
         sender: &mut S,
     ) -> unary::Result<()> {
-        let col = window.column(self.key_column).as_primitive::<Int64Type>();
+        let col = window.column(self.key_column).as_primitive::<T>();
         let keys = unsafe { &*self.table.keys.get() };
         let rows = unsafe { &*self.table.rows.get() };
         let out = ProbeMatchCollector {
@@ -129,7 +106,7 @@ impl Probe {
     }
 }
 
-impl Unary<RecordBatch, RecordBatch> for Probe {
+impl<T: ArrowPrimitiveType<Native: Hash + Eq>> Unary<RecordBatch, RecordBatch> for Probe<T> {
     fn consume<S: Sender<RecordBatch>>(
         &mut self,
         batch: RecordBatch,
@@ -192,7 +169,7 @@ impl Unary<RecordBatch, RecordBatch> for Probe {
         if let Some(sides) = &mut self.sides
             && !sides.probe.is_empty()
         {
-            Probe::emit(sides, &mut self.allocator, sender)?;
+            sides.emit(&mut self.allocator, sender)?;
         }
         Ok(true)
     }
@@ -210,16 +187,43 @@ struct OutputSides {
     build_source: RecordBatch,
 }
 
+impl OutputSides {
+    /// Emit one combined batch from the two sides' accumulated rows.
+    fn emit<S: Sender<RecordBatch>>(
+        &mut self,
+        allocator: &mut SlabAllocator,
+        sender: &mut S,
+    ) -> unary::Result<()> {
+        let probe_part = self.probe.take_batch(allocator)?;
+        let build_part = self.build.take_batch(allocator)?;
+        let columns = probe_part
+            .columns()
+            .iter()
+            .chain(build_part.columns())
+            .cloned()
+            .collect();
+        let options =
+            arrow_array::RecordBatchOptions::new().with_row_count(Some(probe_part.num_rows()));
+        sender.send(RecordBatch::try_new_with_options(
+            self.output_schema.clone(),
+            columns,
+            &options,
+        )?)?;
+        Ok(())
+    }
+}
+
 /// Collects matches produced while probing one input window.
 ///
 /// For each candidate build-arena row, it verifies the full key, buffers the
 /// corresponding `(probe row, build payload row)` indices, and periodically
 /// appends those rows to the probe and build output accumulators. Full output
 /// batches are emitted as the accumulators fill.
-struct ProbeMatchCollector<'a, 'b, S: Sender<RecordBatch>> {
-    keys: &'a MultiSlabBuffer<u64>,
+struct ProbeMatchCollector<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, S: Sender<RecordBatch>>
+{
+    keys: &'a MultiSlabBuffer<T::Native>,
     rows: &'a MultiSlabBuffer<u32>,
-    col: &'b Int64Array,
+    col: &'b PrimitiveArray<T>,
     /// Row offset of `col`'s window within the probed batch, added to every
     /// recorded probe index so the indices address `probe_source`.
     window_offset: usize,
@@ -235,7 +239,9 @@ struct ProbeMatchCollector<'a, 'b, S: Sender<RecordBatch>> {
     allocator: &'a mut SlabAllocator,
 }
 
-impl<'a, 'b, S: Sender<RecordBatch>> ProbeMatchCollector<'a, 'b, S> {
+impl<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, S: Sender<RecordBatch>>
+    ProbeMatchCollector<'a, 'b, T, S>
+{
     /// Append the collected pairs to the output sides, emitting if a full
     /// batch accumulated.
     #[inline(never)]
@@ -253,7 +259,7 @@ impl<'a, 'b, S: Sender<RecordBatch>> ProbeMatchCollector<'a, 'b, S> {
         build.append(build_source, &self.build_indices[..self.matched]);
         self.matched = 0;
         if self.sides.probe.should_emit() {
-            Probe::emit(self.sides, self.allocator, self.sender)?;
+            self.sides.emit(self.allocator, self.sender)?;
         }
         Ok(())
     }
@@ -263,7 +269,12 @@ impl<'a, 'b, S: Sender<RecordBatch>> ProbeMatchCollector<'a, 'b, S> {
     /// advance it only when the full-width key matches (branchless on the
     /// match itself; the capacity drain branch is almost never taken).
     #[inline(always)]
-    fn record_match(&mut self, j: usize, probe_row: usize, probe_key: u64) -> unary::Result<()> {
+    fn record_match(
+        &mut self,
+        j: usize,
+        probe_row: usize,
+        probe_key: T::Native,
+    ) -> unary::Result<()> {
         let key = self.keys[j];
         debug_assert!(self.matched < self.probe_indices.len());
         // SAFETY: `matched` stays below the slices' length: they are
@@ -285,7 +296,7 @@ impl<'a, 'b, S: Sender<RecordBatch>> ProbeMatchCollector<'a, 'b, S> {
 /// The prefetch-pipelined probe: hashes ahead, bloom-filters into a ring of
 /// matched directory slots, prefetches their arena ranges, then drains matches
 /// a window behind — keeping many independent loads in flight.
-struct ProbeArray<'a, 'b, S: Sender<RecordBatch>> {
+struct ProbeArray<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, S: Sender<RecordBatch>> {
     row_idx: usize,
     hash_state: RandomState,
     directory: &'a JoinDirectory,
@@ -300,10 +311,12 @@ struct ProbeArray<'a, 'b, S: Sender<RecordBatch>> {
     matched_size: [usize; 2],
     matched_idx: usize,
 
-    out: ProbeMatchCollector<'a, 'b, S>,
+    out: ProbeMatchCollector<'a, 'b, T, S>,
 }
 
-impl<'a, 'b, S: Sender<RecordBatch>> ProbeArray<'a, 'b, S> {
+impl<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, S: Sender<RecordBatch>>
+    ProbeArray<'a, 'b, T, S>
+{
     #[inline(always)]
     pub fn generate_matched_slots<const HASH: bool>(&mut self, length: usize) {
         let next_matched_slots: &mut [(usize, usize); PREFETCH_LENGTH] =
@@ -378,7 +391,7 @@ impl<'a, 'b, S: Sender<RecordBatch>> ProbeArray<'a, 'b, S> {
             let (slot, idx) = current_matched_slots[i];
             let start = directory.end_ptr(slot as isize);
             let end = directory.end_ptr((slot + 1) as isize);
-            let probe_key = unsafe { out.col.value_unchecked(idx) } as u64;
+            let probe_key = unsafe { out.col.value_unchecked(idx) };
 
             for j in start..end {
                 out.record_match(j, idx, probe_key)?;
