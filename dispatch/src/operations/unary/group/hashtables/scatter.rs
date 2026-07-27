@@ -10,7 +10,7 @@
 //! **seeded in place** ([`ScatterRows::push_with`]), so scattering never
 //! materialises an owned value and never allocates per row.
 
-use super::hash_table::{EntryLayout, PersistedKey, entry_layout};
+use super::hash_table::{PersistedKey, entry_layout};
 use crate::memory::{Slab, SlabAllocator, SlabVec};
 use crate::operations::unary::group::values::AggregationValue;
 use std::marker::PhantomData;
@@ -19,20 +19,21 @@ use std::marker::PhantomData;
 /// worker during consume, drained once by the merge job that owns the
 /// partition.
 pub trait ScatterRows<KP: PersistedKey, V: AggregationValue>: Send {
-    /// A register-resident snapshot of the row layout. Every partition buffer
-    /// of one scatter shares the same layout (it is the signature's), so the
-    /// scatter loop snapshots it once and hands it to every push; the rows
-    /// land in a different partition's buffer each time, which would otherwise
-    /// re-load the layout from the buffer per row. `()` for typed rows.
+    /// A register-resident snapshot of the row layout, derived from the
+    /// signature. Every partition buffer of one scatter shares it, so the
+    /// scatter loop computes it once and hands it to every call; it is *not*
+    /// stored per buffer, because a scatter keeps thousands of partition
+    /// buffers and touches one per row in random order — every byte of the
+    /// buffer struct multiplies a cache-resident working set. `()` for typed
+    /// rows.
     type Geometry: Copy;
 
-    /// An empty buffer for a signature described by `ctx` (a runtime-arity
-    /// value derives its row stride from it). Allocates nothing until the
-    /// first push.
-    fn new(ctx: &V::SharedContext) -> Self;
+    /// An empty buffer. Allocates nothing until the first push.
+    fn new() -> Self;
 
-    /// The shared row-layout snapshot (see [`Geometry`](Self::Geometry)).
-    fn geometry(&self) -> Self::Geometry;
+    /// The shared row-layout snapshot for `ctx`'s signature (see
+    /// [`Geometry`](Self::Geometry)).
+    fn geometry(ctx: &V::SharedContext) -> Self::Geometry;
 
     /// Number of rows appended.
     fn len(&self) -> usize;
@@ -52,7 +53,7 @@ pub trait ScatterRows<KP: PersistedKey, V: AggregationValue>: Send {
     );
 
     /// Visit every row in insertion order.
-    fn for_each(&self, f: impl FnMut(u64, &KP, &V::Stored));
+    fn for_each(&self, geo: Self::Geometry, f: impl FnMut(u64, &KP, &V::Stored));
 
     /// Like [`for_each`](Self::for_each), but also hands `f` the hash and key
     /// of the row `AHEAD` slots ahead (or `None` near the end of a chunk), so
@@ -60,6 +61,7 @@ pub trait ScatterRows<KP: PersistedKey, V: AggregationValue>: Send {
     /// reaching the row.
     fn for_each_prefetched<const AHEAD: usize>(
         &self,
+        geo: Self::Geometry,
         f: impl FnMut(u64, &KP, &V::Stored, Option<(u64, &KP)>),
     );
 }
@@ -73,11 +75,11 @@ impl<KP: PersistedKey, V: AggregationValue<Stored = V>> ScatterRows<KP, V>
 {
     type Geometry = ();
 
-    fn new(_ctx: &V::SharedContext) -> Self {
+    fn new() -> Self {
         Self(SlabVec::new())
     }
 
-    fn geometry(&self) {}
+    fn geometry(_ctx: &V::SharedContext) {}
 
     fn len(&self) -> usize {
         self.0.len()
@@ -98,13 +100,14 @@ impl<KP: PersistedKey, V: AggregationValue<Stored = V>> ScatterRows<KP, V>
     }
 
     #[inline(always)]
-    fn for_each(&self, mut f: impl FnMut(u64, &KP, &V::Stored)) {
+    fn for_each(&self, _geo: (), mut f: impl FnMut(u64, &KP, &V::Stored)) {
         self.0.for_each(|(hash, key, value)| f(hash, &key, &value));
     }
 
     #[inline(always)]
     fn for_each_prefetched<const AHEAD: usize>(
         &self,
+        _geo: (),
         mut f: impl FnMut(u64, &KP, &V::Stored, Option<(u64, &KP)>),
     ) {
         self.0
@@ -114,15 +117,39 @@ impl<KP: PersistedKey, V: AggregationValue<Stored = V>> ScatterRows<KP, V>
     }
 }
 
+/// The strided rows' caller-held layout snapshot: the field offsets, the
+/// stride, the chunk row capacities, and the value's view metadata, all
+/// runtime values kept in registers across a scatter loop rather than in the
+/// thousands of per-partition buffers the loop hops between.
+pub struct ScatterGeometry<V: AggregationValue> {
+    hash_offset: usize,
+    key_offset: usize,
+    value_offset: usize,
+    stride: usize,
+    align: usize,
+    /// Rows in the first chunk and in every later one; see [`SlabVec`]'s
+    /// chunk sizing rationale.
+    first_chunk_rows: usize,
+    full_chunk_rows: usize,
+    meta: V::StoredMeta,
+}
+
+impl<V: AggregationValue> Clone for ScatterGeometry<V> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<V: AggregationValue> Copy for ScatterGeometry<V> {}
+
 /// Scatter rows at a runtime stride: each row is `hash | key | cells` with the
 /// same per-query layout a hash entry has ([`entry_layout`]), chunked like a
-/// [`SlabVec`] (a ~64KB chunk target, a small first chunk so the thousands of
-/// mostly-tiny per-partition buffers don't each pin real memory).
+/// [`SlabVec`].
 ///
-/// The hot paths never divide or multiply by the runtime stride: chunk
-/// capacities are precomputed, pushes bump a row pointer, and the scans walk
-/// each chunk by row count with the layout hoisted into locals — the scatter
-/// runs once per input row, so it gets the same care as a table probe.
+/// The struct holds only the chunk list and the row cursor — one cache line,
+/// like a `SlabVec` — because a scatter keeps one buffer per radix partition
+/// (thousands) and touches one per row in hash order: the buffer headers form
+/// a cache-resident working set that every extra field inflates. Everything
+/// layout-shaped lives in the caller's [`ScatterGeometry`].
 pub struct StridedScatterRows<KP: PersistedKey, V: AggregationValue> {
     chunks: Vec<Slab>,
     /// The next row's address in the chunk being filled.
@@ -132,12 +159,7 @@ pub struct StridedScatterRows<KP: PersistedKey, V: AggregationValue> {
     end: *mut u8,
     /// Rows pushed.
     len: usize,
-    layout: EntryLayout,
-    /// Rows per chunk, precomputed: the first chunk and every later one.
-    first_chunk_rows: usize,
-    full_chunk_rows: usize,
-    meta: V::StoredMeta,
-    _phantom: PhantomData<KP>,
+    _phantom: PhantomData<(KP, V)>,
 }
 
 // SAFETY: as for `SlabVec` — the cached row pointers target address-stable
@@ -150,76 +172,57 @@ impl<KP: PersistedKey, V: AggregationValue> StridedScatterRows<KP, V> {
 
     /// Allocate the next chunk and point the row cursor at it.
     #[cold]
-    fn grow(&mut self, allocator: &mut SlabAllocator) {
+    fn grow(&mut self, geo: &ScatterGeometry<V>, allocator: &mut SlabAllocator) {
         let rows = if self.chunks.is_empty() {
-            self.first_chunk_rows
+            geo.first_chunk_rows
         } else {
-            self.full_chunk_rows
+            geo.full_chunk_rows
         };
-        let chunk = allocator.get_aligned_slab(rows * self.layout.stride, self.layout.align, false);
+        let chunk = allocator.get_aligned_slab(rows * geo.stride, geo.align, false);
         self.cur = chunk.ptr;
-        self.end = unsafe { chunk.ptr.add(rows * self.layout.stride) };
+        self.end = unsafe { chunk.ptr.add(rows * geo.stride) };
         self.chunks.push(chunk);
     }
 
     /// Visit each chunk as `(base, rows)`. The division deriving a chunk's row
     /// count runs once per chunk, never per row.
     #[inline(always)]
-    fn for_each_chunk(&self, mut f: impl FnMut(*mut u8, usize)) {
+    fn for_each_chunk(&self, stride: usize, mut f: impl FnMut(*mut u8, usize)) {
         let mut remaining = self.len;
         for chunk in &self.chunks {
-            let rows = (chunk.size / self.layout.stride).min(remaining);
+            let rows = (chunk.size / stride).min(remaining);
             f(chunk.ptr, rows);
             remaining -= rows;
         }
     }
 }
 
-/// The strided rows' caller-held layout snapshot: the field offsets, the
-/// stride, and the value's view metadata, all runtime values kept in registers
-/// across a scatter loop.
-pub struct ScatterGeometry<V: AggregationValue> {
-    hash_offset: usize,
-    key_offset: usize,
-    value_offset: usize,
-    stride: usize,
-    meta: V::StoredMeta,
-}
-
-impl<V: AggregationValue> Clone for ScatterGeometry<V> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<V: AggregationValue> Copy for ScatterGeometry<V> {}
-
 impl<KP: PersistedKey, V: AggregationValue> ScatterRows<KP, V> for StridedScatterRows<KP, V> {
     type Geometry = ScatterGeometry<V>;
 
-    fn geometry(&self) -> ScatterGeometry<V> {
-        ScatterGeometry {
-            hash_offset: self.layout.hash_offset,
-            key_offset: self.layout.key_offset,
-            value_offset: self.layout.value_offset,
-            stride: self.layout.stride,
-            meta: self.meta,
-        }
-    }
-
-    fn new(ctx: &V::SharedContext) -> Self {
-        let meta = V::stored_meta(ctx);
-        let layout = entry_layout::<KP, V>(meta);
-        let full_chunk_rows = (Self::CHUNK_BYTES / layout.stride).max(1);
+    fn new() -> Self {
         Self {
             chunks: Vec::new(),
             cur: std::ptr::null_mut(),
             end: std::ptr::null_mut(),
             len: 0,
+            _phantom: PhantomData,
+        }
+    }
+
+    fn geometry(ctx: &V::SharedContext) -> ScatterGeometry<V> {
+        let meta = V::stored_meta(ctx);
+        let layout = entry_layout::<KP, V>(meta);
+        let full_chunk_rows = (Self::CHUNK_BYTES / layout.stride).max(1);
+        ScatterGeometry {
+            hash_offset: layout.hash_offset,
+            key_offset: layout.key_offset,
+            value_offset: layout.value_offset,
+            stride: layout.stride,
+            align: layout.align,
             first_chunk_rows: (full_chunk_rows / 8).max(1),
             full_chunk_rows,
-            layout,
             meta,
-            _phantom: PhantomData,
         }
     }
 
@@ -237,10 +240,10 @@ impl<KP: PersistedKey, V: AggregationValue> ScatterRows<KP, V> for StridedScatte
         seed: impl FnOnce(&mut V::Stored),
     ) {
         if self.cur == self.end {
-            self.grow(allocator);
+            self.grow(&geo, allocator);
         }
-        // Every offset comes off the caller's snapshot (registers), so the
-        // only buffer state this touches is the row cursor.
+        // Every offset comes off the caller's snapshot (registers); the only
+        // buffer state this touches is the row cursor.
         let row = self.cur;
         unsafe {
             *(row.add(geo.hash_offset) as *mut u64) = hash;
@@ -252,25 +255,19 @@ impl<KP: PersistedKey, V: AggregationValue> ScatterRows<KP, V> for StridedScatte
     }
 
     #[inline(always)]
-    fn for_each(&self, mut f: impl FnMut(u64, &KP, &V::Stored)) {
-        // Hoist the layout into locals so the per-row reads don't re-load it
-        // around the caller's writes.
-        let EntryLayout {
-            hash_offset,
-            key_offset,
-            value_offset,
-            stride,
-            ..
-        } = self.layout;
-        let meta = self.meta;
-        self.for_each_chunk(|base, rows| {
+    fn for_each(&self, geo: ScatterGeometry<V>, mut f: impl FnMut(u64, &KP, &V::Stored)) {
+        self.for_each_chunk(geo.stride, |base, rows| {
             let mut row = base;
             for _ in 0..rows {
                 unsafe {
-                    let hash = *(row.add(hash_offset) as *const u64);
-                    let key = &*(row.add(key_offset) as *const KP);
-                    f(hash, key, V::stored_ref(row.add(value_offset), meta));
-                    row = row.add(stride);
+                    let hash = *(row.add(geo.hash_offset) as *const u64);
+                    let key = &*(row.add(geo.key_offset) as *const KP);
+                    f(
+                        hash,
+                        key,
+                        V::stored_ref(row.add(geo.value_offset), geo.meta),
+                    );
+                    row = row.add(geo.stride);
                 }
             }
         });
@@ -279,31 +276,29 @@ impl<KP: PersistedKey, V: AggregationValue> ScatterRows<KP, V> for StridedScatte
     #[inline(always)]
     fn for_each_prefetched<const AHEAD: usize>(
         &self,
+        geo: ScatterGeometry<V>,
         mut f: impl FnMut(u64, &KP, &V::Stored, Option<(u64, &KP)>),
     ) {
-        let EntryLayout {
-            hash_offset,
-            key_offset,
-            value_offset,
-            stride,
-            ..
-        } = self.layout;
-        let meta = self.meta;
-        self.for_each_chunk(|base, rows| {
+        self.for_each_chunk(geo.stride, |base, rows| {
             let mut row = base;
             for i in 0..rows {
                 unsafe {
-                    let hash = *(row.add(hash_offset) as *const u64);
-                    let key = &*(row.add(key_offset) as *const KP);
+                    let hash = *(row.add(geo.hash_offset) as *const u64);
+                    let key = &*(row.add(geo.key_offset) as *const KP);
                     let ahead = (i + AHEAD < rows).then(|| {
-                        let a = row.add(AHEAD * stride);
+                        let a = row.add(AHEAD * geo.stride);
                         (
-                            *(a.add(hash_offset) as *const u64),
-                            &*(a.add(key_offset) as *const KP),
+                            *(a.add(geo.hash_offset) as *const u64),
+                            &*(a.add(geo.key_offset) as *const KP),
                         )
                     });
-                    f(hash, key, V::stored_ref(row.add(value_offset), meta), ahead);
-                    row = row.add(stride);
+                    f(
+                        hash,
+                        key,
+                        V::stored_ref(row.add(geo.value_offset), geo.meta),
+                        ahead,
+                    );
+                    row = row.add(geo.stride);
                 }
             }
         });

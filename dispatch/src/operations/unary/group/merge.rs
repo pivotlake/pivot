@@ -272,10 +272,13 @@ pub(super) fn merge_combined<K: KeyExtractor, V: AggregationValue>(
     let stride = (scatter_buckets / num_partitions).max(1);
     let bucket_lo = partition * stride;
     let bucket_hi = bucket_lo + stride;
+    // One row-layout snapshot for every bucket this job folds.
+    let geo = <V::Scatter<<K as KeyExtractor>::Persisted> as ScatterRows<_, V>>::geometry(cfg);
     for wb in buffers {
         for bucket in bucket_lo..bucket_hi {
             if merge_prefetch {
                 wb.0[bucket].for_each_prefetched::<SCATTER_PREFETCH_AHEAD>(
+                    geo,
                     |hash, key, stored, ahead| {
                         if let Some((ahead_hash, ahead_key)) = ahead {
                             ahead_key.prefetch_blob(key_arena);
@@ -287,7 +290,7 @@ pub(super) fn merge_combined<K: KeyExtractor, V: AggregationValue>(
                     },
                 );
             } else {
-                wb.0[bucket].for_each(|hash, key, stored| {
+                wb.0[bucket].for_each(geo, |hash, key, stored| {
                     target.grow_if_full(&mut allocator, &mut cap);
                     let live = K::resolve_persisted(key_arena, *key);
                     target.merge_from::<false, _>(hash, live, stored, cfg);

@@ -361,7 +361,7 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
         if self.buffers.is_none() {
             self.buffers = Some(
                 (0..self.radix_cfg.partitions)
-                    .map(|_| V::Scatter::new(&self.shared_context))
+                    .map(|_| V::Scatter::new())
                     .collect(),
             );
         }
@@ -393,13 +393,14 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
             buffers,
             hll,
             hashes,
+            shared_context,
             ..
         } = self;
         let buffers = buffers.as_mut().unwrap();
         // One layout snapshot for the whole range: every partition's buffer
-        // shares it, and rows alternate buffers, so per-push loads would
-        // otherwise re-read it from a different object each row.
-        let geo = buffers[0].geometry();
+        // shares it, and rows alternate buffers, so buffer-resident layout
+        // state would multiply into a cache-hostile working set.
+        let geo = V::Scatter::<<K as KeyExtractor>::Persisted>::geometry(shared_context);
         for i in start..end {
             let hash = hashes[i];
             hll.add(hash);
@@ -428,11 +429,12 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
             buffers,
             allocator,
             hll,
+            shared_context,
             ..
         } = self;
         let table = tables.last_mut().unwrap();
         let buffers = buffers.as_mut().unwrap();
-        let geo = buffers[0].geometry();
+        let geo = V::Scatter::<<K as KeyExtractor>::Persisted>::geometry(shared_context);
         for entry in table.iter(0) {
             let hash = entry.hash;
             hll.add(hash);
