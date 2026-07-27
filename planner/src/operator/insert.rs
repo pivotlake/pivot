@@ -4,12 +4,12 @@ use std::fmt;
 
 use dispatch::{DataFlowDispatcher, RecordBatchOperatorSpec};
 
-use crate::catalog::{CatalogTransaction, Table};
+use crate::catalog::BoundTable;
 use crate::compile::Error;
 
 #[derive(Debug)]
 pub struct Insert {
-    pub table: Box<dyn Table>,
+    pub table: Box<dyn BoundTable>,
 }
 
 impl fmt::Display for Insert {
@@ -23,10 +23,9 @@ impl Insert {
         &self,
         input: RecordBatchOperatorSpec,
         dispatcher: &DataFlowDispatcher,
-        transaction: &dyn CatalogTransaction,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         self.table
-            .compile_insert(input, dispatcher, transaction)
+            .compile_insert(input, dispatcher)
             .map_err(Error::Insert)
     }
 }

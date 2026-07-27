@@ -1,0 +1,12 @@
+[package]
+name = "metastore"
+version.workspace = true
+edition.workspace = true
+description = "Provider-neutral metastore interface for resolving PivotDB datastores."
+
+[dependencies]
+# The cross-datastore layer owns the closed set of datastore kinds returned by
+# every metastore provider.
+catalog = { workspace = true }
+# Opening a datastore reads its tables' footers over the worker pool.
+dispatch = { workspace = true }

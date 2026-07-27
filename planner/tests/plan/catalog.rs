@@ -2,10 +2,10 @@ use std::sync::{Arc, Mutex};
 
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use insta::assert_snapshot;
-use planner::Planner;
-use planner::catalog::{Catalog, CatalogTransaction, Column, CreateTableRequest, Table};
+use planner::catalog::{BoundTable, CatalogTransaction, Column};
 use planner::expression::TableFilter;
 use planner::types::Type;
+use planner::{DEFAULT_DATASTORE_NAME, Planner};
 
 #[allow(unused_imports)]
 use crate::common::*;
@@ -33,14 +33,13 @@ impl RecordingTable {
     }
 }
 
-impl Table for RecordingTable {
+impl BoundTable for RecordingTable {
     fn compile_scan(
         &self,
         _dispatcher: &DataFlowDispatcher,
         _projection: Projection,
         _dynamic_filters: Vec<planner::catalog::DynamicScanPredicate>,
         _emit_row_group_metadata: bool,
-        _transaction: &dyn CatalogTransaction,
     ) -> planner::catalog::Result<RecordBatchOperatorSpec> {
         unreachable!("plan-only test should not reach compile")
     }
@@ -49,7 +48,7 @@ impl Table for RecordingTable {
         self.columns.clone()
     }
 
-    fn clone_box(&self) -> Box<dyn Table> {
+    fn clone_box(&self) -> Box<dyn BoundTable> {
         Box::new(self.clone())
     }
 
@@ -60,7 +59,7 @@ impl Table for RecordingTable {
 }
 
 /// Minimal `Catalog` that resolves a single, known table name. Used instead
-/// of the shared `TestCatalog` because we need a hand-rolled `Table` impl.
+/// of the shared `TestCatalog` because we need a hand-rolled `BoundTable` impl.
 /// Its transaction snapshot is the catalog itself: the table never changes.
 #[derive(Debug)]
 struct SingleTableCatalog {
@@ -69,29 +68,17 @@ struct SingleTableCatalog {
 }
 
 impl CatalogTransaction for SingleTableCatalog {
-    fn table(&self, name: &str) -> Option<Box<dyn Table>> {
-        (name == self.name).then(|| Box::new(self.table.clone()) as Box<dyn Table>)
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+    fn bind_table(&self, _datastore: &str, name: &str) -> Option<Box<dyn BoundTable>> {
+        (name == self.name).then(|| Box::new(self.table.clone()) as Box<dyn BoundTable>)
     }
 }
 
-impl Catalog for SingleTableCatalog {
+impl SingleTableCatalog {
     fn begin_transaction(&self) -> Arc<dyn CatalogTransaction> {
         Arc::new(SingleTableCatalog {
             name: self.name.clone(),
             table: self.table.clone(),
         })
-    }
-
-    fn create_table(
-        &self,
-        _request: CreateTableRequest,
-        _dispatcher: &dispatch::DataFlowDispatcher,
-    ) -> planner::catalog::Result<dispatch::RecordBatchOperatorSpec> {
-        unreachable!("test catalog does not support CREATE TABLE")
     }
 }
 
@@ -113,7 +100,13 @@ fn build_planner(table: RecordingTable) -> (Planner, Arc<SingleTableCatalog>) {
         name: "t".to_string(),
         table,
     });
-    (Planner::new(catalog.clone()), catalog)
+    (
+        Planner::from_datastore_names(
+            vec![DEFAULT_DATASTORE_NAME.to_string()],
+            DEFAULT_DATASTORE_NAME.to_string(),
+        ),
+        catalog,
+    )
 }
 
 fn plan_sql(
@@ -124,7 +117,7 @@ fn plan_sql(
     planner.plan(sql, catalog.begin_transaction())
 }
 
-/// `Catalog::table` is consulted by name; the looked-up `Table::columns` is
+/// `Catalog::table` is consulted by name; the looked-up `BoundTable::columns` is
 /// what the planner shows in `Input([...])`.
 #[test]
 fn catalog_resolves_named_table() {

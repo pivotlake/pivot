@@ -3,9 +3,12 @@ resolver = "3"
 members = [
     "benchmarks",
     "catalog",
+    "datastore",
+    "datastore-delta",
     "dispatch",
     "duckdb-planner",
-    "compact",
+    "metastore",
+    "metastore-toml",
     "planner",
     "server",
     "thriftparquet",
@@ -21,9 +24,12 @@ edition = "2024"
 [workspace.dependencies]
 # Sibling crates.
 catalog = { path = "catalog" }
+datastore = { path = "datastore" }
+datastore-delta = { path = "datastore-delta" }
 dispatch = { path = "dispatch" }
 duckdb-planner = { path = "duckdb-planner" }
-compact = { path = "compact" }
+metastore = { path = "metastore" }
+metastore-toml = { path = "metastore-toml" }
 planner = { path = "planner" }
 server = { path = "server" }
 thriftparquet = { path = "thriftparquet" }

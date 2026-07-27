@@ -25,7 +25,7 @@ use duckdb_planner::handle::{
     TableScan as TableScanView, rowid_column_id,
 };
 
-use crate::catalog::Table;
+use crate::catalog::BoundTable;
 use crate::dynamic_filter::DynamicFilter;
 use crate::expression::{Cast, Error as ExpressionError, Expression, Ref};
 use crate::operator::{
@@ -519,7 +519,7 @@ fn strip_trailing_rowid(node: &mut PlanNode) -> Option<usize> {
 /// HACK: this finds the scan positionally (first input until an `Input` turns
 /// up), which silently tags the wrong scan if the narrow subtree ever branches.
 /// Should be rewritten to key off the row-id scan `strip_trailing_rowid` touched.
-fn prepare_narrow_scan(node: &mut PlanNode) -> Option<Box<dyn Table>> {
+fn prepare_narrow_scan(node: &mut PlanNode) -> Option<Box<dyn BoundTable>> {
     if let Operator::Input(input) = &mut node.operator {
         input.emit_row_group_metadata = true;
         return Some(input.table.clone_box());

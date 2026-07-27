@@ -6,7 +6,7 @@ edition.workspace = true
 [dependencies]
 server = { workspace = true }
 catalog = { workspace = true }
-compact = { workspace = true }
+datastore-delta = { workspace = true }
 planner = { workspace = true }
 dispatch = { workspace = true }
 # `ndjson-to-parquet` loads JSONBench's ndjson through the real write pipeline,
@@ -29,6 +29,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 core_affinity = { workspace = true }
 sysinfo = { workspace = true }
+tempfile = { workspace = true }
 
 [[bin]]
 name = "pivot-bench"

@@ -11,11 +11,11 @@ use rstest::fixture;
 use serde_json::Value;
 use tempfile::TempDir;
 
-use catalog::parquet::{ParquetTable, row_group_filter_from, table_input_with_filter};
+use datastore_delta::parquet::{ParquetTable, row_group_filter_from, table_input_with_filter};
 use dispatch::{DataFlowDispatcher, Dispatch, Projection, RecordBatchOperatorSpec};
-use planner::Planner;
-use planner::catalog::{Catalog, CatalogTransaction, Column, DynamicScanPredicate, Table};
+use planner::catalog::{BoundTable, CatalogTransaction, Column, DynamicScanPredicate};
 use planner::types::Type;
+use planner::{DEFAULT_DATASTORE_NAME, Planner};
 
 #[derive(Clone, Debug)]
 struct TestTable {
@@ -99,14 +99,13 @@ impl TestTable {
     }
 }
 
-impl Table for TestTable {
+impl BoundTable for TestTable {
     fn compile_scan(
         &self,
         dispatcher: &DataFlowDispatcher,
         projection: Projection,
         dynamic_filters: Vec<DynamicScanPredicate>,
         emit_row_group_metadata: bool,
-        _transaction: &dyn CatalogTransaction,
     ) -> planner::catalog::Result<RecordBatchOperatorSpec> {
         Ok(table_input_with_filter(
             dispatcher,
@@ -125,7 +124,7 @@ impl Table for TestTable {
         self.nullability.clone()
     }
 
-    fn clone_box(&self) -> Box<dyn Table> {
+    fn clone_box(&self) -> Box<dyn BoundTable> {
         Box::new(self.clone())
     }
 
@@ -133,19 +132,15 @@ impl Table for TestTable {
         &self,
         input: RecordBatchOperatorSpec,
         projection: Projection,
-        _transaction: &dyn CatalogTransaction,
     ) -> planner::catalog::Result<RecordBatchOperatorSpec> {
-        Ok(catalog::parquet::materialize(
+        Ok(datastore_delta::parquet::materialize(
             input,
             self.parquet_table.clone(),
             projection,
         ))
     }
 
-    fn estimate_row_count(
-        &self,
-        _transaction: &dyn planner::catalog::CatalogTransaction,
-    ) -> Option<u64> {
+    fn estimate_row_count(&self) -> Option<u64> {
         Some(
             self.parquet_table
                 .row_groups()
@@ -206,28 +201,16 @@ struct TestTransaction {
 }
 
 impl CatalogTransaction for TestTransaction {
-    fn table(&self, name: &str) -> Option<Box<dyn Table>> {
+    fn bind_table(&self, _datastore: &str, name: &str) -> Option<Box<dyn BoundTable>> {
         self.tables.get(name).cloned().map(|t| Box::new(t) as _)
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 
-impl Catalog for TestCatalog {
+impl TestCatalog {
     fn begin_transaction(&self) -> Arc<dyn CatalogTransaction> {
         Arc::new(TestTransaction {
             tables: self.tables.lock().unwrap().clone(),
         })
-    }
-
-    fn create_table(
-        &self,
-        _request: ::planner::catalog::CreateTableRequest,
-        _dispatcher: &::dispatch::DataFlowDispatcher,
-    ) -> ::planner::catalog::Result<::dispatch::RecordBatchOperatorSpec> {
-        unreachable!("test helper catalog does not support CREATE TABLE")
     }
 }
 
@@ -343,7 +326,10 @@ pub fn testing_planner() -> TestingPlanner {
             ),
         ],
     );
-    let planner = Planner::new(catalog.clone() as Arc<dyn Catalog>);
+    let planner = Planner::from_datastore_names(
+        vec![DEFAULT_DATASTORE_NAME.to_string()],
+        DEFAULT_DATASTORE_NAME.to_string(),
+    );
     TestingPlanner {
         planner,
         catalog,
