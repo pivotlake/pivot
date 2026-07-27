@@ -117,7 +117,6 @@ impl Table for TestTable {
         projection: Projection,
         _dynamic_filters: Vec<DynamicScanPredicate>,
         _emit_row_group_metadata: bool,
-        _transaction: &dyn CatalogTransaction,
     ) -> crate::catalog::Result<RecordBatchOperatorSpec> {
         let projected = self
             .batch
@@ -141,7 +140,6 @@ impl Table for TestTable {
         &self,
         _input: RecordBatchOperatorSpec,
         _projection: Projection,
-        _transaction: &dyn CatalogTransaction,
     ) -> crate::catalog::Result<RecordBatchOperatorSpec> {
         unreachable!("the in-memory test table is never late-materialized")
     }
@@ -149,11 +147,7 @@ impl Table for TestTable {
     /// Exact min/max over the stored column as a scalar of its physical int type,
     /// so the no-scan global MIN/MAX peephole ([`Aggregate::try_compile_from_stats`])
     /// can be exercised. Only the int columns the peephole supports are answered.
-    fn column_min_max(
-        &self,
-        column: usize,
-        _transaction: &dyn CatalogTransaction,
-    ) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
+    fn column_min_max(&self, column: usize) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
         let arr = self.batch.column(column);
         match arr.data_type() {
             DataType::Int32 => {
@@ -228,7 +222,7 @@ struct TestTransaction {
 }
 
 impl CatalogTransaction for TestTransaction {
-    fn table(&self, name: &str) -> Option<Box<dyn Table>> {
+    fn bind_table(&self, _datastore: &str, name: &str) -> Option<Box<dyn Table>> {
         self.tables.get(name).cloned().map(|t| Box::new(t) as _)
     }
 
@@ -242,14 +236,6 @@ impl Catalog for TestCatalog {
         Arc::new(TestTransaction {
             tables: self.tables.lock().unwrap().clone(),
         })
-    }
-
-    fn create_table(
-        &self,
-        _request: crate::catalog::CreateTableRequest,
-        _dispatcher: &DataFlowDispatcher,
-    ) -> crate::catalog::Result<RecordBatchOperatorSpec> {
-        unreachable!("test helper catalog does not support CREATE TABLE")
     }
 }
 
@@ -318,7 +304,7 @@ pub fn testing_planner() -> TestingPlanner {
             ),
         ],
     );
-    let planner = Planner::new(catalog.clone() as Arc<dyn Catalog>);
+    let planner = Planner::new();
     TestingPlanner {
         planner,
         catalog,

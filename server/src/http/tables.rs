@@ -1,10 +1,13 @@
-//! Paginated per-table internals: the data-file list (`/api/tables/{name}/files`)
-//! and the Parquet row-group stats (`/api/tables/{name}/rowgroups`). Both page
-//! so a table with thousands of files/row groups streams to the UI a slice at a
-//! time (infinite scroll) instead of all at once.
+//! Paginated per-table internals: the data-file list
+//! (`/api/datastores/{datastore}/tables/{name}/files`) and the Parquet row-group
+//! stats (`/api/tables/{name}/rowgroups`). The unqualified files and row-group
+//! routes address the default datastore for compatibility. Both page so a table
+//! with thousands of files/row groups streams to the UI a slice at a time
+//! (infinite scroll).
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
+use datastore_delta::DeltaDatastore;
 use serde::{Deserialize, Serialize};
 
 use super::IntrospectState;
@@ -40,38 +43,52 @@ pub(super) struct FilesPage {
 /// One page of a table's data files (path + size), straight from the catalog.
 /// Paginated so a table with thousands of files streams to the client a slice
 /// at a time (infinite scroll) instead of all at once.
-pub(super) async fn files_page(
+pub(super) async fn default_files_page(
     State(state): State<IntrospectState>,
     Path(name): Path<String>,
     Query(page): Query<Page>,
 ) -> Json<FilesPage> {
-    let catalog = state.catalog.clone();
+    let datastore = state.catalog.default_name().to_string();
+    files_page_for(state, datastore, name, page).await
+}
+
+/// One page from an explicitly named datastore. The concrete backend owns the
+/// format-specific file enumeration; this handler only selects and paginates.
+pub(super) async fn files_page(
+    State(state): State<IntrospectState>,
+    Path((datastore, name)): Path<(String, String)>,
+    Query(page): Query<Page>,
+) -> Json<FilesPage> {
+    files_page_for(state, datastore, name, page).await
+}
+
+async fn files_page_for(
+    state: IntrospectState,
+    datastore: String,
+    name: String,
+    page: Page,
+) -> Json<FilesPage> {
+    let Some(datastore) = state.catalog.get_datastore(&datastore).cloned() else {
+        return Json(FilesPage::default());
+    };
+    // File enumeration is Parquet-specific; recover the concrete backend.
+    let Ok(datastore) = datastore.into_any_arc().downcast::<DeltaDatastore>() else {
+        return Json(FilesPage::default());
+    };
     let limit = page.limit.min(500);
     let offset = page.offset;
     let result = tokio::task::spawn_blocking(move || {
-        let Some(mut table) = catalog.table_handle(&name) else {
+        let Ok(Some(ordered)) = datastore.table_data_files(&name) else {
             return FilesPage::default();
         };
-        let _ = table.refresh();
-        // `file_partitions` is in manifest order, which is the same order
-        // `metadata()` assigns `file_index` - so a file's position here is its
-        // `file_index`, letting the UI filter row groups by it. `file_refs`
-        // supplies the sizes.
-        let sizes: std::collections::HashMap<String, u64> = table
-            .file_refs()
-            .into_iter()
-            .map(|f| (f.path.as_str().to_string(), f.size))
-            .collect();
-        let ordered = table.file_partitions();
         let total = ordered.len();
         let items = ordered
             .into_iter()
             .skip(offset)
             .take(limit)
-            .map(|(path, _)| {
-                let path = path.as_str().to_string();
-                let size = sizes.get(&path).copied().unwrap_or(0);
-                FileOut { path, size }
+            .map(|file| FileOut {
+                path: file.path,
+                size: file.size,
             })
             .collect();
         FilesPage { items, total }
@@ -113,12 +130,8 @@ pub(super) async fn rowgroups_page(
         limit,
         page.offset,
     );
-    match crate::query_handler::execute_sql(
-        state.catalog_dyn.clone(),
-        state.dispatcher.clone(),
-        sql,
-    )
-    .await
+    match crate::query_handler::execute_sql(state.catalog.clone(), state.dispatcher.clone(), sql)
+        .await
     {
         Ok(batches) => {
             let (columns, rows) = batches_to_json(&batches);

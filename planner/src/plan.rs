@@ -4,19 +4,18 @@
 //! `build`) into Pivot's own structs. Each [`PlanNode`] holds an
 //! [`Operator`] and its child plan nodes.
 //!
-//! The [`Plan`] carries the [`Catalog`] it was bound against (operators like
-//! `CREATE TABLE` need it at execution time). The dispatcher, on the other
-//! hand, is passed in at [`compile`] time — it represents
-//! "what worker pool runs this plan" and isn't a property of the plan itself.
-
-use crate::catalog::Catalog;
+//! The [`Plan`] carries no catalog: every table and DDL access resolves through
+//! the [`CatalogTransaction`](crate::catalog::CatalogTransaction) passed to
+//! [`compile`], so a plan can be cached and re-compiled under a later
+//! transaction. The dispatcher, likewise passed in at [`compile`] time,
+//! represents "what worker pool runs this plan" and isn't a property of the plan
+//! itself.
 use crate::compile;
 use crate::expression::Expression;
 use crate::operator::{self, Operator, OrderByDirection, SetVariable};
 use crate::types::Type;
 use dispatch::GroupLimit;
 use std::fmt;
-use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -237,7 +236,6 @@ impl PlanNode {
 /// via [`Plan::compile`](crate::compile), which takes the dispatcher.
 #[derive(Debug)]
 pub struct Plan {
-    pub catalog: Arc<dyn Catalog>,
     pub root: PlanNode,
     /// The result column names DuckDB resolved for the client, in output order
     /// (e.g. `["hour", "count_star()"]`). Stamped onto the compiled output's

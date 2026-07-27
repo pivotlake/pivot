@@ -29,8 +29,8 @@ pub trait DuckDBTable: Any {
 
     /// Clone this table into a fresh boxed trait object.
     ///
-    /// A single `table_id` can be referenced by more than one plan node — a
-    /// late-materialized query's narrow scan and its `Materialize` share one —
+    /// A single `table_id` can be referenced by more than one plan node, a
+    /// late-materialized query's narrow scan and its `Materialize` share one;
     /// so `resolve_inputs` hands each reference its own clone rather than moving
     /// the one resolved table out.
     fn clone_box(&self) -> Box<dyn DuckDBTable>;
@@ -82,17 +82,19 @@ pub trait DuckDBBind {
 /// plan binds comes from one consistent view of the catalog. Only names that
 /// are static registry (scalar functions) still resolve through [`DuckDBBind`].
 pub trait DuckDBTransaction: Send + Sync {
-    /// Given a table name, return a table/object that implements [`DuckDBTable`]
-    /// with column definitions, resolved against this transaction's snapshot.
-    /// Returns `None` if the table doesn't exist.
-    fn table(&self, name: &str) -> Option<Box<dyn DuckDBTable>>;
+    /// Given a table name in datastore `datastore` (the DuckDB database qualifier),
+    /// return a table/object that implements [`DuckDBTable`] with column
+    /// definitions, resolved against that datastore's snapshot. Returns `None`
+    /// if the table doesn't exist. Single-datastore transactions ignore
+    /// `datastore`; a composite over several datastores routes by it.
+    fn bind_table(&self, datastore: &str, name: &str) -> Option<Box<dyn DuckDBTable>>;
 
-    /// Given a function name, return its binding signature, or `None` if this
-    /// transaction's catalog has no such table function. The bridge registers it
-    /// on demand during binding; functions it doesn't know (e.g. DuckDB
-    /// built-ins like `generate_series`) return `None` and resolve elsewhere.
-    /// Default: none.
-    fn table_function(&self, _name: &str) -> Option<TableFunctionDef> {
+    /// Given a function name in datastore `datastore`, return its binding
+    /// signature, or `None` if that datastore has no such table function. The
+    /// bridge registers it on demand during binding; functions it doesn't know
+    /// (e.g. DuckDB built-ins like `generate_series`) return `None` and resolve
+    /// elsewhere. Default: none.
+    fn bind_table_function(&self, _datastore: &str, _name: &str) -> Option<TableFunctionDef> {
         None
     }
 }
@@ -104,15 +106,42 @@ pub trait DuckDBTransaction: Send + Sync {
 /// constraint while keeping the inner provider cheaply cloneable via `Arc`.
 ///
 /// Users don't interact with this type; [`PlannerContext::new`](crate::PlannerContext::new)
-/// accepts `Arc<dyn DuckDBBind>` and wraps it internally.
+/// accepts the pieces and wraps them internally.
+///
+/// The static provider is a single one shared by every attached datastore:
+/// scalar functions are generic (not per-datastore). `database_names` are the
+/// datastores to `ATTACH` (one DuckDB database each) and `default_name` the one
+/// to `USE` as the current database.
 pub struct CatalogContext {
     provider: Arc<dyn DuckDBBind>,
+    database_names: Vec<String>,
+    default_name: String,
 }
 
 impl CatalogContext {
-    pub(crate) fn new(provider: Arc<dyn DuckDBBind>) -> Self {
-        CatalogContext { provider }
+    pub(crate) fn new(
+        provider: Arc<dyn DuckDBBind>,
+        database_names: Vec<String>,
+        default_name: String,
+    ) -> Self {
+        CatalogContext {
+            provider,
+            database_names,
+            default_name,
+        }
     }
+}
+
+/// The datastore names to attach, one DuckDB `ATTACH` per name. Called from the
+/// C++ context constructor.
+pub(crate) fn catalog_context_names(ctx: &CatalogContext) -> Vec<String> {
+    ctx.database_names.clone()
+}
+
+/// The datastore DuckDB should make its current database (`USE`). Called from the
+/// C++ context constructor.
+pub(crate) fn catalog_context_default(ctx: &CatalogContext) -> String {
+    ctx.default_name.clone()
 }
 
 /// Wraps an `Arc<dyn DuckDBTransaction>` for the C++ bridge, the same way
@@ -132,9 +161,10 @@ impl TransactionContext {
 
 pub(crate) fn catalog_get_table(
     transaction: &TransactionContext,
+    datastore: &str,
     name: &str,
 ) -> CatalogGetTableResult {
-    match transaction.transaction.table(name) {
+    match transaction.transaction.bind_table(datastore, name) {
         Some(table) => {
             let columns = table.duckdb_typed_columns();
             CatalogGetTableResult {
@@ -153,9 +183,10 @@ pub(crate) fn catalog_get_table(
 
 pub(crate) fn catalog_get_table_function(
     transaction: &TransactionContext,
+    datastore: &str,
     name: &str,
 ) -> CatalogGetTableFunctionResult {
-    match transaction.transaction.table_function(name) {
+    match transaction.transaction.bind_table_function(datastore, name) {
         Some(def) => CatalogGetTableFunctionResult {
             found: true,
             arg_type_ids: def.arg_type_ids,

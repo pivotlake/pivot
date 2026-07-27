@@ -1,12 +1,12 @@
 //! Catalog: how the planner discovers tables.
 //!
-//! The planner does not know anything about persistence — it defers to a
+//! The planner does not know anything about persistence; it defers to a
 //! caller-supplied [`Catalog`] implementation to resolve table names into
 //! [`Table`]s, each of which exposes a schema (as a list of Pivot [`Column`]s)
 //! and knows how to compile itself into a dispatch scan spec.
 //!
 //! Because DuckDB owns SQL binding, the catalog and tables also need to be
-//! visible to it: the adapters [`DuckDBCatalogAdapter`] and
+//! visible to it: the adapters [`DuckDBScalarFunctionBinder`] and
 //! [`DuckDBTableAdapter`] implement DuckDB's [`DuckDBBind`] /
 //! [`DuckDBTable`] traits over our Pivot types. They exist as
 //! standalone wrapper structs (rather than blanket impls) because the orphan
@@ -42,7 +42,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// A single-column predicate whose constant is supplied at runtime from a shared
 /// [`DynamicFilterSlot`] (filled by a Top-N as it tightens its boundary).
 ///
-/// It is a purely logical predicate — "column `column_idx` `compare_type` the
+/// It is a purely logical predicate: "column `column_idx` `compare_type` the
 /// current slot value". A storage backend may use it to skip data that cannot
 /// match the live boundary (e.g. Parquet row-group elimination), or ignore it
 /// entirely; ignoring is always correct, just without the optimization.
@@ -59,49 +59,82 @@ pub struct Column {
     pub col_type: Type,
 }
 
-/// Description of a table to be created — produced by translating a
-/// `CREATE TABLE` statement, consumed by [`Catalog::create_table`].
+/// Description of a table to be created, produced by translating a
+/// `CREATE TABLE` statement, consumed by a transaction's `bind_create_table`
+/// ([`CatalogTransaction::bind_create_table`], which routes to the target
+/// datastore).
 ///
-/// `options` carries the `WITH (...)` clause verbatim so the catalog
+/// `options` carries the `WITH (...)` clause verbatim so the target datastore
 /// implementation can decide what to do with backend-specific keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateTableRequest {
+    /// The datastore (DuckDB database) the statement named: `db` in
+    /// `CREATE TABLE db.schema.t`. `None` when unqualified, meaning the default
+    /// datastore. A multi-datastore catalog routes the create by this.
+    pub datastore_name: Option<String>,
     pub name: String,
     pub columns: Vec<Column>,
     pub options: HashMap<String, String>,
     pub if_not_exists: bool,
 }
 
-/// One query's transaction: a consistent **snapshot** of the catalog, opened by
-/// [`Catalog::begin_transaction`] before the query is planned and held until
-/// [`Catalog::commit_transaction`] or [`Catalog::rollback_transaction`]. Every
-/// table the query binds resolves through this snapshot (never through the live
-/// catalog, which a background refresh may be updating concurrently), so a
-/// plan's scans, its late materialize, and its metadata peepholes all see one
-/// frozen view. A backend may also hold pending writes here until commit.
+/// One query's transaction across **several datastores**: it routes every
+/// resolution by the datastore (DuckDB database) qualifier of a
+/// `datastore.schema.table` reference. The composite half of the pair; the
+/// per-datastore half is a `datastore::DatastoreTransaction`. This is the
+/// transaction the planner binds against, since DuckDB always resolves through a
+/// database name.
 pub trait CatalogTransaction: Debug + Send + Sync {
-    /// Resolve a table name to a fresh, independently-mutable [`Table`] bound
-    /// to this transaction's snapshot, or `None` if no such table exists in the
-    /// snapshot. Each call returns a unique `Box`, so per-query filter pushdown
-    /// can mutate the table without affecting concurrent queries.
-    fn table(&self, name: &str) -> Option<Box<dyn Table>>;
+    /// Resolve `name` in datastore `datastore` to a fresh, independently-mutable
+    /// [`Table`], or `None` if that datastore holds no such table. This is how
+    /// DuckDB's per-database binding reaches the right datastore's snapshot.
+    fn bind_table(&self, datastore: &str, name: &str) -> Option<Box<dyn Table>>;
 
-    /// A backend-specific table-valued function by `name`, or `None`. This is
-    /// how a backend contributes functions only it can answer (e.g. `metadata`,
-    /// which needs the backend's row-group metadata). It lives on the
-    /// transaction rather than the catalog because such a function reads data,
-    /// and must read it from the transaction handed to its compile. The
-    /// generic functions (`generate_series`, `range`) are resolved by the
-    /// planner itself and never reach here. Default: none.
-    fn table_function(&self, _name: &str) -> Option<Box<dyn TableFunction>> {
+    /// A backend-specific table-valued function `name` in datastore `datastore`,
+    /// or `None`. Used at **bind** time, where DuckDB supplies the database
+    /// qualifier. The composite analogue of the per-datastore transaction's
+    /// `bind_table_function`. Default: none.
+    fn bind_table_function(&self, _datastore: &str, _name: &str) -> Option<Box<dyn TableFunction>> {
         None
     }
 
-    /// Downcast hook: a backend's [`Table`] recovers its concrete transaction
-    /// from the `&dyn CatalogTransaction` handed to the compile-time methods
-    /// ([`Table::compile_scan`], [`Table::row_count`], ...), so a binding carries no
-    /// snapshot state of its own.
+    /// A backend table function by bare `name`, resolved against the default
+    /// datastore. Used at **compile** time, where a table-function scan carries
+    /// no datastore qualifier; the composite routes it to its default child,
+    /// matching DuckDB's bind against the current database. Default: none.
+    fn bind_default_table_function(&self, _name: &str) -> Option<Box<dyn TableFunction>> {
+        None
+    }
+
+    /// Resolve a `CREATE TABLE` by routing to the datastore
+    /// [`CreateTableRequest::datastore_name`] names (the default when unqualified)
+    /// and deferring to that datastore's own `bind_create_table`. Returns a
+    /// [`TableCreation`] the caller compiles into the creating dataflow, the same
+    /// resolve-then-compile shape a table function follows. The default rejects
+    /// DDL (a read-only catalog).
+    fn bind_create_table(&self, _request: CreateTableRequest) -> Result<Box<dyn TableCreation>> {
+        Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "this catalog does not support CREATE TABLE",
+        )
+        .into())
+    }
+
+    /// Downcast hook: recover the concrete composite transaction (e.g. to fan a
+    /// commit out to each datastore's child transaction).
     fn as_any(&self) -> &dyn Any;
+}
+
+/// A resolved `CREATE TABLE`, bound to its target datastore and ready to be
+/// compiled into the dataflow that creates the table. Resolution (routing,
+/// validation, locating the table's existing files) happens when
+/// [`CatalogTransaction::bind_create_table`] produces it; [`compile`](Self::compile)
+/// then builds the dataflow with the worker pool, the same two-step shape a
+/// resolved [`TableFunction`](crate::TableFunction) follows (resolve, then
+/// compile).
+pub trait TableCreation: Send + Sync {
+    /// Build the dataflow that fetches the new table's file footers over the pool
+    /// and, at its terminal, commits the table into the datastore.
+    fn compile(&self, dispatcher: &DataFlowDispatcher) -> Result<RecordBatchOperatorSpec>;
 }
 
 /// A table that the planner can read from.
@@ -115,8 +148,8 @@ pub trait Table: Debug + Send + Sync {
     ///
     /// `dynamic_filters` are logical single-column predicates whose constants are
     /// filled in at runtime (by a Top-N above the scan tightening its boundary).
-    /// A backend may use them to skip data that can't match — e.g. Parquet
-    /// row-group elimination — or ignore them; ignoring is always correct, just
+    /// A backend may use them to skip data that can't match (e.g. Parquet
+    /// row-group elimination) or ignore them; ignoring is always correct, just
     /// without the optimization.
     ///
     /// `emit_row_group_metadata` asks the scan to tag each emitted row with the
@@ -125,28 +158,25 @@ pub trait Table: Debug + Send + Sync {
     /// ignore it; the bridge only sets it on a late-materialized query's narrow
     /// scan.
     ///
-    /// `transaction` is the query's catalog transaction, the same one this
-    /// table was bound from; the backend resolves the table's file set from its
-    /// snapshot (downcasting via [`CatalogTransaction::as_any`]), so the
-    /// binding itself carries no snapshot state.
+    /// The binding is self-contained: it captured its datastore snapshot at bind
+    /// time, so it resolves its own file set here without a transaction handle.
     fn compile_scan(
         &self,
         dispatcher: &DataFlowDispatcher,
         projection: Projection,
         dynamic_filters: Vec<DynamicScanPredicate>,
         emit_row_group_metadata: bool,
-        transaction: &dyn CatalogTransaction,
     ) -> Result<RecordBatchOperatorSpec>;
 
     /// Build a dispatch spec that writes the rows produced by `input` into this
     /// table and emits one `BIGINT` row with the count. Durable publication
-    /// belongs to `transaction`'s [`commit_transaction`](Catalog::commit_transaction).
-    /// The default rejects INSERT (a read-only or virtual table).
+    /// belongs to the query transaction's
+    /// [`commit_transaction`](Catalog::commit_transaction). The default rejects
+    /// INSERT (a read-only or virtual table).
     fn compile_insert(
         &self,
         _input: RecordBatchOperatorSpec,
         _dispatcher: &DataFlowDispatcher,
-        _transaction: &dyn CatalogTransaction,
     ) -> Result<RecordBatchOperatorSpec> {
         Err(
             Box::<dyn std::error::Error + Send + Sync>::from("this table does not support INSERT")
@@ -175,7 +205,6 @@ pub trait Table: Debug + Send + Sync {
         &self,
         _input: RecordBatchOperatorSpec,
         _projection: Projection,
-        _transaction: &dyn CatalogTransaction,
     ) -> Result<RecordBatchOperatorSpec> {
         unreachable!("materialize called on a table that does not support late materialization")
     }
@@ -193,21 +222,17 @@ pub trait Table: Debug + Send + Sync {
     /// statistics covering every row group, with no predicates pushed into this
     /// binding). The scalars carry the column's physical storage type. `None`
     /// means "unknown, scan instead" and is always a safe answer. Answered from
-    /// `transaction`'s snapshot, as in [`compile_scan`](Table::compile_scan).
-    fn column_min_max(
-        &self,
-        _column: usize,
-        _transaction: &dyn CatalogTransaction,
-    ) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
+    /// the binding's captured snapshot, as in [`compile_scan`](Table::compile_scan).
+    fn column_min_max(&self, _column: usize) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
         None
     }
 
     /// The table's total row count derived purely from metadata, if it can be
     /// answered without scanning any rows (e.g. summing Parquet row-group row
     /// counts, with no predicates pushed into this binding). `None` means
-    /// "unknown, scan instead" and is always a safe answer. Answered from
-    /// `transaction`'s snapshot, as in [`compile_scan`](Table::compile_scan).
-    fn row_count(&self, _transaction: &dyn CatalogTransaction) -> Option<i64> {
+    /// "unknown, scan instead" and is always a safe answer. Answered from the
+    /// binding's captured snapshot, as in [`compile_scan`](Table::compile_scan).
+    fn row_count(&self) -> Option<i64> {
         None
     }
 }
@@ -253,65 +278,39 @@ impl DuckDBTable for DuckDBTableAdapter {
     }
 }
 
-/// The set of tables the planner can resolve names against.
+/// A set of named datastores the planner resolves tables against, opening one
+/// composite [`CatalogTransaction`] per query. This is the whole catalog a
+/// caller provides; DuckDB binds every reference through it by database name.
 ///
-/// This is the only thing a caller has to provide to use the planner — DuckDB
-/// will call into it (via [`DuckDBCatalogAdapter`]) during binding, and the
-/// translation layer will call it when wiring [`Operator::Input`](crate::operator::Operator::Input)
-/// nodes to concrete [`Table`]s.
-///
-/// `create_table` compiles a `CREATE TABLE` statement: it does the up-front work
-/// (e.g. reading every data file's footer, in parallel, into a materialized
-/// table) on the coordinator and returns the dataflow plan that *writes* the
-/// result into the catalog when executed.
+/// A single datastore is presented to the planner as a one-entry catalog; the
+/// planner itself holds no catalog and is handed a [`begin_transaction`](Self::begin_transaction)
+/// result per query.
 #[async_trait]
 pub trait Catalog: Debug + Send + Sync {
-    /// Open a transaction: snapshot the catalog as it stands right now. All
-    /// binding for one query resolves through the returned snapshot, so the
-    /// query reads a single consistent view regardless of concurrent refreshes
-    /// or commits. The caller holds the transaction for the query's lifetime and
-    /// passes it to commit or rollback when the query finishes.
+    /// Open a composite transaction: snapshot every datastore as it stands right
+    /// now, keyed by name, so one query reads one consistent view of each.
     fn begin_transaction(&self) -> Arc<dyn CatalogTransaction>;
 
-    /// Compile a `CREATE TABLE` statement into the dataflow that writes the new
-    /// table into the catalog.
-    ///
-    /// Called on the **coordinator** at plan-compile time, so the backend may
-    /// run a dataflow here to build the table (e.g. fetch every Parquet footer
-    /// in parallel over the dispatch worker pool) before returning the plan that
-    /// commits it. The returned spec, when executed, performs the catalog write
-    /// and yields no rows. Errors surface as [`catalog::Error`](enum@Error).
-    fn create_table(
-        &self,
-        request: CreateTableRequest,
-        dispatcher: &DataFlowDispatcher,
-    ) -> Result<RecordBatchOperatorSpec>;
-
-    /// Commit `transaction`: the query it served finished successfully. The
-    /// default does nothing; the snapshot is simply released when the caller's
-    /// last reference drops. A backend with real transactional state hooks its
-    /// finalization here and returns any commit failure to the query.
-    ///
-    /// Async so the implementation decides where its work runs: a commit that
-    /// does blocking store I/O hops to a blocking thread itself, while the
-    /// default and read-only commits resolve immediately.
+    /// Commit `transaction`, fanning out to each datastore's child transaction.
+    /// `async` because publishing an INSERT's uploaded files does blocking
+    /// object-store I/O; the implementation offloads that to the blocking pool so
+    /// callers just `.await` (a read-only commit stays inline). Default: nothing.
     async fn commit_transaction(&self, _transaction: Arc<dyn CatalogTransaction>) -> Result<()> {
         Ok(())
     }
 
-    /// Roll back `transaction`: the query it served failed or was cancelled.
-    /// Default: nothing, as with [`commit_transaction`](Self::commit_transaction).
+    /// Roll back `transaction`, fanning out to each datastore's child. Default:
+    /// nothing.
     fn rollback_transaction(&self, _transaction: Arc<dyn CatalogTransaction>) {}
 }
 
-/// Adapts a Pivot [`Catalog`] to DuckDB's [`DuckDBBind`] trait, resolving the
-/// static (transaction-independent) names during SQL binding: today only the
-/// planner's built-in scalar functions. Tables and table functions resolve
-/// through a per-query [`DuckDBTransactionAdapter`] instead, since both are
-/// answered from the transaction's snapshot.
-pub struct DuckDBCatalogAdapter {
-    pub catalog: Arc<dyn Catalog>,
-}
+/// The DuckDB [`DuckDBBind`] provider: resolves the static
+/// (transaction-independent) names during SQL binding, today only the planner's
+/// built-in scalar functions, which are generic across datastores. It holds no
+/// catalog: tables and table functions resolve through a per-query
+/// [`DuckDBTransactionAdapter`] instead, since both are answered from the
+/// transaction's snapshot.
+pub struct DuckDBScalarFunctionBinder;
 
 /// Adapts a Pivot [`CatalogTransaction`] to DuckDB's [`DuckDBTransaction`]
 /// trait: table and table-function lookups during one plan's binding resolve
@@ -321,15 +320,18 @@ pub struct DuckDBTransactionAdapter {
 }
 
 impl DuckDBTransaction for DuckDBTransactionAdapter {
-    fn table(&self, name: &str) -> Option<Box<dyn DuckDBTable>> {
-        let table = self.transaction.table(name)?;
+    fn bind_table(&self, datastore: &str, name: &str) -> Option<Box<dyn DuckDBTable>> {
+        let table = self.transaction.bind_table(datastore, name)?;
         Some(Box::new(DuckDBTableAdapter { table }))
     }
 
-    fn table_function(&self, name: &str) -> Option<TableFunctionDef> {
+    fn bind_table_function(&self, datastore: &str, name: &str) -> Option<TableFunctionDef> {
         // The function's own signature is the single source of truth; convert its
         // Pivot types to DuckDB logical type ids for the binder.
-        let signature = self.transaction.table_function(name)?.signature();
+        let signature = self
+            .transaction
+            .bind_table_function(datastore, name)?
+            .signature();
         Some(TableFunctionDef {
             arg_type_ids: signature
                 .arguments
@@ -341,7 +343,7 @@ impl DuckDBTransaction for DuckDBTransactionAdapter {
     }
 }
 
-impl DuckDBBind for DuckDBCatalogAdapter {
+impl DuckDBBind for DuckDBScalarFunctionBinder {
     fn scalar_function(&self, name: &str) -> Option<ScalarFunctionDef> {
         // Pivot's own scalar functions (e.g. drop_cache) are generic, not
         // catalog-specific, so their signatures live in the planner rather than

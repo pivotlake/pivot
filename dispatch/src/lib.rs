@@ -165,6 +165,11 @@ pub struct DataFlowDispatcher {
     waker_set: WakerSet,
     /// Total ring slots across all nodes, used to size group-by working memory.
     buffers: usize,
+    /// The pool's shared exit flag, the same `Arc<AtomicBool>` the [`Shutdown`]
+    /// handle flips. Lets long-lived background work owned elsewhere (per-table
+    /// refresh and compaction loops) observe that the pool is tearing down and
+    /// stop, without the pool having to hand out its `Shutdown`.
+    shutdown_flag: Arc<AtomicBool>,
     /// Whether every dataflow launched through this handle is marked profiled.
     /// Set only on a per-query clone (see [`with_profiling`](Self::with_profiling))
     /// so profiling (and the exclusive execution it triggers) is scoped to one
@@ -220,6 +225,13 @@ impl DataFlowDispatcher {
     /// state by node (e.g. work-stealing channels, scan queues).
     pub fn topology(&self) -> numa::Topology {
         self.topology
+    }
+
+    /// Whether the worker pool is shutting down: the shared exit flag has been
+    /// flipped (by [`Shutdown::shutdown`]). Background loops that outlive a
+    /// single query poll this to know when to stop.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutdown_flag.load(Ordering::Relaxed)
     }
 
     /// Ship a `FnOnce() -> T` to worker 0 and return its result.
@@ -372,6 +384,7 @@ impl Dispatch {
                 topology,
                 waker_set: waker_set.clone(),
                 buffers: layout.total_slots(),
+                shutdown_flag: should_exit.clone(),
                 #[cfg(feature = "perf")]
                 profiled: false,
             },

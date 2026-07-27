@@ -1,0 +1,23 @@
+# A datastore named `default` is required. It is DuckDB's current database, so
+# unqualified names such as `main.events` resolve here.
+# `kind` is the datastore format (only `delta` today). The storage backend is
+# inferred from `location`: a local path here, an `s3://` URI for `warm` below.
+[datastore.default]
+kind = "delta"
+location = "/var/lib/pivot/default"
+
+# Other entries are attached as databases and can be queried with three-part
+# names such as `warm.main.events`.
+[datastore.warm]
+kind = "delta"
+location = "s3://example-bucket/warm/"
+region = "us-east-1"
+access_key_id = "replace-me"
+secret_access_key = "replace-me"
+# session_token = "replace-me"
+# endpoint = "http://localhost:9000" # MinIO / S3-compatible
+
+# To source AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
+# AWS_REGION/AWS_DEFAULT_REGION, and AWS_ENDPOINT_URL from the environment,
+# remove the inline credential fields above and set:
+# source = "env"

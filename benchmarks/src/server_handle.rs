@@ -7,12 +7,14 @@
 //! plus a `oneshot::Sender` that triggers a clean shutdown when the handle is
 //! dropped.
 
+use std::collections::HashMap;
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use catalog::ParquetCatalog;
+use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
+use datastore_delta::DeltaDatastore;
 use dispatch::{BUFFER_SIZE, Dispatch};
 use server::Server;
 use tokio::sync::oneshot;
@@ -78,13 +80,26 @@ pub fn start(workers: usize) -> std::io::Result<ServerHandle> {
         .expect("valid socket addr");
 
     let dispatch = Dispatch::spin_up(workers, total_memory_bytes() * 4 / 5 / BUFFER_SIZE, None);
-    let catalog = Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()));
+    let data_dir = tempfile::tempdir()?;
+    let datastore: Arc<dyn Datastore> =
+        DeltaDatastore::open_local(data_dir.path(), dispatch.dispatcher())
+            .map_err(std::io::Error::other)?;
+    let catalog = Arc::new(
+        PivotCatalog::new(
+            HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),
+            DEFAULT_DATASTORE_NAME.to_string(),
+        )
+        .map_err(std::io::Error::other)?,
+    );
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     let thread = thread::Builder::new()
         .name("pivot-bench-server".into())
         .spawn(move || {
+            // The benchmark owns its scratch datastore explicitly for exactly
+            // as long as the in-process server thread is alive.
+            let _data_dir = data_dir;
             // The runtime gets few threads on purpose: its default (one per
             // core) would sit hundreds of mostly-idle threads next to the
             // pinned dispatch workers and preempt them on every wakeup.
@@ -94,14 +109,7 @@ pub fn start(workers: usize) -> std::io::Result<ServerHandle> {
                 .build()
                 .expect("build tokio runtime");
             rt.block_on(async move {
-                let server = Server::new(
-                    bind,
-                    dispatch,
-                    catalog,
-                    0,
-                    4,
-                    server::DEFAULT_CATALOG_REFRESH,
-                );
+                let server = Server::new(bind, dispatch, catalog);
                 let _ = server
                     .serve(Box::pin(async move {
                         let _ = shutdown_rx.await;

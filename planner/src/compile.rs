@@ -1,12 +1,12 @@
-//! Compil a Pivot [`Plan`] into an executable
+//! Compile a Pivot [`Plan`] into an executable
 //! [`RecordBatchOperatorSpec`].
 //!
 //! Compilation is a recursive walk: each [`PlanNode`] compiles its inputs
 //! first, then dispatches to the per-operator `compile` impl (e.g. a
 //! [`Filter`](crate::operator::Filter) compiles into
 //! [`RecordBatchOperatorSpec::filter`]). Expressions compile into **builder
-//! closures** ([`ExprFn`]) — `Fn()` returning a per-worker
-//! `FnMut(&RecordBatch) -> ExprResult` — matching dispatch's two-level
+//! closures** ([`ExprFn`]): a `Fn()` returning a per-worker
+//! `FnMut(&RecordBatch) -> ExprResult`, matching dispatch's two-level
 //! closure pattern so each worker gets its own state without synchronization.
 //!
 //! # Organization
@@ -20,7 +20,7 @@
 //! submodules, not here.
 //!
 
-use crate::catalog::{Catalog, CatalogTransaction};
+use crate::catalog::CatalogTransaction;
 use crate::expression::Expression;
 use crate::types::Type;
 use crate::{Plan, PlanNode};
@@ -35,9 +35,9 @@ use thiserror::Error;
 /// Each [`Plan::compile`] starts with an empty registry; the producer (`TopN`)
 /// and consumer (`Input`) for a given `slot_id` lazily get-or-create one shared
 /// [`DynamicFilterSlot`] from it, so they end up holding the same `Arc`. The
-/// registry is intentionally *not* part of the (cacheable) `Plan`: a fresh set
-/// of empty slots is minted on every compile, so a reused plan never carries a
-/// stale boundary — or a slice of a previous run's pooled scan buffers — across
+/// registry is intentionally *not* part of the `Plan`: a fresh set of empty
+/// slots is minted on every compile, so a re-compiled plan never carries a stale
+/// boundary (or a slice of a previous run's pooled scan buffers) across
 /// executions.
 pub(crate) type DynamicFilterSlots = HashMap<usize, Arc<DynamicFilterSlot>>;
 
@@ -112,24 +112,21 @@ pub enum Error {
 
 impl Plan {
     /// Lower this plan into an executable
-    /// [`dispatch::RecordBatchOperatorSpec`] on the
-    /// given dispatcher. The catalog the plan was bound against is read from
-    /// [`Plan::catalog`] for operators that need it at runtime
-    /// (e.g. `CREATE TABLE`).
+    /// [`dispatch::RecordBatchOperatorSpec`] on the given dispatcher. Every table
+    /// access and DDL (e.g. `CREATE TABLE`) resolves through `transaction`, so
+    /// the plan carries no catalog and no snapshot of its own.
     pub fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
         transaction: &dyn CatalogTransaction,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        // Every table access resolves through `transaction`, so the whole
-        // query reads one frozen view of the catalog and no live catalog
-        // state is consulted here. The plan itself carries no snapshot: it can
-        // be cached and compiled again under a later transaction, reading that
-        // transaction's view.
+        // Table functions and DDL resolve through `transaction`, so the whole
+        // query reads one frozen view of the catalog and no live catalog state
+        // is consulted here. The plan itself carries no snapshot: it can be
+        // compiled again under a later transaction, reading that transaction's
+        // view.
         let mut slots = DynamicFilterSlots::new();
-        let compiled = self
-            .root
-            .compile(dispatcher, &self.catalog, transaction, &mut slots)?;
+        let compiled = self.root.compile(dispatcher, transaction, &mut slots)?;
         Ok(stamp_output_names(compiled, &self.output_names))
     }
 }
@@ -196,7 +193,6 @@ impl PlanNode {
     pub(crate) fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
-        catalog: &Arc<dyn Catalog>,
         transaction: &dyn CatalogTransaction,
         slots: &mut DynamicFilterSlots,
     ) -> Result<RecordBatchOperatorSpec, Error> {
@@ -206,7 +202,7 @@ impl PlanNode {
         // succeeding means no scan happens at all. `try_compile_from_stats`
         // checks the rest of the shape (single bare-scan child, no predicates).
         if let crate::Operator::Aggregate(agg) = &self.operator
-            && let Some(spec) = agg.try_compile_from_stats(&self.inputs, dispatcher, transaction)?
+            && let Some(spec) = agg.try_compile_from_stats(&self.inputs, dispatcher)?
         {
             return Ok(spec);
         }
@@ -225,11 +221,11 @@ impl PlanNode {
 
         let mut inputs = Vec::with_capacity(self.inputs.len());
         for input in &self.inputs {
-            inputs.push(input.compile(dispatcher, catalog, transaction, slots)?);
+            inputs.push(input.compile(dispatcher, transaction, slots)?);
         }
 
         match &self.operator {
-            crate::Operator::Input(o) => o.compile(dispatcher, transaction, slots),
+            crate::Operator::Input(o) => o.compile(dispatcher, slots),
             crate::Operator::Values(o) => o.compile(dispatcher),
             crate::Operator::TableFunctionScan(o) => o.compile(dispatcher, transaction),
             crate::Operator::Projection(o) => o.compile(inputs.remove(0)),
@@ -238,14 +234,14 @@ impl PlanNode {
             crate::Operator::OrderBy(o) => o.compile(inputs.remove(0)),
             crate::Operator::TopN(o) => o.compile(inputs.remove(0), slots),
             crate::Operator::Limit(o) => o.compile(inputs.remove(0)),
-            crate::Operator::Materialize(o) => o.compile(inputs.remove(0), transaction),
+            crate::Operator::Materialize(o) => o.compile(inputs.remove(0)),
             crate::Operator::CreateTable(o) => {
                 if !inputs.is_empty() {
                     return Err(Error::UnexpectedCreateTableInputs);
                 }
-                o.compile(dispatcher, catalog)
+                o.compile(dispatcher, transaction)
             }
-            crate::Operator::Insert(o) => o.compile(inputs.remove(0), dispatcher, transaction),
+            crate::Operator::Insert(o) => o.compile(inputs.remove(0), dispatcher),
             crate::Operator::DummyScan(o) => o.compile(dispatcher),
             // EXPLAIN is handled above, before inputs are compiled.
             crate::Operator::Explain(_) => unreachable!("Explain is compiled before its inputs"),

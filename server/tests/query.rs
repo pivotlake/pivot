@@ -1,5 +1,5 @@
 //! End-to-end blackbox tests: spin up the real `Server` (with a real
-//! `dispatch` worker pool and `ParquetCatalog`), connect with a real Postgres
+//! `dispatch` worker pool and `DeltaDatastore`), connect with a real Postgres
 //! client (`tokio-postgres`), and exercise the full
 //! `CREATE TABLE` → `SELECT` → wire-encoding flow.
 //!

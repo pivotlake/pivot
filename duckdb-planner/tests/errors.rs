@@ -35,7 +35,7 @@ impl DuckDBBind for TestCatalog {}
 struct TestTransaction;
 
 impl DuckDBTransaction for TestTransaction {
-    fn table(&self, table_name: &str) -> Option<Box<dyn DuckDBTable>> {
+    fn bind_table(&self, _datastore: &str, table_name: &str) -> Option<Box<dyn DuckDBTable>> {
         match table_name {
             "t" => Some(Box::new(TTable)),
             _ => None,
@@ -44,7 +44,11 @@ impl DuckDBTransaction for TestTransaction {
 }
 
 fn create_simple_context() -> PlannerContext {
-    PlannerContext::new(Arc::new(TestCatalog))
+    PlannerContext::new(
+        Arc::new(TestCatalog),
+        vec!["db".to_string()],
+        "db".to_string(),
+    )
 }
 
 fn plan(p: &mut PlannerContext, query: &str) -> Result<duckdb_planner::Plan, Error> {

@@ -64,7 +64,7 @@ impl Insert {
             ));
         }
         Ok(Insert {
-            table: resolve_table(*view.take_table()),
+            table: bind_table(*view.take_table()),
         })
     }
 }
@@ -137,7 +137,7 @@ impl Input {
         ctx: &mut BuildCtx,
     ) -> Result<Input, OperatorError> {
         Ok(Input {
-            table: resolve_table(*scan.take_table()),
+            table: bind_table(*scan.take_table()),
             columns: build_scan_columns(scan.output_columns())?,
             dynamic_filters: scan
                 .dynamic_filters()
@@ -172,6 +172,7 @@ impl CreateTable {
     pub(crate) fn from_handle(view: CreateTableView<'_>) -> Result<CreateTable, OperatorError> {
         Ok(CreateTable {
             request: CreateTableRequest {
+                datastore_name: view.datastore(),
                 name: view.name(),
                 columns: view
                     .columns()
@@ -227,7 +228,7 @@ fn build_orders<'a>(
 
 /// Resolve a bound catalog entry into the Pivot [`Table`] it wraps: the DuckDB
 /// table is a [`DuckDBTableAdapter`] holding the `Box<dyn Table>`.
-fn resolve_table(wrapper: OptionalTableWrapper) -> Box<dyn Table> {
+fn bind_table(wrapper: OptionalTableWrapper) -> Box<dyn Table> {
     let duck: Box<dyn DuckDBTable> = wrapper.table.expect("planner returned an unbound table");
     let any: Box<dyn Any> = duck;
     let adapter: Box<DuckDBTableAdapter> = any

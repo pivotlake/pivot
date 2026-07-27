@@ -6,7 +6,7 @@
 //! materializes at once and a downstream `LIMIT`/aggregate stops it early.
 
 use super::{TableFunction, TableFunctionSignature, invalid_argument};
-use crate::catalog::{CatalogTransaction, Column};
+use crate::catalog::Column;
 use crate::compile::Error;
 use crate::types::Type;
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
@@ -67,7 +67,6 @@ impl TableFunction for SeriesTableFunction {
         &self,
         args: &[ScalarValue],
         dispatcher: &DataFlowDispatcher,
-        _transaction: &dyn CatalogTransaction,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let nums = self.parse_i64_args(args)?;
         let (start, stop, step) = match nums.as_slice() {

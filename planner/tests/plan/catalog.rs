@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use insta::assert_snapshot;
 use planner::Planner;
-use planner::catalog::{Catalog, CatalogTransaction, Column, CreateTableRequest, Table};
+use planner::catalog::{Catalog, CatalogTransaction, Column, Table};
 use planner::expression::TableFilter;
 use planner::types::Type;
 
@@ -40,7 +40,6 @@ impl Table for RecordingTable {
         _projection: Projection,
         _dynamic_filters: Vec<planner::catalog::DynamicScanPredicate>,
         _emit_row_group_metadata: bool,
-        _transaction: &dyn CatalogTransaction,
     ) -> planner::catalog::Result<RecordBatchOperatorSpec> {
         unreachable!("plan-only test should not reach compile")
     }
@@ -69,7 +68,7 @@ struct SingleTableCatalog {
 }
 
 impl CatalogTransaction for SingleTableCatalog {
-    fn table(&self, name: &str) -> Option<Box<dyn Table>> {
+    fn bind_table(&self, _datastore: &str, name: &str) -> Option<Box<dyn Table>> {
         (name == self.name).then(|| Box::new(self.table.clone()) as Box<dyn Table>)
     }
 
@@ -84,14 +83,6 @@ impl Catalog for SingleTableCatalog {
             name: self.name.clone(),
             table: self.table.clone(),
         })
-    }
-
-    fn create_table(
-        &self,
-        _request: CreateTableRequest,
-        _dispatcher: &dispatch::DataFlowDispatcher,
-    ) -> planner::catalog::Result<dispatch::RecordBatchOperatorSpec> {
-        unreachable!("test catalog does not support CREATE TABLE")
     }
 }
 
@@ -113,7 +104,7 @@ fn build_planner(table: RecordingTable) -> (Planner, Arc<SingleTableCatalog>) {
         name: "t".to_string(),
         table,
     });
-    (Planner::new(catalog.clone()), catalog)
+    (Planner::new(), catalog)
 }
 
 fn plan_sql(
