@@ -14,7 +14,7 @@ pub use crate::operations::unary::group::keys::KeyExtractor;
 pub use crate::operations::unary::group::values::AggregationValue;
 
 mod hash_table;
-pub use hash_table::{LiveKey, MAX_LOAD_FACTOR, PersistedKey};
+pub use hash_table::{LiveKey, MAX_LOAD_FACTOR, PersistedKey, Prober};
 
 mod aggregated_table;
 pub use aggregated_table::{AggregatedTable, AggregatedTableOutput, PartitionBuffers, RadixConfig};

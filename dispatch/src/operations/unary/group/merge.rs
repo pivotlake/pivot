@@ -34,7 +34,8 @@ use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::PartitionBuffers;
 use crate::operations::unary::group::hashtables::{
-    AggregationValue, DEFAULT_CAPACITY, KeyExtractor, MAX_LOAD_FACTOR, MultiSlabTable, PersistedKey,
+    AggregationValue, DEFAULT_CAPACITY, KeyExtractor, MAX_LOAD_FACTOR, MultiSlabTable,
+    PersistedKey, Prober,
 };
 
 /// Collision-to-entry ratio at which we double the target table.
@@ -56,20 +57,18 @@ const SCAN_BATCH_SIZE: usize = 100;
 
 const PREFETCH_DISTANCE: usize = 8;
 
-/// Try to resize `target` if cumulative collision pressure is too high.
+/// Try to resize the target if cumulative collision pressure is too high.
 #[inline]
 fn resize_if_needed<K: KeyExtractor, V: AggregationValue>(
     allocator: &mut SlabAllocator,
-    target: &mut MultiSlabTable<K, V>,
+    target: &mut Prober<'_, <K as KeyExtractor>::Persisted, V>,
 ) {
     // Integer form of `collisions / len > RESIZE_COLLISION_RATIO`. This runs on
     // the critical path after every insert, so we avoid the int→float converts
     // and the float division (~20+ cycles each) that would otherwise serialize
     // the merge's random-access inserts and cap throughput well below DRAM
     // bandwidth. `RESIZE_COLLISION_RATIO` is 2.0, so the test is `collisions > 2*len`.
-    if target.collisions() > target.len() * RESIZE_COLLISION_RATIO as usize {
-        target.resize(allocator, target.capacity() << 1);
-    }
+    target.resize_on_collisions(allocator, RESIZE_COLLISION_RATIO as usize);
 }
 
 /// Scan the expected slot range `[start, end)` across all source `tables`,
@@ -85,7 +84,7 @@ fn merge_within_partition_bounds<K: KeyExtractor, V: AggregationValue>(
     partition: usize,
     slot_count: usize,
     tables: &[&MultiSlabTable<K, V>],
-    target: &mut MultiSlabTable<K, V>,
+    target: &mut Prober<'_, <K as KeyExtractor>::Persisted, V>,
     partition_bits: u32,
     cfg: &V::SharedContext,
 ) {
@@ -143,7 +142,7 @@ fn merge_past_partition_bounds<K: KeyExtractor, V: AggregationValue>(
     partition: usize,
     slot_count: usize,
     tables: &[&MultiSlabTable<K, V>],
-    target: &mut MultiSlabTable<K, V>,
+    target: &mut Prober<'_, <K as KeyExtractor>::Persisted, V>,
     partition_bits: u32,
     cfg: &V::SharedContext,
 ) {
@@ -182,7 +181,7 @@ fn merge_into_partition<K: KeyExtractor, V: AggregationValue>(
     partition: usize,
     slot_count: usize,
     tables: Vec<&MultiSlabTable<K, V>>,
-    target: &mut MultiSlabTable<K, V>,
+    target: &mut Prober<'_, <K as KeyExtractor>::Persisted, V>,
     partition_bits: u32,
     cfg: &V::SharedContext,
 ) {
@@ -230,8 +229,13 @@ pub(super) fn merge_combined<K: KeyExtractor, V: AggregationValue>(
     let partition_bits = num_partitions.trailing_zeros();
     let mut allocator = SlabAllocator::new(true);
     let mut cap = partition_capacity.max(DEFAULT_CAPACITY);
-    let mut target: MultiSlabTable<K, V> =
+    let mut result: MultiSlabTable<K, V> =
         <MultiSlabTable<K, V>>::new(&mut allocator, cap, partition_bits, cfg);
+    // One geometry snapshot for the whole partition job: the scatter fold and
+    // the slot-range merges below probe the target once per row/entry, and a
+    // per-call snapshot would be paid on each. Resizes go through the prober,
+    // which re-snapshots.
+    let mut target = result.prober();
 
     // 1. Scatter buffers (present only when some worker switched). Each row is
     //    inserted once — the consume phase did no aggregation, so this is the only
@@ -277,14 +281,14 @@ pub(super) fn merge_combined<K: KeyExtractor, V: AggregationValue>(
                             ahead_key.prefetch_blob(key_arena);
                             target.prefetch(*ahead_hash);
                         }
-                        grow_if_full::<K, V>(&mut allocator, &mut target, &mut cap);
+                        target.grow_if_full(&mut allocator, &mut cap);
                         let live = K::resolve_persisted(key_arena, key);
                         target.merge::<false, _>(hash, live, value, cfg);
                     },
                 );
             } else {
                 wb.0[bucket].for_each(|(hash, key, value)| {
-                    grow_if_full::<K, V>(&mut allocator, &mut target, &mut cap);
+                    target.grow_if_full(&mut allocator, &mut cap);
                     let live = K::resolve_persisted(key_arena, key);
                     target.merge::<false, _>(hash, live, value, cfg);
                 });
@@ -317,7 +321,8 @@ pub(super) fn merge_combined<K: KeyExtractor, V: AggregationValue>(
             cfg,
         );
     }
-    target
+    drop(target);
+    result
 }
 /// Merge one partition's per-node aggregated tables into its final table.
 ///
@@ -354,33 +359,20 @@ pub(super) fn merge_node_aggregated_tables<K: KeyExtractor, V: AggregationValue>
         let cap = partition_capacity.max(DEFAULT_CAPACITY);
         <MultiSlabTable<K, V>>::new(&mut allocator, cap, partition_bits, cfg)
     };
+    let mut prober = target.prober();
     for node_table in &node_tables {
         for entry in node_table.iter(0) {
-            target.merge_from::<true, _>(
+            prober.merge_from::<true, _>(
                 entry.hash,
                 K::resolve_persisted(key_arena, *entry.key),
                 entry.stored,
                 cfg,
             );
-            resize_if_needed::<K, V>(&mut allocator, &mut target);
+            resize_if_needed::<K, V>(&mut allocator, &mut prober);
         }
     }
+    drop(prober);
     target
-}
-
-/// Grow a merge target by 4x if it has crossed its load threshold. A safety net:
-/// `partition_capacity` is sized (from the HLL estimate) to hold the partition's
-/// groups, so with a sound estimate this never fires.
-#[inline]
-fn grow_if_full<K: KeyExtractor, V: AggregationValue>(
-    allocator: &mut SlabAllocator,
-    target: &mut MultiSlabTable<K, V>,
-    cap: &mut usize,
-) {
-    if target.undersized() {
-        *cap *= 4;
-        target.resize(allocator, *cap);
-    }
 }
 
 #[cfg(test)]

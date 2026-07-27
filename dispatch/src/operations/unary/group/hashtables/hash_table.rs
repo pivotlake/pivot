@@ -746,6 +746,74 @@ impl<K: PersistedKey, V: AggregationValue> Prober<'_, K, V> {
         self.table.undersized()
     }
 
+    /// See [`BaseHashTable::merge`]. The merge phase folds one scattered row
+    /// per call, so it keeps one prober per partition job rather than paying a
+    /// geometry snapshot per row.
+    #[inline(always)]
+    pub fn merge<const COUNT_COLLISIONS: bool, L>(
+        &mut self,
+        hash: u64,
+        key: L,
+        value: V,
+        ctx: &V::SharedContext,
+    ) where
+        L: LiveKey<Persisted = K>,
+    {
+        self.probe_fold::<COUNT_COLLISIONS, L, V, _, _>(
+            hash,
+            key,
+            value,
+            |value, stored| V::store(stored, value),
+            |value, stored| V::merge_value(stored, value, ctx),
+        );
+    }
+
+    /// See [`BaseHashTable::merge_from`].
+    #[inline(always)]
+    pub fn merge_from<const COUNT_COLLISIONS: bool, L>(
+        &mut self,
+        hash: u64,
+        key: L,
+        src: &V::Stored,
+        ctx: &V::SharedContext,
+    ) where
+        L: LiveKey<Persisted = K>,
+    {
+        self.probe_fold::<COUNT_COLLISIONS, L, &V::Stored, _, _>(
+            hash,
+            key,
+            src,
+            |src, stored| V::clone_stored(stored, src),
+            |src, stored| V::merge_stored(stored, src, ctx),
+        );
+    }
+
+    /// Grow the table 4x (updating `cap`) if it has crossed its load threshold,
+    /// re-snapshotting the geometry the resize invalidated. The merge's
+    /// safety-net growth, kept on the prober so the per-row fold loop needn't
+    /// give up its snapshot.
+    #[inline(always)]
+    pub fn grow_if_full(&mut self, allocator: &mut SlabAllocator, cap: &mut usize) {
+        if self.table.undersized() {
+            *cap *= 4;
+            self.table.resize(allocator, *cap);
+            self.geo = self.table.geometry();
+        }
+    }
+
+    /// Double the table if cumulative collision pressure is too high (see the
+    /// merge's resize ratio), re-snapshotting the geometry on resize.
+    /// `collision_ratio` is the integer threshold: resize once
+    /// `collisions > collision_ratio * len`.
+    #[inline(always)]
+    pub fn resize_on_collisions(&mut self, allocator: &mut SlabAllocator, collision_ratio: usize) {
+        if self.table.collisions() > self.table.len() * collision_ratio {
+            let new_size = self.table.capacity() << 1;
+            self.table.resize(allocator, new_size);
+            self.geo = self.table.geometry();
+        }
+    }
+
     /// See [`BaseHashTable::probe_fold`]; this is its implementation, reading
     /// the layout off the snapshot.
     #[inline(always)]
