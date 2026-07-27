@@ -470,6 +470,13 @@ impl<'plan> CreateTable<'plan> {
         ffi::lo_create_table_name(self.raw)
     }
 
+    /// The target database (datastore) of `CREATE TABLE db.schema.t`, or `None`
+    /// when the statement is unqualified (routes to the default datastore).
+    pub fn datastore(self) -> Option<String> {
+        let datastore = ffi::lo_create_table_datastore(self.raw);
+        (!datastore.is_empty()).then_some(datastore)
+    }
+
     pub fn columns(self) -> impl Iterator<Item = (String, BoundLogicalType)> {
         (0..ffi::lo_create_column_count(self.raw)).map(move |i| {
             (

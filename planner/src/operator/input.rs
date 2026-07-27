@@ -1,7 +1,7 @@
 //! [`Input`] — scans a [`Table`] from the catalog.
 
 use super::slot_for;
-use crate::catalog::{CatalogTransaction, DynamicScanPredicate, Table};
+use crate::catalog::{DynamicScanPredicate, Table};
 use crate::compile::{DynamicFilterSlots, Error};
 use crate::dynamic_filter::DynamicFilter;
 use crate::expression::Expression;
@@ -55,7 +55,6 @@ impl Input {
     pub(crate) fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
-        transaction: &dyn CatalogTransaction,
         slots: &mut DynamicFilterSlots,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let column_indices: Vec<usize> = self
@@ -77,7 +76,6 @@ impl Input {
                 projection,
                 dynamic_filters,
                 self.emit_row_group_metadata,
-                transaction,
             )
             .map_err(Error::TableScan)
     }

@@ -247,7 +247,7 @@ async fn run_query(
         let elapsed = start.elapsed().as_millis();
         iterations_ms.push(elapsed);
         println!(
-            "[{}/{}] Query {} — {}ms",
+            "[{}/{}] Query {}: {}ms",
             i + 1,
             opts.iterations,
             query.id,
@@ -310,7 +310,7 @@ fn check_or_update_expected(query: &Query, actual: &str, update: bool) -> Result
 ///
 /// `setup_template` reads the suite's `setup.sql`, substitutes `{source}`
 /// with the data path, and ships it as one `simple_query`. Tables persist on
-/// the server's `ParquetCatalog` for the lifetime of the process — fine,
+/// the server's `DeltaDatastore` for the lifetime of the process, fine,
 /// since we tear the server down at the end of `main`.
 pub async fn run_suite(port: u16, suite: &Suite, opts: &RunOptions) -> Result<SuiteRun> {
     let (client, connection) = tokio_postgres::Config::new()

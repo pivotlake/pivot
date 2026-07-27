@@ -2,100 +2,17 @@
 name = "catalog"
 version.workspace = true
 edition.workspace = true
+description = "The cross-datastore catalog: presents many named datastores to the planner as one Catalog, opening a per-datastore sub-transaction per query."
 
 [dependencies]
 planner = { workspace = true }
-async-trait = "0.1"
-# `rt` for `spawn_blocking`: a transaction commit with uploaded files hops its
-# blocking store I/O off the caller's async thread itself.
-tokio = { workspace = true, features = ["rt"] }
+datastore = { workspace = true }
 dispatch = { workspace = true }
-thriftparquet = { workspace = true }
-arrow-array = { workspace = true }
-arrow-ord = { workspace = true }
-arrow-row = { workspace = true }
-arrow-arith = { workspace = true }
-arrow-cast = { workspace = true }
-arrow-schema = { workspace = true }
-arrow-buffer = { workspace = true }
-# Filtering a decoded batch down to the rows a pushed-down equality keeps
-# (see the row-group decoder's view-equality test).
-arrow-select = { workspace = true }
-# Variant (JSON) columns: `parquet-variant` supplies the value/path types the
-# shredding inference walks, `parquet-variant-compute` the shred/unshred kernels
-# each output file's layout is applied with.
-parquet-variant = { workspace = true }
-parquet-variant-compute = { workspace = true }
+datastore-delta = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
-bytes = { workspace = true }
-crossbeam-deque = { workspace = true }
-ahash = { workspace = true }
-snap = { workspace = true }
-# The database-level `_pivot_manifest.json` table index is serialized as JSON.
-# Per-table state is standard Delta Lake metadata under each table's `_delta_log`.
-serde = { workspace = true }
-serde_json = { workspace = true }
-# Synchronous object-store access for the catalog control plane (LIST/GET/PUT/
-# conditional-PUT of the manifest and initial Delta commit), so the engine
-# never spins up an async runtime.
-# `ureq` is blocking HTTP + rustls; `aws-sigv4::sign` is a pure sync function we
-# call to sign S3 requests (the tokio it transitively pulls is never driven).
-# Credentials are read from the environment ourselves. The hot data path uses
-# none of this — it's on the ring.
-ureq = { workspace = true, features = ["json"] }
-aws-sigv4 = "1"
-aws-credential-types = "1"
-# Parse S3 ListObjectsV2 XML.
-quick-xml = { version = "0.37", features = ["serialize"] }
-# Build/parse the concrete URLs handed to the io_uring HTTP reader.
-url = { workspace = true }
-# Delta Kernel owns per-table snapshot semantics.  The catalog index remains
-# Pivot's `_pivot_manifest.json`, while every indexed table is loaded from its
-# standard `_delta_log` through the reference Arrow/object-store engine.
-delta_kernel = { version = "0.25.0", features = ["arrow-conversion", "internal-api"] }
-delta_kernel_default_engine = { version = "0.25.0", features = ["rustls", "arrow-58"] }
-uuid = { version = "1", features = ["v4"] }
-# Optional, behind the `test-support` feature: the in-Docker object-store test
-# harness exposed as `catalog::test_support`. testcontainers brings up MinIO;
-# tempfile backs the local() backend. (The harness's other needs — ureq,
-# aws-sigv4, aws-credential-types, url — are already deps above.)
-testcontainers = { version = "0.24", features = ["blocking"], optional = true }
-testcontainers-modules = { version = "0.12", features = ["minio"], optional = true }
-tempfile = { workspace = true, optional = true }
-
-[features]
-# Exposes `catalog::test_support`, a MinIO object-store harness used by
-# this crate's object-store integration tests and by downstream crates (e.g.
-# `server`) that want to run a catalog rooted in a real bucket.
-test-support = ["dep:testcontainers", "dep:testcontainers-modules", "dep:tempfile"]
+# `Catalog::commit_transaction` is async: the composite awaits each touched
+# datastore's own commit (each datastore self-offloads its blocking I/O).
+async-trait = "0.1"
 
 [dev-dependencies]
-# Self-dependency to turn on `test-support` for this crate's own integration
-# tests (so they can use `catalog::test_support`).
-catalog = { path = ".", features = ["test-support"] }
-# `test-util` exposes dispatch's single-operator test harness for the moved
-# Parquet reader unit/integration tests.
-dispatch = { workspace = true, features = ["test-util"] }
-# `variant_experimental` so `ArrowWriter` emits the VARIANT logical type for an
-# extension-tagged variant field (the variant scan test reads it back).
-parquet = { workspace = true, features = ["variant_experimental"] }
-arrow-schema = { workspace = true }
-arrow = { workspace = true, features = ["prettyprint"] }
-# Build a variant column (`json_to_variant`) and extract a path (`variant_get`)
-# in the variant scan test; render a written-back variant to JSON to assert the
-# documents survived shredding, the same way a query renders a variant column.
-parquet-variant = { workspace = true }
-parquet-variant-compute = { workspace = true }
-parquet-variant-json = { workspace = true }
 tempfile = { workspace = true }
-core_affinity = { workspace = true }
-tracing-subscriber = { workspace = true }
-# Parquet decompression/decoding microbenchmarks (`benches/decode.rs`).
-# `harness = false`: we drive Criterion from our own `main` so one `Dispatch`
-# (worker pool) + one synthetic parquet are built once and reused.
-criterion = { workspace = true }
-
-[[bench]]
-name = "decode"
-harness = false

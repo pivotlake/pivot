@@ -28,11 +28,11 @@
 //! use std::path::Path;
 //! use std::sync::Arc;
 //!
-//! use catalog::parquet::{ParquetTable, table_input};
+//! use datastore_delta::parquet::{ParquetTable, table_input};
 //! use dispatch::{DataFlowDispatcher, Dispatch, Projection, RecordBatchOperatorSpec};
 //! use planner::Planner;
 //! use planner::catalog::{
-//!     Catalog, CatalogTransaction, Column, CreateTableRequest, DynamicScanPredicate, Table,
+//!     Catalog, CatalogTransaction, Column, DynamicScanPredicate, Table,
 //! };
 //! use planner::types::Type;
 //!
@@ -43,7 +43,7 @@
 //! }
 //!
 //! impl Table for MyTable {
-//!     fn compile(&self, dispatcher: &DataFlowDispatcher, projection: Projection, _filters: Vec<DynamicScanPredicate>, _emit_row_group_metadata: bool, _transaction: &dyn CatalogTransaction) -> planner::catalog::Result<RecordBatchOperatorSpec> {
+//!     fn compile(&self, dispatcher: &DataFlowDispatcher, projection: Projection, _filters: Vec<DynamicScanPredicate>, _emit_row_group_metadata: bool) -> planner::catalog::Result<RecordBatchOperatorSpec> {
 //!         Ok(table_input(dispatcher, &self.parquet, projection, false))
 //!     }
 //!     fn columns(&self) -> Vec<Column> { self.columns.clone() }
@@ -68,8 +68,10 @@
 //!     tables: HashMap<String, MyTableTemplate>,
 //! }
 //!
+//! // A single read-only database presented to the planner as a one-entry
+//! // catalog: it ignores the datastore qualifier and resolves by table name.
 //! impl CatalogTransaction for MyTransaction {
-//!     fn table(&self, name: &str) -> Option<Box<dyn Table>> {
+//!     fn bind_table(&self, _datastore: &str, name: &str) -> Option<Box<dyn Table>> {
 //!         self.tables
 //!             .get(name)
 //!             .cloned()
@@ -81,9 +83,6 @@
 //! impl Catalog for MyCatalog {
 //!     fn begin_transaction(&self) -> Arc<dyn CatalogTransaction> {
 //!         Arc::new(MyTransaction { tables: self.tables.clone() })
-//!     }
-//!     fn create_table(&self, _req: CreateTableRequest, _dispatcher: &DataFlowDispatcher) -> planner::catalog::Result<RecordBatchOperatorSpec> {
-//!         unimplemented!("this catalog is read-only")
 //!     }
 //! }
 //!
@@ -98,7 +97,7 @@
 //! tables.insert("hits".to_string(), template);
 //! let catalog: Arc<dyn Catalog> = Arc::new(MyCatalog { tables });
 //!
-//! let mut planner = Planner::new(catalog.clone());
+//! let mut planner = Planner::new();
 //!
 //! // One transaction per query: SQL -> Pivot Plan -> dispatch spec -> execution.
 //! let transaction = catalog.begin_transaction();
@@ -133,15 +132,21 @@ mod test_support;
 pub mod types;
 use std::sync::Arc;
 
-use crate::catalog::Catalog;
 pub use operator::{Operator, SetVariable, TableFunction, TableFunctionSignature};
 pub use plan::{Plan, PlanNode};
 use thiserror::Error;
 
-use crate::catalog::{CatalogTransaction, DuckDBCatalogAdapter, DuckDBTransactionAdapter};
+use crate::catalog::{CatalogTransaction, DuckDBScalarFunctionBinder, DuckDBTransactionAdapter};
 pub use duckdb_planner::{
     DuckDBBind, DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, ScalarValue,
 };
+
+/// The datastore name a datastore opened without an explicit one takes: the
+/// database DuckDB attaches it as by default and the key it registers under. A
+/// single-datastore [`Planner`] attaches under this name and makes it DuckDB's
+/// current database, so unqualified names resolve against it. Owned here, the
+/// lowest crate that names it; `catalog` re-exports it.
+pub const DEFAULT_DATASTORE_NAME: &str = "default";
 
 /// Errors surfaced by [`Planner::plan`].
 #[derive(Debug, Error)]
@@ -152,28 +157,44 @@ pub enum Error {
     PlanConversion(#[from] plan::Error),
 }
 
-/// Entry point for using crate: plans SQL statements against a [`Catalog`] into a Pivot [`Plan`].
+/// Entry point for using crate: plans SQL statements into a Pivot [`Plan`].
 ///
-/// A `Planner` owns a [`duckdb_planner::PlannerContext`] wrapped around a
-/// [`DuckDBCatalogAdapter`], so DuckDB can resolve table names against the
-/// Pivot catalog during binding. A single `Planner` instance can be reused
+/// A `Planner` owns a [`duckdb_planner::PlannerContext`] configured with the
+/// datastore names to attach as DuckDB databases; it holds no catalog. Every
+/// query hands [`plan`](Self::plan) a [`CatalogTransaction`], and all table and
+/// DDL resolution flows through that. A single `Planner` instance can be reused
 /// for many queries.
 pub struct Planner {
-    catalog: Arc<dyn Catalog>,
     planner_context: duckdb_planner::PlannerContext,
 }
 
 impl Planner {
-    /// Create a new `Planner` backed by `catalog`.
-    ///
-    /// The catalog is cloned into the internal DuckDB adapter so both the
-    /// translation layer and DuckDB's binder see the same tables.
-    pub fn new(catalog: Arc<dyn Catalog>) -> Self {
+    /// Create a `Planner` for a single datastore, attached to DuckDB as the
+    /// [`DEFAULT_DATASTORE_NAME`] database (its current database, so unqualified
+    /// names resolve against it). The degenerate one-datastore case of
+    /// [`with_datastore_names`](Self::with_datastore_names).
+    pub fn new() -> Self {
+        Self::with_datastore_names(
+            vec![DEFAULT_DATASTORE_NAME.to_string()],
+            DEFAULT_DATASTORE_NAME.to_string(),
+        )
+    }
+
+    /// Create a `Planner` over several named datastores, each attached to DuckDB
+    /// as its own database so a query can name it (`db.schema.t`). `default_name`
+    /// is the current database. The planner holds no catalog: the per-query
+    /// [`CatalogTransaction`] passed to [`plan`](Self::plan) must span these
+    /// datastores and routes each table to the right one's snapshot by the attach
+    /// name.
+    pub fn with_datastore_names(database_names: Vec<String>, default_name: String) -> Self {
         Self {
-            catalog: catalog.clone(),
-            planner_context: duckdb_planner::PlannerContext::new(Arc::new(DuckDBCatalogAdapter {
-                catalog,
-            })),
+            // The static provider only answers generic scalar functions, shared
+            // across every attached datastore.
+            planner_context: duckdb_planner::PlannerContext::new(
+                Arc::new(DuckDBScalarFunctionBinder),
+                database_names,
+                default_name,
+            ),
         }
     }
 
@@ -197,9 +218,14 @@ impl Planner {
         // Push a plain LIMIT (no ORDER BY) into a grouped aggregate beneath it.
         root.annotate_group_limit();
         Ok(Plan {
-            catalog: self.catalog.clone(),
             root,
             output_names: planned.into_output_names(),
         })
+    }
+}
+
+impl Default for Planner {
+    fn default() -> Self {
+        Self::new()
     }
 }

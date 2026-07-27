@@ -1,0 +1,15 @@
+[package]
+name = "metastore-toml"
+version.workspace = true
+edition.workspace = true
+description = "TOML-backed metastore provider for PivotDB."
+
+[dependencies]
+metastore = { workspace = true }
+catalog = { workspace = true }
+datastore-delta = { workspace = true }
+dispatch = { workspace = true }
+
+serde = { workspace = true }
+thiserror = { workspace = true }
+toml = "0.8"

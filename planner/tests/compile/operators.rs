@@ -1662,17 +1662,28 @@ fn group_order_by_key_asc_with_offset(mut testing_planner: TestingPlanner) {
 
 #[derive(Debug, Default)]
 struct RecordingCatalog {
-    created_tables: Mutex<Vec<CreateTableRequest>>,
+    created_tables: Arc<Mutex<Vec<CreateTableRequest>>>,
 }
 
 /// The CREATE TABLE statements planned here reference no tables, so the
-/// transaction resolves nothing.
+/// transaction resolves nothing; it only records the `create_table` it is asked
+/// to compile (which now runs through the transaction, not the catalog).
 #[derive(Debug)]
-struct EmptyTransaction;
+struct RecordingTransaction {
+    created_tables: Arc<Mutex<Vec<CreateTableRequest>>>,
+}
 
-impl planner::catalog::CatalogTransaction for EmptyTransaction {
-    fn table(&self, _name: &str) -> Option<Box<dyn Table>> {
+impl planner::catalog::CatalogTransaction for RecordingTransaction {
+    fn bind_table(&self, _datastore: &str, _name: &str) -> Option<Box<dyn Table>> {
         None
+    }
+
+    fn bind_create_table(
+        &self,
+        request: CreateTableRequest,
+    ) -> planner::catalog::Result<Box<dyn planner::catalog::TableCreation>> {
+        self.created_tables.lock().unwrap().push(request);
+        Ok(Box::new(NoRowsCreation))
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -1680,22 +1691,28 @@ impl planner::catalog::CatalogTransaction for EmptyTransaction {
     }
 }
 
-impl Catalog for RecordingCatalog {
-    fn begin_transaction(&self) -> Arc<dyn planner::catalog::CatalogTransaction> {
-        Arc::new(EmptyTransaction)
-    }
+/// The resolved create a [`RecordingTransaction`] returns: it compiles to a
+/// no-rows dataflow (CREATE TABLE yields no rows; a real datastore would commit
+/// the table when this compiles).
+struct NoRowsCreation;
 
-    fn create_table(
+impl planner::catalog::TableCreation for NoRowsCreation {
+    fn compile(
         &self,
-        request: CreateTableRequest,
         dispatcher: &dispatch::DataFlowDispatcher,
     ) -> planner::catalog::Result<dispatch::RecordBatchOperatorSpec> {
-        self.created_tables.lock().unwrap().push(request);
-        // CREATE TABLE yields no rows; a real catalog would commit the table here.
         Ok(dispatch::RecordBatchOperatorSpec::from_nullary(
             dispatcher,
             (0..dispatcher.worker_count()).map(|_| NoRowsNullary::default()),
         ))
+    }
+}
+
+impl Catalog for RecordingCatalog {
+    fn begin_transaction(&self) -> Arc<dyn planner::catalog::CatalogTransaction> {
+        Arc::new(RecordingTransaction {
+            created_tables: self.created_tables.clone(),
+        })
     }
 }
 
@@ -1742,7 +1759,7 @@ impl dispatch::Nullary<RecordBatch> for NoRowsNullary {
 fn create_table_calls_catalog_once() {
     let dispatch = Dispatch::spin_up(1, 32, None);
     let catalog = Arc::new(RecordingCatalog::default());
-    let mut planner = Planner::new(catalog.clone());
+    let mut planner = Planner::new();
     let transaction = catalog.begin_transaction();
 
     let results = planner
@@ -1774,7 +1791,7 @@ fn create_table_calls_catalog_once() {
 fn create_table_passes_with_options_to_catalog() {
     let dispatch = Dispatch::spin_up(1, 32, None);
     let catalog = Arc::new(RecordingCatalog::default());
-    let mut planner = Planner::new(catalog.clone());
+    let mut planner = Planner::new();
     let transaction = catalog.begin_transaction();
 
     let results = planner

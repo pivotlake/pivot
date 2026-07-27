@@ -6,13 +6,15 @@
 
 mod common;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use catalog::ParquetCatalog;
+use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
 use common::{pick_free_port, wait_until_listening};
+use datastore_delta::DeltaDatastore;
 use dispatch::Dispatch;
 use server::Server;
 use tokio::sync::oneshot;
@@ -28,7 +30,16 @@ fn shutdown_signal_drains_all_worker_threads() {
 
     let server_thread = thread::spawn(move || {
         let dispatch = Dispatch::spin_up(workers, 32, None);
-        let catalog = Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()));
+        let data_dir = tempfile::tempdir().unwrap();
+        let datastore: Arc<dyn Datastore> =
+            DeltaDatastore::open_local(data_dir.path(), dispatch.dispatcher()).unwrap();
+        let catalog = Arc::new(
+            PivotCatalog::new(
+                HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),
+                DEFAULT_DATASTORE_NAME.to_string(),
+            )
+            .unwrap(),
+        );
         assert_eq!(
             dispatch.workers(),
             workers,
@@ -39,14 +50,7 @@ fn shutdown_signal_drains_all_worker_threads() {
             .build()
             .unwrap();
         rt.block_on(async move {
-            let server = Server::new(
-                bind,
-                dispatch,
-                catalog,
-                0,
-                4,
-                server::DEFAULT_CATALOG_REFRESH,
-            );
+            let server = Server::new(bind, dispatch, catalog);
             server
                 .serve(Box::pin(async move {
                     let _ = shutdown_rx.await;

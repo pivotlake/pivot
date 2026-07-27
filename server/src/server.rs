@@ -16,26 +16,21 @@
 //!
 //! On clean shutdown the accept loop sets the exit flag itself and drains the
 //! worker watchers, so when [`Server::serve`] returns `Ok(())` every worker
-//! thread has already terminated.
+//! thread has already terminated. Each datastore's own refresh and compaction
+//! tasks watch that same exit flag and self-exit, so the server no longer
+//! orchestrates them.
 
 use crate::query_handler::PivotHandlers;
-use catalog::ParquetCatalog;
-use compact::Compaction;
+use catalog::PivotCatalog;
 use dispatch::{DataFlowDispatcher, Dispatch, Shutdown};
 use pgwire::tokio::process_socket;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::task::{JoinError, JoinSet};
-use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
-
-/// Default cadence of the background catalog refresh (the
-/// `catalog_refresh_interval` argument of [`Server::new`]).
-pub const DEFAULT_CATALOG_REFRESH: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -65,22 +60,15 @@ pub struct Server {
     /// Cloned dispatcher, kept for the query handler (compiling plans) and the
     /// bundled web console's in-process queries.
     dispatcher: DataFlowDispatcher,
-    /// The concrete catalog, kept so the bundled compacter can read and swap the
-    /// Parquet files a table holds. The query handlers hold it as a
-    /// `dyn Catalog`.
-    catalog: Arc<ParquetCatalog>,
-    /// Target size for the bundled compacter (`0` = don't run one).
-    compact_bytes: u64,
-    /// The compacter's count trigger for sub-target (low-traffic) partitions.
-    compact_min_files: usize,
+    /// Every datastore, presented as one composite catalog. Query binding and
+    /// dashboard access start here. [`serve`](Self::serve) starts each datastore's
+    /// background maintenance when it begins serving and aborts it on shutdown,
+    /// before the worker pool is torn down.
+    catalog: Arc<PivotCatalog>,
     /// Address for the optional bundled web dashboard (the `http` module).
     /// `None` (the default) leaves it off; set it with
     /// [`with_http_bind`](Self::with_http_bind).
     http_bind: Option<SocketAddr>,
-    /// How often the background sweep refreshes the in-memory catalog from the
-    /// store (Delta versions + new footers). Queries snapshot the in-memory
-    /// set, so this bounds staleness for externally committed data.
-    catalog_refresh_interval: Duration,
 }
 
 impl Server {
@@ -90,14 +78,7 @@ impl Server {
     /// dispatcher for the query handler and adopts every worker `JoinHandle`
     /// for the shutdown / fault-detection path. Pass port `0` in `bind` to
     /// let the OS pick a free port (useful in tests).
-    pub fn new(
-        bind: SocketAddr,
-        dispatch: Dispatch,
-        catalog: Arc<ParquetCatalog>,
-        compact_bytes: u64,
-        compact_min_files: usize,
-        catalog_refresh_interval: Duration,
-    ) -> Self {
+    pub fn new(bind: SocketAddr, dispatch: Dispatch, catalog: Arc<PivotCatalog>) -> Self {
         // Clone the dispatcher out *before* `into_parts` drops it; the query
         // handler needs it to compile every plan, and the web console runs
         // queries on the worker pool.
@@ -114,10 +95,7 @@ impl Server {
             handlers: Arc::new(PivotHandlers::new(catalog.clone(), dispatcher.clone())),
             dispatcher,
             catalog,
-            compact_bytes,
-            compact_min_files,
             http_bind: None,
-            catalog_refresh_interval,
         }
     }
 
@@ -142,25 +120,18 @@ impl Server {
         let listener = TcpListener::bind(self.bind).await?;
         info!(addr = %self.bind, "listening for psql connections");
 
-        // Start the bundled compacter. It re-encodes on the dispatch workers, so
-        // it must be stopped before the workers stop. It reads and swaps a
-        // table's files through the catalog.
-        let compaction = Compaction::start(
-            self.catalog.clone(),
-            self.compact_bytes,
-            self.compact_min_files,
-        );
+        // Start each datastore's background maintenance now that we are serving,
+        // so it spawns onto this runtime. The shutdown arm aborts it before the
+        // worker pool is torn down.
+        self.catalog.start();
 
         // Optionally serve the bundled web dashboard. It reads the engine's live
-        // state directly - the catalog, the compaction stats handle, and the
-        // dispatcher (for the in-process query console). Read-only except
-        // `/api/query`, so on shutdown we just abort the task.
+        // state directly - the catalog and the dispatcher (for the in-process
+        // query console). Read-only except `/api/query`, so on shutdown we just
+        // abort the task.
         let http_task = self.http_bind.map(|bind| {
-            let state = crate::http::IntrospectState::new(
-                self.catalog.clone(),
-                self.dispatcher.clone(),
-                compaction.stats(),
-            );
+            let state =
+                crate::http::IntrospectState::new(self.catalog.clone(), self.dispatcher.clone());
             tokio::spawn(async move {
                 if let Err(e) = crate::http::serve(bind, state, std::future::pending()).await {
                     error!(?e, "web dashboard server error");
@@ -168,72 +139,33 @@ impl Server {
             })
         });
 
-        // Keep the in-memory catalog current: on an interval, reload every
-        // table to its latest committed Delta version and fetch any new
-        // files' footers. Queries bind against a snapshot of the in-memory set
-        // and never read the store themselves, so this sweep is what makes
-        // externally committed data (another process, a bucket writer)
-        // visible. The catalog was fully loaded at open, so the
-        // immediate first tick is skipped.
-        let refresh_task = {
-            let catalog = self.catalog.clone();
-            let mut tick = tokio::time::interval(self.catalog_refresh_interval);
-            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-            tokio::spawn(async move {
-                // A tokio interval fires its first tick immediately on
-                // creation; consume it so the first refresh runs one full
-                // interval from now (the catalog was just loaded at open).
-                tick.tick().await;
-                loop {
-                    tick.tick().await;
-                    let catalog = catalog.clone();
-                    // The refresh drives footer-fetch dataflows and blocking
-                    // store reads, so it runs off the reactor.
-                    match tokio::task::spawn_blocking(move || catalog.refresh_catalog()).await {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(e)) => warn!(error = %e, "catalog refresh failed"),
-                        Err(e) => warn!(error = %e, "catalog refresh panicked"),
-                    }
-                }
-            })
-        };
-
-        // `Option` so the two terminal arms below can each take ownership
-        // without the borrow checker tripping over the loop.
-        let mut compaction = Some(compaction);
-
         loop {
             tokio::select! {
                 // Prefer a clean shutdown over a worker exit if both fire on
                 // the same poll: shutdown should look clean.
                 biased;
                 _ = &mut shutdown => {
-                    info!("shutdown signalled, stopping compaction then workers");
-                    refresh_task.abort();
+                    info!("shutdown signalled, stopping workers");
                     if let Some(task) = &http_task {
                         task.abort();
                     }
-                    // Stop compaction first -- an in-flight merge encodes on the
-                    // workers, which must still be alive.
-                    if let Some(compaction) = compaction.take() {
-                        compaction.shutdown().await;
-                    }
+                    // Stop each datastore's maintenance *before* tearing down the
+                    // pool, so no refresh/compaction sweep races the workers'
+                    // exit.
+                    self.catalog.abort();
+                    // Flip the shared exit flag: every dispatch worker watches it
+                    // and exits.
                     self.shutdown.shutdown();
                     // Wait for every worker to observe the flag and exit. No
-                    // need to inspect results — we initiated the shutdown.
+                    // need to inspect results; we initiated the shutdown.
                     while self.worker_watchers.join_next().await.is_some() {}
                     return Ok(());
                 }
                 Some(joined) = self.worker_watchers.join_next() => {
-                    // A worker died: waiting on an in-flight merge would hang on
-                    // the dead worker, so stop compaction without waiting.
-                    refresh_task.abort();
                     if let Some(task) = &http_task {
                         task.abort();
                     }
-                    if let Some(compaction) = compaction.take() {
-                        compaction.abort();
-                    }
+                    self.catalog.abort();
                     self.shutdown.shutdown();
                     return Err(match joined {
                         Ok(Ok(())) => {
@@ -287,31 +219,35 @@ fn format_panic_payload(payload: &Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use catalog::{DEFAULT_DATASTORE_NAME, Datastore};
+    use datastore_delta::DeltaDatastore;
+    use std::collections::HashMap;
     use tokio::sync::oneshot;
 
     fn bind() -> SocketAddr {
         "127.0.0.1:0".parse().unwrap()
     }
 
-    /// An empty in-memory catalog: `Server::serve` only consults it on
-    /// incoming queries, which these tests don't drive.
-    fn catalog(dispatch: &Dispatch) -> Arc<ParquetCatalog> {
-        Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()))
+    /// An empty datastore on a test-owned directory: `Server::serve` only
+    /// consults it on incoming queries, which these tests don't drive.
+    fn catalog(dispatch: &Dispatch) -> (tempfile::TempDir, Arc<PivotCatalog>) {
+        let directory = tempfile::tempdir().unwrap();
+        let datastore: Arc<dyn Datastore> =
+            DeltaDatastore::open_local(directory.path(), dispatch.dispatcher()).unwrap();
+        let catalog = PivotCatalog::new(
+            HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),
+            DEFAULT_DATASTORE_NAME.to_string(),
+        )
+        .unwrap();
+        (directory, Arc::new(catalog))
     }
 
     #[tokio::test]
     async fn shutdown_signal_returns_ok() {
         let (tx, rx) = oneshot::channel::<()>();
         let dispatch = Dispatch::spin_up(1, 32, None);
-        let catalog = catalog(&dispatch);
-        let server = Server::new(
-            bind(),
-            dispatch,
-            catalog,
-            0,
-            compact::DEFAULT_MIN_FILES_TO_MERGE,
-            DEFAULT_CATALOG_REFRESH,
-        );
+        let (_directory, catalog) = catalog(&dispatch);
+        let server = Server::new(bind(), dispatch, catalog);
 
         let join = tokio::spawn(server.serve(Box::pin(async move {
             let _ = rx.await;
