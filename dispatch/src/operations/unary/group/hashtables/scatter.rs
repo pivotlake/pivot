@@ -19,10 +19,20 @@ use std::marker::PhantomData;
 /// worker during consume, drained once by the merge job that owns the
 /// partition.
 pub trait ScatterRows<KP: PersistedKey, V: AggregationValue>: Send {
+    /// A register-resident snapshot of the row layout. Every partition buffer
+    /// of one scatter shares the same layout (it is the signature's), so the
+    /// scatter loop snapshots it once and hands it to every push; the rows
+    /// land in a different partition's buffer each time, which would otherwise
+    /// re-load the layout from the buffer per row. `()` for typed rows.
+    type Geometry: Copy;
+
     /// An empty buffer for a signature described by `ctx` (a runtime-arity
     /// value derives its row stride from it). Allocates nothing until the
     /// first push.
     fn new(ctx: &V::SharedContext) -> Self;
+
+    /// The shared row-layout snapshot (see [`Geometry`](Self::Geometry)).
+    fn geometry(&self) -> Self::Geometry;
 
     /// Number of rows appended.
     fn len(&self) -> usize;
@@ -30,9 +40,11 @@ pub trait ScatterRows<KP: PersistedKey, V: AggregationValue>: Send {
     /// Append one row, seeding its value in place: `seed` receives the row's
     /// zero-initialised-by-write value slot and must fully initialise it (the
     /// consume path seeds from the batch reader; the abandon path copies a
-    /// deduplicated entry's stored value in).
+    /// deduplicated entry's stored value in). `geo` must be this scatter's
+    /// [`geometry`](Self::geometry).
     fn push_with(
         &mut self,
+        geo: Self::Geometry,
         allocator: &mut SlabAllocator,
         hash: u64,
         key: KP,
@@ -59,9 +71,13 @@ pub struct SizedScatterRows<KP: PersistedKey, V: AggregationValue + Copy>(SlabVe
 impl<KP: PersistedKey, V: AggregationValue<Stored = V>> ScatterRows<KP, V>
     for SizedScatterRows<KP, V>
 {
+    type Geometry = ();
+
     fn new(_ctx: &V::SharedContext) -> Self {
         Self(SlabVec::new())
     }
+
+    fn geometry(&self) {}
 
     fn len(&self) -> usize {
         self.0.len()
@@ -70,6 +86,7 @@ impl<KP: PersistedKey, V: AggregationValue<Stored = V>> ScatterRows<KP, V>
     #[inline(always)]
     fn push_with(
         &mut self,
+        _geo: (),
         allocator: &mut SlabAllocator,
         hash: u64,
         key: KP,
@@ -158,7 +175,37 @@ impl<KP: PersistedKey, V: AggregationValue> StridedScatterRows<KP, V> {
     }
 }
 
+/// The strided rows' caller-held layout snapshot: the field offsets, the
+/// stride, and the value's view metadata, all runtime values kept in registers
+/// across a scatter loop.
+pub struct ScatterGeometry<V: AggregationValue> {
+    hash_offset: usize,
+    key_offset: usize,
+    value_offset: usize,
+    stride: usize,
+    meta: V::StoredMeta,
+}
+
+impl<V: AggregationValue> Clone for ScatterGeometry<V> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<V: AggregationValue> Copy for ScatterGeometry<V> {}
+
 impl<KP: PersistedKey, V: AggregationValue> ScatterRows<KP, V> for StridedScatterRows<KP, V> {
+    type Geometry = ScatterGeometry<V>;
+
+    fn geometry(&self) -> ScatterGeometry<V> {
+        ScatterGeometry {
+            hash_offset: self.layout.hash_offset,
+            key_offset: self.layout.key_offset,
+            value_offset: self.layout.value_offset,
+            stride: self.layout.stride,
+            meta: self.meta,
+        }
+    }
+
     fn new(ctx: &V::SharedContext) -> Self {
         let meta = V::stored_meta(ctx);
         let layout = entry_layout::<KP, V>(meta);
@@ -183,6 +230,7 @@ impl<KP: PersistedKey, V: AggregationValue> ScatterRows<KP, V> for StridedScatte
     #[inline(always)]
     fn push_with(
         &mut self,
+        geo: ScatterGeometry<V>,
         allocator: &mut SlabAllocator,
         hash: u64,
         key: KP,
@@ -191,12 +239,14 @@ impl<KP: PersistedKey, V: AggregationValue> ScatterRows<KP, V> for StridedScatte
         if self.cur == self.end {
             self.grow(allocator);
         }
+        // Every offset comes off the caller's snapshot (registers), so the
+        // only buffer state this touches is the row cursor.
         let row = self.cur;
         unsafe {
-            *(row.add(self.layout.hash_offset) as *mut u64) = hash;
-            (row.add(self.layout.key_offset) as *mut KP).write(key);
-            seed(V::stored_mut(row.add(self.layout.value_offset), self.meta));
-            self.cur = row.add(self.layout.stride);
+            *(row.add(geo.hash_offset) as *mut u64) = hash;
+            (row.add(geo.key_offset) as *mut KP).write(key);
+            seed(V::stored_mut(row.add(geo.value_offset), geo.meta));
+            self.cur = row.add(geo.stride);
         }
         self.len += 1;
     }

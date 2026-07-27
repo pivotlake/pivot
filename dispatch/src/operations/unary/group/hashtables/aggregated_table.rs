@@ -396,6 +396,10 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
             ..
         } = self;
         let buffers = buffers.as_mut().unwrap();
+        // One layout snapshot for the whole range: every partition's buffer
+        // shares it, and rows alternate buffers, so per-push loads would
+        // otherwise re-read it from a different object each row.
+        let geo = buffers[0].geometry();
         for i in start..end {
             let hash = hashes[i];
             hll.add(hash);
@@ -404,7 +408,7 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
             // The row's value is seeded straight into the scatter row, so a
             // runtime-arity signature's cells land inline with no per-row
             // allocation.
-            buffers[p].push_with(allocator, hash, key, |stored| {
+            buffers[p].push_with(geo, allocator, hash, key, |stored| {
                 V::seed_stored(stored, value_reader, i, worker_context)
             });
         }
@@ -428,13 +432,14 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
         } = self;
         let table = tables.last_mut().unwrap();
         let buffers = buffers.as_mut().unwrap();
+        let geo = buffers[0].geometry();
         for entry in table.iter(0) {
             let hash = entry.hash;
             hll.add(hash);
             let p = (hash >> shift) as usize;
             // The entry's already-deduplicated partial is copied straight into
             // the scatter row.
-            buffers[p].push_with(allocator, hash, *entry.key, |stored| {
+            buffers[p].push_with(geo, allocator, hash, *entry.key, |stored| {
                 V::clone_stored(stored, entry.stored)
             });
         }
