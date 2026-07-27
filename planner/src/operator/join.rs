@@ -10,6 +10,7 @@
 //! dispatch probe skip materialization entirely.
 
 use crate::compile::Error;
+use crate::types::{Type, physical_arrow_type};
 use dispatch::{JoinOutputColumns, RecordBatchOperatorSpec};
 use std::fmt;
 
@@ -20,6 +21,10 @@ pub struct Join {
     pub probe_key: usize,
     /// The key's column index in the build (second) input's output.
     pub build_key: usize,
+    /// The type both key columns arrive as (DuckDB casts mismatched sides to
+    /// a common type before the join); picks the dispatch join's key
+    /// instantiation.
+    pub key_type: Type,
     /// The probe input columns the join emits, in output order.
     pub probe_output: Vec<usize>,
     /// The build input columns the join emits after the probe columns.
@@ -46,6 +51,12 @@ impl Join {
             probe: self.probe_output.clone(),
             build: self.build_output.clone(),
         };
-        Ok(probe.join(build, self.build_key, self.probe_key, output_columns))
+        Ok(probe.join(
+            build,
+            self.build_key,
+            self.probe_key,
+            &physical_arrow_type(&self.key_type),
+            output_columns,
+        ))
     }
 }

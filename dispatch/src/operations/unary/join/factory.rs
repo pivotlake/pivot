@@ -3,7 +3,9 @@ use std::sync::{Arc, mpsc};
 
 use ahash::RandomState;
 use arrow_array::RecordBatch;
+use arrow_array::types::ArrowPrimitiveType;
 use crossbeam_deque::Injector;
+use std::hash::Hash;
 
 use crate::memory::MultiSlabBuffer;
 use crate::operations::UnaryFactory;
@@ -16,23 +18,23 @@ use crate::operations::unary::join::{JoinCell, JoinOutputColumns, JoinTable};
 use crate::operations::unary::pipeline_breaker::PipelineBreaker;
 
 /// Creates one [`JoinBuildConsumer`] per worker, with shared state wired up.
-pub struct JoinBuildFactory {
+pub struct JoinBuildFactory<T: ArrowPrimitiveType<Native: Hash + Eq>> {
     key_column: usize,
     worker_id: usize,
     hash_state: RandomState,
     partition_sizes: Arc<Vec<AtomicUsize>>,
-    table: JoinTable,
-    injector: Arc<Injector<JoinPartitionJob>>,
+    table: JoinTable<T::Native>,
+    injector: Arc<Injector<JoinPartitionJob<T::Native>>>,
     jobs_injected: Arc<AtomicBool>,
     build_ready: Arc<AtomicBool>,
-    sender: mpsc::Sender<BuildWorkerOutput>,
-    receiver: Option<mpsc::Receiver<BuildWorkerOutput>>,
+    sender: mpsc::Sender<BuildWorkerOutput<T::Native>>,
+    receiver: Option<mpsc::Receiver<BuildWorkerOutput<T::Native>>>,
     remaining_jobs: Arc<AtomicUsize>,
 }
 
 /// Creates one [`Probe`] per worker, all sharing the same [`JoinTable`].
-pub struct JoinProbeFactory {
-    pub(crate) table: JoinTable,
+pub struct JoinProbeFactory<T: ArrowPrimitiveType<Native: Hash + Eq>> {
+    pub(crate) table: JoinTable<T::Native>,
     hash_state: RandomState,
     key_column: usize,
     output_columns: Arc<JoinOutputColumns>,
@@ -45,14 +47,14 @@ pub struct JoinProbeFactory {
 /// Returns `(build_factories, probe_factories, build_ready)`. The build
 /// outputters publish readiness only after every partition job has run; the
 /// graph builder uses that flag to gate every root of the probe input.
-pub fn create_for_workers(
+pub fn create_for_workers<T: ArrowPrimitiveType<Native: Hash + Eq>>(
     build_key_column: usize,
     probe_key_column: usize,
     output_columns: JoinOutputColumns,
     worker_count: usize,
 ) -> (
-    impl IntoIterator<Item = JoinBuildFactory>,
-    impl IntoIterator<Item = JoinProbeFactory>,
+    impl IntoIterator<Item = JoinBuildFactory<T>>,
+    impl IntoIterator<Item = JoinProbeFactory<T>>,
     Arc<AtomicBool>,
 ) {
     let hash_state = RandomState::with_seeds(0, 0, 0, 0);
@@ -60,7 +62,7 @@ pub fn create_for_workers(
         Arc::new((0..NUM_PARTITIONS).map(|_| AtomicUsize::new(0)).collect());
     let table = JoinTable {
         directory: Arc::new(JoinCell::new(JoinDirectory::initial())),
-        keys: Arc::new(JoinCell::new(MultiSlabBuffer::<u64>::new(vec![]))),
+        keys: Arc::new(JoinCell::new(MultiSlabBuffer::<T::Native>::new(vec![]))),
         rows: Arc::new(JoinCell::new(MultiSlabBuffer::<u32>::new(vec![]))),
         build_rows: Arc::new(JoinCell::new(None)),
     };
@@ -100,8 +102,10 @@ pub fn create_for_workers(
     (build_factories, probe_factories, probe_gate)
 }
 
-impl UnaryFactory<RecordBatch, ()> for JoinBuildFactory {
-    type Unary = PipelineBreaker<RecordBatch, (), JoinBuildConsumer>;
+impl<T: ArrowPrimitiveType<Native: Hash + Eq>> UnaryFactory<RecordBatch, ()>
+    for JoinBuildFactory<T>
+{
+    type Unary = PipelineBreaker<RecordBatch, (), JoinBuildConsumer<T>>;
 
     fn build_unary(self) -> Self::Unary {
         PipelineBreaker::Consuming(JoinBuildConsumer::new(
@@ -120,10 +124,12 @@ impl UnaryFactory<RecordBatch, ()> for JoinBuildFactory {
     }
 }
 
-impl UnaryFactory<RecordBatch, RecordBatch> for JoinProbeFactory {
-    type Unary = Probe;
+impl<T: ArrowPrimitiveType<Native: Hash + Eq>> UnaryFactory<RecordBatch, RecordBatch>
+    for JoinProbeFactory<T>
+{
+    type Unary = Probe<T>;
 
-    fn build_unary(self) -> Probe {
+    fn build_unary(self) -> Probe<T> {
         Probe::new(
             self.table,
             self.hash_state,

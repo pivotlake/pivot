@@ -40,11 +40,55 @@ fn join_matching_keys() {
     let probe = values_input(&d, vec![int64_batch("id", &[20, 30, 99])]).record_batches();
 
     let results = probe
-        .join(build, 0, 0, JoinOutputColumns::keep_all(1, 1))
+        .join(
+            build,
+            0,
+            0,
+            &DataType::Int64,
+            JoinOutputColumns::keep_all(1, 1),
+        )
         .collect()
         .unwrap();
 
     let mut keys = collect_i64s(&results, 1);
+    keys.sort();
+    assert_eq!(keys, vec![20, 30]);
+}
+
+#[test]
+fn join_on_int32_keys() {
+    let d = dispatch(1);
+    let int32_batch = |values: &[i32]| {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            vec![Arc::new(arrow_array::Int32Array::from(values.to_vec()))],
+        )
+        .unwrap()
+    };
+    let build = values_input(&d, vec![int32_batch(&[10, 20, 30])]).record_batches();
+    let probe = values_input(&d, vec![int32_batch(&[20, 30, 99])]).record_batches();
+
+    let results = probe
+        .join(
+            build,
+            0,
+            0,
+            &DataType::Int32,
+            JoinOutputColumns::keep_all(1, 1),
+        )
+        .collect()
+        .unwrap();
+
+    let mut keys: Vec<i32> = results
+        .iter()
+        .flat_map(|b| {
+            use arrow_array::cast::AsArray;
+            b.column(1)
+                .as_primitive::<arrow_array::types::Int32Type>()
+                .values()
+                .to_vec()
+        })
+        .collect();
     keys.sort();
     assert_eq!(keys, vec![20, 30]);
 }
@@ -56,7 +100,13 @@ fn join_no_matches() {
     let probe = values_input(&d, vec![int64_batch("id", &[4, 5, 6])]).record_batches();
 
     let results = probe
-        .join(build, 0, 0, JoinOutputColumns::keep_all(1, 1))
+        .join(
+            build,
+            0,
+            0,
+            &DataType::Int64,
+            JoinOutputColumns::keep_all(1, 1),
+        )
         .collect()
         .unwrap();
 
@@ -70,7 +120,13 @@ fn join_duplicate_build_keys() {
     let probe = values_input(&d, vec![int64_batch("id", &[10])]).record_batches();
 
     let results = probe
-        .join(build, 0, 0, JoinOutputColumns::keep_all(1, 1))
+        .join(
+            build,
+            0,
+            0,
+            &DataType::Int64,
+            JoinOutputColumns::keep_all(1, 1),
+        )
         .collect()
         .unwrap();
 
@@ -86,7 +142,13 @@ fn join_all_keys_match() {
     let probe = values_input(&d, vec![int64_batch("id", &[5, 4, 3, 2, 1])]).record_batches();
 
     let results = probe
-        .join(build, 0, 0, JoinOutputColumns::keep_all(1, 1))
+        .join(
+            build,
+            0,
+            0,
+            &DataType::Int64,
+            JoinOutputColumns::keep_all(1, 1),
+        )
         .collect()
         .unwrap();
 
@@ -105,7 +167,13 @@ fn join_large_tables() {
     let probe = values_input(&d, vec![int64_batch("id", &probe_keys)]).record_batches();
 
     let results = probe
-        .join(build, 0, 0, JoinOutputColumns::keep_all(1, 1))
+        .join(
+            build,
+            0,
+            0,
+            &DataType::Int64,
+            JoinOutputColumns::keep_all(1, 1),
+        )
         .collect()
         .unwrap();
 
@@ -121,7 +189,13 @@ fn join_then_count() {
     let probe = values_input(&d, vec![int64_batch("id", &[20, 30, 99])]).record_batches();
 
     let results = probe
-        .join(build, 0, 0, JoinOutputColumns::keep_all(1, 1))
+        .join(
+            build,
+            0,
+            0,
+            &DataType::Int64,
+            JoinOutputColumns::keep_all(1, 1),
+        )
         .aggregate::<i64>(vec![AggregationSlot::new(
             AggregationKind::CountStar,
             0,
@@ -156,6 +230,7 @@ fn join_keeps_only_listed_columns() {
             build,
             0,
             0,
+            &DataType::Int64,
             JoinOutputColumns {
                 probe: vec![1],
                 build: vec![1],

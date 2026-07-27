@@ -68,9 +68,9 @@ unsafe impl<T: Send> Sync for JoinCell<T> {}
 /// populated by the build phase and published to probe only after every
 /// partition job has run.
 #[derive(Clone)]
-pub(crate) struct JoinTable {
+pub(crate) struct JoinTable<K> {
     pub(crate) directory: Arc<JoinCell<JoinDirectory>>,
-    pub(crate) keys: Arc<JoinCell<MultiSlabBuffer<u64>>>,
+    pub(crate) keys: Arc<JoinCell<MultiSlabBuffer<K>>>,
     pub(crate) rows: Arc<JoinCell<MultiSlabBuffer<u32>>>,
     pub(crate) build_rows: Arc<JoinCell<Option<RecordBatch>>>,
 }
@@ -113,8 +113,8 @@ mod tests {
     }
 
     fn extract_consumer(
-        breaker: PipelineBreaker<RecordBatch, (), JoinBuildConsumer>,
-    ) -> JoinBuildConsumer {
+        breaker: PipelineBreaker<RecordBatch, (), JoinBuildConsumer<arrow_array::types::Int64Type>>,
+    ) -> JoinBuildConsumer<arrow_array::types::Int64Type> {
         match breaker {
             PipelineBreaker::Consuming(c) => c,
             _ => unreachable!(),
@@ -135,7 +135,12 @@ mod tests {
         let build_column_count = build_worker_batches[0][0].num_columns();
         let output_columns =
             super::JoinOutputColumns::keep_all(probe_column_count, build_column_count);
-        let (builds, probes, _) = factory::create_for_workers(0, 0, output_columns, workers);
+        let (builds, probes, _) = factory::create_for_workers::<arrow_array::types::Int64Type>(
+            0,
+            0,
+            output_columns,
+            workers,
+        );
 
         let mut consumers: Vec<_> = builds
             .into_iter()

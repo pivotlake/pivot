@@ -318,8 +318,14 @@ fn build_join(
         )));
     }
 
-    let probe_key = join_key_ref(Expression::from_handle(condition.left)?)?;
-    let build_key = join_key_ref(Expression::from_handle(condition.right)?)?;
+    let (probe_key, probe_key_type) = join_key_ref(Expression::from_handle(condition.left)?)?;
+    let (build_key, build_key_type) = join_key_ref(Expression::from_handle(condition.right)?)?;
+    if probe_key_type != build_key_type {
+        return Err(OperatorError::Unsupported(format!(
+            "join key types differ: {probe_key_type:?} vs {build_key_type:?} \
+             (DuckDB casts both sides to a common type, so this plan shape is unexpected)"
+        )));
+    }
 
     let probe_types = inputs[0].output_types()?;
     let build_types = inputs[1].output_types()?;
@@ -345,6 +351,7 @@ fn build_join(
         operator: Operator::Join(Join {
             probe_key,
             build_key,
+            key_type: probe_key_type,
             probe_output,
             build_output,
         }),
@@ -352,20 +359,33 @@ fn build_join(
 }
 
 /// The column ref a join key must be, with the key type restriction the
-/// dispatch join imposes.
-fn join_key_ref(key: Expression) -> Result<usize, OperatorError> {
+/// dispatch join imposes: any fixed-width hashable type. Floats hash and
+/// compare by SQL semantics, not bit patterns, so they are out; strings are
+/// not fixed-width.
+fn join_key_ref(key: Expression) -> Result<(usize, Type), OperatorError> {
     let Expression::Ref(key) = key else {
         return Err(OperatorError::Unsupported(format!(
             "join keys must be plain columns, got: {key:?}"
         )));
     };
-    if key.return_type != Type::Int64 {
-        return Err(OperatorError::Unsupported(format!(
+    match key.return_type {
+        Type::Int8
+        | Type::Int16
+        | Type::Int32
+        | Type::Int64
+        | Type::UInt8
+        | Type::UInt16
+        | Type::UInt32
+        | Type::UInt64
+        | Type::Int128
+        | Type::Decimal { .. }
+        | Type::Date
+        | Type::Timestamp => Ok((key.column_idx, key.return_type)),
+        _ => Err(OperatorError::Unsupported(format!(
             "Unsupported join key type: {:?}",
             key.return_type
-        )));
+        ))),
     }
-    Ok(key.column_idx)
 }
 
 /// A scan's projected output columns (and a filter's `projection_map`), each a
