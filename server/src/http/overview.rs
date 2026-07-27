@@ -1,11 +1,10 @@
-//! `GET /api/overview`: a single poll-friendly snapshot of the whole engine -
-//! every table (metadata + live row count), compaction counters, and system
-//! metrics.
+//! `GET /api/overview`: a single poll-friendly snapshot of the default Delta
+//! datastore: every table (metadata + live row count) and system metrics.
 
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use axum::Json;
 use axum::extract::State;
-use catalog::ParquetCatalog;
+use datastore_delta::DeltaDatastore;
 use serde::Serialize;
 
 use super::IntrospectState;
@@ -16,7 +15,6 @@ use super::system::{SystemInfo, collect_system};
 pub(super) struct Overview {
     store: String,
     tables: Vec<TableOut>,
-    compaction: Option<CompactionOut>,
     system: SystemInfo,
     connected: bool,
 }
@@ -31,30 +29,9 @@ struct TableOut {
     partition_by: Vec<String>,
     sort_by: Vec<String>,
     row_count: Option<i64>,
-    /// This table's compaction counters, if a compacter is running.
-    compaction: Option<CompactionOut>,
 }
 
-#[derive(Serialize, Default)]
-struct CompactionOut {
-    compactions: u64,
-    files_merged_in: u64,
-    files_written: u64,
-    bytes_written: u64,
-    last_run_unix_ms: u64,
-}
-
-fn compaction_out(stats: &compact::CompactStatsSnapshot) -> CompactionOut {
-    CompactionOut {
-        compactions: stats.compactions,
-        files_merged_in: stats.files_merged_in,
-        files_written: stats.files_written,
-        bytes_written: stats.bytes_written,
-        last_run_unix_ms: stats.last_run_unix_ms,
-    }
-}
-
-/// Table metadata gathered from the catalog (no row count yet).
+/// BoundTable metadata gathered from the catalog (no row count yet).
 struct TableMeta {
     name: String,
     location: String,
@@ -66,25 +43,29 @@ struct TableMeta {
 }
 
 pub(super) async fn overview(State(state): State<IntrospectState>) -> Json<Overview> {
-    let store = state.catalog.store_description();
+    // The default datastore always exists (`PivotCatalog` requires it). This
+    // overview reads Parquet-level detail, so recover the concrete backend; the
+    // dashboard serves only Delta datastores.
+    let datastore = state
+        .catalog
+        .default_datastore()
+        .clone()
+        .into_any_arc()
+        .downcast::<DeltaDatastore>()
+        .expect("the dashboard serves only Delta datastores");
+    let store = datastore.store_description();
 
     // Catalog snapshot (manifest reads may touch object storage) off the runtime.
     let metas = {
-        let catalog = state.catalog.clone();
-        tokio::task::spawn_blocking(move || collect_tables(&catalog))
+        let datastore = datastore.clone();
+        tokio::task::spawn_blocking(move || collect_tables(&datastore))
             .await
             .unwrap_or_default()
     };
 
-    let compaction_snap = state.compaction.compaction();
-
     let mut tables = Vec::with_capacity(metas.len());
     for meta in metas {
         let row_count = count_rows(&state, &meta.name).await;
-        let compaction = compaction_snap
-            .as_ref()
-            .and_then(|snap| snap.per_table.get(&meta.name))
-            .map(compaction_out);
         tables.push(TableOut {
             name: meta.name,
             location: meta.location,
@@ -94,35 +75,19 @@ pub(super) async fn overview(State(state): State<IntrospectState>) -> Json<Overv
             partition_by: meta.partition_by,
             sort_by: meta.sort_by,
             row_count,
-            compaction,
         });
     }
-
-    // Roll the per-table counters up for the summary card; "last run" is the
-    // last full sweep.
-    let compaction = compaction_snap.as_ref().map(|snap| {
-        let mut out = CompactionOut::default();
-        for stats in snap.per_table.values() {
-            out.compactions += stats.compactions;
-            out.files_merged_in += stats.files_merged_in;
-            out.files_written += stats.files_written;
-            out.bytes_written += stats.bytes_written;
-        }
-        out.last_run_unix_ms = snap.last_sweep_unix_ms;
-        out
-    });
 
     Json(Overview {
         store,
         tables,
-        compaction,
         system: collect_system(&state.system, state.pid),
         connected: true,
     })
 }
 
-fn collect_tables(catalog: &ParquetCatalog) -> Vec<TableMeta> {
-    catalog
+fn collect_tables(datastore: &DeltaDatastore) -> Vec<TableMeta> {
+    datastore
         .tables()
         .into_iter()
         .map(|table| {
@@ -138,7 +103,7 @@ fn collect_tables(catalog: &ParquetCatalog) -> Vec<TableMeta> {
             // Count + total size only; the file *list* is paginated separately
             // (`/api/tables/{name}/files`) so the polled overview stays small
             // even for a table with thousands of files.
-            let files = catalog.table_files(&name).unwrap_or_default();
+            let files = datastore.table_files(&name).unwrap_or_default();
             let total_bytes = files.iter().map(|f| f.size).sum();
             let file_count = files.len();
             TableMeta {
@@ -159,7 +124,7 @@ fn collect_tables(catalog: &ParquetCatalog) -> Vec<TableMeta> {
 async fn count_rows(state: &IntrospectState, table: &str) -> Option<i64> {
     let sql = format!("SELECT COUNT(*) FROM \"{}\"", table.replace('"', "\"\""));
     let batches =
-        crate::query_handler::execute_sql(state.catalog_dyn.clone(), state.dispatcher.clone(), sql)
+        crate::query_handler::execute_sql(state.catalog.clone(), state.dispatcher.clone(), sql)
             .await
             .ok()?;
     let batch = batches.first()?;

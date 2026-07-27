@@ -1,10 +1,9 @@
-//! [`CreateTable`] — `CREATE TABLE` with an explicit column list.
+//! [`CreateTable`]: `CREATE TABLE` with an explicit column list.
 
-use crate::catalog::{Catalog, CreateTableRequest};
+use crate::catalog::{CatalogTransaction, CreateTableRequest};
 use crate::compile::Error;
 use dispatch::{DataFlowDispatcher, RecordBatchOperatorSpec};
 use std::fmt;
-use std::sync::Arc;
 
 /// CREATE TABLE with an explicit column list.
 #[derive(Debug)]
@@ -25,7 +24,7 @@ impl fmt::Display for CreateTable {
             .map(|c| format!("{}:{}", c.name, c.col_type))
             .collect::<Vec<_>>()
             .join(", ");
-        // Sort by key so the rendered output is deterministic — `HashMap`
+        // Sort by key so the rendered output is deterministic; `HashMap`
         // iteration order is randomized per process and would otherwise flake
         // any snapshot/equality test that includes options.
         let mut options: Vec<(&String, &String)> = self.request.options.iter().collect();
@@ -47,7 +46,7 @@ impl CreateTable {
     pub(crate) fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
-        catalog: &Arc<dyn Catalog>,
+        transaction: &dyn CatalogTransaction,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         if self.or_replace {
             return Err(Error::UnsupportedCreateTableOrReplace);
@@ -64,13 +63,16 @@ impl CreateTable {
             ));
         }
 
-        // The catalog does the up-front work — fetching every data file's footer
-        // in parallel over the worker pool, here on the coordinator — and returns
-        // the plan that writes the materialized table into the catalog. (Running
-        // that fetch dataflow from a per-worker nullary would nest a dataflow
-        // inside a worker and deadlock the pool.)
-        catalog
-            .create_table(self.request.clone(), dispatcher)
-            .map_err(Error::CreateTable)
+        // Resolve the create against the datastore the statement named (routing,
+        // validation, locating the table's files), then compile the resolved
+        // creation into the dataflow that fetches every data file's footer in
+        // parallel over the pool and, at its terminal, stages the materialized
+        // table for transaction commit. (Running that fetch dataflow from a
+        // per-worker nullary would nest a dataflow inside a worker and deadlock the
+        // pool, so it is built here on the coordinator.)
+        let creation = transaction
+            .bind_create_table(self.request.clone())
+            .map_err(Error::CreateTable)?;
+        creation.compile(dispatcher).map_err(Error::CreateTable)
     }
 }

@@ -42,7 +42,7 @@ struct StatsTransaction {
 }
 
 impl DuckDBTransaction for StatsTransaction {
-    fn table(&self, table_name: &str) -> Option<Box<dyn DuckDBTable>> {
+    fn bind_table(&self, _datastore: &str, table_name: &str) -> Option<Box<dyn DuckDBTable>> {
         let rows = match table_name {
             "small" => 10,
             "big" => 1_000_000,
@@ -58,7 +58,11 @@ impl DuckDBTransaction for StatsTransaction {
 #[test]
 fn join_planning_consults_table_row_counts() {
     let asked = Arc::new(AtomicUsize::new(0));
-    let mut planner = PlannerContext::new(Arc::new(StatsCatalog));
+    let mut planner = PlannerContext::new(
+        Arc::new(StatsCatalog),
+        vec!["db".to_string()],
+        "db".to_string(),
+    );
 
     planner
         .plan(

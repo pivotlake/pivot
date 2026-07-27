@@ -9,16 +9,18 @@
 
 mod common;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::thread;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use catalog::ParquetCatalog;
-use catalog::store::ObjectPath;
-use catalog::test_support::{self, Backend};
+use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
 use common::{connect_client, pick_free_port, wait_until_listening};
+use datastore_delta::DeltaDatastore;
+use datastore_delta::store::ObjectPath;
+use datastore_delta::test_support::{self, Backend};
 use dispatch::Dispatch;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
@@ -57,20 +59,21 @@ fn start_server_on(root: &str) -> u16 {
     let root = root.to_string();
     thread::spawn(move || {
         let dispatch = Dispatch::spin_up(workers, 32, None);
-        let catalog = Arc::new(ParquetCatalog::open(&root, dispatch.dispatcher()).unwrap());
+        let datastore: Arc<dyn Datastore> =
+            DeltaDatastore::open(&root, dispatch.dispatcher()).unwrap();
+        let catalog = Arc::new(
+            PivotCatalog::new(
+                HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),
+                DEFAULT_DATASTORE_NAME.to_string(),
+            )
+            .unwrap(),
+        );
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async move {
-            let server = Server::new(
-                bind,
-                dispatch,
-                catalog,
-                0,
-                4,
-                server::DEFAULT_CATALOG_REFRESH,
-            );
+            let server = Server::new(bind, dispatch, catalog);
             let _ = server.serve(Box::pin(std::future::pending::<()>())).await;
         });
     });

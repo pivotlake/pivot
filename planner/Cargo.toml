@@ -4,8 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-# `Catalog::commit_transaction` is async on a dyn-compatible trait.
-async-trait = "0.1"
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-ord = { workspace = true }
@@ -19,6 +17,10 @@ parquet-variant-compute = { workspace = true }
 parquet-variant-json = { workspace = true }
 duckdb-planner = { workspace = true }
 dispatch = { workspace = true }
+# `Catalog::commit_transaction` is async (publishing an INSERT's files does
+# blocking store I/O, offloaded to the blocking pool); `async-trait` keeps the
+# trait object-safe.
+async-trait = "0.1"
 ahash = { workspace = true }
 regex = "1"
 pcre2 = "0.2"
@@ -30,7 +32,7 @@ serde = { workspace = true }
 [dev-dependencies]
 # The Parquet reader, for integration tests that plan over a real on-disk table.
 # A dev-dependency cycle (catalog depends on planner) — allowed by Cargo.
-catalog = { workspace = true }
+datastore-delta = { workspace = true }
 # `variant_experimental` so `ArrowWriter` stamps the VARIANT logical type on an
 # extension-tagged variant field (the variant tests read it back through pivot).
 parquet = { workspace = true, features = ["variant_experimental"] }

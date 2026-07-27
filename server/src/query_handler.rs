@@ -68,11 +68,23 @@ thread_local! {
 }
 
 fn with_planner<R>(
-    catalog: &Arc<dyn planner::catalog::Catalog>,
+    catalog: &Arc<catalog::PivotCatalog>,
     f: impl FnOnce(&mut planner::Planner) -> R,
 ) -> R {
     PLANNER.with_borrow_mut(|opt| {
-        let planner = opt.get_or_insert_with(|| planner::Planner::new(catalog.clone()));
+        let planner = opt.get_or_insert_with(|| {
+            // Attach every datastore as its own database (so a query can name
+            // it). The planner holds no catalog; each query's transaction
+            // (from `catalog.begin_transaction()`) does all table/DDL resolution.
+            let names = catalog
+                .iter_datastores()
+                .map(|(name, _)| name.clone())
+                .collect();
+            planner::Planner::from_datastore_names(
+                names,
+                catalog.default_datastore_name().to_string(),
+            )
+        });
         f(planner)
     })
 }
@@ -88,7 +100,7 @@ fn with_planner<R>(
 /// (non-worker) thread. Calling `execute().collect()` instead would return
 /// ring-backed batches whose `Drop` reaches `memory_ctx()` off-worker and aborts.
 pub(crate) async fn execute_sql(
-    catalog: Arc<dyn planner::catalog::Catalog>,
+    catalog: Arc<catalog::PivotCatalog>,
     dispatcher: dispatch::DataFlowDispatcher,
     sql: String,
 ) -> Result<Vec<arrow_array::RecordBatch>, String> {
@@ -142,14 +154,11 @@ pub(crate) async fn execute_sql(
     .await;
     match result {
         Ok(batches) => {
-            catalog
-                .commit_transaction(transaction)
-                .await
-                .map_err(|e| e.to_string())?;
+            transaction.commit().await.map_err(|e| e.to_string())?;
             Ok(batches)
         }
         Err(error) => {
-            catalog.rollback_transaction(transaction);
+            transaction.rollback();
             Err(error)
         }
     }
@@ -291,13 +300,13 @@ impl Drop for CancelOnDrop {
 /// pgwire `SimpleQueryHandler`: plans, compiles, and runs each query on the
 /// blocking pool, surfacing errors and supporting cancellation.
 pub struct PivotQueryHandler {
-    catalog: Arc<dyn planner::catalog::Catalog>,
+    catalog: Arc<catalog::PivotCatalog>,
     dispatcher: dispatch::DataFlowDispatcher,
 }
 
 impl PivotQueryHandler {
     pub fn new(
-        catalog: Arc<dyn planner::catalog::Catalog>,
+        catalog: Arc<catalog::PivotCatalog>,
         dispatcher: dispatch::DataFlowDispatcher,
     ) -> Self {
         Self {
@@ -326,9 +335,6 @@ impl PivotQueryHandler {
             let dispatcher = self.dispatcher.clone();
             let query = query.to_string();
 
-            // Plan the statement fresh inside this query's transaction. Planning
-            // (DuckDB optimize + bridge round-trip + plan translation) is a fixed
-            // few-ms cost, made visible by the `plan` phase time below.
             let started = Instant::now();
             let plan = {
                 let catalog = self.catalog.clone();
@@ -434,11 +440,11 @@ impl PivotQueryHandler {
         .await;
         match result {
             Ok(outcome) => {
-                self.catalog.commit_transaction(transaction).await?;
+                transaction.commit().await?;
                 Ok(outcome)
             }
             Err(error) => {
-                self.catalog.rollback_transaction(transaction);
+                transaction.rollback();
                 Err(error)
             }
         }
@@ -624,7 +630,7 @@ pub struct PivotHandlers {
 
 impl PivotHandlers {
     pub fn new(
-        catalog: Arc<dyn planner::catalog::Catalog>,
+        catalog: Arc<catalog::PivotCatalog>,
         dispatcher: dispatch::DataFlowDispatcher,
     ) -> Self {
         let manager = Arc::new(ConnectionManager::new());

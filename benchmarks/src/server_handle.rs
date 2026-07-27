@@ -7,13 +7,16 @@
 //! plus a `oneshot::Sender` that triggers a clean shutdown when the handle is
 //! dropped.
 
+use std::collections::HashMap;
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use catalog::ParquetCatalog;
-use compact::{Compacter, DEFAULT_COMPACT_BYTES, DEFAULT_MIN_FILES_TO_MERGE};
+use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
+use datastore_delta::{
+    Compacter, DEFAULT_COMPACT_BYTES, DEFAULT_MIN_FILES_TO_MERGE, DeltaDatastore,
+};
 use dispatch::{BUFFER_SIZE, Dispatch};
 use server::Server;
 use tokio::sync::oneshot;
@@ -39,7 +42,7 @@ fn ring_buffers() -> usize {
 
 pub struct ServerHandle {
     port: u16,
-    catalog: Arc<ParquetCatalog>,
+    datastore: Arc<DeltaDatastore>,
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -51,34 +54,36 @@ impl ServerHandle {
 
     /// Compact every table synchronously. A load of many small `INSERT`s leaves
     /// as many small files; this merges them into target-sized ones before the
-    /// queries read them, the way the background compacter would over time.
+    /// queries read them, the way the datastore's own compacter would over time.
     ///
     /// One sweep can leave a tail: a merge changes the file list, and a later
     /// candidate in the same sweep may be missed. So sweep until one merges
-    /// nothing (`files_merged_in` is cumulative, so an unchanged total means the
-    /// last sweep did no work).
+    /// nothing, which a sweep that advanced no table's log version did.
     pub async fn compact(&self) {
         let compacter = Compacter::new(
             DEFAULT_COMPACT_BYTES,
             DEFAULT_MIN_FILES_TO_MERGE,
             // The poll interval is unused for a manual sweep.
-            std::time::Duration::from_secs(1),
-            self.catalog.clone(),
+            Duration::from_secs(1),
+            self.datastore.clone(),
         );
-        let mut merged_so_far = 0;
         loop {
+            let versions_before = self.table_versions();
             compacter.compact_all().await;
-            let merged: u64 = compacter
-                .snapshot()
-                .per_table
-                .values()
-                .map(|table| table.files_merged_in)
-                .sum();
-            if merged == merged_so_far {
+            if self.table_versions() == versions_before {
                 break;
             }
-            merged_so_far = merged;
         }
+    }
+
+    /// Every table's committed log version, keyed by name, so two of these taken
+    /// around a sweep say whether it merged anything.
+    fn table_versions(&self) -> HashMap<String, u64> {
+        self.datastore
+            .tables()
+            .iter()
+            .map(|table| (table.name().to_string(), table.version()))
+            .collect()
     }
 }
 
@@ -124,16 +129,28 @@ pub fn start(workers: usize) -> std::io::Result<ServerHandle> {
         .expect("valid socket addr");
 
     let dispatch = Dispatch::spin_up(workers, ring_buffers(), None);
-    let catalog = Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone()));
-    // Kept so the harness can run a compaction pass between load and queries;
-    // the thread below takes its own clone.
-    let handle_catalog = catalog.clone();
+    let data_dir = tempfile::tempdir()?;
+    let datastore = DeltaDatastore::open_local(data_dir.path(), dispatch.dispatcher())
+        .map_err(std::io::Error::other)?;
+    let catalog = Arc::new(
+        PivotCatalog::new(
+            HashMap::from([(
+                DEFAULT_DATASTORE_NAME.to_string(),
+                datastore.clone() as Arc<dyn Datastore>,
+            )]),
+            DEFAULT_DATASTORE_NAME.to_string(),
+        )
+        .map_err(std::io::Error::other)?,
+    );
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
     let thread = thread::Builder::new()
         .name("pivot-bench-server".into())
         .spawn(move || {
+            // The benchmark owns its scratch datastore explicitly for exactly
+            // as long as the in-process server thread is alive.
+            let _data_dir = data_dir;
             // The runtime gets few threads on purpose: its default (one per
             // core) would sit hundreds of mostly-idle threads next to the
             // pinned dispatch workers and preempt them on every wakeup.
@@ -143,14 +160,7 @@ pub fn start(workers: usize) -> std::io::Result<ServerHandle> {
                 .build()
                 .expect("build tokio runtime");
             rt.block_on(async move {
-                let server = Server::new(
-                    bind,
-                    dispatch,
-                    catalog,
-                    0,
-                    4,
-                    server::DEFAULT_CATALOG_REFRESH,
-                );
+                let server = Server::new(bind, dispatch, catalog);
                 let _ = server
                     .serve(Box::pin(async move {
                         let _ = shutdown_rx.await;
@@ -163,7 +173,7 @@ pub fn start(workers: usize) -> std::io::Result<ServerHandle> {
 
     Ok(ServerHandle {
         port,
-        catalog: handle_catalog,
+        datastore,
         shutdown: Some(shutdown_tx),
         thread: Some(thread),
     })

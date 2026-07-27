@@ -1,7 +1,7 @@
 //! Binary entry point for the pivotdb postgres-wire server.
 //!
 //! This internally plans & compiles queries using the `planner` crate (internally based on DuckDB's,
-//! planner) with the `ParquetCatalog` and runs queries on `dispatch`
+//! planner) with the `DeltaDatastore` and runs queries on `dispatch`
 
 use std::io::IsTerminal;
 use std::net::SocketAddr;
@@ -9,10 +9,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use catalog::ParquetCatalog;
+use catalog::PivotCatalog;
 use clap::Parser;
 use dispatch::env::get_env_var_with_default;
-use dispatch::{BUFFER_SIZE, Dispatch};
+use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
+use metastore::Metastore;
+use metastore_toml::TomlMetastore;
 use server::{Error, Server};
 use tracing::{error, info};
 
@@ -34,11 +36,13 @@ struct Args {
     #[arg(long)]
     workers: Option<usize>,
 
-    /// Database directory. Tables created with `CREATE TABLE` (without their own
-    /// `path`) live under here, and are reloaded on restart. Omit for an
-    /// in-memory catalog — tables vanish on restart and must each name a `path`.
-    #[arg(long)]
-    path: Option<PathBuf>,
+    /// Metastore file (TOML) defining the datastores to serve, each a local
+    /// directory or S3 root, attached as its own database
+    /// (`SELECT * FROM <datastore>.main.<table>`). Exactly one datastore must set
+    /// `default = true`; it is the current database (unqualified names resolve
+    /// against it).
+    #[arg(long, value_name = "FILE")]
+    metastore: PathBuf,
 
     /// Enable the on-disk cache for remote (S3) object reads, storing cached
     /// byte ranges under this directory (persists across restarts). Omit to
@@ -54,36 +58,6 @@ struct Args {
     /// object (only with `--disk-cache-dir`). Keep below the process's fd limit.
     #[arg(long, default_value_t = 65536, value_name = "N")]
     disk_cache_max_objects: usize,
-
-    /// Run the bundled compacter (OFF by default). The compacter merges and
-    /// then deletes a table's small Parquet files, so it mutates the catalog;
-    /// leave it off for a read-only server or an external reader, and only the
-    /// process that owns the data (the writer) should enable it. The
-    /// `--compact-*` tuning flags require this.
-    #[arg(long)]
-    compact: bool,
-
-    /// Byte threshold the compacter merges a table's small Parquet files up to
-    /// (CPU on the dispatch pool), once they amount to it. Requires `--compact`.
-    #[arg(
-        long,
-        default_value_t = compact::DEFAULT_COMPACT_BYTES,
-        requires = "compact",
-        value_name = "BYTES"
-    )]
-    compact_bytes: u64,
-
-    /// Compacter count trigger for low-traffic partitions: merge a sub-target
-    /// partition's small files once this many accumulate (even below
-    /// `--compact-bytes`). Lower means fewer tiny files per partition and more
-    /// frequent sub-target merges. Requires `--compact`.
-    #[arg(
-        long,
-        default_value_t = compact::DEFAULT_MIN_FILES_TO_MERGE,
-        requires = "compact",
-        value_name = "N"
-    )]
-    compact_min_files: usize,
 
     /// Also serve the bundled web dashboard (data-flow graph, live compaction
     /// stats, system metrics, SQL console) on this address. Omit to disable.
@@ -174,6 +148,29 @@ fn build_disk_cache(args: &Args) -> Option<Arc<dispatch::io::DiskCache>> {
     }
 }
 
+/// Open every datastore from the required metastore file and assemble them into
+/// one composite catalog. Each datastore self-manages its maintenance (the global
+/// refresh cadence plus its own per-datastore compaction from the metastore file),
+/// spawning its background tasks onto the ambient runtime, so this must run inside
+/// `rt.block_on`.
+fn build_catalog(args: &Args, dispatcher: &DataFlowDispatcher) -> Result<Arc<PivotCatalog>, Error> {
+    let path = &args.metastore;
+    let refresh_interval = Duration::from_secs(args.catalog_refresh_secs);
+    let store =
+        TomlMetastore::open(path, refresh_interval).map_err(|source| Error::ReadMetastore {
+            path: path.clone(),
+            source: Box::new(source),
+        })?;
+    let default_name = store.default_datastore_name().to_string();
+    let datastores = store
+        .open_datastores(dispatcher)
+        .map_err(|source| Error::OpenDatastores {
+            path: path.clone(),
+            source,
+        })?;
+    Ok(Arc::new(PivotCatalog::new(datastores, default_name)?))
+}
+
 fn main() -> Result<(), Error> {
     init_tracing();
     let args = Args::parse();
@@ -200,32 +197,10 @@ fn main() -> Result<(), Error> {
         .enable_all()
         .build()?;
 
-    // Build the catalog on this (coordinator) thread, before the workers are
-    // handed off: opening a persisted database reloads its tables, which reads
-    // Parquet footers over the dispatch pool.
-    let catalog = match args.path.as_deref() {
-        Some(dir) => {
-            let dir = dir.to_str().expect("database path must be valid UTF-8");
-            Arc::new(
-                ParquetCatalog::open(dir, dispatch.dispatcher()).unwrap_or_else(|e| {
-                    error!("failed to open database `{dir}`: {e}");
-                    std::process::exit(1);
-                }),
-            )
-        }
-        None => Arc::new(ParquetCatalog::new(dispatch.dispatcher().clone())),
-    };
-
     rt.block_on(async move {
-        let compact_bytes = if args.compact { args.compact_bytes } else { 0 };
-        let mut server = Server::new(
-            args.bind,
-            dispatch,
-            catalog,
-            compact_bytes,
-            args.compact_min_files,
-            Duration::from_secs(args.catalog_refresh_secs),
-        );
+        let catalog = build_catalog(&args, dispatch.dispatcher())?;
+
+        let mut server = Server::new(args.bind, dispatch, catalog);
         if let Some(addr) = args.http_bind {
             server = server.with_http_bind(addr);
         }

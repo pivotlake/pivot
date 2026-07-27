@@ -1,7 +1,6 @@
 //! Global aggregates (no GROUP BY).
 
 use super::{Aggregate, aggregation_slots, needs_wide_accumulator};
-use crate::catalog::CatalogTransaction;
 use crate::compile::Error;
 use crate::expression::{AggregateFunc, Expression};
 use crate::types::Type;
@@ -34,13 +33,12 @@ impl Aggregate {
     /// entirely. Applies when the aggregate sits directly on a scan with no
     /// dynamic predicates, every expression is a `MIN`/`MAX` over a plain
     /// column, and the table can prove both bounds for each column
-    /// ([`Table::column_min_max`](crate::catalog::Table::column_min_max)); any
+    /// ([`BoundTable::column_min_max`](crate::catalog::BoundTable::column_min_max)); any
     /// miss returns `None` and the ordinary scan-based path runs.
     pub(crate) fn try_compile_from_stats(
         &self,
         inputs: &[crate::PlanNode],
         dispatcher: &DataFlowDispatcher,
-        transaction: &dyn CatalogTransaction,
     ) -> Result<Option<RecordBatchOperatorSpec>, Error> {
         // Only fires on an aggregate sitting directly on a bare scan (a single
         // Input child with no children of its own), so the table's metadata
@@ -65,7 +63,7 @@ impl Aggregate {
         // A lone unfiltered COUNT(*) is the sum of every row group's row count.
         // Emit the same Int64 "count" column the scan-based aggregate path does.
         if self.is_lone_count_star() {
-            let Some(count) = scan.table.row_count(transaction) else {
+            let Some(count) = scan.table.row_count() else {
                 return Ok(None);
             };
             let array = Int64Array::from(vec![count]);
@@ -115,7 +113,7 @@ impl Aggregate {
                 Some(Expression::Ref(r)) => r.column_idx,
                 _ => return Ok(None),
             };
-            let Some((min, max)) = scan.table.column_min_max(table_col, transaction) else {
+            let Some((min, max)) = scan.table.column_min_max(table_col) else {
                 return Ok(None);
             };
             let scalar = if is_min { min } else { max };
