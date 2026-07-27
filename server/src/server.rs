@@ -26,6 +26,7 @@ use dispatch::{DataFlowDispatcher, Dispatch, Shutdown};
 use pgwire::tokio::process_socket;
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -36,6 +37,20 @@ use tracing::{error, info, warn};
 pub enum Error {
     #[error(transparent)]
     IO(#[from] io::Error),
+    #[error("failed to read metastore `{path}`: {source}")]
+    ReadMetastore {
+        path: PathBuf,
+        #[source]
+        source: metastore_toml::Error,
+    },
+    #[error("failed to open datastores from `{path}`: {source}")]
+    OpenDatastores {
+        path: PathBuf,
+        #[source]
+        source: metastore::Error,
+    },
+    #[error("invalid metastore configuration: {0}")]
+    InvalidCatalog(#[from] catalog::Error),
     #[error("worker watcher panic: {0}")]
     WorkerWatcherPanic(JoinError),
     #[error("dispatch worker failed: {0}")]
