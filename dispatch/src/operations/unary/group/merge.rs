@@ -321,7 +321,7 @@ pub(super) fn merge_combined<K: KeyExtractor, V: AggregationValue>(
             cfg,
         );
     }
-    drop(target);
+    // The prober's borrow of `result` ends at its last use above.
     result
 }
 /// Merge one partition's per-node aggregated tables into its final table.
@@ -371,7 +371,7 @@ pub(super) fn merge_node_aggregated_tables<K: KeyExtractor, V: AggregationValue>
             resize_if_needed::<K, V>(&mut allocator, &mut prober);
         }
     }
-    drop(prober);
+    // The prober's borrow of `target` ends at its last use above.
     target
 }
 
