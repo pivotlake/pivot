@@ -177,6 +177,41 @@ fn create_table_succeeds_with_valid_path() {
 }
 
 #[test]
+fn create_duplicate_table_fails() {
+    let (dir, columns) = three_row_table();
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
+    create_table(&catalog, create_request("t", dir.path(), columns.clone())).unwrap();
+
+    let err = create_table(&catalog, create_request("t", dir.path(), columns))
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.contains("already exists"),
+        "expected duplicate rejection: {err}"
+    );
+}
+
+#[test]
+fn create_table_if_not_exists_keeps_the_existing_table() {
+    let (dir, columns) = three_row_table();
+    let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
+    create_table(&catalog, create_request("t", dir.path(), columns.clone())).unwrap();
+
+    // A path-less request would produce an empty table if it actually created
+    // one, so surviving row groups prove the statement was a no-op.
+    let request = CreateTableRequest {
+        name: "t".to_string(),
+        columns,
+        options: HashMap::new(),
+        if_not_exists: true,
+    };
+    create_table(&catalog, request).unwrap();
+
+    assert_eq!(current_parquet(&catalog, "t").row_groups().len(), 3);
+}
+
+#[test]
 fn create_table_without_a_path_makes_an_empty_table() {
     let (_dir, columns) = three_row_table();
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
