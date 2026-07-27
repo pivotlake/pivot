@@ -18,11 +18,11 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
-use catalog::{DEFAULT_DATASTORE_NAME, PivotCatalog};
+use catalog::PivotCatalog;
 use datastore::{Datastore, DatastoreTransaction};
 use datastore_delta::DeltaDatastore;
 use planner::Planner;
-use planner::catalog::{Catalog, Column, CreateTableRequest};
+use planner::catalog::{Column, CreateTableRequest};
 use planner::types::Type;
 
 fn dispatcher() -> DataFlowDispatcher {
@@ -95,14 +95,15 @@ fn run_count(datastore: &Arc<DeltaDatastore>) -> usize {
     let catalog = Arc::new(
         PivotCatalog::new(
             HashMap::from([(
-                DEFAULT_DATASTORE_NAME.to_string(),
+                "default".to_string(),
                 datastore.clone() as Arc<dyn Datastore>,
             )]),
-            DEFAULT_DATASTORE_NAME.to_string(),
+            "default".to_string(),
         )
         .unwrap(),
     );
-    let mut planner = Planner::new();
+    let mut planner =
+        Planner::from_datastore_names(vec!["default".to_string()], "default".to_string());
     let transaction = catalog.begin_transaction();
     planner
         .plan("SELECT id FROM t", transaction.clone())

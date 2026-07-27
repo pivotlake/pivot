@@ -53,7 +53,7 @@ pub trait TableFunction: Send + Sync {
     /// Build the dataflow emitting this function's full output. A backend
     /// function that reads catalog data (e.g. `metadata`) captured the snapshot
     /// it needs when it was resolved, exactly as a self-contained
-    /// [`Table`](crate::catalog::Table) binding does; pure functions need
+    /// [`BoundTable`](crate::catalog::BoundTable) binding does; pure functions need
     /// nothing beyond their arguments.
     fn compile(
         &self,

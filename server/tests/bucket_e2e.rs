@@ -16,7 +16,7 @@ use std::thread;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
+use catalog::{Datastore, PivotCatalog};
 use common::{connect_client, pick_free_port, wait_until_listening};
 use datastore_delta::DeltaDatastore;
 use datastore_delta::store::ObjectPath;
@@ -63,8 +63,8 @@ fn start_server_on(root: &str) -> u16 {
             DeltaDatastore::open(&root, dispatch.dispatcher()).unwrap();
         let catalog = Arc::new(
             PivotCatalog::new(
-                HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),
-                DEFAULT_DATASTORE_NAME.to_string(),
+                HashMap::from([("default".to_string(), datastore)]),
+                "default".to_string(),
             )
             .unwrap(),
         );

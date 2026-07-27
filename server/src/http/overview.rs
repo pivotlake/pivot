@@ -31,7 +31,7 @@ struct TableOut {
     row_count: Option<i64>,
 }
 
-/// Table metadata gathered from the catalog (no row count yet).
+/// BoundTable metadata gathered from the catalog (no row count yet).
 struct TableMeta {
     name: String,
     location: String,

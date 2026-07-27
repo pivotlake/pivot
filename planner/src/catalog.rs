@@ -2,7 +2,7 @@
 //!
 //! The planner does not know anything about persistence; it defers to a
 //! caller-supplied [`Catalog`] implementation to resolve table names into
-//! [`Table`]s, each of which exposes a schema (as a list of Pivot [`Column`]s)
+//! [`BoundTable`]s, each of which exposes a schema (as a list of Pivot [`Column`]s)
 //! and knows how to compile itself into a dispatch scan spec.
 //!
 //! Because DuckDB owns SQL binding, the catalog and tables also need to be
@@ -10,9 +10,8 @@
 //! [`DuckDBTableAdapter`] implement DuckDB's [`DuckDBBind`] /
 //! [`DuckDBTable`] traits over our Pivot types. They exist as
 //! standalone wrapper structs (rather than blanket impls) because the orphan
-//! rule prevents implementing a foreign trait for `Box<dyn Table>` directly.
+//! rule prevents implementing a foreign trait for `Box<dyn BoundTable>` directly.
 
-use std::any::Any;
 use std::collections::HashMap;
 
 use async_trait::async_trait;
@@ -52,7 +51,7 @@ pub struct DynamicScanPredicate {
     pub slot: Arc<DynamicFilterSlot>,
 }
 
-/// A single column in a [`Table`]'s schema: name plus Pivot [`Type`].
+/// A single column in a [`BoundTable`]'s schema: name plus Pivot [`Type`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Column {
     pub name: String,
@@ -82,10 +81,11 @@ pub struct CreateTableRequest {
 /// catalog, which a background refresh may be updating concurrently), so a
 /// plan's scans, its late materialize, and its metadata peepholes all see one
 /// frozen view. A backend may also hold pending writes here until commit.
+#[async_trait]
 pub trait CatalogTransaction: Debug + Send + Sync {
     /// Resolve `name` in datastore `datastore` to a fresh, independently-mutable
-    /// [`Table`], or `None` if that datastore holds no such table.
-    fn bind_table(&self, datastore: &str, name: &str) -> Option<Box<dyn Table>>;
+    /// [`BoundTable`], or `None` if that datastore holds no such table.
+    fn bind_table(&self, datastore: &str, name: &str) -> Option<Box<dyn BoundTable>>;
 
     /// A backend-specific table-valued function `name` in datastore `datastore`,
     /// or `None`.
@@ -109,9 +109,17 @@ pub trait CatalogTransaction: Debug + Send + Sync {
         .into())
     }
 
-    /// Downcast hook: recover the concrete composite transaction (e.g. to fan a
-    /// commit out to each datastore's child transaction).
-    fn as_any(&self) -> &dyn Any;
+    /// Commit this transaction: publish whatever it staged (an INSERT's uploaded
+    /// files, a CREATE's table). A read-only transaction is a no-op. Async so a
+    /// backend can hop blocking store I/O to the blocking pool; the composite
+    /// awaits each sub-transaction it opened.
+    async fn commit(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Roll back this transaction: discard whatever it staged. Default: nothing,
+    /// the snapshot is released when the last reference drops.
+    fn rollback(&self) {}
 }
 
 /// A resolved `CREATE TABLE`, bound to its target datastore and ready to be
@@ -131,7 +139,7 @@ pub trait TableCreation: Send + Sync {
 /// during planning, both for our own translation and to feed DuckDB through
 /// [`DuckDBTableAdapter`]) and a way to compile a scan into a dispatch
 /// [`RecordBatchOperatorSpec`].
-pub trait Table: Debug + Send + Sync {
+pub trait BoundTable: Debug + Send + Sync {
     /// Build a dispatch scan spec that reads this table.
     ///
     /// `dynamic_filters` are logical single-column predicates whose constants are
@@ -141,7 +149,7 @@ pub trait Table: Debug + Send + Sync {
     /// without the optimization.
     ///
     /// `emit_row_group_metadata` asks the scan to tag each emitted row with the
-    /// metadata a downstream [`materialize`](Table::materialize) needs (e.g. its
+    /// metadata a downstream [`materialize`](BoundTable::materialize) needs (e.g. its
     /// row-group ID and per-row index). Backends that don't materialize can
     /// ignore it; the bridge only sets it on a late-materialized query's narrow
     /// scan.
@@ -178,9 +186,9 @@ pub trait Table: Debug + Send + Sync {
     /// Clone this table into a fresh boxed trait object.
     ///
     /// A late-materialized query references one table from both its narrow scan
-    /// and its [`Materialize`](crate::operator::Materialize); `Box<dyn Table>`
+    /// and its [`Materialize`](crate::operator::Materialize); `Box<dyn BoundTable>`
     /// isn't `Clone`, so backends expose cloning through this method.
-    fn clone_box(&self) -> Box<dyn Table>;
+    fn clone_box(&self) -> Box<dyn BoundTable>;
 
     /// Fetch `projection` for the rows that survived `input` (whose scan was
     /// tagged via `emit_row_group_metadata`), emitting them in `projection`
@@ -210,7 +218,7 @@ pub trait Table: Debug + Send + Sync {
     /// statistics covering every row group, with no predicates pushed into this
     /// binding). The scalars carry the column's physical storage type. `None`
     /// means "unknown, scan instead" and is always a safe answer. Answered from
-    /// the binding's captured snapshot, as in [`compile_scan`](Table::compile_scan).
+    /// the binding's captured snapshot, as in [`compile_scan`](BoundTable::compile_scan).
     fn column_min_max(&self, _column: usize) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
         None
     }
@@ -219,7 +227,7 @@ pub trait Table: Debug + Send + Sync {
     /// answered without scanning any rows (e.g. summing Parquet row-group row
     /// counts, with no predicates pushed into this binding). `None` means
     /// "unknown, scan instead" and is always a safe answer. Answered from the
-    /// binding's captured snapshot, as in [`compile_scan`](Table::compile_scan).
+    /// binding's captured snapshot, as in [`compile_scan`](BoundTable::compile_scan).
     fn row_count(&self) -> Option<i64> {
         None
     }
@@ -234,12 +242,12 @@ fn duckdb_columns(columns: &[Column]) -> Vec<DuckDBColumn> {
         .collect()
 }
 
-/// Adapts a Pivot [`Table`] to DuckDB's [`DuckDBTable`] trait,
+/// Adapts a Pivot [`BoundTable`] to DuckDB's [`DuckDBTable`] trait,
 /// converting our column types into DuckDB logical types. Required because
 /// Rust's orphan rule prevents implementing a foreign trait for a foreign type.
 #[derive(Debug)]
 pub struct DuckDBTableAdapter {
-    pub table: Box<dyn Table>,
+    pub table: Box<dyn BoundTable>,
 }
 
 impl DuckDBTable for DuckDBTableAdapter {
@@ -264,32 +272,6 @@ impl DuckDBTable for DuckDBTableAdapter {
         )?));
         Ok(self.table.pushdown_filter(filter)?)
     }
-}
-
-/// A set of named datastores the planner resolves tables against, opening one
-/// composite [`CatalogTransaction`] per query. This is the whole catalog a
-/// caller provides; DuckDB binds every reference through it by database name.
-///
-/// A single datastore is presented to the planner as a one-entry catalog; the
-/// planner itself holds no catalog and is handed a [`begin_transaction`](Self::begin_transaction)
-/// result per query.
-#[async_trait]
-pub trait Catalog: Debug + Send + Sync {
-    /// Open a composite transaction: snapshot every datastore as it stands right
-    /// now, keyed by name, so one query reads one consistent view of each.
-    fn begin_transaction(&self) -> Arc<dyn CatalogTransaction>;
-
-    /// Commit `transaction`, fanning out to each datastore's child transaction.
-    /// `async` because publishing an INSERT's uploaded files does blocking
-    /// object-store I/O; the implementation offloads that to the blocking pool so
-    /// callers just `.await` (a read-only commit stays inline). Default: nothing.
-    async fn commit_transaction(&self, _transaction: Arc<dyn CatalogTransaction>) -> Result<()> {
-        Ok(())
-    }
-
-    /// Roll back `transaction`, fanning out to each datastore's child. Default:
-    /// nothing.
-    fn rollback_transaction(&self, _transaction: Arc<dyn CatalogTransaction>) {}
 }
 
 /// The DuckDB [`DuckDBBind`] provider: resolves the static

@@ -43,7 +43,6 @@ use pgwire::error::PgWireResult;
 use pgwire::error::{ErrorInfo, PgWireError};
 use pgwire::messages::PgWireBackendMessage;
 use pgwire::messages::response::NoticeResponse;
-use planner::catalog::Catalog;
 use thiserror::Error;
 use tokio::task::JoinError;
 use tracing::{info, warn};
@@ -81,7 +80,7 @@ fn with_planner<R>(
                 .iter_datastores()
                 .map(|(name, _)| name.clone())
                 .collect();
-            planner::Planner::with_datastore_names(
+            planner::Planner::from_datastore_names(
                 names,
                 catalog.default_datastore_name().to_string(),
             )
@@ -155,14 +154,11 @@ pub(crate) async fn execute_sql(
     .await;
     match result {
         Ok(batches) => {
-            catalog
-                .commit_transaction(transaction)
-                .await
-                .map_err(|e| e.to_string())?;
+            transaction.commit().await.map_err(|e| e.to_string())?;
             Ok(batches)
         }
         Err(error) => {
-            catalog.rollback_transaction(transaction);
+            transaction.rollback();
             Err(error)
         }
     }
@@ -444,11 +440,11 @@ impl PivotQueryHandler {
         .await;
         match result {
             Ok(outcome) => {
-                self.catalog.commit_transaction(transaction).await?;
+                transaction.commit().await?;
                 Ok(outcome)
             }
             Err(error) => {
-                self.catalog.rollback_transaction(transaction);
+                transaction.rollback();
                 Err(error)
             }
         }

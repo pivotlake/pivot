@@ -15,7 +15,7 @@ use arrow_array::{Array, ArrayRef, Scalar};
 use crossbeam_deque::Injector;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use planner::catalog::{
-    Column, DynamicScanPredicate, Error as CatalogError, Result as CatalogResult, Table,
+    BoundTable, Column, DynamicScanPredicate, Error as CatalogError, Result as CatalogResult,
 };
 use planner::expression::{CompareType, Expression, Function, JsonPath, TableFilter};
 
@@ -23,7 +23,7 @@ use super::CatalogTable;
 use super::insert_sink::{UploadedFile, build_insert_spec};
 
 /// A single-column constant comparison (`col <cmp> const`) pushed down by
-/// DuckDB during binding. Recorded as-is; applied at [`compile_scan`](Table::compile_scan)
+/// DuckDB during binding. Recorded as-is; applied at [`compile_scan`](BoundTable::compile_scan)
 /// time after the row-group metadata exists: min/max stats prune row groups,
 /// and equality additionally prunes by dictionary contents in the decoder. The
 /// upstream `Filter` always runs, so this is a pure optimization.
@@ -96,12 +96,12 @@ pub struct TableBinding {
     table: CatalogTable,
     pub columns: Vec<Column>,
     /// Single-column predicates pushed down for this binding (recorded here
-    /// because the `Table` trait gives no channel from `pushdown_filter` to
+    /// because the `BoundTable` trait gives no channel from `pushdown_filter` to
     /// `compile`); applied as a filter when the scan is compiled.
     predicates: Vec<PushedPredicate>,
     /// The transaction's shared queue of finished INSERT files. Shared (`Arc`)
     /// with the [`DeltaTransaction`](super::DeltaTransaction) that produced this
-    /// binding, so a file this binding's [`compile_insert`](Table::compile_insert)
+    /// binding, so a file this binding's [`compile_insert`](BoundTable::compile_insert)
     /// pushes is drained by that transaction's commit.
     uploaded_files: Arc<Injector<UploadedFile>>,
 }
@@ -158,7 +158,7 @@ impl TableBinding {
     }
 }
 
-impl Table for TableBinding {
+impl BoundTable for TableBinding {
     fn compile_scan(
         &self,
         dispatcher: &DataFlowDispatcher,
@@ -220,7 +220,7 @@ impl Table for TableBinding {
         self.columns.clone()
     }
 
-    fn clone_box(&self) -> Box<dyn Table> {
+    fn clone_box(&self) -> Box<dyn BoundTable> {
         Box::new(self.clone())
     }
 
@@ -325,7 +325,7 @@ fn scalar_lt(a: &Scalar<ArrayRef>, b: &Scalar<ArrayRef>) -> bool {
 
 impl TableBinding {
     /// Clone `parquet`'s row groups and keep only those that survive this
-    /// binding's pushed-down predicates — i.e. what [`Table::compile_scan`] actually
+    /// binding's pushed-down predicates — i.e. what [`BoundTable::compile_scan`] actually
     /// scans over the table's current files. A min/max stat that proves no row in
     /// a group can match drops it; a stats-comparison error means "can't prune"
     /// (kept) — never wrong, just unoptimized. No footer I/O. Exposed so pruning

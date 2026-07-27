@@ -120,7 +120,7 @@ impl Plan {
         dispatcher: &DataFlowDispatcher,
         transaction: &dyn CatalogTransaction,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        // Table functions and DDL resolve through `transaction`, so the whole
+        // BoundTable functions and DDL resolve through `transaction`, so the whole
         // query reads one frozen view of the catalog and no live catalog state
         // is consulted here. The plan itself carries no snapshot: it can be
         // compiled again under a later transaction, reading that transaction's

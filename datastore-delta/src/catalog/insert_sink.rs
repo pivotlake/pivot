@@ -27,7 +27,7 @@ use crate::store::{DataFileLocation, FileRef, ObjectPath, ObjectStore};
 /// the write mirror of the scan's
 /// [`table_input_with_filter_and_eq_predicates`](crate::parquet::table_input_with_filter_and_eq_predicates):
 /// it wires the encode pipeline into this module's upload operators. Driven by
-/// the binding's `Table::compile_insert` impl (see [`super::binding::TableBinding`]).
+/// the binding's `BoundTable::compile_insert` impl (see [`super::binding::TableBinding`]).
 pub(super) fn build_insert_spec(
     table: &CatalogTable,
     uploaded_files: Arc<Injector<UploadedFile>>,

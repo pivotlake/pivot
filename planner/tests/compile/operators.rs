@@ -9,7 +9,7 @@ use dispatch::Dispatch;
 use crate::common::*;
 use planner::Error as PlannerError;
 use planner::Planner;
-use planner::catalog::{Catalog, CreateTableRequest, Table};
+use planner::catalog::{BoundTable, CreateTableRequest};
 use planner::types::Type;
 use rstest::rstest;
 
@@ -1674,7 +1674,7 @@ struct RecordingTransaction {
 }
 
 impl planner::catalog::CatalogTransaction for RecordingTransaction {
-    fn bind_table(&self, _datastore: &str, _name: &str) -> Option<Box<dyn Table>> {
+    fn bind_table(&self, _datastore: &str, _name: &str) -> Option<Box<dyn BoundTable>> {
         None
     }
 
@@ -1684,10 +1684,6 @@ impl planner::catalog::CatalogTransaction for RecordingTransaction {
     ) -> planner::catalog::Result<Box<dyn planner::catalog::TableCreation>> {
         self.created_tables.lock().unwrap().push(request);
         Ok(Box::new(NoRowsCreation))
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 
@@ -1708,7 +1704,7 @@ impl planner::catalog::TableCreation for NoRowsCreation {
     }
 }
 
-impl Catalog for RecordingCatalog {
+impl RecordingCatalog {
     fn begin_transaction(&self) -> Arc<dyn planner::catalog::CatalogTransaction> {
         Arc::new(RecordingTransaction {
             created_tables: self.created_tables.clone(),
@@ -1759,7 +1755,8 @@ impl dispatch::Nullary<RecordBatch> for NoRowsNullary {
 fn create_table_calls_catalog_once() {
     let dispatch = Dispatch::spin_up(1, 32, None);
     let catalog = Arc::new(RecordingCatalog::default());
-    let mut planner = Planner::new();
+    let mut planner =
+        Planner::from_datastore_names(vec!["default".to_string()], "default".to_string());
     let transaction = catalog.begin_transaction();
 
     let results = planner
@@ -1791,7 +1788,8 @@ fn create_table_calls_catalog_once() {
 fn create_table_passes_with_options_to_catalog() {
     let dispatch = Dispatch::spin_up(1, 32, None);
     let catalog = Arc::new(RecordingCatalog::default());
-    let mut planner = Planner::new();
+    let mut planner =
+        Planner::from_datastore_names(vec!["default".to_string()], "default".to_string());
     let transaction = catalog.begin_transaction();
 
     let results = planner

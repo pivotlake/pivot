@@ -22,8 +22,3 @@ access_key_id = "replace-me"
 secret_access_key = "replace-me"
 # session_token = "replace-me"
 # endpoint = "http://localhost:9000" # MinIO / S3-compatible
-
-# To source AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
-# AWS_REGION/AWS_DEFAULT_REGION, and AWS_ENDPOINT_URL from the environment,
-# remove the inline credential fields above and set:
-# source = "env"

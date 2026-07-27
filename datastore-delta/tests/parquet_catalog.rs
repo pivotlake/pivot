@@ -15,14 +15,14 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tempfile::TempDir;
 
-use catalog::{DEFAULT_DATASTORE_NAME, PivotCatalog};
+use catalog::PivotCatalog;
 use common::current_parquet;
 use datastore::{Datastore, DatastoreTransaction};
 use datastore_delta::store::ObjectPath;
 use datastore_delta::{DeltaDatastore, PartitionEqFilter, TableBinding};
 use planner::Planner;
 use planner::catalog::{
-    Catalog, CatalogTransaction, Column, CreateTableRequest, Result as CatalogResult, Table,
+    BoundTable, CatalogTransaction, Column, CreateTableRequest, Result as CatalogResult,
 };
 use planner::expression::{
     Compare, CompareType, Expression, Function, Ref, TableFilter, VariantGet,
@@ -74,10 +74,10 @@ fn single_catalog(datastore: &Arc<DeltaDatastore>) -> Arc<PivotCatalog> {
     Arc::new(
         PivotCatalog::new(
             HashMap::from([(
-                DEFAULT_DATASTORE_NAME.to_string(),
+                "default".to_string(),
                 datastore.clone() as Arc<dyn Datastore>,
             )]),
-            DEFAULT_DATASTORE_NAME.to_string(),
+            "default".to_string(),
         )
         .unwrap(),
     )
@@ -85,11 +85,11 @@ fn single_catalog(datastore: &Arc<DeltaDatastore>) -> Arc<PivotCatalog> {
 
 /// Drive a transaction commit to completion. A commit that wrote files hops to
 /// the blocking pool, so it needs a Tokio runtime to run under.
-fn commit_transaction_blocking(catalog: &dyn Catalog, transaction: Arc<dyn CatalogTransaction>) {
+fn commit_transaction_blocking(transaction: Arc<dyn CatalogTransaction>) {
     tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap()
-        .block_on(catalog.commit_transaction(transaction))
+        .block_on(transaction.commit())
         .unwrap();
 }
 
@@ -458,7 +458,8 @@ fn append(datastore: &DeltaDatastore, name: &str, path: &Path) {
 fn run_sql(datastore: &Arc<DeltaDatastore>, sql: &str) -> Vec<RecordBatch> {
     let catalog = single_catalog(datastore);
     let transaction = catalog.begin_transaction();
-    let mut planner = Planner::new();
+    let mut planner =
+        Planner::from_datastore_names(vec!["default".to_string()], "default".to_string());
     let batches = planner
         .plan(sql, transaction.clone())
         .unwrap()
@@ -466,7 +467,7 @@ fn run_sql(datastore: &Arc<DeltaDatastore>, sql: &str) -> Vec<RecordBatch> {
         .unwrap()
         .collect()
         .unwrap();
-    commit_transaction_blocking(catalog.as_ref(), transaction);
+    commit_transaction_blocking(transaction);
     batches
 }
 
@@ -477,7 +478,8 @@ fn run_sql_with_stats(
 ) -> (Vec<RecordBatch>, dispatch::DataFlowStats) {
     let catalog = single_catalog(datastore);
     let transaction = catalog.begin_transaction();
-    let mut planner = Planner::new();
+    let mut planner =
+        Planner::from_datastore_names(vec!["default".to_string()], "default".to_string());
     let result = planner
         .plan(sql, transaction.clone())
         .unwrap()
@@ -485,7 +487,7 @@ fn run_sql_with_stats(
         .unwrap()
         .collect_with_stats()
         .unwrap();
-    commit_transaction_blocking(catalog.as_ref(), transaction);
+    commit_transaction_blocking(transaction);
     result
 }
 
@@ -576,7 +578,8 @@ fn insert_files_publish_only_when_transaction_commits() {
 
     let catalog = single_catalog(&datastore);
     let transaction = catalog.begin_transaction();
-    let mut planner = Planner::new();
+    let mut planner =
+        Planner::from_datastore_names(vec!["default".to_string()], "default".to_string());
     let inserted = planner
         .plan(
             "INSERT INTO pending_insert VALUES (1), (2)",
@@ -592,7 +595,7 @@ fn insert_files_publish_only_when_transaction_commits() {
     let before_commit = run_sql(&datastore, "SELECT COUNT(*) FROM pending_insert");
     assert_eq!(common::extract_count(&before_commit), 0);
 
-    commit_transaction_blocking(catalog.as_ref(), transaction);
+    commit_transaction_blocking(transaction);
     let after_commit = run_sql(&datastore, "SELECT COUNT(*) FROM pending_insert");
     assert_eq!(common::extract_count(&after_commit), 2);
 
@@ -605,7 +608,7 @@ fn insert_files_publish_only_when_transaction_commits() {
         .collect()
         .unwrap();
     assert_eq!(common::extract_count(&discarded), 1);
-    catalog.rollback_transaction(rolled_back);
+    rolled_back.rollback();
 
     let after_rollback = run_sql(&datastore, "SELECT COUNT(*) FROM pending_insert");
     assert_eq!(common::extract_count(&after_rollback), 2);

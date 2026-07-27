@@ -11,8 +11,6 @@ use dispatch::DataFlowDispatcher;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub use catalog::DEFAULT_DATASTORE_NAME;
-
 /// The server's configuration source. Today it defines the datastores to serve;
 /// it is the seam future server configuration (users, secrets) would extend.
 pub trait Metastore: Send + Sync {

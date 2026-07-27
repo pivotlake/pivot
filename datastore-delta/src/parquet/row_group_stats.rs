@@ -18,7 +18,7 @@ use crate::parquet::types::metadata::RowGroupMetadata;
 /// Turn the planner's logical [`DynamicScanPredicate`]s into a [`RowGroupFilter`]:
 /// for each, read the Top-N's live boundary from its slot and eliminate any row
 /// group whose statistics prove it can't match. An empty list means no filter.
-/// This is the bridge a Parquet-backed `Table` uses to honour dynamic filters.
+/// This is the bridge a Parquet-backed `BoundTable` uses to honour dynamic filters.
 pub fn row_group_filter_from(predicates: Vec<DynamicScanPredicate>) -> Option<RowGroupFilter> {
     if predicates.is_empty() {
         return None;

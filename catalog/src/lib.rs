@@ -1,8 +1,8 @@
 //! The **cross-datastore catalog**: the layer that presents the set of named
-//! datastores a server serves to the planner as one [`planner::catalog::Catalog`].
+//! datastores a server serves to the planner.
 //!
-//! [`PivotCatalog`] holds the datastores keyed by name as `Arc<dyn Datastore>`
-//! and implements `Catalog`. Its `begin_transaction` returns a
+//! [`PivotCatalog`] holds the datastores keyed by name as `Arc<dyn Datastore>`.
+//! Its `begin_transaction` returns a
 //! [`PivotTransaction`] that opens a datastore's sub-transaction **lazily**, the
 //! first time a query touches that datastore (each datastore is independently
 //! snapshot-isolated); there is no cross-datastore atomic transaction. Query
@@ -14,7 +14,6 @@
 //! one's own commit; a datastore decides for itself whether that commit does
 //! blocking store I/O or is an in-memory no-op.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -22,20 +21,14 @@ use async_trait::async_trait;
 use datastore::DatastoreTransaction;
 use planner::TableFunction;
 use planner::catalog::{
-    Catalog, CatalogTransaction, CreateTableRequest, Error as CatalogError,
-    Result as CatalogResult, Table, TableCreation,
+    BoundTable, CatalogTransaction, CreateTableRequest, Error as CatalogError,
+    Result as CatalogResult, TableCreation,
 };
 
 /// One named data source served by pivotdb. Re-exported from `datastore`, where
 /// the trait lives; concrete backends (e.g. `datastore_delta::DeltaDatastore`)
 /// implement it and are held here behind `Arc<dyn Datastore>`.
 pub use datastore::Datastore;
-/// The datastore name a datastore opened without an explicit one takes: the
-/// database DuckDB attaches it as by default and the key it registers under. A
-/// datastore with this name is required; it is DuckDB's current database, so
-/// unqualified table names and DDL resolve against it. Defined by `planner` (the
-/// lowest crate that names it) and re-exported here.
-pub use planner::DEFAULT_DATASTORE_NAME;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -47,7 +40,7 @@ pub enum Error {
     UnknownDatastore(String),
 }
 
-/// A set of named datastores presented to the planner as one [`Catalog`]. The
+/// A set of named datastores presented to the planner. The
 /// datastore named `default_name` is DuckDB's current database, so unqualified
 /// names resolve against it.
 #[derive(Debug, Clone)]
@@ -112,59 +105,20 @@ impl PivotCatalog {
         }
     }
 
-    /// The datastore sub-transactions a [`PivotTransaction`] lazily opened, as
-    /// `(name, child)` pairs, with the lock dropped before the caller uses them:
-    /// commit and rollback both iterate these and must not hold the transaction's
-    /// lock across a datastore's own commit.
-    fn touched_children(
-        transaction: &Arc<dyn CatalogTransaction>,
-    ) -> Vec<(String, Arc<dyn DatastoreTransaction>)> {
-        let Some(named) = transaction.as_any().downcast_ref::<PivotTransaction>() else {
-            return Vec::new();
-        };
-        named
-            .children
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(name, child)| (name.clone(), child.clone()))
-            .collect()
-    }
-}
-
-#[async_trait]
-impl Catalog for PivotCatalog {
-    fn begin_transaction(&self) -> Arc<dyn CatalogTransaction> {
+    /// Open a transaction over these datastores: a [`PivotTransaction`] that opens
+    /// each datastore's sub-transaction lazily, the first time a query touches it.
+    /// Commit and rollback are methods on the returned transaction itself.
+    pub fn begin_transaction(&self) -> Arc<dyn CatalogTransaction> {
         Arc::new(PivotTransaction {
             datastores: self.datastores.clone(),
             default_name: self.default_name.clone(),
-            children: Mutex::new(HashMap::new()),
+            sub_transactions: Mutex::new(HashMap::new()),
         })
-    }
-
-    async fn commit_transaction(
-        &self,
-        transaction: Arc<dyn CatalogTransaction>,
-    ) -> CatalogResult<()> {
-        // Commit only the datastores this query touched, awaiting each one's own
-        // commit. A datastore decides for itself whether that commit does blocking
-        // store I/O (hopping to the blocking pool) or is an in-memory no-op it can
-        // finish inline, so there is no offload gate here.
-        for (name, child) in Self::touched_children(&transaction) {
-            self.datastores[&name].commit_transaction(child).await?;
-        }
-        Ok(())
-    }
-
-    fn rollback_transaction(&self, transaction: Arc<dyn CatalogTransaction>) {
-        for (name, child) in Self::touched_children(&transaction) {
-            self.datastores[&name].rollback_transaction(child);
-        }
     }
 }
 
 /// The [`CatalogTransaction`] a [`PivotCatalog`] opens. It holds the datastore
-/// map and opens a datastore's child [`DatastoreTransaction`] **lazily**, the
+/// map and opens a datastore's sub-transaction [`DatastoreTransaction`] **lazily**, the
 /// first time the query touches that datastore (reusing it thereafter), so a
 /// query that reads one datastore never snapshots the others. The `bind_table`
 /// / `bind_table_function` resolutions route by name (the path DuckDB's
@@ -176,39 +130,58 @@ impl Catalog for PivotCatalog {
 pub struct PivotTransaction {
     datastores: Arc<HashMap<String, Arc<dyn Datastore>>>,
     default_name: String,
-    /// The child transactions opened so far, keyed by datastore name. Populated
-    /// on first touch during binding (`&self`, hence the lock) and read back at
-    /// commit to publish only the datastores the query used.
-    children: Mutex<HashMap<String, Arc<dyn DatastoreTransaction>>>,
+    /// The datastore sub-transactions opened so far, keyed by datastore name.
+    /// Populated on first touch during binding (`&self`, hence the lock) and read
+    /// back at commit to publish only the datastores the query used.
+    sub_transactions: Mutex<HashMap<String, Arc<dyn DatastoreTransaction>>>,
 }
 
 impl PivotTransaction {
-    /// The child transaction for `datastore`, opening (and remembering) one on
-    /// first touch and reusing it thereafter, or `None` if no such datastore
-    /// exists. Every table a query binds in one datastore shares this single
-    /// child, so they read one consistent snapshot of it.
-    fn child(&self, datastore: &str) -> Option<Arc<dyn DatastoreTransaction>> {
-        let mut children = self.children.lock().unwrap();
-        if let Some(existing) = children.get(datastore) {
+    /// The sub-transaction for `datastore`, opening (and remembering) one on first
+    /// touch and reusing it thereafter, or `None` if no such datastore exists.
+    /// Every table a query binds in one datastore shares this single
+    /// sub-transaction, so they read one consistent snapshot of it.
+    fn find_or_create_sub_transaction(
+        &self,
+        datastore: &str,
+    ) -> Option<Arc<dyn DatastoreTransaction>> {
+        let mut sub_transactions = self.sub_transactions.lock().unwrap();
+        if let Some(existing) = sub_transactions.get(datastore) {
             return Some(existing.clone());
         }
-        let child = self.datastores.get(datastore)?.begin_transaction();
-        children.insert(datastore.to_string(), child.clone());
-        Some(child)
+        let sub_transaction = self.datastores.get(datastore)?.begin_transaction();
+        sub_transactions.insert(datastore.to_string(), sub_transaction.clone());
+        Some(sub_transaction)
+    }
+
+    /// The sub-transactions opened so far, as `(name, sub-transaction)` pairs, with
+    /// the lock dropped before returning: commit and rollback iterate these and
+    /// must not hold the lock across a datastore's own commit.
+    fn opened_sub_transactions(&self) -> Vec<(String, Arc<dyn DatastoreTransaction>)> {
+        self.sub_transactions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, sub)| (name.clone(), sub.clone()))
+            .collect()
     }
 }
 
+#[async_trait]
 impl CatalogTransaction for PivotTransaction {
-    fn bind_table(&self, datastore: &str, name: &str) -> Option<Box<dyn Table>> {
-        self.child(datastore)?.bind_table(name)
+    fn bind_table(&self, datastore: &str, name: &str) -> Option<Box<dyn BoundTable>> {
+        self.find_or_create_sub_transaction(datastore)?
+            .bind_table(name)
     }
 
     fn bind_table_function(&self, datastore: &str, name: &str) -> Option<Box<dyn TableFunction>> {
-        self.child(datastore)?.bind_table_function(name)
+        self.find_or_create_sub_transaction(datastore)?
+            .bind_table_function(name)
     }
 
     fn bind_default_table_function(&self, name: &str) -> Option<Box<dyn TableFunction>> {
-        self.child(&self.default_name)?.bind_table_function(name)
+        self.find_or_create_sub_transaction(&self.default_name)?
+            .bind_table_function(name)
     }
 
     fn bind_create_table(
@@ -222,14 +195,28 @@ impl CatalogTransaction for PivotTransaction {
             .datastore_name
             .clone()
             .unwrap_or_else(|| self.default_name.clone());
-        let child = self.child(&target).ok_or_else(|| {
-            CatalogError::Other(Box::new(Error::UnknownDatastore(target.clone())))
-        })?;
-        child.bind_create_table(request)
+        let sub_transaction = self
+            .find_or_create_sub_transaction(&target)
+            .ok_or_else(|| {
+                CatalogError::Other(Box::new(Error::UnknownDatastore(target.clone())))
+            })?;
+        sub_transaction.bind_create_table(request)
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
+    /// Commit every sub-transaction the query opened, awaiting each datastore's own
+    /// commit. Each datastore decides whether its commit does blocking store I/O
+    /// (hopping to the blocking pool) or is an in-memory no-op it finishes inline.
+    async fn commit(&self) -> CatalogResult<()> {
+        for (_name, sub_transaction) in self.opened_sub_transactions() {
+            sub_transaction.commit().await?;
+        }
+        Ok(())
+    }
+
+    fn rollback(&self) {
+        for (_name, sub_transaction) in self.opened_sub_transactions() {
+            sub_transaction.rollback();
+        }
     }
 }
 
@@ -241,12 +228,9 @@ mod tests {
 
     #[test]
     fn requires_the_default_datastore() {
-        let error =
-            PivotCatalog::new(HashMap::new(), DEFAULT_DATASTORE_NAME.to_string()).unwrap_err();
+        let error = PivotCatalog::new(HashMap::new(), "default".to_string()).unwrap_err();
 
-        assert!(
-            matches!(error, Error::MissingDefaultDatastore(name) if name == DEFAULT_DATASTORE_NAME)
-        );
+        assert!(matches!(error, Error::MissingDefaultDatastore(name) if name == "default"));
     }
 
     #[test]
@@ -256,17 +240,16 @@ mod tests {
         let datastore: Arc<dyn Datastore> =
             DeltaDatastore::open_local(directory.path(), dispatch.dispatcher()).unwrap();
 
-        assert_eq!(datastore.name(), DEFAULT_DATASTORE_NAME);
-        assert!(!datastore.refresh().unwrap());
+        assert_eq!(datastore.name(), "default");
 
         let catalog = PivotCatalog::new(
-            HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),
-            DEFAULT_DATASTORE_NAME.to_string(),
+            HashMap::from([("default".to_string(), datastore)]),
+            "default".to_string(),
         )
         .unwrap();
 
-        assert_eq!(catalog.default_name(), DEFAULT_DATASTORE_NAME);
-        assert!(catalog.get_datastore(DEFAULT_DATASTORE_NAME).is_some());
+        assert_eq!(catalog.default_datastore_name(), "default");
+        assert!(catalog.get_datastore("default").is_some());
         dispatch.exit();
     }
 }

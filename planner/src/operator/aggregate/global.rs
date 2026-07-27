@@ -33,7 +33,7 @@ impl Aggregate {
     /// entirely. Applies when the aggregate sits directly on a scan with no
     /// dynamic predicates, every expression is a `MIN`/`MAX` over a plain
     /// column, and the table can prove both bounds for each column
-    /// ([`Table::column_min_max`](crate::catalog::Table::column_min_max)); any
+    /// ([`BoundTable::column_min_max`](crate::catalog::BoundTable::column_min_max)); any
     /// miss returns `None` and the ordinary scan-based path runs.
     pub(crate) fn try_compile_from_stats(
         &self,

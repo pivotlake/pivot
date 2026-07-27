@@ -27,7 +27,7 @@
 //! use std::net::SocketAddr;
 //! use std::sync::Arc;
 //!
-//! use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
+//! use catalog::{Datastore, PivotCatalog};
 //! use datastore_delta::DeltaDatastore;
 //! use dispatch::Dispatch;
 //! use server::Server;
@@ -38,8 +38,8 @@
 //! let datastore: Arc<dyn Datastore> =
 //!     DeltaDatastore::open_local("/var/lib/pivot/default", dispatch.dispatcher())?;
 //! let catalog = Arc::new(PivotCatalog::new(
-//!     HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),
-//!     DEFAULT_DATASTORE_NAME.to_string(),
+//!     HashMap::from([("default".to_string(), datastore)]),
+//!     "default".to_string(),
 //! )?);
 //! let bind: SocketAddr = "127.0.0.1:5433".parse().unwrap();
 //!
