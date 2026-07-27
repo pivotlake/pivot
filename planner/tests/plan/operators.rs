@@ -52,6 +52,23 @@ fn filter(mut testing_planner: TestingPlanner) {
     ");
 }
 
+// DuckDB pushes the simple `a > 5` into the scan's table_filters while the
+// column-to-column `a <> b` stays in the plan's Filter; the walk must fold
+// both into ONE Filter (pushed condition first), never a stack of two - a
+// stack materializes survivors once per level.
+#[rstest]
+fn pushed_and_residual_conditions_fold_into_one_filter(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .plan("SELECT a FROM example_table WHERE a > 5 AND a <> b")
+        .unwrap();
+    assert_snapshot!(plan.to_string(), @"
+    Projection(a:Int32)
+      Projection(#0:Int32)
+        Filter(a:Int32 > 5:Int32 -> Boolean AND a:Int32 <> b:Int32 -> Boolean)
+          Input([a:Int32, b:Int32])
+    ");
+}
+
 #[rstest]
 fn order_by_limit_produces_top_n(mut testing_planner: TestingPlanner) {
     let plan = testing_planner

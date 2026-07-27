@@ -190,11 +190,24 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         }
     };
 
-    let node = merge_stacked_filters(PlanNode {
+    let mut node = PlanNode {
         name: op.name(),
         inputs,
         operator,
-    });
+    };
+
+    // A filter directly above a base-table scan folds the scan's lifted
+    // pushed-down conditions into itself (see `absorb_scan_pushdown_filter`).
+    // The peek at the DuckDB child is what grounds the fold: only a scan child
+    // means the built input's Filter can be the synthetic wrapper.
+    if matches!(kind, DuckOperator::Filter(_))
+        && op
+            .children()
+            .next()
+            .is_some_and(|child| matches!(child.operator(), DuckOperator::TableScan(_)))
+    {
+        node = absorb_scan_pushdown_filter(node);
+    }
 
     // Reattach the scan's static pushed-down filters as a Filter above it, so the
     // Rust side keeps seeing `Filter -> Input` exactly as with filter_pushdown off.
@@ -227,17 +240,21 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
     Ok(node)
 }
 
-/// Merge a Filter whose input is another Filter into one node, the child's
-/// conditions first (they sit closer to the scan, where DuckDB put the
-/// pushed-down, typically most selective predicates). One filter evaluates
-/// its conditions progressively and materializes survivors once, so a stack
-/// of filters would re-materialize at every level — the first level at its
-/// own (much weaker) selectivity.
-fn merge_stacked_filters(node: PlanNode) -> PlanNode {
-    let is_stack = matches!(node.operator, Operator::Filter(_))
-        && node.inputs.len() == 1
-        && matches!(node.inputs[0].operator, Operator::Filter(_));
-    if !is_stack {
+/// Fold the synthetic pushdown filter under `node` into `node` itself.
+///
+/// Called only for a filter whose DuckDB child is a base-table scan. By
+/// construction (see the `TableScan` arm) the built input is then either the
+/// raw `Input` or the synthetic Filter carrying the scan's lifted pushed-down
+/// conditions - never a user filter - so a Filter input is always the
+/// wrapper, and it is safe to dissolve. The wrapper's conditions go first:
+/// they sit closer to the scan, where DuckDB puts the typically most
+/// selective predicates. One filter evaluates its conditions progressively
+/// and materializes survivors once, where a stack of filters would
+/// re-materialize at every level - the lower one at its own (much weaker)
+/// selectivity.
+fn absorb_scan_pushdown_filter(node: PlanNode) -> PlanNode {
+    if node.inputs.len() != 1 || !matches!(node.inputs[0].operator, Operator::Filter(_)) {
+        // The scan had no pushed-down conditions, so there is no wrapper.
         return node;
     }
     let PlanNode {
@@ -246,22 +263,17 @@ fn merge_stacked_filters(node: PlanNode) -> PlanNode {
         operator,
     } = node;
     let Operator::Filter(filter) = operator else {
+        unreachable!("the caller matched a filter");
+    };
+    let wrapper = inputs.remove(0);
+    let Operator::Filter(mut merged) = wrapper.operator else {
         unreachable!("matched as a filter above");
     };
-    let child = inputs.remove(0);
-    let PlanNode {
-        inputs: child_inputs,
-        operator: child_operator,
-        ..
-    } = child;
-    let Operator::Filter(mut child_filter) = child_operator else {
-        unreachable!("matched as a filter above");
-    };
-    child_filter.conditions.extend(filter.conditions);
+    merged.conditions.extend(filter.conditions);
     PlanNode {
         name,
-        inputs: child_inputs,
-        operator: Operator::Filter(child_filter),
+        inputs: wrapper.inputs,
+        operator: Operator::Filter(merged),
     }
 }
 
