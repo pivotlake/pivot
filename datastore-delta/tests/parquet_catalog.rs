@@ -782,6 +782,28 @@ fn append_data_file_makes_new_file_visible_to_new_binds() {
     assert_eq!(groups.iter().map(|rg| rg.num_rows).sum::<i64>(), 5);
 }
 
+#[test]
+fn table_revision_is_frozen_with_the_transaction_snapshot() {
+    let (dir, columns) = three_row_table();
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
+    let before_append = datastore.clone().begin_transaction();
+    let before_revision = before_append.table_revision("t").unwrap();
+
+    let new_file = write_ids(dir.path(), "later.parquet", &[40]);
+    append(&datastore, "t", &new_file);
+    let after_revision = datastore
+        .clone()
+        .begin_transaction()
+        .table_revision("t")
+        .unwrap();
+
+    assert_eq!(before_revision.version, 0);
+    assert_eq!(after_revision.version, 1);
+    assert_eq!(before_revision.identity, after_revision.identity);
+    assert_eq!(before_append.table_revision("t").unwrap(), before_revision);
+}
+
 /// Appending the same path twice (a replayed flush notification) must not
 /// double-count its rows. The second handle starts a version behind, so it CAS-
 /// conflicts, refreshes, and sees the file already present.

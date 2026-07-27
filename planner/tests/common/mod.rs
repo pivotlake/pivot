@@ -13,12 +13,15 @@ use tempfile::TempDir;
 
 use datastore_delta::parquet::{ParquetTable, row_group_filter_from, table_input_with_filter};
 use dispatch::{DataFlowDispatcher, Dispatch, Projection, RecordBatchOperatorSpec};
-use planner::catalog::{BoundTable, CatalogTransaction, Column, DynamicScanPredicate};
+use planner::catalog::{
+    BoundTable, CatalogTransaction, Column, DynamicScanPredicate, TableReference, TableRevision,
+};
 use planner::types::Type;
 use planner::{DEFAULT_DATASTORE_NAME, Planner};
 
 #[derive(Clone, Debug)]
 struct TestTable {
+    reference: TableReference,
     _dir: Arc<TempDir>,
     parquet_table: Arc<ParquetTable>,
     columns: Vec<Column>,
@@ -26,7 +29,7 @@ struct TestTable {
 }
 
 impl TestTable {
-    fn new(dispatch: &Dispatch, columns: &[(&str, Type, ArrayRef)]) -> Self {
+    fn new(dispatch: &Dispatch, name: &str, columns: &[(&str, Type, ArrayRef)]) -> Self {
         let fields: Vec<Field> = columns
             .iter()
             .map(|(name, col_type, array)| {
@@ -51,14 +54,19 @@ impl TestTable {
                 col_type: col_type.clone(),
             })
             .collect();
-        Self::from_batches(dispatch, cols, &[batch])
+        Self::from_batches(dispatch, name, cols, &[batch])
     }
 
     /// A table whose data spans one parquet file per batch. The batches may
     /// differ physically (e.g. a variant column shredded differently, or not
     /// at all, per file), as real ingested files do; each batch's own schema
     /// is written as-is.
-    fn from_batches(dispatch: &Dispatch, columns: Vec<Column>, batches: &[RecordBatch]) -> Self {
+    fn from_batches(
+        dispatch: &Dispatch,
+        name: &str,
+        columns: Vec<Column>,
+        batches: &[RecordBatch],
+    ) -> Self {
         // Report the data's actual nullability, as a real binding derives it
         // from footers, so NULL-free test data keeps the fast paths.
         let nullability: Vec<bool> = (0..columns.len())
@@ -91,6 +99,10 @@ impl TestTable {
         );
 
         TestTable {
+            reference: TableReference {
+                datastore: DEFAULT_DATASTORE_NAME.to_string(),
+                table: name.to_string(),
+            },
             _dir: Arc::new(dir),
             parquet_table,
             columns,
@@ -100,6 +112,17 @@ impl TestTable {
 }
 
 impl BoundTable for TestTable {
+    fn table_reference(&self) -> TableReference {
+        self.reference.clone()
+    }
+
+    fn table_revision(&self) -> TableRevision {
+        TableRevision {
+            identity: format!("{}:{}", self.reference.datastore, self.reference.table),
+            version: 0,
+        }
+    }
+
     fn compile_scan(
         &self,
         dispatcher: &DataFlowDispatcher,
@@ -174,7 +197,7 @@ impl TestCatalog {
         self.tables
             .lock()
             .unwrap()
-            .insert(name.to_string(), TestTable::new(dispatch, columns));
+            .insert(name.to_string(), TestTable::new(dispatch, name, columns));
     }
 
     /// Register a table whose data spans one parquet file per batch (the files
@@ -188,7 +211,7 @@ impl TestCatalog {
     ) {
         self.tables.lock().unwrap().insert(
             name.to_string(),
-            TestTable::from_batches(dispatch, columns, batches),
+            TestTable::from_batches(dispatch, name, columns, batches),
         );
     }
 }
@@ -203,6 +226,13 @@ struct TestTransaction {
 impl CatalogTransaction for TestTransaction {
     fn bind_table(&self, _datastore: &str, name: &str) -> Option<Box<dyn BoundTable>> {
         self.tables.get(name).cloned().map(|t| Box::new(t) as _)
+    }
+
+    fn table_revision(&self, datastore: &str, name: &str) -> Option<TableRevision> {
+        self.tables.contains_key(name).then(|| TableRevision {
+            identity: format!("{datastore}:{name}"),
+            version: 0,
+        })
     }
 }
 

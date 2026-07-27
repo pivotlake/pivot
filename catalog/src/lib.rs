@@ -22,7 +22,7 @@ use datastore::DatastoreTransaction;
 use planner::TableFunction;
 use planner::catalog::{
     BoundTable, CatalogTransaction, CreateTableRequest, Error as CatalogError,
-    Result as CatalogResult, TableCreation,
+    Result as CatalogResult, TableCreation, TableRevision,
 };
 
 /// One named data source served by pivotdb. Re-exported from `datastore`, where
@@ -176,6 +176,11 @@ impl CatalogTransaction for PivotTransaction {
     fn bind_table(&self, datastore: &str, name: &str) -> Option<Box<dyn BoundTable>> {
         self.find_or_create_sub_transaction(datastore)?
             .bind_table(name)
+    }
+
+    fn table_revision(&self, datastore: &str, name: &str) -> Option<TableRevision> {
+        self.find_or_create_sub_transaction(datastore)?
+            .table_revision(name)
     }
 
     fn bind_table_function(&self, datastore: &str, name: &str) -> Option<Box<dyn TableFunction>> {

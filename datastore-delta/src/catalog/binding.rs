@@ -16,6 +16,7 @@ use crossbeam_deque::Injector;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Error as CatalogError, Result as CatalogResult,
+    TableReference, TableRevision,
 };
 use planner::expression::{CompareType, Expression, Function, JsonPath, TableFilter};
 
@@ -88,6 +89,8 @@ fn get_prunable_column_and_json_path(expr: &Expression) -> Option<(usize, JsonPa
 /// Cloned per-binding so each query accumulates its own predicates.
 #[derive(Clone)]
 pub struct TableBinding {
+    /// The datastore/database qualifier DuckDB resolved for this table.
+    datastore_name: String,
     /// The snapshot's frozen copy of this table: its schema and the row groups of
     /// every committed file at the version the transaction opened. Reads build
     /// their scan view straight from it; a write resolves the live table by its
@@ -112,6 +115,7 @@ pub struct TableBinding {
 impl std::fmt::Debug for TableBinding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TableBinding")
+            .field("datastore", &self.datastore_name)
             .field("table", &self.table.name())
             .field("id", &self.table.id())
             .field("predicates", &self.predicates)
@@ -122,10 +126,15 @@ impl std::fmt::Debug for TableBinding {
 impl TableBinding {
     /// A binding over the snapshot's `table` copy, sharing the transaction's
     /// `uploaded_files` injector, with no predicates pushed yet.
-    pub(super) fn new(table: CatalogTable, uploaded_files: Arc<Injector<UploadedFile>>) -> Self {
+    pub(super) fn new(
+        datastore_name: String,
+        table: CatalogTable,
+        uploaded_files: Arc<Injector<UploadedFile>>,
+    ) -> Self {
         let columns = table.columns();
         let nullability = table.nullability();
         Self {
+            datastore_name,
             table,
             columns,
             nullability,
@@ -164,6 +173,20 @@ impl TableBinding {
 }
 
 impl BoundTable for TableBinding {
+    fn table_reference(&self) -> TableReference {
+        TableReference {
+            datastore: self.datastore_name.clone(),
+            table: self.table.name().to_string(),
+        }
+    }
+
+    fn table_revision(&self) -> TableRevision {
+        TableRevision {
+            identity: self.table.id().to_string(),
+            version: self.table.version(),
+        }
+    }
+
     fn compile_scan(
         &self,
         dispatcher: &DataFlowDispatcher,

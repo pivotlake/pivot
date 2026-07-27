@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use planner::TableFunction;
-use planner::catalog::{BoundTable, CreateTableRequest, Result, TableCreation};
+use planner::catalog::{BoundTable, CreateTableRequest, Result, TableCreation, TableRevision};
 
 /// One query's transaction against a **single datastore**: a consistent
 /// snapshot of that datastore, opened by [`Datastore::begin_transaction`] before
@@ -37,6 +37,11 @@ pub trait DatastoreTransaction: Debug + Send + Sync {
     /// binding captures the snapshot's copy of the table, so its compile needs
     /// no transaction handle.
     fn bind_table(&self, name: &str) -> Option<Box<dyn BoundTable>>;
+
+    /// The identity and version of `name` in this transaction's frozen
+    /// snapshot, or `None` if no such table exists. This must return `Some` for
+    /// every table returned by [`bind_table`](Self::bind_table).
+    fn table_revision(&self, name: &str) -> Option<TableRevision>;
 
     /// A backend-specific table-valued function by `name`, or `None`. This is
     /// how a backend contributes functions only it can answer (e.g. `metadata`,

@@ -230,8 +230,7 @@ fn build_orders<'a>(
     .collect()
 }
 
-/// Resolve a bound catalog entry into the Pivot [`BoundTable`] it wraps: the DuckDB
-/// table is a [`DuckDBTableAdapter`] holding the `Box<dyn BoundTable>`.
+/// Resolve a bound catalog entry into the Pivot [`BoundTable`] it wraps.
 fn bind_table(wrapper: OptionalTableWrapper) -> Box<dyn BoundTable> {
     let duck: Box<dyn DuckDBTable> = wrapper.table.expect("planner returned an unbound table");
     let any: Box<dyn Any> = duck;
