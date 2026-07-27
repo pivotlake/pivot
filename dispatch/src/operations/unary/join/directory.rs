@@ -136,14 +136,6 @@ impl<B: Index<usize, Output = u64> + IndexMut<usize>> Directory<B> {
         prefetch_ptr_l2(ptr);
     }
 
-    #[inline(always)]
-    pub fn matches_bloom(&self, hash: u64) -> bool {
-        let slot = self.slot_for(hash);
-        let stored = self.entries()[slot];
-        let probe = Self::compute_tag(hash) as u64;
-        (stored & probe) == probe
-    }
-
     /// End-pointer (exclusive) stored in the upper 48 bits.
     /// Slot -1 reads the sentinel (always 0).
     #[inline(always)]

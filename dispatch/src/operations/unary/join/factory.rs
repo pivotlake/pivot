@@ -38,7 +38,6 @@ pub struct JoinProbeFactory {
     pub(crate) table: JoinTable,
     hash_state: RandomState,
     key_column: usize,
-    use_probe_array: bool,
     output_columns: Arc<JoinOutputColumns>,
 }
 
@@ -59,7 +58,6 @@ pub fn create_for_workers(
     impl IntoIterator<Item = JoinProbeFactory>,
     Arc<AtomicBool>,
 ) {
-    let use_probe_array = crate::env::get_env_var_with_default("PIVOT_JOIN_PROBE_ARRAY", true);
     let hash_state = RandomState::with_seeds(0, 0, 0, 0);
     let partition_sizes: Arc<Vec<AtomicUsize>> =
         Arc::new((0..NUM_PARTITIONS).map(|_| AtomicUsize::new(0)).collect());
@@ -108,7 +106,6 @@ pub fn create_for_workers(
         },
         hash_state: hs_clone.clone(),
         key_column: probe_key_column,
-        use_probe_array,
         output_columns: output_columns.clone(),
     });
 
@@ -146,16 +143,7 @@ impl UnaryFactory<RecordBatch, RecordBatch> for JoinProbeFactory {
             self.table,
             self.hash_state,
             self.key_column,
-            self.use_probe_array,
             self.output_columns,
         )
-    }
-}
-
-#[cfg(test)]
-impl JoinProbeFactory {
-    pub(super) fn with_probe_array(mut self, use_probe_array: bool) -> Self {
-        self.use_probe_array = use_probe_array;
-        self
     }
 }
