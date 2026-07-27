@@ -35,7 +35,7 @@ use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::PartitionBuffers;
 use crate::operations::unary::group::hashtables::{
     AggregationValue, DEFAULT_CAPACITY, KeyExtractor, MAX_LOAD_FACTOR, MultiSlabTable,
-    PersistedKey, Prober,
+    PersistedKey, Prober, ScatterRows,
 };
 
 /// Collision-to-entry ratio at which we double the target table.
@@ -276,21 +276,21 @@ pub(super) fn merge_combined<K: KeyExtractor, V: AggregationValue>(
         for bucket in bucket_lo..bucket_hi {
             if merge_prefetch {
                 wb.0[bucket].for_each_prefetched::<SCATTER_PREFETCH_AHEAD>(
-                    |(hash, key, value), ahead| {
-                        if let Some((ahead_hash, ahead_key, _)) = ahead {
+                    |hash, key, stored, ahead| {
+                        if let Some((ahead_hash, ahead_key)) = ahead {
                             ahead_key.prefetch_blob(key_arena);
-                            target.prefetch(*ahead_hash);
+                            target.prefetch(ahead_hash);
                         }
                         target.grow_if_full(&mut allocator, &mut cap);
-                        let live = K::resolve_persisted(key_arena, key);
-                        target.merge::<false, _>(hash, live, value, cfg);
+                        let live = K::resolve_persisted(key_arena, *key);
+                        target.merge_from::<false, _>(hash, live, stored, cfg);
                     },
                 );
             } else {
-                wb.0[bucket].for_each(|(hash, key, value)| {
+                wb.0[bucket].for_each(|hash, key, stored| {
                     target.grow_if_full(&mut allocator, &mut cap);
-                    let live = K::resolve_persisted(key_arena, key);
-                    target.merge::<false, _>(hash, live, value, cfg);
+                    let live = K::resolve_persisted(key_arena, *key);
+                    target.merge_from::<false, _>(hash, live, stored, cfg);
                 });
             }
         }

@@ -1,23 +1,21 @@
-//! [`Dynamic`] — the runtime-signature value: `N` cells of a uniform width `A`,
-//! each folded by its slot's op.
+//! The runtime per-slot fold machinery: [`BoundSlot`] (a slot's bound reader
+//! for a batch) and the per-slot `seed`/`update`/`merge`/`finish` helpers the
+//! runtime-arity [`Variable`](super::Variable) container folds through.
 //!
-//! Where [`Compiled`](super::Compiled) names its `(`[`Read`]`, `[`Fold`]`)` slots
-//! in the type, `Dynamic` resolves them at runtime: [`make_reader`](OwnedValue::make_reader)
-//! binds each slot to a [`BoundSlot`] (one variant *per (op, width family)* — the
-//! column is downcast into an [`I64Reader`]/[`F64Reader`]/[`U128Reader`] payload,
-//! see [`readers`]), and the fold drives every slot through the *same*
-//! `Op::<A>::update(cell, read, …)`. The cell is `A` in and `A` out for every op — a
-//! string extreme's `ArenaKey`, a float's raw `f64` bits, and a wide `i128` partial
-//! are all just the bits of `A` (`= i128`), viewed by the op via
-//! [`StringCell`]/[`F64Cell`]/[`WideCell`], so the container never reinterprets and
-//! never branches on the value's family.
+//! [`BoundSlot`] carries one variant *per (op, width family)*: the column is
+//! downcast into an [`I64Reader`]/[`F64Reader`]/[`U128Reader`] payload (see
+//! [`readers`]), and the fold drives every slot through the *same*
+//! `Op::<A>::update(cell, read, …)`. The cell is `A` in and `A` out for every
+//! op — a string extreme's `ArenaKey`, a float's raw `f64` bits, and a wide
+//! `i128` partial are all just the bits of `A` (`= i128`), viewed by the op
+//! via [`StringCell`]/[`F64Cell`]/[`WideCell`], so the fold never reinterprets
+//! and never branches on the value's family.
 //!
 //! Generic over `A` (`i64` narrow / `i128` wide) and `ONLY_ADDITIVE` (the
-//! branch-free additive fast path). A string extreme, a float value, and a re-read
-//! wide partial all ride the wide (`i128`) instantiation; the `i64` arms of those
-//! cell traits are the fail-out (the planner always widens such a signature). This
-//! is the runtime container for every non-`Compiled` signature — numeric, string, or
-//! mixed.
+//! branch-free additive fast path). A string extreme, a float value, and a
+//! re-read wide partial all ride the wide (`i128`) instantiation; the `i64`
+//! arms of those cell traits are the fail-out (the planner always widens such
+//! a signature).
 
 mod readers;
 
@@ -25,11 +23,10 @@ use super::super::cell::{F64Cell, IntCell, StringCell, WideCell};
 use super::super::fold::Fold;
 use super::super::read::{Read, StrRead};
 use super::super::{
-    AggregationKind, AggregationSlot, Count, F64Max, F64Min, F64Sum, Max, Min, OwnedValue, StrMax,
-    StrMin, Sum, U128Max, U128Min, U128Sum, ValueColumns,
+    AggregationKind, AggregationSlot, Count, F64Max, F64Min, F64Sum, Max, Min, StrMax, StrMin, Sum,
+    U128Max, U128Min, U128Sum,
 };
 use crate::arrays::SlabColumn;
-use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use arrow_array::{ArrayRef, RecordBatch, StringViewArray};
 use arrow_schema::{DataType, Field};
@@ -127,11 +124,10 @@ impl<'b> BoundSlot<'b> {
     }
 }
 
-/// Seed one slot's cell from row `idx`, a new group's first value. This is the
-/// per-slot fold shared by the const-arity [`Dynamic`] and the runtime-arity
-/// [`Variable`](super::Variable) containers, so every runtime signature folds
-/// identically whichever holds it. Only a string arm touches the `WorkerArena`;
-/// the numeric `seed`s take their value directly.
+/// Seed one slot's cell from row `idx`, a new group's first value: the
+/// per-slot fold of the runtime-arity [`Variable`](super::Variable) container.
+/// Only a string arm touches the `WorkerArena`; the numeric `seed`s take their
+/// value directly.
 ///
 /// `ONLY_ADDITIVE` prunes each non-additive arm *in its body*: `if
 /// ONLY_ADDITIVE { unreachable!() } else { .. }` const-folds to a bare
@@ -354,172 +350,5 @@ pub(in super::super) fn finish_slot<A: IntCell + StringCell + F64Cell + WideCell
         AggregationKind::Max if *ty == DataType::Utf8View => StrMax::<A>::finish(name, col, arena),
         AggregationKind::Max if ty.is_floating() => F64Max::<A>::finish(name, col),
         AggregationKind::Max => Max::<A>::finish(name, col),
-    }
-}
-
-/// `N` cells of width `A`, each folded by its slot op.
-///
-/// `ONLY_ADDITIVE` is a fast-path promise: when `true`, every slot is guaranteed
-/// (by the planner) to be a `COUNT` or an integer/wide `SUM`, so `merge` drops the
-/// per-slot kind dispatch to a branch-free `a + b`, and `value`/`update` prune their
-/// non-additive arms to `unreachable!()`. An all-additive grouped aggregate (e.g. a
-/// low-card `pair (int, int)` aggregate) sets it; a string extreme, a float value, or
-/// a `Min`/`Max` leaves it `false`. Worth ~1.5-2% on a low-card grouped aggregate.
-pub struct Dynamic<
-    const N: usize,
-    A: IntCell + StringCell + F64Cell + WideCell = i64,
-    const ONLY_ADDITIVE: bool = false,
-> {
-    cells: [A; N],
-}
-
-impl<const N: usize, A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Copy
-    for Dynamic<N, A, ONLY_ADDITIVE>
-{
-}
-impl<const N: usize, A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Clone
-    for Dynamic<N, A, ONLY_ADDITIVE>
-{
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<const N: usize, A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
-    Default for Dynamic<N, A, ONLY_ADDITIVE>
-{
-    fn default() -> Self {
-        Self {
-            cells: [A::default(); N],
-        }
-    }
-}
-
-/// The output-column builders for a [`Dynamic`] signature: `N` [`SlabColumn`]s of
-/// width `A`. The value-side counterpart to a key extractor's
-/// [`KeyColumns`](crate::operations::unary::group::keys::KeyColumns). The
-/// `ONLY_ADDITIVE` flag is carried only to bind these columns one-to-one to their
-/// [`Dynamic`] value; the output path renders by slot kind regardless.
-pub struct DynamicColumns<
-    const N: usize,
-    A: IntCell + StringCell + F64Cell + WideCell,
-    const ONLY_ADDITIVE: bool,
-> {
-    cols: [SlabColumn<A>; N],
-}
-
-impl<const N: usize, A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
-    OwnedValue for Dynamic<N, A, ONLY_ADDITIVE>
-{
-    type Reader<'b> = [BoundSlot<'b>; N];
-    /// The per-slot kinds (which op merges/renders each cell) and the value arena
-    /// (which a string extreme resolves its keys through). It spawns a per-worker
-    /// [`WorkerArena`] via [`SharedContext::worker`](super::super::SharedContext::worker).
-    type SharedContext = (Arc<[AggregationSlot]>, Arc<SharedArena>);
-    type Columns = DynamicColumns<N, A, ONLY_ADDITIVE>;
-    type SortKey = i128;
-    /// A runtime signature may carry a string extreme, so it always takes a real
-    /// per-worker [`WorkerArena`] (its numeric arms thread a throwaway `&mut ()`).
-    type WorkerContext = WorkerArena;
-
-    fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> [BoundSlot<'b>; N] {
-        assert_eq!(slots.len(), N, "slot count must match N");
-        std::array::from_fn(|s| BoundSlot::bind(batch, &slots[s]))
-    }
-
-    #[inline(always)]
-    fn value(reader: &[BoundSlot<'_>; N], idx: usize, wc: &mut WorkerArena) -> Self {
-        // A plain loop, not `std::array::from_fn`: the per-slot match is large, so
-        // as a `from_fn` closure it exceeds the inline threshold and is emitted
-        // out-of-line through the `Wrapped`/try-trait machinery. The loop keeps
-        // the op `seed`s inlined.
-        let mut cells = [A::default(); N];
-        #[allow(clippy::needless_range_loop)]
-        for s in 0..N {
-            cells[s] = seed_slot::<A, ONLY_ADDITIVE>(&reader[s], idx, wc);
-        }
-        Self { cells }
-    }
-
-    #[inline(always)]
-    fn update_from_reader(
-        mut self,
-        reader: &[BoundSlot<'_>; N],
-        idx: usize,
-        wc: &mut WorkerArena,
-        ctx: &Self::SharedContext,
-    ) -> Self {
-        let (_, shared) = ctx;
-        #[allow(clippy::needless_range_loop)]
-        for s in 0..N {
-            self.cells[s] =
-                update_slot::<A, ONLY_ADDITIVE>(self.cells[s], &reader[s], idx, wc, shared);
-        }
-        self
-    }
-
-    #[inline(always)]
-    fn merge(self, other: Self, ctx: &Self::SharedContext) -> Self {
-        let (slots, shared) = ctx;
-        // A plain loop, not `std::array::from_fn`, for the same inlining reason as
-        // `value` — this runs per matched entry in the partition merge, the hottest
-        // path for a high-cardinality `COUNT(DISTINCT)`.
-        let mut cells = [A::default(); N];
-        #[allow(clippy::needless_range_loop)]
-        for s in 0..N {
-            let (a, b) = (self.cells[s], other.cells[s]);
-            cells[s] = if ONLY_ADDITIVE {
-                // All-additive: `Count` and every `Sum` merge by `+`, so skip the
-                // per-slot `slots[s].kind` load and dispatch entirely — a branch-free
-                // add, the additive fast path the partition merge wants.
-                a + b
-            } else {
-                merge_slot(a, b, &slots[s], shared)
-            };
-        }
-        Self { cells }
-    }
-
-    #[inline(always)]
-    fn sort_key(&self, slot: usize) -> i128 {
-        // Integer cells widen to their `ORDER BY` key. A string extreme never feeds
-        // a top-k (the planner doesn't push one), so its raw bits here are inert.
-        self.cells[slot].into()
-    }
-}
-
-impl<const N: usize, A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
-    ValueColumns for DynamicColumns<N, A, ONLY_ADDITIVE>
-{
-    type Value = Dynamic<N, A, ONLY_ADDITIVE>;
-    type Context = (Arc<[AggregationSlot]>, Arc<SharedArena>);
-
-    fn with_capacity(allocator: &mut SlabAllocator, rows: usize, _context: &Self::Context) -> Self {
-        Self {
-            cols: std::array::from_fn(|_| SlabColumn::with_capacity(allocator, rows)),
-        }
-    }
-
-    #[inline(always)]
-    fn push(&mut self, value: &Self::Value) {
-        for (col, cell) in self.cols.iter_mut().zip(value.cells.iter()) {
-            col.push(*cell);
-        }
-    }
-
-    #[inline(always)]
-    fn push_stored(&mut self, stored: &Self::Value) {
-        self.push(stored);
-    }
-
-    fn finish(self, context: &Self::Context) -> (Vec<Field>, Vec<ArrayRef>) {
-        let (slots, arena) = context;
-        let mut fields = Vec::with_capacity(N);
-        let mut arrays = Vec::with_capacity(N);
-        for (s, col) in self.cols.into_iter().enumerate() {
-            let (f, a) = finish_slot(&format!("v{s}"), &slots[s], col, arena);
-            fields.push(f);
-            arrays.push(a);
-        }
-        (fields, arrays)
     }
 }

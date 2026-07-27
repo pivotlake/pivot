@@ -21,12 +21,12 @@
 //! the merge slot-range-combines both by the same top bits, with no pre-fold.
 
 use crate::RECORD_BATCH_SIZE;
-use crate::memory::{SlabAllocator, SlabVec};
+use crate::memory::SlabAllocator;
 use crate::operations::unary::group::RADIX_PARTITIONS;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::BaseHashTable;
 use crate::operations::unary::group::hashtables::{
-    AggregationValue, DEFAULT_CAPACITY, KeyExtractor, LiveKey, MultiSlabTable,
+    AggregationValue, DEFAULT_CAPACITY, KeyExtractor, LiveKey, MultiSlabTable, ScatterRows,
 };
 use crate::operations::unary::group::hll::Hll;
 use crate::operations::unary::group::values::{AggregationSlot, WorkerContext};
@@ -74,11 +74,12 @@ impl RadixConfig {
     }
 }
 
-/// One scattered row: `(hash, persisted key, per-row value contribution)`.
-pub type RadixRow<K, V> = (u64, <K as KeyExtractor>::Persisted, V);
-
-/// A worker's scatter output: one engine-backed buffer of raw rows per partition.
-pub struct PartitionBuffers<K: KeyExtractor, V: AggregationValue>(pub Vec<SlabVec<RadixRow<K, V>>>);
+/// A worker's scatter output: one engine-backed buffer of raw
+/// `(hash, key, value)` rows per partition, in the value's own row storage
+/// (see [`ScatterRows`]).
+pub struct PartitionBuffers<K: KeyExtractor, V: AggregationValue>(
+    pub Vec<<V as AggregationValue>::Scatter<<K as KeyExtractor>::Persisted>>,
+);
 unsafe impl<K: KeyExtractor, V: AggregationValue> Send for PartitionBuffers<K, V> {}
 
 /// What a worker hands the merge phase: its in-place stack (always), the radix
@@ -123,7 +124,7 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue> {
     /// Phase 1: stack of growing in-place tables.
     tables: Vec<MultiSlabTable<K, V>>,
     /// Phase 2: per-partition scatter buffers (allocated on switch).
-    buffers: Option<Vec<SlabVec<RadixRow<K, V>>>>,
+    buffers: Option<Vec<<V as AggregationValue>::Scatter<<K as KeyExtractor>::Persisted>>>,
     /// Distinct-count sketch over scattered (post-switch) hashes, for sizing.
     hll: Hll,
     /// Have we switched to radix yet (we may never with low-cardinality)
@@ -360,7 +361,7 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
         if self.buffers.is_none() {
             self.buffers = Some(
                 (0..self.radix_cfg.partitions)
-                    .map(|_| SlabVec::new())
+                    .map(|_| V::Scatter::new(&self.shared_context))
                     .collect(),
             );
         }
@@ -400,8 +401,12 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
             hll.add(hash);
             let p = (hash >> shift) as usize;
             let key = K::live_key(key_reader, i, key_arena).persist();
-            let value = V::value(value_reader, i, worker_context);
-            buffers[p].push(allocator, (hash, key, value));
+            // The row's value is seeded straight into the scatter row, so a
+            // runtime-arity signature's cells land inline with no per-row
+            // allocation.
+            buffers[p].push_with(allocator, hash, key, |stored| {
+                V::seed_stored(stored, value_reader, i, worker_context)
+            });
         }
     }
 
@@ -419,7 +424,6 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
             buffers,
             allocator,
             hll,
-            shared_context,
             ..
         } = self;
         let table = tables.last_mut().unwrap();
@@ -428,11 +432,11 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
             let hash = entry.hash;
             hll.add(hash);
             let p = (hash >> shift) as usize;
-            // The abandon route is radix, so only a radix-compatible value (one
-            // whose owned form is the stored form) reaches it; `to_owned` is a
-            // plain copy and spawns no worker context.
-            let value = V::to_owned(entry.stored, shared_context, &mut None);
-            buffers[p].push(allocator, (hash, *entry.key, value));
+            // The entry's already-deduplicated partial is copied straight into
+            // the scatter row.
+            buffers[p].push_with(allocator, hash, *entry.key, |stored| {
+                V::clone_stored(stored, entry.stored)
+            });
         }
         table.clear();
     }

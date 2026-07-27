@@ -79,8 +79,8 @@ use criterion::{BatchSize, Criterion, Throughput, black_box};
 
 use dispatch::{
     AggregationKind, AggregationSlot, Compiled, Contains, CountSlot, DataFlowDispatcher, Dispatch,
-    Distinct, Dynamic, GroupLimit, IntKeyExtractor, IntPairKeyExtractor, IntStrKeyExtractor,
-    OrderBy, RecordBatchOperatorSpec, RowKeyExtractor, RowKeySchema, StringKeyExtractor, SumSlot,
+    Distinct, GroupLimit, IntKeyExtractor, IntPairKeyExtractor, IntStrKeyExtractor, OrderBy,
+    RecordBatchOperatorSpec, RowKeyExtractor, RowKeySchema, StringKeyExtractor, SumSlot, Variable,
     memory_ctx, values_input,
 };
 
@@ -669,7 +669,7 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
 
     // (h) Composite low-card-ish key (i16, i32) with aggregates, behind a
     //     non-empty free-text filter — the lower-cardinality sibling of (g),
-    //     using the runtime-signature `Dynamic` value. Its slots are all additive
+    //     using the runtime-signature `Variable` value. Its slots are all additive
     //     (COUNT/SUM), so it takes the `ONLY_ADDITIVE` form the planner routes an
     //     all-additive signature to: a branch-free additive fold, not the per-slot
     //     kind dispatch.
@@ -720,7 +720,7 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
             },
             move |s| {
                 s.filter(|| move |b: RecordBatch| keep_nonempty(b, 4))
-                    .group_by_aggregate::<IntPairKeyExtractor<Int16Type, Int32Type>, Dynamic<4, i64, true>>(
+                    .group_by_aggregate::<IntPairKeyExtractor<Int16Type, Int32Type>, Variable<i64, true>>(
                         vec![0, 1],
                         slots.clone(),
                         Some(GroupLimit::TopK { slot: 0, limit: 10 }),

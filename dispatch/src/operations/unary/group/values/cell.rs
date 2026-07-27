@@ -188,7 +188,7 @@ impl WideCell for i64 {
 ///
 /// A grouped string `MIN`/`MAX` keeps its winning `ArenaKey` — a 128-bit Arrow
 /// `StringView` header — in the very slot a numeric aggregate would use, so a
-/// `Dynamic` value can mix a string extreme with integer ones without a second
+/// `Variable` value can mix a string extreme with integer ones without a second
 /// storage path. Only the 128-bit cell (`i128`) can hold the key; `i64` is the
 /// fail-out, since the planner always widens a signature containing a string
 /// extreme to `i128`. The `i64` methods therefore panic: reaching them means the

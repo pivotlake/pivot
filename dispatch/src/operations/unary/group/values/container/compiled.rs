@@ -9,7 +9,7 @@
 //! so the impl fixes both [`AggregationValue`] contexts to `()` — the
 //! `WorkerContext` consume passes (`&mut ()`) and the `SharedContext` merge/finish
 //! pass (`&()`) are inert. A signature carrying a string extreme — which needs a
-//! real `WorkerArena` to store winners — takes the [`Dynamic`](super::Dynamic) path
+//! real `WorkerArena` to store winners — takes the [`Variable`](super::Variable) path
 //! instead.
 //!
 //! There is no per-slot trait and no plumbing trait: a slot's behaviour *is* its
@@ -25,7 +25,7 @@
 //! `Compiled<…>` signature stays shallow (a bare nested `(R, F)` tuple sends the
 //! monomorphisation collector into a loop through the top-k heap). The planner
 //! instantiates the tuple it needs; numeric runtime signatures (shape not known
-//! until plan time) fall back to [`Dynamic`](super::Dynamic).
+//! until plan time) fall back to [`Variable`](super::Variable).
 
 use super::super::cell::Cell;
 use super::super::fold::{Count, Fold, Max, Min, Sum};
@@ -59,7 +59,7 @@ pub type MinSlot<T, A = i64> = Pair<IntRead<T>, Min<A>>;
 /// `MAX(col: T)` over an integer column, accumulating in `A`.
 pub type MaxSlot<T, A = i64> = Pair<IntRead<T>, Max<A>>;
 // (No `StrMinSlot`/`StrMaxSlot`: `Compiled` is numeric-only — a string extreme.s
-// `WorkerContext` is `WorkerArena`, not `()` — so a string signature uses `Dynamic`.)
+// `WorkerContext` is `WorkerArena`, not `()` — so a string signature uses `Variable`.)
 
 /// What a tuple of slots stores: the parallel tuple of accumulator cells, e.g.
 /// `(i64,)` or `(i128, i64)`. The *only* thing [`Compiled`] needs from `Ops` that
@@ -129,7 +129,7 @@ macro_rules! impl_compiled {
         // `Compiled` is numeric-only — its ops are contextless numeric `Fold`s — so
         // both its value contexts are concretely `()`: the `&mut ()` consume passes
         // and the `&()` merge/finish pass are inert (the fold ops take no context).
-        // A signature with a string extreme takes the `Dynamic` path instead.
+        // A signature with a string extreme takes the `Variable` path instead.
         impl<$($R, $F),+> OwnedValue for Compiled<($(Pair<$R, $F>,)+)>
         where
             $($R: Read, $F: Fold, for<'b> $R: Read<Val<'b> = $F::Val>, $F::Acc: Into<i128>,)+

@@ -77,7 +77,7 @@
 //!   ([`IntKeyExtractor`], [`StringKeyExtractor`]), each co-located with its key
 //!   type (e.g. `keys::string` owns [`ArenaKey`])
 //! - [`values`] — the [`AggregationValue`] trait and its container
-//!   implementations (`Compiled`, `Dynamic`), the per-op folds (`Count`, `Sum`,
+//!   implementations (`Compiled`, `Variable`), the per-op folds (`Count`, `Sum`,
 //!   …), plus [`AggregationKind`]/[`AggregationSlot`]
 //! - [`hashtables`] — `BaseHashTable`, [`AggregatedTable`], [`MultiSlabTable`],
 //!   and associated type machinery
@@ -104,8 +104,8 @@ pub use keys::{
 pub(crate) use values::cast_value_column;
 pub use values::{
     AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot, Distinct,
-    Dynamic, F64Cell, F64Max, F64Min, F64Sum, Fold, IntCell, IntRead, Max, MaxSlot, Min, MinSlot,
-    NoRead, OpTuple, Read, SharedContext, StrMax, StrMin, StrRead, Sum, SumSlot, Variable, WideSum,
+    F64Cell, F64Max, F64Min, F64Sum, Fold, IntCell, IntRead, Max, MaxSlot, Min, MinSlot, NoRead,
+    OpTuple, Read, SharedContext, StrMax, StrMin, StrRead, Sum, SumSlot, Variable, WideSum,
     WorkerContext,
 };
 
@@ -114,7 +114,7 @@ use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::group::hashtables::{
     AggregatedTable, AggregatedTableOutput, DEFAULT_CAPACITY, MAX_LOAD_FACTOR, MultiSlabTable,
-    PartitionBuffers, RadixConfig, entry_stride,
+    PartitionBuffers, RadixConfig, ScatterRows, entry_stride,
 };
 use crate::waker::waker_set;
 use crate::worker::current_node;
@@ -265,12 +265,10 @@ impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
         let value_output_types: Arc<[DataType]> =
             value_slots.iter().map(|s| s.output_type.clone()).collect();
         // A string extreme persists its winner lazily during the in-place fold, so
-        // it must not take the radix scatter path (which materialises — and thus
+        // it must not take the radix scatter path (which seeds — and thus
         // persists — every row's string before any comparison). Disable the switch
-        // when any value slot is a string extreme, or when the value itself
-        // declares per-row materialisation unaffordable (see
-        // `AggregationValue::RADIX_COMPATIBLE`); other signatures keep radix.
-        let radix = if !V::RADIX_COMPATIBLE || value_slots.iter().any(|s| s.is_string_extreme()) {
+        // when any value slot is a string extreme; other signatures keep radix.
+        let radix = if value_slots.iter().any(|s| s.is_string_extreme()) {
             radix.without_radix()
         } else {
             radix
@@ -1551,10 +1549,10 @@ mod tests {
         );
     }
 
-    // ---- Mixed string + integer aggregates via the runtime `Dynamic` ----
+    // ---- Mixed string + integer aggregates via the runtime `Variable` ----
 
     /// The same `MIN(name)` (string) + `MAX(v)` (int) mix, but folded by the
-    /// runtime [`Dynamic`] instead of a `Compiled` tuple — the path the planner
+    /// runtime [`Variable`] instead of a `Compiled` tuple — the path the planner
     /// now takes for a heterogeneous string signature. The wide (`i128`) cell
     /// holds the string slot's `ArenaKey` and the int slot's value; the int
     /// extreme stores wide but its slot declares `Int64`, so the output phase
@@ -1570,7 +1568,7 @@ mod tests {
             AggregationSlot::new(AggregationKind::Min, 1, DataType::Utf8View), // MIN(name) — string
             AggregationSlot::new(AggregationKind::Max, 2, DataType::Int64),    // MAX(v)    — int
         ];
-        type Mix = Dynamic<2, i128>;
+        type Mix = Variable<i128>;
         let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
             vec![vec![batch]],
             vec![0],
@@ -1606,7 +1604,7 @@ mod tests {
             AggregationSlot::new(AggregationKind::Min, 1, DataType::Utf8View), // MIN(name)
             AggregationSlot::new(AggregationKind::Max, 1, DataType::Utf8View), // MAX(name)
         ];
-        type Mix = Dynamic<2, i128>;
+        type Mix = Variable<i128>;
         let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
             vec![vec![batch]],
             vec![0],
@@ -1647,7 +1645,7 @@ mod tests {
             AggregationSlot::new(AggregationKind::Min, 1, DataType::Utf8View),
             AggregationSlot::new(AggregationKind::Max, 1, DataType::Utf8View),
         ];
-        type Mix = Dynamic<2, i128>;
+        type Mix = Variable<i128>;
         let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
             vec![vec![w0], vec![w1]],
             vec![0],
@@ -1687,7 +1685,7 @@ mod tests {
             AggregationSlot::new(AggregationKind::Min, 1, DataType::Utf8View),
             AggregationSlot::new(AggregationKind::Max, 1, DataType::Utf8View),
         ];
-        type Mix = Dynamic<2, i128>;
+        type Mix = Variable<i128>;
         // A threshold the in-place table crosses well before N groups — a numeric
         // value would switch to radix here; the string value's override must not.
         let radix = RadixConfig {

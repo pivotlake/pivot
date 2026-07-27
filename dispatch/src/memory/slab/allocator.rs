@@ -151,6 +151,17 @@ impl SlabAllocator {
         self.get_slabs_of_size(bytes, true)
     }
 
+    /// Allocates a single slab of `size` bytes starting at an `align`-aligned
+    /// address, for rows whose size is a runtime value (so no `T` exists to
+    /// carry the alignment). `size + align` must fit one buffer.
+    pub fn get_aligned_slab(&mut self, size: usize, align: usize, zeroed: bool) -> Slab {
+        if self.remaining_in_buffer() < size + align {
+            self.advance_to_new_buffer(zeroed);
+        }
+        self.offset = (self.offset + align - 1) & !(align - 1);
+        self.get_slab_from_current_buffer(size, zeroed)
+    }
+
     /// Allocates a [`SlabBuffer<T>`] that can hold `size` elements of type `T`.
     ///
     /// The total byte size (`size * size_of::<T>()`) must be < 2MB since `SlabBuffer` is

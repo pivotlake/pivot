@@ -2,31 +2,26 @@
 //! fixed for a given GROUP BY but not known at compile time, so no arity is
 //! monomorphised for it.
 //!
-//! Where [`Dynamic`](super::Dynamic) stores its `N` cells as a `[A; N]` (`N` a
-//! const generic, one instantiation per arity), `Variable`'s table-resident
-//! form is a runtime-length cell slice, `Stored = [A]`, living inline in the
-//! hash entry at a stride the table computes at query build. The entry layout
-//! is therefore the same `hash | key | cells` a `Dynamic` entry has; only who
-//! knows the cell count differs. That count is deliberately stored **nowhere**
-//! in the data: consume reads it off the per-batch reader, merge and output off
-//! the shared slot list, and the column builders off their own length.
+//! The table-resident form is a runtime-length cell slice, `Stored = [A]`,
+//! living inline in the hash entry (`hash | key | cells`) at a stride the
+//! table computes at query build. The cell count is deliberately stored
+//! **nowhere** in the data: consume reads it off the per-batch reader, merge
+//! and output off the shared slot list, and the column builders off their own
+//! length.
 //!
-//! Each slot folds exactly as in [`Dynamic`], through the shared per-slot
-//! helpers ([`seed_slot`]/[`update_slot`]/[`merge_slot`]/[`finish_slot`]), so
-//! the two containers agree on every op. The generics mirror [`Dynamic`]'s:
-//! the accumulator width `A` (`i64` narrow / `i128` wide) and the
+//! Each slot folds through the per-slot helpers
+//! ([`seed_slot`]/[`update_slot`]/[`merge_slot`]/[`finish_slot`]). Generic
+//! over the accumulator width `A` (`i64` narrow / `i128` wide) and the
 //! `ONLY_ADDITIVE` branch-free fast path.
 //!
-//! The owned `Variable` value itself is a thin pointer to a cell block in the
-//! value arena; it exists only for the side paths that need an owned, `Sized`
-//! value (a top-k heap row, whose cells must outlive the table they came from,
-//! copied out via [`to_owned`](AggregationValue::to_owned)). `Variable` opts
-//! out of the radix scatter
-//! ([`RADIX_COMPATIBLE`](AggregationValue::RADIX_COMPATIBLE) is `false`): the
-//! scatter path materialises an owned value per *row*, which here would
-//! allocate an arena block per row instead of per group. Such a worker
-//! aggregates in place for the whole consume, as a string-extreme signature
-//! already does.
+//! The radix scatter carries this value's cells inline in each scatter row at
+//! the same per-query stride
+//! ([`StridedScatterRows`](crate::operations::unary::group::hashtables::StridedScatterRows)),
+//! seeded in place, so scattering allocates nothing per row. The owned
+//! `Variable` value itself is a thin pointer to a cell block in the value
+//! arena; it exists only for the one side path that needs an owned, `Sized`
+//! value: a top-k heap row, whose cells must outlive the table they came from,
+//! copied out via [`to_owned`](AggregationValue::to_owned).
 
 use super::super::cell::{F64Cell, IntCell, StringCell, WideCell};
 use super::super::{AggregationSlot, AggregationValue, SharedContext, ValueColumns};
@@ -34,6 +29,7 @@ use super::dynamic::{BoundSlot, finish_slot, merge_slot, seed_slot, update_slot}
 use crate::arrays::SlabColumn;
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
+use crate::operations::unary::group::hashtables::{PersistedKey, StridedScatterRows};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 use std::sync::Arc;
@@ -48,8 +44,7 @@ pub struct Variable<
 > {
     /// The owned copy's cells, in the value arena. Null only in the `Default`
     /// value, which is never read (every real value comes from
-    /// [`to_owned`](AggregationValue::to_owned) or
-    /// [`value`](AggregationValue::value)).
+    /// [`to_owned`](AggregationValue::to_owned)).
     cells: *mut A,
 }
 
@@ -88,20 +83,6 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> De
     }
 }
 
-impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
-    Variable<A, ONLY_ADDITIVE>
-{
-    /// The owned copy's cells. `len` comes from the caller's context (the slot
-    /// count), since the value stores no length.
-    ///
-    /// # Safety
-    /// `len` must not exceed the block's allocated cell count (the signature's
-    /// slot count).
-    unsafe fn cells(&self, len: usize) -> &[A] {
-        unsafe { std::slice::from_raw_parts(self.cells, len) }
-    }
-}
-
 /// The output-column builders for a [`Variable`] signature: one [`SlabColumn`]
 /// per slot, the count taken from the shared slot list at construction. The
 /// value-side counterpart to a key extractor's
@@ -118,6 +99,8 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Ag
     /// The signature's slot count: the one runtime fact the table needs to size
     /// entries and view their cell run.
     type StoredMeta = usize;
+    /// Scatter rows carry the cells inline at the entry stride.
+    type Scatter<KP: PersistedKey> = StridedScatterRows<KP, Self>;
     type Reader<'b> = Box<[BoundSlot<'b>]>;
     /// The per-slot kinds (which op folds/renders each cell, and how many cells
     /// an entry holds) and the value arena (string extremes and owned top-k
@@ -128,11 +111,6 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Ag
     /// The per-worker arena write handle a string extreme persists winners
     /// into (and owned top-k copies allocate from).
     type WorkerContext = WorkerArena;
-
-    /// The scatter path materialises an owned value per row, which for this
-    /// value would allocate an arena cell block per *row* rather than per
-    /// group, so a runtime-arity signature always aggregates in place.
-    const RADIX_COMPATIBLE: bool = false;
 
     fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> Box<[BoundSlot<'b>]> {
         slots
@@ -212,33 +190,25 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Ag
         stored[slot].into()
     }
 
-    fn value(reader: &Self::Reader<'_>, idx: usize, wc: &mut WorkerArena) -> Self {
-        // Only the radix scatter materialises per-row owned values, and this
-        // value opts out of radix, so this is never on a hot path.
-        let cells: *mut A = wc.alloc_cells(reader.len());
-        for (s, slot) in reader.iter().enumerate() {
-            unsafe {
-                cells
-                    .add(s)
-                    .write(seed_slot::<A, ONLY_ADDITIVE>(slot, idx, wc))
-            };
-        }
-        Self { cells }
-    }
-
-    fn store(dst: &mut [A], value: Self) {
-        dst.copy_from_slice(unsafe { value.cells(dst.len()) });
-    }
-
-    fn merge_value(dst: &mut [A], value: Self, ctx: &Self::SharedContext) {
-        Self::merge_stored(dst, unsafe { value.cells(dst.len()) }, ctx);
-    }
-
     fn to_owned(stored: &[A], ctx: &Self::SharedContext, wc: &mut Option<WorkerArena>) -> Self {
         let wc = wc.get_or_insert_with(|| ctx.worker());
         let cells: *mut A = wc.alloc_cells(stored.len());
         unsafe { std::ptr::copy_nonoverlapping(stored.as_ptr(), cells, stored.len()) };
         Self { cells }
+    }
+}
+
+impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
+    Variable<A, ONLY_ADDITIVE>
+{
+    /// The owned copy's cells. `len` comes from the caller's context (the slot
+    /// count), since the value stores no length.
+    ///
+    /// # Safety
+    /// `len` must not exceed the block's allocated cell count (the signature's
+    /// slot count).
+    unsafe fn cells(&self, len: usize) -> &[A] {
+        unsafe { std::slice::from_raw_parts(self.cells, len) }
     }
 }
 

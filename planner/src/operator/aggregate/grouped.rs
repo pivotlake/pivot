@@ -18,12 +18,11 @@
 //!   [`Aggregate::materialize_inputs`]), so from the dispatch's view every key
 //!   and aggregate argument is a column.
 //! * **value** — recognised signatures lower to a branch-free [`Compiled`]
-//!   tuple; every other shape folds each slot by kind in `Dynamic<N>` (numeric,
-//!   string, or mixed; branch-free `+` when all-additive), in `i128` when a slot
-//!   needs the width (see [`Aggregate`]'s rule) else the narrow `i64`. A slot
-//!   count beyond the monomorphised `Dynamic` arities takes the runtime-arity
-//!   [`Variable`], which folds identically with the cell count fixed at query
-//!   build instead of compile time.
+//!   tuple; every other shape folds each slot by kind in the runtime-arity
+//!   [`Variable`] (numeric, string, or mixed; branch-free `+` when
+//!   all-additive), in `i128` when a slot needs the width (see [`Aggregate`]'s
+//!   rule) else the narrow `i64`. The slot count is fixed at query build, so
+//!   one container covers every arity.
 
 use super::{Aggregate, aggregation_slots, row_key_schema, sum_reads_wide_column};
 use crate::compile::{Error, ExprEvalFn, ExprFn};
@@ -33,9 +32,9 @@ use arrow_array::types::{Int8Type, Int16Type, Int32Type, Int64Type};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use dispatch::{
-    AggregationKind, AggregationSlot, Compiled, CountSlot, Distinct, Dynamic, GroupLimit,
-    IntKeyExtractor, IntPairKeyExtractor, IntStrKeyExtractor, RecordBatchOperatorSpec,
-    RowKeyExtractor, StringKeyExtractor, SumSlot, Variable,
+    AggregationKind, AggregationSlot, Compiled, CountSlot, Distinct, GroupLimit, IntKeyExtractor,
+    IntPairKeyExtractor, IntStrKeyExtractor, RecordBatchOperatorSpec, RowKeyExtractor,
+    StringKeyExtractor, SumSlot, Variable,
 };
 use std::sync::Arc;
 
@@ -576,38 +575,19 @@ pub(super) fn dispatch_group_by(
             Ok(input.group_by_aggregate::<$K, $V>(key_cols, slots, output_limit, $cfg))
         };
     }
-    // Fold each slot by kind (or branch-free `+` when `$add`) in
-    // `Dynamic<N, acc, ADDITIVE>`, dispatched on the slot count N (the inline
-    // cell-array length). Numeric, string (`acc = i128`), and mixed alike, since
-    // `Dynamic` dispatches per slot. A slot count with no monomorphised arity
-    // takes `Variable`, which folds the same signature with its cells out of
-    // line in the value arena, so any count lowers without compiling more
-    // arities.
-    macro_rules! arity {
-        ($K:ty, $acc:ty, $add:literal, $cfg:expr) => {
-            match slots.len() {
-                0 => Err(Error::UnsupportedAggregateExpressionAmount(0)),
-                1 => build_group_by!($K, Dynamic<1, $acc, $add>, $cfg),
-                2 => build_group_by!($K, Dynamic<2, $acc, $add>, $cfg),
-                3 => build_group_by!($K, Dynamic<3, $acc, $add>, $cfg),
-                4 => build_group_by!($K, Dynamic<4, $acc, $add>, $cfg),
-                5 => build_group_by!($K, Dynamic<5, $acc, $add>, $cfg),
-                6 => build_group_by!($K, Dynamic<6, $acc, $add>, $cfg),
-                7 => build_group_by!($K, Dynamic<7, $acc, $add>, $cfg),
-                8 => build_group_by!($K, Dynamic<8, $acc, $add>, $cfg),
-                _ => build_group_by!($K, Variable<$acc, $add>, $cfg),
-            }
-        };
-    }
-    // The generic value fallback: pick the accumulator width and the additive
-    // flag, then dispatch by arity. A string extreme is `wide` + non-additive.
+    // The generic value fallback: fold each slot by kind (or branch-free `+`
+    // when additive) in `Variable<acc, ADDITIVE>`, whose slot count is fixed at
+    // query build rather than monomorphised, so one container covers every
+    // arity. Numeric, string (`acc = i128`), and mixed alike, since the fold
+    // dispatches per slot.
     macro_rules! dynamic {
         ($K:ty, $cfg:expr) => {
             match (wide, all_additive) {
-                (true, true) => arity!($K, i128, true, $cfg),
-                (true, false) => arity!($K, i128, false, $cfg),
-                (false, true) => arity!($K, i64, true, $cfg),
-                (false, false) => arity!($K, i64, false, $cfg),
+                _ if slots.is_empty() => Err(Error::UnsupportedAggregateExpressionAmount(0)),
+                (true, true) => build_group_by!($K, Variable<i128, true>, $cfg),
+                (true, false) => build_group_by!($K, Variable<i128, false>, $cfg),
+                (false, true) => build_group_by!($K, Variable<i64, true>, $cfg),
+                (false, false) => build_group_by!($K, Variable<i64, false>, $cfg),
             }
         };
     }

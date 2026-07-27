@@ -10,7 +10,7 @@ use std::marker::PhantomData;
 
 /// Counts rows, in accumulator width `A` (`i64` by default — a count never
 /// exceeds the row count). The width is generic so the runtime
-/// [`Dynamic`](crate::operations::unary::group::values::container::Dynamic) value,
+/// [`Variable`](crate::operations::unary::group::values::container::Variable) value,
 /// whose cells are a uniform width, can hold a `Count` slot in the same cell its
 /// numeric extremes use; `Compiled` instantiates the default `Count<i64>`.
 pub struct Count<A = i64>(PhantomData<A>);

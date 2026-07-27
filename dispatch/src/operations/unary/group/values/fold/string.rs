@@ -5,7 +5,7 @@
 //! arena (a per-worker [`WorkerArena`] to persist winners, the shared
 //! [`SharedArena`] to resolve them) and they hold a borrowed `&str`, so they carry
 //! context a numeric fold never does. They expose plain inherent methods, called
-//! directly from the runtime [`Dynamic`](super::super::container::Dynamic)
+//! directly from the runtime [`Variable`](super::super::container::Variable)
 //! container's string arms — the only place a string extreme appears (there is no
 //! `Compiled` string slot).
 //!
