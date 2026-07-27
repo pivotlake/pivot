@@ -232,7 +232,7 @@ fn format_panic_payload(payload: &Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use catalog::Datastore;
+    use catalog::{DEFAULT_DATASTORE_NAME, Datastore};
     use datastore_delta::DeltaDatastore;
     use std::collections::HashMap;
     use tokio::sync::oneshot;
@@ -248,8 +248,8 @@ mod tests {
         let datastore: Arc<dyn Datastore> =
             DeltaDatastore::open_local(directory.path(), dispatch.dispatcher()).unwrap();
         let catalog = PivotCatalog::new(
-            HashMap::from([("default".to_string(), datastore)]),
-            "default".to_string(),
+            HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),
+            DEFAULT_DATASTORE_NAME.to_string(),
         )
         .unwrap();
         (directory, Arc::new(catalog))

@@ -15,7 +15,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tempfile::TempDir;
 
-use catalog::PivotCatalog;
+use catalog::{DEFAULT_DATASTORE_NAME, PivotCatalog};
 use common::current_parquet;
 use datastore::{Datastore, DatastoreTransaction};
 use datastore_delta::store::ObjectPath;
@@ -74,10 +74,10 @@ fn single_catalog(datastore: &Arc<DeltaDatastore>) -> Arc<PivotCatalog> {
     Arc::new(
         PivotCatalog::new(
             HashMap::from([(
-                "default".to_string(),
+                DEFAULT_DATASTORE_NAME.to_string(),
                 datastore.clone() as Arc<dyn Datastore>,
             )]),
-            "default".to_string(),
+            DEFAULT_DATASTORE_NAME.to_string(),
         )
         .unwrap(),
     )
@@ -458,8 +458,10 @@ fn append(datastore: &DeltaDatastore, name: &str, path: &Path) {
 fn run_sql(datastore: &Arc<DeltaDatastore>, sql: &str) -> Vec<RecordBatch> {
     let catalog = single_catalog(datastore);
     let transaction = catalog.begin_transaction();
-    let mut planner =
-        Planner::from_datastore_names(vec!["default".to_string()], "default".to_string());
+    let mut planner = Planner::from_datastore_names(
+        vec![DEFAULT_DATASTORE_NAME.to_string()],
+        DEFAULT_DATASTORE_NAME.to_string(),
+    );
     let batches = planner
         .plan(sql, transaction.clone())
         .unwrap()
@@ -478,8 +480,10 @@ fn run_sql_with_stats(
 ) -> (Vec<RecordBatch>, dispatch::DataFlowStats) {
     let catalog = single_catalog(datastore);
     let transaction = catalog.begin_transaction();
-    let mut planner =
-        Planner::from_datastore_names(vec!["default".to_string()], "default".to_string());
+    let mut planner = Planner::from_datastore_names(
+        vec![DEFAULT_DATASTORE_NAME.to_string()],
+        DEFAULT_DATASTORE_NAME.to_string(),
+    );
     let result = planner
         .plan(sql, transaction.clone())
         .unwrap()
@@ -578,8 +582,10 @@ fn insert_files_publish_only_when_transaction_commits() {
 
     let catalog = single_catalog(&datastore);
     let transaction = catalog.begin_transaction();
-    let mut planner =
-        Planner::from_datastore_names(vec!["default".to_string()], "default".to_string());
+    let mut planner = Planner::from_datastore_names(
+        vec![DEFAULT_DATASTORE_NAME.to_string()],
+        DEFAULT_DATASTORE_NAME.to_string(),
+    );
     let inserted = planner
         .plan(
             "INSERT INTO pending_insert VALUES (1), (2)",

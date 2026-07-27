@@ -13,9 +13,9 @@ use tempfile::TempDir;
 
 use datastore_delta::parquet::{ParquetTable, row_group_filter_from, table_input_with_filter};
 use dispatch::{DataFlowDispatcher, Dispatch, Projection, RecordBatchOperatorSpec};
-use planner::Planner;
 use planner::catalog::{BoundTable, CatalogTransaction, Column, DynamicScanPredicate};
 use planner::types::Type;
+use planner::{DEFAULT_DATASTORE_NAME, Planner};
 
 #[derive(Clone, Debug)]
 struct TestTable {
@@ -301,7 +301,10 @@ pub fn testing_planner() -> TestingPlanner {
             ),
         ],
     );
-    let planner = Planner::from_datastore_names(vec!["default".to_string()], "default".to_string());
+    let planner = Planner::from_datastore_names(
+        vec![DEFAULT_DATASTORE_NAME.to_string()],
+        DEFAULT_DATASTORE_NAME.to_string(),
+    );
     TestingPlanner {
         planner,
         catalog,

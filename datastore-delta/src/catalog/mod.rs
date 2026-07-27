@@ -50,10 +50,10 @@ use crossbeam_deque::{Injector, Steal};
 use datastore::{Datastore, DatastoreTransaction};
 use dispatch::{DataFlowDispatcher, DataFlowError, RecordBatchOperatorSpec};
 use metadata_function::MetadataTableFunction;
-use planner::TableFunction;
 use planner::catalog::{
     BoundTable, CreateTableRequest, Error as CatalogError, Result as CatalogResult, TableCreation,
 };
+use planner::{DEFAULT_DATASTORE_NAME, TableFunction};
 pub use table::CatalogTable;
 pub use table::TableFile;
 use thiserror::Error as ThisError;
@@ -216,7 +216,7 @@ impl DeltaDatastore {
         dispatcher: &DataFlowDispatcher,
     ) -> Result<Arc<Self>> {
         Self::from_store(
-            "default".to_string(),
+            DEFAULT_DATASTORE_NAME.to_string(),
             Arc::new(LocalStore::new(root)),
             dispatcher,
             None,
@@ -231,7 +231,7 @@ impl DeltaDatastore {
     /// No background maintenance runs (see [`from_store`](Self::from_store)).
     pub fn open(uri: &str, dispatcher: &DataFlowDispatcher) -> Result<Arc<Self>> {
         let store: Arc<dyn ObjectStore> = open_store(uri)?.into();
-        Self::from_store("default".to_string(), store, dispatcher, None)
+        Self::from_store(DEFAULT_DATASTORE_NAME.to_string(), store, dispatcher, None)
     }
 
     /// Open a persisted database over an already-built object store, under the

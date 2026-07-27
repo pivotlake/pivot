@@ -2,10 +2,10 @@ use std::sync::{Arc, Mutex};
 
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use insta::assert_snapshot;
-use planner::Planner;
 use planner::catalog::{BoundTable, CatalogTransaction, Column};
 use planner::expression::TableFilter;
 use planner::types::Type;
+use planner::{DEFAULT_DATASTORE_NAME, Planner};
 
 #[allow(unused_imports)]
 use crate::common::*;
@@ -101,7 +101,10 @@ fn build_planner(table: RecordingTable) -> (Planner, Arc<SingleTableCatalog>) {
         table,
     });
     (
-        Planner::from_datastore_names(vec!["default".to_string()], "default".to_string()),
+        Planner::from_datastore_names(
+            vec![DEFAULT_DATASTORE_NAME.to_string()],
+            DEFAULT_DATASTORE_NAME.to_string(),
+        ),
         catalog,
     )
 }

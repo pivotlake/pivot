@@ -30,6 +30,10 @@ use planner::catalog::{
 /// implement it and are held here behind `Arc<dyn Datastore>`.
 pub use datastore::Datastore;
 
+/// The conventional name for a standalone datastore; see
+/// [`planner::DEFAULT_DATASTORE_NAME`].
+pub use planner::DEFAULT_DATASTORE_NAME;
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, thiserror::Error)]
@@ -228,9 +232,12 @@ mod tests {
 
     #[test]
     fn requires_the_default_datastore() {
-        let error = PivotCatalog::new(HashMap::new(), "default".to_string()).unwrap_err();
+        let error =
+            PivotCatalog::new(HashMap::new(), DEFAULT_DATASTORE_NAME.to_string()).unwrap_err();
 
-        assert!(matches!(error, Error::MissingDefaultDatastore(name) if name == "default"));
+        assert!(
+            matches!(error, Error::MissingDefaultDatastore(name) if name == DEFAULT_DATASTORE_NAME)
+        );
     }
 
     #[test]
@@ -240,16 +247,16 @@ mod tests {
         let datastore: Arc<dyn Datastore> =
             DeltaDatastore::open_local(directory.path(), dispatch.dispatcher()).unwrap();
 
-        assert_eq!(datastore.name(), "default");
+        assert_eq!(datastore.name(), DEFAULT_DATASTORE_NAME);
 
         let catalog = PivotCatalog::new(
-            HashMap::from([("default".to_string(), datastore)]),
-            "default".to_string(),
+            HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),
+            DEFAULT_DATASTORE_NAME.to_string(),
         )
         .unwrap();
 
-        assert_eq!(catalog.default_datastore_name(), "default");
-        assert!(catalog.get_datastore("default").is_some());
+        assert_eq!(catalog.default_datastore_name(), DEFAULT_DATASTORE_NAME);
+        assert!(catalog.get_datastore(DEFAULT_DATASTORE_NAME).is_some());
         dispatch.exit();
     }
 }

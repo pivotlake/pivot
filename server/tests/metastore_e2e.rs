@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use catalog::PivotCatalog;
+use catalog::{DEFAULT_DATASTORE_NAME, PivotCatalog};
 use common::{CatalogFixture, connect_client, select_rows, start_server};
 use metastore::Metastore;
 use metastore_toml::TomlMetastore;
@@ -89,7 +89,7 @@ async fn queries_bind_tables_by_datastore_name() {
             TomlMetastore::open(&meta_path_str, std::time::Duration::from_secs(30)).unwrap();
         let datastores = metastore.open_datastores(dispatch.dispatcher()).unwrap();
         CatalogFixture::new(Arc::new(
-            PivotCatalog::new(datastores, "default".to_string()).unwrap(),
+            PivotCatalog::new(datastores, DEFAULT_DATASTORE_NAME.to_string()).unwrap(),
         ))
     });
     let client = connect_client(port).await;

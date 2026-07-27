@@ -27,9 +27,9 @@ use arrow_schema::{DataType, Field, Schema};
 use rstest::fixture;
 use serde_json::Value;
 
-use crate::Planner;
 use crate::catalog::{BoundTable, CatalogTransaction, Column, DynamicScanPredicate};
 use crate::types::{Type, physical_arrow_type};
+use crate::{DEFAULT_DATASTORE_NAME, Planner};
 use dispatch::{
     DataFlowDispatcher, Dispatch, Nullary, NullaryFactory, NullaryResult, Projection,
     RecordBatchOperatorSpec, Sender, WorkStatus,
@@ -300,7 +300,10 @@ pub fn testing_planner() -> TestingPlanner {
             ),
         ],
     );
-    let planner = Planner::from_datastore_names(vec!["default".to_string()], "default".to_string());
+    let planner = Planner::from_datastore_names(
+        vec![DEFAULT_DATASTORE_NAME.to_string()],
+        DEFAULT_DATASTORE_NAME.to_string(),
+    );
     TestingPlanner {
         planner,
         catalog,
