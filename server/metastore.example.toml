@@ -9,9 +9,14 @@ default = true
 
 # Other entries are attached as databases and can be queried with three-part
 # names such as `warm.main.events`.
+# `compact` enables this datastore's own background compaction (off by default);
+# run it in only one process per datastore. `compact_bytes` (a size such as
+# `128m`) and `compact_min_files` tune it.
 [datastore.warm]
 kind = "delta"
 location = "s3://example-bucket/warm/"
+compact = true
+compact_bytes = "128m"
 region = "us-east-1"
 access_key_id = "replace-me"
 secret_access_key = "replace-me"

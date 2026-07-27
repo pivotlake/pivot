@@ -85,11 +85,8 @@ async fn queries_bind_tables_by_datastore_name() {
 
     let meta_path_str = meta_path.to_str().unwrap().to_string();
     let port = start_server(64, move |dispatch| {
-        let maintenance = datastore_delta::MaintenanceConfig {
-            refresh_interval: std::time::Duration::from_secs(30),
-            compaction: None,
-        };
-        let metastore = TomlMetastore::open(&meta_path_str, maintenance).unwrap();
+        let metastore =
+            TomlMetastore::open(&meta_path_str, std::time::Duration::from_secs(30)).unwrap();
         let datastores = metastore.open_datastores(dispatch.dispatcher()).unwrap();
         CatalogFixture::new(Arc::new(
             PivotCatalog::new(datastores, "default".to_string()).unwrap(),
