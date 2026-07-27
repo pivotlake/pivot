@@ -22,7 +22,8 @@
 
 use std::cell::RefCell;
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::arrow_to_pgwire::PGRowBatch;
@@ -30,6 +31,7 @@ use arrow_array::{Array, Int64Array, RecordBatch};
 use async_trait::async_trait;
 use dispatch::{CancelToken, DataFlowHandle, DataFlowStats};
 use futures::{Sink, SinkExt, stream};
+use lru::LruCache;
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
@@ -67,6 +69,55 @@ thread_local! {
     static PLANNER: RefCell<Option<planner::Planner>> = const { RefCell::new(None) };
 }
 
+/// Maximum distinct SQL strings retained.
+const PLAN_CACHE_QUERY_CAPACITY: usize = 128;
+
+/// A bounded, shared cache of planned read queries.
+///
+/// The map is an LRU over exact SQL strings and retains one plan per query.
+pub(crate) struct PlanCache {
+    inner: Mutex<LruCache<String, Arc<planner::Plan>>>,
+}
+
+impl Default for PlanCache {
+    fn default() -> Self {
+        Self::new(PLAN_CACHE_QUERY_CAPACITY)
+    }
+}
+
+impl PlanCache {
+    fn new(query_capacity: usize) -> Self {
+        Self {
+            inner: Mutex::new(LruCache::new(
+                NonZeroUsize::new(query_capacity).expect("plan cache capacity must be non-zero"),
+            )),
+        }
+    }
+
+    /// Find the cached plan if its revisions match `transaction`'s frozen
+    /// snapshots. A revision mismatch discards the entry.
+    fn get(
+        &self,
+        query: &str,
+        transaction: &dyn planner::catalog::CatalogTransaction,
+    ) -> Option<Arc<planner::Plan>> {
+        let mut inner = self.inner.lock().unwrap();
+        let plan = inner.get(query)?.clone();
+        if plan.has_matching_table_revisions(transaction) {
+            Some(plan)
+        } else {
+            let _ = inner.pop(query);
+            None
+        }
+    }
+
+    /// Insert one cacheable plan, replacing any plan for the same SQL.
+    fn insert(&self, query: String, plan: Arc<planner::Plan>) {
+        debug_assert!(plan.is_cacheable());
+        self.inner.lock().unwrap().put(query, plan);
+    }
+}
+
 fn with_planner<R>(
     catalog: &Arc<catalog::PivotCatalog>,
     f: impl FnOnce(&mut planner::Planner) -> R,
@@ -102,6 +153,7 @@ fn with_planner<R>(
 pub(crate) async fn execute_sql(
     catalog: Arc<catalog::PivotCatalog>,
     dispatcher: dispatch::DataFlowDispatcher,
+    plan_cache: Arc<PlanCache>,
     sql: String,
 ) -> Result<Vec<arrow_array::RecordBatch>, String> {
     // One transaction per statement: the query binds and compiles against this
@@ -109,21 +161,13 @@ pub(crate) async fn execute_sql(
     // (the async block scopes the `?` early-returns so both paths land below).
     let transaction = catalog.begin_transaction();
     let result = async {
-        let plan = {
-            let catalog = catalog.clone();
-            let transaction = transaction.clone();
-            tokio::task::spawn_blocking(move || {
-                with_planner(&catalog, |p| p.plan(&sql, transaction))
-            })
+        let plan = plan_query(&catalog, transaction.clone(), plan_cache.as_ref(), &sql)
             .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())?
-        };
+            .map_err(|e| e.to_string())?;
         // A SET/RESET compiles to no dataflow; nothing to return.
         if plan.as_set_variable().is_some() {
             return Ok(Vec::new());
         }
-        let plan = Arc::new(plan);
         // Compile and launch the dataflow (with the CopyOut cap) on the blocking
         // pool; `execute_copying` returns the running handle without collecting.
         // The closure gets its own clone of the transaction Arc only because
@@ -198,6 +242,36 @@ impl Error {
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Reuse the exact SQL's plan when its complete table-revision map matches this
+/// transaction; otherwise plan inside the same transaction and cache the result
+/// only when the planner marked it safe.
+async fn plan_query(
+    catalog: &Arc<catalog::PivotCatalog>,
+    transaction: Arc<dyn planner::catalog::CatalogTransaction>,
+    plan_cache: &PlanCache,
+    query: &str,
+) -> Result<Arc<planner::Plan>> {
+    if let Some(plan) = plan_cache.get(query, transaction.as_ref()) {
+        return Ok(plan);
+    }
+
+    let catalog = catalog.clone();
+    let cache_key = query.to_string();
+    let query = cache_key.clone();
+    let planning_transaction = transaction;
+    let plan = tokio::task::spawn_blocking(move || -> Result<Arc<planner::Plan>> {
+        with_planner(&catalog, |planner| {
+            Ok(Arc::new(planner.plan(&query, planning_transaction)?))
+        })
+    })
+    .await
+    .map_err(Error::PlannerPanic)??;
+    if plan.is_cacheable() {
+        plan_cache.insert(cache_key, plan.clone());
+    }
+    Ok(plan)
+}
 
 /// Output converted before it leaves the dispatch worker. Query
 /// batches become pgwire rows; INSERT's internal one-row result becomes an
@@ -302,16 +376,19 @@ impl Drop for CancelOnDrop {
 pub struct PivotQueryHandler {
     catalog: Arc<catalog::PivotCatalog>,
     dispatcher: dispatch::DataFlowDispatcher,
+    plan_cache: Arc<PlanCache>,
 }
 
 impl PivotQueryHandler {
     pub fn new(
         catalog: Arc<catalog::PivotCatalog>,
         dispatcher: dispatch::DataFlowDispatcher,
+        plan_cache: Arc<PlanCache>,
     ) -> Self {
         Self {
             catalog,
             dispatcher,
+            plan_cache,
         }
     }
 
@@ -336,18 +413,13 @@ impl PivotQueryHandler {
             let query = query.to_string();
 
             let started = Instant::now();
-            let plan = {
-                let catalog = self.catalog.clone();
-                let q = query.clone();
-                let planning_transaction = transaction.clone();
-                tokio::task::spawn_blocking(move || -> Result<Arc<planner::Plan>> {
-                    with_planner(&catalog, |planner| {
-                        Ok(Arc::new(planner.plan(&q, planning_transaction)?))
-                    })
-                })
-                .await
-                .map_err(Error::PlannerPanic)??
-            };
+            let plan = plan_query(
+                &self.catalog,
+                transaction.clone(),
+                self.plan_cache.as_ref(),
+                &query,
+            )
+            .await?;
             let plan_time = started.elapsed();
 
             // A `SET`/`RESET` is a session command, not a query — DuckDB parsed and
@@ -632,10 +704,11 @@ impl PivotHandlers {
     pub fn new(
         catalog: Arc<catalog::PivotCatalog>,
         dispatcher: dispatch::DataFlowDispatcher,
+        plan_cache: Arc<PlanCache>,
     ) -> Self {
         let manager = Arc::new(ConnectionManager::new());
         Self {
-            query_handler: Arc::new(PivotQueryHandler::new(catalog, dispatcher)),
+            query_handler: Arc::new(PivotQueryHandler::new(catalog, dispatcher, plan_cache)),
             startup_handler: Arc::new(PivotStartupHandler::new(manager.clone())),
             cancel_handler: Arc::new(DefaultCancelHandler::new(manager)),
         }
@@ -661,5 +734,168 @@ impl PgWireServerHandlers for PivotHandlers {
 
     fn copy_handler(&self) -> Arc<impl pgwire::api::copy::CopyHandler> {
         Arc::new(NoopHandler)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use planner::catalog::{BoundTable, Column, TableReference, TableRevision};
+    use std::collections::HashMap;
+
+    #[derive(Clone, Debug)]
+    struct CacheTestTable {
+        reference: TableReference,
+        revision: TableRevision,
+    }
+
+    impl BoundTable for CacheTestTable {
+        fn table_reference(&self) -> TableReference {
+            self.reference.clone()
+        }
+
+        fn table_revision(&self) -> TableRevision {
+            self.revision.clone()
+        }
+
+        fn compile_scan(
+            &self,
+            _dispatcher: &dispatch::DataFlowDispatcher,
+            _projection: dispatch::Projection,
+            _dynamic_filters: Vec<planner::catalog::DynamicScanPredicate>,
+            _emit_row_group_metadata: bool,
+        ) -> planner::catalog::Result<dispatch::RecordBatchOperatorSpec> {
+            unreachable!("cache unit test does not compile its plans")
+        }
+
+        fn columns(&self) -> Vec<Column> {
+            Vec::new()
+        }
+
+        fn clone_box(&self) -> Box<dyn BoundTable> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[derive(Debug)]
+    struct RevisionTransaction {
+        revisions: HashMap<TableReference, TableRevision>,
+    }
+
+    #[async_trait]
+    impl planner::catalog::CatalogTransaction for RevisionTransaction {
+        fn bind_table(&self, _datastore: &str, _name: &str) -> Option<Box<dyn BoundTable>> {
+            None
+        }
+
+        fn table_revision(&self, datastore: &str, name: &str) -> Option<TableRevision> {
+            self.revisions
+                .get(&TableReference {
+                    datastore: datastore.to_string(),
+                    table: name.to_string(),
+                })
+                .cloned()
+        }
+    }
+
+    fn table() -> TableReference {
+        TableReference {
+            datastore: "default".to_string(),
+            table: "events".to_string(),
+        }
+    }
+
+    fn revision(identity: &str, version: u64) -> TableRevision {
+        TableRevision {
+            identity: identity.to_string(),
+            version,
+        }
+    }
+
+    fn transaction(identity: &str, version: u64) -> RevisionTransaction {
+        RevisionTransaction {
+            revisions: HashMap::from([(table(), revision(identity, version))]),
+        }
+    }
+
+    fn plan(identity: &str, version: u64) -> Arc<planner::Plan> {
+        Arc::new(planner::Plan {
+            root: planner::PlanNode {
+                name: "input".to_string(),
+                inputs: Vec::new(),
+                operator: planner::Operator::Input(planner::operator::Input {
+                    table: Box::new(CacheTestTable {
+                        reference: table(),
+                        revision: revision(identity, version),
+                    }),
+                    columns: Vec::new(),
+                    dynamic_filters: Vec::new(),
+                    emit_row_group_metadata: false,
+                }),
+            },
+            output_names: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn cache_hit_requires_the_same_identity_and_version() {
+        let cache = PlanCache::new(2);
+        let cached = plan("table-id", 7);
+        cache.insert("SELECT * FROM events".to_string(), cached.clone());
+
+        let hit = cache
+            .get("SELECT * FROM events", &transaction("table-id", 7))
+            .unwrap();
+        let changed_version = cache.get("SELECT * FROM events", &transaction("table-id", 8));
+        cache.insert("SELECT * FROM events".to_string(), cached.clone());
+        let changed_identity = cache.get("SELECT * FROM events", &transaction("new-table-id", 7));
+
+        assert!(Arc::ptr_eq(&hit, &cached));
+        assert!(changed_version.is_none());
+        assert!(changed_identity.is_none());
+        assert!(cache.inner.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn inserting_a_new_revision_replaces_the_previous_plan() {
+        let cache = PlanCache::new(2);
+        let first = plan("table-id", 7);
+        let second = plan("table-id", 8);
+        cache.insert("SELECT * FROM events".to_string(), first);
+        cache.insert("SELECT * FROM events".to_string(), second.clone());
+
+        let second_hit = cache
+            .get("SELECT * FROM events", &transaction("table-id", 8))
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&second_hit, &second));
+        assert_eq!(cache.inner.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn inserting_over_capacity_evicts_the_least_recently_used_query() {
+        let cache = PlanCache::new(2);
+        let first = plan("first", 1);
+        let second = plan("second", 1);
+        let third = plan("third", 1);
+        cache.insert("first query".to_string(), first.clone());
+        cache.insert("second query".to_string(), second);
+        cache.get("first query", &transaction("first", 1)).unwrap();
+
+        cache.insert("third query".to_string(), third.clone());
+
+        assert!(
+            cache
+                .get("second query", &transaction("second", 1))
+                .is_none()
+        );
+        assert!(Arc::ptr_eq(
+            &cache.get("first query", &transaction("first", 1)).unwrap(),
+            &first
+        ));
+        assert!(Arc::ptr_eq(
+            &cache.get("third query", &transaction("third", 1)).unwrap(),
+            &third
+        ));
     }
 }

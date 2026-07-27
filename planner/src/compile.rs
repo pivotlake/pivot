@@ -120,19 +120,18 @@ pub enum Error {
 
 impl Plan {
     /// Lower this plan into an executable
-    /// [`dispatch::RecordBatchOperatorSpec`] on the given dispatcher. Every table
-    /// access and DDL (e.g. `CREATE TABLE`) resolves through `transaction`, so
-    /// the plan carries no catalog and no snapshot of its own.
+    /// [`dispatch::RecordBatchOperatorSpec`] on the given dispatcher. Base-table
+    /// scans use the self-contained bindings captured while planning; backend
+    /// table functions and DDL resolve through `transaction`.
     pub fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
         transaction: &dyn CatalogTransaction,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        // BoundTable functions and DDL resolve through `transaction`, so the whole
-        // query reads one frozen view of the catalog and no live catalog state
-        // is consulted here. The plan itself carries no snapshot: it can be
-        // compiled again under a later transaction, reading that transaction's
-        // view.
+        // Backend table functions and DDL resolve through `transaction`.
+        // Base-table scans carry their planning snapshot and may reach this
+        // compile through the plan cache only after the server verifies that
+        // every recorded table revision matches this transaction.
         let mut slots = DynamicFilterSlots::new();
         let compiled = self.root.compile(dispatcher, transaction, &mut slots)?;
         Ok(stamp_output_names(compiled, &self.output_names))

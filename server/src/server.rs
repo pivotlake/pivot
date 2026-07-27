@@ -20,7 +20,7 @@
 //! tasks watch that same exit flag and self-exit, so the server no longer
 //! orchestrates them.
 
-use crate::query_handler::PivotHandlers;
+use crate::query_handler::{PivotHandlers, PlanCache};
 use catalog::PivotCatalog;
 use dispatch::{DataFlowDispatcher, Dispatch, Shutdown};
 use pgwire::tokio::process_socket;
@@ -75,6 +75,8 @@ pub struct Server {
     worker_watchers: JoinSet<std::thread::Result<()>>,
     shutdown: Shutdown,
     handlers: Arc<PivotHandlers>,
+    /// Planned read queries shared by the PostgreSQL and in-process HTTP paths.
+    plan_cache: Arc<PlanCache>,
     /// Cloned dispatcher, kept for the query handler (compiling plans) and the
     /// bundled web console's in-process queries.
     dispatcher: DataFlowDispatcher,
@@ -106,11 +108,17 @@ impl Server {
         for handle in handles {
             watchers.spawn_blocking(move || handle.join());
         }
+        let plan_cache = Arc::new(PlanCache::default());
         Self {
             bind,
             shutdown,
             worker_watchers: watchers,
-            handlers: Arc::new(PivotHandlers::new(catalog.clone(), dispatcher.clone())),
+            handlers: Arc::new(PivotHandlers::new(
+                catalog.clone(),
+                dispatcher.clone(),
+                plan_cache.clone(),
+            )),
+            plan_cache,
             dispatcher,
             catalog,
             http_bind: None,
@@ -146,8 +154,11 @@ impl Server {
         // query console). Read-only except `/api/query`, so on shutdown we just
         // abort the task.
         let http_task = self.http_bind.map(|bind| {
-            let state =
-                crate::http::IntrospectState::new(self.catalog.clone(), self.dispatcher.clone());
+            let state = crate::http::IntrospectState::new(
+                self.catalog.clone(),
+                self.dispatcher.clone(),
+                self.plan_cache.clone(),
+            );
             tokio::spawn(async move {
                 if let Err(e) = crate::http::serve(bind, state, std::future::pending()).await {
                     error!(?e, "web dashboard server error");

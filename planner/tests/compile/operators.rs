@@ -1678,6 +1678,14 @@ impl planner::catalog::CatalogTransaction for RecordingTransaction {
         None
     }
 
+    fn table_revision(
+        &self,
+        _datastore: &str,
+        _name: &str,
+    ) -> Option<planner::catalog::TableRevision> {
+        None
+    }
+
     fn bind_create_table(
         &self,
         request: CreateTableRequest,

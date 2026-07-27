@@ -52,6 +52,7 @@ use dispatch::{DataFlowDispatcher, DataFlowError, RecordBatchOperatorSpec};
 use metadata_function::MetadataTableFunction;
 use planner::catalog::{
     BoundTable, CreateTableRequest, Error as CatalogError, Result as CatalogResult, TableCreation,
+    TableRevision,
 };
 use planner::{DEFAULT_DATASTORE_NAME, TableFunction};
 pub use table::CatalogTable;
@@ -802,6 +803,17 @@ impl DeltaSnapshot {
         self.tables.get_by_name(name).cloned()
     }
 
+    /// The cache revision of `name` in this frozen snapshot. The Delta metadata
+    /// UUID distinguishes table incarnations; the log version distinguishes
+    /// every committed snapshot of one incarnation.
+    fn table_revision(&self, name: &str) -> Option<TableRevision> {
+        let table = self.tables.get_by_name(name)?;
+        Some(TableRevision {
+            identity: table.id().to_string(),
+            version: table.version(),
+        })
+    }
+
     /// A clone of the table with `id`, or `None`. An INSERT commit takes its base
     /// version from here (the frozen snapshot), so it commits to the log without
     /// touching the datastore's live set.
@@ -868,6 +880,7 @@ impl DeltaTransaction {
     /// uploaded-files injector, so it is self-contained.
     pub fn table(&self, name: &str) -> Option<TableBinding> {
         Some(TableBinding::new(
+            self.snapshot.datastore_name.clone(),
             self.snapshot.catalog_table_by_name(name)?,
             self.uploaded_files.clone(),
         ))
@@ -878,6 +891,10 @@ impl DeltaTransaction {
 impl DatastoreTransaction for DeltaTransaction {
     fn bind_table(&self, name: &str) -> Option<Box<dyn BoundTable>> {
         Some(Box::new(DeltaTransaction::table(self, name)?))
+    }
+
+    fn table_revision(&self, name: &str) -> Option<TableRevision> {
+        self.snapshot.table_revision(name)
     }
 
     fn bind_table_function(&self, name: &str) -> Option<Box<dyn TableFunction>> {
