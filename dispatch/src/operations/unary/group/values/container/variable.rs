@@ -32,6 +32,7 @@ use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::{PersistedKey, StridedScatterRows};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
+use std::array;
 use std::sync::Arc;
 
 /// A runtime-arity aggregation value in its *owned* form: one thin pointer to a
@@ -83,6 +84,55 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> De
     }
 }
 
+/// The bound per-slot readers for one batch. Signatures up to eight slots
+/// keep them in an inline array — stack memory the optimizer can prove the
+/// probe's raw entry writes never alias, so the readers' payloads hoist into
+/// registers across the row loop exactly as a monomorphised reader array's
+/// did. (A heap `Box` defeats that proof: the loop re-loads reader state per
+/// row, measured as the last per-row stack traffic on multi-slot folds.)
+/// Wider signatures fall back to the heap.
+pub enum SlotReader<'b> {
+    Inline {
+        len: usize,
+        slots: [BoundSlot<'b>; 8],
+    },
+    Boxed(Box<[BoundSlot<'b>]>),
+}
+
+impl<'b> SlotReader<'b> {
+    fn bind(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> Self {
+        if slots.len() <= 8 {
+            SlotReader::Inline {
+                len: slots.len(),
+                // Unused tail slots hold the unit `Count` op; never read (every
+                // access goes through `as_slice`, cut to `len`).
+                slots: array::from_fn(|s| {
+                    if s < slots.len() {
+                        BoundSlot::bind(batch, &slots[s])
+                    } else {
+                        BoundSlot::Count
+                    }
+                }),
+            }
+        } else {
+            SlotReader::Boxed(
+                slots
+                    .iter()
+                    .map(|slot| BoundSlot::bind(batch, slot))
+                    .collect(),
+            )
+        }
+    }
+
+    #[inline(always)]
+    fn as_slice(&self) -> &[BoundSlot<'b>] {
+        match self {
+            SlotReader::Inline { len, slots } => &slots[..*len],
+            SlotReader::Boxed(slots) => slots,
+        }
+    }
+}
+
 /// The output-column builders for a [`Variable`] signature: one [`SlabColumn`]
 /// per slot, the count taken from the shared slot list at construction. The
 /// value-side counterpart to a key extractor's
@@ -101,7 +151,7 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Ag
     type StoredMeta = usize;
     /// Scatter rows carry the cells inline at the entry stride.
     type Scatter<KP: PersistedKey> = StridedScatterRows<KP, Self>;
-    type Reader<'b> = Box<[BoundSlot<'b>]>;
+    type Reader<'b> = SlotReader<'b>;
     /// The per-slot kinds (which op folds/renders each cell, and how many cells
     /// an entry holds) and the value arena (string extremes and owned top-k
     /// copies live there).
@@ -112,11 +162,8 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Ag
     /// into (and owned top-k copies allocate from).
     type WorkerContext = WorkerArena;
 
-    fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> Box<[BoundSlot<'b>]> {
-        slots
-            .iter()
-            .map(|slot| BoundSlot::bind(batch, slot))
-            .collect()
+    fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> SlotReader<'b> {
+        SlotReader::bind(batch, slots)
     }
 
     fn stored_meta(ctx: &Self::SharedContext) -> usize {
@@ -143,6 +190,7 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Ag
 
     #[inline(always)]
     fn seed_stored(dst: &mut [A], reader: &Self::Reader<'_>, idx: usize, wc: &mut WorkerArena) {
+        let reader = reader.as_slice();
         debug_assert_eq!(dst.len(), reader.len());
         // A runtime trip count keeps the compiler from unrolling the per-slot
         // fold, which a monomorphised arity got for free — a measured ~12% on
@@ -175,6 +223,7 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Ag
         ctx: &Self::SharedContext,
     ) {
         let (_, shared) = ctx;
+        let reader = reader.as_slice();
         // Const-count dispatch as in `seed_stored`; this is the hottest fold
         // (every repeated key folds here per row).
         match dst.len() {
