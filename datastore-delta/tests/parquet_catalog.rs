@@ -59,6 +59,7 @@ fn empty_datastore() -> (TempDir, Arc<DeltaDatastore>) {
 /// tests can still assert on the `Err`.
 fn create_table(datastore: &Arc<DeltaDatastore>, request: CreateTableRequest) -> CatalogResult<()> {
     datastore
+        .clone()
         .begin_transaction()
         .bind_create_table(request)?
         .compile(&dispatcher())?
@@ -197,7 +198,7 @@ fn create_table_succeeds_with_valid_path() {
     let (dir, columns) = three_row_table();
     let (_database, datastore) = empty_datastore();
     create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
-    assert!(datastore.begin_transaction().table("t").is_some());
+    assert!(datastore.clone().begin_transaction().table("t").is_some());
 }
 
 #[test]
@@ -249,7 +250,7 @@ fn create_table_without_a_path_makes_an_empty_table() {
     };
     // No path: the table lives under the (in-memory) database root with no data.
     create_table(&datastore, req).unwrap();
-    assert!(datastore.begin_transaction().table("t").is_some());
+    assert!(datastore.clone().begin_transaction().table("t").is_some());
     assert!(current_parquet(&datastore, "t").row_groups().is_empty());
 }
 
@@ -270,7 +271,7 @@ fn create_table_over_an_unwritable_path_fails() {
         err.to_lowercase().contains("permission denied"),
         "expected the Delta commit's write failure, got: {err}"
     );
-    assert!(datastore.begin_transaction().table("t").is_none());
+    assert!(datastore.clone().begin_transaction().table("t").is_none());
 }
 
 #[test]
@@ -313,7 +314,7 @@ fn pushdown_filter_always_returns_false() {
     let (dir, columns) = three_row_table();
     let (_database, datastore) = empty_datastore();
     create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
-    let mut table = datastore.begin_transaction().table("t").unwrap();
+    let mut table = datastore.clone().begin_transaction().table("t").unwrap();
     let pushed = table
         .pushdown_filter(col_neq_filter(0, int_constant(20)))
         .unwrap();
@@ -326,7 +327,7 @@ fn pushdown_filter_prunes_row_group_with_only_excluded_value() {
     let (_database, datastore) = empty_datastore();
     create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
 
-    let mut table = datastore.begin_transaction().table("t").unwrap();
+    let mut table = datastore.clone().begin_transaction().table("t").unwrap();
     assert_eq!(row_group_count(&datastore, "t", &table), 3);
 
     table
@@ -345,14 +346,14 @@ fn second_bind_is_independent_of_first_bind_pushdown() {
     let (_database, datastore) = empty_datastore();
     create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
 
-    let mut first = datastore.begin_transaction().table("t").unwrap();
+    let mut first = datastore.clone().begin_transaction().table("t").unwrap();
     first
         .pushdown_filter(col_neq_filter(0, int_constant(20)))
         .unwrap();
     assert_eq!(row_group_count(&datastore, "t", &first), 2);
 
     // A fresh bind starts from the master entry's full row group set.
-    let second = datastore.begin_transaction().table("t").unwrap();
+    let second = datastore.clone().begin_transaction().table("t").unwrap();
     assert_eq!(row_group_count(&datastore, "t", &second), 3);
 }
 
@@ -363,7 +364,7 @@ fn pushdown_filter_eq_prunes_row_groups_when_constant_outside_range() {
     create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
 
     // `id = 999` lies outside every (min,max) → all three row groups drop.
-    let mut table = datastore.begin_transaction().table("t").unwrap();
+    let mut table = datastore.clone().begin_transaction().table("t").unwrap();
     table
         .pushdown_filter(col_eq_filter(0, int_constant(999)))
         .unwrap();
@@ -377,7 +378,7 @@ fn pushdown_filter_eq_keeps_only_matching_row_group() {
     create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
 
     // `id = 20` matches only the row group whose single value is 20.
-    let mut table = datastore.begin_transaction().table("t").unwrap();
+    let mut table = datastore.clone().begin_transaction().table("t").unwrap();
     table
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
         .unwrap();
@@ -389,7 +390,7 @@ fn pushdown_filter_eq_returns_false() {
     let (dir, columns) = three_row_table();
     let (_database, datastore) = empty_datastore();
     create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
-    let mut table = datastore.begin_transaction().table("t").unwrap();
+    let mut table = datastore.clone().begin_transaction().table("t").unwrap();
     let pushed = table
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
         .unwrap();
@@ -402,7 +403,7 @@ fn pushdown_filter_keeps_row_groups_when_constant_outside_range() {
     let (_database, datastore) = empty_datastore();
     create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
 
-    let mut table = datastore.begin_transaction().table("t").unwrap();
+    let mut table = datastore.clone().begin_transaction().table("t").unwrap();
     table
         .pushdown_filter(col_neq_filter(0, int_constant(999)))
         .unwrap();
@@ -512,7 +513,7 @@ fn column_names(batches: &[RecordBatch]) -> Vec<String> {
 }
 
 #[test]
-fn insert_multiple_values_writes_and_publishes_rows() {
+fn insert_rows_are_visible_after_a_refresh() {
     let data = TempDir::new().unwrap();
     let columns = vec![
         Column {
@@ -543,6 +544,10 @@ fn insert_multiple_values_writes_and_publishes_rows() {
     let inserted = run_sql(&datastore, "INSERT INTO inserted VALUES (3, 'three')");
     assert_eq!(common::extract_count(&inserted), 1);
 
+    // An INSERT commits to the Delta log only; the background refresh brings the
+    // new rows into the live set that later transactions bind against.
+    datastore.refresh_from_store().unwrap();
+
     let rows = run_sql(&datastore, "SELECT id, name FROM inserted ORDER BY id");
     let ids = rows
         .iter()
@@ -563,7 +568,7 @@ fn insert_multiple_values_writes_and_publishes_rows() {
 }
 
 #[test]
-fn insert_files_publish_only_when_transaction_commits() {
+fn insert_files_reach_the_log_only_when_the_transaction_commits() {
     let (_database, datastore) = empty_datastore();
     create_table(
         &datastore,
@@ -598,10 +603,15 @@ fn insert_files_publish_only_when_transaction_commits() {
         .unwrap();
     assert_eq!(common::extract_count(&inserted), 2);
 
+    // Uncommitted: the files are uploaded but not in the Delta log, so a refresh
+    // finds nothing and the rows stay invisible.
+    datastore.refresh_from_store().unwrap();
     let before_commit = run_sql(&datastore, "SELECT COUNT(*) FROM pending_insert");
     assert_eq!(common::extract_count(&before_commit), 0);
 
+    // Committing writes the files to the log; the refresh then surfaces them.
     commit_transaction_blocking(transaction);
+    datastore.refresh_from_store().unwrap();
     let after_commit = run_sql(&datastore, "SELECT COUNT(*) FROM pending_insert");
     assert_eq!(common::extract_count(&after_commit), 2);
 
@@ -616,6 +626,9 @@ fn insert_files_publish_only_when_transaction_commits() {
     assert_eq!(common::extract_count(&discarded), 1);
     rolled_back.rollback();
 
+    // The rolled-back INSERT never reached the log, so a refresh leaves the count
+    // at the two committed rows.
+    datastore.refresh_from_store().unwrap();
     let after_rollback = run_sql(&datastore, "SELECT COUNT(*) FROM pending_insert");
     assert_eq!(common::extract_count(&after_rollback), 2);
 }
@@ -868,7 +881,7 @@ fn pushed_predicate_prunes_latest_files_after_refresh() {
     let (dir, columns) = three_row_table();
     let (_database, datastore) = empty_datastore();
     create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
-    let mut table = datastore.begin_transaction().table("t").unwrap();
+    let mut table = datastore.clone().begin_transaction().table("t").unwrap();
     table
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
         .unwrap();
@@ -1019,7 +1032,7 @@ fn filter_on_partition_column_prunes_whole_single_partition_file() {
     let (_database, datastore) = empty_datastore();
     create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
 
-    let mut table = datastore.begin_transaction().table("t").unwrap();
+    let mut table = datastore.clone().begin_transaction().table("t").unwrap();
     assert_eq!(row_group_count(&datastore, "t", &table), 6);
 
     table
@@ -1199,7 +1212,7 @@ fn shredded_docs_datastore(dir: &Path) -> (TempDir, Arc<DeltaDatastore>, TableBi
         col_type: Type::Variant,
     }];
     create_table(&datastore, create_request("docs", dir, columns)).unwrap();
-    let binding = datastore.begin_transaction().table("docs").unwrap();
+    let binding = datastore.clone().begin_transaction().table("docs").unwrap();
     (database, datastore, binding)
 }
 

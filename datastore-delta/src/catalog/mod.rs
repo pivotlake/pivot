@@ -316,15 +316,15 @@ impl DeltaDatastore {
     /// INSERT files. Cheap: clones the map (the row-group metadata inside is
     /// `Arc`-shared), no I/O. The [`Datastore::begin_transaction`] trait impl
     /// delegates here.
-    pub fn begin_transaction(&self) -> Arc<DeltaTransaction> {
+    pub fn begin_transaction(self: Arc<Self>) -> Arc<DeltaTransaction> {
+        let snapshot = Arc::new(DeltaSnapshot {
+            datastore_name: self.name.clone(),
+            tables: self.tables.read().unwrap().clone(),
+        });
         Arc::new(DeltaTransaction {
-            snapshot: Arc::new(DeltaSnapshot {
-                datastore_name: self.name.clone(),
-                tables: self.tables.read().unwrap().clone(),
-            }),
+            snapshot,
             uploaded_files: Arc::new(Injector::new()),
-            tables: self.tables.clone(),
-            store: self.store.clone(),
+            datastore: self,
         })
     }
 
@@ -395,6 +395,53 @@ impl DeltaDatastore {
                 true
             }
         }
+    }
+
+    /// The terminal step of a `CREATE TABLE`, run on the worker that finishes the
+    /// footer-fetch dataflow: create the table (committing Delta version 0),
+    /// record it in the database index, and publish it into the live set so the
+    /// next transaction binds it (DDL cannot wait for a refresh). The whole step
+    /// holds the table-set write lock, which serializes in-process creates and
+    /// their database-index read-modify-write; the name is re-checked under it as
+    /// a race backstop. `CREATE TABLE` compiles a call to this seam rather than
+    /// letting a transaction touch the live set directly.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn commit_created_table(
+        &self,
+        name: String,
+        location: ObjectPath,
+        columns: Vec<planner::catalog::Column>,
+        partition_by: Vec<String>,
+        sort_by: Vec<String>,
+        if_not_exists: bool,
+        loaded: Vec<TableFile>,
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut map = self.tables.write().unwrap();
+        if map.contains_name(&name) {
+            // A concurrent create won the race. With `IF NOT EXISTS` that is still
+            // a success; the fetched footers are dropped.
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(
+                Box::new(Error::TableExists(name)) as Box<dyn std::error::Error + Send + Sync>
+            );
+        }
+        let table = CatalogTable::create_new(
+            name.clone(),
+            location.clone(),
+            loaded,
+            columns,
+            partition_by,
+            sort_by,
+            self.store.clone(),
+            self.dispatcher.clone(),
+        )?;
+        let mut index = CatalogManifest::load(self.store.as_ref())?;
+        index.upsert(CatalogManifestTableEntry::new(name.clone(), location));
+        index.store(self.store.as_ref())?;
+        map.insert(table);
+        Ok(())
     }
 
     /// The worker pool this datastore fetches footers on, shared with callers
@@ -487,28 +534,22 @@ pub struct DataFileInfo {
 }
 
 impl DeltaTransaction {
-    /// Compile a `CREATE TABLE` to the dataflow that runs it: read every Parquet
-    /// footer under the table's location in parallel and, at the final stage,
-    /// record the table in the manifest with the files found, and publish it in
-    /// the datastore's live catalog map (shared with the datastore through this
-    /// transaction's `tables` handle). Fetch and write are one spec:
-    /// the caller executes it; nothing happens here but the (cheap, read-only)
-    /// directory listing.
-    ///
-    /// The data lives at a directory/prefix: an explicit `WITH (path = '…')`,
-    /// always a plain path, never an object-store URL, or `<name>` under the
-    /// database root when none is given. An empty/absent location yields an
-    /// empty table (registered with no row groups).
     /// Resolve a `CREATE TABLE` against this datastore: check the name is still
     /// free, parse the layout options, and locate the table's existing data
     /// files. Returns a [`DeltaTableCreation`] whose `compile` builds the
     /// footer-fetch-and-commit dataflow. This part runs on the coordinator;
     /// compiling needs the pool.
+    ///
+    /// The data lives at a directory/prefix: an explicit `WITH (path = '…')`,
+    /// always a plain path, never an object-store URL, or `<name>` under the
+    /// database root when none is given. An empty/absent location yields an
+    /// empty table (registered with no row groups).
     fn bind_create(&self, request: CreateTableRequest) -> Result<DeltaTableCreation> {
         // Reject a duplicate up front, unless `IF NOT EXISTS` makes an existing
-        // table a success. The commit re-checks the name under the write lock as a
-        // race backstop, and likewise honours `IF NOT EXISTS` there.
-        if !request.if_not_exists && self.tables.read().unwrap().contains_name(&request.name) {
+        // table a success. This checks the transaction's frozen snapshot; the
+        // datastore re-checks the name under its write lock at commit as the real
+        // race backstop, honouring `IF NOT EXISTS` there too.
+        if !request.if_not_exists && self.snapshot.contains_table(&request.name) {
             return Err(Error::TableExists(request.name));
         }
 
@@ -519,15 +560,15 @@ impl DeltaTransaction {
         // Locate every data file under the table's directory for reading, keeping
         // its `FileRef` identity so each footer's row groups land on the right
         // `TableFile`.
+        let store = &self.datastore.store;
         let files = self
             .list_file_refs(&location)?
             .into_iter()
-            .map(|f| f.into_data_file(self.store.as_ref(), &location))
+            .map(|f| f.into_data_file(store.as_ref(), &location))
             .collect::<store::Result<Vec<DataFile>>>()?;
 
         Ok(DeltaTableCreation {
-            tables: self.tables.clone(),
-            store: self.store.clone(),
+            datastore: self.datastore.clone(),
             files,
             name: request.name,
             columns: request.columns,
@@ -585,6 +626,7 @@ impl DeltaTransaction {
     /// source of truth: `CREATE TABLE`.
     fn list_file_refs(&self, location: &ObjectPath) -> Result<Vec<FileRef>> {
         Ok(self
+            .datastore
             .store
             .list(location)?
             .into_iter()
@@ -593,12 +635,16 @@ impl DeltaTransaction {
     }
 }
 
-/// Publish the files an INSERT drained from its transaction: group them by table,
-/// append each table's to its Delta log (a CAS over the sync object store), and
-/// swap the new version into `tables`. Blocking store I/O, so
+/// Commit the files an INSERT drained from its transaction: group them by table
+/// and append each table's to its Delta log (a CAS over the sync object store).
+/// The commit base is the transaction's frozen snapshot; a stale base just loses
+/// the first CAS attempt and retries on the reloaded latest (see
+/// [`CatalogTable::commit_manifest_version`]). The datastore's live set is left
+/// untouched: the background refresh advances it to the committed version, so an
+/// INSERT never writes shared read state. Blocking store I/O, so
 /// [`DeltaTransaction::commit`] runs it on the blocking pool.
-fn publish_uploaded_files(
-    tables: &Arc<RwLock<TableIndex>>,
+fn commit_uploaded_files(
+    snapshot: &DeltaSnapshot,
     drained: Vec<insert_sink::UploadedFile>,
 ) -> CatalogResult<()> {
     let mut files_by_table = HashMap::<Uuid, Vec<_>>::new();
@@ -621,21 +667,10 @@ fn publish_uploaded_files(
     }
 
     for (table_id, files) in files_by_table {
-        let mut table = tables
-            .read()
-            .unwrap()
-            .get_by_id(&table_id)
-            .cloned()
+        let mut table = snapshot
+            .catalog_table_by_id(&table_id)
             .ok_or_else(|| Error::TableNotFound(table_id.to_string()))?;
         table.commit_uploaded_files(files)?;
-        // Swap the committed copy into the live set unless a newer version won.
-        let mut map = tables.write().unwrap();
-        if map
-            .get_by_id(&table.id())
-            .is_none_or(|existing| existing.version() < table.version())
-        {
-            map.insert(table);
-        }
     }
     Ok(())
 }
@@ -652,7 +687,7 @@ impl Datastore for DeltaDatastore {
     /// consistent version of every table regardless of concurrent refreshes or
     /// commits. [`Datastore::commit_transaction`] publishes files injected by an
     /// INSERT; rollback or dropping the transaction discards that pending set.
-    fn begin_transaction(&self) -> Arc<dyn DatastoreTransaction> {
+    fn begin_transaction(self: Arc<Self>) -> Arc<dyn DatastoreTransaction> {
         DeltaDatastore::begin_transaction(self)
     }
 
@@ -741,6 +776,19 @@ impl DeltaSnapshot {
         self.tables.get_by_name(name).cloned()
     }
 
+    /// A clone of the table with `id`, or `None`. An INSERT commit takes its base
+    /// version from here (the frozen snapshot), so it commits to the log without
+    /// touching the datastore's live set.
+    pub(super) fn catalog_table_by_id(&self, id: &Uuid) -> Option<CatalogTable> {
+        self.tables.get_by_id(id).cloned()
+    }
+
+    /// Whether this snapshot holds a table named `name`; the up-front duplicate
+    /// check for `CREATE TABLE`.
+    pub(super) fn contains_table(&self, name: &str) -> bool {
+        self.tables.contains_name(name)
+    }
+
     /// Per-file row groups (path + its row groups, manifest order) for the
     /// `metadata()` table function. Errors if the snapshot has no such table.
     pub(super) fn file_row_groups(
@@ -756,12 +804,12 @@ impl DeltaSnapshot {
 pub struct DeltaTransaction {
     pub(super) snapshot: Arc<DeltaSnapshot>,
     pub(super) uploaded_files: Arc<Injector<insert_sink::UploadedFile>>,
-    /// The datastore's live table set and object store, so a `CREATE TABLE` this
-    /// transaction compiles publishes the new table into the datastore itself,
-    /// not just into the frozen snapshot. Shared (`Arc`) with the datastore, so
-    /// the publish is visible to later transactions.
-    tables: Arc<RwLock<TableIndex>>,
-    store: Arc<dyn ObjectStore>,
+    /// The datastore this transaction reads and writes back to. An INSERT commits
+    /// to the Delta log alone and never touches the datastore's live set; only a
+    /// `CREATE TABLE` publishes, through the datastore's own
+    /// [`commit_created_table`](DeltaDatastore::commit_created_table) seam, so DDL
+    /// is visible to the next transaction without waiting for a refresh.
+    datastore: Arc<DeltaDatastore>,
 }
 
 impl std::fmt::Debug for DeltaTransaction {
@@ -825,29 +873,28 @@ impl DatastoreTransaction for DeltaTransaction {
 
     async fn commit(&self) -> CatalogResult<()> {
         // A read-only transaction uploaded nothing: an in-memory no-op, run inline
-        // rather than pay a blocking-pool round trip. Only a commit that publishes
+        // rather than pay a blocking-pool round trip. Only a commit that writes
         // files does blocking store I/O, so it (and only it) hops off the runtime.
         if self.uploaded_files.is_empty() {
             return Ok(());
         }
-        let tables = self.tables.clone();
+        let snapshot = self.snapshot.clone();
         let drained = self.drain_uploaded_files();
-        tokio::task::spawn_blocking(move || publish_uploaded_files(&tables, drained))
+        tokio::task::spawn_blocking(move || commit_uploaded_files(&snapshot, drained))
             .await
             .map_err(|e| CatalogError::Other(format!("commit thread panicked: {e}").into()))?
     }
 }
 
-/// A resolved `CREATE TABLE` for a [`DeltaDatastore`]: the validated request, the
-/// datastore's live table set and store, and the located data files, captured at
-/// resolution by [`DeltaTransaction::bind_create`]. Compiling it builds the
-/// dataflow that fetches the files' footers and, at its terminal, commits the new
-/// table into the datastore.
+/// A resolved `CREATE TABLE` for a [`DeltaDatastore`]: the validated request, a
+/// handle to the datastore that will publish the table, and the located data
+/// files, captured at resolution by [`DeltaTransaction::bind_create`]. Compiling
+/// it builds the dataflow that fetches the files' footers and, at its terminal,
+/// commits the new table through the datastore.
 struct DeltaTableCreation {
-    /// The datastore's live table set (shared `Arc` with the datastore), so the
-    /// terminal commit publishes the new table into the datastore itself.
-    tables: Arc<RwLock<TableIndex>>,
-    store: Arc<dyn ObjectStore>,
+    /// The datastore whose [`commit_created_table`](DeltaDatastore::commit_created_table)
+    /// seam the terminal commit calls to create and publish the table.
+    datastore: Arc<DeltaDatastore>,
     files: Vec<DataFile>,
     name: String,
     columns: Vec<planner::catalog::Column>,
@@ -862,13 +909,9 @@ struct DeltaTableCreation {
 impl TableCreation for DeltaTableCreation {
     fn compile(&self, dispatcher: &DataFlowDispatcher) -> CatalogResult<RecordBatchOperatorSpec> {
         // The commit runs on the dataflow's last worker once the footers are
-        // fetched, under the table-set write lock (which serializes in-process
-        // creates): CAS-commit the table's own manifest, record it in the database
-        // index, then publish it in the in-memory map, re-checking the name as a
-        // race backstop.
-        let tables = self.tables.clone();
-        let store = self.store.clone();
-        let pool = dispatcher.clone();
+        // fetched, handing them to the datastore's seam, which creates the table
+        // and publishes it under its own write lock.
+        let datastore = self.datastore.clone();
         let name = self.name.clone();
         let location = self.location.clone();
         let columns = self.columns.clone();
@@ -881,32 +924,15 @@ impl TableCreation for DeltaTableCreation {
             &self.files,
             declared_columns,
             move |loaded: Vec<TableFile>| {
-                let mut map = tables.write().unwrap();
-                if map.contains_name(&name) {
-                    // A concurrent create won the race. With `IF NOT EXISTS` that
-                    // is still a success; the fetched footers are dropped.
-                    if if_not_exists {
-                        return Ok(());
-                    }
-                    return Err(Box::new(Error::TableExists(name))
-                        as Box<dyn std::error::Error + Send + Sync>);
-                }
-                let table = CatalogTable::create_new(
-                    name.clone(),
-                    location.clone(),
-                    loaded,
+                datastore.commit_created_table(
+                    name,
+                    location,
                     columns,
                     partition_by,
                     sort_by,
-                    store.clone(),
-                    pool,
-                )?;
-                // Record name → location in the database index.
-                let mut index = CatalogManifest::load(store.as_ref())?;
-                index.upsert(CatalogManifestTableEntry::new(name.clone(), location));
-                index.store(store.as_ref())?;
-                map.insert(table);
-                Ok(())
+                    if_not_exists,
+                    loaded,
+                )
             },
         ))
     }

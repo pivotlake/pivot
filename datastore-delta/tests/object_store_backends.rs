@@ -85,6 +85,7 @@ fn create_events(d: &DispatchGuard, b: &Backend, files: &[(&str, &[i64])]) -> Ar
     }
     let datastore = DeltaDatastore::open(&b.root, d).unwrap();
     datastore
+        .clone()
         .begin_transaction()
         .bind_create_table(path_request("events", "events"))
         .unwrap()
@@ -125,6 +126,7 @@ mod bodies {
         let datastore = DeltaDatastore::open(&b.root, &d).unwrap();
 
         datastore
+            .clone()
             .begin_transaction()
             .bind_create_table(path_request("events", "events"))
             .unwrap()

@@ -350,6 +350,7 @@ mod tests {
             if_not_exists: false,
         };
         datastore
+            .clone()
             .begin_transaction()
             .bind_create_table(request)
             .unwrap()

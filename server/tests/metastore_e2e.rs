@@ -85,8 +85,10 @@ async fn queries_bind_tables_by_datastore_name() {
 
     let meta_path_str = meta_path.to_str().unwrap().to_string();
     let port = start_server(64, move |dispatch| {
+        // A short refresh interval: an INSERT commits to the log and the refresh
+        // brings the new rows into the live set, so the test observes them quickly.
         let metastore =
-            TomlMetastore::open(&meta_path_str, std::time::Duration::from_secs(30)).unwrap();
+            TomlMetastore::open(&meta_path_str, std::time::Duration::from_millis(100)).unwrap();
         let datastores = metastore.open_datastores(dispatch.dispatcher()).unwrap();
         CatalogFixture::new(Arc::new(
             PivotCatalog::new(datastores, DEFAULT_DATASTORE_NAME.to_string()).unwrap(),
@@ -129,6 +131,16 @@ async fn queries_bind_tables_by_datastore_name() {
         )
         .await
         .unwrap();
-    let copied = select_rows(&client, "SELECT kind FROM warm.main.events WHERE id = 3").await;
+
+    // The INSERT is durable in `warm`'s Delta log on commit, but only visible to a
+    // later query once the background refresh advances the live set, so poll for it.
+    let mut copied = Vec::new();
+    for _ in 0..100 {
+        copied = select_rows(&client, "SELECT kind FROM warm.main.events WHERE id = 3").await;
+        if !copied.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     assert_eq!(copied, vec![vec![Some("carol".into())]]);
 }
