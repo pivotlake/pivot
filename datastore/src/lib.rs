@@ -7,12 +7,6 @@
 //! [`planner::catalog::Catalog`], whose per-query
 //! [`planner::catalog::CatalogTransaction`] routes each resolution to the right
 //! datastore's transaction by name.
-//!
-//! These two traits live here rather than in `planner` so the concrete backends
-//! (e.g. `datastore_delta::DeltaDatastore`) and the cross-datastore `catalog`
-//! crate can name them without the planner depending on them: the planner binds
-//! against a [`Table`] whose compile is self-contained, so it never needs a
-//! transaction handle.
 
 use std::any::Any;
 use std::fmt::Debug;
@@ -73,13 +67,10 @@ pub trait DatastoreTransaction: Debug + Send + Sync {
     fn as_any(&self) -> &dyn Any;
 }
 
-/// One named data source the planner can resolve tables against: the
-/// per-datastore half, opening [`DatastoreTransaction`]s. A composite over
-/// several of these is a [`planner::catalog::Catalog`].
+/// One named data source the planner can resolve tables against.
 #[async_trait]
 pub trait Datastore: Debug + Send + Sync {
-    /// This datastore's name: the database it is attached as in DuckDB and the
-    /// key it is registered under in the catalog.
+    /// This datastore's name.
     fn name(&self) -> &str;
 
     /// Open a transaction: snapshot this datastore as it stands right now. All

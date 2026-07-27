@@ -120,9 +120,7 @@ impl Server {
         let listener = TcpListener::bind(self.bind).await?;
         info!(addr = %self.bind, "listening for psql connections");
 
-        // Start each datastore's background maintenance now that we are serving,
-        // so it spawns onto this runtime. The shutdown arm aborts it before the
-        // worker pool is torn down.
+        // Start each datastore's background maintenance.
         self.catalog.start();
 
         // Optionally serve the bundled web dashboard. It reads the engine's live

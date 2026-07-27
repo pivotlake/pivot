@@ -38,18 +38,23 @@ pivotdb-server --metastore <FILE> [OPTIONS]
 ### Metastore configuration
 
 The TOML provider lives in the separate `metastore-toml` crate. A metastore is
-always required, including when serving one local datastore. A datastore named
-`default` is required because DuckDB uses it for unqualified table names. Each
-other datastore is attached as a database of the same name:
+always required, including when serving one local datastore. Exactly one
+datastore must set `default = true`; it becomes the current database (the target
+of unqualified table names). Every datastore is attached as
+a database of its own name, so a query reads any other one by qualifying it:
+`SELECT * FROM warm.main.tbl`. `kind` is the datastore format (`delta` today); the
+storage backend is inferred from `location` (a plain path is local, an `s3://`
+URI is S3):
 
 ```toml
-[datastore.default]
-kind = "local"
-location = "/var/lib/pivot/hot"
+[datastore.hot]
+kind = "delta"
+location = "/var/lib/pivot/hot"    # local path -> local store
+default = true                     # the current database
 
 [datastore.warm]
-kind = "s3"
-location = "s3://analytics/warm/"
+kind = "delta"
+location = "s3://analytics/warm/"  # s3:// -> S3 store
 region = "us-east-1"
 access_key_id = "AKIA..."
 secret_access_key = "..."

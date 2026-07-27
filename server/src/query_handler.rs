@@ -43,8 +43,6 @@ use pgwire::error::PgWireResult;
 use pgwire::error::{ErrorInfo, PgWireError};
 use pgwire::messages::PgWireBackendMessage;
 use pgwire::messages::response::NoticeResponse;
-// Brings `begin_transaction`/`commit_transaction`/`rollback_transaction` into
-// scope on the concrete `PivotCatalog`.
 use planner::catalog::Catalog;
 use thiserror::Error;
 use tokio::task::JoinError;
@@ -79,8 +77,14 @@ fn with_planner<R>(
             // Attach every datastore as its own database (so a query can name
             // it). The planner holds no catalog; each query's transaction
             // (from `catalog.begin_transaction()`) does all table/DDL resolution.
-            let names = catalog.iter().map(|(name, _)| name.clone()).collect();
-            planner::Planner::with_datastore_names(names, catalog.default_name().to_string())
+            let names = catalog
+                .iter_datastores()
+                .map(|(name, _)| name.clone())
+                .collect();
+            planner::Planner::with_datastore_names(
+                names,
+                catalog.default_datastore_name().to_string(),
+            )
         });
         f(planner)
     })
@@ -335,9 +339,6 @@ impl PivotQueryHandler {
             let dispatcher = self.dispatcher.clone();
             let query = query.to_string();
 
-            // Plan fresh every time, inside this query's transaction. A binding
-            // captures its datastore snapshot at bind time, so planning here
-            // guarantees every scan reads this transaction's live view.
             let started = Instant::now();
             let plan = {
                 let catalog = self.catalog.clone();
