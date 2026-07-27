@@ -21,10 +21,7 @@ pub struct JoinBuildFactory {
     worker_id: usize,
     hash_state: RandomState,
     partition_sizes: Arc<Vec<AtomicUsize>>,
-    directory: Arc<JoinCell<JoinDirectory>>,
-    keys: Arc<JoinCell<MultiSlabBuffer<u64>>>,
-    rows: Arc<JoinCell<MultiSlabBuffer<u32>>>,
-    build_rows: Arc<JoinCell<Option<RecordBatch>>>,
+    table: JoinTable,
     injector: Arc<Injector<JoinPartitionJob>>,
     jobs_injected: Arc<AtomicBool>,
     build_ready: Arc<AtomicBool>,
@@ -61,10 +58,12 @@ pub fn create_for_workers(
     let hash_state = RandomState::with_seeds(0, 0, 0, 0);
     let partition_sizes: Arc<Vec<AtomicUsize>> =
         Arc::new((0..NUM_PARTITIONS).map(|_| AtomicUsize::new(0)).collect());
-    let directory = Arc::new(JoinCell::new(JoinDirectory::initial()));
-    let keys = Arc::new(JoinCell::new(MultiSlabBuffer::<u64>::new(vec![])));
-    let rows = Arc::new(JoinCell::new(MultiSlabBuffer::<u32>::new(vec![])));
-    let build_rows = Arc::new(JoinCell::new(None));
+    let table = JoinTable {
+        directory: Arc::new(JoinCell::new(JoinDirectory::initial())),
+        keys: Arc::new(JoinCell::new(MultiSlabBuffer::<u64>::new(vec![]))),
+        rows: Arc::new(JoinCell::new(MultiSlabBuffer::<u32>::new(vec![]))),
+        build_rows: Arc::new(JoinCell::new(None)),
+    };
     let injector = Arc::new(Injector::new());
     let jobs_injected = Arc::new(AtomicBool::new(false));
     let build_ready = Arc::new(AtomicBool::new(false));
@@ -72,10 +71,7 @@ pub fn create_for_workers(
     let (tx, rx) = mpsc::channel();
     let mut rx_opt = Some(rx);
 
-    let dir_clone = directory.clone();
-    let keys_clone = keys.clone();
-    let rows_clone = rows.clone();
-    let build_rows_clone = build_rows.clone();
+    let table_clone = table.clone();
     let hs_clone = hash_state.clone();
     let probe_gate = build_ready.clone();
 
@@ -84,10 +80,7 @@ pub fn create_for_workers(
         worker_id,
         hash_state: hash_state.clone(),
         partition_sizes: partition_sizes.clone(),
-        directory: directory.clone(),
-        keys: keys.clone(),
-        rows: rows.clone(),
-        build_rows: build_rows.clone(),
+        table: table.clone(),
         injector: injector.clone(),
         jobs_injected: jobs_injected.clone(),
         build_ready: build_ready.clone(),
@@ -98,12 +91,7 @@ pub fn create_for_workers(
 
     let output_columns = Arc::new(output_columns);
     let probe_factories = (0..worker_count).map(move |_| JoinProbeFactory {
-        table: JoinTable {
-            directory: dir_clone.clone(),
-            keys: keys_clone.clone(),
-            rows: rows_clone.clone(),
-            build_rows: build_rows_clone.clone(),
-        },
+        table: table_clone.clone(),
         hash_state: hs_clone.clone(),
         key_column: probe_key_column,
         output_columns: output_columns.clone(),
@@ -123,10 +111,7 @@ impl UnaryFactory<RecordBatch, ()> for JoinBuildFactory {
             self.sender,
             self.receiver,
             self.partition_sizes,
-            self.directory,
-            self.keys,
-            self.rows,
-            self.build_rows,
+            self.table,
             self.injector,
             self.jobs_injected,
             self.build_ready,

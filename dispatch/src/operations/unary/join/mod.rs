@@ -67,6 +67,7 @@ unsafe impl<T: Send> Sync for JoinCell<T> {}
 /// `build_rows` (the concatenated build-side payload batch). All fields are
 /// populated by the build phase and published to probe only after every
 /// partition job has run.
+#[derive(Clone)]
 pub(crate) struct JoinTable {
     pub(crate) directory: Arc<JoinCell<JoinDirectory>>,
     pub(crate) keys: Arc<JoinCell<MultiSlabBuffer<u64>>>,

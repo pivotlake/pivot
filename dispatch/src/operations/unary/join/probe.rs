@@ -102,7 +102,7 @@ impl Probe {
         let col = window.column(self.key_column).as_primitive::<Int64Type>();
         let keys = unsafe { &*self.table.keys.get() };
         let rows = unsafe { &*self.table.rows.get() };
-        let out = BatchProbe {
+        let out = ProbeMatchCollector {
             keys,
             rows,
             col,
@@ -116,8 +116,17 @@ impl Probe {
             allocator: &mut self.allocator,
         };
 
-        let join_dir = unsafe { &*self.table.directory.get() };
-        run_probe_array(join_dir, &self.hash_state, out)
+        ProbeArray {
+            row_idx: 0,
+            hash_state: self.hash_state.clone(),
+            directory: unsafe { &*self.table.directory.get() },
+            hashes: [0; RING_SIZE],
+            matched_slots: [[(0, 0); PREFETCH_LENGTH]; 2],
+            matched_size: [0; 2],
+            matched_idx: 0,
+            out,
+        }
+        .run()
     }
 }
 
@@ -202,10 +211,13 @@ struct OutputSides {
     build_source: RecordBatch,
 }
 
-/// The per-batch probe state: scans `col` against the directory, collecting
-/// matched (probe row, build payload row) pairs into the index slices and
-/// draining them into the output sides as they fill.
-struct BatchProbe<'a, 'b, S: Sender<RecordBatch>> {
+/// Collects matches produced while probing one input window.
+///
+/// For each candidate build-arena row, it verifies the full key, buffers the
+/// corresponding `(probe row, build payload row)` indices, and periodically
+/// appends those rows to the probe and build output accumulators. Full output
+/// batches are emitted as the accumulators fill.
+struct ProbeMatchCollector<'a, 'b, S: Sender<RecordBatch>> {
     keys: &'a MultiSlabBuffer<u64>,
     rows: &'a MultiSlabBuffer<u32>,
     col: &'b Int64Array,
@@ -224,7 +236,7 @@ struct BatchProbe<'a, 'b, S: Sender<RecordBatch>> {
     allocator: &'a mut SlabAllocator,
 }
 
-impl<'a, 'b, S: Sender<RecordBatch>> BatchProbe<'a, 'b, S> {
+impl<'a, 'b, S: Sender<RecordBatch>> ProbeMatchCollector<'a, 'b, S> {
     /// Append the collected pairs to the output sides, emitting if a full
     /// batch accumulated.
     #[inline(never)]
@@ -294,7 +306,7 @@ struct ProbeArray<
     matched_size: [usize; 2],
     matched_idx: usize,
 
-    out: BatchProbe<'a, 'b, S>,
+    out: ProbeMatchCollector<'a, 'b, S>,
 }
 
 impl<'a, 'b, B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer, S: Sender<RecordBatch>>
@@ -466,28 +478,4 @@ impl<'a, 'b, B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer, S: Sen
 
         self.out.drain()
     }
-}
-
-/// Run the pipelined probe over one batch: monomorphized per directory
-/// backing so the inner loops carry no per-element dispatch.
-fn run_probe_array<'a, 'b, B, S>(
-    directory: &'a Directory<B>,
-    hash_state: &RandomState,
-    out: BatchProbe<'a, 'b, S>,
-) -> unary::Result<()>
-where
-    B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer,
-    S: Sender<RecordBatch>,
-{
-    ProbeArray {
-        row_idx: 0,
-        hash_state: hash_state.clone(),
-        directory,
-        hashes: [0; RING_SIZE],
-        matched_slots: [[(0, 0); PREFETCH_LENGTH]; 2],
-        matched_size: [0; 2],
-        matched_idx: 0,
-        out,
-    }
-    .run()
 }
