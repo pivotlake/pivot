@@ -148,16 +148,16 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Ag
         // fold, which a monomorphised arity got for free — a measured ~12% on
         // a low-cardinality multi-slot fold. Dispatch the common counts to
         // const-length bodies (small leaf functions, monomorphised only per
-        // accumulator width, never per key shape).
+        // accumulator width, never per key shape). Only counts 1..=4 get one:
+        // every inlined arm's dead code raises the consume loop's register
+        // pressure (all-eight arms measurably spilled the loop's state to the
+        // stack), and outlining the bodies costs more per row than it saves,
+        // so rarer arities take the runtime loop instead.
         match dst.len() {
             1 => Self::seed_fixed::<1>(dst, reader, idx, wc),
             2 => Self::seed_fixed::<2>(dst, reader, idx, wc),
             3 => Self::seed_fixed::<3>(dst, reader, idx, wc),
             4 => Self::seed_fixed::<4>(dst, reader, idx, wc),
-            5 => Self::seed_fixed::<5>(dst, reader, idx, wc),
-            6 => Self::seed_fixed::<6>(dst, reader, idx, wc),
-            7 => Self::seed_fixed::<7>(dst, reader, idx, wc),
-            8 => Self::seed_fixed::<8>(dst, reader, idx, wc),
             _ => {
                 for (cell, slot) in dst.iter_mut().zip(reader.iter()) {
                     *cell = seed_slot::<A, ONLY_ADDITIVE>(slot, idx, wc);
@@ -182,10 +182,6 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Ag
             2 => Self::update_fixed::<2>(dst, reader, idx, wc, shared),
             3 => Self::update_fixed::<3>(dst, reader, idx, wc, shared),
             4 => Self::update_fixed::<4>(dst, reader, idx, wc, shared),
-            5 => Self::update_fixed::<5>(dst, reader, idx, wc, shared),
-            6 => Self::update_fixed::<6>(dst, reader, idx, wc, shared),
-            7 => Self::update_fixed::<7>(dst, reader, idx, wc, shared),
-            8 => Self::update_fixed::<8>(dst, reader, idx, wc, shared),
             _ => {
                 for (cell, slot) in dst.iter_mut().zip(reader.iter()) {
                     *cell = update_slot::<A, ONLY_ADDITIVE>(*cell, slot, idx, wc, shared);
@@ -204,10 +200,6 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Ag
             2 => Self::merge_fixed::<2>(dst, src, ctx),
             3 => Self::merge_fixed::<3>(dst, src, ctx),
             4 => Self::merge_fixed::<4>(dst, src, ctx),
-            5 => Self::merge_fixed::<5>(dst, src, ctx),
-            6 => Self::merge_fixed::<6>(dst, src, ctx),
-            7 => Self::merge_fixed::<7>(dst, src, ctx),
-            8 => Self::merge_fixed::<8>(dst, src, ctx),
             _ => {
                 let (slots, shared) = ctx;
                 for ((a, &b), slot) in dst.iter_mut().zip(src.iter()).zip(slots.iter()) {
@@ -231,10 +223,6 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Ag
             2 => Self::clone_fixed::<2>(dst, src),
             3 => Self::clone_fixed::<3>(dst, src),
             4 => Self::clone_fixed::<4>(dst, src),
-            5 => Self::clone_fixed::<5>(dst, src),
-            6 => Self::clone_fixed::<6>(dst, src),
-            7 => Self::clone_fixed::<7>(dst, src),
-            8 => Self::clone_fixed::<8>(dst, src),
             _ => dst.copy_from_slice(src),
         }
     }
@@ -270,14 +258,7 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
 
     /// [`seed_stored`](AggregationValue::seed_stored) with a const trip count,
     /// so the per-slot fold unrolls.
-    ///
-    /// Deliberately `inline(never)`, as are the other fixed-arity bodies:
-    /// inlining all eight arms into every consume loop tripled the loop
-    /// function's code and, worse, its register pressure, spilling the loop's
-    /// own state to the stack and re-loading it per row (visible as sp-relative
-    /// loads in the annotated hot block). One small hot callee keeps its own
-    /// registers and the loop keeps its own.
-    #[inline(never)]
+    #[inline(always)]
     fn seed_fixed<const N: usize>(
         dst: &mut [A],
         reader: &[BoundSlot<'_>],
@@ -297,7 +278,7 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
 
     /// [`update_stored`](AggregationValue::update_stored) with a const trip
     /// count, so the per-slot fold unrolls.
-    #[inline(never)]
+    #[inline(always)]
     fn update_fixed<const N: usize>(
         dst: &mut [A],
         reader: &[BoundSlot<'_>],
@@ -316,7 +297,7 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
 
     /// [`merge_stored`](AggregationValue::merge_stored) with a const trip
     /// count, so the per-slot combine unrolls.
-    #[inline(never)]
+    #[inline(always)]
     fn merge_fixed<const N: usize>(
         dst: &mut [A],
         src: &[A],
@@ -341,7 +322,7 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
 
     /// [`clone_stored`](AggregationValue::clone_stored) with a const length:
     /// an array assignment instead of a `memmove` call.
-    #[inline(never)]
+    #[inline(always)]
     fn clone_fixed<const N: usize>(dst: &mut [A], src: &[A]) {
         // Safety: as in `seed_fixed`.
         debug_assert!(dst.len() == N && src.len() == N);
