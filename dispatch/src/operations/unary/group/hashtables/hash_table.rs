@@ -473,6 +473,7 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
             pre_shift: self.pre_shift,
             bases: self.bases.as_ptr(),
             bases_len: self.bases.len(),
+            first_base: self.bases[0],
             meta: self.meta,
             _phantom: PhantomData,
         }
@@ -568,6 +569,9 @@ struct Geometry<K, V: AggregationValue> {
     pre_shift: u32,
     bases: *const usize,
     bases_len: usize,
+    /// `bases[0]`, kept inline so a single-slab table's entry address needs
+    /// neither the reciprocal multiply nor the dependent base load.
+    first_base: usize,
     meta: V::StoredMeta,
     _phantom: PhantomData<K>,
 }
@@ -590,6 +594,14 @@ impl<K, V: AggregationValue> Geometry<K, V> {
     /// [`BaseHashTable::entry_ptr_in`].
     #[inline(always)]
     fn entry_ptr(&self, index: usize) -> *mut u8 {
+        // Nearly every in-place consume table and merge target fits one slab
+        // (a slab holds ~1-2MB of entries and the radix switch caps in-place
+        // growth), so take the entry address straight off the slab base: no
+        // reciprocal multiply and no dependent base load on the address chain.
+        // The branch is fixed per table, so it predicts perfectly either way.
+        if self.bases_len == 1 {
+            return self.first_base.wrapping_add(index * self.stride) as *mut u8;
+        }
         let slab_idx = fast_div(index, self.magic);
         assert!(slab_idx < self.bases_len);
         let base = unsafe { *self.bases.add(slab_idx) };
