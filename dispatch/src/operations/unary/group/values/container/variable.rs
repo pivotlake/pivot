@@ -270,7 +270,14 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
 
     /// [`seed_stored`](AggregationValue::seed_stored) with a const trip count,
     /// so the per-slot fold unrolls.
-    #[inline(always)]
+    ///
+    /// Deliberately `inline(never)`, as are the other fixed-arity bodies:
+    /// inlining all eight arms into every consume loop tripled the loop
+    /// function's code and, worse, its register pressure, spilling the loop's
+    /// own state to the stack and re-loading it per row (visible as sp-relative
+    /// loads in the annotated hot block). One small hot callee keeps its own
+    /// registers and the loop keeps its own.
+    #[inline(never)]
     fn seed_fixed<const N: usize>(
         dst: &mut [A],
         reader: &[BoundSlot<'_>],
@@ -290,7 +297,7 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
 
     /// [`update_stored`](AggregationValue::update_stored) with a const trip
     /// count, so the per-slot fold unrolls.
-    #[inline(always)]
+    #[inline(never)]
     fn update_fixed<const N: usize>(
         dst: &mut [A],
         reader: &[BoundSlot<'_>],
@@ -309,7 +316,7 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
 
     /// [`merge_stored`](AggregationValue::merge_stored) with a const trip
     /// count, so the per-slot combine unrolls.
-    #[inline(always)]
+    #[inline(never)]
     fn merge_fixed<const N: usize>(
         dst: &mut [A],
         src: &[A],
@@ -334,7 +341,7 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
 
     /// [`clone_stored`](AggregationValue::clone_stored) with a const length:
     /// an array assignment instead of a `memmove` call.
-    #[inline(always)]
+    #[inline(never)]
     fn clone_fixed<const N: usize>(dst: &mut [A], src: &[A]) {
         // Safety: as in `seed_fixed`.
         debug_assert!(dst.len() == N && src.len() == N);
