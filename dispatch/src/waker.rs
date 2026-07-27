@@ -178,7 +178,7 @@ impl WorkerWaker {
         let epoch = self.broadcast_epoch.load(Ordering::SeqCst);
         if epoch != *last_seen {
             *last_seen = epoch;
-            self.wake_all_parked();
+            self.notify();
         }
     }
 
@@ -370,9 +370,8 @@ mod tests {
                 thread::spawn(move || {
                     waker.register(i);
                     let mut broadcast_memo = waker.broadcast_epoch();
-                    let count = waker.wait_if_unchanged(waker.wake_count(), i);
+                    waker.wait_if_unchanged(waker.wake_count(), i);
                     waker.finish_delegated_wake(&mut broadcast_memo);
-                    count
                 })
             })
             .collect();
@@ -381,8 +380,9 @@ mod tests {
         waker.notify_delegated();
 
         for handle in handles {
-            assert_eq!(handle.join().unwrap(), waker.wake_count());
+            handle.join().unwrap();
         }
+        assert_eq!(waker.parked_workers.load(Ordering::SeqCst), 0);
     }
 
     #[test]
