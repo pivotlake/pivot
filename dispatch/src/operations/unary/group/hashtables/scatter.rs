@@ -101,18 +101,29 @@ impl<KP: PersistedKey, V: AggregationValue<Stored = V>> ScatterRows<KP, V>
 /// same per-query layout a hash entry has ([`entry_layout`]), chunked like a
 /// [`SlabVec`] (a ~64KB chunk target, a small first chunk so the thousands of
 /// mostly-tiny per-partition buffers don't each pin real memory).
+///
+/// The hot paths never divide or multiply by the runtime stride: chunk
+/// capacities are precomputed, pushes bump a row pointer, and the scans walk
+/// each chunk by row count with the layout hoisted into locals — the scatter
+/// runs once per input row, so it gets the same care as a table probe.
 pub struct StridedScatterRows<KP: PersistedKey, V: AggregationValue> {
     chunks: Vec<Slab>,
-    /// Base address of the chunk being filled.
-    cur_base: *mut u8,
-    /// Rows in the chunk being filled.
-    last_len: usize,
+    /// The next row's address in the chunk being filled.
+    cur: *mut u8,
+    /// End (exclusive) of the chunk being filled; `cur == end` means full (and
+    /// both start null, so the first push allocates).
+    end: *mut u8,
+    /// Rows pushed.
+    len: usize,
     layout: EntryLayout,
+    /// Rows per chunk, precomputed: the first chunk and every later one.
+    first_chunk_rows: usize,
+    full_chunk_rows: usize,
     meta: V::StoredMeta,
     _phantom: PhantomData<KP>,
 }
 
-// SAFETY: as for `SlabVec` — the cached base pointer targets address-stable
+// SAFETY: as for `SlabVec` — the cached row pointers target address-stable
 // slab memory owned by `chunks`.
 unsafe impl<KP: PersistedKey, V: AggregationValue> Send for StridedScatterRows<KP, V> {}
 
@@ -120,41 +131,29 @@ impl<KP: PersistedKey, V: AggregationValue> StridedScatterRows<KP, V> {
     /// Byte target per chunk; see [`SlabVec`]'s chunk sizing rationale.
     const CHUNK_BYTES: usize = 64 * 1024;
 
-    /// Rows in chunk `ci`: the first chunk is an eighth of the target so a
-    /// barely-used partition stays small.
-    fn chunk_rows(&self, ci: usize) -> usize {
-        let full = (Self::CHUNK_BYTES / self.layout.stride).max(1);
-        if ci == 0 { (full / 8).max(1) } else { full }
+    /// Allocate the next chunk and point the row cursor at it.
+    #[cold]
+    fn grow(&mut self, allocator: &mut SlabAllocator) {
+        let rows = if self.chunks.is_empty() {
+            self.first_chunk_rows
+        } else {
+            self.full_chunk_rows
+        };
+        let chunk = allocator.get_aligned_slab(rows * self.layout.stride, self.layout.align, false);
+        self.cur = chunk.ptr;
+        self.end = unsafe { chunk.ptr.add(rows * self.layout.stride) };
+        self.chunks.push(chunk);
     }
 
-    /// The address of row `i` of `chunk`.
-    #[inline(always)]
-    fn row_ptr(base: *mut u8, stride: usize, i: usize) -> *mut u8 {
-        unsafe { base.add(i * stride) }
-    }
-
-    /// Visit each chunk as `(base, rows)`.
+    /// Visit each chunk as `(base, rows)`. The division deriving a chunk's row
+    /// count runs once per chunk, never per row.
     #[inline(always)]
     fn for_each_chunk(&self, mut f: impl FnMut(*mut u8, usize)) {
-        let n = self.chunks.len();
-        for (ci, chunk) in self.chunks.iter().enumerate() {
-            let rows = if ci + 1 == n {
-                self.last_len
-            } else {
-                self.chunk_rows(ci)
-            };
+        let mut remaining = self.len;
+        for chunk in &self.chunks {
+            let rows = (chunk.size / self.layout.stride).min(remaining);
             f(chunk.ptr, rows);
-        }
-    }
-
-    /// Read row `ptr`'s header.
-    #[inline(always)]
-    fn header<'a>(&self, ptr: *mut u8) -> (u64, &'a KP) {
-        unsafe {
-            (
-                *(ptr.add(self.layout.hash_offset) as *const u64),
-                &*(ptr.add(self.layout.key_offset) as *const KP),
-            )
+            remaining -= rows;
         }
     }
 }
@@ -162,24 +161,23 @@ impl<KP: PersistedKey, V: AggregationValue> StridedScatterRows<KP, V> {
 impl<KP: PersistedKey, V: AggregationValue> ScatterRows<KP, V> for StridedScatterRows<KP, V> {
     fn new(ctx: &V::SharedContext) -> Self {
         let meta = V::stored_meta(ctx);
+        let layout = entry_layout::<KP, V>(meta);
+        let full_chunk_rows = (Self::CHUNK_BYTES / layout.stride).max(1);
         Self {
             chunks: Vec::new(),
-            cur_base: std::ptr::null_mut(),
-            last_len: 0,
-            layout: entry_layout::<KP, V>(meta),
+            cur: std::ptr::null_mut(),
+            end: std::ptr::null_mut(),
+            len: 0,
+            first_chunk_rows: (full_chunk_rows / 8).max(1),
+            full_chunk_rows,
+            layout,
             meta,
             _phantom: PhantomData,
         }
     }
 
     fn len(&self) -> usize {
-        if self.chunks.is_empty() {
-            return 0;
-        }
-        (0..self.chunks.len() - 1)
-            .map(|ci| self.chunk_rows(ci))
-            .sum::<usize>()
-            + self.last_len
+        self.len
     }
 
     #[inline(always)]
@@ -190,33 +188,40 @@ impl<KP: PersistedKey, V: AggregationValue> ScatterRows<KP, V> for StridedScatte
         key: KP,
         seed: impl FnOnce(&mut V::Stored),
     ) {
-        if self.chunks.is_empty() || self.last_len == self.chunk_rows(self.chunks.len() - 1) {
-            let rows = self.chunk_rows(self.chunks.len());
-            let chunk =
-                allocator.get_aligned_slab(rows * self.layout.stride, self.layout.align, false);
-            self.cur_base = chunk.ptr;
-            self.chunks.push(chunk);
-            self.last_len = 0;
+        if self.cur == self.end {
+            self.grow(allocator);
         }
-        let row = Self::row_ptr(self.cur_base, self.layout.stride, self.last_len);
+        let row = self.cur;
         unsafe {
             *(row.add(self.layout.hash_offset) as *mut u64) = hash;
             (row.add(self.layout.key_offset) as *mut KP).write(key);
             seed(V::stored_mut(row.add(self.layout.value_offset), self.meta));
+            self.cur = row.add(self.layout.stride);
         }
-        self.last_len += 1;
+        self.len += 1;
     }
 
     #[inline(always)]
     fn for_each(&self, mut f: impl FnMut(u64, &KP, &V::Stored)) {
-        let (stride, value_offset, meta) =
-            (self.layout.stride, self.layout.value_offset, self.meta);
+        // Hoist the layout into locals so the per-row reads don't re-load it
+        // around the caller's writes.
+        let EntryLayout {
+            hash_offset,
+            key_offset,
+            value_offset,
+            stride,
+            ..
+        } = self.layout;
+        let meta = self.meta;
         self.for_each_chunk(|base, rows| {
-            for i in 0..rows {
-                let row = Self::row_ptr(base, stride, i);
-                let (hash, key) = self.header(row);
-                let stored = unsafe { V::stored_ref(row.add(value_offset), meta) };
-                f(hash, key, stored);
+            let mut row = base;
+            for _ in 0..rows {
+                unsafe {
+                    let hash = *(row.add(hash_offset) as *const u64);
+                    let key = &*(row.add(key_offset) as *const KP);
+                    f(hash, key, V::stored_ref(row.add(value_offset), meta));
+                    row = row.add(stride);
+                }
             }
         });
     }
@@ -226,16 +231,30 @@ impl<KP: PersistedKey, V: AggregationValue> ScatterRows<KP, V> for StridedScatte
         &self,
         mut f: impl FnMut(u64, &KP, &V::Stored, Option<(u64, &KP)>),
     ) {
-        let (stride, value_offset, meta) =
-            (self.layout.stride, self.layout.value_offset, self.meta);
+        let EntryLayout {
+            hash_offset,
+            key_offset,
+            value_offset,
+            stride,
+            ..
+        } = self.layout;
+        let meta = self.meta;
         self.for_each_chunk(|base, rows| {
+            let mut row = base;
             for i in 0..rows {
-                let row = Self::row_ptr(base, stride, i);
-                let (hash, key) = self.header(row);
-                let stored = unsafe { V::stored_ref(row.add(value_offset), meta) };
-                let ahead =
-                    (i + AHEAD < rows).then(|| self.header(Self::row_ptr(base, stride, i + AHEAD)));
-                f(hash, key, stored, ahead);
+                unsafe {
+                    let hash = *(row.add(hash_offset) as *const u64);
+                    let key = &*(row.add(key_offset) as *const KP);
+                    let ahead = (i + AHEAD < rows).then(|| {
+                        let a = row.add(AHEAD * stride);
+                        (
+                            *(a.add(hash_offset) as *const u64),
+                            &*(a.add(key_offset) as *const KP),
+                        )
+                    });
+                    f(hash, key, V::stored_ref(row.add(value_offset), meta), ahead);
+                    row = row.add(stride);
+                }
             }
         });
     }
