@@ -176,6 +176,7 @@ double value_f64(const Value &v);
 rust::String value_string(const Value &v);
 BridgeDecimalValue value_decimal(const Value &v);
 BridgeHugeint value_hugeint(const Value &v);
+bool value_is_null(const Value &v);
 int32_t value_date(const Value &v);
 int64_t value_timestamp(const Value &v);
 int32_t value_interval_months(const Value &v);

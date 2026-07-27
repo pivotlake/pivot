@@ -107,6 +107,10 @@ pub enum ScalarValue {
         days: i32,
         micros: i64,
     },
+    /// A SQL NULL, of whatever type. Kept distinct from the typed variants
+    /// because DuckDB's typed readers render a NULL as its text form, so a NULL
+    /// VARCHAR would otherwise decode as the string "NULL".
+    Null,
     /// A DuckDB type the bridge does not decode into a typed variant.
     Other(LogicalTypeId),
 }
@@ -139,6 +143,7 @@ impl fmt::Display for ScalarValue {
                 days,
                 micros,
             } => write!(f, "{months} {days} {micros}"),
+            ScalarValue::Null => write!(f, "NULL"),
             ScalarValue::Other(ty) => write!(f, "{ty:?}"),
         }
     }

@@ -29,6 +29,7 @@ mod not;
 mod prefix;
 mod reference;
 mod regexp;
+mod regexp_full_match;
 mod regexp_jit;
 mod variant_get;
 
@@ -52,6 +53,7 @@ pub use not::Not;
 pub use prefix::Prefix;
 pub use reference::Ref;
 pub use regexp::RegexpReplace;
+pub use regexp_full_match::RegexpFullMatch;
 pub use regexp_jit::RegexpJitReplace;
 pub use variant_get::{JsonPath, VariantGet, VariantToJson};
 

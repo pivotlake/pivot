@@ -46,6 +46,11 @@ fn bound_type_from(raw: ffi::BridgeLogicalType) -> BoundLogicalType {
 /// [`ScalarValue::Other`].
 fn scalar_from_value(v: &ffi::Value) -> ScalarValue {
     use LogicalTypeId as L;
+    // Before the typed readers, which render a NULL as its text form rather
+    // than reporting it (a NULL VARCHAR reads back as the string "NULL").
+    if ffi::value_is_null(v) {
+        return ScalarValue::Null;
+    }
     match LogicalTypeId::from_u8(ffi::value_type(v)) {
         L::BOOLEAN => ScalarValue::Boolean(ffi::value_bool(v)),
         L::TINYINT => ScalarValue::Int8(ffi::value_i8(v)),

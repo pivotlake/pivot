@@ -108,7 +108,18 @@ DuckPlannerContext::DuckPlannerContext(rust::Box<CatalogContext> catalog)
     : catalog(std::move(catalog)),
       db(nullptr, &this->config),
       con(db) {
-        con.Query("SET disabled_optimizers='compressed_materialization,empty_result_pullup'");
+	// `regex_range` rewrites a regexp_full_match filter into extra range
+	// bounds carrying BLOB constants. Those bounds are arbitrary bytes rather
+	// than text, so pivot cannot decode them into a scalar.
+	//
+	// DuckDB rejects the whole list if any one name is unknown to this build, so
+	// an unchecked failure here would quietly re-enable every pass pivot needs
+	// off and surface much later as an opaque translation error.
+	auto disable_result = con.Query(
+	    "SET disabled_optimizers='compressed_materialization,empty_result_pullup,regex_range'");
+	if (disable_result->HasError()) {
+		throw std::runtime_error(disable_result->GetError());
+	}
 
 	// Set catalog context on the storage extension and attach the pivot catalog as default
 	auto ext = duckdb::StorageExtension::Find(
@@ -851,6 +862,9 @@ BridgeHugeint value_hugeint(const Value &v) {
 	out.hi = raw.upper;
 	out.lo = raw.lower;
 	return out;
+}
+bool value_is_null(const Value &v) {
+	return v.IsNull();
 }
 // DATE is days since the Unix epoch; TIMESTAMP is microseconds since the epoch.
 int32_t value_date(const Value &v) {

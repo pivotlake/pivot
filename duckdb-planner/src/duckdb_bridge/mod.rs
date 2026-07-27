@@ -317,7 +317,11 @@ pub mod ffi {
         fn expr_constant(expr: &Expression) -> &Value;
 
         // ---- Value: typed accessors (shared by constants and table-function
-        // arguments). Read `value_type` first, then the matching accessor.
+        // arguments). Read `value_is_null` and `value_type` first, then the
+        // matching accessor: the typed readers render a NULL as its text form
+        // (a NULL VARCHAR reads back as "NULL"), so the null check has to come
+        // first.
+        fn value_is_null(v: &Value) -> bool;
         fn value_type(v: &Value) -> u8;
         fn value_bool(v: &Value) -> bool;
         fn value_i8(v: &Value) -> i8;

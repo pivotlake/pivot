@@ -330,7 +330,8 @@ pub fn build_scalar_value(value: ScalarValue) -> Result<Scalar<ArrayRef>, Error>
         }
         // INTERVAL never appears as a query constant we materialise (it is
         // consumed by interval arithmetic), and types the bridge doesn't decode
-        // arrive as `Other`.
+        // arrive as `Other`. BLOB is the one DuckDB synthesises on its own, in
+        // the `regex_range` pass, which the bridge disables for that reason.
         other => return Err(Error::UnsupportedScalarConstant(other)),
     };
 

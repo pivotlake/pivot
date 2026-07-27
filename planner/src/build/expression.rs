@@ -24,7 +24,7 @@ use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Conjunction,
     ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide, Error,
     Expression, Function, InList, IntervalArithmetic, Length, Not, NumericAggregate, Prefix, Ref,
-    RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
+    RegexpFullMatch, RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
 
@@ -291,6 +291,11 @@ impl Function {
             "length" | "strlen" | "len" => Ok(Function::Length(Length::from_handle(func)?)),
             "regexp_replace" => Ok(Function::RegexpReplace(RegexpReplace::from_handle(func)?)),
             "regexp_jit_replace" => Ok(Function::RegexpJitReplace(RegexpJitReplace::from_handle(
+                func,
+            )?)),
+            // DuckDB's parser lowers `col ~ 'pat'` and `SIMILAR TO` into
+            // regexp_full_match (`!~` adds a `NOT` above it).
+            "regexp_full_match" => Ok(Function::RegexpFullMatch(RegexpFullMatch::from_handle(
                 func,
             )?)),
             "/" => Ok(Function::Divide(Divide::from_handle(func)?)),
@@ -588,6 +593,21 @@ impl RegexpJitReplace {
             pattern,
             replacement,
         })
+    }
+}
+
+impl RegexpFullMatch {
+    /// Only the two-argument form is accepted: a third `options` argument would
+    /// change how the pattern matches.
+    pub(crate) fn from_handle(func: FunctionHandle<'_>) -> Result<RegexpFullMatch, Error> {
+        let name = func.name();
+        let params = function_args(func, 2)?;
+        let pattern = constant_string(
+            Expression::from_handle(params[1])?,
+            &format!("{name}: pattern"),
+        )?;
+        let input = Box::new(Expression::from_handle(params[0])?);
+        Ok(RegexpFullMatch { input, pattern })
     }
 }
 
