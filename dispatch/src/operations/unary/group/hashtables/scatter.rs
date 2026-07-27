@@ -172,7 +172,10 @@ impl<KP: PersistedKey, V: AggregationValue> StridedScatterRows<KP, V> {
 
     /// Allocate the next chunk and point the row cursor at it.
     #[cold]
-    fn grow(&mut self, geo: &ScatterGeometry<V>, allocator: &mut SlabAllocator) {
+    /// Takes the geometry by value: taking its address would force the
+    /// caller's register-resident copy onto the stack, re-loaded per row in
+    /// the hot push loop this is the cold side of.
+    fn grow(&mut self, geo: ScatterGeometry<V>, allocator: &mut SlabAllocator) {
         let rows = if self.chunks.is_empty() {
             geo.first_chunk_rows
         } else {
@@ -240,7 +243,7 @@ impl<KP: PersistedKey, V: AggregationValue> ScatterRows<KP, V> for StridedScatte
         seed: impl FnOnce(&mut V::Stored),
     ) {
         if self.cur == self.end {
-            self.grow(&geo, allocator);
+            self.grow(geo, allocator);
         }
         // Every offset comes off the caller's snapshot (registers); the only
         // buffer state this touches is the row cursor.
