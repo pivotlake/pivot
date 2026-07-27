@@ -8,9 +8,9 @@ use dispatch::Dispatch;
 
 use crate::common::*;
 use planner::Error as PlannerError;
-use planner::Planner;
 use planner::catalog::{BoundTable, CreateTableRequest};
 use planner::types::Type;
+use planner::{DEFAULT_DATASTORE_NAME, Planner};
 use rstest::rstest;
 
 fn int_col(values: Vec<i32>) -> ArrayRef {
@@ -1755,8 +1755,10 @@ impl dispatch::Nullary<RecordBatch> for NoRowsNullary {
 fn create_table_calls_catalog_once() {
     let dispatch = Dispatch::spin_up(1, 32, None);
     let catalog = Arc::new(RecordingCatalog::default());
-    let mut planner =
-        Planner::from_datastore_names(vec!["default".to_string()], "default".to_string());
+    let mut planner = Planner::from_datastore_names(
+        vec![DEFAULT_DATASTORE_NAME.to_string()],
+        DEFAULT_DATASTORE_NAME.to_string(),
+    );
     let transaction = catalog.begin_transaction();
 
     let results = planner
@@ -1788,8 +1790,10 @@ fn create_table_calls_catalog_once() {
 fn create_table_passes_with_options_to_catalog() {
     let dispatch = Dispatch::spin_up(1, 32, None);
     let catalog = Arc::new(RecordingCatalog::default());
-    let mut planner =
-        Planner::from_datastore_names(vec!["default".to_string()], "default".to_string());
+    let mut planner = Planner::from_datastore_names(
+        vec![DEFAULT_DATASTORE_NAME.to_string()],
+        DEFAULT_DATASTORE_NAME.to_string(),
+    );
     let transaction = catalog.begin_transaction();
 
     let results = planner

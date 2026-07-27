@@ -306,6 +306,7 @@ fn require(name: &str, value: &Option<String>, field: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metastore::DEFAULT_DATASTORE_NAME;
     use std::time::Duration;
 
     #[test]
@@ -434,8 +435,8 @@ mod tests {
         let store = TomlMetastore::from_toml(toml, "test", Duration::from_secs(30)).unwrap();
 
         assert!(
-            store.datastore_configs["default"]
-                .open_store("default")
+            store.datastore_configs[DEFAULT_DATASTORE_NAME]
+                .open_store(DEFAULT_DATASTORE_NAME)
                 .is_ok()
         );
         assert!(store.datastore_configs["warm"].open_store("warm").is_ok());

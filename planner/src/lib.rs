@@ -149,6 +149,14 @@ pub enum Error {
     PlanConversion(#[from] plan::Error),
 }
 
+/// The conventional name for a standalone datastore: the database a datastore
+/// opened on its own registers under, and the current database of a
+/// single-datastore setup, so unqualified names resolve against it. A metastore
+/// instead names its datastores explicitly and marks the current one with
+/// `default = true`. Owned here, the lowest crate that names it; `catalog` and
+/// `metastore` re-export it.
+pub const DEFAULT_DATASTORE_NAME: &str = "default";
+
 /// Entry point for using crate: plans SQL statements into a Pivot [`Plan`].
 ///
 /// A `Planner` owns a [`duckdb_planner::PlannerContext`] configured with the
