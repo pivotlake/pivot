@@ -1,6 +1,5 @@
 use crate::memory::MultiSlabBuffer;
 use std::cell::UnsafeCell;
-use std::ops::{Index, IndexMut};
 
 pub const PTR_SHIFT: u32 = 16;
 
@@ -20,25 +19,21 @@ const fn build_tag_table() -> [u16; 2048] {
 }
 static TAG_TABLE: [u16; 2048] = build_tag_table();
 
-/// Returns a raw pointer to the element at the given slot index. Implemented by
-/// the buffer types that back a [`Directory`] so probe code can compute the exact
-/// address for a hash slot ahead of time and feed many independent loads to the
-/// CPU's reorder buffer.
-pub trait PtrBuffer {
-    fn get_ptr(&self, slot: usize) -> *const u64;
-}
-
-pub struct Directory<B> {
-    entries: UnsafeCell<B>,
+/// The join's hash directory: one `u64` entry per slot, held in ring-slab
+/// chunks. Each entry packs an arena end pointer in the upper 48 bits over a
+/// 16-bit bloom tag, so a probe rejects most non-matching rows on the entry
+/// word alone and otherwise reads its arena range straight out of it.
+pub struct JoinDirectory {
+    entries: UnsafeCell<MultiSlabBuffer<u64>>,
     capacity: usize,
     pub(crate) shift: u32,
 }
 
-unsafe impl<B> Send for Directory<B> {}
-unsafe impl<B> Sync for Directory<B> {}
+unsafe impl Send for JoinDirectory {}
+unsafe impl Sync for JoinDirectory {}
 
-impl<B> Directory<B> {
-    pub fn new(entries: B, capacity: usize) -> Self {
+impl JoinDirectory {
+    pub fn new(entries: MultiSlabBuffer<u64>, capacity: usize) -> Self {
         Self {
             entries: UnsafeCell::new(entries),
             capacity,
@@ -49,6 +44,12 @@ impl<B> Directory<B> {
                 64
             },
         }
+    }
+
+    /// The empty directory a [`super::JoinTable`] starts with; the build
+    /// replaces it once the table's size is known.
+    pub fn initial() -> Self {
+        Self::new(MultiSlabBuffer::new(vec![]), 0)
     }
 
     #[inline(always)]
@@ -65,34 +66,17 @@ impl<B> Directory<B> {
     pub fn capacity(&self) -> usize {
         self.capacity
     }
-}
 
-impl<B: PtrBuffer> Directory<B> {
-    /// Raw pointer to the entry at `slot` (accounts for the sentinel at index 0).
+    /// Raw pointer to the entry at `slot`, so probe code can compute the exact
+    /// address for a hash slot ahead of time and feed many independent loads
+    /// to the CPU's reorder buffer.
     #[inline(always)]
     pub fn ptr_for_slot(&self, slot: usize) -> *const u64 {
-        unsafe { (*self.entries.get()).get_ptr(slot) }
+        unsafe { (*self.entries.get()).ptr_at_index(slot) as *const u64 }
     }
-}
 
-#[inline(always)]
-pub fn prefetch_ptr_l2(ptr: *const u8) {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T1 }>(ptr as *const i8);
-    }
-    #[cfg(target_arch = "aarch64")]
-    #[allow(clippy::pointers_in_nomem_asm_block)]
-    unsafe {
-        std::arch::asm!("prfm pldl2keep, [{0}]", in(reg) ptr, options(nomem, nostack, preserves_flags));
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    let _ = ptr;
-}
-
-impl<B: Index<usize, Output = u64> + IndexMut<usize>> Directory<B> {
     #[inline(always)]
-    pub(crate) fn entries(&self) -> &B {
+    pub(crate) fn entries(&self) -> &MultiSlabBuffer<u64> {
         unsafe { &*self.entries.get() }
     }
 
@@ -144,18 +128,17 @@ impl<B: Index<usize, Output = u64> + IndexMut<usize>> Directory<B> {
     }
 }
 
-impl PtrBuffer for MultiSlabBuffer<u64> {
-    #[inline(always)]
-    fn get_ptr(&self, slot: usize) -> *const u64 {
-        self.ptr_at_index(slot) as *const u64
+#[inline(always)]
+pub fn prefetch_ptr_l2(ptr: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T1 }>(ptr as *const i8);
     }
-}
-
-/// The directory shape joins run on: slot entries held in ring-slab chunks.
-pub type JoinDirectory = Directory<MultiSlabBuffer<u64>>;
-
-impl JoinDirectory {
-    pub fn initial() -> Self {
-        Directory::new(MultiSlabBuffer::new(vec![]), 0)
+    #[cfg(target_arch = "aarch64")]
+    #[allow(clippy::pointers_in_nomem_asm_block)]
+    unsafe {
+        std::arch::asm!("prfm pldl2keep, [{0}]", in(reg) ptr, options(nomem, nostack, preserves_flags));
     }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = ptr;
 }

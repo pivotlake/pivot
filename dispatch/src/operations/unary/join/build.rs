@@ -1,7 +1,7 @@
 use crate::memory::{SlabAllocator, SlabVec};
 use crate::operations::channels::Sender;
 use crate::operations::unary::join::JoinTable;
-use crate::operations::unary::join::directory::Directory;
+use crate::operations::unary::join::directory::JoinDirectory;
 use crate::operations::{Consumer, Outputter, unary};
 use crate::waker::worker_waker;
 use ahash::RandomState;
@@ -10,7 +10,6 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
 use arrow_array::{Array, BooleanArray, RecordBatch};
 use crossbeam_deque::{Injector, Steal};
-use std::ops::{Index, IndexMut};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use tracing::debug;
@@ -181,15 +180,7 @@ unsafe impl Send for JoinPartitionJob {}
 impl JoinPartitionJob {
     fn run(self) {
         debug!("Running partition job");
-        let join_dir = unsafe { &*self.table.directory.get() };
-        self.run_with_dir(join_dir);
-    }
-
-    #[inline(always)]
-    fn run_with_dir<B: Index<usize, Output = u64> + IndexMut<usize>>(
-        &self,
-        directory: &Directory<B>,
-    ) {
+        let directory = unsafe { &*self.table.directory.get() };
         let shift = directory.shift;
         let keys = unsafe { &*self.table.keys.get() };
         let rows = unsafe { &*self.table.rows.get() };
@@ -201,7 +192,7 @@ impl JoinPartitionJob {
                 let slot = (tuple.hash >> shift) as usize;
                 unsafe {
                     directory.add_to_entry(slot, 1 << 16);
-                    directory.or_to_entry(slot, Directory::<B>::compute_tag(tuple.hash) as u64);
+                    directory.or_to_entry(slot, JoinDirectory::compute_tag(tuple.hash) as u64);
                 }
             });
         }
@@ -294,7 +285,7 @@ impl Outputter<()> for JoinBuilder {
                 .max(NUM_PARTITIONS);
             let directory = unsafe { &mut *self.table.directory.get() };
             let mut directory_alloc = SlabAllocator::new(false);
-            *directory = Directory::new(
+            *directory = JoinDirectory::new(
                 directory_alloc.create_multi_slab_buffer(dir_capacity + 1, true),
                 dir_capacity,
             );

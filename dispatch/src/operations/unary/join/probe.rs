@@ -16,7 +16,7 @@ use crate::operations::Unary;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::join::build::filter_null_keys;
-use crate::operations::unary::join::directory::{Directory, PtrBuffer, prefetch_ptr_l2};
+use crate::operations::unary::join::directory::{JoinDirectory, prefetch_ptr_l2};
 use crate::operations::unary::join::{JoinOutputColumns, JoinTable};
 use ahash::RandomState;
 use arrow_array::cast::AsArray;
@@ -24,7 +24,6 @@ use arrow_array::types::Int64Type;
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{Field, Schema, SchemaRef};
 use std::cmp::min;
-use std::ops::{Index, IndexMut};
 use std::sync::Arc;
 
 const PROBE_BATCH_SIZE: usize = 2048;
@@ -286,15 +285,10 @@ impl<'a, 'b, S: Sender<RecordBatch>> ProbeMatchCollector<'a, 'b, S> {
 /// The prefetch-pipelined probe: hashes ahead, bloom-filters into a ring of
 /// matched directory slots, prefetches their arena ranges, then drains matches
 /// a window behind — keeping many independent loads in flight.
-struct ProbeArray<
-    'a,
-    'b,
-    B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer,
-    S: Sender<RecordBatch>,
-> {
+struct ProbeArray<'a, 'b, S: Sender<RecordBatch>> {
     row_idx: usize,
     hash_state: RandomState,
-    directory: &'a Directory<B>,
+    directory: &'a JoinDirectory,
 
     hashes: [u64; RING_SIZE],
 
@@ -309,9 +303,7 @@ struct ProbeArray<
     out: ProbeMatchCollector<'a, 'b, S>,
 }
 
-impl<'a, 'b, B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer, S: Sender<RecordBatch>>
-    ProbeArray<'a, 'b, B, S>
-{
+impl<'a, 'b, S: Sender<RecordBatch>> ProbeArray<'a, 'b, S> {
     #[inline(always)]
     pub fn generate_matched_slots<const HASH: bool>(&mut self, length: usize) {
         let next_matched_slots: &mut [(usize, usize); PREFETCH_LENGTH] =
@@ -337,7 +329,7 @@ impl<'a, 'b, B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer, S: Sen
 
             let slot = (hash >> shift) as usize;
             let stored = unsafe { *self.directory.ptr_for_slot(slot) };
-            let probe = Directory::<B>::compute_tag(hash) as u64;
+            let probe = JoinDirectory::compute_tag(hash) as u64;
 
             if (stored & probe) == probe {
                 // Given that we matched, let's prefetch the slot after ours. Cache lines are 64 bytes,
