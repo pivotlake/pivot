@@ -196,21 +196,47 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Ag
 
     #[inline(always)]
     fn merge_stored(dst: &mut [A], src: &[A], ctx: &Self::SharedContext) {
-        let (slots, shared) = ctx;
-        for ((a, &b), slot) in dst.iter_mut().zip(src.iter()).zip(slots.iter()) {
-            *a = if ONLY_ADDITIVE {
-                // All-additive: `Count` and every `Sum` merge by `+`, so skip
-                // the per-slot kind dispatch entirely.
-                *a + b
-            } else {
-                merge_slot(*a, b, slot, shared)
-            };
+        // Const-count dispatch as in `seed_stored`: the merge runs this once
+        // per folded entry, and a runtime trip count would keep the per-slot
+        // combine from unrolling.
+        match dst.len() {
+            1 => Self::merge_fixed::<1>(dst, src, ctx),
+            2 => Self::merge_fixed::<2>(dst, src, ctx),
+            3 => Self::merge_fixed::<3>(dst, src, ctx),
+            4 => Self::merge_fixed::<4>(dst, src, ctx),
+            5 => Self::merge_fixed::<5>(dst, src, ctx),
+            6 => Self::merge_fixed::<6>(dst, src, ctx),
+            7 => Self::merge_fixed::<7>(dst, src, ctx),
+            8 => Self::merge_fixed::<8>(dst, src, ctx),
+            _ => {
+                let (slots, shared) = ctx;
+                for ((a, &b), slot) in dst.iter_mut().zip(src.iter()).zip(slots.iter()) {
+                    *a = if ONLY_ADDITIVE {
+                        *a + b
+                    } else {
+                        merge_slot(*a, b, slot, shared)
+                    };
+                }
+            }
         }
     }
 
     #[inline(always)]
     fn clone_stored(dst: &mut [A], src: &[A]) {
-        dst.copy_from_slice(src);
+        // A runtime-length `copy_from_slice` lowers to a `memmove` call; a
+        // const-length array assignment is a handful of register moves. The
+        // merge runs this once per newly claimed entry.
+        match dst.len() {
+            1 => Self::clone_fixed::<1>(dst, src),
+            2 => Self::clone_fixed::<2>(dst, src),
+            3 => Self::clone_fixed::<3>(dst, src),
+            4 => Self::clone_fixed::<4>(dst, src),
+            5 => Self::clone_fixed::<5>(dst, src),
+            6 => Self::clone_fixed::<6>(dst, src),
+            7 => Self::clone_fixed::<7>(dst, src),
+            8 => Self::clone_fixed::<8>(dst, src),
+            _ => dst.copy_from_slice(src),
+        }
     }
 
     #[inline(always)]
@@ -273,6 +299,37 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
         for s in 0..N {
             dst[s] = update_slot::<A, ONLY_ADDITIVE>(dst[s], &reader[s], idx, wc, shared);
         }
+    }
+
+    /// [`merge_stored`](AggregationValue::merge_stored) with a const trip
+    /// count, so the per-slot combine unrolls.
+    #[inline(always)]
+    fn merge_fixed<const N: usize>(
+        dst: &mut [A],
+        src: &[A],
+        ctx: &(Arc<[AggregationSlot]>, Arc<SharedArena>),
+    ) {
+        let (slots, shared) = ctx;
+        let dst: &mut [A; N] = dst.try_into().unwrap();
+        let src: &[A; N] = src.try_into().unwrap();
+        for s in 0..N {
+            dst[s] = if ONLY_ADDITIVE {
+                // All-additive: `Count` and every `Sum` merge by `+`, so skip
+                // the per-slot kind dispatch entirely.
+                dst[s] + src[s]
+            } else {
+                merge_slot(dst[s], src[s], &slots[s], shared)
+            };
+        }
+    }
+
+    /// [`clone_stored`](AggregationValue::clone_stored) with a const length:
+    /// an array assignment instead of a `memmove` call.
+    #[inline(always)]
+    fn clone_fixed<const N: usize>(dst: &mut [A], src: &[A]) {
+        let dst: &mut [A; N] = dst.try_into().unwrap();
+        let src: &[A; N] = src.try_into().unwrap();
+        *dst = *src;
     }
 }
 
