@@ -152,26 +152,23 @@ fn build_disk_cache(args: &Args) -> Option<Arc<dispatch::io::DiskCache>> {
 /// one composite catalog. Each datastore self-manages its maintenance (the global
 /// refresh cadence plus its own per-datastore compaction from the metastore file),
 /// spawning its background tasks onto the ambient runtime, so this must run inside
-/// `rt.block_on`. Exits the process on any open failure; there is nothing to serve
-/// without it.
-fn build_catalog(args: &Args, dispatcher: &DataFlowDispatcher) -> Arc<PivotCatalog> {
+/// `rt.block_on`.
+fn build_catalog(args: &Args, dispatcher: &DataFlowDispatcher) -> Result<Arc<PivotCatalog>, Error> {
     let path = &args.metastore;
     let refresh_interval = Duration::from_secs(args.catalog_refresh_secs);
-    let store = TomlMetastore::open(path, refresh_interval).unwrap_or_else(|e| {
-        error!("failed to read metastore `{}`: {e}", path.display());
-        std::process::exit(1);
-    });
+    let store =
+        TomlMetastore::open(path, refresh_interval).map_err(|source| Error::ReadMetastore {
+            path: path.clone(),
+            source,
+        })?;
     let default_name = store.default_datastore_name().to_string();
-    let datastores = store.open_datastores(dispatcher).unwrap_or_else(|e| {
-        error!("failed to open datastores from `{}`: {e}", path.display());
-        std::process::exit(1);
-    });
-    Arc::new(
-        PivotCatalog::new(datastores, default_name).unwrap_or_else(|e| {
-            error!("invalid metastore configuration: {e}");
-            std::process::exit(1);
-        }),
-    )
+    let datastores = store
+        .open_datastores(dispatcher)
+        .map_err(|source| Error::OpenDatastores {
+            path: path.clone(),
+            source,
+        })?;
+    Ok(Arc::new(PivotCatalog::new(datastores, default_name)?))
 }
 
 fn main() -> Result<(), Error> {
@@ -201,7 +198,7 @@ fn main() -> Result<(), Error> {
         .build()?;
 
     rt.block_on(async move {
-        let catalog = build_catalog(&args, dispatch.dispatcher());
+        let catalog = build_catalog(&args, dispatch.dispatcher())?;
 
         let mut server = Server::new(args.bind, dispatch, catalog);
         if let Some(addr) = args.http_bind {
