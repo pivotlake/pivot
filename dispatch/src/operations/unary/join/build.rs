@@ -1,7 +1,7 @@
-use crate::memory::{MultiSlabBuffer, SlabAllocator, SlabVec};
+use crate::memory::{SlabAllocator, SlabVec};
 use crate::operations::channels::Sender;
-use crate::operations::unary::join::JoinCell;
-use crate::operations::unary::join::directory::{Directory, JoinDirectory};
+use crate::operations::unary::join::JoinTable;
+use crate::operations::unary::join::directory::Directory;
 use crate::operations::{Consumer, Outputter, unary};
 use crate::waker::worker_waker;
 use ahash::RandomState;
@@ -65,10 +65,7 @@ impl JoinBuildConsumer {
         sender: mpsc::Sender<BuildWorkerOutput>,
         receiver: Option<mpsc::Receiver<BuildWorkerOutput>>,
         partition_sizes: Arc<Vec<AtomicUsize>>,
-        directory: Arc<JoinCell<JoinDirectory>>,
-        keys: Arc<JoinCell<MultiSlabBuffer<u64>>>,
-        rows: Arc<JoinCell<MultiSlabBuffer<u32>>>,
-        build_rows: Arc<JoinCell<Option<RecordBatch>>>,
+        table: JoinTable,
         injector: Arc<Injector<JoinPartitionJob>>,
         jobs_injected: Arc<AtomicBool>,
         build_ready: Arc<AtomicBool>,
@@ -85,10 +82,7 @@ impl JoinBuildConsumer {
             partition_sizes: partition_sizes.clone(),
             sender,
             outputter: JoinBuilder {
-                directory,
-                keys,
-                rows,
-                build_rows,
+                table,
                 receiver,
                 partition_sizes,
                 injector,
@@ -160,10 +154,7 @@ impl Consumer<RecordBatch, ()> for JoinBuildConsumer {
 }
 
 pub struct JoinBuilder {
-    directory: Arc<JoinCell<JoinDirectory>>,
-    keys: Arc<JoinCell<MultiSlabBuffer<u64>>>,
-    rows: Arc<JoinCell<MultiSlabBuffer<u32>>>,
-    build_rows: Arc<JoinCell<Option<RecordBatch>>>,
+    table: JoinTable,
     receiver: Option<mpsc::Receiver<BuildWorkerOutput>>,
     partition_sizes: Arc<Vec<AtomicUsize>>,
     injector: Arc<Injector<JoinPartitionJob>>,
@@ -178,9 +169,7 @@ pub struct JoinPartitionJob {
     /// This partition's tuples, one entry per build worker, paired with that
     /// worker's global payload row base (added to each tuple's local row).
     tuples: Vec<(u32, SlabVec<BuildTuple>)>,
-    directory: Arc<JoinCell<JoinDirectory>>,
-    keys: Arc<JoinCell<MultiSlabBuffer<u64>>>,
-    rows: Arc<JoinCell<MultiSlabBuffer<u32>>>,
+    table: JoinTable,
     arena_offset: usize,
 
     slot_start: usize,
@@ -192,7 +181,7 @@ unsafe impl Send for JoinPartitionJob {}
 impl JoinPartitionJob {
     fn run(self) {
         debug!("Running partition job");
-        let join_dir = unsafe { &*self.directory.get() };
+        let join_dir = unsafe { &*self.table.directory.get() };
         self.run_with_dir(join_dir);
     }
 
@@ -202,8 +191,8 @@ impl JoinPartitionJob {
         directory: &Directory<B>,
     ) {
         let shift = directory.shift;
-        let keys = unsafe { &*self.keys.get() };
-        let rows = unsafe { &*self.rows.get() };
+        let keys = unsafe { &*self.table.keys.get() };
+        let rows = unsafe { &*self.table.rows.get() };
 
         // Pass 1: accumulate counts in upper 48 bits, OR bloom tags into
         // lower 16 bits
@@ -293,7 +282,7 @@ impl Outputter<()> for JoinBuilder {
                 .iter()
                 .flat_map(|output| output.payload.iter().cloned())
                 .collect();
-            let build_rows = unsafe { &mut *self.build_rows.get() };
+            let build_rows = unsafe { &mut *self.table.build_rows.get() };
             *build_rows = payload_batches.first().map(|first| {
                 concat_batches(&first.schema(), &payload_batches)
                     .expect("build payload batches share a schema")
@@ -303,7 +292,7 @@ impl Outputter<()> for JoinBuilder {
             let dir_capacity = ((total as f64 * 1.125) as usize)
                 .next_power_of_two()
                 .max(NUM_PARTITIONS);
-            let directory = unsafe { &mut *self.directory.get() };
+            let directory = unsafe { &mut *self.table.directory.get() };
             let mut directory_alloc = SlabAllocator::new(false);
             *directory = Directory::new(
                 directory_alloc.create_multi_slab_buffer(dir_capacity + 1, true),
@@ -315,9 +304,9 @@ impl Outputter<()> for JoinBuilder {
             directory.set_entry(dir_capacity, (total as u64) << 16);
 
             let mut arena_alloc = SlabAllocator::new(false);
-            let keys = unsafe { &mut *self.keys.get() };
+            let keys = unsafe { &mut *self.table.keys.get() };
             *keys = arena_alloc.create_multi_slab_buffer::<u64>(total.max(1), false);
-            let rows = unsafe { &mut *self.rows.get() };
+            let rows = unsafe { &mut *self.table.rows.get() };
             *rows = arena_alloc.create_multi_slab_buffer::<u32>(total.max(1), false);
 
             // Prefix sums give each partition its arena offset.
@@ -335,9 +324,7 @@ impl Outputter<()> for JoinBuilder {
                     .collect();
                 self.injector.push(JoinPartitionJob {
                     tuples,
-                    directory: self.directory.clone(),
-                    keys: self.keys.clone(),
-                    rows: self.rows.clone(),
+                    table: self.table.clone(),
                     arena_offset,
                     slot_start: i * slots_per_partition,
                     remaining_jobs: self.remaining_jobs.clone(),
