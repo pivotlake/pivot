@@ -60,8 +60,8 @@ use crate::operations::channels::{
 use crate::operations::{
     AggregateFactory, AggregationSlot, AggregationValue, CopyOutFactory, Distinct,
     DynamicFilterSlot, F64Cell, FilterFactory, GroupFactory, GroupLimit, IntCell, KeyExtractor,
-    LimitFactory, MapFactory, NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByLimitFactory,
-    UnaryFactory, UnaryOperator, UnaryOperatorFactory, WideCell,
+    LimitFactory, MapFactory, NoOpNullaryFactory, NullaryFactory, NullaryOperatorFactory, OrderBy,
+    OrderByLimitFactory, UnaryFactory, UnaryOperator, UnaryOperatorFactory, WideCell,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle, DataFlowStats};
 pub const RECORD_BATCH_SIZE: usize = 8192;
@@ -296,6 +296,17 @@ impl RecordBatchOperatorSpec {
                 .into_iter()
                 .map(NullaryOperatorFactory::new),
         ))
+    }
+
+    /// Build a spec that emits no rows and completes immediately: each worker
+    /// gets a [`NoOpNullary`](crate::operations::NoOpNullary), which has no
+    /// work and finishes on its first finish pass. This is the plan for a
+    /// statement that turns out to have nothing to do.
+    pub fn no_op(dispatcher: &DataFlowDispatcher) -> Self {
+        Self::from_nullary(
+            dispatcher,
+            (0..dispatcher.worker_count()).map(|_| NoOpNullaryFactory),
+        )
     }
 
     /// Borrow the dispatcher this spec was built against.

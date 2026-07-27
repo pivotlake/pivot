@@ -180,6 +180,27 @@ impl<O: 'static, NF: NullaryFactory<O>> OperatorFactory<O> for NullaryOperatorFa
     }
 }
 
+/// A source that emits nothing and finishes on its first finish pass. Backs
+/// [`no_op`](crate::api::RecordBatchOperatorSpec::no_op) dataflows, the plan
+/// for a statement that turns out to have nothing to do.
+pub struct NoOpNullaryFactory;
+
+impl<O: 'static> NullaryFactory<O> for NoOpNullaryFactory {
+    type Nullary = NoOpNullary;
+
+    fn build_nullary(self) -> NoOpNullary {
+        NoOpNullary
+    }
+}
+
+pub struct NoOpNullary;
+
+impl<O> Nullary<O> for NoOpNullary {
+    fn run<S: Sender<O>>(&mut self, _sender: &mut S) -> Result<WorkStatus> {
+        Ok(WorkStatus::Pending)
+    }
+}
+
 /// Runs a `FnOnce() -> O` exactly once on the worker it lands on, sends the
 /// result downstream, and finishes.
 ///
@@ -280,5 +301,18 @@ mod tests {
             WorkStatus::Pending
         ));
         assert_eq!(operator.try_finish().unwrap(), FinishStatus::Done);
+    }
+
+    #[test]
+    fn no_op_nullary_finishes_without_emitting() {
+        let mut operator = NullaryOperator::new(NoOpNullary, CollectSender::<i32>::new());
+
+        assert!(matches!(
+            operator.run_cpu_work().unwrap(),
+            WorkStatus::Pending
+        ));
+
+        assert_eq!(operator.try_finish().unwrap(), FinishStatus::Done);
+        assert!(operator.sender.items.is_empty());
     }
 }

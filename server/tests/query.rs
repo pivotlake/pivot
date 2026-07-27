@@ -92,6 +92,21 @@ async fn create_table_and_query(#[future] conn: Conn) {
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
+async fn create_table_if_not_exists_is_a_noop_on_an_existing_table(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_if_not_exists", dir.path()).await;
+
+    conn.simple_query("CREATE TABLE IF NOT EXISTS people_if_not_exists (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+
+    let rows = select_rows(&conn, "SELECT COUNT(*) FROM people_if_not_exists").await;
+    assert_eq!(rows, vec![vec![Some("3".into())]]);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
 async fn insert_returns_affected_row_count(#[future] conn: Conn) {
     let dir = write_parquet(&people_batch());
     create_people_table(&conn, "people_insert", dir.path()).await;

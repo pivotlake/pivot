@@ -74,8 +74,6 @@ pub enum Error {
     TablePathWithScheme(String),
     #[error("`{option}` column `{column}` is not a declared column of the table")]
     UnknownSpecColumn { option: String, column: String },
-    #[error("`IF NOT EXISTS` is not supported")]
-    IfNotExistsUnsupported,
     #[error(transparent)]
     ParquetTable(#[from] ParquetTableError),
     #[error("table `{0}` already exists")]
@@ -442,12 +440,14 @@ impl ParquetCatalog {
         request: CreateTableRequest,
         dispatcher: &DataFlowDispatcher,
     ) -> Result<RecordBatchOperatorSpec> {
-        if request.if_not_exists {
-            return Err(Error::IfNotExistsUnsupported);
-        }
         // Reject a duplicate up front; the commit re-checks under the lock as a
-        // race backstop.
+        // race backstop. With `IF NOT EXISTS`, an existing table makes the
+        // statement a successful no-op: the table (whatever its definition)
+        // stays exactly as it is, and the returned plan does nothing.
         if self.tables.read().unwrap().contains_name(&request.name) {
+            if request.if_not_exists {
+                return Ok(RecordBatchOperatorSpec::no_op(dispatcher));
+            }
             return Err(Error::TableExists(request.name));
         }
 
@@ -480,6 +480,11 @@ impl ParquetCatalog {
             move |loaded: Vec<TableFile>| {
                 let mut map = tables.write().unwrap();
                 if map.contains_name(&request.name) {
+                    // A concurrent create won the race. With `IF NOT EXISTS`
+                    // that is still a success; the fetched footers are dropped.
+                    if request.if_not_exists {
+                        return Ok(());
+                    }
                     return Err(Box::new(Error::TableExists(request.name))
                         as Box<dyn std::error::Error + Send + Sync>);
                 }
