@@ -36,11 +36,9 @@ pub struct Probe {
     table: JoinTable,
     hash_state: RandomState,
     key_column: usize,
-    use_probe_array: bool,
     output_columns: Arc<JoinOutputColumns>,
     allocator: SlabAllocator,
 
-    hashes: [u64; PROBE_BATCH_SIZE],
     /// Matched (probe row, build payload row) pairs of the batch being
     /// probed, drained into the accumulators when full or at batch end.
     probe_indices: Vec<u32>,
@@ -51,34 +49,19 @@ pub struct Probe {
     sides: Option<OutputSides>,
 }
 
-/// The join's output state: the selected probe columns and selected build
-/// payload columns accumulate separately (their rows come from different
-/// sources), and every emitted batch splices them under one schema.
-struct OutputSides {
-    /// The probe columns listed in the output, then the build columns.
-    output_schema: SchemaRef,
-    probe: BatchAccumulator,
-    build: BatchAccumulator,
-    /// The build payload restricted to the listed build columns.
-    build_source: RecordBatch,
-}
-
 impl Probe {
     pub(crate) fn new(
         table: JoinTable,
         hash_state: RandomState,
         key_column: usize,
-        use_probe_array: bool,
         output_columns: Arc<JoinOutputColumns>,
     ) -> Self {
         Self {
             table,
             hash_state,
             key_column,
-            use_probe_array,
             output_columns,
             allocator: SlabAllocator::new(false),
-            hashes: [0; PROBE_BATCH_SIZE],
             probe_indices: vec![0; RECORD_BATCH_SIZE],
             build_indices: vec![0; RECORD_BATCH_SIZE],
             sides: None,
@@ -108,6 +91,115 @@ impl Probe {
         )?)?;
         Ok(())
     }
+
+    fn probe_window<S: Sender<RecordBatch>>(
+        &mut self,
+        window: &RecordBatch,
+        window_offset: usize,
+        probe_source: &RecordBatch,
+        sender: &mut S,
+    ) -> unary::Result<()> {
+        let col = window.column(self.key_column).as_primitive::<Int64Type>();
+        let keys = unsafe { &*self.table.keys.get() };
+        let rows = unsafe { &*self.table.rows.get() };
+        let out = BatchProbe {
+            keys,
+            rows,
+            col,
+            window_offset,
+            probe_source,
+            sides: self.sides.as_mut().expect("sides are built before probing"),
+            probe_indices: &mut self.probe_indices,
+            build_indices: &mut self.build_indices,
+            matched: 0,
+            sender,
+            allocator: &mut self.allocator,
+        };
+
+        let join_dir = unsafe { &*self.table.directory.get() };
+        run_probe_array(join_dir, &self.hash_state, out)
+    }
+}
+
+impl Unary<RecordBatch, RecordBatch> for Probe {
+    fn consume<S: Sender<RecordBatch>>(
+        &mut self,
+        batch: RecordBatch,
+        sender: &mut S,
+    ) -> unary::Result<()> {
+        let build_rows = unsafe { &*self.table.build_rows.get() };
+        let Some(build_rows) = build_rows else {
+            // Empty build side: an inner join emits nothing.
+            return Ok(());
+        };
+
+        let batch = filter_null_keys(batch, self.key_column);
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+
+        if self.sides.is_none() {
+            let probe_schema = batch.schema();
+            let build_schema = build_rows.schema();
+            let fields: Vec<Field> = self
+                .output_columns
+                .probe
+                .iter()
+                .map(|&i| probe_schema.field(i).clone())
+                .chain(
+                    self.output_columns
+                        .build
+                        .iter()
+                        .map(|&i| build_schema.field(i).clone()),
+                )
+                .collect();
+            let build_source = build_rows.project(&self.output_columns.build)?;
+            let probe_fields = Arc::new(Schema::new(
+                fields[..self.output_columns.probe.len()].to_vec(),
+            ));
+            let build_fields = Arc::new(Schema::new(
+                fields[self.output_columns.probe.len()..].to_vec(),
+            ));
+            self.sides = Some(OutputSides {
+                output_schema: Arc::new(Schema::new(fields)),
+                probe: BatchAccumulator::new(probe_fields, &mut self.allocator),
+                build: BatchAccumulator::new(build_fields, &mut self.allocator),
+                build_source,
+            });
+        }
+        let probe_source = batch.project(&self.output_columns.probe)?;
+
+        let total = batch.num_rows();
+        let mut start = 0;
+        while start < total {
+            let len = (total - start).min(PROBE_BATCH_SIZE);
+            let window = batch.slice(start, len);
+            self.probe_window(&window, start, &probe_source, sender)?;
+            start += len;
+        }
+        Ok(())
+    }
+
+    fn finish<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> unary::Result<bool> {
+        if let Some(sides) = &mut self.sides
+            && !sides.probe.is_empty()
+        {
+            Probe::emit(sides, &mut self.allocator, sender)?;
+        }
+        Ok(true)
+    }
+}
+
+/// The join's output state: the selected probe columns and selected build
+/// payload columns accumulate separately (their rows come from different
+/// sources), and every emitted batch splices them under one schema.
+struct OutputSides {
+    /// The probe columns listed in the output, then the build columns.
+    output_schema: SchemaRef,
+    probe: BatchAccumulator,
+    build: BatchAccumulator,
+    /// The build payload restricted to the listed build columns.
+    build_source: RecordBatch,
 }
 
 /// The per-batch probe state: scans `col` against the directory, collecting
@@ -123,7 +215,6 @@ struct BatchProbe<'a, 'b, S: Sender<RecordBatch>> {
     /// The probed batch restricted to the listed probe columns.
     probe_source: &'b RecordBatch,
     sides: &'a mut OutputSides,
-    hashes: &'a mut [u64],
 
     probe_indices: &'a mut [u32],
     build_indices: &'a mut [u32],
@@ -177,55 +268,6 @@ impl<'a, 'b, S: Sender<RecordBatch>> BatchProbe<'a, 'b, S> {
             self.drain()?;
         }
         Ok(())
-    }
-
-    /// Scalar reference probe: hash, bloom-check and scan each probe row's
-    /// directory slot in order, with light lookahead prefetching.
-    fn run_scalar<B: Index<usize, Output = u64> + IndexMut<usize> + PtrBuffer>(
-        mut self,
-        directory: &Directory<B>,
-        hash_state: &RandomState,
-    ) -> unary::Result<()> {
-        let col = self.col;
-        debug_assert!(col.len() <= self.hashes.len());
-        for (row_idx, hash) in self.hashes[..col.len()].iter_mut().enumerate() {
-            *hash = hash_state.hash_one(unsafe { col.value_unchecked(row_idx) });
-        }
-
-        for row_idx in 0..col.len() {
-            const DIRECTORY_PREFETCH_DISTANCE: usize = 64;
-            const ARENA_PREFETCH_DISTANCE: usize = 32;
-
-            if row_idx + DIRECTORY_PREFETCH_DISTANCE < col.len() {
-                directory.prefetch_l2(self.hashes[row_idx + DIRECTORY_PREFETCH_DISTANCE]);
-            }
-
-            if row_idx + ARENA_PREFETCH_DISTANCE < col.len() {
-                let future_hash = self.hashes[row_idx + ARENA_PREFETCH_DISTANCE];
-                let future_slot = directory.slot_for(future_hash);
-                let future_start = directory.end_ptr(future_slot as isize);
-                let future_start_2 = directory.end_ptr((future_slot + 1) as isize);
-                prefetch_ptr_l2(self.keys.ptr_at_index(future_start) as *const u8);
-                prefetch_ptr_l2(self.keys.ptr_at_index(future_start_2) as *const u8);
-                prefetch_ptr_l2(self.rows.ptr_at_index(future_start) as *const u8);
-            }
-
-            let hash = self.hashes[row_idx];
-            if !directory.matches_bloom(hash) {
-                continue;
-            }
-
-            let slot = directory.slot_for(hash);
-            let start = directory.end_ptr(slot as isize);
-            let end = directory.end_ptr((slot + 1) as isize);
-            let probe_key = unsafe { col.value_unchecked(row_idx) } as u64;
-
-            for j in start..end {
-                self.record_match(j, row_idx, probe_key)?;
-            }
-        }
-
-        self.drain()
     }
 }
 
@@ -448,109 +490,4 @@ where
         out,
     }
     .run()
-}
-
-impl Probe {
-    fn probe_window<S: Sender<RecordBatch>>(
-        &mut self,
-        window: &RecordBatch,
-        window_offset: usize,
-        probe_source: &RecordBatch,
-        sender: &mut S,
-    ) -> unary::Result<()> {
-        let col = window.column(self.key_column).as_primitive::<Int64Type>();
-        debug_assert!(col.len() <= self.hashes.len());
-        let keys = unsafe { &*self.table.keys.get() };
-        let rows = unsafe { &*self.table.rows.get() };
-        let out = BatchProbe {
-            keys,
-            rows,
-            col,
-            window_offset,
-            probe_source,
-            sides: self.sides.as_mut().expect("sides are built before probing"),
-            hashes: &mut self.hashes[..window.num_rows()],
-            probe_indices: &mut self.probe_indices,
-            build_indices: &mut self.build_indices,
-            matched: 0,
-            sender,
-            allocator: &mut self.allocator,
-        };
-
-        let join_dir = unsafe { &*self.table.directory.get() };
-        if !self.use_probe_array {
-            return out.run_scalar(join_dir, &self.hash_state);
-        }
-
-        run_probe_array(join_dir, &self.hash_state, out)
-    }
-}
-
-impl Unary<RecordBatch, RecordBatch> for Probe {
-    fn consume<S: Sender<RecordBatch>>(
-        &mut self,
-        batch: RecordBatch,
-        sender: &mut S,
-    ) -> unary::Result<()> {
-        let build_rows = unsafe { &*self.table.build_rows.get() };
-        let Some(build_rows) = build_rows else {
-            // Empty build side: an inner join emits nothing.
-            return Ok(());
-        };
-
-        let batch = filter_null_keys(batch, self.key_column);
-        if batch.num_rows() == 0 {
-            return Ok(());
-        }
-
-        if self.sides.is_none() {
-            let probe_schema = batch.schema();
-            let build_schema = build_rows.schema();
-            let fields: Vec<Field> = self
-                .output_columns
-                .probe
-                .iter()
-                .map(|&i| probe_schema.field(i).clone())
-                .chain(
-                    self.output_columns
-                        .build
-                        .iter()
-                        .map(|&i| build_schema.field(i).clone()),
-                )
-                .collect();
-            let build_source = build_rows.project(&self.output_columns.build)?;
-            let probe_fields = Arc::new(Schema::new(
-                fields[..self.output_columns.probe.len()].to_vec(),
-            ));
-            let build_fields = Arc::new(Schema::new(
-                fields[self.output_columns.probe.len()..].to_vec(),
-            ));
-            self.sides = Some(OutputSides {
-                output_schema: Arc::new(Schema::new(fields)),
-                probe: BatchAccumulator::new(probe_fields, &mut self.allocator),
-                build: BatchAccumulator::new(build_fields, &mut self.allocator),
-                build_source,
-            });
-        }
-        let probe_source = batch.project(&self.output_columns.probe)?;
-
-        let total = batch.num_rows();
-        let mut start = 0;
-        while start < total {
-            let len = (total - start).min(PROBE_BATCH_SIZE);
-            let window = batch.slice(start, len);
-            self.probe_window(&window, start, &probe_source, sender)?;
-            start += len;
-        }
-        Ok(())
-    }
-
-    fn finish<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> unary::Result<bool> {
-        if let Some(sides) = &mut self.sides
-            && !sides.probe.is_empty()
-        {
-            Probe::emit(sides, &mut self.allocator, sender)?;
-        }
-        Ok(true)
-    }
 }
