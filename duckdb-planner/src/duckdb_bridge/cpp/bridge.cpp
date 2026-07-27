@@ -3,6 +3,7 @@
 #include "duckdb-planner/src/duckdb_bridge/cpp/storage_info.h"
 #include "duckdb-planner/src/duckdb_bridge/cpp/catalog/table_entry.h"
 #include "duckdb/main/config.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
@@ -114,15 +115,30 @@ DuckPlannerContext::DuckPlannerContext(rust::Box<CatalogContext> catalog)
                 throw std::runtime_error(disable_result->GetError());
         }
 
-	// Set catalog context on the storage extension and attach the pivot catalog as default
+	// Point the pivotdb storage extension at our catalog context, then attach one
+	// DuckDB database per datastore. All attached databases share this one
+	// PivotStorageInfo; each ATTACH's alias is the datastore name, which the
+	// schema-entry lookups pass back so a table lookup routes to that datastore's
+	// snapshot in the current transaction. Finally make the default datastore the
+	// current database, so unqualified names resolve against it.
 	auto ext = duckdb::StorageExtension::Find(
 	    duckdb::DBConfig::GetConfig(*db.instance), "pivotdb");
 	ext->storage_info = duckdb::make_shared_ptr<PivotStorageInfo>(&*this->catalog);
-	auto attach_result = con.Query("ATTACH '' AS pv (TYPE pivotdb)");
-	if (attach_result->HasError()) {
-		throw std::runtime_error(attach_result->GetError());
+
+	for (const auto &name : catalog_context_names(*this->catalog)) {
+		std::string db_name(name);
+		std::string sql = "ATTACH " + duckdb::KeywordHelper::WriteQuoted(db_name, '\'') +
+		                  " AS " + duckdb::KeywordHelper::WriteQuoted(db_name, '"') +
+		                  " (TYPE pivotdb)";
+		auto attach_result = con.Query(sql);
+		if (attach_result->HasError()) {
+			throw std::runtime_error(attach_result->GetError());
+		}
 	}
-	auto use_result = con.Query("USE pv");
+
+	std::string default_name(catalog_context_default(*this->catalog));
+	auto use_result =
+	    con.Query("USE " + duckdb::KeywordHelper::WriteQuoted(default_name, '"'));
 	if (use_result->HasError()) {
 		throw std::runtime_error(use_result->GetError());
 	}
@@ -602,6 +618,13 @@ static duckdb::CreateTableInfo &create_table_info(const LogicalOperator &op) {
 
 rust::String lo_create_table_name(const LogicalOperator &op) {
 	return rust::String::lossy(create_table_info(op).table);
+}
+
+rust::String lo_create_table_datastore(const LogicalOperator &op) {
+	// DuckDB stores the resolved datastore/database for
+	// `CREATE TABLE db.schema.t` in its native `catalog` field. It is empty when
+	// the statement is unqualified.
+	return rust::String::lossy(create_table_info(op).catalog);
 }
 
 size_t lo_create_column_count(const LogicalOperator &op) {

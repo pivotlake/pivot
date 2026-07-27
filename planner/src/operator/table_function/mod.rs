@@ -6,7 +6,8 @@
 //! column projection shared by all of them. The concrete functions live
 //! elsewhere: the generic ones ([`series`]) here, backend-specific ones (e.g.
 //! `metadata`, which only a catalog that has row groups can answer) in the
-//! catalog, contributed through [`CatalogTransaction::table_function`].
+//! catalog, contributed through
+//! [`CatalogTransaction::bind_default_table_function`].
 //!
 //! A function produces its *full* output (every column it declares, in order)
 //! as a dataflow; the operator then projects that to the columns DuckDB asked
@@ -49,15 +50,15 @@ pub trait TableFunction: Send + Sync {
     /// function in DuckDB. Must match what [`compile`](Self::compile) emits.
     fn signature(&self) -> TableFunctionSignature;
 
-    /// Build the dataflow emitting this function's full output. `transaction`
-    /// is the query's catalog transaction; a backend function that reads
-    /// catalog data (e.g. `metadata`) resolves it from there, exactly as a
-    /// [`Table`](crate::catalog::Table) does. Pure functions ignore it.
+    /// Build the dataflow emitting this function's full output. A backend
+    /// function that reads catalog data (e.g. `metadata`) captured the snapshot
+    /// it needs when it was resolved, exactly as a self-contained
+    /// [`BoundTable`](crate::catalog::BoundTable) binding does; pure functions need
+    /// nothing beyond their arguments.
     fn compile(
         &self,
         args: &[ScalarValue],
         dispatcher: &DataFlowDispatcher,
-        transaction: &dyn CatalogTransaction,
     ) -> Result<RecordBatchOperatorSpec, Error>;
 }
 
@@ -70,7 +71,9 @@ fn find_table_function(
     name: &str,
     transaction: &dyn CatalogTransaction,
 ) -> Option<Box<dyn TableFunction>> {
-    transaction.table_function(name).or_else(|| builtin(name))
+    transaction
+        .bind_default_table_function(name)
+        .or_else(|| builtin(name))
 }
 
 /// The generic built-in table functions, keyed by name. These depend only on
@@ -133,7 +136,7 @@ impl TableFunctionScan {
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let function = find_table_function(&self.function_name, transaction)
             .ok_or_else(|| Error::UnsupportedTableFunction(self.function_name.clone()))?;
-        let full = function.compile(&self.args, dispatcher, transaction)?;
+        let full = function.compile(&self.args, dispatcher)?;
         self.project(full)
     }
 

@@ -1,19 +1,19 @@
-//! [`Input`] — scans a [`Table`] from the catalog.
+//! [`Input`] — scans a [`BoundTable`] from the catalog.
 
 use super::slot_for;
-use crate::catalog::{CatalogTransaction, DynamicScanPredicate, Table};
+use crate::catalog::{BoundTable, DynamicScanPredicate};
 use crate::compile::{DynamicFilterSlots, Error};
 use crate::dynamic_filter::DynamicFilter;
 use crate::expression::Expression;
 use dispatch::{DataFlowDispatcher, Projection as DispatchProjection, RecordBatchOperatorSpec};
 use std::fmt;
 
-/// Scans a [`Table`] from the catalog. `columns` lists the requested output
+/// Scans a [`BoundTable`] from the catalog. `columns` lists the requested output
 /// columns (each as a [`Ref`](crate::expression::Ref) into the table schema)
 /// and `filters` are predicates pushed down into the scan.
 #[derive(Debug)]
 pub struct Input {
-    pub table: Box<dyn Table>,
+    pub table: Box<dyn BoundTable>,
     pub columns: Vec<Expression>,
     /// Runtime-populated predicates the scan reads from shared slots — installed
     /// by a Top-N (or, in future, a hash join) elsewhere in the plan. Each
@@ -55,7 +55,6 @@ impl Input {
     pub(crate) fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
-        transaction: &dyn CatalogTransaction,
         slots: &mut DynamicFilterSlots,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let column_indices: Vec<usize> = self
@@ -77,7 +76,6 @@ impl Input {
                 projection,
                 dynamic_filters,
                 self.emit_row_group_metadata,
-                transaction,
             )
             .map_err(Error::TableScan)
     }

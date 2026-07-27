@@ -20,8 +20,8 @@ use std::time::Instant;
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{ArrowError, Schema};
-use catalog::parquet::writing::encode_record_batches;
 use clap::Parser;
+use datastore_delta::parquet::writing::encode_record_batches;
 use dispatch::{BUFFER_SIZE, Dispatch, values_input};
 use flate2::read::MultiGzDecoder;
 use parquet_variant_compute::json_to_variant;

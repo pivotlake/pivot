@@ -1,7 +1,7 @@
 //! `pivot-bench` — performance harness for pivotdb.
 //!
 //! Spins up the full pivotdb stack (`dispatch` workers + pgwire `Server` +
-//! `ParquetCatalog`) in-process on a free local port, connects with
+//! `DeltaDatastore`) in-process on a free local port, connects with
 //! `tokio-postgres`, and runs a benchmark suite end-to-end through the wire
 //! protocol so the numbers reflect what a real client would see.
 //!

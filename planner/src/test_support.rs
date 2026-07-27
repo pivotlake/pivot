@@ -27,9 +27,9 @@ use arrow_schema::{DataType, Field, Schema};
 use rstest::fixture;
 use serde_json::Value;
 
-use crate::Planner;
-use crate::catalog::{Catalog, CatalogTransaction, Column, DynamicScanPredicate, Table};
+use crate::catalog::{BoundTable, CatalogTransaction, Column, DynamicScanPredicate};
 use crate::types::{Type, physical_arrow_type};
+use crate::{DEFAULT_DATASTORE_NAME, Planner};
 use dispatch::{
     DataFlowDispatcher, Dispatch, Nullary, NullaryFactory, NullaryResult, Projection,
     RecordBatchOperatorSpec, Sender, WorkStatus,
@@ -112,14 +112,13 @@ impl TestTable {
     }
 }
 
-impl Table for TestTable {
+impl BoundTable for TestTable {
     fn compile_scan(
         &self,
         dispatcher: &DataFlowDispatcher,
         projection: Projection,
         _dynamic_filters: Vec<DynamicScanPredicate>,
         _emit_row_group_metadata: bool,
-        _transaction: &dyn CatalogTransaction,
     ) -> crate::catalog::Result<RecordBatchOperatorSpec> {
         let projected = self
             .batch
@@ -145,7 +144,7 @@ impl Table for TestTable {
             .collect()
     }
 
-    fn clone_box(&self) -> Box<dyn Table> {
+    fn clone_box(&self) -> Box<dyn BoundTable> {
         Box::new(self.clone())
     }
 
@@ -153,26 +152,18 @@ impl Table for TestTable {
         &self,
         _input: RecordBatchOperatorSpec,
         _projection: Projection,
-        _transaction: &dyn CatalogTransaction,
     ) -> crate::catalog::Result<RecordBatchOperatorSpec> {
         unreachable!("the in-memory test table is never late-materialized")
     }
 
-    fn estimate_row_count(
-        &self,
-        _transaction: &dyn crate::catalog::CatalogTransaction,
-    ) -> Option<u64> {
+    fn estimate_row_count(&self) -> Option<u64> {
         Some(self.batch.num_rows() as u64)
     }
 
     /// Exact min/max over the stored column as a scalar of its physical int type,
     /// so the no-scan global MIN/MAX peephole ([`Aggregate::try_compile_from_stats`])
     /// can be exercised. Only the int columns the peephole supports are answered.
-    fn column_min_max(
-        &self,
-        column: usize,
-        _transaction: &dyn CatalogTransaction,
-    ) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
+    fn column_min_max(&self, column: usize) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
         let arr = self.batch.column(column);
         // `values()` below reads the zero-filled null slots too, which would
         // fabricate a 0 extreme; a nullable column just skips the peephole.
@@ -252,28 +243,16 @@ struct TestTransaction {
 }
 
 impl CatalogTransaction for TestTransaction {
-    fn table(&self, name: &str) -> Option<Box<dyn Table>> {
+    fn bind_table(&self, _datastore: &str, name: &str) -> Option<Box<dyn BoundTable>> {
         self.tables.get(name).cloned().map(|t| Box::new(t) as _)
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 
-impl Catalog for TestCatalog {
+impl TestCatalog {
     fn begin_transaction(&self) -> Arc<dyn CatalogTransaction> {
         Arc::new(TestTransaction {
             tables: self.tables.lock().unwrap().clone(),
         })
-    }
-
-    fn create_table(
-        &self,
-        _request: crate::catalog::CreateTableRequest,
-        _dispatcher: &DataFlowDispatcher,
-    ) -> crate::catalog::Result<RecordBatchOperatorSpec> {
-        unreachable!("test helper catalog does not support CREATE TABLE")
     }
 }
 
@@ -386,7 +365,10 @@ pub fn testing_planner() -> TestingPlanner {
             ),
         ],
     );
-    let planner = Planner::new(catalog.clone() as Arc<dyn Catalog>);
+    let planner = Planner::from_datastore_names(
+        vec![DEFAULT_DATASTORE_NAME.to_string()],
+        DEFAULT_DATASTORE_NAME.to_string(),
+    );
     TestingPlanner {
         planner,
         catalog,

@@ -105,7 +105,8 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
 	// binder falls through to the system catalog. The function's schema comes
 	// entirely from Rust; nothing about it is declared in this bridge.
 	if (lookup_info.GetCatalogType() == CatalogType::TABLE_FUNCTION_ENTRY) {
-		auto function = catalog_get_table_function(pivot_transaction_ctx(ParentCatalog()), table_name);
+		auto function = catalog_get_table_function(
+		    pivot_transaction_ctx(ParentCatalog()), ParentCatalog().GetName(), table_name);
 		if (!function.found) {
 			return nullptr;
 		}
@@ -167,7 +168,8 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
 	}
 
 	// A base-table reference: resolve it through the transaction's snapshot.
-	auto result = catalog_get_table(pivot_transaction_ctx(ParentCatalog()), table_name);
+	auto result = catalog_get_table(
+	    pivot_transaction_ctx(ParentCatalog()), ParentCatalog().GetName(), table_name);
 
 	if (!result.found) {
 		return nullptr;
