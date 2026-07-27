@@ -48,7 +48,7 @@ pub(super) async fn default_files_page(
     Path(name): Path<String>,
     Query(page): Query<Page>,
 ) -> Json<FilesPage> {
-    let datastore = state.catalog.default_name().to_string();
+    let datastore = state.catalog.default_datastore().to_string();
     files_page_for(state, datastore, name, page).await
 }
 

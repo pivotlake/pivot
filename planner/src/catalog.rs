@@ -68,9 +68,6 @@ pub struct Column {
 /// implementation can decide what to do with backend-specific keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateTableRequest {
-    /// The datastore (DuckDB database) the statement named: `db` in
-    /// `CREATE TABLE db.schema.t`. `None` when unqualified, meaning the default
-    /// datastore. A multi-datastore catalog routes the create by this.
     pub datastore_name: Option<String>,
     pub name: String,
     pub columns: Vec<Column>,
@@ -78,40 +75,33 @@ pub struct CreateTableRequest {
     pub if_not_exists: bool,
 }
 
-/// One query's transaction across **several datastores**: it routes every
-/// resolution by the datastore (DuckDB database) qualifier of a
-/// `datastore.schema.table` reference. The composite half of the pair; the
-/// per-datastore half is a `datastore::DatastoreTransaction`. This is the
-/// transaction the planner binds against, since DuckDB always resolves through a
-/// database name.
+/// One query's transaction: a consistent **snapshot** of the catalog, opened by
+/// [`Catalog::begin_transaction`] before the query is planned and held until
+/// [`Catalog::commit_transaction`] or [`Catalog::rollback_transaction`]. Every
+/// table the query binds resolves through this snapshot (never through the live
+/// catalog, which a background refresh may be updating concurrently), so a
+/// plan's scans, its late materialize, and its metadata peepholes all see one
+/// frozen view. A backend may also hold pending writes here until commit.
 pub trait CatalogTransaction: Debug + Send + Sync {
     /// Resolve `name` in datastore `datastore` to a fresh, independently-mutable
-    /// [`Table`], or `None` if that datastore holds no such table. This is how
-    /// DuckDB's per-database binding reaches the right datastore's snapshot.
+    /// [`Table`], or `None` if that datastore holds no such table.
     fn bind_table(&self, datastore: &str, name: &str) -> Option<Box<dyn Table>>;
 
     /// A backend-specific table-valued function `name` in datastore `datastore`,
-    /// or `None`. Used at **bind** time, where DuckDB supplies the database
-    /// qualifier. The composite analogue of the per-datastore transaction's
-    /// `bind_table_function`. Default: none.
+    /// or `None`.
     fn bind_table_function(&self, _datastore: &str, _name: &str) -> Option<Box<dyn TableFunction>> {
         None
     }
 
     /// A backend table function by bare `name`, resolved against the default
-    /// datastore. Used at **compile** time, where a table-function scan carries
-    /// no datastore qualifier; the composite routes it to its default child,
-    /// matching DuckDB's bind against the current database. Default: none.
+    /// datastore.
     fn bind_default_table_function(&self, _name: &str) -> Option<Box<dyn TableFunction>> {
         None
     }
 
     /// Resolve a `CREATE TABLE` by routing to the datastore
     /// [`CreateTableRequest::datastore_name`] names (the default when unqualified)
-    /// and deferring to that datastore's own `bind_create_table`. Returns a
-    /// [`TableCreation`] the caller compiles into the creating dataflow, the same
-    /// resolve-then-compile shape a table function follows. The default rejects
-    /// DDL (a read-only catalog).
+    /// and deferring to that datastore's own `bind_create_table`.
     fn bind_create_table(&self, _request: CreateTableRequest) -> Result<Box<dyn TableCreation>> {
         Err(Box::<dyn std::error::Error + Send + Sync>::from(
             "this catalog does not support CREATE TABLE",
@@ -128,9 +118,7 @@ pub trait CatalogTransaction: Debug + Send + Sync {
 /// compiled into the dataflow that creates the table. Resolution (routing,
 /// validation, locating the table's existing files) happens when
 /// [`CatalogTransaction::bind_create_table`] produces it; [`compile`](Self::compile)
-/// then builds the dataflow with the worker pool, the same two-step shape a
-/// resolved [`TableFunction`](crate::TableFunction) follows (resolve, then
-/// compile).
+/// then builds the dataflow with the worker pool.
 pub trait TableCreation: Send + Sync {
     /// Build the dataflow that fetches the new table's file footers over the pool
     /// and, at its terminal, commits the table into the datastore.

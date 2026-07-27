@@ -239,13 +239,6 @@ impl DeltaDatastore {
     /// store (local dir / S3, with whatever credentials it holds) and hands
     /// it in, rather than having the datastore re-derive one from a URI. Reloads
     /// every table the manifest records, exactly as [`open`](Self::open) does.
-    ///
-    /// `maintenance` records the upkeep this datastore will run once
-    /// [`start`](Datastore::start) is called: background tasks that periodically
-    /// refresh the table set from the store and (if configured) compact small
-    /// files. It is only stored here, not acted on; nothing spawns until `start`.
-    /// Callers that only read (tests, `open`) pass `None` and run no background
-    /// work.
     pub fn from_store(
         name: String,
         store: Arc<dyn ObjectStore>,

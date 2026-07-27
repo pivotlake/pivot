@@ -247,9 +247,6 @@ fn main() -> Result<(), Error> {
         .build()?;
 
     rt.block_on(async move {
-        // Build the datastores inside the runtime: opening a persisted datastore
-        // reloads its tables (Parquet footers over the dispatch pool), and each
-        // one spawns its own refresh/compaction tasks onto this ambient runtime.
         let catalog = build_catalog(&args, dispatch.dispatcher());
 
         let mut server = Server::new(args.bind, dispatch, catalog);

@@ -13,10 +13,6 @@
 //! Commit iterates only the datastores the query actually touched, awaiting each
 //! one's own commit; a datastore decides for itself whether that commit does
 //! blocking store I/O or is an in-memory no-op.
-//!
-//! A datastore's concrete backend (today only `datastore_delta::DeltaDatastore`)
-//! is recovered by server features specific to one format (compaction and
-//! introspection) through the `Datastore` downcast hooks.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -90,13 +86,13 @@ impl PivotCatalog {
     }
 
     /// The name of the default datastore.
-    pub fn default_name(&self) -> &str {
+    pub fn default_datastore_name(&self) -> &str {
         &self.default_name
     }
 
     /// Every datastore, name and handle: for wiring the planner's attach list
     /// and for introspection.
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &Arc<dyn Datastore>)> {
+    pub fn iter_datastores(&self) -> impl Iterator<Item = (&String, &Arc<dyn Datastore>)> {
         self.datastores.iter()
     }
 
