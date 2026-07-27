@@ -114,7 +114,7 @@ use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::group::hashtables::{
     AggregatedTable, AggregatedTableOutput, DEFAULT_CAPACITY, MAX_LOAD_FACTOR, MultiSlabTable,
-    PartitionBuffers, RadixConfig,
+    PartitionBuffers, RadixConfig, entry_stride,
 };
 use crate::waker::waker_set;
 use crate::worker::current_node;
@@ -589,13 +589,11 @@ impl<K: KeyExtractor, V: AggregationValue> GroupOutputter<K, V> {
         // entry width, a wide multi-column key (fat entries) targets fewer groups
         // per job than a bare integer key.
         const TARGET_MERGE_PARTITION_BYTES: usize = 256 * 1024; // ~one core's L2
-        // Approximate bytes per table entry: hash + key + the stored value
-        // (whose size may be a query-time fact, e.g. a runtime-arity
-        // signature's cell run). Padding is ignored; this is a sizing
-        // heuristic, not a layout.
-        let entry_bytes = size_of::<u64>()
-            + size_of::<K::Persisted>()
-            + V::stored_size(V::stored_meta(&self.shared_context));
+        // The exact bytes per table entry (hash + key + stored value with
+        // their padding), as the tables themselves lay it out. Undersizing
+        // this inflates the per-partition group target and produces fewer,
+        // larger merge targets that fall out of cache.
+        let entry_bytes = entry_stride::<K::Persisted, V>(&self.shared_context);
         let target_groups_per_partition =
             (TARGET_MERGE_PARTITION_BYTES / entry_bytes.max(1)).max(1);
         let (num_partitions, partition_capacity) = if !any_switched {

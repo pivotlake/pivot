@@ -131,6 +131,12 @@ struct EntryLayout {
     align: usize,
 }
 
+/// The exact bytes one table entry occupies for this key type and signature,
+/// for entry-footprint heuristics (merge-partition sizing).
+pub fn entry_stride<K, V: AggregationValue>(ctx: &V::SharedContext) -> usize {
+    entry_layout::<K, V>(V::stored_meta(ctx)).stride
+}
+
 fn entry_layout<K, V: AggregationValue>(meta: V::StoredMeta) -> EntryLayout {
     // (alignment, size) per field, in hash, key, value order.
     let fields = [
