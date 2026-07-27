@@ -61,7 +61,7 @@ impl<P: PersistedKey + PartialEq> LiveKey for P {
 
 /// A borrowed read of one occupied table entry: its hash, persisted key, and
 /// stored value. What [`BaseHashTable::iter`] yields and
-/// [`BaseHashTable::view_at`] returns. A view rather than a struct reference
+/// [`TableReader::view_at`] returns. A view rather than a struct reference
 /// because an entry is a byte region at a per-table stride, not a Rust struct
 /// (the stride is a runtime value; see [`BaseHashTable`]).
 pub struct EntryView<'a, K, S: ?Sized> {
@@ -435,27 +435,6 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
         self.entry_ptr_in(&self.bases, index)
     }
 
-    /// The stored hash at slot `index` (0 = empty slot).
-    #[inline(always)]
-    pub fn hash_at(&self, index: usize) -> u64 {
-        unsafe { *(self.entry_ptr(index).add(self.hash_offset) as *const u64) }
-    }
-
-    /// A borrowed view of the entry at slot `index`. The caller must only read
-    /// `key`/`stored` of an occupied slot (`hash != 0`); an empty slot's view is
-    /// zeroed bytes.
-    #[inline(always)]
-    pub fn view_at(&self, index: usize) -> EntryView<'_, K, V::Stored> {
-        let entry = self.entry_ptr(index);
-        unsafe {
-            EntryView {
-                hash: *(entry.add(self.hash_offset) as *const u64),
-                key: &*(entry.add(self.key_offset) as *const K),
-                stored: V::stored_ref(entry.add(self.value_offset), self.meta),
-            }
-        }
-    }
-
     /// Prefetch the hash table slot where `hash` would land, plus the next cache line
     /// to cover short probe chains. Brings the lines all the way into L1 (`T0`) —
     /// use this *near* the access (small lookahead).
@@ -467,31 +446,60 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
         prefetch_l1_line(ptr.wrapping_add(128));
     }
 
-    /// Prefetch the slot's cache line into L2 (`T1`) only. Issued *far* ahead of
-    /// the access and paired with a nearer [`prefetch`](Self::prefetch) (L1) call, this
-    /// software-pipelines the memory hierarchy: the line is pulled DRAM→L2 far
-    /// ahead, then L2→L1 just before use, hiding the full DRAM latency that a
-    /// single L1 prefetch at a short distance can't cover on a multi-GB table.
-    #[inline]
-    pub fn prefetch_l2(&self, hash: u64) {
-        let ptr = self.entry_ptr(self.slot_for(hash)) as *const u8;
-        prefetch_l2_line(ptr);
-    }
-
     /// Returns an iterator over all non-empty entries in the table.
     ///
     /// Iteration order is arbitrary (based on slot positions, not insertion order).
     /// Empty slots (hash == 0) are skipped automatically.
     pub fn iter(&self, start_offset: usize) -> HashTableIterator<'_, K, V> {
         HashTableIterator {
-            hash_table: self,
+            geo: self.geometry(),
             idx: start_offset,
+            _table: PhantomData,
         }
     }
 
     /// Returns `true` if the table has exceeded its [`MAX_LOAD_FACTOR`] threshold.
     pub fn undersized(&self) -> bool {
         self.len() > self.max_load
+    }
+
+    /// A register-resident snapshot of this table's entry layout and probe
+    /// parameters (see [`Geometry`]).
+    #[inline(always)]
+    fn geometry(&self) -> Geometry<K, V> {
+        Geometry {
+            magic: self.entries_per_slab_magic,
+            stride: self.stride,
+            hash_offset: self.hash_offset,
+            key_offset: self.key_offset,
+            value_offset: self.value_offset,
+            mask: self.mask,
+            shift: self.shift,
+            pre_shift: self.pre_shift,
+            bases: self.bases.as_ptr(),
+            bases_len: self.bases.len(),
+            meta: self.meta,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// A probing handle that holds the table's [`Geometry`] in locals for the
+    /// duration of a consume window, so the per-row probe reads its layout
+    /// constants from registers (see [`Prober`]).
+    #[inline(always)]
+    pub fn prober(&mut self) -> Prober<'_, K, V> {
+        let geo = self.geometry();
+        Prober { table: self, geo }
+    }
+
+    /// A read handle with the same register-resident [`Geometry`], for the
+    /// merge phase's linear slot scans.
+    #[inline(always)]
+    pub fn reader(&self) -> TableReader<'_, K, V> {
+        TableReader {
+            geo: self.geometry(),
+            _table: PhantomData,
+        }
     }
 
     /// Insert or fold an *owned* value — the radix scatter rows' aggregation
@@ -580,7 +588,7 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
     #[inline(always)]
     pub fn probe_fold<const COUNT_COLLISIONS: bool, L, X, S, U>(
         &mut self,
-        mut hash: u64,
+        hash: u64,
         key: L,
         ctx: X,
         seed: S,
@@ -590,33 +598,8 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
         S: FnOnce(X, &mut V::Stored),
         U: FnOnce(X, &mut V::Stored),
     {
-        // hash == 0 is our empty sentinel, so remap actual zero hashes to 1.
-        if hash == 0 {
-            hash = 1;
-        }
-        let mut idx = self.slot_for(hash);
-        loop {
-            let entry = self.entry_ptr(idx);
-            unsafe {
-                let hash_ptr = entry.add(self.hash_offset) as *mut u64;
-                if *hash_ptr == 0 {
-                    *hash_ptr = hash;
-                    (entry.add(self.key_offset) as *mut K).write(key.persist());
-                    self.length += 1;
-                    seed(ctx, V::stored_mut(entry.add(self.value_offset), self.meta));
-                    return;
-                }
-                if *hash_ptr == hash && key.eq_persisted(&*(entry.add(self.key_offset) as *const K))
-                {
-                    update(ctx, V::stored_mut(entry.add(self.value_offset), self.meta));
-                    return;
-                }
-            }
-            if COUNT_COLLISIONS {
-                self.collisions += 1;
-            }
-            idx = (idx + 1) & self.mask;
-        }
+        self.prober()
+            .probe_fold::<COUNT_COLLISIONS, L, X, S, U>(hash, key, ctx, seed, update);
     }
 
     /// Rehash all entries into fresh zeroed slabs of `new_size` slots.
@@ -667,33 +650,198 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
     }
 }
 
+/// A register-resident snapshot of a table's entry layout and probe
+/// parameters. These are all runtime values (the whole point of the strided
+/// table), so hot loops that touched them through `&self` would re-load them
+/// from memory constantly — the probe writes entries through raw pointers,
+/// which the compiler must assume may alias the table's own fields. A
+/// `Geometry` is plain `Copy` locals, immune to that: snapshotted once per
+/// call (or once per consume window via [`Prober`]), it keeps the layout in
+/// registers exactly as a compile-time layout would be immediates.
+///
+/// The `bases` pointer is valid while the table's slabs are untouched; every
+/// holder ties itself to the table with a borrow, and nothing resizes a table
+/// while a snapshot of it is live.
+struct Geometry<K, V: AggregationValue> {
+    magic: u64,
+    stride: usize,
+    hash_offset: usize,
+    key_offset: usize,
+    value_offset: usize,
+    mask: usize,
+    shift: u32,
+    pre_shift: u32,
+    bases: *const usize,
+    bases_len: usize,
+    meta: V::StoredMeta,
+    _phantom: PhantomData<K>,
+}
+
+impl<K, V: AggregationValue> Clone for Geometry<K, V> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<K, V: AggregationValue> Copy for Geometry<K, V> {}
+
+impl<K, V: AggregationValue> Geometry<K, V> {
+    /// Map a hash to a slot index using the top bits.
+    #[inline(always)]
+    fn slot_for(&self, hash: u64) -> usize {
+        ((hash << self.pre_shift) >> self.shift) as usize
+    }
+
+    /// The address of the entry at `index`; see
+    /// [`BaseHashTable::entry_ptr_in`].
+    #[inline(always)]
+    fn entry_ptr(&self, index: usize) -> *mut u8 {
+        let slab_idx = fast_div(index, self.magic);
+        assert!(slab_idx < self.bases_len);
+        let base = unsafe { *self.bases.add(slab_idx) };
+        base.wrapping_add(index * self.stride) as *mut u8
+    }
+
+    /// The view of the occupied entry at `entry`'s address, with `hash`
+    /// already read.
+    #[inline(always)]
+    unsafe fn view<'a>(&self, entry: *const u8, hash: u64) -> EntryView<'a, K, V::Stored> {
+        unsafe {
+            EntryView {
+                hash,
+                key: &*(entry.add(self.key_offset) as *const K),
+                stored: V::stored_ref(entry.add(self.value_offset), self.meta),
+            }
+        }
+    }
+}
+
+/// A probing handle over a mutably borrowed table, carrying its [`Geometry`]
+/// in locals. The consume loop creates one per active table and probes through
+/// it row after row, so the layout constants are read once per window, not
+/// re-loaded per row and per probe step.
+pub struct Prober<'t, K: PersistedKey, V: AggregationValue> {
+    table: &'t mut BaseHashTable<K, V>,
+    geo: Geometry<K, V>,
+}
+
+impl<K: PersistedKey, V: AggregationValue> Prober<'_, K, V> {
+    /// See [`BaseHashTable::prefetch`].
+    #[inline(always)]
+    pub fn prefetch(&self, hash: u64) {
+        let ptr = self.geo.entry_ptr(self.geo.slot_for(hash)) as *const u8;
+        prefetch_l1_line(ptr);
+        prefetch_l1_line(ptr.wrapping_add(64));
+        prefetch_l1_line(ptr.wrapping_add(128));
+    }
+
+    /// See [`BaseHashTable::prefetch_l2`].
+    #[inline(always)]
+    pub fn prefetch_l2(&self, hash: u64) {
+        prefetch_l2_line(self.geo.entry_ptr(self.geo.slot_for(hash)) as *const u8);
+    }
+
+    /// See [`BaseHashTable::undersized`].
+    #[inline(always)]
+    pub fn undersized(&self) -> bool {
+        self.table.undersized()
+    }
+
+    /// See [`BaseHashTable::probe_fold`]; this is its implementation, reading
+    /// the layout off the snapshot.
+    #[inline(always)]
+    pub fn probe_fold<const COUNT_COLLISIONS: bool, L, X, S, U>(
+        &mut self,
+        mut hash: u64,
+        key: L,
+        ctx: X,
+        seed: S,
+        update: U,
+    ) where
+        L: LiveKey<Persisted = K>,
+        S: FnOnce(X, &mut V::Stored),
+        U: FnOnce(X, &mut V::Stored),
+    {
+        let geo = self.geo;
+        // hash == 0 is our empty sentinel, so remap actual zero hashes to 1.
+        if hash == 0 {
+            hash = 1;
+        }
+        let mut idx = geo.slot_for(hash);
+        loop {
+            let entry = geo.entry_ptr(idx);
+            unsafe {
+                let hash_ptr = entry.add(geo.hash_offset) as *mut u64;
+                if *hash_ptr == 0 {
+                    *hash_ptr = hash;
+                    (entry.add(geo.key_offset) as *mut K).write(key.persist());
+                    self.table.length += 1;
+                    seed(ctx, V::stored_mut(entry.add(geo.value_offset), geo.meta));
+                    return;
+                }
+                if *hash_ptr == hash && key.eq_persisted(&*(entry.add(geo.key_offset) as *const K))
+                {
+                    update(ctx, V::stored_mut(entry.add(geo.value_offset), geo.meta));
+                    return;
+                }
+            }
+            if COUNT_COLLISIONS {
+                self.table.collisions += 1;
+            }
+            idx = (idx + 1) & geo.mask;
+        }
+    }
+}
+
+/// A read handle over a borrowed table, carrying its [`Geometry`] in locals:
+/// the merge phase's linear slot scans read thousands of consecutive slots, so
+/// they too keep the layout in registers.
+pub struct TableReader<'a, K: PersistedKey, V: AggregationValue> {
+    geo: Geometry<K, V>,
+    _table: PhantomData<&'a BaseHashTable<K, V>>,
+}
+
+impl<'a, K: PersistedKey, V: AggregationValue> TableReader<'a, K, V> {
+    /// See [`BaseHashTable::hash_at`].
+    #[inline(always)]
+    pub fn hash_at(&self, index: usize) -> u64 {
+        unsafe { *(self.geo.entry_ptr(index).add(self.geo.hash_offset) as *const u64) }
+    }
+
+    /// See [`BaseHashTable::view_at`].
+    #[inline(always)]
+    pub fn view_at(&self, index: usize) -> EntryView<'a, K, V::Stored> {
+        let entry = self.geo.entry_ptr(index);
+        unsafe {
+            let hash = *(entry.add(self.geo.hash_offset) as *const u64);
+            self.geo.view(entry, hash)
+        }
+    }
+}
+
 /// An iterator over the non-empty entries in a `BaseHashTable`.
 ///
 /// Created by [`BaseHashTable::iter`]. Yields [`EntryView`]s of entries where
 /// `hash != 0` in arbitrary order (based on slot positions, not insertion order).
 pub struct HashTableIterator<'a, K: PersistedKey, V: AggregationValue> {
-    hash_table: &'a BaseHashTable<K, V>,
+    geo: Geometry<K, V>,
     idx: usize,
+    _table: PhantomData<&'a BaseHashTable<K, V>>,
 }
 
 impl<'a, K: PersistedKey, V: AggregationValue> Iterator for HashTableIterator<'a, K, V> {
     type Item = EntryView<'a, K, V::Stored>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let table = self.hash_table;
-        while self.idx < table.mask + 1 {
+        let geo = self.geo;
+        while self.idx < geo.mask + 1 {
             // One address computation per slot: the hash check and the yielded
             // view read the same entry pointer.
-            let entry = table.entry_ptr(self.idx);
+            let entry = geo.entry_ptr(self.idx);
             self.idx += 1;
             unsafe {
-                let hash = *(entry.add(table.hash_offset) as *const u64);
+                let hash = *(entry.add(geo.hash_offset) as *const u64);
                 if hash != 0 {
-                    return Some(EntryView {
-                        hash,
-                        key: &*(entry.add(table.key_offset) as *const K),
-                        stored: V::stored_ref(entry.add(table.value_offset), table.meta),
-                    });
+                    return Some(geo.view(entry, hash));
                 }
             }
         }
@@ -996,11 +1144,11 @@ mod tests {
         table.merge::<false, _>(42, 100u64, Count(1), &());
 
         let occupied: Vec<usize> = (0..table.capacity())
-            .filter(|&i| table.hash_at(i) != 0)
+            .filter(|&i| table.reader().hash_at(i) != 0)
             .collect();
 
         assert_eq!(occupied.len(), 1);
-        assert_eq!(*table.view_at(occupied[0]).key, 100);
+        assert_eq!(*table.reader().view_at(occupied[0]).key, 100);
     }
 
     #[test]

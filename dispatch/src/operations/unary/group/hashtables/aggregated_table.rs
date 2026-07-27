@@ -263,53 +263,73 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
         const L2_DISTANCE: usize = 48;
         let mut i = 0;
         while i < length {
-            let hash = self.hashes[i];
-            // Keys-only exact COUNT(DISTINCT): a 0 hash collides with the
-            // empty-slot sentinel, so don't store it (the table would remap it to
-            // 1 and alias a real key) — count it out of band instead. At most one
-            // key hashes to 0 (the hash is a bijection), so the flag adds 1 at
-            // output. Const-gated: zero cost for every other group-by.
-            if K::DEDUP_BY_HASH && hash == 0 {
-                self.zero_hash_seen = true;
-                i += 1;
-                continue;
-            }
+            // Probe through one `Prober` until the active table overflows
+            // (rare), so its entry layout lives in registers across rows
+            // instead of being re-loaded per row and per probe step.
             let overflowed = {
-                let table = self.tables.last_mut().unwrap();
-                if i + L2_DISTANCE < length {
-                    table.prefetch_l2(self.hashes[i + L2_DISTANCE]);
+                let Self {
+                    tables,
+                    key_arena,
+                    worker_context,
+                    hashes,
+                    zero_hash_seen,
+                    ..
+                } = self;
+                let mut prober = tables.last_mut().unwrap().prober();
+                let mut overflowed = false;
+                while i < length {
+                    let hash = hashes[i];
+                    // Keys-only exact COUNT(DISTINCT): a 0 hash collides with the
+                    // empty-slot sentinel, so don't store it (the table would remap
+                    // it to 1 and alias a real key) — count it out of band instead.
+                    // At most one key hashes to 0 (the hash is a bijection), so the
+                    // flag adds 1 at output. Const-gated: zero cost for every other
+                    // group-by.
+                    if K::DEDUP_BY_HASH && hash == 0 {
+                        *zero_hash_seen = true;
+                        i += 1;
+                        continue;
+                    }
+                    if i + L2_DISTANCE < length {
+                        prober.prefetch_l2(hashes[i + L2_DISTANCE]);
+                    }
+                    if i + L1_DISTANCE < length {
+                        prober.prefetch(hashes[i + L1_DISTANCE]);
+                    }
+                    // Probe and fold in one pass. The live key persists into the key
+                    // arena; the value's write state (`&mut self.worker_context`) is
+                    // handed to whichever arm runs — `seed` materialises a new group's
+                    // value, `update` folds the row into an existing one (a string
+                    // extreme persists only if it wins). When `V::WorkerContext` is `()`
+                    // (a string-free `Compiled` signature) this threads `&mut ()` —
+                    // free, with nothing in the loop that can alias the table it
+                    // mutates; a string extreme threads its `WorkerArena` to store the
+                    // winning string.
+                    let key = K::live_key(key_reader, i, key_arena);
+                    prober.probe_fold::<false, _, _, _, _>(
+                        hash,
+                        key,
+                        &mut *worker_context,
+                        |wc, stored| V::seed_stored(stored, value_reader, i, wc),
+                        |wc, stored| V::update_stored(stored, value_reader, i, wc, shared_context),
+                    );
+                    i += 1;
+                    if prober.undersized() {
+                        overflowed = true;
+                        break;
+                    }
                 }
-                if i + L1_DISTANCE < length {
-                    table.prefetch(self.hashes[i + L1_DISTANCE]);
-                }
-                // Probe and fold in one pass. The live key persists into the key
-                // arena; the value's write state (`&mut self.worker_context`) is
-                // handed to whichever arm runs — `seed` materialises a new group's
-                // value, `update` folds the row into an existing one (a string
-                // extreme persists only if it wins). When `V::WorkerContext` is `()`
-                // (a string-free `Compiled` signature) this threads `&mut ()` —
-                // free, with nothing in the loop that can alias the table it
-                // mutates; a string extreme threads its `WorkerArena` to store the
-                // winning string.
-                let key = K::live_key(key_reader, i, &mut self.key_arena);
-                table.probe_fold::<false, _, _, _, _>(
-                    hash,
-                    key,
-                    &mut self.worker_context,
-                    |wc, stored| V::seed_stored(stored, value_reader, i, wc),
-                    |wc, stored| V::update_stored(stored, value_reader, i, wc, shared_context),
-                );
-                table.undersized()
+                overflowed
             };
             // On overflow take the radix route. For a scatter-route key this returns
-            // `true`: scatter the rest of the batch raw and stop probing. For an
-            // abandon-route key (or a plain in-place grow) it returns `false` and we
-            // keep probing into the reset/grown table.
+            // `true`: scatter the rest of the batch raw (the overflowing row is
+            // already folded) and stop probing. For an abandon-route key (or a
+            // plain in-place grow) it returns `false` and we keep probing into the
+            // reset/grown table.
             if overflowed && self.grow_or_radix() {
-                self.scatter_range(i + 1, length, key_reader, value_reader);
+                self.scatter_range(i, length, key_reader, value_reader);
                 return;
             }
-            i += 1;
         }
     }
 

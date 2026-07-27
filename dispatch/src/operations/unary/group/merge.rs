@@ -98,15 +98,18 @@ fn merge_within_partition_bounds<K: KeyExtractor, V: AggregationValue>(
         let range = std::cmp::min(SCAN_BATCH_SIZE, end - i);
 
         for table in tables {
+            // The scan touches `range` consecutive slots; read them through
+            // one geometry snapshot so the source layout stays in registers.
+            let source = table.reader();
             for j in i..i + range {
                 if j + PREFETCH_DISTANCE < slot_count {
                     // Prefetch unconditionally: `slot_for(0)` is a valid slot and
                     // a prefetch is only a hint, so dropping the `!= 0` guard
                     // removes a ~70/30-biased (load-factor) branch from this hot
                     // inner loop, which dominated the merge's branch mispredicts.
-                    target.prefetch(table.hash_at(j + PREFETCH_DISTANCE));
+                    target.prefetch(source.hash_at(j + PREFETCH_DISTANCE));
                 }
-                let entry = table.view_at(j);
+                let entry = source.view_at(j);
                 let h = entry.hash;
                 // Single non-short-circuiting `&` so this is one branch instead of
                 // two: both the empty-slot test (`h != 0`) and the partition test
@@ -149,9 +152,10 @@ fn merge_past_partition_bounds<K: KeyExtractor, V: AggregationValue>(
     let mask = slot_count - 1;
 
     for table in tables {
+        let source = table.reader();
         let mut i = end & mask;
         loop {
-            let entry = table.view_at(i);
+            let entry = source.view_at(i);
             let h = entry.hash;
             if h == 0 {
                 break;
