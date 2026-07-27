@@ -277,8 +277,12 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
         idx: usize,
         wc: &mut WorkerArena,
     ) {
-        let dst: &mut [A; N] = dst.try_into().unwrap();
-        let reader: &[BoundSlot<'_>; N] = reader.try_into().unwrap();
+        // Safety: the dispatching caller matched both lengths against `N`;
+        // this runs once per row, so the re-checks `try_into` would emit are
+        // paid-for work.
+        debug_assert!(dst.len() == N && reader.len() == N);
+        let dst = unsafe { &mut *(dst.as_mut_ptr() as *mut [A; N]) };
+        let reader = unsafe { &*(reader.as_ptr() as *const [BoundSlot<'_>; N]) };
         for s in 0..N {
             dst[s] = seed_slot::<A, ONLY_ADDITIVE>(&reader[s], idx, wc);
         }
@@ -294,8 +298,10 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
         wc: &mut WorkerArena,
         shared: &Arc<SharedArena>,
     ) {
-        let dst: &mut [A; N] = dst.try_into().unwrap();
-        let reader: &[BoundSlot<'_>; N] = reader.try_into().unwrap();
+        // Safety: as in `seed_fixed`.
+        debug_assert!(dst.len() == N && reader.len() == N);
+        let dst = unsafe { &mut *(dst.as_mut_ptr() as *mut [A; N]) };
+        let reader = unsafe { &*(reader.as_ptr() as *const [BoundSlot<'_>; N]) };
         for s in 0..N {
             dst[s] = update_slot::<A, ONLY_ADDITIVE>(dst[s], &reader[s], idx, wc, shared);
         }
@@ -310,8 +316,11 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
         ctx: &(Arc<[AggregationSlot]>, Arc<SharedArena>),
     ) {
         let (slots, shared) = ctx;
-        let dst: &mut [A; N] = dst.try_into().unwrap();
-        let src: &[A; N] = src.try_into().unwrap();
+        // Safety: as in `seed_fixed` (`src` and `slots` share the signature's
+        // slot count with `dst`).
+        debug_assert!(dst.len() == N && src.len() == N && slots.len() == N);
+        let dst = unsafe { &mut *(dst.as_mut_ptr() as *mut [A; N]) };
+        let src = unsafe { &*(src.as_ptr() as *const [A; N]) };
         for s in 0..N {
             dst[s] = if ONLY_ADDITIVE {
                 // All-additive: `Count` and every `Sum` merge by `+`, so skip
@@ -327,8 +336,10 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
     /// an array assignment instead of a `memmove` call.
     #[inline(always)]
     fn clone_fixed<const N: usize>(dst: &mut [A], src: &[A]) {
-        let dst: &mut [A; N] = dst.try_into().unwrap();
-        let src: &[A; N] = src.try_into().unwrap();
+        // Safety: as in `seed_fixed`.
+        debug_assert!(dst.len() == N && src.len() == N);
+        let dst = unsafe { &mut *(dst.as_mut_ptr() as *mut [A; N]) };
+        let src = unsafe { &*(src.as_ptr() as *const [A; N]) };
         *dst = *src;
     }
 }
