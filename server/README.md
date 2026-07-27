@@ -44,7 +44,9 @@ of unqualified table names). Every datastore is attached as
 a database of its own name, so a query reads any other one by qualifying it:
 `SELECT * FROM warm.main.tbl`. `kind` is the datastore format (`delta` today); the
 storage backend is inferred from `location` (a plain path is local, an `s3://`
-URI is S3):
+URI is S3). Compaction is configured per datastore with `compact` (and the
+optional `compact_bytes` / `compact_min_files` tuning); it is off by default and
+should run in only one process per datastore:
 
 ```toml
 [datastore.hot]
@@ -55,6 +57,8 @@ default = true                     # the current database
 [datastore.warm]
 kind = "delta"
 location = "s3://analytics/warm/"  # s3:// -> S3 store
+compact = true                     # this datastore compacts itself
+compact_bytes = "128m"
 region = "us-east-1"
 access_key_id = "AKIA..."
 secret_access_key = "..."

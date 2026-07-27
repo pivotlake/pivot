@@ -11,7 +11,6 @@ use std::time::Duration;
 
 use catalog::PivotCatalog;
 use clap::Parser;
-use datastore_delta::{CompactionConfig, MaintenanceConfig};
 use dispatch::env::get_env_var_with_default;
 use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
 use metastore::Metastore;
@@ -59,37 +58,6 @@ struct Args {
     /// object (only with `--disk-cache-dir`). Keep below the process's fd limit.
     #[arg(long, default_value_t = 65536, value_name = "N")]
     disk_cache_max_objects: usize,
-
-    /// Run bundled compaction (OFF by default), with one independent compacter
-    /// per Delta datastore. Each compacter merges and then deletes its tables'
-    /// small Parquet files, so it mutates that datastore; leave it off for a
-    /// read-only server or external reader, and enable it in only one process
-    /// per datastore. The `--compact-*` tuning flags require this.
-    #[arg(long)]
-    compact: bool,
-
-    /// Per-table byte threshold each compacter merges small Parquet files up to
-    /// (CPU on the shared dispatch pool), once they amount to it. Requires
-    /// `--compact`.
-    #[arg(
-        long,
-        default_value_t = datastore_delta::DEFAULT_COMPACT_BYTES,
-        requires = "compact",
-        value_name = "BYTES"
-    )]
-    compact_bytes: u64,
-
-    /// Compacter count trigger for low-traffic partitions: merge a sub-target
-    /// partition's small files once this many accumulate (even below
-    /// `--compact-bytes`). Lower means fewer tiny files per partition and more
-    /// frequent sub-target merges. Requires `--compact`.
-    #[arg(
-        long,
-        default_value_t = datastore_delta::DEFAULT_MIN_FILES_TO_MERGE,
-        requires = "compact",
-        value_name = "N"
-    )]
-    compact_min_files: usize,
 
     /// Also serve the bundled web dashboard (data-flow graph, live compaction
     /// stats, system metrics, SQL console) on this address. Omit to disable.
@@ -180,30 +148,16 @@ fn build_disk_cache(args: &Args) -> Option<Arc<dispatch::io::DiskCache>> {
     }
 }
 
-/// The background maintenance each opened datastore self-manages, built from the
-/// CLI flags: the catalog-refresh cadence, plus compaction (target size and
-/// low-traffic count trigger) when `--compact` is set. Each datastore spawns its
-/// own refresh and (optional) compaction tasks from this.
-fn maintenance_config(args: &Args) -> MaintenanceConfig {
-    let compaction = args.compact.then(|| CompactionConfig {
-        target_bytes: args.compact_bytes,
-        min_files: args.compact_min_files,
-        poll_interval: datastore_delta::DEFAULT_COMPACT_POLL,
-    });
-    MaintenanceConfig {
-        refresh_interval: Duration::from_secs(args.catalog_refresh_secs),
-        compaction,
-    }
-}
-
 /// Open every datastore from the required metastore file and assemble them into
-/// one composite catalog. Each datastore self-manages the maintenance built from
-/// the CLI flags, spawning its background tasks onto the ambient runtime, so this
-/// must run inside `rt.block_on`. Exits the process on any open failure; there is
-/// nothing to serve without it.
+/// one composite catalog. Each datastore self-manages its maintenance (the global
+/// refresh cadence plus its own per-datastore compaction from the metastore file),
+/// spawning its background tasks onto the ambient runtime, so this must run inside
+/// `rt.block_on`. Exits the process on any open failure; there is nothing to serve
+/// without it.
 fn build_catalog(args: &Args, dispatcher: &DataFlowDispatcher) -> Arc<PivotCatalog> {
     let path = &args.metastore;
-    let store = TomlMetastore::open(path, maintenance_config(args)).unwrap_or_else(|e| {
+    let refresh_interval = Duration::from_secs(args.catalog_refresh_secs);
+    let store = TomlMetastore::open(path, refresh_interval).unwrap_or_else(|e| {
         error!("failed to read metastore `{}`: {e}", path.display());
         std::process::exit(1);
     });

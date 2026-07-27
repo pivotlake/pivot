@@ -33,10 +33,14 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use catalog::Datastore;
 use datastore_delta::store::{LocalStore, ObjectStore, S3Credentials, S3Store};
-use datastore_delta::{DeltaDatastore, MaintenanceConfig};
+use datastore_delta::{
+    CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL, DEFAULT_MIN_FILES_TO_MERGE,
+    DeltaDatastore, MaintenanceConfig,
+};
 use dispatch::DataFlowDispatcher;
 use metastore::Metastore;
 use serde::Deserialize;
@@ -52,26 +56,26 @@ const DEFAULT_S3_REGION: &str = "us-east-1";
 pub struct TomlMetastore {
     datastore_configs: HashMap<String, DatastoreConfig>,
     default_name: String,
-    /// Background maintenance every datastore this metastore opens self-manages
-    /// (refresh cadence and optional compaction). Passed straight through to
-    /// [`DeltaDatastore::from_store`].
-    maintenance: MaintenanceConfig,
+    /// How often every datastore this metastore opens refreshes its table set
+    /// from the store. Global (all datastores share the cadence); compaction, in
+    /// contrast, is configured per datastore.
+    refresh_interval: Duration,
 }
 
 impl TomlMetastore {
-    /// Read and parse the metastore file at `path`, applying `maintenance` to
-    /// every datastore it opens.
-    pub fn open(path: impl AsRef<Path>, maintenance: MaintenanceConfig) -> Result<Self> {
+    /// Read and parse the metastore file at `path`, applying `refresh_interval`
+    /// to every datastore it opens.
+    pub fn open(path: impl AsRef<Path>, refresh_interval: Duration) -> Result<Self> {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path).map_err(|source| Error::Read {
             path: path.display().to_string(),
             source,
         })?;
-        Self::from_toml(&text, &path.display().to_string(), maintenance)
+        Self::from_toml(&text, &path.display().to_string(), refresh_interval)
     }
 
     /// Parse metastore configuration from TOML text, using `path` in errors.
-    pub fn from_toml(text: &str, path: &str, maintenance: MaintenanceConfig) -> Result<Self> {
+    pub fn from_toml(text: &str, path: &str, refresh_interval: Duration) -> Result<Self> {
         let file: MetastoreFile = toml::from_str(text).map_err(|source| Error::Parse {
             path: path.to_string(),
             source,
@@ -92,7 +96,7 @@ impl TomlMetastore {
         Ok(Self {
             datastore_configs: file.datastore,
             default_name,
-            maintenance,
+            refresh_interval,
         })
     }
 
@@ -104,12 +108,16 @@ impl TomlMetastore {
             .iter()
             .map(|(name, config)| {
                 let store = config.open_store(name)?;
+                let maintenance = MaintenanceConfig {
+                    refresh_interval: self.refresh_interval,
+                    compaction: config.compaction(name)?,
+                };
                 let datastore: Arc<dyn Datastore> = match config.kind {
                     DatastoreKind::Delta => DeltaDatastore::from_store(
                         name.clone(),
                         store,
                         dispatcher,
-                        Some(self.maintenance.clone()),
+                        Some(maintenance),
                     )?,
                 };
                 Ok((name.clone(), datastore))
@@ -179,6 +187,19 @@ struct DatastoreConfig {
     /// unqualified table names and DDL. Exactly one datastore must set it.
     #[serde(rename = "default", default)]
     is_default: bool,
+    /// Run this datastore's own background compaction. Off by default; the
+    /// `compact_*` tuning fields apply only when it is on. Compaction rewrites a
+    /// table's small Parquet files, so enable it in only one process per
+    /// datastore.
+    #[serde(default)]
+    compact: bool,
+    /// Per-table byte threshold compaction merges small files up to (a size such
+    /// as `128m` or `1g`). Defaults to [`DEFAULT_COMPACT_BYTES`].
+    compact_bytes: Option<String>,
+    /// Count trigger for a low-traffic partition's small files (merge once this
+    /// many accumulate, even below `compact_bytes`). Defaults to
+    /// [`DEFAULT_MIN_FILES_TO_MERGE`].
+    compact_min_files: Option<usize>,
     region: Option<String>,
     access_key_id: Option<String>,
     secret_access_key: Option<String>,
@@ -186,6 +207,53 @@ struct DatastoreConfig {
     endpoint: Option<String>,
     #[serde(default)]
     source: CredentialSource,
+}
+
+impl DatastoreConfig {
+    /// This datastore's compaction settings, or `None` when `compact` is off.
+    /// Parses `compact_bytes` and fills the tuning fields' defaults.
+    fn compaction(&self, name: &str) -> Result<Option<CompactionConfig>> {
+        if !self.compact {
+            return Ok(None);
+        }
+        let target_bytes = match &self.compact_bytes {
+            Some(size) => parse_byte_size(size).map_err(|message| Error::Datastore {
+                name: name.to_string(),
+                message,
+            })?,
+            None => DEFAULT_COMPACT_BYTES,
+        };
+        Ok(Some(CompactionConfig {
+            target_bytes,
+            min_files: self.compact_min_files.unwrap_or(DEFAULT_MIN_FILES_TO_MERGE),
+            poll_interval: DEFAULT_COMPACT_POLL,
+        }))
+    }
+}
+
+/// Parse a human-readable byte size such as `128m`, `1g`, or `4096` into a byte
+/// count. Accepts an optional base-1024 suffix (`k`/`m`/`g`/`t`, each also with a
+/// trailing `b`), case-insensitive; a bare number is bytes.
+fn parse_byte_size(input: &str) -> std::result::Result<u64, String> {
+    let trimmed = input.trim();
+    let digits_end = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (number, suffix) = trimmed.split_at(digits_end);
+    let value: u64 = number
+        .parse()
+        .map_err(|_| format!("`{input}` is not a valid size"))?;
+    let multiplier: u64 = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" => 1024,
+        "m" | "mb" => 1024 * 1024,
+        "g" | "gb" => 1024 * 1024 * 1024,
+        "t" | "tb" => 1024 * 1024 * 1024 * 1024,
+        other => return Err(format!("`{other}` is not a known size suffix (k/m/g/t)")),
+    };
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("`{input}` overflows a byte count"))
 }
 
 /// The datastore format. Only [`Delta`](Self::Delta) is supported today; adding
@@ -262,13 +330,27 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// A no-compaction maintenance config for the parse tests, which never open
-    /// datastores and so never act on it.
-    fn test_maintenance() -> MaintenanceConfig {
-        MaintenanceConfig {
-            refresh_interval: Duration::from_secs(30),
-            compaction: None,
-        }
+    #[test]
+    fn compaction_is_per_datastore() {
+        let toml = r#"
+            [datastore.hot]
+            kind = "delta"
+            location = "/tmp/hot"
+            default = true
+            compact = true
+            compact_bytes = "128m"
+
+            [datastore.warm]
+            kind = "delta"
+            location = "/tmp/warm"
+        "#;
+
+        let store = TomlMetastore::from_toml(toml, "test", Duration::from_secs(30)).unwrap();
+
+        let hot = store.datastore_configs["hot"].compaction("hot").unwrap();
+        let warm = store.datastore_configs["warm"].compaction("warm").unwrap();
+        assert_eq!(hot.unwrap().target_bytes, 128 * 1024 * 1024);
+        assert!(warm.is_none());
     }
 
     #[test]
@@ -279,7 +361,7 @@ mod tests {
             location = "/tmp/warm"
         "#;
 
-        let result = TomlMetastore::from_toml(toml, "test", test_maintenance());
+        let result = TomlMetastore::from_toml(toml, "test", Duration::from_secs(30));
 
         assert!(matches!(result, Err(Error::MissingDefault)));
     }
@@ -292,7 +374,7 @@ mod tests {
             location = "/tmp/default"
         "#;
 
-        let result = TomlMetastore::from_toml(toml, "test", test_maintenance());
+        let result = TomlMetastore::from_toml(toml, "test", Duration::from_secs(30));
 
         assert!(matches!(result, Err(Error::Parse { .. })));
     }
@@ -311,7 +393,7 @@ mod tests {
             default = true
         "#;
 
-        let result = TomlMetastore::from_toml(toml, "test", test_maintenance());
+        let result = TomlMetastore::from_toml(toml, "test", Duration::from_secs(30));
 
         assert!(matches!(result, Err(Error::MultipleDefaults(names)) if names == ["hot", "warm"]));
     }
@@ -329,7 +411,7 @@ mod tests {
             location = "/tmp/warm"
         "#;
 
-        let store = TomlMetastore::from_toml(toml, "test", test_maintenance()).unwrap();
+        let store = TomlMetastore::from_toml(toml, "test", Duration::from_secs(30)).unwrap();
 
         assert_eq!(store.default_datastore_name(), "hot");
     }
@@ -347,7 +429,7 @@ mod tests {
             location = "s3://bucket/prefix"
         "#;
 
-        let store = TomlMetastore::from_toml(toml, "test", test_maintenance()).unwrap();
+        let store = TomlMetastore::from_toml(toml, "test", Duration::from_secs(30)).unwrap();
         let err = store.datastore_configs["warm"]
             .open_store("warm")
             .unwrap_err();
@@ -371,7 +453,7 @@ mod tests {
             secret_access_key = "secret"
         "#;
 
-        let store = TomlMetastore::from_toml(toml, "test", test_maintenance()).unwrap();
+        let store = TomlMetastore::from_toml(toml, "test", Duration::from_secs(30)).unwrap();
 
         assert!(
             store.datastore_configs["default"]
