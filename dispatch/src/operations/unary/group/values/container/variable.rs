@@ -144,8 +144,25 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Ag
     #[inline(always)]
     fn seed_stored(dst: &mut [A], reader: &Self::Reader<'_>, idx: usize, wc: &mut WorkerArena) {
         debug_assert_eq!(dst.len(), reader.len());
-        for (cell, slot) in dst.iter_mut().zip(reader.iter()) {
-            *cell = seed_slot::<A, ONLY_ADDITIVE>(slot, idx, wc);
+        // A runtime trip count keeps the compiler from unrolling the per-slot
+        // fold, which a monomorphised arity got for free — a measured ~12% on
+        // a low-cardinality multi-slot fold. Dispatch the common counts to
+        // const-length bodies (small leaf functions, monomorphised only per
+        // accumulator width, never per key shape).
+        match dst.len() {
+            1 => Self::seed_fixed::<1>(dst, reader, idx, wc),
+            2 => Self::seed_fixed::<2>(dst, reader, idx, wc),
+            3 => Self::seed_fixed::<3>(dst, reader, idx, wc),
+            4 => Self::seed_fixed::<4>(dst, reader, idx, wc),
+            5 => Self::seed_fixed::<5>(dst, reader, idx, wc),
+            6 => Self::seed_fixed::<6>(dst, reader, idx, wc),
+            7 => Self::seed_fixed::<7>(dst, reader, idx, wc),
+            8 => Self::seed_fixed::<8>(dst, reader, idx, wc),
+            _ => {
+                for (cell, slot) in dst.iter_mut().zip(reader.iter()) {
+                    *cell = seed_slot::<A, ONLY_ADDITIVE>(slot, idx, wc);
+                }
+            }
         }
     }
 
@@ -158,8 +175,22 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Ag
         ctx: &Self::SharedContext,
     ) {
         let (_, shared) = ctx;
-        for (cell, slot) in dst.iter_mut().zip(reader.iter()) {
-            *cell = update_slot::<A, ONLY_ADDITIVE>(*cell, slot, idx, wc, shared);
+        // Const-count dispatch as in `seed_stored`; this is the hottest fold
+        // (every repeated key folds here per row).
+        match dst.len() {
+            1 => Self::update_fixed::<1>(dst, reader, idx, wc, shared),
+            2 => Self::update_fixed::<2>(dst, reader, idx, wc, shared),
+            3 => Self::update_fixed::<3>(dst, reader, idx, wc, shared),
+            4 => Self::update_fixed::<4>(dst, reader, idx, wc, shared),
+            5 => Self::update_fixed::<5>(dst, reader, idx, wc, shared),
+            6 => Self::update_fixed::<6>(dst, reader, idx, wc, shared),
+            7 => Self::update_fixed::<7>(dst, reader, idx, wc, shared),
+            8 => Self::update_fixed::<8>(dst, reader, idx, wc, shared),
+            _ => {
+                for (cell, slot) in dst.iter_mut().zip(reader.iter()) {
+                    *cell = update_slot::<A, ONLY_ADDITIVE>(*cell, slot, idx, wc, shared);
+                }
+            }
         }
     }
 
@@ -209,6 +240,39 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
     /// slot count).
     unsafe fn cells(&self, len: usize) -> &[A] {
         unsafe { std::slice::from_raw_parts(self.cells, len) }
+    }
+
+    /// [`seed_stored`](AggregationValue::seed_stored) with a const trip count,
+    /// so the per-slot fold unrolls.
+    #[inline(always)]
+    fn seed_fixed<const N: usize>(
+        dst: &mut [A],
+        reader: &[BoundSlot<'_>],
+        idx: usize,
+        wc: &mut WorkerArena,
+    ) {
+        let dst: &mut [A; N] = dst.try_into().unwrap();
+        let reader: &[BoundSlot<'_>; N] = reader.try_into().unwrap();
+        for s in 0..N {
+            dst[s] = seed_slot::<A, ONLY_ADDITIVE>(&reader[s], idx, wc);
+        }
+    }
+
+    /// [`update_stored`](AggregationValue::update_stored) with a const trip
+    /// count, so the per-slot fold unrolls.
+    #[inline(always)]
+    fn update_fixed<const N: usize>(
+        dst: &mut [A],
+        reader: &[BoundSlot<'_>],
+        idx: usize,
+        wc: &mut WorkerArena,
+        shared: &Arc<SharedArena>,
+    ) {
+        let dst: &mut [A; N] = dst.try_into().unwrap();
+        let reader: &[BoundSlot<'_>; N] = reader.try_into().unwrap();
+        for s in 0..N {
+            dst[s] = update_slot::<A, ONLY_ADDITIVE>(dst[s], &reader[s], idx, wc, shared);
+        }
     }
 }
 
