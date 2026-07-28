@@ -565,8 +565,11 @@ struct ScatterWindow<'a, 'b, K: KeyExtractor, V: AggregationValue> {
 }
 
 impl<K: KeyExtractor, V: AggregationValue> ArityBody<()> for ScatterWindow<'_, '_, K, V> {
-    /// Outlined for the same reason as [`ProbeWindow::run`].
-    #[inline(never)]
+    /// Inlined, unlike [`ProbeWindow::run`]: the scatter loop keeps little
+    /// live state (no prober, no fold accumulators), so it tolerates the
+    /// shared frame, and measured suite-wide it wins from inlining where the
+    /// probe loop lost.
+    #[inline(always)]
     fn run<const N: usize>(self) {
         let ScatterWindow {
             buffers,
