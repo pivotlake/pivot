@@ -7,11 +7,9 @@ use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use crate::types::{Type, physical_arrow_type};
 use arrow_array::RecordBatch;
-use arrow_array::builder::StringViewBuilder;
 use arrow_schema::{Field, FieldRef};
 use parquet_variant::{VariantPath, VariantPathElement};
-use parquet_variant_compute::{GetOptions, VariantArray, unshred_variant, variant_get};
-use parquet_variant_json::VariantToJson as ToJson;
+use parquet_variant_compute::{GetOptions, variant_get};
 use std::fmt::{self, Display};
 use std::sync::Arc;
 
@@ -92,64 +90,6 @@ impl Display for VariantGet {
             write!(f, "::{ty}")?;
         }
         Ok(())
-    }
-}
-
-/// Converts variant output to JSON text.
-#[derive(Debug, Clone)]
-pub struct VariantToJson {
-    pub input: Box<Expression>,
-}
-
-impl VariantToJson {
-    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
-        let input_builder = self.input.compile()?;
-        Ok(Box::new(move || {
-            let mut input_expr = input_builder();
-            Box::new(move |batch: &RecordBatch| {
-                let input = input_expr(batch);
-                let (arr, _) = input.as_datum().get();
-                // `VariantArray` reads any physical layout, shredded or not,
-                // so batches from differently-shredded files render the same.
-                let variant =
-                    VariantArray::try_new(arr).expect("a variant-typed input is a variant struct");
-                // Row-wise rendering can't reassemble a shredded OBJECT from
-                // its typed leaves (`value()` only handles typed scalars), so
-                // fold the typed leaves back into the binary value column
-                // first. A no-op for unshredded input.
-                let variant = unshred_variant(&variant)
-                    .expect("shredded variant folds back to its binary form");
-
-                let mut json = StringViewBuilder::with_capacity(variant.len());
-                // One text buffer reused across rows, instead of a fresh
-                // `String` per rendered value.
-                let mut text = Vec::new();
-                for row in 0..variant.len() {
-                    if variant.is_null(row) {
-                        json.append_null();
-                        continue;
-                    }
-                    // Both failures are data-dependent (a corrupt metadata or
-                    // value blob); compiled expressions have no error channel,
-                    // so the dataflow catches the panic and fails the query.
-                    let value = variant
-                        .try_value(row)
-                        .unwrap_or_else(|e| panic!("corrupt variant value at row {row}: {e}"));
-                    text.clear();
-                    value
-                        .to_json(&mut text)
-                        .unwrap_or_else(|e| panic!("variant value failed to render as JSON: {e}"));
-                    json.append_value(std::str::from_utf8(&text).expect("JSON output is UTF-8"));
-                }
-                ExprResult::Array(Arc::new(json.finish()))
-            }) as ExprEvalFn
-        }))
-    }
-}
-
-impl Display for VariantToJson {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "to_json({})", self.input)
     }
 }
 

@@ -71,6 +71,10 @@ fn scalar_from_value(v: &ffi::Value) -> ScalarValue {
             }
         }
         L::VARCHAR => ScalarValue::Utf8(ffi::value_string(v)),
+        // A variant Value casts to VARCHAR as its raw text (DuckDB's
+        // variant-to-VARCHAR is a direct string conversion, not a JSON render),
+        // so `value_string` recovers the document the variant was built from.
+        L::VARIANT => ScalarValue::Variant(ffi::value_string(v)),
         L::DATE => ScalarValue::Date(ffi::value_date(v)),
         L::TIMESTAMP => ScalarValue::Timestamp(ffi::value_timestamp(v)),
         L::INTERVAL => ScalarValue::Interval {

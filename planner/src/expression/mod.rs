@@ -37,6 +37,7 @@ pub use arithmetic::{Arithmetic, ArithmeticOp};
 pub use between::Between;
 pub use case::{Case, CaseCheck};
 pub use cast::Cast;
+pub(crate) use cast::json_to_canonical_variant;
 pub use compare::{Compare, CompareType};
 pub use conjunction::{Conjunction, ConjunctionOp};
 pub use contains::Contains;
@@ -53,7 +54,7 @@ pub use prefix::Prefix;
 pub use reference::Ref;
 pub use regexp::{RegexpFullMatch, RegexpReplace};
 pub use regexp_jit::RegexpJitReplace;
-pub use variant_get::{JsonPath, VariantGet, VariantToJson};
+pub use variant_get::{JsonPath, VariantGet};
 
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::types::{self, Type};

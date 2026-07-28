@@ -314,6 +314,16 @@ pub fn build_scalar_value(value: ScalarValue) -> Result<Scalar<ArrayRef>, Error>
                 .with_precision_and_scale(width, scale as i8)?,
         ),
         ScalarValue::Utf8(v) => Arc::new(StringViewArray::new_scalar(v).into_inner()),
+        // A VARIANT constant reaches the bridge as the text it was built from:
+        // DuckDB's variant-to-VARCHAR gives back the raw string, not its JSON
+        // rendering, so parse that document into pivot's variant here. This is
+        // how `'{...}'::VARIANT` -- an INSERT of a JSON document -- loads. A
+        // malformed document is an error, not a panic: constant folding runs on
+        // the compile path, which has an error channel.
+        ScalarValue::Variant(text) => {
+            let json: ArrayRef = Arc::new(arrow_array::StringArray::from(vec![text]));
+            crate::expression::json_to_canonical_variant(&json)?
+        }
         // DuckDB's DATE is days since the epoch, the same as arrow `Date32`.
         // Comparisons coerce both sides to a common numeric type, so this lines up
         // with the integer day-count the parquet stores for a `DATE` column.
