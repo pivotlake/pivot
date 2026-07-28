@@ -32,7 +32,7 @@ use std::sync::{Arc, mpsc};
 ///
 /// Only the first worker receives the channel receiver; it will drain
 /// the channel and inject partition jobs during the output phase.
-pub struct GroupFactory<K: KeyExtractor, V: AggregationValue> {
+pub struct GroupFactory<K: KeyExtractor, V: AggregationValue + ?Sized> {
     key_arena: Arc<SharedArena>,
     value_arena: Arc<SharedArena>,
     key_cols: Vec<usize>,
@@ -51,7 +51,7 @@ pub struct GroupFactory<K: KeyExtractor, V: AggregationValue> {
     radix: RadixConfig,
 }
 
-impl<K: KeyExtractor, V: AggregationValue> GroupFactory<K, V> {
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupFactory<K, V> {
     /// Create one factory per worker of `topology`, sharing the same arena,
     /// hash state, and synchronization primitives. `key_cols` are the GROUP BY
     /// column indices; `value_slots` configure the per-group aggregates.
@@ -101,7 +101,7 @@ impl<K: KeyExtractor, V: AggregationValue> GroupFactory<K, V> {
     }
 }
 
-impl<K: KeyExtractor, V: AggregationValue> UnaryFactory<RecordBatch, RecordBatch>
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> UnaryFactory<RecordBatch, RecordBatch>
     for GroupFactory<K, V>
 {
     type Unary = PipelineBreaker<RecordBatch, RecordBatch, Group<K, V>>;

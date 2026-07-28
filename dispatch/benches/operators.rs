@@ -737,7 +737,7 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
             },
             move |s| {
                 s.filter(|| move |b: &RecordBatch, _: &mut SlabAllocator, ix: &mut Vec<u32>| keep_nonempty(b, 4, ix))
-                    .group_by_aggregate::<IntPairKeyExtractor<Int16Type, Int32Type>, Dynamic<4, i64, true>>(
+                    .group_by_aggregate::<IntPairKeyExtractor<Int16Type, Int32Type>, Dynamic<i64, true>>(
                         vec![0, 1],
                         slots.clone(),
                         Some(GroupLimit::TopK { slot: 0, limit: 10 }),

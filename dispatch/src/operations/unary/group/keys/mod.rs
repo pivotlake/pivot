@@ -89,7 +89,7 @@ pub trait KeyExtractor: Send + 'static {
     /// into).
     type Reader<'b>;
     /// Accumulates persisted keys into the result's leading key column(s).
-    type Columns: KeyColumns<Key = Self::Persisted, Config = Self::Config>;
+    type ColumnBuilder: KeyColumnBuilder<Key = Self::Persisted, Config = Self::Config>;
     /// Per-worker reusable scratch, owned by the table and reused across batches.
     /// `()` for extractors that read columns directly; the row extractor uses it
     /// to hold the batch's encoded key bytes so nothing is reallocated per batch.
@@ -138,7 +138,7 @@ pub trait KeyExtractor: Send + 'static {
 /// `finish` materialises the Arrow columns and their fields. `finish` takes the
 /// [`SharedArena`] so arena-backed keys (strings) can emit zero-copy views into
 /// the ring buffers; non-arena keys ignore it.
-pub trait KeyColumns {
+pub trait KeyColumnBuilder {
     type Key;
     /// The owning extractor's runtime configuration (see [`KeyExtractor::Config`]).
     type Config;

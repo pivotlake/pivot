@@ -114,7 +114,7 @@ use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::group::hashtables::{
     AggregatedTable, AggregatedTableOutput, DEFAULT_CAPACITY, MAX_LOAD_FACTOR, MultiSlabTable,
-    PartitionBuffers, RadixConfig,
+    PartitionBuffers, RadixConfig, entry_stride,
 };
 use crate::waker::waker_set;
 use crate::worker::current_node;
@@ -230,7 +230,7 @@ fn get_scatter_bucket_count_for_worker(total_workers: usize) -> usize {
 /// rows and inserts them into its local [`AggregatedTable`]. When consumption
 /// finishes, the accumulated tables are sent to a shared channel and the
 /// `Group` transitions into a [`GroupOutputter`] for the merge phase.
-pub struct Group<K: KeyExtractor, V: AggregationValue> {
+pub struct Group<K: KeyExtractor, V: AggregationValue + ?Sized> {
     key_cols: Vec<usize>,
     /// Slots drive the per-batch value reader (which column / `COUNT` vs `SUM`).
     value_slots: Vec<AggregationSlot>,
@@ -244,7 +244,7 @@ pub struct Group<K: KeyExtractor, V: AggregationValue> {
     outputter: GroupOutputter<K, V>,
 }
 
-impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         key_arena: Arc<SharedArena>,
@@ -265,9 +265,9 @@ impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
         let value_output_types: Arc<[DataType]> =
             value_slots.iter().map(|s| s.output_type.clone()).collect();
         // A string extreme persists its winner lazily during the in-place fold, so
-        // it must not take the radix scatter path (which materialises — and thus
+        // it must not take the radix scatter path (which seeds — and thus
         // persists — every row's string before any comparison). Disable the switch
-        // when any value slot is a string extreme; numeric signatures keep radix.
+        // when any value slot is a string extreme; other signatures keep radix.
         let radix = if value_slots.iter().any(|s| s.is_string_extreme()) {
             radix.without_radix()
         } else {
@@ -275,8 +275,13 @@ impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
         };
         // The per-worker write context is spawned from the shared one (a fresh
         // `WorkerArena` for a string value, `()` for numeric).
-        let aggregated_table =
-            AggregatedTable::new(state, key_arena.clone(), shared_context.worker(), radix);
+        let aggregated_table = AggregatedTable::new(
+            state,
+            key_arena.clone(),
+            shared_context.clone(),
+            shared_context.worker(),
+            radix,
+        );
         Self {
             key_cols,
             value_slots,
@@ -302,7 +307,9 @@ impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
     }
 }
 
-impl<K: KeyExtractor, V: AggregationValue> Consumer<RecordBatch, RecordBatch> for Group<K, V> {
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> Consumer<RecordBatch, RecordBatch>
+    for Group<K, V>
+{
     type Outputter = GroupOutputter<K, V>;
 
     fn consume<S: Sender<RecordBatch>>(
@@ -334,7 +341,7 @@ impl<K: KeyExtractor, V: AggregationValue> Consumer<RecordBatch, RecordBatch> fo
 /// tables, and publishes [`PARTITIONS`] [`PartitionJob`]s to the shared
 /// work-stealing [`Injector`]. All workers (including the one that injected)
 /// then steal and execute jobs until the injector is empty.
-pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue> {
+pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// String *key* storage; backs the leading key column(s) at output.
     key_arena: Arc<SharedArena>,
     /// One job queue per NUMA node. A node-level merge job reads that node's
@@ -348,7 +355,7 @@ pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue> {
     partition_jobs_injected: Arc<AtomicBool>,
     key_config: K::Config,
     /// The value's shared context, threaded into each [`PartitionJob`] so the merge
-    /// folds existing entries via [`AggregationValue::merge`] and the output
+    /// folds existing entries via [`AggregationValue::merge_from`] and the output
     /// resolves string extremes (it carries the value arena).
     shared_context: V::SharedContext,
     /// The declared output type of each value column, in slot order. The output
@@ -388,7 +395,7 @@ pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue> {
 /// the shared [`CrossNodeMerge`]; the last job to finish receives every node's
 /// table and merges them into the final one. That last merge is the only step
 /// that reads another node's memory.
-pub struct PartitionJob<K: KeyExtractor, V: AggregationValue> {
+pub struct PartitionJob<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// This node's switched workers' scatter buffers (empty Vec when none switched).
     buffers: Arc<Vec<PartitionBuffers<K, V>>>,
     /// Holds the in-place stacks of this node's workers: switched workers'
@@ -418,7 +425,7 @@ pub struct PartitionJob<K: KeyExtractor, V: AggregationValue> {
     count_only: bool,
 }
 
-unsafe impl<K: KeyExtractor, V: AggregationValue> Send for PartitionJob<K, V> {}
+unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Send for PartitionJob<K, V> {}
 
 /// One partition's pending cross-node merge: each node's job sends the node's
 /// merged aggregated table; the send that completes the set hands every
@@ -426,17 +433,17 @@ unsafe impl<K: KeyExtractor, V: AggregationValue> Send for PartitionJob<K, V> {}
 /// ([`merge::merge_node_aggregated_tables`]) and emit. Senders never block
 /// and no job ever waits: the mailbox is a lock-free queue and the election
 /// is one atomic countdown.
-struct CrossNodeMerge<K: KeyExtractor, V: AggregationValue> {
+struct CrossNodeMerge<K: KeyExtractor, V: AggregationValue + ?Sized> {
     node_tables: Injector<MultiSlabTable<K, V>>,
     /// Sends still outstanding; the sender that decrements this to zero is
     /// the receiver.
     pending_sends: AtomicUsize,
 }
 
-unsafe impl<K: KeyExtractor, V: AggregationValue> Send for CrossNodeMerge<K, V> {}
-unsafe impl<K: KeyExtractor, V: AggregationValue> Sync for CrossNodeMerge<K, V> {}
+unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Send for CrossNodeMerge<K, V> {}
+unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Sync for CrossNodeMerge<K, V> {}
 
-impl<K: KeyExtractor, V: AggregationValue> CrossNodeMerge<K, V> {
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> CrossNodeMerge<K, V> {
     fn new(node_count: usize) -> Self {
         Self {
             node_tables: Injector::new(),
@@ -466,7 +473,7 @@ impl<K: KeyExtractor, V: AggregationValue> CrossNodeMerge<K, V> {
     }
 }
 
-impl<K: KeyExtractor, V: AggregationValue> PartitionJob<K, V> {
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
     /// Merge this partition's scatter buffers and in-place stacks into one result
     /// table, then feed its rows into the worker's shared `acc` (building columns
     /// into `allocator`). Accumulating across partition jobs, rather than emitting
@@ -525,7 +532,7 @@ impl<K: KeyExtractor, V: AggregationValue> PartitionJob<K, V> {
     }
 }
 
-impl<K: KeyExtractor, V: AggregationValue> GroupOutputter<K, V> {
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
     /// Drain every worker's tables off the channel, size the merge from the merged
     /// distinct estimate, and publish one [`PartitionJob`] per merge partition to
     /// the shared injector (plus, for `COUNT(DISTINCT)`, the out-of-band 0-hash count
@@ -582,9 +589,13 @@ impl<K: KeyExtractor, V: AggregationValue> GroupOutputter<K, V> {
         // entry width, a wide multi-column key (fat entries) targets fewer groups
         // per job than a bare integer key.
         const TARGET_MERGE_PARTITION_BYTES: usize = 256 * 1024; // ~one core's L2
-        let target_groups_per_partition = (TARGET_MERGE_PARTITION_BYTES
-            / std::mem::size_of::<(u64, K::Persisted, V)>().max(1))
-        .max(1);
+        // The exact bytes per table entry (hash + key + stored value with
+        // their padding), as the tables themselves lay it out. Undersizing
+        // this inflates the per-partition group target and produces fewer,
+        // larger merge targets that fall out of cache.
+        let entry_bytes = entry_stride::<K::Persisted, V>(&self.shared_context);
+        let target_groups_per_partition =
+            (TARGET_MERGE_PARTITION_BYTES / entry_bytes.max(1)).max(1);
         let (num_partitions, partition_capacity) = if !any_switched {
             // No worker switched to radix, so every group still sits in an in-place
             // table. Run a partition_floor-way merge, each job sized to its share of
@@ -753,7 +764,9 @@ impl<K: KeyExtractor, V: AggregationValue> GroupOutputter<K, V> {
     }
 }
 
-impl<K: KeyExtractor, V: AggregationValue> Outputter<RecordBatch> for GroupOutputter<K, V> {
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> Outputter<RecordBatch>
+    for GroupOutputter<K, V>
+{
     fn output<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> unary::Result<bool> {
         if let Some(rx) = self.receiver.take() {
             self.create_partition_jobs(rx, sender)?;
@@ -911,7 +924,7 @@ mod tests {
     /// General harness: choose the key/value extractors, key columns, aggregates,
     /// LIMIT pushdown, and radix config. The common-case wrappers above cover
     /// `Int32` keys + `COUNT(*)`.
-    fn run_group_full<K: KeyExtractor<Config: Default>, V: AggregationValue>(
+    fn run_group_full<K: KeyExtractor<Config: Default>, V: AggregationValue + ?Sized>(
         worker_batches: Vec<Vec<RecordBatch>>,
         key_cols: Vec<usize>,
         value_slots: Vec<AggregationSlot>,
@@ -1232,7 +1245,7 @@ mod tests {
         RecordBatch::try_new(schema, vec![id, name, val]).unwrap()
     }
 
-    fn run_row_key_group<V: AggregationValue>(
+    fn run_row_key_group<V: AggregationValue + ?Sized>(
         worker_batches: Vec<Vec<RecordBatch>>,
         key_cols: Vec<usize>,
         schema: RowKeySchema,
@@ -1247,7 +1260,7 @@ mod tests {
         )
     }
 
-    fn run_row_key_group_radix<V: AggregationValue>(
+    fn run_row_key_group_radix<V: AggregationValue + ?Sized>(
         worker_batches: Vec<Vec<RecordBatch>>,
         key_cols: Vec<usize>,
         schema: RowKeySchema,
@@ -1543,7 +1556,7 @@ mod tests {
     // ---- Mixed string + integer aggregates via the runtime `Dynamic` ----
 
     /// The same `MIN(name)` (string) + `MAX(v)` (int) mix, but folded by the
-    /// runtime [`Dynamic`] instead of a `Compiled` tuple — the path the planner
+    /// runtime [`Dynamic`] instead of a `Compiled` tuple, the path the planner
     /// now takes for a heterogeneous string signature. The wide (`i128`) cell
     /// holds the string slot's `ArenaKey` and the int slot's value; the int
     /// extreme stores wide but its slot declares `Int64`, so the output phase
@@ -1559,7 +1572,7 @@ mod tests {
             AggregationSlot::new(AggregationKind::Min, 1, DataType::Utf8View), // MIN(name) — string
             AggregationSlot::new(AggregationKind::Max, 2, DataType::Int64),    // MAX(v)    — int
         ];
-        type Mix = Dynamic<2, i128>;
+        type Mix = Dynamic<i128>;
         let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
             vec![vec![batch]],
             vec![0],
@@ -1595,7 +1608,7 @@ mod tests {
             AggregationSlot::new(AggregationKind::Min, 1, DataType::Utf8View), // MIN(name)
             AggregationSlot::new(AggregationKind::Max, 1, DataType::Utf8View), // MAX(name)
         ];
-        type Mix = Dynamic<2, i128>;
+        type Mix = Dynamic<i128>;
         let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
             vec![vec![batch]],
             vec![0],
@@ -1636,7 +1649,7 @@ mod tests {
             AggregationSlot::new(AggregationKind::Min, 1, DataType::Utf8View),
             AggregationSlot::new(AggregationKind::Max, 1, DataType::Utf8View),
         ];
-        type Mix = Dynamic<2, i128>;
+        type Mix = Dynamic<i128>;
         let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
             vec![vec![w0], vec![w1]],
             vec![0],
@@ -1676,7 +1689,7 @@ mod tests {
             AggregationSlot::new(AggregationKind::Min, 1, DataType::Utf8View),
             AggregationSlot::new(AggregationKind::Max, 1, DataType::Utf8View),
         ];
-        type Mix = Dynamic<2, i128>;
+        type Mix = Dynamic<i128>;
         // A threshold the in-place table crosses well before N groups — a numeric
         // value would switch to radix here; the string value's override must not.
         let radix = RadixConfig {

@@ -1,27 +1,25 @@
-//! The general grouped aggregate: `GROUP BY k1, k2 …` with one or more of
+//! The general grouped aggregate: `GROUP BY k1, k2, ...` with one or more of
 //! COUNT(*)/SUM/COUNT/MIN/MAX.
 //!
 //! DuckDB lowers grouped `AVG(c)` to `sum(c)`+`count(c)` with a downstream
 //! divide, so the node here only ever holds count/sum/min/max slots.
 //!
-//! Lowering is pure monomorphisation dispatch over two independent axes — the
-//! group **key** and the **value** — neither of which can be chosen at runtime
-//! (the group operator stores its cells inline as `[Acc; N]` and takes the key
-//! extractor as a type parameter), so the code is a tree of small `match`es each
-//! selecting one concrete type:
+//! Lowering selects concrete key and value types independently:
 //!
-//! * **key** — a single integer/string column gets its dedicated extractor
+//! * **key**: a single integer/string column gets its dedicated extractor
 //!   ([`IntKeyExtractor`]/[`StringKeyExtractor`]); two integer keys pack into
 //!   [`IntPairKeyExtractor`]; anything else (3+ keys, mixed types) byte-encodes
 //!   the tuple with [`RowKeyExtractor`]. *Computed* keys (`date_trunc(...)`,
-//!   `ip - 1`, `CASE …`) and computed aggregate arguments (`SUM(a * b)`) are
+//!   `ip - 1`, `CASE ...`) and computed aggregate arguments (`SUM(a * b)`) are
 //!   first materialised into leading columns (see
 //!   [`Aggregate::materialize_inputs`]), so from the dispatch's view every key
 //!   and aggregate argument is a column.
-//! * **value** — recognised signatures lower to a branch-free [`Compiled`]
-//!   tuple; every other shape folds each slot by kind in `Dynamic<N>` (numeric,
-//!   string, or mixed; branch-free `+` when all-additive), in `i128` when a slot
-//!   needs the width (see [`Aggregate`]'s rule) else the narrow `i64`.
+//! * **value**: recognized signatures lower to a branch-free [`Compiled`]
+//!   tuple; every other shape folds each slot by kind in the runtime-arity
+//!   [`Dynamic`] (numeric, string, or mixed; branch-free `+` when
+//!   all-additive), in `i128` when a slot needs the width (see [`Aggregate`]'s
+//!   rule) else the narrow `i64`. The slot count is fixed at query build, so
+//!   one container covers every arity.
 
 use super::{Aggregate, aggregation_slots, needs_wide_accumulator, row_key_schema};
 use crate::compile::{Error, ExprEvalFn, ExprFn};
@@ -249,7 +247,7 @@ pub(super) fn build_group_by_operator(
     let unique_exprs: Vec<Expression> = unique.iter().map(|e| (*e).clone()).collect();
 
     let slots = aggregation_slots(&unique_exprs)?;
-    let sig = signatures(&unique_exprs);
+    let signatures = aggregation_signatures(&unique_exprs);
 
     // A pushed-down Top-K sorts by a value slot identified by expression index;
     // coalescing renumbers the slots, so remap it to the unique slot it folds into
@@ -266,9 +264,17 @@ pub(super) fn build_group_by_operator(
     // Cell width: i128 when a string extreme needs its 128-bit `ArenaKey` cell, or
     // when an aggregate reads a column whose values need the wide accumulator (a
     // 64-bit SUM, or any aggregate over a decimal); else the narrow i64 entry.
-    let wide = slots.iter().any(|s| s.is_string_extreme()) || needs_wide_accumulator(&unique_exprs);
+    let requires_wide_cells = slots.iter().any(AggregationSlot::is_string_extreme)
+        || needs_wide_accumulator(&unique_exprs);
 
-    let grouped = dispatch_group_by(input, keys, slots, &sig, wide, output_limit)?;
+    let grouped = dispatch_group_by(
+        input,
+        keys,
+        slots,
+        &signatures,
+        requires_wide_cells,
+        output_limit,
+    )?;
 
     // No two aggregates coalesced: the output already has one value column per
     // expression, in order.
@@ -366,7 +372,7 @@ fn canonical_input_type(result_type: &Type) -> Option<Type> {
 
 /// Evaluate each `expr` per batch, cast it to the physical arrow type of its
 /// canonical [`canonical_input_type`] (`Utf8View`/`Int64`/`Date32`/`Timestamp`),
-/// and prepend them as leading columns `k0, k1, …`. The original columns follow,
+/// and prepend them as leading columns `k0, k1, ...`. The original columns follow,
 /// shifted right by `exprs.len()`, so the aggregates can still read their value
 /// columns.
 fn project_leading_columns(
@@ -410,37 +416,33 @@ fn project_leading_columns(
     }))
 }
 
-/// Per-slot signature used to recognise the `Compiled` specialisations in
-/// `select_value`. `CountStar` and `Count` collapse to one `Count` (both add +1 per
-/// row); a `Sum` carries its column type so the specialisation can fix the read
-/// width.
-pub(super) enum Sig {
+/// Slot information needed to select a compiled value specialization.
+///
+/// COUNT and COUNT(*) share one signature because they use the same accumulator
+/// operation. SUM retains its input type so the reader type can be selected.
+pub(super) enum AggregationSignature {
     Count,
     Sum(Type),
-    /// MIN/MAX (and any kind with no compiled specialisation). A distinct
-    /// variant so these never match a compiled Count/Sum shape — doing so would
-    /// monomorphise the wrong op and silently compute a count/sum instead of the
-    /// extreme.
+    /// Any operation without a compiled specialization.
     Other,
 }
 
-fn signatures(exprs: &[Expression]) -> Vec<Sig> {
-    exprs
+fn aggregation_signatures(expressions: &[Expression]) -> Vec<AggregationSignature> {
+    expressions
         .iter()
-        .map(|e| match e {
-            Expression::AggregateFunc(AggregateFunc::Sum(a)) => {
-                Sig::Sum(a.column().return_type.clone())
+        .map(|expression| match expression {
+            Expression::AggregateFunc(AggregateFunc::Sum(argument)) => {
+                AggregationSignature::Sum(argument.column().return_type.clone())
             }
             Expression::AggregateFunc(AggregateFunc::CountStar(_) | AggregateFunc::Count(_)) => {
-                Sig::Count
+                AggregationSignature::Count
             }
-            _ => Sig::Other,
+            _ => AggregationSignature::Other,
         })
         .collect()
 }
 
-/// The two key types when the group is exactly two integer columns we've
-/// monomorphised the pair extractor for; `None` routes to the row fallback.
+/// Returns supported integer pairs for the packed two-key extractor.
 fn int_pair_keys(keys: &[(usize, Type)]) -> Option<(Type, Type)> {
     let [(_, a), (_, b)] = keys else { return None };
     let pair = (a.clone(), b.clone());
@@ -456,24 +458,13 @@ fn int_pair_keys(keys: &[(usize, Type)]) -> Option<(Type, Type)> {
     .then_some(pair)
 }
 
-/// Select the concrete group-key extractor for `$keys` and hand it (plus its key
-/// config) to the `$with_key!` macro, which finishes the build. This is one half
-/// of the two-axis monomorphisation: a `macro_rules!` cannot *return* the chosen
-/// type, so the key choice cannot be a value combined later, it must call a
-/// continuation that has the rest of the build. [`dispatch_group_by`] passes
-/// `select_value` (pick the value container, then `build_group_by!`);
-/// [`build_dedup_operator`] passes `emit_dedup` (no value container, keys only).
+/// Selects a key extractor and invokes a continuation with its concrete type.
 ///
-/// A single integer/string column gets its dedicated extractor; two integer keys
-/// pack into [`IntPairKeyExtractor`]; one integer plus one string key use
-/// [`IntStrKeyExtractor`]; anything else byte-encodes the tuple with
-/// [`RowKeyExtractor`]. Every arm `return`s except the row fallback, which is the
-/// tail expression, so the surrounding function returns from inside the macro.
+/// A macro continuation is required because a selected Rust type cannot be
+/// returned as a runtime value.
 macro_rules! select_key_extractor {
     ($keys:expr, $with_key:ident) => {{
-        // A single column keys on its native value directly: the dedicated
-        // int/string extractor is cheaper than byte-encoding one column into the
-        // row key and, unlike the row encoder, radix-partitions.
+        // Use native extractors for supported single-column keys.
         if let [(_, ty)] = $keys {
             match ty {
                 Type::Int8 => return $with_key!(IntKeyExtractor<Int8Type>, ()),
@@ -495,7 +486,7 @@ macro_rules! select_key_extractor {
             }
         }
 
-        // Two integer keys pack into the specialised u128 pair extractor.
+        // Pack supported integer pairs into one u128 key.
         if let Some(pair) = int_pair_keys($keys) {
             return match pair {
                 (Type::Int64, Type::Int32) => $with_key!(IntPairKeyExtractor<Int64Type, Int32Type>, ()),
@@ -508,10 +499,7 @@ macro_rules! select_key_extractor {
             };
         }
 
-        // One integer key plus one string key, in either order: the dedicated
-        // int+string extractor keys on the native integer beside the string's arena
-        // handle, skipping the row encoder's byte-encode of the tuple. `STR_FIRST`
-        // follows the key order so the leading output column stays the first key.
+        // Keep an integer and string in their native representations.
         match $keys {
             [(_, int_ty), (_, Type::Utf8)] => match int_ty {
                 Type::Int8 => return $with_key!(IntStrKeyExtractor<Int8Type, false>, ()),
@@ -547,105 +535,70 @@ macro_rules! select_key_extractor {
     }};
 }
 
-/// The monomorphisation core: pick the concrete key extractor for `keys` and value
-/// container for `slots`, then build the GROUP BY operator. The mechanical layer
-/// under [`build_group_by_operator`] (its only caller); the keys-only dedup path
-/// ([`build_dedup_operator`]) shares the key cascade but supplies its own value.
+/// Selects concrete key and value containers, then builds GROUP BY.
 ///
-/// `keys`/`slots` are already resolved to input column indices and kinds.
-/// `sig` selects a hand-written, branch-free [`Compiled`] tuple for the few
-/// signatures worth specialising; any shape it doesn't list folds per-slot in
-/// [`Dynamic`]. `wide` requests the `i128` cell (a string extreme needs its
-/// 128-bit `ArenaKey`, or a `SUM` can overflow `i64`); `output_limit` is the
-/// per-partition LIMIT pushed into this level, or `None` to emit every group.
+/// Selected signatures use [`Compiled`]. All others use [`Dynamic`], with
+/// `i128` cells when strings or wide sums require them.
 pub(super) fn dispatch_group_by(
     input: RecordBatchOperatorSpec,
     keys: &[(usize, Type)],
     slots: Vec<AggregationSlot>,
-    sig: &[Sig],
-    wide: bool,
+    signatures: &[AggregationSignature],
+    requires_wide_cells: bool,
     output_limit: Option<GroupLimit>,
 ) -> Result<RecordBatchOperatorSpec, Error> {
-    let key_cols: Vec<usize> = keys.iter().map(|(col, _)| *col).collect();
+    let key_columns: Vec<usize> = keys.iter().map(|(column, _)| *column).collect();
 
-    // Whether every slot folds additively (COUNT/SUM, no MIN/MAX or string
-    // extreme): the `ONLY_ADDITIVE` `Dynamic` then merges branch-free (`a + b`) and
-    // prunes its non-additive arms, skipping the per-slot kind dispatch (~1.5-2% on
-    // a low-card grouped aggregate). A float `SUM` (a floating `output_type`) is
-    // excluded: its cell holds `f64` bits, so the branch-free integer `a + b` would
-    // corrupt it.
-    let all_additive = slots.iter().all(|s| {
+    // COUNT and integer SUM can use the addition-only specialization. Float
+    // cells store raw bits, so they must use operation-aware merging.
+    let only_additive = slots.iter().all(|slot| {
         matches!(
-            s.kind,
+            slot.kind,
             AggregationKind::CountStar | AggregationKind::Count | AggregationKind::Sum
-        ) && !s.output_type.is_floating()
+        ) && !slot.output_type.is_floating()
     });
 
-    // The leaf combiner: both monomorphisation axes meet here, building the GROUP
-    // BY operator for one concrete key type `$K`, value type `$V`, and key config
-    // `$cfg`. The surrounding `input`/`key_cols`/`slots`/`output_limit` are captured
-    // from this scope; exactly one arm ever runs, so each moved-once value is
-    // consumed at most once.
+    // Both type selections meet at this operator-construction leaf.
     macro_rules! build_group_by {
-        ($K:ty, $V:ty, $cfg:expr) => {
-            Ok(input.group_by_aggregate::<$K, $V>(key_cols, slots, output_limit, $cfg))
+        ($K:ty, $V:ty, $key_config:expr) => {
+            Ok(input.group_by_aggregate::<$K, $V>(key_columns, slots, output_limit, $key_config))
         };
     }
-    // Fold each slot by kind (or branch-free `+` when `$add`) in
-    // `Dynamic<N, acc, ADDITIVE>`, dispatched on the slot count N (the inline
-    // cell-array length). Numeric, string (`acc = i128`), and mixed alike, since
-    // `Dynamic` dispatches per slot.
-    macro_rules! arity {
-        ($K:ty, $acc:ty, $add:literal, $cfg:expr) => {
-            match slots.len() {
-                1 => build_group_by!($K, Dynamic<1, $acc, $add>, $cfg),
-                2 => build_group_by!($K, Dynamic<2, $acc, $add>, $cfg),
-                3 => build_group_by!($K, Dynamic<3, $acc, $add>, $cfg),
-                4 => build_group_by!($K, Dynamic<4, $acc, $add>, $cfg),
-                5 => build_group_by!($K, Dynamic<5, $acc, $add>, $cfg),
-                6 => build_group_by!($K, Dynamic<6, $acc, $add>, $cfg),
-                7 => build_group_by!($K, Dynamic<7, $acc, $add>, $cfg),
-                8 => build_group_by!($K, Dynamic<8, $acc, $add>, $cfg),
-                n => Err(Error::UnsupportedAggregateExpressionAmount(n)),
-            }
-        };
-    }
-    // The generic value fallback: pick the accumulator width and the additive
-    // flag, then dispatch by arity. A string extreme is `wide` + non-additive.
+    // Dynamic covers every slot count and supported operation mix.
     macro_rules! dynamic {
-        ($K:ty, $cfg:expr) => {
-            match (wide, all_additive) {
-                (true, true) => arity!($K, i128, true, $cfg),
-                (true, false) => arity!($K, i128, false, $cfg),
-                (false, true) => arity!($K, i64, true, $cfg),
-                (false, false) => arity!($K, i64, false, $cfg),
+        ($K:ty, $key_config:expr) => {
+            match (requires_wide_cells, only_additive) {
+                _ if slots.is_empty() => Err(Error::UnsupportedAggregateExpressionAmount(0)),
+                (true, true) => build_group_by!($K, Dynamic<i128, true>, $key_config),
+                (true, false) => build_group_by!($K, Dynamic<i128, false>, $key_config),
+                (false, true) => build_group_by!($K, Dynamic<i64, true>, $key_config),
+                (false, false) => build_group_by!($K, Dynamic<i64, false>, $key_config),
             }
         };
     }
-    // The value-container selection (the continuation `select_key_extractor!`
-    // calls once it has picked a key): a few signatures are worth a hand-written,
-    // branch-free `Compiled` tuple; everything else folds per-slot in `Dynamic`.
-    // Add a signature here to specialise it. Ends at the `build_group_by!` leaf.
+    // Keep the compiled list small and route every other signature to Dynamic.
     macro_rules! select_value {
-        ($K:ty, $cfg:expr) => {
-            match sig {
-                [Sig::Count] => build_group_by!($K, Compiled<(CountSlot,)>, $cfg),
-                // `COUNT(*), SUM(i16), SUM(i16)` (e.g. an `AVG(i16)` whose count has
-                // coalesced into the `COUNT(*)`): a branch-free, narrow entry.
-                [Sig::Count, Sig::Sum(Type::Int16), Sig::Sum(Type::Int16)] => build_group_by!(
+        ($K:ty, $key_config:expr) => {
+            match signatures {
+                [AggregationSignature::Count] => {
+                    build_group_by!($K, Compiled<(CountSlot,)>, $key_config)
+                }
+                // Common narrow signature produced when AVG shares a count.
+                [
+                    AggregationSignature::Count,
+                    AggregationSignature::Sum(Type::Int16),
+                    AggregationSignature::Sum(Type::Int16),
+                ] => build_group_by!(
                     $K,
                     Compiled<(CountSlot, SumSlot<Int16Type>, SumSlot<Int16Type>)>,
-                    $cfg
+                    $key_config
                 ),
-                _ => dynamic!($K, $cfg),
+                _ => dynamic!($K, $key_config),
             }
         };
     }
 
-    // Select the key extractor (the cascade shared with the keys-only dedup path);
-    // `select_value` then picks the value container for it and reaches the
-    // `build_group_by!` leaf. The two selections nest because a macro can't return a
-    // chosen type to combine later.
+    // Key selection invokes value selection as its continuation.
     select_key_extractor!(keys, select_value)
 }
 
@@ -658,12 +611,19 @@ pub(super) fn build_dedup_operator(
     input: RecordBatchOperatorSpec,
     keys: &[(usize, Type)],
 ) -> Result<RecordBatchOperatorSpec, Error> {
-    let key_cols: Vec<usize> = keys.iter().map(|(col, _)| *col).collect();
+    let key_columns: Vec<usize> = keys.iter().map(|(column, _)| *column).collect();
     // Keys-only: `Distinct` holds no accumulator, so the slot list is empty and the
     // group emits the key columns themselves.
     macro_rules! emit_dedup {
-        ($K:ty, $cfg:expr) => {
-            Ok(input.group_by_aggregate::<$K, Distinct>(key_cols, Vec::new(), None, $cfg))
+        ($K:ty, $key_config:expr) => {
+            Ok(
+                input.group_by_aggregate::<$K, Distinct>(
+                    key_columns,
+                    Vec::new(),
+                    None,
+                    $key_config,
+                ),
+            )
         };
     }
     select_key_extractor!(keys, emit_dedup)
@@ -1233,6 +1193,212 @@ mod tests {
         let col = batches[0].column(0);
         assert_eq!(col.data_type(), &DataType::Date32);
         assert_eq!(col.as_primitive::<Date32Type>().value(0), 10);
+    }
+
+    #[rstest]
+    fn nine_mixed_aggregates_group_correctly(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "wide",
+            &[
+                (
+                    "g",
+                    Type::Int32,
+                    Arc::new(Int32Array::from(vec![1, 1, 2])) as ArrayRef,
+                ),
+                (
+                    "a",
+                    Type::Int32,
+                    Arc::new(Int32Array::from(vec![3, 5, 7])) as ArrayRef,
+                ),
+                (
+                    "b",
+                    Type::Float64,
+                    Arc::new(Float64Array::from(vec![1.5, 2.5, 4.0])) as ArrayRef,
+                ),
+            ],
+        );
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT g, COUNT(*), SUM(a), MIN(a), MAX(a), SUM(b), MIN(b), MAX(b), MIN(g), MAX(g) \
+             FROM wide GROUP BY g ORDER BY g",
+        );
+
+        use arrow_array::types::{Decimal128Type, Int32Type, Int64Type};
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 2);
+        let counts = batch.column(1).as_primitive::<Int64Type>();
+        assert_eq!((counts.value(0), counts.value(1)), (2, 1));
+        let sums = batch.column(2).as_primitive::<Decimal128Type>();
+        assert_eq!((sums.value(0), sums.value(1)), (8, 7));
+        let mins = batch.column(3).as_primitive::<Int32Type>();
+        assert_eq!((mins.value(0), mins.value(1)), (3, 7));
+        let float_sums = batch.column(5).as_primitive::<Float64Type>();
+        assert_eq!((float_sums.value(0), float_sums.value(1)), (4.0, 4.0));
+        let float_maxes = batch.column(7).as_primitive::<Float64Type>();
+        assert_eq!((float_maxes.value(0), float_maxes.value(1)), (2.5, 4.0));
+        let key_maxes = batch.column(9).as_primitive::<Int32Type>();
+        assert_eq!((key_maxes.value(0), key_maxes.value(1)), (1, 2));
+    }
+
+    #[rstest]
+    fn nine_additive_aggregates_group_correctly(mut testing_planner: TestingPlanner) {
+        let group = Arc::new(Int32Array::from(vec![1, 1, 2])) as ArrayRef;
+        let values = Arc::new(Int32Array::from(vec![3, 5, 7])) as ArrayRef;
+        let columns: Vec<(&str, Type, ArrayRef)> = std::iter::once(("g", Type::Int32, group))
+            .chain(
+                ["c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7"]
+                    .map(|name| (name, Type::Int32, values.clone())),
+            )
+            .collect();
+        testing_planner.add_table("adds", &columns);
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT g, COUNT(*), SUM(c0), SUM(c1), SUM(c2), SUM(c3), SUM(c4), SUM(c5), SUM(c6), SUM(c7) \
+             FROM adds GROUP BY g ORDER BY g",
+        );
+
+        use arrow_array::types::{Decimal128Type, Int64Type};
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 2);
+        let counts = batch.column(1).as_primitive::<Int64Type>();
+        assert_eq!((counts.value(0), counts.value(1)), (2, 1));
+        for column in 2..10 {
+            let sums = batch.column(column).as_primitive::<Decimal128Type>();
+            assert_eq!((sums.value(0), sums.value(1)), (8, 7));
+        }
+    }
+
+    #[rstest]
+    fn nine_aggregates_with_string_extremes_group_correctly(mut testing_planner: TestingPlanner) {
+        use arrow_array::{Int64Array, StringViewArray};
+        testing_planner.add_table(
+            "mixed",
+            &[
+                (
+                    "g",
+                    Type::Int32,
+                    Arc::new(Int32Array::from(vec![1, 1, 2])) as ArrayRef,
+                ),
+                (
+                    "i",
+                    Type::Int64,
+                    Arc::new(Int64Array::from(vec![10i64, 20, 7])) as ArrayRef,
+                ),
+                (
+                    "s",
+                    Type::Utf8,
+                    Arc::new(StringViewArray::from(vec![
+                        "a longer string beyond inlining",
+                        "banana",
+                        "cherry",
+                    ])) as ArrayRef,
+                ),
+            ],
+        );
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT g, COUNT(*), SUM(i), MIN(i), MAX(i), MIN(g), MAX(g), SUM(g), MIN(s), MAX(s) \
+             FROM mixed GROUP BY g ORDER BY g",
+        );
+
+        use arrow_array::types::Decimal128Type;
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 2);
+        let sums = batch.column(2).as_primitive::<Decimal128Type>();
+        assert_eq!((sums.value(0), sums.value(1)), (30, 7));
+        let string_mins = batch.column(8).as_string_view();
+        assert_eq!(string_mins.value(0), "a longer string beyond inlining");
+        assert_eq!(string_mins.value(1), "cherry");
+        let string_maxes = batch.column(9).as_string_view();
+        assert_eq!(string_maxes.value(0), "banana");
+        assert_eq!(string_maxes.value(1), "cherry");
+    }
+
+    #[rstest]
+    fn nine_aggregates_over_many_groups(mut testing_planner: TestingPlanner) {
+        // Enough distinct groups to grow the consume tables past their initial
+        // capacity and split the merge across partitions.
+        let n = 10_000i32;
+        let keys = Arc::new(Int32Array::from((0..n).collect::<Vec<_>>())) as ArrayRef;
+        let values = Arc::new(Int32Array::from((0..n).collect::<Vec<_>>())) as ArrayRef;
+        let floats = Arc::new(Float64Array::from(
+            (0..n).map(f64::from).collect::<Vec<_>>(),
+        )) as ArrayRef;
+        testing_planner.add_table(
+            "big",
+            &[
+                ("g", Type::Int32, keys),
+                ("a", Type::Int32, values),
+                ("b", Type::Float64, floats),
+            ],
+        );
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT g, COUNT(*), SUM(a), MIN(a), MAX(a), SUM(b), MIN(b), MAX(b), MIN(g), MAX(g) \
+             FROM big GROUP BY g",
+        );
+
+        use arrow_array::types::{Decimal128Type, Int64Type};
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, n as usize);
+        let total_count: i64 = batches
+            .iter()
+            .flat_map(|b| b.column(1).as_primitive::<Int64Type>().iter())
+            .flatten()
+            .sum();
+        assert_eq!(total_count, n as i64);
+        let total_sum: i128 = batches
+            .iter()
+            .flat_map(|b| b.column(2).as_primitive::<Decimal128Type>().iter())
+            .flatten()
+            .sum();
+        assert_eq!(total_sum, i128::from(n) * i128::from(n - 1) / 2);
+    }
+
+    #[rstest]
+    fn nine_aggregates_with_pushed_top_k(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "ranked",
+            &[
+                (
+                    "g",
+                    Type::Int32,
+                    Arc::new(Int32Array::from(vec![1, 1, 2, 3, 4])) as ArrayRef,
+                ),
+                (
+                    "a",
+                    Type::Int32,
+                    Arc::new(Int32Array::from(vec![5, 6, 20, 9, 1])) as ArrayRef,
+                ),
+                (
+                    "b",
+                    Type::Float64,
+                    Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0, 4.0, 5.0])) as ArrayRef,
+                ),
+            ],
+        );
+
+        // ORDER BY an integer SUM slot with LIMIT pushes a per-partition top-k
+        // into the group operator.
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT g, SUM(a), COUNT(*), MIN(a), MAX(a), SUM(b), MIN(b), MAX(b), MIN(g), MAX(g) \
+             FROM ranked GROUP BY g ORDER BY SUM(a) DESC LIMIT 2",
+        );
+
+        use arrow_array::types::{Decimal128Type, Int32Type, Int64Type};
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 2);
+        let keys = batch.column(0).as_primitive::<Int32Type>();
+        assert_eq!((keys.value(0), keys.value(1)), (2, 1));
+        let sums = batch.column(1).as_primitive::<Decimal128Type>();
+        assert_eq!((sums.value(0), sums.value(1)), (20, 11));
+        let counts = batch.column(2).as_primitive::<Int64Type>();
+        assert_eq!((counts.value(0), counts.value(1)), (1, 2));
     }
 
     #[rstest]

@@ -11,14 +11,14 @@
 //! build (the probe is bound by cache-miss latency, so denser entries win).
 //!
 //! This is paired with the count-only group output, so the no-op
-//! [`KeyColumns`] below is never materialised (the group emits per-partition
+//! [`KeyColumnBuilder`] below is never materialised (the group emits per-partition
 //! counts, not keys). It must therefore only be used via `group_by_distinct_count`.
 
 use super::int_pair::IntBits;
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::PersistedKey;
-use crate::operations::unary::group::keys::{KeyColumns, KeyExtractor};
+use crate::operations::unary::group::keys::{KeyColumnBuilder, KeyExtractor};
 use ahash::RandomState;
 use arrow_array::cast::AsArray;
 use arrow_array::types::ArrowPrimitiveType;
@@ -64,7 +64,7 @@ where
     type LiveKey<'a, 'b> = ();
     type PersistedLiveKey<'a> = ();
     type Reader<'b> = &'b PrimitiveArray<T>;
-    type Columns = NoKeyColumns;
+    type ColumnBuilder = NoKeyColumnBuilder;
     type Scratch = ();
 
     fn make_reader<'b>(
@@ -98,14 +98,14 @@ where
 
 /// No-op key columns: a keys-only group is only ever used count-only, so this is
 /// never materialised.
-pub struct NoKeyColumns;
+pub struct NoKeyColumnBuilder;
 
-impl KeyColumns for NoKeyColumns {
+impl KeyColumnBuilder for NoKeyColumnBuilder {
     type Key = ();
     type Config = ();
 
     fn with_capacity(_allocator: &mut SlabAllocator, _rows: usize, _config: &()) -> Self {
-        NoKeyColumns
+        NoKeyColumnBuilder
     }
 
     #[inline(always)]

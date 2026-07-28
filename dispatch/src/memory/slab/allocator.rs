@@ -130,6 +130,35 @@ impl SlabAllocator {
         MultiSlabBuffer::new(self.get_slabs_of_size(bytes, zeroed))
     }
 
+    /// Allocates zeroed slabs for `count` runtime-sized entries.
+    ///
+    /// Entries never cross slab boundaries. Multi-slab allocations begin at a
+    /// buffer boundary so every entry can be addressed from its slab base.
+    pub fn create_strided_slabs(&mut self, count: usize, stride: usize, align: usize) -> Vec<Slab> {
+        let entries_per_slab = BUFFER_SIZE / stride;
+        let bytes = if count <= entries_per_slab {
+            count * stride
+        } else {
+            count.div_ceil(entries_per_slab) * BUFFER_SIZE
+        };
+        if self.remaining_in_buffer() < bytes {
+            self.advance_to_new_buffer(true);
+        }
+        self.offset = (self.offset + align - 1) & !(align - 1);
+        self.get_slabs_of_size(bytes, true)
+    }
+
+    /// Allocates one slab at an explicitly aligned address.
+    ///
+    /// `size + align` must fit in one backing buffer.
+    pub fn get_aligned_slab(&mut self, size: usize, align: usize, zeroed: bool) -> Slab {
+        if self.remaining_in_buffer() < size + align {
+            self.advance_to_new_buffer(zeroed);
+        }
+        self.offset = (self.offset + align - 1) & !(align - 1);
+        self.get_slab_from_current_buffer(size, zeroed)
+    }
+
     /// Allocates a [`SlabBuffer<T>`] that can hold `size` elements of type `T`.
     ///
     /// The total byte size (`size * size_of::<T>()`) must be < 2MB since `SlabBuffer` is
