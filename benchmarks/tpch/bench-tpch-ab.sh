@@ -213,8 +213,9 @@ run_duckdb_query() {
 # ---------------------------------------------------------------------------
 # Phase 0: disk, data, checkouts.
 # ---------------------------------------------------------------------------
-mkdir -p "$work_dir"
 mount_nvme
+# Build on the instance-store mount, not the small root volume.
+use_nvme_scratch
 data_dev="$(df --output=source "$(dirname "$data_root")" | tail -1 | sed 's|/dev/||')"
 
 ( sync_scale "$sf_pgo"; sync_scale "$sf_measure" ) &

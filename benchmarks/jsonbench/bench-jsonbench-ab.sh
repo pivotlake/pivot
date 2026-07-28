@@ -111,6 +111,13 @@ case "$scale" in
     *) echo "error: --scale must be 1m|10m|100m (got '$scale')" >&2; exit 2 ;;
 esac
 
+# The server prefaults its buffer-pool ring; the default 80% of RAM leaves too
+# little for the INSERT load's own working set (variant parsing, batch buffers,
+# the Parquet writer) and the process is OOM-killed. Default to a smaller ring.
+# `--bench-env PIVOT_MEMORY_PCT=..` (applied by ab_common_init) overrides this,
+# as does an already-set value.
+export PIVOT_MEMORY_PCT="${PIVOT_MEMORY_PCT:-60}"
+
 ab_common_init
 
 # The public Bluesky ndjson the whole benchmark reads. Anonymous access, so no
@@ -120,9 +127,8 @@ data_bucket="s3://clickhouse-public-datasets/bluesky"
 # separate directories because pivot-bench loads every ndjson under --source.
 pgo_data="$data_root/pgo"
 measure_data="$data_root/measure"
-# The table's Parquet is written under TMPDIR (catalog store root); keep it on
-# the NVMe, not the small root volume.
-export TMPDIR="$data_root/tmp"
+# The table's Parquet is written under TMPDIR (the catalog's store root); it
+# lands on the NVMe because use_nvme_scratch points TMPDIR there.
 
 # ---------------------------------------------------------------------------
 # Dataset download, backgrounded: the one PGO file lands first (it gates the
@@ -228,9 +234,9 @@ run_duckdb_side() {
 # ---------------------------------------------------------------------------
 # Phase 0: disk, data, checkouts.
 # ---------------------------------------------------------------------------
-mkdir -p "$work_dir"
 mount_nvme
-mkdir -p "$TMPDIR"
+# Build and write table Parquet on the instance-store mount, not the root volume.
+use_nvme_scratch
 
 ( download_scale 1 "$pgo_data"; download_scale "$measure_files" "$measure_data" ) &
 download_pid=$!

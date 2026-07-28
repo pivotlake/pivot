@@ -63,6 +63,19 @@ mount_nvme() {
     sudo chown "$(id -u):$(id -g)" "$mnt"
 }
 
+# Move the build scratch onto the instance-store mount. The root volume is
+# small (tens of GB), and the checkouts, the four PGO target dirs, and the C/C++
+# compiler's temp files (TMPDIR) together far exceed it; the ephemeral disk has
+# hundreds. Sets `work_dir` and `TMPDIR` under the mount and creates them. Call
+# right after mount_nvme, before anything writes to either.
+use_nvme_scratch() {
+    local mnt
+    mnt="$(dirname "$data_root")"
+    work_dir="$mnt/ab"
+    export TMPDIR="$mnt/tmp"
+    mkdir -p "$work_dir" "$TMPDIR"
+}
+
 # ---------------------------------------------------------------------------
 # Source checkouts: local clones of the AMI-baked repo (object hardlinks, no
 # network), with submodules resolved against the baked clone's modules. A
