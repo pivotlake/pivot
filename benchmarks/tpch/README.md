@@ -34,6 +34,7 @@ as the engine grows the features each needs.
 | q03 | Shipping Priority | customer/orders/lineitem, top 10 by revenue |
 | q06 | Forecasting Revenue | no join: one row from a filtered scan |
 | q08 | National Market Share | 7 joins, `extract(year ...)` groups, share of two sums |
+| q10 | Returned Item Reporting | 4 joins, a 7-column group key of ints and strings |
 | q12 | Shipping Modes | orders/lineitem, CASE priority buckets per shipmode |
 | q14 | Promotion Effect | lineitem/part, promo share of revenue |
 
@@ -44,15 +45,9 @@ mark and outer joins (q16, q13), and the `suffix` / `~~` / `!~~` / `substring`
 scalar functions (q02, q13, q16, q22). q07 and q19 additionally hit a join
 predicate that ORs columns from both sides, which the bridge cannot read.
 
-q10 plans and runs, but its `c_comment` group key comes back corrupted at SF100
-(fragments of other rows, with the length prefix of a neighbouring field showing
-up inside the string), so it is held back until that is fixed. The corruption
-needs scale: the same query is correct at SF0.05, and it appears whether or not
-the LIMIT reaches the group operator as a Top-K.
-
-q03 orders by a summed revenue and cuts with a LIMIT, so a tie in that sum would
-make its row order (and therefore the exact-string comparison) arbitrary. No tie
-occurs in the reference datasets.
+q03 and q10 order by a summed revenue and cut with a LIMIT, so a tie in that sum
+would make their row order (and therefore the exact-string comparison)
+arbitrary. No tie occurs in the reference datasets.
 
 Oracles (`qNN.tsv`) are produced by DuckDB over the same parquet files
 (`run-duckdb.sh --write-expected`), in pivot's wire format, and are specific to
@@ -60,7 +55,7 @@ the dataset's scale factor. The committed ones are for SF100; regenerate them
 when you run another scale factor:
 
 ```sh
-./run-duckdb.sh --source ~/tpch-sf10 --query 1,3,6,8,12,14 --write-expected
+./run-duckdb.sh --source ~/tpch-sf10 --query 1,3,6,8,10,12,14 --write-expected
 ```
 
 `q01.tsv` is pivot's own rendering of those numbers rather than DuckDB's text:
