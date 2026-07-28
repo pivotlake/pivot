@@ -74,7 +74,7 @@ pub enum Error {
     UnsupportedExpressionForPrefixHaystack(Expression),
     #[error("Failed to downcast scalar into string: {0:?}")]
     FailedToDowncastScalarIntoString(Scalar<ArrayRef>),
-    #[error("Invalid regexp_replace pattern '{pattern}': {source}")]
+    #[error("Invalid regex pattern '{pattern}': {source}")]
     InvalidRegexPattern {
         pattern: String,
         #[source]

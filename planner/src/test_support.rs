@@ -92,7 +92,9 @@ impl TestTable {
         let fields: Vec<Field> = columns
             .iter()
             .zip(&arrays)
-            .map(|((name, _, _), array)| Field::new(*name, array.data_type().clone(), false))
+            .map(|((name, _, _), array)| {
+                Field::new(*name, array.data_type().clone(), array.is_nullable())
+            })
             .collect();
         let schema = Arc::new(Schema::new(fields));
         let batch = RecordBatch::try_new(schema, arrays).unwrap();

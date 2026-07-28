@@ -3,7 +3,7 @@
 
 use super::{
     Arithmetic, Contains, DatePart, DateTrunc, Divide, IntervalArithmetic, Length, Prefix,
-    RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet, VariantToJson,
+    RegexpFullMatch, RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet, VariantToJson,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::expression::Expression;
@@ -72,6 +72,8 @@ pub enum Function {
     Arithmetic(Arithmetic),
     Length(Length),
     RegexpReplace(RegexpReplace),
+    /// `regexp_full_match` — also the `~` / `!~` operators and `SIMILAR TO`.
+    RegexpFullMatch(RegexpFullMatch),
     /// `regexp_jit_replace` — like `RegexpReplace` but always PCRE2 JIT-compiled.
     RegexpJitReplace(RegexpJitReplace),
     Divide(Divide),
@@ -120,6 +122,8 @@ impl Function {
             }
             Function::Length(l) => visit(&l.input),
             Function::RegexpReplace(r) => visit(&r.input),
+            // The pattern is a plan-time constant, not a child expression.
+            Function::RegexpFullMatch(r) => visit(&r.input),
             Function::RegexpJitReplace(r) => visit(&r.input),
             Function::Divide(d) => {
                 visit(&d.left);
@@ -144,6 +148,7 @@ impl Display for Function {
             Function::Arithmetic(a) => write!(f, "{a}"),
             Function::Length(l) => write!(f, "{l}"),
             Function::RegexpReplace(r) => write!(f, "{r}"),
+            Function::RegexpFullMatch(r) => write!(f, "{r}"),
             Function::RegexpJitReplace(r) => write!(f, "{r}"),
             Function::Divide(d) => write!(f, "{d}"),
             Function::DateTrunc(dt) => write!(f, "{dt}"),
@@ -163,7 +168,9 @@ impl Function {
     pub fn result_type(&self) -> Type {
         match self {
             // The string matchers yield booleans.
-            Function::Contains(_) | Function::Prefix(_) => Type::Boolean,
+            Function::Contains(_) | Function::Prefix(_) | Function::RegexpFullMatch(_) => {
+                Type::Boolean
+            }
             // Arithmetic and the extractors carry DuckDB's bound result type.
             Function::Arithmetic(a) => a.return_type.clone(),
             Function::Length(l) => l.return_type.clone(),
@@ -194,6 +201,7 @@ impl Function {
             Function::Arithmetic(a) => a.compile(),
             Function::Length(l) => l.compile(),
             Function::RegexpReplace(r) => r.compile(),
+            Function::RegexpFullMatch(r) => r.compile(),
             Function::RegexpJitReplace(r) => r.compile(),
             Function::Divide(d) => d.compile(),
             Function::DateTrunc(dt) => dt.compile(),

@@ -24,7 +24,7 @@ use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Conjunction,
     ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide, Error,
     Expression, Function, InList, IntervalArithmetic, Length, Not, NumericAggregate, Prefix, Ref,
-    RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
+    RegexpFullMatch, RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
 
@@ -290,6 +290,9 @@ impl Function {
             "*" => Ok(Function::Arithmetic(Arithmetic::from_handle(func)?)),
             "length" | "strlen" | "len" => Ok(Function::Length(Length::from_handle(func)?)),
             "regexp_replace" => Ok(Function::RegexpReplace(RegexpReplace::from_handle(func)?)),
+            "regexp_full_match" => Ok(Function::RegexpFullMatch(RegexpFullMatch::from_handle(
+                func,
+            )?)),
             "regexp_jit_replace" => Ok(Function::RegexpJitReplace(RegexpJitReplace::from_handle(
                 func,
             )?)),
@@ -329,7 +332,7 @@ impl VariantGet {
     /// cast above it types the read ([`Cast::from_handle`] fuses the chain).
     pub(crate) fn from_handle(func: FunctionHandle<'_>) -> Result<VariantGet, Error> {
         let params = function_args(func, 2)?;
-        let field = constant_string(Expression::from_handle(params[1])?, "->: field name")?;
+        let field = constant_string(Expression::from_handle(params[1])?)?;
         Ok(VariantGet {
             input: Box::new(Expression::from_handle(params[0])?),
             path: vec![field],
@@ -402,8 +405,7 @@ impl Length {
 impl DateTrunc {
     pub(crate) fn from_handle(func: FunctionHandle<'_>) -> Result<DateTrunc, Error> {
         let params = function_args(func, 2)?;
-        let unit = constant_string(Expression::from_handle(params[0])?, "date_trunc: unit")?
-            .to_ascii_lowercase();
+        let unit = constant_string(Expression::from_handle(params[0])?)?.to_ascii_lowercase();
         Ok(DateTrunc {
             unit,
             source: Box::new(Expression::from_handle(params[1])?),
@@ -551,20 +553,13 @@ fn interval_offset(interval: &IntervalParts, result: &Type) -> Result<i64, Error
 /// Extract the `(input, pattern, replacement)` shared by `regexp_replace` and
 /// `regexp_jit_replace`. Only the three-argument first-match form is accepted: a
 /// fourth `options` argument (e.g. 'g' for replace-all) would change the
-/// semantics. Error contexts are keyed off the function's own name.
+/// semantics.
 fn regex_replace_args(
     func: FunctionHandle<'_>,
 ) -> Result<(Box<Expression>, String, String), Error> {
-    let name = func.name();
     let params = function_args(func, 3)?;
-    let replacement = constant_string(
-        Expression::from_handle(params[2])?,
-        &format!("{name}: replacement"),
-    )?;
-    let pattern = constant_string(
-        Expression::from_handle(params[1])?,
-        &format!("{name}: pattern"),
-    )?;
+    let replacement = constant_string(Expression::from_handle(params[2])?)?;
+    let pattern = constant_string(Expression::from_handle(params[1])?)?;
     let input = Box::new(Expression::from_handle(params[0])?);
     Ok((input, pattern, replacement))
 }
@@ -577,6 +572,17 @@ impl RegexpReplace {
             pattern,
             replacement,
         })
+    }
+}
+
+impl RegexpFullMatch {
+    pub(crate) fn from_handle(func: FunctionHandle<'_>) -> Result<RegexpFullMatch, Error> {
+        // Only the two-argument overload; DuckDB's third `options` argument
+        // (`'i'`, `'s'`, …) is rejected as a wrong parameter count.
+        let params = function_args(func, 2)?;
+        let pattern = constant_string(Expression::from_handle(params[1])?)?;
+        let input = Box::new(Expression::from_handle(params[0])?);
+        Ok(RegexpFullMatch { input, pattern })
     }
 }
 
@@ -609,22 +615,25 @@ fn function_args(func: FunctionHandle<'_>, expected: usize) -> Result<Vec<Expr<'
 }
 
 /// Extract a constant string argument (e.g. a regex pattern or a `date_trunc`
-/// unit) from a built expression, erroring with `context` when the argument is
-/// not a string constant.
-fn constant_string(e: Expression, context: &str) -> Result<String, Error> {
+/// unit) from a built expression. The error names the offending argument, so a
+/// caller needs to supply nothing beyond the expression itself.
+fn constant_string(e: Expression) -> Result<String, Error> {
     match e {
         Expression::Constant(scalar) => {
             let (arr, _) = scalar.get();
             Ok(arr
                 .as_string_view_opt()
                 .ok_or_else(|| {
-                    Error::UnsupportedScalarFunction(format!("{context} must be a string"))
+                    Error::UnsupportedScalarFunction(format!(
+                        "expected a string constant, got a {} constant",
+                        arr.data_type()
+                    ))
                 })?
                 .value(0)
                 .to_string())
         }
-        _ => Err(Error::UnsupportedScalarFunction(format!(
-            "{context} must be a constant"
+        other => Err(Error::UnsupportedScalarFunction(format!(
+            "expected a string constant, got {other}"
         ))),
     }
 }
