@@ -202,7 +202,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let suite_run = rt.block_on(runner::run_suite(server.port(), &suite, &opts))?;
+    let suite_run = rt.block_on(runner::run_suite(&server, &suite, &opts))?;
 
     if cli.update_results {
         println!(

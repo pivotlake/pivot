@@ -1,0 +1,1 @@
+SELECT j->>'$.did' AS user_id, CAST((MAX(CAST(j->>'$.time_us' AS BIGINT)) - MIN(CAST(j->>'$.time_us' AS BIGINT))) / 1000 AS BIGINT) AS activity_span_ms FROM bluesky WHERE (j->>'$.kind' = 'commit') AND (j->>'$.commit.operation' = 'create') AND (j->>'$.commit.collection' = 'app.bsky.feed.post') GROUP BY user_id ORDER BY activity_span_ms DESC, user_id LIMIT 3;

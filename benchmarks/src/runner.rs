@@ -8,12 +8,16 @@
 //! `--update-results`) so a faster regression that silently broke the result
 //! is caught.
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
+use flate2::read::MultiGzDecoder;
 use thiserror::Error;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
+
+use crate::server_handle::ServerHandle;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -48,12 +52,53 @@ pub struct Query {
     pub expected_path: PathBuf,
 }
 
+/// How a suite loads its data by `INSERT` rather than reading pre-written
+/// Parquet in place, declared in the suite's `load.conf` as `<table> <batch>`.
+/// The documents are the newline-delimited JSON under `--source`, sent as
+/// batched `INSERT ... VALUES`, then compacted into target-sized files.
+#[derive(Debug, Clone)]
+pub struct LoadSpec {
+    /// Table the documents are inserted into.
+    pub table: String,
+    /// Documents per `INSERT` statement. Each statement is its own file, so
+    /// this trades statement size against how many small files compaction then
+    /// merges.
+    pub batch_rows: usize,
+}
+
 /// Description of a benchmark suite.
 #[derive(Debug)]
 pub struct Suite {
     pub name: String,
     pub setup_sql_path: PathBuf,
     pub queries: Vec<Query>,
+    /// Present when the suite loads its data through `INSERT` (see [`LoadSpec`]).
+    pub load: Option<LoadSpec>,
+}
+
+/// Read a suite's optional `load.conf`: one line, `<table> <batch_rows>`.
+fn read_load_spec(suite_dir: &Path) -> Result<Option<LoadSpec>> {
+    let path = suite_dir.join("load.conf");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(Error::Io { path, source }),
+    };
+    let spec_line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .unwrap_or_else(|| panic!("load.conf has no `<table> <batch_rows>` line: {text:?}"));
+    let mut fields = spec_line.split_whitespace();
+    let table = fields.next().unwrap_or_default().to_string();
+    let batch_rows = fields
+        .next()
+        .and_then(|n| n.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            panic!("load.conf must read `<table> <batch_rows>`, got: {spec_line:?}")
+        });
+    Ok(Some(LoadSpec { table, batch_rows }))
 }
 
 /// Discover queries by listing `.sql` files in `suite_dir`. Every `*.sql`
@@ -101,6 +146,7 @@ pub fn discover_suite(name: &str, suite_dir: &Path) -> Result<Suite> {
         name: name.to_string(),
         setup_sql_path,
         queries,
+        load: read_load_spec(suite_dir)?,
     })
 }
 
@@ -325,18 +371,113 @@ fn clear_stale_table_logs(source: &std::path::Path) {
     }
 }
 
+/// Split a setup script into the statements it declares. The server prepares one
+/// statement per query, so a suite that declares more than one table, or loads
+/// one from another, has to send them separately. Line comments come off first:
+/// a comment's prose carries semicolons of its own, and they are not statement
+/// ends. This assumes no statement holds `--` or `;` inside a string literal,
+/// which is true of every suite here.
+fn setup_statements(script: &str) -> Vec<String> {
+    let statements = script
+        .lines()
+        .map(|line| line.split_once("--").map_or(line, |(code, _)| code))
+        .collect::<Vec<_>>()
+        .join("\n");
+    statements
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Load every newline-delimited JSON document under `source` into `spec.table`
+/// as batched `INSERT ... VALUES`. A `.json.gz` file is decompressed on the fly;
+/// a plain `.json` is read as-is. Files are loaded in name order so a run is
+/// reproducible.
+async fn load_documents(client: &Client, source: &Path, spec: &LoadSpec) -> Result<()> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(source)
+        .map_err(|source_err| Error::Io {
+            path: source.to_path_buf(),
+            source: source_err,
+        })?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| {
+            let name = path.to_string_lossy();
+            name.ends_with(".json") || name.ends_with(".json.gz")
+        })
+        .collect();
+    files.sort();
+
+    let mut batch: Vec<String> = Vec::with_capacity(spec.batch_rows);
+    let mut inserted = 0usize;
+    for path in &files {
+        let file = std::fs::File::open(path).map_err(|source| Error::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let reader: Box<dyn BufRead> = if path.extension().is_some_and(|e| e == "gz") {
+            Box::new(BufReader::new(MultiGzDecoder::new(file)))
+        } else {
+            Box::new(BufReader::new(file))
+        };
+        for line in reader.lines() {
+            let document = line.map_err(|source| Error::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if document.trim().is_empty() {
+                continue;
+            }
+            batch.push(document);
+            if batch.len() == spec.batch_rows {
+                inserted += insert_documents(client, &spec.table, &batch).await?;
+                batch.clear();
+            }
+        }
+    }
+    if !batch.is_empty() {
+        inserted += insert_documents(client, &spec.table, &batch).await?;
+    }
+    println!("loaded {inserted} documents into {}", spec.table);
+    Ok(())
+}
+
+/// Insert one batch of JSON documents as a single `INSERT ... VALUES`. Each
+/// document is a string literal the column's `VARIANT` type parses as JSON; the
+/// only thing to escape for a SQL string literal is the single quote.
+async fn insert_documents(client: &Client, table: &str, documents: &[String]) -> Result<usize> {
+    let mut sql = String::from("INSERT INTO ");
+    sql.push_str(table);
+    sql.push_str(" VALUES ");
+    for (i, document) in documents.iter().enumerate() {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str("('");
+        sql.push_str(&document.replace('\'', "''"));
+        sql.push_str("')");
+    }
+    client.simple_query(&sql).await?;
+    Ok(documents.len())
+}
+
 /// Run every query in `suite` (filtered by `opts.query_filter`).
 ///
 /// `setup_template` reads the suite's `setup.sql`, substitutes `{source}`
-/// with the data path, and ships each `;`-terminated statement as its own
-/// `simple_query` (the server plans one statement at a time; a multi-table
-/// suite's setup holds one CREATE TABLE per table). Tables persist on
+/// with the data path, and ships each statement as its own `simple_query` (the
+/// server plans one statement at a time; a multi-table suite's setup holds one
+/// CREATE TABLE per table). Tables persist on
 /// the server's `ParquetCatalog` for the lifetime of the process — fine,
 /// since we tear the server down at the end of `main`.
-pub async fn run_suite(port: u16, suite: &Suite, opts: &RunOptions) -> Result<SuiteRun> {
+pub async fn run_suite(
+    server: &ServerHandle,
+    suite: &Suite,
+    opts: &RunOptions,
+) -> Result<SuiteRun> {
     let (client, connection) = tokio_postgres::Config::new()
         .host("127.0.0.1")
-        .port(port)
+        .port(server.port())
         .user("bench")
         .dbname("bench")
         .connect(NoTls)
@@ -347,16 +488,16 @@ pub async fn run_suite(port: u16, suite: &Suite, opts: &RunOptions) -> Result<Su
 
     let setup_template = read_to_string(&suite.setup_sql_path)?;
     let setup_sql = setup_template.replace("{source}", &opts.source.display().to_string());
-    for statement in setup_sql.split(';') {
-        // A chunk with no SQL in it (whitespace, or `--` comment lines only,
-        // e.g. a trailing comment block) has nothing to run.
-        let is_sql = statement
-            .lines()
-            .any(|line| !line.trim().is_empty() && !line.trim().starts_with("--"));
-        if !is_sql {
-            continue;
-        }
-        client.simple_query(statement).await?;
+    for statement in setup_statements(&setup_sql) {
+        client.simple_query(&statement).await?;
+    }
+
+    // A suite with a `load.conf` populates its table by INSERT instead of
+    // reading Parquet in place: send the documents in batches, then compact the
+    // many small files each batch left into target-sized ones before querying.
+    if let Some(spec) = &suite.load {
+        load_documents(&client, &opts.source, spec).await?;
+        server.compact().await;
     }
 
     if let Some(warmup) = &opts.warmup {
