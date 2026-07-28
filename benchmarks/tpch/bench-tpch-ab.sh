@@ -18,6 +18,11 @@
 # --regression-pct fails the run, as does a missing timing or an output
 # mismatch between the two sides.
 #
+# The box-side machinery it shares with the JSONBench harness (NVMe mount,
+# checkouts, warm-cache restore/save, PGO builds, correctness) lives in
+# benchmarks/lib/bench-ab-common.sh; what is specific to the TPC-H flat suite
+# stays here: the S3 dataset sync, and the per-query interleaved measurement.
+#
 # Meant to be launched detached and polled over ssh, so it writes its PID and
 # emits a sentinel on every exit path.
 #
@@ -31,6 +36,14 @@
 #     [--report /tmp/ab-report.txt] [--before-label <sha>] [--after-label <sha>]
 
 set -uo pipefail
+
+# The shared library sits at ../lib in the repo, but the workflow ships both
+# files flat into one /tmp directory on the box; find it either way.
+_here="${BASH_SOURCE[0]%/*}"
+_common="$_here/bench-ab-common.sh"
+[[ -f "$_common" ]] || _common="$_here/../lib/bench-ab-common.sh"
+# shellcheck source=../lib/bench-ab-common.sh
+source "$_common"
 
 pid_file="${PID_FILE:-/tmp/bench-tpch-ab.pid}"
 echo $$ >"$pid_file"
@@ -96,47 +109,12 @@ if [[ "$mode" != "pgo" && "$mode" != "release" ]]; then
     exit 2
 fi
 
-export PATH="$PATH:$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin"
-export NO_COLOR=1
-
-if [[ -n "$bench_env" ]]; then
-    for kv in $bench_env; do
-        export "${kv?}"
-    done
-fi
-
-run_id="$(date +%s)-$$"
-host_target="$(rustc -vV | sed -n 's/^host: //p')"
-# Cache entries are only valid for the exact compiler (fingerprints) and this
-# instance family's target-cpu=native output; the toolchain string covers both
-# since the AMI pins the toolchain and the workflow pins the instance type.
-cache_key="$(rustc -V | tr ' ()' '__.')"
+ab_common_init
 
 sf_pgo="sf10"
 sf_measure="sf100"
 pgo_data="$data_root/$sf_pgo/flat"
 measure_data="$data_root/$sf_measure/flat"
-
-# ---------------------------------------------------------------------------
-# Instance-store NVMe: find the unformatted ephemeral disk and mount it.
-# Device names are not stable across instance types, so pick by model string.
-# ---------------------------------------------------------------------------
-mount_nvme() {
-    local mnt
-    mnt="$(dirname "$data_root")"
-    if mountpoint -q "$mnt"; then
-        echo ">>> $mnt already mounted"
-        return
-    fi
-    local dev
-    dev="$(lsblk -dno NAME,MODEL | awk '/Instance Storage/ {print $1; exit}')"
-    [[ -n "$dev" ]] || { echo "error: no instance-store NVMe device found" >&2; exit 1; }
-    echo ">>> formatting /dev/$dev and mounting at $mnt"
-    sudo mkfs.ext4 -q -E lazy_itable_init=1 "/dev/$dev"
-    sudo mkdir -p "$mnt"
-    sudo mount -o noatime "/dev/$dev" "$mnt"
-    sudo chown "$(id -u):$(id -g)" "$mnt"
-}
 
 # ---------------------------------------------------------------------------
 # Dataset sync, backgrounded: the small PGO scale lands first (it gates the
@@ -174,134 +152,8 @@ wait_for_scale() {
 }
 
 # ---------------------------------------------------------------------------
-# Source checkouts: local clones of the AMI-baked repo (object hardlinks, no
-# network), with submodules resolved against the baked clone's modules. A
-# commit that bumps a submodule past the baked state falls back to the
-# network, which all submodules allow (public forks).
-# ---------------------------------------------------------------------------
-checkout_side() {
-    local sha="$1" dir="$2"
-    rm -rf "$dir"
-    git -c protocol.file.allow=always clone --quiet --no-checkout "$mirror" "$dir"
-    git -C "$dir" checkout --quiet "$sha"
-    git -C "$dir" \
-        -c submodule.alternateLocation=superproject \
-        -c submodule.alternateErrorStrategy=info \
-        -c protocol.file.allow=always \
-        submodule update --quiet --init --recursive
-    # Cargo fingerprints path dependencies by mtime, and a fresh clone stamps
-    # fresh mtimes, so a restored target dir would rebuild every workspace and
-    # submodule crate anyway. Re-stamping each file with its last commit's
-    # time makes mtimes stable across runs, so unchanged crates really do
-    # come out of the cache.
-    git -C "$dir" restore-mtime --quiet
-    git -C "$dir" submodule foreach --quiet --recursive 'git restore-mtime --quiet'
-}
-
-# ---------------------------------------------------------------------------
-# Warm-cache tarballs in S3. Restores are best-effort: a miss just means a
-# cold build. Saves happen after the builds so even a failed measurement
-# leaves the next run warm.
-# ---------------------------------------------------------------------------
-s3_get() { aws s3 cp --only-show-errors "$1" - 2>/dev/null; }
-s3_put() { aws s3 cp --only-show-errors - "$1"; }
-
-restore_cache() {
-    local name="$1" dest="$2"
-    [[ -n "$cache_prefix" ]] || return 0
-    mkdir -p "$dest"
-    if s3_get "$cache_prefix/$cache_key/$name.tar.zst" | tar -I 'zstd -d' -x -C "$dest" 2>/dev/null; then
-        echo ">>> cache restored: $name"
-    else
-        echo ">>> cache miss: $name (cold build)"
-        # A partial extract from a truncated stream must not poison the build.
-        rm -rf "${dest:?}"/*
-    fi
-}
-
-# Restoring into ~/.cargo must never touch bin/ (the AMI's toolchain), so the
-# cargo-home tarball holds only the registry and git checkouts.
-restore_cargo_home() {
-    [[ -n "$cache_prefix" ]] || return 0
-    if s3_get "$cache_prefix/$cache_key/cargo-home.tar.zst" | tar -I 'zstd -d' -x -C "$HOME/.cargo" 2>/dev/null; then
-        echo ">>> cache restored: cargo-home"
-    else
-        echo ">>> cache miss: cargo-home"
-    fi
-}
-
-save_cache() {
-    local name="$1" src="$2"; shift 2
-    local paths=("${@:-.}")
-    [[ -n "$cache_prefix" && -d "$src" ]] || return 0
-    (cd "$src" && mkdir -p "${paths[@]}")
-    tar -I 'zstd -3 -T0' -c -C "$src" "${paths[@]}" | s3_put "$cache_prefix/$cache_key/$name.tar.zst"
-    echo ">>> cache saved: $name"
-}
-
-# ---------------------------------------------------------------------------
-# Builds. PGO: instrumented build (shared warm cache; the profile-generate
-# path is the fixed pgo_dir from benchmarks/justfile, so its RUSTFLAGS never
-# change and restored artifacts stay valid), profiling run on the small scale
-# with LLVM_PROFILE_FILE separating the sides, then a profile-use build. The
-# profdata path embeds this run's id so the rebuild of every Rust unit under
-# the fresh profile follows from the flags hash alone; rustc's dep-info also
-# tracks the profile file, but that check compares mtimes against artifacts
-# restored from another machine's clock. The restored target dir still
-# donates its profile-independent build-script outputs (the DuckDB C++
-# build), which the explicit --target keeps unflagged.
-# ---------------------------------------------------------------------------
-# Fixed profile-generate path, matching benchmarks/justfile's pgo_dir: the
-# path sits inside RUSTFLAGS, and identical flags are what keep the restored
-# target-pgogen artifacts valid run over run.
-pgo_dir="/tmp/benchmarks-pgo"
-
-# Mirrors `just pgo-gen-build` / `just pgo-use-with` (pgo.just), inlined so
-# both sides build identically even when the before commit predates those
-# recipes. Keep the flags in sync with pgo.just.
-build_gen() {
-    local dir="$1"
-    mkdir -p "$pgo_dir"
-    # lld: instrumentation grows the text section past the 128MB aarch64
-    # branch range and GNU ld fails the link with relocation overflows; lld
-    # inserts range-extension thunks. Only the throwaway instrumented binary
-    # needs it, the measured profile-use build links like any release build.
-    (cd "$dir/benchmarks" && \
-        RUSTC_WRAPPER= \
-        RUSTFLAGS="-Cprofile-generate=$pgo_dir -Ctarget-cpu=native -Clink-arg=-fuse-ld=lld" \
-        CARGO_TARGET_DIR=target-pgogen cargo build --target "$host_target" --release)
-}
-
-profile_side() {
-    local dir="$1" side="$2"
-    local prof_dir="$work_dir/prof-$side"
-    rm -rf "$prof_dir"; mkdir -p "$prof_dir"
-    LLVM_PROFILE_FILE="$prof_dir/%m-%p.profraw" \
-        "$dir/benchmarks/target-pgogen/$host_target/release/pivot-bench" \
-        --suite tpch --suite-dir "$dir/benchmarks/tpch" \
-        --source "$pgo_data" --iterations 2 --skip-check >/dev/null
-    "$(dirname "$(rustc --print target-libdir)")/bin/llvm-profdata" \
-        merge -o "$work_dir/$side-$run_id.profdata" "$prof_dir"
-}
-
-build_use() {
-    local dir="$1" side="$2"
-    (cd "$dir/benchmarks" && \
-        RUSTC_WRAPPER= \
-        RUSTFLAGS="-Cprofile-use=$work_dir/$side-$run_id.profdata -Ctarget-cpu=native" \
-        CARGO_TARGET_DIR=target-pgouse cargo build --target "$host_target" --release)
-}
-
-build_release() {
-    local dir="$1"
-    (cd "$dir/benchmarks" && RUSTC_WRAPPER= cargo build --release)
-}
-
-# ---------------------------------------------------------------------------
 # Measurement helpers.
 # ---------------------------------------------------------------------------
-drop_caches() { sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null; }
-
 data_dev="" # set after mount, for the io_ticks sanity column
 io_ticks() {
     [[ -n "$data_dev" ]] || return 0
@@ -403,8 +255,8 @@ if [[ "$mode" == "pgo" ]]; then
     echo ">>> waiting for the $sf_pgo dataset"
     wait_for_scale "$sf_pgo"
     echo ">>> profiling runs on $sf_pgo"
-    profile_side "$before_dir" before
-    profile_side "$after_dir" after
+    profile_side "$before_dir" before tpch "$pgo_data"
+    profile_side "$after_dir" after tpch "$pgo_data"
 
     echo ">>> profile-use builds (A and B in parallel)"
     build_use "$before_dir" before & b1=$!
@@ -458,28 +310,7 @@ drop_caches
     --source "$measure_data" --query "$queries" --iterations 1 --update-results >/dev/null
 
 correctness="ok"
-if ! python3 - "$before_dir/benchmarks/tpch" "$after_dir/benchmarks/tpch" <<'EOF'
-import glob, sys
-before, after = sys.argv[1], sys.argv[2]
-ok = True
-for f in sorted(glob.glob(before + "/q*.tsv")):
-    name = f.rsplit("/", 1)[1]
-    a = open(f).read().strip().split("\n")
-    b = open(after + "/" + name).read().strip().split("\n")
-    if len(a) != len(b):
-        print(f"MISMATCH {name}: {len(a)} vs {len(b)} rows"); ok = False; continue
-    for ra, rb in zip(a, b):
-        for va, vb in zip(ra.split("\t"), rb.split("\t")):
-            try:
-                x, y = float(va), float(vb)
-                if abs(x - y) > 1e-6 * max(1, abs(x)):
-                    print(f"MISMATCH {name}: {va} vs {vb}"); ok = False
-            except ValueError:
-                if va != vb:
-                    print(f"MISMATCH {name}: {va!r} vs {vb!r}"); ok = False
-sys.exit(0 if ok else 1)
-EOF
-then
+if ! compare_outputs "$before_dir/benchmarks/tpch" "$after_dir/benchmarks/tpch"; then
     correctness="MISMATCH"
 fi
 
