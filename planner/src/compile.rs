@@ -70,6 +70,14 @@ pub enum Error {
     UnsupportedExpressionForContainsHaystack(Expression),
     #[error("Unsupported pattern expression for prefix: {0:?}")]
     UnsupportedExpressionForPrefixPattern(Expression),
+    #[error("Unsupported input expression for LIKE: {0:?}")]
+    UnsupportedExpressionForLikeInput(Expression),
+    #[error("Invalid LIKE pattern '{pattern}': {source}")]
+    InvalidLikePattern {
+        pattern: String,
+        #[source]
+        source: regex::Error,
+    },
     #[error("Unsupported haystack expression for prefix: {0:?}")]
     UnsupportedExpressionForPrefixHaystack(Expression),
     #[error("Failed to downcast scalar into string: {0:?}")]
