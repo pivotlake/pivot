@@ -2,7 +2,7 @@
 //! to the per-function expression types.
 
 use super::{
-    Arithmetic, Contains, DatePart, DateTrunc, Divide, IntervalArithmetic, Length, Prefix,
+    Arithmetic, Contains, DatePart, DateTrunc, Divide, IntervalArithmetic, Length, Like, Prefix,
     RegexpFullMatch, RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
@@ -69,6 +69,9 @@ pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
 pub enum Function {
     Contains(Contains),
     Prefix(Prefix),
+    /// `LIKE` / `NOT LIKE` against a constant pattern, for the patterns DuckDB's
+    /// optimizer leaves alone (several wildcards, or a `_`).
+    Like(Like),
     Arithmetic(Arithmetic),
     Length(Length),
     RegexpReplace(RegexpReplace),
@@ -113,6 +116,7 @@ impl Function {
                 visit(&p.haystack);
                 visit(&p.prefix);
             }
+            Function::Like(l) => visit(&l.input),
             Function::Arithmetic(a) => {
                 visit(&a.left);
                 visit(&a.right);
@@ -141,6 +145,7 @@ impl Display for Function {
         match self {
             Function::Contains(c) => write!(f, "{c}"),
             Function::Prefix(p) => write!(f, "{p}"),
+            Function::Like(l) => write!(f, "{l}"),
             Function::Arithmetic(a) => write!(f, "{a}"),
             Function::Length(l) => write!(f, "{l}"),
             Function::RegexpReplace(r) => write!(f, "{r}"),
@@ -163,9 +168,10 @@ impl Function {
     pub fn result_type(&self) -> Type {
         match self {
             // The string matchers yield booleans.
-            Function::Contains(_) | Function::Prefix(_) | Function::RegexpFullMatch(_) => {
-                Type::Boolean
-            }
+            Function::Contains(_)
+            | Function::Prefix(_)
+            | Function::Like(_)
+            | Function::RegexpFullMatch(_) => Type::Boolean,
             // Arithmetic and the extractors carry DuckDB's bound result type.
             Function::Arithmetic(a) => a.return_type.clone(),
             Function::Length(l) => l.return_type.clone(),
@@ -192,6 +198,7 @@ impl Function {
         match self {
             Function::Contains(c) => c.compile(),
             Function::Prefix(p) => p.compile(),
+            Function::Like(l) => l.compile(),
             Function::Arithmetic(a) => a.compile(),
             Function::Length(l) => l.compile(),
             Function::RegexpReplace(r) => r.compile(),
