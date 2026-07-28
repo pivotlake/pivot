@@ -284,11 +284,16 @@ fn absorb_scan_pushdown_filter(node: PlanNode) -> PlanNode {
 }
 
 /// Translate a general comparison join into pivot's [`Join`]. The supported
-/// shape is an INNER join with a single equality condition whose sides are
-/// plain column refs of a key type the dispatch join handles (`Int64`);
+/// shape is an INNER or RIGHT join with a single equality condition whose sides
+/// are plain column refs of a key type the dispatch join handles (`Int64`);
 /// anything else reports the specific gap. The probe is DuckDB's left child
 /// and the build its right, matching its hash-join convention (the cost model
 /// puts the smaller relation on the right).
+///
+/// RIGHT is the outer join whose preserved side is that right child, so it maps
+/// onto the dispatch join's build-side outer mode. A written `LEFT JOIN` lands
+/// here as RIGHT whenever its preserved relation is the smaller one; LEFT
+/// itself (preserving the streamed side) is not supported yet.
 ///
 /// DuckDB's join projection maps (which trim the join's output to the columns
 /// actually used above it) are folded into the join's own output lists, so
@@ -302,12 +307,15 @@ fn build_join(
     join: ComparisonJoinView<'_>,
     inputs: Vec<PlanNode>,
 ) -> Result<PlanNode, OperatorError> {
-    if join.join_type() != JoinType::INNER {
-        return Err(OperatorError::Unsupported(format!(
-            "Unsupported join type: {:?}",
-            join.join_type()
-        )));
-    }
+    let build_outer = match join.join_type() {
+        JoinType::INNER => false,
+        JoinType::RIGHT => true,
+        other => {
+            return Err(OperatorError::Unsupported(format!(
+                "Unsupported join type: {other:?}"
+            )));
+        }
+    };
     let mut conditions = join.conditions();
     let condition = match (conditions.next(), conditions.next()) {
         (Some(condition), None) => condition,
@@ -351,6 +359,12 @@ fn build_join(
     } else {
         right_map
     };
+    let outer_probe_types = build_outer.then(|| {
+        probe_output
+            .iter()
+            .map(|&i| probe_types[i].clone())
+            .collect()
+    });
     Ok(PlanNode {
         name: op.name(),
         inputs,
@@ -360,6 +374,7 @@ fn build_join(
             key_type: probe_key_type,
             probe_output,
             build_output,
+            outer_probe_types,
         }),
     })
 }

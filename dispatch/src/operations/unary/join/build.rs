@@ -41,7 +41,7 @@ pub(crate) struct BuildWorkerOutput<K: Copy> {
     payload: Vec<RecordBatch>,
 }
 
-pub struct JoinBuildConsumer<T: ArrowPrimitiveType<Native: Hash + Eq>> {
+pub struct JoinBuildConsumer<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool> {
     key_column: usize,
     worker_id: usize,
     hash_state: RandomState,
@@ -51,12 +51,17 @@ pub struct JoinBuildConsumer<T: ArrowPrimitiveType<Native: Hash + Eq>> {
     slab_allocator: SlabAllocator,
     partition_sizes: Arc<Vec<AtomicUsize>>,
     sender: mpsc::Sender<BuildWorkerOutput<T::Native>>,
-    outputter: JoinBuilder<T::Native>,
+    outputter: JoinBuilder<T::Native, BUILD_OUTER>,
 }
 
-unsafe impl<T: ArrowPrimitiveType<Native: Hash + Eq>> Send for JoinBuildConsumer<T> {}
+unsafe impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool> Send
+    for JoinBuildConsumer<T, BUILD_OUTER>
+{
+}
 
-impl<T: ArrowPrimitiveType<Native: Hash + Eq>> JoinBuildConsumer<T> {
+impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool>
+    JoinBuildConsumer<T, BUILD_OUTER>
+{
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         key_column: usize,
@@ -94,8 +99,10 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>> JoinBuildConsumer<T> {
     }
 }
 
-/// Drop rows whose join key is null: an inner equi-join can never match them,
-/// and the hot loops read key values without validity checks.
+/// Drop rows whose join key is null: an equi-join can never match them, and the
+/// hot loops read key values without validity checks. A build-side outer join
+/// keeps its build rows instead (they still reach the output, unmatched) and
+/// skips them when generating tuples.
 pub(crate) fn filter_null_keys(batch: RecordBatch, key_column: usize) -> RecordBatch {
     let col = batch.column(key_column);
     if col.null_count() == 0 {
@@ -105,12 +112,17 @@ pub(crate) fn filter_null_keys(batch: RecordBatch, key_column: usize) -> RecordB
     filter_record_batch(&batch, &mask).expect("null-key filter mask matches batch length")
 }
 
-impl<T: ArrowPrimitiveType<Native: Hash + Eq>> Consumer<RecordBatch, ()> for JoinBuildConsumer<T> {
-    type Outputter = JoinBuilder<T::Native>;
+impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool> Consumer<RecordBatch, ()>
+    for JoinBuildConsumer<T, BUILD_OUTER>
+{
+    type Outputter = JoinBuilder<T::Native, BUILD_OUTER>;
 
     fn consume<S: Sender<()>>(&mut self, batch: RecordBatch, _sender: &mut S) -> unary::Result<()> {
         debug!("Consuming build");
-        let batch = filter_null_keys(batch, self.key_column);
+        let batch = match BUILD_OUTER {
+            true => batch,
+            false => filter_null_keys(batch, self.key_column),
+        };
         let col = batch.column(self.key_column).as_primitive::<T>();
         let n = col.len();
         assert!(
@@ -119,6 +131,11 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>> Consumer<RecordBatch, ()> for Joi
         );
 
         for i in 0..n {
+            // Null-keyed rows are still in the payload of an outer build, and
+            // reach the output through the unmatched pass rather than a tuple.
+            if BUILD_OUTER && col.is_null(i) {
+                continue;
+            }
             let key = unsafe { col.value_unchecked(i) };
             let hash = self.hash_state.hash_one(key);
             let partition = (hash >> PARTITION_SHIFT) as usize;
@@ -153,7 +170,7 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>> Consumer<RecordBatch, ()> for Joi
     }
 }
 
-pub struct JoinBuilder<K: Copy + Send> {
+pub struct JoinBuilder<K: Copy + Send, const BUILD_OUTER: bool> {
     table: JoinTable<K>,
     receiver: Option<mpsc::Receiver<BuildWorkerOutput<K>>>,
     partition_sizes: Arc<Vec<AtomicUsize>>,
@@ -163,7 +180,7 @@ pub struct JoinBuilder<K: Copy + Send> {
     remaining_jobs: Arc<AtomicUsize>,
 }
 
-unsafe impl<K: Copy + Send> Send for JoinBuilder<K> {}
+unsafe impl<K: Copy + Send, const BUILD_OUTER: bool> Send for JoinBuilder<K, BUILD_OUTER> {}
 
 pub struct JoinPartitionJob<K: Copy + Send> {
     /// This partition's tuples, one entry per build worker, paired with that
@@ -241,7 +258,7 @@ impl<K: Copy + Send> JoinPartitionJob<K> {
     }
 }
 
-impl<K: Copy + Send> Outputter<()> for JoinBuilder<K> {
+impl<K: Copy + Send, const BUILD_OUTER: bool> Outputter<()> for JoinBuilder<K, BUILD_OUTER> {
     fn output<S: Sender<()>>(&mut self, _sender: &mut S) -> unary::Result<bool> {
         if let Some(rx) = self.receiver.take() {
             let mut worker_outputs: Vec<BuildWorkerOutput<K>> = rx.into_iter().collect();
@@ -279,6 +296,15 @@ impl<K: Copy + Send> Outputter<()> for JoinBuilder<K> {
                 concat_batches(&first.schema(), &payload_batches)
                     .expect("build payload batches share a schema")
             });
+
+            // One flag per payload row, not per tuple: a null-keyed row of an
+            // outer build has no tuple and stays permanently unmatched.
+            if BUILD_OUTER {
+                let payload_rows = build_rows.as_ref().map_or(0, |batch| batch.num_rows());
+                let mut matched_alloc = SlabAllocator::new(false);
+                let matched = unsafe { &mut *self.table.matched.get() };
+                *matched = matched_alloc.create_multi_slab_buffer::<u8>(payload_rows.max(1), true);
+            }
 
             // Pre-allocate directory and arenas.
             let dir_capacity = ((total as f64 * 1.125) as usize)
