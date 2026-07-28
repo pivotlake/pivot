@@ -1,5 +1,8 @@
 //! `pivot-bench` — performance harness for pivotdb.
 //!
+//! (A/B smoke-test marker: a behavior-neutral change so a distinct commit
+//! exists to compare against, exercising the harness without altering output.)
+//!
 //! Spins up the full pivotdb stack (`dispatch` workers + pgwire `Server` +
 //! `ParquetCatalog`) in-process on a free local port, connects with
 //! `tokio-postgres`, and runs a benchmark suite end-to-end through the wire
