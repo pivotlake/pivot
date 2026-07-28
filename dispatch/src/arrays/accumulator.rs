@@ -75,6 +75,13 @@ impl BatchAccumulator {
         self.len == 0
     }
 
+    /// The schema this accumulator coalesces into. A batch of a different schema
+    /// cannot be appended (its columns would not concatenate), so a caller
+    /// checks this and flushes first.
+    pub fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
     pub fn should_emit(&self) -> bool {
         self.len >= RECORD_BATCH_SIZE
     }

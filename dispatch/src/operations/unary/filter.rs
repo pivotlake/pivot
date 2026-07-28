@@ -150,6 +150,19 @@ where
             output.send(selected)?;
             return Ok(());
         }
+        // The accumulator coalesces into a fixed schema, but consecutive batches
+        // need not share one: a variant column shredded differently file to file
+        // arrives as a different struct type each time. When the schema changes,
+        // flush what is held and start a fresh accumulator, so unlike batches are
+        // emitted separately rather than concatenated into a type mismatch.
+        if let Some(accumulator) = &mut self.accumulator
+            && accumulator.schema() != &batch.schema()
+        {
+            if !accumulator.is_empty() {
+                output.send(accumulator.take_batch(&mut self.allocator)?)?;
+            }
+            self.accumulator = None;
+        }
         let accumulator = self
             .accumulator
             .get_or_insert_with(|| BatchAccumulator::new(batch.schema(), &mut self.allocator));
@@ -281,6 +294,57 @@ mod tests {
 
         assert_eq!(out.len(), 1);
         assert_eq!(i32_col(&out[0]), vec![10, 20, 30]);
+    }
+
+    /// A one-column batch whose column is a struct of `fields`, all rows zero.
+    /// Stands in for a variant column, which is a struct whose shredded shape
+    /// (and so arrow type) differs file to file.
+    fn struct_batch(fields: Vec<Field>) -> RecordBatch {
+        use arrow_array::StructArray;
+        use arrow_schema::Fields;
+        let arrays: Vec<ArrayRef> = fields
+            .iter()
+            .map(|_| Arc::new(Int32Array::from(vec![0, 0, 0])) as ArrayRef)
+            .collect();
+        let fields = Fields::from(fields);
+        let column = Arc::new(StructArray::new(fields.clone(), arrays, None)) as ArrayRef;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            DataType::Struct(fields),
+            false,
+        )]));
+        RecordBatch::try_new(schema, vec![column]).unwrap()
+    }
+
+    #[test]
+    fn survivors_of_unlike_schema_are_not_coalesced() {
+        // Partially-selected batches of different struct shape must not be
+        // coalesced into one accumulation: their columns are of different types
+        // and would fail to concatenate. This is what a variant column shredded
+        // differently across files produces.
+        init_test_free_pool(4);
+        let one = struct_batch(vec![Field::new("a", DataType::Int32, true)]);
+        let two = struct_batch(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]);
+
+        // Keep one row from each, so both take the coalescing (accumulator) path
+        // rather than passing through whole.
+        let filter = filter_operator(
+            |_: &RecordBatch, _: &mut SlabAllocator, indices: &mut Vec<u32>| {
+                indices.clear();
+                indices.push(0);
+                RowSelection::Indices
+            },
+        );
+
+        let out = run_unary_to_completion(filter, vec![one, two]);
+
+        assert_eq!(out.len(), 2, "unlike batches come out separately");
+        assert_eq!(out[0].num_rows(), 1);
+        assert_eq!(out[1].num_rows(), 1);
+        assert_ne!(out[0].schema(), out[1].schema());
     }
 
     #[test]
