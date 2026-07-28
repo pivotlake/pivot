@@ -61,13 +61,13 @@ impl RadixConfig {
 }
 
 /// One worker's scatter buffer for each radix partition.
-pub struct PartitionBuffers<K: KeyExtractor, V: AggregationValue>(
+pub struct PartitionBuffers<K: KeyExtractor, V: AggregationValue + ?Sized>(
     pub Vec<<V as AggregationValue>::Scatter<<K as KeyExtractor>::Persisted>>,
 );
-unsafe impl<K: KeyExtractor, V: AggregationValue> Send for PartitionBuffers<K, V> {}
+unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Send for PartitionBuffers<K, V> {}
 
 /// Tables, optional scatter buffers, and sizing data produced by one worker.
-pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue> {
+pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// The NUMA node whose worker flushed this output; the merge groups
     /// sources by it.
     pub node: usize,
@@ -84,7 +84,7 @@ pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue> {
 }
 
 /// Per-worker aggregation state.
-pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue> {
+pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     hash_state: RandomState,
     /// Shared value state used to construct tables and scatter rows.
     shared_context: V::SharedContext,
@@ -116,7 +116,7 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue> {
     zero_hash_seen: bool,
 }
 
-impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
     pub fn new(
         hash_state: RandomState,
         key_arena: Arc<SharedArena>,
@@ -349,7 +349,7 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
             let partition = (hash >> shift) as usize;
             // Entries are already deduplicated within this table.
             buffers[partition].push_with(scatter_layout, allocator, hash, *entry.key, |stored| {
-                V::clone_stored(stored, entry.stored)
+                stored.copy_from(entry.stored)
             });
         }
         table.clear();
@@ -381,7 +381,7 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
 ///
 /// A nonzero `N` specializes the entry layout and slot loops. `N == 0` uses
 /// runtime metadata.
-struct ProbeWindow<'a, 'b, K: KeyExtractor, V: AggregationValue> {
+struct ProbeWindow<'a, 'b, K: KeyExtractor, V: AggregationValue + ?Sized> {
     table: &'a mut MultiSlabTable<K, V>,
     key_arena: &'a mut WorkerArena,
     worker_context: &'a mut V::WorkerContext,
@@ -394,7 +394,7 @@ struct ProbeWindow<'a, 'b, K: KeyExtractor, V: AggregationValue> {
     shared_context: &'a V::SharedContext,
 }
 
-impl<K: KeyExtractor, V: AggregationValue> ArityBody<bool> for ProbeWindow<'_, '_, K, V> {
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> ArityBody<bool> for ProbeWindow<'_, '_, K, V> {
     #[inline(always)]
     fn run<const N: usize>(self) -> bool {
         let ProbeWindow {
@@ -433,7 +433,7 @@ impl<K: KeyExtractor, V: AggregationValue> ArityBody<bool> for ProbeWindow<'_, '
 /// table writes, allowing bound column pointers to remain outside the row loop.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
-fn probe_rows<const N: usize, K: KeyExtractor, V: AggregationValue>(
+fn probe_rows<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized>(
     table: &mut MultiSlabTable<K, V>,
     key_arena: &mut WorkerArena,
     worker_context: &mut V::WorkerContext,
@@ -477,9 +477,9 @@ fn probe_rows<const N: usize, K: KeyExtractor, V: AggregationValue>(
                 hash,
                 key,
                 &mut *worker_context,
-                |worker_context, stored| V::seed_stored(stored, value_reader, row, worker_context),
+                |worker_context, stored| stored.seed(value_reader, row, worker_context),
                 |worker_context, stored| {
-                    V::update_stored(stored, value_reader, row, worker_context, shared_context)
+                    stored.update(value_reader, row, worker_context, shared_context)
                 },
             );
             row += 1;
@@ -494,7 +494,7 @@ fn probe_rows<const N: usize, K: KeyExtractor, V: AggregationValue>(
 }
 
 /// State passed through arity dispatch for one scatter range.
-struct ScatterWindow<'a, 'b, K: KeyExtractor, V: AggregationValue> {
+struct ScatterWindow<'a, 'b, K: KeyExtractor, V: AggregationValue + ?Sized> {
     buffers: &'a mut Vec<<V as AggregationValue>::Scatter<<K as KeyExtractor>::Persisted>>,
     key_arena: &'a mut WorkerArena,
     worker_context: &'a mut V::WorkerContext,
@@ -509,7 +509,7 @@ struct ScatterWindow<'a, 'b, K: KeyExtractor, V: AggregationValue> {
     shared_context: &'a V::SharedContext,
 }
 
-impl<K: KeyExtractor, V: AggregationValue> ArityBody<()> for ScatterWindow<'_, '_, K, V> {
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> ArityBody<()> for ScatterWindow<'_, '_, K, V> {
     /// Scatter has little live state, so keeping it inline avoids a window call.
     #[inline(always)]
     fn run<const N: usize>(self) {
@@ -542,7 +542,7 @@ impl<K: KeyExtractor, V: AggregationValue> ArityBody<()> for ScatterWindow<'_, '
             let key = K::live_key(key_reader, i, key_arena).persist();
             // Seed directly into the destination row.
             buffers[partition].push_with(scatter_layout, allocator, hash, key, |stored| {
-                V::seed_stored(stored, value_reader, i, worker_context)
+                stored.seed(value_reader, i, worker_context)
             });
         }
     }

@@ -32,21 +32,21 @@ const OUTPUT_CHUNK_ROWS: usize = BUFFER_SIZE / 16;
 /// Limits that fit one slab use contiguous storage. Larger limits use
 /// multi-slab storage. Selecting the representation once keeps row offers
 /// statically dispatched.
-enum TopKHeap<K: KeyExtractor, V: AggregationValue> {
+enum TopKHeap<K: KeyExtractor, V: AggregationValue + ?Sized> {
     Single {
         slot: usize,
-        heap: SingleTopK<V::SortKey, (K::Persisted, V)>,
+        heap: SingleTopK<V::SortKey, (K::Persisted, V::Owned)>,
     },
     Multi {
         slot: usize,
-        heap: MultiTopK<V::SortKey, (K::Persisted, V)>,
+        heap: MultiTopK<V::SortKey, (K::Persisted, V::Owned)>,
     },
 }
 
-impl<K: KeyExtractor, V: AggregationValue> TopKHeap<K, V> {
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> TopKHeap<K, V> {
     /// A heap that keeps the top `limit` groups by `sort_key(slot)`.
     fn new(allocator: &mut SlabAllocator, slot: usize, limit: usize) -> Self {
-        if limit <= slots_per_slab::<V::SortKey, (K::Persisted, V)>() {
+        if limit <= slots_per_slab::<V::SortKey, (K::Persisted, V::Owned)>() {
             Self::Single {
                 slot,
                 heap: SlabTopK::single(allocator, limit),
@@ -65,7 +65,7 @@ impl<K: KeyExtractor, V: AggregationValue> TopKHeap<K, V> {
 /// The retention check precedes [`AggregationValue::to_owned`], so dynamic
 /// cells are copied only for candidates the heap can keep.
 fn offer_all<K, V, A>(
-    heap: &mut SlabTopK<V::SortKey, (K::Persisted, V), A>,
+    heap: &mut SlabTopK<V::SortKey, (K::Persisted, V::Owned), A>,
     slot: usize,
     table: &Table<K, V>,
     allocator: &mut SlabAllocator,
@@ -73,20 +73,20 @@ fn offer_all<K, V, A>(
     owned_context: &mut Option<V::WorkerContext>,
 ) where
     K: KeyExtractor,
-    V: AggregationValue,
-    A: HeapBuffer<Ranked<V::SortKey, (K::Persisted, V)>>,
+    V: AggregationValue + ?Sized,
+    A: HeapBuffer<Ranked<V::SortKey, (K::Persisted, V::Owned)>>,
 {
     for entry in table.iter(0) {
-        let sort_key = V::sort_key_stored(entry.stored, slot);
+        let sort_key = entry.stored.sort_key(slot);
         if heap.would_retain(sort_key) {
-            let value = V::to_owned(entry.stored, context, owned_context);
+            let value = entry.stored.to_owned(context, owned_context);
             heap.offer(allocator, sort_key, (*entry.key, value));
         }
     }
 }
 
 /// Per-worker output pruning mode.
-enum OutputMode<K: KeyExtractor, V: AggregationValue> {
+enum OutputMode<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// Keeps the worker's best rows for ORDER BY and LIMIT.
     TopK(TopKHeap<K, V>),
     /// Remaining row budget for an unordered LIMIT.
@@ -95,7 +95,7 @@ enum OutputMode<K: KeyExtractor, V: AggregationValue> {
     Unlimited,
 }
 
-impl<K: KeyExtractor, V: AggregationValue> OutputMode<K, V> {
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputMode<K, V> {
     fn new(allocator: &mut SlabAllocator, output_limit: Option<GroupLimit>) -> Self {
         match output_limit {
             Some(GroupLimit::TopK { slot, limit }) => {
@@ -111,7 +111,7 @@ impl<K: KeyExtractor, V: AggregationValue> OutputMode<K, V> {
 ///
 /// LIMIT state is worker-wide rather than partition-local, which allows many
 /// small radix partitions to be pruned together.
-pub(crate) struct OutputAccumulator<K: KeyExtractor, V: AggregationValue> {
+pub(crate) struct OutputAccumulator<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// Key and value builders for the batch currently being filled.
     key_builder: K::ColumnBuilder,
     value_builder: V::ColumnBuilder,
@@ -130,7 +130,7 @@ pub(crate) struct OutputAccumulator<K: KeyExtractor, V: AggregationValue> {
     owned_copy_context: Option<V::WorkerContext>,
 }
 
-impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
     pub(crate) fn new(
         allocator: &mut SlabAllocator,
         output_limit: Option<GroupLimit>,
@@ -165,7 +165,7 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
 
     /// Appends one group directly from a table entry.
     #[inline]
-    fn push_entry(&mut self, key: &K::Persisted, stored: &V::Stored) {
+    fn push_entry(&mut self, key: &K::Persisted, stored: &V) {
         self.key_builder.push(key);
         self.value_builder.push_stored(stored);
         self.len += 1;
@@ -173,7 +173,7 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
 
     /// Appends one owned group from the top-k heap.
     #[inline]
-    fn push_owned(&mut self, key: &K::Persisted, value: &V) {
+    fn push_owned(&mut self, key: &K::Persisted, value: &V::Owned) {
         self.key_builder.push(key);
         self.value_builder.push(value);
         self.len += 1;

@@ -143,16 +143,16 @@ impl WorkerContext for WorkerArena {
 /// Builds the aggregation columns in a GROUP BY result.
 pub trait ValueColumnBuilder {
     /// Value type appended to these columns.
-    type Value: AggregationValue;
+    type Value: AggregationValue + ?Sized;
     /// Shared context needed while finishing columns.
     type Context;
 
     /// Allocates builders for at most `rows` output groups.
     fn with_capacity(allocator: &mut SlabAllocator, rows: usize, context: &Self::Context) -> Self;
     /// Appends an owned value, as used by top-k output.
-    fn push(&mut self, value: &Self::Value);
+    fn push(&mut self, value: &<Self::Value as AggregationValue>::Owned);
     /// Appends a value directly from a table entry.
-    fn push_stored(&mut self, stored: &<Self::Value as AggregationValue>::Stored);
+    fn push_stored(&mut self, stored: &Self::Value);
     /// Finishes the Arrow fields and arrays.
     fn finish(self, context: &Self::Context) -> (Vec<Field>, Vec<ArrayRef>);
 }
@@ -211,20 +211,23 @@ pub trait ArityBody<R> {
     fn run<const N: usize>(self) -> R;
 }
 
-/// Aggregation payload stored for one group.
-///
-/// [`Stored`](Self::Stored) is the table-resident representation:
+/// Aggregation payload stored for one group, implemented by the
+/// entry-resident representation itself:
 ///
 /// ```text
-/// Compiled: Stored = Self
-/// Dynamic:  Stored = [A], with the slot count in StorageMetadata
+/// Compiled: implements this directly (its stored form is itself)
+/// Dynamic:  an unsized cell run, with the slot count in StorageMetadata
 /// ```
 ///
-/// `Self` remains a sized, copyable representation for paths such as top-k.
-pub trait AggregationValue: Copy + Default + Send + Sync + 'static {
-    /// Value representation stored inline in a table entry.
-    type Stored: ?Sized + Send + Sync;
-    /// Metadata needed to size and view [`Stored`](Self::Stored).
+/// The fold methods mutate `self` in place inside a table entry or scatter
+/// row. The one path that needs a sized, copyable value that outlives its
+/// table (a top-k heap row) goes through [`Owned`](Self::Owned).
+pub trait AggregationValue: Send + Sync + 'static {
+    /// Sized handle to a value that outlives its table, used only by top-k
+    /// heap rows. `Self` for a fixed-size value; an arena pointer for
+    /// [`Dynamic`].
+    type Owned: Copy + Default + Send + Sync + 'static;
+    /// Metadata needed to size and view a stored value.
     type StorageMetadata: Copy + Send + Sync + 'static;
     /// Per-partition scatter storage selected by the value representation.
     type Scatter<KP: PersistedKey>: ScatterRows<KP, Self>;
@@ -257,63 +260,58 @@ pub trait AggregationValue: Copy + Default + Send + Sync + 'static {
     /// The alignment of one stored value.
     fn stored_align() -> usize;
 
-    /// View an entry's value bytes as the stored form.
+    /// Views an entry's value bytes as a value reference.
     ///
     /// # Safety
     /// `ptr` must point at [`stored_size`](Self::stored_size) bytes aligned to
     /// [`stored_align`](Self::stored_align), valid for the returned lifetime,
     /// and `metadata` must describe this table's value layout.
-    unsafe fn stored_ref<'a>(ptr: *const u8, metadata: Self::StorageMetadata) -> &'a Self::Stored;
+    unsafe fn from_entry<'a>(ptr: *const u8, metadata: Self::StorageMetadata) -> &'a Self;
 
-    /// Mutable counterpart of [`stored_ref`](Self::stored_ref).
+    /// Mutable counterpart of [`from_entry`](Self::from_entry).
     ///
     /// # Safety
-    /// As [`stored_ref`](Self::stored_ref), plus `ptr` must be exclusive for
+    /// As [`from_entry`](Self::from_entry), plus `ptr` must be exclusive for
     /// the returned lifetime.
-    unsafe fn stored_mut<'a>(ptr: *mut u8, metadata: Self::StorageMetadata)
-    -> &'a mut Self::Stored;
+    unsafe fn from_entry_mut<'a>(ptr: *mut u8, metadata: Self::StorageMetadata) -> &'a mut Self;
 
-    /// Seeds a new table entry from one input row.
-    fn seed_stored(
-        destination: &mut Self::Stored,
+    /// Seeds this newly claimed, zeroed entry from one input row.
+    fn seed(
+        &mut self,
         reader: &Self::Reader<'_>,
         idx: usize,
         worker_context: &mut Self::WorkerContext,
     );
 
-    /// Folds one input row into an existing table entry.
-    fn update_stored(
-        destination: &mut Self::Stored,
+    /// Folds one input row into this existing group.
+    fn update(
+        &mut self,
         reader: &Self::Reader<'_>,
         idx: usize,
         worker_context: &mut Self::WorkerContext,
         context: &Self::SharedContext,
     );
 
-    /// Merges a source partial into a destination entry.
-    fn merge_stored(
-        destination: &mut Self::Stored,
-        source: &Self::Stored,
-        context: &Self::SharedContext,
-    );
+    /// Merges a source partial into this group.
+    fn merge_from(&mut self, source: &Self, context: &Self::SharedContext);
 
-    /// Copies a partial into a newly claimed entry.
-    fn clone_stored(destination: &mut Self::Stored, source: &Self::Stored);
+    /// Copies a partial into this newly claimed, zeroed entry.
+    fn copy_from(&mut self, source: &Self);
 
     /// Returns one slot as an ORDER BY key.
-    fn sort_key_stored(stored: &Self::Stored, slot: usize) -> Self::SortKey;
+    fn sort_key(&self, slot: usize) -> Self::SortKey;
 
-    /// Copies a table value into an owned representation for top-k.
+    /// Copies this table value into an owned handle for top-k.
     fn to_owned(
-        stored: &Self::Stored,
+        &self,
         context: &Self::SharedContext,
         worker_context: &mut Option<Self::WorkerContext>,
-    ) -> Self;
+    ) -> Self::Owned;
 }
 
 /// Adapts every fixed-size [`OwnedValue`] to in-place table storage.
 impl<T: OwnedValue> AggregationValue for T {
-    type Stored = T;
+    type Owned = T;
     type StorageMetadata = ();
     type Scatter<KP: PersistedKey> = SizedScatterRows<KP, T>;
     type Reader<'b> = <T as OwnedValue>::Reader<'b>;
@@ -345,57 +343,57 @@ impl<T: OwnedValue> AggregationValue for T {
     }
 
     #[inline(always)]
-    unsafe fn stored_ref<'a>(ptr: *const u8, _metadata: ()) -> &'a T {
+    unsafe fn from_entry<'a>(ptr: *const u8, _metadata: ()) -> &'a T {
         unsafe { &*(ptr as *const T) }
     }
 
     #[inline(always)]
-    unsafe fn stored_mut<'a>(ptr: *mut u8, _metadata: ()) -> &'a mut T {
+    unsafe fn from_entry_mut<'a>(ptr: *mut u8, _metadata: ()) -> &'a mut T {
         unsafe { &mut *(ptr as *mut T) }
     }
 
     #[inline(always)]
-    fn seed_stored(
-        destination: &mut T,
+    fn seed(
+        &mut self,
         reader: &Self::Reader<'_>,
         idx: usize,
         worker_context: &mut Self::WorkerContext,
     ) {
-        *destination = <T as OwnedValue>::value(reader, idx, worker_context);
+        *self = <T as OwnedValue>::value(reader, idx, worker_context);
     }
 
     #[inline(always)]
-    fn update_stored(
-        destination: &mut T,
+    fn update(
+        &mut self,
         reader: &Self::Reader<'_>,
         idx: usize,
         worker_context: &mut Self::WorkerContext,
         context: &Self::SharedContext,
     ) {
-        *destination = destination.update_from_reader(reader, idx, worker_context, context);
+        *self = self.update_from_reader(reader, idx, worker_context, context);
     }
 
     #[inline(always)]
-    fn merge_stored(destination: &mut T, source: &T, context: &Self::SharedContext) {
-        *destination = destination.merge(*source, context);
+    fn merge_from(&mut self, source: &T, context: &Self::SharedContext) {
+        *self = OwnedValue::merge(*self, *source, context);
     }
 
     #[inline(always)]
-    fn clone_stored(destination: &mut T, source: &T) {
-        *destination = *source;
+    fn copy_from(&mut self, source: &T) {
+        *self = *source;
     }
 
     #[inline(always)]
-    fn sort_key_stored(stored: &T, slot: usize) -> Self::SortKey {
-        stored.sort_key(slot)
+    fn sort_key(&self, slot: usize) -> Self::SortKey {
+        OwnedValue::sort_key(self, slot)
     }
 
     #[inline(always)]
     fn to_owned(
-        stored: &T,
+        &self,
         _context: &Self::SharedContext,
         _worker_context: &mut Option<Self::WorkerContext>,
     ) -> Self {
-        *stored
+        *self
     }
 }

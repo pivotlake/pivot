@@ -549,7 +549,7 @@ impl RecordBatchOperatorSpec {
     /// `V` the aggregate shape (e.g. its arity). `key_config` configures the key
     /// extractor (e.g. a [`RowKeySchema`](crate::RowKeySchema)); pass `()` for the
     /// extractors whose key shape is fully determined by their type.
-    pub fn group_by_aggregate<K: KeyExtractor, V: AggregationValue>(
+    pub fn group_by_aggregate<K: KeyExtractor, V: AggregationValue + ?Sized>(
         self,
         key_cols: Vec<usize>,
         value_slots: Vec<AggregationSlot>,

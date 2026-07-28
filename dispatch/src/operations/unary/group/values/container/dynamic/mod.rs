@@ -13,9 +13,9 @@
 //! `A` selects `i64` or `i128` accumulator storage. `ONLY_ADDITIVE` removes the
 //! per-slot operation dispatch when every slot merges with addition.
 //!
-//! Scatter rows use the same inline cell layout. [`Dynamic`] itself is only an
-//! owned handle used by top-k, where its pointer refers to a copy in the value
-//! arena.
+//! Scatter rows use the same inline cell layout. [`Dynamic`] is the stored
+//! cell run itself (an unsized slice newtype); [`OwnedDynamic`] is the sized
+//! handle top-k rows hold, pointing at a copy in the value arena.
 
 use super::super::cell::{F64Cell, IntCell, StringCell, WideCell};
 use super::super::{
@@ -33,11 +33,19 @@ use arrow_schema::Field;
 use operations::{Operation, Operations, finish_operation, merge_operation};
 use std::sync::Arc;
 
+/// One group's dynamic aggregation value: the cell run itself, one cell per
+/// slot, living inline in a hash entry or scatter row. Unsized; the slot
+/// count comes from the storage metadata.
+#[repr(transparent)]
+pub struct Dynamic<
+    A: IntCell + StringCell + F64Cell + WideCell = i64,
+    const ONLY_ADDITIVE: bool = false,
+>([A]);
+
 /// Owned handle to a dynamic aggregation value copied into the value arena.
 ///
-/// Hash tables and scatter buffers store the cells inline. This handle exists
-/// for top-k rows, which must outlive their source table.
-pub struct Dynamic<
+/// Exists only for top-k heap rows, which must outlive their source table.
+pub struct OwnedDynamic<
     A: IntCell + StringCell + F64Cell + WideCell = i64,
     const ONLY_ADDITIVE: bool = false,
 > {
@@ -47,30 +55,30 @@ pub struct Dynamic<
 }
 
 // SAFETY: every non-null pointer refers to an independent allocation in the
-// shared arena. The arena outlives every Dynamic handle, and normal table
-// handoffs provide synchronization between writers and readers.
+// shared arena. The arena outlives every handle, and normal table handoffs
+// provide synchronization between writers and readers.
 unsafe impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Send
-    for Dynamic<A, ONLY_ADDITIVE>
+    for OwnedDynamic<A, ONLY_ADDITIVE>
 {
 }
 unsafe impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Sync
-    for Dynamic<A, ONLY_ADDITIVE>
+    for OwnedDynamic<A, ONLY_ADDITIVE>
 {
 }
 
 impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Copy
-    for Dynamic<A, ONLY_ADDITIVE>
+    for OwnedDynamic<A, ONLY_ADDITIVE>
 {
 }
 impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Clone
-    for Dynamic<A, ONLY_ADDITIVE>
+    for OwnedDynamic<A, ONLY_ADDITIVE>
 {
     fn clone(&self) -> Self {
         *self
     }
 }
 impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Default
-    for Dynamic<A, ONLY_ADDITIVE>
+    for OwnedDynamic<A, ONLY_ADDITIVE>
 {
     fn default() -> Self {
         Self {
@@ -79,10 +87,22 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> De
     }
 }
 
+impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
+    OwnedDynamic<A, ONLY_ADDITIVE>
+{
+    /// Returns the owned cell block using the slot count from the query context.
+    ///
+    /// # Safety
+    /// `len` must equal the allocation's cell count.
+    unsafe fn cells(&self, len: usize) -> &[A] {
+        unsafe { std::slice::from_raw_parts(self.cells, len) }
+    }
+}
+
 impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> AggregationValue
     for Dynamic<A, ONLY_ADDITIVE>
 {
-    type Stored = [A];
+    type Owned = OwnedDynamic<A, ONLY_ADDITIVE>;
     /// Number of cells stored in each table entry.
     type StorageMetadata = usize;
     /// Scatter rows carry cells inline at a query-specific stride.
@@ -129,22 +149,25 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Ag
     }
 
     #[inline(always)]
-    unsafe fn stored_ref<'a>(ptr: *const u8, metadata: usize) -> &'a [A] {
-        unsafe { std::slice::from_raw_parts(ptr as *const A, metadata) }
+    unsafe fn from_entry<'a>(ptr: *const u8, metadata: usize) -> &'a Self {
+        // SAFETY of the cast: `repr(transparent)` over `[A]` gives Self the
+        // same layout and slice metadata as the cell run.
+        unsafe { &*(std::ptr::slice_from_raw_parts(ptr as *const A, metadata) as *const Self) }
     }
 
     #[inline(always)]
-    unsafe fn stored_mut<'a>(ptr: *mut u8, metadata: usize) -> &'a mut [A] {
-        unsafe { std::slice::from_raw_parts_mut(ptr as *mut A, metadata) }
+    unsafe fn from_entry_mut<'a>(ptr: *mut u8, metadata: usize) -> &'a mut Self {
+        unsafe { &mut *(std::ptr::slice_from_raw_parts_mut(ptr as *mut A, metadata) as *mut Self) }
     }
 
     #[inline(always)]
-    fn seed_stored(
-        destination: &mut [A],
+    fn seed(
+        &mut self,
         operations: &Self::Reader<'_>,
         idx: usize,
         worker_context: &mut WorkerArena,
     ) {
+        let destination = &mut self.0;
         let operations = operations.as_slice();
         debug_assert_eq!(destination.len(), operations.len());
         // Constant lengths let LLVM unroll the common small signatures.
@@ -164,16 +187,17 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Ag
     }
 
     #[inline(always)]
-    fn update_stored(
-        destination: &mut [A],
+    fn update(
+        &mut self,
         operations: &Self::Reader<'_>,
         idx: usize,
         worker_context: &mut WorkerArena,
         context: &Self::SharedContext,
     ) {
+        let destination = &mut self.0;
         let (_, shared) = context;
         let operations = operations.as_slice();
-        // Match `seed_stored` so repeated-key updates also unroll.
+        // Match `seed` so repeated-key updates also unroll.
         match destination.len() {
             1 => Self::update_fixed::<1>(destination, operations, idx, worker_context, shared),
             2 => Self::update_fixed::<2>(destination, operations, idx, worker_context, shared),
@@ -189,8 +213,9 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Ag
     }
 
     #[inline(always)]
-    fn merge_stored(destination: &mut [A], source: &[A], context: &Self::SharedContext) {
-        // Match `seed_stored` so common merge signatures unroll.
+    fn merge_from(&mut self, source: &Self, context: &Self::SharedContext) {
+        let (destination, source) = (&mut self.0, &source.0);
+        // Match `seed` so common merge signatures unroll.
         match destination.len() {
             1 => Self::merge_fixed::<1>(destination, source, context),
             2 => Self::merge_fixed::<2>(destination, source, context),
@@ -212,7 +237,8 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Ag
     }
 
     #[inline(always)]
-    fn clone_stored(destination: &mut [A], source: &[A]) {
+    fn copy_from(&mut self, source: &Self) {
+        let (destination, source) = (&mut self.0, &source.0);
         // Constant-size copies compile to direct loads and stores. Larger
         // values use the slice implementation.
         match destination.len() {
@@ -225,34 +251,27 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Ag
     }
 
     #[inline(always)]
-    fn sort_key_stored(stored: &[A], slot: usize) -> i128 {
+    fn sort_key(&self, slot: usize) -> i128 {
         // The planner only requests top-k sort keys for numeric slots.
-        stored[slot].into()
+        self.0[slot].into()
     }
 
     fn to_owned(
-        stored: &[A],
+        &self,
         context: &Self::SharedContext,
         worker_context: &mut Option<WorkerArena>,
-    ) -> Self {
+    ) -> OwnedDynamic<A, ONLY_ADDITIVE> {
+        let stored = &self.0;
         let worker_context = worker_context.get_or_insert_with(|| context.worker());
         let cells: *mut A = worker_context.alloc_cells(stored.len());
         unsafe { std::ptr::copy_nonoverlapping(stored.as_ptr(), cells, stored.len()) };
-        Self { cells }
+        OwnedDynamic { cells }
     }
 }
 
 impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
     Dynamic<A, ONLY_ADDITIVE>
 {
-    /// Returns the owned cell block using the slot count from the query context.
-    ///
-    /// # Safety
-    /// `len` must equal the allocation's cell count.
-    unsafe fn cells(&self, len: usize) -> &[A] {
-        unsafe { std::slice::from_raw_parts(self.cells, len) }
-    }
-
     /// Seeds a fixed-size cell array so the slot loop can unroll.
     #[inline(always)]
     fn seed_fixed<const N: usize>(
@@ -357,7 +376,7 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Va
     }
 
     #[inline(always)]
-    fn push(&mut self, value: &Self::Value) {
+    fn push(&mut self, value: &OwnedDynamic<A, ONLY_ADDITIVE>) {
         // The query context gives both the allocation and columns the same
         // slot count.
         let cells = unsafe { value.cells(self.builders.len()) };
@@ -367,8 +386,8 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Va
     }
 
     #[inline(always)]
-    fn push_stored(&mut self, stored: &[A]) {
-        for (builder, &cell) in self.builders.iter_mut().zip(stored.iter()) {
+    fn push_stored(&mut self, stored: &Dynamic<A, ONLY_ADDITIVE>) {
+        for (builder, &cell) in self.builders.iter_mut().zip(stored.0.iter()) {
             builder.push(cell);
         }
     }

@@ -125,11 +125,13 @@ pub(super) struct EntryLayout {
 }
 
 /// Returns the byte stride for one entry of this key and value type.
-pub fn entry_stride<K, V: AggregationValue>(ctx: &V::SharedContext) -> usize {
+pub fn entry_stride<K, V: AggregationValue + ?Sized>(ctx: &V::SharedContext) -> usize {
     entry_layout::<K, V>(V::storage_metadata(ctx)).stride
 }
 
-pub(super) fn entry_layout<K, V: AggregationValue>(metadata: V::StorageMetadata) -> EntryLayout {
+pub(super) fn entry_layout<K, V: AggregationValue + ?Sized>(
+    metadata: V::StorageMetadata,
+) -> EntryLayout {
     // Alignment and size for hash, key, and value.
     let fields = [
         (align_of::<u64>(), size_of::<u64>()),
@@ -240,7 +242,7 @@ fn prefetch_l2_line(ptr: *const u8) {
 ///
 /// This lets one merge job scan only its ranges. Storing the full hash also
 /// avoids hashing large keys again during resize and merge.
-pub struct BaseHashTable<K: PersistedKey, V: AggregationValue> {
+pub struct BaseHashTable<K: PersistedKey, V: AggregationValue + ?Sized> {
     mask: usize,
     shift: u32,
     collisions: usize,
@@ -265,12 +267,13 @@ pub struct BaseHashTable<K: PersistedKey, V: AggregationValue> {
     slabs: Vec<Slab>,
     length: usize,
     max_load: usize,
-    _phantom: PhantomData<(K, V)>,
+    // A raw-pointer marker: a plain `(K, V)` tuple would require `V: Sized`.
+    _phantom: PhantomData<(K, *const V)>,
 }
 
-unsafe impl<K: PersistedKey, V: AggregationValue> Send for BaseHashTable<K, V> {}
+unsafe impl<K: PersistedKey, V: AggregationValue + ?Sized> Send for BaseHashTable<K, V> {}
 
-impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
+impl<K: PersistedKey, V: AggregationValue + ?Sized> BaseHashTable<K, V> {
     /// Creates a zeroed table with power-of-two capacity.
     pub fn new(
         allocator: &mut SlabAllocator,
@@ -483,7 +486,7 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
 /// Hot loops copy this value into locals so raw entry writes cannot force
 /// repeated loads from the table object. Its `bases` pointer remains valid for
 /// the lifetime of the borrowing reader or prober.
-struct ProbeLayout<K, V: AggregationValue> {
+struct ProbeLayout<K, V: AggregationValue + ?Sized> {
     magic: u64,
     stride: usize,
     hash_offset: usize,
@@ -500,14 +503,14 @@ struct ProbeLayout<K, V: AggregationValue> {
     _phantom: PhantomData<K>,
 }
 
-impl<K, V: AggregationValue> Clone for ProbeLayout<K, V> {
+impl<K, V: AggregationValue + ?Sized> Clone for ProbeLayout<K, V> {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<K, V: AggregationValue> Copy for ProbeLayout<K, V> {}
+impl<K, V: AggregationValue + ?Sized> Copy for ProbeLayout<K, V> {}
 
-impl<K, V: AggregationValue> ProbeLayout<K, V> {
+impl<K, V: AggregationValue + ?Sized> ProbeLayout<K, V> {
     /// Map a hash to a slot index using the top bits.
     #[inline(always)]
     fn slot_for(&self, hash: u64) -> usize {
@@ -531,24 +534,24 @@ impl<K, V: AggregationValue> ProbeLayout<K, V> {
     /// The view of the occupied entry at `entry`'s address, with `hash`
     /// already read.
     #[inline(always)]
-    unsafe fn view<'a>(&self, entry: *const u8, hash: u64) -> EntryView<'a, K, V::Stored> {
+    unsafe fn view<'a>(&self, entry: *const u8, hash: u64) -> EntryView<'a, K, V> {
         unsafe {
             EntryView {
                 hash,
                 key: &*(entry.add(self.key_offset) as *const K),
-                stored: V::stored_ref(entry.add(self.value_offset), self.metadata),
+                stored: V::from_entry(entry.add(self.value_offset), self.metadata),
             }
         }
     }
 }
 
 /// Mutable table handle that keeps the probe layout local across many probes.
-pub struct Prober<'t, K: PersistedKey, V: AggregationValue> {
+pub struct Prober<'t, K: PersistedKey, V: AggregationValue + ?Sized> {
     table: &'t mut BaseHashTable<K, V>,
     layout: ProbeLayout<K, V>,
 }
 
-impl<K: PersistedKey, V: AggregationValue> Prober<'_, K, V> {
+impl<K: PersistedKey, V: AggregationValue + ?Sized> Prober<'_, K, V> {
     /// Prefetches the initial slot and two following cache lines into L1.
     #[inline(always)]
     pub fn prefetch(&self, hash: u64) {
@@ -576,17 +579,17 @@ impl<K: PersistedKey, V: AggregationValue> Prober<'_, K, V> {
         &mut self,
         hash: u64,
         key: L,
-        source: &V::Stored,
+        source: &V,
         ctx: &V::SharedContext,
     ) where
         L: LiveKey<Persisted = K>,
     {
-        self.probe_fold::<COUNT_COLLISIONS, L, &V::Stored, _, _>(
+        self.probe_fold::<COUNT_COLLISIONS, L, &V, _, _>(
             hash,
             key,
             source,
-            |source, stored| V::clone_stored(stored, source),
-            |source, stored| V::merge_stored(stored, source, ctx),
+            |source, stored| stored.copy_from(source),
+            |source, stored| stored.merge_from(source, ctx),
         );
     }
 
@@ -631,8 +634,8 @@ impl<K: PersistedKey, V: AggregationValue> Prober<'_, K, V> {
         update: U,
     ) where
         L: LiveKey<Persisted = K>,
-        S: FnOnce(X, &mut V::Stored),
-        U: FnOnce(X, &mut V::Stored),
+        S: FnOnce(X, &mut V),
+        U: FnOnce(X, &mut V),
     {
         let layout = self.layout;
         // hash == 0 is our empty sentinel, so remap actual zero hashes to 1.
@@ -650,7 +653,7 @@ impl<K: PersistedKey, V: AggregationValue> Prober<'_, K, V> {
                     self.table.length += 1;
                     seed(
                         context,
-                        V::stored_mut(entry.add(layout.value_offset), layout.metadata),
+                        V::from_entry_mut(entry.add(layout.value_offset), layout.metadata),
                     );
                     return;
                 }
@@ -659,7 +662,7 @@ impl<K: PersistedKey, V: AggregationValue> Prober<'_, K, V> {
                 {
                     update(
                         context,
-                        V::stored_mut(entry.add(layout.value_offset), layout.metadata),
+                        V::from_entry_mut(entry.add(layout.value_offset), layout.metadata),
                     );
                     return;
                 }
@@ -673,12 +676,12 @@ impl<K: PersistedKey, V: AggregationValue> Prober<'_, K, V> {
 }
 
 /// Read-only table handle with a local probe-layout snapshot.
-pub struct TableReader<'a, K: PersistedKey, V: AggregationValue> {
+pub struct TableReader<'a, K: PersistedKey, V: AggregationValue + ?Sized> {
     layout: ProbeLayout<K, V>,
     _table: PhantomData<&'a BaseHashTable<K, V>>,
 }
 
-impl<'a, K: PersistedKey, V: AggregationValue> TableReader<'a, K, V> {
+impl<'a, K: PersistedKey, V: AggregationValue + ?Sized> TableReader<'a, K, V> {
     /// See [`BaseHashTable::hash_at`].
     #[inline(always)]
     pub fn hash_at(&self, index: usize) -> u64 {
@@ -687,7 +690,7 @@ impl<'a, K: PersistedKey, V: AggregationValue> TableReader<'a, K, V> {
 
     /// See [`BaseHashTable::view_at`].
     #[inline(always)]
-    pub fn view_at(&self, index: usize) -> EntryView<'a, K, V::Stored> {
+    pub fn view_at(&self, index: usize) -> EntryView<'a, K, V> {
         let entry = self.layout.entry_ptr(index);
         unsafe {
             let hash = *(entry.add(self.layout.hash_offset) as *const u64);
@@ -700,14 +703,14 @@ impl<'a, K: PersistedKey, V: AggregationValue> TableReader<'a, K, V> {
 ///
 /// Created by [`BaseHashTable::iter`]. Yields [`EntryView`]s of entries where
 /// `hash != 0` in arbitrary order (based on slot positions, not insertion order).
-pub struct HashTableIterator<'a, K: PersistedKey, V: AggregationValue> {
+pub struct HashTableIterator<'a, K: PersistedKey, V: AggregationValue + ?Sized> {
     layout: ProbeLayout<K, V>,
     idx: usize,
     _table: PhantomData<&'a BaseHashTable<K, V>>,
 }
 
-impl<'a, K: PersistedKey, V: AggregationValue> Iterator for HashTableIterator<'a, K, V> {
-    type Item = EntryView<'a, K, V::Stored>;
+impl<'a, K: PersistedKey, V: AggregationValue + ?Sized> Iterator for HashTableIterator<'a, K, V> {
+    type Item = EntryView<'a, K, V>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let layout = self.layout;

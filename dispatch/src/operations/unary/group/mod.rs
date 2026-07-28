@@ -230,7 +230,7 @@ fn get_scatter_bucket_count_for_worker(total_workers: usize) -> usize {
 /// rows and inserts them into its local [`AggregatedTable`]. When consumption
 /// finishes, the accumulated tables are sent to a shared channel and the
 /// `Group` transitions into a [`GroupOutputter`] for the merge phase.
-pub struct Group<K: KeyExtractor, V: AggregationValue> {
+pub struct Group<K: KeyExtractor, V: AggregationValue + ?Sized> {
     key_cols: Vec<usize>,
     /// Slots drive the per-batch value reader (which column / `COUNT` vs `SUM`).
     value_slots: Vec<AggregationSlot>,
@@ -244,7 +244,7 @@ pub struct Group<K: KeyExtractor, V: AggregationValue> {
     outputter: GroupOutputter<K, V>,
 }
 
-impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         key_arena: Arc<SharedArena>,
@@ -307,7 +307,9 @@ impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
     }
 }
 
-impl<K: KeyExtractor, V: AggregationValue> Consumer<RecordBatch, RecordBatch> for Group<K, V> {
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> Consumer<RecordBatch, RecordBatch>
+    for Group<K, V>
+{
     type Outputter = GroupOutputter<K, V>;
 
     fn consume<S: Sender<RecordBatch>>(
@@ -339,7 +341,7 @@ impl<K: KeyExtractor, V: AggregationValue> Consumer<RecordBatch, RecordBatch> fo
 /// tables, and publishes [`PARTITIONS`] [`PartitionJob`]s to the shared
 /// work-stealing [`Injector`]. All workers (including the one that injected)
 /// then steal and execute jobs until the injector is empty.
-pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue> {
+pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// String *key* storage; backs the leading key column(s) at output.
     key_arena: Arc<SharedArena>,
     /// One job queue per NUMA node. A node-level merge job reads that node's
@@ -393,7 +395,7 @@ pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue> {
 /// the shared [`CrossNodeMerge`]; the last job to finish receives every node's
 /// table and merges them into the final one. That last merge is the only step
 /// that reads another node's memory.
-pub struct PartitionJob<K: KeyExtractor, V: AggregationValue> {
+pub struct PartitionJob<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// This node's switched workers' scatter buffers (empty Vec when none switched).
     buffers: Arc<Vec<PartitionBuffers<K, V>>>,
     /// Holds the in-place stacks of this node's workers: switched workers'
@@ -423,7 +425,7 @@ pub struct PartitionJob<K: KeyExtractor, V: AggregationValue> {
     count_only: bool,
 }
 
-unsafe impl<K: KeyExtractor, V: AggregationValue> Send for PartitionJob<K, V> {}
+unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Send for PartitionJob<K, V> {}
 
 /// One partition's pending cross-node merge: each node's job sends the node's
 /// merged aggregated table; the send that completes the set hands every
@@ -431,17 +433,17 @@ unsafe impl<K: KeyExtractor, V: AggregationValue> Send for PartitionJob<K, V> {}
 /// ([`merge::merge_node_aggregated_tables`]) and emit. Senders never block
 /// and no job ever waits: the mailbox is a lock-free queue and the election
 /// is one atomic countdown.
-struct CrossNodeMerge<K: KeyExtractor, V: AggregationValue> {
+struct CrossNodeMerge<K: KeyExtractor, V: AggregationValue + ?Sized> {
     node_tables: Injector<MultiSlabTable<K, V>>,
     /// Sends still outstanding; the sender that decrements this to zero is
     /// the receiver.
     pending_sends: AtomicUsize,
 }
 
-unsafe impl<K: KeyExtractor, V: AggregationValue> Send for CrossNodeMerge<K, V> {}
-unsafe impl<K: KeyExtractor, V: AggregationValue> Sync for CrossNodeMerge<K, V> {}
+unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Send for CrossNodeMerge<K, V> {}
+unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Sync for CrossNodeMerge<K, V> {}
 
-impl<K: KeyExtractor, V: AggregationValue> CrossNodeMerge<K, V> {
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> CrossNodeMerge<K, V> {
     fn new(node_count: usize) -> Self {
         Self {
             node_tables: Injector::new(),
@@ -471,7 +473,7 @@ impl<K: KeyExtractor, V: AggregationValue> CrossNodeMerge<K, V> {
     }
 }
 
-impl<K: KeyExtractor, V: AggregationValue> PartitionJob<K, V> {
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
     /// Merge this partition's scatter buffers and in-place stacks into one result
     /// table, then feed its rows into the worker's shared `acc` (building columns
     /// into `allocator`). Accumulating across partition jobs, rather than emitting
@@ -530,7 +532,7 @@ impl<K: KeyExtractor, V: AggregationValue> PartitionJob<K, V> {
     }
 }
 
-impl<K: KeyExtractor, V: AggregationValue> GroupOutputter<K, V> {
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
     /// Drain every worker's tables off the channel, size the merge from the merged
     /// distinct estimate, and publish one [`PartitionJob`] per merge partition to
     /// the shared injector (plus, for `COUNT(DISTINCT)`, the out-of-band 0-hash count
@@ -762,7 +764,9 @@ impl<K: KeyExtractor, V: AggregationValue> GroupOutputter<K, V> {
     }
 }
 
-impl<K: KeyExtractor, V: AggregationValue> Outputter<RecordBatch> for GroupOutputter<K, V> {
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> Outputter<RecordBatch>
+    for GroupOutputter<K, V>
+{
     fn output<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> unary::Result<bool> {
         if let Some(rx) = self.receiver.take() {
             self.create_partition_jobs(rx, sender)?;
@@ -920,7 +924,7 @@ mod tests {
     /// General harness: choose the key/value extractors, key columns, aggregates,
     /// LIMIT pushdown, and radix config. The common-case wrappers above cover
     /// `Int32` keys + `COUNT(*)`.
-    fn run_group_full<K: KeyExtractor<Config: Default>, V: AggregationValue>(
+    fn run_group_full<K: KeyExtractor<Config: Default>, V: AggregationValue + ?Sized>(
         worker_batches: Vec<Vec<RecordBatch>>,
         key_cols: Vec<usize>,
         value_slots: Vec<AggregationSlot>,
@@ -1241,7 +1245,7 @@ mod tests {
         RecordBatch::try_new(schema, vec![id, name, val]).unwrap()
     }
 
-    fn run_row_key_group<V: AggregationValue>(
+    fn run_row_key_group<V: AggregationValue + ?Sized>(
         worker_batches: Vec<Vec<RecordBatch>>,
         key_cols: Vec<usize>,
         schema: RowKeySchema,
@@ -1256,7 +1260,7 @@ mod tests {
         )
     }
 
-    fn run_row_key_group_radix<V: AggregationValue>(
+    fn run_row_key_group_radix<V: AggregationValue + ?Sized>(
         worker_batches: Vec<Vec<RecordBatch>>,
         key_cols: Vec<usize>,
         schema: RowKeySchema,

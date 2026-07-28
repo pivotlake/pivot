@@ -35,7 +35,7 @@ const PREFETCH_DISTANCE: usize = 8;
 
 /// Try to resize the target if cumulative collision pressure is too high.
 #[inline]
-fn resize_if_needed<K: KeyExtractor, V: AggregationValue>(
+fn resize_if_needed<K: KeyExtractor, V: AggregationValue + ?Sized>(
     allocator: &mut SlabAllocator,
     target: &mut Prober<'_, <K as KeyExtractor>::Persisted, V>,
 ) {
@@ -49,7 +49,7 @@ fn resize_if_needed<K: KeyExtractor, V: AggregationValue>(
 /// Equal-sized source tables are scanned in small batches so their target
 /// region remains local.
 #[allow(clippy::too_many_arguments)]
-fn merge_within_partition_bounds<const N: usize, K: KeyExtractor, V: AggregationValue>(
+fn merge_within_partition_bounds<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized>(
     allocator: &mut SlabAllocator,
     arena: &SharedArena,
     partition: usize,
@@ -101,7 +101,7 @@ fn merge_within_partition_bounds<const N: usize, K: KeyExtractor, V: Aggregation
 
 /// Scans the probe-chain overflow beyond a partition's nominal slot range.
 #[allow(clippy::too_many_arguments)]
-fn merge_past_partition_bounds<const N: usize, K: KeyExtractor, V: AggregationValue>(
+fn merge_past_partition_bounds<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized>(
     allocator: &mut SlabAllocator,
     arena: &SharedArena,
     partition: usize,
@@ -144,7 +144,7 @@ fn merge_past_partition_bounds<const N: usize, K: KeyExtractor, V: AggregationVa
 
 /// Merge entries from `tables` that belong to `partition` into `target`.
 #[allow(clippy::too_many_arguments)]
-fn merge_into_partition<const N: usize, K: KeyExtractor, V: AggregationValue>(
+fn merge_into_partition<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized>(
     allocator: &mut SlabAllocator,
     arena: &SharedArena,
     partition: usize,
@@ -180,7 +180,7 @@ fn merge_into_partition<const N: usize, K: KeyExtractor, V: AggregationValue>(
 ///
 /// Both sources use the same high hash bits, so no preliminary repartitioning
 /// is required.
-pub(super) fn merge_combined<K: KeyExtractor, V: AggregationValue>(
+pub(super) fn merge_combined<K: KeyExtractor, V: AggregationValue + ?Sized>(
     partition: usize,
     buffers: &[PartitionBuffers<K, V>],
     tables: &[MultiSlabTable<K, V>],
@@ -205,7 +205,7 @@ pub(super) fn merge_combined<K: KeyExtractor, V: AggregationValue>(
 }
 
 /// State passed through arity dispatch for one partition merge.
-struct MergeCombined<'a, K: KeyExtractor, V: AggregationValue> {
+struct MergeCombined<'a, K: KeyExtractor, V: AggregationValue + ?Sized> {
     partition: usize,
     buffers: &'a [PartitionBuffers<K, V>],
     tables: &'a [MultiSlabTable<K, V>],
@@ -215,7 +215,7 @@ struct MergeCombined<'a, K: KeyExtractor, V: AggregationValue> {
     context: &'a V::SharedContext,
 }
 
-impl<K: KeyExtractor, V: AggregationValue> ArityBody<MultiSlabTable<K, V>>
+impl<K: KeyExtractor, V: AggregationValue + ?Sized> ArityBody<MultiSlabTable<K, V>>
     for MergeCombined<'_, K, V>
 {
     #[inline(always)]
@@ -246,7 +246,7 @@ impl<K: KeyExtractor, V: AggregationValue> ArityBody<MultiSlabTable<K, V>>
 /// Separate reference parameters preserve alias information across raw target
 /// writes, keeping shared state outside the inner loops.
 #[allow(clippy::too_many_arguments)]
-fn merge_combined_rows<const N: usize, K: KeyExtractor, V: AggregationValue>(
+fn merge_combined_rows<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized>(
     partition: usize,
     buffers: &[PartitionBuffers<K, V>],
     tables: &[MultiSlabTable<K, V>],
@@ -353,7 +353,7 @@ fn merge_combined_rows<const N: usize, K: KeyExtractor, V: AggregationValue>(
 ///
 /// The largest input is reused when it can hold the combined upper bound.
 /// Otherwise a new table is allocated at the estimated partition capacity.
-pub(super) fn merge_node_aggregated_tables<K: KeyExtractor, V: AggregationValue>(
+pub(super) fn merge_node_aggregated_tables<K: KeyExtractor, V: AggregationValue + ?Sized>(
     mut node_tables: Vec<MultiSlabTable<K, V>>,
     partition_capacity: usize,
     partition_bits: u32,
@@ -469,7 +469,10 @@ mod tests {
                 &COUNT_CFG,
             );
             for entry in result.iter(0) {
-                all_entries.push((*entry.key, entry.stored.sort_key(0) as usize));
+                all_entries.push((
+                    *entry.key,
+                    AggregationValue::sort_key(entry.stored, 0) as usize,
+                ));
             }
         }
         all_entries.sort_by_key(|(k, _)| *k);
@@ -654,7 +657,10 @@ mod tests {
                 &COUNT_CFG,
             );
             for entry in folded.iter(0) {
-                entries.push((*entry.key, entry.stored.sort_key(0) as usize));
+                entries.push((
+                    *entry.key,
+                    AggregationValue::sort_key(entry.stored, 0) as usize,
+                ));
             }
         }
 
@@ -732,7 +738,7 @@ mod tests {
             );
             for entry in result.iter(0) {
                 occurrences[*entry.key as usize] += 1;
-                counts[*entry.key as usize] += entry.stored.sort_key(0) as usize;
+                counts[*entry.key as usize] += AggregationValue::sort_key(entry.stored, 0) as usize;
             }
         }
 

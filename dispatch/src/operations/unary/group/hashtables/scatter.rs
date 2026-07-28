@@ -11,11 +11,11 @@
 
 use super::hash_table::{PersistedKey, entry_layout};
 use crate::memory::{Slab, SlabAllocator, SlabVec};
-use crate::operations::unary::group::values::AggregationValue;
+use crate::operations::unary::group::values::{AggregationValue, OwnedValue};
 use std::marker::PhantomData;
 
 /// Storage for one worker's rows in one radix partition.
-pub trait ScatterRows<KP: PersistedKey, V: AggregationValue>: Send {
+pub trait ScatterRows<KP: PersistedKey, V: AggregationValue + ?Sized>: Send {
     /// Copyable row layout shared by every partition buffer for a signature.
     type Layout: Copy;
 
@@ -40,33 +40,31 @@ pub trait ScatterRows<KP: PersistedKey, V: AggregationValue>: Send {
         allocator: &mut SlabAllocator,
         hash: u64,
         key: KP,
-        seed: impl FnOnce(&mut V::Stored),
+        seed: impl FnOnce(&mut V),
     );
 
     /// Visit every row in insertion order.
-    fn for_each(&self, layout: Self::Layout, visitor: impl FnMut(u64, &KP, &V::Stored));
+    fn for_each(&self, layout: Self::Layout, visitor: impl FnMut(u64, &KP, &V));
 
     /// Visits rows and exposes a future row for software prefetching.
     fn for_each_prefetched<const AHEAD: usize>(
         &self,
         layout: Self::Layout,
-        visitor: impl FnMut(u64, &KP, &V::Stored, Option<(u64, &KP)>),
+        visitor: impl FnMut(u64, &KP, &V, Option<(u64, &KP)>),
     );
 }
 
 /// Typed scatter rows for a compiled value.
-pub struct SizedScatterRows<KP: PersistedKey, V: AggregationValue + Copy>(SlabVec<(u64, KP, V)>);
+pub struct SizedScatterRows<KP: PersistedKey, V: OwnedValue>(SlabVec<(u64, KP, V)>);
 
-impl<KP: PersistedKey, V: AggregationValue<Stored = V>> ScatterRows<KP, V>
-    for SizedScatterRows<KP, V>
-{
+impl<KP: PersistedKey, V: OwnedValue> ScatterRows<KP, V> for SizedScatterRows<KP, V> {
     type Layout = ();
 
     fn new() -> Self {
         Self(SlabVec::new())
     }
 
-    fn layout_with_metadata(_metadata: V::StorageMetadata) {}
+    fn layout_with_metadata(_metadata: <V as AggregationValue>::StorageMetadata) {}
 
     fn len(&self) -> usize {
         self.0.len()
@@ -79,7 +77,7 @@ impl<KP: PersistedKey, V: AggregationValue<Stored = V>> ScatterRows<KP, V>
         allocator: &mut SlabAllocator,
         hash: u64,
         key: KP,
-        seed: impl FnOnce(&mut V::Stored),
+        seed: impl FnOnce(&mut V),
     ) {
         let mut value = V::default();
         seed(&mut value);
@@ -87,7 +85,7 @@ impl<KP: PersistedKey, V: AggregationValue<Stored = V>> ScatterRows<KP, V>
     }
 
     #[inline(always)]
-    fn for_each(&self, _layout: (), mut visitor: impl FnMut(u64, &KP, &V::Stored)) {
+    fn for_each(&self, _layout: (), mut visitor: impl FnMut(u64, &KP, &V)) {
         self.0
             .for_each(|(hash, key, value)| visitor(hash, &key, &value));
     }
@@ -96,7 +94,7 @@ impl<KP: PersistedKey, V: AggregationValue<Stored = V>> ScatterRows<KP, V>
     fn for_each_prefetched<const AHEAD: usize>(
         &self,
         _layout: (),
-        mut visitor: impl FnMut(u64, &KP, &V::Stored, Option<(u64, &KP)>),
+        mut visitor: impl FnMut(u64, &KP, &V, Option<(u64, &KP)>),
     ) {
         self.0
             .for_each_prefetched::<AHEAD>(|(hash, key, value), ahead| {
@@ -115,7 +113,7 @@ impl<KP: PersistedKey, V: AggregationValue<Stored = V>> ScatterRows<KP, V>
 /// The caller holds one layout value for all partitions. Keeping it out of
 /// each buffer makes partition headers smaller and keeps layout fields local in
 /// the scatter loop.
-pub struct ScatterLayout<V: AggregationValue> {
+pub struct ScatterLayout<V: AggregationValue + ?Sized> {
     hash_offset: usize,
     key_offset: usize,
     value_offset: usize,
@@ -127,18 +125,18 @@ pub struct ScatterLayout<V: AggregationValue> {
     metadata: V::StorageMetadata,
 }
 
-impl<V: AggregationValue> Clone for ScatterLayout<V> {
+impl<V: AggregationValue + ?Sized> Clone for ScatterLayout<V> {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<V: AggregationValue> Copy for ScatterLayout<V> {}
+impl<V: AggregationValue + ?Sized> Copy for ScatterLayout<V> {}
 
 /// Runtime-strided scatter rows for a dynamic value.
 ///
 /// Rows share the hash table entry layout. The buffer stores only allocation
 /// and cursor state; the caller supplies [`ScatterLayout`].
-pub struct StridedScatterRows<KP: PersistedKey, V: AggregationValue> {
+pub struct StridedScatterRows<KP: PersistedKey, V: AggregationValue + ?Sized> {
     chunks: Vec<Slab>,
     /// The next row's address in the chunk being filled.
     cursor: *mut u8,
@@ -147,13 +145,14 @@ pub struct StridedScatterRows<KP: PersistedKey, V: AggregationValue> {
     end: *mut u8,
     /// Rows pushed.
     len: usize,
-    _phantom: PhantomData<(KP, V)>,
+    // A raw-pointer marker: a plain `(KP, V)` tuple would require `V: Sized`.
+    _phantom: PhantomData<(KP, *const V)>,
 }
 
 // SAFETY: cached row pointers refer to address-stable slabs owned by `chunks`.
-unsafe impl<KP: PersistedKey, V: AggregationValue> Send for StridedScatterRows<KP, V> {}
+unsafe impl<KP: PersistedKey, V: AggregationValue + ?Sized> Send for StridedScatterRows<KP, V> {}
 
-impl<KP: PersistedKey, V: AggregationValue> StridedScatterRows<KP, V> {
+impl<KP: PersistedKey, V: AggregationValue + ?Sized> StridedScatterRows<KP, V> {
     /// Target allocation size for each chunk.
     const CHUNK_BYTES: usize = 64 * 1024;
 
@@ -184,7 +183,9 @@ impl<KP: PersistedKey, V: AggregationValue> StridedScatterRows<KP, V> {
     }
 }
 
-impl<KP: PersistedKey, V: AggregationValue> ScatterRows<KP, V> for StridedScatterRows<KP, V> {
+impl<KP: PersistedKey, V: AggregationValue + ?Sized> ScatterRows<KP, V>
+    for StridedScatterRows<KP, V>
+{
     type Layout = ScatterLayout<V>;
 
     fn new() -> Self {
@@ -223,7 +224,7 @@ impl<KP: PersistedKey, V: AggregationValue> ScatterRows<KP, V> for StridedScatte
         allocator: &mut SlabAllocator,
         hash: u64,
         key: KP,
-        seed: impl FnOnce(&mut V::Stored),
+        seed: impl FnOnce(&mut V),
     ) {
         if self.cursor == self.end {
             self.grow(layout, allocator);
@@ -233,14 +234,17 @@ impl<KP: PersistedKey, V: AggregationValue> ScatterRows<KP, V> for StridedScatte
         unsafe {
             *(row.add(layout.hash_offset) as *mut u64) = hash;
             (row.add(layout.key_offset) as *mut KP).write(key);
-            seed(V::stored_mut(row.add(layout.value_offset), layout.metadata));
+            seed(V::from_entry_mut(
+                row.add(layout.value_offset),
+                layout.metadata,
+            ));
             self.cursor = row.add(layout.stride);
         }
         self.len += 1;
     }
 
     #[inline(always)]
-    fn for_each(&self, layout: ScatterLayout<V>, mut f: impl FnMut(u64, &KP, &V::Stored)) {
+    fn for_each(&self, layout: ScatterLayout<V>, mut f: impl FnMut(u64, &KP, &V)) {
         self.for_each_chunk(layout.stride, |base, rows| {
             let mut row = base;
             for _ in 0..rows {
@@ -250,7 +254,7 @@ impl<KP: PersistedKey, V: AggregationValue> ScatterRows<KP, V> for StridedScatte
                     f(
                         hash,
                         key,
-                        V::stored_ref(row.add(layout.value_offset), layout.metadata),
+                        V::from_entry(row.add(layout.value_offset), layout.metadata),
                     );
                     row = row.add(layout.stride);
                 }
@@ -262,7 +266,7 @@ impl<KP: PersistedKey, V: AggregationValue> ScatterRows<KP, V> for StridedScatte
     fn for_each_prefetched<const AHEAD: usize>(
         &self,
         layout: ScatterLayout<V>,
-        mut f: impl FnMut(u64, &KP, &V::Stored, Option<(u64, &KP)>),
+        mut f: impl FnMut(u64, &KP, &V, Option<(u64, &KP)>),
     ) {
         self.for_each_chunk(layout.stride, |base, rows| {
             let mut row = base;
@@ -280,7 +284,7 @@ impl<KP: PersistedKey, V: AggregationValue> ScatterRows<KP, V> for StridedScatte
                     f(
                         hash,
                         key,
-                        V::stored_ref(row.add(layout.value_offset), layout.metadata),
+                        V::from_entry(row.add(layout.value_offset), layout.metadata),
                         ahead,
                     );
                     row = row.add(layout.stride);
