@@ -32,7 +32,7 @@ pivotdb-server --metastore <FILE> [OPTIONS]
 | --- | --- | --- |
 | `--bind` | `127.0.0.1:5432` | TCP socket the server binds to. |
 | `--workers` | number of cores | Number of dispatch worker threads. |
-| `--metastore` | required | YAML file defining the named datastores. |
+| `--metastore` | required | YAML file defining the named datastores and users. |
 | `--memory` | 80% of RAM | Buffer-pool budget such as `32g` or `512m`. |
 
 ### Metastore configuration
@@ -76,6 +76,33 @@ An S3 datastore's `region`, `access_key_id`, and `secret_access_key` are
 required and given inline. Protect files containing inline credentials
 appropriately.
 
+### Users
+
+Each entry under `users` names a user that may connect. Its nested `auth`
+contains exactly one authentication method and that method's fields:
+
+```yaml
+users:
+  pivot:
+    auth:
+      method: trust
+
+  analytics:
+    auth:
+      method: scram-sha-256
+      verifier: "pivot-scram-sha-256$4096:8fZ1u...$Wm9tYm..."
+```
+
+The SCRAM verifier is precomputed in PivotDB's
+`pivot-scram-sha-256$4096:<base64 salt>$<base64 salted password>` format. Trust
+performs no identity proof: anyone who supplies `pivot` as the user name is
+accepted. Variant-specific fields are enforced, so trust cannot contain a
+verifier and SCRAM cannot omit one.
+
+A YAML file with no users (an omitted or empty `users` section) receives one
+built-in trusted user named `pivot`. Defining any users replaces that default
+with the configured allowlist.
+
 Logging is controlled by `RUST_LOG` (defaults to `info`):
 
 ```sh
@@ -84,10 +111,17 @@ RUST_LOG=server=debug,dispatch=info pivotdb-server --metastore config.yaml --bin
 
 ## Connecting
 
-The server speaks the PostgreSQL v3 wire protocol with no auth. Any Postgres client works — for example `psql`:
+The server speaks the PostgreSQL v3 wire protocol. Any Postgres client works, for example `psql`:
 
 ```sh
-psql -h 127.0.0.1 -p 5432 -U anything
+psql -h 127.0.0.1 -p 5432 -U analytics
+```
+
+SCRAM users prove their password without sending it over the wire. Trusted users
+connect without a password. The built-in configuration therefore connects as:
+
+```sh
+psql -h 127.0.0.1 -p 5432 -U pivot
 ```
 
 Tables are registered in a datastore with `CREATE TABLE`. A table path is

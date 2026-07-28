@@ -17,7 +17,8 @@ use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
 use datastore_delta::{
     Compacter, DEFAULT_COMPACT_BYTES, DEFAULT_MIN_FILES_TO_MERGE, DeltaDatastore,
 };
-use dispatch::{BUFFER_SIZE, Dispatch};
+use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
+use metastore::{DEFAULT_USER_NAME, Metastore, UserAuth};
 use server::Server;
 use tokio::sync::oneshot;
 
@@ -119,6 +120,31 @@ fn wait_until_listening(addr: SocketAddr) -> std::io::Result<()> {
     Err(last_err.unwrap_or_else(|| std::io::Error::other("timed out waiting for server")))
 }
 
+/// User source for the in-process benchmark server. The catalog is assembled
+/// directly above, so only the built-in trusted `pivot` login is used here.
+fn pivot_metastore() -> Arc<dyn Metastore> {
+    struct PivotMetastore;
+
+    impl Metastore for PivotMetastore {
+        fn open_datastores(
+            &self,
+            _dispatcher: &DataFlowDispatcher,
+        ) -> metastore::Result<HashMap<String, Arc<dyn Datastore>>> {
+            Ok(HashMap::new())
+        }
+
+        fn default_datastore_name(&self) -> &str {
+            DEFAULT_DATASTORE_NAME
+        }
+
+        fn user_auth(&self, username: &str) -> Option<UserAuth> {
+            (username == DEFAULT_USER_NAME).then_some(UserAuth::Trust)
+        }
+    }
+
+    Arc::new(PivotMetastore)
+}
+
 /// Start a pivotdb server with the given worker count, returning once the
 /// listener is accepting connections. The catalog is empty; the runner sends
 /// `CREATE TABLE` over the wire to populate it.
@@ -160,7 +186,7 @@ pub fn start(workers: usize) -> std::io::Result<ServerHandle> {
                 .build()
                 .expect("build tokio runtime");
             rt.block_on(async move {
-                let server = Server::new(bind, dispatch, catalog);
+                let server = Server::new(bind, dispatch, catalog, pivot_metastore());
                 let _ = server
                     .serve(Box::pin(async move {
                         let _ = shutdown_rx.await;

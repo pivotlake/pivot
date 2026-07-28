@@ -14,7 +14,8 @@ use std::time::{Duration, Instant};
 
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
 use datastore_delta::DeltaDatastore;
-use dispatch::Dispatch;
+use dispatch::{DataFlowDispatcher, Dispatch};
+use metastore::{DEFAULT_USER_NAME, Metastore, UserAuth};
 use rstest::fixture;
 use server::Server;
 use tempfile::TempDir;
@@ -78,6 +79,43 @@ pub fn start_server<F>(ring_slots: usize, build_catalog: F) -> u16
 where
     F: FnOnce(&Dispatch) -> CatalogFixture + Send + 'static,
 {
+    start_server_with_metastore(ring_slots, |dispatch| {
+        (build_catalog(dispatch), pivot_metastore())
+    })
+}
+
+/// Minimal metastore for tests whose catalog is built directly: it supplies the
+/// same built-in trusted `pivot` user as an empty YAML user map. Its datastore
+/// methods are not used because those tests pass an already-open catalog.
+pub fn pivot_metastore() -> Arc<dyn Metastore> {
+    struct PivotMetastore;
+
+    impl Metastore for PivotMetastore {
+        fn open_datastores(
+            &self,
+            _dispatcher: &DataFlowDispatcher,
+        ) -> metastore::Result<HashMap<String, Arc<dyn Datastore>>> {
+            Ok(HashMap::new())
+        }
+
+        fn default_datastore_name(&self) -> &str {
+            DEFAULT_DATASTORE_NAME
+        }
+
+        fn user_auth(&self, username: &str) -> Option<UserAuth> {
+            (username == DEFAULT_USER_NAME).then_some(UserAuth::Trust)
+        }
+    }
+
+    Arc::new(PivotMetastore)
+}
+
+/// As [`start_server`], but the builder returns the same metastore that the
+/// server should consult for every login.
+pub fn start_server_with_metastore<F>(ring_slots: usize, build_catalog: F) -> u16
+where
+    F: FnOnce(&Dispatch) -> (CatalogFixture, Arc<dyn Metastore>) + Send + 'static,
+{
     let port = pick_free_port();
     let workers = core_affinity::get_core_ids().unwrap().len().clamp(1, 4);
     let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -91,8 +129,8 @@ where
         rt.block_on(async move {
             // Build the datastores inside the runtime: a datastore that
             // self-manages maintenance spawns its tasks onto the ambient runtime.
-            let CatalogFixture { catalog, data_dirs } = build_catalog(&dispatch);
-            let server = Server::new(bind, dispatch, catalog);
+            let (CatalogFixture { catalog, data_dirs }, metastore) = build_catalog(&dispatch);
+            let server = Server::new(bind, dispatch, catalog, metastore);
             let result = server.serve(Box::pin(std::future::pending::<()>())).await;
             drop(data_dirs);
             let _ = result;
@@ -145,7 +183,7 @@ pub async fn connect_client(port: u16) -> Client {
     let (client, conn) = tokio_postgres::Config::new()
         .host("127.0.0.1")
         .port(port)
-        .user("test")
+        .user("pivot")
         .dbname("test")
         .connect(NoTls)
         .await

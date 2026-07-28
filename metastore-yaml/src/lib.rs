@@ -26,8 +26,35 @@
 //!     # compact: true                # optional
 //! ```
 //!
+//! Each entry under `users` names a user that may authenticate to the
+//! PostgreSQL endpoint. Its nested `auth` selects one authentication method. A
+//! user may explicitly be trusted without a password:
+//!
+//! ```yaml
+//! users:
+//!   reader:
+//!     auth:
+//!       method: trust
+//! ```
+//!
+//! Or it may authenticate with a SCRAM-SHA-256 verifier derived from its
+//! password:
+//!
+//! ```yaml
+//! users:
+//!   analytics:
+//!     auth:
+//!       method: scram-sha-256
+//!       verifier: "pivot-scram-sha-256$4096:cGVwcGVy...$Zm9vYmFy..."
+//! ```
+//!
+//! When `users` is omitted or empty, the provider supplies one built-in trusted
+//! user named `pivot`. Defining any users replaces that default with the
+//! configured allowlist.
+//!
 //! An S3 datastore's credentials are inline, so the file holds secrets and should
-//! be readable only by the PivotDB process.
+//! be readable only by the PivotDB process. A verifier is not a password (the
+//! password cannot be recovered from it), but it is still worth the same care.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -41,7 +68,7 @@ use datastore_delta::{
     DeltaDatastore, MaintenanceConfig,
 };
 use dispatch::DataFlowDispatcher;
-use metastore::Metastore;
+use metastore::{DEFAULT_USER_NAME, Metastore, UserAuth, parse_scram_verifier};
 use serde::Deserialize;
 
 /// A metastore backed by a parsed YAML file.
@@ -52,6 +79,11 @@ use serde::Deserialize;
 pub struct YamlMetastore {
     datastore_configs: HashMap<String, DatastoreConfig>,
     default_name: String,
+    /// Every user's authentication method, keyed by user name. A file with no
+    /// users receives the built-in trusted `pivot` user. Verifiers are decoded
+    /// once, by [`from_yaml`](Self::from_yaml), so a malformed one fails startup
+    /// rather than a login.
+    user_auth: HashMap<String, UserAuth>,
     /// How often every datastore this metastore opens refreshes its table set
     /// from the store. Global (all datastores share the cadence); compaction, in
     /// contrast, is configured per datastore.
@@ -89,9 +121,24 @@ impl YamlMetastore {
             return Err(Error::MultipleDefaults(defaults));
         }
         let default_name = defaults.pop().ok_or(Error::MissingDefault)?;
+        let mut user_auth = file
+            .users
+            .into_iter()
+            .map(|(name, config)| {
+                let auth = config.into_auth().map_err(|message| Error::User {
+                    name: name.clone(),
+                    message,
+                })?;
+                Ok((name, auth))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        if user_auth.is_empty() {
+            user_auth.insert(DEFAULT_USER_NAME.to_string(), UserAuth::Trust);
+        }
         Ok(Self {
             datastore_configs: file.datastores,
             default_name,
+            user_auth,
             refresh_interval,
         })
     }
@@ -134,6 +181,10 @@ impl Metastore for YamlMetastore {
     fn default_datastore_name(&self) -> &str {
         &self.default_name
     }
+
+    fn user_auth(&self, username: &str) -> Option<UserAuth> {
+        self.user_auth.get(username).cloned()
+    }
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -152,6 +203,8 @@ pub enum Error {
     },
     #[error("datastore `{name}`: {message}")]
     Datastore { name: String, message: String },
+    #[error("user `{name}`: {message}")]
+    User { name: String, message: String },
     #[error(
         "no datastore is marked `default = true`; exactly one is required (it is the current database)"
     )]
@@ -166,10 +219,47 @@ pub enum Error {
     Delta(#[from] datastore_delta::Error),
 }
 
+/// Unknown top-level keys are rejected: a misspelled `users` section would
+/// otherwise be dropped in silence and unexpectedly select the built-in
+/// trusted `pivot` user.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MetastoreFile {
     #[serde(default)]
     datastores: HashMap<String, DatastoreConfig>,
+    #[serde(default)]
+    users: HashMap<String, UserConfig>,
+}
+
+/// One user and the authentication method nested inside it. Keeping the user as
+/// a struct leaves room for later user-level fields such as roles.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserConfig {
+    auth: UserAuthConfig,
+}
+
+impl UserConfig {
+    fn into_auth(self) -> std::result::Result<UserAuth, String> {
+        match self.auth {
+            UserAuthConfig::Trust {} => Ok(UserAuth::Trust),
+            UserAuthConfig::ScramSha256 { verifier } => {
+                parse_scram_verifier(&verifier).map(UserAuth::ScramSha256)
+            }
+        }
+    }
+}
+
+/// YAML representation of a user's one authentication method. Variant-specific
+/// fields live inside the variant, so `trust` cannot carry a verifier and SCRAM
+/// cannot omit one.
+#[derive(Deserialize)]
+#[serde(tag = "method", deny_unknown_fields)]
+enum UserAuthConfig {
+    #[serde(rename = "trust")]
+    Trust {},
+    #[serde(rename = "scram-sha-256")]
+    ScramSha256 { verifier: String },
 }
 
 /// One datastore's configuration. `kind` is the datastore format; the storage
@@ -307,6 +397,7 @@ fn require(name: &str, value: &Option<String>, field: &str) -> Result<String> {
 mod tests {
     use super::*;
     use metastore::DEFAULT_DATASTORE_NAME;
+    use metastore::ScramVerifier;
     use std::time::Duration;
 
     #[test]
@@ -442,5 +533,164 @@ datastores:
                 .is_ok()
         );
         assert!(store.datastore_configs["warm"].open_store("warm").is_ok());
+    }
+
+    /// A metastore with a default datastore and whatever `users` adds.
+    fn from_yaml_with(users: &str) -> Result<YamlMetastore> {
+        let yaml = format!(
+            "datastores:\n  default:\n    kind: delta\n    location: /tmp/default\n    \
+             default: true\n{users}"
+        );
+        YamlMetastore::from_yaml(&yaml, "test", Duration::from_secs(30))
+    }
+
+    fn verifier_for(password: &str) -> String {
+        metastore::format_scram_verifier(&ScramVerifier {
+            salt: vec![1; 16],
+            salted_password: password
+                .as_bytes()
+                .iter()
+                .cycle()
+                .take(32)
+                .copied()
+                .collect(),
+        })
+    }
+
+    #[test]
+    fn a_file_without_users_provides_the_builtin_pivot_user() {
+        for users in ["", "users: {}\n"] {
+            let store = from_yaml_with(users).unwrap();
+
+            assert!(matches!(
+                store.user_auth(DEFAULT_USER_NAME),
+                Some(UserAuth::Trust)
+            ));
+            assert!(store.user_auth("analytics").is_none());
+        }
+    }
+
+    #[test]
+    fn each_scram_user_keeps_its_own_verifier() {
+        let users = format!(
+            "users:\n  analytics:\n    auth:\n      method: scram-sha-256\n      \
+             verifier: \"{}\"\n  ingest:\n    auth:\n      method: scram-sha-256\n      \
+             verifier: \"{}\"\n",
+            verifier_for("a"),
+            verifier_for("b")
+        );
+
+        let store = from_yaml_with(&users).unwrap();
+
+        let Some(UserAuth::ScramSha256(analytics)) = store.user_auth("analytics") else {
+            panic!("analytics should use SCRAM-SHA-256");
+        };
+        assert_eq!(analytics.salted_password, [b'a'; 32]);
+        let Some(UserAuth::ScramSha256(ingest)) = store.user_auth("ingest") else {
+            panic!("ingest should use SCRAM-SHA-256");
+        };
+        assert_eq!(ingest.salted_password, [b'b'; 32]);
+        assert!(store.user_auth("nobody").is_none());
+    }
+
+    #[test]
+    fn a_user_can_explicitly_be_trusted_without_a_password() {
+        let users = r#"
+users:
+  reader:
+    auth:
+      method: trust
+"#;
+
+        let store = from_yaml_with(users).unwrap();
+
+        assert!(matches!(store.user_auth("reader"), Some(UserAuth::Trust)));
+    }
+
+    #[test]
+    fn trust_rejects_a_verifier_instead_of_ignoring_it() {
+        let users = r#"
+users:
+  reader:
+    auth:
+      method: trust
+      verifier: irrelevant
+"#;
+
+        let error = from_yaml_with(users).err().unwrap();
+
+        assert!(matches!(error, Error::Parse { .. }), "{error}");
+    }
+
+    #[test]
+    fn scram_requires_a_verifier() {
+        let users = r#"
+users:
+  analytics:
+    auth:
+      method: scram-sha-256
+"#;
+
+        let error = from_yaml_with(users).err().unwrap();
+
+        assert!(matches!(error, Error::Parse { .. }), "{error}");
+    }
+
+    #[test]
+    fn an_empty_user_is_not_silently_trusted() {
+        let users = r#"
+users:
+  analytics: {}
+"#;
+
+        let error = from_yaml_with(users).err().unwrap();
+
+        assert!(matches!(error, Error::Parse { .. }), "{error}");
+    }
+
+    #[test]
+    fn a_misspelled_user_section_is_rejected_rather_than_dropped() {
+        let users = r#"
+user:
+  analytics:
+    auth:
+      method: trust
+"#;
+
+        let error = from_yaml_with(users).err().unwrap();
+
+        assert!(matches!(error, Error::Parse { .. }), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_authentication_method_is_rejected() {
+        let users = r#"
+users:
+  analytics:
+    auth:
+      method: kerberos
+"#;
+
+        let error = from_yaml_with(users).err().unwrap();
+
+        assert!(matches!(error, Error::Parse { .. }), "{error}");
+    }
+
+    #[test]
+    fn a_malformed_verifier_is_rejected_at_parse_time() {
+        let users = r#"
+users:
+  analytics:
+    auth:
+      method: scram-sha-256
+      verifier: hunter2
+"#;
+
+        let error = from_yaml_with(users).err().unwrap();
+
+        assert!(
+            matches!(&error, Error::User { name, .. } if name == "analytics"),
+            "{error}"
+        );
     }
 }

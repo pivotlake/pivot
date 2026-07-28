@@ -957,6 +957,7 @@ dependencies = [
  "datastore-delta",
  "dispatch",
  "flate2",
+ "metastore",
  "parquet-variant-compute",
  "planner",
  "serde",
@@ -3153,6 +3154,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 name = "metastore"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "catalog",
  "dispatch",
 ]
@@ -4795,9 +4797,11 @@ dependencies = [
  "parquet-variant-compute",
  "pgwire",
  "planner",
+ "rand 0.10.2",
  "rstest",
  "serde",
  "serde_json",
+ "sha2",
  "sysinfo",
  "tempfile",
  "thiserror 2.0.18",

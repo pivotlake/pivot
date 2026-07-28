@@ -5,7 +5,7 @@
 
 use std::io::IsTerminal;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,7 +40,9 @@ struct Args {
     /// directory or S3 root, attached as its own database
     /// (`SELECT * FROM <datastore>.main.<table>`). Exactly one datastore must set
     /// `default = true`; it is the current database (unqualified names resolve
-    /// against it).
+    /// against it). Its entries under `users` are the users that may connect,
+    /// using either explicit trust or SCRAM-SHA-256. When omitted or empty,
+    /// `pivot` is provided as a trusted user.
     #[arg(long, value_name = "FILE")]
     metastore: PathBuf,
 
@@ -148,26 +150,35 @@ fn build_disk_cache(args: &Args) -> Option<Arc<dispatch::io::DiskCache>> {
     }
 }
 
-/// Open every datastore from the required metastore file and assemble them into
-/// one composite catalog. Each datastore self-manages its maintenance (the global
-/// refresh cadence plus its own per-datastore compaction from the metastore file),
-/// spawning its background tasks onto the ambient runtime, so this must run inside
-/// `rt.block_on`.
-fn build_catalog(args: &Args, dispatcher: &DataFlowDispatcher) -> Result<Arc<PivotCatalog>, Error> {
-    let path = &args.metastore;
-    let refresh_interval = Duration::from_secs(args.catalog_refresh_secs);
-    let store =
+/// Load the process's one metastore. The returned object is shared by catalog
+/// construction and every later login, so authentication always reaches the
+/// same live source rather than a startup copy of its users.
+fn build_metastore(path: &Path, refresh_interval: Duration) -> Result<Arc<dyn Metastore>, Error> {
+    let metastore =
         YamlMetastore::open(path, refresh_interval).map_err(|source| Error::ReadMetastore {
-            path: path.clone(),
+            path: path.to_path_buf(),
             source: Box::new(source),
         })?;
-    let default_name = store.default_datastore_name().to_string();
-    let datastores = store
-        .open_datastores(dispatcher)
-        .map_err(|source| Error::OpenDatastores {
-            path: path.clone(),
-            source,
-        })?;
+    Ok(Arc::new(metastore))
+}
+
+/// Open every datastore from `metastore` and assemble them into one composite
+/// catalog. Each datastore self-manages its maintenance (the global refresh
+/// cadence plus its own per-datastore compaction), spawning its background tasks
+/// onto the ambient runtime, so this must run inside `rt.block_on`.
+fn build_catalog(
+    path: &Path,
+    metastore: &dyn Metastore,
+    dispatcher: &DataFlowDispatcher,
+) -> Result<Arc<PivotCatalog>, Error> {
+    let default_name = metastore.default_datastore_name().to_string();
+    let datastores =
+        metastore
+            .open_datastores(dispatcher)
+            .map_err(|source| Error::OpenDatastores {
+                path: path.to_path_buf(),
+                source,
+            })?;
     Ok(Arc::new(PivotCatalog::new(datastores, default_name)?))
 }
 
@@ -198,9 +209,11 @@ fn main() -> Result<(), Error> {
         .build()?;
 
     rt.block_on(async move {
-        let catalog = build_catalog(&args, dispatch.dispatcher())?;
+        let refresh_interval = Duration::from_secs(args.catalog_refresh_secs);
+        let metastore = build_metastore(&args.metastore, refresh_interval)?;
+        let catalog = build_catalog(&args.metastore, metastore.as_ref(), dispatch.dispatcher())?;
 
-        let mut server = Server::new(args.bind, dispatch, catalog);
+        let mut server = Server::new(args.bind, dispatch, catalog, metastore);
         if let Some(addr) = args.http_bind {
             server = server.with_http_bind(addr);
         }

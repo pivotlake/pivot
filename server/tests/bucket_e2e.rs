@@ -17,7 +17,7 @@ use std::thread;
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
-use common::{connect_client, pick_free_port, wait_until_listening};
+use common::{connect_client, pick_free_port, pivot_metastore, wait_until_listening};
 use datastore_delta::DeltaDatastore;
 use datastore_delta::store::ObjectPath;
 use datastore_delta::test_support::{self, Backend};
@@ -73,7 +73,7 @@ fn start_server_on(root: &str) -> u16 {
             .build()
             .unwrap();
         rt.block_on(async move {
-            let server = Server::new(bind, dispatch, catalog);
+            let server = Server::new(bind, dispatch, catalog, pivot_metastore());
             let _ = server.serve(Box::pin(std::future::pending::<()>())).await;
         });
     });

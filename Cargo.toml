@@ -53,6 +53,7 @@ parquet-variant-compute = { path = "arrow-rs/parquet-variant-compute" }
 parquet-variant-json = { path = "arrow-rs/parquet-variant-json" }
 
 ahash = "0.8.12"
+base64 = "0.22"
 bytes = "1.11.0"
 clap = { version = "4", features = ["derive"] }
 core_affinity = "0.8.3"
@@ -61,9 +62,11 @@ crossbeam-deque = "0.8.6"
 insta = "1"
 libc = "0.2.184"
 lru = "0.18.1"
+rand = "0.10.0"
 rstest = "0.26"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.11"
 snap = { git = "https://github.com/Epsio-Labs/rust-snappy.git", rev = "c1754fc37fe43db77c3b5428d57689cd5f2182a5" }
 sysinfo = "0.38.0"
 tempfile = "3"

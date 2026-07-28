@@ -27,13 +27,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::arrow_to_pgwire::PGRowBatch;
+use crate::auth::Authenticator;
 use arrow_array::{Array, Int64Array, RecordBatch};
 use async_trait::async_trait;
 use dispatch::{CancelToken, DataFlowHandle, DataFlowStats};
 use futures::{Sink, SinkExt, stream};
 use lru::LruCache;
+use metastore::Metastore;
 use pgwire::api::auth::StartupHandler;
-use pgwire::api::auth::noop::NoopStartupHandler;
 use pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
 use pgwire::api::query::SimpleQueryHandler;
 use pgwire::api::results::{QueryResponse, Response, Tag};
@@ -666,38 +667,22 @@ impl SimpleQueryHandler for PivotQueryHandler {
     }
 }
 
-/// Startup handler that registers each new connection with the shared
-/// [`ConnectionManager`] so that subsequent `CancelRequest` packets can be
-/// routed back to the running query. Otherwise behaves as a noop (no auth).
-pub struct PivotStartupHandler {
-    manager: Arc<ConnectionManager>,
-}
-
-impl PivotStartupHandler {
-    pub fn new(manager: Arc<ConnectionManager>) -> Self {
-        Self { manager }
-    }
-}
-
-impl NoopStartupHandler for PivotStartupHandler {
-    fn connection_manager(&self) -> Option<Arc<ConnectionManager>> {
-        Some(self.manager.clone())
-    }
-}
-
 /// Bundle handed to `pgwire::tokio::process_socket` for each connection. Holds
 /// the query handler instance reused across the process.
 ///
 /// The default cancel handler is enough: pgwire routes each `CancelRequest`
 /// packet through the shared `ConnectionManager` (populated by
-/// [`PivotStartupHandler`]) to the in-flight query's `do_query` future, which
+/// [`crate::auth::UserStartupHandler`]) to the in-flight query's `do_query`
+/// future, which
 /// is then dropped. The `CancelOnDrop` guard inside [`PivotQueryHandler::run_query`]
 /// fires the dataflow's cancel token from that drop, so we never need to
 /// reach into the dispatch layer from a cancel handler.
 pub struct PivotHandlers {
     query_handler: Arc<PivotQueryHandler>,
-    startup_handler: Arc<PivotStartupHandler>,
     cancel_handler: Arc<DefaultCancelHandler>,
+    /// Shared authentication configuration. Every new connection reads its
+    /// current method from the metastore using its startup user name.
+    authenticator: Authenticator,
 }
 
 impl PivotHandlers {
@@ -705,12 +690,13 @@ impl PivotHandlers {
         catalog: Arc<catalog::PivotCatalog>,
         dispatcher: dispatch::DataFlowDispatcher,
         plan_cache: Arc<PlanCache>,
+        metastore: Arc<dyn Metastore>,
     ) -> Self {
         let manager = Arc::new(ConnectionManager::new());
         Self {
             query_handler: Arc::new(PivotQueryHandler::new(catalog, dispatcher, plan_cache)),
-            startup_handler: Arc::new(PivotStartupHandler::new(manager.clone())),
-            cancel_handler: Arc::new(DefaultCancelHandler::new(manager)),
+            cancel_handler: Arc::new(DefaultCancelHandler::new(manager.clone())),
+            authenticator: Authenticator::new(metastore, manager),
         }
     }
 }
@@ -720,8 +706,11 @@ impl PgWireServerHandlers for PivotHandlers {
         self.query_handler.clone()
     }
 
+    /// pgwire calls this once per connection, which is what per-user routing and
+    /// a SCRAM handshake need: the selected method and handshake state span
+    /// several messages.
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
-        self.startup_handler.clone()
+        self.authenticator.startup_handler()
     }
 
     fn cancel_handler(&self) -> Arc<impl CancelHandler> {
