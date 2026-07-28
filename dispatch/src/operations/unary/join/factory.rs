@@ -4,6 +4,7 @@ use std::sync::{Arc, mpsc};
 use ahash::RandomState;
 use arrow_array::RecordBatch;
 use arrow_array::types::ArrowPrimitiveType;
+use arrow_schema::Field;
 use crossbeam_deque::Injector;
 use std::hash::Hash;
 
@@ -14,11 +15,13 @@ use crate::operations::unary::join::build::{
 };
 use crate::operations::unary::join::directory::JoinDirectory;
 use crate::operations::unary::join::probe::Probe;
-use crate::operations::unary::join::{JoinCell, JoinOutputColumns, JoinTable};
+use crate::operations::unary::join::{
+    JoinCell, JoinOutputColumns, JoinSpec, JoinTable, UnmatchedScan,
+};
 use crate::operations::unary::pipeline_breaker::PipelineBreaker;
 
 /// Creates one [`JoinBuildConsumer`] per worker, with shared state wired up.
-pub struct JoinBuildFactory<T: ArrowPrimitiveType<Native: Hash + Eq>> {
+pub struct JoinBuildFactory<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool> {
     key_column: usize,
     worker_id: usize,
     hash_state: RandomState,
@@ -33,11 +36,13 @@ pub struct JoinBuildFactory<T: ArrowPrimitiveType<Native: Hash + Eq>> {
 }
 
 /// Creates one [`Probe`] per worker, all sharing the same [`JoinTable`].
-pub struct JoinProbeFactory<T: ArrowPrimitiveType<Native: Hash + Eq>> {
+pub struct JoinProbeFactory<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool> {
     pub(crate) table: JoinTable<T::Native>,
     hash_state: RandomState,
     key_column: usize,
     output_columns: Arc<JoinOutputColumns>,
+    probe_fields: Option<Arc<Vec<Field>>>,
+    unmatched: Arc<UnmatchedScan>,
 }
 
 /// Create `worker_count` build factories and probe factories that share the
@@ -47,16 +52,21 @@ pub struct JoinProbeFactory<T: ArrowPrimitiveType<Native: Hash + Eq>> {
 /// Returns `(build_factories, probe_factories, build_ready)`. The build
 /// outputters publish readiness only after every partition job has run; the
 /// graph builder uses that flag to gate every root of the probe input.
-pub fn create_for_workers<T: ArrowPrimitiveType<Native: Hash + Eq>>(
-    build_key_column: usize,
-    probe_key_column: usize,
-    output_columns: JoinOutputColumns,
+pub fn create_for_workers<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool>(
+    spec: JoinSpec,
     worker_count: usize,
 ) -> (
-    impl IntoIterator<Item = JoinBuildFactory<T>>,
-    impl IntoIterator<Item = JoinProbeFactory<T>>,
+    impl IntoIterator<Item = JoinBuildFactory<T, BUILD_OUTER>>,
+    impl IntoIterator<Item = JoinProbeFactory<T, BUILD_OUTER>>,
     Arc<AtomicBool>,
 ) {
+    let JoinSpec {
+        build_key_column,
+        probe_key_column,
+        output_columns,
+        outer_probe_fields,
+    } = spec;
+    debug_assert_eq!(BUILD_OUTER, outer_probe_fields.is_some());
     let hash_state = RandomState::with_seeds(0, 0, 0, 0);
     let partition_sizes: Arc<Vec<AtomicUsize>> =
         Arc::new((0..NUM_PARTITIONS).map(|_| AtomicUsize::new(0)).collect());
@@ -65,6 +75,7 @@ pub fn create_for_workers<T: ArrowPrimitiveType<Native: Hash + Eq>>(
         keys: Arc::new(JoinCell::new(MultiSlabBuffer::<T::Native>::new(vec![]))),
         rows: Arc::new(JoinCell::new(MultiSlabBuffer::<u32>::new(vec![]))),
         build_rows: Arc::new(JoinCell::new(None)),
+        matched: Arc::new(JoinCell::new(MultiSlabBuffer::<u8>::new(vec![]))),
     };
     let injector = Arc::new(Injector::new());
     let jobs_injected = Arc::new(AtomicBool::new(false));
@@ -92,20 +103,24 @@ pub fn create_for_workers<T: ArrowPrimitiveType<Native: Hash + Eq>>(
     });
 
     let output_columns = Arc::new(output_columns);
+    let probe_fields = outer_probe_fields.map(Arc::new);
+    let unmatched = Arc::new(UnmatchedScan::new(worker_count));
     let probe_factories = (0..worker_count).map(move |_| JoinProbeFactory {
         table: table_clone.clone(),
         hash_state: hs_clone.clone(),
         key_column: probe_key_column,
         output_columns: output_columns.clone(),
+        probe_fields: probe_fields.clone(),
+        unmatched: unmatched.clone(),
     });
 
     (build_factories, probe_factories, probe_gate)
 }
 
-impl<T: ArrowPrimitiveType<Native: Hash + Eq>> UnaryFactory<RecordBatch, ()>
-    for JoinBuildFactory<T>
+impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool>
+    UnaryFactory<RecordBatch, ()> for JoinBuildFactory<T, BUILD_OUTER>
 {
-    type Unary = PipelineBreaker<RecordBatch, (), JoinBuildConsumer<T>>;
+    type Unary = PipelineBreaker<RecordBatch, (), JoinBuildConsumer<T, BUILD_OUTER>>;
 
     fn build_unary(self) -> Self::Unary {
         PipelineBreaker::Consuming(JoinBuildConsumer::new(
@@ -124,17 +139,19 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>> UnaryFactory<RecordBatch, ()>
     }
 }
 
-impl<T: ArrowPrimitiveType<Native: Hash + Eq>> UnaryFactory<RecordBatch, RecordBatch>
-    for JoinProbeFactory<T>
+impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool>
+    UnaryFactory<RecordBatch, RecordBatch> for JoinProbeFactory<T, BUILD_OUTER>
 {
-    type Unary = Probe<T>;
+    type Unary = Probe<T, BUILD_OUTER>;
 
-    fn build_unary(self) -> Probe<T> {
+    fn build_unary(self) -> Probe<T, BUILD_OUTER> {
         Probe::new(
             self.table,
             self.hash_state,
             self.key_column,
             self.output_columns,
+            self.probe_fields,
+            self.unmatched,
         )
     }
 }

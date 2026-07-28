@@ -220,14 +220,19 @@ impl Operator {
             }
             // An INSERT emits one row: the inserted-row count, never NULL.
             Operator::Insert(_) => vec![false],
-            // An inner join only ever emits rows built from both inputs, so
-            // each output column keeps its own side's nullability.
-            Operator::Join(join) => join
-                .probe_output
-                .iter()
-                .map(|&i| inputs[0][i])
-                .chain(join.build_output.iter().map(|&i| inputs[1][i]))
-                .collect(),
+            // An inner join only emits rows built from both inputs, so each
+            // output column keeps its own side's nullability. A build-side
+            // outer join also emits unmatched build rows, filling their probe
+            // columns with NULL regardless of the probe input's declared
+            // nullability.
+            Operator::Join(join) => {
+                let probe_nullable = join.outer_probe_types.is_some();
+                join.probe_output
+                    .iter()
+                    .map(|&i| probe_nullable || inputs[0][i])
+                    .chain(join.build_output.iter().map(|&i| inputs[1][i]))
+                    .collect()
+            }
             Operator::CreateTable(_) | Operator::SetVariable(_) => Vec::new(),
         }
     }

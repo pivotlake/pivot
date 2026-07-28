@@ -5,11 +5,21 @@ mod common;
 
 use std::sync::Arc;
 
-use arrow_array::{Int64Array, RecordBatch};
+use arrow_array::{Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 
 use common::*;
-use dispatch::{AggregationKind, AggregationSlot, JoinOutputColumns, values_input};
+use dispatch::{AggregationKind, AggregationSlot, JoinOutputColumns, JoinSpec, values_input};
+
+/// An inner join keyed on column 0 of both sides.
+fn inner_join(output_columns: JoinOutputColumns) -> JoinSpec {
+    JoinSpec {
+        build_key_column: 0,
+        probe_key_column: 0,
+        output_columns,
+        outer_probe_fields: None,
+    }
+}
 
 fn int64_batch(name: &str, values: &[i64]) -> RecordBatch {
     RecordBatch::try_new(
@@ -42,10 +52,8 @@ fn join_matching_keys() {
     let results = probe
         .join(
             build,
-            0,
-            0,
             &DataType::Int64,
-            JoinOutputColumns::keep_all(1, 1),
+            inner_join(JoinOutputColumns::keep_all(1, 1)),
         )
         .collect()
         .unwrap();
@@ -71,10 +79,8 @@ fn join_on_int32_keys() {
     let results = probe
         .join(
             build,
-            0,
-            0,
             &DataType::Int32,
-            JoinOutputColumns::keep_all(1, 1),
+            inner_join(JoinOutputColumns::keep_all(1, 1)),
         )
         .collect()
         .unwrap();
@@ -102,10 +108,8 @@ fn join_no_matches() {
     let results = probe
         .join(
             build,
-            0,
-            0,
             &DataType::Int64,
-            JoinOutputColumns::keep_all(1, 1),
+            inner_join(JoinOutputColumns::keep_all(1, 1)),
         )
         .collect()
         .unwrap();
@@ -122,10 +126,8 @@ fn join_duplicate_build_keys() {
     let results = probe
         .join(
             build,
-            0,
-            0,
             &DataType::Int64,
-            JoinOutputColumns::keep_all(1, 1),
+            inner_join(JoinOutputColumns::keep_all(1, 1)),
         )
         .collect()
         .unwrap();
@@ -144,10 +146,8 @@ fn join_all_keys_match() {
     let results = probe
         .join(
             build,
-            0,
-            0,
             &DataType::Int64,
-            JoinOutputColumns::keep_all(1, 1),
+            inner_join(JoinOutputColumns::keep_all(1, 1)),
         )
         .collect()
         .unwrap();
@@ -169,10 +169,8 @@ fn join_large_tables() {
     let results = probe
         .join(
             build,
-            0,
-            0,
             &DataType::Int64,
-            JoinOutputColumns::keep_all(1, 1),
+            inner_join(JoinOutputColumns::keep_all(1, 1)),
         )
         .collect()
         .unwrap();
@@ -191,10 +189,8 @@ fn join_then_count() {
     let results = probe
         .join(
             build,
-            0,
-            0,
             &DataType::Int64,
-            JoinOutputColumns::keep_all(1, 1),
+            inner_join(JoinOutputColumns::keep_all(1, 1)),
         )
         .aggregate::<i64>(vec![AggregationSlot::new(
             AggregationKind::CountStar,
@@ -228,13 +224,11 @@ fn join_keeps_only_listed_columns() {
     let results = probe
         .join(
             build,
-            0,
-            0,
             &DataType::Int64,
-            JoinOutputColumns {
+            inner_join(JoinOutputColumns {
                 probe: vec![1],
                 build: vec![1],
-            },
+            }),
         )
         .collect()
         .unwrap();
@@ -246,4 +240,74 @@ fn join_keeps_only_listed_columns() {
     probe_payloads.sort();
     assert_eq!(probe_payloads, vec![7, 8]);
     assert_eq!(collect_i64s(&results, 1), vec![200, 200]);
+}
+
+/// A build-side outer join keyed on column 0 of both sides, whose probe side
+/// contributes one nullable `Int64` column to the output.
+fn build_outer_join(output_columns: JoinOutputColumns) -> JoinSpec {
+    JoinSpec {
+        build_key_column: 0,
+        probe_key_column: 0,
+        output_columns,
+        outer_probe_fields: Some(vec![Field::new("id", DataType::Int64, true)]),
+    }
+}
+
+#[test]
+fn build_outer_join_emits_unmatched_build_rows() {
+    let d = dispatch(4);
+    let build = values_input(&d, vec![int64_batch("id", &[10, 20, 30])]).record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &[20, 99])]).record_batches();
+
+    let results = probe
+        .join(
+            build,
+            &DataType::Int64,
+            build_outer_join(JoinOutputColumns::keep_all(1, 1)),
+        )
+        .collect()
+        .unwrap();
+
+    let mut rows: Vec<(bool, i64)> = results
+        .iter()
+        .flat_map(|batch| {
+            let probe_ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let build_ids = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            (0..batch.num_rows())
+                .map(|row| (probe_ids.is_valid(row), build_ids.value(row)))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(rows, vec![(false, 10), (false, 30), (true, 20)]);
+}
+
+#[test]
+fn every_build_row_reaches_a_build_outer_join_output() {
+    let d = dispatch(4);
+    let build_ids: Vec<i64> = (0..30_000).collect();
+    let probe_ids: Vec<i64> = (0..30_000).step_by(3).collect();
+    let build = values_input(&d, vec![int64_batch("id", &build_ids)]).record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &probe_ids)]).record_batches();
+
+    let results = probe
+        .join(
+            build,
+            &DataType::Int64,
+            build_outer_join(JoinOutputColumns::keep_all(1, 1)),
+        )
+        .collect()
+        .unwrap();
+
+    let mut build_ids_out = collect_i64s(&results, 1);
+    build_ids_out.sort();
+    assert_eq!(build_ids_out, (0..30_000).collect::<Vec<i64>>());
 }

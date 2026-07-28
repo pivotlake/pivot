@@ -62,8 +62,8 @@ use crate::operations::channels::{
 };
 use crate::operations::{
     AggregateFactory, AggregationSlot, AggregationValue, CopyOutFactory, Distinct,
-    DynamicFilterSlot, F64Cell, FilterFactory, GroupFactory, GroupLimit, IntCell,
-    JoinOutputColumns, KeyExtractor, LimitFactory, MapFactory, NoOpNullaryFactory, NullaryFactory,
+    DynamicFilterSlot, F64Cell, FilterFactory, GroupFactory, GroupLimit, IntCell, JoinSpec,
+    KeyExtractor, LimitFactory, MapFactory, NoOpNullaryFactory, NullaryFactory,
     NullaryOperatorFactory, OrderBy, OrderByLimitFactory, UnaryFactory, UnaryOperator,
     UnaryOperatorFactory, WideCell, create_join_factories,
 };
@@ -681,12 +681,16 @@ impl RecordBatchOperatorSpec {
         ))
     }
 
-    /// Inner hash equi-join: build a hash table from `build`'s rows keyed on
-    /// `build_key_column`, then probe it with `self`'s rows keyed on
-    /// `probe_key_column`, emitting one output row per matching pair. Each
-    /// output row is the probe columns listed in `output_columns` (in list
+    /// Hash equi-join: build a hash table from `build`'s rows keyed on
+    /// `spec.build_key_column`, then probe it with `self`'s rows keyed on
+    /// `spec.probe_key_column`, emitting one output row per matching pair. Each
+    /// output row is the probe columns listed in `spec.output_columns` (in list
     /// order) followed by the listed build columns. Rows with a null key on
     /// either side never match.
+    ///
+    /// The join is inner unless `spec.outer_probe_fields` makes it outer on the build
+    /// side, which adds one output row per build row nothing matched, its probe
+    /// columns null.
     ///
     /// `key_type` is the Arrow type both key columns arrive as (the planner
     /// casts mismatched sides to a common type first) and picks the join's key
@@ -696,126 +700,55 @@ impl RecordBatchOperatorSpec {
     /// Both sides are roots in one dataflow. Probe input may be produced while
     /// the build runs, but the probe operator does not consume it until the
     /// completed build table is published.
-    pub fn join(
-        self,
-        build: RecordBatchOperatorSpec,
-        build_key_column: usize,
-        probe_key_column: usize,
-        key_type: &DataType,
-        output_columns: JoinOutputColumns,
-    ) -> Self {
+    pub fn join(self, build: RecordBatchOperatorSpec, key_type: &DataType, spec: JoinSpec) -> Self {
         use arrow_array::types as t;
         use arrow_schema::TimeUnit;
         match key_type {
-            DataType::Int8 => self.join_typed::<t::Int8Type>(
-                build,
-                build_key_column,
-                probe_key_column,
-                output_columns,
-            ),
-            DataType::Int16 => self.join_typed::<t::Int16Type>(
-                build,
-                build_key_column,
-                probe_key_column,
-                output_columns,
-            ),
-            DataType::Int32 => self.join_typed::<t::Int32Type>(
-                build,
-                build_key_column,
-                probe_key_column,
-                output_columns,
-            ),
-            DataType::Int64 => self.join_typed::<t::Int64Type>(
-                build,
-                build_key_column,
-                probe_key_column,
-                output_columns,
-            ),
-            DataType::UInt8 => self.join_typed::<t::UInt8Type>(
-                build,
-                build_key_column,
-                probe_key_column,
-                output_columns,
-            ),
-            DataType::UInt16 => self.join_typed::<t::UInt16Type>(
-                build,
-                build_key_column,
-                probe_key_column,
-                output_columns,
-            ),
-            DataType::UInt32 => self.join_typed::<t::UInt32Type>(
-                build,
-                build_key_column,
-                probe_key_column,
-                output_columns,
-            ),
-            DataType::UInt64 => self.join_typed::<t::UInt64Type>(
-                build,
-                build_key_column,
-                probe_key_column,
-                output_columns,
-            ),
-            DataType::Date32 => self.join_typed::<t::Date32Type>(
-                build,
-                build_key_column,
-                probe_key_column,
-                output_columns,
-            ),
-            DataType::Date64 => self.join_typed::<t::Date64Type>(
-                build,
-                build_key_column,
-                probe_key_column,
-                output_columns,
-            ),
-            DataType::Timestamp(TimeUnit::Second, _) => self.join_typed::<t::TimestampSecondType>(
-                build,
-                build_key_column,
-                probe_key_column,
-                output_columns,
-            ),
-            DataType::Timestamp(TimeUnit::Millisecond, _) => self
-                .join_typed::<t::TimestampMillisecondType>(
-                    build,
-                    build_key_column,
-                    probe_key_column,
-                    output_columns,
-                ),
-            DataType::Timestamp(TimeUnit::Microsecond, _) => self
-                .join_typed::<t::TimestampMicrosecondType>(
-                    build,
-                    build_key_column,
-                    probe_key_column,
-                    output_columns,
-                ),
-            DataType::Timestamp(TimeUnit::Nanosecond, _) => self
-                .join_typed::<t::TimestampNanosecondType>(
-                    build,
-                    build_key_column,
-                    probe_key_column,
-                    output_columns,
-                ),
-            DataType::Decimal64(_, _) => self.join_typed::<t::Decimal64Type>(
-                build,
-                build_key_column,
-                probe_key_column,
-                output_columns,
-            ),
-            DataType::Decimal128(_, _) => self.join_typed::<t::Decimal128Type>(
-                build,
-                build_key_column,
-                probe_key_column,
-                output_columns,
-            ),
+            DataType::Int8 => self.join_dispatch::<t::Int8Type>(build, spec),
+            DataType::Int16 => self.join_dispatch::<t::Int16Type>(build, spec),
+            DataType::Int32 => self.join_dispatch::<t::Int32Type>(build, spec),
+            DataType::Int64 => self.join_dispatch::<t::Int64Type>(build, spec),
+            DataType::UInt8 => self.join_dispatch::<t::UInt8Type>(build, spec),
+            DataType::UInt16 => self.join_dispatch::<t::UInt16Type>(build, spec),
+            DataType::UInt32 => self.join_dispatch::<t::UInt32Type>(build, spec),
+            DataType::UInt64 => self.join_dispatch::<t::UInt64Type>(build, spec),
+            DataType::Date32 => self.join_dispatch::<t::Date32Type>(build, spec),
+            DataType::Date64 => self.join_dispatch::<t::Date64Type>(build, spec),
+            DataType::Timestamp(TimeUnit::Second, _) => {
+                self.join_dispatch::<t::TimestampSecondType>(build, spec)
+            }
+            DataType::Timestamp(TimeUnit::Millisecond, _) => {
+                self.join_dispatch::<t::TimestampMillisecondType>(build, spec)
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                self.join_dispatch::<t::TimestampMicrosecondType>(build, spec)
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                self.join_dispatch::<t::TimestampNanosecondType>(build, spec)
+            }
+            DataType::Decimal64(_, _) => self.join_dispatch::<t::Decimal64Type>(build, spec),
+            DataType::Decimal128(_, _) => self.join_dispatch::<t::Decimal128Type>(build, spec),
             other => panic!("unsupported join key type {other}; the planner gates key types"),
         }
     }
 
-    fn join_typed<T: ArrowPrimitiveType<Native: Hash + Eq>>(
+    /// Pick the outerness instantiation, so the probe's match loop carries no
+    /// runtime test for it.
+    fn join_dispatch<T: ArrowPrimitiveType<Native: Hash + Eq>>(
         self,
         build: RecordBatchOperatorSpec,
-        build_key_column: usize,
-        probe_key_column: usize,
-        output_columns: JoinOutputColumns,
+        spec: JoinSpec,
+    ) -> Self {
+        match spec.outer_probe_fields.is_some() {
+            true => self.join_typed::<T, true>(build, spec),
+            false => self.join_typed::<T, false>(build, spec),
+        }
+    }
+
+    fn join_typed<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool>(
+        self,
+        build: RecordBatchOperatorSpec,
+        spec: JoinSpec,
     ) -> Self {
         let worker_count = self.worker_count();
         assert_eq!(
@@ -830,12 +763,8 @@ impl RecordBatchOperatorSpec {
             "join inputs must use the same worker pool"
         );
 
-        let (build_factories, probe_factories, build_ready) = create_join_factories::<T>(
-            build_key_column,
-            probe_key_column,
-            output_columns,
-            worker_count,
-        );
+        let (build_factories, probe_factories, build_ready) =
+            create_join_factories::<T, BUILD_OUTER>(spec, worker_count);
 
         let (_, build_heads) = build.into_parts();
         let build_siblings_left = Arc::new(AtomicUsize::new(worker_count));
