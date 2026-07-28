@@ -15,7 +15,7 @@ use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::keys::ArenaKey;
 use arrow_array::types::{ArrowPrimitiveType, Decimal128Type, Int64Type};
 use arrow_array::{ArrayRef, Decimal128Array, Float64Array, Int64Array, StringViewArray};
-use arrow_buffer::ScalarBuffer;
+use arrow_buffer::{NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field};
 use std::sync::Arc;
 
@@ -34,8 +34,14 @@ impl<T: Copy + Default + Send + Sync + 'static> Cell for T {}
 pub trait IntCell: Cell + Ord + std::ops::Add<Output = Self> + From<i64> + Into<i128> {
     /// The Arrow primitive whose `Native` is this width.
     type Arrow: ArrowPrimitiveType<Native = Self>;
-    /// Render a finished grouped column, handing the engine slab to Arrow zero-copy.
-    fn finish(name: &str, col: SlabColumn<Self>) -> (Field, ArrayRef);
+    /// The width's largest value: a `MIN`'s empty cell, absorbed by any fold.
+    const MAX_VALUE: Self;
+    /// The width's smallest value: a `MAX`'s empty cell.
+    const MIN_VALUE: Self;
+    /// Render a finished grouped column, handing the engine slab to Arrow
+    /// zero-copy. `nulls` marks the groups whose slot never saw a non-NULL
+    /// value; those render as SQL NULL.
+    fn finish(name: &str, col: SlabColumn<Self>, nulls: Option<NullBuffer>) -> (Field, ArrayRef);
     /// This width's Arrow data type.
     fn data_type() -> DataType;
     /// A single-row array — the global (no-GROUP-BY) output. `None` is a SQL NULL
@@ -44,12 +50,14 @@ pub trait IntCell: Cell + Ord + std::ops::Add<Output = Self> + From<i64> + Into<
 }
 impl IntCell for i64 {
     type Arrow = Int64Type;
-    fn finish(name: &str, col: SlabColumn<Self>) -> (Field, ArrayRef) {
+    const MAX_VALUE: Self = i64::MAX;
+    const MIN_VALUE: Self = i64::MIN;
+    fn finish(name: &str, col: SlabColumn<Self>, nulls: Option<NullBuffer>) -> (Field, ArrayRef) {
         let len = col.len();
         let values = ScalarBuffer::<i64>::new(col.into_buffer(), 0, len);
         (
-            Field::new(name, DataType::Int64, false),
-            Arc::new(Int64Array::new(values, None)),
+            Field::new(name, DataType::Int64, nulls.is_some()),
+            Arc::new(Int64Array::new(values, nulls)),
         )
     }
     fn data_type() -> DataType {
@@ -62,14 +70,17 @@ impl IntCell for i64 {
 
 impl IntCell for i128 {
     type Arrow = Decimal128Type;
-    fn finish(name: &str, col: SlabColumn<Self>) -> (Field, ArrayRef) {
+    const MAX_VALUE: Self = i128::MAX;
+    const MIN_VALUE: Self = i128::MIN;
+    fn finish(name: &str, col: SlabColumn<Self>, nulls: Option<NullBuffer>) -> (Field, ArrayRef) {
         let len = col.len();
         let values = ScalarBuffer::<i128>::new(col.into_buffer(), 0, len);
-        let arr = Decimal128Array::new(values, None)
+        let nullable = nulls.is_some();
+        let arr = Decimal128Array::new(values, nulls)
             .with_precision_and_scale(38, 0)
             .expect("(38, 0) is a valid decimal128 precision/scale");
         (
-            Field::new(name, DataType::Decimal128(38, 0), false),
+            Field::new(name, DataType::Decimal128(38, 0), nullable),
             Arc::new(arr),
         )
     }
@@ -100,8 +111,13 @@ pub trait F64Cell: Cell {
     fn into_f64(self) -> f64;
     /// Render a finished column of float cells as a zero-or-near-zero-copy `Float64`
     /// array. The output phase narrows this to `Float32` for a `REAL` slot via the
-    /// slot's declared `output_type` cast.
-    fn finish_float(name: &str, col: SlabColumn<Self>) -> (Field, ArrayRef);
+    /// slot's declared `output_type` cast. `nulls` marks the groups whose slot
+    /// never saw a non-NULL value.
+    fn finish_float(
+        name: &str,
+        col: SlabColumn<Self>,
+        nulls: Option<NullBuffer>,
+    ) -> (Field, ArrayRef);
 }
 
 impl F64Cell for i64 {
@@ -113,14 +129,18 @@ impl F64Cell for i64 {
     fn into_f64(self) -> f64 {
         f64::from_bits(self as u64)
     }
-    fn finish_float(name: &str, col: SlabColumn<Self>) -> (Field, ArrayRef) {
+    fn finish_float(
+        name: &str,
+        col: SlabColumn<Self>,
+        nulls: Option<NullBuffer>,
+    ) -> (Field, ArrayRef) {
         let len = col.len();
         // Each `i64` cell holds an `f64`'s raw bits, so the same 8-byte slab
         // reinterprets as an `f64` buffer with no copy.
         let values = ScalarBuffer::<f64>::new(col.into_buffer(), 0, len);
         (
-            Field::new(name, DataType::Float64, false),
-            Arc::new(Float64Array::new(values, None)),
+            Field::new(name, DataType::Float64, nulls.is_some()),
+            Arc::new(Float64Array::new(values, nulls)),
         )
     }
 }
@@ -135,13 +155,23 @@ impl F64Cell for i128 {
     fn into_f64(self) -> f64 {
         f64::from_bits(self as u64)
     }
-    fn finish_float(name: &str, col: SlabColumn<Self>) -> (Field, ArrayRef) {
+    fn finish_float(
+        name: &str,
+        col: SlabColumn<Self>,
+        nulls: Option<NullBuffer>,
+    ) -> (Field, ArrayRef) {
         let len = col.len();
         // The f64 bits sit in each cell's low 64; the 16-byte stride can't
         // reinterpret in place, so gather them back into a fresh Float64 buffer.
         let cells = ScalarBuffer::<i128>::new(col.into_buffer(), 0, len);
-        let arr = Float64Array::from_iter_values(cells.iter().map(|&c| f64::from_bits(c as u64)));
-        (Field::new(name, DataType::Float64, false), Arc::new(arr))
+        let arr = Float64Array::new(
+            cells.iter().map(|&c| f64::from_bits(c as u64)).collect(),
+            nulls.clone(),
+        );
+        (
+            Field::new(name, DataType::Float64, nulls.is_some()),
+            Arc::new(arr),
+        )
     }
 }
 
@@ -200,8 +230,15 @@ pub trait StringCell: Cell {
     /// Read the cell back as the `ArenaKey` a string slot stored in it.
     fn into_key(self) -> ArenaKey;
     /// Render a finished column of string-extreme cells as a zero-copy
-    /// `Utf8View` array over the value arena's ring buffers.
-    fn finish(name: &str, col: SlabColumn<Self>, arena: &Arc<SharedArena>) -> (Field, ArrayRef);
+    /// `Utf8View` array over the value arena's ring buffers. `nulls` marks the
+    /// groups whose slot never saw a non-NULL value; their cells are the default
+    /// (an empty inline view), never resolved through the arena.
+    fn finish(
+        name: &str,
+        col: SlabColumn<Self>,
+        arena: &Arc<SharedArena>,
+        nulls: Option<NullBuffer>,
+    ) -> (Field, ArrayRef);
 }
 
 /// The fail-out: a string extreme requires 128-bit storage, so the planner must
@@ -215,7 +252,12 @@ impl StringCell for i64 {
     fn into_key(self) -> ArenaKey {
         panic!("{NARROW_STRING_CELL}")
     }
-    fn finish(_: &str, _: SlabColumn<Self>, _: &Arc<SharedArena>) -> (Field, ArrayRef) {
+    fn finish(
+        _: &str,
+        _: SlabColumn<Self>,
+        _: &Arc<SharedArena>,
+        _: Option<NullBuffer>,
+    ) -> (Field, ArrayRef) {
         panic!("{NARROW_STRING_CELL}")
     }
 }
@@ -232,16 +274,23 @@ impl StringCell for i128 {
     fn into_key(self) -> ArenaKey {
         ArenaKey::from_raw(self as u128)
     }
-    fn finish(name: &str, col: SlabColumn<Self>, arena: &Arc<SharedArena>) -> (Field, ArrayRef) {
+    fn finish(
+        name: &str,
+        col: SlabColumn<Self>,
+        arena: &Arc<SharedArena>,
+        nulls: Option<NullBuffer>,
+    ) -> (Field, ArrayRef) {
         let len = col.len();
         // The cells are valid `ArenaKey`s (StringView headers); reinterpret the
-        // slab as `u128` views (zero-copy) over the arena's ring buffers.
+        // slab as `u128` views (zero-copy) over the arena's ring buffers. A NULL
+        // group's cell is 0, a valid empty inline view, masked by `nulls`.
         let views = ScalarBuffer::<u128>::new(col.into_buffer(), 0, len);
         let buffers = arena.to_arrow_buffers();
+        let nullable = nulls.is_some();
         // Safety: the views are valid ArenaKeys and the arena (Arc-held in each
         // Buffer) outlives the array — the same contract as string keys.
         let arr: ArrayRef =
-            Arc::new(unsafe { StringViewArray::new_unchecked(views, buffers, None) });
-        (Field::new(name, DataType::Utf8View, false), arr)
+            Arc::new(unsafe { StringViewArray::new_unchecked(views, buffers, nulls) });
+        (Field::new(name, DataType::Utf8View, nullable), arr)
     }
 }

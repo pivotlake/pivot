@@ -658,6 +658,9 @@ impl<'plan> Expr<'plan> {
             }
             T::CASE_EXPR => Expression::Case(Case { raw: self.raw }),
             T::OPERATOR_NOT => Expression::Not(Not { raw: self.raw }),
+            T::OPERATOR_IS_NULL | T::OPERATOR_IS_NOT_NULL => {
+                Expression::IsNull(IsNull { raw: self.raw })
+            }
             T::OPERATOR_CAST => Expression::Cast(Cast { raw: self.raw }),
             other => Expression::Unsupported(other),
         }
@@ -686,6 +689,8 @@ pub enum Expression<'plan> {
     Case(Case<'plan>),
     /// Logical negation (`NOT expr`).
     Not(Not<'plan>),
+    /// An `expr IS NULL` / `expr IS NOT NULL` test.
+    IsNull(IsNull<'plan>),
     /// A type cast.
     Cast(Cast<'plan>),
     /// Any expression type the consumer doesn't handle, carrying the raw type.
@@ -713,6 +718,8 @@ define_handles! { ffi::Expression;
     Case,
     /// Logical negation (`NOT expr`).
     Not,
+    /// An `expr IS NULL` / `expr IS NOT NULL` test.
+    IsNull,
     /// A type cast (`CAST(child AS return_type)`).
     Cast,
 }
@@ -889,6 +896,20 @@ impl<'plan> Not<'plan> {
         Expr {
             raw: ffi::expr_operator_child(self.raw, 0),
         }
+    }
+}
+
+impl<'plan> IsNull<'plan> {
+    /// The tested operand (both IS NULL forms have a single child).
+    pub fn input(self) -> Expr<'plan> {
+        Expr {
+            raw: ffi::expr_operator_child(self.raw, 0),
+        }
+    }
+
+    /// `true` for `IS NOT NULL`, `false` for `IS NULL`.
+    pub fn negated(self) -> bool {
+        ExpressionType::from_u8(ffi::expr_type(self.raw)) == ExpressionType::OPERATOR_IS_NOT_NULL
     }
 }
 

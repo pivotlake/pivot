@@ -50,6 +50,17 @@ impl PlanNode {
         self.operator.output_types(&inputs)
     }
 
+    /// Whether each column this node emits can hold SQL NULLs, in output order:
+    /// the nullability companion to [`output_types`](Self::output_types).
+    pub fn output_nullability(&self) -> Vec<bool> {
+        let inputs: Vec<Vec<bool>> = self
+            .inputs
+            .iter()
+            .map(PlanNode::output_nullability)
+            .collect();
+        self.operator.output_nullability(&inputs)
+    }
+
     fn fmt_indented(&self, f: &mut fmt::Formatter<'_>, indent: usize) -> fmt::Result {
         let prefix = "  ".repeat(indent);
         writeln!(f, "{prefix}{}", self.operator)?;

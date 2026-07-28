@@ -157,6 +157,17 @@ pub trait Table: Debug + Send + Sync {
     /// Return the table's schema.
     fn columns(&self) -> Vec<Column>;
 
+    /// Whether each column (in [`columns`](Self::columns) order) can actually
+    /// hold SQL NULLs. The planner routes a nullable column through the
+    /// null-aware execution paths; a `false` keeps the branch-free fast paths,
+    /// so a binding should report `false` whenever it can prove the data has
+    /// no NULLs (e.g. from parquet statistics), not merely echo a declared
+    /// `OPTIONAL`. The default reports every column nullable, which is always
+    /// sound.
+    fn nullability(&self) -> Vec<bool> {
+        vec![true; self.columns().len()]
+    }
+
     /// Clone this table into a fresh boxed trait object.
     ///
     /// A late-materialized query references one table from both its narrow scan

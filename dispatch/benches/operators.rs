@@ -823,7 +823,10 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                 vec![0, 1],
                 count_star(),
                 Some(GroupLimit::First { limit: 10 }),
-                RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]),
+                RowKeySchema::new(
+                    vec![DataType::Int64, DataType::Utf8View],
+                    vec![false, false],
+                ),
             )
         },
     );

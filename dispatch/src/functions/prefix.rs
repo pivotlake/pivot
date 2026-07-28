@@ -58,14 +58,16 @@ impl Prefix {
             bitmap.set_bit(i, matched);
         }
 
-        bitmap.finish().into()
+        // A NULL input row must stay NULL in the mask (not `true`, which an
+        // empty prefix would otherwise produce), so the filter drops it.
+        BooleanArray::new(bitmap.finish(), col.nulls().cloned())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::Prefix;
-    use arrow_array::StringViewArray;
+    use arrow_array::{Array, StringViewArray};
 
     fn run(prefix: &str, values: &[&str]) -> Vec<bool> {
         let array = StringViewArray::from_iter_values(values.iter().copied());
@@ -124,6 +126,16 @@ mod tests {
         let result = run("longer than the value", &["short", ""]);
 
         assert_eq!(result, vec![false, false]);
+    }
+
+    #[test]
+    fn null_rows_stay_null_even_for_empty_prefix() {
+        let array = StringViewArray::from(vec![Some("abc"), None]);
+
+        let result = Prefix::new("").run(&array);
+
+        assert!(result.value(0));
+        assert!(result.is_null(1));
     }
 
     #[test]

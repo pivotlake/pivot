@@ -401,7 +401,7 @@ mod tests {
     type IntExtractor = IntKeyExtractor<Int32Type>;
     // A single `COUNT` slot. `Compiled` is numeric-only, so its `SharedContext`
     // is concretely `()`.
-    type CountValue = Compiled<(CountSlot,)>;
+    type CountValue = Compiled<(CountSlot,), u8>;
     const COUNT_CFG: <CountValue as AggregationValue>::SharedContext = ();
 
     fn make_worker_tables(

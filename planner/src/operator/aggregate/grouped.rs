@@ -32,8 +32,8 @@ use arrow_array::types::{
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use dispatch::{
-    AggregationKind, AggregationSlot, Compiled, CountSlot, Distinct, Dynamic, GroupLimit,
-    IntKeyExtractor, IntPairKeyExtractor, IntStrKeyExtractor, RecordBatchOperatorSpec,
+    AggregationKind, AggregationSlot, Compiled, CountSlot, CountValidSlot, Distinct, Dynamic,
+    GroupLimit, IntKeyExtractor, IntPairKeyExtractor, IntStrKeyExtractor, RecordBatchOperatorSpec,
     RowKeyExtractor, StringKeyExtractor, SumSlot,
 };
 use std::sync::Arc;
@@ -42,12 +42,19 @@ impl Aggregate {
     pub(super) fn compile_grouped(
         &self,
         input: RecordBatchOperatorSpec,
+        nullability: &[bool],
     ) -> Result<RecordBatchOperatorSpec, Error> {
         // Every group key and aggregate argument is a plain column after
         // `materialize_inputs`, so resolve the keys directly and build the
         // operator with no further column shift.
         let keys = self.resolved_keys();
-        build_group_by_operator(input, &keys, &self.expressions, self.output_limit)
+        build_group_by_operator(
+            input,
+            &keys,
+            &self.expressions,
+            self.output_limit,
+            nullability,
+        )
     }
 
     /// The group keys as `(column, type)` pairs. Every key is a plain column
@@ -101,7 +108,8 @@ impl Aggregate {
     pub(super) fn materialize_inputs(
         &self,
         input: RecordBatchOperatorSpec,
-    ) -> Result<(RecordBatchOperatorSpec, Option<Aggregate>), Error> {
+        input_nullability: Vec<bool>,
+    ) -> Result<(RecordBatchOperatorSpec, Vec<bool>, Option<Aggregate>), Error> {
         // The computed sub-expressions to materialise and their canonical column
         // types, group keys first then aggregate arguments.
         let mut computed: Vec<&Expression> = Vec::new();
@@ -137,8 +145,17 @@ impl Aggregate {
         // Nothing computed: reuse the input untouched and let the caller lower
         // `self` directly (every key and argument is already a column).
         if computed.is_empty() {
-            return Ok((input, None));
+            return Ok((input, input_nullability, None));
         }
+
+        // The materialised columns lead, so the nullability vector mirrors the
+        // projection: one entry per computed expression, then the original
+        // input's entries shifted right.
+        let nullability: Vec<bool> = computed
+            .iter()
+            .map(|e| e.nullability(&input_nullability))
+            .chain(input_nullability.iter().copied())
+            .collect();
 
         let shift = computed.len();
         let input = project_leading_columns(input, &computed, &types)?;
@@ -159,6 +176,7 @@ impl Aggregate {
 
         Ok((
             input,
+            nullability,
             Some(Aggregate {
                 groups,
                 expressions,
@@ -223,17 +241,18 @@ pub(super) fn build_group_by_operator(
     keys: &[(usize, Type)],
     exprs: &[Expression],
     output_limit: Option<GroupLimit>,
+    nullability: &[bool],
 ) -> Result<RecordBatchOperatorSpec, Error> {
     // Coalesce aggregates that fold to the same value so each is scattered/merged
-    // once and the hash entry stays narrow: any COUNT/COUNT(*) is identical (pivot's
-    // Count is +1 per row), a SUM/MIN/MAX of the same column is identical.
-    // `to_unique[i]` is the deduped slot expression `i` folds into; the value
-    // columns are re-expanded below so the output still has one per expression.
+    // once and the hash entry stays narrow: a COUNT(col) over a NULL-free column
+    // is COUNT(*), a SUM/MIN/MAX of the same column is identical. `to_unique[i]`
+    // is the deduped slot expression `i` folds into; the value columns are
+    // re-expanded below so the output still has one per expression.
     let mut unique: Vec<&Expression> = Vec::new();
     let mut fold_keys: Vec<FoldKey> = Vec::new();
     let mut to_unique: Vec<usize> = Vec::with_capacity(exprs.len());
     for e in exprs {
-        let key = fold_key(e)?;
+        let key = fold_key(e, nullability)?;
         let idx = match fold_keys.iter().position(|k| *k == key) {
             Some(i) => i,
             None => {
@@ -247,7 +266,7 @@ pub(super) fn build_group_by_operator(
     let unique_exprs: Vec<Expression> = unique.iter().map(|e| (*e).clone()).collect();
 
     let slots = aggregation_slots(&unique_exprs)?;
-    let signatures = aggregation_signatures(&unique_exprs);
+    let signatures = aggregation_signatures(&unique_exprs, nullability);
 
     // A pushed-down Top-K sorts by a value slot identified by expression index;
     // coalescing renumbers the slots, so remap it to the unique slot it folds into
@@ -274,6 +293,7 @@ pub(super) fn build_group_by_operator(
         &signatures,
         requires_wide_cells,
         output_limit,
+        nullability,
     )?;
 
     // No two aggregates coalesced: the output already has one value column per
@@ -323,27 +343,45 @@ fn reexpand_coalesced(
 }
 
 /// Identifies aggregates that fold to the same value, so [`build_group_by_operator`] scatters
-/// and merges each once: any COUNT/COUNT(*) (pivot's Count is +1 per row, so it
-/// equals COUNT(*)), or a SUM/MIN/MAX of a given column.
+/// and merges each once: a `COUNT(col)` over a NULL-free column is `COUNT(*)`
+/// (both count every row), so it collapses into [`CountStar`](FoldKey::CountStar);
+/// over a nullable column it counts only the non-NULL rows, so it folds per
+/// column. A SUM/MIN/MAX of a given column is identical to another of the same
+/// column either way (both skip the same NULLs).
 #[derive(PartialEq)]
 enum FoldKey {
-    Count,
+    CountStar,
+    Count(usize),
     Sum(usize),
     Min(usize),
     Max(usize),
 }
 
-fn fold_key(e: &Expression) -> Result<FoldKey, Error> {
+fn fold_key(e: &Expression, nullability: &[bool]) -> Result<FoldKey, Error> {
     let Expression::AggregateFunc(func) = e else {
         return Err(Error::UnsupportedAggregateExpression(e.clone()));
     };
     Ok(match func {
-        AggregateFunc::CountStar(_) | AggregateFunc::Count(_) => FoldKey::Count,
+        AggregateFunc::CountStar(_) => FoldKey::CountStar,
+        AggregateFunc::Count(a) => {
+            let column = a.column().column_idx;
+            if column_nullable(nullability, column) {
+                FoldKey::Count(column)
+            } else {
+                FoldKey::CountStar
+            }
+        }
         AggregateFunc::Sum(a) => FoldKey::Sum(a.column().column_idx),
         AggregateFunc::Min(a) => FoldKey::Min(a.column().column_idx),
         AggregateFunc::Max(a) => FoldKey::Max(a.column().column_idx),
         _ => return Err(Error::UnsupportedAggregateExpression(e.clone())),
     })
+}
+
+/// Whether `column` can hold NULLs, conservatively `true` when the vector does
+/// not cover it (a synthesised reference into an intermediate output).
+pub(super) fn column_nullable(nullability: &[bool], column: usize) -> bool {
+    nullability.get(column).copied().unwrap_or(true)
 }
 
 /// The canonical column type a computed group key or aggregate argument is
@@ -419,23 +457,35 @@ fn project_leading_columns(
 /// Slot information needed to select a compiled value specialization.
 ///
 /// COUNT and COUNT(*) share one signature because they use the same accumulator
-/// operation. SUM retains its input type so the reader type can be selected.
+/// operation; a COUNT over a nullable column is its own shape, since it must
+/// consult the column's validity. SUM retains its input type so the reader type
+/// can be selected.
 pub(super) enum AggregationSignature {
     Count,
+    /// `COUNT(col)` over a nullable column: counts only the non-NULL rows.
+    CountNullable,
     Sum(Type),
     /// Any operation without a compiled specialization.
     Other,
 }
 
-fn aggregation_signatures(expressions: &[Expression]) -> Vec<AggregationSignature> {
+fn aggregation_signatures(
+    expressions: &[Expression],
+    nullability: &[bool],
+) -> Vec<AggregationSignature> {
     expressions
         .iter()
         .map(|expression| match expression {
             Expression::AggregateFunc(AggregateFunc::Sum(argument)) => {
                 AggregationSignature::Sum(argument.column().return_type.clone())
             }
-            Expression::AggregateFunc(AggregateFunc::CountStar(_) | AggregateFunc::Count(_)) => {
-                AggregationSignature::Count
+            Expression::AggregateFunc(AggregateFunc::CountStar(_)) => AggregationSignature::Count,
+            Expression::AggregateFunc(AggregateFunc::Count(argument)) => {
+                if column_nullable(nullability, argument.column().column_idx) {
+                    AggregationSignature::CountNullable
+                } else {
+                    AggregationSignature::Count
+                }
             }
             _ => AggregationSignature::Other,
         })
@@ -463,66 +513,77 @@ fn int_pair_keys(keys: &[(usize, Type)]) -> Option<(Type, Type)> {
 /// A macro continuation is required because a selected Rust type cannot be
 /// returned as a runtime value.
 macro_rules! select_key_extractor {
-    ($keys:expr, $with_key:ident) => {{
-        // Use native extractors for supported single-column keys.
-        if let [(_, ty)] = $keys {
-            match ty {
-                Type::Int8 => return $with_key!(IntKeyExtractor<Int8Type>, ()),
-                Type::Int16 => return $with_key!(IntKeyExtractor<Int16Type>, ()),
-                Type::Int32 => return $with_key!(IntKeyExtractor<Int32Type>, ()),
-                Type::Int64 => return $with_key!(IntKeyExtractor<Int64Type>, ()),
-                // A decimal keys on its raw unscaled integer at its carrier
-                // width (equal values share a scale, so raw equality is value
-                // equality); the emitted key column gets its declared
-                // precision/scale restamped on by the aggregate's output
-                // restore.
-                Type::Decimal { precision, .. } if *precision <= MAX_DECIMAL64_PRECISION => {
-                    return $with_key!(IntKeyExtractor<Decimal64Type>, ());
+    ($keys:expr, $keys_nullable:expr, $with_key:ident) => {{
+        // The dedicated extractors read key values with no notion of validity,
+        // so they are only sound over NULL-free key columns; nullable keys take
+        // the row encoder below, whose blobs carry per-field validity.
+        if $keys_nullable.iter().all(|&nullable| !nullable) {
+            // Use native extractors for supported single-column keys.
+            if let [(_, ty)] = $keys {
+                match ty {
+                    Type::Int8 => return $with_key!(IntKeyExtractor<Int8Type>, ()),
+                    Type::Int16 => return $with_key!(IntKeyExtractor<Int16Type>, ()),
+                    Type::Int32 => return $with_key!(IntKeyExtractor<Int32Type>, ()),
+                    Type::Int64 => return $with_key!(IntKeyExtractor<Int64Type>, ()),
+                    // A decimal keys on its raw unscaled integer at its carrier
+                    // width (equal values share a scale, so raw equality is value
+                    // equality); the emitted key column gets its declared
+                    // precision/scale restamped on by the aggregate's output
+                    // restore.
+                    Type::Decimal { precision, .. } if *precision <= MAX_DECIMAL64_PRECISION => {
+                        return $with_key!(IntKeyExtractor<Decimal64Type>, ());
+                    }
+                    Type::Decimal { .. } => return $with_key!(IntKeyExtractor<Decimal128Type>, ()),
+                    Type::Utf8 => return $with_key!(StringKeyExtractor, ()),
+                    // Other single-key types fall through to the row encoder below.
+                    _ => {}
                 }
-                Type::Decimal { .. } => return $with_key!(IntKeyExtractor<Decimal128Type>, ()),
-                Type::Utf8 => return $with_key!(StringKeyExtractor, ()),
-                // Other single-key types fall through to the row encoder below.
+            }
+
+            // Pack supported integer pairs into one u128 key.
+            if let Some(pair) = int_pair_keys($keys) {
+                return match pair {
+                    (Type::Int64, Type::Int32) => $with_key!(IntPairKeyExtractor<Int64Type, Int32Type>, ()),
+                    (Type::Int32, Type::Int32) => $with_key!(IntPairKeyExtractor<Int32Type, Int32Type>, ()),
+                    (Type::Int16, Type::Int32) => $with_key!(IntPairKeyExtractor<Int16Type, Int32Type>, ()),
+                    (Type::Int16, Type::Int16) => $with_key!(IntPairKeyExtractor<Int16Type, Int16Type>, ()),
+                    (Type::Int64, Type::Int64) => $with_key!(IntPairKeyExtractor<Int64Type, Int64Type>, ()),
+                    (Type::Int32, Type::Int64) => $with_key!(IntPairKeyExtractor<Int32Type, Int64Type>, ()),
+                    _ => unreachable!("int_pair_keys only returns the arms above"),
+                };
+            }
+
+            // Keep an integer and string in their native representations.
+            match $keys {
+                [(_, int_ty), (_, Type::Utf8)] => match int_ty {
+                    Type::Int8 => return $with_key!(IntStrKeyExtractor<Int8Type, false>, ()),
+                    Type::Int16 => return $with_key!(IntStrKeyExtractor<Int16Type, false>, ()),
+                    Type::Int32 => return $with_key!(IntStrKeyExtractor<Int32Type, false>, ()),
+                    Type::Int64 => return $with_key!(IntStrKeyExtractor<Int64Type, false>, ()),
+                    _ => {}
+                },
+                [(_, Type::Utf8), (_, int_ty)] => match int_ty {
+                    Type::Int8 => return $with_key!(IntStrKeyExtractor<Int8Type, true>, ()),
+                    Type::Int16 => return $with_key!(IntStrKeyExtractor<Int16Type, true>, ()),
+                    Type::Int32 => return $with_key!(IntStrKeyExtractor<Int32Type, true>, ()),
+                    Type::Int64 => return $with_key!(IntStrKeyExtractor<Int64Type, true>, ()),
+                    _ => {}
+                },
+                // Anything else (two non-int/string keys, 3+ keys) falls
+                // through to the row encoder below.
                 _ => {}
             }
         }
 
-        // Pack supported integer pairs into one u128 key.
-        if let Some(pair) = int_pair_keys($keys) {
-            return match pair {
-                (Type::Int64, Type::Int32) => $with_key!(IntPairKeyExtractor<Int64Type, Int32Type>, ()),
-                (Type::Int32, Type::Int32) => $with_key!(IntPairKeyExtractor<Int32Type, Int32Type>, ()),
-                (Type::Int16, Type::Int32) => $with_key!(IntPairKeyExtractor<Int16Type, Int32Type>, ()),
-                (Type::Int16, Type::Int16) => $with_key!(IntPairKeyExtractor<Int16Type, Int16Type>, ()),
-                (Type::Int64, Type::Int64) => $with_key!(IntPairKeyExtractor<Int64Type, Int64Type>, ()),
-                (Type::Int32, Type::Int64) => $with_key!(IntPairKeyExtractor<Int32Type, Int64Type>, ()),
-                _ => unreachable!("int_pair_keys only returns the arms above"),
-            };
-        }
-
-        // Keep an integer and string in their native representations.
-        match $keys {
-            [(_, int_ty), (_, Type::Utf8)] => match int_ty {
-                Type::Int8 => return $with_key!(IntStrKeyExtractor<Int8Type, false>, ()),
-                Type::Int16 => return $with_key!(IntStrKeyExtractor<Int16Type, false>, ()),
-                Type::Int32 => return $with_key!(IntStrKeyExtractor<Int32Type, false>, ()),
-                Type::Int64 => return $with_key!(IntStrKeyExtractor<Int64Type, false>, ()),
-                _ => {}
-            },
-            [(_, Type::Utf8), (_, int_ty)] => match int_ty {
-                Type::Int8 => return $with_key!(IntStrKeyExtractor<Int8Type, true>, ()),
-                Type::Int16 => return $with_key!(IntStrKeyExtractor<Int16Type, true>, ()),
-                Type::Int32 => return $with_key!(IntStrKeyExtractor<Int32Type, true>, ()),
-                Type::Int64 => return $with_key!(IntStrKeyExtractor<Int64Type, true>, ()),
-                _ => {}
-            },
-            // Anything else (two non-int/string, 3+ keys) falls through to the row
-            // encoder below.
-            _ => {}
-        }
-
         // The general fallback: encode the whole key tuple into one byte blob.
-        // Handles a single non-int/string key, 3+ keys, or mixed types.
-        let schema = match row_key_schema($keys.iter().map(|(_, t)| t)) {
+        // Handles a single non-int/string key, 3+ keys, mixed types, and any
+        // nullable key column.
+        let schema = match row_key_schema(
+            $keys
+                .iter()
+                .zip($keys_nullable.iter())
+                .map(|((_, t), &nullable)| (t, nullable)),
+        ) {
             Ok(schema) => schema,
             Err(unsupported) => {
                 return Err(Error::DataTypeNotSupportedForGroupBy {
@@ -546,8 +607,13 @@ pub(super) fn dispatch_group_by(
     signatures: &[AggregationSignature],
     requires_wide_cells: bool,
     output_limit: Option<GroupLimit>,
+    nullability: &[bool],
 ) -> Result<RecordBatchOperatorSpec, Error> {
     let key_columns: Vec<usize> = keys.iter().map(|(column, _)| *column).collect();
+    let keys_nullable: Vec<bool> = keys
+        .iter()
+        .map(|(column, _)| column_nullable(nullability, *column))
+        .collect();
 
     // COUNT and integer SUM can use the addition-only specialization. Float
     // cells store raw bits, so they must use operation-aware merging.
@@ -558,21 +624,40 @@ pub(super) fn dispatch_group_by(
         ) && !slot.output_type.is_floating()
     });
 
+    // Whether any aggregated column can hold NULLs. When none can, the value
+    // containers instantiate with the zero-sized `()` seen mask: no per-group
+    // mask storage and no per-row validity checks, so a NULL-free query's
+    // group entries and fold loops match a mask-less build exactly.
+    // `COUNT(*)` reads no column, so its placeholder column is exempt.
+    let values_nullable = slots.iter().any(|slot| {
+        !matches!(slot.kind, AggregationKind::CountStar)
+            && column_nullable(nullability, slot.column)
+    });
+    // A tracking `Dynamic` keeps the group's seen bits in one u64 mask cell.
+    if values_nullable && slots.len() > 64 {
+        return Err(Error::UnsupportedAggregateExpressionAmount(slots.len()));
+    }
+
     // Both type selections meet at this operator-construction leaf.
     macro_rules! build_group_by {
         ($K:ty, $V:ty, $key_config:expr) => {
             Ok(input.group_by_aggregate::<$K, $V>(key_columns, slots, output_limit, $key_config))
         };
     }
-    // Dynamic covers every slot count and supported operation mix.
+    // Dynamic covers every slot count and supported operation mix. The seen
+    // mask instantiates `u8` only when an aggregated column can hold NULLs.
     macro_rules! dynamic {
         ($K:ty, $key_config:expr) => {
-            match (requires_wide_cells, only_additive) {
+            match (requires_wide_cells, only_additive, values_nullable) {
                 _ if slots.is_empty() => Err(Error::UnsupportedAggregateExpressionAmount(0)),
-                (true, true) => build_group_by!($K, Dynamic<i128, true>, $key_config),
-                (true, false) => build_group_by!($K, Dynamic<i128, false>, $key_config),
-                (false, true) => build_group_by!($K, Dynamic<i64, true>, $key_config),
-                (false, false) => build_group_by!($K, Dynamic<i64, false>, $key_config),
+                (true, true, false) => build_group_by!($K, Dynamic<i128, true>, $key_config),
+                (true, false, false) => build_group_by!($K, Dynamic<i128, false>, $key_config),
+                (false, true, false) => build_group_by!($K, Dynamic<i64, true>, $key_config),
+                (false, false, false) => build_group_by!($K, Dynamic<i64, false>, $key_config),
+                (true, true, true) => build_group_by!($K, Dynamic<i128, true, u8>, $key_config),
+                (true, false, true) => build_group_by!($K, Dynamic<i128, false, u8>, $key_config),
+                (false, true, true) => build_group_by!($K, Dynamic<i64, true, u8>, $key_config),
+                (false, false, true) => build_group_by!($K, Dynamic<i64, false, u8>, $key_config),
             }
         };
     }
@@ -580,17 +665,34 @@ pub(super) fn dispatch_group_by(
     macro_rules! select_value {
         ($K:ty, $key_config:expr) => {
             match signatures {
+                // A lone count over no column or a proven NULL-free column.
                 [AggregationSignature::Count] => {
                     build_group_by!($K, Compiled<(CountSlot,)>, $key_config)
+                }
+                // `COUNT(col)` over a nullable column: the same branch-free
+                // entry, reading only the column's validity. The `u8` mask
+                // keeps the validity checks live (a count's output is still
+                // never NULL, so its bits are always set).
+                [AggregationSignature::CountNullable] => {
+                    build_group_by!($K, Compiled<(CountValidSlot,), u8>, $key_config)
                 }
                 // Common narrow signature produced when AVG shares a count.
                 [
                     AggregationSignature::Count,
                     AggregationSignature::Sum(Type::Int16),
                     AggregationSignature::Sum(Type::Int16),
-                ] => build_group_by!(
+                ] if !values_nullable => build_group_by!(
                     $K,
                     Compiled<(CountSlot, SumSlot<Int16Type>, SumSlot<Int16Type>)>,
+                    $key_config
+                ),
+                [
+                    AggregationSignature::Count,
+                    AggregationSignature::Sum(Type::Int16),
+                    AggregationSignature::Sum(Type::Int16),
+                ] => build_group_by!(
+                    $K,
+                    Compiled<(CountSlot, SumSlot<Int16Type>, SumSlot<Int16Type>), u8>,
                     $key_config
                 ),
                 _ => dynamic!($K, $key_config),
@@ -599,7 +701,7 @@ pub(super) fn dispatch_group_by(
     }
 
     // Key selection invokes value selection as its continuation.
-    select_key_extractor!(keys, select_value)
+    select_key_extractor!(keys, keys_nullable, select_value)
 }
 
 /// Lower a keys-only GROUP BY that dedups the `keys` tuple and emits each distinct
@@ -610,8 +712,13 @@ pub(super) fn dispatch_group_by(
 pub(super) fn build_dedup_operator(
     input: RecordBatchOperatorSpec,
     keys: &[(usize, Type)],
+    nullability: &[bool],
 ) -> Result<RecordBatchOperatorSpec, Error> {
     let key_columns: Vec<usize> = keys.iter().map(|(column, _)| *column).collect();
+    let keys_nullable: Vec<bool> = keys
+        .iter()
+        .map(|(column, _)| column_nullable(nullability, *column))
+        .collect();
     // Keys-only: `Distinct` holds no accumulator, so the slot list is empty and the
     // group emits the key columns themselves.
     macro_rules! emit_dedup {
@@ -626,7 +733,7 @@ pub(super) fn build_dedup_operator(
             )
         };
     }
-    select_key_extractor!(keys, emit_dedup)
+    select_key_extractor!(keys, keys_nullable, emit_dedup)
 }
 
 /// Remap resolved group `keys` onto the leading output columns `0..n` of a
@@ -1419,5 +1526,101 @@ mod tests {
         let col = batches[0].column(0);
         assert_eq!(col.data_type(), &DataType::Date32);
         assert_eq!(col.as_primitive::<Date32Type>().value(0), 10);
+    }
+
+    #[rstest]
+    fn global_aggregates_skip_nulls(mut testing_planner: TestingPlanner) {
+        let rows = run(
+            &mut testing_planner,
+            "SELECT COUNT(b) AS cb, COUNT(*) AS ca, SUM(b) AS sb, MIN(b) AS mn, MAX(b) AS mx \
+             FROM nullable_table",
+        );
+
+        assert_eq!(rows[0]["cb"].as_i64(), Some(3));
+        assert_eq!(rows[0]["ca"].as_i64(), Some(6));
+        assert_eq!(rows[0]["sb"].as_i64(), Some(90));
+        assert_eq!(rows[0]["mn"].as_i64(), Some(10));
+        assert_eq!(rows[0]["mx"].as_i64(), Some(50));
+    }
+
+    #[rstest]
+    fn global_sum_over_only_nulls_is_null(mut testing_planner: TestingPlanner) {
+        let rows = run(
+            &mut testing_planner,
+            "SELECT SUM(b) AS sb FROM nullable_table WHERE b IS NULL",
+        );
+
+        assert!(rows[0]["sb"].is_null());
+    }
+
+    #[rstest]
+    fn grouped_values_skip_nulls_and_all_null_groups_are_null(mut testing_planner: TestingPlanner) {
+        let mut rows = run(
+            &mut testing_planner,
+            "SELECT a, SUM(b) AS sb, COUNT(b) AS cb, MIN(s) AS ms, MIN(b) AS mb \
+             FROM nullable_table GROUP BY a",
+        );
+
+        rows.sort_by_key(|r| r["a"].as_i64().unwrap());
+        assert_eq!(rows.len(), 6);
+        assert_eq!(rows[0]["sb"].as_i64(), Some(10));
+        assert_eq!(rows[0]["cb"].as_i64(), Some(1));
+        assert_eq!(rows[0]["ms"].as_str(), Some("x"));
+        // a = 2 saw only NULLs: the sum and extremes are NULL, the count is 0.
+        assert!(rows[1]["sb"].is_null());
+        assert_eq!(rows[1]["cb"].as_i64(), Some(0));
+        assert!(rows[1]["ms"].is_null());
+        assert!(rows[1]["mb"].is_null());
+        // a = 6 has a NULL b beside a real s.
+        assert!(rows[5]["sb"].is_null());
+        assert_eq!(rows[5]["ms"].as_str(), Some("z"));
+    }
+
+    #[rstest]
+    fn lone_grouped_count_of_nullable_column_skips_nulls(mut testing_planner: TestingPlanner) {
+        // A lone COUNT(col) is the compiled validity-reading slot.
+        let mut rows = run(
+            &mut testing_planner,
+            "SELECT a, COUNT(b) AS c FROM nullable_table GROUP BY a",
+        );
+
+        rows.sort_by_key(|r| r["a"].as_i64().unwrap());
+        assert_eq!(
+            rows.iter()
+                .map(|r| r["c"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 0, 1, 0, 1, 0]
+        );
+    }
+
+    #[rstest]
+    fn null_int_keys_group_together(mut testing_planner: TestingPlanner) {
+        let rows = run(
+            &mut testing_planner,
+            "SELECT b, COUNT(*) AS c FROM nullable_table GROUP BY b",
+        );
+
+        assert_eq!(rows.len(), 4);
+        let null_group = rows.iter().find(|r| r["b"].is_null()).unwrap();
+        assert_eq!(null_group["c"].as_i64(), Some(3));
+    }
+
+    #[rstest]
+    fn null_string_and_int_keys_group_together(mut testing_planner: TestingPlanner) {
+        let rows = run(
+            &mut testing_planner,
+            "SELECT s, b, COUNT(*) AS c FROM nullable_table GROUP BY s, b",
+        );
+
+        // (x, 10), (NULL, NULL) x2, (y, 30), (x, 50), (z, NULL).
+        assert_eq!(rows.len(), 5);
+        let all_null = rows
+            .iter()
+            .find(|r| r["s"].is_null() && r["b"].is_null())
+            .unwrap();
+        assert_eq!(all_null["c"].as_i64(), Some(2));
+        let z_group = rows.iter().find(|r| r["s"].as_str() == Some("z")).unwrap();
+        assert!(z_group["b"].is_null());
+        assert_eq!(z_group["c"].as_i64(), Some(1));
     }
 }

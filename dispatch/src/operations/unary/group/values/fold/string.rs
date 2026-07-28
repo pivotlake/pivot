@@ -20,6 +20,7 @@ use crate::arrays::SlabColumn;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::values::cell::StringCell;
 use arrow_array::ArrayRef;
+use arrow_buffer::NullBuffer;
 use arrow_schema::Field;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -60,8 +61,8 @@ macro_rules! str_extreme {
                 }
             }
             /// Render a finished column of keys as a `Utf8View` array over the arena.
-            pub fn finish(name: &str, col: SlabColumn<A>, ctx: &Arc<SharedArena>) -> (Field, ArrayRef) {
-                A::finish(name, col, ctx)
+            pub fn finish(name: &str, col: SlabColumn<A>, ctx: &Arc<SharedArena>, nulls: Option<NullBuffer>) -> (Field, ArrayRef) {
+                A::finish(name, col, ctx, nulls)
             }
         }
     };

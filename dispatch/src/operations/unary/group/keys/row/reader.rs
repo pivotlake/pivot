@@ -48,10 +48,19 @@ macro_rules! define_column_encoder {
                 }
             }
 
-            /// Append row `idx`'s encoded bytes to `out`. Safety: `idx` is always within
-            /// the batch row count, so the unchecked reads are sound.
+            /// Append row `idx`'s encoded bytes to `out`. A nullable field leads
+            /// with a validity byte, and a NULL row is that byte alone. Safety:
+            /// `idx` is always within the batch row count, so the unchecked reads
+            /// are sound.
             #[inline(always)]
-            fn encode(&self, idx: usize, out: &mut Vec<u8>) {
+            fn encode(&self, idx: usize, nullable: bool, out: &mut Vec<u8>) {
+                if nullable {
+                    let valid = self.is_valid(idx);
+                    out.push(valid as u8);
+                    if !valid {
+                        return;
+                    }
+                }
                 // Every fixed-width arm is the same: append the value's little-endian
                 // bytes (a const-width copy, see the type doc). A decimal appends its
                 // raw unscaled integer's bytes at its width; every value of a column
@@ -72,6 +81,16 @@ macro_rules! define_column_encoder {
                             out.extend_from_slice(s);
                         }
                     }
+                }
+            }
+
+            #[inline(always)]
+            fn is_valid(&self, idx: usize) -> bool {
+                match self {
+                    $( ColumnEncoder::$variant(a) => a.is_valid(idx), )+
+                    ColumnEncoder::Dec64(a) => a.is_valid(idx),
+                    ColumnEncoder::Dec128(a) => a.is_valid(idx),
+                    ColumnEncoder::Str(a) => a.is_valid(idx),
                 }
             }
         }
@@ -97,6 +116,7 @@ pub struct RowScratch {
 /// [`row`](RowReader::row) slices it.
 pub struct RowReader<'b> {
     casted: Vec<ArrayRef>,
+    nullable: Vec<bool>,
     scratch: &'b mut RowScratch,
 }
 
@@ -134,12 +154,27 @@ impl<'b> RowReader<'b> {
                 }
             })
             .collect();
-        RowReader { casted, scratch }
+        RowReader {
+            casted,
+            nullable: config.nullable().to_vec(),
+            scratch,
+        }
     }
 
     /// Encode every row's key tuple into the scratch buffer and write its hash
-    /// into `hashes` (sized to the batch length by the caller).
+    /// into `hashes` (sized to the batch length by the caller). The row loop is
+    /// instantiated per schema nullability: a NULL-free schema takes the
+    /// `ANY_NULLABLE = false` copy, whose per-field validity checks const-fold
+    /// away, so it pays nothing for the nullable machinery.
     pub(super) fn encode_and_hash(&mut self, state: &RandomState, hashes: &mut [u64]) {
+        if self.nullable.contains(&true) {
+            self.encode_rows::<true>(state, hashes);
+        } else {
+            self.encode_rows::<false>(state, hashes);
+        }
+    }
+
+    fn encode_rows<const ANY_NULLABLE: bool>(&mut self, state: &RandomState, hashes: &mut [u64]) {
         let encoders: Vec<ColumnEncoder> = self.casted.iter().map(ColumnEncoder::new).collect();
         let scratch = &mut *self.scratch;
         scratch.bytes.clear();
@@ -161,13 +196,23 @@ impl<'b> RowReader<'b> {
         };
         let mut start = 0usize;
         for (i, slot) in hashes.iter_mut().enumerate() {
-            for enc in &encoders[..head] {
-                enc.encode(i, &mut scratch.bytes);
+            for (enc, &nullable) in encoders[..head].iter().zip(&self.nullable) {
+                enc.encode(i, ANY_NULLABLE && nullable, &mut scratch.bytes);
             }
             if let Some(ColumnEncoder::Str(a)) = encoders.get(head) {
-                scratch
-                    .bytes
-                    .extend_from_slice(unsafe { a.value_unchecked(i) }.as_bytes());
+                // The trailing string skips its length prefix, but a nullable one
+                // still leads with its validity byte (a NULL is that byte alone).
+                let mut write_bytes = true;
+                if ANY_NULLABLE && self.nullable[head] {
+                    let valid = a.is_valid(i);
+                    scratch.bytes.push(valid as u8);
+                    write_bytes = valid;
+                }
+                if write_bytes {
+                    scratch
+                        .bytes
+                        .extend_from_slice(unsafe { a.value_unchecked(i) }.as_bytes());
+                }
             }
             let end = scratch.bytes.len();
             // Hash each blob the moment it is written — still hot from encoding —

@@ -65,14 +65,16 @@ impl Contains {
             bitmap.append(found);
         }
 
-        bitmap.finish().into()
+        // A NULL input row must stay NULL in the mask (not `true`, which an
+        // empty needle would otherwise produce), so the filter drops it.
+        BooleanArray::new(bitmap.finish(), array.nulls().cloned())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::Contains;
-    use arrow_array::StringViewArray;
+    use arrow_array::{Array, StringViewArray};
 
     fn run(needle: &str, values: &[&str]) -> Vec<bool> {
         let array = StringViewArray::from_iter_values(values.iter().copied());
@@ -161,6 +163,17 @@ mod tests {
         let result = run("google", &values);
 
         assert_eq!(result, vec![true, false, true]);
+    }
+
+    #[test]
+    fn null_rows_stay_null_even_for_empty_needle() {
+        let array = StringViewArray::from(vec![Some("hello"), None, Some("x")]);
+
+        let result = Contains::new("").run(&array);
+
+        assert!(result.value(0));
+        assert!(result.is_null(1));
+        assert!(result.value(2));
     }
 
     #[test]

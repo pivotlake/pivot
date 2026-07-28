@@ -415,7 +415,10 @@ fn group_by_count_row_key_with_string_field() {
                 DataType::Int64,
             )],
             None,
-            RowKeySchema::new(vec![DataType::Utf8View, DataType::Int64]),
+            RowKeySchema::new(
+                vec![DataType::Utf8View, DataType::Int64],
+                vec![false, false],
+            ),
         )
         .order_by_limit(vec![OrderBy::new(2, true, false)], 10)
         .collect()

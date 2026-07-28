@@ -122,7 +122,7 @@ fn filter_then_group_by_then_order_by() {
                 dispatch::RowSelection::Indices
             }
         })
-        .group_by_aggregate::<StringKeyExtractor, Compiled<(CountSlot,)>>(
+        .group_by_aggregate::<StringKeyExtractor, Compiled<(CountSlot,), u8>>(
             vec![0],
             vec![AggregationSlot::new(
                 AggregationKind::CountStar,

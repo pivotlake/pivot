@@ -168,6 +168,69 @@ impl Operator {
             Operator::CreateTable(_) | Operator::SetVariable(_) => Ok(Vec::new()),
         }
     }
+
+    /// Whether each column this operator emits can hold SQL NULLs, in output
+    /// order: the nullability companion to [`output_types`](Self::output_types),
+    /// resolved per expression via [`Expression::nullability`]. The planner uses
+    /// it to route between the branch-free and the null-aware execution paths,
+    /// so `false` must be sound while `true` merely costs the fast path.
+    pub fn output_nullability(&self, inputs: &[Vec<bool>]) -> Vec<bool> {
+        match self {
+            // A scan's nullability comes from the table binding, which reports
+            // whether each column's data can actually hold NULLs.
+            Operator::Input(input) => {
+                let table = input.table.nullability();
+                input
+                    .columns
+                    .iter()
+                    .map(|e| e.nullability(&table))
+                    .collect()
+            }
+            // Table functions do not report nullability; stay conservative.
+            Operator::TableFunctionScan(scan) => {
+                vec![true; scan.output_types().map_or(0, |t| t.len())]
+            }
+            Operator::Materialize(materialize) => {
+                let nullability = materialize.table.nullability();
+                materialize
+                    .columns
+                    .iter()
+                    .map(|&i| nullability[i])
+                    .collect()
+            }
+            Operator::Projection(projection) => projection
+                .projections
+                .iter()
+                .map(|e| e.nullability(&inputs[0]))
+                .collect(),
+            Operator::Aggregate(aggregate) => aggregate
+                .groups
+                .iter()
+                .chain(aggregate.expressions.iter())
+                .map(|e| e.nullability(&inputs[0]))
+                .collect(),
+            Operator::Filter(_) | Operator::OrderBy(_) | Operator::TopN(_) | Operator::Limit(_) => {
+                inputs[0].clone()
+            }
+            Operator::DummyScan(_) => Vec::new(),
+            Operator::Explain(_) => vec![false],
+            // A VALUES row may hold NULL literals; stay conservative.
+            Operator::Values(values) => {
+                vec![true; values.rows.first().map_or(0, Vec::len)]
+            }
+            // An INSERT emits one row: the inserted-row count, never NULL.
+            Operator::Insert(_) => vec![false],
+            // An inner join only ever emits rows built from both inputs, so
+            // each output column keeps its own side's nullability.
+            Operator::Join(join) => join
+                .probe_output
+                .iter()
+                .map(|&i| inputs[0][i])
+                .chain(join.build_output.iter().map(|&i| inputs[1][i]))
+                .collect(),
+            Operator::CreateTable(_) | Operator::SetVariable(_) => Vec::new(),
+        }
+    }
 }
 
 /// The result type of each expression, in order.
