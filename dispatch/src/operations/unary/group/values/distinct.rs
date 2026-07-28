@@ -6,7 +6,7 @@
 //! Used for the dedup stage of `COUNT(DISTINCT x)` (and, later, `SELECT DISTINCT`):
 //! only the *set* of distinct keys matters, so it emits no value columns.
 
-use super::{AggregationSlot, AggregationValue, ValueColumns};
+use super::{AggregationSlot, AggregationValue, ArityBody, ValueColumnBuilder};
 use crate::memory::SlabAllocator;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
@@ -16,48 +16,87 @@ use arrow_schema::Field;
 #[derive(Clone, Copy, Default)]
 pub struct Distinct;
 
-/// The (empty) output columns of a [`Distinct`] value: a keys-only group emits no
-/// value columns, so this builds nothing.
-pub struct DistinctColumns;
-
 impl AggregationValue for Distinct {
+    type Owned = Self;
+    type StorageMetadata = ();
     type Reader<'b> = ();
     type SharedContext = ();
-    type Columns = DistinctColumns;
+    type ColumnBuilder = DistinctColumnBuilder;
     type SortKey = i64;
     type WorkerContext = ();
 
     #[inline(always)]
     fn make_reader(_batch: &RecordBatch, _slots: &[AggregationSlot]) {}
 
+    fn storage_metadata(_ctx: &()) {}
+
+    fn metadata_for_arity<const N: usize>() {}
+
     #[inline(always)]
-    fn value(_reader: &(), _idx: usize, _wc: &mut ()) -> Self {
-        Distinct
+    fn dispatch_arity<Ret>(_metadata: (), body: impl ArityBody<Ret>) -> Ret {
+        body.run::<0>()
+    }
+
+    fn stored_size(_metadata: ()) -> usize {
+        0
+    }
+
+    fn stored_align() -> usize {
+        1
     }
 
     #[inline(always)]
-    fn merge(self, _other: Self, _ctx: &()) -> Self {
-        // No accumulator — both sides are the same (distinct) key.
-        self
+    unsafe fn from_entry<'a>(ptr: *const u8, _metadata: ()) -> &'a Self {
+        unsafe { &*(ptr as *const Self) }
     }
+
+    #[inline(always)]
+    unsafe fn from_entry_mut<'a>(ptr: *mut u8, _metadata: ()) -> &'a mut Self {
+        unsafe { &mut *(ptr as *mut Self) }
+    }
+
+    #[inline(always)]
+    fn seed(&mut self, _reader: &(), _idx: usize, _wc: &mut ()) {}
+
+    #[inline(always)]
+    fn update(&mut self, _reader: &(), _idx: usize, _wc: &mut (), _ctx: &()) {}
+
+    #[inline(always)]
+    fn merge_from(&mut self, _source: &Self, _ctx: &()) {
+        // No accumulator: both sides are the same (distinct) key.
+    }
+
+    #[inline(always)]
+    fn copy_from(&mut self, _source: &Self) {}
 
     #[inline(always)]
     fn sort_key(&self, _slot: usize) -> i64 {
         // A keys-only group never feeds an ORDER BY <agg> top-k.
         0
     }
+
+    #[inline(always)]
+    fn to_owned(&self, _ctx: &(), _wc: &mut Option<()>) -> Self {
+        Distinct
+    }
 }
 
-impl ValueColumns for DistinctColumns {
+/// Empty output builder for a keys-only value.
+pub struct DistinctColumnBuilder;
+
+impl ValueColumnBuilder for DistinctColumnBuilder {
     type Value = Distinct;
     type Context = ();
 
-    fn with_capacity(_allocator: &mut SlabAllocator, _rows: usize) -> Self {
-        DistinctColumns
+    fn with_capacity(_allocator: &mut SlabAllocator, _rows: usize, _context: &()) -> Self {
+        DistinctColumnBuilder
     }
 
     #[inline(always)]
     fn push(&mut self, _value: &Distinct) {}
+
+    #[inline(always)]
+    fn push_stored(&mut self, _stored: &Distinct) {}
 
     fn finish(self, _context: &()) -> (Vec<Field>, Vec<ArrayRef>) {
         (Vec::new(), Vec::new())

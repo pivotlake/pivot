@@ -280,7 +280,7 @@ fn group_by_sum_float_values() {
 
     let results = values_input(&dispatch, vec![batch])
         .record_batches()
-        .group_by_aggregate::<IntKeyExtractor<Int64Type>, Dynamic<1, i64, false>>(
+        .group_by_aggregate::<IntKeyExtractor<Int64Type>, Dynamic<i64, false>>(
             vec![0],
             vec![AggregationSlot::new(
                 AggregationKind::Sum,
@@ -318,7 +318,7 @@ fn group_by_sum_decimal128_does_not_clip_to_i64() {
 
     let results = values_input(&dispatch, vec![batch])
         .record_batches()
-        .group_by_aggregate::<IntKeyExtractor<Int64Type>, Dynamic<1, i128, false>>(
+        .group_by_aggregate::<IntKeyExtractor<Int64Type>, Dynamic<i128, false>>(
             vec![0],
             vec![AggregationSlot::new(
                 AggregationKind::Sum,

@@ -191,6 +191,12 @@ impl<K: Ord + Copy, V: Copy, A: HeapBuffer<Ranked<K, V>>> SlabTopK<K, V, A> {
         }
     }
 
+    /// Returns whether [`offer`](Self::offer) could retain this key.
+    #[inline]
+    pub fn would_retain(&mut self, key: K) -> bool {
+        self.len < self.cap || (self.cap > 0 && key > self.buf.cursor()[0].key)
+    }
+
     /// Offer an item, keeping it only if it is among the `cap` largest by `key`.
     /// `allocator` backs the buffer's lazy growth during the fill phase; it is
     /// untouched once the heap is full.

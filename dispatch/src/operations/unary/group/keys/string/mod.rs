@@ -7,7 +7,7 @@ pub use live_key::{ResolvedKey, StringKey};
 use crate::arrays::SlabColumn;
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
-use crate::operations::unary::group::keys::{KeyColumns, KeyExtractor};
+use crate::operations::unary::group::keys::{KeyColumnBuilder, KeyExtractor};
 use ahash::RandomState;
 use arrow_array::{Array, ArrayRef, RecordBatch, StringViewArray};
 use arrow_buffer::{Buffer, ScalarBuffer};
@@ -31,7 +31,7 @@ impl KeyExtractor for StringKeyExtractor {
     type LiveKey<'a, 'b> = StringKey<'a, 'b>;
     type PersistedLiveKey<'a> = ResolvedKey<'a>;
     type Reader<'b> = &'b StringViewArray;
-    type Columns = StringKeyColumn;
+    type ColumnBuilder = StringKeyColumnBuilder;
     type Scratch = ();
 
     fn make_reader<'b>(
@@ -82,11 +82,11 @@ impl KeyExtractor for StringKeyExtractor {
 /// detect the shared `Arc` and reuse it, so a high-partition-count result never
 /// rebuilds the buffer list, keeping the whole output path off the millions of
 /// per-buffer refcount operations a naive per-batch wrap would cost.
-pub struct StringKeyColumn {
+pub struct StringKeyColumnBuilder {
     views: SlabColumn<u128>,
 }
 
-impl KeyColumns for StringKeyColumn {
+impl KeyColumnBuilder for StringKeyColumnBuilder {
     type Key = ArenaKey;
     type Config = ();
 
