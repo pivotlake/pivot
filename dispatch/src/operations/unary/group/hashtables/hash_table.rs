@@ -4,6 +4,7 @@
 
 use crate::memory::{BUFFER_SIZE, Slab, SlabAllocator};
 use crate::operations::unary::group::arena::SharedArena;
+use crate::operations::unary::group::hashtables::TableLayout;
 use crate::operations::unary::group::values::AggregationValue;
 use std::marker::PhantomData;
 use std::mem;
@@ -89,14 +90,14 @@ fn align_up(x: usize, align: usize) -> usize {
 /// stays below `n / 2^64`. The true quotient's fractional part is at most
 /// `1 - 1/d`, so rounding can change the floor only if `n >= 2^64 / d`.
 /// Here `d < 2^21`, making the result exact for every table slot index.
-fn reciprocal(d: u64) -> u64 {
+pub(super) fn reciprocal(d: u64) -> u64 {
     assert!(d >= 2, "an entry never fills half a slab");
     ((1u128 << 64).div_ceil(d as u128)) as u64
 }
 
 /// Divides `n` using a reciprocal returned by [`reciprocal`].
 #[inline(always)]
-fn fast_div(n: usize, m: u64) -> usize {
+pub(super) fn fast_div(n: usize, m: u64) -> usize {
     (((n as u128) * (m as u128)) >> 64) as usize
 }
 
@@ -243,27 +244,27 @@ fn prefetch_l2_line(ptr: *const u8) {
 /// This lets one merge job scan only its ranges. Storing the full hash also
 /// avoids hashing large keys again during resize and merge.
 pub struct BaseHashTable<K: PersistedKey, V: AggregationValue + ?Sized> {
-    mask: usize,
-    shift: u32,
+    slot_mask: usize,
+    slot_shift: u32,
     collisions: usize,
     /// Left-shift applied to hash before computing the slot index.
     /// Set to `PARTITIONS.trailing_zeros()` for merge maps so that the partition
     /// bits (top N) are stripped and the next top bits drive slot placement.
-    pre_shift: u32,
-    /// Whole entries per 2MB slab (`BUFFER_SIZE / stride`); entries never
+    hash_left_shift: u32,
+    /// Whole entries per 2MB slab (`BUFFER_SIZE / entry_stride`); entries never
     /// straddle a slab boundary.
     entries_per_slab: usize,
     /// Reciprocal used by [`fast_div`] to find a slab without hardware division.
-    entries_per_slab_magic: u64,
+    entries_per_slab_reciprocal: u64,
     /// Bytes per entry.
-    stride: usize,
+    entry_stride: usize,
     hash_offset: usize,
     /// Strictest field alignment, for allocating replacement slabs on resize.
-    align: usize,
+    entry_alignment: usize,
     /// Value layout metadata stored once per table.
-    metadata: V::StorageMetadata,
+    storage_metadata: V::StorageMetadata,
     /// Slab addresses adjusted by their first global entry offset.
-    bases: Vec<usize>,
+    adjusted_slab_bases: Vec<usize>,
     slabs: Vec<Slab>,
     length: usize,
     max_load: usize,
@@ -278,26 +279,26 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> BaseHashTable<K, V> {
     pub fn new(
         allocator: &mut SlabAllocator,
         expected_capacity: usize,
-        pre_shift: u32,
+        hash_left_shift: u32,
         ctx: &V::SharedContext,
     ) -> Self {
-        let metadata = V::storage_metadata(ctx);
-        let layout = entry_layout::<K, V>(metadata);
+        let storage_metadata = V::storage_metadata(ctx);
+        let layout = entry_layout::<K, V>(storage_metadata);
         let entries_per_slab = BUFFER_SIZE / layout.stride;
         let slabs = allocator.create_strided_slabs(expected_capacity, layout.stride, layout.align);
         BaseHashTable {
-            mask: expected_capacity - 1,
+            slot_mask: expected_capacity - 1,
             length: 0,
             max_load: max_load_for_len(expected_capacity),
-            pre_shift,
-            shift: u64::BITS - expected_capacity.trailing_zeros(),
+            hash_left_shift,
+            slot_shift: u64::BITS - expected_capacity.trailing_zeros(),
             entries_per_slab,
-            entries_per_slab_magic: reciprocal(entries_per_slab as u64),
-            stride: layout.stride,
+            entries_per_slab_reciprocal: reciprocal(entries_per_slab as u64),
+            entry_stride: layout.stride,
             hash_offset: layout.hash_offset,
-            align: layout.align,
-            metadata,
-            bases: adjusted_bases(&slabs, entries_per_slab, layout.stride),
+            entry_alignment: layout.align,
+            storage_metadata,
+            adjusted_slab_bases: adjusted_bases(&slabs, entries_per_slab, layout.stride),
             slabs,
             _phantom: PhantomData,
             collisions: 0,
@@ -315,7 +316,7 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> BaseHashTable<K, V> {
 
     /// Total number of slots (occupied + empty). Always a power of 2.
     pub fn capacity(&self) -> usize {
-        self.mask + 1
+        self.slot_mask + 1
     }
 
     /// Returns the number of entries currently stored in the table.
@@ -328,10 +329,10 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> BaseHashTable<K, V> {
         self.collisions
     }
 
-    /// Map a hash to a slot index using the top bits: `(hash << pre_shift) >> shift`.
+    /// Maps a hash to a slot index using the selected high bits.
     #[inline(always)]
     fn slot_for(&self, hash: u64) -> usize {
-        ((hash << self.pre_shift) >> self.shift) as usize
+        ((hash << self.hash_left_shift) >> self.slot_shift) as usize
     }
 
     /// Returns an entry address using the supplied adjusted slab bases.
@@ -340,15 +341,15 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> BaseHashTable<K, V> {
     /// and the adjusted base allows the byte address to use the global index
     /// directly.
     #[inline(always)]
-    fn entry_ptr_in(&self, bases: &[usize], index: usize) -> *mut u8 {
-        let slab_idx = fast_div(index, self.entries_per_slab_magic);
-        bases[slab_idx].wrapping_add(index * self.stride) as *mut u8
+    fn entry_ptr_in(&self, adjusted_slab_bases: &[usize], index: usize) -> *mut u8 {
+        let slab_index = fast_div(index, self.entries_per_slab_reciprocal);
+        adjusted_slab_bases[slab_index].wrapping_add(index * self.entry_stride) as *mut u8
     }
 
     /// The address of this table's entry at `index`.
     #[inline(always)]
     fn entry_ptr(&self, index: usize) -> *mut u8 {
-        self.entry_ptr_in(&self.bases, index)
+        self.entry_ptr_in(&self.adjusted_slab_bases, index)
     }
 
     /// Returns an iterator over all non-empty entries in the table.
@@ -357,9 +358,8 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> BaseHashTable<K, V> {
     /// Empty slots (hash == 0) are skipped automatically.
     pub fn iter(&self, start_offset: usize) -> HashTableIterator<'_, K, V> {
         HashTableIterator {
-            layout: self.probe_layout(),
+            layout: self.layout(),
             idx: start_offset,
-            _table: PhantomData,
         }
     }
 
@@ -368,68 +368,70 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> BaseHashTable<K, V> {
         self.len() > self.max_load
     }
 
-    /// Copies entry layout and probe parameters into a [`ProbeLayout`].
+    /// Returns a copyable description of this table's slot and entry layout.
     #[inline(always)]
-    fn probe_layout(&self) -> ProbeLayout<K, V> {
-        self.probe_layout_with_metadata(self.metadata)
+    pub(crate) fn layout(&self) -> TableLayout<'_, K, V> {
+        self.layout_with_metadata(self.storage_metadata)
     }
 
-    /// Builds a probe layout from caller-provided value metadata.
+    /// Builds a table layout from caller-provided value metadata.
     ///
     /// Arity-specialized loops pass constant metadata here so field offsets and
     /// stride arithmetic can be constant-folded. The metadata must describe
     /// the layout used to construct this table.
     #[inline(always)]
-    fn probe_layout_with_metadata(&self, metadata: V::StorageMetadata) -> ProbeLayout<K, V> {
+    pub(crate) fn layout_with_metadata(
+        &self,
+        metadata: V::StorageMetadata,
+    ) -> TableLayout<'_, K, V> {
+        unsafe { self.layout_with_unchecked_lifetime(metadata) }
+    }
+
+    /// Builds a layout without tying its lifetime to this particular borrow.
+    ///
+    /// The prober already holds an exclusive table borrow for the resulting
+    /// lifetime. It uses this constructor so the copied layout and that mutable
+    /// borrow can live in the same struct.
+    ///
+    /// # Safety
+    ///
+    /// The returned layout must not outlive this table. It must be replaced
+    /// before accessing entries after any operation that changes the table's
+    /// slabs, capacity, or entry layout.
+    #[inline(always)]
+    unsafe fn layout_with_unchecked_lifetime<'table>(
+        &self,
+        metadata: V::StorageMetadata,
+    ) -> TableLayout<'table, K, V> {
         let layout = entry_layout::<K, V>(metadata);
-        debug_assert_eq!(layout.stride, self.stride);
+        debug_assert_eq!(layout.stride, self.entry_stride);
         let entries_per_slab = BUFFER_SIZE / layout.stride;
-        ProbeLayout {
-            magic: reciprocal(entries_per_slab as u64),
-            stride: layout.stride,
-            hash_offset: layout.hash_offset,
-            key_offset: layout.key_offset,
-            value_offset: layout.value_offset,
-            mask: self.mask,
-            shift: self.shift,
-            pre_shift: self.pre_shift,
-            bases: self.bases.as_ptr(),
-            bases_len: self.bases.len(),
-            first_base: self.bases[0],
-            metadata,
-            _phantom: PhantomData,
+        unsafe {
+            TableLayout::new(
+                layout,
+                entries_per_slab,
+                self.slot_mask,
+                self.slot_shift,
+                self.hash_left_shift,
+                &self.adjusted_slab_bases,
+                metadata,
+            )
         }
     }
 
     /// Creates a probing handle with a local layout snapshot.
     #[inline(always)]
     pub fn prober(&mut self) -> Prober<'_, K, V> {
-        self.prober_with_metadata(self.metadata)
+        self.prober_with_metadata(self.storage_metadata)
     }
 
     /// Creates a probing handle for an arity-specialized loop.
     #[inline(always)]
     pub fn prober_with_metadata(&mut self, metadata: V::StorageMetadata) -> Prober<'_, K, V> {
-        let layout = self.probe_layout_with_metadata(metadata);
+        let layout = unsafe { self.layout_with_unchecked_lifetime(metadata) };
         Prober {
             table: self,
             layout,
-        }
-    }
-
-    /// Creates a read handle with a local layout snapshot.
-    #[inline(always)]
-    pub fn reader(&self) -> TableReader<'_, K, V> {
-        self.reader_with_metadata(self.metadata)
-    }
-
-    /// [`reader`](Self::reader) with caller-supplied metadata; see
-    /// [`probe_layout_with_metadata`](Self::probe_layout_with_metadata).
-    #[inline(always)]
-    pub fn reader_with_metadata(&self, metadata: V::StorageMetadata) -> TableReader<'_, K, V> {
-        TableReader {
-            layout: self.probe_layout_with_metadata(metadata),
-            _table: PhantomData,
         }
     }
 
@@ -448,31 +450,34 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> BaseHashTable<K, V> {
     #[cold]
     pub fn resize(&mut self, allocator: &mut SlabAllocator, new_size: usize) {
         debug!("Resizing map to {:?}...", new_size);
-        let new_slabs = allocator.create_strided_slabs(new_size, self.stride, self.align);
+        let new_slabs =
+            allocator.create_strided_slabs(new_size, self.entry_stride, self.entry_alignment);
         // Keep the replaced slabs alive until the copy loop below has read
-        // every old entry; `old_bases` points into them.
+        // every old entry; `old_adjusted_slab_bases` points into them.
         let _old_slabs = mem::replace(&mut self.slabs, new_slabs);
-        let old_bases = mem::replace(
-            &mut self.bases,
-            adjusted_bases(&self.slabs, self.entries_per_slab, self.stride),
+        let old_adjusted_slab_bases = mem::replace(
+            &mut self.adjusted_slab_bases,
+            adjusted_bases(&self.slabs, self.entries_per_slab, self.entry_stride),
         );
-        let old_mask = self.mask;
+        let old_slot_mask = self.slot_mask;
         self.collisions = self.length;
-        self.mask = new_size - 1;
-        self.shift = u64::BITS - new_size.trailing_zeros();
+        self.slot_mask = new_size - 1;
+        self.slot_shift = u64::BITS - new_size.trailing_zeros();
 
-        for idx in 0..=old_mask {
-            let old_entry = self.entry_ptr_in(&old_bases, idx);
+        for idx in 0..=old_slot_mask {
+            let old_entry = self.entry_ptr_in(&old_adjusted_slab_bases, idx);
             let hash = unsafe { *(old_entry.add(self.hash_offset) as *const u64) };
             if hash != 0 {
                 let mut new_idx = self.slot_for(hash);
                 loop {
                     let new_entry = self.entry_ptr(new_idx);
                     if unsafe { *(new_entry.add(self.hash_offset) as *const u64) } == 0 {
-                        unsafe { ptr::copy_nonoverlapping(old_entry, new_entry, self.stride) };
+                        unsafe {
+                            ptr::copy_nonoverlapping(old_entry, new_entry, self.entry_stride)
+                        };
                         break;
                     }
-                    new_idx = (new_idx + 1) & self.mask;
+                    new_idx = (new_idx + 1) & self.slot_mask;
                 }
             }
         }
@@ -481,74 +486,10 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> BaseHashTable<K, V> {
     }
 }
 
-/// Copyable snapshot of an entry layout and probe parameters.
-///
-/// Hot loops copy this value into locals so raw entry writes cannot force
-/// repeated loads from the table object. Its `bases` pointer remains valid for
-/// the lifetime of the borrowing reader or prober.
-struct ProbeLayout<K, V: AggregationValue + ?Sized> {
-    magic: u64,
-    stride: usize,
-    hash_offset: usize,
-    key_offset: usize,
-    value_offset: usize,
-    mask: usize,
-    shift: u32,
-    pre_shift: u32,
-    bases: *const usize,
-    bases_len: usize,
-    /// Cached first slab base for the common single-slab case.
-    first_base: usize,
-    metadata: V::StorageMetadata,
-    _phantom: PhantomData<K>,
-}
-
-impl<K, V: AggregationValue + ?Sized> Clone for ProbeLayout<K, V> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-impl<K, V: AggregationValue + ?Sized> Copy for ProbeLayout<K, V> {}
-
-impl<K, V: AggregationValue + ?Sized> ProbeLayout<K, V> {
-    /// Map a hash to a slot index using the top bits.
-    #[inline(always)]
-    fn slot_for(&self, hash: u64) -> usize {
-        ((hash << self.pre_shift) >> self.shift) as usize
-    }
-
-    /// The address of the entry at `index`; see
-    /// [`BaseHashTable::entry_ptr_in`].
-    #[inline(always)]
-    fn entry_ptr(&self, index: usize) -> *mut u8 {
-        // Skip slab selection when the table uses a single slab.
-        if self.bases_len == 1 {
-            return self.first_base.wrapping_add(index * self.stride) as *mut u8;
-        }
-        let slab_idx = fast_div(index, self.magic);
-        assert!(slab_idx < self.bases_len);
-        let base = unsafe { *self.bases.add(slab_idx) };
-        base.wrapping_add(index * self.stride) as *mut u8
-    }
-
-    /// The view of the occupied entry at `entry`'s address, with `hash`
-    /// already read.
-    #[inline(always)]
-    unsafe fn view<'a>(&self, entry: *const u8, hash: u64) -> EntryView<'a, K, V> {
-        unsafe {
-            EntryView {
-                hash,
-                key: &*(entry.add(self.key_offset) as *const K),
-                stored: V::from_entry(entry.add(self.value_offset), self.metadata),
-            }
-        }
-    }
-}
-
 /// Mutable table handle that keeps the probe layout local across many probes.
 pub struct Prober<'t, K: PersistedKey, V: AggregationValue + ?Sized> {
     table: &'t mut BaseHashTable<K, V>,
-    layout: ProbeLayout<K, V>,
+    layout: TableLayout<'t, K, V>,
 }
 
 impl<K: PersistedKey, V: AggregationValue + ?Sized> Prober<'_, K, V> {
@@ -600,7 +541,10 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> Prober<'_, K, V> {
             *capacity *= 4;
             self.table.resize(allocator, *capacity);
             // Preserve constant metadata across the uncommon resize branch.
-            self.layout = self.table.probe_layout_with_metadata(self.layout.metadata);
+            self.layout = unsafe {
+                self.table
+                    .layout_with_unchecked_lifetime(self.layout.storage_metadata)
+            };
         }
     }
 
@@ -611,7 +555,10 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> Prober<'_, K, V> {
             let new_size = self.table.capacity() << 1;
             self.table.resize(allocator, new_size);
             // See `grow_if_full` for why this uses the prober's metadata.
-            self.layout = self.table.probe_layout_with_metadata(self.layout.metadata);
+            self.layout = unsafe {
+                self.table
+                    .layout_with_unchecked_lifetime(self.layout.storage_metadata)
+            };
         }
     }
 
@@ -653,7 +600,7 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> Prober<'_, K, V> {
                     self.table.length += 1;
                     seed(
                         context,
-                        V::from_entry_mut(entry.add(layout.value_offset), layout.metadata),
+                        V::from_entry_mut(entry.add(layout.value_offset), layout.storage_metadata),
                     );
                     return;
                 }
@@ -662,7 +609,7 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> Prober<'_, K, V> {
                 {
                     update(
                         context,
-                        V::from_entry_mut(entry.add(layout.value_offset), layout.metadata),
+                        V::from_entry_mut(entry.add(layout.value_offset), layout.storage_metadata),
                     );
                     return;
                 }
@@ -670,31 +617,7 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> Prober<'_, K, V> {
             if COUNT_COLLISIONS {
                 self.table.collisions += 1;
             }
-            idx = (idx + 1) & layout.mask;
-        }
-    }
-}
-
-/// Read-only table handle with a local probe-layout snapshot.
-pub struct TableReader<'a, K: PersistedKey, V: AggregationValue + ?Sized> {
-    layout: ProbeLayout<K, V>,
-    _table: PhantomData<&'a BaseHashTable<K, V>>,
-}
-
-impl<'a, K: PersistedKey, V: AggregationValue + ?Sized> TableReader<'a, K, V> {
-    /// See [`BaseHashTable::hash_at`].
-    #[inline(always)]
-    pub fn hash_at(&self, index: usize) -> u64 {
-        unsafe { *(self.layout.entry_ptr(index).add(self.layout.hash_offset) as *const u64) }
-    }
-
-    /// See [`BaseHashTable::view_at`].
-    #[inline(always)]
-    pub fn view_at(&self, index: usize) -> EntryView<'a, K, V> {
-        let entry = self.layout.entry_ptr(index);
-        unsafe {
-            let hash = *(entry.add(self.layout.hash_offset) as *const u64);
-            self.layout.view(entry, hash)
+            idx = (idx + 1) & layout.slot_mask;
         }
     }
 }
@@ -704,9 +627,8 @@ impl<'a, K: PersistedKey, V: AggregationValue + ?Sized> TableReader<'a, K, V> {
 /// Created by [`BaseHashTable::iter`]. Yields [`EntryView`]s of entries where
 /// `hash != 0` in arbitrary order (based on slot positions, not insertion order).
 pub struct HashTableIterator<'a, K: PersistedKey, V: AggregationValue + ?Sized> {
-    layout: ProbeLayout<K, V>,
+    layout: TableLayout<'a, K, V>,
     idx: usize,
-    _table: PhantomData<&'a BaseHashTable<K, V>>,
 }
 
 impl<'a, K: PersistedKey, V: AggregationValue + ?Sized> Iterator for HashTableIterator<'a, K, V> {
@@ -714,7 +636,7 @@ impl<'a, K: PersistedKey, V: AggregationValue + ?Sized> Iterator for HashTableIt
 
     fn next(&mut self) -> Option<Self::Item> {
         let layout = self.layout;
-        while self.idx < layout.mask + 1 {
+        while self.idx < layout.slot_mask + 1 {
             // One address computation per slot: the hash check and the yielded
             // view read the same entry pointer.
             let entry = layout.entry_ptr(self.idx);
@@ -1080,12 +1002,13 @@ mod tests {
             .prober()
             .merge_from::<false, _>(42, 100u64, &Count(1), &());
 
+        let layout = table.layout();
         let occupied: Vec<usize> = (0..table.capacity())
-            .filter(|&i| table.reader().hash_at(i) != 0)
+            .filter(|&i| layout.hash_at(i) != 0)
             .collect();
 
         assert_eq!(occupied.len(), 1);
-        assert_eq!(*table.reader().view_at(occupied[0]).key, 100);
+        assert_eq!(*layout.view_at(occupied[0]).key, 100);
     }
 
     #[test]

@@ -11,6 +11,9 @@ pub use crate::operations::unary::group::values::AggregationValue;
 mod hash_table;
 pub use hash_table::{LiveKey, MAX_LOAD_FACTOR, PersistedKey, Prober, entry_stride};
 
+mod table_layout;
+pub(crate) use table_layout::TableLayout;
+
 mod scatter;
 pub use scatter::{ScatterRows, SizedScatterRows, StridedScatterRows};
 

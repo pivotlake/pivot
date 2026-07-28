@@ -68,18 +68,18 @@ fn merge_within_partition_bounds<const N: usize, K: KeyExtractor, V: Aggregation
         let range = std::cmp::min(SCAN_BATCH_SIZE, end - i);
 
         for table in tables {
-            // Reuse one source probe layout for this range.
-            let source = if N == 0 {
-                table.reader()
+            // Reuse one source table layout for this range.
+            let source_layout = if N == 0 {
+                table.layout()
             } else {
-                table.reader_with_metadata(V::metadata_for_arity::<N>())
+                table.layout_with_metadata(V::metadata_for_arity::<N>())
             };
             for j in i..i + range {
                 if j + PREFETCH_DISTANCE < slot_count {
                     // Prefetching hash zero is harmless and avoids a branch.
-                    target.prefetch(source.hash_at(j + PREFETCH_DISTANCE));
+                    target.prefetch(source_layout.hash_at(j + PREFETCH_DISTANCE));
                 }
-                let entry = source.view_at(j);
+                let entry = source_layout.view_at(j);
                 let hash = entry.hash;
                 // A non-short-circuiting AND combines both data-dependent tests.
                 let take = (hash != 0) & ((hash >> partition_shift) as usize == partition);
@@ -116,14 +116,14 @@ fn merge_past_partition_bounds<const N: usize, K: KeyExtractor, V: AggregationVa
     let mask = slot_count - 1;
 
     for table in tables {
-        let source = if N == 0 {
-            table.reader()
+        let source_layout = if N == 0 {
+            table.layout()
         } else {
-            table.reader_with_metadata(V::metadata_for_arity::<N>())
+            table.layout_with_metadata(V::metadata_for_arity::<N>())
         };
         let mut i = end & mask;
         loop {
-            let entry = source.view_at(i);
+            let entry = source_layout.view_at(i);
             let hash = entry.hash;
             if hash == 0 {
                 break;
