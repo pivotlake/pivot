@@ -196,6 +196,8 @@ impl Planner {
         root.annotate_group_topn();
         // Push a plain LIMIT (no ORDER BY) into a grouped aggregate beneath it.
         root.annotate_group_limit();
+        // Let filters under a LIMIT or Top-N deliver rows as they are selected.
+        root.annotate_filter_delivery();
         Ok(Plan {
             catalog: self.catalog.clone(),
             root,

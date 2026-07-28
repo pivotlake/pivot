@@ -465,8 +465,29 @@ impl RecordBatchOperatorSpec {
             + 'static,
         FB: Fn() -> F,
     {
+        self.filter_with_delivery(builder, crate::RowDelivery::Coalesced)
+    }
+
+    /// [`filter`](Self::filter), choosing when survivors reach the operator
+    /// below. Use [`RowDelivery::Immediate`](crate::RowDelivery::Immediate)
+    /// when that operator acts on early rows, such as a LIMIT that cancels its
+    /// input or a Top-N whose boundary prunes the scan; holding rows back to
+    /// fill a batch defers the decision until the filter has selected a whole
+    /// batch's worth, which under a selective filter reads far more of the
+    /// table than the query needs.
+    pub fn filter_with_delivery<F, FB>(self, builder: FB, delivery: crate::RowDelivery) -> Self
+    where
+        F: FnMut(
+                &RecordBatch,
+                &mut crate::memory::SlabAllocator,
+                &mut Vec<u32>,
+            ) -> crate::RowSelection
+            + Send
+            + 'static,
+        FB: Fn() -> F,
+    {
         let worker_count = self.worker_count();
-        self.unary((0..worker_count).map(|_| FilterFactory(builder())))
+        self.unary((0..worker_count).map(|_| FilterFactory(builder(), delivery)))
     }
 
     /// Apply a per-batch 1→1 transform that can change the output type.

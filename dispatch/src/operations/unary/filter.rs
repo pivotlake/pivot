@@ -4,12 +4,14 @@
 //! together with an optional mask of surviving rows. Owning the batch lets
 //! the closure evaluate multiple conditions progressively - shrink the batch
 //! after each condition, so later (often costlier) conditions only see rows
-//! the earlier ones kept (the operator'"'"'s [`SlabAllocator`] is passed in for
+//! the earlier ones kept (the operator's [`SlabAllocator`] is passed in for
 //! that, see [`take`](crate::arrays::take::take)).
 //! A returned mask is applied by appending the surviving rows to a
 //! [`BatchAccumulator`], which coalesces survivors across input batches and
-//! emits full-size batches, so a selective filter'"'"'s downstream sees a few
-//! large batches instead of a runt batch per input.
+//! emits full-size batches, so a selective filter's downstream sees a few
+//! large batches instead of a runt batch per input. Whether to coalesce at all
+//! is the consumer's call, carried as a [`RowDelivery`]: an operator that acts
+//! on early rows needs them as soon as they are selected.
 
 use crate::RECORD_BATCH_SIZE;
 use crate::arrays::accumulator::BatchAccumulator;
@@ -63,9 +65,29 @@ pub enum RowSelection {
     Indices,
 }
 
+/// When a filter hands its surviving rows to the operator below it.
+///
+/// The choice belongs to that operator, not to the filter: it is about
+/// whether anything downstream can act on rows before the input ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowDelivery {
+    /// Coalesce survivors across input batches and emit full-size batches, so
+    /// the consumer pays its per-batch costs once per full batch rather than
+    /// once per runt. For an operator that must see the whole input anyway (a
+    /// group-by, a join, a sort), holding rows back costs nothing.
+    Coalesced,
+    /// Emit each input batch's survivors as soon as they are selected. An
+    /// operator that acts on early rows needs them early: a LIMIT cancels its
+    /// input once it has enough, and a Top-N publishes the boundary that
+    /// prunes row groups from the scan. Rows held back to fill a batch delay
+    /// that decision, and under a selective filter the delay is long enough to
+    /// read far more of the table than the query needs.
+    Immediate,
+}
+
 /// Factory that wraps a filter closure. `F` is the per-worker closure created by the
 /// builder passed to [`RecordBatchOperatorSpec::filter`](crate::api::RecordBatchOperatorSpec::filter).
-pub struct FilterFactory<F>(pub F);
+pub struct FilterFactory<F>(pub F, pub RowDelivery);
 
 impl<F> UnaryFactory<RecordBatch, RecordBatch> for FilterFactory<F>
 where
@@ -76,6 +98,7 @@ where
     fn build_unary(self) -> Self::Unary {
         Filter {
             func: self.0,
+            delivery: self.1,
             allocator: SlabAllocator::new(false),
             accumulator: None,
             selection: Vec::new(),
@@ -88,6 +111,8 @@ where
     F: FnMut(&RecordBatch, &mut SlabAllocator, &mut Vec<u32>) -> RowSelection + Send,
 {
     func: F,
+    /// Whether surviving rows wait for a full batch or go downstream at once.
+    delivery: RowDelivery,
     allocator: SlabAllocator,
     /// Coalesces surviving rows across batches. Created on the first batch
     /// because that is when a schema first exists: dispatch pipelines are
@@ -129,7 +154,7 @@ where
             .accumulator
             .get_or_insert_with(|| BatchAccumulator::new(batch.schema(), &mut self.allocator));
         accumulator.append(&batch, &self.selection);
-        if accumulator.should_emit() {
+        if accumulator.should_emit() || self.delivery == RowDelivery::Immediate {
             output.send(accumulator.take_batch(&mut self.allocator)?)?;
         }
         Ok(())
@@ -183,7 +208,17 @@ mod tests {
     where
         F: FnMut(&RecordBatch, &mut SlabAllocator, &mut Vec<u32>) -> RowSelection + Send + 'static,
     {
-        FilterFactory(func).build_unary()
+        FilterFactory(func, RowDelivery::Coalesced).build_unary()
+    }
+
+    fn keep_first_row(
+        _: &RecordBatch,
+        _: &mut SlabAllocator,
+        indices: &mut Vec<u32>,
+    ) -> RowSelection {
+        indices.clear();
+        indices.push(0);
+        RowSelection::Indices
     }
 
     fn batch(values: &[i32]) -> RecordBatch {
@@ -264,6 +299,34 @@ mod tests {
 
         assert_eq!(out.len(), 1);
         assert_eq!(i32_col(&out[0]), vec![2, 4, 6]);
+    }
+
+    /// A downstream LIMIT or Top-N acts on the rows it has been handed, so a
+    /// selective filter under one must not sit on them waiting for a full
+    /// batch: it emits per input batch.
+    #[test]
+    fn immediate_delivery_emits_per_input_batch() {
+        init_test_free_pool(4);
+        let filter = FilterFactory(keep_first_row, RowDelivery::Immediate).build_unary();
+
+        let out = run_unary_to_completion(filter, vec![batch(&[1, 2, 3]), batch(&[4, 5, 6])]);
+
+        assert_eq!(out.len(), 2);
+        assert_eq!(i32_col(&out[0]), vec![1]);
+        assert_eq!(i32_col(&out[1]), vec![4]);
+    }
+
+    /// The same filter under a group-by or a join hands over one coalesced
+    /// batch instead, since nothing downstream can act before the input ends.
+    #[test]
+    fn coalesced_delivery_emits_one_batch() {
+        init_test_free_pool(4);
+        let filter = FilterFactory(keep_first_row, RowDelivery::Coalesced).build_unary();
+
+        let out = run_unary_to_completion(filter, vec![batch(&[1, 2, 3]), batch(&[4, 5, 6])]);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(i32_col(&out[0]), vec![1, 4]);
     }
 
     #[test]

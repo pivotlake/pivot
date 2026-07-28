@@ -1,4 +1,5 @@
 use crate::common::*;
+use dispatch::RowDelivery;
 use insta::assert_snapshot;
 use rstest::rstest;
 
@@ -313,4 +314,62 @@ fn join_with_unread_build_side_keeps_it_anyway(mut testing_planner: TestingPlann
           Input([i_order:Int64])
           Input([o_key:Int64])
     ");
+}
+
+/// The delivery of every filter in `plan`, in tree order.
+fn filter_deliveries(node: &planner::plan::PlanNode) -> Vec<RowDelivery> {
+    let mut found = match &node.operator {
+        planner::operator::Operator::Filter(f) => vec![f.delivery],
+        _ => vec![],
+    };
+    for child in &node.inputs {
+        found.extend(filter_deliveries(child));
+    }
+    found
+}
+
+// A filter feeding a LIMIT must hand rows over as it selects them: the LIMIT
+// cancels its input once it has enough, and rows held back to fill a batch
+// keep the scan reading. The projections in between are transparent, so the
+// choice reaches the filter through them.
+#[rstest]
+fn filter_under_a_limit_delivers_immediately(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .plan("SELECT a FROM example_table WHERE a <> b LIMIT 10")
+        .unwrap();
+
+    assert_eq!(filter_deliveries(&plan.root), vec![RowDelivery::Immediate]);
+}
+
+// An ORDER BY with a LIMIT is a Top-N, which publishes the boundary that
+// prunes row groups from the scan, so it wants rows just as early.
+#[rstest]
+fn filter_under_a_top_n_delivers_immediately(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .plan("SELECT a FROM example_table WHERE a <> b ORDER BY a LIMIT 10")
+        .unwrap();
+
+    assert_eq!(filter_deliveries(&plan.root), vec![RowDelivery::Immediate]);
+}
+
+// A group-by reads its whole input before emitting anything, so its filter
+// coalesces into full batches instead.
+#[rstest]
+fn filter_under_a_group_by_coalesces(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .plan("SELECT a, count(*) FROM example_table WHERE a <> b GROUP BY a")
+        .unwrap();
+
+    assert_eq!(filter_deliveries(&plan.root), vec![RowDelivery::Coalesced]);
+}
+
+// The nearest consumer decides: a LIMIT above a group-by changes nothing for
+// the filter, which still feeds the group-by.
+#[rstest]
+fn group_by_under_a_limit_still_coalesces_its_filter(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .plan("SELECT a, count(*) FROM example_table WHERE a <> b GROUP BY a LIMIT 10")
+        .unwrap();
+
+    assert_eq!(filter_deliveries(&plan.root), vec![RowDelivery::Coalesced]);
 }
