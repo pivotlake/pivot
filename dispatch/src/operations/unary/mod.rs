@@ -42,11 +42,14 @@
 
 mod group;
 pub use group::{
-    AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot, Distinct,
-    F64Cell, Fold, GroupFactory, GroupLimit, HashOnlyIntKeyExtractor, IntCell, IntKeyExtractor,
-    IntPairKeyExtractor, IntRead, IntStrKeyExtractor, KeyExtractor, Max, MaxSlot, Min, MinSlot,
-    NoRead, OpTuple, Read, RowKeyExtractor, RowKeySchema, StrMax, StrMin, StrRead,
-    StringKeyExtractor, Sum, SumSlot, Variable, WideSum,
+    AggregationColumnBuilders, AggregationContext, AggregationKind, AggregationSlot,
+    AggregationValue, AggregationWorkerState, ByValueAggregation, Cell, Compiled, Count, CountSlot,
+    Distinct, F64Cell, Fold, GroupFactory, GroupLimit, HashOnlyIntKeyExtractor, IntCell,
+    IntKeyExtractor, IntPairKeyExtractor, IntRead, IntStrKeyExtractor, KeyExtractor, LiveKey, Max,
+    MaxSlot, Min, MinSlot, NoRead, OpTuple, PersistedKey, Read, RowKeyExtractor, RowKeySchema,
+    RuntimeAggregation, RuntimeAggregationContext, ScatterRows, SharedArena, SizedScatterRows,
+    StrMax, StrMin, StrRead, StridedScatterRows, StringKeyExtractor, Sum, SumSlot, WideSum,
+    WorkerArena,
 };
 
 #[cfg(any(test, feature = "test-util"))]

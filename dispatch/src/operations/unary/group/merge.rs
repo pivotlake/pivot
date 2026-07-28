@@ -86,7 +86,7 @@ fn merge_within_partition_bounds<K: KeyExtractor, V: AggregationValue>(
     tables: &[&MultiSlabTable<K, V>],
     target: &mut Prober<'_, <K as KeyExtractor>::Persisted, V>,
     partition_bits: u32,
-    cfg: &V::SharedContext,
+    value_context: &V::Context,
 ) {
     let partition_shift = u64::BITS - partition_bits;
     let start = (partition * slot_count) >> partition_bits;
@@ -97,8 +97,7 @@ fn merge_within_partition_bounds<K: KeyExtractor, V: AggregationValue>(
         let range = std::cmp::min(SCAN_BATCH_SIZE, end - i);
 
         for table in tables {
-            // The scan touches `range` consecutive slots; read them through
-            // one geometry snapshot so the source layout stays in registers.
+            // Reuse one layout snapshot while scanning this consecutive range.
             let source = table.reader();
             for j in i..i + range {
                 if j + PREFETCH_DISTANCE < slot_count {
@@ -118,8 +117,8 @@ fn merge_within_partition_bounds<K: KeyExtractor, V: AggregationValue>(
                     target.merge_from::<true, _>(
                         h,
                         K::resolve_persisted(arena, *entry.key),
-                        entry.stored,
-                        cfg,
+                        entry.state,
+                        value_context,
                     );
                     resize_if_needed::<K, V>(allocator, target);
                 }
@@ -144,7 +143,7 @@ fn merge_past_partition_bounds<K: KeyExtractor, V: AggregationValue>(
     tables: &[&MultiSlabTable<K, V>],
     target: &mut Prober<'_, <K as KeyExtractor>::Persisted, V>,
     partition_bits: u32,
-    cfg: &V::SharedContext,
+    value_context: &V::Context,
 ) {
     let partition_shift = u64::BITS - partition_bits;
     let end = ((partition + 1) * slot_count) >> partition_bits;
@@ -163,8 +162,8 @@ fn merge_past_partition_bounds<K: KeyExtractor, V: AggregationValue>(
                 target.merge_from::<true, _>(
                     h,
                     K::resolve_persisted(arena, *entry.key),
-                    entry.stored,
-                    cfg,
+                    entry.state,
+                    value_context,
                 );
                 resize_if_needed::<K, V>(allocator, target);
             }
@@ -183,7 +182,7 @@ fn merge_into_partition<K: KeyExtractor, V: AggregationValue>(
     tables: Vec<&MultiSlabTable<K, V>>,
     target: &mut Prober<'_, <K as KeyExtractor>::Persisted, V>,
     partition_bits: u32,
-    cfg: &V::SharedContext,
+    value_context: &V::Context,
 ) {
     merge_within_partition_bounds::<K, V>(
         allocator,
@@ -193,7 +192,7 @@ fn merge_into_partition<K: KeyExtractor, V: AggregationValue>(
         &tables,
         target,
         partition_bits,
-        cfg,
+        value_context,
     );
     merge_past_partition_bounds::<K, V>(
         allocator,
@@ -203,7 +202,7 @@ fn merge_into_partition<K: KeyExtractor, V: AggregationValue>(
         &tables,
         target,
         partition_bits,
-        cfg,
+        value_context,
     );
 }
 
@@ -216,7 +215,8 @@ fn merge_into_partition<K: KeyExtractor, V: AggregationValue>(
 /// `buffers` is empty in the all-in-place case (`num_partitions == PARTITIONS`);
 /// `tables` holds switched workers' pre-switch stacks and non-switched workers'
 /// full stacks. `partition_bits` = log2(num_partitions) sets the target's
-/// pre_shift, skipping the partition's top bits so it slots on the bits below.
+/// `hash_left_shift` removes the radix prefix before the remaining high bits
+/// choose a slot in the partition-local target.
 pub(super) fn merge_combined<K: KeyExtractor, V: AggregationValue>(
     partition: usize,
     buffers: &[PartitionBuffers<K, V>],
@@ -224,17 +224,15 @@ pub(super) fn merge_combined<K: KeyExtractor, V: AggregationValue>(
     partition_capacity: usize,
     num_partitions: usize,
     key_arena: &SharedArena,
-    cfg: &V::SharedContext,
+    value_context: &V::Context,
 ) -> MultiSlabTable<K, V> {
     let partition_bits = num_partitions.trailing_zeros();
     let mut allocator = SlabAllocator::new(true);
     let mut cap = partition_capacity.max(DEFAULT_CAPACITY);
     let mut result: MultiSlabTable<K, V> =
-        <MultiSlabTable<K, V>>::new(&mut allocator, cap, partition_bits, cfg);
-    // One geometry snapshot for the whole partition job: the scatter fold and
-    // the slot-range merges below probe the target once per row/entry, and a
-    // per-call snapshot would be paid on each. Resizes go through the prober,
-    // which re-snapshots.
+        <MultiSlabTable<K, V>>::new(&mut allocator, cap, partition_bits, value_context);
+    // Keep one target layout snapshot for the whole partition job. The prober
+    // refreshes it if a resize occurs.
     let mut target = result.prober();
 
     // 1. Scatter buffers (present only when some worker switched). Each row is
@@ -276,21 +274,21 @@ pub(super) fn merge_combined<K: KeyExtractor, V: AggregationValue>(
         for bucket in bucket_lo..bucket_hi {
             if merge_prefetch {
                 wb.0[bucket].for_each_prefetched::<SCATTER_PREFETCH_AHEAD>(
-                    |hash, key, stored, ahead| {
+                    |hash, key, state, ahead| {
                         if let Some((ahead_hash, ahead_key)) = ahead {
                             ahead_key.prefetch_blob(key_arena);
                             target.prefetch(ahead_hash);
                         }
-                        target.grow_if_full(&mut allocator, &mut cap);
+                        target.grow_if_needed(&mut allocator, &mut cap);
                         let live = K::resolve_persisted(key_arena, *key);
-                        target.merge_from::<false, _>(hash, live, stored, cfg);
+                        target.merge_from::<false, _>(hash, live, state, value_context);
                     },
                 );
             } else {
-                wb.0[bucket].for_each(|hash, key, stored| {
-                    target.grow_if_full(&mut allocator, &mut cap);
+                wb.0[bucket].for_each(|hash, key, state| {
+                    target.grow_if_needed(&mut allocator, &mut cap);
                     let live = K::resolve_persisted(key_arena, *key);
-                    target.merge_from::<false, _>(hash, live, stored, cfg);
+                    target.merge_from::<false, _>(hash, live, state, value_context);
                 });
             }
         }
@@ -318,7 +316,7 @@ pub(super) fn merge_combined<K: KeyExtractor, V: AggregationValue>(
             group,
             &mut target,
             partition_bits,
-            cfg,
+            value_context,
         );
     }
     // The prober's borrow of `result` ends at its last use above.
@@ -343,7 +341,7 @@ pub(super) fn merge_node_aggregated_tables<K: KeyExtractor, V: AggregationValue>
     partition_capacity: usize,
     partition_bits: u32,
     key_arena: &SharedArena,
-    cfg: &V::SharedContext,
+    value_context: &V::Context,
 ) -> MultiSlabTable<K, V> {
     let mut allocator = SlabAllocator::new(true);
     let total: usize = node_tables.iter().map(|f| f.len()).sum();
@@ -357,7 +355,7 @@ pub(super) fn merge_node_aggregated_tables<K: KeyExtractor, V: AggregationValue>
         node_tables.swap_remove(largest)
     } else {
         let cap = partition_capacity.max(DEFAULT_CAPACITY);
-        <MultiSlabTable<K, V>>::new(&mut allocator, cap, partition_bits, cfg)
+        <MultiSlabTable<K, V>>::new(&mut allocator, cap, partition_bits, value_context)
     };
     let mut prober = target.prober();
     for node_table in &node_tables {
@@ -365,8 +363,8 @@ pub(super) fn merge_node_aggregated_tables<K: KeyExtractor, V: AggregationValue>
             prober.merge_from::<true, _>(
                 entry.hash,
                 K::resolve_persisted(key_arena, *entry.key),
-                entry.stored,
-                cfg,
+                entry.state,
+                value_context,
             );
             resize_if_needed::<K, V>(&mut allocator, &mut prober);
         }
@@ -387,7 +385,7 @@ mod tests {
     };
     use crate::operations::unary::group::keys::IntKeyExtractor;
     use crate::operations::unary::group::values::{
-        AggregationKind, AggregationSlot, AggregationValue, Compiled, CountSlot, OwnedValue,
+        AggregationKind, AggregationSlot, AggregationValue, ByValueAggregation, Compiled, CountSlot,
     };
     use ahash::RandomState;
     use arrow_array::types::Int32Type;
@@ -396,10 +394,10 @@ mod tests {
     use std::sync::Arc;
 
     type IntExtractor = IntKeyExtractor<Int32Type>;
-    // A single `COUNT` slot. `Compiled` is numeric-only, so its `SharedContext`
+    // A single `COUNT` slot. `Compiled` is numeric-only, so its `AggregationContext`
     // is concretely `()`.
     type CountValue = Compiled<(CountSlot,)>;
-    const COUNT_CFG: <CountValue as AggregationValue>::SharedContext = ();
+    const COUNT_CFG: <CountValue as AggregationValue>::Context = ();
 
     fn make_worker_tables(
         state: &RandomState,
@@ -453,7 +451,7 @@ mod tests {
                 &COUNT_CFG,
             );
             for entry in result.iter(0) {
-                all_entries.push((*entry.key, entry.stored.sort_key(0) as usize));
+                all_entries.push((*entry.key, entry.state.sort_key(0) as usize));
             }
         }
         all_entries.sort_by_key(|(k, _)| *k);
@@ -638,7 +636,7 @@ mod tests {
                 &COUNT_CFG,
             );
             for entry in folded.iter(0) {
-                entries.push((*entry.key, entry.stored.sort_key(0) as usize));
+                entries.push((*entry.key, entry.state.sort_key(0) as usize));
             }
         }
 
@@ -716,7 +714,7 @@ mod tests {
             );
             for entry in result.iter(0) {
                 occurrences[*entry.key as usize] += 1;
-                counts[*entry.key as usize] += entry.stored.sort_key(0) as usize;
+                counts[*entry.key as usize] += entry.state.sort_key(0) as usize;
             }
         }
 

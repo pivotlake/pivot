@@ -1,24 +1,13 @@
-//! The **[`Fold`]** trait — one per *numeric* aggregate op, over the value a
-//! [`Read`](super::read::Read) already produced. A fold knows nothing about the
-//! column it came from: an integer `Sum` folds an `i64` whatever width it was
-//! read at, so there is one `Sum`, not one per width. The read/fold split is what
-//! collapses the `ops × widths` signature space to `ops + widths`.
+//! Numeric aggregate operations.
 //!
-//! The ops:
-//! - [`Count`] — folds `()` (reads no column).
-//! - [`Sum<A>`](Sum) / [`WideSum`] — folds `i64`, accumulating in `A` (`i64` /
-//!   `i128`).
-//! - [`Min<A>`](Min) / [`Max<A>`](Max) — fold `i64`.
+//! [`Read`](super::read::Read) handles Arrow's physical column width, while
+//! [`Fold`] handles the aggregate operation. A fold therefore sees a normalized
+//! value such as `i64`, independent of whether the source was `Int16`, `Int32`,
+//! or `Int64`.
 //!
-//! `Fold` is numeric-only: every op folds an owned, `'static` value (`()` / `i64`)
-//! with no per-worker or shared state, so it carries no context. String extremes
-//! ([`StrMin`]/[`StrMax`]) need a value arena and a borrowed `&str`, so they are
-//! *not* folds — they expose inherent methods used only by the runtime
-//! [`Variable`](super::container::Variable) container's string arms.
-//!
-//! A fixed numeric signature is a tuple of (read, fold) pairs
-//! ([`Compiled`](super::container::Compiled)); a runtime signature folds each slot
-//! by its kind ([`Variable`](super::container::Variable)).
+//! `Fold` itself is context-free and numeric. Float, wide-input, and string
+//! helpers live beside it but use inherent methods because their cells require
+//! representation-specific conversion or arena access.
 
 mod count;
 mod extreme;

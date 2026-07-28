@@ -60,7 +60,10 @@ impl<N: Default> Default for IntStrKey<N> {
         Self::from_parts(N::default(), ArenaKey::default())
     }
 }
-impl<N: Copy + Default + Send + Sync + 'static> PersistedKey for IntStrKey<N> {
+// SAFETY: `N` satisfies the persisted-key contract. A zeroed `[u64; 2]`
+// reconstructs the valid default ArenaKey, and the handle points only into the
+// shared arena that outlives the table.
+unsafe impl<N: PersistedKey> PersistedKey for IntStrKey<N> {
     const HAS_BLOB: bool = true;
 
     #[inline(always)]
@@ -98,7 +101,7 @@ pub struct IntStrLiveKey<'a, 'b, N> {
     string: &'b str,
 }
 
-impl<N: Copy + Default + PartialEq + Send + Sync + 'static> LiveKey for IntStrLiveKey<'_, '_, N> {
+impl<N: PersistedKey + PartialEq> LiveKey for IntStrLiveKey<'_, '_, N> {
     type Persisted = IntStrKey<N>;
 
     #[inline(always)]
@@ -122,7 +125,7 @@ pub struct IntStrResolvedKey<'a, N> {
     arena: &'a SharedArena,
 }
 
-impl<N: Copy + Default + PartialEq + Send + Sync + 'static> LiveKey for IntStrResolvedKey<'_, N> {
+impl<N: PersistedKey + PartialEq> LiveKey for IntStrResolvedKey<'_, N> {
     type Persisted = IntStrKey<N>;
 
     #[inline(always)]
@@ -160,7 +163,7 @@ unsafe impl<T: ArrowPrimitiveType, const STR_FIRST: bool> Send
 impl<T: ArrowPrimitiveType + Send + 'static, const STR_FIRST: bool> KeyExtractor
     for IntStrKeyExtractor<T, STR_FIRST>
 where
-    T::Native: Copy + Default + Hash + Eq + Send + Sync,
+    T::Native: PersistedKey + Hash + Eq,
 {
     // Equivalent to `StringKeyExtractor`: the key owns an out-of-line string, so
     // abandon (dedup during the scan) persists each string once rather than

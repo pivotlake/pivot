@@ -6,7 +6,7 @@
 //! Used for the dedup stage of `COUNT(DISTINCT x)` (and, later, `SELECT DISTINCT`):
 //! only the *set* of distinct keys matters, so it emits no value columns.
 
-use super::{AggregationSlot, OwnedValue, ValueColumns};
+use super::{AggregationColumnBuilders, AggregationSlot, ByValueAggregation};
 use crate::memory::SlabAllocator;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
@@ -20,12 +20,13 @@ pub struct Distinct;
 /// value columns, so this builds nothing.
 pub struct DistinctColumns;
 
-impl OwnedValue for Distinct {
+// SAFETY: Distinct is zero-sized, Copy, and has no invalid bit patterns.
+unsafe impl ByValueAggregation for Distinct {
     type Reader<'b> = ();
-    type SharedContext = ();
+    type Context = ();
     type Columns = DistinctColumns;
     type SortKey = i64;
-    type WorkerContext = ();
+    type WorkerState = ();
 
     #[inline(always)]
     fn make_reader(_batch: &RecordBatch, _slots: &[AggregationSlot]) {}
@@ -48,7 +49,7 @@ impl OwnedValue for Distinct {
     }
 }
 
-impl ValueColumns for DistinctColumns {
+impl AggregationColumnBuilders for DistinctColumns {
     type Value = Distinct;
     type Context = ();
 
@@ -57,10 +58,10 @@ impl ValueColumns for DistinctColumns {
     }
 
     #[inline(always)]
-    fn push(&mut self, _value: &Distinct) {}
+    fn push_owned(&mut self, _value: &Distinct) {}
 
     #[inline(always)]
-    fn push_stored(&mut self, _stored: &Distinct) {}
+    fn push_entry(&mut self, _state: &Distinct) {}
 
     fn finish(self, _context: &()) -> (Vec<Field>, Vec<ArrayRef>) {
         (Vec::new(), Vec::new())

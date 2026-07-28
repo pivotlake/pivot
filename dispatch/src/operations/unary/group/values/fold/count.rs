@@ -8,11 +8,10 @@ use arrow_array::ArrayRef;
 use arrow_schema::Field;
 use std::marker::PhantomData;
 
-/// Counts rows, in accumulator width `A` (`i64` by default — a count never
-/// exceeds the row count). The width is generic so the runtime
-/// [`Variable`](crate::operations::unary::group::values::container::Variable) value,
-/// whose cells are a uniform width, can hold a `Count` slot in the same cell its
-/// numeric extremes use; `Compiled` instantiates the default `Count<i64>`.
+/// Counts rows in accumulator width `A`.
+///
+/// Runtime aggregation uses one width for all slots, so `A` may be `i128` even
+/// though a compiled count normally uses `i64`.
 pub struct Count<A = i64>(PhantomData<A>);
 
 impl<A: IntCell> Fold for Count<A> {

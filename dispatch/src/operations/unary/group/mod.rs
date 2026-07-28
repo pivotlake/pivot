@@ -77,7 +77,7 @@
 //!   ([`IntKeyExtractor`], [`StringKeyExtractor`]), each co-located with its key
 //!   type (e.g. `keys::string` owns [`ArenaKey`])
 //! - [`values`] — the [`AggregationValue`] trait and its container
-//!   implementations (`Compiled`, `Variable`), the per-op folds (`Count`, `Sum`,
+//!   implementations (`Compiled`, `RuntimeAggregation`), the per-op folds (`Count`, `Sum`,
 //!   …), plus [`AggregationKind`]/[`AggregationSlot`]
 //! - [`hashtables`] — `BaseHashTable`, [`AggregatedTable`], [`MultiSlabTable`],
 //!   and associated type machinery
@@ -97,16 +97,19 @@ mod values;
 pub use factory::GroupFactory;
 mod hashtables;
 
+pub use arena::{SharedArena, WorkerArena};
+pub use hashtables::{LiveKey, PersistedKey, ScatterRows, SizedScatterRows, StridedScatterRows};
 pub use keys::{
     ArenaKey, HashOnlyIntKeyExtractor, IntKeyExtractor, IntPairKeyExtractor, IntStrKeyExtractor,
     KeyExtractor, RowKeyExtractor, RowKeySchema, StringKeyExtractor,
 };
 pub(crate) use values::cast_value_column;
 pub use values::{
-    AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot, Distinct,
-    F64Cell, F64Max, F64Min, F64Sum, Fold, IntCell, IntRead, Max, MaxSlot, Min, MinSlot, NoRead,
-    OpTuple, Read, SharedContext, StrMax, StrMin, StrRead, Sum, SumSlot, Variable, WideSum,
-    WorkerContext,
+    AggregationColumnBuilders, AggregationContext, AggregationKind, AggregationSlot,
+    AggregationValue, AggregationWorkerState, ByValueAggregation, Cell, Compiled, Count, CountSlot,
+    Distinct, F64Cell, F64Max, F64Min, F64Sum, Fold, IntCell, IntRead, Max, MaxSlot, Min, MinSlot,
+    NoRead, OpTuple, Read, RuntimeAggregation, RuntimeAggregationContext, StrMax, StrMin, StrRead,
+    Sum, SumSlot, WideSum,
 };
 
 use crate::memory::SlabAllocator;
@@ -114,12 +117,11 @@ use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::group::hashtables::{
     AggregatedTable, AggregatedTableOutput, DEFAULT_CAPACITY, MAX_LOAD_FACTOR, MultiSlabTable,
-    PartitionBuffers, RadixConfig, ScatterRows, entry_stride,
+    PartitionBuffers, RadixConfig, entry_stride,
 };
 use crate::waker::waker_set;
 use crate::worker::current_node;
 use ahash::RandomState;
-use arena::SharedArena;
 use arrow_array::RecordBatch;
 use arrow_buffer::Buffer;
 use arrow_schema::{ArrowError, DataType};
@@ -236,7 +238,7 @@ pub struct Group<K: KeyExtractor, V: AggregationValue> {
     value_slots: Vec<AggregationSlot>,
     /// The value's shared, read-side context, built once from the slots + value
     /// arena (like `key_config`); resolves string keys during merge/output.
-    shared_context: V::SharedContext,
+    value_context: V::Context,
     key_config: K::Config,
 
     aggregated_table: AggregatedTable<K, V>,
@@ -261,7 +263,7 @@ impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
         partition_jobs_injected: Arc<AtomicBool>,
         radix: RadixConfig,
     ) -> Self {
-        let shared_context = <V::SharedContext as SharedContext>::build(&value_slots, &value_arena);
+        let value_context = <V::Context as AggregationContext>::build(&value_slots, &value_arena);
         let value_output_types: Arc<[DataType]> =
             value_slots.iter().map(|s| s.output_type.clone()).collect();
         // A string extreme persists its winner lazily during the in-place fold, so
@@ -273,19 +275,19 @@ impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
         } else {
             radix
         };
-        // The per-worker write context is spawned from the shared one (a fresh
-        // `WorkerArena` for a string value, `()` for numeric).
+        // Derive this worker's mutable aggregation resources from the immutable
+        // query context.
         let aggregated_table = AggregatedTable::new(
             state,
             key_arena.clone(),
-            shared_context.clone(),
-            shared_context.worker(),
+            value_context.clone(),
+            value_context.worker(),
             radix,
         );
         Self {
             key_cols,
             value_slots,
-            shared_context: shared_context.clone(),
+            value_context: value_context.clone(),
             key_config: key_config.clone(),
             outputter: GroupOutputter {
                 key_arena,
@@ -294,7 +296,7 @@ impl<K: KeyExtractor, V: AggregationValue> Group<K, V> {
                 receiver,
                 partition_jobs_injected,
                 key_config,
-                shared_context,
+                value_context,
                 value_output_types,
                 output_limit,
                 count_only,
@@ -320,7 +322,7 @@ impl<K: KeyExtractor, V: AggregationValue> Consumer<RecordBatch, RecordBatch> fo
             &self.key_cols,
             &self.value_slots,
             &self.key_config,
-            &self.shared_context,
+            &self.value_context,
         );
         Ok(())
     }
@@ -355,7 +357,7 @@ pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue> {
     /// The value's shared context, threaded into each [`PartitionJob`] so the merge
     /// folds existing entries via [`AggregationValue::merge`] and the output
     /// resolves string extremes (it carries the value arena).
-    shared_context: V::SharedContext,
+    value_context: V::Context,
     /// The declared output type of each value column, in slot order. The output
     /// phase renders each accumulator at its storage width then casts it to this
     /// type (a `COUNT` in an `i128` cell down to `Int64`, a narrow `SUM` up to
@@ -415,7 +417,7 @@ pub struct PartitionJob<K: KeyExtractor, V: AggregationValue> {
     num_partitions: usize,
     key_config: K::Config,
     /// The value's shared context, for the partition merge's entry fold + output.
-    shared_context: V::SharedContext,
+    value_context: V::Context,
     /// Declared output type per value column, in slot order; the output phase casts
     /// each finished value column to its type.
     value_output_types: Arc<[DataType]>,
@@ -490,7 +492,7 @@ impl<K: KeyExtractor, V: AggregationValue> PartitionJob<K, V> {
             self.partition_capacity,
             self.num_partitions,
             &self.key_arena,
-            &self.shared_context,
+            &self.value_context,
         );
         let result_map = match &self.cross_node_merge {
             None => result_map,
@@ -503,7 +505,7 @@ impl<K: KeyExtractor, V: AggregationValue> PartitionJob<K, V> {
                     self.partition_capacity,
                     self.num_partitions.trailing_zeros(),
                     &self.key_arena,
-                    &self.shared_context,
+                    &self.value_context,
                 ),
             },
         };
@@ -522,7 +524,7 @@ impl<K: KeyExtractor, V: AggregationValue> PartitionJob<K, V> {
                 self.key_arena.clone(),
                 self.output_buffers.clone(),
                 self.key_config.clone(),
-                self.shared_context.clone(),
+                self.value_context.clone(),
                 self.value_output_types.clone(),
             )
         });
@@ -587,11 +589,9 @@ impl<K: KeyExtractor, V: AggregationValue> GroupOutputter<K, V> {
         // entry width, a wide multi-column key (fat entries) targets fewer groups
         // per job than a bare integer key.
         const TARGET_MERGE_PARTITION_BYTES: usize = 256 * 1024; // ~one core's L2
-        // The exact bytes per table entry (hash + key + stored value with
-        // their padding), as the tables themselves lay it out. Undersizing
-        // this inflates the per-partition group target and produces fewer,
-        // larger merge targets that fall out of cache.
-        let entry_bytes = entry_stride::<K::Persisted, V>(&self.shared_context);
+        // Use the real padded entry stride. An underestimated width would choose
+        // too many groups per target and push those targets out of cache.
+        let entry_bytes = entry_stride::<K::Persisted, V>(&self.value_context);
         let target_groups_per_partition =
             (TARGET_MERGE_PARTITION_BYTES / entry_bytes.max(1)).max(1);
         let (num_partitions, partition_capacity) = if !any_switched {
@@ -687,7 +687,7 @@ impl<K: KeyExtractor, V: AggregationValue> GroupOutputter<K, V> {
                 partition_capacity,
                 num_partitions,
                 key_config: self.key_config.clone(),
-                shared_context: self.shared_context.clone(),
+                value_context: self.value_context.clone(),
                 value_output_types: self.value_output_types.clone(),
                 output_limit: self.output_limit,
                 count_only: self.count_only,
@@ -1549,16 +1549,13 @@ mod tests {
         );
     }
 
-    // ---- Mixed string + integer aggregates via the runtime `Variable` ----
+    // ---- Mixed string and integer runtime aggregation ----
 
-    /// The same `MIN(name)` (string) + `MAX(v)` (int) mix, but folded by the
-    /// runtime [`Variable`] instead of a `Compiled` tuple — the path the planner
-    /// now takes for a heterogeneous string signature. The wide (`i128`) cell
-    /// holds the string slot's `ArenaKey` and the int slot's value; the int
-    /// extreme stores wide but its slot declares `Int64`, so the output phase
-    /// casts it back to `Int64`.
+    /// A runtime signature can mix string `MIN` with integer `MAX`. Both states
+    /// occupy `i128` cells; the integer output is cast back to its declared
+    /// `Int64` type.
     #[test]
-    fn dynamic_string_min_int_max() {
+    fn runtime_aggregation_string_min_int_max() {
         let batch = mixed_key_batch(
             &[1, 2, 1, 2, 1],
             &["cat", "fig", "ant", "bee", "dog"],
@@ -1568,7 +1565,7 @@ mod tests {
             AggregationSlot::new(AggregationKind::Min, 1, DataType::Utf8View), // MIN(name) — string
             AggregationSlot::new(AggregationKind::Max, 2, DataType::Int64),    // MAX(v)    — int
         ];
-        type Mix = Variable<i128>;
+        type Mix = RuntimeAggregation<i128>;
         let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
             vec![vec![batch]],
             vec![0],
@@ -1594,7 +1591,7 @@ mod tests {
     /// of opposite directions (rejected by the old `Compiled`-only routing). Each
     /// slot keeps its own `ArenaKey` cell and folds its own direction.
     #[test]
-    fn dynamic_string_min_and_max() {
+    fn runtime_aggregation_string_min_and_max() {
         let batch = mixed_key_batch(
             &[1, 2, 1, 2, 1],
             &["cat", "fig", "ant", "bee", "dog"],
@@ -1604,7 +1601,7 @@ mod tests {
             AggregationSlot::new(AggregationKind::Min, 1, DataType::Utf8View), // MIN(name)
             AggregationSlot::new(AggregationKind::Max, 1, DataType::Utf8View), // MAX(name)
         ];
-        type Mix = Variable<i128>;
+        type Mix = RuntimeAggregation<i128>;
         let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
             vec![vec![batch]],
             vec![0],
@@ -1636,7 +1633,7 @@ mod tests {
     /// shared value arena) and a long string (> 12 bytes, a non-inline view) must
     /// round-trip through the arena rather than the inline header.
     #[test]
-    fn dynamic_string_extreme_merges_across_workers() {
+    fn runtime_aggregation_string_extreme_merges_across_workers() {
         let long_a = "alpha-aardvark-antelope"; // > 12 bytes, non-inline view
         let long_z = "zeta-zebra-zephyr-zenith";
         let w0 = mixed_key_batch(&[1, 1], &["mango", long_z], &[1, 2]);
@@ -1645,7 +1642,7 @@ mod tests {
             AggregationSlot::new(AggregationKind::Min, 1, DataType::Utf8View),
             AggregationSlot::new(AggregationKind::Max, 1, DataType::Utf8View),
         ];
-        type Mix = Variable<i128>;
+        type Mix = RuntimeAggregation<i128>;
         let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
             vec![vec![w0], vec![w1]],
             vec![0],
@@ -1667,7 +1664,7 @@ mod tests {
     /// string), so this exercises in-place stack growth with string cells and
     /// confirms every group's `MIN`/`MAX(name)` is still correct.
     #[test]
-    fn dynamic_string_high_cardinality_stays_correct() {
+    fn runtime_aggregation_string_high_cardinality_stays_correct() {
         const N: i64 = 400;
         let ids: Vec<i64> = (0..N).chain(0..N).collect();
         // Group k sees "a{k}" then "z{k}": MIN is the "a" form, MAX the "z" form.
@@ -1685,7 +1682,7 @@ mod tests {
             AggregationSlot::new(AggregationKind::Min, 1, DataType::Utf8View),
             AggregationSlot::new(AggregationKind::Max, 1, DataType::Utf8View),
         ];
-        type Mix = Variable<i128>;
+        type Mix = RuntimeAggregation<i128>;
         // A threshold the in-place table crosses well before N groups — a numeric
         // value would switch to radix here; the string value's override must not.
         let radix = RadixConfig {

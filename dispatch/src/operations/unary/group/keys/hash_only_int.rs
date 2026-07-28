@@ -27,9 +27,9 @@ use arrow_schema::Field;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-/// `()` is a valid persisted key: zero-sized, so an entry that stores only the
-/// (bijective) hash carries no separate key bytes.
-impl PersistedKey for () {}
+// SAFETY: `()` is zero-sized, Copy, and has no invalid bit patterns or
+// out-of-line data.
+unsafe impl PersistedKey for () {}
 
 /// SplitMix64 finalizer — a *bijection* on `u64` (each step is invertible: an
 /// xor-shift-right and a multiply by an odd constant). Distinct inputs therefore

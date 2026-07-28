@@ -1,20 +1,12 @@
 //! [`StrMin<A>`](StrMin) / [`StrMax<A>`](StrMax) — string extremes over the `&str`
 //! their [`Read`](super::super::read::StrRead) *borrows* from the column.
 //!
-//! Unlike the numeric ops these are *not* [`Fold`](super::Fold)s: they need a value
-//! arena (a per-worker [`WorkerArena`] to persist winners, the shared
-//! [`SharedArena`] to resolve them) and they hold a borrowed `&str`, so they carry
-//! context a numeric fold never does. They expose plain inherent methods, called
-//! directly from the runtime [`Variable`](super::super::container::Variable)
-//! container's string arms — the only place a string extreme appears (there is no
-//! `Compiled` string slot).
+//! These operations need arenas and borrowed strings, so they do not implement
+//! the context-free numeric [`Fold`](super::Fold) trait. Runtime aggregation
+//! calls their inherent methods directly.
 //!
-//! The accumulator is the plain cell width `A`: an `ArenaKey` is just a 128-bit
-//! value, so a string extreme rides the same `A` (`= i128`) cell a numeric slot
-//! uses — no separate cell type, no container reinterpret. Viewing those 128 bits
-//! as a key is *this op's* business, via [`StringCell`] (the identity for `i128`,
-//! the fail-out for `i64`). Because the op holds the real `&str`, it compares
-//! *before* persisting, so only a winner ever touches the value arena (lazy).
+//! The `i128` cell contains an `ArenaKey`. Updates compare the borrowed input
+//! before persisting it, so losing candidates consume no arena space.
 
 use crate::arrays::SlabColumn;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};

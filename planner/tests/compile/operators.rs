@@ -1413,7 +1413,7 @@ fn global_string_min_max(mut testing_planner: TestingPlanner) {
 
 #[rstest]
 fn grouped_min_max(mut testing_planner: TestingPlanner) {
-    // Per-group extremes through the dynamic value extractor's MIN/MAX slots.
+    // Per-group extrema through RuntimeAggregation's MIN and MAX slots.
     // g=1 -> v {10,40} (min 10, max 40); g=2 -> v {20,5} (min 5, max 20). The
     // consume fold and the partition merge are both kind-aware.
     testing_planner.add_table(
@@ -1521,13 +1521,10 @@ fn grouped_string_max_order_by_limit(mut testing_planner: TestingPlanner) {
     assert_eq!(rows[0]["max(s)"], "zebra");
 }
 
-/// A string extreme mixed with the opposite direction (or with integer
-/// aggregates) routes to the runtime `Dynamic` value (widened to `i128` so the
-/// `ArenaKey` cell fits) rather than the homogeneous `Compiled` tuple. Both the
-/// string MIN+MAX mix and a string-extreme-beside-an-integer-extreme mix must
-/// compile and return the right per-group values.
+/// Mixed string extrema use RuntimeAggregation with `i128` cells, leaving room
+/// for each string's ArenaKey. Cover both MIN+MAX and a string/integer mix.
 #[rstest]
-fn mixed_string_extreme_via_dynamic(mut testing_planner: TestingPlanner) {
+fn mixed_string_extreme_via_runtime_aggregation(mut testing_planner: TestingPlanner) {
     testing_planner.add_table(
         "gs2",
         &[

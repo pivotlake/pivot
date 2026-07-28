@@ -1,23 +1,16 @@
-//! The runtime per-slot fold machinery: [`BoundSlot`] (a slot's bound reader
-//! for a batch) and the per-slot `seed`/`update`/`merge`/`finish` helpers the
-//! runtime-arity [`Variable`](super::Variable) container folds through.
+//! Per-slot operations for [`RuntimeAggregation`].
 //!
-//! [`BoundSlot`] carries one variant *per (op, width family)*: the column is
-//! downcast into an [`I64Reader`]/[`F64Reader`]/[`U128Reader`] payload (see
-//! [`readers`]), and the fold drives every slot through the *same*
-//! `Op::<A>::update(cell, read, …)`. The cell is `A` in and `A` out for every
-//! op — a string extreme's `ArenaKey`, a float's raw `f64` bits, and a wide
-//! `i128` partial are all just the bits of `A` (`= i128`), viewed by the op
-//! via [`StringCell`]/[`F64Cell`]/[`WideCell`], so the fold never reinterprets
-//! and never branches on the value's family.
+//! A [`BoundSlot`] downcasts one input column once per batch and pairs it with
+//! the aggregate operation to apply. The row loop then dispatches on that bound
+//! variant instead of repeatedly inspecting Arrow types.
 //!
-//! Generic over `A` (`i64` narrow / `i128` wide) and `ONLY_ADDITIVE` (the
-//! branch-free additive fast path). A string extreme, a float value, and a
-//! re-read wide partial all ride the wide (`i128`) instantiation; the `i64`
-//! arms of those cell traits are the fail-out (the planner always widens such
-//! a signature).
+//! All operations consume and return the common cell type `A`. Cell traits
+//! encode and decode floats, strings, and wide integers within that cell.
+//! Signatures needing any of those representations use `i128`; narrow integer
+//! signatures use `i64`.
 
 mod readers;
+mod value;
 
 use super::super::cell::{F64Cell, IntCell, StringCell, WideCell};
 use super::super::fold::Fold;
@@ -33,12 +26,11 @@ use arrow_schema::{DataType, Field};
 use std::sync::Arc;
 
 pub use readers::{F64Reader, I64Reader, U128Reader};
+pub use value::{RuntimeAggregation, RuntimeAggregationContext};
 
-/// One slot's bound reader for a batch — one variant *per (op, width family)*, the
-/// column downcast into its [`readers`] payload. Built once per batch by
-/// [`bind`](BoundSlot::bind). The `I64`/`F64`/`U128` prefixes name the value width
-/// the op folds (`i64` / `f64` / `i128`), so the container's arm reads exactly that
-/// type with no per-row `is_float` branch.
+/// One aggregate slot bound to a typed reader for the current batch.
+///
+/// The prefixes describe what the reader returns: `i64`, `f64`, or `i128`.
 pub enum BoundSlot<'b> {
     Count,
     I64Sum(I64Reader<'b>),
@@ -85,9 +77,7 @@ impl<'b> BoundSlot<'b> {
         }
     }
 
-    /// Pick the reader for a `SUM` column by its width family — an integer column
-    /// reads as `i64`, a float as `f64`, a `Decimal128` (a re-read wide partial) as
-    /// `i128` — and wrap it in the caller's matching op variant.
+    /// Bind a numeric column and wrap it in the matching operation variant.
     fn bind_numeric(
         batch: &'b RecordBatch,
         column: usize,
@@ -105,9 +95,8 @@ impl<'b> BoundSlot<'b> {
         }
     }
 
-    /// A `MIN`/`MAX` picks its op by column type: a `Utf8` column reads the string
-    /// extreme (the raw `&str`, folded through the value arena); any other column is
-    /// numeric ([`bind_numeric`](BoundSlot::bind_numeric)).
+    /// Bind string `MIN`/`MAX` directly; delegate numeric inputs to
+    /// [`bind_numeric`](BoundSlot::bind_numeric).
     fn bind_extreme(
         batch: &'b RecordBatch,
         column: usize,
@@ -124,21 +113,15 @@ impl<'b> BoundSlot<'b> {
     }
 }
 
-/// Seed one slot's cell from row `idx`, a new group's first value: the
-/// per-slot fold of the runtime-arity [`Variable`](super::Variable) container.
-/// Only a string arm touches the `WorkerArena`; the numeric `seed`s take their
-/// value directly.
+/// Initialize one slot from row `idx`.
 ///
-/// `ONLY_ADDITIVE` prunes each non-additive arm *in its body*: `if
-/// ONLY_ADDITIVE { unreachable!() } else { .. }` const-folds to a bare
-/// `unreachable!()` arm. A `_ if ONLY_ADDITIVE` guard arm instead lowers
-/// to a worse Count/Sum dispatch (measured ~2.3B more in `consume_window`).
-/// `Count` and the integer/wide `SUM` arms carry no guard; they are the
-/// additive ops the fast path keeps.
+/// In the `ALL_ADDITIVE` instantiation, non-additive arms are unreachable and
+/// constant-fold away. Keeping the const check inside each arm preserves the
+/// compact dispatch generated for `COUNT` and integer `SUM`.
 #[inline(always)]
 pub(in super::super) fn seed_slot<
     A: IntCell + StringCell + F64Cell + WideCell,
-    const ONLY_ADDITIVE: bool,
+    const ALL_ADDITIVE: bool,
 >(
     slot: &BoundSlot<'_>,
     idx: usize,
@@ -149,63 +132,63 @@ pub(in super::super) fn seed_slot<
         BoundSlot::I64Sum(r) => Sum::<A>::seed(r.read(idx)),
         BoundSlot::U128Sum(r) => U128Sum::<A>::seed(r.read(idx)),
         BoundSlot::I64Min(r) => {
-            if ONLY_ADDITIVE {
+            if ALL_ADDITIVE {
                 unreachable!()
             } else {
                 Min::<A>::seed(r.read(idx))
             }
         }
         BoundSlot::I64Max(r) => {
-            if ONLY_ADDITIVE {
+            if ALL_ADDITIVE {
                 unreachable!()
             } else {
                 Max::<A>::seed(r.read(idx))
             }
         }
         BoundSlot::F64Sum(r) => {
-            if ONLY_ADDITIVE {
+            if ALL_ADDITIVE {
                 unreachable!()
             } else {
                 F64Sum::<A>::seed(r.read(idx))
             }
         }
         BoundSlot::F64Min(r) => {
-            if ONLY_ADDITIVE {
+            if ALL_ADDITIVE {
                 unreachable!()
             } else {
                 F64Min::<A>::seed(r.read(idx))
             }
         }
         BoundSlot::F64Max(r) => {
-            if ONLY_ADDITIVE {
+            if ALL_ADDITIVE {
                 unreachable!()
             } else {
                 F64Max::<A>::seed(r.read(idx))
             }
         }
         BoundSlot::U128Min(r) => {
-            if ONLY_ADDITIVE {
+            if ALL_ADDITIVE {
                 unreachable!()
             } else {
                 U128Min::<A>::seed(r.read(idx))
             }
         }
         BoundSlot::U128Max(r) => {
-            if ONLY_ADDITIVE {
+            if ALL_ADDITIVE {
                 unreachable!()
             } else {
                 U128Max::<A>::seed(r.read(idx))
             }
         }
         BoundSlot::StrMin(a) => {
-            if ONLY_ADDITIVE {
+            if ALL_ADDITIVE {
                 unreachable!()
             } else {
                 StrMin::<A>::seed(StrRead::read(a, idx), wc)
             }
         }
         BoundSlot::StrMax(a) => {
-            if ONLY_ADDITIVE {
+            if ALL_ADDITIVE {
                 unreachable!()
             } else {
                 StrMax::<A>::seed(StrRead::read(a, idx), wc)
@@ -214,125 +197,119 @@ pub(in super::super) fn seed_slot<
     }
 }
 
-/// Fold row `idx` into one slot's existing cell. A numeric arm folds its own cell
-/// (no context); a string arm folds into the real `WorkerArena` and resolves the
-/// current extreme through `shared`. Per-arm `ONLY_ADDITIVE` pruning as in
-/// [`seed_slot`].
+/// Fold row `idx` into an existing cell.
+///
+/// Numeric operations need only the cell and reader. String operations use the
+/// worker arena to persist a new winner and the shared arena to compare with
+/// the current winner. `ALL_ADDITIVE` is specialized as in [`seed_slot`].
 #[inline(always)]
 pub(in super::super) fn update_slot<
     A: IntCell + StringCell + F64Cell + WideCell,
-    const ONLY_ADDITIVE: bool,
+    const ALL_ADDITIVE: bool,
 >(
     cell: A,
     slot: &BoundSlot<'_>,
     idx: usize,
     wc: &mut WorkerArena,
-    shared: &Arc<SharedArena>,
+    arena: &Arc<SharedArena>,
 ) -> A {
     match slot {
         BoundSlot::Count => Count::<A>::update(cell, ()),
         BoundSlot::I64Sum(r) => Sum::<A>::update(cell, r.read(idx)),
         BoundSlot::U128Sum(r) => U128Sum::<A>::update(cell, r.read(idx)),
         BoundSlot::I64Min(r) => {
-            if ONLY_ADDITIVE {
+            if ALL_ADDITIVE {
                 unreachable!()
             } else {
                 Min::<A>::update(cell, r.read(idx))
             }
         }
         BoundSlot::I64Max(r) => {
-            if ONLY_ADDITIVE {
+            if ALL_ADDITIVE {
                 unreachable!()
             } else {
                 Max::<A>::update(cell, r.read(idx))
             }
         }
         BoundSlot::F64Sum(r) => {
-            if ONLY_ADDITIVE {
+            if ALL_ADDITIVE {
                 unreachable!()
             } else {
                 F64Sum::<A>::update(cell, r.read(idx))
             }
         }
         BoundSlot::F64Min(r) => {
-            if ONLY_ADDITIVE {
+            if ALL_ADDITIVE {
                 unreachable!()
             } else {
                 F64Min::<A>::update(cell, r.read(idx))
             }
         }
         BoundSlot::F64Max(r) => {
-            if ONLY_ADDITIVE {
+            if ALL_ADDITIVE {
                 unreachable!()
             } else {
                 F64Max::<A>::update(cell, r.read(idx))
             }
         }
         BoundSlot::U128Min(r) => {
-            if ONLY_ADDITIVE {
+            if ALL_ADDITIVE {
                 unreachable!()
             } else {
                 U128Min::<A>::update(cell, r.read(idx))
             }
         }
         BoundSlot::U128Max(r) => {
-            if ONLY_ADDITIVE {
+            if ALL_ADDITIVE {
                 unreachable!()
             } else {
                 U128Max::<A>::update(cell, r.read(idx))
             }
         }
         BoundSlot::StrMin(a) => {
-            if ONLY_ADDITIVE {
+            if ALL_ADDITIVE {
                 unreachable!()
             } else {
-                StrMin::<A>::update(cell, StrRead::read(a, idx), wc, shared)
+                StrMin::<A>::update(cell, StrRead::read(a, idx), wc, arena)
             }
         }
         BoundSlot::StrMax(a) => {
-            if ONLY_ADDITIVE {
+            if ALL_ADDITIVE {
                 unreachable!()
             } else {
-                StrMax::<A>::update(cell, StrRead::read(a, idx), wc, shared)
+                StrMax::<A>::update(cell, StrRead::read(a, idx), wc, arena)
             }
         }
     }
 }
 
-/// Combine one slot's two finished partial cells, for the partition merge and
-/// the radix fold. The reader is gone by the merge, so the value family is read
-/// off the slot's declared `output_type`: a `Utf8View` extreme, a floating
-/// `SUM`/`MIN`/`MAX`, else integer/wide. A wide (`i128`) re-read merges
-/// identically to the narrow integer one (both accumulate in `A = i128`), so it
-/// needs no separate arm. Each check lives in its own arm, so `Count` and the
-/// integer paths pay for none of them. (The caller's all-additive fast path, a
-/// branch-free `a + b`, skips this dispatch entirely.)
+/// Merge two partial cells for one slot.
+///
+/// No input reader exists during merge, so `output_type` distinguishes string
+/// and floating-point operations from integer operations. The caller bypasses
+/// this dispatch entirely for an all-additive signature.
 #[inline(always)]
 pub(in super::super) fn merge_slot<A: IntCell + StringCell + F64Cell + WideCell>(
     a: A,
     b: A,
     slot: &AggregationSlot,
-    shared: &Arc<SharedArena>,
+    arena: &Arc<SharedArena>,
 ) -> A {
     let ty = &slot.output_type;
     match slot.kind {
         AggregationKind::CountStar | AggregationKind::Count => Count::<A>::merge(a, b),
         AggregationKind::Sum if ty.is_floating() => F64Sum::<A>::merge(a, b),
         AggregationKind::Sum => Sum::<A>::merge(a, b),
-        AggregationKind::Min if *ty == DataType::Utf8View => StrMin::<A>::merge(a, b, shared),
+        AggregationKind::Min if *ty == DataType::Utf8View => StrMin::<A>::merge(a, b, arena),
         AggregationKind::Min if ty.is_floating() => F64Min::<A>::merge(a, b),
         AggregationKind::Min => Min::<A>::merge(a, b),
-        AggregationKind::Max if *ty == DataType::Utf8View => StrMax::<A>::merge(a, b, shared),
+        AggregationKind::Max if *ty == DataType::Utf8View => StrMax::<A>::merge(a, b, arena),
         AggregationKind::Max if ty.is_floating() => F64Max::<A>::merge(a, b),
         AggregationKind::Max => Max::<A>::merge(a, b),
     }
 }
 
-/// Render one slot's finished output column. Called once per output column (not
-/// per row), so the per-slot kind dispatch is irrelevant. Each op renders its own
-/// column, dispatched by kind + declared `output_type` as in [`merge_slot`]
-/// (numeric to its width's Arrow type, float to `Float64`, string to `Utf8View`
-/// resolved through the arena, wide re-read to `Decimal128` via the integer arm).
+/// Render one completed cell column using the slot's operation and result type.
 pub(in super::super) fn finish_slot<A: IntCell + StringCell + F64Cell + WideCell>(
     name: &str,
     slot: &AggregationSlot,

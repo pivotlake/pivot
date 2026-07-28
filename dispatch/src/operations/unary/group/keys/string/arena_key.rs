@@ -89,7 +89,9 @@ impl ArenaKey {
     }
 }
 
-impl PersistedKey for ArenaKey {
+// SAFETY: An all-zero ArenaKey is its valid empty inline representation. The
+// handle is Copy, and non-inline bytes live in the arena that owns the table.
+unsafe impl PersistedKey for ArenaKey {
     const HAS_BLOB: bool = true;
 
     #[inline(always)]

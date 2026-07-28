@@ -2,12 +2,10 @@
 //! [`Sum`](super::Sum)/[`Min`](super::Min)/[`Max`](super::Max), folding the `f64` an
 //! `F64Reader` yields.
 //!
-//! Like the string extremes these are *not* [`Fold`](super::Fold)s: a float
-//! accumulator lives bit-punned in the cell width `A` via [`F64Cell`], so the op
-//! owns the reinterpret and exposes plain inherent methods, called from the runtime
-//! [`Variable`](super::super::container::Variable) container's float arms (there is no
-//! `Compiled` float slot). `MIN`/`MAX` order with [`f64::total_cmp`] so the extreme
-//! is deterministic regardless of row order (NaN sorts greatest, matching DuckDB).
+//! These are inherent helpers rather than [`Fold`](super::Fold)
+//! implementations because [`F64Cell`] encodes the float's bits in a shared
+//! integer cell. Runtime aggregation calls them for float slots. `MIN` and
+//! `MAX` use [`f64::total_cmp`] for deterministic ordering.
 
 use crate::arrays::SlabColumn;
 use crate::operations::unary::group::values::cell::F64Cell;

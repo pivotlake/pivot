@@ -10,27 +10,34 @@ use std::mem;
 use std::ptr;
 use tracing::debug;
 
-/// Maximum fraction of slots that can be occupied before the table is
-/// considered undersized. Used by [`AggregatedTable`](super::AggregatedTable)
-/// to decide when to stop inserting and create a new table.
+/// Maximum occupied fraction before the caller grows or replaces the table.
 pub const MAX_LOAD_FACTOR: f64 = 0.7;
 
-/// A `LiveKey` is a key that has *not* yet been persisted, and therefore needs to explicitly be
-/// persisted if it is saved within the HashTable. The HashTable may decide not to persist a key
-/// if, for example, the same key already exists.
+/// A candidate key that has not necessarily been copied into durable storage.
+///
+/// Probing compares this form directly with table keys. [`persist`](Self::persist)
+/// is called only after an empty slot is found, avoiding an allocation or string
+/// copy when the group already exists.
 pub trait LiveKey {
     type Persisted: PersistedKey;
 
     /// Compare this live key against a persisted key in the table.
     fn eq_persisted(&self, other: &Self::Persisted) -> bool;
 
-    /// Save the key
+    /// Convert the candidate into the representation stored by the table.
     fn persist(self) -> Self::Persisted;
 }
 
-/// A key that has been persisted in the HashTable. Any PersistedKey can be referenced from within
-/// the HashTable as long as the HashTable is alive
-pub trait PersistedKey: Copy + Clone + Default {
+/// A key representation that can live in raw hash-table storage.
+///
+/// # Safety
+///
+/// An all-zero byte region with the size and alignment of `Self` must be a valid
+/// value. Empty table slots are zero-filled and may be viewed as keys before
+/// their hash is checked. The `Copy` bound ensures keys have no destructor and
+/// can be relocated byte-for-byte when a table grows. Any out-of-line data
+/// referenced by a key must remain valid for at least as long as the table.
+pub unsafe trait PersistedKey: Copy + Clone + Default + Send + Sync + 'static {
     /// Whether this key holds out-of-line data (an arena string blob) that
     /// `eq_persisted` will chase. `true` for string-bearing keys, `false` for
     /// fixed-width integer keys. Used to decide whether the merge's blob prefetch
@@ -44,8 +51,7 @@ pub trait PersistedKey: Copy + Clone + Default {
     fn prefetch_blob(&self, _arena: &SharedArena) {}
 }
 
-/// We reimplement LiveKey for any PersistentKey to allow saving an already persisted key within
-/// the HashTable (for example, if it was saved in another HashTable's arena previously)
+/// A persisted key can be inserted into another table without conversion.
 impl<P: PersistedKey + PartialEq> LiveKey for P {
     type Persisted = Self;
 
@@ -59,18 +65,17 @@ impl<P: PersistedKey + PartialEq> LiveKey for P {
     }
 }
 
-/// A borrowed read of one occupied table entry: its hash, persisted key, and
-/// stored value. What [`BaseHashTable::iter`] yields and
-/// [`TableReader::view_at`] returns. A view rather than a struct reference
-/// because an entry is a byte region at a per-table stride, not a Rust struct
-/// (the stride is a runtime value; see [`BaseHashTable`]).
+/// Borrowed fields of one table entry.
+///
+/// This is a view rather than a reference to a Rust struct because entry layout
+/// and stride are computed at query construction time.
 pub struct EntryView<'a, K, S: ?Sized> {
     /// The stored hash (never 0 for an occupied entry).
     pub hash: u64,
     /// The persisted group key.
     pub key: &'a K,
-    /// The group's stored aggregation value.
-    pub stored: &'a S,
+    /// The group's aggregation state.
+    pub state: &'a S,
 }
 
 /// Maximum number of entries allowed for a table with `len` total slots.
@@ -82,17 +87,12 @@ fn align_up(x: usize, align: usize) -> usize {
     (x + align - 1) & !(align - 1)
 }
 
-/// The magic reciprocal for dividing by `d` with a widening multiply:
-/// `n / d == (n * reciprocal(d)) >> 64` — the same strength reduction the
-/// compiler applies to a compile-time divisor.
+/// Compute a reciprocal that replaces division by `d` with a widening multiply:
+/// `n / d == (n * reciprocal(d)) >> 64`.
 ///
-/// Exact for this table's ranges: with `m = ceil(2^64 / d) = (2^64 + e) / d`
-/// (`0 <= e < d`), `n * m / 2^64 = n/d + n*e/(d * 2^64)`, and the error term
-/// stays below `n / 2^64`. The true quotient's fractional part is at most
-/// `1 - 1/d`, so the floor can only be pushed over when `n / 2^64 >= 1/d`,
-/// i.e. `n >= 2^64 / d`. Here `d = entries_per_slab < 2^21` (a slab is 2MB and
-/// an entry at least 8 bytes... at least 2 entries per slab), so the result is
-/// exact for every `n < 2^43` — far above any slot index.
+/// With `m = ceil(2^64 / d)`, this formula is exact while `n < 2^64 / d`.
+/// A slab contains fewer than `2^21` entries, so every practical table index is
+/// well inside that range.
 fn reciprocal(d: u64) -> u64 {
     assert!(d >= 2, "an entry never fills half a slab");
     ((1u128 << 64).div_ceil(d as u128)) as u64
@@ -105,11 +105,11 @@ fn fast_div(n: usize, m: u64) -> usize {
     (((n as u128) * (m as u128)) >> 64) as usize
 }
 
-/// Each slab's base address minus its first slot's global byte offset
-/// (`s * entries_per_slab * stride`), so an entry address is
-/// `bases[slab] + index * stride` with no per-access subtract (see
-/// [`BaseHashTable::entry_ptr_in`]). Wrapping: an adjusted base may
-/// arithmetically precede its mapping; only the re-added sum is dereferenced.
+/// Pre-adjust each slab base so a global slot index maps to
+/// `adjusted_bases[slab] + index * stride`.
+///
+/// The stored integer may wrap below the mapped address. It is never
+/// dereferenced until the matching global byte offset has been added back.
 fn adjusted_bases(slabs: &[Slab], entries_per_slab: usize, stride: usize) -> Vec<usize> {
     slabs
         .iter()
@@ -118,31 +118,34 @@ fn adjusted_bases(slabs: &[Slab], entries_per_slab: usize, stride: usize) -> Vec
         .collect()
 }
 
-/// The runtime layout of one entry: where each field starts, the entry stride,
-/// and the strictest field alignment. Fields are placed in descending alignment
-/// order (ties keep hash, key, value order), mirroring the padding-minimising
-/// layout the compiler gives a sized entry struct, so a fixed-arity value's
-/// entry is exactly as large as it always was.
+/// Runtime offsets, stride, and alignment for one table or scatter row.
+///
+/// Fields are placed in descending alignment order. Equal alignments retain the
+/// logical hash, key, state order. This minimizes padding and preserves the
+/// previous layout for fixed-size aggregation states.
 pub(super) struct EntryLayout {
     pub(super) hash_offset: usize,
     pub(super) key_offset: usize,
-    pub(super) value_offset: usize,
+    pub(super) state_offset: usize,
     pub(super) stride: usize,
     pub(super) align: usize,
 }
 
 /// The exact bytes one table entry occupies for this key type and signature,
 /// for entry-footprint heuristics (merge-partition sizing).
-pub fn entry_stride<K, V: AggregationValue>(ctx: &V::SharedContext) -> usize {
-    entry_layout::<K, V>(V::stored_meta(ctx)).stride
+pub fn entry_stride<K, V: AggregationValue>(ctx: &V::Context) -> usize {
+    entry_layout::<K, V>(V::entry_state_meta(ctx)).stride
 }
 
-pub(super) fn entry_layout<K, V: AggregationValue>(meta: V::StoredMeta) -> EntryLayout {
-    // (alignment, size) per field, in hash, key, value order.
+pub(super) fn entry_layout<K, V: AggregationValue>(state_meta: V::EntryStateMeta) -> EntryLayout {
+    // Each tuple is (alignment, size), in logical hash, key, state order.
     let fields = [
         (align_of::<u64>(), size_of::<u64>()),
         (align_of::<K>(), size_of::<K>()),
-        (V::stored_align(meta), V::stored_size(meta)),
+        (
+            V::entry_state_align(state_meta),
+            V::entry_state_size(state_meta),
+        ),
     ];
     let mut order = [0usize, 1, 2];
     order.sort_by_key(|&f| std::cmp::Reverse(fields[f].0));
@@ -159,7 +162,7 @@ pub(super) fn entry_layout<K, V: AggregationValue>(meta: V::StoredMeta) -> Entry
     EntryLayout {
         hash_offset: offsets[0],
         key_offset: offsets[1],
-        value_offset: offsets[2],
+        state_offset: offsets[2],
         stride,
         align,
     }
@@ -200,153 +203,67 @@ fn prefetch_l2_line(ptr: *const u8) {
     let _ = ptr;
 }
 
-/// A linear probing hash table optimized for never rehashing, exposing a very raw interface allowing
-/// maximum control by the caller.
+/// A linear-probing table specialized for grouped aggregation.
 ///
-/// # Memory Layout
+/// # Entry layout
 ///
-/// Entries live in one or more 2MB slabs as raw byte regions at a fixed
-/// per-table `stride`, each holding the hash, the persisted key, and the
-/// group's stored aggregation value:
-///
-/// ```text
-/// ┌─────────────────────────────────────────────────────────────────────────┐
-/// │                    Slabs: entries at `stride` bytes each                │
-/// ├─────────────┬─────────────┬─────────────┬─────────────┬────────────────┤
-/// │  entry 0    │  entry 1    │             │  entry 3    │      ...       │
-/// │ hash|key|val│ hash|key|val│             │ hash|key|val│                │
-/// └─────────────┴─────────────┴─────────────┴─────────────┴────────────────┘
-///  stride = 8 bytes + key + stored value, fields in descending-alignment
-///  order (e.g. 24 bytes for an `Int64` key with one `i64` cell)
-/// ```
-///
-/// The stride is a *runtime* value computed at construction rather than a
-/// compile-time `size_of`, because a stored value's size may itself be fixed
-/// only at query build time: a runtime-arity signature ([`Variable`]) stores
-/// `n` cells inline per entry, `n` constant per query but unknown to the
-/// compiler. Fixed-arity values get the same field offsets and stride a sized
-/// entry struct had; they simply pay the stride multiply at probe time.
-///
-/// Each entry contains:
-/// - `hash: u64` - Full 64-bit hash (0 = empty slot sentinel)
-/// - `key: K` - The persisted key (e.g., ArenaKey with pointer + length)
-/// - value - The stored aggregation value (see [`AggregationValue::Stored`])
-///
-/// Entries never straddle a slab boundary: each slab holds
-/// `BUFFER_SIZE / stride` whole entries, with the leftover tail bytes unused.
-/// Capacity is always a power of 2, which allows wrapping via `& mask` during
-/// linear probing and efficient top-bit slot placement via `hash >> shift`.
-///
-/// # How It Works
-///
-/// Uses open addressing with linear probing:
-///
-/// 1. **Insert/Merge**: Compute `slot = hash >> shift` (top bits of the hash).
-///    Top-bit placement is required so that the partition (top `log2(PARTITIONS)`
-///    bits) is a prefix of the slot index, enabling the merge phase to scan
-///    tables of different sizes by partition (see module-level docs in `group`).
-///    If occupied and different key, probe linearly (slot+1, slot+2, ...) until
-///    finding an empty slot (hash == 0) or matching key. On match, fold values
-///    instead of inserting.
-///
-/// 2. **Empty detection**: `hash == 0` marks empty slots. Real zero hashes are
-///    converted to 1 to preserve this invariant.
-///
-/// 3. **Resize**: Handled externally — callers check load pressure and call
-///    [`resize`](BaseHashTable::resize) to rehash into fresh slabs.
-///
-/// # Why Not Swiss Tables (hashbrown / std HashMap)
-///
-/// Swiss Tables use a two-array layout — a `ctrl[]` byte array for
-/// SIMD-accelerated probing and a separate `slots[]` array for key-value
-/// data:
+/// Entries are raw byte regions in 2 MiB slabs. Each region contains a full
+/// hash, a persisted key, and aggregation state. Their physical order depends
+/// on alignment; [`EntryLayout`] records their offsets.
 ///
 /// ```text
-/// Swiss Table layout:
-/// ┌──────────────────────────┐    ┌─────────────────────────────────────────┐
-/// │   ctrl[] (1 byte each)   │    │         slots[] (key+value only)        │
-/// │ [h2|h2|h2|h2|h2|h2|h2|h2]│    │ [kv0|kv1|kv2|kv3|kv4|kv5|kv6|kv7|...]   │
-/// └──────────────────────────┘    └─────────────────────────────────────────┘
-///    SIMD-probed metadata              actual data (accessed on match)
+/// slab:  [ entry 0 ][ entry 1 ][ entry 2 ] ... [ unused tail ]
+/// entry: hash at hash_offset, key at key_offset, state at state_offset
+///        <---------------------- stride ---------------------->
 /// ```
 ///
-/// This is excellent for general-purpose use, but the GROUP BY merge
-/// phase requires properties that Swiss Tables cannot provide:
+/// The stride is computed once per table because
+/// [`AggregationValue::EntryState`] may contain a query-defined number of
+/// cells. Entries never cross slab boundaries; any remaining bytes at the end
+/// of a slab are unused.
 ///
-/// ## 1. Top-bit slot placement enables partitioned merging
+/// # Probing and partitioning
 ///
-/// This table places entries using the **top** bits of the hash
-/// (`slot = hash >> shift`). Because the partition index is also derived
-/// from the top bits (`partition = hash >> (64 - log2(PARTITIONS))`), the
-/// partition is always a **prefix** of the slot index. This means entries
-/// for partition P occupy a contiguous, predictable slot range in any
-/// power-of-2 table, regardless of size:
+/// The initial slot comes from the high hash bits. A collision advances to the
+/// next slot until an empty hash or equal key is found. Zero is the empty-slot
+/// sentinel, so ordinary callers remap a zero hash to one.
 ///
-/// ```text
-/// 128-slot table:  partition 0 = slots [0, 2)    partition 1 = slots [2, 4)   ...
-/// 256-slot table:  partition 0 = slots [0, 4)    partition 1 = slots [4, 8)   ...
-/// ```
+/// High-bit placement is important to merge scheduling. Radix partitions use a
+/// prefix of the same high bits, so a partition corresponds to a contiguous
+/// slot range in every power-of-two table. A merge job can scan only its range,
+/// even when source tables have different capacities.
 ///
-/// The merge phase exploits this: it scans only the relevant slot range
-/// per partition, across tables of mixed sizes, without touching entries
-/// from other partitions. **Swiss Tables use the lower bits for slot
-/// placement**, so entries from the same partition are scattered across
-/// the entire table. A Swiss Table merge would require either a full scan
-/// of every source table (touching all entries to check partition
-/// membership) or an O(n) pre-partitioning pass — both losing the
-/// cache-locality advantage.
-///
-/// ## 2. Stored hashes avoid rehashing large keys
-///
-/// Large strings (URLs, paths) are expensive to hash. We store the full
-/// 64-bit hash inline with each entry, so resize and cross-table merge
-/// never re-hash a key. Swiss Tables only store 7 bits (h2) in their
-/// control byte — to avoid rehashing they'd need to store the full hash
-/// separately, losing their space advantage over this layout.
-///
-/// ## 3. Inline entries give single-access probing
-///
-/// Each entry packs hash + key + value into one region (e.g. 32 bytes
-/// for `ArenaKey` + a count = 2 entries per 64-byte cache line). A single
-/// cache-line fetch gives the hash for comparison AND the next linear-probe
-/// candidate. Swiss Tables require two separate memory accesses per probe:
-/// one for the ctrl byte and one for the slot data.
+/// The full hash is stored with the entry. Resizing and merging therefore never
+/// need to hash a persisted string key again.
 pub struct BaseHashTable<K: PersistedKey, V: AggregationValue> {
     mask: usize,
-    shift: u32,
+    slot_shift: u32,
     collisions: usize,
     /// Left-shift applied to hash before computing the slot index.
     /// Set to `PARTITIONS.trailing_zeros()` for merge maps so that the partition
     /// bits (top N) are stripped and the next top bits drive slot placement.
-    pre_shift: u32,
+    hash_left_shift: u32,
     /// Whole entries per 2MB slab (`BUFFER_SIZE / stride`); entries never
     /// straddle a slab boundary.
     entries_per_slab: usize,
-    /// Magic reciprocal of `entries_per_slab` (see [`reciprocal`]), so the
-    /// per-probe slab lookup divides with a widening multiply instead of a
-    /// hardware `udiv`. A compile-time divisor gets this strength reduction
-    /// from the compiler; a runtime one must carry it itself, or the divide's
-    /// latency lands on the probe's address computation, in front of the
-    /// entry load it feeds. Measured +70% on a hash-only distinct count.
-    entries_per_slab_magic: u64,
+    /// Reciprocal used by [`fast_div`] to avoid a hardware division while
+    /// locating the slab for a slot.
+    entries_per_slab_reciprocal: u64,
     /// Bytes per entry; see the layout docs above.
     stride: usize,
     hash_offset: usize,
     key_offset: usize,
-    value_offset: usize,
+    state_offset: usize,
     /// Strictest field alignment, for allocating replacement slabs on resize.
     align: usize,
     /// The value's runtime view metadata (slot count for a runtime-arity
     /// signature); held once here, never per entry.
-    meta: V::StoredMeta,
-    /// Each slab's base address pre-adjusted by its first slot's byte offset
-    /// (`slabs[s].ptr - s * entries_per_slab * stride`), so an entry address is
-    /// `bases[slab] + index * stride`: the slab-index multiply and the byte
-    /// multiply are independent and run in parallel, with no subtract on the
-    /// dependency chain, matching the latency of a compile-time stride.
-    bases: Vec<usize>,
+    state_meta: V::EntryStateMeta,
+    /// Slab bases adjusted for addressing with a global slot index; see
+    /// [`adjusted_bases`].
+    adjusted_bases: Vec<usize>,
     slabs: Vec<Slab>,
-    length: usize,
+    len: usize,
     max_load: usize,
     _phantom: PhantomData<(K, V)>,
 }
@@ -354,35 +271,34 @@ pub struct BaseHashTable<K: PersistedKey, V: AggregationValue> {
 unsafe impl<K: PersistedKey, V: AggregationValue> Send for BaseHashTable<K, V> {}
 
 impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
-    /// Creates a new table with `expected_capacity` slots (must be a power of
-    /// 2), its entry layout derived from the key type and the value's runtime
-    /// metadata off `ctx`. The slabs are zeroed so all slots start empty
-    /// (`hash == 0`).
+    /// Create a zero-filled table with a power-of-two slot capacity.
+    ///
+    /// The key type and aggregation context determine the entry layout.
     pub fn new(
         allocator: &mut SlabAllocator,
         expected_capacity: usize,
-        pre_shift: u32,
-        ctx: &V::SharedContext,
+        hash_left_shift: u32,
+        ctx: &V::Context,
     ) -> Self {
-        let meta = V::stored_meta(ctx);
-        let layout = entry_layout::<K, V>(meta);
+        let state_meta = V::entry_state_meta(ctx);
+        let layout = entry_layout::<K, V>(state_meta);
         let entries_per_slab = BUFFER_SIZE / layout.stride;
         let slabs = allocator.create_strided_slabs(expected_capacity, layout.stride, layout.align);
         BaseHashTable {
             mask: expected_capacity - 1,
-            length: 0,
+            len: 0,
             max_load: max_load_for_len(expected_capacity),
-            pre_shift,
-            shift: u64::BITS - expected_capacity.trailing_zeros(),
+            hash_left_shift,
+            slot_shift: u64::BITS - expected_capacity.trailing_zeros(),
             entries_per_slab,
-            entries_per_slab_magic: reciprocal(entries_per_slab as u64),
+            entries_per_slab_reciprocal: reciprocal(entries_per_slab as u64),
             stride: layout.stride,
             hash_offset: layout.hash_offset,
             key_offset: layout.key_offset,
-            value_offset: layout.value_offset,
+            state_offset: layout.state_offset,
             align: layout.align,
-            meta,
-            bases: adjusted_bases(&slabs, entries_per_slab, layout.stride),
+            state_meta,
+            adjusted_bases: adjusted_bases(&slabs, entries_per_slab, layout.stride),
             slabs,
             _phantom: PhantomData,
             collisions: 0,
@@ -397,7 +313,7 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
         for slab in &mut self.slabs {
             slab.zero_out();
         }
-        self.length = 0;
+        self.len = 0;
         self.collisions = 0;
     }
 
@@ -408,7 +324,7 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
 
     /// Returns the number of entries currently stored in the table.
     pub fn len(&self) -> usize {
-        self.length
+        self.len
     }
 
     /// Cumulative number of probe-chain collisions since the last resize.
@@ -416,29 +332,24 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
         self.collisions
     }
 
-    /// Map a hash to a slot index using the top bits: `(hash << pre_shift) >> shift`.
+    /// Map a hash to a slot index using the top bits:
+    /// `(hash << hash_left_shift) >> slot_shift`.
     #[inline(always)]
     fn slot_for(&self, hash: u64) -> usize {
-        ((hash << self.pre_shift) >> self.shift) as usize
+        ((hash << self.hash_left_shift) >> self.slot_shift) as usize
     }
 
-    /// The address of the entry at `index` in the slabs behind `bases` (with
-    /// this table's layout). Entries never straddle slabs: entry `i` lives in
-    /// slab `i / entries_per_slab` at byte offset
-    /// `(i % entries_per_slab) * stride`, but through the pre-adjusted bases
-    /// this is one reciprocal multiply and one independent byte multiply — no
-    /// hardware divide and no subtract on the address dependency chain, which
-    /// every probe's entry load waits on.
+    /// Find a global slot in the supplied set of adjusted slab bases.
     #[inline(always)]
-    fn entry_ptr_in(&self, bases: &[usize], index: usize) -> *mut u8 {
-        let slab_idx = fast_div(index, self.entries_per_slab_magic);
-        bases[slab_idx].wrapping_add(index * self.stride) as *mut u8
+    fn entry_ptr_in(&self, adjusted_bases: &[usize], index: usize) -> *mut u8 {
+        let slab_idx = fast_div(index, self.entries_per_slab_reciprocal);
+        adjusted_bases[slab_idx].wrapping_add(index * self.stride) as *mut u8
     }
 
     /// The address of this table's entry at `index`.
     #[inline(always)]
     fn entry_ptr(&self, index: usize) -> *mut u8 {
-        self.entry_ptr_in(&self.bases, index)
+        self.entry_ptr_in(&self.adjusted_bases, index)
     }
 
     /// Returns an iterator over all non-empty entries in the table.
@@ -447,53 +358,56 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
     /// Empty slots (hash == 0) are skipped automatically.
     pub fn iter(&self, start_offset: usize) -> HashTableIterator<'_, K, V> {
         HashTableIterator {
-            geo: self.geometry(),
+            layout: self.probe_layout(),
             idx: start_offset,
             _table: PhantomData,
         }
     }
 
     /// Returns `true` if the table has exceeded its [`MAX_LOAD_FACTOR`] threshold.
-    pub fn undersized(&self) -> bool {
+    pub fn needs_growth(&self) -> bool {
         self.len() > self.max_load
     }
 
     /// A register-resident snapshot of this table's entry layout and probe
-    /// parameters (see [`Geometry`]).
+    /// parameters (see [`ProbeLayout`]).
     #[inline(always)]
-    fn geometry(&self) -> Geometry<K, V> {
-        Geometry {
-            magic: self.entries_per_slab_magic,
+    fn probe_layout(&self) -> ProbeLayout<K, V> {
+        ProbeLayout {
+            entries_per_slab_reciprocal: self.entries_per_slab_reciprocal,
             stride: self.stride,
             hash_offset: self.hash_offset,
             key_offset: self.key_offset,
-            value_offset: self.value_offset,
+            state_offset: self.state_offset,
             mask: self.mask,
-            shift: self.shift,
-            pre_shift: self.pre_shift,
-            bases: self.bases.as_ptr(),
-            bases_len: self.bases.len(),
-            first_base: self.bases[0],
-            meta: self.meta,
+            slot_shift: self.slot_shift,
+            hash_left_shift: self.hash_left_shift,
+            adjusted_bases: self.adjusted_bases.as_ptr(),
+            adjusted_bases_len: self.adjusted_bases.len(),
+            first_adjusted_base: self.adjusted_bases[0],
+            state_meta: self.state_meta,
             _phantom: PhantomData,
         }
     }
 
-    /// A probing handle that holds the table's [`Geometry`] in locals for the
+    /// A probing handle that holds the table's [`ProbeLayout`] in locals for the
     /// duration of a consume window, so the per-row probe reads its layout
     /// constants from registers (see [`Prober`]).
     #[inline(always)]
     pub fn prober(&mut self) -> Prober<'_, K, V> {
-        let geo = self.geometry();
-        Prober { table: self, geo }
+        let layout = self.probe_layout();
+        Prober {
+            table: self,
+            layout,
+        }
     }
 
-    /// A read handle with the same register-resident [`Geometry`], for the
+    /// A read handle with the same register-resident [`ProbeLayout`], for the
     /// merge phase's linear slot scans.
     #[inline(always)]
     pub fn reader(&self) -> TableReader<'_, K, V> {
         TableReader {
-            geo: self.geometry(),
+            layout: self.probe_layout(),
             _table: PhantomData,
         }
     }
@@ -501,9 +415,9 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
     /// Rehash all entries into fresh zeroed slabs of `new_size` slots.
     ///
     /// Every occupied entry is re-probed into the larger table and copied whole
-    /// (`stride` bytes: hash, key, and stored value alike).
+    /// (`stride` bytes: hash, key, and aggregation state).
     ///
-    /// The collision counter is reset to `self.length` so that post-resize
+    /// The collision counter is reset to `self.len` so that post-resize
     /// collision tracking reflects only new probing pressure, not historical
     /// collisions from the smaller table.
     ///
@@ -515,19 +429,19 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
         debug!("Resizing map to {:?}...", new_size);
         let new_slabs = allocator.create_strided_slabs(new_size, self.stride, self.align);
         // Keep the replaced slabs alive until the copy loop below has read
-        // every old entry; `old_bases` points into them.
+        // every old entry; `old_adjusted_bases` points into them.
         let _old_slabs = mem::replace(&mut self.slabs, new_slabs);
-        let old_bases = mem::replace(
-            &mut self.bases,
+        let old_adjusted_bases = mem::replace(
+            &mut self.adjusted_bases,
             adjusted_bases(&self.slabs, self.entries_per_slab, self.stride),
         );
         let old_mask = self.mask;
-        self.collisions = self.length;
+        self.collisions = self.len;
         self.mask = new_size - 1;
-        self.shift = u64::BITS - new_size.trailing_zeros();
+        self.slot_shift = u64::BITS - new_size.trailing_zeros();
 
         for idx in 0..=old_mask {
-            let old_entry = self.entry_ptr_in(&old_bases, idx);
+            let old_entry = self.entry_ptr_in(&old_adjusted_bases, idx);
             let hash = unsafe { *(old_entry.add(self.hash_offset) as *const u64) };
             if hash != 0 {
                 let mut new_idx = self.slot_for(hash);
@@ -546,48 +460,42 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
     }
 }
 
-/// A register-resident snapshot of a table's entry layout and probe
-/// parameters. These are all runtime values (the whole point of the strided
-/// table), so hot loops that touched them through `&self` would re-load them
-/// from memory constantly — the probe writes entries through raw pointers,
-/// which the compiler must assume may alias the table's own fields. A
-/// `Geometry` is plain `Copy` locals, immune to that: snapshotted once per
-/// call (or once per consume window via [`Prober`]), it keeps the layout in
-/// registers exactly as a compile-time layout would be immediates.
+/// A copyable snapshot of the layout and values needed by a probe loop.
 ///
-/// The `bases` pointer is valid while the table's slabs are untouched; every
-/// holder ties itself to the table with a borrow, and nothing resizes a table
-/// while a snapshot of it is live.
-struct Geometry<K, V: AggregationValue> {
-    magic: u64,
+/// Raw entry writes prevent the compiler from proving that fields read through
+/// `&BaseHashTable` do not alias those writes. Copying these values before the
+/// loop lets them remain ordinary locals. `adjusted_bases` stays valid because
+/// every owner of a snapshot also borrows the table, preventing resize.
+struct ProbeLayout<K, V: AggregationValue> {
+    entries_per_slab_reciprocal: u64,
     stride: usize,
     hash_offset: usize,
     key_offset: usize,
-    value_offset: usize,
+    state_offset: usize,
     mask: usize,
-    shift: u32,
-    pre_shift: u32,
-    bases: *const usize,
-    bases_len: usize,
-    /// `bases[0]`, kept inline so a single-slab table's entry address needs
+    slot_shift: u32,
+    hash_left_shift: u32,
+    adjusted_bases: *const usize,
+    adjusted_bases_len: usize,
+    /// `adjusted_bases[0]`, kept inline so a single-slab table's entry address needs
     /// neither the reciprocal multiply nor the dependent base load.
-    first_base: usize,
-    meta: V::StoredMeta,
+    first_adjusted_base: usize,
+    state_meta: V::EntryStateMeta,
     _phantom: PhantomData<K>,
 }
 
-impl<K, V: AggregationValue> Clone for Geometry<K, V> {
+impl<K, V: AggregationValue> Clone for ProbeLayout<K, V> {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<K, V: AggregationValue> Copy for Geometry<K, V> {}
+impl<K, V: AggregationValue> Copy for ProbeLayout<K, V> {}
 
-impl<K, V: AggregationValue> Geometry<K, V> {
+impl<K, V: AggregationValue> ProbeLayout<K, V> {
     /// Map a hash to a slot index using the top bits.
     #[inline(always)]
     fn slot_for(&self, hash: u64) -> usize {
-        ((hash << self.pre_shift) >> self.shift) as usize
+        ((hash << self.hash_left_shift) >> self.slot_shift) as usize
     }
 
     /// The address of the entry at `index`; see
@@ -599,36 +507,36 @@ impl<K, V: AggregationValue> Geometry<K, V> {
         // growth), so take the entry address straight off the slab base: no
         // reciprocal multiply and no dependent base load on the address chain.
         // The branch is fixed per table, so it predicts perfectly either way.
-        if self.bases_len == 1 {
-            return self.first_base.wrapping_add(index * self.stride) as *mut u8;
+        if self.adjusted_bases_len == 1 {
+            return self.first_adjusted_base.wrapping_add(index * self.stride) as *mut u8;
         }
-        let slab_idx = fast_div(index, self.magic);
-        assert!(slab_idx < self.bases_len);
-        let base = unsafe { *self.bases.add(slab_idx) };
+        let slab_idx = fast_div(index, self.entries_per_slab_reciprocal);
+        assert!(slab_idx < self.adjusted_bases_len);
+        let base = unsafe { *self.adjusted_bases.add(slab_idx) };
         base.wrapping_add(index * self.stride) as *mut u8
     }
 
     /// The view of the occupied entry at `entry`'s address, with `hash`
     /// already read.
     #[inline(always)]
-    unsafe fn view<'a>(&self, entry: *const u8, hash: u64) -> EntryView<'a, K, V::Stored> {
+    unsafe fn view<'a>(&self, entry: *const u8, hash: u64) -> EntryView<'a, K, V::EntryState> {
         unsafe {
             EntryView {
                 hash,
                 key: &*(entry.add(self.key_offset) as *const K),
-                stored: V::stored_ref(entry.add(self.value_offset), self.meta),
+                state: V::entry_state_ref(entry.add(self.state_offset), self.state_meta),
             }
         }
     }
 }
 
-/// A probing handle over a mutably borrowed table, carrying its [`Geometry`]
+/// A probing handle over a mutably borrowed table, carrying its [`ProbeLayout`]
 /// in locals. The consume loop creates one per active table and probes through
 /// it row after row, so the layout constants are read once per window, not
 /// re-loaded per row and per probe step.
 pub struct Prober<'t, K: PersistedKey, V: AggregationValue> {
     table: &'t mut BaseHashTable<K, V>,
-    geo: Geometry<K, V>,
+    layout: ProbeLayout<K, V>,
 }
 
 impl<K: PersistedKey, V: AggregationValue> Prober<'_, K, V> {
@@ -637,7 +545,7 @@ impl<K: PersistedKey, V: AggregationValue> Prober<'_, K, V> {
     /// into L1 (`T0`) — use this *near* the access (small lookahead).
     #[inline(always)]
     pub fn prefetch(&self, hash: u64) {
-        let ptr = self.geo.entry_ptr(self.geo.slot_for(hash)) as *const u8;
+        let ptr = self.layout.entry_ptr(self.layout.slot_for(hash)) as *const u8;
         prefetch_l1_line(ptr);
         prefetch_l1_line(ptr.wrapping_add(64));
         prefetch_l1_line(ptr.wrapping_add(128));
@@ -651,53 +559,53 @@ impl<K: PersistedKey, V: AggregationValue> Prober<'_, K, V> {
     /// on a multi-GB table.
     #[inline(always)]
     pub fn prefetch_l2(&self, hash: u64) {
-        prefetch_l2_line(self.geo.entry_ptr(self.geo.slot_for(hash)) as *const u8);
+        prefetch_l2_line(self.layout.entry_ptr(self.layout.slot_for(hash)) as *const u8);
     }
 
-    /// See [`BaseHashTable::undersized`].
+    /// See [`BaseHashTable::needs_growth`].
     #[inline(always)]
-    pub fn undersized(&self) -> bool {
-        self.table.undersized()
+    pub fn needs_growth(&self) -> bool {
+        self.table.needs_growth()
     }
 
-    /// Insert or fold a *stored* value read from another table's entry — the
-    /// partition merge and the node merge. A new key copies the partial in; an
-    /// existing one combines the two partials in place. Thin wrapper over
-    /// [`probe_fold`](Self::probe_fold).
+    /// Merge a state read from another table.
+    ///
+    /// A new group copies `src`; an existing group combines `src` with its
+    /// current state.
     #[inline(always)]
     pub fn merge_from<const COUNT_COLLISIONS: bool, L>(
         &mut self,
         hash: u64,
         key: L,
-        src: &V::Stored,
-        ctx: &V::SharedContext,
+        src: &V::EntryState,
+        ctx: &V::Context,
     ) where
         L: LiveKey<Persisted = K>,
     {
-        self.probe_fold::<COUNT_COLLISIONS, L, &V::Stored, _, _>(
+        self.probe_fold::<COUNT_COLLISIONS, L, &V::EntryState, _, _>(
             hash,
             key,
             src,
-            |src, stored| V::clone_stored(stored, src),
-            |src, stored| V::merge_stored(stored, src, ctx),
+            |src, dst| V::copy_entry(dst, src),
+            |src, dst| V::merge_entries(dst, src, ctx),
         );
     }
 
     /// Grow the table 4x (updating `cap`) if it has crossed its load threshold,
-    /// re-snapshotting the geometry the resize invalidated. The merge's
+    /// re-snapshotting the probe layout the resize invalidated. The merge's
     /// safety-net growth, kept on the prober so the per-row fold loop needn't
     /// give up its snapshot.
     #[inline(always)]
-    pub fn grow_if_full(&mut self, allocator: &mut SlabAllocator, cap: &mut usize) {
-        if self.table.undersized() {
+    pub fn grow_if_needed(&mut self, allocator: &mut SlabAllocator, cap: &mut usize) {
+        if self.table.needs_growth() {
             *cap *= 4;
             self.table.resize(allocator, *cap);
-            self.geo = self.table.geometry();
+            self.layout = self.table.probe_layout();
         }
     }
 
     /// Double the table if cumulative collision pressure is too high (see the
-    /// merge's resize ratio), re-snapshotting the geometry on resize.
+    /// merge's resize ratio), refreshing the probe layout on resize.
     /// `collision_ratio` is the integer threshold: resize once
     /// `collisions > collision_ratio * len`.
     #[inline(always)]
@@ -705,30 +613,22 @@ impl<K: PersistedKey, V: AggregationValue> Prober<'_, K, V> {
         if self.table.collisions() > self.table.len() * collision_ratio {
             let new_size = self.table.capacity() << 1;
             self.table.resize(allocator, new_size);
-            self.geo = self.table.geometry();
+            self.layout = self.table.probe_layout();
         }
     }
 
-    /// Probe for `hash`/`key`, then initialise or fold the value at the
-    /// matched slot — one probe-and-fold pass, the stored-value reference
-    /// handed straight from the matched entry (no second slot lookup). A
-    /// freshly inserted slot calls `seed` (its value bytes are zeroed until
-    /// then); an existing one calls `update`. Splitting the two avoids a
-    /// per-row `is_new` branch and lets each do only its own work (a string
-    /// extreme's `update` can skip persisting a loser).
+    /// Probe for `hash` and `key`, then initialize or update that entry's state.
     ///
-    /// `ctx` is the one per-call value both arms might need — moved into
-    /// whichever arm runs, so they needn't both capture it: the merge phase
-    /// passes the already-materialised value; the consume path passes
-    /// `&mut value_arena`. Because the key is persisted before either arm
-    /// runs, and keys and values live in separate memory, the closure's
-    /// value-arena borrow never aliases the key's.
+    /// A newly claimed slot calls `seed`; a matching slot calls `update`. Both
+    /// closures receive the state reference produced during the probe, so no
+    /// second lookup is needed.
     ///
-    /// Since `hash == 0` is the empty sentinel, a key that legitimately
-    /// hashes to 0 is stored with `hash = 1`; invisible to callers. When
-    /// `COUNT_COLLISIONS` is true, each probe step increments the collision
-    /// counter, so callers can resize on cumulative probe-chain pressure. At
-    /// the 70% max load, the expected probe length is ~1.8 slots.
+    /// `ctx` is moved to the one closure that runs. Consume uses it for
+    /// worker-local aggregation resources; merge uses it for the source state.
+    ///
+    /// Zero hashes are remapped to one because zero marks an empty slot. When
+    /// `COUNT_COLLISIONS` is true, every unsuccessful probe step increments the
+    /// table's collision counter.
     #[inline(always)]
     pub fn probe_fold<const COUNT_COLLISIONS: bool, L, X, S, U>(
         &mut self,
@@ -739,45 +639,52 @@ impl<K: PersistedKey, V: AggregationValue> Prober<'_, K, V> {
         update: U,
     ) where
         L: LiveKey<Persisted = K>,
-        S: FnOnce(X, &mut V::Stored),
-        U: FnOnce(X, &mut V::Stored),
+        S: FnOnce(X, &mut V::EntryState),
+        U: FnOnce(X, &mut V::EntryState),
     {
-        let geo = self.geo;
+        let layout = self.layout;
         // hash == 0 is our empty sentinel, so remap actual zero hashes to 1.
         if hash == 0 {
             hash = 1;
         }
-        let mut idx = geo.slot_for(hash);
+        let mut idx = layout.slot_for(hash);
         loop {
-            let entry = geo.entry_ptr(idx);
+            let entry = layout.entry_ptr(idx);
             unsafe {
-                let hash_ptr = entry.add(geo.hash_offset) as *mut u64;
+                let hash_ptr = entry.add(layout.hash_offset) as *mut u64;
                 if *hash_ptr == 0 {
                     *hash_ptr = hash;
-                    (entry.add(geo.key_offset) as *mut K).write(key.persist());
-                    self.table.length += 1;
-                    seed(ctx, V::stored_mut(entry.add(geo.value_offset), geo.meta));
+                    (entry.add(layout.key_offset) as *mut K).write(key.persist());
+                    self.table.len += 1;
+                    seed(
+                        ctx,
+                        V::entry_state_mut(entry.add(layout.state_offset), layout.state_meta),
+                    );
                     return;
                 }
-                if *hash_ptr == hash && key.eq_persisted(&*(entry.add(geo.key_offset) as *const K))
+                if *hash_ptr == hash
+                    && key.eq_persisted(&*(entry.add(layout.key_offset) as *const K))
                 {
-                    update(ctx, V::stored_mut(entry.add(geo.value_offset), geo.meta));
+                    update(
+                        ctx,
+                        V::entry_state_mut(entry.add(layout.state_offset), layout.state_meta),
+                    );
                     return;
                 }
             }
             if COUNT_COLLISIONS {
                 self.table.collisions += 1;
             }
-            idx = (idx + 1) & geo.mask;
+            idx = (idx + 1) & layout.mask;
         }
     }
 }
 
-/// A read handle over a borrowed table, carrying its [`Geometry`] in locals:
+/// A read handle over a borrowed table, carrying its [`ProbeLayout`] in locals:
 /// the merge phase's linear slot scans read thousands of consecutive slots, so
 /// they too keep the layout in registers.
 pub struct TableReader<'a, K: PersistedKey, V: AggregationValue> {
-    geo: Geometry<K, V>,
+    layout: ProbeLayout<K, V>,
     _table: PhantomData<&'a BaseHashTable<K, V>>,
 }
 
@@ -785,16 +692,16 @@ impl<'a, K: PersistedKey, V: AggregationValue> TableReader<'a, K, V> {
     /// See [`BaseHashTable::hash_at`].
     #[inline(always)]
     pub fn hash_at(&self, index: usize) -> u64 {
-        unsafe { *(self.geo.entry_ptr(index).add(self.geo.hash_offset) as *const u64) }
+        unsafe { *(self.layout.entry_ptr(index).add(self.layout.hash_offset) as *const u64) }
     }
 
     /// See [`BaseHashTable::view_at`].
     #[inline(always)]
-    pub fn view_at(&self, index: usize) -> EntryView<'a, K, V::Stored> {
-        let entry = self.geo.entry_ptr(index);
+    pub fn view_at(&self, index: usize) -> EntryView<'a, K, V::EntryState> {
+        let entry = self.layout.entry_ptr(index);
         unsafe {
-            let hash = *(entry.add(self.geo.hash_offset) as *const u64);
-            self.geo.view(entry, hash)
+            let hash = *(entry.add(self.layout.hash_offset) as *const u64);
+            self.layout.view(entry, hash)
         }
     }
 }
@@ -804,25 +711,25 @@ impl<'a, K: PersistedKey, V: AggregationValue> TableReader<'a, K, V> {
 /// Created by [`BaseHashTable::iter`]. Yields [`EntryView`]s of entries where
 /// `hash != 0` in arbitrary order (based on slot positions, not insertion order).
 pub struct HashTableIterator<'a, K: PersistedKey, V: AggregationValue> {
-    geo: Geometry<K, V>,
+    layout: ProbeLayout<K, V>,
     idx: usize,
     _table: PhantomData<&'a BaseHashTable<K, V>>,
 }
 
 impl<'a, K: PersistedKey, V: AggregationValue> Iterator for HashTableIterator<'a, K, V> {
-    type Item = EntryView<'a, K, V::Stored>;
+    type Item = EntryView<'a, K, V::EntryState>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let geo = self.geo;
-        while self.idx < geo.mask + 1 {
+        let layout = self.layout;
+        while self.idx < layout.mask + 1 {
             // One address computation per slot: the hash check and the yielded
             // view read the same entry pointer.
-            let entry = geo.entry_ptr(self.idx);
+            let entry = layout.entry_ptr(self.idx);
             self.idx += 1;
             unsafe {
-                let hash = *(entry.add(geo.hash_offset) as *const u64);
+                let hash = *(entry.add(layout.hash_offset) as *const u64);
                 if hash != 0 {
-                    return Some(geo.view(entry, hash));
+                    return Some(layout.view(entry, hash));
                 }
             }
         }
@@ -834,7 +741,9 @@ impl<'a, K: PersistedKey, V: AggregationValue> Iterator for HashTableIterator<'a
 mod tests {
     use super::*;
     use crate::memory::init_test_free_pool;
-    use crate::operations::unary::group::values::{AggregationSlot, OwnedValue, ValueColumns};
+    use crate::operations::unary::group::values::{
+        AggregationColumnBuilders, AggregationSlot, ByValueAggregation,
+    };
     use arrow_array::{ArrayRef, RecordBatch};
     use arrow_schema::Field;
 
@@ -843,12 +752,12 @@ mod tests {
     #[derive(Copy, Clone, Default, Debug, PartialEq)]
     struct Count(usize);
 
-    impl OwnedValue for Count {
+    unsafe impl ByValueAggregation for Count {
         type Reader<'b> = ();
-        type SharedContext = ();
+        type Context = ();
         type Columns = CountColumns;
         type SortKey = i64;
-        type WorkerContext = ();
+        type WorkerState = ();
         fn make_reader(_batch: &RecordBatch, _slots: &[AggregationSlot]) {}
         fn value(_reader: &(), _idx: usize, _wc: &mut ()) -> Self {
             Count(1)
@@ -865,14 +774,14 @@ mod tests {
     /// materialise output).
     struct CountColumns;
 
-    impl ValueColumns for CountColumns {
+    impl AggregationColumnBuilders for CountColumns {
         type Value = Count;
         type Context = ();
         fn with_capacity(_allocator: &mut SlabAllocator, _rows: usize, _context: &()) -> Self {
             CountColumns
         }
-        fn push(&mut self, _value: &Count) {}
-        fn push_stored(&mut self, _stored: &Count) {}
+        fn push_owned(&mut self, _value: &Count) {}
+        fn push_entry(&mut self, _stored: &Count) {}
         fn finish(self, _context: &()) -> (Vec<Field>, Vec<ArrayRef>) {
             (Vec::new(), Vec::new())
         }
@@ -918,7 +827,7 @@ mod tests {
         assert_eq!(table.len(), 1);
         let entry = table.iter(0).next().unwrap();
         assert_eq!(*entry.key, 100);
-        assert_eq!(*entry.stored, Count(1));
+        assert_eq!(*entry.state, Count(1));
     }
 
     #[test]
@@ -939,7 +848,7 @@ mod tests {
 
         assert_eq!(table.len(), 1);
         let entry = table.iter(0).next().unwrap();
-        assert_eq!(*entry.stored, Count(3));
+        assert_eq!(*entry.state, Count(3));
     }
 
     #[test]
@@ -988,14 +897,14 @@ mod tests {
             table
                 .prober()
                 .merge_from::<false, _>(i as u64 + 1, i as u64, &Count(1), &());
-            assert!(!table.undersized());
+            assert!(!table.needs_growth());
         }
 
         table
             .prober()
             .merge_from::<false, _>(max_load as u64 + 1, max_load as u64, &Count(1), &());
 
-        assert!(table.undersized());
+        assert!(table.needs_growth());
     }
 
     #[test]
@@ -1103,7 +1012,7 @@ mod tests {
 
         assert_eq!(table.len(), 100);
         for i in 0..100u64 {
-            let found = table.iter(0).any(|e| *e.key == i && e.stored.0 == 1);
+            let found = table.iter(0).any(|e| *e.key == i && e.state.0 == 1);
             assert!(found, "key {} missing or wrong value", i);
         }
     }
@@ -1165,7 +1074,7 @@ mod tests {
 
         assert_eq!(table.len(), 3);
         let merged = table.iter(0).find(|e| *e.key == 1).unwrap();
-        assert_eq!(*merged.stored, Count(2));
+        assert_eq!(*merged.state, Count(2));
         assert!(table.iter(0).any(|e| *e.key == 3));
     }
 

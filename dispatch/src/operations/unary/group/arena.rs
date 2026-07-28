@@ -204,11 +204,11 @@ impl WorkerArena {
         ArenaKey::view(data, self.buffer_index, offset as u32)
     }
 
-    /// Allocate an uninitialised, naturally aligned block of `count` cells of `T`
-    /// from the arena's ring memory and return its address. The pointer is stable
-    /// (ring buffers never move) and the block lives as long as the shared arena,
-    /// so a group value can hold it across the consume, merge, and output phases.
-    /// The caller initialises the cells.
+    /// Reserve an uninitialized, naturally aligned block of `count` cells.
+    ///
+    /// Ring buffers do not move, so the returned address remains stable until
+    /// the shared arena is dropped. The caller must initialize every cell before
+    /// reading or publishing the block.
     #[inline]
     pub fn alloc_cells<T>(&mut self, count: usize) -> *mut T {
         let size = count * size_of::<T>();
@@ -216,8 +216,8 @@ impl WorkerArena {
         let mut offset = self.cursor.next_multiple_of(align_of::<T>());
         if offset + size > BUFFER_SIZE {
             self.add_buffer();
-            // A fresh buffer starts at its 2MB-aligned base, so offset 0 is
-            // aligned for any cell type.
+            // Allocator buffers are 2 MiB aligned, so offset zero satisfies
+            // every supported cell alignment.
             offset = 0;
         }
         self.cursor = offset + size;

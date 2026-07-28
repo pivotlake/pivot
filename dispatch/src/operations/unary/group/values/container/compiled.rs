@@ -1,56 +1,34 @@
-//! [`Compiled`] — a fixed aggregate signature monomorphised over a tuple of
-//! per-slot ops, straight-line with no per-row dispatch.
+//! Fixed-arity, statically typed aggregation.
 //!
-//! A slot is one `(`[`Read`]`, `[`Fold`]`)` pair — named [`Pair`], aliased to
-//! [`CountSlot`]/[`SumSlot`]/… — a whole op with its own input array and its own
-//! cell, so a `Compiled` mixes integer families freely (a `SUM` beside a `MAX`),
-//! each reading its *own typed array* with no per-row dispatch. It is
-//! **numeric-only**: its ops are contextless numeric [`Fold`]s (they take no arena),
-//! so the impl fixes both [`AggregationValue`] contexts to `()` — the
-//! `WorkerContext` consume passes (`&mut ()`) and the `SharedContext` merge/finish
-//! pass (`&()`) are inert. A signature carrying a string extreme — which needs a
-//! real `WorkerArena` to store winners — takes the [`Variable`](super::Variable) path
-//! instead.
+//! Each slot is a [`Pair`] of a typed [`Read`] implementation and a [`Fold`].
+//! The slot tuple determines the accumulator tuple, readers, and output builders
+//! at compile time. The generated row operations are therefore unrolled and
+//! contain no per-slot dispatch.
 //!
-//! There is no per-slot trait and no plumbing trait: a slot's behaviour *is* its
-//! [`Read`] plus its [`Fold`], so `impl_compiled!` emits the whole
-//! [`AggregationValue`] impl for each arity directly, calling those — `R::read` to
-//! pull the value, `F::seed`/`update`/`merge`/`finish` to fold it — unrolled over
-//! the tuple, with the reader/config/column shapes as literal tuples. The lone
-//! [`OpTuple`] trait carries a single associated type (the cell tuple), because a
-//! `Compiled<Ops>` struct declared once over a generic `Ops` has to name its one
-//! stored field's type somehow; it holds no behaviour.
+//! This representation is numeric-only and uses `()` for its query context and
+//! worker state. Signatures containing string extrema use
+//! [`RuntimeAggregation`](super::RuntimeAggregation), which can carry an arena.
 //!
-//! `Pair<R, F>` is only a nominal tag so a slot alias names a single type and the
-//! `Compiled<…>` signature stays shallow (a bare nested `(R, F)` tuple sends the
-//! monomorphisation collector into a loop through the top-k heap). The planner
-//! instantiates the tuple it needs; numeric runtime signatures (shape not known
-//! until plan time) fall back to [`Variable`](super::Variable).
+//! [`Pair`] is a nominal type instead of a nested `(R, F)` tuple because keeping
+//! the generated type shallow avoids a compiler monomorphization cycle when the
+//! value flows through top-k output.
 
 use super::super::cell::Cell;
 use super::super::fold::{Count, Fold, Max, Min, Sum};
 use super::super::read::{IntRead, NoRead, Read};
-use super::super::{AggregationSlot, OwnedValue, ValueColumns};
+use super::super::{AggregationColumnBuilders, AggregationSlot, ByValueAggregation};
 use crate::arrays::SlabColumn;
 use crate::memory::SlabAllocator;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 use std::marker::PhantomData;
 
-/// A `(Read, Fold)` pair as one *nominal* type — a slot. A bare `(R, F)` tuple
-/// would do, but nesting tuples inside a `Compiled<…>` signature blows the
-/// monomorphisation collector when the value flows through the top-k heap; a named
-/// struct keeps the type shallow. It's a pure type tag — never instantiated as a
-/// value (a `Compiled` stores the cells, not the pairs).
+/// A type-level association between one input reader and one aggregate fold.
+///
+/// `Pair` is never instantiated; [`Compiled`] stores only accumulator cells.
 pub struct Pair<R, F>(PhantomData<(R, F)>);
 
-/// Slot aliases — a [`Pair`] named by what it computes, so signatures read
-/// `Compiled<(SumSlot<Int32Type>, CountSlot)>` instead of the raw pairs.
-///
-/// `Count` defaults its accumulator to `i64` (a count never exceeds the row
-/// count); a numeric extreme/sum defaults to `i64` too (pass `i128` for a wide
-/// sum). A string extreme always rides `i128`, since its cell holds a 128-bit
-/// `ArenaKey`.
+/// `COUNT(*)` with accumulator type `A`.
 pub type CountSlot<A = i64> = Pair<NoRead, Count<A>>;
 /// `SUM(col: T)` accumulating in `A` — `SumSlot<T, i128>` is the wide sum.
 pub type SumSlot<T, A = i64> = Pair<IntRead<T>, Sum<A>>;
@@ -58,16 +36,13 @@ pub type SumSlot<T, A = i64> = Pair<IntRead<T>, Sum<A>>;
 pub type MinSlot<T, A = i64> = Pair<IntRead<T>, Min<A>>;
 /// `MAX(col: T)` over an integer column, accumulating in `A`.
 pub type MaxSlot<T, A = i64> = Pair<IntRead<T>, Max<A>>;
-// (No `StrMinSlot`/`StrMaxSlot`: `Compiled` is numeric-only — a string extreme.s
-// `WorkerContext` is `WorkerArena`, not `()` — so a string signature uses `Variable`.)
+// String extrema are intentionally absent: they need an arena and therefore use
+// RuntimeAggregation.
 
-/// What a tuple of slots stores: the parallel tuple of accumulator cells, e.g.
-/// `(i64,)` or `(i128, i64)`. The *only* thing [`Compiled`] needs from `Ops` that
-/// it can't write inline — the struct holds one `Ops::Accs` field, and a struct
-/// declared once over a generic `Ops` has to name that field's type through an
-/// associated type. Every other shape (the reader, the configs, the columns) is a
-/// literal tuple written directly in the macro-generated [`AggregationValue`]
-/// impl, so there is no behaviour here — just the cell type.
+/// Types supplied by a tuple of compiled slots.
+///
+/// The macro writes the operational code directly; this trait only names tuple
+/// types that the generic container structs need in their fields.
 pub trait OpTuple: Send + Sync + 'static {
     /// The per-slot accumulator cells.
     type Accs: Cell;
@@ -105,17 +80,8 @@ impl<Ops: OpTuple> Default for Compiled<Ops> {
     }
 }
 
-/// One per arity: the [`OpTuple`] cell type for a tuple of slots `(Pair<R, F>, …)`,
-/// and the whole [`AggregationValue`] impl for the `Compiled` over it. Each method
-/// unrolls the obvious per-slot call — `R::read` to pull the value,
-/// `F::seed`/`update`/`merge`/`finish` to fold it — and writes the
-/// reader / config / column shapes as literal tuples. The slot's read and fold are
-/// tied by `for<'b> R: Read<Val<'b> = F::Val>`: every row a `Read` yields is
-/// exactly what its `Fold` consumes. Both `F::Val` and `F::Acc` are lifetime-free
-/// (a numeric op folds an owned `()`/`i64`), so the cell tuple names `F::Acc`
-/// directly, with no `for<'b>` projection or `'static` bound. The only aggregate
-/// value that isn't lifetime-free is a string extreme's borrowed `&str`, and those
-/// never take the `Compiled` path.
+/// Generate the tuple plumbing and unrolled aggregation implementation for one
+/// supported arity.
 macro_rules! impl_compiled {
     ($($R:ident $F:ident $idx:tt),+) => {
         impl<$($R, $F),+> OpTuple for ($(Pair<$R, $F>,)+)
@@ -126,19 +92,17 @@ macro_rules! impl_compiled {
             type Cols = ($(SlabColumn<$F::Acc>,)+);
         }
 
-        // `Compiled` is numeric-only — its ops are contextless numeric `Fold`s — so
-        // both its value contexts are concretely `()`: the `&mut ()` consume passes
-        // and the `&()` merge/finish pass are inert (the fold ops take no context).
-        // A signature with a string extreme takes the `Variable` path instead.
-        impl<$($R, $F),+> OwnedValue for Compiled<($(Pair<$R, $F>,)+)>
+        // SAFETY: Every accumulator is a numeric Cell: it is Copy, needs no
+        // destructor, and accepts an all-zero bit pattern.
+        unsafe impl<$($R, $F),+> ByValueAggregation for Compiled<($(Pair<$R, $F>,)+)>
         where
             $($R: Read, $F: Fold, for<'b> $R: Read<Val<'b> = $F::Val>, $F::Acc: Into<i128>,)+
         {
             type Reader<'b> = ($($R::Input<'b>,)+);
-            type SharedContext = ();
+            type Context = ();
             type Columns = CompiledColumns<($(Pair<$R, $F>,)+)>;
             type SortKey = i128;
-            type WorkerContext = ();
+            type WorkerState = ();
 
             fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> Self::Reader<'b> {
                 debug_assert_eq!(slots.len(), [$($idx),+].len(), "slot count must match the tuple arity");
@@ -179,7 +143,7 @@ macro_rules! impl_compiled {
             }
         }
 
-        impl<$($R, $F),+> ValueColumns for CompiledColumns<($(Pair<$R, $F>,)+)>
+        impl<$($R, $F),+> AggregationColumnBuilders for CompiledColumns<($(Pair<$R, $F>,)+)>
         where
             $($R: Read, $F: Fold, for<'b> $R: Read<Val<'b> = $F::Val>, $F::Acc: Into<i128>,)+
         {
@@ -191,13 +155,13 @@ macro_rules! impl_compiled {
             }
 
             #[inline(always)]
-            fn push(&mut self, value: &Self::Value) {
+            fn push_owned(&mut self, value: &Self::Value) {
                 $(self.cols.$idx.push(value.accs.$idx);)+
             }
 
             #[inline(always)]
-            fn push_stored(&mut self, stored: &Self::Value) {
-                self.push(stored);
+            fn push_entry(&mut self, state: &Self::Value) {
+                self.push_owned(state);
             }
 
             fn finish(self, _context: &()) -> (Vec<Field>, Vec<ArrayRef>) {

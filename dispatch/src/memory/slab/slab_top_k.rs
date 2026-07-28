@@ -191,10 +191,10 @@ impl<K: Ord + Copy, V: Copy, A: HeapBuffer<Ranked<K, V>>> SlabTopK<K, V, A> {
         }
     }
 
-    /// Whether an item with `key` would currently be retained by
-    /// [`offer`](Self::offer): the heap is still filling, or the key beats the
-    /// smallest retained one. Lets a caller skip building an expensive `value`
-    /// for an item the heap would discard.
+    /// Whether [`offer`](Self::offer) would retain an item with this key.
+    ///
+    /// Callers use this to avoid constructing an expensive value that would be
+    /// discarded immediately.
     #[inline]
     pub fn would_retain(&mut self, key: K) -> bool {
         self.len < self.cap || (self.cap > 0 && key > self.buf.cursor()[0].key)

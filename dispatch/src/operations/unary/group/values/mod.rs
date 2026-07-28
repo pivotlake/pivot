@@ -1,20 +1,17 @@
-//! Aggregation values for GROUP BY.
+//! Per-group aggregation state and operations.
 //!
-//! An [`AggregationValue`] is the value-side counterpart to a
-//! [`KeyExtractor`](super::keys::KeyExtractor): it *is* the per-group payload
-//! stored in the hash table — read from input rows, folded with other rows and
-//! partials, and emitted as the result's trailing value column(s). Any key shape
-//! pairs with any aggregation value.
+//! [`AggregationValue`] is the value half of a grouped hash-table entry. It
+//! defines how to read an input row, initialize or update one group's state,
+//! merge partial states, and build the result columns. The key half is described
+//! independently by [`KeyExtractor`](super::keys::KeyExtractor), so any supported
+//! key representation can be paired with any aggregation representation.
 //!
-//! It is built from one trait and two containers:
+//! There are two main representations:
 //!
-//! - an **`Aggregation`** op — fully typed to its own input array and cell
-//!   ([`Count`], [`Sum<T>`](Sum), [`Min<T>`](Min), [`Max<T>`](Max), [`StrMin`],
-//!   [`StrMax`]).
-//! - **containers** — [`Compiled`] (a fixed *numeric* tuple
-//!   of ops, branch-free) and [`Variable`] (a runtime
-//!   signature folded per slot, generic over the width — the path for any string
-//!   extreme).
+//! - [`Compiled`] stores a fixed, statically typed tuple of numeric aggregates.
+//! - [`RuntimeAggregation`] stores a query-defined number of homogeneous cells.
+//!   It supports signatures whose arity is not known to Rust's type system and
+//!   is also the representation used for string `MIN` and `MAX`.
 
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
@@ -30,7 +27,10 @@ pub mod fold;
 pub mod read;
 
 pub use cell::{Cell, F64Cell, IntCell};
-pub use container::{Compiled, CountSlot, MaxSlot, MinSlot, OpTuple, SumSlot, Variable};
+pub use container::{
+    Compiled, CountSlot, MaxSlot, MinSlot, OpTuple, RuntimeAggregation, RuntimeAggregationContext,
+    SumSlot,
+};
 pub use distinct::Distinct;
 pub use fold::{
     Count, F64Max, F64Min, F64Sum, Fold, Max, Min, StrMax, StrMin, Sum, U128Max, U128Min, U128Sum,
@@ -38,14 +38,10 @@ pub use fold::{
 };
 pub use read::{IntRead, NoRead, Read, StrRead};
 
-/// Which per-group aggregate a value slot computes during consume — a pure
-/// descriptor the planner attaches to each slot. It tells the numeric
-/// [`Variable`] fallback what to read (a `COUNT` reads no
-/// column; everything else reads its column) and how to fold.
+/// The operation computed by one aggregate output slot.
 ///
 /// `Avg` is not represented: `AVG(c)` is lowered to `sum(c)` + `count(c)` with a
-/// divide projection, so a grouped average arrives as a `Sum` slot plus a `Count`
-/// slot and the division happens downstream.
+/// division projection downstream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AggregationKind {
     /// `COUNT(*)` — +1 per row, ignores the column.
@@ -54,24 +50,19 @@ pub enum AggregationKind {
     Count,
     /// `SUM(col)`.
     Sum,
-    /// `MIN(col)`. The value's family (integer / float / string / wide) is decided
-    /// by the column type at bind, not by the kind — a `Utf8` column reads the
-    /// string extreme, a numeric column the numeric one.
+    /// `MIN(col)`. The input type determines whether this is numeric or textual.
     Min,
     /// `MAX(col)`. See [`Min`](AggregationKind::Min).
     Max,
 }
 
-/// One aggregate output slot: which aggregate, over which input column, and the
-/// Arrow type its output column is declared as.
+/// A bound aggregate output: its operation, input column, and result type.
 ///
-/// The accumulator's *storage* width (`i64` / `i128`) is an execution detail
-/// independent of this declared type: a `COUNT` may sit in an `i128` cell (forced
-/// by a `SUM` sharing a [`Variable`] cell run) yet is always a `BIGINT`, and a
-/// narrow `SUM` accumulates in `i64` yet is always a `HUGEINT`. The slot carries
-/// the type the result column must have, so the output phase renders the
-/// accumulator at its storage width then casts each column to its `output_type`
-/// (a no-op when they already match).
+/// A runtime aggregation may choose one cell width for the whole signature.
+/// That storage width is independent of the SQL result type. For example,
+/// `COUNT` still produces `BIGINT` when it shares an `i128` cell array with a
+/// wide `SUM`. The output phase therefore renders the cell and then casts it to
+/// `output_type` when necessary.
 #[derive(Clone, Debug)]
 pub struct AggregationSlot {
     pub kind: AggregationKind,
@@ -80,8 +71,7 @@ pub struct AggregationSlot {
 }
 
 impl AggregationSlot {
-    /// A slot for `kind` over input `column`, whose result column is declared as
-    /// `output_type` (the planner passes DuckDB's result type for the call).
+    /// Bind `kind` to `column` with the declared result `output_type`.
     pub fn new(kind: AggregationKind, column: usize, output_type: DataType) -> Self {
         Self {
             kind,
@@ -90,12 +80,11 @@ impl AggregationSlot {
         }
     }
 
-    /// Whether this slot is a string extreme (`MIN`/`MAX` over a `Utf8` column),
-    /// whose cell is an [`ArenaKey`](super::ArenaKey). Read off the declared
-    /// `output_type` (`Utf8View`), since the `MIN`/`MAX` kind alone doesn't say — the
-    /// value family is decided by the column type. A signature with any such slot
-    /// must use 128-bit (`i128`) cells and stays off the radix scatter path (which
-    /// would eagerly persist every row's string, winner or not).
+    /// Whether this is string `MIN` or `MAX`.
+    ///
+    /// String states contain an [`ArenaKey`](super::ArenaKey), which requires a
+    /// 128-bit cell. Such signatures also avoid raw radix scatter because scatter
+    /// would persist every candidate string before knowing whether it wins.
     #[inline(always)]
     pub fn is_string_extreme(&self) -> bool {
         matches!(self.kind, AggregationKind::Min | AggregationKind::Max)
@@ -103,11 +92,9 @@ impl AggregationSlot {
     }
 }
 
-/// Cast a rendered value column to its slot's declared `output_type`, rebuilding
-/// the field to match. A no-op (a cheap `Arc` clone) when the rendered type
-/// already equals the declared one, so a slot whose accumulator width is its
-/// output type pays nothing; a `COUNT` rendered from an `i128` cell narrows to
-/// `Int64` here, a narrow `SUM` widens to `Decimal128`.
+/// Cast a rendered accumulator column to its declared result type.
+///
+/// When the types already match, this only clones the column's `Arc`.
 pub(crate) fn cast_value_column(
     field: Field,
     column: ArrayRef,
@@ -121,339 +108,313 @@ pub(crate) fn cast_value_column(
     (field, casted)
 }
 
-/// The shared, read-side context the merge + output phase resolves through — the
-/// counterpart to a value's per-worker [`WorkerContext`]. Built once from the
-/// slots and the value arena (cloned across workers and into the merge jobs).
-/// `()` for a numeric value (it stores nothing); a string-capable value carries
-/// the slot layout and the `Arc<SharedArena>` its keys resolve through.
-pub trait SharedContext: Clone + Send + Sync + 'static {
-    /// The per-worker write side this context spawns for the consume phase.
-    type Worker: WorkerContext;
-    /// Build the context for `slots` over the value `arena`.
+/// Immutable, query-wide information needed by an aggregation representation.
+///
+/// The context is built once and cheaply cloned into workers and merge jobs.
+/// Fixed, numeric representations use `()`. A runtime representation carries
+/// its slot descriptors and the arena used to resolve string states.
+pub trait AggregationContext: Clone + Send + Sync + 'static {
+    /// Mutable worker-local state created from this context.
+    type Worker: AggregationWorkerState;
+    /// Build the query-wide context.
     fn build(slots: &[AggregationSlot], arena: &Arc<SharedArena>) -> Self;
-    /// Spawn a fresh per-worker write context (called once per worker).
+    /// Create state for one worker.
     fn worker(&self) -> Self::Worker;
 }
 
-/// The per-worker, exclusive write side of a value's string storage during
-/// consume. `()` for a numeric value; a [`WorkerArena`] for a string extreme.
-pub trait WorkerContext {
-    /// Hand any active arena buffer back to the shared arena at end of consume.
+/// Worker-local resources used while aggregation states are being written.
+///
+/// Numeric representations use `()`. String-capable representations use a
+/// [`WorkerArena`] and return its active buffer when the worker finishes.
+pub trait AggregationWorkerState {
+    /// Release worker-local resources back to their shared owner.
     fn flush(self);
 }
 
-impl SharedContext for () {
+impl AggregationContext for () {
     type Worker = ();
     fn build(_slots: &[AggregationSlot], _arena: &Arc<SharedArena>) {}
     fn worker(&self) {}
 }
-impl WorkerContext for () {
+impl AggregationWorkerState for () {
     fn flush(self) {}
 }
 
-impl SharedContext for (Arc<[AggregationSlot]>, Arc<SharedArena>) {
-    type Worker = WorkerArena;
-    fn build(slots: &[AggregationSlot], arena: &Arc<SharedArena>) -> Self {
-        (Arc::from(slots), arena.clone())
-    }
-    fn worker(&self) -> WorkerArena {
-        WorkerArena::new(self.1.clone())
-    }
-}
-impl WorkerContext for WorkerArena {
+impl AggregationWorkerState for WorkerArena {
     fn flush(self) {
         WorkerArena::flush(self)
     }
 }
 
-/// Builds the trailing value column(s) of a GROUP BY result, one group at a time:
-/// the value-side counterpart to [`KeyColumns`](super::keys::KeyColumns).
+/// Builds the aggregate columns of a grouped result.
 ///
-/// The output combinator pushes each surviving group's value, then
-/// [`finish`](Self::finish) materialises the Arrow columns and their fields.
-/// `finish` takes the value's [`SharedContext`] so a string extreme can emit
-/// zero-copy `StringView`s into the value arena and a runtime [`Variable`] value
-/// can read each slot's render kind; an all-numeric value ignores it.
-pub trait ValueColumns {
+/// Values are appended one group at a time. [`finish`](Self::finish) converts
+/// the builders into Arrow fields and arrays.
+pub trait AggregationColumnBuilders {
     /// The per-group value these columns accumulate.
     type Value: AggregationValue;
-    /// The owning value's read-side context (see [`AggregationValue::SharedContext`]).
+    /// Query-wide information used while building the columns.
     type Context;
 
-    /// Allocate the value-column builders over engine memory, sized for `rows`
-    /// (one output chunk; must fit a single 2 MB slab). `context` carries the
-    /// slot list a runtime-arity value ([`Variable`]) sizes its builder count
-    /// from; fixed-arity values ignore it.
+    /// Allocate builders for at most `rows` groups.
     fn with_capacity(allocator: &mut SlabAllocator, rows: usize, context: &Self::Context) -> Self;
-    /// Append one finished group's owned value (the top-k heap drain).
-    fn push(&mut self, value: &Self::Value);
-    /// Append one finished group's value straight from its table entry.
-    fn push_stored(&mut self, stored: &<Self::Value as AggregationValue>::Stored);
-    /// Materialise the value columns and their fields. `context` backs the
-    /// zero-copy `StringView` output of a string extreme (numeric columns ignore
-    /// it) and carries the per-slot descriptor a runtime value ([`Variable`]) needs
-    /// to pick each slot's output type.
+    /// Append a value copied out of table storage.
+    fn push_owned(&mut self, value: &Self::Value);
+    /// Append a value directly from a table entry.
+    fn push_entry(&mut self, state: &<Self::Value as AggregationValue>::EntryState);
+    /// Materialize the completed Arrow columns and their fields.
     fn finish(self, context: &Self::Context) -> (Vec<Field>, Vec<ArrayRef>);
 }
 
-/// A fixed-arity aggregation value that is moved around *by value*: what a hash
-/// entry stores for it is the value itself, so every fold produces a new value
-/// from owned inputs. The compile-time-shaped containers ([`Compiled`],
-/// [`Distinct`]) implement this; the blanket impl below lifts any
-/// `OwnedValue` into the storage-generic [`AggregationValue`] the group operator
-/// actually runs on. The runtime-arity [`Variable`] cannot (its entry payload is
-/// a runtime-length cell slice), so it implements [`AggregationValue`] directly.
+/// A fixed-size aggregation whose table state is the value itself.
 ///
-/// Reading and folding are separate so a string extreme can persist lazily: a new
-/// group materialises with [`value`](Self::value), an existing group folds the
-/// next row with [`update_from_reader`](Self::update_from_reader) (which can skip
-/// persisting a row that doesn't win), and two finished partials combine with
-/// [`merge`](Self::merge) (no new materialisation). For values whose fold is the
-/// same elementwise op for rows and partials, `update_from_reader` defaults to
-/// merging the row in.
-pub trait OwnedValue: Copy + Default + Send + Sync + 'static {
+/// [`Compiled`] and [`Distinct`] use this simpler, by-value interface.
+/// [`AggregationValue`] has a blanket implementation that adapts it to in-place
+/// table operations. [`RuntimeAggregation`] cannot use this interface because
+/// its entry state is a dynamically sized slice.
+///
+/// # Safety
+///
+/// The all-zero bit pattern must be a valid value of `Self`. Hash-table slabs
+/// start zeroed and may be viewed as `Self` before a new group is initialized.
+/// `Copy` ensures the value has no destructor and can be relocated byte-for-byte.
+pub unsafe trait ByValueAggregation: Copy + Default + Send + Sync + 'static {
     /// Per-batch reader holding the downcast value columns.
     type Reader<'b>;
-    /// The shared, read-side context [`merge`](Self::merge)/[`ValueColumns::finish`]
-    /// resolve through (slot kinds for [`Variable`] + the value
-    /// arena for a string extreme; `()` otherwise). It builds the per-worker
-    /// [`WorkerContext`](Self::WorkerContext); see [`SharedContext`].
-    type SharedContext: SharedContext<Worker = Self::WorkerContext>;
+    /// Immutable query-wide information used by merge and output.
+    type Context: AggregationContext<Worker = Self::WorkerState>;
     /// The trailing value columns these groups emit (the value-side counterpart
     /// to [`KeyExtractor::Columns`](super::keys::KeyExtractor::Columns)).
-    type Columns: ValueColumns<Value = Self, Context = Self::SharedContext>;
+    type Columns: AggregationColumnBuilders<Value = Self, Context = Self::Context>;
     /// The scalar an `ORDER BY <slot> DESC LIMIT k` sorts on — widened to `i128`
     /// so a wide sum compares at full precision.
     type SortKey: Ord + Copy;
-    /// The per-worker write state consume folds into — `()` for an all-numeric
-    /// signature (so consume threads `&mut ()`, free: a `()` reference can't alias
-    /// the table the probe loop mutates), a real [`WorkerArena`] for a string
-    /// extreme. Spawned from [`SharedContext`](Self::SharedContext) per worker.
-    type WorkerContext: WorkerContext;
+    /// Mutable resources used by one consume worker.
+    type WorkerState: AggregationWorkerState;
 
     /// Bind `batch`'s value columns for the configured `slots`.
     fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> Self::Reader<'b>;
 
-    /// Materialise a brand-new group from row `idx` — the consume path's new-key
-    /// case, and the radix scatter. `wc` is the per-worker write state a string
-    /// extreme persists its winning string into; numeric cells ignore it.
-    fn value(reader: &Self::Reader<'_>, idx: usize, wc: &mut Self::WorkerContext) -> Self;
+    /// Create a new group value from row `idx`.
+    fn value(reader: &Self::Reader<'_>, idx: usize, wc: &mut Self::WorkerState) -> Self;
 
-    /// Fold row `idx` into this (existing) group. Defaults to merging the row's
-    /// [`value`](Self::value) in; a string extreme overrides it to compare against
-    /// the current extreme (resolved via `ctx`) and persist only when it wins.
+    /// Fold row `idx` into an existing group.
+    ///
+    /// The default creates a one-row value and merges it.
     #[inline(always)]
     fn update_from_reader(
         self,
         reader: &Self::Reader<'_>,
         idx: usize,
-        wc: &mut Self::WorkerContext,
-        ctx: &Self::SharedContext,
+        wc: &mut Self::WorkerState,
+        ctx: &Self::Context,
     ) -> Self {
         self.merge(Self::value(reader, idx, wc), ctx)
     }
 
     /// Combine two partial group values — the partition merge and the radix fold.
-    fn merge(self, other: Self, ctx: &Self::SharedContext) -> Self;
+    fn merge(self, other: Self, ctx: &Self::Context) -> Self;
 
     /// This group's value for slot `slot`, as an `ORDER BY` sort key.
     fn sort_key(&self, slot: usize) -> Self::SortKey;
 }
 
-/// The per-group aggregation value as the GROUP BY operator sees it: read from
-/// input rows, folded *in place* inside a hash-table entry, and emitted as the
-/// result's value columns.
+/// Describes the aggregation state stored in each grouped hash-table entry.
 ///
-/// The table never holds `Self` directly; it holds [`Stored`](Self::Stored), the
-/// entry-resident form the fold methods mutate through a reference. For every
-/// fixed-arity value `Stored = Self` (the blanket impl over [`OwnedValue`]
-/// forwards each in-place op to the by-value fold). For the runtime-arity
-/// [`Variable`], `Stored = [A]` — a cell slice living inline in the entry at a
-/// stride fixed per query — and `Self` is a thin owned handle used only where an
-/// owned, `Sized` value is unavoidable (a radix scatter row, a top-k heap row).
+/// `Self` is the sized value used by paths that must own a result, such as a
+/// top-k heap. [`EntryState`](Self::EntryState) is the representation stored
+/// inline in the table and may be dynamically sized. They are the same type for
+/// fixed aggregations; runtime aggregation uses `[A]` as its entry state and a
+/// small arena-backed handle as `Self`.
 ///
-/// The table's entries are raw bytes at a per-table stride, so the value also
-/// tells the table how large its stored form is and how to view an entry's
-/// value bytes as `Stored`, via [`StoredMeta`](Self::StoredMeta) (the one
-/// runtime fact needed: nothing for a fixed-arity value, the slot count for
-/// [`Variable`]).
+/// # Safety
 ///
-/// `Self` (not `Stored`) still travels through the owned side paths, which is
-/// why the trait keeps the `Copy` bound.
-pub trait AggregationValue: Copy + Default + Send + Sync + 'static {
+/// Implementations define references into raw, zero-filled table storage and
+/// must uphold all of these requirements:
+///
+/// - `entry_state_size`, `entry_state_align`, and the two view methods must
+///   describe the same layout for a given `EntryStateMeta`.
+/// - An all-zero region of that layout must be a valid `EntryState`. Empty slots
+///   may be viewed before their hash is checked.
+/// - The state must require no destructor and remain valid when its raw bytes are
+///   relocated during table growth.
+/// - `entry_state_ref` and `entry_state_mut` must construct references with the
+///   exact extent and alignment described by the metadata.
+///
+/// `Self: Copy` supplies the corresponding no-destructor and relocation
+/// guarantee for values copied out of the table.
+pub unsafe trait AggregationValue: Copy + Default + Send + Sync + 'static {
     /// The entry-resident form of one group's value; what the fold methods
     /// mutate in place. `Self` for a fixed-arity value; a runtime-length cell
-    /// slice for [`Variable`].
-    type Stored: ?Sized + Send + Sync;
-    /// The runtime fact needed to size and view a stored value: `()` for a
-    /// fixed-arity value, the slot count for [`Variable`]. Held once per hash
-    /// table, never per value.
-    type StoredMeta: Copy + Send + Sync + 'static;
+    /// slice for [`RuntimeAggregation`].
+    type EntryState: ?Sized + Send + Sync;
+    /// Per-table metadata needed to size and view an entry state.
+    type EntryStateMeta: Copy + Send + Sync + 'static;
     /// The radix scatter's per-partition row buffer for this value: typed
     /// tuples for a fixed-arity value, runtime-strided rows (cells inline,
-    /// like a hash entry) for [`Variable`]. Rows are seeded in place, so
+    /// like a hash entry) for [`RuntimeAggregation`]. Rows are seeded in place, so
     /// scattering allocates nothing per row.
-    type Scatter<KP: PersistedKey>: ScatterRows<KP, Self>;
+    type ScatterBuffer<KP: PersistedKey>: ScatterRows<KP, Self>;
     /// Per-batch reader holding the downcast value columns.
     type Reader<'b>;
     /// The shared, read-side context the merge and output phases resolve
-    /// through; see [`OwnedValue::SharedContext`].
-    type SharedContext: SharedContext<Worker = Self::WorkerContext>;
+    /// through; see [`ByValueAggregation::Context`].
+    type Context: AggregationContext<Worker = Self::WorkerState>;
     /// The trailing value columns these groups emit.
-    type Columns: ValueColumns<Value = Self, Context = Self::SharedContext>;
+    type Columns: AggregationColumnBuilders<Value = Self, Context = Self::Context>;
     /// The scalar an `ORDER BY <slot> DESC LIMIT k` sorts on.
     type SortKey: Ord + Copy;
     /// The per-worker write state consume folds into; see
-    /// [`OwnedValue::WorkerContext`].
-    type WorkerContext: WorkerContext;
+    /// [`ByValueAggregation::WorkerState`].
+    type WorkerState: AggregationWorkerState;
 
     /// Bind `batch`'s value columns for the configured `slots`.
     fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> Self::Reader<'b>;
 
     /// The runtime metadata for this query's signature, read off the shared
     /// context once per table.
-    fn stored_meta(ctx: &Self::SharedContext) -> Self::StoredMeta;
+    fn entry_state_meta(ctx: &Self::Context) -> Self::EntryStateMeta;
 
-    /// The byte size of one stored value.
-    fn stored_size(meta: Self::StoredMeta) -> usize;
+    /// The byte size of one entry state.
+    fn entry_state_size(meta: Self::EntryStateMeta) -> usize;
 
-    /// The alignment of one stored value.
-    fn stored_align(meta: Self::StoredMeta) -> usize;
+    /// The required alignment of one entry state.
+    fn entry_state_align(meta: Self::EntryStateMeta) -> usize;
 
-    /// View an entry's value bytes as the stored form.
+    /// View an entry's state bytes.
     ///
     /// # Safety
-    /// `ptr` must point at [`stored_size`](Self::stored_size) bytes aligned to
-    /// [`stored_align`](Self::stored_align), valid for the returned lifetime,
+    /// `ptr` must point at [`entry_state_size`](Self::entry_state_size) bytes aligned to
+    /// [`entry_state_align`](Self::entry_state_align), valid for the returned lifetime,
     /// and `meta` must be the table's own.
-    unsafe fn stored_ref<'a>(ptr: *const u8, meta: Self::StoredMeta) -> &'a Self::Stored;
+    unsafe fn entry_state_ref<'a>(
+        ptr: *const u8,
+        meta: Self::EntryStateMeta,
+    ) -> &'a Self::EntryState;
 
-    /// Mutable counterpart of [`stored_ref`](Self::stored_ref).
+    /// Mutable counterpart of [`entry_state_ref`](Self::entry_state_ref).
     ///
     /// # Safety
-    /// As [`stored_ref`](Self::stored_ref), plus `ptr` must be exclusive for
+    /// As [`entry_state_ref`](Self::entry_state_ref), plus `ptr` must be exclusive for
     /// the returned lifetime.
-    unsafe fn stored_mut<'a>(ptr: *mut u8, meta: Self::StoredMeta) -> &'a mut Self::Stored;
+    unsafe fn entry_state_mut<'a>(
+        ptr: *mut u8,
+        meta: Self::EntryStateMeta,
+    ) -> &'a mut Self::EntryState;
 
     /// Materialise a brand-new group from row `idx` into `dst` — the consume
     /// path's new-key case.
-    fn seed_stored(
-        dst: &mut Self::Stored,
+    fn seed_entry(
+        dst: &mut Self::EntryState,
         reader: &Self::Reader<'_>,
         idx: usize,
-        wc: &mut Self::WorkerContext,
+        wc: &mut Self::WorkerState,
     );
 
     /// Fold row `idx` into the existing group at `dst`.
-    fn update_stored(
-        dst: &mut Self::Stored,
+    fn update_entry(
+        dst: &mut Self::EntryState,
         reader: &Self::Reader<'_>,
         idx: usize,
-        wc: &mut Self::WorkerContext,
-        ctx: &Self::SharedContext,
+        wc: &mut Self::WorkerState,
+        ctx: &Self::Context,
     );
 
     /// Combine two partial group values in place — the partition merge.
-    fn merge_stored(dst: &mut Self::Stored, src: &Self::Stored, ctx: &Self::SharedContext);
+    fn merge_entries(dst: &mut Self::EntryState, src: &Self::EntryState, ctx: &Self::Context);
 
     /// Copy a finished partial into a freshly claimed entry (the merge's
     /// new-key case; `dst` is zeroed).
-    fn clone_stored(dst: &mut Self::Stored, src: &Self::Stored);
+    fn copy_entry(dst: &mut Self::EntryState, src: &Self::EntryState);
 
     /// The group's value for slot `slot`, as an `ORDER BY` sort key.
-    fn sort_key_stored(stored: &Self::Stored, slot: usize) -> Self::SortKey;
+    fn entry_sort_key(state: &Self::EntryState, slot: usize) -> Self::SortKey;
 
     /// Copy a table-resident value out into an owned one that survives its
     /// table — a top-k heap row. A fixed-arity value is its own owned form; a
     /// runtime-arity value copies its cells into the value arena, spawning the
     /// per-worker write handle into `wc` on first use (the caller flushes it).
-    fn to_owned(
-        stored: &Self::Stored,
-        ctx: &Self::SharedContext,
-        wc: &mut Option<Self::WorkerContext>,
+    fn copy_out(
+        state: &Self::EntryState,
+        ctx: &Self::Context,
+        wc: &mut Option<Self::WorkerState>,
     ) -> Self;
 }
 
-/// Every fixed-arity (by-value) container is an [`AggregationValue`] whose
-/// stored form is itself: each in-place op reads the entry, runs the by-value
-/// fold, and writes the result back — which is exactly what the pre-storage
-/// table did, so codegen is unchanged.
-impl<T: OwnedValue> AggregationValue for T {
-    type Stored = T;
-    type StoredMeta = ();
-    type Scatter<KP: PersistedKey> = SizedScatterRows<KP, T>;
-    type Reader<'b> = <T as OwnedValue>::Reader<'b>;
-    type SharedContext = <T as OwnedValue>::SharedContext;
-    type Columns = <T as OwnedValue>::Columns;
-    type SortKey = <T as OwnedValue>::SortKey;
-    type WorkerContext = <T as OwnedValue>::WorkerContext;
+/// Adapt a fixed-size by-value aggregation to the table's in-place interface.
+///
+/// The entry state is `T`, so each operation loads the value, applies the
+/// by-value operation, and writes it back.
+// SAFETY: ByValueAggregation requires zero-valid, byte-relocatable state. This
+// adapter uses exactly T's size and alignment and casts only suitably laid-out
+// table storage to T.
+unsafe impl<T: ByValueAggregation> AggregationValue for T {
+    type EntryState = T;
+    type EntryStateMeta = ();
+    type ScatterBuffer<KP: PersistedKey> = SizedScatterRows<KP, T>;
+    type Reader<'b> = <T as ByValueAggregation>::Reader<'b>;
+    type Context = <T as ByValueAggregation>::Context;
+    type Columns = <T as ByValueAggregation>::Columns;
+    type SortKey = <T as ByValueAggregation>::SortKey;
+    type WorkerState = <T as ByValueAggregation>::WorkerState;
 
     fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> Self::Reader<'b> {
-        <T as OwnedValue>::make_reader(batch, slots)
+        <T as ByValueAggregation>::make_reader(batch, slots)
     }
 
-    fn stored_meta(_ctx: &Self::SharedContext) {}
+    fn entry_state_meta(_ctx: &Self::Context) {}
 
-    fn stored_size(_meta: ()) -> usize {
+    fn entry_state_size(_meta: ()) -> usize {
         size_of::<T>()
     }
 
-    fn stored_align(_meta: ()) -> usize {
+    fn entry_state_align(_meta: ()) -> usize {
         align_of::<T>()
     }
 
     #[inline(always)]
-    unsafe fn stored_ref<'a>(ptr: *const u8, _meta: ()) -> &'a T {
+    unsafe fn entry_state_ref<'a>(ptr: *const u8, _meta: ()) -> &'a T {
         unsafe { &*(ptr as *const T) }
     }
 
     #[inline(always)]
-    unsafe fn stored_mut<'a>(ptr: *mut u8, _meta: ()) -> &'a mut T {
+    unsafe fn entry_state_mut<'a>(ptr: *mut u8, _meta: ()) -> &'a mut T {
         unsafe { &mut *(ptr as *mut T) }
     }
 
     #[inline(always)]
-    fn seed_stored(
-        dst: &mut T,
-        reader: &Self::Reader<'_>,
-        idx: usize,
-        wc: &mut Self::WorkerContext,
-    ) {
-        *dst = <T as OwnedValue>::value(reader, idx, wc);
+    fn seed_entry(dst: &mut T, reader: &Self::Reader<'_>, idx: usize, wc: &mut Self::WorkerState) {
+        *dst = <T as ByValueAggregation>::value(reader, idx, wc);
     }
 
     #[inline(always)]
-    fn update_stored(
+    fn update_entry(
         dst: &mut T,
         reader: &Self::Reader<'_>,
         idx: usize,
-        wc: &mut Self::WorkerContext,
-        ctx: &Self::SharedContext,
+        wc: &mut Self::WorkerState,
+        ctx: &Self::Context,
     ) {
         *dst = dst.update_from_reader(reader, idx, wc, ctx);
     }
 
     #[inline(always)]
-    fn merge_stored(dst: &mut T, src: &T, ctx: &Self::SharedContext) {
+    fn merge_entries(dst: &mut T, src: &T, ctx: &Self::Context) {
         *dst = dst.merge(*src, ctx);
     }
 
     #[inline(always)]
-    fn clone_stored(dst: &mut T, src: &T) {
+    fn copy_entry(dst: &mut T, src: &T) {
         *dst = *src;
     }
 
     #[inline(always)]
-    fn sort_key_stored(stored: &T, slot: usize) -> Self::SortKey {
-        stored.sort_key(slot)
+    fn entry_sort_key(state: &T, slot: usize) -> Self::SortKey {
+        state.sort_key(slot)
     }
 
     #[inline(always)]
-    fn to_owned(
-        stored: &T,
-        _ctx: &Self::SharedContext,
-        _wc: &mut Option<Self::WorkerContext>,
-    ) -> Self {
-        *stored
+    fn copy_out(state: &T, _ctx: &Self::Context, _wc: &mut Option<Self::WorkerState>) -> Self {
+        *state
     }
 }

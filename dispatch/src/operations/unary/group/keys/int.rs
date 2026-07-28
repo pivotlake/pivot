@@ -15,7 +15,9 @@ use std::sync::Arc;
 /// be used directly as hash table keys without indirection.
 macro_rules! impl_persisted_key {
     ($($t:ty),*) => {
-        $(impl PersistedKey for $t {})*
+        // SAFETY: Every integer accepts the all-zero bit pattern, is Copy, and
+        // contains no out-of-line data.
+        $(unsafe impl PersistedKey for $t {})*
     }
 }
 

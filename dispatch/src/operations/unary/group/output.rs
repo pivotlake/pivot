@@ -25,7 +25,7 @@ use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::Table;
 use crate::operations::unary::group::keys::{KeyColumns, KeyExtractor};
 use crate::operations::unary::group::values::{
-    AggregationValue, ValueColumns, WorkerContext, cast_value_column,
+    AggregationColumnBuilders, AggregationValue, AggregationWorkerState, cast_value_column,
 };
 
 use super::{GroupLimit, Result};
@@ -89,9 +89,9 @@ impl<K: KeyExtractor, V: AggregationValue> TopKHeap<K, V> {
 /// Offer every group in `table` into `heap`, keyed by the sort key of aggregate
 /// `slot`. The heap retains the top rows by that key.
 ///
-/// The heap must hold *owned* values (its rows outlive the table), so a
-/// retained entry's stored value is copied out via
-/// [`AggregationValue::to_owned`]. The retention check runs first so only rows
+/// The heap must hold *owned* values because its rows outlive the table. A
+/// retained entry's state is therefore copied out through
+/// [`AggregationValue::copy_out`]. The retention check runs first so only rows
 /// the heap actually keeps pay the copy: for a fixed-arity value the copy is
 /// free, but a runtime-arity value copies its cells into the value arena
 /// (through `owned_wc`, spawned on first use and flushed by the accumulator
@@ -101,17 +101,17 @@ fn offer_all<K, V, A>(
     slot: usize,
     table: &Table<K, V>,
     allocator: &mut SlabAllocator,
-    ctx: &V::SharedContext,
-    owned_wc: &mut Option<V::WorkerContext>,
+    ctx: &V::Context,
+    owned_wc: &mut Option<V::WorkerState>,
 ) where
     K: KeyExtractor,
     V: AggregationValue,
     A: HeapBuffer<Ranked<V::SortKey, (K::Persisted, V)>>,
 {
     for entry in table.iter(0) {
-        let sort = V::sort_key_stored(entry.stored, slot);
+        let sort = V::entry_sort_key(entry.state, slot);
         if heap.would_retain(sort) {
-            let value = V::to_owned(entry.stored, ctx, owned_wc);
+            let value = V::copy_out(entry.state, ctx, owned_wc);
             heap.offer(allocator, sort, (*entry.key, value));
         }
     }
@@ -158,7 +158,7 @@ impl<K: KeyExtractor, V: AggregationValue> OutputMode<K, V> {
 /// radix path's small buckets still prune (see [`TopKHeap`]).
 ///
 /// The per-output-phase constants (`key_arena`, `output_buffers`, `key_config`,
-/// `shared_context`) are captured once at construction, so the final flush needs
+/// `value_context`) are captured once at construction, so the final flush needs
 /// no live job in hand.
 pub(crate) struct OutputAccumulator<K: KeyExtractor, V: AggregationValue> {
     /// The key and value column builders for the batch currently filling. Sized to
@@ -176,15 +176,15 @@ pub(crate) struct OutputAccumulator<K: KeyExtractor, V: AggregationValue> {
     key_arena: Arc<SharedArena>,
     output_buffers: Arc<[Buffer]>,
     key_config: K::Config,
-    shared_context: V::SharedContext,
+    value_context: V::Context,
     /// Declared output type per value column, in slot order; each finished value
     /// column is cast to its type (see [`emit`](Self::emit)).
     value_output_types: Arc<[DataType]>,
-    /// The per-worker write handle a top-k offer's [`AggregationValue::to_owned`]
+    /// The per-worker write handle a top-k offer's [`AggregationValue::copy_out`]
     /// copies runtime-arity cells through. Spawned lazily by the first copy that
     /// needs it, flushed (returned to the arena, never dropped: the arena's ring
     /// buffers must stay owned) right after the heap drains.
-    owned_copy_context: Option<V::WorkerContext>,
+    owned_copy_context: Option<V::WorkerState>,
 }
 
 impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
@@ -194,7 +194,7 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
         key_arena: Arc<SharedArena>,
         output_buffers: Arc<[Buffer]>,
         key_config: K::Config,
-        shared_context: V::SharedContext,
+        value_context: V::Context,
         value_output_types: Arc<[DataType]>,
     ) -> Self {
         // A pushed LIMIT caps the rows this worker ever emits, so its builders never
@@ -204,14 +204,14 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
         });
         Self {
             keys: K::Columns::with_capacity(allocator, builder_cap, &key_config),
-            values: V::Columns::with_capacity(allocator, builder_cap, &shared_context),
+            values: V::Columns::with_capacity(allocator, builder_cap, &value_context),
             builder_cap,
             len: 0,
             mode: OutputMode::new(allocator, output_limit),
             key_arena,
             output_buffers,
             key_config,
-            shared_context,
+            value_context,
             value_output_types,
             owned_copy_context: None,
         }
@@ -219,9 +219,9 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
 
     /// Append one group straight from its table entry.
     #[inline]
-    fn push_entry(&mut self, key: &K::Persisted, stored: &V::Stored) {
+    fn push_entry(&mut self, key: &K::Persisted, state: &V::EntryState) {
         self.keys.push(key);
-        self.values.push_stored(stored);
+        self.values.push_entry(state);
         self.len += 1;
     }
 
@@ -229,7 +229,7 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
     #[inline]
     fn push_owned(&mut self, key: &K::Persisted, value: &V) {
         self.keys.push(key);
-        self.values.push(value);
+        self.values.push_owned(value);
         self.len += 1;
     }
 
@@ -254,7 +254,7 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
         {
             let Self {
                 mode,
-                shared_context,
+                value_context,
                 owned_copy_context,
                 ..
             } = self;
@@ -265,7 +265,7 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
                         *slot,
                         &table,
                         allocator,
-                        shared_context,
+                        value_context,
                         owned_copy_context,
                     );
                     return Ok(());
@@ -276,7 +276,7 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
                         *slot,
                         &table,
                         allocator,
-                        shared_context,
+                        value_context,
                         owned_copy_context,
                     );
                     return Ok(());
@@ -294,7 +294,7 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
                         break;
                     }
                     remaining -= 1;
-                    self.push_entry(entry.key, entry.stored);
+                    self.push_entry(entry.key, entry.state);
                     self.flush_if_full(allocator, sender)?;
                 }
                 self.mode = OutputMode::First { remaining };
@@ -302,7 +302,7 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
             // No pushdown: every group streams into the builders.
             OutputMode::Unlimited => {
                 for entry in table.iter(0) {
-                    self.push_entry(entry.key, entry.stored);
+                    self.push_entry(entry.key, entry.state);
                     self.flush_if_full(allocator, sender)?;
                 }
             }
@@ -366,7 +366,7 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
         );
         let values = std::mem::replace(
             &mut self.values,
-            V::Columns::with_capacity(allocator, self.builder_cap, &self.shared_context),
+            V::Columns::with_capacity(allocator, self.builder_cap, &self.value_context),
         );
         self.len = 0;
         self.emit(keys, values, allocator, sender)
@@ -374,7 +374,7 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
 
     /// Build the accumulated key and value columns into one `RecordBatch` and send
     /// it. Reads the per-output-phase state (`key_arena`, `output_buffers`,
-    /// `shared_context`) straight off `self`; the caller hands over the filled
+    /// `value_context`) straight off `self`; the caller hands over the filled
     /// builders to finish.
     fn emit<Snd: Sender<RecordBatch>>(
         &self,
@@ -385,7 +385,7 @@ impl<K: KeyExtractor, V: AggregationValue> OutputAccumulator<K, V> {
     ) -> Result<()> {
         let (mut fields, mut columns) =
             keys.finish(&self.key_arena, &self.output_buffers, allocator);
-        let (value_fields, value_columns) = values.finish(&self.shared_context);
+        let (value_fields, value_columns) = values.finish(&self.value_context);
         // The accumulator renders each value at its storage width; cast it to the
         // slot's declared output type (zero-cost when they already match).
         for ((field, column), output_type) in value_fields

@@ -80,8 +80,8 @@ use criterion::{BatchSize, Criterion, Throughput, black_box};
 use dispatch::{
     AggregationKind, AggregationSlot, Compiled, Contains, CountSlot, DataFlowDispatcher, Dispatch,
     Distinct, GroupLimit, IntKeyExtractor, IntPairKeyExtractor, IntStrKeyExtractor, OrderBy,
-    RecordBatchOperatorSpec, RowKeyExtractor, RowKeySchema, StringKeyExtractor, SumSlot, Variable,
-    memory_ctx, values_input,
+    RecordBatchOperatorSpec, RowKeyExtractor, RowKeySchema, RuntimeAggregation, StringKeyExtractor,
+    SumSlot, memory_ctx, values_input,
 };
 
 // ---------------------------------------------------------------------------
@@ -667,12 +667,9 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
         );
     }
 
-    // (h) Composite low-card-ish key (i16, i32) with aggregates, behind a
-    //     non-empty free-text filter — the lower-cardinality sibling of (g),
-    //     using the runtime-signature `Variable` value. Its slots are all additive
-    //     (COUNT/SUM), so it takes the `ONLY_ADDITIVE` form the planner routes an
-    //     all-additive signature to: a branch-free additive fold, not the per-slot
-    //     kind dispatch.
+    // (h) The lower-cardinality counterpart of (g), using the runtime
+    //     aggregation representation. All slots are COUNT or integer SUM, so
+    //     this exercises its ALL_ADDITIVE specialization.
     {
         let slots = vec![
             AggregationSlot::new(AggregationKind::CountStar, 0, DataType::Int64),
@@ -720,7 +717,7 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
             },
             move |s| {
                 s.filter(|| move |b: RecordBatch| keep_nonempty(b, 4))
-                    .group_by_aggregate::<IntPairKeyExtractor<Int16Type, Int32Type>, Variable<i64, true>>(
+                    .group_by_aggregate::<IntPairKeyExtractor<Int16Type, Int32Type>, RuntimeAggregation<i64, true>>(
                         vec![0, 1],
                         slots.clone(),
                         Some(GroupLimit::TopK { slot: 0, limit: 10 }),

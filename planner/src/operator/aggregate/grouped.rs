@@ -4,10 +4,8 @@
 //! DuckDB lowers grouped `AVG(c)` to `sum(c)`+`count(c)` with a downstream
 //! divide, so the node here only ever holds count/sum/min/max slots.
 //!
-//! Lowering is pure monomorphisation dispatch over two independent axes — the
-//! group **key** and the **value** — both taken as type parameters by the group
-//! operator, so the code is a tree of small `match`es each selecting one
-//! concrete type:
+//! Lowering selects concrete types for two independent parts of the operator:
+//! the group key and the aggregation state.
 //!
 //! * **key** — a single integer/string column gets its dedicated extractor
 //!   ([`IntKeyExtractor`]/[`StringKeyExtractor`]); two integer keys pack into
@@ -17,12 +15,11 @@
 //!   first materialised into leading columns (see
 //!   [`Aggregate::materialize_inputs`]), so from the dispatch's view every key
 //!   and aggregate argument is a column.
-//! * **value** — recognised signatures lower to a branch-free [`Compiled`]
-//!   tuple; every other shape folds each slot by kind in the runtime-arity
-//!   [`Variable`] (numeric, string, or mixed; branch-free `+` when
-//!   all-additive), in `i128` when a slot needs the width (see [`Aggregate`]'s
-//!   rule) else the narrow `i64`. The slot count is fixed at query build, so
-//!   one container covers every arity.
+//! * **value** — a few common signatures use a branch-free [`Compiled`] tuple.
+//!   Every other signature uses [`RuntimeAggregation`], whose slot count is
+//!   fixed when the query is built. It chooses `i128` when any slot needs the
+//!   width and `i64` otherwise; all-additive signatures use their specialized
+//!   merge path.
 
 use super::{Aggregate, aggregation_slots, row_key_schema, sum_reads_wide_column};
 use crate::compile::{Error, ExprEvalFn, ExprFn};
@@ -34,7 +31,7 @@ use arrow_schema::{DataType, Field, Schema};
 use dispatch::{
     AggregationKind, AggregationSlot, Compiled, CountSlot, Distinct, GroupLimit, IntKeyExtractor,
     IntPairKeyExtractor, IntStrKeyExtractor, RecordBatchOperatorSpec, RowKeyExtractor,
-    StringKeyExtractor, SumSlot, Variable,
+    RuntimeAggregation, StringKeyExtractor, SumSlot,
 };
 use std::sync::Arc;
 
@@ -539,9 +536,8 @@ macro_rules! select_key_extractor {
 /// `keys`/`slots` are already resolved to input column indices and kinds.
 /// `sig` selects a hand-written, branch-free [`Compiled`] tuple for the few
 /// signatures worth specialising; any shape it doesn't list folds per-slot in
-/// [`Dynamic`]. `wide` requests the `i128` cell (a string extreme needs its
-/// 128-bit `ArenaKey`, or a `SUM` can overflow `i64`); `output_limit` is the
-/// per-partition LIMIT pushed into this level, or `None` to emit every group.
+/// [`RuntimeAggregation`]. `wide` selects an `i128` cell for string handles or
+/// wide sums. `output_limit` is the limit pushed into this aggregation level.
 pub(super) fn dispatch_group_by(
     input: RecordBatchOperatorSpec,
     keys: &[(usize, Type)],
@@ -552,12 +548,9 @@ pub(super) fn dispatch_group_by(
 ) -> Result<RecordBatchOperatorSpec, Error> {
     let key_cols: Vec<usize> = keys.iter().map(|(col, _)| *col).collect();
 
-    // Whether every slot folds additively (COUNT/SUM, no MIN/MAX or string
-    // extreme): the `ONLY_ADDITIVE` `Dynamic` then merges branch-free (`a + b`) and
-    // prunes its non-additive arms, skipping the per-slot kind dispatch (~1.5-2% on
-    // a low-card grouped aggregate). A float `SUM` (a floating `output_type`) is
-    // excluded: its cell holds `f64` bits, so the branch-free integer `a + b` would
-    // corrupt it.
+    // COUNT and integer SUM share the same cell addition, so their runtime
+    // representation can bypass per-slot merge dispatch. Float SUM is excluded
+    // because its cell contains encoded floating-point bits.
     let all_additive = slots.iter().all(|s| {
         matches!(
             s.kind,
@@ -575,26 +568,21 @@ pub(super) fn dispatch_group_by(
             Ok(input.group_by_aggregate::<$K, $V>(key_cols, slots, output_limit, $cfg))
         };
     }
-    // The generic value fallback: fold each slot by kind (or branch-free `+`
-    // when additive) in `Variable<acc, ADDITIVE>`, whose slot count is fixed at
-    // query build rather than monomorphised, so one container covers every
-    // arity. Numeric, string (`acc = i128`), and mixed alike, since the fold
-    // dispatches per slot.
-    macro_rules! dynamic {
+    // The fallback selects only cell width and the additive specialization;
+    // slot count and operations remain query data in RuntimeAggregation.
+    macro_rules! runtime_value {
         ($K:ty, $cfg:expr) => {
             match (wide, all_additive) {
                 _ if slots.is_empty() => Err(Error::UnsupportedAggregateExpressionAmount(0)),
-                (true, true) => build_group_by!($K, Variable<i128, true>, $cfg),
-                (true, false) => build_group_by!($K, Variable<i128, false>, $cfg),
-                (false, true) => build_group_by!($K, Variable<i64, true>, $cfg),
-                (false, false) => build_group_by!($K, Variable<i64, false>, $cfg),
+                (true, true) => build_group_by!($K, RuntimeAggregation<i128, true>, $cfg),
+                (true, false) => build_group_by!($K, RuntimeAggregation<i128, false>, $cfg),
+                (false, true) => build_group_by!($K, RuntimeAggregation<i64, true>, $cfg),
+                (false, false) => build_group_by!($K, RuntimeAggregation<i64, false>, $cfg),
             }
         };
     }
-    // The value-container selection (the continuation `select_key_extractor!`
-    // calls once it has picked a key): a few signatures are worth a hand-written,
-    // branch-free `Compiled` tuple; everything else folds per-slot in `Dynamic`.
-    // Add a signature here to specialise it. Ends at the `build_group_by!` leaf.
+    // After the key type is known, select one of the explicitly specialized
+    // signatures or use the runtime representation.
     macro_rules! select_value {
         ($K:ty, $cfg:expr) => {
             match sig {
@@ -606,7 +594,7 @@ pub(super) fn dispatch_group_by(
                     Compiled<(CountSlot, SumSlot<Int16Type>, SumSlot<Int16Type>)>,
                     $cfg
                 ),
-                _ => dynamic!($K, $cfg),
+                _ => runtime_value!($K, $cfg),
             }
         };
     }

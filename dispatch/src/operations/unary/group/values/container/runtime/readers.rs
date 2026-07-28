@@ -1,15 +1,8 @@
-//! The per-batch column readers a [`BoundSlot`](super::BoundSlot) binds — one
-//! reader type per *value width*, each downcasting its column family once and
-//! yielding one row's value:
+//! Typed column readers used by [`BoundSlot`](super::BoundSlot).
 //!
-//! - [`I64Reader`] — an integer column (Int16/Int32/Int64), widened to `i64`.
-//! - [`F64Reader`] — a float column (Float32/Float64), widened to `f64`.
-//! - [`U128Reader`] — a `Decimal128` column, read as a full `i128`.
-//!
-//! Splitting by width keeps each reader single-purpose: a `read` returns exactly one
-//! type, so the fold that consumes it needs no `is_float`/`as`-cast branching. The
-//! op the reader feeds is chosen by the [`BoundSlot`](super::BoundSlot) variant, not
-//! by the reader.
+//! Binding downcasts the Arrow array once per batch. Each reader then returns
+//! one normalized Rust type: integers as `i64`, floats as `f64`, and wide
+//! partials as `i128`. The bound slot, not the reader, selects the operation.
 
 use crate::operations::unary::group::values::read::{IntRead, Read};
 use arrow_array::cast::AsArray;
@@ -19,9 +12,7 @@ use arrow_array::types::{
 use arrow_array::{PrimitiveArray, RecordBatch};
 use arrow_schema::DataType;
 
-/// An integer column bound at one of the supported widths, read as `i64`. The width
-/// is a payload, not a cross-product with the op: adding a width is one more variant
-/// here, shared by every integer op.
+/// An integer column whose values are widened to `i64` on read.
 pub enum I64Reader<'b> {
     I16(&'b PrimitiveArray<Int16Type>),
     I32(&'b PrimitiveArray<Int32Type>),
@@ -72,13 +63,10 @@ impl<'b> F64Reader<'b> {
     }
 }
 
-/// A `Decimal128(38, 0)` column, read as a full `i128`.
+/// A `Decimal128` column read without narrowing its `i128` values.
 ///
-/// `Decimal128` is the Arrow type a *wide* (`i128`) cell emits for its
-/// `COUNT`/`SUM`/`MIN`/`MAX` slots, so this reader binds whenever such a column is
-/// aggregated — an aggregate re-reading partials a prior level already widened.
-/// Reading the full `i128` (rather than truncating to `i64`) keeps a partial `SUM`
-/// that overflows `i64` exact.
+/// This occurs when one aggregation level reads the wide output of an earlier
+/// level. Preserving all 128 bits keeps large partial sums exact.
 pub struct U128Reader<'b>(&'b PrimitiveArray<Decimal128Type>);
 
 impl<'b> U128Reader<'b> {
