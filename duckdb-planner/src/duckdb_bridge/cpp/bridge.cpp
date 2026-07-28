@@ -11,6 +11,8 @@
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/parser/statement/insert_statement.hpp"
+#include "duckdb/parser/query_node/insert_query_node.hpp"
 #include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
@@ -143,6 +145,32 @@ PlanHandle::~PlanHandle() {
 	}
 }
 
+// Publishes, for the duration of one plan, the table whose generated columns
+// are declared to the binder as GENERATED. See
+// `PivotStorageInfo::generated_columns_table`.
+struct GeneratedColumnsScope {
+	PivotStorageInfo &storage_info;
+
+	GeneratedColumnsScope(PivotStorageInfo &storage_info, std::string table)
+	    : storage_info(storage_info) {
+		storage_info.generated_columns_table = std::move(table);
+	}
+	~GeneratedColumnsScope() {
+		storage_info.generated_columns_table.clear();
+	}
+};
+
+// The table a statement writes into, or empty if it writes to none. Read off
+// the parsed statement, before binding, because binding the write is what needs
+// the answer.
+static std::string insert_target_table(duckdb::SQLStatement &statement) {
+	if (statement.type != duckdb::StatementType::INSERT_STATEMENT) {
+		return std::string();
+	}
+	auto &node = statement.Cast<duckdb::InsertStatement>().node;
+	return node ? node->table : std::string();
+}
+
 // Replicates `duckdb::ClientContext::ExtractPlan`, additionally returning the
 // binder-resolved result column names (in select order) via `result_names`.
 // The stock `ExtractPlan` computes those names on its local `Planner` and then
@@ -151,11 +179,21 @@ PlanHandle::~PlanHandle() {
 // captured without patching the bundled DuckDB.
 static duckdb::unique_ptr<duckdb::LogicalOperator>
 extract_plan_with_names(duckdb::Connection &con, const std::string &query,
-                        duckdb::vector<std::string> &result_names) {
+                        duckdb::vector<std::string> &result_names,
+                        PivotStorageInfo &storage_info,
+                        const std::string &generated_columns_table) {
 	auto statements = con.ExtractStatements(query);
 	if (statements.size() != 1) {
 		throw duckdb::InvalidInputException("ExtractPlan can only prepare a single statement");
 	}
+	// A statement writing into a table binds that table's generated columns as
+	// GENERATED; the caller can name the table itself when it wants the same
+	// declaration for a read (to have the binder hand back a generation
+	// expression bound against the table's other columns).
+	GeneratedColumnsScope generated_scope(
+	    storage_info, generated_columns_table.empty()
+	                      ? insert_target_table(*statements[0])
+	                      : generated_columns_table);
 	auto &context = *con.context;
 	duckdb::unique_ptr<duckdb::LogicalOperator> plan;
 	context.RunFunctionInTransaction([&]() {
@@ -194,17 +232,20 @@ struct CurrentTransactionScope {
 };
 
 ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
-                               const TransactionContext &transaction) {
+                               const TransactionContext &transaction,
+                               rust::Str generated_columns_table) {
 	duckdb::unique_ptr<duckdb::LogicalOperator> plan;
 	duckdb::vector<std::string> name_list;
 	std::optional<ExtractPlanResult> error;
-	CurrentTransactionScope transaction_scope(PivotStorageInfo::Get(*ctx.db.instance), transaction);
+	auto &storage_info = PivotStorageInfo::Get(*ctx.db.instance);
+	CurrentTransactionScope transaction_scope(storage_info, transaction);
 
 	try {
 		std::string query_str(query.data(), query.size());
+		std::string generated_table(generated_columns_table.data(), generated_columns_table.size());
 		// The result column names DuckDB would hand a client, in select order
 		// (e.g. `["hour", "count_star()"]` for `SELECT f(t) AS hour, COUNT(*)`).
-		plan = extract_plan_with_names(ctx.con, query_str, name_list);
+		plan = extract_plan_with_names(ctx.con, query_str, name_list, storage_info, generated_table);
 		// Rewrite DuckDB's column *bindings* (table_index, column_index) into
 		// positional BoundReference indices against each operator's actual child
 		// output. This is the standard resolution DuckDB runs before execution;
@@ -295,6 +336,10 @@ rust::Box<OptionalTableWrapper> lo_insert_take_table(const LogicalOperator &op) 
 	auto &insert = as<duckdb::LogicalInsert>(op);
 	auto &pivot_entry = insert.table.Cast<PivotTableCatalogEntry>();
 	return std::move(pivot_entry.table);
+}
+
+rust::String lo_insert_table_name(const LogicalOperator &op) {
+	return rust::String::lossy(as<duckdb::LogicalInsert>(op).table.name);
 }
 
 size_t lo_insert_column_map_count(const LogicalOperator &op) {
@@ -616,6 +661,19 @@ rust::String lo_create_column_name(const LogicalOperator &op, size_t index) {
 BridgeLogicalType lo_create_column_type(const LogicalOperator &op, size_t index) {
 	auto &col = create_table_info(op).columns.GetColumn(duckdb::LogicalIndex(index));
 	return bridge_logical_type(col.Type());
+}
+
+// The column's `GENERATED ALWAYS AS (...)` expression rendered back to SQL, or
+// empty for an ordinary column. Binding a CREATE TABLE resolves the
+// expression's type and wraps it in a cast to the declared type; the cast is
+// kept in the text so re-binding it later reproduces exactly the type the
+// column was created with.
+rust::String lo_create_column_generation_expression(const LogicalOperator &op, size_t index) {
+	auto &col = create_table_info(op).columns.GetColumn(duckdb::LogicalIndex(index));
+	if (!col.Generated()) {
+		return rust::String();
+	}
+	return rust::String::lossy(col.GeneratedExpression().ToString());
 }
 
 static string create_table_option_to_string(duckdb::ParsedExpression &expr) {

@@ -9,6 +9,8 @@
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/column_definition.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
@@ -42,6 +44,18 @@ LogicalType logical_type_from_column(const DuckDBColumn &col) {
 		return LogicalType::DECIMAL(col.decimal_width, col.decimal_scale);
 	}
 	return logical_type_from(col.duckdb_logical_type_id);
+}
+
+// Parse a generated column's expression back from the SQL text the catalog
+// stores it as. The text came from DuckDB's own rendering of the expression it
+// bound at CREATE TABLE, so anything it fails to parse is a corrupted schema
+// rather than user error.
+unique_ptr<ParsedExpression> parse_generation_expression(const string &sql) {
+	auto expressions = Parser::ParseExpressionList(sql);
+	if (expressions.size() != 1) {
+		throw InternalException("a generation expression is not a single expression: %s", sql);
+	}
+	return std::move(expressions[0]);
 }
 
 // Carries a table function's output schema from the lookup (where Rust supplied
@@ -173,15 +187,25 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
 		return nullptr;
 	}
 
+	auto &db_instance = ParentCatalog().GetAttached().GetDatabase();
+	auto &storage_info = PivotStorageInfo::Get(db_instance);
+
+	// Only a write to this very table declares its generated columns as
+	// generated. See `PivotStorageInfo::generated_columns_table`.
+	bool declare_generated = !storage_info.generated_columns_table.empty() &&
+	                         StringUtil::CIEquals(storage_info.generated_columns_table, table_name);
+
 	CreateTableInfo table_info(*this, table_name);
 	for (const auto &col : result.columns) {
 		auto col_name = std::string(col.name);
-		table_info.columns.AddColumn(
-		    ColumnDefinition(col_name, logical_type_from_column(col)));
+		ColumnDefinition column(col_name, logical_type_from_column(col));
+		if (declare_generated && !col.generation_expression.empty()) {
+			column.SetGeneratedExpression(
+			    parse_generation_expression(std::string(col.generation_expression)));
+		}
+		table_info.columns.AddColumn(std::move(column));
 	}
 
-	auto &db_instance = ParentCatalog().GetAttached().GetDatabase();
-	auto &storage_info = PivotStorageInfo::Get(db_instance);
 	auto entry = make_uniq<PivotTableCatalogEntry>(ParentCatalog(), *this, table_info, std::move(result.table));
 
 	return storage_info.AddTableEntry(std::move(entry));

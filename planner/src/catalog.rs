@@ -52,11 +52,64 @@ pub struct DynamicScanPredicate {
     pub slot: Arc<DynamicFilterSlot>,
 }
 
-/// A single column in a [`Table`]'s schema: name plus Pivot [`Type`].
+/// The SQL expression that computes a generated column's value from the other
+/// columns of its row, held as text.
+///
+/// Text rather than a bound [`Expression`](crate::expression::Expression)
+/// because this travels with the schema: it is serialized into the catalog's
+/// durable metadata and read back before any binder exists. Binding it needs a
+/// table to resolve column names against, which is only available once the
+/// schema it belongs to has already been loaded. The bound form is derived from
+/// this text when a write needs it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GenerationExpression(String);
+
+impl GenerationExpression {
+    pub fn new(sql: impl Into<String>) -> Self {
+        GenerationExpression(sql.into())
+    }
+
+    /// The expression text, as it would appear in `GENERATED ALWAYS AS (...)`.
+    pub fn sql(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A single column in a [`Table`]'s schema: name plus Pivot [`Type`], and for a
+/// generated column the expression its values are computed from.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Column {
     pub name: String,
     pub col_type: Type,
+    /// `Some` for a generated column: values are computed from the row's other
+    /// columns on write and stored like any other column, so reads, statistics
+    /// and partitioning treat it as ordinary data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated: Option<GenerationExpression>,
+}
+
+impl Column {
+    /// An ordinary column, whose values come from the rows being written.
+    pub fn new(name: impl Into<String>, col_type: Type) -> Self {
+        Column {
+            name: name.into(),
+            col_type,
+            generated: None,
+        }
+    }
+
+    /// A generated column, whose values are computed from `expression`.
+    pub fn generated(
+        name: impl Into<String>,
+        col_type: Type,
+        expression: GenerationExpression,
+    ) -> Self {
+        Column {
+            name: name.into(),
+            col_type,
+            generated: Some(expression),
+        }
+    }
 }
 
 /// Description of a table to be created — produced by translating a
@@ -228,7 +281,14 @@ pub trait Table: Debug + Send + Sync {
 fn duckdb_columns(columns: &[Column]) -> Vec<DuckDBColumn> {
     columns
         .iter()
-        .map(|column| logical_from_type(&column.col_type).to_duckdb_column(column.name.clone()))
+        .map(|column| {
+            let mut duckdb_column =
+                logical_from_type(&column.col_type).to_duckdb_column(column.name.clone());
+            if let Some(expression) = &column.generated {
+                duckdb_column.generation_expression = expression.sql().to_string();
+            }
+            duckdb_column
+        })
         .collect()
 }
 

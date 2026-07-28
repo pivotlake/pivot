@@ -36,10 +36,7 @@ fn unannotated_text_batch(values: &[&[u8]]) -> RecordBatch {
 fn declared_varchar_reads_unannotated_binary_as_text(mut testing_planner: TestingPlanner) {
     testing_planner.add_table_files(
         "pages",
-        vec![Column {
-            name: "s".to_string(),
-            col_type: Type::Utf8,
-        }],
+        vec![Column::new("s", Type::Utf8)],
         &[unannotated_text_batch(&[b"alpha", b"beta"])],
     );
 
@@ -54,10 +51,7 @@ fn declared_varchar_reads_unannotated_binary_as_text(mut testing_planner: Testin
 fn declared_varchar_surfaces_a_string_column(mut testing_planner: TestingPlanner) {
     testing_planner.add_table_files(
         "pages",
-        vec![Column {
-            name: "s".to_string(),
-            col_type: Type::Utf8,
-        }],
+        vec![Column::new("s", Type::Utf8)],
         &[unannotated_text_batch(&[b"alpha"])],
     );
 

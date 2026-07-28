@@ -47,7 +47,8 @@ struct ExpressionList {
 
 std::unique_ptr<DuckPlannerContext> new_context(rust::Box<CatalogContext> catalog);
 ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
-                               const TransactionContext &transaction);
+                               const TransactionContext &transaction,
+                               rust::Str generated_columns_table);
 
 const LogicalOperator &plan_root(const PlanHandle &plan);
 size_t rowid_column_id();
@@ -69,6 +70,7 @@ const Expression &lo_values_expr(const LogicalOperator &op, size_t row, size_t c
 
 // ---- Insert ----
 rust::Box<OptionalTableWrapper> lo_insert_take_table(const LogicalOperator &op);
+rust::String lo_insert_table_name(const LogicalOperator &op);
 size_t lo_insert_column_map_count(const LogicalOperator &op);
 bool lo_insert_returns_rows(const LogicalOperator &op);
 
@@ -130,6 +132,7 @@ rust::String lo_create_table_name(const LogicalOperator &op);
 size_t lo_create_column_count(const LogicalOperator &op);
 rust::String lo_create_column_name(const LogicalOperator &op, size_t index);
 BridgeLogicalType lo_create_column_type(const LogicalOperator &op, size_t index);
+rust::String lo_create_column_generation_expression(const LogicalOperator &op, size_t index);
 size_t lo_create_option_count(const LogicalOperator &op);
 rust::String lo_create_option_key(const LogicalOperator &op, size_t index);
 rust::String lo_create_option_value(const LogicalOperator &op, size_t index);

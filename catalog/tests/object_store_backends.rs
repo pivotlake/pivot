@@ -38,14 +38,8 @@ use planner::types::Type;
 /// (name Utf8, value Int64) — matches [`strings_and_ints`].
 fn columns() -> Vec<Column> {
     vec![
-        Column {
-            name: "name".to_string(),
-            col_type: Type::Utf8,
-        },
-        Column {
-            name: "value".to_string(),
-            col_type: Type::Int64,
-        },
+        Column::new("name", Type::Utf8),
+        Column::new("value", Type::Int64),
     ]
 }
 

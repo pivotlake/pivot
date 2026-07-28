@@ -1,6 +1,7 @@
 use duckdb_planner::duckdb_bridge::duckdb_types::LogicalOperatorType;
 use duckdb_planner::{
-    DuckDBBind, DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, PlannerContext,
+    BoundLogicalType, DuckDBBind, DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId,
+    PlannerContext,
 };
 use std::sync::Arc;
 
@@ -13,24 +14,9 @@ impl DuckDBTable for UsersTable {
 
     fn duckdb_typed_columns(&self) -> Vec<DuckDBColumn> {
         vec![
-            DuckDBColumn {
-                name: "id".to_string(),
-                duckdb_logical_type_id: LogicalTypeId::INTEGER as u8,
-                decimal_width: 0,
-                decimal_scale: 0,
-            },
-            DuckDBColumn {
-                name: "name".to_string(),
-                duckdb_logical_type_id: LogicalTypeId::VARCHAR as u8,
-                decimal_width: 0,
-                decimal_scale: 0,
-            },
-            DuckDBColumn {
-                name: "age".to_string(),
-                duckdb_logical_type_id: LogicalTypeId::SMALLINT as u8,
-                decimal_width: 0,
-                decimal_scale: 0,
-            },
+            BoundLogicalType::plain(LogicalTypeId::INTEGER).to_duckdb_column("id".to_string()),
+            BoundLogicalType::plain(LogicalTypeId::VARCHAR).to_duckdb_column("name".to_string()),
+            BoundLogicalType::plain(LogicalTypeId::SMALLINT).to_duckdb_column("age".to_string()),
         ]
     }
 }

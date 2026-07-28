@@ -90,7 +90,7 @@
 //! // Wire one parquet directory into the catalog under the name "hits". The
 //! // footers are read once here, over the dispatch worker pool.
 //! let dispatch = Dispatch::spin_up(1, 10, None);
-//! let columns = vec![Column { name: "URL".into(), col_type: Type::Utf8 }];
+//! let columns = vec![Column::new("URL".into(), Type::Utf8)];
 //! let parquet = Arc::new(ParquetTable::from_directory(dispatch.dispatcher(), Path::new("/tmp/hits"), &columns).unwrap());
 //! let template = MyTableTemplate { parquet, columns };
 //!
@@ -150,6 +150,8 @@ pub enum Error {
     Planning(#[from] duckdb_planner::Error),
     #[error("Error converting plan: {0}")]
     PlanConversion(#[from] plan::Error),
+    #[error("{0}")]
+    GenerationExpression(String),
 }
 
 /// Entry point for using crate: plans SQL statements against a [`Catalog`] into a Pivot [`Plan`].
@@ -189,9 +191,11 @@ impl Planner {
         query: &str,
         transaction: Arc<dyn CatalogTransaction>,
     ) -> Result<Plan, Error> {
-        let adapter = Arc::new(DuckDBTransactionAdapter { transaction });
-        let planned = self.planner_context.plan(query, adapter)?;
+        let adapter: Arc<dyn DuckDBTransaction> =
+            Arc::new(DuckDBTransactionAdapter { transaction });
+        let planned = self.planner_context.plan(query, adapter.clone())?;
         let mut root = build::build_plan(planned.root())?;
+        self.widen_rows_for_generated_columns(&mut root, &adapter)?;
         // Push a top-k limit into a grouped aggregate that feeds ORDER BY DESC.
         root.annotate_group_topn();
         // Push a plain LIMIT (no ORDER BY) into a grouped aggregate beneath it.
@@ -202,4 +206,120 @@ impl Planner {
             output_names: planned.into_output_names(),
         })
     }
+
+    /// Widen the rows flowing into every INSERT whose target has generated
+    /// columns, so what reaches the write is the table's full row.
+    ///
+    /// A generated column's expression is stored as text (it travels with the
+    /// schema), so it is bound here by planning `SELECT <every column> FROM
+    /// <target>` with the target's generated columns declared as generated,
+    /// which makes DuckDB resolve each of those into its expression over the
+    /// table's other columns. That is the same binder, with the same functions,
+    /// casts and type rules the original `CREATE TABLE` used, and it hands back
+    /// the stored columns as plain references in the same breath, so the result
+    /// is precisely the projection the insert needs.
+    ///
+    /// This cannot happen while the statement's own plan is being walked, since
+    /// that walk is what discovers the target, so it runs as this second pass.
+    fn widen_rows_for_generated_columns(
+        &mut self,
+        node: &mut PlanNode,
+        transaction: &Arc<dyn DuckDBTransaction>,
+    ) -> Result<(), Error> {
+        for input in &mut node.inputs {
+            self.widen_rows_for_generated_columns(input, transaction)?;
+        }
+        let Operator::Insert(insert) = &node.operator else {
+            return Ok(());
+        };
+        let schema = insert.table.columns();
+        if schema.iter().all(|column| column.generated.is_none()) {
+            return Ok(());
+        }
+
+        let projection = self.bind_row_of(&insert.table_name, &schema, transaction)?;
+        let input = node.inputs.remove(0);
+        node.inputs.push(PlanNode {
+            name: "generated columns".to_string(),
+            operator: Operator::Projection(operator::Projection {
+                projections: projection,
+            }),
+            inputs: vec![input],
+        });
+        Ok(())
+    }
+
+    /// Bind the expression for each of `table`'s columns as written into a row:
+    /// a reference to the row's own value for a stored column, and the
+    /// generation expression for a generated one.
+    ///
+    /// The stored columns are selected first and in order, which is the order
+    /// the row supplies them in, so the references the generation expressions
+    /// resolve to address that row directly.
+    fn bind_row_of(
+        &mut self,
+        table: &str,
+        schema: &[catalog::Column],
+        transaction: &Arc<dyn DuckDBTransaction>,
+    ) -> Result<Vec<expression::Expression>, Error> {
+        let (stored, generated): (Vec<usize>, Vec<usize>) =
+            (0..schema.len()).partition(|&column| schema[column].generated.is_none());
+        let selected = stored
+            .iter()
+            .chain(&generated)
+            .map(|&column| quote_identifier(&schema[column].name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!("SELECT {selected} FROM {}", quote_identifier(table));
+
+        let bound = self.planner_context.plan_binding_generated_columns_of(
+            &query,
+            transaction.clone(),
+            table,
+        )?;
+        let bound = build::build_selected_expressions(bound.root())
+            .map_err(|e| Error::GenerationExpression(e.to_string()))?;
+
+        // The stored columns were selected first and in order, so the scan reads
+        // exactly them, in the order the row holds them, and the references the
+        // expressions carry are already positions in that row. Anything else
+        // means they address a row this insert does not supply.
+        if bound.scanned_columns.iter().ne(stored.iter()) {
+            return Err(Error::GenerationExpression(format!(
+                "the columns of {table} are bound against table columns {:?} rather than \
+                 the {} a row supplies",
+                bound.scanned_columns,
+                stored.len()
+            )));
+        }
+        if bound.expressions.len() != schema.len() {
+            return Err(Error::GenerationExpression(format!(
+                "binding the columns of {table} produced {} expressions for {} columns",
+                bound.expressions.len(),
+                schema.len()
+            )));
+        }
+
+        // Selected stored-then-generated; put each back where the table
+        // declares it.
+        let mut expressions = bound.expressions;
+        let mut generated = expressions.split_off(stored.len()).into_iter();
+        let mut stored = expressions.into_iter();
+        schema
+            .iter()
+            .map(|column| match column.generated {
+                Some(_) => generated.next(),
+                None => stored.next(),
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                Error::GenerationExpression(format!("{table} bound too few column expressions"))
+            })
+    }
+}
+
+/// Quote an identifier for use in the column-binding query, so a name that needs
+/// quoting (or contains a quote) still resolves to itself.
+fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }

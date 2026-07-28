@@ -104,14 +104,8 @@ fn three_row_table() -> (TempDir, Vec<Column>) {
     .unwrap();
     let dir = write_one_row_per_group(&[batch]);
     let columns = vec![
-        Column {
-            name: "id".to_string(),
-            col_type: Type::Int32,
-        },
-        Column {
-            name: "name".to_string(),
-            col_type: Type::Utf8,
-        },
+        Column::new("id", Type::Int32),
+        Column::new("name", Type::Utf8),
     ];
     (dir, columns)
 }
@@ -482,14 +476,8 @@ fn column_names(batches: &[RecordBatch]) -> Vec<String> {
 fn insert_multiple_values_writes_and_publishes_rows() {
     let data = TempDir::new().unwrap();
     let columns = vec![
-        Column {
-            name: "id".to_string(),
-            col_type: Type::Int32,
-        },
-        Column {
-            name: "name".to_string(),
-            col_type: Type::Utf8,
-        },
+        Column::new("id", Type::Int32),
+        Column::new("name", Type::Utf8),
     ];
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("inserted", data.path(), columns)).unwrap();
@@ -536,10 +524,7 @@ fn insert_files_publish_only_when_transaction_commits() {
         &catalog,
         CreateTableRequest {
             name: "pending_insert".to_string(),
-            columns: vec![Column {
-                name: "id".to_string(),
-                col_type: Type::Int32,
-            }],
+            columns: vec![Column::new("id", Type::Int32)],
             options: HashMap::new(),
             if_not_exists: false,
         },
@@ -759,10 +744,7 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
 #[test]
 fn compact_files_merges_small_files_into_one() {
     let dir = TempDir::new().unwrap();
-    let columns = vec![Column {
-        name: "id".to_string(),
-        col_type: Type::Int32,
-    }];
+    let columns = vec![Column::new("id", Type::Int32)];
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
     run_sql(&catalog, "INSERT INTO t VALUES (10), (20), (30)");
@@ -970,10 +952,7 @@ fn filter_on_partition_column_prunes_whole_single_partition_file() {
     let dir = TempDir::new().unwrap();
     write_ids_one_group_each(dir.path(), "part-1.parquet", &[1, 1, 1]);
     write_ids_one_group_each(dir.path(), "part-2.parquet", &[2, 2, 2]);
-    let columns = vec![Column {
-        name: "id".to_string(),
-        col_type: Type::Int32,
-    }];
+    let columns = vec![Column::new("id", Type::Int32)];
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
     create_table(&catalog, create_request("t", dir.path(), columns)).unwrap();
 
@@ -1000,14 +979,8 @@ fn table_partitioned_by_name() -> (TempDir, Arc<ParquetCatalog>) {
     let request = CreateTableRequest {
         name: "p".to_string(),
         columns: vec![
-            Column {
-                name: "id".to_string(),
-                col_type: Type::Int32,
-            },
-            Column {
-                name: "name".to_string(),
-                col_type: Type::Utf8,
-            },
+            Column::new("id", Type::Int32),
+            Column::new("name", Type::Utf8),
         ],
         options: HashMap::from([
             (
@@ -1151,10 +1124,7 @@ fn variant_filter(path: &[&str], cmp: CompareType, value: i64) -> TableFilter {
 
 fn shredded_docs_catalog(dir: &Path) -> (Arc<ParquetCatalog>, TableBinding) {
     let catalog = Arc::new(ParquetCatalog::new(dispatcher()));
-    let columns = vec![Column {
-        name: "doc".to_string(),
-        col_type: Type::Variant,
-    }];
+    let columns = vec![Column::new("doc", Type::Variant)];
     create_table(&catalog, create_request("docs", dir, columns)).unwrap();
     let binding = catalog.begin_transaction().table("docs").unwrap();
     (catalog, binding)

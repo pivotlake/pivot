@@ -67,14 +67,8 @@ fn make_catalog() -> (TempDir, Arc<ParquetCatalog>) {
             CreateTableRequest {
                 name: "t".to_string(),
                 columns: vec![
-                    Column {
-                        name: "id".to_string(),
-                        col_type: Type::Int64,
-                    },
-                    Column {
-                        name: "name".to_string(),
-                        col_type: Type::Utf8,
-                    },
+                    Column::new("id", Type::Int64),
+                    Column::new("name", Type::Utf8),
                 ],
                 options,
                 if_not_exists: false,

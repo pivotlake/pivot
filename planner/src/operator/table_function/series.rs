@@ -56,10 +56,7 @@ impl TableFunction for SeriesTableFunction {
         // single output column is named after the function, matching `compile`.
         TableFunctionSignature {
             arguments: vec![Type::Int64],
-            columns: vec![Column {
-                name: self.name.to_string(),
-                col_type: Type::Int64,
-            }],
+            columns: vec![Column::new(self.name.to_string(), Type::Int64)],
         }
     }
 

@@ -13,7 +13,8 @@
 //! ```no_run
 //! use std::sync::Arc;
 //! use duckdb_planner::{
-//!     DuckDBBind, DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, PlannerContext,
+//!     BoundLogicalType, DuckDBBind, DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId,
+//!     PlannerContext,
 //! };
 //! use duckdb_planner::duckdb_bridge::duckdb_types::LogicalOperatorType;
 //!
@@ -22,12 +23,7 @@
 //! impl DuckDBTable for UsersTable {
 //!     fn clone_box(&self) -> Box<dyn DuckDBTable> { Box::new(UsersTable) }
 //!     fn duckdb_typed_columns(&self) -> Vec<DuckDBColumn> {
-//!         vec![DuckDBColumn {
-//!             name: "name".to_string(),
-//!             duckdb_logical_type_id: LogicalTypeId::VARCHAR as u8,
-//!             decimal_width: 0,
-//!             decimal_scale: 0,
-//!         }]
+//!         vec![BoundLogicalType::plain(LogicalTypeId::VARCHAR).to_duckdb_column("name".to_string())]
 //!     }
 //! }
 //!
@@ -143,8 +139,26 @@ impl PlannerContext {
         query: &str,
         transaction: Arc<dyn DuckDBTransaction>,
     ) -> Result<Plan, Error> {
+        self.plan_binding_generated_columns_of(query, transaction, "")
+    }
+
+    /// Plan `query` with `table`'s generated columns declared to the binder as
+    /// generated, so a reference to one binds to its generation expression over
+    /// the table's other columns instead of to the stored column.
+    ///
+    /// This is how a caller recovers a generated column's expression already
+    /// bound and type-checked: plan `SELECT <generated column> FROM <table>` and
+    /// read the expression off the resulting projection. Writes get the same
+    /// declaration without asking, since binding an INSERT is the case that
+    /// needs it (see [`plan`](Self::plan)).
+    pub fn plan_binding_generated_columns_of(
+        &mut self,
+        query: &str,
+        transaction: Arc<dyn DuckDBTransaction>,
+        table: &str,
+    ) -> Result<Plan, Error> {
         let transaction_ctx = catalog_provider::TransactionContext::new(transaction);
-        let result = ffi::extract_plan(self.cxx_context.pin_mut(), query, &transaction_ctx);
+        let result = ffi::extract_plan(self.cxx_context.pin_mut(), query, &transaction_ctx, table);
         if !result.error_kind.is_empty() {
             return Err(bridge_error(&result));
         }

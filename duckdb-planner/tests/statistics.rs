@@ -2,7 +2,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use duckdb_planner::{
-    DuckDBBind, DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, PlannerContext,
+    BoundLogicalType, DuckDBBind, DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId,
+    PlannerContext,
 };
 
 struct CountingTable {
@@ -19,12 +20,7 @@ impl DuckDBTable for CountingTable {
     }
 
     fn duckdb_typed_columns(&self) -> Vec<DuckDBColumn> {
-        vec![DuckDBColumn {
-            name: "id".to_string(),
-            duckdb_logical_type_id: LogicalTypeId::INTEGER as u8,
-            decimal_width: 0,
-            decimal_scale: 0,
-        }]
+        vec![BoundLogicalType::plain(LogicalTypeId::INTEGER).to_duckdb_column("id".to_string())]
     }
 
     fn estimate_row_count(&self) -> Option<u64> {

@@ -14,6 +14,12 @@ struct PivotStorageInfo : public duckdb::StorageExtensionInfo {
 	// per context) and stamped onto each `PivotTransaction` the transaction
 	// manager starts, so table binding resolves against that plan's snapshot.
 	const TransactionContext *current_transaction = nullptr;
+	// The table whose generated columns are declared to the binder as GENERATED
+	// for the plan currently being extracted, or empty for none. Only a write to
+	// a table needs that declaration (it is what excludes generated columns from
+	// the inserted column list and rejects an explicit insert into one); every
+	// other binding sees ordinary columns and so reads the stored values.
+	std::string generated_columns_table;
 	std::vector<duckdb::unique_ptr<PivotTableCatalogEntry>> table_entries;
 	// Table- and scalar-function catalog entries synthesized on lookup; kept
 	// alive for the duration of one plan alongside the table entries.

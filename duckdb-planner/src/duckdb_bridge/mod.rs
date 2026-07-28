@@ -30,6 +30,12 @@ pub mod ffi {
         pub duckdb_logical_type_id: u8,
         pub decimal_width: u8,
         pub decimal_scale: u8,
+        /// The SQL expression a generated column's values are computed from, or
+        /// empty for an ordinary column. Only declared to DuckDB's binder while
+        /// binding a write to the column's own table (see
+        /// `PivotSchemaCatalogEntry::LookupEntry`); reads see an ordinary
+        /// column, since the values are stored like any other.
+        pub generation_expression: String,
     }
 
     /// A DuckDB `LogicalType` read off a bound plan object: the
@@ -159,10 +165,15 @@ pub mod ffi {
         /// (see `PivotSchemaCatalogEntry::LookupEntry`). The reference only
         /// needs to outlive this call; the C++ side clears its pointer before
         /// returning.
+        /// `generated_columns_table` names the table whose generated columns are
+        /// declared to the binder as generated. Empty means "derive it from the
+        /// statement", which declares them for an INSERT's target table and for
+        /// nothing else.
         fn extract_plan(
             ctx: Pin<&mut DuckPlannerContext>,
             query: &str,
             transaction: &TransactionContext,
+            generated_columns_table: &str,
         ) -> ExtractPlanResult;
 
         fn plan_root(plan: &PlanHandle) -> &LogicalOperator;
@@ -190,6 +201,7 @@ pub mod ffi {
 
         // ---- Insert ----
         fn lo_insert_take_table(op: &LogicalOperator) -> Box<OptionalTableWrapper>;
+        fn lo_insert_table_name(op: &LogicalOperator) -> String;
         fn lo_insert_column_map_count(op: &LogicalOperator) -> usize;
         fn lo_insert_returns_rows(op: &LogicalOperator) -> bool;
 
@@ -271,6 +283,9 @@ pub mod ffi {
         fn lo_create_column_count(op: &LogicalOperator) -> usize;
         fn lo_create_column_name(op: &LogicalOperator, index: usize) -> String;
         fn lo_create_column_type(op: &LogicalOperator, index: usize) -> BridgeLogicalType;
+        /// The column's `GENERATED ALWAYS AS (...)` expression as SQL text,
+        /// empty for an ordinary column.
+        fn lo_create_column_generation_expression(op: &LogicalOperator, index: usize) -> String;
         fn lo_create_option_count(op: &LogicalOperator) -> usize;
         fn lo_create_option_key(op: &LogicalOperator, index: usize) -> String;
         fn lo_create_option_value(op: &LogicalOperator, index: usize) -> String;

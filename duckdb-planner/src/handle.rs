@@ -35,6 +35,12 @@ fn i128_from_halves(hi: i64, lo: u64) -> i128 {
     ((hi as i128) << 64) | (lo as i128)
 }
 
+/// An empty FFI string means "absent": the bridge has no optional string, so a
+/// field that may be missing is carried as one that may be empty.
+fn none_if_empty(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
+}
+
 /// Decode the FFI type struct into a [`BoundLogicalType`].
 fn bound_type_from(raw: ffi::BridgeLogicalType) -> BoundLogicalType {
     BoundLogicalType::from_bridge(raw)
@@ -294,6 +300,10 @@ impl<'plan> Insert<'plan> {
         ffi::lo_insert_take_table(self.raw)
     }
 
+    pub fn table_name(self) -> String {
+        ffi::lo_insert_table_name(self.raw)
+    }
+
     /// Empty means DuckDB bound an insert into every physical column by position.
     pub fn has_column_map(self) -> bool {
         ffi::lo_insert_column_map_count(self.raw) != 0
@@ -465,17 +475,27 @@ impl<'plan> TableFunctionScan<'plan> {
     }
 }
 
+/// One column of a `CREATE TABLE`'s column list.
+pub struct CreateTableColumn {
+    pub name: String,
+    pub col_type: BoundLogicalType,
+    /// The `GENERATED ALWAYS AS (...)` expression as SQL text, for a generated
+    /// column. `None` for an ordinary one.
+    pub generation_expression: Option<String>,
+}
+
 impl<'plan> CreateTable<'plan> {
     pub fn name(self) -> String {
         ffi::lo_create_table_name(self.raw)
     }
 
-    pub fn columns(self) -> impl Iterator<Item = (String, BoundLogicalType)> {
-        (0..ffi::lo_create_column_count(self.raw)).map(move |i| {
-            (
-                ffi::lo_create_column_name(self.raw, i),
-                bound_type_from(ffi::lo_create_column_type(self.raw, i)),
-            )
+    pub fn columns(self) -> impl Iterator<Item = CreateTableColumn> {
+        (0..ffi::lo_create_column_count(self.raw)).map(move |i| CreateTableColumn {
+            name: ffi::lo_create_column_name(self.raw, i),
+            col_type: bound_type_from(ffi::lo_create_column_type(self.raw, i)),
+            generation_expression: none_if_empty(ffi::lo_create_column_generation_expression(
+                self.raw, i,
+            )),
         })
     }
 

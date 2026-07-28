@@ -101,14 +101,7 @@ fn docs_batch(rows: Vec<&str>, shred_age: bool) -> RecordBatch {
 
 /// Register `docs(d VARIANT)` over several parquet files, one per batch.
 fn docs_table_files(planner: &mut TestingPlanner, batches: &[RecordBatch]) {
-    planner.add_table_files(
-        "docs",
-        vec![Column {
-            name: "d".to_string(),
-            col_type: Type::Variant,
-        }],
-        batches,
-    );
+    planner.add_table_files("docs", vec![Column::new("d", Type::Variant)], batches);
 }
 
 /// `SELECT d.age` across two files where only one shreds `age`: each file's

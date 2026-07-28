@@ -45,10 +45,7 @@ impl TestTable {
 
         let cols = columns
             .iter()
-            .map(|(name, col_type, _)| Column {
-                name: name.to_string(),
-                col_type: col_type.clone(),
-            })
+            .map(|(name, col_type, _)| Column::new(name.to_string(), col_type.clone()))
             .collect();
         Self::from_batches(dispatch, cols, &[batch])
     }

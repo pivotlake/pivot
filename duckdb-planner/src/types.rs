@@ -63,6 +63,7 @@ impl BoundLogicalType {
             duckdb_logical_type_id: self.id.clone() as u8,
             decimal_width,
             decimal_scale,
+            generation_expression: String::new(),
         }
     }
 }

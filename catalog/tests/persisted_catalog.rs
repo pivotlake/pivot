@@ -17,7 +17,9 @@ use tempfile::TempDir;
 use catalog::ParquetCatalog;
 use catalog::parquet::table_input;
 use dispatch::Projection;
-use planner::catalog::{Catalog, Column, CreateTableRequest, Result as CatalogResult};
+use planner::catalog::{
+    Catalog, Column, CreateTableRequest, GenerationExpression, Result as CatalogResult,
+};
 use planner::types::Type;
 
 fn write_parquet(path: &Path, batch: &arrow_array::RecordBatch) {
@@ -48,14 +50,8 @@ fn write_delta_commit(table: &Path, version: u64, actions: &[serde_json::Value])
 
 fn columns() -> Vec<Column> {
     vec![
-        Column {
-            name: "name".to_string(),
-            col_type: Type::Utf8,
-        },
-        Column {
-            name: "value".to_string(),
-            col_type: Type::Int64,
-        },
+        Column::new("name", Type::Utf8),
+        Column::new("value", Type::Int64),
     ]
 }
 
@@ -164,6 +160,41 @@ fn tables_persist_across_reopen() {
         .collect()
         .unwrap();
     assert_eq!(results.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+}
+
+/// A generated column's expression is part of the schema, so a table reopened
+/// from its durable metadata still knows which columns it computes on write.
+#[test]
+fn generated_columns_persist_across_reopen() {
+    let dispatch = dispatch(1);
+    let db = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    let db_uri = db.path().to_str().unwrap();
+    let columns = vec![
+        Column::new("name", Type::Utf8),
+        Column::generated(
+            "shouted",
+            Type::Utf8,
+            GenerationExpression::new("upper(name)"),
+        ),
+    ];
+
+    {
+        let catalog = ParquetCatalog::open(db_uri, &dispatch).unwrap();
+        create(
+            &dispatch,
+            &catalog,
+            path_request("events", data.path(), columns.clone()),
+        )
+        .unwrap();
+    }
+
+    let reopened = ParquetCatalog::open(db_uri, &dispatch).unwrap();
+    let table = reopened
+        .begin_transaction()
+        .table("events")
+        .expect("table reloaded from the manifest");
+    assert_eq!(table.columns, columns);
 }
 
 #[test]

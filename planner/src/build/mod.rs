@@ -70,6 +70,58 @@ impl BuildCtx {
     }
 }
 
+/// The expressions a `SELECT <expressions> FROM <table>` plan computes, read
+/// off DuckDB's handles rather than from a built Pivot tree: this is a bound
+/// expression list on its own, not a plan anyone runs.
+pub(crate) struct SelectedExpressions {
+    pub expressions: Vec<Expression>,
+    /// The table columns the scan under the projection reads, in the order the
+    /// expressions address them.
+    pub scanned_columns: Vec<usize>,
+}
+
+/// Read back the expressions DuckDB bound for a `SELECT <expressions> FROM
+/// <table>`, which is how the planner recovers an expression it holds only as
+/// text (see [`Planner::bind_generated_columns`](crate::Planner)).
+///
+/// Such a plan is a projection over a scan of the columns the expressions read,
+/// or the bare scan when every expression is a plain column reference and
+/// DuckDB folds the projection away.
+pub(crate) fn build_selected_expressions(
+    root: LogicalOp<'_>,
+) -> Result<SelectedExpressions, OperatorError> {
+    let unsupported = |what: &str| {
+        OperatorError::Unsupported(format!("a bound expression list {what}: {}", root.name()))
+    };
+    // A list of plain column references leaves DuckDB nothing to project, so
+    // the scan itself is the root and its output is the expression list.
+    let (projected, scan) = match root.operator() {
+        DuckOperator::Projection(view) => {
+            let expressions = view
+                .exprs()
+                .map(Expression::from_handle)
+                .collect::<Result<Vec<_>, _>>()?;
+            (Some(expressions), root.child(0))
+        }
+        DuckOperator::TableScan(_) => (None, root),
+        _ => return Err(unsupported("is not a projection over a scan")),
+    };
+    let scanned = match scan.operator() {
+        DuckOperator::TableScan(view) => view.output_columns().collect::<Vec<_>>(),
+        // Nothing is read from the table, so every expression is constant.
+        DuckOperator::DummyScan => Vec::new(),
+        _ => return Err(unsupported("does not read its table directly")),
+    };
+    let scanned_columns = scanned.iter().map(|(column, _)| *column).collect();
+    Ok(SelectedExpressions {
+        expressions: match projected {
+            Some(expressions) => expressions,
+            None => build_scan_columns(scanned.into_iter())?,
+        },
+        scanned_columns,
+    })
+}
+
 /// Build the whole Pivot plan tree from DuckDB's root operator handle.
 pub(crate) fn build_plan(root: LogicalOp<'_>) -> Result<PlanNode, plan::Error> {
     let mut ctx = BuildCtx {

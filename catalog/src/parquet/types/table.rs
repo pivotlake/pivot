@@ -721,10 +721,7 @@ mod tests {
     }
 
     fn column(name: &str, col_type: Type) -> Column {
-        Column {
-            name: name.to_string(),
-            col_type,
-        }
+        Column::new(name, col_type)
     }
 
     /// A column the table declares VARCHAR whose file leaf is unannotated

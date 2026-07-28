@@ -24,7 +24,7 @@ use delta_kernel::schema::{
 };
 use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
-use planner::catalog::Column;
+use planner::catalog::{Column, GenerationExpression};
 use planner::types::Type;
 use url::Url;
 
@@ -99,7 +99,7 @@ pub(crate) fn initialize_table(
     let uri = table_uri(&store.location_uri(), location)?;
     let fields = columns
         .iter()
-        .map(|column| build_delta_field(&column.name, &column.col_type))
+        .map(build_delta_field)
         .collect::<Result<Vec<_>, Error>>()?;
     let schema = StructType::try_new(fields)?;
     let schema = serde_json::to_string(&schema).expect("Delta Kernel schema is serializable");
@@ -122,15 +122,27 @@ pub(crate) fn initialize_table(
     });
     // A variant column is a Delta table feature: readers and writers must
     // declare `variantType`, which requires the feature-listing protocol
-    // versions. Tables without one keep the plain legacy protocol so any
-    // reader can open them.
-    let protocol = if columns.iter().any(|c| matches!(c.col_type, Type::Variant)) {
+    // versions. Generated columns are a writer-only feature, since their values
+    // are materialized into the data files like any other column and readers
+    // need to know nothing. Tables with neither keep the plain legacy protocol
+    // so any reader can open them.
+    let has_variant = columns.iter().any(|c| matches!(c.col_type, Type::Variant));
+    let has_generated = columns.iter().any(|c| c.generated.is_some());
+    let protocol = if has_variant {
+        let mut writer_features = vec!["variantType"];
+        if has_generated {
+            writer_features.push("generatedColumns");
+        }
         serde_json::json!({"protocol": {
             "minReaderVersion": 3,
             "minWriterVersion": 7,
             "readerFeatures": ["variantType"],
-            "writerFeatures": ["variantType"],
+            "writerFeatures": writer_features,
         }})
+    } else if has_generated {
+        // Writer version 4 is the legacy version that introduced generated
+        // columns, so no feature list is needed to declare them.
+        serde_json::json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 4}})
     } else {
         serde_json::json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}})
     };
@@ -300,9 +312,10 @@ pub(crate) fn load_table(uri: &Url) -> Result<DeltaTableState, Error> {
     let columns = schema
         .fields()
         .map(|field| {
-            Ok(Column {
-                name: field.name().clone(),
-                col_type: pivot_type_from_field(field)?,
+            let col_type = pivot_type_from_field(field)?;
+            Ok(match generation_expression_from_field(field) {
+                Some(expression) => Column::generated(field.name().clone(), col_type, expression),
+                None => Column::new(field.name().clone(), col_type),
             })
         })
         .collect::<Result<Vec<_>, Error>>()?;
@@ -559,15 +572,26 @@ fn delta_type(column: &str, data_type: &Type) -> Result<DeltaDataType, Error> {
 /// true type is recovered from this tag on read.
 const PIVOT_LOGICAL_TYPE_KEY: &str = "pivot.logicalTypeOverride";
 
+/// Field-metadata key holding a generated column's expression. This is Delta's
+/// own key for the generated-columns writer feature, so a table pivot writes
+/// stays readable by any Delta engine that understands it.
+const DELTA_GENERATION_EXPRESSION_KEY: &str = "delta.generationExpression";
+
 /// Build the Delta struct field for one Pivot column. Types Delta represents
 /// natively map straight through [`delta_type`]; the unsigned types it rejects
 /// fall back to [`build_unsigned_field`], which stores them as a tagged signed
-/// primitive.
-fn build_delta_field(column: &str, data_type: &Type) -> Result<StructField, Error> {
-    match delta_type(column, data_type) {
-        Ok(delta_type) => Ok(StructField::new(column, delta_type, false)),
-        Err(_) => build_unsigned_field(column, data_type),
-    }
+/// primitive. A generated column carries its expression in field metadata.
+fn build_delta_field(column: &Column) -> Result<StructField, Error> {
+    let field = match delta_type(&column.name, &column.col_type) {
+        Ok(delta_type) => StructField::new(&column.name, delta_type, false),
+        Err(_) => build_unsigned_field(&column.name, &column.col_type)?,
+    };
+    Ok(match &column.generated {
+        Some(expression) => {
+            field.add_metadata([(DELTA_GENERATION_EXPRESSION_KEY, expression.sql())])
+        }
+        None => field,
+    })
 }
 
 /// Build the Delta field for an unsigned integer column, which Delta has no
@@ -591,6 +615,14 @@ fn build_unsigned_field(column: &str, data_type: &Type) -> Result<StructField, E
     };
     Ok(StructField::new(column, primitive, false)
         .with_metadata([(PIVOT_LOGICAL_TYPE_KEY, data_type.to_string())]))
+}
+
+/// Recover a generated column's expression from its Delta field metadata.
+fn generation_expression_from_field(field: &StructField) -> Option<GenerationExpression> {
+    match field.metadata.get(DELTA_GENERATION_EXPRESSION_KEY) {
+        Some(MetadataValue::String(expression)) => Some(GenerationExpression::new(expression)),
+        _ => None,
+    }
 }
 
 /// Recover a column's Pivot type from a Delta field, honoring the
@@ -788,7 +820,10 @@ mod tests {
     /// smallest signed primitive that holds its full value range.
     #[test]
     fn unsigned_columns_store_as_signed_delta_primitives() {
-        let stored_primitive = |ty| match build_delta_field("c", &ty).unwrap().data_type() {
+        let stored_primitive = |ty| match build_delta_field(&Column::new("c", ty))
+            .unwrap()
+            .data_type()
+        {
             DeltaDataType::Primitive(p) => p.clone(),
             other => panic!("expected primitive, got {other:?}"),
         };
@@ -805,7 +840,7 @@ mod tests {
     #[test]
     fn unsigned_column_type_round_trips_through_field_metadata() {
         for ty in [Type::UInt8, Type::UInt16, Type::UInt32, Type::UInt64] {
-            let field = build_delta_field("event_date", &ty).unwrap();
+            let field = build_delta_field(&Column::new("event_date", ty.clone())).unwrap();
             assert_eq!(pivot_type_from_field(&field).unwrap(), ty);
         }
     }
@@ -814,8 +849,46 @@ mod tests {
     /// primitive mapping without one.
     #[test]
     fn signed_columns_round_trip_without_a_metadata_tag() {
-        let field = build_delta_field("id", &Type::Int32).unwrap();
+        let field = build_delta_field(&Column::new("id", Type::Int32)).unwrap();
         assert!(!field.metadata.contains_key(PIVOT_LOGICAL_TYPE_KEY));
         assert_eq!(pivot_type_from_field(&field).unwrap(), Type::Int32);
+    }
+
+    /// A generated column's expression is stored under Delta's own key and comes
+    /// back with the column, so a table reopened from its log still knows which
+    /// columns it computes on write.
+    #[test]
+    fn generation_expression_round_trips_through_field_metadata() {
+        let column = Column::generated(
+            "day",
+            Type::Int32,
+            GenerationExpression::new("date_trunc('day', ts)"),
+        );
+
+        let field = build_delta_field(&column).unwrap();
+
+        assert_eq!(
+            generation_expression_from_field(&field),
+            Some(GenerationExpression::new("date_trunc('day', ts)"))
+        );
+    }
+
+    /// The generation expression rides alongside the type tag rather than
+    /// replacing it, so an unsigned generated column keeps both.
+    #[test]
+    fn a_generated_unsigned_column_keeps_its_type_tag() {
+        let column = Column::generated(
+            "bucket",
+            Type::UInt32,
+            GenerationExpression::new("id % 100"),
+        );
+
+        let field = build_delta_field(&column).unwrap();
+
+        assert_eq!(pivot_type_from_field(&field).unwrap(), Type::UInt32);
+        assert_eq!(
+            generation_expression_from_field(&field),
+            Some(GenerationExpression::new("id % 100"))
+        );
     }
 }

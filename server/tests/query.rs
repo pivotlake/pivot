@@ -40,6 +40,16 @@ async fn select_rows(client: &Client, sql: &str) -> Vec<Vec<Option<String>>> {
         .collect()
 }
 
+/// The message the server sent back for a failed query. `Error`'s own
+/// `Display` is just "db error", so tests that assert on what went wrong read
+/// the `DbError` underneath it.
+fn db_error_message(error: &tokio_postgres::Error) -> String {
+    match error.as_db_error() {
+        Some(db_error) => db_error.message().to_string(),
+        None => error.to_string(),
+    }
+}
+
 /// Write `batch` as a single parquet file inside a fresh tempdir and return
 /// the directory (kept alive by the caller — drop it to clean up).
 fn write_parquet(batch: &RecordBatch) -> TempDir {
@@ -65,6 +75,24 @@ fn people_batch() -> RecordBatch {
     let id: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2, 3]));
     let name: ArrayRef = Arc::new(StringArray::from(vec!["alice", "bob", "carol"]));
     RecordBatch::try_new(schema, vec![id, name]).unwrap()
+}
+
+/// (value BIGINT, doubled BIGINT GENERATED, label VARCHAR) over an empty
+/// directory, so the table starts with no rows and every row it holds arrives
+/// through an INSERT. The generated column sits in the middle of the column
+/// list so a computed value has to land in the right place.
+async fn create_measurements_table(client: &Client, table: &str, dir: &Path) {
+    let path = dir.to_str().unwrap();
+    client
+        .simple_query(&format!(
+            "CREATE TABLE {table} (
+                 value BIGINT,
+                 doubled BIGINT GENERATED ALWAYS AS (value * 2),
+                 label VARCHAR
+             ) WITH (path = '{path}')"
+        ))
+        .await
+        .unwrap();
 }
 
 async fn create_people_table(client: &Client, table: &str, dir: &Path) {
@@ -458,5 +486,229 @@ async fn query_against_unknown_table_errors(#[future] conn: Conn) {
             || err.to_string().to_lowercase().contains("not found")
             || err.code().is_some(),
         "expected a structured pgwire error, got: {err}",
+    );
+}
+
+/// A generated column's value is computed from the inserted row and stored, so
+/// reading it back returns the computed value.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn generated_column_is_computed_on_insert(#[future] conn: Conn) {
+    let dir = TempDir::new().unwrap();
+    create_measurements_table(&conn, "measurements_computed", dir.path()).await;
+
+    conn.simple_query("INSERT INTO measurements_computed VALUES (21, 'ok'), (50, 'high')")
+        .await
+        .unwrap();
+
+    let rows = select_rows(
+        &conn,
+        "SELECT value, doubled, label FROM measurements_computed ORDER BY value",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("21".into()), Some("42".into()), Some("ok".into())],
+            vec![Some("50".into()), Some("100".into()), Some("high".into())],
+        ]
+    );
+}
+
+/// A generated column can be read on its own, filtered on, and aggregated, like
+/// any other stored column.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn generated_column_reads_like_a_stored_column(#[future] conn: Conn) {
+    let dir = TempDir::new().unwrap();
+    create_measurements_table(&conn, "measurements_read", dir.path()).await;
+    conn.simple_query("INSERT INTO measurements_read VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        .await
+        .unwrap();
+
+    let filtered = select_rows(
+        &conn,
+        "SELECT value FROM measurements_read WHERE doubled > 2 ORDER BY value",
+    )
+    .await;
+    let total = select_one_i64(&conn, "SELECT SUM(doubled) FROM measurements_read").await;
+
+    assert_eq!(
+        filtered,
+        vec![vec![Some("2".into())], vec![Some("3".into())]]
+    );
+    assert_eq!(total, 12);
+}
+
+/// Values cannot be supplied for a generated column: it is computed, never
+/// written by the statement.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn inserting_into_a_generated_column_is_rejected(#[future] conn: Conn) {
+    let dir = TempDir::new().unwrap();
+    create_measurements_table(&conn, "measurements_rejected", dir.path()).await;
+
+    let err = conn
+        .simple_query("INSERT INTO measurements_rejected (doubled) VALUES (4)")
+        .await
+        .unwrap_err();
+
+    assert!(
+        db_error_message(&err).contains("generated column"),
+        "expected a rejection naming the generated column, got: {}",
+        db_error_message(&err)
+    );
+}
+
+/// Supplying a value for every column of the table, generated one included, is
+/// a row too wide: the statement only supplies the columns it owns.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_row_that_includes_the_generated_column_is_rejected(#[future] conn: Conn) {
+    let dir = TempDir::new().unwrap();
+    create_measurements_table(&conn, "measurements_too_wide", dir.path()).await;
+
+    let err = conn
+        .simple_query("INSERT INTO measurements_too_wide VALUES (1, 2, 'a')")
+        .await
+        .unwrap_err();
+
+    let message = db_error_message(&err);
+    assert!(
+        message.contains("2 columns") && message.contains("3 values"),
+        "expected a column-count rejection, got: {message}"
+    );
+}
+
+/// Rows can come from a query rather than a literal list; the generated column
+/// is computed from them the same way.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn generated_column_is_computed_for_an_inserted_query(#[future] conn: Conn) {
+    let source = write_parquet(&people_batch());
+    create_people_table(&conn, "people_source", source.path()).await;
+    let dir = TempDir::new().unwrap();
+    create_measurements_table(&conn, "measurements_from_select", dir.path()).await;
+
+    conn.simple_query("INSERT INTO measurements_from_select SELECT id, name FROM people_source")
+        .await
+        .unwrap();
+
+    let rows = select_rows(
+        &conn,
+        "SELECT value, doubled FROM measurements_from_select ORDER BY value",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("2".into())],
+            vec![Some("2".into()), Some("4".into())],
+            vec![Some("3".into()), Some("6".into())],
+        ]
+    );
+}
+
+/// A generated column is stored, so it can partition the table it belongs to:
+/// the value each row is filed under is computed as the row is written.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_table_can_be_partitioned_by_a_generated_column(#[future] conn: Conn) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_str().unwrap();
+    conn.simple_query(&format!(
+        "CREATE TABLE measurements_partitioned (
+             value BIGINT,
+             bucket BIGINT GENERATED ALWAYS AS (CASE WHEN value > 2 THEN 1 ELSE 0 END)
+         ) WITH (path = '{path}', partition_by = 'bucket')"
+    ))
+    .await
+    .unwrap();
+
+    conn.simple_query("INSERT INTO measurements_partitioned VALUES (1), (2), (3), (4)")
+        .await
+        .unwrap();
+
+    let rows = select_rows(
+        &conn,
+        "SELECT value FROM measurements_partitioned WHERE bucket = 0 ORDER BY value",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Some("1".into())], vec![Some("2".into())]]);
+}
+
+/// Reading the table an insert writes into is allowed: the generated column's
+/// value on the read side is the same value the write side stores, since both
+/// come from the one expression.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_table_can_be_inserted_into_from_itself(#[future] conn: Conn) {
+    let dir = TempDir::new().unwrap();
+    create_measurements_table(&conn, "measurements_self", dir.path()).await;
+    conn.simple_query("INSERT INTO measurements_self VALUES (5, 'a')")
+        .await
+        .unwrap();
+
+    conn.simple_query(
+        "INSERT INTO measurements_self SELECT value + 1, label FROM measurements_self",
+    )
+    .await
+    .unwrap();
+
+    let rows = select_rows(
+        &conn,
+        "SELECT value, doubled FROM measurements_self ORDER BY value",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("5".into()), Some("10".into())],
+            vec![Some("6".into()), Some("12".into())],
+        ]
+    );
+}
+
+/// A generation expression can read a column declared after it. The columns the
+/// expression reads are addressed by their position among the table's stored
+/// columns, which the generated column itself is not part of on the way in.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_generated_column_can_read_a_later_column(#[future] conn: Conn) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().to_str().unwrap();
+    conn.simple_query(&format!(
+        "CREATE TABLE measurements_backwards (
+             value BIGINT,
+             label_length BIGINT GENERATED ALWAYS AS (length(label)),
+             label VARCHAR
+         ) WITH (path = '{path}')"
+    ))
+    .await
+    .unwrap();
+
+    conn.simple_query("INSERT INTO measurements_backwards VALUES (1, 'ok'), (2, 'high')")
+        .await
+        .unwrap();
+
+    let rows = select_rows(
+        &conn,
+        "SELECT value, label_length, label FROM measurements_backwards ORDER BY value",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("2".into()), Some("ok".into())],
+            vec![Some("2".into()), Some("4".into()), Some("high".into())],
+        ]
     );
 }

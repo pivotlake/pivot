@@ -96,16 +96,7 @@ impl Catalog for SingleTableCatalog {
 }
 
 fn two_int_cols() -> Vec<Column> {
-    vec![
-        Column {
-            name: "a".to_string(),
-            col_type: Type::Int32,
-        },
-        Column {
-            name: "b".to_string(),
-            col_type: Type::Int32,
-        },
-    ]
+    vec![Column::new("a", Type::Int32), Column::new("b", Type::Int32)]
 }
 
 fn build_planner(table: RecordingTable) -> (Planner, Arc<SingleTableCatalog>) {

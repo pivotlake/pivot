@@ -46,10 +46,7 @@ impl TableFunction for MetadataTableFunction {
             arguments: vec![Type::Utf8],
             columns: COLUMNS
                 .iter()
-                .map(|(name, col_type)| Column {
-                    name: name.to_string(),
-                    col_type: col_type.clone(),
-                })
+                .map(|(name, col_type)| Column::new(name.to_string(), col_type.clone()))
                 .collect(),
         }
     }

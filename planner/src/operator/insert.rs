@@ -10,6 +10,11 @@ use crate::compile::Error;
 #[derive(Debug)]
 pub struct Insert {
     pub table: Box<dyn Table>,
+    /// The target's name, as the statement referenced it. Kept so the planner
+    /// can bind the target's generated columns against it (see
+    /// [`Planner::plan`](crate::Planner::plan)), which happens after the walk
+    /// that builds this operator.
+    pub table_name: String,
 }
 
 impl fmt::Display for Insert {

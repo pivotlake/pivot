@@ -168,10 +168,7 @@ mod tests {
         };
         let request = CreateTableRequest {
             name: name.to_string(),
-            columns: vec![Column {
-                name: "Timestamp".to_string(),
-                col_type: planner::types::Type::Int64,
-            }],
+            columns: vec![Column::new("Timestamp", planner::types::Type::Int64)],
             options,
             if_not_exists: false,
         };

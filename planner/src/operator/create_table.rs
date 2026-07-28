@@ -22,7 +22,15 @@ impl fmt::Display for CreateTable {
             .request
             .columns
             .iter()
-            .map(|c| format!("{}:{}", c.name, c.col_type))
+            .map(|c| match &c.generated {
+                Some(expression) => format!(
+                    "{}:{} generated as ({})",
+                    c.name,
+                    c.col_type,
+                    expression.sql()
+                ),
+                None => format!("{}:{}", c.name, c.col_type),
+            })
             .collect::<Vec<_>>()
             .join(", ");
         // Sort by key so the rendered output is deterministic — `HashMap`

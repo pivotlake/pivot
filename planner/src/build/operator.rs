@@ -19,7 +19,7 @@ use duckdb_planner::handle::{
 };
 
 use super::{BuildCtx, build_scan_columns};
-use crate::catalog::{Column, CreateTableRequest, DuckDBTableAdapter, Table};
+use crate::catalog::{Column, CreateTableRequest, DuckDBTableAdapter, GenerationExpression, Table};
 use crate::expression::{Error as ExpressionError, Expression};
 use crate::operator::{
     Aggregate, CreateTable, Error as OperatorError, Filter, Input, Insert, Limit, OrderBy,
@@ -64,6 +64,7 @@ impl Insert {
             ));
         }
         Ok(Insert {
+            table_name: view.table_name(),
             table: resolve_table(*view.take_table()),
         })
     }
@@ -175,10 +176,15 @@ impl CreateTable {
                 name: view.name(),
                 columns: view
                     .columns()
-                    .map(|(name, col_type)| {
-                        Ok(Column {
-                            name,
-                            col_type: type_from_logical(col_type)?,
+                    .map(|column| {
+                        let col_type = type_from_logical(column.col_type)?;
+                        Ok(match column.generation_expression {
+                            Some(expression) => Column::generated(
+                                column.name,
+                                col_type,
+                                GenerationExpression::new(expression),
+                            ),
+                            None => Column::new(column.name, col_type),
                         })
                     })
                     .collect::<Result<Vec<_>, OperatorError>>()?,
