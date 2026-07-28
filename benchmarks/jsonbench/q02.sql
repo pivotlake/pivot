@@ -1,0 +1,1 @@
+SELECT CAST(j->'commit'->'collection' AS VARCHAR) AS event, count(*) AS count, count(DISTINCT CAST(j->'did' AS VARCHAR)) AS users FROM bluesky WHERE CAST(j->'kind' AS VARCHAR) = 'commit' AND CAST(j->'commit'->'operation' AS VARCHAR) = 'create' GROUP BY event ORDER BY count DESC, event;

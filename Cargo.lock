@@ -942,11 +942,16 @@ dependencies = [
 name = "benchmarks"
 version = "0.1.0"
 dependencies = [
+ "arrow-array 58.0.0",
+ "arrow-schema 58.0.0",
  "catalog",
  "chrono",
  "clap",
+ "compact",
  "core_affinity",
  "dispatch",
+ "flate2",
+ "parquet-variant-compute",
  "planner",
  "serde",
  "serde_json",
@@ -3516,6 +3521,7 @@ dependencies = [
  "base64",
  "chrono",
  "parquet-variant",
+ "serde",
  "serde_json",
  "uuid",
 ]
@@ -4733,6 +4739,7 @@ dependencies = [
  "include_dir",
  "libc",
  "parquet 58.0.0",
+ "parquet-variant-compute",
  "pgwire",
  "planner",
  "rstest",
