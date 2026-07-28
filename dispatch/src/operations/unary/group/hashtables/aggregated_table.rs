@@ -468,15 +468,8 @@ struct ProbeWindow<'a, 'b, K: KeyExtractor, V: AggregationValue> {
 }
 
 impl<K: KeyExtractor, V: AggregationValue> ArityBody<bool> for ProbeWindow<'_, '_, K, V> {
-    /// Outlined on purpose: every specialised arity's probe loop gets its own
-    /// function, frame, and register allocation. Inlined, all the arity bodies
-    /// (plus the scatter ones) would share one giant `consume_window` frame,
-    /// and its register pressure puts spill traffic inside every loop; the
-    /// call happens once per window, so it costs nothing per row.
-    #[inline(never)]
+    #[inline(always)]
     fn run<const N: usize>(self) -> bool {
-        const L1_DISTANCE: usize = 16;
-        const L2_DISTANCE: usize = 48;
         let ProbeWindow {
             table,
             key_arena,
@@ -489,6 +482,53 @@ impl<K: KeyExtractor, V: AggregationValue> ArityBody<bool> for ProbeWindow<'_, '
             value_reader,
             shared_context,
         } = self;
+        probe_rows::<N, K, V>(
+            table,
+            key_arena,
+            worker_context,
+            hashes,
+            zero_hash_seen,
+            i,
+            length,
+            key_reader,
+            value_reader,
+            shared_context,
+        )
+    }
+}
+
+/// [`ProbeWindow`]'s loop as an outlined free function.
+///
+/// Outlined on purpose: every specialised arity's probe loop gets its own
+/// function, frame, and register allocation. Inlined, all the arity bodies
+/// (plus the scatter ones) would share one giant `consume_window` frame, and
+/// its register pressure puts spill traffic inside every loop; the call
+/// happens once per window, so it costs nothing per row.
+///
+/// A free function with one reference parameter per piece of state, rather
+/// than a method on the window struct: reference *parameters* carry the
+/// no-alias guarantees the optimizer needs to hoist the readers' column
+/// pointers out of the loop across the probe's raw-pointer entry writes.
+/// Reached through struct fields they are plain loaded pointers with no such
+/// guarantee, and every reader access reloads per row (measured as a
+/// per-row, per-slot dependent-load chain on a runtime-arity fold).
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn probe_rows<const N: usize, K: KeyExtractor, V: AggregationValue>(
+    table: &mut MultiSlabTable<K, V>,
+    key_arena: &mut WorkerArena,
+    worker_context: &mut V::WorkerContext,
+    hashes: &[u64; RECORD_BATCH_SIZE],
+    zero_hash_seen: &mut bool,
+    i: &mut usize,
+    length: usize,
+    key_reader: &K::Reader<'_>,
+    value_reader: &V::Reader<'_>,
+    shared_context: &V::SharedContext,
+) -> bool {
+    {
+        const L1_DISTANCE: usize = 16;
+        const L2_DISTANCE: usize = 48;
         // Probe through one `Prober` for the whole window, so the entry layout
         // lives in registers across rows instead of being re-loaded per row
         // and per probe step.

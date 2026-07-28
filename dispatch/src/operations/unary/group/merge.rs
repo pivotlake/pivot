@@ -268,6 +268,7 @@ struct MergeCombined<'a, K: KeyExtractor, V: AggregationValue> {
 impl<K: KeyExtractor, V: AggregationValue> ArityBody<MultiSlabTable<K, V>>
     for MergeCombined<'_, K, V>
 {
+    #[inline(always)]
     fn run<const N: usize>(self) -> MultiSlabTable<K, V> {
         let MergeCombined {
             partition,
@@ -278,6 +279,34 @@ impl<K: KeyExtractor, V: AggregationValue> ArityBody<MultiSlabTable<K, V>>
             key_arena,
             cfg,
         } = self;
+        merge_combined_rows::<N, K, V>(
+            partition,
+            buffers,
+            tables,
+            partition_capacity,
+            num_partitions,
+            key_arena,
+            cfg,
+        )
+    }
+}
+
+/// [`MergeCombined`]'s body as a free function with one reference parameter
+/// per piece of state: reference parameters carry the no-alias guarantees
+/// that let the fold loops keep the key arena and slot context in registers
+/// across the target's raw-pointer entry writes (see `probe_rows` in
+/// `aggregated_table.rs` for the full rationale).
+#[allow(clippy::too_many_arguments)]
+fn merge_combined_rows<const N: usize, K: KeyExtractor, V: AggregationValue>(
+    partition: usize,
+    buffers: &[PartitionBuffers<K, V>],
+    tables: &[MultiSlabTable<K, V>],
+    partition_capacity: usize,
+    num_partitions: usize,
+    key_arena: &SharedArena,
+    cfg: &V::SharedContext,
+) -> MultiSlabTable<K, V> {
+    {
         let partition_bits = num_partitions.trailing_zeros();
         let mut allocator = SlabAllocator::new(true);
         let mut cap = partition_capacity.max(DEFAULT_CAPACITY);
