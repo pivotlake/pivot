@@ -1,13 +1,8 @@
-//! Hash table infrastructure for GROUP BY aggregation.
+//! Hash tables used by grouped aggregation.
 //!
-//! This module wires together the generic [`BaseHashTable`] with the
-//! [`KeyExtractor`] trait to produce concrete table types parameterized
-//! by key extraction strategy.
-//!
-//! - [`Table<K, V>`] — a `BaseHashTable` whose key type is derived from
-//!   `K: KeyExtractor`.
-//! - [`AggregatedTable<K, V>`] — the per-worker accumulator used during the
-//!   consume phase.
+//! [`Table`] stores one key and aggregation value per group.
+//! [`AggregatedTable`] owns the tables built by a single worker and decides
+//! when to partition them for parallel merging.
 
 use crate::operations::unary::group::hashtables::hash_table::BaseHashTable;
 pub use crate::operations::unary::group::keys::KeyExtractor;
@@ -25,9 +20,8 @@ pub use aggregated_table::{AggregatedTable, AggregatedTableOutput, PartitionBuff
 /// Initial number of slots for a new per-worker hash table.
 pub const DEFAULT_CAPACITY: usize = 128;
 
-/// A [`BaseHashTable`] parameterized by a key extractor and an aggregation
-/// value.
+/// A table whose persisted key type comes from `K`.
 pub type Table<K, V> = BaseHashTable<<K as KeyExtractor>::Persisted, V>;
 
-/// The per-worker and merge-phase table type (slab-backed, may span slabs).
+/// A slab-backed table used both while consuming rows and while merging.
 pub type MultiSlabTable<K, V> = Table<K, V>;

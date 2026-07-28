@@ -18,8 +18,8 @@ use arrow_schema::{DataType, Field, Schema};
 
 use common::*;
 use dispatch::{
-    AggregationKind, AggregationSlot, Compiled, Contains, CountSlot, IntKeyExtractor, OrderBy,
-    RowKeyExtractor, RowKeySchema, StringKeyExtractor, Variable, values_input,
+    AggregationKind, AggregationSlot, Compiled, Contains, CountSlot, Dynamic, IntKeyExtractor,
+    OrderBy, RowKeyExtractor, RowKeySchema, StringKeyExtractor, values_input,
 };
 
 #[test]
@@ -272,7 +272,7 @@ fn group_by_sum_float_values() {
 
     let results = values_input(&dispatch, vec![batch])
         .record_batches()
-        .group_by_aggregate::<IntKeyExtractor<Int64Type>, Variable<i64, false>>(
+        .group_by_aggregate::<IntKeyExtractor<Int64Type>, Dynamic<i64, false>>(
             vec![0],
             vec![AggregationSlot::new(
                 AggregationKind::Sum,
@@ -310,7 +310,7 @@ fn group_by_sum_decimal128_does_not_clip_to_i64() {
 
     let results = values_input(&dispatch, vec![batch])
         .record_batches()
-        .group_by_aggregate::<IntKeyExtractor<Int64Type>, Variable<i128, false>>(
+        .group_by_aggregate::<IntKeyExtractor<Int64Type>, Dynamic<i128, false>>(
             vec![0],
             vec![AggregationSlot::new(
                 AggregationKind::Sum,

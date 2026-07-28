@@ -1,354 +1,392 @@
-//! The runtime per-slot fold machinery: [`BoundSlot`] (a slot's bound reader
-//! for a batch) and the per-slot `seed`/`update`/`merge`/`finish` helpers the
-//! runtime-arity [`Variable`](super::Variable) container folds through.
+//! Runtime aggregation container.
 //!
-//! [`BoundSlot`] carries one variant *per (op, width family)*: the column is
-//! downcast into an [`I64Reader`]/[`F64Reader`]/[`U128Reader`] payload (see
-//! [`readers`]), and the fold drives every slot through the *same*
-//! `Op::<A>::update(cell, read, …)`. The cell is `A` in and `A` out for every
-//! op — a string extreme's `ArenaKey`, a float's raw `f64` bits, and a wide
-//! `i128` partial are all just the bits of `A` (`= i128`), viewed by the op
-//! via [`StringCell`]/[`F64Cell`]/[`WideCell`], so the fold never reinterprets
-//! and never branches on the value's family.
+//! [`Dynamic`] handles signatures whose number of aggregation slots is known
+//! while building a query, but not encoded in a Rust type.
 //!
-//! Generic over `A` (`i64` narrow / `i128` wide) and `ONLY_ADDITIVE` (the
-//! branch-free additive fast path). A string extreme, a float value, and a
-//! re-read wide partial all ride the wide (`i128`) instantiation; the `i64`
-//! arms of those cell traits are the fail-out (the planner always widens such
-//! a signature).
-
-mod readers;
+//! A table entry stores the accumulator cells inline:
+//!
+//! ```text
+//! hash | key | cell 0 | cell 1 | ... | cell n
+//! ```
+//!
+//! The shared query context supplies `n`; it is not repeated in every entry.
+//! `A` selects `i64` or `i128` accumulator storage. `ONLY_ADDITIVE` removes the
+//! per-slot operation dispatch when every slot merges with addition.
+//!
+//! Scatter rows use the same inline cell layout. [`Dynamic`] itself is only an
+//! owned handle used by top-k, where its pointer refers to a copy in the value
+//! arena.
 
 use super::super::cell::{F64Cell, IntCell, StringCell, WideCell};
-use super::super::fold::Fold;
-use super::super::read::{Read, StrRead};
 use super::super::{
-    AggregationKind, AggregationSlot, Count, F64Max, F64Min, F64Sum, Max, Min, StrMax, StrMin, Sum,
-    U128Max, U128Min, U128Sum,
+    AggregationSlot, AggregationValue, ArityBody, SharedContext, ValueColumnBuilder,
 };
+mod operations;
+mod readers;
+
 use crate::arrays::SlabColumn;
+use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
-use arrow_array::{ArrayRef, RecordBatch, StringViewArray};
-use arrow_schema::{DataType, Field};
+use crate::operations::unary::group::hashtables::{PersistedKey, StridedScatterRows};
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_schema::Field;
+use operations::{Operation, Operations, finish_operation, merge_operation};
 use std::sync::Arc;
 
-pub use readers::{F64Reader, I64Reader, U128Reader};
-
-/// One slot's bound reader for a batch — one variant *per (op, width family)*, the
-/// column downcast into its [`readers`] payload. Built once per batch by
-/// [`bind`](BoundSlot::bind). The `I64`/`F64`/`U128` prefixes name the value width
-/// the op folds (`i64` / `f64` / `i128`), so the container's arm reads exactly that
-/// type with no per-row `is_float` branch.
-pub enum BoundSlot<'b> {
-    Count,
-    I64Sum(I64Reader<'b>),
-    I64Min(I64Reader<'b>),
-    I64Max(I64Reader<'b>),
-    F64Sum(F64Reader<'b>),
-    F64Min(F64Reader<'b>),
-    F64Max(F64Reader<'b>),
-    U128Sum(U128Reader<'b>),
-    U128Min(U128Reader<'b>),
-    U128Max(U128Reader<'b>),
-    StrMin(&'b StringViewArray),
-    StrMax(&'b StringViewArray),
-}
-
-impl<'b> BoundSlot<'b> {
-    pub(in super::super) fn bind(batch: &'b RecordBatch, slot: &AggregationSlot) -> Self {
-        use AggregationKind::*;
-        match slot.kind {
-            CountStar | Count => BoundSlot::Count,
-            Sum => Self::bind_numeric(
-                batch,
-                slot.column,
-                BoundSlot::I64Sum,
-                BoundSlot::F64Sum,
-                BoundSlot::U128Sum,
-            ),
-            Min => Self::bind_extreme(
-                batch,
-                slot.column,
-                BoundSlot::StrMin,
-                BoundSlot::I64Min,
-                BoundSlot::F64Min,
-                BoundSlot::U128Min,
-            ),
-            Max => Self::bind_extreme(
-                batch,
-                slot.column,
-                BoundSlot::StrMax,
-                BoundSlot::I64Max,
-                BoundSlot::F64Max,
-                BoundSlot::U128Max,
-            ),
-        }
-    }
-
-    /// Pick the reader for a `SUM` column by its width family — an integer column
-    /// reads as `i64`, a float as `f64`, a `Decimal128` (a re-read wide partial) as
-    /// `i128` — and wrap it in the caller's matching op variant.
-    fn bind_numeric(
-        batch: &'b RecordBatch,
-        column: usize,
-        on_i64: fn(I64Reader<'b>) -> Self,
-        on_f64: fn(F64Reader<'b>) -> Self,
-        on_u128: fn(U128Reader<'b>) -> Self,
-    ) -> Self {
-        match batch.column(column).data_type() {
-            DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                on_i64(I64Reader::bind(batch, column))
-            }
-            DataType::Float32 | DataType::Float64 => on_f64(F64Reader::bind(batch, column)),
-            DataType::Decimal128(_, _) => on_u128(U128Reader::bind(batch, column)),
-            other => panic!("numeric aggregate over unsupported column type {other:?}"),
-        }
-    }
-
-    /// A `MIN`/`MAX` picks its op by column type: a `Utf8` column reads the string
-    /// extreme (the raw `&str`, folded through the value arena); any other column is
-    /// numeric ([`bind_numeric`](BoundSlot::bind_numeric)).
-    fn bind_extreme(
-        batch: &'b RecordBatch,
-        column: usize,
-        on_str: fn(&'b StringViewArray) -> Self,
-        on_i64: fn(I64Reader<'b>) -> Self,
-        on_f64: fn(F64Reader<'b>) -> Self,
-        on_u128: fn(U128Reader<'b>) -> Self,
-    ) -> Self {
-        if let DataType::Utf8View = batch.column(column).data_type() {
-            on_str(StrRead::bind(batch, column))
-        } else {
-            Self::bind_numeric(batch, column, on_i64, on_f64, on_u128)
-        }
-    }
-}
-
-/// Seed one slot's cell from row `idx`, a new group's first value: the
-/// per-slot fold of the runtime-arity [`Variable`](super::Variable) container.
-/// Only a string arm touches the `WorkerArena`; the numeric `seed`s take their
-/// value directly.
+/// Owned handle to a dynamic aggregation value copied into the value arena.
 ///
-/// `ONLY_ADDITIVE` prunes each non-additive arm *in its body*: `if
-/// ONLY_ADDITIVE { unreachable!() } else { .. }` const-folds to a bare
-/// `unreachable!()` arm. A `_ if ONLY_ADDITIVE` guard arm instead lowers
-/// to a worse Count/Sum dispatch (measured ~2.3B more in `consume_window`).
-/// `Count` and the integer/wide `SUM` arms carry no guard; they are the
-/// additive ops the fast path keeps.
-#[inline(always)]
-pub(in super::super) fn seed_slot<
+/// Hash tables and scatter buffers store the cells inline. This handle exists
+/// for top-k rows, which must outlive their source table.
+pub struct Dynamic<
+    A: IntCell + StringCell + F64Cell + WideCell = i64,
+    const ONLY_ADDITIVE: bool = false,
+> {
+    /// Arena allocation containing one cell per slot. The default value is
+    /// null and is never read.
+    cells: *mut A,
+}
+
+// SAFETY: every non-null pointer refers to an independent allocation in the
+// shared arena. The arena outlives every Dynamic handle, and normal table
+// handoffs provide synchronization between writers and readers.
+unsafe impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Send
+    for Dynamic<A, ONLY_ADDITIVE>
+{
+}
+unsafe impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Sync
+    for Dynamic<A, ONLY_ADDITIVE>
+{
+}
+
+impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Copy
+    for Dynamic<A, ONLY_ADDITIVE>
+{
+}
+impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Clone
+    for Dynamic<A, ONLY_ADDITIVE>
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Default
+    for Dynamic<A, ONLY_ADDITIVE>
+{
+    fn default() -> Self {
+        Self {
+            cells: std::ptr::null_mut(),
+        }
+    }
+}
+
+impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> AggregationValue
+    for Dynamic<A, ONLY_ADDITIVE>
+{
+    type Stored = [A];
+    /// Number of cells stored in each table entry.
+    type StorageMetadata = usize;
+    /// Scatter rows carry cells inline at a query-specific stride.
+    type Scatter<KP: PersistedKey> = StridedScatterRows<KP, Self>;
+    type Reader<'b> = Operations<'b>;
+    /// Slot descriptors and the arena used by strings and owned top-k copies.
+    type SharedContext = (Arc<[AggregationSlot]>, Arc<SharedArena>);
+    type ColumnBuilder = DynamicColumnBuilder<A, ONLY_ADDITIVE>;
+    type SortKey = i128;
+    /// Per-worker arena handle for winning strings and owned copies.
+    type WorkerContext = WorkerArena;
+
+    fn make_reader<'b>(batch: &'b RecordBatch, slots: &[AggregationSlot]) -> Operations<'b> {
+        Operations::bind(batch, slots)
+    }
+
+    fn storage_metadata(ctx: &Self::SharedContext) -> usize {
+        ctx.0.len()
+    }
+
+    fn metadata_for_arity<const N: usize>() -> usize {
+        N
+    }
+
+    #[inline(always)]
+    fn dispatch_arity<R>(metadata: usize, body: impl ArityBody<R>) -> R {
+        // Specialize common arities. The fallback keeps code size bounded for
+        // larger signatures.
+        match metadata {
+            1 => body.run::<1>(),
+            2 => body.run::<2>(),
+            3 => body.run::<3>(),
+            4 => body.run::<4>(),
+            _ => body.run::<0>(),
+        }
+    }
+
+    fn stored_size(metadata: usize) -> usize {
+        metadata * size_of::<A>()
+    }
+
+    fn stored_align() -> usize {
+        align_of::<A>()
+    }
+
+    #[inline(always)]
+    unsafe fn stored_ref<'a>(ptr: *const u8, metadata: usize) -> &'a [A] {
+        unsafe { std::slice::from_raw_parts(ptr as *const A, metadata) }
+    }
+
+    #[inline(always)]
+    unsafe fn stored_mut<'a>(ptr: *mut u8, metadata: usize) -> &'a mut [A] {
+        unsafe { std::slice::from_raw_parts_mut(ptr as *mut A, metadata) }
+    }
+
+    #[inline(always)]
+    fn seed_stored(
+        destination: &mut [A],
+        operations: &Self::Reader<'_>,
+        idx: usize,
+        worker_context: &mut WorkerArena,
+    ) {
+        let operations = operations.as_slice();
+        debug_assert_eq!(destination.len(), operations.len());
+        // Constant lengths let LLVM unroll the common small signatures.
+        // Larger signatures use the ordinary slice loop to limit generated
+        // code and register pressure.
+        match destination.len() {
+            1 => Self::seed_fixed::<1>(destination, operations, idx, worker_context),
+            2 => Self::seed_fixed::<2>(destination, operations, idx, worker_context),
+            3 => Self::seed_fixed::<3>(destination, operations, idx, worker_context),
+            4 => Self::seed_fixed::<4>(destination, operations, idx, worker_context),
+            _ => {
+                for (cell, operation) in destination.iter_mut().zip(operations.iter()) {
+                    *cell = operation.seed::<A, ONLY_ADDITIVE>(idx, worker_context);
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn update_stored(
+        destination: &mut [A],
+        operations: &Self::Reader<'_>,
+        idx: usize,
+        worker_context: &mut WorkerArena,
+        context: &Self::SharedContext,
+    ) {
+        let (_, shared) = context;
+        let operations = operations.as_slice();
+        // Match `seed_stored` so repeated-key updates also unroll.
+        match destination.len() {
+            1 => Self::update_fixed::<1>(destination, operations, idx, worker_context, shared),
+            2 => Self::update_fixed::<2>(destination, operations, idx, worker_context, shared),
+            3 => Self::update_fixed::<3>(destination, operations, idx, worker_context, shared),
+            4 => Self::update_fixed::<4>(destination, operations, idx, worker_context, shared),
+            _ => {
+                for (cell, operation) in destination.iter_mut().zip(operations.iter()) {
+                    *cell =
+                        operation.update::<A, ONLY_ADDITIVE>(*cell, idx, worker_context, shared);
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn merge_stored(destination: &mut [A], source: &[A], context: &Self::SharedContext) {
+        // Match `seed_stored` so common merge signatures unroll.
+        match destination.len() {
+            1 => Self::merge_fixed::<1>(destination, source, context),
+            2 => Self::merge_fixed::<2>(destination, source, context),
+            3 => Self::merge_fixed::<3>(destination, source, context),
+            4 => Self::merge_fixed::<4>(destination, source, context),
+            _ => {
+                let (slots, shared) = context;
+                for ((destination_cell, &source_cell), slot) in
+                    destination.iter_mut().zip(source.iter()).zip(slots.iter())
+                {
+                    *destination_cell = if ONLY_ADDITIVE {
+                        *destination_cell + source_cell
+                    } else {
+                        merge_operation(*destination_cell, source_cell, slot, shared)
+                    };
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn clone_stored(destination: &mut [A], source: &[A]) {
+        // Constant-size copies compile to direct loads and stores. Larger
+        // values use the slice implementation.
+        match destination.len() {
+            1 => Self::clone_fixed::<1>(destination, source),
+            2 => Self::clone_fixed::<2>(destination, source),
+            3 => Self::clone_fixed::<3>(destination, source),
+            4 => Self::clone_fixed::<4>(destination, source),
+            _ => destination.copy_from_slice(source),
+        }
+    }
+
+    #[inline(always)]
+    fn sort_key_stored(stored: &[A], slot: usize) -> i128 {
+        // The planner only requests top-k sort keys for numeric slots.
+        stored[slot].into()
+    }
+
+    fn to_owned(
+        stored: &[A],
+        context: &Self::SharedContext,
+        worker_context: &mut Option<WorkerArena>,
+    ) -> Self {
+        let worker_context = worker_context.get_or_insert_with(|| context.worker());
+        let cells: *mut A = worker_context.alloc_cells(stored.len());
+        unsafe { std::ptr::copy_nonoverlapping(stored.as_ptr(), cells, stored.len()) };
+        Self { cells }
+    }
+}
+
+impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool>
+    Dynamic<A, ONLY_ADDITIVE>
+{
+    /// Returns the owned cell block using the slot count from the query context.
+    ///
+    /// # Safety
+    /// `len` must equal the allocation's cell count.
+    unsafe fn cells(&self, len: usize) -> &[A] {
+        unsafe { std::slice::from_raw_parts(self.cells, len) }
+    }
+
+    /// Seeds a fixed-size cell array so the slot loop can unroll.
+    #[inline(always)]
+    fn seed_fixed<const N: usize>(
+        destination: &mut [A],
+        operations: &[Operation<'_>],
+        idx: usize,
+        worker_context: &mut WorkerArena,
+    ) {
+        // SAFETY: the caller dispatched after matching both lengths to `N`.
+        debug_assert!(destination.len() == N && operations.len() == N);
+        let destination = unsafe { &mut *(destination.as_mut_ptr() as *mut [A; N]) };
+        let operations = unsafe { &*(operations.as_ptr() as *const [Operation<'_>; N]) };
+        for operation_index in 0..N {
+            destination[operation_index] =
+                operations[operation_index].seed::<A, ONLY_ADDITIVE>(idx, worker_context);
+        }
+    }
+
+    /// Updates a fixed-size cell array so the slot loop can unroll.
+    #[inline(always)]
+    fn update_fixed<const N: usize>(
+        destination: &mut [A],
+        operations: &[Operation<'_>],
+        idx: usize,
+        worker_context: &mut WorkerArena,
+        shared: &Arc<SharedArena>,
+    ) {
+        // SAFETY: the caller dispatched after matching both lengths to `N`.
+        debug_assert!(destination.len() == N && operations.len() == N);
+        let destination = unsafe { &mut *(destination.as_mut_ptr() as *mut [A; N]) };
+        let operations = unsafe { &*(operations.as_ptr() as *const [Operation<'_>; N]) };
+        for operation_index in 0..N {
+            destination[operation_index] = operations[operation_index].update::<A, ONLY_ADDITIVE>(
+                destination[operation_index],
+                idx,
+                worker_context,
+                shared,
+            );
+        }
+    }
+
+    /// Merges fixed-size cell arrays so the slot loop can unroll.
+    #[inline(always)]
+    fn merge_fixed<const N: usize>(
+        destination: &mut [A],
+        source: &[A],
+        context: &(Arc<[AggregationSlot]>, Arc<SharedArena>),
+    ) {
+        let (slots, shared) = context;
+        // SAFETY: all three slices come from the same `N`-slot signature.
+        debug_assert!(destination.len() == N && source.len() == N && slots.len() == N);
+        let destination = unsafe { &mut *(destination.as_mut_ptr() as *mut [A; N]) };
+        let source = unsafe { &*(source.as_ptr() as *const [A; N]) };
+        for slot_index in 0..N {
+            destination[slot_index] = if ONLY_ADDITIVE {
+                // COUNT and SUM both merge by addition.
+                destination[slot_index] + source[slot_index]
+            } else {
+                merge_operation(
+                    destination[slot_index],
+                    source[slot_index],
+                    &slots[slot_index],
+                    shared,
+                )
+            };
+        }
+    }
+
+    /// Copies a fixed-size cell array with an array assignment.
+    #[inline(always)]
+    fn clone_fixed<const N: usize>(destination: &mut [A], source: &[A]) {
+        // SAFETY: the caller dispatched after matching both lengths to `N`.
+        debug_assert!(destination.len() == N && source.len() == N);
+        let destination = unsafe { &mut *(destination.as_mut_ptr() as *mut [A; N]) };
+        let source = unsafe { &*(source.as_ptr() as *const [A; N]) };
+        *destination = *source;
+    }
+}
+
+/// One output-column builder per dynamic aggregation slot.
+pub struct DynamicColumnBuilder<
     A: IntCell + StringCell + F64Cell + WideCell,
     const ONLY_ADDITIVE: bool,
->(
-    slot: &BoundSlot<'_>,
-    idx: usize,
-    wc: &mut WorkerArena,
-) -> A {
-    match slot {
-        BoundSlot::Count => Count::<A>::seed(()),
-        BoundSlot::I64Sum(r) => Sum::<A>::seed(r.read(idx)),
-        BoundSlot::U128Sum(r) => U128Sum::<A>::seed(r.read(idx)),
-        BoundSlot::I64Min(r) => {
-            if ONLY_ADDITIVE {
-                unreachable!()
-            } else {
-                Min::<A>::seed(r.read(idx))
-            }
-        }
-        BoundSlot::I64Max(r) => {
-            if ONLY_ADDITIVE {
-                unreachable!()
-            } else {
-                Max::<A>::seed(r.read(idx))
-            }
-        }
-        BoundSlot::F64Sum(r) => {
-            if ONLY_ADDITIVE {
-                unreachable!()
-            } else {
-                F64Sum::<A>::seed(r.read(idx))
-            }
-        }
-        BoundSlot::F64Min(r) => {
-            if ONLY_ADDITIVE {
-                unreachable!()
-            } else {
-                F64Min::<A>::seed(r.read(idx))
-            }
-        }
-        BoundSlot::F64Max(r) => {
-            if ONLY_ADDITIVE {
-                unreachable!()
-            } else {
-                F64Max::<A>::seed(r.read(idx))
-            }
-        }
-        BoundSlot::U128Min(r) => {
-            if ONLY_ADDITIVE {
-                unreachable!()
-            } else {
-                U128Min::<A>::seed(r.read(idx))
-            }
-        }
-        BoundSlot::U128Max(r) => {
-            if ONLY_ADDITIVE {
-                unreachable!()
-            } else {
-                U128Max::<A>::seed(r.read(idx))
-            }
-        }
-        BoundSlot::StrMin(a) => {
-            if ONLY_ADDITIVE {
-                unreachable!()
-            } else {
-                StrMin::<A>::seed(StrRead::read(a, idx), wc)
-            }
-        }
-        BoundSlot::StrMax(a) => {
-            if ONLY_ADDITIVE {
-                unreachable!()
-            } else {
-                StrMax::<A>::seed(StrRead::read(a, idx), wc)
-            }
-        }
-    }
+> {
+    builders: Vec<SlabColumn<A>>,
 }
 
-/// Fold row `idx` into one slot's existing cell. A numeric arm folds its own cell
-/// (no context); a string arm folds into the real `WorkerArena` and resolves the
-/// current extreme through `shared`. Per-arm `ONLY_ADDITIVE` pruning as in
-/// [`seed_slot`].
-#[inline(always)]
-pub(in super::super) fn update_slot<
-    A: IntCell + StringCell + F64Cell + WideCell,
-    const ONLY_ADDITIVE: bool,
->(
-    cell: A,
-    slot: &BoundSlot<'_>,
-    idx: usize,
-    wc: &mut WorkerArena,
-    shared: &Arc<SharedArena>,
-) -> A {
-    match slot {
-        BoundSlot::Count => Count::<A>::update(cell, ()),
-        BoundSlot::I64Sum(r) => Sum::<A>::update(cell, r.read(idx)),
-        BoundSlot::U128Sum(r) => U128Sum::<A>::update(cell, r.read(idx)),
-        BoundSlot::I64Min(r) => {
-            if ONLY_ADDITIVE {
-                unreachable!()
-            } else {
-                Min::<A>::update(cell, r.read(idx))
-            }
-        }
-        BoundSlot::I64Max(r) => {
-            if ONLY_ADDITIVE {
-                unreachable!()
-            } else {
-                Max::<A>::update(cell, r.read(idx))
-            }
-        }
-        BoundSlot::F64Sum(r) => {
-            if ONLY_ADDITIVE {
-                unreachable!()
-            } else {
-                F64Sum::<A>::update(cell, r.read(idx))
-            }
-        }
-        BoundSlot::F64Min(r) => {
-            if ONLY_ADDITIVE {
-                unreachable!()
-            } else {
-                F64Min::<A>::update(cell, r.read(idx))
-            }
-        }
-        BoundSlot::F64Max(r) => {
-            if ONLY_ADDITIVE {
-                unreachable!()
-            } else {
-                F64Max::<A>::update(cell, r.read(idx))
-            }
-        }
-        BoundSlot::U128Min(r) => {
-            if ONLY_ADDITIVE {
-                unreachable!()
-            } else {
-                U128Min::<A>::update(cell, r.read(idx))
-            }
-        }
-        BoundSlot::U128Max(r) => {
-            if ONLY_ADDITIVE {
-                unreachable!()
-            } else {
-                U128Max::<A>::update(cell, r.read(idx))
-            }
-        }
-        BoundSlot::StrMin(a) => {
-            if ONLY_ADDITIVE {
-                unreachable!()
-            } else {
-                StrMin::<A>::update(cell, StrRead::read(a, idx), wc, shared)
-            }
-        }
-        BoundSlot::StrMax(a) => {
-            if ONLY_ADDITIVE {
-                unreachable!()
-            } else {
-                StrMax::<A>::update(cell, StrRead::read(a, idx), wc, shared)
-            }
+impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> ValueColumnBuilder
+    for DynamicColumnBuilder<A, ONLY_ADDITIVE>
+{
+    type Value = Dynamic<A, ONLY_ADDITIVE>;
+    type Context = (Arc<[AggregationSlot]>, Arc<SharedArena>);
+
+    fn with_capacity(allocator: &mut SlabAllocator, rows: usize, context: &Self::Context) -> Self {
+        let (slots, _) = context;
+        Self {
+            builders: slots
+                .iter()
+                .map(|_| SlabColumn::with_capacity(allocator, rows))
+                .collect(),
         }
     }
-}
 
-/// Combine one slot's two finished partial cells, for the partition merge and
-/// the radix fold. The reader is gone by the merge, so the value family is read
-/// off the slot's declared `output_type`: a `Utf8View` extreme, a floating
-/// `SUM`/`MIN`/`MAX`, else integer/wide. A wide (`i128`) re-read merges
-/// identically to the narrow integer one (both accumulate in `A = i128`), so it
-/// needs no separate arm. Each check lives in its own arm, so `Count` and the
-/// integer paths pay for none of them. (The caller's all-additive fast path, a
-/// branch-free `a + b`, skips this dispatch entirely.)
-#[inline(always)]
-pub(in super::super) fn merge_slot<A: IntCell + StringCell + F64Cell + WideCell>(
-    a: A,
-    b: A,
-    slot: &AggregationSlot,
-    shared: &Arc<SharedArena>,
-) -> A {
-    let ty = &slot.output_type;
-    match slot.kind {
-        AggregationKind::CountStar | AggregationKind::Count => Count::<A>::merge(a, b),
-        AggregationKind::Sum if ty.is_floating() => F64Sum::<A>::merge(a, b),
-        AggregationKind::Sum => Sum::<A>::merge(a, b),
-        AggregationKind::Min if *ty == DataType::Utf8View => StrMin::<A>::merge(a, b, shared),
-        AggregationKind::Min if ty.is_floating() => F64Min::<A>::merge(a, b),
-        AggregationKind::Min => Min::<A>::merge(a, b),
-        AggregationKind::Max if *ty == DataType::Utf8View => StrMax::<A>::merge(a, b, shared),
-        AggregationKind::Max if ty.is_floating() => F64Max::<A>::merge(a, b),
-        AggregationKind::Max => Max::<A>::merge(a, b),
+    #[inline(always)]
+    fn push(&mut self, value: &Self::Value) {
+        // The query context gives both the allocation and columns the same
+        // slot count.
+        let cells = unsafe { value.cells(self.builders.len()) };
+        for (builder, &cell) in self.builders.iter_mut().zip(cells.iter()) {
+            builder.push(cell);
+        }
     }
-}
 
-/// Render one slot's finished output column. Called once per output column (not
-/// per row), so the per-slot kind dispatch is irrelevant. Each op renders its own
-/// column, dispatched by kind + declared `output_type` as in [`merge_slot`]
-/// (numeric to its width's Arrow type, float to `Float64`, string to `Utf8View`
-/// resolved through the arena, wide re-read to `Decimal128` via the integer arm).
-pub(in super::super) fn finish_slot<A: IntCell + StringCell + F64Cell + WideCell>(
-    name: &str,
-    slot: &AggregationSlot,
-    col: SlabColumn<A>,
-    arena: &Arc<SharedArena>,
-) -> (Field, ArrayRef) {
-    let ty = &slot.output_type;
-    match slot.kind {
-        AggregationKind::CountStar | AggregationKind::Count => Count::<A>::finish(name, col),
-        AggregationKind::Sum if ty.is_floating() => F64Sum::<A>::finish(name, col),
-        AggregationKind::Sum => Sum::<A>::finish(name, col),
-        AggregationKind::Min if *ty == DataType::Utf8View => StrMin::<A>::finish(name, col, arena),
-        AggregationKind::Min if ty.is_floating() => F64Min::<A>::finish(name, col),
-        AggregationKind::Min => Min::<A>::finish(name, col),
-        AggregationKind::Max if *ty == DataType::Utf8View => StrMax::<A>::finish(name, col, arena),
-        AggregationKind::Max if ty.is_floating() => F64Max::<A>::finish(name, col),
-        AggregationKind::Max => Max::<A>::finish(name, col),
+    #[inline(always)]
+    fn push_stored(&mut self, stored: &[A]) {
+        for (builder, &cell) in self.builders.iter_mut().zip(stored.iter()) {
+            builder.push(cell);
+        }
+    }
+
+    fn finish(self, context: &Self::Context) -> (Vec<Field>, Vec<ArrayRef>) {
+        let (slots, arena) = context;
+        let mut fields = Vec::with_capacity(self.builders.len());
+        let mut arrays = Vec::with_capacity(self.builders.len());
+        for (slot_index, builder) in self.builders.into_iter().enumerate() {
+            let (field, array) = finish_operation(
+                &format!("v{slot_index}"),
+                &slots[slot_index],
+                builder,
+                arena,
+            );
+            fields.push(field);
+            arrays.push(array);
+        }
+        (fields, arrays)
     }
 }

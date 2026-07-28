@@ -23,7 +23,7 @@ use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::{LiveKey, PersistedKey};
 use crate::operations::unary::group::keys::string::ArenaKey;
-use crate::operations::unary::group::keys::{KeyColumns, KeyExtractor};
+use crate::operations::unary::group::keys::{KeyColumnBuilder, KeyExtractor};
 use ahash::RandomState;
 use arrow_array::types::ArrowPrimitiveType;
 use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch, StringViewArray};
@@ -171,7 +171,7 @@ where
     type LiveKey<'a, 'b> = IntStrLiveKey<'a, 'b, T::Native>;
     type PersistedLiveKey<'a> = IntStrResolvedKey<'a, T::Native>;
     type Reader<'b> = IntStrReader<'b, T>;
-    type Columns = IntStrKeyColumns<T, STR_FIRST>;
+    type ColumnBuilder = IntStrKeyColumnBuilder<T, STR_FIRST>;
     type Scratch = ();
 
     fn make_reader<'b>(
@@ -243,12 +243,14 @@ where
 /// string as a zero-copy `StringViewArray` whose views point into the shared
 /// arena's ring buffers. `STR_FIRST` selects the emit order so the leading column
 /// matches the GROUP BY order (`k0` is whichever key came first).
-pub struct IntStrKeyColumns<T: ArrowPrimitiveType, const STR_FIRST: bool> {
+pub struct IntStrKeyColumnBuilder<T: ArrowPrimitiveType, const STR_FIRST: bool> {
     ints: PrimitiveBuilder<T>,
     views: SlabColumn<u128>,
 }
 
-impl<T: ArrowPrimitiveType, const STR_FIRST: bool> KeyColumns for IntStrKeyColumns<T, STR_FIRST> {
+impl<T: ArrowPrimitiveType, const STR_FIRST: bool> KeyColumnBuilder
+    for IntStrKeyColumnBuilder<T, STR_FIRST>
+{
     type Key = IntStrKey<T::Native>;
     type Config = ();
 

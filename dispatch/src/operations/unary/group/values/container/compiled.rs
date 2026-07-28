@@ -1,94 +1,49 @@
-//! [`Compiled`] — a fixed aggregate signature monomorphised over a tuple of
-//! per-slot ops, straight-line with no per-row dispatch.
+//! Compile-time aggregation container.
 //!
-//! A slot is one `(`[`Read`]`, `[`Fold`]`)` pair — named [`Pair`], aliased to
-//! [`CountSlot`]/[`SumSlot`]/… — a whole op with its own input array and its own
-//! cell, so a `Compiled` mixes integer families freely (a `SUM` beside a `MAX`),
-//! each reading its *own typed array* with no per-row dispatch. It is
-//! **numeric-only**: its ops are contextless numeric [`Fold`]s (they take no arena),
-//! so the impl fixes both [`AggregationValue`] contexts to `()` — the
-//! `WorkerContext` consume passes (`&mut ()`) and the `SharedContext` merge/finish
-//! pass (`&()`) are inert. A signature carrying a string extreme — which needs a
-//! real `WorkerArena` to store winners — takes the [`Variable`](super::Variable) path
-//! instead.
+//! [`Compiled`] stores a fixed tuple of numeric aggregation slots. Each slot
+//! combines a typed [`Read`] implementation with a [`Fold`], so row processing
+//! has no runtime slot dispatch. String aggregates and signatures not selected
+//! for specialization use [`Dynamic`](super::Dynamic).
 //!
-//! There is no per-slot trait and no plumbing trait: a slot's behaviour *is* its
-//! [`Read`] plus its [`Fold`], so `impl_compiled!` emits the whole
-//! [`AggregationValue`] impl for each arity directly, calling those — `R::read` to
-//! pull the value, `F::seed`/`update`/`merge`/`finish` to fold it — unrolled over
-//! the tuple, with the reader/config/column shapes as literal tuples. The lone
-//! [`OpTuple`] trait carries a single associated type (the cell tuple), because a
-//! `Compiled<Ops>` struct declared once over a generic `Ops` has to name its one
-//! stored field's type somehow; it holds no behaviour.
-//!
-//! `Pair<R, F>` is only a nominal tag so a slot alias names a single type and the
-//! `Compiled<…>` signature stays shallow (a bare nested `(R, F)` tuple sends the
-//! monomorphisation collector into a loop through the top-k heap). The planner
-//! instantiates the tuple it needs; numeric runtime signatures (shape not known
-//! until plan time) fall back to [`Variable`](super::Variable).
+//! [`Pair`] is a named marker instead of a nested `(Read, Fold)` tuple. Keeping
+//! the type shallow avoids excessive recursive monomorphization when a value
+//! passes through top-k.
 
 use super::super::cell::Cell;
 use super::super::fold::{Count, Fold, Max, Min, Sum};
 use super::super::read::{IntRead, NoRead, Read};
-use super::super::{AggregationSlot, OwnedValue, ValueColumns};
+use super::super::{AggregationSlot, OwnedValue, ValueColumnBuilder};
 use crate::arrays::SlabColumn;
 use crate::memory::SlabAllocator;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
 use std::marker::PhantomData;
 
-/// A `(Read, Fold)` pair as one *nominal* type — a slot. A bare `(R, F)` tuple
-/// would do, but nesting tuples inside a `Compiled<…>` signature blows the
-/// monomorphisation collector when the value flows through the top-k heap; a named
-/// struct keeps the type shallow. It's a pure type tag — never instantiated as a
-/// value (a `Compiled` stores the cells, not the pairs).
+/// Type marker pairing a slot reader with its fold operation.
 pub struct Pair<R, F>(PhantomData<(R, F)>);
 
-/// Slot aliases — a [`Pair`] named by what it computes, so signatures read
+/// Slot aliases keep signatures readable, for example
 /// `Compiled<(SumSlot<Int32Type>, CountSlot)>` instead of the raw pairs.
-///
-/// `Count` defaults its accumulator to `i64` (a count never exceeds the row
-/// count); a numeric extreme/sum defaults to `i64` too (pass `i128` for a wide
-/// sum). A string extreme always rides `i128`, since its cell holds a 128-bit
-/// `ArenaKey`.
 pub type CountSlot<A = i64> = Pair<NoRead, Count<A>>;
-/// `SUM(col: T)` accumulating in `A` — `SumSlot<T, i128>` is the wide sum.
+/// `SUM(col: T)` accumulating in `A`. Use `i128` for a wide sum.
 pub type SumSlot<T, A = i64> = Pair<IntRead<T>, Sum<A>>;
 /// `MIN(col: T)` over an integer column, accumulating in `A`.
 pub type MinSlot<T, A = i64> = Pair<IntRead<T>, Min<A>>;
 /// `MAX(col: T)` over an integer column, accumulating in `A`.
 pub type MaxSlot<T, A = i64> = Pair<IntRead<T>, Max<A>>;
-// (No `StrMinSlot`/`StrMaxSlot`: `Compiled` is numeric-only — a string extreme.s
-// `WorkerContext` is `WorkerArena`, not `()` — so a string signature uses `Variable`.)
 
-/// What a tuple of slots stores: the parallel tuple of accumulator cells, e.g.
-/// `(i64,)` or `(i128, i64)`. The *only* thing [`Compiled`] needs from `Ops` that
-/// it can't write inline — the struct holds one `Ops::Accs` field, and a struct
-/// declared once over a generic `Ops` has to name that field's type through an
-/// associated type. Every other shape (the reader, the configs, the columns) is a
-/// literal tuple written directly in the macro-generated [`AggregationValue`]
-/// impl, so there is no behaviour here — just the cell type.
+/// Associates a tuple of slot markers with its accumulator and output-column
+/// tuple types. Folding is generated directly by `impl_compiled!`.
 pub trait OpTuple: Send + Sync + 'static {
-    /// The per-slot accumulator cells.
+    /// One accumulator cell per slot.
     type Accs: Cell;
-    /// The per-slot output-column builders: one [`SlabColumn`] per slot, in the
-    /// same tuple shape as [`Accs`](Self::Accs). Held by [`CompiledColumns`], which
-    /// a struct declared once over a generic `Ops` can only name through this
-    /// associated type (the same reason [`Accs`](Self::Accs) exists).
-    type Cols;
+    /// One output-column builder per slot.
+    type ColumnBuilders;
 }
 
-/// A fixed aggregate signature: the slots named by the op tuple `Ops`, each its
-/// own cell. The running cells are the only state — their tuple type is `Ops::Accs`.
+/// Accumulator cells for a fixed aggregation signature.
 pub struct Compiled<Ops: OpTuple> {
     accs: Ops::Accs,
-}
-
-/// The output-column builders for a [`Compiled`] signature: one [`SlabColumn`] per
-/// slot, in the tuple shape [`OpTuple::Cols`]. The value-side counterpart to a key
-/// extractor's [`KeyColumns`](crate::operations::unary::group::keys::KeyColumns).
-pub struct CompiledColumns<Ops: OpTuple> {
-    cols: Ops::Cols,
 }
 
 impl<Ops: OpTuple> Copy for Compiled<Ops> {}
@@ -105,17 +60,15 @@ impl<Ops: OpTuple> Default for Compiled<Ops> {
     }
 }
 
-/// One per arity: the [`OpTuple`] cell type for a tuple of slots `(Pair<R, F>, …)`,
-/// and the whole [`AggregationValue`] impl for the `Compiled` over it. Each method
-/// unrolls the obvious per-slot call — `R::read` to pull the value,
-/// `F::seed`/`update`/`merge`/`finish` to fold it — and writes the
-/// reader / config / column shapes as literal tuples. The slot's read and fold are
-/// tied by `for<'b> R: Read<Val<'b> = F::Val>`: every row a `Read` yields is
-/// exactly what its `Fold` consumes. Both `F::Val` and `F::Acc` are lifetime-free
-/// (a numeric op folds an owned `()`/`i64`), so the cell tuple names `F::Acc`
-/// directly, with no `for<'b>` projection or `'static` bound. The only aggregate
-/// value that isn't lifetime-free is a string extreme's borrowed `&str`, and those
-/// never take the `Compiled` path.
+/// Output-column builders for a [`Compiled`] signature.
+pub struct CompiledColumnBuilder<Ops: OpTuple> {
+    builders: Ops::ColumnBuilders,
+}
+
+/// Implements each supported tuple arity as straight-line reads and folds.
+///
+/// The equality constraint on `R::Val` and `F::Val` ensures each reader
+/// produces exactly the value its fold accepts.
 macro_rules! impl_compiled {
     ($($R:ident $F:ident $idx:tt),+) => {
         impl<$($R, $F),+> OpTuple for ($(Pair<$R, $F>,)+)
@@ -123,20 +76,17 @@ macro_rules! impl_compiled {
             $($R: Read, $F: Fold, for<'b> $R: Read<Val<'b> = $F::Val>,)+
         {
             type Accs = ($($F::Acc,)+);
-            type Cols = ($(SlabColumn<$F::Acc>,)+);
+            type ColumnBuilders = ($(SlabColumn<$F::Acc>,)+);
         }
 
-        // `Compiled` is numeric-only — its ops are contextless numeric `Fold`s — so
-        // both its value contexts are concretely `()`: the `&mut ()` consume passes
-        // and the `&()` merge/finish pass are inert (the fold ops take no context).
-        // A signature with a string extreme takes the `Variable` path instead.
+        // Compiled folds are numeric and need no arena context.
         impl<$($R, $F),+> OwnedValue for Compiled<($(Pair<$R, $F>,)+)>
         where
             $($R: Read, $F: Fold, for<'b> $R: Read<Val<'b> = $F::Val>, $F::Acc: Into<i128>,)+
         {
             type Reader<'b> = ($($R::Input<'b>,)+);
             type SharedContext = ();
-            type Columns = CompiledColumns<($(Pair<$R, $F>,)+)>;
+            type ColumnBuilder = CompiledColumnBuilder<($(Pair<$R, $F>,)+)>;
             type SortKey = i128;
             type WorkerContext = ();
 
@@ -170,8 +120,7 @@ macro_rules! impl_compiled {
 
             #[inline(always)]
             fn sort_key(&self, slot: usize) -> i128 {
-                // Widen the cell directly — a numeric extreme/sum/count to its
-                // `ORDER BY` key.
+                // All accumulator types convert to the common ORDER BY key type.
                 match slot {
                     $($idx => self.accs.$idx.into(),)+
                     _ => unreachable!("sort_key slot {slot} out of range"),
@@ -179,7 +128,7 @@ macro_rules! impl_compiled {
             }
         }
 
-        impl<$($R, $F),+> ValueColumns for CompiledColumns<($(Pair<$R, $F>,)+)>
+        impl<$($R, $F),+> ValueColumnBuilder for CompiledColumnBuilder<($(Pair<$R, $F>,)+)>
         where
             $($R: Read, $F: Fold, for<'b> $R: Read<Val<'b> = $F::Val>, $F::Acc: Into<i128>,)+
         {
@@ -187,12 +136,12 @@ macro_rules! impl_compiled {
             type Context = ();
 
             fn with_capacity(allocator: &mut SlabAllocator, rows: usize, _context: &()) -> Self {
-                Self { cols: ($(SlabColumn::<$F::Acc>::with_capacity(allocator, rows),)+) }
+                Self { builders: ($(SlabColumn::<$F::Acc>::with_capacity(allocator, rows),)+) }
             }
 
             #[inline(always)]
             fn push(&mut self, value: &Self::Value) {
-                $(self.cols.$idx.push(value.accs.$idx);)+
+                $(self.builders.$idx.push(value.accs.$idx);)+
             }
 
             #[inline(always)]
@@ -204,7 +153,7 @@ macro_rules! impl_compiled {
                 let mut fields = Vec::new();
                 let mut arrays = Vec::new();
                 $(
-                    let (f, a) = $F::finish(&format!("v{}", $idx), self.cols.$idx);
+                    let (f, a) = $F::finish(&format!("v{}", $idx), self.builders.$idx);
                     fields.push(f);
                     arrays.push(a);
                 )+

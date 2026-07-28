@@ -6,7 +6,7 @@
 //! [`Fold`](super::Fold)s: the value is a full `i128` held in the cell width `A` via
 //! [`WideCell`]. Only `seed` and `update` are defined — a wide cell `merge`s and
 //! renders identically whether it was seeded from an `i64` or an `i128` input (both
-//! accumulate in `A = i128`), so the [`Variable`](super::super::container::Variable)
+//! accumulate in `A = i128`), so the [`Dynamic`](super::super::container::Dynamic)
 //! container drives `merge` and `finish` through the integer
 //! [`Sum`](super::Sum)/[`Min`](super::Min)/[`Max`](super::Max) arms. Reading the
 //! `Decimal128` as `i128` here (not `i64`) keeps a partial that overflows `i64`

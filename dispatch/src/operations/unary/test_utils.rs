@@ -71,7 +71,7 @@ impl CollectSender<RecordBatch> {
 
     /// All values from a `Decimal128` column `col` as `i128`, in order — a wide
     /// (`i128`) value slot renders here (e.g. a numeric extreme co-located with a
-    /// string extreme in a `Variable`, or a wide grouped `SUM`).
+    /// string extreme in a `Dynamic`, or a wide grouped `SUM`).
     pub fn decimal128_column(&self, col: usize) -> Vec<i128> {
         self.items
             .iter()

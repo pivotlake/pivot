@@ -130,13 +130,10 @@ impl SlabAllocator {
         MultiSlabBuffer::new(self.get_slabs_of_size(bytes, zeroed))
     }
 
-    /// Allocates zeroed slabs holding `count` entries of `stride` bytes each,
-    /// the runtime-size counterpart of [`create_multi_slab_buffer`](Self::create_multi_slab_buffer)
-    /// (used by hash tables whose entry size is fixed per query, not per type).
-    /// The same packing rules apply: each slab holds `BUFFER_SIZE / stride`
-    /// whole entries, and an allocation spanning slabs starts at a buffer
-    /// boundary so every slab is entry-indexable from its base. `align` is the
-    /// entries' strictest field alignment.
+    /// Allocates zeroed slabs for `count` runtime-sized entries.
+    ///
+    /// Entries never cross slab boundaries. Multi-slab allocations begin at a
+    /// buffer boundary so every entry can be addressed from its slab base.
     pub fn create_strided_slabs(&mut self, count: usize, stride: usize, align: usize) -> Vec<Slab> {
         let entries_per_slab = BUFFER_SIZE / stride;
         let bytes = if count <= entries_per_slab {
@@ -151,9 +148,9 @@ impl SlabAllocator {
         self.get_slabs_of_size(bytes, true)
     }
 
-    /// Allocates a single slab of `size` bytes starting at an `align`-aligned
-    /// address, for rows whose size is a runtime value (so no `T` exists to
-    /// carry the alignment). `size + align` must fit one buffer.
+    /// Allocates one slab at an explicitly aligned address.
+    ///
+    /// `size + align` must fit in one backing buffer.
     pub fn get_aligned_slab(&mut self, size: usize, align: usize, zeroed: bool) -> Slab {
         if self.remaining_in_buffer() < size + align {
             self.advance_to_new_buffer(zeroed);

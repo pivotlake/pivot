@@ -33,7 +33,7 @@
 //! - [`reader`] — the encode side: [`RowReader`]/[`RowScratch`] turn a batch's
 //!   key columns into hashes + a contiguous blob buffer.
 //! - [`live_key`] — [`RowKey`], the transient key probed against the table.
-//! - [`columns`] — the decode side: [`RowKeyColumns`] rebuilds typed output
+//! - [`columns`] — the decode side: [`RowKeyColumnBuilder`] rebuilds typed output
 //!   columns from the persisted blobs.
 
 /// The fixed-width integer types a row key can hold, listed **once**. Both the
@@ -72,7 +72,7 @@ mod live_key;
 mod reader;
 mod schema;
 
-pub use columns::RowKeyColumns;
+pub use columns::RowKeyColumnBuilder;
 pub use live_key::RowKey;
 pub use reader::{RowReader, RowScratch};
 pub use schema::RowKeySchema;
@@ -99,7 +99,7 @@ impl KeyExtractor for RowKeyExtractor {
     type LiveKey<'a, 'b> = RowKey<'a, 'b>;
     type PersistedLiveKey<'a> = ResolvedKey<'a>;
     type Reader<'b> = RowReader<'b>;
-    type Columns = RowKeyColumns;
+    type ColumnBuilder = RowKeyColumnBuilder;
     type Scratch = RowScratch;
 
     fn make_reader<'b>(

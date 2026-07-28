@@ -2,7 +2,7 @@ use crate::arrays::{ArrayBuilder, PrimitiveBuilder};
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::PersistedKey;
-use crate::operations::unary::group::keys::{KeyColumns, KeyExtractor};
+use crate::operations::unary::group::keys::{KeyColumnBuilder, KeyExtractor};
 use ahash::RandomState;
 use arrow_array::types::ArrowPrimitiveType;
 use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch};
@@ -43,7 +43,7 @@ where
     type LiveKey<'a, 'b> = T::Native;
     type PersistedLiveKey<'a> = T::Native;
     type Reader<'b> = &'b PrimitiveArray<T>;
-    type Columns = IntKeyColumn<T>;
+    type ColumnBuilder = IntKeyColumnBuilder<T>;
     type Scratch = ();
 
     fn make_reader<'b>(
@@ -81,9 +81,9 @@ where
 }
 
 /// Emits the single primitive key column.
-pub struct IntKeyColumn<T: ArrowPrimitiveType>(PrimitiveBuilder<T>);
+pub struct IntKeyColumnBuilder<T: ArrowPrimitiveType>(PrimitiveBuilder<T>);
 
-impl<T: ArrowPrimitiveType> KeyColumns for IntKeyColumn<T> {
+impl<T: ArrowPrimitiveType> KeyColumnBuilder for IntKeyColumnBuilder<T> {
     type Key = T::Native;
     type Config = ();
 

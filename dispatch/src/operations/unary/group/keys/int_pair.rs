@@ -5,12 +5,12 @@
 //! which is `Copy`/`Hash`/`Eq` and needs no arena. The aggregate value is the
 //! separate concern of a
 //! [`AggregationValue`](crate::operations::unary::group::values::AggregationValue)
-//! (typically [`Variable`](crate::operations::unary::group::values::Variable)).
+//! (typically [`Dynamic`](crate::operations::unary::group::values::Dynamic)).
 
 use crate::arrays::{ArrayBuilder, PrimitiveBuilder};
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
-use crate::operations::unary::group::keys::{KeyColumns, KeyExtractor};
+use crate::operations::unary::group::keys::{KeyColumnBuilder, KeyExtractor};
 use ahash::RandomState;
 use arrow_array::cast::AsArray;
 use arrow_array::types::ArrowPrimitiveType;
@@ -80,7 +80,7 @@ where
     type LiveKey<'a, 'b> = u128;
     type PersistedLiveKey<'a> = u128;
     type Reader<'b> = PairReader<'b, A, B>;
-    type Columns = IntPairKeyColumns<A, B>;
+    type ColumnBuilder = IntPairKeyColumnBuilder<A, B>;
     type Scratch = ();
 
     fn make_reader<'b>(
@@ -116,7 +116,7 @@ where
 }
 
 /// Emits the two unpacked key columns (`k0`, `k1`).
-pub struct IntPairKeyColumns<A: ArrowPrimitiveType, B: ArrowPrimitiveType>
+pub struct IntPairKeyColumnBuilder<A: ArrowPrimitiveType, B: ArrowPrimitiveType>
 where
     A::Native: IntBits,
     B::Native: IntBits,
@@ -125,7 +125,8 @@ where
     b: PrimitiveBuilder<B>,
 }
 
-impl<A: ArrowPrimitiveType, B: ArrowPrimitiveType> KeyColumns for IntPairKeyColumns<A, B>
+impl<A: ArrowPrimitiveType, B: ArrowPrimitiveType> KeyColumnBuilder
+    for IntPairKeyColumnBuilder<A, B>
 where
     A::Native: IntBits,
     B::Native: IntBits,

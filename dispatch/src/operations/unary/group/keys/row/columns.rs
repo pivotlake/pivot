@@ -4,7 +4,7 @@ use super::schema::RowKeySchema;
 use crate::arrays::{ArrayBuilder, PrimitiveBuilder, SlabColumn};
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::SharedArena;
-use crate::operations::unary::group::keys::{ArenaKey, KeyColumns};
+use crate::operations::unary::group::keys::{ArenaKey, KeyColumnBuilder};
 use arrow_array::builder::make_view;
 use arrow_array::types::{
     Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
@@ -108,15 +108,15 @@ int_key_types!(define_field_builder);
 /// Emits the decoded key columns of a row-key GROUP BY result.
 ///
 /// Persisted keys are buffered raw (decoding needs the arena, which only
-/// [`finish`](KeyColumns::finish) receives). At `finish` each blob is walked
+/// [`finish`](KeyColumnBuilder::finish) receives). At `finish` each blob is walked
 /// once: fixed-width fields scatter into primitive builders, string fields are
 /// emitted as views into the blob's own arena bytes — zero-copy.
-pub struct RowKeyColumns {
+pub struct RowKeyColumnBuilder {
     schema: RowKeySchema,
     keys: SlabColumn<u128>,
 }
 
-impl KeyColumns for RowKeyColumns {
+impl KeyColumnBuilder for RowKeyColumnBuilder {
     type Key = ArenaKey;
     type Config = RowKeySchema;
 

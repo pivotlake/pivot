@@ -5,7 +5,7 @@
 //! Like the string extremes these are *not* [`Fold`](super::Fold)s: a float
 //! accumulator lives bit-punned in the cell width `A` via [`F64Cell`], so the op
 //! owns the reinterpret and exposes plain inherent methods, called from the runtime
-//! [`Variable`](super::super::container::Variable) container's float arms (there is no
+//! [`Dynamic`](super::super::container::Dynamic) container's float arms (there is no
 //! `Compiled` float slot). `MIN`/`MAX` order with [`f64::total_cmp`] so the extreme
 //! is deterministic regardless of row order (NaN sorts greatest, matching DuckDB).
 

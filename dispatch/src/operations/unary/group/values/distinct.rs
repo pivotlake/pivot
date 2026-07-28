@@ -6,7 +6,7 @@
 //! Used for the dedup stage of `COUNT(DISTINCT x)` (and, later, `SELECT DISTINCT`):
 //! only the *set* of distinct keys matters, so it emits no value columns.
 
-use super::{AggregationSlot, OwnedValue, ValueColumns};
+use super::{AggregationSlot, OwnedValue, ValueColumnBuilder};
 use crate::memory::SlabAllocator;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
@@ -16,14 +16,10 @@ use arrow_schema::Field;
 #[derive(Clone, Copy, Default)]
 pub struct Distinct;
 
-/// The (empty) output columns of a [`Distinct`] value: a keys-only group emits no
-/// value columns, so this builds nothing.
-pub struct DistinctColumns;
-
 impl OwnedValue for Distinct {
     type Reader<'b> = ();
     type SharedContext = ();
-    type Columns = DistinctColumns;
+    type ColumnBuilder = DistinctColumnBuilder;
     type SortKey = i64;
     type WorkerContext = ();
 
@@ -48,12 +44,15 @@ impl OwnedValue for Distinct {
     }
 }
 
-impl ValueColumns for DistinctColumns {
+/// Empty output builder for a keys-only value.
+pub struct DistinctColumnBuilder;
+
+impl ValueColumnBuilder for DistinctColumnBuilder {
     type Value = Distinct;
     type Context = ();
 
     fn with_capacity(_allocator: &mut SlabAllocator, _rows: usize, _context: &()) -> Self {
-        DistinctColumns
+        DistinctColumnBuilder
     }
 
     #[inline(always)]

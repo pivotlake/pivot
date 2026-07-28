@@ -14,11 +14,11 @@
 //! with no per-worker or shared state, so it carries no context. String extremes
 //! ([`StrMin`]/[`StrMax`]) need a value arena and a borrowed `&str`, so they are
 //! *not* folds — they expose inherent methods used only by the runtime
-//! [`Variable`](super::container::Variable) container's string arms.
+//! [`Dynamic`](super::container::Dynamic) container's string arms.
 //!
 //! A fixed numeric signature is a tuple of (read, fold) pairs
 //! ([`Compiled`](super::container::Compiled)); a runtime signature folds each slot
-//! by its kind ([`Variable`](super::container::Variable)).
+//! by its kind ([`Dynamic`](super::container::Dynamic)).
 
 mod count;
 mod extreme;
