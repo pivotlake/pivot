@@ -92,6 +92,9 @@ pub struct TableBinding {
     /// table by this id at commit, so it survives a concurrent rename.
     id: uuid::Uuid,
     pub columns: Vec<Column>,
+    /// Per-column footer-derived nullability, in `columns` order (see
+    /// [`CatalogTable::nullability`](super::table::CatalogTable)).
+    nullability: Vec<bool>,
     /// Single-column predicates pushed down for this binding (recorded here
     /// because the `Table` trait gives no channel from `pushdown_filter` to
     /// `compile`); applied as a filter when the scan is compiled.
@@ -100,10 +103,11 @@ pub struct TableBinding {
 
 impl TableBinding {
     /// A binding over `id`, with no predicates pushed yet.
-    pub(super) fn new(id: uuid::Uuid, columns: Vec<Column>) -> Self {
+    pub(super) fn new(id: uuid::Uuid, columns: Vec<Column>, nullability: Vec<bool>) -> Self {
         Self {
             id,
             columns,
+            nullability,
             predicates: Vec::new(),
         }
     }
@@ -227,6 +231,10 @@ impl Table for TableBinding {
 
     fn columns(&self) -> Vec<Column> {
         self.columns.clone()
+    }
+
+    fn nullability(&self) -> Vec<bool> {
+        self.nullability.clone()
     }
 
     fn clone_box(&self) -> Box<dyn Table> {

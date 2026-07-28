@@ -1,7 +1,7 @@
 //! The decode side: rebuild typed output columns from the persisted key blobs.
 
 use super::schema::RowKeySchema;
-use crate::arrays::{ArrayBuilder, PrimitiveBuilder, SlabColumn};
+use crate::arrays::{ArrayBuilder, PrimitiveBuilder, SlabColumn, ValidityBuilder};
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::keys::{ArenaKey, KeyColumnBuilder};
@@ -12,7 +12,7 @@ use arrow_array::types::{
     UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow_array::{ArrayRef, StringViewArray};
-use arrow_buffer::ScalarBuffer;
+use arrow_buffer::{BooleanBuffer, NullBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field};
 use std::sync::Arc;
 
@@ -72,11 +72,34 @@ macro_rules! define_field_builder {
             }
 
             /// Decode this field off the front of `blob`, advancing it, and push it into
-            /// the column. `key`/`full_len` (the whole blob's length) place a non-inline
-            /// string view into its arena buffer; `trailing` marks the prefix-less
-            /// trailing string, whose bytes are the rest of `blob`.
+            /// the column; returns whether the value is non-NULL. `key`/`full_len` (the
+            /// whole blob's length) place a non-inline string view into its arena
+            /// buffer; `trailing` marks the prefix-less trailing string, whose bytes are
+            /// the rest of `blob`; a `nullable` field leads with its validity byte, and
+            /// a NULL pushes the column's default under its cleared validity bit.
             #[inline]
-            fn decode(&mut self, blob: &mut &[u8], full_len: usize, key: &ArenaKey, trailing: bool) {
+            fn decode(
+                &mut self,
+                blob: &mut &[u8],
+                full_len: usize,
+                key: &ArenaKey,
+                trailing: bool,
+                nullable: bool,
+            ) -> bool {
+                if nullable {
+                    let (validity, rest) = blob.split_at(1);
+                    *blob = rest;
+                    if validity[0] == 0 {
+                        match self {
+                            $( FieldBuilder::$variant(b) => b.col.push(<$native>::default()), )+
+                            FieldBuilder::Dec64 { builder, .. } => builder.col.push(0),
+                            FieldBuilder::Dec128 { builder, .. } => builder.col.push(0),
+                            // A zeroed view is a valid empty inline string.
+                            FieldBuilder::Str(views) => views.push(0),
+                        }
+                        return false;
+                    }
+                }
                 match self {
                     $( FieldBuilder::$variant(b) => b.col.push(pop_le!(blob, $native)), )+
                     FieldBuilder::Dec64 { builder, .. } => builder.col.push(pop_le!(blob, i64)),
@@ -98,24 +121,29 @@ macro_rules! define_field_builder {
                         views.push(make_view(s, key.buffer_index(), key.offset() + pos_in_blob));
                     }
                 }
+                true
             }
 
             /// Finish this builder into its arrow column and the matching schema field.
             /// String columns emit zero-copy views into the shared output buffers.
+            /// `validity` carries the field's decoded null bitmap (`None` for a
+            /// non-nullable field).
             #[inline]
             fn into_field(
                 self,
                 name: String,
                 output_buffers: &Arc<[arrow_buffer::Buffer]>,
+                validity: Option<arrow_buffer::Buffer>,
             ) -> (Field, ArrayRef) {
+                let nullable = validity.is_some();
                 let (dt, array): (DataType, ArrayRef) = match self {
-                    $( FieldBuilder::$variant(b) => (DataType::$dt, b.into_array(None)), )+
+                    $( FieldBuilder::$variant(b) => (DataType::$dt, b.into_array(validity)), )+
                     // Restamp the schema's exact precision/scale over the raw
                     // decoded unscaled integers: the builder renders arrow's
                     // default decimal shape, and only a metadata restamp (never
                     // a rescaling arrow cast) keeps the values intact.
                     FieldBuilder::Dec64 { builder, precision, scale } => {
-                        let array = builder.into_array(None);
+                        let array = builder.into_array(validity);
                         let array: ArrayRef = Arc::new(
                             array
                                 .as_primitive::<Decimal64Type>()
@@ -126,7 +154,7 @@ macro_rules! define_field_builder {
                         (DataType::Decimal64(precision, scale), array)
                     }
                     FieldBuilder::Dec128 { builder, precision, scale } => {
-                        let array = builder.into_array(None);
+                        let array = builder.into_array(validity);
                         let array: ArrayRef = Arc::new(
                             array
                                 .as_primitive::<Decimal128Type>()
@@ -139,18 +167,21 @@ macro_rules! define_field_builder {
                     FieldBuilder::Str(views) => {
                         let len = views.len();
                         let views = ScalarBuffer::<u128>::new(views.into_buffer(), 0, len);
+                        let nulls = validity
+                            .map(|b| NullBuffer::new(BooleanBuffer::new(b, 0, len)))
+                            .filter(|n| n.null_count() != 0);
                         // Safety: views built from valid blob slices; the shared buffers
                         // (Arc-holding the arena) keep the ring memory alive as long as the
                         // array exists. Every batch shares the one `Arc<[Buffer]>` built for
                         // this output phase, so the downstream concat/take reuse it instead
                         // of rebuilding the buffer list per batch.
                         let array: ArrayRef = Arc::new(unsafe {
-                            StringViewArray::new_unchecked(views, output_buffers.clone(), None)
+                            StringViewArray::new_unchecked(views, output_buffers.clone(), nulls)
                         });
                         (DataType::Utf8View, array)
                     }
                 };
-                (Field::new(name, dt, false), array)
+                (Field::new(name, dt, nullable), array)
             }
         }
     };
@@ -198,6 +229,13 @@ impl KeyColumnBuilder for RowKeyColumnBuilder {
             .iter()
             .map(|t| FieldBuilder::new(t, allocator, rows))
             .collect();
+        // One validity bitmap per nullable field, filled as the blobs decode.
+        let mut validities: Vec<Option<ValidityBuilder>> = self
+            .schema
+            .nullable()
+            .iter()
+            .map(|&nullable| nullable.then(|| ValidityBuilder::with_capacity(allocator, rows)))
+            .collect();
 
         let raw_keys = ScalarBuffer::<u128>::new(self.keys.into_buffer(), 0, rows);
         let last = builders.len() - 1;
@@ -219,14 +257,27 @@ impl KeyColumnBuilder for RowKeyColumnBuilder {
             let full_len = full.len();
             let mut blob = full;
             for (j, builder) in builders.iter_mut().enumerate() {
-                builder.decode(&mut blob, full_len, &key, trailing_str && j == last);
+                let valid = builder.decode(
+                    &mut blob,
+                    full_len,
+                    &key,
+                    trailing_str && j == last,
+                    validities[j].is_some(),
+                );
+                if let Some(validity) = validities[j].as_mut() {
+                    validity.append_n(1, valid);
+                }
             }
         }
 
         let mut fields = Vec::with_capacity(builders.len());
         let mut columns = Vec::with_capacity(builders.len());
-        for (i, builder) in builders.into_iter().enumerate() {
-            let (field, array) = builder.into_field(format!("k{i}"), output_buffers);
+        for ((i, builder), validity) in builders.into_iter().enumerate().zip(validities) {
+            let (field, array) = builder.into_field(
+                format!("k{i}"),
+                output_buffers,
+                validity.map(ValidityBuilder::into_buffer),
+            );
             fields.push(field);
             columns.push(array);
         }

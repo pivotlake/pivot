@@ -37,6 +37,7 @@ pub use u128::{U128Max, U128Min, U128Sum};
 use super::cell::Cell;
 use crate::arrays::SlabColumn;
 use arrow_array::ArrayRef;
+use arrow_buffer::NullBuffer;
 use arrow_schema::Field;
 
 /// One numeric aggregate op, folding the [`Val`](Self::Val) a
@@ -58,12 +59,30 @@ pub trait Fold: Send + Sync + 'static {
     /// This op's accumulator cell (`i64` / `i128`).
     type Acc: Cell;
 
+    /// Whether this op's output can never be SQL NULL: `true` only for
+    /// [`Count`], which renders `0` (not NULL) for a group with no non-NULL
+    /// rows. The containers keep such a slot's seen bit always set, so its
+    /// output column skips the null-buffer pass entirely.
+    const ALWAYS_SEEN: bool = false;
+
+    /// The cell of a group that has seen no non-NULL value yet: the fold's
+    /// identity, absorbed by any [`update`](Self::update)/[`merge`](Self::merge)
+    /// (`0` for a sum/count, the width's extreme for `MIN`/`MAX`). Keeps the
+    /// fold loops branch-free: a NULL row simply contributes the identity, and
+    /// whether the group's output is NULL is tracked by the container's seen
+    /// bits, not the cell.
+    fn empty() -> Self::Acc;
     /// Materialise a new group's cell from a row's value.
     fn seed(v: Self::Val) -> Self::Acc;
     /// Fold a value into an existing cell.
     fn update(acc: Self::Acc, v: Self::Val) -> Self::Acc;
     /// Combine two finished partials — the partition merge and radix fold.
     fn merge(a: Self::Acc, b: Self::Acc) -> Self::Acc;
-    /// Render a finished column of cells into the Arrow array + field.
-    fn finish(name: &str, col: SlabColumn<Self::Acc>) -> (Field, ArrayRef);
+    /// Render a finished column of cells into the Arrow array + field. `nulls`
+    /// marks the groups that saw no non-NULL value (never set for a count).
+    fn finish(
+        name: &str,
+        col: SlabColumn<Self::Acc>,
+        nulls: Option<NullBuffer>,
+    ) -> (Field, ArrayRef);
 }

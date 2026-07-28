@@ -3,6 +3,7 @@
 //! GROUP BY handled in [`super::grouped_distinct`].
 
 use super::Aggregate;
+use super::grouped::{build_dedup_operator, column_nullable};
 use crate::compile::Error;
 use crate::expression::NumericAggregate;
 use crate::types::Type;
@@ -25,7 +26,25 @@ impl Aggregate {
         &self,
         input: RecordBatchOperatorSpec,
         distinct: &NumericAggregate,
+        nullability: &[bool],
     ) -> Result<RecordBatchOperatorSpec, Error> {
+        // The hash-only dedup counts every distinct key, but SQL does not count
+        // NULL as a distinct value. Over a nullable column, dedup the keys (the
+        // NULLs collapse into one key row) and count only the non-NULL
+        // survivors.
+        if column_nullable(nullability, distinct.column().column_idx) {
+            let keys = [(
+                distinct.column().column_idx,
+                distinct.column().return_type.clone(),
+            )];
+            let deduped = build_dedup_operator(input, &keys, nullability)?;
+            return Ok(deduped.aggregate::<i64>(vec![AggregationSlot::new(
+                AggregationKind::Count,
+                0,
+                crate::types::physical_arrow_type(&distinct.return_type),
+            )]));
+        }
+
         let distinct_cols = vec![distinct.column().column_idx];
         let counts =
             match &distinct.column().return_type {
@@ -53,5 +72,31 @@ impl Aggregate {
             0,
             crate::types::physical_arrow_type(&distinct.return_type),
         )]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::test_support::*;
+    use rstest::rstest;
+
+    #[rstest]
+    fn global_count_distinct_string_excludes_nulls(mut testing_planner: TestingPlanner) {
+        let rows = run(
+            &mut testing_planner,
+            "SELECT COUNT(DISTINCT s) AS d FROM nullable_table",
+        );
+
+        assert_eq!(rows[0]["d"].as_i64(), Some(3)); // x, y, z
+    }
+
+    #[rstest]
+    fn global_count_distinct_int_excludes_nulls(mut testing_planner: TestingPlanner) {
+        let rows = run(
+            &mut testing_planner,
+            "SELECT COUNT(DISTINCT b) AS d FROM nullable_table",
+        );
+
+        assert_eq!(rows[0]["d"].as_i64(), Some(3)); // 10, 30, 50
     }
 }

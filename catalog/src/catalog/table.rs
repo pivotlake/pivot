@@ -442,6 +442,49 @@ impl CatalogTable {
         self.manifest.columns.clone()
     }
 
+    /// Whether each column (in [`columns`](Self::columns) order) can hold SQL
+    /// NULLs, computed from the loaded footers rather than the declared schema:
+    /// the planner uses the flags to route between the branch-free and the
+    /// null-aware execution paths, so they must reflect whether the data can
+    /// actually hold NULLs. An empty table reports every column nullable.
+    pub fn nullability(&self) -> Vec<bool> {
+        self.manifest
+            .columns
+            .iter()
+            .map(|column| self.files.is_empty() || self.column_may_hold_nulls(&column.name))
+            .collect()
+    }
+
+    /// Whether any loaded row group can hold a NULL in `name`. A column that is
+    /// `REQUIRED` everywhere cannot; an `OPTIONAL` one (writers like DuckDB mark
+    /// every column `OPTIONAL` even when no value is ever NULL) is refined by
+    /// the chunk's `null_count` statistic when the schema is flat enough to map
+    /// fields to leaves; a file missing the column entirely reads as all-NULL.
+    fn column_may_hold_nulls(&self, name: &str) -> bool {
+        self.files
+            .iter()
+            .flat_map(|file| file.row_groups.iter())
+            .any(|rg| {
+                let Ok(field_idx) = rg.schema.index_of(name) else {
+                    return true;
+                };
+                if !rg.schema.field(field_idx).is_nullable() {
+                    return false;
+                }
+                // Nested fields (e.g. a shredded variant) span several leaves,
+                // so the field-to-chunk mapping below does not hold; stay
+                // conservative for the whole row group.
+                if rg.columns.len() != rg.schema.fields().len() {
+                    return true;
+                }
+                rg.columns[field_idx]
+                    .statistics
+                    .as_ref()
+                    .and_then(|stats| stats.null_count)
+                    .is_none_or(|null_count| null_count > 0)
+            })
+    }
+
     /// The declared schema as one shareable slice: what a footer load
     /// reconciles each file's parsed schema against.
     fn declared_columns(&self) -> Arc<[Column]> {

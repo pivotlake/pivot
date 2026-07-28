@@ -8,6 +8,7 @@ use super::Fold;
 use crate::arrays::SlabColumn;
 use crate::operations::unary::group::values::cell::IntCell;
 use arrow_array::ArrayRef;
+use arrow_buffer::NullBuffer;
 use arrow_schema::Field;
 use std::marker::PhantomData;
 
@@ -22,6 +23,10 @@ impl<A: IntCell> Fold for Sum<A> {
     type Acc = A;
 
     #[inline(always)]
+    fn empty() -> A {
+        A::from(0)
+    }
+    #[inline(always)]
     fn seed(v: i64) -> A {
         A::from(v)
     }
@@ -33,7 +38,7 @@ impl<A: IntCell> Fold for Sum<A> {
     fn merge(a: A, b: A) -> A {
         a + b
     }
-    fn finish(name: &str, col: SlabColumn<A>) -> (Field, ArrayRef) {
-        A::finish(name, col)
+    fn finish(name: &str, col: SlabColumn<A>, nulls: Option<NullBuffer>) -> (Field, ArrayRef) {
+        A::finish(name, col, nulls)
     }
 }

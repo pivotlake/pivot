@@ -22,6 +22,7 @@ struct TestTable {
     _dir: Arc<TempDir>,
     parquet_table: Arc<ParquetTable>,
     columns: Vec<Column>,
+    nullability: Vec<bool>,
 }
 
 impl TestTable {
@@ -29,7 +30,7 @@ impl TestTable {
         let fields: Vec<Field> = columns
             .iter()
             .map(|(name, col_type, array)| {
-                let field = Field::new(*name, array.data_type().clone(), false);
+                let field = Field::new(*name, array.data_type().clone(), array.null_count() > 0);
                 // A variant column keeps its extension tag: the parquet writer
                 // stamps the VARIANT logical type from it, which the reader in
                 // turn needs to hand the binary leaves back as binary.
@@ -58,6 +59,15 @@ impl TestTable {
     /// at all, per file), as real ingested files do; each batch's own schema
     /// is written as-is.
     fn from_batches(dispatch: &Dispatch, columns: Vec<Column>, batches: &[RecordBatch]) -> Self {
+        // Report the data's actual nullability, as a real binding derives it
+        // from footers, so NULL-free test data keeps the fast paths.
+        let nullability: Vec<bool> = (0..columns.len())
+            .map(|i| {
+                batches
+                    .iter()
+                    .any(|batch| batch.num_columns() > i && batch.column(i).null_count() > 0)
+            })
+            .collect();
         let dir = TempDir::new().unwrap();
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
@@ -84,6 +94,7 @@ impl TestTable {
             _dir: Arc::new(dir),
             parquet_table,
             columns,
+            nullability,
         }
     }
 }
@@ -108,6 +119,10 @@ impl Table for TestTable {
 
     fn columns(&self) -> Vec<Column> {
         self.columns.clone()
+    }
+
+    fn nullability(&self) -> Vec<bool> {
+        self.nullability.clone()
     }
 
     fn clone_box(&self) -> Box<dyn Table> {

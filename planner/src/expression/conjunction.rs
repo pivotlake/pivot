@@ -2,7 +2,7 @@
 
 use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
-use arrow::compute::kernels::boolean::{and, or};
+use arrow::compute::kernels::boolean::{and_kleene, or_kleene};
 use arrow_array::{ArrayRef, BooleanArray, RecordBatch};
 use arrow_schema::ArrowError;
 use std::fmt::{self, Display};
@@ -38,11 +38,13 @@ impl Display for Conjunction {
 impl Conjunction {
     pub fn compile(&self) -> Result<ExprFn, compile::Error> {
         // Compile each child predicate once, then per batch reduce their boolean
-        // masks with the conjunction's kernel (`AND`/`OR`).
+        // masks with the conjunction's kernel (`AND`/`OR`). The Kleene kernels
+        // keep SQL three-valued logic: `TRUE OR NULL` is `TRUE` and
+        // `FALSE AND NULL` is `FALSE`, which the plain kernels would turn NULL.
         type BoolKernel = fn(&BooleanArray, &BooleanArray) -> Result<BooleanArray, ArrowError>;
         let kernel: BoolKernel = match self.op {
-            ConjunctionOp::And => and,
-            ConjunctionOp::Or => or,
+            ConjunctionOp::And => and_kleene,
+            ConjunctionOp::Or => or_kleene,
         };
         let child_builders = self
             .children
@@ -71,6 +73,24 @@ impl Conjunction {
 mod tests {
     use crate::test_support::*;
     use rstest::rstest;
+
+    #[rstest]
+    fn true_or_null_keeps_the_row(mut testing_planner: TestingPlanner) {
+        // Row a = 6 has s = 'z' but b NULL: `b = 10` is NULL there, and SQL's
+        // `TRUE OR NULL` is TRUE, so the row must be kept.
+        let mut rows = run(
+            &mut testing_planner,
+            "SELECT a FROM nullable_table WHERE s = 'z' OR b = 10",
+        );
+
+        rows.sort_by_key(|r| r["a"].as_i64().unwrap());
+        assert_eq!(
+            rows.iter()
+                .map(|r| r["a"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 6]
+        );
+    }
 
     #[rstest]
     fn or_of_two_equalities(mut testing_planner: TestingPlanner) {

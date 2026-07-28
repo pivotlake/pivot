@@ -24,6 +24,7 @@ mod divide;
 mod function;
 mod in_list;
 mod interval;
+mod is_null;
 mod length;
 mod like;
 mod not;
@@ -49,6 +50,7 @@ pub use divide::Divide;
 pub use function::{Function, ScalarFunctionSignature, builtin_scalar_function};
 pub use in_list::InList;
 pub use interval::IntervalArithmetic;
+pub use is_null::IsNull;
 pub use length::Length;
 pub use like::Like;
 pub use not::Not;
@@ -113,6 +115,7 @@ pub enum Expression {
     Conjunction(Conjunction),
     Case(Case),
     Not(Not),
+    IsNull(IsNull),
     Cast(Cast),
 }
 
@@ -142,6 +145,7 @@ impl Expression {
                     + c.else_expr.count_kernels()
             }
             Expression::Not(n) => 1 + n.input.count_kernels(),
+            Expression::IsNull(n) => 1 + n.input.count_kernels(),
             Expression::Cast(c) => 1 + c.source.count_kernels(),
         }
     }
@@ -189,6 +193,7 @@ impl Expression {
                 c.else_expr.collect_column_refs(out);
             }
             Expression::Not(n) => n.input.collect_column_refs(out),
+            Expression::IsNull(n) => n.input.collect_column_refs(out),
             Expression::Cast(c) => c.source.collect_column_refs(out),
         }
     }
@@ -208,7 +213,8 @@ impl Expression {
             | Expression::Between(_)
             | Expression::InList(_)
             | Expression::Conjunction(_)
-            | Expression::Not(_) => Ok(Type::Boolean),
+            | Expression::Not(_)
+            | Expression::IsNull(_) => Ok(Type::Boolean),
             // A CASE's branches are unified to one type by DuckDB, so the ELSE
             // branch's type is the whole expression's type.
             Expression::Case(c) => c.else_expr.result_type(),
@@ -217,6 +223,49 @@ impl Expression {
             // An aggregate carries DuckDB's bound result type.
             Expression::AggregateFunc(a) => Ok(a.return_type().clone()),
             Expression::Function(f) => Ok(f.result_type()),
+        }
+    }
+
+    /// Whether this expression can evaluate to SQL NULL, given the nullability
+    /// of each input column (`input[i]` = column `i` can hold NULLs). The
+    /// planner uses this to route between the branch-free and the null-aware
+    /// execution paths, so `false` must be sound: a `true` merely costs the
+    /// fast path. Functions are folded conservatively (any nullable input
+    /// column makes a function nullable) since a function of an entirely
+    /// NULL-free input produces no NULLs (an operation that introduces its own
+    /// NULLs, if one is ever added, must be special-cased here).
+    pub fn nullability(&self, input: &[bool]) -> bool {
+        match self {
+            Expression::Ref(r) => input.get(r.column_idx).copied().unwrap_or(true),
+            Expression::Constant(c) => c.get().0.is_null(0),
+            // `IS NULL` is the one predicate that never yields NULL itself.
+            Expression::IsNull(_) => false,
+            Expression::Compare(c) => c.left.nullability(input) || c.right.nullability(input),
+            Expression::Between(b) => {
+                b.input.nullability(input)
+                    || b.lower.nullability(input)
+                    || b.upper.nullability(input)
+            }
+            Expression::InList(l) => {
+                l.input.nullability(input) || l.values.iter().any(|v| v.nullability(input))
+            }
+            Expression::Conjunction(c) => c.children.iter().any(|e| e.nullability(input)),
+            Expression::Not(n) => n.input.nullability(input),
+            // A CASE's value comes from its THEN/ELSE branches.
+            Expression::Case(c) => {
+                c.checks.iter().any(|check| check.then.nullability(input))
+                    || c.else_expr.nullability(input)
+            }
+            Expression::Cast(c) => c.source.nullability(input),
+            // A count is never NULL; the other aggregates are NULL over zero
+            // (non-NULL) rows.
+            Expression::AggregateFunc(a) => !matches!(
+                a,
+                AggregateFunc::CountStar(_)
+                    | AggregateFunc::Count(_)
+                    | AggregateFunc::CountDistinct(_)
+            ),
+            Expression::Function(_) => input.iter().any(|&nullable| nullable),
         }
     }
 
@@ -236,6 +285,7 @@ impl Expression {
             Expression::Conjunction(c) => c.compile(),
             Expression::Case(c) => c.compile(),
             Expression::Not(n) => n.compile(),
+            Expression::IsNull(n) => n.compile(),
             Expression::Cast(c) => c.compile(),
             _ => Err(compile::Error::UnsupportedExpression(self.clone())),
         }
@@ -255,6 +305,7 @@ impl Display for Expression {
             Expression::Conjunction(c) => write!(f, "{c}"),
             Expression::Case(c) => write!(f, "{c}"),
             Expression::Not(n) => write!(f, "{n}"),
+            Expression::IsNull(n) => write!(f, "{n}"),
             Expression::Cast(c) => write!(f, "{c}"),
         }
     }

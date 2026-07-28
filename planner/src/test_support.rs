@@ -93,7 +93,7 @@ impl TestTable {
             .iter()
             .zip(&arrays)
             .map(|((name, _, _), array)| {
-                Field::new(*name, array.data_type().clone(), array.is_nullable())
+                Field::new(*name, array.data_type().clone(), array.null_count() > 0)
             })
             .collect();
         let schema = Arc::new(Schema::new(fields));
@@ -135,6 +135,16 @@ impl Table for TestTable {
         self.columns.clone()
     }
 
+    fn nullability(&self) -> Vec<bool> {
+        // Report the batch's actual nullability, as a real binding derives it
+        // from footers, so NULL-free test data keeps the fast paths.
+        self.batch
+            .columns()
+            .iter()
+            .map(|array| array.null_count() > 0)
+            .collect()
+    }
+
     fn clone_box(&self) -> Box<dyn Table> {
         Box::new(self.clone())
     }
@@ -164,6 +174,11 @@ impl Table for TestTable {
         _transaction: &dyn CatalogTransaction,
     ) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
         let arr = self.batch.column(column);
+        // `values()` below reads the zero-filled null slots too, which would
+        // fabricate a 0 extreme; a nullable column just skips the peephole.
+        if arr.null_count() > 0 {
+            return None;
+        }
         match arr.data_type() {
             DataType::Int32 => {
                 let values = arr.as_primitive::<Int32Type>().values();
@@ -310,6 +325,20 @@ impl TestingPlanner {
 /// 4 | 40 | 400 | dave
 /// 5 | 50 | 500 | alice
 /// ```
+///
+/// and `nullable_table`: `(a Int32, b Int32, s Utf8)`, 6 rows where `b` and
+/// `s` carry NULLs:
+///
+/// ```text
+/// a | b    | s
+/// --+------+------
+/// 1 | 10   | x
+/// 2 | NULL | NULL
+/// 3 | 30   | y
+/// 4 | NULL | NULL
+/// 5 | 50   | x
+/// 6 | NULL | z
+/// ```
 #[fixture]
 pub fn testing_planner() -> TestingPlanner {
     let dispatch = Dispatch::spin_up(1, 32, None);
@@ -324,6 +353,36 @@ pub fn testing_planner() -> TestingPlanner {
                 "name",
                 Type::Utf8,
                 str_col(vec!["alice", "bob", "charlie", "dave", "alice"]),
+            ),
+        ],
+    );
+    catalog.add_table(
+        "nullable_table",
+        &[
+            ("a", Type::Int32, int_col(vec![1, 2, 3, 4, 5, 6])),
+            (
+                "b",
+                Type::Int32,
+                Arc::new(Int32Array::from(vec![
+                    Some(10),
+                    None,
+                    Some(30),
+                    None,
+                    Some(50),
+                    None,
+                ])),
+            ),
+            (
+                "s",
+                Type::Utf8,
+                Arc::new(StringViewArray::from(vec![
+                    Some("x"),
+                    None,
+                    Some("y"),
+                    None,
+                    Some("x"),
+                    Some("z"),
+                ])),
             ),
         ],
     );

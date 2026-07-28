@@ -103,10 +103,10 @@ pub use keys::{
 };
 pub(crate) use values::cast_value_column;
 pub use values::{
-    AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot, Distinct,
-    Dynamic, F64Cell, F64Max, F64Min, F64Sum, Fold, IntCell, IntRead, Max, MaxSlot, Min, MinSlot,
-    NoRead, OpTuple, Read, SharedContext, StrMax, StrMin, StrRead, Sum, SumSlot, U128Max, U128Min,
-    U128Sum, WideCell, WideSum, WorkerContext,
+    AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot,
+    CountValidSlot, Distinct, Dynamic, F64Cell, F64Max, F64Min, F64Sum, Fold, IntCell, IntRead,
+    Max, MaxSlot, Min, MinSlot, NoRead, OpTuple, Read, SharedContext, StrMax, StrMin, StrRead, Sum,
+    SumSlot, U128Max, U128Min, U128Sum, WideCell, WideSum, WorkerContext,
 };
 
 use crate::memory::SlabAllocator;
@@ -1330,7 +1330,10 @@ mod tests {
     #[test]
     fn row_key_mixed_int_string_counts() {
         let batch = mixed_key_batch(&[1, 1, 1, 2, 2], &["a", "b", "a", "a", "a"], &[0; 5]);
-        let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
+        let schema = RowKeySchema::new(
+            vec![DataType::Int64, DataType::Utf8View],
+            vec![false, false],
+        );
         let sender = run_row_key_group::<Compiled<(CountSlot,)>>(
             vec![vec![batch]],
             vec![0, 1],
@@ -1445,7 +1448,10 @@ mod tests {
     fn row_key_sums_per_group() {
         let long = "a-string-well-over-twelve-bytes";
         let batch = mixed_key_batch(&[1, 2, 1, 2], &["x", long, "x", "y"], &[10, 5, 30, 7]);
-        let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
+        let schema = RowKeySchema::new(
+            vec![DataType::Int64, DataType::Utf8View],
+            vec![false, false],
+        );
         let slots = vec![AggregationSlot::new(
             AggregationKind::Sum,
             2,
@@ -1470,7 +1476,10 @@ mod tests {
     /// Keys split across two workers must merge into the same groups.
     #[test]
     fn row_key_two_workers_merge() {
-        let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
+        let schema = RowKeySchema::new(
+            vec![DataType::Int64, DataType::Utf8View],
+            vec![false, false],
+        );
         let sender = run_row_key_group::<Compiled<(CountSlot,)>>(
             vec![
                 vec![mixed_key_batch(&[1, 2], &["a", "a"], &[0; 2])],
@@ -1499,7 +1508,10 @@ mod tests {
         let long = "a-string-well-over-twelve-bytes";
         // GROUP BY (name, id), summing the value column.
         let batch = mixed_key_batch(&[1, 2, 1, 2], &[long, "y", long, "y"], &[10, 5, 30, 7]);
-        let schema = RowKeySchema::new(vec![DataType::Utf8View, DataType::Int64]);
+        let schema = RowKeySchema::new(
+            vec![DataType::Utf8View, DataType::Int64],
+            vec![false, false],
+        );
         let slots = vec![AggregationSlot::new(
             AggregationKind::Sum,
             2,
@@ -1533,7 +1545,10 @@ mod tests {
         let long = "a-string-well-over-twelve-bytes";
         let b1 = mixed_key_batch(&[1, 1], &["a", long], &[10, 5]);
         let b2 = mixed_key_batch(&[1, 1], &["a", long], &[3, 7]);
-        let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
+        let schema = RowKeySchema::new(
+            vec![DataType::Int64, DataType::Utf8View],
+            vec![false, false],
+        );
         let slots = vec![AggregationSlot::new(
             AggregationKind::Sum,
             2,
@@ -1866,7 +1881,10 @@ mod tests {
             .map(String::as_str)
             .collect();
         let vals = vec![0i32; 1000];
-        let schema = RowKeySchema::new(vec![DataType::Int64, DataType::Utf8View]);
+        let schema = RowKeySchema::new(
+            vec![DataType::Int64, DataType::Utf8View],
+            vec![false, false],
+        );
         let radix = RadixConfig {
             switch_threshold: 256,
             partitions: 16,

@@ -23,8 +23,8 @@ use duckdb_planner::{Expr, LogicalTypeId, ScalarValue};
 use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Conjunction,
     ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide, Error,
-    Expression, Function, InList, IntervalArithmetic, Length, Like, Not, NumericAggregate, Prefix,
-    Ref, RegexpFullMatch, RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
+    Expression, Function, InList, IntervalArithmetic, IsNull, Length, Like, Not, NumericAggregate,
+    Prefix, Ref, RegexpFullMatch, RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
 
@@ -47,6 +47,10 @@ impl Expression {
             DuckExpression::Conjunction(c) => Expression::Conjunction(Conjunction::from_handle(c)?),
             DuckExpression::Case(c) => Expression::Case(Case::from_handle(c)?),
             DuckExpression::Not(n) => Expression::Not(Not::from_handle(n)?),
+            DuckExpression::IsNull(n) => Expression::IsNull(IsNull {
+                negated: n.negated(),
+                input: Box::new(Expression::from_handle(n.input())?),
+            }),
             DuckExpression::Cast(c) => Cast::from_handle(c)?,
             DuckExpression::Unsupported(t) => return Err(Error::UnsupportedExpressionType(t)),
         })
