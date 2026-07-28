@@ -5,8 +5,12 @@
 # of cold and hot timings plus the speedup (how many times faster pivot is than
 # the fastest competitor) per query.
 #
-# pivot always runs (via `just pgo-use run --release -- ...`, so generate the PGO
-# profile first with `just pgo-gen ...`). DuckDB is opt-in with --duckdb (or
+# pivot always runs, from the binary given by --binary. That binary is built
+# beforehand, by `just setup-bench` and `just bench-build`; this script never
+# builds. Driving it through `just pgo-use run` used to mean any stale flag or
+# profile silently triggered a full rebuild in the middle of a measurement, and
+# the rebuilt binary was not necessarily the one that had been measured before.
+# DuckDB is opt-in with --duckdb (or
 # --native) and driven by run-duckdb.sh; ClickHouse is opt-in with --clickhouse
 # and driven by run-clickhouse.sh. A bare run is pivot-only.
 #
@@ -26,8 +30,9 @@
 # red when it is slower.
 #
 # Usage:
-#   ./benchmark.sh --source ~/hits                     # pivot only
-#   ./benchmark.sh --source ~/hits --duckdb            # pivot vs DuckDB
+#   B=~/bench/working/target-pgouse/$(rustc -vV | sed -n 's/^host: //p')/profiling/pivot-bench
+#   ./benchmark.sh --binary $B --source ~/hits                  # pivot only
+#   ./benchmark.sh --binary $B --source ~/hits --duckdb         # pivot vs DuckDB
 #   ./benchmark.sh --source ~/hits --duckdb --clickhouse ~/clickhouse  # all three
 #   ./benchmark.sh --hits ~/hits --duckdb --query 7,20 # subset; --hits == --source
 #   ./benchmark.sh --source ~/hits --iterations 5      # 1 cold + 4 hot runs
@@ -68,6 +73,8 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 crate_dir="$(cd "$here/.." && pwd)"   # benchmarks/ - where the justfile / cargo crate live
+
+pivot_bin=""
 suite_dir="$here"
 
 source_path=""
@@ -91,6 +98,10 @@ usage() {
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --source|--hits)  source_path="$2"; shift 2 ;;
+        # The pivot-bench binary to measure, built beforehand by setup-bench or
+        # bench-build. Required, so a measurement can never quietly turn into a
+        # rebuild of something other than what was measured a moment ago.
+        --binary)         pivot_bin="$2"; shift 2 ;;
         --duckdb)         duck_enabled=1; shift ;;
         --native)         native_db="$2"; duck_enabled=1; shift 2 ;;  # native implies DuckDB
         --duckdb-process) duckdb_process="$2"; shift 2 ;;
@@ -106,6 +117,28 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown argument: $1" >&2; usage 1 ;;
     esac
 done
+
+if [[ -z "$pivot_bin" ]]; then
+    {
+        echo "error: --binary is required"
+        echo
+        echo "This script measures a prebuilt pivot-bench; it does not build one."
+        echo "Build it first, then pass it:"
+        echo
+        echo "    cd $crate_dir"
+        echo "    just setup-bench --pgo-source ~/hits-pgo-subset   # once per box"
+        echo "    just bench-build                                  # after editing"
+        echo
+        echo "    ./clickbench/benchmark.sh --binary \\"
+        echo "        ~/bench/working/target-pgouse/$(rustc -vV 2>/dev/null | sed -n 's/^host: //p')/profiling/pivot-bench \\"
+        echo "        --source ~/hits"
+    } >&2
+    exit 2
+fi
+if [[ ! -x "$pivot_bin" ]]; then
+    echo "error: --binary $pivot_bin is not an executable file" >&2
+    exit 2
+fi
 
 if [[ -z "$source_path" ]]; then
     echo "error: --source/--hits is required" >&2
@@ -153,9 +186,9 @@ pivot_invoke() {
     # a true cold read within the one warm server session (no restart needed).
     local cold_flag=""
     [[ $drop_caches -eq 1 ]] && cold_flag="--drop-caches"
-    ( cd "$crate_dir" && just pgo-use run --release -- \
+    "$pivot_bin" \
         --source "$source_path" --query "$*" --iterations "$iterations" \
-        --sleep "$sleep_ms" $skip_flag $cold_flag ) 2>&1
+        --sleep "$sleep_ms" $skip_flag $cold_flag 2>&1
 }
 
 # Run DuckDB for one or more queries (comma-joined), raw output on stdout.

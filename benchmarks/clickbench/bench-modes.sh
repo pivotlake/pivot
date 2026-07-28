@@ -9,8 +9,9 @@
 #                 (ClickBench-native style) — pivot-on-parquet vs DuckDB-native
 #
 # Run prep-modes-data.sh first to create <root>/{single,partitioned,hits.db}.
-# Like benchmark.sh, pivot runs via `just pgo-use`, so generate a PGO profile
-# first (see the bench skills) — ideally on this same subset.
+# Like benchmark.sh, this measures a prebuilt binary rather than building one:
+# pass --binary <pivot-bench>, built by `just setup-bench` / `just bench-build`
+# (see the bench skills). It is forwarded to benchmark.sh with everything else.
 #
 # Usage:
 #   ./bench-modes.sh --root ~/bench-data --query "$IDS" --iterations 3 --skip-check
