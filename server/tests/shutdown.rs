@@ -13,7 +13,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
-use common::{pick_free_port, wait_until_listening};
+use common::{pick_free_port, pivot_metastore, wait_until_listening};
 use datastore_delta::DeltaDatastore;
 use dispatch::Dispatch;
 use server::Server;
@@ -50,7 +50,7 @@ fn shutdown_signal_drains_all_worker_threads() {
             .build()
             .unwrap();
         rt.block_on(async move {
-            let server = Server::new(bind, dispatch, catalog);
+            let server = Server::new(bind, dispatch, catalog, pivot_metastore());
             server
                 .serve(Box::pin(async move {
                     let _ = shutdown_rx.await;

@@ -23,6 +23,7 @@
 use crate::query_handler::{PivotHandlers, PlanCache};
 use catalog::PivotCatalog;
 use dispatch::{DataFlowDispatcher, Dispatch, Shutdown};
+use metastore::Metastore;
 use pgwire::tokio::process_socket;
 use std::io;
 use std::net::SocketAddr;
@@ -67,14 +68,13 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 /// A pivotdb server instance.
 ///
 /// Holds the TCP bind address, a [`JoinSet`] watching every dispatch worker
-/// thread, and the shared pgwire handlers bundle (query / startup / cancel
-/// handlers) used by every connection. Construct one with [`Server::new`] and
-/// drive it with [`Server::serve`].
+/// thread, and the configuration the pgwire handler bundle (query / startup /
+/// cancel handlers) is built from when the accept loop starts. Construct one
+/// with [`Server::new`] and drive it with [`Server::serve`].
 pub struct Server {
     bind: SocketAddr,
     worker_watchers: JoinSet<std::thread::Result<()>>,
     shutdown: Shutdown,
-    handlers: Arc<PivotHandlers>,
     /// Planned read queries shared by the PostgreSQL and in-process HTTP paths.
     plan_cache: Arc<PlanCache>,
     /// Cloned dispatcher, kept for the query handler (compiling plans) and the
@@ -89,16 +89,25 @@ pub struct Server {
     /// `None` (the default) leaves it off; set it with
     /// [`with_http_bind`](Self::with_http_bind).
     http_bind: Option<SocketAddr>,
+    /// The metastore consulted for every connection's current user and
+    /// authentication method.
+    metastore: Arc<dyn Metastore>,
 }
 
 impl Server {
     /// Build a server from the bind address, an already-spun-up [`Dispatch`],
-    /// and the catalog used to resolve table names. The server takes the
-    /// `Dispatch` apart with [`Dispatch::into_parts`]: it clones the
+    /// the catalog used to resolve table names, and its metastore. The server
+    /// keeps the metastore so every login can read current user credentials. It
+    /// takes the `Dispatch` apart with [`Dispatch::into_parts`]: it clones the
     /// dispatcher for the query handler and adopts every worker `JoinHandle`
-    /// for the shutdown / fault-detection path. Pass port `0` in `bind` to
-    /// let the OS pick a free port (useful in tests).
-    pub fn new(bind: SocketAddr, dispatch: Dispatch, catalog: Arc<PivotCatalog>) -> Self {
+    /// for the shutdown / fault-detection path. Pass port `0` in `bind` to let
+    /// the OS pick a free port (useful in tests).
+    pub fn new(
+        bind: SocketAddr,
+        dispatch: Dispatch,
+        catalog: Arc<PivotCatalog>,
+        metastore: Arc<dyn Metastore>,
+    ) -> Self {
         // Clone the dispatcher out *before* `into_parts` drops it; the query
         // handler needs it to compile every plan, and the web console runs
         // queries on the worker pool.
@@ -113,15 +122,11 @@ impl Server {
             bind,
             shutdown,
             worker_watchers: watchers,
-            handlers: Arc::new(PivotHandlers::new(
-                catalog.clone(),
-                dispatcher.clone(),
-                plan_cache.clone(),
-            )),
             plan_cache,
             dispatcher,
             catalog,
             http_bind: None,
+            metastore,
         }
     }
 
@@ -146,6 +151,13 @@ impl Server {
         let listener = TcpListener::bind(self.bind).await?;
         info!(addr = %self.bind, "listening for psql connections");
 
+        let handlers = Arc::new(PivotHandlers::new(
+            self.catalog.clone(),
+            self.dispatcher.clone(),
+            self.plan_cache.clone(),
+            self.metastore.clone(),
+        ));
+
         // Start each datastore's background maintenance.
         self.catalog.start();
 
@@ -154,6 +166,12 @@ impl Server {
         // query console). Read-only except `/api/query`, so on shutdown we just
         // abort the task.
         let http_task = self.http_bind.map(|bind| {
+            // The dashboard has no authentication of its own, and `/api/query`
+            // runs arbitrary SQL. PostgreSQL users do not govern this endpoint.
+            warn!(
+                %bind,
+                "web dashboard is unauthenticated and runs SQL; users govern only the PostgreSQL endpoint"
+            );
             let state = crate::http::IntrospectState::new(
                 self.catalog.clone(),
                 self.dispatcher.clone(),
@@ -212,7 +230,7 @@ impl Server {
                 accept = listener.accept() => {
                     match accept {
                         Ok((socket, peer)) => {
-                            let handlers = self.handlers.clone();
+                            let handlers = handlers.clone();
                             tokio::spawn(async move {
                                 info!(?peer, "connection accepted");
                                 if let Err(e) = process_socket(socket, None, handlers).await {
@@ -269,12 +287,35 @@ mod tests {
         (directory, Arc::new(catalog))
     }
 
+    fn metastore() -> Arc<dyn Metastore> {
+        struct TestMetastore;
+
+        impl Metastore for TestMetastore {
+            fn open_datastores(
+                &self,
+                _dispatcher: &DataFlowDispatcher,
+            ) -> metastore::Result<HashMap<String, Arc<dyn Datastore>>> {
+                Ok(HashMap::new())
+            }
+
+            fn default_datastore_name(&self) -> &str {
+                DEFAULT_DATASTORE_NAME
+            }
+
+            fn user_auth(&self, username: &str) -> Option<metastore::UserAuth> {
+                (username == metastore::DEFAULT_USER_NAME).then_some(metastore::UserAuth::Trust)
+            }
+        }
+
+        Arc::new(TestMetastore)
+    }
+
     #[tokio::test]
     async fn shutdown_signal_returns_ok() {
         let (tx, rx) = oneshot::channel::<()>();
         let dispatch = Dispatch::spin_up(1, 32, None);
         let (_directory, catalog) = catalog(&dispatch);
-        let server = Server::new(bind(), dispatch, catalog);
+        let server = Server::new(bind(), dispatch, catalog, metastore());
 
         let join = tokio::spawn(server.serve(Box::pin(async move {
             let _ = rx.await;

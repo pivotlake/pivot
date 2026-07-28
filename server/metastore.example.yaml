@@ -21,3 +21,17 @@ datastores:
     secret_access_key: replace-me
     # session_token: replace-me
     # endpoint: http://localhost:9000 # MinIO / S3-compatible
+
+# Users are an allowlist. The built-in configuration provides `pivot` without a
+# password so a fresh server remains easy to connect to. Trust proves no
+# identity: anyone using this name is accepted.
+users:
+  pivot:
+    auth:
+      method: trust
+
+  # A SCRAM-SHA-256 method contains its precomputed verifier, not the password.
+  # analytics:
+  #   auth:
+  #     method: scram-sha-256
+  #     verifier: "pivot-scram-sha-256$4096:..."

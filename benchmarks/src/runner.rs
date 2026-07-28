@@ -487,7 +487,7 @@ pub async fn run_suite(
     let (client, connection) = tokio_postgres::Config::new()
         .host("127.0.0.1")
         .port(server.port())
-        .user("bench")
+        .user("pivot")
         .dbname("bench")
         .connect(NoTls)
         .await?;

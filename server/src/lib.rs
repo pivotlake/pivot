@@ -11,39 +11,54 @@
 //! thread and reused across queries. When run as a binary, the default is to run with the default
 //! `datastore_delta::DeltaDatastore`.
 //!
-//! The public interface: hand a bind address to [`Server::new`] together
-//! with a [`Dispatch`](dispatch::Dispatch) (from
-//! [`Dispatch::spin_up`](dispatch::Dispatch::spin_up)) and your catalog; then
-//! call [`Server::serve`] with a shutdown future. The returned future runs the
-//! accept loop until shutdown is signalled or a worker dies. Each datastore
-//! self-manages its own refresh and (optional) compaction, re-encoding Parquet
-//! on the same dispatch workers; those tasks watch the shared exit flag the
-//! server flips on shutdown and stop before the workers do.
+//! The public interface: hand a bind address to [`Server::new`] together with a
+//! [`Dispatch`](dispatch::Dispatch) (from
+//! [`Dispatch::spin_up`](dispatch::Dispatch::spin_up)), your catalog, and the
+//! metastore that produced it; then call [`Server::serve`] with a shutdown
+//! future. The returned future runs the accept loop until shutdown is signalled
+//! or a worker dies. Each datastore self-manages its own refresh and (optional)
+//! compaction, re-encoding Parquet on the same dispatch workers; those tasks
+//! watch the shared exit flag the server flips on shutdown and stop before the
+//! workers do.
 //!
 //! # Example
 //!
 //! ```no_run
-//! use std::collections::HashMap;
 //! use std::net::SocketAddr;
 //! use std::sync::Arc;
+//! use std::time::Duration;
 //!
-//! use catalog::{Datastore, PivotCatalog};
-//! use datastore_delta::DeltaDatastore;
+//! use catalog::PivotCatalog;
 //! use dispatch::Dispatch;
+//! use metastore::Metastore;
+//! use metastore_yaml::YamlMetastore;
 //! use server::Server;
 //!
-//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! # async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 //! let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
 //! let dispatch = Dispatch::spin_up(workers, 32, None);
-//! let datastore: Arc<dyn Datastore> =
-//!     DeltaDatastore::open_local("/var/lib/pivot/default", dispatch.dispatcher())?;
+//! let metastore: Arc<dyn Metastore> = Arc::new(YamlMetastore::from_yaml(
+//!     r#"
+//! datastores:
+//!   default:
+//!     kind: delta
+//!     location: /var/lib/pivot/default
+//!     default: true
+//! users:
+//!   pivot:
+//!     auth:
+//!       method: trust
+//! "#,
+//!     "inline",
+//!     Duration::from_secs(30),
+//! )?);
 //! let catalog = Arc::new(PivotCatalog::new(
-//!     HashMap::from([("default".to_string(), datastore)]),
-//!     "default".to_string(),
+//!     metastore.open_datastores(dispatch.dispatcher())?,
+//!     metastore.default_datastore_name().to_string(),
 //! )?);
 //! let bind: SocketAddr = "127.0.0.1:5433".parse().unwrap();
 //!
-//! let server = Server::new(bind, dispatch, catalog);
+//! let server = Server::new(bind, dispatch, catalog, metastore);
 //! // Returns when ctrl_c fires, or earlier if a dispatch worker dies.
 //! server.serve(Box::pin(async {
 //!     let _ = tokio::signal::ctrl_c().await;
@@ -53,6 +68,7 @@
 //! ```
 
 mod arrow_to_pgwire;
+mod auth;
 mod http;
 #[cfg(feature = "perf")]
 mod perf;
