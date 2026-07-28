@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow_array::{Int64Array, RecordBatch};
+
 use arrow_schema::{DataType, Field, Schema};
 use crossbeam_deque::Injector;
 use dispatch::io::{FsRequest, FsWriteRequest, HttpRequest, HttpUploadRequest, RemoteFile};
@@ -18,7 +19,7 @@ use uuid::Uuid;
 
 use crate::catalog::CatalogTable;
 use crate::parquet::RowGroupMetadata;
-use crate::parquet::writing::{EncodedFile, encode_record_batches_spec};
+use crate::parquet::writing::{EncodedFile, encode_record_batches_spec, unshred_batch};
 use crate::store::{DataFileLocation, FileRef, ObjectPath, ObjectStore};
 
 /// Build the dataflow that writes `input`'s rows into `table` as Parquet and
@@ -47,11 +48,22 @@ pub(super) fn build_insert_spec(
             .columns()
             .into_iter()
             .map(|column| {
-                Field::new(
+                let field = Field::new(
                     column.name,
                     planner::types::physical_arrow_type(&column.col_type),
                     false,
-                )
+                );
+                // The Arrow extension tag lives on the field, not on the data
+                // type, so a variant built from `physical_arrow_type` alone is
+                // indistinguishable from any other struct. Put the tag back, or
+                // the shredding stage further down this pipeline does not
+                // recognize the column and writes the documents unshredded.
+                match column.col_type {
+                    planner::types::Type::Variant => {
+                        field.with_metadata(crate::parquet::variant_extension_metadata())
+                    }
+                    _ => field,
+                }
             })
             .collect::<Vec<_>>(),
     ));
@@ -60,6 +72,13 @@ pub(super) fn build_insert_spec(
         move || {
             let schema = schema.clone();
             move |batch| {
+                // Selecting a variant column out of a table hands over the
+                // physical shape that table shredded it into, while the column
+                // declared here is the plain pair. Reassemble the documents, so
+                // the rows are shredded for the file they land in rather than
+                // carrying the source table's layout across.
+                let batch = unshred_batch(batch)
+                    .expect("a variant column reassembles into metadata and value");
                 RecordBatch::try_new(schema.clone(), batch.columns().to_vec())
                     .expect("DuckDB INSERT binding matches the target table schema")
             }

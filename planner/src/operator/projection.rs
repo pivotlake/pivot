@@ -2,9 +2,11 @@
 
 use crate::compile::{Error, ExprEvalFn, ExprFn};
 use crate::expression::Expression;
+use crate::types::Type;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{Field, Schema};
 use dispatch::RecordBatchOperatorSpec;
+use parquet_variant_compute::VariantArray;
 use std::fmt;
 use std::sync::Arc;
 
@@ -76,8 +78,23 @@ impl Projection {
                 .collect::<Result<Vec<_>, _>>()?,
         );
 
+        // A variant column is a struct of `{metadata, value}` that only the Arrow
+        // extension tag on its *field* distinguishes from any other struct, and
+        // the schema below is rebuilt from the produced arrays, whose data type
+        // has nowhere to carry that tag. Remember which projections yield a
+        // variant so the tag can be put back on, or a consumer downstream (the
+        // write pipeline, which decides shredding by that tag) sees a plain
+        // struct and treats the documents as opaque.
+        let variant_outputs: Arc<Vec<bool>> = Arc::new(
+            self.projections
+                .iter()
+                .map(|projection| Ok(projection.result_type()? == Type::Variant))
+                .collect::<Result<Vec<_>, Error>>()?,
+        );
+
         Ok(input.project(move || {
             let mut evals: Vec<ExprEvalFn> = builders.iter().map(|b| b()).collect();
+            let variant_outputs = variant_outputs.clone();
             move |batch: RecordBatch| {
                 let num_rows = batch.num_rows();
                 // A constant projection (e.g. `SELECT 1`) yields a length-1 scalar;
@@ -90,7 +107,17 @@ impl Projection {
                 let fields: Vec<Field> = columns
                     .iter()
                     .enumerate()
-                    .map(|(i, c)| Field::new(format!("col{i}"), c.data_type().clone(), true))
+                    .map(|(i, c)| {
+                        let name = format!("col{i}");
+                        match variant_outputs[i] {
+                            // `VariantArray::field` is the constructor that
+                            // re-applies the extension tag.
+                            true => VariantArray::try_new(c.as_ref())
+                                .expect("a projection typed VARIANT yields a variant array")
+                                .field(name),
+                            false => Field::new(name, c.data_type().clone(), true),
+                        }
+                    })
                     .collect();
                 RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
             }

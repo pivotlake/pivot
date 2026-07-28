@@ -8,7 +8,7 @@ use arrow_schema::{ArrowError, DataType};
 use thriftparquet::parquet_thrift::ParquetError;
 
 #[derive(Debug, thiserror::Error)]
-pub(super) enum WriteError {
+pub(crate) enum WriteError {
     /// An Arrow kernel or schema operation failed (sort, take, concat, min/max,
     /// `index_of`, building a typed scalar map, or encoding a row key).
     #[error(transparent)]
@@ -38,7 +38,7 @@ pub(super) enum WriteError {
     Downcast { expected: &'static str },
 }
 
-pub(super) type WriteResult<T> = Result<T, WriteError>;
+pub(crate) type WriteResult<T> = Result<T, WriteError>;
 
 /// Carry a `WriteError` out of a stage on dispatch's `unary` error channel as the
 /// typed cause, so a helper's `?` lifts straight into a `UnaryResult` (mirrors

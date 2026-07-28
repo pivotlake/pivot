@@ -642,7 +642,7 @@ fn parse_schema_element(
 pub const VARIANT_EXTENSION_NAME: &str = "arrow.parquet.variant";
 
 /// The Arrow field metadata that marks a struct as a Parquet variant.
-fn variant_extension_metadata() -> std::collections::HashMap<String, String> {
+pub fn variant_extension_metadata() -> std::collections::HashMap<String, String> {
     use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY};
     [
         (
