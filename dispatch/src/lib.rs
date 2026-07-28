@@ -110,12 +110,13 @@ pub use operations::channels::{
 pub use operations::unary::test_utils;
 pub use operations::unary::{Error as UnaryError, Result as UnaryResult};
 pub use operations::{
-    AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot, Distinct,
-    Dynamic, DynamicFilterSlot, Fold, GroupLimit, HashOnlyIntKeyExtractor, IntCell,
-    IntKeyExtractor, IntPairKeyExtractor, IntRead, IntStrKeyExtractor, Max, MaxSlot, Min, MinSlot,
-    NoRead, Nullary, NullaryFactory, NullaryOperatorFactory, OpTuple, Operator, OrderBy, Read,
-    Result as OperatorResult, RowKeyExtractor, RowKeySchema, StrMax, StrMin, StrRead,
-    StringKeyExtractor, Sum, SumSlot, WideSum,
+    AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot,
+    CountValidSlot, Distinct, Dynamic, DynamicFilterSlot, Fold, GroupLimit,
+    HashOnlyIntKeyExtractor, IntCell, IntKeyExtractor, IntPairKeyExtractor, IntRead,
+    IntStrKeyExtractor, Max, MaxSlot, Min, MinSlot, NoRead, Nullary, NullaryFactory,
+    NullaryOperatorFactory, OpTuple, Operator, OrderBy, Read, Result as OperatorResult,
+    RowKeyExtractor, RowKeySchema, StrMax, StrMin, StrRead, StringKeyExtractor, Sum, SumSlot,
+    WideSum,
 };
 pub use operations::{
     Consumer, DefaultUnaryFactory, MapFactory, Outputter, PipelineBreaker,
@@ -496,7 +497,7 @@ mod tests {
 
         let results = values_input(dispatch.dispatcher(), batches)
             .record_batches()
-            .group_by_aggregate::<IntKeyExtractor<Int32Type>, Compiled<(CountSlot,)>>(
+            .group_by_aggregate::<IntKeyExtractor<Int32Type>, Compiled<(CountSlot,), u8>>(
                 vec![0],
                 vec![AggregationSlot::new(
                     AggregationKind::CountStar,

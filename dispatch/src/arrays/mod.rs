@@ -104,6 +104,12 @@ impl<T: Copy> SlabColumn<T> {
         self.len == 0
     }
 
+    /// The pushed elements as a slice: the backing is a single contiguous slab
+    /// and every slot below `len` has been written.
+    pub fn as_slice(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.values.ptr_at_index(0), self.len) }
+    }
+
     /// Consumes the column, handing its slab to Arrow as a zero-copy [`Buffer`].
     /// The caller wraps it in the appropriate typed buffer / array.
     pub fn into_buffer(self) -> Buffer {

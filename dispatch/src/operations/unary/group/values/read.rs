@@ -13,7 +13,8 @@
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::ArrowPrimitiveType;
-use arrow_array::{PrimitiveArray, RecordBatch, StringViewArray};
+use arrow_array::{Array, PrimitiveArray, RecordBatch, StringViewArray};
+use arrow_buffer::NullBuffer;
 use std::marker::PhantomData;
 
 /// How one column type is read for a batch. One impl per *input shape* (integer
@@ -32,6 +33,9 @@ pub trait Read: Send + Sync + 'static {
     /// Read row `idx`. An integer widens to `i64` here; a string is *borrowed*
     /// (no arena write — laziness lives in the fold).
     fn read<'b>(input: &Self::Input<'b>, idx: usize) -> Self::Val<'b>;
+    /// Whether row `idx` is non-NULL. A NULL row is never [`read`](Self::read);
+    /// its fold keeps the cell untouched.
+    fn is_valid(input: &Self::Input<'_>, idx: usize) -> bool;
 }
 
 /// Reads an integer column of width `T`, widened to `i64`. The single place a
@@ -54,6 +58,10 @@ where
     fn read<'b>(input: &Self::Input<'b>, idx: usize) -> Self::Val<'b> {
         unsafe { input.value_unchecked(idx) }.into()
     }
+    #[inline(always)]
+    fn is_valid(input: &Self::Input<'_>, idx: usize) -> bool {
+        input.is_valid(idx)
+    }
 }
 
 /// Reads a string (`Utf8View`) column, *borrowing* the `&str` — the string
@@ -73,10 +81,14 @@ impl Read for StrRead {
     fn read<'b>(input: &Self::Input<'b>, idx: usize) -> Self::Val<'b> {
         unsafe { input.value_unchecked(idx) }
     }
+    #[inline(always)]
+    fn is_valid(input: &Self::Input<'_>, idx: usize) -> bool {
+        input.is_valid(idx)
+    }
 }
 
-/// Reads nothing — for [`Count`](super::fold::Count), whose fold ignores
-/// the input.
+/// Reads nothing: for a `COUNT(*)`'s [`Count`](super::fold::Count), whose fold
+/// ignores the input. Every row is valid: `COUNT(*)` counts rows, not values.
 pub struct NoRead;
 
 impl Read for NoRead {
@@ -87,4 +99,30 @@ impl Read for NoRead {
     fn bind(_batch: &RecordBatch, _column: usize) {}
     #[inline(always)]
     fn read<'b>(_input: &Self::Input<'b>, _idx: usize) -> Self::Val<'b> {}
+    #[inline(always)]
+    fn is_valid(_input: &Self::Input<'_>, _idx: usize) -> bool {
+        true
+    }
+}
+
+/// Reads only a column's validity: for a `COUNT(col)`'s
+/// [`Count`](super::fold::Count), which adds nothing for a NULL row. Binds the
+/// column's null buffer alone (`None` when the batch's column has no NULLs, so
+/// the per-row check is one predictable branch).
+pub struct ValidRead;
+
+impl Read for ValidRead {
+    type Input<'b> = Option<&'b NullBuffer>;
+    type Val<'b> = ();
+
+    #[inline(always)]
+    fn bind(batch: &RecordBatch, column: usize) -> Option<&NullBuffer> {
+        batch.column(column).nulls()
+    }
+    #[inline(always)]
+    fn read<'b>(_input: &Self::Input<'b>, _idx: usize) -> Self::Val<'b> {}
+    #[inline(always)]
+    fn is_valid(input: &Self::Input<'_>, idx: usize) -> bool {
+        input.is_none_or(|nulls| nulls.is_valid(idx))
+    }
 }

@@ -189,6 +189,86 @@ impl<'b> OperationReader<'b> {
         }
     }
 
+    /// Whether this operation's seen bit is always set: a count renders `0`
+    /// for a group with no counted rows, never SQL NULL.
+    #[inline(always)]
+    pub(in super::super) fn always_seen(&self) -> bool {
+        matches!(self, OperationReader::Count)
+    }
+
+    /// The cell of a group whose slot has seen no non-NULL value yet: the
+    /// fold's identity, absorbed by any later fold (`0` for a sum or count,
+    /// the width's extreme for `MIN`/`MAX`). A string extreme's cell is the
+    /// default empty view, guarded by the seen bit so it is never resolved
+    /// through the arena.
+    #[inline(always)]
+    pub(in super::super) fn empty<
+        A: IntCell + StringCell + F64Cell + WideCell,
+        const ONLY_ADDITIVE: bool,
+    >(
+        &self,
+    ) -> A {
+        match self {
+            OperationReader::Count => Count::<A>::empty(),
+            OperationReader::I64Sum(_) | OperationReader::U128Sum(_) => Sum::<A>::empty(),
+            OperationReader::I64Min(_) | OperationReader::U128Min(_) => Min::<A>::empty(),
+            OperationReader::I64Max(_) | OperationReader::U128Max(_) => Max::<A>::empty(),
+            OperationReader::F64Sum(_) => F64Sum::<A>::empty(),
+            OperationReader::F64Min(_) => F64Min::<A>::empty(),
+            OperationReader::F64Max(_) => F64Max::<A>::empty(),
+            OperationReader::StrMin(_) | OperationReader::StrMax(_) => A::default(),
+        }
+    }
+
+    /// Folds one valid row into an existing cell of a tracking run. A string
+    /// extreme whose slot has not seen a value yet re-seeds instead of
+    /// updating: its unseen cell holds no arena key to resolve; every other
+    /// operation folds normally (identity cells absorb).
+    #[inline(always)]
+    pub(in super::super) fn update_seen<
+        A: IntCell + StringCell + F64Cell + WideCell,
+        const ONLY_ADDITIVE: bool,
+    >(
+        &self,
+        cell: A,
+        row_index: usize,
+        was_seen: bool,
+        worker_context: &mut WorkerArena,
+        shared: &Arc<SharedArena>,
+    ) -> A {
+        match self {
+            OperationReader::StrMin(array) => {
+                if ONLY_ADDITIVE {
+                    unreachable!()
+                } else if !was_seen {
+                    StrMin::<A>::seed(StrRead::read(array, row_index), worker_context)
+                } else {
+                    StrMin::<A>::update(
+                        cell,
+                        StrRead::read(array, row_index),
+                        worker_context,
+                        shared,
+                    )
+                }
+            }
+            OperationReader::StrMax(array) => {
+                if ONLY_ADDITIVE {
+                    unreachable!()
+                } else if !was_seen {
+                    StrMax::<A>::seed(StrRead::read(array, row_index), worker_context)
+                } else {
+                    StrMax::<A>::update(
+                        cell,
+                        StrRead::read(array, row_index),
+                        worker_context,
+                        shared,
+                    )
+                }
+            }
+            _ => self.update::<A, ONLY_ADDITIVE>(cell, row_index, worker_context, shared),
+        }
+    }
+
     /// Folds one row into an existing cell.
     #[inline(always)]
     pub(in super::super) fn update<

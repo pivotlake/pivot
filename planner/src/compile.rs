@@ -242,7 +242,9 @@ impl PlanNode {
             crate::Operator::TableFunctionScan(o) => o.compile(dispatcher, transaction),
             crate::Operator::Projection(o) => o.compile(inputs.remove(0)),
             crate::Operator::Filter(o) => o.compile(inputs.remove(0)),
-            crate::Operator::Aggregate(o) => o.compile(inputs.remove(0)),
+            crate::Operator::Aggregate(o) => {
+                o.compile(inputs.remove(0), self.inputs[0].output_nullability())
+            }
             crate::Operator::OrderBy(o) => o.compile(inputs.remove(0)),
             crate::Operator::TopN(o) => o.compile(inputs.remove(0), slots),
             crate::Operator::Limit(o) => o.compile(inputs.remove(0)),

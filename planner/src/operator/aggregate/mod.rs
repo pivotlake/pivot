@@ -69,6 +69,7 @@ impl Aggregate {
     pub fn compile(
         &self,
         input: RecordBatchOperatorSpec,
+        input_nullability: Vec<bool>,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         // Materialise every computed group key and aggregate argument (e.g. the
         // `column1 * column2` in `SUM(column1 * column2)`) into a leading
@@ -77,9 +78,10 @@ impl Aggregate {
         // ever read column indices, never run an expression. When nothing needs
         // materialising (the common all-plain-column case) the input and `self`
         // are reused as-is, with no projection and no clone.
-        match self.materialize_inputs(input)? {
-            (input, Some(resolved)) => resolved.compile_resolved(input),
-            (input, None) => self.compile_resolved(input),
+        let (input, nullability, resolved) = self.materialize_inputs(input, input_nullability)?;
+        match resolved {
+            Some(resolved) => resolved.compile_resolved(input, &nullability),
+            None => self.compile_resolved(input, &nullability),
         }
     }
 
@@ -92,6 +94,7 @@ impl Aggregate {
     fn compile_resolved(
         &self,
         input: RecordBatchOperatorSpec,
+        nullability: &[bool],
     ) -> Result<RecordBatchOperatorSpec, Error> {
         // `COUNT(DISTINCT x)` as the sole aggregate with no GROUP BY: a dedicated
         // single-level global fast path.
@@ -99,7 +102,7 @@ impl Aggregate {
             self.expressions.as_slice()
             && self.groups.is_empty()
         {
-            return self.compile_global_distinct(input, a);
+            return self.compile_global_distinct(input, a, nullability);
         }
 
         // Reject any group key whose type no extractor can encode, naming the
@@ -139,13 +142,13 @@ impl Aggregate {
             })
             .count();
         let grouped = if !self.groups.is_empty() && n_distinct == 1 {
-            self.compile_grouped_distinct(input)?
+            self.compile_grouped_distinct(input, nullability)?
         } else if self.groups.is_empty() {
             self.compile_global(input)?
         } else {
             // Every GROUP BY (plain column keys, two-int-key, the row fallback, or
             // a single computed key) lowers through the general grouped path.
-            self.compile_grouped(input)?
+            self.compile_grouped(input, nullability)?
         };
         Ok(self.restore_declared_output(grouped))
     }
@@ -314,20 +317,26 @@ fn aggregate_value_temporal(e: &Expression) -> Option<DataType> {
     }
 }
 
-/// Map group-key types to the arrow types the [`RowKeyExtractor`](dispatch::RowKeyExtractor)
-/// encodes, in key order. Shared by the general grouped path
-/// ([`grouped`]) and the `COUNT(DISTINCT)` two-level lowering
-/// ([`grouped_distinct`]). Returns `Err` with the first key type the row
-/// encoding doesn't support, so the caller can name the offending key rather
-/// than panicking in `RowKeySchema::new`.
+/// Map group-key types (each paired with its column's nullability) to the
+/// [`RowKeyExtractor`](dispatch::RowKeyExtractor) encoding schema, in key
+/// order. Shared by the general grouped path ([`grouped`]) and the
+/// `COUNT(DISTINCT)` two-level lowering ([`grouped_distinct`]). Returns `Err`
+/// with the first key type the row encoding doesn't support, so the caller can
+/// name the offending key rather than panicking in `RowKeySchema::new`.
 pub(super) fn row_key_schema<'a>(
-    types: impl IntoIterator<Item = &'a Type>,
+    keys: impl IntoIterator<Item = (&'a Type, bool)>,
 ) -> Result<RowKeySchema, Type> {
-    let arrow = types
+    let (arrow, nullable): (Vec<_>, Vec<_>) = keys
         .into_iter()
-        .map(|t| row_key_arrow_type(t).ok_or_else(|| t.clone()))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(RowKeySchema::new(arrow))
+        .map(|(t, nullable)| {
+            row_key_arrow_type(t)
+                .map(|dt| (dt, nullable))
+                .ok_or_else(|| t.clone())
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .unzip();
+    Ok(RowKeySchema::new(arrow, nullable))
 }
 
 /// The arrow type the row encoder uses for one group-key column, or `None` for a
@@ -362,15 +371,19 @@ pub(super) fn is_groupable_key_type(t: &Type) -> bool {
 }
 
 /// The accumulator-width rule shared by the global and grouped paths: `i128` when
-/// a `SUM` reads a 64-bit column (whose total can overflow `i64`, and any decimal
-/// `SUM` declares a `DECIMAL(38, s)` result), or when a `MIN`/`MAX` reads a wide
-/// (`Decimal128`-carried) decimal column whose raw unscaled `i128` values must be
-/// held losslessly; else `i64`. A `MIN`/`MAX` over a `Decimal64`-carried column
-/// stays narrow: its raw values are `i64` and its extreme is one of them.
+/// a `SUM` reads a 64-bit or 128-bit column (whose total can overflow `i64`, and
+/// any decimal `SUM` declares a `DECIMAL(38, s)` result), or when a `MIN`/`MAX`
+/// reads a wide (`Decimal128`-carried) decimal column whose raw unscaled `i128`
+/// values must be held losslessly; else `i64`. A `MIN`/`MAX` over a
+/// `Decimal64`-carried column stays narrow: its raw values are `i64` and its
+/// extreme is one of them.
 fn needs_wide_accumulator(exprs: &[Expression]) -> bool {
     exprs.iter().any(|e| match e {
         Expression::AggregateFunc(AggregateFunc::Sum(a)) => {
-            matches!(a.column().return_type, Type::Int64 | Type::Decimal { .. })
+            matches!(
+                a.column().return_type,
+                Type::Int64 | Type::Int128 | Type::Decimal { .. }
+            )
         }
         Expression::AggregateFunc(AggregateFunc::Min(a) | AggregateFunc::Max(a)) => {
             matches!(

@@ -199,14 +199,17 @@ fn fold_primitive_column<A, V, T: ArrowPrimitiveType>(
 where
     T::Native: Into<V>,
 {
-    assert_eq!(
-        arr.null_count(),
-        0,
-        "aggregate input must not contain NULLs"
-    );
-    let mut values = arr.values().iter().map(|&v| v.into());
-    let first = values.next()?;
-    Some(values.fold(seed(first), update))
+    if arr.null_count() == 0 {
+        let mut values = arr.values().iter().map(|&v| v.into());
+        let first = values.next()?;
+        Some(values.fold(seed(first), update))
+    } else {
+        // NULLs contribute nothing to a SUM/MIN/MAX; a column with only NULLs
+        // reduces to `None`, exactly like an empty column.
+        let mut values = arr.iter().flatten().map(|v| v.into());
+        let first = values.next()?;
+        Some(values.fold(seed(first), update))
+    }
 }
 
 /// One aggregate's running accumulator and its whole lifecycle: fold batches in
@@ -220,8 +223,9 @@ where
 /// rows stays a SQL `NULL` rather than a fabricated `0`/bound; a count over zero
 /// rows is `0`, so it needs no such distinction.
 enum Slot<A: IntCell> {
-    /// `COUNT(*)` / `COUNT(col)` - with no NULLs, both are the row count.
-    Count { count: i64 },
+    /// `COUNT(*)` (`column: None`, all rows) or `COUNT(col)` (`column: Some`,
+    /// only the rows where `col` is non-NULL).
+    Count { column: Option<usize>, count: i64 },
     /// `SUM`/`MIN`/`MAX` over an integer column, accumulating in the width `A`
     /// the planner picks (`i128` only when a sum reads a 64-bit column).
     Int {
@@ -254,7 +258,18 @@ impl<A: IntCell + F64Cell + WideCell> Slot<A> {
     fn build(spec: &AggregationSlot) -> Self {
         let column = spec.column;
         let op = match spec.kind {
-            AggregationKind::CountStar | AggregationKind::Count => return Slot::Count { count: 0 },
+            AggregationKind::CountStar => {
+                return Slot::Count {
+                    column: None,
+                    count: 0,
+                };
+            }
+            AggregationKind::Count => {
+                return Slot::Count {
+                    column: Some(column),
+                    count: 0,
+                };
+            }
             AggregationKind::Sum => NumOp::Sum,
             AggregationKind::Min => NumOp::Min,
             AggregationKind::Max => NumOp::Max,
@@ -283,7 +298,12 @@ impl<A: IntCell + F64Cell + WideCell> Slot<A> {
     /// Fold one batch's contribution into this accumulator.
     fn consume(&mut self, batch: &RecordBatch) {
         match self {
-            Slot::Count { count } => *count += batch.num_rows() as i64,
+            Slot::Count { column, count } => {
+                *count += batch.num_rows() as i64;
+                if let Some(column) = column {
+                    *count -= batch.column(*column).null_count() as i64;
+                }
+            }
             Slot::Int { op, column, acc } => {
                 let op = *op;
                 let reduced = op.reduce_int_column::<A>(batch.column(*column).as_ref());
@@ -309,7 +329,7 @@ impl<A: IntCell + F64Cell + WideCell> Slot<A> {
     /// builds its slots from the same specs, so the variants always match.
     fn merge(&mut self, other: Slot<A>) {
         match (self, other) {
-            (Slot::Count { count }, Slot::Count { count: other }) => *count += other,
+            (Slot::Count { count, .. }, Slot::Count { count: other, .. }) => *count += other,
             (Slot::Int { op, acc, .. }, Slot::Int { acc: other, .. }) => {
                 let op = *op;
                 fold_into(acc, other, |a, b| op.merge(a, b));
@@ -330,7 +350,7 @@ impl<A: IntCell + F64Cell + WideCell> Slot<A> {
     /// total (`0` over zero rows, never NULL).
     fn into_column(self) -> (Field, ArrayRef) {
         match self {
-            Slot::Count { count } => (
+            Slot::Count { count, .. } => (
                 Field::new("count", DataType::Int64, false),
                 Arc::new(Int64Array::from(vec![count])),
             ),
@@ -391,7 +411,6 @@ fn str_extreme_fn<T: Ord>(is_max: bool) -> fn(T, T) -> T {
 /// allocation.
 fn reduce_str_column(is_max: bool, arr: &dyn Array) -> Option<String> {
     let a = arr.as_string_view();
-    assert_eq!(a.null_count(), 0, "aggregate input must not contain NULLs");
     if is_max {
         reduce_str_extreme::<true>(a)
     } else {
@@ -399,17 +418,32 @@ fn reduce_str_column(is_max: bool, arr: &dyn Array) -> Option<String> {
     }
 }
 
-/// The hot string loop, monomorphic per extreme.
+/// The hot string loop, monomorphic per extreme. NULL rows contribute nothing;
+/// an all-NULL column reduces to `None`, exactly like an empty one.
 fn reduce_str_extreme<const MAX: bool>(a: &StringViewArray) -> Option<String> {
-    if a.is_empty() {
-        return None;
+    if a.null_count() == 0 {
+        if a.is_empty() {
+            return None;
+        }
+        let mut acc: &str = unsafe { a.value_unchecked(0) };
+        for i in 1..a.len() {
+            let v = unsafe { a.value_unchecked(i) };
+            acc = str_extreme::<_, MAX>(acc, v);
+        }
+        Some(acc.to_string())
+    } else {
+        let mut acc: Option<&str> = None;
+        for i in 0..a.len() {
+            if a.is_valid(i) {
+                let v = unsafe { a.value_unchecked(i) };
+                acc = Some(match acc {
+                    Some(best) => str_extreme::<_, MAX>(best, v),
+                    None => v,
+                });
+            }
+        }
+        acc.map(str::to_string)
     }
-    let mut acc: &str = unsafe { a.value_unchecked(0) };
-    for i in 1..a.len() {
-        let v = unsafe { a.value_unchecked(i) };
-        acc = str_extreme::<_, MAX>(acc, v);
-    }
-    Some(acc.to_string())
 }
 
 /// Factory for the aggregate operator. All workers share one mpsc channel; the
@@ -1004,5 +1038,85 @@ mod tests {
         let out = run_consumers(ops, vec![vec![]]);
 
         assert!(out.items[0].column(0).is_null(0));
+    }
+
+    fn make_nullable_batch(values: &[Option<i32>]) -> RecordBatch {
+        let array = Int32Array::from(values.to_vec());
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, true)])),
+            vec![Arc::new(array)],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn nulls_are_skipped_by_sum_min_max() {
+        let ops = build::<i64>(
+            1,
+            vec![
+                slot(AggregationKind::Sum, 0),
+                slot(AggregationKind::Min, 0),
+                slot(AggregationKind::Max, 0),
+            ],
+        );
+
+        let out = run_consumers(
+            ops,
+            vec![vec![make_nullable_batch(&[Some(5), None, Some(2), None])]],
+        );
+
+        assert_eq!(col_i128(&out.items[0], 0), 7);
+        assert_eq!(col_i64(&out.items[0], 1), 2);
+        assert_eq!(col_i64(&out.items[0], 2), 5);
+    }
+
+    #[test]
+    fn count_column_skips_nulls_count_star_does_not() {
+        let ops = build::<i64>(
+            1,
+            vec![
+                slot(AggregationKind::Count, 0),
+                slot(AggregationKind::CountStar, 0),
+            ],
+        );
+
+        let out = run_consumers(
+            ops,
+            vec![vec![make_nullable_batch(&[Some(1), None, None, Some(4)])]],
+        );
+
+        assert_eq!(col_i64(&out.items[0], 0), 2);
+        assert_eq!(col_i64(&out.items[0], 1), 4);
+    }
+
+    #[test]
+    fn all_null_input_sum_is_null() {
+        let ops = build::<i64>(1, vec![slot(AggregationKind::Sum, 0)]);
+
+        let out = run_consumers(ops, vec![vec![make_nullable_batch(&[None, None])]]);
+
+        assert!(out.items[0].column(0).is_null(0));
+    }
+
+    #[test]
+    fn string_extreme_skips_nulls() {
+        let array = StringViewArray::from(vec![Some("pear"), None, Some("apple"), None]);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8View, true)])),
+            vec![Arc::new(array)],
+        )
+        .unwrap();
+        let ops = build::<i64>(
+            1,
+            vec![
+                str_slot(AggregationKind::Min, 0),
+                str_slot(AggregationKind::Max, 0),
+            ],
+        );
+
+        let out = run_consumers(ops, vec![vec![batch]]);
+
+        assert_eq!(col_str(&out.items[0], 0), "apple");
+        assert_eq!(col_str(&out.items[0], 1), "pear");
     }
 }

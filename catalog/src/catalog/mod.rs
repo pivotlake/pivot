@@ -676,7 +676,11 @@ impl CatalogSnapshot {
     /// of [`CatalogTransaction::table`].
     pub fn table(&self, name: &str) -> Option<TableBinding> {
         let table = self.tables.get_by_name(name)?;
-        Some(TableBinding::new(table.id(), table.columns()))
+        Some(TableBinding::new(
+            table.id(),
+            table.columns(),
+            table.nullability(),
+        ))
     }
 
     /// A shared handle to the table with identity `id`, or `None` if this
