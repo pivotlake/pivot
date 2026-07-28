@@ -1,5 +1,7 @@
 //! [`RegexpReplace`] — SQL `regexp_replace(input, pattern, replacement)`,
-//! first-match replacement evaluated with the `regex` crate.
+//! first-match replacement evaluated with the `regex` crate — and
+//! [`RegexpFullMatch`], the whole-row `regexp_full_match(input, pattern)`
+//! predicate that shares its engine and byte semantics.
 //!
 //! Matching runs in *byte* mode (Unicode matching off), which matches
 //! RE2/ClickHouse byte semantics and handles columns that aren't valid UTF-8.
@@ -17,9 +19,9 @@
 
 use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
-use arrow_array::builder::StringViewBuilder;
+use arrow_array::builder::{BooleanBufferBuilder, StringViewBuilder};
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, ArrayRef, RecordBatch, StringViewArray};
+use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, StringViewArray};
 use regex::bytes::{Captures, Regex as BytesRegex, RegexBuilder as BytesRegexBuilder};
 use std::borrow::Cow;
 use std::fmt::{self, Display};
@@ -82,9 +84,70 @@ impl RegexpReplace {
     }
 }
 
+/// SQL `regexp_full_match(input, pattern)` — true when `pattern` matches the
+/// *whole* of a row of `input`, null when the row is null. This is also what
+/// DuckDB lowers `~`, `!~`, `SIMILAR TO`, and `NOT SIMILAR TO` to, so all four
+/// spellings land here (the negated ones wrapped in a [`Not`](super::Not)).
+/// `pattern` must be a constant so the regex compiles once at plan-compile time.
+#[derive(Debug, Clone)]
+pub struct RegexpFullMatch {
+    pub input: Box<Expression>,
+    pub pattern: String,
+}
+
+impl Display for RegexpFullMatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "regexp_full_match({}, '{}')", self.input, self.pattern)
+    }
+}
+
+impl RegexpFullMatch {
+    pub fn compile(&self) -> Result<ExprFn, compile::Error> {
+        build_anchored_regex(&self.pattern).map_err(|source| {
+            compile::Error::InvalidRegexPattern {
+                // Report the pattern the query wrote, not the anchored rewrite.
+                pattern: self.pattern.clone(),
+                source,
+            }
+        })?;
+
+        let pattern = self.pattern.clone();
+        let input_builder = self.input.compile()?;
+
+        Ok(Box::new(move || {
+            // A fresh `Regex` per worker, for the reason `RegexpReplace` gives above.
+            let regex = build_anchored_regex(&pattern).expect("pattern validated at plan compile");
+            let mut input_expr = input_builder();
+            Box::new(move |batch: &RecordBatch| {
+                let input = input_expr(batch);
+                let (arr, _) = input.as_datum().get();
+                let strings = arr.as_string_view();
+                let mut matches = BooleanBufferBuilder::new(strings.len());
+                for row in strings.iter() {
+                    matches.append(row.is_some_and(|value| regex.is_match(value.as_bytes())));
+                }
+                // The input's validity carries over as is, so a null row stays
+                // null whichever bit the loop left under it.
+                let result = BooleanArray::new(matches.finish(), strings.nulls().cloned());
+                ExprResult::Array(Arc::new(result))
+            }) as ExprEvalFn
+        }))
+    }
+}
+
 /// Build a byte-mode `regex` (Unicode matching off).
 fn build_regex(pattern: &str) -> Result<BytesRegex, regex::Error> {
     BytesRegexBuilder::new(pattern).unicode(false).build()
+}
+
+/// Compile a byte-mode regex that requires the pattern to match the entire
+/// input. Checking the span of an unanchored match is not sufficient because
+/// the `regex` crate chooses the first matching alternative: for example,
+/// `a|ab` matches only `a` in `"ab"`, despite `ab` being a full match. Putting
+/// the anchors in the pattern lets the engine try the second alternative.
+/// Use `\A` and `\z` so an inline `(?m)` cannot turn them into line anchors.
+fn build_anchored_regex(pattern: &str) -> Result<BytesRegex, regex::Error> {
+    build_regex(&format!(r"\A(?:{pattern})\z"))
 }
 
 /// Translate a PostgreSQL-style replacement into the `regex` crate's dialect so
@@ -237,5 +300,81 @@ mod tests {
 
         // PostgreSQL's `\&` inserts the whole match, so "b" becomes "[b]".
         assert_eq!(*only_column(&rows[0]), "a[b]c");
+    }
+
+    #[rstest]
+    fn full_match_spans_the_whole_row(mut testing_planner: TestingPlanner) {
+        urls(&mut testing_planner, vec!["abc", "xabc", "abcd"]);
+
+        let rows = run(
+            &mut testing_planner,
+            "SELECT url, regexp_full_match(url, 'a.*c') AS matched FROM urls",
+        );
+
+        let mut got = rows
+            .iter()
+            .map(|r| (r["url"].as_str().unwrap(), r["matched"].as_bool().unwrap()))
+            .collect::<Vec<_>>();
+        got.sort();
+        // Only "abc" is covered end to end; the other two merely contain a match.
+        assert_eq!(got, vec![("abc", true), ("abcd", false), ("xabc", false)]);
+    }
+
+    #[rstest]
+    fn full_match_takes_the_alternative_covering_the_row(mut testing_planner: TestingPlanner) {
+        urls(&mut testing_planner, vec!["ab"]);
+
+        let rows = run(
+            &mut testing_planner,
+            "SELECT regexp_full_match(url, 'a|ab') FROM urls",
+        );
+
+        // Matching is leftmost-first, so the engine's own first match here is the
+        // one-byte "a". Anchoring the pattern makes it pick the alternative that
+        // covers the row instead.
+        assert_eq!(*only_column(&rows[0]), true);
+    }
+
+    #[rstest]
+    fn full_match_of_a_null_row_is_null(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "maybe_urls",
+            &[(
+                "url",
+                Type::Utf8,
+                Arc::new(StringViewArray::from(vec![None::<&str>])) as ArrayRef,
+            )],
+        );
+
+        let rows = run(
+            &mut testing_planner,
+            "SELECT regexp_full_match(url, '.*') AS matched FROM maybe_urls",
+        );
+
+        assert!(rows[0]["matched"].is_null(), "got: {:?}", rows[0]);
+    }
+
+    /// DuckDB lowers `~`, `!~`, and `SIMILAR TO` to this one scalar, the negated
+    /// form under a `Not`, so every spelling filters the same way.
+    #[rstest]
+    fn every_spelling_filters_on_the_full_match(mut testing_planner: TestingPlanner) {
+        urls(&mut testing_planner, vec!["abc", "xabc"]);
+
+        let tilde = run(
+            &mut testing_planner,
+            "SELECT url FROM urls WHERE url ~ 'a.c'",
+        );
+        let negated = run(
+            &mut testing_planner,
+            "SELECT url FROM urls WHERE url !~ 'a.c'",
+        );
+        let similar = run(
+            &mut testing_planner,
+            "SELECT url FROM urls WHERE url SIMILAR TO 'a.c'",
+        );
+
+        assert_eq!(*only_column(&tilde[0]), "abc");
+        assert_eq!(*only_column(&negated[0]), "xabc");
+        assert_eq!(*only_column(&similar[0]), "abc");
     }
 }

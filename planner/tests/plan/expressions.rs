@@ -95,8 +95,7 @@ fn aggregate_count_star(mut testing_planner: TestingPlanner) {
     ");
 }
 
-/// `Function::Contains` — the only scalar function the planner currently
-/// supports.
+/// `Function::Contains` — a substring test on a string column.
 #[rstest]
 fn function_contains(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
@@ -105,6 +104,21 @@ fn function_contains(mut testing_planner: TestingPlanner) {
     assert_snapshot!(plan.to_string(), @"
     Projection(name:Utf8)
       Filter(contains(name:Utf8, ali:Utf8View))
+        Input([name:Utf8])
+    ");
+}
+
+/// `Function::RegexpFullMatch` via the `~` operator. The pattern has a prefix
+/// range DuckDB's `regex_range` optimizer could exploit, so this also pins that
+/// no extra BLOB-bounded `Filter` is layered under the plan.
+#[rstest]
+fn function_regexp_full_match(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .plan("SELECT name FROM example_table WHERE name ~ 'ali.*'")
+        .unwrap();
+    assert_snapshot!(plan.to_string(), @"
+    Projection(name:Utf8)
+      Filter(regexp_full_match(name:Utf8, 'ali.*'))
         Input([name:Utf8])
     ");
 }

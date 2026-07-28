@@ -916,6 +916,24 @@ fn regexp_jit_replace_extracts_group(mut testing_planner: TestingPlanner) {
 }
 
 #[rstest]
+fn regexp_full_match_invalid_pattern_returns_error(mut testing_planner: TestingPlanner) {
+    let result = testing_planner.plan("SELECT regexp_full_match(name, '(') FROM example_table");
+
+    // DuckDB compiles a constant pattern while binding, so an unparsable one is
+    // rejected during planning rather than reaching pivot's own compile.
+    assert!(result.is_err(), "expected a planning error");
+}
+
+/// A non-constant pattern can't be compiled once per plan, so it is refused
+/// rather than silently re-compiled per row.
+#[rstest]
+fn regexp_full_match_non_constant_pattern_returns_error(mut testing_planner: TestingPlanner) {
+    let result = testing_planner.plan("SELECT regexp_full_match(name, name) FROM example_table");
+
+    assert!(matches!(result, Err(PlannerError::PlanConversion(_))));
+}
+
+#[rstest]
 fn unsupported_scalar_function_returns_error(mut testing_planner: TestingPlanner) {
     let result = testing_planner.plan("SELECT lower(name) FROM example_table");
     assert!(matches!(result, Err(PlannerError::PlanConversion(_))));

@@ -108,7 +108,11 @@ DuckPlannerContext::DuckPlannerContext(rust::Box<CatalogContext> catalog)
     : catalog(std::move(catalog)),
       db(nullptr, &this->config),
       con(db) {
-        con.Query("SET disabled_optimizers='compressed_materialization,empty_result_pullup'");
+        auto disable_result = con.Query(
+            "SET disabled_optimizers='compressed_materialization,empty_result_pullup,regex_range'");
+        if (disable_result->HasError()) {
+                throw std::runtime_error(disable_result->GetError());
+        }
 
 	// Set catalog context on the storage extension and attach the pivot catalog as default
 	auto ext = duckdb::StorageExtension::Find(

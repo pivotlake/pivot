@@ -51,7 +51,7 @@ pub use length::Length;
 pub use not::Not;
 pub use prefix::Prefix;
 pub use reference::Ref;
-pub use regexp::RegexpReplace;
+pub use regexp::{RegexpFullMatch, RegexpReplace};
 pub use regexp_jit::RegexpJitReplace;
 pub use variant_get::{JsonPath, VariantGet, VariantToJson};
 
