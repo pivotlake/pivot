@@ -23,8 +23,8 @@ use duckdb_planner::{Expr, LogicalTypeId, ScalarValue};
 use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Conjunction,
     ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide, Error,
-    Expression, Function, InList, IntervalArithmetic, Length, Not, NumericAggregate, Prefix, Ref,
-    RegexpFullMatch, RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
+    Expression, Function, InList, IntervalArithmetic, Length, Like, Not, NumericAggregate, Prefix,
+    Ref, RegexpFullMatch, RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
 
@@ -281,6 +281,10 @@ impl Function {
             "contains" => Ok(Function::Contains(Contains::from_handle(func)?)),
             // DuckDB's optimizer rewrites `LIKE 'foo%'` into `prefix(col, 'foo')`.
             "prefix" => Ok(Function::Prefix(Prefix::from_handle(func)?)),
+            // The patterns that same optimizer leaves alone stay `LIKE` calls:
+            // `~~` is the operator's function name, `!~~` the negated form.
+            "~~" => Ok(Function::Like(Like::from_handle(func, false)?)),
+            "!~~" => Ok(Function::Like(Like::from_handle(func, true)?)),
             // `date`/`timestamp` ± `INTERVAL` carries an INTERVAL constant operand;
             // plain numeric `+`/`-` does not and stays `Arithmetic`.
             "+" | "-" => match func.children().position(|p| {
@@ -351,6 +355,17 @@ impl Contains {
         Ok(Contains {
             needle: Box::new(Expression::from_handle(params[1])?),
             haystack: Box::new(Expression::from_handle(params[0])?),
+        })
+    }
+}
+
+impl Like {
+    pub(crate) fn from_handle(func: FunctionHandle<'_>, negated: bool) -> Result<Like, Error> {
+        let params = function_args(func, 2)?;
+        Ok(Like {
+            input: Box::new(Expression::from_handle(params[0])?),
+            pattern: constant_string(Expression::from_handle(params[1])?)?,
+            negated,
         })
     }
 }
