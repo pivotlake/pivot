@@ -1,2 +1,14 @@
-pgo_dir := "/tmp/benchmarks-pgo"
+# Where the instrumented build drops .profraw files and the merged profile
+# lands. Overridable so each side of an A/B keeps its own profile.
+pgo_dir := env_var_or_default("PGO_DIR", "/tmp/benchmarks-pgo")
 import '../pgo.just'
+
+# Build the baseline artifact tree an A/B measures from, then clone it to the
+# working tree. See setup-bench.sh for the layout and the flags it takes.
+setup-bench *args:
+    "{{justfile_directory()}}/setup-bench.sh" {{args}}
+
+# Rebuild the working side after editing the source. Incremental throughout,
+# including with --regen-profile. See bench-build.sh.
+bench-build *args:
+    "{{justfile_directory()}}/bench-build.sh" {{args}}

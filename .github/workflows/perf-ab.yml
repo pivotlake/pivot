@@ -121,7 +121,9 @@ jobs:
       # commit is checked out into the tree later (the 'before' commit may
       # predate this script).
       - name: Stage A/B harness
-        run: cp benchmarks/clickbench/bench-ab.sh /tmp/bench-ab.sh
+        run: |
+          cp benchmarks/clickbench/bench-ab.sh /tmp/bench-ab.sh
+          cp benchmarks/clickbench/build-ab-servers.sh /tmp/build-ab-servers.sh
 
       - name: Start the perf box
         env:
@@ -204,6 +206,16 @@ jobs:
           fi
           echo "No other users logged in (who count: $count)."
 
+      - name: Ensure the box has the build deps
+        run: |
+          set -euo pipefail
+          # The instrumented PGO build links with lld: instrumentation grows the
+          # text past the aarch64 128MB branch range and GNU ld fails with
+          # relocation overflows. The tpch A/B AMI bakes lld in, but this box is
+          # long-lived and predates that, so install it rather than assume it.
+          ssh perf 'command -v ld.lld >/dev/null \
+            || sudo DEBIAN_FRONTEND=noninteractive apt-get install -qy lld'
+
       - name: Sync both source trees to the box
         run: |
           set -euo pipefail
@@ -240,6 +252,7 @@ jobs:
             -e "ssh -F $HOME/.ssh/config" clickbench-src/ perf:perf-ab/ClickBench/
 
           scp -F "$HOME/.ssh/config" /tmp/bench-ab.sh perf:/tmp/bench-ab.sh
+          scp -F "$HOME/.ssh/config" /tmp/build-ab-servers.sh perf:/tmp/build-ab-servers.sh
 
       - name: Run A/B benchmark (detached, polled)
         env:
@@ -272,17 +285,32 @@ jobs:
           # expands the leading ~ in the paths against the box's own home.
           # Launch detached so the long build+bench survives ssh idle timeouts;
           # bench-ab.sh writes its PID and emits a sentinel on every exit path.
+          # Build both servers first, then measure them. bench-ab.sh no longer
+          # builds, so the phase is: build -> hand the two binaries over. The
+          # outer shell owns /tmp/bench-ab.pid and emits the sentinel the poll
+          # below watches for, so a failure during the *build* ends the poll
+          # too instead of leaving it spinning on a run that never started.
           cat > /tmp/launch.sh <<EOF
-          rm -f /tmp/ab.log /tmp/ab-report.txt /tmp/bench-ab.pid
-          setsid bash /tmp/bench-ab.sh \
-            --before-dir '~/perf-ab/before' \
-            --after-dir '~/perf-ab/after' \
-            --clickbench-dir '~/perf-ab/ClickBench' \
-            --source '$HITS_PATH' --pgo-subset '$PGO_SUBSET_PATH' \
-            --iterations '$ITERATIONS' --regression-pct '$REGRESSION_PCT' \
-            --report /tmp/ab-report.txt \
-            --before-label '${BEFORE_SHA:0:12}' --after-label '${AFTER_SHA:0:12}' \
-            $query_arg $duckdb_arg $env_arg >/tmp/ab.log 2>&1 </dev/null &
+          rm -f /tmp/ab.log /tmp/ab-report.txt /tmp/bench-ab.pid /tmp/ab-bins.env
+          setsid bash -c '
+            echo \$\$ >/tmp/bench-ab.pid
+            trap '"'"'echo "=== BENCH-AB COMPLETE exit=\$? ==="'"'"' EXIT
+            set -e
+            bash /tmp/build-ab-servers.sh \
+              --before-dir ~/perf-ab/before \
+              --after-dir ~/perf-ab/after \
+              --pgo-subset '$PGO_SUBSET_PATH' >/tmp/ab-bins.env
+            . /tmp/ab-bins.env
+            PID_FILE=/tmp/bench-ab-inner.pid bash /tmp/bench-ab.sh \
+              --before-bin "\$BEFORE_BIN" \
+              --after-bin "\$AFTER_BIN" \
+              --clickbench-dir ~/perf-ab/ClickBench \
+              --source '$HITS_PATH' --pgo-subset '$PGO_SUBSET_PATH' \
+              --iterations '$ITERATIONS' --regression-pct '$REGRESSION_PCT' \
+              --report /tmp/ab-report.txt \
+              --before-label '${BEFORE_SHA:0:12}' --after-label '${AFTER_SHA:0:12}' \
+              $query_arg $duckdb_arg $env_arg
+          ' >/tmp/ab.log 2>&1 </dev/null &
           EOF
           scp -F "$HOME/.ssh/config" /tmp/launch.sh perf:/tmp/launch.sh
           ssh perf 'bash /tmp/launch.sh'
@@ -328,6 +356,11 @@ jobs:
           # attached as an artifact (the box's /tmp is wiped when it stops).
           scp -F "$HOME/.ssh/config" perf:/tmp/ab-report.txt ab-report.txt || true
           scp -F "$HOME/.ssh/config" perf:/tmp/ab.log ab-full.log || true
+          # The per-side harness output. A query that errors shows up in the
+          # report only as a null timing, and the reason it failed is in here,
+          # so without these a failed run is undiagnosable after the box stops.
+          scp -F "$HOME/.ssh/config" perf:/tmp/ab-before.out ab-before.out || true
+          scp -F "$HOME/.ssh/config" perf:/tmp/ab-after.out ab-after.out || true
           {
             echo "## pivotdb Perf A/B"
             echo ""
@@ -354,6 +387,8 @@ jobs:
           path: |
             ab-report.txt
             ab-full.log
+            ab-before.out
+            ab-after.out
           if-no-files-found: ignore
 
       - name: Stop the perf box

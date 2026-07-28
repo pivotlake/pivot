@@ -356,18 +356,27 @@ fn check_or_update_expected(query: &Query, actual: &str, update: bool) -> Result
 /// dataset's table directories. The log only re-registers the same parquet
 /// files, but its presence makes a re-run's CREATE TABLE fail ("version 0
 /// already exists"), so a benchmark could never run twice against one
-/// dataset copy. Looks one level deep: the suite convention is one directory
-/// per table under `source`.
+/// dataset copy.
+///
+/// Both suite layouts are covered. A single-table suite points its table at
+/// `source` itself, so the log lands directly in it; a multi-table suite gives
+/// every table its own directory one level down.
 fn clear_stale_table_logs(source: &std::path::Path) {
+    remove_table_log(source);
     let Ok(entries) = std::fs::read_dir(source) else {
         return;
     };
     for entry in entries.flatten() {
-        let log = entry.path().join("_delta_log");
-        if log.is_dir() {
-            std::fs::remove_dir_all(&log)
-                .unwrap_or_else(|e| panic!("removing stale table log {}: {e}", log.display()));
-        }
+        remove_table_log(&entry.path());
+    }
+}
+
+/// Remove `dir`'s Delta log, if it has one.
+fn remove_table_log(dir: &std::path::Path) {
+    let log = dir.join("_delta_log");
+    if log.is_dir() {
+        std::fs::remove_dir_all(&log)
+            .unwrap_or_else(|e| panic!("removing stale table log {}: {e}", log.display()));
     }
 }
 

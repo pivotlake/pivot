@@ -135,17 +135,17 @@ save_cache() {
 # outputs (the DuckDB C++ build), which the explicit --target keeps unflagged.
 # The suite's own harness supplies the profiling workload via profile_side.
 # ---------------------------------------------------------------------------
+# Both builds go through the pgo.just recipes rather than repeating their
+# RUSTFLAGS here. The flags are subtle (lld for the instrumented link, an
+# explicit --target so build scripts stay unflagged and cached) and a second
+# copy of them drifts from the recipe silently, changing what is measured
+# without changing anything that looks like a measurement.
 build_gen() {
     local dir="$1"
     mkdir -p "$pgo_dir"
-    # lld: instrumentation grows the text section past the 128MB aarch64 branch
-    # range and GNU ld fails the link with relocation overflows; lld inserts
-    # range-extension thunks. Only the throwaway instrumented binary needs it;
-    # the measured profile-use build links like any release build.
     (cd "$dir/benchmarks" && \
-        RUSTC_WRAPPER= \
-        RUSTFLAGS="-Cprofile-generate=$pgo_dir -Ctarget-cpu=native -Clink-arg=-fuse-ld=lld" \
-        CARGO_TARGET_DIR=target-pgogen cargo build --target "$host_target" --release)
+        PGO_DIR="$pgo_dir" PGO_GEN_TARGET_DIR=target-pgogen \
+        just pgo-gen-build build --release)
 }
 
 # Run the instrumented pivot-bench to produce a profile for one side, then merge
@@ -166,9 +166,8 @@ profile_side() {
 build_use() {
     local dir="$1" side="$2"
     (cd "$dir/benchmarks" && \
-        RUSTC_WRAPPER= \
-        RUSTFLAGS="-Cprofile-use=$work_dir/$side-$run_id.profdata -Ctarget-cpu=native" \
-        CARGO_TARGET_DIR=target-pgouse cargo build --target "$host_target" --release)
+        PGO_USE_TARGET_DIR=target-pgouse \
+        just pgo-use-with "$work_dir/$side-$run_id.profdata" build --release)
 }
 
 build_release() {

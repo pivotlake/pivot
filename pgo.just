@@ -6,6 +6,12 @@
 # and profile-use builds forces a full rebuild on every flavor switch (~5 min each).
 # With separate dirs each flavor rebuilds incrementally (~10 s for a leaf-crate
 # change). Costs disk for the extra target dirs.
+#
+# Both target dirs can be pointed elsewhere. setup-bench.sh gives the baseline
+# and working sides of an A/B their own pair, so each side keeps its own warm
+# artifacts and neither invalidates the other.
+pgogen_target_dir := env_var_or_default("PGO_GEN_TARGET_DIR", "target-pgogen")
+pgouse_target_dir := env_var_or_default("PGO_USE_TARGET_DIR", "target-pgouse")
 
 # Run a cargo command instrumented for PGO profile generation, then merge the profiles.
 #
@@ -17,7 +23,7 @@ pgo-gen *args:
     # RUSTC_WRAPPER= bypasses the kache rustc wrapper (.cargo/config.toml): these
     # optimized PGO builds are compiled fresh, never restored from cache.
     RUSTC_WRAPPER= RUSTFLAGS="-Cprofile-generate={{pgo_dir}} -Ctarget-cpu=native" \
-        CARGO_TARGET_DIR=target-pgogen cargo {{args}}
+        CARGO_TARGET_DIR={{pgogen_target_dir}} cargo {{args}}
     $(dirname "$(rustc --print target-libdir)")/bin/llvm-profdata merge -o {{pgo_dir}}/merged.profdata {{pgo_dir}}
 
 # Run a cargo command using the merged PGO profile.
@@ -25,7 +31,7 @@ pgo-gen *args:
 #   just pgo-use bench --bench clickbench
 pgo-use *args:
     RUSTC_WRAPPER= RUSTFLAGS="-Cprofile-use={{pgo_dir}}/merged.profdata -Ctarget-cpu=native" \
-        CARGO_TARGET_DIR=target-pgouse cargo {{args}}
+        CARGO_TARGET_DIR={{pgouse_target_dir}} cargo {{args}}
 
 
 # Host triple, for the A/B recipes below. Passing an explicit --target (even
@@ -44,7 +50,7 @@ host_target := `rustc -vV | sed -n 's/^host: //p'`
 pgo-gen-build subcmd *args:
     mkdir -p {{pgo_dir}}
     RUSTC_WRAPPER= RUSTFLAGS="-Cprofile-generate={{pgo_dir}} -Ctarget-cpu=native -Clink-arg=-fuse-ld=lld" \
-        CARGO_TARGET_DIR=target-pgogen cargo {{subcmd}} --target {{host_target}} {{args}}
+        CARGO_TARGET_DIR={{pgogen_target_dir}} cargo {{subcmd}} --target {{host_target}} {{args}}
 
 # Like pgo-use but with a caller-supplied profdata path. rustc records the
 # profile file in dep-info, so even at a constant path a regenerated profile
@@ -55,7 +61,7 @@ pgo-gen-build subcmd *args:
 # under target-pgouse/{{host_target}}/.
 pgo-use-with profdata subcmd *args:
     RUSTC_WRAPPER= RUSTFLAGS="-Cprofile-use={{profdata}} -Ctarget-cpu=native" \
-        CARGO_TARGET_DIR=target-pgouse cargo {{subcmd}} --target {{host_target}} {{args}}
+        CARGO_TARGET_DIR={{pgouse_target_dir}} cargo {{subcmd}} --target {{host_target}} {{args}}
 
 # Remove all PGO profiles and merged data.
 pgo-clean:
