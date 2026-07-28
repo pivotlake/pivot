@@ -3,6 +3,15 @@ name = "planner"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Compile the grouped-aggregate key/value monomorphisation cascade in a debug
+# build too. Off by default: a debug build lowers every group through the row
+# encoder and the generic accumulator, which yields the same results and cuts the
+# instantiations (and so the rlib) by most of their size. Turn this on to compile
+# the specialised operators a release build always uses, either to measure them or
+# to cover them from a debug test run.
+specialized-dispatch = []
+
 [dependencies]
 # `Catalog::commit_transaction` is async on a dyn-compatible trait.
 async-trait = "0.1"

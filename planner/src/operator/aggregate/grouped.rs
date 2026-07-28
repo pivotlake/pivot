@@ -26,19 +26,29 @@
 use super::{Aggregate, aggregation_slots, needs_wide_accumulator, row_key_schema};
 use crate::compile::{Error, ExprEvalFn, ExprFn};
 use crate::expression::{AggregateFunc, Expression, Ref};
-use crate::types::MAX_DECIMAL64_PRECISION;
 use crate::types::Type;
-use arrow_array::types::{
-    Decimal64Type, Decimal128Type, Int8Type, Int16Type, Int32Type, Int64Type,
-};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use dispatch::{
-    AggregationKind, AggregationSlot, Compiled, CountSlot, Distinct, Dynamic, GroupLimit,
-    IntKeyExtractor, IntPairKeyExtractor, IntStrKeyExtractor, RecordBatchOperatorSpec,
-    RowKeyExtractor, StringKeyExtractor, SumSlot,
+    AggregationKind, AggregationSlot, Distinct, Dynamic, GroupLimit, RecordBatchOperatorSpec,
+    RowKeyExtractor,
 };
 use std::sync::Arc;
+
+// The key extractors and accumulator tuples only the specialising cascade names. A
+// debug build lowers every group through `RowKeyExtractor` and `Dynamic`, so it
+// never mentions them.
+#[cfg(any(not(debug_assertions), feature = "specialized-dispatch"))]
+use crate::types::MAX_DECIMAL64_PRECISION;
+#[cfg(any(not(debug_assertions), feature = "specialized-dispatch"))]
+use arrow_array::types::{
+    Decimal64Type, Decimal128Type, Int8Type, Int16Type, Int32Type, Int64Type,
+};
+#[cfg(any(not(debug_assertions), feature = "specialized-dispatch"))]
+use dispatch::{
+    Compiled, CountSlot, IntKeyExtractor, IntPairKeyExtractor, IntStrKeyExtractor,
+    StringKeyExtractor, SumSlot,
+};
 
 impl Aggregate {
     pub(super) fn compile_grouped(
@@ -414,6 +424,14 @@ fn project_leading_columns(
 /// `select_value`. `CountStar` and `Count` collapse to one `Count` (both add +1 per
 /// row); a `Sum` carries its column type so the specialisation can fix the read
 /// width.
+///
+/// The signatures are still computed in a debug build (they cost one pass over the
+/// slots), but nothing reads the `Sum` width there because the collapsed
+/// `select_value` folds every signature in `Dynamic`.
+#[cfg_attr(
+    all(debug_assertions, not(feature = "specialized-dispatch")),
+    allow(dead_code)
+)]
 pub(super) enum Sig {
     Count,
     Sum(Type),
@@ -441,6 +459,7 @@ fn signatures(exprs: &[Expression]) -> Vec<Sig> {
 
 /// The two key types when the group is exactly two integer columns we've
 /// monomorphised the pair extractor for; `None` routes to the row fallback.
+#[cfg(any(not(debug_assertions), feature = "specialized-dispatch"))]
 fn int_pair_keys(keys: &[(usize, Type)]) -> Option<(Type, Type)> {
     let [(_, a), (_, b)] = keys else { return None };
     let pair = (a.clone(), b.clone());
@@ -469,6 +488,15 @@ fn int_pair_keys(keys: &[(usize, Type)]) -> Option<(Type, Type)> {
 /// [`IntStrKeyExtractor`]; anything else byte-encodes the tuple with
 /// [`RowKeyExtractor`]. Every arm `return`s except the row fallback, which is the
 /// tail expression, so the surrounding function returns from inside the macro.
+///
+/// Only compiled when the lowering specialises. A debug build takes the collapsed
+/// definition below instead, which keeps just the row fallback: the specialised
+/// extractors are a throughput optimisation, and every key type they accept is
+/// also byte-packable by the row encoder (both gate on
+/// [`row_key_arrow_type`](super::row_key_schema)), so dropping them costs speed
+/// and nothing else. Set the `specialized-dispatch` feature to compile the full
+/// cascade in a debug build.
+#[cfg(any(not(debug_assertions), feature = "specialized-dispatch"))]
 macro_rules! select_key_extractor {
     ($keys:expr, $with_key:ident) => {{
         // A single column keys on its native value directly: the dedicated
@@ -547,6 +575,30 @@ macro_rules! select_key_extractor {
     }};
 }
 
+/// The collapsed key selection a debug build compiles in place of the cascade
+/// above: every group shape byte-encodes its key tuple with [`RowKeyExtractor`],
+/// so the key axis contributes one instantiation instead of twenty-two.
+///
+/// The cascade's specialised arms only ever accept integer, decimal, and `Utf8`
+/// keys, all of which [`row_key_schema`] encodes, so this rejects exactly the same
+/// key types with the same error and returns the same groups. What it gives up is
+/// throughput: the row encoder byte-packs the tuple and does not radix-partition.
+#[cfg(all(debug_assertions, not(feature = "specialized-dispatch")))]
+macro_rules! select_key_extractor {
+    ($keys:expr, $with_key:ident) => {{
+        let schema = match row_key_schema($keys.iter().map(|(_, t)| t)) {
+            Ok(schema) => schema,
+            Err(unsupported) => {
+                return Err(Error::DataTypeNotSupportedForGroupBy {
+                    column: None,
+                    data_type: unsupported,
+                });
+            }
+        };
+        $with_key!(RowKeyExtractor, schema)
+    }};
+}
+
 /// The monomorphisation core: pick the concrete key extractor for `keys` and value
 /// container for `slots`, then build the GROUP BY operator. The mechanical layer
 /// under [`build_group_by_operator`] (its only caller); the keys-only dedup path
@@ -612,6 +664,7 @@ pub(super) fn dispatch_group_by(
     }
     // The generic value fallback: pick the accumulator width and the additive
     // flag, then dispatch by arity. A string extreme is `wide` + non-additive.
+    #[cfg(any(not(debug_assertions), feature = "specialized-dispatch"))]
     macro_rules! dynamic {
         ($K:ty, $cfg:expr) => {
             match (wide, all_additive) {
@@ -622,10 +675,29 @@ pub(super) fn dispatch_group_by(
             }
         };
     }
+    // A debug build folds the additive fast path away and keeps the width. Only the
+    // additive flag is free to drop: `ONLY_ADDITIVE` is a promise that lets `merge`
+    // skip the per-slot kind dispatch, so `false` is the general path every
+    // non-additive shape already takes. The width is *not* free — it picks the
+    // physical array the aggregate emits (`i64` an `Int64`, `i128` a `Decimal128`),
+    // which the output restore matches on to rebuild the declared type, so a
+    // narrow-accumulator aggregate has to stay narrow. Two instantiations per arity
+    // instead of four.
+    #[cfg(all(debug_assertions, not(feature = "specialized-dispatch")))]
+    macro_rules! dynamic {
+        ($K:ty, $cfg:expr) => {{
+            let _ = all_additive;
+            match wide {
+                true => arity!($K, i128, false, $cfg),
+                false => arity!($K, i64, false, $cfg),
+            }
+        }};
+    }
     // The value-container selection (the continuation `select_key_extractor!`
     // calls once it has picked a key): a few signatures are worth a hand-written,
     // branch-free `Compiled` tuple; everything else folds per-slot in `Dynamic`.
     // Add a signature here to specialise it. Ends at the `build_group_by!` leaf.
+    #[cfg(any(not(debug_assertions), feature = "specialized-dispatch"))]
     macro_rules! select_value {
         ($K:ty, $cfg:expr) => {
             match sig {
@@ -640,6 +712,16 @@ pub(super) fn dispatch_group_by(
                 _ => dynamic!($K, $cfg),
             }
         };
+    }
+    // A debug build skips the hand-written `Compiled` tuples and folds every
+    // signature in `Dynamic`, which is the arm each of them already falls back to
+    // when the shape doesn't match. Same results, minus the branch-free entries.
+    #[cfg(all(debug_assertions, not(feature = "specialized-dispatch")))]
+    macro_rules! select_value {
+        ($K:ty, $cfg:expr) => {{
+            let _ = sig;
+            dynamic!($K, $cfg)
+        }};
     }
 
     // Select the key extractor (the cascade shared with the keys-only dedup path);
