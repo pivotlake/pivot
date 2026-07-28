@@ -1,0 +1,1 @@
+SELECT j->>'$.did' AS user_id, make_timestamp(CAST(MIN(CAST(j->>'$.time_us' AS BIGINT)) / 1000000 AS BIGINT) * 1000000) AS first_post_date FROM bluesky WHERE (j->>'$.kind' = 'commit') AND (j->>'$.commit.operation' = 'create') AND (j->>'$.commit.collection' = 'app.bsky.feed.post') GROUP BY user_id ORDER BY first_post_date ASC, user_id LIMIT 3;

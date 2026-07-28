@@ -1,0 +1,1 @@
+SELECT j->>'$.commit.collection' AS event, hour(make_timestamp(CAST(j->>'$.time_us' AS BIGINT))) AS hour_of_day, count() AS count FROM bluesky WHERE (j->>'$.kind' = 'commit') AND (j->>'$.commit.operation' = 'create') AND (j->>'$.commit.collection' in ['app.bsky.feed.post', 'app.bsky.feed.repost', 'app.bsky.feed.like']) GROUP BY event, hour_of_day ORDER BY hour_of_day, event;
