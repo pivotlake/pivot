@@ -1,16 +1,14 @@
-//! The per-batch column readers a [`BoundSlot`](super::BoundSlot) binds — one
-//! reader type per *value width*, each downcasting its column family once and
-//! yielding one row's value:
+//! Numeric column readers used by the dynamic container.
 //!
 //! - [`I64Reader`] — an integer column (Int16/Int32/Int64) widened to `i64`, or a
 //!   `Decimal64` column's raw unscaled `i64` values read as-is.
 //! - [`F64Reader`] — a float column (Float32/Float64), widened to `f64`.
 //! - [`U128Reader`] — a `Decimal128` column, read as a full `i128`.
 //!
-//! Splitting by width keeps each reader single-purpose: a `read` returns exactly one
-//! type, so the fold that consumes it needs no `is_float`/`as`-cast branching. The
-//! op the reader feeds is chosen by the [`BoundSlot`](super::BoundSlot) variant, not
-//! by the reader.
+//! Each reader downcasts its Arrow column once when binding the batch. Reading
+//! a row then returns one stable Rust type without inspecting the data type;
+//! the op the reader feeds is chosen by the
+//! [`OperationReader`](super::OperationReader) variant, not by the reader.
 
 use crate::operations::unary::group::values::read::{IntRead, Read};
 use arrow_array::cast::AsArray;
@@ -20,11 +18,9 @@ use arrow_array::types::{
 use arrow_array::{PrimitiveArray, RecordBatch};
 use arrow_schema::DataType;
 
-/// An integer column bound at one of the supported widths, read as `i64`. The width
-/// is a payload, not a cross-product with the op: adding a width is one more variant
-/// here, shared by every integer op. A `Decimal64` column is one such width: its raw
-/// unscaled `i64` values fold exactly like an integer column's (every value of a
-/// column shares its scale, so the raw ordering and sums are the decimal ones).
+/// An Int16, Int32, or Int64 column read as `i64`, or a `Decimal64` column's raw
+/// unscaled `i64` values read as-is (every value of a column shares its scale, so
+/// the raw ordering and sums are the decimal ones).
 pub enum I64Reader<'b> {
     I16(&'b PrimitiveArray<Int16Type>),
     I32(&'b PrimitiveArray<Int32Type>),
@@ -78,13 +74,7 @@ impl<'b> F64Reader<'b> {
     }
 }
 
-/// A `Decimal128(38, 0)` column, read as a full `i128`.
-///
-/// `Decimal128` is the Arrow type a *wide* (`i128`) cell emits for its
-/// `COUNT`/`SUM`/`MIN`/`MAX` slots, so this reader binds whenever such a column is
-/// aggregated — an aggregate re-reading partials a prior level already widened.
-/// Reading the full `i128` (rather than truncating to `i64`) keeps a partial `SUM`
-/// that overflows `i64` exact.
+/// A Decimal128 column read as `i128`, preserving wide partial aggregates.
 pub struct U128Reader<'b>(&'b PrimitiveArray<Decimal128Type>);
 
 impl<'b> U128Reader<'b> {
