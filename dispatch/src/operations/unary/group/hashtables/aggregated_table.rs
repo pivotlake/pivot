@@ -468,7 +468,12 @@ struct ProbeWindow<'a, 'b, K: KeyExtractor, V: AggregationValue> {
 }
 
 impl<K: KeyExtractor, V: AggregationValue> ArityBody<bool> for ProbeWindow<'_, '_, K, V> {
-    #[inline(always)]
+    /// Outlined on purpose: every specialised arity's probe loop gets its own
+    /// function, frame, and register allocation. Inlined, all the arity bodies
+    /// (plus the scatter ones) would share one giant `consume_window` frame,
+    /// and its register pressure puts spill traffic inside every loop; the
+    /// call happens once per window, so it costs nothing per row.
+    #[inline(never)]
     fn run<const N: usize>(self) -> bool {
         const L1_DISTANCE: usize = 16;
         const L2_DISTANCE: usize = 48;
@@ -560,7 +565,8 @@ struct ScatterWindow<'a, 'b, K: KeyExtractor, V: AggregationValue> {
 }
 
 impl<K: KeyExtractor, V: AggregationValue> ArityBody<()> for ScatterWindow<'_, '_, K, V> {
-    #[inline(always)]
+    /// Outlined for the same reason as [`ProbeWindow::run`].
+    #[inline(never)]
     fn run<const N: usize>(self) {
         let ScatterWindow {
             buffers,
