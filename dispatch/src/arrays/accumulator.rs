@@ -128,9 +128,9 @@ enum ColumnAccumulator {
         slab: SlabBuffer<u128>,
         buffers: Vec<Buffer>,
         validity: ValidityMask,
-        /// The previous append's source data buffers (first pointer, count)
-        /// and the base they were rebased onto.
-        last_source: Option<(usize, usize, u128)>,
+        /// Where the previous append's source data buffers were rebased onto,
+        /// as their (start, length) range in `buffers`.
+        last_source: Option<(usize, usize)>,
     },
     /// Any other column type (booleans, offset strings, nested types,
     /// dictionaries, overly wide primitives): kept as zero-copy slices and
@@ -188,17 +188,17 @@ impl ColumnAccumulator {
                     _ => unreachable!("Views is only built for view types"),
                 };
                 validity.append(nulls, indices, at);
-                let source_key = (
-                    source_buffers.first().map_or(0, |b| b.as_ptr() as usize),
-                    source_buffers.len(),
-                );
                 let base = match *last_source {
-                    Some((ptr, count, base)) if (ptr, count) == source_key => base,
+                    Some((start, count))
+                        if same_buffers(&buffers[start..start + count], source_buffers) =>
+                    {
+                        start as u128
+                    }
                     _ => {
-                        let base = buffers.len() as u128;
+                        let start = buffers.len();
                         buffers.extend(source_buffers.iter().cloned());
-                        *last_source = Some((source_key.0, source_key.1, base));
-                        base
+                        *last_source = Some((start, source_buffers.len()));
+                        start as u128
                     }
                 };
                 // SAFETY: as for Fixed; views are 16 bytes each and the
@@ -350,6 +350,19 @@ impl ValidityMask {
     }
 }
 
+/// Whether `accumulated` holds exactly the buffers of `source`.
+///
+/// Comparing by address is sound because `accumulated` holds a clone of every
+/// buffer it names: those clones keep the allocations alive, so an address
+/// that still matches cannot have been freed and handed to a different
+/// buffer in the meantime.
+fn same_buffers(accumulated: &[Buffer], source: &[Buffer]) -> bool {
+    accumulated.len() == source.len()
+        && accumulated.iter().zip(source).all(|(held, incoming)| {
+            held.as_ptr() == incoming.as_ptr() && held.len() == incoming.len()
+        })
+}
+
 /// Gather `indices` rows from `src` to `dst`, as elements of `T`. A flat
 /// loop with independent iterations, so the CPU overlaps the source cache
 /// misses of many gathers.
@@ -460,6 +473,69 @@ mod tests {
         let emitted = accumulator.take_batch(&mut allocator).unwrap();
 
         let expected = filter_record_batch(&batch, &mask).unwrap();
+        assert_eq!(emitted, expected);
+    }
+
+    /// A `Utf8View` batch whose rows are `(buffer index, value)` pairs, each
+    /// value living at offset 0 of the data buffer it names.
+    fn view_batch(buffers: Vec<Buffer>, rows: &[(u32, &str)]) -> RecordBatch {
+        let views: Vec<u128> = rows
+            .iter()
+            .map(|(buffer_index, value)| {
+                let prefix = u32::from_le_bytes(value.as_bytes()[..4].try_into().unwrap());
+                // A view of a value longer than 12 bytes: length, the first
+                // four bytes, the data buffer it points into, and last the
+                // offset within that buffer, which is 0 for every value here.
+                (value.len() as u128) | (prefix as u128) << 32 | (*buffer_index as u128) << 64
+            })
+            .collect();
+        let column = StringViewArray::try_new(views.into(), buffers, None).unwrap();
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "name",
+                DataType::Utf8View,
+                false,
+            )])),
+            vec![Arc::new(column)],
+        )
+        .unwrap()
+    }
+
+    /// Two batches can hold the same first data buffer and the same buffer
+    /// count while differing in the rest, so a source is only the one already
+    /// accumulated when every one of its buffers matches.
+    #[test]
+    fn appends_sources_that_share_a_first_data_buffer() {
+        init_test_free_pool(4);
+        let shared = Buffer::from_slice_ref("a value both sources hold".as_bytes());
+        let first = view_batch(
+            vec![
+                shared.clone(),
+                Buffer::from_slice_ref("a value only the first source holds".as_bytes()),
+            ],
+            &[
+                (0, "a value both sources hold"),
+                (1, "a value only the first source holds"),
+            ],
+        );
+        let second = view_batch(
+            vec![
+                shared.clone(),
+                Buffer::from_slice_ref("a value only the second source holds".as_bytes()),
+            ],
+            &[
+                (0, "a value both sources hold"),
+                (1, "a value only the second source holds"),
+            ],
+        );
+        let mut allocator = SlabAllocator::new(false);
+        let mut accumulator = BatchAccumulator::new(first.schema(), &mut allocator);
+
+        accumulator.append(&first, &[0, 1]);
+        accumulator.append(&second, &[0, 1]);
+        let emitted = accumulator.take_batch(&mut allocator).unwrap();
+
+        let expected = concat_batches(&first.schema(), &[first, second]).unwrap();
         assert_eq!(emitted, expected);
     }
 
