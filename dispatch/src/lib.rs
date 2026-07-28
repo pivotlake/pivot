@@ -92,10 +92,10 @@ pub use memory::BUFFER_SIZE;
 pub use memory::ReadBuffer;
 pub use memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 pub use numa::{Topology, default_worker_count};
-pub use operations::JoinOutputColumns;
 pub use operations::channels::{MpscSender, Sender};
 pub use operations::nullary::Result as NullaryResult;
 pub use operations::unary::filter::{RowDelivery, RowSelection, collect_selected_indices};
+pub use operations::{JoinOutputColumns, JoinSpec};
 #[cfg(feature = "perf")]
 pub use profiler::worker_tids;
 pub use scan::{Projection, ROW_GROUP_IDX_FIELD, ROW_IDX_FIELD, trailing_metadata_columns};

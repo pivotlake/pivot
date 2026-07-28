@@ -8,6 +8,14 @@
 //! payload row — and appended into a [`BatchAccumulator`] per side, so the
 //! hot loops touch only hashes, the directory, and the key/row arenas, and a
 //! selective join still emits full-size batches.
+//!
+//! When the join is outer on the build side, the build row of each collected
+//! pair is also flagged as matched, in the drain rather than the match loop:
+//! the indices there are already the verified matches, so it costs one byte
+//! store per output row and nothing at all per probed row. The rows still
+//! unflagged once every worker has stopped probing are emitted with their probe
+//! columns null by
+//! [`send_out_next_unmatched_build_rows`](Probe::send_out_next_unmatched_build_rows).
 
 use crate::RECORD_BATCH_SIZE;
 use crate::arrays::accumulator::BatchAccumulator;
@@ -17,22 +25,26 @@ use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::join::build::filter_null_keys;
 use crate::operations::unary::join::directory::{JoinDirectory, prefetch_ptr_l2};
-use crate::operations::unary::join::{JoinOutputColumns, JoinTable};
+use crate::operations::unary::join::{JoinOutputColumns, JoinTable, UnmatchedScan};
 use ahash::RandomState;
 use arrow_array::cast::AsArray;
 use arrow_array::types::ArrowPrimitiveType;
-use arrow_array::{PrimitiveArray, RecordBatch};
+use arrow_array::{PrimitiveArray, RecordBatch, new_null_array};
 use arrow_schema::{Field, Schema, SchemaRef};
 use std::cmp::min;
 use std::hash::Hash;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 const PROBE_BATCH_SIZE: usize = 2048;
 const RING_SIZE: usize = 64;
 const MASK: usize = RING_SIZE - 1;
 const PREFETCH_LENGTH: usize = 63;
+/// Build rows one worker claims per pass of the unmatched scan. A full output
+/// batch's worth, so a pass can never overfill the accumulator it appends to.
+const UNMATCHED_SCAN_CHUNK: usize = RECORD_BATCH_SIZE;
 
-pub struct Probe<T: ArrowPrimitiveType<Native: Hash + Eq>> {
+pub struct Probe<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool> {
     table: JoinTable<T::Native>,
     hash_state: RandomState,
     key_column: usize,
@@ -47,14 +59,26 @@ pub struct Probe<T: ArrowPrimitiveType<Native: Hash + Eq>> {
     /// exists then). Both receive the same row count per drain, so they fill
     /// and emit in lockstep.
     sides: Option<OutputSides>,
+    /// The fields the probe side contributes to the output, when the caller
+    /// supplied them (a build-side outer join always does). Taking them over
+    /// the probed batch's own schema is what lets a worker that never saw a
+    /// probe batch still shape the unmatched rows.
+    probe_fields: Option<Arc<Vec<Field>>>,
+    /// Shared progress of the unmatched pass. Unused by an inner join.
+    unmatched: Arc<UnmatchedScan>,
+    /// Whether this worker has entered `finish` — the point it stops probing
+    /// and leaves the barrier the unmatched pass waits on.
+    probing_done: bool,
 }
 
-impl<T: ArrowPrimitiveType<Native: Hash + Eq>> Probe<T> {
+impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool> Probe<T, BUILD_OUTER> {
     pub(crate) fn new(
         table: JoinTable<T::Native>,
         hash_state: RandomState,
         key_column: usize,
         output_columns: Arc<JoinOutputColumns>,
+        probe_fields: Option<Arc<Vec<Field>>>,
+        unmatched: Arc<UnmatchedScan>,
     ) -> Self {
         Self {
             table,
@@ -65,7 +89,91 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>> Probe<T> {
             probe_indices: vec![0; RECORD_BATCH_SIZE],
             build_indices: vec![0; RECORD_BATCH_SIZE],
             sides: None,
+            probe_fields,
+            unmatched,
+            probing_done: false,
         }
+    }
+
+    /// Build the output sides if this worker has not already, given the build
+    /// payload and, when one is at hand, the schema of a probed batch.
+    fn ensure_output_sides_initialized(
+        &mut self,
+        build_rows: &RecordBatch,
+        probe_schema: Option<&Schema>,
+    ) -> unary::Result<()> {
+        if self.sides.is_some() {
+            return Ok(());
+        }
+        let build_schema = build_rows.schema();
+        let probe_fields: Vec<Field> = match &self.probe_fields {
+            Some(fields) => fields.as_ref().clone(),
+            None => {
+                let schema = probe_schema.expect("a join without given probe fields has a batch");
+                self.output_columns
+                    .probe
+                    .iter()
+                    .map(|&i| schema.field(i).clone())
+                    .collect()
+            }
+        };
+        let build_fields: Vec<Field> = self
+            .output_columns
+            .build
+            .iter()
+            .map(|&i| build_schema.field(i).clone())
+            .collect();
+        let fields: Vec<Field> = probe_fields.iter().chain(&build_fields).cloned().collect();
+        let build_source = build_rows.project(&self.output_columns.build)?;
+        self.sides = Some(OutputSides {
+            output_schema: Arc::new(Schema::new(fields)),
+            probe: BatchAccumulator::new(Arc::new(Schema::new(probe_fields)), &mut self.allocator),
+            build: BatchAccumulator::new(Arc::new(Schema::new(build_fields)), &mut self.allocator),
+            build_source,
+        });
+        Ok(())
+    }
+
+    /// Claim one chunk of the flag array and append its unmatched build rows to
+    /// the build accumulator, emitting once a full batch has gathered. Returns
+    /// whether every chunk has been claimed.
+    fn send_out_next_unmatched_build_rows<S: Sender<RecordBatch>>(
+        &mut self,
+        total_rows: usize,
+        sender: &mut S,
+    ) -> unary::Result<bool> {
+        let start = self
+            .unmatched
+            .cursor
+            .fetch_add(UNMATCHED_SCAN_CHUNK, Ordering::Relaxed);
+        let sides = self
+            .sides
+            .as_mut()
+            .expect("sides are built before scanning");
+        if start >= total_rows {
+            if !sides.build.is_empty() {
+                sides.emit_unmatched_build_rows(&mut self.allocator, sender)?;
+            }
+            return Ok(true);
+        }
+
+        let flags = unsafe { &*self.table.matched.get() };
+        let mut found = 0;
+        for row in start..min(start + UNMATCHED_SCAN_CHUNK, total_rows) {
+            // Branchless, as in the match collector: write the row and keep it
+            // only if its flag is still clear.
+            self.build_indices[found] = row as u32;
+            found += (unsafe { *flags.ptr_at_index(row) } == 0) as usize;
+        }
+        if found > 0 {
+            sides
+                .build
+                .append(&sides.build_source, &self.build_indices[..found]);
+        }
+        if sides.build.should_emit() {
+            sides.emit_unmatched_build_rows(&mut self.allocator, sender)?;
+        }
+        Ok(false)
     }
 
     fn probe_window<S: Sender<RecordBatch>>(
@@ -78,9 +186,10 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>> Probe<T> {
         let col = window.column(self.key_column).as_primitive::<T>();
         let keys = unsafe { &*self.table.keys.get() };
         let rows = unsafe { &*self.table.rows.get() };
-        let out = ProbeMatchCollector {
+        let out = ProbeMatchCollector::<T, S, BUILD_OUTER> {
             keys,
             rows,
+            matched_flags: unsafe { &*self.table.matched.get() },
             col,
             window_offset,
             probe_source,
@@ -106,7 +215,9 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>> Probe<T> {
     }
 }
 
-impl<T: ArrowPrimitiveType<Native: Hash + Eq>> Unary<RecordBatch, RecordBatch> for Probe<T> {
+impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool>
+    Unary<RecordBatch, RecordBatch> for Probe<T, BUILD_OUTER>
+{
     fn consume<S: Sender<RecordBatch>>(
         &mut self,
         batch: RecordBatch,
@@ -114,7 +225,8 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>> Unary<RecordBatch, RecordBatch> f
     ) -> unary::Result<()> {
         let build_rows = unsafe { &*self.table.build_rows.get() };
         let Some(build_rows) = build_rows else {
-            // Empty build side: an inner join emits nothing.
+            // Empty build side: nothing matches, and an outer build has no rows
+            // to carry through unmatched either.
             return Ok(());
         };
 
@@ -123,35 +235,7 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>> Unary<RecordBatch, RecordBatch> f
             return Ok(());
         }
 
-        if self.sides.is_none() {
-            let probe_schema = batch.schema();
-            let build_schema = build_rows.schema();
-            let fields: Vec<Field> = self
-                .output_columns
-                .probe
-                .iter()
-                .map(|&i| probe_schema.field(i).clone())
-                .chain(
-                    self.output_columns
-                        .build
-                        .iter()
-                        .map(|&i| build_schema.field(i).clone()),
-                )
-                .collect();
-            let build_source = build_rows.project(&self.output_columns.build)?;
-            let probe_fields = Arc::new(Schema::new(
-                fields[..self.output_columns.probe.len()].to_vec(),
-            ));
-            let build_fields = Arc::new(Schema::new(
-                fields[self.output_columns.probe.len()..].to_vec(),
-            ));
-            self.sides = Some(OutputSides {
-                output_schema: Arc::new(Schema::new(fields)),
-                probe: BatchAccumulator::new(probe_fields, &mut self.allocator),
-                build: BatchAccumulator::new(build_fields, &mut self.allocator),
-                build_source,
-            });
-        }
+        self.ensure_output_sides_initialized(build_rows, Some(batch.schema_ref()))?;
         let probe_source = batch.project(&self.output_columns.probe)?;
 
         let total = batch.num_rows();
@@ -166,12 +250,35 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>> Unary<RecordBatch, RecordBatch> f
     }
 
     fn finish<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> unary::Result<bool> {
-        if let Some(sides) = &mut self.sides
-            && !sides.probe.is_empty()
-        {
-            sides.emit(&mut self.allocator, sender)?;
+        if !self.probing_done {
+            self.probing_done = true;
+            if let Some(sides) = &mut self.sides
+                && !sides.probe.is_empty()
+            {
+                sides.emit(&mut self.allocator, sender)?;
+            }
+            if BUILD_OUTER {
+                // Release this worker's flag writes and leave the barrier. It
+                // is sound to leave it here and nowhere earlier: `consume` is
+                // never called again once `finish` has run.
+                self.unmatched.probes_live.fetch_sub(1, Ordering::Release);
+            }
         }
-        Ok(true)
+        if !BUILD_OUTER {
+            return Ok(true);
+        }
+
+        // A peer still probing can yet flag a row this worker would otherwise
+        // read as unmatched, so the scan waits for all of them to arrive here.
+        if self.unmatched.probes_live.load(Ordering::Acquire) != 0 {
+            return Ok(false);
+        }
+        let build_rows = unsafe { &*self.table.build_rows.get() };
+        let Some(build_rows) = build_rows else {
+            return Ok(true);
+        };
+        self.ensure_output_sides_initialized(build_rows, None)?;
+        self.send_out_next_unmatched_build_rows(build_rows.num_rows(), sender)
     }
 }
 
@@ -211,6 +318,32 @@ impl OutputSides {
         )?)?;
         Ok(())
     }
+
+    /// Emit one batch of build rows that matched nothing: the accumulated build
+    /// columns, and an all-null column of the right shape for each probe column.
+    fn emit_unmatched_build_rows<S: Sender<RecordBatch>>(
+        &mut self,
+        allocator: &mut SlabAllocator,
+        sender: &mut S,
+    ) -> unary::Result<()> {
+        let build_part = self.build.take_batch(allocator)?;
+        let rows = build_part.num_rows();
+        let columns = self
+            .probe
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| new_null_array(field.data_type(), rows))
+            .chain(build_part.columns().iter().cloned())
+            .collect();
+        let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(rows));
+        sender.send(RecordBatch::try_new_with_options(
+            self.output_schema.clone(),
+            columns,
+            &options,
+        )?)?;
+        Ok(())
+    }
 }
 
 /// Collects matches produced while probing one input window.
@@ -219,10 +352,17 @@ impl OutputSides {
 /// corresponding `(probe row, build payload row)` indices, and periodically
 /// appends those rows to the probe and build output accumulators. Full output
 /// batches are emitted as the accumulators fill.
-struct ProbeMatchCollector<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, S: Sender<RecordBatch>>
-{
+struct ProbeMatchCollector<
+    'a,
+    'b,
+    T: ArrowPrimitiveType<Native: Hash + Eq>,
+    S: Sender<RecordBatch>,
+    const BUILD_OUTER: bool,
+> {
     keys: &'a MultiSlabBuffer<T::Native>,
     rows: &'a MultiSlabBuffer<u32>,
+    /// The build rows' matched flags, written on drain by an outer build.
+    matched_flags: &'a MultiSlabBuffer<u8>,
     col: &'b PrimitiveArray<T>,
     /// Row offset of `col`'s window within the probed batch, added to every
     /// recorded probe index so the indices address `probe_source`.
@@ -239,8 +379,13 @@ struct ProbeMatchCollector<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, S: 
     allocator: &'a mut SlabAllocator,
 }
 
-impl<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, S: Sender<RecordBatch>>
-    ProbeMatchCollector<'a, 'b, T, S>
+impl<
+    'a,
+    'b,
+    T: ArrowPrimitiveType<Native: Hash + Eq>,
+    S: Sender<RecordBatch>,
+    const BUILD_OUTER: bool,
+> ProbeMatchCollector<'a, 'b, T, S, BUILD_OUTER>
 {
     /// Append the collected pairs to the output sides, emitting if a full
     /// batch accumulated.
@@ -248,6 +393,16 @@ impl<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, S: Sender<RecordBatch>>
     fn drain(&mut self) -> unary::Result<()> {
         if self.matched == 0 {
             return Ok(());
+        }
+        if BUILD_OUTER {
+            // These indices are the verified matches, so flagging them here
+            // keeps the match loop itself untouched. Relaxed because the flags
+            // are only read after a barrier that orders them, and atomic only
+            // because peer workers write the same bytes concurrently.
+            for &row in &self.build_indices[..self.matched] {
+                let flag = self.matched_flags.ptr_at_index(row as usize);
+                unsafe { AtomicU8::from_ptr(flag) }.store(1, Ordering::Relaxed);
+            }
         }
         let OutputSides {
             probe,
@@ -296,7 +451,13 @@ impl<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, S: Sender<RecordBatch>>
 /// The prefetch-pipelined probe: hashes ahead, bloom-filters into a ring of
 /// matched directory slots, prefetches their arena ranges, then drains matches
 /// a window behind — keeping many independent loads in flight.
-struct ProbeArray<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, S: Sender<RecordBatch>> {
+struct ProbeArray<
+    'a,
+    'b,
+    T: ArrowPrimitiveType<Native: Hash + Eq>,
+    S: Sender<RecordBatch>,
+    const BUILD_OUTER: bool,
+> {
     row_idx: usize,
     hash_state: RandomState,
     directory: &'a JoinDirectory,
@@ -311,11 +472,16 @@ struct ProbeArray<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, S: Sender<Re
     matched_size: [usize; 2],
     matched_idx: usize,
 
-    out: ProbeMatchCollector<'a, 'b, T, S>,
+    out: ProbeMatchCollector<'a, 'b, T, S, BUILD_OUTER>,
 }
 
-impl<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, S: Sender<RecordBatch>>
-    ProbeArray<'a, 'b, T, S>
+impl<
+    'a,
+    'b,
+    T: ArrowPrimitiveType<Native: Hash + Eq>,
+    S: Sender<RecordBatch>,
+    const BUILD_OUTER: bool,
+> ProbeArray<'a, 'b, T, S, BUILD_OUTER>
 {
     #[inline(always)]
     pub fn generate_matched_slots<const HASH: bool>(&mut self, length: usize) {

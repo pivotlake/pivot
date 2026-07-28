@@ -7,8 +7,15 @@
 //! then the probe reads the populated [`JoinTable`].
 //!
 //! Output layout: the probe-side columns listed in [`JoinOutputColumns`] (in
-//! list order) followed by the listed build-side columns. An inner equi-join
-//! on a single `Int64` key is the supported shape.
+//! list order) followed by the listed build-side columns. The supported shape
+//! is an equi-join on a single fixed-width key, either inner or outer on the
+//! build side.
+//!
+//! A build-side outer join ([`JoinSpec::outer_probe_fields`]) also emits every build
+//! row no probe row matched, its probe columns null-filled. Which rows those
+//! are is only known once every worker has stopped probing, so the probe marks
+//! each matched build row in a shared flag array and the workers scan it
+//! together behind a barrier ([`UnmatchedScan`]).
 
 mod build;
 mod directory;
@@ -17,8 +24,10 @@ mod probe;
 
 use std::cell::UnsafeCell;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 
 use arrow_array::RecordBatch;
+use arrow_schema::Field;
 
 use crate::memory::MultiSlabBuffer;
 use crate::operations::unary::join::directory::JoinDirectory;
@@ -39,6 +48,45 @@ impl JoinOutputColumns {
         Self {
             probe: (0..probe_column_count).collect(),
             build: (0..build_column_count).collect(),
+        }
+    }
+}
+
+/// How a join is configured beyond the key type it is instantiated for.
+#[derive(Debug, Clone)]
+pub struct JoinSpec {
+    /// The key column's index in the build input's schema.
+    pub build_key_column: usize,
+    /// The key column's index in the probe input's schema.
+    pub probe_key_column: usize,
+    /// Which columns of each side the join emits.
+    pub output_columns: JoinOutputColumns,
+    /// The fields the probe columns take in the output. Present exactly when the
+    /// join is outer on the build side, which is what asks for them: every build
+    /// row then reaches the output, its probe columns null-filled when nothing
+    /// matched, and a worker can reach that pass without ever having seen a probe
+    /// batch to read a schema off — an empty probe side, or simply a peer
+    /// having taken all the work. Every worker shaping its output from the same
+    /// fields is also what keeps their batches concatenable downstream.
+    pub outer_probe_fields: Option<Vec<Field>>,
+}
+
+/// The cross-worker state of a build-side outer join's unmatched pass.
+pub(crate) struct UnmatchedScan {
+    /// Probe workers that may still mark a matched build row. Each decrements
+    /// it once, on entering `finish`, after which that worker never consumes
+    /// again; at zero the flags are final and the scan below can start.
+    probes_live: AtomicUsize,
+    /// The next build payload row the scan hands out, so workers claim
+    /// disjoint chunks of the flag array.
+    cursor: AtomicUsize,
+}
+
+impl UnmatchedScan {
+    fn new(worker_count: usize) -> Self {
+        Self {
+            probes_live: AtomicUsize::new(worker_count),
+            cursor: AtomicUsize::new(0),
         }
     }
 }
@@ -73,6 +121,11 @@ pub(crate) struct JoinTable<K> {
     pub(crate) keys: Arc<JoinCell<MultiSlabBuffer<K>>>,
     pub(crate) rows: Arc<JoinCell<MultiSlabBuffer<u32>>>,
     pub(crate) build_rows: Arc<JoinCell<Option<RecordBatch>>>,
+    /// One zeroed byte per `build_rows` row, set to 1 by whichever probe worker
+    /// matches that row. Only allocated for a build-side outer join, which is
+    /// the only reader; the bytes are written as [`AtomicU8`](std::sync::atomic::AtomicU8)
+    /// because several probe workers can match the same build row at once.
+    pub(crate) matched: Arc<JoinCell<MultiSlabBuffer<u8>>>,
 }
 
 #[cfg(test)]
@@ -112,9 +165,13 @@ mod tests {
         .unwrap()
     }
 
-    fn extract_consumer(
-        breaker: PipelineBreaker<RecordBatch, (), JoinBuildConsumer<arrow_array::types::Int64Type>>,
-    ) -> JoinBuildConsumer<arrow_array::types::Int64Type> {
+    fn extract_consumer<const BUILD_OUTER: bool>(
+        breaker: PipelineBreaker<
+            RecordBatch,
+            (),
+            JoinBuildConsumer<arrow_array::types::Int64Type, BUILD_OUTER>,
+        >,
+    ) -> JoinBuildConsumer<arrow_array::types::Int64Type, BUILD_OUTER> {
         match breaker {
             PipelineBreaker::Consuming(c) => c,
             _ => unreachable!(),
@@ -125,22 +182,56 @@ mod tests {
         batches: Vec<RecordBatch>,
     }
 
+    impl JoinResult {
+        fn rows(&self) -> usize {
+            self.batches.iter().map(|b| b.num_rows()).sum()
+        }
+    }
+
     fn build_and_probe(
         build_worker_batches: Vec<Vec<RecordBatch>>,
         probe_batches: Vec<RecordBatch>,
+    ) -> JoinResult {
+        run_join::<false>(build_worker_batches, probe_batches, None)
+    }
+
+    /// Build-side outer: every build row reaches the output, with null probe
+    /// columns when nothing matched.
+    fn build_and_probe_outer(
+        build_worker_batches: Vec<Vec<RecordBatch>>,
+        probe_batches: Vec<RecordBatch>,
+        probe_fields: Vec<Field>,
+    ) -> JoinResult {
+        run_join::<true>(build_worker_batches, probe_batches, Some(probe_fields))
+    }
+
+    /// Run one join to completion: one build worker per entry of
+    /// `build_worker_batches`, and as many probe workers, all of whose `finish`
+    /// is driven (the unmatched pass only starts once every one has arrived).
+    /// The probe batches all go to the first, so the rest exercise a worker
+    /// reaching that pass with no batch of its own.
+    fn run_join<const BUILD_OUTER: bool>(
+        build_worker_batches: Vec<Vec<RecordBatch>>,
+        probe_batches: Vec<RecordBatch>,
+        probe_fields: Option<Vec<Field>>,
     ) -> JoinResult {
         init_test_free_pool(16);
         let workers = build_worker_batches.len();
         let probe_column_count = probe_batches[0].num_columns();
         let build_column_count = build_worker_batches[0][0].num_columns();
-        let output_columns =
-            super::JoinOutputColumns::keep_all(probe_column_count, build_column_count);
-        let (builds, probes, _) = factory::create_for_workers::<arrow_array::types::Int64Type>(
-            0,
-            0,
-            output_columns,
-            workers,
-        );
+        let spec = super::JoinSpec {
+            build_key_column: 0,
+            probe_key_column: 0,
+            output_columns: super::JoinOutputColumns::keep_all(
+                probe_column_count,
+                build_column_count,
+            ),
+            outer_probe_fields: probe_fields,
+        };
+        let (builds, probes, _) = factory::create_for_workers::<
+            arrow_array::types::Int64Type,
+            BUILD_OUTER,
+        >(spec, workers);
 
         let mut consumers: Vec<_> = builds
             .into_iter()
@@ -171,12 +262,22 @@ mod tests {
             }
         }
 
-        let mut probe = probes.into_iter().next().unwrap().build_unary();
+        let mut probers: Vec<_> = probes.into_iter().map(|p| p.build_unary()).collect();
         let mut sender = CollectSender::new();
         for batch in probe_batches {
-            probe.consume(batch, &mut sender).unwrap();
+            probers[0].consume(batch, &mut sender).unwrap();
         }
-        while !probe.finish(&mut sender).unwrap() {}
+        loop {
+            let mut all_done = true;
+            for probe in &mut probers {
+                if !probe.finish(&mut sender).unwrap() {
+                    all_done = false;
+                }
+            }
+            if all_done {
+                break;
+            }
+        }
         JoinResult {
             batches: sender.items,
         }
@@ -510,5 +611,125 @@ mod tests {
         let r = build_and_probe(vec![vec![int64_batch(&[])]], vec![int64_batch(&[10])]);
 
         assert!(r.batches.is_empty());
+    }
+
+    fn nullable_key_field() -> Vec<Field> {
+        vec![Field::new("key", DataType::Int64, true)]
+    }
+
+    /// Every output row as (probe key, build key), each null-aware.
+    fn collect_key_pairs(results: &[RecordBatch]) -> Vec<(Option<i64>, Option<i64>)> {
+        let mut pairs: Vec<(Option<i64>, Option<i64>)> = results
+            .iter()
+            .flat_map(|batch| {
+                let key = |col: usize, row: usize| {
+                    let column = batch
+                        .column(col)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap();
+                    column.is_valid(row).then(|| column.value(row))
+                };
+                (0..batch.num_rows())
+                    .map(|row| (key(0, row), key(1, row)))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    #[test]
+    fn unmatched_build_rows_come_out_with_null_probe_columns() {
+        let r = build_and_probe_outer(
+            vec![vec![int64_batch(&[10, 20, 30])]],
+            vec![int64_batch(&[20])],
+            nullable_key_field(),
+        );
+
+        assert_eq!(
+            collect_key_pairs(&r.batches),
+            vec![(None, Some(10)), (None, Some(30)), (Some(20), Some(20))]
+        );
+    }
+
+    #[test]
+    fn every_build_row_survives_a_probe_side_that_matches_nothing() {
+        let r = build_and_probe_outer(
+            vec![vec![int64_batch(&[10, 20, 30])]],
+            vec![int64_batch(&[99])],
+            nullable_key_field(),
+        );
+
+        assert_eq!(
+            collect_key_pairs(&r.batches),
+            vec![(None, Some(10)), (None, Some(20)), (None, Some(30))]
+        );
+    }
+
+    #[test]
+    fn a_build_row_matched_twice_is_not_also_reported_unmatched() {
+        let r = build_and_probe_outer(
+            vec![vec![int64_batch(&[10])]],
+            vec![int64_batch(&[10, 10])],
+            nullable_key_field(),
+        );
+
+        assert_eq!(
+            collect_key_pairs(&r.batches),
+            vec![(Some(10), Some(10)), (Some(10), Some(10))]
+        );
+    }
+
+    #[test]
+    fn null_keyed_build_rows_are_emitted_unmatched() {
+        let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, true)]));
+        let build = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![Some(10), None]))],
+        )
+        .unwrap();
+
+        let r = build_and_probe_outer(
+            vec![vec![build]],
+            vec![int64_batch(&[10])],
+            nullable_key_field(),
+        );
+
+        assert_eq!(
+            collect_key_pairs(&r.batches),
+            vec![(None, None), (Some(10), Some(10))]
+        );
+    }
+
+    #[test]
+    fn the_unmatched_pass_covers_every_build_worker() {
+        let r = build_and_probe_outer(
+            vec![vec![int64_batch(&[1, 2])], vec![int64_batch(&[3, 4])]],
+            vec![int64_batch(&[3])],
+            nullable_key_field(),
+        );
+
+        assert_eq!(
+            collect_key_pairs(&r.batches),
+            vec![
+                (None, Some(1)),
+                (None, Some(2)),
+                (None, Some(4)),
+                (Some(3), Some(3))
+            ]
+        );
+    }
+
+    #[test]
+    fn an_outer_build_larger_than_one_batch_emits_every_row() {
+        let build_keys: Vec<i64> = (0..crate::RECORD_BATCH_SIZE as i64 * 2 + 5).collect();
+        let r = build_and_probe_outer(
+            vec![vec![int64_batch(&build_keys)]],
+            vec![int64_batch(&[7])],
+            nullable_key_field(),
+        );
+
+        assert_eq!(r.rows(), build_keys.len());
     }
 }

@@ -256,3 +256,85 @@ fn inner_join_count_star(mut testing_planner: TestingPlanner) {
         serde_json::json!([{"n": 3}]).as_array().unwrap().clone()
     );
 }
+
+#[rstest]
+fn left_join_keeps_a_row_that_matched_nothing(mut testing_planner: TestingPlanner) {
+    add_orders_and_items(&testing_planner);
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT o_key, i_qty FROM orders LEFT JOIN items ON o_key = i_order",
+    );
+    rows.sort_by_key(|r| (r["o_key"].as_i64().unwrap(), r["i_qty"].as_i64()));
+
+    // Order 3 has no item, and comes out with a NULL quantity rather than not
+    // at all.
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"o_key": 1, "i_qty": 10},
+            {"o_key": 1, "i_qty": 20},
+            {"o_key": 2, "i_qty": 30},
+            {"o_key": 3},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
+
+#[rstest]
+fn counting_a_column_over_a_left_join_skips_the_rows_it_filled_in(
+    mut testing_planner: TestingPlanner,
+) {
+    add_orders_and_items(&testing_planner);
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT o_key, count(i_qty) AS items FROM orders LEFT JOIN items ON o_key = i_order \
+         GROUP BY o_key",
+    );
+    rows.sort_by_key(|r| r["o_key"].as_i64().unwrap());
+
+    // Counting a column counts its values, and the row the join filled in for
+    // order 3 holds none, so that order counts zero items rather than one.
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"o_key": 1, "items": 2},
+            {"o_key": 2, "items": 1},
+            {"o_key": 3, "items": 0},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
+
+#[rstest]
+fn aggregating_a_column_over_a_left_join_skips_the_rows_it_filled_in(
+    mut testing_planner: TestingPlanner,
+) {
+    add_orders_and_items(&testing_planner);
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT o_key, min(i_qty) AS smallest, sum(i_qty) AS total FROM orders \
+         LEFT JOIN items ON o_key = i_order GROUP BY o_key",
+    );
+    rows.sort_by_key(|r| r["o_key"].as_i64().unwrap());
+
+    // An order with no items has nothing to take an extreme or a total of, so
+    // both come back NULL rather than reading the filled-in row's value.
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"o_key": 1, "smallest": 10, "total": 30},
+            {"o_key": 2, "smallest": 30, "total": 30},
+            {"o_key": 3},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
