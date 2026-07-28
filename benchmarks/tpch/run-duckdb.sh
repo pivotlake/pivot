@@ -10,11 +10,15 @@
 #   ./run-duckdb.sh --source ~/tpch-sf100                    # all queries, 1 run
 #   ./run-duckdb.sh --source ~/tpch-sf100 --query 12         # just q12
 #   ./run-duckdb.sh --source ~/tpch-sf100 --iterations 3     # 3 timed runs each
-#   ./run-duckdb.sh --source ~/tpch-sf100 --no-drop-caches   # skip the cache drop
+#   ./run-duckdb.sh --source ~/tpch-sf100 --sleep 500        # 500ms between queries
+#   ./run-duckdb.sh --source ~/tpch-sf100 --drop-caches-between-queries
 #   ./run-duckdb.sh --source ~/tpch-sf100 --query 12 --write-expected  # write q12.tsv
 #   ./run-duckdb.sh --data native --source /mnt/nvme/tpch-native.duckdb --query 12
 #
 # We always report DuckDB's own `.timer` "Run Time" (query execution only).
+# The whole suite goes to ONE duckdb process over stdin, so every query after
+# the first reuses the buffer pool its predecessors warmed, the way pivot-bench's
+# long-lived server does.
 #
 # --data parquet|native  (default parquet)
 #   parquet: --source is the dataset root directory; each table is a view over
@@ -22,14 +26,17 @@
 #   native:  --source is a .duckdb database file holding the base tables (see
 #     fetch-native-dbs.sh); opened read-only.
 #
-# --duckdb-process per-iteration|single  (default single)
-#   single: all of a query's iterations in ONE duckdb process, so iterations
-#     2+ reuse DuckDB's warm buffer pool - symmetric with pivot's warm server.
-#   per-iteration: a FRESH duckdb process per timed iteration (engine-cold,
-#     page cache warm after iteration 1).
+# --sleep <ms> waits that long between queries, so one query's tail (background
+# threads winding down, dirty pages flushing) doesn't land inside the next
+# one's timing. DuckDB runs each statement as it arrives on stdin, so the pause
+# really does fall between queries. Matches pivot-bench's --sleep.
 #
-# The OS page cache is dropped once before each query (needs root, via sudo),
-# so iteration 1 is a true cold read; --no-drop-caches skips that.
+# The OS page cache is always dropped once before the first query (needs root,
+# via sudo; a failure warns and continues), so a run never inherits the cache
+# state of whatever ran before it. Between queries it is left alone, so each
+# query sees what its predecessors warmed, which is what a power run wants.
+# --drop-caches-between-queries drops before every query instead, making each
+# one a cold read.
 #
 # --write-expected runs each query once and writes its rows to the suite's
 # qNN.tsv in pivot-bench's exact wire format (tab-separated, no header, NULL as
@@ -43,14 +50,13 @@ suite_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source_path=""
 queries=""
 iterations=1
-drop_caches=1
+drop_between=0
 write_expected=0
 sleep_ms=0
-duckdb_process="single"
 data="parquet"
 
 usage() {
-    sed -n '3,37p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,44p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -61,18 +67,12 @@ while [[ $# -gt 0 ]]; do
         --iterations) iterations="$2"; shift 2 ;;
         --sleep)      sleep_ms="$2"; shift 2 ;;
         --data)       data="$2"; shift 2 ;;
-        --duckdb-process) duckdb_process="$2"; shift 2 ;;
-        --no-drop-caches) drop_caches=0; shift ;;
+        --drop-caches-between-queries) drop_between=1; shift ;;
         --write-expected) write_expected=1; shift ;;
         -h|--help)    usage 0 ;;
         *) echo "unknown argument: $1" >&2; usage 1 ;;
     esac
 done
-
-case "$duckdb_process" in
-    per-iteration|single) ;;
-    *) echo "error: --duckdb-process must be per-iteration|single (got '$duckdb_process')" >&2; usage 1 ;;
-esac
 
 case "$data" in
     parquet|native) ;;
@@ -92,9 +92,10 @@ command -v duckdb >/dev/null 2>&1 || {
 }
 
 flush_page_cache() {
-    [[ "$drop_caches" == "1" ]] || return 0
     sync
-    echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+    if ! echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1; then
+        echo "warning: could not drop the OS page cache (needs sudo); continuing" >&2
+    fi
 }
 
 # One view per base table over its parquet directory; a native database
@@ -134,51 +135,67 @@ else
 fi
 echo
 
-# Parquet mode persists the views into a throwaway .db once, then opens it
-# fresh each iteration with parquet metadata caching on, so a timed run
-# doesn't pay the view re-creation. Native mode opens the database itself,
-# read-only so a run can never dirty it.
-if [[ "$write_expected" != "1" ]]; then
-    if [[ "$data" == "parquet" ]]; then
-        query_db="$(mktemp -u)-tpch.db"
-        trap 'rm -f "$query_db" "$query_db".wal' EXIT
-        duckdb "$query_db" -c "$setup" >/dev/null 2>&1
-        iter_cmd=(duckdb "$query_db" -c "SET parquet_metadata_cache=true" -c ".timer on")
-    else
-        iter_cmd=(duckdb -readonly "$source_path" -c ".timer on")
-    fi
-fi
-
-for f in "${query_files[@]}"; do
-    stem="$(basename "$f" .sql)"
-    [[ -f "$suite_dir/$stem-duckdb.sql" ]] && f="$suite_dir/$stem-duckdb.sql"
-    sql="$(cat "$f")"
-    echo "=== $stem ==="
-
-    if [[ "$write_expected" == "1" ]]; then
+if [[ "$write_expected" == "1" ]]; then
+    for f in "${query_files[@]}"; do
+        stem="$(basename "$f" .sql)"
+        [[ -f "$suite_dir/$stem-duckdb.sql" ]] && f="$suite_dir/$stem-duckdb.sql"
         out_file="$suite_dir/$stem.tsv"
         expected_cmd=(duckdb)
         [[ "$data" == "native" ]] && expected_cmd=(duckdb -readonly "$source_path")
+        echo "=== $stem ==="
         printf '%s\n.headers off\n.nullvalue '\'''\''\n.mode tabs\n.output %s\n%s\n' \
-            "$setup" "$out_file" "$sql" \
+            "$setup" "$out_file" "$(cat "$f")" \
             | "${expected_cmd[@]}"
         echo "  wrote $out_file ($(wc -l < "$out_file" | tr -d ' ') rows)"
         echo
-        continue
-    fi
+    done
+    exit 0
+fi
 
-    flush_page_cache
-    if [[ "$duckdb_process" == "single" ]]; then
-        cmd=("${iter_cmd[@]}")
-        for ((i = 1; i <= iterations; i++)); do cmd+=(-c "$sql"); done
-        "${cmd[@]}" 2>&1 | grep -E 'Run Time|Error' || true
-    else
-        for ((i = 1; i <= iterations; i++)); do
-            "${iter_cmd[@]}" -c "$sql" 2>&1 | grep -E 'Run Time|Error' || true
-            if [[ "${sleep_ms:-0}" -gt 0 && $i -lt $iterations ]]; then
+# Parquet mode persists the views into a throwaway .db first, so the timed run
+# doesn't pay the view creation and the page-cache drop below clears whatever
+# creating them read. Native mode opens the database itself, read-only so a run
+# can never dirty it.
+if [[ "$data" == "parquet" ]]; then
+    query_db="$(mktemp -u)-tpch.db"
+    trap 'rm -f "$query_db" "$query_db".wal' EXIT
+    duckdb "$query_db" -c "$setup" >/dev/null 2>&1
+    db_cmd=(duckdb "$query_db")
+    prologue=("SET parquet_metadata_cache=true;" ".timer on")
+else
+    db_cmd=(duckdb -readonly "$source_path")
+    prologue=(".timer on")
+fi
+
+# Write the whole suite to ONE duckdb process over stdin. DuckDB runs each
+# statement as it arrives, so pausing here pauses between queries *inside* that
+# process: the buffer pool one query warms is still there for the next, which is
+# what pivot-bench's long-lived server gives its side. The `.print` markers ride
+# the same output stream as the timings, so they stay in order with them.
+feed_suite() {
+    printf '%s\n' "${prologue[@]}"
+    for idx in "${!query_files[@]}"; do
+        f="${query_files[$idx]}"
+        stem="$(basename "$f" .sql)"
+        [[ -f "$suite_dir/$stem-duckdb.sql" ]] && f="$suite_dir/$stem-duckdb.sql"
+        if [[ "$idx" -gt 0 ]]; then
+            if [[ "$drop_between" == "1" ]]; then
+                flush_page_cache
+            fi
+            if [[ "${sleep_ms:-0}" -gt 0 ]]; then
                 sleep "$(awk "BEGIN{print $sleep_ms/1000}")"
             fi
+        fi
+        printf '.print === %s ===\n' "$stem"
+        for ((i = 1; i <= iterations; i++)); do
+            cat "$f"
+            printf '\n'
         done
-    fi
-    echo
-done
+    done
+    return 0
+}
+
+# Always start from a cold page cache, so a run never inherits whatever ran
+# before it.
+flush_page_cache
+feed_suite | "${db_cmd[@]}" 2>&1 | grep -E '^=== |Run Time|Error' || true
