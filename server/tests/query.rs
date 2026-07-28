@@ -15,10 +15,14 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use catalog::parquet::writing::{EncodedFile, encode_record_batches};
 use common::{Conn, conn, connect_client, server_port};
+use dispatch::{BUFFER_SIZE, Dispatch, values_input};
 use parquet::arrow::ArrowWriter;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
+use parquet_variant_compute::json_to_variant;
 use rstest::rstest;
 use tempfile::TempDir;
 use tokio_postgres::{Client, SimpleQueryMessage};
@@ -458,5 +462,129 @@ async fn query_against_unknown_table_errors(#[future] conn: Conn) {
             || err.to_string().to_lowercase().contains("not found")
             || err.code().is_some(),
         "expected a structured pgwire error, got: {err}",
+    );
+}
+
+/// Write `docs` as one Parquet file of a single shredded variant column, through
+/// the real write pipeline. Only that pipeline annotates the column VARIANT in
+/// the footer and picks its shredding, which is what a table reading the file
+/// back needs, so a plain Arrow writer cannot stand in here.
+fn write_shredded_variant(docs: &[String]) -> TempDir {
+    let json: ArrayRef = Arc::new(StringArray::from(docs.to_vec()));
+    let variants = json_to_variant(&json).unwrap();
+    let schema = Schema::new(vec![variants.field("j")]);
+    let batch =
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(variants.into_inner())]).unwrap();
+
+    let dispatch = Dispatch::spin_up(2, 64 * 1024 * 1024 / BUFFER_SIZE, None);
+    let spec = values_input(dispatch.dispatcher(), vec![batch]).record_batches();
+    let files: Vec<EncodedFile> =
+        encode_record_batches(spec, Arc::from([]), Arc::from([]), docs.len().max(1), 1)
+            .collect()
+            .unwrap();
+    dispatch.exit();
+
+    let dir = TempDir::new().unwrap();
+    for (i, file) in files.iter().enumerate() {
+        std::fs::write(dir.path().join(format!("part-{i}.parquet")), &file.bytes).unwrap();
+    }
+    dir
+}
+
+/// The `typed_value` leaves of every Parquet file in `dir`: empty when nothing
+/// was shredded, so a caller can tell an opaque document from a laid-out one.
+fn shredded_leaves(dir: &Path) -> Vec<String> {
+    let mut leaves = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_none_or(|e| e != "parquet") {
+            continue;
+        }
+        let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&path).unwrap()).unwrap();
+        for column in reader.parquet_schema().columns() {
+            let name = column.path().string();
+            if name.contains("typed_value") {
+                leaves.push(name);
+            }
+        }
+    }
+    leaves
+}
+
+/// 80 documents carrying `a.x`, 20 carrying nothing but `kind`. The second kind
+/// is the one that matters: a row with none of the shredded paths, which the
+/// reader can only tell apart by the null mask it rebuilds over `typed_value`.
+fn mixed_documents() -> Vec<String> {
+    let mut docs: Vec<String> = (0..80)
+        .map(|i| format!("{{\"kind\":\"commit\",\"a\":{{\"x\":{i}}}}}"))
+        .collect();
+    docs.extend((0..20).map(|_| "{\"kind\":\"identity\"}".to_string()));
+    docs
+}
+
+/// Copying a variant from one table into another has to reassemble it: the
+/// source hands over the shape *it* shredded into, while the destination shreds
+/// for the rows it gets. Rows that have none of the source's shredded paths are
+/// what makes this more than a copy, and they must survive it.
+///
+/// The copy goes through a select list that computes a column, so the variant
+/// travels the path that rebuilds output fields rather than the one that passes
+/// them through untouched.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_from_a_shredded_variant_reassembles_and_reshreds(#[future] conn: Conn) {
+    let source = write_shredded_variant(&mixed_documents());
+    let destination = TempDir::new().unwrap();
+    conn.simple_query(&format!(
+        "CREATE TABLE variant_source (j VARIANT) WITH (path = '{}')",
+        source.path().to_str().unwrap()
+    ))
+    .await
+    .unwrap();
+    conn.simple_query(&format!(
+        "CREATE TABLE variant_copy (n BIGINT, j VARIANT) WITH (path = '{}')",
+        destination.path().to_str().unwrap()
+    ))
+    .await
+    .unwrap();
+
+    // The computed `1` matters: a select list of nothing but column references
+    // is copied through with its fields intact, while one that computes anything
+    // rebuilds them, and that is where a variant column can lose the tag saying
+    // it is one.
+    conn.simple_query("INSERT INTO variant_copy SELECT 1, j FROM variant_source")
+        .await
+        .unwrap();
+
+    let kinds = select_rows(
+        &conn,
+        "SELECT CAST(j->'kind' AS VARCHAR) AS kind, count(*) FROM variant_copy \
+         GROUP BY kind ORDER BY kind",
+    )
+    .await;
+    assert_eq!(
+        kinds,
+        vec![
+            vec![Some("commit".into()), Some("80".into())],
+            vec![Some("identity".into()), Some("20".into())],
+        ],
+        "every document survives the copy, including the ones with no shredded path"
+    );
+
+    // Restricted to the documents that have the path: an aggregate over the
+    // rows that do not would be feeding it NULLs, which is a separate gap.
+    let total = select_rows(
+        &conn,
+        "SELECT sum(CAST(j->'a'->'x' AS BIGINT)) FROM variant_copy \
+         WHERE CAST(j->'kind' AS VARCHAR) = 'commit'",
+    )
+    .await;
+    assert_eq!(total, vec![vec![Some("3160".into())]], "0..80 summed");
+
+    assert!(
+        !shredded_leaves(destination.path()).is_empty(),
+        "the copy shreds for itself; an unshredded write would answer the same \
+         queries while storing every document opaque"
     );
 }

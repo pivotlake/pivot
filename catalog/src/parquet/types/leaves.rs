@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, StructArray};
-use arrow_buffer::NullBuffer;
+use arrow_buffer::{BooleanBuffer, NullBuffer};
 use arrow_schema::{DataType, FieldRef, Fields};
 
 /// The depth-first leaf fields of `fields` (struct fields expanded to their
@@ -137,9 +137,10 @@ fn child_leaf_offset<'a>(field: &'a FieldRef, name: &str) -> Option<(usize, &'a 
 /// A struct wrapper's null buffer is derived from its non-nullable children:
 /// a null in such a child can only mean the struct (or an ancestor) is null
 /// at that row, since the child itself never is. Without this mask,
-/// `StructArray::new` rejects the child's nulls as unmasked. Structs whose
-/// children are all nullable get no mask; their null rows decode as
-/// all-null children, which readers treat the same way.
+/// `StructArray::new` rejects the child's nulls as unmasked. A nullable struct
+/// left without a mask that way takes instead the one that is null where every
+/// child is: a variant's `typed_value` needs it, since its reader tells a row
+/// that has a value for the field from one that does not by exactly that mask.
 pub(crate) fn nest_leaves_into_columns(
     fields: &Fields,
     leaf_arrays: &mut impl Iterator<Item = ArrayRef>,
@@ -150,12 +151,18 @@ pub(crate) fn nest_leaves_into_columns(
     struct PartialStruct {
         fields: Fields,
         arrays: Vec<ArrayRef>,
+        /// Whether the field this struct fills is itself nullable. A struct that
+        /// cannot be null must not be given a mask, both because it would say
+        /// something untrue and because its parent reads a null in it as proof
+        /// that the parent is null.
+        nullable: bool,
     }
     impl PartialStruct {
-        fn start(fields: &Fields) -> Self {
+        fn start(fields: &Fields, nullable: bool) -> Self {
             Self {
                 fields: fields.clone(),
                 arrays: Vec::with_capacity(fields.len()),
+                nullable,
             }
         }
         fn next_unfilled_field(&self) -> Option<&FieldRef> {
@@ -170,18 +177,32 @@ pub(crate) fn nest_leaves_into_columns(
                     nulls = NullBuffer::union(nulls.as_ref(), array.nulls());
                 }
             }
+            // No non-nullable child said anything, so fall back to the only
+            // thing the children still say between them: the struct is null
+            // exactly where all of them are. A variant's `typed_value` needs
+            // this, since its reader tells a row that has a value for the field
+            // from one that does not by that mask. Only for a struct that can be
+            // null in the first place: giving a non-nullable one a mask reads,
+            // to the rule above, as its parent being null, which would drop the
+            // whole enclosing struct wherever one field happened to be absent.
+            if self.nullable && nulls.is_none() {
+                nulls = null_where_every_child_is_null(&self.arrays);
+            }
             Arc::new(StructArray::new(self.fields, self.arrays, nulls))
         }
     }
 
     // Keep the open structs in a stack to support deeply nested schemas.
-    let mut open = vec![PartialStruct::start(fields)];
+    // The top level is the batch itself and is never null.
+    let mut open = vec![PartialStruct::start(fields, false)];
     loop {
         let innermost = open.last().expect("the top level only closes by returning");
         match innermost.next_unfilled_field().cloned() {
             Some(field) => match field.data_type() {
                 // The next field is itself a struct: open it and fill it first.
-                DataType::Struct(children) => open.push(PartialStruct::start(children)),
+                DataType::Struct(children) => {
+                    open.push(PartialStruct::start(children, field.is_nullable()))
+                }
                 // A primitive field owns exactly the next decoded leaf array.
                 _ => open.last_mut().expect("just inspected").arrays.push(
                     leaf_arrays
@@ -203,9 +224,48 @@ pub(crate) fn nest_leaves_into_columns(
     }
 }
 
+/// The mask that is null exactly where every one of `arrays` is null, or `None`
+/// when there is no such row. A child that is null nowhere makes the struct
+/// present everywhere, which is why one of those ends the search.
+fn null_where_every_child_is_null(arrays: &[ArrayRef]) -> Option<NullBuffer> {
+    let mut valid: Option<BooleanBuffer> = None;
+    for array in arrays {
+        let child = rows_present_in(array)?;
+        valid = Some(match valid {
+            None => child,
+            Some(valid) => &valid | &child,
+        });
+    }
+    valid.map(NullBuffer::new)
+}
+
+/// The rows where `array` holds something, or `None` when that is every row.
+///
+/// A struct carrying a mask of its own is answered by it. One without has to be
+/// answered by its descendants, because the struct that says whether a variant
+/// field is present sits above children that are themselves non-nullable, and a
+/// non-nullable child never carries a mask. What it has instead is its own
+/// children, one level further down, being null.
+fn rows_present_in(array: &ArrayRef) -> Option<BooleanBuffer> {
+    if let Some(nulls) = array.nulls() {
+        return Some(nulls.inner().clone());
+    }
+    let structure = array.as_any().downcast_ref::<StructArray>()?;
+    let mut valid: Option<BooleanBuffer> = None;
+    for child in structure.columns() {
+        let child = rows_present_in(child)?;
+        valid = Some(match valid {
+            None => child,
+            Some(valid) => &valid | &child,
+        });
+    }
+    valid
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::{BinaryViewArray, Int64Array};
     use arrow_schema::Field;
 
     /// A shredded variant struct:
@@ -229,8 +289,88 @@ mod tests {
         Field::new("v", DataType::Struct(children.into()), true)
     }
 
+    /// A variant shredded on `paths`, laid out the way a written file has it:
+    /// each path's `{value, typed_value}` pair is non-nullable, and only the
+    /// `typed_value` holding them says whether a row has any of them at all.
+    fn file_shredded_variant(paths: &[(&str, DataType)]) -> Field {
+        let shredded: Vec<Field> = paths
+            .iter()
+            .map(|(name, ty)| {
+                let pair = vec![
+                    Field::new("value", DataType::BinaryView, true),
+                    Field::new("typed_value", ty.clone(), true),
+                ];
+                Field::new(*name, DataType::Struct(pair.into()), false)
+            })
+            .collect();
+        let children = vec![
+            Field::new("metadata", DataType::BinaryView, false),
+            Field::new("value", DataType::BinaryView, true),
+            Field::new("typed_value", DataType::Struct(shredded.into()), true),
+        ];
+        Field::new("v", DataType::Struct(children.into()), true)
+    }
+
     fn path(segments: &[&str]) -> Vec<String> {
         segments.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// A row that has none of the shredded paths must come back null at
+    /// `typed_value`, which is how a reader tells "this row had no value for
+    /// the field" from "it had one". Nothing else carries that: the pairs
+    /// beneath are non-nullable and never hold a mask of their own.
+    #[test]
+    fn shredded_variant_is_null_where_a_row_has_no_shredded_path() {
+        let fields = Fields::from(vec![file_shredded_variant(&[
+            ("a", DataType::Int64),
+            ("b", DataType::Int64),
+        ])]);
+        // Row 0 has only `a`, row 1 only `b`, row 2 neither.
+        let mut leaves = vec![
+            Arc::new(BinaryViewArray::from(vec![Some(&b"m"[..]); 3])) as ArrayRef,
+            Arc::new(BinaryViewArray::from(vec![None::<&[u8]>; 3])) as ArrayRef,
+            Arc::new(BinaryViewArray::from(vec![None::<&[u8]>; 3])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(1), None, None])) as ArrayRef,
+            Arc::new(BinaryViewArray::from(vec![None::<&[u8]>; 3])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![None, Some(2), None])) as ArrayRef,
+        ]
+        .into_iter();
+
+        let columns = nest_leaves_into_columns(&fields, &mut leaves);
+
+        let variant = columns[0].as_any().downcast_ref::<StructArray>().unwrap();
+        let typed_value = variant.column(2);
+        assert!(!typed_value.is_null(0), "row 0 has `a`");
+        assert!(!typed_value.is_null(1), "row 1 has `b`");
+        assert!(typed_value.is_null(2), "row 2 has neither");
+    }
+
+    /// The pairs under `typed_value` are non-nullable, so a row missing one of
+    /// them says nothing about the row as a whole. Masking them anyway reads,
+    /// to the rule that a null in a non-nullable child means the parent is
+    /// null, as the whole variant being absent wherever one path is.
+    #[test]
+    fn a_shredded_path_missing_from_a_row_does_not_null_the_variant() {
+        let fields = Fields::from(vec![file_shredded_variant(&[
+            ("a", DataType::Int64),
+            ("b", DataType::Int64),
+        ])]);
+        let mut leaves = vec![
+            Arc::new(BinaryViewArray::from(vec![Some(&b"m"[..]); 2])) as ArrayRef,
+            Arc::new(BinaryViewArray::from(vec![None::<&[u8]>; 2])) as ArrayRef,
+            Arc::new(BinaryViewArray::from(vec![None::<&[u8]>; 2])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(1), Some(2)])) as ArrayRef,
+            Arc::new(BinaryViewArray::from(vec![None::<&[u8]>; 2])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![None, None])) as ArrayRef,
+        ]
+        .into_iter();
+
+        let columns = nest_leaves_into_columns(&fields, &mut leaves);
+
+        // Every row has `a`; none has `b`. Both rows are still present.
+        assert_eq!(columns[0].null_count(), 0);
+        let variant = columns[0].as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(variant.column(2).null_count(), 0);
     }
 
     #[test]

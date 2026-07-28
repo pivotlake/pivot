@@ -41,12 +41,13 @@
 
 mod assembler;
 mod encoder;
-mod error;
+pub(crate) mod error;
 mod partition;
 mod shredding;
 mod stats;
 mod types;
 
+pub(crate) use shredding::unshred_batch;
 pub use types::EncodedFile;
 
 use std::sync::Arc;

@@ -59,7 +59,9 @@ pub use types::arrow_map::{
 pub use types::metadata::{ColumnStatistics, RowGroupMetadata};
 pub use types::page::{CompressedPage, DecompressedPage};
 pub use types::requests::{RowGroupBuffer, RowGroupRequest};
-pub use types::table::{Error as ParquetTableError, ParquetTable, is_variant_field};
+pub use types::table::{
+    Error as ParquetTableError, ParquetTable, is_variant_field, variant_extension_metadata,
+};
 
 #[cfg(test)]
 pub(crate) mod test_utils {

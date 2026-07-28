@@ -41,7 +41,7 @@ use super::error::WriteResult;
 /// Fold every variant column of `batch` back to the plain `{metadata, value}`
 /// pair, dropping any typed leaves it arrived with. A batch whose variants are
 /// already unshredded (or which has none) is returned untouched.
-pub(super) fn unshred_batch(batch: RecordBatch) -> WriteResult<RecordBatch> {
+pub(crate) fn unshred_batch(batch: RecordBatch) -> WriteResult<RecordBatch> {
     map_variant_columns(batch, |array| {
         // Already the plain pair: nothing to fold, and rebuilding it would copy
         // every document for nothing. This is the ingest path.

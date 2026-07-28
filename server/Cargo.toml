@@ -45,6 +45,8 @@ path = "src/main.rs"
 tokio-postgres = { workspace = true }
 tempfile = { workspace = true }
 parquet = { workspace = true }
+# The variant end-to-end test builds the documents it loads.
+parquet-variant-compute = { workspace = true }
 core_affinity = { workspace = true }
 rstest = { workspace = true }
 # Pull catalog's `test_support` (MinIO / fake-gcs object-store harness) in for
