@@ -4,7 +4,7 @@ use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use crate::types::Type;
 use arrow_array::cast::AsArray;
-use arrow_array::types::Int64Type;
+use arrow_array::types::{Date32Type, Int64Type};
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::DataType;
 use std::fmt::{self, Display};
@@ -162,9 +162,12 @@ impl DatePartKind {
 /// SQL `extract(<part> FROM source)` — a timestamp field accessor. DuckDB
 /// lowers each part to a scalar function (`minute`, `year`, …); a timestamp is
 /// stored as Int64 epoch *seconds* (see [`Type::Timestamp`]), so every part is
-/// a pure integer computation. See its compile impl.
+/// a pure integer computation. A `DATE` source (see [`Type::Date`]) stores days
+/// instead, and is scaled to those seconds before the parts are read. See its
+/// compile impl.
 ///
 /// [`Type::Timestamp`]: crate::types::Type::Timestamp
+/// [`Type::Date`]: crate::types::Type::Date
 #[derive(Debug, Clone)]
 pub struct DatePart {
     pub kind: DatePartKind,
@@ -191,8 +194,20 @@ impl DatePart {
             Box::new(move |batch: &RecordBatch| {
                 let src = source_expr(batch);
                 let (arr, _) = src.as_datum().get();
-                let i64arr = arrow::compute::cast(arr, &DataType::Int64).unwrap();
-                let vals = i64arr.as_primitive::<Int64Type>();
+                // A DATE column stores whole days since the epoch, so scale it to
+                // the epoch seconds every arm below computes on. The time-of-day
+                // parts of a date then read as midnight, which is what DuckDB
+                // returns for them.
+                let seconds: Int64Array = match arr.data_type() {
+                    DataType::Date32 => arr
+                        .as_primitive::<Date32Type>()
+                        .unary(|days: i32| i64::from(days) * SECS_PER_DAY),
+                    _ => arrow::compute::cast(arr, &DataType::Int64)
+                        .unwrap()
+                        .as_primitive::<Int64Type>()
+                        .clone(),
+                };
+                let vals = &seconds;
                 // Dispatch on the part ONCE per batch, then run a single
                 // monomorphic, branch-free row loop per arm — so e.g. `minute`
                 // compiles to exactly its two-op loop with no per-row `kind`
@@ -245,9 +260,36 @@ impl DatePart {
 mod tests {
     use crate::test_support::*;
     use crate::types::Type;
-    use arrow_array::{ArrayRef, Int64Array};
+    use arrow_array::{ArrayRef, Int32Array, Int64Array};
     use rstest::rstest;
     use std::sync::Arc;
+
+    #[rstest]
+    fn extracts_the_calendar_parts_of_a_date(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "orders",
+            &[(
+                "o_orderdate",
+                Type::Date,
+                // 9204 days after the epoch is 1995-03-15.
+                Arc::new(Int32Array::from(vec![9204i32])) as ArrayRef,
+            )],
+        );
+
+        let rows = run(
+            &mut testing_planner,
+            "SELECT extract(year FROM o_orderdate) AS y, \
+                    extract(month FROM o_orderdate) AS m, \
+                    extract(day FROM o_orderdate) AS d, \
+                    extract(hour FROM o_orderdate) AS h \
+             FROM orders",
+        );
+
+        assert_eq!(rows[0]["y"], 1995);
+        assert_eq!(rows[0]["m"], 3);
+        assert_eq!(rows[0]["d"], 15);
+        assert_eq!(rows[0]["h"], 0);
+    }
 
     #[rstest]
     fn extracts_year(mut testing_planner: TestingPlanner) {
