@@ -33,7 +33,15 @@ pub trait ScatterRows<KP: PersistedKey, V: AggregationValue>: Send {
 
     /// The shared row-layout snapshot for `ctx`'s signature (see
     /// [`Geometry`](Self::Geometry)).
-    fn geometry(ctx: &V::SharedContext) -> Self::Geometry;
+    fn geometry(ctx: &V::SharedContext) -> Self::Geometry {
+        Self::geometry_with_meta(V::stored_meta(ctx))
+    }
+
+    /// The row-layout snapshot for a caller-supplied `meta`. An
+    /// arity-specialised scatter loop (see
+    /// [`AggregationValue::dispatch_arity`]) passes its const arity here so
+    /// the row offsets and stride constant-fold.
+    fn geometry_with_meta(meta: V::StoredMeta) -> Self::Geometry;
 
     /// Number of rows appended.
     fn len(&self) -> usize;
@@ -79,7 +87,7 @@ impl<KP: PersistedKey, V: AggregationValue<Stored = V>> ScatterRows<KP, V>
         Self(SlabVec::new())
     }
 
-    fn geometry(_ctx: &V::SharedContext) {}
+    fn geometry_with_meta(_meta: V::StoredMeta) {}
 
     fn len(&self) -> usize {
         self.0.len()
@@ -213,8 +221,7 @@ impl<KP: PersistedKey, V: AggregationValue> ScatterRows<KP, V> for StridedScatte
         }
     }
 
-    fn geometry(ctx: &V::SharedContext) -> ScatterGeometry<V> {
-        let meta = V::stored_meta(ctx);
+    fn geometry_with_meta(meta: V::StoredMeta) -> ScatterGeometry<V> {
         let layout = entry_layout::<KP, V>(meta);
         let full_chunk_rows = (Self::CHUNK_BYTES / layout.stride).max(1);
         ScatterGeometry {

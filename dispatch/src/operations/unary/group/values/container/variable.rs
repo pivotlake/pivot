@@ -24,7 +24,7 @@
 //! copied out via [`to_owned`](AggregationValue::to_owned).
 
 use super::super::cell::{F64Cell, IntCell, StringCell, WideCell};
-use super::super::{AggregationSlot, AggregationValue, SharedContext, ValueColumns};
+use super::super::{AggregationSlot, AggregationValue, ArityBody, SharedContext, ValueColumns};
 use super::dynamic::{BoundSlot, finish_slot, merge_slot, seed_slot, update_slot};
 use crate::arrays::SlabColumn;
 use crate::memory::SlabAllocator;
@@ -168,6 +168,25 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool> Ag
 
     fn stored_meta(ctx: &Self::SharedContext) -> usize {
         ctx.0.len()
+    }
+
+    fn const_meta<const N: usize>() -> usize {
+        N
+    }
+
+    #[inline(always)]
+    fn dispatch_arity<R>(meta: usize, body: impl ArityBody<R>) -> R {
+        // The specialised counts match the per-fold dispatch (see
+        // `seed_stored`): each arm instantiates the caller's whole loop body,
+        // so covering rare wide signatures would multiply generated code for
+        // shapes that see little data.
+        match meta {
+            1 => body.run::<1>(),
+            2 => body.run::<2>(),
+            3 => body.run::<3>(),
+            4 => body.run::<4>(),
+            _ => body.run::<0>(),
+        }
     }
 
     fn stored_size(meta: usize) -> usize {

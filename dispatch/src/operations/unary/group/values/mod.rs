@@ -260,6 +260,17 @@ pub trait OwnedValue: Copy + Default + Send + Sync + 'static {
     fn sort_key(&self, slot: usize) -> Self::SortKey;
 }
 
+/// A hot-loop body instantiated per compile-time arity `N` by
+/// [`AggregationValue::dispatch_arity`]. `N == 0` is the fallback
+/// instantiation, which must take the arity off the runtime metadata; any
+/// other `N` promises the signature holds exactly `N` slots, so the body can
+/// derive the entry layout from `N` and have it constant-fold (the stride
+/// multiply strength-reduces, per-slot folds unroll, readers stay in
+/// registers).
+pub trait ArityBody<R> {
+    fn run<const N: usize>(self) -> R;
+}
+
 /// The per-group aggregation value as the GROUP BY operator sees it: read from
 /// input rows, folded *in place* inside a hash-table entry, and emitted as the
 /// result's value columns.
@@ -313,6 +324,20 @@ pub trait AggregationValue: Copy + Default + Send + Sync + 'static {
     /// The runtime metadata for this query's signature, read off the shared
     /// context once per table.
     fn stored_meta(ctx: &Self::SharedContext) -> Self::StoredMeta;
+
+    /// The stored metadata for a compile-time arity `N` — what a body
+    /// instantiated through [`dispatch_arity`](Self::dispatch_arity) passes to
+    /// the layout and view functions so the compiler sees the arity as a
+    /// constant. `()` for a fixed-arity value, whose layout never depended on
+    /// `N` in the first place.
+    fn const_meta<const N: usize>() -> Self::StoredMeta;
+
+    /// Run `body` with the signature's slot count as a compile-time constant
+    /// when it is one of the specialised counts, else as the `N == 0` runtime
+    /// fallback. A per-row loop dispatched here once per window compiles per
+    /// common arity with the entry layout constant, instead of paying
+    /// runtime-layout arithmetic on every row.
+    fn dispatch_arity<R>(meta: Self::StoredMeta, body: impl ArityBody<R>) -> R;
 
     /// The byte size of one stored value.
     fn stored_size(meta: Self::StoredMeta) -> usize;
@@ -393,6 +418,15 @@ impl<T: OwnedValue> AggregationValue for T {
     }
 
     fn stored_meta(_ctx: &Self::SharedContext) {}
+
+    fn const_meta<const N: usize>() {}
+
+    #[inline(always)]
+    fn dispatch_arity<R>(_meta: (), body: impl ArityBody<R>) -> R {
+        // A fixed-arity value's layout is fully known to the compiler in every
+        // instantiation, so the fallback body already constant-folds.
+        body.run::<0>()
+    }
 
     fn stored_size(_meta: ()) -> usize {
         size_of::<T>()

@@ -37,6 +37,7 @@ use crate::operations::unary::group::hashtables::{
     AggregationValue, DEFAULT_CAPACITY, KeyExtractor, MAX_LOAD_FACTOR, MultiSlabTable,
     PersistedKey, Prober, ScatterRows,
 };
+use crate::operations::unary::group::values::ArityBody;
 
 /// Collision-to-entry ratio at which we double the target table.
 ///
@@ -78,7 +79,7 @@ fn resize_if_needed<K: KeyExtractor, V: AggregationValue>(
 /// we round-robin through the source tables, the target region stays in
 /// cache. Each batch also prefetches [`PREFETCH_DISTANCE`] slots ahead.
 #[allow(clippy::too_many_arguments)]
-fn merge_within_partition_bounds<K: KeyExtractor, V: AggregationValue>(
+fn merge_within_partition_bounds<const N: usize, K: KeyExtractor, V: AggregationValue>(
     allocator: &mut SlabAllocator,
     arena: &SharedArena,
     partition: usize,
@@ -98,8 +99,13 @@ fn merge_within_partition_bounds<K: KeyExtractor, V: AggregationValue>(
 
         for table in tables {
             // The scan touches `range` consecutive slots; read them through
-            // one geometry snapshot so the source layout stays in registers.
-            let source = table.reader();
+            // one geometry snapshot so the source layout stays in registers
+            // (constant-folded when `N` is a specialised arity).
+            let source = if N == 0 {
+                table.reader()
+            } else {
+                table.reader_with_meta(V::const_meta::<N>())
+            };
             for j in i..i + range {
                 if j + PREFETCH_DISTANCE < slot_count {
                     // Prefetch unconditionally: `slot_for(0)` is a valid slot and
@@ -136,7 +142,7 @@ fn merge_within_partition_bounds<K: KeyExtractor, V: AggregationValue>(
 /// partition this means wrapping around to slot 0. We follow each source
 /// table's probe chain until hitting an empty slot (`hash == 0`).
 #[allow(clippy::too_many_arguments)]
-fn merge_past_partition_bounds<K: KeyExtractor, V: AggregationValue>(
+fn merge_past_partition_bounds<const N: usize, K: KeyExtractor, V: AggregationValue>(
     allocator: &mut SlabAllocator,
     arena: &SharedArena,
     partition: usize,
@@ -151,7 +157,11 @@ fn merge_past_partition_bounds<K: KeyExtractor, V: AggregationValue>(
     let mask = slot_count - 1;
 
     for table in tables {
-        let source = table.reader();
+        let source = if N == 0 {
+            table.reader()
+        } else {
+            table.reader_with_meta(V::const_meta::<N>())
+        };
         let mut i = end & mask;
         loop {
             let entry = source.view_at(i);
@@ -175,7 +185,7 @@ fn merge_past_partition_bounds<K: KeyExtractor, V: AggregationValue>(
 
 /// Merge entries from `tables` that belong to `partition` into `target`.
 #[allow(clippy::too_many_arguments)]
-fn merge_into_partition<K: KeyExtractor, V: AggregationValue>(
+fn merge_into_partition<const N: usize, K: KeyExtractor, V: AggregationValue>(
     allocator: &mut SlabAllocator,
     arena: &SharedArena,
     partition: usize,
@@ -185,7 +195,7 @@ fn merge_into_partition<K: KeyExtractor, V: AggregationValue>(
     partition_bits: u32,
     cfg: &V::SharedContext,
 ) {
-    merge_within_partition_bounds::<K, V>(
+    merge_within_partition_bounds::<N, K, V>(
         allocator,
         arena,
         partition,
@@ -195,7 +205,7 @@ fn merge_into_partition<K: KeyExtractor, V: AggregationValue>(
         partition_bits,
         cfg,
     );
-    merge_past_partition_bounds::<K, V>(
+    merge_past_partition_bounds::<N, K, V>(
         allocator,
         arena,
         partition,
@@ -226,106 +236,159 @@ pub(super) fn merge_combined<K: KeyExtractor, V: AggregationValue>(
     key_arena: &SharedArena,
     cfg: &V::SharedContext,
 ) -> MultiSlabTable<K, V> {
-    let partition_bits = num_partitions.trailing_zeros();
-    let mut allocator = SlabAllocator::new(true);
-    let mut cap = partition_capacity.max(DEFAULT_CAPACITY);
-    let mut result: MultiSlabTable<K, V> =
-        <MultiSlabTable<K, V>>::new(&mut allocator, cap, partition_bits, cfg);
-    // One geometry snapshot for the whole partition job: the scatter fold and
-    // the slot-range merges below probe the target once per row/entry, and a
-    // per-call snapshot would be paid on each. Resizes go through the prober,
-    // which re-snapshots.
-    let mut target = result.prober();
+    // The whole partition job runs through one arity-specialised body: every
+    // per-row/per-entry loop in it (scatter fold, slot-range scans, target
+    // probes) then works on a constant entry layout for a runtime-arity
+    // signature, as it always did for a fixed-arity one.
+    V::dispatch_arity(
+        V::stored_meta(cfg),
+        MergeCombined {
+            partition,
+            buffers,
+            tables,
+            partition_capacity,
+            num_partitions,
+            key_arena,
+            cfg,
+        },
+    )
+}
 
-    // 1. Scatter buffers (present only when some worker switched). Each row is
-    //    inserted once — the consume phase did no aggregation, so this is the only
-    //    aggregation pass for the scattered rows. The compare inside `merge` chases
-    //    the scattered row's string blob, which has no locality (rows land here in
-    //    scatter order, not by key), so it misses cold. Warm it a window ahead off
-    //    the handle in hand, and warm the target slot it will probe. (The target's
-    //    own blob is left alone: hot keys repeat, so resident entries stay warm.)
-    const SCATTER_PREFETCH_AHEAD: usize = 16;
-    // The scatter-merge prefetch only pays off when its reads are genuinely cold:
-    // the target slot is worth prefetching only when the per-partition target is
-    // too large to stay cache-resident (high cardinality), and a string key's
-    // arena blob is cold regardless. For a fixed-width key with a small (cache-hot)
-    // target the prefetch is pure overhead (it chases slots already resident), so
-    // scan plainly there.
-    const TARGET_PREFETCH_MIN_SLOTS: usize = 16384;
-    let merge_prefetch =
-        <K::Persisted as PersistedKey>::HAS_BLOB || cap > TARGET_PREFETCH_MIN_SLOTS;
-    // `num_partitions` may be coarser than the scatter bucket count: at moderate
-    // cardinality the output sizes the merge from the exact HLL estimate so each
-    // job folds a contiguous *range* of scatter buckets (a `PARTITIONS`-way merge
-    // rather than a `RADIX_PARTITIONS`-way one), avoiding thousands of tiny merge
-    // jobs. The range is contiguous because buckets and partitions both key on the
-    // top hash bits; `stride == 1` (one bucket per partition) at high cardinality.
-    let scatter_buckets = buffers.first().map_or(num_partitions, |b| b.0.len());
-    // The fold below visits buckets `[0, num_partitions * stride)`; for that to be
-    // every bucket, `num_partitions` must divide `scatter_buckets` evenly. Both are
-    // powers of two with `num_partitions <= scatter_buckets`, so it holds. A count
-    // that didn't divide would silently drop the tail buckets' rows, so guard it.
-    debug_assert!(
-        scatter_buckets.is_multiple_of(num_partitions),
-        "merge partitions ({num_partitions}) must evenly divide scatter buckets ({scatter_buckets})"
-    );
-    let stride = (scatter_buckets / num_partitions).max(1);
-    let bucket_lo = partition * stride;
-    let bucket_hi = bucket_lo + stride;
-    // One row-layout snapshot for every bucket this job folds.
-    let geo = <V::Scatter<<K as KeyExtractor>::Persisted> as ScatterRows<_, V>>::geometry(cfg);
-    for wb in buffers {
-        for bucket in bucket_lo..bucket_hi {
-            if merge_prefetch {
-                wb.0[bucket].for_each_prefetched::<SCATTER_PREFETCH_AHEAD>(
-                    geo,
-                    |hash, key, stored, ahead| {
-                        if let Some((ahead_hash, ahead_key)) = ahead {
-                            ahead_key.prefetch_blob(key_arena);
-                            target.prefetch(ahead_hash);
-                        }
+/// The body of [`merge_combined`], as an [`ArityBody`] (see there).
+struct MergeCombined<'a, K: KeyExtractor, V: AggregationValue> {
+    partition: usize,
+    buffers: &'a [PartitionBuffers<K, V>],
+    tables: &'a [MultiSlabTable<K, V>],
+    partition_capacity: usize,
+    num_partitions: usize,
+    key_arena: &'a SharedArena,
+    cfg: &'a V::SharedContext,
+}
+
+impl<K: KeyExtractor, V: AggregationValue> ArityBody<MultiSlabTable<K, V>>
+    for MergeCombined<'_, K, V>
+{
+    fn run<const N: usize>(self) -> MultiSlabTable<K, V> {
+        let MergeCombined {
+            partition,
+            buffers,
+            tables,
+            partition_capacity,
+            num_partitions,
+            key_arena,
+            cfg,
+        } = self;
+        let partition_bits = num_partitions.trailing_zeros();
+        let mut allocator = SlabAllocator::new(true);
+        let mut cap = partition_capacity.max(DEFAULT_CAPACITY);
+        let mut result: MultiSlabTable<K, V> =
+            <MultiSlabTable<K, V>>::new(&mut allocator, cap, partition_bits, cfg);
+        // One geometry snapshot for the whole partition job: the scatter fold and
+        // the slot-range merges below probe the target once per row/entry, and a
+        // per-call snapshot would be paid on each. Resizes go through the prober,
+        // which re-snapshots.
+        let mut target = if N == 0 {
+            result.prober()
+        } else {
+            result.prober_with_meta(V::const_meta::<N>())
+        };
+
+        // 1. Scatter buffers (present only when some worker switched). Each row is
+        //    inserted once — the consume phase did no aggregation, so this is the only
+        //    aggregation pass for the scattered rows. The compare inside `merge` chases
+        //    the scattered row's string blob, which has no locality (rows land here in
+        //    scatter order, not by key), so it misses cold. Warm it a window ahead off
+        //    the handle in hand, and warm the target slot it will probe. (The target's
+        //    own blob is left alone: hot keys repeat, so resident entries stay warm.)
+        const SCATTER_PREFETCH_AHEAD: usize = 16;
+        // The scatter-merge prefetch only pays off when its reads are genuinely cold:
+        // the target slot is worth prefetching only when the per-partition target is
+        // too large to stay cache-resident (high cardinality), and a string key's
+        // arena blob is cold regardless. For a fixed-width key with a small (cache-hot)
+        // target the prefetch is pure overhead (it chases slots already resident), so
+        // scan plainly there.
+        const TARGET_PREFETCH_MIN_SLOTS: usize = 16384;
+        let merge_prefetch =
+            <K::Persisted as PersistedKey>::HAS_BLOB || cap > TARGET_PREFETCH_MIN_SLOTS;
+        // `num_partitions` may be coarser than the scatter bucket count: at moderate
+        // cardinality the output sizes the merge from the exact HLL estimate so each
+        // job folds a contiguous *range* of scatter buckets (a `PARTITIONS`-way merge
+        // rather than a `RADIX_PARTITIONS`-way one), avoiding thousands of tiny merge
+        // jobs. The range is contiguous because buckets and partitions both key on the
+        // top hash bits; `stride == 1` (one bucket per partition) at high cardinality.
+        let scatter_buckets = buffers.first().map_or(num_partitions, |b| b.0.len());
+        // The fold below visits buckets `[0, num_partitions * stride)`; for that to be
+        // every bucket, `num_partitions` must divide `scatter_buckets` evenly. Both are
+        // powers of two with `num_partitions <= scatter_buckets`, so it holds. A count
+        // that didn't divide would silently drop the tail buckets' rows, so guard it.
+        debug_assert!(
+            scatter_buckets.is_multiple_of(num_partitions),
+            "merge partitions ({num_partitions}) must evenly divide scatter buckets ({scatter_buckets})"
+        );
+        let stride = (scatter_buckets / num_partitions).max(1);
+        let bucket_lo = partition * stride;
+        let bucket_hi = bucket_lo + stride;
+        // One row-layout snapshot for every bucket this job folds.
+        let geo = if N == 0 {
+            <V::Scatter<<K as KeyExtractor>::Persisted> as ScatterRows<_, V>>::geometry(cfg)
+        } else {
+            <V::Scatter<<K as KeyExtractor>::Persisted> as ScatterRows<_, V>>::geometry_with_meta(
+                V::const_meta::<N>(),
+            )
+        };
+        for wb in buffers {
+            for bucket in bucket_lo..bucket_hi {
+                if merge_prefetch {
+                    wb.0[bucket].for_each_prefetched::<SCATTER_PREFETCH_AHEAD>(
+                        geo,
+                        |hash, key, stored, ahead| {
+                            if let Some((ahead_hash, ahead_key)) = ahead {
+                                ahead_key.prefetch_blob(key_arena);
+                                target.prefetch(ahead_hash);
+                            }
+                            target.grow_if_full(&mut allocator, &mut cap);
+                            let live = K::resolve_persisted(key_arena, *key);
+                            target.merge_from::<false, _>(hash, live, stored, cfg);
+                        },
+                    );
+                } else {
+                    wb.0[bucket].for_each(geo, |hash, key, stored| {
                         target.grow_if_full(&mut allocator, &mut cap);
                         let live = K::resolve_persisted(key_arena, *key);
                         target.merge_from::<false, _>(hash, live, stored, cfg);
-                    },
-                );
-            } else {
-                wb.0[bucket].for_each(geo, |hash, key, stored| {
-                    target.grow_if_full(&mut allocator, &mut cap);
-                    let live = K::resolve_persisted(key_arena, *key);
-                    target.merge_from::<false, _>(hash, live, stored, cfg);
-                });
+                    });
+                }
             }
         }
-    }
 
-    // 2. In-place stacks, slot-range merged at num_partitions. Grouped by size so
-    //    same-sized tables walk in lockstep (shared slot range -> cache-hot target).
-    //    The within+past pair handles any size, including stacks smaller than
-    //    num_partitions (degenerate within-range, past picks up the spillover).
-    let mut by_size: Vec<(usize, Vec<&MultiSlabTable<K, V>>)> = Vec::new();
-    for table in tables {
-        let slot_count = table.capacity();
-        if let Some(group) = by_size.iter_mut().find(|(s, _)| *s == slot_count) {
-            group.1.push(table);
-        } else {
-            by_size.push((slot_count, vec![table]));
+        // 2. In-place stacks, slot-range merged at num_partitions. Grouped by size so
+        //    same-sized tables walk in lockstep (shared slot range -> cache-hot target).
+        //    The within+past pair handles any size, including stacks smaller than
+        //    num_partitions (degenerate within-range, past picks up the spillover).
+        let mut by_size: Vec<(usize, Vec<&MultiSlabTable<K, V>>)> = Vec::new();
+        for table in tables {
+            let slot_count = table.capacity();
+            if let Some(group) = by_size.iter_mut().find(|(s, _)| *s == slot_count) {
+                group.1.push(table);
+            } else {
+                by_size.push((slot_count, vec![table]));
+            }
         }
+        for (slot_count, group) in by_size.into_iter() {
+            merge_into_partition::<N, K, V>(
+                &mut allocator,
+                key_arena,
+                partition,
+                slot_count,
+                group,
+                &mut target,
+                partition_bits,
+                cfg,
+            );
+        }
+        // The prober's borrow of `result` ends at its last use above.
+        result
     }
-    for (slot_count, group) in by_size.into_iter() {
-        merge_into_partition::<K, V>(
-            &mut allocator,
-            key_arena,
-            partition,
-            slot_count,
-            group,
-            &mut target,
-            partition_bits,
-            cfg,
-        );
-    }
-    // The prober's borrow of `result` ends at its last use above.
-    result
 }
 /// Merge one partition's per-node aggregated tables into its final table.
 ///

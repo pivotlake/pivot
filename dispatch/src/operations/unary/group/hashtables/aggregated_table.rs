@@ -29,7 +29,7 @@ use crate::operations::unary::group::hashtables::{
     AggregationValue, DEFAULT_CAPACITY, KeyExtractor, LiveKey, MultiSlabTable, ScatterRows,
 };
 use crate::operations::unary::group::hll::Hll;
-use crate::operations::unary::group::values::{AggregationSlot, WorkerContext};
+use crate::operations::unary::group::values::{AggregationSlot, ArityBody, WorkerContext};
 use ahash::RandomState;
 use arrow_array::RecordBatch;
 use std::sync::Arc;
@@ -250,8 +250,9 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
     }
 
     /// Row-by-row probe, growing or abandoning the active table when it overflows
-    /// mid-batch. A two-level software prefetch (DRAM→L2 far, L2→L1 near) hides the
-    /// per-row probe latency on the large in-place tables this path handles.
+    /// mid-batch. The probe loop itself lives in [`ProbeWindow`], dispatched
+    /// through [`AggregationValue::dispatch_arity`] so a runtime-arity
+    /// signature's window compiles with its slot count as a constant.
     #[inline(always)]
     fn consume_scalared<'b>(
         &mut self,
@@ -260,13 +261,9 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
         value_reader: &V::Reader<'b>,
         shared_context: &V::SharedContext,
     ) {
-        const L1_DISTANCE: usize = 16;
-        const L2_DISTANCE: usize = 48;
+        let meta = V::stored_meta(shared_context);
         let mut i = 0;
         while i < length {
-            // Probe through one `Prober` until the active table overflows
-            // (rare), so its entry layout lives in registers across rows
-            // instead of being re-loaded per row and per probe step.
             let overflowed = {
                 let Self {
                     tables,
@@ -276,51 +273,21 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
                     zero_hash_seen,
                     ..
                 } = self;
-                let mut prober = tables.last_mut().unwrap().prober();
-                let mut overflowed = false;
-                while i < length {
-                    let hash = hashes[i];
-                    // Keys-only exact COUNT(DISTINCT): a 0 hash collides with the
-                    // empty-slot sentinel, so don't store it (the table would remap
-                    // it to 1 and alias a real key) — count it out of band instead.
-                    // At most one key hashes to 0 (the hash is a bijection), so the
-                    // flag adds 1 at output. Const-gated: zero cost for every other
-                    // group-by.
-                    if K::DEDUP_BY_HASH && hash == 0 {
-                        *zero_hash_seen = true;
-                        i += 1;
-                        continue;
-                    }
-                    if i + L2_DISTANCE < length {
-                        prober.prefetch_l2(hashes[i + L2_DISTANCE]);
-                    }
-                    if i + L1_DISTANCE < length {
-                        prober.prefetch(hashes[i + L1_DISTANCE]);
-                    }
-                    // Probe and fold in one pass. The live key persists into the key
-                    // arena; the value's write state (`&mut self.worker_context`) is
-                    // handed to whichever arm runs — `seed` materialises a new group's
-                    // value, `update` folds the row into an existing one (a string
-                    // extreme persists only if it wins). When `V::WorkerContext` is `()`
-                    // (a string-free `Compiled` signature) this threads `&mut ()` —
-                    // free, with nothing in the loop that can alias the table it
-                    // mutates; a string extreme threads its `WorkerArena` to store the
-                    // winning string.
-                    let key = K::live_key(key_reader, i, key_arena);
-                    prober.probe_fold::<false, _, _, _, _>(
-                        hash,
-                        key,
-                        &mut *worker_context,
-                        |wc, stored| V::seed_stored(stored, value_reader, i, wc),
-                        |wc, stored| V::update_stored(stored, value_reader, i, wc, shared_context),
-                    );
-                    i += 1;
-                    if prober.undersized() {
-                        overflowed = true;
-                        break;
-                    }
-                }
-                overflowed
+                V::dispatch_arity(
+                    meta,
+                    ProbeWindow::<K, V> {
+                        table: tables.last_mut().unwrap(),
+                        key_arena,
+                        worker_context,
+                        hashes,
+                        zero_hash_seen,
+                        i: &mut i,
+                        length,
+                        key_reader,
+                        value_reader,
+                        shared_context,
+                    },
+                )
             };
             // On overflow take the radix route. For a scatter-route key this returns
             // `true`: scatter the rest of the batch raw (the overflowing row is
@@ -378,12 +345,12 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
     /// the radix route for fixed-width keys: a cheap append (no probe, no per-row
     /// dedup), with deduplication deferred to the merge.
     #[inline(always)]
-    fn scatter_range(
+    fn scatter_range<'b>(
         &mut self,
         start: usize,
         end: usize,
-        key_reader: &K::Reader<'_>,
-        value_reader: &V::Reader<'_>,
+        key_reader: &K::Reader<'b>,
+        value_reader: &V::Reader<'b>,
     ) {
         let shift = u64::BITS - self.radix_cfg.partitions.trailing_zeros();
         let Self {
@@ -396,23 +363,23 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
             shared_context,
             ..
         } = self;
-        let buffers = buffers.as_mut().unwrap();
-        // One layout snapshot for the whole range: every partition's buffer
-        // shares it, and rows alternate buffers, so buffer-resident layout
-        // state would multiply into a cache-hostile working set.
-        let geo = V::Scatter::<<K as KeyExtractor>::Persisted>::geometry(shared_context);
-        for i in start..end {
-            let hash = hashes[i];
-            hll.add(hash);
-            let p = (hash >> shift) as usize;
-            let key = K::live_key(key_reader, i, key_arena).persist();
-            // The row's value is seeded straight into the scatter row, so a
-            // runtime-arity signature's cells land inline with no per-row
-            // allocation.
-            buffers[p].push_with(geo, allocator, hash, key, |stored| {
-                V::seed_stored(stored, value_reader, i, worker_context)
-            });
-        }
+        V::dispatch_arity(
+            V::stored_meta(shared_context),
+            ScatterWindow::<K, V> {
+                buffers: buffers.as_mut().unwrap(),
+                key_arena,
+                worker_context,
+                allocator,
+                hll,
+                hashes,
+                shift,
+                start,
+                end,
+                key_reader,
+                value_reader,
+                shared_context,
+            },
+        );
     }
 
     /// Drain the active table's aggregated entries into the per-partition scatter
@@ -469,6 +436,165 @@ impl<K: KeyExtractor, V: AggregationValue> AggregatedTable<K, V> {
             buffers: self.buffers.map(PartitionBuffers),
             hll: self.hll,
             zero_hash_seen: self.zero_hash_seen,
+        }
+    }
+}
+
+/// One consume window's probe-and-fold loop over rows `[*i, length)` of the
+/// active table, as an [`ArityBody`]: `consume_scalared` dispatches it through
+/// [`AggregationValue::dispatch_arity`], so for a runtime-arity signature the
+/// whole loop is instantiated with the slot count `N` as a constant — the
+/// entry layout (recomputed from `N`) folds, the per-slot folds unroll, and
+/// the reader payloads stay in registers, exactly as they did for a
+/// compile-time entry struct. `N == 0` runs the same loop with the table's
+/// runtime layout.
+///
+/// A two-level software prefetch (DRAM→L2 far, L2→L1 near) hides the per-row
+/// probe latency on the large in-place tables this path handles.
+///
+/// Returns whether the active table overflowed, leaving `*i` at the first
+/// unconsumed row.
+struct ProbeWindow<'a, 'b, K: KeyExtractor, V: AggregationValue> {
+    table: &'a mut MultiSlabTable<K, V>,
+    key_arena: &'a mut WorkerArena,
+    worker_context: &'a mut V::WorkerContext,
+    hashes: &'a [u64; RECORD_BATCH_SIZE],
+    zero_hash_seen: &'a mut bool,
+    i: &'a mut usize,
+    length: usize,
+    key_reader: &'a K::Reader<'b>,
+    value_reader: &'a V::Reader<'b>,
+    shared_context: &'a V::SharedContext,
+}
+
+impl<K: KeyExtractor, V: AggregationValue> ArityBody<bool> for ProbeWindow<'_, '_, K, V> {
+    #[inline(always)]
+    fn run<const N: usize>(self) -> bool {
+        const L1_DISTANCE: usize = 16;
+        const L2_DISTANCE: usize = 48;
+        let ProbeWindow {
+            table,
+            key_arena,
+            worker_context,
+            hashes,
+            zero_hash_seen,
+            i,
+            length,
+            key_reader,
+            value_reader,
+            shared_context,
+        } = self;
+        // Probe through one `Prober` for the whole window, so the entry layout
+        // lives in registers across rows instead of being re-loaded per row
+        // and per probe step.
+        let mut prober = if N == 0 {
+            table.prober()
+        } else {
+            table.prober_with_meta(V::const_meta::<N>())
+        };
+        let mut row = *i;
+        let mut overflowed = false;
+        while row < length {
+            let hash = hashes[row];
+            // Keys-only exact COUNT(DISTINCT): a 0 hash collides with the
+            // empty-slot sentinel, so don't store it (the table would remap
+            // it to 1 and alias a real key) — count it out of band instead.
+            // At most one key hashes to 0 (the hash is a bijection), so the
+            // flag adds 1 at output. Const-gated: zero cost for every other
+            // group-by.
+            if K::DEDUP_BY_HASH && hash == 0 {
+                *zero_hash_seen = true;
+                row += 1;
+                continue;
+            }
+            if row + L2_DISTANCE < length {
+                prober.prefetch_l2(hashes[row + L2_DISTANCE]);
+            }
+            if row + L1_DISTANCE < length {
+                prober.prefetch(hashes[row + L1_DISTANCE]);
+            }
+            // Probe and fold in one pass. The live key persists into the key
+            // arena; the value's write state (`&mut self.worker_context`) is
+            // handed to whichever arm runs — `seed` materialises a new group's
+            // value, `update` folds the row into an existing one (a string
+            // extreme persists only if it wins). When `V::WorkerContext` is `()`
+            // (a string-free `Compiled` signature) this threads `&mut ()` —
+            // free, with nothing in the loop that can alias the table it
+            // mutates; a string extreme threads its `WorkerArena` to store the
+            // winning string.
+            let key = K::live_key(key_reader, row, key_arena);
+            prober.probe_fold::<false, _, _, _, _>(
+                hash,
+                key,
+                &mut *worker_context,
+                |wc, stored| V::seed_stored(stored, value_reader, row, wc),
+                |wc, stored| V::update_stored(stored, value_reader, row, wc, shared_context),
+            );
+            row += 1;
+            if prober.undersized() {
+                overflowed = true;
+                break;
+            }
+        }
+        *i = row;
+        overflowed
+    }
+}
+
+/// The radix scatter loop over rows `[start, end)`, as an [`ArityBody`] for
+/// the same reason as [`ProbeWindow`]: with the slot count a constant, the
+/// scatter row layout folds and the per-row seed unrolls.
+struct ScatterWindow<'a, 'b, K: KeyExtractor, V: AggregationValue> {
+    buffers: &'a mut Vec<<V as AggregationValue>::Scatter<<K as KeyExtractor>::Persisted>>,
+    key_arena: &'a mut WorkerArena,
+    worker_context: &'a mut V::WorkerContext,
+    allocator: &'a mut SlabAllocator,
+    hll: &'a mut Hll,
+    hashes: &'a [u64; RECORD_BATCH_SIZE],
+    shift: u32,
+    start: usize,
+    end: usize,
+    key_reader: &'a K::Reader<'b>,
+    value_reader: &'a V::Reader<'b>,
+    shared_context: &'a V::SharedContext,
+}
+
+impl<K: KeyExtractor, V: AggregationValue> ArityBody<()> for ScatterWindow<'_, '_, K, V> {
+    #[inline(always)]
+    fn run<const N: usize>(self) {
+        let ScatterWindow {
+            buffers,
+            key_arena,
+            worker_context,
+            allocator,
+            hll,
+            hashes,
+            shift,
+            start,
+            end,
+            key_reader,
+            value_reader,
+            shared_context,
+        } = self;
+        // One layout snapshot for the whole range: every partition's buffer
+        // shares it, and rows alternate buffers, so buffer-resident layout
+        // state would multiply into a cache-hostile working set.
+        let geo = if N == 0 {
+            V::Scatter::<<K as KeyExtractor>::Persisted>::geometry(shared_context)
+        } else {
+            V::Scatter::<<K as KeyExtractor>::Persisted>::geometry_with_meta(V::const_meta::<N>())
+        };
+        for i in start..end {
+            let hash = hashes[i];
+            hll.add(hash);
+            let p = (hash >> shift) as usize;
+            let key = K::live_key(key_reader, i, key_arena).persist();
+            // The row's value is seeded straight into the scatter row, so a
+            // runtime-arity signature's cells land inline with no per-row
+            // allocation.
+            buffers[p].push_with(geo, allocator, hash, key, |stored| {
+                V::seed_stored(stored, value_reader, i, worker_context)
+            });
         }
     }
 }

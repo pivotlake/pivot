@@ -144,8 +144,21 @@ pub(super) fn entry_layout<K, V: AggregationValue>(meta: V::StoredMeta) -> Entry
         (align_of::<K>(), size_of::<K>()),
         (V::stored_align(meta), V::stored_size(meta)),
     ];
+    // Stable descending-alignment order via a fixed compare network (bubble
+    // passes swap only on strictly-greater, so ties keep field order). Written
+    // out rather than `sort_by_key` so the whole layout constant-folds when
+    // `meta` is a compile-time constant (see
+    // [`AggregationValue::dispatch_arity`]); a sort call would not.
     let mut order = [0usize, 1, 2];
-    order.sort_by_key(|&f| std::cmp::Reverse(fields[f].0));
+    if fields[order[1]].0 > fields[order[0]].0 {
+        order.swap(0, 1);
+    }
+    if fields[order[2]].0 > fields[order[1]].0 {
+        order.swap(1, 2);
+    }
+    if fields[order[1]].0 > fields[order[0]].0 {
+        order.swap(0, 1);
+    }
     let mut offsets = [0usize; 3];
     let mut cursor = 0;
     for &f in &order {
@@ -332,8 +345,6 @@ pub struct BaseHashTable<K: PersistedKey, V: AggregationValue> {
     /// Bytes per entry; see the layout docs above.
     stride: usize,
     hash_offset: usize,
-    key_offset: usize,
-    value_offset: usize,
     /// Strictest field alignment, for allocating replacement slabs on resize.
     align: usize,
     /// The value's runtime view metadata (slot count for a runtime-arity
@@ -378,8 +389,6 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
             entries_per_slab_magic: reciprocal(entries_per_slab as u64),
             stride: layout.stride,
             hash_offset: layout.hash_offset,
-            key_offset: layout.key_offset,
-            value_offset: layout.value_offset,
             align: layout.align,
             meta,
             bases: adjusted_bases(&slabs, entries_per_slab, layout.stride),
@@ -462,19 +471,35 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
     /// parameters (see [`Geometry`]).
     #[inline(always)]
     fn geometry(&self) -> Geometry<K, V> {
+        self.geometry_with_meta(self.meta)
+    }
+
+    /// The [`Geometry`] snapshot with its layout *recomputed* from `meta`
+    /// rather than read off the table's fields. When the call site holds
+    /// `meta` as a compile-time constant (a fixed-arity value's `()`, or a
+    /// const arity from [`AggregationValue::dispatch_arity`]), the entire
+    /// layout half of the snapshot constant-folds: the stride multiply in
+    /// [`entry_ptr`](Geometry::entry_ptr) strength-reduces and the field
+    /// offsets become immediates, as they were for a compile-time entry
+    /// struct. Must describe the layout the table was built with.
+    #[inline(always)]
+    fn geometry_with_meta(&self, meta: V::StoredMeta) -> Geometry<K, V> {
+        let layout = entry_layout::<K, V>(meta);
+        debug_assert_eq!(layout.stride, self.stride);
+        let entries_per_slab = BUFFER_SIZE / layout.stride;
         Geometry {
-            magic: self.entries_per_slab_magic,
-            stride: self.stride,
-            hash_offset: self.hash_offset,
-            key_offset: self.key_offset,
-            value_offset: self.value_offset,
+            magic: reciprocal(entries_per_slab as u64),
+            stride: layout.stride,
+            hash_offset: layout.hash_offset,
+            key_offset: layout.key_offset,
+            value_offset: layout.value_offset,
             mask: self.mask,
             shift: self.shift,
             pre_shift: self.pre_shift,
             bases: self.bases.as_ptr(),
             bases_len: self.bases.len(),
             first_base: self.bases[0],
-            meta: self.meta,
+            meta,
             _phantom: PhantomData,
         }
     }
@@ -484,7 +509,16 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
     /// constants from registers (see [`Prober`]).
     #[inline(always)]
     pub fn prober(&mut self) -> Prober<'_, K, V> {
-        let geo = self.geometry();
+        self.prober_with_meta(self.meta)
+    }
+
+    /// A prober whose geometry derives from a caller-supplied `meta` (see
+    /// [`geometry_with_meta`](Self::geometry_with_meta)): the entry point for
+    /// arity-specialised loop bodies, which pass the const arity so the
+    /// layout folds.
+    #[inline(always)]
+    pub fn prober_with_meta(&mut self, meta: V::StoredMeta) -> Prober<'_, K, V> {
+        let geo = self.geometry_with_meta(meta);
         Prober { table: self, geo }
     }
 
@@ -492,8 +526,15 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
     /// merge phase's linear slot scans.
     #[inline(always)]
     pub fn reader(&self) -> TableReader<'_, K, V> {
+        self.reader_with_meta(self.meta)
+    }
+
+    /// [`reader`](Self::reader) with a caller-supplied `meta`; see
+    /// [`geometry_with_meta`](Self::geometry_with_meta).
+    #[inline(always)]
+    pub fn reader_with_meta(&self, meta: V::StoredMeta) -> TableReader<'_, K, V> {
         TableReader {
-            geo: self.geometry(),
+            geo: self.geometry_with_meta(meta),
             _table: PhantomData,
         }
     }
@@ -692,7 +733,11 @@ impl<K: PersistedKey, V: AggregationValue> Prober<'_, K, V> {
         if self.table.undersized() {
             *cap *= 4;
             self.table.resize(allocator, *cap);
-            self.geo = self.table.geometry();
+            // Re-derive from the prober's own meta, not the table fields: in an
+            // arity-specialised body the meta is a constant, and rebuilding the
+            // layout from it keeps it constant on both sides of this (rare)
+            // branch, so the per-row address arithmetic stays strength-reduced.
+            self.geo = self.table.geometry_with_meta(self.geo.meta);
         }
     }
 
@@ -705,7 +750,8 @@ impl<K: PersistedKey, V: AggregationValue> Prober<'_, K, V> {
         if self.table.collisions() > self.table.len() * collision_ratio {
             let new_size = self.table.capacity() << 1;
             self.table.resize(allocator, new_size);
-            self.geo = self.table.geometry();
+            // See `grow_if_full` for why this rebuilds from the prober's meta.
+            self.geo = self.table.geometry_with_meta(self.geo.meta);
         }
     }
 
