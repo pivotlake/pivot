@@ -3,7 +3,7 @@
 
 use super::{
     Arithmetic, Contains, DatePart, DateTrunc, Divide, IntervalArithmetic, Length, Prefix,
-    RegexpFullMatch, RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet, VariantToJson,
+    RegexpFullMatch, RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::expression::Expression;
@@ -97,9 +97,6 @@ pub enum Function {
     /// A variant (JSON) path read: `doc->'key'` chains, optionally typed by a
     /// fused `CAST`.
     VariantGet(VariantGet),
-    /// A variant value rendered as JSON text, wrapped around variant-typed
-    /// output columns by plan build.
-    VariantToJson(VariantToJson),
 }
 
 impl Function {
@@ -135,7 +132,6 @@ impl Function {
             Function::TemporalConvert(t) => visit(&t.source),
             Function::DropCache | Function::Now => {}
             Function::VariantGet(v) => visit(&v.input),
-            Function::VariantToJson(v) => visit(&v.input),
         }
     }
 }
@@ -158,7 +154,6 @@ impl Display for Function {
             Function::DropCache => write!(f, "drop_cache()"),
             Function::Now => write!(f, "now()"),
             Function::VariantGet(v) => write!(f, "{v}"),
-            Function::VariantToJson(v) => write!(f, "{v}"),
         }
     }
 }
@@ -188,7 +183,6 @@ impl Function {
             // A variant path read yields its cast's type (the sub-variant when
             // bare); a JSON-text render always yields a string.
             Function::VariantGet(v) => v.result_type(),
-            Function::VariantToJson(_) => Type::Utf8,
             // `drop_cache()` returns the evicted-entry count.
             Function::DropCache => Type::Int64,
         }
@@ -209,7 +203,6 @@ impl Function {
             Function::IntervalArithmetic(i) => i.compile(),
             Function::TemporalConvert(c) => c.compile(),
             Function::VariantGet(v) => v.compile(),
-            Function::VariantToJson(v) => v.compile(),
             // `drop_cache()` evicts pivot's in-memory compressed cache *and* the on-disk
             // cache (so remote reads go cold to the network) as a side effect, then
             // returns the total entries dropped. Evaluated over the single

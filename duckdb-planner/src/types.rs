@@ -107,6 +107,10 @@ pub enum ScalarValue {
         days: i32,
         micros: i64,
     },
+    /// A `VARIANT`: the document text it holds. DuckDB builds a variant from a
+    /// string by wrapping the raw text, and hands it back as that same text
+    /// under a variant-to-VARCHAR cast, so the consumer parses it as JSON.
+    Variant(String),
     /// A DuckDB type the bridge does not decode into a typed variant.
     Other(LogicalTypeId),
 }
@@ -139,6 +143,7 @@ impl fmt::Display for ScalarValue {
                 days,
                 micros,
             } => write!(f, "{months} {days} {micros}"),
+            ScalarValue::Variant(v) => write!(f, "{v}"),
             ScalarValue::Other(ty) => write!(f, "{ty:?}"),
         }
     }
