@@ -139,7 +139,7 @@ unsafe impl<A: IntCell + StringCell + F64Cell + WideCell, const ALL_ADDITIVE: bo
         meta * size_of::<A>()
     }
 
-    fn entry_state_align(_meta: usize) -> usize {
+    fn entry_state_align() -> usize {
         align_of::<A>()
     }
 

@@ -278,8 +278,11 @@ pub unsafe trait AggregationValue: Copy + Default + Send + Sync + 'static {
     /// The byte size of one entry state.
     fn entry_state_size(meta: Self::EntryStateMeta) -> usize;
 
-    /// The required alignment of one entry state.
-    fn entry_state_align(meta: Self::EntryStateMeta) -> usize;
+    /// The required alignment of an entry state.
+    ///
+    /// Unlike its size, the alignment belongs to the state type itself and
+    /// therefore does not depend on per-table metadata.
+    fn entry_state_align() -> usize;
 
     /// View an entry's state bytes.
     ///
@@ -368,7 +371,7 @@ unsafe impl<T: ByValueAggregation> AggregationValue for T {
         size_of::<T>()
     }
 
-    fn entry_state_align(_meta: ()) -> usize {
+    fn entry_state_align() -> usize {
         align_of::<T>()
     }
 

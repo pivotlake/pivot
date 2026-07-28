@@ -7,10 +7,10 @@
 //! runtime layout. In both cases [`ScatterRows::push_with`] initializes the
 //! state directly in its destination.
 
-use super::hash_table::{EntryLayout, PersistedKey, entry_layout};
+use super::entry_layout::EntryLayout;
+use super::hash_table::PersistedKey;
 use crate::memory::{Slab, SlabAllocator, SlabVec};
 use crate::operations::unary::group::values::AggregationValue;
-use std::marker::PhantomData;
 
 /// Buffered rows for one worker and one radix partition.
 pub trait ScatterRows<KP: PersistedKey, V: AggregationValue>: Send {
@@ -100,9 +100,7 @@ pub struct StridedScatterRows<KP: PersistedKey, V: AggregationValue> {
     current_chunk_base: *mut u8,
     /// Initialized rows in the current write chunk.
     current_chunk_len: usize,
-    layout: EntryLayout,
-    state_meta: V::EntryStateMeta,
-    _phantom: PhantomData<KP>,
+    layout: EntryLayout<KP, V>,
 }
 
 // SAFETY: as for `SlabVec` — the cached base pointer targets address-stable
@@ -157,14 +155,11 @@ impl<KP: PersistedKey, V: AggregationValue> StridedScatterRows<KP, V> {
 
 impl<KP: PersistedKey, V: AggregationValue> ScatterRows<KP, V> for StridedScatterRows<KP, V> {
     fn new(ctx: &V::Context) -> Self {
-        let state_meta = V::entry_state_meta(ctx);
         Self {
             chunks: Vec::new(),
             current_chunk_base: std::ptr::null_mut(),
             current_chunk_len: 0,
-            layout: entry_layout::<KP, V>(state_meta),
-            state_meta,
-            _phantom: PhantomData,
+            layout: EntryLayout::from(ctx),
         }
     }
 
@@ -206,7 +201,7 @@ impl<KP: PersistedKey, V: AggregationValue> ScatterRows<KP, V> for StridedScatte
             (row.add(self.layout.key_offset) as *mut KP).write(key);
             seed(V::entry_state_mut(
                 row.add(self.layout.state_offset),
-                self.state_meta,
+                self.layout.state_meta,
             ));
         }
         self.current_chunk_len += 1;
@@ -217,7 +212,7 @@ impl<KP: PersistedKey, V: AggregationValue> ScatterRows<KP, V> for StridedScatte
         let (stride, state_offset, state_meta) = (
             self.layout.stride,
             self.layout.state_offset,
-            self.state_meta,
+            self.layout.state_meta,
         );
         self.for_each_chunk(|base, rows| {
             for i in 0..rows {
@@ -237,7 +232,7 @@ impl<KP: PersistedKey, V: AggregationValue> ScatterRows<KP, V> for StridedScatte
         let (stride, state_offset, state_meta) = (
             self.layout.stride,
             self.layout.state_offset,
-            self.state_meta,
+            self.layout.state_meta,
         );
         self.for_each_chunk(|base, rows| {
             for i in 0..rows {

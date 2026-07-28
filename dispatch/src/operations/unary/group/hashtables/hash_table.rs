@@ -2,6 +2,7 @@
 //!
 //! See [`BaseHashTable`] for the full design rationale.
 
+use super::entry_layout::EntryLayout;
 use crate::memory::{BUFFER_SIZE, Slab, SlabAllocator};
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::values::AggregationValue;
@@ -83,10 +84,6 @@ fn max_load_for_len(len: usize) -> usize {
     (len as f64 * MAX_LOAD_FACTOR).round() as usize
 }
 
-fn align_up(x: usize, align: usize) -> usize {
-    (x + align - 1) & !(align - 1)
-}
-
 /// Compute a reciprocal that replaces division by `d` with a widening multiply:
 /// `n / d == (n * reciprocal(d)) >> 64`.
 ///
@@ -116,56 +113,6 @@ fn adjusted_bases(slabs: &[Slab], entries_per_slab: usize, stride: usize) -> Vec
         .enumerate()
         .map(|(s, slab)| (slab.ptr as usize).wrapping_sub(s * entries_per_slab * stride))
         .collect()
-}
-
-/// Runtime offsets, stride, and alignment for one table or scatter row.
-///
-/// Fields are placed in descending alignment order. Equal alignments retain the
-/// logical hash, key, state order. This minimizes padding and preserves the
-/// previous layout for fixed-size aggregation states.
-pub(super) struct EntryLayout {
-    pub(super) hash_offset: usize,
-    pub(super) key_offset: usize,
-    pub(super) state_offset: usize,
-    pub(super) stride: usize,
-    pub(super) align: usize,
-}
-
-/// The exact bytes one table entry occupies for this key type and signature,
-/// for entry-footprint heuristics (merge-partition sizing).
-pub fn entry_stride<K, V: AggregationValue>(ctx: &V::Context) -> usize {
-    entry_layout::<K, V>(V::entry_state_meta(ctx)).stride
-}
-
-pub(super) fn entry_layout<K, V: AggregationValue>(state_meta: V::EntryStateMeta) -> EntryLayout {
-    // Each tuple is (alignment, size), in logical hash, key, state order.
-    let fields = [
-        (align_of::<u64>(), size_of::<u64>()),
-        (align_of::<K>(), size_of::<K>()),
-        (
-            V::entry_state_align(state_meta),
-            V::entry_state_size(state_meta),
-        ),
-    ];
-    let mut order = [0usize, 1, 2];
-    order.sort_by_key(|&f| std::cmp::Reverse(fields[f].0));
-    let mut offsets = [0usize; 3];
-    let mut cursor = 0;
-    for &f in &order {
-        cursor = align_up(cursor, fields[f].0);
-        offsets[f] = cursor;
-        cursor += fields[f].1;
-    }
-    let align = fields.iter().map(|&(a, _)| a).max().unwrap();
-    let stride = align_up(cursor, align);
-    assert!(stride <= BUFFER_SIZE, "entry stride exceeds one slab");
-    EntryLayout {
-        hash_offset: offsets[0],
-        key_offset: offsets[1],
-        state_offset: offsets[2],
-        stride,
-        align,
-    }
 }
 
 /// Prefetch the cache line at `ptr` into L1 (x86 `T0` / ARM `pldl1keep`).
@@ -209,7 +156,7 @@ fn prefetch_l2_line(ptr: *const u8) {
 ///
 /// Entries are raw byte regions in 2 MiB slabs. Each region contains a full
 /// hash, a persisted key, and aggregation state. Their physical order depends
-/// on alignment; [`EntryLayout`] records their offsets.
+/// on alignment; `EntryLayout` records their offsets.
 ///
 /// ```text
 /// slab:  [ entry 0 ][ entry 1 ][ entry 2 ] ... [ unused tail ]
@@ -280,8 +227,7 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
         hash_left_shift: u32,
         ctx: &V::Context,
     ) -> Self {
-        let state_meta = V::entry_state_meta(ctx);
-        let layout = entry_layout::<K, V>(state_meta);
+        let layout = EntryLayout::<K, V>::from(ctx);
         let entries_per_slab = BUFFER_SIZE / layout.stride;
         let slabs = allocator.create_strided_slabs(expected_capacity, layout.stride, layout.align);
         BaseHashTable {
@@ -297,7 +243,7 @@ impl<K: PersistedKey, V: AggregationValue> BaseHashTable<K, V> {
             key_offset: layout.key_offset,
             state_offset: layout.state_offset,
             align: layout.align,
-            state_meta,
+            state_meta: layout.state_meta,
             adjusted_bases: adjusted_bases(&slabs, entries_per_slab, layout.stride),
             slabs,
             _phantom: PhantomData,

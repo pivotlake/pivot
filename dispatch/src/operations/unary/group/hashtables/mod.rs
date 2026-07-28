@@ -14,7 +14,10 @@ pub use crate::operations::unary::group::keys::KeyExtractor;
 pub use crate::operations::unary::group::values::AggregationValue;
 
 mod hash_table;
-pub use hash_table::{LiveKey, MAX_LOAD_FACTOR, PersistedKey, Prober, entry_stride};
+pub use hash_table::{LiveKey, MAX_LOAD_FACTOR, PersistedKey, Prober};
+
+mod entry_layout;
+pub(crate) use entry_layout::entry_stride;
 
 mod scatter;
 pub use scatter::{ScatterRows, SizedScatterRows, StridedScatterRows};
