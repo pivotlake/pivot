@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 
+use dispatch::RowDelivery;
 use duckdb_planner::BoundLogicalType;
 use duckdb_planner::LogicalOp;
 use duckdb_planner::duckdb_bridge::duckdb_types::{ExpressionType, JoinType};
@@ -218,6 +219,7 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
             inputs: vec![node],
             operator: Operator::Filter(Filter {
                 conditions: pushed_conditions,
+                delivery: RowDelivery::Coalesced,
             }),
         });
     }

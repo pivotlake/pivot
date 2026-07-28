@@ -6,7 +6,7 @@ use arrow_array::{Array, ArrayRef, BooleanArray, NullArray, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dispatch::arrays::take::take;
 use dispatch::memory::SlabAllocator;
-use dispatch::{RecordBatchOperatorSpec, RowSelection};
+use dispatch::{RecordBatchOperatorSpec, RowDelivery, RowSelection};
 use std::fmt;
 use std::sync::Arc;
 
@@ -14,6 +14,10 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct Filter {
     pub conditions: Vec<Expression>,
+    /// When survivors reach the operator below, decided by what that operator
+    /// is: the plan's `annotate_filter_delivery` pass sets this once the tree
+    /// is built. Coalesced until that pass says otherwise.
+    pub delivery: RowDelivery,
 }
 
 impl fmt::Display for Filter {
@@ -73,112 +77,117 @@ impl Filter {
         // cycles), while a vectorized kernel touches an element in ~1.
         const GATHER_COST_IN_KERNEL_PASSES: f64 = 4.0;
 
-        Ok(input.filter(move || {
-            let mut eval_fns: Vec<ExprEvalFn> = filters.iter().map(|f| f()).collect();
-            let later_kernel_counts = later_kernel_counts.clone();
-            let later_columns_by_condition = later_columns_by_condition.clone();
-            let mut condition_mask = ConditionMask::new();
-            let mut selection_scratch: Vec<u32> = Vec::new();
-            let mut remap_scratch: Vec<u32> = Vec::new();
-            let mut mini_schemas: Vec<Option<SchemaRef>> = vec![None; later_kernel_counts.len()];
-            // Each row of `current` mapped to its position in the input
-            // batch; identity until the first shrink compacts `current`.
-            let mut input_row_map: Vec<u32> = Vec::new();
-            move |batch: &RecordBatch,
-                  allocator: &mut SlabAllocator,
-                  selected_indices: &mut Vec<u32>| {
-                let mut current = batch.clone();
-                let mut has_input_row_map = false;
-                condition_mask.reset();
-                for (i, (eval, &later_kernels)) in
-                    eval_fns.iter_mut().zip(&later_kernel_counts).enumerate()
-                {
-                    let result = eval(&current);
-                    let (arr, _) = result.as_datum().get();
-                    let mask = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
-                    let selected_count = condition_mask.intersect(mask, current.num_rows());
-                    if selected_count == 0 {
-                        selected_indices.clear();
-                        return RowSelection::Indices;
-                    }
-                    // Shrink or carry the mask? Arrow kernels cannot skip
-                    // rows, so rows that already failed a condition ("dead",
-                    // the `1.0 - selected_fraction` fraction) are still computed over by
-                    // every later_kernels condition unless the batch is
-                    // physically compacted first. Compacting is not free
-                    // either: a gather copies every selected row once per
-                    // column. Compare the two options in expected per-row
-                    // cost (the batch's row count multiplies both sides, so
-                    // it cancels):
-                    //
-                    //   wasted ops/row if we keep the dead rows around:
-                    //       remaining kernel passes x fraction dead
-                    //   copy ops/row if we compact now:
-                    //       GATHER_COST_IN_KERNEL_PASSES x columns x fraction selected_fraction
-                    //
-                    // Copy when the copy is cheaper than the waste it
-                    // removes.
-                    //
-                    // When the columns the later conditions read are known,
-                    // the shrink keeps only those; cheap zeroed placeholders
-                    // (which nothing reads) stand in for the rest, since the
-                    // final output gathers full-width rows straight from the
-                    // input batch through the input row map.
-                    let needed_columns = &later_columns_by_condition[i];
-                    let prune = needed_columns.len() < current.num_columns();
-                    let compacted_column_count = if prune {
-                        needed_columns.len()
-                    } else {
-                        current.num_columns()
-                    };
-                    let selected_fraction = selected_count as f64 / current.num_rows() as f64;
-                    if later_kernels as f64 * (1.0 - selected_fraction)
-                        > GATHER_COST_IN_KERNEL_PASSES
-                            * compacted_column_count as f64
-                            * selected_fraction
+        let delivery = self.delivery;
+        Ok(input.filter_with_delivery(
+            move || {
+                let mut eval_fns: Vec<ExprEvalFn> = filters.iter().map(|f| f()).collect();
+                let later_kernel_counts = later_kernel_counts.clone();
+                let later_columns_by_condition = later_columns_by_condition.clone();
+                let mut condition_mask = ConditionMask::new();
+                let mut selection_scratch: Vec<u32> = Vec::new();
+                let mut remap_scratch: Vec<u32> = Vec::new();
+                let mut mini_schemas: Vec<Option<SchemaRef>> =
+                    vec![None; later_kernel_counts.len()];
+                // Each row of `current` mapped to its position in the input
+                // batch; identity until the first shrink compacts `current`.
+                let mut input_row_map: Vec<u32> = Vec::new();
+                move |batch: &RecordBatch,
+                      allocator: &mut SlabAllocator,
+                      selected_indices: &mut Vec<u32>| {
+                    let mut current = batch.clone();
+                    let mut has_input_row_map = false;
+                    condition_mask.reset();
+                    for (i, (eval, &later_kernels)) in
+                        eval_fns.iter_mut().zip(&later_kernel_counts).enumerate()
                     {
-                        condition_mask.collect_indices(&mut selection_scratch);
-                        current = if prune {
-                            compact_columns_for_later_conditions(
-                                allocator,
-                                &current,
-                                needed_columns,
-                                &selection_scratch,
-                                &mut mini_schemas[i],
-                            )
+                        let result = eval(&current);
+                        let (arr, _) = result.as_datum().get();
+                        let mask = arr.as_any().downcast_ref::<BooleanArray>().unwrap();
+                        let selected_count = condition_mask.intersect(mask, current.num_rows());
+                        if selected_count == 0 {
+                            selected_indices.clear();
+                            return RowSelection::Indices;
+                        }
+                        // Shrink or carry the mask? Arrow kernels cannot skip
+                        // rows, so rows that already failed a condition ("dead",
+                        // the `1.0 - selected_fraction` fraction) are still computed over by
+                        // every later_kernels condition unless the batch is
+                        // physically compacted first. Compacting is not free
+                        // either: a gather copies every selected row once per
+                        // column. Compare the two options in expected per-row
+                        // cost (the batch's row count multiplies both sides, so
+                        // it cancels):
+                        //
+                        //   wasted ops/row if we keep the dead rows around:
+                        //       remaining kernel passes x fraction dead
+                        //   copy ops/row if we compact now:
+                        //       GATHER_COST_IN_KERNEL_PASSES x columns x fraction selected_fraction
+                        //
+                        // Copy when the copy is cheaper than the waste it
+                        // removes.
+                        //
+                        // When the columns the later conditions read are known,
+                        // the shrink keeps only those; cheap zeroed placeholders
+                        // (which nothing reads) stand in for the rest, since the
+                        // final output gathers full-width rows straight from the
+                        // input batch through the input row map.
+                        let needed_columns = &later_columns_by_condition[i];
+                        let prune = needed_columns.len() < current.num_columns();
+                        let compacted_column_count = if prune {
+                            needed_columns.len()
                         } else {
-                            compact_record_batch_rows(allocator, &current, &selection_scratch)
+                            current.num_columns()
                         };
-                        remap_selection_to_input(
-                            &mut input_row_map,
-                            has_input_row_map,
-                            &selection_scratch,
-                            &mut remap_scratch,
-                        );
-                        has_input_row_map = true;
-                        condition_mask.reset();
+                        let selected_fraction = selected_count as f64 / current.num_rows() as f64;
+                        if later_kernels as f64 * (1.0 - selected_fraction)
+                            > GATHER_COST_IN_KERNEL_PASSES
+                                * compacted_column_count as f64
+                                * selected_fraction
+                        {
+                            condition_mask.collect_indices(&mut selection_scratch);
+                            current = if prune {
+                                compact_columns_for_later_conditions(
+                                    allocator,
+                                    &current,
+                                    needed_columns,
+                                    &selection_scratch,
+                                    &mut mini_schemas[i],
+                                )
+                            } else {
+                                compact_record_batch_rows(allocator, &current, &selection_scratch)
+                            };
+                            remap_selection_to_input(
+                                &mut input_row_map,
+                                has_input_row_map,
+                                &selection_scratch,
+                                &mut remap_scratch,
+                            );
+                            has_input_row_map = true;
+                            condition_mask.reset();
+                        }
                     }
+                    // The mask is always active here: a shrink only pays off
+                    // while conditions remain (its cost model multiplies the
+                    // kernels left to run), and every remaining condition
+                    // reactivates the mask.
+                    debug_assert!(condition_mask.is_active());
+                    // Report the selected rows as positions in the input batch.
+                    if has_input_row_map {
+                        condition_mask.collect_indices(&mut selection_scratch);
+                        selected_indices.clear();
+                        selected_indices.extend(
+                            selection_scratch
+                                .iter()
+                                .map(|&pos| input_row_map[pos as usize]),
+                        );
+                    } else {
+                        condition_mask.collect_indices(selected_indices);
+                    }
+                    RowSelection::Indices
                 }
-                // The mask is always active here: a shrink only pays off
-                // while conditions remain (its cost model multiplies the
-                // kernels left to run), and every remaining condition
-                // reactivates the mask.
-                debug_assert!(condition_mask.is_active());
-                // Report the selected rows as positions in the input batch.
-                if has_input_row_map {
-                    condition_mask.collect_indices(&mut selection_scratch);
-                    selected_indices.clear();
-                    selected_indices.extend(
-                        selection_scratch
-                            .iter()
-                            .map(|&pos| input_row_map[pos as usize]),
-                    );
-                } else {
-                    condition_mask.collect_indices(selected_indices);
-                }
-                RowSelection::Indices
-            }
-        }))
+            },
+            delivery,
+        ))
     }
 }
 

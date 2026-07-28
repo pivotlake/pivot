@@ -14,7 +14,7 @@ use crate::compile;
 use crate::expression::Expression;
 use crate::operator::{self, Operator, OrderByDirection, SetVariable};
 use crate::types::Type;
-use dispatch::GroupLimit;
+use dispatch::{GroupLimit, RowDelivery};
 use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
@@ -167,6 +167,45 @@ impl PlanNode {
                 }
                 Step::Stop => return,
             }
+        }
+    }
+
+    /// Tell every filter whether to hand its surviving rows down as full
+    /// batches or as soon as they are selected, based on the operator that
+    /// consumes them.
+    ///
+    /// A consumer that reads its whole input before producing anything (a
+    /// group-by, a join, a sort) wants full batches: it pays its per-batch
+    /// costs once per batch, and nothing it does can happen earlier. A LIMIT
+    /// or a Top-N is the opposite, because both act on rows as they arrive: a
+    /// LIMIT cancels its input once it has enough rows, and a Top-N publishes
+    /// the boundary that prunes row groups from the scan. Batching rows up for
+    /// those defers the decision until a filter has selected a whole batch's
+    /// worth, and under a selective filter that is long enough to read most of
+    /// the table before anything downstream can stop it.
+    ///
+    /// The nearest consumer decides, so each operator that cares imposes its
+    /// choice on the subtree beneath it: under `Limit → Aggregate → Filter`
+    /// the aggregate is what the filter feeds, and it still wants batches.
+    pub(crate) fn annotate_filter_delivery(&mut self) {
+        self.annotate_filter_delivery_below(RowDelivery::Coalesced);
+    }
+
+    fn annotate_filter_delivery_below(&mut self, consumer: RowDelivery) {
+        if let Operator::Filter(filter) = &mut self.operator {
+            filter.delivery = consumer;
+        }
+        // What this node's own inputs feed, which is this node unless it is
+        // transparent (a projection, a materialize) and passes the choice on.
+        let below = match &self.operator {
+            Operator::Limit(_) | Operator::TopN(_) => RowDelivery::Immediate,
+            Operator::Aggregate(_) | Operator::Join(_) | Operator::OrderBy(_) => {
+                RowDelivery::Coalesced
+            }
+            _ => consumer,
+        };
+        for child in &mut self.inputs {
+            child.annotate_filter_delivery_below(below);
         }
     }
 

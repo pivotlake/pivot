@@ -7,6 +7,7 @@
 
 use std::any::Any;
 
+use dispatch::RowDelivery;
 use duckdb_planner::DuckDBTable;
 use duckdb_planner::catalog_provider::OptionalTableWrapper;
 use duckdb_planner::duckdb_bridge::duckdb_types::LimitNodeType;
@@ -76,6 +77,9 @@ impl Filter {
                 .exprs()
                 .map(Expression::from_handle)
                 .collect::<Result<Vec<_>, _>>()?,
+            // `annotate_filter_delivery` revisits this once the tree is built
+            // and the operator below this filter is known.
+            delivery: RowDelivery::Coalesced,
         })
     }
 }
