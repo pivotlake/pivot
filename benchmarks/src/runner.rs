@@ -496,8 +496,17 @@ pub async fn run_suite(
     // reading Parquet in place: send the documents in batches, then compact the
     // many small files each batch left into target-sized ones before querying.
     if let Some(spec) = &suite.load {
+        let load_start = Instant::now();
         load_documents(&client, &opts.source, spec).await?;
         server.compact().await;
+        // The ingest (INSERT + compaction) is itself a benchmarked cost for a
+        // suite loaded this way, so report it the way a query iteration is
+        // reported. `=== Load ... ===` keeps it out of the query lines.
+        println!(
+            "=== Load {} — {}ms ===",
+            spec.table,
+            load_start.elapsed().as_millis()
+        );
     }
 
     if let Some(warmup) = &opts.warmup {
