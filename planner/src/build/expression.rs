@@ -171,6 +171,10 @@ impl Cast {
             })));
         }
 
+        // Every other cast, including text into a variant (which `Cast::compile`
+        // parses as JSON), is a plain `Cast`. A constant `'{...}'::VARIANT` never
+        // reaches here: DuckDB folds it into a variant constant, parsed in
+        // `build_scalar_value`.
         Ok(Expression::Cast(Cast {
             target_arrow: physical_arrow_type(&target),
             target,

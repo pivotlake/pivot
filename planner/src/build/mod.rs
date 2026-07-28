@@ -27,14 +27,14 @@ use duckdb_planner::handle::{
 
 use crate::catalog::Table;
 use crate::dynamic_filter::DynamicFilter;
-use crate::expression::{Error as ExpressionError, Expression, Function, Ref, VariantToJson};
+use crate::expression::{Cast, Error as ExpressionError, Expression, Ref};
 use crate::operator::{
     Aggregate, CreateTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Insert,
     Join, Limit, Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan, TopN,
     Values,
 };
 use crate::plan::{self, PlanNode};
-use crate::types::{Type, type_from_logical};
+use crate::types::{Type, physical_arrow_type, type_from_logical};
 
 mod expression;
 mod operator;
@@ -107,9 +107,13 @@ fn render_variant_outputs(plan: PlanNode) -> Result<PlanNode, crate::compile::Er
                 name: None,
             });
             match column_type {
-                Type::Variant => Expression::Function(Function::VariantToJson(VariantToJson {
-                    input: Box::new(column),
-                })),
+                // Serialize a variant output column as JSON text: a cast to
+                // text, which `Cast::compile` renders each document with.
+                Type::Variant => Expression::Cast(Cast {
+                    target: Type::Utf8,
+                    target_arrow: physical_arrow_type(&Type::Utf8),
+                    source: Box::new(column),
+                }),
                 _ => column,
             }
         })
@@ -544,7 +548,7 @@ mod tests {
         };
         assert!(matches!(
             &projection.projections[0],
-            Expression::Function(Function::VariantToJson(_))
+            Expression::Cast(cast) if cast.target == Type::Utf8
         ));
     }
 
