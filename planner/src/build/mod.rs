@@ -30,8 +30,8 @@ use crate::dynamic_filter::DynamicFilter;
 use crate::expression::{Cast, Error as ExpressionError, Expression, Ref};
 use crate::operator::{
     Aggregate, CreateTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Insert,
-    Join, Limit, Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan, TopN,
-    Values,
+    Join, JoinKind, Limit, Materialize, Operator, OrderBy, Projection, SetVariable,
+    TableFunctionScan, TopN, Values,
 };
 use crate::plan::{self, PlanNode};
 use crate::types::{Type, physical_arrow_type, type_from_logical};
@@ -284,8 +284,8 @@ fn absorb_scan_pushdown_filter(node: PlanNode) -> PlanNode {
 }
 
 /// Translate a general comparison join into pivot's [`Join`]. The supported
-/// shape is an INNER or RIGHT join with a single equality condition whose sides
-/// are plain column refs of a key type the dispatch join handles (`Int64`);
+/// shape is an INNER, RIGHT or SEMI join with a single equality condition whose
+/// sides are plain column refs of a key type the dispatch join handles;
 /// anything else reports the specific gap. The probe is DuckDB's left child
 /// and the build its right, matching its hash-join convention (the cost model
 /// puts the smaller relation on the right).
@@ -294,6 +294,11 @@ fn absorb_scan_pushdown_filter(node: PlanNode) -> PlanNode {
 /// onto the dispatch join's build-side outer mode. A written `LEFT JOIN` lands
 /// here as RIGHT whenever its preserved relation is the smaller one; LEFT
 /// itself (preserving the streamed side) is not supported yet.
+///
+/// SEMI keeps rows of the left child, so it is semi on the *probe* side. The
+/// mirrored RIGHT_SEMI, which DuckDB's build-probe-side optimizer produces when
+/// it would rather build the hash table from the left child, is not supported
+/// yet.
 ///
 /// DuckDB's join projection maps (which trim the join's output to the columns
 /// actually used above it) are folded into the join's own output lists, so
@@ -307,15 +312,6 @@ fn build_join(
     join: ComparisonJoinView<'_>,
     inputs: Vec<PlanNode>,
 ) -> Result<PlanNode, OperatorError> {
-    let build_outer = match join.join_type() {
-        JoinType::INNER => false,
-        JoinType::RIGHT => true,
-        other => {
-            return Err(OperatorError::Unsupported(format!(
-                "Unsupported join type: {other:?}"
-            )));
-        }
-    };
     let mut conditions = join.conditions();
     let condition = match (conditions.next(), conditions.next()) {
         (Some(condition), None) => condition,
@@ -349,22 +345,38 @@ fn build_join(
     // Refs above the join were resolved against the trimmed output (kept left
     // columns, then kept right columns), which is exactly the layout the join
     // emits with these lists.
-    let probe_output = if left_map.is_empty() {
+    let probe_output: Vec<usize> = if left_map.is_empty() {
         (0..probe_types.len()).collect()
     } else {
         left_map
     };
-    let build_output = if right_map.is_empty() {
+    let kept_build_output: Vec<usize> = if right_map.is_empty() {
         (0..build_types.len()).collect()
     } else {
         right_map
     };
-    let outer_probe_types = build_outer.then(|| {
-        probe_output
-            .iter()
-            .map(|&i| probe_types[i].clone())
-            .collect()
-    });
+    let (kind, build_output) = match join.join_type() {
+        JoinType::INNER => (JoinKind::Inner, kept_build_output),
+        JoinType::RIGHT => (
+            JoinKind::BuildOuter {
+                probe_types: probe_output
+                    .iter()
+                    .map(|&i| probe_types[i].clone())
+                    .collect(),
+            },
+            kept_build_output,
+        ),
+        // A semi join emits no build column at all. DuckDB agrees, and says so
+        // by returning the left bindings alone for such a join rather than
+        // through the right projection map, which it never reads here — so the
+        // map's "empty means keep every column" reading must not be applied.
+        JoinType::SEMI => (JoinKind::ProbeSemi, Vec::new()),
+        other => {
+            return Err(OperatorError::Unsupported(format!(
+                "Unsupported join type: {other:?}"
+            )));
+        }
+    };
     Ok(PlanNode {
         name: op.name(),
         inputs,
@@ -374,7 +386,7 @@ fn build_join(
             key_type: probe_key_type,
             probe_output,
             build_output,
-            outer_probe_types,
+            kind,
         }),
     })
 }

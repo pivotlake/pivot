@@ -9,7 +9,9 @@ use arrow_array::{Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 
 use common::*;
-use dispatch::{AggregationKind, AggregationSlot, JoinOutputColumns, JoinSpec, values_input};
+use dispatch::{
+    AggregationKind, AggregationSlot, JoinKind, JoinOutputColumns, JoinSpec, values_input,
+};
 
 /// An inner join keyed on column 0 of both sides.
 fn inner_join(output_columns: JoinOutputColumns) -> JoinSpec {
@@ -17,7 +19,7 @@ fn inner_join(output_columns: JoinOutputColumns) -> JoinSpec {
         build_key_column: 0,
         probe_key_column: 0,
         output_columns,
-        outer_probe_fields: None,
+        kind: JoinKind::Inner,
     }
 }
 
@@ -249,7 +251,9 @@ fn build_outer_join(output_columns: JoinOutputColumns) -> JoinSpec {
         build_key_column: 0,
         probe_key_column: 0,
         output_columns,
-        outer_probe_fields: Some(vec![Field::new("id", DataType::Int64, true)]),
+        kind: JoinKind::BuildOuter {
+            probe_fields: vec![Field::new("id", DataType::Int64, true)],
+        },
     }
 }
 
@@ -310,4 +314,126 @@ fn every_build_row_reaches_a_build_outer_join_output() {
     let mut build_ids_out = collect_i64s(&results, 1);
     build_ids_out.sort();
     assert_eq!(build_ids_out, (0..30_000).collect::<Vec<i64>>());
+}
+
+/// A probe-side semi join keyed on column 0 of both sides, emitting the listed
+/// probe columns and, as every semi join must, no build column.
+fn probe_semi_join(probe_columns: Vec<usize>) -> JoinSpec {
+    JoinSpec {
+        build_key_column: 0,
+        probe_key_column: 0,
+        output_columns: JoinOutputColumns {
+            probe: probe_columns,
+            build: Vec::new(),
+        },
+        kind: JoinKind::ProbeSemi,
+    }
+}
+
+#[test]
+fn probe_semi_join_emits_a_matched_probe_row_once() {
+    let d = dispatch(1);
+    let build = values_input(&d, vec![int64_batch("id", &[10, 10, 20])]).record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &[10, 20, 99])]).record_batches();
+
+    let results = probe
+        .join(build, &DataType::Int64, probe_semi_join(vec![0]))
+        .collect()
+        .unwrap();
+
+    // Key 10 sits in the build side twice, and still brings its probe row out
+    // once; 99 is in neither.
+    let mut ids = collect_i64s(&results, 0);
+    ids.sort();
+    assert_eq!(ids, vec![10, 20]);
+    assert!(results.iter().all(|batch| batch.num_columns() == 1));
+}
+
+#[test]
+fn probe_semi_join_keeps_every_copy_of_a_repeated_probe_row() {
+    let d = dispatch(1);
+    let build = values_input(&d, vec![int64_batch("id", &[10])]).record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &[10, 10, 10])]).record_batches();
+
+    let results = probe
+        .join(build, &DataType::Int64, probe_semi_join(vec![0]))
+        .collect()
+        .unwrap();
+
+    // The de-duplication is per probe row, not per key: each of the three rows
+    // has a match of its own.
+    assert_eq!(collect_i64s(&results, 0), vec![10, 10, 10]);
+}
+
+#[test]
+fn probe_semi_join_carries_the_probe_columns_it_lists() {
+    let d = dispatch(1);
+    let build = values_input(&d, vec![int64_batch("id", &[20])]).record_batches();
+    let probe = values_input(
+        &d,
+        vec![two_int64_batch(("id", "payload"), &[10, 20], &[100, 200])],
+    )
+    .record_batches();
+
+    let results = probe
+        .join(build, &DataType::Int64, probe_semi_join(vec![1]))
+        .collect()
+        .unwrap();
+
+    assert_eq!(collect_i64s(&results, 0), vec![200]);
+}
+
+#[test]
+fn probe_semi_join_over_an_empty_build_side_emits_nothing() {
+    let d = dispatch(1);
+    let build = values_input(&d, vec![int64_batch("id", &[])]).record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &[10, 20])]).record_batches();
+
+    let results = probe
+        .join(build, &DataType::Int64, probe_semi_join(vec![0]))
+        .collect()
+        .unwrap();
+
+    assert_eq!(collect_i64s(&results, 0), Vec::<i64>::new());
+}
+
+#[test]
+fn probe_semi_join_never_matches_a_null_key() {
+    let d = dispatch(1);
+    let nullable = |values: Vec<Option<i64>>| {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(values))],
+        )
+        .unwrap()
+    };
+    let build = values_input(&d, vec![nullable(vec![Some(10), None])]).record_batches();
+    let probe = values_input(&d, vec![nullable(vec![None, Some(10), None])]).record_batches();
+
+    let results = probe
+        .join(build, &DataType::Int64, probe_semi_join(vec![0]))
+        .collect()
+        .unwrap();
+
+    assert_eq!(collect_i64s(&results, 0), vec![10]);
+}
+
+#[test]
+fn a_semi_join_spanning_batches_emits_each_matched_probe_row_once() {
+    let d = dispatch(4);
+    // Every key three times over on the build side, so a row that came out per
+    // match would come out three times too.
+    let build_ids: Vec<i64> = (0..30_000).flat_map(|id| [id, id, id]).collect();
+    let probe_ids: Vec<i64> = (0..30_000).step_by(3).collect();
+    let build = values_input(&d, vec![int64_batch("id", &build_ids)]).record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &probe_ids)]).record_batches();
+
+    let results = probe
+        .join(build, &DataType::Int64, probe_semi_join(vec![0]))
+        .collect()
+        .unwrap();
+
+    let mut ids = collect_i64s(&results, 0);
+    ids.sort();
+    assert_eq!(ids, probe_ids);
 }

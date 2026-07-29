@@ -62,8 +62,8 @@ use crate::operations::channels::{
 };
 use crate::operations::{
     AggregateFactory, AggregationSlot, AggregationValue, CopyOutFactory, Distinct,
-    DynamicFilterSlot, F64Cell, FilterFactory, GroupFactory, GroupLimit, IntCell, JoinSpec,
-    KeyExtractor, LimitFactory, MapFactory, NoOpNullaryFactory, NullaryFactory,
+    DynamicFilterSlot, F64Cell, FilterFactory, GroupFactory, GroupLimit, IntCell, JoinKind,
+    JoinSpec, KeyExtractor, LimitFactory, MapFactory, NoOpNullaryFactory, NullaryFactory,
     NullaryOperatorFactory, OrderBy, OrderByLimitFactory, UnaryFactory, UnaryOperator,
     UnaryOperatorFactory, WideCell, create_join_factories,
 };
@@ -688,9 +688,9 @@ impl RecordBatchOperatorSpec {
     /// order) followed by the listed build columns. Rows with a null key on
     /// either side never match.
     ///
-    /// The join is inner unless `spec.outer_probe_fields` makes it outer on the build
-    /// side, which adds one output row per build row nothing matched, its probe
-    /// columns null.
+    /// `spec.kind` picks which rows reach the output: the matching pairs alone,
+    /// those plus one row per build row nothing matched (with null probe
+    /// columns), or one row per probe row that matched anything at all.
     ///
     /// `key_type` is the Arrow type both key columns arrive as (the planner
     /// casts mismatched sides to a common type first) and picks the join's key
@@ -732,20 +732,25 @@ impl RecordBatchOperatorSpec {
         }
     }
 
-    /// Pick the outerness instantiation, so the probe's match loop carries no
+    /// Pick the kind's instantiation, so the probe's match loop carries no
     /// runtime test for it.
     fn join_dispatch<T: ArrowPrimitiveType<Native: Hash + Eq>>(
         self,
         build: RecordBatchOperatorSpec,
         spec: JoinSpec,
     ) -> Self {
-        match spec.outer_probe_fields.is_some() {
-            true => self.join_typed::<T, true>(build, spec),
-            false => self.join_typed::<T, false>(build, spec),
+        match spec.kind {
+            JoinKind::Inner => self.join_typed::<T, false, false>(build, spec),
+            JoinKind::BuildOuter { .. } => self.join_typed::<T, true, false>(build, spec),
+            JoinKind::ProbeSemi => self.join_typed::<T, false, true>(build, spec),
         }
     }
 
-    fn join_typed<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool>(
+    fn join_typed<
+        T: ArrowPrimitiveType<Native: Hash + Eq>,
+        const BUILD_OUTER: bool,
+        const SEMI: bool,
+    >(
         self,
         build: RecordBatchOperatorSpec,
         spec: JoinSpec,
@@ -764,7 +769,7 @@ impl RecordBatchOperatorSpec {
         );
 
         let (build_factories, probe_factories, build_ready) =
-            create_join_factories::<T, BUILD_OUTER>(spec, worker_count);
+            create_join_factories::<T, BUILD_OUTER, SEMI>(spec, worker_count);
 
         let (_, build_heads) = build.into_parts();
         let build_siblings_left = Arc::new(AtomicUsize::new(worker_count));

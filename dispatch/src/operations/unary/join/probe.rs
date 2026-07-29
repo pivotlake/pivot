@@ -16,6 +16,10 @@
 //! unflagged once every worker has stopped probing are emitted with their probe
 //! columns null by
 //! [`send_out_next_unmatched_build_rows`](Probe::send_out_next_unmatched_build_rows).
+//!
+//! A semi join collects probe rows alone: one per probe row whose arena range
+//! holds its key, found by stopping at the first one that does. Only the probe
+//! accumulator ever fills, since such a join carries no build columns.
 
 use crate::RECORD_BATCH_SIZE;
 use crate::arrays::accumulator::BatchAccumulator;
@@ -44,7 +48,11 @@ const PREFETCH_LENGTH: usize = 63;
 /// batch's worth, so a pass can never overfill the accumulator it appends to.
 const UNMATCHED_SCAN_CHUNK: usize = RECORD_BATCH_SIZE;
 
-pub struct Probe<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool> {
+pub struct Probe<
+    T: ArrowPrimitiveType<Native: Hash + Eq>,
+    const BUILD_OUTER: bool,
+    const SEMI: bool,
+> {
     table: JoinTable<T::Native>,
     hash_state: RandomState,
     key_column: usize,
@@ -52,12 +60,14 @@ pub struct Probe<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bo
     allocator: SlabAllocator,
 
     /// Matched (probe row, build payload row) pairs of the batch being
-    /// probed, drained into the accumulators when full or at batch end.
+    /// probed, drained into the accumulators when full or at batch end. A semi
+    /// join fills the probe indices alone; it has no build columns to gather.
     probe_indices: Vec<u32>,
     build_indices: Vec<u32>,
     /// The two output sides, created on the first batch (a schema only
     /// exists then). Both receive the same row count per drain, so they fill
-    /// and emit in lockstep.
+    /// and emit in lockstep — except in a semi join, where the build side stays
+    /// empty and contributes only its (zero) columns.
     sides: Option<OutputSides>,
     /// The fields the probe side contributes to the output, when the caller
     /// supplied them (a build-side outer join always does). Taking them over
@@ -71,7 +81,9 @@ pub struct Probe<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bo
     probing_done: bool,
 }
 
-impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool> Probe<T, BUILD_OUTER> {
+impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, const SEMI: bool>
+    Probe<T, BUILD_OUTER, SEMI>
+{
     pub(crate) fn new(
         table: JoinTable<T::Native>,
         hash_state: RandomState,
@@ -186,7 +198,7 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool> Probe<T,
         let col = window.column(self.key_column).as_primitive::<T>();
         let keys = unsafe { &*self.table.keys.get() };
         let rows = unsafe { &*self.table.rows.get() };
-        let out = ProbeMatchCollector::<T, S, BUILD_OUTER> {
+        let out = ProbeMatchCollector::<T, S, BUILD_OUTER, SEMI> {
             keys,
             rows,
             matched_flags: unsafe { &*self.table.matched.get() },
@@ -215,8 +227,8 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool> Probe<T,
     }
 }
 
-impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool>
-    Unary<RecordBatch, RecordBatch> for Probe<T, BUILD_OUTER>
+impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, const SEMI: bool>
+    Unary<RecordBatch, RecordBatch> for Probe<T, BUILD_OUTER, SEMI>
 {
     fn consume<S: Sender<RecordBatch>>(
         &mut self,
@@ -351,13 +363,15 @@ impl OutputSides {
 /// For each candidate build-arena row, it verifies the full key, buffers the
 /// corresponding `(probe row, build payload row)` indices, and periodically
 /// appends those rows to the probe and build output accumulators. Full output
-/// batches are emitted as the accumulators fill.
+/// batches are emitted as the accumulators fill. A semi join buffers the probe
+/// row alone, once per probe row that has a match at all.
 struct ProbeMatchCollector<
     'a,
     'b,
     T: ArrowPrimitiveType<Native: Hash + Eq>,
     S: Sender<RecordBatch>,
     const BUILD_OUTER: bool,
+    const SEMI: bool,
 > {
     keys: &'a MultiSlabBuffer<T::Native>,
     rows: &'a MultiSlabBuffer<u32>,
@@ -385,7 +399,8 @@ impl<
     T: ArrowPrimitiveType<Native: Hash + Eq>,
     S: Sender<RecordBatch>,
     const BUILD_OUTER: bool,
-> ProbeMatchCollector<'a, 'b, T, S, BUILD_OUTER>
+    const SEMI: bool,
+> ProbeMatchCollector<'a, 'b, T, S, BUILD_OUTER, SEMI>
 {
     /// Append the collected pairs to the output sides, emitting if a full
     /// batch accumulated.
@@ -411,10 +426,57 @@ impl<
             ..
         } = &mut *self.sides;
         probe.append(self.probe_source, &self.probe_indices[..self.matched]);
-        build.append(build_source, &self.build_indices[..self.matched]);
+        // A semi join has no build columns and buffered no build rows: its
+        // build side only ever contributes its (empty) column list on emit.
+        if !SEMI {
+            build.append(build_source, &self.build_indices[..self.matched]);
+        }
         self.matched = 0;
         if self.sides.probe.should_emit() {
             self.sides.emit(self.allocator, self.sender)?;
+        }
+        Ok(())
+    }
+
+    /// Record what probe row `probe_row` matches among the arena range
+    /// `start..end`, its slot's candidates: every one of them, or - in a semi
+    /// join, where a probe row reaches the output at most once - the first.
+    #[inline(always)]
+    fn record_matches(
+        &mut self,
+        start: usize,
+        end: usize,
+        probe_row: usize,
+        probe_key: T::Native,
+    ) -> unary::Result<()> {
+        if SEMI {
+            for j in start..end {
+                if self.keys[j] == probe_key {
+                    return self.record_probe_row(probe_row);
+                }
+            }
+            return Ok(());
+        }
+        for j in start..end {
+            self.record_match(j, probe_row, probe_key)?;
+        }
+        Ok(())
+    }
+
+    /// Buffer `probe_row` as a matched probe row, without a build row to pair
+    /// it with: a semi join's whole output.
+    #[inline(always)]
+    fn record_probe_row(&mut self, probe_row: usize) -> unary::Result<()> {
+        debug_assert!(self.matched < self.probe_indices.len());
+        // SAFETY: as in `record_match` - the drain below resets the cursor the
+        // moment it reaches the slice's length.
+        unsafe {
+            *self.probe_indices.get_unchecked_mut(self.matched) =
+                (self.window_offset + probe_row) as u32;
+        }
+        self.matched += 1;
+        if self.matched == RECORD_BATCH_SIZE {
+            self.drain()?;
         }
         Ok(())
     }
@@ -457,6 +519,7 @@ struct ProbeArray<
     T: ArrowPrimitiveType<Native: Hash + Eq>,
     S: Sender<RecordBatch>,
     const BUILD_OUTER: bool,
+    const SEMI: bool,
 > {
     row_idx: usize,
     hash_state: RandomState,
@@ -472,7 +535,7 @@ struct ProbeArray<
     matched_size: [usize; 2],
     matched_idx: usize,
 
-    out: ProbeMatchCollector<'a, 'b, T, S, BUILD_OUTER>,
+    out: ProbeMatchCollector<'a, 'b, T, S, BUILD_OUTER, SEMI>,
 }
 
 impl<
@@ -481,7 +544,8 @@ impl<
     T: ArrowPrimitiveType<Native: Hash + Eq>,
     S: Sender<RecordBatch>,
     const BUILD_OUTER: bool,
-> ProbeArray<'a, 'b, T, S, BUILD_OUTER>
+    const SEMI: bool,
+> ProbeArray<'a, 'b, T, S, BUILD_OUTER, SEMI>
 {
     #[inline(always)]
     pub fn generate_matched_slots<const HASH: bool>(&mut self, length: usize) {
@@ -559,9 +623,7 @@ impl<
             let end = directory.end_ptr((slot + 1) as isize);
             let probe_key = unsafe { out.col.value_unchecked(idx) };
 
-            for j in start..end {
-                out.record_match(j, idx, probe_key)?;
-            }
+            out.record_matches(start, end, idx, probe_key)?;
         }
         Ok(())
     }
