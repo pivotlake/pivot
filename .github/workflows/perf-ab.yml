@@ -327,6 +327,7 @@ jobs:
           # flushed. Hence "pid alive" => keep waiting; "pid gone + sentinel" =>
           # done; "pid gone + no sentinel" => an untrappable kill (OOM/SIGKILL),
           # the only genuine failure. No sleep-and-hope needed.
+          prev_id=""
           while true; do
             state=$(ssh perf '
               if kill -0 "$(cat /tmp/bench-ab.pid 2>/dev/null)" 2>/dev/null; then
@@ -343,7 +344,25 @@ jobs:
                 ssh perf 'tail -n 60 /tmp/ab.log' || true
                 exit 1 ;;
               *)
-                ssh perf 'tail -n 2 /tmp/ab.log' 2>/dev/null || true
+                # Tail whichever file is actually moving: ab.log during the
+                # builds, then the active side's harness output once timing
+                # starts, since run_harness redirects there and ab.log stops
+                # growing for that whole phase.
+                #
+                # Skip a tick only when that file has not grown, keying on its
+                # name and size rather than on the text. Output that repeats is
+                # still progress: a query timing the same twice, or the run of
+                # nulls a failing side produces, would compare equal and be
+                # hidden exactly when it most needs watching.
+                cur=$(ssh perf 'f=$(ls -t /tmp/ab.log /tmp/ab-before.out /tmp/ab-after.out 2>/dev/null | head -1)
+                                [ -n "$f" ] || exit 0
+                                printf "%s %s\n" "$f" "$(stat -c %s "$f")"
+                                tail -n 3 "$f"' 2>/dev/null || true)
+                cur_id=$(printf '%s\n' "$cur" | head -1)
+                if [ -n "$cur_id" ] && [ "$cur_id" != "$prev_id" ]; then
+                  printf '%s\n' "$cur" | tail -n +2
+                fi
+                prev_id=$cur_id
                 sleep 20 ;;
             esac
           done
