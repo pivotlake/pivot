@@ -12,9 +12,9 @@
 //! width on every value and four bytes on every byte-array length. A key column
 //! is the usual case, and packing its differences roughly halves it.
 //!
-//! The layout choice, 128 values a block in four miniblocks of 32, is what
-//! other writers emit, and the count per miniblock being a multiple of 32 is
-//! what keeps each one starting on a byte boundary.
+//! The block layout is [`VALUES_PER_BLOCK`] and [`MINIBLOCKS_PER_BLOCK`]; the
+//! count per miniblock has to stay a multiple of 32, which is what keeps each
+//! one starting on a byte boundary.
 
 use arrow_array::{
     Array, BinaryViewArray, Date32Array, Decimal64Array, Decimal128Array, Int32Array, Int64Array,
@@ -32,8 +32,15 @@ use super::leaves::Leaf;
 use super::pages::{self, PageKind, PageRange};
 
 /// Values a block holds, and how many miniblocks it is cut into.
-const VALUES_PER_BLOCK: usize = 128;
-const MINIBLOCKS_PER_BLOCK: usize = 4;
+///
+/// A block header (its smallest difference, plus a width per miniblock) is
+/// parsed on read whatever the block holds, so a wide block spreads that cost
+/// over more values, and a wide miniblock spreads the per-miniblock setup over
+/// more values still. The cost of going wide is that one outlying difference
+/// widens every value it shares a miniblock with, which is why this is a
+/// balance rather than the largest block the format allows.
+const VALUES_PER_BLOCK: usize = 2048;
+const MINIBLOCKS_PER_BLOCK: usize = 8;
 const VALUES_PER_MINIBLOCK: usize = VALUES_PER_BLOCK / MINIBLOCKS_PER_BLOCK;
 
 /// Delta-encode a leaf, or `None` when its type has no delta form: floats are
@@ -130,13 +137,13 @@ fn integers(array: &dyn Array) -> WriteResult<Cow<'_, [i64]>> {
     })
 }
 
-/// Write `values` as `DELTA_BINARY_PACKED`: the header, then a block per 128
-/// values holding the block's smallest difference, one width per miniblock, and
-/// the packed differences.
+/// Write `values` as `DELTA_BINARY_PACKED`: the header, then a block per
+/// [`VALUES_PER_BLOCK`] values holding the block's smallest difference, one
+/// width per miniblock, and the packed differences.
 ///
 /// A block's differences are built into a fixed buffer rather than a vector as
-/// long as the column: a block is 128 values wide whatever the page holds, so
-/// the same small buffer serves the whole page and the work stays in cache.
+/// long as the column: a block is the same width whatever the page holds, so
+/// the same buffer serves the whole page and the work stays in cache.
 pub(crate) fn encode_binary_packed(values: &[i64], out: &mut Vec<u8>) {
     put_uvarint(out, VALUES_PER_BLOCK as u64);
     put_uvarint(out, MINIBLOCKS_PER_BLOCK as u64);
