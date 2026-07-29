@@ -11,8 +11,8 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
-use arrow_schema::{ArrowError, Schema};
+use arrow_array::{ArrayRef, Date32Array, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_schema::{ArrowError, DataType, Schema};
 use dispatch::{BUFFER_SIZE, Dispatch, values_input};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet_variant_compute::{
@@ -564,3 +564,30 @@ fn packing_a_scattered_key_costs_a_third_of_writing_it_whole() {
     let per_value = bytes as f64 / values.len() as f64;
     assert!(per_value < 4.0, "{per_value} bytes a value");
 }
+
+/// A date column writes as the day count its INT32 storage holds, annotated so
+/// a reader knows it is a date and not a plain integer. Arrow's reader reads it
+/// back as a date, which is what a table with a date column needs to round trip
+/// at all.
+#[test]
+fn a_date_column_reads_back_as_a_date() {
+    // 9204 days after the epoch is 1995-03-15.
+    let days: Vec<i32> = (0..50_000).map(|i| 9_204 + i % 2_557).collect();
+    let column: ArrayRef = Arc::new(Date32Array::from(days.clone()));
+
+    let files = write(vec![ColumnsItem(vec![("shipdate", column)])], 100_000);
+
+    let batch = read_back(&files[0]);
+    assert_eq!(batch.schema().field(0).data_type(), &DataType::Date32);
+    let read: Vec<i32> = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+    assert_eq!(read, days);
+}
+
+
+

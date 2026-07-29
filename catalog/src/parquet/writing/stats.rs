@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use arrow_arith::aggregate::{max, min};
 use arrow_array::{
-    ArrayRef, Decimal64Array, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
-    StringArray, StringViewArray,
+    ArrayRef, Date32Array, Decimal64Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
+    Int64Array, StringArray, StringViewArray,
 };
 use arrow_schema::DataType;
 
@@ -43,6 +43,7 @@ pub(super) fn column_min_max(array: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
     match array.data_type() {
         DataType::Int32 => numeric!(Int32Array),
         DataType::Int64 => numeric!(Int64Array),
+        DataType::Date32 => numeric!(Date32Array),
         DataType::Float32 => numeric!(Float32Array),
         DataType::Float64 => numeric!(Float64Array),
         // Ordering decimals by their unscaled integers is the numeric order,
@@ -107,6 +108,7 @@ pub(super) fn stat_bytes(value: &ArrayRef) -> Option<Vec<u8>> {
     Some(match value.data_type() {
         DataType::Int32 => le_bytes!(Int32Array),
         DataType::Int64 => le_bytes!(Int64Array),
+        DataType::Date32 => le_bytes!(Date32Array),
         DataType::Float32 => le_bytes!(Float32Array),
         DataType::Float64 => le_bytes!(Float64Array),
         // Decimal stats bytes follow the precision-chosen value storage:
