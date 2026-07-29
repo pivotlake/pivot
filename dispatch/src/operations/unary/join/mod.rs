@@ -8,14 +8,20 @@
 //!
 //! Output layout: the probe-side columns listed in [`JoinOutputColumns`] (in
 //! list order) followed by the listed build-side columns. The supported shape
-//! is an equi-join on a single fixed-width key, either inner or outer on the
-//! build side.
+//! is an equi-join on a single fixed-width key, in one of the three
+//! [`JoinKind`]s below.
 //!
-//! A build-side outer join ([`JoinSpec::outer_probe_fields`]) also emits every build
+//! A build-side outer join ([`JoinKind::BuildOuter`]) also emits every build
 //! row no probe row matched, its probe columns null-filled. Which rows those
 //! are is only known once every worker has stopped probing, so the probe marks
 //! each matched build row in a shared flag array and the workers scan it
 //! together behind a barrier ([`UnmatchedScan`]).
+//!
+//! A probe-side semi join ([`JoinKind::ProbeSemi`]) emits a probe row once if
+//! the build side holds its key at all. Each probe row's candidates live in one
+//! arena range, so the probe stops walking that range at the first key that
+//! matches; nothing else about the phases changes, and no cross-worker state is
+//! involved.
 
 mod build;
 mod directory;
@@ -52,6 +58,29 @@ impl JoinOutputColumns {
     }
 }
 
+/// Which rows a join emits.
+#[derive(Debug, Clone)]
+pub enum JoinKind {
+    /// One output row per matching (probe row, build row) pair.
+    Inner,
+    /// Every pair an [`Inner`](JoinKind::Inner) emits, plus one row per build
+    /// row nothing matched, its probe columns null-filled.
+    BuildOuter {
+        /// The fields the probe columns take in the output. A worker can reach
+        /// the unmatched pass without ever having seen a probe batch to read a
+        /// schema off — an empty probe side, or simply a peer having taken all
+        /// the work — so the caller states their shape up front. Every worker
+        /// shaping its output from the same fields is also what keeps their
+        /// batches concatenable downstream.
+        probe_fields: Vec<Field>,
+    },
+    /// One output row per probe row that has at least one matching build row,
+    /// with no duplicates for a probe row that matches several. That is also
+    /// why such a join emits no build columns: there is no single build row to
+    /// take them from, so [`JoinOutputColumns::build`] must be empty.
+    ProbeSemi,
+}
+
 /// How a join is configured beyond the key type it is instantiated for.
 #[derive(Debug, Clone)]
 pub struct JoinSpec {
@@ -61,14 +90,8 @@ pub struct JoinSpec {
     pub probe_key_column: usize,
     /// Which columns of each side the join emits.
     pub output_columns: JoinOutputColumns,
-    /// The fields the probe columns take in the output. Present exactly when the
-    /// join is outer on the build side, which is what asks for them: every build
-    /// row then reaches the output, its probe columns null-filled when nothing
-    /// matched, and a worker can reach that pass without ever having seen a probe
-    /// batch to read a schema off — an empty probe side, or simply a peer
-    /// having taken all the work. Every worker shaping its output from the same
-    /// fields is also what keeps their batches concatenable downstream.
-    pub outer_probe_fields: Option<Vec<Field>>,
+    /// Which rows reach the output.
+    pub kind: JoinKind,
 }
 
 /// The cross-worker state of a build-side outer join's unmatched pass.
@@ -226,12 +249,15 @@ mod tests {
                 probe_column_count,
                 build_column_count,
             ),
-            outer_probe_fields: probe_fields,
+            kind: match probe_fields {
+                Some(probe_fields) => super::JoinKind::BuildOuter { probe_fields },
+                None => super::JoinKind::Inner,
+            },
         };
-        let (builds, probes, _) = factory::create_for_workers::<
-            arrow_array::types::Int64Type,
-            BUILD_OUTER,
-        >(spec, workers);
+        let (builds, probes, _) =
+            factory::create_for_workers::<arrow_array::types::Int64Type, BUILD_OUTER, false>(
+                spec, workers,
+            );
 
         let mut consumers: Vec<_> = builds
             .into_iter()

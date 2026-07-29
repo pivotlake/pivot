@@ -16,7 +16,7 @@ use crate::operations::unary::join::build::{
 use crate::operations::unary::join::directory::JoinDirectory;
 use crate::operations::unary::join::probe::Probe;
 use crate::operations::unary::join::{
-    JoinCell, JoinOutputColumns, JoinSpec, JoinTable, UnmatchedScan,
+    JoinCell, JoinKind, JoinOutputColumns, JoinSpec, JoinTable, UnmatchedScan,
 };
 use crate::operations::unary::pipeline_breaker::PipelineBreaker;
 
@@ -36,7 +36,11 @@ pub struct JoinBuildFactory<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUIL
 }
 
 /// Creates one [`Probe`] per worker, all sharing the same [`JoinTable`].
-pub struct JoinProbeFactory<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool> {
+pub struct JoinProbeFactory<
+    T: ArrowPrimitiveType<Native: Hash + Eq>,
+    const BUILD_OUTER: bool,
+    const SEMI: bool,
+> {
     pub(crate) table: JoinTable<T::Native>,
     hash_state: RandomState,
     key_column: usize,
@@ -52,21 +56,36 @@ pub struct JoinProbeFactory<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUIL
 /// Returns `(build_factories, probe_factories, build_ready)`. The build
 /// outputters publish readiness only after every partition job has run; the
 /// graph builder uses that flag to gate every root of the probe input.
-pub fn create_for_workers<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool>(
+///
+/// The build phase is the same for a semi join as for an inner one, so only the
+/// probe factories carry `SEMI`.
+pub fn create_for_workers<
+    T: ArrowPrimitiveType<Native: Hash + Eq>,
+    const BUILD_OUTER: bool,
+    const SEMI: bool,
+>(
     spec: JoinSpec,
     worker_count: usize,
 ) -> (
     impl IntoIterator<Item = JoinBuildFactory<T, BUILD_OUTER>>,
-    impl IntoIterator<Item = JoinProbeFactory<T, BUILD_OUTER>>,
+    impl IntoIterator<Item = JoinProbeFactory<T, BUILD_OUTER, SEMI>>,
     Arc<AtomicBool>,
 ) {
     let JoinSpec {
         build_key_column,
         probe_key_column,
         output_columns,
-        outer_probe_fields,
+        kind,
     } = spec;
+    let outer_probe_fields = match kind {
+        JoinKind::Inner | JoinKind::ProbeSemi => None,
+        JoinKind::BuildOuter { probe_fields } => Some(probe_fields),
+    };
     debug_assert_eq!(BUILD_OUTER, outer_probe_fields.is_some());
+    debug_assert!(
+        !SEMI || output_columns.build.is_empty(),
+        "a semi join emits no build columns"
+    );
     let hash_state = RandomState::with_seeds(0, 0, 0, 0);
     let partition_sizes: Arc<Vec<AtomicUsize>> =
         Arc::new((0..NUM_PARTITIONS).map(|_| AtomicUsize::new(0)).collect());
@@ -139,12 +158,12 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool>
     }
 }
 
-impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool>
-    UnaryFactory<RecordBatch, RecordBatch> for JoinProbeFactory<T, BUILD_OUTER>
+impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, const SEMI: bool>
+    UnaryFactory<RecordBatch, RecordBatch> for JoinProbeFactory<T, BUILD_OUTER, SEMI>
 {
-    type Unary = Probe<T, BUILD_OUTER>;
+    type Unary = Probe<T, BUILD_OUTER, SEMI>;
 
-    fn build_unary(self) -> Probe<T, BUILD_OUTER> {
+    fn build_unary(self) -> Probe<T, BUILD_OUTER, SEMI> {
         Probe::new(
             self.table,
             self.hash_state,

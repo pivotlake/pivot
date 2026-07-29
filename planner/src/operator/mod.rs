@@ -37,7 +37,7 @@ pub use explain::Explain;
 pub use filter::Filter;
 pub use input::Input;
 pub use insert::Insert;
-pub use join::Join;
+pub use join::{Join, JoinKind};
 pub use limit::Limit;
 pub use materialize::Materialize;
 pub use order_by::{OrderBy, OrderByDirection, OrderByNode};
@@ -221,12 +221,13 @@ impl Operator {
             // An INSERT emits one row: the inserted-row count, never NULL.
             Operator::Insert(_) => vec![false],
             // An inner join only emits rows built from both inputs, so each
-            // output column keeps its own side's nullability. A build-side
-            // outer join also emits unmatched build rows, filling their probe
-            // columns with NULL regardless of the probe input's declared
-            // nullability.
+            // output column keeps its own side's nullability; so does a semi
+            // join, whose output is probe columns the build side matched. A
+            // build-side outer join also emits unmatched build rows, filling
+            // their probe columns with NULL regardless of the probe input's
+            // declared nullability.
             Operator::Join(join) => {
-                let probe_nullable = join.outer_probe_types.is_some();
+                let probe_nullable = matches!(join.kind, JoinKind::BuildOuter { .. });
                 join.probe_output
                     .iter()
                     .map(|&i| probe_nullable || inputs[0][i])

@@ -338,3 +338,81 @@ fn aggregating_a_column_over_a_left_join_skips_the_rows_it_filled_in(
         .clone()
     );
 }
+
+/// The q18 shape: a probe side wide and long enough that DuckDB builds the hash
+/// table from the subquery's keys, which is what makes the semi join a
+/// probe-side one. Were the sizes the other way round it would flip the
+/// children and ask for a build-side semi join instead.
+fn add_wide_orders_and_repeated_keys(planner: &TestingPlanner) {
+    planner.add_table(
+        "wide_orders",
+        &[
+            ("w_key", Type::Int64, int64_col((0..1000).collect())),
+            (
+                "w_total",
+                Type::Int64,
+                int64_col((0..1000).map(|key| key * 10).collect()),
+            ),
+        ],
+    );
+    planner.add_table(
+        "big_items",
+        &[("g_order", Type::Int64, int64_col(vec![5, 5, 5, 6]))],
+    );
+}
+
+#[rstest]
+fn semi_join_keeps_a_probe_row_that_matches_at_all(mut testing_planner: TestingPlanner) {
+    add_wide_orders_and_repeated_keys(&testing_planner);
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT w_key FROM wide_orders WHERE w_key IN (SELECT g_order FROM big_items)",
+    );
+    rows.sort_by_key(|r| r["w_key"].as_i64().unwrap());
+
+    // Order 5 is named by three items and still comes out once; every order no
+    // item names does not come out at all.
+    assert_eq!(
+        rows,
+        serde_json::json!([{"w_key": 5}, {"w_key": 6}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
+#[rstest]
+fn a_semi_join_emits_the_probe_columns_asked_for(mut testing_planner: TestingPlanner) {
+    add_wide_orders_and_repeated_keys(&testing_planner);
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT w_total FROM wide_orders WHERE w_key IN (SELECT g_order FROM big_items)",
+    );
+    rows.sort_by_key(|r| r["w_total"].as_i64().unwrap());
+
+    // The key the join filters on is not in the output at all, only the column
+    // asked for.
+    assert_eq!(
+        rows,
+        serde_json::json!([{"w_total": 50}, {"w_total": 60}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
+#[rstest]
+fn aggregating_over_a_semi_join_counts_each_probe_row_once(mut testing_planner: TestingPlanner) {
+    add_wide_orders_and_repeated_keys(&testing_planner);
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT COUNT(*) AS orders, SUM(w_total) AS total FROM wide_orders \
+         WHERE w_key IN (SELECT g_order FROM big_items)",
+    );
+
+    // Two orders match, though one of them is named by three items.
+    assert_eq!(rows, vec![serde_json::json!({"orders": 2, "total": 110})]);
+}

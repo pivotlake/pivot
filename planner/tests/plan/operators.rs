@@ -3,18 +3,24 @@ use dispatch::RowDelivery;
 use insta::assert_snapshot;
 use rstest::rstest;
 
-// A user `IN`/`EXISTS` subquery lowers to a semi-join, which pivot can't
-// execute. It must NOT be mistaken for the row-id semi-join DuckDB's late
-// materialization produces (the bridge only collapses the latter) — it should
-// surface as a plain unsupported-plan error, not a mis-collapsed Materialize.
+// A user `IN`/`EXISTS` subquery lowers to a semi-join, which pivot runs as a
+// probe-side semi join: the probe row comes out once, and no build column comes
+// out at all. It must NOT be mistaken for the row-id semi-join DuckDB's late
+// materialization produces, which the bridge collapses into a Materialize.
 #[rstest]
-fn in_subquery_semijoin_is_unsupported_not_late_materialized(mut testing_planner: TestingPlanner) {
-    let result = testing_planner
-        .plan("SELECT a FROM example_table WHERE a IN (SELECT b FROM example_table WHERE b > 20)");
-    assert!(
-        result.is_err(),
-        "a user semi-join must error, not be collapsed as late materialization; got: {result:?}"
-    );
+fn in_subquery_semijoin_is_a_join_not_late_materialization(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .plan("SELECT a FROM example_table WHERE a IN (SELECT b FROM example_table WHERE b > 20)")
+        .unwrap();
+
+    assert_snapshot!(plan.to_string(), @"
+    Projection(a:Int32)
+      Join[probe semi](probe_key: 0, build_key: 0, probe_output: [0], build_output: [])
+        Input([a:Int32])
+        Projection(b:Int32)
+          Filter(b:Int32 > 20:Int32 -> Boolean)
+            Input([b:Int32])
+    ");
 }
 
 #[rstest]
