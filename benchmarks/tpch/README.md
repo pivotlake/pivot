@@ -35,14 +35,21 @@ as the engine grows the features each needs.
 | q06 | Forecasting Revenue | no join: one row from a filtered scan |
 | q08 | National Market Share | 7 joins, `extract(year ...)` groups, share of two sums |
 | q12 | Shipping Modes | orders/lineitem, CASE priority buckets per shipmode |
+| q13 | Customer Distribution | customer/orders outer join, orders per customer, then a histogram of those counts |
 | q14 | Promotion Effect | lineitem/part, promo share of revenue |
 
 The rest of the 22 need engine features that are not in yet: a join carrying
 two equality conditions (q05, q09), semi joins (q18, q20), the delim joins
 DuckDB plans a correlated subquery into (q04, q17, q21), CTE scans (q11, q15),
-mark and outer joins (q16, q13), and the `suffix` / `~~` / `!~~` / `substring`
-scalar functions (q02, q13, q16, q22). q07 and q19 additionally hit a join
-predicate that ORs columns from both sides, which the bridge cannot read.
+mark joins (q16), and the `suffix` / `substring` scalar functions (q02, q16,
+q22). q07 and q19 additionally hit a join predicate that ORs columns from both
+sides, which the bridge cannot read.
+
+Outer joins are supported only where the preserved side is the one the hash
+table is built from, which is what DuckDB hands over as a RIGHT join. It flips a
+written LEFT JOIN into that shape whenever the preserved relation is the smaller
+one, as in q13, so a query preserving the larger relation still reports the join
+type as unsupported.
 
 q10 plans and runs, but its `c_comment` group key comes back corrupted at SF100
 (fragments of other rows, with the length prefix of a neighbouring field showing
