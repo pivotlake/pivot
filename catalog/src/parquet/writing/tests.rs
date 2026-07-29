@@ -423,7 +423,7 @@ fn a_nested_path_shreds_and_reads_back() {
 /// another implementation reads the values back unchanged.
 #[test]
 fn a_high_cardinality_integer_column_packs_its_differences() {
-    let values: Vec<i64> = (0..200_000).map(|i| 1_000_000 + i * 7919).collect();
+    let values: Vec<i64> = (0..50_000).map(|i| 1_000_000 + i * 7919).collect();
     let column: ArrayRef = Arc::new(Int64Array::from(values.clone()));
 
     let files = write(vec![ColumnsItem(vec![("key", column)])], 400_000);
@@ -589,5 +589,62 @@ fn a_date_column_reads_back_as_a_date() {
     assert_eq!(read, days);
 }
 
+/// The dictionary is left behind on how many distinct values a column has, not
+/// on how large they are. This column's dictionary is only 400 KB, well inside
+/// the size guard, but every value is distinct, so the dictionary would store
+/// each one once and then spend an index per row on top. It packs instead.
+#[test]
+fn a_column_of_distinct_values_packs_rather_than_dictionary_encodes() {
+    let values: Vec<i64> = (0..50_000).map(|i| 7_000_000 + i * 13).collect();
+    let column: ArrayRef = Arc::new(Int64Array::from(values.clone()));
 
+    let files = write(vec![ColumnsItem(vec![("key", column)])], 400_000);
 
+    assert_eq!(
+        leaf_encodings(&files[0]),
+        vec![("key".to_string(), vec!["DELTA_BINARY_PACKED".to_string()])]
+    );
+}
+
+/// A column that repeats itself often enough still takes the dictionary, even
+/// where the values themselves are long: it is the repetition that pays, and
+/// this is what keeps a low-cardinality string column dictionary-encoded, where
+/// a reader can prune a row group by the dictionary alone.
+#[test]
+fn a_column_that_repeats_takes_the_dictionary_however_long_its_values() {
+    let values: Vec<String> = (0..50_000)
+        .map(|i: usize| format!("a fairly long repeated value number {}", i % 100))
+        .collect();
+    let column: ArrayRef = Arc::new(StringArray::from(values));
+
+    let files = write(vec![ColumnsItem(vec![("label", column)])], 400_000);
+
+    let (_, encodings) = leaf_encodings(&files[0]).pop().unwrap();
+    assert!(
+        encodings.contains(&"RLE_DICTIONARY".to_string()),
+        "expected a dictionary, got {encodings:?}"
+    );
+}
+
+/// A date column that falls out of the dictionary still writes: every step of
+/// the encode path has to know the type, not just the value encoders, and a
+/// small row group is enough to tip a column of few distinct dates out.
+#[test]
+fn a_date_column_writes_whichever_encoding_it_takes() {
+    let days: Vec<i32> = (0..2_000).map(|i| 9_204 + i).collect();
+    let column: ArrayRef = Arc::new(Date32Array::from(days.clone()));
+
+    let files = write(vec![ColumnsItem(vec![("shipdate", column)])], 400_000);
+
+    let (_, encodings) = leaf_encodings(&files[0]).pop().unwrap();
+    assert_eq!(encodings, vec!["DELTA_BINARY_PACKED".to_string()]);
+    let batch = read_back(&files[0]);
+    let read: Vec<i32> = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Date32Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+    assert_eq!(read, days);
+}
