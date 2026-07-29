@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # bench-ab-common.sh - shared box-side machinery for the A/B benchmark harnesses
-# (benchmarks/tpch/bench-tpch-ab.sh and benchmarks/jsonbench/bench-jsonbench-ab.sh).
+# (benchmarks/tpch/bench-tpch-ab.sh, benchmarks/tpch-flat/bench-tpch-flat-ab.sh
+# and benchmarks/jsonbench/bench-jsonbench-ab.sh).
 #
 # Sourced, not executed. It defines functions only; it runs nothing at source
 # time and does not set shell options, so each harness keeps its own `set`.

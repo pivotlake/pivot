@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# bench-tpch-ab.sh - A/B performance comparison of two pivotdb commits on the
+# bench-tpch-flat-ab.sh - A/B performance comparison of two pivotdb commits on the
 # TPC-H flat suite, run on a freshly launched instance-store machine.
 #
 # Owns the whole box side: checks both commits out of the AMI-baked repo clone,
@@ -27,7 +27,7 @@
 # emits a sentinel on every exit path.
 #
 # Usage:
-#   bench-tpch-ab.sh \
+#   bench-tpch-flat-ab.sh \
 #     --mirror /opt/pivotdb --repo-url <tokenised fetch url> \
 #     --before <sha> --after <sha> \
 #     --data-bucket s3://bucket/prefix --cache-prefix s3://bucket/cache \
@@ -45,11 +45,11 @@ _common="$_here/bench-ab-common.sh"
 # shellcheck source=../lib/bench-ab-common.sh
 source "$_common"
 
-pid_file="${PID_FILE:-/tmp/bench-tpch-ab.pid}"
+pid_file="${PID_FILE:-/tmp/bench-tpch-flat-ab.pid}"
 echo $$ >"$pid_file"
 # Fire on every exit path carrying the real exit code, so a poller watching the
 # log never hangs on a silent failure.
-trap 'echo "=== BENCH-TPCH-AB COMPLETE exit=$? ==="' EXIT
+trap 'echo "=== BENCH-TPCH-FLAT-AB COMPLETE exit=$? ==="' EXIT
 set -e
 
 mirror="/opt/pivotdb"
@@ -111,11 +111,10 @@ fi
 
 ab_common_init
 
-power_sleep=500
 sf_pgo="sf10"
 sf_measure="sf100"
-pgo_data="$data_root/$sf_pgo"
-measure_data="$data_root/$sf_measure"
+pgo_data="$data_root/$sf_pgo/flat"
+measure_data="$data_root/$sf_measure/flat"
 
 # ---------------------------------------------------------------------------
 # Dataset sync, backgrounded: the small PGO scale lands first (it gates the
@@ -161,24 +160,6 @@ io_ticks() {
     awk '{print $10}' "/sys/block/$data_dev/stat"
 }
 
-# Runs one side's whole suite in a single process, each query once, cold, with
-# a gap between queries: the TPC-H power test shape. pivot-bench applies
-# --sleep between queries rather than between iterations (runner.rs runs it in
-# the per-query loop, skipping the first), and --drop-caches evicts pivot's
-# file cache and the OS page cache before each one, so every query is a true
-# cold read inside the one warm server session a power run is meant to use.
-# Echoes "<query> <ms>" per line, in suite order.
-run_power() {
-    local bin="$1" dir="$2" out
-    out="$("$bin" --suite tpch --suite-dir "$dir/benchmarks/tpch" \
-        --source "$measure_data" --query "$queries" \
-        --iterations 1 --sleep "$power_sleep" --drop-caches --skip-check 2>&1)" || true
-    # Timing lines end in "<ms>ms"; match without depending on the separator
-    # glyph the runner prints between the query id and the time.
-    grep -E "Query q[0-9]+" <<<"$out" \
-        | sed -E 's/^.*Query (q[0-9]+).*[[:space:]]([0-9]+)ms$/\1 \2/'
-}
-
 # Runs one side's pivot-bench for one query with $iterations tries in one
 # process, echoing "cold hot io_seconds": cold is try 1 in ms, hot the min of
 # the rest ("null" when missing), io_seconds the device's io_ticks delta as a
@@ -187,7 +168,7 @@ run_pivot() {
     local bin="$1" dir="$2" query="$3"
     local t0 t1 out times
     t0="$(io_ticks)"
-    out="$("$bin" --suite tpch --suite-dir "$dir/benchmarks/tpch" \
+    out="$("$bin" --suite tpch-flat --suite-dir "$dir/benchmarks/tpch-flat" \
         --source "$measure_data" --query "$query" \
         --iterations "$iterations" --skip-check 2>&1)" || true
     t1="$(io_ticks)"
@@ -318,18 +299,18 @@ wait
 # last digit unstable); a real mismatch fails the run.
 # ---------------------------------------------------------------------------
 if [[ -z "$queries" ]]; then
-    queries="$(cd "$after_dir/benchmarks/tpch" && ls q*.sql | sed 's/\.sql$//' | paste -sd,)"
+    queries="$(cd "$after_dir/benchmarks/tpch-flat" && ls q*.sql | sed 's/\.sql$//' | paste -sd,)"
 fi
 echo ">>> burn-in + result capture (queries: $queries)"
 drop_caches
-"$before_bin" --suite tpch --suite-dir "$before_dir/benchmarks/tpch" \
+"$before_bin" --suite tpch-flat --suite-dir "$before_dir/benchmarks/tpch-flat" \
     --source "$measure_data" --query "$queries" --iterations 1 --update-results >/dev/null
 drop_caches
-"$after_bin" --suite tpch --suite-dir "$after_dir/benchmarks/tpch" \
+"$after_bin" --suite tpch-flat --suite-dir "$after_dir/benchmarks/tpch-flat" \
     --source "$measure_data" --query "$queries" --iterations 1 --update-results >/dev/null
 
 correctness="ok"
-if ! compare_outputs "$before_dir/benchmarks/tpch" "$after_dir/benchmarks/tpch"; then
+if ! compare_outputs "$before_dir/benchmarks/tpch-flat" "$after_dir/benchmarks/tpch-flat"; then
     correctness="MISMATCH"
 fi
 
@@ -344,18 +325,6 @@ fi
 rows="/tmp/ab-rows.tsv"
 : >"$rows"
 IFS=',' read -ra qlist <<<"$queries"
-# The power run first, on the quietest the box will be: one stream through the
-# whole suite, each query once and cold. It is a single sample per query, so it
-# reports but never gates; the per-query phase below is what the gate reads.
-power_before="/tmp/ab-power-before.txt"
-power_after="/tmp/ab-power-after.txt"
-echo ">>> power run (1 iteration per query, ${power_sleep}ms between queries, cold)"
-drop_caches; sleep 3
-run_power "$before_bin" "$before_dir" >"$power_before"
-drop_caches; sleep 3
-run_power "$after_bin" "$after_dir" >"$power_after"
-echo "    power run done ($(wc -l <"$power_before") / $(wc -l <"$power_after") queries timed)"
-
 echo ">>> measuring (iterations=$iterations, passes=$passes, mode=$mode)"
 for pass in $(seq "$passes"); do
     for q in "${qlist[@]}"; do
@@ -367,7 +336,7 @@ for pass in $(seq "$passes"); do
         echo -e "$q\tafter\t$cold\t$hot\t$io" >>"$rows"
         if [[ "$run_duckdb" == "1" ]]; then
             drop_caches; sleep 3
-            read -r cold hot <<<"$(run_duckdb_query "$after_dir/benchmarks/tpch/$q.sql")"
+            read -r cold hot <<<"$(run_duckdb_query "$after_dir/benchmarks/tpch-flat/$q.sql")"
             echo -e "$q\tduckdb\t$cold\t$hot\t-" >>"$rows"
         fi
         echo "    $q pass $pass done"
@@ -379,38 +348,13 @@ done
 # the io column are informational. DuckDB, when present, is a reference only.
 # ---------------------------------------------------------------------------
 {
-    echo "=== TPC-H A/B: '$before_label' (before) vs '$after_label' (after) ==="
+    echo "=== TPC-H flat A/B: '$before_label' (before) vs '$after_label' (after) ==="
     echo "mode=$mode source=$measure_data iterations=$iterations passes=$passes regression_pct=$regression_pct (cold/hot are per-query mins across passes)"
     [[ -n "$bench_env" ]] && echo "bench_env=$bench_env"
     [[ "$mode" == "release" ]] && echo "NOTE: release mode is non-PGO; numbers carry code-alignment noise, use for iteration only"
     echo "correctness (before vs after, 1e-6 relative): $correctness"
     echo
 } >"$report"
-
-# Power run: one cold sample per query, so a single number each and no hot
-# column. Reported for the shape of the whole stream, never gated on.
-{
-    echo "--- power run (1 iteration, ${power_sleep}ms between queries, cold) ---"
-    awk -v bf="$power_before" -v af="$power_after" '
-    function pct(b, a) { b = (b < 1 ? 1 : b); return (a - b) / b * 100 }
-    FILENAME == bf { b[$1] = $2; seen[$1] = 1; next }
-    FILENAME == af { a[$1] = $2; seen[$1] = 1; next }
-    END {
-        printf "%-6s %10s %10s %9s\n", "query", "before", "after", "delta"
-        n = asorti(seen, ks)
-        for (i = 1; i <= n; i++) {
-            q = ks[i]
-            if (q in b && q in a) {
-                printf "%-6s %9dms %9dms %8.1f%%\n", q, b[q], a[q], pct(b[q], a[q])
-                tb += b[q]; ta += a[q]
-            } else {
-                printf "%-6s %10s %10s %9s\n", q, (q in b ? b[q] "ms" : "-"), (q in a ? a[q] "ms" : "-"), "-"
-            }
-        }
-        if (tb > 0) printf "%-6s %9dms %9dms %8.1f%%\n", "total", tb, ta, pct(tb, ta)
-    }' "$power_before" "$power_after"
-    echo
-} >>"$report"
 
 failures="$(awk -F'\t' -v t="$regression_pct" -v duck="$run_duckdb" '
 function pct(b, a) { b = (b < 1 ? 1 : b); return (a - b) / b * 100 }

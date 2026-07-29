@@ -1,22 +1,13 @@
-name: TPC-H A/B
+name: TPC-H flat A/B
 
 # Compare pivotdb performance across two commits ("before" vs "after") on the
-# normalized TPC-H suite, on a FRESHLY LAUNCHED instance-store machine that is
+# TPC-H flat suite, on a FRESHLY LAUNCHED instance-store machine that is
 # terminated when the run ends. The box does all the work itself
-# (benchmarks/tpch/bench-tpch-ab.sh): checkouts from an AMI-baked repo clone,
+# (benchmarks/tpch-flat/bench-tpch-flat-ab.sh): checkouts from an AMI-baked repo clone,
 # dataset sync from S3 overlapping the builds, PGO (or plain release) builds
-# per side with warm cargo caches restored from S3, then two measurements.
-#
-# First a power run: one stream through the whole suite, each query once and
-# cold, 500ms apart, which is the shape TPC-H's power test measures. It is a
-# single sample per query, so it is reported and never gated on.
-#
-# Then the per-query phase, a fresh pivot-bench process per query so every
-# query gets its own server, sides interleaved across passes, with cold and hot
-# as per-query mins. That is what the gate reads: a cold regression past the
-# threshold, or an output mismatch between the sides, fails the run.
-#
-# Manual trigger only.
+# per side with warm cargo caches restored from S3, and a per-query interleaved
+# cold/hot measurement. Fails on a cold regression past the threshold or an
+# output mismatch between the sides. Manual trigger only.
 #
 # One-time setup: bake the AMI with benchmarks/tpch/bake-tpch-ab-ami.sh and set
 # the TPCH_AB_AMI_ID variable to its output.
@@ -40,8 +31,7 @@ name: TPC-H A/B
 #   TPCH_AB_KEY_NAME      (ec2-key-pair)  - EC2 key pair matching PERF_SSH_KEY
 #   TPCH_AB_SUBNET_ID / TPCH_AB_SECURITY_GROUP  (account defaults) - the
 #                         security group must allow ssh from the runner
-#   TPCH_AB_DATA_BUCKET_NORM (s3://epsio-tpch) - the normalized dataset, one
-#                         directory per table under each scale prefix
+#   TPCH_AB_DATA_BUCKET   (s3://pivot-tpch-flat)
 #   TPCH_AB_CACHE_PREFIX  (s3://pivot-tpch-flat/tpch-ab-cache) - empty string
 #                         disables warm caches entirely
 
@@ -87,15 +77,15 @@ on:
         default: ""
 
 jobs:
-  tpch-ab:
-    name: TPC-H A/B on a fresh box
+  tpch-flat-ab:
+    name: TPC-H flat A/B on a fresh box
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.PERF_AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.PERF_AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ${{ vars.TPCH_AB_REGION || 'eu-central-1' }}
-      DATA_BUCKET: ${{ vars.TPCH_AB_DATA_BUCKET_NORM || 's3://epsio-tpch' }}
+      DATA_BUCKET: ${{ vars.TPCH_AB_DATA_BUCKET }}
       CACHE_PREFIX: ${{ vars.TPCH_AB_CACHE_PREFIX }}
 
     steps:
@@ -139,7 +129,7 @@ jobs:
                 --key-name "$KEY_NAME"
                 --iam-instance-profile "Name=$INSTANCE_PROFILE"
                 --instance-initiated-shutdown-behavior terminate
-                --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=tpch-ab-norm-${GITHUB_RUN_ID}}]")
+                --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=tpch-ab-flat-${GITHUB_RUN_ID}}]")
           [ -n "$SUBNET_ID" ] && args+=(--subnet-id "$SUBNET_ID")
           [ -n "$SECURITY_GROUP" ] && args+=(--security-group-ids "$SECURITY_GROUP")
 
@@ -210,7 +200,7 @@ jobs:
           # Ship the harness and its shared library from the run's commit (the
           # 'before' commit may predate them). The harness sources the library
           # by relative path, so both land in the same /tmp directory.
-          scp -F "$HOME/.ssh/config" benchmarks/tpch/bench-tpch-ab.sh box:/tmp/bench-tpch-ab.sh
+          scp -F "$HOME/.ssh/config" benchmarks/tpch-flat/bench-tpch-flat-ab.sh box:/tmp/bench-tpch-flat-ab.sh
           scp -F "$HOME/.ssh/config" benchmarks/lib/bench-ab-common.sh box:/tmp/bench-ab-common.sh
 
           query_arg=""
@@ -221,8 +211,8 @@ jobs:
           [ -n "$BENCH_ENV" ] && env_arg="--bench-env '$BENCH_ENV'"
 
           cat > /tmp/launch.sh <<EOF
-          rm -f /tmp/ab.log /tmp/ab-report.txt /tmp/bench-tpch-ab.pid
-          setsid bash /tmp/bench-tpch-ab.sh \
+          rm -f /tmp/ab.log /tmp/ab-report.txt /tmp/bench-tpch-flat-ab.pid
+          setsid bash /tmp/bench-tpch-flat-ab.sh \
             --mirror /opt/pivotdb \
             --repo-url 'https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git' \
             --before '$BEFORE_SHA' --after '$AFTER_SHA' \
@@ -243,9 +233,9 @@ jobs:
           # means an untrappable kill.
           while true; do
             state=$(ssh box '
-              if kill -0 "$(cat /tmp/bench-tpch-ab.pid 2>/dev/null)" 2>/dev/null; then
+              if kill -0 "$(cat /tmp/bench-tpch-flat-ab.pid 2>/dev/null)" 2>/dev/null; then
                 echo alive
-              elif grep -q "BENCH-TPCH-AB COMPLETE" /tmp/ab.log 2>/dev/null; then
+              elif grep -q "BENCH-TPCH-FLAT-AB COMPLETE" /tmp/ab.log 2>/dev/null; then
                 echo done
               else
                 echo dead
@@ -262,7 +252,7 @@ jobs:
             esac
           done
 
-          exit_line=$(ssh box "grep -o 'BENCH-TPCH-AB COMPLETE exit=[0-9]*' /tmp/ab.log | tail -1")
+          exit_line=$(ssh box "grep -o 'BENCH-TPCH-FLAT-AB COMPLETE exit=[0-9]*' /tmp/ab.log | tail -1")
           code="${exit_line##*=}"
           echo "A/B exit code: ${code:-unknown}"
 
