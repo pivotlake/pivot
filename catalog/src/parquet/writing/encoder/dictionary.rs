@@ -1,10 +1,17 @@
 //! The dictionary encode path: a PLAIN dictionary page of the distinct values
 //! plus one data page of RLE/bit-packed indices into it.
 //!
-//! Mirrors arrow's policy — try a dictionary, fall back to PLAIN once the
-//! dictionary's distinct values would reach [`DICTIONARY_PAGE_SIZE_LIMIT`] — so
-//! low-cardinality columns dictionary-encode and high-cardinality ones (e.g.
-//! timestamps) stay PLAIN.
+//! A dictionary pays while a column repeats itself: the values are stored once
+//! and each row becomes a small integer. It stops paying as the column
+//! approaches distinct, where the dictionary holds nearly every value anyway and
+//! the indices are pure addition, and the leaf is better served by an encoding
+//! that packs the values themselves.
+//!
+//! Which is why the test is on the count of distinct values rather than on their
+//! size: a key column is close to fully distinct at any width, so a byte
+//! threshold only catches it once the dictionary is enormous, while
+//! [`MAX_DISTINCT_SHARE`] catches it immediately. The size limit stays as a
+//! second guard for a column of few but very large values.
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int32Type;
@@ -17,14 +24,19 @@ use super::leaves::Leaf;
 use super::pages::{self, PageKind};
 use super::{plain, rle};
 
-/// Fall back from dictionary to PLAIN once the dictionary's distinct values would
-/// reach this PLAIN-encoded size — arrow's default `dictionary_page_size_limit`.
+/// Fall back once the distinct values reach this PLAIN-encoded size — arrow's
+/// default `dictionary_page_size_limit`.
 const DICTIONARY_PAGE_SIZE_LIMIT: usize = 1024 * 1024;
 
+/// Fall back once the distinct values reach this share of the leaf's rows, one
+/// in five, which is what DuckDB's writer uses.
+const MAX_DISTINCT_SHARE: usize = 5;
+
 /// Dictionary-encode a leaf if it pays: build the dictionary, and while its
-/// distinct values stay under [`DICTIONARY_PAGE_SIZE_LIMIT`], return the PLAIN
-/// dictionary page and the RLE-encoded index page. `None` means fall back to
-/// PLAIN — the dictionary grew too large, or the value type doesn't
+/// distinct values stay under both [`MAX_DISTINCT_SHARE`] of the rows and
+/// [`DICTIONARY_PAGE_SIZE_LIMIT`], return the PLAIN dictionary page and the
+/// RLE-encoded index page. `None` means the leaf is better encoded another way
+/// — too many distinct values, too large a dictionary, or a type that does not
 /// dictionary-cast.
 pub(super) fn try_encode(leaf: &Leaf) -> WriteResult<Option<(EncodedPage, EncodedPage)>> {
     let values = &leaf.values;
@@ -37,9 +49,12 @@ pub(super) fn try_encode(leaf: &Leaf) -> WriteResult<Option<(EncodedPage, Encode
     };
     let dictionary = dictionary.as_dictionary::<Int32Type>();
     let distinct = dictionary.values();
+    if distinct.len() >= values.len().div_ceil(MAX_DISTINCT_SHARE) {
+        return Ok(None);
+    }
 
-    // The PLAIN-encoded distinct values are the dictionary page body; their size
-    // is arrow's fallback signal.
+    // The PLAIN-encoded distinct values are the dictionary page body, and their
+    // size is the second guard.
     let mut dict_raw = Vec::new();
     plain::encode_into(distinct.as_ref(), &mut dict_raw)?;
     if dict_raw.len() >= DICTIONARY_PAGE_SIZE_LIMIT {
