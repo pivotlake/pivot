@@ -130,8 +130,10 @@ jobs:
                 --iam-instance-profile "Name=$INSTANCE_PROFILE"
                 --instance-initiated-shutdown-behavior terminate
                 --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=tpch-ab-${GITHUB_RUN_ID}}]")
-          [ -n "$SUBNET_ID" ] && args+=(--subnet-id "$SUBNET_ID")
-          [ -n "$SECURITY_GROUP" ] && args+=(--security-group-ids "$SECURITY_GROUP")
+          # `[ -n "$X" ] && args+=(...)` returns non-zero when X is empty, which
+          # under set -e aborts the launch before it ever runs run-instances.
+          if [ -n "$SUBNET_ID" ]; then args+=(--subnet-id "$SUBNET_ID"); fi
+          if [ -n "$SECURITY_GROUP" ]; then args+=(--security-group-ids "$SECURITY_GROUP"); fi
 
           # Belt-and-braces leak guard: the instance halts itself after 3h and
           # a halt terminates it (shutdown behavior above), so a runner that
@@ -285,8 +287,32 @@ jobs:
           if-no-files-found: ignore
 
       - name: Terminate the box
-        if: ${{ always() && env.INSTANCE_ID != '' }}
+        # Always, and never gated on the id: a launch that died between
+        # run-instances and writing INSTANCE_ID leaves a box the job has
+        # forgotten, which is exactly the one that would otherwise bill until
+        # the 4h self-shutdown. The run tag finds it either way.
+        if: ${{ always() }}
         run: |
-          set -euo pipefail
-          echo "Terminating ${INSTANCE_ID}"
-          aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" >/dev/null || true
+          set -uo pipefail
+          tagged=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=tpch-ab-${GITHUB_RUN_ID}" \
+                      'Name=instance-state-name,Values=pending,running,stopping,stopped' \
+            --query 'Reservations[].Instances[].InstanceId' --output text 2>/dev/null || true)
+          [ "$tagged" = "None" ] && tagged=""
+
+          rc=0
+          seen=""
+          for id in ${INSTANCE_ID:-} $tagged; do
+            case " $seen " in *" $id "*) continue ;; esac
+            seen="$seen $id"
+            echo "Terminating $id"
+            # Not swallowed. A failure here leaks a running box that bills until
+            # the four-hour self-shutdown, so it has to be visible and fail the
+            # job rather than read as success.
+            if ! aws ec2 terminate-instances --instance-ids "$id"; then
+              echo "::error::failed to terminate $id; terminate it by hand"
+              rc=1
+            fi
+          done
+          [ -n "$seen" ] || echo "no instance to terminate"
+          exit $rc
