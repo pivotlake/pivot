@@ -23,7 +23,7 @@ use dispatch::{Unary, UnaryFactory};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-mod column_decoders;
+pub(crate) mod column_decoders;
 
 mod row_group_decoder;
 pub use row_group_decoder::{Error as RowGroupDecoderError, RowGroupDecoder};

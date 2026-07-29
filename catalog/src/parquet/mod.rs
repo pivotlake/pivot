@@ -32,7 +32,13 @@ pub(crate) fn http_readahead() -> usize {
 
 mod request_tracker;
 
-mod reading;
+/// Entry points for the decode benchmark, behind a feature so they are built
+/// only for it and never enter a normal build.
+#[cfg(feature = "bench-hooks")]
+#[doc(hidden)]
+pub mod decoder_bench_hooks;
+
+pub(crate) mod reading;
 pub use reading::{
     DecoderFactory, DecompressorError, DecompressorFactory, IndexerFactory, MaterializerFactory,
     RowGroupDecoderError, RowGroupFetcherFactory, RowGroupInjectorFactory, ScanEqualityPredicate,

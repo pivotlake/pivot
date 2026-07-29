@@ -8,6 +8,7 @@
 
 use super::super::ArrayBuilder;
 use crate::parquet::reading::decoding::column_decoders::DecodePlain;
+use crate::parquet::reading::decoding::column_decoders::bytes_view::delta_length_page_decoder::DeltaLengthPageDecoder;
 use crate::parquet::reading::decoding::column_decoders::bytes_view::views_builder::ViewsBuilder;
 use arrow_array::builder::make_view;
 use arrow_array::types::ByteViewType;
@@ -149,6 +150,7 @@ impl<V: ByteViewType> PlainPageDecoder<V> {
 
 impl<V: ByteViewType> DecodePlain for PlainPageDecoder<V> {
     type Builder = ViewsBuilder<V>;
+    type Delta = DeltaLengthPageDecoder<V>;
 
     fn new(data: Vec<Bytes>, position: ReaderPosition) -> Self {
         Self {

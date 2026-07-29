@@ -835,3 +835,198 @@ fn scan_empty_table() {
 
     assert_eq!(extract_count(&results), 0);
 }
+
+/// A column written `DELTA_BINARY_PACKED` by arrow's writer reads back with the
+/// same values as the plain-encoded column beside it, which is the check the
+/// hand-built decoder unit tests cannot make: it decodes what another
+/// implementation actually wrote.
+#[test]
+fn scan_delta_binary_packed_column() {
+    let dispatch = dispatch(2);
+    let rows: Vec<i64> = (0..50_000).map(|i| 1_000_000 + i * 37 % 999_983).collect();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("delta", DataType::Int64, false),
+        Field::new("plain", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(rows.clone())) as ArrayRef,
+            Arc::new(Int64Array::from(rows.clone())) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let dir = TempDir::new().unwrap();
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_dictionary_enabled(false)
+        .set_column_encoding(
+            "delta".into(),
+            parquet::basic::Encoding::DELTA_BINARY_PACKED,
+        )
+        .set_column_encoding("plain".into(), parquet::basic::Encoding::PLAIN)
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        std::fs::File::create(dir.path().join("data.parquet")).unwrap(),
+        schema,
+        Some(props),
+    )
+    .unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let table = parquet_table_from_dir(&dispatch, dir.path());
+
+    let results = table_input(&dispatch, &table, Projection::all(2), false)
+        .collect()
+        .unwrap();
+
+    let mut delta: Vec<i64> = Vec::new();
+    let mut plain: Vec<i64> = Vec::new();
+    for batch in &results {
+        delta.extend(
+            batch
+                .column(0)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .values(),
+        );
+        plain.extend(
+            batch
+                .column(1)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .values(),
+        );
+    }
+    delta.sort_unstable();
+    plain.sort_unstable();
+    let mut expected = rows;
+    expected.sort_unstable();
+    assert_eq!(delta, expected);
+    assert_eq!(plain, expected);
+}
+
+/// A string column written `DELTA_LENGTH_BYTE_ARRAY` by arrow's writer reads
+/// back with the same values as the plain-encoded copy beside it. The column is
+/// sized past one 2 MiB buffer so values land across a buffer boundary too, and
+/// mixes lengths either side of the twelve bytes a view inlines.
+#[test]
+fn scan_delta_length_byte_array_column() {
+    let dispatch = dispatch(2);
+    let rows: Vec<String> = (0..60_000)
+        .map(|i: usize| {
+            if i.is_multiple_of(5) {
+                format!("s{i}")
+            } else {
+                format!("a much longer value that will not inline, number {i:012}")
+            }
+        })
+        .collect();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("delta", DataType::Utf8View, false),
+        Field::new("plain", DataType::Utf8View, false),
+    ]));
+    let column: ArrayRef = Arc::new(StringViewArray::from(
+        rows.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+    ));
+    let batch = RecordBatch::try_new(schema.clone(), vec![column.clone(), column.clone()]).unwrap();
+    let dir = TempDir::new().unwrap();
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_dictionary_enabled(false)
+        .set_column_encoding(
+            "delta".into(),
+            parquet::basic::Encoding::DELTA_LENGTH_BYTE_ARRAY,
+        )
+        .set_column_encoding("plain".into(), parquet::basic::Encoding::PLAIN)
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        std::fs::File::create(dir.path().join("data.parquet")).unwrap(),
+        schema,
+        Some(props),
+    )
+    .unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let table = parquet_table_from_dir(&dispatch, dir.path());
+
+    let results = table_input(&dispatch, &table, Projection::all(2), false)
+        .collect()
+        .unwrap();
+
+    let mut delta = collect_strings(&results, 0);
+    let mut plain = collect_strings(&results, 1);
+    delta.sort();
+    plain.sort();
+    let mut expected = rows;
+    expected.sort();
+    assert_eq!(delta, expected);
+    assert_eq!(plain, expected);
+}
+
+/// A column our own writer delta-encodes reads back through our own scan, so
+/// the two halves of the encoding agree with each other and not only with
+/// arrow's reader.
+#[test]
+fn scan_a_column_our_writer_delta_encoded() {
+    let dispatch = dispatch(2);
+    let keys: Vec<i64> = (0..200_000).map(|i| 5_000_000 + i * 7919).collect();
+    let names: Vec<String> = (0..200_000)
+        .map(|i| format!("value {i} with enough tail to not inline"))
+        .collect();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Int64, false),
+            Field::new("name", DataType::Utf8View, false),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(keys.clone())) as ArrayRef,
+            Arc::new(StringViewArray::from(
+                names.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let dir = TempDir::new().unwrap();
+    let spec = dispatch::values_input(&dispatch, vec![batch]).record_batches();
+    let files: Vec<catalog::parquet::writing::EncodedFile> =
+        catalog::parquet::writing::encode_record_batches(
+            spec,
+            Arc::from([]),
+            Arc::from([]),
+            400_000,
+            1,
+        )
+        .collect()
+        .unwrap();
+    std::fs::write(dir.path().join("data.parquet"), &files[0].bytes).unwrap();
+    let table = parquet_table_from_dir(&dispatch, dir.path());
+
+    let results = table_input(&dispatch, &table, Projection::all(2), false)
+        .collect()
+        .unwrap();
+
+    let mut read_keys: Vec<i64> = Vec::new();
+    let mut read_names: Vec<String> = Vec::new();
+    for batch in &results {
+        read_keys.extend(
+            batch
+                .column(0)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .values(),
+        );
+        read_names.extend(
+            batch
+                .column(1)
+                .as_string_view()
+                .iter()
+                .map(|v| v.unwrap().to_string()),
+        );
+    }
+    read_keys.sort_unstable();
+    read_names.sort();
+    let mut expected_keys = keys;
+    let mut expected_names = names;
+    expected_keys.sort_unstable();
+    expected_names.sort();
+    assert_eq!(read_keys, expected_keys);
+    assert_eq!(read_names, expected_names);
+}

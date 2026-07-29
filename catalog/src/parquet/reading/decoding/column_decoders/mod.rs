@@ -17,11 +17,14 @@
 //! - [`primitive::PrimitiveColumnDecoder`] for fixed-width numeric types.
 //! - [`bytes_view::BytesViewDecoder`] for variable-length string / binary types.
 
-mod bytes_view;
+pub(crate) mod bytes_view;
 pub use bytes_view::BytesViewDecoder;
 
 mod decimal;
-pub use decimal::decimal_decoder;
+pub use decimal::{DecimalStorage, decimal_decoder};
+
+pub(crate) mod delta_binary_packed;
+pub use delta_binary_packed::{DecimalDeltaDecoder, DeltaDecoder, FromDelta};
 
 mod levels;
 
@@ -118,6 +121,13 @@ pub use dispatch::arrays::ArrayBuilder;
 pub trait DecodePlain {
     type Builder: ArrayBuilder;
 
+    /// This column type's delta decoder: `DELTA_BINARY_PACKED` for the
+    /// integer and decimal columns, `DELTA_LENGTH_BYTE_ARRAY` for the byte-view
+    /// ones. Construction answers `None` when the page's own type rules the
+    /// encoding out (a float column, or a decimal stored as fixed-length
+    /// bytes), which reports it as unsupported rather than decoding nonsense.
+    type Delta: DecodeDelta<Builder = Self::Builder>;
+
     /// Creates a decoder starting at `position` within `data`.
     fn new(data: Vec<Bytes>, position: ReaderPosition) -> Self;
 
@@ -125,6 +135,28 @@ pub trait DecodePlain {
     fn read(&mut self, builder: &mut Self::Builder, size: usize);
 
     /// Advances past `size` values without decoding them.
+    fn skip(&mut self, size: usize);
+}
+
+/// Reads `DELTA_BINARY_PACKED` values from raw page bytes into an
+/// [`ArrayBuilder`], the delta-encoded counterpart of [`DecodePlain`].
+pub trait DecodeDelta: Sized {
+    type Builder: ArrayBuilder;
+
+    /// The encoding this decoder reads. A column type has exactly one delta
+    /// form, so naming it here is what lets the page dispatch pair them up and
+    /// reject a page whose encoding does not match the column's type.
+    const ENCODING: Encoding;
+
+    /// Creates a decoder over a page starting at `position`, reading its
+    /// header. `None` when the encoding does not apply to this column type.
+    fn new(data: Vec<Bytes>, position: ReaderPosition) -> Option<Self>;
+
+    /// Decodes `size` values into `builder`.
+    fn read(&mut self, builder: &mut Self::Builder, size: usize);
+
+    /// Advances past `size` values. The values are still decoded, because each
+    /// delta is relative to the one before it.
     fn skip(&mut self, size: usize);
 }
 

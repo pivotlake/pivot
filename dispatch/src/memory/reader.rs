@@ -58,7 +58,7 @@ impl<'a, 'b> MultiBufferReader<'a, 'b> {
 
     /// The unread portion of the current buffer.
     #[inline(always)]
-    fn current_slice(&self) -> &[u8] {
+    pub fn current_slice(&self) -> &[u8] {
         &self.cur[self.position.offset..]
     }
 

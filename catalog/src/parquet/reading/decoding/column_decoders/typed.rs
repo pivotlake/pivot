@@ -17,7 +17,8 @@
 use crate::parquet::reading::decoding::column_decoders::levels::decode_def_levels;
 use crate::parquet::reading::decoding::column_decoders::rle::RleDecoder;
 use crate::parquet::reading::decoding::column_decoders::{
-    ArrayBuilder, ColumnDecoder, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error, Result,
+    ArrayBuilder, ColumnDecoder, DecodeDelta, DecodePlain, Dict, DictFromBytes, DictFromVecBytes,
+    Error, Result,
 };
 use crate::parquet::types::filter_mask::RunningFilterMask;
 use crate::parquet::types::page::{DataPage, DecompressedPage, DecompressedPageType};
@@ -33,6 +34,7 @@ use std::marker::PhantomData;
 pub enum ValueDecoder<P: DecodePlain> {
     Plain(P),
     Rle(RleDecoder),
+    Delta(P::Delta),
 }
 
 /// Decode `n` values into `builder` (a dictionary page looks each index up in
@@ -49,6 +51,7 @@ fn decode_run<D, P>(
     match decoder {
         ValueDecoder::Plain(p) => p.read(builder, n),
         ValueDecoder::Rle(r) => r.read(builder, dict.expect("No dict available!"), n),
+        ValueDecoder::Delta(d) => d.read(builder, n),
     }
 }
 
@@ -57,6 +60,7 @@ fn skip_run<P: DecodePlain>(decoder: &mut ValueDecoder<P>, n: usize) {
     match decoder {
         ValueDecoder::Plain(p) => p.skip(n),
         ValueDecoder::Rle(r) => r.skip(n),
+        ValueDecoder::Delta(d) => d.skip(n),
     }
 }
 
@@ -278,8 +282,8 @@ where
         }
     }
 
-    /// Selects the appropriate [`ValueDecoder`] (plain or RLE-dictionary)
-    /// based on the page header's encoding.
+    /// Selects the appropriate [`ValueDecoder`] (plain, RLE-dictionary, or
+    /// delta) based on the page header's encoding.
     fn create_decoder(
         &self,
         header: DataPageHeader,
@@ -300,6 +304,11 @@ where
                     data, position, bit_width,
                 )))
             }
+            // The column type decides which delta encoding it can read, so a
+            // page carrying the other one falls through as unsupported.
+            e if e == P::Delta::ENCODING => P::Delta::new(data, position)
+                .map(ValueDecoder::Delta)
+                .ok_or(Error::UnsupportedEncoding(e)),
             r => Err(Error::UnsupportedEncoding(r)),
         }
     }
