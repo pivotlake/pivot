@@ -163,6 +163,10 @@ impl WriteThrift for LogicalType {
                 precision.write_thrift_field(writer, 2, last_field_id)?;
                 writer.write_struct_end()?;
             }
+            // DATE union member: field 6, an (empty) DateType struct.
+            LogicalType::Date => {
+                writer.write_empty_struct(6, 0)?;
+            }
             // VARIANT union member: field 16, an (empty) VariantType struct.
             LogicalType::Variant => {
                 writer.write_empty_struct(16, 0)?;

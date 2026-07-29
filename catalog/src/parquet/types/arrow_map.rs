@@ -20,7 +20,7 @@
 //!   Float32           FLOAT              -                       read+write
 //!   Float64           DOUBLE             -                       read+write
 //!   Utf8 / Utf8View   BYTE_ARRAY         converted UTF8 / String read+write
-//!   Date32            INT32              Date                    read only
+//!   Date32            INT32              Date
 //!   Timestamp(Second) INT64              Timestamp{..}           read only
 //!   BinaryView        BYTE_ARRAY         unannotated             read+write
 //!   Decimal64(p,s)    INT32              Decimal (p <= 9)        read+write
@@ -316,6 +316,9 @@ pub fn arrow_to_parquet_physical(data_type: &DataType) -> Result<i32> {
     Ok(match data_type {
         DataType::Int32 => INT32,
         DataType::Int64 => INT64,
+        // A date is its day count, stored as the INT32 the DATE annotation
+        // (stamped alongside it) tells a reader to interpret.
+        DataType::Date32 => INT32,
         DataType::Float32 => FLOAT,
         DataType::Float64 => DOUBLE,
         DataType::Utf8 | DataType::Utf8View | DataType::BinaryView => BYTE_ARRAY,

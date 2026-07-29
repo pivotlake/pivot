@@ -17,8 +17,8 @@
 //! what keeps each one starting on a byte boundary.
 
 use arrow_array::{
-    Array, BinaryViewArray, Decimal64Array, Decimal128Array, Int32Array, Int64Array, StringArray,
-    StringViewArray,
+    Array, BinaryViewArray, Date32Array, Decimal64Array, Decimal128Array, Int32Array, Int64Array,
+    StringArray, StringViewArray,
 };
 use arrow_schema::DataType;
 use std::borrow::Cow;
@@ -57,7 +57,7 @@ pub(super) fn try_encode_chunk(leaf: &Leaf) -> WriteResult<Option<(Encoding, Vec
 /// none.
 fn encoding_for(data_type: &DataType) -> Option<Encoding> {
     match data_type {
-        DataType::Int32 | DataType::Int64 => Some(Encoding::DELTA_BINARY_PACKED),
+        DataType::Int32 | DataType::Int64 | DataType::Date32 => Some(Encoding::DELTA_BINARY_PACKED),
         DataType::Decimal64(precision, _) | DataType::Decimal128(precision, _) => {
             match decimal_write_storage(*precision) {
                 DecimalWriteStorage::Int32 | DecimalWriteStorage::Int64 => {
@@ -112,6 +112,10 @@ fn integers(array: &dyn Array) -> WriteResult<Cow<'_, [i64]>> {
         DataType::Decimal64(_, _) => Cow::Borrowed(downcast::<Decimal64Array>(array)?.values()),
         DataType::Int32 => {
             let a = downcast::<Int32Array>(array)?;
+            Cow::Owned((0..len).map(|i| a.value(i) as i64).collect())
+        }
+        DataType::Date32 => {
+            let a = downcast::<Date32Array>(array)?;
             Cow::Owned((0..len).map(|i| a.value(i) as i64).collect())
         }
         DataType::Decimal128(_, _) => {

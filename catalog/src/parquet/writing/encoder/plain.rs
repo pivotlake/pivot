@@ -7,8 +7,8 @@
 //! distinct values.
 
 use arrow_array::{
-    Array, BinaryViewArray, Decimal64Array, Decimal128Array, Float32Array, Float64Array,
-    Int32Array, Int64Array, StringArray, StringViewArray,
+    Array, BinaryViewArray, Date32Array, Decimal64Array, Decimal128Array, Float32Array,
+    Float64Array, Int32Array, Int64Array, StringArray, StringViewArray,
 };
 use arrow_schema::DataType;
 use thriftparquet::general::Encoding;
@@ -87,6 +87,8 @@ pub(super) fn encode_into(array: &dyn Array, out: &mut Vec<u8>) -> WriteResult<(
     match array.data_type() {
         DataType::Int32 => fixed!(Int32Array),
         DataType::Int64 => fixed!(Int64Array),
+        // A date writes the day count its INT32 storage holds.
+        DataType::Date32 => fixed!(Date32Array),
         DataType::Float32 => fixed!(Float32Array),
         DataType::Float64 => fixed!(Float64Array),
         // A decimal writes the narrowest storage its precision allows (see
