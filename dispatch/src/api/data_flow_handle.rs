@@ -64,8 +64,12 @@ impl<T> DataFlowHandle<T> {
     /// Like [`collect`](Self::collect), but also returns the dataflow's stats
     /// folded across every worker. The tally is all zeros unless the dataflow
     /// was launched with [`execute_with_stats`](crate::OperatorSpec::execute_with_stats).
-    /// By the time the output channel has closed, every worker that finished has
-    /// already shipped its tally, so the stats channel is fully drained here.
+    ///
+    /// The output channel closing does not mean the tallies have landed: a
+    /// worker releases the output sender the moment its last operator finishes,
+    /// and ships its tally just afterwards, when the worker drops the dataflow.
+    /// So the fold waits on the stats channel itself, which closes only once
+    /// every worker has dropped its dataflow, and therefore reported.
     pub fn collect_with_stats(mut self) -> crate::data_flow::Result<(Vec<T>, DataFlowStats)> {
         let mut items = Vec::new();
         let mut error = None;
@@ -90,7 +94,7 @@ impl<T> DataFlowHandle<T> {
             error = Some(e);
         }
         let mut stats = DataFlowStats::default();
-        while let Ok(worker_stats) = self.stats_rx.try_recv() {
+        while let Ok(worker_stats) = self.stats_rx.recv() {
             stats.merge(&worker_stats);
         }
         match error {

@@ -55,9 +55,6 @@ use thiserror::Error;
 
 pub mod channels;
 
-mod abandoned;
-pub use abandoned::AbandonedOperator;
-
 pub mod in_memory;
 pub use in_memory::{Forward, InjectorSourceFactory};
 
@@ -82,7 +79,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// Outcome of an operator's [`try_finish`](Operator::try_finish).
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum FinishStatus {
-    /// Fully finished. The worker latches this and stops calling `try_finish`.
+    /// Fully finished. The node drops the operator on hearing this, so it is
+    /// never asked again.
     Done,
     /// Still producing final output and needs to be re-driven — e.g. a pipeline
     /// breaker draining its outputter over several calls. The worker keeps
@@ -96,7 +94,8 @@ pub enum FinishStatus {
 
 /// A single node in a `DataFlow`.
 ///
-/// Each operator lives for the full lifetime of the dataflow on one worker thread.
+/// Each operator runs on one worker thread, and is dropped as soon as it reports
+/// [`FinishStatus::Done`] rather than at the end of the dataflow.
 /// Sibling operators (the same stage on different workers) share the same identifier,
 /// enabling work stealing and coordinated finishing (e.g. a shared atomic counter for
 /// `Count`).

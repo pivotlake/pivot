@@ -28,7 +28,7 @@ use crate::io::{
     DataFlowRequest, FsReadRequest, FsRequest, FsWriteRequest, HttpGetRequest, HttpRequest,
     HttpUploadRequest,
 };
-use crate::operations::{AbandonedOperator, FinishStatus, Operator};
+use crate::operations::{FinishStatus, Operator};
 use crate::stats::{DataFlowStats, StatsCollector};
 use crate::waker::waker_set;
 use ahash::HashMap;
@@ -46,17 +46,46 @@ use tracing::{debug, error, warn};
 /// in the parent `DataFlow` as index lists.
 struct OperatorNode {
     id: Identifier,
-    operator: Box<dyn Operator>,
+    /// The node's operator, or `None` once it has finished (or been abandoned).
+    /// Dropping it at that moment frees what it held right away: the batches
+    /// buffered in its channels, its hash tables, and the downstream sender it
+    /// owns. Releasing that sender is also how a stage's completion becomes
+    /// observable to whoever holds the other end.
+    ///
+    /// Retiring the node in place, rather than restructuring the graph, keeps
+    /// every edge index stable: traversals skip a retired node and move on, and
+    /// a late IO completion routed to one lands nowhere.
+    operator: Option<Box<dyn Operator>>,
     /// One-shot publication gates. Open gates are removed after an Acquire
     /// observation, leaving no atomic loads on this node's steady-state path.
     gates: Vec<Arc<AtomicBool>>,
-    /// turns true once `try_finish` returns `true`. Future traversals skip
-    /// this node so each operator's try_finish isn't called after it reports
-    /// done.
-    finished: bool,
 }
 
 impl OperatorNode {
+    /// Whether this node has retired, which is exactly "it no longer holds an
+    /// operator".
+    #[inline]
+    fn is_finished(&self) -> bool {
+        self.operator.is_none()
+    }
+
+    /// Run `f` against this node's operator, or return `None` when the node has
+    /// nothing to run because it retired or is still gated.
+    #[inline]
+    fn run<T>(
+        &mut self,
+        f: &mut impl FnMut(Identifier, &mut dyn Operator) -> Result<ControlFlow<T>>,
+    ) -> Result<Option<ControlFlow<T>>> {
+        if self.is_gated() {
+            return Ok(None);
+        }
+        let id = self.id;
+        match self.operator.as_deref_mut() {
+            Some(operator) => f(id, operator).map(Some),
+            None => Ok(None),
+        }
+    }
+
     #[inline]
     fn is_gated(&mut self) -> bool {
         let gated_before = self.gates.len();
@@ -135,9 +164,8 @@ impl OperatorGraph {
             .enumerate()
             .map(|(id, operator)| OperatorNode {
                 id,
-                operator,
+                operator: Some(operator),
                 gates: gates.remove(&id).unwrap_or_default(),
-                finished: false,
             })
             .collect();
 
@@ -153,32 +181,42 @@ impl OperatorGraph {
         }
     }
 
-    /// Walk leaf-to-root via back-edges. The closure receives `&mut OperatorNode`
-    /// so it can drive the operator and read/update `finished` or other properties.
-    pub fn traverse_backwards<T, F: FnMut(&mut OperatorNode) -> Result<ControlFlow<T>>>(
+    /// Walk leaf-to-root via back-edges, running the closure against every node
+    /// that still has work to give: a retired or gated node is stepped over, but
+    /// the walk carries on through it to its publishers.
+    pub fn traverse_backwards<
+        T,
+        F: FnMut(Identifier, &mut dyn Operator) -> Result<ControlFlow<T>>,
+    >(
         &mut self,
         mut f: F,
     ) -> Result<ControlFlow<T>> {
         let mut stack: Vec<usize> = self.leafs.clone();
         while let Some(idx) = stack.pop() {
-            let res = f(&mut self.operators[idx])?;
-            if matches!(res, ControlFlow::Break(..)) {
-                return Ok(res);
+            if let Some(res) = self.operators[idx].run(&mut f)? {
+                if matches!(res, ControlFlow::Break(..)) {
+                    return Ok(res);
+                }
             }
             stack.extend(self.back_edges[idx].iter().copied());
         }
         Ok(ControlFlow::Continue(()))
     }
 
-    pub fn traverse_forwards<T, F: FnMut(&mut OperatorNode) -> Result<ControlFlow<T>>>(
+    /// The root-to-leaf twin of [`traverse_backwards`](Self::traverse_backwards).
+    pub fn traverse_forwards<
+        T,
+        F: FnMut(Identifier, &mut dyn Operator) -> Result<ControlFlow<T>>,
+    >(
         &mut self,
         mut f: F,
     ) -> Result<ControlFlow<T>> {
         let mut stack: Vec<usize> = self.roots.clone();
         while let Some(idx) = stack.pop() {
-            let res = f(&mut self.operators[idx])?;
-            if matches!(res, ControlFlow::Break(..)) {
-                return Ok(res);
+            if let Some(res) = self.operators[idx].run(&mut f)? {
+                if matches!(res, ControlFlow::Break(..)) {
+                    return Ok(res);
+                }
             }
             if let Some(child) = self.edges[idx] {
                 stack.push(child);
@@ -198,7 +236,7 @@ impl OperatorGraph {
                 // A converging node cannot finish before all of its publishers.
                 if self.back_edges[idx]
                     .iter()
-                    .any(|&publisher| !self.operators[publisher].finished)
+                    .any(|&publisher| !self.operators[publisher].is_finished())
                 {
                     break;
                 }
@@ -207,22 +245,25 @@ impl OperatorGraph {
                 if node.is_gated() {
                     break;
                 }
-                if !node.finished {
-                    match node.operator.try_finish()? {
-                        FinishStatus::Done => node.finished = true,
+                if let Some(operator) = node.operator.as_deref_mut() {
+                    match operator.try_finish()? {
+                        // Retiring the node drops the operator, and with it the
+                        // sender it holds, so a stage that watches the other end
+                        // of that channel learns the stage is over.
+                        FinishStatus::Done => node.operator = None,
                         FinishStatus::Working => working = true,
                         FinishStatus::Pending => {}
                     }
                 }
 
-                if !node.finished {
+                if !node.is_finished() {
                     break;
                 }
                 next = self.edges[idx];
             }
         }
 
-        Ok(if self.operators.iter().all(|node| node.finished) {
+        Ok(if self.operators.iter().all(OperatorNode::is_finished) {
             FinishStatus::Done
         } else if working {
             FinishStatus::Working
@@ -232,8 +273,7 @@ impl OperatorGraph {
     }
 
     /// Abandon every operator transitively *upstream* of `node` (its publishers,
-    /// their publishers, and so on) by replacing each with an
-    /// [`AbandonedOperator`] and marking it finished. The node itself and
+    /// their publishers, and so on) by retiring each of them. The node itself and
     /// everything downstream are left running. Used by a satisfied `LIMIT` to
     /// stop and free the scan feeding it.
     ///
@@ -243,14 +283,12 @@ impl OperatorGraph {
     fn abandon_ancestors(&mut self, node: usize) {
         let mut stack: Vec<usize> = self.back_edges[node].clone();
         while let Some(idx) = stack.pop() {
-            let already_abandoned = self.operators[idx].finished;
-            if already_abandoned {
+            if self.operators[idx].is_finished() {
                 // Guards against re-visiting on a DAG and against re-abandoning
                 // across repeated calls; on a chain it simply never triggers.
                 continue;
             }
-            self.operators[idx].operator = Box::new(AbandonedOperator);
-            self.operators[idx].finished = true;
+            self.operators[idx].operator = None;
             stack.extend(self.back_edges[idx].iter().copied());
         }
     }
@@ -322,7 +360,12 @@ impl DataFlow {
             .operators
             .iter()
             .enumerate()
-            .filter_map(|(idx, node)| node.operator.upstream_cancel_flag().map(|flag| (idx, flag)))
+            .filter_map(|(idx, node)| {
+                node.operator
+                    .as_ref()?
+                    .upstream_cancel_flag()
+                    .map(|flag| (idx, flag))
+            })
             .collect();
         Self {
             id,
@@ -429,8 +472,8 @@ impl DataFlow {
     /// [`Pending`](FinishStatus::Pending) when stalled on input/siblings (the
     /// worker may park).
     ///
-    /// Operators that have reported [`FinishStatus::Done`] are latched via
-    /// `OperatorNode::finished` and skipped on subsequent passes.
+    /// An operator that reports [`FinishStatus::Done`] is dropped there and then,
+    /// so subsequent passes step over its node.
     pub fn maybe_finish(&mut self) -> FinishStatus {
         self.try_run_or(FinishStatus::Pending, |d| d.graph.try_finish())
     }
@@ -464,9 +507,9 @@ impl DataFlow {
     /// has landed (already committed into the cache slot by the requester).
     pub fn process_fs_read(&mut self, node_id: Identifier, request: FsReadRequest) {
         self.try_run(|d| {
-            d.graph.operators[node_id]
-                .operator
-                .process_fs_read_response(request)?;
+            if let Some(operator) = d.graph.operators[node_id].operator.as_deref_mut() {
+                operator.process_fs_read_response(request)?;
+            }
             Ok(())
         });
     }
@@ -475,9 +518,9 @@ impl DataFlow {
     /// has completed.
     pub fn process_fs_write(&mut self, node_id: Identifier, request: FsWriteRequest) {
         self.try_run(|d| {
-            d.graph.operators[node_id]
-                .operator
-                .process_fs_write_response(request)?;
+            if let Some(operator) = d.graph.operators[node_id].operator.as_deref_mut() {
+                operator.process_fs_write_response(request)?;
+            }
             Ok(())
         });
     }
@@ -486,9 +529,9 @@ impl DataFlow {
     /// landed (already committed into the cache slot by the requester).
     pub fn process_http_get_response(&mut self, node_id: Identifier, request: HttpGetRequest) {
         self.try_run(|d| {
-            d.graph.operators[node_id]
-                .operator
-                .process_http_get_response(request)?;
+            if let Some(operator) = d.graph.operators[node_id].operator.as_deref_mut() {
+                operator.process_http_get_response(request)?;
+            }
             Ok(())
         });
     }
@@ -501,9 +544,9 @@ impl DataFlow {
         request: HttpUploadRequest,
     ) {
         self.try_run(|d| {
-            d.graph.operators[node_id]
-                .operator
-                .process_http_upload_response(request)?;
+            if let Some(operator) = d.graph.operators[node_id].operator.as_deref_mut() {
+                operator.process_http_upload_response(request)?;
+            }
             Ok(())
         });
     }
@@ -513,14 +556,9 @@ impl DataFlow {
     pub fn run_ready_cpu_work(&mut self) -> WorkStatus {
         self.try_run_or(WorkStatus::Ran, |d| {
             d.graph
-                .traverse_backwards(|op| {
-                    if op.is_gated() {
-                        return Ok(ControlFlow::Continue(()));
-                    }
-                    match op.operator.run_cpu_work()? {
-                        WorkStatus::Pending => Ok(ControlFlow::Continue(())),
-                        WorkStatus::Ran => Ok(ControlFlow::Break(())),
-                    }
+                .traverse_backwards(|_, operator| match operator.run_cpu_work()? {
+                    WorkStatus::Pending => Ok(ControlFlow::Continue(())),
+                    WorkStatus::Ran => Ok(ControlFlow::Break(())),
                 })
                 .map(|c| match c {
                     ControlFlow::Continue(_) => WorkStatus::Pending,
@@ -534,14 +572,9 @@ impl DataFlow {
     pub fn try_stealing_work(&mut self) -> WorkStatus {
         self.try_run_or(WorkStatus::Ran, |d| {
             d.graph
-                .traverse_forwards(|op| {
-                    if op.is_gated() {
-                        return Ok(ControlFlow::Continue(()));
-                    }
-                    match op.operator.try_steal_work()? {
-                        WorkStatus::Pending => Ok(ControlFlow::Continue(())),
-                        WorkStatus::Ran => Ok(ControlFlow::Break(())),
-                    }
+                .traverse_forwards(|_, operator| match operator.try_steal_work()? {
+                    WorkStatus::Pending => Ok(ControlFlow::Continue(())),
+                    WorkStatus::Ran => Ok(ControlFlow::Break(())),
                 })
                 .map(|c| match c {
                     ControlFlow::Continue(_) => WorkStatus::Pending,
@@ -555,16 +588,13 @@ impl DataFlow {
     pub fn get_next_fs_request(&mut self) -> Option<Vec<DataFlowRequest<FsRequest>>> {
         self.try_run_or(None, |d| {
             d.graph
-                .traverse_backwards(|op| {
-                    if op.is_gated() {
-                        return Ok(ControlFlow::Continue(()));
-                    }
-                    let requests = op.operator.next_fs_requests()?;
+                .traverse_backwards(|id, operator| {
+                    let requests = operator.next_fs_requests()?;
                     if !requests.is_empty() {
                         Ok(ControlFlow::Break(
                             requests
                                 .into_iter()
-                                .map(|r| DataFlowRequest::new(d.id, op.id, r))
+                                .map(|r| DataFlowRequest::new(d.id, id, r))
                                 .collect(),
                         ))
                     } else {
@@ -580,16 +610,13 @@ impl DataFlow {
     pub fn get_next_http_request(&mut self) -> Option<Vec<DataFlowRequest<HttpRequest>>> {
         self.try_run_or(None, |d| {
             d.graph
-                .traverse_backwards(|op| {
-                    if op.is_gated() {
-                        return Ok(ControlFlow::Continue(()));
-                    }
-                    let requests = op.operator.next_http_requests()?;
+                .traverse_backwards(|id, operator| {
+                    let requests = operator.next_http_requests()?;
                     if !requests.is_empty() {
                         Ok(ControlFlow::Break(
                             requests
                                 .into_iter()
-                                .map(|r| DataFlowRequest::new(d.id, op.id, r))
+                                .map(|r| DataFlowRequest::new(d.id, id, r))
                                 .collect(),
                         ))
                     } else {
@@ -606,9 +633,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    /// A test operator distinguishable from [`AbandonedOperator`]: it always
-    /// reports it `Ran` and never finishes on its own, so a node still holding
-    /// one is visibly "live".
+    /// A test operator that always reports it `Ran` and never finishes on its
+    /// own, so a node still holding one is visibly "live".
     struct LiveOperator;
     impl Operator for LiveOperator {
         fn run_cpu_work(&mut self) -> crate::operations::Result<WorkStatus> {
@@ -646,7 +672,37 @@ mod tests {
         }
     }
 
-    struct FinishOperator(FinishStatus);
+    /// Reports a fixed [`FinishStatus`], and optionally raises a flag when it is
+    /// dropped so a test can watch for the node letting go of it.
+    struct FinishOperator {
+        status: FinishStatus,
+        dropped: Option<Arc<AtomicBool>>,
+    }
+
+    impl FinishOperator {
+        fn new(status: FinishStatus) -> Self {
+            Self {
+                status,
+                dropped: None,
+            }
+        }
+
+        fn signalling_drop(status: FinishStatus, dropped: Arc<AtomicBool>) -> Self {
+            Self {
+                status,
+                dropped: Some(dropped),
+            }
+        }
+    }
+
+    impl Drop for FinishOperator {
+        fn drop(&mut self) {
+            if let Some(dropped) = &self.dropped {
+                dropped.store(true, Ordering::Release);
+            }
+        }
+    }
+
     impl Operator for FinishOperator {
         fn run_cpu_work(&mut self) -> crate::operations::Result<WorkStatus> {
             Ok(WorkStatus::Pending)
@@ -679,7 +735,7 @@ mod tests {
             Ok(())
         }
         fn try_finish(&mut self) -> crate::operations::Result<FinishStatus> {
-            Ok(self.0)
+            Ok(self.status)
         }
     }
 
@@ -732,26 +788,39 @@ mod tests {
         OperatorGraph::from_edges(operators, publisher_to_subscriber, HashMap::default())
     }
 
-    fn is_abandoned(graph: &mut OperatorGraph, idx: usize) -> bool {
-        // An abandoned node is inert: marked finished, reports no CPU work, and
-        // immediately finishes. A LiveOperator does the opposite.
-        graph.operators[idx].finished
-            && graph.operators[idx].operator.run_cpu_work().unwrap() == WorkStatus::Pending
-            && graph.operators[idx].operator.try_finish().unwrap() == FinishStatus::Done
+    /// An abandoned node has given up its operator; a node still holding a
+    /// [`LiveOperator`] has not.
+    fn is_abandoned(graph: &OperatorGraph, idx: usize) -> bool {
+        graph.operators[idx].is_finished()
+    }
+
+    #[test]
+    fn a_node_lets_go_of_its_operator_once_it_finishes() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let operators: Vec<Box<dyn Operator>> = vec![Box::new(FinishOperator::signalling_drop(
+            FinishStatus::Done,
+            dropped.clone(),
+        ))];
+        let mut graph =
+            OperatorGraph::from_edges(operators, HashMap::default(), HashMap::default());
+
+        assert_eq!(graph.try_finish().unwrap(), FinishStatus::Done);
+
+        assert!(dropped.load(Ordering::Acquire));
     }
 
     #[test]
     fn finishing_pending_root_does_not_block_other_roots() {
         let operators: Vec<Box<dyn Operator>> = vec![
-            Box::new(FinishOperator(FinishStatus::Pending)),
-            Box::new(FinishOperator(FinishStatus::Done)),
+            Box::new(FinishOperator::new(FinishStatus::Pending)),
+            Box::new(FinishOperator::new(FinishStatus::Done)),
         ];
         let mut graph =
             OperatorGraph::from_edges(operators, HashMap::default(), HashMap::default());
 
         assert_eq!(graph.try_finish().unwrap(), FinishStatus::Pending);
-        assert!(!graph.operators[0].finished);
-        assert!(graph.operators[1].finished);
+        assert!(!graph.operators[0].is_finished());
+        assert!(graph.operators[1].is_finished());
     }
 
     #[test]
@@ -788,7 +857,8 @@ mod tests {
         let second = Arc::new(AtomicBool::new(false));
         let mut gates = HashMap::default();
         gates.insert(0, vec![first.clone(), second.clone()]);
-        let operators: Vec<Box<dyn Operator>> = vec![Box::new(FinishOperator(FinishStatus::Done))];
+        let operators: Vec<Box<dyn Operator>> =
+            vec![Box::new(FinishOperator::new(FinishStatus::Done))];
         let mut graph = OperatorGraph::from_edges(operators, HashMap::default(), gates);
 
         assert_eq!(graph.try_finish().unwrap(), FinishStatus::Pending);
@@ -806,11 +876,11 @@ mod tests {
         graph.abandon_ancestors(2);
 
         // Everything upstream of the limit is abandoned and freed.
-        assert!(is_abandoned(&mut graph, 0));
-        assert!(is_abandoned(&mut graph, 1));
+        assert!(is_abandoned(&graph, 0));
+        assert!(is_abandoned(&graph, 1));
         // The limit and everything downstream keep running.
-        assert!(!is_abandoned(&mut graph, 2));
-        assert!(!is_abandoned(&mut graph, 3));
+        assert!(!is_abandoned(&graph, 2));
+        assert!(!is_abandoned(&graph, 3));
     }
 
     #[test]
@@ -820,8 +890,8 @@ mod tests {
 
         graph.abandon_ancestors(2);
 
-        assert!(is_abandoned(&mut graph, 0));
-        assert!(is_abandoned(&mut graph, 1));
-        assert!(!is_abandoned(&mut graph, 2));
+        assert!(is_abandoned(&graph, 0));
+        assert!(is_abandoned(&graph, 1));
+        assert!(!is_abandoned(&graph, 2));
     }
 }
