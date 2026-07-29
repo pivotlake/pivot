@@ -104,3 +104,7 @@ criterion = { workspace = true }
 [[bench]]
 name = "decode"
 harness = false
+
+[[bench]]
+name = "encode"
+harness = false
