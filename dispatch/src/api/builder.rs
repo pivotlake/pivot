@@ -201,10 +201,40 @@ impl DataFlowBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operations::AbandonedOperator;
+    use crate::data_flow::WorkStatus;
+    use crate::io::{FsReadRequest, FsRequest, FsWriteRequest, HttpGetRequest, HttpUploadRequest};
+    use crate::operations::{FinishStatus, Result};
+
+    /// Stand-in for a real operator: these tests only assert on the shape of the
+    /// graph the builder produces, never run it.
+    struct InertOperator;
+
+    impl Operator for InertOperator {
+        fn run_cpu_work(&mut self) -> Result<WorkStatus> {
+            Ok(WorkStatus::Pending)
+        }
+        fn next_fs_requests(&mut self) -> Result<Vec<FsRequest>> {
+            Ok(vec![])
+        }
+        fn process_fs_read_response(&mut self, _request: FsReadRequest) -> Result<()> {
+            Ok(())
+        }
+        fn process_fs_write_response(&mut self, _request: FsWriteRequest) -> Result<()> {
+            Ok(())
+        }
+        fn process_http_get_response(&mut self, _request: HttpGetRequest) -> Result<()> {
+            Ok(())
+        }
+        fn process_http_upload_response(&mut self, _request: HttpUploadRequest) -> Result<()> {
+            Ok(())
+        }
+        fn try_finish(&mut self) -> Result<FinishStatus> {
+            Ok(FinishStatus::Done)
+        }
+    }
 
     fn root() -> OperatorGraphBuilder {
-        OperatorGraphBuilder::root(Box::new(AbandonedOperator))
+        OperatorGraphBuilder::root(Box::new(InertOperator))
     }
 
     #[test]
@@ -214,11 +244,11 @@ mod tests {
 
         let inner_join = root()
             .gated_by(inner_gate.clone())
-            .with(Box::new(AbandonedOperator))
+            .with(Box::new(InertOperator))
             .with_side_graph(root());
         let graph = inner_join
             .gated_by(outer_gate.clone())
-            .with(Box::new(AbandonedOperator))
+            .with(Box::new(InertOperator))
             .with_side_graph(root());
 
         assert_eq!(graph.roots, vec![0, 2, 4]);
