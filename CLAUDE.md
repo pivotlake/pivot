@@ -18,3 +18,10 @@ Don't return None or have fallbacks when it's not absolutely necessary. We don't
 failures or have unexpected flows.
 
 Never push unformatted code. Before every `git push`, run `cargo fmt` and ensure `cargo fmt --check` passes.
+
+## Never use pgrep to decide whether a job is alive
+
+`pgrep -f PATTERN` scans full command lines, and the shell running it has
+PATTERN in its own command line, so it matches itself. The check returns a hit
+even when nothing is running, and it fails in the direction that looks healthy:
+"still going" when the job died.
