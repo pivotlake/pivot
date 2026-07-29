@@ -264,12 +264,13 @@ fn write_leaf_chunk(out: &mut Vec<u8>, leaf: EncodedLeaf) -> WriteResult<ColumnC
     }
     let compressed = out.len() as i64 - chunk_start;
 
-    // A dictionary chunk encodes its data pages as RLE_DICTIONARY indices and its
-    // dictionary page as PLAIN; a plain chunk is all PLAIN.
+    // A dictionary chunk encodes its data pages as RLE_DICTIONARY indices and
+    // its dictionary page as PLAIN; any other chunk reports the one encoding
+    // its data pages carry.
     let encodings = if dictionary_page_offset.is_some() {
         vec![Encoding::PLAIN as i32, Encoding::RLE_DICTIONARY as i32]
     } else {
-        vec![Encoding::PLAIN as i32]
+        vec![leaf.data_page_encoding as i32]
     };
     Ok(ColumnChunk {
         file_offset: chunk_start,

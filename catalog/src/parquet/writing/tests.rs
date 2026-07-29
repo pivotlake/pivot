@@ -11,7 +11,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, RecordBatch, StringArray};
+use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{ArrowError, Schema};
 use dispatch::{BUFFER_SIZE, Dispatch, values_input};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -112,6 +112,41 @@ fn leaf_stats(bytes: &[u8]) -> Vec<(String, Option<u64>, bool)> {
                 column.column_path().string(),
                 stats.and_then(|s| s.null_count_opt()),
                 stats.is_some_and(|s| s.min_bytes_opt().is_some()),
+            )
+        })
+        .collect()
+}
+
+/// A batch of plain columns, for the tests about which encoding a column's
+/// values take.
+struct ColumnsItem(Vec<(&'static str, ArrayRef)>);
+
+impl IntoBatch for ColumnsItem {
+    fn into_batch(self) -> Result<RecordBatch, ArrowError> {
+        let fields: Vec<_> = self
+            .0
+            .iter()
+            .map(|(name, array)| arrow_schema::Field::new(*name, array.data_type().clone(), false))
+            .collect();
+        let arrays = self.0.into_iter().map(|(_, array)| array).collect();
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+    }
+}
+
+/// The encodings a file's footer reports per leaf, keyed by column name.
+fn leaf_encodings(bytes: &[u8]) -> Vec<(String, Vec<String>)> {
+    let reader =
+        ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(bytes)).unwrap();
+    let row_group = reader.metadata().row_group(0);
+    (0..row_group.num_columns())
+        .map(|i| {
+            let column = row_group.column(i);
+            (
+                column.column_path().string(),
+                column
+                    .encodings()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<String>>(),
             )
         })
         .collect()
@@ -381,4 +416,151 @@ fn a_nested_path_shreds_and_reads_back() {
         documents(&read_back(&files[0])),
         vec![r#"{"user":{"id":1}}"#, r#"{"user":{"id":2}}"#]
     );
+}
+
+/// A column with too many distinct values to dictionary-encode used to fall to
+/// PLAIN and pay the full width per value. It now packs its differences, and
+/// another implementation reads the values back unchanged.
+#[test]
+fn a_high_cardinality_integer_column_packs_its_differences() {
+    let values: Vec<i64> = (0..200_000).map(|i| 1_000_000 + i * 7919).collect();
+    let column: ArrayRef = Arc::new(Int64Array::from(values.clone()));
+
+    let files = write(vec![ColumnsItem(vec![("key", column)])], 400_000);
+
+    assert_eq!(
+        leaf_encodings(&files[0]),
+        vec![("key".to_string(), vec!["DELTA_BINARY_PACKED".to_string()])]
+    );
+    let batch = read_back(&files[0]);
+    let read: Vec<i64> = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+    assert_eq!(read, values);
+}
+
+/// Values that fall as well as rise, and that span far enough for a difference
+/// to need every bit of its width.
+#[test]
+fn packed_differences_survive_falling_and_wide_values() {
+    let values: Vec<i64> = (0..200_000)
+        .map(|i: i64| match i % 3 {
+            0 => -i * 1_000_003,
+            1 => i64::MAX / 2 - i,
+            _ => i64::MIN / 2 + i,
+        })
+        .collect();
+    let column: ArrayRef = Arc::new(Int64Array::from(values.clone()));
+
+    let files = write(vec![ColumnsItem(vec![("key", column)])], 400_000);
+
+    let batch = read_back(&files[0]);
+    let read: Vec<i64> = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+    assert_eq!(read, values);
+}
+
+/// A string column past the dictionary drops the four-byte length it used to
+/// spend per value, packing the lengths instead and laying the bytes end to end.
+#[test]
+fn a_high_cardinality_string_column_packs_its_lengths() {
+    let values: Vec<String> = (0..40_000)
+        .map(|i: usize| {
+            if i.is_multiple_of(7) {
+                String::new()
+            } else {
+                format!("value {i} with enough tail to not inline")
+            }
+        })
+        .collect();
+    let column: ArrayRef = Arc::new(StringArray::from(values.clone()));
+
+    let files = write(vec![ColumnsItem(vec![("name", column)])], 100_000);
+
+    assert_eq!(
+        leaf_encodings(&files[0]),
+        vec![(
+            "name".to_string(),
+            vec!["DELTA_LENGTH_BYTE_ARRAY".to_string()]
+        )]
+    );
+    let batch = read_back(&files[0]);
+    let read: Vec<String> = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .iter()
+        .map(|v| v.unwrap().to_string())
+        .collect();
+    assert_eq!(read, values);
+}
+
+/// Few enough distinct values and the dictionary still wins, which is what the
+/// delta forms are a fallback from, not a replacement for.
+#[test]
+fn a_repeating_column_still_dictionary_encodes() {
+    let values: Vec<String> = (0..40_000).map(|i| format!("colour {}", i % 8)).collect();
+    let column: ArrayRef = Arc::new(StringArray::from(values));
+
+    let files = write(vec![ColumnsItem(vec![("colour", column)])], 100_000);
+
+    let (_, encodings) = leaf_encodings(&files[0]).pop().unwrap();
+    assert!(
+        encodings.contains(&"RLE_DICTIONARY".to_string()),
+        "expected a dictionary, got {encodings:?}"
+    );
+}
+
+/// Floats are not whole numbers and have no delta form, so they keep taking
+/// PLAIN rather than being packed as something they are not.
+#[test]
+fn a_float_column_stays_plain() {
+    let values: Vec<f64> = (0..200_000).map(|i| i as f64 * 1.5).collect();
+    let column: ArrayRef = Arc::new(Float64Array::from(values.clone()));
+
+    let files = write(vec![ColumnsItem(vec![("measure", column)])], 400_000);
+
+    assert_eq!(
+        leaf_encodings(&files[0]),
+        vec![("measure".to_string(), vec!["PLAIN".to_string()])]
+    );
+    let batch = read_back(&files[0]);
+    let read: Vec<f64> = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+    assert_eq!(read, values);
+}
+
+/// What the fallback buys, measured rather than assumed. A key scattered over
+/// twenty million values has no run to exploit, so every difference still needs
+/// most of its width; the packing is what takes the column from the eight bytes
+/// PLAIN spends per value to a little over three.
+#[test]
+fn packing_a_scattered_key_costs_a_third_of_writing_it_whole() {
+    let mut seed = 12_345u64;
+    let mut next = || {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        (seed >> 33) as i64
+    };
+    let values: Vec<i64> = (0..200_000).map(|_| 1 + next() % 20_000_000).collect();
+    let column: ArrayRef = Arc::new(Int64Array::from(values.clone()));
+
+    let bytes = write(vec![ColumnsItem(vec![("key", column)])], 400_000)[0].len();
+
+    let per_value = bytes as f64 / values.len() as f64;
+    assert!(per_value < 4.0, "{per_value} bytes a value");
 }

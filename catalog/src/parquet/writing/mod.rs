@@ -40,7 +40,7 @@
 //! [`encode_record_batches_spec`].
 
 mod assembler;
-mod encoder;
+pub(crate) mod encoder;
 pub(crate) mod error;
 mod partition;
 mod shredding;

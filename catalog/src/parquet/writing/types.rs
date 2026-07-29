@@ -15,6 +15,7 @@ use arrow_array::ArrayRef;
 use arrow_schema::SchemaRef;
 use dispatch::{Identifier, WorkerIdOutput};
 use thriftparquet::footer::Statistics;
+use thriftparquet::general::Encoding;
 
 /// Identifies a row group across the pipeline so its column chunks reassemble
 /// together.
@@ -92,9 +93,10 @@ pub(crate) struct EncodedPage {
 
 /// One leaf's encoded pages. Parquet stores a chunk per *leaf*, not per column:
 /// a flat column has exactly one, and a shredded variant one per primitive under
-/// its `{metadata, value, typed_value{..}}` struct. Either PLAIN
-/// (`dictionary_page` is `None`) or dictionary-encoded (`dictionary_page` holds
-/// the distinct values; `data_pages` hold RLE-encoded indices).
+/// its `{metadata, value, typed_value{..}}` struct. A dictionary-encoded leaf
+/// holds its distinct values in `dictionary_page` and RLE-encoded indices in
+/// `data_pages`; otherwise the data pages carry the values themselves, in
+/// whichever encoding `data_page_encoding` names.
 pub(crate) struct EncodedLeaf {
     /// The leaf's path from its top-level column down, e.g. `["attrs",
     /// "typed_value", "user", "typed_value"]` — the footer's `path_in_schema`.
@@ -104,6 +106,9 @@ pub(crate) struct EncodedLeaf {
     /// Every leaf carries them, so a reader can prune by any column.
     pub(crate) statistics: Statistics,
     pub(crate) dictionary_page: Option<EncodedPage>,
+    /// How the data pages encode their values, which the footer reports so a
+    /// reader knows which decoder to use.
+    pub(crate) data_page_encoding: Encoding,
     pub(crate) data_pages: Vec<EncodedPage>,
 }
 
