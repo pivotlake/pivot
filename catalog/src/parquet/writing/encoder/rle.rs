@@ -3,10 +3,9 @@
 //! carries after its one leading bit-width byte (which the data-page builder
 //! prepends).
 //!
-//! A faithful port of the Parquet reference encoder (arrow's `RleEncoder`):
-//! values are buffered eight at a time, and each group of eight is bit-packed
-//! unless the value has been repeating for ≥ 8, in which case the run becomes a
-//! (much smaller) RLE run.
+//! Values are buffered eight at a time, and each group of eight is bit-packed
+//! unless the value has been repeating long enough for an RLE run to be smaller,
+//! which [`min_repeat_groups`] decides.
 //!
 //! Adjacent bit-packed groups share one run header, up to
 //! [`MAX_GROUPS_PER_RUN`]. Giving each group its own header instead costs a byte
@@ -18,13 +17,27 @@
 //! The stream is built straight into a `Vec<u8>` since every run is byte-aligned
 //! (a group of eight values is exactly `bit_width` bytes).
 
-/// Parquet bit-packs values in groups of this many; an RLE run also becomes
-/// worthwhile once a value has repeated this many times.
+/// Parquet bit-packs values in groups of this many.
 const GROUP: usize = 8;
 
 /// Groups a single bit-packed run may cover. Held to 63 so the run's header
 /// stays one byte, which is what other writers emit and every reader expects.
 const MAX_GROUPS_PER_RUN: usize = 63;
+
+/// Groups a value has to repeat for before an RLE run is worth it.
+///
+/// A run does not just replace the values it covers: it also ends the bit-packed
+/// run it interrupts, so what follows needs a header of its own. Against that
+/// the run saves `groups * bit_width` bytes, which at a narrow width is very
+/// little — eight one-bit values are a single byte packed, where the run that
+/// replaces them is three. Below the threshold the repeat stays bit-packed,
+/// leaving the stream both smaller and cheaper to walk.
+fn min_repeat_groups(bit_width: u8) -> usize {
+    // The run's own header and value, plus the header it forces on the values
+    // after it.
+    let run_cost = 2 + (bit_width as usize).div_ceil(8);
+    run_cost / bit_width as usize + 1
+}
 
 /// Encode dictionary `indices` as a Parquet RLE/bit-packed hybrid stream at
 /// `bit_width` bits per index (`bit_width >= 1`).
@@ -65,11 +78,16 @@ struct RleEncoder {
     /// Values held back for the current (possibly bit-packed) group.
     buffered: [u32; GROUP],
     num_buffered: usize,
-    /// The last value seen and how many times it has repeated in a row. A repeat
-    /// of a full [`GROUP`] switches the run to RLE.
+    /// The last value seen and how many times it has repeated in a row. A long
+    /// enough repeat switches the run to RLE.
     current_value: u32,
     repeat_count: usize,
-    /// Bit-packed groups waiting to be written as one run, and how many.
+    /// How long that repeat has to be, held here rather than recomputed per
+    /// group.
+    repeat_threshold: usize,
+    /// Bit-packed groups waiting to be written, and how many. They are held
+    /// until a run boundary so that a repeat which turns out to be long enough
+    /// for RLE can still take back the groups it has already contributed.
     packed: Vec<u8>,
     packed_groups: usize,
 }
@@ -83,6 +101,7 @@ impl RleEncoder {
             num_buffered: 0,
             current_value: 0,
             repeat_count: 0,
+            repeat_threshold: GROUP * min_repeat_groups(bit_width),
             packed: Vec::new(),
             packed_groups: 0,
         }
@@ -91,13 +110,13 @@ impl RleEncoder {
     fn put(&mut self, value: u32) {
         if value == self.current_value {
             self.repeat_count += 1;
-            if self.repeat_count > GROUP {
-                // Mid-RLE-run: counted, not buffered (the group it started in
-                // was already flushed as RLE-pending).
+            if self.repeat_count > self.repeat_threshold {
+                // Mid-RLE-run: counted, not buffered (the groups it started in
+                // were taken back when the run began).
                 return;
             }
         } else {
-            if self.repeat_count >= GROUP {
+            if self.repeat_count >= self.repeat_threshold {
                 self.flush_rle_run();
             }
             self.repeat_count = 1;
@@ -111,31 +130,53 @@ impl RleEncoder {
     }
 
     /// A full group: bit-pack it into the pending run, unless the value has
-    /// repeated a whole [`GROUP`], in which case it belongs to an RLE run and is
-    /// dropped here (the run's count already covers it, flushed at the next
-    /// distinct value or at finish).
+    /// repeated long enough that the group belongs to an RLE run instead, in
+    /// which case it is dropped here (the run's count already covers it, and the
+    /// run is written at the next distinct value or at finish).
     fn flush_group(&mut self) {
-        if self.repeat_count < GROUP {
-            pack_group(&mut self.packed, &self.buffered, self.bit_width);
-            self.packed_groups += 1;
-            if self.packed_groups == MAX_GROUPS_PER_RUN {
-                self.flush_packed_run();
+        let group_repeats = self.repeat_count >= GROUP;
+        if self.repeat_count >= self.repeat_threshold {
+            if self.repeat_count == self.repeat_threshold {
+                // The repeat only just proved itself worth a run, so the groups
+                // it spent waiting come back out of the pending run: the run
+                // covers those values now.
+                self.drop_packed_groups(self.repeat_threshold / GROUP - 1);
             }
+            self.num_buffered = 0;
+            return;
+        }
+
+        pack_group(&mut self.packed, &self.buffered, self.bit_width);
+        self.packed_groups += 1;
+        if !group_repeats {
             self.repeat_count = 0;
         }
         self.num_buffered = 0;
     }
 
-    /// Write the pending bit-packed groups as one run. Every run that follows
-    /// them has to call this first, since they come earlier in the stream.
+    /// Take back the last `groups` bit-packed groups, which is exact because a
+    /// group of eight values occupies exactly `bit_width` bytes.
+    fn drop_packed_groups(&mut self, groups: usize) {
+        self.packed
+            .truncate(self.packed.len() - groups * self.bit_width as usize);
+        self.packed_groups -= groups;
+    }
+
+    /// Write the pending bit-packed groups, as few runs as their headers allow.
+    /// Every run that follows them has to call this first, since they come
+    /// earlier in the stream.
     fn flush_packed_run(&mut self) {
-        if self.packed_groups == 0 {
-            return;
+        let mut written = 0;
+        while self.packed_groups > 0 {
+            let groups = self.packed_groups.min(MAX_GROUPS_PER_RUN);
+            put_vlq(&mut self.out, ((groups as u64) << 1) | 1);
+            let bytes = groups * self.bit_width as usize;
+            self.out
+                .extend_from_slice(&self.packed[written..written + bytes]);
+            written += bytes;
+            self.packed_groups -= groups;
         }
-        put_vlq(&mut self.out, ((self.packed_groups as u64) << 1) | 1);
-        self.out.extend_from_slice(&self.packed);
         self.packed.clear();
-        self.packed_groups = 0;
     }
 
     fn flush_rle_run(&mut self) {
@@ -151,18 +192,17 @@ impl RleEncoder {
     }
 
     fn finish(mut self) -> Vec<u8> {
-        if self.repeat_count == 0 && self.num_buffered == 0 {
-            // Whole groups may still be waiting under no header yet.
-            self.flush_packed_run();
+        // A repeat long enough to have taken its groups back is covered by
+        // nothing else, so it has to be written as the run it became.
+        if self.repeat_count >= self.repeat_threshold {
+            self.flush_rle_run();
             return self.out;
         }
-        // A pure repeat (an ongoing RLE run, or a short all-equal tail) flushes as
-        // RLE; anything else bit-packs the partial group, zero-padded to eight
-        // (the padding lands past the page's value count, so it is never read).
-        let all_repeat = self.num_buffered == 0 || self.repeat_count == self.num_buffered;
-        if self.repeat_count > 0 && all_repeat {
-            self.flush_rle_run();
-        } else {
+        // Any shorter repeat is bit-packed like anything else: whole groups are
+        // in the pending run already, and a part-full one is zero-padded to
+        // eight (the padding lands past the page's value count, so it is never
+        // read).
+        if self.num_buffered > 0 {
             self.buffered[self.num_buffered..].fill(0);
             pack_group(&mut self.packed, &self.buffered, self.bit_width);
             self.packed_groups += 1;
@@ -338,5 +378,36 @@ mod tests {
         let stream = encode_indices(&indices, 2);
 
         assert_eq!(decode(&stream, 2, indices.len()), indices);
+    }
+
+    /// At one bit a value, eight repeats are a single byte where they are, and
+    /// three as a run of their own, so they stay where they are.
+    #[test]
+    fn a_short_repeat_stays_bit_packed_at_a_narrow_width() {
+        let mut indices: Vec<u32> = (0..16).map(|i| i % 2).collect();
+        indices.extend(std::iter::repeat_n(1, 8));
+        indices.extend((0..16).map(|i| i % 2));
+
+        let stream = encode_indices(&indices, 1);
+
+        // One header, then a byte for each group of eight one-bit values.
+        assert_eq!(stream.len(), 1 + indices.len() / 8);
+        round_trip(&indices, 1);
+    }
+
+    /// A repeat that does grow long enough still becomes a single run covering
+    /// every one of its values, including those bit-packed while it was still
+    /// too short to be worth one.
+    #[test]
+    fn a_long_repeat_becomes_one_run_at_a_narrow_width() {
+        let mut indices: Vec<u32> = (0..8).map(|i| i % 2).collect();
+        indices.extend(std::iter::repeat_n(1, 200));
+
+        let stream = encode_indices(&indices, 1);
+
+        // A header and a byte for the eight literals, then the run: a two-byte
+        // count and the value.
+        assert_eq!(stream.len(), 1 + 1 + 2 + 1);
+        round_trip(&indices, 1);
     }
 }
