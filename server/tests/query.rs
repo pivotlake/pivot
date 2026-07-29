@@ -617,3 +617,49 @@ async fn cte_read_twice_runs_once_and_feeds_both_readers(#[future] conn: Conn) {
         ]
     );
 }
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn one_query_reads_two_ctes_including_one_built_from_the_other(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_nested_cte", dir.path()).await;
+
+    // `doubled` is built from `totals`, so its definition sits inside the other
+    // CTE's body, and the query reads both. Each is read more than once and
+    // ends in an aggregate, which is what makes DuckDB materialize the pair
+    // instead of inlining a copy per reference.
+    let rows = select_rows(
+        &conn,
+        "WITH totals AS (SELECT id, count(*) AS n FROM people_nested_cte GROUP BY id), \
+              doubled AS (SELECT id, sum(n) * 2 AS n2 FROM totals GROUP BY id) \
+         SELECT t1.id, t2.n, d1.n2, d2.n2 \
+         FROM totals t1, totals t2, doubled d1, doubled d2 \
+         WHERE t1.id = t2.id AND t1.id = d1.id AND t1.id = d2.id ORDER BY t1.id",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Some("1".into()),
+                Some("1".into()),
+                Some("2".into()),
+                Some("2".into())
+            ],
+            vec![
+                Some("2".into()),
+                Some("1".into()),
+                Some("2".into()),
+                Some("2".into())
+            ],
+            vec![
+                Some("3".into()),
+                Some("1".into()),
+                Some("2".into()),
+                Some("2".into())
+            ],
+        ]
+    );
+}
