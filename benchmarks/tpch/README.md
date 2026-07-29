@@ -37,19 +37,28 @@ as the engine grows the features each needs.
 | q12 | Shipping Modes | orders/lineitem, CASE priority buckets per shipmode |
 | q13 | Customer Distribution | customer/orders outer join, orders per customer, then a histogram of those counts |
 | q14 | Promotion Effect | lineitem/part, promo share of revenue |
+| q18 | Large Volume Customer | orders semi-joined against the order keys whose quantities sum above 300, then the top 100 by price |
 
 The rest of the 22 need engine features that are not in yet: a join carrying
-two equality conditions (q05, q09), semi joins (q18, q20), the delim joins
-DuckDB plans a correlated subquery into (q04, q17, q21), CTE scans (q11, q15),
-mark joins (q16), and the `suffix` / `substring` scalar functions (q02, q16,
-q22). q07 and q19 additionally hit a join predicate that ORs columns from both
-sides, which the bridge cannot read.
+two equality conditions (q05, q09), the delim joins DuckDB plans a correlated
+subquery into (q04, q17, q20, q21), CTE scans (q11, q15), mark joins (q16), and
+the `suffix` / `substring` scalar functions (q02, q16, q22). q07 and q19
+additionally hit a join predicate that ORs columns from both sides, which the
+bridge cannot read.
 
 Outer joins are supported only where the preserved side is the one the hash
 table is built from, which is what DuckDB hands over as a RIGHT join. It flips a
 written LEFT JOIN into that shape whenever the preserved relation is the smaller
 one, as in q13, so a query preserving the larger relation still reports the join
 type as unsupported.
+
+Semi joins are supported the other way round: the rows kept are the probe
+side's, which is what DuckDB hands over as SEMI (that join type keeps its left
+child's rows, and the left child is the probe). q18's `IN` subquery arrives in
+that shape, since the aggregate it selects from is the cheaper side to build the
+hash table from at every scale factor. Its mirror image RIGHT_SEMI, which
+DuckDB's build-probe-side optimizer produces when the left child is the cheaper
+one instead, is not supported; q20 needs that as well as a delim join.
 
 q10 plans and runs, but its `c_comment` group key comes back corrupted at SF100
 (fragments of other rows, with the length prefix of a neighbouring field showing
@@ -59,7 +68,9 @@ the LIMIT reaches the group operator as a Top-K.
 
 q03 orders by a summed revenue and cuts with a LIMIT, so a tie in that sum would
 make its row order (and therefore the exact-string comparison) arbitrary. No tie
-occurs in the reference datasets.
+occurs in the reference datasets. q18 cuts with a LIMIT too, and at SF100 it has
+more qualifying orders than the LIMIT keeps; the prices either side of that
+boundary differ, so its row order is not ambiguous either.
 
 Oracles (`qNN.tsv`) are produced by DuckDB over the same parquet files
 (`run-duckdb.sh --write-expected`), in pivot's wire format, and are specific to
