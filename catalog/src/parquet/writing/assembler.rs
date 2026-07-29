@@ -57,6 +57,9 @@ const CONVERTED_UTF8: i32 = 0;
 /// alongside the modern `LogicalType::Decimal` so older readers resolve the
 /// column too.
 const CONVERTED_DECIMAL: i32 = 5;
+/// `ConvertedType::DATE`: the legacy annotation for an INT32 day count, written
+/// beside the modern `LogicalType::Date` so older readers resolve it too.
+const CONVERTED_DATE: i32 = 6;
 
 pub(super) type FileAssemblerFactory = DefaultUnaryFactory<FileAssembler>;
 
@@ -366,12 +369,19 @@ fn push_schema_element(field: &FieldRef, elements: &mut Vec<SchemaElement>) -> W
                     DataType::Decimal64(_, _) | DataType::Decimal128(_, _) => {
                         Some(CONVERTED_DECIMAL)
                     }
+                    DataType::Date32 => Some(CONVERTED_DATE),
                     _ => None,
                 },
                 scale: decimal_shape.map(|(_, scale)| scale),
                 precision: decimal_shape.map(|(precision, _)| precision),
-                logical_type: decimal_shape
-                    .map(|(precision, scale)| LogicalType::Decimal { scale, precision }),
+                // Without the annotation a date column reads back as the plain
+                // INT32 it is stored as, so it is stamped both ways: the modern
+                // logical type and the legacy converted one above.
+                logical_type: match data_type {
+                    DataType::Date32 => Some(LogicalType::Date),
+                    _ => decimal_shape
+                        .map(|(precision, scale)| LogicalType::Decimal { scale, precision }),
+                },
             })
         }
     }

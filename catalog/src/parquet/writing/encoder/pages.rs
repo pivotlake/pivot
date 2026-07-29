@@ -115,7 +115,8 @@ enum PlainSizes<'a> {
 impl<'a> PlainSizes<'a> {
     fn new(values: &'a ArrayRef) -> WriteResult<Self> {
         Ok(match values.data_type() {
-            DataType::Int32 | DataType::Float32 => Self::Fixed(4),
+            // A date is a day count, stored as the INT32 it is annotated as.
+            DataType::Int32 | DataType::Float32 | DataType::Date32 => Self::Fixed(4),
             DataType::Int64 | DataType::Float64 => Self::Fixed(8),
             // A decimal's width follows its precision-chosen storage.
             DataType::Decimal64(precision, _) | DataType::Decimal128(precision, _) => {
