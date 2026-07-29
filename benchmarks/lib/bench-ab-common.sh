@@ -155,6 +155,16 @@ profile_side() {
     local dir="$1" side="$2" suite="$3" source="$4"
     local prof_dir="$work_dir/prof-$side"
     rm -rf "$prof_dir"; mkdir -p "$prof_dir"
+    # Clear the Delta log CREATE TABLE leaves in the dataset, for both suite
+    # layouts (a single-table suite points at --source itself, a multi-table
+    # one at a directory per table). pivot-bench clears it itself, but only in
+    # versions carrying that fix, and the before side is by definition older
+    # code, so setup that must hold for both sides cannot live in the binary
+    # under test.
+    rm -rf "$source/_delta_log"
+    for table_dir in "$source"/*/; do
+        [[ -d "$table_dir" ]] && rm -rf "${table_dir}_delta_log"
+    done
     LLVM_PROFILE_FILE="$prof_dir/%m-%p.profraw" \
         "$dir/benchmarks/target-pgogen/$host_target/release/pivot-bench" \
         --suite "$suite" --suite-dir "$dir/benchmarks/$suite" \
