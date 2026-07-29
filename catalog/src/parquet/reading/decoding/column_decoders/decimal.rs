@@ -26,8 +26,8 @@ use bytes::Bytes;
 
 use crate::parquet::reading::decoding::column_decoders::primitive::ElemPtr;
 use crate::parquet::reading::decoding::column_decoders::{
-    ColumnDecoder, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error, Result,
-    TypedColumnDecoder,
+    ColumnDecoder, DecimalDeltaDecoder, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error,
+    FromDelta, Result, TypedColumnDecoder,
 };
 use crate::parquet::types::metadata::ColumnChunkMeta;
 use crate::parquet::types::page::DecompressedPage;
@@ -41,6 +41,11 @@ use dispatch::memory::{
 pub trait DecimalStorage: 'static {
     /// Bytes one value occupies on disk.
     const PHYSICAL_SIZE: usize;
+
+    /// Whether a page in this storage can arrive `DELTA_BINARY_PACKED`, which
+    /// the encoding defines for `INT32` and `INT64` but not for fixed-length
+    /// bytes.
+    const DELTA_PACKABLE: bool;
 
     /// Decodes one value from its exactly-`PHYSICAL_SIZE`-byte slice,
     /// sign-extending to 128 bits.
@@ -56,6 +61,7 @@ pub struct DecimalFromInt32;
 
 impl DecimalStorage for DecimalFromInt32 {
     const PHYSICAL_SIZE: usize = 4;
+    const DELTA_PACKABLE: bool = true;
 
     #[inline(always)]
     fn decode(bytes: &[u8]) -> i128 {
@@ -73,6 +79,7 @@ pub struct DecimalFromInt64;
 
 impl DecimalStorage for DecimalFromInt64 {
     const PHYSICAL_SIZE: usize = 8;
+    const DELTA_PACKABLE: bool = true;
 
     #[inline(always)]
     fn decode(bytes: &[u8]) -> i128 {
@@ -91,6 +98,7 @@ pub struct DecimalFromFixedLen<const LEN: usize>;
 
 impl<const LEN: usize> DecimalStorage for DecimalFromFixedLen<LEN> {
     const PHYSICAL_SIZE: usize = LEN;
+    const DELTA_PACKABLE: bool = false;
 
     #[inline(always)]
     fn decode(bytes: &[u8]) -> i128 {
@@ -110,7 +118,7 @@ impl<const LEN: usize> DecimalStorage for DecimalFromFixedLen<LEN> {
 /// The in-memory column a decimal column decodes into: [`Decimal64Type`]
 /// (i64) for a declared precision up to 18 digits, [`Decimal128Type`] (i128)
 /// beyond.
-pub trait DecimalCarrier: DecimalType {
+pub trait DecimalCarrier: DecimalType<Native: FromDelta> {
     /// Narrows the storage's sign-extended `i128` to the carrier's native
     /// integer. The declared precision guarantees the value fits.
     fn narrow(value: i128) -> Self::Native;
@@ -190,6 +198,10 @@ pub struct DecimalPlainDecoder<T: DecimalCarrier, S: DecimalStorage> {
 
 impl<T: DecimalCarrier, S: DecimalStorage> DecodePlain for DecimalPlainDecoder<T, S> {
     type Builder = PrimitiveBuilder<T>;
+    // A decimal stored as INT32/INT64 could be delta packed; the storage kinds
+    // are read through `DecimalStorage`, which the delta decoder does not go
+    // through yet, so such a page reports an unsupported encoding.
+    type Delta = DecimalDeltaDecoder<T, S>;
 
     fn new(data: Vec<Bytes>, position: ReaderPosition) -> Self {
         Self {

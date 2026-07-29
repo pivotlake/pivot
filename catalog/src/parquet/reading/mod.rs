@@ -20,7 +20,7 @@ pub use indexer::IndexerFactory;
 mod decompressor;
 pub use decompressor::{DecompressorFactory, Error as DecompressorError};
 
-mod decoding;
+pub(crate) mod decoding;
 pub use decoding::{DecoderFactory, RowGroupDecoderError, ScanEqualityPredicate};
 
 mod materializer;

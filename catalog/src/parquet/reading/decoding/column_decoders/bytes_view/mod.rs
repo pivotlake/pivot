@@ -25,6 +25,7 @@ use crate::parquet::reading::decoding::column_decoders::bytes_view::plain_page_d
 use crate::parquet::reading::decoding::column_decoders::bytes_view::views_builder::ViewsBuilder;
 pub(crate) mod views_builder;
 
+pub(crate) mod delta_length_page_decoder;
 pub(crate) mod dict;
 mod plain_page_decoder;
 

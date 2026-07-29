@@ -18,7 +18,7 @@ use arrow_array::{ArrayRef, Scalar};
 use arrow_buffer::ArrowNativeType;
 
 use crate::parquet::reading::decoding::column_decoders::{
-    DecodePlain, Dict, DictFromBytes, DictFromVecBytes, TypedColumnDecoder,
+    DecodePlain, DeltaDecoder, Dict, DictFromBytes, DictFromVecBytes, FromDelta, TypedColumnDecoder,
 };
 use bytes::Bytes;
 use dispatch::memory::{
@@ -32,6 +32,7 @@ use dispatch::memory::{
 /// differ from `size_of::<Self>()` for narrowed types like `i16`).
 pub trait ReadLeBytes: ArrowNativeType {
     const PHYSICAL_SIZE: usize;
+
     fn read_le(reader: &mut MultiBufferReader) -> Self;
 }
 
@@ -178,7 +179,7 @@ pub use dispatch::arrays::PrimitiveBuilder;
 /// slow-path strategy.
 pub struct PrimitivePlainDecoder<T: ArrowPrimitiveType>
 where
-    T::Native: ReadLeBytes,
+    T::Native: ReadLeBytes + FromDelta,
 {
     data: Vec<Bytes>,
     position: ReaderPosition,
@@ -187,9 +188,10 @@ where
 
 impl<T: ArrowPrimitiveType> DecodePlain for PrimitivePlainDecoder<T>
 where
-    T::Native: ReadLeBytes,
+    T::Native: ReadLeBytes + FromDelta,
 {
     type Builder = PrimitiveBuilder<T>;
+    type Delta = DeltaDecoder<T>;
 
     fn new(data: Vec<Bytes>, position: ReaderPosition) -> Self {
         Self {

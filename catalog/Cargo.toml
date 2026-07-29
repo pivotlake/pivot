@@ -70,10 +70,15 @@ tempfile = { workspace = true, optional = true }
 # `server`) that want to run a catalog rooted in a real bucket.
 test-support = ["dep:testcontainers", "dep:testcontainers-modules", "dep:tempfile"]
 
+# Exposes `catalog::parquet::decoder_bench_hooks`, which lets `benches/decode.rs`
+# drive a single column decoder. Off by default, so a normal build carries
+# neither the entry points nor their place in this crate's surface.
+bench-hooks = []
+
 [dev-dependencies]
 # Self-dependency to turn on `test-support` for this crate's own integration
 # tests (so they can use `catalog::test_support`).
-catalog = { path = ".", features = ["test-support"] }
+catalog = { path = ".", features = ["test-support", "bench-hooks"] }
 # `test-util` exposes dispatch's single-operator test harness for the moved
 # Parquet reader unit/integration tests.
 dispatch = { workspace = true, features = ["test-util"] }
