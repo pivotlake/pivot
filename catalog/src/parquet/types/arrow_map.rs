@@ -20,7 +20,7 @@
 //!   Float32           FLOAT              -                       read+write
 //!   Float64           DOUBLE             -                       read+write
 //!   Utf8 / Utf8View   BYTE_ARRAY         converted UTF8 / String read+write
-//!   Date32            INT32              Date
+//!   Date32            INT32              Date                    read+write
 //!   Timestamp(Second) INT64              Timestamp{..}           read only
 //!   BinaryView        BYTE_ARRAY         unannotated             read+write
 //!   Decimal64(p,s)    INT32              Decimal (p <= 9)        read+write
@@ -33,8 +33,9 @@
 //! `physical_arrow_type` so a file-derived schema and a declared schema agree.
 //!
 //! The "read only" rows resolve files written elsewhere; pivot's own writer only
-//! emits the column set its encoder supports (Int32/Int64/Float32/Float64/
-//! strings/binary/decimals), so [`arrow_to_parquet_physical`] errors on the rest.
+//! emits the column set its encoder supports (Int32/Int64/Date32/Float32/
+//! Float64/strings/binary/decimals), so [`arrow_to_parquet_physical`] errors on
+//! the rest. `catalog/tests/types.rs` round trips every one of them.
 
 use arrow_schema::{DataType, TimeUnit};
 
