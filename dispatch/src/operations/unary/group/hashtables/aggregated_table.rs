@@ -22,7 +22,8 @@ use crate::operations::unary::group::RADIX_PARTITIONS;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::BaseHashTable;
 use crate::operations::unary::group::hashtables::{
-    AggregationValue, DEFAULT_CAPACITY, KeyExtractor, LiveKey, MultiSlabTable, StridedScatterRows,
+    AggregationValue, DEFAULT_CAPACITY, KeyExtractor, LiveKey, MultiSlabTable, PersistedKey,
+    StridedScatterRows,
 };
 use crate::operations::unary::group::hll::Hll;
 use crate::operations::unary::group::values::{AggregationSlot, ArityBody, WorkerContext};
@@ -61,10 +62,10 @@ impl RadixConfig {
 }
 
 /// One worker's scatter buffer for each radix partition.
-pub struct PartitionBuffers<K: KeyExtractor, V: AggregationValue + ?Sized>(
-    pub Vec<StridedScatterRows<<K as KeyExtractor>::Persisted, V>>,
+pub struct PartitionBuffers<KP: PersistedKey, V: AggregationValue + ?Sized>(
+    pub Vec<StridedScatterRows<KP, V>>,
 );
-unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Send for PartitionBuffers<K, V> {}
+unsafe impl<KP: PersistedKey, V: AggregationValue + ?Sized> Send for PartitionBuffers<KP, V> {}
 
 /// Tables, optional scatter buffers, and sizing data produced by one worker.
 pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue + ?Sized> {
@@ -73,9 +74,9 @@ pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue + ?Sized> 
     pub node: usize,
     /// In-place table stack: the full result if the worker never switched,
     /// otherwise its pre-switch tables.
-    pub tables: Vec<MultiSlabTable<K, V>>,
+    pub tables: Vec<MultiSlabTable<K::Persisted, V>>,
     /// Per-partition scatter buffers, present only after a radix transition.
-    pub buffers: Option<PartitionBuffers<K, V>>,
+    pub buffers: Option<PartitionBuffers<K::Persisted, V>>,
     /// Distinct-count sketch over the worker's rows, for sizing the merge targets.
     pub hll: Hll,
     /// `K::DEDUP_BY_HASH` only: this worker saw the (single) key whose bijective
@@ -94,7 +95,7 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     worker_context: V::WorkerContext,
     allocator: SlabAllocator,
     /// Tables built before a radix transition.
-    tables: Vec<MultiSlabTable<K, V>>,
+    tables: Vec<MultiSlabTable<K::Persisted, V>>,
     /// Per-partition buffers allocated on the first radix transition.
     buffers: Option<Vec<StridedScatterRows<<K as KeyExtractor>::Persisted, V>>>,
     /// Distinct-count sketch used to size merge targets.
@@ -383,7 +384,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
 /// A nonzero `N` specializes the entry layout and slot loops. `N == 0` uses
 /// runtime metadata.
 struct ProbeWindow<'a, 'b, K: KeyExtractor, V: AggregationValue + ?Sized> {
-    table: &'a mut MultiSlabTable<K, V>,
+    table: &'a mut MultiSlabTable<K::Persisted, V>,
     key_arena: &'a mut WorkerArena,
     worker_context: &'a mut V::WorkerContext,
     hashes: &'a [u64; RECORD_BATCH_SIZE],
@@ -435,7 +436,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> ArityBody<bool> for ProbeWin
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
 fn probe_rows<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized>(
-    table: &mut MultiSlabTable<K, V>,
+    table: &mut MultiSlabTable<K::Persisted, V>,
     key_arena: &mut WorkerArena,
     worker_context: &mut V::WorkerContext,
     hashes: &[u64; RECORD_BATCH_SIZE],

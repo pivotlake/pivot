@@ -7,7 +7,7 @@ pub use live_key::{ResolvedKey, StringKey};
 use crate::arrays::SlabColumn;
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
-use crate::operations::unary::group::keys::{KeyColumnBuilder, KeyExtractor};
+use crate::operations::unary::group::keys::{KeyColumnBuilder, KeyExtractor, StoredKey};
 use ahash::RandomState;
 use arrow_array::{Array, ArrayRef, RecordBatch, StringViewArray};
 use arrow_buffer::{Buffer, ScalarBuffer};
@@ -29,7 +29,7 @@ impl KeyExtractor for StringKeyExtractor {
     type Config = ();
     type Persisted = ArenaKey;
     type LiveKey<'a, 'b> = StringKey<'a, 'b>;
-    type PersistedLiveKey<'a> = ResolvedKey<'a>;
+    type Stored = ArenaStored;
     type Reader<'b> = &'b StringViewArray;
     type ColumnBuilder = StringKeyColumnBuilder;
     type Scratch = ();
@@ -62,13 +62,6 @@ impl KeyExtractor for StringKeyExtractor {
     ) -> Self::LiveKey<'a, 'r> {
         let val = unsafe { reader.value_unchecked(idx) };
         StringKey::new(arena, val)
-    }
-
-    fn resolve_persisted(arena: &SharedArena, persisted: ArenaKey) -> ResolvedKey<'_> {
-        ResolvedKey {
-            key: persisted,
-            arena,
-        }
     }
 }
 
@@ -124,5 +117,20 @@ impl KeyColumnBuilder for StringKeyColumnBuilder {
         });
         let fields = vec![Field::new("key", DataType::Utf8View, false)];
         (fields, vec![keys])
+    }
+}
+
+/// Keys stored as an [`ArenaKey`] pointing at a blob in the shared arena. Shared
+/// by the string extractor and the row encoder, whose keys differ in how they are
+/// built and decoded but are byte blobs in the arena either way.
+pub struct ArenaStored;
+
+impl StoredKey for ArenaStored {
+    type Persisted = ArenaKey;
+    type PersistedLiveKey<'a> = ResolvedKey<'a>;
+
+    #[inline(always)]
+    fn resolve_persisted(arena: &SharedArena, persisted: ArenaKey) -> ResolvedKey<'_> {
+        ResolvedKey::new(persisted, arena)
     }
 }

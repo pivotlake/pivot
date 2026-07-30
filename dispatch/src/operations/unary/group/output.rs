@@ -67,7 +67,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> TopKHeap<K, V> {
 fn offer_all<K, V, A>(
     heap: &mut SlabTopK<V::SortKey, (K::Persisted, V::Owned), A>,
     slot: usize,
-    table: &Table<K, V>,
+    table: &Table<K::Persisted, V>,
     allocator: &mut SlabAllocator,
     context: &V::SharedContext,
     owned_context: &mut Option<V::WorkerContext>,
@@ -182,7 +182,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
     /// Appends one partition table, applying worker-wide pruning when enabled.
     pub(crate) fn extend_from_table<Snd>(
         &mut self,
-        table: Table<K, V>,
+        table: Table<K::Persisted, V>,
         allocator: &mut SlabAllocator,
         sender: &mut Snd,
     ) -> Result<()>
