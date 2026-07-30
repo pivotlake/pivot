@@ -380,6 +380,9 @@ jobs:
           # so without these a failed run is undiagnosable after the box stops.
           scp -F "$HOME/.ssh/config" perf:/tmp/ab-before.out ab-before.out || true
           scp -F "$HOME/.ssh/config" perf:/tmp/ab-after.out ab-after.out || true
+          # The servers' own logs. When one fails to come up the harness only
+          # reports that it could not connect, and the reason it died is here.
+          scp -F "$HOME/.ssh/config" 'perf:/tmp/pivot-server-*.log' . || true
           {
             echo "## pivotdb Perf A/B"
             echo ""
@@ -408,6 +411,7 @@ jobs:
             ab-full.log
             ab-before.out
             ab-after.out
+            pivot-server-*.log
           if-no-files-found: ignore
 
       - name: Stop the perf box

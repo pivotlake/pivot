@@ -364,3 +364,14 @@ cat "$report"
 if [[ -n "$failures" ]]; then
     exit 3
 fi
+
+# A side that timed nothing produces no rows, so the gate above finds no
+# regressions and the run reads as a pass while having measured nothing. Treat
+# an empty side as the failure it is, and point at the harness output, which
+# carries the reason the report cannot.
+for side_tsv in "$before_tsv" "$after_tsv"; do
+    if [[ ! -s "$side_tsv" ]]; then
+        echo "error: no query was timed (${side_tsv##*/} is empty); see $before_out and $after_out" >&2
+        exit 4
+    fi
+done
