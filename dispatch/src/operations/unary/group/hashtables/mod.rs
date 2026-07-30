@@ -24,7 +24,7 @@ pub use aggregated_table::{AggregatedTable, AggregatedTableOutput, PartitionBuff
 pub const DEFAULT_CAPACITY: usize = 128;
 
 /// A table whose persisted key type comes from `K`.
-pub type Table<K, V> = BaseHashTable<<K as KeyExtractor>::Persisted, V>;
+pub type Table<KP, V> = BaseHashTable<KP, V>;
 
 /// A slab-backed table used both while consuming rows and while merging.
-pub type MultiSlabTable<K, V> = Table<K, V>;
+pub type MultiSlabTable<KP, V> = Table<KP, V>;

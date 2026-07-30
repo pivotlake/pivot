@@ -397,11 +397,11 @@ pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue + ?Sized> {
 /// that reads another node's memory.
 pub struct PartitionJob<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// This node's switched workers' scatter buffers (empty Vec when none switched).
-    buffers: Arc<Vec<PartitionBuffers<K, V>>>,
+    buffers: Arc<Vec<PartitionBuffers<K::Persisted, V>>>,
     /// Holds the in-place stacks of this node's workers: switched workers'
     /// pre-switch tables and non-switched workers' full stacks. Jobs merge
     /// them by slot range at `num_partitions` granularity.
-    tables: Arc<Vec<MultiSlabTable<K, V>>>,
+    tables: Arc<Vec<MultiSlabTable<K::Persisted, V>>>,
     index: usize,
     /// One shared instance per partition on a multi-node hierarchical merge;
     /// `None` when this job's merge result is already final (single-node pool
@@ -434,7 +434,7 @@ unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Send for PartitionJob
 /// and no job ever waits: the mailbox is a lock-free queue and the election
 /// is one atomic countdown.
 struct CrossNodeMerge<K: KeyExtractor, V: AggregationValue + ?Sized> {
-    node_tables: Injector<MultiSlabTable<K, V>>,
+    node_tables: Injector<MultiSlabTable<K::Persisted, V>>,
     /// Sends still outstanding; the sender that decrements this to zero is
     /// the receiver.
     pending_sends: AtomicUsize,
@@ -457,7 +457,10 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> CrossNodeMerge<K, V> {
     /// decrement observes all of them, so the drain below is guaranteed to
     /// see every node's table (and after the election nobody else touches
     /// the queue).
-    fn send(&self, table: MultiSlabTable<K, V>) -> Option<Vec<MultiSlabTable<K, V>>> {
+    fn send(
+        &self,
+        table: MultiSlabTable<K::Persisted, V>,
+    ) -> Option<Vec<MultiSlabTable<K::Persisted, V>>> {
         self.node_tables.push(table);
         if self.pending_sends.fetch_sub(1, Ordering::AcqRel) != 1 {
             return None;
@@ -485,7 +488,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
         sender: &mut S,
         allocator: &mut SlabAllocator,
     ) -> Result<()> {
-        let result_map = merge::merge_combined::<K, V>(
+        let result_map = merge::merge_combined::<K::Stored, V>(
             self.index,
             &self.buffers,
             &self.tables,
@@ -500,7 +503,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
                 // Another node's job for this partition is still running; it
                 // will receive the tables and run the final merge.
                 None => return Ok(()),
-                Some(node_tables) => merge::merge_node_aggregated_tables::<K, V>(
+                Some(node_tables) => merge::merge_node_aggregated_tables::<K::Stored, V>(
                     node_tables,
                     self.partition_capacity,
                     self.num_partitions.trailing_zeros(),
@@ -543,9 +546,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         sender: &mut S,
     ) -> unary::Result<()> {
         let node_count = self.injectors.len();
-        let mut tables_by_node: Vec<Vec<MultiSlabTable<K, V>>> =
+        let mut tables_by_node: Vec<Vec<MultiSlabTable<K::Persisted, V>>> =
             (0..node_count).map(|_| Vec::new()).collect();
-        let mut buffers_by_node: Vec<Vec<PartitionBuffers<K, V>>> =
+        let mut buffers_by_node: Vec<Vec<PartitionBuffers<K::Persisted, V>>> =
             (0..node_count).map(|_| Vec::new()).collect();
         let mut hll = Hll::new();
         let mut zero_hash_seen = false;
@@ -677,8 +680,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         let push_job = |injector: &Injector<PartitionJob<K, V>>,
                         index: usize,
                         cross_node_merge: Option<Arc<CrossNodeMerge<K, V>>>,
-                        buffers: Arc<Vec<PartitionBuffers<K, V>>>,
-                        tables: Arc<Vec<MultiSlabTable<K, V>>>| {
+                        buffers: Arc<Vec<PartitionBuffers<K::Persisted, V>>>,
+                        tables: Arc<Vec<MultiSlabTable<K::Persisted, V>>>| {
             injector.push(PartitionJob {
                 buffers,
                 tables,

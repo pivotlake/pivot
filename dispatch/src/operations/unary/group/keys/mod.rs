@@ -80,10 +80,13 @@ pub trait KeyExtractor: Send + 'static {
     type Config: Clone + Send + Sync + 'static;
     /// The `Copy` key representation stored inside hash table entries.
     type Persisted: PersistedKey;
+    /// How this extractor's keys are stored and read back during the merge.
+    ///
+    /// Extractors that store keys identically name the same [`StoredKey`], which
+    /// is what lets one compiled merge serve all of them.
+    type Stored: StoredKey<Persisted = Self::Persisted>;
     /// A transient key that borrows from the input batch and/or the worker arena.
     type LiveKey<'a, 'b>: LiveKey<Persisted = Self::Persisted>;
-    /// A live key reconstructed from an already-persisted key (used during merge).
-    type PersistedLiveKey<'a>: LiveKey<Persisted = Self::Persisted>;
     /// Per-batch reader holding downcast key-column accessors (or, for the row
     /// extractor, a borrow of the worker [`Scratch`](Self::Scratch) it encodes
     /// into).
@@ -124,12 +127,45 @@ pub trait KeyExtractor: Send + 'static {
         idx: usize,
         arena: &'a mut WorkerArena,
     ) -> Self::LiveKey<'a, 'r>;
+}
+
+/// How a key is stored in a table and read back out of one.
+///
+/// This is the whole of what the merge needs from a key: it never reads input
+/// columns or builds output ones, it only walks keys already in tables. Keeping
+/// it separate from [`KeyExtractor`] means extractors that store keys the same
+/// way share one implementation, and the merge is compiled once for all of them
+/// instead of once per extractor. Every integer pair packs to a `u128`, a string
+/// key and a row key are both arena keys, and an int-string key stores the same
+/// thing whichever order the two columns were written in, so 22 extractors need
+/// only 11 of these. The input and output sides stay fully specialized, which is
+/// where specialization actually pays.
+pub trait StoredKey: Send + 'static {
+    /// The `Copy` key representation stored inside hash table entries.
+    type Persisted: PersistedKey;
+    /// A live key reconstructed from an already-persisted key.
+    type PersistedLiveKey<'a>: LiveKey<Persisted = Self::Persisted>;
 
     /// Reconstruct a live key from a persisted key, borrowing from the shared arena.
     fn resolve_persisted(
         arena: &SharedArena,
         persisted: Self::Persisted,
     ) -> Self::PersistedLiveKey<'_>;
+}
+
+/// Keys held inline in the entry as a plain `Copy` value: a single integer, a
+/// packed integer pair, or the zero-sized key of a hash-only extractor. There is
+/// nothing out of line to chase, so resolving one returns it unchanged.
+pub struct InlineKey<P>(std::marker::PhantomData<P>);
+
+impl<P: PersistedKey + LiveKey<Persisted = P> + Send + 'static> StoredKey for InlineKey<P> {
+    type Persisted = P;
+    type PersistedLiveKey<'a> = P;
+
+    #[inline(always)]
+    fn resolve_persisted(_arena: &SharedArena, persisted: P) -> P {
+        persisted
+    }
 }
 
 /// Builds the leading key column(s) of a GROUP BY result, one group at a time.

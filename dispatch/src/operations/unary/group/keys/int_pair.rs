@@ -10,7 +10,7 @@
 use crate::arrays::{ArrayBuilder, PrimitiveBuilder};
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
-use crate::operations::unary::group::keys::{KeyColumnBuilder, KeyExtractor};
+use crate::operations::unary::group::keys::{InlineKey, KeyColumnBuilder, KeyExtractor};
 use ahash::RandomState;
 use arrow_array::cast::AsArray;
 use arrow_array::types::ArrowPrimitiveType;
@@ -78,7 +78,7 @@ where
     type Config = ();
     type Persisted = u128;
     type LiveKey<'a, 'b> = u128;
-    type PersistedLiveKey<'a> = u128;
+    type Stored = InlineKey<u128>;
     type Reader<'b> = PairReader<'b, A, B>;
     type ColumnBuilder = IntPairKeyColumnBuilder<A, B>;
     type Scratch = ();
@@ -108,10 +108,6 @@ where
         _arena: &'a mut WorkerArena,
     ) -> Self::LiveKey<'a, 'r> {
         reader.packed(idx)
-    }
-
-    fn resolve_persisted(_arena: &SharedArena, persisted: u128) -> u128 {
-        persisted
     }
 }
 

@@ -18,7 +18,7 @@ use super::int_pair::IntBits;
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::PersistedKey;
-use crate::operations::unary::group::keys::{KeyColumnBuilder, KeyExtractor};
+use crate::operations::unary::group::keys::{InlineKey, KeyColumnBuilder, KeyExtractor};
 use ahash::RandomState;
 use arrow_array::cast::AsArray;
 use arrow_array::types::ArrowPrimitiveType;
@@ -62,7 +62,7 @@ where
     type Config = ();
     type Persisted = ();
     type LiveKey<'a, 'b> = ();
-    type PersistedLiveKey<'a> = ();
+    type Stored = InlineKey<()>;
     type Reader<'b> = &'b PrimitiveArray<T>;
     type ColumnBuilder = NoKeyColumnBuilder;
     type Scratch = ();
@@ -92,8 +92,6 @@ where
         _arena: &'a mut WorkerArena,
     ) -> Self::LiveKey<'a, 'r> {
     }
-
-    fn resolve_persisted(_arena: &SharedArena, _persisted: ()) {}
 }
 
 /// No-op key columns: a keys-only group is only ever used count-only, so this is
