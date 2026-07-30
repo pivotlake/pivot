@@ -125,9 +125,9 @@ async fn insert_returns_affected_row_count(#[future] conn: Conn) {
         SimpleQueryMessage::CommandComplete(rows) => assert_eq!(*rows, 2),
         other => panic!("expected INSERT command completion, got {other:?}"),
     }
-    // The inserted rows are durable in the Delta log but only become visible once
-    // the datastore's background refresh advances the live set (this server runs
-    // none); an INSERT's own visibility is exercised end-to-end in `metastore_e2e`.
+
+    let rows = select_rows(&conn, "SELECT id FROM people_insert ORDER BY id").await;
+    assert_eq!(rows.len(), 5);
 }
 
 #[rstest]
