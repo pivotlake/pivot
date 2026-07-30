@@ -659,6 +659,7 @@ fn commit_table_creations(
 /// INSERT never writes shared read state. Blocking store I/O, so
 /// [`DeltaTransaction::commit`] runs it on the blocking pool.
 fn commit_uploaded_files(
+    datastore: &DeltaDatastore,
     snapshot: &DeltaSnapshot,
     drained: Vec<insert_sink::UploadedFile>,
 ) -> CatalogResult<()> {
@@ -686,6 +687,12 @@ fn commit_uploaded_files(
             .catalog_table_by_id(&table_id)
             .ok_or_else(|| Error::TableNotFound(table_id.to_string()))?;
         table.commit_uploaded_files(files)?;
+        // The copy that performed the commit is the one holding the new version,
+        // and the only one carrying the uploaded files' sort bounds (the Delta
+        // log does not persist them). Publish it so the next transaction reads
+        // the inserted rows instead of waiting for a background refresh, which
+        // would also reload those files without their bounds.
+        datastore.publish_table(table);
     }
     Ok(())
 }
@@ -928,7 +935,7 @@ impl DatastoreTransaction for DeltaTransaction {
         let uploaded_files = drain_injector(&self.uploaded_files);
         tokio::task::spawn_blocking(move || {
             commit_table_creations(&datastore, pending_table_creations)?;
-            commit_uploaded_files(&snapshot, uploaded_files)
+            commit_uploaded_files(&datastore, &snapshot, uploaded_files)
         })
         .await
         .map_err(|e| CatalogError::Other(format!("commit thread panicked: {e}").into()))?
