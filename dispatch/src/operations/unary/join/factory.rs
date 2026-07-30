@@ -8,8 +8,8 @@ use arrow_schema::Field;
 use crossbeam_deque::Injector;
 use std::hash::Hash;
 
-use crate::api::OperatorFactory;
 use crate::api::OperatorGraphBuilder;
+use crate::api::{BuildContext, OperatorFactory};
 use crate::memory::MultiSlabBuffer;
 use crate::operations::UnaryFactory;
 use crate::operations::channels::{ChannelFactory, Sender, StealableChannelFactory};
@@ -206,11 +206,15 @@ where
     BF: UnaryFactory<RecordBatch, ()>,
     PF: UnaryFactory<RecordBatch, RecordBatch>,
 {
-    fn build(self: Box<Self>, sender: Box<dyn Sender<RecordBatch>>) -> OperatorGraphBuilder {
+    fn build(
+        self: Box<Self>,
+        sender: Box<dyn Sender<RecordBatch>>,
+        context: &mut BuildContext,
+    ) -> OperatorGraphBuilder {
         let (probe_tx, probe_rx) = self.probe_channel_factory.build();
         let probe_graph = self
             .probe_head
-            .build(Box::new(probe_tx))
+            .build(Box::new(probe_tx), context)
             .gated_by(self.build_ready)
             .with(Box::new(UnaryOperator::new(
                 self.probe_factory.build_unary(),
@@ -220,15 +224,15 @@ where
             )));
 
         let (build_tx, build_rx) = self.build_channel_factory.build();
-        let build_graph =
-            self.build_head
-                .build(Box::new(build_tx))
-                .with(Box::new(UnaryOperator::new(
-                    self.build_factory.build_unary(),
-                    build_rx,
-                    Box::new(DiscardSender),
-                    self.build_siblings_left,
-                )));
+        let build_graph = self
+            .build_head
+            .build(Box::new(build_tx), context)
+            .with(Box::new(UnaryOperator::new(
+                self.build_factory.build_unary(),
+                build_rx,
+                Box::new(DiscardSender),
+                self.build_siblings_left,
+            )));
 
         probe_graph.with_side_graph(build_graph)
     }

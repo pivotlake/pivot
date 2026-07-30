@@ -55,6 +55,9 @@ use thiserror::Error;
 
 pub mod channels;
 
+pub mod cte;
+pub use cte::{CteFactory, CteScanFactory};
+
 pub mod in_memory;
 pub use in_memory::{Forward, InjectorSourceFactory};
 

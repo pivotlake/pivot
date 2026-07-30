@@ -5,7 +5,7 @@
 //! worker event loop through [`Operator`].
 
 use super::{FinishStatus, Operator};
-use crate::api::{OperatorFactory, OperatorGraphBuilder};
+use crate::api::{BuildContext, OperatorFactory, OperatorGraphBuilder};
 use crate::data_flow::WorkStatus;
 use crate::io::{
     FsReadRequest, FsRequest, FsWriteRequest, HttpGetRequest, HttpRequest, HttpUploadRequest,
@@ -172,7 +172,11 @@ impl<O, NF: NullaryFactory<O>> NullaryOperatorFactory<O, NF> {
 }
 
 impl<O: 'static, NF: NullaryFactory<O>> OperatorFactory<O> for NullaryOperatorFactory<O, NF> {
-    fn build(self: Box<Self>, sender: Box<dyn Sender<O>>) -> OperatorGraphBuilder {
+    fn build(
+        self: Box<Self>,
+        sender: Box<dyn Sender<O>>,
+        _context: &mut BuildContext,
+    ) -> OperatorGraphBuilder {
         OperatorGraphBuilder::root(Box::new(NullaryOperator::new(
             self.nullary_factory.build_nullary(),
             sender,

@@ -1,3 +1,4 @@
+use crate::api::BuildContext;
 use crate::operations::channels::{
     ChannelFactory, Sender, StealableChannelFactory, mpsc_channel, stealable,
 };
@@ -78,7 +79,9 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
             .dispatcher
             .push_data_flow(self.factories.into_iter().map(|f| {
                 let tx = tx.clone();
-                let build = Box::new(move || Box::new(f).build(Box::new(tx)));
+                let build = Box::new(move |context: &mut BuildContext| {
+                    Box::new(f).build(Box::new(tx), context)
+                });
                 let builder = DataFlowBuilder::new(
                     build,
                     cancelled.clone(),
@@ -217,13 +220,21 @@ impl<OF: OperatorFactory<RecordBatch> + 'static> OperatorSpec<RecordBatch, OF> {
 /// call costs nothing next to producing the batch.
 pub trait OperatorFactory<O>: Send {
     /// Build the operator chain, outputting to `sender`.
-    fn build(self: Box<Self>, sender: Box<dyn Sender<O>>) -> OperatorGraphBuilder;
+    fn build(
+        self: Box<Self>,
+        sender: Box<dyn Sender<O>>,
+        context: &mut BuildContext,
+    ) -> OperatorGraphBuilder;
 }
 
 /// A boxed factory is itself a factory, so an already-erased head can be handed
 /// straight to a stage that wants one by value.
 impl<O> OperatorFactory<O> for Box<dyn OperatorFactory<O>> {
-    fn build(self: Box<Self>, sender: Box<dyn Sender<O>>) -> OperatorGraphBuilder {
-        (*self).build(sender)
+    fn build(
+        self: Box<Self>,
+        sender: Box<dyn Sender<O>>,
+        context: &mut BuildContext,
+    ) -> OperatorGraphBuilder {
+        (*self).build(sender, context)
     }
 }
