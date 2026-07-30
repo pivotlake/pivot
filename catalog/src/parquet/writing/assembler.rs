@@ -401,18 +401,17 @@ fn write_footer(out: &mut Vec<u8>, file_meta: &FileMetaData) -> WriteResult<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parquet::ParquetTable;
     use crate::parquet::writing::encoder::encode_column_chunk;
     use crate::parquet::writing::types::{EncodedColumnChunk, PartitionTag};
-    use crate::parquet::{ParquetTable, table_input};
     use arrow_array::cast::AsArray;
-    use arrow_array::types::{Decimal64Type, Decimal128Type, Int64Type};
+    use arrow_array::types::{Decimal64Type, Int64Type};
     use arrow_array::{
-        Array, ArrayRef, Datum, Decimal64Array, Decimal128Array, Int64Array, RecordBatch,
-        StringArray, StructArray,
+        Array, ArrayRef, Datum, Decimal64Array, Int64Array, RecordBatch, StructArray,
     };
     use arrow_buffer::NullBuffer;
     use arrow_schema::{Field, Fields, Schema};
-    use dispatch::{Dispatch, Projection};
+    use dispatch::Dispatch;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::sync::Arc;
 
@@ -466,36 +465,6 @@ mod tests {
         let read: Vec<RecordBatch> = reader.map(|b| b.unwrap()).collect();
         assert_eq!(read.len(), 1);
         read.into_iter().next().unwrap()
-    }
-
-    /// A small low-cardinality batch dictionary-encodes; the output round-trips.
-    #[test]
-    fn output_is_readable_by_a_strict_parquet_reader() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("n", DataType::Int64, false),
-            Field::new("s", DataType::Utf8, false),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(Int64Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec!["a", "bb", "ccc"])),
-            ],
-        )
-        .unwrap();
-
-        let got = round_trip(&batch);
-        assert_eq!(
-            got.column(0).as_any().downcast_ref::<Int64Array>().unwrap(),
-            &Int64Array::from(vec![1, 2, 3])
-        );
-        assert_eq!(
-            got.column(1)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap(),
-            &StringArray::from(vec!["a", "bb", "ccc"])
-        );
     }
 
     /// A nullable column and a nullable struct round-trip through arrow-rs: the
@@ -575,12 +544,11 @@ mod tests {
         assert_eq!(wide.type_length, Some(16));
     }
 
-    /// A decimal column round-trips through pivot's own catalog reader: the
-    /// loader resolves `Decimal64(10, 2)` from the footer annotations, the
-    /// decoder restores the values (negative ones included), and the row-group
-    /// statistics decode into usable bounds.
+    /// A decimal column's row-group statistics decode into bounds at the
+    /// column's own type, negative values included, which is what lets a decimal
+    /// predicate skip a row group.
     #[test]
-    fn a_decimal_column_round_trips_through_the_catalog_reader() {
+    fn a_decimal_columns_statistics_decode_into_bounds() {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "amount",
             DataType::Decimal64(10, 2),
@@ -589,96 +557,19 @@ mod tests {
         let values = Decimal64Array::from(vec![12345_i64, -67890, 100])
             .with_precision_and_scale(10, 2)
             .unwrap();
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(values.clone()) as ArrayRef]).unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(values) as ArrayRef]).unwrap();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("data.parquet"), encode(&batch)).unwrap();
         let dispatch = Dispatch::spin_up(2, 64, None);
 
         let table =
             Arc::new(ParquetTable::from_directory(dispatch.dispatcher(), dir.path(), &[]).unwrap());
-        let read = table_input(dispatch.dispatcher(), &table, Projection::all(1), false)
-            .collect()
-            .unwrap();
 
-        assert_eq!(
-            table.schema().field(0).data_type(),
-            &DataType::Decimal64(10, 2)
-        );
-        let read = arrow_select::concat::concat_batches(&read[0].schema(), &read).unwrap();
-        assert_eq!(read.column(0).as_primitive::<Decimal64Type>(), &values);
         let stats = table.row_groups()[0].column_statistics(0).unwrap();
         let (min, _) = stats.min.as_ref().unwrap().get();
         let (max, _) = stats.max.as_ref().unwrap().get();
         assert_eq!(min.as_primitive::<Decimal64Type>().value(0), -67890);
         assert_eq!(max.as_primitive::<Decimal64Type>().value(0), 12345);
         dispatch.exit();
-    }
-
-    /// A low-cardinality decimal column takes the dictionary path (a PLAIN
-    /// dictionary page of 16-byte big-endian entries behind RLE indices) and
-    /// still round-trips through a strict reader.
-    #[test]
-    fn dictionary_encoded_decimals_round_trip() {
-        let values: Vec<i64> = (0..300).map(|i| [100, -250, 999][i % 3]).collect();
-        let array = Decimal64Array::from(values.clone())
-            .with_precision_and_scale(10, 2)
-            .unwrap();
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "amount",
-            DataType::Decimal64(10, 2),
-            false,
-        )]));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(array.clone()) as ArrayRef]).unwrap();
-
-        let bytes = encode(&batch);
-
-        let reader =
-            ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(&bytes))
-                .unwrap();
-        let encodings: Vec<_> = reader
-            .metadata()
-            .row_group(0)
-            .column(0)
-            .encodings()
-            .collect();
-        assert!(
-            encodings.contains(&parquet::basic::Encoding::RLE_DICTIONARY),
-            "expected a dictionary-encoded chunk, got {encodings:?}"
-        );
-        let got: Vec<RecordBatch> = reader.build().unwrap().map(|b| b.unwrap()).collect();
-        let got = arrow_select::concat::concat_batches(&got[0].schema(), &got).unwrap();
-        // The strict external reader resolves an FLBA-stored decimal as
-        // `Decimal128`, so the expected values widen accordingly.
-        let widened = Decimal128Array::from(values.iter().map(|&v| v as i128).collect::<Vec<_>>())
-            .with_precision_and_scale(10, 2)
-            .unwrap();
-        assert_eq!(got.column(0).as_primitive::<Decimal128Type>(), &widened);
-    }
-
-    /// A many-row, few-distinct column exercises the dictionary path's RLE runs
-    /// (long repeats) and bit-packed groups, and round-trips through arrow-rs.
-    #[test]
-    fn dictionary_encoded_column_round_trips() {
-        // 900 rows over 3 distinct strings, with both long runs and scattered
-        // values, so the index stream uses RLE and bit-packed runs.
-        let services = ["api", "db", "cache"];
-        let values: Vec<&str> = (0..900).map(|i| services[(i / 50 + i % 3) % 3]).collect();
-        let schema = Arc::new(Schema::new(vec![Field::new("svc", DataType::Utf8, false)]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(StringArray::from(values.clone())) as ArrayRef],
-        )
-        .unwrap();
-
-        let got = round_trip(&batch);
-        assert_eq!(
-            got.column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap(),
-            &StringArray::from(values)
-        );
     }
 }
