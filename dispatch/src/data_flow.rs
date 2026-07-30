@@ -125,16 +125,18 @@ pub enum WorkStatus {
 
 /// Directed graph of operators with precomputed roots and leaves.
 ///
-/// Each node has at most one downstream subscriber (`edges`) and zero or more
-/// upstream publishers (`back_edges`). Supports two traversal orders:
+/// A node has zero or more downstream subscribers (`edges`) and zero or more
+/// upstream publishers (`back_edges`). Several subscribers means one stage's
+/// output is read in full by each of them, as a CTE's is. Supports two
+/// traversal orders:
 /// - **Backwards** (leaf-to-root): for running CPU work and collecting IO requests.
 /// - **Forwards** (root-to-leaf): for stealing and finishing.
 struct OperatorGraph {
     operators: Vec<OperatorNode>,
     leafs: Vec<usize>,
     roots: Vec<usize>,
-    /// Subscriber index for each node, or `None` if the node is a leaf.
-    edges: Vec<Option<usize>>,
+    /// Subscriber indices for each node; empty for a leaf.
+    edges: Vec<Vec<usize>>,
     /// Publisher indices for each node.
     back_edges: Vec<Vec<usize>>,
 }
@@ -142,7 +144,7 @@ struct OperatorGraph {
 impl OperatorGraph {
     fn from_edges(
         operators: Vec<Box<dyn Operator>>,
-        publisher_to_subscriber: HashMap<Identifier, Identifier>,
+        publisher_to_subscriber: Vec<(Identifier, Identifier)>,
         mut gates: HashMap<Identifier, Vec<Arc<AtomicBool>>>,
     ) -> Self {
         debug!(
@@ -151,11 +153,11 @@ impl OperatorGraph {
         );
 
         let n = operators.len();
-        let mut edges: Vec<Option<usize>> = vec![None; n];
+        let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
         let mut back_edges: Vec<Vec<usize>> = vec![Vec::new(); n];
 
-        for (&publisher, &sub) in &publisher_to_subscriber {
-            edges[publisher] = Some(sub);
+        for (publisher, sub) in publisher_to_subscriber {
+            edges[publisher].push(sub);
             back_edges[sub].push(publisher);
         }
 
@@ -170,7 +172,7 @@ impl OperatorGraph {
             .collect();
 
         let roots = (0..n).filter(|&i| back_edges[i].is_empty()).collect();
-        let leafs = (0..n).filter(|&i| edges[i].is_none()).collect();
+        let leafs = (0..n).filter(|&i| edges[i].is_empty()).collect();
 
         Self {
             operators,
@@ -218,49 +220,45 @@ impl OperatorGraph {
                     return Ok(res);
                 }
             }
-            if let Some(child) = self.edges[idx] {
-                stack.push(child);
-            }
+            stack.extend(self.edges[idx].iter().copied());
         }
         Ok(ControlFlow::Continue(()))
     }
 
-    /// Advance finishing independently from every root. A pending node blocks
-    /// only its own downstream path, not sibling roots.
+    /// Advance finishing from every root. A pending node blocks only what is
+    /// downstream of it, not sibling roots.
     fn try_finish(&mut self) -> Result<FinishStatus> {
         let mut working = false;
 
-        for root in self.roots.clone() {
-            let mut next = Some(root);
-            while let Some(idx) = next {
-                // A converging node cannot finish before all of its publishers.
-                if self.back_edges[idx]
-                    .iter()
-                    .any(|&publisher| !self.operators[publisher].is_finished())
-                {
-                    break;
-                }
-
-                let node = &mut self.operators[idx];
-                if node.is_gated() {
-                    break;
-                }
-                if let Some(operator) = node.operator.as_deref_mut() {
-                    match operator.try_finish()? {
-                        // Retiring the node drops the operator, and with it the
-                        // sender it holds, so a stage that watches the other end
-                        // of that channel learns the stage is over.
-                        FinishStatus::Done => node.operator = None,
-                        FinishStatus::Working => working = true,
-                        FinishStatus::Pending => {}
-                    }
-                }
-
-                if !node.is_finished() {
-                    break;
-                }
-                next = self.edges[idx];
+        let mut stack: Vec<usize> = self.roots.clone();
+        while let Some(idx) = stack.pop() {
+            // A converging node cannot finish before all of its publishers.
+            if self.back_edges[idx]
+                .iter()
+                .any(|&publisher| !self.operators[publisher].is_finished())
+            {
+                continue;
             }
+
+            let node = &mut self.operators[idx];
+            if node.is_gated() {
+                continue;
+            }
+            if let Some(operator) = node.operator.as_deref_mut() {
+                match operator.try_finish()? {
+                    // Retiring the node drops the operator, and with it the
+                    // sender it holds, so a stage that watches the other end
+                    // of that channel learns the stage is over.
+                    FinishStatus::Done => node.operator = None,
+                    FinishStatus::Working => working = true,
+                    FinishStatus::Pending => {}
+                }
+            }
+
+            if !node.is_finished() {
+                continue;
+            }
+            stack.extend(self.edges[idx].iter().copied());
         }
 
         Ok(if self.operators.iter().all(OperatorNode::is_finished) {
@@ -277,18 +275,36 @@ impl OperatorGraph {
     /// everything downstream are left running. Used by a satisfied `LIMIT` to
     /// stop and free the scan feeding it.
     ///
-    /// This walks `back_edges`. Because every node has at most one downstream
-    /// subscriber, every ancestor reached this way can feed downstream only
-    /// through `node`, even when the dataflow contains multiple roots.
+    /// A publisher is only abandoned once nothing still reads it. On a chain
+    /// that is every ancestor, since each feeds downstream only through `node`.
+    /// Where a stage's output is read in more than one place, such as a CTE
+    /// feeding several scans, a `LIMIT` over one reader must leave the stage
+    /// alone: the other readers are still waiting on its rows.
     fn abandon_ancestors(&mut self, node: usize) {
+        // The requester keeps running, but as far as its publishers are
+        // concerned it is done reading.
+        let mut done: Vec<bool> = (0..self.operators.len())
+            .map(|idx| idx == node || self.operators[idx].is_finished())
+            .collect();
+
         let mut stack: Vec<usize> = self.back_edges[node].clone();
         while let Some(idx) = stack.pop() {
-            if self.operators[idx].is_finished() {
+            if done[idx] {
                 // Guards against re-visiting on a DAG and against re-abandoning
                 // across repeated calls; on a chain it simply never triggers.
                 continue;
             }
+            if !self.edges[idx].iter().all(|&subscriber| done[subscriber]) {
+                // Still read by someone else, so it stays. A reader can't retire
+                // before the stage feeding it, so in practice a stage read in
+                // more than one place runs to completion rather than being freed
+                // early. That costs the work a `LIMIT` would have saved, and is
+                // the direction to err in: the alternative starves the readers
+                // that had not finished.
+                continue;
+            }
             self.operators[idx].operator = None;
+            done[idx] = true;
             stack.extend(self.back_edges[idx].iter().copied());
         }
     }
@@ -350,7 +366,7 @@ impl DataFlow {
         canceled: Arc<AtomicBool>,
         err_tx: mpsc::Sender<Error>,
         operators: Vec<Box<dyn Operator>>,
-        publisher_to_subscriber: HashMap<Identifier, Identifier>,
+        publisher_to_subscriber: Vec<(Identifier, Identifier)>,
         gates: HashMap<Identifier, Vec<Arc<AtomicBool>>>,
         stats_tx: mpsc::Sender<DataFlowStats>,
         collect_stats: bool,
@@ -783,7 +799,7 @@ mod tests {
         let operators: Vec<Box<dyn Operator>> = (0..n)
             .map(|_| Box::new(LiveOperator) as Box<dyn Operator>)
             .collect();
-        let publisher_to_subscriber: HashMap<Identifier, Identifier> =
+        let publisher_to_subscriber: Vec<(Identifier, Identifier)> =
             (0..n - 1).map(|i| (i, i + 1)).collect();
         OperatorGraph::from_edges(operators, publisher_to_subscriber, HashMap::default())
     }
@@ -801,8 +817,7 @@ mod tests {
             FinishStatus::Done,
             dropped.clone(),
         ))];
-        let mut graph =
-            OperatorGraph::from_edges(operators, HashMap::default(), HashMap::default());
+        let mut graph = OperatorGraph::from_edges(operators, Vec::new(), HashMap::default());
 
         assert_eq!(graph.try_finish().unwrap(), FinishStatus::Done);
 
@@ -815,8 +830,7 @@ mod tests {
             Box::new(FinishOperator::new(FinishStatus::Pending)),
             Box::new(FinishOperator::new(FinishStatus::Done)),
         ];
-        let mut graph =
-            OperatorGraph::from_edges(operators, HashMap::default(), HashMap::default());
+        let mut graph = OperatorGraph::from_edges(operators, Vec::new(), HashMap::default());
 
         assert_eq!(graph.try_finish().unwrap(), FinishStatus::Pending);
         assert!(!graph.operators[0].is_finished());
@@ -836,7 +850,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             err_tx,
             vec![Box::new(CountingOperator(runs.clone()))],
-            HashMap::default(),
+            Vec::new(),
             gates,
             stats_tx,
             false,
@@ -859,7 +873,7 @@ mod tests {
         gates.insert(0, vec![first.clone(), second.clone()]);
         let operators: Vec<Box<dyn Operator>> =
             vec![Box::new(FinishOperator::new(FinishStatus::Done))];
-        let mut graph = OperatorGraph::from_edges(operators, HashMap::default(), gates);
+        let mut graph = OperatorGraph::from_edges(operators, Vec::new(), gates);
 
         assert_eq!(graph.try_finish().unwrap(), FinishStatus::Pending);
         first.store(true, Ordering::Release);
@@ -881,6 +895,22 @@ mod tests {
         // The limit and everything downstream keep running.
         assert!(!is_abandoned(&graph, 2));
         assert!(!is_abandoned(&graph, 3));
+    }
+
+    #[test]
+    fn abandoning_one_reader_spares_a_publisher_the_other_still_needs() {
+        // Node 0's output is read by both 1 and 2, as a CTE's definition is read
+        // by each of its scans.
+        let operators: Vec<Box<dyn Operator>> = (0..3)
+            .map(|_| Box::new(LiveOperator) as Box<dyn Operator>)
+            .collect();
+        let mut graph =
+            OperatorGraph::from_edges(operators, vec![(0, 1), (0, 2)], HashMap::default());
+
+        graph.abandon_ancestors(1);
+
+        assert!(!is_abandoned(&graph, 0), "node 2 is still reading it");
+        assert!(!is_abandoned(&graph, 2));
     }
 
     #[test]

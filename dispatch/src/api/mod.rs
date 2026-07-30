@@ -74,6 +74,9 @@
 //! - [`DataFlowBuilder`] — Pairs a `Box<dyn OperatorFactory<RecordBatch>>` with the output
 //!   `MpscSender`. Sent to a worker thread, which calls `.build()` to produce a `DataFlow`.
 
+mod build_context;
+pub use build_context::BuildContext;
+
 mod builder;
 pub use builder::{DataFlowBuilder, OperatorGraphBuilder};
 

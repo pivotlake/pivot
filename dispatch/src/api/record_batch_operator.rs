@@ -55,11 +55,11 @@ use std::hash::Hash;
 use crate::api::operator_spec::{OperatorFactory, OperatorSpec};
 use crate::operations::channels::{StealableChannelFactory, stealable};
 use crate::operations::{
-    AggregateFactory, AggregationSlot, AggregationValue, CopyOutFactory, Distinct,
-    DynamicFilterSlot, F64Cell, FilterFactory, GroupFactory, GroupLimit, IntCell, JoinKind,
-    JoinRecordBatchOperatorFactory, JoinSpec, KeyExtractor, LimitFactory, MapFactory,
-    NoOpNullaryFactory, NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByLimitFactory,
-    UnaryFactory, UnaryOperatorFactory, WideCell, create_join_factories,
+    AggregateFactory, AggregationSlot, AggregationValue, CopyOutFactory, CteFactory,
+    CteScanFactory, Distinct, DynamicFilterSlot, F64Cell, FilterFactory, GroupFactory, GroupLimit,
+    IntCell, JoinKind, JoinRecordBatchOperatorFactory, JoinSpec, KeyExtractor, LimitFactory,
+    MapFactory, NoOpNullaryFactory, NullaryFactory, NullaryOperatorFactory, OrderBy,
+    OrderByLimitFactory, UnaryFactory, UnaryOperatorFactory, WideCell, create_join_factories,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle, DataFlowStats};
 pub const RECORD_BATCH_SIZE: usize = 8192;
@@ -201,6 +201,70 @@ impl RecordBatchOperatorSpec {
             dispatcher,
             (0..dispatcher.worker_count()).map(|_| NoOpNullaryFactory),
         )
+    }
+
+    /// One scan site of a CTE: a source over every row the CTE's definition
+    /// produces, in whatever order they arrive.
+    ///
+    /// A site reads its own channel, so several sites each see the full result
+    /// rather than dividing it between them. Pair with
+    /// [`with_cte`](Self::with_cte) on a spec containing the sites, which is
+    /// what supplies the rows: on its own a site produces nothing and never
+    /// finishes.
+    pub fn cte_scan(dispatcher: &DataFlowDispatcher, cte_index: usize) -> Self {
+        let siblings_left = Arc::new(AtomicUsize::new(dispatcher.worker_count()));
+        let factories = stealable::<RecordBatch>(dispatcher.topology())
+            .into_iter()
+            .map(|channel_factory| {
+                Box::new(CteScanFactory {
+                    channel_factory,
+                    cte_index,
+                    siblings_left: siblings_left.clone(),
+                }) as Box<dyn OperatorFactory<RecordBatch>>
+            })
+            .collect();
+        Self {
+            dispatcher: dispatcher.clone(),
+            factories,
+        }
+    }
+
+    /// Run `definition` alongside this spec, feeding its rows to each of the
+    /// `sites` [`cte_scan`](Self::cte_scan) sites for `cte_index` that this spec
+    /// contains.
+    ///
+    /// The definition runs once however many sites read it, and runs
+    /// concurrently with them: a site consumes batches as they are produced
+    /// rather than waiting for the whole result.
+    pub fn with_cte(
+        self,
+        definition: RecordBatchOperatorSpec,
+        cte_index: usize,
+        sites: usize,
+    ) -> Self {
+        let (_, definition_heads) = definition.into_parts();
+        assert_eq!(
+            self.factories.len(),
+            definition_heads.len(),
+            "a CTE and its definition must use the same worker count"
+        );
+        let factories = self
+            .factories
+            .into_iter()
+            .zip(definition_heads)
+            .map(|(body_head, definition_head)| {
+                Box::new(CteFactory {
+                    definition_head,
+                    body_head,
+                    cte_index,
+                    sites,
+                }) as Box<dyn OperatorFactory<RecordBatch>>
+            })
+            .collect();
+        Self {
+            dispatcher: self.dispatcher,
+            factories,
+        }
     }
 
     /// Borrow the dispatcher this spec was built against.

@@ -11,8 +11,8 @@
 //!   Uses a [`RootChannelFactory`] that only produces a receiver (the sender lives
 //!   externally, e.g. a shared injector queue).
 
-use crate::api::OperatorFactory;
 use crate::api::OperatorGraphBuilder;
+use crate::api::{BuildContext, OperatorFactory};
 use crate::operations::channels::ChannelFactory;
 use crate::operations::channels::{RootChannelFactory, Sender};
 use crate::operations::unary::{Unary, UnaryOperator};
@@ -74,9 +74,13 @@ impl<I, O, UF: UnaryFactory<I, O>, C: ChannelFactory<I>, OP: OperatorFactory<I>>
 impl<I: 'static, O: 'static, UF: UnaryFactory<I, O>, C: ChannelFactory<I>, OP: OperatorFactory<I>>
     OperatorFactory<O> for UnaryOperatorFactory<I, O, UF, C, OP>
 {
-    fn build(self: Box<Self>, sender: Box<dyn Sender<O>>) -> OperatorGraphBuilder {
+    fn build(
+        self: Box<Self>,
+        sender: Box<dyn Sender<O>>,
+        context: &mut BuildContext,
+    ) -> OperatorGraphBuilder {
         let (tx, rx) = self.channel_factory.build();
-        let chain = Box::new(self.head).build(Box::new(tx));
+        let chain = Box::new(self.head).build(Box::new(tx), context);
         chain.with(Box::new(UnaryOperator::new(
             self.unary_factory.build_unary(),
             rx,
@@ -112,7 +116,11 @@ impl<I, O, UF: UnaryFactory<I, O>, C: RootChannelFactory<I>> RootUnaryOperatorFa
 impl<I: 'static, O: 'static, UF: UnaryFactory<I, O>, C: RootChannelFactory<I>> OperatorFactory<O>
     for RootUnaryOperatorFactory<I, O, UF, C>
 {
-    fn build(self: Box<Self>, sender: Box<dyn Sender<O>>) -> OperatorGraphBuilder {
+    fn build(
+        self: Box<Self>,
+        sender: Box<dyn Sender<O>>,
+        _context: &mut BuildContext,
+    ) -> OperatorGraphBuilder {
         let rx = self.channel_factory.build();
         OperatorGraphBuilder::root(Box::new(UnaryOperator::new(
             self.unary_factory.build_unary(),
