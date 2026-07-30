@@ -9,6 +9,7 @@
 //! decompressor to locate pages on disk.
 
 use crate::parquet::types::table::ParquetTable;
+use crate::parquet::types::thrift::general::CompressionCodec;
 use arrow_array::{ArrayRef, Scalar};
 use arrow_schema::SchemaRef;
 use dispatch::io::OpenFile;
@@ -37,6 +38,9 @@ pub struct ColumnStatistics {
 /// on disk without re-parsing Parquet footer metadata at read time.
 #[derive(Clone)]
 pub struct ColumnChunkMeta {
+    /// Compression codec of every page in this chunk. Validated as a codec the
+    /// engine can decompress when the footer is parsed.
+    pub codec: CompressionCodec,
     /// Offset of the dictionary page, if the column uses dictionary encoding.
     pub dictionary_page_offset: Option<i64>,
     /// Offset of the first data page.
