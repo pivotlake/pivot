@@ -4,7 +4,7 @@
 //!
 //! The crate is a thin glue layer: [`pgwire`] drives the wire protocol,
 //! [`planner`] turns each SQL string into an executable plan against a
-//! caller-supplied [`Catalog`](planner::catalog::Catalog), and [`dispatch`]
+//! caller-supplied [`PivotCatalog`](catalog::PivotCatalog), and [`dispatch`]
 //! runs the resulting dataflow on its thread-per-core worker pool. Each query
 //! hops to `tokio::task::spawn_blocking` to drive the (non-`Send`) DuckDB
 //! planner; the planner is cached in a thread-local on each blocking-pool
