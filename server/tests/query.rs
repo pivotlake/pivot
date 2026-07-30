@@ -588,3 +588,32 @@ async fn insert_from_a_shredded_variant_reassembles_and_reshreds(#[future] conn:
          queries while storing every document opaque"
     );
 }
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn cte_read_twice_runs_once_and_feeds_both_readers(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_cte", dir.path()).await;
+
+    // Grouping by a unique column gives one row per id, so the self-join below
+    // pairs each row of the CTE with itself: a reader that saw only some of the
+    // rows loses whole output rows rather than changing a value. DuckDB
+    // materializes this CTE rather than inlining a copy per reference, because
+    // it ends in an aggregate.
+    let rows = select_rows(
+        &conn,
+        "WITH totals AS (SELECT id, count(*) AS n FROM people_cte GROUP BY id) \
+         SELECT a.id, a.n, b.n FROM totals a, totals b WHERE a.id = b.id ORDER BY a.id",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("1".into()), Some("1".into())],
+            vec![Some("2".into()), Some("1".into()), Some("1".into())],
+            vec![Some("3".into()), Some("1".into()), Some("1".into())],
+        ]
+    );
+}

@@ -180,6 +180,10 @@ impl<'plan> LogicalOp<'plan> {
             L::LOGICAL_COMPARISON_JOIN => {
                 Operator::ComparisonJoin(ComparisonJoin { raw: self.raw })
             }
+            L::LOGICAL_MATERIALIZED_CTE => {
+                Operator::MaterializedCte(MaterializedCte { raw: self.raw })
+            }
+            L::LOGICAL_CTE_REF => Operator::CteRef(CteRef { raw: self.raw }),
             L::LOGICAL_DUMMY_SCAN => Operator::DummyScan,
             L::LOGICAL_EXPLAIN => Operator::Explain,
             _ => Operator::Unsupported,
@@ -213,6 +217,10 @@ pub enum Operator<'plan> {
     /// A comparison join; the consumer only handles the late-materialization
     /// shape (see [`ComparisonJoin::is_late_materialization`]).
     ComparisonJoin(ComparisonJoin<'plan>),
+    /// A CTE: its definition, then the query reading it.
+    MaterializedCte(MaterializedCte<'plan>),
+    /// One place a CTE's rows are read.
+    CteRef(CteRef<'plan>),
     /// The single-row source under a `FROM`-less `SELECT`.
     DummyScan,
     /// `EXPLAIN <query>`.
@@ -265,6 +273,25 @@ define_handles! { ffi::LogicalOperator;
     Reset,
     /// A `LogicalComparisonJoin`.
     ComparisonJoin,
+    /// A `LogicalMaterializedCTE`: the CTE's definition above the query using it.
+    MaterializedCte,
+    /// A `LogicalCTERef`: one place a CTE's rows are read.
+    CteRef,
+}
+
+impl<'plan> MaterializedCte<'plan> {
+    /// The index this CTE publishes its rows under, which every
+    /// [`CteRef`] reading it carries.
+    pub fn cte_index(self) -> usize {
+        ffi::lo_cte_table_index(self.raw)
+    }
+}
+
+impl<'plan> CteRef<'plan> {
+    /// The CTE these rows come from.
+    pub fn cte_index(self) -> usize {
+        ffi::lo_cte_ref_index(self.raw)
+    }
 }
 
 impl<'plan> Projection<'plan> {

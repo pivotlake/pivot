@@ -15,6 +15,8 @@
 #include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_materialized_cte.hpp"
+#include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_set.hpp"
 #include "duckdb/planner/operator/logical_reset.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -766,6 +768,19 @@ size_t lo_late_materialization_column_count(const LogicalOperator &op) {
 
 size_t lo_late_materialization_column(const LogicalOperator &op, size_t index) {
 	return late_materialization_columns(op)[index];
+}
+
+// ---- CTE ----
+
+// The index a materialized CTE publishes its rows under, which every reference
+// to it carries (see `lo_cte_ref_index`).
+size_t lo_cte_table_index(const LogicalOperator &op) {
+	return as<duckdb::LogicalMaterializedCTE>(op).table_index.index;
+}
+
+// The CTE a reference reads, as the index that CTE was published under.
+size_t lo_cte_ref_index(const LogicalOperator &op) {
+	return as<duckdb::LogicalCTERef>(op).cte_index.index;
 }
 
 // ---- ComparisonJoin: general accessors ----

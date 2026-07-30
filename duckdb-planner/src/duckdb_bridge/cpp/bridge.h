@@ -150,6 +150,10 @@ bool lo_is_late_materialization_join(const LogicalOperator &op);
 size_t lo_late_materialization_column_count(const LogicalOperator &op);
 size_t lo_late_materialization_column(const LogicalOperator &op, size_t index);
 
+// ---- CTE ----
+size_t lo_cte_table_index(const LogicalOperator &op);
+size_t lo_cte_ref_index(const LogicalOperator &op);
+
 // ---- ComparisonJoin: general accessors ----
 uint8_t lo_join_type(const LogicalOperator &op);
 size_t lo_join_condition_count(const LogicalOperator &op);

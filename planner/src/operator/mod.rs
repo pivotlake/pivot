@@ -15,6 +15,7 @@
 
 mod aggregate;
 mod create_table;
+mod cte;
 mod dummy_scan;
 mod explain;
 mod filter;
@@ -32,6 +33,7 @@ mod values;
 
 pub use aggregate::Aggregate;
 pub use create_table::CreateTable;
+pub use cte::{Cte, CteScan};
 pub use dummy_scan::DummyScan;
 pub use explain::Explain;
 pub use filter::Filter;
@@ -108,6 +110,10 @@ pub enum Operator {
     Materialize(Materialize),
     /// `EXPLAIN <query>`: renders its child plan as text (see [`Explain`]).
     Explain(Explain),
+    /// A CTE: its definition (first input) feeding the query reading it (second).
+    Cte(Cte),
+    /// One place a CTE's rows are read (see [`CteScan`]).
+    CteScan(CteScan),
 }
 
 impl Operator {
@@ -164,6 +170,12 @@ impl Operator {
             Operator::DummyScan(_) => Ok(Vec::new()),
             // EXPLAIN renders its child plan as text, one line per row.
             Operator::Explain(_) => Ok(vec![Type::Utf8]),
+            // A CTE emits what the query reading it emits; the definition
+            // under its first input is only a source for the scans.
+            Operator::Cte(_) => Ok(inputs[1].clone()),
+            // A scan of a CTE emits what that CTE's definition produces,
+            // recorded when the definition was walked.
+            Operator::CteScan(scan) => Ok(scan.types.clone()),
             // Statements, not queries: no result columns.
             Operator::CreateTable(_) | Operator::SetVariable(_) => Ok(Vec::new()),
         }
@@ -234,6 +246,8 @@ impl Operator {
                     .chain(join.build_output.iter().map(|&i| inputs[1][i]))
                     .collect()
             }
+            Operator::Cte(_) => inputs[1].clone(),
+            Operator::CteScan(scan) => scan.nullable.clone(),
             Operator::CreateTable(_) | Operator::SetVariable(_) => Vec::new(),
         }
     }
@@ -263,6 +277,8 @@ impl fmt::Display for Operator {
             Operator::SetVariable(s) => write!(f, "{s}"),
             Operator::Materialize(m) => write!(f, "{m}"),
             Operator::Explain(e) => write!(f, "{e}"),
+            Operator::Cte(c) => write!(f, "{c}"),
+            Operator::CteScan(c) => write!(f, "{c}"),
         }
     }
 }
