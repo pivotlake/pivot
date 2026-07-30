@@ -38,6 +38,88 @@ fn scan_all_columns() {
 }
 
 #[test]
+fn scan_lz4_raw_file() {
+    let dispatch = dispatch(1);
+    let names: Vec<String> = (0..20_000).map(|i| format!("name-{}", i % 97)).collect();
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let values: Vec<i64> = (0..20_000).collect();
+    let (_dir, table) = parquet_table_compressed(
+        &dispatch,
+        &[strings_and_ints(&name_refs, &values)],
+        false,
+        Compression::LZ4_RAW,
+    );
+
+    let results = table_input(&dispatch, &table, Projection::all(2), false)
+        .collect()
+        .unwrap();
+
+    let mut got = collect_i64s(&results, 1);
+    got.sort();
+    assert_eq!(got, values);
+    assert!(collect_strings(&results, 0).contains(&"name-42".to_string()));
+}
+
+#[test]
+fn scan_lz4_raw_dictionary_file() {
+    let dispatch = dispatch(1);
+    let (_dir, table) = parquet_table_compressed(
+        &dispatch,
+        &[strings_and_ints(&["a", "b", "a", "c"], &[1, 2, 3, 4])],
+        true,
+        Compression::LZ4_RAW,
+    );
+
+    let results = table_input(&dispatch, &table, Projection::all(2), false)
+        .collect()
+        .unwrap();
+
+    let mut got = collect_strings(&results, 0);
+    got.sort();
+    assert_eq!(got, vec!["a", "a", "b", "c"]);
+}
+
+#[test]
+fn scan_uncompressed_file() {
+    let dispatch = dispatch(1);
+    let (_dir, table) = parquet_table_compressed(
+        &dispatch,
+        &[strings_and_ints(&["a", "b", "c"], &[1, 2, 3])],
+        false,
+        Compression::UNCOMPRESSED,
+    );
+
+    let results = table_input(&dispatch, &table, Projection::all(2), false)
+        .collect()
+        .unwrap();
+
+    let mut got = collect_i64s(&results, 1);
+    got.sort();
+    assert_eq!(got, vec![1, 2, 3]);
+}
+
+/// The deprecated Hadoop-framed LZ4 codec is rejected when the table opens,
+/// not mid-scan.
+#[test]
+fn open_legacy_lz4_file_fails() {
+    let dispatch = dispatch(1);
+    let dir = TempDir::new().unwrap();
+    let batch = strings_and_ints(&["a"], &[1]);
+    let props = WriterProperties::builder()
+        .set_compression(Compression::LZ4)
+        .build();
+    let file = std::fs::File::create(dir.path().join("data.parquet")).unwrap();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let result = ParquetTable::from_directory(&dispatch, dir.path(), &[]);
+
+    let err = result.expect_err("legacy LZ4 must be rejected");
+    assert!(err.to_string().contains("unsupported compression"));
+}
+
+#[test]
 fn scan_column_subset() {
     let dispatch = dispatch(1);
     let batch = RecordBatch::try_new(

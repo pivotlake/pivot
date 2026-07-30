@@ -118,13 +118,22 @@ pub fn parquet_table(
     batches: &[RecordBatch],
     dictionary: bool,
 ) -> (TempDir, Arc<ParquetTable>) {
+    parquet_table_compressed(dispatch, batches, dictionary, Compression::SNAPPY)
+}
+
+pub fn parquet_table_compressed(
+    dispatch: &DispatchGuard,
+    batches: &[RecordBatch],
+    dictionary: bool,
+    compression: Compression,
+) -> (TempDir, Arc<ParquetTable>) {
     // Write the parquet file on the test thread (`ArrowWriter` is plain
     // `std::fs` IO — no `MemoryContext` needed).
     let dir = TempDir::new().unwrap();
     let schema = batches[0].schema();
     let path = dir.path().join("data.parquet");
     let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
+        .set_compression(compression)
         .set_dictionary_enabled(dictionary)
         .build();
     let mut writer =
