@@ -11,7 +11,7 @@ use crate::handle::Expr;
 /// Describes a table that the planner can reference during query planning.
 ///
 /// Implement this trait for tables in your schema and return instances
-/// from [`DuckDBTransaction::table`]. The planner uses [`duckdb_typed_columns`](DuckDBTable::duckdb_typed_columns)
+/// from [`DuckDBTransaction::bind_table`]. The planner uses [`duckdb_typed_columns`](DuckDBTable::duckdb_typed_columns)
 /// to resolve column names and types, and attaches the `Box<dyn DuckDBTable>` to the
 /// resulting scan operator so downstream consumers
 /// can identify which table is being scanned.

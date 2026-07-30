@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// The conventional name for a standalone datastore; see
-/// [`planner::DEFAULT_DATASTORE_NAME`].
+/// [`catalog::DEFAULT_DATASTORE_NAME`].
 pub use catalog::DEFAULT_DATASTORE_NAME;
 
 /// The server's configuration source. Today it defines the datastores to serve;
