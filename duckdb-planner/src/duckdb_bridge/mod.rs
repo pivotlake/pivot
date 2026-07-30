@@ -301,6 +301,12 @@ pub mod ffi {
 
         // ---- ComparisonJoin: general accessors ----
         /// DuckDB `JoinType` discriminant.
+        /// The index a materialized CTE publishes its rows under.
+        fn lo_cte_table_index(op: &LogicalOperator) -> usize;
+
+        /// The CTE index a reference reads.
+        fn lo_cte_ref_index(op: &LogicalOperator) -> usize;
+
         fn lo_join_type(op: &LogicalOperator) -> u8;
         fn lo_join_condition_count(op: &LogicalOperator) -> usize;
         fn lo_join_condition_left(op: &LogicalOperator, index: usize) -> &Expression;

@@ -248,6 +248,12 @@ impl PlanNode {
                 let build = inputs.remove(0);
                 o.compile(probe, build)
             }
+            crate::Operator::Cte(o) => {
+                let definition = inputs.remove(0);
+                let body = inputs.remove(0);
+                o.compile(definition, body)
+            }
+            crate::Operator::CteScan(o) => o.compile(dispatcher),
             crate::Operator::Materialize(o) => o.compile(inputs.remove(0)),
             crate::Operator::CreateTable(o) => {
                 if !inputs.is_empty() {

@@ -29,8 +29,8 @@ use crate::catalog::BoundTable;
 use crate::dynamic_filter::DynamicFilter;
 use crate::expression::{Cast, Error as ExpressionError, Expression, Ref};
 use crate::operator::{
-    Aggregate, CreateTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Insert,
-    Join, JoinKind, Limit, Materialize, Operator, OrderBy, Projection, SetVariable,
+    Aggregate, CreateTable, Cte, CteScan, DummyScan, Error as OperatorError, Explain, Filter,
+    Input, Insert, Join, JoinKind, Limit, Materialize, Operator, OrderBy, Projection, SetVariable,
     TableFunctionScan, TopN, Values,
 };
 use crate::plan::{self, PlanNode};
@@ -44,6 +44,14 @@ mod operator;
 /// the scans that consume its filter agree on a slot.
 pub(crate) struct BuildCtx {
     dynamic_filter_slots: HashMap<usize, usize>,
+    /// What each CTE walked so far produces, keyed by DuckDB's CTE index. A
+    /// scan of a CTE is a leaf, so it takes its output shape from here rather
+    /// than from a child, which is why a CTE's definition is walked before the
+    /// query reading it.
+    cte_outputs: HashMap<usize, (Vec<Type>, Vec<bool>)>,
+    /// How many scans of each CTE have been walked, so the CTE knows how many
+    /// readers to feed.
+    cte_sites: HashMap<usize, usize>,
 }
 
 impl BuildCtx {
@@ -75,6 +83,8 @@ impl BuildCtx {
 pub(crate) fn build_plan(root: LogicalOp<'_>) -> Result<PlanNode, plan::Error> {
     let mut ctx = BuildCtx {
         dynamic_filter_slots: HashMap::new(),
+        cte_outputs: HashMap::new(),
+        cte_sites: HashMap::new(),
     };
     let plan = build_node(root, &mut ctx)?;
     Ok(render_variant_outputs(plan)?)
@@ -137,6 +147,13 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         return build_late_materialization(op, join, ctx);
     }
 
+    // A CTE's two children are walked in order for a reason, so it can't go
+    // through the generic loop below: the definition's output shape is what the
+    // scans in the body declare as their own.
+    if let DuckOperator::MaterializedCte(cte) = kind {
+        return build_cte(op, cte.cte_index(), ctx);
+    }
+
     let inputs = op
         .children()
         .map(|child| build_node(child, ctx))
@@ -186,6 +203,13 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         DuckOperator::Explain => Operator::Explain(Explain),
         DuckOperator::ComparisonJoin(join) => {
             return build_join(op, join, inputs);
+        }
+        DuckOperator::CteRef(cte_ref) => {
+            Operator::CteScan(build_cte_scan(cte_ref.cte_index(), ctx)?)
+        }
+        // A CTE is walked above, before its children.
+        DuckOperator::MaterializedCte(_) => {
+            unreachable!("a CTE walks its own children")
         }
         DuckOperator::Unsupported => {
             return Err(OperatorError::Unsupported(format!(
@@ -446,6 +470,48 @@ fn build_pushed_conditions(scan: TableScanView<'_>) -> Result<Vec<Expression>, O
         .iter()
         .map(Expression::from_handle)
         .collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Walk a CTE: its definition first, so the scans reading it in the body know
+/// what shape the rows arrive in, then the body.
+fn build_cte(
+    op: LogicalOp<'_>,
+    cte_index: usize,
+    ctx: &mut BuildCtx,
+) -> Result<PlanNode, OperatorError> {
+    let definition = build_node(op.child(0), ctx)?;
+    let types = definition.output_types()?;
+    let nullable = definition.output_nullability();
+    ctx.cte_outputs.insert(cte_index, (types, nullable));
+
+    let body = build_node(op.child(1), ctx)?;
+    let sites = ctx.cte_sites.remove(&cte_index).unwrap_or_default();
+    if sites == 0 {
+        return Err(OperatorError::Unsupported(format!(
+            "CTE #{cte_index} is materialized but never read"
+        )));
+    }
+
+    Ok(PlanNode {
+        name: op.name(),
+        inputs: vec![definition, body],
+        operator: Operator::Cte(Cte { cte_index, sites }),
+    })
+}
+
+/// One scan of a CTE, taking its output shape from the definition walked earlier.
+fn build_cte_scan(cte_index: usize, ctx: &mut BuildCtx) -> Result<CteScan, OperatorError> {
+    let Some((types, nullable)) = ctx.cte_outputs.get(&cte_index) else {
+        return Err(OperatorError::Unsupported(format!(
+            "CTE #{cte_index} is read outside the plan that defines it"
+        )));
+    };
+    *ctx.cte_sites.entry(cte_index).or_default() += 1;
+    Ok(CteScan {
+        cte_index,
+        types: types.clone(),
+        nullable: nullable.clone(),
+    })
 }
 
 /// Collapse DuckDB's late-materialization SEMI join into a pivot Materialize: the
