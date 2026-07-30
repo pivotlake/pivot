@@ -305,6 +305,7 @@ mod tests {
             schema,
             columns: (0..num_cols)
                 .map(|_| ColumnChunkMeta {
+                    codec: thriftparquet::general::CompressionCodec::SNAPPY,
                     dictionary_page_offset: None,
                     data_page_offset: 0,
                     total_compressed_size: 0,
@@ -388,6 +389,7 @@ mod tests {
         ]));
         let file = dispatch::io::LocalFile::new(std::fs::File::open("/dev/null").unwrap()).unwrap();
         let column = |dict| ColumnChunkMeta {
+            codec: crate::parquet::types::thrift::general::CompressionCodec::SNAPPY,
             dictionary_page_offset: None,
             data_page_offset: 0,
             total_compressed_size: 0,

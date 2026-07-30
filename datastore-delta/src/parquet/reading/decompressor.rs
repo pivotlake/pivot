@@ -1,4 +1,5 @@
-//! Snappy-decompresses individual compressed Parquet pages.
+//! Decompresses individual compressed Parquet pages (snappy or raw LZ4,
+//! per the page's column chunk codec).
 //!
 //! Each [`CompressedPage`] is decompressed into a [`DecompressedPage`] using the Ring buffer
 //! pool for output allocation. These pages can be backed by multiple underlying buffers, and will be
@@ -12,7 +13,7 @@
 use crate::parquet::types::page::{
     CompressedPage, DataPage, DecompressedPage, DecompressedPageType,
 };
-use crate::parquet::types::thrift::general::PageType;
+use crate::parquet::types::thrift::general::{CompressionCodec, PageType};
 use crate::parquet::types::thrift::headers::PageHeader;
 use crate::parquet::types::thrift::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 use bytes::Bytes;
@@ -28,7 +29,15 @@ pub enum Error {
     #[error("{0}")]
     Snappy(#[from] snap::Error),
     #[error("{0}")]
+    Lz4(#[from] lz4_flex::block::DecompressError),
+    #[error("{0}")]
     UnsupportedPageType(PageType),
+    /// Unreachable for tables built from a parsed footer, which rejects
+    /// unsupported codecs at open time.
+    #[error("unsupported compression codec: {0}")]
+    UnsupportedCodec(CompressionCodec),
+    #[error("page decompressed to {written} bytes but the footer records {expected}")]
+    DecompressedLength { written: usize, expected: usize },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -36,7 +45,8 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 /// Factory for creating [`Decompressor`] instances, one per worker thread.
 pub type DecompressorFactory = DefaultUnaryFactory<Decompressor>;
 
-/// Snappy decompressor that converts [`CompressedPage`]s into [`DecompressedPage`]s.
+/// Decompressor that converts [`CompressedPage`]s into [`DecompressedPage`]s,
+/// dispatching on each page's codec.
 ///
 /// Holds a reusable [`snap::raw::Decoder`] to avoid per-page allocation of decoder state.
 pub struct Decompressor {
@@ -66,6 +76,17 @@ impl Decompressor {
         // and now.
         let data = if let Some(decompressed) = page.decompressed.take() {
             decompressed
+        } else if page.codec == CompressionCodec::UNCOMPRESSED {
+            // Nothing to decode: forward the page's bytes zero-copy (they stay
+            // backed by the compressed cache), skipping the reservation and the
+            // decompressed cache entirely - caching a byte-identical copy of
+            // already-resident bytes would be pure waste.
+            let written: usize = page.data.iter().map(|b| b.len()).sum();
+            let expected = page.header.uncompressed_page_size as usize;
+            if written != expected {
+                return Err(Error::DecompressedLength { written, expected });
+            }
+            std::mem::take(&mut page.data)
         } else {
             // The decompressed bytes depend only on the compressed input, not on the
             // per-query filter mask, so a cache hit reuses them across queries; the
@@ -77,8 +98,8 @@ impl Decompressor {
             };
             match memory_ctx().decompressed_cache().get(&key) {
                 Some(cached) => cached,
-                // An empty page decompresses to no bytes, and the snappy decoder
-                // panics if handed zero output buffers. This happens for the
+                // An empty page decompresses to no bytes, and the decoders
+                // reject zero input/output buffers. This happens for the
                 // dictionary page of an all-null column, e.g. the unused `value`
                 // fallback leaf of a shredded variant path (every value went to
                 // its typed leaf). Nothing to cache either.
@@ -95,8 +116,27 @@ impl Decompressor {
                         .decompressed_cache()
                         .reserve(&key, uncompressed_size);
                     let input: Vec<&[u8]> = page.data.iter().map(|b: &Bytes| b.as_ref()).collect();
-                    self.decoder
-                        .decompress_scattered(&input, reservation.as_mut_slices())?;
+                    let written = match page.codec {
+                        CompressionCodec::SNAPPY => self
+                            .decoder
+                            .decompress_scattered(&input, reservation.as_mut_slices())?,
+                        CompressionCodec::LZ4_RAW => lz4_flex::block::decompress_scattered(
+                            &input,
+                            &mut reservation.as_mut_slices(),
+                        )?,
+                        // UNCOMPRESSED took the zero-copy passthrough above.
+                        other => return Err(Error::UnsupportedCodec(other)),
+                    };
+                    // The reservation's capacity says nothing about the true
+                    // page length (a disabled cache hands out whole pooled
+                    // slots), so verify the decoded byte count against the
+                    // footer's recorded size.
+                    if written != uncompressed_size {
+                        return Err(Error::DecompressedLength {
+                            written,
+                            expected: uncompressed_size,
+                        });
+                    }
                     memory_ctx().decompressed_cache().insert(
                         key,
                         serialize_header(&page.header),
@@ -166,7 +206,7 @@ impl Unary<CompressedPage, DecompressedPage> for Decompressor {
             return Ok(());
         }
 
-        // Skip snappy for a data page whose rows are all filtered out by a filter
+        // Skip decompression for a data page whose rows are all filtered out by a filter
         // mask: the decoder still needs the page slot for accounting, so emit a
         // SkippedData marker instead of paying decompression.
         let skip = page.header.data_page_header.is_some()
@@ -195,7 +235,7 @@ mod tests {
     use super::*;
     use crate::parquet::test_utils::dummy_metadata;
     use crate::parquet::types::filter_mask::FilterMask;
-    use crate::parquet::types::thrift::general::Encoding;
+    use crate::parquet::types::thrift::general::{CompressionCodec, Encoding};
     use crate::parquet::types::thrift::headers::{
         DataPageHeader, DictionaryPageHeader, PageHeader,
     };
@@ -214,6 +254,7 @@ mod tests {
         let compressed = Encoder::new().compress_vec(data).unwrap();
         CompressedPage {
             worker_id: 0,
+            codec: CompressionCodec::SNAPPY,
             row_group: dummy_metadata(None),
             column_idx: 0,
             file_offset: 0,
@@ -241,10 +282,27 @@ mod tests {
         }
     }
 
+    /// LZ4-compress `data` and return a CompressedPage tagged LZ4_RAW, its
+    /// compressed bytes split across `fragments` buffers.
+    fn lz4_compressed_data_page(data: &[u8], num_values: i32, fragments: usize) -> CompressedPage {
+        let mut page = compressed_data_page(data, num_values, None);
+        let compressed = lz4_flex::block::compress(data);
+        page.codec = CompressionCodec::LZ4_RAW;
+        page.span = compressed.len();
+        page.header.compressed_page_size = compressed.len() as i32;
+        let chunk = compressed.len().div_ceil(fragments);
+        page.data = compressed
+            .chunks(chunk)
+            .map(|c| Bytes::from(c.to_vec()))
+            .collect();
+        page
+    }
+
     fn compressed_dict_page(data: &[u8], num_values: i32) -> CompressedPage {
         let compressed = Encoder::new().compress_vec(data).unwrap();
         CompressedPage {
             worker_id: 0,
+            codec: CompressionCodec::SNAPPY,
             row_group: dummy_metadata(None),
             column_idx: 0,
             file_offset: 0,
@@ -352,6 +410,102 @@ mod tests {
         assert_eq!(header.num_values, 50);
         let decompressed: Vec<u8> = data.iter().flat_map(|b| b.to_vec()).collect();
         assert_eq!(decompressed, payload);
+    }
+
+    /// An LZ4_RAW data page decompresses to the original bytes.
+    #[test]
+    fn test_lz4_data_page_decompression() {
+        init_test_free_pool(4);
+        let payload: Vec<u8> = b"pivot".repeat(60);
+        let page = lz4_compressed_data_page(&payload, 100, 1);
+
+        let out = run_unary(Decompressor::default(), vec![page]);
+
+        let DecompressedPageType::Data(data_page) = &out[0].data else {
+            panic!("expected Data");
+        };
+        let decompressed: Vec<u8> = data_page.data.iter().flat_map(|b| b.to_vec()).collect();
+        assert_eq!(decompressed, payload);
+    }
+
+    /// An LZ4_RAW page whose compressed bytes are split across several input
+    /// buffers still decompresses correctly.
+    #[test]
+    fn test_lz4_scattered_input_page() {
+        init_test_free_pool(4);
+        let payload: Vec<u8> = (0..1024u32).flat_map(|v| v.to_le_bytes()).collect();
+        let page = lz4_compressed_data_page(&payload, 100, 5);
+
+        let out = run_unary(Decompressor::default(), vec![page]);
+
+        let DecompressedPageType::Data(data_page) = &out[0].data else {
+            panic!("expected Data");
+        };
+        let decompressed: Vec<u8> = data_page.data.iter().flat_map(|b| b.to_vec()).collect();
+        assert_eq!(decompressed, payload);
+    }
+
+    /// An UNCOMPRESSED page's bytes pass through zero-copy: the very same
+    /// backing buffers come out, with no decompression or cache involvement.
+    #[test]
+    fn test_uncompressed_page_zero_copy_passthrough() {
+        let payload: Vec<u8> = (0..512u32).flat_map(|v| v.to_le_bytes()).collect();
+        let mut page = compressed_data_page(&payload, 100, None);
+        page.codec = CompressionCodec::UNCOMPRESSED;
+        page.span = payload.len();
+        page.header.compressed_page_size = payload.len() as i32;
+        page.data = payload
+            .chunks(300)
+            .map(|c| Bytes::from(c.to_vec()))
+            .collect();
+        let input_ptrs: Vec<*const u8> = page.data.iter().map(|b| b.as_ptr()).collect();
+
+        let out = run_unary(Decompressor::default(), vec![page]);
+
+        let DecompressedPageType::Data(data_page) = &out[0].data else {
+            panic!("expected Data");
+        };
+        let bytes: Vec<u8> = data_page.data.iter().flat_map(|b| b.to_vec()).collect();
+        assert_eq!(bytes, payload);
+        let out_ptrs: Vec<*const u8> = data_page.data.iter().map(|b| b.as_ptr()).collect();
+        assert_eq!(out_ptrs, input_ptrs, "must forward the same buffers");
+    }
+
+    /// An UNCOMPRESSED page whose body size contradicts the footer's recorded
+    /// uncompressed size is rejected.
+    #[test]
+    fn test_uncompressed_page_length_mismatch_errors() {
+        let mut page = compressed_data_page(&[1u8, 2, 3, 4], 4, None);
+        page.codec = CompressionCodec::UNCOMPRESSED;
+        page.data = vec![Bytes::from(vec![1u8, 2, 3])];
+
+        let mut sender = CollectSender::new();
+        let result = Decompressor::default().consume(page, &mut sender);
+
+        assert!(result.is_err());
+    }
+
+    /// Snappy and LZ4_RAW pages interleave through one decompressor instance.
+    #[test]
+    fn test_mixed_codec_pages() {
+        init_test_free_pool(8);
+        let snappy_payload = vec![0xABu8; 256];
+        let lz4_payload = vec![0xCDu8; 256];
+        let pages = vec![
+            compressed_data_page(&snappy_payload, 10, None),
+            lz4_compressed_data_page(&lz4_payload, 10, 1),
+        ];
+
+        let out = run_unary(Decompressor::default(), pages);
+
+        let bytes = |idx: usize| -> Vec<u8> {
+            let DecompressedPageType::Data(d) = &out[idx].data else {
+                panic!("expected Data");
+            };
+            d.data.iter().flat_map(|b| b.to_vec()).collect()
+        };
+        assert_eq!(bytes(0), snappy_payload);
+        assert_eq!(bytes(1), lz4_payload);
     }
 
     /// Non-all-false filter mask → page is decompressed and filter mask is forwarded.
@@ -534,6 +688,7 @@ mod tests {
         let compressed = Encoder::new().compress_vec(&[0u8; 16]).unwrap();
         let page = CompressedPage {
             worker_id: 0,
+            codec: CompressionCodec::SNAPPY,
             row_group: dummy_metadata(None),
             column_idx: 0,
             file_offset: 0,

@@ -39,6 +39,8 @@ bytes = { workspace = true }
 crossbeam-deque = { workspace = true }
 ahash = { workspace = true }
 snap = { workspace = true }
+# LZ4_RAW page decompression (the Epsio fork with scattered decode).
+lz4_flex = { workspace = true }
 # The database-level `_pivot_manifest.json` table index is serialized as JSON.
 # Per-table state is standard Delta Lake metadata under each table's `_delta_log`.
 serde = { workspace = true }
