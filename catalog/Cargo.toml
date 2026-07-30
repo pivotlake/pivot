@@ -32,6 +32,8 @@ bytes = { workspace = true }
 crossbeam-deque = { workspace = true }
 ahash = { workspace = true }
 snap = { workspace = true }
+# LZ4_RAW page decompression (the Epsio fork with scattered decode).
+lz4_flex = { workspace = true }
 # The database-level `_pivot_manifest.json` table index is serialized as JSON.
 # Per-table state is standard Delta Lake metadata under each table's `_delta_log`.
 serde = { workspace = true }
@@ -84,7 +86,8 @@ catalog = { path = ".", features = ["test-support", "bench-hooks"] }
 dispatch = { workspace = true, features = ["test-util"] }
 # `variant_experimental` so `ArrowWriter` emits the VARIANT logical type for an
 # extension-tagged variant field (the variant scan test reads it back).
-parquet = { workspace = true, features = ["variant_experimental"] }
+# `lz4` so scan tests can write LZ4_RAW (and legacy LZ4) files to read back.
+parquet = { workspace = true, features = ["variant_experimental", "lz4"] }
 arrow-schema = { workspace = true }
 arrow = { workspace = true, features = ["prettyprint"] }
 # Build a variant column (`json_to_variant`) and extract a path (`variant_get`)
@@ -108,3 +111,4 @@ harness = false
 [[bench]]
 name = "encode"
 harness = false
+

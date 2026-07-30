@@ -7,7 +7,7 @@
 
 use crate::parquet::types::metadata::{ColumnChunkMeta, ColumnStatistics, RowGroupMetadata};
 use crate::parquet::types::thrift::footer::{FileMetaData, PageEncodingStats, Statistics};
-use crate::parquet::types::thrift::general::{Encoding, PageType};
+use crate::parquet::types::thrift::general::{CompressionCodec, Encoding, PageType};
 use crate::parquet::types::thrift::parquet_thrift::{ReadThrift, ThriftSliceInputProtocol};
 use crate::store::DataFile;
 use arrow_array::{
@@ -50,6 +50,9 @@ pub enum Error {
         declared: Type,
         file_type: DataType,
     },
+    /// A column chunk compressed with a codec the engine cannot decompress.
+    #[error("unsupported compression codec: {0}")]
+    UnsupportedCompression(CompressionCodec),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -241,12 +244,24 @@ pub(crate) fn row_groups_from_metadata(
                 .map(|(j, cc)| {
                     let meta = cc.meta_data.expect("missing column metadata");
                     let physical_type = meta.physical_type;
+                    // Reject codecs the decompressor cannot handle here, at
+                    // open time, rather than as garbage or a decode error
+                    // mid-query.
+                    if !matches!(
+                        meta.codec,
+                        CompressionCodec::SNAPPY
+                            | CompressionCodec::LZ4_RAW
+                            | CompressionCodec::UNCOMPRESSED
+                    ) {
+                        return Err(Error::UnsupportedCompression(meta.codec));
+                    }
                     let statistics = meta
                         .statistics
                         .and_then(|s| decode_statistics(s, leaves[j].data_type(), physical_type));
                     let data_pages_all_dictionary = meta.dictionary_page_offset.is_some()
                         && data_pages_all_dictionary(meta.encoding_stats.as_deref());
-                    ColumnChunkMeta {
+                    Ok(ColumnChunkMeta {
+                        codec: meta.codec,
                         dictionary_page_offset: meta.dictionary_page_offset,
                         data_page_offset: meta.data_page_offset,
                         total_compressed_size: meta.total_compressed_size,
@@ -255,9 +270,9 @@ pub(crate) fn row_groups_from_metadata(
                         fixed_len_byte_width: leaf_infos[j].type_length,
                         statistics,
                         data_pages_all_dictionary,
-                    }
+                    })
                 })
-                .collect();
+                .collect::<Result<_>>()?;
             Ok(RowGroupMetadata {
                 open_file: open_file.clone(),
                 schema: schema.clone(),

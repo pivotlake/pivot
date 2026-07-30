@@ -1,4 +1,4 @@
-use super::general::{Encoding, PageType, TimeUnit};
+use super::general::{CompressionCodec, Encoding, PageType, TimeUnit};
 use super::parquet_thrift::*;
 use crate::{general_err, thrift_struct};
 use std::io::Write;
@@ -232,7 +232,7 @@ thrift_struct!(
         1: required i32 physical_type;
         2: required list<i32> encodings;
         3: required list<string> path_in_schema;
-        4: required i32 codec;
+        4: required CompressionCodec codec;
         5: required i64 num_values;
         6: required i64 total_uncompressed_size;
         7: required i64 total_compressed_size;

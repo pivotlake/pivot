@@ -1212,6 +1212,7 @@ dependencies = [
  "delta_kernel",
  "delta_kernel_default_engine",
  "dispatch",
+ "lz4_flex 0.13.1 (git+https://github.com/Epsio-Labs/lz4_flex.git?rev=a5cc41c918bbe0a2266db4cb7a1d16a406844d18)",
  "parquet 58.0.0",
  "parquet-variant",
  "parquet-variant-compute",
@@ -3086,6 +3087,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "lz4_flex"
+version = "0.13.1"
+source = "git+https://github.com/Epsio-Labs/lz4_flex.git?rev=a5cc41c918bbe0a2266db4cb7a1d16a406844d18#a5cc41c918bbe0a2266db4cb7a1d16a406844d18"
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3437,6 +3443,7 @@ dependencies = [
  "chrono",
  "half",
  "hashbrown 0.16.1",
+ "lz4_flex 0.13.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "num-bigint",
  "num-integer",
  "num-traits",
@@ -3471,7 +3478,7 @@ dependencies = [
  "futures",
  "half",
  "hashbrown 0.17.1",
- "lz4_flex",
+ "lz4_flex 0.13.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "num-bigint",
  "num-integer",
  "num-traits",

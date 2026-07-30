@@ -2,6 +2,7 @@ use crate::parquet::request_tracker::PendingRequest;
 use crate::parquet::types::leaves::projected_leaves;
 use crate::parquet::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata};
 use crate::parquet::types::projection::Projection;
+use crate::parquet::types::thrift::general::CompressionCodec;
 use crate::parquet::types::thrift::headers::PageHeader;
 use crate::parquet::types::thrift::parquet_thrift::ThriftReadInputProtocol;
 use bytes::Bytes;
@@ -68,6 +69,7 @@ impl ColumnPart<Vec<CacheLookup>> {
 /// left is looked up in the compressed cache exactly as before, one
 /// [`CacheLookup`] per contiguous cached/missing run, and queued for IO.
 struct ColumnRequest {
+    codec: CompressionCodec,
     parts: Vec<ColumnPart<Vec<CacheLookup>>>,
 }
 
@@ -106,13 +108,19 @@ impl ColumnRequest {
                 },
             })
             .collect();
-        Self { parts }
+        Self {
+            codec: meta.codec,
+            parts,
+        }
     }
 
     /// Consume this request into the column's resolved parts, in file order. Only
     /// valid once every queued read has landed.
-    fn into_source(self) -> Vec<ColumnPart> {
-        self.parts.into_iter().map(ColumnPart::into_ready).collect()
+    fn into_source(self) -> ColumnBuffer {
+        ColumnBuffer {
+            codec: self.codec,
+            parts: self.parts.into_iter().map(ColumnPart::into_ready).collect(),
+        }
     }
 }
 
@@ -249,12 +257,20 @@ impl PendingRequest for RowGroupRequest {
 
 pub struct RowGroupBuffer {
     pub metadata: QueryRowGroupMetadata,
-    /// Each projected column's resolved parts, in file order.
-    pub columns: Vec<Vec<ColumnPart>>,
+    /// Each projected column's resolved bytes, in file order.
+    pub columns: Vec<ColumnBuffer>,
     /// The worker every page of this row group returns to for decode. It must
     /// be the worker that claimed the row group: that worker holds the row
     /// group's decoder state and accounts for the claim (see
     /// `RowGroupFetcher`). The middle stages may run on stealing siblings, so
     /// the id is stamped at claim time, not by whoever runs a stage.
     pub worker_id: usize,
+}
+
+/// One projected column's resolved parts, tagged with the codec its compressed
+/// pages were written with (from the column chunk's footer metadata).
+pub struct ColumnBuffer {
+    pub codec: CompressionCodec,
+    /// The column's resolved parts, in file order.
+    pub parts: Vec<ColumnPart>,
 }

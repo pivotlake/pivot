@@ -26,8 +26,8 @@
 use crate::parquet::types::filter_mask::FilterMask;
 use crate::parquet::types::metadata::QueryRowGroupMetadata;
 use crate::parquet::types::page::CompressedPage;
-use crate::parquet::types::requests::{ColumnPart, RowGroupBuffer};
-use crate::parquet::types::thrift::general::PageType;
+use crate::parquet::types::requests::{ColumnBuffer, ColumnPart, RowGroupBuffer};
+use crate::parquet::types::thrift::general::{CompressionCodec, PageType};
 use crate::parquet::types::thrift::headers::PageHeader;
 use crate::parquet::types::thrift::parquet_thrift::{ParquetError, ThriftReadInputProtocol};
 use bytes::Bytes;
@@ -74,10 +74,12 @@ enum PagePayload {
 }
 
 /// Carries the context for emitting one column's pages: the column's
-/// identity, the query's view of the row group, the worker that claimed it,
-/// and the running [`PageCursor`] threaded across the column's parts.
+/// identity and codec, the query's view of the row group, the worker that
+/// claimed it, and the running [`PageCursor`] threaded across the column's
+/// parts.
 struct ColumnPageBuilder {
     col_idx: usize,
+    codec: CompressionCodec,
     query_row_group_metadata: QueryRowGroupMetadata,
     worker_id: usize,
     cursor: PageCursor,
@@ -119,6 +121,7 @@ impl ColumnPageBuilder {
             // the worker that claimed the row group (it owns the decoder
             // state and the claim accounting).
             worker_id: self.worker_id,
+            codec: self.codec,
             row_group: self.query_row_group_metadata.clone(),
             column_idx: self.col_idx,
             file_offset,
@@ -175,17 +178,18 @@ impl ColumnPageBuilder {
 fn build_column_pages(
     col_idx: usize,
     query_row_group_metadata: QueryRowGroupMetadata,
-    parts: Vec<ColumnPart>,
+    column: ColumnBuffer,
     worker_id: usize,
 ) -> Result<Vec<CompressedPage>, ParquetError> {
     let mut builder = ColumnPageBuilder {
         col_idx,
+        codec: column.codec,
         query_row_group_metadata,
         worker_id,
         cursor: PageCursor::default(),
     };
     let mut pages = Vec::with_capacity(128);
-    for part in parts {
+    for part in column.parts {
         match part {
             ColumnPart::Compressed { offset, bytes } => {
                 builder.parse_compressed_pages(offset, &bytes, &mut pages)?
@@ -216,8 +220,8 @@ impl Unary<RowGroupBuffer, CompressedPage> for Indexer {
             .columns
             .into_iter()
             .enumerate()
-            .map(|(col_idx, parts)| {
-                build_column_pages(col_idx, buffer.metadata.clone(), parts, buffer.worker_id)
+            .map(|(col_idx, column)| {
+                build_column_pages(col_idx, buffer.metadata.clone(), column, buffer.worker_id)
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(crate::parquet::op_err)?;
@@ -340,7 +344,13 @@ mod tests {
     ) -> RowGroupBuffer {
         RowGroupBuffer {
             metadata: dummy_metadata(filtered_indices),
-            columns,
+            columns: columns
+                .into_iter()
+                .map(|parts| ColumnBuffer {
+                    codec: CompressionCodec::SNAPPY,
+                    parts,
+                })
+                .collect(),
             worker_id: 0,
         }
     }
