@@ -81,8 +81,8 @@ pub use live_key::RowKey;
 pub use reader::{RowReader, RowScratch};
 pub use schema::RowKeySchema;
 
-use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
-use crate::operations::unary::group::keys::string::ResolvedKey;
+use crate::operations::unary::group::arena::WorkerArena;
+use crate::operations::unary::group::keys::string::ArenaStored;
 use crate::operations::unary::group::keys::{ArenaKey, KeyExtractor};
 use ahash::RandomState;
 use arrow_array::RecordBatch;
@@ -101,7 +101,7 @@ impl KeyExtractor for RowKeyExtractor {
     type Config = RowKeySchema;
     type Persisted = ArenaKey;
     type LiveKey<'a, 'b> = RowKey<'a, 'b>;
-    type PersistedLiveKey<'a> = ResolvedKey<'a>;
+    type Stored = ArenaStored;
     type Reader<'b> = RowReader<'b>;
     type ColumnBuilder = RowKeyColumnBuilder;
     type Scratch = RowScratch;
@@ -128,9 +128,5 @@ impl KeyExtractor for RowKeyExtractor {
         // The row slice borrows the reader's scratch for exactly `'r`, the live
         // key's own lifetime — so no transmute is needed.
         RowKey::new(arena, reader.row(idx))
-    }
-
-    fn resolve_persisted(arena: &SharedArena, persisted: ArenaKey) -> ResolvedKey<'_> {
-        ResolvedKey::new(persisted, arena)
     }
 }

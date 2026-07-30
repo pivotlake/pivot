@@ -23,7 +23,7 @@ use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::{LiveKey, PersistedKey};
 use crate::operations::unary::group::keys::string::ArenaKey;
-use crate::operations::unary::group::keys::{KeyColumnBuilder, KeyExtractor};
+use crate::operations::unary::group::keys::{KeyColumnBuilder, KeyExtractor, StoredKey};
 use ahash::RandomState;
 use arrow_array::types::ArrowPrimitiveType;
 use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch, StringViewArray};
@@ -169,7 +169,7 @@ where
     type Config = ();
     type Persisted = IntStrKey<T::Native>;
     type LiveKey<'a, 'b> = IntStrLiveKey<'a, 'b, T::Native>;
-    type PersistedLiveKey<'a> = IntStrResolvedKey<'a, T::Native>;
+    type Stored = IntStrStored<T::Native>;
     type Reader<'b> = IntStrReader<'b, T>;
     type ColumnBuilder = IntStrKeyColumnBuilder<T, STR_FIRST>;
     type Scratch = ();
@@ -224,17 +224,6 @@ where
             arena,
             int: unsafe { reader.ints.value_unchecked(idx) },
             string: unsafe { reader.strings.value_unchecked(idx) },
-        }
-    }
-
-    fn resolve_persisted(
-        arena: &SharedArena,
-        persisted: IntStrKey<T::Native>,
-    ) -> Self::PersistedLiveKey<'_> {
-        IntStrResolvedKey {
-            int: persisted.int,
-            string: persisted.string_key(),
-            arena,
         }
     }
 }
@@ -296,6 +285,26 @@ impl<T: ArrowPrimitiveType, const STR_FIRST: bool> KeyColumnBuilder
             Field::new("k1", k1_type, false),
         ];
         (fields, vec![k0, k1])
+    }
+}
+
+/// Keys stored as an integer plus an arena string blob. Parameterised on the
+/// integer's width only: the two columns' order in the GROUP BY changes how the
+/// result columns are emitted, not how the key is stored, so both orders share
+/// this one implementation.
+pub struct IntStrStored<N>(std::marker::PhantomData<N>);
+
+impl<N: Copy + Default + PartialEq + Send + Sync + 'static> StoredKey for IntStrStored<N> {
+    type Persisted = IntStrKey<N>;
+    type PersistedLiveKey<'a> = IntStrResolvedKey<'a, N>;
+
+    #[inline(always)]
+    fn resolve_persisted(arena: &SharedArena, persisted: IntStrKey<N>) -> IntStrResolvedKey<'_, N> {
+        IntStrResolvedKey {
+            int: persisted.int,
+            string: persisted.string_key(),
+            arena,
+        }
     }
 }
 
