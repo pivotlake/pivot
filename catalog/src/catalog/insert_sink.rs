@@ -133,15 +133,6 @@ pub(super) fn encode_and_upload_spec(
     // last worker into `finish` emits it once all uploads have landed, so no
     // separate fan-in is needed.
     let rows = Arc::new(AtomicUsize::new(0));
-    // TODO(unary-finish-barrier): REMOVE THIS SECOND WORKER COUNTDOWN once
-    // `UnaryOperator` correctly handles a sibling stealing work after it has
-    // decremented `siblings_left`. Today such a sibling can start a new async
-    // upload without rejoining the barrier, allowing `Unary::finish` to run and
-    // read `rows` before that upload completes. `remaining_workers` deliberately
-    // waits for every `Upload::finish` invocation and is only a correctness
-    // workaround. Fix Unary by atomically rejoining the still-open sibling
-    // barrier before stealing (and leaving it again after a failed steal), then
-    // replace this countdown with a one-shot emission latch.
     let remaining_workers = Arc::new(AtomicUsize::new(workers));
     let uploads = encoded.chain(
         stealable::<EncodedFile>(dispatcher.topology())
