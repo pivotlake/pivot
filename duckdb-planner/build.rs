@@ -3,6 +3,9 @@ fn main() {
         .map(|n| n.get().to_string())
         .unwrap_or_else(|_| "4".to_string());
 
+    let crate_dir = std::env::var("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR");
+    let ccache_base_dir = find_ccache_base_dir(std::path::Path::new(&crate_dir));
+
     let mut duckdb_config = cmake::Config::new("duckdb-sources");
     duckdb_config
         .profile("Release")
@@ -20,6 +23,24 @@ fn main() {
         duckdb_config
             .define("CMAKE_C_COMPILER_LAUNCHER", &wrapper)
             .define("CMAKE_CXX_COMPILER_LAUNCHER", &wrapper);
+    } else if let Some(ccache) = find_ccache() {
+        // DuckDB is around 2400 translation units pinned to a submodule commit,
+        // so every checkout sitting on that commit compiles byte-identical
+        // objects. ccache turns all but the first of those into cache hits.
+        //
+        // Those compiles carry the checkout's absolute path in two places: the
+        // include flags cmake passes, and the bodies of the unity files it
+        // generates, which include each source by absolute path. Both would
+        // otherwise land in the hash and miss on every sibling checkout.
+        // CCACHE_BASEDIR makes ccache rewrite paths beneath it, in the command
+        // line and in preprocessed output alike, as relative to the directory
+        // being compiled in. Since that directory sits under the same root, the
+        // part of the path naming the checkout appears on both sides of the
+        // relative path and cancels out.
+        duckdb_config
+            .define("CMAKE_C_COMPILER_LAUNCHER", &ccache)
+            .define("CMAKE_CXX_COMPILER_LAUNCHER", &ccache)
+            .env("CCACHE_BASEDIR", &ccache_base_dir);
     }
 
     let duckdb = duckdb_config.build();
@@ -39,6 +60,9 @@ fn main() {
             "--parallel",
             &num_jobs,
         ])
+        // The launcher cmake recorded while configuring runs for this build too,
+        // so it needs the same view of where paths are rooted.
+        .env("CCACHE_BASEDIR", &ccache_base_dir)
         .status()
         .expect("Failed to build extensions");
     assert!(status.success(), "Failed to build extensions");
@@ -108,4 +132,43 @@ fn main() {
     println!("cargo:rerun-if-changed=src/duckdb_bridge/cpp/catalog/table_entry.cpp");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=duckdb-sources");
+}
+
+/// The directory ccache expresses compile paths relative to.
+///
+/// This has to be an ancestor of every checkout meant to share cached objects,
+/// so it is the repository root rather than the checkout's own root: worktrees
+/// live inside it, and picking the checkout root instead leaves each one with a
+/// cache only it can use. A checkout placed outside the repository still caches
+/// against itself, just not against its siblings.
+fn find_ccache_base_dir(crate_dir: &std::path::Path) -> std::path::PathBuf {
+    let repository_root = std::process::Command::new("git")
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .current_dir(crate_dir)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            let git_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            std::path::PathBuf::from(git_dir)
+        })
+        .and_then(|git_dir| git_dir.parent().map(std::path::Path::to_path_buf));
+
+    repository_root.unwrap_or_else(|| {
+        crate_dir
+            .parent()
+            .expect("the crate directory always has a parent")
+            .to_path_buf()
+    })
+}
+
+/// The ccache to hand cmake, or `None` when it is not installed and DuckDB has
+/// to be compiled the slow way.
+fn find_ccache() -> Option<String> {
+    let installed = std::process::Command::new("ccache")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success());
+
+    installed.then(|| "ccache".to_string())
 }
