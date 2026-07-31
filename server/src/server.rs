@@ -40,11 +40,11 @@ pub enum Error {
     #[error("failed to read metastore `{path}`: {source}")]
     ReadMetastore {
         path: PathBuf,
-        /// Boxed: the TOML parse error it carries is by far the largest thing
+        /// Boxed: the YAML parse error it carries is by far the largest thing
         /// in this enum, and every `Result<_, Error>` in the crate would pay
         /// for it on the success path too.
         #[source]
-        source: Box<metastore_toml::Error>,
+        source: Box<metastore_yaml::Error>,
     },
     #[error("failed to open datastores from `{path}`: {source}")]
     OpenDatastores {

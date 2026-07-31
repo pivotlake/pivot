@@ -32,12 +32,12 @@ pivotdb-server --metastore <FILE> [OPTIONS]
 | --- | --- | --- |
 | `--bind` | `127.0.0.1:5432` | TCP socket the server binds to. |
 | `--workers` | number of cores | Number of dispatch worker threads. |
-| `--metastore` | required | TOML file defining the named datastores. |
+| `--metastore` | required | YAML file defining the named datastores. |
 | `--memory` | 80% of RAM | Buffer-pool budget such as `32g` or `512m`. |
 
 ### Metastore configuration
 
-The TOML provider lives in the separate `metastore-toml` crate. A metastore is
+The YAML provider lives in the separate `metastore-yaml` crate. A metastore is
 always required, including when serving one local datastore. Exactly one
 datastore must set `default = true`; it becomes the current database (the target
 of unqualified table names). Every datastore is attached as
@@ -48,28 +48,28 @@ URI is S3). Compaction is configured per datastore with `compact` (and the
 optional `compact_bytes` / `compact_min_files` tuning); it is off by default and
 should run in only one process per datastore:
 
-```toml
-[datastore.hot]
-kind = "delta"
-location = "/var/lib/pivot/hot"    # local path -> local store
-default = true                     # the current database
-
-[datastore.warm]
-kind = "delta"
-location = "s3://analytics/warm/"  # s3:// -> S3 store
-compact = true                     # this datastore compacts itself
-compact_bytes = "128m"
-region = "us-east-1"
-access_key_id = "AKIA..."
-secret_access_key = "..."
-# session_token = "..."
-# endpoint = "http://localhost:9000"
+```yaml
+datastores:
+  hot:
+    kind: delta
+    location: /var/lib/pivot/hot    # local path -> local store
+    default: true                   # the current database
+  warm:
+    kind: delta
+    location: s3://analytics/warm/  # S3 store
+    compact: true                   # this datastore compacts itself
+    compact_bytes: 128m
+    region: us-east-1
+    access_key_id: AKIA...
+    secret_access_key: "..."
+    # session_token: "..."
+    # endpoint: http://localhost:9000
 ```
 
 Start the server with:
 
 ```sh
-pivotdb-server --metastore config.toml
+pivotdb-server --metastore config.yaml
 ```
 
 An S3 datastore's `region`, `access_key_id`, and `secret_access_key` are
@@ -79,7 +79,7 @@ appropriately.
 Logging is controlled by `RUST_LOG` (defaults to `info`):
 
 ```sh
-RUST_LOG=server=debug,dispatch=info pivotdb-server --metastore config.toml --bind 0.0.0.0:5432
+RUST_LOG=server=debug,dispatch=info pivotdb-server --metastore config.yaml --bind 0.0.0.0:5432
 ```
 
 ## Connecting

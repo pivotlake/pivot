@@ -14,7 +14,7 @@ use arrow_schema::{DataType, Field, Schema};
 use catalog::{DEFAULT_DATASTORE_NAME, PivotCatalog};
 use common::{CatalogFixture, connect_client, select_rows, start_server};
 use metastore::Metastore;
-use metastore_toml::TomlMetastore;
+use metastore_yaml::YamlMetastore;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -71,12 +71,12 @@ async fn queries_bind_tables_by_datastore_name() {
     write_table(warm_dir.path(), "events", &events_batch());
 
     let meta_dir = TempDir::new().unwrap();
-    let meta_path = meta_dir.path().join("metastore.toml");
+    let meta_path = meta_dir.path().join("metastore.yaml");
     std::fs::write(
         &meta_path,
         format!(
-            "[datastore.default]\nkind = \"delta\"\nlocation = \"{}\"\ndefault = true\n\n\
-             [datastore.warm]\nkind = \"delta\"\nlocation = \"{}\"\n",
+            "datastores:\n  default:\n    kind: delta\n    location: \"{}\"\n    \
+             default: true\n  warm:\n    kind: delta\n    location: \"{}\"\n",
             default_dir.path().display(),
             warm_dir.path().display(),
         ),
@@ -88,7 +88,7 @@ async fn queries_bind_tables_by_datastore_name() {
         // A short refresh interval: an INSERT commits to the log and the refresh
         // brings the new rows into the live set, so the test observes them quickly.
         let metastore =
-            TomlMetastore::open(&meta_path_str, std::time::Duration::from_millis(100)).unwrap();
+            YamlMetastore::open(&meta_path_str, std::time::Duration::from_millis(100)).unwrap();
         let datastores = metastore.open_datastores(dispatch.dispatcher()).unwrap();
         CatalogFixture::new(Arc::new(
             PivotCatalog::new(datastores, DEFAULT_DATASTORE_NAME.to_string()).unwrap(),

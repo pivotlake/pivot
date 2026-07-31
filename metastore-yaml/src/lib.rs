@@ -1,4 +1,4 @@
-//! A TOML-backed [`metastore::Metastore`] provider.
+//! A YAML-backed [`metastore::Metastore`] provider.
 //!
 //! `kind` is the datastore format (only `delta` today). The storage backend is
 //! chosen from `location`: a plain path (or `file://`) opens a local store, an
@@ -9,21 +9,21 @@
 //! database, so unqualified table names and DDL resolve against it. Its name is
 //! free (it need not be called `default`).
 //!
-//! ```toml
-//! [datastore.hot]
-//! kind = "delta"
-//! location = "/var/lib/pivot"        # local path -> local store
-//! default = true                     # the current database
-//!
-//! [datastore.warm]
-//! kind = "delta"
-//! location = "s3://my-bucket/pivot/" # s3:// -> S3 store
-//! region = "us-east-1"               # required for s3://
-//! access_key_id = "AKIA..."          # required for s3://
-//! secret_access_key = "..."          # required for s3://
-//! # session_token = "..."    # optional
-//! # endpoint = "http://localhost:9000" # optional (MinIO / S3-compatible)
-//! # compact = true           # optional: this datastore compacts itself
+//! ```yaml
+//! datastores:
+//!   hot:
+//!     kind: delta
+//!     location: /var/lib/pivot       # local path -> local store
+//!     default: true                  # the current database
+//!   warm:
+//!     kind: delta
+//!     location: s3://my-bucket/pivot/
+//!     region: us-east-1              # required for s3://
+//!     access_key_id: AKIA...         # required for s3://
+//!     secret_access_key: "..."
+//!     # session_token: "..."         # optional
+//!     # endpoint: http://localhost:9000
+//!     # compact: true                # optional
 //! ```
 //!
 //! An S3 datastore's credentials are inline, so the file holds secrets and should
@@ -44,12 +44,12 @@ use dispatch::DataFlowDispatcher;
 use metastore::Metastore;
 use serde::Deserialize;
 
-/// A metastore backed by a parsed TOML file.
+/// A metastore backed by a parsed YAML file.
 ///
 /// Configuration is parsed and structurally validated by [`open`](Self::open).
 /// Object stores and their Delta datastores are opened when
 /// [`Metastore::open_datastores`] is called.
-pub struct TomlMetastore {
+pub struct YamlMetastore {
     datastore_configs: HashMap<String, DatastoreConfig>,
     default_name: String,
     /// How often every datastore this metastore opens refreshes its table set
@@ -58,7 +58,7 @@ pub struct TomlMetastore {
     refresh_interval: Duration,
 }
 
-impl TomlMetastore {
+impl YamlMetastore {
     /// Read and parse the metastore file at `path`, applying `refresh_interval`
     /// to every datastore it opens.
     pub fn open(path: impl AsRef<Path>, refresh_interval: Duration) -> Result<Self> {
@@ -67,19 +67,19 @@ impl TomlMetastore {
             path: path.display().to_string(),
             source,
         })?;
-        Self::from_toml(&text, &path.display().to_string(), refresh_interval)
+        Self::from_yaml(&text, &path.display().to_string(), refresh_interval)
     }
 
-    /// Parse metastore configuration from TOML text, using `path` in errors.
-    pub fn from_toml(text: &str, path: &str, refresh_interval: Duration) -> Result<Self> {
-        let file: MetastoreFile = toml::from_str(text).map_err(|source| Error::Parse {
+    /// Parse metastore configuration from YAML text, using `path` in errors.
+    pub fn from_yaml(text: &str, path: &str, refresh_interval: Duration) -> Result<Self> {
+        let file: MetastoreFile = serde_yaml_ng::from_str(text).map_err(|source| Error::Parse {
             path: path.to_string(),
             source,
         })?;
         // The default datastore is the one flagged `default = true`, not one with
         // a reserved name. Exactly one is required: it is the current database.
         let mut defaults: Vec<String> = file
-            .datastore
+            .datastores
             .iter()
             .filter(|(_, config)| config.is_default)
             .map(|(name, _)| name.clone())
@@ -90,7 +90,7 @@ impl TomlMetastore {
         }
         let default_name = defaults.pop().ok_or(Error::MissingDefault)?;
         Ok(Self {
-            datastore_configs: file.datastore,
+            datastore_configs: file.datastores,
             default_name,
             refresh_interval,
         })
@@ -122,7 +122,7 @@ impl TomlMetastore {
     }
 }
 
-impl Metastore for TomlMetastore {
+impl Metastore for YamlMetastore {
     fn open_datastores(
         &self,
         dispatcher: &DataFlowDispatcher,
@@ -148,7 +148,7 @@ pub enum Error {
     #[error("parsing metastore file `{path}`: {source}")]
     Parse {
         path: String,
-        source: toml::de::Error,
+        source: serde_yaml_ng::Error,
     },
     #[error("datastore `{name}`: {message}")]
     Datastore { name: String, message: String },
@@ -169,7 +169,7 @@ pub enum Error {
 #[derive(Deserialize)]
 struct MetastoreFile {
     #[serde(default)]
-    datastore: HashMap<String, DatastoreConfig>,
+    datastores: HashMap<String, DatastoreConfig>,
 }
 
 /// One datastore's configuration. `kind` is the datastore format; the storage
@@ -252,7 +252,7 @@ fn parse_byte_size(input: &str) -> std::result::Result<u64, String> {
 
 /// The datastore format. Only [`Delta`](Self::Delta) is supported today; adding
 /// another (Iceberg, ...) is a new variant plus its arm in
-/// [`build_datastores`](TomlMetastore::build_datastores).
+/// [`build_datastores`](YamlMetastore::build_datastores).
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum DatastoreKind {
@@ -311,20 +311,20 @@ mod tests {
 
     #[test]
     fn compaction_is_per_datastore() {
-        let toml = r#"
-            [datastore.hot]
-            kind = "delta"
-            location = "/tmp/hot"
-            default = true
-            compact = true
-            compact_bytes = "128m"
+        let yaml = r#"
+datastores:
+  hot:
+    kind: delta
+    location: /tmp/hot
+    default: true
+    compact: true
+    compact_bytes: 128m
+  warm:
+    kind: delta
+    location: /tmp/warm
+"#;
 
-            [datastore.warm]
-            kind = "delta"
-            location = "/tmp/warm"
-        "#;
-
-        let store = TomlMetastore::from_toml(toml, "test", Duration::from_secs(30)).unwrap();
+        let store = YamlMetastore::from_yaml(yaml, "test", Duration::from_secs(30)).unwrap();
 
         let hot = store.datastore_configs["hot"].compaction("hot").unwrap();
         let warm = store.datastore_configs["warm"].compaction("warm").unwrap();
@@ -334,81 +334,83 @@ mod tests {
 
     #[test]
     fn missing_default_datastore_is_rejected() {
-        let toml = r#"
-            [datastore.warm]
-            kind = "delta"
-            location = "/tmp/warm"
-        "#;
+        let yaml = r#"
+datastores:
+  warm:
+    kind: delta
+    location: /tmp/warm
+"#;
 
-        let result = TomlMetastore::from_toml(toml, "test", Duration::from_secs(30));
+        let result = YamlMetastore::from_yaml(yaml, "test", Duration::from_secs(30));
 
         assert!(matches!(result, Err(Error::MissingDefault)));
     }
 
     #[test]
     fn unknown_datastore_kind_is_rejected() {
-        let toml = r#"
-            [datastore.default]
-            kind = "iceberg"
-            location = "/tmp/default"
-        "#;
+        let yaml = r#"
+datastores:
+  default:
+    kind: iceberg
+    location: /tmp/default
+"#;
 
-        let result = TomlMetastore::from_toml(toml, "test", Duration::from_secs(30));
+        let result = YamlMetastore::from_yaml(yaml, "test", Duration::from_secs(30));
 
         assert!(matches!(result, Err(Error::Parse { .. })));
     }
 
     #[test]
     fn multiple_defaults_are_rejected() {
-        let toml = r#"
-            [datastore.hot]
-            kind = "delta"
-            location = "/tmp/hot"
-            default = true
+        let yaml = r#"
+datastores:
+  hot:
+    kind: delta
+    location: /tmp/hot
+    default: true
+  warm:
+    kind: delta
+    location: /tmp/warm
+    default: true
+"#;
 
-            [datastore.warm]
-            kind = "delta"
-            location = "/tmp/warm"
-            default = true
-        "#;
-
-        let result = TomlMetastore::from_toml(toml, "test", Duration::from_secs(30));
+        let result = YamlMetastore::from_yaml(yaml, "test", Duration::from_secs(30));
 
         assert!(matches!(result, Err(Error::MultipleDefaults(names)) if names == ["hot", "warm"]));
     }
 
     #[test]
     fn default_is_the_flagged_datastore_whatever_its_name() {
-        let toml = r#"
-            [datastore.hot]
-            kind = "delta"
-            location = "/tmp/hot"
-            default = true
+        let yaml = r#"
+datastores:
+  hot:
+    kind: delta
+    location: /tmp/hot
+    default: true
+  warm:
+    kind: delta
+    location: /tmp/warm
+"#;
 
-            [datastore.warm]
-            kind = "delta"
-            location = "/tmp/warm"
-        "#;
-
-        let store = TomlMetastore::from_toml(toml, "test", Duration::from_secs(30)).unwrap();
+        let store = YamlMetastore::from_yaml(yaml, "test", Duration::from_secs(30)).unwrap();
 
         assert_eq!(store.default_datastore_name(), "hot");
     }
 
     #[test]
     fn s3_location_without_keys_is_rejected() {
-        let toml = r#"
-            [datastore.default]
-            kind = "delta"
-            location = "/tmp/default"
-            default = true
+        let yaml = r#"
+datastores:
+  default:
+    kind: delta
+    location: /tmp/default
+    default: true
+  warm:
+    kind: delta
+    location: s3://bucket/prefix
+"#;
 
-            [datastore.warm]
-            kind = "delta"
-            location = "s3://bucket/prefix"
-        "#;
-
-        let store = TomlMetastore::from_toml(toml, "test", Duration::from_secs(30)).unwrap();
+        let store = YamlMetastore::from_yaml(yaml, "test", Duration::from_secs(30)).unwrap();
         let err = store.datastore_configs["warm"]
             .open_store("warm")
             .unwrap_err();
@@ -418,21 +420,21 @@ mod tests {
 
     #[test]
     fn local_and_s3_locations_open_stores() {
-        let toml = r#"
-            [datastore.default]
-            kind = "delta"
-            location = "/tmp/default"
-            default = true
+        let yaml = r#"
+datastores:
+  default:
+    kind: delta
+    location: /tmp/default
+    default: true
+  warm:
+    kind: delta
+    location: s3://bucket/prefix
+    region: eu-west-1
+    access_key_id: AKIA
+    secret_access_key: secret
+"#;
 
-            [datastore.warm]
-            kind = "delta"
-            location = "s3://bucket/prefix"
-            region = "eu-west-1"
-            access_key_id = "AKIA"
-            secret_access_key = "secret"
-        "#;
-
-        let store = TomlMetastore::from_toml(toml, "test", Duration::from_secs(30)).unwrap();
+        let store = YamlMetastore::from_yaml(yaml, "test", Duration::from_secs(30)).unwrap();
 
         assert!(
             store.datastore_configs[DEFAULT_DATASTORE_NAME]
