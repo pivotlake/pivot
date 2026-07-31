@@ -3,7 +3,7 @@
 //!
 //! [`Metastore`] is the trait the server holds; the datastores it returns are
 //! resolved however the implementation likes. Concrete providers live in sibling
-//! crates so a TOML file, PostgreSQL, or another backend can be selected without
+//! crates so a YAML file, PostgreSQL, or another backend can be selected without
 //! coupling this interface to its configuration format or datastore implementation.
 
 use catalog::Datastore;

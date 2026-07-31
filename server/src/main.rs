@@ -14,7 +14,7 @@ use clap::Parser;
 use dispatch::env::get_env_var_with_default;
 use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
 use metastore::Metastore;
-use metastore_toml::TomlMetastore;
+use metastore_yaml::YamlMetastore;
 use server::{Error, Server};
 use tracing::{error, info};
 
@@ -36,7 +36,7 @@ struct Args {
     #[arg(long)]
     workers: Option<usize>,
 
-    /// Metastore file (TOML) defining the datastores to serve, each a local
+    /// Metastore file (YAML) defining the datastores to serve, each a local
     /// directory or S3 root, attached as its own database
     /// (`SELECT * FROM <datastore>.main.<table>`). Exactly one datastore must set
     /// `default = true`; it is the current database (unqualified names resolve
@@ -157,7 +157,7 @@ fn build_catalog(args: &Args, dispatcher: &DataFlowDispatcher) -> Result<Arc<Piv
     let path = &args.metastore;
     let refresh_interval = Duration::from_secs(args.catalog_refresh_secs);
     let store =
-        TomlMetastore::open(path, refresh_interval).map_err(|source| Error::ReadMetastore {
+        YamlMetastore::open(path, refresh_interval).map_err(|source| Error::ReadMetastore {
             path: path.clone(),
             source: Box::new(source),
         })?;

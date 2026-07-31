@@ -1,8 +1,8 @@
 [package]
-name = "metastore-toml"
+name = "metastore-yaml"
 version.workspace = true
 edition.workspace = true
-description = "TOML-backed metastore provider for PivotDB."
+description = "YAML-backed metastore provider for PivotDB."
 
 [dependencies]
 metastore = { workspace = true }
@@ -12,4 +12,4 @@ dispatch = { workspace = true }
 
 serde = { workspace = true }
 thiserror = { workspace = true }
-toml = "0.8"
+serde_yaml_ng = "0.10"

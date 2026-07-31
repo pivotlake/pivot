@@ -1,0 +1,23 @@
+# Exactly one datastore must set `default: true`. It is the current database, so
+# unqualified names such as `main.events` resolve against it.
+datastores:
+  # `kind` is the datastore format (only `delta` today). The storage backend is
+  # inferred from `location`: a local path here, an S3 URI for `warm` below.
+  default:
+    kind: delta
+    location: /var/lib/pivot/default
+    default: true
+
+  # Other entries are attached as databases and can be queried with three-part
+  # names such as `warm.main.events`. Compaction is off by default; run it in
+  # only one process per datastore.
+  warm:
+    kind: delta
+    location: s3://example-bucket/warm/
+    compact: true
+    compact_bytes: 128m
+    region: us-east-1
+    access_key_id: replace-me
+    secret_access_key: replace-me
+    # session_token: replace-me
+    # endpoint: http://localhost:9000 # MinIO / S3-compatible
