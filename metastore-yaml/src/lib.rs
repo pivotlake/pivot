@@ -206,7 +206,7 @@ pub enum Error {
     #[error("user `{name}`: {message}")]
     User { name: String, message: String },
     #[error(
-        "no datastore is marked `default = true`; exactly one is required (it is the current database)"
+        "no default datastore is configured; mark exactly one entry under `datastores` with `default: true`"
     )]
     MissingDefault,
     #[error(
@@ -432,9 +432,15 @@ datastores:
     location: /tmp/warm
 "#;
 
-        let result = YamlMetastore::from_yaml(yaml, "test", Duration::from_secs(30));
+        let error = YamlMetastore::from_yaml(yaml, "test", Duration::from_secs(30))
+            .err()
+            .expect("a metastore without a default should be rejected");
 
-        assert!(matches!(result, Err(Error::MissingDefault)));
+        assert!(matches!(&error, Error::MissingDefault));
+        assert_eq!(
+            error.to_string(),
+            "no default datastore is configured; mark exactly one entry under `datastores` with `default: true`"
+        );
     }
 
     #[test]

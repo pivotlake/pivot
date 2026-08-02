@@ -6,6 +6,7 @@
 use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -182,7 +183,7 @@ fn build_catalog(
     Ok(Arc::new(PivotCatalog::new(datastores, default_name)?))
 }
 
-fn main() -> Result<(), Error> {
+fn run() -> Result<(), Error> {
     init_tracing();
     let args = Args::parse();
 
@@ -222,4 +223,14 @@ fn main() -> Result<(), Error> {
         });
         server.serve(shutdown).await
     })
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
