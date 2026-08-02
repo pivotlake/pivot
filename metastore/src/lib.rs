@@ -19,10 +19,6 @@ use dispatch::DataFlowDispatcher;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// The conventional name for a standalone datastore; see
-/// [`catalog::DEFAULT_DATASTORE_NAME`].
-pub use catalog::DEFAULT_DATASTORE_NAME;
-
 /// The user provided by a metastore configuration that does not define any
 /// users explicitly. It authenticates with [`UserAuth::Trust`].
 pub const DEFAULT_USER_NAME: &str = "pivot";

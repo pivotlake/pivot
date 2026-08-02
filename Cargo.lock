@@ -3561,6 +3561,7 @@ dependencies = [
  "base64",
  "chrono",
  "parquet-variant",
+ "serde",
  "serde_json",
  "uuid",
 ]

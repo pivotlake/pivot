@@ -30,13 +30,19 @@ use planner::catalog::{BoundTable, CreateTableRequest, Result, TableCreation, Ta
 /// composes several of these and routes to them by name.
 #[async_trait]
 pub trait DatastoreTransaction: Debug + Send + Sync {
-    /// Resolve a table name to a fresh, independently-mutable [`BoundTable`] bound
-    /// to this transaction's snapshot, or `None` if no such table exists in the
-    /// snapshot. Each call returns a unique `Box`, so per-query filter pushdown
-    /// can mutate the table without affecting concurrent queries. The returned
-    /// binding captures the snapshot's copy of the table, so its compile needs
-    /// no transaction handle.
-    fn bind_table(&self, name: &str) -> Option<Box<dyn BoundTable>>;
+    /// Resolve `name` in the datastore the catalog serves as `datastore` to a
+    /// fresh, independently-mutable [`BoundTable`] bound to this transaction's
+    /// snapshot, or `None` if no such table exists in the snapshot. Each call
+    /// returns a unique `Box`, so per-query filter pushdown can mutate the table
+    /// without affecting concurrent queries. The returned binding captures the
+    /// snapshot's copy of the table, so its compile needs no transaction handle.
+    ///
+    /// `datastore` is the name the *catalog* holds this datastore under, passed
+    /// in rather than known here: a datastore is registered by its owner, so the
+    /// binding can only learn the qualifier it was reached through from the
+    /// caller that routed to it. The binding records it, so re-resolving the
+    /// table later uses the very key it was bound by.
+    fn bind_table(&self, datastore: &str, name: &str) -> Option<Box<dyn BoundTable>>;
 
     /// The identity and version of `name` in this transaction's frozen
     /// snapshot, or `None` if no such table exists. This must return `Some` for
@@ -80,12 +86,9 @@ pub trait DatastoreTransaction: Debug + Send + Sync {
     fn rollback(&self) {}
 }
 
-/// One named data source the planner can resolve tables against.
+/// One data source the planner can resolve tables against.
 #[async_trait]
 pub trait Datastore: Debug + Send + Sync {
-    /// This datastore's name.
-    fn name(&self) -> &str;
-
     /// Open a transaction: snapshot this datastore as it stands right now. All
     /// binding for one query resolves through the returned snapshot, so the
     /// query reads a single consistent view regardless of concurrent refreshes
