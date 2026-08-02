@@ -19,6 +19,7 @@ use datastore::DatastoreTransaction;
 use datastore_delta::DeltaDatastore;
 use datastore_delta::parquet::table_input;
 use dispatch::Projection;
+use planner::DEFAULT_DATASTORE_NAME;
 use planner::catalog::{Column, CreateTableRequest, Result as CatalogResult};
 use planner::types::Type;
 
@@ -125,7 +126,7 @@ fn create_table_with_path_scans_rows() {
     let table = datastore
         .clone()
         .begin_transaction()
-        .table("events")
+        .table(DEFAULT_DATASTORE_NAME, "events")
         .expect("table created");
     assert_eq!(table.columns.len(), 2);
     let parquet = current_parquet(&datastore, "events");
@@ -165,7 +166,7 @@ fn tables_persist_across_reopen() {
     let table = reopened
         .clone()
         .begin_transaction()
-        .table("events")
+        .table(DEFAULT_DATASTORE_NAME, "events")
         .expect("table reloaded from the manifest");
     assert_eq!(table.columns.len(), 2);
     let parquet = current_parquet(&reopened, "events");
@@ -239,7 +240,13 @@ fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
 
         // A data-less table: registered, with no row groups (its data lives under
         // `<root>/t`, which fills in once a file is registered there).
-        assert!(datastore.clone().begin_transaction().table("t").is_some());
+        assert!(
+            datastore
+                .clone()
+                .begin_transaction()
+                .table(DEFAULT_DATASTORE_NAME, "t")
+                .is_some()
+        );
         assert!(current_parquet(&datastore, "t").row_groups().is_empty());
 
         let commit =
@@ -264,7 +271,13 @@ fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
 
     // And it survives a reopen.
     let reopened = DeltaDatastore::open(db_uri, &dispatch).unwrap();
-    assert!(reopened.clone().begin_transaction().table("t").is_some());
+    assert!(
+        reopened
+            .clone()
+            .begin_transaction()
+            .table(DEFAULT_DATASTORE_NAME, "t")
+            .is_some()
+    );
 }
 
 #[test]
@@ -314,7 +327,7 @@ fn create_fetches_footers_across_workers_before_commit() {
         datastore
             .clone()
             .begin_transaction()
-            .table("empty")
+            .table(DEFAULT_DATASTORE_NAME, "empty")
             .is_some()
     );
     assert!(current_parquet(&datastore, "empty").row_groups().is_empty());

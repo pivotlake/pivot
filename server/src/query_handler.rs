@@ -729,6 +729,7 @@ impl PgWireServerHandlers for PivotHandlers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use planner::DEFAULT_DATASTORE_NAME;
     use planner::catalog::{BoundTable, Column, TableReference, TableRevision};
     use std::collections::HashMap;
 
@@ -789,7 +790,7 @@ mod tests {
 
     fn table() -> TableReference {
         TableReference {
-            datastore: "default".to_string(),
+            datastore: DEFAULT_DATASTORE_NAME.to_string(),
             table: "events".to_string(),
         }
     }

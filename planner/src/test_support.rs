@@ -110,7 +110,7 @@ impl TestTable {
             .collect();
         TestTable {
             reference: TableReference {
-                datastore: crate::DEFAULT_DATASTORE_NAME.to_string(),
+                datastore: DEFAULT_DATASTORE_NAME.to_string(),
                 table: name.to_string(),
             },
             batch,
