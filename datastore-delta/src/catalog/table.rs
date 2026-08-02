@@ -596,23 +596,4 @@ impl CatalogTable {
         }
         Ok(files)
     }
-
-    /// Each committed file's manifest path paired with its loaded row groups, in
-    /// manifest order - the source for the `metadata()` table function, where
-    /// each row group reports the file it belongs to. Only files whose footers
-    /// are loaded contribute (the refresh path keeps them synced to the
-    /// manifest).
-    pub(super) fn file_row_groups(&self) -> Vec<(String, Vec<Arc<RowGroupMetadata>>)> {
-        let by_path: HashMap<&ObjectPath, &TableFile> =
-            self.files.iter().map(|f| (&f.file.path, f)).collect();
-        self.manifest
-            .entries
-            .iter()
-            .filter_map(|e| {
-                by_path
-                    .get(&e.file.path)
-                    .map(|f| (e.file.path.as_str().to_string(), f.row_groups.to_vec()))
-            })
-            .collect()
-    }
 }
