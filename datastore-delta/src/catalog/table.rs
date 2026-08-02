@@ -148,7 +148,7 @@ impl CatalogTable {
     /// Returns whether it advanced;
     /// `Ok(false)` means this copy was already current.
     pub fn refresh(&mut self) -> crate::Result<bool> {
-        let state = crate::delta::load_table(&self.delta_uri)?;
+        let state = crate::delta::load_table(&self.delta_uri, self.store.as_ref())?;
         if state.version <= self.manifest.version {
             return Ok(false);
         }
