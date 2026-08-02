@@ -281,7 +281,7 @@ impl DeltaDatastore {
         entry: &CatalogManifestTableEntry,
     ) -> Result<CatalogTable> {
         let delta_uri = crate::delta::table_uri(&store.location_uri(), &entry.location)?;
-        let state = crate::delta::load_table(&delta_uri)?;
+        let state = crate::delta::load_table(&delta_uri, store.as_ref())?;
         let id = state.id;
         let manifest = TableManifest {
             version: state.version,
