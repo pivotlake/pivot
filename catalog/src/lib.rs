@@ -30,7 +30,7 @@ use planner::catalog::{
 /// implement it and are held here behind `Arc<dyn Datastore>`.
 pub use datastore::Datastore;
 
-/// The conventional name for a standalone datastore; see
+/// The conventional name for a single-datastore configuration's datastore; see
 /// [`planner::DEFAULT_DATASTORE_NAME`].
 pub use planner::DEFAULT_DATASTORE_NAME;
 
@@ -175,7 +175,7 @@ impl PivotTransaction {
 impl CatalogTransaction for PivotTransaction {
     fn bind_table(&self, datastore: &str, name: &str) -> Option<Box<dyn BoundTable>> {
         self.find_or_create_sub_transaction(datastore)?
-            .bind_table(name)
+            .bind_table(datastore, name)
     }
 
     fn table_revision(&self, datastore: &str, name: &str) -> Option<TableRevision> {
@@ -251,8 +251,6 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let datastore: Arc<dyn Datastore> =
             DeltaDatastore::open_local(directory.path(), dispatch.dispatcher()).unwrap();
-
-        assert_eq!(datastore.name(), DEFAULT_DATASTORE_NAME);
 
         let catalog = PivotCatalog::new(
             HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),

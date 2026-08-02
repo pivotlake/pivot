@@ -50,11 +50,11 @@ use crossbeam_deque::{Injector, Steal};
 use datastore::{Datastore, DatastoreTransaction};
 use dispatch::{DataFlowDispatcher, DataFlowError, RecordBatchOperatorSpec};
 use metadata_function::MetadataTableFunction;
+use planner::TableFunction;
 use planner::catalog::{
     BoundTable, CreateTableRequest, Error as CatalogError, Result as CatalogResult, TableCreation,
-    TableRevision,
+    TableReference, TableRevision,
 };
-use planner::{DEFAULT_DATASTORE_NAME, TableFunction};
 pub use table::CatalogTable;
 pub use table::TableFile;
 use thiserror::Error as ThisError;
@@ -162,16 +162,10 @@ impl TableIndex {
 /// to the latest committed version, so a commit by another process (or this one)
 /// becomes visible to the next query.
 ///
-/// Cloneable (every field is an `Arc`, a `String`, or the shared dispatcher
-/// handle), so a commit that writes can hand a clone to the blocking pool.
+/// Cloneable (every field is an `Arc` or the shared dispatcher handle), so a
+/// commit that writes can hand a clone to the blocking pool.
 #[derive(Clone)]
 pub struct DeltaDatastore {
-    /// This datastore's name: the key it is registered under in the metastore
-    /// and the database it is attached as in DuckDB. Stamped onto every
-    /// [`TableBinding`] this datastore's transactions resolve, so a query that
-    /// spans several datastores routes each table back to the one that produced
-    /// it.
-    name: String,
     /// The in-memory table set. The lock guards the *set* (add on `CREATE`,
     /// swap-in on a resolve's refresh); each [`CatalogTable`] is itself a
     /// lock-free value that callers clone out and evolve independently.
@@ -201,28 +195,22 @@ pub struct DeltaDatastore {
 impl std::fmt::Debug for DeltaDatastore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeltaDatastore")
-            .field("name", &self.name)
             .field("store", &self.store)
             .finish_non_exhaustive()
     }
 }
 
 impl DeltaDatastore {
-    /// Open the default datastore at an explicit local data directory. The
-    /// caller owns the directory and its lifetime; pivotdb never substitutes a
-    /// generated temporary path. A database with no manifest yet opens empty.
-    /// No background maintenance runs (see [`from_store`](Self::from_store) for
+    /// Open a datastore at an explicit local data directory. The caller owns
+    /// the directory and its lifetime; pivotdb never substitutes a generated
+    /// temporary path. A database with no manifest yet opens empty. No
+    /// background maintenance runs (see [`from_store`](Self::from_store) for
     /// that seam).
     pub fn open_local(
         root: impl Into<PathBuf>,
         dispatcher: &DataFlowDispatcher,
     ) -> Result<Arc<Self>> {
-        Self::from_store(
-            DEFAULT_DATASTORE_NAME.to_string(),
-            Arc::new(LocalStore::new(root)),
-            dispatcher,
-            None,
-        )
+        Self::from_store(Arc::new(LocalStore::new(root)), dispatcher, None)
     }
 
     /// Open a persisted database rooted at `uri`, a local directory (or
@@ -233,16 +221,15 @@ impl DeltaDatastore {
     /// No background maintenance runs (see [`from_store`](Self::from_store)).
     pub fn open(uri: &str, dispatcher: &DataFlowDispatcher) -> Result<Arc<Self>> {
         let store: Arc<dyn ObjectStore> = open_store(uri)?.into();
-        Self::from_store(DEFAULT_DATASTORE_NAME.to_string(), store, dispatcher, None)
+        Self::from_store(store, dispatcher, None)
     }
 
-    /// Open a persisted database over an already-built object store, under the
-    /// datastore `name`. This is the seam a metastore uses: it constructs the
-    /// store (local dir / S3, with whatever credentials it holds) and hands
-    /// it in, rather than having the datastore re-derive one from a URI. Reloads
-    /// every table the manifest records, exactly as [`open`](Self::open) does.
+    /// Open a persisted database over an already-built object store. This is the
+    /// seam a metastore uses: it constructs the store (local dir / S3, with
+    /// whatever credentials it holds) and hands it in, rather than having the
+    /// datastore re-derive one from a URI. Reloads every table the manifest
+    /// records, exactly as [`open`](Self::open) does.
     pub fn from_store(
-        name: String,
         store: Arc<dyn ObjectStore>,
         dispatcher: &DataFlowDispatcher,
         maintenance: Option<crate::MaintenanceConfig>,
@@ -256,19 +243,12 @@ impl DeltaDatastore {
         }
 
         Ok(Arc::new(Self {
-            name,
             tables: Arc::new(RwLock::new(tables)),
             store,
             dispatcher: dispatcher.clone(),
             maintenance,
             maintenance_tasks: Arc::new(Mutex::new(Vec::new())),
         }))
-    }
-
-    /// This datastore's name, the database it is attached as in DuckDB and the
-    /// key it is registered under in the metastore.
-    pub fn name(&self) -> &str {
-        &self.name
     }
 
     /// Build the in-memory [`CatalogTable`] for one persisted table: read its
@@ -320,7 +300,6 @@ impl DeltaDatastore {
     /// trait impl delegates here.
     pub fn begin_transaction(self: Arc<Self>) -> Arc<DeltaTransaction> {
         let snapshot = Arc::new(DeltaSnapshot {
-            datastore_name: self.name.clone(),
             tables: self.tables.read().unwrap().clone(),
         });
         Arc::new(DeltaTransaction {
@@ -710,10 +689,6 @@ fn drain_injector<T>(injector: &Injector<T>) -> Vec<T> {
 
 #[async_trait]
 impl Datastore for DeltaDatastore {
-    fn name(&self) -> &str {
-        &self.name
-    }
-
     /// Open a transaction: freeze the table set as it stands right now. Every
     /// table the transaction binds resolves from that frozen
     /// [`DeltaSnapshot`] (pure in-memory, no I/O), so one query reads one
@@ -787,16 +762,12 @@ impl Datastore for DeltaDatastore {
 /// Everything a query does against it (binding, scan-view construction, late
 /// materialize, `metadata()`) is pure in-memory.
 pub struct DeltaSnapshot {
-    /// The datastore this snapshot belongs to, stamped onto every binding it
-    /// resolves so a multi-datastore query routes each table back here.
-    datastore_name: String,
     tables: TableIndex,
 }
 
 impl std::fmt::Debug for DeltaSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeltaSnapshot")
-            .field("datastore_name", &self.datastore_name)
             .field("tables", &self.tables.names().collect::<Vec<_>>())
             .finish_non_exhaustive()
     }
@@ -885,9 +856,12 @@ impl DeltaTransaction {
     /// `TableBinding`, and one function cannot return both). The binding captures
     /// the snapshot's copy of the table and shares this transaction's
     /// uploaded-files injector, so it is self-contained.
-    pub fn table(&self, name: &str) -> Option<TableBinding> {
+    pub fn table(&self, datastore: &str, name: &str) -> Option<TableBinding> {
         Some(TableBinding::new(
-            self.snapshot.datastore_name.clone(),
+            TableReference {
+                datastore: datastore.to_string(),
+                table: name.to_string(),
+            },
             self.snapshot.catalog_table_by_name(name)?,
             self.uploaded_files.clone(),
         ))
@@ -896,8 +870,8 @@ impl DeltaTransaction {
 
 #[async_trait]
 impl DatastoreTransaction for DeltaTransaction {
-    fn bind_table(&self, name: &str) -> Option<Box<dyn BoundTable>> {
-        Some(Box::new(DeltaTransaction::table(self, name)?))
+    fn bind_table(&self, datastore: &str, name: &str) -> Option<Box<dyn BoundTable>> {
+        Some(Box::new(DeltaTransaction::table(self, datastore, name)?))
     }
 
     fn table_revision(&self, name: &str) -> Option<TableRevision> {

@@ -155,12 +155,9 @@ impl YamlMetastore {
                     compaction: config.compaction(name)?,
                 };
                 let datastore: Arc<dyn Datastore> = match config.kind {
-                    DatastoreKind::Delta => DeltaDatastore::from_store(
-                        name.clone(),
-                        store,
-                        dispatcher,
-                        Some(maintenance),
-                    )?,
+                    DatastoreKind::Delta => {
+                        DeltaDatastore::from_store(store, dispatcher, Some(maintenance))?
+                    }
                 };
                 Ok((name.clone(), datastore))
             })
@@ -393,7 +390,7 @@ fn require(name: &str, value: &Option<String>, field: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use metastore::DEFAULT_DATASTORE_NAME;
+    use catalog::DEFAULT_DATASTORE_NAME;
     use metastore::ScramVerifier;
     use std::time::Duration;
 

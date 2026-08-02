@@ -165,7 +165,7 @@ pub trait TableCreation: Send + Sync {
 /// column list used during planning, and a way to compile a scan into a
 /// dispatch [`RecordBatchOperatorSpec`].
 pub trait BoundTable: Debug + Send + Sync {
-    /// The fully-qualified catalog name resolved for this binding.
+    /// The qualified name the catalog resolved for this binding, as it was bound.
     fn table_reference(&self) -> TableReference;
 
     /// The exact table snapshot captured by this binding.
