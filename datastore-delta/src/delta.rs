@@ -15,9 +15,6 @@ use arrow_array::{
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use delta_kernel::Snapshot;
 use delta_kernel::expressions::Scalar as DeltaScalar;
-use delta_kernel::object_store::DynObjectStore;
-use delta_kernel::object_store::aws::AmazonS3Builder;
-use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::state::ScanFile;
 use delta_kernel::schema::{
     DataType as DeltaDataType, MetadataValue, PrimitiveType, StructField, StructType,
@@ -53,8 +50,6 @@ pub enum Error {
         "Delta file `{0}` uses a deletion vector; Pivot's Parquet reader cannot apply deletion vectors yet"
     )]
     DeletionVector(String),
-    #[error("Delta table URI scheme `{0}` is not supported by the catalog")]
-    UnsupportedScheme(String),
     #[error("cannot format Delta partition value for `{column}`: {message}")]
     PartitionFormat { column: String, message: String },
     #[error("Delta table has a non-UUID table id `{id}`: {source}")]
@@ -288,9 +283,11 @@ pub(crate) fn table_uri(store_uri: &str, location: &ObjectPath) -> Result<Url, E
         })
 }
 
-/// Load the latest Delta snapshot and materialize its active file list.
-pub(crate) fn load_table(uri: &Url) -> Result<DeltaTableState, Error> {
-    let engine = build_engine(uri)?;
+/// Load the latest Delta snapshot and materialize its active file list, reading
+/// the log through the client `store` builds for its own location (see
+/// [`ObjectStore::build_delta_object_store`]).
+pub(crate) fn load_table(uri: &Url, store: &dyn ObjectStore) -> Result<DeltaTableState, Error> {
+    let engine = build_engine(store)?;
     let snapshot = Snapshot::builder_for(uri.clone()).build(&engine)?;
     let schema = snapshot.schema();
     let delta_types = schema
@@ -350,22 +347,11 @@ pub(crate) fn load_table(uri: &Url) -> Result<DeltaTableState, Error> {
     })
 }
 
-fn build_engine(uri: &Url) -> Result<DefaultEngine<TokioBackgroundExecutor>, Error> {
-    let store: Arc<DynObjectStore> = match uri.scheme() {
-        "file" => Arc::new(LocalFileSystem::new()),
-        "s3" | "s3a" => {
-            let mut builder = AmazonS3Builder::from_env().with_url(uri.as_str());
-            if let Ok(endpoint) = std::env::var("AWS_ENDPOINT_URL") {
-                builder = builder
-                    .with_endpoint(endpoint)
-                    .with_allow_http(true)
-                    .with_virtual_hosted_style_request(false);
-            }
-            Arc::new(builder.build()?)
-        }
-        scheme => return Err(Error::UnsupportedScheme(scheme.to_string())),
-    };
-    Ok(DefaultEngineBuilder::new(store).build())
+/// Build the Delta Kernel engine that reads a log held by `store`. The backend
+/// supplies the client, so the one reading the log and the one serving the
+/// table's data are configured alike; this decides only how the engine runs.
+fn build_engine(store: &dyn ObjectStore) -> Result<DefaultEngine<TokioBackgroundExecutor>, Error> {
+    Ok(DefaultEngineBuilder::new(store.build_delta_object_store()?).build())
 }
 
 fn collect_scan_file(files: &mut Vec<ScanFile>, file: ScanFile) {

@@ -2,12 +2,17 @@
 //! with SigV4 via `aws_sigv4::http_request::sign` (a pure function — no runtime).
 //!
 //! Credentials come from one of two places. [`S3Store::from_uri`] reads them from
-//! the environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional
-//! `AWS_SESSION_TOKEN`; region from `AWS_REGION`/`AWS_DEFAULT_REGION`; an optional
+//! the environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`; region from
+//! `AWS_REGION`/`AWS_DEFAULT_REGION`; an optional
 //! `AWS_ENDPOINT_URL` selects a path-style S3-compatible endpoint like MinIO).
 //! [`S3Store::with_credentials`] takes them explicitly, so a metastore can supply
 //! a datastore's own key/secret/region/endpoint rather than relying on ambient
 //! environment.
+//!
+//! Either way the resolved parameters are kept on the store, which builds the
+//! Delta Kernel client for the same bucket from them
+//! ([`ObjectStore::build_delta_object_store`](super::ObjectStore::build_delta_object_store))
+//! instead of letting it resolve its own.
 
 use super::{DataFileLocation, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
 use aws_credential_types::Credentials;
@@ -15,7 +20,10 @@ use aws_sigv4::http_request::{
     PayloadChecksumKind, SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
 };
 use aws_sigv4::sign::v4;
+use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::object_store::aws::AmazonS3Builder;
 use std::io::Read;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 #[derive(Debug)]
@@ -28,7 +36,8 @@ pub struct S3Store {
     region: String,
     access_key: String,
     secret_key: String,
-    session_token: Option<String>,
+    /// The path-style endpoint override this store was opened with, if any.
+    endpoint: Option<String>,
     /// Base origin, e.g. `https://bucket.s3.us-east-1.amazonaws.com` (virtual
     /// hosted) or `http://localhost:9000/bucket` (path-style endpoint override).
     base: String,
@@ -43,7 +52,6 @@ pub struct S3Credentials {
     pub region: String,
     pub access_key: String,
     pub secret_key: String,
-    pub session_token: Option<String>,
     /// A path-style S3-compatible endpoint (e.g. MinIO). `None` uses AWS
     /// virtual-hosted style.
     pub endpoint: Option<String>,
@@ -61,7 +69,6 @@ impl S3Store {
             region,
             access_key: env_req("AWS_ACCESS_KEY_ID")?,
             secret_key: env_req("AWS_SECRET_ACCESS_KEY")?,
-            session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
             endpoint: std::env::var("AWS_ENDPOINT_URL").ok(),
         };
         Ok(Self::build(uri, bucket, prefix, credentials))
@@ -105,7 +112,7 @@ impl S3Store {
             region: credentials.region,
             access_key: credentials.access_key,
             secret_key: credentials.secret_key,
-            session_token: credentials.session_token,
+            endpoint: credentials.endpoint,
             base,
             host,
             agent: ureq::AgentBuilder::new().build(),
@@ -127,13 +134,10 @@ impl S3Store {
         extra_headers: &[(&str, &str)],
         body: &[u8],
     ) -> Result<Vec<(String, String)>> {
-        let creds = Credentials::new(
-            &self.access_key,
-            &self.secret_key,
-            self.session_token.clone(),
-            None,
-            "catalog-env",
-        );
+        // Long-lived keys only, so neither a session token nor an expiry.
+        // `Static` is the SDK's own name for keys handed over directly rather
+        // than resolved by a credentials provider.
+        let creds = Credentials::new(&self.access_key, &self.secret_key, None, None, "Static");
         let identity = creds.into();
 
         let mut settings = SigningSettings::default();
@@ -184,6 +188,30 @@ impl ObjectStore for S3Store {
 
     fn location_uri(&self) -> String {
         self.uri.clone()
+    }
+
+    fn build_delta_object_store(&self) -> Result<Arc<DynObjectStore>> {
+        let mut builder = AmazonS3Builder::new()
+            .with_url(self.uri.as_str())
+            .with_region(&self.region)
+            .with_access_key_id(&self.access_key)
+            .with_secret_access_key(&self.secret_key);
+        // A path-style endpoint is how an S3-compatible service (MinIO, the
+        // Google Cloud Storage interoperability API) is addressed; AWS itself
+        // takes the default virtual-hosted style.
+        if let Some(endpoint) = &self.endpoint {
+            builder = builder
+                .with_endpoint(endpoint)
+                .with_allow_http(true)
+                .with_virtual_hosted_style_request(false);
+        }
+        let store = builder
+            .build()
+            .map_err(|source| StoreError::DeltaObjectStore {
+                uri: self.uri.clone(),
+                source,
+            })?;
+        Ok(Arc::new(store))
     }
 
     fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>> {
@@ -306,13 +334,10 @@ impl S3Store {
         let object = object_key(&self.prefix, key);
         let url = self.url_for(&object);
 
-        let creds = Credentials::new(
-            &self.access_key,
-            &self.secret_key,
-            self.session_token.clone(),
-            None,
-            "catalog-env",
-        );
+        // Long-lived keys only, so neither a session token nor an expiry.
+        // `Static` is the SDK's own name for keys handed over directly rather
+        // than resolved by a credentials provider.
+        let creds = Credentials::new(&self.access_key, &self.secret_key, None, None, "Static");
         let identity = creds.into();
 
         let mut settings = SigningSettings::default();

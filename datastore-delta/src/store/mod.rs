@@ -8,10 +8,15 @@
 //! access is plain `std::fs`; S3 goes over [`ureq`] (blocking HTTP + rustls).
 //! S3 requests are signed with `aws_sigv4::http_request::sign` — a pure function
 //! we call inline (the tokio it transitively links is never driven). Credentials
-//! come from the environment. This runs off the io_uring ring on purpose: a
+//! come from whoever opened the store: a metastore hands them in per datastore,
+//! and [`open_store`] falls back to the environment. A backend also builds the
+//! async client Delta Kernel reads the same location's `_delta_log` with
+//! ([`ObjectStore::build_delta_object_store`]), so the two address it alike.
+//! This runs off the io_uring ring on purpose: a
 //! LIST isn't a range-GET the ring can serve, and it's rare and tiny (a few KB
 //! per query) next to the hot column-chunk reads, which stay on the ring.
 
+use delta_kernel::object_store::DynObjectStore;
 use dispatch::io::{AuthHeader, OpenFile, RemoteFile, open_direct_read};
 use std::fmt::Debug;
 use std::path::PathBuf;
@@ -38,6 +43,12 @@ pub enum StoreError {
     UnsupportedUri(String),
     #[error("missing credential/config: {0}")]
     Config(String),
+    #[error("cannot open `{uri}` for Delta: {source}")]
+    DeltaObjectStore {
+        uri: String,
+        #[source]
+        source: delta_kernel::object_store::Error,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -231,6 +242,15 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// which is free-form text for humans. Required (no default): a backend
     /// cannot silently fall back to something unaddressable.
     fn location_uri(&self) -> String;
+
+    /// Build the separate asynchronous object-store client Delta Kernel uses to
+    /// read this store's `_delta_log`. This returns Delta Kernel's
+    /// [`DynObjectStore`] trait object, not this blocking [`ObjectStore`], but
+    /// configures it from the same location and credentials as this backend.
+    /// Required (no default): a backend cannot silently leave Delta Kernel to
+    /// resolve its own credentials, which for an unconfigured S3 client can mean
+    /// a slow failed probe of the instance metadata service.
+    fn build_delta_object_store(&self) -> Result<Arc<DynObjectStore>>;
 }
 
 /// Open the object store for a catalog root URI: `s3://bucket/prefix` or a
