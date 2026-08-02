@@ -21,7 +21,6 @@
 //!     region: us-east-1              # required for s3://
 //!     access_key_id: AKIA...         # required for s3://
 //!     secret_access_key: "..."
-//!     # session_token: "..."         # optional
 //!     # endpoint: http://localhost:9000
 //!     # compact: true                # optional
 //! ```
@@ -289,7 +288,6 @@ struct DatastoreConfig {
     region: Option<String>,
     access_key_id: Option<String>,
     secret_access_key: Option<String>,
-    session_token: Option<String>,
     endpoint: Option<String>,
 }
 
@@ -361,7 +359,6 @@ impl DatastoreConfig {
                 region: require(name, &self.region, "region")?,
                 access_key: require(name, &self.access_key_id, "access_key_id")?,
                 secret_key: require(name, &self.secret_access_key, "secret_access_key")?,
-                session_token: self.session_token.clone(),
                 endpoint: self.endpoint.clone(),
             };
             Ok(Arc::new(S3Store::with_credentials(

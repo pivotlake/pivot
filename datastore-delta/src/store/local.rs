@@ -2,7 +2,10 @@
 //! directory, the CAS primitive is an `O_EXCL` create.
 
 use super::{DataFileLocation, FileRef, ObjectPath, ObjectStore, Result, StoreError};
+use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::object_store::local::LocalFileSystem;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// The local-filesystem backend: keys are paths under `root`.
 #[derive(Debug)]
@@ -35,6 +38,12 @@ impl ObjectStore for LocalStore {
 
     fn location_uri(&self) -> String {
         format!("file://{}", self.root.display())
+    }
+
+    fn build_delta_object_store(&self) -> Result<Arc<DynObjectStore>> {
+        // Keys reach this client as absolute paths from the table URI, so it is
+        // rooted at the filesystem rather than at this store's root.
+        Ok(Arc::new(LocalFileSystem::new()))
     }
 
     fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>> {

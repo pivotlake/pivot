@@ -62,7 +62,6 @@ datastores:
     region: us-east-1
     access_key_id: AKIA...
     secret_access_key: "..."
-    # session_token: "..."
     # endpoint: http://localhost:9000
 ```
 
