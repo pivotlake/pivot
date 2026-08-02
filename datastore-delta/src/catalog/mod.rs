@@ -28,7 +28,6 @@
 
 mod binding;
 mod insert_sink;
-mod metadata_function;
 mod table;
 
 pub use binding::TableBinding;
@@ -49,8 +48,6 @@ use async_trait::async_trait;
 use crossbeam_deque::{Injector, Steal};
 use datastore::{Datastore, DatastoreTransaction};
 use dispatch::{DataFlowDispatcher, DataFlowError, RecordBatchOperatorSpec};
-use metadata_function::MetadataTableFunction;
-use planner::TableFunction;
 use planner::catalog::{
     BoundTable, CreateTableRequest, Error as CatalogError, Result as CatalogResult, TableCreation,
     TableReference, TableRevision,
@@ -760,7 +757,7 @@ impl Datastore for DeltaDatastore {
 /// held when the transaction began, with all row-group metadata already
 /// materialized (the background refresh keeps the master set fully fetched).
 /// Everything a query does against it (binding, scan-view construction, late
-/// materialize, `metadata()`) is pure in-memory.
+/// materialize) is pure in-memory.
 pub struct DeltaSnapshot {
     tables: TableIndex,
 }
@@ -803,15 +800,6 @@ impl DeltaSnapshot {
     /// check for `CREATE TABLE`.
     pub(super) fn contains_table(&self, name: &str) -> bool {
         self.tables.contains_name(name)
-    }
-
-    /// Per-file row groups (path + its row groups, manifest order) for the
-    /// `metadata()` table function. Errors if the snapshot has no such table.
-    pub(super) fn file_row_groups(
-        &self,
-        name: &str,
-    ) -> Option<Vec<(String, Vec<Arc<crate::parquet::RowGroupMetadata>>)>> {
-        Some(self.tables.get_by_name(name)?.file_row_groups())
     }
 }
 
@@ -876,17 +864,6 @@ impl DatastoreTransaction for DeltaTransaction {
 
     fn table_revision(&self, name: &str) -> Option<TableRevision> {
         self.snapshot.table_revision(name)
-    }
-
-    fn bind_table_function(&self, name: &str) -> Option<Box<dyn TableFunction>> {
-        // `metadata('table')` reports a table's row-group footers; it is
-        // parquet-specific, so it lives here rather than in the generic
-        // planner. It captures this transaction's frozen snapshot, the same view
-        // the rest of the query reads.
-        match name {
-            "metadata" => Some(Box::new(MetadataTableFunction::new(self.snapshot.clone()))),
-            _ => None,
-        }
     }
 
     fn bind_create_table(
