@@ -1,0 +1,124 @@
+//! Accumulating a column whose values are all the same number of bytes.
+//!
+//! The simplest case: the values are the array's one buffer, so appending is a
+//! copy of raw bytes and emitting is that buffer with the accumulated validity
+//! beside it. Nothing here reads a value, so one implementation covers every
+//! width Arrow packs this way, from a boolean-free 1-byte type up to a 16-byte
+//! decimal.
+
+use arrow::array::ArrayData;
+use arrow_array::{ArrayRef, make_array};
+use arrow_schema::{ArrowError, DataType};
+
+use super::column::{ColumnAccumulator, SourceSelection};
+use super::validity::ValidityMask;
+use crate::arrays::slab_into_buffer;
+use crate::memory::{SlabAllocator, SlabBuffer};
+
+pub(super) struct FixedWidthColumn {
+    data_type: DataType,
+    width: usize,
+    capacity: usize,
+    /// The values, u128-backed so the buffer start is aligned for any
+    /// fixed-width value type Arrow reads through it.
+    slab: SlabBuffer<u128>,
+    validity: ValidityMask,
+}
+
+impl FixedWidthColumn {
+    pub(super) fn new(
+        data_type: &DataType,
+        width: usize,
+        capacity: usize,
+        allocator: &mut SlabAllocator,
+    ) -> Self {
+        Self {
+            data_type: data_type.clone(),
+            width,
+            capacity,
+            slab: allocate_values_slab(capacity, width, allocator),
+            validity: ValidityMask::new(capacity),
+        }
+    }
+}
+
+impl ColumnAccumulator for FixedWidthColumn {
+    fn append(
+        &mut self,
+        source: &ArrayRef,
+        selection: SourceSelection<'_>,
+        destination_start: usize,
+        _allocator: &mut SlabAllocator,
+    ) {
+        let data = source.to_data();
+        self.validity
+            .append(data.nulls(), selection, destination_start);
+        let width = self.width;
+        // SAFETY: the source holds `offset + len` values, the rows are in-bounds
+        // positions, and the slab has capacity for `at` plus the appended rows
+        // (checked by the caller).
+        unsafe {
+            let src = data.buffers()[0].as_ptr().add(data.offset() * width);
+            let dst = (self.slab.ptr_at_index(0) as *mut u8).add(destination_start * width);
+            match selection {
+                SourceSelection::Range { start, len } => {
+                    std::ptr::copy_nonoverlapping(src.add(start * width), dst, len * width)
+                }
+                SourceSelection::Indices(indices) => match width {
+                    1 => gather_fixed_width::<u8>(src, dst, indices),
+                    2 => gather_fixed_width::<u16>(src, dst, indices),
+                    4 => gather_fixed_width::<u32>(src, dst, indices),
+                    8 => gather_fixed_width::<u64>(src, dst, indices),
+                    16 => gather_fixed_width::<u128>(src, dst, indices),
+                    _ => unreachable!("built only for the widths above"),
+                },
+            }
+        }
+    }
+
+    fn take_array(
+        &mut self,
+        len: usize,
+        allocator: &mut SlabAllocator,
+    ) -> Result<ArrayRef, ArrowError> {
+        let fresh = allocate_values_slab(self.capacity, self.width, allocator);
+        let slab = std::mem::replace(&mut self.slab, fresh);
+        let buffer = slab_into_buffer(slab, len * self.width);
+        let out = ArrayData::builder(self.data_type.clone())
+            .len(len)
+            .add_buffer(buffer)
+            .nulls(self.validity.take(len));
+        // SAFETY: a fixed-width array is a single values buffer plus optional
+        // validity, and both were copied verbatim.
+        Ok(make_array(unsafe { out.build_unchecked() }))
+    }
+}
+
+/// A slab holding `capacity` values of `width` bytes, as the `u128` elements the
+/// buffer is aligned by.
+fn allocate_values_slab(
+    capacity: usize,
+    width: usize,
+    allocator: &mut SlabAllocator,
+) -> SlabBuffer<u128> {
+    allocator.create_slab_buffer((capacity * width).div_ceil(size_of::<u128>()), false)
+}
+
+/// Gather `indices` rows from `src` to `dst`, as elements of `T`. A flat loop
+/// with independent iterations, so the CPU overlaps the source cache misses of
+/// many gathers. Shared with [`view`](super::view), whose views are gathered the
+/// same way when they need no rebasing.
+///
+/// # Safety
+/// `src` must hold every indexed row, `dst` must have room for `indices.len()`
+/// elements, and both must be valid for unaligned `T` access.
+pub(super) unsafe fn gather_fixed_width<T: Copy>(src: *const u8, dst: *mut u8, indices: &[u32]) {
+    let src = src as *const T;
+    let dst = dst as *mut T;
+    unsafe {
+        for (out_idx, &row) in indices.iter().enumerate() {
+            dst.add(out_idx)
+                .write_unaligned(src.add(row as usize).read_unaligned());
+        }
+    }
+}

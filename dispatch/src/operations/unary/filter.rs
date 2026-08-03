@@ -163,11 +163,11 @@ where
             }
             self.accumulator = None;
         }
-        let accumulator = self
-            .accumulator
-            .get_or_insert_with(|| BatchAccumulator::new(batch.schema(), &mut self.allocator));
-        accumulator.append(&batch, &self.selection);
-        if accumulator.should_emit() || self.delivery == RowDelivery::Immediate {
+        let accumulator = self.accumulator.get_or_insert_with(|| {
+            BatchAccumulator::retaining_source_buffers(batch.schema(), &mut self.allocator)
+        });
+        accumulator.append_batch_by_indices(&batch, &self.selection, &mut self.allocator);
+        if accumulator.has_full_batch() || self.delivery == RowDelivery::Immediate {
             output.send(accumulator.take_batch(&mut self.allocator)?)?;
         }
         Ok(())

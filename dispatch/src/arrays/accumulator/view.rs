@@ -1,0 +1,345 @@
+//! Accumulating a byte-view column (`Utf8View` or `BinaryView`).
+//!
+//! A view column is two things: 16-byte views, one per row, and the data blocks
+//! the values too long to inline live in. The views always accumulate into a
+//! slab of their own. Where the bytes behind them come from is the one place the
+//! accumulator's two modes actually differ, so both live here:
+//!
+//! - Retaining the source's buffers copies no bytes at all. The source's data
+//!   buffers join the emitted array's buffer list and each view's buffer index
+//!   is rebased onto it, which is why the emitted array keeps its inputs alive.
+//! - Copying the values gives the accumulator blocks of its own and copies each
+//!   value into them, so the emitted array names nothing the inputs own.
+//!
+//! A value of up to [`INLINE_VIEW_LEN`] bytes needs neither: it lives inside its
+//! own view, and both modes copy that view across as it lies.
+
+use arrow::array::ArrayData;
+use arrow_array::builder::make_view;
+use arrow_array::cast::AsArray;
+use arrow_array::{Array, ArrayRef, make_array};
+use arrow_buffer::Buffer;
+use arrow_schema::{ArrowError, DataType};
+
+use super::column::{ColumnAccumulator, SourceSelection};
+use super::fixed_width::gather_fixed_width;
+use super::validity::ValidityMask;
+use super::{BUFFER_SIZE, ValueStorage};
+use crate::arrays::slab_into_buffer;
+use crate::memory::{SlabAllocator, SlabBuffer};
+
+/// A byte-view value up to this length lives inside its view, with no data
+/// buffer behind it.
+const INLINE_VIEW_LEN: u32 = 12;
+
+/// Bytes a copying view column takes for its values at a time. Well under a
+/// slab, so blocks pack into the buffers the allocator is bumping through rather
+/// than taking one apiece and leaving the rest unused.
+const DATA_BLOCK_SIZE: usize = 256 * 1024;
+
+/// A column of byte views, with the bytes behind them held as [`ViewValues`] says.
+pub(super) struct ViewColumn {
+    data_type: DataType,
+    capacity: usize,
+    views: SlabBuffer<u128>,
+    values: ViewValues,
+    validity: ValidityMask,
+}
+
+/// Where a view column's bytes live, which is what
+/// [`ValueStorage`](super::ValueStorage) decides for it.
+enum ViewValues {
+    /// The source batches' own data buffers, cloned into one list that the
+    /// appended views are rebased onto.
+    SourceBuffers {
+        buffers: Vec<Buffer>,
+        /// Where the previous append's source data buffers were rebased onto, as
+        /// their (start, length) range in `buffers`. Consecutive appends from the
+        /// same source (a join draining against one build payload) reuse that
+        /// range instead of adding its buffers again.
+        last_source: Option<(usize, usize)>,
+    },
+    /// Blocks this column fills itself, so the emitted array references nothing
+    /// of the batches its values came from.
+    OwnedBlocks { blocks: Vec<DataBlock> },
+}
+
+/// One data block of a copying view column.
+///
+/// A block is slab memory, except for the one case the ring cannot serve: a
+/// value's bytes must be one contiguous run, and the ring hands out runs of at
+/// most [`BUFFER_SIZE`]. A single value larger than that gets a heap buffer of
+/// its own, one allocation of exactly that value's size. Retaining the source
+/// buffer it came from would copy nothing, but it would pin however much else
+/// that buffer holds, which is the retention this mode exists to avoid.
+enum DataBlock {
+    Slab {
+        slab: SlabBuffer<u8>,
+        /// Bytes the block can hold.
+        size: usize,
+        /// Bytes written so far.
+        used: usize,
+    },
+    /// A single value too large for any slab.
+    OversizedValue(Vec<u8>),
+}
+
+impl DataBlock {
+    /// Hand the block's bytes to Arrow. A slab block rides in the buffer's
+    /// allocation `Arc`, so it returns to the pool with the last reference to
+    /// the array.
+    fn into_buffer(self) -> Buffer {
+        match self {
+            Self::Slab { slab, used, .. } => slab_into_buffer(slab, used),
+            Self::OversizedValue(bytes) => Buffer::from_vec(bytes),
+        }
+    }
+}
+
+impl ViewColumn {
+    pub(super) fn new(
+        data_type: &DataType,
+        capacity: usize,
+        storage: ValueStorage,
+        allocator: &mut SlabAllocator,
+    ) -> Self {
+        Self {
+            data_type: data_type.clone(),
+            capacity,
+            views: allocator.create_slab_buffer(capacity, false),
+            values: match storage {
+                ValueStorage::RetainSourceBuffers => ViewValues::SourceBuffers {
+                    buffers: Vec::new(),
+                    last_source: None,
+                },
+                ValueStorage::CopyValues => ViewValues::OwnedBlocks { blocks: Vec::new() },
+            },
+            validity: ValidityMask::new(capacity),
+        }
+    }
+}
+
+impl ColumnAccumulator for ViewColumn {
+    fn append(
+        &mut self,
+        source: &ArrayRef,
+        selection: SourceSelection<'_>,
+        destination_start: usize,
+        allocator: &mut SlabAllocator,
+    ) {
+        // Borrow the views and data buffers through the concrete array type:
+        // `to_data` would clone (and then drop) an Arc per source data buffer on
+        // every append, which a source reused across appends turns into an
+        // atomics storm.
+        let (views, source_buffers, nulls) = match source.data_type() {
+            DataType::Utf8View => {
+                let array = source.as_string_view();
+                (array.views(), array.data_buffers(), array.nulls())
+            }
+            DataType::BinaryView => {
+                let array = source.as_binary_view();
+                (array.views(), array.data_buffers(), array.nulls())
+            }
+            _ => unreachable!("built only for view types"),
+        };
+        self.validity.append(nulls, selection, destination_start);
+        match &mut self.values {
+            ViewValues::SourceBuffers {
+                buffers,
+                last_source,
+            } => append_rebasing_views(
+                &mut self.views,
+                buffers,
+                last_source,
+                views,
+                source_buffers,
+                selection,
+                destination_start,
+            ),
+            ViewValues::OwnedBlocks { blocks } => append_copying_values(
+                &mut self.views,
+                blocks,
+                views,
+                source_buffers,
+                selection,
+                destination_start,
+                allocator,
+            ),
+        }
+    }
+
+    fn take_array(
+        &mut self,
+        len: usize,
+        allocator: &mut SlabAllocator,
+    ) -> Result<ArrayRef, ArrowError> {
+        let fresh = allocator.create_slab_buffer(self.capacity, false);
+        let views = slab_into_buffer(
+            std::mem::replace(&mut self.views, fresh),
+            len * size_of::<u128>(),
+        );
+        let buffers: Vec<Buffer> = match &mut self.values {
+            ViewValues::SourceBuffers {
+                buffers,
+                last_source,
+            } => {
+                *last_source = None;
+                std::mem::take(buffers)
+            }
+            ViewValues::OwnedBlocks { blocks } => std::mem::take(blocks)
+                .into_iter()
+                .map(DataBlock::into_buffer)
+                .collect(),
+        };
+        let out = ArrayData::builder(self.data_type.clone())
+            .len(len)
+            .add_buffer(views)
+            .add_buffers(buffers)
+            .nulls(self.validity.take(len));
+        // SAFETY: every appended view was rebased onto the buffer list emitted
+        // with it, or built over the block its bytes were copied into, so all
+        // view references stay valid. Views of null rows hold whatever bytes the
+        // source held, which the validity marks as not a value.
+        Ok(make_array(unsafe { out.build_unchecked() }))
+    }
+}
+
+/// Append views that keep pointing at the source's data buffers: the source's
+/// buffers join the accumulated list (unless they already are the last ones
+/// appended) and each view's buffer index is rebased onto it.
+#[allow(clippy::too_many_arguments)]
+fn append_rebasing_views(
+    slab: &mut SlabBuffer<u128>,
+    buffers: &mut Vec<Buffer>,
+    last_source: &mut Option<(usize, usize)>,
+    views: &[u128],
+    source_buffers: &[Buffer],
+    selection: SourceSelection<'_>,
+    destination_start: usize,
+) {
+    let base = match *last_source {
+        Some((start, count))
+            if holds_same_buffers(&buffers[start..start + count], source_buffers) =>
+        {
+            start as u128
+        }
+        _ => {
+            let start = buffers.len();
+            buffers.extend(source_buffers.iter().cloned());
+            *last_source = Some((start, source_buffers.len()));
+            start as u128
+        }
+    };
+    // SAFETY: the rows are in-bounds source positions, views are 16 bytes each
+    // (the views slice already accounts for the array offset), and the slab has
+    // room for `destination_start` plus the appended rows.
+    unsafe {
+        let src = views.as_ptr();
+        let dst = slab.ptr_at_index(destination_start);
+        match (base, selection) {
+            // Nothing accumulated references a data buffer yet, so incoming
+            // views keep their buffer indices and copy verbatim. All-inline
+            // columns stay on this path for every batch.
+            (0, SourceSelection::Range { start, len }) => {
+                std::ptr::copy_nonoverlapping(src.add(start), dst, len)
+            }
+            (0, SourceSelection::Indices(indices)) => {
+                gather_fixed_width::<u128>(src as *const u8, dst as *mut u8, indices)
+            }
+            _ => {
+                let mut dst = dst;
+                for row in selection.iter_positions() {
+                    let mut view = src.add(row).read_unaligned();
+                    // A view longer than the inline limit points into a data
+                    // buffer; rebase its buffer index onto the accumulated list.
+                    if view as u32 > INLINE_VIEW_LEN {
+                        view += base << 64;
+                    }
+                    dst.write(view);
+                    dst = dst.add(1);
+                }
+            }
+        }
+    }
+}
+
+/// Append views over bytes copied into this column's own blocks, so the emitted
+/// array holds nothing of the source. An inlined value is its own view and comes
+/// over as it lies; a longer one's bytes are copied and re-viewed against the
+/// block they land in.
+#[allow(clippy::too_many_arguments)]
+fn append_copying_values(
+    slab: &mut SlabBuffer<u128>,
+    blocks: &mut Vec<DataBlock>,
+    views: &[u128],
+    source_buffers: &[Buffer],
+    selection: SourceSelection<'_>,
+    destination_start: usize,
+    allocator: &mut SlabAllocator,
+) {
+    for (destination, row) in (destination_start..).zip(selection.iter_positions()) {
+        let view = views[row];
+        let length = view as u32;
+        let copied = if length <= INLINE_VIEW_LEN {
+            view
+        } else {
+            // The bytes a long view names: its buffer, at its offset.
+            let buffer = (view >> 64) as u32 as usize;
+            let offset = (view >> 96) as u32 as usize;
+            let value = &source_buffers[buffer][offset..offset + length as usize];
+            copy_value(blocks, value, allocator)
+        };
+        // SAFETY: the slab has room for `destination_start` plus the appended
+        // rows, which the caller checked against the capacity.
+        unsafe { *slab.ptr_at_index(destination) = copied };
+    }
+}
+
+/// Copy `value` into the block being filled, opening one (or a larger one for an
+/// outsized value) as needed, and return the view naming where it landed.
+fn copy_value(blocks: &mut Vec<DataBlock>, value: &[u8], allocator: &mut SlabAllocator) -> u128 {
+    if value.len() > BUFFER_SIZE {
+        blocks.push(DataBlock::OversizedValue(value.to_vec()));
+        return make_view(value, blocks.len() as u32 - 1, 0);
+    }
+    let free = match blocks.last() {
+        Some(DataBlock::Slab { size, used, .. }) => size - used,
+        _ => 0,
+    };
+    if free < value.len() {
+        // A value too large for a standard block takes a block sized to it,
+        // which still fits one slab (anything larger took the branch above).
+        let size = DATA_BLOCK_SIZE.max(value.len());
+        blocks.push(DataBlock::Slab {
+            slab: allocator.create_slab_buffer(size, false),
+            size,
+            used: 0,
+        });
+    }
+    let block = blocks.len() as u32 - 1;
+    let DataBlock::Slab { slab, used, .. } = blocks.last_mut().expect("a block was just ensured")
+    else {
+        unreachable!("the block being filled is always a slab block")
+    };
+    let offset = *used;
+    // SAFETY: the block holds `size` bytes and `offset + value.len()` is within
+    // it, which is what the free-space check above establishes.
+    unsafe {
+        std::ptr::copy_nonoverlapping(value.as_ptr(), slab.ptr_at_index(offset), value.len());
+    }
+    *used += value.len();
+    make_view(value, block, offset as u32)
+}
+
+/// Whether `accumulated` holds exactly the buffers of `source`.
+///
+/// Comparing by address is sound because `accumulated` holds a clone of every
+/// buffer it names: those clones keep the allocations alive, so an address that
+/// still matches cannot have been freed and handed to a different buffer in the
+/// meantime.
+fn holds_same_buffers(accumulated: &[Buffer], source: &[Buffer]) -> bool {
+    accumulated.len() == source.len()
+        && accumulated.iter().zip(source).all(|(held, incoming)| {
+            held.as_ptr() == incoming.as_ptr() && held.len() == incoming.len()
+        })
+}
