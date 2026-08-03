@@ -1,11 +1,11 @@
 //! The probe side of the hash join: for each probe row whose key matches a
 //! build row, emit the output columns declared in
 //! [`JoinOutputColumns`] — the listed probe columns
-//! followed by the listed build columns (gathered from the concatenated build
-//! payload batch).
+//! followed by the listed build columns, gathered from the build payload
+//! chunks by payload id.
 //!
 //! Matches are collected as two parallel index slices — probe row and build
-//! payload row — and appended into a [`BatchAccumulator`] per side, so the
+//! payload id — and appended into a [`BatchAccumulator`] per side, so the
 //! hot loops touch only hashes, the directory, and the key/row arenas, and a
 //! selective join still emits full-size batches.
 //!
@@ -22,7 +22,7 @@
 //! accumulator ever fills, since such a join carries no build columns.
 
 use crate::RECORD_BATCH_SIZE;
-use crate::arrays::accumulator::BatchAccumulator;
+use crate::arrays::accumulator::{BatchAccumulator, ChunkedGatherSource};
 use crate::memory::{MultiSlabBuffer, SlabAllocator};
 use crate::operations::Unary;
 use crate::operations::channels::Sender;
@@ -30,7 +30,9 @@ use crate::operations::unary;
 use crate::operations::unary::join::build::filter_null_keys;
 use crate::operations::unary::join::directory::{JoinDirectory, prefetch_ptr_l2};
 use crate::operations::unary::join::keys::JoinKey;
-use crate::operations::unary::join::{JoinOutputColumns, JoinTable, UnmatchedScan};
+use crate::operations::unary::join::{
+    JoinOutputColumns, JoinTable, PAYLOAD_CHUNK_SHIFT, UnmatchedScan,
+};
 use ahash::RandomState;
 use arrow_array::{RecordBatch, new_null_array};
 use arrow_schema::{Field, Schema, SchemaRef};
@@ -42,9 +44,6 @@ const PROBE_BATCH_SIZE: usize = 2048;
 const RING_SIZE: usize = 64;
 const MASK: usize = RING_SIZE - 1;
 const PREFETCH_LENGTH: usize = 63;
-/// Build rows one worker claims per pass of the unmatched scan. A full output
-/// batch's worth, so a pass can never overfill the accumulator it appends to.
-const UNMATCHED_SCAN_CHUNK: usize = RECORD_BATCH_SIZE;
 
 pub struct Probe<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> {
     table: JoinTable<K::Stored>,
@@ -106,16 +105,16 @@ impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Probe<K, BUILD_OUTER
     }
 
     /// Build the output sides if this worker has not already, given the build
-    /// payload and, when one is at hand, the schema of a probed batch.
+    /// payload chunks and, when one is at hand, the schema of a probed batch.
     fn ensure_output_sides_initialized(
         &mut self,
-        build_rows: &RecordBatch,
+        build_rows: &[RecordBatch],
         probe_schema: Option<&Schema>,
     ) -> unary::Result<()> {
         if self.sides.is_some() {
             return Ok(());
         }
-        let build_schema = build_rows.schema();
+        let build_schema = build_rows[0].schema();
         let probe_fields: Vec<Field> = match &self.probe_fields {
             Some(fields) => fields.as_ref().clone(),
             None => {
@@ -134,7 +133,11 @@ impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Probe<K, BUILD_OUTER
             .map(|&i| build_schema.field(i).clone())
             .collect();
         let fields: Vec<Field> = probe_fields.iter().chain(&build_fields).cloned().collect();
-        let build_source = build_rows.project(&self.output_columns.build)?;
+        let build_chunks: Vec<RecordBatch> = build_rows
+            .iter()
+            .map(|chunk| chunk.project(&self.output_columns.build))
+            .collect::<Result<_, _>>()?;
+        let build_gather = ChunkedGatherSource::prepare(&build_chunks, PAYLOAD_CHUNK_SHIFT);
         self.sides = Some(OutputSides {
             output_schema: Arc::new(Schema::new(fields)),
             probe: BatchAccumulator::retaining_source_buffers(
@@ -145,45 +148,46 @@ impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Probe<K, BUILD_OUTER
                 Arc::new(Schema::new(build_fields)),
                 &mut self.allocator,
             ),
-            build_source,
+            build_chunks,
+            build_gather,
         });
         Ok(())
     }
 
-    /// Claim one chunk of the flag array and append its unmatched build rows to
-    /// the build accumulator, emitting once a full batch has gathered. Returns
-    /// whether every chunk has been claimed.
+    /// Claim one payload chunk, scan its flags, and append its unmatched build
+    /// rows to the build accumulator, emitting once a full batch has gathered.
+    /// Returns whether every chunk has been claimed.
     fn send_out_next_unmatched_build_rows(
         &mut self,
-        total_rows: usize,
         sender: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<bool> {
-        let start = self
-            .unmatched
-            .cursor
-            .fetch_add(UNMATCHED_SCAN_CHUNK, Ordering::Relaxed);
+        let chunk_idx = self.unmatched.cursor.fetch_add(1, Ordering::Relaxed);
         let sides = self
             .sides
             .as_mut()
             .expect("sides are built before scanning");
-        if start >= total_rows {
+        if chunk_idx >= sides.build_chunks.len() {
             if !sides.build.is_empty() {
                 sides.emit_unmatched_build_rows(&mut self.allocator, sender)?;
             }
             return Ok(true);
         }
 
+        let chunk = &sides.build_chunks[chunk_idx];
+        let id_base = chunk_idx << PAYLOAD_CHUNK_SHIFT;
         let flags = unsafe { &*self.table.matched.get() };
         let mut found = 0;
-        for row in start..min(start + UNMATCHED_SCAN_CHUNK, total_rows) {
+        for row in 0..chunk.num_rows() {
             // Branchless, as in the match collector: write the row and keep it
-            // only if its flag is still clear.
+            // only if its flag is still clear. A chunk holds at most one
+            // output batch's worth of rows, so a pass never overfills the
+            // accumulator.
             self.build_indices[found] = row as u32;
-            found += (unsafe { *flags.ptr_at_index(row) } == 0) as usize;
+            found += (unsafe { *flags.ptr_at_index(id_base + row) } == 0) as usize;
         }
         if found > 0 {
             sides.build.append_batch_by_indices(
-                &sides.build_source,
+                chunk,
                 &self.build_indices[..found],
                 &mut self.allocator,
             );
@@ -202,9 +206,6 @@ impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Probe<K, BUILD_OUTER
         sender: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<()> {
         let build_rows = unsafe { &*self.table.build_rows.get() };
-        let build_rows = build_rows
-            .as_ref()
-            .expect("probing requires a published build payload");
         let reader = K::make_reader(window, &self.key_columns, &self.hash_state);
         let verifier = K::make_verifier(build_rows, &self.build_key_columns);
         let keys = unsafe { &*self.table.keys.get() };
@@ -249,11 +250,11 @@ impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Unary<RecordBatch, R
         sender: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<()> {
         let build_rows = unsafe { &*self.table.build_rows.get() };
-        let Some(build_rows) = build_rows else {
+        if build_rows.is_empty() {
             // Empty build side: nothing matches, and an outer build has no rows
             // to carry through unmatched either.
             return Ok(());
-        };
+        }
 
         let batch = filter_null_keys(batch, &self.key_columns);
         if batch.num_rows() == 0 {
@@ -299,11 +300,11 @@ impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Unary<RecordBatch, R
             return Ok(false);
         }
         let build_rows = unsafe { &*self.table.build_rows.get() };
-        let Some(build_rows) = build_rows else {
+        if build_rows.is_empty() {
             return Ok(true);
-        };
+        }
         self.ensure_output_sides_initialized(build_rows, None)?;
-        self.send_out_next_unmatched_build_rows(build_rows.num_rows(), sender)
+        self.send_out_next_unmatched_build_rows(sender)
     }
 }
 
@@ -315,8 +316,11 @@ struct OutputSides {
     output_schema: SchemaRef,
     probe: BatchAccumulator,
     build: BatchAccumulator,
-    /// The build payload restricted to the listed build columns.
-    build_source: RecordBatch,
+    /// The build payload chunks restricted to the listed build columns, for
+    /// the unmatched pass's per-chunk scan.
+    build_chunks: Vec<RecordBatch>,
+    /// The same chunks prepared for gathering matched rows by payload id.
+    build_gather: ChunkedGatherSource,
 }
 
 impl OutputSides {
@@ -423,7 +427,7 @@ impl<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
         let OutputSides {
             probe,
             build,
-            build_source,
+            build_gather,
             ..
         } = &mut *self.sides;
         probe.append_batch_by_indices(
@@ -434,8 +438,8 @@ impl<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
         // A semi join has no build columns and buffered no build rows: its
         // build side only ever contributes its (empty) column list on emit.
         if !SEMI {
-            build.append_batch_by_indices(
-                build_source,
+            build.append_chunked_by_ids(
+                build_gather,
                 &self.build_indices[..self.matched],
                 self.allocator,
             );

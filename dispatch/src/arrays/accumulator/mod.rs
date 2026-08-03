@@ -32,12 +32,15 @@
 //!   group waiting for its file to finish encoding) must not pin those buffers,
 //!   so it copies the values into blocks of its own instead.
 
+mod chunked;
 mod column;
 mod concatenated;
 mod fixed_width;
 mod structs;
 mod validity;
 mod view;
+
+pub use chunked::ChunkedGatherSource;
 
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{ArrowError, DataType, Fields, SchemaRef};
@@ -180,6 +183,23 @@ impl BatchAccumulator {
         allocator: &mut SlabAllocator,
     ) {
         self.append_selection(batch, SourceSelection::Indices(indices), allocator);
+    }
+
+    /// Append the rows of a prepared chunked source at the encoded `ids`
+    /// (`chunk << shift | row`, see [`ChunkedGatherSource`]), which must be no
+    /// more than the remaining [`capacity`](Self::capacity). The source's
+    /// schema must match the accumulator's.
+    pub fn append_chunked_by_ids(
+        &mut self,
+        source: &ChunkedGatherSource,
+        ids: &[u32],
+        allocator: &mut SlabAllocator,
+    ) {
+        debug_assert!(self.len + ids.len() <= self.capacity);
+        for (accumulator, column) in self.columns.iter_mut().zip(&source.columns) {
+            accumulator.append_chunked(column, ids, source.shift, self.len, allocator);
+        }
+        self.len += ids.len();
     }
 
     /// Append `len` consecutive rows of `batch` from `start`, which must fit in

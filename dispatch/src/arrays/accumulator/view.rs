@@ -21,6 +21,7 @@ use arrow_array::{Array, ArrayRef, make_array};
 use arrow_buffer::Buffer;
 use arrow_schema::{ArrowError, DataType};
 
+use super::chunked::PreparedColumn;
 use super::column::{ColumnAccumulator, SourceSelection};
 use super::fixed_width::gather_fixed_width;
 use super::validity::ValidityMask;
@@ -44,6 +45,13 @@ pub(super) struct ViewColumn {
     views: SlabBuffer<u128>,
     values: ViewValues,
     validity: ValidityMask,
+    /// Per-chunk rebase cache for chunked appends: the buffer-list position a
+    /// chunk's data buffers were registered at. An entry is live only while
+    /// its generation matches `generation`, which
+    /// [`take_array`](ColumnAccumulator::take_array) bumps because the buffer
+    /// list resets with every emitted batch.
+    chunk_bases: Vec<(u64, u32)>,
+    generation: u64,
 }
 
 /// Where a view column's bytes live, which is what
@@ -115,6 +123,8 @@ impl ViewColumn {
                 ValueStorage::CopyValues => ViewValues::OwnedBlocks { blocks: Vec::new() },
             },
             validity: ValidityMask::new(capacity),
+            chunk_bases: Vec::new(),
+            generation: 1,
         }
     }
 }
@@ -168,11 +178,85 @@ impl ColumnAccumulator for ViewColumn {
         }
     }
 
+    fn append_chunked(
+        &mut self,
+        source: &PreparedColumn,
+        ids: &[u32],
+        shift: u32,
+        destination_start: usize,
+        allocator: &mut SlabAllocator,
+    ) {
+        let PreparedColumn::View { chunks, nulls } = source else {
+            unreachable!("a view accumulator receives a view prepared column");
+        };
+        self.validity
+            .append_by_ids(nulls, ids, shift, destination_start);
+        if self.chunk_bases.len() < chunks.len() {
+            self.chunk_bases.resize(chunks.len(), (0, 0));
+        }
+        let Self {
+            views,
+            values,
+            chunk_bases,
+            generation,
+            ..
+        } = self;
+        let mask = (1u32 << shift) - 1;
+        match values {
+            ViewValues::SourceBuffers { buffers, .. } => {
+                // SAFETY: each id names an in-bounds row of its chunk, and the
+                // views slab has capacity for `destination_start` plus the
+                // appended rows (checked by the caller).
+                unsafe {
+                    let mut dst = views.ptr_at_index(destination_start);
+                    for &id in ids {
+                        let chunk_idx = (id >> shift) as usize;
+                        let chunk = &chunks[chunk_idx];
+                        let mut view = chunk.views.add((id & mask) as usize).read_unaligned();
+                        // A view longer than the inline limit points into its
+                        // chunk's data buffers; register those once per emitted
+                        // batch and rebase the buffer index onto the list.
+                        if view as u32 > INLINE_VIEW_LEN {
+                            let entry = chunk_bases.get_unchecked_mut(chunk_idx);
+                            if entry.0 != *generation {
+                                *entry = (*generation, buffers.len() as u32);
+                                buffers.extend(chunk.data_buffers.iter().cloned());
+                            }
+                            view += (entry.1 as u128) << 64;
+                        }
+                        dst.write(view);
+                        dst = dst.add(1);
+                    }
+                }
+            }
+            ViewValues::OwnedBlocks { blocks } => {
+                for (destination, &id) in (destination_start..).zip(ids) {
+                    let chunk = &chunks[(id >> shift) as usize];
+                    // SAFETY: the id names an in-bounds row of the chunk.
+                    let view = unsafe { chunk.views.add((id & mask) as usize).read_unaligned() };
+                    let length = view as u32;
+                    let copied = if length <= INLINE_VIEW_LEN {
+                        view
+                    } else {
+                        let buffer = (view >> 64) as u32 as usize;
+                        let offset = (view >> 96) as u32 as usize;
+                        let value = &chunk.data_buffers[buffer][offset..offset + length as usize];
+                        copy_value(blocks, value, allocator)
+                    };
+                    // SAFETY: the slab has room for `destination_start` plus
+                    // the appended rows, which the caller checked.
+                    unsafe { *views.ptr_at_index(destination) = copied };
+                }
+            }
+        }
+    }
+
     fn take_array(
         &mut self,
         len: usize,
         allocator: &mut SlabAllocator,
     ) -> Result<ArrayRef, ArrowError> {
+        self.generation += 1;
         let fresh = allocator.create_slab_buffer(self.capacity, false);
         let views = slab_into_buffer(
             std::mem::replace(&mut self.views, fresh),

@@ -15,6 +15,7 @@
 //! the match loop untouched.
 
 use crate::arrays::IntBits;
+use crate::operations::unary::join::{PAYLOAD_CHUNK_ROWS, PAYLOAD_CHUNK_SHIFT};
 use ahash::RandomState;
 use arrow::array::ArrayData;
 use arrow_array::cast::AsArray;
@@ -62,15 +63,15 @@ pub trait JoinKey: 'static {
     /// the batch up front.
     fn is_null(reader: &Self::Reader<'_>, idx: usize) -> bool;
 
-    /// Bind the build payload's key columns for [`verify`](Self::verify).
+    /// Bind the build payload chunks' key columns for [`verify`](Self::verify).
     fn make_verifier<'a>(
-        build_rows: &'a RecordBatch,
+        build_rows: &'a [RecordBatch],
         build_key_columns: &[usize],
     ) -> Self::Verifier<'a>;
 
-    /// Whether probe row `probe_idx` (read through `reader`) and build payload
-    /// row `build_row` (read through `verifier`) hold equal keys, given their
-    /// stored values already compared equal.
+    /// Whether probe row `probe_idx` (read through `reader`) and the build row
+    /// at payload id `build_row` (read through `verifier`) hold equal keys,
+    /// given their stored values already compared equal.
     fn verify(
         reader: &Self::Reader<'_>,
         verifier: &Self::Verifier<'_>,
@@ -118,7 +119,7 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>> JoinKey for SingleColumnKey<T> {
         reader.is_null(idx)
     }
 
-    fn make_verifier(_build_rows: &RecordBatch, _build_key_columns: &[usize]) {}
+    fn make_verifier(_build_rows: &[RecordBatch], _build_key_columns: &[usize]) {}
 
     #[inline(always)]
     fn verify(
@@ -210,7 +211,7 @@ macro_rules! impl_packed_join_key {
                 }
             }
 
-            fn make_verifier(_build_rows: &RecordBatch, _build_key_columns: &[usize]) {}
+            fn make_verifier(_build_rows: &[RecordBatch], _build_key_columns: &[usize]) {}
 
             #[inline(always)]
             fn verify(
@@ -291,9 +292,10 @@ pub struct DynamicReader {
 }
 
 /// The build payload's key columns, compared against during
-/// [`DynamicRowKey::verify`].
+/// [`DynamicRowKey::verify`]: per key column, one bound accessor per payload
+/// chunk, addressed by the payload id's chunk bits.
 pub struct DynamicVerifier {
-    columns: Vec<DynamicKeyColumn>,
+    columns: Vec<Vec<DynamicKeyColumn>>,
 }
 
 /// The fallback join key: any number of key columns of any fixed-width or
@@ -345,11 +347,16 @@ impl JoinKey for DynamicRowKey {
         }
     }
 
-    fn make_verifier(build_rows: &RecordBatch, build_key_columns: &[usize]) -> DynamicVerifier {
+    fn make_verifier(build_rows: &[RecordBatch], build_key_columns: &[usize]) -> DynamicVerifier {
         DynamicVerifier {
             columns: build_key_columns
                 .iter()
-                .map(|&key_column| DynamicKeyColumn::bind(build_rows.column(key_column)))
+                .map(|&key_column| {
+                    build_rows
+                        .iter()
+                        .map(|chunk| DynamicKeyColumn::bind(chunk.column(key_column)))
+                        .collect()
+                })
                 .collect(),
         }
     }
@@ -361,12 +368,14 @@ impl JoinKey for DynamicRowKey {
         probe_idx: usize,
         build_row: u32,
     ) -> bool {
+        let chunk = (build_row >> PAYLOAD_CHUNK_SHIFT) as usize;
+        let row = (build_row as usize) & (PAYLOAD_CHUNK_ROWS - 1);
         reader
             .columns
             .iter()
             .zip(&verifier.columns)
-            .all(|(probe_column, build_column)| {
-                probe_column.value_bytes(probe_idx) == build_column.value_bytes(build_row as usize)
+            .all(|(probe_column, build_chunks)| {
+                probe_column.value_bytes(probe_idx) == build_chunks[chunk].value_bytes(row)
             })
     }
 }

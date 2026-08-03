@@ -17,6 +17,7 @@ use arrow::compute::kernels::concat::concat;
 use arrow_array::{Array, ArrayRef};
 use arrow_schema::ArrowError;
 
+use super::chunked::PreparedColumn;
 use super::column::{ColumnAccumulator, SourceSelection};
 use crate::memory::SlabAllocator;
 
@@ -60,6 +61,41 @@ impl ColumnAccumulator for ConcatenatedColumn {
                     self.arrays.push(source.slice(start, end - start));
                 }
             }
+        }
+    }
+
+    fn append_chunked(
+        &mut self,
+        source: &PreparedColumn,
+        ids: &[u32],
+        shift: u32,
+        _destination_start: usize,
+        _allocator: &mut SlabAllocator,
+    ) {
+        let PreparedColumn::Whole { arrays } = source else {
+            unreachable!("a concatenated accumulator receives a whole prepared column");
+        };
+        let mask = (1u32 << shift) - 1;
+        // Consecutive same-chunk rows become one slice, as in `append`.
+        let mut run: Option<(usize, usize, usize)> = None;
+        for &id in ids {
+            let chunk = (id >> shift) as usize;
+            let row = (id & mask) as usize;
+            match run {
+                Some((run_chunk, start, end)) if run_chunk == chunk && row == end => {
+                    run = Some((run_chunk, start, end + 1));
+                }
+                Some((run_chunk, start, end)) => {
+                    self.arrays
+                        .push(arrays[run_chunk].slice(start, end - start));
+                    run = Some((chunk, row, row + 1));
+                }
+                None => run = Some((chunk, row, row + 1)),
+            }
+        }
+        if let Some((run_chunk, start, end)) = run {
+            self.arrays
+                .push(arrays[run_chunk].slice(start, end - start));
         }
     }
 
