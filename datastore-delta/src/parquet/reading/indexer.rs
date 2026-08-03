@@ -207,10 +207,10 @@ fn build_column_pages(
 }
 
 impl Unary<RowGroupBuffer, CompressedPage> for Indexer {
-    fn consume<S: Sender<CompressedPage>>(
+    fn consume(
         &mut self,
         buffer: RowGroupBuffer,
-        sender: &mut S,
+        sender: &mut dyn Sender<CompressedPage>,
     ) -> dispatch::UnaryResult<()> {
         let mut pages_per_column: Vec<_> = buffer
             .columns

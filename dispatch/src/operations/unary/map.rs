@@ -35,7 +35,7 @@ impl<I, O, F> Unary<I, O> for Map<F>
 where
     F: FnMut(I) -> O + Send,
 {
-    fn consume<S: Sender<O>>(&mut self, item: I, sender: &mut S) -> unary::Result<()> {
+    fn consume(&mut self, item: I, sender: &mut dyn Sender<O>) -> unary::Result<()> {
         sender.send((self.func)(item))?;
         Ok(())
     }

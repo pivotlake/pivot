@@ -63,10 +63,10 @@ impl TableFileMetadataFetcher {
     /// Called from `consume` (after the probe) and on each completion — both just
     /// "make a read happen, then advance" — so the pending-vs-cached decision
     /// lives only here.
-    fn advance<S: Sender<TableFile>>(
+    fn advance(
         &mut self,
         slot: usize,
-        sender: &mut S,
+        sender: &mut dyn Sender<TableFile>,
     ) -> dispatch::UnaryResult<()> {
         while !self.tracker.request_for_slot(slot).unwrap().is_pending() {
             let parsed = self
@@ -92,10 +92,10 @@ impl TableFileMetadataFetcher {
 }
 
 impl Unary<DataFile, TableFile> for TableFileMetadataFetcher {
-    fn consume<S: Sender<TableFile>>(
+    fn consume(
         &mut self,
         file: DataFile,
-        sender: &mut S,
+        sender: &mut dyn Sender<TableFile>,
     ) -> dispatch::UnaryResult<()> {
         // Open the file's transport. The size — which locates the footer's tail
         // window with no HEAD/suffix probe — is already carried by the data
@@ -130,9 +130,9 @@ impl Unary<DataFile, TableFile> for TableFileMetadataFetcher {
             && self.tracker.http_in_flight() < crate::parquet::http_readahead()
     }
 
-    fn process_fs_read_response<S: Sender<TableFile>>(
+    fn process_fs_read_response(
         &mut self,
-        sender: &mut S,
+        sender: &mut dyn Sender<TableFile>,
         request: FsReadRequest,
     ) -> dispatch::UnaryResult<()> {
         for slot in self.tracker.complete(&ReadRequest::of_fs(&request)) {
@@ -142,9 +142,9 @@ impl Unary<DataFile, TableFile> for TableFileMetadataFetcher {
         Ok(())
     }
 
-    fn process_http_get_response<S: Sender<TableFile>>(
+    fn process_http_get_response(
         &mut self,
-        sender: &mut S,
+        sender: &mut dyn Sender<TableFile>,
         request: HttpGetRequest,
     ) -> dispatch::UnaryResult<()> {
         for slot in self.tracker.complete(&ReadRequest::of_http_get(&request)) {
@@ -154,7 +154,7 @@ impl Unary<DataFile, TableFile> for TableFileMetadataFetcher {
         Ok(())
     }
 
-    fn finish<S: Sender<TableFile>>(&mut self, _sender: &mut S) -> dispatch::UnaryResult<bool> {
+    fn finish(&mut self, _sender: &mut dyn Sender<TableFile>) -> dispatch::UnaryResult<bool> {
         Ok(self.tracker.is_idle())
     }
 }

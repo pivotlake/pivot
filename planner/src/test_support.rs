@@ -56,7 +56,7 @@ struct Replay {
 }
 
 impl Nullary<RecordBatch> for Replay {
-    fn run<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> NullaryResult<WorkStatus> {
+    fn run(&mut self, sender: &mut dyn Sender<RecordBatch>) -> NullaryResult<WorkStatus> {
         match self.batch.take() {
             Some(batch) => {
                 sender.send(batch)?;
@@ -66,7 +66,7 @@ impl Nullary<RecordBatch> for Replay {
         }
     }
 
-    fn finish<S: Sender<RecordBatch>>(&mut self, _sender: &mut S) -> NullaryResult<bool> {
+    fn finish(&mut self, _sender: &mut dyn Sender<RecordBatch>) -> NullaryResult<bool> {
         Ok(self.batch.is_none())
     }
 }

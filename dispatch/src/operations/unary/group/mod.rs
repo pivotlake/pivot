@@ -312,10 +312,10 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Consumer<RecordBatch, Record
 {
     type Outputter = GroupOutputter<K, V>;
 
-    fn consume<S: Sender<RecordBatch>>(
+    fn consume(
         &mut self,
         batch: RecordBatch,
-        _sender: &mut S,
+        _sender: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<()> {
         self.aggregated_table.consume_batch(
             &batch,
@@ -482,10 +482,10 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
     /// into `allocator`). Accumulating across partition jobs, rather than emitting
     /// one batch per job, keeps the radix path's many small partitions from each
     /// producing a tiny `RecordBatch`.
-    pub fn run_into<S: Sender<RecordBatch>>(
+    pub fn run_into(
         self,
         acc: &mut Option<output::OutputAccumulator<K, V>>,
-        sender: &mut S,
+        sender: &mut dyn Sender<RecordBatch>,
         allocator: &mut SlabAllocator,
     ) -> Result<()> {
         let result_map = merge::merge_combined::<K::Stored, V>(
@@ -531,7 +531,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
                 self.value_output_types.clone(),
             )
         });
-        acc.extend_from_table(result_map, allocator, sender)
+        acc.extend_from_table(result_map, allocator, &mut *sender)
     }
 }
 
@@ -540,10 +540,10 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
     /// distinct estimate, and publish one [`PartitionJob`] per merge partition to
     /// the shared injector (plus, for `COUNT(DISTINCT)`, the out-of-band 0-hash count
     /// row). Run exactly once, by whichever worker holds the receiver.
-    fn create_partition_jobs<S: Sender<RecordBatch>>(
+    fn create_partition_jobs(
         &self,
         rx: mpsc::Receiver<AggregatedTableOutput<K, V>>,
-        sender: &mut S,
+        sender: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<()> {
         let node_count = self.injectors.len();
         let mut tables_by_node: Vec<Vec<MultiSlabTable<K::Persisted, V>>> =
@@ -770,7 +770,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
 impl<K: KeyExtractor, V: AggregationValue + ?Sized> Outputter<RecordBatch>
     for GroupOutputter<K, V>
 {
-    fn output<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> unary::Result<bool> {
+    fn output(&mut self, sender: &mut dyn Sender<RecordBatch>) -> unary::Result<bool> {
         if let Some(rx) = self.receiver.take() {
             self.create_partition_jobs(rx, sender)?;
         }

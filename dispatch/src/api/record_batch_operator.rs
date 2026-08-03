@@ -37,215 +37,36 @@
 //!
 //! # Internals
 //!
-//! Factories are stored as `Box<dyn RecordBatchOperatorFactory>` — an object-safe trait
+//! Factories are stored as `Box<dyn OperatorFactory<RecordBatch>>` — an object-safe trait
 //! that wraps the generic [`OperatorFactory<O>`]. This keeps the return type of every
 //! chained method as plain `RecordBatchOperatorSpec`, rather than deeply nested generics.
-//! See [`RecordBatchOperatorFactory`] and [`operator_spec`](super::operator_spec) for
+//! See [`OperatorFactory`](super::operator_spec::OperatorFactory) and [`operator_spec`](super::operator_spec) for
 //! details on why this split exists.
 
-use std::any::Any;
 use std::collections::VecDeque;
-use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::AtomicUsize;
 
 use arrow_array::RecordBatch;
 use arrow_array::types::ArrowPrimitiveType;
 use arrow_schema::DataType;
-use crossbeam_deque::Worker;
 use std::hash::Hash;
 
-use crate::api::OperatorGraphBuilder;
 use crate::api::operator_spec::{OperatorFactory, OperatorSpec};
-use crate::operations::channels::{
-    ChannelFactory, MpscSender, Sender, StealableChannelFactory, stealable,
-};
+use crate::operations::channels::{StealableChannelFactory, stealable};
 use crate::operations::{
     AggregateFactory, AggregationSlot, AggregationValue, CopyOutFactory, Distinct,
     DynamicFilterSlot, F64Cell, FilterFactory, GroupFactory, GroupLimit, IntCell, JoinKind,
-    JoinSpec, KeyExtractor, LimitFactory, MapFactory, NoOpNullaryFactory, NullaryFactory,
-    NullaryOperatorFactory, OrderBy, OrderByLimitFactory, UnaryFactory, UnaryOperator,
-    UnaryOperatorFactory, WideCell, create_join_factories,
+    JoinRecordBatchOperatorFactory, JoinSpec, KeyExtractor, LimitFactory, MapFactory,
+    NoOpNullaryFactory, NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByLimitFactory,
+    UnaryFactory, UnaryOperatorFactory, WideCell, create_join_factories,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle, DataFlowStats};
 pub const RECORD_BATCH_SIZE: usize = 8192;
 
-/// Object-safe version of [`OperatorFactory<RecordBatch>`].
-///
-/// [`OperatorFactory::build`] is generic over `S: Sender<O>`, which prevents it from
-/// being used as a trait object. This trait replaces that single generic method with
-/// two concrete methods — one per sender type used at the `RecordBatch` boundary:
-///
-/// - [`build_stealable`](RecordBatchOperatorFactory::build_stealable) — called when this
-///   factory is the head of another stage, connected via a work-stealing channel.
-/// - [`build_collect`](RecordBatchOperatorFactory::build_collect) — called for the final
-///   stage, which sends results to the output mpsc channel.
-///
-/// A blanket impl automatically implements this for any `T: OperatorFactory<RecordBatch>`,
-/// so generic factories from the parquet pipeline can be erased into
-/// `Box<dyn RecordBatchOperatorFactory>` without manual wrapping.
-pub trait RecordBatchOperatorFactory: Send {
-    /// Build the operator chain, outputting to a work-stealing channel.
-    /// Called when this factory is an intermediate stage (the head of another operator).
-    fn build_stealable(self: Box<Self>, sender: Rc<Worker<RecordBatch>>) -> OperatorGraphBuilder;
-
-    /// Build the operator chain, outputting to an mpsc channel.
-    /// Called for the final stage by [`DataFlowBuilder::build`](crate::api::DataFlowBuilder::build).
-    fn build_collect(self: Box<Self>, sender: MpscSender<RecordBatch>) -> OperatorGraphBuilder;
-}
-
-impl<T: OperatorFactory<RecordBatch>> RecordBatchOperatorFactory for T {
-    fn build_stealable(self: Box<Self>, sender: Rc<Worker<RecordBatch>>) -> OperatorGraphBuilder {
-        self.build(sender)
-    }
-    fn build_collect(self: Box<Self>, sender: MpscSender<RecordBatch>) -> OperatorGraphBuilder {
-        self.build(sender)
-    }
-}
-
-/// Type-erased unary operator factory for `RecordBatch -> RecordBatch` stages.
-///
-/// Wraps a type-erased head (`Box<dyn RecordBatchOperatorFactory>`) with a concrete
-/// unary operation (e.g. filter, project, count). The `UF` type parameter is the
-/// concrete `UnaryFactory` — it gets erased when this struct is boxed as
-/// `Box<dyn RecordBatchOperatorFactory>`.
-///
-/// Created internally by `RecordBatchOperatorSpec::unary` — not constructed directly.
-pub struct RecordBatchUnaryOperatorFactory<UF: UnaryFactory<RecordBatch, RecordBatch>> {
-    head: Box<dyn RecordBatchOperatorFactory>,
-    unary_factory: UF,
-    channel_factory: StealableChannelFactory<RecordBatch>,
-    siblings_left: Arc<AtomicUsize>,
-}
-
-impl<UF: UnaryFactory<RecordBatch, RecordBatch>> RecordBatchOperatorFactory
-    for RecordBatchUnaryOperatorFactory<UF>
-{
-    fn build_stealable(self: Box<Self>, sender: Rc<Worker<RecordBatch>>) -> OperatorGraphBuilder {
-        let (tx, rx) = self.channel_factory.build();
-        let chain = self.head.build_stealable(tx);
-        chain.with(Box::new(UnaryOperator::new(
-            self.unary_factory.build_unary(),
-            rx,
-            sender,
-            self.siblings_left,
-        )))
-    }
-
-    fn build_collect(self: Box<Self>, sender: MpscSender<RecordBatch>) -> OperatorGraphBuilder {
-        let (tx, rx) = self.channel_factory.build();
-        let chain = self.head.build_stealable(tx);
-        chain.with(Box::new(UnaryOperator::new(
-            self.unary_factory.build_unary(),
-            rx,
-            sender,
-            self.siblings_left,
-        )))
-    }
-}
-
-struct DiscardSender;
-
-impl Sender<()> for DiscardSender {
-    fn send(&mut self, _item: ()) -> crate::operations::channels::Result<()> {
-        Ok(())
-    }
-}
-
-/// Builds the probe result path and the disconnected build path into one
-/// per-worker operator graph.
-struct JoinRecordBatchOperatorFactory<BF, PF> {
-    probe_head: Box<dyn RecordBatchOperatorFactory>,
-    build_head: Box<dyn RecordBatchOperatorFactory>,
-    build_factory: BF,
-    probe_factory: PF,
-    build_channel_factory: StealableChannelFactory<RecordBatch>,
-    probe_channel_factory: StealableChannelFactory<RecordBatch>,
-    build_siblings_left: Arc<AtomicUsize>,
-    probe_siblings_left: Arc<AtomicUsize>,
-    build_ready: Arc<AtomicBool>,
-}
-
-impl<BF, PF> JoinRecordBatchOperatorFactory<BF, PF>
-where
-    BF: UnaryFactory<RecordBatch, ()>,
-    PF: UnaryFactory<RecordBatch, RecordBatch>,
-{
-    fn build_graph<S: Sender<RecordBatch> + 'static>(self, sender: S) -> OperatorGraphBuilder {
-        let (probe_tx, probe_rx) = self.probe_channel_factory.build();
-        let probe_graph = self
-            .probe_head
-            .build_stealable(probe_tx)
-            .gated_by(self.build_ready)
-            .with(Box::new(UnaryOperator::new(
-                self.probe_factory.build_unary(),
-                probe_rx,
-                sender,
-                self.probe_siblings_left,
-            )));
-
-        let (build_tx, build_rx) = self.build_channel_factory.build();
-        let build_graph =
-            self.build_head
-                .build_stealable(build_tx)
-                .with(Box::new(UnaryOperator::new(
-                    self.build_factory.build_unary(),
-                    build_rx,
-                    DiscardSender,
-                    self.build_siblings_left,
-                )));
-
-        probe_graph.with_side_graph(build_graph)
-    }
-}
-
-impl<BF, PF> RecordBatchOperatorFactory for JoinRecordBatchOperatorFactory<BF, PF>
-where
-    BF: UnaryFactory<RecordBatch, ()>,
-    PF: UnaryFactory<RecordBatch, RecordBatch>,
-{
-    fn build_stealable(self: Box<Self>, sender: Rc<Worker<RecordBatch>>) -> OperatorGraphBuilder {
-        self.build_graph(sender)
-    }
-
-    fn build_collect(self: Box<Self>, sender: MpscSender<RecordBatch>) -> OperatorGraphBuilder {
-        self.build_graph(sender)
-    }
-}
-
-/// Bridges a `Box<dyn RecordBatchOperatorFactory>` into `OperatorFactory<RecordBatch>`,
-/// so the type-erased `RecordBatch` head can be slotted into any generic
-/// `UnaryOperatorFactory<RecordBatch, ..., RecordBatchFactoryBridge>`.
-///
-/// Uses [`Any`] downcasting at build time (once per worker, not per batch) to
-/// dispatch the now-erased sender to the correct concrete build method on
-/// the underlying [`RecordBatchOperatorFactory`].
-pub struct RecordBatchFactoryBridge(Box<dyn RecordBatchOperatorFactory>);
-
-impl RecordBatchFactoryBridge {
-    /// Wrap a type-erased `RecordBatch` factory so it can head a generic
-    /// [`UnaryOperatorFactory`] (used by out-of-crate late materialization).
-    pub fn new(factory: Box<dyn RecordBatchOperatorFactory>) -> Self {
-        Self(factory)
-    }
-}
-
-impl OperatorFactory<RecordBatch> for RecordBatchFactoryBridge {
-    fn build<S: Sender<RecordBatch> + 'static>(self: Box<Self>, sender: S) -> OperatorGraphBuilder {
-        let sender_any: Box<dyn Any> = Box::new(sender);
-        match sender_any.downcast::<Rc<Worker<RecordBatch>>>() {
-            Ok(s) => self.0.build_stealable(*s),
-            Err(sender_any) => match sender_any.downcast::<MpscSender<RecordBatch>>() {
-                Ok(s) => self.0.build_collect(*s),
-                Err(_) => panic!("RecordBatchFactoryBridge: unsupported sender type"),
-            },
-        }
-    }
-}
-
 /// RecordBatchOperatorSpec represents a parallel operator running over Arrow [`RecordBatch`]es.
 ///
-/// Holds one factory per worker, stored as `Box<dyn RecordBatchOperatorFactory>` to
+/// Holds one factory per worker, stored as `Box<dyn OperatorFactory<RecordBatch>>` to
 /// erase the nested generic types that would otherwise grow with each chained operation. Factories
 /// that implement `Send` are sent to workers (instead of the actual operations/channels) as the
 /// final channel/operation may not be `Send`.
@@ -309,7 +130,7 @@ impl OperatorFactory<RecordBatch> for RecordBatchFactoryBridge {
 /// ```
 pub struct RecordBatchOperatorSpec {
     dispatcher: DataFlowDispatcher,
-    factories: VecDeque<Box<dyn RecordBatchOperatorFactory>>,
+    factories: VecDeque<Box<dyn OperatorFactory<RecordBatch>>>,
 }
 
 /// Return type of [`RecordBatchOperatorSpec::map`]: a generic
@@ -321,7 +142,7 @@ type MapOperatorSpec<T, F> = OperatorSpec<
         T,
         MapFactory<F>,
         StealableChannelFactory<RecordBatch>,
-        RecordBatchFactoryBridge,
+        Box<dyn OperatorFactory<RecordBatch>>,
     >,
 >;
 
@@ -338,7 +159,7 @@ impl RecordBatchOperatorSpec {
             dispatcher,
             factories: factories
                 .into_iter()
-                .map(|f| Box::new(f) as Box<dyn RecordBatchOperatorFactory>)
+                .map(|f| Box::new(f) as Box<dyn OperatorFactory<RecordBatch>>)
                 .collect(),
         }
     }
@@ -349,7 +170,7 @@ impl RecordBatchOperatorSpec {
         self,
     ) -> (
         DataFlowDispatcher,
-        VecDeque<Box<dyn RecordBatchOperatorFactory>>,
+        VecDeque<Box<dyn OperatorFactory<RecordBatch>>>,
     ) {
         (self.dispatcher, self.factories)
     }
@@ -390,7 +211,7 @@ impl RecordBatchOperatorSpec {
     /// Append a unary (one-in, one-out) stage to the dataflow.
     ///
     /// Takes an iterator of [`UnaryFactory`] instances (one per worker) and wraps
-    /// each existing factory with a [`RecordBatchUnaryOperatorFactory`].
+    /// each existing factory with a [`UnaryOperatorFactory`].
     fn unary<UF: UnaryFactory<RecordBatch, RecordBatch>>(
         self,
         unary_factories: impl IntoIterator<Item = UF>,
@@ -401,12 +222,12 @@ impl RecordBatchOperatorSpec {
             .zip(unary_factories)
             .zip(self.factories)
             .map(|((channel_factory, unary_factory), head)| {
-                Box::new(RecordBatchUnaryOperatorFactory {
+                Box::new(UnaryOperatorFactory::new(
                     head,
                     unary_factory,
                     channel_factory,
-                    siblings_left: siblings_left.clone(),
-                }) as Box<dyn RecordBatchOperatorFactory>
+                    siblings_left.clone(),
+                )) as Box<dyn OperatorFactory<RecordBatch>>
             })
             .collect();
         Self {
@@ -537,7 +358,7 @@ impl RecordBatchOperatorSpec {
             .zip(self.factories)
             .map(|((channel_factory, unary_factory), head)| {
                 UnaryOperatorFactory::new(
-                    RecordBatchFactoryBridge(head),
+                    head,
                     unary_factory,
                     channel_factory,
                     siblings_left.clone(),
@@ -802,7 +623,7 @@ impl RecordBatchOperatorSpec {
                         build_siblings_left: build_siblings_left.clone(),
                         probe_siblings_left: probe_siblings_left.clone(),
                         build_ready: build_ready.clone(),
-                    }) as Box<dyn RecordBatchOperatorFactory>
+                    }) as Box<dyn OperatorFactory<RecordBatch>>
                 },
             )
             .collect();
@@ -851,22 +672,14 @@ impl RecordBatchOperatorSpec {
     /// `CopyOut` cap so every
     /// batch leaves the worker as plain heap-backed buffers.
     pub fn execute(self) -> DataFlowHandle<RecordBatch> {
-        let factories: Vec<_> = self
-            .factories
-            .into_iter()
-            .map(RecordBatchFactoryBridge)
-            .collect();
+        let factories: Vec<_> = self.factories.into_iter().collect();
         OperatorSpec::new(self.dispatcher, factories).execute()
     }
 
     /// Like [`execute`](Self::execute) but with per-dataflow stats collection on;
     /// read them back via [`DataFlowHandle::collect_with_stats`].
     pub fn execute_with_stats(self) -> DataFlowHandle<RecordBatch> {
-        let factories: Vec<_> = self
-            .factories
-            .into_iter()
-            .map(RecordBatchFactoryBridge)
-            .collect();
+        let factories: Vec<_> = self.factories.into_iter().collect();
         OperatorSpec::new(self.dispatcher, factories).execute_with_stats()
     }
 

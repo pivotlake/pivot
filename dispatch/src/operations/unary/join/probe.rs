@@ -149,10 +149,10 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, const SE
     /// Claim one chunk of the flag array and append its unmatched build rows to
     /// the build accumulator, emitting once a full batch has gathered. Returns
     /// whether every chunk has been claimed.
-    fn send_out_next_unmatched_build_rows<S: Sender<RecordBatch>>(
+    fn send_out_next_unmatched_build_rows(
         &mut self,
         total_rows: usize,
-        sender: &mut S,
+        sender: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<bool> {
         let start = self
             .unmatched
@@ -188,17 +188,17 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, const SE
         Ok(false)
     }
 
-    fn probe_window<S: Sender<RecordBatch>>(
+    fn probe_window(
         &mut self,
         window: &RecordBatch,
         window_offset: usize,
         probe_source: &RecordBatch,
-        sender: &mut S,
+        sender: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<()> {
         let col = window.column(self.key_column).as_primitive::<T>();
         let keys = unsafe { &*self.table.keys.get() };
         let rows = unsafe { &*self.table.rows.get() };
-        let out = ProbeMatchCollector::<T, S, BUILD_OUTER, SEMI> {
+        let out = ProbeMatchCollector::<T, BUILD_OUTER, SEMI> {
             keys,
             rows,
             matched_flags: unsafe { &*self.table.matched.get() },
@@ -230,10 +230,10 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, const SE
 impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, const SEMI: bool>
     Unary<RecordBatch, RecordBatch> for Probe<T, BUILD_OUTER, SEMI>
 {
-    fn consume<S: Sender<RecordBatch>>(
+    fn consume(
         &mut self,
         batch: RecordBatch,
-        sender: &mut S,
+        sender: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<()> {
         let build_rows = unsafe { &*self.table.build_rows.get() };
         let Some(build_rows) = build_rows else {
@@ -261,7 +261,7 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, const SE
         Ok(())
     }
 
-    fn finish<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> unary::Result<bool> {
+    fn finish(&mut self, sender: &mut dyn Sender<RecordBatch>) -> unary::Result<bool> {
         if !self.probing_done {
             self.probing_done = true;
             if let Some(sides) = &mut self.sides
@@ -308,10 +308,10 @@ struct OutputSides {
 
 impl OutputSides {
     /// Emit one combined batch from the two sides' accumulated rows.
-    fn emit<S: Sender<RecordBatch>>(
+    fn emit(
         &mut self,
         allocator: &mut SlabAllocator,
-        sender: &mut S,
+        sender: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<()> {
         let probe_part = self.probe.take_batch(allocator)?;
         let build_part = self.build.take_batch(allocator)?;
@@ -333,10 +333,10 @@ impl OutputSides {
 
     /// Emit one batch of build rows that matched nothing: the accumulated build
     /// columns, and an all-null column of the right shape for each probe column.
-    fn emit_unmatched_build_rows<S: Sender<RecordBatch>>(
+    fn emit_unmatched_build_rows(
         &mut self,
         allocator: &mut SlabAllocator,
-        sender: &mut S,
+        sender: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<()> {
         let build_part = self.build.take_batch(allocator)?;
         let rows = build_part.num_rows();
@@ -369,7 +369,6 @@ struct ProbeMatchCollector<
     'a,
     'b,
     T: ArrowPrimitiveType<Native: Hash + Eq>,
-    S: Sender<RecordBatch>,
     const BUILD_OUTER: bool,
     const SEMI: bool,
 > {
@@ -389,18 +388,12 @@ struct ProbeMatchCollector<
     build_indices: &'a mut [u32],
     matched: usize,
 
-    sender: &'a mut S,
+    sender: &'a mut dyn Sender<RecordBatch>,
     allocator: &'a mut SlabAllocator,
 }
 
-impl<
-    'a,
-    'b,
-    T: ArrowPrimitiveType<Native: Hash + Eq>,
-    S: Sender<RecordBatch>,
-    const BUILD_OUTER: bool,
-    const SEMI: bool,
-> ProbeMatchCollector<'a, 'b, T, S, BUILD_OUTER, SEMI>
+impl<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, const SEMI: bool>
+    ProbeMatchCollector<'a, 'b, T, BUILD_OUTER, SEMI>
 {
     /// Append the collected pairs to the output sides, emitting if a full
     /// batch accumulated.
@@ -517,7 +510,6 @@ struct ProbeArray<
     'a,
     'b,
     T: ArrowPrimitiveType<Native: Hash + Eq>,
-    S: Sender<RecordBatch>,
     const BUILD_OUTER: bool,
     const SEMI: bool,
 > {
@@ -535,17 +527,11 @@ struct ProbeArray<
     matched_size: [usize; 2],
     matched_idx: usize,
 
-    out: ProbeMatchCollector<'a, 'b, T, S, BUILD_OUTER, SEMI>,
+    out: ProbeMatchCollector<'a, 'b, T, BUILD_OUTER, SEMI>,
 }
 
-impl<
-    'a,
-    'b,
-    T: ArrowPrimitiveType<Native: Hash + Eq>,
-    S: Sender<RecordBatch>,
-    const BUILD_OUTER: bool,
-    const SEMI: bool,
-> ProbeArray<'a, 'b, T, S, BUILD_OUTER, SEMI>
+impl<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, const SEMI: bool>
+    ProbeArray<'a, 'b, T, BUILD_OUTER, SEMI>
 {
     #[inline(always)]
     pub fn generate_matched_slots<const HASH: bool>(&mut self, length: usize) {

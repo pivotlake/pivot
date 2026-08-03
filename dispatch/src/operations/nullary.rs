@@ -33,7 +33,7 @@ pub trait NullaryFactory<O>: Send + 'static {
 /// A source-like transform that receives no input and may emit items of type `O`.
 pub trait Nullary<O> {
     /// Run one unit of work, possibly sending output.
-    fn run<S: Sender<O>>(&mut self, sender: &mut S) -> Result<WorkStatus>;
+    fn run(&mut self, sender: &mut dyn Sender<O>) -> Result<WorkStatus>;
 
     /// Return any pending filesystem requests.
     fn next_fs_requests(&mut self) -> Result<Vec<FsRequest>> {
@@ -48,18 +48,18 @@ pub trait Nullary<O> {
 
     /// Handle a completed filesystem read; its bytes are already committed to
     /// the cache slot.
-    fn process_fs_read_response<S: Sender<O>>(
+    fn process_fs_read_response(
         &mut self,
-        _sender: &mut S,
+        _sender: &mut dyn Sender<O>,
         _request: FsReadRequest,
     ) -> Result<()> {
         unreachable!()
     }
 
     /// Handle a completed filesystem write.
-    fn process_fs_write_response<S: Sender<O>>(
+    fn process_fs_write_response(
         &mut self,
-        _sender: &mut S,
+        _sender: &mut dyn Sender<O>,
         _request: FsWriteRequest,
     ) -> Result<()> {
         unreachable!()
@@ -67,38 +67,38 @@ pub trait Nullary<O> {
 
     /// Handle a completed HTTP GET; its bytes are already committed to the
     /// cache slot.
-    fn process_http_get_response<S: Sender<O>>(
+    fn process_http_get_response(
         &mut self,
-        _sender: &mut S,
+        _sender: &mut dyn Sender<O>,
         _request: HttpGetRequest,
     ) -> Result<()> {
         unreachable!()
     }
 
     /// Handle a completed HTTP upload.
-    fn process_http_upload_response<S: Sender<O>>(
+    fn process_http_upload_response(
         &mut self,
-        _sender: &mut S,
+        _sender: &mut dyn Sender<O>,
         _request: HttpUploadRequest,
     ) -> Result<()> {
         unreachable!()
     }
 
     /// Try to finish. Called until it returns `true`.
-    fn finish<S: Sender<O>>(&mut self, _sender: &mut S) -> Result<bool> {
+    fn finish(&mut self, _sender: &mut dyn Sender<O>) -> Result<bool> {
         Ok(true)
     }
 }
 
 /// Wraps a [`Nullary`] and its output sender as a concrete [`Operator`].
-pub struct NullaryOperator<O, N: Nullary<O>, S: Sender<O>> {
+pub struct NullaryOperator<O, N: Nullary<O>> {
     nullary: N,
-    sender: S,
+    sender: Box<dyn Sender<O>>,
     _phantom: PhantomData<O>,
 }
 
-impl<O, N: Nullary<O>, S: Sender<O>> NullaryOperator<O, N, S> {
-    pub fn new(nullary: N, sender: S) -> Self {
+impl<O, N: Nullary<O>> NullaryOperator<O, N> {
+    pub fn new(nullary: N, sender: Box<dyn Sender<O>>) -> Self {
         Self {
             nullary,
             sender,
@@ -107,9 +107,9 @@ impl<O, N: Nullary<O>, S: Sender<O>> NullaryOperator<O, N, S> {
     }
 }
 
-impl<O, N: Nullary<O>, S: Sender<O>> Operator for NullaryOperator<O, N, S> {
+impl<O, N: Nullary<O>> Operator for NullaryOperator<O, N> {
     fn run_cpu_work(&mut self) -> super::Result<WorkStatus> {
-        Ok(self.nullary.run(&mut self.sender)?)
+        Ok(self.nullary.run(&mut *self.sender)?)
     }
 
     fn next_fs_requests(&mut self) -> super::Result<Vec<FsRequest>> {
@@ -123,32 +123,32 @@ impl<O, N: Nullary<O>, S: Sender<O>> Operator for NullaryOperator<O, N, S> {
     fn process_fs_read_response(&mut self, request: FsReadRequest) -> super::Result<()> {
         Ok(self
             .nullary
-            .process_fs_read_response(&mut self.sender, request)?)
+            .process_fs_read_response(&mut *self.sender, request)?)
     }
 
     fn process_fs_write_response(&mut self, request: FsWriteRequest) -> super::Result<()> {
         Ok(self
             .nullary
-            .process_fs_write_response(&mut self.sender, request)?)
+            .process_fs_write_response(&mut *self.sender, request)?)
     }
 
     fn process_http_get_response(&mut self, request: HttpGetRequest) -> super::Result<()> {
         Ok(self
             .nullary
-            .process_http_get_response(&mut self.sender, request)?)
+            .process_http_get_response(&mut *self.sender, request)?)
     }
 
     fn process_http_upload_response(&mut self, request: HttpUploadRequest) -> super::Result<()> {
         Ok(self
             .nullary
-            .process_http_upload_response(&mut self.sender, request)?)
+            .process_http_upload_response(&mut *self.sender, request)?)
     }
 
     fn try_finish(&mut self) -> super::Result<FinishStatus> {
         // A source has no outputter to drain: it's either done or still
         // producing (driven by `run_cpu_work`, which sets `did_work`), so it
         // never needs the `Working` re-drive.
-        Ok(if self.nullary.finish(&mut self.sender)? {
+        Ok(if self.nullary.finish(&mut *self.sender)? {
             FinishStatus::Done
         } else {
             FinishStatus::Pending
@@ -172,7 +172,7 @@ impl<O, NF: NullaryFactory<O>> NullaryOperatorFactory<O, NF> {
 }
 
 impl<O: 'static, NF: NullaryFactory<O>> OperatorFactory<O> for NullaryOperatorFactory<O, NF> {
-    fn build<S: Sender<O> + 'static>(self: Box<Self>, sender: S) -> OperatorGraphBuilder {
+    fn build(self: Box<Self>, sender: Box<dyn Sender<O>>) -> OperatorGraphBuilder {
         OperatorGraphBuilder::root(Box::new(NullaryOperator::new(
             self.nullary_factory.build_nullary(),
             sender,
@@ -196,7 +196,7 @@ impl<O: 'static> NullaryFactory<O> for NoOpNullaryFactory {
 pub struct NoOpNullary;
 
 impl<O> Nullary<O> for NoOpNullary {
-    fn run<S: Sender<O>>(&mut self, _sender: &mut S) -> Result<WorkStatus> {
+    fn run(&mut self, _sender: &mut dyn Sender<O>) -> Result<WorkStatus> {
         Ok(WorkStatus::Pending)
     }
 }
@@ -248,7 +248,7 @@ pub struct OneShotNullary<O, F: FnOnce() -> O> {
 }
 
 impl<O, F: FnOnce() -> O + Send> Nullary<O> for OneShotNullary<O, F> {
-    fn run<S: Sender<O>>(&mut self, sender: &mut S) -> Result<WorkStatus> {
+    fn run(&mut self, sender: &mut dyn Sender<O>) -> Result<WorkStatus> {
         match self.func.take() {
             Some(f) => {
                 sender.send(f())?;
@@ -258,7 +258,7 @@ impl<O, F: FnOnce() -> O + Send> Nullary<O> for OneShotNullary<O, F> {
         }
     }
 
-    fn finish<S: Sender<O>>(&mut self, _sender: &mut S) -> Result<bool> {
+    fn finish(&mut self, _sender: &mut dyn Sender<O>) -> Result<bool> {
         // We're done once `run` has consumed the closure.
         Ok(self.func.is_none())
     }
@@ -268,7 +268,7 @@ impl<O, F: FnOnce() -> O + Send> Nullary<O> for OneShotNullary<O, F> {
 mod tests {
     use super::*;
     use crate::operations::Operator;
-    use crate::operations::unary::test_utils::CollectSender;
+    use crate::operations::unary::test_utils::SharedCollectSender;
 
     #[derive(Default)]
     struct EmitOne {
@@ -276,7 +276,7 @@ mod tests {
     }
 
     impl Nullary<i32> for EmitOne {
-        fn run<S: Sender<i32>>(&mut self, sender: &mut S) -> Result<WorkStatus> {
+        fn run(&mut self, sender: &mut dyn Sender<i32>) -> Result<WorkStatus> {
             if self.emitted {
                 return Ok(WorkStatus::Pending);
             }
@@ -285,17 +285,21 @@ mod tests {
             Ok(WorkStatus::Ran)
         }
 
-        fn finish<S: Sender<i32>>(&mut self, _sender: &mut S) -> Result<bool> {
+        fn finish(&mut self, _sender: &mut dyn Sender<i32>) -> Result<bool> {
             Ok(self.emitted)
         }
     }
 
     #[test]
     fn nullary_operator_emits_once() {
-        let mut operator = NullaryOperator::new(EmitOne::default(), CollectSender::<i32>::new());
+        let items = std::rc::Rc::new(std::cell::RefCell::new(Vec::<i32>::new()));
+        let mut operator = NullaryOperator::new(
+            EmitOne::default(),
+            Box::new(SharedCollectSender(items.clone())),
+        );
 
         assert!(matches!(operator.run_cpu_work().unwrap(), WorkStatus::Ran));
-        assert_eq!(operator.sender.items, vec![7]);
+        assert_eq!(*items.borrow(), vec![7]);
         assert!(matches!(
             operator.run_cpu_work().unwrap(),
             WorkStatus::Pending
@@ -305,7 +309,9 @@ mod tests {
 
     #[test]
     fn no_op_nullary_finishes_without_emitting() {
-        let mut operator = NullaryOperator::new(NoOpNullary, CollectSender::<i32>::new());
+        let items = std::rc::Rc::new(std::cell::RefCell::new(Vec::<i32>::new()));
+        let mut operator =
+            NullaryOperator::new(NoOpNullary, Box::new(SharedCollectSender(items.clone())));
 
         assert!(matches!(
             operator.run_cpu_work().unwrap(),
@@ -313,6 +319,6 @@ mod tests {
         ));
 
         assert_eq!(operator.try_finish().unwrap(), FinishStatus::Done);
-        assert!(operator.sender.items.is_empty());
+        assert!(items.borrow().is_empty());
     }
 }

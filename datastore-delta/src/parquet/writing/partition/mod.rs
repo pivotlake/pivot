@@ -210,10 +210,10 @@ impl Partitioner {
 impl Consumer<RecordBatch, ColumnChunkJob> for Partitioner {
     type Outputter = TailOutputter;
 
-    fn consume<S: Sender<ColumnChunkJob>>(
+    fn consume(
         &mut self,
         batch: RecordBatch,
-        sender: &mut S,
+        sender: &mut dyn Sender<ColumnChunkJob>,
     ) -> UnaryResult<()> {
         if batch.num_rows() == 0 {
             return Ok(());
@@ -259,7 +259,7 @@ pub(super) struct TailOutputter {
 }
 
 impl Outputter<ColumnChunkJob> for TailOutputter {
-    fn output<S: Sender<ColumnChunkJob>>(&mut self, sender: &mut S) -> UnaryResult<bool> {
+    fn output(&mut self, sender: &mut dyn Sender<ColumnChunkJob>) -> UnaryResult<bool> {
         match self.rx.try_recv() {
             Ok((key, batches)) => {
                 self.batches_by_partition
@@ -294,11 +294,11 @@ struct RowGroupBuilder {
 }
 
 impl RowGroupBuilder {
-    fn emit_column_chunks<S: Sender<ColumnChunkJob>>(
+    fn emit_column_chunks(
         &self,
         partition: PartitionKey,
         batches: Vec<RecordBatch>,
-        sender: &mut S,
+        sender: &mut dyn Sender<ColumnChunkJob>,
     ) -> UnaryResult<()> {
         let schema = batches[0].schema();
         let batch = concat_batches(&schema, &batches)?;

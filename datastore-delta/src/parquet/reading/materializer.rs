@@ -81,10 +81,10 @@ impl Materializer {
 impl Unary<RecordBatch, RowGroupRequest> for Materializer {
     /// Extracts row group IDs and row indices from the batch metadata columns,
     /// accumulating them into `pending_row_groups` keyed by row group.
-    fn consume<S: Sender<RowGroupRequest>>(
+    fn consume(
         &mut self,
         batch: RecordBatch,
-        _sender: &mut S,
+        _sender: &mut dyn Sender<RowGroupRequest>,
     ) -> dispatch::UnaryResult<()> {
         // The row-group column is a `RunArray` (consecutive same-group rows = one
         // run). The batch may be a logical slice (e.g. a `LIMIT` above the scan),
@@ -121,10 +121,7 @@ impl Unary<RecordBatch, RowGroupRequest> for Materializer {
 
     /// Drains accumulated row groups and sends one [`RowGroupRequest`] per group.
     /// Indices are sorted so downstream IO can read them sequentially.
-    fn finish<S: Sender<RowGroupRequest>>(
-        &mut self,
-        sender: &mut S,
-    ) -> dispatch::UnaryResult<bool> {
+    fn finish(&mut self, sender: &mut dyn Sender<RowGroupRequest>) -> dispatch::UnaryResult<bool> {
         let pending_row_groups = mem::take(&mut self.pending_row_groups);
         for (group, mut indices) in pending_row_groups {
             indices.sort_unstable();
