@@ -16,8 +16,8 @@ use dispatch::{
 /// An inner join keyed on column 0 of both sides.
 fn inner_join(output_columns: JoinOutputColumns) -> JoinSpec {
     JoinSpec {
-        build_key_column: 0,
-        probe_key_column: 0,
+        build_key_columns: vec![0],
+        probe_key_columns: vec![0],
         output_columns,
         kind: JoinKind::Inner,
     }
@@ -54,7 +54,7 @@ fn join_matching_keys() {
     let results = probe
         .join(
             build,
-            &DataType::Int64,
+            &[DataType::Int64],
             inner_join(JoinOutputColumns::keep_all(1, 1)),
         )
         .collect()
@@ -81,7 +81,7 @@ fn join_on_int32_keys() {
     let results = probe
         .join(
             build,
-            &DataType::Int32,
+            &[DataType::Int32],
             inner_join(JoinOutputColumns::keep_all(1, 1)),
         )
         .collect()
@@ -110,7 +110,7 @@ fn join_no_matches() {
     let results = probe
         .join(
             build,
-            &DataType::Int64,
+            &[DataType::Int64],
             inner_join(JoinOutputColumns::keep_all(1, 1)),
         )
         .collect()
@@ -128,7 +128,7 @@ fn join_duplicate_build_keys() {
     let results = probe
         .join(
             build,
-            &DataType::Int64,
+            &[DataType::Int64],
             inner_join(JoinOutputColumns::keep_all(1, 1)),
         )
         .collect()
@@ -148,7 +148,7 @@ fn join_all_keys_match() {
     let results = probe
         .join(
             build,
-            &DataType::Int64,
+            &[DataType::Int64],
             inner_join(JoinOutputColumns::keep_all(1, 1)),
         )
         .collect()
@@ -171,7 +171,7 @@ fn join_large_tables() {
     let results = probe
         .join(
             build,
-            &DataType::Int64,
+            &[DataType::Int64],
             inner_join(JoinOutputColumns::keep_all(1, 1)),
         )
         .collect()
@@ -191,7 +191,7 @@ fn join_then_count() {
     let results = probe
         .join(
             build,
-            &DataType::Int64,
+            &[DataType::Int64],
             inner_join(JoinOutputColumns::keep_all(1, 1)),
         )
         .aggregate::<i64>(vec![AggregationSlot::new(
@@ -226,7 +226,7 @@ fn join_keeps_only_listed_columns() {
     let results = probe
         .join(
             build,
-            &DataType::Int64,
+            &[DataType::Int64],
             inner_join(JoinOutputColumns {
                 probe: vec![1],
                 build: vec![1],
@@ -248,8 +248,8 @@ fn join_keeps_only_listed_columns() {
 /// contributes one nullable `Int64` column to the output.
 fn build_outer_join(output_columns: JoinOutputColumns) -> JoinSpec {
     JoinSpec {
-        build_key_column: 0,
-        probe_key_column: 0,
+        build_key_columns: vec![0],
+        probe_key_columns: vec![0],
         output_columns,
         kind: JoinKind::BuildOuter {
             probe_fields: vec![Field::new("id", DataType::Int64, true)],
@@ -266,7 +266,7 @@ fn build_outer_join_emits_unmatched_build_rows() {
     let results = probe
         .join(
             build,
-            &DataType::Int64,
+            &[DataType::Int64],
             build_outer_join(JoinOutputColumns::keep_all(1, 1)),
         )
         .collect()
@@ -305,7 +305,7 @@ fn every_build_row_reaches_a_build_outer_join_output() {
     let results = probe
         .join(
             build,
-            &DataType::Int64,
+            &[DataType::Int64],
             build_outer_join(JoinOutputColumns::keep_all(1, 1)),
         )
         .collect()
@@ -320,8 +320,8 @@ fn every_build_row_reaches_a_build_outer_join_output() {
 /// probe columns and, as every semi join must, no build column.
 fn probe_semi_join(probe_columns: Vec<usize>) -> JoinSpec {
     JoinSpec {
-        build_key_column: 0,
-        probe_key_column: 0,
+        build_key_columns: vec![0],
+        probe_key_columns: vec![0],
         output_columns: JoinOutputColumns {
             probe: probe_columns,
             build: Vec::new(),
@@ -337,7 +337,7 @@ fn probe_semi_join_emits_a_matched_probe_row_once() {
     let probe = values_input(&d, vec![int64_batch("id", &[10, 20, 99])]).record_batches();
 
     let results = probe
-        .join(build, &DataType::Int64, probe_semi_join(vec![0]))
+        .join(build, &[DataType::Int64], probe_semi_join(vec![0]))
         .collect()
         .unwrap();
 
@@ -356,7 +356,7 @@ fn probe_semi_join_keeps_every_copy_of_a_repeated_probe_row() {
     let probe = values_input(&d, vec![int64_batch("id", &[10, 10, 10])]).record_batches();
 
     let results = probe
-        .join(build, &DataType::Int64, probe_semi_join(vec![0]))
+        .join(build, &[DataType::Int64], probe_semi_join(vec![0]))
         .collect()
         .unwrap();
 
@@ -376,7 +376,7 @@ fn probe_semi_join_carries_the_probe_columns_it_lists() {
     .record_batches();
 
     let results = probe
-        .join(build, &DataType::Int64, probe_semi_join(vec![1]))
+        .join(build, &[DataType::Int64], probe_semi_join(vec![1]))
         .collect()
         .unwrap();
 
@@ -390,7 +390,7 @@ fn probe_semi_join_over_an_empty_build_side_emits_nothing() {
     let probe = values_input(&d, vec![int64_batch("id", &[10, 20])]).record_batches();
 
     let results = probe
-        .join(build, &DataType::Int64, probe_semi_join(vec![0]))
+        .join(build, &[DataType::Int64], probe_semi_join(vec![0]))
         .collect()
         .unwrap();
 
@@ -411,7 +411,7 @@ fn probe_semi_join_never_matches_a_null_key() {
     let probe = values_input(&d, vec![nullable(vec![None, Some(10), None])]).record_batches();
 
     let results = probe
-        .join(build, &DataType::Int64, probe_semi_join(vec![0]))
+        .join(build, &[DataType::Int64], probe_semi_join(vec![0]))
         .collect()
         .unwrap();
 
@@ -429,7 +429,7 @@ fn a_semi_join_spanning_batches_emits_each_matched_probe_row_once() {
     let probe = values_input(&d, vec![int64_batch("id", &probe_ids)]).record_batches();
 
     let results = probe
-        .join(build, &DataType::Int64, probe_semi_join(vec![0]))
+        .join(build, &[DataType::Int64], probe_semi_join(vec![0]))
         .collect()
         .unwrap();
 

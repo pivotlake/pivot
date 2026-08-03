@@ -27,8 +27,8 @@ fn int64_batch(values: &[i64]) -> RecordBatch {
 
 fn inner_join_on_id() -> JoinSpec {
     JoinSpec {
-        build_key_column: 0,
-        probe_key_column: 0,
+        build_key_columns: vec![0],
+        probe_key_columns: vec![0],
         output_columns: JoinOutputColumns::keep_all(1, 1),
         kind: JoinKind::Inner,
     }
@@ -47,7 +47,7 @@ fn self_join_over_cte(
     let build = RecordBatchOperatorSpec::cte_scan(dispatcher, CTE);
 
     probe
-        .join(build, &DataType::Int64, inner_join_on_id())
+        .join(build, &[DataType::Int64], inner_join_on_id())
         .with_cte(definition, CTE, 2)
         .collect()
         .unwrap()
@@ -94,7 +94,7 @@ fn a_site_waits_out_a_lull_in_the_definition() {
     let results = RecordBatchOperatorSpec::cte_scan(&d, CTE)
         .join(
             RecordBatchOperatorSpec::cte_scan(&d, CTE),
-            &DataType::Int64,
+            &[DataType::Int64],
             inner_join_on_id(),
         )
         .with_cte(definition, CTE, 2)
@@ -137,7 +137,7 @@ fn a_limit_over_one_site_spares_the_cte_its_other_readers_need() {
     counted
         .join(
             RecordBatchOperatorSpec::cte_scan(&d, CTE).limit(2, 0),
-            &DataType::Int64,
+            &[DataType::Int64],
             inner_join_on_id(),
         )
         .with_cte(definition, CTE, 2)

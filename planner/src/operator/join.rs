@@ -41,17 +41,19 @@ pub enum JoinKind {
     ProbeSemi,
 }
 
-/// Hash equi-join on a single key column per side.
+/// Hash equi-join on one or more key columns per side, one per equality
+/// condition.
 #[derive(Debug)]
 pub struct Join {
-    /// The key's column index in the probe (first) input's output.
-    pub probe_key: usize,
-    /// The key's column index in the build (second) input's output.
-    pub build_key: usize,
-    /// The type both key columns arrive as (DuckDB casts mismatched sides to
-    /// a common type before the join); picks the dispatch join's key
-    /// instantiation.
-    pub key_type: Type,
+    /// The keys' column indices in the probe (first) input's output, aligned
+    /// condition by condition with `build_keys`.
+    pub probe_keys: Vec<usize>,
+    /// The keys' column indices in the build (second) input's output.
+    pub build_keys: Vec<usize>,
+    /// The type each condition's key columns arrive as (DuckDB casts a
+    /// condition's mismatched sides to a common type before the join);
+    /// together they pick the dispatch join's key instantiation.
+    pub key_types: Vec<Type>,
     /// The probe input columns the join emits, in output order.
     pub probe_output: Vec<usize>,
     /// The build input columns the join emits after the probe columns. Always
@@ -72,8 +74,8 @@ impl fmt::Display for Join {
         };
         write!(
             f,
-            "{kind}(probe_key: {}, build_key: {}, probe_output: {:?}, build_output: {:?})",
-            self.probe_key, self.build_key, self.probe_output, self.build_output
+            "{kind}(probe_keys: {:?}, build_keys: {:?}, probe_output: {:?}, build_output: {:?})",
+            self.probe_keys, self.build_keys, self.probe_output, self.build_output
         )
     }
 }
@@ -101,14 +103,15 @@ impl Join {
             JoinKind::ProbeSemi => DispatchJoinKind::ProbeSemi,
         };
         let spec = JoinSpec {
-            build_key_column: self.build_key,
-            probe_key_column: self.probe_key,
+            build_key_columns: self.build_keys.clone(),
+            probe_key_columns: self.probe_keys.clone(),
             output_columns: JoinOutputColumns {
                 probe: self.probe_output.clone(),
                 build: self.build_output.clone(),
             },
             kind,
         };
-        Ok(probe.join(build, &physical_arrow_type(&self.key_type), spec))
+        let key_types: Vec<_> = self.key_types.iter().map(physical_arrow_type).collect();
+        Ok(probe.join(build, &key_types, spec))
     }
 }

@@ -344,27 +344,38 @@ fn build_join(
     join: ComparisonJoinView<'_>,
     inputs: Vec<PlanNode>,
 ) -> Result<PlanNode, OperatorError> {
-    let mut conditions = join.conditions()?;
-    if conditions.len() != 1 {
+    let mut probe_keys = Vec::new();
+    let mut build_keys = Vec::new();
+    let mut key_types = Vec::new();
+    for condition in join.conditions()? {
+        if condition.comparison != ExpressionType::COMPARE_EQUAL {
+            return Err(OperatorError::Unsupported(format!(
+                "Unsupported join comparison type: {:?}",
+                condition.comparison
+            )));
+        }
+        let (probe_key, probe_key_type) = join_key_ref(Expression::from_handle(condition.left)?)?;
+        let (build_key, build_key_type) = join_key_ref(Expression::from_handle(condition.right)?)?;
+        if probe_key_type != build_key_type {
+            return Err(OperatorError::Unsupported(format!(
+                "join key types differ: {probe_key_type:?} vs {build_key_type:?} \
+                 (DuckDB casts both sides of a condition to a common type, so this plan \
+                 shape is unexpected)"
+            )));
+        }
+        probe_keys.push(probe_key);
+        build_keys.push(build_key);
+        key_types.push(probe_key_type);
+    }
+    if key_types.is_empty() {
         return Err(OperatorError::Unsupported(
-            "joins must have exactly one equality condition".to_string(),
+            "joins must have at least one equality condition".to_string(),
         ));
     }
-    let condition = conditions.remove(0);
-    if condition.comparison != ExpressionType::COMPARE_EQUAL {
-        return Err(OperatorError::Unsupported(format!(
-            "Unsupported join comparison type: {:?}",
-            condition.comparison
-        )));
-    }
-
-    let (probe_key, probe_key_type) = join_key_ref(Expression::from_handle(condition.left)?)?;
-    let (build_key, build_key_type) = join_key_ref(Expression::from_handle(condition.right)?)?;
-    if probe_key_type != build_key_type {
-        return Err(OperatorError::Unsupported(format!(
-            "join key types differ: {probe_key_type:?} vs {build_key_type:?} \
-             (DuckDB casts both sides to a common type, so this plan shape is unexpected)"
-        )));
+    if key_types.len() > 1 {
+        return Err(OperatorError::Unsupported(
+            "joins on more than one equality condition are not yet supported".to_string(),
+        ));
     }
 
     let probe_types = inputs[0].output_types()?;
@@ -411,9 +422,9 @@ fn build_join(
         name: op.name()?,
         inputs,
         operator: Operator::Join(Join {
-            probe_key,
-            build_key,
-            key_type: probe_key_type,
+            probe_keys,
+            build_keys,
+            key_types,
             probe_output,
             build_output,
             kind,
