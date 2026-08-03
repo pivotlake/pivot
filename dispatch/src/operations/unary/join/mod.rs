@@ -28,7 +28,7 @@ mod directory;
 mod factory;
 pub use factory::JoinRecordBatchOperatorFactory;
 mod keys;
-pub use keys::{JoinKey, SingleColumnKey};
+pub use keys::{JoinKey, PackedKey, SingleColumnKey};
 mod probe;
 
 use std::cell::UnsafeCell;
@@ -159,7 +159,8 @@ pub(crate) struct JoinTable<K> {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Array, Int64Array, RecordBatch, StringViewArray};
+    use arrow_array::types::{Int32Type, Int64Type};
+    use arrow_array::{Array, Int32Array, Int64Array, RecordBatch, StringViewArray};
     use arrow_schema::{DataType, Field, Schema};
 
     use crate::memory::init_test_free_pool;
@@ -169,7 +170,7 @@ mod tests {
 
     use super::build::JoinBuildConsumer;
     use super::factory;
-    use super::keys::SingleColumnKey;
+    use super::keys::{JoinKey, PackedKey, SingleColumnKey};
 
     fn int64_batch(keys: &[i64]) -> RecordBatch {
         RecordBatch::try_new(
@@ -195,9 +196,9 @@ mod tests {
 
     type Int64Key = SingleColumnKey<arrow_array::types::Int64Type>;
 
-    fn extract_consumer<const BUILD_OUTER: bool>(
-        breaker: PipelineBreaker<RecordBatch, (), JoinBuildConsumer<Int64Key, BUILD_OUTER>>,
-    ) -> JoinBuildConsumer<Int64Key, BUILD_OUTER> {
+    fn extract_consumer<K: JoinKey, const BUILD_OUTER: bool>(
+        breaker: PipelineBreaker<RecordBatch, (), JoinBuildConsumer<K, BUILD_OUTER>>,
+    ) -> JoinBuildConsumer<K, BUILD_OUTER> {
         match breaker {
             PipelineBreaker::Consuming(c) => c,
             _ => unreachable!(),
@@ -218,7 +219,7 @@ mod tests {
         build_worker_batches: Vec<Vec<RecordBatch>>,
         probe_batches: Vec<RecordBatch>,
     ) -> JoinResult {
-        run_join::<false>(build_worker_batches, probe_batches, None)
+        run_join::<Int64Key, false>(build_worker_batches, probe_batches, None, vec![0])
     }
 
     /// Build-side outer: every build row reaches the output, with null probe
@@ -228,26 +229,33 @@ mod tests {
         probe_batches: Vec<RecordBatch>,
         probe_fields: Vec<Field>,
     ) -> JoinResult {
-        run_join::<true>(build_worker_batches, probe_batches, Some(probe_fields))
+        run_join::<Int64Key, true>(
+            build_worker_batches,
+            probe_batches,
+            Some(probe_fields),
+            vec![0],
+        )
     }
 
     /// Run one join to completion: one build worker per entry of
     /// `build_worker_batches`, and as many probe workers, all of whose `finish`
     /// is driven (the unmatched pass only starts once every one has arrived).
     /// The probe batches all go to the first, so the rest exercise a worker
-    /// reaching that pass with no batch of its own.
-    fn run_join<const BUILD_OUTER: bool>(
+    /// reaching that pass with no batch of its own. Both sides key on
+    /// `key_columns`.
+    fn run_join<K: JoinKey, const BUILD_OUTER: bool>(
         build_worker_batches: Vec<Vec<RecordBatch>>,
         probe_batches: Vec<RecordBatch>,
         probe_fields: Option<Vec<Field>>,
+        key_columns: Vec<usize>,
     ) -> JoinResult {
         init_test_free_pool(16);
         let workers = build_worker_batches.len();
         let probe_column_count = probe_batches[0].num_columns();
         let build_column_count = build_worker_batches[0][0].num_columns();
         let spec = super::JoinSpec {
-            build_key_columns: vec![0],
-            probe_key_columns: vec![0],
+            build_key_columns: key_columns.clone(),
+            probe_key_columns: key_columns,
             output_columns: super::JoinOutputColumns::keep_all(
                 probe_column_count,
                 build_column_count,
@@ -258,7 +266,7 @@ mod tests {
             },
         };
         let (builds, probes, _) =
-            factory::create_for_workers::<Int64Key, BUILD_OUTER, false>(spec, workers);
+            factory::create_for_workers::<K, BUILD_OUTER, false>(spec, workers);
 
         let mut consumers: Vec<_> = builds
             .into_iter()
@@ -758,5 +766,111 @@ mod tests {
         );
 
         assert_eq!(r.rows(), build_keys.len());
+    }
+
+    fn pair_key_batch(first_keys: &[i64], second_keys: &[i32]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k0", DataType::Int64, false),
+                Field::new("k1", DataType::Int32, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(first_keys.to_vec())),
+                Arc::new(Int32Array::from(second_keys.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Every output row's probe-side key pair.
+    fn collect_probe_key_pairs(results: &[RecordBatch]) -> Vec<(i64, i32)> {
+        let mut pairs: Vec<(i64, i32)> = results
+            .iter()
+            .flat_map(|batch| {
+                let first = collect_i64_column(std::slice::from_ref(batch), 0);
+                let second = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec();
+                first.into_iter().zip(second)
+            })
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    #[test]
+    fn a_packed_pair_matches_only_when_both_columns_match() {
+        let build = pair_key_batch(&[1, 1, 2], &[10, 20, 30]);
+        let probe = pair_key_batch(&[1, 2, 7], &[20, 30, 30]);
+
+        let r = run_join::<PackedKey<(Int64Type, Int32Type)>, false>(
+            vec![vec![build]],
+            vec![probe],
+            None,
+            vec![0, 1],
+        );
+
+        assert_eq!(collect_probe_key_pairs(&r.batches), vec![(1, 20), (2, 30)]);
+    }
+
+    #[test]
+    fn a_packed_triple_needs_all_three_columns_equal() {
+        let triple_batch = |a: &[i64], b: &[i64], c: &[i32]| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("k0", DataType::Int64, false),
+                    Field::new("k1", DataType::Int64, false),
+                    Field::new("k2", DataType::Int32, false),
+                ])),
+                vec![
+                    Arc::new(Int64Array::from(a.to_vec())),
+                    Arc::new(Int64Array::from(b.to_vec())),
+                    Arc::new(Int32Array::from(c.to_vec())),
+                ],
+            )
+            .unwrap()
+        };
+        let build = triple_batch(&[1, 1, 2], &[10, 10, 20], &[100, 101, 200]);
+        let probe = triple_batch(&[1, 1, 3], &[10, 10, 30], &[101, 999, 300]);
+
+        let r = run_join::<PackedKey<(Int64Type, Int64Type, Int32Type)>, false>(
+            vec![vec![build]],
+            vec![probe],
+            None,
+            vec![0, 1, 2],
+        );
+
+        assert_eq!(r.rows(), 1);
+        assert_eq!(collect_i64_column(&r.batches, 0), vec![1]);
+    }
+
+    #[test]
+    fn a_packed_pair_with_a_null_in_either_key_column_never_matches() {
+        let nullable_pair_batch = |a: Vec<Option<i64>>, b: Vec<Option<i32>>| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("k0", DataType::Int64, true),
+                    Field::new("k1", DataType::Int32, true),
+                ])),
+                vec![Arc::new(Int64Array::from(a)), Arc::new(Int32Array::from(b))],
+            )
+            .unwrap()
+        };
+        let build = nullable_pair_batch(vec![Some(1), Some(1)], vec![Some(10), None]);
+        let probe =
+            nullable_pair_batch(vec![Some(1), Some(1), None], vec![Some(10), None, Some(10)]);
+
+        let r = run_join::<PackedKey<(Int64Type, Int32Type)>, false>(
+            vec![vec![build]],
+            vec![probe],
+            None,
+            vec![0, 1],
+        );
+
+        assert_eq!(r.rows(), 1);
     }
 }

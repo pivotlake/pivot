@@ -7,7 +7,7 @@
 //! [`AggregationValue`](crate::operations::unary::group::values::AggregationValue)
 //! (typically [`Dynamic`](crate::operations::unary::group::values::Dynamic)).
 
-use crate::arrays::{ArrayBuilder, PrimitiveBuilder};
+use crate::arrays::{ArrayBuilder, IntBits, PrimitiveBuilder};
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::keys::{InlineKey, KeyColumnBuilder, KeyExtractor};
@@ -18,25 +18,6 @@ use arrow_array::{ArrayRef, PrimitiveArray, RecordBatch};
 use arrow_schema::Field;
 use std::marker::PhantomData;
 use std::sync::Arc;
-
-/// Reversible conversion between an integer's bit pattern and `u64`, so a key
-/// pair packs losslessly into a `u128` and unpacks back to the original value.
-pub trait IntBits: Copy {
-    fn to_u64(self) -> u64;
-    fn from_u64(bits: u64) -> Self;
-}
-
-macro_rules! impl_int_bits {
-    ($($t:ty => $u:ty),*) => {
-        $(impl IntBits for $t {
-            #[inline(always)]
-            fn to_u64(self) -> u64 { self as $u as u64 }
-            #[inline(always)]
-            fn from_u64(bits: u64) -> Self { bits as $u as $t }
-        })*
-    }
-}
-impl_int_bits!(i8 => u8, i16 => u16, i32 => u32, i64 => u64, u8 => u8, u16 => u16, u32 => u32, u64 => u64);
 
 /// Pack a key pair into a `u128`: first key's bits in the high 64, second's low.
 #[inline(always)]

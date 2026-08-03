@@ -15,7 +15,7 @@ fn in_subquery_semijoin_is_a_join_not_late_materialization(mut testing_planner: 
 
     assert_snapshot!(plan.to_string(), @"
     Projection(a:Int32)
-      Join[probe semi](probe_key: 0, build_key: 0, probe_output: [0], build_output: [])
+      Join[probe semi](probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [])
         Input([a:Int32])
         Projection(b:Int32)
           Filter(b:Int32 > 20:Int32 -> Boolean)
@@ -322,7 +322,7 @@ fn count_star_join_keeps_all_columns(mut testing_planner: TestingPlanner) {
     assert_snapshot!(plan.to_string(), @"
     Projection(count_star():Int64)
       Aggregate(groups: [], exprs: [count_star()])
-        Join(probe_key: 0, build_key: 0, probe_output: [0], build_output: [0])
+        Join(probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [0])
           Input([i_order:Int64])
           Input([o_key:Int64])
     ");
@@ -338,7 +338,7 @@ fn join_output_folds_projection_maps(mut testing_planner: TestingPlanner) {
 
     assert_snapshot!(plan.to_string(), @"
     Projection(i_qty:Int64, o_total:Int64)
-      Join(probe_key: 0, build_key: 0, probe_output: [1], build_output: [1])
+      Join(probe_keys: [0], build_keys: [0], probe_output: [1], build_output: [1])
         Input([i_order:Int64, i_qty:Int64])
         Input([o_key:Int64, o_total:Int64])
     ");
@@ -355,7 +355,7 @@ fn join_with_unread_build_side_keeps_it_anyway(mut testing_planner: TestingPlann
     assert_snapshot!(plan.to_string(), @"
     Projection(sum(i_order):Int128)
       Aggregate(groups: [], exprs: [sum(i_order:Int64)])
-        Join(probe_key: 0, build_key: 0, probe_output: [0], build_output: [0])
+        Join(probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [0])
           Input([i_order:Int64])
           Input([o_key:Int64])
     ");

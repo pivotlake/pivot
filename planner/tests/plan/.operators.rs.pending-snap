@@ -1,0 +1,54 @@
+{"run_id":"1785779443-86859164","line":322,"new":{"module_name":"plan__operators","snapshot_name":"count_star_join_keeps_all_columns","metadata":{"source":"planner/tests/plan/operators.rs","assertion_line":322,"expression":"plan.to_string()"},"snapshot":"Projection(count_star():Int64)\n  Aggregate(groups: [], exprs: [count_star()])\n    Join(probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [0])\n      Input([i_order:Int64])\n      Input([o_key:Int64])"},"old":{"module_name":"plan__operators","metadata":{},"snapshot":"Projection(count_star():Int64)\n  Aggregate(groups: [], exprs: [count_star()])\n    Join(probe_key: 0, build_key: 0, probe_output: [0], build_output: [0])\n      Input([i_order:Int64])\n      Input([o_key:Int64])"}}
+{"run_id":"1785779443-86859164","line":16,"new":{"module_name":"plan__operators","snapshot_name":"in_subquery_semijoin_is_a_join_not_late_materialization","metadata":{"source":"planner/tests/plan/operators.rs","assertion_line":16,"expression":"plan.to_string()"},"snapshot":"Projection(a:Int32)\n  Join[probe semi](probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [])\n    Input([a:Int32])\n    Projection(b:Int32)\n      Filter(b:Int32 > 20:Int32 -> Boolean)\n        Input([b:Int32])"},"old":{"module_name":"plan__operators","metadata":{},"snapshot":"Projection(a:Int32)\n  Join[probe semi](probe_key: 0, build_key: 0, probe_output: [0], build_output: [])\n    Input([a:Int32])\n    Projection(b:Int32)\n      Filter(b:Int32 > 20:Int32 -> Boolean)\n        Input([b:Int32])"}}
+{"run_id":"1785779443-86859164","line":247,"new":null,"old":null}
+{"run_id":"1785779443-86859164","line":123,"new":null,"old":null}
+{"run_id":"1785779443-86859164","line":135,"new":null,"old":null}
+{"run_id":"1785779443-86859164","line":234,"new":null,"old":null}
+{"run_id":"1785779443-86859164","line":110,"new":null,"old":null}
+{"run_id":"1785779443-86859164","line":31,"new":null,"old":null}
+{"run_id":"1785779443-86859164","line":355,"new":{"module_name":"plan__operators","snapshot_name":"join_with_unread_build_side_keeps_it_anyway","metadata":{"source":"planner/tests/plan/operators.rs","assertion_line":355,"expression":"plan.to_string()"},"snapshot":"Projection(sum(i_order):Int128)\n  Aggregate(groups: [], exprs: [sum(i_order:Int64)])\n    Join(probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [0])\n      Input([i_order:Int64])\n      Input([o_key:Int64])"},"old":{"module_name":"plan__operators","metadata":{},"snapshot":"Projection(sum(i_order):Int128)\n  Aggregate(groups: [], exprs: [sum(i_order:Int64)])\n    Join(probe_key: 0, build_key: 0, probe_output: [0], build_output: [0])\n      Input([i_order:Int64])\n      Input([o_key:Int64])"}}
+{"run_id":"1785779443-86859164","line":222,"new":null,"old":null}
+{"run_id":"1785779443-86859164","line":147,"new":null,"old":null}
+{"run_id":"1785779443-86859164","line":339,"new":{"module_name":"plan__operators","snapshot_name":"join_output_folds_projection_maps","metadata":{"source":"planner/tests/plan/operators.rs","assertion_line":339,"expression":"plan.to_string()"},"snapshot":"Projection(i_qty:Int64, o_total:Int64)\n  Join(probe_keys: [0], build_keys: [0], probe_output: [1], build_output: [1])\n    Input([i_order:Int64, i_qty:Int64])\n    Input([o_key:Int64, o_total:Int64])"},"old":{"module_name":"plan__operators","metadata":{},"snapshot":"Projection(i_qty:Int64, o_total:Int64)\n  Join(probe_key: 0, build_key: 0, probe_output: [1], build_output: [1])\n    Input([i_order:Int64, i_qty:Int64])\n    Input([o_key:Int64, o_total:Int64])"}}
+{"run_id":"1785779451-996961868","line":339,"new":{"module_name":"plan__operators","snapshot_name":"join_output_folds_projection_maps","metadata":{"source":"planner/tests/plan/operators.rs","assertion_line":339,"expression":"plan.to_string()"},"snapshot":"Projection(i_qty:Int64, o_total:Int64)\n  Join(probe_keys: [0], build_keys: [0], probe_output: [1], build_output: [1])\n    Input([i_order:Int64, i_qty:Int64])\n    Input([o_key:Int64, o_total:Int64])"},"old":{"module_name":"plan__operators","metadata":{},"snapshot":"Projection(i_qty:Int64, o_total:Int64)\n  Join(probe_key: 0, build_key: 0, probe_output: [1], build_output: [1])\n    Input([i_order:Int64, i_qty:Int64])\n    Input([o_key:Int64, o_total:Int64])"}}
+{"run_id":"1785779465-633700634","line":339,"new":{"module_name":"plan__operators","snapshot_name":"join_output_folds_projection_maps","metadata":{"source":"planner/tests/plan/operators.rs","assertion_line":339,"expression":"plan.to_string()"},"snapshot":"Projection(i_qty:Int64, o_total:Int64)\n  Join(probe_keys: [0], build_keys: [0], probe_output: [1], build_output: [1])\n    Input([i_order:Int64, i_qty:Int64])\n    Input([o_key:Int64, o_total:Int64])"},"old":{"module_name":"plan__operators","metadata":{},"snapshot":"Projection(i_qty:Int64, o_total:Int64)\n  Join(probe_key: 0, build_key: 0, probe_output: [1], build_output: [1])\n    Input([i_order:Int64, i_qty:Int64])\n    Input([o_key:Int64, o_total:Int64])"}}
+{"run_id":"1785779474-893192268","line":210,"new":null,"old":null}
+{"run_id":"1785779474-893192268","line":81,"new":null,"old":null}
+{"run_id":"1785779474-893192268","line":259,"new":null,"old":null}
+{"run_id":"1785779474-893192268","line":160,"new":null,"old":null}
+{"run_id":"1785779474-893192268","line":198,"new":null,"old":null}
+{"run_id":"1785779474-893192268","line":172,"new":null,"old":null}
+{"run_id":"1785779474-893192268","line":93,"new":null,"old":null}
+{"run_id":"1785779474-893192268","line":322,"new":{"module_name":"plan__operators","snapshot_name":"count_star_join_keeps_all_columns","metadata":{"source":"planner/tests/plan/operators.rs","assertion_line":322,"expression":"plan.to_string()"},"snapshot":"Projection(count_star():Int64)\n  Aggregate(groups: [], exprs: [count_star()])\n    Join(probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [0])\n      Input([i_order:Int64])\n      Input([o_key:Int64])"},"old":{"module_name":"plan__operators","metadata":{},"snapshot":"Projection(count_star():Int64)\n  Aggregate(groups: [], exprs: [count_star()])\n    Join(probe_key: 0, build_key: 0, probe_output: [0], build_output: [0])\n      Input([i_order:Int64])\n      Input([o_key:Int64])"}}
+{"run_id":"1785779474-893192268","line":247,"new":null,"old":null}
+{"run_id":"1785779474-893192268","line":234,"new":null,"old":null}
+{"run_id":"1785779474-893192268","line":187,"new":null,"old":null}
+{"run_id":"1785779474-893192268","line":110,"new":null,"old":null}
+{"run_id":"1785779474-893192268","line":16,"new":{"module_name":"plan__operators","snapshot_name":"in_subquery_semijoin_is_a_join_not_late_materialization","metadata":{"source":"planner/tests/plan/operators.rs","assertion_line":16,"expression":"plan.to_string()"},"snapshot":"Projection(a:Int32)\n  Join[probe semi](probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [])\n    Input([a:Int32])\n    Projection(b:Int32)\n      Filter(b:Int32 > 20:Int32 -> Boolean)\n        Input([b:Int32])"},"old":{"module_name":"plan__operators","metadata":{},"snapshot":"Projection(a:Int32)\n  Join[probe semi](probe_key: 0, build_key: 0, probe_output: [0], build_output: [])\n    Input([a:Int32])\n    Projection(b:Int32)\n      Filter(b:Int32 > 20:Int32 -> Boolean)\n        Input([b:Int32])"}}
+{"run_id":"1785779474-893192268","line":135,"new":null,"old":null}
+{"run_id":"1785779474-893192268","line":147,"new":null,"old":null}
+{"run_id":"1785779474-893192268","line":222,"new":null,"old":null}
+{"run_id":"1785779474-893192268","line":123,"new":null,"old":null}
+{"run_id":"1785779474-893192268","line":31,"new":null,"old":null}
+{"run_id":"1785779474-893192268","line":355,"new":{"module_name":"plan__operators","snapshot_name":"join_with_unread_build_side_keeps_it_anyway","metadata":{"source":"planner/tests/plan/operators.rs","assertion_line":355,"expression":"plan.to_string()"},"snapshot":"Projection(sum(i_order):Int128)\n  Aggregate(groups: [], exprs: [sum(i_order:Int64)])\n    Join(probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [0])\n      Input([i_order:Int64])\n      Input([o_key:Int64])"},"old":{"module_name":"plan__operators","metadata":{},"snapshot":"Projection(sum(i_order):Int128)\n  Aggregate(groups: [], exprs: [sum(i_order:Int64)])\n    Join(probe_key: 0, build_key: 0, probe_output: [0], build_output: [0])\n      Input([i_order:Int64])\n      Input([o_key:Int64])"}}
+{"run_id":"1785779474-893192268","line":339,"new":{"module_name":"plan__operators","snapshot_name":"join_output_folds_projection_maps","metadata":{"source":"planner/tests/plan/operators.rs","assertion_line":339,"expression":"plan.to_string()"},"snapshot":"Projection(i_qty:Int64, o_total:Int64)\n  Join(probe_keys: [0], build_keys: [0], probe_output: [1], build_output: [1])\n    Input([i_order:Int64, i_qty:Int64])\n    Input([o_key:Int64, o_total:Int64])"},"old":{"module_name":"plan__operators","metadata":{},"snapshot":"Projection(i_qty:Int64, o_total:Int64)\n  Join(probe_key: 0, build_key: 0, probe_output: [1], build_output: [1])\n    Input([i_order:Int64, i_qty:Int64])\n    Input([o_key:Int64, o_total:Int64])"}}
+{"run_id":"1785779498-936695282","line":198,"new":null,"old":null}
+{"run_id":"1785779498-936695282","line":160,"new":null,"old":null}
+{"run_id":"1785779498-936695282","line":172,"new":null,"old":null}
+{"run_id":"1785779498-936695282","line":210,"new":null,"old":null}
+{"run_id":"1785779498-936695282","line":259,"new":null,"old":null}
+{"run_id":"1785779498-936695282","line":81,"new":null,"old":null}
+{"run_id":"1785779498-936695282","line":322,"new":null,"old":null}
+{"run_id":"1785779498-936695282","line":93,"new":null,"old":null}
+{"run_id":"1785779498-936695282","line":16,"new":null,"old":null}
+{"run_id":"1785779498-936695282","line":187,"new":null,"old":null}
+{"run_id":"1785779498-936695282","line":247,"new":null,"old":null}
+{"run_id":"1785779498-936695282","line":234,"new":null,"old":null}
+{"run_id":"1785779498-936695282","line":123,"new":null,"old":null}
+{"run_id":"1785779498-936695282","line":110,"new":null,"old":null}
+{"run_id":"1785779498-936695282","line":135,"new":null,"old":null}
+{"run_id":"1785779498-936695282","line":339,"new":null,"old":null}
+{"run_id":"1785779498-936695282","line":355,"new":null,"old":null}
+{"run_id":"1785779498-936695282","line":147,"new":null,"old":null}
+{"run_id":"1785779498-936695282","line":31,"new":null,"old":null}
+{"run_id":"1785779498-936695282","line":222,"new":null,"old":null}
