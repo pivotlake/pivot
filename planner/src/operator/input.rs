@@ -4,8 +4,11 @@ use super::slot_for;
 use crate::catalog::{BoundTable, DynamicScanPredicate};
 use crate::compile::{DynamicFilterSlots, Error};
 use crate::dynamic_filter::DynamicFilter;
-use crate::expression::Expression;
-use dispatch::{DataFlowDispatcher, Projection as DispatchProjection, RecordBatchOperatorSpec};
+use crate::expression::{Expression, Function};
+use crate::types::physical_arrow_type;
+use dispatch::{
+    DataFlowDispatcher, Projection as DispatchProjection, RecordBatchOperatorSpec, VariantExtract,
+};
 use std::fmt;
 
 /// Scans a [`BoundTable`] from the catalog. `columns` lists the requested output
@@ -57,18 +60,45 @@ impl Input {
         dispatcher: &DataFlowDispatcher,
         slots: &mut DynamicFilterSlots,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        let column_indices: Vec<usize> = self
-            .columns
-            .iter()
-            .filter_map(|e| match e {
-                // DuckDB emits column_idx == usize::MAX as a sentinel for
-                // "no column needed" (e.g. COUNT(*) scans). Skip these.
-                Expression::Ref(r) if r.column_idx == usize::MAX => None,
-                Expression::Ref(r) => Some(Ok(r.column_idx)),
-                _ => Some(Err(Error::UnexpectedInputExpression(e.clone()))),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let projection = DispatchProjection::columns(column_indices);
+        // Each output column is either a plain column read (`Ref`) or a pushed
+        // variant field extract (`VariantGet` over a `Ref`), where DuckDB's
+        // projection-pushdown pushed the path into the scan so the reader emits
+        // only the referenced leaf. `column_indices` and `extracts` stay
+        // parallel: the extract at each position, or `None` for a plain read.
+        let mut column_indices: Vec<usize> = Vec::with_capacity(self.columns.len());
+        let mut extracts: Vec<Option<VariantExtract>> = Vec::with_capacity(self.columns.len());
+        for expr in &self.columns {
+            match expr {
+                // DuckDB emits column_idx == usize::MAX as a sentinel for "no
+                // column needed" (e.g. COUNT(*) scans). Skip these.
+                Expression::Ref(r) if r.column_idx == usize::MAX => {}
+                Expression::Ref(r) => {
+                    column_indices.push(r.column_idx);
+                    extracts.push(None);
+                }
+                Expression::Function(Function::VariantGet(vg)) => {
+                    let Expression::Ref(r) = vg.input.as_ref() else {
+                        return Err(Error::UnexpectedInputExpression(expr.clone()));
+                    };
+                    let Some(as_type) = &vg.as_type else {
+                        // A bare (untyped) extract yields a sub-variant, not a
+                        // leaf value; not something the scan emits directly.
+                        return Err(Error::UnexpectedInputExpression(expr.clone()));
+                    };
+                    column_indices.push(r.column_idx);
+                    extracts.push(Some(VariantExtract {
+                        path: vg.path.clone(),
+                        as_type: physical_arrow_type(as_type),
+                    }));
+                }
+                _ => return Err(Error::UnexpectedInputExpression(expr.clone())),
+            }
+        }
+        let projection = if extracts.iter().all(Option::is_none) {
+            DispatchProjection::columns(column_indices)
+        } else {
+            DispatchProjection::columns_with_extracts(column_indices, extracts)
+        };
         let dynamic_filters = build_dynamic_scan_predicates(&self.dynamic_filters, slots);
         self.table
             .compile_scan(

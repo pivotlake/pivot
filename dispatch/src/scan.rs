@@ -33,6 +33,19 @@ pub fn trailing_metadata_columns(schema: &Schema) -> usize {
     }
 }
 
+/// A pushed-down variant field extract on a projected column: read only the
+/// shredded leaf at `path` and emit it as `as_type`, instead of materializing
+/// the whole variant. Produced when DuckDB's projection-pushdown pushes a
+/// `variant_extract` into the scan; the reader resolves the path to a single
+/// leaf per file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VariantExtract {
+    /// Object-field path from the variant root to the referenced leaf.
+    pub path: Vec<String>,
+    /// The physical arrow type to emit the extracted value as.
+    pub as_type: arrow_schema::DataType,
+}
+
 /// An ordered set of column indices that a scan should read.
 ///
 /// Can be built from explicit indices, from an Arrow [`Schema`], or by
@@ -41,19 +54,43 @@ pub fn trailing_metadata_columns(schema: &Schema) -> usize {
 pub struct Projection {
     /// Column indices to read.
     pub column_indices: Vec<usize>,
+    /// Per output column (parallel to `column_indices`), a pushed field extract
+    /// to apply instead of reading the whole column. Empty means no extracts —
+    /// every output is a whole-column read (the common case).
+    pub extracts: Vec<Option<VariantExtract>>,
 }
 
 impl Projection {
+    /// The pushed extract for output column `output_idx`, if any. Safe whether
+    /// or not `extracts` was populated.
+    pub fn extract_at(&self, output_idx: usize) -> Option<&VariantExtract> {
+        self.extracts.get(output_idx).and_then(|e| e.as_ref())
+    }
+
+    /// A projection of columns, some of which carry a pushed field extract
+    /// (parallel to `indices`).
+    pub fn columns_with_extracts(
+        indices: impl IntoIterator<Item = usize>,
+        extracts: Vec<Option<VariantExtract>>,
+    ) -> Self {
+        Self {
+            column_indices: indices.into_iter().collect(),
+            extracts,
+        }
+    }
+
     /// Create a projection for specific column indices.
     pub fn columns(indices: impl IntoIterator<Item = usize>) -> Self {
         Self {
             column_indices: indices.into_iter().collect(),
+            extracts: Vec::new(),
         }
     }
 
     /// Create a projection that includes all `num_columns` columns (`0..num_columns`).
     pub fn all(num_columns: usize) -> Self {
         Self {
+            extracts: Vec::new(),
             column_indices: (0..num_columns).collect(),
         }
     }
@@ -68,6 +105,7 @@ impl Projection {
     /// Panics if any name is not found in the schema.
     pub fn from_field_names<'a>(schema: &Schema, names: impl IntoIterator<Item = &'a str>) -> Self {
         Self {
+            extracts: Vec::new(),
             column_indices: names
                 .into_iter()
                 .map(|name| {

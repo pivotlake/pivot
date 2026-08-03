@@ -122,6 +122,16 @@ PivotTableCatalogEntry::PivotTableCatalogEntry(Catalog &catalog, SchemaCatalogEn
     : TableCatalogEntry(catalog, schema, info), table(std::move(table)) {
 }
 
+// DuckDB's projection-pushdown pass asks, per column, whether this scanner can
+// satisfy a field extract (`variant_extract`/`struct_extract`) by reading only
+// the referenced sub-column instead of the whole column. We can: a variant
+// column reads only the referenced shredded leaves, and a column with no
+// extracts simply has nothing to push. Returning true lets the pass rewrite the
+// scan's column_ids into a ColumnIndex path tree the bridge then reads.
+static bool PivotScanSupportsPushdownExtract(const FunctionData &, const LogicalIndex &) {
+	return true;
+}
+
 TableFunction PivotTableCatalogEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
 	bind_data = make_uniq<PivotScanBindData>(*this, *table);
 	TableFunction func(name, {}, nullptr, nullptr);
@@ -137,6 +147,10 @@ TableFunction PivotTableCatalogEntry::GetScanFunction(ClientContext &context, un
 	// attached to the Input and its producing Top-N.
 	func.filter_pushdown = true;
 	func.projection_pushdown = true;
+	// Push variant/struct field extracts into this scan's column_ids so we read
+	// only the referenced leaves. Gated by the optimizer on `func.statistics`
+	// being unset, which it is.
+	func.supports_pushdown_extract = PivotScanSupportsPushdownExtract;
 	// Advertise row-id / late-materialization support so DuckDB's
 	// `late_materialization` optimizer fires for `SELECT <wide> ... ORDER BY ...
 	// LIMIT n` queries over this table: it rewrites them into a SEMI join on the

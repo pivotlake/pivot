@@ -27,7 +27,7 @@ use duckdb_planner::handle::{
 
 use crate::catalog::BoundTable;
 use crate::dynamic_filter::DynamicFilter;
-use crate::expression::{Cast, Error as ExpressionError, Expression, Ref};
+use crate::expression::{Cast, Error as ExpressionError, Expression, Function, Ref, VariantGet};
 use crate::operator::{
     Aggregate, CreateTable, Cte, CteScan, DummyScan, Error as OperatorError, Explain, Filter,
     Input, Insert, Join, JoinKind, Limit, Materialize, Operator, OrderBy, Projection, SetVariable,
@@ -257,7 +257,10 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
     // in a Projection that selects exactly projection_map, positionally, so refs
     // above the filter line up.
     if let DuckOperator::Filter(f) = kind {
-        let projections = build_scan_columns(f.projection_map())?;
+        // A filter's projection_map is a plain positional reorder of its child's
+        // columns, never a variant field extract, so each carries an empty path.
+        let projections =
+            build_scan_columns(f.projection_map().map(|(idx, ty)| (idx, ty, Vec::new())))?;
         if !projections.is_empty() {
             return Ok(PlanNode {
                 name: "FILTER_PROJECTION".to_string(),
@@ -449,15 +452,36 @@ fn join_key_ref(key: Expression) -> Result<(usize, Type), OperatorError> {
 /// positional `BOUND_REF` over storage column indices. Shared by the walk's
 /// `projection_map` replay and the scan constructors in [`operator`].
 fn build_scan_columns(
-    columns: impl Iterator<Item = (usize, BoundLogicalType)>,
+    columns: impl Iterator<Item = (usize, BoundLogicalType, Vec<String>)>,
 ) -> Result<Vec<Expression>, ExpressionError> {
     columns
-        .map(|(column_idx, col_type)| {
-            Ok(Expression::Ref(Ref {
-                column_idx,
-                return_type: type_from_logical(col_type)?,
-                name: None,
-            }))
+        .map(|(column_idx, col_type, path)| {
+            let return_type = type_from_logical(col_type)?;
+            if path.is_empty() {
+                return Ok(Expression::Ref(Ref {
+                    column_idx,
+                    return_type,
+                    name: None,
+                }));
+            }
+            // DuckDB's projection-pushdown pushed a variant field extract into
+            // this scan output. Read it as a `VariantGet` over the variant
+            // column so the reader resolves the path to a single shredded leaf
+            // instead of materializing the whole variant. A `VARIANT` output is
+            // a bare extraction (the sub-variant); any other type is a typed read.
+            let as_type = match return_type {
+                Type::Variant => None,
+                typed => Some(typed),
+            };
+            Ok(Expression::Function(Function::VariantGet(VariantGet {
+                input: Box::new(Expression::Ref(Ref {
+                    column_idx,
+                    return_type: Type::Variant,
+                    name: None,
+                })),
+                path,
+                as_type,
+            })))
         })
         .collect()
 }
