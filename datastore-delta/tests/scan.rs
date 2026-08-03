@@ -1022,3 +1022,136 @@ fn scan_a_column_our_writer_delta_encoded() {
     assert_eq!(read_keys, expected_keys);
     assert_eq!(read_names, expected_names);
 }
+
+/// A pushed extract on a path shredded into a typed leaf, with every row's
+/// value in that leaf, reads the leaf directly and emits a plain scalar column
+/// instead of the whole variant.
+#[test]
+fn scan_pushed_extract_reads_a_shredded_leaf_directly() {
+    use dispatch::VariantExtract;
+    use parquet_variant_compute::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
+
+    let dispatch = dispatch(1);
+    let json: ArrayRef = Arc::new(StringArray::from(vec![r#"{"age":30}"#, r#"{"age":25}"#]));
+    let shred = ShreddedSchemaBuilder::new()
+        .with_path("age", &DataType::Int64)
+        .unwrap()
+        .build();
+    let shredded = shred_variant(&json_to_variant(&json).unwrap(), &shred).unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![shredded.field("doc")])),
+        vec![Arc::new(shredded.into_inner()) as _],
+    )
+    .unwrap();
+    let (_dir, table) = parquet_table(&dispatch, &[batch], false);
+
+    let projection = Projection::columns_with_extracts(
+        vec![0],
+        vec![Some(VariantExtract {
+            path: vec!["age".to_string()],
+            as_type: Some(DataType::Int64),
+        })],
+    );
+    let results = table_input(&dispatch, &table, projection, false)
+        .collect()
+        .unwrap();
+
+    assert_eq!(results[0].column(0).data_type(), &DataType::Int64);
+    assert_eq!(
+        results[0]
+            .column(0)
+            .as_primitive::<arrow_array::types::Int64Type>(),
+        &Int64Array::from(vec![30, 25])
+    );
+}
+
+/// A pushed extract on a path that is not shredded here cannot read a typed
+/// leaf, so the decoder rebuilds the whole variant and reads the path per row.
+#[test]
+fn scan_pushed_extract_falls_back_for_an_unshredded_path() {
+    use dispatch::VariantExtract;
+    use parquet_variant_compute::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
+
+    let dispatch = dispatch(1);
+    let json: ArrayRef = Arc::new(StringArray::from(vec![
+        r#"{"age":30}"#,
+        r#"{"name":"bob"}"#,
+    ]));
+    let shred = ShreddedSchemaBuilder::new()
+        .with_path("age", &DataType::Int64)
+        .unwrap()
+        .build();
+    let shredded = shred_variant(&json_to_variant(&json).unwrap(), &shred).unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![shredded.field("doc")])),
+        vec![Arc::new(shredded.into_inner()) as _],
+    )
+    .unwrap();
+    let (_dir, table) = parquet_table(&dispatch, &[batch], false);
+
+    let projection = Projection::columns_with_extracts(
+        vec![0],
+        vec![Some(VariantExtract {
+            path: vec!["name".to_string()],
+            as_type: Some(DataType::Utf8View),
+        })],
+    );
+    let results = table_input(&dispatch, &table, projection, false)
+        .collect()
+        .unwrap();
+
+    assert_eq!(results[0].column(0).data_type(), &DataType::Utf8View);
+    assert_eq!(
+        results[0].column(0).as_string_view(),
+        &StringViewArray::from(vec![None, Some("bob")])
+    );
+}
+
+/// A bare extract (no cast) yields the sub-variant at the path, read from only
+/// its subtree; casting the emitted sub-variant recovers the value.
+#[test]
+fn scan_pushed_bare_extract_yields_a_subvariant() {
+    use dispatch::VariantExtract;
+    use parquet_variant::VariantPath;
+    use parquet_variant_compute::{
+        GetOptions, ShreddedSchemaBuilder, json_to_variant, shred_variant, variant_get,
+    };
+
+    let dispatch = dispatch(1);
+    let json: ArrayRef = Arc::new(StringArray::from(vec![r#"{"age":30}"#, r#"{"age":25}"#]));
+    let shred = ShreddedSchemaBuilder::new()
+        .with_path("age", &DataType::Int64)
+        .unwrap()
+        .build();
+    let shredded = shred_variant(&json_to_variant(&json).unwrap(), &shred).unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![shredded.field("doc")])),
+        vec![Arc::new(shredded.into_inner()) as _],
+    )
+    .unwrap();
+    let (_dir, table) = parquet_table(&dispatch, &[batch], false);
+
+    let projection = Projection::columns_with_extracts(
+        vec![0],
+        vec![Some(VariantExtract {
+            path: vec!["age".to_string()],
+            as_type: None,
+        })],
+    );
+    let results = table_input(&dispatch, &table, projection, false)
+        .collect()
+        .unwrap();
+
+    // The emitted column is the `age` sub-variant; cast it back to read the value.
+    let ages =
+        variant_get(
+            results[0].column(0),
+            GetOptions::new_with_path(VariantPath::default())
+                .with_as_type(Some(Arc::new(Field::new("age", DataType::Int64, true)))),
+        )
+        .unwrap();
+    assert_eq!(
+        ages.as_any().downcast_ref::<Int64Array>().unwrap(),
+        &Int64Array::from(vec![Some(30), Some(25)])
+    );
+}
