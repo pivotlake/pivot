@@ -32,7 +32,7 @@ pub use catalog::{
 };
 pub use compact::{
     Compacter, CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL,
-    DEFAULT_MIN_FILES_TO_MERGE, MaintenanceConfig,
+    DEFAULT_MIN_FILES_TO_MERGE, DEFAULT_REFRESH_INTERVAL, MaintenanceConfig,
 };
 pub use manifest::{
     ManifestEntry, PartitionEqFilter, PartitionValues, SortBounds, pivot_scalar,

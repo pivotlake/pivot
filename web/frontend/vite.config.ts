@@ -2,7 +2,7 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
 // During `npm run dev`, proxy API calls to the running pivotdb-server's
-// dashboard port (its `--http-bind`), so the hot-reloading SPA hits the same
+// dashboard port (its `server.http_bind`), so the hot-reloading SPA hits the same
 // API it will in production (where the server serves the built `dist/`).
 export default defineConfig({
   plugins: [react()],

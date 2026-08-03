@@ -27,7 +27,7 @@ export default function OverviewTab({ overview, reachable }: Props) {
       <div className="empty">
         <div>Waiting for the engine</div>
         <div className="sub">
-          start pivotdb-server with <code>--http-bind</code>, then open this page on that port
+          set <code>server.http_bind</code> in the config file, then open this page on that port
         </div>
       </div>
     );

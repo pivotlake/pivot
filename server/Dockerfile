@@ -32,8 +32,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 COPY --from=builder /usr/local/bin/pivotdb-server /usr/local/bin/pivotdb-server
 
 ENV RUST_LOG=info
-# Bind to all interfaces so the pgwire port is reachable from outside the
-# container (the binary defaults to 127.0.0.1, which is container-local only).
+# Mount a config file and point the server at it. Set `server.bind` to
+# 0.0.0.0:5432 there so the pgwire port is reachable from outside the container
+# (the default, 127.0.0.1, is container-local only).
 EXPOSE 5432
 ENTRYPOINT ["pivotdb-server"]
-CMD ["--bind", "0.0.0.0:5432"]
+CMD ["--config", "/etc/pivot/pivot.yaml"]

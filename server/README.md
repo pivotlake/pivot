@@ -16,60 +16,84 @@ See `src/lib.rs` for the library API, or run the binary directly.
 ## Running
 
 ```sh
-cargo run --release -- [OPTIONS]
+cargo run --release -- --config <FILE>
 ```
 
 Or after `cargo install --path .` / building, the binary is named
 `pivotdb-server`:
 
 ```sh
-pivotdb-server --metastore <FILE> [OPTIONS]
+pivotdb-server --config <FILE>
 ```
 
-### Options
+`--config` is the only flag: one YAML file configures the whole instance. See
+[`config.example.yaml`](config.example.yaml) for a commented file to copy.
 
-| Flag | Default | Description |
-| --- | --- | --- |
-| `--bind` | `127.0.0.1:5432` | TCP socket the server binds to. |
-| `--workers` | number of cores | Number of dispatch worker threads. |
-| `--metastore` | required | YAML file defining the named datastores and users. |
-| `--memory` | 80% of RAM | Buffer-pool budget such as `32g` or `512m`. |
+### The config file
 
-### Metastore configuration
-
-The YAML provider lives in the separate `metastore-yaml` crate. A metastore is
-always required, including when serving one local datastore. Exactly one
-datastore must set `default = true`; it becomes the current database (the target
-of unqualified table names). Every datastore is attached as
-a database of its own name, so a query reads any other one by qualifying it:
-`SELECT * FROM warm.main.tbl`. `kind` is the datastore format (`delta` today); the
-storage backend is inferred from `location` (a plain path is local, an `s3://`
-URI is S3). Compaction is configured per datastore with `compact` (and the
-optional `compact_bytes` / `compact_min_files` tuning); it is off by default and
-should run in only one process per datastore:
+The file has two sections. `server` is the instance: where it listens and what
+it may use. Every setting there has a default, so the section may be left out
+entirely. `metastore` is the data to serve, and is required.
 
 ```yaml
-datastores:
-  hot:
-    kind: delta
-    location: /var/lib/pivot/hot    # local path -> local store
-    default: true                   # the current database
-  warm:
-    kind: delta
-    location: s3://analytics/warm/  # S3 store
-    compact: true                   # this datastore compacts itself
-    compact_bytes: 128m
-    region: us-east-1
-    access_key_id: AKIA...
-    secret_access_key: "..."
-    # endpoint: http://localhost:9000
+server:
+  bind: 0.0.0.0:5432        # default 127.0.0.1:5432
+  memory: 32g               # default: 80% of total RAM (see PIVOT_MEMORY_PCT)
+  workers: 16               # default: number of cores
+  http_bind: 127.0.0.1:8081 # serve the web dashboard; omitted means no dashboard
+  disk_cache:               # cache S3 reads on local disk; omitted means no cache
+    dir: /var/cache/pivot   # required once the section is present
+    size: 64g               # default 64g
+    max_objects: 65536      # default; one open file descriptor per cached object
+
+metastore:
+  refresh_interval: 30s     # default 30s
+  datastores: ...
+  users: ...
+```
+
+### Datastores
+
+The YAML provider lives in the separate `metastore-yaml` crate, which owns the
+`metastore` section. At least one datastore is always required, including when
+serving one local directory. Exactly one datastore must set `default = true`; it
+becomes the current database (the target of unqualified table names). Every
+datastore is attached as a database of its own name, so a query reads any other
+one by qualifying it: `SELECT * FROM warm.main.tbl`. `kind` is the datastore
+format (`delta` today); the storage backend is inferred from `location` (a plain
+path is local, an `s3://` URI is S3). Compaction is configured per datastore
+with `compact` (and the optional `compact_bytes` / `compact_min_files` tuning);
+it is off by default and should run in only one process per datastore:
+
+```yaml
+metastore:
+  datastores:
+    hot:
+      kind: delta
+      location: /var/lib/pivot/hot    # local path -> local store
+      default: true                   # the current database
+    warm:
+      kind: delta
+      location: s3://analytics/warm/  # S3 store
+      compact: true                   # this datastore compacts itself
+      compact_bytes: 128m
+      region: us-east-1
+      access_key_id: AKIA...
+      secret_access_key: "..."
+      # endpoint: http://localhost:9000
 ```
 
 Start the server with:
 
 ```sh
-pivotdb-server --metastore config.yaml
+pivotdb-server --config pivot.yaml
 ```
+
+`refresh_interval` sets how often the background refresh brings the in-memory
+table set up to date with the store: new Delta versions, new files' footers, and
+tables committed by other processes. It bounds how stale a query's view of
+externally committed data can be; this process's own INSERT and compaction
+publish their commits immediately.
 
 An S3 datastore's `region`, `access_key_id`, and `secret_access_key` are
 required and given inline. Protect files containing inline credentials
@@ -81,15 +105,16 @@ Each entry under `users` names a user that may connect. Its nested `auth`
 contains exactly one authentication method and that method's fields:
 
 ```yaml
-users:
-  pivot:
-    auth:
-      method: trust
+metastore:
+  users:
+    pivot:
+      auth:
+        method: trust
 
-  analytics:
-    auth:
-      method: scram-sha-256
-      verifier: "pivot-scram-sha-256$4096:8fZ1u...$Wm9tYm..."
+    analytics:
+      auth:
+        method: scram-sha-256
+        verifier: "pivot-scram-sha-256$4096:8fZ1u...$Wm9tYm..."
 ```
 
 The SCRAM verifier is precomputed in PivotDB's
@@ -98,14 +123,14 @@ performs no identity proof: anyone who supplies `pivot` as the user name is
 accepted. Variant-specific fields are enforced, so trust cannot contain a
 verifier and SCRAM cannot omit one.
 
-A YAML file with no users (an omitted or empty `users` section) receives one
+A config file with no users (an omitted or empty `users` section) receives one
 built-in trusted user named `pivot`. Defining any users replaces that default
 with the configured allowlist.
 
 Logging is controlled by `RUST_LOG` (defaults to `info`):
 
 ```sh
-RUST_LOG=server=debug,dispatch=info pivotdb-server --metastore config.yaml --bind 0.0.0.0:5432
+RUST_LOG=server=debug,dispatch=info pivotdb-server --config pivot.yaml
 ```
 
 ## Connecting

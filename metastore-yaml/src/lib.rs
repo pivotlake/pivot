@@ -1,5 +1,11 @@
 //! A YAML-backed [`metastore::Metastore`] provider.
 //!
+//! This crate owns the `metastore` section of PivotDB's config file: the
+//! datastores to serve and the users that may connect. The server reads the
+//! file, keeps its own `server` section, and hands this section over as a
+//! [`MetastoreConfig`]. The scalars both sections are written with,
+//! [`ByteSize`] and [`Interval`], are defined here too.
+//!
 //! `kind` is the datastore format (only `delta` today). The storage backend is
 //! chosen from `location`: a plain path (or `file://`) opens a local store, an
 //! `s3://` URI opens an S3 store. The S3 credential fields apply only to an
@@ -10,19 +16,21 @@
 //! free (it need not be called `default`).
 //!
 //! ```yaml
-//! datastores:
-//!   hot:
-//!     kind: delta
-//!     location: /var/lib/pivot       # local path -> local store
-//!     default: true                  # the current database
-//!   warm:
-//!     kind: delta
-//!     location: s3://my-bucket/pivot/
-//!     region: us-east-1              # required for s3://
-//!     access_key_id: AKIA...         # required for s3://
-//!     secret_access_key: "..."
-//!     # endpoint: http://localhost:9000
-//!     # compact: true                # optional
+//! metastore:
+//!   refresh_interval: 30s            # how often the table set is refreshed
+//!   datastores:
+//!     hot:
+//!       kind: delta
+//!       location: /var/lib/pivot     # local path -> local store
+//!       default: true                # the current database
+//!     warm:
+//!       kind: delta
+//!       location: s3://my-bucket/pivot/
+//!       region: us-east-1            # required for s3://
+//!       access_key_id: AKIA...       # required for s3://
+//!       secret_access_key: "..."
+//!       # endpoint: http://localhost:9000
+//!       # compact: true              # optional
 //! ```
 //!
 //! Each entry under `users` names a user that may authenticate to the
@@ -30,21 +38,23 @@
 //! user may explicitly be trusted without a password:
 //!
 //! ```yaml
-//! users:
-//!   reader:
-//!     auth:
-//!       method: trust
+//! metastore:
+//!   users:
+//!     reader:
+//!       auth:
+//!         method: trust
 //! ```
 //!
 //! Or it may authenticate with a SCRAM-SHA-256 verifier derived from its
 //! password:
 //!
 //! ```yaml
-//! users:
-//!   analytics:
-//!     auth:
-//!       method: scram-sha-256
-//!       verifier: "pivot-scram-sha-256$4096:cGVwcGVy...$Zm9vYmFy..."
+//! metastore:
+//!   users:
+//!     analytics:
+//!       auth:
+//!         method: scram-sha-256
+//!         verifier: "pivot-scram-sha-256$4096:cGVwcGVy...$Zm9vYmFy..."
 //! ```
 //!
 //! When `users` is omitted or empty, the provider supplies one built-in trusted
@@ -56,7 +66,6 @@
 //! password cannot be recovered from it), but it is still worth the same care.
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -64,15 +73,19 @@ use catalog::Datastore;
 use datastore_delta::store::{LocalStore, ObjectStore, S3Credentials, S3Store};
 use datastore_delta::{
     CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL, DEFAULT_MIN_FILES_TO_MERGE,
-    DeltaDatastore, MaintenanceConfig,
+    DEFAULT_REFRESH_INTERVAL, DeltaDatastore, MaintenanceConfig,
 };
 use dispatch::DataFlowDispatcher;
 use metastore::{DEFAULT_USER_NAME, Metastore, UserAuth, parse_scram_verifier};
 use serde::Deserialize;
 
-/// A metastore backed by a parsed YAML file.
+mod units;
+
+pub use units::{ByteSize, Interval};
+
+/// A metastore backed by the config file's `metastore` section.
 ///
-/// Configuration is parsed and structurally validated by [`open`](Self::open).
+/// The section is structurally validated by [`from_config`](Self::from_config).
 /// Object stores and their Delta datastores are opened when
 /// [`Metastore::open_datastores`] is called.
 pub struct YamlMetastore {
@@ -80,7 +93,7 @@ pub struct YamlMetastore {
     default_name: String,
     /// Every user's authentication method, keyed by user name. A file with no
     /// users receives the built-in trusted `pivot` user. Verifiers are decoded
-    /// once, by [`from_yaml`](Self::from_yaml), so a malformed one fails startup
+    /// once, by [`from_config`](Self::from_config), so a malformed one fails startup
     /// rather than a login.
     user_auth: HashMap<String, UserAuth>,
     /// How often every datastore this metastore opens refreshes its table set
@@ -90,26 +103,24 @@ pub struct YamlMetastore {
 }
 
 impl YamlMetastore {
-    /// Read and parse the metastore file at `path`, applying `refresh_interval`
-    /// to every datastore it opens.
-    pub fn open(path: impl AsRef<Path>, refresh_interval: Duration) -> Result<Self> {
-        let path = path.as_ref();
-        let text = std::fs::read_to_string(path).map_err(|source| Error::Read {
-            path: path.display().to_string(),
-            source,
-        })?;
-        Self::from_yaml(&text, &path.display().to_string(), refresh_interval)
+    /// Parse a `metastore` section from YAML text, using `path` in errors. The
+    /// server reads the whole config file in one pass instead; this is for
+    /// callers that hold only this section.
+    pub fn from_yaml(text: &str, path: &str) -> Result<Self> {
+        let config: MetastoreConfig =
+            serde_yaml_ng::from_str(text).map_err(|source| Error::Parse {
+                path: path.to_string(),
+                source,
+            })?;
+        Self::from_config(config)
     }
 
-    /// Parse metastore configuration from YAML text, using `path` in errors.
-    pub fn from_yaml(text: &str, path: &str, refresh_interval: Duration) -> Result<Self> {
-        let file: MetastoreFile = serde_yaml_ng::from_str(text).map_err(|source| Error::Parse {
-            path: path.to_string(),
-            source,
-        })?;
+    /// Validate an already-parsed `metastore` section: exactly one default
+    /// datastore, and users whose verifiers decode.
+    pub fn from_config(config: MetastoreConfig) -> Result<Self> {
         // The default datastore is the one flagged `default = true`, not one with
         // a reserved name. Exactly one is required: it is the current database.
-        let mut defaults: Vec<String> = file
+        let mut defaults: Vec<String> = config
             .datastores
             .iter()
             .filter(|(_, config)| config.is_default)
@@ -120,7 +131,7 @@ impl YamlMetastore {
             return Err(Error::MultipleDefaults(defaults));
         }
         let default_name = defaults.pop().ok_or(Error::MissingDefault)?;
-        let mut user_auth = file
+        let mut user_auth = config
             .users
             .into_iter()
             .map(|(name, config)| {
@@ -135,10 +146,10 @@ impl YamlMetastore {
             user_auth.insert(DEFAULT_USER_NAME.to_string(), UserAuth::Trust);
         }
         Ok(Self {
-            datastore_configs: file.datastores,
+            datastore_configs: config.datastores,
             default_name,
             user_auth,
-            refresh_interval,
+            refresh_interval: config.refresh_interval.as_duration(),
         })
     }
 
@@ -152,7 +163,7 @@ impl YamlMetastore {
                 let store = config.open_store(name)?;
                 let maintenance = MaintenanceConfig {
                     refresh_interval: self.refresh_interval,
-                    compaction: config.compaction(name)?,
+                    compaction: config.compaction(),
                 };
                 let datastore: Arc<dyn Datastore> = match config.kind {
                     DatastoreKind::Delta => {
@@ -187,12 +198,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("reading metastore file `{path}`: {source}")]
-    Read {
-        path: String,
-        source: std::io::Error,
-    },
-    #[error("parsing metastore file `{path}`: {source}")]
+    #[error("parsing the `metastore` section of `{path}`: {source}")]
     Parse {
         path: String,
         source: serde_yaml_ng::Error,
@@ -215,16 +221,29 @@ pub enum Error {
     Delta(#[from] datastore_delta::Error),
 }
 
-/// Unknown top-level keys are rejected: a misspelled `users` section would
-/// otherwise be dropped in silence and unexpectedly select the built-in
-/// trusted `pivot` user.
+/// The config file's `metastore` section, as written.
+///
+/// Unknown keys are rejected: a misspelled `users` section would otherwise be
+/// dropped in silence and unexpectedly select the built-in trusted `pivot` user.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MetastoreFile {
+pub struct MetastoreConfig {
     #[serde(default)]
     datastores: HashMap<String, DatastoreConfig>,
     #[serde(default)]
     users: HashMap<String, UserConfig>,
+    /// How often the background catalog refresh brings the in-memory table set
+    /// up to date with the store: new Delta versions, new files' footers, and
+    /// tables committed by other processes. Queries bind against a snapshot of
+    /// that in-memory set, so this bounds how stale a query's view of
+    /// *externally* committed data can be (this process's own INSERT and
+    /// compaction publish their commits immediately).
+    #[serde(default = "default_refresh_interval")]
+    refresh_interval: Interval,
+}
+
+fn default_refresh_interval() -> Interval {
+    Interval::from_duration(DEFAULT_REFRESH_INTERVAL)
 }
 
 /// One user and the authentication method nested inside it. Keeping the user as
@@ -262,6 +281,7 @@ enum UserAuthConfig {
 /// backend (local filesystem vs S3) is inferred from `location`'s scheme, and
 /// the S3 credential fields apply only when `location` is an `s3://` URI.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DatastoreConfig {
     kind: DatastoreKind,
     location: String,
@@ -277,7 +297,7 @@ struct DatastoreConfig {
     compact: bool,
     /// Per-table byte threshold compaction merges small files up to (a size such
     /// as `128m` or `1g`). Defaults to [`DEFAULT_COMPACT_BYTES`].
-    compact_bytes: Option<String>,
+    compact_bytes: Option<ByteSize>,
     /// Count trigger for a low-traffic partition's small files (merge once this
     /// many accumulate, even below `compact_bytes`). Defaults to
     /// [`DEFAULT_MIN_FILES_TO_MERGE`].
@@ -290,49 +310,20 @@ struct DatastoreConfig {
 
 impl DatastoreConfig {
     /// This datastore's compaction settings, or `None` when `compact` is off.
-    /// Parses `compact_bytes` and fills the tuning fields' defaults.
-    fn compaction(&self, name: &str) -> Result<Option<CompactionConfig>> {
+    /// Fills the tuning fields' defaults.
+    fn compaction(&self) -> Option<CompactionConfig> {
         if !self.compact {
-            return Ok(None);
+            return None;
         }
-        let target_bytes = match &self.compact_bytes {
-            Some(size) => parse_byte_size(size).map_err(|message| Error::Datastore {
-                name: name.to_string(),
-                message,
-            })?,
-            None => DEFAULT_COMPACT_BYTES,
-        };
-        Ok(Some(CompactionConfig {
-            target_bytes,
+        Some(CompactionConfig {
+            target_bytes: self
+                .compact_bytes
+                .map(ByteSize::as_bytes)
+                .unwrap_or(DEFAULT_COMPACT_BYTES),
             min_files: self.compact_min_files.unwrap_or(DEFAULT_MIN_FILES_TO_MERGE),
             poll_interval: DEFAULT_COMPACT_POLL,
-        }))
+        })
     }
-}
-
-/// Parse a human-readable byte size such as `128m`, `1g`, or `4096` into a byte
-/// count. Accepts an optional base-1024 suffix (`k`/`m`/`g`/`t`, each also with a
-/// trailing `b`), case-insensitive; a bare number is bytes.
-fn parse_byte_size(input: &str) -> std::result::Result<u64, String> {
-    let trimmed = input.trim();
-    let digits_end = trimmed
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(trimmed.len());
-    let (number, suffix) = trimmed.split_at(digits_end);
-    let value: u64 = number
-        .parse()
-        .map_err(|_| format!("`{input}` is not a valid size"))?;
-    let multiplier: u64 = match suffix.trim().to_ascii_lowercase().as_str() {
-        "" | "b" => 1,
-        "k" | "kb" => 1024,
-        "m" | "mb" => 1024 * 1024,
-        "g" | "gb" => 1024 * 1024 * 1024,
-        "t" | "tb" => 1024 * 1024 * 1024 * 1024,
-        other => return Err(format!("`{other}` is not a known size suffix (k/m/g/t)")),
-    };
-    value
-        .checked_mul(multiplier)
-        .ok_or_else(|| format!("`{input}` overflows a byte count"))
 }
 
 /// The datastore format. Only [`Delta`](Self::Delta) is supported today; adding
@@ -409,12 +400,59 @@ datastores:
     location: /tmp/warm
 "#;
 
-        let store = YamlMetastore::from_yaml(yaml, "test", Duration::from_secs(30)).unwrap();
+        let store = YamlMetastore::from_yaml(yaml, "test").unwrap();
 
-        let hot = store.datastore_configs["hot"].compaction("hot").unwrap();
-        let warm = store.datastore_configs["warm"].compaction("warm").unwrap();
+        let hot = store.datastore_configs["hot"].compaction();
+        let warm = store.datastore_configs["warm"].compaction();
         assert_eq!(hot.unwrap().target_bytes, 128 * 1024 * 1024);
         assert!(warm.is_none());
+    }
+
+    #[test]
+    fn every_datastore_shares_the_configured_refresh_interval() {
+        let yaml = r#"
+refresh_interval: 500ms
+datastores:
+  hot:
+    kind: delta
+    location: /tmp/hot
+    default: true
+"#;
+
+        let store = YamlMetastore::from_yaml(yaml, "test").unwrap();
+
+        assert_eq!(store.refresh_interval, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn a_section_without_a_refresh_interval_uses_the_default() {
+        let yaml = r#"
+datastores:
+  hot:
+    kind: delta
+    location: /tmp/hot
+    default: true
+"#;
+
+        let store = YamlMetastore::from_yaml(yaml, "test").unwrap();
+
+        assert_eq!(store.refresh_interval, DEFAULT_REFRESH_INTERVAL);
+    }
+
+    #[test]
+    fn a_misspelled_datastore_setting_is_rejected_rather_than_ignored() {
+        let yaml = r#"
+datastores:
+  hot:
+    kind: delta
+    location: /tmp/hot
+    default: true
+    compact_byte: 128m
+"#;
+
+        let error = YamlMetastore::from_yaml(yaml, "test").err().unwrap();
+
+        assert!(matches!(error, Error::Parse { .. }), "{error}");
     }
 
     #[test]
@@ -426,7 +464,7 @@ datastores:
     location: /tmp/warm
 "#;
 
-        let error = YamlMetastore::from_yaml(yaml, "test", Duration::from_secs(30))
+        let error = YamlMetastore::from_yaml(yaml, "test")
             .err()
             .expect("a metastore without a default should be rejected");
 
@@ -446,7 +484,7 @@ datastores:
     location: /tmp/default
 "#;
 
-        let result = YamlMetastore::from_yaml(yaml, "test", Duration::from_secs(30));
+        let result = YamlMetastore::from_yaml(yaml, "test");
 
         assert!(matches!(result, Err(Error::Parse { .. })));
     }
@@ -465,7 +503,7 @@ datastores:
     default: true
 "#;
 
-        let result = YamlMetastore::from_yaml(yaml, "test", Duration::from_secs(30));
+        let result = YamlMetastore::from_yaml(yaml, "test");
 
         assert!(matches!(result, Err(Error::MultipleDefaults(names)) if names == ["hot", "warm"]));
     }
@@ -483,7 +521,7 @@ datastores:
     location: /tmp/warm
 "#;
 
-        let store = YamlMetastore::from_yaml(yaml, "test", Duration::from_secs(30)).unwrap();
+        let store = YamlMetastore::from_yaml(yaml, "test").unwrap();
 
         assert_eq!(store.default_datastore_name(), "hot");
     }
@@ -501,7 +539,7 @@ datastores:
     location: s3://bucket/prefix
 "#;
 
-        let store = YamlMetastore::from_yaml(yaml, "test", Duration::from_secs(30)).unwrap();
+        let store = YamlMetastore::from_yaml(yaml, "test").unwrap();
         let err = store.datastore_configs["warm"]
             .open_store("warm")
             .unwrap_err();
@@ -525,7 +563,7 @@ datastores:
     secret_access_key: secret
 "#;
 
-        let store = YamlMetastore::from_yaml(yaml, "test", Duration::from_secs(30)).unwrap();
+        let store = YamlMetastore::from_yaml(yaml, "test").unwrap();
 
         assert!(
             store.datastore_configs[DEFAULT_DATASTORE_NAME]
@@ -541,7 +579,7 @@ datastores:
             "datastores:\n  default:\n    kind: delta\n    location: /tmp/default\n    \
              default: true\n{users}"
         );
-        YamlMetastore::from_yaml(&yaml, "test", Duration::from_secs(30))
+        YamlMetastore::from_yaml(&yaml, "test")
     }
 
     fn verifier_for(password: &str) -> String {

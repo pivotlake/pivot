@@ -27,7 +27,7 @@ npm --prefix web/frontend install
 npm --prefix web/frontend run build
 
 # 2. build + run the server with the dashboard on (embeds dist/ in the binary)
-cd server && cargo run -- --bind 127.0.0.1:5432 --http-bind 127.0.0.1:8081 --metastore ../config.yaml
+cd server && cargo run -- --config ../pivot.yaml   # set `http_bind` in its `server` section
 # open http://127.0.0.1:8081
 ```
 
@@ -41,7 +41,7 @@ No need to rebuild the (slow) server on every UI change:
 
 ```sh
 # server provides the API on :8081
-pivotdb-server --http-bind 127.0.0.1:8081 --metastore config.yaml
+pivotdb-server --config pivot.yaml   # with `http_bind: 127.0.0.1:8081` in its `server` section
 
 # Vite serves the UI on :5173 with HMR, proxying /api to the server
 npm --prefix web/frontend run dev
