@@ -34,9 +34,9 @@
 //! [`RecordBatchOperatorSpec::collect`] is called. The lifecycle is:
 //!
 //! 1. **Build factories** — Each chained method (`.filter(...)`, `.aggregate(...)`, etc.) wraps
-//!    the previous factories in a new layer of [`RecordBatchUnaryOperatorFactory`], producing
+//!    the previous factories in a new layer of [`UnaryOperatorFactory`], producing
 //!    already one factory per worker.
-//!    The factories are stored as `Box<dyn RecordBatchOperatorFactory>`
+//!    The factories are stored as `Box<dyn OperatorFactory<RecordBatch>>`
 //!    to erase the nested generic types.
 //!
 //! 2. **Ship to workers** — `collect()` pairs each factory with an `MpscSender<RecordBatch>`
@@ -45,7 +45,7 @@
 //!    which live on the worker thread.
 //!
 //! 3. **Build on worker** — The worker calls [`DataFlowBuilder::build`], which calls
-//!    `build_collect(sender)` on the factory. This recursively builds the full operator
+//!    `build(sender)` on the factory. This recursively builds the full operator
 //!    chain: each factory creates a channel, builds its head with the channel's sender,
 //!    then appends its own operator reading from the channel's receiver.
 //!
@@ -54,17 +54,14 @@
 //!
 //! # Key types
 //!
-//! - [`RecordBatchOperatorFactory`] — Object-safe trait that erases
-//!   `OperatorFactory<RecordBatch>`. Has two methods (`build_stealable`, `build_collect`)
-//!   for the two sender types used at the RecordBatch boundary.
-//!
 //! - [`RecordBatchOperatorSpec`] — The user-facing query builder.
-//!   Holds `VecDeque<Box<dyn RecordBatchOperatorFactory>>` (one per worker).
+//!   Holds `VecDeque<Box<dyn OperatorFactory<RecordBatch>>>` (one per worker).
 //!
-//! - [`OperatorFactory<O>`](OperatorFactory) — Generic factory trait with
-//!   `build<S: Sender<O>>`. Not object-safe (generic method), but used for
-//!   pipelines that flow through non-RecordBatch intermediate types — e.g. the
-//!   multi-stage decode in `catalog`'s Parquet reader.
+//! - [`OperatorFactory<O>`](OperatorFactory) — Factory trait with
+//!   `build(self: Box<Self>, sender: Box<dyn Sender<O>>)`. The sender is a trait
+//!   object, so the trait is object-safe and a factory can be boxed at any stage.
+//!   Also carries pipelines that flow through non-RecordBatch intermediate types —
+//!   e.g. the multi-stage decode in `catalog`'s Parquet reader.
 //!
 //! - [`OperatorSpec<O, OF>`](OperatorSpec) — Generic spec holding `VecDeque<OF>`. Can be used for
 //!   any operator that does not expose `RecordBatch`. Used to build multi-stage
@@ -74,7 +71,7 @@
 //! - [`OperatorGraphBuilder`] — Accumulates operators and edges during the build step,
 //!   then converts them to a `DataFlow`.
 //!
-//! - [`DataFlowBuilder`] — Pairs a `Box<dyn RecordBatchOperatorFactory>` with the output
+//! - [`DataFlowBuilder`] — Pairs a `Box<dyn OperatorFactory<RecordBatch>>` with the output
 //!   `MpscSender`. Sent to a worker thread, which calls `.build()` to produce a `DataFlow`.
 
 mod builder;
@@ -88,7 +85,4 @@ mod record_batch_operator;
 pub use data_flow_handle::{CancelToken, DataFlowHandle};
 
 pub use operator_spec::values_input;
-pub use record_batch_operator::{
-    RECORD_BATCH_SIZE, RecordBatchFactoryBridge, RecordBatchOperatorFactory,
-    RecordBatchOperatorSpec, RecordBatchUnaryOperatorFactory,
-};
+pub use record_batch_operator::{RECORD_BATCH_SIZE, RecordBatchOperatorSpec};

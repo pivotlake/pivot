@@ -1736,9 +1736,9 @@ impl dispatch::NullaryFactory<RecordBatch> for NoRowsNullary {
 }
 
 impl dispatch::Nullary<RecordBatch> for NoRowsNullary {
-    fn run<S: dispatch::Sender<RecordBatch>>(
+    fn run(
         &mut self,
-        _sender: &mut S,
+        _sender: &mut dyn dispatch::Sender<RecordBatch>,
     ) -> dispatch::NullaryResult<dispatch::WorkStatus> {
         if self.ran {
             return Ok(dispatch::WorkStatus::Pending);
@@ -1747,9 +1747,9 @@ impl dispatch::Nullary<RecordBatch> for NoRowsNullary {
         Ok(dispatch::WorkStatus::Ran)
     }
 
-    fn finish<S: dispatch::Sender<RecordBatch>>(
+    fn finish(
         &mut self,
-        _sender: &mut S,
+        _sender: &mut dyn dispatch::Sender<RecordBatch>,
     ) -> dispatch::NullaryResult<bool> {
         Ok(self.ran)
     }

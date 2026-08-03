@@ -180,15 +180,12 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
     }
 
     /// Appends one partition table, applying worker-wide pruning when enabled.
-    pub(crate) fn extend_from_table<Snd>(
+    pub(crate) fn extend_from_table(
         &mut self,
         table: Table<K::Persisted, V>,
         allocator: &mut SlabAllocator,
-        sender: &mut Snd,
-    ) -> Result<()>
-    where
-        Snd: Sender<RecordBatch>,
-    {
+        sender: &mut dyn Sender<RecordBatch>,
+    ) -> Result<()> {
         // Match the top-k backing once per table, not once per row.
         {
             let Self {
@@ -250,10 +247,10 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
     }
 
     #[inline]
-    fn flush_if_full<Snd: Sender<RecordBatch>>(
+    fn flush_if_full(
         &mut self,
         allocator: &mut SlabAllocator,
-        sender: &mut Snd,
+        sender: &mut dyn Sender<RecordBatch>,
     ) -> Result<()> {
         if self.len >= OUTPUT_CHUNK_ROWS {
             self.flush(allocator, sender)
@@ -263,10 +260,10 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
     }
 
     /// Emits accumulated rows and resets the builders.
-    pub(crate) fn flush<Snd: Sender<RecordBatch>>(
+    pub(crate) fn flush(
         &mut self,
         allocator: &mut SlabAllocator,
-        sender: &mut Snd,
+        sender: &mut dyn Sender<RecordBatch>,
     ) -> Result<()> {
         if let Some(top_k) = self.take_topk() {
             match top_k {
@@ -309,12 +306,12 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
     /// it. Reads the per-output-phase state (`key_arena`, `output_buffers`,
     /// `shared_context`) straight off `self`; the caller hands over the filled
     /// builders to finish.
-    fn emit<Snd: Sender<RecordBatch>>(
+    fn emit(
         &self,
         key_builder: K::ColumnBuilder,
         value_builder: V::ColumnBuilder,
         allocator: &mut SlabAllocator,
-        sender: &mut Snd,
+        sender: &mut dyn Sender<RecordBatch>,
     ) -> Result<()> {
         let (mut fields, mut columns) =
             key_builder.finish(&self.key_arena, &self.output_buffers, allocator);
@@ -355,7 +352,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
 /// waste at high cardinality); a downstream `SUM` over the per-partition counts
 /// gives the total (partitions are hash-disjoint). Callers skip `count == 0`
 /// partitions, so every emitted count is non-zero.
-pub(crate) fn emit_count<Snd: Sender<RecordBatch>>(count: usize, sender: &mut Snd) -> Result<()> {
+pub(crate) fn emit_count(count: usize, sender: &mut dyn Sender<RecordBatch>) -> Result<()> {
     let arr = Arc::new(Int64Array::from(vec![count as i64]));
     let field = ArrowField::new("v0", DataType::Int64, false);
     let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![arr])?;

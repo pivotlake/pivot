@@ -470,10 +470,10 @@ fn is_tighter(new: &Scalar<ArrayRef>, current: &Scalar<ArrayRef>, descending: bo
 impl Consumer<RecordBatch, RecordBatch> for OrderByLimit {
     type Outputter = OrderByLimitOutputter;
 
-    fn consume<S: Sender<RecordBatch>>(
+    fn consume(
         &mut self,
         batch: RecordBatch,
-        _sender: &mut S,
+        _sender: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<()> {
         debug!("Received batch of length {:?}", batch.num_rows());
         // Local stages keep `limit + offset` candidates (skip = 0); only the
@@ -599,7 +599,7 @@ pub struct OrderByLimitOutputter {
 }
 
 impl Outputter<RecordBatch> for OrderByLimitOutputter {
-    fn output<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> unary::Result<bool> {
+    fn output(&mut self, sender: &mut dyn Sender<RecordBatch>) -> unary::Result<bool> {
         match self.rx.try_recv() {
             Ok(c) => {
                 self.batches.push(c);

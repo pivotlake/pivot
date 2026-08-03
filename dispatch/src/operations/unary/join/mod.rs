@@ -26,6 +26,7 @@
 mod build;
 mod directory;
 mod factory;
+pub use factory::JoinRecordBatchOperatorFactory;
 mod probe;
 
 use std::cell::UnsafeCell;

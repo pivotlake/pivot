@@ -21,19 +21,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 /// stage uses a different channel/sender type — including `WorkerAwareSender` which
 /// requires `O: WorkerIdOutput`.
 ///
-/// [`OperatorFactory::build`] must be generic over `S: Sender<O>` to support this,
-/// which makes it **not object-safe**. This is why we can't use
-/// `Box<dyn OperatorFactory<O>>` directly and need a separate object-safe
-/// [`RecordBatchOperatorFactory`](super::record_batch_operator::RecordBatchOperatorFactory)
-/// trait at the RecordBatch boundary.
-///
-/// Concretely, making `OperatorFactory<O>` object-safe would require replacing
-/// `build<S: Sender<O>>` with concrete methods like `build_stealable(Rc<Worker<O>>)`
-/// and `build_collect(MpscSender<O>)`. But there is no clean way to add a
-/// `build_worker_aware(WorkerAwareSender<O>)` method: the `Sender` impl for
-/// `WorkerAwareSender<O>` requires `O: WorkerIdOutput`, and adding that bound to the
-/// trait method either forces the bound onto all users (wrong for `RecordBatch`) or
-/// requires a `where` clause that breaks object safety.
+/// The spec stays strongly typed, but [`OperatorFactory::build`] takes its sender as
+/// `Box<dyn Sender<O>>`, so the trait is object-safe and `Box<dyn OperatorFactory<O>>`
+/// works directly. Every sender kind goes through the one method, including
+/// `WorkerAwareSender<O>`: its `Sender` impl requires `O: WorkerIdOutput`, and the
+/// caller that constructs it already satisfies that, so the bound never has to appear
+/// on the trait.
 pub struct OperatorSpec<O, OF: OperatorFactory<O>> {
     dispatcher: DataFlowDispatcher,
     factories: VecDeque<OF>,
@@ -85,7 +78,7 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
             .dispatcher
             .push_data_flow(self.factories.into_iter().map(|f| {
                 let tx = tx.clone();
-                let build = Box::new(move || Box::new(f).build(tx));
+                let build = Box::new(move || Box::new(f).build(Box::new(tx)));
                 let builder = DataFlowBuilder::new(
                     build,
                     cancelled.clone(),
@@ -217,11 +210,20 @@ impl<OF: OperatorFactory<RecordBatch> + 'static> OperatorSpec<RecordBatch, OF> {
 /// The `build` method consumes the factory, creates channels between stages, and returns
 /// an [`OperatorGraphBuilder`] ready to finalize and execute.
 ///
-/// `build` is generic over `S: Sender<O>` because different stages connect via different
-/// sender types (work-stealing, mpsc, worker-aware). This makes the trait **not object-safe**
-/// — see [`RecordBatchOperatorFactory`](super::record_batch_operator::RecordBatchOperatorFactory)
-/// for the object-safe equivalent at the `RecordBatch` boundary.
+/// Stages connect via different sender types (work-stealing, mpsc, worker-aware), so
+/// `build` takes the sender as a trait object rather than a type parameter. That keeps
+/// the trait object-safe, and it means an operator is compiled once rather than once per
+/// sender type it happens to be built with. A sender is used per batch, so the indirect
+/// call costs nothing next to producing the batch.
 pub trait OperatorFactory<O>: Send {
     /// Build the operator chain, outputting to `sender`.
-    fn build<S: Sender<O> + 'static>(self: Box<Self>, sender: S) -> OperatorGraphBuilder;
+    fn build(self: Box<Self>, sender: Box<dyn Sender<O>>) -> OperatorGraphBuilder;
+}
+
+/// A boxed factory is itself a factory, so an already-erased head can be handed
+/// straight to a stage that wants one by value.
+impl<O> OperatorFactory<O> for Box<dyn OperatorFactory<O>> {
+    fn build(self: Box<Self>, sender: Box<dyn Sender<O>>) -> OperatorGraphBuilder {
+        (*self).build(sender)
+    }
 }

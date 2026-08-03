@@ -12,7 +12,7 @@
 //!   (process one input item) and optionally [`finish`](Unary::finish) (emit final results
 //!   after all input is drained, e.g. aggregation output).
 //!
-//! - [`UnaryOperator<I, O, U, R, S>`] — The [`Operator`] implementation that wires a
+//! - [`UnaryOperator<I, O, U, R>`] — The [`Operator`] implementation that wires a
 //!   [`Unary`] to a receiver and sender. Created during the factory build step on the
 //!   worker thread.
 //!
@@ -92,7 +92,7 @@ mod order_by_limit;
 
 pub use copy_out::CopyOutFactory;
 pub(crate) use join::create_join_factories;
-pub use join::{JoinKind, JoinOutputColumns, JoinSpec};
+pub use join::{JoinKind, JoinOutputColumns, JoinRecordBatchOperatorFactory, JoinSpec};
 pub use limit::LimitFactory;
 pub use order_by_limit::{DynamicFilterSlot, OrderBy, OrderByLimitFactory};
 
@@ -121,7 +121,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// but the parquet pipeline uses other types (e.g. `CompressedPage -> DecompressedPage`).
 pub trait Unary<I, O> {
     /// Process one input item, sending zero or more output items to `sender`.
-    fn consume<S: Sender<O>>(&mut self, object: I, sender: &mut S) -> Result<()>;
+    fn consume(&mut self, object: I, sender: &mut dyn Sender<O>) -> Result<()>;
 
     /// Return any pending filesystem requests. See [`Operator::next_fs_requests`].
     fn next_fs_requests(&mut self) -> Result<Vec<FsRequest>> {
@@ -142,17 +142,17 @@ pub trait Unary<I, O> {
 
     /// Handle a completed filesystem operation. Read bytes are already
     /// committed to the cache slot.
-    fn process_fs_read_response<S: Sender<O>>(
+    fn process_fs_read_response(
         &mut self,
-        _sender: &mut S,
+        _sender: &mut dyn Sender<O>,
         _request: FsReadRequest,
     ) -> Result<()> {
         unreachable!()
     }
 
-    fn process_fs_write_response<S: Sender<O>>(
+    fn process_fs_write_response(
         &mut self,
-        _sender: &mut S,
+        _sender: &mut dyn Sender<O>,
         _request: FsWriteRequest,
     ) -> Result<()> {
         unreachable!()
@@ -160,18 +160,18 @@ pub trait Unary<I, O> {
 
     /// Handle a completed HTTP GET; its bytes are already committed to the
     /// cache slot.
-    fn process_http_get_response<S: Sender<O>>(
+    fn process_http_get_response(
         &mut self,
-        _sender: &mut S,
+        _sender: &mut dyn Sender<O>,
         _request: HttpGetRequest,
     ) -> Result<()> {
         unreachable!()
     }
 
     /// Handle a completed HTTP upload.
-    fn process_http_upload_response<S: Sender<O>>(
+    fn process_http_upload_response(
         &mut self,
-        _sender: &mut S,
+        _sender: &mut dyn Sender<O>,
         _request: HttpUploadRequest,
     ) -> Result<()> {
         unreachable!()
@@ -179,7 +179,7 @@ pub trait Unary<I, O> {
 
     /// Called each iteration even when no input is available. Useful for operators
     /// that generate work independently of input (e.g. emitting buffered results).
-    fn run<S: Sender<O>>(&mut self, _sender: &mut S) -> Result<WorkStatus> {
+    fn run(&mut self, _sender: &mut dyn Sender<O>) -> Result<WorkStatus> {
         Ok(WorkStatus::Pending)
     }
 
@@ -192,7 +192,7 @@ pub trait Unary<I, O> {
     /// responsibility of the specific operator to do any synchronizing necessary.
     ///
     /// Once finish is called, `consume` is guaranteed never to be called again.
-    fn finish<S: Sender<O>>(&mut self, _sender: &mut S) -> Result<bool> {
+    fn finish(&mut self, _sender: &mut dyn Sender<O>) -> Result<bool> {
         Ok(true)
     }
 
@@ -234,17 +234,22 @@ pub trait Unary<I, O> {
 ///
 /// Created during the factory build step — not constructed directly. See
 /// [`UnaryOperatorFactory`] in the [`factory`] module.
-pub struct UnaryOperator<I, O, U: Unary<I, O>, R: Receiver<I>, S: Sender<O>> {
+pub struct UnaryOperator<I, O, U: Unary<I, O>, R: Receiver<I>> {
     unary: U,
     receiver: R,
-    sender: S,
+    sender: Box<dyn Sender<O>>,
     notified_finished: bool,
     siblings_left: Arc<AtomicUsize>,
     _phantom: PhantomData<(I, O)>,
 }
 
-impl<I, O, U: Unary<I, O>, R: Receiver<I>, S: Sender<O>> UnaryOperator<I, O, U, R, S> {
-    pub fn new(unary: U, receiver: R, sender: S, siblings_left: Arc<AtomicUsize>) -> Self {
+impl<I, O, U: Unary<I, O>, R: Receiver<I>> UnaryOperator<I, O, U, R> {
+    pub fn new(
+        unary: U,
+        receiver: R,
+        sender: Box<dyn Sender<O>>,
+        siblings_left: Arc<AtomicUsize>,
+    ) -> Self {
         Self {
             unary,
             receiver,
@@ -256,20 +261,18 @@ impl<I, O, U: Unary<I, O>, R: Receiver<I>, S: Sender<O>> UnaryOperator<I, O, U, 
     }
 }
 
-impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
-    for UnaryOperator<I, O, U, IN, OUT>
-{
+impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, IN> {
     fn run_cpu_work(&mut self) -> super::Result<WorkStatus> {
         if !self.unary.ready_for_more_work() {
             return Ok(WorkStatus::Pending);
         }
 
         let item = match self.receiver.try_recv() {
-            None => return Ok(self.unary.run(&mut self.sender)?),
+            None => return Ok(self.unary.run(&mut *self.sender)?),
             Some(t) => t,
         };
 
-        self.unary.consume(item, &mut self.sender)?;
+        self.unary.consume(item, &mut *self.sender)?;
 
         Ok(WorkStatus::Ran)
     }
@@ -285,25 +288,25 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
     fn process_fs_read_response(&mut self, request: FsReadRequest) -> super::Result<()> {
         Ok(self
             .unary
-            .process_fs_read_response(&mut self.sender, request)?)
+            .process_fs_read_response(&mut *self.sender, request)?)
     }
 
     fn process_fs_write_response(&mut self, request: FsWriteRequest) -> super::Result<()> {
         Ok(self
             .unary
-            .process_fs_write_response(&mut self.sender, request)?)
+            .process_fs_write_response(&mut *self.sender, request)?)
     }
 
     fn process_http_get_response(&mut self, request: HttpGetRequest) -> super::Result<()> {
         Ok(self
             .unary
-            .process_http_get_response(&mut self.sender, request)?)
+            .process_http_get_response(&mut *self.sender, request)?)
     }
 
     fn process_http_upload_response(&mut self, request: HttpUploadRequest) -> super::Result<()> {
         Ok(self
             .unary
-            .process_http_upload_response(&mut self.sender, request)?)
+            .process_http_upload_response(&mut *self.sender, request)?)
     }
 
     fn try_finish(&mut self) -> super::Result<FinishStatus> {
@@ -350,7 +353,7 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
                 return Ok(FinishStatus::Pending);
             }
 
-            if self.unary.finish(&mut self.sender)? {
+            if self.unary.finish(&mut *self.sender)? {
                 // `finish` may have emitted final batches downstream, so wake
                 // any parked peers to pick that work up.
                 worker_waker().notify();
@@ -371,7 +374,7 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>, OUT: Sender<O>> Operator
         }
         match self.receiver.steal() {
             Some(s) => {
-                self.unary.consume(s, &mut self.sender)?;
+                self.unary.consume(s, &mut *self.sender)?;
                 Ok(WorkStatus::Ran)
             }
             None => Ok(WorkStatus::Pending),

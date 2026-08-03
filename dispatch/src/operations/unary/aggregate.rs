@@ -517,10 +517,10 @@ impl<A: IntCell + F64Cell + WideCell> Aggregate<A> {
 impl<A: IntCell + F64Cell + WideCell> Consumer<RecordBatch, RecordBatch> for Aggregate<A> {
     type Outputter = AggregateOutputter<A>;
 
-    fn consume<OP: Sender<RecordBatch>>(
+    fn consume(
         &mut self,
         batch: RecordBatch,
-        _output: &mut OP,
+        _output: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<()> {
         for slot in &mut self.local {
             slot.consume(&batch);
@@ -557,7 +557,7 @@ pub struct AggregateOutputter<A: IntCell> {
 }
 
 impl<A: IntCell + F64Cell + WideCell> Outputter<RecordBatch> for AggregateOutputter<A> {
-    fn output<OP: Sender<RecordBatch>>(&mut self, output: &mut OP) -> unary::Result<bool> {
+    fn output(&mut self, output: &mut dyn Sender<RecordBatch>) -> unary::Result<bool> {
         loop {
             match self.rx.try_recv() {
                 Ok(worker_slots) => {

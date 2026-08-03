@@ -40,10 +40,10 @@ impl UnaryFactory<RecordBatch, RecordBatch> for CopyOutFactory {
 pub struct CopyOut;
 
 impl Unary<RecordBatch, RecordBatch> for CopyOut {
-    fn consume<S: Sender<RecordBatch>>(
+    fn consume(
         &mut self,
         batch: RecordBatch,
-        sender: &mut S,
+        sender: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<()> {
         let schema = batch.schema();
         let columns = batch

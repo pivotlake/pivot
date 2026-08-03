@@ -45,16 +45,16 @@ impl<C> Unary<TableFile, RecordBatch> for TableBuildSink<C>
 where
     C: FnOnce(Vec<TableFile>) + Send + 'static,
 {
-    fn consume<S: Sender<RecordBatch>>(
+    fn consume(
         &mut self,
         table_file: TableFile,
-        _sender: &mut S,
+        _sender: &mut dyn Sender<RecordBatch>,
     ) -> dispatch::UnaryResult<()> {
         self.table_files.push(table_file);
         Ok(())
     }
 
-    fn finish<S: Sender<RecordBatch>>(&mut self, _sender: &mut S) -> dispatch::UnaryResult<bool> {
+    fn finish(&mut self, _sender: &mut dyn Sender<RecordBatch>) -> dispatch::UnaryResult<bool> {
         if let Some(stage) = self.stage.take() {
             stage(mem::take(&mut self.table_files));
         }

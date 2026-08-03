@@ -130,10 +130,10 @@ where
     /// Apply the selection sitting in `self.selection` to `batch`: send whole
     /// surviving batches directly, coalesce partial ones through the
     /// accumulator.
-    fn deliver_selected_rows<OP: Sender<RecordBatch>>(
+    fn deliver_selected_rows(
         &mut self,
         batch: RecordBatch,
-        output: &mut OP,
+        output: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<()> {
         let kept = self.selection.len();
         if kept == 0 {
@@ -178,10 +178,10 @@ impl<F> Unary<RecordBatch, RecordBatch> for Filter<F>
 where
     F: FnMut(&RecordBatch, &mut SlabAllocator, &mut Vec<u32>) -> RowSelection + Send,
 {
-    fn consume<OP: Sender<RecordBatch>>(
+    fn consume(
         &mut self,
         batch: RecordBatch,
-        output: &mut OP,
+        output: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<()> {
         self.selection.clear();
         let selection = (self.func)(&batch, &mut self.allocator, &mut self.selection);
@@ -198,7 +198,7 @@ where
         Ok(())
     }
 
-    fn finish<OP: Sender<RecordBatch>>(&mut self, output: &mut OP) -> unary::Result<bool> {
+    fn finish(&mut self, output: &mut dyn Sender<RecordBatch>) -> unary::Result<bool> {
         if let Some(accumulator) = &mut self.accumulator
             && !accumulator.is_empty()
         {

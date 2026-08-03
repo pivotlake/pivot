@@ -147,10 +147,10 @@ fn serialize_header(header: &PageHeader) -> Vec<Bytes> {
 }
 
 impl Unary<CompressedPage, DecompressedPage> for Decompressor {
-    fn consume<OP: Sender<DecompressedPage>>(
+    fn consume(
         &mut self,
         page: CompressedPage,
-        output: &mut OP,
+        output: &mut dyn Sender<DecompressedPage>,
     ) -> dispatch::UnaryResult<()> {
         // A data page whose row group was pruned downstream (dictionary pushdown
         // set the shared flag) is never read: the decoder has already dropped the

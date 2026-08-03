@@ -74,9 +74,9 @@ impl<I, O, UF: UnaryFactory<I, O>, C: ChannelFactory<I>, OP: OperatorFactory<I>>
 impl<I: 'static, O: 'static, UF: UnaryFactory<I, O>, C: ChannelFactory<I>, OP: OperatorFactory<I>>
     OperatorFactory<O> for UnaryOperatorFactory<I, O, UF, C, OP>
 {
-    fn build<OS: Sender<O> + 'static>(self: Box<Self>, sender: OS) -> OperatorGraphBuilder {
+    fn build(self: Box<Self>, sender: Box<dyn Sender<O>>) -> OperatorGraphBuilder {
         let (tx, rx) = self.channel_factory.build();
-        let chain = Box::new(self.head).build(tx);
+        let chain = Box::new(self.head).build(Box::new(tx));
         chain.with(Box::new(UnaryOperator::new(
             self.unary_factory.build_unary(),
             rx,
@@ -112,7 +112,7 @@ impl<I, O, UF: UnaryFactory<I, O>, C: RootChannelFactory<I>> RootUnaryOperatorFa
 impl<I: 'static, O: 'static, UF: UnaryFactory<I, O>, C: RootChannelFactory<I>> OperatorFactory<O>
     for RootUnaryOperatorFactory<I, O, UF, C>
 {
-    fn build<OS: Sender<O> + 'static>(self: Box<Self>, sender: OS) -> OperatorGraphBuilder {
+    fn build(self: Box<Self>, sender: Box<dyn Sender<O>>) -> OperatorGraphBuilder {
         let rx = self.channel_factory.build();
         OperatorGraphBuilder::root(Box::new(UnaryOperator::new(
             self.unary_factory.build_unary(),

@@ -89,10 +89,10 @@ impl Limit {
 impl Consumer<RecordBatch, RecordBatch> for Limit {
     type Outputter = LimitOutputter;
 
-    fn consume<S: Sender<RecordBatch>>(
+    fn consume(
         &mut self,
         batch: RecordBatch,
-        _sender: &mut S,
+        _sender: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<()> {
         // Keep only what we still have room for. `fetch` rows total across all
         // workers answer any LIMIT/OFFSET, so we never hold more than that.
@@ -181,7 +181,7 @@ pub struct LimitOutputter {
 }
 
 impl Outputter<RecordBatch> for LimitOutputter {
-    fn output<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> unary::Result<bool> {
+    fn output(&mut self, sender: &mut dyn Sender<RecordBatch>) -> unary::Result<bool> {
         match self.rx.try_recv() {
             Ok(batch) => {
                 self.batches.push(batch);

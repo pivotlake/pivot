@@ -8,8 +8,12 @@ use arrow_schema::Field;
 use crossbeam_deque::Injector;
 use std::hash::Hash;
 
+use crate::api::OperatorFactory;
+use crate::api::OperatorGraphBuilder;
 use crate::memory::MultiSlabBuffer;
 use crate::operations::UnaryFactory;
+use crate::operations::channels::{ChannelFactory, Sender, StealableChannelFactory};
+use crate::operations::unary::UnaryOperator;
 use crate::operations::unary::join::build::{
     BuildWorkerOutput, JoinBuildConsumer, JoinPartitionJob, NUM_PARTITIONS,
 };
@@ -172,5 +176,60 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, const SE
             self.probe_fields,
             self.unmatched,
         )
+    }
+}
+
+struct DiscardSender;
+
+impl Sender<()> for DiscardSender {
+    fn send(&mut self, _item: ()) -> crate::operations::channels::Result<()> {
+        Ok(())
+    }
+}
+
+/// Builds the probe result path and the disconnected build path into one
+/// per-worker operator graph.
+pub struct JoinRecordBatchOperatorFactory<BF, PF> {
+    pub probe_head: Box<dyn OperatorFactory<RecordBatch>>,
+    pub build_head: Box<dyn OperatorFactory<RecordBatch>>,
+    pub build_factory: BF,
+    pub probe_factory: PF,
+    pub build_channel_factory: StealableChannelFactory<RecordBatch>,
+    pub probe_channel_factory: StealableChannelFactory<RecordBatch>,
+    pub build_siblings_left: Arc<AtomicUsize>,
+    pub probe_siblings_left: Arc<AtomicUsize>,
+    pub build_ready: Arc<AtomicBool>,
+}
+
+impl<BF, PF> OperatorFactory<RecordBatch> for JoinRecordBatchOperatorFactory<BF, PF>
+where
+    BF: UnaryFactory<RecordBatch, ()>,
+    PF: UnaryFactory<RecordBatch, RecordBatch>,
+{
+    fn build(self: Box<Self>, sender: Box<dyn Sender<RecordBatch>>) -> OperatorGraphBuilder {
+        let (probe_tx, probe_rx) = self.probe_channel_factory.build();
+        let probe_graph = self
+            .probe_head
+            .build(Box::new(probe_tx))
+            .gated_by(self.build_ready)
+            .with(Box::new(UnaryOperator::new(
+                self.probe_factory.build_unary(),
+                probe_rx,
+                sender,
+                self.probe_siblings_left,
+            )));
+
+        let (build_tx, build_rx) = self.build_channel_factory.build();
+        let build_graph =
+            self.build_head
+                .build(Box::new(build_tx))
+                .with(Box::new(UnaryOperator::new(
+                    self.build_factory.build_unary(),
+                    build_rx,
+                    Box::new(DiscardSender),
+                    self.build_siblings_left,
+                )));
+
+        probe_graph.with_side_graph(build_graph)
     }
 }

@@ -308,10 +308,10 @@ impl Upload {
 }
 
 impl Unary<EncodedFile, RecordBatch> for Upload {
-    fn consume<S: Sender<RecordBatch>>(
+    fn consume(
         &mut self,
         encoded: EncodedFile,
-        _sender: &mut S,
+        _sender: &mut dyn Sender<RecordBatch>,
     ) -> dispatch::UnaryResult<()> {
         let path = ObjectPath::new(format!("pivot-{}.parquet", uuid::Uuid::new_v4()));
         let key = self.location.resolve(&path);
@@ -369,17 +369,17 @@ impl Unary<EncodedFile, RecordBatch> for Upload {
         Ok(mem::take(&mut self.pending_http))
     }
 
-    fn process_fs_write_response<S: Sender<RecordBatch>>(
+    fn process_fs_write_response(
         &mut self,
-        _sender: &mut S,
+        _sender: &mut dyn Sender<RecordBatch>,
         request: FsWriteRequest,
     ) -> dispatch::UnaryResult<()> {
         self.complete(request.data.as_ptr() as usize)
     }
 
-    fn process_http_upload_response<S: Sender<RecordBatch>>(
+    fn process_http_upload_response(
         &mut self,
-        _sender: &mut S,
+        _sender: &mut dyn Sender<RecordBatch>,
         request: HttpUploadRequest,
     ) -> dispatch::UnaryResult<()> {
         self.complete(request.data.as_ptr() as usize)
@@ -393,7 +393,7 @@ impl Unary<EncodedFile, RecordBatch> for Upload {
         !self.in_flight.is_empty()
     }
 
-    fn finish<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> dispatch::UnaryResult<bool> {
+    fn finish(&mut self, sender: &mut dyn Sender<RecordBatch>) -> dispatch::UnaryResult<bool> {
         // Each worker reaches here after its own uploads have landed. The last
         // worker to finish observes every worker's row-count contribution and
         // emits the single result row; earlier workers return without emitting.
