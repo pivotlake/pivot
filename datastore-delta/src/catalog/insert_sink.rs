@@ -19,7 +19,7 @@ use uuid::Uuid;
 
 use crate::catalog::CatalogTable;
 use crate::parquet::RowGroupMetadata;
-use crate::parquet::writing::{EncodedFile, encode_record_batches_spec, unshred_batch};
+use crate::parquet::writing::{AssembledFile, encode_record_batches_spec, unshred_batch};
 use crate::store::{DataFileLocation, FileRef, ObjectPath, ObjectStore};
 
 /// Build the dataflow that writes `input`'s rows into `table` as Parquet and
@@ -135,7 +135,7 @@ pub(super) fn encode_and_upload_spec(
     let rows = Arc::new(AtomicUsize::new(0));
     let remaining_workers = Arc::new(AtomicUsize::new(workers));
     let uploads = encoded.chain(
-        stealable::<EncodedFile>(dispatcher.topology())
+        stealable::<AssembledFile>(dispatcher.topology())
             .into_iter()
             .collect(),
         (0..workers)
@@ -207,7 +207,7 @@ impl UploadFactory {
     }
 }
 
-impl UnaryFactory<EncodedFile, RecordBatch> for UploadFactory {
+impl UnaryFactory<AssembledFile, RecordBatch> for UploadFactory {
     type Unary = Upload;
 
     fn build_unary(self) -> Self::Unary {
@@ -307,18 +307,18 @@ impl Upload {
     }
 }
 
-impl Unary<EncodedFile, RecordBatch> for Upload {
+impl Unary<AssembledFile, RecordBatch> for Upload {
     fn consume(
         &mut self,
-        encoded: EncodedFile,
+        encoded: AssembledFile,
         _sender: &mut dyn Sender<RecordBatch>,
     ) -> dispatch::UnaryResult<()> {
         let path = ObjectPath::new(format!("pivot-{}.parquet", uuid::Uuid::new_v4()));
         let key = self.location.resolve(&path);
-        let data: Arc<[u8]> = encoded.bytes.into();
-        // The write/upload request below shares this `Arc`, so its pointer keys
+        let data = Arc::new(encoded.bytes);
+        // The write/upload request below shares this `Arc`, so its address keys
         // the in-flight entry a later completion resolves against.
-        let id = data.as_ptr() as usize;
+        let id = Arc::as_ptr(&data) as usize;
         let file = crate::store::FileRef {
             path,
             size: data.len() as u64,
@@ -374,7 +374,7 @@ impl Unary<EncodedFile, RecordBatch> for Upload {
         _sender: &mut dyn Sender<RecordBatch>,
         request: FsWriteRequest,
     ) -> dispatch::UnaryResult<()> {
-        self.complete(request.data.as_ptr() as usize)
+        self.complete(Arc::as_ptr(&request.data) as usize)
     }
 
     fn process_http_upload_response(
@@ -382,7 +382,7 @@ impl Unary<EncodedFile, RecordBatch> for Upload {
         _sender: &mut dyn Sender<RecordBatch>,
         request: HttpUploadRequest,
     ) -> dispatch::UnaryResult<()> {
-        self.complete(request.data.as_ptr() as usize)
+        self.complete(Arc::as_ptr(&request.data) as usize)
     }
 
     /// The uploads are async: their writes/uploads land later on the ring, so the

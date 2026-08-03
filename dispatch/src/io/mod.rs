@@ -25,6 +25,7 @@
 mod backend;
 
 use crate::Identifier;
+use crate::memory::FileBytes;
 use crate::memory::compressed_cache::MissingExtent;
 use std::fmt::{Debug, Formatter};
 use std::fs::{File, OpenOptions};
@@ -332,10 +333,12 @@ pub struct FsReadRequest {
 }
 
 /// An asynchronous filesystem write owned by a dataflow operator. `data` stays
-/// alive until the shared io_uring reports the write complete.
+/// alive until the shared io_uring reports the write complete, and goes out one
+/// run at a time: holding it as runs is what keeps a file's bytes on the ring
+/// instead of in one heap allocation.
 pub struct FsWriteRequest {
     pub file: Arc<File>,
-    pub data: Arc<[u8]>,
+    pub data: Arc<FileBytes>,
 }
 
 /// A filesystem operation issued by a dataflow operator. Reads and writes use
@@ -363,10 +366,11 @@ pub struct HttpGetRequest {
 }
 
 /// An object upload driven by the same per-worker HTTP connection pool and
-/// io_uring as range GETs. Always a `PUT`.
+/// io_uring as range GETs. Always a `PUT`. The body goes out run by run, like a
+/// filesystem write's.
 pub struct HttpUploadRequest {
     pub remote: Arc<RemoteFile>,
-    pub data: Arc<[u8]>,
+    pub data: Arc<FileBytes>,
 }
 
 /// An HTTP operation issued by a dataflow operator. GETs pass through the

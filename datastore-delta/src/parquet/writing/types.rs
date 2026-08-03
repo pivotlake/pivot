@@ -13,6 +13,7 @@ use std::sync::Arc;
 use crate::SortBounds;
 use arrow_array::ArrayRef;
 use arrow_schema::SchemaRef;
+use dispatch::memory::{FileBytes, Slab};
 use dispatch::{Identifier, WorkerIdOutput};
 use thriftparquet::footer::Statistics;
 use thriftparquet::general::Encoding;
@@ -47,14 +48,41 @@ pub(crate) struct PartitionTag {
 /// A finished Parquet file from the write pipeline, with the manifest metadata to
 /// record for it (`partition`/`sort_bounds` are `None` for an unpartitioned,
 /// unsorted write).
-pub struct EncodedFile {
-    pub bytes: Vec<u8>,
+///
+/// The bytes are the slabs its pages were encoded into, in file order, so the
+/// file is never assembled into one buffer. They are ring memory, so this must
+/// be dropped on a dispatch worker; [`encode_record_batches`](super::encode_record_batches)
+/// hands out [`EncodedFile`] instead for callers outside the pool.
+pub(crate) struct AssembledFile {
+    pub bytes: FileBytes,
     /// The footer metadata written into `bytes`. Kept so a consumer that records
     /// the file's row groups can build them straight from here instead of parsing
     /// the footer back out of a file it just produced.
     pub metadata: thriftparquet::footer::FileMetaData,
     pub partition: Option<crate::PartitionValues>,
     pub sort_bounds: Option<SortBounds>,
+}
+
+/// A finished file for a caller outside the worker pool: the same metadata, with
+/// the bytes copied onto the heap so they can be held and dropped anywhere.
+pub struct EncodedFile {
+    pub bytes: Vec<u8>,
+    pub metadata: thriftparquet::footer::FileMetaData,
+    pub partition: Option<crate::PartitionValues>,
+    pub sort_bounds: Option<SortBounds>,
+}
+
+impl AssembledFile {
+    /// Copy the file's bytes onto the heap, which is what lets it leave the
+    /// worker that assembled it.
+    pub(crate) fn to_encoded_file(&self) -> EncodedFile {
+        EncodedFile {
+            bytes: self.bytes.runs().flatten().copied().collect(),
+            metadata: self.metadata.clone(),
+            partition: self.partition.clone(),
+            sort_bounds: self.sort_bounds.clone(),
+        }
+    }
 }
 
 /// The per-row-group metadata every column chunk of a row group shares: its
@@ -87,8 +115,10 @@ pub(crate) struct EncodedPage {
     pub(crate) uncompressed_size: usize,
     /// Size of the page's thrift header (precedes the compressed body).
     pub(crate) header_len: usize,
-    /// The page on the wire: header followed by the compressed body.
-    pub(crate) bytes: Vec<u8>,
+    /// The page on the wire, header followed by the compressed body, in one
+    /// slab. Every stage after this moves the slab rather than its bytes, so
+    /// this is the only place a page's bytes are written.
+    pub(crate) bytes: Slab,
 }
 
 /// One leaf's encoded pages. Parquet stores a chunk per *leaf*, not per column:

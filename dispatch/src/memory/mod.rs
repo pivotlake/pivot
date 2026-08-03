@@ -16,6 +16,9 @@
 //!
 //! [`WriteBuffer`]s can also be used for many miscellaneous things, such as Vectors and HashTables. It
 //! is generally preferred to use [`WriteBuffer`]s as the memory is easily accounted for. See [`SlabAllocator`].
+//! Bytes on their way out of the engine are held the same way: an encoded Parquet file is a
+//! [`FileBytes`] of the slabs its pages were written into, so a large write is accounted against the
+//! ring rather than growing the heap beside it.
 //!
 //! On a multi-NUMA-node machine the one ring is split into a contiguous region per node
 //! (see [`RingLayout`]): a worker faults, acquires, and evicts only its own node's slots,
@@ -36,6 +39,9 @@ pub use decompressed_cache::{BlockKey, DecompressedCache, Segment};
 
 pub mod clock;
 pub use clock::{Clock, Owner};
+
+mod file_bytes;
+pub use file_bytes::FileBytes;
 
 mod fill_cursor;
 pub use fill_cursor::FillCursor;

@@ -27,6 +27,7 @@ mod rle;
 
 use arrow_array::ArrayRef;
 use arrow_schema::Field;
+use dispatch::memory::SlabAllocator;
 use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult};
 use thriftparquet::footer::Statistics;
 use thriftparquet::general::Encoding;
@@ -45,7 +46,12 @@ pub(super) fn factories(worker_count: usize) -> Vec<ColumnEncoderFactory> {
 }
 
 #[derive(Default)]
-pub(super) struct ColumnEncoder;
+pub(super) struct ColumnEncoder {
+    /// The ring memory this worker's pages are written into, taken on the first
+    /// page rather than when the operator is built, so a worker that encodes
+    /// nothing holds no buffer.
+    allocator: Option<SlabAllocator>,
+}
 
 impl Unary<ColumnChunkJob, EncodedColumnChunk> for ColumnEncoder {
     fn consume(
@@ -54,7 +60,10 @@ impl Unary<ColumnChunkJob, EncodedColumnChunk> for ColumnEncoder {
         sender: &mut dyn Sender<EncodedColumnChunk>,
     ) -> UnaryResult<()> {
         let field = job.header.schema.field(job.column);
-        let leaves = encode_column_chunk(field, &job.values)?;
+        let allocator = self
+            .allocator
+            .get_or_insert_with(|| SlabAllocator::new(false));
+        let leaves = encode_column_chunk(field, &job.values, allocator)?;
         sender.send(EncodedColumnChunk {
             header: job.header,
             column: job.column,
@@ -69,10 +78,11 @@ impl Unary<ColumnChunkJob, EncodedColumnChunk> for ColumnEncoder {
 pub(in crate::parquet::writing) fn encode_column_chunk(
     field: &Field,
     values: &ArrayRef,
+    allocator: &mut SlabAllocator,
 ) -> WriteResult<Vec<EncodedLeaf>> {
     leaves::flatten(field, values)?
         .into_iter()
-        .map(encode_leaf)
+        .map(|leaf| encode_leaf(leaf, allocator))
         .collect()
 }
 
@@ -86,20 +96,25 @@ pub(in crate::parquet::writing) fn encode_column_chunk(
 /// the width they need, which is most of the size of a key column. Floats, and
 /// decimals too wide to store as an integer, have no delta form and still take
 /// PLAIN.
-fn encode_leaf(leaf: Leaf) -> WriteResult<EncodedLeaf> {
+fn encode_leaf(leaf: Leaf, allocator: &mut SlabAllocator) -> WriteResult<EncodedLeaf> {
     let physical_type = crate::parquet::arrow_to_parquet_physical(leaf.values.data_type())?;
     let statistics = leaf_statistics(&leaf);
-    let (dictionary_page, data_page_encoding, data_pages) = match dictionary::try_encode(&leaf)? {
-        Some((dictionary_page, index_page)) => (
-            Some(dictionary_page),
-            Encoding::RLE_DICTIONARY,
-            vec![index_page],
-        ),
-        None => match delta::try_encode_chunk(&leaf)? {
-            Some((encoding, pages)) => (None, encoding, pages),
-            None => (None, Encoding::PLAIN, plain::encode_chunk(&leaf)?),
-        },
-    };
+    let (dictionary_page, data_page_encoding, data_pages) =
+        match dictionary::try_encode(&leaf, allocator)? {
+            Some((dictionary_page, index_page)) => (
+                Some(dictionary_page),
+                Encoding::RLE_DICTIONARY,
+                vec![index_page],
+            ),
+            None => match delta::try_encode_chunk(&leaf, allocator)? {
+                Some((encoding, pages)) => (None, encoding, pages),
+                None => (
+                    None,
+                    Encoding::PLAIN,
+                    plain::encode_chunk(&leaf, allocator)?,
+                ),
+            },
+        };
     Ok(EncodedLeaf {
         path: leaf.path,
         physical_type,

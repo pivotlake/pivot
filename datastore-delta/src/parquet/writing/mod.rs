@@ -28,7 +28,7 @@
 //!    snappy-compress. The one heavy stage; finished chunks route back to their
 //!    file's owner worker. (Leaf flattening, page cutting and index RLE live in
 //!    the `encoder` directory.)
-//! 3. [`assembler`] (`EncodedColumnChunk → EncodedFile`) — gather a file's column
+//! 3. [`assembler`] (`EncodedColumnChunk → AssembledFile`) — gather a file's column
 //!    chunks, lay each out (the dictionary page, then the data pages) with
 //!    sort-column footer statistics, and emit the finished file.
 //!
@@ -48,6 +48,7 @@ mod stats;
 mod types;
 
 pub(crate) use shredding::unshred_batch;
+pub(crate) use types::AssembledFile;
 pub use types::EncodedFile;
 
 use std::sync::Arc;
@@ -72,6 +73,9 @@ pub fn encode_record_batches(
     target_rows_per_group: usize,
     target_row_groups_per_file: usize,
 ) -> DataFlowHandle<EncodedFile> {
+    // A file's bytes are ring memory, which is released through the worker that
+    // holds it, so the last stage copies each one onto the heap before it leaves
+    // the pool. The INSERT path keeps the ring-backed form and uploads from it.
     encode_record_batches_spec(
         spec,
         partition_by,
@@ -79,6 +83,7 @@ pub fn encode_record_batches(
         target_rows_per_group,
         target_row_groups_per_file,
     )
+    .map_each(|file: AssembledFile| file.to_encoded_file())
     .execute()
 }
 
@@ -91,7 +96,7 @@ pub(crate) fn encode_record_batches_spec(
     sort_by: Arc<[String]>,
     target_rows_per_group: usize,
     target_row_groups_per_file: usize,
-) -> OperatorSpec<EncodedFile, impl OperatorFactory<EncodedFile> + 'static> {
+) -> OperatorSpec<AssembledFile, impl OperatorFactory<AssembledFile> + 'static> {
     let (dispatcher, heads) = spec.into_parts();
     let workers = heads.len();
     let batches = OperatorSpec::new(dispatcher, heads.into_iter().collect::<Vec<_>>());
@@ -117,7 +122,7 @@ fn encode_stages<OF: OperatorFactory<RecordBatch> + Send + 'static>(
     sort_by: Arc<[String]>,
     target_rows_per_group: usize,
     target_row_groups_per_file: usize,
-) -> OperatorSpec<EncodedFile, impl OperatorFactory<EncodedFile> + 'static> {
+) -> OperatorSpec<AssembledFile, impl OperatorFactory<AssembledFile> + 'static> {
     // One file's worth of rows; a partition flushes a file once it reaches this.
     let file_rows = target_rows_per_group
         .saturating_mul(target_row_groups_per_file)

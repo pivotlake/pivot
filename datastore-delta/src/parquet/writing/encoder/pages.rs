@@ -18,6 +18,8 @@ use thriftparquet::general::{Encoding, PageType};
 use thriftparquet::headers::{DataPageHeader, DictionaryPageHeader, PageHeader};
 use thriftparquet::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 
+use dispatch::memory::SlabAllocator;
+
 use super::super::error::{WriteError, WriteResult};
 use super::super::types::EncodedPage;
 use super::leaves::Leaf;
@@ -159,6 +161,7 @@ pub(super) fn assemble_page(
     num_rows: i64,
     raw: Vec<u8>,
     kind: PageKind,
+    allocator: &mut SlabAllocator,
 ) -> WriteResult<EncodedPage> {
     let compressed = Encoder::new().compress_vec(&raw)?;
     let (page_type, data_page_header, dictionary_page_header) = match kind {
@@ -201,10 +204,16 @@ pub(super) fn assemble_page(
     };
 
     // The page on the wire is the thrift header followed by the compressed body.
-    let mut bytes = Vec::new();
-    header.write_thrift(&mut ThriftCompactOutputProtocol::new(&mut bytes))?;
-    let header_len = bytes.len();
-    bytes.extend_from_slice(&compressed);
+    // Both are written once, into a slab sized to hold exactly them: this is the
+    // only copy a page's bytes make, since the assembler moves the slab rather
+    // than concatenating what is in it.
+    let mut head = Vec::new();
+    header.write_thrift(&mut ThriftCompactOutputProtocol::new(&mut head))?;
+    let header_len = head.len();
+    let mut bytes = allocator.get_slab_of_size(header_len + compressed.len(), false);
+    let page = bytes.as_mut_slice();
+    page[..header_len].copy_from_slice(&head);
+    page[header_len..].copy_from_slice(&compressed);
 
     Ok(EncodedPage {
         num_rows,
