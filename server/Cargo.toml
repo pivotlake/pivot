@@ -36,6 +36,10 @@ sysinfo = { workspace = true }
 # so it flushes its report (a plain `Child::kill` would SIGKILL and lose it).
 libc = { workspace = true, optional = true }
 
+[target.'cfg(unix)'.dependencies]
+# Reads and raises the process's open-file limit at startup (see `limits`).
+nix = { version = "0.31.2", features = ["resource"] }
+
 [features]
 # Staging-only per-query `perf record` profiling: when on, a session that runs
 # `SET perf = 1` profiles each of its queries (one report per query) into the
