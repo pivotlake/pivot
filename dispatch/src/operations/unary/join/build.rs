@@ -2,15 +2,14 @@ use crate::memory::{SlabAllocator, SlabVec};
 use crate::operations::channels::Sender;
 use crate::operations::unary::join::JoinTable;
 use crate::operations::unary::join::directory::JoinDirectory;
+use crate::operations::unary::join::keys::JoinKey;
 use crate::operations::{Consumer, Outputter, unary};
 use crate::waker::worker_waker;
 use ahash::RandomState;
 use arrow::compute::{concat_batches, filter_record_batch};
-use arrow_array::cast::AsArray;
-use arrow_array::types::ArrowPrimitiveType;
 use arrow_array::{Array, BooleanArray, RecordBatch};
+use arrow_buffer::NullBuffer;
 use crossbeam_deque::{Injector, Steal};
-use std::hash::Hash;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use tracing::debug;
@@ -41,43 +40,38 @@ pub(crate) struct BuildWorkerOutput<K: Copy> {
     payload: Vec<RecordBatch>,
 }
 
-pub struct JoinBuildConsumer<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool> {
-    key_column: usize,
+pub struct JoinBuildConsumer<K: JoinKey, const BUILD_OUTER: bool> {
+    key_columns: Vec<usize>,
     worker_id: usize,
     hash_state: RandomState,
-    values: PartitionBuffers<T::Native>,
+    values: PartitionBuffers<K::Stored>,
     payload: Vec<RecordBatch>,
     rows_consumed: usize,
     slab_allocator: SlabAllocator,
     partition_sizes: Arc<Vec<AtomicUsize>>,
-    sender: mpsc::Sender<BuildWorkerOutput<T::Native>>,
-    outputter: JoinBuilder<T::Native, BUILD_OUTER>,
+    sender: mpsc::Sender<BuildWorkerOutput<K::Stored>>,
+    outputter: JoinBuilder<K::Stored, BUILD_OUTER>,
 }
 
-unsafe impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool> Send
-    for JoinBuildConsumer<T, BUILD_OUTER>
-{
-}
+unsafe impl<K: JoinKey, const BUILD_OUTER: bool> Send for JoinBuildConsumer<K, BUILD_OUTER> {}
 
-impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool>
-    JoinBuildConsumer<T, BUILD_OUTER>
-{
+impl<K: JoinKey, const BUILD_OUTER: bool> JoinBuildConsumer<K, BUILD_OUTER> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        key_column: usize,
+        key_columns: Vec<usize>,
         worker_id: usize,
         hash_state: RandomState,
-        sender: mpsc::Sender<BuildWorkerOutput<T::Native>>,
-        receiver: Option<mpsc::Receiver<BuildWorkerOutput<T::Native>>>,
+        sender: mpsc::Sender<BuildWorkerOutput<K::Stored>>,
+        receiver: Option<mpsc::Receiver<BuildWorkerOutput<K::Stored>>>,
         partition_sizes: Arc<Vec<AtomicUsize>>,
-        table: JoinTable<T::Native>,
-        injector: Arc<Injector<JoinPartitionJob<T::Native>>>,
+        table: JoinTable<K::Stored>,
+        injector: Arc<Injector<JoinPartitionJob<K::Stored>>>,
         jobs_injected: Arc<AtomicBool>,
         build_ready: Arc<AtomicBool>,
         remaining_jobs: Arc<AtomicUsize>,
     ) -> Self {
         Self {
-            key_column,
+            key_columns,
             worker_id,
             hash_state,
             values: (0..NUM_PARTITIONS).map(|_| SlabVec::new()).collect(),
@@ -99,32 +93,43 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool>
     }
 }
 
-/// Drop rows whose join key is null: an equi-join can never match them, and the
-/// hot loops read key values without validity checks. A build-side outer join
-/// keeps its build rows instead (they still reach the output, unmatched) and
-/// skips them when generating tuples.
-pub(crate) fn filter_null_keys(batch: RecordBatch, key_column: usize) -> RecordBatch {
-    let col = batch.column(key_column);
-    if col.null_count() == 0 {
-        return batch;
+/// Drop rows any of whose join key columns is null: an equi-join can never
+/// match them, and the hot loops read key values without validity checks. A
+/// build-side outer join keeps its build rows instead (they still reach the
+/// output, unmatched) and skips them when generating tuples.
+pub(crate) fn filter_null_keys(batch: RecordBatch, key_columns: &[usize]) -> RecordBatch {
+    let mut combined_validity: Option<NullBuffer> = None;
+    for &key_column in key_columns {
+        let column = batch.column(key_column);
+        if column.null_count() == 0 {
+            continue;
+        }
+        let nulls = column.nulls().unwrap();
+        combined_validity = Some(match combined_validity {
+            None => nulls.clone(),
+            Some(previous) => NullBuffer::new(previous.inner() & nulls.inner()),
+        });
     }
-    let mask = BooleanArray::new(col.nulls().unwrap().inner().clone(), None);
+    let Some(combined_validity) = combined_validity else {
+        return batch;
+    };
+    let mask = BooleanArray::new(combined_validity.inner().clone(), None);
     filter_record_batch(&batch, &mask).expect("null-key filter mask matches batch length")
 }
 
-impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool> Consumer<RecordBatch, ()>
-    for JoinBuildConsumer<T, BUILD_OUTER>
+impl<K: JoinKey, const BUILD_OUTER: bool> Consumer<RecordBatch, ()>
+    for JoinBuildConsumer<K, BUILD_OUTER>
 {
-    type Outputter = JoinBuilder<T::Native, BUILD_OUTER>;
+    type Outputter = JoinBuilder<K::Stored, BUILD_OUTER>;
 
     fn consume(&mut self, batch: RecordBatch, _sender: &mut dyn Sender<()>) -> unary::Result<()> {
         debug!("Consuming build");
         let batch = match BUILD_OUTER {
             true => batch,
-            false => filter_null_keys(batch, self.key_column),
+            false => filter_null_keys(batch, &self.key_columns),
         };
-        let col = batch.column(self.key_column).as_primitive::<T>();
-        let n = col.len();
+        let reader = K::make_reader(&batch, &self.key_columns);
+        let n = batch.num_rows();
         assert!(
             self.rows_consumed + n <= u32::MAX as usize,
             "join build side exceeds u32 row indexing"
@@ -133,11 +138,11 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool> Consumer
         for i in 0..n {
             // Null-keyed rows are still in the payload of an outer build, and
             // reach the output through the unmatched pass rather than a tuple.
-            if BUILD_OUTER && col.is_null(i) {
+            if BUILD_OUTER && K::is_null(&reader, i) {
                 continue;
             }
-            let key = unsafe { col.value_unchecked(i) };
-            let hash = self.hash_state.hash_one(key);
+            let key = K::read_stored(&reader, i);
+            let hash = K::hash_row(&reader, i, &self.hash_state);
             let partition = (hash >> PARTITION_SHIFT) as usize;
             self.values[partition].push(
                 &mut self.slab_allocator,
@@ -148,6 +153,7 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool> Consumer
                 },
             );
         }
+        drop(reader);
         self.rows_consumed += n;
         self.payload.push(batch);
 

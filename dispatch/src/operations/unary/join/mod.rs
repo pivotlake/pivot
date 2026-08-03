@@ -7,9 +7,9 @@
 //! then the probe reads the populated [`JoinTable`].
 //!
 //! Output layout: the probe-side columns listed in [`JoinOutputColumns`] (in
-//! list order) followed by the listed build-side columns. The supported shape
-//! is an equi-join on a single fixed-width key, in one of the three
-//! [`JoinKind`]s below.
+//! list order) followed by the listed build-side columns. The join is an
+//! equi-join whose key columns are read, hashed, and compared through one of
+//! the [`JoinKey`] shapes, in one of the three [`JoinKind`]s below.
 //!
 //! A build-side outer join ([`JoinKind::BuildOuter`]) also emits every build
 //! row no probe row matched, its probe columns null-filled. Which rows those
@@ -27,6 +27,8 @@ mod build;
 mod directory;
 mod factory;
 pub use factory::JoinRecordBatchOperatorFactory;
+mod keys;
+pub use keys::{JoinKey, SingleColumnKey};
 mod probe;
 
 use std::cell::UnsafeCell;
@@ -82,13 +84,14 @@ pub enum JoinKind {
     ProbeSemi,
 }
 
-/// How a join is configured beyond the key type it is instantiated for.
+/// How a join is configured beyond the key shape it is instantiated for.
 #[derive(Debug, Clone)]
 pub struct JoinSpec {
-    /// The key column's index in the build input's schema.
-    pub build_key_column: usize,
-    /// The key column's index in the probe input's schema.
-    pub probe_key_column: usize,
+    /// The key columns' indices in the build input's schema, condition by
+    /// condition, aligned with `probe_key_columns`.
+    pub build_key_columns: Vec<usize>,
+    /// The key columns' indices in the probe input's schema.
+    pub probe_key_columns: Vec<usize>,
     /// Which columns of each side the join emits.
     pub output_columns: JoinOutputColumns,
     /// Which rows reach the output.
@@ -166,6 +169,7 @@ mod tests {
 
     use super::build::JoinBuildConsumer;
     use super::factory;
+    use super::keys::SingleColumnKey;
 
     fn int64_batch(keys: &[i64]) -> RecordBatch {
         RecordBatch::try_new(
@@ -189,13 +193,11 @@ mod tests {
         .unwrap()
     }
 
+    type Int64Key = SingleColumnKey<arrow_array::types::Int64Type>;
+
     fn extract_consumer<const BUILD_OUTER: bool>(
-        breaker: PipelineBreaker<
-            RecordBatch,
-            (),
-            JoinBuildConsumer<arrow_array::types::Int64Type, BUILD_OUTER>,
-        >,
-    ) -> JoinBuildConsumer<arrow_array::types::Int64Type, BUILD_OUTER> {
+        breaker: PipelineBreaker<RecordBatch, (), JoinBuildConsumer<Int64Key, BUILD_OUTER>>,
+    ) -> JoinBuildConsumer<Int64Key, BUILD_OUTER> {
         match breaker {
             PipelineBreaker::Consuming(c) => c,
             _ => unreachable!(),
@@ -244,8 +246,8 @@ mod tests {
         let probe_column_count = probe_batches[0].num_columns();
         let build_column_count = build_worker_batches[0][0].num_columns();
         let spec = super::JoinSpec {
-            build_key_column: 0,
-            probe_key_column: 0,
+            build_key_columns: vec![0],
+            probe_key_columns: vec![0],
             output_columns: super::JoinOutputColumns::keep_all(
                 probe_column_count,
                 build_column_count,
@@ -256,9 +258,7 @@ mod tests {
             },
         };
         let (builds, probes, _) =
-            factory::create_for_workers::<arrow_array::types::Int64Type, BUILD_OUTER, false>(
-                spec, workers,
-            );
+            factory::create_for_workers::<Int64Key, BUILD_OUTER, false>(spec, workers);
 
         let mut consumers: Vec<_> = builds
             .into_iter()
