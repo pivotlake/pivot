@@ -27,7 +27,7 @@ use thriftparquet::general::Encoding;
 use crate::parquet::{DecimalWriteStorage, decimal_write_storage};
 
 use super::super::error::WriteResult;
-use super::super::types::EncodedPage;
+use super::super::types::{Compression, EncodedPage};
 use super::leaves::Leaf;
 use super::pages::{self, PageKind, PageRange};
 
@@ -49,13 +49,16 @@ const VALUES_PER_MINIBLOCK: usize = VALUES_PER_BLOCK / MINIBLOCKS_PER_BLOCK;
 ///
 /// Which of the two encodings a leaf takes follows from its type, so the caller
 /// gets it back rather than having to ask again.
-pub(super) fn try_encode_chunk(leaf: &Leaf) -> WriteResult<Option<(Encoding, Vec<EncodedPage>)>> {
+pub(super) fn try_encode_chunk(
+    leaf: &Leaf,
+    compression: Compression,
+) -> WriteResult<Option<(Encoding, Vec<EncodedPage>)>> {
     let Some(encoding) = encoding_for(leaf.values.data_type()) else {
         return Ok(None);
     };
     let pages = pages::page_ranges(leaf)?
         .into_iter()
-        .map(|range| encode_data_page(leaf, range, encoding))
+        .map(|range| encode_data_page(leaf, range, encoding, compression))
         .collect::<WriteResult<Vec<_>>>()?;
     Ok(Some((encoding, pages)))
 }
@@ -82,7 +85,12 @@ fn encoding_for(data_type: &DataType) -> Option<Encoding> {
 
 /// Encode one delta data page: the page's rows' definition levels, then its
 /// values in whichever delta form the leaf's type takes.
-fn encode_data_page(leaf: &Leaf, range: PageRange, encoding: Encoding) -> WriteResult<EncodedPage> {
+fn encode_data_page(
+    leaf: &Leaf,
+    range: PageRange,
+    encoding: Encoding,
+    compression: Compression,
+) -> WriteResult<EncodedPage> {
     let num_rows = range.rows.len();
     let values = leaf.values.slice(range.values.start, range.values.len());
     let mut encoded = Vec::new();
@@ -102,6 +110,7 @@ fn encode_data_page(leaf: &Leaf, range: PageRange, encoding: Encoding) -> WriteR
             num_values: num_rows,
             encoding,
         },
+        compression,
     )
 }
 

@@ -13,13 +13,12 @@ use std::ops::Range;
 use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, BinaryViewArray, StringArray, StringViewArray};
 use arrow_schema::DataType;
-use snap::raw::Encoder;
 use thriftparquet::general::{Encoding, PageType};
 use thriftparquet::headers::{DataPageHeader, DictionaryPageHeader, PageHeader};
 use thriftparquet::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 
 use super::super::error::{WriteError, WriteResult};
-use super::super::types::EncodedPage;
+use super::super::types::{Compression, EncodedPage};
 use super::leaves::Leaf;
 use super::rle;
 
@@ -153,14 +152,15 @@ pub(super) enum PageKind {
     },
 }
 
-/// Snappy-compress `raw` (an encoded page body), prepend the page header, and
-/// tally the sizes into an [`EncodedPage`].
+/// Compress `raw` (an encoded page body), prepend the page header, and tally the
+/// sizes into an [`EncodedPage`].
 pub(super) fn assemble_page(
     num_rows: i64,
     raw: Vec<u8>,
     kind: PageKind,
+    compression: Compression,
 ) -> WriteResult<EncodedPage> {
-    let compressed = Encoder::new().compress_vec(&raw)?;
+    let compressed = compression.compress(&raw)?;
     let (page_type, data_page_header, dictionary_page_header) = match kind {
         PageKind::Data {
             num_values,

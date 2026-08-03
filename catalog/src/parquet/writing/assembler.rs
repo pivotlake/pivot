@@ -32,12 +32,12 @@ use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult};
 use thriftparquet::footer::{
     ColumnChunk, ColumnMetaData, FileMetaData, LogicalType, RowGroup, SchemaElement,
 };
-use thriftparquet::general::{CompressionCodec, Encoding};
+use thriftparquet::general::Encoding;
 use thriftparquet::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 
 use super::error::{WriteError, WriteResult};
 use super::types::{
-    EncodedColumnChunk, EncodedFile, EncodedLeaf, FileId, RowGroupHeader, RowGroupId,
+    Compression, EncodedColumnChunk, EncodedFile, EncodedLeaf, FileId, RowGroupHeader, RowGroupId,
 };
 
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
@@ -173,8 +173,9 @@ fn assemble_row_group(mut chunks: Vec<EncodedColumnChunk>) -> WriteResult<Assemb
     let mut bytes = Vec::new();
     let mut columns = Vec::with_capacity(chunks.len());
     for chunk in chunks {
+        let compression = chunk.header.compression;
         for leaf in chunk.leaves {
-            columns.push(write_leaf_chunk(&mut bytes, leaf)?);
+            columns.push(write_leaf_chunk(&mut bytes, leaf, compression)?);
         }
     }
     Ok(AssembledRowGroup { bytes, columns })
@@ -239,7 +240,11 @@ fn build_file(
 /// Append one leaf's column chunk to `out`: its dictionary page (if any) followed
 /// by its data pages, contiguously. Returns the chunk metadata with offsets
 /// relative to `out` (rebased to the file by [`build_file`]).
-fn write_leaf_chunk(out: &mut Vec<u8>, leaf: EncodedLeaf) -> WriteResult<ColumnChunk> {
+fn write_leaf_chunk(
+    out: &mut Vec<u8>,
+    leaf: EncodedLeaf,
+    compression: Compression,
+) -> WriteResult<ColumnChunk> {
     if leaf.data_pages.is_empty() {
         return Err(WriteError::MissingPages {
             path: leaf.path.join("."),
@@ -279,7 +284,7 @@ fn write_leaf_chunk(out: &mut Vec<u8>, leaf: EncodedLeaf) -> WriteResult<ColumnC
             physical_type: leaf.physical_type,
             encodings,
             path_in_schema: leaf.path,
-            codec: CompressionCodec::SNAPPY,
+            codec: compression.codec(),
             num_values,
             total_uncompressed_size: uncompressed,
             total_compressed_size: compressed,
@@ -419,6 +424,7 @@ mod tests {
             row_group_id: 0,
             dest_worker: 0,
             schema: schema.clone(),
+            compression: Compression::Snappy,
             tag: Arc::new(PartitionTag {
                 file_id: 0,
                 n_row_groups: 1,
@@ -440,7 +446,11 @@ mod tests {
                 Ok(EncodedColumnChunk {
                     header: header.clone(),
                     column,
-                    leaves: encode_column_chunk(schema.field(column), batch.column(column))?,
+                    leaves: encode_column_chunk(
+                        schema.field(column),
+                        batch.column(column),
+                        Compression::Snappy,
+                    )?,
                 })
             })
             .collect::<WriteResult<_>>()

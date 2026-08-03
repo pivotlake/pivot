@@ -48,7 +48,12 @@ mod stats;
 mod types;
 
 pub(crate) use shredding::unshred_batch;
-pub use types::EncodedFile;
+pub use types::{Compression, EncodedFile};
+
+/// What every page the engine writes is compressed with. Held in one place so a
+/// table's files are uniform however they were produced, by an INSERT or by a
+/// compaction rewriting them.
+pub const DEFAULT_COMPRESSION: Compression = Compression::Snappy;
 
 use std::sync::Arc;
 
@@ -71,6 +76,7 @@ pub fn encode_record_batches(
     sort_by: Arc<[String]>,
     target_rows_per_group: usize,
     target_row_groups_per_file: usize,
+    compression: Compression,
 ) -> DataFlowHandle<EncodedFile> {
     encode_record_batches_spec(
         spec,
@@ -78,6 +84,7 @@ pub fn encode_record_batches(
         sort_by,
         target_rows_per_group,
         target_row_groups_per_file,
+        compression,
     )
     .execute()
 }
@@ -91,6 +98,7 @@ pub(crate) fn encode_record_batches_spec(
     sort_by: Arc<[String]>,
     target_rows_per_group: usize,
     target_row_groups_per_file: usize,
+    compression: Compression,
 ) -> OperatorSpec<EncodedFile, impl OperatorFactory<EncodedFile> + 'static> {
     let (dispatcher, heads) = spec.into_parts();
     let workers = heads.len();
@@ -108,6 +116,7 @@ pub(crate) fn encode_record_batches_spec(
         sort_by,
         target_rows_per_group,
         target_row_groups_per_file,
+        compression,
     )
 }
 
@@ -123,6 +132,7 @@ fn encode_stages<OF: OperatorFactory<RecordBatch> + Send + 'static>(
     sort_by: Arc<[String]>,
     target_rows_per_group: usize,
     target_row_groups_per_file: usize,
+    compression: Compression,
 ) -> OperatorSpec<EncodedFile, impl OperatorFactory<EncodedFile> + 'static> {
     // One file's worth of rows; a partition flushes a file once it reaches this.
     let file_rows = target_rows_per_group
@@ -137,6 +147,7 @@ fn encode_stages<OF: OperatorFactory<RecordBatch> + Send + 'static>(
                 sort_by,
                 file_rows,
                 target_rows_per_group,
+                compression,
                 workers,
             ),
         )

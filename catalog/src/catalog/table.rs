@@ -547,6 +547,7 @@ impl CatalogTable {
             Arc::from(self.sort_by()),
             target_rows_per_group,
             target_row_groups_per_file,
+            crate::parquet::writing::DEFAULT_COMPRESSION,
             &self.dispatcher,
         );
         // Drive encode → upload to completion; the emitted row-count batch is

@@ -33,7 +33,7 @@ use thriftparquet::general::Encoding;
 
 use super::error::WriteResult;
 use super::stats;
-use super::types::{ColumnChunkJob, EncodedColumnChunk, EncodedLeaf};
+use super::types::{ColumnChunkJob, Compression, EncodedColumnChunk, EncodedLeaf};
 use leaves::Leaf;
 
 pub(super) type ColumnEncoderFactory = DefaultUnaryFactory<ColumnEncoder>;
@@ -54,7 +54,7 @@ impl Unary<ColumnChunkJob, EncodedColumnChunk> for ColumnEncoder {
         sender: &mut S,
     ) -> UnaryResult<()> {
         let field = job.header.schema.field(job.column);
-        let leaves = encode_column_chunk(field, &job.values)?;
+        let leaves = encode_column_chunk(field, &job.values, job.header.compression)?;
         sender.send(EncodedColumnChunk {
             header: job.header,
             column: job.column,
@@ -69,10 +69,11 @@ impl Unary<ColumnChunkJob, EncodedColumnChunk> for ColumnEncoder {
 pub(in crate::parquet::writing) fn encode_column_chunk(
     field: &Field,
     values: &ArrayRef,
+    compression: Compression,
 ) -> WriteResult<Vec<EncodedLeaf>> {
     leaves::flatten(field, values)?
         .into_iter()
-        .map(encode_leaf)
+        .map(|leaf| encode_leaf(leaf, compression))
         .collect()
 }
 
@@ -86,20 +87,25 @@ pub(in crate::parquet::writing) fn encode_column_chunk(
 /// the width they need, which is most of the size of a key column. Floats, and
 /// decimals too wide to store as an integer, have no delta form and still take
 /// PLAIN.
-fn encode_leaf(leaf: Leaf) -> WriteResult<EncodedLeaf> {
+fn encode_leaf(leaf: Leaf, compression: Compression) -> WriteResult<EncodedLeaf> {
     let physical_type = crate::parquet::arrow_to_parquet_physical(leaf.values.data_type())?;
     let statistics = leaf_statistics(&leaf);
-    let (dictionary_page, data_page_encoding, data_pages) = match dictionary::try_encode(&leaf)? {
-        Some((dictionary_page, index_page)) => (
-            Some(dictionary_page),
-            Encoding::RLE_DICTIONARY,
-            vec![index_page],
-        ),
-        None => match delta::try_encode_chunk(&leaf)? {
-            Some((encoding, pages)) => (None, encoding, pages),
-            None => (None, Encoding::PLAIN, plain::encode_chunk(&leaf)?),
-        },
-    };
+    let (dictionary_page, data_page_encoding, data_pages) =
+        match dictionary::try_encode(&leaf, compression)? {
+            Some((dictionary_page, index_page)) => (
+                Some(dictionary_page),
+                Encoding::RLE_DICTIONARY,
+                vec![index_page],
+            ),
+            None => match delta::try_encode_chunk(&leaf, compression)? {
+                Some((encoding, pages)) => (None, encoding, pages),
+                None => (
+                    None,
+                    Encoding::PLAIN,
+                    plain::encode_chunk(&leaf, compression)?,
+                ),
+            },
+        };
     Ok(EncodedLeaf {
         path: leaf.path,
         physical_type,

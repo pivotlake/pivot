@@ -19,7 +19,7 @@ use arrow_schema::DataType;
 use thriftparquet::general::Encoding;
 
 use super::super::error::WriteResult;
-use super::super::types::EncodedPage;
+use super::super::types::{Compression, EncodedPage};
 use super::leaves::Leaf;
 use super::pages::{self, PageKind};
 use super::{plain, rle};
@@ -38,7 +38,10 @@ const MAX_DISTINCT_SHARE: usize = 5;
 /// RLE-encoded index page. `None` means the leaf is better encoded another way
 /// — too many distinct values, too large a dictionary, or a type that does not
 /// dictionary-cast.
-pub(super) fn try_encode(leaf: &Leaf) -> WriteResult<Option<(EncodedPage, EncodedPage)>> {
+pub(super) fn try_encode(
+    leaf: &Leaf,
+    compression: Compression,
+) -> WriteResult<Option<(EncodedPage, EncodedPage)>> {
     let values = &leaf.values;
     let dict_type = DataType::Dictionary(
         Box::new(DataType::Int32),
@@ -68,8 +71,8 @@ pub(super) fn try_encode(leaf: &Leaf) -> WriteResult<Option<(EncodedPage, Encode
         .map(|&k| k as u32)
         .collect();
     Ok(Some((
-        dictionary_page(dict_raw, distinct.len())?,
-        index_page(leaf, &indices, index_bit_width(distinct.len()))?,
+        dictionary_page(dict_raw, distinct.len(), compression)?,
+        index_page(leaf, &indices, index_bit_width(distinct.len()), compression)?,
     )))
 }
 
@@ -81,15 +84,24 @@ fn index_bit_width(len: usize) -> u8 {
 
 /// Encode the dictionary page: the distinct values, already PLAIN-encoded into
 /// `raw`. A dictionary page has no rows of its own.
-fn dictionary_page(raw: Vec<u8>, num_values: usize) -> WriteResult<EncodedPage> {
-    pages::assemble_page(0, raw, PageKind::Dictionary { num_values })
+fn dictionary_page(
+    raw: Vec<u8>,
+    num_values: usize,
+    compression: Compression,
+) -> WriteResult<EncodedPage> {
+    pages::assemble_page(0, raw, PageKind::Dictionary { num_values }, compression)
 }
 
 /// Encode the index data page: the leaf's definition levels, then a one-byte
 /// index bit-width followed by the RLE/bit-packed indices. One page covers the
 /// whole leaf, so it carries every row's level; the indices cover only the rows
 /// that store a value.
-fn index_page(leaf: &Leaf, indices: &[u32], bit_width: u8) -> WriteResult<EncodedPage> {
+fn index_page(
+    leaf: &Leaf,
+    indices: &[u32],
+    bit_width: u8,
+    compression: Compression,
+) -> WriteResult<EncodedPage> {
     let mut encoded = Vec::with_capacity(1 + indices.len());
     encoded.push(bit_width);
     encoded.extend_from_slice(&rle::encode_indices(indices, bit_width));
@@ -103,5 +115,6 @@ fn index_page(leaf: &Leaf, indices: &[u32], bit_width: u8) -> WriteResult<Encode
             num_values: num_rows,
             encoding: Encoding::RLE_DICTIONARY,
         },
+        compression,
     )
 }

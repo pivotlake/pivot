@@ -24,7 +24,7 @@ use arrow_array::{
 };
 use arrow_schema::{Field, Schema};
 use catalog::parquet::table_input;
-use catalog::parquet::writing::{EncodedFile, encode_record_batches};
+use catalog::parquet::writing::{Compression, EncodedFile, encode_record_batches};
 use common::*;
 use dispatch::{Projection, values_input};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -147,6 +147,15 @@ fn as_is<T: ArrowPrimitiveType>(array: PrimitiveArray<T>) -> ArrayRef {
 /// Write `cases` as the columns of one file, through the pipeline a catalog
 /// INSERT uses.
 fn write_cases(dispatch: &DispatchGuard, cases: &[Case]) -> Vec<u8> {
+    write_cases_compressed(dispatch, cases, Compression::Snappy)
+}
+
+/// The same, under a chosen page compression.
+fn write_cases_compressed(
+    dispatch: &DispatchGuard,
+    cases: &[Case],
+    compression: Compression,
+) -> Vec<u8> {
     let fields: Vec<Field> = cases
         .iter()
         .map(|case| {
@@ -162,7 +171,7 @@ fn write_cases(dispatch: &DispatchGuard, cases: &[Case]) -> Vec<u8> {
 
     let spec = values_input(dispatch, vec![batch]).record_batches();
     let files: Vec<EncodedFile> =
-        encode_record_batches(spec, Arc::from([]), Arc::from([]), ROWS, 1)
+        encode_record_batches(spec, Arc::from([]), Arc::from([]), ROWS, 1, compression)
             .collect()
             .unwrap();
 
@@ -348,4 +357,30 @@ type_tests! {
             .collect();
         Arc::new(BinaryViewArray::from_iter(values)) as ArrayRef
     });
+}
+
+/// Every codec the writer offers round trips through both readers. A page's
+/// compression is undone before anything looks at its bytes, so this is about
+/// the codec the footer records and the bytes the writer produced under it,
+/// whatever the values are.
+#[test]
+fn every_compression_round_trips() {
+    let dispatch = dispatch_with_buffers(2, RING_BUFFERS);
+    let spec = primitive::<Int64Type>(PACKED, |row| row as i64 * 7_919_483, as_is);
+    let cases = vec![spec.case("int64", Shape::Distinct, "distinct")];
+
+    for compression in [Compression::Snappy, Compression::Lz4Raw, Compression::None] {
+        let bytes = write_cases_compressed(&dispatch, &cases, compression);
+
+        assert_column_matches(
+            &cases[0],
+            read_with_pivot(&dispatch, bytes.clone(), 1).column(0),
+            &format!("pivot's reader under {compression:?}"),
+        );
+        assert_column_matches(
+            &cases[0],
+            read_with_arrow(bytes).column(0),
+            &format!("arrow-rs's reader under {compression:?}"),
+        );
+    }
 }

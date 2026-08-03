@@ -19,7 +19,9 @@ use uuid::Uuid;
 
 use crate::catalog::CatalogTable;
 use crate::parquet::RowGroupMetadata;
-use crate::parquet::writing::{EncodedFile, encode_record_batches_spec, unshred_batch};
+use crate::parquet::writing::{
+    Compression, DEFAULT_COMPRESSION, EncodedFile, encode_record_batches_spec, unshred_batch,
+};
 use crate::store::{DataFileLocation, FileRef, ObjectPath, ObjectStore};
 
 /// Build the dataflow that writes `input`'s rows into `table` as Parquet and
@@ -98,6 +100,7 @@ pub(super) fn build_insert_spec(
         table.sort_by().to_vec().into(),
         TARGET_ROWS_PER_GROUP,
         TARGET_ROW_GROUPS_PER_FILE,
+        DEFAULT_COMPRESSION,
         dispatcher,
     ))
 }
@@ -119,6 +122,7 @@ pub(super) fn encode_and_upload_spec(
     sort_by: Arc<[String]>,
     target_rows_per_group: usize,
     target_row_groups_per_file: usize,
+    compression: Compression,
     dispatcher: &DataFlowDispatcher,
 ) -> RecordBatchOperatorSpec {
     let encoded = encode_record_batches_spec(
@@ -127,6 +131,7 @@ pub(super) fn encode_and_upload_spec(
         sort_by,
         target_rows_per_group,
         target_row_groups_per_file,
+        compression,
     );
     let workers = dispatcher.worker_count();
     // One shared total; every worker's `Upload` adds its completions to it and the

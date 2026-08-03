@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use arrow_array::{ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{ArrowError, Schema};
-use catalog::parquet::writing::encode_record_batches;
+use catalog::parquet::writing::{DEFAULT_COMPRESSION, encode_record_batches};
 use clap::Parser;
 use dispatch::{BUFFER_SIZE, Dispatch, values_input};
 use flate2::read::MultiGzDecoder;
@@ -118,6 +118,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::from([]),
             ROW_GROUP_ROWS,
             ROW_GROUPS_PER_FILE,
+            DEFAULT_COMPRESSION,
         );
         for file in encoded {
             let path = args.output.join(format!("bluesky-{files:05}.parquet"));

@@ -15,7 +15,43 @@ use arrow_array::ArrayRef;
 use arrow_schema::SchemaRef;
 use dispatch::{Identifier, WorkerIdOutput};
 use thriftparquet::footer::Statistics;
-use thriftparquet::general::Encoding;
+use thriftparquet::general::{CompressionCodec, Encoding};
+
+use super::error::WriteResult;
+
+/// How a page body is compressed on its way out, chosen per file and recorded
+/// in the footer so a reader knows what to undo.
+///
+/// Only what the reader can undo is offered here: writing a codec pivot cannot
+/// read back would produce a file only other engines could use.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Compression {
+    Snappy,
+    /// The raw LZ4 block format, one block per page.
+    Lz4Raw,
+    None,
+}
+
+impl Compression {
+    /// The codec a column chunk's footer entry records.
+    pub(crate) fn codec(self) -> CompressionCodec {
+        match self {
+            Self::Snappy => CompressionCodec::SNAPPY,
+            Self::Lz4Raw => CompressionCodec::LZ4_RAW,
+            Self::None => CompressionCodec::UNCOMPRESSED,
+        }
+    }
+
+    /// Compress one page body. Uncompressed pages hand the body back as it is,
+    /// which is what the format asks for: the page is its own body.
+    pub(crate) fn compress(self, raw: &[u8]) -> WriteResult<Vec<u8>> {
+        Ok(match self {
+            Self::Snappy => snap::raw::Encoder::new().compress_vec(raw)?,
+            Self::Lz4Raw => lz4_flex::block::compress(raw),
+            Self::None => raw.to_vec(),
+        })
+    }
+}
 
 /// Identifies a row group across the pipeline so its column chunks reassemble
 /// together.
@@ -69,6 +105,10 @@ pub(crate) struct RowGroupHeader {
     pub(crate) dest_worker: usize,
     pub(crate) schema: SchemaRef,
     pub(crate) tag: Arc<PartitionTag>,
+    /// How this row group's pages are compressed. Held here because both the
+    /// encoder (which compresses) and the assembler (which records the codec)
+    /// need it, and both already share this header.
+    pub(crate) compression: Compression,
 }
 
 /// One column's values for one row group, to encode into a column chunk.
@@ -79,11 +119,11 @@ pub(crate) struct ColumnChunkJob {
     pub(crate) values: ArrayRef,
 }
 
-/// An encoded page (data or dictionary): its snappy-compressed body behind a
+/// An encoded page (data or dictionary): its compressed body behind a
 /// thrift header. The sizes feed the column-chunk footer metadata.
 pub(crate) struct EncodedPage {
     pub(crate) num_rows: i64,
-    /// Uncompressed size of the page body (before snappy).
+    /// Uncompressed size of the page body.
     pub(crate) uncompressed_size: usize,
     /// Size of the page's thrift header (precedes the compressed body).
     pub(crate) header_len: usize,
