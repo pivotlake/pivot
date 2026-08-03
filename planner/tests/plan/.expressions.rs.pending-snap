@@ -1,0 +1,48 @@
+{"run_id":"1785832231-248097308","line":143,"new":{"module_name":"plan__expressions","snapshot_name":"function_minute","metadata":{"source":"planner/tests/plan/expressions.rs","assertion_line":143,"expression":"plan.to_string()"},"snapshot":"Projection(#0:Int64, count_star():Int64)\n  Aggregate(groups: [minute(cast(EventTime:Timestamp(s) as Timestamp(us)))], exprs: [count_star()])\n    Input([EventTime:Timestamp(s)])"},"old":{"module_name":"plan__expressions","metadata":{},"snapshot":"Projection(#0:Int64, count_star():Int64)\n  Aggregate(groups: [minute(EventTime:Timestamp)], exprs: [count_star()])\n    Input([EventTime:Timestamp])"}}
+{"run_id":"1785832255-721856346","line":104,"new":null,"old":null}
+{"run_id":"1785832255-721856346","line":76,"new":null,"old":null}
+{"run_id":"1785832255-721856346","line":21,"new":null,"old":null}
+{"run_id":"1785832255-721856346","line":159,"new":null,"old":null}
+{"run_id":"1785832255-721856346","line":90,"new":null,"old":null}
+{"run_id":"1785832255-721856346","line":35,"new":null,"old":null}
+{"run_id":"1785832255-721856346","line":49,"new":null,"old":null}
+{"run_id":"1785832255-721856346","line":119,"new":null,"old":null}
+{"run_id":"1785832255-721856346","line":9,"new":null,"old":null}
+{"run_id":"1785832255-721856346","line":62,"new":null,"old":null}
+{"run_id":"1785832255-721856346","line":143,"new":{"module_name":"plan__expressions","snapshot_name":"function_minute","metadata":{"source":"planner/tests/plan/expressions.rs","assertion_line":143,"expression":"plan.to_string()"},"snapshot":"Projection(#0:Int64, count_star():Int64)\n  Aggregate(groups: [minute(cast(EventTime:Timestamp(s) as Timestamp(us)))], exprs: [count_star()])\n    Input([EventTime:Timestamp(s)])"},"old":{"module_name":"plan__expressions","metadata":{},"snapshot":"Projection(#0:Int64, count_star():Int64)\n  Aggregate(groups: [minute(EventTime:Timestamp)], exprs: [count_star()])\n    Input([EventTime:Timestamp])"}}
+{"run_id":"1785832266-965639214","line":143,"new":{"module_name":"plan__expressions","snapshot_name":"function_minute","metadata":{"source":"planner/tests/plan/expressions.rs","assertion_line":143,"expression":"plan.to_string()"},"snapshot":"Projection(#0:Int64, count_star():Int64)\n  Aggregate(groups: [minute(cast(EventTime:Timestamp(s) as Timestamp(us)))], exprs: [count_star()])\n    Input([EventTime:Timestamp(s)])"},"old":{"module_name":"plan__expressions","metadata":{},"snapshot":"Projection(#0:Int64, count_star():Int64)\n  Aggregate(groups: [minute(EventTime:Timestamp)], exprs: [count_star()])\n    Input([EventTime:Timestamp])"}}
+{"run_id":"1785832288-293643444","line":143,"new":{"module_name":"plan__expressions","snapshot_name":"function_minute","metadata":{"source":"planner/tests/plan/expressions.rs","assertion_line":143,"expression":"plan.to_string()"},"snapshot":"Projection(#0:Int64, count_star():Int64)\n  Aggregate(groups: [minute(cast(EventTime:Timestamp(s) as Timestamp(us)))], exprs: [count_star()])\n    Input([EventTime:Timestamp(s)])"},"old":{"module_name":"plan__expressions","metadata":{},"snapshot":"Projection(#0:Int64, count_star():Int64)\n  Aggregate(groups: [minute(EventTime:Timestamp)], exprs: [count_star()])\n    Input([EventTime:Timestamp])"}}
+{"run_id":"1785832301-142361899","line":143,"new":{"module_name":"plan__expressions","snapshot_name":"function_minute","metadata":{"source":"planner/tests/plan/expressions.rs","assertion_line":143,"expression":"plan.to_string()"},"snapshot":"Projection(#0:Int64, count_star():Int64)\n  Aggregate(groups: [minute(cast(EventTime:Timestamp(s) as Timestamp(us)))], exprs: [count_star()])\n    Input([EventTime:Timestamp(s)])"},"old":{"module_name":"plan__expressions","metadata":{},"snapshot":"Projection(#0:Int64, count_star():Int64)\n  Aggregate(groups: [minute(EventTime:Timestamp)], exprs: [count_star()])\n    Input([EventTime:Timestamp])"}}
+{"run_id":"1785832325-260379903","line":119,"new":null,"old":null}
+{"run_id":"1785832325-260379903","line":90,"new":null,"old":null}
+{"run_id":"1785832325-260379903","line":62,"new":null,"old":null}
+{"run_id":"1785832325-260379903","line":76,"new":null,"old":null}
+{"run_id":"1785832325-260379903","line":49,"new":null,"old":null}
+{"run_id":"1785832325-260379903","line":104,"new":null,"old":null}
+{"run_id":"1785832325-260379903","line":9,"new":null,"old":null}
+{"run_id":"1785832325-260379903","line":159,"new":null,"old":null}
+{"run_id":"1785832325-260379903","line":21,"new":null,"old":null}
+{"run_id":"1785832325-260379903","line":35,"new":null,"old":null}
+{"run_id":"1785832325-260379903","line":143,"new":null,"old":null}
+{"run_id":"1785832388-907514554","line":35,"new":null,"old":null}
+{"run_id":"1785832388-907514554","line":90,"new":null,"old":null}
+{"run_id":"1785832388-907514554","line":62,"new":null,"old":null}
+{"run_id":"1785832388-907514554","line":76,"new":null,"old":null}
+{"run_id":"1785832388-907514554","line":159,"new":null,"old":null}
+{"run_id":"1785832388-907514554","line":9,"new":null,"old":null}
+{"run_id":"1785832388-907514554","line":21,"new":null,"old":null}
+{"run_id":"1785832388-907514554","line":104,"new":null,"old":null}
+{"run_id":"1785832388-907514554","line":49,"new":null,"old":null}
+{"run_id":"1785832388-907514554","line":119,"new":null,"old":null}
+{"run_id":"1785832388-907514554","line":143,"new":null,"old":null}
+{"run_id":"1785832418-767275652","line":21,"new":null,"old":null}
+{"run_id":"1785832418-767275652","line":104,"new":null,"old":null}
+{"run_id":"1785832418-767275652","line":35,"new":null,"old":null}
+{"run_id":"1785832418-767275652","line":76,"new":null,"old":null}
+{"run_id":"1785832418-767275652","line":90,"new":null,"old":null}
+{"run_id":"1785832418-767275652","line":9,"new":null,"old":null}
+{"run_id":"1785832418-767275652","line":159,"new":null,"old":null}
+{"run_id":"1785832418-767275652","line":119,"new":null,"old":null}
+{"run_id":"1785832418-767275652","line":49,"new":null,"old":null}
+{"run_id":"1785832418-767275652","line":62,"new":null,"old":null}
+{"run_id":"1785832418-767275652","line":143,"new":null,"old":null}

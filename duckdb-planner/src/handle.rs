@@ -28,7 +28,7 @@ use crate::duckdb_bridge::duckdb_types::{
     ExpressionType, JoinType, LimitNodeType, LogicalOperatorType, LogicalTypeId, OrderType,
 };
 use crate::duckdb_bridge::ffi;
-use crate::types::{BoundLogicalType, ScalarValue};
+use crate::types::{BoundLogicalType, ScalarValue, TimestampPrecision};
 
 /// A DuckDB C++ exception caught at the FFI boundary while reading plan
 /// objects. Reaching one means a shape assumption in the plan walk was wrong;
@@ -97,13 +97,26 @@ fn scalar_from_value(v: &ffi::Value) -> Result<ScalarValue> {
         // so `value_string` recovers the document the variant was built from.
         L::VARIANT => ScalarValue::Variant(ffi::value_string(v)?),
         L::DATE => ScalarValue::Date(ffi::value_date(v)?),
-        L::TIMESTAMP => ScalarValue::Timestamp(ffi::value_timestamp(v)?),
+        // Every timestamp resolution reads through the same accessor, which
+        // casts to microseconds; the declared one rides along so the consumer
+        // can convert back to it.
+        L::TIMESTAMP_SEC => timestamp(v, TimestampPrecision::Second)?,
+        L::TIMESTAMP_MS => timestamp(v, TimestampPrecision::Millisecond)?,
+        L::TIMESTAMP => timestamp(v, TimestampPrecision::Microsecond)?,
+        L::TIMESTAMP_NS => timestamp(v, TimestampPrecision::Nanosecond)?,
         L::INTERVAL => ScalarValue::Interval {
             months: ffi::value_interval_months(v)?,
             days: ffi::value_interval_days(v)?,
             micros: ffi::value_interval_micros(v)?,
         },
         other => ScalarValue::Other(other),
+    })
+}
+
+fn timestamp(v: &ffi::Value, precision: TimestampPrecision) -> Result<ScalarValue> {
+    Ok(ScalarValue::Timestamp {
+        micros: ffi::value_timestamp(v)?,
+        precision,
     })
 }
 

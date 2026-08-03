@@ -395,7 +395,7 @@ fn canonical_input_type(result_type: &Type) -> Option<Type> {
     match result_type {
         Type::Utf8 => Some(Type::Utf8),
         Type::Date => Some(Type::Date),
-        Type::Timestamp => Some(Type::Timestamp),
+        Type::Timestamp(unit) => Some(Type::Timestamp(*unit)),
         Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64 => Some(Type::Int64),
         // A computed float aggregate argument (`SUM(a * b)`) materialises as the
         // Float64 the float readers consume.
@@ -751,6 +751,7 @@ pub(super) fn derive_outer_keys(groups: &[(usize, Type)]) -> Vec<(usize, Type)> 
 #[cfg(test)]
 mod tests {
     use crate::test_support::*;
+    use crate::types::TimestampUnit;
     use crate::types::Type;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Date32Type, Float64Type, Int64Type};
@@ -1236,14 +1237,15 @@ mod tests {
             "events",
             &[(
                 "ts",
-                Type::Timestamp,
+                Type::Timestamp(TimestampUnit::Second),
                 Arc::new(TimestampSecondArray::from(vec![0i64, 3600, 90_000])) as ArrayRef,
             )],
         );
 
         // A computed temporal group key is materialised into a leading column;
-        // it must still be restored to its TIMESTAMP type on output, not left the
-        // raw epoch-seconds int the group-by computes on.
+        // it must still be restored to its TIMESTAMP type on output, not left
+        // the raw epoch count the group-by computes on. The unit is DuckDB's,
+        // which types `date_trunc` as its microsecond TIMESTAMP.
         let batches = run_batches(
             &mut testing_planner,
             "SELECT date_trunc('day', ts) AS d, count(*) FROM events GROUP BY date_trunc('day', ts)",
@@ -1251,7 +1253,7 @@ mod tests {
 
         assert_eq!(
             batches[0].schema().field(0).data_type(),
-            &DataType::Timestamp(TimeUnit::Second, None)
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
         );
     }
 

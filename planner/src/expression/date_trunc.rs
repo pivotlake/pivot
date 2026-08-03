@@ -2,12 +2,12 @@
 
 use super::{Expression, Function};
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
+use crate::types::TimestampUnit;
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
-use arrow_array::{ArrayRef, RecordBatch, TimestampSecondArray};
+use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::DataType;
 use std::fmt::{self, Display};
-use std::sync::Arc;
 
 /// SQL `date_trunc(unit, source)` — truncate a timestamp down to `unit`
 /// (e.g. `date_trunc('minute', ts)`). DuckDB passes the unit as a string
@@ -15,6 +15,9 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct DateTrunc {
     pub unit: String,
+    /// The resolution `source` counts in, which the truncated result keeps: a
+    /// value is floored in its own unit rather than converted to another.
+    pub source_unit: TimestampUnit,
     pub source: Box<Expression>,
 }
 
@@ -26,8 +29,10 @@ impl Display for DateTrunc {
 
 impl DateTrunc {
     pub fn compile(&self) -> Result<ExprFn, compile::Error> {
-        // A timestamp is stored as Int64 epoch *seconds*, so truncating to a unit
-        // is flooring to that many seconds. `M = (t / secs) * secs`.
+        // A timestamp is stored as an Int64 epoch count in its own unit, so
+        // truncating to a unit is flooring to that many of them:
+        // `M = (t / step) * step`, where `step` is the unit's seconds scaled
+        // into the column's resolution.
         let secs: i64 = match self.unit.as_str() {
             "second" => 1,
             "minute" => 60,
@@ -37,26 +42,33 @@ impl DateTrunc {
                 return Err(compile::Error::UnsupportedExpression(Expression::Function(
                     Function::DateTrunc(DateTrunc {
                         unit: other.to_string(),
+                        source_unit: self.source_unit,
                         source: self.source.clone(),
                     }),
                 )));
             }
         };
+        let step = secs * self.source_unit.per_second();
+        let source_unit = self.source_unit;
         let source_builder = self.source.compile()?;
         Ok(Box::new(move || {
+            let result_type = DataType::Timestamp(source_unit.arrow_unit(), None);
             let mut source_expr = source_builder();
             Box::new(move |batch: &RecordBatch| {
                 let src = source_expr(batch);
                 let (arr, _) = src.as_datum().get();
                 let i64arr = arrow::compute::cast(arr, &DataType::Int64).unwrap();
                 let vals = i64arr.as_primitive::<Int64Type>();
-                // Floor to `secs` and emit a real TIMESTAMP (epoch seconds), the
-                // type date_trunc returns, rather than a bare int.
-                let truncated: TimestampSecondArray = vals
+                // Floor to `step` and emit a real TIMESTAMP of the source's own
+                // unit, the type date_trunc returns, rather than a bare int. The
+                // cast only re-labels the counts; it does not rescale them.
+                let truncated: Int64Array = vals
                     .iter()
-                    .map(|v| v.map(|x| x.div_euclid(secs) * secs))
+                    .map(|v| v.map(|x| x.div_euclid(step) * step))
                     .collect();
-                ExprResult::Array(Arc::new(truncated) as ArrayRef)
+                let typed = arrow::compute::cast(&truncated, &result_type)
+                    .expect("an Int64 count re-labels as a timestamp of any unit");
+                ExprResult::Array(typed as ArrayRef)
             }) as ExprEvalFn
         }))
     }
@@ -65,9 +77,10 @@ impl DateTrunc {
 #[cfg(test)]
 mod tests {
     use crate::test_support::*;
+    use crate::types::TimestampUnit;
     use crate::types::Type;
     use arrow_array::cast::AsArray;
-    use arrow_array::types::TimestampSecondType;
+    use arrow_array::types::TimestampMicrosecondType;
     use arrow_array::{ArrayRef, Int64Array};
     use arrow_schema::{DataType, TimeUnit};
     use rstest::rstest;
@@ -79,7 +92,7 @@ mod tests {
             "events",
             &[(
                 "EventTime",
-                Type::Timestamp,
+                Type::Timestamp(TimestampUnit::Second),
                 Arc::new(Int64Array::from(vec![0i64, 90, 150, 3690])) as ArrayRef,
             )],
         );
@@ -89,13 +102,19 @@ mod tests {
             "SELECT date_trunc('minute', EventTime) FROM events",
         );
 
-        // date_trunc yields a real TIMESTAMP (epoch seconds floored to the minute).
+        // The column counts seconds, but DuckDB types `date_trunc` as its
+        // microsecond TIMESTAMP, so the floored value arrives in microseconds.
         let col = batches[0].column(0);
         assert_eq!(
             col.data_type(),
-            &DataType::Timestamp(TimeUnit::Second, None)
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
         );
-        let mut secs: Vec<i64> = col.as_primitive::<TimestampSecondType>().values().to_vec();
+        let mut secs: Vec<i64> = col
+            .as_primitive::<TimestampMicrosecondType>()
+            .values()
+            .iter()
+            .map(|micros| micros / 1_000_000)
+            .collect();
         secs.sort();
         assert_eq!(secs, vec![0, 60, 120, 3660]);
     }

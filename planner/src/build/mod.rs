@@ -443,7 +443,7 @@ fn join_key_ref(key: Expression) -> Result<(usize, Type), OperatorError> {
         | Type::Int128
         | Type::Decimal { .. }
         | Type::Date
-        | Type::Timestamp => Ok((key.column_idx, key.return_type)),
+        | Type::Timestamp(_) => Ok((key.column_idx, key.return_type)),
         _ => Err(OperatorError::Unsupported(format!(
             "Unsupported join key type: {:?}",
             key.return_type

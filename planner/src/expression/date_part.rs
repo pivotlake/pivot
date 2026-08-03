@@ -2,7 +2,7 @@
 
 use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
-use crate::types::Type;
+use crate::types::{TimestampUnit, Type};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Date32Type, Int64Type};
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
@@ -160,11 +160,10 @@ impl DatePartKind {
 }
 
 /// SQL `extract(<part> FROM source)` — a timestamp field accessor. DuckDB
-/// lowers each part to a scalar function (`minute`, `year`, …); a timestamp is
-/// stored as Int64 epoch *seconds* (see [`Type::Timestamp`]), so every part is
-/// a pure integer computation. A `DATE` source (see [`Type::Date`]) stores days
-/// instead, and is scaled to those seconds before the parts are read. See its
-/// compile impl.
+/// lowers each part to a scalar function (`minute`, `year`, …). Every part is
+/// derived from whole epoch seconds, so a source counting in a finer unit (see
+/// [`Type::Timestamp`]) is scaled down to seconds first, and a `DATE` source
+/// (see [`Type::Date`]) scaled up from its days. See its compile impl.
 ///
 /// [`Type::Timestamp`]: crate::types::Type::Timestamp
 /// [`Type::Date`]: crate::types::Type::Date
@@ -194,14 +193,23 @@ impl DatePart {
             Box::new(move |batch: &RecordBatch| {
                 let src = source_expr(batch);
                 let (arr, _) = src.as_datum().get();
-                // A DATE column stores whole days since the epoch, so scale it to
-                // the epoch seconds every arm below computes on. The time-of-day
-                // parts of a date then read as midnight, which is what DuckDB
-                // returns for them.
+                // Every arm below computes on whole epoch seconds, so the
+                // source is brought to them first. A DATE column stores whole
+                // days, so it scales up (its time-of-day parts then read as
+                // midnight, which is what DuckDB returns for them); a timestamp
+                // counting in a finer unit scales down, flooring so a pre-epoch
+                // value keeps the second it falls in.
                 let seconds: Int64Array = match arr.data_type() {
                     DataType::Date32 => arr
                         .as_primitive::<Date32Type>()
                         .unary(|days: i32| i64::from(days) * SECS_PER_DAY),
+                    DataType::Timestamp(unit, _) => {
+                        let per_second = TimestampUnit::from_arrow_unit(*unit).per_second();
+                        arrow::compute::cast(arr, &DataType::Int64)
+                            .unwrap()
+                            .as_primitive::<Int64Type>()
+                            .unary(|count: i64| count.div_euclid(per_second))
+                    }
                     _ => arrow::compute::cast(arr, &DataType::Int64)
                         .unwrap()
                         .as_primitive::<Int64Type>()
@@ -259,7 +267,7 @@ impl DatePart {
 #[cfg(test)]
 mod tests {
     use crate::test_support::*;
-    use crate::types::Type;
+    use crate::types::{TimestampUnit, Type};
     use arrow_array::{ArrayRef, Int32Array, Int64Array};
     use rstest::rstest;
     use std::sync::Arc;
@@ -297,7 +305,7 @@ mod tests {
             "ts",
             &[(
                 "EventTime",
-                Type::Timestamp,
+                Type::Timestamp(TimestampUnit::Second),
                 // 1704067200 = 2024-01-01 00:00:00 UTC.
                 Arc::new(Int64Array::from(vec![1_704_067_200i64])) as ArrayRef,
             )],
@@ -317,7 +325,7 @@ mod tests {
             "ts",
             &[(
                 "EventTime",
-                Type::Timestamp,
+                Type::Timestamp(TimestampUnit::Second),
                 Arc::new(Int64Array::from(vec![0i64, 0, 3600])) as ArrayRef,
             )],
         );

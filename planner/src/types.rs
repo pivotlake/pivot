@@ -16,12 +16,13 @@
 
 use arrow_array::{
     ArrayRef, BooleanArray, Decimal64Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, Scalar, StringViewArray, TimestampSecondArray, UInt8Array,
+    Int16Array, Int32Array, Int64Array, Scalar, StringViewArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
     UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, TimeUnit};
 use duckdb_planner::duckdb_bridge::duckdb_types::LogicalTypeId;
-use duckdb_planner::{BoundLogicalType, ExtraTypeInfo, ScalarValue};
+use duckdb_planner::{BoundLogicalType, ExtraTypeInfo, ScalarValue, TimestampPrecision};
 use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
@@ -66,14 +67,105 @@ pub enum Type {
     /// small integer (days), so the executor sees an integer column; the type
     /// exists so `DATE` columns/constants survive plan translation and compare.
     Date,
-    /// DuckDB `TIMESTAMP` — the type of a timestamp column and the result of
-    /// `date_trunc`. The source parquet stores it as packed epoch *seconds* in
-    /// an `Int64` column, so the executor treats it as `Int64` seconds.
-    Timestamp,
+    /// A DuckDB timestamp — the type of a timestamp column and the result of
+    /// `date_trunc`. The unit is part of the type, so a column keeps the
+    /// resolution its source declares rather than being flattened to one:
+    /// `TIMESTAMP_S`, `TIMESTAMP_MS`, `TIMESTAMP` (microseconds, DuckDB's
+    /// default) and `TIMESTAMP_NS` each map to the matching [`TimestampUnit`].
+    /// The executor sees the epoch count in that unit, packed in an `Int64`
+    /// column.
+    Timestamp(TimestampUnit),
     /// A Parquet `variant` (semi-structured / JSON) column, presented to DuckDB
     /// as its native `VARIANT` type: `d.age`, `d->'age'`, and casts all bind
     /// natively. The executor sees the Arrow struct of leaves the file stores.
     Variant,
+}
+
+/// Microseconds in a second, the unit DuckDB hands every timestamp constant
+/// over in.
+const MICROS_PER_SECOND: i64 = 1_000_000;
+
+/// The resolution a [`Type::Timestamp`] counts the epoch in.
+///
+/// Carried by the type rather than fixed at one resolution, so a column reads
+/// back at the precision its file declares and a value never has to be scaled
+/// between the two. The arithmetic that needs to reason across units goes
+/// through [`per_second`](TimestampUnit::per_second).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TimestampUnit {
+    Second,
+    Millisecond,
+    Microsecond,
+    Nanosecond,
+}
+
+impl TimestampUnit {
+    /// How many of this unit make a second, which is what converts a count in
+    /// this unit to and from the whole seconds the calendar parts are derived
+    /// from.
+    pub fn per_second(self) -> i64 {
+        match self {
+            TimestampUnit::Second => 1,
+            TimestampUnit::Millisecond => 1_000,
+            TimestampUnit::Microsecond => 1_000_000,
+            TimestampUnit::Nanosecond => 1_000_000_000,
+        }
+    }
+
+    /// The arrow [`TimeUnit`] a column of this unit carries.
+    pub fn arrow_unit(self) -> TimeUnit {
+        match self {
+            TimestampUnit::Second => TimeUnit::Second,
+            TimestampUnit::Millisecond => TimeUnit::Millisecond,
+            TimestampUnit::Microsecond => TimeUnit::Microsecond,
+            TimestampUnit::Nanosecond => TimeUnit::Nanosecond,
+        }
+    }
+
+    /// Convert a microsecond count into this unit, which is how a DuckDB
+    /// constant (always handed over in microseconds) reaches the resolution it
+    /// was declared at. Scaled by the ratio between the two units rather than
+    /// through a common factor, so a nanosecond conversion cannot overflow the
+    /// intermediate.
+    pub fn from_micros(self, micros: i64) -> i64 {
+        let per_second = self.per_second();
+        if per_second >= MICROS_PER_SECOND {
+            micros * (per_second / MICROS_PER_SECOND)
+        } else {
+            micros / (MICROS_PER_SECOND / per_second)
+        }
+    }
+
+    /// The unit a DuckDB constant's declared precision names.
+    pub fn from_precision(precision: TimestampPrecision) -> Self {
+        match precision {
+            TimestampPrecision::Second => TimestampUnit::Second,
+            TimestampPrecision::Millisecond => TimestampUnit::Millisecond,
+            TimestampPrecision::Microsecond => TimestampUnit::Microsecond,
+            TimestampPrecision::Nanosecond => TimestampUnit::Nanosecond,
+        }
+    }
+
+    /// The unit an arrow [`TimeUnit`] names.
+    pub fn from_arrow_unit(unit: TimeUnit) -> Self {
+        match unit {
+            TimeUnit::Second => TimestampUnit::Second,
+            TimeUnit::Millisecond => TimestampUnit::Millisecond,
+            TimeUnit::Microsecond => TimestampUnit::Microsecond,
+            TimeUnit::Nanosecond => TimestampUnit::Nanosecond,
+        }
+    }
+}
+
+impl fmt::Display for TimestampUnit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            TimestampUnit::Second => "s",
+            TimestampUnit::Millisecond => "ms",
+            TimestampUnit::Microsecond => "us",
+            TimestampUnit::Nanosecond => "ns",
+        })
+    }
 }
 
 impl fmt::Display for Type {
@@ -96,7 +188,7 @@ impl fmt::Display for Type {
             }
             Type::Utf8 => "Utf8",
             Type::Date => "Date",
-            Type::Timestamp => "Timestamp",
+            Type::Timestamp(unit) => return write!(f, "Timestamp({unit})"),
             Type::Variant => "Variant",
         };
         f.write_str(name)
@@ -153,7 +245,19 @@ pub fn type_from_logical(bound: BoundLogicalType) -> Result<Type, Error> {
         }
         (LogicalTypeId::VARCHAR, ExtraTypeInfo::None) => Ok(Type::Utf8),
         (LogicalTypeId::DATE, ExtraTypeInfo::None) => Ok(Type::Date),
-        (LogicalTypeId::TIMESTAMP, ExtraTypeInfo::None) => Ok(Type::Timestamp),
+        (LogicalTypeId::TIMESTAMP_SEC, ExtraTypeInfo::None) => {
+            Ok(Type::Timestamp(TimestampUnit::Second))
+        }
+        (LogicalTypeId::TIMESTAMP_MS, ExtraTypeInfo::None) => {
+            Ok(Type::Timestamp(TimestampUnit::Millisecond))
+        }
+        // Plain `TIMESTAMP` is DuckDB's microsecond default.
+        (LogicalTypeId::TIMESTAMP, ExtraTypeInfo::None) => {
+            Ok(Type::Timestamp(TimestampUnit::Microsecond))
+        }
+        (LogicalTypeId::TIMESTAMP_NS, ExtraTypeInfo::None) => {
+            Ok(Type::Timestamp(TimestampUnit::Nanosecond))
+        }
         (LogicalTypeId::VARIANT, ExtraTypeInfo::None) => Ok(Type::Variant),
         _ => Err(Error::UnsupportedLogicalType(bound.id.clone())),
     }
@@ -184,7 +288,12 @@ pub fn logical_from_type(pivot_type: &Type) -> BoundLogicalType {
         },
         Type::Utf8 => BoundLogicalType::plain(LogicalTypeId::VARCHAR),
         Type::Date => BoundLogicalType::plain(LogicalTypeId::DATE),
-        Type::Timestamp => BoundLogicalType::plain(LogicalTypeId::TIMESTAMP),
+        Type::Timestamp(unit) => BoundLogicalType::plain(match unit {
+            TimestampUnit::Second => LogicalTypeId::TIMESTAMP_SEC,
+            TimestampUnit::Millisecond => LogicalTypeId::TIMESTAMP_MS,
+            TimestampUnit::Microsecond => LogicalTypeId::TIMESTAMP,
+            TimestampUnit::Nanosecond => LogicalTypeId::TIMESTAMP_NS,
+        }),
         Type::Variant => BoundLogicalType::plain(LogicalTypeId::VARIANT),
     }
 }
@@ -220,7 +329,7 @@ pub fn physical_arrow_type(pivot_type: &Type) -> DataType {
         }
         Type::Utf8 => DataType::Utf8View,
         Type::Date => DataType::Date32,
-        Type::Timestamp => DataType::Timestamp(TimeUnit::Second, None),
+        Type::Timestamp(unit) => DataType::Timestamp(unit.arrow_unit(), None),
         Type::Variant => variant_struct_type(),
     }
 }
@@ -251,7 +360,9 @@ pub fn type_from_physical(data_type: &DataType) -> Option<Type> {
         }
         DataType::Utf8View => Some(Type::Utf8),
         DataType::Date32 => Some(Type::Date),
-        DataType::Timestamp(TimeUnit::Second, None) => Some(Type::Timestamp),
+        DataType::Timestamp(unit, None) => {
+            Some(Type::Timestamp(TimestampUnit::from_arrow_unit(*unit)))
+        }
         other if *other == variant_struct_type() => Some(Type::Variant),
         _ => None,
     }
@@ -330,13 +441,27 @@ pub fn build_scalar_value(value: ScalarValue) -> Result<Scalar<ArrayRef>, Error>
         ScalarValue::Date(days) => {
             Arc::new(arrow_array::Date32Array::new_scalar(days).into_inner())
         }
-        // DuckDB's TIMESTAMP is microseconds; pivot carries a timestamp as
-        // second-resolution (`Type::Timestamp` → `Timestamp(Second)`, the same as
-        // `make_timestamp`), so drop to seconds to match. A `date ± interval`
-        // constant lowers to a TIMESTAMP compared against `CAST(date AS TIMESTAMP)`,
-        // which casts the date column to the same second resolution.
-        ScalarValue::Timestamp(micros) => {
-            Arc::new(TimestampSecondArray::new_scalar(micros / 1_000_000).into_inner())
+        // Every timestamp constant arrives in microseconds whatever it was
+        // declared at, so it is converted back to its declared unit here: that
+        // is the resolution of the column it will be compared against, since
+        // DuckDB's binder brought the two to a common type before this point.
+        ScalarValue::Timestamp { micros, precision } => {
+            let unit = TimestampUnit::from_precision(precision);
+            let value = unit.from_micros(micros);
+            match unit {
+                TimestampUnit::Second => {
+                    Arc::new(TimestampSecondArray::new_scalar(value).into_inner())
+                }
+                TimestampUnit::Millisecond => {
+                    Arc::new(TimestampMillisecondArray::new_scalar(value).into_inner())
+                }
+                TimestampUnit::Microsecond => {
+                    Arc::new(TimestampMicrosecondArray::new_scalar(value).into_inner())
+                }
+                TimestampUnit::Nanosecond => {
+                    Arc::new(TimestampNanosecondArray::new_scalar(value).into_inner())
+                }
+            }
         }
         // INTERVAL never appears as a query constant we materialise (it is
         // consumed by interval arithmetic), and types the bridge doesn't decode
@@ -350,6 +475,9 @@ pub fn build_scalar_value(value: ScalarValue) -> Result<Scalar<ArrayRef>, Error>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::Datum;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::{TimestampNanosecondType, TimestampSecondType};
 
     /// One value of every [`Type`] variant. Extend this when adding a type;
     /// the round-trip tests below then cover its conversions.
@@ -377,9 +505,68 @@ mod tests {
             },
             Type::Utf8,
             Type::Date,
-            Type::Timestamp,
+            Type::Timestamp(TimestampUnit::Second),
             Type::Variant,
         ]
+    }
+
+    /// Each timestamp resolution survives the round trip through DuckDB's
+    /// logical type and back, so a column declared at one unit is never
+    /// silently read as another.
+    #[test]
+    fn every_timestamp_unit_round_trips_through_duckdb() {
+        for unit in [
+            TimestampUnit::Second,
+            TimestampUnit::Millisecond,
+            TimestampUnit::Microsecond,
+            TimestampUnit::Nanosecond,
+        ] {
+            let pivot = Type::Timestamp(unit);
+
+            let restored = type_from_logical(logical_from_type(&pivot)).unwrap();
+
+            assert_eq!(restored, pivot);
+            assert_eq!(
+                physical_arrow_type(&pivot),
+                DataType::Timestamp(unit.arrow_unit(), None)
+            );
+        }
+    }
+
+    /// A constant arrives from DuckDB in microseconds whatever it was declared
+    /// at, so it has to land back on its own unit to line up with the column it
+    /// is compared against.
+    #[test]
+    fn a_timestamp_constant_converts_to_its_declared_unit() {
+        let one_second_after_epoch = 1_000_000;
+
+        let seconds = build_scalar_value(ScalarValue::Timestamp {
+            micros: one_second_after_epoch,
+            precision: TimestampPrecision::Second,
+        })
+        .unwrap();
+        let nanos = build_scalar_value(ScalarValue::Timestamp {
+            micros: one_second_after_epoch,
+            precision: TimestampPrecision::Nanosecond,
+        })
+        .unwrap();
+
+        assert_eq!(
+            seconds
+                .get()
+                .0
+                .as_primitive::<TimestampSecondType>()
+                .value(0),
+            1
+        );
+        assert_eq!(
+            nanos
+                .get()
+                .0
+                .as_primitive::<TimestampNanosecondType>()
+                .value(0),
+            1_000_000_000
+        );
     }
 
     #[test]

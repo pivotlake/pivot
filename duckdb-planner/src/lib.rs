@@ -73,7 +73,7 @@ pub use catalog_provider::{DuckDBBind, DuckDBTable, DuckDBTransaction};
 pub use duckdb_bridge::duckdb_types::LogicalTypeId;
 pub use duckdb_bridge::ffi::DuckDBColumn;
 pub use handle::{BridgeError, Expr, LogicalOp, Plan};
-pub use types::{BoundLogicalType, ExtraTypeInfo, ScalarValue};
+pub use types::{BoundLogicalType, ExtraTypeInfo, ScalarValue, TimestampPrecision};
 
 /// Top-level error type for the planner.
 #[derive(Error, Debug)]

@@ -35,7 +35,7 @@ impl IntervalArithmetic {
         // The physical int the temporal result reinterprets through.
         let int_arrow = match self.result {
             Type::Date => DataType::Int32,
-            Type::Timestamp => DataType::Int64,
+            Type::Timestamp(_) => DataType::Int64,
             _ => unreachable!("interval result is Date or Timestamp"),
         };
         let op = self.op;
@@ -90,7 +90,7 @@ mod tests {
     use crate::test_support::*;
     use crate::types::Type;
     use arrow_array::cast::AsArray;
-    use arrow_array::types::TimestampSecondType;
+    use arrow_array::types::TimestampMicrosecondType;
     use arrow_array::{ArrayRef, Int32Array};
     use arrow_schema::{DataType, TimeUnit};
     use rstest::rstest;
@@ -112,16 +112,16 @@ mod tests {
             "SELECT d + interval '7 days' FROM events",
         );
 
-        // DuckDB promotes `date + interval` to a TIMESTAMP: 1970-01-01 + 7 days =
-        // 1970-01-08 00:00:00 = 604800 epoch seconds.
+        // DuckDB promotes `date + interval` to its microsecond TIMESTAMP:
+        // 1970-01-01 + 7 days = 1970-01-08 00:00:00 = 604800 epoch seconds.
         let col = batches[0].column(0);
         assert_eq!(
             col.data_type(),
-            &DataType::Timestamp(TimeUnit::Second, None)
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
         );
         assert_eq!(
-            col.as_primitive::<TimestampSecondType>().value(0),
-            7 * 86_400
+            col.as_primitive::<TimestampMicrosecondType>().value(0),
+            7 * 86_400 * 1_000_000
         );
     }
 
@@ -141,9 +141,9 @@ mod tests {
         let col = batches[0].column(0);
         assert_eq!(
             col.data_type(),
-            &DataType::Timestamp(TimeUnit::Second, None)
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
         );
-        let secs = col.as_primitive::<TimestampSecondType>().value(0);
+        let secs = col.as_primitive::<TimestampMicrosecondType>().value(0) / 1_000_000;
         let five_days = 5 * 86_400;
         assert!(
             (before - five_days..=after - five_days).contains(&secs),

@@ -26,7 +26,9 @@ use crate::expression::{
     Expression, Function, InList, IntervalArithmetic, IsNull, Length, Like, Not, NumericAggregate,
     Prefix, Ref, RegexpFullMatch, RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
 };
-use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
+use crate::types::{
+    TimestampUnit, Type, build_scalar_value, physical_arrow_type, type_from_logical,
+};
 
 impl Expression {
     /// Build a Pivot [`Expression`] (and its whole subtree) from a borrowed DuckDB
@@ -444,9 +446,18 @@ impl DateTrunc {
     pub(crate) fn from_handle(func: FunctionHandle<'_>) -> Result<DateTrunc, Error> {
         let params = function_args(func, 2)?;
         let unit = constant_string(Expression::from_handle(params[0])?)?.to_ascii_lowercase();
+        let source = Expression::from_handle(params[1])?;
+        // date_trunc keeps its source's resolution, so the unit is read off the
+        // expression it truncates.
+        let Ok(Type::Timestamp(source_unit)) = source.result_type() else {
+            return Err(Error::UnsupportedScalarFunction(
+                "date_trunc on a non-timestamp source".to_string(),
+            ));
+        };
         Ok(DateTrunc {
             unit,
-            source: Box::new(Expression::from_handle(params[1])?),
+            source_unit,
+            source: Box::new(source),
         })
     }
 }
@@ -481,7 +492,7 @@ impl TemporalConvert {
     pub(crate) fn make_timestamp(func: FunctionHandle<'_>) -> Result<TemporalConvert, Error> {
         Self::build(
             "make_timestamp",
-            Type::Timestamp,
+            Type::Timestamp(TimestampUnit::Second),
             DataType::Timestamp(TimeUnit::Second, None),
             DataType::Int64,
             func,
@@ -558,7 +569,6 @@ struct IntervalParts {
 }
 
 const SECS_PER_DAY: i64 = 86_400;
-const MICROS_PER_SEC: i64 = 1_000_000;
 
 /// Reduce an interval to a constant offset in the result's unit. Months/years are
 /// calendar-variable (rejected); a `DATE` only takes whole-day intervals, a
@@ -579,9 +589,11 @@ fn interval_offset(interval: &IntervalParts, result: &Type) -> Result<i64, Error
             }
             Ok(interval.days as i64)
         }
-        Type::Timestamp => {
-            Ok(interval.days as i64 * SECS_PER_DAY + interval.micros / MICROS_PER_SEC)
-        }
+        // The offset lands in the column's own unit, so the whole-day part is
+        // scaled into it and the sub-day part converted from the microseconds
+        // DuckDB carries an interval in.
+        Type::Timestamp(unit) => Ok(interval.days as i64 * SECS_PER_DAY * unit.per_second()
+            + unit.from_micros(interval.micros)),
         other => Err(Error::UnsupportedInterval(format!(
             "interval arithmetic on a non-temporal {other}"
         ))),

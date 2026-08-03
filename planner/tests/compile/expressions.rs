@@ -4,7 +4,7 @@ use arrow_array::{ArrayRef, Float64Array, Int32Array, StringViewArray};
 
 use crate::common::*;
 use planner::Error as PlannerError;
-use planner::types::Type;
+use planner::types::{TimestampUnit, Type};
 use rstest::rstest;
 
 #[rstest]
@@ -105,7 +105,7 @@ fn group_by_minute_of_timestamp(mut testing_planner: TestingPlanner) {
         "events",
         &[(
             "EventTime",
-            Type::Timestamp,
+            Type::Timestamp(TimestampUnit::Second),
             Arc::new(Int64Array::from(vec![0i64, 90, 150, 3690])) as ArrayRef,
         )],
     );
@@ -145,7 +145,7 @@ fn minute_grouped_table(testing_planner: &mut TestingPlanner, name: &str) {
         &[
             (
                 "EventTime",
-                Type::Timestamp,
+                Type::Timestamp(TimestampUnit::Second),
                 Arc::new(Int64Array::from(vec![0i64, 90, 150, 3690])) as ArrayRef,
             ),
             (
@@ -300,7 +300,7 @@ fn group_by_plain_and_computed_key(mut testing_planner: TestingPlanner) {
             ),
             (
                 "EventTime",
-                Type::Timestamp,
+                Type::Timestamp(TimestampUnit::Second),
                 Arc::new(Int64Array::from(vec![0i64, 90, 150, 90])) as ArrayRef,
             ),
             (
@@ -408,7 +408,7 @@ fn extract_all_date_parts(mut testing_planner: TestingPlanner) {
         "ts",
         &[(
             "EventTime",
-            Type::Timestamp,
+            Type::Timestamp(TimestampUnit::Second),
             Arc::new(Int64Array::from(timestamps.to_vec())) as ArrayRef,
         )],
     );
@@ -440,7 +440,8 @@ fn extract_all_date_parts(mut testing_planner: TestingPlanner) {
     for (part, expected) in cases {
         let results = testing_planner
             .plan(&format!(
-                "SELECT extract({part} FROM EventTime) AS v, EventTime AS t FROM ts"
+                "SELECT extract({part} FROM EventTime) AS v, \
+                 extract(epoch FROM EventTime) AS t FROM ts"
             ))
             .unwrap()
             .compile(
@@ -451,9 +452,11 @@ fn extract_all_date_parts(mut testing_planner: TestingPlanner) {
             .collect()
             .unwrap();
 
-        // The select item aliases are `v` (the extracted value) and `t`
-        // (the source EventTime). Map each row's timestamp to its
-        // value, then compare against the expectation (row order isn't fixed).
+        // The select item aliases are `v` (the extracted value) and `t` (the
+        // source EventTime as epoch seconds, since the column itself renders
+        // as a timestamp rather than a number). Map each row's timestamp to
+        // its value, then compare against the expectation (row order isn't
+        // fixed).
         let rows = batches_to_json(&results);
         for (i, &t) in timestamps.iter().enumerate() {
             let row = rows

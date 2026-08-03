@@ -99,8 +99,15 @@ pub enum ScalarValue {
     Utf8(String),
     /// `DATE`: days since the Unix epoch (1970-01-01).
     Date(i32),
-    /// `TIMESTAMP`: microseconds since the Unix epoch.
-    Timestamp(i64),
+    /// A timestamp: always microseconds since the Unix epoch, whatever
+    /// resolution it was declared at, because DuckDB's value accessor casts to
+    /// its microsecond timestamp on the way out. `precision` is the resolution
+    /// the value was declared at, which is what a consumer converts back to so
+    /// the constant matches the column it is compared against.
+    Timestamp {
+        micros: i64,
+        precision: TimestampPrecision,
+    },
     /// `INTERVAL` kept as its three independent components.
     Interval {
         months: i32,
@@ -113,6 +120,17 @@ pub enum ScalarValue {
     Variant(String),
     /// A DuckDB type the bridge does not decode into a typed variant.
     Other(LogicalTypeId),
+}
+
+/// The resolution a DuckDB timestamp is declared at: `TIMESTAMP_S`,
+/// `TIMESTAMP_MS`, `TIMESTAMP` (DuckDB's microsecond default) or
+/// `TIMESTAMP_NS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimestampPrecision {
+    Second,
+    Millisecond,
+    Microsecond,
+    Nanosecond,
 }
 
 impl fmt::Display for ScalarValue {
@@ -137,7 +155,7 @@ impl fmt::Display for ScalarValue {
             } => write!(f, "{value} as DECIMAL({width},{scale})"),
             ScalarValue::Utf8(v) => write!(f, "{v}"),
             ScalarValue::Date(v) => write!(f, "{v}"),
-            ScalarValue::Timestamp(v) => write!(f, "{v}"),
+            ScalarValue::Timestamp { micros, .. } => write!(f, "{micros}"),
             ScalarValue::Interval {
                 months,
                 days,

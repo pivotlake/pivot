@@ -527,9 +527,17 @@ fn delta_type(column: &str, data_type: &Type) -> Result<DeltaDataType, Error> {
         Type::Float64 => PrimitiveType::Double,
         Type::Utf8 => PrimitiveType::String,
         Type::Date => PrimitiveType::Date,
-        Type::Timestamp => PrimitiveType::Timestamp,
+        // Delta's timestamp primitives are microsecond, so that is the one
+        // resolution it expresses natively; the others go through the tagged
+        // path below.
+        Type::Timestamp(planner::types::TimestampUnit::Microsecond) => PrimitiveType::Timestamp,
         Type::Decimal { precision, scale } => PrimitiveType::decimal(*precision, *scale as u8)?,
-        Type::Int128 | Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64 => {
+        Type::Int128
+        | Type::UInt8
+        | Type::UInt16
+        | Type::UInt32
+        | Type::UInt64
+        | Type::Timestamp(_) => {
             return Err(Error::UnsupportedType {
                 column: column.to_string(),
                 data_type: data_type.to_string(),
@@ -546,13 +554,13 @@ fn delta_type(column: &str, data_type: &Type) -> Result<DeltaDataType, Error> {
 const PIVOT_LOGICAL_TYPE_KEY: &str = "pivot.logicalTypeOverride";
 
 /// Build the Delta struct field for one Pivot column. Types Delta represents
-/// natively map straight through [`delta_type`]; the unsigned types it rejects
-/// fall back to [`build_unsigned_field`], which stores them as a tagged signed
-/// primitive.
+/// natively map straight through [`delta_type`]; the ones it cannot express
+/// fall back to [`build_tagged_field`], which stores them as a primitive that
+/// holds their range and records the true type beside it.
 fn build_delta_field(column: &str, data_type: &Type) -> Result<StructField, Error> {
     match delta_type(column, data_type) {
         Ok(delta_type) => Ok(StructField::new(column, delta_type, false)),
-        Err(_) => build_unsigned_field(column, data_type),
+        Err(_) => build_tagged_field(column, data_type),
     }
 }
 
@@ -563,8 +571,13 @@ fn build_delta_field(column: &str, data_type: &Type) -> Result<StructField, Erro
 /// physical file decodes because the read is driven by the recovered type, not
 /// this stored primitive. Any non-unsigned type reaching here is genuinely
 /// unsupported and errors.
-fn build_unsigned_field(column: &str, data_type: &Type) -> Result<StructField, Error> {
+fn build_tagged_field(column: &str, data_type: &Type) -> Result<StructField, Error> {
     let primitive = match data_type {
+        // Delta has only a microsecond timestamp, so a column of any other
+        // resolution is declared as that one and recovered from the tag. The
+        // stored primitive bounds nothing: the read is driven by the recovered
+        // type against the physical file.
+        Type::Timestamp(_) => PrimitiveType::Timestamp,
         Type::UInt8 => PrimitiveType::Short,
         Type::UInt16 => PrimitiveType::Integer,
         Type::UInt32 | Type::UInt64 => PrimitiveType::Long,
@@ -584,7 +597,7 @@ fn build_unsigned_field(column: &str, data_type: &Type) -> Result<StructField, E
 /// signed primitive.
 fn pivot_type_from_field(field: &StructField) -> Result<Type, Error> {
     if let Some(MetadataValue::String(tag)) = field.metadata.get(PIVOT_LOGICAL_TYPE_KEY) {
-        return parse_unsigned_tag(tag).ok_or_else(|| Error::UnsupportedType {
+        return parse_tagged_type(tag).ok_or_else(|| Error::UnsupportedType {
             column: field.name().clone(),
             data_type: tag.clone(),
         });
@@ -609,7 +622,9 @@ fn pivot_type_from_field(field: &StructField) -> Result<Type, Error> {
         PrimitiveType::Double => Type::Float64,
         PrimitiveType::Boolean => Type::Boolean,
         PrimitiveType::Date => Type::Date,
-        PrimitiveType::Timestamp | PrimitiveType::TimestampNtz => Type::Timestamp,
+        PrimitiveType::Timestamp | PrimitiveType::TimestampNtz => {
+            Type::Timestamp(planner::types::TimestampUnit::Microsecond)
+        }
         // Delta Kernel already enforces precision 1..=38 and scale <= precision,
         // exactly the shapes Pivot's decimal supports.
         PrimitiveType::Decimal(decimal) => Type::Decimal {
@@ -623,13 +638,20 @@ fn pivot_type_from_field(field: &StructField) -> Result<Type, Error> {
     Ok(data_type)
 }
 
-/// Parse a [`PIVOT_LOGICAL_TYPE_KEY`] tag back into its unsigned Pivot type.
-fn parse_unsigned_tag(tag: &str) -> Option<Type> {
+/// Parse a [`PIVOT_LOGICAL_TYPE_KEY`] tag back into the Pivot type it records.
+/// The tags are the types' own `Display` forms, so this is the inverse of what
+/// [`build_tagged_field`] wrote.
+fn parse_tagged_type(tag: &str) -> Option<Type> {
+    use planner::types::TimestampUnit;
     match tag {
         "UInt8" => Some(Type::UInt8),
         "UInt16" => Some(Type::UInt16),
         "UInt32" => Some(Type::UInt32),
         "UInt64" => Some(Type::UInt64),
+        "Timestamp(s)" => Some(Type::Timestamp(TimestampUnit::Second)),
+        "Timestamp(ms)" => Some(Type::Timestamp(TimestampUnit::Millisecond)),
+        "Timestamp(us)" => Some(Type::Timestamp(TimestampUnit::Microsecond)),
+        "Timestamp(ns)" => Some(Type::Timestamp(TimestampUnit::Nanosecond)),
         _ => None,
     }
 }
@@ -638,6 +660,7 @@ fn parse_unsigned_tag(tag: &str) -> Option<Type> {
 mod tests {
     use super::*;
     use arrow_array::Datum;
+    use planner::types::TimestampUnit;
 
     #[test]
     fn delta_partition_values_become_pivot_scalars() {
@@ -688,7 +711,7 @@ mod tests {
         let restored = partition_scalar(
             "ts",
             written.as_str().unwrap(),
-            &Type::Timestamp,
+            &Type::Timestamp(TimestampUnit::Second),
             &DeltaDataType::Primitive(PrimitiveType::Timestamp),
         )
         .unwrap();

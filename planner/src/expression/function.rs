@@ -7,7 +7,7 @@ use super::{
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::expression::Expression;
-use crate::types::Type;
+use crate::types::{TimestampUnit, Type};
 use arrow_array::{Int64Array, RecordBatch, TimestampSecondArray};
 use std::fmt::{self, Display};
 use std::sync::Arc;
@@ -43,7 +43,7 @@ pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
         // only the `now()` call form is intercepted here.)
         "now" => Some(ScalarFunctionSignature {
             arguments: vec![],
-            return_type: Type::Timestamp,
+            return_type: Type::Timestamp(TimestampUnit::Second),
             volatile: true,
         }),
         // Not a DuckDB built-in (unlike `regexp_replace`), so its signature is
@@ -180,8 +180,10 @@ impl Function {
             Function::RegexpReplace(_) | Function::RegexpJitReplace(_) => Type::Utf8,
             // `/` computes a float quotient, single- or double-precision.
             Function::Divide(d) => d.return_type.clone(),
-            // `date_trunc` and `now()` yield a timestamp.
-            Function::DateTrunc(_) | Function::Now => Type::Timestamp,
+            // `date_trunc` keeps the resolution of what it truncates; `now()`
+            // yields the epoch seconds the rest of the time path uses.
+            Function::DateTrunc(d) => Type::Timestamp(d.source_unit),
+            Function::Now => Type::Timestamp(TimestampUnit::Second),
             // `date`/`timestamp` ± interval keeps the temporal operand's type,
             // and `make_date`/`make_timestamp` produce the type they convert to.
             Function::IntervalArithmetic(i) => i.result.clone(),

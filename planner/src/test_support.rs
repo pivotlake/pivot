@@ -86,7 +86,7 @@ impl TestTable {
         let arrays: Vec<ArrayRef> = columns
             .iter()
             .map(|(_, col_type, array)| match col_type {
-                Type::Date | Type::Timestamp => {
+                Type::Date | Type::Timestamp(_) => {
                     arrow::compute::cast(array, &physical_arrow_type(col_type)).unwrap()
                 }
                 _ => array.clone(),

@@ -133,7 +133,7 @@ fn function_minute(mut testing_planner: TestingPlanner) {
         "events",
         &[(
             "EventTime",
-            planner::types::Type::Timestamp,
+            planner::types::Type::Timestamp(planner::types::TimestampUnit::Second),
             Arc::new(Int64Array::from(vec![0i64, 90, 150])) as ArrayRef,
         )],
     );
@@ -142,8 +142,8 @@ fn function_minute(mut testing_planner: TestingPlanner) {
         .unwrap();
     assert_snapshot!(plan.to_string(), @"
     Projection(#0:Int64, count_star():Int64)
-      Aggregate(groups: [minute(EventTime:Timestamp)], exprs: [count_star()])
-        Input([EventTime:Timestamp])
+      Aggregate(groups: [minute(cast(EventTime:Timestamp(s) as Timestamp(us)))], exprs: [count_star()])
+        Input([EventTime:Timestamp(s)])
     ");
 }
 
