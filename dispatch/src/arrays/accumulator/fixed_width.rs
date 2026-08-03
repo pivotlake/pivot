@@ -10,6 +10,7 @@ use arrow::array::ArrayData;
 use arrow_array::{ArrayRef, make_array};
 use arrow_schema::{ArrowError, DataType};
 
+use super::chunked::PreparedColumn;
 use super::column::{ColumnAccumulator, SourceSelection};
 use super::validity::ValidityMask;
 use crate::arrays::slab_into_buffer;
@@ -76,6 +77,41 @@ impl ColumnAccumulator for FixedWidthColumn {
         }
     }
 
+    fn append_chunked(
+        &mut self,
+        source: &PreparedColumn,
+        ids: &[u32],
+        shift: u32,
+        destination_start: usize,
+        _allocator: &mut SlabAllocator,
+    ) {
+        let PreparedColumn::FixedWidth {
+            width,
+            values,
+            nulls,
+        } = source
+        else {
+            unreachable!("a fixed-width accumulator receives a fixed-width prepared column");
+        };
+        debug_assert_eq!(*width, self.width);
+        self.validity
+            .append_by_ids(nulls, ids, shift, destination_start);
+        // SAFETY: each id names an in-bounds row of its chunk, and the slab has
+        // capacity for `destination_start` plus the appended rows (checked by
+        // the caller).
+        unsafe {
+            let dst = (self.slab.ptr_at_index(0) as *mut u8).add(destination_start * self.width);
+            match self.width {
+                1 => gather_chunked::<u8>(values, ids, shift, dst),
+                2 => gather_chunked::<u16>(values, ids, shift, dst),
+                4 => gather_chunked::<u32>(values, ids, shift, dst),
+                8 => gather_chunked::<u64>(values, ids, shift, dst),
+                16 => gather_chunked::<u128>(values, ids, shift, dst),
+                _ => unreachable!("built only for the widths above"),
+            }
+        }
+    }
+
     fn take_array(
         &mut self,
         len: usize,
@@ -135,6 +171,26 @@ pub(super) unsafe fn gather_fixed_width<T: Copy>(src: *const u8, dst: *mut u8, i
         for (offset, &row) in rows.remainder().iter().enumerate() {
             dst.add(destination + offset)
                 .write_unaligned(src.add(row as usize).read_unaligned());
+        }
+    }
+}
+
+/// Gather the rows at the encoded `ids` from per-chunk value pointers to
+/// `dst`, as elements of `T`. The two-level read stays a flat loop with
+/// independent iterations, like [`gather_fixed_width`].
+///
+/// # Safety
+/// Every id must name an in-bounds row of an in-bounds chunk, `dst` must have
+/// room for `ids.len()` elements, and all pointers must be valid for unaligned
+/// `T` access.
+unsafe fn gather_chunked<T: Copy>(chunks: &[*const u8], ids: &[u32], shift: u32, dst: *mut u8) {
+    let mask = (1u32 << shift) - 1;
+    let dst = dst as *mut T;
+    unsafe {
+        for (out_idx, &id) in ids.iter().enumerate() {
+            let src = *chunks.get_unchecked((id >> shift) as usize) as *const T;
+            dst.add(out_idx)
+                .write_unaligned(src.add((id & mask) as usize).read_unaligned());
         }
     }
 }
