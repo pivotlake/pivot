@@ -6,8 +6,8 @@
 //! and builds a `Vec<u128>` of Arrow views so that each RLE index can be
 //! resolved to a view in O(1).
 
-use crate::parquet::reading::decoding::column_decoders::bytes_view::views_builder::ViewsBuilder;
-use crate::parquet::reading::decoding::column_decoders::{Dict, DictFromBytes, DictFromVecBytes};
+use crate::parquet::reading::decoding::leaf_decoders::bytes_view::views_builder::ViewsBuilder;
+use crate::parquet::reading::decoding::leaf_decoders::{Dict, DictFromBytes, DictFromVecBytes};
 use arrow_array::builder::make_view;
 use arrow_array::types::ByteViewType;
 use arrow_array::{

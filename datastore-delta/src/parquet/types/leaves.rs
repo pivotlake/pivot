@@ -1,5 +1,6 @@
-//! Conversion between nested Arrow columns and Parquet's depth-first leaves.
+//! Converts between nested Arrow columns and Parquet's depth-first leaves.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, StructArray};
@@ -9,8 +10,9 @@ use dispatch::Projection;
 
 use crate::parquet::types::metadata::QueryRowGroupMetadata;
 
-/// The depth-first leaf fields of `fields` (struct fields expanded to their
-/// primitive descendants), in the same order as a Parquet file's column chunks.
+/// Returns the primitive descendants of `fields` in depth-first order.
+///
+/// This is the same order that Parquet uses for column chunks.
 pub(crate) fn leaf_fields(fields: &Fields) -> Vec<FieldRef> {
     let mut leaves = Vec::new();
     for field in fields {
@@ -19,15 +21,18 @@ pub(crate) fn leaf_fields(fields: &Fields) -> Vec<FieldRef> {
     leaves
 }
 
-fn push_leaf_fields(field: &FieldRef, out: &mut Vec<FieldRef>) {
+fn push_leaf_fields(field: &FieldRef, leaves: &mut Vec<FieldRef>) {
     match field.data_type() {
-        DataType::Struct(children) => children.iter().for_each(|c| push_leaf_fields(c, out)),
-        _ => out.push(field.clone()),
+        DataType::Struct(children) => children
+            .iter()
+            .for_each(|child| push_leaf_fields(child, leaves)),
+        _ => leaves.push(field.clone()),
     }
 }
 
-/// Number of leaves (column chunks) the field spans: `1` for a primitive, the
-/// descendant-leaf count for a struct.
+/// Returns the number of Parquet leaves spanned by `field`.
+///
+/// A primitive spans one leaf, while a struct spans all its descendant leaves.
 pub(crate) fn leaf_count(field: &FieldRef) -> usize {
     match field.data_type() {
         DataType::Struct(children) => children.iter().map(leaf_count).sum(),
@@ -35,18 +40,24 @@ pub(crate) fn leaf_count(field: &FieldRef) -> usize {
     }
 }
 
-/// The index of `column`'s first leaf: the leaves of every field before it.
+/// Returns the index of the first leaf belonging to `column`.
 pub(crate) fn first_leaf(fields: &Fields, column: usize) -> usize {
     fields.iter().take(column).map(leaf_count).sum()
 }
 
-/// The typed leaf a pushed variant extract can be read directly from, when
-/// `path` is shredded to a typed (non-object) leaf under `column` AND every
-/// row's value for the path lives in that leaf in this row group (no residual
-/// `value` fallback holds anything), so reading the leaf alone is exact.
-/// `None` means read the whole variant and extract (the path isn't shredded
-/// here, or some rows fell to the residual, invisible to the typed leaf).
-pub(crate) fn direct_extract_typed_leaf(
+/// Returns the file leaf range spanned by top-level `column`.
+pub(crate) fn leaf_range(fields: &Fields, column: usize) -> Range<usize> {
+    let start = first_leaf(fields, column);
+    start..start + leaf_count(&fields[column])
+}
+
+/// Returns the typed leaf that can satisfy a pushed variant extract by itself.
+///
+/// The path must resolve to a typed scalar leaf under `column`, and every
+/// untyped `value` leaf along the path must be null for the entire row group.
+/// Otherwise, some values may live outside the typed leaf and the caller must
+/// read the whole variant.
+pub(crate) fn try_extract_typed_leaf(
     fields: &Fields,
     metadata: &QueryRowGroupMetadata,
     column: usize,
@@ -54,27 +65,28 @@ pub(crate) fn direct_extract_typed_leaf(
 ) -> Option<usize> {
     let leaves = variant_shredded_leaves(fields, column, path)?;
     let num_rows = metadata.num_rows();
-    for &fallback in &leaves.value_fallbacks {
+    for &value_leaf in &leaves.value_leaves {
         if metadata
             .get_metadata()
-            .leaf_statistics(fallback)?
+            .leaf_statistics(value_leaf)?
             .null_count?
             != num_rows
         {
             return None;
         }
     }
-    Some(leaves.typed_value)
+    Some(leaves.typed_leaf)
 }
 
-/// The leaf (column-chunk) indices a `projection` reads against this file's
-/// `fields` and row-group stats. Each output is one of: a plain column (its
-/// run of leaves), a pushed extract read directly from its shredded typed leaf
-/// (one leaf), or a pushed extract that falls back to the whole variant (its
-/// run of leaves) so `variant_get` can reconstruct it. The fetcher and the
-/// decoder both resolve outputs this way, so a fetched chunk's position always
-/// lines up with its decoder, even when another file shreds a variant column
-/// into a different number of leaves.
+/// Returns the file leaf indices needed for `projection`.
+///
+/// A plain column contributes all its leaves. A scalar variant extract uses one
+/// typed leaf when that leaf contains every value. A bare variant extract uses
+/// its pruned path subtree when possible. All other extracts contribute the
+/// complete variant column so that `variant_get` can reconstruct the result.
+///
+/// Both fetching and decoding use this resolution, which keeps fetched chunks
+/// aligned with their decoders when files have different shredding layouts.
 pub(crate) fn projected_leaves(
     fields: &Fields,
     metadata: &QueryRowGroupMetadata,
@@ -84,18 +96,18 @@ pub(crate) fn projected_leaves(
     for (output_idx, &column) in projection.column_indices.iter().enumerate() {
         if let Some(extract) = projection.extract_at(output_idx) {
             match &extract.as_type {
-                // A scalar extract reads only the shredded typed leaf when the
-                // path is fully shredded here.
+                // A scalar extract can use a typed leaf only when it contains
+                // every value for the path.
                 Some(_) => {
                     if let Some(typed_leaf) =
-                        direct_extract_typed_leaf(fields, metadata, column, &extract.path)
+                        try_extract_typed_leaf(fields, metadata, column, &extract.path)
                     {
                         leaves.push(typed_leaf);
                         continue;
                     }
                 }
-                // A bare extract reads only the path's subtree (plus residuals)
-                // when the path is shredded here.
+                // A bare extract can use the path subtree when this file
+                // shreds the path.
                 None => {
                     if let Some(plan) = plan_variant_extract(fields, column, &extract.path) {
                         leaves.extend(plan.file_leaves);
@@ -104,29 +116,29 @@ pub(crate) fn projected_leaves(
                 }
             }
         }
-        let start = first_leaf(fields, column);
-        leaves.extend(start..start + leaf_count(&fields[column]));
+        leaves.extend(leaf_range(fields, column));
     }
     leaves
 }
 
-/// The column-chunk indices that decide whether a shredded variant path can
-/// be pruned by statistics.
-pub(crate) struct ShreddedPathLeaves {
-    /// The typed leaf holding the path's shredded values, whose min/max
-    /// statistics a predicate compares against.
-    pub typed_value: usize,
-    /// The binary `value` leaves along the path. A row's value for the path
-    /// may live in any of them instead of the typed leaf (an unshredded row,
-    /// or a value of another variant type), invisible to the typed leaf's
-    /// statistics; pruning is sound only when each is all-null in the row
-    /// group.
-    pub value_fallbacks: Vec<usize>,
+/// Describes where a shredded scalar path lives in one file's column chunks.
+///
+/// Shredding stores each field in a typed `typed_value` column and an untyped
+/// binary `value` column. Values that match the shredded type use the typed
+/// column, while other values use an untyped `value` column. Recursive
+/// shredding adds an untyped column at every level of the path. The typed
+/// column is complete only when every one of those untyped columns is null.
+pub(crate) struct ShreddedScalarPath {
+    /// This leaf holds the shredded values and their predicate statistics.
+    pub typed_leaf: usize,
+    /// These untyped leaves can hold values missing from the typed leaf.
+    pub value_leaves: Vec<usize>,
 }
 
-/// Resolve `path`, shredded under the variant column `column`, to its leaves
-/// in THIS file's schema; `None` when the file doesn't shred that path (no
-/// pruning, always sound).
+/// Resolves a shredded scalar `path` under variant `column` to its file leaves.
+///
+/// This returns `None` when the file does not shred the path or when the path
+/// ends at a shredded object instead of a scalar.
 ///
 /// For example, `user.id` maps to
 /// `column.typed_value.user.typed_value.id.typed_value`.
@@ -134,55 +146,54 @@ pub(crate) fn variant_shredded_leaves(
     fields: &Fields,
     column: usize,
     path: &[String],
-) -> Option<ShreddedPathLeaves> {
-    let mut offset = first_leaf(fields, column);
-    let mut field = &fields[column];
-    let mut value_fallbacks = Vec::new();
-    // Each shredding level holds a binary `value` fallback next to the
-    // `typed_value` we descend. A level without a `value` child has no
-    // fallback to guard against.
+) -> Option<ShreddedScalarPath> {
+    let mut field_first_leaf = first_leaf(fields, column);
+    let mut current_field = &fields[column];
+    let mut value_leaves = Vec::new();
+    // Each shredding level may hold an untyped `value` next to the
+    // `typed_value` branch.
     for segment in path {
-        if let Some((value_offset, _)) = child_leaf_offset(field, "value") {
-            value_fallbacks.push(offset + value_offset);
+        if let Some((value_offset, _)) = find_child_leaf_offset(current_field, "value") {
+            value_leaves.push(field_first_leaf + value_offset);
         }
-        let (typed_offset, typed) = child_leaf_offset(field, "typed_value")?;
-        let (segment_offset, segment_field) = child_leaf_offset(typed, segment)?;
-        offset += typed_offset + segment_offset;
-        field = segment_field;
+        let (typed_offset, typed_field) = find_child_leaf_offset(current_field, "typed_value")?;
+        let (segment_offset, segment_field) = find_child_leaf_offset(typed_field, segment)?;
+        field_first_leaf += typed_offset + segment_offset;
+        current_field = segment_field;
     }
-    if let Some((value_offset, _)) = child_leaf_offset(field, "value") {
-        value_fallbacks.push(offset + value_offset);
+    if let Some((value_offset, _)) = find_child_leaf_offset(current_field, "value") {
+        value_leaves.push(field_first_leaf + value_offset);
     }
-    let (typed_offset, typed) = child_leaf_offset(field, "typed_value")?;
-    if matches!(typed.data_type(), DataType::Struct(_)) {
+    let (typed_offset, typed_field) = find_child_leaf_offset(current_field, "typed_value")?;
+    if matches!(typed_field.data_type(), DataType::Struct(_)) {
         // The path names an object shredded further, not a typed leaf.
         return None;
     }
-    Some(ShreddedPathLeaves {
-        typed_value: offset + typed_offset,
-        value_fallbacks,
+    Some(ShreddedScalarPath {
+        typed_leaf: field_first_leaf + typed_offset,
+        value_leaves,
     })
 }
 
-/// A plan for reading a bare (uncast) variant sub-extraction at a path: the
-/// file leaf indices to read and the pruned variant field to fold them into.
+/// Describes the leaves and field structure for a bare variant extraction.
 ///
-/// Only the metadata, the residual `value` at each level along the path, and
+/// Only the metadata, the untyped `value` at each level along the path, and
 /// the whole subtree at the path are read; sibling fields are skipped. Folding
 /// the read leaves into `nest_field` yields a variant that is the input with
 /// every off-path field dropped, so `variant_get(folded, path)` reconstructs
-/// the sub-variant exactly as it would over the full column, residual fallbacks
+/// the sub-variant exactly as it would over the full column, untyped fallbacks
 /// and all, while touching far fewer column chunks.
 pub(crate) struct VariantExtractPlan {
-    /// File leaf (column-chunk) indices to read, in depth-first order.
+    /// These file leaf indices are read in depth-first order.
     pub file_leaves: Vec<usize>,
-    /// The pruned variant struct field the read leaves fold back into.
+    /// The read leaves fold back into this pruned variant field.
     pub nest_field: FieldRef,
 }
 
-/// Plan a bare variant extraction of `path` under variant `column` against this
-/// file's `fields`. `None` when the path isn't shredded here (the caller reads
-/// the whole variant instead).
+/// Plans a bare variant extraction of `path` under variant `column`.
+///
+/// This returns `None` when the file does not shred the path. The caller then
+/// reads the whole variant.
 pub(crate) fn plan_variant_extract(
     fields: &Fields,
     column: usize,
@@ -197,70 +208,76 @@ pub(crate) fn plan_variant_extract(
     })
 }
 
-/// Prune variant node `field` (a `{[metadata], [value], typed_value}` struct,
-/// with `base` the file index of its first leaf) to the single branch that
-/// reaches `path`: metadata and residual `value` children are kept, and
-/// `typed_value` is narrowed to just the on-path child until `path` empties, at
-/// which point the whole subtree is kept. Appends the kept leaves (absolute
-/// file indices, depth-first) to `leaves`. `None` when `path` isn't shredded.
+/// Prunes a variant node to the single branch that reaches `path`.
+///
+/// The function retains metadata and untyped `value` children. It narrows
+/// `typed_value` to the on-path child until the path ends, then retains the
+/// complete remaining subtree. It appends the retained absolute leaf indices
+/// to `file_leaves` in depth-first order.
 fn prune_variant_node(
     field: &FieldRef,
     path: &[String],
-    base: usize,
-    leaves: &mut Vec<usize>,
+    first_leaf: usize,
+    file_leaves: &mut Vec<usize>,
 ) -> Option<FieldRef> {
     let DataType::Struct(children) = field.data_type() else {
         return None;
     };
-    let mut pruned = Vec::with_capacity(children.len());
-    let mut cursor = base;
+    let mut pruned_children = Vec::with_capacity(children.len());
+    let mut child_first_leaf = first_leaf;
     for child in children {
-        let count = leaf_count(child);
+        let child_leaf_count = leaf_count(child);
         if child.name() == "typed_value" {
             if path.is_empty() {
-                // The path ends here: keep the whole subtree.
-                leaves.extend(cursor..cursor + count);
-                pruned.push(child.clone());
+                // The path ends here, so the entire subtree is retained.
+                file_leaves.extend(child_first_leaf..child_first_leaf + child_leaf_count);
+                pruned_children.push(child.clone());
             } else {
-                // Descend the shredded object to only its on-path child.
-                let DataType::Struct(object) = child.data_type() else {
+                // Only the on-path child of the shredded object is retained.
+                let DataType::Struct(object_fields) = child.data_type() else {
                     // The path continues but this level is a typed leaf.
                     return None;
                 };
-                let mut sub = cursor;
-                let mut kept = None;
-                for object_child in object {
+                let mut object_child_first_leaf = child_first_leaf;
+                let mut pruned_path_field = None;
+                for object_child in object_fields {
                     if object_child.name() == path[0].as_str() {
-                        kept = Some(prune_variant_node(object_child, &path[1..], sub, leaves)?);
+                        pruned_path_field = Some(prune_variant_node(
+                            object_child,
+                            &path[1..],
+                            object_child_first_leaf,
+                            file_leaves,
+                        )?);
                         break;
                     }
-                    sub += leaf_count(object_child);
+                    object_child_first_leaf += leaf_count(object_child);
                 }
-                let kept = kept?;
-                pruned.push(Arc::new(Field::new(
+                let pruned_path_field = pruned_path_field?;
+                pruned_children.push(Arc::new(Field::new(
                     child.name(),
-                    DataType::Struct(Fields::from(vec![kept.as_ref().clone()])),
+                    DataType::Struct(Fields::from(vec![pruned_path_field.as_ref().clone()])),
                     child.is_nullable(),
                 )));
             }
         } else {
-            // A metadata or residual `value` leaf: keep and read it.
-            leaves.extend(cursor..cursor + count);
-            pruned.push(child.clone());
+            // Metadata and untyped `value` children are always retained.
+            file_leaves.extend(child_first_leaf..child_first_leaf + child_leaf_count);
+            pruned_children.push(child.clone());
         }
-        cursor += count;
+        child_first_leaf += child_leaf_count;
     }
     Some(Arc::new(Field::new(
         field.name(),
-        DataType::Struct(Fields::from(pruned)),
+        DataType::Struct(Fields::from(pruned_children)),
         field.is_nullable(),
     )))
 }
 
-/// The leaf offset (within `field`) and field of `field`'s direct child named
-/// `name`, counting the leaves of earlier siblings; `None` when `field` isn't
-/// a struct or has no such child.
-fn child_leaf_offset<'a>(field: &'a FieldRef, name: &str) -> Option<(usize, &'a FieldRef)> {
+/// Finds a direct child and its leaf offset within `field`.
+///
+/// The offset counts the leaves of preceding siblings. This returns `None`
+/// when `field` is not a struct or does not contain the named child.
+fn find_child_leaf_offset<'a>(field: &'a FieldRef, name: &str) -> Option<(usize, &'a FieldRef)> {
     let DataType::Struct(children) = field.data_type() else {
         return None;
     };
@@ -274,38 +291,28 @@ fn child_leaf_offset<'a>(field: &'a FieldRef, name: &str) -> Option<(usize, &'a 
     None
 }
 
-/// Rebuilds top-level columns from decoded leaf arrays.
+/// Reconstructs one top-level Arrow column from decoded Parquet leaf arrays.
 ///
-/// The decoder hands us one flat array per leaf, in the same depth-first
-/// order the file stores its column chunks. The output batch wants one array
-/// per top-level field, where a struct field is a [`StructArray`] holding its
-/// children. So we walk the schema's fields in order: a primitive field
-/// simply takes the next decoded array, and a struct field first collects an
-/// array for each of its children (its own structs collect theirs, and so
-/// on), then wraps them in a `StructArray`. For a flat schema this is a plain
-/// pass-through. The inverse of [`leaf_fields`].
-///
-/// A struct wrapper's null buffer is derived from its non-nullable children:
-/// a null in such a child can only mean the struct (or an ancestor) is null
-/// at that row, since the child itself never is. Without this mask,
-/// `StructArray::new` rejects the child's nulls as unmasked. A nullable struct
-/// left without a mask that way takes instead the one that is null where every
-/// child is: a variant's `typed_value` needs it, since its reader tells a row
-/// that has a value for the field from one that does not by exactly that mask.
-pub(crate) fn nest_leaves_into_columns(
-    fields: &Fields,
+/// Parquet stores a nested column as depth-first leaf column chunks, while
+/// Arrow represents it as one array. This function walks `field` in order,
+/// taking the next decoded leaf array for each primitive descendant and
+/// assembling each struct from the arrays of its children (which are themselves
+/// assembled the same way). A primitive field is a plain pass-through. It is
+/// the inverse of [`leaf_fields`].
+pub(crate) fn reconstruct_column_from_leaves(
+    field: &FieldRef,
     leaf_arrays: &mut impl Iterator<Item = ArrayRef>,
-) -> Vec<ArrayRef> {
-    /// A struct column mid-rebuild (or the top level itself): the fields it
-    /// wants, and the arrays collected for them so far. The next field to
-    /// fill is always `fields[arrays.len()]`.
+) -> ArrayRef {
+    /// Tracks the fields and arrays of a struct that is being reconstructed.
+    ///
+    /// The next field to fill is always `fields[arrays.len()]`.
     struct PartialStruct {
         fields: Fields,
         arrays: Vec<ArrayRef>,
-        /// Whether the field this struct fills is itself nullable. A struct that
-        /// cannot be null must not be given a mask, both because it would say
-        /// something untrue and because its parent reads a null in it as proof
-        /// that the parent is null.
+        /// This records whether the field containing this struct is nullable.
+        ///
+        /// A required struct cannot have a mask because its parent interprets
+        /// child nulls as evidence that the parent is null.
         nullable: bool,
     }
     impl PartialStruct {
@@ -316,72 +323,90 @@ pub(crate) fn nest_leaves_into_columns(
                 nullable,
             }
         }
-        fn next_unfilled_field(&self) -> Option<&FieldRef> {
+        fn get_next_unfilled_field(&self) -> Option<&FieldRef> {
             self.fields.get(self.arrays.len())
         }
-        fn into_struct_array(self) -> ArrayRef {
-            // Null wherever any non-nullable child is null: the child itself
-            // can't be, so the null came from this struct or an ancestor.
+        /// Finishes this partial struct and reconstructs its null buffer.
+        ///
+        /// Parquet stores only leaf arrays, so a struct's own null buffer is
+        /// not available directly. A null in a non-nullable child must come
+        /// from the struct or one of its ancestors, so combining those child
+        /// null buffers recovers the mask that makes their nulls valid.
+        ///
+        /// If no non-nullable child provides a mask and this struct is
+        /// nullable, its nulls are inferred from rows where every child is
+        /// absent. Shredded variant `typed_value` structs rely on this fallback
+        /// to distinguish rows that have a value from rows that do not. The
+        /// fallback is not applied to a non-nullable struct, since absent
+        /// nullable children do not make a required struct null.
+        fn finish_struct_array(self) -> ArrayRef {
             let mut nulls: Option<NullBuffer> = None;
             for (field, array) in self.fields.iter().zip(&self.arrays) {
                 if !field.is_nullable() {
                     nulls = NullBuffer::union(nulls.as_ref(), array.nulls());
                 }
             }
-            // No non-nullable child said anything, so fall back to the only
-            // thing the children still say between them: the struct is null
-            // exactly where all of them are. A variant's `typed_value` needs
-            // this, since its reader tells a row that has a value for the field
-            // from one that does not by that mask. Only for a struct that can be
-            // null in the first place: giving a non-nullable one a mask reads,
-            // to the rule above, as its parent being null, which would drop the
-            // whole enclosing struct wherever one field happened to be absent.
             if self.nullable && nulls.is_none() {
-                nulls = null_where_every_child_is_null(&self.arrays);
+                nulls = infer_nulls_from_children(&self.arrays);
             }
             Arc::new(StructArray::new(self.fields, self.arrays, nulls))
         }
     }
 
-    // Keep the open structs in a stack to support deeply nested schemas.
-    // The top level is the batch itself and is never null.
-    let mut open = vec![PartialStruct::start(fields, false)];
+    let DataType::Struct(children) = field.data_type() else {
+        // A primitive column is exactly the next decoded leaf array.
+        return leaf_arrays
+            .next()
+            .expect("one decoded leaf array per leaf field");
+    };
+    // A stack of open structs supports arbitrarily deep schemas. The bottom
+    // entry is the column itself and closes by returning.
+    let mut open_structs = vec![PartialStruct::start(children, field.is_nullable())];
     loop {
-        let innermost = open.last().expect("the top level only closes by returning");
-        match innermost.next_unfilled_field().cloned() {
+        let innermost = open_structs
+            .last()
+            .expect("the column's own struct only closes by returning");
+        match innermost.get_next_unfilled_field().cloned() {
             Some(field) => match field.data_type() {
-                // The next field is itself a struct: open it and fill it first.
+                // A nested struct must be filled before it can be added here.
                 DataType::Struct(children) => {
-                    open.push(PartialStruct::start(children, field.is_nullable()))
+                    open_structs.push(PartialStruct::start(children, field.is_nullable()))
                 }
                 // A primitive field owns exactly the next decoded leaf array.
-                _ => open.last_mut().expect("just inspected").arrays.push(
-                    leaf_arrays
-                        .next()
-                        .expect("one decoded leaf array per leaf field"),
-                ),
+                _ => open_structs
+                    .last_mut()
+                    .expect("just inspected")
+                    .arrays
+                    .push(
+                        leaf_arrays
+                            .next()
+                            .expect("one decoded leaf array per leaf field"),
+                    ),
             },
-            // Every field is filled: close this struct and hand it to the one
-            // it lives in as a single array. Closing the top level means every
-            // column is rebuilt, and those are the output.
+            // A complete struct is added to its parent as one array. Completing
+            // the column's own struct produces the reconstructed column.
             None => {
-                let finished = open.pop().expect("just inspected");
-                match open.last_mut() {
-                    Some(enclosing) => enclosing.arrays.push(finished.into_struct_array()),
-                    None => return finished.arrays,
+                let finished = open_structs.pop().expect("just inspected");
+                match open_structs.last_mut() {
+                    Some(enclosing) => enclosing.arrays.push(finished.finish_struct_array()),
+                    None => return finished.finish_struct_array(),
                 }
             }
         }
     }
 }
 
-/// The mask that is null exactly where every one of `arrays` is null, or `None`
-/// when there is no such row. A child that is null nowhere makes the struct
-/// present everywhere, which is why one of those ends the search.
-fn null_where_every_child_is_null(arrays: &[ArrayRef]) -> Option<NullBuffer> {
+/// Infers a struct's null buffer from the presence of its child `arrays`.
+///
+/// A row is present when at least one child is present, so the mask is null
+/// exactly where every child is absent, and `None` when no such row exists. A
+/// child that is present in every row makes the struct present in every row,
+/// which ends the search. A struct child that carries no mask of its own has
+/// its presence inferred from its descendants by [`find_present_rows`].
+fn infer_nulls_from_children(arrays: &[ArrayRef]) -> Option<NullBuffer> {
     let mut valid: Option<BooleanBuffer> = None;
     for array in arrays {
-        let child = rows_present_in(array)?;
+        let child = find_present_rows(array)?;
         valid = Some(match valid {
             None => child,
             Some(valid) => &valid | &child,
@@ -390,21 +415,22 @@ fn null_where_every_child_is_null(arrays: &[ArrayRef]) -> Option<NullBuffer> {
     valid.map(NullBuffer::new)
 }
 
-/// The rows where `array` holds something, or `None` when that is every row.
+/// Finds the rows where `array` holds a value.
 ///
 /// A struct carrying a mask of its own is answered by it. One without has to be
 /// answered by its descendants, because the struct that says whether a variant
 /// field is present sits above children that are themselves non-nullable, and a
 /// non-nullable child never carries a mask. What it has instead is its own
-/// children, one level further down, being null.
-fn rows_present_in(array: &ArrayRef) -> Option<BooleanBuffer> {
+/// children, one level further down, being null. This returns `None` when every
+/// row is present.
+fn find_present_rows(array: &ArrayRef) -> Option<BooleanBuffer> {
     if let Some(nulls) = array.nulls() {
         return Some(nulls.inner().clone());
     }
     let structure = array.as_any().downcast_ref::<StructArray>()?;
     let mut valid: Option<BooleanBuffer> = None;
     for child in structure.columns() {
-        let child = rows_present_in(child)?;
+        let child = find_present_rows(child)?;
         valid = Some(match valid {
             None => child,
             Some(valid) => &valid | &child,
@@ -419,9 +445,11 @@ mod tests {
     use arrow_array::{BinaryViewArray, Int64Array};
     use arrow_schema::Field;
 
-    /// A shredded variant struct:
+    /// Builds a shredded variant struct for the supplied paths.
+    ///
+    /// The result has the shape
     /// `{metadata, value, typed_value{<path>{value, typed_value}}}`.
-    fn variant(paths: &[(&str, DataType)]) -> Field {
+    fn build_variant_field(paths: &[(&str, DataType)]) -> Field {
         let shredded: Vec<Field> = paths
             .iter()
             .map(|(name, ty)| {
@@ -440,10 +468,11 @@ mod tests {
         Field::new("v", DataType::Struct(children.into()), true)
     }
 
-    /// A variant shredded on `paths`, laid out the way a written file has it:
-    /// each path's `{value, typed_value}` pair is non-nullable, and only the
-    /// `typed_value` holding them says whether a row has any of them at all.
-    fn file_shredded_variant(paths: &[(&str, DataType)]) -> Field {
+    /// Builds a shredded variant field with the layout used in a written file.
+    ///
+    /// Each path's `{value, typed_value}` pair is non-nullable. Only the
+    /// enclosing `typed_value` records whether a row contains any path.
+    fn build_file_variant_field(paths: &[(&str, DataType)]) -> Field {
         let shredded: Vec<Field> = paths
             .iter()
             .map(|(name, ty)| {
@@ -462,7 +491,7 @@ mod tests {
         Field::new("v", DataType::Struct(children.into()), true)
     }
 
-    fn path(segments: &[&str]) -> Vec<String> {
+    fn build_path(segments: &[&str]) -> Vec<String> {
         segments.iter().map(|s| s.to_string()).collect()
     }
 
@@ -471,11 +500,11 @@ mod tests {
     /// the field" from "it had one". Nothing else carries that: the pairs
     /// beneath are non-nullable and never hold a mask of their own.
     #[test]
-    fn shredded_variant_is_null_where_a_row_has_no_shredded_path() {
-        let fields = Fields::from(vec![file_shredded_variant(&[
+    fn verifies_shredded_variant_nulls_for_rows_without_paths() {
+        let field = Arc::new(build_file_variant_field(&[
             ("a", DataType::Int64),
             ("b", DataType::Int64),
-        ])]);
+        ]));
         // Row 0 has only `a`, row 1 only `b`, row 2 neither.
         let mut leaves = vec![
             Arc::new(BinaryViewArray::from(vec![Some(&b"m"[..]); 3])) as ArrayRef,
@@ -487,9 +516,9 @@ mod tests {
         ]
         .into_iter();
 
-        let columns = nest_leaves_into_columns(&fields, &mut leaves);
+        let column = reconstruct_column_from_leaves(&field, &mut leaves);
 
-        let variant = columns[0].as_any().downcast_ref::<StructArray>().unwrap();
+        let variant = column.as_any().downcast_ref::<StructArray>().unwrap();
         let typed_value = variant.column(2);
         assert!(!typed_value.is_null(0), "row 0 has `a`");
         assert!(!typed_value.is_null(1), "row 1 has `b`");
@@ -501,11 +530,11 @@ mod tests {
     /// to the rule that a null in a non-nullable child means the parent is
     /// null, as the whole variant being absent wherever one path is.
     #[test]
-    fn a_shredded_path_missing_from_a_row_does_not_null_the_variant() {
-        let fields = Fields::from(vec![file_shredded_variant(&[
+    fn verifies_missing_shredded_path_does_not_null_variant() {
+        let field = Arc::new(build_file_variant_field(&[
             ("a", DataType::Int64),
             ("b", DataType::Int64),
-        ])]);
+        ]));
         let mut leaves = vec![
             Arc::new(BinaryViewArray::from(vec![Some(&b"m"[..]); 2])) as ArrayRef,
             Arc::new(BinaryViewArray::from(vec![None::<&[u8]>; 2])) as ArrayRef,
@@ -516,56 +545,57 @@ mod tests {
         ]
         .into_iter();
 
-        let columns = nest_leaves_into_columns(&fields, &mut leaves);
+        let column = reconstruct_column_from_leaves(&field, &mut leaves);
 
         // Every row has `a`; none has `b`. Both rows are still present.
-        assert_eq!(columns[0].null_count(), 0);
-        let variant = columns[0].as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(column.null_count(), 0);
+        let variant = column.as_any().downcast_ref::<StructArray>().unwrap();
         assert_eq!(variant.column(2).null_count(), 0);
     }
 
     #[test]
-    fn variant_typed_leaf_resolves_each_shredded_path() {
-        let fields = Fields::from(vec![variant(&[
+    fn verifies_typed_leaf_resolution_for_each_shredded_path() {
+        let fields = Fields::from(vec![build_variant_field(&[
             ("age", DataType::Int64),
             ("name", DataType::Utf8),
         ])]);
 
-        let age = variant_shredded_leaves(&fields, 0, &path(&["age"])).unwrap();
-        let name = variant_shredded_leaves(&fields, 0, &path(&["name"])).unwrap();
+        let age = variant_shredded_leaves(&fields, 0, &build_path(&["age"])).unwrap();
+        let name = variant_shredded_leaves(&fields, 0, &build_path(&["name"])).unwrap();
 
-        // metadata=0 value=1 | age.value=2 age.typed_value=3
-        //                    | name.value=4 name.typed_value=5
-        assert_eq!(age.typed_value, 3);
-        assert_eq!(age.value_fallbacks, vec![1, 2]);
-        assert_eq!(name.typed_value, 5);
-        assert_eq!(name.value_fallbacks, vec![1, 4]);
+        // The layout is metadata=0, value=1, age.value=2,
+        // age.typed_value=3, name.value=4, and name.typed_value=5.
+        assert_eq!(age.typed_leaf, 3);
+        assert_eq!(age.value_leaves, vec![1, 2]);
+        assert_eq!(name.typed_leaf, 5);
+        assert_eq!(name.value_leaves, vec![1, 4]);
     }
 
     #[test]
-    fn variant_typed_leaf_is_none_for_an_unshredded_path() {
-        let fields = Fields::from(vec![variant(&[("age", DataType::Int64)])]);
+    fn verifies_unshredded_path_has_no_typed_leaf() {
+        let fields = Fields::from(vec![build_variant_field(&[("age", DataType::Int64)])]);
 
-        assert!(variant_shredded_leaves(&fields, 0, &path(&["missing"])).is_none());
+        assert!(variant_shredded_leaves(&fields, 0, &build_path(&["missing"])).is_none());
     }
 
     #[test]
-    fn plan_variant_extract_reads_only_the_path_subtree() {
-        let fields = Fields::from(vec![variant(&[
+    fn verifies_extract_plan_reads_only_path_subtree() {
+        let fields = Fields::from(vec![build_variant_field(&[
             ("age", DataType::Int64),
             ("name", DataType::Utf8),
         ])]);
 
-        let plan = plan_variant_extract(&fields, 0, &path(&["age"])).unwrap();
+        let plan = plan_variant_extract(&fields, 0, &build_path(&["age"])).unwrap();
 
-        // metadata=0 value=1 | age.value=2 age.typed_value=3; name's 4,5 skipped.
+        // The plan reads metadata=0, value=1, age.value=2, and
+        // age.typed_value=3. It skips both leaves for name.
         assert_eq!(plan.file_leaves, vec![0, 1, 2, 3]);
         // The pruned field folds exactly the read leaves and nothing else.
         assert_eq!(leaf_count(&plan.nest_field), plan.file_leaves.len());
     }
 
     #[test]
-    fn plan_variant_extract_keeps_residuals_along_a_nested_path() {
+    fn verifies_extract_plan_keeps_nested_path_value_leaves() {
         let id = Field::new(
             "id",
             DataType::Struct(
@@ -602,38 +632,40 @@ mod tests {
         );
         let fields = Fields::from(vec![doc]);
 
-        let plan = plan_variant_extract(&fields, 0, &path(&["user", "id"])).unwrap();
+        let plan = plan_variant_extract(&fields, 0, &build_path(&["user", "id"])).unwrap();
 
-        // metadata=0 value=1 user.value=2 user.id.value=3 user.id.typed_value=4: every
-        // residual `value` along the path is read so `variant_get` stays sound.
+        // The plan reads metadata=0, value=1, user.value=2, user.id.value=3,
+        // and user.id.typed_value=4. Reading every untyped value keeps the extract
+        // sound.
         assert_eq!(plan.file_leaves, vec![0, 1, 2, 3, 4]);
         assert_eq!(leaf_count(&plan.nest_field), plan.file_leaves.len());
     }
 
     #[test]
-    fn plan_variant_extract_is_none_for_an_unshredded_path() {
-        let fields = Fields::from(vec![variant(&[("age", DataType::Int64)])]);
+    fn verifies_unshredded_path_has_no_extract_plan() {
+        let fields = Fields::from(vec![build_variant_field(&[("age", DataType::Int64)])]);
 
-        assert!(plan_variant_extract(&fields, 0, &path(&["missing"])).is_none());
+        assert!(plan_variant_extract(&fields, 0, &build_path(&["missing"])).is_none());
     }
 
     #[test]
-    fn variant_typed_leaf_counts_preceding_columns() {
+    fn verifies_typed_leaf_counts_preceding_columns() {
         let fields = Fields::from(vec![
             Field::new("id", DataType::Int64, false),
-            variant(&[("age", DataType::Int64)]),
+            build_variant_field(&[("age", DataType::Int64)]),
         ]);
 
-        let age = variant_shredded_leaves(&fields, 1, &path(&["age"])).unwrap();
+        let age = variant_shredded_leaves(&fields, 1, &build_path(&["age"])).unwrap();
 
-        // id=0 | metadata=1 value=2 age.value=3 age.typed_value=4
-        assert_eq!(age.typed_value, 4);
-        assert_eq!(age.value_fallbacks, vec![2, 3]);
+        // The layout is id=0, metadata=1, value=2, age.value=3, and
+        // age.typed_value=4.
+        assert_eq!(age.typed_leaf, 4);
+        assert_eq!(age.value_leaves, vec![2, 3]);
     }
 
     #[test]
-    fn variant_typed_leaf_resolves_a_nested_path() {
-        // `user` shredded as an object whose own typed_value shreds `id`.
+    fn verifies_typed_leaf_resolution_for_nested_path() {
+        // The `user` object has a `typed_value` that shreds `id`.
         let id = Field::new(
             "id",
             DataType::Struct(
@@ -670,10 +702,11 @@ mod tests {
         );
         let fields = Fields::from(vec![doc]);
 
-        let leaves = variant_shredded_leaves(&fields, 0, &path(&["user", "id"])).unwrap();
+        let leaves = variant_shredded_leaves(&fields, 0, &build_path(&["user", "id"])).unwrap();
 
-        // metadata=0 value=1 user.value=2 user.id.value=3 user.id.typed_value=4
-        assert_eq!(leaves.typed_value, 4);
-        assert_eq!(leaves.value_fallbacks, vec![1, 2, 3]);
+        // The layout is metadata=0, value=1, user.value=2, user.id.value=3,
+        // and user.id.typed_value=4.
+        assert_eq!(leaves.typed_leaf, 4);
+        assert_eq!(leaves.value_leaves, vec![1, 2, 3]);
     }
 }

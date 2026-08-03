@@ -21,9 +21,9 @@ use dispatch::env::MAX_INLINE_STRING_VIEW;
 use dispatch::memory::{MultiBufferReader, ReaderPosition};
 use std::marker::PhantomData;
 
-use crate::parquet::reading::decoding::column_decoders::bytes_view::views_builder::ViewsBuilder;
-use crate::parquet::reading::decoding::column_decoders::delta_binary_packed::DeltaDecoder;
-use crate::parquet::reading::decoding::column_decoders::{ArrayBuilder, DecodeDelta};
+use crate::parquet::reading::decoding::leaf_decoders::bytes_view::views_builder::ViewsBuilder;
+use crate::parquet::reading::decoding::leaf_decoders::delta_binary_packed::DeltaDecoder;
+use crate::parquet::reading::decoding::leaf_decoders::{ArrayBuilder, DecodeDelta};
 use crate::parquet::types::thrift::general::Encoding;
 
 /// Reads `DELTA_LENGTH_BYTE_ARRAY` pages, producing views for a string or

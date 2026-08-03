@@ -23,10 +23,13 @@ use dispatch::{Unary, UnaryFactory};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub(crate) mod column_decoders;
+pub(crate) mod leaf_decoders;
+
+mod column_decoder;
+pub use column_decoder::Error as ColumnDecoderError;
 
 mod row_group_decoder;
-pub use row_group_decoder::{Error as RowGroupDecoderError, RowGroupDecoder};
+pub use row_group_decoder::RowGroupDecoder;
 
 /// A pushed-down equality predicate (`column == value`) used for dictionary
 /// pruning at scan time. `column_idx` indexes the table's full schema. When a

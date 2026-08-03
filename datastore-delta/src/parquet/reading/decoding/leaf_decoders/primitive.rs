@@ -5,8 +5,8 @@
 //! (e.g. `Int16` is stored as 4-byte `INT32`), so [`ReadLeBytes`] abstracts
 //! over the on-disk width vs. the in-memory width.
 //!
-//! The public type alias [`PrimitiveColumnDecoder`] wires everything together
-//! into a ready-to-use [`TypedColumnDecoder`].
+//! The public type alias [`PrimitiveLeafDecoder`] wires everything together
+//! into a ready-to-use [`TypedLeafDecoder`].
 
 use std::marker::PhantomData;
 use std::mem;
@@ -17,8 +17,8 @@ use arrow_array::types::ArrowPrimitiveType;
 use arrow_array::{ArrayRef, Scalar};
 use arrow_buffer::ArrowNativeType;
 
-use crate::parquet::reading::decoding::column_decoders::{
-    DecodePlain, DeltaDecoder, Dict, DictFromBytes, DictFromVecBytes, FromDelta, TypedColumnDecoder,
+use crate::parquet::reading::decoding::leaf_decoders::{
+    DecodePlain, DeltaDecoder, Dict, DictFromBytes, DictFromVecBytes, FromDelta, TypedLeafDecoder,
 };
 use bytes::Bytes;
 use dispatch::memory::{
@@ -323,7 +323,7 @@ where
 
 /// Ready-to-use column decoder for any [`ArrowPrimitiveType`] whose native
 /// type implements [`ReadLeBytes`].
-pub type PrimitiveColumnDecoder<T> = TypedColumnDecoder<
+pub type PrimitiveLeafDecoder<T> = TypedLeafDecoder<
     PrimitiveDict<T, SlabBuffer<<T as ArrowPrimitiveType>::Native>>,
     PrimitiveDict<T, MultiSlabBuffer<<T as ArrowPrimitiveType>::Native>>,
     PrimitiveBuilder<T>,
@@ -340,13 +340,13 @@ mod tests {
     };
     use bytes::Bytes;
 
-    use super::{Dict, PrimitiveColumnDecoder, PrimitiveDict};
+    use super::{Dict, PrimitiveDict, PrimitiveLeafDecoder};
     use dispatch::memory::SlabBuffer;
 
     /// `maybe_contains` scans raw page bytes, so the buffer flavour is
     /// irrelevant; any instantiation works.
     type Int64Dict = PrimitiveDict<Int64Type, SlabBuffer<i64>>;
-    use crate::parquet::reading::decoding::column_decoders::ColumnDecoder;
+    use crate::parquet::reading::decoding::leaf_decoders::LeafDecoder;
     use crate::parquet::test_utils::dummy_metadata;
     use dispatch::memory::SlabAllocator;
     use dispatch::memory::init_test_free_pool;
@@ -469,7 +469,7 @@ mod tests {
 
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = PrimitiveColumnDecoder::<Int32Type>::new(0);
+        let mut dec = PrimitiveLeafDecoder::<Int32Type>::new(0);
         dec.insert_page(page, &mut allocator);
 
         assert_eq!(dec.available(), 5);
@@ -484,7 +484,7 @@ mod tests {
 
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = PrimitiveColumnDecoder::<Int64Type>::new(0);
+        let mut dec = PrimitiveLeafDecoder::<Int64Type>::new(0);
         dec.insert_page(page, &mut allocator);
 
         assert_eq!(dec.available(), 5);
@@ -499,7 +499,7 @@ mod tests {
 
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = PrimitiveColumnDecoder::<Float32Type>::new(0);
+        let mut dec = PrimitiveLeafDecoder::<Float32Type>::new(0);
         dec.insert_page(page, &mut allocator);
 
         assert_eq!(dec.available(), 4);
@@ -516,7 +516,7 @@ mod tests {
 
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = PrimitiveColumnDecoder::<Int32Type>::new(0);
+        let mut dec = PrimitiveLeafDecoder::<Int32Type>::new(0);
         dec.insert_page(page, &mut allocator);
 
         let r1 = dec.read(&mut allocator, 2).unwrap();
@@ -533,7 +533,7 @@ mod tests {
 
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = PrimitiveColumnDecoder::<Int32Type>::new(0);
+        let mut dec = PrimitiveLeafDecoder::<Int32Type>::new(0);
         dec.insert_page(page0, &mut allocator);
         dec.insert_page(page1, &mut allocator);
 
@@ -549,7 +549,7 @@ mod tests {
 
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = PrimitiveColumnDecoder::<Int32Type>::new(0);
+        let mut dec = PrimitiveLeafDecoder::<Int32Type>::new(0);
         dec.insert_page(page, &mut allocator);
 
         let result = dec.read(&mut allocator, 6).unwrap();
@@ -571,7 +571,7 @@ mod tests {
 
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = PrimitiveColumnDecoder::<Int32Type>::new(0);
+        let mut dec = PrimitiveLeafDecoder::<Int32Type>::new(0);
         dec.insert_page(page, &mut allocator);
 
         let result = dec.read(&mut allocator, 3).unwrap();
@@ -596,7 +596,7 @@ mod tests {
 
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = PrimitiveColumnDecoder::<Int32Type>::new(0);
+        let mut dec = PrimitiveLeafDecoder::<Int32Type>::new(0);
         dec.insert_page(dict_page, &mut allocator);
         dec.insert_page(data_page, &mut allocator);
 
@@ -647,7 +647,7 @@ mod tests {
 
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = PrimitiveColumnDecoder::<Int32Type>::new(0);
+        let mut dec = PrimitiveLeafDecoder::<Int32Type>::new(0);
         dec.insert_page(page, &mut allocator);
 
         assert_eq!(dec.available(), 2);
@@ -668,7 +668,7 @@ mod tests {
 
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = PrimitiveColumnDecoder::<Int32Type>::new(0);
+        let mut dec = PrimitiveLeafDecoder::<Int32Type>::new(0);
         dec.insert_page(page, &mut allocator);
 
         assert_eq!(dec.available(), 1);
@@ -689,7 +689,7 @@ mod tests {
 
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = PrimitiveColumnDecoder::<Int32Type>::new(0);
+        let mut dec = PrimitiveLeafDecoder::<Int32Type>::new(0);
         dec.insert_page(page, &mut allocator);
 
         assert_eq!(dec.available(), 3);
@@ -710,7 +710,7 @@ mod tests {
 
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = PrimitiveColumnDecoder::<Int32Type>::new(0);
+        let mut dec = PrimitiveLeafDecoder::<Int32Type>::new(0);
         dec.insert_page(page, &mut allocator);
 
         assert_eq!(dec.available(), 0);
@@ -736,7 +736,7 @@ mod tests {
 
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = PrimitiveColumnDecoder::<Int32Type>::new(0);
+        let mut dec = PrimitiveLeafDecoder::<Int32Type>::new(0);
         dec.insert_page(dict_page, &mut allocator);
         dec.insert_page(data_page, &mut allocator);
 
@@ -780,7 +780,7 @@ mod tests {
 
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = PrimitiveColumnDecoder::<Int16Type>::new(0);
+        let mut dec = PrimitiveLeafDecoder::<Int16Type>::new(0);
         dec.insert_page(page, &mut allocator);
 
         assert_eq!(dec.available(), 1);
@@ -796,7 +796,7 @@ mod tests {
 
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = PrimitiveColumnDecoder::<Int16Type>::new(0);
+        let mut dec = PrimitiveLeafDecoder::<Int16Type>::new(0);
         dec.insert_page(page, &mut allocator);
 
         assert_eq!(dec.available(), 5);
@@ -811,7 +811,7 @@ mod tests {
 
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = PrimitiveColumnDecoder::<Int16Type>::new(0);
+        let mut dec = PrimitiveLeafDecoder::<Int16Type>::new(0);
         dec.insert_page(page, &mut allocator);
 
         assert_eq!(dec.available(), 5);
@@ -826,7 +826,7 @@ mod tests {
 
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = PrimitiveColumnDecoder::<UInt16Type>::new(0);
+        let mut dec = PrimitiveLeafDecoder::<UInt16Type>::new(0);
         dec.insert_page(page, &mut allocator);
 
         assert_eq!(dec.available(), 5);
@@ -842,7 +842,7 @@ mod tests {
 
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = PrimitiveColumnDecoder::<Int16Type>::new(0);
+        let mut dec = PrimitiveLeafDecoder::<Int16Type>::new(0);
         dec.insert_page(page, &mut allocator);
 
         let r1 = dec.read(&mut allocator, 2).unwrap();
@@ -865,7 +865,7 @@ mod tests {
 
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = PrimitiveColumnDecoder::<Int16Type>::new(0);
+        let mut dec = PrimitiveLeafDecoder::<Int16Type>::new(0);
         dec.insert_page(page, &mut allocator);
 
         assert_eq!(dec.available(), 2);
@@ -881,7 +881,7 @@ mod tests {
 
         init_test_free_pool(4);
         let mut allocator = SlabAllocator::new(true);
-        let mut dec = PrimitiveColumnDecoder::<Int16Type>::new(0);
+        let mut dec = PrimitiveLeafDecoder::<Int16Type>::new(0);
         dec.insert_page(page0, &mut allocator);
         dec.insert_page(page1, &mut allocator);
 

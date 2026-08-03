@@ -13,7 +13,7 @@
 //! saved and resumed on the next call, so the decoder can be driven in
 //! arbitrarily sized chunks.
 
-use crate::parquet::reading::decoding::column_decoders::{ArrayBuilder, Dict};
+use crate::parquet::reading::decoding::leaf_decoders::{ArrayBuilder, Dict};
 use bytes::Bytes;
 use dispatch::memory::{MultiBufferReader, ReaderPosition};
 
@@ -395,12 +395,12 @@ impl RleDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parquet::reading::decoding::column_decoders::ArrayBuilder;
-    use crate::parquet::reading::decoding::column_decoders::Dict;
-    use crate::parquet::reading::decoding::column_decoders::bytes_view::dict::{
+    use crate::parquet::reading::decoding::leaf_decoders::ArrayBuilder;
+    use crate::parquet::reading::decoding::leaf_decoders::Dict;
+    use crate::parquet::reading::decoding::leaf_decoders::bytes_view::dict::{
         DictFactory, ViewDict,
     };
-    use crate::parquet::reading::decoding::column_decoders::bytes_view::views_builder::ViewsBuilder;
+    use crate::parquet::reading::decoding::leaf_decoders::bytes_view::views_builder::ViewsBuilder;
     use arrow_array::types::StringViewType;
     use arrow_array::{Array, StringViewArray};
     use bytes::Bytes;

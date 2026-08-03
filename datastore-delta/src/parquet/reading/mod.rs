@@ -21,7 +21,7 @@ mod decompressor;
 pub use decompressor::{DecompressorFactory, Error as DecompressorError};
 
 pub(crate) mod decoding;
-pub use decoding::{DecoderFactory, RowGroupDecoderError, ScanEqualityPredicate};
+pub use decoding::{ColumnDecoderError, DecoderFactory, ScanEqualityPredicate};
 
 mod materializer;
 pub use materializer::MaterializerFactory;

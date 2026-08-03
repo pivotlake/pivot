@@ -1,11 +1,12 @@
-//! Traits and types for decoding individual Parquet columns into Arrow arrays.
+//! Traits and types for decoding individual Parquet leaf columns into Arrow
+//! arrays.
 //!
-//! The core abstraction is [`ColumnDecoder`], an object-safe trait used by
-//! [`RowGroupDecoder`](super::row_group_decoder::RowGroupDecoder) to decode
-//! each projected column independently. The concrete, generic implementation
-//! lives in [`TypedColumnDecoder`] (in the [`typed`] submodule), parameterised
-//! by three helper traits that together describe how to decode a particular
-//! Parquet type:
+//! The core abstraction is [`LeafDecoder`], an object-safe trait used by
+//! [`ColumnDecoder`](super::column_decoder::ColumnDecoder) to decode each of a
+//! projected column's leaf column chunks independently. The concrete, generic
+//! implementation lives in [`TypedLeafDecoder`] (in the [`typed`] submodule),
+//! parameterised by three helper traits that together describe how to decode a
+//! particular Parquet type:
 //!
 //! - [`ArrayBuilder`] — accumulates decoded values and produces an Arrow array.
 //! - [`DecodePlain`] — reads plain-encoded values from raw page bytes.
@@ -13,8 +14,8 @@
 //!   [`DictFromBytes`] or [`DictFromVecBytes`] depending on the dictionary
 //!   page's buffer shape.
 //!
-//! Concrete column decoders are type aliases over `TypedColumnDecoder`:
-//! - [`primitive::PrimitiveColumnDecoder`] for fixed-width numeric types.
+//! Concrete leaf decoders are type aliases over `TypedLeafDecoder`:
+//! - [`primitive::PrimitiveLeafDecoder`] for fixed-width numeric types.
 //! - [`bytes_view::BytesViewDecoder`] for variable-length string / binary types.
 
 pub(crate) mod bytes_view;
@@ -29,12 +30,12 @@ pub use delta_binary_packed::{DecimalDeltaDecoder, DeltaDecoder, FromDelta};
 mod levels;
 
 mod primitive;
-pub use primitive::PrimitiveColumnDecoder;
+pub use primitive::PrimitiveLeafDecoder;
 
 mod rle;
 
 mod typed;
-pub use typed::TypedColumnDecoder;
+pub use typed::TypedLeafDecoder;
 
 use crate::parquet::types::page::DecompressedPage;
 use crate::parquet::types::thrift::general::Encoding;
@@ -68,13 +69,13 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Object-safe interface for decoding a single column from decompressed pages
-/// into Arrow arrays.
+/// Object-safe interface for decoding a single Parquet leaf column from
+/// decompressed pages into Arrow arrays.
 ///
-/// Used as `Box<dyn ColumnDecoder>` inside
-/// [`RowGroupDecoder`](super::row_group_decoder::RowGroupDecoder) so that
-/// columns of different types can be stored in a single `Vec`.
-pub trait ColumnDecoder {
+/// Used as `Box<dyn LeafDecoder>` inside
+/// [`ColumnDecoder`](super::column_decoder::ColumnDecoder) so that leaves of
+/// different types can be stored in a single `Vec`.
+pub trait LeafDecoder {
     /// Returns `true` if at least `size` rows can be decoded from the pages
     /// buffered so far.
     fn available(&self) -> usize;

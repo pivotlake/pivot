@@ -4,7 +4,7 @@
 //! Arrow's *view* layout stores each value as a 128-bit view: short values
 //! (≤ 12 bytes) are inlined, while longer ones reference a `(block_id,
 //! offset)` into an external buffer list. This module provides the three
-//! components needed by [`TypedColumnDecoder`]:
+//! components needed by [`TypedLeafDecoder`]:
 //!
 //! - [`ViewsBuilder`] — the [`ArrayBuilder`](super::ArrayBuilder) that
 //!   accumulates views and data blocks.
@@ -19,10 +19,10 @@
 //! the parameter only picks the array type the finished column is built as,
 //! matching the leaf's declared schema type (`Utf8View` or `BinaryView`).
 
-use crate::parquet::reading::decoding::column_decoders::TypedColumnDecoder;
-use crate::parquet::reading::decoding::column_decoders::bytes_view::dict::ViewDict;
-use crate::parquet::reading::decoding::column_decoders::bytes_view::plain_page_decoder::PlainPageDecoder;
-use crate::parquet::reading::decoding::column_decoders::bytes_view::views_builder::ViewsBuilder;
+use crate::parquet::reading::decoding::leaf_decoders::TypedLeafDecoder;
+use crate::parquet::reading::decoding::leaf_decoders::bytes_view::dict::ViewDict;
+use crate::parquet::reading::decoding::leaf_decoders::bytes_view::plain_page_decoder::PlainPageDecoder;
+use crate::parquet::reading::decoding::leaf_decoders::bytes_view::views_builder::ViewsBuilder;
 pub(crate) mod views_builder;
 
 pub(crate) mod delta_length_page_decoder;
@@ -33,12 +33,12 @@ mod plain_page_decoder;
 /// (a [`ByteViewType`](arrow_array::types::ByteViewType)) picks whether it
 /// finalises as a `StringViewArray` or a `BinaryViewArray`.
 pub type BytesViewDecoder<V> =
-    TypedColumnDecoder<ViewDict<V>, ViewDict<V>, ViewsBuilder<V>, PlainPageDecoder<V>>;
+    TypedLeafDecoder<ViewDict<V>, ViewDict<V>, ViewsBuilder<V>, PlainPageDecoder<V>>;
 
 #[cfg(test)]
 mod tests {
-    use crate::parquet::reading::decoding::column_decoders::ColumnDecoder;
-    use crate::parquet::reading::decoding::column_decoders::bytes_view::BytesViewDecoder;
+    use crate::parquet::reading::decoding::leaf_decoders::LeafDecoder;
+    use crate::parquet::reading::decoding::leaf_decoders::bytes_view::BytesViewDecoder;
     use crate::parquet::test_utils::dummy_metadata;
     use crate::parquet::types::filter_mask::FilterMask;
     use crate::parquet::types::page::{DataPage, DecompressedPage, DecompressedPageType};
