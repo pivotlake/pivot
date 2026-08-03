@@ -41,13 +41,9 @@ as the engine grows the features each needs.
 | q14 | Promotion Effect | lineitem/part, promo share of revenue |
 | q18 | Large Volume Customer | orders semi-joined against the order keys whose quantities sum above 300, then the top 100 by price |
 
-q05 and q09 ship without committed `.tsv` expectations yet: those are produced
-from an SF100 run (`--update-results` on the bench box), cross-checked against
-DuckDB, and this checkout has only run them on SF1.
-
 The rest of the 22 need engine features that are not in yet: the delim joins
-DuckDB plans a correlated
-subquery into (q04, q17, q20, q21), CTE scans (q11, q15), mark joins (q16), and
+DuckDB plans a correlated subquery into (q04, q17, q20, q21), CTE scans
+(q11, q15), mark joins (q16), and
 the `suffix` / `substring` scalar functions (q02, q16, q22). q07 and q19
 additionally hit a join predicate that ORs columns from both sides, which the
 bridge cannot read.
