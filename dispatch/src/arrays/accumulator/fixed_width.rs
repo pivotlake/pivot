@@ -109,15 +109,31 @@ fn allocate_values_slab(
 /// many gathers. Shared with [`view`](super::view), whose views are gathered the
 /// same way when they need no rebasing.
 ///
+/// Four rows are copied per step rather than left to the compiler to unroll. How
+/// far it unrolls this loop depends on the size of the function the loop ends up
+/// in, so left implicit the cost of a copy moves with the shape of the code
+/// around it rather than staying a property of the copy.
+///
 /// # Safety
 /// `src` must hold every indexed row, `dst` must have room for `indices.len()`
 /// elements, and both must be valid for unaligned `T` access.
 pub(super) unsafe fn gather_fixed_width<T: Copy>(src: *const u8, dst: *mut u8, indices: &[u32]) {
     let src = src as *const T;
     let dst = dst as *mut T;
+    /// Rows copied per step of the loop below.
+    const STEP: usize = 4;
     unsafe {
-        for (out_idx, &row) in indices.iter().enumerate() {
-            dst.add(out_idx)
+        let mut destination = 0;
+        let mut rows = indices.chunks_exact(STEP);
+        for step in &mut rows {
+            for (offset, &row) in step.iter().enumerate() {
+                dst.add(destination + offset)
+                    .write_unaligned(src.add(row as usize).read_unaligned());
+            }
+            destination += STEP;
+        }
+        for (offset, &row) in rows.remainder().iter().enumerate() {
+            dst.add(destination + offset)
                 .write_unaligned(src.add(row as usize).read_unaligned());
         }
     }
