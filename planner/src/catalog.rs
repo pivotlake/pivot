@@ -195,6 +195,20 @@ pub trait BoundTable: Debug + Send + Sync {
         emit_row_group_metadata: bool,
     ) -> Result<RecordBatchOperatorSpec>;
 
+    /// Whether a scan of this table applies the variant field extracts carried
+    /// in its [`Projection`].
+    ///
+    /// Unlike `dynamic_filters`, a pushed extract is not an optimization a
+    /// backend may quietly decline: a scan that ignored one would emit the whole
+    /// variant document where the query asked for a single field, which is a
+    /// wrong answer rather than a slow one. The default is therefore `false`,
+    /// and the planner keeps the extraction as an expression above the scan. A
+    /// backend that can resolve a path against its own storage layout, and so
+    /// read only the leaves the path needs, overrides this to `true`.
+    fn applies_variant_extracts(&self) -> bool {
+        false
+    }
+
     /// Build a dispatch spec that writes the rows produced by `input` into this
     /// table and emits one `BIGINT` row with the count. Durable publication
     /// belongs to the query transaction's [`commit`](CatalogTransaction::commit).
