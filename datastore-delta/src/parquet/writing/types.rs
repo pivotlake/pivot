@@ -51,8 +51,8 @@ pub(crate) struct PartitionTag {
 ///
 /// The bytes are the slabs its pages were encoded into, in file order, so the
 /// file is never assembled into one buffer. They are ring memory, so this must
-/// be dropped on a dispatch worker; [`encode_record_batches`](super::encode_record_batches)
-/// hands out [`EncodedFile`] instead for callers outside the pool.
+/// be dropped on the dispatch worker that assembled it, which is where the
+/// upload operators consume it.
 pub(crate) struct AssembledFile {
     pub bytes: FileBytes,
     /// The footer metadata written into `bytes`. Kept so a consumer that records
@@ -61,28 +61,6 @@ pub(crate) struct AssembledFile {
     pub metadata: thriftparquet::footer::FileMetaData,
     pub partition: Option<crate::PartitionValues>,
     pub sort_bounds: Option<SortBounds>,
-}
-
-/// A finished file for a caller outside the worker pool: the same metadata, with
-/// the bytes copied onto the heap so they can be held and dropped anywhere.
-pub struct EncodedFile {
-    pub bytes: Vec<u8>,
-    pub metadata: thriftparquet::footer::FileMetaData,
-    pub partition: Option<crate::PartitionValues>,
-    pub sort_bounds: Option<SortBounds>,
-}
-
-impl AssembledFile {
-    /// Copy the file's bytes onto the heap, which is what lets it leave the
-    /// worker that assembled it.
-    pub(crate) fn to_encoded_file(&self) -> EncodedFile {
-        EncodedFile {
-            bytes: self.bytes.runs().flatten().copied().collect(),
-            metadata: self.metadata.clone(),
-            partition: self.partition.clone(),
-            sort_bounds: self.sort_bounds.clone(),
-        }
-    }
 }
 
 /// The per-row-group metadata every column chunk of a row group shares: its

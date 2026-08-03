@@ -11,6 +11,10 @@
 //! rather than the whole dataset. That also means each output file's shredding is
 //! decided from its own rows, which is the same thing a real ingest would do with
 //! a flush.
+//!
+//! The documents go in as an `INSERT` into a table over the output directory,
+//! which is the only way rows are written: the files never take a detour through
+//! this process's memory, they are encoded and written by the workers.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -18,29 +22,31 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow_array::{ArrayRef, RecordBatch, StringArray};
-use arrow_schema::{ArrowError, Schema};
+use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, StructArray};
+use arrow_schema::{ArrowError, DataType, Field, Schema};
+use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
 use clap::Parser;
-use datastore_delta::parquet::writing::encode_record_batches;
+use datastore_delta::DeltaDatastore;
 use dispatch::{BUFFER_SIZE, Dispatch, values_input};
 use flate2::read::MultiGzDecoder;
-use parquet_variant_compute::json_to_variant;
+use parquet_variant_compute::{VariantArray, json_to_variant};
+use planner::catalog::{Column, CreateTableRequest};
+use planner::types::{Type, physical_arrow_type};
 
 /// Documents per `RecordBatch`. Each item converts on a worker, so this is the
 /// unit of parallelism in the pipeline's first stage; a few thousand keeps the
 /// batches big enough to be worth a hop and small enough to spread.
 const DOCUMENTS_PER_BATCH: usize = 8192;
 
-/// Rows per row group, and row groups per file — the same shape the ingest sink
-/// writes, so the benchmark reads files laid out like real ones.
-const ROW_GROUP_ROWS: usize = 128 * 1024;
-const ROW_GROUPS_PER_FILE: usize = 8;
-
 /// Dispatch's memory ring. Small on purpose: the ring backs the *read* path's
 /// file cache, and this only writes, so it needs little more than the pipeline's
 /// own buffers. (A server sizes this from total memory; doing that here just
 /// prefaults tens of gigabytes and gets the loader OOM-killed.)
 const RING_BYTES: usize = 256 * 1024 * 1024;
+
+/// The table the documents are inserted into. Its name never leaves this
+/// process: the benchmark reads the files, not the catalog.
+const TABLE: &str = "documents";
 
 #[derive(Parser)]
 #[command(about = "Load newline-delimited JSON into Parquet as a shredded variant column")]
@@ -76,9 +82,25 @@ impl JsonDocuments {
     fn to_record_batch(self) -> Result<RecordBatch, ArrowError> {
         let json: ArrayRef = Arc::new(StringArray::from(self.lines));
         let variants = json_to_variant(&json)?;
-        let schema = Schema::new(vec![variants.field(&self.column)]);
-        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(variants.into_inner())])
+        let column = as_declared_variant(variants);
+        let schema = Schema::new(vec![
+            Field::new(&self.column, column.data_type().clone(), true)
+                .with_metadata(datastore_delta::parquet::variant_extension_metadata()),
+        ]);
+        RecordBatch::try_new(Arc::new(schema), vec![column])
     }
+}
+
+/// `variants` as the column type a VARIANT declares. `json_to_variant` marks the
+/// `value` child non-nullable when every document has one, while the declared
+/// column always allows a null there, and an INSERT checks the two agree.
+fn as_declared_variant(variants: VariantArray) -> ArrayRef {
+    let DataType::Struct(declared) = physical_arrow_type(&Type::Variant) else {
+        unreachable!("a variant is declared as a struct")
+    };
+    let array = variants.into_inner();
+    let (_, columns, nulls) = array.into_parts();
+    Arc::new(StructArray::new(declared, columns, nulls))
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -96,8 +118,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let dispatch = Dispatch::spin_up(workers, RING_BYTES / BUFFER_SIZE, None);
 
+    // One table over the output directory, inserted into once per input file.
+    // The row group and file sizes are the ingest sink's, so the benchmark reads
+    // files laid out like real ones.
+    let datastore = DeltaDatastore::open_local(&args.output, dispatch.dispatcher())?;
+    let catalog = PivotCatalog::new(
+        std::collections::HashMap::from([(
+            DEFAULT_DATASTORE_NAME.to_string(),
+            datastore as Arc<dyn Datastore>,
+        )]),
+        DEFAULT_DATASTORE_NAME.to_string(),
+    )?;
+    // Committing a transaction is async; this loader has no runtime of its own,
+    // so it drives each commit to completion on the thread it runs on.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    let mut options = std::collections::HashMap::new();
+    options.insert(
+        "path".to_string(),
+        args.output.to_string_lossy().into_owned(),
+    );
+    let creation = catalog.begin_transaction();
+    creation
+        .bind_create_table(CreateTableRequest {
+            datastore_name: None,
+            name: TABLE.to_string(),
+            columns: vec![Column {
+                name: args.column.clone(),
+                col_type: Type::Variant,
+            }],
+            options,
+            if_not_exists: true,
+        })?
+        .compile(dispatch.dispatcher())?
+        .execute()
+        .collect()?;
+    runtime.block_on(creation.commit())?;
+
     let started = Instant::now();
-    let (mut documents, mut files) = (0usize, 0usize);
+    let mut documents = 0usize;
     for (i, input) in inputs.iter().enumerate() {
         let read = Instant::now();
         let items = read_documents(input, &args.column)?;
@@ -112,18 +173,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .expect("a batch of documents converts to Arrow")
             })
             .record_batches();
-        let encoded = encode_record_batches(
-            batches,
-            Arc::from([]),
-            Arc::from([]),
-            ROW_GROUP_ROWS,
-            ROW_GROUPS_PER_FILE,
-        );
-        for file in encoded {
-            let path = args.output.join(format!("bluesky-{files:05}.parquet"));
-            std::fs::write(&path, &file?.bytes)?;
-            files += 1;
-        }
+        // The rows are written by the workers that encode them, and published
+        // when the transaction commits.
+        let transaction = catalog.begin_transaction();
+        let table = transaction
+            .bind_table(DEFAULT_DATASTORE_NAME, TABLE)
+            .expect("the table was just created");
+        table
+            .compile_insert(batches, dispatch.dispatcher())?
+            .execute()
+            .collect()?;
+        runtime.block_on(transaction.commit())?;
         documents += rows;
         println!(
             "[{}/{}] {} — {rows} documents in {:.1?}",
@@ -134,6 +194,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    let files = std::fs::read_dir(&args.output)?
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .is_ok_and(|entry| entry.path().extension().is_some_and(|ext| ext == "parquet"))
+        })
+        .count();
     println!(
         "{documents} documents into {files} parquet files in {:.1?}",
         started.elapsed()

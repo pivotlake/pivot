@@ -209,3 +209,63 @@ pub fn collect_u64s(batches: &[RecordBatch], col: usize) -> Vec<u64> {
         })
         .collect()
 }
+
+/// Write `batches` into `dir` as Parquet, through the engine's own write path:
+/// a table over that directory, an INSERT of the rows, and a commit. This is how
+/// a test gets files our writer produced, and it exercises what production runs
+/// rather than a separate entry point kept alive for tests.
+///
+/// The columns are taken from the batches' schema, so a caller only has to pass
+/// the rows it wants written.
+pub fn write_parquet_files(
+    dispatch: &DispatchGuard,
+    dir: &std::path::Path,
+    batches: Vec<RecordBatch>,
+) {
+    use planner::catalog::{Column, CreateTableRequest};
+
+    let schema = batches[0].schema();
+    let columns: Vec<Column> = schema
+        .fields()
+        .iter()
+        .map(|field| Column {
+            name: field.name().clone(),
+            col_type: planner::types::type_from_physical(field.data_type())
+                .expect("a test writes a column type the engine has"),
+        })
+        .collect();
+
+    let database = TempDir::new().unwrap();
+    let datastore = datastore_delta::DeltaDatastore::open_local(database.path(), dispatch).unwrap();
+    let mut options = std::collections::HashMap::new();
+    options.insert("path".to_string(), dir.to_string_lossy().into_owned());
+    let creation = datastore.clone().begin_transaction();
+    creation
+        .bind_create_table(CreateTableRequest {
+            datastore_name: None,
+            name: "written".to_string(),
+            columns,
+            options,
+            if_not_exists: false,
+        })
+        .unwrap()
+        .compile(dispatch)
+        .unwrap()
+        .execute()
+        .collect()
+        .unwrap();
+    commit_datastore_transaction(creation).unwrap();
+
+    let insert = datastore.begin_transaction();
+    let table = insert
+        .bind_table(planner::DEFAULT_DATASTORE_NAME, "written")
+        .expect("the table was created");
+    let rows = dispatch::values_input(dispatch, batches).record_batches();
+    table
+        .compile_insert(rows, dispatch)
+        .unwrap()
+        .execute()
+        .collect()
+        .unwrap();
+    commit_datastore_transaction(insert).unwrap();
+}

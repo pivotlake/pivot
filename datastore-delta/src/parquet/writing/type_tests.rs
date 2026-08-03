@@ -10,10 +10,9 @@
 //! level assembly on top of either. The [`type_tests!`] table at the bottom turns
 //! each into its own test, named `<type>::<shape>`.
 
-mod common;
-
 use std::sync::Arc;
 
+use crate::parquet::{ParquetTable, table_input};
 use arrow::compute::cast;
 use arrow_array::types::{
     Date32Type, Decimal64Type, Decimal128Type, Float32Type, Float64Type, Int32Type, Int64Type,
@@ -23,10 +22,9 @@ use arrow_array::{
     StringViewArray,
 };
 use arrow_schema::{Field, Schema};
-use common::*;
-use datastore_delta::parquet::table_input;
-use datastore_delta::parquet::writing::{EncodedFile, encode_record_batches};
-use dispatch::{Projection, values_input};
+use dispatch::{Dispatch, Projection, values_input};
+
+use super::{AssembledFile, encode_record_batches_spec};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use tempfile::TempDir;
 
@@ -145,8 +143,8 @@ fn as_is<T: ArrowPrimitiveType>(array: PrimitiveArray<T>) -> ArrayRef {
 }
 
 /// Write `cases` as the columns of one file, through the pipeline a catalog
-/// INSERT uses.
-fn write_cases(dispatch: &DispatchGuard, cases: &[Case]) -> Vec<u8> {
+/// INSERT uses, and return the file's bytes for the readers to check.
+fn write_cases(dispatch: &Dispatch, cases: &[Case]) -> Vec<u8> {
     let fields: Vec<Field> = cases
         .iter()
         .map(|case| {
@@ -160,25 +158,36 @@ fn write_cases(dispatch: &DispatchGuard, cases: &[Case]) -> Vec<u8> {
     let columns = cases.iter().map(|case| case.values.clone()).collect();
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
 
-    let spec = values_input(dispatch, vec![batch]).record_batches();
-    let files: Vec<EncodedFile> =
-        encode_record_batches(spec, Arc::from([]), Arc::from([]), ROWS, 1)
+    let spec = values_input(dispatch.dispatcher(), vec![batch]).record_batches();
+    // A file's bytes live in ring memory the assembling worker owns, so they are
+    // copied out there rather than followed to this thread.
+    let mut files: Vec<Vec<u8>> =
+        encode_record_batches_spec(spec, Arc::from([]), Arc::from([]), ROWS, 1)
+            .map_each(|file: AssembledFile| {
+                file.bytes.runs().flatten().copied().collect::<Vec<u8>>()
+            })
+            .execute()
             .collect()
             .unwrap();
-
-    assert_eq!(files.len(), 1);
-    files.into_iter().next().unwrap().bytes
+    assert_eq!(files.len(), 1, "the rows fit one file");
+    files.pop().unwrap()
 }
 
 /// Read a file back through pivot's own reader.
-fn read_with_pivot(dispatch: &DispatchGuard, bytes: Vec<u8>, columns: usize) -> RecordBatch {
+fn read_with_pivot(dispatch: &Dispatch, bytes: Vec<u8>, columns: usize) -> RecordBatch {
     let dir = TempDir::new().unwrap();
     std::fs::write(dir.path().join("data.parquet"), bytes).unwrap();
 
-    let table = parquet_table_from_dir(dispatch, dir.path());
-    let batches = table_input(dispatch, &table, Projection::all(columns), false)
-        .collect()
-        .unwrap();
+    let table =
+        Arc::new(ParquetTable::from_directory(dispatch.dispatcher(), dir.path(), &[]).unwrap());
+    let batches = table_input(
+        dispatch.dispatcher(),
+        &table,
+        Projection::all(columns),
+        false,
+    )
+    .collect()
+    .unwrap();
     arrow_select::concat::concat_batches(&batches[0].schema(), &batches).unwrap()
 }
 
@@ -222,7 +231,7 @@ fn encodings(bytes: Vec<u8>, column: usize) -> Vec<String> {
 /// Write one column and check everything about it: both readers give back what
 /// went in, and the encoder chose the encoding the values call for.
 fn assert_round_trips(cases: Vec<Case>) {
-    let dispatch = dispatch_with_buffers(2, RING_BUFFERS);
+    let dispatch = Dispatch::spin_up(2, RING_BUFFERS, None);
     let bytes = write_cases(&dispatch, &cases);
 
     let pivot = read_with_pivot(&dispatch, bytes.clone(), cases.len());

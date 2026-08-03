@@ -6,9 +6,8 @@
 //! pipeline's [`WriteError`](error::WriteError) in [`error`].
 //!
 //! A `RecordBatch` dataflow flows through three work-stealing stages and
-//! finished Parquet files ([`EncodedFile`]) stream out the far end (consumed via
-//! `execute()`), so nothing waits for the whole input and only a bounded amount
-//! sits in memory. After the first stage the unit of work is one **column chunk**
+//! finished Parquet files stream out the far end, so nothing waits for the
+//! whole input and only a bounded amount sits in memory. After the first stage the unit of work is one **column chunk**
 //! (a single column's values for one row group):
 //!
 //! 1. [`partition`] (`RecordBatch → ColumnChunkJob`) — split each batch by its
@@ -34,10 +33,11 @@
 //!
 //! An unpartitioned, unsorted write is just the degenerate case where
 //! [`partition`] makes a single group (key `None`) and the per-file metadata is
-//! empty. [`encode_record_batches`] feeds the pipeline an existing `RecordBatch`
-//! dataflow, which is how compaction re-encodes a table without its batches ever
-//! leaving the worker pool; INSERT continues into the upload operators via
-//! [`encode_record_batches_spec`].
+//! empty. The pipeline is reached by inserting into a table:
+//! [`encode_record_batches_spec`] attaches these stages to a `RecordBatch`
+//! dataflow and the caller continues into the upload operators, which is how
+//! both INSERT and compaction write without a file's bytes ever leaving the
+//! worker pool.
 
 mod assembler;
 pub(crate) mod encoder;
@@ -49,43 +49,15 @@ mod types;
 
 pub(crate) use shredding::unshred_batch;
 pub(crate) use types::AssembledFile;
-pub use types::EncodedFile;
 
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use dispatch::{
-    DataFlowHandle, OperatorFactory, OperatorSpec, RecordBatchOperatorSpec, return_to_worker_mpsc,
-    stealable,
+    OperatorFactory, OperatorSpec, RecordBatchOperatorSpec, return_to_worker_mpsc, stealable,
 };
 
 use types::{ColumnChunkJob, EncodedColumnChunk};
-
-/// Encode an existing `RecordBatch` dataflow into Parquet files. Re-applies
-/// `partition_by`/`sort_by`, so the output files carry the right partition tuple
-/// and recomputed sort bounds.
-/// This is the compaction path: a table scan feeds the batches a worker decodes
-/// straight back into the write pipeline without ever leaving the pool.
-pub fn encode_record_batches(
-    spec: RecordBatchOperatorSpec,
-    partition_by: Arc<[String]>,
-    sort_by: Arc<[String]>,
-    target_rows_per_group: usize,
-    target_row_groups_per_file: usize,
-) -> DataFlowHandle<EncodedFile> {
-    // A file's bytes are ring memory, which is released through the worker that
-    // holds it, so the last stage copies each one onto the heap before it leaves
-    // the pool. The INSERT path keeps the ring-backed form and uploads from it.
-    encode_record_batches_spec(
-        spec,
-        partition_by,
-        sort_by,
-        target_rows_per_group,
-        target_row_groups_per_file,
-    )
-    .map_each(|file: AssembledFile| file.to_encoded_file())
-    .execute()
-}
 
 /// Attach the Parquet encoding stages without executing the dataflow. Catalog
 /// INSERT uses this to continue directly into asynchronous upload and commit
@@ -112,6 +84,9 @@ pub(crate) fn encode_record_batches_spec(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod type_tests;
 
 /// Chain the encode stages (partition onward) onto a `RecordBatch` dataflow and
 /// run it, yielding finished [`EncodedFile`]s as they complete.
