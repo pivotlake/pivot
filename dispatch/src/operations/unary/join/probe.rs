@@ -29,14 +29,12 @@ use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::join::build::filter_null_keys;
 use crate::operations::unary::join::directory::{JoinDirectory, prefetch_ptr_l2};
+use crate::operations::unary::join::keys::JoinKey;
 use crate::operations::unary::join::{JoinOutputColumns, JoinTable, UnmatchedScan};
 use ahash::RandomState;
-use arrow_array::cast::AsArray;
-use arrow_array::types::ArrowPrimitiveType;
-use arrow_array::{PrimitiveArray, RecordBatch, new_null_array};
+use arrow_array::{RecordBatch, new_null_array};
 use arrow_schema::{Field, Schema, SchemaRef};
 use std::cmp::min;
-use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -48,14 +46,13 @@ const PREFETCH_LENGTH: usize = 63;
 /// batch's worth, so a pass can never overfill the accumulator it appends to.
 const UNMATCHED_SCAN_CHUNK: usize = RECORD_BATCH_SIZE;
 
-pub struct Probe<
-    T: ArrowPrimitiveType<Native: Hash + Eq>,
-    const BUILD_OUTER: bool,
-    const SEMI: bool,
-> {
-    table: JoinTable<T::Native>,
+pub struct Probe<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> {
+    table: JoinTable<K::Stored>,
     hash_state: RandomState,
-    key_column: usize,
+    key_columns: Vec<usize>,
+    /// The build payload's key columns, bound into the verifier of a key shape
+    /// whose stored values need exact confirmation.
+    build_key_columns: Vec<usize>,
     output_columns: Arc<JoinOutputColumns>,
     allocator: SlabAllocator,
 
@@ -81,13 +78,13 @@ pub struct Probe<
     probing_done: bool,
 }
 
-impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, const SEMI: bool>
-    Probe<T, BUILD_OUTER, SEMI>
-{
+impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Probe<K, BUILD_OUTER, SEMI> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        table: JoinTable<T::Native>,
+        table: JoinTable<K::Stored>,
         hash_state: RandomState,
-        key_column: usize,
+        key_columns: Vec<usize>,
+        build_key_columns: Vec<usize>,
         output_columns: Arc<JoinOutputColumns>,
         probe_fields: Option<Arc<Vec<Field>>>,
         unmatched: Arc<UnmatchedScan>,
@@ -95,7 +92,8 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, const SE
         Self {
             table,
             hash_state,
-            key_column,
+            key_columns,
+            build_key_columns,
             output_columns,
             allocator: SlabAllocator::new(false),
             probe_indices: vec![0; RECORD_BATCH_SIZE],
@@ -203,14 +201,20 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, const SE
         probe_source: &RecordBatch,
         sender: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<()> {
-        let col = window.column(self.key_column).as_primitive::<T>();
+        let build_rows = unsafe { &*self.table.build_rows.get() };
+        let build_rows = build_rows
+            .as_ref()
+            .expect("probing requires a published build payload");
+        let reader = K::make_reader(window, &self.key_columns);
+        let verifier = K::make_verifier(build_rows, &self.build_key_columns);
         let keys = unsafe { &*self.table.keys.get() };
         let rows = unsafe { &*self.table.rows.get() };
-        let out = ProbeMatchCollector::<T, BUILD_OUTER, SEMI> {
+        let out = ProbeMatchCollector::<K, BUILD_OUTER, SEMI> {
             keys,
             rows,
             matched_flags: unsafe { &*self.table.matched.get() },
-            col,
+            reader,
+            verifier,
             window_offset,
             probe_source,
             sides: self.sides.as_mut().expect("sides are built before probing"),
@@ -223,6 +227,7 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, const SE
 
         ProbeArray {
             row_idx: 0,
+            len: window.num_rows(),
             hash_state: self.hash_state.clone(),
             directory: unsafe { &*self.table.directory.get() },
             hashes: [0; RING_SIZE],
@@ -235,8 +240,8 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, const SE
     }
 }
 
-impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, const SEMI: bool>
-    Unary<RecordBatch, RecordBatch> for Probe<T, BUILD_OUTER, SEMI>
+impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Unary<RecordBatch, RecordBatch>
+    for Probe<K, BUILD_OUTER, SEMI>
 {
     fn consume(
         &mut self,
@@ -250,7 +255,7 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, const SE
             return Ok(());
         };
 
-        let batch = filter_null_keys(batch, self.key_column);
+        let batch = filter_null_keys(batch, &self.key_columns);
         if batch.num_rows() == 0 {
             return Ok(());
         }
@@ -373,20 +378,15 @@ impl OutputSides {
 /// appends those rows to the probe and build output accumulators. Full output
 /// batches are emitted as the accumulators fill. A semi join buffers the probe
 /// row alone, once per probe row that has a match at all.
-struct ProbeMatchCollector<
-    'a,
-    'b,
-    T: ArrowPrimitiveType<Native: Hash + Eq>,
-    const BUILD_OUTER: bool,
-    const SEMI: bool,
-> {
-    keys: &'a MultiSlabBuffer<T::Native>,
+struct ProbeMatchCollector<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> {
+    keys: &'a MultiSlabBuffer<K::Stored>,
     rows: &'a MultiSlabBuffer<u32>,
     /// The build rows' matched flags, written on drain by an outer build.
     matched_flags: &'a MultiSlabBuffer<u8>,
-    col: &'b PrimitiveArray<T>,
-    /// Row offset of `col`'s window within the probed batch, added to every
-    /// recorded probe index so the indices address `probe_source`.
+    reader: K::Reader<'b>,
+    verifier: K::Verifier<'a>,
+    /// Row offset of the reader's window within the probed batch, added to
+    /// every recorded probe index so the indices address `probe_source`.
     window_offset: usize,
     /// The probed batch restricted to the listed probe columns.
     probe_source: &'b RecordBatch,
@@ -400,8 +400,8 @@ struct ProbeMatchCollector<
     allocator: &'a mut SlabAllocator,
 }
 
-impl<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, const SEMI: bool>
-    ProbeMatchCollector<'a, 'b, T, BUILD_OUTER, SEMI>
+impl<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
+    ProbeMatchCollector<'a, 'b, K, BUILD_OUTER, SEMI>
 {
     /// Append the collected pairs to the output sides, emitting if a full
     /// batch accumulated.
@@ -456,11 +456,13 @@ impl<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, 
         start: usize,
         end: usize,
         probe_row: usize,
-        probe_key: T::Native,
+        probe_key: K::Stored,
     ) -> unary::Result<()> {
         if SEMI {
             for j in start..end {
-                if self.keys[j] == probe_key {
+                if self.keys[j] == probe_key
+                    && K::verify(&self.reader, &self.verifier, probe_row, self.rows[j])
+                {
                     return self.record_probe_row(probe_row);
                 }
             }
@@ -491,15 +493,16 @@ impl<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, 
     }
 
     /// Record the match candidate at arena index `j` for probe row
-    /// `probe_row`: write both index slices at the current cursor and
-    /// advance it only when the full-width key matches (branchless on the
-    /// match itself; the capacity drain branch is almost never taken).
+    /// `probe_row`: write both index slices at the current cursor and advance
+    /// it only when the stored key matches and the shape's verify confirms it
+    /// (branchless on the match itself for a shape whose verify is constant
+    /// `true`; the capacity drain branch is almost never taken).
     #[inline(always)]
     fn record_match(
         &mut self,
         j: usize,
         probe_row: usize,
-        probe_key: T::Native,
+        probe_key: K::Stored,
     ) -> unary::Result<()> {
         let key = self.keys[j];
         debug_assert!(self.matched < self.probe_indices.len());
@@ -511,7 +514,9 @@ impl<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, 
                 (self.window_offset + probe_row) as u32;
             *self.build_indices.get_unchecked_mut(self.matched) = self.rows[j];
         }
-        self.matched += (key == probe_key) as usize;
+        let key_matches =
+            key == probe_key && K::verify(&self.reader, &self.verifier, probe_row, self.rows[j]);
+        self.matched += key_matches as usize;
         if self.matched == RECORD_BATCH_SIZE {
             self.drain()?;
         }
@@ -522,14 +527,10 @@ impl<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, 
 /// The prefetch-pipelined probe: hashes ahead, bloom-filters into a ring of
 /// matched directory slots, prefetches their arena ranges, then drains matches
 /// a window behind — keeping many independent loads in flight.
-struct ProbeArray<
-    'a,
-    'b,
-    T: ArrowPrimitiveType<Native: Hash + Eq>,
-    const BUILD_OUTER: bool,
-    const SEMI: bool,
-> {
+struct ProbeArray<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> {
     row_idx: usize,
+    /// The probed window's row count.
+    len: usize,
     hash_state: RandomState,
     directory: &'a JoinDirectory,
 
@@ -543,11 +544,11 @@ struct ProbeArray<
     matched_size: [usize; 2],
     matched_idx: usize,
 
-    out: ProbeMatchCollector<'a, 'b, T, BUILD_OUTER, SEMI>,
+    out: ProbeMatchCollector<'a, 'b, K, BUILD_OUTER, SEMI>,
 }
 
-impl<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, const SEMI: bool>
-    ProbeArray<'a, 'b, T, BUILD_OUTER, SEMI>
+impl<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
+    ProbeArray<'a, 'b, K, BUILD_OUTER, SEMI>
 {
     #[inline(always)]
     pub fn generate_matched_slots<const HASH: bool>(&mut self, length: usize) {
@@ -559,9 +560,12 @@ impl<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, 
         for _ in 0..length {
             if HASH {
                 // hash
-                let value = unsafe { self.out.col.value_unchecked(row_idx + PREFETCH_LENGTH) };
                 let hash_offset = (row_idx + PREFETCH_LENGTH) & MASK;
-                self.hashes[hash_offset] = self.hash_state.hash_one(value);
+                self.hashes[hash_offset] = K::hash_row(
+                    &self.out.reader,
+                    row_idx + PREFETCH_LENGTH,
+                    &self.hash_state,
+                );
                 let dir_slot = (self.hashes[hash_offset] >> shift) as usize;
                 // Prefetch this hash from the directory; we're going to need it soon when we run bloom
                 // on it
@@ -623,7 +627,7 @@ impl<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, 
             let (slot, idx) = current_matched_slots[i];
             let start = directory.end_ptr(slot as isize);
             let end = directory.end_ptr((slot + 1) as isize);
-            let probe_key = unsafe { out.col.value_unchecked(idx) };
+            let probe_key = K::read_stored(&out.reader, idx);
 
             out.record_matches(start, end, idx, probe_key)?;
         }
@@ -650,10 +654,8 @@ impl<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, 
 
     #[inline(always)]
     pub fn bootstrap_initial_hashes(&mut self) {
-        for i in 0..min(PREFETCH_LENGTH, self.out.col.len()) {
-            self.hashes[i] = self
-                .hash_state
-                .hash_one(unsafe { self.out.col.value_unchecked(i) });
+        for i in 0..min(PREFETCH_LENGTH, self.len) {
+            self.hashes[i] = K::hash_row(&self.out.reader, i, &self.hash_state);
             prefetch_ptr_l2(
                 self.directory
                     .ptr_for_slot((self.hashes[i] >> self.directory.shift) as usize)
@@ -672,7 +674,7 @@ impl<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, 
     pub fn run(mut self) -> unary::Result<()> {
         self.bootstrap_initial_hashes();
 
-        let len = self.out.col.len();
+        let len = self.len;
 
         // No row has a `row + PREFETCH_LENGTH`, so never use HASH=true.
         if len <= PREFETCH_LENGTH {
