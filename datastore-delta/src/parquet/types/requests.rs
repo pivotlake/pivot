@@ -186,7 +186,7 @@ impl RowGroupRequest {
         // chunks in this file's layout. The decoder resolves leaves the same
         // way, so a fetched chunk's position lines up with its decoder.
         let fields = metadata_handle.get_metadata().schema.fields();
-        let leaves = projected_leaves(fields, projection.indices());
+        let leaves = projected_leaves(fields, &metadata_handle, projection);
 
         let mut pending_fs = vec![];
         let mut pending_http = vec![];

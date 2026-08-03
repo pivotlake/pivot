@@ -13,22 +13,106 @@ use crate::parquet::reading::decoding::column_decoders::{
 };
 use crate::parquet::reading::record_batch_metadata::with_row_group_metadata;
 use crate::parquet::types::leaves::{
-    first_leaf, leaf_count, leaf_fields, nest_leaves_into_columns,
+    direct_extract_typed_leaf, first_leaf, leaf_count, leaf_fields, nest_leaves_into_columns,
+    plan_variant_extract,
 };
 use crate::parquet::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata};
 use crate::parquet::types::page::DecompressedPage;
 use crate::parquet::types::projection::Projection;
-use arrow_array::RecordBatch;
 use arrow_array::types::{
     BinaryViewType, Date32Type, Decimal64Type, Decimal128Type, Float32Type, Float64Type, Int16Type,
     Int32Type, Int64Type, StringViewType, TimestampSecondType, UInt16Type,
 };
-use arrow_schema::{ArrowError, DataType, Fields, Schema, SchemaRef, TimeUnit};
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, Schema, SchemaRef, TimeUnit};
 use dispatch::memory::SlabAllocator;
+use parquet_variant::{VariantPath, VariantPathElement};
+use parquet_variant_compute::{GetOptions, variant_get};
 use std::cmp::min;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
+
+/// How an output column is finished after leaf decoding, for a column that
+/// carries a pushed-down variant field extract. A plain column has no
+/// transform.
+enum OutputTransform {
+    /// The path is shredded to a typed leaf here, decoded directly; only its
+    /// physical type differs from the type the extract must emit, so cast it.
+    Cast(DataType),
+    /// A (possibly pruned) variant was folded from the read leaves; read the
+    /// path out of it. `as_type` casts to a scalar; `None` yields the
+    /// sub-variant. Used both for the not-shredded-here fallback and for a bare
+    /// sub-variant extract read from only its subtree.
+    Extract {
+        path: Arc<[String]>,
+        as_type: Option<DataType>,
+    },
+}
+
+impl OutputTransform {
+    fn apply(&self, column: &ArrayRef) -> Result<ArrayRef> {
+        match self {
+            OutputTransform::Cast(as_type) => Ok(arrow_cast::cast(column, as_type)?),
+            OutputTransform::Extract { path, as_type } => {
+                Ok(variant_get_path(column, path, as_type)?)
+            }
+        }
+    }
+}
+
+/// Read `path` out of a folded variant `column`, as a scalar `as_type` or, when
+/// `None`, as the sub-variant at the path.
+fn variant_get_path(
+    column: &ArrayRef,
+    path: &[String],
+    as_type: &Option<DataType>,
+) -> Result<ArrayRef, ArrowError> {
+    let vpath: VariantPath<'_> = path
+        .iter()
+        .map(|segment| VariantPathElement::field(segment.as_str()))
+        .collect();
+    let as_field = as_type
+        .as_ref()
+        .map(|t| Arc::new(Field::new("item", t.clone(), true)));
+    variant_get(
+        column,
+        GetOptions::new_with_path(vpath).with_as_type(as_field),
+    )
+}
+
+/// The leaf-index range a projected top-level `column` spans in this file.
+fn leaf_range(fields: &Fields, column: usize) -> std::ops::Range<usize> {
+    let start = first_leaf(fields, column);
+    start..start + leaf_count(&fields[column])
+}
+
+/// Build a decoder for each of `leaf_indices`, all routed to `output_idx`.
+fn push_column_decoders(
+    output_idx: usize,
+    leaf_indices: impl Iterator<Item = usize>,
+    leaves: &[FieldRef],
+    columns: &[ColumnChunkMeta],
+    decoder_output_columns: &mut Vec<usize>,
+    column_decoders: &mut Vec<Box<dyn ColumnDecoder>>,
+) -> Result<()> {
+    for leaf in leaf_indices {
+        decoder_output_columns.push(output_idx);
+        column_decoders.push(column_decoder_for_type(
+            leaves[leaf].data_type(),
+            &columns[leaf],
+        )?);
+    }
+    Ok(())
+}
+
+/// The arrow type a bare sub-variant extract emits: what `variant_get` yields
+/// for `path` over a variant of `nest_field`'s shape. Determined once from an
+/// empty array so the row group's output schema is fixed before any batch.
+fn sub_variant_output_type(nest_field: &FieldRef, path: &[String]) -> Result<DataType> {
+    let empty = arrow_array::new_empty_array(nest_field.data_type());
+    Ok(variant_get_path(&empty, path, &None)?.data_type().clone())
+}
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -93,8 +177,17 @@ pub struct RowGroupDecoder {
     row_group_idx: usize,
     /// One decoder per projected column, in projection order.
     column_decoders: Vec<Box<dyn ColumnDecoder>>,
-    /// Output schema (projected).
+    /// Output schema (projected). A pushed-down extract column carries the
+    /// type the extract emits, not the variant it was read from.
     schema: SchemaRef,
+    /// The field structure the decoded leaf arrays fold back into, before any
+    /// per-column [`OutputTransform`]. Differs from `schema` only at a
+    /// fallback extract column, which folds into the whole variant struct and
+    /// is then narrowed to a scalar.
+    nest_fields: Fields,
+    /// Per output column (parallel to `schema`'s fields), the transform that
+    /// finishes a pushed-down extract column. `None` for a plain column.
+    output_transforms: Vec<Option<OutputTransform>>,
     /// Max rows per batch.
     batch_size: usize,
     /// Total rows to emit (filtered count, or full row-group count).
@@ -149,8 +242,104 @@ impl RowGroupDecoder {
         let filter_batches =
             !add_row_group_metadata && row_group_metadata.filtered_indices().is_none();
         let mut output_fields = Vec::with_capacity(projection.column_indices.len());
+        let mut nest_fields = Vec::with_capacity(projection.column_indices.len());
+        let mut output_transforms = Vec::with_capacity(projection.column_indices.len());
         for (output_idx, &column) in projection.column_indices.iter().enumerate() {
+            // A pushed-down variant field extract: emit only the referenced
+            // path, not the whole variant column.
+            if let Some(extract) = projection.extract_at(output_idx) {
+                match &extract.as_type {
+                    // A scalar extract: emit the path's value as `as_type`.
+                    Some(as_type) => {
+                        output_fields.push(Arc::new(Field::new(
+                            fields[column].name(),
+                            as_type.clone(),
+                            true,
+                        )));
+                        match direct_extract_typed_leaf(
+                            fields,
+                            &row_group_metadata,
+                            column,
+                            &extract.path,
+                        ) {
+                            // Shredded to a typed leaf, every value in it here:
+                            // decode that one leaf, casting only if its physical
+                            // type differs from the declared type.
+                            Some(typed_leaf) => {
+                                let leaf_type = leaves[typed_leaf].data_type();
+                                nest_fields.push(Arc::new(Field::new(
+                                    fields[column].name(),
+                                    leaf_type.clone(),
+                                    true,
+                                )));
+                                output_transforms.push(
+                                    (*leaf_type != *as_type)
+                                        .then(|| OutputTransform::Cast(as_type.clone())),
+                                );
+                                decoder_output_columns.push(output_idx);
+                                column_decoders.push(column_decoder_for_type(
+                                    leaf_type,
+                                    &columns[typed_leaf],
+                                )?);
+                            }
+                            // Not shredded here: rebuild the whole variant and
+                            // read the path out of it per row.
+                            None => {
+                                nest_fields.push(fields[column].clone());
+                                output_transforms.push(Some(OutputTransform::Extract {
+                                    path: extract.path.clone().into(),
+                                    as_type: Some(as_type.clone()),
+                                }));
+                                push_column_decoders(
+                                    output_idx,
+                                    leaf_range(fields, column),
+                                    &leaves,
+                                    columns,
+                                    &mut decoder_output_columns,
+                                    &mut column_decoders,
+                                )?;
+                            }
+                        }
+                    }
+                    // A bare extract: emit the sub-variant at the path. Read only
+                    // the path's subtree (plus residuals) when shredded here,
+                    // else the whole variant; a `variant_get` with no cast then
+                    // reconstructs the sub-variant either way.
+                    None => {
+                        let (nest_field, extract_leaves) =
+                            match plan_variant_extract(fields, column, &extract.path) {
+                                Some(plan) => (plan.nest_field, plan.file_leaves),
+                                None => {
+                                    (fields[column].clone(), leaf_range(fields, column).collect())
+                                }
+                            };
+                        let output_type = sub_variant_output_type(&nest_field, &extract.path)?;
+                        output_fields.push(Arc::new(Field::new(
+                            fields[column].name(),
+                            output_type,
+                            true,
+                        )));
+                        nest_fields.push(nest_field);
+                        output_transforms.push(Some(OutputTransform::Extract {
+                            path: extract.path.clone().into(),
+                            as_type: None,
+                        }));
+                        push_column_decoders(
+                            output_idx,
+                            extract_leaves.into_iter(),
+                            &leaves,
+                            columns,
+                            &mut decoder_output_columns,
+                            &mut column_decoders,
+                        )?;
+                    }
+                }
+                continue;
+            }
+
             output_fields.push(fields[column].clone());
+            nest_fields.push(fields[column].clone());
+            output_transforms.push(None);
             let start = first_leaf(fields, column);
             let count = leaf_count(&fields[column]);
             // Equality pushdown applies to a scalar (single-leaf) column only.
@@ -186,6 +375,8 @@ impl RowGroupDecoder {
             row_group_idx: row_group_metadata.index(),
             column_decoders,
             schema: Arc::new(Schema::new(Fields::from(output_fields))),
+            nest_fields: Fields::from(nest_fields),
+            output_transforms,
             batch_size,
             total: row_group_metadata
                 .filtered_indices()
@@ -262,10 +453,21 @@ impl RowGroupDecoder {
                 .iter_mut()
                 .map(|c| c.read(allocator, available).map_err(Error::from))
                 .collect::<Result<Vec<_>>>()?;
-            // Fold the decoded leaf arrays back under their struct parents to
-            // match the (possibly nested) output schema.
-            let columns =
-                nest_leaves_into_columns(self.schema.fields(), &mut leaf_arrays.into_iter());
+            // Fold the decoded leaf arrays back under their struct parents.
+            // `nest_fields` matches the leaves read; it equals the output schema
+            // except at a fallback extract, which folds into the whole variant
+            // struct here and is narrowed to its scalar just below.
+            let columns = nest_leaves_into_columns(&self.nest_fields, &mut leaf_arrays.into_iter());
+            // Finish any pushed-down extract columns: cast a directly-read leaf
+            // to its declared type, or read the path out of a rebuilt variant.
+            let columns = columns
+                .into_iter()
+                .zip(&self.output_transforms)
+                .map(|(column, transform)| match transform {
+                    Some(transform) => transform.apply(&column),
+                    None => Ok(column),
+                })
+                .collect::<Result<Vec<_>>>()?;
             let record_batch = RecordBatch::try_new(self.schema.clone(), columns)?;
             // Give each decoder a chance to drop rows that provably fail its
             // pushed-down equality constant, before the batch travels any

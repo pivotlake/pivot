@@ -34,16 +34,17 @@ pub fn trailing_metadata_columns(schema: &Schema) -> usize {
 }
 
 /// A pushed-down variant field extract on a projected column: read only the
-/// shredded leaf at `path` and emit it as `as_type`, instead of materializing
-/// the whole variant. Produced when DuckDB's projection-pushdown pushes a
-/// `variant_extract` into the scan; the reader resolves the path to a single
-/// leaf per file.
+/// leaves at `path` and emit them, instead of materializing the whole variant.
+/// Produced when DuckDB's projection-pushdown pushes a `variant_extract` into
+/// the scan; the reader resolves the path against each file's shredding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VariantExtract {
-    /// Object-field path from the variant root to the referenced leaf.
+    /// Object-field path from the variant root to the referenced field.
     pub path: Vec<String>,
-    /// The physical arrow type to emit the extracted value as.
-    pub as_type: arrow_schema::DataType,
+    /// The physical arrow type to emit the extracted value as, when the path
+    /// is cast to a scalar. `None` for a bare extraction, which yields a
+    /// sub-variant (the object at the path) rather than a typed leaf.
+    pub as_type: Option<arrow_schema::DataType>,
 }
 
 /// An ordered set of column indices that a scan should read.
@@ -55,7 +56,7 @@ pub struct Projection {
     /// Column indices to read.
     pub column_indices: Vec<usize>,
     /// Per output column (parallel to `column_indices`), a pushed field extract
-    /// to apply instead of reading the whole column. Empty means no extracts —
+    /// to apply instead of reading the whole column. Empty means no extracts:
     /// every output is a whole-column read (the common case).
     pub extracts: Vec<Option<VariantExtract>>,
 }

@@ -80,15 +80,13 @@ impl Input {
                     let Expression::Ref(r) = vg.input.as_ref() else {
                         return Err(Error::UnexpectedInputExpression(expr.clone()));
                     };
-                    let Some(as_type) = &vg.as_type else {
-                        // A bare (untyped) extract yields a sub-variant, not a
-                        // leaf value; not something the scan emits directly.
-                        return Err(Error::UnexpectedInputExpression(expr.clone()));
-                    };
+                    // A cast pushes a typed scalar read; a bare extract (no
+                    // cast) pushes a sub-variant read. The scan resolves either
+                    // against each file's shredding.
                     column_indices.push(r.column_idx);
                     extracts.push(Some(VariantExtract {
                         path: vg.path.clone(),
-                        as_type: physical_arrow_type(as_type),
+                        as_type: vg.as_type.as_ref().map(physical_arrow_type),
                     }));
                 }
                 _ => return Err(Error::UnexpectedInputExpression(expr.clone())),
