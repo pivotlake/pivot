@@ -119,10 +119,6 @@ pub struct ColumnDecoder {
 
 impl ColumnDecoder {
     /// Builds a decoder that reads all of `column`'s leaves.
-    ///
-    /// A pushed-down equality constant on `column` is installed on its leaf
-    /// decoder only when the chunk is prunable, which
-    /// [`is_prunable`](Self::is_prunable) then reports.
     pub fn for_column(
         column: usize,
         leaf_fields: &[FieldRef],
@@ -130,39 +126,24 @@ impl ColumnDecoder {
         eq_predicates: &[ScanEqualityPredicate],
     ) -> Result<Self> {
         let fields = metadata.get_metadata().schema.fields();
-        let column_chunks = metadata.columns();
-        let leaves = leaf_range(fields, column);
-        // Equality pushdown applies to a scalar (single-leaf) column only.
-        let predicate = (leaves.len() == 1)
-            .then(|| eq_predicates.iter().find(|p| p.column_idx == column))
-            .flatten();
-        // A column chunk can only be pruned (or batch-filtered) by dictionary
-        // contents when every one of its data pages is dictionary encoded; a
-        // PLAIN fallback page could hold the constant even if the dictionary
-        // does not.
-        let prunable = predicate.is_some() && column_chunks[leaves.start].data_pages_all_dictionary;
-        let mut leaf_decoders = Vec::with_capacity(leaves.len());
-        for leaf in leaves {
-            let mut decoder =
-                create_leaf_decoder(leaf_fields[leaf].data_type(), &column_chunks[leaf])?;
-            // Install the equality constant only when the column is prunable.
-            // The decoder uses it to skip building a dictionary that excludes
-            // the constant, which is sound only when an excluded dictionary
-            // prunes the whole row group. On a non-prunable column (e.g.
-            // PLAIN fallback data pages) the row group is still scanned, so
-            // the dictionary must be built to decode it.
-            if prunable && let Some(predicate) = predicate {
-                decoder.set_eq_constant(&predicate.value);
-            }
-            leaf_decoders.push(decoder);
+        let file_leaves: Vec<usize> = leaf_range(fields, column).collect();
+        let mut decoder = Self::from_leaves(
+            &file_leaves,
+            fields[column].clone(),
+            None,
+            fields[column].clone(),
+            leaf_fields,
+            metadata.columns(),
+        )?;
+        // A whole-column read answers a comparison on the column itself, never
+        // one that reaches into a variant path.
+        if let Some(predicate) = eq_predicates
+            .iter()
+            .find(|p| p.column_idx == column && p.path.is_empty())
+        {
+            decoder.install_eq_constant(predicate, &file_leaves, metadata.columns());
         }
-        Ok(Self {
-            leaf_decoders,
-            pre_transform_field: fields[column].clone(),
-            transform: None,
-            output_field: fields[column].clone(),
-            prunable,
-        })
+        Ok(decoder)
     }
 
     /// Builds a decoder that reads only what a pushed-down `extract` on variant
@@ -171,13 +152,13 @@ impl ColumnDecoder {
     /// A scalar extract reads only a complete shredded typed leaf when possible.
     /// It otherwise reconstructs the whole variant before extracting the scalar.
     /// A bare extract reconstructs only the shredded path subtree when possible,
-    /// or the whole variant when the path is not shredded. A pushed-down extract
-    /// never carries an equality constant, so the decoder is never prunable.
+    /// or the whole variant when the path is not shredded.
     pub fn for_extract(
         column: usize,
         extract: &VariantExtract,
         leaf_fields: &[FieldRef],
         metadata: &QueryRowGroupMetadata,
+        eq_predicates: &[ScanEqualityPredicate],
     ) -> Result<Self> {
         let fields = metadata.get_metadata().schema.fields();
         let column_name = fields[column].name();
@@ -235,10 +216,38 @@ impl ColumnDecoder {
             }
         };
 
-        let column_chunks = metadata.columns();
+        let mut decoder = Self::from_leaves(
+            &file_leaves,
+            pre_transform_field,
+            transform,
+            output_field,
+            leaf_fields,
+            metadata.columns(),
+        )?;
+        // A pushed extract answers a comparison that names the very path it
+        // reads, on the same variant column.
+        if let Some(predicate) = eq_predicates
+            .iter()
+            .find(|p| p.column_idx == column && p.path == extract.path)
+        {
+            decoder.install_eq_constant(predicate, &file_leaves, metadata.columns());
+        }
+        Ok(decoder)
+    }
+
+    /// Builds the leaf decoders for `file_leaves` and assembles the column
+    /// around them. The result carries no equality constant yet.
+    fn from_leaves(
+        file_leaves: &[usize],
+        pre_transform_field: FieldRef,
+        transform: Option<OutputTransform>,
+        output_field: FieldRef,
+        leaf_fields: &[FieldRef],
+        column_chunks: &[ColumnChunkMeta],
+    ) -> Result<Self> {
         let leaf_decoders = file_leaves
-            .into_iter()
-            .map(|leaf| create_leaf_decoder(leaf_fields[leaf].data_type(), &column_chunks[leaf]))
+            .iter()
+            .map(|&leaf| create_leaf_decoder(leaf_fields[leaf].data_type(), &column_chunks[leaf]))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             leaf_decoders,
@@ -247,6 +256,42 @@ impl ColumnDecoder {
             output_field,
             prunable: false,
         })
+    }
+
+    /// Installs a pushed-down equality `predicate` on this column, and records
+    /// whether the row group is then sound to prune by it.
+    ///
+    /// Both uses of the constant read the column's leaf directly:
+    /// [`dict_excludes_eq_constant`](Self::dict_excludes_eq_constant) answers
+    /// from that leaf's dictionary, and
+    /// [`fast_filter_record_batch`](Self::fast_filter_record_batch) compares the
+    /// emitted batch's own array against the dictionary's view of the constant.
+    /// A column that casts or reconstructs its leaves emits something other
+    /// than the leaf, so it can use neither. The constant therefore goes in only
+    /// when the column emits exactly one leaf unchanged.
+    ///
+    /// It also goes in only when every data page of that chunk is dictionary
+    /// encoded. The decoder uses the constant to skip building a dictionary that
+    /// excludes it, which is sound only when an excluded dictionary prunes the
+    /// whole row group. A PLAIN fallback page could hold the constant even if
+    /// the dictionary does not, so such a chunk is still scanned and its
+    /// dictionary must be built to decode it.
+    ///
+    /// A constant whose type does not match the leaf is dropped by the leaf
+    /// decoder, which forgoes the pushdown; the query's `Filter` still applies
+    /// the comparison.
+    fn install_eq_constant(
+        &mut self,
+        predicate: &ScanEqualityPredicate,
+        file_leaves: &[usize],
+        column_chunks: &[ColumnChunkMeta],
+    ) {
+        let [leaf] = file_leaves else { return };
+        if self.transform.is_some() || !column_chunks[*leaf].data_pages_all_dictionary {
+            return;
+        }
+        self.leaf_decoders[0].set_eq_constant(&predicate.value);
+        self.prunable = true;
     }
 
     /// Returns the field this column contributes to the batch schema.

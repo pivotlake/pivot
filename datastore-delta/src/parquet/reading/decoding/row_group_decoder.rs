@@ -100,9 +100,13 @@ impl RowGroupDecoder {
         for (output_idx, &column) in projection.column_indices.iter().enumerate() {
             // A pushed-down variant extract emits only the referenced path.
             let decoder = match projection.extract_at(output_idx) {
-                Some(extract) => {
-                    ColumnDecoder::for_extract(column, extract, &leaves, &row_group_metadata)?
-                }
+                Some(extract) => ColumnDecoder::for_extract(
+                    column,
+                    extract,
+                    &leaves,
+                    &row_group_metadata,
+                    eq_predicates,
+                )?,
                 None => {
                     ColumnDecoder::for_column(column, &leaves, &row_group_metadata, eq_predicates)?
                 }

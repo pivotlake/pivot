@@ -32,13 +32,19 @@ mod row_group_decoder;
 pub use row_group_decoder::RowGroupDecoder;
 
 /// A pushed-down equality predicate (`column == value`) used for dictionary
-/// pruning at scan time. `column_idx` indexes the table's full schema. When a
-/// row group's dictionary for this column excludes `value` (and the column
-/// chunk is fully dictionary encoded), the row group can emit no rows and is
-/// dropped without decoding its data pages.
+/// pruning at scan time. When a row group's dictionary for the compared column
+/// excludes `value` (and the column chunk is fully dictionary encoded), the row
+/// group can emit no rows and is dropped without decoding its data pages.
 #[derive(Clone, Debug)]
 pub struct ScanEqualityPredicate {
+    /// The top-level column the comparison reads, indexing the table's full
+    /// schema. For a variant path this is the variant column.
     pub column_idx: usize,
+    /// The object-field path inside the variant column
+    /// (`CAST(col->'a'->'b' AS T) = value`), empty for a plain column
+    /// comparison. A path predicate applies to the shredded typed leaf that
+    /// path resolves to in each file.
+    pub path: Vec<String>,
     pub value: Scalar<ArrayRef>,
 }
 
@@ -453,6 +459,7 @@ mod tests {
     fn string_eq_predicate(column_idx: usize, value: &str) -> ScanEqualityPredicate {
         ScanEqualityPredicate {
             column_idx,
+            path: Vec::new(),
             value: Scalar::new(
                 Arc::new(arrow_array::StringViewArray::from(vec![value])) as ArrayRef
             ),
