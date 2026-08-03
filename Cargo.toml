@@ -79,6 +79,15 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 ureq = "2"
 url = "2.5"
 
+# Compiled dataflow operators nest their factory types, so an operator's type name
+# embeds the full name of every stage beneath it. Full DWARF writes each of those
+# names into `.debug_str` once per instantiation, which ends up being most of the
+# bytes in a debug build. Line tables still give backtraces with file and line, and
+# still symbolize under `perf`; what goes away is printing variables in gdb/lldb.
+# Build with `CARGO_PROFILE_DEV_DEBUG=full` when you need to inspect values.
+[profile.dev]
+debug = "line-tables-only"
+
 # Optimized like release but with debuginfo, so `perf` can resolve inlined
 # frames and line numbers. Build for profiling with
 # `cargo build --profile profiling`; plain `--release` stays lean.
