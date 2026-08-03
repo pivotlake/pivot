@@ -989,18 +989,7 @@ fn scan_a_column_our_writer_delta_encoded() {
     )
     .unwrap();
     let dir = TempDir::new().unwrap();
-    let spec = dispatch::values_input(&dispatch, vec![batch]).record_batches();
-    let files: Vec<datastore_delta::parquet::writing::EncodedFile> =
-        datastore_delta::parquet::writing::encode_record_batches(
-            spec,
-            Arc::from([]),
-            Arc::from([]),
-            400_000,
-            1,
-        )
-        .collect()
-        .unwrap();
-    std::fs::write(dir.path().join("data.parquet"), &files[0].bytes).unwrap();
+    write_parquet_files(&dispatch, dir.path(), vec![batch]);
     let table = parquet_table_from_dir(&dispatch, dir.path());
 
     let results = table_input(&dispatch, &table, Projection::all(2), false)

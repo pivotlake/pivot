@@ -20,7 +20,7 @@ use parquet_variant_compute::{
 };
 use parquet_variant_json::VariantToJson;
 
-use super::{EncodedFile, encode_record_batches};
+use super::{AssembledFile, encode_record_batches_spec};
 
 /// A 64 MiB file-cache ring, as the other in-crate write tests use.
 const RING_BUFFERS: usize = 64 * 1024 * 1024 / BUFFER_SIZE;
@@ -81,12 +81,19 @@ fn write<T: IntoBatch>(items: Vec<T>, rows_per_file: usize) -> Vec<Vec<u8>> {
         .map(|item| item.into_batch().unwrap())
         .collect();
     let spec = values_input(dispatch.dispatcher(), batches).record_batches();
-    let files: Vec<EncodedFile> =
-        encode_record_batches(spec, Arc::from([]), Arc::from([]), rows_per_file, 1)
+    // A file's bytes are the slabs its pages were written into, which only the
+    // worker holding them may release, so each one is copied out on the worker
+    // that assembled it before this thread ever sees it.
+    let files: Vec<Vec<u8>> =
+        encode_record_batches_spec(spec, Arc::from([]), Arc::from([]), rows_per_file, 1)
+            .map_each(|file: AssembledFile| {
+                file.bytes.runs().flatten().copied().collect::<Vec<u8>>()
+            })
+            .execute()
             .collect()
             .unwrap();
     dispatch.exit();
-    files.into_iter().map(|f| f.bytes).collect()
+    files
 }
 
 /// Read a file back through arrow-rs's strict reader, as another engine would.

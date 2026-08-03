@@ -16,13 +16,10 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use common::{Conn, conn, connect_client, server_port};
-use datastore_delta::parquet::writing::{EncodedFile, encode_record_batches};
-use dispatch::{BUFFER_SIZE, Dispatch, values_input};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
-use parquet_variant_compute::json_to_variant;
 use rstest::rstest;
 use tempfile::TempDir;
 use tokio_postgres::{Client, SimpleQueryMessage};
@@ -465,30 +462,26 @@ async fn query_against_unknown_table_errors(#[future] conn: Conn) {
     );
 }
 
-/// Write `docs` as one Parquet file of a single shredded variant column, through
-/// the real write pipeline. Only that pipeline annotates the column VARIANT in
-/// the footer and picks its shredding, which is what a table reading the file
-/// back needs, so a plain Arrow writer cannot stand in here.
-fn write_shredded_variant(docs: &[String]) -> TempDir {
-    let json: ArrayRef = Arc::new(StringArray::from(docs.to_vec()));
-    let variants = json_to_variant(&json).unwrap();
-    let schema = Schema::new(vec![variants.field("j")]);
-    let batch =
-        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(variants.into_inner())]).unwrap();
-
-    let dispatch = Dispatch::spin_up(2, 64 * 1024 * 1024 / BUFFER_SIZE, None);
-    let spec = values_input(dispatch.dispatcher(), vec![batch]).record_batches();
-    let files: Vec<EncodedFile> =
-        encode_record_batches(spec, Arc::from([]), Arc::from([]), docs.len().max(1), 1)
-            .collect()
-            .unwrap();
-    dispatch.exit();
-
-    let dir = TempDir::new().unwrap();
-    for (i, file) in files.iter().enumerate() {
-        std::fs::write(dir.path().join(format!("part-{i}.parquet")), &file.bytes).unwrap();
-    }
-    dir
+/// Create `table` over `dir` and fill it with `docs`, one document per row.
+///
+/// The rows go in through the server, so the files under `dir` are what our own
+/// write path produces: the column is annotated VARIANT in the footer and its
+/// shredding is chosen from the documents, which is what a table reading them
+/// back needs. A plain Arrow writer cannot stand in here.
+async fn write_shredded_variant(conn: &Conn, table: &str, dir: &Path, docs: &[String]) {
+    conn.simple_query(&format!(
+        "CREATE TABLE {table} (j VARIANT) WITH (path = '{}')",
+        dir.to_str().unwrap()
+    ))
+    .await
+    .unwrap();
+    let values: Vec<String> = docs
+        .iter()
+        .map(|doc| format!("('{}')", doc.replace('\'', "''")))
+        .collect();
+    conn.simple_query(&format!("INSERT INTO {table} VALUES {}", values.join(",")))
+        .await
+        .unwrap();
 }
 
 /// The `typed_value` leaves of every Parquet file in `dir`: empty when nothing
@@ -534,14 +527,9 @@ fn mixed_documents() -> Vec<String> {
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
 async fn insert_from_a_shredded_variant_reassembles_and_reshreds(#[future] conn: Conn) {
-    let source = write_shredded_variant(&mixed_documents());
+    let source = TempDir::new().unwrap();
+    write_shredded_variant(&conn, "variant_source", source.path(), &mixed_documents()).await;
     let destination = TempDir::new().unwrap();
-    conn.simple_query(&format!(
-        "CREATE TABLE variant_source (j VARIANT) WITH (path = '{}')",
-        source.path().to_str().unwrap()
-    ))
-    .await
-    .unwrap();
     conn.simple_query(&format!(
         "CREATE TABLE variant_copy (n BIGINT, j VARIANT) WITH (path = '{}')",
         destination.path().to_str().unwrap()
