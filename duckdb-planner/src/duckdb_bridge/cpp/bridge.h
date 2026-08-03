@@ -14,6 +14,27 @@ struct BridgeLogicalType;
 struct BridgeDecimalValue;
 struct BridgeHugeint;
 
+// DuckDB exceptions serialize themselves as JSON; returns the embedded
+// exception type and message when present, the raw what() otherwise.
+std::string bridge_exception_message(const std::exception &e);
+
+// Every bridge function below is declared with a Result return on the Rust
+// side, so cxx routes it through this handler: a C++ exception becomes a Rust
+// error instead of unwinding into the (noexcept) FFI frame and terminating the
+// process. The catch-all clause covers throws that are not std::exceptions.
+namespace rust {
+namespace behavior {
+template <typename Try, typename Fail>
+static void trycatch(Try &&func, Fail &&fail) noexcept try {
+	func();
+} catch (const std::exception &e) {
+	fail(bridge_exception_message(e).c_str());
+} catch (...) {
+	fail("unknown C++ exception");
+}
+} // namespace behavior
+} // namespace rust
+
 // The Rust plan builder reads DuckDB's own objects directly, so expose them to
 // CXX as opaque types by their real names.
 using LogicalOperator = duckdb::LogicalOperator;

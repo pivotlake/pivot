@@ -582,7 +582,8 @@ fn run_sql(datastore: &Arc<DeltaDatastore>, sql: &str) -> Vec<RecordBatch> {
     let mut planner = Planner::from_datastore_names(
         vec![DEFAULT_DATASTORE_NAME.to_string()],
         DEFAULT_DATASTORE_NAME.to_string(),
-    );
+    )
+    .expect("planner context");
     let batches = planner
         .plan(sql, transaction.clone())
         .unwrap()
@@ -604,7 +605,8 @@ fn run_sql_with_stats(
     let mut planner = Planner::from_datastore_names(
         vec![DEFAULT_DATASTORE_NAME.to_string()],
         DEFAULT_DATASTORE_NAME.to_string(),
-    );
+    )
+    .expect("planner context");
     let result = planner
         .plan(sql, transaction.clone())
         .unwrap()
@@ -812,7 +814,8 @@ fn insert_files_reach_the_log_only_when_the_transaction_commits() {
     let mut planner = Planner::from_datastore_names(
         vec![DEFAULT_DATASTORE_NAME.to_string()],
         DEFAULT_DATASTORE_NAME.to_string(),
-    );
+    )
+    .expect("planner context");
     let inserted = planner
         .plan(
             "INSERT INTO pending_insert VALUES (1), (2)",

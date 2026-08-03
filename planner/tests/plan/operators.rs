@@ -361,6 +361,27 @@ fn join_with_unread_build_side_keeps_it_anyway(mut testing_planner: TestingPlann
     ");
 }
 
+// A join predicate that references both sides but is not a bare comparison
+// (an OR of per-side conjunctions) stays on the join as a single-expression
+// condition, which has no left/right/comparison to read. Planning must report
+// an error for it; the C++ exception those accessors throw must not cross the
+// FFI and abort the process.
+#[rstest]
+fn join_with_expression_condition_errors_instead_of_aborting(mut testing_planner: TestingPlanner) {
+    add_join_tables(&testing_planner);
+
+    let result = testing_planner.plan(
+        "SELECT count(*) FROM items JOIN orders ON i_order = o_key \
+         AND ((i_qty < 6 AND o_total > 5) OR (i_qty > 6 AND o_total < 25))",
+    );
+
+    let error = result.expect_err("expression-form join conditions are unsupported");
+    assert!(
+        error.to_string().to_lowercase().contains("join"),
+        "unexpected error: {error}"
+    );
+}
+
 /// The delivery of every filter in `plan`, in tree order.
 fn filter_deliveries(node: &planner::plan::PlanNode) -> Vec<RowDelivery> {
     let mut found = match &node.operator {

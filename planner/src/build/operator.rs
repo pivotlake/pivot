@@ -12,7 +12,7 @@ use duckdb_planner::DuckDBTable;
 use duckdb_planner::catalog_provider::OptionalTableWrapper;
 use duckdb_planner::duckdb_bridge::duckdb_types::LimitNodeType;
 use duckdb_planner::handle::{
-    Aggregate as AggregateView, CreateTable as CreateTableView, Filter as FilterView,
+    Aggregate as AggregateView, BridgeError, CreateTable as CreateTableView, Filter as FilterView,
     Insert as InsertView, Limit as LimitView, OrderBy as OrderByView, OrderKey,
     Projection as ProjectionView, Reset as ResetView, Set as SetView,
     TableFunctionScan as TableFunctionScanView, TableScan as TableScanView, TopN as TopNView,
@@ -32,7 +32,8 @@ impl Projection {
     pub(crate) fn from_handle(view: ProjectionView<'_>) -> Result<Projection, OperatorError> {
         Ok(Projection {
             projections: view
-                .exprs()
+                .exprs()?
+                .into_iter()
                 .map(Expression::from_handle)
                 .collect::<Result<Vec<_>, _>>()?,
         })
@@ -41,10 +42,13 @@ impl Projection {
 
 impl Values {
     pub(crate) fn from_handle(view: ValuesView<'_>) -> Result<Values, OperatorError> {
-        let rows = (0..view.row_count())
+        let rows = (0..view.row_count()?)
             .map(|row| {
-                (0..view.column_count())
-                    .map(|column| Expression::from_handle(view.expression(row, column)))
+                (0..view.column_count()?)
+                    .map(|column| {
+                        Expression::from_handle(view.expression(row, column)?)
+                            .map_err(OperatorError::from)
+                    })
                     .collect::<Result<Vec<_>, _>>()
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -54,18 +58,18 @@ impl Values {
 
 impl Insert {
     pub(crate) fn from_handle(view: InsertView<'_>) -> Result<Insert, OperatorError> {
-        if view.has_column_map() {
+        if view.has_column_map()? {
             return Err(OperatorError::Unsupported(
                 "INSERT with an explicit target-column list is not supported".to_string(),
             ));
         }
-        if view.returns_rows() {
+        if view.returns_rows()? {
             return Err(OperatorError::Unsupported(
                 "INSERT ... RETURNING is not supported".to_string(),
             ));
         }
         Ok(Insert {
-            table: bind_table(*view.take_table()),
+            table: bind_table(*view.take_table()?),
         })
     }
 }
@@ -74,7 +78,8 @@ impl Filter {
     pub(crate) fn from_handle(view: FilterView<'_>) -> Result<Filter, OperatorError> {
         Ok(Filter {
             conditions: view
-                .exprs()
+                .exprs()?
+                .into_iter()
                 .map(Expression::from_handle)
                 .collect::<Result<Vec<_>, _>>()?,
             // `annotate_filter_delivery` revisits this once the tree is built
@@ -89,11 +94,13 @@ impl Aggregate {
         Ok(Aggregate {
             output_limit: None,
             groups: view
-                .groups()
+                .groups()?
+                .into_iter()
                 .map(Expression::from_handle)
                 .collect::<Result<Vec<_>, _>>()?,
             expressions: view
-                .expressions()
+                .expressions()?
+                .into_iter()
                 .map(Expression::from_handle)
                 .collect::<Result<Vec<_>, _>>()?,
         })
@@ -103,7 +110,7 @@ impl Aggregate {
 impl OrderBy {
     pub(crate) fn from_handle(view: OrderByView<'_>) -> Result<OrderBy, OperatorError> {
         Ok(OrderBy {
-            order_bys: build_orders(view.keys())?,
+            order_bys: build_orders(view.keys()?)?,
         })
     }
 }
@@ -113,14 +120,14 @@ impl TopN {
         view: TopNView<'_>,
         ctx: &mut BuildCtx,
     ) -> Result<TopN, OperatorError> {
-        let produces_dynamic_filter = match view.dynamic_filter() {
+        let produces_dynamic_filter = match view.dynamic_filter()? {
             Some(df) => Some(ctx.dynamic_filter(df)?),
             None => None,
         };
         Ok(TopN {
-            order_bys: build_orders(view.keys())?,
-            limit: view.limit(),
-            offset: view.offset(),
+            order_bys: build_orders(view.keys()?)?,
+            limit: view.limit()?,
+            offset: view.offset()?,
             produces_dynamic_filter,
         })
     }
@@ -129,8 +136,8 @@ impl TopN {
 impl Limit {
     pub(crate) fn from_handle(view: LimitView<'_>) -> Result<Limit, OperatorError> {
         Ok(Limit {
-            limit: limit_bound(view.value_kind(), || view.value(), "value")?,
-            offset: limit_bound(view.offset_kind(), || view.offset(), "offset")?.unwrap_or(0),
+            limit: limit_bound(view.value_kind()?, || view.value(), "value")?,
+            offset: limit_bound(view.offset_kind()?, || view.offset(), "offset")?.unwrap_or(0),
         })
     }
 }
@@ -141,10 +148,11 @@ impl Input {
         ctx: &mut BuildCtx,
     ) -> Result<Input, OperatorError> {
         Ok(Input {
-            table: bind_table(*scan.take_table()),
-            columns: build_scan_columns(scan.output_columns())?,
+            table: bind_table(*scan.take_table()?),
+            columns: build_scan_columns(scan.output_columns()?)?,
             dynamic_filters: scan
-                .dynamic_filters()
+                .dynamic_filters()?
+                .into_iter()
                 .map(|df| ctx.dynamic_filter(df))
                 .collect::<Result<Vec<_>, _>>()?,
             emit_row_group_metadata: false,
@@ -158,16 +166,16 @@ impl TableFunctionScan {
     ) -> Result<TableFunctionScan, OperatorError> {
         // Only positional parameters are supported; reject named parameters rather
         // than silently drop a bound argument.
-        if view.has_named_params() {
+        if view.has_named_params()? {
             return Err(OperatorError::Unsupported(format!(
                 "table function {} with named parameters is not supported",
-                view.function_name()
+                view.function_name()?
             )));
         }
         Ok(TableFunctionScan::new(
-            view.function_name(),
-            view.params().collect(),
-            build_scan_columns(view.output_columns())?,
+            view.function_name()?,
+            view.params()?,
+            build_scan_columns(view.output_columns()?)?,
         ))
     }
 }
@@ -176,10 +184,11 @@ impl CreateTable {
     pub(crate) fn from_handle(view: CreateTableView<'_>) -> Result<CreateTable, OperatorError> {
         Ok(CreateTable {
             request: CreateTableRequest {
-                datastore_name: view.datastore(),
-                name: view.name(),
+                datastore_name: view.datastore()?,
+                name: view.name()?,
                 columns: view
-                    .columns()
+                    .columns()?
+                    .into_iter()
                     .map(|(name, col_type)| {
                         Ok(Column {
                             name,
@@ -187,47 +196,46 @@ impl CreateTable {
                         })
                     })
                     .collect::<Result<Vec<_>, OperatorError>>()?,
-                options: view.options().collect(),
-                if_not_exists: view.if_not_exists(),
+                options: view.options()?.into_iter().collect(),
+                if_not_exists: view.if_not_exists()?,
             },
-            or_replace: view.or_replace(),
-            temporary: view.temporary(),
-            has_query: view.has_query(),
-            constraint_count: view.constraint_count(),
+            or_replace: view.or_replace()?,
+            temporary: view.temporary()?,
+            has_query: view.has_query()?,
+            constraint_count: view.constraint_count()?,
         })
     }
 }
 
 impl SetVariable {
-    pub(crate) fn from_set(view: SetView<'_>) -> SetVariable {
-        SetVariable {
-            name: view.name(),
-            value: Some(view.value()),
-        }
+    pub(crate) fn from_set(view: SetView<'_>) -> Result<SetVariable, BridgeError> {
+        Ok(SetVariable {
+            name: view.name()?,
+            value: Some(view.value()?),
+        })
     }
 
     /// `RESET name` is modelled as a `SET` with no value (the consumer reads "no
     /// value" as "off / default").
-    pub(crate) fn from_reset(view: ResetView<'_>) -> SetVariable {
-        SetVariable {
-            name: view.name(),
+    pub(crate) fn from_reset(view: ResetView<'_>) -> Result<SetVariable, BridgeError> {
+        Ok(SetVariable {
+            name: view.name()?,
             value: None,
-        }
+        })
     }
 }
 
 /// Lower a sequence of handle sort keys into Pivot [`OrderByNode`]s. Shared by the
 /// `OrderBy` and `TopN` constructors.
-fn build_orders<'a>(
-    keys: impl Iterator<Item = OrderKey<'a>>,
-) -> Result<Vec<OrderByNode>, ExpressionError> {
-    keys.map(|key| {
-        Ok(OrderByNode {
-            direction: key.direction.into(),
-            expression: Expression::from_handle(key.expression)?,
+fn build_orders(keys: Vec<OrderKey<'_>>) -> Result<Vec<OrderByNode>, ExpressionError> {
+    keys.into_iter()
+        .map(|key| {
+            Ok(OrderByNode {
+                direction: key.direction.into(),
+                expression: Expression::from_handle(key.expression)?,
+            })
         })
-    })
-    .collect()
+        .collect()
 }
 
 /// Resolve a bound catalog entry into the Pivot [`BoundTable`] it wraps.
@@ -248,12 +256,12 @@ fn bind_table(wrapper: OptionalTableWrapper) -> Box<dyn BoundTable> {
 /// bound, so it must only be called once the kind is known to be a constant.
 fn limit_bound(
     kind: LimitNodeType,
-    value: impl FnOnce() -> usize,
+    value: impl FnOnce() -> Result<usize, BridgeError>,
     what: &str,
 ) -> Result<Option<usize>, OperatorError> {
     match kind {
         LimitNodeType::UNSET => Ok(None),
-        LimitNodeType::CONSTANT_VALUE => Ok(Some(value())),
+        LimitNodeType::CONSTANT_VALUE => Ok(Some(value()?)),
         _ => Err(OperatorError::Unsupported(format!(
             "Unsupported non-constant LIMIT {what}"
         ))),

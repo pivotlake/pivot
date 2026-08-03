@@ -69,6 +69,22 @@ static const T &as_expr(const Expression &expr) {
 	return expr.Cast<T>();
 }
 
+std::string bridge_exception_message(const std::exception &e) {
+	using json = nlohmann::json;
+	auto parsed = json::parse(e.what(), nullptr, false);
+	if (parsed.is_object()) {
+		auto message_it = parsed.find("exception_message");
+		if (message_it != parsed.end() && message_it->is_string()) {
+			auto type_it = parsed.find("exception_type");
+			if (type_it != parsed.end() && type_it->is_string()) {
+				return type_it->get<string>() + ": " + message_it->get<string>();
+			}
+			return message_it->get<string>();
+		}
+	}
+	return e.what();
+}
+
 static ExtractPlanResult make_error(const string &kind, const string &message,
                                     std::optional<string> position = std::nullopt) {
 	ExtractPlanResult result;

@@ -48,12 +48,13 @@
 //!     }
 //! }
 //!
-//! let mut ctx = PlannerContext::new(Arc::new(MyCatalog), vec!["db".to_string()], "db".to_string());
+//! let mut ctx = PlannerContext::new(Arc::new(MyCatalog), vec!["db".to_string()], "db".to_string())
+//!     .unwrap();
 //!
 //! // Plan a query inside a transaction; walk the root handle.
 //! let plan = ctx.plan("SELECT name FROM users", Arc::new(MyTransaction)).unwrap();
-//! let root = plan.root();
-//! assert_eq!(root.op_type(), LogicalOperatorType::LOGICAL_PROJECTION);
+//! let root = plan.root().unwrap();
+//! assert_eq!(root.op_type().unwrap(), LogicalOperatorType::LOGICAL_PROJECTION);
 //! ```
 
 #![allow(clippy::upper_case_acronyms)]
@@ -71,7 +72,7 @@ use thiserror::Error;
 pub use catalog_provider::{DuckDBBind, DuckDBTable, DuckDBTransaction};
 pub use duckdb_bridge::duckdb_types::LogicalTypeId;
 pub use duckdb_bridge::ffi::DuckDBColumn;
-pub use handle::{Expr, LogicalOp, Plan};
+pub use handle::{BridgeError, Expr, LogicalOp, Plan};
 pub use types::{BoundLogicalType, ExtraTypeInfo, ScalarValue};
 
 /// Top-level error type for the planner.
@@ -83,6 +84,18 @@ pub enum Error {
     UnsupportedPlan(String),
     #[error("Bridge error: {0}")]
     Bridge(String),
+}
+
+impl From<cxx::Exception> for Error {
+    fn from(exception: cxx::Exception) -> Self {
+        Error::Bridge(exception.what().to_string())
+    }
+}
+
+impl From<BridgeError> for Error {
+    fn from(error: BridgeError) -> Self {
+        Error::Bridge(error.0)
+    }
 }
 
 /// Error returned by DuckDB when it cannot produce a plan for a query.
@@ -129,19 +142,22 @@ impl PlannerContext {
     /// independent names (scalar functions), which are generic across datastores;
     /// per-query table lookups are routed by database name through the
     /// transaction handed to [`plan`](Self::plan).
+    /// Creating the context attaches every datastore as a DuckDB database, and
+    /// any of those steps can fail inside DuckDB; the C++ exception comes back
+    /// as [`Error::Bridge`].
     pub fn new(
         provider: Arc<dyn DuckDBBind>,
         database_names: Vec<String>,
         default_name: String,
-    ) -> Self {
+    ) -> Result<Self, Error> {
         let ctx = Box::new(catalog_provider::CatalogContext::new(
             provider,
             database_names,
             default_name,
         ));
-        Self {
-            cxx_context: ffi::new_context(ctx),
-        }
+        Ok(Self {
+            cxx_context: ffi::new_context(ctx)?,
+        })
     }
 
     /// Plan a SQL query inside `transaction`: sends the query to DuckDB and
@@ -157,7 +173,7 @@ impl PlannerContext {
         transaction: Arc<dyn DuckDBTransaction>,
     ) -> Result<Plan, Error> {
         let transaction_ctx = catalog_provider::TransactionContext::new(transaction);
-        let result = ffi::extract_plan(self.cxx_context.pin_mut(), query, &transaction_ctx);
+        let result = ffi::extract_plan(self.cxx_context.pin_mut(), query, &transaction_ctx)?;
         if !result.error_kind.is_empty() {
             return Err(bridge_error(&result));
         }

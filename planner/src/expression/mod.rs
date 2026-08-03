@@ -88,6 +88,9 @@ pub enum Error {
     UnsupportedInterval(String),
     #[error("Unsupported expression type: {0:?}")]
     UnsupportedExpressionType(ExpressionType),
+    /// A DuckDB exception surfaced while reading the plan across the bridge.
+    #[error("{0}")]
+    Bridge(#[from] duckdb_planner::BridgeError),
 }
 
 /// Format an arrow `Scalar<ArrayRef>` constant as `value:Type` for plan

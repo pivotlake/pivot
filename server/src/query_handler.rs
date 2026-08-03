@@ -122,22 +122,25 @@ impl PlanCache {
 fn with_planner<R>(
     catalog: &Arc<catalog::PivotCatalog>,
     f: impl FnOnce(&mut planner::Planner) -> R,
-) -> R {
+) -> Result<R, planner::Error> {
     PLANNER.with_borrow_mut(|opt| {
-        let planner = opt.get_or_insert_with(|| {
-            // Attach every datastore as its own database (so a query can name
-            // it). The planner holds no catalog; each query's transaction
-            // (from `catalog.begin_transaction()`) does all table/DDL resolution.
-            let names = catalog
-                .iter_datastores()
-                .map(|(name, _)| name.clone())
-                .collect();
-            planner::Planner::from_datastore_names(
-                names,
-                catalog.default_datastore_name().to_string(),
-            )
-        });
-        f(planner)
+        let planner = match opt {
+            Some(planner) => planner,
+            None => {
+                // Attach every datastore as its own database (so a query can name
+                // it). The planner holds no catalog; each query's transaction
+                // (from `catalog.begin_transaction()`) does all table/DDL resolution.
+                let names = catalog
+                    .iter_datastores()
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                opt.insert(planner::Planner::from_datastore_names(
+                    names,
+                    catalog.default_datastore_name().to_string(),
+                )?)
+            }
+        };
+        Ok(f(planner))
     })
 }
 
@@ -264,7 +267,7 @@ async fn plan_query(
     let plan = tokio::task::spawn_blocking(move || -> Result<Arc<planner::Plan>> {
         with_planner(&catalog, |planner| {
             Ok(Arc::new(planner.plan(&query, planning_transaction)?))
-        })
+        })?
     })
     .await
     .map_err(Error::PlannerPanic)??;

@@ -62,7 +62,8 @@ fn join_planning_consults_table_row_counts() {
         Arc::new(StatsCatalog),
         vec!["db".to_string()],
         "db".to_string(),
-    );
+    )
+    .unwrap();
 
     planner
         .plan(

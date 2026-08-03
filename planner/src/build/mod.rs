@@ -136,13 +136,13 @@ fn render_variant_outputs(plan: PlanNode) -> Result<PlanNode, crate::compile::Er
 }
 
 fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, OperatorError> {
-    let kind = op.operator();
+    let kind = op.operator()?;
 
     // DuckDB's late_materialization optimizer rewrites a wide Top-N/Limit scan
     // into a row-id SEMI join. Collapse that into pivot's Materialize rather than
     // executing a join (only the late-mat shape, not a user IN/EXISTS semi-join).
     if let DuckOperator::ComparisonJoin(join) = kind
-        && join.is_late_materialization()
+        && join.is_late_materialization()?
     {
         return build_late_materialization(op, join, ctx);
     }
@@ -151,11 +151,12 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
     // through the generic loop below: the definition's output shape is what the
     // scans in the body declare as their own.
     if let DuckOperator::MaterializedCte(cte) = kind {
-        return build_cte(op, cte.cte_index(), ctx);
+        return build_cte(op, cte.cte_index()?, ctx);
     }
 
     let inputs = op
-        .children()
+        .children()?
+        .into_iter()
         .map(|child| build_node(child, ctx))
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -196,8 +197,8 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
             Operator::TableFunctionScan(TableFunctionScan::from_handle(view)?)
         }
         DuckOperator::CreateTable(c) => Operator::CreateTable(CreateTable::from_handle(c)?),
-        DuckOperator::Set(s) => Operator::SetVariable(SetVariable::from_set(s)),
-        DuckOperator::Reset(r) => Operator::SetVariable(SetVariable::from_reset(r)),
+        DuckOperator::Set(s) => Operator::SetVariable(SetVariable::from_set(s)?),
+        DuckOperator::Reset(r) => Operator::SetVariable(SetVariable::from_reset(r)?),
         // No view to construct from: these carry no kind-specific payload.
         DuckOperator::DummyScan => Operator::DummyScan(DummyScan),
         DuckOperator::Explain => Operator::Explain(Explain),
@@ -205,7 +206,7 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
             return build_join(op, join, inputs);
         }
         DuckOperator::CteRef(cte_ref) => {
-            Operator::CteScan(build_cte_scan(cte_ref.cte_index(), ctx)?)
+            Operator::CteScan(build_cte_scan(cte_ref.cte_index()?, ctx)?)
         }
         // A CTE is walked above, before its children.
         DuckOperator::MaterializedCte(_) => {
@@ -214,13 +215,13 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         DuckOperator::Unsupported => {
             return Err(OperatorError::Unsupported(format!(
                 "Unsupported operator type: {}",
-                op.name()
+                op.name()?
             )));
         }
     };
 
     let mut node = PlanNode {
-        name: op.name(),
+        name: op.name()?,
         inputs,
         operator,
     };
@@ -230,10 +231,10 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
     // The peek at the DuckDB child is what grounds the fold: only a scan child
     // means the built input's Filter can be the synthetic wrapper.
     if matches!(kind, DuckOperator::Filter(_))
-        && op
-            .children()
-            .next()
-            .is_some_and(|child| matches!(child.operator(), DuckOperator::TableScan(_)))
+        && match op.children()?.first() {
+            Some(child) => matches!(child.operator()?, DuckOperator::TableScan(_)),
+            None => false,
+        }
     {
         node = absorb_scan_pushdown_filter(node);
     }
@@ -259,8 +260,12 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
     if let DuckOperator::Filter(f) = kind {
         // A filter's projection_map is a plain positional reorder of its child's
         // columns, never a variant field extract, so each carries an empty path.
-        let projections =
-            build_scan_columns(f.projection_map().map(|(idx, ty)| (idx, ty, Vec::new())))?;
+        let projections = build_scan_columns(
+            f.projection_map()?
+                .into_iter()
+                .map(|(idx, ty)| (idx, ty, Vec::new()))
+                .collect(),
+        )?;
         if !projections.is_empty() {
             return Ok(PlanNode {
                 name: "FILTER_PROJECTION".to_string(),
@@ -339,15 +344,13 @@ fn build_join(
     join: ComparisonJoinView<'_>,
     inputs: Vec<PlanNode>,
 ) -> Result<PlanNode, OperatorError> {
-    let mut conditions = join.conditions();
-    let condition = match (conditions.next(), conditions.next()) {
-        (Some(condition), None) => condition,
-        _ => {
-            return Err(OperatorError::Unsupported(
-                "joins must have exactly one equality condition".to_string(),
-            ));
-        }
-    };
+    let mut conditions = join.conditions()?;
+    if conditions.len() != 1 {
+        return Err(OperatorError::Unsupported(
+            "joins must have exactly one equality condition".to_string(),
+        ));
+    }
+    let condition = conditions.remove(0);
     if condition.comparison != ExpressionType::COMPARE_EQUAL {
         return Err(OperatorError::Unsupported(format!(
             "Unsupported join comparison type: {:?}",
@@ -366,8 +369,8 @@ fn build_join(
 
     let probe_types = inputs[0].output_types()?;
     let build_types = inputs[1].output_types()?;
-    let left_map: Vec<usize> = join.left_projection_map().collect();
-    let right_map: Vec<usize> = join.right_projection_map().collect();
+    let left_map: Vec<usize> = join.left_projection_map()?;
+    let right_map: Vec<usize> = join.right_projection_map()?;
 
     // Refs above the join were resolved against the trimmed output (kept left
     // columns, then kept right columns), which is exactly the layout the join
@@ -382,7 +385,7 @@ fn build_join(
     } else {
         right_map
     };
-    let (kind, build_output) = match join.join_type() {
+    let (kind, build_output) = match join.join_type()? {
         JoinType::INNER => (JoinKind::Inner, kept_build_output),
         JoinType::RIGHT => (
             JoinKind::BuildOuter {
@@ -405,7 +408,7 @@ fn build_join(
         }
     };
     Ok(PlanNode {
-        name: op.name(),
+        name: op.name()?,
         inputs,
         operator: Operator::Join(Join {
             probe_key,
@@ -452,9 +455,10 @@ fn join_key_ref(key: Expression) -> Result<(usize, Type), OperatorError> {
 /// positional `BOUND_REF` over storage column indices. Shared by the walk's
 /// `projection_map` replay and the scan constructors in [`operator`].
 fn build_scan_columns(
-    columns: impl Iterator<Item = (usize, BoundLogicalType, Vec<String>)>,
+    columns: Vec<(usize, BoundLogicalType, Vec<String>)>,
 ) -> Result<Vec<Expression>, ExpressionError> {
     columns
+        .into_iter()
         .map(|(column_idx, col_type, path)| {
             let return_type = type_from_logical(col_type)?;
             if path.is_empty() {
@@ -487,11 +491,10 @@ fn build_scan_columns(
 }
 
 fn build_pushed_conditions(scan: TableScanView<'_>) -> Result<Vec<Expression>, OperatorError> {
-    let list = scan
-        .pushed_conditions()
-        .map_err(|e| OperatorError::Unsupported(e.to_string()))?;
+    let list = scan.pushed_conditions()?;
     Ok(list
-        .iter()
+        .exprs()?
+        .into_iter()
         .map(Expression::from_handle)
         .collect::<Result<Vec<_>, _>>()?)
 }
@@ -503,12 +506,12 @@ fn build_cte(
     cte_index: usize,
     ctx: &mut BuildCtx,
 ) -> Result<PlanNode, OperatorError> {
-    let definition = build_node(op.child(0), ctx)?;
+    let definition = build_node(op.child(0)?, ctx)?;
     let types = definition.output_types()?;
     let nullable = definition.output_nullability();
     ctx.cte_outputs.insert(cte_index, (types, nullable));
 
-    let body = build_node(op.child(1), ctx)?;
+    let body = build_node(op.child(1)?, ctx)?;
     let sites = ctx.cte_sites.remove(&cte_index).unwrap_or_default();
     if sites == 0 {
         return Err(OperatorError::Unsupported(format!(
@@ -517,7 +520,7 @@ fn build_cte(
     }
 
     Ok(PlanNode {
-        name: op.name(),
+        name: op.name()?,
         inputs: vec![definition, body],
         operator: Operator::Cte(Cte { cte_index, sites }),
     })
@@ -546,11 +549,11 @@ fn build_late_materialization(
     join: ComparisonJoinView<'_>,
     ctx: &mut BuildCtx,
 ) -> Result<PlanNode, OperatorError> {
-    let columns: Vec<usize> = join.columns().collect();
+    let columns: Vec<usize> = join.columns()?;
 
     // The narrow pipeline is the RHS; translate it normally, then drop the row-id
     // column DuckDB threaded through it for the join we're discarding.
-    let mut child = build_node(op.child(1), ctx)?;
+    let mut child = build_node(op.child(1)?, ctx)?;
     strip_trailing_rowid(&mut child);
     // Flag the narrow scan to emit row-group metadata, and clone its table for the
     // Materialize so both read (a clone of) the same table.
