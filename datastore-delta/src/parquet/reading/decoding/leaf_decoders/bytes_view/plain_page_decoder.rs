@@ -7,9 +7,9 @@
 //! the length prefix or the string body straddles a buffer boundary.
 
 use super::super::ArrayBuilder;
-use crate::parquet::reading::decoding::column_decoders::DecodePlain;
-use crate::parquet::reading::decoding::column_decoders::bytes_view::delta_length_page_decoder::DeltaLengthPageDecoder;
-use crate::parquet::reading::decoding::column_decoders::bytes_view::views_builder::ViewsBuilder;
+use crate::parquet::reading::decoding::leaf_decoders::DecodePlain;
+use crate::parquet::reading::decoding::leaf_decoders::bytes_view::delta_length_page_decoder::DeltaLengthPageDecoder;
+use crate::parquet::reading::decoding::leaf_decoders::bytes_view::views_builder::ViewsBuilder;
 use arrow_array::builder::make_view;
 use arrow_array::types::ByteViewType;
 use arrow_buffer::Buffer;
@@ -212,8 +212,8 @@ impl<V: ByteViewType> DecodePlain for PlainPageDecoder<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parquet::reading::decoding::column_decoders::bytes_view::views_builder::ViewsBuilder;
-    use crate::parquet::reading::decoding::column_decoders::{ArrayBuilder, DecodePlain};
+    use crate::parquet::reading::decoding::leaf_decoders::bytes_view::views_builder::ViewsBuilder;
+    use crate::parquet::reading::decoding::leaf_decoders::{ArrayBuilder, DecodePlain};
     use arrow_array::types::StringViewType;
     use arrow_array::{Array, StringViewArray};
     use bytes::Bytes;

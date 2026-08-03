@@ -31,8 +31,8 @@ use bytes::Bytes;
 use dispatch::arrays::ArrayBuilder;
 use dispatch::memory::{MultiBufferReader, ReaderPosition};
 
-use crate::parquet::reading::decoding::column_decoders::primitive::PrimitiveBuilder;
-use crate::parquet::reading::decoding::column_decoders::{DecimalStorage, DecodeDelta};
+use crate::parquet::reading::decoding::leaf_decoders::primitive::PrimitiveBuilder;
+use crate::parquet::reading::decoding::leaf_decoders::{DecimalStorage, DecodeDelta};
 use crate::parquet::types::thrift::general::Encoding;
 
 /// Widest block layout accepted. Writers use four miniblocks of 32 values;
@@ -522,7 +522,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parquet::reading::decoding::column_decoders::decimal::DecimalFromInt64;
+    use crate::parquet::reading::decoding::leaf_decoders::decimal::DecimalFromInt64;
     use arrow_array::types::{Decimal64Type, Decimal128Type, Float64Type, Int32Type, Int64Type};
     use dispatch::memory::{SlabAllocator, init_test_free_pool};
 

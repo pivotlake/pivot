@@ -12,7 +12,7 @@
 //! straight off each buffer's contiguous slice, and only a value straddling a
 //! buffer boundary goes through a [`MultiBufferReader`].
 //!
-//! [`DecimalColumnDecoder`] pairs the page decoder with the column's declared
+//! [`DecimalLeafDecoder`] pairs the page decoder with the column's declared
 //! precision and scale, so every array it emits carries the declared shape.
 
 use std::marker::PhantomData;
@@ -24,10 +24,10 @@ use arrow_array::types::{Decimal64Type, Decimal128Type, DecimalType};
 use arrow_array::{ArrayRef, ArrowPrimitiveType, RecordBatch, Scalar};
 use bytes::Bytes;
 
-use crate::parquet::reading::decoding::column_decoders::primitive::ElemPtr;
-use crate::parquet::reading::decoding::column_decoders::{
-    ColumnDecoder, DecimalDeltaDecoder, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error,
-    FromDelta, Result, TypedColumnDecoder,
+use crate::parquet::reading::decoding::leaf_decoders::primitive::ElemPtr;
+use crate::parquet::reading::decoding::leaf_decoders::{
+    DecimalDeltaDecoder, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error, FromDelta,
+    LeafDecoder, Result, TypedLeafDecoder,
 };
 use crate::parquet::types::metadata::ColumnChunkMeta;
 use crate::parquet::types::page::DecompressedPage;
@@ -335,7 +335,7 @@ impl<T: DecimalCarrier, S: DecimalStorage> DictFromVecBytes
 
 /// The generic page decoder a decimal column decodes through, before its
 /// arrays are given the column's declared shape.
-type DecimalPageDecoder<T, S> = TypedColumnDecoder<
+type DecimalPageDecoder<T, S> = TypedLeafDecoder<
     DecimalDict<T, S, SlabBuffer<<T as ArrowPrimitiveType>::Native>>,
     DecimalDict<T, S, MultiSlabBuffer<<T as ArrowPrimitiveType>::Native>>,
     PrimitiveBuilder<T>,
@@ -351,13 +351,13 @@ type DecimalPageDecoder<T, S> = TypedColumnDecoder<
 /// The restamp is metadata-only: the values buffer is shared, never rescaled.
 /// An arrow `cast` between decimal types would rescale the stored integers,
 /// so it must never be used here.
-pub struct DecimalColumnDecoder<T: DecimalCarrier, S: DecimalStorage> {
+pub struct DecimalLeafDecoder<T: DecimalCarrier, S: DecimalStorage> {
     inner: DecimalPageDecoder<T, S>,
     precision: u8,
     scale: i8,
 }
 
-impl<T: DecimalCarrier, S: DecimalStorage> DecimalColumnDecoder<T, S> {
+impl<T: DecimalCarrier, S: DecimalStorage> DecimalLeafDecoder<T, S> {
     pub fn new(max_def_level: i16, precision: u8, scale: i8) -> Self {
         Self {
             inner: DecimalPageDecoder::new(max_def_level),
@@ -367,7 +367,7 @@ impl<T: DecimalCarrier, S: DecimalStorage> DecimalColumnDecoder<T, S> {
     }
 }
 
-impl<T: DecimalCarrier, S: DecimalStorage> ColumnDecoder for DecimalColumnDecoder<T, S> {
+impl<T: DecimalCarrier, S: DecimalStorage> LeafDecoder for DecimalLeafDecoder<T, S> {
     fn available(&self) -> usize {
         self.inner.available()
     }
@@ -408,17 +408,17 @@ pub fn decimal_decoder<T: DecimalCarrier>(
     chunk: &ColumnChunkMeta,
     precision: u8,
     scale: i8,
-) -> Result<Box<dyn ColumnDecoder>> {
+) -> Result<Box<dyn LeafDecoder>> {
     use crate::parquet::types::thrift::general::Type as PhysicalType;
     if chunk.physical_type == PhysicalType::INT32 as i32 {
-        return Ok(Box::new(DecimalColumnDecoder::<T, DecimalFromInt32>::new(
+        return Ok(Box::new(DecimalLeafDecoder::<T, DecimalFromInt32>::new(
             chunk.max_def_level,
             precision,
             scale,
         )));
     }
     if chunk.physical_type == PhysicalType::INT64 as i32 {
-        return Ok(Box::new(DecimalColumnDecoder::<T, DecimalFromInt64>::new(
+        return Ok(Box::new(DecimalLeafDecoder::<T, DecimalFromInt64>::new(
             chunk.max_def_level,
             precision,
             scale,
@@ -430,7 +430,7 @@ pub fn decimal_decoder<T: DecimalCarrier>(
                 match chunk.fixed_len_byte_width {
                     $(Some($len) => {
                         return Ok(Box::new(
-                            DecimalColumnDecoder::<T, DecimalFromFixedLen<$len>>::new(
+                            DecimalLeafDecoder::<T, DecimalFromFixedLen<$len>>::new(
                                 chunk.max_def_level,
                                 precision,
                                 scale,

@@ -46,21 +46,21 @@ impl PushedPredicate {
     /// column's own leaf for a plain predicate, or the shredded typed leaf for
     /// a variant path. `None` means pruning isn't sound for this row group
     /// (always safe): the path isn't shredded in this file, or some rows may
-    /// hold the path's value in a binary `value` fallback along the path,
-    /// where the typed leaf's statistics can't see them. The spec only allows
-    /// stats-based skipping when every such fallback is all-null.
+    /// hold the path's value in an untyped `value` leaf along the path, where
+    /// the typed leaf's statistics can't see them. The spec only allows
+    /// stats-based skipping when every such value leaf is all-null.
     fn get_leaf_for_row_group(&self, rg: &RowGroupMetadata) -> Option<usize> {
         let fields = rg.schema.fields();
         if self.path.is_empty() {
             return Some(first_leaf(fields, self.column_idx));
         }
         let leaves = variant_shredded_leaves(fields, self.column_idx, &self.path)?;
-        let all_fallbacks_null = leaves.value_fallbacks.iter().all(|&leaf| {
+        let all_value_leaves_null = leaves.value_leaves.iter().all(|&leaf| {
             rg.leaf_statistics(leaf)
                 .and_then(|stats| stats.null_count)
                 .is_some_and(|null_count| null_count == rg.num_rows)
         });
-        all_fallbacks_null.then_some(leaves.typed_value)
+        all_value_leaves_null.then_some(leaves.typed_leaf)
     }
 }
 

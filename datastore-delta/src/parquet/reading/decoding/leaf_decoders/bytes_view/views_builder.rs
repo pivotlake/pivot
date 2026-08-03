@@ -25,7 +25,7 @@
 //! [`into_array`](ArrayBuilder::into_array). The two flavours share this one
 //! physical layout; `V` only decides the array type the leaf's schema declares.
 
-use crate::parquet::reading::decoding::column_decoders::ArrayBuilder;
+use crate::parquet::reading::decoding::leaf_decoders::ArrayBuilder;
 use arrow_array::types::ByteViewType;
 use arrow_array::{ArrayRef, GenericByteViewArray, builder::make_view};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};

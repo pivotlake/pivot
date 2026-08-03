@@ -1,5 +1,5 @@
-//! [`TypedColumnDecoder`] — the generic, type-parameterised implementation of
-//! [`ColumnDecoder`].
+//! [`TypedLeafDecoder`] — the generic, type-parameterised implementation of
+//! [`LeafDecoder`].
 //!
 //! This struct is parameterised over the traits that together describe how to
 //! decode a particular Parquet column type:
@@ -10,15 +10,15 @@
 //! - `B: ArrayBuilder` — accumulates decoded values into an Arrow array.
 //! - `P: DecodePlain` — reads plain-encoded values from raw page bytes.
 //!
-//! Concrete column decoders (e.g. `PrimitiveColumnDecoder`, `BytesViewDecoder`)
-//! are type aliases over `TypedColumnDecoder` with the appropriate type
+//! Concrete column decoders (e.g. `PrimitiveLeafDecoder`, `BytesViewDecoder`)
+//! are type aliases over `TypedLeafDecoder` with the appropriate type
 //! parameters.
 
-use crate::parquet::reading::decoding::column_decoders::levels::decode_def_levels;
-use crate::parquet::reading::decoding::column_decoders::rle::RleDecoder;
-use crate::parquet::reading::decoding::column_decoders::{
-    ArrayBuilder, ColumnDecoder, DecodeDelta, DecodePlain, Dict, DictFromBytes, DictFromVecBytes,
-    Error, Result,
+use crate::parquet::reading::decoding::leaf_decoders::levels::decode_def_levels;
+use crate::parquet::reading::decoding::leaf_decoders::rle::RleDecoder;
+use crate::parquet::reading::decoding::leaf_decoders::{
+    ArrayBuilder, DecodeDelta, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error,
+    LeafDecoder, Result,
 };
 use crate::parquet::types::filter_mask::RunningFilterMask;
 use crate::parquet::types::page::{DataPage, DecompressedPage, DecompressedPageType};
@@ -232,7 +232,7 @@ impl<DC: DictFromBytes, DS: DictFromVecBytes> DictStorage<DC, DS> {
 /// Accumulates [`DecompressedPage`]s and decodes them into Arrow arrays on
 /// demand. See the [module docs](self) for how the type parameters fit
 /// together.
-pub struct TypedColumnDecoder<DC, DS, B, P>
+pub struct TypedLeafDecoder<DC, DS, B, P>
 where
     DC: DictFromBytes<Builder = B, Item = B::Element>,
     DS: DictFromVecBytes<Builder = B, Item = B::Element, EqConstant = DC::EqConstant>,
@@ -260,7 +260,7 @@ where
     phantom_data: PhantomData<B>,
 }
 
-impl<DC, DS, B, P> TypedColumnDecoder<DC, DS, B, P>
+impl<DC, DS, B, P> TypedLeafDecoder<DC, DS, B, P>
 where
     DC: DictFromBytes<Builder = B, Item = B::Element>,
     DS: DictFromVecBytes<Builder = B, Item = B::Element, EqConstant = DC::EqConstant>,
@@ -367,7 +367,7 @@ where
     }
 }
 
-impl<DC, DS, B, P> ColumnDecoder for TypedColumnDecoder<DC, DS, B, P>
+impl<DC, DS, B, P> LeafDecoder for TypedLeafDecoder<DC, DS, B, P>
 where
     DC: DictFromBytes<Builder = B, Item = B::Element>,
     DS: DictFromVecBytes<Builder = B, Item = B::Element, EqConstant = DC::EqConstant>,
@@ -537,7 +537,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parquet::reading::decoding::column_decoders::primitive::PrimitiveColumnDecoder;
+    use crate::parquet::reading::decoding::leaf_decoders::primitive::PrimitiveLeafDecoder;
     use crate::parquet::test_utils::dummy_metadata;
     use crate::parquet::types::filter_mask::FilterMask;
     use crate::parquet::types::page::{DataPage, DecompressedPageType};
@@ -624,7 +624,7 @@ mod tests {
         }
     }
 
-    type Dec = PrimitiveColumnDecoder<Int32Type>;
+    type Dec = PrimitiveLeafDecoder<Int32Type>;
 
     // -- available --
 
