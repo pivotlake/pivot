@@ -142,15 +142,21 @@ fn main() {
 /// cache only it can use. A checkout placed outside the repository still caches
 /// against itself, just not against its siblings.
 fn find_ccache_base_dir(crate_dir: &std::path::Path) -> std::path::PathBuf {
+    // Pre-2.31 git has no --path-format=absolute; worse, rev-parse echoes the
+    // unknown flag back on stdout while still exiting 0, which would end up
+    // verbatim in CCACHE_BASEDIR and fail every compile. Ask for the plain
+    // --git-common-dir instead, which older gits print relative to the working
+    // directory, and resolve it against that directory ourselves. Canonicalizing
+    // also rejects any output that is not an existing path.
     let repository_root = std::process::Command::new("git")
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .args(["rev-parse", "--git-common-dir"])
         .current_dir(crate_dir)
         .output()
         .ok()
         .filter(|output| output.status.success())
-        .map(|output| {
+        .and_then(|output| {
             let git_dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            std::path::PathBuf::from(git_dir)
+            crate_dir.join(git_dir).canonicalize().ok()
         })
         .and_then(|git_dir| git_dir.parent().map(std::path::Path::to_path_buf));
 
