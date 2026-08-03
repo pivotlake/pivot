@@ -577,6 +577,43 @@ async fn insert_from_a_shredded_variant_reassembles_and_reshreds(#[future] conn:
     );
 }
 
+/// Dot access is the syntax DuckDB folds into the scan's projection, so this
+/// query reaches the reader as a pushed-down path rather than as an expression
+/// above the scan. It has to answer exactly what the arrow syntax answers.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn dot_access_pushed_into_the_scan_reads_the_same_values(#[future] conn: Conn) {
+    let dir = TempDir::new().unwrap();
+    write_shredded_variant(&conn, "variant_dot", dir.path(), &mixed_documents()).await;
+
+    let pushed = select_rows(
+        &conn,
+        "SELECT CAST(j.a.x AS BIGINT) AS x FROM variant_dot \
+         WHERE CAST(j.kind AS VARCHAR) = 'commit' ORDER BY x LIMIT 3",
+    )
+    .await;
+    let above_scan = select_rows(
+        &conn,
+        "SELECT CAST(j->'a'->'x' AS BIGINT) AS x FROM variant_dot \
+         WHERE CAST(j->'kind' AS VARCHAR) = 'commit' ORDER BY x LIMIT 3",
+    )
+    .await;
+
+    assert_eq!(
+        pushed,
+        vec![
+            vec![Some("0".into())],
+            vec![Some("1".into())],
+            vec![Some("2".into())]
+        ]
+    );
+    assert_eq!(
+        pushed, above_scan,
+        "the pushed path answers what the arrow syntax does"
+    );
+}
+
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]

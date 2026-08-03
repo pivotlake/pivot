@@ -186,6 +186,12 @@ impl BoundTable for TableBinding {
         }
     }
 
+    /// Each row group resolves a pushed path against its own shredding layout,
+    /// so the scan reads only the leaves the path needs.
+    fn applies_variant_extracts(&self) -> bool {
+        true
+    }
+
     fn compile_scan(
         &self,
         dispatcher: &DataFlowDispatcher,
