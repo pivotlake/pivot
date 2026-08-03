@@ -179,10 +179,12 @@ fn resolve_fields(fields: &BTreeMap<String, Candidate>, min_count: usize) -> Opt
 
 /// The `typed_value` type to shred `array` into, or `None` when no path is worth
 /// it (the column then stays unshredded, which is a legal variant column).
-pub(super) fn infer_shredding_type(array: &VariantArray) -> Option<DataType> {
+pub(super) fn infer_shredding_type(arrays: &[VariantArray]) -> Option<DataType> {
     let mut root = Candidate::default();
     let mut sampled = 0usize;
-    for row in sample_rows(array.len()) {
+    let rows: usize = arrays.iter().map(|array| array.len()).sum();
+    for row in sample_rows(rows) {
+        let (array, row) = locate(arrays, row);
         if array.is_null(row) {
             continue;
         }
@@ -206,6 +208,20 @@ pub(super) fn infer_shredding_type(array: &VariantArray) -> Option<DataType> {
 fn sample_rows(rows: usize) -> impl Iterator<Item = usize> {
     let stride = rows.div_ceil(SAMPLE_ROWS).max(1);
     (0..rows).step_by(stride)
+}
+
+/// The array holding row `row` of the file, and that row's index within it. A
+/// file arrives as its row groups, and the sample spans the file, so a sampled
+/// row has to be placed back in the group it came from.
+fn locate(arrays: &[VariantArray], row: usize) -> (&VariantArray, usize) {
+    let mut row = row;
+    for array in arrays {
+        if row < array.len() {
+            return (array, row);
+        }
+        row -= array.len();
+    }
+    unreachable!("a sampled row is one of the file's rows")
 }
 
 #[cfg(test)]
@@ -242,7 +258,7 @@ mod tests {
             r#"{"id": 3, "name": "c"}"#,
         ]);
 
-        let inferred = infer_shredding_type(&array).unwrap();
+        let inferred = infer_shredding_type(std::slice::from_ref(&array)).unwrap();
 
         assert_eq!(
             shredded_fields(&inferred),
@@ -262,7 +278,7 @@ mod tests {
         rows.resize(100, r#"{"id": 1}"#.to_string());
         let array = variants(&rows.iter().map(String::as_str).collect::<Vec<_>>());
 
-        let inferred = infer_shredding_type(&array).unwrap();
+        let inferred = infer_shredding_type(std::slice::from_ref(&array)).unwrap();
 
         assert_eq!(
             shredded_fields(&inferred),
@@ -278,7 +294,7 @@ mod tests {
         rows.resize(100, r#"{"id": 1}"#.to_string());
         let array = variants(&rows.iter().map(String::as_str).collect::<Vec<_>>());
 
-        let inferred = infer_shredding_type(&array).unwrap();
+        let inferred = infer_shredding_type(std::slice::from_ref(&array)).unwrap();
 
         assert_eq!(
             shredded_fields(&inferred),
@@ -294,7 +310,7 @@ mod tests {
     fn unifies_integer_widths_into_one_leaf() {
         let array = variants(&[r#"{"n": 1}"#, r#"{"n": 40000000000}"#, r#"{"n": 3}"#]);
 
-        let inferred = infer_shredding_type(&array).unwrap();
+        let inferred = infer_shredding_type(std::slice::from_ref(&array)).unwrap();
 
         assert_eq!(
             shredded_fields(&inferred),
@@ -313,7 +329,7 @@ mod tests {
             r#"{"v": 4}"#,
         ]);
 
-        let inferred = infer_shredding_type(&array).unwrap();
+        let inferred = infer_shredding_type(std::slice::from_ref(&array)).unwrap();
 
         assert_eq!(
             shredded_fields(&inferred),
@@ -328,7 +344,7 @@ mod tests {
     fn a_field_that_is_mostly_an_object_shreds_as_one() {
         let array = variants(&[r#"{"a": {"b": 1}}"#, r#"{"a": {"b": 2}}"#, r#"{"a": 3}"#]);
 
-        let inferred = infer_shredding_type(&array).unwrap();
+        let inferred = infer_shredding_type(std::slice::from_ref(&array)).unwrap();
 
         let nested = DataType::Struct(Fields::from(vec![Field::new("b", DataType::Int64, true)]));
         assert_eq!(shredded_fields(&inferred), vec![("a".to_string(), nested)]);
@@ -340,7 +356,7 @@ mod tests {
     fn a_field_that_is_mostly_a_scalar_shreds_as_one() {
         let array = variants(&[r#"{"a": 1}"#, r#"{"a": 2}"#, r#"{"a": {"b": 3}}"#]);
 
-        let inferred = infer_shredding_type(&array).unwrap();
+        let inferred = infer_shredding_type(std::slice::from_ref(&array)).unwrap();
 
         assert_eq!(
             shredded_fields(&inferred),
@@ -374,7 +390,7 @@ mod tests {
         });
         let array = variants(&[&deep, &deep]);
 
-        let inferred = infer_shredding_type(&array).unwrap();
+        let inferred = infer_shredding_type(std::slice::from_ref(&array)).unwrap();
 
         assert_eq!(max_path_depth(&inferred), MAX_DEPTH);
         assert!(2 * max_path_depth(&inferred) + 2 < 128);
@@ -385,7 +401,7 @@ mod tests {
     fn shreds_a_nested_path() {
         let array = variants(&[r#"{"user": {"id": 1}}"#, r#"{"user": {"id": 2}}"#]);
 
-        let inferred = infer_shredding_type(&array).unwrap();
+        let inferred = infer_shredding_type(std::slice::from_ref(&array)).unwrap();
 
         let expected =
             DataType::Struct(Fields::from(vec![Field::new("id", DataType::Int64, true)]));
@@ -401,7 +417,7 @@ mod tests {
     fn infers_nothing_when_no_path_is_worth_it() {
         let array = variants(&[r#"{"ok": true}"#, r#"{"ok": false}"#]);
 
-        assert!(infer_shredding_type(&array).is_none());
+        assert!(infer_shredding_type(std::slice::from_ref(&array)).is_none());
     }
 
     /// Documents that are bare scalars rather than objects have no fields to
@@ -410,7 +426,7 @@ mod tests {
     fn infers_nothing_for_documents_that_are_bare_scalars() {
         let array = variants(&["1", "2", "3"]);
 
-        assert!(infer_shredding_type(&array).is_none());
+        assert!(infer_shredding_type(std::slice::from_ref(&array)).is_none());
     }
 
     /// A key containing a dot is one field, not a nested path — splitting it
@@ -419,7 +435,7 @@ mod tests {
     fn treats_a_dotted_key_as_one_field() {
         let array = variants(&[r#"{"a.b": 1}"#, r#"{"a.b": 2}"#]);
 
-        let inferred = infer_shredding_type(&array).unwrap();
+        let inferred = infer_shredding_type(std::slice::from_ref(&array)).unwrap();
 
         assert_eq!(
             shredded_fields(&inferred),
@@ -438,7 +454,7 @@ mod tests {
         rows.resize(100, r#"{"keep": 2}"#.to_string());
         let array = variants(&rows.iter().map(String::as_str).collect::<Vec<_>>());
 
-        let inferred = infer_shredding_type(&array).unwrap();
+        let inferred = infer_shredding_type(std::slice::from_ref(&array)).unwrap();
 
         assert_eq!(
             shredded_fields(&inferred),
@@ -454,8 +470,8 @@ mod tests {
             r#"{"a": 2, "b": "y", "c": 2.5}"#,
         ];
 
-        let first = infer_shredding_type(&variants(&rows)).unwrap();
-        let second = infer_shredding_type(&variants(&rows)).unwrap();
+        let first = infer_shredding_type(&[variants(&rows)]).unwrap();
+        let second = infer_shredding_type(&[variants(&rows)]).unwrap();
 
         assert_eq!(first, second);
         assert_eq!(

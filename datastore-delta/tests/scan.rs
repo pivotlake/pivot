@@ -967,7 +967,10 @@ fn scan_delta_length_byte_array_column() {
 /// arrow's reader.
 #[test]
 fn scan_a_column_our_writer_delta_encoded() {
-    let dispatch = dispatch(2);
+    // The rows are accumulated into ring-backed row groups before they are
+    // encoded, so the ring has to hold this file's 200k rows (~10 MB of keys and
+    // string bytes) as well as the reads that follow.
+    let dispatch = dispatch_with_buffers(2, 32);
     let keys: Vec<i64> = (0..200_000).map(|i| 5_000_000 + i * 7919).collect();
     let names: Vec<String> = (0..200_000)
         .map(|i| format!("value {i} with enough tail to not inline"))
