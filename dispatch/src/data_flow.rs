@@ -195,10 +195,10 @@ impl OperatorGraph {
     ) -> Result<ControlFlow<T>> {
         let mut stack: Vec<usize> = self.leafs.clone();
         while let Some(idx) = stack.pop() {
-            if let Some(res) = self.operators[idx].run(&mut f)? {
-                if matches!(res, ControlFlow::Break(..)) {
-                    return Ok(res);
-                }
+            if let Some(res) = self.operators[idx].run(&mut f)?
+                && matches!(res, ControlFlow::Break(..))
+            {
+                return Ok(res);
             }
             stack.extend(self.back_edges[idx].iter().copied());
         }
@@ -215,10 +215,10 @@ impl OperatorGraph {
     ) -> Result<ControlFlow<T>> {
         let mut stack: Vec<usize> = self.roots.clone();
         while let Some(idx) = stack.pop() {
-            if let Some(res) = self.operators[idx].run(&mut f)? {
-                if matches!(res, ControlFlow::Break(..)) {
-                    return Ok(res);
-                }
+            if let Some(res) = self.operators[idx].run(&mut f)?
+                && matches!(res, ControlFlow::Break(..))
+            {
+                return Ok(res);
             }
             stack.extend(self.edges[idx].iter().copied());
         }
