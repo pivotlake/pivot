@@ -32,16 +32,18 @@ as the engine grows the features each needs.
 |-------|-------|-------|
 | q01 | Pricing Summary | no join: group by returnflag/linestatus, 8 aggregates |
 | q03 | Shipping Priority | customer/orders/lineitem, top 10 by revenue |
+| q05 | Local Supplier Volume | 6 tables, one join on two keys (suppkey and nationkey), revenue per nation |
 | q06 | Forecasting Revenue | no join: one row from a filtered scan |
 | q08 | National Market Share | 7 joins, `extract(year ...)` groups, share of two sums |
+| q09 | Product Type Profit | 6 tables, partsupp joined on two keys (suppkey and partkey), profit per nation per year |
 | q12 | Shipping Modes | orders/lineitem, CASE priority buckets per shipmode |
 | q13 | Customer Distribution | customer/orders outer join, orders per customer, then a histogram of those counts |
 | q14 | Promotion Effect | lineitem/part, promo share of revenue |
 | q18 | Large Volume Customer | orders semi-joined against the order keys whose quantities sum above 300, then the top 100 by price |
 
-The rest of the 22 need engine features that are not in yet: a join carrying
-two equality conditions (q05, q09), the delim joins DuckDB plans a correlated
-subquery into (q04, q17, q20, q21), CTE scans (q11, q15), mark joins (q16), and
+The rest of the 22 need engine features that are not in yet: the delim joins
+DuckDB plans a correlated subquery into (q04, q17, q20, q21), CTE scans
+(q11, q15), mark joins (q16), and
 the `suffix` / `substring` scalar functions (q02, q16, q22). q07 and q19
 additionally hit a join predicate that ORs columns from both sides, which the
 bridge cannot read.
