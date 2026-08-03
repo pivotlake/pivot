@@ -437,3 +437,40 @@ fn a_semi_join_spanning_batches_emits_each_matched_probe_row_once() {
     ids.sort();
     assert_eq!(ids, probe_ids);
 }
+
+#[test]
+fn join_on_two_key_columns_needs_both_to_match() {
+    let d = dispatch(1);
+    let build = values_input(
+        &d,
+        vec![two_int64_batch(("k0", "k1"), &[1, 1, 2], &[10, 20, 30])],
+    )
+    .record_batches();
+    let probe = values_input(
+        &d,
+        vec![two_int64_batch(("k0", "k1"), &[1, 2, 7], &[20, 30, 30])],
+    )
+    .record_batches();
+
+    let results = probe
+        .join(
+            build,
+            &[DataType::Int64, DataType::Int64],
+            JoinSpec {
+                build_key_columns: vec![0, 1],
+                probe_key_columns: vec![0, 1],
+                output_columns: JoinOutputColumns::keep_all(2, 2),
+                kind: JoinKind::Inner,
+            },
+        )
+        .collect()
+        .unwrap();
+
+    // Only (1, 20) and (2, 30) exist on both sides.
+    let mut pairs: Vec<(i64, i64)> = collect_i64s(&results, 0)
+        .into_iter()
+        .zip(collect_i64s(&results, 1))
+        .collect();
+    pairs.sort();
+    assert_eq!(pairs, vec![(1, 20), (2, 30)]);
+}

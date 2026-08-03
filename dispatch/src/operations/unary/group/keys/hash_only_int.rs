@@ -14,7 +14,7 @@
 //! [`KeyColumnBuilder`] below is never materialised (the group emits per-partition
 //! counts, not keys). It must therefore only be used via `group_by_distinct_count`.
 
-use super::int_pair::IntBits;
+use crate::arrays::IntBits;
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::PersistedKey;

@@ -162,7 +162,9 @@ impl<T: ArrowPrimitiveType> ArrayBuilder for PrimitiveBuilder<T> {
 }
 
 pub mod accumulator;
+mod int_bits;
 pub mod take;
+pub use int_bits::IntBits;
 
 /// Hand a slab's first `byte_len` bytes to Arrow as a zero-copy [`Buffer`].
 /// The slab rides in the buffer's allocation `Arc`, so the memory returns to

@@ -2,13 +2,12 @@ use crate::memory::{SlabAllocator, SlabVec};
 use crate::operations::channels::Sender;
 use crate::operations::unary::join::JoinTable;
 use crate::operations::unary::join::directory::JoinDirectory;
-use crate::operations::unary::join::keys::JoinKey;
+use crate::operations::unary::join::keys::{JoinKey, combined_key_validity};
 use crate::operations::{Consumer, Outputter, unary};
 use crate::waker::worker_waker;
 use ahash::RandomState;
 use arrow::compute::{concat_batches, filter_record_batch};
-use arrow_array::{Array, BooleanArray, RecordBatch};
-use arrow_buffer::NullBuffer;
+use arrow_array::{BooleanArray, RecordBatch};
 use crossbeam_deque::{Injector, Steal};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
@@ -98,19 +97,7 @@ impl<K: JoinKey, const BUILD_OUTER: bool> JoinBuildConsumer<K, BUILD_OUTER> {
 /// build-side outer join keeps its build rows instead (they still reach the
 /// output, unmatched) and skips them when generating tuples.
 pub(crate) fn filter_null_keys(batch: RecordBatch, key_columns: &[usize]) -> RecordBatch {
-    let mut combined_validity: Option<NullBuffer> = None;
-    for &key_column in key_columns {
-        let column = batch.column(key_column);
-        if column.null_count() == 0 {
-            continue;
-        }
-        let nulls = column.nulls().unwrap();
-        combined_validity = Some(match combined_validity {
-            None => nulls.clone(),
-            Some(previous) => NullBuffer::new(previous.inner() & nulls.inner()),
-        });
-    }
-    let Some(combined_validity) = combined_validity else {
+    let Some(combined_validity) = combined_key_validity(&batch, key_columns) else {
         return batch;
     };
     let mask = BooleanArray::new(combined_validity.inner().clone(), None);

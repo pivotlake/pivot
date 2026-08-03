@@ -372,10 +372,18 @@ fn build_join(
             "joins must have at least one equality condition".to_string(),
         ));
     }
-    if key_types.len() > 1 {
-        return Err(OperatorError::Unsupported(
-            "joins on more than one equality condition are not yet supported".to_string(),
-        ));
+    // A single key joins on any type `join_key_ref` admits. More keys take the
+    // dispatch join's packed-lane shapes, compiled so far for pairs of plain
+    // 32/64-bit integers; other multi-key shapes wait on the dynamic fallback.
+    if key_types.len() > 1
+        && !(key_types.len() == 2
+            && key_types
+                .iter()
+                .all(|key_type| matches!(key_type, Type::Int32 | Type::Int64)))
+    {
+        return Err(OperatorError::Unsupported(format!(
+            "unsupported multi-key join shape: {key_types:?}"
+        )));
     }
 
     let probe_types = inputs[0].output_types()?;
