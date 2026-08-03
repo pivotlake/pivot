@@ -3,6 +3,7 @@
 use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use crate::types::Type;
+use arrow_array::Array;
 use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use std::fmt::{self, Display};
@@ -36,12 +37,24 @@ impl Length {
                 let (arr, _) = input.as_datum().get();
                 let strings = arr.as_string_view();
                 // Byte length: each StringView stores its length in the view
-                // header, so `&str::len()` reads it without ever touching the
+                // header, so this reads headers without ever touching the
                 // string payload buffers. That makes this O(rows), not
                 // O(bytes) — no per-byte scan like a Unicode character count
                 // would need.
-                let lengths: Int64Array =
-                    strings.iter().map(|v| v.map(|s| s.len() as i64)).collect();
+                //
+                // The null-free path iterates the raw view slice. The Option
+                // iterator below compiles into an outlined per-element
+                // Map::next call in some profile-guided builds, and this
+                // kernel runs once per row.
+                let lengths: Int64Array = if strings.nulls().is_none() {
+                    let mut lengths = Vec::with_capacity(strings.views().len());
+                    for view in strings.views() {
+                        lengths.push((*view as u32) as i64);
+                    }
+                    Int64Array::from(lengths)
+                } else {
+                    strings.iter().map(|v| v.map(|s| s.len() as i64)).collect()
+                };
                 ExprResult::Array(Arc::new(lengths) as ArrayRef)
             }) as ExprEvalFn
         }))
