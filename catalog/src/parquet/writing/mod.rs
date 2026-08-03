@@ -48,12 +48,12 @@ mod stats;
 mod types;
 
 pub(crate) use shredding::unshred_batch;
-pub use types::{Compression, EncodedFile};
+pub use types::{Compression, CompressionPolicy, EncodedFile};
 
-/// What every page the engine writes is compressed with. Held in one place so a
+/// How every table the engine writes is compressed. Held in one place so a
 /// table's files are uniform however they were produced, by an INSERT or by a
 /// compaction rewriting them.
-pub const DEFAULT_COMPRESSION: Compression = Compression::Snappy;
+pub const DEFAULT_COMPRESSION: CompressionPolicy = CompressionPolicy::Every(Compression::Snappy);
 
 use std::sync::Arc;
 
@@ -76,7 +76,7 @@ pub fn encode_record_batches(
     sort_by: Arc<[String]>,
     target_rows_per_group: usize,
     target_row_groups_per_file: usize,
-    compression: Compression,
+    compression: CompressionPolicy,
 ) -> DataFlowHandle<EncodedFile> {
     encode_record_batches_spec(
         spec,
@@ -98,7 +98,7 @@ pub(crate) fn encode_record_batches_spec(
     sort_by: Arc<[String]>,
     target_rows_per_group: usize,
     target_row_groups_per_file: usize,
-    compression: Compression,
+    compression: CompressionPolicy,
 ) -> OperatorSpec<EncodedFile, impl OperatorFactory<EncodedFile> + 'static> {
     let (dispatcher, heads) = spec.into_parts();
     let workers = heads.len();
@@ -132,7 +132,7 @@ fn encode_stages<OF: OperatorFactory<RecordBatch> + Send + 'static>(
     sort_by: Arc<[String]>,
     target_rows_per_group: usize,
     target_row_groups_per_file: usize,
-    compression: Compression,
+    compression: CompressionPolicy,
 ) -> OperatorSpec<EncodedFile, impl OperatorFactory<EncodedFile> + 'static> {
     // One file's worth of rows; a partition flushes a file once it reaches this.
     let file_rows = target_rows_per_group

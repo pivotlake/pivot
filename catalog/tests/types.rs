@@ -24,7 +24,9 @@ use arrow_array::{
 };
 use arrow_schema::{Field, Schema};
 use catalog::parquet::table_input;
-use catalog::parquet::writing::{Compression, EncodedFile, encode_record_batches};
+use catalog::parquet::writing::{
+    Compression, CompressionPolicy, EncodedFile, encode_record_batches,
+};
 use common::*;
 use dispatch::{Projection, values_input};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -147,14 +149,18 @@ fn as_is<T: ArrowPrimitiveType>(array: PrimitiveArray<T>) -> ArrayRef {
 /// Write `cases` as the columns of one file, through the pipeline a catalog
 /// INSERT uses.
 fn write_cases(dispatch: &DispatchGuard, cases: &[Case]) -> Vec<u8> {
-    write_cases_compressed(dispatch, cases, Compression::Snappy)
+    write_cases_compressed(
+        dispatch,
+        cases,
+        CompressionPolicy::Every(Compression::Snappy),
+    )
 }
 
 /// The same, under a chosen page compression.
 fn write_cases_compressed(
     dispatch: &DispatchGuard,
     cases: &[Case],
-    compression: Compression,
+    compression: CompressionPolicy,
 ) -> Vec<u8> {
     let fields: Vec<Field> = cases
         .iter()
@@ -359,28 +365,63 @@ type_tests! {
     });
 }
 
-/// Every codec the writer offers round trips through both readers. A page's
-/// compression is undone before anything looks at its bytes, so this is about
-/// the codec the footer records and the bytes the writer produced under it,
-/// whatever the values are.
+/// Every codec the writer offers round trips through both readers, over a
+/// numeric column and a text one, which is what the per-column policy splits on.
 #[test]
 fn every_compression_round_trips() {
     let dispatch = dispatch_with_buffers(2, RING_BUFFERS);
-    let spec = primitive::<Int64Type>(PACKED, |row| row as i64 * 7_919_483, as_is);
-    let cases = vec![spec.case("int64", Shape::Distinct, "distinct")];
+    let numbers = primitive::<Int64Type>(PACKED, |row| row as i64 * 7_919_483, as_is);
+    let text = bytes(|rows| Arc::new(StringArray::from(rows)) as ArrayRef);
+    let cases = vec![
+        numbers.case("int64", Shape::Distinct, "distinct"),
+        text.case("utf8", Shape::Distinct, "distinct"),
+    ];
 
-    for compression in [Compression::Snappy, Compression::Lz4Raw, Compression::None] {
-        let bytes = write_cases_compressed(&dispatch, &cases, compression);
+    for policy in [
+        CompressionPolicy::Every(Compression::Snappy),
+        CompressionPolicy::Every(Compression::Lz4Raw),
+        CompressionPolicy::Every(Compression::None),
+        CompressionPolicy::PerColumn,
+    ] {
+        let bytes = write_cases_compressed(&dispatch, &cases, policy);
 
-        assert_column_matches(
-            &cases[0],
-            read_with_pivot(&dispatch, bytes.clone(), 1).column(0),
-            &format!("pivot's reader under {compression:?}"),
-        );
-        assert_column_matches(
-            &cases[0],
-            read_with_arrow(bytes).column(0),
-            &format!("arrow-rs's reader under {compression:?}"),
-        );
+        let pivot = read_with_pivot(&dispatch, bytes.clone(), cases.len());
+        let arrow = read_with_arrow(bytes);
+        for (column, case) in cases.iter().enumerate() {
+            assert_column_matches(
+                case,
+                pivot.column(column),
+                &format!("pivot under {policy:?}"),
+            );
+            assert_column_matches(
+                case,
+                arrow.column(column),
+                &format!("arrow-rs under {policy:?}"),
+            );
+        }
     }
+}
+
+/// The per-column policy leaves packed numbers alone and spends LZ4 on the text
+/// beside them, in one file, which the format allows because a codec is recorded
+/// per column chunk.
+#[test]
+fn the_per_column_policy_gives_each_column_its_own_codec() {
+    let dispatch = dispatch_with_buffers(2, RING_BUFFERS);
+    let numbers = primitive::<Int64Type>(PACKED, |row| row as i64 * 7_919_483, as_is);
+    let text = bytes(|rows| Arc::new(StringArray::from(rows)) as ArrayRef);
+    let cases = vec![
+        numbers.case("int64", Shape::Distinct, "distinct"),
+        text.case("utf8", Shape::Distinct, "distinct"),
+    ];
+
+    let file = write_cases_compressed(&dispatch, &cases, CompressionPolicy::PerColumn);
+
+    let reader = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(file)).unwrap();
+    let row_group = reader.metadata().row_group(0);
+    assert_eq!(
+        row_group.column(0).compression().to_string(),
+        "UNCOMPRESSED"
+    );
+    assert_eq!(row_group.column(1).compression().to_string(), "LZ4_RAW");
 }

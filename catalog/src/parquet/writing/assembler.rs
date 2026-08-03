@@ -37,7 +37,7 @@ use thriftparquet::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 
 use super::error::{WriteError, WriteResult};
 use super::types::{
-    Compression, EncodedColumnChunk, EncodedFile, EncodedLeaf, FileId, RowGroupHeader, RowGroupId,
+    EncodedColumnChunk, EncodedFile, EncodedLeaf, FileId, RowGroupHeader, RowGroupId,
 };
 
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
@@ -173,9 +173,8 @@ fn assemble_row_group(mut chunks: Vec<EncodedColumnChunk>) -> WriteResult<Assemb
     let mut bytes = Vec::new();
     let mut columns = Vec::with_capacity(chunks.len());
     for chunk in chunks {
-        let compression = chunk.header.compression;
         for leaf in chunk.leaves {
-            columns.push(write_leaf_chunk(&mut bytes, leaf, compression)?);
+            columns.push(write_leaf_chunk(&mut bytes, leaf)?);
         }
     }
     Ok(AssembledRowGroup { bytes, columns })
@@ -240,11 +239,7 @@ fn build_file(
 /// Append one leaf's column chunk to `out`: its dictionary page (if any) followed
 /// by its data pages, contiguously. Returns the chunk metadata with offsets
 /// relative to `out` (rebased to the file by [`build_file`]).
-fn write_leaf_chunk(
-    out: &mut Vec<u8>,
-    leaf: EncodedLeaf,
-    compression: Compression,
-) -> WriteResult<ColumnChunk> {
+fn write_leaf_chunk(out: &mut Vec<u8>, leaf: EncodedLeaf) -> WriteResult<ColumnChunk> {
     if leaf.data_pages.is_empty() {
         return Err(WriteError::MissingPages {
             path: leaf.path.join("."),
@@ -284,7 +279,7 @@ fn write_leaf_chunk(
             physical_type: leaf.physical_type,
             encodings,
             path_in_schema: leaf.path,
-            codec: compression.codec(),
+            codec: leaf.compression.codec(),
             num_values,
             total_uncompressed_size: uncompressed,
             total_compressed_size: compressed,
@@ -406,6 +401,7 @@ mod tests {
     use super::*;
     use crate::parquet::ParquetTable;
     use crate::parquet::writing::encoder::encode_column_chunk;
+    use crate::parquet::writing::types::{Compression, CompressionPolicy};
     use crate::parquet::writing::types::{EncodedColumnChunk, PartitionTag};
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Decimal64Type, Int64Type};
@@ -424,7 +420,7 @@ mod tests {
             row_group_id: 0,
             dest_worker: 0,
             schema: schema.clone(),
-            compression: Compression::Snappy,
+            compression: CompressionPolicy::Every(Compression::Snappy),
             tag: Arc::new(PartitionTag {
                 file_id: 0,
                 n_row_groups: 1,
@@ -449,7 +445,7 @@ mod tests {
                     leaves: encode_column_chunk(
                         schema.field(column),
                         batch.column(column),
-                        Compression::Snappy,
+                        CompressionPolicy::Every(Compression::Snappy),
                     )?,
                 })
             })

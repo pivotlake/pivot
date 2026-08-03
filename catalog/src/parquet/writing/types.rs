@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::SortBounds;
 use arrow_array::ArrayRef;
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef};
 use dispatch::{Identifier, WorkerIdOutput};
 use thriftparquet::footer::Statistics;
 use thriftparquet::general::{CompressionCodec, Encoding};
@@ -30,6 +30,36 @@ pub enum Compression {
     /// The raw LZ4 block format, one block per page.
     Lz4Raw,
     None,
+}
+
+/// Which codec each of a file's columns is written with.
+///
+/// A codec is a bet about the bytes it is given, and a file's columns are not
+/// alike: text still holds the repetition a compressor lives on, while a column
+/// of packed differences or dictionary indices has had its repetition encoded
+/// away already and comes out barely smaller for the work.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CompressionPolicy {
+    /// One codec for every column.
+    Every(Compression),
+    /// The codec each column's own bytes call for.
+    PerColumn,
+}
+
+impl CompressionPolicy {
+    /// The codec a leaf of this type takes.
+    pub(crate) fn codec(self, data_type: &DataType) -> Compression {
+        match self {
+            Self::Every(compression) => compression,
+            // A byte array holds the values themselves whichever encoding it
+            // took: a dictionary's distinct values, or the bytes behind packed
+            // lengths. Everything else reaching here is a number.
+            Self::PerColumn => match data_type {
+                DataType::Utf8 | DataType::Utf8View | DataType::BinaryView => Compression::Lz4Raw,
+                _ => Compression::None,
+            },
+        }
+    }
 }
 
 impl Compression {
@@ -105,10 +135,9 @@ pub(crate) struct RowGroupHeader {
     pub(crate) dest_worker: usize,
     pub(crate) schema: SchemaRef,
     pub(crate) tag: Arc<PartitionTag>,
-    /// How this row group's pages are compressed. Held here because both the
-    /// encoder (which compresses) and the assembler (which records the codec)
-    /// need it, and both already share this header.
-    pub(crate) compression: Compression,
+    /// How this row group's columns are compressed. Held here because the
+    /// encoder resolves it per leaf, and this header is what it has.
+    pub(crate) compression: CompressionPolicy,
 }
 
 /// One column's values for one row group, to encode into a column chunk.
@@ -150,6 +179,9 @@ pub(crate) struct EncodedLeaf {
     /// reader knows which decoder to use.
     pub(crate) data_page_encoding: Encoding,
     pub(crate) data_pages: Vec<EncodedPage>,
+    /// The codec this leaf's pages were compressed with, which the footer
+    /// records per column chunk.
+    pub(crate) compression: Compression,
 }
 
 /// A fully-encoded column chunk, routed back to its row group's owner worker for

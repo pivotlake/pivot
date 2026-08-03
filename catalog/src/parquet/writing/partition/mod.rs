@@ -32,7 +32,7 @@ use std::sync::mpsc::{self, Receiver, Sender as StdSender, TryRecvError};
 use super::error::WriteResult;
 use super::shredding;
 use super::stats::column_min_max;
-use super::types::{ColumnChunkJob, Compression, PartitionTag, RowGroupHeader};
+use super::types::{ColumnChunkJob, CompressionPolicy, PartitionTag, RowGroupHeader};
 use crate::{SortBounds, pivot_scalar, scalar_values_from_row};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_ord::partition::partition;
@@ -110,7 +110,7 @@ pub(super) fn factories(
     sort_by: Arc<[String]>,
     file_rows: usize,
     target_rows_per_group: usize,
-    compression: Compression,
+    compression: CompressionPolicy,
     worker_count: usize,
 ) -> Vec<PartitionerFactory> {
     let builder = RowGroupBuilder {
@@ -290,7 +290,7 @@ impl Outputter<ColumnChunkJob> for TailOutputter {
 struct RowGroupBuilder {
     sort_by: Arc<[String]>,
     target_rows_per_group: usize,
-    compression: Compression,
+    compression: CompressionPolicy,
     worker_count: usize,
     next_file_id: Arc<AtomicU64>,
     next_row_group_id: Arc<AtomicU64>,
@@ -397,6 +397,7 @@ impl RowGroupBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parquet::writing::types::Compression;
     use arrow_array::{Datum, Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
 
@@ -409,7 +410,7 @@ mod tests {
             builder: RowGroupBuilder {
                 sort_by: Arc::from([]),
                 target_rows_per_group: usize::MAX,
-                compression: Compression::Snappy,
+                compression: CompressionPolicy::Every(Compression::Snappy),
                 worker_count: 1,
                 next_file_id: Arc::new(AtomicU64::new(0)),
                 next_row_group_id: Arc::new(AtomicU64::new(0)),

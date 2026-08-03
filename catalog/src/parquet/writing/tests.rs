@@ -20,7 +20,7 @@ use parquet_variant_compute::{
 };
 use parquet_variant_json::VariantToJson;
 
-use super::{Compression, EncodedFile, encode_record_batches};
+use super::{Compression, CompressionPolicy, EncodedFile, encode_record_batches};
 
 /// A 64 MiB file-cache ring, as the other in-crate write tests use.
 const RING_BUFFERS: usize = 64 * 1024 * 1024 / BUFFER_SIZE;
@@ -87,7 +87,7 @@ fn write<T: IntoBatch>(items: Vec<T>, rows_per_file: usize) -> Vec<Vec<u8>> {
         Arc::from([]),
         rows_per_file,
         1,
-        Compression::Snappy,
+        CompressionPolicy::Every(Compression::Snappy),
     )
     .collect()
     .unwrap();

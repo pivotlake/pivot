@@ -20,7 +20,7 @@ use uuid::Uuid;
 use crate::catalog::CatalogTable;
 use crate::parquet::RowGroupMetadata;
 use crate::parquet::writing::{
-    Compression, DEFAULT_COMPRESSION, EncodedFile, encode_record_batches_spec, unshred_batch,
+    CompressionPolicy, DEFAULT_COMPRESSION, EncodedFile, encode_record_batches_spec, unshred_batch,
 };
 use crate::store::{DataFileLocation, FileRef, ObjectPath, ObjectStore};
 
@@ -122,7 +122,7 @@ pub(super) fn encode_and_upload_spec(
     sort_by: Arc<[String]>,
     target_rows_per_group: usize,
     target_row_groups_per_file: usize,
-    compression: Compression,
+    compression: CompressionPolicy,
     dispatcher: &DataFlowDispatcher,
 ) -> RecordBatchOperatorSpec {
     let encoded = encode_record_batches_spec(

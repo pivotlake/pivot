@@ -1076,7 +1076,9 @@ fn scan_a_column_our_writer_delta_encoded() {
             Arc::from([]),
             400_000,
             1,
-            catalog::parquet::writing::Compression::Snappy,
+            catalog::parquet::writing::CompressionPolicy::Every(
+                catalog::parquet::writing::Compression::Snappy,
+            ),
         )
         .collect()
         .unwrap();

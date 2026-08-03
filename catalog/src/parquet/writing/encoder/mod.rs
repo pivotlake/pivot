@@ -33,7 +33,7 @@ use thriftparquet::general::Encoding;
 
 use super::error::WriteResult;
 use super::stats;
-use super::types::{ColumnChunkJob, Compression, EncodedColumnChunk, EncodedLeaf};
+use super::types::{ColumnChunkJob, CompressionPolicy, EncodedColumnChunk, EncodedLeaf};
 use leaves::Leaf;
 
 pub(super) type ColumnEncoderFactory = DefaultUnaryFactory<ColumnEncoder>;
@@ -69,7 +69,7 @@ impl Unary<ColumnChunkJob, EncodedColumnChunk> for ColumnEncoder {
 pub(in crate::parquet::writing) fn encode_column_chunk(
     field: &Field,
     values: &ArrayRef,
-    compression: Compression,
+    compression: CompressionPolicy,
 ) -> WriteResult<Vec<EncodedLeaf>> {
     leaves::flatten(field, values)?
         .into_iter()
@@ -87,7 +87,8 @@ pub(in crate::parquet::writing) fn encode_column_chunk(
 /// the width they need, which is most of the size of a key column. Floats, and
 /// decimals too wide to store as an integer, have no delta form and still take
 /// PLAIN.
-fn encode_leaf(leaf: Leaf, compression: Compression) -> WriteResult<EncodedLeaf> {
+fn encode_leaf(leaf: Leaf, policy: CompressionPolicy) -> WriteResult<EncodedLeaf> {
+    let compression = policy.codec(leaf.values.data_type());
     let physical_type = crate::parquet::arrow_to_parquet_physical(leaf.values.data_type())?;
     let statistics = leaf_statistics(&leaf);
     let (dictionary_page, data_page_encoding, data_pages) =
@@ -113,6 +114,7 @@ fn encode_leaf(leaf: Leaf, compression: Compression) -> WriteResult<EncodedLeaf>
         dictionary_page,
         data_page_encoding,
         data_pages,
+        compression,
     })
 }
 
