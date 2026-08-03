@@ -63,6 +63,25 @@ impl Slab {
             std::ptr::write_bytes(self.ptr, 0, self.size);
         }
     }
+
+    /// Bytes this slab holds.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// The slab's region as bytes.
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: the region is `size` bytes of live buffer memory, kept alive
+        // by the `Arc<WriteBuffer>` this slab holds, and no other slab overlaps
+        // it, since the allocator bumps past each one it carves.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.size) }
+    }
+
+    /// The slab's region as mutable bytes. Same reasoning as
+    /// [`as_slice`](Self::as_slice), with `&mut self` for the exclusivity.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.size) }
+    }
 }
 
 #[cfg(test)]

@@ -6,7 +6,7 @@
 //! `row_group_id`, one per schema column), assembles the row group — laying each
 //! chunk's dictionary page (if any) and data pages out contiguously and stamping
 //! sort columns' footer `Statistics` — and once a `file_id` has all its
-//! `n_row_groups`, builds the file and emits it as an [`EncodedFile`] tagged with
+//! `n_row_groups`, builds the file and emits it as an [`AssembledFile`] tagged with
 //! the partition tuple and `sort_bounds` to record in the manifest. Nothing
 //! crosses workers and there is no finish phase: every file completes in
 //! `consume`. (The upstream [`partition`](super::partition) breaker is what makes
@@ -35,9 +35,11 @@ use thriftparquet::footer::{
 use thriftparquet::general::Encoding;
 use thriftparquet::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 
+use dispatch::memory::{FileBytes, Slab, SlabAllocator};
+
 use super::error::{WriteError, WriteResult};
 use super::types::{
-    EncodedColumnChunk, EncodedFile, EncodedLeaf, FileId, RowGroupHeader, RowGroupId,
+    AssembledFile, EncodedColumnChunk, EncodedLeaf, FileId, RowGroupHeader, RowGroupId,
 };
 
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
@@ -103,11 +105,11 @@ pub(super) struct FileAssembler {
     row_groups_by_file: HashMap<FileId, Gathering<AssembledRowGroup>>,
 }
 
-impl Unary<EncodedColumnChunk, EncodedFile> for FileAssembler {
+impl Unary<EncodedColumnChunk, AssembledFile> for FileAssembler {
     fn consume(
         &mut self,
         chunk: EncodedColumnChunk,
-        sender: &mut dyn Sender<EncodedFile>,
+        sender: &mut dyn Sender<AssembledFile>,
     ) -> UnaryResult<()> {
         // Gather this row group's column chunks (one per schema column).
         let row_group_id = chunk.header.row_group_id;
@@ -128,7 +130,7 @@ impl Unary<EncodedColumnChunk, EncodedFile> for FileAssembler {
             items: chunks,
             ..
         } = self.chunks_by_row_group.remove(&row_group_id).unwrap();
-        let group = assemble_row_group(chunks)?;
+        let group = AssembledRowGroup::new(chunks)?;
 
         // Add it to its file; emit the file once all its row groups are in.
         let file_id = header.tag.file_id;
@@ -148,7 +150,7 @@ impl Unary<EncodedColumnChunk, EncodedFile> for FileAssembler {
             ..
         } = self.row_groups_by_file.remove(&file_id).unwrap();
         let (bytes, metadata) = build_file(&header.schema, groups)?;
-        sender.send(EncodedFile {
+        sender.send(AssembledFile {
             bytes,
             metadata,
             partition: header.tag.partition.clone(),
@@ -158,28 +160,32 @@ impl Unary<EncodedColumnChunk, EncodedFile> for FileAssembler {
     }
 }
 
-/// One fully-encoded row group: its column-chunk bytes plus the chunk metadata,
-/// with offsets relative to the start of `bytes` (rebased by [`build_file`]).
+/// One fully-encoded row group: the runs its pages were encoded into, in the
+/// order they belong in the file, plus the chunk metadata with offsets relative
+/// to the start of the group (rebased by [`build_file`]).
 struct AssembledRowGroup {
-    bytes: Vec<u8>,
+    bytes: FileBytes,
     columns: Vec<ColumnChunk>,
 }
 
-/// Assemble one row group from its column chunks (one per schema column, any
-/// order). Each leaf brings its own footer statistics from the encoder.
-fn assemble_row_group(mut chunks: Vec<EncodedColumnChunk>) -> WriteResult<AssembledRowGroup> {
-    // Footer column chunks must be in schema order; work-stealing delivers them
-    // in any order. Within a column, its leaves are already in footer order.
-    chunks.sort_by_key(|c| c.column);
+impl AssembledRowGroup {
+    /// Assemble one row group from its column chunks (one per schema column, any
+    /// order). Each leaf brings its own footer statistics from the encoder.
+    fn new(mut chunks: Vec<EncodedColumnChunk>) -> WriteResult<Self> {
+        // Footer column chunks must be in schema order; work-stealing delivers
+        // them in any order. Within a column, its leaves are already in footer
+        // order.
+        chunks.sort_by_key(|c| c.column);
 
-    let mut bytes = Vec::new();
-    let mut columns = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        for leaf in chunk.leaves {
-            columns.push(write_leaf_chunk(&mut bytes, leaf)?);
+        let mut bytes = FileBytes::new();
+        let mut columns = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            for leaf in chunk.leaves {
+                columns.push(write_leaf_chunk(&mut bytes, leaf)?);
+            }
         }
+        Ok(Self { bytes, columns })
     }
-    Ok(AssembledRowGroup { bytes, columns })
 }
 
 /// Stitch several assembled row groups into one Parquet file, rebasing each row
@@ -189,15 +195,15 @@ fn assemble_row_group(mut chunks: Vec<EncodedColumnChunk>) -> WriteResult<Assemb
 fn build_file(
     schema: &SchemaRef,
     groups: Vec<AssembledRowGroup>,
-) -> WriteResult<(Vec<u8>, FileMetaData)> {
-    let mut out: Vec<u8> = Vec::new();
-    out.extend_from_slice(PARQUET_MAGIC);
+) -> WriteResult<(FileBytes, FileMetaData)> {
+    let mut out = FileBytes::new();
+    out.push(run_of(PARQUET_MAGIC)?);
 
     let mut row_groups = Vec::with_capacity(groups.len());
     let mut num_rows = 0i64;
     for group in groups {
         let base = out.len() as i64;
-        out.extend_from_slice(&group.bytes);
+        out.append(group.bytes);
 
         // Rebase each column's page offsets to the file, and tally the row
         // group's size and (from any column — all cover the same rows) row count.
@@ -241,7 +247,7 @@ fn build_file(
 /// Append one leaf's column chunk to `out`: its dictionary page (if any) followed
 /// by its data pages, contiguously. Returns the chunk metadata with offsets
 /// relative to `out` (rebased to the file by [`build_file`]).
-fn write_leaf_chunk(out: &mut Vec<u8>, leaf: EncodedLeaf) -> WriteResult<ColumnChunk> {
+fn write_leaf_chunk(out: &mut FileBytes, leaf: EncodedLeaf) -> WriteResult<ColumnChunk> {
     if leaf.data_pages.is_empty() {
         return Err(WriteError::MissingPages {
             path: leaf.path.join("."),
@@ -251,19 +257,19 @@ fn write_leaf_chunk(out: &mut Vec<u8>, leaf: EncodedLeaf) -> WriteResult<ColumnC
     let mut uncompressed = 0i64;
 
     // The dictionary page, if any, precedes the data pages.
-    let dictionary_page_offset = leaf.dictionary_page.as_ref().map(|dict| {
+    let dictionary_page_offset = leaf.dictionary_page.map(|dict| {
         let offset = out.len() as i64;
         uncompressed += (dict.header_len + dict.uncompressed_size) as i64;
-        out.extend_from_slice(&dict.bytes);
+        out.push(dict.bytes);
         offset
     });
 
     let data_page_offset = out.len() as i64;
     let mut num_values = 0i64;
-    for page in &leaf.data_pages {
+    for page in leaf.data_pages {
         num_values += page.num_rows;
         uncompressed += (page.header_len + page.uncompressed_size) as i64;
-        out.extend_from_slice(&page.bytes);
+        out.push(page.bytes);
     }
     let compressed = out.len() as i64 - chunk_start;
 
@@ -388,14 +394,23 @@ fn push_schema_element(field: &FieldRef, elements: &mut Vec<SchemaElement>) -> W
     Ok(())
 }
 
-/// Write the trailing footer: `[FileMetaData][u32 LE footer length][PAR1]`.
-fn write_footer(out: &mut Vec<u8>, file_meta: &FileMetaData) -> WriteResult<()> {
+/// Write the trailing footer: `[FileMetaData][u32 LE footer length][PAR1]`. It
+/// is one more run of the file, small enough to build in one piece.
+fn write_footer(out: &mut FileBytes, file_meta: &FileMetaData) -> WriteResult<()> {
     let mut footer = Vec::new();
     file_meta.write_thrift(&mut ThriftCompactOutputProtocol::new(&mut footer))?;
-    out.extend_from_slice(&footer);
-    out.extend_from_slice(&(footer.len() as u32).to_le_bytes());
-    out.extend_from_slice(PARQUET_MAGIC);
+    footer.extend_from_slice(&(footer.len() as u32).to_le_bytes());
+    footer.extend_from_slice(PARQUET_MAGIC);
+    out.push(run_of(&footer)?);
     Ok(())
+}
+
+/// A run holding a copy of `bytes`, for the small pieces of a file that are not
+/// pages: the leading magic, and the footer.
+fn run_of(bytes: &[u8]) -> WriteResult<Slab> {
+    let mut run = SlabAllocator::new(false).get_slab_of_size(bytes.len(), false);
+    run.as_mut_slice().copy_from_slice(bytes);
+    Ok(run)
 }
 
 #[cfg(test)]
@@ -435,20 +450,43 @@ mod tests {
     /// `assemble_row_group` → `build_file` — and return the bytes (a
     /// single-row-group file, no stats).
     fn encode(batch: &RecordBatch) -> Vec<u8> {
-        let schema = batch.schema();
-        let header = header(&schema);
-        let chunks: Vec<EncodedColumnChunk> = (0..batch.num_columns())
-            .map(|column| {
-                Ok(EncodedColumnChunk {
-                    header: header.clone(),
-                    column,
-                    leaves: encode_column_chunk(schema.field(column), batch.column(column))?,
+        // Pages are written into ring memory, so this needs a memory context of
+        // its own: a thread can hold only one, and a test may also spin up a
+        // Dispatch. The file is copied out before the thread ends, which is
+        // where its slabs are released.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    dispatch::memory::init_test_free_pool(64);
+                    let mut allocator = SlabAllocator::new(false);
+                    let schema = batch.schema();
+                    let header = header(&schema);
+                    let chunks: Vec<EncodedColumnChunk> = (0..batch.num_columns())
+                        .map(|column| {
+                            Ok(EncodedColumnChunk {
+                                header: header.clone(),
+                                column,
+                                leaves: encode_column_chunk(
+                                    schema.field(column),
+                                    batch.column(column),
+                                    &mut allocator,
+                                )?,
+                            })
+                        })
+                        .collect::<WriteResult<_>>()
+                        .unwrap();
+                    let group = AssembledRowGroup::new(chunks).unwrap();
+                    build_file(&schema, vec![group])
+                        .unwrap()
+                        .0
+                        .runs()
+                        .flatten()
+                        .copied()
+                        .collect()
                 })
-            })
-            .collect::<WriteResult<_>>()
-            .unwrap();
-        let group = assemble_row_group(chunks).unwrap();
-        build_file(&schema, vec![group]).unwrap().0
+                .join()
+                .unwrap()
+        })
     }
 
     /// Write `batch` and read it back through arrow-rs's strict reader (our

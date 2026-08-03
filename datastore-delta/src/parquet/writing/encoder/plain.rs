@@ -13,6 +13,8 @@ use arrow_array::{
 use arrow_schema::DataType;
 use thriftparquet::general::Encoding;
 
+use dispatch::memory::SlabAllocator;
+
 use crate::parquet::DecimalWriteStorage;
 
 use super::super::error::{WriteError, WriteResult};
@@ -21,17 +23,24 @@ use super::leaves::Leaf;
 use super::pages::{self, PageKind, PageRange};
 
 /// PLAIN-encode a leaf: cut it into pages and encode each.
-pub(super) fn encode_chunk(leaf: &Leaf) -> WriteResult<Vec<EncodedPage>> {
+pub(super) fn encode_chunk(
+    leaf: &Leaf,
+    allocator: &mut SlabAllocator,
+) -> WriteResult<Vec<EncodedPage>> {
     pages::page_ranges(leaf)?
         .into_iter()
-        .map(|range| encode_data_page(leaf, range))
+        .map(|range| encode_data_page(leaf, range, allocator))
         .collect()
 }
 
 /// Encode one PLAIN data page: the page's rows' definition levels, then its
 /// stored values. A page counts its rows, not its values — the absent rows have
 /// a level but nothing in the value stream.
-fn encode_data_page(leaf: &Leaf, range: PageRange) -> WriteResult<EncodedPage> {
+fn encode_data_page(
+    leaf: &Leaf,
+    range: PageRange,
+    allocator: &mut SlabAllocator,
+) -> WriteResult<EncodedPage> {
     let num_rows = range.rows.len();
     let values = leaf.values.slice(range.values.start, range.values.len());
     let mut encoded = Vec::new();
@@ -46,6 +55,7 @@ fn encode_data_page(leaf: &Leaf, range: PageRange) -> WriteResult<EncodedPage> {
             num_values: num_rows,
             encoding: Encoding::PLAIN,
         },
+        allocator,
     )
 }
 

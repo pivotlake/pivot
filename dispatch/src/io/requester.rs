@@ -102,13 +102,19 @@ impl IORequester {
                 read.block.len(),
                 self.next_id,
             )?,
-            FsRequest::Write(write) => self.backend.submit_write(
-                write.file.as_raw_fd(),
-                0,
-                write.data.as_ptr(),
-                write.data.len(),
-                self.next_id,
-            )?,
+            // One op writes one run of the payload, and the completion path
+            // below submits the next. A run boundary looks exactly like the
+            // short write the kernel can hand back anyway.
+            FsRequest::Write(write) => {
+                let run = write.data.run_at(0);
+                self.backend.submit_write(
+                    write.file.as_raw_fd(),
+                    0,
+                    run.as_ptr(),
+                    run.len(),
+                    self.next_id,
+                )?
+            }
         }
         self.pending_io_requests.insert(self.next_id, (request, 0));
         self.next_id += 1;
@@ -215,19 +221,20 @@ impl IORequester {
                 continue; // HTTP socket op, already routed above
             }
             if let Some((request, done)) = self.pending_io_requests.remove(&ud) {
-                // A write may legitimately complete short (the kernel caps a
-                // single write at ~2 GiB, among other reasons); resubmit the
-                // remainder at the matching file offset until the whole buffer
-                // lands. Zero progress means the file accepts no more bytes,
-                // which is an error, not a retry.
+                // A write covers one run, and may complete shorter still (the
+                // kernel caps a single write at ~2 GiB, among other reasons);
+                // resubmit from where it stopped, at the matching file offset,
+                // until the whole payload lands. Zero progress means the file
+                // accepts no more bytes, which is an error, not a retry.
                 if let FsRequest::Write(write) = &request.request {
                     let done = done + result.max(0) as usize;
                     if result > 0 && done < write.data.len() {
+                        let run = write.data.run_at(done);
                         self.backend.submit_write(
                             write.file.as_raw_fd(),
                             done as u64,
-                            write.data[done..].as_ptr(),
-                            write.data.len() - done,
+                            run.as_ptr(),
+                            run.len(),
                             self.next_id,
                         )?;
                         self.pending_io_requests
@@ -483,7 +490,17 @@ mod tests {
                 .unwrap();
         });
 
-        let data: Arc<[u8]> = Arc::from(&b"parquet upload bytes"[..]);
+        // The payload is ring memory, in two runs, so the upload path is
+        // exercised the way a real file reaches it rather than as one buffer.
+        crate::memory::init_test_free_pool(4);
+        let mut allocator = crate::memory::SlabAllocator::new(false);
+        let mut bytes = crate::memory::FileBytes::new();
+        for part in [&b"parquet upload"[..], &b" bytes"[..]] {
+            let mut run = allocator.get_slab_of_size(part.len(), false);
+            run.as_mut_slice().copy_from_slice(part);
+            bytes.push(run);
+        }
+        let data = Arc::new(bytes);
         let remote = Arc::new(
             RemoteFile::open(
                 Url::parse(&format!("http://{addr}/object.parquet")).unwrap(),
@@ -531,7 +548,8 @@ mod tests {
             _ => panic!("expected an HTTP upload completion"),
         }
         server.join().unwrap();
-        assert_eq!(&*received.lock().unwrap(), &*data);
+        let sent: Vec<u8> = data.runs().flatten().copied().collect();
+        assert_eq!(*received.lock().unwrap(), sent);
         assert_eq!(Arc::strong_count(&data), 1);
     }
 

@@ -149,21 +149,33 @@ mod blocking_engine {
         // The channel closes only when the (static) pool's sender is dropped,
         // i.e. never; this loop runs for the life of the process.
         while let Ok(job) = jobs.recv() {
+            let HttpJob {
+                id,
+                request,
+                client_config,
+                sink,
+            } = job;
             // Every job MUST yield one completion (a worker parks until its read
             // reports back) and this thread must survive to serve the next job, so
             // a panic in the fetch fails just this read rather than stranding the
             // worker or shrinking the pool.
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_fetch(conns, &job.client_config, &job.request)
+                run_fetch(conns, &client_config, &request)
             }))
             .unwrap_or_else(|_| {
                 Err(Error::Io(std::io::Error::other(
                     "http pool thread panicked",
                 )))
             });
+            // Let go of the request before reporting. An upload body is ring
+            // memory, which is released through the owning worker's memory
+            // context, and a pool thread has none. The issuing engine holds the
+            // request until it takes this completion, so dropping here only ever
+            // decrements the refcount.
+            drop(request);
             // The issuing engine may have been dropped mid-flight (its receiver
             // gone); a failed send is then expected and ignored.
-            let _ = job.sink.send((job.id, outcome));
+            let _ = sink.send((id, outcome));
         }
     }
 
@@ -330,7 +342,9 @@ mod blocking_engine {
     fn do_upload(mut conn: Conn, upload: &RemoteUpload) -> Result<Option<Conn>> {
         let request = RemoteRequest::Upload(upload.clone()).request_head();
         conn.write_all(&request)?;
-        conn.write_all(&upload.data)?;
+        for run in upload.data.runs() {
+            conn.write_all(run)?;
+        }
         conn.flush()?;
 
         let mut chunk = [0u8; IO_CHUNK_SIZE];
@@ -671,11 +685,15 @@ mod uring_engine {
                         && let RemoteRequest::Upload(upload) = &self.request
                         && self.upload_pos < upload.data.len()
                     {
-                        let end = (self.upload_pos + IO_CHUNK_SIZE).min(upload.data.len());
+                        // A chunk never crosses a run boundary: take what is
+                        // left of the run at the current position, capped at the
+                        // chunk size.
+                        let run = upload.data.run_at(self.upload_pos);
+                        let chunk = &run[..run.len().min(IO_CHUNK_SIZE)];
                         tls.writer()
-                            .write_all(&upload.data[self.upload_pos..end])
+                            .write_all(chunk)
                             .expect("rustls writer is infallible into its buffer");
-                        self.upload_pos = end;
+                        self.upload_pos += chunk.len();
                     }
                     while tls.wants_write() {
                         tls.write_tls(&mut self.conn.out_buf)
@@ -1186,9 +1204,16 @@ mod uring_engine {
                 {
                     exchange.sending_upload_direct = true;
                     exchange.state = State::Sending;
-                    let l = upload.data.len() - exchange.upload_pos;
-                    let a = upload.data[exchange.upload_pos..].as_ptr() as usize;
-                    (true, a, l, exchange.conn.fd.as_raw_fd())
+                    // One send covers one run; `advance` moves `upload_pos` on by
+                    // what went out and `pump` picks up the next, exactly as it
+                    // does after a short send.
+                    let run = upload.data.run_at(exchange.upload_pos);
+                    (
+                        true,
+                        run.as_ptr() as usize,
+                        run.len(),
+                        exchange.conn.fd.as_raw_fd(),
+                    )
                 } else {
                     exchange.sending_upload_direct = false;
                     exchange.state = State::Receiving;

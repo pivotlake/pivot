@@ -15,6 +15,7 @@
 //! once its body has fully landed.
 
 use crate::io::RemoteFile;
+use crate::memory::FileBytes;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -69,11 +70,12 @@ pub(crate) struct RemoteRead {
 unsafe impl Send for RemoteRead {}
 
 /// A whole-object upload. The body is reference counted so the operator-owned
-/// bytes remain stable while socket SQEs point into them.
+/// bytes remain stable while socket SQEs point into them, and is held as runs so
+/// it can live on the ring; the transport sends one run at a time.
 #[derive(Clone)]
 pub(crate) struct RemoteUpload {
     pub remote: Arc<RemoteFile>,
-    pub data: Arc<[u8]>,
+    pub data: Arc<FileBytes>,
 }
 
 #[derive(Clone)]
