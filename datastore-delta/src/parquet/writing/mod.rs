@@ -89,7 +89,7 @@ mod tests;
 mod type_tests;
 
 /// Chain the encode stages (partition onward) onto a `RecordBatch` dataflow and
-/// run it, yielding finished [`EncodedFile`]s as they complete.
+/// run it, yielding finished [`AssembledFile`]s as they complete.
 fn encode_stages<OF: OperatorFactory<RecordBatch> + Send + 'static>(
     batches: OperatorSpec<RecordBatch, OF>,
     workers: usize,

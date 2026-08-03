@@ -40,7 +40,7 @@
 //! Factories are stored as `Box<dyn OperatorFactory<RecordBatch>>` — an object-safe trait
 //! that wraps the generic [`OperatorFactory<O>`]. This keeps the return type of every
 //! chained method as plain `RecordBatchOperatorSpec`, rather than deeply nested generics.
-//! See [`OperatorFactory`](super::operator_spec::OperatorFactory) and [`operator_spec`](super::operator_spec) for
+//! See [`OperatorFactory`] and [`operator_spec`](super::operator_spec) for
 //! details on why this split exists.
 
 use std::collections::VecDeque;
