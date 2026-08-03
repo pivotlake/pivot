@@ -34,7 +34,7 @@
 //! [`RecordBatchOperatorSpec::collect`] is called. The lifecycle is:
 //!
 //! 1. **Build factories** — Each chained method (`.filter(...)`, `.aggregate(...)`, etc.) wraps
-//!    the previous factories in a new layer of [`UnaryOperatorFactory`], producing
+//!    the previous factories in a new layer of [`UnaryOperatorFactory`](crate::UnaryOperatorFactory), producing
 //!    already one factory per worker.
 //!    The factories are stored as `Box<dyn OperatorFactory<RecordBatch>>`
 //!    to erase the nested generic types.
