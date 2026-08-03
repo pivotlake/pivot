@@ -89,7 +89,7 @@ pub fn create_for_workers<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
         directory: Arc::new(JoinCell::new(JoinDirectory::initial())),
         keys: Arc::new(JoinCell::new(MultiSlabBuffer::<K::Stored>::new(vec![]))),
         rows: Arc::new(JoinCell::new(MultiSlabBuffer::<u32>::new(vec![]))),
-        build_rows: Arc::new(JoinCell::new(None)),
+        build_rows: Arc::new(JoinCell::new(Vec::new())),
         matched: Arc::new(JoinCell::new(MultiSlabBuffer::<u8>::new(vec![]))),
     };
     let injector = Arc::new(Injector::new());

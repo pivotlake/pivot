@@ -6,6 +6,7 @@
 use arrow_array::ArrayRef;
 use arrow_schema::ArrowError;
 
+use super::chunked::PreparedColumn;
 use crate::memory::SlabAllocator;
 
 /// One column of an accumulation: rows are copied in with
@@ -28,6 +29,20 @@ pub(super) trait ColumnAccumulator {
         &mut self,
         source: &ArrayRef,
         selection: SourceSelection<'_>,
+        destination_start: usize,
+        allocator: &mut SlabAllocator,
+    );
+
+    /// Append this column's rows at the encoded `ids` (`chunk << shift | row`)
+    /// of a prepared chunked source, landing at accumulated row
+    /// `destination_start` in id order. `source` is this column's prepared
+    /// form, whose variant matches the accumulator by construction (both were
+    /// built from the column's type).
+    fn append_chunked(
+        &mut self,
+        source: &PreparedColumn,
+        ids: &[u32],
+        shift: u32,
         destination_start: usize,
         allocator: &mut SlabAllocator,
     );

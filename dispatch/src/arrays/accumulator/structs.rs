@@ -15,6 +15,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, StructArray};
 use arrow_schema::{ArrowError, Fields};
 
+use super::chunked::PreparedColumn;
 use super::column::{ColumnAccumulator, SourceSelection};
 use super::validity::ValidityMask;
 use super::{ValueStorage, create_column_accumulator};
@@ -60,6 +61,24 @@ impl ColumnAccumulator for StructColumn {
             .append(source.nulls(), selection, destination_start);
         for (child, values) in self.children.iter_mut().zip(source.columns()) {
             child.append(values, selection, destination_start, allocator);
+        }
+    }
+
+    fn append_chunked(
+        &mut self,
+        source: &PreparedColumn,
+        ids: &[u32],
+        shift: u32,
+        destination_start: usize,
+        allocator: &mut SlabAllocator,
+    ) {
+        let PreparedColumn::Struct { nulls, children } = source else {
+            unreachable!("a struct accumulator receives a struct prepared column");
+        };
+        self.validity
+            .append_by_ids(nulls, ids, shift, destination_start);
+        for (child, values) in self.children.iter_mut().zip(children) {
+            child.append_chunked(values, ids, shift, destination_start, allocator);
         }
     }
 
