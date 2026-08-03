@@ -160,14 +160,31 @@ impl DataFlowBuilder {
     /// Build the full operator graph and convert it into an executable `DataFlow`.
     /// Called on the worker thread.
     pub fn build(self) -> Result<DataFlow> {
-        let graph = catch_unwind(AssertUnwindSafe(|| (self.build)())).map_err(|e| {
-            let msg = e
-                .downcast_ref::<String>()
-                .map(|s| s.as_str())
-                .or_else(|| e.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown panic");
-            Error::PanicOnBuild(msg.to_string())
-        })?;
+        let graph = match catch_unwind(AssertUnwindSafe(|| (self.build)())) {
+            Ok(graph) => graph,
+            Err(e) => {
+                let msg = e
+                    .downcast_ref::<String>()
+                    .map(|s| s.as_str())
+                    .or_else(|| e.downcast_ref::<&str>().copied())
+                    .unwrap_or("unknown panic");
+                // A build failure must fail the whole query the way a runtime
+                // failure does (see `DataFlow::bail_and_cancel`): peers that
+                // built their piece of the graph hold output senders until the
+                // query is cancelled, and the collector blocks until every
+                // sender drops, so swallowing the error here hangs the caller.
+                if self
+                    .err_tx
+                    .send(crate::data_flow::Error::Panic(msg.to_string()))
+                    .is_err()
+                {
+                    tracing::warn!("Unable to send build error...");
+                }
+                self.cancelled.store(true, Ordering::Relaxed);
+                crate::waker::waker_set().notify_all();
+                return Err(Error::PanicOnBuild(msg.to_string()));
+            }
+        };
 
         let data_flow = graph.into_data_flow(
             self.cancelled,
