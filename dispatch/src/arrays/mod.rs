@@ -49,6 +49,48 @@ pub trait ArrayBuilder {
     fn into_array(self, null_buffer: Option<Buffer>) -> ArrayRef;
 }
 
+/// Fills `dst` with copies of `value` through explicit 16-byte stores.
+///
+/// `slice::fill` leaves the store width to the loop vectorizer, and inside the
+/// RLE decode loop it has compiled down to one 8-byte store per iteration,
+/// tripling the instructions per filled element. Splatting the value into one
+/// 16-byte pattern and writing that pattern directly pins the wide lowering.
+/// The last partial pattern falls back to per-element writes.
+#[inline(always)]
+pub fn fill_repeated<T: Copy>(dst: &mut [T], value: T) {
+    const PATTERN_BYTES: usize = 16;
+    let element_bytes = size_of::<T>();
+    let byte_len = dst.len() * element_bytes;
+    // Short fills keep `slice::fill`'s small-size specialization; the splat
+    // below would cost more than it saves on a run of a few elements.
+    if element_bytes == 0 || PATTERN_BYTES % element_bytes != 0 || byte_len < PATTERN_BYTES {
+        dst.fill(value);
+        return;
+    }
+
+    // After monomorphization this count is a constant, so the splat unrolls.
+    let per_pattern = PATTERN_BYTES / element_bytes;
+    let mut pattern = std::mem::MaybeUninit::<u128>::uninit();
+    let pattern_elements = pattern.as_mut_ptr() as *mut T;
+    for i in 0..per_pattern {
+        unsafe { pattern_elements.add(i).write(value) };
+    }
+    let pattern = unsafe { pattern.assume_init() };
+
+    let base = dst.as_mut_ptr() as *mut u8;
+    let mut offset = 0;
+    while offset + PATTERN_BYTES <= byte_len {
+        unsafe { (base.add(offset) as *mut u128).write_unaligned(pattern) };
+        offset += PATTERN_BYTES;
+    }
+    // Any leftover bytes get one overlapping pattern store: the window ending
+    // at the last byte is element-aligned (both byte_len and the pattern width
+    // are multiples of the element size), so it writes whole elements.
+    if offset < byte_len {
+        unsafe { (base.add(byte_len - PATTERN_BYTES) as *mut u128).write_unaligned(pattern) };
+    }
+}
+
 /// A fixed-capacity column of `T` backed by a single [`SlabBuffer`], materialised
 /// zero-copy into an Arrow [`Buffer`].
 ///
@@ -143,7 +185,7 @@ impl<T: ArrowPrimitiveType> ArrayBuilder for PrimitiveBuilder<T> {
 
     #[inline(always)]
     fn push(&mut self, element: &T::Native, amount: usize) {
-        self.col.spare_mut(amount).fill(*element);
+        fill_repeated(self.col.spare_mut(amount), *element);
     }
 
     #[inline]
@@ -232,6 +274,20 @@ impl ValidityBuilder {
 mod tests {
     use super::*;
     use crate::memory::init_test_free_pool;
+
+    #[test]
+    fn fill_repeated_writes_every_slot_including_the_tail() {
+        let mut shorts = vec![0u16; 13];
+        let mut longs = vec![0u64; 3];
+        let mut empty: Vec<u32> = Vec::new();
+
+        fill_repeated(&mut shorts, 0x1234);
+        fill_repeated(&mut longs, 7);
+        fill_repeated(&mut empty, 9);
+
+        assert!(shorts.iter().all(|v| *v == 0x1234));
+        assert!(longs.iter().all(|v| *v == 7));
+    }
 
     /// Append `runs` of (count, present) and read the resulting bitmap back.
     fn validity(runs: &[(usize, bool)]) -> Vec<bool> {
