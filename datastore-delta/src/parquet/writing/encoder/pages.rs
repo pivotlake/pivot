@@ -117,9 +117,16 @@ enum PlainSizes<'a> {
 impl<'a> PlainSizes<'a> {
     fn new(values: &'a ArrayRef) -> WriteResult<Self> {
         Ok(match values.data_type() {
-            // A date is a day count, stored as the INT32 it is annotated as.
-            DataType::Int32 | DataType::Float32 | DataType::Date32 => Self::Fixed(4),
-            DataType::Int64 | DataType::Float64 => Self::Fixed(8),
+            // A date is a day count, stored as the INT32 it is annotated as, and
+            // an unsigned value takes the width of the signed physical type it
+            // stores its bits in (the narrow ones widened to INT32).
+            DataType::Int32
+            | DataType::Float32
+            | DataType::Date32
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32 => Self::Fixed(4),
+            DataType::Int64 | DataType::Float64 | DataType::UInt64 => Self::Fixed(8),
             // A decimal's width follows its precision-chosen storage.
             DataType::Decimal64(precision, _) | DataType::Decimal128(precision, _) => {
                 Self::Fixed(crate::parquet::decimal_write_storage(*precision).byte_width())

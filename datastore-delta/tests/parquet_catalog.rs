@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use arrow_array::{
     ArrayRef, Int32Array, Int64Array, RecordBatch, Scalar, StringArray, StringViewArray,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use dispatch::{DataFlowDispatcher, Dispatch};
@@ -668,6 +669,124 @@ fn insert_rows_are_visible_after_a_refresh() {
         common::collect_strings(&rows, 1),
         vec!["one", "two", "three"]
     );
+}
+
+/// Every unsigned width, each inserted at a value past the signed maximum of
+/// the type Parquet stores it in — the values that only survive the round trip
+/// if the file records the column's true width and signedness.
+#[test]
+fn unsigned_columns_insert_and_read_back() {
+    let data = TempDir::new().unwrap();
+    let columns = vec![
+        Column {
+            name: "a".to_string(),
+            col_type: Type::UInt8,
+        },
+        Column {
+            name: "b".to_string(),
+            col_type: Type::UInt16,
+        },
+        Column {
+            name: "c".to_string(),
+            col_type: Type::UInt32,
+        },
+        Column {
+            name: "d".to_string(),
+            col_type: Type::UInt64,
+        },
+    ];
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, create_request("unsigned", data.path(), columns)).unwrap();
+
+    let inserted = run_sql(
+        &datastore,
+        "INSERT INTO unsigned VALUES (255, 65535, 4294967295, 18446744073709551615)",
+    );
+    assert_eq!(common::extract_count(&inserted), 1);
+    datastore.refresh_from_store().unwrap();
+
+    let rows = run_sql(&datastore, "SELECT a, b, c, d FROM unsigned");
+    let batch = &rows[0];
+    assert_eq!(batch.column(0).as_ref(), &UInt8Array::from(vec![255u8]));
+    assert_eq!(batch.column(1).as_ref(), &UInt16Array::from(vec![65535u16]));
+    assert_eq!(
+        batch.column(2).as_ref(),
+        &UInt32Array::from(vec![4_294_967_295u32])
+    );
+    assert_eq!(
+        batch.column(3).as_ref(),
+        &UInt64Array::from(vec![18_446_744_073_709_551_615u64])
+    );
+}
+
+/// An unsigned column filters on its own ordering: the bounds a row group
+/// records are what a scan prunes by, and comparing them as the signed type the
+/// values are stored in would drop the rows above the signed maximum.
+#[test]
+fn unsigned_column_filters_on_unsigned_ordering() {
+    let data = TempDir::new().unwrap();
+    let columns = vec![Column {
+        name: "big".to_string(),
+        col_type: Type::UInt64,
+    }];
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, create_request("wide", data.path(), columns)).unwrap();
+
+    run_sql(
+        &datastore,
+        "INSERT INTO wide VALUES (1), (9223372036854775808), (18446744073709551615)",
+    );
+    datastore.refresh_from_store().unwrap();
+
+    let rows = run_sql(
+        &datastore,
+        "SELECT big FROM wide WHERE big > 9223372036854775807 ORDER BY big",
+    );
+    assert_eq!(
+        rows[0].column(0).as_ref(),
+        &UInt64Array::from(vec![9_223_372_036_854_775_808u64, u64::MAX])
+    );
+}
+
+/// Partitioning by an unsigned column: the value the log records for each file
+/// has to come back as the type the column declares, since that is what a later
+/// scan compares its partition filters against.
+#[test]
+fn unsigned_partition_column_round_trips() {
+    let data = TempDir::new().unwrap();
+    let (_database, datastore) = empty_datastore();
+    create_table(
+        &datastore,
+        CreateTableRequest {
+            datastore_name: None,
+            name: "parts".to_string(),
+            columns: vec![
+                Column {
+                    name: "bucket".to_string(),
+                    col_type: Type::UInt8,
+                },
+                Column {
+                    name: "id".to_string(),
+                    col_type: Type::Int32,
+                },
+            ],
+            options: HashMap::from([
+                (
+                    "path".to_string(),
+                    data.path().to_string_lossy().into_owned(),
+                ),
+                ("partition_by".to_string(), "bucket".to_string()),
+            ]),
+            if_not_exists: false,
+        },
+    )
+    .unwrap();
+
+    run_sql(&datastore, "INSERT INTO parts VALUES (200, 1), (201, 2)");
+    datastore.refresh_from_store().unwrap();
+
+    let rows = run_sql(&datastore, "SELECT id FROM parts WHERE bucket = 200");
+    assert_eq!(rows[0].column(0).as_ref(), &Int32Array::from(vec![1]));
 }
 
 #[test]

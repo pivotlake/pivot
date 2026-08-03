@@ -11,12 +11,13 @@
 //!   --------------    ----------------   ----------------------  ---------
 //!   Boolean           BOOLEAN            -                       read only
 //!   Int8              INT32              Integer{ 8, signed}     read only
-//!   UInt8             INT32              Integer{ 8, unsigned}   read only
+//!   UInt8             INT32              Integer{ 8, unsigned}   read+write
 //!   Int16             INT32              Integer{16, signed}     read only
-//!   UInt16            INT32              Integer{16, unsigned}   read only
+//!   UInt16            INT32              Integer{16, unsigned}   read+write
 //!   Int32             INT32              -                       read+write
-//!   UInt32            INT32              Integer{32, unsigned}   read only
+//!   UInt32            INT32              Integer{32, unsigned}   read+write
 //!   Int64             INT64              -                       read+write
+//!   UInt64            INT64              Integer{64, unsigned}   read+write
 //!   Float32           FLOAT              -                       read+write
 //!   Float64           DOUBLE             -                       read+write
 //!   Utf8 / Utf8View   BYTE_ARRAY         converted UTF8 / String read+write
@@ -33,9 +34,14 @@
 //! `physical_arrow_type` so a file-derived schema and a declared schema agree.
 //!
 //! The "read only" rows resolve files written elsewhere; pivot's own writer only
-//! emits the column set its encoder supports (Int32/Int64/Date32/Float32/
-//! Float64/strings/binary/decimals), so [`arrow_to_parquet_physical`] errors on
-//! the rest. `catalog/tests/types.rs` round trips every one of them.
+//! emits the column set its encoder supports (Int32/Int64/the unsigned widths/
+//! Date32/Float32/Float64/strings/binary/decimals), so
+//! [`arrow_to_parquet_physical`] errors on the rest. `catalog/tests/types.rs`
+//! round trips every one of them.
+//!
+//! The write path is two halves: [`arrow_to_parquet_physical`] for the physical
+//! type, [`arrow_to_annotation`] for everything the schema element says on top
+//! of it.
 
 use arrow_schema::{DataType, TimeUnit};
 
@@ -120,20 +126,21 @@ impl DecimalWriteStorage {
 
 // Parquet `ConvertedType` ids: the legacy width/temporal annotation, read
 // alongside the modern `LogicalType`.
-const CONVERTED_UTF8: i32 = 0;
-const CONVERTED_UINT_8: i32 = 11;
-const CONVERTED_UINT_16: i32 = 12;
-const CONVERTED_UINT_32: i32 = 13;
-const CONVERTED_INT_8: i32 = 15;
-const CONVERTED_INT_16: i32 = 16;
-const CONVERTED_INT_32: i32 = 17;
+pub(crate) const CONVERTED_UTF8: i32 = 0;
+pub(crate) const CONVERTED_UINT_8: i32 = 11;
+pub(crate) const CONVERTED_UINT_16: i32 = 12;
+pub(crate) const CONVERTED_UINT_32: i32 = 13;
+pub(crate) const CONVERTED_UINT_64: i32 = 14;
+pub(crate) const CONVERTED_INT_8: i32 = 15;
+pub(crate) const CONVERTED_INT_16: i32 = 16;
+pub(crate) const CONVERTED_INT_32: i32 = 17;
 /// Legacy temporal annotations (superseded by `LogicalType::Date`/`Timestamp`).
-const CONVERTED_DATE: i32 = 6;
-const CONVERTED_TIMESTAMP_MILLIS: i32 = 9;
-const CONVERTED_TIMESTAMP_MICROS: i32 = 10;
+pub(crate) const CONVERTED_DATE: i32 = 6;
+pub(crate) const CONVERTED_TIMESTAMP_MILLIS: i32 = 9;
+pub(crate) const CONVERTED_TIMESTAMP_MICROS: i32 = 10;
 /// Legacy decimal annotation (superseded by `LogicalType::Decimal`), read
 /// together with the schema element's own `precision`/`scale` fields.
-const CONVERTED_DECIMAL: i32 = 5;
+pub(crate) const CONVERTED_DECIMAL: i32 = 5;
 
 /// Read path: a Parquet leaf's physical type (plus optional logical/converted
 /// annotations) -> the arrow [`DataType`] the executor decodes it into.
@@ -291,12 +298,94 @@ fn int64_arrow(
 ) -> Result<DataType> {
     match logical_type {
         Some(LogicalType::Timestamp { .. }) => Ok(DataType::Timestamp(TimeUnit::Second, None)),
+        Some(LogicalType::Integer {
+            bit_width,
+            is_signed,
+        }) => match (*bit_width, *is_signed) {
+            (64, true) => Ok(DataType::Int64),
+            (64, false) => Ok(DataType::UInt64),
+            _ => Err(Error::UnsupportedType(format!(
+                "INT64 column with integer width {bit_width} (signed: {is_signed})"
+            ))),
+        },
+        // No (recognized) LogicalType: fall back to the legacy ConvertedType.
         _ => match converted_type {
             Some(CONVERTED_TIMESTAMP_MILLIS | CONVERTED_TIMESTAMP_MICROS) => {
                 Ok(DataType::Timestamp(TimeUnit::Second, None))
             }
+            Some(CONVERTED_UINT_64) => Ok(DataType::UInt64),
             _ => Ok(DataType::Int64),
         },
+    }
+}
+
+/// Everything a leaf's schema element says about its type beyond the physical
+/// type [`arrow_to_parquet_physical`] gives it, which is what
+/// [`parquet_to_arrow`] reads back.
+///
+/// Each annotation is written in both spellings: the modern `LogicalType` and
+/// the legacy `ConvertedType`, so a reader that only knows the older one
+/// resolves the column too.
+#[derive(Debug, Default, PartialEq)]
+pub struct LeafAnnotation {
+    pub logical_type: Option<LogicalType>,
+    pub converted_type: Option<i32>,
+    /// Set only by the fixed-length decimal storage, whose declared length is
+    /// how a reader knows how many bytes a value takes.
+    pub type_length: Option<i32>,
+    pub precision: Option<i32>,
+    pub scale: Option<i32>,
+}
+
+/// Write path: how `data_type` is annotated in its schema element. A type whose
+/// physical type describes it on its own — a signed integer, a float, a binary
+/// leaf — needs no annotation and takes the empty default.
+pub fn arrow_to_annotation(data_type: &DataType) -> LeafAnnotation {
+    match data_type {
+        // A BYTE_ARRAY is binary by default, so text says so.
+        DataType::Utf8 | DataType::Utf8View => LeafAnnotation {
+            converted_type: Some(CONVERTED_UTF8),
+            ..LeafAnnotation::default()
+        },
+        // Without this a date reads back as the plain INT32 day count it is
+        // stored as.
+        DataType::Date32 => LeafAnnotation {
+            logical_type: Some(LogicalType::Date),
+            converted_type: Some(CONVERTED_DATE),
+            ..LeafAnnotation::default()
+        },
+        // A decimal carries its full description: the precision and scale that
+        // place the point, and the fixed length its widest storage declares.
+        DataType::Decimal64(precision, scale) | DataType::Decimal128(precision, scale) => {
+            let (precision, scale) = (*precision as i32, *scale as i32);
+            LeafAnnotation {
+                logical_type: Some(LogicalType::Decimal { scale, precision }),
+                converted_type: Some(CONVERTED_DECIMAL),
+                type_length: decimal_write_storage(precision as u8).type_length(),
+                precision: Some(precision),
+                scale: Some(scale),
+            }
+        }
+        // An unsigned leaf stores its bits in a signed physical type, so this
+        // annotation is the only thing keeping a value past the signed maximum
+        // from reading back negative.
+        DataType::UInt8 => unsigned_annotation(8, CONVERTED_UINT_8),
+        DataType::UInt16 => unsigned_annotation(16, CONVERTED_UINT_16),
+        DataType::UInt32 => unsigned_annotation(32, CONVERTED_UINT_32),
+        DataType::UInt64 => unsigned_annotation(64, CONVERTED_UINT_64),
+        _ => LeafAnnotation::default(),
+    }
+}
+
+/// The INTEGER annotation naming an unsigned leaf's true width.
+fn unsigned_annotation(bit_width: i8, converted_type: i32) -> LeafAnnotation {
+    LeafAnnotation {
+        logical_type: Some(LogicalType::Integer {
+            bit_width,
+            is_signed: false,
+        }),
+        converted_type: Some(converted_type),
+        ..LeafAnnotation::default()
     }
 }
 
@@ -317,6 +406,15 @@ pub fn arrow_to_parquet_physical(data_type: &DataType) -> Result<i32> {
     Ok(match data_type {
         DataType::Int32 => INT32,
         DataType::Int64 => INT64,
+        // Parquet has no unsigned physical type and nothing narrower than
+        // INT32, so an unsigned column stores its bits in the signed physical
+        // type of the same width (zero-extended for the narrow ones) and the
+        // INTEGER annotation ([`arrow_to_unsigned_annotation`], stamped alongside it)
+        // tells a reader to read those bits as unsigned. A `UInt32`/`UInt64`
+        // value above the signed maximum stores as a negative physical value,
+        // which is exactly what the spec prescribes.
+        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 => INT32,
+        DataType::UInt64 => INT64,
         // A date is its day count, stored as the INT32 the DATE annotation
         // (stamped alongside it) tells a reader to interpret.
         DataType::Date32 => INT32,

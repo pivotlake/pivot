@@ -11,7 +11,7 @@ use std::sync::Arc;
 use arrow_arith::aggregate::{max, min};
 use arrow_array::{
     ArrayRef, Date32Array, Decimal64Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
-    Int64Array, StringArray, StringViewArray,
+    Int64Array, StringArray, StringViewArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::DataType;
 
@@ -43,6 +43,14 @@ pub(super) fn column_min_max(array: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
     match array.data_type() {
         DataType::Int32 => numeric!(Int32Array),
         DataType::Int64 => numeric!(Int64Array),
+        // Taking the bounds from the unsigned array is what makes them unsigned
+        // bounds: the same values compared as the signed physical type they are
+        // stored in would order everything past the signed maximum below zero,
+        // and a reader pruning on those bounds would drop live rows.
+        DataType::UInt8 => numeric!(UInt8Array),
+        DataType::UInt16 => numeric!(UInt16Array),
+        DataType::UInt32 => numeric!(UInt32Array),
+        DataType::UInt64 => numeric!(UInt64Array),
         DataType::Date32 => numeric!(Date32Array),
         DataType::Float32 => numeric!(Float32Array),
         DataType::Float64 => numeric!(Float64Array),
@@ -95,6 +103,16 @@ pub(super) fn stat_bytes(value: &ArrayRef) -> Option<Vec<u8>> {
                 .to_vec()
         };
     }
+    // A stat for a value narrower than its physical type is widened the same way
+    // the encoder widens the values themselves, so both sides of the file agree
+    // on the width a reader reads back.
+    macro_rules! widened_le_bytes {
+        ($arr:ty, $physical:ty) => {
+            (value.as_any().downcast_ref::<$arr>()?.value(0) as $physical)
+                .to_le_bytes()
+                .to_vec()
+        };
+    }
     macro_rules! raw_bytes {
         ($arr:ty) => {
             value
@@ -108,6 +126,10 @@ pub(super) fn stat_bytes(value: &ArrayRef) -> Option<Vec<u8>> {
     Some(match value.data_type() {
         DataType::Int32 => le_bytes!(Int32Array),
         DataType::Int64 => le_bytes!(Int64Array),
+        DataType::UInt8 => widened_le_bytes!(UInt8Array, u32),
+        DataType::UInt16 => widened_le_bytes!(UInt16Array, u32),
+        DataType::UInt32 => le_bytes!(UInt32Array),
+        DataType::UInt64 => le_bytes!(UInt64Array),
         DataType::Date32 => le_bytes!(Date32Array),
         DataType::Float32 => le_bytes!(Float32Array),
         DataType::Float64 => le_bytes!(Float64Array),

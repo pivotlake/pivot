@@ -8,7 +8,8 @@
 
 use arrow_array::{
     Array, BinaryViewArray, Date32Array, Decimal64Array, Decimal128Array, Float32Array,
-    Float64Array, Int32Array, Int64Array, StringArray, StringViewArray,
+    Float64Array, Int32Array, Int64Array, StringArray, StringViewArray, UInt8Array, UInt16Array,
+    UInt32Array, UInt64Array,
 };
 use arrow_schema::DataType;
 use thriftparquet::general::Encoding;
@@ -82,6 +83,16 @@ pub(super) fn encode_into(array: &dyn Array, out: &mut Vec<u8>) -> WriteResult<(
             (0..len).for_each(|i| out.extend_from_slice(&a.value(i).to_le_bytes()));
         }};
     }
+    // Values narrower than their Parquet physical type: zero-extended to the
+    // physical width, then little-endian. Unsigned values are widened as
+    // unsigned, so the physical integer holds the same bits the annotation
+    // tells a reader to read back as unsigned.
+    macro_rules! widened {
+        ($arr:ty, $physical:ty) => {{
+            let a = downcast::<$arr>(array)?;
+            (0..len).for_each(|i| out.extend_from_slice(&(a.value(i) as $physical).to_le_bytes()));
+        }};
+    }
     // BYTE_ARRAY values: a 4-byte LE length prefix then the bytes.
     macro_rules! byte_array {
         ($arr:ty, |$value:ident| $bytes:expr) => {{
@@ -97,6 +108,13 @@ pub(super) fn encode_into(array: &dyn Array, out: &mut Vec<u8>) -> WriteResult<(
     match array.data_type() {
         DataType::Int32 => fixed!(Int32Array),
         DataType::Int64 => fixed!(Int64Array),
+        // An unsigned value writes into the signed physical type of its width,
+        // widening the two narrow ones to the INT32 that is Parquet's narrowest
+        // integer.
+        DataType::UInt8 => widened!(UInt8Array, u32),
+        DataType::UInt16 => widened!(UInt16Array, u32),
+        DataType::UInt32 => fixed!(UInt32Array),
+        DataType::UInt64 => fixed!(UInt64Array),
         // A date writes the day count its INT32 storage holds.
         DataType::Date32 => fixed!(Date32Array),
         DataType::Float32 => fixed!(Float32Array),
