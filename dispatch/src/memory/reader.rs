@@ -83,8 +83,28 @@ impl<'a, 'b> MultiBufferReader<'a, 'b> {
 
     /// Read exactly `N` bytes into a fixed-size array, crossing buffer
     /// boundaries if needed.
+    ///
+    /// The in-buffer path must copy a length the compiler can see is the
+    /// constant `N`: byte readers sit inside per-run decode loops, and a
+    /// variable-length copy there compiles to a libc memcpy call per byte
+    /// read. Only the rare buffer-straddling read takes the outlined path.
     #[inline(always)]
     pub fn read_fixed_slice<const N: usize>(&mut self) -> [u8; N] {
+        let cur = self.current_slice();
+        if cur.len() >= N {
+            let mut slice: [u8; N] = [0u8; N];
+            slice.copy_from_slice(&cur[..N]);
+            self.position.offset += N;
+            return slice;
+        }
+        self.read_fixed_slice_straddling()
+    }
+
+    /// The buffer-crossing remainder of [`read_fixed_slice`](Self::read_fixed_slice):
+    /// copy what the current buffer still holds, then finish from the next one.
+    #[cold]
+    #[inline(never)]
+    fn read_fixed_slice_straddling<const N: usize>(&mut self) -> [u8; N] {
         let mut slice: [u8; N] = [0u8; N];
 
         let copy_from_cur = std::cmp::min(self.remaining_in_cur(), N);
