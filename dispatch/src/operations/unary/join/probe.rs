@@ -139,8 +139,14 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, const SE
         let build_source = build_rows.project(&self.output_columns.build)?;
         self.sides = Some(OutputSides {
             output_schema: Arc::new(Schema::new(fields)),
-            probe: BatchAccumulator::new(Arc::new(Schema::new(probe_fields)), &mut self.allocator),
-            build: BatchAccumulator::new(Arc::new(Schema::new(build_fields)), &mut self.allocator),
+            probe: BatchAccumulator::retaining_source_buffers(
+                Arc::new(Schema::new(probe_fields)),
+                &mut self.allocator,
+            ),
+            build: BatchAccumulator::retaining_source_buffers(
+                Arc::new(Schema::new(build_fields)),
+                &mut self.allocator,
+            ),
             build_source,
         });
         Ok(())
@@ -178,11 +184,13 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, const SE
             found += (unsafe { *flags.ptr_at_index(row) } == 0) as usize;
         }
         if found > 0 {
-            sides
-                .build
-                .append(&sides.build_source, &self.build_indices[..found]);
+            sides.build.append_batch_by_indices(
+                &sides.build_source,
+                &self.build_indices[..found],
+                &mut self.allocator,
+            );
         }
-        if sides.build.should_emit() {
+        if sides.build.has_full_batch() {
             sides.emit_unmatched_build_rows(&mut self.allocator, sender)?;
         }
         Ok(false)
@@ -418,14 +426,22 @@ impl<'a, 'b, T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool, 
             build_source,
             ..
         } = &mut *self.sides;
-        probe.append(self.probe_source, &self.probe_indices[..self.matched]);
+        probe.append_batch_by_indices(
+            self.probe_source,
+            &self.probe_indices[..self.matched],
+            self.allocator,
+        );
         // A semi join has no build columns and buffered no build rows: its
         // build side only ever contributes its (empty) column list on emit.
         if !SEMI {
-            build.append(build_source, &self.build_indices[..self.matched]);
+            build.append_batch_by_indices(
+                build_source,
+                &self.build_indices[..self.matched],
+                self.allocator,
+            );
         }
         self.matched = 0;
-        if self.sides.probe.should_emit() {
+        if self.sides.probe.has_full_batch() {
             self.sides.emit(self.allocator, self.sender)?;
         }
         Ok(())
