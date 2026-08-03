@@ -198,14 +198,15 @@ impl BoundTable for TableBinding {
         // refresh already materialized every footer.
         let current = self.resolve_files()?;
 
-        // Dictionary pruning currently supports plain columns only. Shredded
-        // leaves have file-specific positions and still use min/max pruning.
+        // A variant path predicate reaches its shredded typed leaf only in the
+        // files that shred it, so each row group resolves the path itself.
         let eq_predicates: Vec<ScanEqualityPredicate> = self
             .predicates
             .iter()
-            .filter(|p| p.path.is_empty() && matches!(p.compare_type, CompareType::Equal))
+            .filter(|p| matches!(p.compare_type, CompareType::Equal))
             .map(|p| ScanEqualityPredicate {
                 column_idx: p.column_idx,
+                path: p.path.clone(),
                 value: p.value.clone(),
             })
             .collect();

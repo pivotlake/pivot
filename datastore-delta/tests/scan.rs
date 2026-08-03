@@ -1155,3 +1155,185 @@ fn scan_pushed_bare_extract_yields_a_subvariant() {
         &Int64Array::from(vec![Some(30), Some(25)])
     );
 }
+
+/// A shredded variant path that a pushed extract reads as its own typed leaf,
+/// unchanged, can carry a pushed-down equality constant: the scan drops rows
+/// whose dictionary entry differs before the batch leaves the decoder.
+#[test]
+fn scan_pushed_extract_filters_by_an_equality_constant() {
+    use arrow_array::Scalar;
+    use datastore_delta::parquet::{
+        ScanEqualityPredicate, table_input_with_filter_and_eq_predicates,
+    };
+    use dispatch::VariantExtract;
+    use parquet_variant_compute::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
+
+    let dispatch = dispatch(1);
+    let json: ArrayRef = Arc::new(StringArray::from(vec![
+        r#"{"name":"alice"}"#,
+        r#"{"name":"bob"}"#,
+        r#"{"name":"carol"}"#,
+    ]));
+    let shred = ShreddedSchemaBuilder::new()
+        .with_path("name", &DataType::Utf8View)
+        .unwrap()
+        .build();
+    let shredded = shred_variant(&json_to_variant(&json).unwrap(), &shred).unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![shredded.field("doc")])),
+        vec![Arc::new(shredded.into_inner()) as _],
+    )
+    .unwrap();
+    let (_dir, table) = parquet_table(&dispatch, &[batch], true);
+    let projection = Projection::columns_with_extracts(
+        vec![0],
+        vec![Some(VariantExtract {
+            path: vec!["name".to_string()],
+            as_type: Some(DataType::Utf8View),
+        })],
+    );
+    let predicate = ScanEqualityPredicate {
+        column_idx: 0,
+        path: vec!["name".to_string()],
+        value: Scalar::new(Arc::new(StringViewArray::from(vec!["bob"])) as ArrayRef),
+    };
+
+    let results = table_input_with_filter_and_eq_predicates(
+        &dispatch,
+        &table,
+        projection,
+        false,
+        None,
+        None,
+        Arc::new(vec![predicate]),
+    )
+    .collect()
+    .unwrap();
+
+    assert_eq!(results.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    assert_eq!(
+        results[0].column(0).as_string_view(),
+        &StringViewArray::from(vec![Some("bob")])
+    );
+}
+
+/// A path this file does not shred makes the extract rebuild the whole variant,
+/// so the emitted column is no longer the leaf the constant's dictionary
+/// describes. The constant must not be installed there, and every row survives
+/// for the query's own `Filter` to judge.
+#[test]
+fn scan_pushed_extract_ignores_an_equality_constant_it_cannot_apply() {
+    use arrow_array::Scalar;
+    use datastore_delta::parquet::{
+        ScanEqualityPredicate, table_input_with_filter_and_eq_predicates,
+    };
+    use dispatch::VariantExtract;
+    use parquet_variant_compute::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
+
+    let dispatch = dispatch(1);
+    let json: ArrayRef = Arc::new(StringArray::from(vec![
+        r#"{"age":30}"#,
+        r#"{"name":"bob"}"#,
+    ]));
+    let shred = ShreddedSchemaBuilder::new()
+        .with_path("age", &DataType::Int64)
+        .unwrap()
+        .build();
+    let shredded = shred_variant(&json_to_variant(&json).unwrap(), &shred).unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![shredded.field("doc")])),
+        vec![Arc::new(shredded.into_inner()) as _],
+    )
+    .unwrap();
+    let (_dir, table) = parquet_table(&dispatch, &[batch], true);
+    let projection = Projection::columns_with_extracts(
+        vec![0],
+        vec![Some(VariantExtract {
+            path: vec!["name".to_string()],
+            as_type: Some(DataType::Utf8View),
+        })],
+    );
+    let predicate = ScanEqualityPredicate {
+        column_idx: 0,
+        path: vec!["name".to_string()],
+        value: Scalar::new(Arc::new(StringViewArray::from(vec!["bob"])) as ArrayRef),
+    };
+
+    let results = table_input_with_filter_and_eq_predicates(
+        &dispatch,
+        &table,
+        projection,
+        false,
+        None,
+        None,
+        Arc::new(vec![predicate]),
+    )
+    .collect()
+    .unwrap();
+
+    assert_eq!(
+        results[0].column(0).as_string_view(),
+        &StringViewArray::from(vec![None, Some("bob")])
+    );
+}
+
+/// A shredded typed leaf the extract has to cast reaches the batch as the cast
+/// array, not as the leaf. The constant describes the leaf's dictionary views,
+/// so it must not be installed: applying it to the cast column would compare
+/// against views that no longer exist.
+#[test]
+fn scan_pushed_extract_ignores_an_equality_constant_across_a_cast() {
+    use arrow_array::Scalar;
+    use datastore_delta::parquet::{
+        ScanEqualityPredicate, table_input_with_filter_and_eq_predicates,
+    };
+    use dispatch::VariantExtract;
+    use parquet_variant_compute::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
+
+    let dispatch = dispatch(1);
+    let json: ArrayRef = Arc::new(StringArray::from(vec![
+        r#"{"name":"alice"}"#,
+        r#"{"name":"bob"}"#,
+    ]));
+    let shred = ShreddedSchemaBuilder::new()
+        .with_path("name", &DataType::Utf8View)
+        .unwrap()
+        .build();
+    let shredded = shred_variant(&json_to_variant(&json).unwrap(), &shred).unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![shredded.field("doc")])),
+        vec![Arc::new(shredded.into_inner()) as _],
+    )
+    .unwrap();
+    let (_dir, table) = parquet_table(&dispatch, &[batch], true);
+    // The leaf is Utf8View, so emitting Utf8 casts it after decoding.
+    let projection = Projection::columns_with_extracts(
+        vec![0],
+        vec![Some(VariantExtract {
+            path: vec!["name".to_string()],
+            as_type: Some(DataType::Utf8),
+        })],
+    );
+    let predicate = ScanEqualityPredicate {
+        column_idx: 0,
+        path: vec!["name".to_string()],
+        value: Scalar::new(Arc::new(StringViewArray::from(vec!["bob"])) as ArrayRef),
+    };
+
+    let results = table_input_with_filter_and_eq_predicates(
+        &dispatch,
+        &table,
+        projection,
+        false,
+        None,
+        None,
+        Arc::new(vec![predicate]),
+    )
+    .collect()
+    .unwrap();
+
+    assert_eq!(
+        results[0].column(0).as_string::<i32>(),
+        &arrow_array::StringArray::from(vec!["alice", "bob"])
+    );
+}
