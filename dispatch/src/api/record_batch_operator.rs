@@ -677,6 +677,13 @@ impl RecordBatchOperatorSpec {
         match spec.kind {
             JoinKind::Inner => self.join_typed::<K, false, false>(build, spec),
             JoinKind::BuildOuter => self.join_typed::<K, true, false>(build, spec),
+            // With a residual predicate the first key match may not be a real
+            // match, so the semi join runs on the pair-recording instantiation
+            // and drops duplicate probe rows at drain time instead of exiting
+            // the match loop early.
+            JoinKind::ProbeSemi if spec.residual_filters.is_some() => {
+                self.join_typed::<K, false, false>(build, spec)
+            }
             JoinKind::ProbeSemi => self.join_typed::<K, false, true>(build, spec),
         }
     }

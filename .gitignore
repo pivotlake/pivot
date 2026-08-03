@@ -7,3 +7,6 @@ target/
 # Python
 __pycache__/
 *.pyc
+
+# insta snapshot leftovers from failed assertions
+*.pending-snap

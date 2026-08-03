@@ -93,8 +93,8 @@ mod order_by_limit;
 pub use copy_out::CopyOutFactory;
 pub(crate) use join::create_join_factories;
 pub use join::{
-    DynamicRowKey, JoinKey, JoinKind, JoinRecordBatchOperatorFactory, JoinSpec, PackedKey,
-    SingleColumnKey,
+    DynamicRowKey, JoinKey, JoinKind, JoinRecordBatchOperatorFactory, JoinResidual, JoinResidualFn,
+    JoinSpec, PackedKey, SingleColumnKey,
 };
 pub use limit::LimitFactory;
 pub use order_by_limit::{DynamicFilterSlot, OrderBy, OrderByLimitFactory};

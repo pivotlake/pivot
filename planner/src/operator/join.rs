@@ -17,12 +17,15 @@
 //! the probe — because its cost model wants the subquery it came from, being
 //! the smaller side, on the build side.
 
-use crate::compile::Error;
+use crate::compile::{Error, ExprEvalFn};
+use crate::expression::Expression;
 use crate::types::{Type, physical_arrow_type};
+use arrow_array::{Array, BooleanArray, RecordBatch};
 use arrow_schema::Field;
 use dispatch::JoinKind as DispatchJoinKind;
-use dispatch::{JoinSpec, RecordBatchOperatorSpec};
+use dispatch::{JoinResidual, JoinSpec, RecordBatchOperatorSpec};
 use std::fmt;
+use std::sync::Arc;
 
 /// Which rows a join emits.
 #[derive(Debug)]
@@ -65,6 +68,12 @@ pub struct Join {
     /// The type and nullability of each listed build output column, in
     /// `build_output` order.
     pub build_column_types: Vec<(Type, bool)>,
+    /// Conditions of the join that are not left/right equalities (e.g. an OR
+    /// referencing both sides), implicitly ANDed; a key-matched pair they
+    /// reject is not a match. Their column refs are bound against the
+    /// concatenation of both inputs' full outputs (probe columns first), the
+    /// layout the dispatch join evaluates them in.
+    pub residual_filters: Vec<Expression>,
     /// Which rows reach the output.
     pub kind: JoinKind,
 }
@@ -78,9 +87,19 @@ impl fmt::Display for Join {
         };
         write!(
             f,
-            "{kind}(probe_keys: {:?}, build_keys: {:?}, probe_output: {:?}, build_output: {:?})",
+            "{kind}(probe_keys: {:?}, build_keys: {:?}, probe_output: {:?}, build_output: {:?}",
             self.probe_keys, self.build_keys, self.probe_output, self.build_output
-        )
+        )?;
+        if !self.residual_filters.is_empty() {
+            let conditions = self
+                .residual_filters
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(" AND ");
+            write!(f, ", residual: {conditions}")?;
+        }
+        write!(f, ")")
     }
 }
 
@@ -132,8 +151,53 @@ impl Join {
             probe_fields,
             build_fields,
             kind,
+            residual_filters: self.compile_residual_filters()?,
         };
         let key_types: Vec<_> = self.key_types.iter().map(physical_arrow_type).collect();
         Ok(probe.join(build, &key_types, spec))
+    }
+
+    /// Compile the residual conditions into the dispatch join's pair
+    /// predicate: each condition evaluated over the gathered pair batch, the
+    /// verdicts ANDed with SQL null semantics (the dispatch side rejects a
+    /// NULL verdict, like any non-TRUE condition).
+    fn compile_residual_filters(&self) -> Result<Option<JoinResidual>, Error> {
+        if self.residual_filters.is_empty() {
+            return Ok(None);
+        }
+        let factories = Arc::new(
+            self.residual_filters
+                .iter()
+                .map(|condition| condition.compile())
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        Ok(Some(JoinResidual(Arc::new(move || {
+            let mut evals: Vec<ExprEvalFn> = factories.iter().map(|factory| factory()).collect();
+            Box::new(move |pairs: &RecordBatch| {
+                let mut combined: Option<BooleanArray> = None;
+                for eval in &mut evals {
+                    let result = eval(pairs);
+                    let (array, is_scalar) = result.as_datum().get();
+                    let mask = array
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .expect("join residual conditions evaluate to booleans");
+                    // A constant-folded condition comes back as one scalar
+                    // verdict; broadcast it over the pairs.
+                    let mask = if is_scalar {
+                        let verdict = mask.is_valid(0).then(|| mask.value(0));
+                        BooleanArray::from(vec![verdict; pairs.num_rows()])
+                    } else {
+                        mask.clone()
+                    };
+                    combined = Some(match combined {
+                        None => mask,
+                        Some(so_far) => arrow::compute::and_kleene(&so_far, &mask)
+                            .expect("residual verdicts have one row per pair"),
+                    });
+                }
+                combined.expect("a compiled residual has at least one condition")
+            })
+        }))))
     }
 }

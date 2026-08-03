@@ -686,15 +686,17 @@ impl<'plan> ComparisonJoin<'plan> {
         Ok(JoinType::from_u8(ffi::lo_join_type(self.raw)?))
     }
 
-    /// The join's conditions. Each side's expression is bound positionally to
-    /// that child's output (LHS into child 0, RHS into child 1). A condition
-    /// that is not a plain left/right comparison (e.g. an OR referencing both
-    /// sides, which DuckDB stores as a single expression) fails here with the
-    /// accessor's error rather than a typed view.
-    pub fn conditions(self) -> Result<Vec<JoinCondition<'plan>>> {
+    /// The join's conditions, each in one of DuckDB's two forms (see
+    /// [`JoinConditionEntry`]).
+    pub fn conditions(self) -> Result<Vec<JoinConditionEntry<'plan>>> {
         (0..ffi::lo_join_condition_count(self.raw)?)
             .map(|i| {
-                Ok(JoinCondition {
+                if !ffi::lo_join_condition_is_comparison(self.raw, i)? {
+                    return Ok(JoinConditionEntry::Expression(Expr {
+                        raw: ffi::lo_join_condition_expression(self.raw, i)?,
+                    }));
+                }
+                Ok(JoinConditionEntry::Comparison(JoinCondition {
                     left: Expr {
                         raw: ffi::lo_join_condition_left(self.raw, i)?,
                     },
@@ -704,7 +706,7 @@ impl<'plan> ComparisonJoin<'plan> {
                     comparison: ExpressionType::from_u8(ffi::lo_join_condition_comparison(
                         self.raw, i,
                     )?),
-                })
+                }))
             })
             .collect()
     }
@@ -726,7 +728,18 @@ impl<'plan> ComparisonJoin<'plan> {
     }
 }
 
-/// One condition of a comparison join: `left <comparison> right`, each side
+/// One condition of a comparison join, in one of DuckDB's two stored forms.
+pub enum JoinConditionEntry<'plan> {
+    /// `left <comparison> right`, each side bound positionally to the
+    /// corresponding child's output.
+    Comparison(JoinCondition<'plan>),
+    /// A predicate that is not a bare comparison (e.g. an OR referencing both
+    /// sides), bound positionally against the two children's concatenated
+    /// outputs: all LHS columns, then all RHS columns.
+    Expression(Expr<'plan>),
+}
+
+/// A comparison-form join condition: `left <comparison> right`, each side
 /// bound positionally to the corresponding child's output.
 pub struct JoinCondition<'plan> {
     pub left: Expr<'plan>,

@@ -32,11 +32,14 @@ pub use factory::JoinRecordBatchOperatorFactory;
 mod keys;
 pub use keys::{DynamicRowKey, JoinKey, PackedKey, SingleColumnKey};
 mod probe;
+mod residual_filter;
 
 use std::cell::UnsafeCell;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
+use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::Field;
 
 use crate::memory::MultiSlabBuffer;
@@ -81,6 +84,31 @@ pub struct JoinSpec {
     pub build_fields: Vec<Field>,
     /// Which rows reach the output.
     pub kind: JoinKind,
+    /// A predicate over key-matched pairs; a pair it rejects is not a match.
+    /// Evaluated batch-wise on the collected pairs, over every probe input
+    /// column followed by every build input column (the layout the caller
+    /// bound the predicate's column refs against). For a
+    /// [`BuildOuter`](JoinKind::BuildOuter) join a build row whose every pair
+    /// is rejected counts as unmatched; for a
+    /// [`ProbeSemi`](JoinKind::ProbeSemi) join a probe row is emitted only if
+    /// some pair passes.
+    pub residual_filters: Option<JoinResidual>,
+}
+
+/// One evaluation instance of a join's residual predicate: batch of paired
+/// rows in, one keep/reject boolean per pair out (a NULL rejects, matching
+/// SQL's treatment of a non-TRUE condition).
+pub type JoinResidualFn = Box<dyn FnMut(&RecordBatch) -> BooleanArray + Send>;
+
+/// A factory of residual-predicate evaluation instances, one per probe
+/// worker (evaluation is stateful, so workers cannot share one instance).
+#[derive(Clone)]
+pub struct JoinResidual(pub Arc<dyn Fn() -> JoinResidualFn + Send + Sync>);
+
+impl fmt::Debug for JoinResidual {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("JoinResidual")
+    }
 }
 
 /// The cross-worker state of a build-side outer join's unmatched pass.
@@ -258,6 +286,7 @@ mod tests {
             probe_fields,
             build_fields,
             kind,
+            residual_filters: None,
         };
         let (builds, probes, _) =
             factory::create_for_workers::<K, BUILD_OUTER, false>(spec, workers);

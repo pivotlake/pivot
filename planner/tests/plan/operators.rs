@@ -363,23 +363,28 @@ fn join_with_unread_build_side_keeps_it_anyway(mut testing_planner: TestingPlann
 
 // A join predicate that references both sides but is not a bare comparison
 // (an OR of per-side conjunctions) stays on the join as a single-expression
-// condition, which has no left/right/comparison to read. Planning must report
-// an error for it; the C++ exception those accessors throw must not cross the
-// FFI and abort the process.
+// condition and becomes the join's residual, evaluated on key-matched pairs.
+// The per-side OR prefilters below the join are DuckDB's own derivation.
 #[rstest]
-fn join_with_expression_condition_errors_instead_of_aborting(mut testing_planner: TestingPlanner) {
+fn join_with_expression_condition_becomes_the_joins_residual(mut testing_planner: TestingPlanner) {
     add_join_tables(&testing_planner);
 
-    let result = testing_planner.plan(
-        "SELECT count(*) FROM items JOIN orders ON i_order = o_key \
-         AND ((i_qty < 6 AND o_total > 5) OR (i_qty > 6 AND o_total < 25))",
-    );
+    let plan = testing_planner
+        .plan(
+            "SELECT count(*) FROM items JOIN orders ON i_order = o_key \
+             AND ((i_qty < 6 AND o_total > 5) OR (i_qty > 6 AND o_total < 25))",
+        )
+        .unwrap();
 
-    let error = result.expect_err("expression-form join conditions are unsupported");
-    assert!(
-        error.to_string().to_lowercase().contains("join"),
-        "unexpected error: {error}"
-    );
+    assert_snapshot!(plan.to_string(), @"
+    Projection(count_star():Int64)
+      Aggregate(groups: [], exprs: [count_star()])
+        Join(probe_keys: [0], build_keys: [0], probe_output: [0, 1], build_output: [0, 1], residual: ((i_qty:Int64 < 6:Int64 -> Boolean AND o_total:Int64 > 5:Int64 -> Boolean) OR (i_qty:Int64 > 6:Int64 -> Boolean AND o_total:Int64 < 25:Int64 -> Boolean)))
+          Filter((i_qty:Int64 < 6:Int64 -> Boolean OR i_qty:Int64 > 6:Int64 -> Boolean))
+            Input([i_order:Int64, i_qty:Int64])
+          Filter((o_total:Int64 > 5:Int64 -> Boolean OR o_total:Int64 < 25:Int64 -> Boolean))
+            Input([o_key:Int64, o_total:Int64])
+    ");
 }
 
 /// The delivery of every filter in `plan`, in tree order.

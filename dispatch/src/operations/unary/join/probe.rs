@@ -20,6 +20,14 @@
 //! A semi join collects probe rows alone: one per probe row whose arena range
 //! holds its key, found by stopping at the first one that does. Only the probe
 //! accumulator ever fills, since such a join carries no build columns.
+//!
+//! A join with a residual predicate ([`JoinSpec::residual_filters`]) weighs
+//! the collected matches once more in the drain: the matched rows of both
+//! sides are gathered into one combined batch, the predicate evaluated over
+//! it, and the rejected matches discarded before any flagging or output. A
+//! semi join with a residual therefore collects every candidate match like an
+//! inner join (the first key match may be rejected) and instead drops its
+//! duplicate probe rows here.
 
 use crate::RECORD_BATCH_SIZE;
 use crate::arrays::accumulator::BatchAccumulator;
@@ -31,7 +39,8 @@ use crate::operations::unary::join::build::filter_null_keys;
 use crate::operations::unary::join::build_rows::{self, BuildRows};
 use crate::operations::unary::join::directory::{JoinDirectory, prefetch_ptr_l2};
 use crate::operations::unary::join::keys::JoinKey;
-use crate::operations::unary::join::{JoinCell, JoinSpec, JoinTable, UnmatchedScan};
+use crate::operations::unary::join::residual_filter::ResidualFilter;
+use crate::operations::unary::join::{JoinCell, JoinKind, JoinSpec, JoinTable, UnmatchedScan};
 use ahash::RandomState;
 use arrow_array::{RecordBatch, new_null_array};
 use arrow_schema::{Field, Schema, SchemaRef};
@@ -65,10 +74,19 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool>
         spec: Arc<JoinSpec>,
         unmatched: Arc<UnmatchedScan>,
     ) -> Self {
+        // A semi join with a residual runs on the pair-recording instantiation
+        // (see `join_dispatch`): the first key match may fail the predicate,
+        // so the first-match exit this instantiation compiles in would be wrong.
+        debug_assert!(!(SEMI && spec.residual_filters.is_some()));
+        let residual_filters = spec
+            .residual_filters
+            .as_ref()
+            .map(|filters| ResidualFilter::new(filters, matches!(spec.kind, JoinKind::ProbeSemi)));
         let output = ProbeMatchOutputter::new(
             &spec.probe_fields,
             &spec.build_fields,
             table.build_rows.clone(),
+            residual_filters,
         );
         Self {
             table,
@@ -113,11 +131,15 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool>
         let verifier = K::make_verifier(&build_rows.batches, &self.spec.build_key_indices);
         let keys = unsafe { &*self.table.keys.get() };
         let rows = unsafe { &*self.table.rows.get() };
+        if let Some(residual_filters) = &mut self.match_outputter.residual_filters {
+            residual_filters.begin_probe_batch();
+        }
         let probe_window = ProbeWindow::<K, OUTER_JOIN_BUILD_SIDE, SEMI> {
             keys,
             rows,
             reader,
             verifier,
+            probe_batch: batch,
             probe_source,
             output: &mut self.match_outputter,
             sender,
@@ -205,6 +227,9 @@ struct ProbeMatchOutputter {
     probe_indices: Vec<u32>,
     build_indices: Vec<u32>,
     matched: usize,
+    /// The join's residual predicate, applied to the collected pairs at drain
+    /// time, before any pair is flagged or emitted.
+    residual_filters: Option<ResidualFilter>,
 }
 
 impl ProbeMatchOutputter {
@@ -212,6 +237,7 @@ impl ProbeMatchOutputter {
         probe_fields: &[Field],
         build_fields: &[Field],
         build_rows: Arc<JoinCell<BuildRows>>,
+        residual_filters: Option<ResidualFilter>,
     ) -> Self {
         let mut allocator = SlabAllocator::new(false);
         let fields: Vec<Field> = probe_fields.iter().chain(build_fields).cloned().collect();
@@ -230,6 +256,7 @@ impl ProbeMatchOutputter {
             probe_indices: vec![0; RECORD_BATCH_SIZE],
             build_indices: vec![0; RECORD_BATCH_SIZE],
             matched: 0,
+            residual_filters,
         }
     }
 
@@ -316,12 +343,27 @@ impl ProbeMatchOutputter {
     fn drain<const OUTER_JOIN_BUILD_SIDE: bool, const SEMI_PROBE_SIDE: bool>(
         &mut self,
         probe_source: &RecordBatch,
+        probe_batch: &RecordBatch,
         sender: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<()> {
         if self.matched == 0 {
             return Ok(());
         }
         let build_rows = unsafe { &*self.build_rows.get() };
+        // The residual runs first: a pair it rejects is not a match, so it
+        // must neither flag its build row nor reach the output.
+        if let Some(residual_filters) = &mut self.residual_filters {
+            self.matched = residual_filters.filter_combined_batch(
+                probe_batch,
+                &build_rows.batches,
+                &mut self.probe_indices,
+                &mut self.build_indices,
+                self.matched,
+            )?;
+            if self.matched == 0 {
+                return Ok(());
+            }
+        }
         if OUTER_JOIN_BUILD_SIDE {
             // These indices are the verified matches, so flagging them here
             // keeps the match loop itself untouched. Relaxed because the flags
@@ -362,6 +404,9 @@ struct ProbeWindow<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool
     rows: &'a MultiSlabBuffer<u32>,
     reader: K::Reader<'b>,
     verifier: K::Verifier<'a>,
+    /// The full probed batch, which the residual predicate's probe columns
+    /// gather from; `probe_source` is its output projection.
+    probe_batch: &'b RecordBatch,
     probe_source: &'b RecordBatch,
     output: &'a mut ProbeMatchOutputter,
     sender: &'a mut dyn Sender<RecordBatch>,
@@ -372,8 +417,11 @@ impl<'a, 'b, K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI_PROBE_SID
 {
     #[inline(never)]
     fn drain(&mut self) -> unary::Result<()> {
-        self.output
-            .drain::<OUTER_JOIN_BUILD_SIDE, SEMI_PROBE_SIDE>(self.probe_source, self.sender)
+        self.output.drain::<OUTER_JOIN_BUILD_SIDE, SEMI_PROBE_SIDE>(
+            self.probe_source,
+            self.probe_batch,
+            self.sender,
+        )
     }
 
     /// Record what probe row `probe_row` matches among the arena range

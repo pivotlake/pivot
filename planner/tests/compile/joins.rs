@@ -159,6 +159,126 @@ fn join_sides_flip_with_table_sizes(mut testing_planner: TestingPlanner) {
     assert_eq!(rows, vec![serde_json::json!({"n": 2})]);
 }
 
+// An ON predicate referencing both sides that is not a bare comparison rides
+// the join as its residual, evaluated on key-matched pairs; only the pairs it
+// accepts are matches.
+#[rstest]
+fn join_with_or_condition_across_both_sides(mut testing_planner: TestingPlanner) {
+    add_orders_and_items(&testing_planner);
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT i_qty, o_status FROM items JOIN orders ON i_order = o_key \
+         AND ((i_qty < 15 AND o_status = 'open') OR (i_qty > 25 AND o_status = 'closed'))",
+    );
+    rows.sort_by_key(|r| r["i_qty"].as_i64().unwrap());
+
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"i_qty": 10, "o_status": "open"},
+            {"i_qty": 30, "o_status": "closed"},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
+
+// Columns referenced only by the residual are trimmed from the join's
+// declared output; the residual reads them off the inputs at match time, so
+// the trim costs it nothing.
+#[rstest]
+fn join_or_condition_columns_can_be_absent_from_the_select(mut testing_planner: TestingPlanner) {
+    add_orders_and_items(&testing_planner);
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT o_status FROM items JOIN orders ON i_order = o_key \
+         AND (i_qty = 10 OR o_status = 'closed')",
+    );
+    rows.sort_by_key(|r| r["o_status"].as_str().unwrap().to_string());
+
+    assert_eq!(
+        rows,
+        serde_json::json!([{"o_status": "closed"}, {"o_status": "open"}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
+// On an outer join the residual takes part in the match decision: a preserved
+// row all of whose key matches fail the predicate is emitted null-filled, not
+// dropped (which is what a filter above the join would wrongly do). The item
+// table is padded so the small preserved side lands on the build side.
+#[rstest]
+fn left_join_residual_rejecting_every_pair_emits_the_row_null_filled(
+    mut testing_planner: TestingPlanner,
+) {
+    add_orders_and_items(&testing_planner);
+    let mut i_order = vec![1, 1, 2];
+    let mut i_qty = vec![10, 20, 30];
+    i_order.extend(std::iter::repeat_n(9, 1000));
+    i_qty.extend(0..1000);
+    testing_planner.add_table(
+        "many_items",
+        &[
+            ("i_order", Type::Int64, int64_col(i_order)),
+            ("i_qty", Type::Int64, int64_col(i_qty)),
+        ],
+    );
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT o_key, i_qty FROM orders LEFT JOIN many_items ON o_key = i_order \
+         AND (i_qty = 30 OR o_status = 'closed')",
+    );
+    rows.sort_by_key(|r| (r["o_key"].as_i64().unwrap(), r["i_qty"].as_i64()));
+
+    // Order 1's two items both fail the predicate, so it comes out unmatched
+    // like order 3, which had no items at all.
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"o_key": 1},
+            {"o_key": 2, "i_qty": 30},
+            {"o_key": 3},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
+
+// A semi join's residual weighs every candidate pair: the first key match may
+// fail the predicate while a later one passes, and however many pairs pass,
+// the probe row comes out once.
+#[rstest]
+fn semi_join_residual_scans_past_a_failing_pair_and_emits_once(
+    mut testing_planner: TestingPlanner,
+) {
+    add_orders_and_items(&testing_planner);
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT o_key FROM orders SEMI JOIN items ON o_key = i_order \
+         AND (i_qty >= 15 OR o_status = 'closed')",
+    );
+    rows.sort_by_key(|r| r["o_key"].as_i64().unwrap());
+
+    // Order 1's first item (quantity 10) fails the predicate and its second
+    // (quantity 20) passes; order 2 passes through its status; order 3 has no
+    // items.
+    assert_eq!(
+        rows,
+        serde_json::json!([{"o_key": 1}, {"o_key": 2}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
 #[rstest]
 fn non_equality_join_reports_unsupported(mut testing_planner: TestingPlanner) {
     add_orders_and_items(&testing_planner);
