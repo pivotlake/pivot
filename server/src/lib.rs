@@ -24,41 +24,26 @@
 //! # Example
 //!
 //! ```no_run
-//! use std::net::SocketAddr;
 //! use std::sync::Arc;
-//! use std::time::Duration;
 //!
 //! use catalog::PivotCatalog;
 //! use dispatch::Dispatch;
 //! use metastore::Metastore;
 //! use metastore_yaml::YamlMetastore;
-//! use server::Server;
+//! use server::{Config, Server};
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-//! let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+//! let config = Config::open("pivot.yaml")?;
+//! let workers = config.server.workers.unwrap_or_else(dispatch::default_worker_count);
 //! let dispatch = Dispatch::spin_up(workers, 32, None);
-//! let metastore: Arc<dyn Metastore> = Arc::new(YamlMetastore::from_yaml(
-//!     r#"
-//! datastores:
-//!   default:
-//!     kind: delta
-//!     location: /var/lib/pivot/default
-//!     default: true
-//! users:
-//!   pivot:
-//!     auth:
-//!       method: trust
-//! "#,
-//!     "inline",
-//!     Duration::from_secs(30),
-//! )?);
+//! let metastore: Arc<dyn Metastore> =
+//!     Arc::new(YamlMetastore::from_config(config.metastore)?);
 //! let catalog = Arc::new(PivotCatalog::new(
 //!     metastore.open_datastores(dispatch.dispatcher())?,
 //!     metastore.default_datastore_name().to_string(),
 //! )?);
-//! let bind: SocketAddr = "127.0.0.1:5433".parse().unwrap();
 //!
-//! let server = Server::new(bind, dispatch, catalog, metastore);
+//! let server = Server::new(config.server.bind, dispatch, catalog, metastore);
 //! // Returns when ctrl_c fires, or earlier if a dispatch worker dies.
 //! server.serve(Box::pin(async {
 //!     let _ = tokio::signal::ctrl_c().await;
@@ -69,6 +54,7 @@
 
 mod arrow_to_pgwire;
 mod auth;
+pub mod config;
 mod http;
 mod limits;
 #[cfg(feature = "perf")]
@@ -76,5 +62,6 @@ mod perf;
 mod query_handler;
 mod server;
 
+pub use config::Config;
 pub use limits::raise_open_file_limit;
 pub use server::{Error, Server};

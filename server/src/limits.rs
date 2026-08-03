@@ -6,7 +6,7 @@ use tracing::{info, warn};
 /// Raise this process's soft open-file limit to its hard limit.
 ///
 /// The server holds a descriptor per cached disk-cache object plus one io_uring
-/// per worker, so a large `--disk-cache-max-objects` exhausts descriptors before
+/// per worker, so a large `disk_cache.max_objects` exhausts descriptors before
 /// any memory or disk budget binds. Shells hand out a low soft default (1024 on
 /// Ubuntu) while permitting far more, and raising your own soft limit needs no
 /// privileges, so take the headroom at boot rather than expect `ulimit -n`.

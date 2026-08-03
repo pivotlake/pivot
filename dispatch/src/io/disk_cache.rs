@@ -239,7 +239,7 @@ pub struct DiskCache {
 impl DiskCache {
     /// Open the disk cache at `dir` with a resident-byte budget and a max object
     /// count (which bounds open fds - keep it below the process's fd limit). The
-    /// server builds one from its `--disk-cache-*` flags and hands it to
+    /// server builds one from its config file's `disk_cache` section and hands it to
     /// [`Dispatch::spin_up`](crate::Dispatch::spin_up).
     pub fn open(dir: PathBuf, byte_budget: u64, max_objects: usize) -> std::io::Result<Self> {
         std::fs::create_dir_all(&dir)?;

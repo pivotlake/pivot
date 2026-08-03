@@ -38,16 +38,19 @@ use tracing::{error, info, warn};
 pub enum Error {
     #[error(transparent)]
     IO(#[from] io::Error),
-    #[error("failed to read metastore `{path}`: {source}")]
-    ReadMetastore {
+    /// Boxed: the YAML parse error it carries is by far the largest thing in
+    /// this enum, and every `Result<_, Error>` in the crate would pay for it on
+    /// the success path too.
+    #[error(transparent)]
+    Config(#[from] Box<crate::config::Error>),
+    #[error("invalid `metastore` section of `{path}`: {source}")]
+    Metastore {
         path: PathBuf,
-        /// Boxed: the YAML parse error it carries is by far the largest thing
-        /// in this enum, and every `Result<_, Error>` in the crate would pay
-        /// for it on the success path too.
+        /// Boxed for the same reason as [`Config`](Self::Config).
         #[source]
         source: Box<metastore_yaml::Error>,
     },
-    #[error("failed to open datastores from `{path}`: {source}")]
+    #[error("failed to open the datastores configured in `{path}`: {source}")]
     OpenDatastores {
         path: PathBuf,
         #[source]

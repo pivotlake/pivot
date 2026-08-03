@@ -1,7 +1,8 @@
-//! End-to-end blackbox test of a multi-datastore server: a metastore file
-//! defines two local datastores (`default` and `warm`); each is attached to
-//! DuckDB as its own database, so a table created in one is queryable by its
-//! datastore name, and unqualified names resolve against `default`.
+//! End-to-end blackbox test of a multi-datastore server: a config file's
+//! `metastore` section defines two local datastores (`default` and `warm`);
+//! each is attached to DuckDB as its own database, so a table created in one is
+//! queryable by its datastore name, and unqualified names resolve against
+//! `default`.
 
 mod common;
 
@@ -18,6 +19,7 @@ use metastore_yaml::YamlMetastore;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
+use server::Config;
 use tempfile::TempDir;
 
 /// (id BIGINT, name VARCHAR): alice, bob, carol.
@@ -70,25 +72,25 @@ async fn queries_bind_tables_by_datastore_name() {
     write_table(default_dir.path(), "people", &people_batch());
     write_table(warm_dir.path(), "events", &events_batch());
 
-    let meta_dir = TempDir::new().unwrap();
-    let meta_path = meta_dir.path().join("metastore.yaml");
+    let config_dir = TempDir::new().unwrap();
+    let config_path = config_dir.path().join("pivot.yaml");
+    // A short refresh interval: an INSERT commits to the log and the refresh
+    // brings the new rows into the live set, so the test observes them quickly.
     std::fs::write(
-        &meta_path,
+        &config_path,
         format!(
-            "datastores:\n  default:\n    kind: delta\n    location: \"{}\"\n    \
-             default: true\n  warm:\n    kind: delta\n    location: \"{}\"\n",
+            "metastore:\n  refresh_interval: 100ms\n  datastores:\n    default:\n      \
+             kind: delta\n      location: \"{}\"\n      default: true\n    warm:\n      \
+             kind: delta\n      location: \"{}\"\n",
             default_dir.path().display(),
             warm_dir.path().display(),
         ),
     )
     .unwrap();
 
-    let meta_path_str = meta_path.to_str().unwrap().to_string();
     let port = start_server(64, move |dispatch| {
-        // A short refresh interval: an INSERT commits to the log and the refresh
-        // brings the new rows into the live set, so the test observes them quickly.
-        let metastore =
-            YamlMetastore::open(&meta_path_str, std::time::Duration::from_millis(100)).unwrap();
+        let config = Config::open(&config_path).unwrap();
+        let metastore = YamlMetastore::from_config(config.metastore).unwrap();
         let datastores = metastore.open_datastores(dispatch.dispatcher()).unwrap();
         CatalogFixture::new(Arc::new(
             PivotCatalog::new(datastores, DEFAULT_DATASTORE_NAME.to_string()).unwrap(),

@@ -12,4 +12,4 @@ dispatch = { workspace = true }
 
 serde = { workspace = true }
 thiserror = { workspace = true }
-serde_yaml_ng = "0.10"
+serde_yaml_ng = { workspace = true }
