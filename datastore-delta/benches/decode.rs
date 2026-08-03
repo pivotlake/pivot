@@ -21,7 +21,11 @@
 //! `event_time` is `i64` (the timestamp columns).
 //!
 //! Then it scans one column at a time with `table_input(..).collect()`, driving
-//! fetch → snappy-decompress → decode → Arrow materialize.
+//! fetch → snappy-decompress → decode → Arrow materialize. Every scenario is a
+//! whole scan: what a change inside a decoder is worth is what it is worth to
+//! one, which is the number this reports. The delta scenarios are here for the
+//! same reason, at both packed widths, since that is where the decode loop does
+//! the most work per byte read.
 //!
 //! # Running
 //!
@@ -238,132 +242,6 @@ fn write_parquet(dir: &TempDir, rows: usize) {
 // DELTA_BINARY_PACKED page decoding, on its own
 // ---------------------------------------------------------------------------
 
-/// Encode `values` as one `DELTA_BINARY_PACKED` page, the way a writer lays it
-/// out: a header, then blocks of `miniblocks` miniblocks, each holding
-/// `values_per_miniblock` deltas bit-packed at the narrowest width that fits.
-fn encode_delta_page(values: &[i64], values_per_miniblock: usize, miniblocks: usize) -> Vec<u8> {
-    let mut out = Vec::new();
-    let put_uvarint = |out: &mut Vec<u8>, mut v: u64| loop {
-        let byte = (v & 0x7f) as u8;
-        v >>= 7;
-        out.push(if v == 0 { byte } else { byte | 0x80 });
-        if v == 0 {
-            break;
-        }
-    };
-    let zigzag = |v: i64| ((v << 1) ^ (v >> 63)) as u64;
-
-    put_uvarint(&mut out, (values_per_miniblock * miniblocks) as u64);
-    put_uvarint(&mut out, miniblocks as u64);
-    put_uvarint(&mut out, values.len() as u64);
-    put_uvarint(&mut out, zigzag(values[0]));
-
-    let deltas: Vec<i64> = values.windows(2).map(|w| w[1].wrapping_sub(w[0])).collect();
-    for block in deltas.chunks(values_per_miniblock * miniblocks) {
-        let min_delta = *block.iter().min().unwrap();
-        put_uvarint(&mut out, zigzag(min_delta));
-        let widths: Vec<u8> = (0..miniblocks)
-            .map(|i| {
-                let start = (i * values_per_miniblock).min(block.len());
-                let end = (start + values_per_miniblock).min(block.len());
-                block[start..end]
-                    .iter()
-                    .map(|d| 64 - d.wrapping_sub(min_delta).leading_zeros() as u8)
-                    .max()
-                    .unwrap_or(0)
-            })
-            .collect();
-        out.extend_from_slice(&widths);
-        for (i, width) in widths.iter().enumerate() {
-            let start = (i * values_per_miniblock).min(block.len());
-            let end = (start + values_per_miniblock).min(block.len());
-            let mut bits = vec![0u8; values_per_miniblock * *width as usize / 8];
-            for (j, delta) in block[start..end].iter().enumerate() {
-                let packed = delta.wrapping_sub(min_delta) as u64;
-                for bit in 0..*width as usize {
-                    if packed >> bit & 1 == 1 {
-                        let pos = j * *width as usize + bit;
-                        bits[pos / 8] |= 1 << (pos % 8);
-                    }
-                }
-            }
-            out.extend_from_slice(&bits);
-        }
-    }
-    out
-}
-
-/// Decode-only benchmark: no IO, no decompression, no Arrow materialisation
-/// beyond the builder the decoder writes into. Two shapes, because the width
-/// of the packed deltas is what the decode loop's cost tracks: a scattered key
-/// packs at ~25 bits, a clustered one at ~3.
-fn bench_delta_pages(c: &mut Criterion) {
-    const PAGE_VALUES: usize = 1 << 16;
-    let mut rng = Rng::new(7);
-    let scattered: Vec<i64> = (0..PAGE_VALUES)
-        .map(|_| 1 + rng.below(20_000_000) as i64)
-        .collect();
-    let mut running = 0i64;
-    let sorted: Vec<i64> = (0..PAGE_VALUES)
-        .map(|_| {
-            running += 1 + rng.below(7) as i64;
-            running
-        })
-        .collect();
-
-    // A string column of the shape a writer sends down this path: values a
-    // little either side of the twelve bytes a view can inline, so both the
-    // block-referencing and the inlining branch are exercised.
-    let strings: Vec<String> = (0..PAGE_VALUES)
-        .map(|i| {
-            if i.is_multiple_of(4) {
-                format!("s{i}")
-            } else {
-                format!("value number {i:016} with a tail that will not inline")
-            }
-        })
-        .collect();
-
-    dispatch::memory::init_test_free_pool(64);
-    let mut g = c.benchmark_group("delta_page");
-    g.throughput(Throughput::Elements(PAGE_VALUES as u64));
-    for (name, values) in [("scattered", &scattered), ("sorted", &sorted)] {
-        let page = vec![bytes::Bytes::from(encode_delta_page(values, 32, 4))];
-        g.bench_function(name, |b| {
-            let mut allocator = dispatch::memory::SlabAllocator::new(true);
-            b.iter(|| {
-                black_box(
-                    datastore_delta::parquet::decoder_bench_hooks::decode_delta_binary_packed(
-                        &page,
-                        PAGE_VALUES,
-                        &mut allocator,
-                    ),
-                )
-            });
-        });
-    }
-    // The string encoding: delta-packed lengths followed by the bytes.
-    let lengths: Vec<i64> = strings.iter().map(|s| s.len() as i64).collect();
-    let mut page_bytes = encode_delta_page(&lengths, 32, 4);
-    for s in &strings {
-        page_bytes.extend_from_slice(s.as_bytes());
-    }
-    let string_page = vec![bytes::Bytes::from(page_bytes)];
-    g.bench_function("strings", |b| {
-        let mut allocator = dispatch::memory::SlabAllocator::new(true);
-        b.iter(|| {
-            black_box(
-                datastore_delta::parquet::decoder_bench_hooks::decode_delta_length_byte_array(
-                    &string_page,
-                    PAGE_VALUES,
-                    &mut allocator,
-                ),
-            )
-        });
-    });
-    g.finish();
-}
-
 // ---------------------------------------------------------------------------
 // Benchmark
 // ---------------------------------------------------------------------------
@@ -421,7 +299,6 @@ fn main() {
 
     let mut c = Criterion::default().configure_from_args();
     bench_decode(&mut c, &dispatch, &table, rows);
-    bench_delta_pages(&mut c);
     c.final_summary();
 
     dispatch.exit();

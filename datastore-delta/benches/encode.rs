@@ -1,93 +1,495 @@
-//! Microbenchmarks for the Parquet **encode** path: turning a column's values
-//! into a page body.
+//! Benchmarks for the Parquet **write** pipeline: rows in, finished files out.
 //!
-//! The counterpart to `decode.rs`. Writing a file wraps this in a dataflow, a
-//! snappy compression pass and footer assembly, all of which cost more than the
-//! encoding itself, so a change inside an encoder is no more visible from the
-//! outside there than a decoder's is from a scan. These drive one encoder on
-//! its own, through the same `bench-hooks` entry points the decode bench uses.
+//! The mirror of `decode.rs`, which measures the read pipeline the same way.
+//! Each case runs an INSERT, which is the whole thing: rows are split by
+//! partition and accumulated into row groups, each column chunk is flattened
+//! into leaves and dictionary, delta or plain encoded, its pages are
+//! compressed, and the assembler lays the file out and writes the footer.
 //!
-//! The shapes are the ones a key column takes: values scattered over a wide
-//! range, where each difference still needs most of its width, and values that
-//! climb, where they pack into a few bits. Strings carry the byte-array
-//! encoding, whose lengths pack the same way before the values are laid end to
-//! end.
+//! What a change inside an encoder is worth is what it is worth to a write, so
+//! that is what these measure. The shapes that lean on one encoder are named for
+//! it rather than driven on their own.
+//!
+//! The files land on tmpfs, so a write is a memcpy and what is measured is the
+//! pipeline rather than the disk under it.
+//!
+//! The shapes are the ones the write path behaves differently on:
+//!
+//! - `delta_sorted`, a clustered key whose differences pack into a few bits, and
+//!   `delta_scattered`, keys spread over a wide range so every difference needs
+//!   most of its width. Between them they are where `DELTA_BINARY_PACKED` does
+//!   its most and least work per value.
+//! - `dictionary`, a column of few distinct values, which is the other encoding
+//!   an integer column can take.
+//! - `strings`, the byte-view case: values are copied into the blocks a row
+//!   group owns, and their lengths pack as deltas.
+//! - `mixed`, the shape of a fact table (keys, money, dates and text), which is
+//!   what a table load actually looks like.
+//! - `variant`, a column of JSON documents, the one shape that carries a struct
+//!   of leaves through accumulation and picks a shredding layout per file.
+//!
+//! # Running
 //!
 //! ```sh
 //! cargo bench --bench encode
+//! cargo bench --bench encode -- --save-baseline main   # then compare with --baseline main
 //! ```
+//!
+//! Env: `PIVOT_BENCH_ROWS` (default 2M), `PIVOT_BENCH_WORKERS` (default all
+//! cores), `PIVOT_BENCH_BUFFERS` (ring slots of 2 MiB, default 1024). The
+//! variant case builds its documents through a JSON parser, which costs more to
+//! set up than it does to encode, so it takes a fraction of the rows.
 
-use arrow_array::StringViewArray;
-use criterion::{Criterion, Throughput, black_box};
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
 
-const PAGE_VALUES: usize = 1 << 16;
+use arrow_array::builder::StringViewBuilder;
+use arrow_array::{
+    Array, ArrayRef, Date32Array, Decimal64Array, Int64Array, RecordBatch, StringArray, StructArray,
+};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use criterion::{BatchSize, Criterion, Throughput, black_box};
+use parquet_variant_compute::{VariantArray, json_to_variant};
 
-/// A small deterministic generator, so a run is repeatable and the numbers can
-/// be compared across changes.
+use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
+use datastore_delta::DeltaDatastore;
+use dispatch::{Dispatch, RECORD_BATCH_SIZE, values_input};
+use planner::catalog::{Column, CreateTableRequest};
+use planner::types::{Type, physical_arrow_type};
+use tempfile::TempDir;
+
+/// Where the files land. tmpfs, so a write is a memcpy and the numbers are the
+/// pipeline's rather than the disk's.
+const OUTPUT_ROOT: &str = "/dev/shm";
+
+/// The table each case inserts into.
+const TABLE: &str = "written";
+
+const DEFAULT_ROWS: usize = 2_000_000;
+/// Rows the variant case takes, as a fraction of the rest. Its documents are
+/// built by parsing JSON, which dominates setup at the full row count.
+const VARIANT_ROW_SHARE: usize = 8;
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+fn total_rows() -> usize {
+    env_usize("PIVOT_BENCH_ROWS", DEFAULT_ROWS)
+}
+fn worker_count() -> usize {
+    env_usize(
+        "PIVOT_BENCH_WORKERS",
+        core_affinity::get_core_ids().map(|c| c.len()).unwrap_or(1),
+    )
+}
+fn ring_buffers() -> usize {
+    env_usize("PIVOT_BENCH_BUFFERS", 1024)
+}
+
+/// Deterministic splitmix64, so every run encodes the same bytes.
 struct Rng(u64);
-
 impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self
-            .0
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1);
-        self.0 >> 33
+    fn new(seed: u64) -> Self {
+        Rng(seed)
+    }
+    #[inline]
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    #[inline]
+    fn below(&mut self, n: usize) -> usize {
+        (self.next_u64() % n as u64) as usize
     }
 }
 
-fn bench_encode(c: &mut Criterion) {
-    let mut rng = Rng(7);
-    let scattered: Vec<i64> = (0..PAGE_VALUES)
-        .map(|_| 1 + (rng.next() % 20_000_000) as i64)
-        .collect();
-    let mut climbing = 0i64;
-    let sorted: Vec<i64> = (0..PAGE_VALUES)
-        .map(|_| {
-            climbing += 1 + (rng.next() % 7) as i64;
-            climbing
-        })
-        .collect();
-    let strings: Vec<String> = (0..PAGE_VALUES)
+/// Distinct strings that share a short lead and then diverge, with lengths
+/// spread around `avg_len`. Long enough to leave the view and land in a data
+/// block, which is the case the accumulator copies.
+fn string_dict(n_distinct: usize, prefix: &str, avg_len: usize) -> Vec<String> {
+    (0..n_distinct.max(1))
         .map(|i| {
-            if i.is_multiple_of(4) {
-                format!("s{i}")
-            } else {
-                format!("value number {i:016} with a tail that will not inline")
+            let mut value = format!("{prefix}{}", i.wrapping_mul(2_654_435_761) % 100_000_000);
+            let target = (avg_len / 2).max(8) + (i % avg_len.max(1));
+            while value.len() < target {
+                value.push_str("-filler");
             }
+            value.truncate(target.max(8));
+            value
         })
-        .collect();
-    let strings = StringViewArray::from(strings.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        .collect()
+}
 
-    let mut g = c.benchmark_group("delta_encode");
-    g.throughput(Throughput::Elements(PAGE_VALUES as u64));
-    for (name, values) in [("scattered", &scattered), ("sorted", &sorted)] {
-        g.bench_function(name, |b| {
-            let mut out = Vec::new();
-            b.iter(|| {
-                black_box(
-                    datastore_delta::parquet::decoder_bench_hooks::encode_delta_binary_packed(
-                        values, &mut out,
-                    ),
-                )
-            });
+fn keys(rng: &mut Rng, rows: usize, range: i64) -> ArrayRef {
+    Arc::new(Int64Array::from(
+        (0..rows)
+            .map(|_| rng.below(range as usize) as i64)
+            .collect::<Vec<_>>(),
+    ))
+}
+
+/// A key that climbs with small gaps, which is what a delta encoding packs down
+/// to a few bits per value.
+fn sorted_keys(rows: usize, start: i64) -> ArrayRef {
+    let mut value = start;
+    Arc::new(Int64Array::from(
+        (0..rows)
+            .map(|i| {
+                value += 1 + (i % 3) as i64;
+                value
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
+
+fn text(rng: &mut Rng, rows: usize, dict: &[String]) -> ArrayRef {
+    let mut builder = StringViewBuilder::with_capacity(rows);
+    for _ in 0..rows {
+        builder.append_value(&dict[rng.below(dict.len())]);
+    }
+    Arc::new(builder.finish())
+}
+
+fn money(rng: &mut Rng, rows: usize) -> ArrayRef {
+    let values = Decimal64Array::from(
+        (0..rows)
+            .map(|_| rng.below(10_000_000) as i64)
+            .collect::<Vec<_>>(),
+    )
+    .with_precision_and_scale(12, 2)
+    .unwrap();
+    Arc::new(values)
+}
+
+/// Ship dates spread over a few years, which the writer stores as the INT32 day
+/// count behind a DATE annotation.
+fn dates(rng: &mut Rng, rows: usize) -> ArrayRef {
+    Arc::new(Date32Array::from(
+        (0..rows)
+            .map(|_| 19_000 + rng.below(2_000) as i32)
+            .collect::<Vec<_>>(),
+    ))
+}
+
+/// Split `rows` into the batch sizes the pipeline is fed in production, and
+/// build each with `column`.
+fn batches(
+    schema: &SchemaRef,
+    rows: usize,
+    mut column: impl FnMut(usize, usize) -> Vec<ArrayRef>,
+) -> Vec<RecordBatch> {
+    let mut built = Vec::new();
+    let mut done = 0;
+    while done < rows {
+        let n = RECORD_BATCH_SIZE.min(rows - done);
+        built.push(RecordBatch::try_new(schema.clone(), column(done, n)).unwrap());
+        done += n;
+    }
+    built
+}
+
+/// Keys that climb with small gaps, so their differences pack into a few bits
+/// and the packing loop does the most work per byte written.
+fn delta_sorted_batches(rows: usize) -> Vec<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("order_key", DataType::Int64, false),
+        Field::new("line_key", DataType::Int64, false),
+    ]));
+    batches(&schema, rows, |done, n| {
+        vec![
+            sorted_keys(n, done as i64 * 4),
+            sorted_keys(n, done as i64 * 9),
+        ]
+    })
+}
+
+/// Keys spread over a wide range, so every difference needs most of its width
+/// and the same encoder writes its widest miniblocks.
+fn delta_scattered_batches(rows: usize) -> Vec<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("part_key", DataType::Int64, false),
+        Field::new("supplier_key", DataType::Int64, false),
+    ]));
+    let mut rng = Rng::new(1);
+    batches(&schema, rows, |_, n| {
+        vec![keys(&mut rng, n, 20_000_000), keys(&mut rng, n, 10_000_000)]
+    })
+}
+
+/// Few distinct values, which is what makes a column worth a dictionary: the
+/// encoder builds one and the column becomes RLE indices into it.
+fn dictionary_batches(rows: usize) -> Vec<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("quantity", DataType::Int64, false),
+        Field::new("line_number", DataType::Int64, false),
+    ]));
+    let mut rng = Rng::new(2);
+    batches(&schema, rows, |_, n| {
+        vec![keys(&mut rng, n, 50), keys(&mut rng, n, 7)]
+    })
+}
+
+fn string_batches(rows: usize) -> Vec<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("comment", DataType::Utf8View, false),
+        Field::new("status", DataType::Utf8View, false),
+    ]));
+    // A comment is nearly unique and too long to inline; a status is one of a
+    // handful of short values, which is what the dictionary encoder is for.
+    let comments = string_dict((rows / 4).max(1), "a line of commentary ", 44);
+    let statuses = string_dict(8, "STATUS", 10);
+    let mut rng = Rng::new(2);
+    batches(&schema, rows, |_, n| {
+        vec![text(&mut rng, n, &comments), text(&mut rng, n, &statuses)]
+    })
+}
+
+fn mixed_batches(rows: usize) -> Vec<RecordBatch> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("order_key", DataType::Int64, false),
+        Field::new("part_key", DataType::Int64, false),
+        Field::new("price", DataType::Decimal64(12, 2), false),
+        Field::new("ship_date", DataType::Date32, false),
+        Field::new("comment", DataType::Utf8View, false),
+    ]));
+    let comments = string_dict((rows / 4).max(1), "a line of commentary ", 44);
+    let mut rng = Rng::new(3);
+    batches(&schema, rows, |done, n| {
+        vec![
+            sorted_keys(n, done as i64 * 4),
+            keys(&mut rng, n, 20_000_000),
+            money(&mut rng, n),
+            dates(&mut rng, n),
+            text(&mut rng, n, &comments),
+        ]
+    })
+}
+
+/// Documents shaped like an event stream: a few fields every row carries, so
+/// inference finds paths worth shredding, and one that only some rows do.
+fn variant_batches(rows: usize) -> Vec<RecordBatch> {
+    let mut rng = Rng::new(4);
+    let mut built = Vec::new();
+    let mut done = 0;
+    while done < rows {
+        let n = RECORD_BATCH_SIZE.min(rows - done);
+        let documents: Vec<String> = (0..n)
+            .map(|i| {
+                let id = done + i;
+                let session = rng.below(1_000_000);
+                if id % 5 == 0 {
+                    format!(
+                        r#"{{"user":{{"id":{id},"name":"user {id}"}},"session":{session},"retry":{}}}"#,
+                        id % 7
+                    )
+                } else {
+                    format!(r#"{{"user":{{"id":{id},"name":"user {id}"}},"session":{session}}}"#)
+                }
+            })
+            .collect();
+        let json: ArrayRef = Arc::new(StringArray::from(documents));
+        let column = as_declared_variant(json_to_variant(&json).unwrap());
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("attrs", column.data_type().clone(), true)
+                .with_metadata(datastore_delta::parquet::variant_extension_metadata()),
+        ]));
+        built.push(RecordBatch::try_new(schema, vec![column]).unwrap());
+        done += n;
+    }
+    built
+}
+
+/// `variants` as the column type a VARIANT declares. `json_to_variant` marks the
+/// `value` child non-nullable when every document has one, while the declared
+/// column always allows a null there, and an INSERT checks the two agree.
+fn as_declared_variant(variants: VariantArray) -> ArrayRef {
+    let DataType::Struct(declared) = physical_arrow_type(&Type::Variant) else {
+        unreachable!("a variant is declared as a struct")
+    };
+    let array = variants.into_inner();
+    let (_, columns, nulls) = array.into_parts();
+    Arc::new(StructArray::new(declared, columns, nulls))
+}
+
+/// One INSERT of `input`: the write pipeline end to end, ending where the files
+/// land. The transaction is rolled back rather than committed, since the
+/// benchmark measures the writing and not the publishing.
+fn insert(dispatch: &Dispatch, catalog: &PivotCatalog, input: Vec<RecordBatch>) {
+    let transaction = catalog.begin_transaction();
+    let table = transaction
+        .bind_table(DEFAULT_DATASTORE_NAME, TABLE)
+        .expect("the table was created");
+    let rows = values_input(dispatch.dispatcher(), input).record_batches();
+    table
+        .compile_insert(rows, dispatch.dispatcher())
+        .unwrap()
+        .execute()
+        .collect()
+        .unwrap();
+    transaction.rollback();
+}
+
+fn bench_encode(c: &mut Criterion, dispatch: &Dispatch, rows: usize) {
+    let cases: Vec<(&str, usize, Vec<Column>, Vec<RecordBatch>)> = vec![
+        (
+            "delta_sorted",
+            rows,
+            columns(&["order_key", "line_key"], Type::Int64),
+            delta_sorted_batches(rows),
+        ),
+        (
+            "delta_scattered",
+            rows,
+            columns(&["part_key", "supplier_key"], Type::Int64),
+            delta_scattered_batches(rows),
+        ),
+        (
+            "dictionary",
+            rows,
+            columns(&["quantity", "line_number"], Type::Int64),
+            dictionary_batches(rows),
+        ),
+        (
+            "strings",
+            rows,
+            columns(&["comment", "status"], Type::Utf8),
+            string_batches(rows),
+        ),
+        (
+            "mixed",
+            rows,
+            vec![
+                column("order_key", Type::Int64),
+                column("part_key", Type::Int64),
+                column(
+                    "price",
+                    Type::Decimal {
+                        precision: 12,
+                        scale: 2,
+                    },
+                ),
+                column("ship_date", Type::Date),
+                column("comment", Type::Utf8),
+            ],
+            mixed_batches(rows),
+        ),
+        (
+            "variant",
+            rows / VARIANT_ROW_SHARE,
+            columns(&["attrs"], Type::Variant),
+            variant_batches(rows / VARIANT_ROW_SHARE),
+        ),
+    ];
+
+    let mut group = c.benchmark_group("encode");
+    for (name, case_rows, columns, input) in &cases {
+        // Each case writes into its own table on tmpfs, so the measurement is
+        // the pipeline rather than the disk under it. The rows are rolled back
+        // instead of committed, and the files they left behind are cleared
+        // between iterations, so the directory holds one run's output at a time.
+        let dir = TempDir::new_in(OUTPUT_ROOT).expect("a writable tmpfs directory");
+        let catalog = table_over(dispatch, dir.path(), columns.clone());
+        group.throughput(Throughput::Elements(*case_rows as u64));
+        group.bench_function(*name, |b| {
+            b.iter_batched(
+                || {
+                    clear_files(dir.path());
+                    // The batches are Arc-backed, so a clone hands the pipeline
+                    // its own handles without copying any values.
+                    input.clone()
+                },
+                |batches| insert(dispatch, &catalog, black_box(batches)),
+                BatchSize::PerIteration,
+            );
         });
     }
-    g.bench_function("strings", |b| {
-        let mut out = Vec::new();
-        b.iter(|| {
-            black_box(
-                datastore_delta::parquet::decoder_bench_hooks::encode_delta_length_byte_array(
-                    &strings, &mut out,
-                ),
-            )
-        });
-    });
-    g.finish();
+    group.finish();
+}
+
+/// One column of `name` and `col_type`.
+fn column(name: &str, col_type: Type) -> Column {
+    Column {
+        name: name.to_string(),
+        col_type,
+    }
+}
+
+/// Columns that share a type.
+fn columns(names: &[&str], col_type: Type) -> Vec<Column> {
+    names
+        .iter()
+        .map(|name| column(name, col_type.clone()))
+        .collect()
+}
+
+/// A catalog holding one table of `columns` over `dir`.
+fn table_over(dispatch: &Dispatch, dir: &Path, columns: Vec<Column>) -> PivotCatalog {
+    let datastore = DeltaDatastore::open_local(dir, dispatch.dispatcher()).unwrap();
+    let catalog = PivotCatalog::new(
+        HashMap::from([(
+            DEFAULT_DATASTORE_NAME.to_string(),
+            datastore as Arc<dyn Datastore>,
+        )]),
+        DEFAULT_DATASTORE_NAME.to_string(),
+    )
+    .unwrap();
+
+    let mut options = HashMap::new();
+    options.insert("path".to_string(), dir.to_string_lossy().into_owned());
+    let creation = catalog.begin_transaction();
+    creation
+        .bind_create_table(CreateTableRequest {
+            datastore_name: None,
+            name: TABLE.to_string(),
+            columns,
+            options,
+            if_not_exists: false,
+        })
+        .unwrap()
+        .compile(dispatch.dispatcher())
+        .unwrap()
+        .execute()
+        .collect()
+        .unwrap();
+    // The table is only visible to the transactions that insert into it once its
+    // creation is committed, and committing is async.
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(creation.commit())
+        .unwrap();
+    catalog
+}
+
+/// Remove the files a previous iteration wrote, leaving the table's log alone.
+fn clear_files(dir: &Path) {
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "parquet")
+        {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
 }
 
 fn main() {
-    let mut c = Criterion::default().configure_from_args();
-    bench_encode(&mut c);
-    c.final_summary();
+    let workers = worker_count();
+    let buffers = ring_buffers();
+    let rows = total_rows();
+    eprintln!("catalog encode benches: {workers} workers, {buffers} buffers, {rows} rows");
+
+    let dispatch = Dispatch::spin_up(workers, buffers, None);
+    let mut criterion = Criterion::default().configure_from_args();
+    bench_encode(&mut criterion, &dispatch, rows);
+    criterion.final_summary();
+    dispatch.exit();
 }

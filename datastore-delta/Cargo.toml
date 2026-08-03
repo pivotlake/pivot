@@ -74,15 +74,10 @@ tempfile = { workspace = true, optional = true }
 # `server`) that want to run a catalog rooted in a real bucket.
 test-support = ["dep:testcontainers", "dep:testcontainers-modules", "dep:tempfile"]
 
-# Exposes `datastore_delta::parquet::decoder_bench_hooks`, which lets
-# `benches/decode.rs` drive a single column decoder. Off by default, so a normal
-# build carries neither the entry points nor their place in this crate's surface.
-bench-hooks = []
-
 [dev-dependencies]
 # Self-dependency to turn on `test-support` for this crate's own integration
 # tests (so they can use `catalog::test_support`).
-datastore-delta = { path = ".", features = ["test-support", "bench-hooks"] }
+datastore-delta = { path = ".", features = ["test-support"] }
 # A dev-dependency cycle (catalog depends on datastore-delta), allowed by Cargo.
 # Integration tests wrap a single `DeltaDatastore` in a `PivotCatalog` to get the
 # `Catalog` the planner binds against.
@@ -117,6 +112,9 @@ criterion = { workspace = true }
 name = "decode"
 harness = false
 
+# The write pipeline end to end (rows in, files out), driven from our own `main`
+# so one `Dispatch` and one set of input batches are built once and reused
+# across the cases.
 [[bench]]
 name = "encode"
 harness = false
