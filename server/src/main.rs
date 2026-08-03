@@ -16,7 +16,7 @@ use dispatch::env::get_env_var_with_default;
 use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
 use metastore::Metastore;
 use metastore_yaml::YamlMetastore;
-use server::{Error, Server};
+use server::{Error, Server, raise_open_file_limit};
 use tracing::{error, info};
 
 /// Postgres-wire-compatible server in front of pivotdb's dispatch engine.
@@ -186,6 +186,8 @@ fn build_catalog(
 fn run() -> Result<(), Error> {
     init_tracing();
     let args = Args::parse();
+
+    raise_open_file_limit();
 
     let workers = args.workers.unwrap_or_else(dispatch::default_worker_count);
     info!(workers, "initialising dispatch");

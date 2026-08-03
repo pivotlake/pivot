@@ -4794,6 +4794,7 @@ dependencies = [
  "lru",
  "metastore",
  "metastore-yaml",
+ "nix",
  "parquet 58.0.0",
  "parquet-variant-compute",
  "pgwire",
