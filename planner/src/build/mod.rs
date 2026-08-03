@@ -21,8 +21,8 @@ use duckdb_planner::BoundLogicalType;
 use duckdb_planner::LogicalOp;
 use duckdb_planner::duckdb_bridge::duckdb_types::{ExpressionType, JoinType};
 use duckdb_planner::handle::{
-    ComparisonJoin as ComparisonJoinView, DynamicFilterRef, Operator as DuckOperator,
-    TableScan as TableScanView, rowid_column_id,
+    ComparisonJoin as ComparisonJoinView, DynamicFilterRef, JoinConditionEntry,
+    Operator as DuckOperator, TableScan as TableScanView, rowid_column_id,
 };
 
 use crate::catalog::BoundTable;
@@ -317,11 +317,22 @@ fn absorb_scan_pushdown_filter(node: PlanNode) -> PlanNode {
 }
 
 /// Translate a general comparison join into pivot's [`Join`]. The supported
-/// shape is an INNER, RIGHT or SEMI join with a single equality condition whose
-/// sides are plain column refs of a key type the dispatch join handles;
+/// shape is an INNER, RIGHT or SEMI join with one or more equality conditions
+/// whose sides are plain column refs of key types the dispatch join handles;
 /// anything else reports the specific gap. The probe is DuckDB's left child
 /// and the build its right, matching its hash-join convention (the cost model
 /// puts the smaller relation on the right).
+///
+/// A join may additionally carry expression-form conditions (a predicate
+/// referencing both sides that is not a bare comparison, e.g. an OR of
+/// per-side conjunctions). Those become the [`Join`]'s residual: part of the
+/// join itself, evaluated on key-matched pairs, so a pair the predicate
+/// rejects is not a match. That placement is what keeps outer and semi joins
+/// correct, where the predicate takes part in the match decision (an outer
+/// build row all of whose pairs are rejected is emitted null-filled). DuckDB
+/// resolved such a predicate against the concatenation of both children's
+/// full outputs (see its `ColumnBindingResolver`), which is the layout the
+/// dispatch join evaluates it in.
 ///
 /// RIGHT is the outer join whose preserved side is that right child, so it maps
 /// onto the dispatch join's build-side outer mode. A written `LEFT JOIN` lands
@@ -348,7 +359,15 @@ fn build_join(
     let mut probe_keys = Vec::new();
     let mut build_keys = Vec::new();
     let mut key_types = Vec::new();
-    for condition in join.conditions()? {
+    let mut residual_predicates = Vec::new();
+    for entry in join.conditions()? {
+        let condition = match entry {
+            JoinConditionEntry::Comparison(condition) => condition,
+            JoinConditionEntry::Expression(predicate) => {
+                residual_predicates.push(predicate);
+                continue;
+            }
+        };
         if condition.comparison != ExpressionType::COMPARE_EQUAL {
             return Err(OperatorError::Unsupported(format!(
                 "Unsupported join comparison type: {:?}",
@@ -374,6 +393,11 @@ fn build_join(
         ));
     }
 
+    let residual_filters = residual_predicates
+        .into_iter()
+        .map(Expression::from_handle)
+        .collect::<Result<Vec<_>, _>>()?;
+
     let probe_types = inputs[0].output_types()?;
     let build_types = inputs[1].output_types()?;
     let left_map: Vec<usize> = join.left_projection_map()?;
@@ -397,7 +421,7 @@ fn build_join(
         JoinType::RIGHT => (JoinKind::BuildOuter, kept_build_output),
         // A semi join emits no build column at all. DuckDB agrees, and says so
         // by returning the left bindings alone for such a join rather than
-        // through the right projection map, which it never reads here — so the
+        // through the right projection map, which it never reads here - so the
         // map's "empty means keep every column" reading must not be applied.
         JoinType::SEMI => (JoinKind::ProbeSemi, Vec::new()),
         other => {
@@ -427,6 +451,7 @@ fn build_join(
             build_output,
             probe_column_types,
             build_column_types,
+            residual_filters,
             kind,
         }),
     })

@@ -185,6 +185,8 @@ size_t lo_cte_ref_index(const LogicalOperator &op);
 // ---- ComparisonJoin: general accessors ----
 uint8_t lo_join_type(const LogicalOperator &op);
 size_t lo_join_condition_count(const LogicalOperator &op);
+bool lo_join_condition_is_comparison(const LogicalOperator &op, size_t index);
+const Expression &lo_join_condition_expression(const LogicalOperator &op, size_t index);
 const Expression &lo_join_condition_left(const LogicalOperator &op, size_t index);
 const Expression &lo_join_condition_right(const LogicalOperator &op, size_t index);
 uint8_t lo_join_condition_comparison(const LogicalOperator &op, size_t index);

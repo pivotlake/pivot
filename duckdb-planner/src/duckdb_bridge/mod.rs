@@ -339,6 +339,14 @@ pub mod ffi {
 
         fn lo_join_type(op: &LogicalOperator) -> Result<u8>;
         fn lo_join_condition_count(op: &LogicalOperator) -> Result<usize>;
+        /// Whether the condition is a left/right comparison. When false, the
+        /// whole predicate is a single expression over both sides, read via
+        /// `lo_join_condition_expression`; the left/right/comparison accessors
+        /// throw for it.
+        fn lo_join_condition_is_comparison(op: &LogicalOperator, index: usize) -> Result<bool>;
+        /// The single-expression form's predicate, bound against the two
+        /// children's concatenated outputs (all LHS columns, then all RHS).
+        fn lo_join_condition_expression(op: &LogicalOperator, index: usize) -> Result<&Expression>;
         fn lo_join_condition_left(op: &LogicalOperator, index: usize) -> Result<&Expression>;
         fn lo_join_condition_right(op: &LogicalOperator, index: usize) -> Result<&Expression>;
         /// DuckDB `ExpressionType` discriminant of the condition's comparison.

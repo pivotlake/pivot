@@ -874,6 +874,14 @@ size_t lo_join_condition_count(const LogicalOperator &op) {
 	return as<duckdb::LogicalComparisonJoin>(op).conditions.size();
 }
 
+bool lo_join_condition_is_comparison(const LogicalOperator &op, size_t index) {
+	return as<duckdb::LogicalComparisonJoin>(op).conditions[index].IsComparison();
+}
+
+const Expression &lo_join_condition_expression(const LogicalOperator &op, size_t index) {
+	return as<duckdb::LogicalComparisonJoin>(op).conditions[index].GetJoinExpression();
+}
+
 const Expression &lo_join_condition_left(const LogicalOperator &op, size_t index) {
 	return as<duckdb::LogicalComparisonJoin>(op).conditions[index].GetLHS();
 }

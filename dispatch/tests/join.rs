@@ -29,6 +29,7 @@ fn inner_join(probe_output_indices: Vec<usize>, build_output_indices: Vec<usize>
         probe_output_indices,
         build_output_indices,
         kind: JoinKind::Inner,
+        residual_filters: None,
     }
 }
 
@@ -96,6 +97,7 @@ fn join_on_int32_keys() {
                 probe_fields: int32_field("probe_id"),
                 build_fields: int32_field("build_id"),
                 kind: JoinKind::Inner,
+                residual_filters: None,
             },
         )
         .collect()
@@ -231,6 +233,7 @@ fn join_keeps_only_listed_columns() {
                 probe_fields: vec![Field::new("p_payload", DataType::Int64, false)],
                 build_fields: vec![Field::new("b_payload", DataType::Int64, false)],
                 kind: JoinKind::Inner,
+                residual_filters: None,
             },
         )
         .collect()
@@ -259,6 +262,7 @@ fn build_outer_join(
         build_output_indices,
         probe_fields: vec![Field::new("id", DataType::Int64, true)],
         kind: JoinKind::BuildOuter,
+        residual_filters: None,
     }
 }
 
@@ -333,6 +337,7 @@ fn probe_semi_join(probe_columns: Vec<usize>) -> JoinSpec {
         probe_fields,
         build_fields: Vec::new(),
         kind: JoinKind::ProbeSemi,
+        residual_filters: None,
     }
 }
 
@@ -470,6 +475,7 @@ fn join_on_two_key_columns_needs_both_to_match() {
                 probe_fields: int64_fields(2),
                 build_fields: int64_fields(2),
                 kind: JoinKind::Inner,
+                residual_filters: None,
             },
         )
         .collect()

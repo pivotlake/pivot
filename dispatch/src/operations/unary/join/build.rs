@@ -264,21 +264,18 @@ impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> Outputter<()>
             let total: usize = sizes.iter().sum();
 
             // Merge every worker's stored build rows, in worker-id order, and
-            // learn each worker's row id base: tuples carry worker-local ids
-            // and get the base added during scatter. No bytes move; an empty
-            // merge means an empty build side, and the probe then emits
-            // nothing.
-            let (merged, row_bases) = build_rows::merge(
+            // prepare them once for every probe worker; tuples carry
+            // worker-local ids and get their worker's returned base added
+            // during scatter. An empty merge means an empty build side, and
+            // the probe then emits nothing. For an outer build this also
+            // allocates one matched flag per row id (gaps included);
+            // null-keyed rows have no tuple and therefore remain unmatched.
+            let (build_rows, row_bases) = BuildRows::new::<OUTER_JOIN_BUILD_SIDE>(
                 worker_outputs
                     .iter_mut()
                     .map(|output| std::mem::take(&mut output.build_row_batches)),
-            );
-            // Prepare the merged rows once for every probe worker. For an
-            // outer build this also allocates one matched flag per row id
-            // (gaps included); null-keyed rows have no tuple and therefore
-            // remain unmatched.
-            let build_rows =
-                BuildRows::new::<OUTER_JOIN_BUILD_SIDE>(merged, &self.build_output_indices)?;
+                &self.build_output_indices,
+            )?;
             unsafe { *self.table.build_rows.get() = build_rows };
 
             // Pre-allocate directory and arenas.

@@ -39,10 +39,24 @@ pub(crate) struct BuildRows {
 }
 
 impl BuildRows {
+    /// Merge every worker's stored rows, in the given order, into the
+    /// published whole, and prepare them for probing. No bytes move in the
+    /// merge. Alongside the rows, returns each worker's row id base: the
+    /// single `u32` added to that worker's local ids at scatter time.
     pub(crate) fn new<const TRACK_MATCHES: bool>(
-        batches: Vec<RecordBatch>,
+        workers: impl IntoIterator<Item = Vec<RecordBatch>>,
         output_indices: &[usize],
-    ) -> Result<Self, ArrowError> {
+    ) -> Result<(Self, Vec<u32>), ArrowError> {
+        let mut batches = Vec::new();
+        let mut row_id_bases = Vec::new();
+        for worker in workers {
+            row_id_bases.push((batches.len() << BATCH_SHIFT) as u32);
+            batches.extend(worker);
+        }
+        assert!(
+            batches.len() <= MAX_BATCHES,
+            "join build side exceeds the row id space"
+        );
         let output_batches: Vec<RecordBatch> = batches
             .iter()
             .map(|batch| batch.project(output_indices))
@@ -63,12 +77,15 @@ impl BuildRows {
         } else {
             MultiSlabBuffer::new(Vec::new())
         };
-        Ok(Self {
-            batches,
-            output_batches,
-            output_columns,
-            matched,
-        })
+        Ok((
+            Self {
+                batches,
+                output_batches,
+                output_columns,
+                matched,
+            },
+            row_id_bases,
+        ))
     }
 
     pub(crate) fn empty() -> Self {
@@ -133,25 +150,6 @@ pub(crate) fn adopt(batches: &mut Vec<RecordBatch>, batch: RecordBatch) -> Vec<(
         offset += rows;
     }
     adopted
-}
-
-/// Merge every worker's stored rows, in the given order, into the published
-/// whole. Returns the merged rows and each worker's row id base: the single
-/// `u32` added to that worker's local ids at scatter time.
-pub(crate) fn merge(
-    workers: impl IntoIterator<Item = Vec<RecordBatch>>,
-) -> (Vec<RecordBatch>, Vec<u32>) {
-    let mut batches = Vec::new();
-    let mut row_id_bases = Vec::new();
-    for worker in workers {
-        row_id_bases.push((batches.len() << BATCH_SHIFT) as u32);
-        batches.extend(worker);
-    }
-    assert!(
-        batches.len() <= MAX_BATCHES,
-        "join build side exceeds the row id space"
-    );
-    (batches, row_id_bases)
 }
 
 /// The id space the stored rows occupy, gaps included.

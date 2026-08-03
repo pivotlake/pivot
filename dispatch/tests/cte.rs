@@ -31,6 +31,7 @@ fn inner_join_on_id() -> JoinSpec {
         probe_fields: vec![Field::new("id", DataType::Int64, false)],
         build_fields: vec![Field::new("id", DataType::Int64, false)],
         kind: JoinKind::Inner,
+        residual_filters: None,
     }
 }
 
