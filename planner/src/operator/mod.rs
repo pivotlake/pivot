@@ -71,6 +71,9 @@ pub enum Error {
     /// (the join projection-map replay needs each side's width and types).
     #[error("{0}")]
     Typing(#[from] compile::Error),
+    /// A DuckDB exception surfaced while reading the plan across the bridge.
+    #[error("{0}")]
+    Bridge(#[from] duckdb_planner::BridgeError),
 }
 
 /// Get-or-create the shared [`DynamicFilterSlot`] for `slot_id` within this

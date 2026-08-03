@@ -109,7 +109,7 @@
 //! tables.insert("hits".to_string(), template);
 //! let catalog = MyCatalog { tables };
 //!
-//! let mut planner = Planner::from_datastore_names(vec!["default".to_string()], "default".to_string());
+//! let mut planner = Planner::from_datastore_names(vec!["default".to_string()], "default".to_string()).unwrap();
 //!
 //! // One transaction per query: SQL -> Pivot Plan -> dispatch spec -> execution.
 //! let transaction = catalog.begin_transaction();
@@ -162,6 +162,12 @@ pub enum Error {
     PlanConversion(#[from] plan::Error),
 }
 
+impl From<duckdb_planner::BridgeError> for Error {
+    fn from(error: duckdb_planner::BridgeError) -> Self {
+        Error::Planning(error.into())
+    }
+}
+
 /// The conventional name for the datastore a single-datastore configuration
 /// serves, and the name unqualified references resolve against in that setup.
 /// A convention only: nothing reads it to decide the default, which a metastore
@@ -187,16 +193,19 @@ impl Planner {
     /// [`CatalogTransaction`] passed to [`plan`](Self::plan) must span these
     /// datastores and routes each table to the right one's snapshot by the attach
     /// name.
-    pub fn from_datastore_names(database_names: Vec<String>, default_name: String) -> Self {
-        Self {
+    pub fn from_datastore_names(
+        database_names: Vec<String>,
+        default_name: String,
+    ) -> Result<Self, Error> {
+        Ok(Self {
             // The static provider only answers generic scalar functions, shared
             // across every attached datastore.
             planner_context: duckdb_planner::PlannerContext::new(
                 Arc::new(DuckDBScalarFunctionBinder),
                 database_names,
                 default_name,
-            ),
-        }
+            )?,
+        })
     }
 
     /// Plan a SQL statement into a Pivot [`Plan`], inside `transaction`.
@@ -213,7 +222,7 @@ impl Planner {
     ) -> Result<Plan, Error> {
         let adapter = Arc::new(DuckDBTransactionAdapter { transaction });
         let planned = self.planner_context.plan(query, adapter)?;
-        let mut root = build::build_plan(planned.root())?;
+        let mut root = build::build_plan(planned.root()?)?;
         // Push a top-k limit into a grouped aggregate that feeds ORDER BY DESC.
         root.annotate_group_topn();
         // Push a plain LIMIT (no ORDER BY) into a grouped aggregate beneath it.

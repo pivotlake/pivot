@@ -1766,7 +1766,8 @@ fn create_table_calls_catalog_once() {
     let mut planner = Planner::from_datastore_names(
         vec![DEFAULT_DATASTORE_NAME.to_string()],
         DEFAULT_DATASTORE_NAME.to_string(),
-    );
+    )
+    .expect("planner context");
     let transaction = catalog.begin_transaction();
 
     let results = planner
@@ -1801,7 +1802,8 @@ fn create_table_passes_with_options_to_catalog() {
     let mut planner = Planner::from_datastore_names(
         vec![DEFAULT_DATASTORE_NAME.to_string()],
         DEFAULT_DATASTORE_NAME.to_string(),
-    );
+    )
+    .expect("planner context");
     let transaction = catalog.begin_transaction();
 
     let results = planner

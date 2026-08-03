@@ -107,7 +107,8 @@ fn run_count(datastore: &Arc<DeltaDatastore>) -> usize {
     let mut planner = Planner::from_datastore_names(
         vec![DEFAULT_DATASTORE_NAME.to_string()],
         DEFAULT_DATASTORE_NAME.to_string(),
-    );
+    )
+    .expect("planner context");
     let transaction = catalog.begin_transaction();
     planner
         .plan("SELECT id FROM t", transaction.clone())

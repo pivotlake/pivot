@@ -164,7 +164,7 @@ pub mod ffi {
         /// Opaque; read via the `value_*` accessors after `value_type`.
         type Value;
 
-        fn new_context(catalog: Box<CatalogContext>) -> UniquePtr<DuckPlannerContext>;
+        fn new_context(catalog: Box<CatalogContext>) -> Result<UniquePtr<DuckPlannerContext>>;
         /// Plan `query` with `transaction` published for its duration: every
         /// table and table-function lookup during binding resolves through it
         /// (see `PivotSchemaCatalogEntry::LookupEntry`). The reference only
@@ -174,247 +174,251 @@ pub mod ffi {
             ctx: Pin<&mut DuckPlannerContext>,
             query: &str,
             transaction: &TransactionContext,
-        ) -> ExtractPlanResult;
+        ) -> Result<ExtractPlanResult>;
 
-        fn plan_root(plan: &PlanHandle) -> &LogicalOperator;
+        fn plan_root(plan: &PlanHandle) -> Result<&LogicalOperator>;
 
         /// DuckDB's virtual row-id column identifier, used by the late-materialization
         /// row-id stripping to recognise the threaded-up row-id column.
-        fn rowid_column_id() -> usize;
+        fn rowid_column_id() -> Result<usize>;
 
         // ---- LogicalOperator: shared structure ----
         /// DuckDB `LogicalOperatorType` discriminant.
-        fn lo_type(op: &LogicalOperator) -> u8;
+        fn lo_type(op: &LogicalOperator) -> Result<u8>;
         /// The operator's display name (`LogicalOperator::GetName`).
-        fn lo_name(op: &LogicalOperator) -> String;
-        fn lo_child_count(op: &LogicalOperator) -> usize;
-        fn lo_child(op: &LogicalOperator, index: usize) -> &LogicalOperator;
+        fn lo_name(op: &LogicalOperator) -> Result<String>;
+        fn lo_child_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_child(op: &LogicalOperator, index: usize) -> Result<&LogicalOperator>;
 
         // ---- Projection ----
-        fn lo_projection_expr_count(op: &LogicalOperator) -> usize;
-        fn lo_projection_expr(op: &LogicalOperator, index: usize) -> &Expression;
+        fn lo_projection_expr_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_projection_expr(op: &LogicalOperator, index: usize) -> Result<&Expression>;
 
         // ---- ExpressionGet (VALUES) ----
-        fn lo_values_row_count(op: &LogicalOperator) -> usize;
-        fn lo_values_column_count(op: &LogicalOperator) -> usize;
-        fn lo_values_expr(op: &LogicalOperator, row: usize, column: usize) -> &Expression;
+        fn lo_values_row_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_values_column_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_values_expr(op: &LogicalOperator, row: usize, column: usize) -> Result<&Expression>;
 
         // ---- Insert ----
-        fn lo_insert_take_table(op: &LogicalOperator) -> Box<OptionalTableWrapper>;
-        fn lo_insert_column_map_count(op: &LogicalOperator) -> usize;
-        fn lo_insert_returns_rows(op: &LogicalOperator) -> bool;
+        fn lo_insert_take_table(op: &LogicalOperator) -> Result<Box<OptionalTableWrapper>>;
+        fn lo_insert_column_map_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_insert_returns_rows(op: &LogicalOperator) -> Result<bool>;
 
         // ---- Filter ----
-        fn lo_filter_expr_count(op: &LogicalOperator) -> usize;
-        fn lo_filter_expr(op: &LogicalOperator, index: usize) -> &Expression;
+        fn lo_filter_expr_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_filter_expr(op: &LogicalOperator, index: usize) -> Result<&Expression>;
         /// A `LogicalFilter`'s `projection_map` (empty when it passes all child
         /// columns through). Each entry is a child-output column index to keep.
-        fn lo_filter_projection_map_count(op: &LogicalOperator) -> usize;
-        fn lo_filter_projection_map_index(op: &LogicalOperator, index: usize) -> usize;
+        fn lo_filter_projection_map_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_filter_projection_map_index(op: &LogicalOperator, index: usize) -> Result<usize>;
         /// The type of the filter's `index`th output column, paired with
         /// `lo_filter_projection_map_index` for the replay projection.
-        fn lo_filter_type_id(op: &LogicalOperator, index: usize) -> BridgeLogicalType;
+        fn lo_filter_type_id(op: &LogicalOperator, index: usize) -> Result<BridgeLogicalType>;
 
         // ---- OrderBy ----
-        fn lo_orderby_count(op: &LogicalOperator) -> usize;
-        fn lo_orderby_direction(op: &LogicalOperator, index: usize) -> u8;
-        fn lo_orderby_expr(op: &LogicalOperator, index: usize) -> &Expression;
+        fn lo_orderby_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_orderby_direction(op: &LogicalOperator, index: usize) -> Result<u8>;
+        fn lo_orderby_expr(op: &LogicalOperator, index: usize) -> Result<&Expression>;
 
         // ---- Aggregate ----
-        fn lo_aggregate_group_count(op: &LogicalOperator) -> usize;
-        fn lo_aggregate_group(op: &LogicalOperator, index: usize) -> &Expression;
-        fn lo_aggregate_expr_count(op: &LogicalOperator) -> usize;
-        fn lo_aggregate_expr(op: &LogicalOperator, index: usize) -> &Expression;
+        fn lo_aggregate_group_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_aggregate_group(op: &LogicalOperator, index: usize) -> Result<&Expression>;
+        fn lo_aggregate_expr_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_aggregate_expr(op: &LogicalOperator, index: usize) -> Result<&Expression>;
 
         // ---- TopN ----
-        fn lo_topn_order_count(op: &LogicalOperator) -> usize;
-        fn lo_topn_order_direction(op: &LogicalOperator, index: usize) -> u8;
-        fn lo_topn_order_expr(op: &LogicalOperator, index: usize) -> &Expression;
-        fn lo_topn_limit(op: &LogicalOperator) -> usize;
-        fn lo_topn_offset(op: &LogicalOperator) -> usize;
-        fn lo_topn_has_dynamic_filter(op: &LogicalOperator) -> bool;
+        fn lo_topn_order_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_topn_order_direction(op: &LogicalOperator, index: usize) -> Result<u8>;
+        fn lo_topn_order_expr(op: &LogicalOperator, index: usize) -> Result<&Expression>;
+        fn lo_topn_limit(op: &LogicalOperator) -> Result<usize>;
+        fn lo_topn_offset(op: &LogicalOperator) -> Result<usize>;
+        fn lo_topn_has_dynamic_filter(op: &LogicalOperator) -> Result<bool>;
         /// Pointer identity of the producer's shared `DynamicFilterData` cell,
         /// used to correlate it with consumer scans (the Rust side assigns slots).
-        fn lo_topn_dynamic_filter_data_id(op: &LogicalOperator) -> usize;
+        fn lo_topn_dynamic_filter_data_id(op: &LogicalOperator) -> Result<usize>;
         /// The child-output column index whose boundary the TopN publishes.
-        fn lo_topn_dynamic_filter_column(op: &LogicalOperator) -> usize;
-        fn lo_topn_dynamic_filter_comparison(op: &LogicalOperator) -> u8;
+        fn lo_topn_dynamic_filter_column(op: &LogicalOperator) -> Result<usize>;
+        fn lo_topn_dynamic_filter_comparison(op: &LogicalOperator) -> Result<u8>;
 
         // ---- Limit ----
         /// DuckDB `LimitNodeType` discriminant of a `LIMIT`/`OFFSET` bound
         /// (`UNSET` / `CONSTANT_VALUE` / a percentage or expression form). The
         /// constant value, when applicable, is read via `lo_limit_value` /
         /// `lo_limit_offset`.
-        fn lo_limit_value_kind(op: &LogicalOperator) -> u8;
-        fn lo_limit_value(op: &LogicalOperator) -> usize;
-        fn lo_limit_offset_kind(op: &LogicalOperator) -> u8;
-        fn lo_limit_offset(op: &LogicalOperator) -> usize;
+        fn lo_limit_value_kind(op: &LogicalOperator) -> Result<u8>;
+        fn lo_limit_value(op: &LogicalOperator) -> Result<usize>;
+        fn lo_limit_offset_kind(op: &LogicalOperator) -> Result<u8>;
+        fn lo_limit_offset(op: &LogicalOperator) -> Result<usize>;
 
         // ---- Get: base table ----
         /// Whether this `LogicalGet` reads a base table (vs a table function).
-        fn lo_get_has_table(op: &LogicalOperator) -> bool;
+        fn lo_get_has_table(op: &LogicalOperator) -> Result<bool>;
         /// Move the pivot `DuckDBTable` handle out of the scan's catalog entry.
         /// Called once per base-table scan during the walk.
-        fn lo_get_take_table(op: &LogicalOperator) -> Box<OptionalTableWrapper>;
+        fn lo_get_take_table(op: &LogicalOperator) -> Result<Box<OptionalTableWrapper>>;
         /// The scan's projected output columns (respecting `projection_ids`),
         /// each a storage column index + its type.
-        fn lo_get_output_count(op: &LogicalOperator) -> usize;
-        fn lo_get_output_column(op: &LogicalOperator, index: usize) -> usize;
-        fn lo_get_output_type(op: &LogicalOperator, index: usize) -> BridgeLogicalType;
+        fn lo_get_output_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_get_output_column(op: &LogicalOperator, index: usize) -> Result<usize>;
+        fn lo_get_output_type(op: &LogicalOperator, index: usize) -> Result<BridgeLogicalType>;
         /// For an output column carrying a pushed field extract (`variant_extract`
         /// / `struct_extract`), the referenced path: `depth` segments, each a
         /// field name via `lo_get_output_extract_field`. `depth` 0 means the whole
         /// column is read (no pushdown).
-        fn lo_get_output_extract_depth(op: &LogicalOperator, index: usize) -> usize;
-        fn lo_get_output_extract_field(op: &LogicalOperator, index: usize, seg: usize) -> String;
+        fn lo_get_output_extract_depth(op: &LogicalOperator, index: usize) -> Result<usize>;
+        fn lo_get_output_extract_field(
+            op: &LogicalOperator,
+            index: usize,
+            seg: usize,
+        ) -> Result<String>;
         /// The static `col op const` predicates DuckDB pushed into `table_filters`,
         /// rebuilt as expressions (owned by the returned list). Empty list when
         /// there are none.
         fn lo_get_pushed_conditions(op: &LogicalOperator) -> Result<UniquePtr<ExpressionList>>;
         /// Dynamic-filter consumers attached to the scan's `table_filters`.
-        fn lo_get_dynamic_filter_count(op: &LogicalOperator) -> usize;
-        fn lo_get_dynamic_filter_data_id(op: &LogicalOperator, index: usize) -> usize;
-        fn lo_get_dynamic_filter_column(op: &LogicalOperator, index: usize) -> usize;
-        fn lo_get_dynamic_filter_comparison(op: &LogicalOperator, index: usize) -> u8;
+        fn lo_get_dynamic_filter_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_get_dynamic_filter_data_id(op: &LogicalOperator, index: usize) -> Result<usize>;
+        fn lo_get_dynamic_filter_column(op: &LogicalOperator, index: usize) -> Result<usize>;
+        fn lo_get_dynamic_filter_comparison(op: &LogicalOperator, index: usize) -> Result<u8>;
 
         // ---- Get: table function ----
-        fn lo_get_function_name(op: &LogicalOperator) -> String;
-        fn lo_get_has_named_params(op: &LogicalOperator) -> bool;
-        fn lo_get_param_count(op: &LogicalOperator) -> usize;
-        fn lo_get_param(op: &LogicalOperator, index: usize) -> &Value;
+        fn lo_get_function_name(op: &LogicalOperator) -> Result<String>;
+        fn lo_get_has_named_params(op: &LogicalOperator) -> Result<bool>;
+        fn lo_get_param_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_get_param(op: &LogicalOperator, index: usize) -> Result<&Value>;
 
         // ---- CreateTable ----
-        fn lo_create_table_name(op: &LogicalOperator) -> String;
+        fn lo_create_table_name(op: &LogicalOperator) -> Result<String>;
         /// The target database (datastore) of `CREATE TABLE db.schema.t`, or empty
         /// when unqualified. Routes the create to the right datastore.
-        fn lo_create_table_datastore(op: &LogicalOperator) -> String;
-        fn lo_create_column_count(op: &LogicalOperator) -> usize;
-        fn lo_create_column_name(op: &LogicalOperator, index: usize) -> String;
-        fn lo_create_column_type(op: &LogicalOperator, index: usize) -> BridgeLogicalType;
-        fn lo_create_option_count(op: &LogicalOperator) -> usize;
-        fn lo_create_option_key(op: &LogicalOperator, index: usize) -> String;
-        fn lo_create_option_value(op: &LogicalOperator, index: usize) -> String;
-        fn lo_create_if_not_exists(op: &LogicalOperator) -> bool;
-        fn lo_create_or_replace(op: &LogicalOperator) -> bool;
-        fn lo_create_temporary(op: &LogicalOperator) -> bool;
-        fn lo_create_has_query(op: &LogicalOperator) -> bool;
-        fn lo_create_constraint_count(op: &LogicalOperator) -> usize;
+        fn lo_create_table_datastore(op: &LogicalOperator) -> Result<String>;
+        fn lo_create_column_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_create_column_name(op: &LogicalOperator, index: usize) -> Result<String>;
+        fn lo_create_column_type(op: &LogicalOperator, index: usize) -> Result<BridgeLogicalType>;
+        fn lo_create_option_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_create_option_key(op: &LogicalOperator, index: usize) -> Result<String>;
+        fn lo_create_option_value(op: &LogicalOperator, index: usize) -> Result<String>;
+        fn lo_create_if_not_exists(op: &LogicalOperator) -> Result<bool>;
+        fn lo_create_or_replace(op: &LogicalOperator) -> Result<bool>;
+        fn lo_create_temporary(op: &LogicalOperator) -> Result<bool>;
+        fn lo_create_has_query(op: &LogicalOperator) -> Result<bool>;
+        fn lo_create_constraint_count(op: &LogicalOperator) -> Result<usize>;
 
         // ---- Set / Reset ----
-        fn lo_set_name(op: &LogicalOperator) -> String;
-        fn lo_set_value(op: &LogicalOperator) -> String;
-        fn lo_reset_name(op: &LogicalOperator) -> String;
+        fn lo_set_name(op: &LogicalOperator) -> Result<String>;
+        fn lo_set_value(op: &LogicalOperator) -> Result<String>;
+        fn lo_reset_name(op: &LogicalOperator) -> Result<String>;
 
         // ---- ComparisonJoin: general accessors ----
         /// DuckDB `JoinType` discriminant.
         /// The index a materialized CTE publishes its rows under.
-        fn lo_cte_table_index(op: &LogicalOperator) -> usize;
+        fn lo_cte_table_index(op: &LogicalOperator) -> Result<usize>;
 
         /// The CTE index a reference reads.
-        fn lo_cte_ref_index(op: &LogicalOperator) -> usize;
+        fn lo_cte_ref_index(op: &LogicalOperator) -> Result<usize>;
 
-        fn lo_join_type(op: &LogicalOperator) -> u8;
-        fn lo_join_condition_count(op: &LogicalOperator) -> usize;
-        fn lo_join_condition_left(op: &LogicalOperator, index: usize) -> &Expression;
-        fn lo_join_condition_right(op: &LogicalOperator, index: usize) -> &Expression;
+        fn lo_join_type(op: &LogicalOperator) -> Result<u8>;
+        fn lo_join_condition_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_join_condition_left(op: &LogicalOperator, index: usize) -> Result<&Expression>;
+        fn lo_join_condition_right(op: &LogicalOperator, index: usize) -> Result<&Expression>;
         /// DuckDB `ExpressionType` discriminant of the condition's comparison.
-        fn lo_join_condition_comparison(op: &LogicalOperator, index: usize) -> u8;
+        fn lo_join_condition_comparison(op: &LogicalOperator, index: usize) -> Result<u8>;
         /// The join's projection maps: which of each child's output columns
         /// survive in the join's output (empty = all of them).
-        fn lo_join_left_projection_map_count(op: &LogicalOperator) -> usize;
-        fn lo_join_left_projection_map_index(op: &LogicalOperator, index: usize) -> usize;
-        fn lo_join_right_projection_map_count(op: &LogicalOperator) -> usize;
-        fn lo_join_right_projection_map_index(op: &LogicalOperator, index: usize) -> usize;
+        fn lo_join_left_projection_map_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_join_left_projection_map_index(op: &LogicalOperator, index: usize) -> Result<usize>;
+        fn lo_join_right_projection_map_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_join_right_projection_map_index(op: &LogicalOperator, index: usize) -> Result<usize>;
 
         // ---- ComparisonJoin: late materialization ----
         /// Whether this is the SEMI join DuckDB's late_materialization optimizer
         /// produces (vs a user IN/EXISTS), which the bridge collapses into a
         /// Materialize.
-        fn lo_is_late_materialization_join(op: &LogicalOperator) -> bool;
+        fn lo_is_late_materialization_join(op: &LogicalOperator) -> Result<bool>;
         /// The full-column (LHS) side's output storage columns (row-id excluded),
         /// which the Materialize re-reads for the surviving rows.
-        fn lo_late_materialization_column_count(op: &LogicalOperator) -> usize;
-        fn lo_late_materialization_column(op: &LogicalOperator, index: usize) -> usize;
+        fn lo_late_materialization_column_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_late_materialization_column(op: &LogicalOperator, index: usize) -> Result<usize>;
 
         // ---- ExpressionList (owned synthesized expressions) ----
-        fn expr_list_count(list: &ExpressionList) -> usize;
-        fn expr_list_get(list: &ExpressionList, index: usize) -> &Expression;
+        fn expr_list_count(list: &ExpressionList) -> Result<usize>;
+        fn expr_list_get(list: &ExpressionList, index: usize) -> Result<&Expression>;
 
         // ---- Expression: shared ----
         /// DuckDB `ExpressionType` discriminant.
-        fn expr_type(expr: &Expression) -> u8;
+        fn expr_type(expr: &Expression) -> Result<u8>;
         /// The type of the expression's result.
-        fn expr_return_type(expr: &Expression) -> BridgeLogicalType;
-        fn expr_has_alias(expr: &Expression) -> bool;
-        fn expr_alias(expr: &Expression) -> String;
+        fn expr_return_type(expr: &Expression) -> Result<BridgeLogicalType>;
+        fn expr_has_alias(expr: &Expression) -> Result<bool>;
+        fn expr_alias(expr: &Expression) -> Result<String>;
 
         // BoundReferenceExpression / BoundColumnRefExpression
-        fn expr_ref_index(expr: &Expression) -> usize;
-        fn expr_columnref_index(expr: &Expression) -> usize;
+        fn expr_ref_index(expr: &Expression) -> Result<usize>;
+        fn expr_columnref_index(expr: &Expression) -> Result<usize>;
 
         // BoundComparisonExpression
-        fn expr_comparison_left(expr: &Expression) -> &Expression;
-        fn expr_comparison_right(expr: &Expression) -> &Expression;
+        fn expr_comparison_left(expr: &Expression) -> Result<&Expression>;
+        fn expr_comparison_right(expr: &Expression) -> Result<&Expression>;
 
         // BoundBetweenExpression
-        fn expr_between_input(expr: &Expression) -> &Expression;
-        fn expr_between_lower(expr: &Expression) -> &Expression;
-        fn expr_between_upper(expr: &Expression) -> &Expression;
-        fn expr_between_lower_inclusive(expr: &Expression) -> bool;
-        fn expr_between_upper_inclusive(expr: &Expression) -> bool;
+        fn expr_between_input(expr: &Expression) -> Result<&Expression>;
+        fn expr_between_lower(expr: &Expression) -> Result<&Expression>;
+        fn expr_between_upper(expr: &Expression) -> Result<&Expression>;
+        fn expr_between_lower_inclusive(expr: &Expression) -> Result<bool>;
+        fn expr_between_upper_inclusive(expr: &Expression) -> Result<bool>;
 
         // BoundConstantExpression
-        fn expr_constant(expr: &Expression) -> &Value;
+        fn expr_constant(expr: &Expression) -> Result<&Value>;
 
         // ---- Value: typed accessors (shared by constants and table-function
         // arguments). Read `value_type` first, then the matching accessor.
-        fn value_type(v: &Value) -> u8;
-        fn value_bool(v: &Value) -> bool;
-        fn value_i8(v: &Value) -> i8;
-        fn value_i16(v: &Value) -> i16;
-        fn value_i32(v: &Value) -> i32;
-        fn value_i64(v: &Value) -> i64;
-        fn value_u8(v: &Value) -> u8;
-        fn value_u16(v: &Value) -> u16;
-        fn value_u32(v: &Value) -> u32;
-        fn value_u64(v: &Value) -> u64;
-        fn value_f32(v: &Value) -> f32;
-        fn value_f64(v: &Value) -> f64;
-        fn value_string(v: &Value) -> String;
-        fn value_decimal(v: &Value) -> BridgeDecimalValue;
-        fn value_hugeint(v: &Value) -> BridgeHugeint;
-        fn value_date(v: &Value) -> i32;
-        fn value_timestamp(v: &Value) -> i64;
-        fn value_interval_months(v: &Value) -> i32;
-        fn value_interval_days(v: &Value) -> i32;
-        fn value_interval_micros(v: &Value) -> i64;
+        fn value_type(v: &Value) -> Result<u8>;
+        fn value_bool(v: &Value) -> Result<bool>;
+        fn value_i8(v: &Value) -> Result<i8>;
+        fn value_i16(v: &Value) -> Result<i16>;
+        fn value_i32(v: &Value) -> Result<i32>;
+        fn value_i64(v: &Value) -> Result<i64>;
+        fn value_u8(v: &Value) -> Result<u8>;
+        fn value_u16(v: &Value) -> Result<u16>;
+        fn value_u32(v: &Value) -> Result<u32>;
+        fn value_u64(v: &Value) -> Result<u64>;
+        fn value_f32(v: &Value) -> Result<f32>;
+        fn value_f64(v: &Value) -> Result<f64>;
+        fn value_string(v: &Value) -> Result<String>;
+        fn value_decimal(v: &Value) -> Result<BridgeDecimalValue>;
+        fn value_hugeint(v: &Value) -> Result<BridgeHugeint>;
+        fn value_date(v: &Value) -> Result<i32>;
+        fn value_timestamp(v: &Value) -> Result<i64>;
+        fn value_interval_months(v: &Value) -> Result<i32>;
+        fn value_interval_days(v: &Value) -> Result<i32>;
+        fn value_interval_micros(v: &Value) -> Result<i64>;
 
         // BoundAggregateExpression
-        fn expr_aggregate_name(expr: &Expression) -> String;
-        fn expr_aggregate_distinct(expr: &Expression) -> bool;
-        fn expr_aggregate_child_count(expr: &Expression) -> usize;
-        fn expr_aggregate_child(expr: &Expression, index: usize) -> &Expression;
+        fn expr_aggregate_name(expr: &Expression) -> Result<String>;
+        fn expr_aggregate_distinct(expr: &Expression) -> Result<bool>;
+        fn expr_aggregate_child_count(expr: &Expression) -> Result<usize>;
+        fn expr_aggregate_child(expr: &Expression, index: usize) -> Result<&Expression>;
 
         // BoundFunctionExpression
-        fn expr_function_name(expr: &Expression) -> String;
-        fn expr_function_child_count(expr: &Expression) -> usize;
-        fn expr_function_child(expr: &Expression, index: usize) -> &Expression;
+        fn expr_function_name(expr: &Expression) -> Result<String>;
+        fn expr_function_child_count(expr: &Expression) -> Result<usize>;
+        fn expr_function_child(expr: &Expression, index: usize) -> Result<&Expression>;
 
         // BoundOperatorExpression (COMPARE_IN, OPERATOR_NOT)
-        fn expr_operator_child_count(expr: &Expression) -> usize;
-        fn expr_operator_child(expr: &Expression, index: usize) -> &Expression;
+        fn expr_operator_child_count(expr: &Expression) -> Result<usize>;
+        fn expr_operator_child(expr: &Expression, index: usize) -> Result<&Expression>;
 
         // BoundConjunctionExpression
-        fn expr_conjunction_child_count(expr: &Expression) -> usize;
-        fn expr_conjunction_child(expr: &Expression, index: usize) -> &Expression;
+        fn expr_conjunction_child_count(expr: &Expression) -> Result<usize>;
+        fn expr_conjunction_child(expr: &Expression, index: usize) -> Result<&Expression>;
 
         // BoundCaseExpression
-        fn expr_case_check_count(expr: &Expression) -> usize;
-        fn expr_case_when(expr: &Expression, index: usize) -> &Expression;
-        fn expr_case_then(expr: &Expression, index: usize) -> &Expression;
-        fn expr_case_else(expr: &Expression) -> &Expression;
+        fn expr_case_check_count(expr: &Expression) -> Result<usize>;
+        fn expr_case_when(expr: &Expression, index: usize) -> Result<&Expression>;
+        fn expr_case_then(expr: &Expression, index: usize) -> Result<&Expression>;
+        fn expr_case_else(expr: &Expression) -> Result<&Expression>;
 
         // BoundCastExpression
-        fn expr_cast_child(expr: &Expression) -> &Expression;
+        fn expr_cast_child(expr: &Expression) -> Result<&Expression>;
     }
 }

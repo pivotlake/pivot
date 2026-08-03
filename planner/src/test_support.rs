@@ -393,7 +393,8 @@ pub fn testing_planner() -> TestingPlanner {
     let planner = Planner::from_datastore_names(
         vec![DEFAULT_DATASTORE_NAME.to_string()],
         DEFAULT_DATASTORE_NAME.to_string(),
-    );
+    )
+    .expect("planner context");
     TestingPlanner {
         planner,
         catalog,

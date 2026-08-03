@@ -49,6 +49,7 @@ fn create_simple_context() -> PlannerContext {
         vec!["db".to_string()],
         "db".to_string(),
     )
+    .unwrap()
 }
 
 fn plan(p: &mut PlannerContext, query: &str) -> Result<duckdb_planner::Plan, Error> {

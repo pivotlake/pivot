@@ -78,7 +78,8 @@ fn no_memory_leak_across_repeated_plans() {
                     Arc::new(TestCatalog),
                     vec!["db".to_string()],
                     "db".to_string(),
-                );
+                )
+                .unwrap();
 
                 for i in 0..per_thread {
                     let plan = ctx
@@ -88,7 +89,7 @@ fn no_memory_leak_across_repeated_plans() {
                         )
                         .unwrap();
                     assert_eq!(
-                        plan.root().op_type(),
+                        plan.root().unwrap().op_type().unwrap(),
                         LogicalOperatorType::LOGICAL_PROJECTION
                     );
                     if i > 0 && i % 10_000 == 0 {
