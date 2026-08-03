@@ -416,3 +416,41 @@ fn aggregating_over_a_semi_join_counts_each_probe_row_once(mut testing_planner: 
     // Two orders match, though one of them is named by three items.
     assert_eq!(rows, vec![serde_json::json!({"orders": 2, "total": 110})]);
 }
+
+#[rstest]
+fn a_join_on_two_equality_conditions_matches_pairwise(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "assignments",
+        &[
+            ("a_person", Type::Int64, int64_col(vec![1, 1, 2])),
+            ("a_day", Type::Int64, int64_col(vec![5, 6, 5])),
+            ("a_task", Type::Utf8, str_col(vec!["a", "b", "c"])),
+        ],
+    );
+    testing_planner.add_table(
+        "shifts",
+        &[
+            ("s_person", Type::Int64, int64_col(vec![1, 1, 2])),
+            ("s_day", Type::Int64, int64_col(vec![5, 6, 6])),
+            ("s_room", Type::Utf8, str_col(vec!["r1", "r2", "r3"])),
+        ],
+    );
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT a_task, s_room FROM assignments \
+         JOIN shifts ON a_person = s_person AND a_day = s_day",
+    );
+    rows.sort_by_key(|r| r["a_task"].as_str().unwrap().to_string());
+
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"a_task": "a", "s_room": "r1"},
+            {"a_task": "b", "s_room": "r2"},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}

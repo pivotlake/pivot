@@ -57,7 +57,7 @@ use crate::operations::{
     CteScanFactory, Distinct, DynamicFilterSlot, F64Cell, FilterFactory, GroupFactory, GroupLimit,
     IntCell, JoinKey, JoinKind, JoinRecordBatchOperatorFactory, JoinSpec, KeyExtractor,
     LimitFactory, MapFactory, NoOpNullaryFactory, NullaryFactory, NullaryOperatorFactory, OrderBy,
-    OrderByLimitFactory, SingleColumnKey, UnaryFactory, UnaryOperatorFactory, WideCell,
+    OrderByLimitFactory, PackedKey, SingleColumnKey, UnaryFactory, UnaryOperatorFactory, WideCell,
     create_join_factories,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle, DataFlowStats};
@@ -603,6 +603,24 @@ impl RecordBatchOperatorSpec {
             key_types.len(),
             "one probe key column per key type"
         );
+        // Multi-key shapes: the packed-lane combos compiled so far. Any int
+        // pair combo (or a higher arity) is one more arm naming its
+        // PackedKey tuple; the impls already exist for every arity.
+        match key_types {
+            [DataType::Int32, DataType::Int32] => {
+                return self.join_dispatch::<PackedKey<(t::Int32Type, t::Int32Type)>>(build, spec);
+            }
+            [DataType::Int32, DataType::Int64] => {
+                return self.join_dispatch::<PackedKey<(t::Int32Type, t::Int64Type)>>(build, spec);
+            }
+            [DataType::Int64, DataType::Int32] => {
+                return self.join_dispatch::<PackedKey<(t::Int64Type, t::Int32Type)>>(build, spec);
+            }
+            [DataType::Int64, DataType::Int64] => {
+                return self.join_dispatch::<PackedKey<(t::Int64Type, t::Int64Type)>>(build, spec);
+            }
+            _ => {}
+        }
         let [key_type] = key_types else {
             panic!("unsupported join key shape {key_types:?}; the planner gates key shapes");
         };
