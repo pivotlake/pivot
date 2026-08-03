@@ -178,3 +178,14 @@ pub fn run_consumers<C: Consumer<RecordBatch, RecordBatch>>(
     }
     sender
 }
+
+/// A [`Sender`] that appends into a vector the test also holds, for operators
+/// that take ownership of their sender.
+pub struct SharedCollectSender<T>(pub std::rc::Rc<std::cell::RefCell<Vec<T>>>);
+
+impl<T> Sender<T> for SharedCollectSender<T> {
+    fn send(&mut self, item: T) -> crate::operations::channels::Result<()> {
+        self.0.borrow_mut().push(item);
+        Ok(())
+    }
+}

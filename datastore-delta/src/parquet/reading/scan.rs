@@ -14,8 +14,8 @@ use crate::parquet::reading::empty_projection_scan::empty_projection_scan;
 use arrow_array::RecordBatch;
 use dispatch::{
     DataFlowDispatcher, OperatorFactory, OperatorSpec, Projection, RECORD_BATCH_SIZE,
-    RecordBatchFactoryBridge, RecordBatchOperatorSpec, RootUnaryOperatorFactory,
-    UnaryOperatorFactory, return_to_worker_mpsc, stealable,
+    RecordBatchOperatorSpec, RootUnaryOperatorFactory, UnaryOperatorFactory, return_to_worker_mpsc,
+    stealable,
 };
 
 use crate::parquet::{
@@ -200,7 +200,7 @@ pub fn materialize(
         .map(|((rb_ch, rq_ch), pending)| {
             UnaryOperatorFactory::new(
                 UnaryOperatorFactory::new(
-                    RecordBatchFactoryBridge::new(heads.pop_front().unwrap()),
+                    heads.pop_front().unwrap(),
                     MaterializerFactory::new(projection.clone(), table.clone()),
                     rb_ch,
                     siblings_materializer.clone(),

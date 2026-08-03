@@ -48,10 +48,10 @@ pub(super) fn factories(worker_count: usize) -> Vec<ColumnEncoderFactory> {
 pub(super) struct ColumnEncoder;
 
 impl Unary<ColumnChunkJob, EncodedColumnChunk> for ColumnEncoder {
-    fn consume<S: Sender<EncodedColumnChunk>>(
+    fn consume(
         &mut self,
         job: ColumnChunkJob,
-        sender: &mut S,
+        sender: &mut dyn Sender<EncodedColumnChunk>,
     ) -> UnaryResult<()> {
         let field = job.header.schema.field(job.column);
         let leaves = encode_column_chunk(field, &job.values)?;

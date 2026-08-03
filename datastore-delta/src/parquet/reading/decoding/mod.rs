@@ -171,9 +171,9 @@ impl Decoder {
     /// # Returns
     ///
     /// Whether a record batch has been sent out
-    fn try_produce_batch<S: Sender<RecordBatch>>(
+    fn try_produce_batch(
         &mut self,
-        sender: &mut S,
+        sender: &mut dyn Sender<RecordBatch>,
     ) -> dispatch::UnaryResult<bool> {
         let mut exhausted_row_group = None;
         let mut produced = false;
@@ -211,10 +211,10 @@ impl Decoder {
 }
 
 impl Unary<DecompressedPage, RecordBatch> for Decoder {
-    fn consume<S: Sender<RecordBatch>>(
+    fn consume(
         &mut self,
         page: DecompressedPage,
-        output: &mut S,
+        output: &mut dyn Sender<RecordBatch>,
     ) -> dispatch::UnaryResult<()> {
         if self
             .closed_row_groups
@@ -256,7 +256,7 @@ impl Unary<DecompressedPage, RecordBatch> for Decoder {
         Ok(())
     }
 
-    fn run<S: Sender<RecordBatch>>(&mut self, sender: &mut S) -> dispatch::UnaryResult<WorkStatus> {
+    fn run(&mut self, sender: &mut dyn Sender<RecordBatch>) -> dispatch::UnaryResult<WorkStatus> {
         if self.try_produce_batch(sender)? {
             Ok(WorkStatus::Ran)
         } else {
@@ -264,7 +264,7 @@ impl Unary<DecompressedPage, RecordBatch> for Decoder {
         }
     }
 
-    fn finish<S: Sender<RecordBatch>>(&mut self, _output: &mut S) -> dispatch::UnaryResult<bool> {
+    fn finish(&mut self, _output: &mut dyn Sender<RecordBatch>) -> dispatch::UnaryResult<bool> {
         Ok(self.row_group_decoders.is_empty())
     }
 }

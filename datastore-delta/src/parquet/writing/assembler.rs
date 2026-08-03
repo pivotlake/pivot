@@ -104,10 +104,10 @@ pub(super) struct FileAssembler {
 }
 
 impl Unary<EncodedColumnChunk, EncodedFile> for FileAssembler {
-    fn consume<S: Sender<EncodedFile>>(
+    fn consume(
         &mut self,
         chunk: EncodedColumnChunk,
-        sender: &mut S,
+        sender: &mut dyn Sender<EncodedFile>,
     ) -> UnaryResult<()> {
         // Gather this row group's column chunks (one per schema column).
         let row_group_id = chunk.header.row_group_id;

@@ -54,8 +54,8 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use dispatch::{
-    DataFlowHandle, OperatorFactory, OperatorSpec, RecordBatchFactoryBridge,
-    RecordBatchOperatorSpec, return_to_worker_mpsc, stealable,
+    DataFlowHandle, OperatorFactory, OperatorSpec, RecordBatchOperatorSpec, return_to_worker_mpsc,
+    stealable,
 };
 
 use types::{ColumnChunkJob, EncodedColumnChunk};
@@ -94,13 +94,7 @@ pub(crate) fn encode_record_batches_spec(
 ) -> OperatorSpec<EncodedFile, impl OperatorFactory<EncodedFile> + 'static> {
     let (dispatcher, heads) = spec.into_parts();
     let workers = heads.len();
-    let batches = OperatorSpec::new(
-        dispatcher,
-        heads
-            .into_iter()
-            .map(RecordBatchFactoryBridge::new)
-            .collect::<Vec<_>>(),
-    );
+    let batches = OperatorSpec::new(dispatcher, heads.into_iter().collect::<Vec<_>>());
     encode_stages(
         batches,
         workers,

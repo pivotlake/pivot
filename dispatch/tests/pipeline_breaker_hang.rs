@@ -38,7 +38,7 @@ struct SilentBreaker;
 impl Consumer<i64, i64> for SilentBreaker {
     type Outputter = SilentOutputter;
 
-    fn consume<S: Sender<i64>>(&mut self, _item: i64, _sender: &mut S) -> UnaryResult<()> {
+    fn consume(&mut self, _item: i64, _sender: &mut dyn Sender<i64>) -> UnaryResult<()> {
         Ok(())
     }
 
@@ -58,7 +58,7 @@ struct SilentOutputter {
 }
 
 impl Outputter<i64> for SilentOutputter {
-    fn output<S: Sender<i64>>(&mut self, _sender: &mut S) -> UnaryResult<bool> {
+    fn output(&mut self, _sender: &mut dyn Sender<i64>) -> UnaryResult<bool> {
         if self.steps_left > 0 {
             self.steps_left -= 1;
             return Ok(false);

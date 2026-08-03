@@ -33,7 +33,7 @@ pub trait Consumer<I, O> {
     type Outputter: Outputter<O>;
 
     /// Process one input item, optionally sending intermediate results to `sender`.
-    fn consume<S: Sender<O>>(&mut self, object: I, sender: &mut S) -> unary::Result<()>;
+    fn consume(&mut self, object: I, sender: &mut dyn Sender<O>) -> unary::Result<()>;
 
     /// Transition from consuming to outputting. Called once after all input is drained.
     fn into_outputter(self) -> unary::Result<Option<Self::Outputter>>;
@@ -63,7 +63,7 @@ pub trait Consumer<I, O> {
 /// indicating all results have been emitted.
 pub trait Outputter<O> {
     /// Emit the next batch of results. Returns `true` when done.
-    fn output<S: Sender<O>>(&mut self, sender: &mut S) -> unary::Result<bool>;
+    fn output(&mut self, sender: &mut dyn Sender<O>) -> unary::Result<bool>;
 }
 
 /// A [`Unary`] implementation that breaks the pipeline into consume and output phases.
@@ -80,7 +80,7 @@ pub enum PipelineBreaker<I, O, C: Consumer<I, O>> {
 }
 
 impl<I, O, C: Consumer<I, O>> Unary<I, O> for PipelineBreaker<I, O, C> {
-    fn consume<S: Sender<O>>(&mut self, object: I, sender: &mut S) -> unary::Result<()> {
+    fn consume(&mut self, object: I, sender: &mut dyn Sender<O>) -> unary::Result<()> {
         match self {
             PipelineBreaker::Consuming(c) => c.consume(object, sender),
             // A breaker that finished *early* (e.g. a satisfied `LIMIT`) can still
@@ -93,7 +93,7 @@ impl<I, O, C: Consumer<I, O>> Unary<I, O> for PipelineBreaker<I, O, C> {
         }
     }
 
-    fn run<S: Sender<O>>(&mut self, sender: &mut S) -> unary::Result<WorkStatus> {
+    fn run(&mut self, sender: &mut dyn Sender<O>) -> unary::Result<WorkStatus> {
         match self {
             PipelineBreaker::Outputting(o, ..) => {
                 if o.output(sender)? {
@@ -129,7 +129,7 @@ impl<I, O, C: Consumer<I, O>> Unary<I, O> for PipelineBreaker<I, O, C> {
         }
     }
 
-    fn finish<S: Sender<O>>(&mut self, sender: &mut S) -> unary::Result<bool> {
+    fn finish(&mut self, sender: &mut dyn Sender<O>) -> unary::Result<bool> {
         if matches!(self, PipelineBreaker::Consuming(..)) {
             let consume = mem::replace(self, PipelineBreaker::Complete);
             match consume {

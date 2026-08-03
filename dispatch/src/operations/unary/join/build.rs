@@ -117,7 +117,7 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>, const BUILD_OUTER: bool> Consumer
 {
     type Outputter = JoinBuilder<T::Native, BUILD_OUTER>;
 
-    fn consume<S: Sender<()>>(&mut self, batch: RecordBatch, _sender: &mut S) -> unary::Result<()> {
+    fn consume(&mut self, batch: RecordBatch, _sender: &mut dyn Sender<()>) -> unary::Result<()> {
         debug!("Consuming build");
         let batch = match BUILD_OUTER {
             true => batch,
@@ -259,7 +259,7 @@ impl<K: Copy + Send> JoinPartitionJob<K> {
 }
 
 impl<K: Copy + Send, const BUILD_OUTER: bool> Outputter<()> for JoinBuilder<K, BUILD_OUTER> {
-    fn output<S: Sender<()>>(&mut self, _sender: &mut S) -> unary::Result<bool> {
+    fn output(&mut self, _sender: &mut dyn Sender<()>) -> unary::Result<bool> {
         if let Some(rx) = self.receiver.take() {
             let mut worker_outputs: Vec<BuildWorkerOutput<K>> = rx.into_iter().collect();
             // Payload row indices are globalized in worker-id order, so the

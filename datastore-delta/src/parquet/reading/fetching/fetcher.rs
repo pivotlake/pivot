@@ -84,10 +84,10 @@ impl RowGroupFetcher {
     /// exactly that run, whose bytes are now committed), then emit any that are
     /// done. Credit all before emitting, so a row group listed twice — it needed
     /// this read for two columns — is fully counted before it emits.
-    fn deliver<S: Sender<RowGroupBuffer>>(
+    fn deliver(
         &mut self,
         read: ReadRequest,
-        sender: &mut S,
+        sender: &mut dyn Sender<RowGroupBuffer>,
     ) -> dispatch::UnaryResult<()> {
         let waiters = self.tracker.complete(&read);
         for &slot in &waiters {
@@ -100,10 +100,10 @@ impl RowGroupFetcher {
     }
 
     /// If the row group in `slot` has all its blocks, free it and emit it.
-    fn emit_if_complete<S: Sender<RowGroupBuffer>>(
+    fn emit_if_complete(
         &mut self,
         slot: usize,
-        sender: &mut S,
+        sender: &mut dyn Sender<RowGroupBuffer>,
     ) -> dispatch::UnaryResult<()> {
         if self
             .tracker
@@ -118,10 +118,10 @@ impl RowGroupFetcher {
 }
 
 impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
-    fn consume<S: Sender<RowGroupBuffer>>(
+    fn consume(
         &mut self,
         request: RowGroupRequest,
-        sender: &mut S,
+        sender: &mut dyn Sender<RowGroupBuffer>,
     ) -> dispatch::UnaryResult<()> {
         self.pending_row_groups.fetch_add(1, Ordering::Relaxed);
         let slot = self.tracker.admit_request(request);
@@ -144,26 +144,23 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
             && self.pending_row_groups.load(Ordering::Relaxed) < self.max_pending_row_groups
     }
 
-    fn process_fs_read_response<S: Sender<RowGroupBuffer>>(
+    fn process_fs_read_response(
         &mut self,
-        sender: &mut S,
+        sender: &mut dyn Sender<RowGroupBuffer>,
         request: FsReadRequest,
     ) -> dispatch::UnaryResult<()> {
         self.deliver(ReadRequest::of_fs(&request), sender)
     }
 
-    fn process_http_get_response<S: Sender<RowGroupBuffer>>(
+    fn process_http_get_response(
         &mut self,
-        sender: &mut S,
+        sender: &mut dyn Sender<RowGroupBuffer>,
         request: HttpGetRequest,
     ) -> dispatch::UnaryResult<()> {
         self.deliver(ReadRequest::of_http_get(&request), sender)
     }
 
-    fn finish<S: Sender<RowGroupBuffer>>(
-        &mut self,
-        _sender: &mut S,
-    ) -> dispatch::UnaryResult<bool> {
+    fn finish(&mut self, _sender: &mut dyn Sender<RowGroupBuffer>) -> dispatch::UnaryResult<bool> {
         Ok(self.tracker.is_idle())
     }
 }
