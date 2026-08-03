@@ -1,4 +1,5 @@
-//! The bundled web dashboard, served in-process (enabled with `--http-bind`).
+//! The bundled web dashboard, served in-process (enabled by the config file's
+//! `server.http_bind`).
 //!
 //! Because it runs inside the server, it reads the engine's live state
 //! directly - the catalog and the process's own CPU/memory - neither of which

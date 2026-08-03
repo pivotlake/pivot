@@ -1,4 +1,4 @@
-//! End-to-end blackbox test of PostgreSQL authentication: a metastore file
+//! End-to-end blackbox test of PostgreSQL authentication: a `metastore` section
 //! defines one SCRAM-SHA-256 user and one explicitly trusted user. Each
 //! connection selects that user's method, while an unconfigured name is
 //! rejected.
@@ -115,8 +115,7 @@ fn authenticating_server() -> &'static AuthServer {
 "#,
             data_dir.path().display(),
         );
-        let inner =
-            YamlMetastore::from_yaml(&yaml, "test", std::time::Duration::from_secs(30)).unwrap();
+        let inner = YamlMetastore::from_yaml(&yaml, "test").unwrap();
         let metastore = Arc::new(MutableMetastore {
             inner,
             users: RwLock::new(HashMap::from([

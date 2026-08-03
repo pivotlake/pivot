@@ -55,6 +55,11 @@ pub const DEFAULT_COMPACT_BYTES: u64 = 64 * 1024 * 1024;
 /// when a flush commits a new version, so seconds-scale is plenty.
 pub const DEFAULT_COMPACT_POLL: Duration = Duration::from_secs(10);
 
+/// Default cadence for reloading the tables from the store. This bounds how
+/// stale a query's view of externally committed data is, so it trades freshness
+/// against the listing traffic a remote store sees.
+pub const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
 /// A partition with at least this many small files is merged even if they don't
 /// yet add up to a full output, otherwise partitions whose data never reaches
 /// the byte target accumulate small files without bound. Kept well above the

@@ -1,0 +1,68 @@
+# One file configures a whole instance: `server` is the instance itself,
+# `metastore` is the data it serves. Every `server` setting has a default, so the
+# section can be left out entirely; `metastore` is required.
+server:
+  # TCP socket the PostgreSQL endpoint binds to. Defaults to 127.0.0.1:5432, so
+  # set this to reach the server from beyond loopback.
+  bind: 127.0.0.1:5432
+
+  # Buffer-pool budget (suffixes k/m/g/t, base-1024). Defaults to a percentage of
+  # the machine's total memory.
+  # memory: 32g
+
+  # Dispatch worker threads. Defaults to the machine's core count.
+  # workers: 16
+
+  # Also serve the bundled web dashboard on this address. Omitted means no
+  # dashboard.
+  # http_bind: 127.0.0.1:8081
+
+  # Cache remote (S3) reads on local disk. The whole section is optional; `dir`
+  # is required once it is present, and the contents survive a restart.
+  # disk_cache:
+  #   dir: /var/cache/pivot
+  #   size: 64g            # default
+  #   max_objects: 65536   # one open file descriptor per cached object
+
+metastore:
+  # How often the background refresh brings the in-memory table set up to date
+  # with the store. This bounds how stale a query's view of data committed by
+  # other processes can be. Defaults to 30s.
+  refresh_interval: 30s
+
+  # Exactly one datastore must set `default: true`. It is the current database, so
+  # unqualified names such as `main.events` resolve against it.
+  datastores:
+    # `kind` is the datastore format (only `delta` today). The storage backend is
+    # inferred from `location`: a local path here, an S3 URI for `warm` below.
+    default:
+      kind: delta
+      location: /var/lib/pivot/default
+      default: true
+
+    # Other entries are attached as databases and can be queried with three-part
+    # names such as `warm.main.events`. Compaction is off by default; run it in
+    # only one process per datastore.
+    warm:
+      kind: delta
+      location: s3://example-bucket/warm/
+      compact: true
+      compact_bytes: 128m
+      region: us-east-1
+      access_key_id: replace-me
+      secret_access_key: replace-me
+      # endpoint: http://localhost:9000 # MinIO / S3-compatible
+
+  # Users are an allowlist. The built-in configuration provides `pivot` without a
+  # password so a fresh server remains easy to connect to. Trust proves no
+  # identity: anyone using this name is accepted.
+  users:
+    pivot:
+      auth:
+        method: trust
+
+    # A SCRAM-SHA-256 method contains its precomputed verifier, not the password.
+    # analytics:
+    #   auth:
+    #     method: scram-sha-256
+    #     verifier: "pivot-scram-sha-256$4096:..."
