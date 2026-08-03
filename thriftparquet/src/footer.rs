@@ -155,6 +155,18 @@ impl WriteThrift for LogicalType {
 
     fn write_thrift<W: Write>(&self, writer: &mut ThriftCompactOutputProtocol<W>) -> Result<()> {
         match self {
+            // INTEGER union member: field 10, an IntType struct with required
+            // bitWidth (field 1) and isSigned (field 2). A bool field writes as
+            // its field header alone, so it contributes no value bytes.
+            LogicalType::Integer {
+                bit_width,
+                is_signed,
+            } => {
+                writer.write_field_begin(FieldType::Struct, 10, 0)?;
+                let last_field_id = bit_width.write_thrift_field(writer, 1, 0)?;
+                is_signed.write_thrift_field(writer, 2, last_field_id)?;
+                writer.write_struct_end()?;
+            }
             // DECIMAL union member: field 5, a DecimalType struct with required
             // scale (field 1) and precision (field 2).
             LogicalType::Decimal { scale, precision } => {

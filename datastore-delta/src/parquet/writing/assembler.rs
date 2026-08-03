@@ -52,16 +52,6 @@ const REPETITION_OPTIONAL: i32 = 1;
 const SNAPPY_CODEC: i32 = 1;
 /// Parquet format version written into the footer.
 const PARQUET_VERSION: i32 = 1;
-/// Parquet `ConvertedType::UTF8` — marks a BYTE_ARRAY column as a string so
-/// readers surface it as text rather than opaque bytes.
-const CONVERTED_UTF8: i32 = 0;
-/// Parquet `ConvertedType::DECIMAL` — the legacy decimal annotation, written
-/// alongside the modern `LogicalType::Decimal` so older readers resolve the
-/// column too.
-const CONVERTED_DECIMAL: i32 = 5;
-/// `ConvertedType::DATE`: the legacy annotation for an INT32 day count, written
-/// beside the modern `LogicalType::Date` so older readers resolve it too.
-const CONVERTED_DATE: i32 = 6;
 
 pub(super) type FileAssemblerFactory = DefaultUnaryFactory<FileAssembler>;
 
@@ -351,43 +341,20 @@ fn push_schema_element(field: &FieldRef, elements: &mut Vec<SchemaElement>) -> W
             }
         }
         data_type => {
-            // A decimal leaf stores its unscaled integer as a
-            // FIXED_LEN_BYTE_ARRAY of DECIMAL_FIXED_LEN bytes, and its schema
-            // element carries the full decimal description: the fixed length,
-            // precision and scale, the modern Decimal logical type, and the
-            // legacy DECIMAL converted type for older readers.
-            let decimal_shape = match data_type {
-                DataType::Decimal64(precision, scale) | DataType::Decimal128(precision, scale) => {
-                    Some((*precision as i32, *scale as i32))
-                }
-                _ => None,
-            };
+            // A leaf is described by its physical type plus whatever annotation
+            // its type needs, which the two write-path halves of `arrow_map`
+            // give together.
+            let annotation = crate::parquet::arrow_to_annotation(data_type);
             elements.push(SchemaElement {
                 physical_type: Some(crate::parquet::arrow_to_parquet_physical(data_type)?),
-                type_length: decimal_shape.and_then(|(precision, _)| {
-                    crate::parquet::decimal_write_storage(precision as u8).type_length()
-                }),
+                type_length: annotation.type_length,
                 repetition_type,
                 name: field.name().clone(),
                 num_children: None,
-                converted_type: match data_type {
-                    DataType::Utf8 | DataType::Utf8View => Some(CONVERTED_UTF8),
-                    DataType::Decimal64(_, _) | DataType::Decimal128(_, _) => {
-                        Some(CONVERTED_DECIMAL)
-                    }
-                    DataType::Date32 => Some(CONVERTED_DATE),
-                    _ => None,
-                },
-                scale: decimal_shape.map(|(_, scale)| scale),
-                precision: decimal_shape.map(|(precision, _)| precision),
-                // Without the annotation a date column reads back as the plain
-                // INT32 it is stored as, so it is stamped both ways: the modern
-                // logical type and the legacy converted one above.
-                logical_type: match data_type {
-                    DataType::Date32 => Some(LogicalType::Date),
-                    _ => decimal_shape
-                        .map(|(precision, scale)| LogicalType::Decimal { scale, precision }),
-                },
+                converted_type: annotation.converted_type,
+                scale: annotation.scale,
+                precision: annotation.precision,
+                logical_type: annotation.logical_type,
             })
         }
     }
@@ -417,6 +384,7 @@ fn run_of(bytes: &[u8]) -> WriteResult<Slab> {
 mod tests {
     use super::*;
     use crate::parquet::ParquetTable;
+    use crate::parquet::types::arrow_map::CONVERTED_DECIMAL;
     use crate::parquet::writing::encoder::encode_column_chunk;
     use crate::parquet::writing::types::{EncodedColumnChunk, PartitionTag};
     use arrow_array::cast::AsArray;

@@ -13,7 +13,7 @@ use crate::store::DataFile;
 use arrow_array::{
     ArrayRef, BooleanArray, Date32Array, Decimal64Array, Decimal128Array, Float32Array,
     Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Scalar, StringViewArray,
-    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use dispatch::DataFlowDispatcher;
@@ -372,6 +372,9 @@ fn decode_scalar(
         DataType::Int64 => read_le::<8>(bytes)
             .map(i64::from_le_bytes)
             .map(|v| erase_type(Int64Array::new_scalar(v))),
+        DataType::UInt64 => read_le::<8>(bytes)
+            .map(u64::from_le_bytes)
+            .map(|v| erase_type(UInt64Array::new_scalar(v))),
         DataType::Float32 => read_le::<4>(bytes)
             .map(f32::from_le_bytes)
             .map(|v| erase_type(Float32Array::new_scalar(v))),

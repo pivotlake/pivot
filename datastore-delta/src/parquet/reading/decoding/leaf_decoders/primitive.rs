@@ -36,6 +36,15 @@ pub trait ReadLeBytes: ArrowNativeType {
     fn read_le(reader: &mut MultiBufferReader) -> Self;
 }
 
+impl ReadLeBytes for u8 {
+    const PHYSICAL_SIZE: usize = 4;
+
+    #[inline(always)]
+    fn read_le(reader: &mut MultiBufferReader) -> Self {
+        reader.read_u32_le() as u8
+    }
+}
+
 impl ReadLeBytes for i16 {
     const PHYSICAL_SIZE: usize = 4;
 
@@ -63,12 +72,32 @@ impl ReadLeBytes for i32 {
     }
 }
 
+impl ReadLeBytes for u32 {
+    const PHYSICAL_SIZE: usize = 4;
+
+    #[inline(always)]
+    fn read_le(reader: &mut MultiBufferReader) -> Self {
+        reader.read_u32_le()
+    }
+}
+
 impl ReadLeBytes for i64 {
     const PHYSICAL_SIZE: usize = 8;
 
     #[inline(always)]
     fn read_le(reader: &mut MultiBufferReader) -> Self {
         reader.read_i64_le()
+    }
+}
+
+/// An unsigned 64-bit value is stored as the INT64 holding its bits, so the
+/// read is the signed one reinterpreted rather than a conversion.
+impl ReadLeBytes for u64 {
+    const PHYSICAL_SIZE: usize = 8;
+
+    #[inline(always)]
+    fn read_le(reader: &mut MultiBufferReader) -> Self {
+        reader.read_i64_le() as u64
     }
 }
 
