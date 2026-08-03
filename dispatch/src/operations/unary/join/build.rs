@@ -115,7 +115,7 @@ impl<K: JoinKey, const BUILD_OUTER: bool> Consumer<RecordBatch, ()>
             true => batch,
             false => filter_null_keys(batch, &self.key_columns),
         };
-        let reader = K::make_reader(&batch, &self.key_columns);
+        let reader = K::make_reader(&batch, &self.key_columns, &self.hash_state);
         let n = batch.num_rows();
         assert!(
             self.rows_consumed + n <= u32::MAX as usize,

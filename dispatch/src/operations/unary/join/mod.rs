@@ -28,7 +28,7 @@ mod directory;
 mod factory;
 pub use factory::JoinRecordBatchOperatorFactory;
 mod keys;
-pub use keys::{JoinKey, PackedKey, SingleColumnKey};
+pub use keys::{DynamicRowKey, JoinKey, PackedKey, SingleColumnKey};
 mod probe;
 
 use std::cell::UnsafeCell;
@@ -170,7 +170,7 @@ mod tests {
 
     use super::build::JoinBuildConsumer;
     use super::factory;
-    use super::keys::{JoinKey, PackedKey, SingleColumnKey};
+    use super::keys::{DynamicRowKey, JoinKey, PackedKey, SingleColumnKey};
 
     fn int64_batch(keys: &[i64]) -> RecordBatch {
         RecordBatch::try_new(
@@ -872,5 +872,86 @@ mod tests {
         );
 
         assert_eq!(r.rows(), 1);
+    }
+
+    fn string_key_batch(keys: &[&str]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "key",
+                DataType::Utf8View,
+                false,
+            )])),
+            vec![Arc::new(StringViewArray::from(keys.to_vec()))],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_dynamic_string_key_joins_on_exact_text() {
+        // One key long enough to live outside the view's inline bytes.
+        let build = string_key_batch(&["apple", "banana", "a-key-too-long-to-inline"]);
+        let probe = string_key_batch(&["banana", "durian", "a-key-too-long-to-inline"]);
+
+        let r = run_join::<DynamicRowKey, false>(vec![vec![build]], vec![probe], None, vec![0]);
+
+        let mut keys: Vec<String> = r
+            .batches
+            .iter()
+            .flat_map(|batch| {
+                let names = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .unwrap();
+                (0..batch.num_rows()).map(|i| names.value(i).to_string())
+            })
+            .collect();
+        keys.sort();
+        assert_eq!(keys, vec!["a-key-too-long-to-inline", "banana"]);
+    }
+
+    #[test]
+    fn a_dynamic_int_and_string_pair_needs_both_columns_equal() {
+        let int_str_batch = |ints: &[i64], names: &[&str]| keyed_names_batch(ints, names);
+        let build = int_str_batch(&[1, 1, 2], &["a", "b", "a"]);
+        let probe = int_str_batch(&[1, 2, 2], &["b", "b", "a"]);
+
+        let r = run_join::<DynamicRowKey, false>(vec![vec![build]], vec![probe], None, vec![0, 1]);
+
+        // Only (1, "b") and (2, "a") exist on both sides.
+        let mut pairs: Vec<(i64, String)> = r
+            .batches
+            .iter()
+            .flat_map(|batch| {
+                let ints = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let names = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .unwrap();
+                (0..batch.num_rows()).map(|i| (ints.value(i), names.value(i).to_string()))
+            })
+            .collect();
+        pairs.sort();
+        assert_eq!(pairs, vec![(1, "b".to_string()), (2, "a".to_string())]);
+    }
+
+    #[test]
+    fn a_dynamic_key_outer_build_emits_unmatched_rows() {
+        let r = run_join::<DynamicRowKey, true>(
+            vec![vec![int64_batch(&[10, 20, 30])]],
+            vec![int64_batch(&[20])],
+            Some(nullable_key_field()),
+            vec![0],
+        );
+
+        assert_eq!(
+            collect_key_pairs(&r.batches),
+            vec![(None, Some(10)), (None, Some(30)), (Some(20), Some(20))]
+        );
     }
 }
