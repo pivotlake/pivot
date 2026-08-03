@@ -42,9 +42,15 @@ impl Drop for DispatchGuard {
 }
 
 /// Spin a `Dispatch` up on the calling thread and return a guard for it.
+///
+/// The buffer count is a process total that `spin_up` divides across NUMA node
+/// regions, and workers only allocate from their own region. A multi-node
+/// runner therefore halves what each worker can reach, and the fixed per-worker
+/// overhead (slab working buffers, input and output batches) can drain a
+/// 10-slot ring before any rows flow. 32 leaves headroom either way.
 pub fn dispatch(workers: usize) -> DispatchGuard {
     init_tracing();
-    DispatchGuard(Some(Dispatch::spin_up(workers, 10, None)))
+    DispatchGuard(Some(Dispatch::spin_up(workers, 32, None)))
 }
 
 pub fn strings_and_ints(names: &[&str], values: &[i64]) -> RecordBatch {

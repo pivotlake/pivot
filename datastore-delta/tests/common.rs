@@ -69,8 +69,14 @@ impl Drop for DispatchGuard {
 }
 
 /// Spin a `Dispatch` up on the calling thread and return a guard for it.
+///
+/// The buffer count is a process total that `spin_up` divides across NUMA node
+/// regions, and workers only allocate from their own region. A multi-node
+/// runner therefore halves what each worker can reach, and tests with a few
+/// megabytes of pinned results (cached footers, zero-copy string views) run a
+/// 10-slot ring dry. 32 leaves headroom either way.
 pub fn dispatch(workers: usize) -> DispatchGuard {
-    dispatch_with_buffers(workers, 10)
+    dispatch_with_buffers(workers, 32)
 }
 
 /// Like [`dispatch`], but with an explicit file-cache buffer count — needed when
