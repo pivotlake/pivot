@@ -431,13 +431,22 @@ impl<'plan> Limit<'plan> {
 
 /// The projected output columns shared by base-table and table-function scans:
 /// each a storage column index paired with its type.
+/// The projected output columns of a scan: each a storage column index, its
+/// output type, and — when DuckDB's projection-pushdown pushed a field extract
+/// into this column — the referenced field path (empty means the whole column
+/// is read). The path lets the reader fetch only the referenced variant leaf.
 fn scan_output_columns(
     raw: &ffi::LogicalOperator,
-) -> impl Iterator<Item = (usize, BoundLogicalType)> + '_ {
+) -> impl Iterator<Item = (usize, BoundLogicalType, Vec<String>)> + '_ {
     (0..ffi::lo_get_output_count(raw)).map(move |i| {
+        let depth = ffi::lo_get_output_extract_depth(raw, i);
+        let path: Vec<String> = (0..depth)
+            .map(|s| ffi::lo_get_output_extract_field(raw, i, s))
+            .collect();
         (
             ffi::lo_get_output_column(raw, i),
             bound_type_from(ffi::lo_get_output_type(raw, i)),
+            path,
         )
     })
 }
@@ -451,7 +460,9 @@ impl<'plan> TableScan<'plan> {
 
     /// The scan's projected output columns, each a storage column index paired
     /// with its type.
-    pub fn output_columns(self) -> impl Iterator<Item = (usize, BoundLogicalType)> + 'plan {
+    pub fn output_columns(
+        self,
+    ) -> impl Iterator<Item = (usize, BoundLogicalType, Vec<String>)> + 'plan {
         scan_output_columns(self.raw)
     }
 
@@ -491,7 +502,9 @@ impl<'plan> TableFunctionScan<'plan> {
 
     /// The scan's projected output columns, each a generated column index paired
     /// with its type.
-    pub fn output_columns(self) -> impl Iterator<Item = (usize, BoundLogicalType)> + 'plan {
+    pub fn output_columns(
+        self,
+    ) -> impl Iterator<Item = (usize, BoundLogicalType, Vec<String>)> + 'plan {
         scan_output_columns(self.raw)
     }
 }

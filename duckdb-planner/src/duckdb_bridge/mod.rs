@@ -261,6 +261,12 @@ pub mod ffi {
         fn lo_get_output_count(op: &LogicalOperator) -> usize;
         fn lo_get_output_column(op: &LogicalOperator, index: usize) -> usize;
         fn lo_get_output_type(op: &LogicalOperator, index: usize) -> BridgeLogicalType;
+        /// For an output column carrying a pushed field extract (`variant_extract`
+        /// / `struct_extract`), the referenced path: `depth` segments, each a
+        /// field name via `lo_get_output_extract_field`. `depth` 0 means the whole
+        /// column is read (no pushdown).
+        fn lo_get_output_extract_depth(op: &LogicalOperator, index: usize) -> usize;
+        fn lo_get_output_extract_field(op: &LogicalOperator, index: usize, seg: usize) -> String;
         /// The static `col op const` predicates DuckDB pushed into `table_filters`,
         /// rebuilt as expressions (owned by the returned list). Empty list when
         /// there are none.

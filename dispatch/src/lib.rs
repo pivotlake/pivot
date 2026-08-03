@@ -98,7 +98,9 @@ pub use operations::unary::filter::{RowDelivery, RowSelection, collect_selected_
 pub use operations::{JoinKind, JoinOutputColumns, JoinSpec};
 #[cfg(feature = "perf")]
 pub use profiler::worker_tids;
-pub use scan::{Projection, ROW_GROUP_IDX_FIELD, ROW_IDX_FIELD, trailing_metadata_columns};
+pub use scan::{
+    Projection, ROW_GROUP_IDX_FIELD, ROW_IDX_FIELD, VariantExtract, trailing_metadata_columns,
+};
 pub use stats::DataFlowStats;
 
 pub use operations::channels::{

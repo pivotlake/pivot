@@ -488,6 +488,32 @@ BridgeLogicalType lo_get_output_type(const LogicalOperator &op, size_t index) {
 	return bridge_logical_type(get.types[get_output_source(get, index)]);
 }
 
+// Depth of the field path DuckDB's pushdown-extract pass attached to a projected
+// output column: 0 = the whole column is read; N = an N-segment field path
+// (`commit.collection` = 2) is pushed, so we read only that leaf. Pushed paths
+// are linear (one child per level), one output column per extracted path.
+size_t lo_get_output_extract_depth(const LogicalOperator &op, size_t index) {
+	auto &get = as<duckdb::LogicalGet>(op);
+	const duckdb::ColumnIndex *cur = &get.GetColumnIds()[get_output_source(get, index)];
+	size_t depth = 0;
+	while (cur->ChildIndexCount() > 0) {
+		cur = &cur->GetChildIndex(0);
+		depth++;
+	}
+	return depth;
+}
+
+// The field name at 0-based segment `seg` of an output column's pushed extract
+// path (segment 0 is the first field below the column, e.g. `commit`).
+rust::String lo_get_output_extract_field(const LogicalOperator &op, size_t index, size_t seg) {
+	auto &get = as<duckdb::LogicalGet>(op);
+	const duckdb::ColumnIndex *cur = &get.GetColumnIds()[get_output_source(get, index)];
+	for (size_t i = 0; i <= seg; i++) {
+		cur = &cur->GetChildIndex(0);
+	}
+	return rust::String::lossy(cur->GetFieldName());
+}
+
 // Find a DynamicFilter inside a TableFilter, peeling off a single OPTIONAL_FILTER
 // wrapper if present. Returns nullptr when there's no DynamicFilter at the top
 // (or one level inside an OptionalFilter). More exotic shapes are intentionally

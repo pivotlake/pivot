@@ -113,6 +113,8 @@ rust::Box<OptionalTableWrapper> lo_get_take_table(const LogicalOperator &op);
 size_t lo_get_output_count(const LogicalOperator &op);
 size_t lo_get_output_column(const LogicalOperator &op, size_t index);
 BridgeLogicalType lo_get_output_type(const LogicalOperator &op, size_t index);
+size_t lo_get_output_extract_depth(const LogicalOperator &op, size_t index);
+rust::String lo_get_output_extract_field(const LogicalOperator &op, size_t index, size_t seg);
 std::unique_ptr<ExpressionList> lo_get_pushed_conditions(const LogicalOperator &op);
 size_t lo_get_dynamic_filter_count(const LogicalOperator &op);
 size_t lo_get_dynamic_filter_data_id(const LogicalOperator &op, size_t index);
