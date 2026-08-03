@@ -454,3 +454,76 @@ fn a_join_on_two_equality_conditions_matches_pairwise(mut testing_planner: Testi
         .clone()
     );
 }
+
+#[rstest]
+fn a_join_on_a_string_key_matches_exact_text(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "people",
+        &[
+            ("p_city", Type::Utf8, str_col(vec!["lyon", "oslo", "kyiv"])),
+            ("p_name", Type::Utf8, str_col(vec!["ana", "bo", "cy"])),
+        ],
+    );
+    testing_planner.add_table(
+        "cities",
+        &[
+            ("c_name", Type::Utf8, str_col(vec!["oslo", "lyon"])),
+            ("c_pop", Type::Int64, int64_col(vec![700, 500])),
+        ],
+    );
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT p_name, c_pop FROM people JOIN cities ON p_city = c_name",
+    );
+    rows.sort_by_key(|r| r["p_name"].as_str().unwrap().to_string());
+
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"p_name": "ana", "c_pop": 500},
+            {"p_name": "bo", "c_pop": 700},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
+
+#[rstest]
+fn a_join_on_an_int_and_a_string_condition_matches_pairwise(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "readings",
+        &[
+            ("r_sensor", Type::Int64, int64_col(vec![1, 1, 2])),
+            ("r_unit", Type::Utf8, str_col(vec!["c", "f", "c"])),
+            ("r_value", Type::Int64, int64_col(vec![20, 68, 21])),
+        ],
+    );
+    testing_planner.add_table(
+        "limits",
+        &[
+            ("l_sensor", Type::Int64, int64_col(vec![1, 2])),
+            ("l_unit", Type::Utf8, str_col(vec!["f", "c"])),
+            ("l_max", Type::Int64, int64_col(vec![100, 30])),
+        ],
+    );
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT r_value, l_max FROM readings \
+         JOIN limits ON r_sensor = l_sensor AND r_unit = l_unit",
+    );
+    rows.sort_by_key(|r| r["r_value"].as_i64().unwrap());
+
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"r_value": 21, "l_max": 30},
+            {"r_value": 68, "l_max": 100},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}

@@ -372,19 +372,6 @@ fn build_join(
             "joins must have at least one equality condition".to_string(),
         ));
     }
-    // A single key joins on any type `join_key_ref` admits. More keys take the
-    // dispatch join's packed-lane shapes, compiled so far for pairs of plain
-    // 32/64-bit integers; other multi-key shapes wait on the dynamic fallback.
-    if key_types.len() > 1
-        && !(key_types.len() == 2
-            && key_types
-                .iter()
-                .all(|key_type| matches!(key_type, Type::Int32 | Type::Int64)))
-    {
-        return Err(OperatorError::Unsupported(format!(
-            "unsupported multi-key join shape: {key_types:?}"
-        )));
-    }
 
     let probe_types = inputs[0].output_types()?;
     let build_types = inputs[1].output_types()?;
@@ -441,9 +428,8 @@ fn build_join(
 }
 
 /// The column ref a join key must be, with the key type restriction the
-/// dispatch join imposes: any fixed-width hashable type. Floats hash and
-/// compare by SQL semantics, not bit patterns, so they are out; strings are
-/// not fixed-width.
+/// dispatch join imposes: any fixed-width hashable type, or text. Floats
+/// hash and compare by SQL semantics, not bit patterns, so they are out.
 fn join_key_ref(key: Expression) -> Result<(usize, Type), OperatorError> {
     let Expression::Ref(key) = key else {
         return Err(OperatorError::Unsupported(format!(
@@ -462,7 +448,8 @@ fn join_key_ref(key: Expression) -> Result<(usize, Type), OperatorError> {
         | Type::Int128
         | Type::Decimal { .. }
         | Type::Date
-        | Type::Timestamp => Ok((key.column_idx, key.return_type)),
+        | Type::Timestamp
+        | Type::Utf8 => Ok((key.column_idx, key.return_type)),
         _ => Err(OperatorError::Unsupported(format!(
             "Unsupported join key type: {:?}",
             key.return_type

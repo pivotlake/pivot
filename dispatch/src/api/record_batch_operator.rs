@@ -54,11 +54,11 @@ use crate::api::operator_spec::{OperatorFactory, OperatorSpec};
 use crate::operations::channels::{StealableChannelFactory, stealable};
 use crate::operations::{
     AggregateFactory, AggregationSlot, AggregationValue, CopyOutFactory, CteFactory,
-    CteScanFactory, Distinct, DynamicFilterSlot, F64Cell, FilterFactory, GroupFactory, GroupLimit,
-    IntCell, JoinKey, JoinKind, JoinRecordBatchOperatorFactory, JoinSpec, KeyExtractor,
-    LimitFactory, MapFactory, NoOpNullaryFactory, NullaryFactory, NullaryOperatorFactory, OrderBy,
-    OrderByLimitFactory, PackedKey, SingleColumnKey, UnaryFactory, UnaryOperatorFactory, WideCell,
-    create_join_factories,
+    CteScanFactory, Distinct, DynamicFilterSlot, DynamicRowKey, F64Cell, FilterFactory,
+    GroupFactory, GroupLimit, IntCell, JoinKey, JoinKind, JoinRecordBatchOperatorFactory, JoinSpec,
+    KeyExtractor, LimitFactory, MapFactory, NoOpNullaryFactory, NullaryFactory,
+    NullaryOperatorFactory, OrderBy, OrderByLimitFactory, PackedKey, SingleColumnKey, UnaryFactory,
+    UnaryOperatorFactory, WideCell, create_join_factories,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle, DataFlowStats};
 pub const RECORD_BATCH_SIZE: usize = 8192;
@@ -621,8 +621,10 @@ impl RecordBatchOperatorSpec {
             }
             _ => {}
         }
+        // Every shape without a compiled instantiation: 3+ keys, mixed types,
+        // strings. Hash-stored with per-candidate verification.
         let [key_type] = key_types else {
-            panic!("unsupported join key shape {key_types:?}; the planner gates key shapes");
+            return self.join_dispatch::<DynamicRowKey>(build, spec);
         };
         match key_type {
             DataType::Int8 => self.join_dispatch::<SingleColumnKey<t::Int8Type>>(build, spec),
@@ -653,7 +655,9 @@ impl RecordBatchOperatorSpec {
             DataType::Decimal128(_, _) => {
                 self.join_dispatch::<SingleColumnKey<t::Decimal128Type>>(build, spec)
             }
-            other => panic!("unsupported join key type {other}; the planner gates key types"),
+            // A single-column key of any other type (a string) also takes the
+            // dynamic shape.
+            _ => self.join_dispatch::<DynamicRowKey>(build, spec),
         }
     }
 

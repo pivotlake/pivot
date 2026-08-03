@@ -16,11 +16,13 @@
 
 use crate::arrays::IntBits;
 use ahash::RandomState;
+use arrow::array::ArrayData;
 use arrow_array::cast::AsArray;
 use arrow_array::types::ArrowPrimitiveType;
-use arrow_array::{Array, PrimitiveArray, RecordBatch};
+use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch, StringViewArray};
 use arrow_buffer::NullBuffer;
-use std::hash::Hash;
+use arrow_schema::DataType;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::marker::PhantomData;
 
 /// One key shape of a hash equi-join. Implementations are zero-sized markers;
@@ -36,8 +38,15 @@ pub trait JoinKey: 'static {
     /// publishes. `()` when stored equality is already exact.
     type Verifier<'a>;
 
-    /// Bind `batch`'s key columns. Cheap: downcasts only.
-    fn make_reader<'a>(batch: &'a RecordBatch, key_columns: &[usize]) -> Self::Reader<'a>;
+    /// Bind `batch`'s key columns. Cheap: downcasts only. `state` is the
+    /// join's shared hash state, for a shape whose stored value is itself a
+    /// hash and so must carry the state into
+    /// [`read_stored`](Self::read_stored).
+    fn make_reader<'a>(
+        batch: &'a RecordBatch,
+        key_columns: &[usize],
+        state: &RandomState,
+    ) -> Self::Reader<'a>;
 
     /// Read row `idx`'s stored key. The row is in bounds, and its key columns
     /// are only null on an outer build's kept rows, which the caller screens
@@ -83,7 +92,11 @@ impl<T: ArrowPrimitiveType<Native: Hash + Eq>> JoinKey for SingleColumnKey<T> {
     type Reader<'a> = &'a PrimitiveArray<T>;
     type Verifier<'a> = ();
 
-    fn make_reader<'a>(batch: &'a RecordBatch, key_columns: &[usize]) -> Self::Reader<'a> {
+    fn make_reader<'a>(
+        batch: &'a RecordBatch,
+        key_columns: &[usize],
+        _state: &RandomState,
+    ) -> Self::Reader<'a> {
         let [key_column] = key_columns else {
             panic!("a single-column join key reads exactly one column");
         };
@@ -167,7 +180,11 @@ macro_rules! impl_packed_join_key {
             type Reader<'a> = PackedReader<($(&'a PrimitiveArray<$T>,)+)>;
             type Verifier<'a> = ();
 
-            fn make_reader<'a>(batch: &'a RecordBatch, key_columns: &[usize]) -> Self::Reader<'a> {
+            fn make_reader<'a>(
+                batch: &'a RecordBatch,
+                key_columns: &[usize],
+                _state: &RandomState,
+            ) -> Self::Reader<'a> {
                 assert_eq!(key_columns.len(), $lanes, "one key column per packed lane");
                 PackedReader {
                     arrays: ($(batch.column(key_columns[$idx]).as_primitive::<$T>(),)+),
@@ -211,3 +228,145 @@ macro_rules! impl_packed_join_key {
 impl_packed_join_key!(2; A => 0, B => 1);
 impl_packed_join_key!(3; A => 0, B => 1, C => 2);
 impl_packed_join_key!(4; A => 0, B => 1, C => 2, D => 3);
+
+/// One key column of a [`DynamicRowKey`], bound for hashing and comparison.
+/// Owned rather than borrowed (the underlying buffers are refcounted), so the
+/// reader and verifier need no borrow of the batch they were bound from.
+enum DynamicKeyColumn {
+    /// Any fixed-width type, viewed as each value's raw bytes. Both sides of
+    /// a condition arrive as one type, so byte equality is value equality.
+    Fixed {
+        values: ArrayData,
+        width: usize,
+    },
+    Utf8View(StringViewArray),
+}
+
+impl DynamicKeyColumn {
+    fn bind(column: &ArrayRef) -> Self {
+        match column.data_type() {
+            DataType::Utf8View => Self::Utf8View(column.as_string_view().clone()),
+            data_type => {
+                let width = data_type.primitive_width().unwrap_or_else(|| {
+                    panic!(
+                        "unsupported dynamic join key type {data_type}; the planner gates key types"
+                    )
+                });
+                Self::Fixed {
+                    values: column.to_data(),
+                    width,
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn value_bytes(&self, idx: usize) -> &[u8] {
+        match self {
+            Self::Fixed { values, width } => {
+                let start = (values.offset() + idx) * width;
+                &values.buffers()[0].as_slice()[start..start + width]
+            }
+            Self::Utf8View(strings) => strings.value(idx).as_bytes(),
+        }
+    }
+
+    #[inline]
+    fn write_row_to_hasher(&self, idx: usize, hasher: &mut impl Hasher) {
+        let bytes = self.value_bytes(idx);
+        // The length keeps adjacent variable-length values from aliasing
+        // across column boundaries; for fixed-width columns it is constant.
+        hasher.write_usize(bytes.len());
+        hasher.write(bytes);
+    }
+}
+
+/// Per-batch state of a [`DynamicRowKey`]: the bound key columns, their
+/// combined validity, and the hash state `read_stored` folds each row's
+/// column values through.
+pub struct DynamicReader {
+    columns: Vec<DynamicKeyColumn>,
+    validity: Option<NullBuffer>,
+    hash_state: RandomState,
+}
+
+/// The build payload's key columns, compared against during
+/// [`DynamicRowKey::verify`].
+pub struct DynamicVerifier {
+    columns: Vec<DynamicKeyColumn>,
+}
+
+/// The fallback join key: any number of key columns of any fixed-width or
+/// string type. The stored value is a hash of the whole key tuple, so
+/// distinct tuples can collide; every candidate whose stored hash matches is
+/// re-compared column by column against the build payload before it counts as
+/// a match.
+pub struct DynamicRowKey;
+
+impl JoinKey for DynamicRowKey {
+    type Stored = u64;
+    type Reader<'a> = DynamicReader;
+    type Verifier<'a> = DynamicVerifier;
+
+    fn make_reader(
+        batch: &RecordBatch,
+        key_columns: &[usize],
+        state: &RandomState,
+    ) -> DynamicReader {
+        DynamicReader {
+            columns: key_columns
+                .iter()
+                .map(|&key_column| DynamicKeyColumn::bind(batch.column(key_column)))
+                .collect(),
+            validity: combined_key_validity(batch, key_columns),
+            hash_state: state.clone(),
+        }
+    }
+
+    #[inline]
+    fn read_stored(reader: &DynamicReader, idx: usize) -> u64 {
+        let mut hasher = reader.hash_state.build_hasher();
+        for column in &reader.columns {
+            column.write_row_to_hasher(idx, &mut hasher);
+        }
+        hasher.finish()
+    }
+
+    #[inline]
+    fn hash_row(reader: &DynamicReader, idx: usize, _state: &RandomState) -> u64 {
+        Self::read_stored(reader, idx)
+    }
+
+    #[inline]
+    fn is_null(reader: &DynamicReader, idx: usize) -> bool {
+        match &reader.validity {
+            Some(validity) => !validity.is_valid(idx),
+            None => false,
+        }
+    }
+
+    fn make_verifier(build_rows: &RecordBatch, build_key_columns: &[usize]) -> DynamicVerifier {
+        DynamicVerifier {
+            columns: build_key_columns
+                .iter()
+                .map(|&key_column| DynamicKeyColumn::bind(build_rows.column(key_column)))
+                .collect(),
+        }
+    }
+
+    #[inline]
+    fn verify(
+        reader: &DynamicReader,
+        verifier: &DynamicVerifier,
+        probe_idx: usize,
+        build_row: u32,
+    ) -> bool {
+        reader
+            .columns
+            .iter()
+            .zip(&verifier.columns)
+            .all(|(probe_column, build_column)| {
+                probe_column.value_bytes(probe_idx) == build_column.value_bytes(build_row as usize)
+            })
+    }
+}

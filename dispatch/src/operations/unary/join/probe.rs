@@ -205,7 +205,7 @@ impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Probe<K, BUILD_OUTER
         let build_rows = build_rows
             .as_ref()
             .expect("probing requires a published build payload");
-        let reader = K::make_reader(window, &self.key_columns);
+        let reader = K::make_reader(window, &self.key_columns, &self.hash_state);
         let verifier = K::make_verifier(build_rows, &self.build_key_columns);
         let keys = unsafe { &*self.table.keys.get() };
         let rows = unsafe { &*self.table.rows.get() };
