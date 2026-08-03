@@ -308,8 +308,7 @@ impl Consumer<RecordBatch, ColumnChunkJob> for Partitioner {
 /// One partition's rows on one worker: the row group being filled, and the
 /// groups already cut, until a file's worth have arrived.
 ///
-/// The accumulator owns its values (see
-/// [`BatchAccumulator::owning`](dispatch::arrays::accumulator::BatchAccumulator::owning)),
+/// The accumulator owns its values (see [`BatchAccumulator::copying_values`]),
 /// so an arriving batch can be dropped as soon as it has been copied and a
 /// finished group holds nothing of it.
 struct PartitionRows {

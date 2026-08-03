@@ -47,7 +47,7 @@ pub(super) struct ViewColumn {
 }
 
 /// Where a view column's bytes live, which is what
-/// [`ValueStorage`](super::ValueStorage) decides for it.
+/// [`ValueStorage`] decides for it.
 enum ViewValues {
     /// The source batches' own data buffers, cloned into one list that the
     /// appended views are rebased onto.
