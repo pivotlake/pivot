@@ -43,6 +43,29 @@ impl ValidityMask {
         }
     }
 
+    /// Record the validity of rows gathered by chunked id: id `chunk << shift
+    /// | row` reads chunk validity `chunk_nulls[chunk]`, landing at
+    /// accumulated position `at` onward in id order.
+    pub(super) fn append_by_ids(
+        &mut self,
+        chunk_nulls: &[Option<NullBuffer>],
+        ids: &[u32],
+        shift: u32,
+        at: usize,
+    ) {
+        let mask = (1u32 << shift) - 1;
+        for (offset, &id) in ids.iter().enumerate() {
+            let Some(nulls) = &chunk_nulls[(id >> shift) as usize] else {
+                continue;
+            };
+            if !nulls.is_valid((id & mask) as usize) {
+                let position = at + offset;
+                self.words[position / 64] &= !(1 << (position % 64));
+                self.any_null = true;
+            }
+        }
+    }
+
     /// The accumulated rows' null buffer (`None` when every row is valid),
     /// resetting for the next batch.
     pub(super) fn take(&mut self, len: usize) -> Option<NullBuffer> {

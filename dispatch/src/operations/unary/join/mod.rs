@@ -42,6 +42,16 @@ use crate::memory::MultiSlabBuffer;
 use crate::operations::unary::join::directory::JoinDirectory;
 pub(crate) use factory::create_for_workers as create_join_factories;
 
+/// Rows a build payload chunk holds at most. A build row's id is
+/// `chunk_index << PAYLOAD_CHUNK_SHIFT | row_in_chunk`, so a chunk shorter
+/// than this leaves a gap in the id space; ids are only gather addresses, so
+/// the gaps cost nothing but the skipped range.
+pub(crate) const PAYLOAD_CHUNK_ROWS: usize = crate::RECORD_BATCH_SIZE;
+pub(crate) const PAYLOAD_CHUNK_SHIFT: u32 = PAYLOAD_CHUNK_ROWS.trailing_zeros();
+/// How many chunks the u32 id encoding addresses.
+pub(crate) const MAX_PAYLOAD_CHUNKS: usize = (u32::MAX as usize + 1) >> PAYLOAD_CHUNK_SHIFT;
+const _: () = assert!(PAYLOAD_CHUNK_ROWS.is_power_of_two());
+
 /// Which columns of each side the join emits, as indices into the probe and
 /// build input schemas. Downstream operators that ignore some join columns
 /// declare that here so the probe never materializes values nobody reads.
@@ -138,20 +148,21 @@ unsafe impl<T: Send> Sync for JoinCell<T> {}
 
 /// Shared hash-table state handed from the build factories to the probe
 /// factories. `keys` and `rows` are parallel arenas indexed by the directory's
-/// slot cursors: the full-width join key, and the row's index into
-/// `build_rows` (the concatenated build-side payload batch). All fields are
-/// populated by the build phase and published to probe only after every
-/// partition job has run.
+/// slot cursors: the full-width join key, and the row's payload id
+/// (`chunk << PAYLOAD_CHUNK_SHIFT | row` into `build_rows`, the build-side
+/// payload chunks). All fields are populated by the build phase and published
+/// to probe only after every partition job has run.
 #[derive(Clone)]
 pub(crate) struct JoinTable<K> {
     pub(crate) directory: Arc<JoinCell<JoinDirectory>>,
     pub(crate) keys: Arc<JoinCell<MultiSlabBuffer<K>>>,
     pub(crate) rows: Arc<JoinCell<MultiSlabBuffer<u32>>>,
-    pub(crate) build_rows: Arc<JoinCell<Option<RecordBatch>>>,
-    /// One zeroed byte per `build_rows` row, set to 1 by whichever probe worker
-    /// matches that row. Only allocated for a build-side outer join, which is
-    /// the only reader; the bytes are written as [`AtomicU8`](std::sync::atomic::AtomicU8)
-    /// because several probe workers can match the same build row at once.
+    pub(crate) build_rows: Arc<JoinCell<Vec<RecordBatch>>>,
+    /// One zeroed byte per `build_rows` payload id (gap ids included), set to
+    /// 1 by whichever probe worker matches that row. Only allocated for a
+    /// build-side outer join, which is the only reader; the bytes are written
+    /// as [`AtomicU8`](std::sync::atomic::AtomicU8) because several probe
+    /// workers can match the same build row at once.
     pub(crate) matched: Arc<JoinCell<MultiSlabBuffer<u8>>>,
 }
 
@@ -952,6 +963,49 @@ mod tests {
         assert_eq!(
             collect_key_pairs(&r.batches),
             vec![(None, Some(10)), (None, Some(30)), (Some(20), Some(20))]
+        );
+    }
+
+    /// Short build batches become short payload chunks with gaps in the id
+    /// space; matched rows must still gather their string payload from the
+    /// right chunk. The long value lives outside a view's inline bytes, so it
+    /// exercises the buffer-rebasing gather path too.
+    #[test]
+    fn short_payload_chunks_gather_from_the_right_chunk() {
+        let build = vec![
+            keyed_names_batch(&[1, 2, 3], &["a", "b", "c"]),
+            keyed_names_batch(&[4, 5], &["d", "a-value-too-long-to-inline"]),
+            keyed_names_batch(&[6, 7, 8, 9], &["f", "g", "h", "i"]),
+        ];
+        let probe = int64_batch(&[5, 2, 9]);
+
+        let r = build_and_probe(vec![build], vec![probe]);
+
+        let mut pairs: Vec<(i64, String)> = r
+            .batches
+            .iter()
+            .flat_map(|batch| {
+                let keys = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let names = batch
+                    .column(2)
+                    .as_any()
+                    .downcast_ref::<StringViewArray>()
+                    .unwrap();
+                (0..batch.num_rows()).map(|i| (keys.value(i), names.value(i).to_string()))
+            })
+            .collect();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            vec![
+                (2, "b".to_string()),
+                (5, "a-value-too-long-to-inline".to_string()),
+                (9, "i".to_string())
+            ]
         );
     }
 }
