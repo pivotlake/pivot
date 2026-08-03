@@ -16,6 +16,7 @@ use crate::parquet::{ParquetTable, table_input};
 use arrow::compute::cast;
 use arrow_array::types::{
     Date32Type, Decimal64Type, Decimal128Type, Float32Type, Float64Type, Int32Type, Int64Type,
+    UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow_array::{
     Array, ArrayRef, ArrowPrimitiveType, BinaryViewArray, PrimitiveArray, RecordBatch, StringArray,
@@ -325,6 +326,23 @@ macro_rules! type_tests {
 type_tests! {
     int32 => primitive::<Int32Type>(PACKED, |row| row as i32 * 7_919, as_is);
     int64 => primitive::<Int64Type>(PACKED, |row| row as i64 * 7_919_483, as_is);
+    // Unsigned columns store their bits in a signed physical type, so each of
+    // these holds values past that type's maximum: they read back as themselves
+    // only if the file kept the column's width and signedness. None has a delta
+    // form (its deltas would not fit the physical type's declared width), so
+    // distinct values stay plain.
+    //
+    // A `u8` column is the exception that cannot leave the dictionary: 256 is
+    // every value the type has, well under the share of the rows at which the
+    // encoder gives up, so all three of its shapes take the dictionary.
+    uint8 => primitive::<UInt8Type>(DICTIONARY, |row| (row % 256) as u8, as_is);
+    uint16 => primitive::<UInt16Type>(PLAIN, |row| 40_000u16.wrapping_add(row as u16), as_is);
+    uint32 => primitive::<UInt32Type>(PLAIN, |row| 4_000_000_000 + row as u32, as_is);
+    uint64 => primitive::<UInt64Type>(
+        PLAIN,
+        |row| 18_000_000_000_000_000_000 + row as u64,
+        as_is
+    );
     // 9204 days after the epoch is 1995-03-15.
     date32 => primitive::<Date32Type>(PACKED, |row| 9_204 + row as i32, as_is);
     // A float is not a whole number, so it has no delta form and no dictionary

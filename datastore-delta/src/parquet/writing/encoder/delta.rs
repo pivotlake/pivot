@@ -67,6 +67,12 @@ pub(super) fn try_encode_chunk(
 
 /// The delta encoding a column of this type takes, or `None` for one that has
 /// none.
+///
+/// An unsigned column is deliberately absent, though it is stored as an integer
+/// and read back from a delta page fine: the deltas here are accumulated in
+/// `i64`, so an unsigned value past its signed maximum would need more bits than
+/// the physical type it is annotated as declares. Such a column takes a
+/// dictionary or PLAIN instead, which store its bits at their declared width.
 fn encoding_for(data_type: &DataType) -> Option<Encoding> {
     match data_type {
         DataType::Int32 | DataType::Int64 | DataType::Date32 => Some(Encoding::DELTA_BINARY_PACKED),

@@ -11,7 +11,10 @@
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Date32Array, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{
+    ArrayRef, Date32Array, Float64Array, Int64Array, RecordBatch, StringArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
+};
 use arrow_schema::{ArrowError, DataType, Schema};
 use dispatch::{BUFFER_SIZE, Dispatch, values_input};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -594,6 +597,107 @@ fn a_date_column_reads_back_as_a_date() {
         .values()
         .to_vec();
     assert_eq!(read, days);
+}
+
+/// The four unsigned columns, each holding values past the signed maximum of
+/// the physical type it is stored in — the values a file that lost the column's
+/// width or signedness reads back wrong.
+fn unsigned_columns() -> Vec<(&'static str, ArrayRef)> {
+    let bytes: Vec<u8> = (0..2_000).map(|i| (128 + i % 128) as u8).collect();
+    let shorts: Vec<u16> = (0..2_000).map(|i| 40_000 + i as u16).collect();
+    let ints: Vec<u32> = (0..2_000).map(|i| 4_000_000_000 + i as u32).collect();
+    let longs: Vec<u64> = (0..2_000)
+        .map(|i| 18_000_000_000_000_000_000 + i as u64)
+        .collect();
+    vec![
+        ("u8", Arc::new(UInt8Array::from(bytes)) as ArrayRef),
+        ("u16", Arc::new(UInt16Array::from(shorts))),
+        ("u32", Arc::new(UInt32Array::from(ints))),
+        ("u64", Arc::new(UInt64Array::from(longs))),
+    ]
+}
+
+/// An unsigned column stores its bits in a signed physical type, so a value past
+/// that type's maximum comes back as a negative number unless the file says how
+/// wide the column really is and that it is unsigned. Arrow-rs reading these
+/// back as their own unsigned types is what says the annotation landed.
+#[test]
+fn unsigned_columns_read_back_unsigned() {
+    let columns = unsigned_columns();
+
+    let files = write(vec![ColumnsItem(columns.clone())], 100_000);
+
+    let batch = read_back(&files[0]);
+    for (i, (name, written)) in columns.iter().enumerate() {
+        assert_eq!(batch.schema().field(i).name(), name);
+        assert_eq!(batch.column(i), written, "column {name} round trips");
+    }
+}
+
+/// An unsigned column that repeats itself takes the dictionary, whose page
+/// stores the distinct values through the same encoder a PLAIN page uses. Both
+/// paths write the values, so both are covered: this one and the all-distinct
+/// column below.
+#[test]
+fn a_repeating_unsigned_column_round_trips_through_the_dictionary() {
+    let values: Vec<u8> = (0..2_000).map(|i| (128 + i % 64) as u8).collect();
+    let column: ArrayRef = Arc::new(UInt8Array::from(values.clone()));
+
+    let files = write(vec![ColumnsItem(vec![("u8", column)])], 400_000);
+
+    let (_, encodings) = leaf_encodings(&files[0]).pop().unwrap();
+    assert!(
+        encodings.contains(&"RLE_DICTIONARY".to_string()),
+        "expected a dictionary, got {encodings:?}"
+    );
+    let batch = read_back(&files[0]);
+    assert_eq!(batch.column(0).as_ref(), &UInt8Array::from(values));
+}
+
+/// An all-distinct unsigned column falls out of the dictionary and takes PLAIN,
+/// since the delta form the signed integers take is not open to it (its values
+/// would not fit the width the physical type declares).
+#[test]
+fn an_all_distinct_unsigned_column_round_trips_through_plain() {
+    let values: Vec<u64> = (0..2_000)
+        .map(|i| 18_000_000_000_000_000_000 + i as u64)
+        .collect();
+    let column: ArrayRef = Arc::new(UInt64Array::from(values.clone()));
+
+    let files = write(vec![ColumnsItem(vec![("u64", column)])], 400_000);
+
+    let (_, encodings) = leaf_encodings(&files[0]).pop().unwrap();
+    assert_eq!(encodings, vec!["PLAIN".to_string()]);
+    let batch = read_back(&files[0]);
+    assert_eq!(batch.column(0).as_ref(), &UInt64Array::from(values));
+}
+
+/// An unsigned column's footer bounds have to be ordered as unsigned, or a
+/// reader pruning row groups by them drops live rows: every value here is past
+/// the signed maximum, so signed bounds would order the whole column below zero.
+#[test]
+fn unsigned_column_bounds_are_ordered_unsigned() {
+    let values: Vec<u32> = vec![4_000_000_000, 7, 2_147_483_648, 4_294_967_295];
+    let column: ArrayRef = Arc::new(UInt32Array::from(values));
+
+    let files = write(vec![ColumnsItem(vec![("u32", column)])], 100_000);
+
+    let reader =
+        ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(&files[0])).unwrap();
+    let stats = reader.metadata().row_group(0).column(0).statistics();
+    let bounds = stats.map(|s| {
+        (
+            s.min_bytes_opt().map(<[u8]>::to_vec),
+            s.max_bytes_opt().map(<[u8]>::to_vec),
+        )
+    });
+    assert_eq!(
+        bounds,
+        Some((
+            Some(7u32.to_le_bytes().to_vec()),
+            Some(4_294_967_295u32.to_le_bytes().to_vec())
+        ))
+    );
 }
 
 /// The dictionary is left behind on how many distinct values a column has, not
