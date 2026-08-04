@@ -46,7 +46,8 @@ pub struct JoinProbeFactory<K: JoinKey, const BUILD_OUTER: bool, const SEMI: boo
     key_columns: Vec<usize>,
     build_key_columns: Vec<usize>,
     output_columns: Arc<JoinOutputColumns>,
-    probe_fields: Option<Arc<Vec<Field>>>,
+    probe_fields: Arc<Vec<Field>>,
+    build_fields: Arc<Vec<Field>>,
     unmatched: Arc<UnmatchedScan>,
 }
 
@@ -72,13 +73,11 @@ pub fn create_for_workers<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
         build_key_columns,
         probe_key_columns,
         output_columns,
+        probe_fields,
+        build_fields,
         kind,
     } = spec;
-    let outer_probe_fields = match kind {
-        JoinKind::Inner | JoinKind::ProbeSemi => None,
-        JoinKind::BuildOuter { probe_fields } => Some(probe_fields),
-    };
-    debug_assert_eq!(BUILD_OUTER, outer_probe_fields.is_some());
+    debug_assert_eq!(BUILD_OUTER, matches!(kind, JoinKind::BuildOuter));
     debug_assert!(
         !SEMI || output_columns.build.is_empty(),
         "a semi join emits no build columns"
@@ -120,7 +119,8 @@ pub fn create_for_workers<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
     });
 
     let output_columns = Arc::new(output_columns);
-    let probe_fields = outer_probe_fields.map(Arc::new);
+    let probe_fields = Arc::new(probe_fields);
+    let build_fields = Arc::new(build_fields);
     let unmatched = Arc::new(UnmatchedScan::new(worker_count));
     let probe_factories = (0..worker_count).map(move |_| JoinProbeFactory {
         table: table_clone.clone(),
@@ -129,6 +129,7 @@ pub fn create_for_workers<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
         build_key_columns: probe_side_build_key_columns.clone(),
         output_columns: output_columns.clone(),
         probe_fields: probe_fields.clone(),
+        build_fields: build_fields.clone(),
         unmatched: unmatched.clone(),
     });
 
@@ -170,6 +171,7 @@ impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> UnaryFactory<RecordB
             self.build_key_columns,
             self.output_columns,
             self.probe_fields,
+            self.build_fields,
             self.unmatched,
         )
     }

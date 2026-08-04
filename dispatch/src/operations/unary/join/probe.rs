@@ -57,21 +57,24 @@ pub struct Probe<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> {
     /// join fills the probe indices alone; it has no build columns to gather.
     probe_indices: Vec<u32>,
     build_indices: Vec<u32>,
-    /// The two output sides, created on the first batch (a schema only
-    /// exists then). Both receive the same row count per drain, so they fill
-    /// and emit in lockstep — except in a semi join, where the build side stays
-    /// empty and contributes only its (zero) columns.
-    sides: Option<OutputSides>,
-    /// The fields the probe side contributes to the output, when the caller
-    /// supplied them (a build-side outer join always does). Taking them over
-    /// the probed batch's own schema is what lets a worker that never saw a
-    /// probe batch still shape the unmatched rows.
-    probe_fields: Option<Arc<Vec<Field>>>,
+    outputter: Outputter,
+    /// The stored build rows bound for gathering output columns. `None` only
+    /// until the build side publishes, which every call that reaches it has
+    /// already waited out.
+    build_gather: Option<BuildGather>,
     /// Shared progress of the unmatched pass. Unused by an inner join.
     unmatched: Arc<UnmatchedScan>,
     /// Whether this worker has entered `finish` — the point it stops probing
     /// and leaves the barrier the unmatched pass waits on.
     probing_done: bool,
+}
+
+/// The stored build rows bound for reading output columns back: the batches
+/// restricted to the listed build columns (for the unmatched pass's per-batch
+/// scan), and the same batches prepared for gathering matched rows by row id.
+struct BuildGather {
+    build_row_batches: Vec<RecordBatch>,
+    columns: ChunkedColumns,
 }
 
 impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Probe<K, BUILD_OUTER, SEMI> {
@@ -82,69 +85,40 @@ impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Probe<K, BUILD_OUTER
         key_columns: Vec<usize>,
         build_key_columns: Vec<usize>,
         output_columns: Arc<JoinOutputColumns>,
-        probe_fields: Option<Arc<Vec<Field>>>,
+        probe_fields: Arc<Vec<Field>>,
+        build_fields: Arc<Vec<Field>>,
         unmatched: Arc<UnmatchedScan>,
     ) -> Self {
+        let mut allocator = SlabAllocator::new(false);
+        let outputter = Outputter::new(&probe_fields, &build_fields, &mut allocator);
         Self {
             table,
             hash_state,
             key_columns,
             build_key_columns,
             output_columns,
-            allocator: SlabAllocator::new(false),
+            allocator,
             probe_indices: vec![0; RECORD_BATCH_SIZE],
             build_indices: vec![0; RECORD_BATCH_SIZE],
-            sides: None,
-            probe_fields,
+            outputter,
+            build_gather: None,
             unmatched,
             probing_done: false,
         }
     }
 
-    /// Build the output sides if this worker has not already, given the
-    /// stored build rows and, when one is at hand, the schema of a probed
-    /// batch.
-    fn ensure_output_sides_initialized(
+    /// Bind the published build rows for output gathering, once.
+    fn ensure_build_gather_bound(
         &mut self,
         build_rows: &build_rows::BuildRowBatches,
-        probe_schema: Option<&Schema>,
     ) -> unary::Result<()> {
-        if self.sides.is_some() {
+        if self.build_gather.is_some() {
             return Ok(());
         }
-        let build_schema = build_rows.batches()[0].schema();
-        let probe_fields: Vec<Field> = match &self.probe_fields {
-            Some(fields) => fields.as_ref().clone(),
-            None => {
-                let schema = probe_schema.expect("a join without given probe fields has a batch");
-                self.output_columns
-                    .probe
-                    .iter()
-                    .map(|&i| schema.field(i).clone())
-                    .collect()
-            }
-        };
-        let build_fields: Vec<Field> = self
-            .output_columns
-            .build
-            .iter()
-            .map(|&i| build_schema.field(i).clone())
-            .collect();
-        let fields: Vec<Field> = probe_fields.iter().chain(&build_fields).cloned().collect();
-        let (build_row_batches, build_gather) =
-            build_rows.gather_source(&self.output_columns.build)?;
-        self.sides = Some(OutputSides {
-            output_schema: Arc::new(Schema::new(fields)),
-            probe: BatchAccumulator::retaining_source_buffers(
-                Arc::new(Schema::new(probe_fields)),
-                &mut self.allocator,
-            ),
-            build: BatchAccumulator::retaining_source_buffers(
-                Arc::new(Schema::new(build_fields)),
-                &mut self.allocator,
-            ),
+        let (build_row_batches, columns) = build_rows.gather_source(&self.output_columns.build)?;
+        self.build_gather = Some(BuildGather {
             build_row_batches,
-            build_gather,
+            columns,
         });
         Ok(())
     }
@@ -157,18 +131,19 @@ impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Probe<K, BUILD_OUTER
         sender: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<bool> {
         let build_row_batch_idx = self.unmatched.cursor.fetch_add(1, Ordering::Relaxed);
-        let sides = self
-            .sides
-            .as_mut()
-            .expect("sides are built before scanning");
-        if build_row_batch_idx >= sides.build_row_batches.len() {
-            if !sides.build.is_empty() {
-                sides.emit_unmatched_build_rows(&mut self.allocator, sender)?;
+        let gather = self
+            .build_gather
+            .as_ref()
+            .expect("the build rows are bound before scanning");
+        if build_row_batch_idx >= gather.build_row_batches.len() {
+            if !self.outputter.build.is_empty() {
+                self.outputter
+                    .emit_unmatched_build_rows(&mut self.allocator, sender)?;
             }
             return Ok(true);
         }
 
-        let batch = &sides.build_row_batches[build_row_batch_idx];
+        let batch = &gather.build_row_batches[build_row_batch_idx];
         let first_row_id = build_rows::first_row_id(build_row_batch_idx);
         let flags = unsafe { &*self.table.matched.get() };
         let mut found = 0;
@@ -181,14 +156,15 @@ impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Probe<K, BUILD_OUTER
             found += (unsafe { *flags.ptr_at_index(first_row_id + row) } == 0) as usize;
         }
         if found > 0 {
-            sides.build.append_batch_by_indices(
+            self.outputter.build.append_batch_by_indices(
                 batch,
                 &self.build_indices[..found],
                 &mut self.allocator,
             );
         }
-        if sides.build.has_full_batch() {
-            sides.emit_unmatched_build_rows(&mut self.allocator, sender)?;
+        if self.outputter.build.has_full_batch() {
+            self.outputter
+                .emit_unmatched_build_rows(&mut self.allocator, sender)?;
         }
         Ok(false)
     }
@@ -213,7 +189,12 @@ impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Probe<K, BUILD_OUTER
             verifier,
             window_offset,
             probe_source,
-            sides: self.sides.as_mut().expect("sides are built before probing"),
+            outputter: &mut self.outputter,
+            build_columns: &self
+                .build_gather
+                .as_ref()
+                .expect("the build rows are bound before probing")
+                .columns,
             probe_indices: &mut self.probe_indices,
             build_indices: &mut self.build_indices,
             matched: 0,
@@ -256,7 +237,7 @@ impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Unary<RecordBatch, R
             return Ok(());
         }
 
-        self.ensure_output_sides_initialized(build_rows, Some(batch.schema_ref()))?;
+        self.ensure_build_gather_bound(build_rows)?;
         let probe_source = batch.project(&self.output_columns.probe)?;
 
         let total = batch.num_rows();
@@ -273,10 +254,8 @@ impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Unary<RecordBatch, R
     fn finish(&mut self, sender: &mut dyn Sender<RecordBatch>) -> unary::Result<bool> {
         if !self.probing_done {
             self.probing_done = true;
-            if let Some(sides) = &mut self.sides
-                && !sides.probe.is_empty()
-            {
-                sides.emit(&mut self.allocator, sender)?;
+            if !self.outputter.probe.is_empty() {
+                self.outputter.emit(&mut self.allocator, sender)?;
             }
             if BUILD_OUTER {
                 // Release this worker's flag writes and leave the barrier. It
@@ -298,27 +277,40 @@ impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Unary<RecordBatch, R
         if build_rows.is_empty() {
             return Ok(true);
         }
-        self.ensure_output_sides_initialized(build_rows, None)?;
+        self.ensure_build_gather_bound(build_rows)?;
         self.send_out_next_unmatched_build_rows(sender)
     }
 }
 
-/// The join's output state: the selected probe columns and selected build
-/// columns accumulate separately (their rows come from different
-/// sources), and every emitted batch splices them under one schema.
-struct OutputSides {
+/// Emits the join's output: the selected probe columns and selected build
+/// columns accumulate separately (their rows come from different sources),
+/// and every emitted batch splices them under one schema. Both sides receive
+/// the same row count per drain, so they fill and emit in lockstep — except
+/// in a semi join, where the build side stays empty and contributes only its
+/// (zero) columns.
+struct Outputter {
     /// The probe columns listed in the output, then the build columns.
     output_schema: SchemaRef,
     probe: BatchAccumulator,
     build: BatchAccumulator,
-    /// The stored build row batches restricted to the listed build columns,
-    /// for the unmatched pass's per-batch scan.
-    build_row_batches: Vec<RecordBatch>,
-    /// The same batches prepared for gathering matched rows by row id.
-    build_gather: ChunkedColumns,
 }
 
-impl OutputSides {
+impl Outputter {
+    fn new(probe_fields: &[Field], build_fields: &[Field], allocator: &mut SlabAllocator) -> Self {
+        let fields: Vec<Field> = probe_fields.iter().chain(build_fields).cloned().collect();
+        Self {
+            output_schema: Arc::new(Schema::new(fields)),
+            probe: BatchAccumulator::retaining_source_buffers(
+                Arc::new(Schema::new(probe_fields.to_vec())),
+                allocator,
+            ),
+            build: BatchAccumulator::retaining_source_buffers(
+                Arc::new(Schema::new(build_fields.to_vec())),
+                allocator,
+            ),
+        }
+    }
+
     /// Emit one combined batch from the two sides' accumulated rows.
     fn emit(
         &mut self,
@@ -389,7 +381,9 @@ struct ProbeMatchCollector<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SE
     window_offset: usize,
     /// The probed batch restricted to the listed probe columns.
     probe_source: &'b RecordBatch,
-    sides: &'a mut OutputSides,
+    outputter: &'a mut Outputter,
+    /// The stored build rows' listed columns, gathered from by row id.
+    build_columns: &'a ChunkedColumns,
 
     probe_indices: &'a mut [u32],
     build_indices: &'a mut [u32],
@@ -402,8 +396,8 @@ struct ProbeMatchCollector<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SE
 impl<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
     ProbeMatchCollector<'a, 'b, K, BUILD_OUTER, SEMI>
 {
-    /// Append the collected pairs to the output sides, emitting if a full
-    /// batch accumulated.
+    /// Append the collected pairs to the outputter, emitting if a full batch
+    /// accumulated.
     #[inline(never)]
     fn drain(&mut self) -> unary::Result<()> {
         if self.matched == 0 {
@@ -419,13 +413,7 @@ impl<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
                 unsafe { AtomicU8::from_ptr(flag) }.store(1, Ordering::Relaxed);
             }
         }
-        let OutputSides {
-            probe,
-            build,
-            build_gather,
-            ..
-        } = &mut *self.sides;
-        probe.append_batch_by_indices(
+        self.outputter.probe.append_batch_by_indices(
             self.probe_source,
             &self.probe_indices[..self.matched],
             self.allocator,
@@ -433,15 +421,15 @@ impl<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
         // A semi join has no build columns and buffered no build rows: its
         // build side only ever contributes its (empty) column list on emit.
         if !SEMI {
-            build.append_chunked_by_ids(
-                build_gather,
+            self.outputter.build.append_chunked_by_ids(
+                self.build_columns,
                 &self.build_indices[..self.matched],
                 self.allocator,
             );
         }
         self.matched = 0;
-        if self.sides.probe.has_full_batch() {
-            self.sides.emit(self.allocator, self.sender)?;
+        if self.outputter.probe.has_full_batch() {
+            self.outputter.emit(self.allocator, self.sender)?;
         }
         Ok(())
     }

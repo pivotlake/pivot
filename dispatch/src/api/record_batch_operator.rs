@@ -603,6 +603,16 @@ impl RecordBatchOperatorSpec {
             key_types.len(),
             "one probe key column per key type"
         );
+        assert_eq!(
+            spec.probe_fields.len(),
+            spec.output_columns.probe.len(),
+            "one probe field per listed probe output column"
+        );
+        assert_eq!(
+            spec.build_fields.len(),
+            spec.output_columns.build.len(),
+            "one build field per listed build output column"
+        );
         // Multi-key shapes: the packed-lane combos compiled so far. Any int
         // pair combo (or a higher arity) is one more arm naming its
         // PackedKey tuple; the impls already exist for every arity.
@@ -666,7 +676,7 @@ impl RecordBatchOperatorSpec {
     fn join_dispatch<K: JoinKey>(self, build: RecordBatchOperatorSpec, spec: JoinSpec) -> Self {
         match spec.kind {
             JoinKind::Inner => self.join_typed::<K, false, false>(build, spec),
-            JoinKind::BuildOuter { .. } => self.join_typed::<K, true, false>(build, spec),
+            JoinKind::BuildOuter => self.join_typed::<K, true, false>(build, spec),
             JoinKind::ProbeSemi => self.join_typed::<K, false, true>(build, spec),
         }
     }

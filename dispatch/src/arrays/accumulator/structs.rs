@@ -16,7 +16,7 @@ use arrow_array::{Array, ArrayRef, StructArray};
 use arrow_schema::{ArrowError, Fields};
 
 use super::chunked::ChunkedColumn;
-use super::column::{AppendSource, ColumnAccumulator, SourceSelection};
+use super::column::{AppendSource, ColumnAccumulator};
 use super::validity::ValidityMask;
 use super::{ValueStorage, create_column_accumulator};
 use crate::memory::SlabAllocator;
