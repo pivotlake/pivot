@@ -15,6 +15,7 @@ use crate::operations::unary::UnaryOperator;
 use crate::operations::unary::join::build::{
     BuildWorkerOutput, JoinBuildConsumer, JoinPartitionJob, NUM_PARTITIONS,
 };
+use crate::operations::unary::join::build_rows::BuildRowBatches;
 use crate::operations::unary::join::directory::JoinDirectory;
 use crate::operations::unary::join::keys::JoinKey;
 use crate::operations::unary::join::probe::Probe;
@@ -50,7 +51,7 @@ pub struct JoinProbeFactory<K: JoinKey, const BUILD_OUTER: bool, const SEMI: boo
 }
 
 /// Create `worker_count` build factories and probe factories that share the
-/// same [`JoinTable`] (directory + key/row arenas + build payload) and hash
+/// same [`JoinTable`] (directory + key/row arenas + stored build rows) and hash
 /// state.
 ///
 /// Returns `(build_factories, probe_factories, build_ready)`. The build
@@ -89,7 +90,7 @@ pub fn create_for_workers<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
         directory: Arc::new(JoinCell::new(JoinDirectory::initial())),
         keys: Arc::new(JoinCell::new(MultiSlabBuffer::<K::Stored>::new(vec![]))),
         rows: Arc::new(JoinCell::new(MultiSlabBuffer::<u32>::new(vec![]))),
-        build_rows: Arc::new(JoinCell::new(Vec::new())),
+        build_rows: Arc::new(JoinCell::new(BuildRowBatches::new())),
         matched: Arc::new(JoinCell::new(MultiSlabBuffer::<u8>::new(vec![]))),
     };
     let injector = Arc::new(Injector::new());
