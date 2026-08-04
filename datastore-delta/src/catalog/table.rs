@@ -45,14 +45,13 @@ impl TableFile {
 /// (an append of freshly-uploaded files, or a compaction swap) commits a new
 /// manifest version by compare-and-swap, retrying past a concurrent writer. Copies drift
 /// freely; [`refresh`](Self::refresh) reconciles any copy to the latest version
-/// (re-reading only the footers it doesn't already hold). `store`, `name`, and
-/// `location` are kept so a copy can persist and reload itself.
+/// (re-reading only the footers it doesn't already hold). `store` and `location`
+/// are kept so a copy can persist and reload itself.
 #[derive(Clone)]
 pub struct CatalogTable {
-    name: String,
     /// The table's durable identity, from the Delta `metaData.id` (minted once at
     /// creation, stable across renames and every commit). The catalog indexes by
-    /// this; `name` is only the user-facing label.
+    /// this.
     id: uuid::Uuid,
     /// Where the table's Parquet data lives in the object store.
     location: ObjectPath,
@@ -72,7 +71,6 @@ impl CatalogTable {
     /// persist anything; the manifest it was loaded from is already durable.
     #[allow(clippy::too_many_arguments)] // an internal constructor; each field is needed
     pub(super) fn new(
-        name: String,
         id: uuid::Uuid,
         location: ObjectPath,
         manifest: TableManifest,
@@ -82,7 +80,6 @@ impl CatalogTable {
         delta_uri: url::Url,
     ) -> Self {
         Self {
-            name,
             id,
             location,
             manifest,
@@ -97,7 +94,6 @@ impl CatalogTable {
     /// Delta version 0 with its protocol, metadata, and initial `Add` actions.
     #[allow(clippy::too_many_arguments)] // an internal constructor; each field is needed
     pub(super) fn create_new(
-        name: String,
         location: ObjectPath,
         files: Vec<TableFile>,
         columns: Vec<Column>,
@@ -133,7 +129,6 @@ impl CatalogTable {
             entries,
         };
         Ok(Self {
-            name,
             id,
             location,
             manifest,
@@ -211,7 +206,7 @@ impl CatalogTable {
                     .any(|entry| entry.file.path.as_str() == path.as_str())
             }) {
                 return Err(Error::CommitConflict {
-                    table: self.name.clone(),
+                    location: self.location.as_str().to_string(),
                     file: missing.to_string(),
                 });
             }
@@ -310,11 +305,6 @@ impl CatalogTable {
 
     pub fn files(&self) -> &[TableFile] {
         &self.files
-    }
-
-    /// The table's name.
-    pub fn name(&self) -> &str {
-        &self.name
     }
 
     /// The table's durable identity (Delta `metaData.id`), stable across renames
@@ -429,7 +419,7 @@ impl CatalogTable {
             let file = by_path
                 .get(&entry.file.path)
                 .ok_or_else(|| Error::FooterNotLoaded {
-                    table: self.name.clone(),
+                    location: self.location.as_str().to_string(),
                     file: entry.file.path.as_str().to_string(),
                 })?;
             row_groups.extend(file.row_groups.iter().cloned());

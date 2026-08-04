@@ -90,8 +90,7 @@ fn collect_tables(datastore: &DeltaDatastore) -> Vec<TableMeta> {
     datastore
         .tables()
         .into_iter()
-        .map(|table| {
-            let name = table.name().to_string();
+        .map(|(name, table)| {
             let columns = table
                 .columns()
                 .into_iter()

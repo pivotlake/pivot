@@ -82,8 +82,8 @@ impl ServerHandle {
     fn table_versions(&self) -> HashMap<String, u64> {
         self.datastore
             .tables()
-            .iter()
-            .map(|table| (table.name().to_string(), table.version()))
+            .into_iter()
+            .map(|(name, table)| (name, table.version()))
             .collect()
     }
 }

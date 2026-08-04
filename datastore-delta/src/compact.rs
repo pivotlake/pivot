@@ -144,8 +144,8 @@ impl Compacter {
     /// and a future standalone compacter binary, can drive one round without
     /// the loop.)
     pub async fn compact_all(&self) {
-        for table in self.datastore.tables() {
-            self.compact_table(table).await;
+        for (name, table) in self.datastore.tables() {
+            self.compact_table(name, table).await;
         }
     }
 
@@ -155,9 +155,9 @@ impl Compacter {
     /// Each batch is capped at roughly one output file's worth, so a long
     /// backlog (e.g. after a restart) is worked off with bounded memory.
     /// Errors are logged and end the table's round, the next poll retries.
-    async fn compact_table(&self, mut table: CatalogTable) {
+    async fn compact_table(&self, name: String, mut table: CatalogTable) {
         if let Err(e) = table.refresh() {
-            warn!(table = table.name(), error = %e, "compaction: table refresh failed");
+            warn!(table = name, error = %e, "compaction: table refresh failed");
             return;
         }
         while let Some(inputs) = self.next_batch(&table) {
@@ -173,19 +173,15 @@ impl Compacter {
                     // query's snapshot reads the merged file instead of the
                     // swapped-out inputs.
                     table = committed;
-                    info!(
-                        table = table.name(),
-                        files = merged.len(),
-                        "compacted batch"
-                    );
+                    info!(table = name, files = merged.len(), "compacted batch");
                     self.datastore.publish_table(table.clone());
                 }
                 Ok(Err(e)) => {
-                    error!(table = table.name(), error = %e, "compaction merge failed");
+                    error!(table = name, error = %e, "compaction merge failed");
                     return;
                 }
                 Err(e) => {
-                    error!(table = table.name(), error = %e, "compaction job panicked");
+                    error!(table = name, error = %e, "compaction job panicked");
                     return;
                 }
             }
