@@ -43,19 +43,19 @@ impl ValidityMask {
         }
     }
 
-    /// Record the validity of rows gathered by chunked id: id `chunk << shift
-    /// | row` reads chunk validity `chunk_nulls[chunk]`, landing at
-    /// accumulated position `at` onward in id order.
-    pub(super) fn append_by_ids(
+    /// Record the validity of rows gathered by encoded id: id
+    /// `batch << shift | row` reads the validity `batch_nulls(batch)` returns,
+    /// landing at accumulated position `at` onward in id order.
+    pub(super) fn append_by_ids<'n>(
         &mut self,
-        chunk_nulls: &[Option<NullBuffer>],
         ids: &[u32],
         shift: u32,
         at: usize,
+        batch_nulls: impl Fn(usize) -> Option<&'n NullBuffer>,
     ) {
         let mask = (1u32 << shift) - 1;
         for (offset, &id) in ids.iter().enumerate() {
-            let Some(nulls) = &chunk_nulls[(id >> shift) as usize] else {
+            let Some(nulls) = batch_nulls((id >> shift) as usize) else {
                 continue;
             };
             if !nulls.is_valid((id & mask) as usize) {

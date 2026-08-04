@@ -40,14 +40,14 @@ mod structs;
 mod validity;
 mod view;
 
-pub use chunked::ChunkedGatherSource;
+pub use chunked::ChunkedColumns;
 
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{ArrowError, DataType, Fields, SchemaRef};
 
 use crate::RECORD_BATCH_SIZE;
 use crate::memory::{BUFFER_SIZE, SlabAllocator};
-use column::{ColumnAccumulator, SourceSelection};
+use column::{AppendSource, ColumnAccumulator, SourceSelection};
 use concatenated::ConcatenatedColumn;
 use fixed_width::FixedWidthColumn;
 use structs::StructColumn;
@@ -185,19 +185,27 @@ impl BatchAccumulator {
         self.append_selection(batch, SourceSelection::Indices(indices), allocator);
     }
 
-    /// Append the rows of a prepared chunked source at the encoded `ids`
-    /// (`chunk << shift | row`, see [`ChunkedGatherSource`]), which must be no
+    /// Append the rows of a chunked row store at the encoded `ids`
+    /// (`batch << shift | row`, see [`ChunkedColumns`]), which must be no
     /// more than the remaining [`capacity`](Self::capacity). The source's
     /// schema must match the accumulator's.
     pub fn append_chunked_by_ids(
         &mut self,
-        source: &ChunkedGatherSource,
+        source: &ChunkedColumns,
         ids: &[u32],
         allocator: &mut SlabAllocator,
     ) {
         debug_assert!(self.len + ids.len() <= self.capacity);
         for (accumulator, column) in self.columns.iter_mut().zip(&source.columns) {
-            accumulator.append_chunked(column, ids, source.shift, self.len, allocator);
+            accumulator.append(
+                AppendSource::Chunked {
+                    column,
+                    ids,
+                    shift: source.shift,
+                },
+                self.len,
+                allocator,
+            );
         }
         self.len += ids.len();
     }
@@ -226,7 +234,11 @@ impl BatchAccumulator {
     ) {
         debug_assert!(self.len + selection.len() <= self.capacity);
         for (accumulator, column) in self.columns.iter_mut().zip(batch.columns()) {
-            accumulator.append(column, selection, self.len, allocator);
+            accumulator.append(
+                AppendSource::Batch { column, selection },
+                self.len,
+                allocator,
+            );
         }
         self.len += selection.len();
     }

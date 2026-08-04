@@ -15,8 +15,8 @@ use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, StructArray};
 use arrow_schema::{ArrowError, Fields};
 
-use super::chunked::PreparedColumn;
-use super::column::{ColumnAccumulator, SourceSelection};
+use super::chunked::ChunkedColumn;
+use super::column::{AppendSource, ColumnAccumulator, SourceSelection};
 use super::validity::ValidityMask;
 use super::{ValueStorage, create_column_accumulator};
 use crate::memory::SlabAllocator;
@@ -51,34 +51,44 @@ impl StructColumn {
 impl ColumnAccumulator for StructColumn {
     fn append(
         &mut self,
-        source: &ArrayRef,
-        selection: SourceSelection<'_>,
+        source: AppendSource<'_>,
         destination_start: usize,
         allocator: &mut SlabAllocator,
     ) {
-        let source = source.as_struct();
-        self.validity
-            .append(source.nulls(), selection, destination_start);
-        for (child, values) in self.children.iter_mut().zip(source.columns()) {
-            child.append(values, selection, destination_start, allocator);
-        }
-    }
-
-    fn append_chunked(
-        &mut self,
-        source: &PreparedColumn,
-        ids: &[u32],
-        shift: u32,
-        destination_start: usize,
-        allocator: &mut SlabAllocator,
-    ) {
-        let PreparedColumn::Struct { nulls, children } = source else {
-            unreachable!("a struct accumulator receives a struct prepared column");
-        };
-        self.validity
-            .append_by_ids(nulls, ids, shift, destination_start);
-        for (child, values) in self.children.iter_mut().zip(children) {
-            child.append_chunked(values, ids, shift, destination_start, allocator);
+        match source {
+            AppendSource::Batch { column, selection } => {
+                let column = column.as_struct();
+                self.validity
+                    .append(column.nulls(), selection, destination_start);
+                for (child, values) in self.children.iter_mut().zip(column.columns()) {
+                    child.append(
+                        AppendSource::Batch {
+                            column: values,
+                            selection,
+                        },
+                        destination_start,
+                        allocator,
+                    );
+                }
+            }
+            AppendSource::Chunked { column, ids, shift } => {
+                let ChunkedColumn::Struct { nulls, children } = column else {
+                    unreachable!("a struct accumulator receives a struct chunked column");
+                };
+                self.validity
+                    .append_by_ids(ids, shift, destination_start, |batch| nulls[batch].as_ref());
+                for (child, values) in self.children.iter_mut().zip(children) {
+                    child.append(
+                        AppendSource::Chunked {
+                            column: values,
+                            ids,
+                            shift,
+                        },
+                        destination_start,
+                        allocator,
+                    );
+                }
+            }
         }
     }
 

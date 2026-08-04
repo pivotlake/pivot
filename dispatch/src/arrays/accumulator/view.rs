@@ -21,8 +21,8 @@ use arrow_array::{Array, ArrayRef, make_array};
 use arrow_buffer::Buffer;
 use arrow_schema::{ArrowError, DataType};
 
-use super::chunked::PreparedColumn;
-use super::column::{ColumnAccumulator, SourceSelection};
+use super::chunked::{ChunkedColumn, ViewChunk};
+use super::column::{AppendSource, ColumnAccumulator, SourceSelection};
 use super::fixed_width::gather_fixed_width;
 use super::validity::ValidityMask;
 use super::{BUFFER_SIZE, ValueStorage};
@@ -129,8 +129,8 @@ impl ViewColumn {
     }
 }
 
-impl ColumnAccumulator for ViewColumn {
-    fn append(
+impl ViewColumn {
+    fn append_batch(
         &mut self,
         source: &ArrayRef,
         selection: SourceSelection<'_>,
@@ -180,17 +180,19 @@ impl ColumnAccumulator for ViewColumn {
 
     fn append_chunked(
         &mut self,
-        source: &PreparedColumn,
+        column: &ChunkedColumn,
         ids: &[u32],
         shift: u32,
         destination_start: usize,
         allocator: &mut SlabAllocator,
     ) {
-        let PreparedColumn::View { chunks, nulls } = source else {
-            unreachable!("a view accumulator receives a view prepared column");
+        let ChunkedColumn::View { chunks } = column else {
+            unreachable!("a view accumulator receives a view chunked column");
         };
         self.validity
-            .append_by_ids(nulls, ids, shift, destination_start);
+            .append_by_ids(ids, shift, destination_start, |batch| {
+                chunks[batch].nulls.as_ref()
+            });
         if self.chunk_bases.len() < chunks.len() {
             self.chunk_bases.resize(chunks.len(), (0, 0));
         }
@@ -204,20 +206,19 @@ impl ColumnAccumulator for ViewColumn {
         let mask = (1u32 << shift) - 1;
         match values {
             ViewValues::SourceBuffers { buffers, .. } => {
-                // SAFETY: each id names an in-bounds row of its chunk, and the
-                // views slab has capacity for `destination_start` plus the
-                // appended rows (checked by the caller).
+                // SAFETY: the views slab has capacity for `destination_start`
+                // plus the appended rows (checked by the caller).
                 unsafe {
                     let mut dst = views.ptr_at_index(destination_start);
                     for &id in ids {
-                        let chunk_idx = (id >> shift) as usize;
-                        let chunk = &chunks[chunk_idx];
-                        let mut view = chunk.views.add((id & mask) as usize).read_unaligned();
+                        let batch_idx = (id >> shift) as usize;
+                        let chunk: &ViewChunk = &chunks[batch_idx];
+                        let mut view = chunk.views[(id & mask) as usize];
                         // A view longer than the inline limit points into its
-                        // chunk's data buffers; register those once per emitted
+                        // batch's data buffers; register those once per emitted
                         // batch and rebase the buffer index onto the list.
                         if view as u32 > INLINE_VIEW_LEN {
-                            let entry = chunk_bases.get_unchecked_mut(chunk_idx);
+                            let entry = chunk_bases.get_unchecked_mut(batch_idx);
                             if entry.0 != *generation {
                                 *entry = (*generation, buffers.len() as u32);
                                 buffers.extend(chunk.data_buffers.iter().cloned());
@@ -232,8 +233,7 @@ impl ColumnAccumulator for ViewColumn {
             ViewValues::OwnedBlocks { blocks } => {
                 for (destination, &id) in (destination_start..).zip(ids) {
                     let chunk = &chunks[(id >> shift) as usize];
-                    // SAFETY: the id names an in-bounds row of the chunk.
-                    let view = unsafe { chunk.views.add((id & mask) as usize).read_unaligned() };
+                    let view = chunk.views[(id & mask) as usize];
                     let length = view as u32;
                     let copied = if length <= INLINE_VIEW_LEN {
                         view
@@ -247,6 +247,24 @@ impl ColumnAccumulator for ViewColumn {
                     // the appended rows, which the caller checked.
                     unsafe { *views.ptr_at_index(destination) = copied };
                 }
+            }
+        }
+    }
+}
+
+impl ColumnAccumulator for ViewColumn {
+    fn append(
+        &mut self,
+        source: AppendSource<'_>,
+        destination_start: usize,
+        allocator: &mut SlabAllocator,
+    ) {
+        match source {
+            AppendSource::Batch { column, selection } => {
+                self.append_batch(column, selection, destination_start, allocator)
+            }
+            AppendSource::Chunked { column, ids, shift } => {
+                self.append_chunked(column, ids, shift, destination_start, allocator)
             }
         }
     }

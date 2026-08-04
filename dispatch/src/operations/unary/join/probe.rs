@@ -22,7 +22,7 @@
 //! accumulator ever fills, since such a join carries no build columns.
 
 use crate::RECORD_BATCH_SIZE;
-use crate::arrays::accumulator::{BatchAccumulator, ChunkedGatherSource};
+use crate::arrays::accumulator::{BatchAccumulator, ChunkedColumns};
 use crate::memory::{MultiSlabBuffer, SlabAllocator};
 use crate::operations::Unary;
 use crate::operations::channels::Sender;
@@ -137,7 +137,7 @@ impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Probe<K, BUILD_OUTER
             .iter()
             .map(|chunk| chunk.project(&self.output_columns.build))
             .collect::<Result<_, _>>()?;
-        let build_gather = ChunkedGatherSource::prepare(&build_chunks, PAYLOAD_CHUNK_SHIFT);
+        let build_gather = ChunkedColumns::prepare(&build_chunks, PAYLOAD_CHUNK_SHIFT);
         self.sides = Some(OutputSides {
             output_schema: Arc::new(Schema::new(fields)),
             probe: BatchAccumulator::retaining_source_buffers(
@@ -320,7 +320,7 @@ struct OutputSides {
     /// the unmatched pass's per-chunk scan.
     build_chunks: Vec<RecordBatch>,
     /// The same chunks prepared for gathering matched rows by payload id.
-    build_gather: ChunkedGatherSource,
+    build_gather: ChunkedColumns,
 }
 
 impl OutputSides {

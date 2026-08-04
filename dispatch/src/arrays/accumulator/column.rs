@@ -6,7 +6,7 @@
 use arrow_array::ArrayRef;
 use arrow_schema::ArrowError;
 
-use super::chunked::PreparedColumn;
+use super::chunked::ChunkedColumn;
 use crate::memory::SlabAllocator;
 
 /// One column of an accumulation: rows are copied in with
@@ -18,31 +18,16 @@ use crate::memory::SlabAllocator;
 /// taken from and appended to again: an accumulator is reused for as many
 /// batches as its owner emits.
 pub(super) trait ColumnAccumulator {
-    /// Append this column's `rows` of `source`, landing at accumulated row
-    /// `destination_start`. The caller has already checked that they fit in the
-    /// capacity the accumulator was built for.
+    /// Append this column's rows of `source`, landing at accumulated row
+    /// `destination_start` in source order. The caller has already checked
+    /// that they fit in the capacity the accumulator was built for.
     ///
     /// `allocator` is drawn on only by an implementation that copies values
     /// (see [`ValueStorage`](super::ValueStorage)); one that retains the
     /// source's buffers never touches it.
     fn append(
         &mut self,
-        source: &ArrayRef,
-        selection: SourceSelection<'_>,
-        destination_start: usize,
-        allocator: &mut SlabAllocator,
-    );
-
-    /// Append this column's rows at the encoded `ids` (`chunk << shift | row`)
-    /// of a prepared chunked source, landing at accumulated row
-    /// `destination_start` in id order. `source` is this column's prepared
-    /// form, whose variant matches the accumulator by construction (both were
-    /// built from the column's type).
-    fn append_chunked(
-        &mut self,
-        source: &PreparedColumn,
-        ids: &[u32],
-        shift: u32,
+        source: AppendSource<'_>,
         destination_start: usize,
         allocator: &mut SlabAllocator,
     );
@@ -56,7 +41,34 @@ pub(super) trait ColumnAccumulator {
     ) -> Result<ArrayRef, ArrowError>;
 }
 
-/// Which rows of a source column an append takes.
+/// Where an append's rows come from.
+#[derive(Clone, Copy)]
+pub(super) enum AppendSource<'a> {
+    /// Rows of one batch's column, picked by a [`SourceSelection`].
+    Batch {
+        column: &'a ArrayRef,
+        selection: SourceSelection<'a>,
+    },
+    /// Rows of a column split across many batches, at the encoded `ids`
+    /// (`batch << shift | row`). The column's variant matches the accumulator
+    /// by construction: both were built from the column's type.
+    Chunked {
+        column: &'a ChunkedColumn,
+        ids: &'a [u32],
+        shift: u32,
+    },
+}
+
+impl AppendSource<'_> {
+    pub(super) fn len(&self) -> usize {
+        match self {
+            Self::Batch { selection, .. } => selection.len(),
+            Self::Chunked { ids, .. } => ids.len(),
+        }
+    }
+}
+
+/// Which rows of a single source column an append takes.
 ///
 /// One implementation serves both: a scattered selection reads its rows through
 /// the indices, while a contiguous run copies them in bulk. The difference costs
