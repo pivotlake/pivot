@@ -24,6 +24,7 @@
 //! involved.
 
 mod build;
+mod build_rows;
 mod directory;
 mod factory;
 pub use factory::JoinRecordBatchOperatorFactory;
@@ -35,22 +36,12 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use arrow_array::RecordBatch;
 use arrow_schema::Field;
 
 use crate::memory::MultiSlabBuffer;
+use crate::operations::unary::join::build_rows::BuildRowBatches;
 use crate::operations::unary::join::directory::JoinDirectory;
 pub(crate) use factory::create_for_workers as create_join_factories;
-
-/// Rows a build payload chunk holds at most. A build row's id is
-/// `chunk_index << PAYLOAD_CHUNK_SHIFT | row_in_chunk`, so a chunk shorter
-/// than this leaves a gap in the id space; ids are only gather addresses, so
-/// the gaps cost nothing but the skipped range.
-pub(crate) const PAYLOAD_CHUNK_ROWS: usize = crate::RECORD_BATCH_SIZE;
-pub(crate) const PAYLOAD_CHUNK_SHIFT: u32 = PAYLOAD_CHUNK_ROWS.trailing_zeros();
-/// How many chunks the u32 id encoding addresses.
-pub(crate) const MAX_PAYLOAD_CHUNKS: usize = (u32::MAX as usize + 1) >> PAYLOAD_CHUNK_SHIFT;
-const _: () = assert!(PAYLOAD_CHUNK_ROWS.is_power_of_two());
 
 /// Which columns of each side the join emits, as indices into the probe and
 /// build input schemas. Downstream operators that ignore some join columns
@@ -114,8 +105,8 @@ pub(crate) struct UnmatchedScan {
     /// it once, on entering `finish`, after which that worker never consumes
     /// again; at zero the flags are final and the scan below can start.
     probes_live: AtomicUsize,
-    /// The next build payload row the scan hands out, so workers claim
-    /// disjoint chunks of the flag array.
+    /// The next build row batch the scan hands out, so workers claim disjoint
+    /// stretches of the flag array.
     cursor: AtomicUsize,
 }
 
@@ -148,18 +139,17 @@ unsafe impl<T: Send> Sync for JoinCell<T> {}
 
 /// Shared hash-table state handed from the build factories to the probe
 /// factories. `keys` and `rows` are parallel arenas indexed by the directory's
-/// slot cursors: the full-width join key, and the row's payload id
-/// (`chunk << PAYLOAD_CHUNK_SHIFT | row` into `build_rows`, the build-side
-/// payload chunks). All fields are populated by the build phase and published
-/// to probe only after every partition job has run.
+/// slot cursors: the full-width join key, and the row's id into `build_rows`,
+/// the stored build rows. All fields are populated by the build phase and
+/// published to probe only after every partition job has run.
 #[derive(Clone)]
 pub(crate) struct JoinTable<K> {
     pub(crate) directory: Arc<JoinCell<JoinDirectory>>,
     pub(crate) keys: Arc<JoinCell<MultiSlabBuffer<K>>>,
     pub(crate) rows: Arc<JoinCell<MultiSlabBuffer<u32>>>,
-    pub(crate) build_rows: Arc<JoinCell<Vec<RecordBatch>>>,
-    /// One zeroed byte per `build_rows` payload id (gap ids included), set to
-    /// 1 by whichever probe worker matches that row. Only allocated for a
+    pub(crate) build_rows: Arc<JoinCell<BuildRowBatches>>,
+    /// One zeroed byte per `build_rows` row id (gap ids included), set to 1
+    /// by whichever probe worker matches that row. Only allocated for a
     /// build-side outer join, which is the only reader; the bytes are written
     /// as [`AtomicU8`](std::sync::atomic::AtomicU8) because several probe
     /// workers can match the same build row at once.
@@ -512,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn build_payload_columns_are_gathered() {
+    fn build_columns_are_gathered() {
         let r = build_and_probe(
             vec![vec![keyed_names_batch(&[10, 20, 30], &["x", "y", "z"])]],
             vec![int64_batch(&[30, 10])],
@@ -535,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn build_payload_spans_workers_and_batches() {
+    fn build_rows_span_workers_and_batches() {
         let r = build_and_probe(
             vec![
                 vec![
@@ -966,12 +956,12 @@ mod tests {
         );
     }
 
-    /// Short build batches become short payload chunks with gaps in the id
-    /// space; matched rows must still gather their string payload from the
+    /// Short build batches become short stored batches with gaps in the row id
+    /// space; matched rows must still gather their string columns from the
     /// right chunk. The long value lives outside a view's inline bytes, so it
     /// exercises the buffer-rebasing gather path too.
     #[test]
-    fn short_payload_chunks_gather_from_the_right_chunk() {
+    fn short_build_row_batches_gather_from_the_right_batch() {
         let build = vec![
             keyed_names_batch(&[1, 2, 3], &["a", "b", "c"]),
             keyed_names_batch(&[4, 5], &["d", "a-value-too-long-to-inline"]),
