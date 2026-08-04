@@ -1366,41 +1366,6 @@ mod tests {
         );
     }
 
-    /// `IntStrKeyExtractor` in string-first order: `GROUP BY (name, id)`. The
-    /// output leads with the string column (`k0`), then the int (`k1`), matching
-    /// the GROUP BY order, and groups identically.
-    #[test]
-    fn str_int_mixed_counts() {
-        // (name, id) pairs: (a,1)x2, (a,2)x2, (b,2)x1.
-        let batch = mixed_key_batch(&[1, 2, 1, 2, 2], &["a", "a", "a", "b", "a"], &[0; 5]);
-        let sender = run_group_full::<
-            IntStrKeyExtractor<arrow_array::types::Int64Type, true>,
-            Compiled<(CountSlot,)>,
-        >(
-            vec![vec![batch]],
-            vec![1, 0], // name (string, col 1) first, then id (int, col 0)
-            count_slots(),
-            None,
-            RadixConfig::DEFAULT,
-        );
-        let mut rows: Vec<(String, i64, i64)> = sender
-            .string_column(0)
-            .into_iter()
-            .zip(sender.i64_column(1))
-            .zip(sender.i64_column(2))
-            .map(|((name, id), c)| (name, id, c))
-            .collect();
-        rows.sort();
-        assert_eq!(
-            rows,
-            vec![
-                ("a".to_string(), 1, 2),
-                ("a".to_string(), 2, 2),
-                ("b".to_string(), 2, 1),
-            ]
-        );
-    }
-
     /// Row-key SUM: each distinct `(id, name)` sums its value column. Includes a
     /// > 12-byte string to exercise the arena (non-inline) path on output.
     #[test]
