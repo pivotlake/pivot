@@ -3,7 +3,6 @@ use std::sync::{Arc, mpsc};
 
 use ahash::RandomState;
 use arrow_array::RecordBatch;
-use arrow_schema::Field;
 use crossbeam_deque::Injector;
 
 use crate::api::OperatorGraphBuilder;
@@ -15,17 +14,16 @@ use crate::operations::unary::UnaryOperator;
 use crate::operations::unary::join::build::{
     BuildWorkerOutput, JoinBuildConsumer, JoinPartitionJob, NUM_PARTITIONS,
 };
+use crate::operations::unary::join::build_rows::BuildRows;
 use crate::operations::unary::join::directory::JoinDirectory;
 use crate::operations::unary::join::keys::JoinKey;
 use crate::operations::unary::join::probe::Probe;
-use crate::operations::unary::join::{
-    JoinCell, JoinKind, JoinOutputColumns, JoinSpec, JoinTable, UnmatchedScan,
-};
+use crate::operations::unary::join::{JoinCell, JoinKind, JoinSpec, JoinTable, UnmatchedScan};
 use crate::operations::unary::pipeline_breaker::PipelineBreaker;
 
 /// Creates one [`JoinBuildConsumer`] per worker, with shared state wired up.
 pub struct JoinBuildFactory<K: JoinKey, const BUILD_OUTER: bool> {
-    key_columns: Vec<usize>,
+    spec: Arc<JoinSpec>,
     worker_id: usize,
     hash_state: RandomState,
     partition_sizes: Arc<Vec<AtomicUsize>>,
@@ -42,15 +40,12 @@ pub struct JoinBuildFactory<K: JoinKey, const BUILD_OUTER: bool> {
 pub struct JoinProbeFactory<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> {
     pub(crate) table: JoinTable<K::Stored>,
     hash_state: RandomState,
-    key_columns: Vec<usize>,
-    build_key_columns: Vec<usize>,
-    output_columns: Arc<JoinOutputColumns>,
-    probe_fields: Option<Arc<Vec<Field>>>,
+    spec: Arc<JoinSpec>,
     unmatched: Arc<UnmatchedScan>,
 }
 
 /// Create `worker_count` build factories and probe factories that share the
-/// same [`JoinTable`] (directory + key/row arenas + build payload) and hash
+/// same [`JoinTable`] (directory + key/row arenas + stored build rows) and hash
 /// state.
 ///
 /// Returns `(build_factories, probe_factories, build_ready)`. The build
@@ -67,21 +62,12 @@ pub fn create_for_workers<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
     impl IntoIterator<Item = JoinProbeFactory<K, BUILD_OUTER, SEMI>>,
     Arc<AtomicBool>,
 ) {
-    let JoinSpec {
-        build_key_columns,
-        probe_key_columns,
-        output_columns,
-        kind,
-    } = spec;
-    let outer_probe_fields = match kind {
-        JoinKind::Inner | JoinKind::ProbeSemi => None,
-        JoinKind::BuildOuter { probe_fields } => Some(probe_fields),
-    };
-    debug_assert_eq!(BUILD_OUTER, outer_probe_fields.is_some());
+    debug_assert_eq!(BUILD_OUTER, matches!(spec.kind, JoinKind::BuildOuter));
     debug_assert!(
-        !SEMI || output_columns.build.is_empty(),
+        !SEMI || spec.build_output_indices.is_empty(),
         "a semi join emits no build columns"
     );
+    let spec = Arc::new(spec);
     let hash_state = RandomState::with_seeds(0, 0, 0, 0);
     let partition_sizes: Arc<Vec<AtomicUsize>> =
         Arc::new((0..NUM_PARTITIONS).map(|_| AtomicUsize::new(0)).collect());
@@ -89,8 +75,7 @@ pub fn create_for_workers<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
         directory: Arc::new(JoinCell::new(JoinDirectory::initial())),
         keys: Arc::new(JoinCell::new(MultiSlabBuffer::<K::Stored>::new(vec![]))),
         rows: Arc::new(JoinCell::new(MultiSlabBuffer::<u32>::new(vec![]))),
-        build_rows: Arc::new(JoinCell::new(Vec::new())),
-        matched: Arc::new(JoinCell::new(MultiSlabBuffer::<u8>::new(vec![]))),
+        build_rows: Arc::new(JoinCell::new(BuildRows::empty())),
     };
     let injector = Arc::new(Injector::new());
     let jobs_injected = Arc::new(AtomicBool::new(false));
@@ -102,10 +87,10 @@ pub fn create_for_workers<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
     let table_clone = table.clone();
     let hs_clone = hash_state.clone();
     let probe_gate = build_ready.clone();
-    let probe_side_build_key_columns = build_key_columns.clone();
+    let build_spec = spec.clone();
 
     let build_factories = (0..worker_count).map(move |worker_id| JoinBuildFactory {
-        key_columns: build_key_columns.clone(),
+        spec: build_spec.clone(),
         worker_id,
         hash_state: hash_state.clone(),
         partition_sizes: partition_sizes.clone(),
@@ -118,16 +103,11 @@ pub fn create_for_workers<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
         remaining_jobs: remaining_jobs.clone(),
     });
 
-    let output_columns = Arc::new(output_columns);
-    let probe_fields = outer_probe_fields.map(Arc::new);
     let unmatched = Arc::new(UnmatchedScan::new(worker_count));
     let probe_factories = (0..worker_count).map(move |_| JoinProbeFactory {
         table: table_clone.clone(),
         hash_state: hs_clone.clone(),
-        key_columns: probe_key_columns.clone(),
-        build_key_columns: probe_side_build_key_columns.clone(),
-        output_columns: output_columns.clone(),
-        probe_fields: probe_fields.clone(),
+        spec: spec.clone(),
         unmatched: unmatched.clone(),
     });
 
@@ -141,7 +121,7 @@ impl<K: JoinKey, const BUILD_OUTER: bool> UnaryFactory<RecordBatch, ()>
 
     fn build_unary(self) -> Self::Unary {
         PipelineBreaker::Consuming(JoinBuildConsumer::new(
-            self.key_columns,
+            self.spec.build_key_indices.clone(),
             self.worker_id,
             self.hash_state,
             self.sender,
@@ -152,6 +132,7 @@ impl<K: JoinKey, const BUILD_OUTER: bool> UnaryFactory<RecordBatch, ()>
             self.jobs_injected,
             self.build_ready,
             self.remaining_jobs,
+            self.spec.build_output_indices.clone(),
         ))
     }
 }
@@ -162,15 +143,7 @@ impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> UnaryFactory<RecordB
     type Unary = Probe<K, BUILD_OUTER, SEMI>;
 
     fn build_unary(self) -> Probe<K, BUILD_OUTER, SEMI> {
-        Probe::new(
-            self.table,
-            self.hash_state,
-            self.key_columns,
-            self.build_key_columns,
-            self.output_columns,
-            self.probe_fields,
-            self.unmatched,
-        )
+        Probe::new(self.table, self.hash_state, self.spec, self.unmatched)
     }
 }
 

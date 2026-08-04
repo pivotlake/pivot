@@ -17,8 +17,9 @@ use arrow::compute::kernels::concat::concat;
 use arrow_array::{Array, ArrayRef};
 use arrow_schema::ArrowError;
 
-use super::chunked::PreparedColumn;
-use super::column::{ColumnAccumulator, SourceSelection};
+use arrow_array::make_array;
+
+use super::column::{ChunkedColumn, ColumnAccumulator};
 use crate::memory::SlabAllocator;
 
 /// A column held as the arrays it was appended from, concatenated on emit.
@@ -33,69 +34,74 @@ impl ConcatenatedColumn {
 }
 
 impl ColumnAccumulator for ConcatenatedColumn {
-    fn append(
+    fn append_from_indices(
         &mut self,
-        source: &ArrayRef,
-        selection: SourceSelection<'_>,
+        column: &ArrayRef,
+        indices: &[u32],
         _destination_start: usize,
         _allocator: &mut SlabAllocator,
     ) {
-        match selection {
-            SourceSelection::Range { start, len } => self.arrays.push(source.slice(start, len)),
-            // Consecutive positions become one slice, so a selection that keeps
-            // a run of rows costs one array rather than one per row.
-            SourceSelection::Indices(indices) => {
-                let mut run: Option<(usize, usize)> = None;
-                for &row in indices {
-                    let row = row as usize;
-                    match run {
-                        Some((start, end)) if row == end => run = Some((start, end + 1)),
-                        Some((start, end)) => {
-                            self.arrays.push(source.slice(start, end - start));
-                            run = Some((row, row + 1));
-                        }
-                        None => run = Some((row, row + 1)),
-                    }
+        // Consecutive positions become one slice, so a selection that keeps a
+        // run of rows costs one array rather than one per row.
+        let mut run: Option<(usize, usize)> = None;
+        for &row in indices {
+            let row = row as usize;
+            match run {
+                Some((start, end)) if row == end => run = Some((start, end + 1)),
+                Some((start, end)) => {
+                    self.arrays.push(column.slice(start, end - start));
+                    run = Some((row, row + 1));
                 }
-                if let Some((start, end)) = run {
-                    self.arrays.push(source.slice(start, end - start));
-                }
+                None => run = Some((row, row + 1)),
             }
+        }
+        if let Some((start, end)) = run {
+            self.arrays.push(column.slice(start, end - start));
         }
     }
 
-    fn append_chunked(
+    fn append_from_range(
         &mut self,
-        source: &PreparedColumn,
+        column: &ArrayRef,
+        start: usize,
+        len: usize,
+        _destination_start: usize,
+        _allocator: &mut SlabAllocator,
+    ) {
+        self.arrays.push(column.slice(start, len));
+    }
+
+    fn append_from_batches(
+        &mut self,
+        column: &ChunkedColumn,
         ids: &[u32],
         shift: u32,
         _destination_start: usize,
         _allocator: &mut SlabAllocator,
     ) {
-        let PreparedColumn::Whole { arrays } = source else {
-            unreachable!("a concatenated accumulator receives a whole prepared column");
-        };
         let mask = (1u32 << shift) - 1;
-        // Consecutive same-chunk rows become one slice, as in `append`.
+        // Consecutive same-batch rows become one slice, as above.
+        let mut push = |batch: usize, start: usize, len: usize| {
+            self.arrays
+                .push(make_array(column.data[batch].slice(start, len)));
+        };
         let mut run: Option<(usize, usize, usize)> = None;
         for &id in ids {
-            let chunk = (id >> shift) as usize;
+            let batch = (id >> shift) as usize;
             let row = (id & mask) as usize;
             match run {
-                Some((run_chunk, start, end)) if run_chunk == chunk && row == end => {
-                    run = Some((run_chunk, start, end + 1));
+                Some((run_batch, start, end)) if run_batch == batch && row == end => {
+                    run = Some((run_batch, start, end + 1));
                 }
-                Some((run_chunk, start, end)) => {
-                    self.arrays
-                        .push(arrays[run_chunk].slice(start, end - start));
-                    run = Some((chunk, row, row + 1));
+                Some((run_batch, start, end)) => {
+                    push(run_batch, start, end - start);
+                    run = Some((batch, row, row + 1));
                 }
-                None => run = Some((chunk, row, row + 1)),
+                None => run = Some((batch, row, row + 1)),
             }
         }
-        if let Some((run_chunk, start, end)) = run {
-            self.arrays
-                .push(arrays[run_chunk].slice(start, end - start));
+        if let Some((run_batch, start, end)) = run {
+            push(run_batch, start, end - start);
         }
     }
 

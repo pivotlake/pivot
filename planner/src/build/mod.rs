@@ -360,7 +360,7 @@ fn build_join(
         if probe_key_type != build_key_type {
             return Err(OperatorError::Unsupported(format!(
                 "join key types differ: {probe_key_type:?} vs {build_key_type:?} \
-                 (DuckDB casts both sides of a condition to a common type, so this plan \
+                 (the planner casts both sides of a condition to a common type, so this plan \
                  shape is unexpected)"
             )));
         }
@@ -394,15 +394,7 @@ fn build_join(
     };
     let (kind, build_output) = match join.join_type()? {
         JoinType::INNER => (JoinKind::Inner, kept_build_output),
-        JoinType::RIGHT => (
-            JoinKind::BuildOuter {
-                probe_types: probe_output
-                    .iter()
-                    .map(|&i| probe_types[i].clone())
-                    .collect(),
-            },
-            kept_build_output,
-        ),
+        JoinType::RIGHT => (JoinKind::BuildOuter, kept_build_output),
         // A semi join emits no build column at all. DuckDB agrees, and says so
         // by returning the left bindings alone for such a join rather than
         // through the right projection map, which it never reads here — so the
@@ -414,6 +406,16 @@ fn build_join(
             )));
         }
     };
+    let probe_nullability = inputs[0].output_nullability();
+    let build_nullability = inputs[1].output_nullability();
+    let probe_column_types = probe_output
+        .iter()
+        .map(|&i| (probe_types[i].clone(), probe_nullability[i]))
+        .collect();
+    let build_column_types = build_output
+        .iter()
+        .map(|&i| (build_types[i].clone(), build_nullability[i]))
+        .collect();
     Ok(PlanNode {
         name: op.name()?,
         inputs,
@@ -423,6 +425,8 @@ fn build_join(
             key_types,
             probe_output,
             build_output,
+            probe_column_types,
+            build_column_types,
             kind,
         }),
     })

@@ -6,10 +6,11 @@
 //! is gated on a publication flag set after all build partition jobs complete,
 //! then the probe reads the populated [`JoinTable`].
 //!
-//! Output layout: the probe-side columns listed in [`JoinOutputColumns`] (in
-//! list order) followed by the listed build-side columns. The join is an
-//! equi-join whose key columns are read, hashed, and compared through one of
-//! the [`JoinKey`] shapes, in one of the three [`JoinKind`]s below.
+//! Output layout: the probe-side columns listed in
+//! [`JoinSpec::probe_output_indices`] (in list order) followed by the listed
+//! build-side columns. The join is an equi-join whose key columns are read,
+//! hashed, and compared through one of the [`JoinKey`] shapes, in one of the
+//! three [`JoinKind`]s below.
 //!
 //! A build-side outer join ([`JoinKind::BuildOuter`]) also emits every build
 //! row no probe row matched, its probe columns null-filled. Which rows those
@@ -24,6 +25,7 @@
 //! involved.
 
 mod build;
+mod build_rows;
 mod directory;
 mod factory;
 pub use factory::JoinRecordBatchOperatorFactory;
@@ -35,41 +37,12 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use arrow_array::RecordBatch;
 use arrow_schema::Field;
 
 use crate::memory::MultiSlabBuffer;
+use crate::operations::unary::join::build_rows::BuildRows;
 use crate::operations::unary::join::directory::JoinDirectory;
 pub(crate) use factory::create_for_workers as create_join_factories;
-
-/// Rows a build payload chunk holds at most. A build row's id is
-/// `chunk_index << PAYLOAD_CHUNK_SHIFT | row_in_chunk`, so a chunk shorter
-/// than this leaves a gap in the id space; ids are only gather addresses, so
-/// the gaps cost nothing but the skipped range.
-pub(crate) const PAYLOAD_CHUNK_ROWS: usize = crate::RECORD_BATCH_SIZE;
-pub(crate) const PAYLOAD_CHUNK_SHIFT: u32 = PAYLOAD_CHUNK_ROWS.trailing_zeros();
-/// How many chunks the u32 id encoding addresses.
-pub(crate) const MAX_PAYLOAD_CHUNKS: usize = (u32::MAX as usize + 1) >> PAYLOAD_CHUNK_SHIFT;
-const _: () = assert!(PAYLOAD_CHUNK_ROWS.is_power_of_two());
-
-/// Which columns of each side the join emits, as indices into the probe and
-/// build input schemas. Downstream operators that ignore some join columns
-/// declare that here so the probe never materializes values nobody reads.
-#[derive(Debug, Clone)]
-pub struct JoinOutputColumns {
-    pub probe: Vec<usize>,
-    pub build: Vec<usize>,
-}
-
-impl JoinOutputColumns {
-    /// Keep every column of both sides: probe columns then build columns.
-    pub fn keep_all(probe_column_count: usize, build_column_count: usize) -> Self {
-        Self {
-            probe: (0..probe_column_count).collect(),
-            build: (0..build_column_count).collect(),
-        }
-    }
-}
 
 /// Which rows a join emits.
 #[derive(Debug, Clone)]
@@ -78,32 +51,34 @@ pub enum JoinKind {
     Inner,
     /// Every pair an [`Inner`](JoinKind::Inner) emits, plus one row per build
     /// row nothing matched, its probe columns null-filled.
-    BuildOuter {
-        /// The fields the probe columns take in the output. A worker can reach
-        /// the unmatched pass without ever having seen a probe batch to read a
-        /// schema off — an empty probe side, or simply a peer having taken all
-        /// the work — so the caller states their shape up front. Every worker
-        /// shaping its output from the same fields is also what keeps their
-        /// batches concatenable downstream.
-        probe_fields: Vec<Field>,
-    },
+    BuildOuter,
     /// One output row per probe row that has at least one matching build row,
     /// with no duplicates for a probe row that matches several. That is also
     /// why such a join emits no build columns: there is no single build row to
-    /// take them from, so [`JoinOutputColumns::build`] must be empty.
+    /// take them from, so [`JoinSpec::build_output_indices`] must be empty.
     ProbeSemi,
 }
 
 /// How a join is configured beyond the key shape it is instantiated for.
 #[derive(Debug, Clone)]
 pub struct JoinSpec {
-    /// The key columns' indices in the build input's schema, condition by
-    /// condition, aligned with `probe_key_columns`.
-    pub build_key_columns: Vec<usize>,
-    /// The key columns' indices in the probe input's schema.
-    pub probe_key_columns: Vec<usize>,
-    /// Which columns of each side the join emits.
-    pub output_columns: JoinOutputColumns,
+    /// Indices of probe input columns used as join keys.
+    pub probe_key_indices: Vec<usize>,
+    /// Indices of build input columns used as aligned join keys.
+    pub build_key_indices: Vec<usize>,
+    /// Indices of probe input columns emitted first.
+    pub probe_output_indices: Vec<usize>,
+    /// Indices of build input columns emitted second.
+    pub build_output_indices: Vec<usize>,
+    /// The fields the listed probe columns take in the output, in
+    /// `probe_output_indices` order. Stated by the caller rather than read
+    /// off a probed batch so every worker shapes identical output whether or
+    /// not it ever received a batch, and so an outer join's probe columns can
+    /// be nullable regardless of the input's declared nullability.
+    pub probe_fields: Vec<Field>,
+    /// The fields the listed build columns take in the output, in
+    /// `build_output_indices` order.
+    pub build_fields: Vec<Field>,
     /// Which rows reach the output.
     pub kind: JoinKind,
 }
@@ -113,16 +88,16 @@ pub(crate) struct UnmatchedScan {
     /// Probe workers that may still mark a matched build row. Each decrements
     /// it once, on entering `finish`, after which that worker never consumes
     /// again; at zero the flags are final and the scan below can start.
-    probes_live: AtomicUsize,
-    /// The next build payload row the scan hands out, so workers claim
-    /// disjoint chunks of the flag array.
+    probes_finished: AtomicUsize,
+    /// The next build row batch the scan hands out, so workers claim disjoint
+    /// stretches of the flag array.
     cursor: AtomicUsize,
 }
 
 impl UnmatchedScan {
     fn new(worker_count: usize) -> Self {
         Self {
-            probes_live: AtomicUsize::new(worker_count),
+            probes_finished: AtomicUsize::new(worker_count),
             cursor: AtomicUsize::new(0),
         }
     }
@@ -148,22 +123,15 @@ unsafe impl<T: Send> Sync for JoinCell<T> {}
 
 /// Shared hash-table state handed from the build factories to the probe
 /// factories. `keys` and `rows` are parallel arenas indexed by the directory's
-/// slot cursors: the full-width join key, and the row's payload id
-/// (`chunk << PAYLOAD_CHUNK_SHIFT | row` into `build_rows`, the build-side
-/// payload chunks). All fields are populated by the build phase and published
-/// to probe only after every partition job has run.
+/// slot cursors: the full-width join key, and the row's id into `build_rows`,
+/// the stored build rows. All fields are populated by the build phase and
+/// published to probe only after every partition job has run.
 #[derive(Clone)]
 pub(crate) struct JoinTable<K> {
     pub(crate) directory: Arc<JoinCell<JoinDirectory>>,
     pub(crate) keys: Arc<JoinCell<MultiSlabBuffer<K>>>,
     pub(crate) rows: Arc<JoinCell<MultiSlabBuffer<u32>>>,
-    pub(crate) build_rows: Arc<JoinCell<Vec<RecordBatch>>>,
-    /// One zeroed byte per `build_rows` payload id (gap ids included), set to
-    /// 1 by whichever probe worker matches that row. Only allocated for a
-    /// build-side outer join, which is the only reader; the bytes are written
-    /// as [`AtomicU8`](std::sync::atomic::AtomicU8) because several probe
-    /// workers can match the same build row at once.
-    pub(crate) matched: Arc<JoinCell<MultiSlabBuffer<u8>>>,
+    pub(crate) build_rows: Arc<JoinCell<BuildRows>>,
 }
 
 #[cfg(test)]
@@ -264,17 +232,32 @@ mod tests {
         let workers = build_worker_batches.len();
         let probe_column_count = probe_batches[0].num_columns();
         let build_column_count = build_worker_batches[0][0].num_columns();
+        let kind = match probe_fields {
+            Some(_) => super::JoinKind::BuildOuter,
+            None => super::JoinKind::Inner,
+        };
+        let probe_fields = probe_fields.unwrap_or_else(|| {
+            probe_batches[0]
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.as_ref().clone())
+                .collect()
+        });
+        let build_fields: Vec<Field> = build_worker_batches[0][0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
         let spec = super::JoinSpec {
-            build_key_columns: key_columns.clone(),
-            probe_key_columns: key_columns,
-            output_columns: super::JoinOutputColumns::keep_all(
-                probe_column_count,
-                build_column_count,
-            ),
-            kind: match probe_fields {
-                Some(probe_fields) => super::JoinKind::BuildOuter { probe_fields },
-                None => super::JoinKind::Inner,
-            },
+            probe_key_indices: key_columns.clone(),
+            build_key_indices: key_columns,
+            probe_output_indices: (0..probe_column_count).collect(),
+            build_output_indices: (0..build_column_count).collect(),
+            probe_fields,
+            build_fields,
+            kind,
         };
         let (builds, probes, _) =
             factory::create_for_workers::<K, BUILD_OUTER, false>(spec, workers);
@@ -512,7 +495,7 @@ mod tests {
     }
 
     #[test]
-    fn build_payload_columns_are_gathered() {
+    fn build_columns_are_gathered() {
         let r = build_and_probe(
             vec![vec![keyed_names_batch(&[10, 20, 30], &["x", "y", "z"])]],
             vec![int64_batch(&[30, 10])],
@@ -535,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn build_payload_spans_workers_and_batches() {
+    fn build_rows_span_workers_and_batches() {
         let r = build_and_probe(
             vec![
                 vec![
@@ -966,12 +949,12 @@ mod tests {
         );
     }
 
-    /// Short build batches become short payload chunks with gaps in the id
-    /// space; matched rows must still gather their string payload from the
+    /// Short build batches become short stored batches with gaps in the row id
+    /// space; matched rows must still gather their string columns from the
     /// right chunk. The long value lives outside a view's inline bytes, so it
     /// exercises the buffer-rebasing gather path too.
     #[test]
-    fn short_payload_chunks_gather_from_the_right_chunk() {
+    fn short_build_row_batches_gather_from_the_right_batch() {
         let build = vec![
             keyed_names_batch(&[1, 2, 3], &["a", "b", "c"]),
             keyed_names_batch(&[4, 5], &["d", "a-value-too-long-to-inline"]),

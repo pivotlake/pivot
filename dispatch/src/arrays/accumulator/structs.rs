@@ -6,7 +6,7 @@
 //! stores a group, and a child gets whichever strategy its own type calls for.
 //!
 //! Slicing a struct slices its children with it, so a child's rows are at the
-//! same positions as the struct's own and the same [`SourceSelection`] goes straight
+//! same positions as the struct's own and the same indices or range go straight
 //! down.
 
 use std::sync::Arc;
@@ -15,8 +15,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, StructArray};
 use arrow_schema::{ArrowError, Fields};
 
-use super::chunked::PreparedColumn;
-use super::column::{ColumnAccumulator, SourceSelection};
+use super::column::{ChunkedColumn, ColumnAccumulator};
 use super::validity::ValidityMask;
 use super::{ValueStorage, create_column_accumulator};
 use crate::memory::SlabAllocator;
@@ -49,36 +48,63 @@ impl StructColumn {
 }
 
 impl ColumnAccumulator for StructColumn {
-    fn append(
+    fn append_from_indices(
         &mut self,
-        source: &ArrayRef,
-        selection: SourceSelection<'_>,
+        column: &ArrayRef,
+        indices: &[u32],
         destination_start: usize,
         allocator: &mut SlabAllocator,
     ) {
-        let source = source.as_struct();
+        let column = column.as_struct();
         self.validity
-            .append(source.nulls(), selection, destination_start);
-        for (child, values) in self.children.iter_mut().zip(source.columns()) {
-            child.append(values, selection, destination_start, allocator);
+            .append_indices(column.nulls(), indices, destination_start);
+        for (child, values) in self.children.iter_mut().zip(column.columns()) {
+            child.append_from_indices(values, indices, destination_start, allocator);
         }
     }
 
-    fn append_chunked(
+    fn append_from_range(
         &mut self,
-        source: &PreparedColumn,
+        column: &ArrayRef,
+        start: usize,
+        len: usize,
+        destination_start: usize,
+        allocator: &mut SlabAllocator,
+    ) {
+        let column = column.as_struct();
+        self.validity
+            .append_range(column.nulls(), start, len, destination_start);
+        for (child, values) in self.children.iter_mut().zip(column.columns()) {
+            child.append_from_range(values, start, len, destination_start, allocator);
+        }
+    }
+
+    fn append_from_batches(
+        &mut self,
+        column: &ChunkedColumn,
         ids: &[u32],
         shift: u32,
         destination_start: usize,
         allocator: &mut SlabAllocator,
     ) {
-        let PreparedColumn::Struct { nulls, children } = source else {
-            unreachable!("a struct accumulator receives a struct prepared column");
-        };
         self.validity
-            .append_by_ids(nulls, ids, shift, destination_start);
-        for (child, values) in self.children.iter_mut().zip(children) {
-            child.append_chunked(values, ids, shift, destination_start, allocator);
+            .append_by_ids(ids, shift, destination_start, |batch| {
+                column.data[batch]
+                    .nulls()
+                    .filter(|nulls| nulls.null_count() > 0)
+            });
+        // Each child gets its own prepared column. Materializing it here clones
+        // one Arc-backed ArrayData per batch per append, which is fine for the
+        // rare struct-typed column.
+        for (k, child) in self.children.iter_mut().enumerate() {
+            let child_column = ChunkedColumn::new(
+                column
+                    .data
+                    .iter()
+                    .map(|data| data.child_data()[k].clone())
+                    .collect(),
+            );
+            child.append_from_batches(&child_column, ids, shift, destination_start, allocator);
         }
     }
 
