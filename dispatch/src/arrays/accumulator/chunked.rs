@@ -1,118 +1,124 @@
-//! A gather source over many at-most-fixed-size chunks, read by encoded ids.
+//! Columns split across many batches, downcast once for gathering by row id.
 //!
-//! A join's build payload is a list of chunk batches, each holding at most
-//! `1 << shift` rows, and a build row is addressed as `chunk << shift | row`
-//! (a short chunk simply leaves a gap in the id space). Resolving a column
-//! through `RecordBatch` accessors and a type downcast on every gathered row
-//! would dominate the gather, so this prepares each column once: per chunk, the
-//! raw values pointer (or view slice) and the validity, behind one enum tag per
-//! column rather than per row per column.
+//! A join stores its build rows as a list of batches and addresses a row with
+//! one `u32`: the high bits pick the batch, the low bits the row within it.
+//! Gathering such rows is two indexes, but a batch's column arrives as
+//! `Arc<dyn Array>`, which cannot be read without resolving its concrete
+//! type, and the batch changes from row to row. The batches are immutable
+//! once handed over, so each column of each batch is resolved exactly once,
+//! here, and the per-row work in the accumulators is plain indexing.
 //!
-//! The prepared pointers stay valid because the source keeps the chunk batches
-//! alive for its own lifetime.
+//! Everything stored is an owned, refcounted handle (buffers, arrays), so
+//! this holds no raw pointers and keeps its sources alive by itself.
 
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, RecordBatch};
-use arrow_buffer::{Buffer, NullBuffer};
+use arrow_buffer::{Buffer, NullBuffer, ScalarBuffer};
 use arrow_schema::DataType;
 
-/// One column of a [`ChunkedGatherSource`], prepared for per-id reads. The
-/// variants mirror the column accumulator kinds, and a column always reaches
-/// the accumulator built for its type, so each accumulator sees its own
-/// variant.
-pub(super) enum PreparedColumn {
+/// The columns of a chunked row store, each downcast once. Built by
+/// [`prepare`](ChunkedColumns::prepare); read through
+/// [`append_chunked_by_ids`](super::BatchAccumulator::append_chunked_by_ids).
+pub struct ChunkedColumns {
+    pub(super) columns: Vec<ChunkedColumn>,
+    /// How a row id splits: `id >> shift` picks the batch,
+    /// `id & ((1 << shift) - 1)` the row within it.
+    pub(super) shift: u32,
+}
+
+/// One column, as its per-batch downcast results. The variants mirror the
+/// accumulator kinds, and a column always reaches the accumulator built for
+/// its type, so each accumulator sees its own variant.
+pub(super) enum ChunkedColumn {
     FixedWidth {
         width: usize,
-        /// Per chunk, the first value's address (the chunk's offset applied).
-        values: Vec<*const u8>,
-        nulls: Vec<Option<NullBuffer>>,
+        chunks: Vec<FixedWidthChunk>,
     },
     View {
         chunks: Vec<ViewChunk>,
-        nulls: Vec<Option<NullBuffer>>,
     },
     Struct {
         nulls: Vec<Option<NullBuffer>>,
-        children: Vec<PreparedColumn>,
+        children: Vec<ChunkedColumn>,
     },
-    /// A type without a raw fast path (bit-packed booleans, lists). Gathered
-    /// through the plain arrays, which the concatenated accumulator slices.
-    Whole { arrays: Vec<ArrayRef> },
+    /// A type without a raw fast path (bit-packed booleans, lists), gathered
+    /// through the arrays themselves.
+    Whole {
+        chunks: Vec<ArrayRef>,
+    },
 }
 
-/// One chunk of a view column: the views (offset applied) and the data
-/// buffers the non-inline views point into.
+/// One batch of a fixed-width column: its values buffer and the element
+/// offset the array starts at within it.
+pub(super) struct FixedWidthChunk {
+    pub(super) values: Buffer,
+    pub(super) offset: usize,
+    pub(super) nulls: Option<NullBuffer>,
+}
+
+/// One batch of a view column: the 16-byte views and the data buffers the
+/// non-inline values point into.
 pub(super) struct ViewChunk {
-    pub(super) views: *const u128,
+    pub(super) views: ScalarBuffer<u128>,
     pub(super) data_buffers: Vec<Buffer>,
+    pub(super) nulls: Option<NullBuffer>,
 }
 
-/// A join build payload prepared for gathering output rows by encoded id.
-pub struct ChunkedGatherSource {
-    pub(super) columns: Vec<PreparedColumn>,
-    pub(super) shift: u32,
-    /// Keeps every prepared pointer alive.
-    _chunks: Vec<RecordBatch>,
-}
-
-// The prepared pointers address immutable Arc-backed buffers the source keeps
-// alive, so reading them from another thread is sound.
-unsafe impl Send for ChunkedGatherSource {}
-
-impl ChunkedGatherSource {
-    /// Prepare `chunks` (all of one schema, each at most `1 << shift` rows)
-    /// for gathering by `chunk << shift | row` ids.
-    pub fn prepare(chunks: &[RecordBatch], shift: u32) -> Self {
-        let column_count = chunks.first().map(|chunk| chunk.num_columns()).unwrap_or(0);
-        let columns = (0..column_count)
-            .map(|column| {
-                prepare_column(
-                    chunks
-                        .iter()
-                        .map(|chunk| chunk.column(column).clone())
-                        .collect(),
-                )
-            })
-            .collect();
+impl ChunkedColumns {
+    /// Downcast every column of every batch, once. The batches must share a
+    /// schema and each hold at most `1 << shift` rows.
+    pub fn prepare(batches: &[RecordBatch], shift: u32) -> Self {
+        let column_count = batches
+            .first()
+            .map(|batch| batch.num_columns())
+            .unwrap_or(0);
         Self {
-            columns,
+            columns: (0..column_count)
+                .map(|column| {
+                    prepare_column(
+                        batches
+                            .iter()
+                            .map(|batch| batch.column(column).clone())
+                            .collect(),
+                    )
+                })
+                .collect(),
             shift,
-            _chunks: chunks.to_vec(),
         }
     }
 }
 
-fn prepare_column(chunk_arrays: Vec<ArrayRef>) -> PreparedColumn {
-    let data_type = chunk_arrays[0].data_type().clone();
+fn prepare_column(arrays: Vec<ArrayRef>) -> ChunkedColumn {
+    let data_type = arrays[0].data_type().clone();
     match &data_type {
-        DataType::Utf8View | DataType::BinaryView => PreparedColumn::View {
-            nulls: prepare_nulls(&chunk_arrays),
-            chunks: chunk_arrays
+        DataType::Utf8View | DataType::BinaryView => ChunkedColumn::View {
+            chunks: arrays
                 .iter()
                 .map(|array| {
                     let (views, data_buffers) = match &data_type {
                         DataType::Utf8View => {
                             let array = array.as_string_view();
-                            (array.views().as_ptr(), array.data_buffers().to_vec())
+                            (array.views().clone(), array.data_buffers().to_vec())
                         }
                         _ => {
                             let array = array.as_binary_view();
-                            (array.views().as_ptr(), array.data_buffers().to_vec())
+                            (array.views().clone(), array.data_buffers().to_vec())
                         }
                     };
                     ViewChunk {
                         views,
                         data_buffers,
+                        nulls: nulls_of(array),
                     }
                 })
                 .collect(),
         },
-        DataType::Struct(fields) => PreparedColumn::Struct {
-            nulls: prepare_nulls(&chunk_arrays),
+        DataType::Struct(fields) => ChunkedColumn::Struct {
+            nulls: arrays.iter().map(nulls_of).collect(),
             children: (0..fields.len())
                 .map(|child| {
                     prepare_column(
-                        chunk_arrays
+                        arrays
                             .iter()
                             .map(|array| array.as_struct().column(child).clone())
                             .collect(),
@@ -121,37 +127,30 @@ fn prepare_column(chunk_arrays: Vec<ArrayRef>) -> PreparedColumn {
                 .collect(),
         },
         other => match other.primitive_width() {
-            Some(width @ (1 | 2 | 4 | 8 | 16)) => PreparedColumn::FixedWidth {
+            Some(width @ (1 | 2 | 4 | 8 | 16)) => ChunkedColumn::FixedWidth {
                 width,
-                nulls: prepare_nulls(&chunk_arrays),
-                values: chunk_arrays
+                chunks: arrays
                     .iter()
                     .map(|array| {
                         let data = array.to_data();
-                        // The pointer outlives the temporary ArrayData: it
-                        // addresses the buffer allocation the array itself
-                        // holds, which the source keeps alive.
-                        unsafe { data.buffers()[0].as_ptr().add(data.offset() * width) }
+                        FixedWidthChunk {
+                            values: data.buffers()[0].clone(),
+                            offset: data.offset(),
+                            nulls: nulls_of(array),
+                        }
                     })
                     .collect(),
             },
-            _ => PreparedColumn::Whole {
-                arrays: chunk_arrays,
-            },
+            _ => ChunkedColumn::Whole { chunks: arrays },
         },
     }
 }
 
-/// Each chunk's validity, normalized to `None` when the chunk holds no null so
-/// the per-id loops keep their null-free fast path.
-fn prepare_nulls(chunk_arrays: &[ArrayRef]) -> Vec<Option<NullBuffer>> {
-    chunk_arrays
-        .iter()
-        .map(|array| {
-            array
-                .nulls()
-                .filter(|nulls| nulls.null_count() > 0)
-                .cloned()
-        })
-        .collect()
+/// A batch's validity, normalized to `None` when it holds no null so the
+/// per-id loops keep their null-free fast path.
+fn nulls_of(array: &ArrayRef) -> Option<NullBuffer> {
+    array
+        .nulls()
+        .filter(|nulls| nulls.null_count() > 0)
+        .cloned()
 }
