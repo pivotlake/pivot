@@ -89,11 +89,11 @@ pub enum Error {
     #[error("loading table footers: {0}")]
     Load(#[from] DataFlowError),
     #[error(
-        "table `{table}`: file `{file}` has no loaded row-group metadata; the copy was not synced to its manifest"
+        "table at `{location}`: file `{file}` has no loaded row-group metadata; the copy was not synced to its manifest"
     )]
-    FooterNotLoaded { table: String, file: String },
-    #[error("table `{table}` commit conflict: input file `{file}` is no longer active")]
-    CommitConflict { table: String, file: String },
+    FooterNotLoaded { location: String, file: String },
+    #[error("table at `{location}` commit conflict: input file `{file}` is no longer active")]
+    CommitConflict { location: String, file: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -118,10 +118,18 @@ struct TableIndex {
 }
 
 impl TableIndex {
-    /// Insert or replace a table under both its identity and its current name.
-    fn insert(&mut self, table: CatalogTable) {
-        self.name_to_uuid
-            .insert(table.name().to_string(), table.id());
+    /// Insert or replace a table under its identity, and point `name` at that
+    /// identity. The name arrives alongside the table because the table does not
+    /// carry one: this is the single place a name is bound to a table.
+    fn insert_table(&mut self, name: String, table: CatalogTable) {
+        self.name_to_uuid.insert(name, table.id());
+        self.by_uuid.insert(table.id(), table);
+    }
+
+    /// Swap in an advanced copy of a table already in the index, leaving the
+    /// name map alone. A refresh has a newer copy of the same table, not a new
+    /// table, so re-asserting a name it never carried would be meaningless.
+    fn replace_table(&mut self, table: CatalogTable) {
         self.by_uuid.insert(table.id(), table);
     }
 
@@ -137,8 +145,11 @@ impl TableIndex {
         self.name_to_uuid.contains_key(name)
     }
 
-    fn values(&self) -> impl Iterator<Item = &CatalogTable> {
-        self.by_uuid.values()
+    /// Each table with the name it is currently indexed under.
+    fn tables(&self) -> impl Iterator<Item = (&String, &CatalogTable)> {
+        self.name_to_uuid
+            .iter()
+            .filter_map(|(name, id)| Some((name, self.by_uuid.get(id)?)))
     }
 
     fn names(&self) -> impl Iterator<Item = &str> {
@@ -236,7 +247,7 @@ impl DeltaDatastore {
         let mut tables = TableIndex::default();
         for entry in &manifest.tables {
             let table = Self::load_table(dispatcher, &store, entry)?;
-            tables.insert(table);
+            tables.insert_table(entry.name.clone(), table);
         }
 
         Ok(Arc::new(Self {
@@ -279,7 +290,6 @@ impl DeltaDatastore {
         let declared_columns: Arc<[planner::catalog::Column]> = manifest.columns.clone().into();
         let table_files = crate::parquet::load_table_files(dispatcher, &files, declared_columns)?;
         Ok(CatalogTable::new(
-            entry.name.clone(),
             id,
             entry.location.clone(),
             manifest,
@@ -340,19 +350,19 @@ impl DeltaDatastore {
             let mut map = self.tables.write().unwrap();
             // An in-process CREATE TABLE may have published it since the read.
             if !map.contains_name(&entry.name) {
-                map.insert(table);
+                map.insert_table(entry.name.clone(), table);
                 changed = true;
             }
         }
 
         // Refresh each table on a clone outside the lock (footer fetches are
         // I/O), then publish the advanced copy back.
-        for mut table in self.tables() {
+        for (name, mut table) in self.tables() {
             match table.refresh() {
                 Ok(true) => changed |= self.publish_table(table),
                 Ok(false) => {}
                 Err(e) => {
-                    tracing::warn!(table = table.name(), error = %e, "catalog refresh: refreshing table failed");
+                    tracing::warn!(table = name, error = %e, "catalog refresh: refreshing table failed");
                 }
             }
         }
@@ -370,7 +380,7 @@ impl DeltaDatastore {
         match map.get_by_id(&table.id()) {
             Some(existing) if existing.version() >= table.version() => false,
             _ => {
-                map.insert(table);
+                map.replace_table(table);
                 true
             }
         }
@@ -405,7 +415,6 @@ impl DeltaDatastore {
             return Err(Error::TableExists(name));
         }
         let table = CatalogTable::create_new(
-            name.clone(),
             location.clone(),
             loaded,
             columns,
@@ -417,7 +426,7 @@ impl DeltaDatastore {
         let mut index = CatalogManifest::load(self.store.as_ref())?;
         index.upsert(CatalogManifestTableEntry::new(name.clone(), location));
         index.store(self.store.as_ref())?;
-        map.insert(table);
+        map.insert_table(name, table);
         Ok(())
     }
 
@@ -446,8 +455,13 @@ impl DeltaDatastore {
 
     /// A snapshot clone of every table the catalog currently holds — for a sweep
     /// (e.g. the compacter) that refreshes and evolves each one independently.
-    pub fn tables(&self) -> Vec<CatalogTable> {
-        self.tables.read().unwrap().values().cloned().collect()
+    pub fn tables(&self) -> Vec<(String, CatalogTable)> {
+        self.tables
+            .read()
+            .unwrap()
+            .tables()
+            .map(|(name, table)| (name.clone(), table.clone()))
+            .collect()
     }
 
     /// A clone of the table with identity `id`, or `None` if it's gone (dropped,

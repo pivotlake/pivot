@@ -118,7 +118,6 @@ impl std::fmt::Debug for TableBinding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TableBinding")
             .field("reference", &self.reference)
-            .field("table", &self.table.name())
             .field("id", &self.table.id())
             .field("predicates", &self.predicates)
             .finish_non_exhaustive()
