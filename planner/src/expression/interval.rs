@@ -90,7 +90,7 @@ mod tests {
     use crate::test_support::*;
     use crate::types::Type;
     use arrow_array::cast::AsArray;
-    use arrow_array::types::TimestampSecondType;
+    use arrow_array::types::TimestampMicrosecondType;
     use arrow_array::{ArrayRef, Int32Array};
     use arrow_schema::{DataType, TimeUnit};
     use rstest::rstest;
@@ -112,44 +112,45 @@ mod tests {
             "SELECT d + interval '7 days' FROM events",
         );
 
-        // DuckDB promotes `date + interval` to a TIMESTAMP: 1970-01-01 + 7 days =
-        // 1970-01-08 00:00:00 = 604800 epoch seconds.
+        // DuckDB promotes `date + interval` to a TIMESTAMP: 1970-01-01 + 7 days
+        // = 1970-01-08 00:00:00, counted in microseconds.
         let col = batches[0].column(0);
         assert_eq!(
             col.data_type(),
-            &DataType::Timestamp(TimeUnit::Second, None)
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
         );
         assert_eq!(
-            col.as_primitive::<TimestampSecondType>().value(0),
-            7 * 86_400
+            col.as_primitive::<TimestampMicrosecondType>().value(0),
+            7 * 86_400 * 1_000_000
         );
     }
 
     #[rstest]
-    fn now_minus_interval_subtracts_seconds(mut testing_planner: TestingPlanner) {
-        let before = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+    fn now_minus_interval_subtracts_the_offset(mut testing_planner: TestingPlanner) {
+        let before = micros_since_epoch();
 
         let batches = run_batches(&mut testing_planner, "SELECT now() - interval '5 days'");
 
-        let after = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let after = micros_since_epoch();
         let col = batches[0].column(0);
         assert_eq!(
             col.data_type(),
-            &DataType::Timestamp(TimeUnit::Second, None)
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
         );
-        let secs = col.as_primitive::<TimestampSecondType>().value(0);
-        let five_days = 5 * 86_400;
+        let micros = col.as_primitive::<TimestampMicrosecondType>().value(0);
+        let five_days = 5 * 86_400 * 1_000_000;
         assert!(
-            (before - five_days..=after - five_days).contains(&secs),
-            "{secs} not in [{}, {}]",
+            (before - five_days..=after - five_days).contains(&micros),
+            "{micros} not in [{}, {}]",
             before - five_days,
             after - five_days
         );
+    }
+
+    fn micros_since_epoch() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64
     }
 }

@@ -8,7 +8,7 @@ use super::{
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::expression::Expression;
 use crate::types::Type;
-use arrow_array::{Int64Array, RecordBatch, TimestampSecondArray};
+use arrow_array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
 use std::fmt::{self, Display};
 use std::sync::Arc;
 
@@ -37,8 +37,8 @@ pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
         }),
         // `now()`: current wall-clock time. VOLATILE so DuckDB can't fold the
         // call into its own `TIMESTAMP WITH TIME ZONE` constant; pivot evaluates
-        // it instead, returning a `TIMESTAMP` (epoch seconds) like the rest of
-        // its time path. (The bare `CURRENT_TIMESTAMP` keyword is a separate
+        // it instead, returning the plain microsecond `TIMESTAMP` the rest of
+        // its time path counts in. (The bare `CURRENT_TIMESTAMP` keyword is a separate
         // DuckDB value-function that yields a TZ type pivot doesn't model, so
         // only the `now()` call form is intercepted here.)
         "now" => Some(ScalarFunctionSignature {
@@ -95,7 +95,7 @@ pub enum Function {
     DropCache,
     /// `now()` yields the wall-clock time captured once when the query
     /// compiles, so every row of the statement sees the same instant. Result is
-    /// a `TIMESTAMP` (epoch seconds).
+    /// a `TIMESTAMP` (epoch microseconds).
     Now,
     /// A variant (JSON) path read: `doc->'key'` chains, optionally typed by a
     /// fused `CAST`.
@@ -225,19 +225,17 @@ impl Function {
             })),
             // Capture the instant once, here at compile time, so every worker and
             // every row of the statement observes the same `now()`. Emitted as a
-            // real `Timestamp` (epoch seconds, pivot's timestamp representation).
-            // Negative (pre-epoch) clocks are clamped to 0, which can't happen on a
-            // sane host.
+            // real `Timestamp` (epoch microseconds, pivot's timestamp
+            // representation). Negative (pre-epoch) clocks are clamped to 0,
+            // which can't happen on a sane host.
             Function::Now => {
-                let now_secs = std::time::SystemTime::now()
+                let now_micros = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .map(|elapsed| elapsed.as_secs() as i64)
+                    .map(|elapsed| i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX))
                     .unwrap_or(0);
                 Ok(stateless_expr(move |batch: &RecordBatch| {
-                    ExprResult::Array(Arc::new(TimestampSecondArray::from(vec![
-                        now_secs;
-                        batch.num_rows()
-                    ])))
+                    let values = vec![now_micros; batch.num_rows()];
+                    ExprResult::Array(Arc::new(TimestampMicrosecondArray::from(values)))
                 }))
             }
         }
@@ -248,7 +246,7 @@ impl Function {
 mod tests {
     use crate::test_support::*;
     use arrow_array::cast::AsArray;
-    use arrow_array::types::TimestampSecondType;
+    use arrow_array::types::TimestampMicrosecondType;
     use arrow_schema::{DataType, TimeUnit};
     use rstest::rstest;
 
@@ -264,27 +262,29 @@ mod tests {
 
     #[rstest]
     fn now_returns_current_time_as_a_timestamp(mut testing_planner: TestingPlanner) {
-        let before = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let before = micros_since_epoch();
 
         let batches = run_batches(&mut testing_planner, "SELECT now()");
 
-        let after = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let after = micros_since_epoch();
         let col = batches[0].column(0);
-        // `now()` surfaces as a real TIMESTAMP carrying the captured epoch second.
+        // `now()` surfaces as a real TIMESTAMP carrying the captured instant at
+        // the microsecond resolution a timestamp counts in.
         assert_eq!(
             col.data_type(),
-            &DataType::Timestamp(TimeUnit::Second, None)
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
         );
-        let now = col.as_primitive::<TimestampSecondType>().value(0);
+        let now = col.as_primitive::<TimestampMicrosecondType>().value(0);
         assert!(
             (before..=after).contains(&now),
             "{now} not in [{before}, {after}]"
         );
+    }
+
+    fn micros_since_epoch() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64
     }
 }

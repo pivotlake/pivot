@@ -13,6 +13,8 @@ use std::sync::Arc;
 /// Seconds in a day / hour, for the time-of-day parts.
 const SECS_PER_DAY: i64 = 86_400;
 const SECS_PER_HOUR: i64 = 3_600;
+/// Microseconds in a second, the unit a timestamp counts in.
+const MICROS_PER_SEC: i64 = 1_000_000;
 
 /// Convert a day count relative to the Unix epoch (1970-01-01) into a
 /// `(year, month, day)` civil date. Howard Hinnant's `civil_from_days`
@@ -69,17 +71,18 @@ fn iso_week(days: i64) -> i64 {
 /// Which field of a timestamp a [`DatePart`] extracts. DuckDB lowers
 /// `extract(<part> FROM ts)` to a scalar function named after the part (e.g.
 /// `minute`, `year`); this enumerates the parts we evaluate from a timestamp's
-/// Int64 epoch-seconds representation. See [`DatePart`]'s compile impl for the
-/// per-part arithmetic.
+/// Int64 epoch-microseconds representation. See [`DatePart`]'s compile impl for
+/// the per-part arithmetic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatePartKind {
-    /// Whole seconds since the Unix epoch (the stored value, unchanged).
+    /// Whole seconds since the Unix epoch.
     Epoch,
     /// Second of minute, 0–59.
     Second,
-    /// Millisecond of minute, 0–59000 (whole seconds only, so `second * 1000`).
+    /// Millisecond of minute, 0–59999: the whole seconds plus the stored
+    /// fraction, as DuckDB reports it.
     Millisecond,
-    /// Microsecond of minute, `second * 1_000_000`.
+    /// Microsecond of minute, 0–59999999, likewise carrying the fraction.
     Microsecond,
     /// Minute of hour, 0–59.
     Minute,
@@ -183,10 +186,10 @@ impl Display for DatePart {
 
 impl DatePart {
     pub fn compile(&self) -> Result<ExprFn, compile::Error> {
-        // A timestamp is stored as Int64 epoch *seconds* (UTC), so every part is a
-        // pure integer computation. Euclidean div/rem keep the time-of-day and
-        // calendar fields well-defined for pre-epoch (negative) timestamps,
-        // matching DuckDB's `extract(<part> FROM ...)`.
+        // A timestamp is stored as Int64 epoch *microseconds* (UTC), so every
+        // part is a pure integer computation. Euclidean div/rem keep the
+        // time-of-day and calendar fields well-defined for pre-epoch (negative)
+        // timestamps, matching DuckDB's `extract(<part> FROM ...)`.
         let kind = self.kind;
         let source_builder = self.source.compile()?;
         Ok(Box::new(move || {
@@ -194,20 +197,20 @@ impl DatePart {
             Box::new(move |batch: &RecordBatch| {
                 let src = source_expr(batch);
                 let (arr, _) = src.as_datum().get();
-                // A DATE column stores whole days since the epoch, so scale it to
-                // the epoch seconds every arm below computes on. The time-of-day
-                // parts of a date then read as midnight, which is what DuckDB
-                // returns for them.
-                let seconds: Int64Array = match arr.data_type() {
+                // A DATE column stores whole days since the epoch, so scale it
+                // to the epoch microseconds every arm below computes on. The
+                // time-of-day parts of a date then read as midnight, which is
+                // what DuckDB returns for them.
+                let micros: Int64Array = match arr.data_type() {
                     DataType::Date32 => arr
                         .as_primitive::<Date32Type>()
-                        .unary(|days: i32| i64::from(days) * SECS_PER_DAY),
+                        .unary(|days: i32| i64::from(days) * SECS_PER_DAY * MICROS_PER_SEC),
                     _ => arrow::compute::cast(arr, &DataType::Int64)
                         .unwrap()
                         .as_primitive::<Int64Type>()
                         .clone(),
                 };
-                let vals = &seconds;
+                let vals = &micros;
                 // Dispatch on the part ONCE per batch, then run a single
                 // monomorphic, branch-free row loop per arm — so e.g. `minute`
                 // compiles to exactly its two-op loop with no per-row `kind`
@@ -220,14 +223,24 @@ impl DatePart {
                         out
                     }};
                 }
-                let day = |t: i64| t.div_euclid(SECS_PER_DAY);
+                // Each arm divides the stored microseconds by its own field's
+                // width in one step rather than reducing to whole seconds
+                // first: flooring twice is flooring once by the product, so
+                // `(t / 1e6) / 60` is `t / 6e7`, and one division per row is
+                // what the field costs.
+                let second = |t: i64| t.div_euclid(MICROS_PER_SEC);
+                let day = |t: i64| t.div_euclid(SECS_PER_DAY * MICROS_PER_SEC);
                 let out = match kind {
-                    Epoch => map_part!(|t: i64| t),
-                    Second => map_part!(|t: i64| t.rem_euclid(60)),
-                    Millisecond => map_part!(|t: i64| t.rem_euclid(60) * 1_000),
-                    Microsecond => map_part!(|t: i64| t.rem_euclid(60) * 1_000_000),
-                    Minute => map_part!(|t: i64| t.div_euclid(60).rem_euclid(60)),
-                    Hour => map_part!(|t: i64| t.div_euclid(SECS_PER_HOUR).rem_euclid(24)),
+                    Epoch => map_part!(|t: i64| second(t)),
+                    Second => map_part!(|t: i64| second(t).rem_euclid(60)),
+                    Millisecond => map_part!(|t: i64| t.div_euclid(1_000).rem_euclid(60_000)),
+                    Microsecond => map_part!(|t: i64| t.rem_euclid(60 * MICROS_PER_SEC)),
+                    Minute => map_part!(|t: i64| t.div_euclid(60 * MICROS_PER_SEC).rem_euclid(60)),
+                    Hour => {
+                        map_part!(|t: i64| t
+                            .div_euclid(SECS_PER_HOUR * MICROS_PER_SEC)
+                            .rem_euclid(24))
+                    }
                     // 0 = Sunday … 6 = Saturday. The epoch day (1970-01-01) was a
                     // Thursday (4), so `(days + 4) mod 7` rebases to Sunday = 0.
                     DayOfWeek => map_part!(|t: i64| (day(t) + 4).rem_euclid(7)),
@@ -298,8 +311,8 @@ mod tests {
             &[(
                 "EventTime",
                 Type::Timestamp,
-                // 1704067200 = 2024-01-01 00:00:00 UTC.
-                Arc::new(Int64Array::from(vec![1_704_067_200i64])) as ArrayRef,
+                // 1704067200s = 2024-01-01 00:00:00 UTC, in microseconds.
+                Arc::new(Int64Array::from(vec![1_704_067_200_000_000i64])) as ArrayRef,
             )],
         );
 
@@ -318,7 +331,7 @@ mod tests {
             &[(
                 "EventTime",
                 Type::Timestamp,
-                Arc::new(Int64Array::from(vec![0i64, 0, 3600])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![0i64, 0, 3_600_000_000])) as ArrayRef,
             )],
         );
 

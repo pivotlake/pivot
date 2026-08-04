@@ -2,8 +2,9 @@
 -- the SQL types pivot's planner understands (BIGINT, INTEGER, SMALLINT,
 -- VARCHAR). EventTime/EventDate are stored in the source parquet as packed
 -- epoch seconds / days, so they're declared as their integer storage type here;
--- the queries read them as real dates on demand via `make_timestamp(EventTime)` and
--- `make_date(EventDate)`. CHAR(...) columns are widened to VARCHAR.
+-- the queries read them as real dates on demand via
+-- `make_timestamp(EventTime * 1000000)` (the function counts microseconds, as it
+-- does in DuckDB, while the column counts seconds) and `make_date(EventDate)`. CHAR(...) columns are widened to VARCHAR.
 --
 -- The runner substitutes `{source}` with the value of `--source`.
 CREATE TABLE hits (

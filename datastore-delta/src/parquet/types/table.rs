@@ -13,7 +13,7 @@ use crate::store::DataFile;
 use arrow_array::{
     ArrayRef, BooleanArray, Date32Array, Decimal64Array, Decimal128Array, Float32Array,
     Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Scalar, StringViewArray,
-    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use dispatch::DataFlowDispatcher;
@@ -385,13 +385,13 @@ fn decode_scalar(
             .ok()
             .map(|s| erase_type(StringViewArray::new_scalar(s))),
         // Temporal stats share their physical int's encoding (Date32 the i32
-        // days, Timestamp(Second) the i64 count).
+        // days, Timestamp(Microsecond) the i64 count).
         DataType::Date32 => read_le::<4>(bytes)
             .map(i32::from_le_bytes)
             .map(|v| erase_type(Date32Array::new_scalar(v))),
-        DataType::Timestamp(TimeUnit::Second, None) => read_le::<8>(bytes)
+        DataType::Timestamp(TimeUnit::Microsecond, None) => read_le::<8>(bytes)
             .map(i64::from_le_bytes)
-            .map(|v| erase_type(TimestampSecondArray::new_scalar(v))),
+            .map(|v| erase_type(TimestampMicrosecondArray::new_scalar(v))),
         // A decimal's unscaled integer follows the column's physical storage;
         // the scalar's carrier follows the column's arrow type.
         DataType::Decimal64(precision, scale) => {
@@ -528,20 +528,18 @@ fn apply_declared_types(schema: Schema, declared_columns: &[Column]) -> Result<S
                     field.as_ref().clone().with_data_type(DataType::Utf8View),
                 ));
             }
-            // Pivot's timestamp convention (see `Type::Timestamp`): scans
-            // hand the executor epoch seconds as plain `Int64`, and
-            // pivot-written files store exactly that. An annotated file
-            // parses to `Timestamp(Second)`, the same 8-byte integers;
-            // retype it to the canonical `Int64` so every file of the table
-            // decodes to the same column type as the executor expects.
-            if **declared == Type::Timestamp
-                && matches!(
-                    file_type,
-                    DataType::Int64 | DataType::Timestamp(TimeUnit::Second, None)
-                )
-            {
+            // A pivot timestamp counts microseconds (see `Type::Timestamp`),
+            // and pivot-written files store that count in a bare INT64 under no
+            // annotation. Such a leaf says nothing about its own unit, so it is
+            // re-labelled as the timestamp the table declares. An annotated
+            // leaf already parsed to `Timestamp(Microsecond)` and matches
+            // below; any other unit was rejected when the footer was read.
+            if **declared == Type::Timestamp && *file_type == DataType::Int64 {
                 return Ok(Arc::new(
-                    field.as_ref().clone().with_data_type(DataType::Int64),
+                    field
+                        .as_ref()
+                        .clone()
+                        .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, None)),
                 ));
             }
             let matches_declared = match declared {
@@ -808,19 +806,16 @@ mod tests {
         );
     }
 
-    /// Both timestamp storage flavors (pivot's plain INT64 epoch seconds and
-    /// an annotated `Timestamp(Second)`) retype to the one canonical arrow
-    /// type the executor reads, so a table mixing such files emits
+    /// Both timestamp storage flavors (pivot's plain INT64 count of
+    /// microseconds and an annotated `Timestamp(Microsecond)`) reconcile to the
+    /// one arrow type the executor reads, so a table mixing such files emits
     /// uniformly-typed batches.
     #[test]
-    fn declared_timestamp_canonicalizes_both_storage_flavors() {
+    fn declared_timestamp_reconciles_both_storage_flavors() {
+        let micros = DataType::Timestamp(TimeUnit::Microsecond, None);
         let schema = Schema::new(vec![
             Field::new("ts_plain", DataType::Int64, false),
-            Field::new(
-                "ts_annotated",
-                DataType::Timestamp(TimeUnit::Second, None),
-                false,
-            ),
+            Field::new("ts_annotated", micros.clone(), false),
         ]);
         let declared = [
             column("ts_plain", Type::Timestamp),
@@ -829,8 +824,8 @@ mod tests {
 
         let reconciled = apply_declared_types(schema, &declared).unwrap();
 
-        assert_eq!(*reconciled.field(0).data_type(), DataType::Int64);
-        assert_eq!(*reconciled.field(1).data_type(), DataType::Int64);
+        assert_eq!(*reconciled.field(0).data_type(), micros);
+        assert_eq!(*reconciled.field(1).data_type(), micros);
     }
 
     /// DuckDB resolves identifiers case-insensitively, so a declared column

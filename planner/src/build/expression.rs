@@ -477,12 +477,13 @@ impl TemporalConvert {
         )
     }
 
-    /// `make_timestamp(seconds)` → `Timestamp(Second)`.
+    /// `make_timestamp(microseconds)` → `Timestamp(Microsecond)`, DuckDB's own
+    /// reading of the function.
     pub(crate) fn make_timestamp(func: FunctionHandle<'_>) -> Result<TemporalConvert, Error> {
         Self::build(
             "make_timestamp",
             Type::Timestamp,
-            DataType::Timestamp(TimeUnit::Second, None),
+            DataType::Timestamp(TimeUnit::Microsecond, None),
             DataType::Int64,
             func,
         )
@@ -561,9 +562,9 @@ const SECS_PER_DAY: i64 = 86_400;
 const MICROS_PER_SEC: i64 = 1_000_000;
 
 /// Reduce an interval to a constant offset in the result's unit. Months/years are
-/// calendar-variable (rejected); a `DATE` only takes whole-day intervals, a
-/// `TIMESTAMP` takes days plus a sub-day part truncated to whole seconds (pivot
-/// stores timestamps at second granularity, so any sub-second part is dropped).
+/// calendar-variable (rejected); a `DATE` only takes whole-day intervals, and a
+/// `TIMESTAMP` takes days plus the sub-day part as-is, both counted in the
+/// microseconds a timestamp stores.
 fn interval_offset(interval: &IntervalParts, result: &Type) -> Result<i64, Error> {
     if interval.months != 0 {
         return Err(Error::UnsupportedInterval(
@@ -580,7 +581,7 @@ fn interval_offset(interval: &IntervalParts, result: &Type) -> Result<i64, Error
             Ok(interval.days as i64)
         }
         Type::Timestamp => {
-            Ok(interval.days as i64 * SECS_PER_DAY + interval.micros / MICROS_PER_SEC)
+            Ok(interval.days as i64 * SECS_PER_DAY * MICROS_PER_SEC + interval.micros)
         }
         other => Err(Error::UnsupportedInterval(format!(
             "interval arithmetic on a non-temporal {other}"

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use arrow_array::{
     Array, BooleanArray, Date32Array, Decimal64Array, Decimal128Array, Float32Array, Float64Array,
     Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray, StringViewArray,
-    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, SchemaRef};
 
@@ -128,22 +128,44 @@ macro_rules! arrow_pg_types {
                 DataType::Decimal128(_, _) => encoder.encode_field(
                     &arr.as_any().downcast_ref::<Decimal128Array>().unwrap().value_as_string(row),
                 ),
-                // Temporal columns render in text format as their ISO string,
-                // which is also Postgres's text wire form for DATE/TIMESTAMP.
-                // The executor only ever produces second-granularity timestamps.
+                // Temporal columns render as their ISO string, Postgres's text
+                // wire form for DATE/TIMESTAMP. A timestamp's fraction goes
+                // through [`trim_fraction`] to match what a server prints.
+                // Handing the encoder the chrono value itself would also
+                // encode, but pgwire's `ToSqlText` fixes the fraction at six
+                // digits, so every whole second would arrive as `.000000`.
+                // Only text format is emitted (see the module doc), so nothing
+                // here rests on the encoder's binary path.
                 DataType::Date32 => encoder.encode_field(
                     &arr.as_any().downcast_ref::<Date32Array>().unwrap()
                         .value_as_date(row).map(|d| d.to_string()),
                 ),
                 DataType::Timestamp(_, _) => encoder.encode_field(
-                    &arr.as_any().downcast_ref::<TimestampSecondArray>().unwrap()
-                        .value_as_datetime(row).map(|t| t.to_string()),
+                    &arr.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap()
+                        .value_as_datetime(row).map(|t| trim_fraction(t.to_string())),
                 ),
                 // Best-effort fallback: stringify and ship as text.
                 _ => encoder.encode_field(&format!("{:?}", arr.slice(row, 1))),
             };
         }
     };
+}
+
+/// Drop the trailing zeros from a rendered timestamp's fractional second, and
+/// the fraction itself when nothing is left, which is how a Postgres server
+/// prints one: `00:00:00.5`, not `00:00:00.500`. Chrono pads the fraction to
+/// three, six or nine digits, so its rendering needs this to read the same as a
+/// real server's.
+fn trim_fraction(rendered: String) -> String {
+    let Some((instant, fraction)) = rendered.split_once('.') else {
+        return rendered;
+    };
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.is_empty() {
+        instant.to_string()
+    } else {
+        format!("{instant}.{fraction}")
+    }
 }
 
 arrow_pg_types! {
@@ -382,13 +404,48 @@ mod tests {
         assert_eq!(decoded[1], vec![Some("1970-01-08".to_string())]);
     }
 
+    /// A fractional second renders with its trailing zeros dropped, and a
+    /// pre-epoch instant keeps the fraction of the second it falls in. Every
+    /// expectation here is what a PostgreSQL 16 server prints for the same
+    /// value.
     #[test]
-    fn timestamp_second_maps_to_timestamp_and_renders_iso() {
-        let col: ArrayRef = Arc::new(TimestampSecondArray::from(vec![0, 90]));
+    fn fractional_timestamps_render_as_a_postgres_server_prints_them() {
+        let col: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+            1_577_836_800_500_000,
+            1_577_836_800_120_000,
+            1_577_836_800_000_001,
+            -1_500_000,
+        ]));
         let b = batch(
             vec![(
                 "t",
-                DataType::Timestamp(arrow_schema::TimeUnit::Second, None),
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
+            )],
+            vec![col],
+        );
+
+        let decoded = rows(&b);
+
+        assert_eq!(decoded[0], vec![Some("2020-01-01 00:00:00.5".to_string())]);
+        assert_eq!(decoded[1], vec![Some("2020-01-01 00:00:00.12".to_string())]);
+        assert_eq!(
+            decoded[2],
+            vec![Some("2020-01-01 00:00:00.000001".to_string())]
+        );
+        assert_eq!(decoded[3], vec![Some("1969-12-31 23:59:58.5".to_string())]);
+    }
+
+    #[test]
+    fn timestamp_maps_to_timestamp_and_renders_iso() {
+        let col: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+            0,
+            90_000_000,
+            1_700_000_000_123_456,
+        ]));
+        let b = batch(
+            vec![(
+                "t",
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
             )],
             vec![col],
         );
@@ -399,6 +456,12 @@ mod tests {
         assert_eq!(fields[0].datatype(), &Type::TIMESTAMP);
         assert_eq!(decoded[0], vec![Some("1970-01-01 00:00:00".to_string())]);
         assert_eq!(decoded[1], vec![Some("1970-01-01 00:01:30".to_string())]);
+        // A sub-second part renders with the timestamp and a whole second
+        // renders without one, which is how Postgres prints them.
+        assert_eq!(
+            decoded[2],
+            vec![Some("2023-11-14 22:13:20.123456".to_string())]
+        );
     }
 
     #[test]
