@@ -798,6 +798,99 @@ fn list_columns_are_rejected_at_load() {
     assert!(err.to_string().contains("not supported"), "{err}");
 }
 
+/// Writes a one-column timestamp file at `unit`, the way another engine would,
+/// and returns the directory holding it.
+fn timestamp_file(unit: arrow_schema::TimeUnit, counts: &[i64]) -> TempDir {
+    use arrow_array::{TimestampMicrosecondArray, TimestampMillisecondArray};
+    use arrow_schema::TimeUnit;
+
+    let counts = counts.to_vec();
+    let values: ArrayRef = match unit {
+        TimeUnit::Microsecond => Arc::new(TimestampMicrosecondArray::from(counts)),
+        TimeUnit::Millisecond => Arc::new(TimestampMillisecondArray::from(counts)),
+        other => panic!("the reader only takes microseconds; {other:?} is for the reject case"),
+    };
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(unit, None),
+            false,
+        )])),
+        vec![values],
+    )
+    .unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let file = std::fs::File::create(dir.path().join("timestamps.parquet")).unwrap();
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    dir
+}
+
+/// A microsecond timestamp column reads back unscaled, sub-second part and all,
+/// whether or not the table declares the column: the file's unit is the one a
+/// pivot timestamp counts in.
+#[test]
+fn scan_reads_a_microsecond_timestamp_column() {
+    use arrow_array::types::TimestampMicrosecondType;
+    use arrow_schema::TimeUnit;
+
+    let dispatch = dispatch(1);
+    let counts = [1_700_000_000_123_456, 0, -1_500_000];
+    let dir = timestamp_file(TimeUnit::Microsecond, &counts);
+    let declared = [planner::catalog::Column {
+        name: "ts".to_string(),
+        col_type: planner::types::Type::Timestamp,
+    }];
+
+    for columns in [&declared[..], &[][..]] {
+        let table = Arc::new(ParquetTable::from_directory(&dispatch, dir.path(), columns).unwrap());
+        let results = table_input(&dispatch, &table, Projection::all(1), false)
+            .collect()
+            .unwrap();
+
+        assert_eq!(
+            *results[0].column(0).data_type(),
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        let read: Vec<i64> = results
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<TimestampMicrosecondType>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(read, counts);
+    }
+}
+
+/// A file at any other resolution fails the load: its counts mean something
+/// else, and reading them as microseconds would misplace every value by the
+/// ratio between the two units.
+#[test]
+fn a_timestamp_file_in_another_unit_is_rejected() {
+    use arrow_schema::TimeUnit;
+
+    let dispatch = dispatch(1);
+    let dir = timestamp_file(TimeUnit::Millisecond, &[1_700_000_000_000]);
+
+    let err = ParquetTable::from_directory(&dispatch, dir.path(), &[])
+        .expect_err("a millisecond timestamp file must not load");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("MILLIS") && message.contains("microsecond"),
+        "unhelpful rejection: {message}"
+    );
+}
+
 #[test]
 fn materialize_rejects_corrupt_footer_without_panicking() {
     // A file whose trailing `[footer_len][PAR1]` claims a footer larger than the

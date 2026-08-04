@@ -16,8 +16,8 @@
 
 use arrow_array::{
     ArrayRef, BooleanArray, Decimal64Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, Scalar, StringViewArray, TimestampSecondArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
+    Int16Array, Int32Array, Int64Array, Scalar, StringViewArray, TimestampMicrosecondArray,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, TimeUnit};
 use duckdb_planner::duckdb_bridge::duckdb_types::LogicalTypeId;
@@ -67,8 +67,9 @@ pub enum Type {
     /// exists so `DATE` columns/constants survive plan translation and compare.
     Date,
     /// DuckDB `TIMESTAMP` — the type of a timestamp column and the result of
-    /// `date_trunc`. The source parquet stores it as packed epoch *seconds* in
-    /// an `Int64` column, so the executor treats it as `Int64` seconds.
+    /// `date_trunc`. It counts microseconds since the epoch, DuckDB's own
+    /// resolution, so a value crosses the two engines unscaled. The executor
+    /// sees that count in an `Int64`-shaped timestamp column.
     Timestamp,
     /// A Parquet `variant` (semi-structured / JSON) column, presented to DuckDB
     /// as its native `VARIANT` type: `d.age`, `d->'age'`, and casts all bind
@@ -192,7 +193,7 @@ pub fn logical_from_type(pivot_type: &Type) -> BoundLogicalType {
 /// The arrow [`DataType`] a column of this `Type` carries.
 ///
 /// This is where the "logical vs physical" facts live, once: `Date` is
-/// `Date32`, `Timestamp` is `Timestamp(Second)`, and the wide aggregate type
+/// `Date32`, `Timestamp` is `Timestamp(Microsecond)`, and the wide aggregate type
 /// `Int128` lands on `Decimal128(38, 0)`. This is the single arrow type a
 /// value carries everywhere; only the group-by drops a temporal column to its
 /// backing int (`temporal_to_int`) to hash/encode it, restoring the type on
@@ -220,7 +221,7 @@ pub fn physical_arrow_type(pivot_type: &Type) -> DataType {
         }
         Type::Utf8 => DataType::Utf8View,
         Type::Date => DataType::Date32,
-        Type::Timestamp => DataType::Timestamp(TimeUnit::Second, None),
+        Type::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
         Type::Variant => variant_struct_type(),
     }
 }
@@ -251,7 +252,7 @@ pub fn type_from_physical(data_type: &DataType) -> Option<Type> {
         }
         DataType::Utf8View => Some(Type::Utf8),
         DataType::Date32 => Some(Type::Date),
-        DataType::Timestamp(TimeUnit::Second, None) => Some(Type::Timestamp),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => Some(Type::Timestamp),
         other if *other == variant_struct_type() => Some(Type::Variant),
         _ => None,
     }
@@ -330,13 +331,12 @@ pub fn build_scalar_value(value: ScalarValue) -> Result<Scalar<ArrayRef>, Error>
         ScalarValue::Date(days) => {
             Arc::new(arrow_array::Date32Array::new_scalar(days).into_inner())
         }
-        // DuckDB's TIMESTAMP is microseconds; pivot carries a timestamp as
-        // second-resolution (`Type::Timestamp` → `Timestamp(Second)`, the same as
-        // `make_timestamp`), so drop to seconds to match. A `date ± interval`
-        // constant lowers to a TIMESTAMP compared against `CAST(date AS TIMESTAMP)`,
-        // which casts the date column to the same second resolution.
+        // DuckDB's TIMESTAMP is microseconds and so is pivot's, so the count
+        // crosses unscaled. A `date ± interval` constant lowers to a TIMESTAMP
+        // compared against `CAST(date AS TIMESTAMP)`, which casts the date
+        // column to the same resolution.
         ScalarValue::Timestamp(micros) => {
-            Arc::new(TimestampSecondArray::new_scalar(micros / 1_000_000).into_inner())
+            Arc::new(TimestampMicrosecondArray::new_scalar(micros).into_inner())
         }
         // INTERVAL never appears as a query constant we materialise (it is
         // consumed by interval arithmetic), and types the bridge doesn't decode

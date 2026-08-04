@@ -2,13 +2,14 @@
 //! query read an integer column as a date/time (both DuckDB built-ins):
 //!
 //! - `make_date(days)` → `Date32`
-//! - `make_timestamp(seconds)` → `Timestamp(Second)`
+//! - `make_timestamp(microseconds)` → `Timestamp(Microsecond)`
 //!
-//! pivot stores a `DATE` as `Int32` days and a `TIMESTAMP` as `Int64` seconds,
-//! so each conversion is just the matching arrow cast over the source column:
-//! seconds→`Timestamp(Second)` is a zero-copy reinterpret (identical i64 bits),
-//! and days→`Date32` is the same for an `Int32` source (a cheap widening cast
-//! for a narrower integer like ClickBench's `UInt16` `EventDate`).
+//! pivot stores a `DATE` as `Int32` days and a `TIMESTAMP` as `Int64`
+//! microseconds, the same counts DuckDB reads these functions as, so each
+//! conversion is just the matching arrow cast over the source column:
+//! microseconds→`Timestamp(Microsecond)` is a zero-copy reinterpret (identical
+//! i64 bits), and days→`Date32` is the same for an `Int32` source (a cheap
+//! widening cast for a narrower integer source).
 
 use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
@@ -68,5 +69,47 @@ impl TemporalConvert {
 impl Display for TemporalConvert {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}({})", self.name, self.source)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::test_support::*;
+    use crate::types::Type;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::TimestampMicrosecondType;
+    use arrow_array::{ArrayRef, Int64Array};
+    use arrow_schema::{DataType, TimeUnit};
+    use rstest::rstest;
+    use std::sync::Arc;
+
+    /// `make_timestamp` reads its integer as the microseconds DuckDB defines it
+    /// to be, so a column counting something coarser is scaled by the query
+    /// itself and the result still lands on a real TIMESTAMP.
+    #[rstest]
+    fn make_timestamp_reads_microseconds(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "events",
+            &[(
+                "seconds",
+                Type::Int64,
+                Arc::new(Int64Array::from(vec![1_704_067_200i64])) as ArrayRef,
+            )],
+        );
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT make_timestamp(seconds * 1000000) FROM events",
+        );
+
+        let col = batches[0].column(0);
+        assert_eq!(
+            col.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        assert_eq!(
+            col.as_primitive::<TimestampMicrosecondType>().value(0),
+            1_704_067_200_000_000
+        );
     }
 }

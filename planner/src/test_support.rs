@@ -17,10 +17,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Date32Type, Int32Type, Int64Type, TimestampSecondType};
+use arrow_array::types::{Date32Type, Int32Type, Int64Type, TimestampMicrosecondType};
 use arrow_array::{
     ArrayRef, Date32Array, Int32Array, Int64Array, RecordBatch, Scalar, StringViewArray,
-    TimestampSecondArray,
+    TimestampMicrosecondArray,
 };
 use arrow_json::ArrayWriter;
 use arrow_schema::{DataType, Field, Schema};
@@ -217,12 +217,12 @@ impl BoundTable for TestTable {
                 ))
             }
             DataType::Timestamp(_, _) => {
-                let values = arr.as_primitive::<TimestampSecondType>().values();
+                let values = arr.as_primitive::<TimestampMicrosecondType>().values();
                 let lo = *values.iter().min()?;
                 let hi = *values.iter().max()?;
                 Some((
-                    Scalar::new(Arc::new(TimestampSecondArray::from(vec![lo])) as ArrayRef),
-                    Scalar::new(Arc::new(TimestampSecondArray::from(vec![hi])) as ArrayRef),
+                    Scalar::new(Arc::new(TimestampMicrosecondArray::from(vec![lo])) as ArrayRef),
+                    Scalar::new(Arc::new(TimestampMicrosecondArray::from(vec![hi])) as ArrayRef),
                 ))
             }
             _ => None,

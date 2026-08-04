@@ -10,7 +10,7 @@ use std::sync::Arc;
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Datum, Decimal64Array, Decimal128Array,
     Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Scalar,
-    StringViewArray, TimestampSecondArray, new_null_array,
+    StringViewArray, TimestampMicrosecondArray, new_null_array,
 };
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use delta_kernel::Snapshot;
@@ -115,19 +115,28 @@ pub(crate) fn initialize_table(
             "configuration": configuration,
         }
     });
-    // A variant column is a Delta table feature: readers and writers must
-    // declare `variantType`, which requires the feature-listing protocol
-    // versions. Tables without one keep the plain legacy protocol so any
-    // reader can open them.
-    let protocol = if columns.iter().any(|c| matches!(c.col_type, Type::Variant)) {
+    // Some column types are Delta table features: readers and writers must
+    // declare them by name, which requires the feature-listing protocol
+    // versions. A variant column needs `variantType`, and a timestamp needs
+    // `timestampNtz` for the zone-less type it is declared as (see
+    // [`delta_type`]). A table using neither keeps the plain legacy protocol so
+    // any reader can open it.
+    let mut features: Vec<&str> = Vec::new();
+    if columns.iter().any(|c| matches!(c.col_type, Type::Variant)) {
+        features.push("variantType");
+    }
+    if columns.iter().any(|c| c.col_type == Type::Timestamp) {
+        features.push("timestampNtz");
+    }
+    let protocol = if features.is_empty() {
+        serde_json::json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}})
+    } else {
         serde_json::json!({"protocol": {
             "minReaderVersion": 3,
             "minWriterVersion": 7,
-            "readerFeatures": ["variantType"],
-            "writerFeatures": ["variantType"],
+            "readerFeatures": features,
+            "writerFeatures": features,
         }})
-    } else {
-        serde_json::json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}})
     };
     let mut actions = vec![protocol, metadata];
     actions.extend(files.iter().map(|file| {
@@ -471,8 +480,10 @@ fn delta_scalar_to_pivot(column: &str, scalar: DeltaScalar) -> Result<Scalar<Arr
         DeltaScalar::Double(value) => erased(Float64Array::from(vec![value])),
         DeltaScalar::String(value) => erased(StringViewArray::from(vec![value])),
         DeltaScalar::Date(value) => erased(Date32Array::from(vec![value])),
+        // Delta counts a timestamp in microseconds, the same unit a pivot
+        // timestamp counts in, so the value carries over unscaled.
         DeltaScalar::Timestamp(value) | DeltaScalar::TimestampNtz(value) => {
-            erased(TimestampSecondArray::from(vec![value / 1_000_000]))
+            erased(TimestampMicrosecondArray::from(vec![value]))
         }
         // A decimal partition value lands on the declared type's carrier,
         // matching `physical_arrow_type`: `Decimal64` up to 18 digits (where
@@ -527,7 +538,7 @@ fn delta_type(column: &str, data_type: &Type) -> Result<DeltaDataType, Error> {
         Type::Float64 => PrimitiveType::Double,
         Type::Utf8 => PrimitiveType::String,
         Type::Date => PrimitiveType::Date,
-        Type::Timestamp => PrimitiveType::Timestamp,
+        Type::Timestamp => PrimitiveType::TimestampNtz,
         Type::Decimal { precision, scale } => PrimitiveType::decimal(*precision, *scale as u8)?,
         Type::Int128 | Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64 => {
             return Err(Error::UnsupportedType {
@@ -682,14 +693,16 @@ mod tests {
     #[test]
     fn timestamp_partition_value_round_trips_through_the_delta_log() {
         let scalar: Scalar<ArrayRef> =
-            Scalar::new(Arc::new(TimestampSecondArray::from(vec![86_401])) as ArrayRef);
+            Scalar::new(
+                Arc::new(TimestampMicrosecondArray::from(vec![86_401_000_000])) as ArrayRef,
+            );
 
         let written = format_partition_value("ts", &scalar).unwrap();
         let restored = partition_scalar(
             "ts",
             written.as_str().unwrap(),
             &Type::Timestamp,
-            &DeltaDataType::Primitive(PrimitiveType::Timestamp),
+            &DeltaDataType::Primitive(PrimitiveType::TimestampNtz),
         )
         .unwrap();
 
@@ -699,10 +712,10 @@ mod tests {
                 .get()
                 .0
                 .as_any()
-                .downcast_ref::<TimestampSecondArray>()
+                .downcast_ref::<TimestampMicrosecondArray>()
                 .unwrap()
                 .value(0),
-            86_401
+            86_401_000_000
         );
     }
 

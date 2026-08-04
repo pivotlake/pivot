@@ -20,8 +20,8 @@ use crate::parquet::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata};
 use crate::parquet::types::page::DecompressedPage;
 use arrow_array::types::{
     BinaryViewType, Date32Type, Decimal64Type, Decimal128Type, Float32Type, Float64Type, Int16Type,
-    Int32Type, Int64Type, StringViewType, TimestampSecondType, UInt8Type, UInt16Type, UInt32Type,
-    UInt64Type,
+    Int32Type, Int64Type, StringViewType, TimestampMicrosecondType, UInt8Type, UInt16Type,
+    UInt32Type, UInt64Type,
 };
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, TimeUnit};
@@ -388,7 +388,9 @@ fn create_leaf_decoder(
         DataType::Int32 => Ok(primitive!(Int32Type)),
         DataType::Int64 => Ok(primitive!(Int64Type)),
         DataType::Date32 => Ok(primitive!(Date32Type)),
-        DataType::Timestamp(TimeUnit::Second, None) => Ok(primitive!(TimestampSecondType)),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => {
+            Ok(primitive!(TimestampMicrosecondType))
+        }
         DataType::Float32 => Ok(primitive!(Float32Type)),
         DataType::Float64 => Ok(primitive!(Float64Type)),
         DataType::Decimal64(precision, scale) => {

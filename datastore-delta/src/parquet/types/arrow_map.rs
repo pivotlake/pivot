@@ -22,7 +22,7 @@
 //!   Float64           DOUBLE             -                       read+write
 //!   Utf8 / Utf8View   BYTE_ARRAY         converted UTF8 / String read+write
 //!   Date32            INT32              Date                    read+write
-//!   Timestamp(Second) INT64              Timestamp{..}           read only
+//!   Timestamp(Micro)  INT64              Timestamp{MICROS}       read only
 //!   BinaryView        BYTE_ARRAY         unannotated             read+write
 //!   Decimal64(p,s)    INT32              Decimal (p <= 9)        read+write
 //!   Decimal64(p,s)    INT64              Decimal (p <= 18)       read+write
@@ -47,7 +47,7 @@ use arrow_schema::{DataType, TimeUnit};
 
 use super::table::{Error, Result};
 use super::thrift::footer::{LogicalType, SchemaElement};
-use super::thrift::general::Type;
+use super::thrift::general::{TimeUnit as ParquetTimeUnit, Type};
 
 // Parquet physical type ids, named off the same thrift enum the writer emits,
 // so read and write reference one definition rather than bare integers.
@@ -289,15 +289,27 @@ fn int32_arrow(
     }
 }
 
-/// The arrow type of an INT64 leaf: a `TIMESTAMP` is `Timestamp(Second)` (pivot
-/// stores timestamps as seconds, so a sub-second file unit is read as seconds);
+/// The arrow type of an INT64 leaf: a microsecond `TIMESTAMP` is
+/// `Timestamp(Microsecond)`, the one resolution a pivot timestamp counts in;
 /// otherwise a plain `Int64`.
+///
+/// A file that declares any other unit errors rather than being read at a
+/// resolution it was not written in, which would misplace every value by the
+/// ratio between the two units.
+///
+/// The annotation's `is_adjusted_to_utc` flag is not carried: a pivot timestamp
+/// has no time zone, so every timestamp column reads as a zone-less one.
 fn int64_arrow(
     converted_type: Option<i32>,
     logical_type: Option<&LogicalType>,
 ) -> Result<DataType> {
     match logical_type {
-        Some(LogicalType::Timestamp { .. }) => Ok(DataType::Timestamp(TimeUnit::Second, None)),
+        Some(LogicalType::Timestamp { unit, .. }) => match unit {
+            ParquetTimeUnit::MICROS => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
+            other => Err(Error::UnsupportedType(format!(
+                "TIMESTAMP column in {other:?}; pivot reads microsecond timestamps"
+            ))),
+        },
         Some(LogicalType::Integer {
             bit_width,
             is_signed,
@@ -310,9 +322,12 @@ fn int64_arrow(
         },
         // No (recognized) LogicalType: fall back to the legacy ConvertedType.
         _ => match converted_type {
-            Some(CONVERTED_TIMESTAMP_MILLIS | CONVERTED_TIMESTAMP_MICROS) => {
-                Ok(DataType::Timestamp(TimeUnit::Second, None))
+            Some(CONVERTED_TIMESTAMP_MICROS) => {
+                Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
             }
+            Some(CONVERTED_TIMESTAMP_MILLIS) => Err(Error::UnsupportedType(
+                "TIMESTAMP_MILLIS column; pivot reads microsecond timestamps".to_string(),
+            )),
             Some(CONVERTED_UINT_64) => Ok(DataType::UInt64),
             _ => Ok(DataType::Int64),
         },

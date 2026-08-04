@@ -1229,7 +1229,7 @@ mod tests {
 
     #[rstest]
     fn group_by_computed_timestamp_emits_a_timestamp(mut testing_planner: TestingPlanner) {
-        use arrow_array::TimestampSecondArray;
+        use arrow_array::TimestampMicrosecondArray;
         use arrow_schema::TimeUnit;
 
         testing_planner.add_table(
@@ -1237,13 +1237,17 @@ mod tests {
             &[(
                 "ts",
                 Type::Timestamp,
-                Arc::new(TimestampSecondArray::from(vec![0i64, 3600, 90_000])) as ArrayRef,
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    0i64,
+                    3_600_000_000,
+                    90_000_000_000,
+                ])) as ArrayRef,
             )],
         );
 
         // A computed temporal group key is materialised into a leading column;
-        // it must still be restored to its TIMESTAMP type on output, not left the
-        // raw epoch-seconds int the group-by computes on.
+        // it must still be restored to its TIMESTAMP type on output, not left
+        // the raw epoch-microseconds int the group-by computes on.
         let batches = run_batches(
             &mut testing_planner,
             "SELECT date_trunc('day', ts) AS d, count(*) FROM events GROUP BY date_trunc('day', ts)",
@@ -1251,7 +1255,7 @@ mod tests {
 
         assert_eq!(
             batches[0].schema().field(0).data_type(),
-            &DataType::Timestamp(TimeUnit::Second, None)
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
         );
     }
 

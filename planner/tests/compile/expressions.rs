@@ -96,17 +96,22 @@ fn contains_then_group_by(mut testing_planner: TestingPlanner) {
     assert!(rows.iter().all(|r| r["name"] != "bob"));
 }
 
+/// Epoch microseconds at 0s, 90s, 150s and 3690s: the minute-of-hour fixture
+/// the computed-group-key tests share.
+const SECOND_MARKS: [i64; 4] = [0, 90_000_000, 150_000_000, 3_690_000_000];
+
 #[rstest]
 fn group_by_minute_of_timestamp(mut testing_planner: TestingPlanner) {
     use arrow_array::Int64Array;
-    // EventTime as epoch seconds. Minute-of-hour = (t mod 3600) / 60:
-    //   0 -> 0, 90 -> 1, 150 -> 2, 3690 -> 1 (3690 mod 3600 = 90).
+    // EventTime as epoch microseconds, at 0s, 90s, 150s and 3690s.
+    // Minute-of-hour = (t mod 3600) / 60: 0 -> 0, 90 -> 1, 150 -> 2,
+    // 3690 -> 1 (3690 mod 3600 = 90).
     testing_planner.add_table(
         "events",
         &[(
             "EventTime",
             Type::Timestamp,
-            Arc::new(Int64Array::from(vec![0i64, 90, 150, 3690])) as ArrayRef,
+            Arc::new(Int64Array::from(SECOND_MARKS.to_vec())) as ArrayRef,
         )],
     );
 
@@ -146,7 +151,7 @@ fn minute_grouped_table(testing_planner: &mut TestingPlanner, name: &str) {
             (
                 "EventTime",
                 Type::Timestamp,
-                Arc::new(Int64Array::from(vec![0i64, 90, 150, 3690])) as ArrayRef,
+                Arc::new(Int64Array::from(SECOND_MARKS.to_vec())) as ArrayRef,
             ),
             (
                 "v",
@@ -301,7 +306,12 @@ fn group_by_plain_and_computed_key(mut testing_planner: TestingPlanner) {
             (
                 "EventTime",
                 Type::Timestamp,
-                Arc::new(Int64Array::from(vec![0i64, 90, 150, 90])) as ArrayRef,
+                Arc::new(Int64Array::from(vec![
+                    0i64,
+                    90_000_000,
+                    150_000_000,
+                    90_000_000,
+                ])) as ArrayRef,
             ),
             (
                 "v",
@@ -403,13 +413,14 @@ fn group_by_column_and_arithmetic_key(mut testing_planner: TestingPlanner) {
 #[rstest]
 fn extract_all_date_parts(mut testing_planner: TestingPlanner) {
     use arrow_array::Int64Array;
-    let timestamps = [1_704_067_200i64, 1_700_000_000, 1_262_304_000, -100_000];
+    let seconds = [1_704_067_200i64, 1_700_000_000, 1_262_304_000, -100_000];
+    let timestamps: Vec<i64> = seconds.iter().map(|s| s * 1_000_000).collect();
     testing_planner.add_table(
         "ts",
         &[(
             "EventTime",
             Type::Timestamp,
-            Arc::new(Int64Array::from(timestamps.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(timestamps.clone())) as ArrayRef,
         )],
     );
 
@@ -440,7 +451,8 @@ fn extract_all_date_parts(mut testing_planner: TestingPlanner) {
     for (part, expected) in cases {
         let results = testing_planner
             .plan(&format!(
-                "SELECT extract({part} FROM EventTime) AS v, EventTime AS t FROM ts"
+                "SELECT extract({part} FROM EventTime) AS v, \
+                 extract(epoch FROM EventTime) AS t FROM ts"
             ))
             .unwrap()
             .compile(
@@ -451,11 +463,13 @@ fn extract_all_date_parts(mut testing_planner: TestingPlanner) {
             .collect()
             .unwrap();
 
-        // The select item aliases are `v` (the extracted value) and `t`
-        // (the source EventTime). Map each row's timestamp to its
-        // value, then compare against the expectation (row order isn't fixed).
+        // The select item aliases are `v` (the extracted value) and `t` (the
+        // source instant in whole epoch seconds, which identifies the row as an
+        // integer whatever resolution the column counts in). Map each row's
+        // timestamp to its value, then compare against the expectation (row
+        // order isn't fixed).
         let rows = batches_to_json(&results);
-        for (i, &t) in timestamps.iter().enumerate() {
+        for (i, &t) in seconds.iter().enumerate() {
             let row = rows
                 .iter()
                 .find(|r| r["t"].as_i64().unwrap() == t)
