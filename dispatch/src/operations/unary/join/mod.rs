@@ -69,15 +69,7 @@ pub enum JoinKind {
     Inner,
     /// Every pair an [`Inner`](JoinKind::Inner) emits, plus one row per build
     /// row nothing matched, its probe columns null-filled.
-    BuildOuter {
-        /// The fields the probe columns take in the output. A worker can reach
-        /// the unmatched pass without ever having seen a probe batch to read a
-        /// schema off — an empty probe side, or simply a peer having taken all
-        /// the work — so the caller states their shape up front. Every worker
-        /// shaping its output from the same fields is also what keeps their
-        /// batches concatenable downstream.
-        probe_fields: Vec<Field>,
-    },
+    BuildOuter,
     /// One output row per probe row that has at least one matching build row,
     /// with no duplicates for a probe row that matches several. That is also
     /// why such a join emits no build columns: there is no single build row to
@@ -95,6 +87,15 @@ pub struct JoinSpec {
     pub probe_key_columns: Vec<usize>,
     /// Which columns of each side the join emits.
     pub output_columns: JoinOutputColumns,
+    /// The fields the listed probe columns take in the output, in
+    /// `output_columns.probe` order. Stated by the caller rather than read
+    /// off a probed batch so every worker shapes identical output whether or
+    /// not it ever received a batch, and so an outer join's probe columns can
+    /// be nullable regardless of the input's declared nullability.
+    pub probe_fields: Vec<Field>,
+    /// The fields the listed build columns take in the output, in
+    /// `output_columns.build` order.
+    pub build_fields: Vec<Field>,
     /// Which rows reach the output.
     pub kind: JoinKind,
 }
@@ -254,6 +255,24 @@ mod tests {
         let workers = build_worker_batches.len();
         let probe_column_count = probe_batches[0].num_columns();
         let build_column_count = build_worker_batches[0][0].num_columns();
+        let kind = match probe_fields {
+            Some(_) => super::JoinKind::BuildOuter,
+            None => super::JoinKind::Inner,
+        };
+        let probe_fields = probe_fields.unwrap_or_else(|| {
+            probe_batches[0]
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.as_ref().clone())
+                .collect()
+        });
+        let build_fields: Vec<Field> = build_worker_batches[0][0]
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
         let spec = super::JoinSpec {
             build_key_columns: key_columns.clone(),
             probe_key_columns: key_columns,
@@ -261,10 +280,9 @@ mod tests {
                 probe_column_count,
                 build_column_count,
             ),
-            kind: match probe_fields {
-                Some(probe_fields) => super::JoinKind::BuildOuter { probe_fields },
-                None => super::JoinKind::Inner,
-            },
+            probe_fields,
+            build_fields,
+            kind,
         };
         let (builds, probes, _) =
             factory::create_for_workers::<K, BUILD_OUTER, false>(spec, workers);

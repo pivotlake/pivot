@@ -59,15 +59,6 @@ pub(super) enum AppendSource<'a> {
     },
 }
 
-impl AppendSource<'_> {
-    pub(super) fn len(&self) -> usize {
-        match self {
-            Self::Batch { selection, .. } => selection.len(),
-            Self::Chunked { ids, .. } => ids.len(),
-        }
-    }
-}
-
 /// Which rows of a single source column an append takes.
 ///
 /// One implementation serves both: a scattered selection reads its rows through
