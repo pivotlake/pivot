@@ -143,22 +143,17 @@ pub struct IntStrReader<'b, T: ArrowPrimitiveType> {
     strings: &'b StringViewArray,
 }
 
-/// `GROUP BY` over one integer column and one string column, in either order.
-/// `STR_FIRST` selects which `key_col` is which and the emitted column order:
-/// `false` = `(integer, string)`, `true` = `(string, integer)` (the order a
-/// `COUNT(DISTINCT)` lowering produces for its inner key). The persisted key,
-/// hash, and equality are order-independent; only the column the integer/string
-/// is read from and the output column order change.
-pub struct IntStrKeyExtractor<T: ArrowPrimitiveType, const STR_FIRST: bool = false>(PhantomData<T>);
+/// `GROUP BY` over one integer column and one string column, integer first:
+/// `key_cols[0]` is the integer and `key_cols[1]` the string, and the output
+/// leads with the integer. A `GROUP BY (string, integer)` is normalized to this
+/// order at plan time and its output columns swapped back there, so one column
+/// order serves both.
+pub struct IntStrKeyExtractor<T: ArrowPrimitiveType>(PhantomData<T>);
 
 // `PhantomData<T>` is only a type tag; the extractor holds no `T` value.
-unsafe impl<T: ArrowPrimitiveType, const STR_FIRST: bool> Send
-    for IntStrKeyExtractor<T, STR_FIRST>
-{
-}
+unsafe impl<T: ArrowPrimitiveType> Send for IntStrKeyExtractor<T> {}
 
-impl<T: ArrowPrimitiveType + Send + 'static, const STR_FIRST: bool> KeyExtractor
-    for IntStrKeyExtractor<T, STR_FIRST>
+impl<T: ArrowPrimitiveType + Send + 'static> KeyExtractor for IntStrKeyExtractor<T>
 where
     T::Native: Copy + Default + Hash + Eq + Send + Sync,
 {
@@ -171,7 +166,7 @@ where
     type LiveKey<'a, 'b> = IntStrLiveKey<'a, 'b, T::Native>;
     type Stored = IntStrStored<T::Native>;
     type Reader<'b> = IntStrReader<'b, T>;
-    type ColumnBuilder = IntStrKeyColumnBuilder<T, STR_FIRST>;
+    type ColumnBuilder = IntStrKeyColumnBuilder<T>;
     type Scratch = ();
 
     fn make_reader<'b>(
@@ -180,12 +175,7 @@ where
         _config: &(),
         _scratch: &'b mut (),
     ) -> Self::Reader<'b> {
-        // `STR_FIRST` ⇒ the string is `key_cols[0]` and the integer `key_cols[1]`.
-        let (int_col, str_col) = if STR_FIRST {
-            (key_cols[1], key_cols[0])
-        } else {
-            (key_cols[0], key_cols[1])
-        };
+        let (int_col, str_col) = (key_cols[0], key_cols[1]);
         IntStrReader {
             ints: batch
                 .column(int_col)
@@ -228,18 +218,15 @@ where
     }
 }
 
-/// Emits the two key columns. The integer is built as its primitive type, the
-/// string as a zero-copy `StringViewArray` whose views point into the shared
-/// arena's ring buffers. `STR_FIRST` selects the emit order so the leading column
-/// matches the GROUP BY order (`k0` is whichever key came first).
-pub struct IntStrKeyColumnBuilder<T: ArrowPrimitiveType, const STR_FIRST: bool> {
+/// Emits the two key columns, integer first. The integer is built as its
+/// primitive type, the string as a zero-copy `StringViewArray` whose views
+/// point into the shared arena's ring buffers.
+pub struct IntStrKeyColumnBuilder<T: ArrowPrimitiveType> {
     ints: PrimitiveBuilder<T>,
     views: SlabColumn<u128>,
 }
 
-impl<T: ArrowPrimitiveType, const STR_FIRST: bool> KeyColumnBuilder
-    for IntStrKeyColumnBuilder<T, STR_FIRST>
-{
+impl<T: ArrowPrimitiveType> KeyColumnBuilder for IntStrKeyColumnBuilder<T> {
     type Key = IntStrKey<T::Native>;
     type Config = ();
 
@@ -272,26 +259,18 @@ impl<T: ArrowPrimitiveType, const STR_FIRST: bool> KeyColumnBuilder
             StringViewArray::new_unchecked(views, output_buffers.clone(), None)
         });
         let ints: ArrayRef = self.ints.into_array(None);
-        let int_type = T::DATA_TYPE;
-        // Emit in GROUP BY order, naming columns positionally (`k0`, `k1`) like the
-        // other multi-key extractors so the leading column is the first group key.
-        let ((k0_type, k0), (k1_type, k1)) = if STR_FIRST {
-            ((DataType::Utf8View, strings), (int_type, ints))
-        } else {
-            ((int_type, ints), (DataType::Utf8View, strings))
-        };
+        // Columns are named positionally (`k0`, `k1`) like the other multi-key
+        // extractors, integer leading.
         let fields = vec![
-            Field::new("k0", k0_type, false),
-            Field::new("k1", k1_type, false),
+            Field::new("k0", T::DATA_TYPE, false),
+            Field::new("k1", DataType::Utf8View, false),
         ];
-        (fields, vec![k0, k1])
+        (fields, vec![ints, strings])
     }
 }
 
-/// Keys stored as an integer plus an arena string blob. Parameterised on the
-/// integer's width only: the two columns' order in the GROUP BY changes how the
-/// result columns are emitted, not how the key is stored, so both orders share
-/// this one implementation.
+/// Keys stored as an integer plus an arena string blob, parameterised on the
+/// integer's width only.
 pub struct IntStrStored<N>(std::marker::PhantomData<N>);
 
 impl<N: Copy + Default + PartialEq + Send + Sync + 'static> StoredKey for IntStrStored<N> {

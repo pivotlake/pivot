@@ -563,25 +563,19 @@ macro_rules! select_key_extractor {
                 };
             }
 
-            // Keep an integer and string in their native representations.
-            match $keys {
-                [(_, int_ty), (_, Type::Utf8)] => match int_ty {
-                    Type::Int8 => return $with_key!(IntStrKeyExtractor<Int8Type, false>, ()),
-                    Type::Int16 => return $with_key!(IntStrKeyExtractor<Int16Type, false>, ()),
-                    Type::Int32 => return $with_key!(IntStrKeyExtractor<Int32Type, false>, ()),
-                    Type::Int64 => return $with_key!(IntStrKeyExtractor<Int64Type, false>, ()),
+            // Keep an integer and string in their native representations. The
+            // extractor is integer-first only; a string-first key pair was
+            // already reordered by [`reorder_string_first_keys`] before the
+            // cascade runs.
+            if let [(_, int_ty), (_, Type::Utf8)] = $keys {
+                match int_ty {
+                    Type::Int8 => return $with_key!(IntStrKeyExtractor<Int8Type>, ()),
+                    Type::Int16 => return $with_key!(IntStrKeyExtractor<Int16Type>, ()),
+                    Type::Int32 => return $with_key!(IntStrKeyExtractor<Int32Type>, ()),
+                    Type::Int64 => return $with_key!(IntStrKeyExtractor<Int64Type>, ()),
+                    // Any other pairing falls through to the row encoder below.
                     _ => {}
-                },
-                [(_, Type::Utf8), (_, int_ty)] => match int_ty {
-                    Type::Int8 => return $with_key!(IntStrKeyExtractor<Int8Type, true>, ()),
-                    Type::Int16 => return $with_key!(IntStrKeyExtractor<Int16Type, true>, ()),
-                    Type::Int32 => return $with_key!(IntStrKeyExtractor<Int32Type, true>, ()),
-                    Type::Int64 => return $with_key!(IntStrKeyExtractor<Int64Type, true>, ()),
-                    _ => {}
-                },
-                // Anything else (two non-int/string keys, 3+ keys) falls
-                // through to the row encoder below.
-                _ => {}
+                }
             }
         }
 
@@ -611,6 +605,76 @@ macro_rules! select_key_extractor {
 /// Selected signatures use [`Compiled`]. All others use [`Dynamic`], with
 /// `i128` cells when strings or wide sums require them.
 pub(super) fn dispatch_group_by(
+    input: RecordBatchOperatorSpec,
+    keys: &[(usize, Type)],
+    slots: Vec<AggregationSlot>,
+    signatures: &[AggregationSignature],
+    requires_wide_cells: bool,
+    output_limit: Option<GroupLimit>,
+    nullability: &[bool],
+) -> Result<RecordBatchOperatorSpec, Error> {
+    if let Some(reordered) = reorder_string_first_keys(keys, nullability) {
+        let grouped = select_group_by_types(
+            input,
+            &reordered,
+            slots,
+            signatures,
+            requires_wide_cells,
+            output_limit,
+            nullability,
+        )?;
+        return Ok(swap_leading_key_columns(grouped));
+    }
+    select_group_by_types(
+        input,
+        keys,
+        slots,
+        signatures,
+        requires_wide_cells,
+        output_limit,
+        nullability,
+    )
+}
+
+/// A `GROUP BY (string, integer)` runs the group operator integer-first, so
+/// [`IntStrKeyExtractor`] exists in one column order. Returns the keys
+/// reordered for the operator when that applies: exactly one non-nullable
+/// string key followed by one non-nullable extractor-supported integer key.
+/// The caller swaps the operator's two leading output columns back with
+/// [`swap_leading_key_columns`].
+fn reorder_string_first_keys(
+    keys: &[(usize, Type)],
+    nullability: &[bool],
+) -> Option<[(usize, Type); 2]> {
+    let [(str_column, Type::Utf8), (int_column, int_ty)] = keys else {
+        return None;
+    };
+    if !matches!(int_ty, Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64) {
+        return None;
+    }
+    if column_nullable(nullability, *str_column) || column_nullable(nullability, *int_column) {
+        return None;
+    }
+    Some([(*int_column, int_ty.clone()), (*str_column, Type::Utf8)])
+}
+
+/// Swap the two leading key columns a group operator emitted for keys that
+/// [`reorder_string_first_keys`] reordered, restoring the query's declared key
+/// order. A per-batch column permutation; the arrays are shared, not copied.
+fn swap_leading_key_columns(op: RecordBatchOperatorSpec) -> RecordBatchOperatorSpec {
+    op.project(|| {
+        |batch: RecordBatch| {
+            let mut fields: Vec<_> = batch.schema().fields().iter().cloned().collect();
+            fields.swap(0, 1);
+            let mut columns = batch.columns().to_vec();
+            columns.swap(0, 1);
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+                .expect("swapping two columns keeps the batch valid")
+        }
+    })
+}
+
+fn select_group_by_types(
     input: RecordBatchOperatorSpec,
     keys: &[(usize, Type)],
     slots: Vec<AggregationSlot>,
@@ -720,6 +784,18 @@ pub(super) fn dispatch_group_by(
 /// does. Used as the inner level of the two-level `COUNT(DISTINCT)` lowerings,
 /// which then count the deduped rows per group.
 pub(in crate::operator) fn build_dedup_operator(
+    input: RecordBatchOperatorSpec,
+    keys: &[(usize, Type)],
+    nullability: &[bool],
+) -> Result<RecordBatchOperatorSpec, Error> {
+    if let Some(reordered) = reorder_string_first_keys(keys, nullability) {
+        let deduped = select_dedup_types(input, &reordered, nullability)?;
+        return Ok(swap_leading_key_columns(deduped));
+    }
+    select_dedup_types(input, keys, nullability)
+}
+
+fn select_dedup_types(
     input: RecordBatchOperatorSpec,
     keys: &[(usize, Type)],
     nullability: &[bool],
@@ -1436,6 +1512,76 @@ mod tests {
         let string_maxes = batch.column(9).as_string_view();
         assert_eq!(string_maxes.value(0), "banana");
         assert_eq!(string_maxes.value(1), "cherry");
+    }
+
+    /// A string-then-integer GROUP BY runs the integer-first extractor with its
+    /// keys reordered, and the output columns swapped back to the query's order.
+    #[rstest]
+    fn string_first_group_keys_keep_declared_column_order(mut testing_planner: TestingPlanner) {
+        use arrow_array::{Int64Array, StringViewArray};
+        testing_planner.add_table(
+            "events",
+            &[
+                (
+                    "name",
+                    Type::Utf8,
+                    Arc::new(StringViewArray::from(vec!["a", "a", "b", "a"])) as ArrayRef,
+                ),
+                (
+                    "id",
+                    Type::Int64,
+                    Arc::new(Int64Array::from(vec![1i64, 2, 2, 1])) as ArrayRef,
+                ),
+            ],
+        );
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT name, id, COUNT(*) FROM events GROUP BY name, id ORDER BY name, id",
+        );
+
+        let batch = &batches[0];
+        let names = batch.column(0).as_string_view();
+        let ids = batch.column(1).as_primitive::<Int64Type>();
+        let counts = batch.column(2).as_primitive::<Int64Type>();
+        let rows: Vec<(&str, i64, i64)> = (0..batch.num_rows())
+            .map(|i| (names.value(i), ids.value(i), counts.value(i)))
+            .collect();
+        assert_eq!(rows, vec![("a", 1, 2), ("a", 2, 1), ("b", 2, 1)]);
+    }
+
+    /// A grouped `COUNT(DISTINCT int)` over a string group key dedups on a
+    /// string-then-integer inner key, which takes the same reorder-and-swap
+    /// path as a direct string-first GROUP BY.
+    #[rstest]
+    fn count_distinct_over_string_group_key(mut testing_planner: TestingPlanner) {
+        use arrow_array::{Int64Array, StringViewArray};
+        testing_planner.add_table(
+            "visits",
+            &[
+                (
+                    "site",
+                    Type::Utf8,
+                    Arc::new(StringViewArray::from(vec!["x", "x", "x", "y"])) as ArrayRef,
+                ),
+                (
+                    "user_id",
+                    Type::Int64,
+                    Arc::new(Int64Array::from(vec![1i64, 1, 2, 3])) as ArrayRef,
+                ),
+            ],
+        );
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT site, COUNT(DISTINCT user_id) FROM visits GROUP BY site ORDER BY site",
+        );
+
+        let batch = &batches[0];
+        let sites = batch.column(0).as_string_view();
+        let counts = batch.column(1).as_primitive::<Int64Type>();
+        assert_eq!((sites.value(0), counts.value(0)), ("x", 2));
+        assert_eq!((sites.value(1), counts.value(1)), ("y", 1));
     }
 
     #[rstest]
