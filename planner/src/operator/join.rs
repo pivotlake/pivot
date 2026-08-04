@@ -21,7 +21,7 @@ use crate::compile::Error;
 use crate::types::{Type, physical_arrow_type};
 use arrow_schema::Field;
 use dispatch::JoinKind as DispatchJoinKind;
-use dispatch::{JoinOutputColumns, JoinSpec, RecordBatchOperatorSpec};
+use dispatch::{JoinSpec, RecordBatchOperatorSpec};
 use std::fmt;
 
 /// Which rows a join emits.
@@ -31,11 +31,7 @@ pub enum JoinKind {
     Inner,
     /// Every pair an [`Inner`](JoinKind::Inner) emits, plus every build row no
     /// probe row matched, its probe columns NULL.
-    BuildOuter {
-        /// The types of the join's probe output columns, which shape the NULLs
-        /// an unmatched build row gets in place of probe values.
-        probe_types: Vec<Type>,
-    },
+    BuildOuter,
     /// One output row per probe row the build side holds the key of, and no
     /// build columns (see [`Join::build_output`]).
     ProbeSemi,
@@ -61,6 +57,14 @@ pub struct Join {
     /// row once however many build rows it matched, so no one build row is
     /// there to take values from.
     pub build_output: Vec<usize>,
+    /// The type and nullability of each listed probe output column, in
+    /// `probe_output` order. The dispatch join shapes its output from these
+    /// rather than from a probed batch, so every worker emits identical
+    /// schemas whether or not it ever received a batch.
+    pub probe_column_types: Vec<(Type, bool)>,
+    /// The type and nullability of each listed build output column, in
+    /// `build_output` order.
+    pub build_column_types: Vec<(Type, bool)>,
     /// Which rows reach the output.
     pub kind: JoinKind,
 }
@@ -69,7 +73,7 @@ impl fmt::Display for Join {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let kind = match self.kind {
             JoinKind::Inner => "Join",
-            JoinKind::BuildOuter { .. } => "Join[build outer]",
+            JoinKind::BuildOuter => "Join[build outer]",
             JoinKind::ProbeSemi => "Join[probe semi]",
         };
         write!(
@@ -88,27 +92,45 @@ impl Join {
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let kind = match &self.kind {
             JoinKind::Inner => DispatchJoinKind::Inner,
-            // The probe side's output fields, named by position: an unmatched
-            // build row's probe values are NULLs the join synthesizes, so their
-            // names are the join's to pick rather than any input column's.
-            JoinKind::BuildOuter { probe_types } => DispatchJoinKind::BuildOuter {
-                probe_fields: probe_types
-                    .iter()
-                    .enumerate()
-                    .map(|(i, col_type)| {
-                        Field::new(format!("probe_{i}"), physical_arrow_type(col_type), true)
-                    })
-                    .collect(),
-            },
+            JoinKind::BuildOuter => DispatchJoinKind::BuildOuter,
             JoinKind::ProbeSemi => DispatchJoinKind::ProbeSemi,
         };
+        // Both sides' output fields, named by position: an outer join
+        // synthesizes NULL probe values, so field names and nullability are
+        // the join's to pick rather than any input column's, and every kind
+        // uses the same convention.
+        let outer = matches!(self.kind, JoinKind::BuildOuter);
+        let probe_fields = self
+            .probe_column_types
+            .iter()
+            .enumerate()
+            .map(|(i, (col_type, nullable))| {
+                Field::new(
+                    format!("probe_{i}"),
+                    physical_arrow_type(col_type),
+                    *nullable || outer,
+                )
+            })
+            .collect();
+        let build_fields = self
+            .build_column_types
+            .iter()
+            .enumerate()
+            .map(|(i, (col_type, nullable))| {
+                Field::new(
+                    format!("build_{i}"),
+                    physical_arrow_type(col_type),
+                    *nullable,
+                )
+            })
+            .collect();
         let spec = JoinSpec {
-            build_key_columns: self.build_keys.clone(),
-            probe_key_columns: self.probe_keys.clone(),
-            output_columns: JoinOutputColumns {
-                probe: self.probe_output.clone(),
-                build: self.build_output.clone(),
-            },
+            probe_key_indices: self.probe_keys.clone(),
+            build_key_indices: self.build_keys.clone(),
+            probe_output_indices: self.probe_output.clone(),
+            build_output_indices: self.build_output.clone(),
+            probe_fields,
+            build_fields,
             kind,
         };
         let key_types: Vec<_> = self.key_types.iter().map(physical_arrow_type).collect();

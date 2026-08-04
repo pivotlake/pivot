@@ -249,7 +249,7 @@ impl Operator {
             // their probe columns with NULL regardless of the probe input's
             // declared nullability.
             Operator::Join(join) => {
-                let probe_nullable = matches!(join.kind, JoinKind::BuildOuter { .. });
+                let probe_nullable = matches!(join.kind, JoinKind::BuildOuter);
                 join.probe_output
                     .iter()
                     .map(|&i| probe_nullable || inputs[0][i])
