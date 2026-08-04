@@ -52,6 +52,10 @@ pub struct ColumnChunkMeta {
     /// The schema's `type_length` for a FIXED_LEN_BYTE_ARRAY leaf: the byte
     /// width of each value.
     pub fixed_len_byte_width: Option<i32>,
+    /// What a sub-second timestamp leaf's stored integers divide by to become
+    /// the epoch seconds the column reads as (1000 for a milliseconds file, and
+    /// so on). `None` for every leaf that is stored in the unit it decodes to.
+    pub seconds_divisor: Option<i64>,
     /// Decoded min/max for this chunk, when the writer recorded statistics
     /// and the column's Arrow type is one we know how to decode.
     pub statistics: Option<ColumnStatistics>,

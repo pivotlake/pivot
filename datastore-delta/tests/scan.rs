@@ -798,6 +798,81 @@ fn list_columns_are_rejected_at_load() {
     assert!(err.to_string().contains("not supported"), "{err}");
 }
 
+/// Writes a one-column file of microsecond timestamps, the unit other writers
+/// emit by default, and returns the directory holding it.
+fn microsecond_timestamp_file(values: &[i64]) -> TempDir {
+    use arrow_array::TimestampMicrosecondArray;
+    use arrow_schema::TimeUnit;
+
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        )])),
+        vec![Arc::new(TimestampMicrosecondArray::from(values.to_vec())) as ArrayRef],
+    )
+    .unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let file = std::fs::File::create(dir.path().join("timestamps.parquet")).unwrap();
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    dir
+}
+
+/// A file stores timestamps in its own time unit, and pivot's timestamps are
+/// epoch seconds: a microsecond column converts to seconds instead of having
+/// its stored integers read as though they already were seconds. A value
+/// before the epoch lands on the second containing it.
+#[test]
+fn scan_converts_subsecond_timestamps_to_seconds() {
+    use arrow_array::types::TimestampSecondType;
+
+    let dispatch = dispatch(1);
+    let dir = microsecond_timestamp_file(&[1_700_000_000_000_000, 0, -1_500_000]);
+    let table = Arc::new(ParquetTable::from_directory(&dispatch, dir.path(), &[]).unwrap());
+
+    let results = table_input(&dispatch, &table, Projection::all(1), false)
+        .collect()
+        .unwrap();
+
+    let seconds: Vec<i64> = results
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_primitive::<TimestampSecondType>()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    assert_eq!(seconds, vec![1_700_000_000, 0, -2]);
+}
+
+/// The same conversion for a table that declares the column TIMESTAMP, whose
+/// columns the executor reads as the epoch seconds packed into an `Int64`.
+#[test]
+fn scan_converts_subsecond_timestamps_of_a_declared_column() {
+    let dispatch = dispatch(1);
+    let dir = microsecond_timestamp_file(&[1_700_000_000_000_000, 2_500_000]);
+    let declared = [planner::catalog::Column {
+        name: "ts".to_string(),
+        col_type: planner::types::Type::Timestamp,
+    }];
+    let table = Arc::new(ParquetTable::from_directory(&dispatch, dir.path(), &declared).unwrap());
+
+    let results = table_input(&dispatch, &table, Projection::all(1), false)
+        .collect()
+        .unwrap();
+
+    assert_eq!(collect_i64s(&results, 0), vec![1_700_000_000, 2]);
+}
+
 #[test]
 fn materialize_rejects_corrupt_footer_without_panicking() {
     // A file whose trailing `[footer_len][PAR1]` claims a footer larger than the

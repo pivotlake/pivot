@@ -11,7 +11,8 @@
 use crate::parquet::reading::decoding::ScanEqualityPredicate;
 use crate::parquet::reading::decoding::leaf_decoders;
 use crate::parquet::reading::decoding::leaf_decoders::{
-    BytesViewDecoder, LeafDecoder, PrimitiveLeafDecoder, decimal_decoder,
+    BytesViewDecoder, LeafDecoder, PrimitiveLeafDecoder, SecondsFromSubsecondDecoder,
+    decimal_decoder,
 };
 use crate::parquet::types::leaves::{
     leaf_range, plan_variant_extract, reconstruct_column_from_leaves, try_extract_typed_leaf,
@@ -368,7 +369,8 @@ impl ColumnDecoder {
 
 /// Creates a leaf decoder for `data_type`.
 ///
-/// The chunk metadata disambiguates a decimal's physical storage.
+/// The chunk metadata disambiguates a decimal's physical storage, and names the
+/// divisor of a timestamp leaf stored finer than the seconds it decodes to.
 fn create_leaf_decoder(
     data_type: &DataType,
     chunk: &ColumnChunkMeta,
@@ -377,6 +379,21 @@ fn create_leaf_decoder(
     macro_rules! primitive {
         ($t:ty) => {
             Box::new(PrimitiveLeafDecoder::<$t>::new(max_def_level)) as Box<dyn LeafDecoder>
+        };
+    }
+    if let Some(divisor) = chunk.seconds_divisor {
+        macro_rules! seconds {
+            ($t:ty) => {
+                Box::new(SecondsFromSubsecondDecoder::<$t>::new(
+                    max_def_level,
+                    divisor,
+                )) as Box<dyn LeafDecoder>
+            };
+        }
+        return match data_type {
+            DataType::Int64 => Ok(seconds!(Int64Type)),
+            DataType::Timestamp(TimeUnit::Second, None) => Ok(seconds!(TimestampSecondType)),
+            other => Err(Error::UnsupportedColumnType(other.clone())),
         };
     }
     match data_type {

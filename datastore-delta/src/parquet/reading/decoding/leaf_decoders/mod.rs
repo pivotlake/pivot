@@ -17,6 +17,9 @@
 //! Concrete leaf decoders are type aliases over `TypedLeafDecoder`:
 //! - [`primitive::PrimitiveLeafDecoder`] for fixed-width numeric types.
 //! - [`bytes_view::BytesViewDecoder`] for variable-length string / binary types.
+//!
+//! [`timestamp::SecondsFromSubsecondDecoder`] wraps the primitive one where a
+//! leaf's stored unit differs from the one its column decodes to.
 
 pub(crate) mod bytes_view;
 pub use bytes_view::BytesViewDecoder;
@@ -33,6 +36,9 @@ mod primitive;
 pub use primitive::PrimitiveLeafDecoder;
 
 mod rle;
+
+mod timestamp;
+pub use timestamp::SecondsFromSubsecondDecoder;
 
 mod typed;
 pub use typed::TypedLeafDecoder;

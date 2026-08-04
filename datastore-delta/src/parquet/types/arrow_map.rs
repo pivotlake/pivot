@@ -22,7 +22,7 @@
 //!   Float64           DOUBLE             -                       read+write
 //!   Utf8 / Utf8View   BYTE_ARRAY         converted UTF8 / String read+write
 //!   Date32            INT32              Date                    read+write
-//!   Timestamp(Second) INT64              Timestamp{..}           read only
+//!   Timestamp(unit)   INT64              Timestamp{unit}         read only
 //!   BinaryView        BYTE_ARRAY         unannotated             read+write
 //!   Decimal64(p,s)    INT32              Decimal (p <= 9)        read+write
 //!   Decimal64(p,s)    INT64              Decimal (p <= 18)       read+write
@@ -32,6 +32,11 @@
 //! A decimal's arrow carrier follows its declared precision: `Decimal64` up
 //! to 18 digits, `Decimal128` beyond, matching the planner's
 //! `physical_arrow_type` so a file-derived schema and a declared schema agree.
+//!
+//! A timestamp keeps the time unit its file declares. Pivot's own timestamps
+//! are epoch seconds, so a finer-grained column is converted to seconds as it
+//! is read (`timestamp_to_seconds_divisor` gives the factor, and `table.rs`
+//! applies it to the column's values and to its statistics).
 //!
 //! The "read only" rows resolve files written elsewhere; pivot's own writer only
 //! emits the column set its encoder supports (Int32/Int64/the unsigned widths/
@@ -47,7 +52,7 @@ use arrow_schema::{DataType, TimeUnit};
 
 use super::table::{Error, Result};
 use super::thrift::footer::{LogicalType, SchemaElement};
-use super::thrift::general::Type;
+use super::thrift::general::{TimeUnit as ParquetTimeUnit, Type};
 
 // Parquet physical type ids, named off the same thrift enum the writer emits,
 // so read and write reference one definition rather than bare integers.
@@ -289,15 +294,22 @@ fn int32_arrow(
     }
 }
 
-/// The arrow type of an INT64 leaf: a `TIMESTAMP` is `Timestamp(Second)` (pivot
-/// stores timestamps as seconds, so a sub-second file unit is read as seconds);
-/// otherwise a plain `Int64`.
+/// The arrow type of an INT64 leaf: a `TIMESTAMP` carries the time unit the
+/// file declares, so its stored integers keep their meaning; otherwise a plain
+/// `Int64`. Pivot's own timestamps are epoch seconds, so a sub-second leaf is
+/// converted on the way in (see [`timestamp_to_seconds_divisor`]) rather than
+/// reinterpreted.
+///
+/// The annotation's `is_adjusted_to_utc` flag is not carried: a pivot timestamp
+/// has no time zone, so every timestamp column reads as a zone-less one.
 fn int64_arrow(
     converted_type: Option<i32>,
     logical_type: Option<&LogicalType>,
 ) -> Result<DataType> {
     match logical_type {
-        Some(LogicalType::Timestamp { .. }) => Ok(DataType::Timestamp(TimeUnit::Second, None)),
+        Some(LogicalType::Timestamp { unit, .. }) => {
+            Ok(DataType::Timestamp(arrow_time_unit(*unit), None))
+        }
         Some(LogicalType::Integer {
             bit_width,
             is_signed,
@@ -310,12 +322,41 @@ fn int64_arrow(
         },
         // No (recognized) LogicalType: fall back to the legacy ConvertedType.
         _ => match converted_type {
-            Some(CONVERTED_TIMESTAMP_MILLIS | CONVERTED_TIMESTAMP_MICROS) => {
-                Ok(DataType::Timestamp(TimeUnit::Second, None))
+            Some(CONVERTED_TIMESTAMP_MILLIS) => {
+                Ok(DataType::Timestamp(TimeUnit::Millisecond, None))
+            }
+            Some(CONVERTED_TIMESTAMP_MICROS) => {
+                Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
             }
             Some(CONVERTED_UINT_64) => Ok(DataType::UInt64),
             _ => Ok(DataType::Int64),
         },
+    }
+}
+
+/// The arrow time unit a Parquet `TIMESTAMP` annotation's unit names.
+fn arrow_time_unit(unit: ParquetTimeUnit) -> TimeUnit {
+    match unit {
+        ParquetTimeUnit::MILLIS => TimeUnit::Millisecond,
+        ParquetTimeUnit::MICROS => TimeUnit::Microsecond,
+        ParquetTimeUnit::NANOS => TimeUnit::Nanosecond,
+    }
+}
+
+/// How many of `data_type`'s units make one second, for a timestamp finer than
+/// a second. `None` for every other type, and for a second-resolution timestamp
+/// — neither needs converting.
+///
+/// A pivot timestamp is an epoch second (see `Type::Timestamp`), so a file that
+/// stores milli-, micro- or nanoseconds has its values divided by this on the
+/// way in; reading them as-is would misplace every timestamp by three to nine
+/// orders of magnitude.
+pub fn timestamp_to_seconds_divisor(data_type: &DataType) -> Option<i64> {
+    match data_type {
+        DataType::Timestamp(TimeUnit::Millisecond, _) => Some(1_000),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => Some(1_000_000),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => Some(1_000_000_000),
+        _ => None,
     }
 }
 

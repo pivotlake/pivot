@@ -310,6 +310,7 @@ mod tests {
                     max_def_level: 0,
                     physical_type: 0,
                     fixed_len_byte_width: None,
+                    seconds_divisor: None,
                     statistics: None,
                     data_pages_all_dictionary: false,
                 })
@@ -393,6 +394,7 @@ mod tests {
             max_def_level: 0,
             physical_type: 0,
             fixed_len_byte_width: None,
+            seconds_divisor: None,
             statistics: None,
             data_pages_all_dictionary: dict,
         };

@@ -5,6 +5,7 @@
 //! Thrift footer, converts the Parquet schema to Arrow, and collects
 //! `RowGroupMetadata` entries with globally unique row-group indices.
 
+use crate::parquet::types::arrow_map::timestamp_to_seconds_divisor;
 use crate::parquet::types::metadata::{ColumnChunkMeta, ColumnStatistics, RowGroupMetadata};
 use crate::parquet::types::thrift::footer::{FileMetaData, PageEncodingStats, Statistics};
 use crate::parquet::types::thrift::general::{Encoding, PageType};
@@ -213,9 +214,19 @@ pub(crate) fn row_groups_from_metadata(
     open_file: dispatch::io::OpenFile,
     declared_columns: &[Column],
 ) -> Result<Vec<RowGroupMetadata>> {
-    let (schema, leaf_infos) = schema_elements_to_arrow(&file_meta.schema)?;
+    let (file_schema, leaf_infos) = schema_elements_to_arrow(&file_meta.schema)?;
+    // A sub-second timestamp leaf stores integers in its own unit; the divisor
+    // that turns them into the epoch seconds pivot carries comes from the
+    // file's own types, before the schema is canonicalized below.
+    let seconds_divisors: Vec<Option<i64>> = super::leaves::leaf_fields(file_schema.fields())
+        .iter()
+        .map(|leaf| timestamp_to_seconds_divisor(leaf.data_type()))
+        .collect();
     // Use reconciled types for statistics, decoders, and output fields.
-    let schema = Arc::new(apply_declared_types(schema, declared_columns)?);
+    let schema = Arc::new(apply_declared_types(
+        canonicalize_timestamps_to_seconds(file_schema),
+        declared_columns,
+    )?);
     // Statistics belong to leaf chunks, not top-level columns.
     let leaves = super::leaves::leaf_fields(schema.fields());
 
@@ -241,9 +252,14 @@ pub(crate) fn row_groups_from_metadata(
                 .map(|(j, cc)| {
                     let meta = cc.meta_data.expect("missing column metadata");
                     let physical_type = meta.physical_type;
-                    let statistics = meta
-                        .statistics
-                        .and_then(|s| decode_statistics(s, leaves[j].data_type(), physical_type));
+                    let statistics = meta.statistics.and_then(|s| {
+                        decode_statistics(
+                            s,
+                            leaves[j].data_type(),
+                            physical_type,
+                            seconds_divisors[j],
+                        )
+                    });
                     let data_pages_all_dictionary = meta.dictionary_page_offset.is_some()
                         && data_pages_all_dictionary(meta.encoding_stats.as_deref());
                     ColumnChunkMeta {
@@ -253,6 +269,7 @@ pub(crate) fn row_groups_from_metadata(
                         max_def_level: leaf_infos[j].def_level,
                         physical_type,
                         fixed_len_byte_width: leaf_infos[j].type_length,
+                        seconds_divisor: seconds_divisors[j],
                         statistics,
                         data_pages_all_dictionary,
                     }
@@ -306,10 +323,14 @@ fn data_pages_all_dictionary(encoding_stats: Option<&[PageEncodingStats]>) -> bo
 /// legacy `min` / `max` only when those aren't populated. Unsupported types
 /// (or stats whose bytes don't match the expected width) yield `None` for
 /// that side rather than failing the parse.
+///
+/// `seconds_divisor` is set for a sub-second timestamp chunk, whose stored
+/// bounds are converted like its values (see [`decode_seconds_scalar`]).
 fn decode_statistics(
     stats: Statistics,
     data_type: &DataType,
     physical_type: i32,
+    seconds_divisor: Option<i64>,
 ) -> Option<ColumnStatistics> {
     let max_bytes = stats.max_value.or(stats.max);
     let min_bytes = stats.min_value.or(stats.min);
@@ -320,12 +341,50 @@ fn decode_statistics(
     {
         return None;
     }
+    let bound = |bytes: Vec<u8>| match seconds_divisor {
+        Some(divisor) => decode_seconds_scalar(&bytes, data_type, divisor),
+        None => decode_scalar(&bytes, data_type, physical_type),
+    };
     Some(ColumnStatistics {
-        min: min_bytes.and_then(|bytes| decode_scalar(&bytes, data_type, physical_type)),
-        max: max_bytes.and_then(|bytes| decode_scalar(&bytes, data_type, physical_type)),
+        min: min_bytes.and_then(&bound),
+        max: max_bytes.and_then(&bound),
         null_count: stats.null_count,
         distinct_count: stats.distinct_count,
     })
+}
+
+/// Read `N` bytes as a little-endian fixed-width primitive. Returns `None`
+/// if the byte slice doesn't have exactly `N` bytes.
+fn read_le<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {
+    bytes.try_into().ok()
+}
+
+fn erase_type<T: arrow_array::Array + 'static>(s: Scalar<T>) -> Scalar<ArrayRef> {
+    Scalar::new(Arc::new(s.into_inner()))
+}
+
+/// A sub-second timestamp bound in the epoch seconds the column decodes to:
+/// the stored integer floor-divided by its unit's divisor, in whichever
+/// carrier the reconciled column uses.
+///
+/// Flooring is monotonic, so the converted bounds still bracket every converted
+/// value in the chunk (and rounding towards zero would not, for a bound before
+/// the epoch).
+fn decode_seconds_scalar(
+    bytes: &[u8],
+    data_type: &DataType,
+    divisor: i64,
+) -> Option<Scalar<ArrayRef>> {
+    let seconds = read_le::<8>(bytes)
+        .map(i64::from_le_bytes)?
+        .div_euclid(divisor);
+    match data_type {
+        DataType::Int64 => Some(erase_type(Int64Array::new_scalar(seconds))),
+        DataType::Timestamp(TimeUnit::Second, None) => {
+            Some(erase_type(TimestampSecondArray::new_scalar(seconds)))
+        }
+        _ => None,
+    }
 }
 
 fn decode_scalar(
@@ -333,16 +392,6 @@ fn decode_scalar(
     data_type: &DataType,
     physical_type: i32,
 ) -> Option<Scalar<ArrayRef>> {
-    /// Read `N` bytes as a little-endian fixed-width primitive. Returns `None`
-    /// if the byte slice doesn't have exactly `N` bytes.
-    fn read_le<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {
-        bytes.try_into().ok()
-    }
-
-    fn erase_type<T: arrow_array::Array + 'static>(s: Scalar<T>) -> Scalar<ArrayRef> {
-        Scalar::new(Arc::new(s.into_inner()))
-    }
-
     match data_type {
         DataType::Boolean => bytes
             .first()
@@ -496,6 +545,39 @@ fn schema_elements_to_arrow(
 /// [`parse_schema_element`]'s per-level recursion, which would abort the
 /// process rather than fail the load.
 const MAX_SCHEMA_DEPTH: usize = 128;
+
+/// Rewrite every timestamp field, however deeply nested, to the second
+/// resolution pivot carries (see `Type::Timestamp`).
+///
+/// The unit a file declares survives just long enough to be read here: it fixes
+/// the divisor each such leaf's values and statistics are converted by
+/// (`seconds_divisor`), and from this point on the whole engine sees one
+/// timestamp type, whatever the file stored.
+fn canonicalize_timestamps_to_seconds(schema: Schema) -> Schema {
+    fn canonicalize(field: &Arc<Field>) -> Arc<Field> {
+        match field.data_type() {
+            DataType::Timestamp(TimeUnit::Second, None) => field.clone(),
+            DataType::Timestamp(_, _) => Arc::new(
+                field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(DataType::Timestamp(TimeUnit::Second, None)),
+            ),
+            DataType::Struct(children) => {
+                let children: Vec<Arc<Field>> = children.iter().map(canonicalize).collect();
+                Arc::new(
+                    field
+                        .as_ref()
+                        .clone()
+                        .with_data_type(DataType::Struct(children.into())),
+                )
+            }
+            _ => field.clone(),
+        }
+    }
+
+    Schema::new(schema.fields().iter().map(canonicalize).collect::<Vec<_>>())
+}
 
 /// Reconcile a file's parsed schema with the table's declared column types,
 /// matched by column name: a file may carry more columns than the table
@@ -723,6 +805,10 @@ mod tests {
         }
     }
 
+    /// The INT64 physical type id, spelled out because `Type` in this module
+    /// is the engine's column type.
+    const INT64_PHYSICAL_TYPE: i32 = crate::parquet::types::thrift::general::Type::INT64 as i32;
+
     fn column(name: &str, col_type: Type) -> Column {
         Column {
             name: name.to_string(),
@@ -831,6 +917,92 @@ mod tests {
 
         assert_eq!(*reconciled.field(0).data_type(), DataType::Int64);
         assert_eq!(*reconciled.field(1).data_type(), DataType::Int64);
+    }
+
+    /// A leaf's declared time unit survives the footer parse (reading a
+    /// microsecond column as though it stored seconds would misplace every
+    /// value by a factor of a million), and names the divisor its values and
+    /// bounds are converted by.
+    #[test]
+    fn a_timestamp_leaf_keeps_the_time_unit_its_file_declares() {
+        use crate::parquet::types::thrift::general::TimeUnit as ParquetTimeUnit;
+
+        let mut element = schema_element("ts", None, None, Some(INT64_PHYSICAL_TYPE));
+        element.logical_type = Some(
+            crate::parquet::types::thrift::footer::LogicalType::Timestamp {
+                unit: ParquetTimeUnit::MICROS,
+                is_adjusted_to_utc: true,
+            },
+        );
+
+        let data_type = crate::parquet::types::arrow_map::parquet_to_arrow(&element).unwrap();
+
+        assert_eq!(data_type, DataType::Timestamp(TimeUnit::Microsecond, None));
+        assert_eq!(timestamp_to_seconds_divisor(&data_type), Some(1_000_000));
+    }
+
+    /// Whatever unit a file stores, the schema the engine reads it through is
+    /// pivot's second resolution: `Timestamp(Second)` on its own, and the
+    /// canonical `Int64` where the table declares the column TIMESTAMP.
+    #[test]
+    fn subsecond_timestamps_canonicalize_to_seconds() {
+        let schema = Schema::new(vec![
+            Field::new(
+                "ts_micros",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
+            Field::new(
+                "ts_declared",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                false,
+            ),
+        ]);
+
+        let canonical = canonicalize_timestamps_to_seconds(schema);
+        let reconciled =
+            apply_declared_types(canonical, &[column("ts_declared", Type::Timestamp)]).unwrap();
+
+        assert_eq!(
+            *reconciled.field(0).data_type(),
+            DataType::Timestamp(TimeUnit::Second, None)
+        );
+        assert_eq!(*reconciled.field(1).data_type(), DataType::Int64);
+    }
+
+    /// A sub-second chunk's min/max convert with its values, so pruning
+    /// compares like with like. Both bounds floor, which keeps them bracketing
+    /// the converted values on either side of the epoch.
+    #[test]
+    fn subsecond_timestamp_statistics_convert_to_seconds() {
+        let stats = Statistics {
+            min: None,
+            max: None,
+            min_value: Some((-1_500_000i64).to_le_bytes().to_vec()),
+            max_value: Some(2_500_000i64.to_le_bytes().to_vec()),
+            null_count: None,
+            distinct_count: None,
+        };
+
+        let decoded = decode_statistics(
+            stats,
+            &DataType::Timestamp(TimeUnit::Second, None),
+            INT64_PHYSICAL_TYPE,
+            Some(1_000_000),
+        )
+        .unwrap();
+
+        let value = |scalar: Option<Scalar<ArrayRef>>| {
+            let scalar = scalar.unwrap();
+            let (array, _) = scalar.get();
+            array
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .unwrap()
+                .value(0)
+        };
+        assert_eq!(value(decoded.min), -2);
+        assert_eq!(value(decoded.max), 2);
     }
 
     /// DuckDB resolves identifiers case-insensitively, so a declared column
