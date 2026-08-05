@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::SortBounds;
 use arrow_array::ArrayRef;
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef};
 use dispatch::memory::{FileBytes, Slab};
 use dispatch::{Identifier, WorkerIdOutput};
 use thriftparquet::footer::Statistics;
@@ -74,6 +74,11 @@ pub(crate) struct RowGroupHeader {
     /// (`file_id % worker_count`, so a file's row groups co-locate).
     pub(crate) dest_worker: usize,
     pub(crate) schema: SchemaRef,
+    /// The type each variant column shreds into before encoding, index-aligned
+    /// with `schema`'s columns and `None` for every other column. Decided per
+    /// file by the partition stage; applied per chunk by the encoder, which is
+    /// what keeps the rewrite on the parallel side of the pipeline.
+    pub(crate) shredding_types: Arc<[Option<DataType>]>,
     pub(crate) tag: Arc<PartitionTag>,
 }
 

@@ -404,6 +404,7 @@ mod tests {
             row_group_id: 0,
             dest_worker: 0,
             schema: schema.clone(),
+            shredding_types: vec![None; schema.fields().len()].into(),
             tag: Arc::new(PartitionTag {
                 file_id: 0,
                 n_row_groups: 1,

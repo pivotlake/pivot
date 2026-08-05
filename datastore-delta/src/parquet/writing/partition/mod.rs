@@ -434,9 +434,11 @@ impl RowGroupBuilder {
         }
         // This file's rows are all here, so this is where its variant columns
         // pick their shredding — from the rows the file actually got, and for
-        // this file alone. It widens the schema, so read it back afterwards.
-        let groups = shredding::shred_groups(groups)?;
-        let schema = groups[0].schema();
+        // this file alone. Only the decision is made here: the encoder applies
+        // it chunk by chunk, on the parallel side. It widens the schema, which
+        // every chunk job below carries.
+        let plan = shredding::plan_shredding(&groups)?;
+        let schema = plan.schema;
         let file_id = self.next_file_id.fetch_add(1, Ordering::Relaxed);
         // The assembler gathers a whole file on one worker, so every column chunk
         // of this file must name the same worker; `return_to_worker_mpsc` routes a
@@ -461,6 +463,7 @@ impl RowGroupBuilder {
                 row_group_id: self.next_row_group_id.fetch_add(1, Ordering::Relaxed),
                 dest_worker,
                 schema: schema.clone(),
+                shredding_types: plan.shredding_types.clone(),
                 tag,
             });
             for (column, values) in group.columns().iter().enumerate() {

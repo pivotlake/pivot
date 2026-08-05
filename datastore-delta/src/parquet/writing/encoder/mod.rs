@@ -60,10 +60,22 @@ impl Unary<ColumnChunkJob, EncodedColumnChunk> for ColumnEncoder {
         sender: &mut dyn Sender<EncodedColumnChunk>,
     ) -> UnaryResult<()> {
         let field = job.header.schema.field(job.column);
+        // A variant column arrives as the plain `{metadata, value}` pair and is
+        // rewritten here into the layout its file planned, so the heavy step of
+        // a variant write runs on this parallel stage rather than in the
+        // pipeline breaker that cut the file.
+        let shredded;
+        let values = match &job.header.shredding_types[job.column] {
+            Some(shredding_type) => {
+                shredded = super::shredding::shred_column(&job.values, shredding_type)?;
+                &shredded
+            }
+            None => &job.values,
+        };
         let allocator = self
             .allocator
             .get_or_insert_with(|| SlabAllocator::new(false));
-        let leaves = encode_column_chunk(field, &job.values, allocator)?;
+        let leaves = encode_column_chunk(field, values, allocator)?;
         sender.send(EncodedColumnChunk {
             header: job.header,
             column: job.column,

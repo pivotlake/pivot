@@ -15,18 +15,19 @@
 //!    file's worth, cut it into row groups and emit one job per column — stamping
 //!    each with its file/partition provenance, `sort_bounds`, and sort-column
 //!    statistics. This is also where each file's variant columns pick their
-//!    [`shredding`], which is why that decision is per file: this stage is the
-//!    only one that sees a whole file's rows at once. The sub-file remainder is
+//!    [`shredding`] layout, which is why that decision is per file: this stage is
+//!    the only one that sees a whole file's rows at once. Only the decision is
+//!    made here — applying it is the encoder's job. The sub-file remainder is
 //!    consolidated per partition on worker 0. This is the pipeline's only
 //!    pipeline-breaker, so every later stage is a plain parallel map or a gather.
 //!    (Its partition-tuple and column-statistics helpers live in the `partition`
 //!    directory.)
 //! 2. [`encoder`] (`ColumnChunkJob → EncodedColumnChunk`) — encode each column
-//!    chunk: flatten the column into the leaves Parquet stores, then for each,
-//!    dictionary-encode it where it pays, else PLAIN; cut into pages and
-//!    snappy-compress. The one heavy stage; finished chunks route back to their
-//!    file's owner worker. (Leaf flattening, page cutting and index RLE live in
-//!    the `encoder` directory.)
+//!    chunk: shred a variant column into the layout its file planned, flatten
+//!    the column into the leaves Parquet stores, then for each, dictionary-encode
+//!    it where it pays, else PLAIN; cut into pages and snappy-compress. The one
+//!    heavy stage; finished chunks route back to their file's owner worker. (Leaf
+//!    flattening, page cutting and index RLE live in the `encoder` directory.)
 //! 3. [`assembler`] (`EncodedColumnChunk → AssembledFile`) — gather a file's column
 //!    chunks, lay each out (the dictionary page, then the data pages) with
 //!    sort-column footer statistics, and emit the finished file.
