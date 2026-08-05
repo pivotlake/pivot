@@ -172,6 +172,13 @@ pub(crate) async fn execute_sql(
         if plan.as_set_variable().is_some() {
             return Ok(Vec::new());
         }
+        // A COMPACT runs its sweeps here on the coordinator and returns no rows.
+        if let Some(request) = plan.as_compact() {
+            execute_compact(&catalog, request)
+                .await
+                .map_err(|e| e.to_string())?;
+            return Ok(Vec::new());
+        }
         // Compile and launch the dataflow (with the CopyOut cap) on the blocking
         // pool; `execute_copying` returns the running handle without collecting.
         // The closure gets its own clone of the transaction Arc only because
@@ -250,6 +257,36 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 /// Reuse the exact SQL's plan when its complete table-revision map matches this
 /// transaction; otherwise plan inside the same transaction and cache the result
 /// only when the planner marked it safe.
+/// Run a `COMPACT` statement: resolve the datastore it names (default when
+/// unqualified) and sweep the table synchronously. The sweeps commit through
+/// the datastore's own log CAS, independent of the statement's transaction.
+async fn execute_compact(
+    catalog: &Arc<catalog::PivotCatalog>,
+    request: planner::CompactRequest,
+) -> Result<u64> {
+    let datastore_name = request
+        .datastore
+        .as_deref()
+        .unwrap_or_else(|| catalog.default_datastore_name());
+    let datastore = catalog
+        .iter_datastores()
+        .find(|(name, _)| name.as_str() == datastore_name)
+        .map(|(_, datastore)| Arc::clone(datastore))
+        .ok_or_else(|| {
+            planner::catalog::Error::Other(
+                format!("COMPACT: no datastore named `{datastore_name}`").into(),
+            )
+        })?;
+    let table = planner::catalog::SchemaQualifiedTableName::new(
+        request
+            .schema
+            .as_deref()
+            .unwrap_or(planner::DEFAULT_SCHEMA_NAME),
+        request.table.as_str(),
+    );
+    Ok(datastore.compact(&table, request.final_sweep).await?)
+}
+
 async fn plan_query(
     catalog: &Arc<catalog::PivotCatalog>,
     transaction: Arc<dyn planner::catalog::CatalogTransaction>,
@@ -435,6 +472,13 @@ impl PivotQueryHandler {
                     value: set.value.clone(),
                 });
             }
+            // A COMPACT also compiles to no dataflow: the sweep drives
+            // dataflows of its own, so it runs here on the coordinator, never
+            // on a worker.
+            if let Some(request) = plan.as_compact() {
+                execute_compact(&self.catalog, request).await?;
+                return Ok(Outcome::Compact);
+            }
             let is_insert = matches!(&plan.root.operator, planner::Operator::Insert(_));
 
             // When the session ran `SET perf = 1`, start a `perf record` scoped to the
@@ -534,6 +578,8 @@ enum Outcome {
     /// A `SET`/`RESET` of a session variable (DuckDB-parsed). `value` is `None`
     /// for `RESET`; the server decides which names actually mean anything.
     Set { name: String, value: Option<String> },
+    /// A completed `COMPACT` statement; the sweeps already ran.
+    Compact,
 }
 
 /// Where a query's time went — phase wall-clocks plus the dataflow's IO/CPU
@@ -649,6 +695,7 @@ impl SimpleQueryHandler for PivotQueryHandler {
 
         let res = match outcome {
             Outcome::Set { name, value } => apply_set(client, &name, value.as_deref()),
+            Outcome::Compact => Response::Execution(Tag::new("COMPACT")),
             Outcome::Response(res, stats) => {
                 // Send the breakdown as an INFO notice before the rows.
                 if with_stats {

@@ -139,6 +139,19 @@ pub trait Datastore: Debug + Send + Sync {
     /// stop.
     fn abort(&self) {}
 
+    /// Merge `table`'s small files into target-sized ones now, synchronously,
+    /// the way this datastore's own background compaction would over time.
+    /// Backs the `COMPACT` statement, so it runs on the coordinator's async
+    /// context, never on a dispatch worker. One call is one sweep;
+    /// `final_sweep` keeps sweeping until a sweep advances no version (a merge
+    /// changes the file list, so one pass can leave a tail). Returns the
+    /// number of sweeps performed, or an error if `table` does not exist.
+    async fn compact(
+        self: Arc<Self>,
+        table: &SchemaQualifiedTableName,
+        final_sweep: bool,
+    ) -> Result<u64>;
+
     /// Downcast hook (owned): recover the concrete backend as an owned `Arc`, for
     /// a server feature specific to one datastore format (the web dashboard's
     /// Parquet-level introspection). Implemented as

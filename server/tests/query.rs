@@ -802,3 +802,61 @@ async fn create_table_in_an_unknown_schema_errors(#[future] conn: Conn) {
         "expected the error to name the missing schema, got: {message}",
     );
 }
+
+/// The set of data files the Delta log currently considers live: every `add`
+/// path across the commits, minus every `remove` path.
+fn live_log_files(dir: &std::path::Path) -> std::collections::HashSet<String> {
+    let mut live = std::collections::HashSet::new();
+    let mut commits: Vec<_> = std::fs::read_dir(dir.join("_delta_log"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|e| e == "json"))
+        .collect();
+    commits.sort();
+    for commit in commits {
+        for line in std::fs::read_to_string(&commit).unwrap().lines() {
+            let action: serde_json::Value = serde_json::from_str(line).unwrap();
+            if let Some(add) = action.get("add") {
+                live.insert(add["path"].as_str().unwrap().to_string());
+            }
+            if let Some(remove) = action.get("remove") {
+                live.remove(remove["path"].as_str().unwrap());
+            }
+        }
+    }
+    live
+}
+
+#[tokio::test]
+async fn compact_final_merges_small_insert_files() {
+    let conn = conn().await;
+    let dir = tempfile::tempdir().unwrap();
+    conn.simple_query(&format!(
+        "CREATE TABLE compact_me (id BIGINT) WITH (path = '{}')",
+        dir.path().to_str().unwrap()
+    ))
+    .await
+    .unwrap();
+    for i in 0..5 {
+        conn.simple_query(&format!("INSERT INTO compact_me VALUES ({i})"))
+            .await
+            .unwrap();
+    }
+    assert_eq!(live_log_files(dir.path()).len(), 5);
+
+    conn.simple_query("COMPACT compact_me FINAL").await.unwrap();
+
+    assert_eq!(live_log_files(dir.path()).len(), 1);
+    let rows = select_rows(&conn, "SELECT COUNT(*), SUM(id) FROM compact_me").await;
+    assert_eq!(rows, vec![vec![Some("5".into()), Some("10".into())]]);
+}
+
+#[tokio::test]
+async fn compact_of_a_missing_table_errors() {
+    let conn = conn().await;
+
+    let result = conn.simple_query("COMPACT no_such_table FINAL").await;
+
+    let message = format!("{:?}", result.unwrap_err());
+    assert!(message.contains("no table named"), "{message}");
+}

@@ -35,17 +35,6 @@ impl ServerHandle {
         self.port
     }
 
-    /// Compact every table synchronously. The in-process handle reached into
-    /// the datastore for this; an external server needs a server-side hook,
-    /// which does not exist yet. Until it does, a suite that loads by INSERT
-    /// measures its queries against the many small files the load left.
-    pub async fn compact(&self) {
-        eprintln!(
-            "warning: compaction is not reachable through an external server yet; \
-             queries will read the uncompacted files the load produced"
-        );
-    }
-
     fn server_log(&self) -> String {
         fs::read_to_string(self.scratch.path().join("server.log")).unwrap_or_default()
     }

@@ -354,6 +354,23 @@ impl Plan {
             _ => None,
         }
     }
+
+    /// This plan as a `COMPACT` statement, if its root is the bound `compact`
+    /// table function the parser's rewrite produces. Like a `SET`, the server
+    /// checks this before compiling: compaction runs coordinator-side, off the
+    /// worker pool, because it drives dataflows of its own.
+    pub fn as_compact(&self) -> Option<crate::operator::CompactRequest> {
+        // DuckDB leaves the bound call under a column-pruning projection or
+        // two; peel those, the request is the leaf scan.
+        let mut node = &self.root;
+        while matches!(node.operator, Operator::Projection(_)) && node.inputs.len() == 1 {
+            node = &node.inputs[0];
+        }
+        match &node.operator {
+            Operator::TableFunctionScan(scan) if node.inputs.is_empty() => scan.compact_request(),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for Plan {
