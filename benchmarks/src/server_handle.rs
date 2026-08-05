@@ -1,51 +1,33 @@
-//! Boot the pivotdb server in-process for benchmarking.
+//! Launch and supervise a pivotdb-server process for benchmarking.
 //!
-//! Picks a free local port, initialises a `dispatch` worker pool, and runs
-//! `server::Server` on a dedicated background thread driving its own tokio
-//! runtime — so the bench's blocking iteration loop on the main thread never
-//! starves the accept loop. Returns a [`ServerHandle`] holding the bind port
-//! plus a `oneshot::Sender` that triggers a clean shutdown when the handle is
-//! dropped.
+//! pivot-bench measures the real server binary from the outside: it writes a
+//! minimal config, spawns the given `pivotdb-server`, waits for its listener,
+//! and shuts the process down when the handle drops. Measuring (and, for PGO,
+//! profiling) the same binary that ships is the point: an in-process stand-in
+//! is a differently linked artifact, and its compiled code can diverge from
+//! the server's even when every crate is identical.
 
-use std::collections::HashMap;
+use std::fs;
 use std::net::{SocketAddr, TcpStream};
-use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
-use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
-use datastore_delta::{
-    Compacter, DEFAULT_COMPACT_BYTES, DEFAULT_MIN_FILES_TO_MERGE, DeltaDatastore,
-};
-use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
-use metastore::{DEFAULT_USER_NAME, Metastore, UserAuth};
-use server::Server;
-use tokio::sync::oneshot;
+/// How long to wait for the spawned server to accept connections. Generous
+/// because an instrumented (PGO generation) build boots slowly: it prefaults
+/// the same buffer pool as a release build while running instrumented code.
+const LISTEN_DEADLINE: Duration = Duration::from_secs(300);
 
-fn total_memory_bytes() -> usize {
-    sysinfo::System::new_with_specifics(
-        sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
-    )
-    .total_memory() as usize
-}
-
-/// Share of the machine's memory the ring takes, as a percentage — the same
-/// `PIVOT_MEMORY_PCT` the real server reads, defaulting to the same 80, so a
-/// benchmark run is sized like the server it stands in for.
-///
-/// Worth overriding on a machine that isn't the benchmark's alone: the ring is
-/// prefaulted, so 80% of total is 80% whether or not something else is holding
-/// memory, and the run is simply OOM-killed.
-fn ring_buffers() -> usize {
-    let pct: usize = dispatch::env::get_env_var_with_default("PIVOT_MEMORY_PCT", 80);
-    total_memory_bytes() * pct / 100 / BUFFER_SIZE
-}
+/// How long a clean shutdown may take before the process is killed.
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(60);
 
 pub struct ServerHandle {
     port: u16,
-    datastore: Arc<DeltaDatastore>,
-    shutdown: Option<oneshot::Sender<()>>,
-    thread: Option<JoinHandle<()>>,
+    child: Child,
+    /// Scratch directory holding the generated config, the empty datastore
+    /// and the server's log; deleted when the handle drops.
+    scratch: tempfile::TempDir,
 }
 
 impl ServerHandle {
@@ -53,154 +35,133 @@ impl ServerHandle {
         self.port
     }
 
-    /// Compact every table synchronously. A load of many small `INSERT`s leaves
-    /// as many small files; this merges them into target-sized ones before the
-    /// queries read them, the way the datastore's own compacter would over time.
-    ///
-    /// One sweep can leave a tail: a merge changes the file list, and a later
-    /// candidate in the same sweep may be missed. So sweep until one merges
-    /// nothing, which a sweep that advanced no table's log version did.
+    /// Compact every table synchronously. The in-process handle reached into
+    /// the datastore for this; an external server needs a server-side hook,
+    /// which does not exist yet. Until it does, a suite that loads by INSERT
+    /// measures its queries against the many small files the load left.
     pub async fn compact(&self) {
-        let compacter = Compacter::new(
-            DEFAULT_COMPACT_BYTES,
-            DEFAULT_MIN_FILES_TO_MERGE,
-            // The poll interval is unused for a manual sweep.
-            Duration::from_secs(1),
-            self.datastore.clone(),
+        eprintln!(
+            "warning: compaction is not reachable through an external server yet; \
+             queries will read the uncompacted files the load produced"
         );
-        loop {
-            let versions_before = self.table_versions();
-            compacter.compact_all().await;
-            if self.table_versions() == versions_before {
-                break;
-            }
-        }
     }
 
-    /// Every table's committed log version, keyed by name, so two of these taken
-    /// around a sweep say whether it merged anything.
-    fn table_versions(&self) -> HashMap<String, u64> {
-        self.datastore
-            .tables()
-            .iter()
-            .map(|(name, table)| (name.to_string(), table.version()))
-            .collect()
+    fn server_log(&self) -> String {
+        fs::read_to_string(self.scratch.path().join("server.log")).unwrap_or_default()
+    }
+
+    /// Wait until the server accepts TCP connections, failing early if the
+    /// process exits first. Either failure carries the server's log, which is
+    /// otherwise deleted with the scratch directory.
+    fn wait_until_listening(&mut self) -> std::io::Result<()> {
+        let addr: SocketAddr = format!("127.0.0.1:{}", self.port)
+            .parse()
+            .expect("valid socket addr");
+        let deadline = Instant::now() + LISTEN_DEADLINE;
+        while Instant::now() < deadline {
+            if TcpStream::connect(addr).is_ok() {
+                return Ok(());
+            }
+            if let Some(status) = self.child.try_wait()? {
+                return Err(std::io::Error::other(format!(
+                    "pivotdb-server exited with {status} before listening:\n{}",
+                    self.server_log()
+                )));
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        Err(std::io::Error::other(format!(
+            "timed out waiting for pivotdb-server to listen on {addr}:\n{}",
+            self.server_log()
+        )))
     }
 }
 
 impl Drop for ServerHandle {
     fn drop(&mut self) {
-        if let Some(tx) = self.shutdown.take() {
-            let _ = tx.send(());
+        // SIGINT is the server's clean-shutdown signal. A clean exit matters
+        // beyond politeness: an instrumented build writes its profile
+        // counters only on a normal exit, so killing the process would
+        // silently forfeit a PGO profiling run.
+        unsafe {
+            libc::kill(self.child.id() as libc::pid_t, libc::SIGINT);
         }
-        if let Some(handle) = self.thread.take() {
-            let _ = handle.join();
+        let deadline = Instant::now() + SHUTDOWN_DEADLINE;
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => thread::sleep(Duration::from_millis(50)),
+                Err(_) => break,
+            }
         }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
 /// Pick a free local port by binding to `:0` and dropping the listener; the
 /// kernel will not immediately reuse the port for the brief window before the
-/// server thread re-binds.
+/// spawned server re-binds it.
 fn pick_free_port() -> std::io::Result<u16> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     Ok(listener.local_addr()?.port())
 }
 
-fn wait_until_listening(addr: SocketAddr) -> std::io::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut last_err = None;
-    while Instant::now() < deadline {
-        match TcpStream::connect(addr) {
-            Ok(_) => return Ok(()),
-            Err(e) => last_err = Some(e),
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-    Err(last_err.unwrap_or_else(|| std::io::Error::other("timed out waiting for server")))
-}
-
-/// User source for the in-process benchmark server. The catalog is assembled
-/// directly above, so only the built-in trusted `pivot` login is used here.
-fn pivot_metastore() -> Arc<dyn Metastore> {
-    struct PivotMetastore;
-
-    impl Metastore for PivotMetastore {
-        fn open_datastores(
-            &self,
-            _dispatcher: &DataFlowDispatcher,
-        ) -> metastore::Result<HashMap<String, Arc<dyn Datastore>>> {
-            Ok(HashMap::new())
-        }
-
-        fn default_datastore_name(&self) -> &str {
-            DEFAULT_DATASTORE_NAME
-        }
-
-        fn user_auth(&self, username: &str) -> Option<UserAuth> {
-            (username == DEFAULT_USER_NAME).then_some(UserAuth::Trust)
-        }
-    }
-
-    Arc::new(PivotMetastore)
-}
-
-/// Start a pivotdb server with the given worker count, returning once the
-/// listener is accepting connections. The catalog is empty; the runner sends
-/// `CREATE TABLE` over the wire to populate it.
-pub fn start(workers: usize) -> std::io::Result<ServerHandle> {
+/// Start `server_bin` on a free port over an empty scratch datastore,
+/// returning once its listener accepts connections. The catalog starts empty;
+/// the runner sends `CREATE TABLE` over the wire to populate it. Memory
+/// sizing is inherited through the environment: the server reads the same
+/// `PIVOT_MEMORY_PCT` this process was started with.
+pub fn start(server_bin: &Path, workers: Option<usize>) -> std::io::Result<ServerHandle> {
     let port = pick_free_port()?;
-    let bind: SocketAddr = format!("127.0.0.1:{port}")
-        .parse()
-        .expect("valid socket addr");
+    let scratch = tempfile::tempdir()?;
+    let data_dir = scratch.path().join("data");
+    fs::create_dir(&data_dir)?;
 
-    let dispatch = Dispatch::spin_up(workers, ring_buffers(), None);
-    let data_dir = tempfile::tempdir()?;
-    let datastore = DeltaDatastore::open_local(data_dir.path(), dispatch.dispatcher())
-        .map_err(std::io::Error::other)?;
-    let catalog = Arc::new(
-        PivotCatalog::new(
-            HashMap::from([(
-                DEFAULT_DATASTORE_NAME.to_string(),
-                datastore.clone() as Arc<dyn Datastore>,
-            )]),
-            DEFAULT_DATASTORE_NAME.to_string(),
-        )
-        .map_err(std::io::Error::other)?,
+    let workers_line = match workers {
+        Some(count) => format!("  workers: {count}\n"),
+        None => String::new(),
+    };
+    let config = format!(
+        "\
+server:
+  bind: 127.0.0.1:{port}
+{workers_line}metastore:
+  datastores:
+    default:
+      kind: delta
+      location: {data_dir}
+      default: true
+  users:
+    pivot:
+      auth:
+        method: trust
+",
+        data_dir = data_dir.display(),
     );
+    let config_path = scratch.path().join("config.yaml");
+    fs::write(&config_path, config)?;
 
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-
-    let thread = thread::Builder::new()
-        .name("pivot-bench-server".into())
-        .spawn(move || {
-            // The benchmark owns its scratch datastore explicitly for exactly
-            // as long as the in-process server thread is alive.
-            let _data_dir = data_dir;
-            // The runtime gets few threads on purpose: its default (one per
-            // core) would sit hundreds of mostly-idle threads next to the
-            // pinned dispatch workers and preempt them on every wakeup.
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .expect("build tokio runtime");
-            rt.block_on(async move {
-                let server = Server::new(bind, dispatch, catalog, pivot_metastore());
-                let _ = server
-                    .serve(Box::pin(async move {
-                        let _ = shutdown_rx.await;
-                    }))
-                    .await;
-            });
+    // The child's output goes to a log file, not this process's stdout: the
+    // benchmark's stdout is parsed by scripts, and the server's tracing lines
+    // would corrupt it. The log surfaces in errors while the handle is alive.
+    let log = fs::File::create(scratch.path().join("server.log"))?;
+    let child = Command::new(server_bin)
+        .arg("--config")
+        .arg(&config_path)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .spawn()
+        .map_err(|e| {
+            std::io::Error::other(format!("failed to spawn {}: {e}", server_bin.display()))
         })?;
 
-    wait_until_listening(bind)?;
-
-    Ok(ServerHandle {
+    let mut handle = ServerHandle {
         port,
-        datastore,
-        shutdown: Some(shutdown_tx),
-        thread: Some(thread),
-    })
+        child,
+        scratch,
+    };
+    handle.wait_until_listening()?;
+    Ok(handle)
 }

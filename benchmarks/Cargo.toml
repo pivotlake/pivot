@@ -3,21 +3,13 @@ name = "benchmarks"
 version.workspace = true
 edition.workspace = true
 
-[dependencies]
-server = { workspace = true }
-catalog = { workspace = true }
-datastore-delta = { workspace = true }
-metastore = { workspace = true }
-planner = { workspace = true }
-dispatch = { workspace = true }
-# `ndjson-to-parquet` loads JSONBench's ndjson through the real write pipeline,
-# so the benchmark reads Parquet that pivot shredded itself. INSERT reads rows
-# from a query rather than ndjson from disk, so this is still how they get in.
-arrow-array = { workspace = true }
-arrow-schema = { workspace = true }
-parquet-variant-compute = { workspace = true }
-flate2 = "1"
+# Deliberately links nothing from the engine. pivot-bench launches an external
+# pivotdb-server and talks to it over pgwire, so the binary being measured (and
+# profiled, for PGO) is exactly the artifact that ships. Adding an engine crate
+# here would recreate a second compiled universe whose performance can silently
+# diverge from the server's.
 
+[dependencies]
 clap = { workspace = true, features = ["env"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "sync"] }
 tokio-postgres = { workspace = true }
@@ -28,14 +20,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-core_affinity = { workspace = true }
-sysinfo = { workspace = true }
 tempfile = { workspace = true }
+flate2 = "1"
+libc = { workspace = true }
 
 [[bin]]
 name = "pivot-bench"
 path = "src/main.rs"
-
-[[bin]]
-name = "ndjson-to-parquet"
-path = "src/bin/ndjson-to-parquet.rs"
