@@ -8,6 +8,7 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use datastore_delta::DeltaDatastore;
+use planner::catalog::SchemaQualifiedTableName;
 use serde::{Deserialize, Serialize};
 
 use super::IntrospectState;
@@ -78,6 +79,9 @@ async fn files_page_for(
     let limit = page.limit.min(500);
     let offset = page.offset;
     let result = tokio::task::spawn_blocking(move || {
+        // The path segment is a table name, taken as written: this route
+        // addresses the default schema only.
+        let name = SchemaQualifiedTableName::in_default_schema(name);
         let Ok(Some(ordered)) = datastore.table_data_files(&name) else {
             return FilesPage::default();
         };

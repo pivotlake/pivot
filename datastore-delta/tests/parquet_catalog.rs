@@ -24,6 +24,7 @@ use datastore_delta::{DeltaDatastore, PartitionEqFilter, TableBinding};
 use planner::Planner;
 use planner::catalog::{
     BoundTable, CatalogTransaction, Column, CreateTableRequest, Result as CatalogResult,
+    SchemaQualifiedTableName,
 };
 use planner::expression::{
     Compare, CompareType, Expression, Function, Ref, TableFilter, VariantGet,
@@ -146,6 +147,7 @@ fn create_request(name: &str, path: &Path, columns: Vec<Column>) -> CreateTableR
     options.insert("path".to_string(), path.to_string_lossy().into_owned());
     CreateTableRequest {
         datastore_name: None,
+        schema_name: None,
         name: name.to_string(),
         columns,
         options,
@@ -203,7 +205,10 @@ fn create_table_succeeds_with_valid_path() {
         datastore
             .clone()
             .begin_transaction()
-            .table(DEFAULT_DATASTORE_NAME, "t")
+            .table(
+                DEFAULT_DATASTORE_NAME,
+                &SchemaQualifiedTableName::in_default_schema("t"),
+            )
             .is_some()
     );
 }
@@ -226,7 +231,10 @@ fn create_table_is_durable_and_visible_only_after_commit() {
         datastore
             .clone()
             .begin_transaction()
-            .table(DEFAULT_DATASTORE_NAME, "t")
+            .table(
+                DEFAULT_DATASTORE_NAME,
+                &SchemaQualifiedTableName::in_default_schema("t"),
+            )
             .is_none()
     );
     assert!(
@@ -241,7 +249,10 @@ fn create_table_is_durable_and_visible_only_after_commit() {
         datastore
             .clone()
             .begin_transaction()
-            .table(DEFAULT_DATASTORE_NAME, "t")
+            .table(
+                DEFAULT_DATASTORE_NAME,
+                &SchemaQualifiedTableName::in_default_schema("t"),
+            )
             .is_some()
     );
     assert!(
@@ -271,7 +282,10 @@ fn rolling_back_create_table_discards_the_staged_creation() {
         datastore
             .clone()
             .begin_transaction()
-            .table(DEFAULT_DATASTORE_NAME, "t")
+            .table(
+                DEFAULT_DATASTORE_NAME,
+                &SchemaQualifiedTableName::in_default_schema("t"),
+            )
             .is_none()
     );
     assert!(!dir.path().join("_delta_log").exists());
@@ -303,6 +317,7 @@ fn create_table_if_not_exists_keeps_the_existing_table() {
     // one, so surviving row groups prove the statement was a no-op.
     let request = CreateTableRequest {
         datastore_name: None,
+        schema_name: None,
         name: "t".to_string(),
         columns,
         options: HashMap::new(),
@@ -319,6 +334,7 @@ fn create_table_without_a_path_makes_an_empty_table() {
     let (_database, datastore) = empty_datastore();
     let req = CreateTableRequest {
         datastore_name: None,
+        schema_name: None,
         name: "t".to_string(),
         columns,
         options: HashMap::new(),
@@ -330,7 +346,10 @@ fn create_table_without_a_path_makes_an_empty_table() {
         datastore
             .clone()
             .begin_transaction()
-            .table(DEFAULT_DATASTORE_NAME, "t")
+            .table(
+                DEFAULT_DATASTORE_NAME,
+                &SchemaQualifiedTableName::in_default_schema("t"),
+            )
             .is_some()
     );
     assert!(current_parquet(&datastore, "t").row_groups().is_empty());
@@ -357,7 +376,10 @@ fn create_table_over_an_unwritable_path_fails() {
         datastore
             .clone()
             .begin_transaction()
-            .table(DEFAULT_DATASTORE_NAME, "t")
+            .table(
+                DEFAULT_DATASTORE_NAME,
+                &SchemaQualifiedTableName::in_default_schema("t"),
+            )
             .is_none()
     );
 }
@@ -385,6 +407,7 @@ fn create_table_rejects_a_url_path() {
     // path's — so a scheme is rejected regardless of the database's storage class.
     let req = CreateTableRequest {
         datastore_name: None,
+        schema_name: None,
         name: "t".to_string(),
         columns,
         options: HashMap::from([("path".to_string(), "s3://bucket/data".to_string())]),
@@ -405,7 +428,10 @@ fn pushdown_filter_always_returns_false() {
     let mut table = datastore
         .clone()
         .begin_transaction()
-        .table(DEFAULT_DATASTORE_NAME, "t")
+        .table(
+            DEFAULT_DATASTORE_NAME,
+            &SchemaQualifiedTableName::in_default_schema("t"),
+        )
         .unwrap();
     let pushed = table
         .pushdown_filter(col_neq_filter(0, int_constant(20)))
@@ -422,7 +448,10 @@ fn pushdown_filter_prunes_row_group_with_only_excluded_value() {
     let mut table = datastore
         .clone()
         .begin_transaction()
-        .table(DEFAULT_DATASTORE_NAME, "t")
+        .table(
+            DEFAULT_DATASTORE_NAME,
+            &SchemaQualifiedTableName::in_default_schema("t"),
+        )
         .unwrap();
     assert_eq!(row_group_count(&datastore, "t", &table), 3);
 
@@ -445,7 +474,10 @@ fn second_bind_is_independent_of_first_bind_pushdown() {
     let mut first = datastore
         .clone()
         .begin_transaction()
-        .table(DEFAULT_DATASTORE_NAME, "t")
+        .table(
+            DEFAULT_DATASTORE_NAME,
+            &SchemaQualifiedTableName::in_default_schema("t"),
+        )
         .unwrap();
     first
         .pushdown_filter(col_neq_filter(0, int_constant(20)))
@@ -456,7 +488,10 @@ fn second_bind_is_independent_of_first_bind_pushdown() {
     let second = datastore
         .clone()
         .begin_transaction()
-        .table(DEFAULT_DATASTORE_NAME, "t")
+        .table(
+            DEFAULT_DATASTORE_NAME,
+            &SchemaQualifiedTableName::in_default_schema("t"),
+        )
         .unwrap();
     assert_eq!(row_group_count(&datastore, "t", &second), 3);
 }
@@ -471,7 +506,10 @@ fn pushdown_filter_eq_prunes_row_groups_when_constant_outside_range() {
     let mut table = datastore
         .clone()
         .begin_transaction()
-        .table(DEFAULT_DATASTORE_NAME, "t")
+        .table(
+            DEFAULT_DATASTORE_NAME,
+            &SchemaQualifiedTableName::in_default_schema("t"),
+        )
         .unwrap();
     table
         .pushdown_filter(col_eq_filter(0, int_constant(999)))
@@ -489,7 +527,10 @@ fn pushdown_filter_eq_keeps_only_matching_row_group() {
     let mut table = datastore
         .clone()
         .begin_transaction()
-        .table(DEFAULT_DATASTORE_NAME, "t")
+        .table(
+            DEFAULT_DATASTORE_NAME,
+            &SchemaQualifiedTableName::in_default_schema("t"),
+        )
         .unwrap();
     table
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
@@ -505,7 +546,10 @@ fn pushdown_filter_eq_returns_false() {
     let mut table = datastore
         .clone()
         .begin_transaction()
-        .table(DEFAULT_DATASTORE_NAME, "t")
+        .table(
+            DEFAULT_DATASTORE_NAME,
+            &SchemaQualifiedTableName::in_default_schema("t"),
+        )
         .unwrap();
     let pushed = table
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
@@ -522,7 +566,10 @@ fn pushdown_filter_keeps_row_groups_when_constant_outside_range() {
     let mut table = datastore
         .clone()
         .begin_transaction()
-        .table(DEFAULT_DATASTORE_NAME, "t")
+        .table(
+            DEFAULT_DATASTORE_NAME,
+            &SchemaQualifiedTableName::in_default_schema("t"),
+        )
         .unwrap();
     table
         .pushdown_filter(col_neq_filter(0, int_constant(999)))
@@ -567,7 +614,9 @@ fn write_ids(dir: &Path, file_name: &str, ids: &[i32]) -> std::path::PathBuf {
 fn append(datastore: &DeltaDatastore, name: &str, path: &Path) {
     let bytes = std::fs::read(path).unwrap();
     let relative = ObjectPath::new(path.file_name().unwrap().to_string_lossy());
-    let mut handle = datastore.table_handle(name).expect("table exists");
+    let mut handle = datastore
+        .table_handle(&SchemaQualifiedTableName::in_default_schema(name))
+        .expect("table exists");
     handle
         .append_data_file(relative, &bytes, None, None)
         .unwrap();
@@ -789,6 +838,7 @@ fn unsigned_partition_column_round_trips() {
         &datastore,
         CreateTableRequest {
             datastore_name: None,
+            schema_name: None,
             name: "parts".to_string(),
             columns: vec![
                 Column {
@@ -826,6 +876,7 @@ fn insert_files_reach_the_log_only_when_the_transaction_commits() {
         &datastore,
         CreateTableRequest {
             datastore_name: None,
+            schema_name: None,
             name: "pending_insert".to_string(),
             columns: vec![Column {
                 name: "id".to_string(),
@@ -910,20 +961,27 @@ fn table_revision_is_frozen_with_the_transaction_snapshot() {
     let (_database, datastore) = empty_datastore();
     create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
     let before_append = datastore.clone().begin_transaction();
-    let before_revision = before_append.table_revision("t").unwrap();
+    let before_revision = before_append
+        .table_revision(&SchemaQualifiedTableName::in_default_schema("t"))
+        .unwrap();
 
     let new_file = write_ids(dir.path(), "later.parquet", &[40]);
     append(&datastore, "t", &new_file);
     let after_revision = datastore
         .clone()
         .begin_transaction()
-        .table_revision("t")
+        .table_revision(&SchemaQualifiedTableName::in_default_schema("t"))
         .unwrap();
 
     assert_eq!(before_revision.version, 0);
     assert_eq!(after_revision.version, 1);
     assert_eq!(before_revision.identity, after_revision.identity);
-    assert_eq!(before_append.table_revision("t").unwrap(), before_revision);
+    assert_eq!(
+        before_append
+            .table_revision(&SchemaQualifiedTableName::in_default_schema("t"))
+            .unwrap(),
+        before_revision
+    );
 }
 
 /// Appending the same path twice (a replayed flush notification) must not
@@ -948,7 +1006,11 @@ fn append_data_file_is_idempotent_per_path() {
 #[test]
 fn table_handle_for_a_missing_table_is_none() {
     let (_database, datastore) = empty_datastore();
-    assert!(datastore.table_handle("missing").is_none());
+    assert!(
+        datastore
+            .table_handle(&SchemaQualifiedTableName::in_default_schema("missing"))
+            .is_none()
+    );
 }
 
 /// Compaction's commit: the small files' row groups vanish, the merged file's
@@ -978,9 +1040,13 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     )];
     // A losing compacter clones the table out at the version where the inputs
     // are present, before the winning swap lands.
-    let mut loser = datastore.table_handle("t").unwrap();
+    let mut loser = datastore
+        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
+        .unwrap();
     loser.refresh().unwrap();
-    let mut winner = datastore.table_handle("t").unwrap();
+    let mut winner = datastore
+        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
+        .unwrap();
     winner.refresh().unwrap();
     winner.replace_data_files(&removed, &added).unwrap();
     // The loser only discovers the inputs are gone after its CAS conflict +
@@ -1020,7 +1086,9 @@ fn compact_files_merges_small_files_into_one() {
     run_sql(&datastore, "INSERT INTO t VALUES (10), (20), (30)");
     run_sql(&datastore, "INSERT INTO t VALUES (40), (50)");
 
-    let mut table = datastore.table_handle("t").unwrap();
+    let mut table = datastore
+        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
+        .unwrap();
     table.refresh().unwrap();
     let inputs = table.file_refs();
     assert_eq!(inputs.len(), 2, "two inserts wrote two files");
@@ -1041,7 +1109,9 @@ fn compact_files_deletes_uploaded_outputs_when_delta_commit_fails() {
     let (_database, datastore) = empty_datastore();
     create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
 
-    let mut table = datastore.table_handle("t").unwrap();
+    let mut table = datastore
+        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
+        .unwrap();
     table.refresh().unwrap();
     let inputs = table.file_refs();
 
@@ -1079,7 +1149,10 @@ fn pushed_predicate_prunes_latest_files_after_refresh() {
     let mut table = datastore
         .clone()
         .begin_transaction()
-        .table(DEFAULT_DATASTORE_NAME, "t")
+        .table(
+            DEFAULT_DATASTORE_NAME,
+            &SchemaQualifiedTableName::in_default_schema("t"),
+        )
         .unwrap();
     table
         .pushdown_filter(col_eq_filter(0, int_constant(20)))
@@ -1152,7 +1225,13 @@ fn reopened_database_restores_sort_by() {
 
     let reopened = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
 
-    assert_eq!(reopened.table_handle("t").unwrap().sort_by(), ["id"]);
+    assert_eq!(
+        reopened
+            .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
+            .unwrap()
+            .sort_by(),
+        ["id"]
+    );
 }
 
 /// Only committed files exist: after a compaction swap, a leftover input
@@ -1174,7 +1253,7 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
         },
     )];
     datastore
-        .table_handle("t")
+        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
         .unwrap()
         .replace_data_files(&[ObjectPath::new("data.parquet")], &added)
         .unwrap();
@@ -1234,7 +1313,10 @@ fn filter_on_partition_column_prunes_whole_single_partition_file() {
     let mut table = datastore
         .clone()
         .begin_transaction()
-        .table(DEFAULT_DATASTORE_NAME, "t")
+        .table(
+            DEFAULT_DATASTORE_NAME,
+            &SchemaQualifiedTableName::in_default_schema("t"),
+        )
         .unwrap();
     assert_eq!(row_group_count(&datastore, "t", &table), 6);
 
@@ -1257,6 +1339,7 @@ fn table_partitioned_by_name() -> (TempDir, TempDir, Arc<DeltaDatastore>) {
     let dir = TempDir::new().unwrap();
     let request = CreateTableRequest {
         datastore_name: None,
+        schema_name: None,
         name: "p".to_string(),
         columns: vec![
             Column {
@@ -1282,7 +1365,9 @@ fn table_partitioned_by_name() -> (TempDir, TempDir, Arc<DeltaDatastore>) {
 
     write_ids_one_group_each(dir.path(), "keep.parquet", &[1]);
     write_ids_one_group_each(dir.path(), "drop.parquet", &[2, 2, 2]);
-    let mut table = datastore.table_handle("p").unwrap();
+    let mut table = datastore
+        .table_handle(&SchemaQualifiedTableName::in_default_schema("p"))
+        .unwrap();
     table
         .append_data_file(
             ObjectPath::new("keep.parquet"),
@@ -1320,7 +1405,9 @@ fn name_eq(value: &str) -> PartitionEqFilter {
 fn partition_filter_builds_only_the_matching_partitions_files() {
     let (_dir, _database, datastore) = table_partitioned_by_name();
 
-    let mut table = datastore.table_handle("p").unwrap();
+    let mut table = datastore
+        .table_handle(&SchemaQualifiedTableName::in_default_schema("p"))
+        .unwrap();
     table.refresh().unwrap();
     let kept = table.build_scan_view(&[name_eq("keep")]).unwrap();
 
@@ -1333,7 +1420,9 @@ fn partition_filter_builds_only_the_matching_partitions_files() {
 fn no_partition_filter_builds_every_partitions_files() {
     let (_dir, _database, datastore) = table_partitioned_by_name();
 
-    let mut table = datastore.table_handle("p").unwrap();
+    let mut table = datastore
+        .table_handle(&SchemaQualifiedTableName::in_default_schema("p"))
+        .unwrap();
     table.refresh().unwrap();
     let all = table.build_scan_view(&[]).unwrap();
 
@@ -1418,7 +1507,10 @@ fn shredded_docs_datastore(dir: &Path) -> (TempDir, Arc<DeltaDatastore>, TableBi
     let binding = datastore
         .clone()
         .begin_transaction()
-        .table(DEFAULT_DATASTORE_NAME, "docs")
+        .table(
+            DEFAULT_DATASTORE_NAME,
+            &SchemaQualifiedTableName::in_default_schema("docs"),
+        )
         .unwrap();
     (database, datastore, binding)
 }

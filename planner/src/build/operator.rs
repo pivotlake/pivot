@@ -12,19 +12,21 @@ use duckdb_planner::DuckDBTable;
 use duckdb_planner::catalog_provider::OptionalTableWrapper;
 use duckdb_planner::duckdb_bridge::duckdb_types::LimitNodeType;
 use duckdb_planner::handle::{
-    Aggregate as AggregateView, BridgeError, CreateTable as CreateTableView, Filter as FilterView,
-    Insert as InsertView, Limit as LimitView, OrderBy as OrderByView, OrderKey,
-    Projection as ProjectionView, Reset as ResetView, Set as SetView,
-    TableFunctionScan as TableFunctionScanView, TableScan as TableScanView, TopN as TopNView,
-    Values as ValuesView,
+    Aggregate as AggregateView, BridgeError, CreateSchema as CreateSchemaView,
+    CreateTable as CreateTableView, Filter as FilterView, Insert as InsertView, Limit as LimitView,
+    OrderBy as OrderByView, OrderKey, Projection as ProjectionView, Reset as ResetView,
+    Set as SetView, TableFunctionScan as TableFunctionScanView, TableScan as TableScanView,
+    TopN as TopNView, Values as ValuesView,
 };
 
 use super::{BuildCtx, build_scan_columns};
-use crate::catalog::{BoundTable, Column, CreateTableRequest, DuckDBTableAdapter};
+use crate::catalog::{
+    BoundTable, Column, CreateSchemaRequest, CreateTableRequest, DuckDBTableAdapter,
+};
 use crate::expression::{Error as ExpressionError, Expression};
 use crate::operator::{
-    Aggregate, CreateTable, Error as OperatorError, Filter, Input, Insert, Limit, OrderBy,
-    OrderByNode, Projection, SetVariable, TableFunctionScan, TopN, Values,
+    Aggregate, CreateSchema, CreateTable, Error as OperatorError, Filter, Input, Insert, Limit,
+    OrderBy, OrderByNode, Projection, SetVariable, TableFunctionScan, TopN, Values,
 };
 use crate::types::type_from_logical;
 
@@ -180,11 +182,25 @@ impl TableFunctionScan {
     }
 }
 
+impl CreateSchema {
+    pub(crate) fn from_handle(view: CreateSchemaView<'_>) -> Result<CreateSchema, OperatorError> {
+        Ok(CreateSchema {
+            request: CreateSchemaRequest {
+                datastore_name: view.datastore()?,
+                name: view.name()?,
+                if_not_exists: view.if_not_exists()?,
+            },
+            or_replace: view.or_replace()?,
+        })
+    }
+}
+
 impl CreateTable {
     pub(crate) fn from_handle(view: CreateTableView<'_>) -> Result<CreateTable, OperatorError> {
         Ok(CreateTable {
             request: CreateTableRequest {
                 datastore_name: view.datastore()?,
+                schema_name: view.schema()?,
                 name: view.name()?,
                 columns: view
                     .columns()?

@@ -5,6 +5,7 @@ use arrow::util::display::{ArrayFormatter, FormatOptions};
 use axum::Json;
 use axum::extract::State;
 use datastore_delta::DeltaDatastore;
+use planner::catalog::SchemaQualifiedTableName;
 use serde::Serialize;
 
 use super::IntrospectState;
@@ -33,7 +34,7 @@ struct TableOut {
 
 /// BoundTable metadata gathered from the catalog (no row count yet).
 struct TableMeta {
-    name: String,
+    name: SchemaQualifiedTableName,
     location: String,
     columns: Vec<ColumnOut>,
     file_count: usize,
@@ -67,7 +68,7 @@ pub(super) async fn overview(State(state): State<IntrospectState>) -> Json<Overv
     for meta in metas {
         let row_count = count_rows(&state, &meta.name).await;
         tables.push(TableOut {
-            name: meta.name,
+            name: format_table_label(&meta.name),
             location: meta.location,
             columns: meta.columns,
             file_count: meta.file_count,
@@ -118,10 +119,31 @@ fn collect_tables(datastore: &DeltaDatastore) -> Vec<TableMeta> {
         .collect()
 }
 
+/// How a table is labelled in the dashboard: bare in the default schema, where
+/// the qualifier would carry no information, and schema-qualified elsewhere so
+/// equal table names stay distinguishable.
+fn format_table_label(name: &SchemaQualifiedTableName) -> String {
+    if name.schema == planner::DEFAULT_SCHEMA_NAME {
+        name.table.clone()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Escape an identifier for embedding in a double-quoted SQL name. Doubles the
+/// quotes within it; the caller supplies the surrounding pair.
+fn escape_identifier_quotes(name: &str) -> String {
+    name.replace('"', "\"\"")
+}
+
 /// Unfiltered `COUNT(*)` for one table - answered from Parquet footers, so it's
 /// cheap to poll. `None` if the query fails (e.g. the table was just dropped).
-async fn count_rows(state: &IntrospectState, table: &str) -> Option<i64> {
-    let sql = format!("SELECT COUNT(*) FROM \"{}\"", table.replace('"', "\"\""));
+async fn count_rows(state: &IntrospectState, table: &SchemaQualifiedTableName) -> Option<i64> {
+    let sql = format!(
+        "SELECT COUNT(*) FROM \"{}\".\"{}\"",
+        escape_identifier_quotes(&table.schema),
+        escape_identifier_quotes(&table.table)
+    );
     let batches = crate::query_handler::execute_sql(
         state.catalog.clone(),
         state.dispatcher.clone(),

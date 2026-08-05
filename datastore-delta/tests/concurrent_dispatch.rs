@@ -69,6 +69,7 @@ fn make_datastore() -> (TempDir, Arc<DeltaDatastore>) {
     transaction
         .bind_create_table(CreateTableRequest {
             datastore_name: None,
+            schema_name: None,
             name: "t".to_string(),
             columns: vec![
                 Column {

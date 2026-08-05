@@ -41,6 +41,7 @@ use tracing::{error, info, warn};
 
 use crate::store::ObjectPath;
 use crate::{CatalogTable, DeltaDatastore, FileRef, scalar_values_equal};
+use planner::catalog::SchemaQualifiedTableName;
 
 /// Rows per row group in a merged file.
 const ROW_GROUP_ROWS: usize = 128 * 1024;
@@ -145,7 +146,7 @@ impl Compacter {
     /// the loop.)
     pub async fn compact_all(&self) {
         for (name, table) in self.datastore.tables() {
-            self.compact_table(name, table).await;
+            self.compact_table(&name, table).await;
         }
     }
 
@@ -155,9 +156,9 @@ impl Compacter {
     /// Each batch is capped at roughly one output file's worth, so a long
     /// backlog (e.g. after a restart) is worked off with bounded memory.
     /// Errors are logged and end the table's round, the next poll retries.
-    async fn compact_table(&self, name: String, mut table: CatalogTable) {
+    async fn compact_table(&self, name: &SchemaQualifiedTableName, mut table: CatalogTable) {
         if let Err(e) = table.refresh() {
-            warn!(table = name, error = %e, "compaction: table refresh failed");
+            warn!(table = %name, error = %e, "compaction: table refresh failed");
             return;
         }
         while let Some(inputs) = self.next_batch(&table) {
@@ -173,15 +174,19 @@ impl Compacter {
                     // query's snapshot reads the merged file instead of the
                     // swapped-out inputs.
                     table = committed;
-                    info!(table = name, files = merged.len(), "compacted batch");
+                    info!(
+                        table = %name,
+                        files = merged.len(),
+                        "compacted batch"
+                    );
                     self.datastore.publish_table(table.clone());
                 }
                 Ok(Err(e)) => {
-                    error!(table = name, error = %e, "compaction merge failed");
+                    error!(table = %name, error = %e, "compaction merge failed");
                     return;
                 }
                 Err(e) => {
-                    error!(table = name, error = %e, "compaction job panicked");
+                    error!(table = %name, error = %e, "compaction job panicked");
                     return;
                 }
             }
@@ -294,6 +299,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
     use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
     use parquet::arrow::ArrowWriter;
+    use planner::catalog::SchemaQualifiedTableName;
     use std::path::Path;
 
     const RING_BUFFERS: usize = 64 * 1024 * 1024 / BUFFER_SIZE;
@@ -342,6 +348,7 @@ mod tests {
         };
         let request = CreateTableRequest {
             datastore_name: None,
+            schema_name: None,
             name: name.to_string(),
             columns: vec![Column {
                 name: "Timestamp".to_string(),
@@ -370,7 +377,9 @@ mod tests {
     /// cloned-out handle, so the datastore's own copy lags until a refresh), then
     /// return its current row groups.
     fn fresh_parquet(datastore: &DeltaDatastore, name: &str) -> Arc<ParquetTable> {
-        let mut table = datastore.table_handle(name).expect("table exists");
+        let mut table = datastore
+            .table_handle(&SchemaQualifiedTableName::in_default_schema(name))
+            .expect("table exists");
         table.refresh().expect("manifest reload");
         table.build_scan_view(&[]).expect("build scan view")
     }
@@ -399,11 +408,22 @@ mod tests {
 
         let datastore =
             DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
-        create_table(&datastore, dispatch.dispatcher(), "events", None);
-        assert_eq!(datastore.table_files("events").unwrap().len(), 3);
+        create_table(
+            &datastore,
+            dispatch.dispatcher(),
+            "events",
+            Some(Path::new("events")),
+        );
+        assert_eq!(
+            datastore
+                .table_files(&SchemaQualifiedTableName::in_default_schema("events"))
+                .unwrap()
+                .len(),
+            3
+        );
 
         let total: u64 = datastore
-            .table_files("events")
+            .table_files(&SchemaQualifiedTableName::in_default_schema("events"))
             .unwrap()
             .iter()
             .map(|f| f.size)
@@ -416,13 +436,19 @@ mod tests {
         );
         run_one_sweep(&compacter);
 
-        assert_eq!(datastore.table_files("events").unwrap().len(), 1);
+        assert_eq!(
+            datastore
+                .table_files(&SchemaQualifiedTableName::in_default_schema("events"))
+                .unwrap()
+                .len(),
+            1
+        );
         let parquet = fresh_parquet(&datastore, "events");
         assert_eq!(parquet.row_groups().len(), 1);
         assert_eq!(parquet.row_groups()[0].num_rows, 9);
         assert!(
             datastore
-                .table_files("events")
+                .table_files(&SchemaQualifiedTableName::in_default_schema("events"))
                 .unwrap()
                 .iter()
                 .all(|f| f.path.as_str().starts_with("pivot-"))
@@ -448,11 +474,17 @@ mod tests {
 
         let datastore =
             DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
-        // No `path` option: the table lives at `events` under the root.
-        create_table(&datastore, dispatch.dispatcher(), "events", None);
+        // A relative `path`: the table lives at `events` under the store root,
+        // rather than at an absolute path of its own.
+        create_table(
+            &datastore,
+            dispatch.dispatcher(),
+            "events",
+            Some(Path::new("events")),
+        );
 
         let total: u64 = datastore
-            .table_files("events")
+            .table_files(&SchemaQualifiedTableName::in_default_schema("events"))
             .unwrap()
             .iter()
             .map(|f| f.size)
@@ -467,7 +499,9 @@ mod tests {
 
         // One merged object replaced the two inputs, in the store and in the
         // datastore's table view.
-        let files = datastore.table_files("events").unwrap();
+        let files = datastore
+            .table_files(&SchemaQualifiedTableName::in_default_schema("events"))
+            .unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].path.as_str().starts_with("pivot-"));
         let on_disk: Vec<_> = std::fs::read_dir(&table_dir)
@@ -508,14 +542,19 @@ mod tests {
         // "Writer" process: creates the table over the pre-written files.
         let writer_datastore =
             DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
-        create_table(&writer_datastore, dispatch.dispatcher(), "events", None);
+        create_table(
+            &writer_datastore,
+            dispatch.dispatcher(),
+            "events",
+            Some(Path::new("events")),
+        );
 
         // "Compacter" process: a separate datastore over the same root. Its poll
         // round reloads the table from the log before scanning.
         let compacter_datastore =
             DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         let total: u64 = writer_datastore
-            .table_files("events")
+            .table_files(&SchemaQualifiedTableName::in_default_schema("events"))
             .unwrap()
             .iter()
             .map(|f| f.size)
@@ -534,12 +573,18 @@ mod tests {
         assert_eq!(parquet.row_groups()[0].num_rows, 9);
         assert!(
             writer_datastore
-                .table_files("events")
+                .table_files(&SchemaQualifiedTableName::in_default_schema("events"))
                 .unwrap()
                 .iter()
                 .all(|f| f.path.as_str().starts_with("pivot-"))
         );
-        assert_eq!(writer_datastore.table_files("events").unwrap().len(), 1);
+        assert_eq!(
+            writer_datastore
+                .table_files(&SchemaQualifiedTableName::in_default_schema("events"))
+                .unwrap()
+                .len(),
+            1
+        );
 
         dispatch.exit();
     }

@@ -5,7 +5,7 @@ use insta::assert_snapshot;
 use planner::catalog::{BoundTable, CatalogTransaction, Column, TableReference, TableRevision};
 use planner::expression::TableFilter;
 use planner::types::Type;
-use planner::{DEFAULT_DATASTORE_NAME, Planner};
+use planner::{DEFAULT_DATASTORE_NAME, DEFAULT_SCHEMA_NAME, Planner};
 
 #[allow(unused_imports)]
 use crate::common::*;
@@ -37,6 +37,7 @@ impl BoundTable for RecordingTable {
     fn table_reference(&self) -> TableReference {
         TableReference {
             datastore: DEFAULT_DATASTORE_NAME.to_string(),
+            schema: DEFAULT_SCHEMA_NAME.to_string(),
             table: "t".to_string(),
         }
     }
@@ -82,13 +83,19 @@ struct SingleTableCatalog {
 }
 
 impl CatalogTransaction for SingleTableCatalog {
-    fn bind_table(&self, _datastore: &str, name: &str) -> Option<Box<dyn BoundTable>> {
-        (name == self.name).then(|| Box::new(self.table.clone()) as Box<dyn BoundTable>)
+    // The one table lives in the default schema, so that is the only schema
+    // this catalog defines.
+    fn does_schema_exist(&self, _datastore: &str, schema: &str) -> bool {
+        schema == DEFAULT_SCHEMA_NAME
     }
 
-    fn table_revision(&self, datastore: &str, name: &str) -> Option<TableRevision> {
-        (name == self.name).then(|| TableRevision {
-            identity: format!("{datastore}:{name}"),
+    fn bind_table(&self, reference: &TableReference) -> Option<Box<dyn BoundTable>> {
+        (reference.table == self.name).then(|| Box::new(self.table.clone()) as Box<dyn BoundTable>)
+    }
+
+    fn table_revision(&self, reference: &TableReference) -> Option<TableRevision> {
+        (reference.table == self.name).then(|| TableRevision {
+            identity: format!("{}:{}", reference.datastore, reference.table),
             version: 0,
         })
     }

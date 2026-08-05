@@ -68,6 +68,7 @@ impl PlanNode {
             self.operator,
             Operator::Insert(_)
                 | Operator::CreateTable(_)
+                | Operator::CreateSchema(_)
                 | Operator::SetVariable(_)
                 | Operator::TableFunctionScan(_)
         ) && self.inputs.iter().all(PlanNode::is_cacheable)
@@ -83,10 +84,7 @@ impl PlanNode {
             Operator::Input(input) => {
                 let table_reference = input.table.table_reference();
                 let table_revision = input.table.table_revision();
-                transaction
-                    .table_revision(&table_reference.datastore, &table_reference.table)
-                    .as_ref()
-                    == Some(&table_revision)
+                transaction.table_revision(&table_reference).as_ref() == Some(&table_revision)
             }
             _ => true,
         };

@@ -30,7 +30,7 @@ use datastore_delta::DeltaDatastore;
 use dispatch::{BUFFER_SIZE, Dispatch, values_input};
 use flate2::read::MultiGzDecoder;
 use parquet_variant_compute::{VariantArray, json_to_variant};
-use planner::catalog::{Column, CreateTableRequest};
+use planner::catalog::{Column, CreateTableRequest, TableReference};
 use planner::types::{Type, physical_arrow_type};
 
 /// Documents per `RecordBatch`. Each item converts on a worker, so this is the
@@ -144,6 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     creation
         .bind_create_table(CreateTableRequest {
             datastore_name: None,
+            schema_name: None,
             name: TABLE.to_string(),
             columns: vec![Column {
                 name: args.column.clone(),
@@ -177,7 +178,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // when the transaction commits.
         let transaction = catalog.begin_transaction();
         let table = transaction
-            .bind_table(DEFAULT_DATASTORE_NAME, TABLE)
+            .bind_table(&TableReference {
+                datastore: DEFAULT_DATASTORE_NAME.to_string(),
+                schema: planner::DEFAULT_SCHEMA_NAME.to_string(),
+                table: TABLE.to_string(),
+            })
             .expect("the table was just created");
         table
             .compile_insert(batches, dispatch.dispatcher())?

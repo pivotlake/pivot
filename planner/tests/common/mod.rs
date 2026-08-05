@@ -17,7 +17,7 @@ use planner::catalog::{
     BoundTable, CatalogTransaction, Column, DynamicScanPredicate, TableReference, TableRevision,
 };
 use planner::types::Type;
-use planner::{DEFAULT_DATASTORE_NAME, Planner};
+use planner::{DEFAULT_DATASTORE_NAME, DEFAULT_SCHEMA_NAME, Planner};
 
 #[derive(Clone, Debug)]
 struct TestTable {
@@ -101,6 +101,7 @@ impl TestTable {
         TestTable {
             reference: TableReference {
                 datastore: DEFAULT_DATASTORE_NAME.to_string(),
+                schema: DEFAULT_SCHEMA_NAME.to_string(),
                 table: name.to_string(),
             },
             _dir: Arc::new(dir),
@@ -224,15 +225,26 @@ struct TestTransaction {
 }
 
 impl CatalogTransaction for TestTransaction {
-    fn bind_table(&self, _datastore: &str, name: &str) -> Option<Box<dyn BoundTable>> {
-        self.tables.get(name).cloned().map(|t| Box::new(t) as _)
+    // Every test table lives in the default schema, so that is the only schema
+    // this catalog defines.
+    fn does_schema_exist(&self, _datastore: &str, schema: &str) -> bool {
+        schema == DEFAULT_SCHEMA_NAME
     }
 
-    fn table_revision(&self, datastore: &str, name: &str) -> Option<TableRevision> {
-        self.tables.contains_key(name).then(|| TableRevision {
-            identity: format!("{datastore}:{name}"),
-            version: 0,
-        })
+    fn bind_table(&self, reference: &TableReference) -> Option<Box<dyn BoundTable>> {
+        self.tables
+            .get(&reference.table)
+            .cloned()
+            .map(|t| Box::new(t) as _)
+    }
+
+    fn table_revision(&self, reference: &TableReference) -> Option<TableRevision> {
+        self.tables
+            .contains_key(&reference.table)
+            .then(|| TableRevision {
+                identity: format!("{}:{}", reference.datastore, reference.table),
+                version: 0,
+            })
     }
 }
 

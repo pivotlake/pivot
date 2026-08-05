@@ -12,7 +12,7 @@ use tempfile::TempDir;
 use datastore::DatastoreTransaction;
 use datastore_delta::parquet::ParquetTable;
 use dispatch::{DataFlowDispatcher, Dispatch};
-use planner::catalog::Result as CatalogResult;
+use planner::catalog::{Result as CatalogResult, SchemaQualifiedTableName};
 
 // The process-wide dispatcher, created on the first `init*` call.
 // static DISPATCHER: OnceLock<Mutex<DataFlowDispatcher>> = OnceLock::new();
@@ -131,7 +131,9 @@ pub fn current_parquet(
     datastore: &datastore_delta::DeltaDatastore,
     name: &str,
 ) -> Arc<ParquetTable> {
-    let mut table = datastore.table_handle(name).expect("table exists");
+    let mut table = datastore
+        .table_handle(&SchemaQualifiedTableName::in_default_schema(name))
+        .expect("table exists");
     table.refresh().expect("manifest reload");
     table.build_scan_view(&[]).expect("build scan view")
 }
@@ -243,6 +245,7 @@ pub fn write_parquet_files(
     creation
         .bind_create_table(CreateTableRequest {
             datastore_name: None,
+            schema_name: None,
             name: "written".to_string(),
             columns,
             options,
@@ -258,7 +261,10 @@ pub fn write_parquet_files(
 
     let insert = datastore.begin_transaction();
     let table = insert
-        .bind_table(planner::DEFAULT_DATASTORE_NAME, "written")
+        .bind_table(
+            planner::DEFAULT_DATASTORE_NAME,
+            &SchemaQualifiedTableName::in_default_schema("written"),
+        )
         .expect("the table was created");
     let rows = dispatch::values_input(dispatch, batches).record_batches();
     table

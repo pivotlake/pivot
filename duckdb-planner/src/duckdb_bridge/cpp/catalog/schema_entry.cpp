@@ -85,7 +85,7 @@ PivotSchemaCatalogEntry::PivotSchemaCatalogEntry(Catalog &catalog, CreateSchemaI
 // snapshot (never from the live catalog, which a background refresh may be
 // updating concurrently). A lookup without one is a bridge bug, never a
 // legitimate binder probe: the only statements run outside `extract_plan` are
-// the ATTACH/USE at context construction, which bind no pivot entries.
+// the ATTACHes at context construction, which bind no pivot entries.
 static const ::TransactionContext &pivot_transaction_ctx(duckdb::Catalog &catalog) {
 	auto &storage_info = PivotStorageInfo::Get(catalog.GetAttached().GetDatabase());
 	if (!storage_info.current_transaction) {
@@ -167,9 +167,11 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
 		return nullptr;
 	}
 
-	// A base-table reference: resolve it through the transaction's snapshot.
+	// A base-table reference: resolve it through the transaction's snapshot,
+	// within this schema. The catalog only hands out an entry for a schema the
+	// datastore defines, so `name` here is always one of its own schemas.
 	auto result = catalog_get_table(
-	    pivot_transaction_ctx(ParentCatalog()), ParentCatalog().GetName(), table_name);
+	    pivot_transaction_ctx(ParentCatalog()), ParentCatalog().GetName(), this->name, table_name);
 
 	if (!result.found) {
 		return nullptr;

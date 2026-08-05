@@ -59,7 +59,7 @@ url = { workspace = true }
 # standard `_delta_log` through the reference Arrow/object-store engine.
 delta_kernel = { version = "0.25.0", features = ["arrow-conversion", "internal-api"] }
 delta_kernel_default_engine = { version = "0.25.0", features = ["rustls", "arrow-58"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 # Optional, behind the `test-support` feature: the in-Docker object-store test
 # harness exposed as `catalog::test_support`. testcontainers brings up MinIO;
 # tempfile backs the local() backend. (The harness's other needs, ureq,

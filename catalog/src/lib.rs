@@ -21,8 +21,8 @@ use async_trait::async_trait;
 use datastore::DatastoreTransaction;
 use planner::TableFunction;
 use planner::catalog::{
-    BoundTable, CatalogTransaction, CreateTableRequest, Error as CatalogError,
-    Result as CatalogResult, TableCreation, TableRevision,
+    BoundTable, CatalogTransaction, CreateSchemaRequest, CreateTableRequest, Error as CatalogError,
+    Result as CatalogResult, SchemaCreation, TableCreation, TableReference, TableRevision,
 };
 
 /// One named data source served by pivotdb. Re-exported from `datastore`, where
@@ -173,14 +173,19 @@ impl PivotTransaction {
 
 #[async_trait]
 impl CatalogTransaction for PivotTransaction {
-    fn bind_table(&self, datastore: &str, name: &str) -> Option<Box<dyn BoundTable>> {
-        self.find_or_create_sub_transaction(datastore)?
-            .bind_table(datastore, name)
+    fn does_schema_exist(&self, datastore: &str, schema: &str) -> bool {
+        self.find_or_create_sub_transaction(datastore)
+            .is_some_and(|sub_transaction| sub_transaction.does_schema_exist(schema))
     }
 
-    fn table_revision(&self, datastore: &str, name: &str) -> Option<TableRevision> {
-        self.find_or_create_sub_transaction(datastore)?
-            .table_revision(name)
+    fn bind_table(&self, reference: &TableReference) -> Option<Box<dyn BoundTable>> {
+        self.find_or_create_sub_transaction(&reference.datastore)?
+            .bind_table(&reference.datastore, &reference.schema_qualified_name())
+    }
+
+    fn table_revision(&self, reference: &TableReference) -> Option<TableRevision> {
+        self.find_or_create_sub_transaction(&reference.datastore)?
+            .table_revision(&reference.schema_qualified_name())
     }
 
     fn bind_table_function(&self, datastore: &str, name: &str) -> Option<Box<dyn TableFunction>> {
@@ -210,6 +215,26 @@ impl CatalogTransaction for PivotTransaction {
                 CatalogError::Other(Box::new(Error::UnknownDatastore(target.clone())))
             })?;
         sub_transaction.bind_create_table(request)
+    }
+
+    fn bind_create_schema(
+        &self,
+        request: CreateSchemaRequest,
+    ) -> CatalogResult<Box<dyn SchemaCreation>> {
+        // DuckDB keeps an unqualified CREATE SCHEMA's catalog unresolved in the
+        // logical operator and normally applies the current database during
+        // physical execution. Pivot executes the logical operator itself, so it
+        // applies the same default here.
+        let target = request
+            .datastore_name
+            .clone()
+            .unwrap_or_else(|| self.default_name.clone());
+        let sub_transaction = self
+            .find_or_create_sub_transaction(&target)
+            .ok_or_else(|| {
+                CatalogError::Other(Box::new(Error::UnknownDatastore(target.clone())))
+            })?;
+        sub_transaction.bind_create_schema(request)
     }
 
     /// Commit every sub-transaction the query opened, awaiting each datastore's own

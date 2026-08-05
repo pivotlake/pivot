@@ -58,13 +58,56 @@ pub struct Column {
     pub col_type: Type,
 }
 
-/// One table name as DuckDB resolved it: the datastore/database plus the table
-/// name inside that datastore. Plan-cache dependencies use the fully-qualified
-/// pair so equal table names in different datastores never collide.
+/// A table name qualified by the schema holding it, with no datastore
+/// qualifier: how one datastore names its own tables. A [`TableReference`] is
+/// this plus the datastore that owns it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SchemaQualifiedTableName {
+    pub schema: String,
+    pub table: String,
+}
+
+impl SchemaQualifiedTableName {
+    pub fn new(schema: impl Into<String>, table: impl Into<String>) -> Self {
+        Self {
+            schema: schema.into(),
+            table: table.into(),
+        }
+    }
+
+    /// The name in the default schema: for a caller that names a table with no
+    /// schema of its own (an embedded API, a test).
+    pub fn in_default_schema(table: impl Into<String>) -> Self {
+        Self::new(crate::DEFAULT_SCHEMA_NAME, table)
+    }
+}
+
+/// The diagnostic form, for error text and UI labels. Not a SQL identifier:
+/// nothing is quoted or escaped, so a name containing a dot or a quote renders
+/// ambiguously. Build SQL from the two fields separately.
+impl std::fmt::Display for SchemaQualifiedTableName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.schema, self.table)
+    }
+}
+
+/// One table name as DuckDB resolved it: the datastore/database, the schema
+/// inside it, and the table name inside that schema. Plan-cache dependencies use
+/// the fully-qualified triple so equal table names in different schemas or
+/// datastores never collide.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableReference {
     pub datastore: String,
+    pub schema: String,
     pub table: String,
+}
+
+impl TableReference {
+    /// This reference with its datastore qualifier dropped: the name the owning
+    /// datastore resolves the table by.
+    pub fn schema_qualified_name(&self) -> SchemaQualifiedTableName {
+        SchemaQualifiedTableName::new(self.schema.clone(), self.table.clone())
+    }
 }
 
 /// The immutable identity and snapshot version of one table.
@@ -85,12 +128,50 @@ pub struct TableRevision {
 ///
 /// `options` carries the `WITH (...)` clause verbatim so the target datastore
 /// implementation can decide what to do with backend-specific keys.
+///
+/// `datastore_name` and `schema_name` are the qualifiers this create targets.
+/// DuckDB resolves both while binding the statement, so in practice each is
+/// `Some` even for an unqualified `CREATE TABLE t`, which arrives carrying the
+/// current database and schema. They stay optional so a caller building a
+/// request by hand (an embedded API, a test) can leave the choice to the
+/// catalog, which reads a `None` as the default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateTableRequest {
     pub datastore_name: Option<String>,
+    pub schema_name: Option<String>,
     pub name: String,
     pub columns: Vec<Column>,
     pub options: HashMap<String, String>,
+    pub if_not_exists: bool,
+}
+
+impl CreateTableRequest {
+    /// The name the target datastore will register the new table under: the
+    /// schema the statement named, or the default when it named none.
+    pub fn schema_qualified_name(&self) -> SchemaQualifiedTableName {
+        SchemaQualifiedTableName::new(
+            self.schema_name
+                .as_deref()
+                .unwrap_or(crate::DEFAULT_SCHEMA_NAME),
+            self.name.clone(),
+        )
+    }
+}
+
+/// Description of a schema to be created, produced by translating a
+/// `CREATE SCHEMA` statement and consumed by
+/// [`CatalogTransaction::bind_create_schema`], which routes it to the target
+/// datastore.
+///
+/// `datastore_name` is the qualifier the statement wrote (`CREATE SCHEMA db.s`),
+/// or `None` when unqualified, which routes to the default datastore. Unlike a
+/// `CREATE TABLE`, this really is `None` for an unqualified statement: naming a
+/// schema to create involves no lookup of an existing one, so DuckDB has
+/// nothing to resolve the qualifier against and leaves it as written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateSchemaRequest {
+    pub datastore_name: Option<String>,
+    pub name: String,
     pub if_not_exists: bool,
 }
 
@@ -103,17 +184,25 @@ pub struct CreateTableRequest {
 /// pending writes here until commit.
 #[async_trait]
 pub trait CatalogTransaction: Debug + Send + Sync {
-    /// Resolve `name` in datastore `datastore` to a fresh, independently-mutable
-    /// [`BoundTable`], or `None` if that datastore holds no such table.
-    fn bind_table(&self, datastore: &str, name: &str) -> Option<Box<dyn BoundTable>>;
+    /// Whether `datastore` defines a schema named `schema` in this transaction's
+    /// frozen snapshot. Asked before any table in that schema is resolved, so a
+    /// reference to a schema that does not exist is reported as such rather than
+    /// as a missing table. `false` for a datastore this transaction doesn't know.
+    fn does_schema_exist(&self, datastore: &str, schema: &str) -> bool;
 
-    /// The identity and version of `name` in this transaction's frozen
-    /// `datastore` snapshot, or `None` if no such table exists. This must return
-    /// `Some` for every table returned by [`bind_table`](Self::bind_table).
-    fn table_revision(&self, datastore: &str, name: &str) -> Option<TableRevision>;
+    /// Resolve `reference` to a fresh, independently-mutable [`BoundTable`], or
+    /// `None` if its datastore holds no such table in that schema.
+    fn bind_table(&self, reference: &TableReference) -> Option<Box<dyn BoundTable>>;
+
+    /// The identity and version of `reference` in this transaction's frozen
+    /// snapshot of its datastore, or `None` if no such table exists. This must
+    /// return `Some` for every table returned by [`bind_table`](Self::bind_table).
+    fn table_revision(&self, reference: &TableReference) -> Option<TableRevision>;
 
     /// A backend-specific table-valued function `name` in datastore `datastore`,
-    /// or `None`.
+    /// or `None`. Table functions belong to the datastore rather than to one of
+    /// its schemas: they are code the backend contributes, not stored objects, so
+    /// every schema of that datastore resolves the same set.
     fn bind_table_function(&self, _datastore: &str, _name: &str) -> Option<Box<dyn TableFunction>> {
         None
     }
@@ -130,6 +219,16 @@ pub trait CatalogTransaction: Debug + Send + Sync {
     fn bind_create_table(&self, _request: CreateTableRequest) -> Result<Box<dyn TableCreation>> {
         Err(Box::<dyn std::error::Error + Send + Sync>::from(
             "this catalog does not support CREATE TABLE",
+        )
+        .into())
+    }
+
+    /// Resolve a `CREATE SCHEMA` by routing to the datastore
+    /// [`CreateSchemaRequest::datastore_name`] names (the default when
+    /// unqualified) and deferring to that datastore's own `bind_create_schema`.
+    fn bind_create_schema(&self, _request: CreateSchemaRequest) -> Result<Box<dyn SchemaCreation>> {
+        Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "this catalog does not support CREATE SCHEMA",
         )
         .into())
     }
@@ -156,6 +255,22 @@ pub trait CatalogTransaction: Debug + Send + Sync {
 pub trait TableCreation: Send + Sync {
     /// Build the dataflow that fetches the new table's file footers over the pool
     /// and stages the completed creation for the transaction's commit.
+    fn compile(&self, dispatcher: &DataFlowDispatcher) -> Result<RecordBatchOperatorSpec>;
+}
+
+/// A resolved `CREATE SCHEMA`, bound to its target datastore and ready to be
+/// compiled into the dataflow that creates it, exactly as [`TableCreation`] is
+/// for a table.
+///
+/// A schema has no data to read, so the dataflow this compiles to does nothing
+/// but stage the creation. It exists so that the catalog changes when the
+/// statement *runs* rather than when it is planned: resolving and compiling a
+/// statement must leave the catalog untouched, or merely planning one (to
+/// report an error, to render `EXPLAIN`) would create the schema. Durable
+/// creation belongs to [`CatalogTransaction::commit`], as it does for a table.
+pub trait SchemaCreation: Send + Sync {
+    /// Build the dataflow that stages this creation for the transaction's
+    /// commit. It emits no rows.
     fn compile(&self, dispatcher: &DataFlowDispatcher) -> Result<RecordBatchOperatorSpec>;
 }
 
@@ -361,8 +476,22 @@ pub struct DuckDBTransactionAdapter {
 }
 
 impl DuckDBTransaction for DuckDBTransactionAdapter {
-    fn bind_table(&self, datastore: &str, name: &str) -> Option<Box<dyn DuckDBTable>> {
-        let table = self.transaction.bind_table(datastore, name)?;
+    fn does_schema_exist(&self, datastore: &str, schema: &str) -> bool {
+        self.transaction.does_schema_exist(datastore, schema)
+    }
+
+    fn bind_table(
+        &self,
+        datastore: &str,
+        schema: &str,
+        name: &str,
+    ) -> Option<Box<dyn DuckDBTable>> {
+        let reference = TableReference {
+            datastore: datastore.to_string(),
+            schema: schema.to_string(),
+            table: name.to_string(),
+        };
+        let table = self.transaction.bind_table(&reference)?;
         Some(Box::new(DuckDBTableAdapter { table }))
     }
 

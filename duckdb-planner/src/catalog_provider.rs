@@ -91,12 +91,20 @@ pub trait DuckDBBind {
 /// plan binds comes from one consistent view of the catalog. Only names that
 /// are static registry (scalar functions) still resolve through [`DuckDBBind`].
 pub trait DuckDBTransaction: Send + Sync {
-    /// Given a table name in datastore `datastore` (the DuckDB database qualifier),
-    /// return a table/object that implements [`DuckDBTable`] with column
-    /// definitions, resolved against that datastore's snapshot. Returns `None`
-    /// if the table doesn't exist. Single-datastore transactions ignore
-    /// `datastore`; a composite over several datastores routes by it.
-    fn bind_table(&self, datastore: &str, name: &str) -> Option<Box<dyn DuckDBTable>>;
+    /// Whether datastore `datastore` defines a schema named `schema`. The bridge
+    /// asks this when the binder looks a schema up, before any table inside it is
+    /// resolved, so a reference into a schema that does not exist fails as an
+    /// unknown schema rather than as an unknown table.
+    fn does_schema_exist(&self, datastore: &str, schema: &str) -> bool;
+
+    /// Given a table name in schema `schema` of datastore `datastore` (the
+    /// DuckDB database qualifier), return a table/object that implements
+    /// [`DuckDBTable`] with column definitions, resolved against that
+    /// datastore's snapshot. Returns `None` if the table doesn't exist.
+    /// Single-datastore transactions ignore `datastore`; a composite over
+    /// several datastores routes by it.
+    fn bind_table(&self, datastore: &str, schema: &str, name: &str)
+    -> Option<Box<dyn DuckDBTable>>;
 
     /// Given a function name in datastore `datastore`, return its binding
     /// signature, or `None` if that datastore has no such table function. The
@@ -168,12 +176,24 @@ impl TransactionContext {
     }
 }
 
+/// Whether `datastore` defines `schema`, answered from the transaction's
+/// snapshot. Called from `PivotCatalog::LookupSchema` before it materializes a
+/// schema entry.
+pub(crate) fn catalog_does_schema_exist(
+    transaction: &TransactionContext,
+    datastore: &str,
+    schema: &str,
+) -> bool {
+    transaction.transaction.does_schema_exist(datastore, schema)
+}
+
 pub(crate) fn catalog_get_table(
     transaction: &TransactionContext,
     datastore: &str,
+    schema: &str,
     name: &str,
 ) -> CatalogGetTableResult {
-    match transaction.transaction.bind_table(datastore, name) {
+    match transaction.transaction.bind_table(datastore, schema, name) {
         Some(table) => {
             let columns = table.duckdb_typed_columns();
             CatalogGetTableResult {

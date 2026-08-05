@@ -7,7 +7,21 @@
 #include "duckdb-planner/src/duckdb_bridge/mod.rs.h"
 
 class PivotCatalog : public duckdb::Catalog {
-	duckdb::unique_ptr<PivotSchemaCatalogEntry> main_schema;
+	// The schema entries materialized by lookups so far, keyed by schema name.
+	// Pivot has no static schema list: which schemas exist is answered per
+	// lookup by the datastore, through the transaction being planned. An entry
+	// is created the first time a schema resolves and then kept, because
+	// DuckDB's binder holds plain references to it for the rest of the plan.
+	// Planning is single-threaded per context, so the map needs no lock.
+	duckdb::unordered_map<std::string, duckdb::unique_ptr<PivotSchemaCatalogEntry>> schemas;
+
+	// The entry for `name`, creating it on first resolution.
+	PivotSchemaCatalogEntry &FindOrCreateSchema(const std::string &name);
+
+	// Whether this datastore defines `name`, asked of the datastore through the
+	// transaction currently being planned.
+	bool DoesSchemaExist(const std::string &name);
+
 public:
 	const CatalogContext *catalog_ctx;
 

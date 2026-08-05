@@ -81,7 +81,6 @@ mod profiler;
 mod scan;
 mod stats;
 
-use crate::operations::nullary::OneShotNullaryFactory;
 use crate::waker::{WakerSet, WorkerWaker};
 use crate::worker::Worker;
 pub use api::*;
@@ -116,9 +115,9 @@ pub use operations::{
     CountValidSlot, Distinct, Dynamic, DynamicFilterSlot, Fold, GroupLimit,
     HashOnlyIntKeyExtractor, IntCell, IntKeyExtractor, IntPairKeyExtractor, IntRead,
     IntStrKeyExtractor, Max, MaxSlot, Min, MinSlot, NoRead, Nullary, NullaryFactory,
-    NullaryOperatorFactory, OpTuple, Operator, OrderBy, Read, Result as OperatorResult,
-    RowKeyExtractor, RowKeySchema, StrMax, StrMin, StrRead, StringKeyExtractor, Sum, SumSlot,
-    WideSum,
+    NullaryOperatorFactory, OneShotNullaryFactory, OpTuple, Operator, OrderBy, Read,
+    Result as OperatorResult, RowKeyExtractor, RowKeySchema, StrMax, StrMin, StrRead,
+    StringKeyExtractor, Sum, SumSlot, WideSum,
 };
 pub use operations::{
     Consumer, DefaultUnaryFactory, MapFactory, Outputter, PipelineBreaker,
@@ -252,7 +251,9 @@ impl DataFlowDispatcher {
     {
         let spec = OperatorSpec::new(
             self.clone(),
-            std::iter::once(NullaryOperatorFactory::new(OneShotNullaryFactory::new(f))),
+            std::iter::once(NullaryOperatorFactory::new(OneShotNullaryFactory::new(
+                move || Some(f()),
+            ))),
         );
         let mut results = spec.collect()?;
         Ok(results
@@ -273,7 +274,7 @@ impl DataFlowDispatcher {
     {
         let factories = (0..self.worker_count()).map(|_| {
             let f = f.clone();
-            NullaryOperatorFactory::new(OneShotNullaryFactory::new(f))
+            NullaryOperatorFactory::new(OneShotNullaryFactory::new(move || Some(f())))
         });
         OperatorSpec::new(self.clone(), factories)
             .collect()

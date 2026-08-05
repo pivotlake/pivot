@@ -32,7 +32,7 @@ impl DummyScan {
         dispatcher: &DataFlowDispatcher,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         // One nullary per worker sharing a flag, so exactly one emits the single
-        // dummy row the parent projection runs over (mirrors `CreateTable`).
+        // dummy row the parent projection runs over.
         let emitted = Arc::new(AtomicBool::new(false));
         Ok(RecordBatchOperatorSpec::from_nullary(
             dispatcher,
