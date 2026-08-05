@@ -3532,6 +3532,7 @@ version = "58.0.0"
 dependencies = [
  "arrow-schema 58.0.0",
  "chrono",
+ "foldhash",
  "half",
  "indexmap 2.14.0",
  "simdutf8",
@@ -3545,6 +3546,7 @@ dependencies = [
  "arrow 58.0.0",
  "arrow-schema 58.0.0",
  "chrono",
+ "foldhash",
  "half",
  "indexmap 2.14.0",
  "parquet-variant",
