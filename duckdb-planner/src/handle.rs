@@ -34,7 +34,7 @@ use crate::types::{BoundLogicalType, ScalarValue};
 /// objects. Reaching one means a shape assumption in the plan walk was wrong;
 /// the query fails with this message instead of the process aborting.
 #[derive(Debug, thiserror::Error)]
-#[error("DuckDB plan walk failed: {0}")]
+#[error("plan walk failed: {0}")]
 pub struct BridgeError(pub String);
 
 impl From<cxx::Exception> for BridgeError {

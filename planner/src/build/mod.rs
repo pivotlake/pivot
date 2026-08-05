@@ -364,7 +364,7 @@ fn build_join(
     if probe_key_type != build_key_type {
         return Err(OperatorError::Unsupported(format!(
             "join key types differ: {probe_key_type:?} vs {build_key_type:?} \
-             (DuckDB casts both sides to a common type, so this plan shape is unexpected)"
+             (the planner casts both sides to a common type, so this plan shape is unexpected)"
         )));
     }
 
