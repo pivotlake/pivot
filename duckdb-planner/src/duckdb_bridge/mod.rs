@@ -170,7 +170,8 @@ pub mod ffi {
         /// pushed-down filter conditions). Read via `expr_list_*`.
         type ExpressionList;
         /// A DuckDB `Value` (a query constant or a table-function argument).
-        /// Opaque; read via the `value_*` accessors after `value_type`.
+        /// Opaque; read via the `value_*` accessors after `value_type`
+        /// and `value_is_null`.
         type Value;
 
         fn new_context(catalog: Box<CatalogContext>) -> Result<UniquePtr<DuckPlannerContext>>;
@@ -460,5 +461,6 @@ pub mod ffi {
 
         // BoundCastExpression
         fn expr_cast_child(expr: &Expression) -> Result<&Expression>;
+        fn expr_cast_is_try(expr: &Expression) -> Result<bool>;
     }
 }

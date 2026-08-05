@@ -78,6 +78,8 @@ pub enum Error {
     UnsupportedAggregateFunction(String),
     #[error("Unsupported scalar function: {0}")]
     UnsupportedScalarFunction(String),
+    #[error("TRY_CAST is not supported; use CAST, which fails on unconvertible values")]
+    TryCastUnsupported,
     #[error("Invalid parameter count for {function}: expected {expected}, got {actual}")]
     InvalidParameterCount {
         function: String,
