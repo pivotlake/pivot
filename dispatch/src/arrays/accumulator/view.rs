@@ -21,7 +21,6 @@ use arrow_array::{Array, ArrayRef, make_array};
 use arrow_buffer::Buffer;
 use arrow_schema::{ArrowError, DataType};
 
-use super::chunked::{ChunkedColumn, ViewChunk};
 use super::column::{AppendSource, ColumnAccumulator, SourceSelection};
 use super::fixed_width::gather_fixed_width;
 use super::validity::ValidityMask;
@@ -178,23 +177,33 @@ impl ViewColumn {
         }
     }
 
+    /// Read the view at `row` of one batch's [`ArrayData`]: buffer 0 holds
+    /// the 16-byte views, with the array's element offset applied.
+    #[inline(always)]
+    fn view_at(chunk: &ArrayData, row: usize) -> u128 {
+        // SAFETY: `row` is an in-bounds position of this array, and a view
+        // array's first buffer holds one 16-byte view per element.
+        unsafe {
+            (chunk.buffers()[0].as_ptr() as *const u128)
+                .add(chunk.offset() + row)
+                .read_unaligned()
+        }
+    }
+
     fn append_chunked(
         &mut self,
-        column: &ChunkedColumn,
+        column: &[ArrayData],
         ids: &[u32],
         shift: u32,
         destination_start: usize,
         allocator: &mut SlabAllocator,
     ) {
-        let ChunkedColumn::View { chunks } = column else {
-            unreachable!("a view accumulator receives a view chunked column");
-        };
         self.validity
             .append_by_ids(ids, shift, destination_start, |batch| {
-                chunks[batch].nulls.as_ref()
+                column[batch].nulls().filter(|nulls| nulls.null_count() > 0)
             });
-        if self.chunk_bases.len() < chunks.len() {
-            self.chunk_bases.resize(chunks.len(), (0, 0));
+        if self.chunk_bases.len() < column.len() {
+            self.chunk_bases.resize(column.len(), (0, 0));
         }
         let Self {
             views,
@@ -212,16 +221,17 @@ impl ViewColumn {
                     let mut dst = views.ptr_at_index(destination_start);
                     for &id in ids {
                         let batch_idx = (id >> shift) as usize;
-                        let chunk: &ViewChunk = &chunks[batch_idx];
-                        let mut view = chunk.views[(id & mask) as usize];
+                        let chunk = &column[batch_idx];
+                        let mut view = Self::view_at(chunk, (id & mask) as usize);
                         // A view longer than the inline limit points into its
-                        // batch's data buffers; register those once per emitted
-                        // batch and rebase the buffer index onto the list.
+                        // batch's data buffers (buffers 1 onward); register
+                        // those once per emitted batch and rebase the buffer
+                        // index onto the list.
                         if view as u32 > INLINE_VIEW_LEN {
                             let entry = chunk_bases.get_unchecked_mut(batch_idx);
                             if entry.0 != *generation {
                                 *entry = (*generation, buffers.len() as u32);
-                                buffers.extend(chunk.data_buffers.iter().cloned());
+                                buffers.extend(chunk.buffers()[1..].iter().cloned());
                             }
                             view += (entry.1 as u128) << 64;
                         }
@@ -232,15 +242,15 @@ impl ViewColumn {
             }
             ViewValues::OwnedBlocks { blocks } => {
                 for (destination, &id) in (destination_start..).zip(ids) {
-                    let chunk = &chunks[(id >> shift) as usize];
-                    let view = chunk.views[(id & mask) as usize];
+                    let chunk = &column[(id >> shift) as usize];
+                    let view = Self::view_at(chunk, (id & mask) as usize);
                     let length = view as u32;
                     let copied = if length <= INLINE_VIEW_LEN {
                         view
                     } else {
                         let buffer = (view >> 64) as u32 as usize;
                         let offset = (view >> 96) as u32 as usize;
-                        let value = &chunk.data_buffers[buffer][offset..offset + length as usize];
+                        let value = &chunk.buffers()[1 + buffer][offset..offset + length as usize];
                         copy_value(blocks, value, allocator)
                     };
                     // SAFETY: the slab has room for `destination_start` plus

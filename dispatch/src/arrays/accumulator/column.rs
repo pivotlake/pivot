@@ -3,10 +3,10 @@
 //! takes. The module docs of [`accumulator`](super) map out which
 //! implementation a column type gets and why.
 
+use arrow::array::ArrayData;
 use arrow_array::ArrayRef;
 use arrow_schema::ArrowError;
 
-use super::chunked::ChunkedColumn;
 use crate::memory::SlabAllocator;
 
 /// One column of an accumulation: rows are copied in with
@@ -50,10 +50,12 @@ pub(super) enum AppendSource<'a> {
         selection: SourceSelection<'a>,
     },
     /// Rows of a column split across many batches, at the encoded `ids`
-    /// (`batch << shift | row`). The column's variant matches the accumulator
-    /// by construction: both were built from the column's type.
+    /// (`batch << shift | row`). One [`ArrayData`] per batch, resolved once
+    /// by the caller ([`ArrayData`] is Arrow's own type-erased form: the
+    /// buffers, offset, validity, and children of one array), so the per-row
+    /// work here is indexing, never type resolution.
     Chunked {
-        column: &'a ChunkedColumn,
+        column: &'a [ArrayData],
         ids: &'a [u32],
         shift: u32,
     },

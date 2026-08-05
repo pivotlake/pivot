@@ -10,8 +10,8 @@
 //! This module is the only place that knows how an id splits. Everything else
 //! goes through the helpers below.
 
-use crate::arrays::accumulator::ChunkedColumns;
 use crate::memory::{MultiSlabBuffer, SlabAllocator};
+use arrow::array::ArrayData;
 use arrow_array::RecordBatch;
 use arrow_schema::ArrowError;
 
@@ -32,8 +32,9 @@ pub(crate) struct BuildRows {
     /// The same batches restricted to the build columns the join emits, used
     /// when scanning unmatched rows one batch at a time.
     pub(crate) output_batches: Vec<RecordBatch>,
-    /// The output columns prepared for gathering matched rows by row id.
-    pub(crate) output_columns: ChunkedColumns,
+    /// Each output column's per-batch Arrow data, prepared for gathering
+    /// matched rows by row id.
+    pub(crate) output_columns: Vec<Vec<ArrayData>>,
     /// One flag per row id for a build-side outer join.
     pub(crate) matched: MultiSlabBuffer<u8>,
 }
@@ -47,7 +48,14 @@ impl BuildRows {
             .iter()
             .map(|batch| batch.project(output_indices))
             .collect::<Result<_, _>>()?;
-        let output_columns = ChunkedColumns::prepare(&output_batches, BATCH_SHIFT);
+        let output_columns = (0..output_indices.len())
+            .map(|column| {
+                output_batches
+                    .iter()
+                    .map(|batch| batch.column(column).to_data())
+                    .collect()
+            })
+            .collect();
         let matched = if TRACK_MATCHES {
             let mut allocator = SlabAllocator::new(false);
             allocator.create_multi_slab_buffer::<u8>(row_id_space(&batches).max(1), true)
@@ -66,7 +74,7 @@ impl BuildRows {
         Self {
             batches: Vec::new(),
             output_batches: Vec::new(),
-            output_columns: ChunkedColumns::prepare(&[], BATCH_SHIFT),
+            output_columns: Vec::new(),
             matched: MultiSlabBuffer::new(Vec::new()),
         }
     }
@@ -89,6 +97,12 @@ pub(crate) fn split_row_id(row_id: u32) -> (usize, usize) {
 #[inline(always)]
 pub(crate) fn first_row_id(build_row_batch_idx: usize) -> usize {
     build_row_batch_idx << BATCH_SHIFT
+}
+
+/// How a row id splits, as the opaque shift the accumulator's gather takes.
+#[inline(always)]
+pub(crate) fn row_id_shift() -> u32 {
+    BATCH_SHIFT
 }
 
 /// Store a batch's rows without copying and hand back each stored batch with

@@ -355,6 +355,7 @@ impl ProbeMatchOutputter {
         if !SEMI_PROBE_SIDE {
             self.build.append_chunked_by_ids(
                 &build_rows.output_columns,
+                build_rows::row_id_shift(),
                 &self.build_indices[..self.matched],
                 &mut self.allocator,
             );

@@ -15,7 +15,8 @@ use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, StructArray};
 use arrow_schema::{ArrowError, Fields};
 
-use super::chunked::ChunkedColumn;
+use arrow::array::ArrayData;
+
 use super::column::{AppendSource, ColumnAccumulator};
 use super::validity::ValidityMask;
 use super::{ValueStorage, create_column_accumulator};
@@ -72,15 +73,21 @@ impl ColumnAccumulator for StructColumn {
                 }
             }
             AppendSource::Chunked { column, ids, shift } => {
-                let ChunkedColumn::Struct { nulls, children } = column else {
-                    unreachable!("a struct accumulator receives a struct chunked column");
-                };
                 self.validity
-                    .append_by_ids(ids, shift, destination_start, |batch| nulls[batch].as_ref());
-                for (child, values) in self.children.iter_mut().zip(children) {
+                    .append_by_ids(ids, shift, destination_start, |batch| {
+                        column[batch].nulls().filter(|nulls| nulls.null_count() > 0)
+                    });
+                // Each child gets its own per-batch data list. Materializing
+                // it here clones one Arc-backed ArrayData per batch per
+                // append, which is fine for the rare struct-typed column.
+                for (k, child) in self.children.iter_mut().enumerate() {
+                    let child_column: Vec<ArrayData> = column
+                        .iter()
+                        .map(|data| data.child_data()[k].clone())
+                        .collect();
                     child.append(
                         AppendSource::Chunked {
-                            column: values,
+                            column: &child_column,
                             ids,
                             shift,
                         },
