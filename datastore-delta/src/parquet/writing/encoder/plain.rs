@@ -8,10 +8,10 @@
 
 use arrow_array::{
     Array, BinaryViewArray, Date32Array, Decimal64Array, Decimal128Array, Float32Array,
-    Float64Array, Int32Array, Int64Array, StringArray, StringViewArray, UInt8Array, UInt16Array,
-    UInt32Array, UInt64Array,
+    Float64Array, Int32Array, Int64Array, StringArray, StringViewArray, TimestampMicrosecondArray,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow_schema::DataType;
+use arrow_schema::{DataType, TimeUnit};
 use thriftparquet::general::Encoding;
 
 use dispatch::memory::SlabAllocator;
@@ -117,6 +117,7 @@ pub(super) fn encode_into(array: &dyn Array, out: &mut Vec<u8>) -> WriteResult<(
         DataType::UInt64 => fixed!(UInt64Array),
         // A date writes the day count its INT32 storage holds.
         DataType::Date32 => fixed!(Date32Array),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => fixed!(TimestampMicrosecondArray),
         DataType::Float32 => fixed!(Float32Array),
         DataType::Float64 => fixed!(Float64Array),
         // A decimal writes the narrowest storage its precision allows (see

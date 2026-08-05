@@ -179,6 +179,18 @@ impl WriteThrift for LogicalType {
             LogicalType::Date => {
                 writer.write_empty_struct(6, 0)?;
             }
+            // TIMESTAMP union member: field 8, a TimestampType struct with
+            // required isAdjustedToUTC (field 1) and unit (field 2, itself a
+            // union whose selected member is an empty struct).
+            LogicalType::Timestamp {
+                unit,
+                is_adjusted_to_utc,
+            } => {
+                writer.write_field_begin(FieldType::Struct, 8, 0)?;
+                let last_field_id = is_adjusted_to_utc.write_thrift_field(writer, 1, 0)?;
+                unit.write_thrift_field(writer, 2, last_field_id)?;
+                writer.write_struct_end()?;
+            }
             // VARIANT union member: field 16, an (empty) VariantType struct.
             LogicalType::Variant => {
                 writer.write_empty_struct(16, 0)?;
@@ -303,6 +315,53 @@ mod tests {
         };
 
         test_roundtrip(element);
+    }
+
+    /// The TIMESTAMP member carries two fields of its own, so the round trip is
+    /// what pins their ids: `is_adjusted_to_utc` defaults to false on a reader,
+    /// and a wrong id for it would be indistinguishable from writing nothing.
+    #[test]
+    fn timestamp_schema_element_round_trips() {
+        let element = SchemaElement {
+            physical_type: Some(2),
+            type_length: None,
+            repetition_type: Some(1),
+            name: "ts".to_string(),
+            num_children: None,
+            converted_type: Some(10),
+            scale: None,
+            precision: None,
+            logical_type: Some(LogicalType::Timestamp {
+                unit: TimeUnit::MICROS,
+                is_adjusted_to_utc: true,
+            }),
+        };
+
+        test_roundtrip(element);
+    }
+
+    /// The unit is a union of its own inside that struct, so each spelling has
+    /// to survive on its own.
+    #[test]
+    fn every_timestamp_unit_round_trips() {
+        for unit in [TimeUnit::MILLIS, TimeUnit::MICROS, TimeUnit::NANOS] {
+            let element = SchemaElement {
+                physical_type: Some(2),
+                type_length: None,
+                repetition_type: Some(1),
+                name: "ts".to_string(),
+                num_children: None,
+                converted_type: None,
+                scale: None,
+                precision: None,
+                logical_type: Some(LogicalType::Timestamp {
+                    unit,
+                    is_adjusted_to_utc: false,
+                }),
+            };
+
+            test_roundtrip(element);
+        }
     }
 
     #[test]
