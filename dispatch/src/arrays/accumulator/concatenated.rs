@@ -19,7 +19,7 @@ use arrow_schema::ArrowError;
 
 use arrow_array::make_array;
 
-use super::column::{ChunkedColumn, ColumnAccumulator, SourceSelection};
+use super::column::{ChunkedColumn, ColumnAccumulator};
 use crate::memory::SlabAllocator;
 
 /// A column held as the arrays it was appended from, concatenated on emit.
@@ -34,35 +34,41 @@ impl ConcatenatedColumn {
 }
 
 impl ColumnAccumulator for ConcatenatedColumn {
-    fn append_from_single_batch(
+    fn append_from_indices(
         &mut self,
         column: &ArrayRef,
-        selection: SourceSelection<'_>,
+        indices: &[u32],
         _destination_start: usize,
         _allocator: &mut SlabAllocator,
     ) {
-        match selection {
-            SourceSelection::Range { start, len } => self.arrays.push(column.slice(start, len)),
-            // Consecutive positions become one slice, so a selection that keeps
-            // a run of rows costs one array rather than one per row.
-            SourceSelection::Indices(indices) => {
-                let mut run: Option<(usize, usize)> = None;
-                for &row in indices {
-                    let row = row as usize;
-                    match run {
-                        Some((start, end)) if row == end => run = Some((start, end + 1)),
-                        Some((start, end)) => {
-                            self.arrays.push(column.slice(start, end - start));
-                            run = Some((row, row + 1));
-                        }
-                        None => run = Some((row, row + 1)),
-                    }
-                }
-                if let Some((start, end)) = run {
+        // Consecutive positions become one slice, so a selection that keeps a
+        // run of rows costs one array rather than one per row.
+        let mut run: Option<(usize, usize)> = None;
+        for &row in indices {
+            let row = row as usize;
+            match run {
+                Some((start, end)) if row == end => run = Some((start, end + 1)),
+                Some((start, end)) => {
                     self.arrays.push(column.slice(start, end - start));
+                    run = Some((row, row + 1));
                 }
+                None => run = Some((row, row + 1)),
             }
         }
+        if let Some((start, end)) = run {
+            self.arrays.push(column.slice(start, end - start));
+        }
+    }
+
+    fn append_from_range(
+        &mut self,
+        column: &ArrayRef,
+        start: usize,
+        len: usize,
+        _destination_start: usize,
+        _allocator: &mut SlabAllocator,
+    ) {
+        self.arrays.push(column.slice(start, len));
     }
 
     fn append_from_batches(

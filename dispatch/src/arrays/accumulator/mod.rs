@@ -45,7 +45,7 @@ use arrow_schema::{ArrowError, DataType, Fields, SchemaRef};
 use crate::RECORD_BATCH_SIZE;
 use crate::memory::{BUFFER_SIZE, SlabAllocator};
 pub use column::ChunkedColumn;
-use column::{ColumnAccumulator, SourceSelection};
+use column::ColumnAccumulator;
 use concatenated::ConcatenatedColumn;
 use fixed_width::FixedWidthColumn;
 use structs::StructColumn;
@@ -182,7 +182,11 @@ impl BatchAccumulator {
         indices: &[u32],
         allocator: &mut SlabAllocator,
     ) {
-        self.append_selection(batch, SourceSelection::Indices(indices), allocator);
+        debug_assert!(self.len + indices.len() <= self.capacity);
+        for (accumulator, column) in self.columns.iter_mut().zip(batch.columns()) {
+            accumulator.append_from_indices(column, indices, self.len, allocator);
+        }
+        self.len += indices.len();
     }
 
     /// Append rows stored across many batches at the encoded `ids`
@@ -217,20 +221,11 @@ impl BatchAccumulator {
         len: usize,
         allocator: &mut SlabAllocator,
     ) {
-        self.append_selection(batch, SourceSelection::Range { start, len }, allocator);
-    }
-
-    fn append_selection(
-        &mut self,
-        batch: &RecordBatch,
-        selection: SourceSelection<'_>,
-        allocator: &mut SlabAllocator,
-    ) {
-        debug_assert!(self.len + selection.len() <= self.capacity);
+        debug_assert!(self.len + len <= self.capacity);
         for (accumulator, column) in self.columns.iter_mut().zip(batch.columns()) {
-            accumulator.append_from_single_batch(column, selection, self.len, allocator);
+            accumulator.append_from_range(column, start, len, self.len, allocator);
         }
-        self.len += selection.len();
+        self.len += len;
     }
 
     /// Emit the accumulated rows as one batch and reset.

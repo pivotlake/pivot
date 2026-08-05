@@ -6,7 +6,7 @@
 //! stores a group, and a child gets whichever strategy its own type calls for.
 //!
 //! Slicing a struct slices its children with it, so a child's rows are at the
-//! same positions as the struct's own and the same [`SourceSelection`] goes straight
+//! same positions as the struct's own and the same indices or range go straight
 //! down.
 
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, StructArray};
 use arrow_schema::{ArrowError, Fields};
 
-use super::column::{ChunkedColumn, ColumnAccumulator, SourceSelection};
+use super::column::{ChunkedColumn, ColumnAccumulator};
 use super::validity::ValidityMask;
 use super::{ValueStorage, create_column_accumulator};
 use crate::memory::SlabAllocator;
@@ -48,18 +48,34 @@ impl StructColumn {
 }
 
 impl ColumnAccumulator for StructColumn {
-    fn append_from_single_batch(
+    fn append_from_indices(
         &mut self,
         column: &ArrayRef,
-        selection: SourceSelection<'_>,
+        indices: &[u32],
         destination_start: usize,
         allocator: &mut SlabAllocator,
     ) {
         let column = column.as_struct();
         self.validity
-            .append(column.nulls(), selection, destination_start);
+            .append_indices(column.nulls(), indices, destination_start);
         for (child, values) in self.children.iter_mut().zip(column.columns()) {
-            child.append_from_single_batch(values, selection, destination_start, allocator);
+            child.append_from_indices(values, indices, destination_start, allocator);
+        }
+    }
+
+    fn append_from_range(
+        &mut self,
+        column: &ArrayRef,
+        start: usize,
+        len: usize,
+        destination_start: usize,
+        allocator: &mut SlabAllocator,
+    ) {
+        let column = column.as_struct();
+        self.validity
+            .append_range(column.nulls(), start, len, destination_start);
+        for (child, values) in self.children.iter_mut().zip(column.columns()) {
+            child.append_from_range(values, start, len, destination_start, allocator);
         }
     }
 

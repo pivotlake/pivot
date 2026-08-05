@@ -51,15 +51,25 @@ unsafe impl Sync for ChunkedColumn {}
 /// taken from and appended to again: an accumulator is reused for as many
 /// batches as its owner emits.
 pub(super) trait ColumnAccumulator {
-    /// Append selected rows from one batch's column.
+    /// Append indexed rows from one batch's column.
     ///
     /// `allocator` is drawn on only by an implementation that copies values
     /// (see [`ValueStorage`](super::ValueStorage)); one that retains the
     /// source's buffers never touches it.
-    fn append_from_single_batch(
+    fn append_from_indices(
         &mut self,
         column: &ArrayRef,
-        selection: SourceSelection<'_>,
+        indices: &[u32],
+        destination_start: usize,
+        allocator: &mut SlabAllocator,
+    );
+
+    /// Append a contiguous range from one batch's column.
+    fn append_from_range(
+        &mut self,
+        column: &ArrayRef,
+        start: usize,
+        len: usize,
         destination_start: usize,
         allocator: &mut SlabAllocator,
     );
@@ -82,41 +92,4 @@ pub(super) trait ColumnAccumulator {
         len: usize,
         allocator: &mut SlabAllocator,
     ) -> Result<ArrayRef, ArrowError>;
-}
-
-/// Which rows of a single source column an append takes.
-///
-/// One implementation serves both: a scattered selection reads its rows through
-/// the indices, while a contiguous run copies them in bulk. The difference costs
-/// a branch per column per append, not per row.
-#[derive(Clone, Copy)]
-pub(super) enum SourceSelection<'a> {
-    /// The rows at these ascending positions, which is what a filter's
-    /// survivors or a join's matches look like.
-    Indices(&'a [u32]),
-    /// The `len` rows from `start`: a whole input batch, or the part of one that
-    /// fits before the accumulator fills.
-    Range { start: usize, len: usize },
-}
-
-impl SourceSelection<'_> {
-    pub(super) fn len(&self) -> usize {
-        match self {
-            Self::Indices(indices) => indices.len(),
-            Self::Range { len, .. } => *len,
-        }
-    }
-
-    /// The source row positions, in the order they are appended.
-    pub(super) fn iter_positions(&self) -> impl Iterator<Item = usize> + '_ {
-        let (indices, range) = match self {
-            Self::Indices(indices) => (Some(indices.iter()), 0..0),
-            Self::Range { start, len } => (None, *start..*start + *len),
-        };
-        indices
-            .into_iter()
-            .flatten()
-            .map(|&row| row as usize)
-            .chain(range)
-    }
 }

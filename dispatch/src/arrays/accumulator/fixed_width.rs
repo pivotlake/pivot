@@ -10,7 +10,7 @@ use arrow::array::ArrayData;
 use arrow_array::{ArrayRef, make_array};
 use arrow_schema::{ArrowError, DataType};
 
-use super::column::{ChunkedColumn, ColumnAccumulator, SourceSelection};
+use super::column::{ChunkedColumn, ColumnAccumulator};
 use super::validity::ValidityMask;
 use crate::arrays::slab_into_buffer;
 use crate::memory::{SlabAllocator, SlabBuffer};
@@ -40,40 +40,55 @@ impl FixedWidthColumn {
             validity: ValidityMask::new(capacity),
         }
     }
-
 }
 
 impl ColumnAccumulator for FixedWidthColumn {
-    fn append_from_single_batch(
+    fn append_from_indices(
         &mut self,
         column: &ArrayRef,
-        selection: SourceSelection<'_>,
+        indices: &[u32],
         destination_start: usize,
         _allocator: &mut SlabAllocator,
     ) {
         let data = column.to_data();
         self.validity
-            .append(data.nulls(), selection, destination_start);
+            .append_indices(data.nulls(), indices, destination_start);
         let width = self.width;
-        // SAFETY: the source holds `offset + len` values, the rows are in-bounds
-        // positions, and the slab has capacity for `at` plus the appended rows
-        // (checked by the caller).
+        // SAFETY: every index is an in-bounds source position and the slab has
+        // capacity for the appended rows (checked by the caller).
         unsafe {
             let src = data.buffers()[0].as_ptr().add(data.offset() * width);
             let dst = (self.slab.ptr_at_index(0) as *mut u8).add(destination_start * width);
-            match selection {
-                SourceSelection::Range { start, len } => {
-                    std::ptr::copy_nonoverlapping(src.add(start * width), dst, len * width)
-                }
-                SourceSelection::Indices(indices) => match width {
-                    1 => gather_fixed_width::<u8>(src, dst, indices),
-                    2 => gather_fixed_width::<u16>(src, dst, indices),
-                    4 => gather_fixed_width::<u32>(src, dst, indices),
-                    8 => gather_fixed_width::<u64>(src, dst, indices),
-                    16 => gather_fixed_width::<u128>(src, dst, indices),
-                    _ => unreachable!("built only for the widths above"),
-                },
+            match width {
+                1 => gather_fixed_width::<u8>(src, dst, indices),
+                2 => gather_fixed_width::<u16>(src, dst, indices),
+                4 => gather_fixed_width::<u32>(src, dst, indices),
+                8 => gather_fixed_width::<u64>(src, dst, indices),
+                16 => gather_fixed_width::<u128>(src, dst, indices),
+                _ => unreachable!("built only for the widths above"),
             }
+        }
+    }
+
+    fn append_from_range(
+        &mut self,
+        column: &ArrayRef,
+        start: usize,
+        len: usize,
+        destination_start: usize,
+        _allocator: &mut SlabAllocator,
+    ) {
+        let data = column.to_data();
+        self.validity
+            .append_range(data.nulls(), start, len, destination_start);
+        let width = self.width;
+        // SAFETY: the range is in bounds and the destination has room for it.
+        unsafe {
+            let src = data.buffers()[0]
+                .as_ptr()
+                .add((data.offset() + start) * width);
+            let dst = (self.slab.ptr_at_index(0) as *mut u8).add(destination_start * width);
+            std::ptr::copy_nonoverlapping(src, dst, len * width);
         }
     }
 
