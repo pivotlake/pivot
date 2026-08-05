@@ -83,7 +83,10 @@ fn cancelled_query_returns_without_hanging() {
                 dispatch::RowSelection::Indices
             }
         })
-        .execute();
+        // `execute_copying`, not `execute`: the batches are collected and
+        // dropped on this test thread, which has no `MemoryContext`, so they
+        // must leave the workers heap-backed rather than ring-backed.
+        .execute_copying();
     handle.cancel();
     let result = handle.collect();
 
