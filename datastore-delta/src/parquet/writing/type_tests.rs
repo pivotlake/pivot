@@ -16,13 +16,13 @@ use crate::parquet::{ParquetTable, table_input};
 use arrow::compute::cast;
 use arrow_array::types::{
     Date32Type, Decimal64Type, Decimal128Type, Float32Type, Float64Type, Int32Type, Int64Type,
-    UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+    TimestampMicrosecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow_array::{
-    Array, ArrayRef, ArrowPrimitiveType, BinaryViewArray, PrimitiveArray, RecordBatch, StringArray,
-    StringViewArray,
+    Array, ArrayRef, ArrowPrimitiveType, BinaryViewArray, Date32Array, PrimitiveArray, RecordBatch,
+    StringArray, StringViewArray, TimestampMicrosecondArray,
 };
-use arrow_schema::{Field, Schema};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use dispatch::{Dispatch, Projection, values_input};
 
 use super::{AssembledFile, encode_record_batches_spec};
@@ -260,6 +260,52 @@ fn assert_round_trips(cases: Vec<Case>) {
     }
 }
 
+/// The annotation an annotated leaf is written under, as another engine
+/// resolves it. `assert_round_trips` cannot see this: it casts each column back
+/// to the type that went in before comparing, and an integer casts to its
+/// temporal type losslessly, so a leaf that lost its annotation would still
+/// compare equal. Reading the schema instead is what pins the annotation, since
+/// an unannotated leaf resolves to the bare integer it is stored as.
+fn assert_reads_back_as(values: ArrayRef, expected: &DataType) {
+    let dispatch = Dispatch::spin_up(2, RING_BUFFERS, None);
+    let case = Case {
+        name: "annotated".to_string(),
+        values,
+        encoding: PLAIN,
+    };
+
+    let bytes = write_cases(&dispatch, &[case]);
+    let schema = ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::from(bytes))
+        .unwrap()
+        .schema()
+        .clone();
+
+    assert_eq!(schema.field(0).data_type(), expected);
+}
+
+/// A timestamp column says so on the leaf, so another engine reads microseconds
+/// rather than the count's bare integer.
+#[test]
+fn timestamp_leaf_carries_its_unit() {
+    let values: ArrayRef = Arc::new(TimestampMicrosecondArray::from(
+        (0..ROWS as i64)
+            .map(|row| 795_225_600_000_000 + row)
+            .collect::<Vec<_>>(),
+    ));
+
+    assert_reads_back_as(values, &DataType::Timestamp(TimeUnit::Microsecond, None));
+}
+
+/// The same for a date, whose day count is likewise an integer on disk.
+#[test]
+fn date_leaf_carries_its_annotation() {
+    let values: ArrayRef = Arc::new(Date32Array::from(
+        (0..ROWS as i32).map(|row| 9_204 + row).collect::<Vec<_>>(),
+    ));
+
+    assert_reads_back_as(values, &DataType::Date32);
+}
+
 /// Every type the writer accepts, one test per type and shape. A type added to
 /// the writer belongs here: this table is the only list of them, so a new line
 /// adds its three tests and its columns to the mixed-file test below.
@@ -345,6 +391,13 @@ type_tests! {
     );
     // 9204 days after the epoch is 1995-03-15.
     date32 => primitive::<Date32Type>(PACKED, |row| 9_204 + row as i32, as_is);
+    // A timestamp counts microseconds, so these run from 1995-03-15 00:00:00 in
+    // steps that keep a sub-second part.
+    timestamp => primitive::<TimestampMicrosecondType>(
+        PACKED,
+        |row| 795_225_600_000_000 + row as i64 * 1_500_007,
+        as_is
+    );
     // A float is not a whole number, so it has no delta form and no dictionary
     // cast: it stays plain whatever its values do.
     float32 => primitive::<Float32Type>(PLAIN, |row| row as f32 * 1.5, as_is);

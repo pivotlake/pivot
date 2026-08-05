@@ -13,9 +13,12 @@
 //! [`MAX_DISTINCT_SHARE`] catches it immediately. The size limit stays as a
 //! second guard for a column of few but very large values.
 
+use std::sync::Arc;
+
 use arrow_array::cast::AsArray;
-use arrow_array::types::Int32Type;
-use arrow_schema::DataType;
+use arrow_array::types::{Date32Type, Int32Type, TimestampMicrosecondType};
+use arrow_array::{Array, ArrayRef, Int32Array, Int64Array};
+use arrow_schema::{DataType, TimeUnit};
 use dispatch::memory::SlabAllocator;
 use thriftparquet::general::Encoding;
 
@@ -24,6 +27,28 @@ use super::super::types::EncodedPage;
 use super::leaves::Leaf;
 use super::pages::{self, PageKind};
 use super::{plain, rle};
+
+/// The integer a temporal leaf stores its count in, sharing the values buffer
+/// rather than copying it. Any other leaf is already what it is stored as.
+fn as_backing_integer(values: &ArrayRef) -> ArrayRef {
+    match values.data_type() {
+        DataType::Date32 => {
+            let days = values.as_primitive::<Date32Type>();
+            Arc::new(Int32Array::new(
+                days.values().clone(),
+                days.nulls().cloned(),
+            ))
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, None) => {
+            let micros = values.as_primitive::<TimestampMicrosecondType>();
+            Arc::new(Int64Array::new(
+                micros.values().clone(),
+                micros.nulls().cloned(),
+            ))
+        }
+        _ => values.clone(),
+    }
+}
 
 /// Fall back once the distinct values reach this PLAIN-encoded size — arrow's
 /// default `dictionary_page_size_limit`.
@@ -44,11 +69,17 @@ pub(super) fn try_encode(
     allocator: &mut SlabAllocator,
 ) -> WriteResult<Option<(EncodedPage, EncodedPage)>> {
     let values = &leaf.values;
+    // A temporal leaf packs through the integer it is stored as. Arrow packs an
+    // integer directly but reaches that same integer from a temporal type by
+    // two further casts and a rebuild, and the dictionary page holds the same
+    // bytes either way, since a day or microsecond count encodes as the integer
+    // it is.
+    let packable = as_backing_integer(values);
     let dict_type = DataType::Dictionary(
         Box::new(DataType::Int32),
-        Box::new(values.data_type().clone()),
+        Box::new(packable.data_type().clone()),
     );
-    let Ok(dictionary) = arrow_cast::cast(values, &dict_type) else {
+    let Ok(dictionary) = arrow_cast::cast(&packable, &dict_type) else {
         return Ok(None);
     };
     let dictionary = dictionary.as_dictionary::<Int32Type>();

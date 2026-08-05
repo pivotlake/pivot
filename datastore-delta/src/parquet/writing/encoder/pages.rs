@@ -12,7 +12,7 @@ use std::ops::Range;
 
 use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, BinaryViewArray, StringArray, StringViewArray};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, TimeUnit};
 use snap::raw::Encoder;
 use thriftparquet::general::{Encoding, PageType};
 use thriftparquet::headers::{DataPageHeader, DictionaryPageHeader, PageHeader};
@@ -126,7 +126,10 @@ impl<'a> PlainSizes<'a> {
             | DataType::UInt8
             | DataType::UInt16
             | DataType::UInt32 => Self::Fixed(4),
-            DataType::Int64 | DataType::Float64 | DataType::UInt64 => Self::Fixed(8),
+            DataType::Int64
+            | DataType::Float64
+            | DataType::UInt64
+            | DataType::Timestamp(TimeUnit::Microsecond, None) => Self::Fixed(8),
             // A decimal's width follows its precision-chosen storage.
             DataType::Decimal64(precision, _) | DataType::Decimal128(precision, _) => {
                 Self::Fixed(crate::parquet::decimal_write_storage(*precision).byte_width())

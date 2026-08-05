@@ -18,9 +18,9 @@
 
 use arrow_array::{
     Array, BinaryViewArray, Date32Array, Decimal64Array, Decimal128Array, Int32Array, Int64Array,
-    StringArray, StringViewArray,
+    StringArray, StringViewArray, TimestampMicrosecondArray,
 };
-use arrow_schema::DataType;
+use arrow_schema::{DataType, TimeUnit};
 use std::borrow::Cow;
 use thriftparquet::general::Encoding;
 
@@ -75,7 +75,10 @@ pub(super) fn try_encode_chunk(
 /// dictionary or PLAIN instead, which store its bits at their declared width.
 fn encoding_for(data_type: &DataType) -> Option<Encoding> {
     match data_type {
-        DataType::Int32 | DataType::Int64 | DataType::Date32 => Some(Encoding::DELTA_BINARY_PACKED),
+        DataType::Int32
+        | DataType::Int64
+        | DataType::Date32
+        | DataType::Timestamp(TimeUnit::Microsecond, None) => Some(Encoding::DELTA_BINARY_PACKED),
         DataType::Decimal64(precision, _) | DataType::Decimal128(precision, _) => {
             match decimal_write_storage(*precision) {
                 DecimalWriteStorage::Int32 | DecimalWriteStorage::Int64 => {
@@ -133,6 +136,9 @@ fn integers(array: &dyn Array) -> WriteResult<Cow<'_, [i64]>> {
     let len = array.len();
     Ok(match array.data_type() {
         DataType::Int64 => Cow::Borrowed(downcast::<Int64Array>(array)?.values()),
+        DataType::Timestamp(TimeUnit::Microsecond, None) => {
+            Cow::Borrowed(downcast::<TimestampMicrosecondArray>(array)?.values())
+        }
         DataType::Decimal64(_, _) => Cow::Borrowed(downcast::<Decimal64Array>(array)?.values()),
         DataType::Int32 => {
             let a = downcast::<Int32Array>(array)?;

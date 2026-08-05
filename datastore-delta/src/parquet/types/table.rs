@@ -528,12 +528,13 @@ fn apply_declared_types(schema: Schema, declared_columns: &[Column]) -> Result<S
                     field.as_ref().clone().with_data_type(DataType::Utf8View),
                 ));
             }
-            // A pivot timestamp counts microseconds (see `Type::Timestamp`),
-            // and pivot-written files store that count in a bare INT64 under no
-            // annotation. Such a leaf says nothing about its own unit, so it is
-            // re-labelled as the timestamp the table declares. An annotated
-            // leaf already parsed to `Timestamp(Microsecond)` and matches
-            // below; any other unit was rejected when the footer was read.
+            // A pivot timestamp counts microseconds (see `Type::Timestamp`).
+            // A leaf that carries the TIMESTAMP annotation, which is what the
+            // writer stamps, already parsed to `Timestamp(Microsecond)` and
+            // matches below; any other unit was rejected when the footer was
+            // read. A bare INT64 leaf says nothing about its own unit, so it is
+            // re-labelled as the timestamp the table declares, which is how a
+            // file written by another engine, or by an older pivot, reads.
             if **declared == Type::Timestamp && *file_type == DataType::Int64 {
                 return Ok(Arc::new(
                     field

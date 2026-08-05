@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use arrow_array::{
     ArrayRef, Int32Array, Int64Array, RecordBatch, Scalar, StringArray, StringViewArray,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use dispatch::{DataFlowDispatcher, Dispatch};
@@ -718,6 +718,34 @@ fn unsigned_columns_insert_and_read_back() {
     assert_eq!(
         batch.column(3).as_ref(),
         &UInt64Array::from(vec![18_446_744_073_709_551_615u64])
+    );
+}
+
+/// A timestamp inserted through SQL reads back at full resolution, on both
+/// sides of the epoch. What the leaf is annotated as is the writer's business,
+/// covered in `writing::type_tests`.
+#[test]
+fn timestamp_column_inserts_and_reads_back() {
+    let data = TempDir::new().unwrap();
+    let columns = vec![Column {
+        name: "ts".to_string(),
+        col_type: Type::Timestamp,
+    }];
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, create_request("events", data.path(), columns)).unwrap();
+
+    let inserted = run_sql(
+        &datastore,
+        "INSERT INTO events VALUES (TIMESTAMP '2023-11-14 22:13:20.123456'), \
+         (TIMESTAMP '1969-12-31 23:59:58.5')",
+    );
+    assert_eq!(common::extract_count(&inserted), 2);
+    datastore.refresh_from_store().unwrap();
+
+    let rows = run_sql(&datastore, "SELECT ts FROM events ORDER BY ts");
+    assert_eq!(
+        rows[0].column(0).as_ref(),
+        &TimestampMicrosecondArray::from(vec![-1_500_000i64, 1_700_000_000_123_456])
     );
 }
 

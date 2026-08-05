@@ -22,7 +22,7 @@
 //!   Float64           DOUBLE             -                       read+write
 //!   Utf8 / Utf8View   BYTE_ARRAY         converted UTF8 / String read+write
 //!   Date32            INT32              Date                    read+write
-//!   Timestamp(Micro)  INT64              Timestamp{MICROS}       read only
+//!   Timestamp(Micro)  INT64              Timestamp{MICROS}       read+write
 //!   BinaryView        BYTE_ARRAY         unannotated             read+write
 //!   Decimal64(p,s)    INT32              Decimal (p <= 9)        read+write
 //!   Decimal64(p,s)    INT64              Decimal (p <= 18)       read+write
@@ -35,8 +35,8 @@
 //!
 //! The "read only" rows resolve files written elsewhere; pivot's own writer only
 //! emits the column set its encoder supports (Int32/Int64/the unsigned widths/
-//! Date32/Float32/Float64/strings/binary/decimals), so
-//! [`arrow_to_parquet_physical`] errors on the rest. `catalog/tests/types.rs`
+//! Date32/Timestamp/Float32/Float64/strings/binary/decimals), so
+//! [`arrow_to_parquet_physical`] errors on the rest. `writing::type_tests`
 //! round trips every one of them.
 //!
 //! The write path is two halves: [`arrow_to_parquet_physical`] for the physical
@@ -369,6 +369,21 @@ pub fn arrow_to_annotation(data_type: &DataType) -> LeafAnnotation {
             converted_type: Some(CONVERTED_DATE),
             ..LeafAnnotation::default()
         },
+        // `is_adjusted_to_utc` is false because a pivot timestamp has no time
+        // zone: the flag would tell a reader to shift the value into its
+        // session's. The legacy spelling has no such flag and the format
+        // defines it as the adjusted one, so a reader old enough to resolve
+        // only that one reads these as UTC; it is written anyway because every
+        // writer in the ecosystem writes it for a microsecond timestamp, and
+        // leaving it off would have that reader see a bare INT64 instead.
+        DataType::Timestamp(TimeUnit::Microsecond, None) => LeafAnnotation {
+            logical_type: Some(LogicalType::Timestamp {
+                unit: ParquetTimeUnit::MICROS,
+                is_adjusted_to_utc: false,
+            }),
+            converted_type: Some(CONVERTED_TIMESTAMP_MICROS),
+            ..LeafAnnotation::default()
+        },
         // A decimal carries its full description: the precision and scale that
         // place the point, and the fixed length its widest storage declares.
         DataType::Decimal64(precision, scale) | DataType::Decimal128(precision, scale) => {
@@ -433,6 +448,7 @@ pub fn arrow_to_parquet_physical(data_type: &DataType) -> Result<i32> {
         // A date is its day count, stored as the INT32 the DATE annotation
         // (stamped alongside it) tells a reader to interpret.
         DataType::Date32 => INT32,
+        DataType::Timestamp(TimeUnit::Microsecond, None) => INT64,
         DataType::Float32 => FLOAT,
         DataType::Float64 => DOUBLE,
         DataType::Utf8 | DataType::Utf8View | DataType::BinaryView => BYTE_ARRAY,
