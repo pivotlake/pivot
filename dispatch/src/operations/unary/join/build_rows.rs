@@ -10,7 +10,7 @@
 //! This module is the only place that knows how an id splits. Everything else
 //! goes through [`BuildRowBatches`], [`split_row_id`], or [`first_row_id`].
 
-use crate::arrays::accumulator::ChunkedColumns;
+use arrow::array::ArrayData;
 use arrow_array::RecordBatch;
 use arrow_schema::ArrowError;
 
@@ -35,6 +35,13 @@ pub(crate) fn split_row_id(row_id: u32) -> (usize, usize) {
 #[inline(always)]
 pub(crate) fn first_row_id(build_row_batch_idx: usize) -> usize {
     build_row_batch_idx << BATCH_SHIFT
+}
+
+/// How a row id splits, as the opaque shift the accumulator's gather takes:
+/// `id >> shift` is the batch, the low bits the row within it.
+#[inline(always)]
+pub(crate) fn row_id_shift() -> u32 {
+    BATCH_SHIFT
 }
 
 /// The build rows one worker stores during its consume phase, and, after
@@ -116,13 +123,22 @@ impl BuildRowBatches {
     pub(crate) fn gather_source(
         &self,
         columns: &[usize],
-    ) -> Result<(Vec<RecordBatch>, ChunkedColumns), ArrowError> {
+    ) -> Result<(Vec<RecordBatch>, Vec<Vec<ArrayData>>), ArrowError> {
         let projected: Vec<RecordBatch> = self
             .batches
             .iter()
             .map(|batch| batch.project(columns))
             .collect::<Result<_, _>>()?;
-        let gather = ChunkedColumns::prepare(&projected, BATCH_SHIFT);
+        // Resolve each column's per-batch ArrayData once, so gathering reads
+        // a flat list instead of chasing batch -> column -> data per row.
+        let gather = (0..columns.len())
+            .map(|column| {
+                projected
+                    .iter()
+                    .map(|batch| batch.column(column).to_data())
+                    .collect()
+            })
+            .collect();
         Ok((projected, gather))
     }
 }

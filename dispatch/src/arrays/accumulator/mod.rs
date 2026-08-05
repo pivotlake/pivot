@@ -32,7 +32,6 @@
 //!   group waiting for its file to finish encoding) must not pin those buffers,
 //!   so it copies the values into blocks of its own instead.
 
-mod chunked;
 mod column;
 mod concatenated;
 mod fixed_width;
@@ -40,8 +39,7 @@ mod structs;
 mod validity;
 mod view;
 
-pub use chunked::ChunkedColumns;
-
+use arrow::array::ArrayData;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{ArrowError, DataType, Fields, SchemaRef};
 
@@ -185,24 +183,23 @@ impl BatchAccumulator {
         self.append_selection(batch, SourceSelection::Indices(indices), allocator);
     }
 
-    /// Append the rows of a chunked row store at the encoded `ids`
-    /// (`batch << shift | row`, see [`ChunkedColumns`]), which must be no
-    /// more than the remaining [`capacity`](Self::capacity). The source's
-    /// schema must match the accumulator's.
+    /// Append rows stored across many batches at the encoded `ids`
+    /// (`batch << shift | row`), which must be no more than the remaining
+    /// [`capacity`](Self::capacity). `columns` holds, per accumulator column,
+    /// one [`ArrayData`] per source batch (`RecordBatch::column(_).to_data()`,
+    /// resolved once by the caller); their schema must match the
+    /// accumulator's.
     pub fn append_chunked_by_ids(
         &mut self,
-        source: &ChunkedColumns,
+        columns: &[Vec<ArrayData>],
+        shift: u32,
         ids: &[u32],
         allocator: &mut SlabAllocator,
     ) {
         debug_assert!(self.len + ids.len() <= self.capacity);
-        for (accumulator, column) in self.columns.iter_mut().zip(&source.columns) {
+        for (accumulator, column) in self.columns.iter_mut().zip(columns) {
             accumulator.append(
-                AppendSource::Chunked {
-                    column,
-                    ids,
-                    shift: source.shift,
-                },
+                AppendSource::Chunked { column, ids, shift },
                 self.len,
                 allocator,
             );
