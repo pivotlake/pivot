@@ -44,8 +44,7 @@ use crate::operations::unary::join::directory::JoinDirectory;
 pub(crate) use factory::create_for_workers as create_join_factories;
 
 /// Which columns of each side the join emits, as indices into the probe and
-/// build input schemas. Downstream operators that ignore some join columns
-/// declare that here so the probe never materializes values nobody reads.
+/// build input schemas.
 #[derive(Debug, Clone)]
 pub struct JoinOutputColumns {
     pub probe: Vec<usize>,
