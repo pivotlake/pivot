@@ -105,7 +105,7 @@ pub(crate) struct UnmatchedScan {
     /// Probe workers that may still mark a matched build row. Each decrements
     /// it once, on entering `finish`, after which that worker never consumes
     /// again; at zero the flags are final and the scan below can start.
-    probes_live: AtomicUsize,
+    probes_finished: AtomicUsize,
     /// The next build row batch the scan hands out, so workers claim disjoint
     /// stretches of the flag array.
     cursor: AtomicUsize,
@@ -114,7 +114,7 @@ pub(crate) struct UnmatchedScan {
 impl UnmatchedScan {
     fn new(worker_count: usize) -> Self {
         Self {
-            probes_live: AtomicUsize::new(worker_count),
+            probes_finished: AtomicUsize::new(worker_count),
             cursor: AtomicUsize::new(0),
         }
     }

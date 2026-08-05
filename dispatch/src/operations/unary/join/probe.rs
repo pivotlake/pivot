@@ -44,7 +44,7 @@ const RING_SIZE: usize = 64;
 const MASK: usize = RING_SIZE - 1;
 const PREFETCH_LENGTH: usize = 63;
 
-pub struct Probe<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> {
+pub struct Probe<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool> {
     table: JoinTable<K::Stored>,
     hash_state: RandomState,
     key_columns: Vec<usize>,
@@ -77,7 +77,7 @@ struct BuildGather {
     columns: ChunkedColumns,
 }
 
-impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Probe<K, BUILD_OUTER, SEMI> {
+impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool> Probe<K, OUTER_JOIN_BUILD_SIDE, SEMI> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         table: JoinTable<K::Stored>,
@@ -181,7 +181,7 @@ impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Probe<K, BUILD_OUTER
         let verifier = K::make_verifier(build_rows.batches(), &self.build_key_columns);
         let keys = unsafe { &*self.table.keys.get() };
         let rows = unsafe { &*self.table.rows.get() };
-        let out = ProbeMatchCollector::<K, BUILD_OUTER, SEMI> {
+        let out = ProbeMatchCollector::<K, OUTER_JOIN_BUILD_SIDE, SEMI> {
             keys,
             rows,
             matched_flags: unsafe { &*self.table.matched.get() },
@@ -217,8 +217,8 @@ impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Probe<K, BUILD_OUTER
     }
 }
 
-impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Unary<RecordBatch, RecordBatch>
-    for Probe<K, BUILD_OUTER, SEMI>
+impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool> Unary<RecordBatch, RecordBatch>
+    for Probe<K, OUTER_JOIN_BUILD_SIDE, SEMI>
 {
     fn consume(
         &mut self,
@@ -227,8 +227,7 @@ impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Unary<RecordBatch, R
     ) -> unary::Result<()> {
         let build_rows = unsafe { &*self.table.build_rows.get() };
         if build_rows.is_empty() {
-            // Empty build side: nothing matches, and an outer build has no rows
-            // to carry through unmatched either.
+            // Empty build side, nothing to match
             return Ok(());
         }
 
@@ -257,20 +256,17 @@ impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Unary<RecordBatch, R
             if !self.outputter.probe.is_empty() {
                 self.outputter.emit(&mut self.allocator, sender)?;
             }
-            if BUILD_OUTER {
-                // Release this worker's flag writes and leave the barrier. It
-                // is sound to leave it here and nowhere earlier: `consume` is
-                // never called again once `finish` has run.
-                self.unmatched.probes_live.fetch_sub(1, Ordering::Release);
+            if OUTER_JOIN_BUILD_SIDE {
+                self.unmatched.probes_finished.fetch_sub(1, Ordering::Release);
             }
         }
-        if !BUILD_OUTER {
+        if !OUTER_JOIN_BUILD_SIDE {
             return Ok(true);
         }
 
         // A peer still probing can yet flag a row this worker would otherwise
         // read as unmatched, so the scan waits for all of them to arrive here.
-        if self.unmatched.probes_live.load(Ordering::Acquire) != 0 {
+        if self.unmatched.probes_finished.load(Ordering::Acquire) != 0 {
             return Ok(false);
         }
         let build_rows = unsafe { &*self.table.build_rows.get() };
