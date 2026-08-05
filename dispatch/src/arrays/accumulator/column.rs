@@ -5,9 +5,56 @@
 
 use arrow::array::ArrayData;
 use arrow_array::ArrayRef;
-use arrow_schema::ArrowError;
+use arrow_schema::{ArrowError, DataType};
 
 use crate::memory::SlabAllocator;
+
+/// A column stored across many batches, prepared for gathering rows by
+/// encoded id.
+///
+/// The batches are held as [`ArrayData`] (Arrow's own type-erased form: the
+/// buffers, offset, validity, and children of one array), and each batch's
+/// values pointer is resolved up front, so a gather loop reads one flat
+/// pointer list per row instead of chasing through the batch's buffer list.
+pub struct ChunkedColumn {
+    /// One [`ArrayData`] per batch. Owning these is what keeps `values`
+    /// valid, and the non-gather paths (validity, data buffers, children,
+    /// slicing) read the batch through them.
+    pub(super) data: Vec<ArrayData>,
+    /// Per batch, the address of its first element in its values buffer, the
+    /// element offset already applied. Null for a type whose values are not
+    /// one fixed-stride buffer; such a column never reads this list.
+    pub(super) values: Vec<*const u8>,
+}
+
+impl ChunkedColumn {
+    pub fn new(data: Vec<ArrayData>) -> Self {
+        let values = data.iter().map(resolve_values_pointer).collect();
+        Self { data, values }
+    }
+}
+
+/// The address of a batch's first element, for the types whose values are one
+/// fixed-stride buffer: every primitive width, and the 16-byte views of a view
+/// array. Anything else gathers through [`ChunkedColumn::data`] instead.
+fn resolve_values_pointer(data: &ArrayData) -> *const u8 {
+    let width = match data.data_type() {
+        DataType::Utf8View | DataType::BinaryView => size_of::<u128>(),
+        other => match other.primitive_width() {
+            Some(width) => width,
+            None => return std::ptr::null(),
+        },
+    };
+    // SAFETY: a fixed-stride array's first buffer holds `offset + len`
+    // elements of `width` bytes, so the offset element is in bounds.
+    unsafe { data.buffers()[0].as_ptr().add(data.offset() * width) }
+}
+
+// SAFETY: the pointers address buffers `data` keeps alive through their Arcs,
+// and everything reachable through them is read-only, exactly the access
+// `data` itself would hand any thread.
+unsafe impl Send for ChunkedColumn {}
+unsafe impl Sync for ChunkedColumn {}
 
 /// One column of an accumulation: rows are copied in with
 /// [`append`](ColumnAccumulator::append) and handed to Arrow with
@@ -49,13 +96,10 @@ pub(super) enum AppendSource<'a> {
         column: &'a ArrayRef,
         selection: SourceSelection<'a>,
     },
-    /// Rows of a column split across many batches, at the encoded `ids`
-    /// (`batch << shift | row`). One [`ArrayData`] per batch, resolved once
-    /// by the caller ([`ArrayData`] is Arrow's own type-erased form: the
-    /// buffers, offset, validity, and children of one array), so the per-row
-    /// work here is indexing, never type resolution.
+    /// Rows of a [`ChunkedColumn`], at the encoded `ids`
+    /// (`batch << shift | row`).
     Chunked {
-        column: &'a [ArrayData],
+        column: &'a ChunkedColumn,
         ids: &'a [u32],
         shift: u32,
     },

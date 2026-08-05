@@ -72,7 +72,7 @@ impl ColumnAccumulator for ConcatenatedColumn {
                 // Consecutive same-batch rows become one slice, as above.
                 let mut push = |batch: usize, start: usize, len: usize| {
                     self.arrays
-                        .push(make_array(column[batch].slice(start, len)));
+                        .push(make_array(column.data[batch].slice(start, len)));
                 };
                 let mut run: Option<(usize, usize, usize)> = None;
                 for &id in ids {

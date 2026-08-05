@@ -15,9 +15,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, StructArray};
 use arrow_schema::{ArrowError, Fields};
 
-use arrow::array::ArrayData;
-
-use super::column::{AppendSource, ColumnAccumulator};
+use super::column::{AppendSource, ChunkedColumn, ColumnAccumulator};
 use super::validity::ValidityMask;
 use super::{ValueStorage, create_column_accumulator};
 use crate::memory::SlabAllocator;
@@ -75,16 +73,21 @@ impl ColumnAccumulator for StructColumn {
             AppendSource::Chunked { column, ids, shift } => {
                 self.validity
                     .append_by_ids(ids, shift, destination_start, |batch| {
-                        column[batch].nulls().filter(|nulls| nulls.null_count() > 0)
+                        column.data[batch]
+                            .nulls()
+                            .filter(|nulls| nulls.null_count() > 0)
                     });
-                // Each child gets its own per-batch data list. Materializing
-                // it here clones one Arc-backed ArrayData per batch per
-                // append, which is fine for the rare struct-typed column.
+                // Each child gets its own chunked column. Materializing it
+                // here clones one Arc-backed ArrayData per batch per append,
+                // which is fine for the rare struct-typed column.
                 for (k, child) in self.children.iter_mut().enumerate() {
-                    let child_column: Vec<ArrayData> = column
-                        .iter()
-                        .map(|data| data.child_data()[k].clone())
-                        .collect();
+                    let child_column = ChunkedColumn::new(
+                        column
+                            .data
+                            .iter()
+                            .map(|data| data.child_data()[k].clone())
+                            .collect(),
+                    );
                     child.append(
                         AppendSource::Chunked {
                             column: &child_column,

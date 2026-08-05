@@ -22,7 +22,7 @@
 //! accumulator ever fills, since such a join carries no build columns.
 
 use crate::RECORD_BATCH_SIZE;
-use crate::arrays::accumulator::BatchAccumulator;
+use crate::arrays::accumulator::{BatchAccumulator, ChunkedColumn};
 use crate::memory::{MultiSlabBuffer, SlabAllocator};
 use crate::operations::Unary;
 use crate::operations::channels::Sender;
@@ -33,7 +33,6 @@ use crate::operations::unary::join::directory::{JoinDirectory, prefetch_ptr_l2};
 use crate::operations::unary::join::keys::JoinKey;
 use crate::operations::unary::join::{JoinOutputColumns, JoinTable, UnmatchedScan};
 use ahash::RandomState;
-use arrow::array::ArrayData;
 use arrow_array::{RecordBatch, new_null_array};
 use arrow_schema::{Field, Schema, SchemaRef};
 use std::cmp::min;
@@ -72,11 +71,11 @@ pub struct Probe<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> {
 
 /// The stored build rows bound for reading output columns back: the batches
 /// restricted to the listed build columns (for the unmatched pass's per-batch
-/// scan), and each column's per-batch [`ArrayData`], resolved once so
-/// gathering matched rows by row id reads a flat list.
+/// scan), and the same columns prepared once as [`ChunkedColumn`]s for
+/// gathering matched rows by row id.
 struct BuildGather {
     build_row_batches: Vec<RecordBatch>,
-    columns: Vec<Vec<ArrayData>>,
+    columns: Vec<ChunkedColumn>,
 }
 
 impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> Probe<K, BUILD_OUTER, SEMI> {
@@ -384,9 +383,9 @@ struct ProbeMatchCollector<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SE
     /// The probed batch restricted to the listed probe columns.
     probe_source: &'b RecordBatch,
     outputter: &'a mut Outputter,
-    /// The stored build rows' listed columns, one [`ArrayData`] per batch
-    /// each, gathered from by row id.
-    build_columns: &'a [Vec<ArrayData>],
+    /// The stored build rows' listed columns, prepared for gathering by row
+    /// id.
+    build_columns: &'a [ChunkedColumn],
 
     probe_indices: &'a mut [u32],
     build_indices: &'a mut [u32],

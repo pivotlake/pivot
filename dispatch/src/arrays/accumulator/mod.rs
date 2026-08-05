@@ -39,12 +39,12 @@ mod structs;
 mod validity;
 mod view;
 
-use arrow::array::ArrayData;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{ArrowError, DataType, Fields, SchemaRef};
 
 use crate::RECORD_BATCH_SIZE;
 use crate::memory::{BUFFER_SIZE, SlabAllocator};
+pub use column::ChunkedColumn;
 use column::{AppendSource, ColumnAccumulator, SourceSelection};
 use concatenated::ConcatenatedColumn;
 use fixed_width::FixedWidthColumn;
@@ -185,13 +185,12 @@ impl BatchAccumulator {
 
     /// Append rows stored across many batches at the encoded `ids`
     /// (`batch << shift | row`), which must be no more than the remaining
-    /// [`capacity`](Self::capacity). `columns` holds, per accumulator column,
-    /// one [`ArrayData`] per source batch (`RecordBatch::column(_).to_data()`,
-    /// resolved once by the caller); their schema must match the
+    /// [`capacity`](Self::capacity). `columns` holds one prepared
+    /// [`ChunkedColumn`] per accumulator column; their schema must match the
     /// accumulator's.
     pub fn append_chunked_by_ids(
         &mut self,
-        columns: &[Vec<ArrayData>],
+        columns: &[ChunkedColumn],
         shift: u32,
         ids: &[u32],
         allocator: &mut SlabAllocator,
