@@ -202,6 +202,16 @@ fn string_values(start: usize, n: usize) -> ArrayRef {
     Arc::new(b.finish())
 }
 
+/// The string key for each listed id, in the same format as [`string_values`],
+/// so probe rows drawing ids reproduce the build side's keys exactly.
+fn string_keys(ids: &[usize]) -> ArrayRef {
+    let mut b = StringViewBuilder::with_capacity(ids.len());
+    for &i in ids {
+        b.append_value(format!("value-{:012}-tail{:06}", i, i % 971));
+    }
+    Arc::new(b.finish())
+}
+
 fn schema(fields: Vec<Field>) -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
@@ -760,6 +770,64 @@ fn bench_joins(c: &mut Criterion, d: &DataFlowDispatcher) {
             },
             vec![DataType::Int64],
             single_key_spec(vec![1], vec![1, 2, 3, 4, 5, 6], JoinKind::Inner),
+        );
+    }
+
+    // (j) A string-keyed join, which no compiled key shape covers: the
+    //     dynamic fallback key end to end. The stored key is a hash, so every
+    //     candidate is re-verified against the build row's actual string, and
+    //     the verifier is built over the full stored build side per probed
+    //     batch. Probe: 8M rows drawing uniformly from 4M unique ~25-byte
+    //     string keys, one i64 gathered from each side.
+    {
+        let probe_rows = scaled(8_000_000);
+        let build_rows = scaled(4_000_000);
+        bench(
+            c,
+            d,
+            "join/dynamic_string_key",
+            probe_rows,
+            move || {
+                let psch = schema(vec![
+                    Field::new("k", DataType::Utf8View, false),
+                    i64_field("v"),
+                ]);
+                let bsch = schema(vec![
+                    Field::new("k", DataType::Utf8View, false),
+                    i64_field("b1"),
+                ]);
+                let mut rng = Rng::new(20);
+                JoinData {
+                    probe: batch_sizes(probe_rows)
+                        .map(|n| {
+                            let ids: Vec<usize> = (0..n).map(|_| rng.below(build_rows)).collect();
+                            batch(&psch, vec![string_keys(&ids), i64_values(&mut rng, n)])
+                        })
+                        .collect(),
+                    build: {
+                        let mut start = 0;
+                        batch_sizes(build_rows)
+                            .map(|n| {
+                                let ids: Vec<usize> = (start..start + n).collect();
+                                let b =
+                                    batch(&bsch, vec![string_keys(&ids), i64_values(&mut rng, n)]);
+                                start += n;
+                                b
+                            })
+                            .collect()
+                    },
+                }
+            },
+            vec![DataType::Utf8View],
+            JoinSpec {
+                build_key_indices: vec![0],
+                probe_key_indices: vec![0],
+                probe_fields: vec![Field::new("v", DataType::Int64, false)],
+                build_fields: vec![Field::new("b1", DataType::Int64, false)],
+                probe_output_indices: vec![1],
+                build_output_indices: vec![1],
+                kind: JoinKind::Inner,
+            },
         );
     }
 }
