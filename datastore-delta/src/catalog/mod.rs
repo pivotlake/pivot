@@ -128,8 +128,9 @@ impl From<Error> for CatalogError {
 #[derive(Clone, Default)]
 struct DatastoreIndex {
     /// Every schema the datastore defines, always including
-    /// [`DEFAULT_SCHEMA_NAME`], each mapping its table names to identities. A
-    /// schema with no tables in it is still a schema.
+    /// [`DEFAULT_SCHEMA_NAME`](planner::DEFAULT_SCHEMA_NAME), each mapping its
+    /// table names to identities. A schema with no tables in it is still a
+    /// schema.
     schemas: HashMap<String, HashMap<String, Uuid>>,
     tables_by_id: HashMap<Uuid, CatalogTable>,
 }
