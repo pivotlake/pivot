@@ -107,7 +107,7 @@ fn restamp_decimal(array: ArrayRef, precision: u8, scale: i8) -> ArrayRef {
         assert_eq!(
             decimal.scale(),
             scale,
-            "arrow and DuckDB derived different scales for a decimal result"
+            "arrow and the planner derived different scales for a decimal result"
         );
         Arc::new(
             decimal

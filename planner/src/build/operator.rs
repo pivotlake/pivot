@@ -260,7 +260,7 @@ fn bind_table(wrapper: OptionalTableWrapper) -> Box<dyn BoundTable> {
     let any: Box<dyn Any> = duck;
     let adapter: Box<DuckDBTableAdapter> = any
         .downcast::<DuckDBTableAdapter>()
-        .expect("scan table should be a DuckDBTableAdapter");
+        .expect("scan table should be the planner's table adapter");
     adapter.table
 }
 

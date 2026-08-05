@@ -80,7 +80,7 @@ pub(super) fn build_insert_spec(
                 let batch = unshred_batch(batch)
                     .expect("a variant column reassembles into metadata and value");
                 RecordBatch::try_new(schema.clone(), batch.columns().to_vec())
-                    .expect("DuckDB INSERT binding matches the target table schema")
+                    .expect("INSERT binding matches the target table schema")
             }
         }
     });
