@@ -706,6 +706,68 @@ fn bench_joins(c: &mut Criterion, d: &DataFlowDispatcher) {
             },
         );
     }
+
+    // (i) The output gather as the dominant cost: a full-match single-key
+    //     join whose build side carries six value columns, every one gathered
+    //     for every probe row. The probe pipeline is as cheap as it gets
+    //     (unique keys, multiplicity one), so most samples land in the
+    //     chunked gather itself, reading a build payload far larger than any
+    //     cache through a couple thousand stored batches. This is the canary
+    //     for per-row costs in the gather path (an extra dependent load per
+    //     row shows up here first); the mixed scenarios above dilute such a
+    //     change several-fold. Run it at scale >= 1: a smaller build keeps
+    //     the payload and the per-batch metadata cache-resident and hides
+    //     exactly what it exists to catch.
+    {
+        let probe_rows = scaled(16_000_000);
+        let build_rows = scaled(16_000_000);
+        bench(
+            c,
+            d,
+            "join/wide_payload_gather",
+            probe_rows,
+            move || {
+                let psch = schema(vec![i64_field("k"), i64_field("v")]);
+                let bsch = schema(vec![
+                    i64_field("k"),
+                    i64_field("b1"),
+                    i64_field("b2"),
+                    i64_field("b3"),
+                    i64_field("b4"),
+                    i64_field("b5"),
+                    i64_field("b6"),
+                ]);
+                let mut rng = Rng::new(19);
+                JoinData {
+                    probe: batch_sizes(probe_rows)
+                        .map(|n| {
+                            batch(
+                                &psch,
+                                vec![
+                                    uniform_keys(&mut rng, n, build_rows),
+                                    i64_values(&mut rng, n),
+                                ],
+                            )
+                        })
+                        .collect(),
+                    build: {
+                        let mut start = 0;
+                        batch_sizes(build_rows)
+                            .map(|n| {
+                                let mut cols = vec![unique_keys(start, n)];
+                                cols.extend((0..6).map(|_| i64_values(&mut rng, n)));
+                                let b = batch(&bsch, cols);
+                                start += n;
+                                b
+                            })
+                            .collect()
+                    },
+                }
+            },
+            vec![DataType::Int64],
+            single_key_spec(vec![1], vec![1, 2, 3, 4, 5, 6], JoinKind::Inner),
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -719,6 +781,13 @@ fn main() {
         "dispatch join benches: {workers} workers, {buffers} ring buffers, scale {}",
         scale()
     );
+    if scale() < 1.0 {
+        eprintln!(
+            "WARNING: scale < 1 shrinks the build sides into cache; \
+             comparisons of gather-path or other cache-sensitive changes \
+             are NOT valid at this scale"
+        );
+    }
 
     let dispatch = Dispatch::spin_up(workers, buffers, None);
     let dispatcher = dispatch.dispatcher().clone();
