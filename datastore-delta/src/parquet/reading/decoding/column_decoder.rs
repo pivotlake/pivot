@@ -1,32 +1,28 @@
-//! Decodes one projected output column, from its Parquet leaves to the array
-//! the batch carries.
+//! Turns a row group's decoded Parquet leaves into one projected output column.
 //!
-//! A [`ColumnDecoder`] owns a [`LeafDecoder`] per leaf column chunk it reads,
-//! the field those leaves fold back into, and the transform that finishes the
-//! folded array. A plain column reads all of its leaves and needs no transform.
-//! A pushed-down variant extract reads only the leaves its path needs, and its
-//! transform casts the typed leaf or pulls the path out of the reconstructed
-//! variant.
+//! A [`ColumnDecoder`] names the leaves this output folds, the field they fold
+//! into, and the transform that finishes the folded array. A plain column folds
+//! all of its leaves and needs no transform. A pushed-down variant extract
+//! folds only the leaves its path needs, and its transform casts the typed leaf
+//! or pulls the path out of the reconstructed variant.
+//!
+//! The leaves themselves are decoded once per row group and shared, because
+//! several extracts on one variant column routinely want the same ones.
 
-use crate::parquet::reading::decoding::ScanEqualityPredicate;
 use crate::parquet::reading::decoding::leaf_decoders;
 use crate::parquet::reading::decoding::leaf_decoders::{
     BytesViewDecoder, LeafDecoder, PrimitiveLeafDecoder, decimal_decoder,
 };
-use crate::parquet::types::leaves::{
-    leaf_range, plan_variant_extract, reconstruct_column_from_leaves, try_extract_typed_leaf,
-};
-use crate::parquet::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata};
-use crate::parquet::types::page::DecompressedPage;
+use crate::parquet::types::leaves::{OutputRead, reconstruct_column_from_leaves};
+use crate::parquet::types::metadata::ColumnChunkMeta;
+use arrow_array::ArrayRef;
 use arrow_array::types::{
     BinaryViewType, Date32Type, Decimal64Type, Decimal128Type, Float32Type, Float64Type, Int16Type,
     Int32Type, Int64Type, StringViewType, TimestampMicrosecondType, UInt8Type, UInt16Type,
     UInt32Type, UInt64Type,
 };
-use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{ArrowError, DataType, Field, FieldRef, TimeUnit};
+use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, TimeUnit};
 use dispatch::VariantExtract;
-use dispatch::memory::SlabAllocator;
 use parquet_variant::{VariantPath, VariantPathElement};
 use parquet_variant_compute::{GetOptions, variant_get};
 use std::sync::Arc;
@@ -95,204 +91,87 @@ fn extract_variant_path(
 
 /// Decodes one output column of a row group's batches.
 ///
-/// The leaf decoders are ordered exactly as
-/// [`projected_leaves`](crate::parquet::types::leaves::projected_leaves)
-/// resolves this column, which is how a fetched leaf finds the decoder that
-/// consumes it.
+/// The leaf column chunks themselves are decoded once by the
+/// [`RowGroupDecoder`](super::row_group_decoder::RowGroupDecoder) and shared:
+/// this is the view that folds the subset of them this output needs and
+/// finishes the result.
 pub struct ColumnDecoder {
-    /// One decoder per leaf column chunk read for this column, in Parquet's
-    /// depth-first order.
-    leaf_decoders: Vec<Box<dyn LeafDecoder>>,
-    /// The decoded leaf arrays fold back under this field. It is the output
-    /// field for a plain column, and for an extract it is whatever the read
-    /// leaves reconstruct: the typed leaf, a pruned variant, or the whole
-    /// variant struct.
+    /// The positions within the row group's decoded leaves that this output
+    /// folds, in Parquet's depth-first order.
+    leaf_positions: Vec<usize>,
+    /// The folded leaves land under this field. It is the output field for a
+    /// plain column, and for an extract it is whatever the read leaves
+    /// reconstruct: the typed leaf, a pruned variant, or the whole variant.
     pre_transform_field: FieldRef,
     /// Finishes the folded array. `None` for a plain column.
     transform: Option<OutputTransform>,
     /// The field this column contributes to the batch schema.
     output_field: FieldRef,
-    /// Whether this column carries a pushed-down equality constant whose
-    /// column chunk is sound to prune the row group by (all data pages
-    /// dictionary encoded).
-    prunable: bool,
 }
 
 impl ColumnDecoder {
-    /// Builds a decoder that reads all of `column`'s leaves.
-    pub fn for_column(
-        column: usize,
-        leaf_fields: &[FieldRef],
-        metadata: &QueryRowGroupMetadata,
-        eq_predicates: &[ScanEqualityPredicate],
-    ) -> Result<Self> {
-        let fields = metadata.get_metadata().schema.fields();
-        let file_leaves: Vec<usize> = leaf_range(fields, column).collect();
-        let mut decoder = Self::from_leaves(
-            &file_leaves,
-            fields[column].clone(),
-            None,
-            fields[column].clone(),
-            leaf_fields,
-            metadata.columns(),
-        )?;
-        // A whole-column read answers a comparison on the column itself, never
-        // one that reaches into a variant path.
-        if let Some(predicate) = eq_predicates
-            .iter()
-            .find(|p| p.column_idx == column && p.path.is_empty())
-        {
-            decoder.install_eq_constant(predicate, &file_leaves, metadata.columns());
-        }
-        Ok(decoder)
-    }
-
-    /// Builds a decoder that reads only what a pushed-down `extract` on variant
-    /// `column` needs in this file.
+    /// Builds the view for an output column that resolved to `read`.
     ///
-    /// A scalar extract reads only a complete shredded typed leaf when possible.
-    /// It otherwise reconstructs the whole variant before extracting the scalar.
-    /// A bare extract reconstructs only the shredded path subtree when possible,
-    /// or the whole variant when the path is not shredded.
-    pub fn for_extract(
+    /// A plain column folds its leaves and is done. A scalar extract that
+    /// reached a complete shredded typed leaf reads that leaf and casts it when
+    /// the leaf's own type is not what the extract asks for. Every other
+    /// extract reconstructs a variant, whether the pruned path subtree or the
+    /// whole column, and reads the path out of it.
+    pub fn new(
         column: usize,
-        extract: &VariantExtract,
+        extract: Option<&VariantExtract>,
+        read: &OutputRead,
+        leaf_positions: Vec<usize>,
         leaf_fields: &[FieldRef],
-        metadata: &QueryRowGroupMetadata,
-        eq_predicates: &[ScanEqualityPredicate],
+        fields: &Fields,
     ) -> Result<Self> {
-        let fields = metadata.get_metadata().schema.fields();
         let column_name = fields[column].name();
         let create_output_field =
             |data_type: DataType| Arc::new(Field::new(column_name, data_type, true));
-        // The read leaves reconstruct `pre_transform_field`, which `transform`
-        // then finishes into `output_field`.
-        let (file_leaves, pre_transform_field, transform, output_field) = match &extract.as_type {
-            Some(as_type) => {
-                match try_extract_typed_leaf(fields, metadata, column, &extract.path) {
-                    Some(typed_leaf) => {
-                        let leaf_type = leaf_fields[typed_leaf].data_type();
-                        (
-                            vec![typed_leaf],
-                            create_output_field(leaf_type.clone()),
-                            (*leaf_type != *as_type)
-                                .then(|| OutputTransform::Cast(as_type.clone())),
-                            create_output_field(as_type.clone()),
-                        )
-                    }
-                    None => (
-                        leaf_range(fields, column).collect(),
-                        fields[column].clone(),
-                        Some(OutputTransform::Extract {
-                            path: extract.path.clone().into(),
-                            as_type: Some(as_type.clone()),
-                        }),
-                        create_output_field(as_type.clone()),
-                    ),
-                }
-            }
-            None => {
-                let (file_leaves, pre_transform_field) =
-                    match plan_variant_extract(fields, column, &extract.path) {
-                        Some(plan) => (plan.file_leaves, plan.nest_field),
-                        None => (leaf_range(fields, column).collect(), fields[column].clone()),
-                    };
-                // The output type is whatever `variant_get` yields for the path
-                // over this variant shape. Resolving it once from an empty array
-                // fixes the row group's output schema before any batch is
-                // decoded.
-                let empty_variant = arrow_array::new_empty_array(pre_transform_field.data_type());
-                let output_type = extract_variant_path(&empty_variant, &extract.path, &None)?
-                    .data_type()
-                    .clone();
+        let (pre_transform_field, transform, output_field) = match (extract, read) {
+            (None, _) => (fields[column].clone(), None, fields[column].clone()),
+            (Some(extract), OutputRead::TypedLeaf(leaf)) => {
+                let as_type = extract
+                    .as_type
+                    .as_ref()
+                    .expect("only a scalar extract resolves to a typed leaf");
+                let leaf_type = leaf_fields[*leaf].data_type();
                 (
-                    file_leaves,
-                    pre_transform_field,
+                    create_output_field(leaf_type.clone()),
+                    (*leaf_type != *as_type).then(|| OutputTransform::Cast(as_type.clone())),
+                    create_output_field(as_type.clone()),
+                )
+            }
+            (Some(extract), OutputRead::PrunedVariant { nest_field, .. }) => (
+                nest_field.clone(),
+                Some(OutputTransform::Extract {
+                    path: extract.path.clone().into(),
+                    as_type: None,
+                }),
+                create_output_field(variant_path_output_type(nest_field, &extract.path)?),
+            ),
+            (Some(extract), OutputRead::WholeColumn(_)) => {
+                let nest_field = fields[column].clone();
+                let output_type = match &extract.as_type {
+                    Some(as_type) => as_type.clone(),
+                    None => variant_path_output_type(&nest_field, &extract.path)?,
+                };
+                (
+                    nest_field,
                     Some(OutputTransform::Extract {
                         path: extract.path.clone().into(),
-                        as_type: None,
+                        as_type: extract.as_type.clone(),
                     }),
                     create_output_field(output_type),
                 )
             }
         };
-
-        let mut decoder = Self::from_leaves(
-            &file_leaves,
-            pre_transform_field,
-            transform,
-            output_field,
-            leaf_fields,
-            metadata.columns(),
-        )?;
-        // A pushed extract answers a comparison that names the very path it
-        // reads, on the same variant column.
-        if let Some(predicate) = eq_predicates
-            .iter()
-            .find(|p| p.column_idx == column && p.path == extract.path)
-        {
-            decoder.install_eq_constant(predicate, &file_leaves, metadata.columns());
-        }
-        Ok(decoder)
-    }
-
-    /// Builds the leaf decoders for `file_leaves` and assembles the column
-    /// around them. The result carries no equality constant yet.
-    fn from_leaves(
-        file_leaves: &[usize],
-        pre_transform_field: FieldRef,
-        transform: Option<OutputTransform>,
-        output_field: FieldRef,
-        leaf_fields: &[FieldRef],
-        column_chunks: &[ColumnChunkMeta],
-    ) -> Result<Self> {
-        let leaf_decoders = file_leaves
-            .iter()
-            .map(|&leaf| create_leaf_decoder(leaf_fields[leaf].data_type(), &column_chunks[leaf]))
-            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            leaf_decoders,
+            leaf_positions,
             pre_transform_field,
             transform,
             output_field,
-            prunable: false,
         })
-    }
-
-    /// Installs a pushed-down equality `predicate` on this column, and records
-    /// whether the row group is then sound to prune by it.
-    ///
-    /// Both uses of the constant read the column's leaf directly:
-    /// [`dict_excludes_eq_constant`](Self::dict_excludes_eq_constant) answers
-    /// from that leaf's dictionary, and
-    /// [`fast_filter_record_batch`](Self::fast_filter_record_batch) compares the
-    /// emitted batch's own array against the dictionary's view of the constant.
-    /// A column that casts or reconstructs its leaves emits something other
-    /// than the leaf, so it can use neither. The constant therefore goes in only
-    /// when the column emits exactly one leaf unchanged.
-    ///
-    /// It also goes in only when every data page of that chunk is dictionary
-    /// encoded. The decoder uses the constant to skip building a dictionary that
-    /// excludes it, which is sound only when an excluded dictionary prunes the
-    /// whole row group. A PLAIN fallback page could hold the constant even if
-    /// the dictionary does not, so such a chunk is still scanned and its
-    /// dictionary must be built to decode it.
-    ///
-    /// A constant whose type does not match the leaf is dropped by the leaf
-    /// decoder, which forgoes the pushdown; the query's `Filter` still applies
-    /// the comparison.
-    fn install_eq_constant(
-        &mut self,
-        predicate: &ScanEqualityPredicate,
-        file_leaves: &[usize],
-        column_chunks: &[ColumnChunkMeta],
-    ) {
-        let [leaf] = file_leaves else { return };
-        if self.transform.is_some() || !column_chunks[*leaf].data_pages_all_dictionary {
-            return;
-        }
-        self.leaf_decoders[0].set_eq_constant(&predicate.value);
-        self.prunable = true;
     }
 
     /// Returns the field this column contributes to the batch schema.
@@ -300,76 +179,51 @@ impl ColumnDecoder {
         &self.output_field
     }
 
-    /// Returns how many leaf column chunks this column reads.
-    pub fn leaf_count(&self) -> usize {
-        self.leaf_decoders.len()
+    /// The single decoded leaf this column emits unchanged, if that is what it
+    /// is: the only shape a pushed-down equality constant can be installed on.
+    ///
+    /// Both uses of such a constant read that leaf directly. The row group is
+    /// pruned from the leaf's own dictionary, and the batch filter compares the
+    /// emitted array against the dictionary's view of the constant. A column
+    /// that casts its leaf or reconstructs a variant emits something else
+    /// entirely, so it can use neither.
+    pub fn untransformed_leaf(&self) -> Option<usize> {
+        match (self.transform.is_some(), self.leaf_positions.as_slice()) {
+            (false, [position]) => Some(*position),
+            _ => None,
+        }
     }
 
-    /// Returns how many rows this column can decode from the pages buffered so
-    /// far.
-    pub fn available(&self) -> usize {
-        self.leaf_decoders
+    /// Folds this column's share of the row group's `decoded` leaves into its
+    /// output array.
+    pub fn read(&self, decoded: &[ArrayRef]) -> Result<ArrayRef> {
+        let mut leaf_arrays = self
+            .leaf_positions
             .iter()
-            .map(|leaf| leaf.available())
-            .min()
-            .expect("a column reads at least one leaf")
-    }
-
-    /// Buffers a decompressed page for the leaf at `leaf` within this column.
-    pub fn insert_page(
-        &mut self,
-        leaf: usize,
-        page: DecompressedPage,
-        allocator: &mut SlabAllocator,
-    ) {
-        self.leaf_decoders[leaf].insert_page(page, allocator);
-    }
-
-    /// Decodes the next `size` rows into this column's output array.
-    pub fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef> {
-        let leaf_arrays = self
-            .leaf_decoders
-            .iter_mut()
-            .map(|leaf| leaf.read(allocator, size).map_err(Error::from))
-            .collect::<Result<Vec<_>>>()?;
-        let column =
-            reconstruct_column_from_leaves(&self.pre_transform_field, &mut leaf_arrays.into_iter());
+            .map(|&position| decoded[position].clone());
+        let column = reconstruct_column_from_leaves(&self.pre_transform_field, &mut leaf_arrays);
         match &self.transform {
             Some(transform) => transform.apply(&column),
             None => Ok(column),
         }
     }
+}
 
-    /// Whether a pushed-down equality constant on this column is sound to prune
-    /// the whole row group by. Only such a column is worth asking
-    /// [`dict_excludes_eq_constant`](Self::dict_excludes_eq_constant).
-    pub fn is_prunable(&self) -> bool {
-        self.prunable
-    }
-
-    /// Whether a loaded dictionary is known to exclude this column's
-    /// pushed-down equality constant, meaning no row can match.
-    pub fn dict_excludes_eq_constant(&self) -> bool {
-        self.leaf_decoders
-            .iter()
-            .any(|leaf| leaf.dict_excludes_eq_constant())
-    }
-
-    /// Drops rows that cannot pass this column's pushed-down equality constant,
-    /// where `column` is its position in `batch`. Most leaf decoders leave the
-    /// batch untouched; dictionary encoded string columns filter it with a
-    /// cheap view comparison.
-    pub fn fast_filter_record_batch(&self, batch: RecordBatch, column: usize) -> RecordBatch {
-        self.leaf_decoders.iter().fold(batch, |batch, leaf| {
-            leaf.fast_filter_record_batch(batch, column)
-        })
-    }
+/// The type `variant_get` yields for `path` over this variant shape.
+///
+/// Resolving it once from an empty array fixes the row group's output schema
+/// before any batch is decoded.
+fn variant_path_output_type(nest_field: &FieldRef, path: &[String]) -> Result<DataType> {
+    let empty_variant = arrow_array::new_empty_array(nest_field.data_type());
+    Ok(extract_variant_path(&empty_variant, path, &None)?
+        .data_type()
+        .clone())
 }
 
 /// Creates a leaf decoder for `data_type`.
 ///
 /// The chunk metadata disambiguates a decimal's physical storage.
-fn create_leaf_decoder(
+pub fn create_leaf_decoder(
     data_type: &DataType,
     chunk: &ColumnChunkMeta,
 ) -> Result<Box<dyn LeafDecoder>> {
