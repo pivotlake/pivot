@@ -827,9 +827,10 @@ fn live_log_files(dir: &std::path::Path) -> std::collections::HashSet<String> {
     live
 }
 
-#[tokio::test]
-async fn compact_final_merges_small_insert_files() {
-    let conn = conn().await;
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn compact_final_merges_small_insert_files(#[future] conn: Conn) {
     let dir = tempfile::tempdir().unwrap();
     conn.simple_query(&format!(
         "CREATE TABLE compact_me (id BIGINT) WITH (path = '{}')",
@@ -851,12 +852,40 @@ async fn compact_final_merges_small_insert_files() {
     assert_eq!(rows, vec![vec![Some("5".into()), Some("10".into())]]);
 }
 
-#[tokio::test]
-async fn compact_of_a_missing_table_errors() {
-    let conn = conn().await;
-
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn compact_of_a_missing_table_errors(#[future] conn: Conn) {
     let result = conn.simple_query("COMPACT no_such_table FINAL").await;
 
     let message = format!("{:?}", result.unwrap_err());
     assert!(message.contains("no table named"), "{message}");
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn compact_accepts_a_fully_qualified_table_name(#[future] conn: Conn) {
+    let dir = tempfile::tempdir().unwrap();
+    conn.simple_query(&format!(
+        "CREATE TABLE compact_qualified (id BIGINT) WITH (path = '{}')",
+        dir.path().to_str().unwrap()
+    ))
+    .await
+    .unwrap();
+    for i in 0..4 {
+        conn.simple_query(&format!("INSERT INTO compact_qualified VALUES ({i})"))
+            .await
+            .unwrap();
+    }
+
+    // The default datastore's name is also a reserved SQL keyword, so the
+    // qualified form needs it quoted.
+    conn.simple_query("COMPACT \"default\".main.compact_qualified FINAL")
+        .await
+        .unwrap();
+
+    assert_eq!(live_log_files(dir.path()).len(), 1);
+    let rows = select_rows(&conn, "SELECT COUNT(*) FROM compact_qualified").await;
+    assert_eq!(rows, vec![vec![Some("4".into())]]);
 }
