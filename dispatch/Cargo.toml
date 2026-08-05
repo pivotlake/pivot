@@ -78,6 +78,10 @@ criterion = { workspace = true }
 name = "operators"
 harness = false
 
+[[bench]]
+name = "joins"
+harness = false
+
 # HTTP(S) range-read throughput (`benches/http_range.rs`): stands up a loopback
 # backend and drives the HTTP engine via a standalone `IORequester`. Needs
 # `test-util` for `init_test_free_pool` (the out-of-crate single-worker context).
