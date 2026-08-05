@@ -21,7 +21,7 @@ use arrow_array::{Array, ArrayRef, make_array};
 use arrow_buffer::Buffer;
 use arrow_schema::{ArrowError, DataType};
 
-use super::column::{AppendSource, ColumnAccumulator, SourceSelection};
+use super::column::{ColumnAccumulator, SourceSelection};
 use super::fixed_width::gather_fixed_width;
 use super::validity::ValidityMask;
 use super::{BUFFER_SIZE, ValueStorage};
@@ -44,12 +44,12 @@ pub(super) struct ViewColumn {
     views: SlabBuffer<u128>,
     values: ViewValues,
     validity: ValidityMask,
-    /// Per-chunk rebase cache for chunked appends: the buffer-list position a
-    /// chunk's data buffers were registered at. An entry is live only while
+    /// Per-batch rebase cache for multi-batch appends: the buffer-list position
+    /// a batch's data buffers were registered at. An entry is live only while
     /// its generation matches `generation`, which
     /// [`take_array`](ColumnAccumulator::take_array) bumps because the buffer
     /// list resets with every emitted batch.
-    chunk_bases: Vec<(u64, u32)>,
+    batch_bases: Vec<(u64, u32)>,
     generation: u64,
 }
 
@@ -122,7 +122,7 @@ impl ViewColumn {
                 ValueStorage::CopyValues => ViewValues::OwnedBlocks { blocks: Vec::new() },
             },
             validity: ValidityMask::new(capacity),
-            chunk_bases: Vec::new(),
+            batch_bases: Vec::new(),
             generation: 1,
         }
     }
@@ -180,17 +180,17 @@ impl ViewColumn {
     /// Read the view at `row` of one batch's [`ArrayData`]: buffer 0 holds
     /// the 16-byte views, with the array's element offset applied.
     #[inline(always)]
-    fn view_at(chunk: &ArrayData, row: usize) -> u128 {
+    fn view_at(batch: &ArrayData, row: usize) -> u128 {
         // SAFETY: `row` is an in-bounds position of this array, and a view
         // array's first buffer holds one 16-byte view per element.
         unsafe {
-            (chunk.buffers()[0].as_ptr() as *const u128)
-                .add(chunk.offset() + row)
+            (batch.buffers()[0].as_ptr() as *const u128)
+                .add(batch.offset() + row)
                 .read_unaligned()
         }
     }
 
-    fn append_chunked(
+    fn append_batches(
         &mut self,
         column: &[ArrayData],
         ids: &[u32],
@@ -202,13 +202,13 @@ impl ViewColumn {
             .append_by_ids(ids, shift, destination_start, |batch| {
                 column[batch].nulls().filter(|nulls| nulls.null_count() > 0)
             });
-        if self.chunk_bases.len() < column.len() {
-            self.chunk_bases.resize(column.len(), (0, 0));
+        if self.batch_bases.len() < column.len() {
+            self.batch_bases.resize(column.len(), (0, 0));
         }
         let Self {
             views,
             values,
-            chunk_bases,
+            batch_bases,
             generation,
             ..
         } = self;
@@ -221,17 +221,17 @@ impl ViewColumn {
                     let mut dst = views.ptr_at_index(destination_start);
                     for &id in ids {
                         let batch_idx = (id >> shift) as usize;
-                        let chunk = &column[batch_idx];
-                        let mut view = Self::view_at(chunk, (id & mask) as usize);
+                        let batch = &column[batch_idx];
+                        let mut view = Self::view_at(batch, (id & mask) as usize);
                         // A view longer than the inline limit points into its
                         // batch's data buffers (buffers 1 onward); register
                         // those once per emitted batch and rebase the buffer
                         // index onto the list.
                         if view as u32 > INLINE_VIEW_LEN {
-                            let entry = chunk_bases.get_unchecked_mut(batch_idx);
+                            let entry = batch_bases.get_unchecked_mut(batch_idx);
                             if entry.0 != *generation {
                                 *entry = (*generation, buffers.len() as u32);
-                                buffers.extend(chunk.buffers()[1..].iter().cloned());
+                                buffers.extend(batch.buffers()[1..].iter().cloned());
                             }
                             view += (entry.1 as u128) << 64;
                         }
@@ -242,15 +242,15 @@ impl ViewColumn {
             }
             ViewValues::OwnedBlocks { blocks } => {
                 for (destination, &id) in (destination_start..).zip(ids) {
-                    let chunk = &column[(id >> shift) as usize];
-                    let view = Self::view_at(chunk, (id & mask) as usize);
+                    let batch = &column[(id >> shift) as usize];
+                    let view = Self::view_at(batch, (id & mask) as usize);
                     let length = view as u32;
                     let copied = if length <= INLINE_VIEW_LEN {
                         view
                     } else {
                         let buffer = (view >> 64) as u32 as usize;
                         let offset = (view >> 96) as u32 as usize;
-                        let value = &chunk.buffers()[1 + buffer][offset..offset + length as usize];
+                        let value = &batch.buffers()[1 + buffer][offset..offset + length as usize];
                         copy_value(blocks, value, allocator)
                     };
                     // SAFETY: the slab has room for `destination_start` plus
@@ -263,20 +263,25 @@ impl ViewColumn {
 }
 
 impl ColumnAccumulator for ViewColumn {
-    fn append(
+    fn append_from_single_batch(
         &mut self,
-        source: AppendSource<'_>,
+        column: &ArrayRef,
+        selection: SourceSelection<'_>,
         destination_start: usize,
         allocator: &mut SlabAllocator,
     ) {
-        match source {
-            AppendSource::Batch { column, selection } => {
-                self.append_batch(column, selection, destination_start, allocator)
-            }
-            AppendSource::Chunked { column, ids, shift } => {
-                self.append_chunked(column, ids, shift, destination_start, allocator)
-            }
-        }
+        self.append_batch(column, selection, destination_start, allocator)
+    }
+
+    fn append_from_batches(
+        &mut self,
+        column: &[ArrayData],
+        ids: &[u32],
+        shift: u32,
+        destination_start: usize,
+        allocator: &mut SlabAllocator,
+    ) {
+        self.append_batches(column, ids, shift, destination_start, allocator)
     }
 
     fn take_array(

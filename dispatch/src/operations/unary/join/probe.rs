@@ -353,7 +353,7 @@ impl ProbeMatchOutputter {
         // A semi join has no build columns and buffered no build rows: its
         // build side only ever contributes its (empty) column list on emit.
         if !SEMI_PROBE_SIDE {
-            self.build.append_chunked_by_ids(
+            self.build.append_from_batches(
                 &build_rows.output_columns,
                 build_rows::row_id_shift(),
                 &self.build_indices[..self.matched],

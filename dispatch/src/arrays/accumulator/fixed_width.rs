@@ -10,7 +10,7 @@ use arrow::array::ArrayData;
 use arrow_array::{ArrayRef, make_array};
 use arrow_schema::{ArrowError, DataType};
 
-use super::column::{AppendSource, ColumnAccumulator, SourceSelection};
+use super::column::{ColumnAccumulator, SourceSelection};
 use super::validity::ValidityMask;
 use crate::arrays::slab_into_buffer;
 use crate::memory::{SlabAllocator, SlabBuffer};
@@ -41,13 +41,17 @@ impl FixedWidthColumn {
         }
     }
 
-    fn append_batch(
+}
+
+impl ColumnAccumulator for FixedWidthColumn {
+    fn append_from_single_batch(
         &mut self,
-        source: &ArrayRef,
+        column: &ArrayRef,
         selection: SourceSelection<'_>,
         destination_start: usize,
+        _allocator: &mut SlabAllocator,
     ) {
-        let data = source.to_data();
+        let data = column.to_data();
         self.validity
             .append(data.nulls(), selection, destination_start);
         let width = self.width;
@@ -73,12 +77,13 @@ impl FixedWidthColumn {
         }
     }
 
-    fn append_chunked(
+    fn append_from_batches(
         &mut self,
         column: &[ArrayData],
         ids: &[u32],
         shift: u32,
         destination_start: usize,
+        _allocator: &mut SlabAllocator,
     ) {
         self.validity
             .append_by_ids(ids, shift, destination_start, |batch| {
@@ -90,30 +95,12 @@ impl FixedWidthColumn {
         unsafe {
             let dst = (self.slab.ptr_at_index(0) as *mut u8).add(destination_start * self.width);
             match self.width {
-                1 => gather_chunked::<u8>(column, ids, shift, dst),
-                2 => gather_chunked::<u16>(column, ids, shift, dst),
-                4 => gather_chunked::<u32>(column, ids, shift, dst),
-                8 => gather_chunked::<u64>(column, ids, shift, dst),
-                16 => gather_chunked::<u128>(column, ids, shift, dst),
+                1 => gather_batches::<u8>(column, ids, shift, dst),
+                2 => gather_batches::<u16>(column, ids, shift, dst),
+                4 => gather_batches::<u32>(column, ids, shift, dst),
+                8 => gather_batches::<u64>(column, ids, shift, dst),
+                16 => gather_batches::<u128>(column, ids, shift, dst),
                 _ => unreachable!("built only for the widths above"),
-            }
-        }
-    }
-}
-
-impl ColumnAccumulator for FixedWidthColumn {
-    fn append(
-        &mut self,
-        source: AppendSource<'_>,
-        destination_start: usize,
-        _allocator: &mut SlabAllocator,
-    ) {
-        match source {
-            AppendSource::Batch { column, selection } => {
-                self.append_batch(column, selection, destination_start)
-            }
-            AppendSource::Chunked { column, ids, shift } => {
-                self.append_chunked(column, ids, shift, destination_start)
             }
         }
     }
@@ -189,14 +176,14 @@ pub(super) unsafe fn gather_fixed_width<T: Copy>(src: *const u8, dst: *mut u8, i
 /// Every id must name an in-bounds row of an in-bounds batch, `dst` must have
 /// room for `ids.len()` elements, and all pointers must be valid for unaligned
 /// `T` access.
-unsafe fn gather_chunked<T: Copy>(chunks: &[ArrayData], ids: &[u32], shift: u32, dst: *mut u8) {
+unsafe fn gather_batches<T: Copy>(batches: &[ArrayData], ids: &[u32], shift: u32, dst: *mut u8) {
     let mask = (1u32 << shift) - 1;
     let dst = dst as *mut T;
     unsafe {
         for (out_idx, &id) in ids.iter().enumerate() {
-            let chunk = chunks.get_unchecked((id >> shift) as usize);
-            let src = (chunk.buffers().get_unchecked(0).as_ptr() as *const T)
-                .add(chunk.offset() + (id & mask) as usize);
+            let batch = batches.get_unchecked((id >> shift) as usize);
+            let src = (batch.buffers().get_unchecked(0).as_ptr() as *const T)
+                .add(batch.offset() + (id & mask) as usize);
             dst.add(out_idx).write_unaligned(src.read_unaligned());
         }
     }

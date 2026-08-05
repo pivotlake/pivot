@@ -45,7 +45,7 @@ use arrow_schema::{ArrowError, DataType, Fields, SchemaRef};
 
 use crate::RECORD_BATCH_SIZE;
 use crate::memory::{BUFFER_SIZE, SlabAllocator};
-use column::{AppendSource, ColumnAccumulator, SourceSelection};
+use column::{ColumnAccumulator, SourceSelection};
 use concatenated::ConcatenatedColumn;
 use fixed_width::FixedWidthColumn;
 use structs::StructColumn;
@@ -76,7 +76,9 @@ pub enum ValueStorage {
 }
 
 /// Accumulates rows of many batches and hands them out as one batch (see the
-/// module docs). Rows arrive via [`append_batch_by_indices`](Self::append_batch_by_indices) or
+/// module docs). Rows arrive via
+/// [`append_batch_by_indices`](Self::append_batch_by_indices),
+/// [`append_from_batches`](Self::append_from_batches), or
 /// [`append_range`](Self::append_range); [`take_batch`](Self::take_batch) hands
 /// out the accumulated rows and resets.
 pub struct BatchAccumulator {
@@ -189,7 +191,7 @@ impl BatchAccumulator {
     /// one [`ArrayData`] per source batch (`RecordBatch::column(_).to_data()`,
     /// resolved once by the caller); their schema must match the
     /// accumulator's.
-    pub fn append_chunked_by_ids(
+    pub fn append_from_batches(
         &mut self,
         columns: &[Vec<ArrayData>],
         shift: u32,
@@ -198,11 +200,7 @@ impl BatchAccumulator {
     ) {
         debug_assert!(self.len + ids.len() <= self.capacity);
         for (accumulator, column) in self.columns.iter_mut().zip(columns) {
-            accumulator.append(
-                AppendSource::Chunked { column, ids, shift },
-                self.len,
-                allocator,
-            );
+            accumulator.append_from_batches(column, ids, shift, self.len, allocator);
         }
         self.len += ids.len();
     }
@@ -231,11 +229,7 @@ impl BatchAccumulator {
     ) {
         debug_assert!(self.len + selection.len() <= self.capacity);
         for (accumulator, column) in self.columns.iter_mut().zip(batch.columns()) {
-            accumulator.append(
-                AppendSource::Batch { column, selection },
-                self.len,
-                allocator,
-            );
+            accumulator.append_from_single_batch(column, selection, self.len, allocator);
         }
         self.len += selection.len();
     }

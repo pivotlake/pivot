@@ -19,7 +19,7 @@ use arrow_schema::ArrowError;
 
 use arrow_array::make_array;
 
-use super::column::{AppendSource, ColumnAccumulator, SourceSelection};
+use super::column::{ColumnAccumulator, SourceSelection};
 use crate::memory::SlabAllocator;
 
 /// A column held as the arrays it was appended from, concatenated on emit.
@@ -34,23 +34,18 @@ impl ConcatenatedColumn {
 }
 
 impl ColumnAccumulator for ConcatenatedColumn {
-    fn append(
+    fn append_from_single_batch(
         &mut self,
-        source: AppendSource<'_>,
+        column: &ArrayRef,
+        selection: SourceSelection<'_>,
         _destination_start: usize,
         _allocator: &mut SlabAllocator,
     ) {
-        match source {
-            AppendSource::Batch {
-                column,
-                selection: SourceSelection::Range { start, len },
-            } => self.arrays.push(column.slice(start, len)),
+        match selection {
+            SourceSelection::Range { start, len } => self.arrays.push(column.slice(start, len)),
             // Consecutive positions become one slice, so a selection that keeps
             // a run of rows costs one array rather than one per row.
-            AppendSource::Batch {
-                column,
-                selection: SourceSelection::Indices(indices),
-            } => {
+            SourceSelection::Indices(indices) => {
                 let mut run: Option<(usize, usize)> = None;
                 for &row in indices {
                     let row = row as usize;
@@ -67,32 +62,40 @@ impl ColumnAccumulator for ConcatenatedColumn {
                     self.arrays.push(column.slice(start, end - start));
                 }
             }
-            AppendSource::Chunked { column, ids, shift } => {
-                let mask = (1u32 << shift) - 1;
-                // Consecutive same-batch rows become one slice, as above.
-                let mut push = |batch: usize, start: usize, len: usize| {
-                    self.arrays
-                        .push(make_array(column[batch].slice(start, len)));
-                };
-                let mut run: Option<(usize, usize, usize)> = None;
-                for &id in ids {
-                    let batch = (id >> shift) as usize;
-                    let row = (id & mask) as usize;
-                    match run {
-                        Some((run_batch, start, end)) if run_batch == batch && row == end => {
-                            run = Some((run_batch, start, end + 1));
-                        }
-                        Some((run_batch, start, end)) => {
-                            push(run_batch, start, end - start);
-                            run = Some((batch, row, row + 1));
-                        }
-                        None => run = Some((batch, row, row + 1)),
-                    }
+        }
+    }
+
+    fn append_from_batches(
+        &mut self,
+        column: &[arrow::array::ArrayData],
+        ids: &[u32],
+        shift: u32,
+        _destination_start: usize,
+        _allocator: &mut SlabAllocator,
+    ) {
+        let mask = (1u32 << shift) - 1;
+        // Consecutive same-batch rows become one slice, as above.
+        let mut push = |batch: usize, start: usize, len: usize| {
+            self.arrays
+                .push(make_array(column[batch].slice(start, len)));
+        };
+        let mut run: Option<(usize, usize, usize)> = None;
+        for &id in ids {
+            let batch = (id >> shift) as usize;
+            let row = (id & mask) as usize;
+            match run {
+                Some((run_batch, start, end)) if run_batch == batch && row == end => {
+                    run = Some((run_batch, start, end + 1));
                 }
-                if let Some((run_batch, start, end)) = run {
+                Some((run_batch, start, end)) => {
                     push(run_batch, start, end - start);
+                    run = Some((batch, row, row + 1));
                 }
+                None => run = Some((batch, row, row + 1)),
             }
+        }
+        if let Some((run_batch, start, end)) = run {
+            push(run_batch, start, end - start);
         }
     }
 

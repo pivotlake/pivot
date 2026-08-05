@@ -1,7 +1,6 @@
 //! The contract every column of a [`BatchAccumulator`](super::BatchAccumulator)
-//! is accumulated through, and the way an append says which source rows it
-//! takes. The module docs of [`accumulator`](super) map out which
-//! implementation a column type gets and why.
+//! is accumulated through. The module docs of [`accumulator`](super) map out
+//! which implementation a column type gets and why.
 
 use arrow::array::ArrayData;
 use arrow_array::ArrayRef;
@@ -9,25 +8,35 @@ use arrow_schema::ArrowError;
 
 use crate::memory::SlabAllocator;
 
-/// One column of an accumulation: rows are copied in with
-/// [`append`](ColumnAccumulator::append) and handed to Arrow with
-/// [`take_array`](ColumnAccumulator::take_array).
+/// One column of an accumulation. Rows are copied in with the append methods
+/// and handed to Arrow with [`take_array`](ColumnAccumulator::take_array).
 ///
 /// An implementation is built for one Arrow type and one capacity and keeps
 /// both, so neither is passed back in on every call. It must tolerate being
 /// taken from and appended to again: an accumulator is reused for as many
 /// batches as its owner emits.
 pub(super) trait ColumnAccumulator {
-    /// Append this column's rows of `source`, landing at accumulated row
-    /// `destination_start` in source order. The caller has already checked
-    /// that they fit in the capacity the accumulator was built for.
+    /// Append selected rows from one batch's column.
     ///
     /// `allocator` is drawn on only by an implementation that copies values
     /// (see [`ValueStorage`](super::ValueStorage)); one that retains the
     /// source's buffers never touches it.
-    fn append(
+    fn append_from_single_batch(
         &mut self,
-        source: AppendSource<'_>,
+        column: &ArrayRef,
+        selection: SourceSelection<'_>,
+        destination_start: usize,
+        allocator: &mut SlabAllocator,
+    );
+
+    /// Append rows from a column stored across batches. Each `id` encodes
+    /// `batch << shift | row`, and `column` contains one [`ArrayData`] per
+    /// batch.
+    fn append_from_batches(
+        &mut self,
+        column: &[ArrayData],
+        ids: &[u32],
+        shift: u32,
         destination_start: usize,
         allocator: &mut SlabAllocator,
     );
@@ -39,26 +48,6 @@ pub(super) trait ColumnAccumulator {
         len: usize,
         allocator: &mut SlabAllocator,
     ) -> Result<ArrayRef, ArrowError>;
-}
-
-/// Where an append's rows come from.
-#[derive(Clone, Copy)]
-pub(super) enum AppendSource<'a> {
-    /// Rows of one batch's column, picked by a [`SourceSelection`].
-    Batch {
-        column: &'a ArrayRef,
-        selection: SourceSelection<'a>,
-    },
-    /// Rows of a column split across many batches, at the encoded `ids`
-    /// (`batch << shift | row`). One [`ArrayData`] per batch, resolved once
-    /// by the caller ([`ArrayData`] is Arrow's own type-erased form: the
-    /// buffers, offset, validity, and children of one array), so the per-row
-    /// work here is indexing, never type resolution.
-    Chunked {
-        column: &'a [ArrayData],
-        ids: &'a [u32],
-        shift: u32,
-    },
 }
 
 /// Which rows of a single source column an append takes.
