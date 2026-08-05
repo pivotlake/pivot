@@ -9,9 +9,7 @@ use arrow_array::{Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 
 use common::*;
-use dispatch::{
-    AggregationKind, AggregationSlot, JoinKind, JoinOutputColumns, JoinSpec, values_input,
-};
+use dispatch::{AggregationKind, AggregationSlot, JoinKind, JoinSpec, values_input};
 
 /// Non-nullable `Int64` output fields, which is what every column of these
 /// tests' batches is.
@@ -22,13 +20,14 @@ fn int64_fields(count: usize) -> Vec<Field> {
 }
 
 /// An inner join keyed on column 0 of both sides.
-fn inner_join(output_columns: JoinOutputColumns) -> JoinSpec {
+fn inner_join(probe_output_indices: Vec<usize>, build_output_indices: Vec<usize>) -> JoinSpec {
     JoinSpec {
-        build_key_columns: vec![0],
-        probe_key_columns: vec![0],
-        probe_fields: int64_fields(output_columns.probe.len()),
-        build_fields: int64_fields(output_columns.build.len()),
-        output_columns,
+        probe_key_indices: vec![0],
+        build_key_indices: vec![0],
+        probe_fields: int64_fields(probe_output_indices.len()),
+        build_fields: int64_fields(build_output_indices.len()),
+        probe_output_indices,
+        build_output_indices,
         kind: JoinKind::Inner,
     }
 }
@@ -62,11 +61,7 @@ fn join_matching_keys() {
     let probe = values_input(&d, vec![int64_batch("id", &[20, 30, 99])]).record_batches();
 
     let results = probe
-        .join(
-            build,
-            &[DataType::Int64],
-            inner_join(JoinOutputColumns::keep_all(1, 1)),
-        )
+        .join(build, &[DataType::Int64], inner_join(vec![0], vec![0]))
         .collect()
         .unwrap();
 
@@ -94,11 +89,12 @@ fn join_on_int32_keys() {
             build,
             &[DataType::Int32],
             JoinSpec {
-                build_key_columns: vec![0],
-                probe_key_columns: vec![0],
+                probe_key_indices: vec![0],
+                build_key_indices: vec![0],
+                probe_output_indices: vec![0],
+                build_output_indices: vec![0],
                 probe_fields: int32_field("probe_id"),
                 build_fields: int32_field("build_id"),
-                output_columns: JoinOutputColumns::keep_all(1, 1),
                 kind: JoinKind::Inner,
             },
         )
@@ -126,11 +122,7 @@ fn join_no_matches() {
     let probe = values_input(&d, vec![int64_batch("id", &[4, 5, 6])]).record_batches();
 
     let results = probe
-        .join(
-            build,
-            &[DataType::Int64],
-            inner_join(JoinOutputColumns::keep_all(1, 1)),
-        )
+        .join(build, &[DataType::Int64], inner_join(vec![0], vec![0]))
         .collect()
         .unwrap();
 
@@ -144,11 +136,7 @@ fn join_duplicate_build_keys() {
     let probe = values_input(&d, vec![int64_batch("id", &[10])]).record_batches();
 
     let results = probe
-        .join(
-            build,
-            &[DataType::Int64],
-            inner_join(JoinOutputColumns::keep_all(1, 1)),
-        )
+        .join(build, &[DataType::Int64], inner_join(vec![0], vec![0]))
         .collect()
         .unwrap();
 
@@ -164,11 +152,7 @@ fn join_all_keys_match() {
     let probe = values_input(&d, vec![int64_batch("id", &[5, 4, 3, 2, 1])]).record_batches();
 
     let results = probe
-        .join(
-            build,
-            &[DataType::Int64],
-            inner_join(JoinOutputColumns::keep_all(1, 1)),
-        )
+        .join(build, &[DataType::Int64], inner_join(vec![0], vec![0]))
         .collect()
         .unwrap();
 
@@ -187,11 +171,7 @@ fn join_large_tables() {
     let probe = values_input(&d, vec![int64_batch("id", &probe_keys)]).record_batches();
 
     let results = probe
-        .join(
-            build,
-            &[DataType::Int64],
-            inner_join(JoinOutputColumns::keep_all(1, 1)),
-        )
+        .join(build, &[DataType::Int64], inner_join(vec![0], vec![0]))
         .collect()
         .unwrap();
 
@@ -207,11 +187,7 @@ fn join_then_count() {
     let probe = values_input(&d, vec![int64_batch("id", &[20, 30, 99])]).record_batches();
 
     let results = probe
-        .join(
-            build,
-            &[DataType::Int64],
-            inner_join(JoinOutputColumns::keep_all(1, 1)),
-        )
+        .join(build, &[DataType::Int64], inner_join(vec![0], vec![0]))
         .aggregate::<i64>(vec![AggregationSlot::new(
             AggregationKind::CountStar,
             0,
@@ -248,14 +224,12 @@ fn join_keeps_only_listed_columns() {
             build,
             &[DataType::Int64],
             JoinSpec {
-                build_key_columns: vec![0],
-                probe_key_columns: vec![0],
+                probe_key_indices: vec![0],
+                build_key_indices: vec![0],
+                probe_output_indices: vec![1],
+                build_output_indices: vec![1],
                 probe_fields: vec![Field::new("p_payload", DataType::Int64, false)],
                 build_fields: vec![Field::new("b_payload", DataType::Int64, false)],
-                output_columns: JoinOutputColumns {
-                    probe: vec![1],
-                    build: vec![1],
-                },
                 kind: JoinKind::Inner,
             },
         )
@@ -273,13 +247,17 @@ fn join_keeps_only_listed_columns() {
 
 /// A build-side outer join keyed on column 0 of both sides, whose probe side
 /// contributes one nullable `Int64` column to the output.
-fn build_outer_join(output_columns: JoinOutputColumns) -> JoinSpec {
+fn build_outer_join(
+    probe_output_indices: Vec<usize>,
+    build_output_indices: Vec<usize>,
+) -> JoinSpec {
     JoinSpec {
-        build_key_columns: vec![0],
-        probe_key_columns: vec![0],
+        probe_key_indices: vec![0],
+        build_key_indices: vec![0],
+        probe_output_indices,
+        build_fields: int64_fields(build_output_indices.len()),
+        build_output_indices,
         probe_fields: vec![Field::new("id", DataType::Int64, true)],
-        build_fields: int64_fields(output_columns.build.len()),
-        output_columns,
         kind: JoinKind::BuildOuter,
     }
 }
@@ -294,7 +272,7 @@ fn build_outer_join_emits_unmatched_build_rows() {
         .join(
             build,
             &[DataType::Int64],
-            build_outer_join(JoinOutputColumns::keep_all(1, 1)),
+            build_outer_join(vec![0], vec![0]),
         )
         .collect()
         .unwrap();
@@ -333,7 +311,7 @@ fn every_build_row_reaches_a_build_outer_join_output() {
         .join(
             build,
             &[DataType::Int64],
-            build_outer_join(JoinOutputColumns::keep_all(1, 1)),
+            build_outer_join(vec![0], vec![0]),
         )
         .collect()
         .unwrap();
@@ -346,15 +324,14 @@ fn every_build_row_reaches_a_build_outer_join_output() {
 /// A probe-side semi join keyed on column 0 of both sides, emitting the listed
 /// probe columns and, as every semi join must, no build column.
 fn probe_semi_join(probe_columns: Vec<usize>) -> JoinSpec {
+    let probe_fields = int64_fields(probe_columns.len());
     JoinSpec {
-        build_key_columns: vec![0],
-        probe_key_columns: vec![0],
-        probe_fields: int64_fields(probe_columns.len()),
+        probe_key_indices: vec![0],
+        build_key_indices: vec![0],
+        probe_output_indices: probe_columns,
+        build_output_indices: Vec::new(),
+        probe_fields,
         build_fields: Vec::new(),
-        output_columns: JoinOutputColumns {
-            probe: probe_columns,
-            build: Vec::new(),
-        },
         kind: JoinKind::ProbeSemi,
     }
 }
@@ -486,11 +463,12 @@ fn join_on_two_key_columns_needs_both_to_match() {
             build,
             &[DataType::Int64, DataType::Int64],
             JoinSpec {
-                build_key_columns: vec![0, 1],
-                probe_key_columns: vec![0, 1],
+                probe_key_indices: vec![0, 1],
+                build_key_indices: vec![0, 1],
+                probe_output_indices: vec![0, 1],
+                build_output_indices: vec![0, 1],
                 probe_fields: int64_fields(2),
                 build_fields: int64_fields(2),
-                output_columns: JoinOutputColumns::keep_all(2, 2),
                 kind: JoinKind::Inner,
             },
         )
