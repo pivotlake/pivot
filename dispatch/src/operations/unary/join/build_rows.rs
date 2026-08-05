@@ -41,11 +41,11 @@ pub(crate) struct BuildRows {
 impl BuildRows {
     pub(crate) fn new<const TRACK_MATCHES: bool>(
         batches: Vec<RecordBatch>,
-        output_columns: &[usize],
+        output_indices: &[usize],
     ) -> Result<Self, ArrowError> {
         let output_batches: Vec<RecordBatch> = batches
             .iter()
-            .map(|batch| batch.project(output_columns))
+            .map(|batch| batch.project(output_indices))
             .collect::<Result<_, _>>()?;
         let output_columns = ChunkedColumns::prepare(&output_batches, BATCH_SHIFT);
         let matched = if TRACK_MATCHES {

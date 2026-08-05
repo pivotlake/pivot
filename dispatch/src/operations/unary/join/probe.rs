@@ -1,6 +1,6 @@
 //! The probe side of the hash join: for each probe row whose key matches a
 //! build row, emit the output columns declared in
-//! [`JoinOutputColumns`] — the listed probe columns
+//! [`JoinSpec::probe_output_indices`] — the listed probe columns
 //! followed by the listed build columns, gathered from the stored build row
 //! batches by row id.
 //!
@@ -31,7 +31,7 @@ use crate::operations::unary::join::build::filter_null_keys;
 use crate::operations::unary::join::build_rows::{self, BuildRows};
 use crate::operations::unary::join::directory::{JoinDirectory, prefetch_ptr_l2};
 use crate::operations::unary::join::keys::JoinKey;
-use crate::operations::unary::join::{JoinCell, JoinOutputColumns, JoinTable, UnmatchedScan};
+use crate::operations::unary::join::{JoinCell, JoinSpec, JoinTable, UnmatchedScan};
 use ahash::RandomState;
 use arrow_array::{RecordBatch, new_null_array};
 use arrow_schema::{Field, Schema, SchemaRef};
@@ -47,14 +47,12 @@ const PREFETCH_LENGTH: usize = 63;
 pub struct Probe<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool> {
     table: JoinTable<K::Stored>,
     hash_state: RandomState,
-    probe_key_columns: Vec<usize>,
-    build_key_columns: Vec<usize>,
-    output_columns: Arc<JoinOutputColumns>,
-    output: ProbeMatchCollector,
+    spec: Arc<JoinSpec>,
+    /// Accumulates matches and outputs them
+    match_outputter: ProbeMatchOutputter,
     /// Shared progress of the unmatched pass. Unused by an inner join.
     unmatched: Arc<UnmatchedScan>,
-    /// Whether this worker has entered `finish` — the point it stops probing
-    /// and leaves the barrier the unmatched pass waits on.
+    /// Whether this worker has entered `finish` and will no longer receive new record batches
     probing_done: bool,
 }
 
@@ -65,25 +63,19 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool>
     pub(crate) fn new(
         table: JoinTable<K::Stored>,
         hash_state: RandomState,
-        key_columns: Vec<usize>,
-        build_key_columns: Vec<usize>,
-        output_columns: Arc<JoinOutputColumns>,
-        probe_fields: Arc<Vec<Field>>,
-        build_fields: Arc<Vec<Field>>,
+        spec: Arc<JoinSpec>,
         unmatched: Arc<UnmatchedScan>,
     ) -> Self {
-        let output = ProbeMatchCollector::new(
-            &probe_fields,
-            &build_fields,
+        let output = ProbeMatchOutputter::new(
+            &spec.probe_fields,
+            &spec.build_fields,
             table.build_rows.clone(),
         );
         Self {
             table,
             hash_state,
-            probe_key_columns: key_columns,
-            build_key_columns,
-            output_columns,
-            output,
+            spec,
+            match_outputter: output,
             unmatched,
             probing_done: false,
         }
@@ -99,13 +91,13 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool>
         let build_row_batch_idx = self.unmatched.cursor.fetch_add(1, Ordering::Relaxed);
         let build_rows = unsafe { &*self.table.build_rows.get() };
         if build_row_batch_idx >= build_rows.output_batches.len() {
-            self.output.emit_unmatched_build_rows(sender)?;
+            self.match_outputter.emit_unmatched_build_rows(sender)?;
             return Ok(true);
         }
 
         let batch = &build_rows.output_batches[build_row_batch_idx];
         let first_row_id = build_rows::first_row_id(build_row_batch_idx);
-        self.output.append_unmatched_build_rows(
+        self.match_outputter.append_unmatched_build_rows(
             batch,
             first_row_id,
             sender,
@@ -122,8 +114,8 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool>
     ) -> unary::Result<()> {
         let len = window.num_rows();
         let build_rows = unsafe { &*self.table.build_rows.get() };
-        let reader = K::make_reader(window, &self.probe_key_columns, &self.hash_state);
-        let verifier = K::make_verifier(&build_rows.batches, &self.build_key_columns);
+        let reader = K::make_reader(window, &self.spec.probe_key_indices, &self.hash_state);
+        let verifier = K::make_verifier(&build_rows.batches, &self.spec.build_key_indices);
         let keys = unsafe { &*self.table.keys.get() };
         let rows = unsafe { &*self.table.rows.get() };
         let probe_window = ProbeWindow::<K, OUTER_JOIN_BUILD_SIDE, SEMI> {
@@ -133,7 +125,7 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool>
             verifier,
             window_offset,
             probe_source,
-            output: &mut self.output,
+            output: &mut self.match_outputter,
             sender,
         };
 
@@ -166,12 +158,12 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool> Unary<Reco
             return Ok(());
         }
 
-        let batch = filter_null_keys(batch, &self.probe_key_columns);
+        let batch = filter_null_keys(batch, &self.spec.probe_key_indices);
         if batch.num_rows() == 0 {
             return Ok(());
         }
 
-        let probe_source = batch.project(&self.output_columns.probe)?;
+        let probe_source = batch.project(&self.spec.probe_output_indices)?;
 
         let total = batch.num_rows();
         let mut start = 0;
@@ -187,8 +179,8 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool> Unary<Reco
     fn finish(&mut self, sender: &mut dyn Sender<RecordBatch>) -> unary::Result<bool> {
         if !self.probing_done {
             self.probing_done = true;
-            if !self.output.probe.is_empty() {
-                self.output.emit(sender)?;
+            if !self.match_outputter.probe.is_empty() {
+                self.match_outputter.emit(sender)?;
             }
             if OUTER_JOIN_BUILD_SIDE {
                 self.unmatched.probes_finished.fetch_sub(1, Ordering::Release);
@@ -214,7 +206,7 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool> Unary<Reco
 /// Owns the buffered matches and accumulators that produce the join's output.
 /// Probe and build columns accumulate separately because their rows come from
 /// different sources; every emitted batch splices them under one schema.
-struct ProbeMatchCollector {
+struct ProbeMatchOutputter {
     /// The probe columns listed in the output, then the build columns.
     output_schema: SchemaRef,
     probe: BatchAccumulator,
@@ -228,7 +220,7 @@ struct ProbeMatchCollector {
     matched: usize,
 }
 
-impl ProbeMatchCollector {
+impl ProbeMatchOutputter {
     fn new(
         probe_fields: &[Field],
         build_fields: &[Field],
@@ -384,7 +376,7 @@ struct ProbeWindow<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool
     verifier: K::Verifier<'a>,
     window_offset: usize,
     probe_source: &'b RecordBatch,
-    output: &'a mut ProbeMatchCollector,
+    output: &'a mut ProbeMatchOutputter,
     sender: &'a mut dyn Sender<RecordBatch>,
 }
 

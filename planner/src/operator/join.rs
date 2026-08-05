@@ -21,7 +21,7 @@ use crate::compile::Error;
 use crate::types::{Type, physical_arrow_type};
 use arrow_schema::Field;
 use dispatch::JoinKind as DispatchJoinKind;
-use dispatch::{JoinOutputColumns, JoinSpec, RecordBatchOperatorSpec};
+use dispatch::{JoinSpec, RecordBatchOperatorSpec};
 use std::fmt;
 
 /// Which rows a join emits.
@@ -125,12 +125,10 @@ impl Join {
             })
             .collect();
         let spec = JoinSpec {
-            build_key_columns: self.build_keys.clone(),
-            probe_key_columns: self.probe_keys.clone(),
-            output_columns: JoinOutputColumns {
-                probe: self.probe_output.clone(),
-                build: self.build_output.clone(),
-            },
+            probe_key_indices: self.probe_keys.clone(),
+            build_key_indices: self.build_keys.clone(),
+            probe_output_indices: self.probe_output.clone(),
+            build_output_indices: self.build_output.clone(),
             probe_fields,
             build_fields,
             kind,

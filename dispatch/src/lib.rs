@@ -95,7 +95,7 @@ pub use numa::{Topology, default_worker_count};
 pub use operations::channels::{MpscSender, Sender};
 pub use operations::nullary::Result as NullaryResult;
 pub use operations::unary::filter::{RowDelivery, RowSelection, collect_selected_indices};
-pub use operations::{JoinKind, JoinOutputColumns, JoinSpec};
+pub use operations::{JoinKind, JoinSpec};
 #[cfg(feature = "perf")]
 pub use profiler::worker_tids;
 pub use scan::{

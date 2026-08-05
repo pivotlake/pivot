@@ -6,10 +6,11 @@
 //! is gated on a publication flag set after all build partition jobs complete,
 //! then the probe reads the populated [`JoinTable`].
 //!
-//! Output layout: the probe-side columns listed in [`JoinOutputColumns`] (in
-//! list order) followed by the listed build-side columns. The join is an
-//! equi-join whose key columns are read, hashed, and compared through one of
-//! the [`JoinKey`] shapes, in one of the three [`JoinKind`]s below.
+//! Output layout: the probe-side columns listed in
+//! [`JoinSpec::probe_output_indices`] (in list order) followed by the listed
+//! build-side columns. The join is an equi-join whose key columns are read,
+//! hashed, and compared through one of the [`JoinKey`] shapes, in one of the
+//! three [`JoinKind`]s below.
 //!
 //! A build-side outer join ([`JoinKind::BuildOuter`]) also emits every build
 //! row no probe row matched, its probe columns null-filled. Which rows those
@@ -43,24 +44,6 @@ use crate::operations::unary::join::build_rows::BuildRows;
 use crate::operations::unary::join::directory::JoinDirectory;
 pub(crate) use factory::create_for_workers as create_join_factories;
 
-/// Which columns of each side the join emits, as indices into the probe and
-/// build input schemas.
-#[derive(Debug, Clone)]
-pub struct JoinOutputColumns {
-    pub probe: Vec<usize>,
-    pub build: Vec<usize>,
-}
-
-impl JoinOutputColumns {
-    /// Keep every column of both sides: probe columns then build columns.
-    pub fn keep_all(probe_column_count: usize, build_column_count: usize) -> Self {
-        Self {
-            probe: (0..probe_column_count).collect(),
-            build: (0..build_column_count).collect(),
-        }
-    }
-}
-
 /// Which rows a join emits.
 #[derive(Debug, Clone)]
 pub enum JoinKind {
@@ -72,28 +55,29 @@ pub enum JoinKind {
     /// One output row per probe row that has at least one matching build row,
     /// with no duplicates for a probe row that matches several. That is also
     /// why such a join emits no build columns: there is no single build row to
-    /// take them from, so [`JoinOutputColumns::build`] must be empty.
+    /// take them from, so [`JoinSpec::build_output_indices`] must be empty.
     ProbeSemi,
 }
 
 /// How a join is configured beyond the key shape it is instantiated for.
 #[derive(Debug, Clone)]
 pub struct JoinSpec {
-    /// The key columns' indices in the build input's schema, condition by
-    /// condition, aligned with `probe_key_columns`.
-    pub build_key_columns: Vec<usize>,
-    /// The key columns' indices in the probe input's schema.
-    pub probe_key_columns: Vec<usize>,
-    /// Which columns of each side the join emits.
-    pub output_columns: JoinOutputColumns,
+    /// Indices of probe input columns used as join keys.
+    pub probe_key_indices: Vec<usize>,
+    /// Indices of build input columns used as aligned join keys.
+    pub build_key_indices: Vec<usize>,
+    /// Indices of probe input columns emitted first.
+    pub probe_output_indices: Vec<usize>,
+    /// Indices of build input columns emitted second.
+    pub build_output_indices: Vec<usize>,
     /// The fields the listed probe columns take in the output, in
-    /// `output_columns.probe` order. Stated by the caller rather than read
+    /// `probe_output_indices` order. Stated by the caller rather than read
     /// off a probed batch so every worker shapes identical output whether or
     /// not it ever received a batch, and so an outer join's probe columns can
     /// be nullable regardless of the input's declared nullability.
     pub probe_fields: Vec<Field>,
     /// The fields the listed build columns take in the output, in
-    /// `output_columns.build` order.
+    /// `build_output_indices` order.
     pub build_fields: Vec<Field>,
     /// Which rows reach the output.
     pub kind: JoinKind,
@@ -267,12 +251,10 @@ mod tests {
             .map(|f| f.as_ref().clone())
             .collect();
         let spec = super::JoinSpec {
-            build_key_columns: key_columns.clone(),
-            probe_key_columns: key_columns,
-            output_columns: super::JoinOutputColumns::keep_all(
-                probe_column_count,
-                build_column_count,
-            ),
+            probe_key_indices: key_columns.clone(),
+            build_key_indices: key_columns,
+            probe_output_indices: (0..probe_column_count).collect(),
+            build_output_indices: (0..build_column_count).collect(),
             probe_fields,
             build_fields,
             kind,

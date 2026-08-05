@@ -9,10 +9,7 @@ use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 
 use common::*;
-use dispatch::{
-    DataFlowDispatcher, JoinKind, JoinOutputColumns, JoinSpec, RecordBatchOperatorSpec,
-    values_input,
-};
+use dispatch::{DataFlowDispatcher, JoinKind, JoinSpec, RecordBatchOperatorSpec, values_input};
 
 /// The CTE index the planner would carry over from DuckDB.
 const CTE: usize = 0;
@@ -27,11 +24,12 @@ fn int64_batch(values: &[i64]) -> RecordBatch {
 
 fn inner_join_on_id() -> JoinSpec {
     JoinSpec {
-        build_key_columns: vec![0],
-        probe_key_columns: vec![0],
+        probe_key_indices: vec![0],
+        build_key_indices: vec![0],
+        probe_output_indices: vec![0],
+        build_output_indices: vec![0],
         probe_fields: vec![Field::new("id", DataType::Int64, false)],
         build_fields: vec![Field::new("id", DataType::Int64, false)],
-        output_columns: JoinOutputColumns::keep_all(1, 1),
         kind: JoinKind::Inner,
     }
 }

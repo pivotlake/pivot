@@ -566,11 +566,11 @@ impl RecordBatchOperatorSpec {
     }
 
     /// Hash equi-join: build a hash table from `build`'s rows keyed on
-    /// `spec.build_key_columns`, then probe it with `self`'s rows keyed on
-    /// `spec.probe_key_columns`, emitting one output row per matching pair.
-    /// Each output row is the probe columns listed in `spec.output_columns`
-    /// (in list order) followed by the listed build columns. Rows with a null
-    /// value in any key column on either side never match.
+    /// `spec.build_key_indices`, then probe it with `self`'s rows keyed on
+    /// `spec.probe_key_indices`, emitting one output row per matching pair.
+    /// Each output row is the probe columns listed in
+    /// `spec.probe_output_indices` followed by `spec.build_output_indices`.
+    /// Rows with a null value in any key column on either side never match.
     ///
     /// `spec.kind` picks which rows reach the output: the matching pairs alone,
     /// those plus one row per build row nothing matched (with null probe
@@ -594,23 +594,23 @@ impl RecordBatchOperatorSpec {
         use arrow_array::types as t;
         use arrow_schema::TimeUnit;
         assert_eq!(
-            spec.build_key_columns.len(),
+            spec.build_key_indices.len(),
             key_types.len(),
             "one build key column per key type"
         );
         assert_eq!(
-            spec.probe_key_columns.len(),
+            spec.probe_key_indices.len(),
             key_types.len(),
             "one probe key column per key type"
         );
         assert_eq!(
             spec.probe_fields.len(),
-            spec.output_columns.probe.len(),
+            spec.probe_output_indices.len(),
             "one probe field per listed probe output column"
         );
         assert_eq!(
             spec.build_fields.len(),
-            spec.output_columns.build.len(),
+            spec.build_output_indices.len(),
             "one build field per listed build output column"
         );
         // Multi-key shapes: the packed-lane combos compiled so far. Any int

@@ -71,7 +71,7 @@ impl<K: JoinKey, const BUILD_OUTER: bool> JoinBuildConsumer<K, BUILD_OUTER> {
         jobs_injected: Arc<AtomicBool>,
         build_ready: Arc<AtomicBool>,
         remaining_jobs: Arc<AtomicUsize>,
-        build_output_columns: Vec<usize>,
+        build_output_indices: Vec<usize>,
     ) -> Self {
         Self {
             key_columns,
@@ -90,7 +90,7 @@ impl<K: JoinKey, const BUILD_OUTER: bool> JoinBuildConsumer<K, BUILD_OUTER> {
                 jobs_injected,
                 build_ready,
                 remaining_jobs,
-                build_output_columns,
+                build_output_indices,
             },
         }
     }
@@ -165,7 +165,7 @@ pub struct JoinBuilder<K: Copy + Send, const BUILD_OUTER: bool> {
     jobs_injected: Arc<AtomicBool>,
     build_ready: Arc<AtomicBool>,
     remaining_jobs: Arc<AtomicUsize>,
-    build_output_columns: Vec<usize>,
+    build_output_indices: Vec<usize>,
 }
 
 unsafe impl<K: Copy + Send, const BUILD_OUTER: bool> Send for JoinBuilder<K, BUILD_OUTER> {}
@@ -275,7 +275,8 @@ impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> Outputter<()> for JoinBu
             // outer build this also allocates one matched flag per row id
             // (gaps included); null-keyed rows have no tuple and therefore
             // remain unmatched.
-            let build_rows = BuildRows::new::<OUTER_JOIN_BUILD_SIDE>(merged, &self.build_output_columns)?;
+            let build_rows =
+                BuildRows::new::<OUTER_JOIN_BUILD_SIDE>(merged, &self.build_output_indices)?;
             unsafe { *self.table.build_rows.get() = build_rows };
 
             // Pre-allocate directory and arenas.
