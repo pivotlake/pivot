@@ -16,7 +16,10 @@
 //! `SELECT <subset>` returning the right columns (the table-function twin of
 //! [`Input`](super::Input)'s column projection).
 
+mod compact;
 mod series;
+
+pub use compact::CompactTableFunction;
 
 use crate::catalog::{CatalogTransaction, Column};
 use crate::compile::Error;
@@ -185,5 +188,48 @@ pub(crate) fn invalid_argument(function: &str, message: String) -> Error {
     Error::InvalidTableFunctionArgument {
         function: function.to_string(),
         message,
+    }
+}
+
+/// The table this `COMPACT` statement targets and how far to sweep it. The
+/// statement arrives as a bound call to the `compact` table function (the
+/// parser rewrites it, the way `CHECKPOINT` becomes `CALL checkpoint()`); the
+/// server recognises the shape before compiling anything, because compaction
+/// drives its own dataflows and must never run inside one.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CompactRequest {
+    /// The datastore the statement named, or `None` for the default.
+    pub datastore: Option<String>,
+    /// The schema the statement named, or `None` for the default.
+    pub schema: Option<String>,
+    pub table: String,
+    /// `COMPACT ... FINAL`: keep sweeping until a sweep merges nothing.
+    pub final_sweep: bool,
+}
+
+impl TableFunctionScan {
+    /// This scan as a [`CompactRequest`], if it is a bound `compact` call of
+    /// the shape the parser's `COMPACT` rewrite produces: three name parts
+    /// (empty for absent) and the FINAL flag, all literal.
+    pub fn compact_request(&self) -> Option<CompactRequest> {
+        if self.function_name != "compact" {
+            return None;
+        }
+        let [
+            ScalarValue::Utf8(datastore),
+            ScalarValue::Utf8(schema),
+            ScalarValue::Utf8(table),
+            ScalarValue::Boolean(final_sweep),
+        ] = self.args.as_slice()
+        else {
+            return None;
+        };
+        let part = |value: &str| (!value.is_empty()).then(|| value.to_string());
+        Some(CompactRequest {
+            datastore: part(datastore),
+            schema: part(schema),
+            table: table.clone(),
+            final_sweep: *final_sweep,
+        })
     }
 }

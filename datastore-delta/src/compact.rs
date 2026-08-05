@@ -150,6 +150,22 @@ impl Compacter {
         }
     }
 
+    /// One manual sweep of the single table `name`, for the `COMPACT`
+    /// statement. Returns whether the table exists; the sweep itself reports
+    /// nothing, so the caller judges progress by the table's log version.
+    pub async fn sweep_table(&self, name: &SchemaQualifiedTableName) -> bool {
+        let Some((name, table)) = self
+            .datastore
+            .tables()
+            .into_iter()
+            .find(|(candidate, _)| candidate == name)
+        else {
+            return false;
+        };
+        self.compact_table(&name, table).await;
+        true
+    }
+
     /// One table's round: reload it to its latest log version (this is what
     /// lets a compacter in *another process* see files the server
     /// registered), then merge batches of eligible files until none remain.

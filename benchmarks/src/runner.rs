@@ -507,7 +507,9 @@ pub async fn run_suite(
     if let Some(spec) = &suite.load {
         let load_start = Instant::now();
         load_documents(&client, &opts.source, spec).await?;
-        server.compact().await;
+        client
+            .simple_query(&format!("COMPACT {} FINAL", spec.table))
+            .await?;
         // The ingest (INSERT + compaction) is itself a benchmarked cost for a
         // suite loaded this way, so report it the way a query iteration is
         // reported. `=== Load ... ===` keeps it out of the query lines.

@@ -950,6 +950,46 @@ impl Datastore for DeltaDatastore {
         }
     }
 
+    /// One sweep with the default thresholds, or sweep-to-fixpoint under
+    /// `final_sweep`: a merge changes the file list, so a sweep can leave a
+    /// tail; progress is judged by the table's committed log version, and the
+    /// loop stops at the first sweep that advances nothing.
+    async fn compact(
+        self: Arc<Self>,
+        table: &SchemaQualifiedTableName,
+        final_sweep: bool,
+    ) -> CatalogResult<u64> {
+        let version_of = |datastore: &DeltaDatastore| {
+            datastore
+                .tables()
+                .into_iter()
+                .find(|(name, _)| name == table)
+                .map(|(_, found)| found.version())
+        };
+        if version_of(&self).is_none() {
+            return Err(CatalogError::Other(
+                format!("COMPACT: no table named `{table}`").into(),
+            ));
+        }
+        let compacter = crate::compact::Compacter::new(
+            crate::compact::DEFAULT_COMPACT_BYTES,
+            crate::compact::DEFAULT_MIN_FILES_TO_MERGE,
+            // The poll interval drives the background loop, which a manual
+            // sweep never enters.
+            std::time::Duration::from_secs(1),
+            Arc::clone(&self),
+        );
+        let mut sweeps = 0;
+        loop {
+            let before = version_of(&self);
+            compacter.sweep_table(table).await;
+            sweeps += 1;
+            if !final_sweep || version_of(&self) == before {
+                return Ok(sweeps);
+            }
+        }
+    }
+
     fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
         self
     }

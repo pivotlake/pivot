@@ -189,11 +189,21 @@ impl CatalogTransaction for PivotTransaction {
     }
 
     fn bind_table_function(&self, datastore: &str, name: &str) -> Option<Box<dyn TableFunction>> {
+        // `compact` backs the COMPACT statement and belongs to no datastore:
+        // it must bind under any qualifier and for every backend, and the
+        // server executes it itself (the function only ever binds; its
+        // compile refuses to run).
+        if name == "compact" {
+            return Some(Box::new(planner::CompactTableFunction));
+        }
         self.find_or_create_sub_transaction(datastore)?
             .bind_table_function(name)
     }
 
     fn bind_default_table_function(&self, name: &str) -> Option<Box<dyn TableFunction>> {
+        if name == "compact" {
+            return Some(Box::new(planner::CompactTableFunction));
+        }
         self.find_or_create_sub_transaction(&self.default_name)?
             .bind_table_function(name)
     }
