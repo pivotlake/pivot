@@ -19,7 +19,7 @@ use arrow_schema::ArrowError;
 
 use arrow_array::make_array;
 
-use super::column::{ColumnAccumulator, SourceSelection};
+use super::column::{ChunkedColumn, ColumnAccumulator, SourceSelection};
 use crate::memory::SlabAllocator;
 
 /// A column held as the arrays it was appended from, concatenated on emit.
@@ -67,7 +67,7 @@ impl ColumnAccumulator for ConcatenatedColumn {
 
     fn append_from_batches(
         &mut self,
-        column: &[arrow::array::ArrayData],
+        column: &ChunkedColumn,
         ids: &[u32],
         shift: u32,
         _destination_start: usize,
@@ -77,7 +77,7 @@ impl ColumnAccumulator for ConcatenatedColumn {
         // Consecutive same-batch rows become one slice, as above.
         let mut push = |batch: usize, start: usize, len: usize| {
             self.arrays
-                .push(make_array(column[batch].slice(start, len)));
+                .push(make_array(column.data[batch].slice(start, len)));
         };
         let mut run: Option<(usize, usize, usize)> = None;
         for &id in ids {

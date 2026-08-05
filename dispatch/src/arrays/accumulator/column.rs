@@ -4,9 +4,44 @@
 
 use arrow::array::ArrayData;
 use arrow_array::ArrayRef;
-use arrow_schema::ArrowError;
+use arrow_schema::{ArrowError, DataType};
 
 use crate::memory::SlabAllocator;
+
+/// A column stored across many batches, prepared for gathering rows by
+/// encoded id.
+///
+/// The batches own the buffers addressed by `values`; resolving those pointers
+/// once keeps the gather loop from walking through `ArrayData` for every row.
+pub struct ChunkedColumn {
+    pub(super) data: Vec<ArrayData>,
+    pub(super) values: Vec<*const u8>,
+}
+
+impl ChunkedColumn {
+    pub fn new(data: Vec<ArrayData>) -> Self {
+        let values = data.iter().map(resolve_values_pointer).collect();
+        Self { data, values }
+    }
+}
+
+fn resolve_values_pointer(data: &ArrayData) -> *const u8 {
+    let width = match data.data_type() {
+        DataType::Utf8View | DataType::BinaryView => size_of::<u128>(),
+        other => match other.primitive_width() {
+            Some(width) => width,
+            None => return std::ptr::null(),
+        },
+    };
+    // SAFETY: a fixed-stride array's first buffer holds `offset + len`
+    // elements of `width` bytes.
+    unsafe { data.buffers()[0].as_ptr().add(data.offset() * width) }
+}
+
+// SAFETY: the pointers address buffers `data` keeps alive through their Arcs,
+// and are only used for read-only access.
+unsafe impl Send for ChunkedColumn {}
+unsafe impl Sync for ChunkedColumn {}
 
 /// One column of an accumulation. Rows are copied in with the append methods
 /// and handed to Arrow with [`take_array`](ColumnAccumulator::take_array).
@@ -30,11 +65,10 @@ pub(super) trait ColumnAccumulator {
     );
 
     /// Append rows from a column stored across batches. Each `id` encodes
-    /// `batch << shift | row`, and `column` contains one [`ArrayData`] per
-    /// batch.
+    /// `batch << shift | row`.
     fn append_from_batches(
         &mut self,
-        column: &[ArrayData],
+        column: &ChunkedColumn,
         ids: &[u32],
         shift: u32,
         destination_start: usize,
