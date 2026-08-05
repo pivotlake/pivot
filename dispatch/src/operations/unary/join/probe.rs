@@ -39,7 +39,6 @@ use std::cmp::min;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-const PROBE_BATCH_SIZE: usize = 2048;
 const RING_SIZE: usize = 64;
 const MASK: usize = RING_SIZE - 1;
 const PREFETCH_LENGTH: usize = 63;
@@ -102,16 +101,15 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool>
         Ok(false)
     }
 
-    fn probe_window(
+    fn probe_batch(
         &mut self,
-        window: &RecordBatch,
-        window_offset: usize,
+        batch: &RecordBatch,
         probe_source: &RecordBatch,
         sender: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<()> {
-        let len = window.num_rows();
+        let len = batch.num_rows();
         let build_rows = unsafe { &*self.table.build_rows.get() };
-        let reader = K::make_reader(window, &self.spec.probe_key_indices, &self.hash_state);
+        let reader = K::make_reader(batch, &self.spec.probe_key_indices, &self.hash_state);
         let verifier = K::make_verifier(&build_rows.batches, &self.spec.build_key_indices);
         let keys = unsafe { &*self.table.keys.get() };
         let rows = unsafe { &*self.table.rows.get() };
@@ -120,7 +118,6 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool>
             rows,
             reader,
             verifier,
-            window_offset,
             probe_source,
             output: &mut self.match_outputter,
             sender,
@@ -161,16 +158,7 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool>
         }
 
         let probe_source = batch.project(&self.spec.probe_output_indices)?;
-
-        let total = batch.num_rows();
-        let mut start = 0;
-        while start < total {
-            let len = (total - start).min(PROBE_BATCH_SIZE);
-            let window = batch.slice(start, len);
-            self.probe_window(&window, start, &probe_source, sender)?;
-            start += len;
-        }
-        Ok(())
+        self.probe_batch(&batch, &probe_source, sender)
     }
 
     fn finish(&mut self, sender: &mut dyn Sender<RecordBatch>) -> unary::Result<bool> {
@@ -367,14 +355,13 @@ impl ProbeMatchOutputter {
     }
 }
 
-/// The per-window inputs borrowed while the persistent collector records and
+/// The per-batch inputs borrowed while the persistent collector records and
 /// emits matches.
 struct ProbeWindow<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> {
     keys: &'a MultiSlabBuffer<K::Stored>,
     rows: &'a MultiSlabBuffer<u32>,
     reader: K::Reader<'b>,
     verifier: K::Verifier<'a>,
-    window_offset: usize,
     probe_source: &'b RecordBatch,
     output: &'a mut ProbeMatchOutputter,
     sender: &'a mut dyn Sender<RecordBatch>,
@@ -418,8 +405,7 @@ impl<'a, 'b, K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI_PROBE_SID
                 // `probe_indices` since a semijoin only outputs probe rows, never build rows.
                 if key_matches {
                     unsafe {
-                        *self.output.probe_indices.get_unchecked_mut(output_idx) =
-                            (self.window_offset + probe_row) as u32;
+                        *self.output.probe_indices.get_unchecked_mut(output_idx) = probe_row as u32;
                     }
                     self.output.matched = output_idx + 1;
                     if self.output.matched == RECORD_BATCH_SIZE {
@@ -432,8 +418,7 @@ impl<'a, 'b, K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI_PROBE_SID
                 // if statement for matching since we can just increment the cursor by *whether there
                 // was a match* which removes the need for branching here.
                 unsafe {
-                    *self.output.probe_indices.get_unchecked_mut(output_idx) =
-                        (self.window_offset + probe_row) as u32;
+                    *self.output.probe_indices.get_unchecked_mut(output_idx) = probe_row as u32;
                     *self.output.build_indices.get_unchecked_mut(output_idx) = self.rows[key_index];
                 }
                 self.output.matched = output_idx + key_matches as usize;
