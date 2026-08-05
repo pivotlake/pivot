@@ -86,11 +86,12 @@ pub(crate) struct DeltaTableState {
 pub(crate) fn initialize_table(
     store: &dyn ObjectStore,
     location: &ObjectPath,
+    id: uuid::Uuid,
     columns: &[Column],
     partition_by: &[String],
     sort_by: &[String],
     files: &[FileRef],
-) -> Result<(Url, uuid::Uuid), Error> {
+) -> Result<Url, Error> {
     let uri = table_uri(&store.location_uri(), location)?;
     let fields = columns
         .iter()
@@ -105,7 +106,6 @@ pub(crate) fn initialize_table(
             serde_json::Value::String(sort_by.join(",")),
         );
     }
-    let id = uuid::Uuid::new_v4();
     let metadata = serde_json::json!({
         "metaData": {
             "id": id.to_string(),
@@ -164,7 +164,7 @@ pub(crate) fn initialize_table(
             "Delta table version 0 already exists",
         )));
     }
-    Ok((uri, id))
+    Ok(uri)
 }
 
 /// Atomically commit a data-file change at `version`: a Remove action per path

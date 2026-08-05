@@ -3,10 +3,11 @@
 //! This manifest answers only which tables exist and where their roots are.
 //! Each table's schema, version, and active files come from its Delta log.
 
-use planner::catalog::Column;
+use planner::catalog::{Column, SchemaQualifiedTableName};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use uuid::Uuid as TableId;
 
 use arrow_array::{
     Array, ArrayRef, Datum, RecordBatch, Scalar, StringArray, StringViewArray, UInt32Array,
@@ -26,6 +27,14 @@ pub enum Error {
     Store(#[from] crate::store::StoreError),
     #[error("manifest json: {0}")]
     Json(#[from] serde_json::Error),
+    /// A table was written to a schema the manifest does not hold. Schemas own
+    /// their tables, so there is nowhere to put it.
+    #[error("schema `{0}` does not exist")]
+    MissingSchema(String),
+    /// A schema names a table whose identity has no recorded location: half of
+    /// the table's registration is missing, so the manifest is inconsistent.
+    #[error("table `{table}`: the manifest records identity {id} but no location for it")]
+    MissingTableLocation { table: String, id: TableId },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -205,27 +214,69 @@ pub struct TableManifest {
     pub entries: Vec<ManifestEntry>,
 }
 
-/// One table's entry in the [`CatalogManifest`]: its name and the
-/// [location](ObjectPath) its Parquet data lives at.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct CatalogManifestTableEntry {
-    pub(crate) name: String,
-    pub(crate) location: ObjectPath,
+/// The schema an entry belongs to when the document omits the field: the
+/// default schema, which every datastore defines.
+fn default_schema_name() -> String {
+    planner::DEFAULT_SCHEMA_NAME.to_string()
 }
 
-impl CatalogManifestTableEntry {
-    pub fn new(name: String, location: ObjectPath) -> Self {
-        Self { name, location }
+/// The schema list of a document that omits the field: the default schema
+/// alone, which every datastore defines.
+fn default_schemas() -> Vec<CatalogManifestSchemaEntry> {
+    vec![CatalogManifestSchemaEntry::new(default_schema_name())]
+}
+
+/// One schema's entry in the [`CatalogManifest`]: its name, and the identity
+/// each of its table names resolves to.
+///
+/// Only the names live here. A name is meaningful just inside one schema (two
+/// schemas can each hold an `events`), so it nests; an identity is the table
+/// itself and is unique across the database, so where its data lives is
+/// recorded once, at the top level. Going through the identity means a rename
+/// touches only this map, and the storage it points at never has to move.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CatalogManifestSchemaEntry {
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) table_ids: HashMap<String, TableId>,
+}
+
+impl CatalogManifestSchemaEntry {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            table_ids: HashMap::new(),
+        }
     }
 }
 
-/// The database manifest: the index of which tables exist and where their data
-/// lives. A monotonically increasing `version` records how many times it has
-/// changed.
-#[derive(Clone, Default, Serialize, Deserialize)]
+/// The database manifest: the index of which schemas and tables exist and where
+/// each table's data lives. A monotonically increasing `version` records how
+/// many times it has changed.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CatalogManifest {
     pub(crate) version: u64,
-    pub(crate) tables: Vec<CatalogManifestTableEntry>,
+    /// Every schema the database defines, always including the default one,
+    /// each naming the tables inside it.
+    #[serde(default = "default_schemas")]
+    pub(crate) schemas: Vec<CatalogManifestSchemaEntry>,
+    /// Where each table's data lives, keyed by the table's identity. Kept
+    /// outside the schemas because an identity is unique across the database
+    /// and a location belongs to the table, not to whichever schema currently
+    /// names it.
+    #[serde(default)]
+    pub(crate) table_locations: HashMap<TableId, ObjectPath>,
+}
+
+impl Default for CatalogManifest {
+    /// A brand-new database: no tables, and the default schema alone.
+    fn default() -> Self {
+        Self {
+            version: 0,
+            schemas: default_schemas(),
+            table_locations: HashMap::new(),
+        }
+    }
 }
 
 impl CatalogManifest {
@@ -243,10 +294,63 @@ impl CatalogManifest {
         Ok(())
     }
 
-    /// Add (or replace) a table entry and bump the manifest version.
-    pub(crate) fn upsert(&mut self, entry: CatalogManifestTableEntry) {
-        self.tables.retain(|t| t.name != entry.name);
-        self.tables.push(entry);
+    /// Register a table inside its schema under `id`, replacing whatever that
+    /// name resolved to before. Errors if the schema does not exist: a table
+    /// only ever lives inside one.
+    pub(crate) fn upsert_table(
+        &mut self,
+        name: &SchemaQualifiedTableName,
+        id: TableId,
+        location: ObjectPath,
+    ) -> Result<()> {
+        let schema = self
+            .schemas
+            .iter_mut()
+            .find(|s| s.name == name.schema)
+            .ok_or_else(|| Error::MissingSchema(name.schema.clone()))?;
+        schema.table_ids.insert(name.table.clone(), id);
+        self.table_locations.insert(id, location);
+        self.version += 1;
+        Ok(())
+    }
+
+    /// Every table the database holds: its schema-qualified name, its identity,
+    /// and where its data lives. A named identity with no recorded location is
+    /// an inconsistent manifest, reported as an error rather than skipped:
+    /// silently dropping the entry would make the table vanish from the
+    /// catalog.
+    pub(crate) fn tables(
+        &self,
+    ) -> impl Iterator<Item = Result<(SchemaQualifiedTableName, TableId, &ObjectPath)>> {
+        self.schemas.iter().flat_map(move |schema| {
+            schema.table_ids.iter().map(move |(table, id)| {
+                let name = SchemaQualifiedTableName::new(schema.name.clone(), table.clone());
+                let location =
+                    self.table_locations
+                        .get(id)
+                        .ok_or_else(|| Error::MissingTableLocation {
+                            table: name.to_string(),
+                            id: *id,
+                        })?;
+                Ok((name, *id, location))
+            })
+        })
+    }
+
+    /// Whether this manifest already lists `schema`.
+    pub(crate) fn contains_schema(&self, schema: &str) -> bool {
+        self.schemas.iter().any(|s| s.name == schema)
+    }
+
+    /// Add a schema and bump the manifest version. Callers check
+    /// [`contains_schema`](Self::contains_schema) first to decide whether a
+    /// duplicate is an error; this stays idempotent so a caller that tolerates
+    /// one cannot double-list it.
+    pub(crate) fn add_schema(&mut self, schema: String) {
+        if self.contains_schema(&schema) {
+            return;
+        }
+        self.schemas.push(CatalogManifestSchemaEntry::new(schema));
         self.version += 1;
     }
 }

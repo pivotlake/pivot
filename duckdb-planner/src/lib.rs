@@ -40,7 +40,10 @@
 //! struct MyTransaction;
 //!
 //! impl DuckDBTransaction for MyTransaction {
-//!     fn bind_table(&self, _datastore: &str, name: &str) -> Option<Box<dyn DuckDBTable>> {
+//!     fn does_schema_exist(&self, _datastore: &str, schema: &str) -> bool {
+//!         schema == "main"
+//!     }
+//!     fn bind_table(&self, _datastore: &str, _schema: &str, name: &str) -> Option<Box<dyn DuckDBTable>> {
 //!         match name {
 //!             "users" => Some(Box::new(UsersTable)),
 //!             _ => None,

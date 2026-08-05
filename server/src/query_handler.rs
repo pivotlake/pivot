@@ -777,23 +777,29 @@ mod tests {
 
     #[async_trait]
     impl planner::catalog::CatalogTransaction for RevisionTransaction {
-        fn bind_table(&self, _datastore: &str, _name: &str) -> Option<Box<dyn BoundTable>> {
+        fn does_schema_exist(&self, _datastore: &str, schema: &str) -> bool {
+            schema == planner::DEFAULT_SCHEMA_NAME
+        }
+
+        fn bind_table(&self, _reference: &TableReference) -> Option<Box<dyn BoundTable>> {
             None
         }
 
-        fn table_revision(&self, datastore: &str, name: &str) -> Option<TableRevision> {
-            self.revisions
-                .get(&TableReference {
-                    datastore: datastore.to_string(),
-                    table: name.to_string(),
-                })
-                .cloned()
+        fn table_revision(&self, reference: &TableReference) -> Option<TableRevision> {
+            self.revisions.get(reference).cloned()
         }
     }
 
     fn table() -> TableReference {
+        table_in_schema(planner::DEFAULT_SCHEMA_NAME)
+    }
+
+    /// The same table name in `schema`. Two schemas can each hold an `events`,
+    /// so these are references to different tables.
+    fn table_in_schema(schema: &str) -> TableReference {
         TableReference {
             datastore: DEFAULT_DATASTORE_NAME.to_string(),
+            schema: schema.to_string(),
             table: "events".to_string(),
         }
     }
@@ -806,19 +812,34 @@ mod tests {
     }
 
     fn transaction(identity: &str, version: u64) -> RevisionTransaction {
+        transaction_over(table(), identity, version)
+    }
+
+    /// A transaction whose only known table is `reference`, at `identity` and
+    /// `version`.
+    fn transaction_over(
+        reference: TableReference,
+        identity: &str,
+        version: u64,
+    ) -> RevisionTransaction {
         RevisionTransaction {
-            revisions: HashMap::from([(table(), revision(identity, version))]),
+            revisions: HashMap::from([(reference, revision(identity, version))]),
         }
     }
 
     fn plan(identity: &str, version: u64) -> Arc<planner::Plan> {
+        plan_over(table(), identity, version)
+    }
+
+    /// A one-input plan that reads `reference` at `identity` and `version`.
+    fn plan_over(reference: TableReference, identity: &str, version: u64) -> Arc<planner::Plan> {
         Arc::new(planner::Plan {
             root: planner::PlanNode {
                 name: "input".to_string(),
                 inputs: Vec::new(),
                 operator: planner::Operator::Input(planner::operator::Input {
                     table: Box::new(CacheTestTable {
-                        reference: table(),
+                        reference,
                         revision: revision(identity, version),
                     }),
                     columns: Vec::new(),
@@ -847,6 +868,31 @@ mod tests {
         assert!(changed_version.is_none());
         assert!(changed_identity.is_none());
         assert!(cache.inner.lock().unwrap().is_empty());
+    }
+
+    /// A cached plan stays valid only while the tables it bound are unchanged,
+    /// and a table is identified by its schema as much as by its name: two
+    /// schemas can each hold an `events`, and they are different tables. A
+    /// revision recorded for one of them must therefore not vouch for a plan
+    /// built over the other, however alike the two revisions look.
+    #[test]
+    fn a_revision_from_another_schema_does_not_validate_a_cached_plan() {
+        const QUERY: &str = "SELECT * FROM analytics.events";
+
+        let cache = PlanCache::new(2);
+        let cached = plan_over(table_in_schema("analytics"), "table-id", 7);
+        cache.insert(QUERY.to_string(), cached.clone());
+
+        let hit = cache
+            .get(
+                QUERY,
+                &transaction_over(table_in_schema("analytics"), "table-id", 7),
+            )
+            .unwrap();
+        let other_schema = cache.get(QUERY, &transaction_over(table(), "table-id", 7));
+
+        assert!(Arc::ptr_eq(&hit, &cached));
+        assert!(other_schema.is_none());
     }
 
     #[test]

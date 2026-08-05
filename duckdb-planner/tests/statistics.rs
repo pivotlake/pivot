@@ -42,7 +42,16 @@ struct StatsTransaction {
 }
 
 impl DuckDBTransaction for StatsTransaction {
-    fn bind_table(&self, _datastore: &str, table_name: &str) -> Option<Box<dyn DuckDBTable>> {
+    fn does_schema_exist(&self, _datastore: &str, schema: &str) -> bool {
+        schema == "main"
+    }
+
+    fn bind_table(
+        &self,
+        _datastore: &str,
+        _schema: &str,
+        table_name: &str,
+    ) -> Option<Box<dyn DuckDBTable>> {
         let rows = match table_name {
             "small" => 10,
             "big" => 1_000_000,

@@ -14,6 +14,7 @@
 //! the dynamic-filter slot helper used by more than one operator.
 
 mod aggregate;
+mod create_schema;
 mod create_table;
 mod cte;
 mod dummy_scan;
@@ -32,6 +33,7 @@ mod top_n;
 mod values;
 
 pub use aggregate::Aggregate;
+pub use create_schema::CreateSchema;
 pub use create_table::CreateTable;
 pub use cte::{Cte, CteScan};
 pub use dummy_scan::DummyScan;
@@ -106,6 +108,7 @@ pub enum Operator {
     /// Inner hash equi-join: probe (first input) against build (second input).
     Join(Join),
     CreateTable(CreateTable),
+    CreateSchema(CreateSchema),
     DummyScan(DummyScan),
     /// `SET`/`RESET` of a session variable — handled by the server, not compiled.
     SetVariable(SetVariable),
@@ -180,7 +183,9 @@ impl Operator {
             // recorded when the definition was walked.
             Operator::CteScan(scan) => Ok(scan.types.clone()),
             // Statements, not queries: no result columns.
-            Operator::CreateTable(_) | Operator::SetVariable(_) => Ok(Vec::new()),
+            Operator::CreateTable(_) | Operator::CreateSchema(_) | Operator::SetVariable(_) => {
+                Ok(Vec::new())
+            }
         }
     }
 
@@ -251,7 +256,9 @@ impl Operator {
             }
             Operator::Cte(_) => inputs[1].clone(),
             Operator::CteScan(scan) => scan.nullable.clone(),
-            Operator::CreateTable(_) | Operator::SetVariable(_) => Vec::new(),
+            Operator::CreateTable(_) | Operator::CreateSchema(_) | Operator::SetVariable(_) => {
+                Vec::new()
+            }
         }
     }
 }
@@ -276,6 +283,7 @@ impl fmt::Display for Operator {
             Operator::Limit(l) => write!(f, "{l}"),
             Operator::Join(j) => write!(f, "{j}"),
             Operator::CreateTable(c) => write!(f, "{c}"),
+            Operator::CreateSchema(c) => write!(f, "{c}"),
             Operator::DummyScan(d) => write!(f, "{d}"),
             Operator::SetVariable(s) => write!(f, "{s}"),
             Operator::Materialize(m) => write!(f, "{m}"),

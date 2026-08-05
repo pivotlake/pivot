@@ -151,6 +151,11 @@ const Value &lo_get_param(const LogicalOperator &op, size_t index);
 // ---- CreateTable ----
 rust::String lo_create_table_name(const LogicalOperator &op);
 rust::String lo_create_table_datastore(const LogicalOperator &op);
+rust::String lo_create_table_schema(const LogicalOperator &op);
+rust::String lo_create_schema_name(const LogicalOperator &op);
+rust::String lo_create_schema_datastore(const LogicalOperator &op);
+bool lo_create_schema_if_not_exists(const LogicalOperator &op);
+bool lo_create_schema_or_replace(const LogicalOperator &op);
 size_t lo_create_column_count(const LogicalOperator &op);
 rust::String lo_create_column_name(const LogicalOperator &op, size_t index);
 BridgeLogicalType lo_create_column_type(const LogicalOperator &op, size_t index);

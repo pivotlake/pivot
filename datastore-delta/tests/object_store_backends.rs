@@ -33,7 +33,7 @@ use datastore_delta::store::ObjectPath;
 use datastore_delta::{DeltaDatastore, FileRef};
 use dispatch::Projection;
 use harness::Backend;
-use planner::catalog::{Column, CreateTableRequest};
+use planner::catalog::{Column, CreateTableRequest, SchemaQualifiedTableName};
 use planner::types::Type;
 
 // --- helpers (not tests) ---------------------------------------------------
@@ -56,6 +56,7 @@ fn columns() -> Vec<Column> {
 fn path_request(name: &str, path: &str) -> CreateTableRequest {
     CreateTableRequest {
         datastore_name: None,
+        schema_name: None,
         name: name.to_string(),
         columns: columns(),
         options: HashMap::from([("path".to_string(), path.to_string())]),
@@ -157,7 +158,7 @@ mod bodies {
         let datastore = create_events(&d, b, &[("p1.parquet", &[1, 2, 3])]);
 
         datastore
-            .table_handle("events")
+            .table_handle(&SchemaQualifiedTableName::in_default_schema("events"))
             .unwrap()
             .append_data_file(ObjectPath::new("p2.parquet"), &pq(&[4, 5, 6]), None, None)
             .unwrap();
@@ -176,7 +177,7 @@ mod bodies {
             .unwrap();
 
         datastore
-            .table_handle("events")
+            .table_handle(&SchemaQualifiedTableName::in_default_schema("events"))
             .unwrap()
             .replace_data_files(
                 &[ObjectPath::new("p1.parquet"), ObjectPath::new("p2.parquet")],

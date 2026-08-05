@@ -108,6 +108,12 @@ pub enum Error {
     TableScan(#[source] crate::catalog::Error),
     #[error("creating table: {0}")]
     CreateTable(#[source] crate::catalog::Error),
+    #[error("CREATE OR REPLACE SCHEMA is not supported")]
+    UnsupportedCreateSchemaOrReplace,
+    #[error("CREATE SCHEMA does not take inputs")]
+    UnexpectedCreateSchemaInputs,
+    #[error("create schema: {0}")]
+    CreateSchema(#[source] crate::catalog::Error),
     #[error("inserting rows: {0}")]
     Insert(#[source] crate::catalog::Error),
     #[error("SET/RESET is a session command, not a compilable query")]
@@ -258,6 +264,12 @@ impl PlanNode {
             crate::Operator::CreateTable(o) => {
                 if !inputs.is_empty() {
                     return Err(Error::UnexpectedCreateTableInputs);
+                }
+                o.compile(dispatcher, transaction)
+            }
+            crate::Operator::CreateSchema(o) => {
+                if !inputs.is_empty() {
+                    return Err(Error::UnexpectedCreateSchemaInputs);
                 }
                 o.compile(dispatcher, transaction)
             }

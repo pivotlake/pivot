@@ -20,7 +20,9 @@ use datastore_delta::DeltaDatastore;
 use datastore_delta::parquet::table_input;
 use dispatch::Projection;
 use planner::DEFAULT_DATASTORE_NAME;
-use planner::catalog::{Column, CreateTableRequest, Result as CatalogResult};
+use planner::catalog::{
+    Column, CreateTableRequest, Result as CatalogResult, SchemaQualifiedTableName,
+};
 use planner::types::Type;
 
 fn write_parquet(path: &Path, batch: &arrow_array::RecordBatch) {
@@ -68,6 +70,7 @@ fn path_request(name: &str, path: &Path, columns: Vec<Column>) -> CreateTableReq
     options.insert("path".to_string(), path.to_string_lossy().into_owned());
     CreateTableRequest {
         datastore_name: None,
+        schema_name: None,
         name: name.to_string(),
         columns,
         options,
@@ -80,6 +83,7 @@ fn path_request(name: &str, path: &Path, columns: Vec<Column>) -> CreateTableReq
 fn rooted_request(name: &str, columns: Vec<Column>) -> CreateTableRequest {
     CreateTableRequest {
         datastore_name: None,
+        schema_name: None,
         name: name.to_string(),
         columns,
         options: HashMap::new(),
@@ -126,7 +130,10 @@ fn create_table_with_path_scans_rows() {
     let table = datastore
         .clone()
         .begin_transaction()
-        .table(DEFAULT_DATASTORE_NAME, "events")
+        .table(
+            DEFAULT_DATASTORE_NAME,
+            &SchemaQualifiedTableName::in_default_schema("events"),
+        )
         .expect("table created");
     assert_eq!(table.columns.len(), 2);
     let parquet = current_parquet(&datastore, "events");
@@ -166,7 +173,10 @@ fn tables_persist_across_reopen() {
     let table = reopened
         .clone()
         .begin_transaction()
-        .table(DEFAULT_DATASTORE_NAME, "events")
+        .table(
+            DEFAULT_DATASTORE_NAME,
+            &SchemaQualifiedTableName::in_default_schema("events"),
+        )
         .expect("table reloaded from the manifest");
     assert_eq!(table.columns.len(), 2);
     let parquet = current_parquet(&reopened, "events");
@@ -238,20 +248,25 @@ fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
         let datastore = DeltaDatastore::open(db_uri, &dispatch).unwrap();
         create(&dispatch, &datastore, rooted_request("t", columns())).unwrap();
 
-        // A data-less table: registered, with no row groups (its data lives under
-        // `<root>/t`, which fills in once a file is registered there).
-        assert!(
-            datastore
-                .clone()
-                .begin_transaction()
-                .table(DEFAULT_DATASTORE_NAME, "t")
-                .is_some()
-        );
+        // A data-less table: registered, with no row groups (its data lives at
+        // the directory named for its identity, which fills in once a file is
+        // registered there).
+        let name = SchemaQualifiedTableName::in_default_schema("t");
+        let id = datastore
+            .clone()
+            .begin_transaction()
+            .table_revision(&name)
+            .expect("table created")
+            .identity;
         assert!(current_parquet(&datastore, "t").row_groups().is_empty());
 
-        let commit =
-            std::fs::read_to_string(db.path().join("t/_delta_log/00000000000000000000.json"))
-                .unwrap();
+        // The storage is named for the table's identity, and the Delta log it
+        // holds records that same identity.
+        let commit = std::fs::read_to_string(
+            db.path()
+                .join(format!("{id}/_delta_log/00000000000000000000.json")),
+        )
+        .unwrap();
         let metadata = commit
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
@@ -267,6 +282,7 @@ fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
         );
         assert_eq!(fields[0]["type"], "string");
         assert_eq!(fields[1]["type"], "long");
+        assert_eq!(metadata["metaData"]["id"], id);
     }
 
     // And it survives a reopen.
@@ -275,7 +291,10 @@ fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
         reopened
             .clone()
             .begin_transaction()
-            .table(DEFAULT_DATASTORE_NAME, "t")
+            .table(
+                DEFAULT_DATASTORE_NAME,
+                &SchemaQualifiedTableName::in_default_schema("t"),
+            )
             .is_some()
     );
 }
@@ -327,7 +346,10 @@ fn create_fetches_footers_across_workers_before_commit() {
         datastore
             .clone()
             .begin_transaction()
-            .table(DEFAULT_DATASTORE_NAME, "empty")
+            .table(
+                DEFAULT_DATASTORE_NAME,
+                &SchemaQualifiedTableName::in_default_schema("empty"),
+            )
             .is_some()
     );
     assert!(current_parquet(&datastore, "empty").row_groups().is_empty());

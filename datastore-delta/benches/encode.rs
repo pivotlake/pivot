@@ -55,7 +55,7 @@ use parquet_variant_compute::{VariantArray, json_to_variant};
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
 use datastore_delta::DeltaDatastore;
 use dispatch::{Dispatch, RECORD_BATCH_SIZE, values_input};
-use planner::catalog::{Column, CreateTableRequest};
+use planner::catalog::{Column, CreateTableRequest, TableReference};
 use planner::types::{Type, physical_arrow_type};
 use tempfile::TempDir;
 
@@ -324,7 +324,11 @@ fn as_declared_variant(variants: VariantArray) -> ArrayRef {
 fn insert(dispatch: &Dispatch, catalog: &PivotCatalog, input: Vec<RecordBatch>) {
     let transaction = catalog.begin_transaction();
     let table = transaction
-        .bind_table(DEFAULT_DATASTORE_NAME, TABLE)
+        .bind_table(&TableReference {
+            datastore: DEFAULT_DATASTORE_NAME.to_string(),
+            schema: planner::DEFAULT_SCHEMA_NAME.to_string(),
+            table: TABLE.to_string(),
+        })
         .expect("the table was created");
     let rows = values_input(dispatch.dispatcher(), input).record_batches();
     table
@@ -447,6 +451,7 @@ fn table_over(dispatch: &Dispatch, dir: &Path, columns: Vec<Column>) -> PivotCat
     creation
         .bind_create_table(CreateTableRequest {
             datastore_name: None,
+            schema_name: None,
             name: TABLE.to_string(),
             columns,
             options,

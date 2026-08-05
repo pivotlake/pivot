@@ -14,7 +14,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use planner::TableFunction;
-use planner::catalog::{BoundTable, CreateTableRequest, Result, TableCreation, TableRevision};
+use planner::catalog::{
+    BoundTable, CreateSchemaRequest, CreateTableRequest, Result, SchemaCreation,
+    SchemaQualifiedTableName, TableCreation, TableRevision,
+};
 
 /// One query's transaction against a **single datastore**: a consistent
 /// snapshot of that datastore, opened by [`Datastore::begin_transaction`] before
@@ -25,29 +28,41 @@ use planner::catalog::{BoundTable, CreateTableRequest, Result, TableCreation, Ta
 /// materialize, and its metadata peepholes all see one frozen view. A backend
 /// may also hold pending writes here until commit.
 ///
-/// This is the per-datastore half of the pair: it resolves tables by bare name,
-/// with no datastore qualifier. A [`planner::catalog::CatalogTransaction`]
-/// composes several of these and routes to them by name.
+/// This is the per-datastore half of the pair: it resolves tables by
+/// schema-qualified name, with no datastore qualifier. A
+/// [`planner::catalog::CatalogTransaction`] composes several of these and routes
+/// to them by datastore name.
 #[async_trait]
 pub trait DatastoreTransaction: Debug + Send + Sync {
-    /// Resolve `name` in the datastore the catalog serves as `datastore` to a
-    /// fresh, independently-mutable [`BoundTable`] bound to this transaction's
-    /// snapshot, or `None` if no such table exists in the snapshot. Each call
-    /// returns a unique `Box`, so per-query filter pushdown can mutate the table
-    /// without affecting concurrent queries. The returned binding captures the
-    /// snapshot's copy of the table, so its compile needs no transaction handle.
+    /// Whether this datastore defines a schema named `schema` in the
+    /// transaction's frozen snapshot. Every datastore defines
+    /// [`planner::DEFAULT_SCHEMA_NAME`], so a table named with no schema always
+    /// has a schema to resolve in.
+    fn does_schema_exist(&self, schema: &str) -> bool;
+
+    /// Resolve the schema-qualified `name`, in the datastore the catalog serves
+    /// as `datastore`, to a fresh, independently-mutable [`BoundTable`] bound to
+    /// this transaction's snapshot, or `None` if no such table exists in the
+    /// snapshot. Each call returns a unique `Box`, so per-query filter pushdown
+    /// can mutate the table without affecting concurrent queries. The returned
+    /// binding captures the snapshot's copy of the table, so its compile needs
+    /// no transaction handle.
     ///
     /// `datastore` is the name the *catalog* holds this datastore under, passed
     /// in rather than known here: a datastore is registered by its owner, so the
     /// binding can only learn the qualifier it was reached through from the
     /// caller that routed to it. The binding records it, so re-resolving the
     /// table later uses the very key it was bound by.
-    fn bind_table(&self, datastore: &str, name: &str) -> Option<Box<dyn BoundTable>>;
+    fn bind_table(
+        &self,
+        datastore: &str,
+        name: &SchemaQualifiedTableName,
+    ) -> Option<Box<dyn BoundTable>>;
 
     /// The identity and version of `name` in this transaction's frozen
     /// snapshot, or `None` if no such table exists. This must return `Some` for
     /// every table returned by [`bind_table`](Self::bind_table).
-    fn table_revision(&self, name: &str) -> Option<TableRevision>;
+    fn table_revision(&self, name: &SchemaQualifiedTableName) -> Option<TableRevision>;
 
     /// A backend-specific table-valued function by `name`, or `None`. This is
     /// how a backend contributes functions only it can answer (e.g. `metadata`,
@@ -69,6 +84,20 @@ pub trait DatastoreTransaction: Debug + Send + Sync {
     fn bind_create_table(&self, _request: CreateTableRequest) -> Result<Box<dyn TableCreation>> {
         Err(Box::<dyn std::error::Error + Send + Sync>::from(
             "this datastore does not support CREATE TABLE",
+        )
+        .into())
+    }
+
+    /// Resolve a `CREATE SCHEMA` against this datastore into a [`SchemaCreation`]
+    /// the caller compiles into the dataflow that stages it. Split the same way
+    /// [`bind_create_table`](Self::bind_create_table) is, so that resolving a
+    /// statement never changes the catalog by itself: the schema is staged when
+    /// the compiled dataflow runs, and made durable by
+    /// [`commit`](Self::commit). The default rejects DDL (a read-only
+    /// datastore).
+    fn bind_create_schema(&self, _request: CreateSchemaRequest) -> Result<Box<dyn SchemaCreation>> {
+        Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "this datastore does not support CREATE SCHEMA",
         )
         .into())
     }

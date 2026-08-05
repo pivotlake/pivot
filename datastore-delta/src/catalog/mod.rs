@@ -8,7 +8,8 @@
 //!
 //! Durable state lives in two places, both in the store:
 //!
-//! - the [`manifest`]: which tables exist (name and location);
+//! - the [`manifest`]: which schemas exist, and which tables exist in them
+//!   (schema-qualified name and location);
 //! - each table's standard Delta `_delta_log`: its schema, partitioning,
 //!   version, and active Parquet files, interpreted by Delta Kernel.
 //!
@@ -39,18 +40,17 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use uuid::Uuid;
 
-use crate::manifest::{
-    self, CatalogManifest, CatalogManifestTableEntry, ManifestEntry, TableManifest,
-};
+use crate::manifest::{self, CatalogManifest, ManifestEntry, TableManifest};
 use crate::parquet::ParquetTableError;
 use crate::store::{self, DataFile, FileRef, LocalStore, ObjectPath, ObjectStore, open_store};
 use async_trait::async_trait;
 use crossbeam_deque::{Injector, Steal};
 use datastore::{Datastore, DatastoreTransaction};
-use dispatch::{DataFlowDispatcher, DataFlowError, RecordBatchOperatorSpec};
+use dispatch::{DataFlowDispatcher, DataFlowError, OneShotNullaryFactory, RecordBatchOperatorSpec};
 use planner::catalog::{
-    BoundTable, CreateTableRequest, Error as CatalogError, Result as CatalogResult, TableCreation,
-    TableReference, TableRevision,
+    BoundTable, CreateSchemaRequest, CreateTableRequest, Error as CatalogError,
+    Result as CatalogResult, SchemaCreation, SchemaQualifiedTableName, TableCreation,
+    TableRevision,
 };
 pub use table::CatalogTable;
 pub use table::TableFile;
@@ -76,6 +76,18 @@ pub enum Error {
     TableExists(String),
     #[error("table `{0}` does not exist")]
     TableNotFound(String),
+    #[error("schema `{0}` does not exist")]
+    SchemaNotFound(String),
+    #[error(
+        "table `{table}`: the catalog records identity {manifest}, but its Delta log records {log}"
+    )]
+    TableIdentityMismatch {
+        table: String,
+        manifest: Uuid,
+        log: Uuid,
+    },
+    #[error("schema `{0}` already exists")]
+    SchemaExists(String),
     #[error("datastore received a transaction created by a different backend")]
     WrongTransactionType,
     #[error(transparent)]
@@ -106,54 +118,88 @@ impl From<Error> for CatalogError {
     }
 }
 
-/// The catalog's table set. A table's durable identity is its [`Uuid`], so the
-/// tables are owned by `by_uuid`; `name_to_uuid` is a lightweight lookup index
-/// on top. Keeping them separate means only one map owns each [`CatalogTable`]
-/// (no aliasing), a rename touches only the name index, and a commit/publish
-/// touches only `by_uuid` - the two never fight over the same value.
+/// The datastore's schemas and the tables inside them, shaped like the manifest
+/// it is a projection of: each schema maps its table names to identities, and
+/// the tables themselves are held once, by identity.
+///
+/// Going through the identity is what lets a name be reassigned without
+/// touching the table, and keeps one owner for each [`CatalogTable`] so a
+/// commit or publish never has to update two copies.
 #[derive(Clone, Default)]
-struct TableIndex {
-    by_uuid: HashMap<Uuid, CatalogTable>,
-    name_to_uuid: HashMap<String, Uuid>,
+struct DatastoreIndex {
+    /// Every schema the datastore defines, always including
+    /// [`DEFAULT_SCHEMA_NAME`], each mapping its table names to identities. A
+    /// schema with no tables in it is still a schema.
+    schemas: HashMap<String, HashMap<String, Uuid>>,
+    tables_by_id: HashMap<Uuid, CatalogTable>,
 }
 
-impl TableIndex {
-    /// Insert or replace a table under its identity, and point `name` at that
-    /// identity. The name arrives alongside the table because the table does not
-    /// carry one: this is the single place a name is bound to a table.
-    fn insert_table(&mut self, name: String, table: CatalogTable) {
-        self.name_to_uuid.insert(name, table.id());
-        self.by_uuid.insert(table.id(), table);
+impl DatastoreIndex {
+    /// Add a table under `name` and its own identity, registering the schema if
+    /// the index does not already list it. A table whose schema is missing would
+    /// be present but unresolvable, so the index keeps itself consistent rather
+    /// than trusting its two inputs to agree. The name index is written here
+    /// alone, so this is the one place a table acquires a name.
+    fn insert_table(&mut self, name: SchemaQualifiedTableName, table: CatalogTable) {
+        self.schemas
+            .entry(name.schema)
+            .or_default()
+            .insert(name.table, table.id());
+        self.tables_by_id.insert(table.id(), table);
     }
 
-    /// Swap in an advanced copy of a table already in the index, leaving the
-    /// name map alone. A refresh has a newer copy of the same table, not a new
-    /// table, so re-asserting a name it never carried would be meaningless.
+    /// Swap in an advanced copy of a table already in the index. Its identity is
+    /// unchanged, so neither the schema nor the name index needs touching.
     fn replace_table(&mut self, table: CatalogTable) {
-        self.by_uuid.insert(table.id(), table);
+        self.tables_by_id.insert(table.id(), table);
     }
 
-    fn get_by_name(&self, name: &str) -> Option<&CatalogTable> {
-        self.by_uuid.get(self.name_to_uuid.get(name)?)
+    /// Register a schema, reporting whether it was new.
+    fn insert_schema(&mut self, schema: String) -> bool {
+        !self.schemas.contains_key(&schema) && {
+            self.schemas.insert(schema, HashMap::new());
+            true
+        }
     }
 
-    fn get_by_id(&self, id: &Uuid) -> Option<&CatalogTable> {
-        self.by_uuid.get(id)
+    fn contains_schema(&self, schema: &str) -> bool {
+        self.schemas.contains_key(schema)
     }
 
-    fn contains_name(&self, name: &str) -> bool {
-        self.name_to_uuid.contains_key(name)
+    fn table_id(&self, name: &SchemaQualifiedTableName) -> Option<Uuid> {
+        self.schemas.get(&name.schema)?.get(&name.table).copied()
     }
 
-    /// Each table with the name it is currently indexed under.
-    fn tables(&self) -> impl Iterator<Item = (&String, &CatalogTable)> {
-        self.name_to_uuid
-            .iter()
-            .filter_map(|(name, id)| Some((name, self.by_uuid.get(id)?)))
+    fn get_table_by_name(&self, name: &SchemaQualifiedTableName) -> Option<&CatalogTable> {
+        self.tables_by_id.get(&self.table_id(name)?)
     }
 
-    fn names(&self) -> impl Iterator<Item = &str> {
-        self.name_to_uuid.keys().map(String::as_str)
+    fn get_table_by_id(&self, id: &Uuid) -> Option<&CatalogTable> {
+        self.tables_by_id.get(id)
+    }
+
+    fn contains_table(&self, name: &SchemaQualifiedTableName) -> bool {
+        self.table_id(name).is_some()
+    }
+
+    /// Every table with the schema-qualified name it is currently indexed under.
+    fn named_tables(&self) -> impl Iterator<Item = (SchemaQualifiedTableName, &CatalogTable)> {
+        self.schemas.iter().flat_map(move |(schema, tables)| {
+            tables.iter().filter_map(move |(table, id)| {
+                Some((
+                    SchemaQualifiedTableName::new(schema.clone(), table.clone()),
+                    self.tables_by_id.get(id)?,
+                ))
+            })
+        })
+    }
+
+    fn table_names(&self) -> impl Iterator<Item = SchemaQualifiedTableName> {
+        self.schemas.iter().flat_map(|(schema, tables)| {
+            tables
+                .keys()
+                .map(move |table| SchemaQualifiedTableName::new(schema.clone(), table.clone()))
+        })
     }
 }
 
@@ -170,14 +216,16 @@ impl TableIndex {
 /// to the latest committed version, so a commit by another process (or this one)
 /// becomes visible to the next query.
 ///
-/// Cloneable (every field is an `Arc` or the shared dispatcher handle), so a
-/// commit that writes can hand a clone to the blocking pool.
+/// Cloneable (every field is an `Arc`, a `String`, or the shared dispatcher
+/// handle), so a commit that writes can hand a clone to the blocking pool.
 #[derive(Clone)]
 pub struct DeltaDatastore {
-    /// The in-memory table set. The lock guards the *set* (add on `CREATE`,
-    /// swap-in on a resolve's refresh); each [`CatalogTable`] is itself a
-    /// lock-free value that callers clone out and evolve independently.
-    tables: Arc<RwLock<TableIndex>>,
+    /// The in-memory schema and table sets. The lock guards the *index* (add on
+    /// `CREATE`, swap-in on a resolve's refresh); each [`CatalogTable`] is itself
+    /// a lock-free value that callers clone out and evolve independently. One
+    /// lock covers both halves so the two `CREATE` paths cannot interleave their
+    /// updates to the shared manifest document.
+    tables_index: Arc<RwLock<DatastoreIndex>>,
     /// The database's object store: the table index, Delta logs, and tables'
     /// Parquet data. The datastore reads and writes a table's data through this
     /// one explicitly configured store: relative locations live under the
@@ -209,10 +257,10 @@ impl std::fmt::Debug for DeltaDatastore {
 }
 
 impl DeltaDatastore {
-    /// Open a datastore at an explicit local data directory. The caller owns
-    /// the directory and its lifetime; pivotdb never substitutes a generated
-    /// temporary path. A database with no manifest yet opens empty. No
-    /// background maintenance runs (see [`from_store`](Self::from_store) for
+    /// Open the default datastore at an explicit local data directory. The
+    /// caller owns the directory and its lifetime; pivotdb never substitutes a
+    /// generated temporary path. A database with no manifest yet opens empty.
+    /// No background maintenance runs (see [`from_store`](Self::from_store) for
     /// that seam).
     pub fn open_local(
         root: impl Into<PathBuf>,
@@ -233,10 +281,10 @@ impl DeltaDatastore {
     }
 
     /// Open a persisted database over an already-built object store. This is the
-    /// seam a metastore uses: it constructs the store (local dir / S3, with
-    /// whatever credentials it holds) and hands it in, rather than having the
-    /// datastore re-derive one from a URI. Reloads every table the manifest
-    /// records, exactly as [`open`](Self::open) does.
+    /// seam a metastore uses: it constructs the
+    /// store (local dir / S3, with whatever credentials it holds) and hands
+    /// it in, rather than having the datastore re-derive one from a URI. Reloads
+    /// every table the manifest records, exactly as [`open`](Self::open) does.
     pub fn from_store(
         store: Arc<dyn ObjectStore>,
         dispatcher: &DataFlowDispatcher,
@@ -244,14 +292,18 @@ impl DeltaDatastore {
     ) -> Result<Arc<Self>> {
         let manifest = CatalogManifest::load(store.as_ref())?;
 
-        let mut tables = TableIndex::default();
-        for entry in &manifest.tables {
-            let table = Self::load_table(dispatcher, &store, entry)?;
-            tables.insert_table(entry.name.clone(), table);
+        let mut index = DatastoreIndex::default();
+        for schema in &manifest.schemas {
+            index.insert_schema(schema.name.clone());
+        }
+        for entry in manifest.tables() {
+            let (name, id, location) = entry?;
+            let table = Self::load_table(dispatcher, &store, &name, id, location)?;
+            index.insert_table(name, table);
         }
 
         Ok(Arc::new(Self {
-            tables: Arc::new(RwLock::new(tables)),
+            tables_index: Arc::new(RwLock::new(index)),
             store,
             dispatcher: dispatcher.clone(),
             maintenance,
@@ -266,11 +318,23 @@ impl DeltaDatastore {
     fn load_table(
         dispatcher: &DataFlowDispatcher,
         store: &Arc<dyn ObjectStore>,
-        entry: &CatalogManifestTableEntry,
+        name: &SchemaQualifiedTableName,
+        id: Uuid,
+        location: &ObjectPath,
     ) -> Result<CatalogTable> {
-        let delta_uri = crate::delta::table_uri(&store.location_uri(), &entry.location)?;
+        let delta_uri = crate::delta::table_uri(&store.location_uri(), location)?;
         let state = crate::delta::load_table(&delta_uri, store.as_ref())?;
-        let id = state.id;
+        // The identity the schema maps this name to is the one the table was
+        // initialized with, so the log has to record the same value. A
+        // disagreement means the two are describing different tables, and
+        // resolving the name would hand back the wrong one.
+        if state.id != id {
+            return Err(Error::TableIdentityMismatch {
+                table: name.to_string(),
+                manifest: id,
+                log: state.id,
+            });
+        }
         let manifest = TableManifest {
             version: state.version,
             columns: state.columns,
@@ -281,17 +345,13 @@ impl DeltaDatastore {
         let files = manifest
             .entries
             .iter()
-            .map(|f| {
-                f.file
-                    .clone()
-                    .into_data_file(store.as_ref(), &entry.location)
-            })
+            .map(|f| f.file.clone().into_data_file(store.as_ref(), location))
             .collect::<store::Result<Vec<DataFile>>>()?;
         let declared_columns: Arc<[planner::catalog::Column]> = manifest.columns.clone().into();
         let table_files = crate::parquet::load_table_files(dispatcher, &files, declared_columns)?;
         Ok(CatalogTable::new(
             id,
-            entry.location.clone(),
+            location.clone(),
             manifest,
             table_files,
             store.clone(),
@@ -307,18 +367,20 @@ impl DeltaDatastore {
     /// trait impl delegates here.
     pub fn begin_transaction(self: Arc<Self>) -> Arc<DeltaTransaction> {
         let snapshot = Arc::new(DeltaSnapshot {
-            tables: self.tables.read().unwrap().clone(),
+            index: self.tables_index.read().unwrap().clone(),
         });
         Arc::new(DeltaTransaction {
             snapshot,
             uploaded_files: Arc::new(Injector::new()),
             pending_table_creations: Arc::new(Injector::new()),
+            pending_schema_creations: Arc::new(Injector::new()),
             datastore: self,
         })
     }
 
-    /// Bring the in-memory table set up to date with the store: pick up tables
-    /// another process registered in the database index, and advance every
+    /// Bring the in-memory schema and table sets up to date with the store: pick
+    /// up schemas and tables another process registered in the database index,
+    /// and advance every
     /// table to its latest committed Delta version, fetching the footers of
     /// files it doesn't hold yet. This is the **only** place the read path
     /// pays store I/O; the server drives it on a background interval, so
@@ -335,22 +397,32 @@ impl DeltaDatastore {
     pub fn refresh_from_store(&self) -> Result<bool> {
         let mut changed = false;
 
-        let index = CatalogManifest::load(self.store.as_ref())?;
-        for entry in &index.tables {
-            if self.tables.read().unwrap().contains_name(&entry.name) {
+        let manifest = CatalogManifest::load(self.store.as_ref())?;
+
+        for schema in &manifest.schemas {
+            let mut index = self.tables_index.write().unwrap();
+            if !index.contains_schema(&schema.name) {
+                index.insert_schema(schema.name.clone());
+                changed = true;
+            }
+        }
+
+        for entry in manifest.tables() {
+            let (name, id, location) = entry?;
+            if self.tables_index.read().unwrap().contains_table(&name) {
                 continue;
             }
-            let table = match Self::load_table(&self.dispatcher, &self.store, entry) {
+            let table = match Self::load_table(&self.dispatcher, &self.store, &name, id, location) {
                 Ok(table) => table,
                 Err(e) => {
-                    tracing::warn!(table = entry.name, error = %e, "catalog refresh: loading table failed");
+                    tracing::warn!(table = %name, error = %e, "catalog refresh: loading table failed");
                     continue;
                 }
             };
-            let mut map = self.tables.write().unwrap();
+            let mut index = self.tables_index.write().unwrap();
             // An in-process CREATE TABLE may have published it since the read.
-            if !map.contains_name(&entry.name) {
-                map.insert_table(entry.name.clone(), table);
+            if !index.contains_table(&name) {
+                index.insert_table(name, table);
                 changed = true;
             }
         }
@@ -362,7 +434,7 @@ impl DeltaDatastore {
                 Ok(true) => changed |= self.publish_table(table),
                 Ok(false) => {}
                 Err(e) => {
-                    tracing::warn!(table = name, error = %e, "catalog refresh: refreshing table failed");
+                    tracing::warn!(table = %name, error = %e, "catalog refresh: refreshing table failed");
                 }
             }
         }
@@ -376,11 +448,11 @@ impl DeltaDatastore {
     /// right after their commit. A copy at or behind the map's current version
     /// is dropped (`false`); a newer one replaces it.
     pub fn publish_table(&self, table: CatalogTable) -> bool {
-        let mut map = self.tables.write().unwrap();
-        match map.get_by_id(&table.id()) {
+        let mut index = self.tables_index.write().unwrap();
+        match index.get_table_by_id(&table.id()) {
             Some(existing) if existing.version() >= table.version() => false,
             _ => {
-                map.replace_table(table);
+                index.replace_table(table);
                 true
             }
         }
@@ -398,6 +470,7 @@ impl DeltaDatastore {
     fn finalize_table_creation(&self, pending: PendingTableCreation) -> Result<()> {
         let PendingTableCreation {
             name,
+            id,
             location,
             columns,
             partition_by,
@@ -405,16 +478,17 @@ impl DeltaDatastore {
             if_not_exists,
             loaded,
         } = pending;
-        let mut map = self.tables.write().unwrap();
-        if map.contains_name(&name) {
+        let mut index = self.tables_index.write().unwrap();
+        if index.contains_table(&name) {
             // A concurrent create won the race. With `IF NOT EXISTS` that is
             // still a success; the fetched footers are dropped.
             if if_not_exists {
                 return Ok(());
             }
-            return Err(Error::TableExists(name));
+            return Err(Error::TableExists(name.to_string()));
         }
         let table = CatalogTable::create_new(
+            id,
             location.clone(),
             loaded,
             columns,
@@ -423,10 +497,44 @@ impl DeltaDatastore {
             self.store.clone(),
             self.dispatcher.clone(),
         )?;
-        let mut index = CatalogManifest::load(self.store.as_ref())?;
-        index.upsert(CatalogManifestTableEntry::new(name.clone(), location));
-        index.store(self.store.as_ref())?;
-        map.insert_table(name, table);
+        let mut manifest = CatalogManifest::load(self.store.as_ref())?;
+        manifest.upsert_table(&name, id, location)?;
+        manifest.store(self.store.as_ref())?;
+        index.insert_table(name, table);
+        Ok(())
+    }
+
+    /// Whether this datastore defines a schema named `schema`.
+    pub fn contains_schema(&self, schema: &str) -> bool {
+        self.tables_index.read().unwrap().contains_schema(schema)
+    }
+
+    /// Persist one schema creation staged by a transaction: record it in the
+    /// database index and publish it into the live set so the next transaction
+    /// resolves it. Called from [`DeltaTransaction::commit`] on the blocking
+    /// pool, never from a dispatch worker.
+    ///
+    /// The whole step holds the index write lock, which serializes in-process
+    /// creates (schemas and tables alike) and their read-modify-write of the
+    /// shared manifest; the name is re-checked under it as a race backstop.
+    fn finalize_schema_creation(&self, pending: PendingSchemaCreation) -> Result<()> {
+        let PendingSchemaCreation {
+            name,
+            if_not_exists,
+        } = pending;
+        let mut index = self.tables_index.write().unwrap();
+        if index.contains_schema(&name) {
+            // A concurrent create won the race. With `IF NOT EXISTS` that is
+            // still a success.
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(Error::SchemaExists(name));
+        }
+        let mut manifest = CatalogManifest::load(self.store.as_ref())?;
+        manifest.add_schema(name.clone());
+        manifest.store(self.store.as_ref())?;
+        index.insert_schema(name);
         Ok(())
     }
 
@@ -442,25 +550,29 @@ impl DeltaDatastore {
     /// this datastore's own copy may
     /// lag until its next resolve refreshes it (which is fine, the store is the
     /// source of truth). `None` if no such table exists.
-    pub fn table_handle(&self, name: &str) -> Option<CatalogTable> {
-        self.tables.read().unwrap().get_by_name(name).cloned()
+    pub fn table_handle(&self, name: &SchemaQualifiedTableName) -> Option<CatalogTable> {
+        self.tables_index
+            .read()
+            .unwrap()
+            .get_table_by_name(name)
+            .cloned()
     }
 
     /// Whether a table named `name` exists in the datastore (a cheap membership
     /// check, no clone). Used to fail fast when a table a writer targets
     /// hasn't been created.
-    pub fn contains_table(&self, name: &str) -> bool {
-        self.tables.read().unwrap().contains_name(name)
+    pub fn contains_table(&self, name: &SchemaQualifiedTableName) -> bool {
+        self.tables_index.read().unwrap().contains_table(name)
     }
 
     /// A snapshot clone of every table the catalog currently holds — for a sweep
     /// (e.g. the compacter) that refreshes and evolves each one independently.
-    pub fn tables(&self) -> Vec<(String, CatalogTable)> {
-        self.tables
+    pub fn tables(&self) -> Vec<(SchemaQualifiedTableName, CatalogTable)> {
+        self.tables_index
             .read()
             .unwrap()
-            .tables()
-            .map(|(name, table)| (name.clone(), table.clone()))
+            .named_tables()
+            .map(|(name, table)| (name, table.clone()))
             .collect()
     }
 
@@ -468,7 +580,11 @@ impl DeltaDatastore {
     /// or a stale reference outliving the table). Used by INSERT commit to resolve
     /// the *live* table its files belong to, regardless of any concurrent rename.
     pub fn table_handle_by_id(&self, id: &Uuid) -> Option<CatalogTable> {
-        self.tables.read().unwrap().get_by_id(id).cloned()
+        self.tables_index
+            .read()
+            .unwrap()
+            .get_table_by_id(id)
+            .cloned()
     }
 
     /// A human-readable description of where this database is rooted (local
@@ -481,7 +597,7 @@ impl DeltaDatastore {
     /// BoundTable `name`'s current committed files — refreshing to the latest version
     /// first, so a commit by INSERT/compaction (in this process or another) is
     /// reflected. `None` if no such table exists.
-    pub fn table_files(&self, name: &str) -> Option<Vec<FileRef>> {
+    pub fn table_files(&self, name: &SchemaQualifiedTableName) -> Option<Vec<FileRef>> {
         let mut table = self.table_handle(name)?;
         let _ = table.refresh();
         Some(table.file_refs())
@@ -492,7 +608,10 @@ impl DeltaDatastore {
     /// table exists. Refreshes to the latest committed version first. Sizes come
     /// from the files' `FileRef`s, correlated by path (the two orderings differ,
     /// so a map lookup rather than a zip).
-    pub fn table_data_files(&self, name: &str) -> Result<Option<Vec<DataFileInfo>>> {
+    pub fn table_data_files(
+        &self,
+        name: &SchemaQualifiedTableName,
+    ) -> Result<Option<Vec<DataFileInfo>>> {
         let Some(mut table) = self.table_handle(name) else {
             return Ok(None);
         };
@@ -525,26 +644,50 @@ pub struct DataFileInfo {
 }
 
 impl DeltaTransaction {
-    /// Resolve a `CREATE TABLE` against this datastore: check the name is still
-    /// free, parse the layout options, and locate the table's existing data
-    /// files. Returns a [`DeltaTableCreation`] whose `compile` builds the
-    /// footer-fetch-and-stage dataflow. This part runs on the coordinator;
-    /// compiling needs the pool.
+    /// Whether this transaction's frozen snapshot holds `schema`. DuckDB
+    /// resolves every name through a schema lookup, so this is answered from the
+    /// snapshot alone and takes no lock. A schema this transaction has staged is
+    /// deliberately not visible: it does not exist until commit creates it.
+    fn contains_schema(&self, schema: &str) -> bool {
+        self.snapshot.contains_schema(schema)
+    }
+
+    /// Resolve a `CREATE TABLE` against this datastore: check the schema exists
+    /// and the name is still free, parse the layout options, and locate the
+    /// table's existing data files. Returns a [`DeltaTableCreation`] whose
+    /// `compile` builds the footer-fetch-and-stage dataflow. This part runs on
+    /// the coordinator; compiling needs the pool.
     ///
     /// The data lives at a directory/prefix: an explicit `WITH (path = '…')`,
-    /// always a plain path, never an object-store URL, or `<name>` under the
-    /// database root when none is given. An empty/absent location yields an
-    /// empty table (registered with no row groups).
+    /// always a plain path, never an object-store URL, or a path derived from
+    /// the table's name under the database root when none is given. An
+    /// empty/absent location yields an empty table (registered with no row
+    /// groups).
     fn bind_create(&self, request: CreateTableRequest) -> Result<DeltaTableCreation> {
+        let name = request.schema_qualified_name();
+
+        // A table can only be created in a schema that exists: `CREATE TABLE`
+        // never brings its schema into being as a side effect. A schema this
+        // transaction staged counts, since commit creates those before any
+        // table; without that, the transaction could never build a schema and
+        // populate it.
+        if !self.contains_schema(&name.schema) {
+            return Err(Error::SchemaNotFound(name.schema));
+        }
+
         // Reject a duplicate up front, unless `IF NOT EXISTS` makes an existing
         // table a success. This checks the transaction's frozen snapshot; the
         // datastore re-checks the name under its write lock at commit as the real
         // race backstop, honouring `IF NOT EXISTS` there too.
-        if !request.if_not_exists && self.snapshot.contains_table(&request.name) {
-            return Err(Error::TableExists(request.name));
+        if !request.if_not_exists && self.snapshot.contains_table(&name) {
+            return Err(Error::TableExists(name.to_string()));
         }
 
-        let location = Self::get_path_for_create_table(&request)?;
+        // The table's identity is minted here, before anything is written, so
+        // it can name the table's storage and still be the identity the Delta
+        // log records for it.
+        let id = Uuid::new_v4();
+        let location = Self::location_for_new_table(&request, id)?;
         let partition_by = Self::parse_spec_columns(&request, PARTITION_BY_OPTION)?;
         let sort_by = Self::parse_spec_columns(&request, SORT_BY_OPTION)?;
 
@@ -561,7 +704,8 @@ impl DeltaTransaction {
         Ok(DeltaTableCreation {
             pending_table_creations: self.pending_table_creations.clone(),
             files,
-            name: request.name,
+            name,
+            id,
             columns: request.columns,
             location,
             partition_by,
@@ -570,8 +714,37 @@ impl DeltaTransaction {
         })
     }
 
-    /// The location stored for a new table: an explicit `path` (kept as given),
-    /// or the table name under the database root.
+    /// Resolve a `CREATE SCHEMA` against this datastore and stage it on the
+    /// transaction. A schema is a pure naming construct here: it owns no store
+    /// state of its own, so there is nothing to locate or load, and creating it
+    /// is just recording the name. The transaction's blocking commit writes it to
+    /// the database manifest and publishes it.
+    ///
+    /// Rejects a duplicate up front, unless `IF NOT EXISTS` makes an existing
+    /// schema a success. This checks the transaction's frozen snapshot; the
+    /// datastore re-checks under its write lock at commit as the real race
+    /// backstop, honouring `IF NOT EXISTS` there too.
+    fn bind_schema_creation(&self, request: CreateSchemaRequest) -> Result<DeltaSchemaCreation> {
+        if !request.if_not_exists && self.contains_schema(&request.name) {
+            return Err(Error::SchemaExists(request.name));
+        }
+        Ok(DeltaSchemaCreation {
+            pending_schema_creations: self.pending_schema_creations.clone(),
+            creation: PendingSchemaCreation {
+                name: request.name,
+                if_not_exists: request.if_not_exists,
+            },
+        })
+    }
+
+    /// Where a new table's data lives: an explicit `path` when the statement
+    /// gave one, or the table's identity when it did not.
+    ///
+    /// Naming the storage after the identity rather than the table means the
+    /// location never has to change: a rename or a move between schemas is a
+    /// catalog edit, and two tables that share a name in different schemas
+    /// cannot collide. The manifest records the mapping, so nothing has to
+    /// re-derive it.
     ///
     /// A table path is always a plain path, never a URL (no scheme) — where it
     /// physically lives is the database's storage, not the path's. A *relative*
@@ -579,9 +752,9 @@ impl DeltaTransaction {
     /// root of the database's storage medium: on a local database, a directory
     /// on the server's filesystem; on a remote database, a key from the **bucket
     /// root** (ignoring the prefix the database was opened at).
-    fn get_path_for_create_table(request: &CreateTableRequest) -> Result<ObjectPath> {
+    fn location_for_new_table(request: &CreateTableRequest, id: Uuid) -> Result<ObjectPath> {
         let Some(path) = request.options.get(PATH_OPTION) else {
-            return Ok(ObjectPath::new(request.name.clone()));
+            return Ok(ObjectPath::new(id.to_string()));
         };
         if path.contains("://") {
             return Err(Error::TablePathWithScheme(path.clone()));
@@ -624,6 +797,20 @@ impl DeltaTransaction {
             .filter(|file| file.path.as_str().ends_with(".parquet"))
             .collect())
     }
+}
+
+/// Commit the schema creations drained from a transaction. Each one records
+/// itself in the database manifest and publishes into the live schema set.
+/// Blocking store I/O, so [`DeltaTransaction::commit`] runs this on the blocking
+/// pool.
+fn commit_schema_creations(
+    datastore: &DeltaDatastore,
+    pending_schema_creations: Vec<PendingSchemaCreation>,
+) -> CatalogResult<()> {
+    for pending in pending_schema_creations {
+        datastore.finalize_schema_creation(pending)?;
+    }
+    Ok(())
 }
 
 /// Commit the table creations drained from a transaction. Each one initializes
@@ -773,13 +960,15 @@ impl Datastore for DeltaDatastore {
 /// Everything a query does against it (binding, scan-view construction, late
 /// materialize) is pure in-memory.
 pub struct DeltaSnapshot {
-    tables: TableIndex,
+    /// The datastore's schemas and tables as they stood when the transaction
+    /// began, so a query resolves both from one frozen view.
+    index: DatastoreIndex,
 }
 
 impl std::fmt::Debug for DeltaSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DeltaSnapshot")
-            .field("tables", &self.tables.names().collect::<Vec<_>>())
+            .field("tables", &self.index.table_names().collect::<Vec<_>>())
             .finish_non_exhaustive()
     }
 }
@@ -788,15 +977,23 @@ impl DeltaSnapshot {
     /// A clone of the table named `name`, or `None` if this snapshot has no such
     /// table. The frozen copy a [`TableBinding`] captures at bind time, so its
     /// compile resolves the table's file set without any transaction handle.
-    pub(super) fn catalog_table_by_name(&self, name: &str) -> Option<CatalogTable> {
-        self.tables.get_by_name(name).cloned()
+    pub(super) fn catalog_table_by_name(
+        &self,
+        name: &SchemaQualifiedTableName,
+    ) -> Option<CatalogTable> {
+        self.index.get_table_by_name(name).cloned()
+    }
+
+    /// Whether this frozen snapshot defines a schema named `schema`.
+    fn contains_schema(&self, schema: &str) -> bool {
+        self.index.contains_schema(schema)
     }
 
     /// The cache revision of `name` in this frozen snapshot. The Delta metadata
     /// UUID distinguishes table incarnations; the log version distinguishes
     /// every committed snapshot of one incarnation.
-    fn table_revision(&self, name: &str) -> Option<TableRevision> {
-        let table = self.tables.get_by_name(name)?;
+    fn table_revision(&self, name: &SchemaQualifiedTableName) -> Option<TableRevision> {
+        let table = self.index.get_table_by_name(name)?;
         Some(TableRevision {
             identity: table.id().to_string(),
             version: table.version(),
@@ -807,20 +1004,31 @@ impl DeltaSnapshot {
     /// version from here (the frozen snapshot), so it commits to the log without
     /// touching the datastore's live set.
     pub(super) fn catalog_table_by_id(&self, id: &Uuid) -> Option<CatalogTable> {
-        self.tables.get_by_id(id).cloned()
+        self.index.get_table_by_id(id).cloned()
     }
 
     /// Whether this snapshot holds a table named `name`; the up-front duplicate
     /// check for `CREATE TABLE`.
-    pub(super) fn contains_table(&self, name: &str) -> bool {
-        self.tables.contains_name(name)
+    pub(super) fn contains_table(&self, name: &SchemaQualifiedTableName) -> bool {
+        self.index.contains_table(name)
     }
+}
+
+/// One schema creation resolved by a transaction and waiting for it to commit.
+/// A schema has no content to load, so it is staged as soon as it resolves.
+#[derive(Clone)]
+struct PendingSchemaCreation {
+    name: String,
+    /// Whether the statement used `IF NOT EXISTS`, so the commit treats a schema
+    /// that appeared since resolution as a success rather than an error.
+    if_not_exists: bool,
 }
 
 /// One table creation whose footer metadata has been loaded successfully and is
 /// waiting for its transaction to commit it.
 struct PendingTableCreation {
-    name: String,
+    name: SchemaQualifiedTableName,
+    id: Uuid,
     location: ObjectPath,
     columns: Vec<planner::catalog::Column>,
     partition_by: Vec<String>,
@@ -836,6 +1044,7 @@ pub struct DeltaTransaction {
     pub(super) snapshot: Arc<DeltaSnapshot>,
     pub(super) uploaded_files: Arc<Injector<insert_sink::UploadedFile>>,
     pending_table_creations: Arc<Injector<PendingTableCreation>>,
+    pending_schema_creations: Arc<Injector<PendingSchemaCreation>>,
     /// The datastore this transaction reads and writes back to. CREATE commits
     /// publish through it so DDL is visible to the next transaction without
     /// waiting for a refresh.
@@ -858,11 +1067,12 @@ impl DeltaTransaction {
     /// `TableBinding`, and one function cannot return both). The binding captures
     /// the snapshot's copy of the table and shares this transaction's
     /// uploaded-files injector, so it is self-contained.
-    pub fn table(&self, datastore: &str, name: &str) -> Option<TableBinding> {
+    pub fn table(&self, datastore: &str, name: &SchemaQualifiedTableName) -> Option<TableBinding> {
         Some(TableBinding::new(
-            TableReference {
+            planner::catalog::TableReference {
                 datastore: datastore.to_string(),
-                table: name.to_string(),
+                schema: name.schema.clone(),
+                table: name.table.clone(),
             },
             self.snapshot.catalog_table_by_name(name)?,
             self.uploaded_files.clone(),
@@ -872,11 +1082,19 @@ impl DeltaTransaction {
 
 #[async_trait]
 impl DatastoreTransaction for DeltaTransaction {
-    fn bind_table(&self, datastore: &str, name: &str) -> Option<Box<dyn BoundTable>> {
+    fn does_schema_exist(&self, schema: &str) -> bool {
+        self.contains_schema(schema)
+    }
+
+    fn bind_table(
+        &self,
+        datastore: &str,
+        name: &SchemaQualifiedTableName,
+    ) -> Option<Box<dyn BoundTable>> {
         Some(Box::new(DeltaTransaction::table(self, datastore, name)?))
     }
 
-    fn table_revision(&self, name: &str) -> Option<TableRevision> {
+    fn table_revision(&self, name: &SchemaQualifiedTableName) -> Option<TableRevision> {
         self.snapshot.table_revision(name)
     }
 
@@ -887,18 +1105,33 @@ impl DatastoreTransaction for DeltaTransaction {
         Ok(Box::new(self.bind_create(request)?))
     }
 
+    fn bind_create_schema(
+        &self,
+        request: CreateSchemaRequest,
+    ) -> CatalogResult<Box<dyn SchemaCreation>> {
+        Ok(Box::new(self.bind_schema_creation(request)?))
+    }
+
     async fn commit(&self) -> CatalogResult<()> {
         // A read-only transaction staged nothing: an in-memory no-op, run inline
         // rather than pay a blocking-pool round trip. Only a commit that writes
         // durable state hops off the runtime.
-        if self.uploaded_files.is_empty() && self.pending_table_creations.is_empty() {
+        if self.uploaded_files.is_empty()
+            && self.pending_table_creations.is_empty()
+            && self.pending_schema_creations.is_empty()
+        {
             return Ok(());
         }
         let snapshot = self.snapshot.clone();
         let datastore = self.datastore.clone();
+        let pending_schema_creations = drain_injector(&self.pending_schema_creations);
         let pending_table_creations = drain_injector(&self.pending_table_creations);
         let uploaded_files = drain_injector(&self.uploaded_files);
         tokio::task::spawn_blocking(move || {
+            // Schemas first: a table is registered into its schema, so the
+            // schema has to be in the manifest before any table write looks for
+            // it.
+            commit_schema_creations(&datastore, pending_schema_creations)?;
             commit_table_creations(&datastore, pending_table_creations)?;
             commit_uploaded_files(&datastore, &snapshot, uploaded_files)
         })
@@ -907,8 +1140,40 @@ impl DatastoreTransaction for DeltaTransaction {
     }
 
     fn rollback(&self) {
+        drain_injector(&self.pending_schema_creations);
         drain_injector(&self.pending_table_creations);
         drain_injector(&self.uploaded_files);
+    }
+}
+
+/// A resolved `CREATE SCHEMA` for a [`DeltaDatastore`]: the validated creation
+/// plus the transaction-owned staging queue it will land in. Compiling it builds
+/// a dataflow that stages the creation and emits no rows, so the schema appears
+/// on the transaction only once that dataflow runs.
+struct DeltaSchemaCreation {
+    pending_schema_creations: Arc<Injector<PendingSchemaCreation>>,
+    creation: PendingSchemaCreation,
+}
+
+impl SchemaCreation for DeltaSchemaCreation {
+    fn compile(&self, dispatcher: &DataFlowDispatcher) -> CatalogResult<RecordBatchOperatorSpec> {
+        // One nullary per worker, but only the first carries the creation; the
+        // rest no-op. Handing it out here rather than racing for it at run time
+        // is how the table-creation sink picks its staging worker too.
+        let mut creation = Some(self.creation.clone());
+        let factories: Vec<_> = (0..dispatcher.worker_count())
+            .map(|_| {
+                let staged = creation.take();
+                let pending_schema_creations = self.pending_schema_creations.clone();
+                OneShotNullaryFactory::new(move || {
+                    if let Some(creation) = staged {
+                        pending_schema_creations.push(creation);
+                    }
+                    None
+                })
+            })
+            .collect();
+        Ok(RecordBatchOperatorSpec::from_nullary(dispatcher, factories))
     }
 }
 
@@ -920,7 +1185,8 @@ impl DatastoreTransaction for DeltaTransaction {
 struct DeltaTableCreation {
     pending_table_creations: Arc<Injector<PendingTableCreation>>,
     files: Vec<DataFile>,
-    name: String,
+    name: SchemaQualifiedTableName,
+    id: Uuid,
     columns: Vec<planner::catalog::Column>,
     location: ObjectPath,
     partition_by: Vec<String>,
@@ -936,6 +1202,7 @@ impl TableCreation for DeltaTableCreation {
         // and live publication happen later in the transaction's blocking commit.
         let pending_table_creations = self.pending_table_creations.clone();
         let name = self.name.clone();
+        let id = self.id;
         let location = self.location.clone();
         let columns = self.columns.clone();
         let partition_by = self.partition_by.clone();
@@ -949,6 +1216,7 @@ impl TableCreation for DeltaTableCreation {
             move |loaded: Vec<TableFile>| {
                 pending_table_creations.push(PendingTableCreation {
                     name,
+                    id,
                     location,
                     columns,
                     partition_by,

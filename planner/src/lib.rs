@@ -45,7 +45,7 @@
 //!
 //! impl BoundTable for MyTable {
 //!     fn table_reference(&self) -> TableReference {
-//!         TableReference { datastore: "default".into(), table: "hits".into() }
+//!         TableReference { datastore: "default".into(), schema: "main".into(), table: "hits".into() }
 //!     }
 //!     fn table_revision(&self) -> TableRevision {
 //!         TableRevision { identity: "hits".into(), version: 0 }
@@ -76,17 +76,21 @@
 //! }
 //!
 //! // A single read-only database presented to the planner as a one-entry
-//! // catalog: it ignores the datastore qualifier and resolves by table name.
+//! // catalog: it ignores the datastore qualifier and holds every table in the
+//! // default schema.
 //! impl CatalogTransaction for MyTransaction {
-//!     fn bind_table(&self, _datastore: &str, name: &str) -> Option<Box<dyn BoundTable>> {
+//!     fn does_schema_exist(&self, _datastore: &str, schema: &str) -> bool {
+//!         schema == planner::DEFAULT_SCHEMA_NAME
+//!     }
+//!     fn bind_table(&self, reference: &TableReference) -> Option<Box<dyn BoundTable>> {
 //!         self.tables
-//!             .get(name)
+//!             .get(&reference.table)
 //!             .cloned()
 //!             .map(|t| Box::new(MyTable { parquet: t.parquet, columns: t.columns }) as Box<dyn BoundTable>)
 //!     }
-//!     fn table_revision(&self, datastore: &str, name: &str) -> Option<TableRevision> {
-//!         self.tables.contains_key(name).then(|| TableRevision {
-//!             identity: format!("{datastore}:{name}"),
+//!     fn table_revision(&self, reference: &TableReference) -> Option<TableRevision> {
+//!         self.tables.contains_key(&reference.table).then(|| TableRevision {
+//!             identity: format!("{}:{}", reference.datastore, reference.table),
 //!             version: 0,
 //!         })
 //!     }
@@ -174,6 +178,12 @@ impl From<duckdb_planner::BridgeError> for Error {
 /// picks by flagging one of its datastores `default = true`. Owned here, the
 /// lowest crate that names it; `catalog` re-exports it.
 pub const DEFAULT_DATASTORE_NAME: &str = "default";
+
+/// The conventional name for the schema every datastore has: DuckDB's default
+/// schema, and the one a reference that names no schema resolves in. A datastore
+/// always defines it, so a two-part `datastore.table` reference always resolves.
+/// Owned here beside [`DEFAULT_DATASTORE_NAME`], the lowest crate that names it.
+pub const DEFAULT_SCHEMA_NAME: &str = "main";
 
 /// Entry point for using crate: plans SQL statements into a Pivot [`Plan`].
 ///

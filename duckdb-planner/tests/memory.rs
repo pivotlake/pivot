@@ -42,7 +42,16 @@ impl DuckDBBind for TestCatalog {}
 struct TestTransaction;
 
 impl DuckDBTransaction for TestTransaction {
-    fn bind_table(&self, _datastore: &str, table_name: &str) -> Option<Box<dyn DuckDBTable>> {
+    fn does_schema_exist(&self, _datastore: &str, schema: &str) -> bool {
+        schema == "main"
+    }
+
+    fn bind_table(
+        &self,
+        _datastore: &str,
+        _schema: &str,
+        table_name: &str,
+    ) -> Option<Box<dyn DuckDBTable>> {
         match table_name {
             "users" => Some(Box::new(UsersTable)),
             _ => None,

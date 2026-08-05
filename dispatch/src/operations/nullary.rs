@@ -205,15 +205,16 @@ impl<O> Nullary<O> for NoOpNullary {
     }
 }
 
-/// Runs a `FnOnce() -> O` exactly once on the worker it lands on, sends the
-/// result downstream, and finishes.
+/// Runs a `FnOnce() -> Option<O>` exactly once on the worker it lands on,
+/// sends the result downstream if there is one, and finishes.
 ///
-/// Used to plumb one-shot setup work (e.g. building a `ParquetTable`) into a
-/// worker thread that has a `MemoryContext`, so the caller doesn't have to
-/// have one. See [`DataFlowDispatcher::run_on_worker`](crate::DataFlowDispatcher::run_on_worker).
+/// Used to plumb one-shot work (e.g. building a `ParquetTable`, or a
+/// side-effect-only DDL step) into a worker thread that has a `MemoryContext`,
+/// so the caller doesn't have to have one. See
+/// [`DataFlowDispatcher::run_on_worker`](crate::DataFlowDispatcher::run_on_worker).
 pub struct OneShotNullaryFactory<O, F>
 where
-    F: FnOnce() -> O + Send + 'static,
+    F: FnOnce() -> Option<O> + Send + 'static,
 {
     func: F,
     _phantom: PhantomData<fn() -> O>,
@@ -221,7 +222,7 @@ where
 
 impl<O, F> OneShotNullaryFactory<O, F>
 where
-    F: FnOnce() -> O + Send + 'static,
+    F: FnOnce() -> Option<O> + Send + 'static,
 {
     pub fn new(func: F) -> Self {
         Self {
@@ -234,7 +235,7 @@ where
 impl<O, F> NullaryFactory<O> for OneShotNullaryFactory<O, F>
 where
     O: Send + 'static,
-    F: FnOnce() -> O + Send + 'static,
+    F: FnOnce() -> Option<O> + Send + 'static,
 {
     type Nullary = OneShotNullary<O, F>;
 
@@ -246,16 +247,18 @@ where
     }
 }
 
-pub struct OneShotNullary<O, F: FnOnce() -> O> {
+pub struct OneShotNullary<O, F: FnOnce() -> Option<O>> {
     func: Option<F>,
     _phantom: PhantomData<fn() -> O>,
 }
 
-impl<O, F: FnOnce() -> O + Send> Nullary<O> for OneShotNullary<O, F> {
+impl<O, F: FnOnce() -> Option<O> + Send> Nullary<O> for OneShotNullary<O, F> {
     fn run(&mut self, sender: &mut dyn Sender<O>) -> Result<WorkStatus> {
         match self.func.take() {
             Some(f) => {
-                sender.send(f())?;
+                if let Some(output) = f() {
+                    sender.send(output)?;
+                }
                 Ok(WorkStatus::Ran)
             }
             None => Ok(WorkStatus::Pending),

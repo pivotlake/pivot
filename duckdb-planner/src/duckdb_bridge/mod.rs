@@ -10,8 +10,8 @@ pub mod duckdb_types;
 
 use crate::catalog_provider::{
     CatalogContext, OptionalTableWrapper, TransactionContext, catalog_context_default,
-    catalog_context_names, catalog_get_scalar_function, catalog_get_table,
-    catalog_get_table_function, pushdown_filter, table_estimate_row_count,
+    catalog_context_names, catalog_does_schema_exist, catalog_get_scalar_function,
+    catalog_get_table, catalog_get_table_function, pushdown_filter, table_estimate_row_count,
 };
 
 /// CXX bridge to the hand-written C++ glue in `bridge.cpp` / `bridge.h`.
@@ -125,11 +125,20 @@ pub mod ffi {
         /// current database, read by the C++ context constructor.
         fn catalog_context_names(ctx: &CatalogContext) -> Vec<String>;
         fn catalog_context_default(ctx: &CatalogContext) -> String;
+        /// Whether `datastore` defines `schema`, asked when the binder looks a
+        /// schema up so an unknown schema is reported as one.
+        fn catalog_does_schema_exist(
+            transaction: &TransactionContext,
+            datastore: &str,
+            schema: &str,
+        ) -> bool;
         /// BoundTable / table-function lookups are routed by `datastore` (the datastore
-        /// / database name) to that datastore's snapshot in the transaction.
+        /// / database name) to that datastore's snapshot in the transaction; a table
+        /// is then resolved within `schema` of that datastore.
         fn catalog_get_table(
             transaction: &TransactionContext,
             datastore: &str,
+            schema: &str,
             name: &str,
         ) -> CatalogGetTableResult;
         fn catalog_get_table_function(
@@ -292,6 +301,9 @@ pub mod ffi {
         /// The target database (datastore) of `CREATE TABLE db.schema.t`, or empty
         /// when unqualified. Routes the create to the right datastore.
         fn lo_create_table_datastore(op: &LogicalOperator) -> Result<String>;
+        /// The target schema of `CREATE TABLE db.schema.t`, or empty when the
+        /// statement named none. Routes the create to the right schema.
+        fn lo_create_table_schema(op: &LogicalOperator) -> Result<String>;
         fn lo_create_column_count(op: &LogicalOperator) -> Result<usize>;
         fn lo_create_column_name(op: &LogicalOperator, index: usize) -> Result<String>;
         fn lo_create_column_type(op: &LogicalOperator, index: usize) -> Result<BridgeLogicalType>;
@@ -303,6 +315,14 @@ pub mod ffi {
         fn lo_create_temporary(op: &LogicalOperator) -> Result<bool>;
         fn lo_create_has_query(op: &LogicalOperator) -> Result<bool>;
         fn lo_create_constraint_count(op: &LogicalOperator) -> Result<usize>;
+
+        // ---- CreateSchema ----
+        fn lo_create_schema_name(op: &LogicalOperator) -> Result<String>;
+        /// The target database (datastore) of `CREATE SCHEMA db.s`, or empty when
+        /// unqualified. Routes the create to the right datastore.
+        fn lo_create_schema_datastore(op: &LogicalOperator) -> Result<String>;
+        fn lo_create_schema_if_not_exists(op: &LogicalOperator) -> Result<bool>;
+        fn lo_create_schema_or_replace(op: &LogicalOperator) -> Result<bool>;
 
         // ---- Set / Reset ----
         fn lo_set_name(op: &LogicalOperator) -> Result<String>;

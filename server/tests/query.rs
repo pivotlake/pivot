@@ -41,6 +41,15 @@ async fn select_rows(client: &Client, sql: &str) -> Vec<Vec<Option<String>>> {
         .collect()
 }
 
+/// The server-side message of a failed query. `tokio_postgres::Error` renders
+/// as a bare "db error", so assertions on what the server said have to read the
+/// `DbError` it carries.
+fn extract_db_error_message(error: &tokio_postgres::Error) -> String {
+    error
+        .as_db_error()
+        .map_or_else(|| error.to_string(), |db| db.message().to_string())
+}
+
 /// Write `batch` as a single parquet file inside a fresh tempdir and return
 /// the directory (kept alive by the caller — drop it to clean up).
 fn write_parquet(batch: &RecordBatch) -> TempDir {
@@ -686,5 +695,110 @@ async fn one_query_reads_two_ctes_including_one_built_from_the_other(#[future] c
                 Some("2".into())
             ],
         ]
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn table_in_a_created_schema_is_queryable(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    let path = dir.path().to_str().unwrap();
+    conn.simple_query("CREATE SCHEMA analytics").await.unwrap();
+
+    conn.simple_query(&format!(
+        "CREATE TABLE analytics.people (id BIGINT, name VARCHAR) WITH (path = '{path}')"
+    ))
+    .await
+    .unwrap();
+
+    let rows = select_rows(&conn, "SELECT name FROM analytics.people WHERE id = 2").await;
+    assert_eq!(rows, vec![vec![Some("bob".into())]]);
+}
+
+/// A write names its table the same way a read does, so the rows an INSERT
+/// produces have to land in the table the qualified name resolves to and come
+/// back from it alongside the ones already there.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_into_a_schema_qualified_table(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    let path = dir.path().to_str().unwrap();
+    conn.simple_query("CREATE SCHEMA staffing").await.unwrap();
+    conn.simple_query(&format!(
+        "CREATE TABLE staffing.people (id BIGINT, name VARCHAR) WITH (path = '{path}')"
+    ))
+    .await
+    .unwrap();
+
+    conn.simple_query("INSERT INTO staffing.people VALUES (4, 'dave')")
+        .await
+        .unwrap();
+
+    let rows = select_rows(&conn, "SELECT id, name FROM staffing.people ORDER BY id").await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1".into()), Some("alice".into())],
+            vec![Some("2".into()), Some("bob".into())],
+            vec![Some("3".into()), Some("carol".into())],
+            vec![Some("4".into()), Some("dave".into())],
+        ],
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_schema_qualifies_a_table_name(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    let path = dir.path().to_str().unwrap();
+    conn.simple_query("CREATE SCHEMA reporting").await.unwrap();
+    conn.simple_query(&format!(
+        "CREATE TABLE reporting.staff (id BIGINT, name VARCHAR) WITH (path = '{path}')"
+    ))
+    .await
+    .unwrap();
+
+    // The same bare name in the default schema is a different table.
+    let err = conn.simple_query("SELECT id FROM staff").await.unwrap_err();
+
+    let message = extract_db_error_message(&err);
+    assert!(
+        message.to_lowercase().contains("staff"),
+        "expected an unknown-table error naming `staff`, got: {message}",
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn query_against_unknown_schema_errors(#[future] conn: Conn) {
+    let err = conn
+        .simple_query("SELECT id FROM no_such_schema.people")
+        .await
+        .unwrap_err();
+
+    let message = extract_db_error_message(&err);
+    assert!(
+        message.contains("no_such_schema"),
+        "expected the error to name the missing schema, got: {message}",
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn create_table_in_an_unknown_schema_errors(#[future] conn: Conn) {
+    let err = conn
+        .simple_query("CREATE TABLE absent_schema.t (id BIGINT)")
+        .await
+        .unwrap_err();
+
+    let message = extract_db_error_message(&err);
+    assert!(
+        message.contains("absent_schema"),
+        "expected the error to name the missing schema, got: {message}",
     );
 }

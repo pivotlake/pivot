@@ -3,6 +3,8 @@
 #include "duckdb-planner/src/duckdb_bridge/cpp/storage_info.h"
 #include "duckdb-planner/src/duckdb_bridge/cpp/catalog/table_entry.h"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/client_data.hpp"
+#include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -14,6 +16,8 @@
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
+#include "duckdb/planner/operator/logical_create.hpp"
+#include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
@@ -154,12 +158,17 @@ DuckPlannerContext::DuckPlannerContext(rust::Box<CatalogContext> catalog)
 		}
 	}
 
+	// Make the default datastore the current database. Set the search path
+	// directly rather than through `USE`: the binder verifies a `USE` target's
+	// schema through the catalog, and schema lookups need a published
+	// transaction, which only exists while a plan is being extracted. The
+	// unverified path is checked at bind time by every plan that resolves an
+	// unqualified name through it.
 	std::string default_name(catalog_context_default(*this->catalog));
-	auto use_result =
-	    con.Query("USE " + duckdb::KeywordHelper::WriteQuoted(default_name, '"'));
-	if (use_result->HasError()) {
-		throw std::runtime_error(use_result->GetError());
-	}
+	duckdb::ClientData::Get(*con.context)
+	    .catalog_search_path->Set(
+	        duckdb::CatalogSearchEntry(default_name, DEFAULT_SCHEMA),
+	        duckdb::CatalogSetPathType::SET_DIRECTLY);
 }
 
 std::unique_ptr<DuckPlannerContext> new_context(rust::Box<CatalogContext> catalog) {
@@ -669,6 +678,36 @@ rust::String lo_create_table_datastore(const LogicalOperator &op) {
 	// `CREATE TABLE db.schema.t` in its native `catalog` field. It is empty when
 	// the statement is unqualified.
 	return rust::String::lossy(create_table_info(op).catalog);
+}
+
+rust::String lo_create_table_schema(const LogicalOperator &op) {
+	// DuckDB resolves the schema of `CREATE TABLE db.schema.t` into its native
+	// `schema` field. It is empty when the statement named no schema.
+	return rust::String::lossy(create_table_info(op).schema);
+}
+
+// ---- CreateSchema ----
+
+static duckdb::CreateSchemaInfo &create_schema_info(const LogicalOperator &op) {
+	return as<duckdb::LogicalCreate>(op).info->Cast<duckdb::CreateSchemaInfo>();
+}
+
+rust::String lo_create_schema_name(const LogicalOperator &op) {
+	return rust::String::lossy(create_schema_info(op).schema);
+}
+
+rust::String lo_create_schema_datastore(const LogicalOperator &op) {
+	// DuckDB stores the resolved datastore/database for `CREATE SCHEMA db.s` in
+	// its native `catalog` field. It is empty when the statement is unqualified.
+	return rust::String::lossy(create_schema_info(op).catalog);
+}
+
+bool lo_create_schema_if_not_exists(const LogicalOperator &op) {
+	return create_schema_info(op).on_conflict == duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
+}
+
+bool lo_create_schema_or_replace(const LogicalOperator &op) {
+	return create_schema_info(op).on_conflict == duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
 }
 
 size_t lo_create_column_count(const LogicalOperator &op) {

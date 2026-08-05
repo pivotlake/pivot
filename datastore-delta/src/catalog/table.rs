@@ -94,6 +94,7 @@ impl CatalogTable {
     /// Delta version 0 with its protocol, metadata, and initial `Add` actions.
     #[allow(clippy::too_many_arguments)] // an internal constructor; each field is needed
     pub(super) fn create_new(
+        id: uuid::Uuid,
         location: ObjectPath,
         files: Vec<TableFile>,
         columns: Vec<Column>,
@@ -113,9 +114,10 @@ impl CatalogTable {
             .iter()
             .map(|file| file.file.clone())
             .collect::<Vec<_>>();
-        let (delta_uri, id) = crate::delta::initialize_table(
+        let delta_uri = crate::delta::initialize_table(
             store.as_ref(),
             &location,
+            id,
             &columns,
             &partition_by,
             &sort_by,

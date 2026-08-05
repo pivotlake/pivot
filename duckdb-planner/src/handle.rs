@@ -196,6 +196,7 @@ impl<'plan> LogicalOp<'plan> {
             }
             L::LOGICAL_GET => Operator::TableFunctionScan(TableFunctionScan { raw: self.raw }),
             L::LOGICAL_CREATE_TABLE => Operator::CreateTable(CreateTable { raw: self.raw }),
+            L::LOGICAL_CREATE_SCHEMA => Operator::CreateSchema(CreateSchema { raw: self.raw }),
             L::LOGICAL_SET => Operator::Set(Set { raw: self.raw }),
             L::LOGICAL_RESET => Operator::Reset(Reset { raw: self.raw }),
             L::LOGICAL_COMPARISON_JOIN => {
@@ -231,6 +232,7 @@ pub enum Operator<'plan> {
     /// A scan over a table-valued function (`LOGICAL_GET` with no base table).
     TableFunctionScan(TableFunctionScan<'plan>),
     CreateTable(CreateTable<'plan>),
+    CreateSchema(CreateSchema<'plan>),
     /// `SET name = value`.
     Set(Set<'plan>),
     /// `RESET name`.
@@ -288,6 +290,8 @@ define_handles! { ffi::LogicalOperator;
     TableFunctionScan,
     /// A `LogicalCreateTable` with an explicit column list.
     CreateTable,
+    /// A `LogicalCreate` for `CREATE SCHEMA`.
+    CreateSchema,
     /// A `LogicalSet`: `SET name = value`.
     Set,
     /// A `LogicalReset`: `RESET name`.
@@ -563,6 +567,27 @@ impl<'plan> TableFunctionScan<'plan> {
     }
 }
 
+impl<'plan> CreateSchema<'plan> {
+    pub fn name(self) -> Result<String> {
+        Ok(ffi::lo_create_schema_name(self.raw)?)
+    }
+
+    /// The target database (datastore) of `CREATE SCHEMA db.s`, or `None` when
+    /// the statement is unqualified (routes to the default datastore).
+    pub fn datastore(self) -> Result<Option<String>> {
+        let datastore = ffi::lo_create_schema_datastore(self.raw)?;
+        Ok((!datastore.is_empty()).then_some(datastore))
+    }
+
+    pub fn if_not_exists(self) -> Result<bool> {
+        Ok(ffi::lo_create_schema_if_not_exists(self.raw)?)
+    }
+
+    pub fn or_replace(self) -> Result<bool> {
+        Ok(ffi::lo_create_schema_or_replace(self.raw)?)
+    }
+}
+
 impl<'plan> CreateTable<'plan> {
     pub fn name(self) -> Result<String> {
         Ok(ffi::lo_create_table_name(self.raw)?)
@@ -573,6 +598,13 @@ impl<'plan> CreateTable<'plan> {
     pub fn datastore(self) -> Result<Option<String>> {
         let datastore = ffi::lo_create_table_datastore(self.raw)?;
         Ok((!datastore.is_empty()).then_some(datastore))
+    }
+
+    /// The target schema of `CREATE TABLE db.schema.t`, or `None` when the
+    /// statement named none (routes to the default schema).
+    pub fn schema(self) -> Result<Option<String>> {
+        let schema = ffi::lo_create_table_schema(self.raw)?;
+        Ok((!schema.is_empty()).then_some(schema))
     }
 
     pub fn columns(self) -> Result<Vec<(String, BoundLogicalType)>> {
