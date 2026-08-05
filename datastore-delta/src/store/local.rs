@@ -6,6 +6,31 @@ use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::object_store::local::LocalFileSystem;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Distinguishes the staging files of concurrent writers within this process.
+/// Paired with the pid, which distinguishes processes sharing one store.
+static NEXT_STAGING_FILE: AtomicU64 = AtomicU64::new(0);
+
+/// A staging path beside `path` that no other writer will pick.
+///
+/// The name has to be unique per *writer*, not per process. Two threads writing
+/// one key would otherwise derive the same staging path, and then one truncates
+/// and rewrites the file the other is about to publish, or removes it from under
+/// them. The publish still succeeds, so a writer reports success having stored
+/// another's bytes. The counter separates writers within a process; the pid
+/// separates processes sharing the store.
+///
+/// `with_extension` replaces the key's own extension, so a staging file for
+/// `000...006.json` is not itself named `.json` and never looks like a log
+/// version to a listing.
+fn staging_path(path: &std::path::Path) -> PathBuf {
+    path.with_extension(format!(
+        "tmp.{}.{}",
+        std::process::id(),
+        NEXT_STAGING_FILE.fetch_add(1, Ordering::Relaxed)
+    ))
+}
 
 /// The local-filesystem backend: keys are paths under `root`.
 #[derive(Debug)]
@@ -66,8 +91,10 @@ impl ObjectStore for LocalStore {
             })?;
         }
         // Write a sibling temp file and rename over the target, so a concurrent
-        // reader sees the old or new file whole — never a half-written one.
-        let tmp = path.with_extension("tmp");
+        // reader sees the old or new file whole — never a half-written one. The
+        // name is per-writer for the same reason as in `put_if_absent`: a shared
+        // one lets two writers interleave into a single staging file.
+        let tmp = staging_path(&path);
         std::fs::write(&tmp, data).map_err(|source| StoreError::Io {
             key: key.to_string(),
             source,
@@ -90,7 +117,11 @@ impl ObjectStore for LocalStore {
         // to the target name: `link` fails with `AlreadyExists` if the target
         // exists, so creation is atomic *and* a concurrent reader can never see
         // a partially-written object.
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        //
+        // The staging name is per-writer (see `staging_path`); a shared one lets
+        // two committers of the same version interleave into one file, so the
+        // link publishes bytes the winner never wrote.
+        let tmp = staging_path(&path);
         std::fs::write(&tmp, data).map_err(|source| StoreError::Io {
             key: key.to_string(),
             source,
@@ -189,6 +220,51 @@ mod tests {
         assert!(!store.put_if_absent(&p("v/1.json"), b"second").unwrap());
         // The loser's bytes never land.
         assert_eq!(store.get(&p("v/1.json")).unwrap().unwrap(), b"first");
+    }
+
+    /// Racing writers must not corrupt each other's staging. Exactly one wins
+    /// the key, and what lands has to be the winner's own bytes: a shared
+    /// staging file lets a loser's content be published under the winner's
+    /// success, which is how a Delta log ends up naming a version whose actions
+    /// were never written.
+    #[test]
+    fn concurrent_put_if_absent_stores_the_winners_own_bytes() {
+        // A race needs repeating to be caught reliably; each round is a fresh
+        // key so the rounds do not interfere.
+        for round in 0..64 {
+            let dir = tempfile::tempdir().unwrap();
+            let store = LocalStore::new(dir.path());
+            let key = p(&format!("_delta_log/{round:020}.json"));
+            let writers: Vec<String> = (0..8).map(|w| format!("writer-{w}")).collect();
+
+            let winners: Vec<&String> = std::thread::scope(|scope| {
+                let handles: Vec<_> = writers
+                    .iter()
+                    .map(|content| {
+                        let store = &store;
+                        let key = &key;
+                        scope.spawn(move || {
+                            store
+                                .put_if_absent(key, content.as_bytes())
+                                .unwrap()
+                                .then_some(content)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .filter_map(|h| h.join().unwrap())
+                    .collect()
+            });
+
+            assert_eq!(winners.len(), 1, "exactly one writer creates the key");
+            let stored = store.get(&key).unwrap().unwrap();
+            assert_eq!(
+                String::from_utf8(stored).unwrap(),
+                *winners[0],
+                "the key holds bytes a different writer wrote"
+            );
+        }
     }
 
     #[test]
