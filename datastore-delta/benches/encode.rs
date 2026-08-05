@@ -37,8 +37,9 @@
 //!
 //! Env: `PIVOT_BENCH_ROWS` (default 2M), `PIVOT_BENCH_WORKERS` (default all
 //! cores), `PIVOT_BENCH_BUFFERS` (ring slots of 2 MiB, default 1024). The
-//! variant case builds its documents through a JSON parser, which costs more to
-//! set up than it does to encode, so it takes a fraction of the rows.
+//! variant case builds its documents through a JSON parser, so it costs
+//! noticeably more to set up than the rest; the setup runs once, outside the
+//! measurement.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -67,9 +68,6 @@ const OUTPUT_ROOT: &str = "/dev/shm";
 const TABLE: &str = "written";
 
 const DEFAULT_ROWS: usize = 2_000_000;
-/// Rows the variant case takes, as a fraction of the rest. Its documents are
-/// built by parsing JSON, which dominates setup at the full row count.
-const VARIANT_ROW_SHARE: usize = 8;
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
@@ -386,9 +384,9 @@ fn bench_encode(c: &mut Criterion, dispatch: &Dispatch, rows: usize) {
         ),
         (
             "variant",
-            rows / VARIANT_ROW_SHARE,
+            rows,
             columns(&["attrs"], Type::Variant),
-            variant_batches(rows / VARIANT_ROW_SHARE),
+            variant_batches(rows),
         ),
     ];
 
