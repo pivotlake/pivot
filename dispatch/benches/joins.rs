@@ -38,6 +38,21 @@
 //! `PIVOT_BENCH_BUFFERS` (ring slots of 2 MiB each, default 4096). The sizing
 //! notes in `operators.rs` apply here too; under `perf`, raise the
 //! locked-memory limit (`ulimit -l unlimited`).
+//!
+//! VALIDATION — each scenario was perf-profiled side by side with the real
+//! query whose join it mirrors (per-query worker-scoped recordings on a
+//! 16-core box, comparing the shares of the join-namespace symbols: the
+//! probe pipeline, the output gather appends, and the build scatter). The
+//! sparse, mid-build, packed-pair, outer, and semi scenarios land within a
+//! few points of their real counterparts' splits; the big-build and
+//! build-heavy scenarios isolate the scatter-dominated component that real
+//! plans mix with other probes. Two notes from that comparison: real plans
+//! precompute string predicates on the build side, so string columns reach
+//! the gather less often than query text suggests (the string scenario
+//! exercises the view-gather path that shows up at a few percent inside
+//! several real joins), and per-query profiles merge every same-shaped join
+//! instantiation into one symbol, so a query with several joins compares
+//! against a blend of scenarios rather than one.
 
 use std::sync::Arc;
 
@@ -348,7 +363,7 @@ fn bench_joins(c: &mut Criterion, d: &DataFlowDispatcher) {
     //     part of the profile.
     {
         let probe_rows = scaled(32_000_000);
-        let build_rows = scaled(6_000_000);
+        let build_rows = scaled(3_000_000);
         bench(
             c,
             d,
