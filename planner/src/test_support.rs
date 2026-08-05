@@ -425,6 +425,22 @@ pub fn run(planner: &mut TestingPlanner, sql: &str) -> Vec<Value> {
 /// inspect the output arrow schema (e.g. that a DATE column surfaces as
 /// `Date32`) rather than only the JSON-rendered values.
 pub fn run_batches(planner: &mut TestingPlanner, sql: &str) -> Vec<RecordBatch> {
+    collect_batches(planner, sql).unwrap()
+}
+
+/// Plan, compile, and run `sql`, returning the error the failing dataflow
+/// reports. For tests asserting that bad data fails the query.
+pub fn run_expecting_error(planner: &mut TestingPlanner, sql: &str) -> String {
+    collect_batches(planner, sql).unwrap_err().to_string()
+}
+
+/// The shared plan-compile-collect pipeline behind [`run_batches`] and
+/// [`run_expecting_error`]: planning and compilation must succeed, running the
+/// dataflow may fail.
+fn collect_batches(
+    planner: &mut TestingPlanner,
+    sql: &str,
+) -> Result<Vec<RecordBatch>, dispatch::DataFlowError> {
     planner
         .plan(sql)
         .unwrap()
@@ -434,7 +450,6 @@ pub fn run_batches(planner: &mut TestingPlanner, sql: &str) -> Vec<RecordBatch> 
         )
         .unwrap()
         .collect()
-        .unwrap()
 }
 
 /// The value of a row's single column, by position rather than name. For tests

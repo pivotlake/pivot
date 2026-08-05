@@ -1169,3 +1169,7 @@ const Expression &expr_case_else(const Expression &expr) {
 const Expression &expr_cast_child(const Expression &expr) {
 	return *as_expr<duckdb::BoundCastExpression>(expr).child;
 }
+
+bool expr_cast_is_try(const Expression &expr) {
+	return as_expr<duckdb::BoundCastExpression>(expr).try_cast;
+}

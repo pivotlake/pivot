@@ -53,14 +53,26 @@ impl Cast {
         }
 
         let target = self.target_arrow.clone();
+        // Cast strictly: a value the target type cannot represent must fail
+        // the query, not silently become NULL (the lenient TRY_CAST form is
+        // rejected while building the plan).
+        let options = arrow::compute::CastOptions {
+            safe: false,
+            ..Default::default()
+        };
         let source_builder = self.source.compile()?;
         Ok(Box::new(move || {
             let target = target.clone();
+            let options = options.clone();
             let mut source_expr = source_builder();
             Box::new(move |batch: &RecordBatch| {
                 let src = source_expr(batch);
                 let (arr, is_scalar) = src.as_datum().get();
-                let out = arrow::compute::cast(arr, &target).expect("cast source to target type");
+                // The failure is data-dependent and a compiled expression has
+                // no error channel, so it panics and the dataflow fails the
+                // query with the kernel's message naming the offending value.
+                let out = arrow::compute::cast_with_options(arr, &target, &options)
+                    .unwrap_or_else(|e| panic!("{e}"));
                 if is_scalar {
                     ExprResult::Scalar(Scalar::new(out))
                 } else {
@@ -152,4 +164,67 @@ pub(crate) fn json_to_canonical_variant(text: &ArrayRef) -> Result<ArrayRef, Arr
         structure.columns().to_vec(),
         structure.nulls().cloned(),
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::test_support::*;
+    use crate::types::Type;
+    use arrow_array::{ArrayRef, StringArray};
+    use rstest::rstest;
+    use std::sync::Arc;
+
+    /// A value the target type cannot represent fails the query with an error
+    /// naming it, rather than quietly becoming NULL. Not temporal-specific:
+    /// any target type rejects a value it cannot represent.
+    #[rstest]
+    #[case("TIMESTAMP", "not-a-timestamp")]
+    #[case("INTEGER", "twelve")]
+    fn unconvertible_cast_fails_the_query(
+        mut testing_planner: TestingPlanner,
+        #[case] target: &str,
+        #[case] value: &str,
+    ) {
+        testing_planner.add_table(
+            "events",
+            &[(
+                "raw",
+                Type::Utf8,
+                Arc::new(StringArray::from(vec![value])) as ArrayRef,
+            )],
+        );
+
+        let err = run_expecting_error(
+            &mut testing_planner,
+            &format!("SELECT CAST(raw AS {target}) FROM events"),
+        );
+
+        assert!(
+            err.contains(value),
+            "the error names the offending value; got: {err}"
+        );
+    }
+
+    /// TRY_CAST's null-on-failure contract is not implemented, so it is
+    /// rejected while building the plan rather than quietly run strict.
+    #[rstest]
+    fn rejects_try_cast(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "events",
+            &[(
+                "raw",
+                Type::Utf8,
+                Arc::new(StringArray::from(vec!["twelve"])) as ArrayRef,
+            )],
+        );
+
+        let err = testing_planner
+            .plan("SELECT TRY_CAST(raw AS INTEGER) FROM events")
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("TRY_CAST is not supported"),
+            "got: {err}"
+        );
+    }
 }

@@ -1144,6 +1144,12 @@ impl<'plan> Cast<'plan> {
     pub fn return_type(self) -> Result<BoundLogicalType> {
         Ok(bound_type_from(ffi::expr_return_type(self.raw)?))
     }
+
+    /// Whether this is a `TRY_CAST`, which yields NULL for a value the target
+    /// type cannot represent instead of failing the query.
+    pub fn is_try(self) -> Result<bool> {
+        Ok(ffi::expr_cast_is_try(self.raw)?)
+    }
 }
 
 /// One `WHEN when THEN then` arm of a `CASE` expression.
