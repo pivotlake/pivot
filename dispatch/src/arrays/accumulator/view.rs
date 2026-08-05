@@ -18,11 +18,10 @@ use arrow::array::ArrayData;
 use arrow_array::builder::make_view;
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, make_array};
-use arrow_buffer::Buffer;
+use arrow_buffer::{Buffer, NullBuffer};
 use arrow_schema::{ArrowError, DataType};
 
-use super::chunked::{ChunkedColumn, ViewChunk};
-use super::column::{AppendSource, ColumnAccumulator, SourceSelection};
+use super::column::{ChunkedColumn, ColumnAccumulator};
 use super::fixed_width::gather_fixed_width;
 use super::validity::ValidityMask;
 use super::{BUFFER_SIZE, ValueStorage};
@@ -45,12 +44,12 @@ pub(super) struct ViewColumn {
     views: SlabBuffer<u128>,
     values: ViewValues,
     validity: ValidityMask,
-    /// Per-chunk rebase cache for chunked appends: the buffer-list position a
-    /// chunk's data buffers were registered at. An entry is live only while
+    /// Per-batch rebase cache for multi-batch appends: the buffer-list position
+    /// a batch's data buffers were registered at. An entry is live only while
     /// its generation matches `generation`, which
     /// [`take_array`](ColumnAccumulator::take_array) bumps because the buffer
     /// list resets with every emitted batch.
-    chunk_bases: Vec<(u64, u32)>,
+    batch_bases: Vec<(u64, u32)>,
     generation: u64,
 }
 
@@ -123,62 +122,23 @@ impl ViewColumn {
                 ValueStorage::CopyValues => ViewValues::OwnedBlocks { blocks: Vec::new() },
             },
             validity: ValidityMask::new(capacity),
-            chunk_bases: Vec::new(),
+            batch_bases: Vec::new(),
             generation: 1,
         }
     }
 }
 
 impl ViewColumn {
-    fn append_batch(
-        &mut self,
-        source: &ArrayRef,
-        selection: SourceSelection<'_>,
-        destination_start: usize,
-        allocator: &mut SlabAllocator,
-    ) {
-        // Borrow the views and data buffers through the concrete array type:
-        // `to_data` would clone (and then drop) an Arc per source data buffer on
-        // every append, which a source reused across appends turns into an
-        // atomics storm.
-        let (views, source_buffers, nulls) = match source.data_type() {
-            DataType::Utf8View => {
-                let array = source.as_string_view();
-                (array.views(), array.data_buffers(), array.nulls())
-            }
-            DataType::BinaryView => {
-                let array = source.as_binary_view();
-                (array.views(), array.data_buffers(), array.nulls())
-            }
-            _ => unreachable!("built only for view types"),
-        };
-        self.validity.append(nulls, selection, destination_start);
-        match &mut self.values {
-            ViewValues::SourceBuffers {
-                buffers,
-                last_source,
-            } => append_rebasing_views(
-                &mut self.views,
-                buffers,
-                last_source,
-                views,
-                source_buffers,
-                selection,
-                destination_start,
-            ),
-            ViewValues::OwnedBlocks { blocks } => append_copying_values(
-                &mut self.views,
-                blocks,
-                views,
-                source_buffers,
-                selection,
-                destination_start,
-                allocator,
-            ),
-        }
+    /// Read the view at `row` through a batch's resolved values pointer, whose
+    /// array offset is already applied.
+    #[inline(always)]
+    fn view_at(values: *const u8, row: usize) -> u128 {
+        // SAFETY: `row` is an in-bounds position of the batch the pointer
+        // resolves, which holds one 16-byte view per element.
+        unsafe { (values as *const u128).add(row).read_unaligned() }
     }
 
-    fn append_chunked(
+    fn append_batches(
         &mut self,
         column: &ChunkedColumn,
         ids: &[u32],
@@ -186,20 +146,19 @@ impl ViewColumn {
         destination_start: usize,
         allocator: &mut SlabAllocator,
     ) {
-        let ChunkedColumn::View { chunks } = column else {
-            unreachable!("a view accumulator receives a view chunked column");
-        };
         self.validity
             .append_by_ids(ids, shift, destination_start, |batch| {
-                chunks[batch].nulls.as_ref()
+                column.data[batch]
+                    .nulls()
+                    .filter(|nulls| nulls.null_count() > 0)
             });
-        if self.chunk_bases.len() < chunks.len() {
-            self.chunk_bases.resize(chunks.len(), (0, 0));
+        if self.batch_bases.len() < column.data.len() {
+            self.batch_bases.resize(column.data.len(), (0, 0));
         }
         let Self {
             views,
             values,
-            chunk_bases,
+            batch_bases,
             generation,
             ..
         } = self;
@@ -212,16 +171,20 @@ impl ViewColumn {
                     let mut dst = views.ptr_at_index(destination_start);
                     for &id in ids {
                         let batch_idx = (id >> shift) as usize;
-                        let chunk: &ViewChunk = &chunks[batch_idx];
-                        let mut view = chunk.views[(id & mask) as usize];
+                        let mut view = Self::view_at(
+                            *column.values.get_unchecked(batch_idx),
+                            (id & mask) as usize,
+                        );
                         // A view longer than the inline limit points into its
-                        // batch's data buffers; register those once per emitted
-                        // batch and rebase the buffer index onto the list.
+                        // batch's data buffers (buffers 1 onward); register
+                        // those once per emitted batch and rebase the buffer
+                        // index onto the list.
                         if view as u32 > INLINE_VIEW_LEN {
-                            let entry = chunk_bases.get_unchecked_mut(batch_idx);
+                            let entry = batch_bases.get_unchecked_mut(batch_idx);
                             if entry.0 != *generation {
                                 *entry = (*generation, buffers.len() as u32);
-                                buffers.extend(chunk.data_buffers.iter().cloned());
+                                buffers
+                                    .extend(column.data[batch_idx].buffers()[1..].iter().cloned());
                             }
                             view += (entry.1 as u128) << 64;
                         }
@@ -232,15 +195,16 @@ impl ViewColumn {
             }
             ViewValues::OwnedBlocks { blocks } => {
                 for (destination, &id) in (destination_start..).zip(ids) {
-                    let chunk = &chunks[(id >> shift) as usize];
-                    let view = chunk.views[(id & mask) as usize];
+                    let batch_idx = (id >> shift) as usize;
+                    let view = Self::view_at(column.values[batch_idx], (id & mask) as usize);
                     let length = view as u32;
                     let copied = if length <= INLINE_VIEW_LEN {
                         view
                     } else {
                         let buffer = (view >> 64) as u32 as usize;
                         let offset = (view >> 96) as u32 as usize;
-                        let value = &chunk.data_buffers[buffer][offset..offset + length as usize];
+                        let value = &column.data[batch_idx].buffers()[1 + buffer]
+                            [offset..offset + length as usize];
                         copy_value(blocks, value, allocator)
                     };
                     // SAFETY: the slab has room for `destination_start` plus
@@ -253,20 +217,87 @@ impl ViewColumn {
 }
 
 impl ColumnAccumulator for ViewColumn {
-    fn append(
+    fn append_from_indices(
         &mut self,
-        source: AppendSource<'_>,
+        column: &ArrayRef,
+        indices: &[u32],
         destination_start: usize,
         allocator: &mut SlabAllocator,
     ) {
-        match source {
-            AppendSource::Batch { column, selection } => {
-                self.append_batch(column, selection, destination_start, allocator)
-            }
-            AppendSource::Chunked { column, ids, shift } => {
-                self.append_chunked(column, ids, shift, destination_start, allocator)
-            }
+        let (views, source_buffers, nulls) = source_parts(column);
+        self.validity
+            .append_indices(nulls, indices, destination_start);
+        match &mut self.values {
+            ViewValues::SourceBuffers {
+                buffers,
+                last_source,
+            } => append_rebasing_indices(
+                &mut self.views,
+                buffers,
+                last_source,
+                views,
+                source_buffers,
+                indices,
+                destination_start,
+            ),
+            ViewValues::OwnedBlocks { blocks } => append_copying_values(
+                &mut self.views,
+                blocks,
+                views,
+                source_buffers,
+                indices.iter().map(|&row| row as usize),
+                destination_start,
+                allocator,
+            ),
         }
+    }
+
+    fn append_from_range(
+        &mut self,
+        column: &ArrayRef,
+        start: usize,
+        len: usize,
+        destination_start: usize,
+        allocator: &mut SlabAllocator,
+    ) {
+        let (views, source_buffers, nulls) = source_parts(column);
+        self.validity
+            .append_range(nulls, start, len, destination_start);
+        match &mut self.values {
+            ViewValues::SourceBuffers {
+                buffers,
+                last_source,
+            } => append_rebasing_range(
+                &mut self.views,
+                buffers,
+                last_source,
+                views,
+                source_buffers,
+                start,
+                len,
+                destination_start,
+            ),
+            ViewValues::OwnedBlocks { blocks } => append_copying_values(
+                &mut self.views,
+                blocks,
+                views,
+                source_buffers,
+                start..start + len,
+                destination_start,
+                allocator,
+            ),
+        }
+    }
+
+    fn append_from_batches(
+        &mut self,
+        column: &ChunkedColumn,
+        ids: &[u32],
+        shift: u32,
+        destination_start: usize,
+        allocator: &mut SlabAllocator,
+    ) {
+        self.append_batches(column, ids, shift, destination_start, allocator)
     }
 
     fn take_array(
@@ -306,20 +337,28 @@ impl ColumnAccumulator for ViewColumn {
     }
 }
 
-/// Append views that keep pointing at the source's data buffers: the source's
-/// buffers join the accumulated list (unless they already are the last ones
-/// appended) and each view's buffer index is rebased onto it.
-#[allow(clippy::too_many_arguments)]
-fn append_rebasing_views(
-    slab: &mut SlabBuffer<u128>,
+/// Borrow view metadata through the concrete array type. `to_data` would clone
+/// and drop an Arc per data buffer on every append.
+fn source_parts(source: &ArrayRef) -> (&[u128], &[Buffer], Option<&NullBuffer>) {
+    match source.data_type() {
+        DataType::Utf8View => {
+            let array = source.as_string_view();
+            (array.views(), array.data_buffers(), array.nulls())
+        }
+        DataType::BinaryView => {
+            let array = source.as_binary_view();
+            (array.views(), array.data_buffers(), array.nulls())
+        }
+        _ => unreachable!("built only for view types"),
+    }
+}
+
+fn source_buffer_base(
     buffers: &mut Vec<Buffer>,
     last_source: &mut Option<(usize, usize)>,
-    views: &[u128],
     source_buffers: &[Buffer],
-    selection: SourceSelection<'_>,
-    destination_start: usize,
-) {
-    let base = match *last_source {
+) -> u128 {
+    match *last_source {
         Some((start, count))
             if holds_same_buffers(&buffers[start..start + count], source_buffers) =>
         {
@@ -331,35 +370,63 @@ fn append_rebasing_views(
             *last_source = Some((start, source_buffers.len()));
             start as u128
         }
-    };
-    // SAFETY: the rows are in-bounds source positions, views are 16 bytes each
-    // (the views slice already accounts for the array offset), and the slab has
-    // room for `destination_start` plus the appended rows.
+    }
+}
+
+/// Append indexed views that keep pointing at the source's data buffers.
+#[allow(clippy::too_many_arguments)]
+fn append_rebasing_indices(
+    slab: &mut SlabBuffer<u128>,
+    buffers: &mut Vec<Buffer>,
+    last_source: &mut Option<(usize, usize)>,
+    views: &[u128],
+    source_buffers: &[Buffer],
+    indices: &[u32],
+    destination_start: usize,
+) {
+    let base = source_buffer_base(buffers, last_source, source_buffers);
     unsafe {
         let src = views.as_ptr();
         let dst = slab.ptr_at_index(destination_start);
-        match (base, selection) {
-            // Nothing accumulated references a data buffer yet, so incoming
-            // views keep their buffer indices and copy verbatim. All-inline
-            // columns stay on this path for every batch.
-            (0, SourceSelection::Range { start, len }) => {
-                std::ptr::copy_nonoverlapping(src.add(start), dst, len)
-            }
-            (0, SourceSelection::Indices(indices)) => {
-                gather_fixed_width::<u128>(src as *const u8, dst as *mut u8, indices)
-            }
-            _ => {
-                let mut dst = dst;
-                for row in selection.iter_positions() {
-                    let mut view = src.add(row).read_unaligned();
-                    // A view longer than the inline limit points into a data
-                    // buffer; rebase its buffer index onto the accumulated list.
-                    if view as u32 > INLINE_VIEW_LEN {
-                        view += base << 64;
-                    }
-                    dst.write(view);
-                    dst = dst.add(1);
+        if base == 0 {
+            gather_fixed_width::<u128>(src.cast(), dst.cast(), indices);
+        } else {
+            for (destination, &row) in indices.iter().enumerate() {
+                let mut view = src.add(row as usize).read_unaligned();
+                if view as u32 > INLINE_VIEW_LEN {
+                    view += base << 64;
                 }
+                dst.add(destination).write(view);
+            }
+        }
+    }
+}
+
+/// Append a contiguous range of views that keep pointing at source buffers.
+#[allow(clippy::too_many_arguments)]
+fn append_rebasing_range(
+    slab: &mut SlabBuffer<u128>,
+    buffers: &mut Vec<Buffer>,
+    last_source: &mut Option<(usize, usize)>,
+    views: &[u128],
+    source_buffers: &[Buffer],
+    start: usize,
+    len: usize,
+    destination_start: usize,
+) {
+    let base = source_buffer_base(buffers, last_source, source_buffers);
+    unsafe {
+        let src = views.as_ptr();
+        let dst = slab.ptr_at_index(destination_start);
+        if base == 0 {
+            std::ptr::copy_nonoverlapping(src.add(start), dst, len);
+        } else {
+            for (destination, row) in (start..start + len).enumerate() {
+                let mut view = src.add(row).read_unaligned();
+                if view as u32 > INLINE_VIEW_LEN {
+                    view += base << 64;
+                }
+                dst.add(destination).write(view);
             }
         }
     }
@@ -370,16 +437,18 @@ fn append_rebasing_views(
 /// over as it lies; a longer one's bytes are copied and re-viewed against the
 /// block they land in.
 #[allow(clippy::too_many_arguments)]
-fn append_copying_values(
+fn append_copying_values<I>(
     slab: &mut SlabBuffer<u128>,
     blocks: &mut Vec<DataBlock>,
     views: &[u128],
     source_buffers: &[Buffer],
-    selection: SourceSelection<'_>,
+    rows: I,
     destination_start: usize,
     allocator: &mut SlabAllocator,
-) {
-    for (destination, row) in (destination_start..).zip(selection.iter_positions()) {
+) where
+    I: IntoIterator<Item = usize>,
+{
+    for (destination, row) in (destination_start..).zip(rows) {
         let view = views[row];
         let length = view as u32;
         let copied = if length <= INLINE_VIEW_LEN {

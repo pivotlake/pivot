@@ -17,8 +17,9 @@ use arrow::compute::kernels::concat::concat;
 use arrow_array::{Array, ArrayRef};
 use arrow_schema::ArrowError;
 
-use super::chunked::ChunkedColumn;
-use super::column::{AppendSource, ColumnAccumulator, SourceSelection};
+use arrow_array::make_array;
+
+use super::column::{ChunkedColumn, ColumnAccumulator};
 use crate::memory::SlabAllocator;
 
 /// A column held as the arrays it was appended from, concatenated on emit.
@@ -33,66 +34,74 @@ impl ConcatenatedColumn {
 }
 
 impl ColumnAccumulator for ConcatenatedColumn {
-    fn append(
+    fn append_from_indices(
         &mut self,
-        source: AppendSource<'_>,
+        column: &ArrayRef,
+        indices: &[u32],
         _destination_start: usize,
         _allocator: &mut SlabAllocator,
     ) {
-        match source {
-            AppendSource::Batch {
-                column,
-                selection: SourceSelection::Range { start, len },
-            } => self.arrays.push(column.slice(start, len)),
-            // Consecutive positions become one slice, so a selection that keeps
-            // a run of rows costs one array rather than one per row.
-            AppendSource::Batch {
-                column,
-                selection: SourceSelection::Indices(indices),
-            } => {
-                let mut run: Option<(usize, usize)> = None;
-                for &row in indices {
-                    let row = row as usize;
-                    match run {
-                        Some((start, end)) if row == end => run = Some((start, end + 1)),
-                        Some((start, end)) => {
-                            self.arrays.push(column.slice(start, end - start));
-                            run = Some((row, row + 1));
-                        }
-                        None => run = Some((row, row + 1)),
-                    }
-                }
-                if let Some((start, end)) = run {
+        // Consecutive positions become one slice, so a selection that keeps a
+        // run of rows costs one array rather than one per row.
+        let mut run: Option<(usize, usize)> = None;
+        for &row in indices {
+            let row = row as usize;
+            match run {
+                Some((start, end)) if row == end => run = Some((start, end + 1)),
+                Some((start, end)) => {
                     self.arrays.push(column.slice(start, end - start));
+                    run = Some((row, row + 1));
                 }
+                None => run = Some((row, row + 1)),
             }
-            AppendSource::Chunked { column, ids, shift } => {
-                let ChunkedColumn::Whole { chunks } = column else {
-                    unreachable!("a concatenated accumulator receives a whole chunked column");
-                };
-                let mask = (1u32 << shift) - 1;
-                // Consecutive same-batch rows become one slice, as above.
-                let mut run: Option<(usize, usize, usize)> = None;
-                for &id in ids {
-                    let batch = (id >> shift) as usize;
-                    let row = (id & mask) as usize;
-                    match run {
-                        Some((run_batch, start, end)) if run_batch == batch && row == end => {
-                            run = Some((run_batch, start, end + 1));
-                        }
-                        Some((run_batch, start, end)) => {
-                            self.arrays
-                                .push(chunks[run_batch].slice(start, end - start));
-                            run = Some((batch, row, row + 1));
-                        }
-                        None => run = Some((batch, row, row + 1)),
-                    }
+        }
+        if let Some((start, end)) = run {
+            self.arrays.push(column.slice(start, end - start));
+        }
+    }
+
+    fn append_from_range(
+        &mut self,
+        column: &ArrayRef,
+        start: usize,
+        len: usize,
+        _destination_start: usize,
+        _allocator: &mut SlabAllocator,
+    ) {
+        self.arrays.push(column.slice(start, len));
+    }
+
+    fn append_from_batches(
+        &mut self,
+        column: &ChunkedColumn,
+        ids: &[u32],
+        shift: u32,
+        _destination_start: usize,
+        _allocator: &mut SlabAllocator,
+    ) {
+        let mask = (1u32 << shift) - 1;
+        // Consecutive same-batch rows become one slice, as above.
+        let mut push = |batch: usize, start: usize, len: usize| {
+            self.arrays
+                .push(make_array(column.data[batch].slice(start, len)));
+        };
+        let mut run: Option<(usize, usize, usize)> = None;
+        for &id in ids {
+            let batch = (id >> shift) as usize;
+            let row = (id & mask) as usize;
+            match run {
+                Some((run_batch, start, end)) if run_batch == batch && row == end => {
+                    run = Some((run_batch, start, end + 1));
                 }
-                if let Some((run_batch, start, end)) = run {
-                    self.arrays
-                        .push(chunks[run_batch].slice(start, end - start));
+                Some((run_batch, start, end)) => {
+                    push(run_batch, start, end - start);
+                    run = Some((batch, row, row + 1));
                 }
+                None => run = Some((batch, row, row + 1)),
             }
+        }
+        if let Some((run_batch, start, end)) = run {
+            push(run_batch, start, end - start);
         }
     }
 

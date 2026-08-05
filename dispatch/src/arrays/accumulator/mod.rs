@@ -32,7 +32,6 @@
 //!   group waiting for its file to finish encoding) must not pin those buffers,
 //!   so it copies the values into blocks of its own instead.
 
-mod chunked;
 mod column;
 mod concatenated;
 mod fixed_width;
@@ -40,14 +39,13 @@ mod structs;
 mod validity;
 mod view;
 
-pub use chunked::ChunkedColumns;
-
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{ArrowError, DataType, Fields, SchemaRef};
 
 use crate::RECORD_BATCH_SIZE;
 use crate::memory::{BUFFER_SIZE, SlabAllocator};
-use column::{AppendSource, ColumnAccumulator, SourceSelection};
+pub use column::ChunkedColumn;
+use column::ColumnAccumulator;
 use concatenated::ConcatenatedColumn;
 use fixed_width::FixedWidthColumn;
 use structs::StructColumn;
@@ -78,7 +76,9 @@ pub enum ValueStorage {
 }
 
 /// Accumulates rows of many batches and hands them out as one batch (see the
-/// module docs). Rows arrive via [`append_batch_by_indices`](Self::append_batch_by_indices) or
+/// module docs). Rows arrive via
+/// [`append_batch_by_indices`](Self::append_batch_by_indices),
+/// [`append_from_batches`](Self::append_from_batches), or
 /// [`append_range`](Self::append_range); [`take_batch`](Self::take_batch) hands
 /// out the accumulated rows and resets.
 pub struct BatchAccumulator {
@@ -182,30 +182,28 @@ impl BatchAccumulator {
         indices: &[u32],
         allocator: &mut SlabAllocator,
     ) {
-        self.append_selection(batch, SourceSelection::Indices(indices), allocator);
+        debug_assert!(self.len + indices.len() <= self.capacity);
+        for (accumulator, column) in self.columns.iter_mut().zip(batch.columns()) {
+            accumulator.append_from_indices(column, indices, self.len, allocator);
+        }
+        self.len += indices.len();
     }
 
-    /// Append the rows of a chunked row store at the encoded `ids`
-    /// (`batch << shift | row`, see [`ChunkedColumns`]), which must be no
-    /// more than the remaining [`capacity`](Self::capacity). The source's
-    /// schema must match the accumulator's.
-    pub fn append_chunked_by_ids(
+    /// Append rows stored across many batches at the encoded `ids`
+    /// (`batch << shift | row`), which must be no more than the remaining
+    /// [`capacity`](Self::capacity). `columns` holds one prepared
+    /// [`ChunkedColumn`] per accumulator column; their schema must match the
+    /// accumulator's.
+    pub fn append_from_batches(
         &mut self,
-        source: &ChunkedColumns,
+        columns: &[ChunkedColumn],
+        shift: u32,
         ids: &[u32],
         allocator: &mut SlabAllocator,
     ) {
         debug_assert!(self.len + ids.len() <= self.capacity);
-        for (accumulator, column) in self.columns.iter_mut().zip(&source.columns) {
-            accumulator.append(
-                AppendSource::Chunked {
-                    column,
-                    ids,
-                    shift: source.shift,
-                },
-                self.len,
-                allocator,
-            );
+        for (accumulator, column) in self.columns.iter_mut().zip(columns) {
+            accumulator.append_from_batches(column, ids, shift, self.len, allocator);
         }
         self.len += ids.len();
     }
@@ -223,24 +221,11 @@ impl BatchAccumulator {
         len: usize,
         allocator: &mut SlabAllocator,
     ) {
-        self.append_selection(batch, SourceSelection::Range { start, len }, allocator);
-    }
-
-    fn append_selection(
-        &mut self,
-        batch: &RecordBatch,
-        selection: SourceSelection<'_>,
-        allocator: &mut SlabAllocator,
-    ) {
-        debug_assert!(self.len + selection.len() <= self.capacity);
+        debug_assert!(self.len + len <= self.capacity);
         for (accumulator, column) in self.columns.iter_mut().zip(batch.columns()) {
-            accumulator.append(
-                AppendSource::Batch { column, selection },
-                self.len,
-                allocator,
-            );
+            accumulator.append_from_range(column, start, len, self.len, allocator);
         }
-        self.len += selection.len();
+        self.len += len;
     }
 
     /// Emit the accumulated rows as one batch and reset.

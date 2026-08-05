@@ -10,8 +10,7 @@ use arrow::array::ArrayData;
 use arrow_array::{ArrayRef, make_array};
 use arrow_schema::{ArrowError, DataType};
 
-use super::chunked::{ChunkedColumn, FixedWidthChunk};
-use super::column::{AppendSource, ColumnAccumulator, SourceSelection};
+use super::column::{ChunkedColumn, ColumnAccumulator};
 use super::validity::ValidityMask;
 use crate::arrays::slab_into_buffer;
 use crate::memory::{SlabAllocator, SlabBuffer};
@@ -41,53 +40,71 @@ impl FixedWidthColumn {
             validity: ValidityMask::new(capacity),
         }
     }
+}
 
-    fn append_batch(
+impl ColumnAccumulator for FixedWidthColumn {
+    fn append_from_indices(
         &mut self,
-        source: &ArrayRef,
-        selection: SourceSelection<'_>,
+        column: &ArrayRef,
+        indices: &[u32],
         destination_start: usize,
+        _allocator: &mut SlabAllocator,
     ) {
-        let data = source.to_data();
+        let data = column.to_data();
         self.validity
-            .append(data.nulls(), selection, destination_start);
+            .append_indices(data.nulls(), indices, destination_start);
         let width = self.width;
-        // SAFETY: the source holds `offset + len` values, the rows are in-bounds
-        // positions, and the slab has capacity for `at` plus the appended rows
-        // (checked by the caller).
+        // SAFETY: every index is an in-bounds source position and the slab has
+        // capacity for the appended rows (checked by the caller).
         unsafe {
             let src = data.buffers()[0].as_ptr().add(data.offset() * width);
             let dst = (self.slab.ptr_at_index(0) as *mut u8).add(destination_start * width);
-            match selection {
-                SourceSelection::Range { start, len } => {
-                    std::ptr::copy_nonoverlapping(src.add(start * width), dst, len * width)
-                }
-                SourceSelection::Indices(indices) => match width {
-                    1 => gather_fixed_width::<u8>(src, dst, indices),
-                    2 => gather_fixed_width::<u16>(src, dst, indices),
-                    4 => gather_fixed_width::<u32>(src, dst, indices),
-                    8 => gather_fixed_width::<u64>(src, dst, indices),
-                    16 => gather_fixed_width::<u128>(src, dst, indices),
-                    _ => unreachable!("built only for the widths above"),
-                },
+            match width {
+                1 => gather_fixed_width::<u8>(src, dst, indices),
+                2 => gather_fixed_width::<u16>(src, dst, indices),
+                4 => gather_fixed_width::<u32>(src, dst, indices),
+                8 => gather_fixed_width::<u64>(src, dst, indices),
+                16 => gather_fixed_width::<u128>(src, dst, indices),
+                _ => unreachable!("built only for the widths above"),
             }
         }
     }
 
-    fn append_chunked(
+    fn append_from_range(
+        &mut self,
+        column: &ArrayRef,
+        start: usize,
+        len: usize,
+        destination_start: usize,
+        _allocator: &mut SlabAllocator,
+    ) {
+        let data = column.to_data();
+        self.validity
+            .append_range(data.nulls(), start, len, destination_start);
+        let width = self.width;
+        // SAFETY: the range is in bounds and the destination has room for it.
+        unsafe {
+            let src = data.buffers()[0]
+                .as_ptr()
+                .add((data.offset() + start) * width);
+            let dst = (self.slab.ptr_at_index(0) as *mut u8).add(destination_start * width);
+            std::ptr::copy_nonoverlapping(src, dst, len * width);
+        }
+    }
+
+    fn append_from_batches(
         &mut self,
         column: &ChunkedColumn,
         ids: &[u32],
         shift: u32,
         destination_start: usize,
+        _allocator: &mut SlabAllocator,
     ) {
-        let ChunkedColumn::FixedWidth { width, chunks } = column else {
-            unreachable!("a fixed-width accumulator receives a fixed-width chunked column");
-        };
-        debug_assert_eq!(*width, self.width);
         self.validity
             .append_by_ids(ids, shift, destination_start, |batch| {
-                chunks[batch].nulls.as_ref()
+                column.data[batch]
+                    .nulls()
+                    .filter(|nulls| nulls.null_count() > 0)
             });
         // SAFETY: each id names an in-bounds row of its batch, and the slab has
         // capacity for `destination_start` plus the appended rows (checked by
@@ -95,30 +112,12 @@ impl FixedWidthColumn {
         unsafe {
             let dst = (self.slab.ptr_at_index(0) as *mut u8).add(destination_start * self.width);
             match self.width {
-                1 => gather_chunked::<u8>(chunks, ids, shift, dst),
-                2 => gather_chunked::<u16>(chunks, ids, shift, dst),
-                4 => gather_chunked::<u32>(chunks, ids, shift, dst),
-                8 => gather_chunked::<u64>(chunks, ids, shift, dst),
-                16 => gather_chunked::<u128>(chunks, ids, shift, dst),
+                1 => gather_batches::<u8>(&column.values, ids, shift, dst),
+                2 => gather_batches::<u16>(&column.values, ids, shift, dst),
+                4 => gather_batches::<u32>(&column.values, ids, shift, dst),
+                8 => gather_batches::<u64>(&column.values, ids, shift, dst),
+                16 => gather_batches::<u128>(&column.values, ids, shift, dst),
                 _ => unreachable!("built only for the widths above"),
-            }
-        }
-    }
-}
-
-impl ColumnAccumulator for FixedWidthColumn {
-    fn append(
-        &mut self,
-        source: AppendSource<'_>,
-        destination_start: usize,
-        _allocator: &mut SlabAllocator,
-    ) {
-        match source {
-            AppendSource::Batch { column, selection } => {
-                self.append_batch(column, selection, destination_start)
-            }
-            AppendSource::Chunked { column, ids, shift } => {
-                self.append_chunked(column, ids, shift, destination_start)
             }
         }
     }
@@ -186,26 +185,21 @@ pub(super) unsafe fn gather_fixed_width<T: Copy>(src: *const u8, dst: *mut u8, i
     }
 }
 
-/// Gather the rows at the encoded `ids` from per-batch value buffers to `dst`,
-/// as elements of `T`. The two-level read stays a flat loop with independent
-/// iterations, like [`gather_fixed_width`].
+/// Gather the rows at the encoded `ids` through one resolved values pointer
+/// per batch. The two-level read stays a flat loop with independent iterations,
+/// like [`gather_fixed_width`].
 ///
 /// # Safety
 /// Every id must name an in-bounds row of an in-bounds batch, `dst` must have
 /// room for `ids.len()` elements, and all pointers must be valid for unaligned
 /// `T` access.
-unsafe fn gather_chunked<T: Copy>(
-    chunks: &[FixedWidthChunk],
-    ids: &[u32],
-    shift: u32,
-    dst: *mut u8,
-) {
+unsafe fn gather_batches<T: Copy>(values: &[*const u8], ids: &[u32], shift: u32, dst: *mut u8) {
     let mask = (1u32 << shift) - 1;
     let dst = dst as *mut T;
     unsafe {
         for (out_idx, &id) in ids.iter().enumerate() {
-            let chunk = chunks.get_unchecked((id >> shift) as usize);
-            let src = (chunk.values.as_ptr() as *const T).add(chunk.offset + (id & mask) as usize);
+            let src = (*values.get_unchecked((id >> shift) as usize) as *const T)
+                .add((id & mask) as usize);
             dst.add(out_idx).write_unaligned(src.read_unaligned());
         }
     }

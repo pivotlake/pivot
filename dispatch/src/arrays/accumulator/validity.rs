@@ -2,8 +2,6 @@
 
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
 
-use super::column::SourceSelection;
-
 /// Validity bits for the accumulated rows of one column, one bit per row.
 /// All-ones until a null actually arrives, so null-free streams never touch it
 /// beyond one flag check per append.
@@ -20,12 +18,11 @@ impl ValidityMask {
         }
     }
 
-    /// Record the validity of the appended rows: the `rows` of a column whose
-    /// null buffer is `nulls`, landing at accumulated position `at`.
-    pub(super) fn append(
+    /// Record validity for indexed rows of one batch.
+    pub(super) fn append_indices(
         &mut self,
         nulls: Option<&NullBuffer>,
-        selection: SourceSelection<'_>,
+        indices: &[u32],
         at: usize,
     ) {
         let Some(nulls) = nulls else {
@@ -34,7 +31,31 @@ impl ValidityMask {
         if nulls.null_count() == 0 {
             return;
         }
-        for (offset, row) in selection.iter_positions().enumerate() {
+        for (offset, &row) in indices.iter().enumerate() {
+            let row = row as usize;
+            if !nulls.is_valid(row) {
+                let position = at + offset;
+                self.words[position / 64] &= !(1 << (position % 64));
+                self.any_null = true;
+            }
+        }
+    }
+
+    /// Record validity for a contiguous range of one batch.
+    pub(super) fn append_range(
+        &mut self,
+        nulls: Option<&NullBuffer>,
+        start: usize,
+        len: usize,
+        at: usize,
+    ) {
+        let Some(nulls) = nulls else {
+            return;
+        };
+        if nulls.null_count() == 0 {
+            return;
+        }
+        for (offset, row) in (start..start + len).enumerate() {
             if !nulls.is_valid(row) {
                 let position = at + offset;
                 self.words[position / 64] &= !(1 << (position % 64));
