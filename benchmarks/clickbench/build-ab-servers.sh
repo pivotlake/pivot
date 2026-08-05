@@ -81,8 +81,16 @@ build_side() {
             "target-pgogen/$host_target/release/pivot-bench" \
             --source "$pgo_subset" --iterations 2 --skip-check >/dev/null
         "$llvm_profdata" merge -o "$pgo/merged.profdata" "$pgo"/*.profraw
+        # The server must be built in the same cargo selection that built the
+        # profiled pivot-bench. Selecting the server package alone resolves
+        # different arrow features, which forks -Cmetadata for every engine
+        # crate; the server then links symbol names the profile has no records
+        # for, and rustc applies no profile data at all, silently. Building
+        # both binaries in one invocation keeps one feature resolution, so the
+        # server links the exact units the profiling run exercised.
         PGO_USE_TARGET_DIR=target-pgouse \
-            just pgo-use-with "$pgo/merged.profdata" build --release -p server --bin pivotdb-server
+            just pgo-use-with "$pgo/merged.profdata" build --release \
+                -p server -p benchmarks --bin pivotdb-server --bin pivot-bench
     ) >&2; then
         # Without this the subshell's failure is swallowed by the printf below,
         # and the run only trips at the final existence check, which then names
@@ -90,7 +98,30 @@ build_side() {
         echo "error: building the $side server from $tree failed" >&2
         return 1
     fi
-    printf '%s' "$tree/benchmarks/target-pgouse/$host_target/release/pivotdb-server"
+    local server="$tree/benchmarks/target-pgouse/$host_target/release/pivotdb-server"
+    # PGO matches profile records to functions by exact mangled name, and a
+    # function without a record compiles on default heuristics with no warning.
+    # Assert the server links units the profile covers: take one hot decode
+    # family's monomorphization hashes from the binary and require that the
+    # profile holds records for at least some of them. Zero overlap means the
+    # server was built outside the profiled feature resolution and its numbers
+    # measure an unoptimized binary.
+    local family="RleDecoder4read"
+    local binary_hashes profile_hashes covered
+    binary_hashes=$(nm "$server" | grep "$family" | grep -oE '17h[0-9a-f]+E' | sort -u)
+    if [[ -n "$binary_hashes" ]]; then
+        profile_hashes=$("$llvm_profdata" show -all-functions "$pgo/merged.profdata" \
+            2>/dev/null | grep "$family" | grep -oE '17h[0-9a-f]+E' | sort -u)
+        covered=$(comm -12 <(printf '%s\n' "$binary_hashes") \
+                           <(printf '%s\n' "$profile_hashes") | wc -l)
+        if [[ "$covered" -eq 0 ]]; then
+            echo "error: the $side server shares no $family symbols with its profile;" >&2
+            echo "       the profile did not apply and the binary is effectively un-PGOed" >&2
+            return 1
+        fi
+        echo "$side server: $covered $family monomorphizations carry profile records" >&2
+    fi
+    printf '%s' "$server"
 }
 
 echo ">>> building BEFORE server" >&2
