@@ -157,6 +157,12 @@ impl Case {
 
 impl Cast {
     pub(crate) fn from_handle(view: CastHandle<'_>) -> Result<Expression, Error> {
+        // DuckDB's TRY_CAST converts cast failures into NULLs; pivot casts
+        // strictly and does not implement that contract, so reject the query
+        // rather than quietly running the cast strict.
+        if view.is_try()? {
+            return Err(Error::TryCastUnsupported);
+        }
         // A `BoundCastExpression`'s target is its own result type.
         let target = type_from_logical(view.return_type()?)?;
         let source = Expression::from_handle(view.child()?)?;

@@ -698,9 +698,15 @@ fn append(datastore: &DeltaDatastore, name: &str, path: &Path) {
     datastore.publish_table(handle);
 }
 
-/// Run `sql` through a planner over `datastore` (inside a fresh transaction,
-/// like the server does per query) and return the result batches.
-fn run_sql(datastore: &Arc<DeltaDatastore>, sql: &str) -> Vec<RecordBatch> {
+/// Plan and compile `sql` over `datastore` inside a fresh transaction (like
+/// the server does per query), leaving execution and commit to the caller.
+fn compile_sql(
+    datastore: &Arc<DeltaDatastore>,
+    sql: &str,
+) -> (
+    Arc<dyn CatalogTransaction>,
+    dispatch::RecordBatchOperatorSpec,
+) {
     let catalog = single_catalog(datastore);
     let transaction = catalog.begin_transaction();
     let mut planner = Planner::from_datastore_names(
@@ -708,15 +714,28 @@ fn run_sql(datastore: &Arc<DeltaDatastore>, sql: &str) -> Vec<RecordBatch> {
         DEFAULT_DATASTORE_NAME.to_string(),
     )
     .expect("planner context");
-    let batches = planner
+    let compiled = planner
         .plan(sql, transaction.clone())
         .unwrap()
         .compile(&dispatcher(), transaction.as_ref())
-        .unwrap()
-        .collect()
         .unwrap();
+    (transaction, compiled)
+}
+
+/// Run `sql` through a planner over `datastore` (inside a fresh transaction,
+/// like the server does per query) and return the result batches.
+fn run_sql(datastore: &Arc<DeltaDatastore>, sql: &str) -> Vec<RecordBatch> {
+    let (transaction, compiled) = compile_sql(datastore, sql);
+    let batches = compiled.collect().unwrap();
     commit_transaction_blocking(transaction);
     batches
+}
+
+/// Run `sql` like [`run_sql`] but expect the dataflow to fail, returning the
+/// reported error. The transaction is dropped rather than committed.
+fn run_sql_err(datastore: &Arc<DeltaDatastore>, sql: &str) -> String {
+    let (_transaction, compiled) = compile_sql(datastore, sql);
+    compiled.collect().unwrap_err().to_string()
 }
 
 /// Run `sql` like [`run_sql`], retaining the dataflow's IO/CPU tally.
@@ -724,20 +743,8 @@ fn run_sql_with_stats(
     datastore: &Arc<DeltaDatastore>,
     sql: &str,
 ) -> (Vec<RecordBatch>, dispatch::DataFlowStats) {
-    let catalog = single_catalog(datastore);
-    let transaction = catalog.begin_transaction();
-    let mut planner = Planner::from_datastore_names(
-        vec![DEFAULT_DATASTORE_NAME.to_string()],
-        DEFAULT_DATASTORE_NAME.to_string(),
-    )
-    .expect("planner context");
-    let result = planner
-        .plan(sql, transaction.clone())
-        .unwrap()
-        .compile(&dispatcher(), transaction.as_ref())
-        .unwrap()
-        .collect_with_stats()
-        .unwrap();
+    let (transaction, compiled) = compile_sql(datastore, sql);
+    let result = compiled.collect_with_stats().unwrap();
     commit_transaction_blocking(transaction);
     result
 }
@@ -906,6 +913,26 @@ fn timestamp_column_inserts_and_reads_back() {
     assert_eq!(
         rows[0].column(0).as_ref(),
         &TimestampMicrosecondArray::from(vec![-1_500_000i64, 1_700_000_000_123_456])
+    );
+}
+
+/// A value a column's type cannot represent fails the INSERT with an error
+/// naming it, instead of silently landing as NULL.
+#[test]
+fn insert_of_an_unparseable_timestamp_names_the_value() {
+    let data = TempDir::new().unwrap();
+    let columns = vec![Column {
+        name: "ts".to_string(),
+        col_type: Type::Timestamp,
+    }];
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, create_request("events", data.path(), columns)).unwrap();
+
+    let err = run_sql_err(&datastore, "INSERT INTO events VALUES ('not-a-timestamp')");
+
+    assert!(
+        err.contains("not-a-timestamp"),
+        "the error names the offending value; got: {err}"
     );
 }
 

@@ -268,3 +268,4 @@ const Expression &expr_case_then(const Expression &expr, size_t index);
 const Expression &expr_case_else(const Expression &expr);
 
 const Expression &expr_cast_child(const Expression &expr);
+bool expr_cast_is_try(const Expression &expr);
