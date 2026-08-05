@@ -58,6 +58,12 @@ struct Cli {
     #[arg(long, env = "SOURCE_DIRECTORY", required_unless_present = "show")]
     source: Option<PathBuf>,
 
+    /// Path to the pivotdb-server binary to launch and measure. The benchmark
+    /// is a client of this process; the binary named here is the one whose
+    /// performance every number describes.
+    #[arg(long, env = "PIVOT_SERVER_BIN", required_unless_present = "show")]
+    server_bin: Option<PathBuf>,
+
     /// Number of dispatch worker threads. Defaults to the number of cores.
     #[arg(long, env = "WORKER_COUNT")]
     workers: Option<usize>,
@@ -144,10 +150,6 @@ fn canonicalise_query(input: &str) -> String {
     }
 }
 
-fn workers_or_default(arg: Option<usize>) -> usize {
-    arg.unwrap_or_else(dispatch::default_worker_count)
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_tracing();
     let cli = Cli::parse();
@@ -177,8 +179,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("clap enforces --source unless --show");
     let suite = runner::discover_suite(&cli.suite, &suite_dir)?;
 
-    let workers = workers_or_default(cli.workers);
-    let server = server_handle::start(workers)?;
+    let server_bin = cli
+        .server_bin
+        .clone()
+        .expect("clap enforces --server-bin unless --show");
+    // No worker count here means none in the generated config, and the server
+    // applies its own default (the machine's core count).
+    let server = server_handle::start(&server_bin, cli.workers)?;
 
     let query_filter = if cli.query.is_empty() {
         None

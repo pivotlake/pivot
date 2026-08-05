@@ -948,22 +948,12 @@ dependencies = [
 name = "benchmarks"
 version = "0.1.0"
 dependencies = [
- "arrow-array 58.0.0",
- "arrow-schema 58.0.0",
- "catalog",
  "chrono",
  "clap",
- "core_affinity",
- "datastore-delta",
- "dispatch",
  "flate2",
- "metastore",
- "parquet-variant-compute",
- "planner",
+ "libc",
  "serde",
  "serde_json",
- "server",
- "sysinfo",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

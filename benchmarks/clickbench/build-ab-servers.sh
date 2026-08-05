@@ -61,10 +61,11 @@ command -v ld.lld >/dev/null || {
 host_target="$(rustc -vV | sed -n 's/^host: //p')"
 llvm_profdata="$(dirname "$(rustc --print target-libdir)")/bin/llvm-profdata"
 
-# Build the instrumented binary, run it over the small subset to produce this
-# side's profile, then build the server against that profile. The profiles land
-# where LLVM_PROFILE_FILE says at run time, so -Cprofile-generate can keep
-# naming one fixed directory and the build stays cacheable run over run.
+# Instrument the server itself, drive it through pivot-bench (a pure pgwire
+# client carrying no engine code and no instrumentation), and build the
+# optimized server from the profile the server process wrote. Profiling the artifact being measured is what makes
+# the profile's symbol names match by construction; PGO matches records to
+# functions by exact mangled name, and a mismatch silently disables it.
 build_side() {
     local tree="$1" side="$2"
     # Beside the tree, never inside it: the launcher rsyncs each tree with
@@ -76,9 +77,18 @@ build_side() {
         rm -rf "$pgo"
         mkdir -p "$pgo"
         PGO_DIR="$pgo" PGO_GEN_TARGET_DIR=target-pgogen \
-            just pgo-gen-build build --release --bin pivot-bench
+            just pgo-gen-build build --release -p server --bin pivotdb-server
+        # The client is a plain build in its own target dir: it takes no
+        # profile flags, and sharing a flagged dir would rebuild it for
+        # nothing on every flavor switch.
+        CARGO_TARGET_DIR=target-client RUSTC_WRAPPER= \
+            cargo build --release -p benchmarks --bin pivot-bench
+        # LLVM_PROFILE_FILE reaches the instrumented server through the
+        # environment pivot-bench spawns it with; the client itself is not
+        # instrumented and writes nothing.
         LLVM_PROFILE_FILE="$pgo/%m-%p.profraw" \
-            "target-pgogen/$host_target/release/pivot-bench" \
+            "target-client/release/pivot-bench" \
+            --server-bin "target-pgogen/$host_target/release/pivotdb-server" \
             --source "$pgo_subset" --iterations 2 --skip-check >/dev/null
         "$llvm_profdata" merge -o "$pgo/merged.profdata" "$pgo"/*.profraw
         PGO_USE_TARGET_DIR=target-pgouse \
@@ -90,7 +100,28 @@ build_side() {
         echo "error: building the $side server from $tree failed" >&2
         return 1
     fi
-    printf '%s' "$tree/benchmarks/target-pgouse/$host_target/release/pivotdb-server"
+    local server="$tree/benchmarks/target-pgouse/$host_target/release/pivotdb-server"
+    # Tripwire for the profile applying at all: the decode family's
+    # monomorphization hashes in the built server must appear in the profile
+    # it was compiled against. Zero overlap means the server was built outside
+    # the profiled symbol universe and is effectively un-PGOed, which is
+    # silent at compile time and shows up only as a mystery regression.
+    local family="RleDecoder4read"
+    local binary_hashes profile_hashes covered
+    binary_hashes=$(nm "$server" | grep "$family" | grep -oE '17h[0-9a-f]+E' | sort -u)
+    if [[ -n "$binary_hashes" ]]; then
+        profile_hashes=$("$llvm_profdata" show -all-functions "$pgo/merged.profdata" \
+            2>/dev/null | grep "$family" | grep -oE '17h[0-9a-f]+E' | sort -u)
+        covered=$(comm -12 <(printf '%s\n' "$binary_hashes") \
+                           <(printf '%s\n' "$profile_hashes") | wc -l)
+        if [[ "$covered" -eq 0 ]]; then
+            echo "error: the $side server shares no $family symbols with its profile;" >&2
+            echo "       the profile did not apply and the binary is effectively un-PGOed" >&2
+            return 1
+        fi
+        echo "$side server: $covered $family monomorphizations carry profile records" >&2
+    fi
+    printf '%s' "$server"
 }
 
 echo ">>> building BEFORE server" >&2
