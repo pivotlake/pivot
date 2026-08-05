@@ -8,9 +8,10 @@
 //! because ids are only gather addresses and are never required to be dense.
 //!
 //! This module is the only place that knows how an id splits. Everything else
-//! goes through [`BuildRowBatches`], [`split_row_id`], or [`first_row_id`].
+//! goes through the helpers below.
 
 use crate::arrays::accumulator::ChunkedColumns;
+use crate::memory::{MultiSlabBuffer, SlabAllocator};
 use arrow_array::RecordBatch;
 use arrow_schema::ArrowError;
 
@@ -21,6 +22,59 @@ const BATCH_SHIFT: u32 = ROWS_PER_BATCH.trailing_zeros();
 /// How many batches the `u32` id encoding addresses.
 const MAX_BATCHES: usize = (u32::MAX as usize + 1) >> BATCH_SHIFT;
 const _: () = assert!(ROWS_PER_BATCH.is_power_of_two());
+
+/// The build-side rows after all workers have merged them, prepared once for
+/// every probe worker to read.
+pub(crate) struct BuildRows {
+    /// Full build batches, used to verify keys whose stored representation is
+    /// lossy.
+    pub(crate) batches: Vec<RecordBatch>,
+    /// The same batches restricted to the build columns the join emits, used
+    /// when scanning unmatched rows one batch at a time.
+    pub(crate) output_batches: Vec<RecordBatch>,
+    /// The output columns prepared for gathering matched rows by row id.
+    pub(crate) output_columns: ChunkedColumns,
+    /// One flag per row id for a build-side outer join.
+    pub(crate) matched: MultiSlabBuffer<u8>,
+}
+
+impl BuildRows {
+    pub(crate) fn new<const TRACK_MATCHES: bool>(
+        batches: Vec<RecordBatch>,
+        output_columns: &[usize],
+    ) -> Result<Self, ArrowError> {
+        let output_batches: Vec<RecordBatch> = batches
+            .iter()
+            .map(|batch| batch.project(output_columns))
+            .collect::<Result<_, _>>()?;
+        let output_columns = ChunkedColumns::prepare(&output_batches, BATCH_SHIFT);
+        let matched = if TRACK_MATCHES {
+            let mut allocator = SlabAllocator::new(false);
+            allocator.create_multi_slab_buffer::<u8>(row_id_space(&batches).max(1), true)
+        } else {
+            MultiSlabBuffer::new(Vec::new())
+        };
+        Ok(Self {
+            batches,
+            output_batches,
+            output_columns,
+            matched,
+        })
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self {
+            batches: Vec::new(),
+            output_batches: Vec::new(),
+            output_columns: ChunkedColumns::prepare(&[], BATCH_SHIFT),
+            matched: MultiSlabBuffer::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.batches.is_empty()
+    }
+}
 
 /// Split a row id into its batch index and the row within that batch.
 #[inline(always)]
@@ -37,92 +91,55 @@ pub(crate) fn first_row_id(build_row_batch_idx: usize) -> usize {
     build_row_batch_idx << BATCH_SHIFT
 }
 
-/// The build rows one worker stores during its consume phase, and, after
-/// [`merge`](Self::merge), every worker's rows as the probe reads them.
-#[derive(Default)]
-pub(crate) struct BuildRowBatches {
-    batches: Vec<RecordBatch>,
-}
-
-impl BuildRowBatches {
-    pub(crate) fn new() -> Self {
-        Self::default()
+/// Store a batch's rows without copying and hand back each stored batch with
+/// its first row's id, for the caller to generate tuples from. Ids are local
+/// to `batches`; a worker's ids are globalized with the base [`merge`] assigns
+/// it.
+pub(crate) fn adopt(batches: &mut Vec<RecordBatch>, batch: RecordBatch) -> Vec<(u32, RecordBatch)> {
+    let total = batch.num_rows();
+    if total == 0 {
+        return Vec::new();
     }
-
-    /// Store a batch's rows without copying and hand back each stored batch
-    /// with its first row's id, for the caller to generate tuples from. Ids
-    /// are local to this instance; a worker's ids are globalized with the
-    /// base [`merge`](Self::merge) assigns it.
-    pub(crate) fn adopt(&mut self, batch: RecordBatch) -> Vec<(u32, RecordBatch)> {
-        let total = batch.num_rows();
-        if total == 0 {
-            return Vec::new();
-        }
-        let mut adopted = Vec::new();
-        let mut offset = 0;
-        while offset < total {
-            let rows = (total - offset).min(ROWS_PER_BATCH);
-            let stored = if rows == total {
-                batch.clone()
-            } else {
-                batch.slice(offset, rows)
-            };
-            assert!(
-                self.batches.len() < MAX_BATCHES,
-                "join build side exceeds the row id space"
-            );
-            adopted.push(((self.batches.len() << BATCH_SHIFT) as u32, stored.clone()));
-            self.batches.push(stored);
-            offset += rows;
-        }
-        adopted
-    }
-
-    /// Merge every worker's stored rows, in the given order, into the
-    /// published whole. Returns the merged rows and each worker's row id
-    /// base: the single `u32` added to that worker's local ids at scatter
-    /// time.
-    pub(crate) fn merge(workers: impl IntoIterator<Item = BuildRowBatches>) -> (Self, Vec<u32>) {
-        let mut batches = Vec::new();
-        let mut row_id_bases = Vec::new();
-        for worker in workers {
-            row_id_bases.push((batches.len() << BATCH_SHIFT) as u32);
-            batches.extend(worker.batches);
-        }
+    let mut adopted = Vec::new();
+    let mut offset = 0;
+    while offset < total {
+        let rows = (total - offset).min(ROWS_PER_BATCH);
+        let stored = if rows == total {
+            batch.clone()
+        } else {
+            batch.slice(offset, rows)
+        };
         assert!(
-            batches.len() <= MAX_BATCHES,
+            batches.len() < MAX_BATCHES,
             "join build side exceeds the row id space"
         );
-        (Self { batches }, row_id_bases)
+        adopted.push(((batches.len() << BATCH_SHIFT) as u32, stored.clone()));
+        batches.push(stored);
+        offset += rows;
     }
+    adopted
+}
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.batches.is_empty()
+/// Merge every worker's stored rows, in the given order, into the published
+/// whole. Returns the merged rows and each worker's row id base: the single
+/// `u32` added to that worker's local ids at scatter time.
+pub(crate) fn merge(
+    workers: impl IntoIterator<Item = Vec<RecordBatch>>,
+) -> (Vec<RecordBatch>, Vec<u32>) {
+    let mut batches = Vec::new();
+    let mut row_id_bases = Vec::new();
+    for worker in workers {
+        row_id_bases.push((batches.len() << BATCH_SHIFT) as u32);
+        batches.extend(worker);
     }
+    assert!(
+        batches.len() <= MAX_BATCHES,
+        "join build side exceeds the row id space"
+    );
+    (batches, row_id_bases)
+}
 
-    /// The stored batches; a row id's batch half indexes this list.
-    pub(crate) fn batches(&self) -> &[RecordBatch] {
-        &self.batches
-    }
-
-    /// The id space the stored rows occupy, gaps included: what sizes the
-    /// outer join's matched-flag array, indexed by row id.
-    pub(crate) fn row_id_space(&self) -> usize {
-        self.batches.len() << BATCH_SHIFT
-    }
-
-    /// The stored batches restricted to `columns`, paired with a gather
-    /// source over them prepared for reading rows back by id.
-    pub(crate) fn gather_source(
-        &self,
-        columns: &[usize],
-    ) -> Result<(Vec<RecordBatch>, ChunkedColumns), ArrowError> {
-        let projected: Vec<RecordBatch> = self
-            .batches
-            .iter()
-            .map(|batch| batch.project(columns))
-            .collect::<Result<_, _>>()?;
-        let gather = ChunkedColumns::prepare(&projected, BATCH_SHIFT);
-        Ok((projected, gather))
-    }
+/// The id space the stored rows occupy, gaps included.
+fn row_id_space(batches: &[RecordBatch]) -> usize {
+    batches.len() << BATCH_SHIFT
 }

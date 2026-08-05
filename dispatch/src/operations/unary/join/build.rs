@@ -1,7 +1,7 @@
 use crate::memory::{SlabAllocator, SlabVec};
 use crate::operations::channels::Sender;
 use crate::operations::unary::join::JoinTable;
-use crate::operations::unary::join::build_rows::BuildRowBatches;
+use crate::operations::unary::join::build_rows::{self, BuildRows};
 use crate::operations::unary::join::directory::JoinDirectory;
 use crate::operations::unary::join::keys::{JoinKey, combined_key_validity};
 use crate::operations::{Consumer, Outputter, unary};
@@ -37,7 +37,7 @@ pub(crate) type PartitionBuffers<K> = Vec<SlabVec<BuildTuple<K>>>;
 pub(crate) struct BuildWorkerOutput<K: Copy> {
     worker_id: usize,
     tuples: PartitionBuffers<K>,
-    build_row_batches: BuildRowBatches,
+    build_row_batches: Vec<RecordBatch>,
 }
 
 pub struct JoinBuildConsumer<K: JoinKey, const BUILD_OUTER: bool> {
@@ -48,7 +48,7 @@ pub struct JoinBuildConsumer<K: JoinKey, const BUILD_OUTER: bool> {
     /// This worker's build rows, stored as the batches they arrived in. No
     /// bytes are copied and nothing leaves engine memory: the batches stay
     /// the arrays the upstream operator produced.
-    build_row_batches: BuildRowBatches,
+    build_row_batches: Vec<RecordBatch>,
     slab_allocator: SlabAllocator,
     partition_sizes: Arc<Vec<AtomicUsize>>,
     sender: mpsc::Sender<BuildWorkerOutput<K::Stored>>,
@@ -71,13 +71,14 @@ impl<K: JoinKey, const BUILD_OUTER: bool> JoinBuildConsumer<K, BUILD_OUTER> {
         jobs_injected: Arc<AtomicBool>,
         build_ready: Arc<AtomicBool>,
         remaining_jobs: Arc<AtomicUsize>,
+        build_output_columns: Vec<usize>,
     ) -> Self {
         Self {
             key_columns,
             worker_id,
             hash_state,
             values: (0..NUM_PARTITIONS).map(|_| SlabVec::new()).collect(),
-            build_row_batches: BuildRowBatches::new(),
+            build_row_batches: Vec::new(),
             slab_allocator: SlabAllocator::new(false),
             partition_sizes: partition_sizes.clone(),
             sender,
@@ -89,6 +90,7 @@ impl<K: JoinKey, const BUILD_OUTER: bool> JoinBuildConsumer<K, BUILD_OUTER> {
                 jobs_injected,
                 build_ready,
                 remaining_jobs,
+                build_output_columns,
             },
         }
     }
@@ -114,7 +116,7 @@ impl<K: JoinKey, const BUILD_OUTER: bool> Consumer<RecordBatch, ()>
 
     fn consume(&mut self, batch: RecordBatch, _sender: &mut dyn Sender<()>) -> unary::Result<()> {
         debug!("Consuming build");
-        for (first_row_id, stored) in self.build_row_batches.adopt(batch) {
+        for (first_row_id, stored) in build_rows::adopt(&mut self.build_row_batches, batch) {
             let reader = K::make_reader(&stored, &self.key_columns, &self.hash_state);
             for i in 0..stored.num_rows() {
                 // A null-keyed row can never match, so it gets no tuple. It
@@ -163,6 +165,7 @@ pub struct JoinBuilder<K: Copy + Send, const BUILD_OUTER: bool> {
     jobs_injected: Arc<AtomicBool>,
     build_ready: Arc<AtomicBool>,
     remaining_jobs: Arc<AtomicUsize>,
+    build_output_columns: Vec<usize>,
 }
 
 unsafe impl<K: Copy + Send, const BUILD_OUTER: bool> Send for JoinBuilder<K, BUILD_OUTER> {}
@@ -243,7 +246,7 @@ impl<K: Copy + Send> JoinPartitionJob<K> {
     }
 }
 
-impl<K: Copy + Send, const BUILD_OUTER: bool> Outputter<()> for JoinBuilder<K, BUILD_OUTER> {
+impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> Outputter<()> for JoinBuilder<K, OUTER_JOIN_BUILD_SIDE> {
     fn output(&mut self, _sender: &mut dyn Sender<()>) -> unary::Result<bool> {
         if let Some(rx) = self.receiver.take() {
             let mut worker_outputs: Vec<BuildWorkerOutput<K>> = rx.into_iter().collect();
@@ -263,24 +266,17 @@ impl<K: Copy + Send, const BUILD_OUTER: bool> Outputter<()> for JoinBuilder<K, B
             // and get the base added during scatter. No bytes move; an empty
             // merge means an empty build side, and the probe then emits
             // nothing.
-            let (merged, row_bases) = BuildRowBatches::merge(
+            let (merged, row_bases) = build_rows::merge(
                 worker_outputs
                     .iter_mut()
                     .map(|output| std::mem::take(&mut output.build_row_batches)),
             );
-            let build_rows = unsafe { &mut *self.table.build_rows.get() };
-            *build_rows = merged;
-
-            // One flag per row id (gaps included), not per tuple: a
-            // null-keyed row of an outer build has no tuple and stays
-            // permanently unmatched, and a gap id is never matched or
-            // scanned.
-            if BUILD_OUTER {
-                let row_id_space = build_rows.row_id_space();
-                let mut matched_alloc = SlabAllocator::new(false);
-                let matched = unsafe { &mut *self.table.matched.get() };
-                *matched = matched_alloc.create_multi_slab_buffer::<u8>(row_id_space.max(1), true);
-            }
+            // Prepare the merged rows once for every probe worker. For an
+            // outer build this also allocates one matched flag per row id
+            // (gaps included); null-keyed rows have no tuple and therefore
+            // remain unmatched.
+            let build_rows = BuildRows::new::<OUTER_JOIN_BUILD_SIDE>(merged, &self.build_output_columns)?;
+            unsafe { *self.table.build_rows.get() = build_rows };
 
             // Pre-allocate directory and arenas.
             let dir_capacity = ((total as f64 * 1.125) as usize)

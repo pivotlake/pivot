@@ -39,7 +39,7 @@ use std::sync::atomic::AtomicUsize;
 use arrow_schema::Field;
 
 use crate::memory::MultiSlabBuffer;
-use crate::operations::unary::join::build_rows::BuildRowBatches;
+use crate::operations::unary::join::build_rows::BuildRows;
 use crate::operations::unary::join::directory::JoinDirectory;
 pub(crate) use factory::create_for_workers as create_join_factories;
 
@@ -148,13 +148,7 @@ pub(crate) struct JoinTable<K> {
     pub(crate) directory: Arc<JoinCell<JoinDirectory>>,
     pub(crate) keys: Arc<JoinCell<MultiSlabBuffer<K>>>,
     pub(crate) rows: Arc<JoinCell<MultiSlabBuffer<u32>>>,
-    pub(crate) build_rows: Arc<JoinCell<BuildRowBatches>>,
-    /// One zeroed byte per `build_rows` row id (gap ids included), set to 1
-    /// by whichever probe worker matches that row. Only allocated for a
-    /// build-side outer join, which is the only reader; the bytes are written
-    /// as [`AtomicU8`](std::sync::atomic::AtomicU8) because several probe
-    /// workers can match the same build row at once.
-    pub(crate) matched: Arc<JoinCell<MultiSlabBuffer<u8>>>,
+    pub(crate) build_rows: Arc<JoinCell<BuildRows>>,
 }
 
 #[cfg(test)]

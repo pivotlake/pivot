@@ -15,7 +15,7 @@ use crate::operations::unary::UnaryOperator;
 use crate::operations::unary::join::build::{
     BuildWorkerOutput, JoinBuildConsumer, JoinPartitionJob, NUM_PARTITIONS,
 };
-use crate::operations::unary::join::build_rows::BuildRowBatches;
+use crate::operations::unary::join::build_rows::BuildRows;
 use crate::operations::unary::join::directory::JoinDirectory;
 use crate::operations::unary::join::keys::JoinKey;
 use crate::operations::unary::join::probe::Probe;
@@ -37,6 +37,7 @@ pub struct JoinBuildFactory<K: JoinKey, const BUILD_OUTER: bool> {
     sender: mpsc::Sender<BuildWorkerOutput<K::Stored>>,
     receiver: Option<mpsc::Receiver<BuildWorkerOutput<K::Stored>>>,
     remaining_jobs: Arc<AtomicUsize>,
+    build_output_columns: Vec<usize>,
 }
 
 /// Creates one [`Probe`] per worker, all sharing the same [`JoinTable`].
@@ -89,8 +90,7 @@ pub fn create_for_workers<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
         directory: Arc::new(JoinCell::new(JoinDirectory::initial())),
         keys: Arc::new(JoinCell::new(MultiSlabBuffer::<K::Stored>::new(vec![]))),
         rows: Arc::new(JoinCell::new(MultiSlabBuffer::<u32>::new(vec![]))),
-        build_rows: Arc::new(JoinCell::new(BuildRowBatches::new())),
-        matched: Arc::new(JoinCell::new(MultiSlabBuffer::<u8>::new(vec![]))),
+        build_rows: Arc::new(JoinCell::new(BuildRows::empty())),
     };
     let injector = Arc::new(Injector::new());
     let jobs_injected = Arc::new(AtomicBool::new(false));
@@ -103,6 +103,7 @@ pub fn create_for_workers<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
     let hs_clone = hash_state.clone();
     let probe_gate = build_ready.clone();
     let probe_side_build_key_columns = build_key_columns.clone();
+    let build_output_columns = output_columns.build.clone();
 
     let build_factories = (0..worker_count).map(move |worker_id| JoinBuildFactory {
         key_columns: build_key_columns.clone(),
@@ -116,6 +117,7 @@ pub fn create_for_workers<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
         sender: tx.clone(),
         receiver: rx_opt.take(),
         remaining_jobs: remaining_jobs.clone(),
+        build_output_columns: build_output_columns.clone(),
     });
 
     let output_columns = Arc::new(output_columns);
@@ -154,6 +156,7 @@ impl<K: JoinKey, const BUILD_OUTER: bool> UnaryFactory<RecordBatch, ()>
             self.jobs_injected,
             self.build_ready,
             self.remaining_jobs,
+            self.build_output_columns,
         ))
     }
 }

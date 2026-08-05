@@ -58,23 +58,11 @@ pub struct Probe<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool
     probe_indices: Vec<u32>,
     build_indices: Vec<u32>,
     outputter: Outputter,
-    /// The stored build rows bound for gathering output columns. `None` only
-    /// until the build side publishes, which every call that reaches it has
-    /// already waited out.
-    build_gather: Option<BuildGather>,
     /// Shared progress of the unmatched pass. Unused by an inner join.
     unmatched: Arc<UnmatchedScan>,
     /// Whether this worker has entered `finish` — the point it stops probing
     /// and leaves the barrier the unmatched pass waits on.
     probing_done: bool,
-}
-
-/// The stored build rows bound for reading output columns back: the batches
-/// restricted to the listed build columns (for the unmatched pass's per-batch
-/// scan), and the same batches prepared for gathering matched rows by row id.
-struct BuildGather {
-    build_row_batches: Vec<RecordBatch>,
-    columns: ChunkedColumns,
 }
 
 impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool> Probe<K, OUTER_JOIN_BUILD_SIDE, SEMI> {
@@ -101,26 +89,9 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool> Probe<K, O
             probe_indices: vec![0; RECORD_BATCH_SIZE],
             build_indices: vec![0; RECORD_BATCH_SIZE],
             outputter,
-            build_gather: None,
             unmatched,
             probing_done: false,
         }
-    }
-
-    /// Bind the published build rows for output gathering, once.
-    fn ensure_build_gather_bound(
-        &mut self,
-        build_rows: &build_rows::BuildRowBatches,
-    ) -> unary::Result<()> {
-        if self.build_gather.is_some() {
-            return Ok(());
-        }
-        let (build_row_batches, columns) = build_rows.gather_source(&self.output_columns.build)?;
-        self.build_gather = Some(BuildGather {
-            build_row_batches,
-            columns,
-        });
-        Ok(())
     }
 
     /// Claim one build row batch, scan its flags, and append its unmatched
@@ -131,11 +102,8 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool> Probe<K, O
         sender: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<bool> {
         let build_row_batch_idx = self.unmatched.cursor.fetch_add(1, Ordering::Relaxed);
-        let gather = self
-            .build_gather
-            .as_ref()
-            .expect("the build rows are bound before scanning");
-        if build_row_batch_idx >= gather.build_row_batches.len() {
+        let build_rows = unsafe { &*self.table.build_rows.get() };
+        if build_row_batch_idx >= build_rows.output_batches.len() {
             if !self.outputter.build.is_empty() {
                 self.outputter
                     .emit_unmatched_build_rows(&mut self.allocator, sender)?;
@@ -143,9 +111,8 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool> Probe<K, O
             return Ok(true);
         }
 
-        let batch = &gather.build_row_batches[build_row_batch_idx];
+        let batch = &build_rows.output_batches[build_row_batch_idx];
         let first_row_id = build_rows::first_row_id(build_row_batch_idx);
-        let flags = unsafe { &*self.table.matched.get() };
         let mut found = 0;
         for row in 0..batch.num_rows() {
             // Branchless, as in the match collector: write the row and keep it
@@ -153,7 +120,7 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool> Probe<K, O
             // one output batch's worth of rows, so a pass never overfills the
             // accumulator.
             self.build_indices[found] = row as u32;
-            found += (unsafe { *flags.ptr_at_index(first_row_id + row) } == 0) as usize;
+            found += (build_rows.matched[first_row_id + row] == 0) as usize;
         }
         if found > 0 {
             self.outputter.build.append_batch_by_indices(
@@ -178,23 +145,19 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool> Probe<K, O
     ) -> unary::Result<()> {
         let build_rows = unsafe { &*self.table.build_rows.get() };
         let reader = K::make_reader(window, &self.key_columns, &self.hash_state);
-        let verifier = K::make_verifier(build_rows.batches(), &self.build_key_columns);
+        let verifier = K::make_verifier(&build_rows.batches, &self.build_key_columns);
         let keys = unsafe { &*self.table.keys.get() };
         let rows = unsafe { &*self.table.rows.get() };
         let out = ProbeMatchCollector::<K, OUTER_JOIN_BUILD_SIDE, SEMI> {
             keys,
             rows,
-            matched_flags: unsafe { &*self.table.matched.get() },
+            matched_flags: &build_rows.matched,
             reader,
             verifier,
             window_offset,
             probe_source,
             outputter: &mut self.outputter,
-            build_columns: &self
-                .build_gather
-                .as_ref()
-                .expect("the build rows are bound before probing")
-                .columns,
+            build_columns: &build_rows.output_columns,
             probe_indices: &mut self.probe_indices,
             build_indices: &mut self.build_indices,
             matched: 0,
@@ -236,7 +199,6 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool> Unary<Reco
             return Ok(());
         }
 
-        self.ensure_build_gather_bound(build_rows)?;
         let probe_source = batch.project(&self.output_columns.probe)?;
 
         let total = batch.num_rows();
@@ -273,7 +235,6 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool> Unary<Reco
         if build_rows.is_empty() {
             return Ok(true);
         }
-        self.ensure_build_gather_bound(build_rows)?;
         self.send_out_next_unmatched_build_rows(sender)
     }
 }
@@ -389,8 +350,8 @@ struct ProbeMatchCollector<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SE
     allocator: &'a mut SlabAllocator,
 }
 
-impl<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
-    ProbeMatchCollector<'a, 'b, K, BUILD_OUTER, SEMI>
+impl<'a, 'b, K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI_PROBE_SIDE: bool>
+    ProbeMatchCollector<'a, 'b, K, OUTER_JOIN_BUILD_SIDE, SEMI_PROBE_SIDE>
 {
     /// Append the collected pairs to the outputter, emitting if a full batch
     /// accumulated.
@@ -399,7 +360,7 @@ impl<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
         if self.matched == 0 {
             return Ok(());
         }
-        if BUILD_OUTER {
+        if OUTER_JOIN_BUILD_SIDE {
             // These indices are the verified matches, so flagging them here
             // keeps the match loop itself untouched. Relaxed because the flags
             // are only read after a barrier that orders them, and atomic only
@@ -416,7 +377,7 @@ impl<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
         );
         // A semi join has no build columns and buffered no build rows: its
         // build side only ever contributes its (empty) column list on emit.
-        if !SEMI {
+        if !SEMI_PROBE_SIDE {
             self.outputter.build.append_chunked_by_ids(
                 self.build_columns,
                 &self.build_indices[..self.matched],
@@ -436,44 +397,51 @@ impl<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
     #[inline(always)]
     fn record_matches(
         &mut self,
-        start: usize,
-        end: usize,
+        keys_start: usize,
+        keys_end: usize,
         probe_row: usize,
         probe_key: K::Stored,
     ) -> unary::Result<()> {
-        if SEMI {
-            for j in start..end {
-                if self.keys[j] == probe_key
-                    && K::verify(&self.reader, &self.verifier, probe_row, self.rows[j])
-                {
-                    return self.record_probe_row(probe_row);
+
+        for key_index in keys_start..keys_end {
+            debug_assert!(self.matched < self.probe_indices.len());
+            let key_matches = self.keys[key_index] == probe_key
+                && K::verify(&self.reader, &self.verifier, probe_row, self.rows[key_index]);
+
+            if SEMI_PROBE_SIDE {
+                // If we're in a semijoin on probe side, we need to exit on first match (since a
+                // semi join never matches more than one row per probe row). So we do an `if` here
+                // (in contrast to a regular join) so we can return early. We also only record
+                // `probe_indices` since a semijoin only outputs probe rows, never build rows.
+                if key_matches {
+                    unsafe {
+                        *self.probe_indices.get_unchecked_mut(self.matched) =
+                            (self.window_offset + probe_row) as u32;
+                    }
+                    self.matched += 1;
+                    if self.matched == RECORD_BATCH_SIZE {
+                        self.drain()?;
+                    }
+                    return Ok(());
+                }
+            } else {
+                // In a regular join, we want to record both probe row and build row. We don't need an
+                // if statement for matching since we can just increment self.matched by *whether there
+                // was a match* which removes the need for branching here.
+                unsafe {
+                    *self.probe_indices.get_unchecked_mut(self.matched) =
+                        (self.window_offset + probe_row) as u32;
+                }
+                unsafe { *self.build_indices.get_unchecked_mut(self.matched) = self.rows[key_index]; }
+                self.matched += key_matches as usize;
+                if self.matched == RECORD_BATCH_SIZE {
+                    self.drain()?;
                 }
             }
-            return Ok(());
-        }
-        for j in start..end {
-            self.record_match(j, probe_row, probe_key)?;
         }
         Ok(())
     }
 
-    /// Buffer `probe_row` as a matched probe row, without a build row to pair
-    /// it with: a semi join's whole output.
-    #[inline(always)]
-    fn record_probe_row(&mut self, probe_row: usize) -> unary::Result<()> {
-        debug_assert!(self.matched < self.probe_indices.len());
-        // SAFETY: as in `record_match` - the drain below resets the cursor the
-        // moment it reaches the slice's length.
-        unsafe {
-            *self.probe_indices.get_unchecked_mut(self.matched) =
-                (self.window_offset + probe_row) as u32;
-        }
-        self.matched += 1;
-        if self.matched == RECORD_BATCH_SIZE {
-            self.drain()?;
-        }
-        Ok(())
-    }
 
     /// Record the match candidate at arena index `j` for probe row
     /// `probe_row`: write both index slices at the current cursor and advance
