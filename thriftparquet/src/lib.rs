@@ -9,8 +9,11 @@
 //! [`WriteThrift`](parquet_thrift::WriteThrift) via the `thrift_struct!` macro,
 //! so the same definitions serve both directions.
 //!
-//! - [`parquet_thrift`] — compact-protocol primitives: [`ReadThrift`],
-//!   [`WriteThrift`], [`ThriftSliceInputProtocol`], [`ThriftCompactOutputProtocol`].
+//! - [`parquet_thrift`] — compact-protocol primitives:
+//!   [`ReadThrift`](parquet_thrift::ReadThrift),
+//!   [`WriteThrift`](parquet_thrift::WriteThrift),
+//!   [`ThriftSliceInputProtocol`](parquet_thrift::ThriftSliceInputProtocol),
+//!   [`ThriftCompactOutputProtocol`](parquet_thrift::ThriftCompactOutputProtocol).
 //! - [`footer`] — `FileMetaData`, `RowGroup`, `ColumnChunk`, `ColumnMetaData`,
 //!   `SchemaElement`, `Statistics`, `LogicalType`.
 //! - [`headers`] — `PageHeader`, `DataPageHeader`, `DictionaryPageHeader`.
