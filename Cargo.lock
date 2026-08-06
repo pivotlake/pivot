@@ -3150,6 +3150,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "metastore-postgres"
+version = "0.1.0"
+dependencies = [
+ "catalog",
+ "datastore-delta",
+ "dispatch",
+ "metastore",
+ "metastore-postgres",
+ "metastore-yaml",
+ "postgres",
+ "serde",
+ "serde_yaml_ng",
+ "testcontainers",
+ "testcontainers-modules",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "metastore-yaml"
 version = "0.1.0"
 dependencies = [
@@ -3780,6 +3799,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51bae2ac328883f7acdfea3d66a7c35751187f870bc81f94563733a154d7a670"
 dependencies = [
  "plotters-backend",
+]
+
+[[package]]
+name = "postgres"
+version = "0.19.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33ad20e0aa0b24f5a394eab4f78c781d248982b22b25cecc7e3aa46a681605bd"
+dependencies = [
+ "bytes",
+ "fallible-iterator",
+ "futures-util",
+ "log",
+ "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]
@@ -4783,12 +4816,14 @@ dependencies = [
  "libc",
  "lru",
  "metastore",
+ "metastore-postgres",
  "metastore-yaml",
  "nix",
  "parquet 58.0.0",
  "parquet-variant-compute",
  "pgwire",
  "planner",
+ "postgres",
  "rand 0.10.2",
  "rstest",
  "serde",

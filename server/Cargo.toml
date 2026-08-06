@@ -9,6 +9,7 @@ planner = { workspace = true }
 catalog = { workspace = true }
 datastore-delta = { workspace = true }
 metastore = { workspace = true }
+metastore-postgres = { workspace = true }
 metastore-yaml = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
@@ -64,3 +65,7 @@ rstest = { workspace = true }
 # Pull catalog's `test_support` (MinIO / fake-gcs object-store harness) in for
 # the bucket-backed end-to-end tests; the bin build keeps the plain catalog dep.
 datastore-delta = { workspace = true, features = ["test-support"] }
+# The PostgreSQL container harness for the Postgres-metastore end-to-end test,
+# plus the synchronous client its fixture administers rows with.
+metastore-postgres = { workspace = true, features = ["test-support"] }
+postgres = { workspace = true }

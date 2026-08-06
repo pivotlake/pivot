@@ -5,5 +5,7 @@
 # pulls the real tag itself):
 #   - MinIO: testcontainers-modules `MinIO` default tag (bump with that crate)
 #   - fake-gcs-server: the tag in catalog/src/test_support.rs
+#   - postgres: testcontainers-modules `Postgres` default tag (bump with that crate)
 minio/minio:RELEASE.2025-02-28T09-55-16Z
 fsouza/fake-gcs-server:1.52.2
+postgres:11-alpine

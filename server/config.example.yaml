@@ -25,6 +25,18 @@ server:
   #   max_objects: 65536   # one open file descriptor per cached object
 
 metastore:
+  # The optional `kind` selects the metastore provider. The default, `yaml`,
+  # keeps the datastores and users inline below. `kind: postgres` reads both
+  # from a PostgreSQL database that every instance of a cluster shares; the
+  # section then holds a connection URL instead of inline entries, and rows in
+  # `pivot_metastore.datastores` / `pivot_metastore.users` (created on first
+  # startup) replace them. See server/README.md for the row formats.
+  #
+  # kind: postgres
+  # url: postgres://pivot:secret@pg.internal:5432/pivot_metastore
+  # compact: true          # honour the rows' compaction settings, in at most
+  #                        # one instance per cluster
+
   # How often the background refresh brings the in-memory table set up to date
   # with the store. This bounds how stale a query's view of data committed by
   # other processes can be. Defaults to 30s.

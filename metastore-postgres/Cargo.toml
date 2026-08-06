@@ -1,0 +1,39 @@
+[package]
+name = "metastore-postgres"
+version.workspace = true
+edition.workspace = true
+description = "PostgreSQL-backed metastore provider for PivotDB."
+
+[dependencies]
+metastore = { workspace = true }
+catalog = { workspace = true }
+datastore-delta = { workspace = true }
+dispatch = { workspace = true }
+# The config-file scalars (`Interval`) every section of the YAML config file is
+# written with, including this provider's own `metastore` section.
+metastore-yaml = { workspace = true }
+
+# The synchronous PostgreSQL client: the `Metastore` trait is synchronous, and
+# the control plane deliberately stays off the server's runtime threads.
+postgres = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+# Only to detect an ambient runtime, so a blocking database call can hop onto
+# its own thread instead of stalling (or panicking) an async worker.
+tokio = { workspace = true, features = ["rt"] }
+
+# Optional, behind the `test-support` feature: a PostgreSQL container harness
+# for this crate's integration tests and downstream crates (e.g. `server`).
+testcontainers = { version = "0.24", features = ["blocking"], optional = true }
+testcontainers-modules = { version = "0.12", features = ["postgres"], optional = true }
+
+[features]
+# Exposes `test_support`, a PostgreSQL container harness used by this crate's
+# integration tests and by downstream crates that want a real shared metastore.
+test-support = ["dep:testcontainers", "dep:testcontainers-modules"]
+
+[dev-dependencies]
+# Self-dependency to turn on `test-support` for this crate's own integration
+# tests (the same pattern as datastore-delta's object-store harness).
+metastore-postgres = { path = ".", features = ["test-support"] }
+serde_yaml_ng = { workspace = true }

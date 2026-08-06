@@ -33,7 +33,10 @@ pivotdb-server --config <FILE>
 
 The file has two sections. `server` is the instance: where it listens and what
 it may use. Every setting there has a default, so the section may be left out
-entirely. `metastore` is the data to serve, and is required.
+entirely. `metastore` is the data to serve, and is required. Its optional
+`kind` selects the provider: `yaml` (the default) keeps datastores and users
+inline in the file, `postgres` reads them from a shared PostgreSQL database
+(see [Sharing the metastore across instances](#sharing-the-metastore-across-instances)).
 
 ```yaml
 server:
@@ -126,6 +129,45 @@ verifier and SCRAM cannot omit one.
 A config file with no users (an omitted or empty `users` section) receives one
 built-in trusted user named `pivot`. Defining any users replaces that default
 with the configured allowlist.
+
+### Sharing the metastore across instances
+
+With `kind: postgres` the `metastore` section holds only a connection URL, and
+the datastores and users live in a PostgreSQL database that every instance of a
+cluster shares:
+
+```yaml
+metastore:
+  kind: postgres
+  url: postgres://pivot:secret@pg.internal:5432/pivot_metastore
+  refresh_interval: 30s   # optional, as with the YAML provider
+  # compact: true         # honour the rows' compaction settings in this instance
+```
+
+On startup the server creates the `pivot_metastore` schema and its two tables
+when they do not exist, so the database only has to exist. Rows are
+administered with plain SQL and carry the same fields as the YAML sections
+above (`pivot_metastore.datastores`: `name`, `kind`, `location`, `is_default`,
+the `compact*` tuning, and the S3 credential columns;
+`pivot_metastore.users`: `name`, `auth_method`, `scram_verifier`):
+
+```sql
+INSERT INTO pivot_metastore.datastores (name, location, is_default)
+    VALUES ('hot', 's3://analytics/hot/', true);
+INSERT INTO pivot_metastore.users (name, auth_method, scram_verifier)
+    VALUES ('analytics', 'scram-sha-256', 'pivot-scram-sha-256$4096:...$...');
+```
+
+Datastore rows are read once at startup; exactly one must set
+`is_default = true` (a unique index keeps a second one out). Users are read on
+every login, so adding a user or rotating a verifier applies to the next login
+of every instance without a restart. An empty `users` table provides the same
+built-in trusted `pivot` user as a YAML file without a `users` section.
+
+Compaction must run in at most one process per datastore, but the rows are
+shared, so an instance honours the rows' `compact` settings only when its own
+`metastore` section sets `compact: true`. Start at most one instance with that
+flag; every other instance leaves it off and never compacts.
 
 Logging is controlled by `RUST_LOG` (defaults to `info`):
 

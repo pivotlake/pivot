@@ -102,8 +102,8 @@ pub fn pivot_metastore() -> Arc<dyn Metastore> {
             DEFAULT_DATASTORE_NAME
         }
 
-        fn user_auth(&self, username: &str) -> Option<UserAuth> {
-            (username == DEFAULT_USER_NAME).then_some(UserAuth::Trust)
+        fn user_auth(&self, username: &str) -> metastore::Result<Option<UserAuth>> {
+            Ok((username == DEFAULT_USER_NAME).then_some(UserAuth::Trust))
         }
     }
 

@@ -59,8 +59,8 @@ impl Metastore for MutableMetastore {
         self.inner.default_datastore_name()
     }
 
-    fn user_auth(&self, username: &str) -> Option<UserAuth> {
-        self.users.read().unwrap().get(username).cloned()
+    fn user_auth(&self, username: &str) -> metastore::Result<Option<UserAuth>> {
+        Ok(self.users.read().unwrap().get(username).cloned())
     }
 }
 

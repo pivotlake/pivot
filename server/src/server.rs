@@ -43,12 +43,14 @@ pub enum Error {
     /// the success path too.
     #[error(transparent)]
     Config(#[from] Box<crate::config::Error>),
-    #[error("invalid `metastore` section of `{path}`: {source}")]
+    #[error("opening the metastore configured in `{path}`: {source}")]
     Metastore {
         path: PathBuf,
-        /// Boxed for the same reason as [`Config`](Self::Config).
+        /// Boxed dynamically: the source is whichever provider the `metastore`
+        /// section selected, and the largest concrete error would otherwise be
+        /// paid for on every `Result<_, Error>` success path too.
         #[source]
-        source: Box<metastore_yaml::Error>,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
     #[error("failed to open the datastores configured in `{path}`: {source}")]
     OpenDatastores {
@@ -305,8 +307,11 @@ mod tests {
                 DEFAULT_DATASTORE_NAME
             }
 
-            fn user_auth(&self, username: &str) -> Option<metastore::UserAuth> {
-                (username == metastore::DEFAULT_USER_NAME).then_some(metastore::UserAuth::Trust)
+            fn user_auth(&self, username: &str) -> metastore::Result<Option<metastore::UserAuth>> {
+                Ok(
+                    (username == metastore::DEFAULT_USER_NAME)
+                        .then_some(metastore::UserAuth::Trust),
+                )
             }
         }
 

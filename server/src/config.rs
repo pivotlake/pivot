@@ -2,9 +2,11 @@
 //!
 //! The file has two sections, each owned by the code that acts on it. `server`
 //! is [`ServerConfig`] below: the endpoint, the memory and worker budgets, the
-//! disk cache. `metastore` is [`MetastoreConfig`]: the datastores to serve and
-//! the users that may connect. Both are read in a single pass, so a mistake in
-//! either one is reported with its place in the file and stops startup.
+//! disk cache. `metastore` is [`MetastoreSection`]: the datastores to serve and
+//! the users that may connect, provided either inline (`kind: yaml`, the
+//! default) or by a shared PostgreSQL database (`kind: postgres`). Both are
+//! read in a single pass, so a mistake in either one is reported with its place
+//! in the file and stops startup.
 //!
 //! ```yaml
 //! server:
@@ -31,6 +33,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
+use metastore_postgres::PostgresMetastoreConfig;
 use metastore_yaml::{ByteSize, MetastoreConfig};
 use serde::Deserialize;
 
@@ -57,7 +60,51 @@ pub struct Config {
     pub server: ServerConfig,
     /// The data to serve. Required: a server with no datastores has nothing to
     /// answer a query with.
-    pub metastore: MetastoreConfig,
+    pub metastore: MetastoreSection,
+}
+
+/// The `metastore` section, dispatched on its `kind` key to the provider that
+/// owns the remaining fields. `kind` is optional and defaults to `yaml`, the
+/// original inline provider, so existing files keep parsing unchanged.
+pub enum MetastoreSection {
+    Yaml(MetastoreConfig),
+    Postgres(PostgresMetastoreConfig),
+}
+
+impl<'de> Deserialize<'de> for MetastoreSection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let mut value = serde_yaml_ng::Value::deserialize(deserializer)?;
+        // Pull `kind` out before handing the rest to the selected provider,
+        // whose own config type rejects keys it does not know.
+        let kind = match &mut value {
+            serde_yaml_ng::Value::Mapping(mapping) => mapping.remove("kind"),
+            _ => None,
+        };
+        let kind = match &kind {
+            None => "yaml",
+            Some(serde_yaml_ng::Value::String(kind)) => kind.as_str(),
+            Some(_) => {
+                return Err(D::Error::custom(
+                    "`metastore.kind` must be a string (`yaml` or `postgres`)",
+                ));
+            }
+        };
+        match kind {
+            "yaml" => serde_yaml_ng::from_value(value)
+                .map(Self::Yaml)
+                .map_err(D::Error::custom),
+            "postgres" => serde_yaml_ng::from_value(value)
+                .map(Self::Postgres)
+                .map_err(D::Error::custom),
+            other => Err(D::Error::custom(format!(
+                "unknown metastore kind `{other}` (expected `yaml` or `postgres`)"
+            ))),
+        }
+    }
 }
 
 impl Config {
@@ -177,10 +224,18 @@ mod tests {
         Config::from_yaml(&format!("server:\n{settings}{METASTORE_SECTION}"), "test")
     }
 
+    /// The parsed section's YAML provider config, for tests written against it.
+    fn yaml_section(section: MetastoreSection) -> MetastoreConfig {
+        match section {
+            MetastoreSection::Yaml(config) => config,
+            MetastoreSection::Postgres(_) => panic!("expected a yaml metastore section"),
+        }
+    }
+
     #[test]
     fn one_file_configures_both_the_instance_and_its_data() {
         let config = from_yaml_with("  bind: 0.0.0.0:5433\n  memory: 32g\n  workers: 8\n").unwrap();
-        let metastore = YamlMetastore::from_config(config.metastore).unwrap();
+        let metastore = YamlMetastore::from_config(yaml_section(config.metastore)).unwrap();
 
         assert_eq!(config.server.bind, "0.0.0.0:5433".parse().unwrap());
         assert_eq!(
@@ -189,6 +244,51 @@ mod tests {
         );
         assert_eq!(config.server.workers, Some(8));
         assert_eq!(metastore.default_datastore_name(), "hot");
+    }
+
+    #[test]
+    fn an_explicit_yaml_kind_selects_the_inline_provider() {
+        let yaml = "metastore:\n  kind: yaml\n  datastores:\n    hot:\n      kind: delta\n      \
+                    location: /tmp/hot\n      default: true\n";
+
+        let config = Config::from_yaml(yaml, "test").unwrap();
+
+        let metastore = YamlMetastore::from_config(yaml_section(config.metastore)).unwrap();
+        assert_eq!(metastore.default_datastore_name(), "hot");
+    }
+
+    #[test]
+    fn a_postgres_kind_selects_the_shared_provider() {
+        let yaml = "metastore:\n  kind: postgres\n  url: postgres://pivot@pg.internal/meta\n";
+
+        let config = Config::from_yaml(yaml, "test").unwrap();
+
+        assert!(matches!(config.metastore, MetastoreSection::Postgres(_)));
+    }
+
+    #[test]
+    fn an_unknown_metastore_kind_is_rejected() {
+        let yaml = "metastore:\n  kind: etcd\n  url: whatever\n";
+
+        let error = Config::from_yaml(yaml, "test").err().unwrap();
+
+        assert!(
+            error.to_string().contains("unknown metastore kind `etcd`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_postgres_section_rejects_yaml_provider_fields() {
+        let yaml = "metastore:\n  kind: postgres\n  url: postgres://pivot@pg.internal/meta\n  \
+                    datastores: {}\n";
+
+        let error = Config::from_yaml(yaml, "test").err().unwrap();
+
+        assert!(
+            error.to_string().contains("unknown field `datastores`"),
+            "{error}"
+        );
     }
 
     #[test]

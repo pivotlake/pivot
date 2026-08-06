@@ -8,6 +8,7 @@ members = [
     "dispatch",
     "duckdb-planner",
     "metastore",
+    "metastore-postgres",
     "metastore-yaml",
     "planner",
     "server",
@@ -29,6 +30,7 @@ datastore-delta = { path = "datastore-delta" }
 dispatch = { path = "dispatch" }
 duckdb-planner = { path = "duckdb-planner" }
 metastore = { path = "metastore" }
+metastore-postgres = { path = "metastore-postgres" }
 metastore-yaml = { path = "metastore-yaml" }
 planner = { path = "planner" }
 server = { path = "server" }
@@ -62,6 +64,7 @@ crossbeam-deque = "0.8.6"
 insta = "1"
 libc = "0.2.184"
 lru = "0.18.1"
+postgres = "0.19"
 rand = "0.10.0"
 rstest = "0.26"
 serde = { version = "1", features = ["derive"] }

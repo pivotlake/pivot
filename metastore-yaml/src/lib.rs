@@ -189,8 +189,8 @@ impl Metastore for YamlMetastore {
         &self.default_name
     }
 
-    fn user_auth(&self, username: &str) -> Option<UserAuth> {
-        self.user_auth.get(username).cloned()
+    fn user_auth(&self, username: &str) -> metastore::Result<Option<UserAuth>> {
+        Ok(self.user_auth.get(username).cloned())
     }
 }
 
@@ -601,10 +601,10 @@ datastores:
             let store = from_yaml_with(users).unwrap();
 
             assert!(matches!(
-                store.user_auth(DEFAULT_USER_NAME),
+                store.user_auth(DEFAULT_USER_NAME).unwrap(),
                 Some(UserAuth::Trust)
             ));
-            assert!(store.user_auth("analytics").is_none());
+            assert!(store.user_auth("analytics").unwrap().is_none());
         }
     }
 
@@ -620,15 +620,15 @@ datastores:
 
         let store = from_yaml_with(&users).unwrap();
 
-        let Some(UserAuth::ScramSha256(analytics)) = store.user_auth("analytics") else {
+        let Some(UserAuth::ScramSha256(analytics)) = store.user_auth("analytics").unwrap() else {
             panic!("analytics should use SCRAM-SHA-256");
         };
         assert_eq!(analytics.salted_password, [b'a'; 32]);
-        let Some(UserAuth::ScramSha256(ingest)) = store.user_auth("ingest") else {
+        let Some(UserAuth::ScramSha256(ingest)) = store.user_auth("ingest").unwrap() else {
             panic!("ingest should use SCRAM-SHA-256");
         };
         assert_eq!(ingest.salted_password, [b'b'; 32]);
-        assert!(store.user_auth("nobody").is_none());
+        assert!(store.user_auth("nobody").unwrap().is_none());
     }
 
     #[test]
@@ -642,7 +642,10 @@ users:
 
         let store = from_yaml_with(users).unwrap();
 
-        assert!(matches!(store.user_auth("reader"), Some(UserAuth::Trust)));
+        assert!(matches!(
+            store.user_auth("reader").unwrap(),
+            Some(UserAuth::Trust)
+        ));
     }
 
     #[test]

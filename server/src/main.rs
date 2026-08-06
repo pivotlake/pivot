@@ -13,8 +13,9 @@ use clap::Parser;
 use dispatch::env::get_env_var_with_default;
 use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
 use metastore::Metastore;
-use metastore_yaml::{MetastoreConfig, YamlMetastore};
-use server::config::DiskCacheConfig;
+use metastore_postgres::PostgresMetastore;
+use metastore_yaml::YamlMetastore;
+use server::config::{DiskCacheConfig, MetastoreSection};
 use server::{Config, Error, Server, raise_open_file_limit};
 use tracing::{error, info};
 
@@ -85,12 +86,22 @@ fn build_disk_cache(config: Option<DiskCacheConfig>) -> Option<Arc<dispatch::io:
 /// returned object is shared by catalog construction and every later login, so
 /// authentication always reaches the same live source rather than a startup copy
 /// of its users.
-fn build_metastore(config: MetastoreConfig, path: &Path) -> Result<Arc<dyn Metastore>, Error> {
-    let metastore = YamlMetastore::from_config(config).map_err(|source| Error::Metastore {
-        path: path.to_path_buf(),
-        source: Box::new(source),
-    })?;
-    Ok(Arc::new(metastore))
+fn build_metastore(section: MetastoreSection, path: &Path) -> Result<Arc<dyn Metastore>, Error> {
+    let metastore: Arc<dyn Metastore> = match section {
+        MetastoreSection::Yaml(config) => Arc::new(YamlMetastore::from_config(config).map_err(
+            |source| Error::Metastore {
+                path: path.to_path_buf(),
+                source: Box::new(source),
+            },
+        )?),
+        MetastoreSection::Postgres(config) => Arc::new(
+            PostgresMetastore::connect(config).map_err(|source| Error::Metastore {
+                path: path.to_path_buf(),
+                source: Box::new(source),
+            })?,
+        ),
+    };
+    Ok(metastore)
 }
 
 /// Open every datastore from `metastore` and assemble them into one composite

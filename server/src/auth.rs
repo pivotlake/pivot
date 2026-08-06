@@ -91,8 +91,13 @@ impl Debug for MetastoreAuthSource {
 }
 
 impl MetastoreAuthSource {
-    fn user_auth(&self, username: &str) -> Option<UserAuth> {
-        self.metastore.user_auth(username)
+    /// The metastore's current method for `username`. A metastore that cannot
+    /// answer (a live backend being down) fails the login as a server error;
+    /// mapping it to "unknown user" would silently deny every configured user.
+    fn user_auth(&self, username: &str) -> PgWireResult<Option<UserAuth>> {
+        self.metastore
+            .user_auth(username)
+            .map_err(PgWireError::ApiError)
     }
 }
 
@@ -104,7 +109,7 @@ impl AuthSource for MetastoreAuthSource {
         // it fails at the same point in the handshake a wrong SCRAM password
         // does. A trusted user never reaches the SCRAM handler; treating one as
         // unknown here is a defensive failure if routing and lookup ever drift.
-        let verifier = match self.user_auth(user) {
+        let verifier = match self.user_auth(user)? {
             Some(UserAuth::ScramSha256(verifier)) => verifier,
             Some(UserAuth::Trust) | None => mock_verifier(&self.mock_secret, user),
         };
@@ -156,8 +161,8 @@ pub struct UserStartupHandler {
 }
 
 impl UserStartupHandler {
-    fn select(&self, username: &str) -> SelectedUserAuth {
-        match self.auth_source.user_auth(username) {
+    fn select(&self, username: &str) -> PgWireResult<SelectedUserAuth> {
+        Ok(match self.auth_source.user_auth(username)? {
             Some(UserAuth::Trust) => SelectedUserAuth::Trust(UnauthenticatedStartupHandler {
                 manager: self.manager.clone(),
             }),
@@ -176,7 +181,7 @@ impl UserStartupHandler {
                         .with_connection_manager(self.manager.clone()),
                 )
             }
-        }
+        })
     }
 }
 
@@ -202,7 +207,8 @@ impl StartupHandler for UserStartupHandler {
                     .parameters
                     .get("user")
                     .ok_or(PgWireError::UserNameRequired)?;
-                self.selected.get_or_init(|| self.select(username))
+                let selected = self.select(username)?;
+                self.selected.get_or_init(|| selected)
             }
         };
         match selected {

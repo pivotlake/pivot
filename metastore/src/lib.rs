@@ -81,11 +81,14 @@ pub trait Metastore: Send + Sync {
     /// does no I/O.
     fn default_datastore_name(&self) -> &str;
 
-    /// The authentication method for `username`, or `None` when no such user is
-    /// configured. The server calls this for every login rather than caching
-    /// credentials at startup, so implementations may reflect users added or
-    /// passwords changed while the server is running.
-    fn user_auth(&self, username: &str) -> Option<UserAuth>;
+    /// The authentication method for `username`, or `Ok(None)` when no such
+    /// user is configured. The server calls this for every login rather than
+    /// caching credentials at startup, so implementations may reflect users
+    /// added or passwords changed while the server is running. A provider that
+    /// consults a live backend returns `Err` when that backend cannot be
+    /// reached, so an outage fails the login as a server error rather than
+    /// masquerading as an unknown user.
+    fn user_auth(&self, username: &str) -> Result<Option<UserAuth>>;
 }
 
 /// Provider errors cross the trait boundary without making this crate depend on

@@ -90,7 +90,10 @@ async fn queries_bind_tables_by_datastore_name() {
 
     let port = start_server(64, move |dispatch| {
         let config = Config::open(&config_path).unwrap();
-        let metastore = YamlMetastore::from_config(config.metastore).unwrap();
+        let server::config::MetastoreSection::Yaml(section) = config.metastore else {
+            panic!("expected a yaml metastore section");
+        };
+        let metastore = YamlMetastore::from_config(section).unwrap();
         let datastores = metastore.open_datastores(dispatch.dispatcher()).unwrap();
         CatalogFixture::new(Arc::new(
             PivotCatalog::new(datastores, DEFAULT_DATASTORE_NAME.to_string()).unwrap(),
