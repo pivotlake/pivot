@@ -7,10 +7,13 @@
 //! [`try_read`](RowGroupDecoder::try_read) decodes the next batch.
 
 use crate::parquet::reading::decoding::ScanEqualityPredicate;
-use crate::parquet::reading::decoding::column_decoder::{ColumnDecoder, Result};
+use crate::parquet::reading::decoding::column_decoder::{
+    ColumnDecoder, Result, create_leaf_decoder,
+};
+use crate::parquet::reading::decoding::leaf_decoders::LeafDecoder;
 use crate::parquet::reading::record_batch_metadata::with_row_group_metadata;
-use crate::parquet::types::leaves::leaf_fields;
-use crate::parquet::types::metadata::QueryRowGroupMetadata;
+use crate::parquet::types::leaves::{leaf_fields, plan_leaves, resolve_output_reads};
+use crate::parquet::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata};
 use crate::parquet::types::page::DecompressedPage;
 use crate::parquet::types::projection::Projection;
 use arrow_array::RecordBatch;
@@ -20,17 +23,13 @@ use std::cmp::min;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Where a fetched leaf's pages are decoded.
-///
-/// A page carries the leaf's position in the row group's fetch order, which is
-/// what [`projected_leaves`](crate::parquet::types::leaves::projected_leaves)
-/// produces. Both sides expand the projection the same way, so that position
-/// names one leaf of one column decoder.
+/// An output column whose pushed-down equality constant can prune the row
+/// group, and the decoded leaf that constant was installed on.
 #[derive(Clone, Copy)]
-struct LeafRoute {
-    /// The output column whose decoder owns this leaf.
-    column: usize,
-    /// The leaf's position within that column's own leaves.
+struct PrunableColumn {
+    /// The column's position in the emitted batch.
+    output_idx: usize,
+    /// The leaf whose dictionary decides the pruning.
     leaf: usize,
 }
 
@@ -44,7 +43,11 @@ struct LeafRoute {
 pub struct RowGroupDecoder {
     /// Global row-group index (used for routing and metadata tagging).
     row_group_idx: usize,
-    /// One decoder per output column, in projection order.
+    /// One decoder per distinct leaf column chunk, in the order the fetcher
+    /// requested them, so a page's `column_idx` indexes straight into this.
+    leaf_decoders: Vec<Box<dyn LeafDecoder>>,
+    /// One view per output column, in projection order. Several can fold the
+    /// same decoded leaf.
     column_decoders: Vec<ColumnDecoder>,
     /// Output schema (projected). A pushed-down extract column carries the
     /// type the extract emits, not the variant it was read from.
@@ -57,14 +60,11 @@ pub struct RowGroupDecoder {
     row_offset: usize,
     /// Whether to append row-group-id / row-index metadata columns.
     add_row_group_metadata: bool,
-    /// One entry per fetched leaf, in fetch order, naming the decoder that
-    /// consumes its pages.
-    leaf_routes: Vec<LeafRoute>,
-    /// Output columns that carry a pushed-down equality constant whose column
-    /// chunk is sound to prune by (all data pages dictionary encoded). When any
-    /// such column's dictionary excludes its constant, the whole row group is
-    /// pruned.
-    prunable_columns: Vec<usize>,
+    /// The output columns carrying a pushed-down equality constant whose chunk
+    /// is sound to prune by (all data pages dictionary encoded), each with the
+    /// leaf holding that constant. When any such leaf's dictionary excludes it,
+    /// the whole row group is pruned.
+    prunable: Vec<PrunableColumn>,
     /// The row group's shared pruned flag is the same `Arc` every page of this
     /// row group carries. It is set here when a prunable column's dictionary
     /// excludes its constant: the row group cannot contain a matching row, so
@@ -89,37 +89,47 @@ impl RowGroupDecoder {
     ) -> Result<Self> {
         let pruned = row_group_metadata.pruned_flag();
         // Expand projected columns into this file's leaves. Variant layouts can
-        // differ between files, so each row group resolves them independently.
-        let leaves = leaf_fields(row_group_metadata.get_metadata().schema.fields());
+        // differ between files, so each row group resolves them independently,
+        // and the fetcher resolved them the same way.
+        let fields = row_group_metadata.get_metadata().schema.fields();
+        let leaves = leaf_fields(fields);
+        let reads = resolve_output_reads(fields, &row_group_metadata, projection);
+        let plan = plan_leaves(&reads);
         let filter_batches =
             !add_row_group_metadata && row_group_metadata.filtered_indices().is_none();
 
+        let column_chunks = row_group_metadata.columns();
+        let mut leaf_decoders = plan
+            .file_leaves
+            .iter()
+            .map(|&leaf| create_leaf_decoder(leaves[leaf].data_type(), &column_chunks[leaf]))
+            .collect::<Result<Vec<_>>>()?;
+
         let mut column_decoders = Vec::with_capacity(projection.column_indices.len());
-        let mut leaf_routes = Vec::new();
-        let mut prunable_columns = Vec::new();
-        for (output_idx, &column) in projection.column_indices.iter().enumerate() {
-            // A pushed-down variant extract emits only the referenced path.
-            let decoder = match projection.extract_at(output_idx) {
-                Some(extract) => ColumnDecoder::for_extract(
-                    column,
-                    extract,
-                    &leaves,
-                    &row_group_metadata,
-                    eq_predicates,
-                )?,
-                None => {
-                    ColumnDecoder::for_column(column, &leaves, &row_group_metadata, eq_predicates)?
-                }
-            };
-            if decoder.is_prunable() {
-                prunable_columns.push(output_idx);
-            }
-            leaf_routes.extend((0..decoder.leaf_count()).map(|leaf| LeafRoute {
-                column: output_idx,
-                leaf,
-            }));
-            column_decoders.push(decoder);
+        for ((output_idx, &column), positions) in projection
+            .column_indices
+            .iter()
+            .enumerate()
+            .zip(plan.output_positions)
+        {
+            column_decoders.push(ColumnDecoder::new(
+                column,
+                projection.extract_at(output_idx),
+                &reads[output_idx],
+                positions,
+                &leaves,
+                fields,
+            )?);
         }
+
+        let prunable = install_eq_constants(
+            &column_decoders,
+            &mut leaf_decoders,
+            &plan.file_leaves,
+            column_chunks,
+            projection,
+            eq_predicates,
+        );
 
         let output_fields: Fields = column_decoders
             .iter()
@@ -127,6 +137,7 @@ impl RowGroupDecoder {
             .collect();
         Ok(Self {
             row_group_idx: row_group_metadata.index(),
+            leaf_decoders,
             column_decoders,
             schema: Arc::new(Schema::new(output_fields)),
             batch_size,
@@ -137,8 +148,7 @@ impl RowGroupDecoder {
                 .unwrap_or(row_group_metadata.num_rows() as usize),
             row_offset: 0,
             add_row_group_metadata,
-            leaf_routes,
-            prunable_columns,
+            prunable,
             pruned,
             filter_batches,
         })
@@ -166,13 +176,12 @@ impl RowGroupDecoder {
     /// exclude a pushed-down constant, allowing the whole row group to be
     /// dropped before its data pages are decoded).
     pub fn insert_page(&mut self, page: DecompressedPage, allocator: &mut SlabAllocator) {
-        let route = self.leaf_routes[page.column_idx];
-        self.column_decoders[route.column].insert_page(route.leaf, page, allocator);
+        self.leaf_decoders[page.column_idx].insert_page(page, allocator);
         if !self.pruned()
             && self
-                .prunable_columns
+                .prunable
                 .iter()
-                .any(|&column| self.column_decoders[column].dict_excludes_eq_constant())
+                .any(|p| self.leaf_decoders[p.leaf].dict_excludes_eq_constant())
         {
             // Publish to the shared flag (seen by every page of this row group):
             // the decoder discards the rest, and the decompressor can skip the
@@ -192,34 +201,39 @@ impl RowGroupDecoder {
         }
         let size = min(self.batch_size, self.total - self.row_offset);
         let available = min(
-            self.column_decoders
+            self.leaf_decoders
                 .iter()
-                .map(|decoder| decoder.available())
+                .map(|leaf| leaf.available())
                 .min()
                 .unwrap(),
             size,
         );
 
         if size > 0 && available > 0 {
+            // Every distinct leaf is decoded once; the output columns then fold
+            // their own views of the result, so two extracts over one variant
+            // column share the decode instead of repeating it.
+            let decoded = self
+                .leaf_decoders
+                .iter_mut()
+                .map(|leaf| leaf.read(allocator, available).map_err(Into::into))
+                .collect::<Result<Vec<_>>>()?;
             let columns = self
                 .column_decoders
-                .iter_mut()
-                .map(|decoder| decoder.read(allocator, available))
+                .iter()
+                .map(|decoder| decoder.read(&decoded))
                 .collect::<Result<Vec<_>>>()?;
             let record_batch = RecordBatch::try_new(self.schema.clone(), columns)?;
-            // Give each column a chance to drop rows that provably fail its
-            // pushed-down equality constant, before the batch travels any
-            // further. Most columns leave the batch untouched; dictionary
-            // encoded string columns filter it with a cheap view comparison.
-            // Never done on the materializer path, which needs every row to
-            // stay in place.
+            // Give each column carrying a pushed-down equality constant a
+            // chance to drop rows that provably fail it, before the batch
+            // travels any further. Dictionary encoded string columns filter it
+            // with a cheap view comparison; the rest leave it untouched. Never
+            // done on the materializer path, which needs every row to stay in
+            // place.
             let record_batch = if self.filter_batches {
-                self.column_decoders
-                    .iter()
-                    .enumerate()
-                    .fold(record_batch, |batch, (column, decoder)| {
-                        decoder.fast_filter_record_batch(batch, column)
-                    })
+                self.prunable.iter().fold(record_batch, |batch, p| {
+                    self.leaf_decoders[p.leaf].fast_filter_record_batch(batch, p.output_idx)
+                })
             } else {
                 record_batch
             };
@@ -234,4 +248,58 @@ impl RowGroupDecoder {
             Ok(None)
         }
     }
+}
+
+/// Installs each pushed-down equality constant on the leaf that answers it, and
+/// returns the columns the row group can then be pruned by.
+///
+/// A constant only goes in when its output column emits exactly one decoded
+/// leaf unchanged, because that is the only shape both uses of the constant can
+/// read: the row group is pruned from the leaf's own dictionary, and the batch
+/// filter compares the emitted array against the dictionary's view of the
+/// constant. A column that casts its leaf or reconstructs a variant emits
+/// something else entirely.
+///
+/// It also goes in only when every data page of that chunk is dictionary
+/// encoded. The decoder uses the constant to skip building a dictionary that
+/// excludes it, which is sound only when an excluded dictionary prunes the whole
+/// row group. A PLAIN fallback page could hold the constant even if the
+/// dictionary does not, so such a chunk is still scanned and its dictionary must
+/// be built to decode it.
+///
+/// A constant whose type does not match the leaf is dropped by the leaf decoder,
+/// which forgoes the pushdown; the query's `Filter` still applies the
+/// comparison.
+fn install_eq_constants(
+    column_decoders: &[ColumnDecoder],
+    leaf_decoders: &mut [Box<dyn LeafDecoder>],
+    file_leaves: &[usize],
+    column_chunks: &[ColumnChunkMeta],
+    projection: &Projection,
+    eq_predicates: &[ScanEqualityPredicate],
+) -> Vec<PrunableColumn> {
+    let mut prunable = Vec::new();
+    for (output_idx, &column) in projection.column_indices.iter().enumerate() {
+        let Some(leaf) = column_decoders[output_idx].untransformed_leaf() else {
+            continue;
+        };
+        // A whole-column read answers a comparison on the column itself; a
+        // pushed extract answers one that names the very path it reads.
+        let path = projection
+            .extract_at(output_idx)
+            .map(|extract| extract.path.as_slice())
+            .unwrap_or_default();
+        let Some(predicate) = eq_predicates
+            .iter()
+            .find(|p| p.column_idx == column && p.path == path)
+        else {
+            continue;
+        };
+        if !column_chunks[file_leaves[leaf]].data_pages_all_dictionary {
+            continue;
+        }
+        leaf_decoders[leaf].set_eq_constant(&predicate.value);
+        prunable.push(PrunableColumn { output_idx, leaf });
+    }
+    prunable
 }
