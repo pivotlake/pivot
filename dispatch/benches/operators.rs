@@ -845,6 +845,130 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
             )
         },
     );
+
+    // (k) Two 1-byte enum-like string keys, a handful of combinations, every
+    //     row over the full input. The pathological shape for per-row key
+    //     machinery: the table stays tiny and cache-hot, so ALL cost is the
+    //     key path itself — encode/hash/probe/verify per row into a few
+    //     buckets. A flag-by-status rollup is the canonical query.
+    bench(
+        c,
+        d,
+        "group_by/string_lowcard_rowkey",
+        rows,
+        || {
+            let sch = schema(vec![
+                Field::new("flag", DataType::Utf8View, false),
+                Field::new("status", DataType::Utf8View, false),
+            ]);
+            let flags = dict_block(&["A".into(), "N".into(), "R".into()]);
+            let statuses = dict_block(&["F".into(), "O".into()]);
+            let mut rng = Rng::new(11);
+            batch_sizes(rows)
+                .map(|n| {
+                    batch(
+                        &sch,
+                        vec![
+                            string_col(&mut rng, n, &flags),
+                            string_col(&mut rng, n, &statuses),
+                        ],
+                    )
+                })
+                .collect()
+        },
+        move |s| {
+            s.group_by_aggregate::<RowKeyExtractor, Compiled<(CountSlot,)>>(
+                vec![0, 1],
+                count_star(),
+                None,
+                RowKeySchema::new(
+                    vec![DataType::Utf8View, DataType::Utf8View],
+                    vec![false, false],
+                ),
+            )
+        },
+    );
+
+    // (l) Three integer key columns through the generic row extractor — the
+    //     many-column fixed-width shape, where per-column hashing has the most
+    //     per-row overhead to amortise. Moderate cardinality so probing mixes
+    //     inserts and hits.
+    bench(
+        c,
+        d,
+        "group_by/multi_int_rowkey",
+        rows,
+        || {
+            let sch = schema(vec![
+                Field::new("a", DataType::Int64, false),
+                Field::new("b", DataType::Int32, false),
+                Field::new("c", DataType::Int64, false),
+            ]);
+            let mut rng = Rng::new(12);
+            batch_sizes(rows)
+                .map(|n| {
+                    batch(
+                        &sch,
+                        vec![
+                            i64_keys(&mut rng, n, 100),
+                            i32_keys(&mut rng, n, 30),
+                            i64_keys(&mut rng, n, 20),
+                        ],
+                    )
+                })
+                .collect()
+        },
+        move |s| {
+            s.group_by_aggregate::<RowKeyExtractor, Compiled<(CountSlot,)>>(
+                vec![0, 1, 2],
+                count_star(),
+                Some(GroupLimit::First { limit: 10 }),
+                RowKeySchema::new(
+                    vec![DataType::Int64, DataType::Int32, DataType::Int64],
+                    vec![false, false, false],
+                ),
+            )
+        },
+    );
+
+    // (m) Verify-bound row key: an (int, ~20-byte string) tuple with few
+    //     enough groups that nearly every row is a hash hit needing key
+    //     verification against a stored blob, and long enough strings that the
+    //     comparison walk is the measured cost.
+    bench(
+        c,
+        d,
+        "group_by/rowkey_update_heavy",
+        rows,
+        || {
+            let sch = schema(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("phrase", DataType::Utf8View, false),
+            ]);
+            let dict = string_dict(512, "session label ", 20);
+            let block = dict_block(&dict);
+            let mut rng = Rng::new(13);
+            batch_sizes(rows)
+                .map(|n| {
+                    batch(
+                        &sch,
+                        vec![i64_keys(&mut rng, n, 512), string_col(&mut rng, n, &block)],
+                    )
+                })
+                .collect()
+        },
+        move |s| {
+            s.group_by_aggregate::<RowKeyExtractor, Compiled<(CountSlot,)>>(
+                vec![0, 1],
+                count_star(),
+                Some(GroupLimit::First { limit: 10 }),
+                RowKeySchema::new(
+                    vec![DataType::Int64, DataType::Utf8View],
+                    vec![false, false],
+                ),
+            )
+        },
+    );
 }
 
 /// The `(i64 id, sparse free-text phrase)` dataset shared by the row-key and
