@@ -96,14 +96,55 @@ fn pick_free_port() -> std::io::Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
+/// Where the scratch datastore lives: beside `source`, so the table and the data
+/// it was built from sit on the same filesystem.
+///
+/// This is not a detail. A benchmark's data goes on the machine's fast scratch
+/// disk while the default temp directory is usually the root volume, so a table
+/// placed there measures the root volume's bandwidth rather than the engine. On
+/// one c8gd run that was the difference between a 450ms and a 13.7s cold query,
+/// with nothing in the output to say which had been measured. The chosen path is
+/// printed for the same reason.
+///
+/// A source tree that cannot be written to (a read-only dataset mount) falls
+/// back to the default temp directory, which is correct but may not measure what
+/// the caller intended, so say so.
+fn scratch_dir(source: &Path) -> std::io::Result<tempfile::TempDir> {
+    let beside = source.parent().unwrap_or(source);
+    match tempfile::tempdir_in(beside) {
+        Ok(dir) => {
+            eprintln!("benchmark datastore: {}", dir.path().display());
+            Ok(dir)
+        }
+        Err(_) => {
+            let dir = tempfile::tempdir()?;
+            eprintln!(
+                "note: {} is not writable, so the benchmark datastore goes to {} \
+                 instead of beside the source data; if that is a different device, \
+                 cold timings measure it and not the source's",
+                beside.display(),
+                dir.path().display(),
+            );
+            Ok(dir)
+        }
+    }
+}
+
 /// Start `server_bin` on a free port over an empty scratch datastore,
 /// returning once its listener accepts connections. The catalog starts empty;
 /// the runner sends `CREATE TABLE` over the wire to populate it. Memory
 /// sizing is inherited through the environment: the server reads the same
 /// `PIVOT_MEMORY_PCT` this process was started with.
-pub fn start(server_bin: &Path, workers: Option<usize>) -> std::io::Result<ServerHandle> {
+///
+/// `source` is the benchmark's data directory; the scratch datastore is placed
+/// beside it (see [`scratch_dir`]).
+pub fn start(
+    server_bin: &Path,
+    workers: Option<usize>,
+    source: &Path,
+) -> std::io::Result<ServerHandle> {
     let port = pick_free_port()?;
-    let scratch = tempfile::tempdir()?;
+    let scratch = scratch_dir(source)?;
     let data_dir = scratch.path().join("data");
     fs::create_dir(&data_dir)?;
 

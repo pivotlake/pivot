@@ -185,7 +185,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .expect("clap enforces --server-bin unless --show");
     // No worker count here means none in the generated config, and the server
     // applies its own default (the machine's core count).
-    let server = server_handle::start(&server_bin, cli.workers)?;
+    let server = server_handle::start(&server_bin, cli.workers, &source)?;
 
     let query_filter = if cli.query.is_empty() {
         None
