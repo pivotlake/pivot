@@ -45,8 +45,6 @@ use planner::catalog::SchemaQualifiedTableName;
 
 /// Rows per row group in a merged file.
 const ROW_GROUP_ROWS: usize = 128 * 1024;
-/// Row groups per merged file, so a merge emits full-size row groups.
-const ROW_GROUPS_PER_FILE: usize = 8;
 
 /// Default compaction target: files smaller than this are merge candidates,
 /// and a merge runs once their combined size reaches it.
@@ -303,9 +301,7 @@ impl CompactJob {
         mut self,
         inputs: Vec<FileRef>,
     ) -> Result<(CatalogTable, Vec<FileRef>), crate::Error> {
-        let merged = self
-            .table
-            .compact_files(&inputs, ROW_GROUP_ROWS, ROW_GROUPS_PER_FILE)?;
+        let merged = self.table.compact_files(&inputs, ROW_GROUP_ROWS)?;
         Ok((self.table, merged))
     }
 }

@@ -159,11 +159,12 @@ fn write_cases(dispatch: &Dispatch, cases: &[Case]) -> Vec<u8> {
     let columns = cases.iter().map(|case| case.values.clone()).collect();
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
 
+    let schema = batch.schema();
     let spec = values_input(dispatch.dispatcher(), vec![batch]).record_batches();
     // A file's bytes live in ring memory the assembling worker owns, so they are
     // copied out there rather than followed to this thread.
     let mut files: Vec<Vec<u8>> =
-        encode_record_batches_spec(spec, Arc::from([]), Arc::from([]), ROWS, 1)
+        encode_record_batches_spec(spec, schema, Arc::from([]), Arc::from([]), ROWS)
             .map_each(|file: AssembledFile| {
                 file.bytes.runs().flatten().copied().collect::<Vec<u8>>()
             })
