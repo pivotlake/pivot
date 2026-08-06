@@ -3,6 +3,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use ahash::HashMap;
 use arrow_array::{Array, ArrayRef, StructArray};
 use arrow_buffer::{BooleanBuffer, NullBuffer};
 use arrow_schema::{DataType, Field, FieldRef, Fields};
@@ -51,74 +52,181 @@ pub(crate) fn leaf_range(fields: &Fields, column: usize) -> Range<usize> {
     start..start + leaf_count(&fields[column])
 }
 
-/// Returns the typed leaf that can satisfy a pushed variant extract by itself.
+/// How one projected output column resolves against this row group's layout.
 ///
-/// The path must resolve to a typed scalar leaf under `column`, and every
-/// untyped `value` leaf along the path must be null for the entire row group.
-/// Otherwise, some values may live outside the typed leaf and the caller must
-/// read the whole variant.
-pub(crate) fn try_extract_typed_leaf(
-    fields: &Fields,
-    metadata: &QueryRowGroupMetadata,
-    column: usize,
-    path: &[String],
-) -> Option<usize> {
-    let leaves = variant_shredded_leaves(fields, column, path)?;
-    let num_rows = metadata.num_rows();
-    for &value_leaf in &leaves.value_leaves {
-        if metadata
-            .get_metadata()
-            .leaf_statistics(value_leaf)?
-            .null_count?
-            != num_rows
-        {
-            return None;
-        }
-    }
-    Some(leaves.typed_leaf)
+/// The fetch side and the decoder both derive their work from the same
+/// resolution, which keeps fetched chunks aligned with their decoders when
+/// files have different shredding layouts.
+pub(crate) enum OutputRead {
+    /// Every leaf of a top-level column: a plain column read, and the fallback
+    /// for an extract this file's layout cannot satisfy any smaller way.
+    WholeColumn(Range<usize>),
+    /// The one shredded typed leaf holding every value for a scalar extract's
+    /// path.
+    TypedLeaf(usize),
+    /// The pruned path subtree a bare extract needs, folded into
+    /// `reconstructed_variant_field`.
+    PrunedVariant {
+        file_leaves: Vec<usize>,
+        reconstructed_variant_field: FieldRef,
+    },
 }
 
-/// Returns the file leaf indices needed for `projection`.
+impl OutputRead {
+    /// The read that satisfies a scalar extract of `path` from one shredded
+    /// typed leaf, or `None` when this row group cannot answer it that way.
+    ///
+    /// The path must resolve to a typed scalar leaf under `column`, and every
+    /// untyped `value` leaf along the path must be null for the entire row
+    /// group. Otherwise some values live outside the typed leaf and the caller
+    /// has to read the whole variant.
+    pub(crate) fn try_create_typed_leaf(
+        fields: &Fields,
+        metadata: &QueryRowGroupMetadata,
+        column: usize,
+        path: &[String],
+    ) -> Option<Self> {
+        let leaves = variant_shredded_leaves(fields, column, path)?;
+        let num_rows = metadata.num_rows();
+        for &value_leaf in &leaves.value_leaves {
+            if metadata
+                .get_metadata()
+                .leaf_statistics(value_leaf)?
+                .null_count?
+                != num_rows
+            {
+                return None;
+            }
+        }
+        Some(OutputRead::TypedLeaf(leaves.typed_leaf))
+    }
+
+    /// The read that satisfies a bare extract of `path` from the path's subtree
+    /// alone, or `None` when this file does not shred the path and the caller
+    /// has to read the whole variant.
+    ///
+    /// Only the metadata, the untyped `value` at each level along the path, and
+    /// the whole subtree at the path are read; sibling fields are skipped.
+    /// Folding those leaves into `reconstructed_variant_field` yields the input
+    /// variant with every off-path field dropped, so `variant_get` over it
+    /// reconstructs the sub-variant exactly as it would over the full column,
+    /// untyped fallbacks and all, while touching far fewer column chunks.
+    pub(crate) fn try_create_pruned_variant(
+        fields: &Fields,
+        column: usize,
+        path: &[String],
+    ) -> Option<Self> {
+        let mut file_leaves = Vec::new();
+        let reconstructed_variant_field = prune_variant_node(
+            &fields[column],
+            path,
+            first_leaf(fields, column),
+            &mut file_leaves,
+        )?;
+        Some(OutputRead::PrunedVariant {
+            file_leaves,
+            reconstructed_variant_field,
+        })
+    }
+
+    /// The file leaves this output reads, in depth-first order.
+    fn file_leaves(&self) -> Vec<usize> {
+        match self {
+            OutputRead::WholeColumn(leaves) => leaves.clone().collect(),
+            OutputRead::TypedLeaf(leaf) => vec![*leaf],
+            OutputRead::PrunedVariant { file_leaves, .. } => file_leaves.clone(),
+        }
+    }
+}
+
+/// Resolves each of `projection`'s output columns against this row group.
+pub(crate) fn resolve_output_reads(
+    fields: &Fields,
+    metadata: &QueryRowGroupMetadata,
+    projection: &Projection,
+) -> Vec<OutputRead> {
+    projection
+        .column_indices
+        .iter()
+        .enumerate()
+        .map(|(output_idx, &column)| {
+            if let Some(extract) = projection.extract_at(output_idx) {
+                match &extract.as_type {
+                    // A scalar extract can use a typed leaf only when it
+                    // contains every value for the path.
+                    Some(_) => {
+                        if let Some(read) = OutputRead::try_create_typed_leaf(
+                            fields,
+                            metadata,
+                            column,
+                            &extract.path,
+                        ) {
+                            return read;
+                        }
+                    }
+                    // A bare extract can use the path subtree when this file
+                    // shreds the path.
+                    None => {
+                        if let Some(read) =
+                            OutputRead::try_create_pruned_variant(fields, column, &extract.path)
+                        {
+                            return read;
+                        }
+                    }
+                }
+            }
+            OutputRead::WholeColumn(leaf_range(fields, column))
+        })
+        .collect()
+}
+
+/// The leaves a row group reads, and which of them each output column folds.
+pub(crate) struct LeafPlan {
+    /// The distinct file leaves, in the order they are fetched and decoded.
+    pub file_leaves: Vec<usize>,
+    /// Per output column, the positions within `file_leaves` it folds, in
+    /// depth-first order.
+    pub output_positions: Vec<Vec<usize>>,
+}
+
+/// Collects `reads` into the distinct leaves to fetch and each output's view of
+/// them.
 ///
-/// A plain column contributes all its leaves. A scalar variant extract uses one
-/// typed leaf when that leaf contains every value. A bare variant extract uses
-/// its pruned path subtree when possible. All other extracts contribute the
-/// complete variant column so that `variant_get` can reconstruct the result.
-///
-/// Both fetching and decoding use this resolution, which keeps fetched chunks
-/// aligned with their decoders when files have different shredding layouts.
+/// Outputs routinely want the same leaf: a query extracting four paths from one
+/// variant column this file does not shred resolves all four to the whole
+/// column. Reading that leaf once and letting each output fold its own view
+/// costs one decode instead of four.
+pub(crate) fn plan_leaves(reads: &[OutputRead]) -> LeafPlan {
+    let mut file_leaves: Vec<usize> = Vec::new();
+    let mut position_of: HashMap<usize, usize> = HashMap::default();
+    let output_positions = reads
+        .iter()
+        .map(|read| {
+            read.file_leaves()
+                .into_iter()
+                .map(|leaf| {
+                    *position_of.entry(leaf).or_insert_with(|| {
+                        file_leaves.push(leaf);
+                        file_leaves.len() - 1
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    LeafPlan {
+        file_leaves,
+        output_positions,
+    }
+}
+
+/// Returns the distinct file leaf indices needed for `projection`, in fetch
+/// order.
 pub(crate) fn projected_leaves(
     fields: &Fields,
     metadata: &QueryRowGroupMetadata,
     projection: &Projection,
 ) -> Vec<usize> {
-    let mut leaves = Vec::with_capacity(projection.column_indices.len());
-    for (output_idx, &column) in projection.column_indices.iter().enumerate() {
-        if let Some(extract) = projection.extract_at(output_idx) {
-            match &extract.as_type {
-                // A scalar extract can use a typed leaf only when it contains
-                // every value for the path.
-                Some(_) => {
-                    if let Some(typed_leaf) =
-                        try_extract_typed_leaf(fields, metadata, column, &extract.path)
-                    {
-                        leaves.push(typed_leaf);
-                        continue;
-                    }
-                }
-                // A bare extract can use the path subtree when this file
-                // shreds the path.
-                None => {
-                    if let Some(plan) = plan_variant_extract(fields, column, &extract.path) {
-                        leaves.extend(plan.file_leaves);
-                        continue;
-                    }
-                }
-            }
-        }
-        leaves.extend(leaf_range(fields, column));
-    }
-    leaves
+    plan_leaves(&resolve_output_reads(fields, metadata, projection)).file_leaves
 }
 
 /// Describes where a shredded scalar path lives in one file's column chunks.
@@ -172,39 +280,6 @@ pub(crate) fn variant_shredded_leaves(
     Some(ShreddedScalarPath {
         typed_leaf: field_first_leaf + typed_offset,
         value_leaves,
-    })
-}
-
-/// Describes the leaves and field structure for a bare variant extraction.
-///
-/// Only the metadata, the untyped `value` at each level along the path, and
-/// the whole subtree at the path are read; sibling fields are skipped. Folding
-/// the read leaves into `nest_field` yields a variant that is the input with
-/// every off-path field dropped, so `variant_get(folded, path)` reconstructs
-/// the sub-variant exactly as it would over the full column, untyped fallbacks
-/// and all, while touching far fewer column chunks.
-pub(crate) struct VariantExtractPlan {
-    /// These file leaf indices are read in depth-first order.
-    pub file_leaves: Vec<usize>,
-    /// The read leaves fold back into this pruned variant field.
-    pub nest_field: FieldRef,
-}
-
-/// Plans a bare variant extraction of `path` under variant `column`.
-///
-/// This returns `None` when the file does not shred the path. The caller then
-/// reads the whole variant.
-pub(crate) fn plan_variant_extract(
-    fields: &Fields,
-    column: usize,
-    path: &[String],
-) -> Option<VariantExtractPlan> {
-    let base = first_leaf(fields, column);
-    let mut file_leaves = Vec::new();
-    let nest_field = prune_variant_node(&fields[column], path, base, &mut file_leaves)?;
-    Some(VariantExtractPlan {
-        file_leaves,
-        nest_field,
     })
 }
 
@@ -553,6 +628,42 @@ mod tests {
         assert_eq!(variant.column(2).null_count(), 0);
     }
 
+    /// Outputs that resolve to the same leaves read them once. The third
+    /// output's typed leaf is already covered by the whole-column reads, so it
+    /// reuses that position instead of adding another chunk to fetch.
+    #[test]
+    fn verifies_outputs_share_the_leaves_they_both_read() {
+        let reads = vec![
+            OutputRead::WholeColumn(0..3),
+            OutputRead::WholeColumn(0..3),
+            OutputRead::TypedLeaf(1),
+        ];
+
+        let plan = plan_leaves(&reads);
+
+        assert_eq!(plan.file_leaves, vec![0, 1, 2]);
+        assert_eq!(
+            plan.output_positions,
+            vec![vec![0, 1, 2], vec![0, 1, 2], vec![1]]
+        );
+    }
+
+    /// Leaves no output shares are still fetched once each, in first-appearance
+    /// order, because that order is what the fetcher and the decoder agree on.
+    #[test]
+    fn verifies_distinct_leaves_keep_first_appearance_order() {
+        let reads = vec![
+            OutputRead::TypedLeaf(4),
+            OutputRead::TypedLeaf(1),
+            OutputRead::TypedLeaf(4),
+        ];
+
+        let plan = plan_leaves(&reads);
+
+        assert_eq!(plan.file_leaves, vec![4, 1]);
+        assert_eq!(plan.output_positions, vec![vec![0], vec![1], vec![0]]);
+    }
+
     #[test]
     fn verifies_typed_leaf_resolution_for_each_shredded_path() {
         let fields = Fields::from(vec![build_variant_field(&[
@@ -579,23 +690,31 @@ mod tests {
     }
 
     #[test]
-    fn verifies_extract_plan_reads_only_path_subtree() {
+    fn verifies_pruned_variant_reads_only_the_path_subtree() {
         let fields = Fields::from(vec![build_variant_field(&[
             ("age", DataType::Int64),
             ("name", DataType::Utf8),
         ])]);
 
-        let plan = plan_variant_extract(&fields, 0, &build_path(&["age"])).unwrap();
+        let read =
+            OutputRead::try_create_pruned_variant(&fields, 0, &build_path(&["age"])).unwrap();
 
-        // The plan reads metadata=0, value=1, age.value=2, and
-        // age.typed_value=3. It skips both leaves for name.
-        assert_eq!(plan.file_leaves, vec![0, 1, 2, 3]);
+        // The read takes metadata=0, value=1, age.value=2, and age.typed_value=3.
+        // It skips both leaves for name.
+        let OutputRead::PrunedVariant {
+            file_leaves,
+            reconstructed_variant_field,
+        } = read
+        else {
+            panic!("a shredded path prunes to its own subtree");
+        };
+        assert_eq!(file_leaves, vec![0, 1, 2, 3]);
         // The pruned field folds exactly the read leaves and nothing else.
-        assert_eq!(leaf_count(&plan.nest_field), plan.file_leaves.len());
+        assert_eq!(leaf_count(&reconstructed_variant_field), file_leaves.len());
     }
 
     #[test]
-    fn verifies_extract_plan_keeps_nested_path_value_leaves() {
+    fn verifies_pruned_variant_keeps_nested_path_value_leaves() {
         let id = Field::new(
             "id",
             DataType::Struct(
@@ -632,20 +751,30 @@ mod tests {
         );
         let fields = Fields::from(vec![doc]);
 
-        let plan = plan_variant_extract(&fields, 0, &build_path(&["user", "id"])).unwrap();
+        let read = OutputRead::try_create_pruned_variant(&fields, 0, &build_path(&["user", "id"]))
+            .unwrap();
 
-        // The plan reads metadata=0, value=1, user.value=2, user.id.value=3,
-        // and user.id.typed_value=4. Reading every untyped value keeps the extract
+        // The read takes metadata=0, value=1, user.value=2, user.id.value=3, and
+        // user.id.typed_value=4. Reading every untyped value keeps the extract
         // sound.
-        assert_eq!(plan.file_leaves, vec![0, 1, 2, 3, 4]);
-        assert_eq!(leaf_count(&plan.nest_field), plan.file_leaves.len());
+        let OutputRead::PrunedVariant {
+            file_leaves,
+            reconstructed_variant_field,
+        } = read
+        else {
+            panic!("a shredded path prunes to its own subtree");
+        };
+        assert_eq!(file_leaves, vec![0, 1, 2, 3, 4]);
+        assert_eq!(leaf_count(&reconstructed_variant_field), file_leaves.len());
     }
 
     #[test]
-    fn verifies_unshredded_path_has_no_extract_plan() {
+    fn verifies_unshredded_path_has_no_pruned_variant() {
         let fields = Fields::from(vec![build_variant_field(&[("age", DataType::Int64)])]);
 
-        assert!(plan_variant_extract(&fields, 0, &build_path(&["missing"])).is_none());
+        assert!(
+            OutputRead::try_create_pruned_variant(&fields, 0, &build_path(&["missing"])).is_none()
+        );
     }
 
     #[test]

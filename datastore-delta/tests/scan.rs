@@ -3,6 +3,7 @@ mod common;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
+use arrow_array::types::Int64Type;
 use arrow_array::{
     ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, StringViewArray, StructArray,
 };
@@ -1428,5 +1429,58 @@ fn scan_pushed_extract_ignores_an_equality_constant_across_a_cast() {
     assert_eq!(
         results[0].column(0).as_string::<i32>(),
         &arrow_array::StringArray::from(vec!["alice", "bob"])
+    );
+}
+
+/// Two pushed extracts on one variant column resolve to overlapping leaves: the
+/// shredded `age` leaf is also part of the whole-column read that unshredded
+/// `name` falls back to. The column is decoded once, so each output has to fold
+/// its own view of that one decode and still come back with its own value.
+#[test]
+fn scan_two_pushed_extracts_on_one_column_share_the_read() {
+    use dispatch::VariantExtract;
+    use parquet_variant_compute::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
+
+    let dispatch = dispatch(1);
+    let json: ArrayRef = Arc::new(StringArray::from(vec![
+        r#"{"age":30,"name":"alice"}"#,
+        r#"{"age":25,"name":"bob"}"#,
+    ]));
+    let shred = ShreddedSchemaBuilder::new()
+        .with_path("age", &DataType::Int64)
+        .unwrap()
+        .build();
+    let shredded = shred_variant(&json_to_variant(&json).unwrap(), &shred).unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![shredded.field("doc")])),
+        vec![Arc::new(shredded.into_inner()) as _],
+    )
+    .unwrap();
+    let (_dir, table) = parquet_table(&dispatch, &[batch], true);
+    let extract = |path: &str, as_type| {
+        Some(VariantExtract {
+            path: vec![path.to_string()],
+            as_type: Some(as_type),
+        })
+    };
+    let projection = Projection::columns_with_extracts(
+        vec![0, 0],
+        vec![
+            extract("age", DataType::Int64),
+            extract("name", DataType::Utf8View),
+        ],
+    );
+
+    let results = table_input(&dispatch, &table, projection, false)
+        .collect()
+        .unwrap();
+
+    assert_eq!(
+        results[0].column(0).as_primitive::<Int64Type>(),
+        &Int64Array::from(vec![30, 25])
+    );
+    assert_eq!(
+        results[0].column(1).as_string_view(),
+        &StringViewArray::from(vec!["alice", "bob"])
     );
 }
