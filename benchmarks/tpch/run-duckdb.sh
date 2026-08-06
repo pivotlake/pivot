@@ -22,14 +22,18 @@
 #   native:  --source is a .duckdb database file holding the base tables (see
 #     fetch-native-dbs.sh); opened read-only.
 #
-# --duckdb-process per-iteration|single  (default single)
-#   single: all of a query's iterations in ONE duckdb process, so iterations
-#     2+ reuse DuckDB's warm buffer pool - symmetric with pivot's warm server.
+# --duckdb-process suite|per-query|per-iteration  (default suite)
+#   suite: every query in ONE duckdb process, like a client session - the
+#     analogue of pivot's warm server. The page cache is dropped once before
+#     the process starts, and --sleep waits between queries.
+#   per-query: all of a query's iterations in one process started for that
+#     query, the page cache dropped before each query, so every query's first
+#     iteration is a true cold read.
 #   per-iteration: a FRESH duckdb process per timed iteration (engine-cold,
-#     page cache warm after iteration 1).
+#     page cache warm after iteration 1); caches dropped before each query,
+#     --sleep waits between iterations.
 #
-# The OS page cache is dropped once before each query (needs root, via sudo),
-# so iteration 1 is a true cold read; --no-drop-caches skips that.
+# --no-drop-caches skips every page cache drop (they need root, via sudo).
 #
 # --write-expected runs each query once and writes its rows to the suite's
 # qNN.tsv in pivot-bench's exact wire format (tab-separated, no header, NULL as
@@ -46,11 +50,11 @@ iterations=1
 drop_caches=1
 write_expected=0
 sleep_ms=0
-duckdb_process="single"
+duckdb_process="suite"
 data="parquet"
 
 usage() {
-    sed -n '3,37p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,41p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -70,8 +74,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$duckdb_process" in
-    per-iteration|single) ;;
-    *) echo "error: --duckdb-process must be per-iteration|single (got '$duckdb_process')" >&2; usage 1 ;;
+    suite|per-query|per-iteration) ;;
+    *) echo "error: --duckdb-process must be suite|per-query|per-iteration (got '$duckdb_process')" >&2; usage 1 ;;
 esac
 
 case "$data" in
@@ -149,6 +153,36 @@ if [[ "$write_expected" != "1" ]]; then
     fi
 fi
 
+# One duckdb process for the whole suite, fed over stdin: the shell emits each
+# query only after the between-queries sleep, so the process idles between
+# statements exactly like a client session would. The page cache is dropped
+# once up front and DuckDB's buffer pool persists across queries, the analogue
+# of pivot's warm server and its retained file cache.
+if [[ "$write_expected" != "1" && "$duckdb_process" == "suite" ]]; then
+    suite_cmd=(duckdb -readonly "$source_path")
+    [[ "$data" == "parquet" ]] && suite_cmd=(duckdb "$query_db")
+    flush_page_cache
+    {
+        [[ "$data" == "parquet" ]] && printf 'SET parquet_metadata_cache=true;\n'
+        printf '.timer on\n'
+        emitted=0
+        for f in "${query_files[@]}"; do
+            stem="$(basename "$f" .sql)"
+            [[ -f "$suite_dir/$stem-duckdb.sql" ]] && f="$suite_dir/$stem-duckdb.sql"
+            if [[ "$emitted" == "1" && "${sleep_ms:-0}" -gt 0 ]]; then
+                sleep "$(awk "BEGIN{print $sleep_ms/1000}")"
+            fi
+            emitted=1
+            printf '.print === %s ===\n' "$stem"
+            for ((i = 1; i <= iterations; i++)); do
+                cat "$f"
+                printf '\n'
+            done
+        done
+    } | "${suite_cmd[@]}" 2>&1 | grep -E '^=== q|Run Time|Error' || true
+    exit 0
+fi
+
 for f in "${query_files[@]}"; do
     stem="$(basename "$f" .sql)"
     [[ -f "$suite_dir/$stem-duckdb.sql" ]] && f="$suite_dir/$stem-duckdb.sql"
@@ -168,7 +202,7 @@ for f in "${query_files[@]}"; do
     fi
 
     flush_page_cache
-    if [[ "$duckdb_process" == "single" ]]; then
+    if [[ "$duckdb_process" == "per-query" ]]; then
         cmd=("${iter_cmd[@]}")
         for ((i = 1; i <= iterations; i++)); do cmd+=(-c "$sql"); done
         "${cmd[@]}" 2>&1 | grep -E 'Run Time|Error' || true
