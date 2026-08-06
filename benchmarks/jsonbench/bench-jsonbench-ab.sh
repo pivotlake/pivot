@@ -43,6 +43,9 @@ _common="$_here/bench-ab-common.sh"
 [[ -f "$_common" ]] || _common="$_here/../lib/bench-ab-common.sh"
 # shellcheck source=../lib/bench-ab-common.sh
 source "$_common"
+# Absolute, because the suite scripts this one drives sit beside it and later
+# phases do not necessarily run from here.
+own_dir="$(cd "$_here" && pwd)"
 
 pid_file="${PID_FILE:-/tmp/bench-jsonbench-ab.pid}"
 echo $$ >"$pid_file"
@@ -113,13 +116,14 @@ esac
 
 ab_common_init
 
-# The public Bluesky ndjson the whole benchmark reads. Anonymous access, so no
-# credentials and no private bucket to provision.
-data_bucket="s3://clickhouse-public-datasets/bluesky"
 # One file for the PGO profiling run, the requested scale for measurement, in
 # separate directories because pivot-bench loads every ndjson under --source.
-pgo_data="$data_root/pgo"
-measure_data="$data_root/measure"
+# `prep-jsonbench-data.sh` owns the download and lays the files out under
+# `<dir>/ndjson`.
+pgo_root="$data_root/pgo"
+measure_root="$data_root/measure"
+pgo_data="$pgo_root/ndjson"
+measure_data="$measure_root/ndjson"
 # The table's Parquet is written under TMPDIR (catalog store root); keep it on
 # the NVMe, not the small root volume.
 export TMPDIR="$data_root/tmp"
@@ -127,25 +131,27 @@ export TMPDIR="$data_root/tmp"
 # ---------------------------------------------------------------------------
 # Dataset download, backgrounded: the one PGO file lands first (it gates the
 # profiling runs), the measurement scale after (it gates the bench phase). Each
-# finished scale is marked with a .done sentinel. Anonymous S3 (--no-sign-request);
-# the files are named file_0001.json.gz .. and fetched in parallel.
+# finished scale is marked with a .done sentinel.
+#
+# The suite's own `prep-jsonbench-data.sh` fetches it, rather than a second
+# downloader here. It is the only thing that rejoins the records upstream cut in
+# half at a 64KB boundary, and both engines refuse those: DuckDB rejects the
+# whole file and pivot's cast to VARIANT fails on the fragment. A separate
+# download would hand them the raw files and every scale past four would fail.
 # ---------------------------------------------------------------------------
 download_scale() {
-    local count="$1" dest="$2"
-    if [[ -f "$dest.done" ]]; then return; fi
-    mkdir -p "$dest"
-    for ((i = 1; i <= count; i++)); do printf 'file_%04d.json.gz\n' "$i"; done \
-        | xargs -P 8 -I{} aws s3 cp --no-sign-request --only-show-errors \
-            "$data_bucket/{}" "$dest/{}"
-    touch "$dest.done"
-    echo ">>> dataset ($count file(s)) ready in $dest"
+    local count="$1" root="$2"
+    if [[ -f "$root.done" ]]; then return; fi
+    "$own_dir/prep-jsonbench-data.sh" --files "$count" --dir "$root" --engines none
+    touch "$root.done"
+    echo ">>> dataset ($count file(s)) ready in $root/ndjson"
 }
 
 wait_for_download() {
-    local dest="$1"
-    while [[ ! -f "$dest.done" ]]; do
+    local root="$1"
+    while [[ ! -f "$root.done" ]]; do
         if ! kill -0 "$download_pid" 2>/dev/null; then
-            echo "error: dataset download died before $dest finished" >&2
+            echo "error: dataset download died before $root finished" >&2
             exit 1
         fi
         sleep 5
@@ -232,7 +238,7 @@ mkdir -p "$work_dir"
 mount_nvme
 mkdir -p "$TMPDIR"
 
-( download_scale 1 "$pgo_data"; download_scale "$measure_files" "$measure_data" ) &
+( download_scale 1 "$pgo_root"; download_scale "$measure_files" "$measure_root" ) &
 download_pid=$!
 
 echo ">>> fetching commits into the baked clone"
@@ -268,7 +274,7 @@ if [[ "$mode" == "pgo" ]]; then
     wait "$b1"; wait "$b2"
 
     echo ">>> waiting for the PGO dataset"
-    wait_for_download "$pgo_data"
+    wait_for_download "$pgo_root"
     echo ">>> profiling runs (1 file)"
     profile_side "$before_dir" before jsonbench "$pgo_data"
     profile_side "$after_dir" after jsonbench "$pgo_data"
@@ -301,7 +307,7 @@ else
     save_cache "release-before" "$before_dir/target" &
     save_cache "release-after" "$after_dir/target" &
 fi
-wait_for_download "$measure_data"
+wait_for_download "$measure_root"
 wait
 
 # ---------------------------------------------------------------------------
