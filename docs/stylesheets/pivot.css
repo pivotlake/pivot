@@ -1,0 +1,105 @@
+:root {
+  --pivot-navy: #11194f;
+  --pivot-navy-soft: #202a68;
+  --pivot-mint: #10d7b3;
+  --pivot-border: rgba(17, 25, 79, 0.16);
+}
+
+body {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", sans-serif;
+}
+
+.navbar {
+  background: var(--pivot-navy) !important;
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+
+.navbar-brand,
+.navbar .nav-link {
+  color: #fff !important;
+}
+
+.pivot-hero {
+  margin: 1rem 0 2rem;
+  padding: clamp(2rem, 6vw, 4.5rem);
+  color: #fff;
+  border-radius: 1.25rem;
+  background:
+    radial-gradient(circle at 85% 20%, rgba(16, 215, 179, 0.24), transparent 28%),
+    linear-gradient(135deg, var(--pivot-navy), var(--pivot-navy-soft));
+  box-shadow: 0 1.25rem 3rem rgba(17, 25, 79, 0.18);
+}
+
+.pivot-kicker {
+  margin: 0 0 0.75rem;
+  color: var(--pivot-mint);
+  font-size: 0.8rem;
+  font-weight: 750;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.pivot-lead {
+  max-width: 42rem;
+  margin: 0;
+  font-size: clamp(1.35rem, 3vw, 2.15rem);
+  font-weight: 650;
+  line-height: 1.25;
+}
+
+.pivot-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin: 2rem 0 0;
+}
+
+.pivot-button {
+  display: inline-block;
+  padding: 0.72rem 1rem;
+  color: #fff;
+  font-weight: 650;
+  text-decoration: none;
+  border: 1px solid rgba(255, 255, 255, 0.4);
+  border-radius: 0.55rem;
+}
+
+.pivot-button:hover {
+  color: #fff;
+  border-color: #fff;
+  text-decoration: none;
+  transform: translateY(-1px);
+}
+
+.pivot-button-primary {
+  color: var(--pivot-navy);
+  background: var(--pivot-mint);
+  border-color: var(--pivot-mint);
+}
+
+.pivot-button-primary:hover {
+  color: var(--pivot-navy);
+  border-color: #73efd9;
+  background: #73efd9;
+}
+
+code {
+  color: #ba315b;
+}
+
+pre code {
+  color: inherit;
+}
+
+table:not(.highlighttable) {
+  width: 100%;
+  border: 1px solid var(--pivot-border);
+}
+
+@media (max-width: 576px) {
+  .pivot-button {
+    width: 100%;
+    text-align: center;
+  }
+}

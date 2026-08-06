@@ -56,13 +56,24 @@ jobs:
         with:
           submodules: recursive
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-docs.txt
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: .
 
-      - name: Build documentation
+      - name: Build user documentation
+        run: |
+          python -m pip install -r requirements-docs.txt
+          python -m mkdocs build --strict
+
+      - name: Build Rust API documentation
         working-directory: dispatch
         run: |
           # ci-runner-x86 is Ubuntu 20.04 with gcc 9.4, which aws-lc-sys rejects
@@ -73,12 +84,17 @@ jobs:
           fi
           cargo doc --no-deps
 
-      - name: Add redirect to dispatch crate
-        run: echo '<meta http-equiv="refresh" content="0;url=dispatch/index.html">' > target/doc/index.html
+      - name: Add Rust API documentation to the site
+        run: |
+          mkdir -p site/api
+          cp -R target/doc/. site/api/
+          printf '%s\n' '<meta http-equiv="refresh" content="0;url=dispatch/">' > site/api/index.html
 
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v4
         with:
-          path: target/doc
+          path: site
 
       - name: Deploy to GitHub Pages
         id: deployment
