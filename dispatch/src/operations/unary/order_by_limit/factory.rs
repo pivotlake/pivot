@@ -1,28 +1,24 @@
+use crate::GatherBarrier;
 use crate::operations::unary::factory::UnaryFactory;
 use crate::operations::unary::order_by_limit::{DynamicFilterSlot, OrderBy, OrderByLimit};
-use crate::operations::unary::pipeline_breaker::PipelineBreaker;
 use arrow_array::RecordBatch;
 use std::sync::Arc;
-use std::sync::mpsc;
-use std::sync::mpsc::Receiver;
 
-/// Creates one [`OrderByLimit`] operator per worker with shared channel wiring.
+/// Creates one [`OrderByLimit`] operator per worker with shared gathering state.
 ///
-/// The first factory receives the channel receiver; the rest get `None`.
-/// All share a sender so per-worker top-k results flow to a single collector.
+/// Per-worker top-k results flow into a shared gather barrier.
 /// When a dynamic-filter slot is present, every worker shares it and publishes
 /// its running boundary into it.
 pub struct OrderByLimitFactory {
     order_by: Vec<OrderBy>,
     limit: usize,
     offset: usize,
-    sender: mpsc::Sender<RecordBatch>,
-    receiver: Option<Receiver<RecordBatch>>,
+    gather: Arc<GatherBarrier<Option<RecordBatch>>>,
     dynamic_filter: Option<Arc<DynamicFilterSlot>>,
 }
 
 impl OrderByLimitFactory {
-    /// Create `worker_count` factories sharing a single mpsc channel and an
+    /// Create `worker_count` factories sharing a gather barrier and an
     /// optional shared dynamic-filter slot.
     pub fn create_for_workers(
         order_by: Vec<OrderBy>,
@@ -31,31 +27,28 @@ impl OrderByLimitFactory {
         worker_count: usize,
         dynamic_filter: Option<Arc<DynamicFilterSlot>>,
     ) -> impl IntoIterator<Item = OrderByLimitFactory> {
-        let (tx, rx) = mpsc::channel();
-        let mut rx_opt = Some(rx);
+        let gather = Arc::new(GatherBarrier::new(worker_count));
 
         (0..worker_count).map(move |_| OrderByLimitFactory {
             order_by: order_by.clone(),
             limit,
             offset,
-            sender: tx.clone(),
-            receiver: rx_opt.take(),
+            gather: gather.clone(),
             dynamic_filter: dynamic_filter.clone(),
         })
     }
 }
 
 impl UnaryFactory<RecordBatch, RecordBatch> for OrderByLimitFactory {
-    type Unary = PipelineBreaker<RecordBatch, RecordBatch, OrderByLimit>;
+    type Unary = OrderByLimit;
 
-    fn build_unary(mut self) -> PipelineBreaker<RecordBatch, RecordBatch, OrderByLimit> {
-        PipelineBreaker::Consuming(OrderByLimit::new(
+    fn build_unary(self) -> OrderByLimit {
+        OrderByLimit::new(
             self.order_by,
             self.limit,
             self.offset,
-            self.sender,
-            self.receiver.take(),
+            self.gather,
             self.dynamic_filter,
-        ))
+        )
     }
 }

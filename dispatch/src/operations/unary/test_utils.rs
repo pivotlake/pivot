@@ -4,6 +4,7 @@ use crate::operations::channels::Sender;
 use crate::operations::unary::Unary;
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter};
 use crate::waker::install_test_worker_waker;
+use crate::worker::WORKER_IDX;
 use arrow_array::{Decimal128Array, Int32Array, Int64Array, RecordBatch, StringViewArray};
 
 /// A [`Sender`] that collects all sent items for later inspection.
@@ -161,10 +162,20 @@ pub fn run_consumers<C: Consumer<RecordBatch, RecordBatch>>(
         }
     }
 
-    let mut outputters: Vec<_> = consumers
+    let mut indexed_consumers: Vec<_> = consumers.into_iter().enumerate().collect();
+    if indexed_consumers.len() > 1 {
+        // The harness has worker 0's memory context, so make worker 0 perform
+        // any completion work elected by the final barrier arrival.
+        indexed_consumers.rotate_left(1);
+    }
+    let mut outputters: Vec<_> = indexed_consumers
         .into_iter()
-        .filter_map(|c| c.into_outputter().unwrap())
+        .filter_map(|(worker_index, consumer)| {
+            WORKER_IDX.set(worker_index);
+            consumer.into_outputter().unwrap()
+        })
         .collect();
+    WORKER_IDX.set(0);
 
     let mut sender = CollectSender::new();
     let mut all_done = false;

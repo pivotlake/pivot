@@ -66,6 +66,7 @@ use tracing::info;
 // primitives and worker identity.
 pub mod arrays;
 pub mod env;
+pub mod gather_barrier;
 pub mod io;
 pub mod memory;
 pub mod waker;
@@ -86,6 +87,7 @@ use crate::worker::Worker;
 pub use api::*;
 pub use data_flow::{Error as DataFlowError, WorkStatus};
 pub use functions::*;
+pub use gather_barrier::GatherBarrier;
 pub use io::{FsRequest, HttpRequest};
 pub use memory::BUFFER_SIZE;
 pub use memory::ReadBuffer;
