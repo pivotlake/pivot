@@ -8,6 +8,9 @@ Pivot is an experimental analytical database for querying and writing Delta
 tables on local storage or S3. It speaks the PostgreSQL wire protocol, so it
 works with `psql` and existing PostgreSQL clients.
 
+[Read the documentation](https://epsio-labs.github.io/pivotdb/) or continue
+below for the shortest path to a first query.
+
 > [!WARNING]
 > Pivot is early-stage software. SQL coverage is incomplete, and configuration
 > and storage compatibility may change. It is not ready for production use.
@@ -118,10 +121,24 @@ types, and expressions return an error.
 
 ## More documentation
 
-- [`server/README.md`](server/README.md): server configuration, users, and
-  connecting clients
-- [`web/README.md`](web/README.md): building and running the web dashboard
-- [`dispatch/README.md`](dispatch/README.md): execution engine internals
+- [Documentation site](https://epsio-labs.github.io/pivotdb/): getting started,
+  configuration, SQL, and architecture
+- [Rust API documentation](https://epsio-labs.github.io/pivotdb/api/): crate and
+  library interfaces
+- [`server/README.md`](server/README.md): detailed server reference
+- [`web/README.md`](web/README.md): dashboard development
+
+To serve the documentation site locally:
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements-docs.txt
+mkdocs serve
+```
+
+Open <http://127.0.0.1:8000>. The development server reloads when a file under
+`docs/` or `mkdocs.yml` changes.
 
 To run the repository checks, use:
 
