@@ -15,6 +15,9 @@
 #   ./run-duckdb.sh --data native --source /mnt/nvme/tpch-native.duckdb --query 12
 #
 # We always report DuckDB's own `.timer` "Run Time" (query execution only).
+# Every process runs an untimed `SELECT 1` first, so the first timed query is
+# not charged for one-time session costs (thread spawn), matching
+# pivot-bench's default --warmup.
 #
 # --data parquet|native  (default parquet)
 #   parquet: --source is the dataset root directory; each table is a view over
@@ -54,7 +57,7 @@ duckdb_process="suite"
 data="parquet"
 
 usage() {
-    sed -n '3,41p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,44p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -147,9 +150,9 @@ if [[ "$write_expected" != "1" ]]; then
         query_db="$(mktemp -u)-tpch.db"
         trap 'rm -f "$query_db" "$query_db".wal' EXIT
         duckdb "$query_db" -c "$setup" >/dev/null 2>&1
-        iter_cmd=(duckdb "$query_db" -c "SET parquet_metadata_cache=true" -c ".timer on")
+        iter_cmd=(duckdb "$query_db" -c "SET parquet_metadata_cache=true" -c "SELECT 1" -c ".timer on")
     else
-        iter_cmd=(duckdb -readonly "$source_path" -c ".timer on")
+        iter_cmd=(duckdb -readonly "$source_path" -c "SELECT 1" -c ".timer on")
     fi
 fi
 
@@ -164,7 +167,7 @@ if [[ "$write_expected" != "1" && "$duckdb_process" == "suite" ]]; then
     flush_page_cache
     {
         [[ "$data" == "parquet" ]] && printf 'SET parquet_metadata_cache=true;\n'
-        printf '.timer on\n'
+        printf 'SELECT 1;\n.timer on\n'
         emitted=0
         for f in "${query_files[@]}"; do
             stem="$(basename "$f" .sql)"
