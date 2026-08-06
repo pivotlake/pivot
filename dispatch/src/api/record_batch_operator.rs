@@ -57,8 +57,8 @@ use crate::operations::{
     CteScanFactory, Distinct, DynamicFilterSlot, DynamicRowKey, F64Cell, FilterFactory,
     GroupFactory, GroupLimit, IntCell, JoinKey, JoinKind, JoinRecordBatchOperatorFactory, JoinSpec,
     KeyExtractor, LimitFactory, MapFactory, NoOpNullaryFactory, NullaryFactory,
-    NullaryOperatorFactory, OrderBy, OrderByLimitFactory, PackedKey, SingleColumnKey, UnaryFactory,
-    UnaryOperatorFactory, WideCell, create_join_factories,
+    NullaryOperatorFactory, OrderBy, OrderByFactory, OrderByLimitFactory, PackedKey,
+    SingleColumnKey, UnaryFactory, UnaryOperatorFactory, WideCell, create_join_factories,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle, DataFlowStats};
 pub const RECORD_BATCH_SIZE: usize = 8192;
@@ -497,6 +497,42 @@ impl RecordBatchOperatorSpec {
             offset,
             worker_count,
             dynamic_filter,
+        ))
+    }
+
+    /// SQL `ORDER BY` with no LIMIT: emit the whole input sorted by
+    /// `order_by`.
+    ///
+    /// A parallel merge sort modeled on rayon's: each worker sorts batches as
+    /// they arrive (batches already in order pass through untouched), and the
+    /// workers' sorted runs merge through a tree whose merges split into
+    /// stealable slices, so even the final merge runs across every worker.
+    /// See the `operations::unary::order_by` module.
+    pub fn order_by(self, order_by: Vec<OrderBy>) -> Self {
+        let worker_count = self.worker_count();
+        self.unary(OrderByFactory::create_for_workers(
+            Vec::new(),
+            order_by,
+            worker_count,
+        ))
+    }
+
+    /// Like [`order_by`](Self::order_by), grouped: rows come out clustered by
+    /// their `partition_columns` tuple (partitions in tuple order, every
+    /// emitted batch single-partition) and sorted by `order_by` within each
+    /// partition. Sorting happens per partition, so partition columns are
+    /// never compared row against row. An empty `order_by` groups without
+    /// ordering inside partitions.
+    pub fn order_by_per_partition(
+        self,
+        partition_columns: Vec<usize>,
+        order_by: Vec<OrderBy>,
+    ) -> Self {
+        let worker_count = self.worker_count();
+        self.unary(OrderByFactory::create_for_workers(
+            partition_columns,
+            order_by,
+            worker_count,
         ))
     }
 

@@ -218,6 +218,18 @@ impl OrderBy {
             nulls_first,
         }
     }
+
+    pub fn column_idx(&self) -> usize {
+        self.column_idx
+    }
+
+    pub fn descending(&self) -> bool {
+        self.descending
+    }
+
+    pub fn nulls_first(&self) -> bool {
+        self.nulls_first
+    }
 }
 
 /// Merge multiple already-sorted top-k batches into a single global top-k.

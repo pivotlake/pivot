@@ -9,6 +9,8 @@ arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow = { workspace = true, features = ["prettyprint"] }
 arrow-buffer = { workspace = true }
+arrow-ord = { workspace = true }
+arrow-row = { workspace = true }
 
 crossbeam-deque = { workspace = true }
 core_affinity = { workspace = true }
