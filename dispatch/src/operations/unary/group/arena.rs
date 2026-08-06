@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 ///
 /// Buffer pointers are stored in a plain pointer array for zero-overhead resolution.
 /// Safety: `next_idx` (atomic) guarantees each slot is written by exactly one thread.
-/// Cross-thread visibility is ensured by the mpsc channel between consume and merge phases.
+/// Cross-thread visibility is ensured by the gather barrier between consume and merge phases.
 pub struct SharedArena {
     /// We want to have all u128 views point to a centralized place shared by all workers;
     /// this allows us in merge time to simply copy the u128s as is when creating the record batch,

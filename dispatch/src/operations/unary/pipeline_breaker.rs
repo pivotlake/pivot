@@ -1,7 +1,7 @@
 //! Pipeline breakers: operators that must see all input before producing output.
 //!
 //! A normal unary operator (like filter or project) can emit output for each input
-//! item immediately. A pipeline breaker (like order-by-limit or group-by) must
+//! item immediately. A pipeline breaker (like group-by) must
 //! accumulate all input first, then emit results in a separate output phase.
 //!
 //! [`PipelineBreaker`] implements [`Unary`] as a state machine with three phases:

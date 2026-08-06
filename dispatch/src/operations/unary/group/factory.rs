@@ -1,11 +1,11 @@
 //! Factory for creating per-worker [`Group`] instances.
 //!
 //! [`GroupFactory::create_for_workers`] allocates the shared state once
-//! (arena, hash state, injector, channel) and produces one factory per
-//! worker. Only the first factory receives the channel receiver; the rest
-//! get `None`. Each factory is consumed by [`build_unary`](GroupFactory::build_unary)
+//! (arena, hash state, injector, gather barrier) and produces one factory per
+//! worker. Each factory is consumed by [`build_unary`](GroupFactory::build_unary)
 //! to produce the actual [`Group`] operator.
 
+use crate::GatherBarrier;
 use crate::numa::Topology;
 use crate::operations::UnaryFactory;
 use crate::operations::unary::group::arena::SharedArena;
@@ -18,8 +18,8 @@ use crate::operations::unary::pipeline_breaker::PipelineBreaker;
 use ahash::RandomState;
 use arrow_array::RecordBatch;
 use crossbeam_deque::Injector;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, mpsc};
 
 /// Creates one [`Group`] operator per worker, with shared state wired up.
 ///
@@ -28,10 +28,7 @@ use std::sync::{Arc, mpsc};
 /// - A [`RandomState`] so hashes are consistent across workers
 /// - One [`Injector`] per NUMA node for work-stealing during the output phase
 ///   (a merge job reads one node's tables, so it queues on that node)
-/// - An mpsc channel for collecting per-worker tables after consumption
-///
-/// Only the first worker receives the channel receiver; it will drain
-/// the channel and inject partition jobs during the output phase.
+/// - A [`GatherBarrier`] collecting per-worker tables after consumption
 pub struct GroupFactory<K: KeyExtractor, V: AggregationValue + ?Sized> {
     key_arena: Arc<SharedArena>,
     value_arena: Arc<SharedArena>,
@@ -43,9 +40,8 @@ pub struct GroupFactory<K: KeyExtractor, V: AggregationValue + ?Sized> {
     hash_state: RandomState,
     injectors: Arc<Vec<Injector<PartitionJob<K, V>>>>,
     partition_jobs_injected: Arc<AtomicBool>,
-
-    sender: mpsc::Sender<AggregatedTableOutput<K, V>>,
-    receiver: Option<mpsc::Receiver<AggregatedTableOutput<K, V>>>,
+    zero_hash_pending: Arc<AtomicBool>,
+    gather: Arc<GatherBarrier<AggregatedTableOutput<K, V>>>,
     /// Radix scatter config with the per-worker bucket count sized for the pool
     /// (see [`get_scatter_bucket_count_for_worker`](super::get_scatter_bucket_count_for_worker)).
     radix: RadixConfig,
@@ -74,8 +70,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupFactory<K, V> {
                 .collect::<Vec<_>>(),
         );
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = mpsc::channel::<_>();
-        let mut rx_opt = Some(rx);
+        let zero_hash_pending = Arc::new(AtomicBool::new(false));
+        let gather = Arc::new(GatherBarrier::new(topology.total_workers()));
         let radix = RadixConfig {
             partitions: crate::operations::unary::group::get_scatter_bucket_count_for_worker(
                 topology.total_workers(),
@@ -94,8 +90,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupFactory<K, V> {
             hash_state: hash_state.clone(),
             injectors: injectors.clone(),
             partition_jobs_injected: partition_jobs_injected.clone(),
-            sender: tx.clone(),
-            receiver: rx_opt.take(),
+            zero_hash_pending: zero_hash_pending.clone(),
+            gather: gather.clone(),
             radix,
         })
     }
@@ -106,7 +102,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> UnaryFactory<RecordBatch, Re
 {
     type Unary = PipelineBreaker<RecordBatch, RecordBatch, Group<K, V>>;
 
-    fn build_unary(mut self) -> PipelineBreaker<RecordBatch, RecordBatch, Group<K, V>> {
+    fn build_unary(self) -> PipelineBreaker<RecordBatch, RecordBatch, Group<K, V>> {
         PipelineBreaker::Consuming(Group::new(
             self.key_arena,
             self.value_arena,
@@ -117,9 +113,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> UnaryFactory<RecordBatch, Re
             self.key_config,
             self.output_limit,
             self.count_only,
-            self.sender,
-            self.receiver.take(),
+            self.gather,
             self.partition_jobs_injected,
+            self.zero_hash_pending,
             self.radix,
         ))
     }

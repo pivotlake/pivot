@@ -26,12 +26,12 @@
 //! Strings and low-cardinality keys never switch and stay fully in-place.
 //!
 //! When consumption finishes, each worker sends its tables (plus any radix
-//! buffers) to a shared mpsc channel and transitions into a [`GroupOutputter`].
+//! buffers) to a shared gather barrier and transitions into a [`GroupOutputter`].
 //!
 //! ## Phase 2: Output / Merge (parallel via work-stealing)
 //!
-//! The first worker to enter the output phase drains the channel (collecting
-//! tables from all workers) and publishes [`PARTITIONS`] independent
+//! The final worker to reach the gather barrier collects every worker's tables
+//! and publishes [`PARTITIONS`] independent
 //! [`PartitionJob`]s to a shared [`Injector`]. Each partition covers a
 //! disjoint range of hash values (determined by the top `log2(PARTITIONS)`
 //! bits), so the jobs are embarrassingly parallel.
@@ -109,6 +109,7 @@ pub use values::{
     SumSlot, U128Max, U128Min, U128Sum, WideCell, WideSum, WorkerContext,
 };
 
+use crate::gather_barrier::GatherBarrier;
 use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
@@ -116,7 +117,6 @@ use crate::operations::unary::group::hashtables::{
     AggregatedTable, AggregatedTableOutput, DEFAULT_CAPACITY, MAX_LOAD_FACTOR, MultiSlabTable,
     PartitionBuffers, RadixConfig, entry_stride,
 };
-use crate::waker::waker_set;
 use crate::worker::current_node;
 use ahash::RandomState;
 use arena::SharedArena;
@@ -124,8 +124,8 @@ use arrow_array::RecordBatch;
 use arrow_buffer::Buffer;
 use arrow_schema::{ArrowError, DataType};
 use crossbeam_deque::{Injector, Steal};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
 use thiserror::Error;
 use unary::pipeline_breaker::{Consumer, Outputter};
 
@@ -228,8 +228,8 @@ fn get_scatter_bucket_count_for_worker(total_workers: usize) -> usize {
 ///
 /// During the consume phase, each worker owns a `Group` that hashes incoming
 /// rows and inserts them into its local [`AggregatedTable`]. When consumption
-/// finishes, the accumulated tables are sent to a shared channel and the
-/// `Group` transitions into a [`GroupOutputter`] for the merge phase.
+/// finishes, the accumulated tables are published to a shared gather barrier,
+/// and the `Group` transitions into a [`GroupOutputter`] for the merge phase.
 pub struct Group<K: KeyExtractor, V: AggregationValue + ?Sized> {
     key_cols: Vec<usize>,
     /// Slots drive the per-batch value reader (which column / `COUNT` vs `SUM`).
@@ -240,7 +240,7 @@ pub struct Group<K: KeyExtractor, V: AggregationValue + ?Sized> {
     key_config: K::Config,
 
     aggregated_table: AggregatedTable<K, V>,
-    sender: mpsc::Sender<AggregatedTableOutput<K, V>>,
+    gather: Arc<GatherBarrier<AggregatedTableOutput<K, V>>>,
     outputter: GroupOutputter<K, V>,
 }
 
@@ -256,9 +256,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
         key_config: K::Config,
         output_limit: Option<GroupLimit>,
         count_only: bool,
-        sender: mpsc::Sender<AggregatedTableOutput<K, V>>,
-        receiver: Option<mpsc::Receiver<AggregatedTableOutput<K, V>>>,
+        gather: Arc<GatherBarrier<AggregatedTableOutput<K, V>>>,
         partition_jobs_injected: Arc<AtomicBool>,
+        zero_hash_pending: Arc<AtomicBool>,
         radix: RadixConfig,
     ) -> Self {
         let shared_context = <V::SharedContext as SharedContext>::build(&value_slots, &value_arena);
@@ -291,8 +291,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
                 key_arena,
                 node: current_node(),
                 injectors,
-                receiver,
                 partition_jobs_injected,
+                zero_hash_pending,
                 key_config,
                 shared_context,
                 value_output_types,
@@ -301,7 +301,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
                 output_allocator: None,
                 output_accumulator: None,
             },
-            sender,
+            gather,
             aggregated_table,
         }
     }
@@ -329,16 +329,17 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Consumer<RecordBatch, Record
 
     fn into_outputter(self) -> unary::Result<Option<Self::Outputter>> {
         let tables = self.aggregated_table.flush();
-        self.sender.send(tables).unwrap();
+        let _ = self.gather.arrive(tables, |values| {
+            self.outputter.create_partition_jobs(values)
+        });
         Ok(Some(self.outputter))
     }
 }
 
 /// Handles the output (merge) phase of a GROUP BY.
 ///
-/// Only one worker holds the `receiver` end of the channel (assigned by
-/// [`GroupFactory`]). That worker drains the channel, collects all per-worker
-/// tables, and publishes [`PARTITIONS`] [`PartitionJob`]s to the shared
+/// The last worker to reach the gather barrier collects all per-worker tables
+/// and publishes [`PARTITIONS`] [`PartitionJob`]s to the shared
 /// work-stealing [`Injector`]. All workers (including the one that injected)
 /// then steal and execute jobs until the injector is empty.
 pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue + ?Sized> {
@@ -351,8 +352,8 @@ pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue + ?Sized> {
     injectors: Arc<Vec<Injector<PartitionJob<K, V>>>>,
     /// This worker's node, i.e. which of `injectors` is local to it.
     node: usize,
-    receiver: Option<mpsc::Receiver<AggregatedTableOutput<K, V>>>,
     partition_jobs_injected: Arc<AtomicBool>,
+    zero_hash_pending: Arc<AtomicBool>,
     key_config: K::Config,
     /// The value's shared context, threaded into each [`PartitionJob`] so the merge
     /// folds existing entries via [`AggregationValue::merge_from`] and the output
@@ -377,8 +378,8 @@ pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// drains.
     ///
     /// `Option` because it can't exist before the worker's first job: the
-    /// per-output-phase buffers it needs are computed once (by whichever worker
-    /// drained the channel) and arrive attached to each [`PartitionJob`], so a
+    /// per-output-phase buffers it needs are computed once (by the final worker
+    /// at the gather barrier) and arrive attached to each [`PartitionJob`], so a
     /// worker only learns them from the first job it steals. A worker running only
     /// count-only `COUNT(DISTINCT)` jobs never builds one.
     output_accumulator: Option<output::OutputAccumulator<K, V>>,
@@ -386,7 +387,7 @@ pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue + ?Sized> {
 
 /// One (NUMA node, partition) merge work unit.
 ///
-/// Created by the [`GroupOutputter`] that holds the receiver and pushed to the
+/// Created by the final worker to reach the gather barrier and pushed to the
 /// node's [`Injector`] for work-stealing execution. Each job merges one node's
 /// source tables for partition `index` into one result table. On a single-node
 /// pool (`cross_node_merge` is `None`) that result is the partition's final
@@ -536,15 +537,11 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
 }
 
 impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
-    /// Drain every worker's tables off the channel, size the merge from the merged
+    /// Combine every worker's gathered tables, size the merge from the merged
     /// distinct estimate, and publish one [`PartitionJob`] per merge partition to
     /// the shared injector (plus, for `COUNT(DISTINCT)`, the out-of-band 0-hash count
-    /// row). Run exactly once, by whichever worker holds the receiver.
-    fn create_partition_jobs(
-        &self,
-        rx: mpsc::Receiver<AggregatedTableOutput<K, V>>,
-        sender: &mut dyn Sender<RecordBatch>,
-    ) -> unary::Result<()> {
+    /// row). Run exactly once, by the last worker to reach the gather barrier.
+    fn create_partition_jobs(&self, outputs: Vec<AggregatedTableOutput<K, V>>) {
         let node_count = self.injectors.len();
         let mut tables_by_node: Vec<Vec<MultiSlabTable<K::Persisted, V>>> =
             (0..node_count).map(|_| Vec::new()).collect();
@@ -561,7 +558,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // merge targets (safe); under-counting is what forces mid-merge resizes.
         let mut non_switched_groups = 0usize;
         let mut contributing_workers = 0usize;
-        for out in rx.into_iter() {
+        for out in outputs {
             contributing_workers += 1;
             if out.buffers.is_none() {
                 non_switched_groups += out.tables.iter().map(|t| t.len()).sum::<usize>();
@@ -742,28 +739,16 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // the flag also sees every job pushed above it. With relaxed ordering
         // another core may observe the flag before the pushes and conclude
         // from a still-empty queue that the merge phase is over.
-        self.partition_jobs_injected.store(true, Ordering::Release);
-
         // Exact COUNT(DISTINCT): the keys-only consume excluded the single
         // key whose bijective hash is 0 (it collides with the empty sentinel)
         // and flagged it instead. Emit it now as one extra count row so the
-        // downstream SUM includes it. Only one worker drains the channel, so
-        // this fires exactly once.
+        // downstream SUM includes it. One outputter claims this after the
+        // gather barrier completes.
         if self.count_only && zero_hash_seen {
-            use arrow_array::Int64Array;
-            use arrow_schema::{DataType, Field, Schema};
-            let arr = Arc::new(Int64Array::from(vec![1i64]));
-            let field = Field::new("v0", DataType::Int64, false);
-            let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![arr])
-                .map_err(|e| unary::Error::from(Error::from(e)))?;
-            sender
-                .send(batch)
-                .map_err(|e| unary::Error::from(Error::from(e)))?;
+            self.zero_hash_pending.store(true, Ordering::Relaxed);
         }
 
-        // Wake up all workers (on every node) so they can start working on partitions
-        waker_set().notify_all();
-        Ok(())
+        self.partition_jobs_injected.store(true, Ordering::Release);
     }
 }
 
@@ -771,8 +756,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Outputter<RecordBatch>
     for GroupOutputter<K, V>
 {
     fn output(&mut self, sender: &mut dyn Sender<RecordBatch>) -> unary::Result<bool> {
-        if let Some(rx) = self.receiver.take() {
-            self.create_partition_jobs(rx, sender)?;
+        if self.zero_hash_pending.swap(false, Ordering::AcqRel) {
+            output::emit_count(1, sender).map_err(unary::Error::from)?;
         }
 
         // Claim a job, trying the own node's queue first (its sources are
@@ -941,8 +926,8 @@ mod tests {
         let state = RandomState::new();
         let injector = Arc::new(vec![Injector::new()]);
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = mpsc::channel();
-        let mut rx_opt = Some(rx);
+        let zero_hash_pending = Arc::new(AtomicBool::new(false));
+        let gather = Arc::new(GatherBarrier::new(worker_count));
 
         let groups: Vec<_> = (0..worker_count)
             .map(|_| {
@@ -956,14 +941,13 @@ mod tests {
                     K::Config::default(),
                     output_limit,
                     false,
-                    tx.clone(),
-                    rx_opt.take(),
+                    gather.clone(),
                     partition_jobs_injected.clone(),
+                    zero_hash_pending.clone(),
                     radix,
                 )
             })
             .collect();
-        drop(tx);
 
         run_consumers(groups, worker_batches)
     }
@@ -1277,8 +1261,8 @@ mod tests {
         let state = RandomState::new();
         let injector = Arc::new(vec![Injector::new()]);
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));
-        let (tx, rx) = mpsc::channel();
-        let mut rx_opt = Some(rx);
+        let zero_hash_pending = Arc::new(AtomicBool::new(false));
+        let gather = Arc::new(GatherBarrier::new(worker_count));
         let groups: Vec<_> = (0..worker_count)
             .map(|_| {
                 Group::<RowKeyExtractor, V>::new(
@@ -1291,14 +1275,13 @@ mod tests {
                     schema.clone(),
                     None,
                     false,
-                    tx.clone(),
-                    rx_opt.take(),
+                    gather.clone(),
                     partition_jobs_injected.clone(),
+                    zero_hash_pending.clone(),
                     radix,
                 )
             })
             .collect();
-        drop(tx);
         run_consumers(groups, worker_batches)
     }
 
