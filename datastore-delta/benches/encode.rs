@@ -25,6 +25,15 @@
 //!   group owns, and their lengths pack as deltas.
 //! - `mixed`, the shape of a fact table (keys, money, dates and text), which is
 //!   what a table load actually looks like.
+//! - `mixed_shuffled_key`, the same fact table with its lead key scattered, and
+//!   the sort-key cases over it: `sort_shuffled`, where every file's rows are
+//!   reordered by the integer key as the file is cut, and `sort_presorted`,
+//!   the same sort key over rows fed in order. `sort_shuffled` against
+//!   `mixed_shuffled_key` is what the reorder costs on scattered input;
+//!   `sort_presorted` against `mixed` is its floor on ordered input.
+//! - `sort_string` and `sort_string_int`, the same rows sorted by the comment
+//!   strings (alone, then with the integer key breaking ties). A string key
+//!   has no radix form, so these are what the comparison-sort path costs.
 //! - `variant`, a column of JSON documents, the one shape that carries a struct
 //!   of leaves through accumulation and picks a shredding layout per file.
 //!
@@ -252,6 +261,17 @@ fn string_batches(rows: usize) -> Vec<RecordBatch> {
 }
 
 fn mixed_batches(rows: usize) -> Vec<RecordBatch> {
+    mixed_batches_keyed(rows, true)
+}
+
+/// The mixed shape with its lead key scattered instead of climbing: on its own
+/// a control with no sort key, and under `sort_by` the input every file must
+/// reorder.
+fn mixed_shuffled_key_batches(rows: usize) -> Vec<RecordBatch> {
+    mixed_batches_keyed(rows, false)
+}
+
+fn mixed_batches_keyed(rows: usize, key_in_order: bool) -> Vec<RecordBatch> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("order_key", DataType::Int64, false),
         Field::new("part_key", DataType::Int64, false),
@@ -262,8 +282,13 @@ fn mixed_batches(rows: usize) -> Vec<RecordBatch> {
     let comments = string_dict((rows / 4).max(1), "a line of commentary ", 44);
     let mut rng = Rng::new(3);
     batches(&schema, rows, |done, n| {
+        let order_key = if key_in_order {
+            sorted_keys(n, done as i64 * 4)
+        } else {
+            keys(&mut rng, n, 20_000_000)
+        };
         vec![
-            sorted_keys(n, done as i64 * 4),
+            order_key,
             keys(&mut rng, n, 20_000_000),
             money(&mut rng, n),
             dates(&mut rng, n),
@@ -340,74 +365,140 @@ fn insert(dispatch: &Dispatch, catalog: &PivotCatalog, input: Vec<RecordBatch>) 
     transaction.rollback();
 }
 
+/// The `mixed` fact-table columns, shared by the plain and sort-key cases.
+fn mixed_columns() -> Vec<Column> {
+    vec![
+        column("order_key", Type::Int64),
+        column("part_key", Type::Int64),
+        column(
+            "price",
+            Type::Decimal {
+                precision: 12,
+                scale: 2,
+            },
+        ),
+        column("ship_date", Type::Date),
+        column("comment", Type::Utf8),
+    ]
+}
+
+/// One bench case: a table shape, the batches written into it, and the sort
+/// key the write orders by (empty for an unsorted table).
+struct EncodeCase {
+    name: &'static str,
+    rows: usize,
+    columns: Vec<Column>,
+    sort_by: &'static [&'static str],
+    input: Vec<RecordBatch>,
+}
+
+fn encode_case(
+    name: &'static str,
+    rows: usize,
+    columns: Vec<Column>,
+    sort_by: &'static [&'static str],
+    input: Vec<RecordBatch>,
+) -> EncodeCase {
+    EncodeCase {
+        name,
+        rows,
+        columns,
+        sort_by,
+        input,
+    }
+}
+
 fn bench_encode(c: &mut Criterion, dispatch: &Dispatch, rows: usize) {
-    let cases: Vec<(&str, usize, Vec<Column>, Vec<RecordBatch>)> = vec![
-        (
+    let cases: Vec<EncodeCase> = vec![
+        encode_case(
             "delta_sorted",
             rows,
             columns(&["order_key", "line_key"], Type::Int64),
+            &[],
             delta_sorted_batches(rows),
         ),
-        (
+        encode_case(
             "delta_scattered",
             rows,
             columns(&["part_key", "supplier_key"], Type::Int64),
+            &[],
             delta_scattered_batches(rows),
         ),
-        (
+        encode_case(
             "dictionary",
             rows,
             columns(&["quantity", "line_number"], Type::Int64),
+            &[],
             dictionary_batches(rows),
         ),
-        (
+        encode_case(
             "strings",
             rows,
             columns(&["comment", "status"], Type::Utf8),
+            &[],
             string_batches(rows),
         ),
-        (
-            "mixed",
+        encode_case("mixed", rows, mixed_columns(), &[], mixed_batches(rows)),
+        encode_case(
+            "mixed_shuffled_key",
             rows,
-            vec![
-                column("order_key", Type::Int64),
-                column("part_key", Type::Int64),
-                column(
-                    "price",
-                    Type::Decimal {
-                        precision: 12,
-                        scale: 2,
-                    },
-                ),
-                column("ship_date", Type::Date),
-                column("comment", Type::Utf8),
-            ],
+            mixed_columns(),
+            &[],
+            mixed_shuffled_key_batches(rows),
+        ),
+        encode_case(
+            "sort_shuffled",
+            rows,
+            mixed_columns(),
+            &["order_key"],
+            mixed_shuffled_key_batches(rows),
+        ),
+        encode_case(
+            "sort_presorted",
+            rows,
+            mixed_columns(),
+            &["order_key"],
             mixed_batches(rows),
         ),
-        (
+        encode_case(
+            "sort_string",
+            rows,
+            mixed_columns(),
+            &["comment"],
+            mixed_shuffled_key_batches(rows),
+        ),
+        encode_case(
+            "sort_string_int",
+            rows,
+            mixed_columns(),
+            &["comment", "order_key"],
+            mixed_shuffled_key_batches(rows),
+        ),
+        encode_case(
             "variant",
             rows / VARIANT_ROW_SHARE,
             columns(&["attrs"], Type::Variant),
+            &[],
             variant_batches(rows / VARIANT_ROW_SHARE),
         ),
     ];
 
     let mut group = c.benchmark_group("encode");
-    for (name, case_rows, columns, input) in &cases {
+    for case in &cases {
         // Each case writes into its own table on tmpfs, so the measurement is
         // the pipeline rather than the disk under it. The rows are rolled back
         // instead of committed, and the files they left behind are cleared
         // between iterations, so the directory holds one run's output at a time.
         let dir = TempDir::new_in(OUTPUT_ROOT).expect("a writable tmpfs directory");
-        let catalog = table_over(dispatch, dir.path(), columns.clone());
-        group.throughput(Throughput::Elements(*case_rows as u64));
-        group.bench_function(*name, |b| {
+        let catalog = table_over(dispatch, dir.path(), case.columns.clone(), case.sort_by);
+        group.throughput(Throughput::Elements(case.rows as u64));
+        group.bench_function(case.name, |b| {
             b.iter_batched(
                 || {
                     clear_files(dir.path());
                     // The batches are Arc-backed, so a clone hands the pipeline
                     // its own handles without copying any values.
-                    input.clone()
+                    case.input.clone()
                 },
                 |batches| insert(dispatch, &catalog, black_box(batches)),
                 BatchSize::PerIteration,
@@ -433,8 +524,14 @@ fn columns(names: &[&str], col_type: Type) -> Vec<Column> {
         .collect()
 }
 
-/// A catalog holding one table of `columns` over `dir`.
-fn table_over(dispatch: &Dispatch, dir: &Path, columns: Vec<Column>) -> PivotCatalog {
+/// A catalog holding one table of `columns` over `dir`, sorted by `sort_by`
+/// where one is given.
+fn table_over(
+    dispatch: &Dispatch,
+    dir: &Path,
+    columns: Vec<Column>,
+    sort_by: &[&str],
+) -> PivotCatalog {
     let datastore = DeltaDatastore::open_local(dir, dispatch.dispatcher()).unwrap();
     let catalog = PivotCatalog::new(
         HashMap::from([(
@@ -447,6 +544,9 @@ fn table_over(dispatch: &Dispatch, dir: &Path, columns: Vec<Column>) -> PivotCat
 
     let mut options = HashMap::new();
     options.insert("path".to_string(), dir.to_string_lossy().into_owned());
+    if !sort_by.is_empty() {
+        options.insert("sort_by".to_string(), sort_by.join(", "));
+    }
     let creation = catalog.begin_transaction();
     creation
         .bind_create_table(CreateTableRequest {

@@ -632,7 +632,6 @@ impl CatalogTable {
         &mut self,
         inputs: &[FileRef],
         target_rows_per_group: usize,
-        target_row_groups_per_file: usize,
     ) -> crate::Result<Vec<FileRef>> {
         // Scan only the inputs and re-encode their rows. They share one partition
         // tuple, so re-applying the table's partition/sort spec reproduces that
@@ -653,10 +652,10 @@ impl CatalogTable {
             self.declared_columns(),
             uploaded_files.clone(),
             scan,
+            parquet.schema().clone(),
             Arc::from(self.partition_by()),
             Arc::from(self.sort_by()),
             target_rows_per_group,
-            target_row_groups_per_file,
             &self.dispatcher,
         );
         // Drive encode → upload to completion; the emitted row-count batch is

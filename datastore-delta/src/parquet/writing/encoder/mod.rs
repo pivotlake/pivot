@@ -11,8 +11,8 @@
 //! into its leaves ([`leaves`]) and each is encoded on its own. A flat column is
 //! its own single leaf and takes the same path it always did; a shredded variant
 //! yields one leaf per primitive under it. Flattening here rather than in the
-//! upstream [`partition`](super::partition) breaker keeps that stage cheap and
-//! serial — the levels and the encoding are computed on the parallel side.
+//! upstream [`indexer`](super::indexer) keeps that stage cheap and serial —
+//! the levels and the encoding are computed on the parallel side.
 //!
 //! The two strategies live in [`plain`] and [`dictionary`]; both frame their
 //! pages with [`pages`] (which also cuts a leaf into pages) — see those modules
@@ -32,9 +32,10 @@ use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult};
 use thriftparquet::footer::Statistics;
 use thriftparquet::general::Encoding;
 
-use super::error::WriteResult;
+use super::error::{WriteError, WriteResult};
 use super::stats;
 use super::types::{ColumnChunkJob, EncodedColumnChunk, EncodedLeaf};
+use dispatch::arrays::take::concat_chunks;
 use leaves::Leaf;
 
 pub(super) type ColumnEncoderFactory = DefaultUnaryFactory<ColumnEncoder>;
@@ -63,7 +64,15 @@ impl Unary<ColumnChunkJob, EncodedColumnChunk> for ColumnEncoder {
         let allocator = self
             .allocator
             .get_or_insert_with(|| SlabAllocator::new(false));
-        let leaves = encode_column_chunk(field, &job.values, allocator)?;
+        // The row group's rows arrive as the chunks they concatenate from:
+        // materializing them is per-column work, so it parallelizes with the
+        // encoding, and the stitched values are encoded while hot.
+        let values = concat_chunks(allocator, &job.chunks).map_err(WriteError::from)?;
+        let values = match &job.shredding {
+            Some(shredding) => super::shredding::shred_gathered_column(&values, shredding)?,
+            None => values,
+        };
+        let leaves = encode_column_chunk(field, &values, allocator)?;
         sender.send(EncodedColumnChunk {
             header: job.header,
             column: job.column,

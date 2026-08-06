@@ -1196,7 +1196,7 @@ fn compact_files_merges_small_files_into_one() {
     table.refresh().unwrap();
     let inputs = table.file_refs();
     assert_eq!(inputs.len(), 2, "two inserts wrote two files");
-    let merged = table.compact_files(&inputs, 128 * 1024, 8).unwrap();
+    let merged = table.compact_files(&inputs, 128 * 1024).unwrap();
 
     assert_eq!(merged.len(), 1, "the two inputs merge into one file");
     let parquet = current_parquet(&datastore, "t");
@@ -1225,7 +1225,7 @@ fn compact_files_deletes_uploaded_outputs_when_delta_commit_fails() {
     let saved_delta_log = dir.path().join("_delta_log.saved");
     std::fs::rename(&delta_log, &saved_delta_log).unwrap();
     File::create(&delta_log).unwrap();
-    let result = table.compact_files(&inputs, 128 * 1024, 8);
+    let result = table.compact_files(&inputs, 128 * 1024);
     std::fs::remove_file(&delta_log).unwrap();
     std::fs::rename(&saved_delta_log, &delta_log).unwrap();
 

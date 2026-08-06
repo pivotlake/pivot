@@ -1,15 +1,16 @@
 //! Assembles encoded column chunks into one Parquet file per output file.
 //!
-//! A plain `Unary` map: the [`partition`](super::partition) stage routes every
+//! A plain `Unary` map: the [`indexer`](super::indexer) stage routes every
 //! column chunk of a file to `file_id % worker_count`, so all of a file's chunks
 //! arrive at one [`FileAssembler`]. It gathers a row group's chunks (by
 //! `row_group_id`, one per schema column), assembles the row group — laying each
 //! chunk's dictionary page (if any) and data pages out contiguously and stamping
 //! sort columns' footer `Statistics` — and once a `file_id` has all its
-//! `n_row_groups`, builds the file and emits it as an [`AssembledFile`] tagged with
+//! `n_row_groups`, builds the file, its row groups in the order they were cut,
+//! and emits it as an [`AssembledFile`] tagged with
 //! the partition tuple and `sort_bounds` to record in the manifest. Nothing
 //! crosses workers and there is no finish phase: every file completes in
-//! `consume`. (The upstream [`partition`](super::partition) breaker is what makes
+//! `consume`. (The upstream [`indexer`](super::indexer) is what makes
 //! this possible — it hands down file-sized units with a known row-group count.)
 //!
 //! The footer is fully populated (column `type`/`encodings`/`path_in_schema`/
@@ -120,7 +121,7 @@ impl Unary<EncodedColumnChunk, AssembledFile> for FileAssembler {
             items: chunks,
             ..
         } = self.chunks_by_row_group.remove(&row_group_id).unwrap();
-        let group = AssembledRowGroup::new(chunks)?;
+        let group = AssembledRowGroup::new(row_group_id, chunks)?;
 
         // Add it to its file; emit the file once all its row groups are in.
         let file_id = header.tag.file_id;
@@ -136,9 +137,13 @@ impl Unary<EncodedColumnChunk, AssembledFile> for FileAssembler {
 
         let Gathering {
             header,
-            items: groups,
+            items: mut groups,
             ..
         } = self.row_groups_by_file.remove(&file_id).unwrap();
+        // Work-stealing finishes row groups in any order; the file lays them
+        // back out in the order they were cut, which is the sorted row order
+        // when the table has a sort key.
+        groups.sort_by_key(|group| group.row_group_id);
         let (bytes, metadata) = build_file(&header.schema, groups)?;
         sender.send(AssembledFile {
             bytes,
@@ -152,8 +157,10 @@ impl Unary<EncodedColumnChunk, AssembledFile> for FileAssembler {
 
 /// One fully-encoded row group: the runs its pages were encoded into, in the
 /// order they belong in the file, plus the chunk metadata with offsets relative
-/// to the start of the group (rebased by [`build_file`]).
+/// to the start of the group (rebased by [`build_file`]). The id orders the
+/// groups back into the sequence they were cut in once the whole file gathers.
 struct AssembledRowGroup {
+    row_group_id: RowGroupId,
     bytes: FileBytes,
     columns: Vec<ColumnChunk>,
 }
@@ -161,7 +168,7 @@ struct AssembledRowGroup {
 impl AssembledRowGroup {
     /// Assemble one row group from its column chunks (one per schema column, any
     /// order). Each leaf brings its own footer statistics from the encoder.
-    fn new(mut chunks: Vec<EncodedColumnChunk>) -> WriteResult<Self> {
+    fn new(row_group_id: RowGroupId, mut chunks: Vec<EncodedColumnChunk>) -> WriteResult<Self> {
         // Footer column chunks must be in schema order; work-stealing delivers
         // them in any order. Within a column, its leaves are already in footer
         // order.
@@ -174,7 +181,11 @@ impl AssembledRowGroup {
                 columns.push(write_leaf_chunk(&mut bytes, leaf)?);
             }
         }
-        Ok(Self { bytes, columns })
+        Ok(Self {
+            row_group_id,
+            bytes,
+            columns,
+        })
     }
 }
 
@@ -443,7 +454,7 @@ mod tests {
                         })
                         .collect::<WriteResult<_>>()
                         .unwrap();
-                    let group = AssembledRowGroup::new(chunks).unwrap();
+                    let group = AssembledRowGroup::new(0, chunks).unwrap();
                     build_file(&schema, vec![group])
                         .unwrap()
                         .0

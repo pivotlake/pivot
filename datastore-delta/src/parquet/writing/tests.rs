@@ -15,7 +15,7 @@ use arrow_array::{
     ArrayRef, Date32Array, Float64Array, Int64Array, RecordBatch, StringArray, UInt8Array,
     UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow_schema::{ArrowError, DataType, Schema};
+use arrow_schema::{ArrowError, DataType, Field, Schema};
 use dispatch::{BUFFER_SIZE, Dispatch, values_input};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet_variant_compute::{
@@ -59,6 +59,30 @@ impl IntoBatch for ShreddedItem {
     }
 }
 
+/// Documents under an integer tag column, so a test can steer rows into
+/// separate partitions — and so separate files.
+struct TaggedJsonItem {
+    file_tag: i64,
+    rows: Vec<String>,
+}
+
+impl IntoBatch for TaggedJsonItem {
+    fn into_batch(self) -> Result<RecordBatch, ArrowError> {
+        let variant = variant_batch(&self.rows, None)?;
+        let schema = Schema::new(vec![
+            Field::new("file_tag", DataType::Int64, false),
+            variant.schema().field(0).clone(),
+        ]);
+        RecordBatch::try_new(
+            Arc::new(schema),
+            vec![
+                Arc::new(Int64Array::from(vec![self.file_tag; variant.num_rows()])),
+                variant.column(0).clone(),
+            ],
+        )
+    }
+}
+
 /// A one-column batch of `rows` as a variant, shredded on `paths` if given.
 fn variant_batch(rows: &[String], paths: Option<&[&str]>) -> Result<RecordBatch, ArrowError> {
     let json: ArrayRef = Arc::new(StringArray::from(rows.to_vec()));
@@ -74,21 +98,44 @@ fn variant_batch(rows: &[String], paths: Option<&[&str]>) -> Result<RecordBatch,
     RecordBatch::try_new(Arc::new(schema), vec![Arc::new(variants.into_inner())])
 }
 
-/// Run the write pipeline over `items` (one unpartitioned, unsorted file stream)
-/// and return the finished files' bytes. `rows_per_file` caps a file's rows, so a
-/// test can force more than one file.
-fn write<T: IntoBatch>(items: Vec<T>, rows_per_file: usize) -> Vec<Vec<u8>> {
+/// Run the write pipeline over `items` (one unpartitioned, unsorted stream —
+/// so one output file) and return the finished files' bytes. `rows_per_group`
+/// caps a row group's rows, so a test can force a file of several groups.
+fn write<T: IntoBatch>(items: Vec<T>, rows_per_group: usize) -> Vec<Vec<u8>> {
+    write_grouped(items, &[], &[], rows_per_group)
+}
+
+/// As [`write`], with each file's rows ordered by `sort_by`.
+fn write_sorted<T: IntoBatch>(
+    items: Vec<T>,
+    sort_by: &[&str],
+    rows_per_group: usize,
+) -> Vec<Vec<u8>> {
+    write_grouped(items, &[], sort_by, rows_per_group)
+}
+
+/// As [`write`], split into one file per distinct `partition_by` tuple, each
+/// file's rows ordered by `sort_by` when one is given.
+fn write_grouped<T: IntoBatch>(
+    items: Vec<T>,
+    partition_by: &[&str],
+    sort_by: &[&str],
+    rows_per_group: usize,
+) -> Vec<Vec<u8>> {
     let dispatch = Dispatch::spin_up(2, RING_BUFFERS, None);
     let batches: Vec<RecordBatch> = items
         .into_iter()
         .map(|item| item.into_batch().unwrap())
         .collect();
+    let schema = batches[0].schema();
     let spec = values_input(dispatch.dispatcher(), batches).record_batches();
+    let partition_by: Arc<[String]> = partition_by.iter().map(|name| name.to_string()).collect();
+    let sort_by: Arc<[String]> = sort_by.iter().map(|name| name.to_string()).collect();
     // A file's bytes are the slabs its pages were written into, which only the
     // worker holding them may release, so each one is copied out on the worker
     // that assembled it before this thread ever sees it.
     let files: Vec<Vec<u8>> =
-        encode_record_batches_spec(spec, Arc::from([]), Arc::from([]), rows_per_file, 1)
+        encode_record_batches_spec(spec, schema, partition_by, sort_by, rows_per_group)
             .map_each(|file: AssembledFile| {
                 file.bytes.runs().flatten().copied().collect::<Vec<u8>>()
             })
@@ -206,7 +253,7 @@ fn json_writes_as_a_shredded_variant_column() {
             r#"{"id": 1, "name": "a"}"#,
             r#"{"id": 2, "name": "b"}"#,
         ]))],
-        usize::MAX,
+        128 * 1024,
     );
 
     assert_eq!(files.len(), 1);
@@ -232,7 +279,7 @@ fn a_shredded_document_reads_back_whole() {
             r#"{"id": 1, "extra": true}"#,
             r#"{"id": 2, "extra": false}"#,
         ]))],
-        usize::MAX,
+        128 * 1024,
     );
 
     let batch = read_back(&files[0]);
@@ -256,7 +303,7 @@ fn a_row_that_disagrees_on_a_shredded_types_falls_back() {
             r#"{"v": 2}"#,
             r#"{"v": "not a number"}"#,
         ]))],
-        usize::MAX,
+        128 * 1024,
     );
 
     let batch = read_back(&files[0]);
@@ -268,17 +315,25 @@ fn a_row_that_disagrees_on_a_shredded_types_falls_back() {
     );
 }
 
-/// Each file shreds to its own rows: two files whose documents disagree get
-/// different layouts, which the read path resolves per file.
+/// Each file shreds to its own rows: two partitions' files whose documents
+/// disagree get different layouts, which the read path resolves per file.
 #[test]
 fn each_file_shreds_to_its_own_rows() {
-    // Two rows per file, so each item lands in its own file with its own shape.
-    let files = write(
+    // One file per partition, so each tag's documents shred on their own.
+    let files = write_grouped(
         vec![
-            JsonItem(rows(&[r#"{"id": 1}"#, r#"{"id": 2}"#])),
-            JsonItem(rows(&[r#"{"host": "a"}"#, r#"{"host": "b"}"#])),
+            TaggedJsonItem {
+                file_tag: 1,
+                rows: rows(&[r#"{"id": 1}"#, r#"{"id": 2}"#]),
+            },
+            TaggedJsonItem {
+                file_tag: 2,
+                rows: rows(&[r#"{"host": "a"}"#, r#"{"host": "b"}"#]),
+            },
         ],
-        2,
+        &["file_tag"],
+        &[],
+        128 * 1024,
     );
 
     assert_eq!(files.len(), 2);
@@ -302,7 +357,7 @@ fn each_file_shreds_to_its_own_rows() {
 fn a_column_with_nothing_worth_shredding_stays_unshredded() {
     let files = write(
         vec![JsonItem(rows(&[r#"{"ok": true}"#, r#"{"ok": false}"#]))],
-        usize::MAX,
+        128 * 1024,
     );
 
     assert_eq!(leaf_paths(&files[0]), vec!["attrs.metadata", "attrs.value"]);
@@ -328,7 +383,7 @@ fn already_shredded_input_re_shreds_to_the_merged_rows() {
                 paths: vec!["n"],
             },
         ],
-        usize::MAX,
+        128 * 1024,
     );
 
     // One file, and it shreds *both* paths — neither input's layout survived as
@@ -366,7 +421,7 @@ fn already_shredded_input_re_shreds_to_the_merged_rows() {
 fn every_leaf_carries_footer_statistics() {
     let files = write(
         vec![JsonItem(rows(&[r#"{"id": 1}"#, r#"{"id": 5}"#]))],
-        usize::MAX,
+        128 * 1024,
     );
 
     let stats = leaf_stats(&files[0]);
@@ -390,7 +445,7 @@ fn every_leaf_carries_footer_statistics() {
 #[test]
 fn an_unused_fallback_leaf_records_a_full_null_count() {
     let documents = rows(&[r#"{"id": 1}"#, r#"{"id": 5}"#, r#"{"id": 9}"#]);
-    let files = write(vec![JsonItem(documents.clone())], usize::MAX);
+    let files = write(vec![JsonItem(documents.clone())], 128 * 1024);
 
     let stats = leaf_stats(&files[0]);
 
@@ -415,7 +470,7 @@ fn a_nested_path_shreds_and_reads_back() {
             r#"{"user": {"id": 1}}"#,
             r#"{"user": {"id": 2}}"#,
         ]))],
-        usize::MAX,
+        128 * 1024,
     );
 
     assert!(
@@ -436,7 +491,7 @@ fn a_high_cardinality_integer_column_packs_its_differences() {
     let values: Vec<i64> = (0..50_000).map(|i| 1_000_000 + i * 7919).collect();
     let column: ArrayRef = Arc::new(Int64Array::from(values.clone()));
 
-    let files = write(vec![ColumnsItem(vec![("key", column)])], 400_000);
+    let files = write(vec![ColumnsItem(vec![("key", column)])], 128 * 1024);
 
     assert_eq!(
         leaf_encodings(&files[0]),
@@ -466,7 +521,7 @@ fn packed_differences_survive_falling_and_wide_values() {
         .collect();
     let column: ArrayRef = Arc::new(Int64Array::from(values.clone()));
 
-    let files = write(vec![ColumnsItem(vec![("key", column)])], 400_000);
+    let files = write(vec![ColumnsItem(vec![("key", column)])], 128 * 1024);
 
     let batch = read_back(&files[0]);
     let read: Vec<i64> = batch
@@ -538,7 +593,7 @@ fn a_float_column_stays_plain() {
     let values: Vec<f64> = (0..200_000).map(|i| i as f64 * 1.5).collect();
     let column: ArrayRef = Arc::new(Float64Array::from(values.clone()));
 
-    let files = write(vec![ColumnsItem(vec![("measure", column)])], 400_000);
+    let files = write(vec![ColumnsItem(vec![("measure", column)])], 128 * 1024);
 
     assert_eq!(
         leaf_encodings(&files[0]),
@@ -569,10 +624,160 @@ fn packing_a_scattered_key_costs_a_third_of_writing_it_whole() {
     let values: Vec<i64> = (0..200_000).map(|_| 1 + next() % 20_000_000).collect();
     let column: ArrayRef = Arc::new(Int64Array::from(values.clone()));
 
-    let bytes = write(vec![ColumnsItem(vec![("key", column)])], 400_000)[0].len();
+    let bytes = write(vec![ColumnsItem(vec![("key", column)])], 128 * 1024)[0].len();
 
     let per_value = bytes as f64 / values.len() as f64;
     assert!(per_value < 4.0, "{per_value} bytes a value");
+}
+
+/// Rows written under a sort key read back in key order however they arrived,
+/// each row's other columns still on it — across row groups, since the file is
+/// forced to hold several.
+#[test]
+fn a_sort_key_orders_a_files_rows() {
+    let keys: Vec<i64> = (0..10_000).map(|i| (i * 7919) % 10_000).collect();
+    let names: Vec<String> = keys.iter().map(|key| format!("row {key}")).collect();
+    let item = |range: std::ops::Range<usize>| {
+        ColumnsItem(vec![
+            (
+                "key",
+                Arc::new(Int64Array::from(keys[range.clone()].to_vec())) as ArrayRef,
+            ),
+            ("name", Arc::new(StringArray::from(names[range].to_vec()))),
+        ])
+    };
+
+    let files = write_sorted(vec![item(0..5_000), item(5_000..10_000)], &["key"], 1_000);
+
+    assert_eq!(files.len(), 1);
+    let batch = read_back(&files[0]);
+    let read_keys: Vec<i64> = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .values()
+        .to_vec();
+    assert_eq!(read_keys, (0..10_000).collect::<Vec<i64>>());
+    let read_names = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    for (row, key) in read_keys.iter().enumerate() {
+        assert_eq!(read_names.value(row), format!("row {key}"));
+    }
+}
+
+/// A partitioned, sorted write cuts one file per partition tuple, each file
+/// single-partition with its rows in key order.
+#[test]
+fn a_partitioned_sorted_write_cuts_one_sorted_file_per_partition() {
+    let parts: Vec<i64> = (0..2_000).map(|i| i % 2).collect();
+    let keys: Vec<i64> = (0..2_000).map(|i| (i * 7919) % 2_000).collect();
+    let files = write_grouped(
+        vec![ColumnsItem(vec![
+            ("part", Arc::new(Int64Array::from(parts)) as ArrayRef),
+            ("key", Arc::new(Int64Array::from(keys))),
+        ])],
+        &["part"],
+        &["key"],
+        500,
+    );
+
+    assert_eq!(files.len(), 2);
+    for file in &files {
+        let batch = read_back(file);
+        let parts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert!(parts.values().iter().all(|&part| part == parts.value(0)));
+        let keys = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values();
+        assert!(keys.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(keys.len(), 1_000);
+    }
+}
+
+/// A string sort key orders a file's rows too, through the general sort path
+/// rather than the fixed-width one.
+#[test]
+fn a_string_sort_key_orders_a_files_rows() {
+    let names: Vec<String> = (0..2_000)
+        .map(|i| format!("name {:04}", (i * 7919) % 2_000))
+        .collect();
+    let keys: Vec<i64> = (0..2_000).collect();
+    let files = write_sorted(
+        vec![ColumnsItem(vec![
+            (
+                "name",
+                Arc::new(StringArray::from(names.clone())) as ArrayRef,
+            ),
+            ("key", Arc::new(Int64Array::from(keys))),
+        ])],
+        &["name"],
+        1_000,
+    );
+
+    assert_eq!(files.len(), 1);
+    let batch = read_back(&files[0]);
+    let read_names: Vec<String> = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .iter()
+        .map(|value| value.unwrap().to_string())
+        .collect();
+    let mut expected = names;
+    expected.sort();
+    assert_eq!(read_names, expected);
+}
+
+/// A string-and-integer key sorts lexicographically: rows tied on the string
+/// order by the integer.
+#[test]
+fn a_string_and_int_key_sort_ties_by_the_int() {
+    let names: Vec<String> = (0..2_000).map(|i| format!("name {}", i % 4)).collect();
+    let keys: Vec<i64> = (0..2_000).map(|i| (i * 7919) % 2_000).collect();
+    let files = write_sorted(
+        vec![ColumnsItem(vec![
+            (
+                "name",
+                Arc::new(StringArray::from(names.clone())) as ArrayRef,
+            ),
+            ("key", Arc::new(Int64Array::from(keys.clone()))),
+        ])],
+        &["name", "key"],
+        1_000,
+    );
+
+    let batch = read_back(&files[0]);
+    let read: Vec<(String, i64)> = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .iter()
+        .zip(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values(),
+        )
+        .map(|(name, &key)| (name.unwrap().to_string(), key))
+        .collect();
+    let mut expected: Vec<(String, i64)> = names.into_iter().zip(keys).collect();
+    expected.sort();
+    assert_eq!(read, expected);
 }
 
 /// A date column writes as the day count its INT32 storage holds, annotated so
@@ -643,7 +848,7 @@ fn a_repeating_unsigned_column_round_trips_through_the_dictionary() {
     let values: Vec<u8> = (0..2_000).map(|i| (128 + i % 64) as u8).collect();
     let column: ArrayRef = Arc::new(UInt8Array::from(values.clone()));
 
-    let files = write(vec![ColumnsItem(vec![("u8", column)])], 400_000);
+    let files = write(vec![ColumnsItem(vec![("u8", column)])], 128 * 1024);
 
     let (_, encodings) = leaf_encodings(&files[0]).pop().unwrap();
     assert!(
@@ -664,7 +869,7 @@ fn an_all_distinct_unsigned_column_round_trips_through_plain() {
         .collect();
     let column: ArrayRef = Arc::new(UInt64Array::from(values.clone()));
 
-    let files = write(vec![ColumnsItem(vec![("u64", column)])], 400_000);
+    let files = write(vec![ColumnsItem(vec![("u64", column)])], 128 * 1024);
 
     let (_, encodings) = leaf_encodings(&files[0]).pop().unwrap();
     assert_eq!(encodings, vec!["PLAIN".to_string()]);
@@ -709,7 +914,7 @@ fn a_column_of_distinct_values_packs_rather_than_dictionary_encodes() {
     let values: Vec<i64> = (0..50_000).map(|i| 7_000_000 + i * 13).collect();
     let column: ArrayRef = Arc::new(Int64Array::from(values.clone()));
 
-    let files = write(vec![ColumnsItem(vec![("key", column)])], 400_000);
+    let files = write(vec![ColumnsItem(vec![("key", column)])], 128 * 1024);
 
     assert_eq!(
         leaf_encodings(&files[0]),
@@ -728,7 +933,7 @@ fn a_column_that_repeats_takes_the_dictionary_however_long_its_values() {
         .collect();
     let column: ArrayRef = Arc::new(StringArray::from(values));
 
-    let files = write(vec![ColumnsItem(vec![("label", column)])], 400_000);
+    let files = write(vec![ColumnsItem(vec![("label", column)])], 128 * 1024);
 
     let (_, encodings) = leaf_encodings(&files[0]).pop().unwrap();
     assert!(
@@ -745,7 +950,7 @@ fn a_date_column_writes_whichever_encoding_it_takes() {
     let days: Vec<i32> = (0..2_000).map(|i| 9_204 + i).collect();
     let column: ArrayRef = Arc::new(Date32Array::from(days.clone()));
 
-    let files = write(vec![ColumnsItem(vec![("shipdate", column)])], 400_000);
+    let files = write(vec![ColumnsItem(vec![("shipdate", column)])], 128 * 1024);
 
     let (_, encodings) = leaf_encodings(&files[0]).pop().unwrap();
     assert_eq!(encodings, vec!["DELTA_BINARY_PACKED".to_string()]);

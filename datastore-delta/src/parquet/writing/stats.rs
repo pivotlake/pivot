@@ -3,7 +3,7 @@
 //! Used at both ends of the pipeline. The [`encoder`](super::encoder) gives every
 //! leaf its row group's statistics, which is what lets a reader prune row groups
 //! by any column rather than only by the sort key. The
-//! [`partition`](super::partition) stage takes the same min/max over a whole
+//! [`indexer`](super::indexer) stage takes the same min/max over a whole
 //! file, for the `sort_bounds` it records in the manifest.
 
 use std::collections::HashMap;

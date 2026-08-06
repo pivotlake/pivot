@@ -1,7 +1,7 @@
 //! Messages that flow between the write pipeline's stages.
 //!
 //! The unit of encode work is one **column chunk** (a single column's values for
-//! one row group): the [`partition`](super::partition) stage emits a
+//! one row group): the [`indexer`](super::indexer) stage emits a
 //! [`ColumnChunkJob`], the [`encoder`](super::encoder) turns it into an
 //! [`EncodedColumnChunk`] holding one [`EncodedLeaf`] per leaf of that column
 //! (PLAIN, or dictionary-encoded), and the [`assembler`](super::assembler) lays
@@ -26,7 +26,7 @@ pub(crate) type RowGroupId = u64;
 /// together (and route to one worker).
 pub(crate) type FileId = u64;
 
-/// Per-row-group provenance threaded from the [`partition`](super::partition)
+/// Per-row-group provenance threaded from the [`indexer`](super::indexer)
 /// stage to the [`assembler`](super::assembler). Every field is file-level, so a
 /// file's row groups all carry the same one. Always present (an unpartitioned,
 /// unsorted write carries one with `partition`/`sort_bounds` `None`). `Arc` so
@@ -65,7 +65,7 @@ pub(crate) struct AssembledFile {
 
 /// The per-row-group metadata every column chunk of a row group shares: its
 /// identity and owner worker (for routing), schema, and [`PartitionTag`]. Built
-/// once by the [`partition`](super::partition) stage and shared by `Arc`, so each
+/// once by the [`indexer`](super::indexer) stage and shared by `Arc`, so each
 /// column job clones a single pointer instead of re-copying all of this. The row
 /// group is complete once the assembler has one chunk per `schema` column.
 pub(crate) struct RowGroupHeader {
@@ -77,12 +77,23 @@ pub(crate) struct RowGroupHeader {
     pub(crate) tag: Arc<PartitionTag>,
 }
 
-/// One column's values for one row group, to encode into a column chunk.
+/// One column of one row group, to encode into a column chunk. The rows ride
+/// as the chunks whose concatenation they are, not as a finished array: the
+/// [`indexer`](super::indexer) never touches row data, and the encode worker
+/// materializes the row group itself — the stream's batch-sized chunks
+/// appended back to back — right before encoding it, while the values are
+/// hot.
 pub(crate) struct ColumnChunkJob {
     pub(crate) header: Arc<RowGroupHeader>,
     /// Index of this column in the schema.
     pub(crate) column: usize,
-    pub(crate) values: ArrayRef,
+    /// This row group's rows: this column's slices of the stream chunks the
+    /// row group's window covers, in order.
+    pub(crate) chunks: Arc<[ArrayRef]>,
+    /// The shredding the file's plan chose for this column, applied to the
+    /// materialized rows before encoding; `None` for plain columns and
+    /// variants left as the plain pair.
+    pub(crate) shredding: Option<Arc<arrow_schema::DataType>>,
 }
 
 /// An encoded page (data or dictionary): its snappy-compressed body behind a

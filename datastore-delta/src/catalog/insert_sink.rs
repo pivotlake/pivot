@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow_array::{Int64Array, RecordBatch};
 
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use crossbeam_deque::Injector;
 use dispatch::io::{FsRequest, FsWriteRequest, HttpRequest, HttpUploadRequest, RemoteFile};
 use dispatch::{
@@ -86,7 +86,6 @@ pub(super) fn build_insert_spec(
     });
 
     const TARGET_ROWS_PER_GROUP: usize = 128 * 1024;
-    const TARGET_ROW_GROUPS_PER_FILE: usize = 8;
     Ok(encode_and_upload_spec(
         store,
         table.object_location().clone(),
@@ -94,10 +93,10 @@ pub(super) fn build_insert_spec(
         table.columns().into(),
         uploaded_files,
         input,
+        schema,
         table.partition_by().to_vec().into(),
         table.sort_by().to_vec().into(),
         TARGET_ROWS_PER_GROUP,
-        TARGET_ROW_GROUPS_PER_FILE,
         dispatcher,
     ))
 }
@@ -115,19 +114,14 @@ pub(super) fn encode_and_upload_spec(
     declared_columns: Arc<[Column]>,
     uploaded_files: Arc<Injector<UploadedFile>>,
     input: RecordBatchOperatorSpec,
+    schema: SchemaRef,
     partition_by: Arc<[String]>,
     sort_by: Arc<[String]>,
     target_rows_per_group: usize,
-    target_row_groups_per_file: usize,
     dispatcher: &DataFlowDispatcher,
 ) -> RecordBatchOperatorSpec {
-    let encoded = encode_record_batches_spec(
-        input,
-        partition_by,
-        sort_by,
-        target_rows_per_group,
-        target_row_groups_per_file,
-    );
+    let encoded =
+        encode_record_batches_spec(input, schema, partition_by, sort_by, target_rows_per_group);
     let workers = dispatcher.worker_count();
     // One shared total; every worker's `Upload` adds its completions to it and the
     // last worker into `finish` emits it once all uploads have landed, so no
