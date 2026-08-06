@@ -102,6 +102,27 @@ fn nonexistent_table() {
     }
 }
 
+/// Pivot cannot install or load DuckDB extensions, so stock DuckDB's "it
+/// exists in the json extension, run INSTALL/LOAD" error steers users to a
+/// dead end. Our duckdb fork strips those suggestions; this pins the plain
+/// missing-function error so an upstream merge cannot quietly bring them back.
+#[test]
+fn function_known_only_to_extensions_errors_without_install_hint() {
+    let mut p = create_simple_context();
+
+    // `->>` exists in DuckDB's json extension, which pivot never ships.
+    let result = plan(&mut p, "SELECT name->>'x' FROM t");
+
+    match result {
+        Ok(_) => panic!("Expected error"),
+        Err(Error::DuckDBPlanning(e)) => assert_eq!(
+            e.exception_message,
+            "Scalar Function with name ->> does not exist!\nDid you mean \"-\"?"
+        ),
+        Err(e) => panic!("Unexpected error: {e}"),
+    }
+}
+
 #[test]
 fn exception_location() {
     let mut p = create_simple_context();
