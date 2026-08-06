@@ -88,6 +88,7 @@ pub use default_unary_factory::DefaultUnaryFactory;
 mod copy_out;
 mod join;
 mod limit;
+mod order_by;
 mod order_by_limit;
 
 pub use copy_out::CopyOutFactory;
@@ -97,6 +98,7 @@ pub use join::{
     JoinSpec, PackedKey, SingleColumnKey,
 };
 pub use limit::LimitFactory;
+pub use order_by::OrderByFactory;
 pub use order_by_limit::{DynamicFilterSlot, OrderBy, OrderByLimitFactory};
 
 #[derive(Debug, Error)]

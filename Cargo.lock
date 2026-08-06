@@ -1709,6 +1709,8 @@ dependencies = [
  "arrow",
  "arrow-array",
  "arrow-buffer",
+ "arrow-ord",
+ "arrow-row",
  "arrow-schema",
  "blake3",
  "bytes",
