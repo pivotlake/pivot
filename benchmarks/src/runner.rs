@@ -10,14 +10,26 @@
 
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use flate2::read::MultiGzDecoder;
 use thiserror::Error;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
 use crate::server_handle::ServerHandle;
+
+/// How many `INSERT`s the load keeps in flight, each on its own connection.
+fn in_flight_inserts() -> usize {
+    std::env::var("PIVOT_BENCH_INSERTS_IN_FLIGHT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(8)
+}
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -404,7 +416,7 @@ fn setup_statements(script: &str) -> Vec<String> {
 /// as batched `INSERT ... VALUES`. A `.json.gz` file is decompressed on the fly;
 /// a plain `.json` is read as-is. Files are loaded in name order so a run is
 /// reproducible.
-async fn load_documents(client: &Client, source: &Path, spec: &LoadSpec) -> Result<()> {
+async fn load_documents(port: u16, source: &Path, spec: &LoadSpec) -> Result<()> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(source)
         .map_err(|source_err| Error::Io {
             path: source.to_path_buf(),
@@ -418,8 +430,23 @@ async fn load_documents(client: &Client, source: &Path, spec: &LoadSpec) -> Resu
         .collect();
     files.sort();
 
+    // One connection carries one statement at a time, so overlapping inserts
+    // needs a connection each. Appends do not conflict: a commit takes the next
+    // log version and, when a concurrent writer took it first, reloads and
+    // retries on top. The only consequence of overlapping them is that rows land
+    // in an unspecified order, which no query in a suite depends on.
+    let in_flight = in_flight_inserts();
+    let mut clients = Vec::with_capacity(in_flight);
+    for _ in 0..in_flight {
+        clients.push(Arc::new(connect(port).await?));
+    }
+    // The permits are what bound memory: each insert in flight holds its batch
+    // as SQL text here and again on the server.
+    let inflight = Arc::new(Semaphore::new(in_flight));
+    let mut running: JoinSet<Result<usize>> = JoinSet::new();
     let mut batch: Vec<String> = Vec::with_capacity(spec.batch_rows);
-    let mut inserted = 0usize;
+    let mut sent = 0usize;
+
     for path in &files {
         let file = std::fs::File::open(path).map_err(|source| Error::Io {
             path: path.clone(),
@@ -440,16 +467,61 @@ async fn load_documents(client: &Client, source: &Path, spec: &LoadSpec) -> Resu
             }
             batch.push(document);
             if batch.len() == spec.batch_rows {
-                inserted += insert_documents(client, &spec.table, &batch).await?;
-                batch.clear();
+                let documents = std::mem::replace(&mut batch, Vec::with_capacity(spec.batch_rows));
+                spawn_insert(&mut running, &inflight, &clients, sent, spec, documents).await;
+                sent += 1;
             }
         }
     }
     if !batch.is_empty() {
-        inserted += insert_documents(client, &spec.table, &batch).await?;
+        spawn_insert(&mut running, &inflight, &clients, sent, spec, batch).await;
+    }
+
+    let mut inserted = 0usize;
+    while let Some(finished) = running.join_next().await {
+        inserted += finished.expect("an insert task is not cancelled or panicked")?;
     }
     println!("loaded {inserted} documents into {}", spec.table);
     Ok(())
+}
+
+/// Wait for a free slot, then start one batch's `INSERT` on the next connection
+/// in the pool. Connections are taken round-robin, so a slow statement holds up
+/// only its own.
+async fn spawn_insert(
+    running: &mut JoinSet<Result<usize>>,
+    inflight: &Arc<Semaphore>,
+    clients: &[Arc<Client>],
+    sent: usize,
+    spec: &LoadSpec,
+    documents: Vec<String>,
+) {
+    let permit = inflight
+        .clone()
+        .acquire_owned()
+        .await
+        .expect("the semaphore outlives every insert");
+    let client = clients[sent % clients.len()].clone();
+    let table = spec.table.clone();
+    running.spawn(async move {
+        let inserted = insert_documents(&client, &table, &documents).await;
+        drop(permit);
+        inserted
+    });
+}
+
+/// Open one connection to the benchmark server, driving its protocol task in the
+/// background for as long as the returned client lives.
+async fn connect(port: u16) -> Result<Client> {
+    let (client, connection) = tokio_postgres::Config::new()
+        .host("127.0.0.1")
+        .port(port)
+        .user("pivot")
+        .dbname("bench")
+        .connect(NoTls)
+        .await?;
+    tokio::spawn(connection);
+    Ok(client)
 }
 
 /// Insert one batch of JSON documents as a single `INSERT ... VALUES`. Each
@@ -506,7 +578,7 @@ pub async fn run_suite(
     // many small files each batch left into target-sized ones before querying.
     if let Some(spec) = &suite.load {
         let load_start = Instant::now();
-        load_documents(&client, &opts.source, spec).await?;
+        load_documents(server.port(), &opts.source, spec).await?;
         client
             .simple_query(&format!("COMPACT {} FINAL", spec.table))
             .await?;
