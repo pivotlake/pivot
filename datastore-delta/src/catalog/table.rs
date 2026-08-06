@@ -149,6 +149,25 @@ impl CatalogTable {
         if state.version <= self.manifest.version {
             return Ok(false);
         }
+        self.adopt_log_state(state);
+        self.sync_files_to_manifest()?;
+        Ok(true)
+    }
+
+    /// Reload from the log even when this copy's recorded version is not behind.
+    ///
+    /// A commit that stepped over versions other writers took holds the version
+    /// it wrote while missing their entries, so the comparison
+    /// [`refresh`](Self::refresh) makes would wrongly call it current.
+    fn reload_manifest(&mut self) -> crate::Result<()> {
+        let state = crate::delta::load_table(&self.delta_uri, self.store.as_ref())?;
+        self.adopt_log_state(state);
+        self.sync_files_to_manifest()
+    }
+
+    /// Replace this copy's manifest with what the log says, carrying over the
+    /// sort bounds the log does not persist.
+    fn adopt_log_state(&mut self, state: crate::delta::DeltaTableState) {
         // The Delta log does not persist per-file sort bounds, so a reloaded
         // entry carries none; keep the bounds this copy already recorded for
         // files it still holds, or sort-key pruning would silently degrade on
@@ -177,8 +196,6 @@ impl CatalogTable {
             sort_by: state.sort_by,
             entries,
         };
-        self.sync_files_to_manifest()?;
-        Ok(true)
     }
 
     /// The compare-and-swap loop every manifest commit runs: check each `removed`
@@ -199,7 +216,7 @@ impl CatalogTable {
         data_change: bool,
         mut apply_committed: impl FnMut(&mut Self) -> crate::Result<()>,
     ) -> crate::Result<()> {
-        loop {
+        'against_latest: loop {
             if let Some(missing) = removed.iter().find(|path| {
                 !self
                     .manifest
@@ -212,26 +229,53 @@ impl CatalogTable {
                     file: missing.to_string(),
                 });
             }
-            let next_version = self.manifest.version + 1;
-            if crate::delta::commit_file_changes(
-                self.store.as_ref(),
-                &self.location,
-                next_version,
-                removed,
-                entries,
-                data_change,
-            )? {
-                self.manifest.version = next_version;
-                self.manifest
-                    .entries
-                    .retain(|e| !removed.contains(&e.file.path));
-                self.manifest.entries.extend(entries.iter().cloned());
-                apply_committed(self)?;
-                return Ok(());
+
+            let first_version = self.manifest.version + 1;
+            let mut version = first_version;
+            loop {
+                if crate::delta::commit_file_changes(
+                    self.store.as_ref(),
+                    &self.location,
+                    version,
+                    removed,
+                    entries,
+                    data_change,
+                )? {
+                    break;
+                }
+                // A concurrent writer took this version.
+                if !removed.is_empty() {
+                    // A swap is only valid against the file list it was planned
+                    // from, and the writer that won may have swapped the very
+                    // files it removes, so reload and re-check before retrying.
+                    self.refresh()?;
+                    continue 'against_latest;
+                }
+                // An append does not depend on what the winner wrote, only on
+                // finding a free version. Stepping to the next one costs a
+                // create attempt per concurrent writer, where reloading costs a
+                // full log replay whose price grows with every version already
+                // committed -- which, under a concurrent load, is what turns
+                // more writers into less throughput.
+                version += 1;
             }
-            // A concurrent writer took this version; reload to the latest and
-            // retry the commit on top of it.
-            self.refresh()?;
+
+            self.manifest.version = version;
+            self.manifest
+                .entries
+                .retain(|e| !removed.contains(&e.file.path));
+            self.manifest.entries.extend(entries.iter().cloned());
+            apply_committed(self)?;
+            if version != first_version {
+                // Versions landed between this copy's and the one it took, so it
+                // is missing their entries and must not publish a file list that
+                // drops them. One reload here, rather than one per lost attempt.
+                // It runs after `apply_committed` so the files this commit wrote
+                // are already held with the row groups and sort bounds the writer
+                // produced, and are not re-read from their footers.
+                self.reload_manifest()?;
+            }
+            return Ok(());
         }
     }
 
@@ -254,7 +298,18 @@ impl CatalogTable {
             .map(|(_, table_file)| table_file)
             .collect::<Vec<_>>();
         self.commit_manifest_version(removed, &entries, data_change, |table| {
-            table.files.retain(|f| !removed.contains(&f.file.path));
+            // Drop the removed files, and any earlier copy of the ones being
+            // added: a commit that raced reloads afterwards, and the reload can
+            // fetch a file's footer before this puts back the richer version the
+            // writer already holds. Keeping this idempotent means the writer's
+            // copy wins either way, with its row groups and sort bounds intact.
+            let added: HashSet<&str> = table_files
+                .iter()
+                .map(|file| file.file.path.as_str())
+                .collect();
+            table.files.retain(|f| {
+                !removed.contains(&f.file.path) && !added.contains(f.file.path.as_str())
+            });
             table.files.extend(table_files.iter().cloned());
             Ok(())
         })
