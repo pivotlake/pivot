@@ -214,6 +214,24 @@ mod tests {
         );
     }
 
+    /// `->` and `.` are the same read of the same field, so they must produce
+    /// the same plan. They did not always: `->` bound to `json_extract`, which
+    /// projection pushdown cannot fold into a scan, so the arrow spelling read
+    /// the whole document where the dotted one read a single field.
+    #[rstest]
+    fn arrow_and_dot_access_plan_identically(mut testing_planner: TestingPlanner) {
+        docs_table(&mut testing_planner, vec![r#"{"user":{"id":7}}"#]);
+
+        let arrow = testing_planner
+            .plan("SELECT CAST(d->'user'->'id' AS BIGINT) AS i FROM docs")
+            .expect("arrow extraction plans");
+        let dot = testing_planner
+            .plan("SELECT CAST(d.user.id AS BIGINT) AS i FROM docs")
+            .expect("dot extraction plans");
+
+        assert_eq!(format!("{arrow}"), format!("{dot}"));
+    }
+
     /// A chain of `->` descends into nested objects; the cast fuses the whole
     /// chain into one typed read.
     #[rstest]
