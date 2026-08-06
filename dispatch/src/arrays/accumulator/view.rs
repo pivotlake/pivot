@@ -30,7 +30,7 @@ use crate::memory::{SlabAllocator, SlabBuffer};
 
 /// A byte-view value up to this length lives inside its view, with no data
 /// buffer behind it.
-const INLINE_VIEW_LEN: u32 = 12;
+pub(in crate::arrays) const INLINE_VIEW_LEN: u32 = 12;
 
 /// Bytes a copying view column takes for its values at a time. Well under a
 /// slab, so blocks pack into the buffers the allocator is bumping through rather
@@ -71,7 +71,9 @@ enum ViewValues {
     OwnedBlocks { blocks: Vec<DataBlock> },
 }
 
-/// One data block of a copying view column.
+/// One data block of a copying view column, shared with the chunked take
+/// ([`crate::arrays::take::take_chunked`]), whose view gather copies values the
+/// same way.
 ///
 /// A block is slab memory, except for the one case the ring cannot serve: a
 /// value's bytes must be one contiguous run, and the ring hands out runs of at
@@ -79,7 +81,7 @@ enum ViewValues {
 /// its own, one allocation of exactly that value's size. Retaining the source
 /// buffer it came from would copy nothing, but it would pin however much else
 /// that buffer holds, which is the retention this mode exists to avoid.
-enum DataBlock {
+pub(in crate::arrays) enum DataBlock {
     Slab {
         slab: SlabBuffer<u8>,
         /// Bytes the block can hold.
@@ -95,7 +97,7 @@ impl DataBlock {
     /// Hand the block's bytes to Arrow. A slab block rides in the buffer's
     /// allocation `Arc`, so it returns to the pool with the last reference to
     /// the array.
-    fn into_buffer(self) -> Buffer {
+    pub(in crate::arrays) fn into_buffer(self) -> Buffer {
         match self {
             Self::Slab { slab, used, .. } => slab_into_buffer(slab, used),
             Self::OversizedValue(bytes) => Buffer::from_vec(bytes),
@@ -468,7 +470,11 @@ fn append_copying_values<I>(
 
 /// Copy `value` into the block being filled, opening one (or a larger one for an
 /// outsized value) as needed, and return the view naming where it landed.
-fn copy_value(blocks: &mut Vec<DataBlock>, value: &[u8], allocator: &mut SlabAllocator) -> u128 {
+pub(in crate::arrays) fn copy_value(
+    blocks: &mut Vec<DataBlock>,
+    value: &[u8],
+    allocator: &mut SlabAllocator,
+) -> u128 {
     if value.len() > BUFFER_SIZE {
         blocks.push(DataBlock::OversizedValue(value.to_vec()));
         return make_view(value, blocks.len() as u32 - 1, 0);
