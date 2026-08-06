@@ -31,8 +31,9 @@
 //! ## Module layout
 //!
 //! - [`schema`] — [`RowKeySchema`], the per-query key types.
-//! - [`reader`] — the encode side: [`RowReader`]/[`RowScratch`] turn a batch's
-//!   key columns into hashes + a contiguous blob buffer.
+//! - [`reader`] — the hash/encode side: [`RowReader`]/[`RowScratch`] hash a
+//!   batch's key columns in place and encode a row's blob only when a new
+//!   group persists it.
 //! - [`live_key`] — [`RowKey`], the transient key probed against the table.
 //! - [`columns`] — the decode side: [`RowKeyColumnBuilder`] rebuilds typed output
 //!   columns from the persisted blobs.
@@ -116,7 +117,7 @@ impl KeyExtractor for RowKeyExtractor {
     }
 
     fn prepare_and_hash(reader: &mut RowReader<'_>, state: &RandomState, hashes: &mut [u64]) {
-        reader.encode_and_hash(state, hashes);
+        reader.hash_rows(state, hashes);
     }
 
     #[inline(always)]
@@ -125,8 +126,8 @@ impl KeyExtractor for RowKeyExtractor {
         idx: usize,
         arena: &'a mut WorkerArena,
     ) -> Self::LiveKey<'a, 'r> {
-        // The row slice borrows the reader's scratch for exactly `'r`, the live
-        // key's own lifetime — so no transmute is needed.
-        RowKey::new(arena, reader.row(idx))
+        // The reader's batch-long borrows shorten covariantly to `'r`, the live
+        // key's own lifetime.
+        RowKey::new(arena, reader, idx)
     }
 }
