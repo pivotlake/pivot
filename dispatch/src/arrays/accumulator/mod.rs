@@ -39,6 +39,8 @@ mod structs;
 mod validity;
 mod view;
 
+pub(in crate::arrays) use view::{DataBlock, INLINE_VIEW_LEN, copy_value};
+
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{ArrowError, DataType, Fields, SchemaRef};
 
