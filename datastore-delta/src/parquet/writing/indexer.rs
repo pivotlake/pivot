@@ -197,7 +197,6 @@ impl Indexer {
                 file_id,
                 n_row_groups,
                 partition: partition_values.clone(),
-                sort_bounds: None,
             });
             let header = Arc::new(RowGroupHeader {
                 row_group_id: self.next_row_group_id,

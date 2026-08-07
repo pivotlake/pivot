@@ -861,14 +861,12 @@ fn commit_uploaded_files(
             table_id,
             file,
             partition,
-            sort_bounds,
             row_groups,
         } = uploaded;
         let stats = Some(crate::parquet::aggregate_file_stats(&row_groups));
         let entry = DeltaFileEntry {
             file,
             partition,
-            sort_bounds,
             stats,
         };
         files_by_table

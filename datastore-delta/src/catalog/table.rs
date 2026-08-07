@@ -352,14 +352,9 @@ impl CatalogTable {
             .collect();
 
         let mut files = Vec::with_capacity(entries.len());
-        for mut entry in entries {
+        for entry in entries {
             let row_groups = match held.get(&entry.file.path) {
-                Some(held_file) => {
-                    // The log does not persist sort bounds, so carry forward the
-                    // ones this copy already recorded for a file it still holds.
-                    entry.sort_bounds = held_file.entry.sort_bounds.clone();
-                    held_file.row_groups.clone()
-                }
+                Some(held_file) => held_file.row_groups.clone(),
                 None => fetched
                     .remove(&entry.file.path)
                     .ok_or_else(|| Error::FooterNotLoaded {
@@ -670,7 +665,6 @@ impl CatalogTable {
                     let super::insert_sink::UploadedFile {
                         file,
                         partition,
-                        sort_bounds,
                         row_groups,
                         ..
                     } = uploaded;
@@ -678,7 +672,6 @@ impl CatalogTable {
                     let entry = DeltaFileEntry {
                         file,
                         partition,
-                        sort_bounds,
                         stats,
                     };
                     added.push(TableFile::new(entry, row_groups));

@@ -160,7 +160,7 @@ mod bodies {
         datastore
             .table_handle(&SchemaQualifiedTableName::in_default_schema("events"))
             .unwrap()
-            .append_data_file(ObjectPath::new("p2.parquet"), &pq(&[4, 5, 6]), None, None)
+            .append_data_file(ObjectPath::new("p2.parquet"), &pq(&[4, 5, 6]), None)
             .unwrap();
 
         assert_eq!(scan(&d, &datastore, "events"), vec![1, 2, 3, 4, 5, 6]);

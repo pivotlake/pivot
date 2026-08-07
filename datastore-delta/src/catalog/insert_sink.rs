@@ -151,14 +151,13 @@ pub(super) fn encode_and_upload_spec(
 
 /// One finished upload waiting to be committed, drained from `uploaded_files` by
 /// whoever owns it (a statement's transaction, or compaction). Its consumer
-/// builds the `DeltaFileEntry` (from `file`/`partition`/`sort_bounds`) and
+/// builds the `DeltaFileEntry` (from `file`/`partition`) and
 /// `TableFile` (from `file`/`row_groups`) it commits. Carries the table's durable
 /// id, not its name, so the commit resolves the live table regardless of a rename.
 pub(crate) struct UploadedFile {
     pub table_id: Uuid,
     pub file: FileRef,
     pub partition: Option<crate::PartitionValues>,
-    pub sort_bounds: Option<crate::SortBounds>,
     pub row_groups: Vec<Arc<RowGroupMetadata>>,
 }
 
@@ -224,7 +223,6 @@ struct PendingUpload {
     file: crate::store::FileRef,
     key: ObjectPath,
     partition: Option<crate::PartitionValues>,
-    sort_bounds: Option<crate::SortBounds>,
     /// The footer metadata the writer produced for this file, used to record its
     /// row groups once the upload lands (no re-parsing the file we just wrote).
     metadata: thriftparquet::footer::FileMetaData,
@@ -291,7 +289,6 @@ impl Upload {
             table_id: self.table_id,
             file: pending.file,
             partition: pending.partition,
-            sort_bounds: pending.sort_bounds,
             row_groups: loaded.row_groups,
         });
         // Relaxed: the finish barrier (AcqRel on the sibling counter) publishes
@@ -348,7 +345,6 @@ impl Unary<AssembledFile, RecordBatch> for Upload {
                 file,
                 key,
                 partition: encoded.partition,
-                sort_bounds: encoded.sort_bounds,
                 metadata: encoded.metadata,
             },
         );
