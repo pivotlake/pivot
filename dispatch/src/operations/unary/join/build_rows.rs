@@ -125,7 +125,7 @@ pub(crate) fn row_id_shift() -> u32 {
 
 /// Store a batch's rows without copying and hand back each stored batch with
 /// its first row's id, for the caller to generate tuples from. Ids are local
-/// to `batches`; a worker's ids are globalized with the base [`merge`] assigns
+/// to `batches`; a worker's ids are globalized with the base merge assigns
 /// it.
 pub(crate) fn adopt(batches: &mut Vec<RecordBatch>, batch: RecordBatch) -> Vec<(u32, RecordBatch)> {
     let total = batch.num_rows();
