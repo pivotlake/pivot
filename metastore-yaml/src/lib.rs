@@ -73,7 +73,7 @@ use catalog::Datastore;
 use datastore_delta::store::{LocalStore, ObjectStore, S3Credentials, S3Store};
 use datastore_delta::{
     CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL, DEFAULT_MIN_FILES_TO_MERGE,
-    DEFAULT_REFRESH_INTERVAL, DeltaDatastore, MaintenanceConfig,
+    DEFAULT_REFRESH_INTERVAL, DEFAULT_VACUUM_POLL, DeltaDatastore, MaintenanceConfig, VacuumConfig,
 };
 use dispatch::DataFlowDispatcher;
 use metastore::{DEFAULT_USER_NAME, Metastore, UserAuth, parse_scram_verifier};
@@ -164,6 +164,7 @@ impl YamlMetastore {
                 let maintenance = MaintenanceConfig {
                     refresh_interval: self.refresh_interval,
                     compaction: config.compaction(),
+                    vacuum: config.vacuum(),
                 };
                 let datastore: Arc<dyn Datastore> = match config.kind {
                     DatastoreKind::Delta => {
@@ -289,11 +290,11 @@ struct DatastoreConfig {
     /// unqualified table names and DDL. Exactly one datastore must set it.
     #[serde(rename = "default", default)]
     is_default: bool,
-    /// Run this datastore's own background compaction. Off by default; the
+    /// Run this datastore's own background compaction. On by default; the
     /// `compact_*` tuning fields apply only when it is on. Compaction rewrites a
-    /// table's small Parquet files, so enable it in only one process per
-    /// datastore.
-    #[serde(default)]
+    /// table's small Parquet files, so run it in only one process per datastore
+    /// (set `compact: false` on the others).
+    #[serde(default = "default_true")]
     compact: bool,
     /// Per-table byte threshold compaction merges small files up to (a size such
     /// as `128m` or `1g`). Defaults to [`DEFAULT_COMPACT_BYTES`].
@@ -302,10 +303,22 @@ struct DatastoreConfig {
     /// many accumulate, even below `compact_bytes`). Defaults to
     /// [`DEFAULT_MIN_FILES_TO_MERGE`].
     compact_min_files: Option<usize>,
+    /// Run this datastore's own background vacuum. On by default: the vacuumer
+    /// deletes unreferenced data files and superseded commit JSONs past their
+    /// retention. Set `vacuum: false` on a read-only server, or where another
+    /// process owns physical cleanup.
+    #[serde(default = "default_true")]
+    vacuum: bool,
     region: Option<String>,
     access_key_id: Option<String>,
     secret_access_key: Option<String>,
     endpoint: Option<String>,
+}
+
+/// Serde default for the `compact` and `vacuum` toggles: both maintenance loops
+/// run unless a datastore explicitly turns them off.
+fn default_true() -> bool {
+    true
 }
 
 impl DatastoreConfig {
@@ -322,6 +335,18 @@ impl DatastoreConfig {
                 .unwrap_or(DEFAULT_COMPACT_BYTES),
             min_files: self.compact_min_files.unwrap_or(DEFAULT_MIN_FILES_TO_MERGE),
             poll_interval: DEFAULT_COMPACT_POLL,
+        })
+    }
+
+    /// This datastore's vacuum settings, or `None` when `vacuum` is off. On by
+    /// default; each table's `delta.deletedFileRetentionDuration` governs the
+    /// deletion window.
+    fn vacuum(&self) -> Option<VacuumConfig> {
+        if !self.vacuum {
+            return None;
+        }
+        Some(VacuumConfig {
+            poll_interval: DEFAULT_VACUUM_POLL,
         })
     }
 }
@@ -393,17 +418,19 @@ datastores:
     kind: delta
     location: /tmp/hot
     default: true
-    compact: true
     compact_bytes: 128m
   warm:
     kind: delta
     location: /tmp/warm
+    compact: false
 "#;
 
         let store = YamlMetastore::from_yaml(yaml, "test").unwrap();
 
         let hot = store.datastore_configs["hot"].compaction();
         let warm = store.datastore_configs["warm"].compaction();
+        // Compaction is on by default (hot omits `compact`), and off only where a
+        // datastore turns it off explicitly (warm).
         assert_eq!(hot.unwrap().target_bytes, 128 * 1024 * 1024);
         assert!(warm.is_none());
     }

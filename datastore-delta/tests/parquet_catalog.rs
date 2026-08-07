@@ -20,7 +20,7 @@ use catalog::{DEFAULT_DATASTORE_NAME, PivotCatalog};
 use common::{commit_datastore_transaction, current_parquet};
 use datastore::{Datastore, DatastoreTransaction};
 use datastore_delta::store::ObjectPath;
-use datastore_delta::{DeltaDatastore, PartitionEqFilter, TableBinding};
+use datastore_delta::{ColumnStatFilter, DeltaDatastore, PartitionEqFilter, TableBinding};
 use planner::Planner;
 use planner::catalog::{
     BoundTable, CatalogTransaction, Column, CreateTableRequest, Result as CatalogResult,
@@ -1032,7 +1032,7 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
         ObjectPath::new("data.parquet"),
         ObjectPath::new("extra.parquet"),
     ];
-    let added = vec![datastore_delta::ManifestEntry::new(
+    let added = vec![datastore_delta::DeltaFileEntry::new(
         datastore_delta::FileRef {
             path: ObjectPath::new("merged.parquet"),
             size: merged_size,
@@ -1051,7 +1051,7 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     winner.replace_data_files(&removed, &added).unwrap();
     // The loser only discovers the inputs are gone after its CAS conflict +
     // refresh and returns a typed commit-conflict error.
-    let loser_added = vec![datastore_delta::ManifestEntry::new(
+    let loser_added = vec![datastore_delta::DeltaFileEntry::new(
         datastore_delta::FileRef {
             path: ObjectPath::new("merged-loser.parquet"),
             size: merged_size,
@@ -1070,6 +1070,110 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     let groups = parquet.row_groups();
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].num_rows, 4);
+}
+
+/// A writer's copy carries its own Delta snapshot forward across commits: each
+/// commit rides the snapshot the previous one produced, so the copy commits
+/// again and again with no reload in between and every commit lands exactly one
+/// version on.
+#[test]
+fn one_copy_commits_repeatedly_without_reloading_between_commits() {
+    let (dir, columns) = three_row_table();
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
+    let mut table = datastore
+        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
+        .unwrap();
+    let start = table.version();
+
+    for id in 0..3 {
+        let name = format!("extra{id}.parquet");
+        let bytes = std::fs::read(write_ids(dir.path(), &name, &[id])).unwrap();
+        table
+            .append_data_file(ObjectPath::new(name), &bytes, None, None)
+            .unwrap();
+    }
+
+    assert_eq!(table.version(), start + 3);
+    assert_eq!(
+        table.file_refs().len(),
+        4,
+        "the seed file plus three appends"
+    );
+}
+
+/// A copy refreshes onto a version another copy committed, picking up its file;
+/// refreshing an already-current copy reports no change.
+#[test]
+fn a_refresh_advances_a_copy_onto_another_copys_commit() {
+    let (dir, columns) = three_row_table();
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
+    let mut reader = datastore
+        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
+        .unwrap();
+    let start = reader.version();
+
+    append(
+        &datastore,
+        "t",
+        &write_ids(dir.path(), "extra.parquet", &[40]),
+    );
+
+    assert_eq!(
+        reader.version(),
+        start,
+        "the other copy's commit is not ours"
+    );
+    assert!(reader.refresh().unwrap(), "the refresh advances us onto it");
+    assert_eq!(reader.version(), start + 1);
+    assert_eq!(reader.file_refs().len(), 2);
+    assert!(
+        !reader.refresh().unwrap(),
+        "a current copy does not advance"
+    );
+}
+
+/// A refresh that cannot materialize the newer version leaves the copy exactly
+/// where it was, files and version together. A copy moved onto a version whose
+/// files it does not hold would never recover: its next refresh finds that
+/// version already current and reconciles nothing, so it would serve, and
+/// commit on top of, a file set missing the rows it claims.
+#[test]
+fn a_refresh_that_cannot_read_the_new_files_leaves_the_copy_untouched() {
+    let (dir, columns) = three_row_table();
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
+    let mut reader = datastore
+        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
+        .unwrap();
+    let version = reader.version();
+
+    // Another writer commits an `Add` for a file that is not in the store, so
+    // any copy reloading onto that version fails to read its footer.
+    let mut writer = datastore
+        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
+        .unwrap();
+    let absent = vec![datastore_delta::DeltaFileEntry::new(
+        datastore_delta::FileRef {
+            path: ObjectPath::new("absent.parquet"),
+            size: 1,
+        },
+    )];
+    assert!(writer.replace_data_files(&[], &absent).is_err());
+
+    assert!(reader.refresh().is_err());
+    assert_eq!(reader.version(), version, "the copy stays at its version");
+    assert_eq!(
+        reader.file_refs().len(),
+        1,
+        "with the files of that version"
+    );
+    assert_eq!(
+        reader.build_scan_view(&[], &[]).unwrap().row_groups().len(),
+        3,
+        "and still scans them"
+    );
 }
 
 /// Compaction merges a table's small files into one target-sized file over the
@@ -1246,7 +1350,7 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
     // "Compact" data.parquet into merged.parquet but crash before deleting the
     // input: both files are on disk, only merged is in the manifest.
     let merged = write_ids(data_dir.path(), "merged.parquet", &[10, 20, 30]);
-    let added = vec![datastore_delta::ManifestEntry::new(
+    let added = vec![datastore_delta::DeltaFileEntry::new(
         datastore_delta::FileRef {
             path: ObjectPath::new("merged.parquet"),
             size: std::fs::metadata(&merged).unwrap().len(),
@@ -1409,7 +1513,7 @@ fn partition_filter_builds_only_the_matching_partitions_files() {
         .table_handle(&SchemaQualifiedTableName::in_default_schema("p"))
         .unwrap();
     table.refresh().unwrap();
-    let kept = table.build_scan_view(&[name_eq("keep")]).unwrap();
+    let kept = table.build_scan_view(&[name_eq("keep")], &[]).unwrap();
 
     // Only the one-group `keep` file enters the scan view; the three-group
     // `drop` file's partition tuple can't match.
@@ -1424,10 +1528,117 @@ fn no_partition_filter_builds_every_partitions_files() {
         .table_handle(&SchemaQualifiedTableName::in_default_schema("p"))
         .unwrap();
     table.refresh().unwrap();
-    let all = table.build_scan_view(&[]).unwrap();
+    let all = table.build_scan_view(&[], &[]).unwrap();
 
     // Without a filter both files are in view: keep's 1 group + drop's 3.
     assert_eq!(all.row_groups().len(), 4);
+}
+
+/// Write `file_name` into `dir` with a constant `part` column and a varying `id`,
+/// one row group per id, so a discovered file is single-partition on `part` with
+/// observable per-group stats.
+fn write_part_id_file(dir: &Path, file_name: &str, part: i32, ids: &[i32]) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("part", DataType::Int32, false),
+        Field::new("id", DataType::Int32, false),
+    ]));
+    let props = WriterProperties::builder()
+        .set_statistics_enabled(EnabledStatistics::Chunk)
+        .set_max_row_group_row_count(Some(1))
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        File::create(dir.join(file_name)).unwrap(),
+        schema.clone(),
+        Some(props),
+    )
+    .unwrap();
+    for id in ids {
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![part])),
+                Arc::new(Int32Array::from(vec![*id])),
+            ],
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+    }
+    writer.close().unwrap();
+}
+
+#[test]
+fn create_over_partitioned_files_stamps_each_file_with_its_partition() {
+    let dir = TempDir::new().unwrap();
+    write_part_id_file(dir.path(), "part-1.parquet", 1, &[10, 11, 12]);
+    write_part_id_file(dir.path(), "part-2.parquet", 2, &[20, 21, 22]);
+    let columns = vec![
+        Column {
+            name: "part".to_string(),
+            col_type: Type::Int32,
+        },
+        Column {
+            name: "id".to_string(),
+            col_type: Type::Int32,
+        },
+    ];
+    let (_database, datastore) = empty_datastore();
+    let mut request = create_request("t", dir.path(), columns);
+    request
+        .options
+        .insert("partition_by".to_string(), "part".to_string());
+    create_table(&datastore, request).unwrap();
+
+    let mut table = datastore
+        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
+        .unwrap();
+    table.refresh().unwrap();
+    let part_is_one = PartitionEqFilter {
+        column: "part".to_string(),
+        value: int_constant(1),
+    };
+    let kept = table.build_scan_view(&[part_is_one], &[]).unwrap();
+
+    // Each discovered file's constant `part` was recorded as its partition, so the
+    // part=1 filter drops the part=2 file's three row groups and keeps part=1's.
+    assert_eq!(kept.row_groups().len(), 3);
+}
+
+#[test]
+fn file_level_stats_prune_drops_a_whole_file_out_of_range() {
+    let dir = TempDir::new().unwrap();
+    write_ids_one_group_each(dir.path(), "low.parquet", &[1, 2, 3]);
+    write_ids_one_group_each(dir.path(), "high.parquet", &[100, 200, 300]);
+    let columns = vec![Column {
+        name: "id".to_string(),
+        col_type: Type::Int32,
+    }];
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
+    let mut table = datastore
+        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
+        .unwrap();
+    for name in ["low.parquet", "high.parquet"] {
+        table
+            .append_data_file(
+                ObjectPath::new(name),
+                &std::fs::read(dir.path().join(name)).unwrap(),
+                None,
+                None,
+            )
+            .unwrap();
+    }
+    table.refresh().unwrap();
+
+    let id_below_fifty = ColumnStatFilter {
+        column: "id".to_string(),
+        compare_type: CompareType::Less,
+        value: int_constant(50),
+    };
+    let kept = table.build_scan_view(&[], &[id_below_fifty]).unwrap();
+
+    // The high file's aggregate min (100) proves no row is `< 50`, so all three
+    // of its groups drop before row-group pruning; the low file's three survive.
+    assert_eq!(kept.row_groups().len(), 3);
 }
 
 // -- Variant shredded-path pushdown --

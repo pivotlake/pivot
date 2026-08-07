@@ -3,7 +3,8 @@
 //! This manifest answers only which tables exist and where their roots are.
 //! Each table's schema, version, and active files come from its Delta log.
 
-use planner::catalog::{Column, SchemaQualifiedTableName};
+use planner::catalog::SchemaQualifiedTableName;
+use planner::expression::CompareType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -142,18 +143,39 @@ pub struct SortBounds {
     pub max: HashMap<String, Scalar<ArrayRef>>,
 }
 
-/// One file in a table manifest: its store identity ([`FileRef`]) plus the
+/// One file at the Delta log level: its store identity ([`FileRef`]), the
 /// optional partition tuple and sort-key bounds a partitioned/sorted INSERT
-/// stamps on it. Both are `None` for files written without that metadata
-/// (an unpartitioned/unsorted table, or compaction output today).
+/// stamps on it, and its Parquet statistics. Each optional field is `None` when
+/// the file carries no such metadata (an unpartitioned/unsorted table, or a file
+/// whose footer stats were not read).
 #[derive(Clone)]
-pub struct ManifestEntry {
+pub struct DeltaFileEntry {
     pub file: FileRef,
     pub partition: Option<PartitionValues>,
     pub sort_bounds: Option<SortBounds>,
+    /// The file's Parquet statistics, persisted into the Delta `Add` action's
+    /// `stats`. `None` for a file we did not write (adopted at CREATE) or reloaded
+    /// from the log, where the stats are not re-committed.
+    pub stats: Option<FileStats>,
 }
 
-impl ManifestEntry {
+/// A file's Parquet statistics, aggregated over its row groups, as they are
+/// persisted into the Delta `Add` action's `stats`: the row count, and per-column
+/// min/max and null count for every column whose type carries them (a column
+/// missing from a map simply records no stat, which is sound: it is never pruned).
+#[derive(Debug, Clone)]
+pub struct FileStats {
+    /// The file's row count. `None` when it could not be read (a reload whose log
+    /// entry recorded no `numRecords`), so an unknown count is never mistaken for
+    /// an empty file and a later pass can fill it in.
+    pub num_records: Option<i64>,
+    /// Per-column min/max as single-element Arrow arrays (the value's own type).
+    pub min_values: HashMap<String, ArrayRef>,
+    pub max_values: HashMap<String, ArrayRef>,
+    pub null_counts: HashMap<String, i64>,
+}
+
+impl DeltaFileEntry {
     /// An entry with no partition/sort metadata (unpartitioned + unsorted table,
     /// or a writer that doesn't record it).
     pub fn new(file: FileRef) -> Self {
@@ -161,6 +183,7 @@ impl ManifestEntry {
             file,
             partition: None,
             sort_bounds: None,
+            stats: None,
         }
     }
 
@@ -186,11 +209,38 @@ impl ManifestEntry {
                 }
         })
     }
+
+    /// Whether this file *can* hold a row matching every stat filter — a soft
+    /// test (like [`maybe_matches_partition`](Self::maybe_matches_partition)), so
+    /// it never wrongly drops a file. A file with no recorded stats, or a filter
+    /// on a column the stats don't bound, keeps the file. Only a min/max range
+    /// that proves no row can match excludes it. Skips a whole file (all its row
+    /// groups) before the finer row-group stats pruning looks inside it.
+    pub fn maybe_matches_stats(&self, filters: &[ColumnStatFilter]) -> bool {
+        let Some(stats) = self.stats.as_ref() else {
+            return true;
+        };
+        filters.iter().all(|filter| {
+            let (Some(min), Some(max)) = (
+                stats.min_values.get(&filter.column),
+                stats.max_values.get(&filter.column),
+            ) else {
+                return true;
+            };
+            !crate::parquet::bounds_eliminate(
+                &Scalar::new(min.clone()),
+                &Scalar::new(max.clone()),
+                filter.compare_type,
+                &filter.value,
+            )
+            .unwrap_or(false)
+        })
+    }
 }
 
 /// A `partition column = constant` predicate the query pushed down, with the
 /// constant retained as Pivot's typed Arrow scalar.
-/// [`ManifestEntry::maybe_matches_partition`] uses it to skip a file whose
+/// [`DeltaFileEntry::maybe_matches_partition`] uses it to skip a file whose
 /// recorded partition value can't match *before* its footer is fetched — the
 /// HTTP a stats prune can't save, since stats live in the footer.
 #[derive(Clone, Debug)]
@@ -199,19 +249,16 @@ pub struct PartitionEqFilter {
     pub value: Scalar<ArrayRef>,
 }
 
-/// One table's in-memory Delta snapshot projected into the metadata Pivot's
-/// existing Parquet scan path consumes.
-///
-/// [`CatalogTable`]: crate::catalog::CatalogTable
-#[derive(Clone)]
-pub struct TableManifest {
-    pub version: u64,
-    pub columns: Vec<Column>,
-    /// Partition columns, in order (identity partitioning); empty = unpartitioned.
-    pub partition_by: Vec<String>,
-    /// Sort columns, in order; empty = unsorted.
-    pub sort_by: Vec<String>,
-    pub entries: Vec<ManifestEntry>,
+/// A `column <cmp> constant` range predicate the query pushed down, retained as
+/// Pivot's typed Arrow scalar. [`DeltaFileEntry::maybe_matches_stats`] uses it to
+/// skip a whole file whose Parquet stats prove no row can match, before the finer
+/// row-group pruning descends into the file. Plain top-level columns only: a
+/// variant path's stats live in a shredded leaf, pruned per row group.
+#[derive(Clone, Debug)]
+pub struct ColumnStatFilter {
+    pub column: String,
+    pub compare_type: CompareType,
+    pub value: Scalar<ArrayRef>,
 }
 
 /// The schema an entry belongs to when the document omits the field: the
@@ -365,14 +412,15 @@ mod tests {
         Scalar::new(Arc::new(array))
     }
 
-    fn manifest_entry(partition: HashMap<String, Scalar<ArrayRef>>) -> ManifestEntry {
-        ManifestEntry {
+    fn manifest_entry(partition: HashMap<String, Scalar<ArrayRef>>) -> DeltaFileEntry {
+        DeltaFileEntry {
             file: FileRef {
                 path: ObjectPath::new("part.parquet"),
                 size: 1,
             },
             partition: Some(partition),
             sort_bounds: None,
+            stats: None,
         }
     }
 

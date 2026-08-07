@@ -98,11 +98,24 @@ pub fn row_group_eliminated(
     let (Some(min), Some(max)) = (stats.min.as_ref(), stats.max.as_ref()) else {
         return Ok(false);
     };
+    bounds_eliminate(min, max, compare_type, constant)
+}
 
+/// Returns whether the inclusive range `[min, max]` proves that
+/// `col <compare_type> constant` matches no value in it. Shared by row-group
+/// elimination and file-level ([`DeltaFileEntry`](crate::manifest::DeltaFileEntry))
+/// stats pruning, so both reason about bounds identically. `min`/`max` are
+/// single-value scalars typed as the physical column.
+pub fn bounds_eliminate(
+    min: &Scalar<ArrayRef>,
+    max: &Scalar<ArrayRef>,
+    compare_type: CompareType,
+    constant: &Scalar<ArrayRef>,
+) -> Result<bool, ArrowError> {
     // Stats come back typed as the physical parquet column (e.g. a DATE stored
     // as UInt16), while the constant carries the logical type (e.g. Date32).
     // The comparison kernels need matching types, so when they differ we can't
-    // prune — keep the row group (always safe, just no pruning).
+    // prune — keep the range (always safe, just no pruning).
     if min.get().0.data_type() != constant.get().0.data_type() {
         return Ok(false);
     }

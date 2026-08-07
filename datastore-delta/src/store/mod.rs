@@ -54,17 +54,26 @@ pub enum StoreError {
 pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// A table's data file: its [`ObjectPath`] in the store and its size in bytes.
-/// The single durable file identity — the [table manifest] records a
-/// `Vec<FileRef>`, [`ObjectStore::list`] returns these, and the catalog and
-/// compacter speak them. The path reads the file directly (no re-joining a
-/// location); the size lets a reader locate a Parquet footer without a separate
-/// HEAD/`stat`.
-///
-/// [table manifest]: crate::manifest::TableManifest
+/// The single durable file identity — a Delta log entry records one,
+/// [`ObjectStore::list`] returns these, and the catalog and compacter speak
+/// them. The path reads the file directly (no re-joining a location); the size
+/// lets a reader locate a Parquet footer without a separate HEAD/`stat`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FileRef {
     pub path: ObjectPath,
     pub size: u64,
+}
+
+/// A listed object paired with its storage modification time (Unix
+/// milliseconds): the backend's own last-modified stamp — a filesystem mtime, or
+/// S3's `LastModified`. Kept out of [`FileRef`] because that timestamp is a
+/// backend clock reading, not part of a file's durable identity; only vacuum's
+/// orphan detection needs it, where an unreferenced file's mtime is the sole
+/// "how new is this" signal for deciding it is safe to delete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedObject {
+    pub file: FileRef,
+    pub modified_unix_ms: u64,
 }
 
 impl FileRef {
@@ -192,23 +201,11 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// the caller's goal (key absent) is already met.
     fn delete(&self, key: &ObjectPath) -> Result<()>;
 
-    /// List objects directly under `prefix` (one level, not recursive), as
-    /// [`FileRef`]s — each a **relative** [`ObjectPath`] (the object's name
-    /// within `prefix`) paired with its size. The caller pairs it with the
-    /// `prefix` it listed to read it.
-    fn list(&self, prefix: &ObjectPath) -> Result<Vec<FileRef>>;
-
-    /// Like [`list`](Self::list), but only objects whose key is at or after
-    /// `start` (a lexicographic lower bound — a full key under `prefix`, e.g. the
-    /// caller's current version file). A backend with a server-side start offset
-    /// (S3 `start-after`) uses it to begin the scan at `start`
-    /// instead of the bottom of the prefix — crucial when the prefix has
-    /// accumulated many soft-deleted tombstones a full scan would wade through.
-    /// The default ignores `start` and returns a full `list` (a correct
-    /// superset); callers must filter the result themselves regardless.
-    fn list_from(&self, prefix: &ObjectPath, _start: &ObjectPath) -> Result<Vec<FileRef>> {
-        self.list(prefix)
-    }
+    /// List objects directly under `prefix` (one level, not recursive), each as
+    /// a [`ListedObject`] — a **relative** [`ObjectPath`] (the object's name
+    /// within `prefix`) with its size and its storage modification time (Unix
+    /// ms).
+    fn list(&self, prefix: &ObjectPath) -> Result<Vec<ListedObject>>;
 
     /// How the io_uring reader should fetch object `key`: a local backend yields
     /// a filesystem path, a remote one a GET URL — either presigned or paired
@@ -224,6 +221,12 @@ pub trait ObjectStore: Debug + Send + Sync {
     fn prepare_write(&self) -> Result<()> {
         Ok(())
     }
+
+    /// Ensure the directory named by `prefix` exists so a writer can create
+    /// objects under it. A local filesystem backend must create it, because a
+    /// writer that addresses the prefix as a real path — Delta Kernel canonicalizes
+    /// a table root before writing its log — fails if the directory is missing.
+    fn create_dir(&self, prefix: &ObjectPath) -> Result<()>;
 
     /// A human-readable description of where this store is rooted - e.g.
     /// `file:///var/lib/pivot` or `s3://bucket/prefix`.

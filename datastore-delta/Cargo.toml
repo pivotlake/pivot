@@ -28,10 +28,12 @@ tracing = { workspace = true }
 # `Datastore::commit_transaction` is async: this datastore self-offloads a
 # writing commit to the blocking pool and finishes a read-only one inline.
 async-trait = "0.1"
-# A datastore self-manages its background maintenance (periodic refresh and
-# compaction), spawning tasks onto the ambient runtime and driving merge
-# dataflows from blocking threads.
-tokio = { workspace = true, features = ["rt", "time"] }
+# A datastore self-manages its background maintenance (periodic refresh,
+# compaction, vacuum), spawning tasks onto the ambient runtime and driving merge
+# dataflows from blocking threads. `rt-multi-thread` also drives Kernel's engine
+# I/O for log writes (checkpoints/commits run a read and a write concurrently,
+# which Kernel's default single-thread executor deadlocks).
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
 bytes = { workspace = true }
 crossbeam-deque = { workspace = true }
 ahash = { workspace = true }

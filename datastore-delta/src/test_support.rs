@@ -173,7 +173,7 @@ fn s3_create_bucket(endpoint: &str) -> Result<(), String> {
 }
 
 use crate::CatalogTable;
-use crate::manifest::{ManifestEntry, SortBounds};
+use crate::manifest::{DeltaFileEntry, SortBounds};
 
 impl CatalogTable {
     /// Test-only: write `bytes` as a new data file at `path` (under the table's
@@ -194,14 +194,15 @@ impl CatalogTable {
             return Ok(());
         }
         let file = self.write_data_file(path, bytes)?;
-        let entry = ManifestEntry {
+        let entry = DeltaFileEntry {
             file,
             partition,
             sort_bounds,
+            stats: None,
         };
         // A plain add (data_change = true); the new file's footer is read on a
         // winning commit via `sync_files_to_manifest`, so no dispatcher is needed.
-        self.commit_manifest_version(&[], &[entry], true, |table| table.sync_files_to_manifest())?;
+        self.commit_entries(&[], &[entry], true)?;
         Ok(())
     }
 }
@@ -215,10 +216,8 @@ impl CatalogTable {
     pub fn replace_data_files(
         &mut self,
         removed: &[ObjectPath],
-        added: &[ManifestEntry],
+        added: &[DeltaFileEntry],
     ) -> crate::Result<()> {
-        self.commit_manifest_version(removed, added, false, |table| {
-            table.sync_files_to_manifest()
-        })
+        self.commit_entries(removed, added, false)
     }
 }

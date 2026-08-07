@@ -45,6 +45,7 @@ pub(crate) mod error;
 mod partition;
 mod shredding;
 mod stats;
+pub(crate) use stats::aggregate_file_stats;
 mod types;
 
 pub(crate) use shredding::unshred_batch;
