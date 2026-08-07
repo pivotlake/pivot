@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use crate::manifest::PartitionEqFilter;
+use crate::manifest::{ColumnStatFilter, PartitionEqFilter};
 use crate::parquet::types::leaves::{first_leaf, variant_shredded_leaves};
 use crate::parquet::types::metadata::RowGroupMetadata;
 use crate::parquet::{
@@ -149,9 +149,11 @@ impl TableBinding {
     /// immutable, so a scan and its late materialize (same filters) build
     /// identical views addressing the same global row-group indices.
     fn resolve_files(&self) -> CatalogResult<Arc<ParquetTable>> {
-        let filters: Vec<PartitionEqFilter> = self.partition_filter_candidates().collect();
+        let partition_filters: Vec<PartitionEqFilter> =
+            self.partition_filter_candidates().collect();
+        let stat_filters: Vec<ColumnStatFilter> = self.stat_filter_candidates().collect();
         self.table
-            .build_scan_view(&filters)
+            .build_scan_view(&partition_filters, &stat_filters)
             .map_err(|e| CatalogError::Other(Box::new(e)))
     }
 
@@ -167,6 +169,24 @@ impl TableBinding {
             .filter_map(|p| {
                 Some(PartitionEqFilter {
                     column: self.columns.get(p.column_idx)?.name.clone(),
+                    value: p.value.clone(),
+                })
+            })
+    }
+
+    /// This binding's pushed predicates as file-level stat-filter candidates: a
+    /// plain top-level column comparison (no variant path) paired with its typed
+    /// constant. Variant paths are excluded — their stats live in a shredded leaf,
+    /// pruned per row group, not in the file's column stats. A column the file's
+    /// stats don't bound simply prunes no files.
+    fn stat_filter_candidates(&self) -> impl Iterator<Item = ColumnStatFilter> + '_ {
+        self.predicates
+            .iter()
+            .filter(|p| p.path.is_empty())
+            .filter_map(|p| {
+                Some(ColumnStatFilter {
+                    column: self.columns.get(p.column_idx)?.name.clone(),
+                    compare_type: p.compare_type,
                     value: p.value.clone(),
                 })
             })
@@ -354,7 +374,7 @@ impl BoundTable for TableBinding {
         // cost model accounts for filter selectivity itself. Build the whole
         // (unfiltered) view over the captured snapshot and sum the footers'
         // row-group counts.
-        let parquet = self.table.build_scan_view(&[]).ok()?;
+        let parquet = self.table.build_scan_view(&[], &[]).ok()?;
         Some(
             parquet
                 .row_groups()

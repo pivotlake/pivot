@@ -157,7 +157,7 @@ pub(super) fn encode_and_upload_spec(
 
 /// One finished upload waiting to be committed, drained from `uploaded_files` by
 /// whoever owns it (a statement's transaction, or compaction). Its consumer
-/// builds the `ManifestEntry` (from `file`/`partition`/`sort_bounds`) and
+/// builds the `DeltaFileEntry` (from `file`/`partition`/`sort_bounds`) and
 /// `TableFile` (from `file`/`row_groups`) it commits. Carries the table's durable
 /// id, not its name, so the commit resolves the live table regardless of a rename.
 pub(crate) struct UploadedFile {
@@ -283,7 +283,7 @@ impl Upload {
         // Build the row groups from the footer the writer already produced; only
         // the location is bound now, since it names the stored file (which exists
         // only once the upload has landed) that future scans read.
-        let table_file = crate::parquet::table_file_from_metadata(
+        let loaded = crate::parquet::file_row_groups_from_metadata(
             pending.file.clone(),
             source,
             pending.metadata,
@@ -298,7 +298,7 @@ impl Upload {
             file: pending.file,
             partition: pending.partition,
             sort_bounds: pending.sort_bounds,
-            row_groups: table_file.row_groups,
+            row_groups: loaded.row_groups,
         });
         // Relaxed: the finish barrier (AcqRel on the sibling counter) publishes
         // this add to whichever worker reads the total.

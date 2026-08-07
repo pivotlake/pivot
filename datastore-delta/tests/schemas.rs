@@ -216,42 +216,6 @@ fn a_refresh_picks_up_a_schema_another_process_created() {
     assert!(other_process.contains_schema("analytics"));
 }
 
-/// The identity a schema maps a table name to and the identity the table's own
-/// Delta log records are two statements about the same table. If they disagree,
-/// the name is pointing at storage that belongs to a different table, and
-/// resolving it would hand back the wrong one, so the open fails instead.
-#[test]
-fn a_table_whose_manifest_identity_contradicts_its_log_is_rejected() {
-    const OTHER_IDENTITY: &str = "00000000-0000-0000-0000-0000000000ff";
-
-    let dispatch = dispatch(1);
-    let db = TempDir::new().unwrap();
-    let datastore = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
-    create_table(&dispatch, &datastore, create_table_request(None, "events")).unwrap();
-
-    // Point the name at an identity the table's log does not record, while
-    // leaving the identity's location the one the table's data is actually at:
-    // the name still resolves to a loadable table, just not to the right one.
-    let manifest_path = db.path().join("_pivot_manifest.json");
-    let mut manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
-    let created = manifest["schemas"][0]["table_ids"]["events"]
-        .as_str()
-        .expect("the created table is listed by identity")
-        .to_string();
-    let location = manifest["table_locations"][&created].clone();
-    manifest["schemas"][0]["table_ids"]["events"] = OTHER_IDENTITY.into();
-    manifest["table_locations"][OTHER_IDENTITY] = location;
-    std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-
-    let error = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap_err();
-
-    assert!(
-        matches!(error, datastore_delta::Error::TableIdentityMismatch { .. }),
-        "expected the two identities to be reported as contradicting, got: {error}"
-    );
-}
-
 #[test]
 fn creating_a_table_in_an_unknown_schema_is_rejected() {
     let dispatch = dispatch(1);

@@ -260,8 +260,9 @@ fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
             .identity;
         assert!(current_parquet(&datastore, "t").row_groups().is_empty());
 
-        // The storage is named for the table's identity, and the Delta log it
-        // holds records that same identity.
+        // The storage is named for the table's identity. The Delta log's own
+        // `metaData` id is Kernel's, minted independently: the catalog owns
+        // identity in its manifest and does not read it back from the log.
         let commit = std::fs::read_to_string(
             db.path()
                 .join(format!("{id}/_delta_log/00000000000000000000.json")),
@@ -282,7 +283,6 @@ fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
         );
         assert_eq!(fields[0]["type"], "string");
         assert_eq!(fields[1]["type"], "long");
-        assert_eq!(metadata["metaData"]["id"], id);
     }
 
     // And it survives a reopen.
@@ -372,4 +372,80 @@ fn rejects_an_object_store_scheme_in_a_table_path() {
         err.contains("not a URL"),
         "expected scheme rejection: {err}"
     );
+}
+
+/// The INSERT path records each written file's Parquet statistics in its `Add`
+/// action's `stats`: the row count, and per-column min/max and null count, so a
+/// reader can count, prune by range, and skip nulls straight from the log.
+#[test]
+fn insert_persists_stats_in_add_stats() {
+    let dispatch = dispatch(2);
+    let table_dir = TempDir::new().unwrap();
+    // Columns `name` (a,b,c) and `value` (1,2,3), no nulls.
+    write_parquet_files(
+        &dispatch,
+        table_dir.path(),
+        vec![strings_and_ints(&["a", "b", "c"], &[1, 2, 3])],
+    );
+
+    // The insert commit (v1) follows the empty CREATE (v0). Aggregate the stats
+    // across however many files the write produced.
+    let commit = std::fs::read_to_string(
+        table_dir
+            .path()
+            .join("_delta_log/00000000000000000001.json"),
+    )
+    .unwrap();
+    let stats: Vec<serde_json::Value> = commit
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|action| action.get("add").is_some())
+        .map(|action| serde_json::from_str(action["add"]["stats"].as_str().unwrap()).unwrap())
+        .collect();
+
+    let total_records: i64 = stats
+        .iter()
+        .map(|s| s["numRecords"].as_i64().unwrap())
+        .sum();
+    assert_eq!(total_records, 3, "the log records the inserted row count");
+
+    // Per-file bounds vary if the write split across workers; the tightest bounds
+    // over all files must span the data.
+    let min_value = stats
+        .iter()
+        .filter_map(|s| s["minValues"]["value"].as_i64())
+        .min()
+        .expect("a file records a min for `value`");
+    let max_value = stats
+        .iter()
+        .filter_map(|s| s["maxValues"]["value"].as_i64())
+        .max()
+        .expect("a file records a max for `value`");
+    assert_eq!(
+        (min_value, max_value),
+        (1, 3),
+        "value min/max span the data"
+    );
+
+    let min_name = stats
+        .iter()
+        .filter_map(|s| s["minValues"]["name"].as_str())
+        .min()
+        .expect("a file records a min for `name`");
+    let max_name = stats
+        .iter()
+        .filter_map(|s| s["maxValues"]["name"].as_str())
+        .max()
+        .expect("a file records a max for `name`");
+    assert_eq!(
+        (min_name, max_name),
+        ("a", "c"),
+        "name min/max span the data"
+    );
+
+    let total_nulls: i64 = stats
+        .iter()
+        .map(|s| s["nullCount"]["value"].as_i64().unwrap())
+        .sum();
+    assert_eq!(total_nulls, 0, "no nulls were inserted");
 }

@@ -181,7 +181,7 @@ mod bodies {
             .unwrap()
             .replace_data_files(
                 &[ObjectPath::new("p1.parquet"), ObjectPath::new("p2.parquet")],
-                &[datastore_delta::ManifestEntry::new(FileRef {
+                &[datastore_delta::DeltaFileEntry::new(FileRef {
                     path: ObjectPath::new("merged.parquet"),
                     size: merged.len() as u64,
                 })],
@@ -214,7 +214,7 @@ mod bodies {
             .list(&ObjectPath::new("d"))
             .unwrap()
             .into_iter()
-            .map(|f| f.path.as_str().to_string())
+            .map(|o| o.file.path.as_str().to_string())
             .collect();
 
         assert_eq!(names, vec!["x.bin".to_string()]);

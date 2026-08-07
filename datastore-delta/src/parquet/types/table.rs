@@ -168,12 +168,15 @@ impl ParquetTable {
         files: Vec<DataFile>,
         declared_columns: &[Column],
     ) -> Result<Self> {
-        let table_files =
-            crate::parquet::metadata::load_table_files(dispatcher, &files, declared_columns.into())
-                .map_err(|e| Error::Materialize(e.to_string()))?;
-        let row_groups = table_files
+        let loaded = crate::parquet::metadata::load_file_row_groups(
+            dispatcher,
+            &files,
+            declared_columns.into(),
+        )
+        .map_err(|e| Error::Materialize(e.to_string()))?;
+        let row_groups = loaded
             .iter()
-            .flat_map(|f| f.row_groups().iter().cloned())
+            .flat_map(|f| f.row_groups.iter().cloned())
             .collect();
         Ok(Self::new(row_groups))
     }

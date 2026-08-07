@@ -25,6 +25,7 @@ pub mod store;
 /// never enter a normal build.
 #[cfg(feature = "test-support")]
 pub mod test_support;
+mod vacuum;
 
 pub use catalog::{
     CatalogTable, DataFileInfo, DeltaDatastore, DeltaSnapshot, DeltaTransaction, Error, Result,
@@ -35,7 +36,8 @@ pub use compact::{
     DEFAULT_MIN_FILES_TO_MERGE, DEFAULT_REFRESH_INTERVAL, MaintenanceConfig,
 };
 pub use manifest::{
-    ManifestEntry, PartitionEqFilter, PartitionValues, SortBounds, pivot_scalar,
+    ColumnStatFilter, DeltaFileEntry, PartitionEqFilter, PartitionValues, SortBounds, pivot_scalar,
     scalar_values_equal, scalar_values_from_row,
 };
 pub use store::FileRef;
+pub use vacuum::{DEFAULT_VACUUM_POLL, VacuumConfig, Vacuumer};

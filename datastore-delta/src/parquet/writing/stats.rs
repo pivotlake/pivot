@@ -6,13 +6,14 @@
 //! [`partition`](super::partition) stage takes the same min/max over a whole
 //! file, for the `sort_bounds` it records in the manifest.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_arith::aggregate::{max, min};
 use arrow_array::{
-    ArrayRef, Date32Array, Decimal64Array, Decimal128Array, Float32Array, Float64Array, Int32Array,
-    Int64Array, StringArray, StringViewArray, TimestampMicrosecondArray, UInt8Array, UInt16Array,
-    UInt32Array, UInt64Array,
+    Array, ArrayRef, Date32Array, Datum, Decimal64Array, Decimal128Array, Float32Array,
+    Float64Array, Int32Array, Int64Array, Scalar, StringArray, StringViewArray,
+    TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, TimeUnit};
 
@@ -161,4 +162,90 @@ fn decimal_stat_bytes(unscaled: i128, precision: u8) -> Vec<u8> {
         crate::parquet::DecimalWriteStorage::Int64 => (unscaled as i64).to_le_bytes().to_vec(),
         crate::parquet::DecimalWriteStorage::FixedLen => unscaled.to_be_bytes().to_vec(),
     }
+}
+
+/// Aggregate a file's per-column Parquet statistics over its row groups into the
+/// [`FileStats`](crate::manifest::FileStats) persisted in the Delta `Add` action:
+/// the row count, and each column's min (min of the groups' mins), max (max of
+/// the maxes), and null count (their sum). A column's bound is kept only when
+/// every row group carries it, so a bound is never claimed from partial coverage.
+/// A column whose type has no decodable min/max (a variant's binary leaf) records
+/// none, which is sound: it is simply never pruned by range.
+pub(crate) fn aggregate_file_stats(
+    row_groups: &[Arc<crate::parquet::RowGroupMetadata>],
+) -> crate::manifest::FileStats {
+    // The footer path always knows the count -- it is the sum of the row groups'
+    // row counts -- so it is always recorded here; only a reload from the log can
+    // leave it unknown.
+    let num_records = Some(row_groups.iter().map(|rg| rg.num_rows).sum());
+    let mut min_values = HashMap::new();
+    let mut max_values = HashMap::new();
+    let mut null_counts = HashMap::new();
+
+    let Some(first) = row_groups.first() else {
+        return crate::manifest::FileStats {
+            num_records,
+            min_values,
+            max_values,
+            null_counts,
+        };
+    };
+    for (column, field) in first.schema.fields().iter().enumerate() {
+        // Fold the row groups' stats into the file's: the smallest group min, the
+        // largest group max, and the sum of null counts. The running min/max
+        // borrow into `row_groups` (each is a single-value stat array); a bound or
+        // count is kept only when every group carries it, so it is never claimed
+        // from partial coverage.
+        let mut min: Option<&Scalar<ArrayRef>> = None;
+        let mut max: Option<&Scalar<ArrayRef>> = None;
+        let mut every_group_has_bounds = true;
+        let mut null_sum: i64 = 0;
+        let mut every_group_has_null_count = true;
+        for rg in row_groups {
+            match rg.column_statistics(column) {
+                Some(stats) => {
+                    match (stats.min.as_ref(), stats.max.as_ref()) {
+                        (Some(lo), Some(hi)) => {
+                            if min.is_none_or(|current| scalar_lt(lo, current)) {
+                                min = Some(lo);
+                            }
+                            if max.is_none_or(|current| scalar_lt(current, hi)) {
+                                max = Some(hi);
+                            }
+                        }
+                        _ => every_group_has_bounds = false,
+                    }
+                    match stats.null_count {
+                        Some(n) => null_sum += n,
+                        None => every_group_has_null_count = false,
+                    }
+                }
+                None => {
+                    every_group_has_bounds = false;
+                    every_group_has_null_count = false;
+                }
+            }
+        }
+        if every_group_has_bounds && let (Some(min), Some(max)) = (min, max) {
+            min_values.insert(field.name().clone(), min.get().0.slice(0, 1));
+            max_values.insert(field.name().clone(), max.get().0.slice(0, 1));
+        }
+        if every_group_has_null_count {
+            null_counts.insert(field.name().clone(), null_sum);
+        }
+    }
+    crate::manifest::FileStats {
+        num_records,
+        min_values,
+        max_values,
+        null_counts,
+    }
+}
+
+/// `a < b` for two single-value scalar bounds, compared in their shared physical
+/// type. A null, type mismatch, or kernel error reads as `false`, so folding a
+/// column's per-row-group bounds gets a well-defined, never-panicking answer.
+fn scalar_lt(a: &Scalar<ArrayRef>, b: &Scalar<ArrayRef>) -> bool {
+    arrow_ord::cmp::lt(a as &dyn Datum, b as &dyn Datum)
+        .is_ok_and(|result| result.len() == 1 && result.is_valid(0) && result.value(0))
 }
