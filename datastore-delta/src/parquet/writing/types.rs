@@ -10,7 +10,6 @@
 
 use std::sync::Arc;
 
-use crate::SortBounds;
 use arrow_array::ArrayRef;
 use arrow_schema::SchemaRef;
 use dispatch::memory::{FileBytes, Slab};
@@ -28,9 +27,9 @@ pub(crate) type FileId = u64;
 
 /// Per-row-group provenance threaded from the [`indexer`](super::indexer)
 /// stage to the [`assembler`](super::assembler). Every field is file-level, so a
-/// file's row groups all carry the same one. Always present (an unpartitioned,
-/// unsorted write carries one with `partition`/`sort_bounds` `None`). `Arc` so
-/// the chunk stages clone it cheaply.
+/// file's row groups all carry the same one. Always present (an unpartitioned
+/// write carries one with `partition` `None`). `Arc` so the chunk stages clone
+/// it cheaply.
 pub(crate) struct PartitionTag {
     /// The output file this row group belongs to; the assembler packs all row
     /// groups of one `file_id` into a single Parquet file.
@@ -38,16 +37,10 @@ pub(crate) struct PartitionTag {
     /// Total row groups in this file, so the assembler knows when it's complete.
     pub(crate) n_row_groups: usize,
     pub(crate) partition: Option<crate::PartitionValues>,
-    /// The file's sort-key bounds (min/max per sort column over the whole file),
-    /// recorded in the manifest. `None` when the table has no sort key. The
-    /// per-row-group, per-column statistics the footer carries are a separate
-    /// thing, computed by the encoder for every leaf.
-    pub(crate) sort_bounds: Option<SortBounds>,
 }
 
 /// A finished Parquet file from the write pipeline, with the manifest metadata to
-/// record for it (`partition`/`sort_bounds` are `None` for an unpartitioned,
-/// unsorted write).
+/// record for it (`partition` is `None` for an unpartitioned write).
 ///
 /// The bytes are the slabs its pages were encoded into, in file order, so the
 /// file is never assembled into one buffer. They are ring memory, so this must
@@ -60,7 +53,6 @@ pub(crate) struct AssembledFile {
     /// the footer back out of a file it just produced.
     pub metadata: thriftparquet::footer::FileMetaData,
     pub partition: Option<crate::PartitionValues>,
-    pub sort_bounds: Option<SortBounds>,
 }
 
 /// The per-row-group metadata every column chunk of a row group shares: its

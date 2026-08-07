@@ -289,7 +289,7 @@ fn s3_create_bucket(endpoint: &str) -> Result<(), String> {
 }
 
 use crate::CatalogTable;
-use crate::manifest::{DeltaFileEntry, SortBounds};
+use crate::manifest::DeltaFileEntry;
 
 impl CatalogTable {
     /// Test-only: write `bytes` as a new data file at `path` (under the table's
@@ -304,7 +304,6 @@ impl CatalogTable {
         path: ObjectPath,
         bytes: &[u8],
         partition: Option<crate::PartitionValues>,
-        sort_bounds: Option<SortBounds>,
     ) -> crate::Result<()> {
         if self.file_refs().iter().any(|file| file.path == path) {
             return Ok(());
@@ -313,7 +312,6 @@ impl CatalogTable {
         let entry = DeltaFileEntry {
             file,
             partition,
-            sort_bounds,
             stats: None,
         };
         // A plain add (data_change = true); the new file's footer is read on a

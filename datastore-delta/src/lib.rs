@@ -36,7 +36,7 @@ pub use compact::{
     DEFAULT_MIN_FILES_TO_MERGE, DEFAULT_REFRESH_INTERVAL, MaintenanceConfig,
 };
 pub use manifest::{
-    ColumnStatFilter, DeltaFileEntry, PartitionEqFilter, PartitionValues, SortBounds, pivot_scalar,
+    ColumnStatFilter, DeltaFileEntry, PartitionEqFilter, PartitionValues, pivot_scalar,
     scalar_values_equal, scalar_values_from_row,
 };
 pub use store::FileRef;

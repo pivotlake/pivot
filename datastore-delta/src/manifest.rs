@@ -133,26 +133,15 @@ pub fn pivot_scalar(array: &ArrayRef, row: usize) -> Scalar<ArrayRef> {
 /// value every row of the file carries for it.
 pub type PartitionValues = HashMap<String, Scalar<ArrayRef>>;
 
-/// The sort key's range within one file: the `sort_by` columns at the file's
-/// first and last row (the file is sorted, so these bound every row). Each side
-/// is a map of column names to typed Pivot scalars. Lets a reader prune a file
-/// on a sort-key range predicate without fetching its footer.
-#[derive(Clone, Debug)]
-pub struct SortBounds {
-    pub min: HashMap<String, Scalar<ArrayRef>>,
-    pub max: HashMap<String, Scalar<ArrayRef>>,
-}
-
 /// One file at the Delta log level: its store identity ([`FileRef`]), the
-/// optional partition tuple and sort-key bounds a partitioned/sorted INSERT
-/// stamps on it, and its Parquet statistics. Each optional field is `None` when
-/// the file carries no such metadata (an unpartitioned/unsorted table, or a file
-/// whose footer stats were not read).
+/// optional partition tuple a partitioned INSERT stamps on it, and its Parquet
+/// statistics. Each optional field is `None` when the file carries no such
+/// metadata (an unpartitioned table, or a file whose footer stats were not
+/// read).
 #[derive(Clone)]
 pub struct DeltaFileEntry {
     pub file: FileRef,
     pub partition: Option<PartitionValues>,
-    pub sort_bounds: Option<SortBounds>,
     /// The file's Parquet statistics, persisted into the Delta `Add` action's
     /// `stats`. `None` for a file we did not write (adopted at CREATE) or reloaded
     /// from the log, where the stats are not re-committed.
@@ -182,7 +171,6 @@ impl DeltaFileEntry {
         Self {
             file,
             partition: None,
-            sort_bounds: None,
             stats: None,
         }
     }
@@ -419,7 +407,6 @@ mod tests {
                 size: 1,
             },
             partition: Some(partition),
-            sort_bounds: None,
             stats: None,
         }
     }

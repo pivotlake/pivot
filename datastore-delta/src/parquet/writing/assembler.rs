@@ -8,7 +8,7 @@
 //! sort columns' footer `Statistics` — and once a `file_id` has all its
 //! `n_row_groups`, builds the file, its row groups in the order they were cut,
 //! and emits it as an [`AssembledFile`] tagged with
-//! the partition tuple and `sort_bounds` to record in the manifest. Nothing
+//! the partition tuple to record in the manifest. Nothing
 //! crosses workers and there is no finish phase: every file completes in
 //! `consume`. (The upstream [`indexer`](super::indexer) is what makes
 //! this possible — it hands down file-sized units with a known row-group count.)
@@ -149,7 +149,6 @@ impl Unary<EncodedColumnChunk, AssembledFile> for FileAssembler {
             bytes,
             metadata,
             partition: header.tag.partition.clone(),
-            sort_bounds: header.tag.sort_bounds.clone(),
         })?;
         Ok(())
     }
@@ -419,7 +418,6 @@ mod tests {
                 file_id: 0,
                 n_row_groups: 1,
                 partition: None,
-                sort_bounds: None,
             }),
         })
     }

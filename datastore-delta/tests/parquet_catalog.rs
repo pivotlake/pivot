@@ -617,9 +617,7 @@ fn append(datastore: &DeltaDatastore, name: &str, path: &Path) {
     let mut handle = datastore
         .table_handle(&SchemaQualifiedTableName::in_default_schema(name))
         .expect("table exists");
-    handle
-        .append_data_file(relative, &bytes, None, None)
-        .unwrap();
+    handle.append_data_file(relative, &bytes, None).unwrap();
     datastore.publish_table(handle);
 }
 
@@ -1090,7 +1088,7 @@ fn one_copy_commits_repeatedly_without_reloading_between_commits() {
         let name = format!("extra{id}.parquet");
         let bytes = std::fs::read(write_ids(dir.path(), &name, &[id])).unwrap();
         table
-            .append_data_file(ObjectPath::new(name), &bytes, None, None)
+            .append_data_file(ObjectPath::new(name), &bytes, None)
             .unwrap();
     }
 
@@ -1477,7 +1475,6 @@ fn table_partitioned_by_name() -> (TempDir, TempDir, Arc<DeltaDatastore>) {
             ObjectPath::new("keep.parquet"),
             &std::fs::read(dir.path().join("keep.parquet")).unwrap(),
             Some(string_values("name", "keep")),
-            None,
         )
         .unwrap();
     table
@@ -1485,7 +1482,6 @@ fn table_partitioned_by_name() -> (TempDir, TempDir, Arc<DeltaDatastore>) {
             ObjectPath::new("drop.parquet"),
             &std::fs::read(dir.path().join("drop.parquet")).unwrap(),
             Some(string_values("name", "drop")),
-            None,
         )
         .unwrap();
     (dir, database, datastore)
@@ -1622,7 +1618,6 @@ fn file_level_stats_prune_drops_a_whole_file_out_of_range() {
             .append_data_file(
                 ObjectPath::new(name),
                 &std::fs::read(dir.path().join(name)).unwrap(),
-                None,
                 None,
             )
             .unwrap();

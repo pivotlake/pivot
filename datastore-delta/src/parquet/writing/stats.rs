@@ -2,9 +2,8 @@
 //!
 //! Used at both ends of the pipeline. The [`encoder`](super::encoder) gives every
 //! leaf its row group's statistics, which is what lets a reader prune row groups
-//! by any column rather than only by the sort key. The
-//! [`indexer`](super::indexer) stage takes the same min/max over a whole
-//! file, for the `sort_bounds` it records in the manifest.
+//! by any column rather than only by the sort key. The whole-file aggregation
+//! feeds the per-file statistics the catalog commits into the Delta log.
 
 use std::collections::HashMap;
 use std::sync::Arc;

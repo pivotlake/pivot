@@ -37,7 +37,7 @@ use planner::catalog::Column;
 use planner::types::Type;
 use url::Url;
 
-use crate::manifest::{DeltaFileEntry, SortBounds};
+use crate::manifest::DeltaFileEntry;
 use crate::store::{FileRef, ObjectPath, ObjectStore};
 
 #[derive(Debug, thiserror::Error)]
@@ -866,7 +866,6 @@ fn scan_file_entry(
             size,
         },
         partition,
-        sort_bounds: None::<SortBounds>,
         // The caller joins in the log-persisted stats (read as Kernel's typed
         // `stats_parsed`) by path; a file the log has no stats for stays `None`.
         stats: None,
@@ -1330,7 +1329,6 @@ mod tests {
                 size: 123,
             },
             partition: None,
-            sort_bounds: None,
             stats: Some(crate::manifest::FileStats {
                 num_records: Some(5),
                 min_values: HashMap::from([(
