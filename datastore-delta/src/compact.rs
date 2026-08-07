@@ -82,6 +82,10 @@ pub struct MaintenanceConfig {
     /// Compaction settings, or `None` to run no compacter (a read-only server
     /// or a deployment where another process owns compaction).
     pub compaction: Option<CompactionConfig>,
+    /// Vacuum settings, or `None` to run no vacuumer (a read-only server, or a
+    /// deployment where another process owns physical cleanup). Deletes
+    /// tombstoned data files and superseded commit JSONs past their retention.
+    pub vacuum: Option<crate::vacuum::VacuumConfig>,
 }
 
 /// Tuning for a datastore's self-managed compaction loop.
@@ -397,7 +401,7 @@ mod tests {
             .table_handle(&SchemaQualifiedTableName::in_default_schema(name))
             .expect("table exists");
         table.refresh().expect("manifest reload");
-        table.build_scan_view(&[]).expect("build scan view")
+        table.build_scan_view(&[], &[]).expect("build scan view")
     }
 
     /// Drive one full compaction sweep to completion on a temporary runtime.

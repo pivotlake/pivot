@@ -1,51 +1,61 @@
 //! Parallel **footer metadata** fetch — the table-load pipeline, run once at
 //! `CREATE`/`ATTACH` (the reading pipeline scans the row groups it produces).
 //! A small work-stealing dataflow with one module per stage, carrying one
-//! [`TableFile`] (a file's [`FileRef`] plus its row
-//! groups) per file end to end:
+//! [`FileRowGroups`] (a file's [`FileRef`] plus the row groups read from its
+//! footer) per file end to end. This layer is Parquet-specific and knows nothing
+//! of the Delta log: the catalog joins each result with its log entry afterward.
 //!
 //! - [`injector`] — the source: hands out the input files.
 //! - [`fetcher`] — reads each file's footer (over the io_uring ring, through the
-//!   compressed cache) on whatever worker steals it, emitting one [`TableFile`].
-//! - [`writer`] — the terminal fan-in sink: gathers the [`TableFile`]s on one
+//!   compressed cache) on whatever worker steals it, emitting one [`FileRowGroups`].
+//! - [`writer`] — the terminal fan-in sink: gathers the [`FileRowGroups`] on one
 //!   worker and hands them to the transaction-staging closure.
 //!
 //! It is consumed two ways, both over the same fetch core
-//! ([`fetch_table_file_factories`]): [`load_table_files`] collects the
-//! [`TableFile`]s on the coordinator and returns them as a **value** (the
+//! ([`fetch_file_row_group_factories`]): [`load_file_row_groups`] collects the
+//! [`FileRowGroups`] on the coordinator and returns them as a **value** (the
 //! `ParquetTable::from_*` constructors, which flatten them into a table), while
 //! [`create_load_and_stage_spec`] returns a `RecordBatchOperatorSpec` ending
-//! in the [`writer`] sink that hands the `Vec<TableFile>` to a staging closure
+//! in the [`writer`] sink that hands the `Vec<FileRowGroups>` to a staging closure
 //! for the `CREATE TABLE` transaction.
 
 mod fetcher;
 mod injector;
 mod writer;
 
-use crate::catalog::TableFile;
+use crate::parquet::types::metadata::RowGroupMetadata;
 use crate::store::{DataFile, DataFileLocation, FileRef};
 use dispatch::{
     DataFlowDispatcher, OperatorSpec, RecordBatchOperatorSpec, RootUnaryOperatorFactory,
     UnaryFactory, fan_in,
 };
-use fetcher::TableFileMetadataFetcher;
+use fetcher::FileRowGroupsFetcher;
 use injector::FileInjectorFactory;
 use planner::catalog::Column;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
-use writer::TableBuildSinkFactory;
+use writer::FileRowGroupsSinkFactory;
 
-/// Builds each worker's [`TableFileMetadataFetcher`], carrying the table's
+/// A file's footer metadata: its store identity ([`FileRef`]) and the row groups
+/// read from its footer, in file-local order. The Parquet-level result of the
+/// metadata-fetch pipeline; the Delta catalog joins it with the file's log entry
+/// to form a [`TableFile`](crate::catalog::TableFile).
+pub struct FileRowGroups {
+    pub file: FileRef,
+    pub row_groups: Vec<Arc<RowGroupMetadata>>,
+}
+
+/// Builds each worker's [`FileRowGroupsFetcher`], carrying the table's
 /// declared column types so every parsed footer is reconciled with them.
 struct MetadataFetcherFactory {
     declared_columns: Arc<[Column]>,
 }
 
-impl UnaryFactory<DataFile, TableFile> for MetadataFetcherFactory {
-    type Unary = TableFileMetadataFetcher;
+impl UnaryFactory<DataFile, FileRowGroups> for MetadataFetcherFactory {
+    type Unary = FileRowGroupsFetcher;
 
     fn build_unary(self) -> Self::Unary {
-        TableFileMetadataFetcher::new(self.declared_columns)
+        FileRowGroupsFetcher::new(self.declared_columns)
     }
 }
 
@@ -54,12 +64,12 @@ impl UnaryFactory<DataFile, TableFile> for MetadataFetcherFactory {
 /// metadata dataflow from a worker and re-parsing a footer we just wrote; only
 /// the open_file has to be bound now, since it names the stored file that future
 /// scans read and exists only once the upload has landed.
-pub(crate) fn table_file_from_metadata(
+pub(crate) fn file_row_groups_from_metadata(
     file: FileRef,
     source: DataFileLocation,
     metadata: thriftparquet::footer::FileMetaData,
     declared_columns: &[Column],
-) -> crate::Result<TableFile> {
+) -> crate::Result<FileRowGroups> {
     let open_file = source.open_read(file.size)?;
     let row_groups = crate::parquet::types::table::row_groups_from_metadata(
         metadata,
@@ -69,19 +79,19 @@ pub(crate) fn table_file_from_metadata(
     .into_iter()
     .map(Arc::new)
     .collect();
-    Ok(TableFile::new(file, row_groups))
+    Ok(FileRowGroups { file, row_groups })
 }
 
 /// The per-worker source→fetch factories: each worker steals files from a shared
-/// injector and reads their footers, emitting one [`TableFile`] per file (the
-/// file's [`FileRef`] rides along on the [`DataFile`] and
-/// lands on the `TableFile`).
-fn fetch_table_file_factories(
+/// injector and reads their footers, emitting one [`FileRowGroups`] per file (the
+/// file's [`FileRef`] rides along on the [`DataFile`] and lands on the result).
+fn fetch_file_row_group_factories(
     files: &[DataFile],
     workers: usize,
     declared_columns: Arc<[Column]>,
-) -> Vec<RootUnaryOperatorFactory<DataFile, TableFile, MetadataFetcherFactory, FileInjectorFactory>>
-{
+) -> Vec<
+    RootUnaryOperatorFactory<DataFile, FileRowGroups, MetadataFetcherFactory, FileInjectorFactory>,
+> {
     let injector = FileInjectorFactory::new(files);
     let siblings = Arc::new(AtomicUsize::new(workers));
     (0..workers)
@@ -98,16 +108,16 @@ fn fetch_table_file_factories(
 }
 
 /// Read every file's footer in parallel and collect the resulting
-/// [`TableFile`]s on the coordinator (file order is not preserved — the table's
+/// [`FileRowGroups`] on the coordinator (file order is not preserved — the table's
 /// row groups are flattened across whichever order the workers finish in). The
-/// fetch stage already emits `TableFile`s, so the dataflow's typed `collect`
+/// fetch stage already emits `FileRowGroups`, so the dataflow's typed `collect`
 /// drains them directly — no terminal sink. Drives the dataflow, so it must run
 /// on the **coordinator**, not inside a `run_on_worker` closure.
-pub(crate) fn load_table_files(
+pub(crate) fn load_file_row_groups(
     dispatcher: &DataFlowDispatcher,
     files: &[DataFile],
     declared_columns: Arc<[Column]>,
-) -> Result<Vec<TableFile>, dispatch::DataFlowError> {
+) -> Result<Vec<FileRowGroups>, dispatch::DataFlowError> {
     // When there is nothing to fetch, skip the dataflow round-trip entirely.
     // Every query's compile resolves its table through here, and a warm
     // catalog has no missing footers, so this is the common case.
@@ -116,13 +126,13 @@ pub(crate) fn load_table_files(
     }
     OperatorSpec::new(
         dispatcher.clone(),
-        fetch_table_file_factories(files, dispatcher.worker_count(), declared_columns),
+        fetch_file_row_group_factories(files, dispatcher.worker_count(), declared_columns),
     )
     .collect()
 }
 
 /// A `RecordBatchOperatorSpec` that, when executed, reads every file's footer in
-/// parallel and — at its terminal stage — regroups the [`TableFile`]s and
+/// parallel and — at its terminal stage — regroups the [`FileRowGroups`] and
 /// hands them to `stage` once on the terminal worker. Emits no rows. The stage
 /// closure must only enqueue the loaded metadata; durable table creation belongs
 /// to the transaction's commit path, outside the dispatch pool.
@@ -133,11 +143,11 @@ pub fn create_load_and_stage_spec<C>(
     stage: C,
 ) -> RecordBatchOperatorSpec
 where
-    C: FnOnce(Vec<TableFile>) + Send + 'static,
+    C: FnOnce(Vec<FileRowGroups>) + Send + 'static,
 {
     let fetch = OperatorSpec::new(
         dispatcher.clone(),
-        fetch_table_file_factories(files, dispatcher.worker_count(), declared_columns),
+        fetch_file_row_group_factories(files, dispatcher.worker_count(), declared_columns),
     );
 
     // `fan_in` funnels every worker's row groups to worker 0; only worker 0 gets
@@ -145,9 +155,9 @@ where
     // no-op). The channel closing is the "all fetched" signal.
     let mut stage = Some(stage);
     let sinks: Vec<_> = (0..dispatcher.worker_count())
-        .map(|_| TableBuildSinkFactory::new(stage.take()))
+        .map(|_| FileRowGroupsSinkFactory::new(stage.take()))
         .collect();
     RecordBatchOperatorSpec::from_spec(
-        fetch.chain(fan_in::<TableFile>(dispatcher.worker_count()), sinks),
+        fetch.chain(fan_in::<FileRowGroups>(dispatcher.worker_count()), sinks),
     )
 }

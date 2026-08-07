@@ -42,7 +42,7 @@ impl FileInjector {
     /// A worker whose `try_finish` saw the queue non-empty (so it did not
     /// decrement its finish counter) can park in the window before it re-checks,
     /// just as another worker claims the final file. Claiming a file emits a
-    /// `TableFile` only to the single fan-in worker, so nothing else wakes that
+    /// `FileRowGroups` only to the single fan-in worker, so nothing else wakes that
     /// parked worker to run its finish. Broadcasting when the queue empties wakes
     /// it (and, via the wake-count bump, any worker mid-park) so every worker
     /// reaches its finish and the stage's sibling counter can drain to zero.
@@ -126,7 +126,7 @@ mod tests {
     /// A worker whose `try_finish` saw the queue non-empty returns without
     /// decrementing its stage's sibling counter. If a peer then claims the last
     /// file, that worker parks on an empty queue still owing its decrement, and
-    /// claiming a file only sends a `TableFile` to the single fan-in worker — so
+    /// claiming a file only sends a `FileRowGroups` to the single fan-in worker — so
     /// nothing else would wake it. Without this broadcast the sibling counter
     /// never reaches zero and `CREATE TABLE` hangs with the pool parked one step
     /// short of done.

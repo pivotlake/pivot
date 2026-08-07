@@ -1,7 +1,7 @@
 //! The local-filesystem [`ObjectStore`] backend: keys are paths under a root
 //! directory, the CAS primitive is an `O_EXCL` create.
 
-use super::{DataFileLocation, FileRef, ObjectPath, ObjectStore, Result, StoreError};
+use super::{DataFileLocation, FileRef, ListedObject, ObjectPath, ObjectStore, Result, StoreError};
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::object_store::local::LocalFileSystem;
 use std::path::PathBuf;
@@ -44,6 +44,13 @@ impl ObjectStore for LocalStore {
         // Keys reach this client as absolute paths from the table URI, so it is
         // rooted at the filesystem rather than at this store's root.
         Ok(Arc::new(LocalFileSystem::new()))
+    }
+
+    fn create_dir(&self, prefix: &ObjectPath) -> Result<()> {
+        std::fs::create_dir_all(self.path_for(prefix)).map_err(|source| StoreError::Io {
+            key: prefix.to_string(),
+            source,
+        })
     }
 
     fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>> {
@@ -118,7 +125,7 @@ impl ObjectStore for LocalStore {
         }
     }
 
-    fn list(&self, prefix: &ObjectPath) -> Result<Vec<FileRef>> {
+    fn list(&self, prefix: &ObjectPath) -> Result<Vec<ListedObject>> {
         let dir = self.path_for(prefix);
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
@@ -145,10 +152,21 @@ impl ObjectStore for LocalStore {
             if !meta.is_file() {
                 continue;
             }
+            let modified = meta.modified().map_err(|source| StoreError::Io {
+                key: prefix.to_string(),
+                source,
+            })?;
+            let modified_unix_ms = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
             if let Some(name) = entry.file_name().to_str() {
-                objects.push(FileRef {
-                    path: ObjectPath::new(name),
-                    size: meta.len(),
+                objects.push(ListedObject {
+                    file: FileRef {
+                        path: ObjectPath::new(name),
+                        size: meta.len(),
+                    },
+                    modified_unix_ms,
                 });
             }
         }

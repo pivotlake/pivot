@@ -40,7 +40,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use uuid::Uuid;
 
-use crate::manifest::{self, CatalogManifest, ManifestEntry, TableManifest};
+use crate::manifest::{self, CatalogManifest, DeltaFileEntry};
 use crate::parquet::ParquetTableError;
 use crate::store::{self, DataFile, FileRef, LocalStore, ObjectPath, ObjectStore, open_store};
 use async_trait::async_trait;
@@ -78,14 +78,6 @@ pub enum Error {
     TableNotFound(String),
     #[error("schema `{0}` does not exist")]
     SchemaNotFound(String),
-    #[error(
-        "table `{table}`: the catalog records identity {manifest}, but its Delta log records {log}"
-    )]
-    TableIdentityMismatch {
-        table: String,
-        manifest: Uuid,
-        log: Uuid,
-    },
     #[error("schema `{0}` already exists")]
     SchemaExists(String),
     #[error("datastore received a transaction created by a different backend")]
@@ -233,6 +225,11 @@ pub struct DeltaDatastore {
     /// database root, an absolute location at the store's own root (the
     /// filesystem root, or the bucket root).
     store: Arc<dyn ObjectStore>,
+    /// The Delta Kernel engine every table's log is read and written through.
+    /// Built once for the store, so a refresh, a commit, or a vacuum sweep reuses
+    /// the one object-store client and task executor instead of standing up its
+    /// own; each table holds a clone.
+    engine: crate::delta::DeltaEngine,
 
     /// The worker pool every footer fetch runs on. Held by the datastore because
     /// refreshes drive their own dataflows, with no dispatcher passed in.
@@ -292,6 +289,7 @@ impl DeltaDatastore {
         maintenance: Option<crate::MaintenanceConfig>,
     ) -> Result<Arc<Self>> {
         let manifest = CatalogManifest::load(store.as_ref())?;
+        let engine = crate::delta::DeltaEngine::new(store.as_ref())?;
 
         let mut index = DatastoreIndex::default();
         for schema in &manifest.schemas {
@@ -299,13 +297,14 @@ impl DeltaDatastore {
         }
         for entry in manifest.tables() {
             let (name, id, location) = entry?;
-            let table = Self::load_table(dispatcher, &store, &name, id, location)?;
+            let table = Self::load_table(dispatcher, &store, &engine, id, location)?;
             index.insert_table(name, table);
         }
 
         Ok(Arc::new(Self {
             tables_index: Arc::new(RwLock::new(index)),
             store,
+            engine,
             dispatcher: dispatcher.clone(),
             maintenance,
             maintenance_tasks: Arc::new(Mutex::new(Vec::new())),
@@ -319,45 +318,52 @@ impl DeltaDatastore {
     fn load_table(
         dispatcher: &DataFlowDispatcher,
         store: &Arc<dyn ObjectStore>,
-        name: &SchemaQualifiedTableName,
+        engine: &crate::delta::DeltaEngine,
         id: Uuid,
         location: &ObjectPath,
     ) -> Result<CatalogTable> {
         let delta_uri = crate::delta::table_uri(&store.location_uri(), location)?;
-        let state = crate::delta::load_table(&delta_uri, store.as_ref())?;
-        // The identity the schema maps this name to is the one the table was
-        // initialized with, so the log has to record the same value. A
-        // disagreement means the two are describing different tables, and
-        // resolving the name would hand back the wrong one.
-        if state.id != id {
-            return Err(Error::TableIdentityMismatch {
-                table: name.to_string(),
-                manifest: id,
-                log: state.id,
-            });
-        }
-        let manifest = TableManifest {
-            version: state.version,
-            columns: state.columns,
-            partition_by: state.partition_by,
-            sort_by: state.sort_by,
-            entries: state.entries,
-        };
-        let files = manifest
-            .entries
+        let state = crate::delta::load_table(&delta_uri, engine)?;
+        let data_files = state
+            .file_entries
             .iter()
-            .map(|f| f.file.clone().into_data_file(store.as_ref(), location))
+            .map(|e| e.file.clone().into_data_file(store.as_ref(), location))
             .collect::<store::Result<Vec<DataFile>>>()?;
-        let declared_columns: Arc<[planner::catalog::Column]> = manifest.columns.clone().into();
-        let table_files = crate::parquet::load_table_files(dispatcher, &files, declared_columns)?;
+        let declared_columns: Arc<[planner::catalog::Column]> = state.columns.clone().into();
+        // The footer fetch returns each file's row groups keyed by identity; join
+        // each back to its log entry (partition tuple) by path.
+        let mut footers: HashMap<ObjectPath, Vec<Arc<crate::parquet::RowGroupMetadata>>> =
+            crate::parquet::load_file_row_groups(dispatcher, &data_files, declared_columns)?
+                .into_iter()
+                .map(|loaded| (loaded.file.path.clone(), loaded.row_groups))
+                .collect();
+        // A file the fetch returned nothing for would scan as an empty file, so
+        // the table fails to open rather than silently serving a narrower one.
+        let files = state
+            .file_entries
+            .into_iter()
+            .map(|entry| {
+                let row_groups =
+                    footers
+                        .remove(&entry.file.path)
+                        .ok_or_else(|| Error::FooterNotLoaded {
+                            location: location.as_str().to_string(),
+                            file: entry.file.path.as_str().to_string(),
+                        })?;
+                Ok(TableFile::new(entry, row_groups))
+            })
+            .collect::<Result<Vec<TableFile>>>()?;
         Ok(CatalogTable::new(
             id,
             location.clone(),
-            manifest,
-            table_files,
+            state.snapshot,
+            state.columns,
+            state.partition_by,
+            state.sort_by,
+            files,
             store.clone(),
             dispatcher.clone(),
-            delta_uri,
+            engine.clone(),
         ))
     }
 
@@ -413,7 +419,13 @@ impl DeltaDatastore {
             if self.tables_index.read().unwrap().contains_table(&name) {
                 continue;
             }
-            let table = match Self::load_table(&self.dispatcher, &self.store, &name, id, location) {
+            let table = match Self::load_table(
+                &self.dispatcher,
+                &self.store,
+                &self.engine,
+                id,
+                location,
+            ) {
                 Ok(table) => table,
                 Err(e) => {
                     tracing::warn!(table = %name, error = %e, "catalog refresh: loading table failed");
@@ -497,6 +509,7 @@ impl DeltaDatastore {
             sort_by,
             self.store.clone(),
             self.dispatcher.clone(),
+            self.engine.clone(),
         )?;
         let mut manifest = CatalogManifest::load(self.store.as_ref())?;
         manifest.upsert_table(&name, id, location)?;
@@ -795,6 +808,7 @@ impl DeltaTransaction {
             .store
             .list(location)?
             .into_iter()
+            .map(|object| object.file)
             .filter(|file| file.path.as_str().ends_with(".parquet"))
             .collect())
     }
@@ -832,7 +846,7 @@ fn commit_table_creations(
 /// and append each table's to its Delta log (a CAS over the sync object store).
 /// The commit base is the transaction's frozen snapshot; a stale base just loses
 /// the first CAS attempt and retries on the reloaded latest (see
-/// [`CatalogTable::commit_manifest_version`]). The datastore's live set is left
+/// [`CatalogTable::commit_files`]). The datastore's live set is left
 /// untouched: the background refresh advances it to the committed version, so an
 /// INSERT never writes shared read state. Blocking store I/O, so
 /// [`DeltaTransaction::commit`] runs it on the blocking pool.
@@ -841,7 +855,7 @@ fn commit_uploaded_files(
     snapshot: &DeltaSnapshot,
     drained: Vec<insert_sink::UploadedFile>,
 ) -> CatalogResult<()> {
-    let mut files_by_table = HashMap::<Uuid, Vec<_>>::new();
+    let mut files_by_table = HashMap::<Uuid, Vec<TableFile>>::new();
     for uploaded in drained {
         let insert_sink::UploadedFile {
             table_id,
@@ -850,14 +864,17 @@ fn commit_uploaded_files(
             sort_bounds,
             row_groups,
         } = uploaded;
-        files_by_table.entry(table_id).or_default().push((
-            ManifestEntry {
-                file: file.clone(),
-                partition,
-                sort_bounds,
-            },
-            TableFile::new(file, row_groups),
-        ));
+        let stats = Some(crate::parquet::aggregate_file_stats(&row_groups));
+        let entry = DeltaFileEntry {
+            file,
+            partition,
+            sort_bounds,
+            stats,
+        };
+        files_by_table
+            .entry(table_id)
+            .or_default()
+            .push(TableFile::new(entry, row_groups));
     }
 
     for (table_id, files) in files_by_table {
@@ -941,6 +958,15 @@ impl Datastore for DeltaDatastore {
             ));
             let compaction_task = tokio::spawn(compacter.run());
             tasks.push(compaction_task.abort_handle());
+        }
+
+        if let Some(vacuum) = maintenance.vacuum {
+            let vacuumer = Arc::new(crate::vacuum::Vacuumer::new(
+                vacuum.poll_interval,
+                Arc::clone(&self),
+            ));
+            let vacuum_task = tokio::spawn(vacuumer.run());
+            tasks.push(vacuum_task.abort_handle());
         }
     }
 
@@ -1075,7 +1101,7 @@ struct PendingTableCreation {
     partition_by: Vec<String>,
     sort_by: Vec<String>,
     if_not_exists: bool,
-    loaded: Vec<TableFile>,
+    loaded: Vec<crate::parquet::FileRowGroups>,
 }
 
 /// The [`DatastoreTransaction`] a [`DeltaDatastore`] opens: one query's frozen
@@ -1254,7 +1280,7 @@ impl TableCreation for DeltaTableCreation {
             dispatcher,
             &self.files,
             declared_columns,
-            move |loaded: Vec<TableFile>| {
+            move |loaded: Vec<crate::parquet::FileRowGroups>| {
                 pending_table_creations.push(PendingTableCreation {
                     name,
                     id,

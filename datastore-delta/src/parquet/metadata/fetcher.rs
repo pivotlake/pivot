@@ -1,5 +1,5 @@
 //! Fetch stage: reads each file's Parquet footer — through the io_uring ring and
-//! the compressed cache, exactly like a column-chunk read — and emits one [`TableFile`]
+//! the compressed cache, exactly like a column-chunk read — and emits one [`FileRowGroups`]
 //! per file (its [`FileRef`] paired with its row groups). The footer-reading
 //! analog of the column-chunk scan fetcher: it keeps many footer reads in flight,
 //! bounded per medium, and shares the same slot/routing/in-flight bookkeeping
@@ -7,7 +7,7 @@
 //! ([`FooterRead`]): read the tail probe window, parse the footer, and — if it
 //! overflowed the probe — read it exactly before parsing.
 
-use crate::catalog::TableFile;
+use super::FileRowGroups;
 use crate::parquet::request_tracker::{PendingRequest, ReadRequest, RequestTracker};
 use crate::parquet::types::metadata::RowGroupMetadata;
 use crate::parquet::types::table::{Error, FOOTER_PROBE_BYTES, Result, row_groups_from_footer};
@@ -36,10 +36,10 @@ pub(super) fn footer_len_from_tail(tail: &[u8]) -> Result<usize> {
     Ok(u32::from_le_bytes(len.try_into().unwrap()) as usize)
 }
 
-/// Reads files' footers and emits one [`TableFile`] per file, keeping many reads
-/// in flight (bounded by `MAX_DISK_IN_FLIGHT`/`MAX_HTTP_IN_FLIGHT` via the
+/// Reads files' footers and emits one [`FileRowGroups`] per file, keeping many
+/// reads in flight (bounded by `MAX_DISK_IN_FLIGHT`/`MAX_HTTP_IN_FLIGHT` via the
 /// shared [`RequestTracker`]).
-pub(super) struct TableFileMetadataFetcher {
+pub(super) struct FileRowGroupsFetcher {
     tracker: RequestTracker<FooterRead>,
     /// The table's declared schema, reconciled with each parsed footer's
     /// schema (see `apply_declared_types`); empty when the table declares
@@ -47,7 +47,7 @@ pub(super) struct TableFileMetadataFetcher {
     declared_columns: Arc<[Column]>,
 }
 
-impl TableFileMetadataFetcher {
+impl FileRowGroupsFetcher {
     pub(super) fn new(declared_columns: Arc<[Column]>) -> Self {
         Self {
             tracker: RequestTracker::default(),
@@ -57,7 +57,7 @@ impl TableFileMetadataFetcher {
 
     /// Advance the read in `slot` as far as it can without blocking on IO: while
     /// its current region is fully present, parse it and either emit the file's
-    /// [`TableFile`] (done) or issue the next region's read (the exact-footer
+    /// [`FileRowGroups`] (done) or issue the next region's read (the exact-footer
     /// re-read). Stop once a region has reads outstanding or the file is finished.
     ///
     /// Called from `consume` (after the probe) and on each completion — both just
@@ -66,7 +66,7 @@ impl TableFileMetadataFetcher {
     fn advance(
         &mut self,
         slot: usize,
-        sender: &mut dyn Sender<TableFile>,
+        sender: &mut dyn Sender<FileRowGroups>,
     ) -> dispatch::UnaryResult<()> {
         while !self.tracker.request_for_slot(slot).unwrap().is_pending() {
             let parsed = self
@@ -82,7 +82,10 @@ impl TableFileMetadataFetcher {
                 Some(row_groups) => {
                     let request = self.tracker.take_request_at_slot(slot);
                     let row_groups = row_groups.into_iter().map(Arc::new).collect();
-                    sender.send(TableFile::new(request.file, row_groups))?;
+                    sender.send(FileRowGroups {
+                        file: request.file,
+                        row_groups,
+                    })?;
                     return Ok(());
                 }
             }
@@ -91,17 +94,17 @@ impl TableFileMetadataFetcher {
     }
 }
 
-impl Unary<DataFile, TableFile> for TableFileMetadataFetcher {
+impl Unary<DataFile, FileRowGroups> for FileRowGroupsFetcher {
     fn consume(
         &mut self,
         file: DataFile,
-        sender: &mut dyn Sender<TableFile>,
+        sender: &mut dyn Sender<FileRowGroups>,
     ) -> dispatch::UnaryResult<()> {
         // Open the file's transport. The size — which locates the footer's tail
         // window with no HEAD/suffix probe — is already carried by the data
         // file (`stat`ed at listing time for a local file, from the store
         // listing for a remote one). The `file_ref` rides through to the emitted
-        // `TableFile`.
+        // `FileRowGroups`.
         let DataFile {
             file: file_ref,
             source,
@@ -132,7 +135,7 @@ impl Unary<DataFile, TableFile> for TableFileMetadataFetcher {
 
     fn process_fs_read_response(
         &mut self,
-        sender: &mut dyn Sender<TableFile>,
+        sender: &mut dyn Sender<FileRowGroups>,
         request: FsReadRequest,
     ) -> dispatch::UnaryResult<()> {
         for slot in self.tracker.complete(&ReadRequest::of_fs(&request)) {
@@ -144,7 +147,7 @@ impl Unary<DataFile, TableFile> for TableFileMetadataFetcher {
 
     fn process_http_get_response(
         &mut self,
-        sender: &mut dyn Sender<TableFile>,
+        sender: &mut dyn Sender<FileRowGroups>,
         request: HttpGetRequest,
     ) -> dispatch::UnaryResult<()> {
         for slot in self.tracker.complete(&ReadRequest::of_http_get(&request)) {
@@ -154,7 +157,7 @@ impl Unary<DataFile, TableFile> for TableFileMetadataFetcher {
         Ok(())
     }
 
-    fn finish(&mut self, _sender: &mut dyn Sender<TableFile>) -> dispatch::UnaryResult<bool> {
+    fn finish(&mut self, _sender: &mut dyn Sender<FileRowGroups>) -> dispatch::UnaryResult<bool> {
         Ok(self.tracker.is_idle())
     }
 }
@@ -167,7 +170,7 @@ impl Unary<DataFile, TableFile> for TableFileMetadataFetcher {
 /// all landed, [`parse_region`](Self::parse_region) turns it into the file's row
 /// groups (or issues the exact re-read).
 struct FooterRead {
-    /// The file's durable identity, stamped onto the emitted [`TableFile`].
+    /// The file's durable identity, stamped onto the emitted [`FileRowGroups`].
     file: FileRef,
     /// The open file (it keeps the handle alive, and travels into the row
     /// groups as their file).
