@@ -14,7 +14,10 @@
 //! ([`ObjectStore::build_delta_object_store`])
 //! instead of letting it resolve its own.
 
-use super::{DataFileLocation, FileRef, ObjectPath, ObjectStore, Result, StoreError, object_key};
+use super::{
+    DataFileLocation, FileRef, ListedObject, ObjectPath, ObjectStore, Result, StoreError,
+    object_key,
+};
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
     PayloadChecksumKind, SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
@@ -186,6 +189,12 @@ impl ObjectStore for S3Store {
         format!("{} (prefix `{}`)", self.base, self.prefix)
     }
 
+    /// A no-op: S3 has no directories. A key is a flat string, and an object at
+    /// `prefix/name` exists the moment it is PUT, with no parent to create first.
+    fn create_dir(&self, _prefix: &ObjectPath) -> Result<()> {
+        Ok(())
+    }
+
     fn location_uri(&self) -> String {
         self.uri.clone()
     }
@@ -277,7 +286,7 @@ impl ObjectStore for S3Store {
         }
     }
 
-    fn list(&self, prefix: &ObjectPath) -> Result<Vec<FileRef>> {
+    fn list(&self, prefix: &ObjectPath) -> Result<Vec<ListedObject>> {
         let object_prefix = object_key(&self.prefix, prefix);
         // ListObjectsV2, one level (delimiter=/), under the object prefix.
         let query = format!(
@@ -297,14 +306,25 @@ impl ObjectStore for S3Store {
         let parsed: ListBucketResult = quick_xml::de::from_str(&body)
             .map_err(|e| StoreError::Http(format!("LIST parse: {e}")))?;
 
-        Ok(parsed
+        parsed
             .contents
             .into_iter()
-            .map(|c| FileRef {
-                path: ObjectPath::new(super::key_name(&c.key)),
-                size: c.size,
+            .map(|c| {
+                let modified_unix_ms = parse_iso8601_millis(&c.last_modified).ok_or_else(|| {
+                    StoreError::Http(format!(
+                        "LIST object `{}` has an unparseable LastModified `{}`",
+                        c.key, c.last_modified
+                    ))
+                })?;
+                Ok(ListedObject {
+                    file: FileRef {
+                        path: ObjectPath::new(super::key_name(&c.key)),
+                        size: c.size,
+                    },
+                    modified_unix_ms,
+                })
             })
-            .collect())
+            .collect()
     }
 
     fn source(&self, key: &ObjectPath) -> Result<DataFileLocation> {
@@ -391,6 +411,18 @@ struct Contents {
     key: String,
     #[serde(default)]
     size: u64,
+    /// ISO-8601 `LastModified` (e.g. `2009-10-12T17:50:30.000Z`), parsed by
+    /// [`parse_iso8601_millis`] for vacuum's orphan sweep.
+    #[serde(default)]
+    last_modified: String,
+}
+
+/// Parse an S3 `LastModified` timestamp (RFC 3339, always UTC) into Unix
+/// milliseconds. Returns `None` on any malformed field, which the caller turns
+/// into a listing error rather than a silently-wrong (too-old) timestamp.
+fn parse_iso8601_millis(s: &str) -> Option<u64> {
+    let nanos = arrow_cast::parse::string_to_timestamp_nanos(s).ok()?;
+    u64::try_from(nanos / 1_000_000).ok()
 }
 
 /// Split an `s3://bucket/prefix` (or `s3a://…`) URI into its bucket and

@@ -41,15 +41,16 @@ pub use reading::{
 };
 
 pub mod writing;
+pub(crate) use writing::aggregate_file_stats;
 
 mod metadata;
-pub use metadata::create_load_and_stage_spec;
-pub(crate) use metadata::load_table_files;
-pub(crate) use metadata::table_file_from_metadata;
+pub use metadata::{FileRowGroups, create_load_and_stage_spec};
+pub(crate) use metadata::{file_row_groups_from_metadata, load_file_row_groups};
 
 mod row_group_stats;
 pub use row_group_stats::{
-    RowGroupFilter, ScanOrder, row_group_eliminated, row_group_filter_from, scan_order_from,
+    RowGroupFilter, ScanOrder, bounds_eliminate, row_group_eliminated, row_group_filter_from,
+    scan_order_from,
 };
 
 pub(crate) mod types;
