@@ -1,7 +1,7 @@
 //! The catalog's in-memory projection of one Delta table snapshot.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::Error;
 use crate::manifest::{
@@ -43,40 +43,107 @@ impl TableFile {
     }
 }
 
-/// The catalog's master record of one table: its declared schema, partitioning,
-/// version, and its active [`TableFile`]s — each a file's Delta log entry paired
-/// with its materialized row groups.
+/// One committed version of a table: the Delta snapshot, the schema and layout
+/// declared by it, and the [`TableFile`]s active at it (each a log entry paired
+/// with its materialized row groups).
 ///
-/// It is a plain **value** — `Clone`, no interior locks. A writer (INSERT,
-/// compaction) clones one out of the catalog, mutates its own copy, and lets the
-/// Delta log be the source of truth: every mutation (an append of freshly-uploaded
-/// files, or a compaction swap) commits a new version by compare-and-swap,
-/// retrying past a concurrent writer. Copies drift freely;
-/// [`refresh`](Self::refresh) reconciles any copy to the latest version (re-reading
-/// only the footers it doesn't already hold). `store` and `location` are kept so a
-/// copy can persist and reload itself.
-#[derive(Clone)]
-pub struct CatalogTable {
+/// The snapshot and the files are one indivisible unit. A snapshot paired with a
+/// file list built at a different version would name files its holder does not
+/// hold, and nothing would heal that: the holder's next refresh finds its version
+/// already current and reconciles nothing. So every step that moves one moves the
+/// other, and builds the whole value before publishing it.
+struct TableVersion {
+    /// The Delta snapshot this version is at: the version its `files` were built
+    /// from, and the base a commit riding it is written on top of.
+    snapshot: Arc<delta_kernel::Snapshot>,
+    /// The table's declared columns (schema), as of this version. Shared rather
+    /// than owned, so the versions a table passes through hand the schema and
+    /// layout along by pointer instead of re-copying them per commit.
+    columns: Arc<[Column]>,
+    /// Partition columns, in order; empty = unpartitioned.
+    partition_by: Arc<[String]>,
+    /// Sort columns, in order; empty = unsorted.
+    sort_by: Arc<[String]>,
+    /// The active files: each a log entry (identity + partition + stats) paired
+    /// with its materialized footers.
+    files: Vec<TableFile>,
+}
+
+impl TableVersion {
+    /// One version, from the schema and layout a log read reports and the files
+    /// materialized for it.
+    fn new(
+        snapshot: Arc<delta_kernel::Snapshot>,
+        columns: Vec<Column>,
+        partition_by: Vec<String>,
+        sort_by: Vec<String>,
+        files: Vec<TableFile>,
+    ) -> Self {
+        Self {
+            snapshot,
+            columns: columns.into(),
+            partition_by: partition_by.into(),
+            sort_by: sort_by.into(),
+            files,
+        }
+    }
+
+    /// This version plus the commit just written on top of it: `snapshot` is the
+    /// version that commit produced, and the files it changed are folded onto the
+    /// ones this version holds. Schema and layout carry over, since a data-file
+    /// commit does not touch them.
+    ///
+    /// A path is carried by exactly one file, so an added path displaces the file
+    /// already holding it rather than joining it. The log reads the same way (the
+    /// later `Add` wins), and a file listed twice would have its rows scanned, and
+    /// counted, twice.
+    fn advance(
+        &self,
+        snapshot: Arc<delta_kernel::Snapshot>,
+        removed: &[ObjectPath],
+        added: Vec<TableFile>,
+    ) -> Self {
+        let replaced: HashSet<&ObjectPath> =
+            added.iter().map(|file| &file.entry.file.path).collect();
+        let mut files: Vec<TableFile> = self
+            .files
+            .iter()
+            .filter(|f| {
+                !removed.contains(&f.entry.file.path) && !replaced.contains(&f.entry.file.path)
+            })
+            .cloned()
+            .collect();
+        files.extend(added);
+        Self {
+            snapshot,
+            columns: self.columns.clone(),
+            partition_by: self.partition_by.clone(),
+            sort_by: self.sort_by.clone(),
+            files,
+        }
+    }
+}
+
+/// Replace `target` with `candidate` when `candidate` is at a later version, so
+/// that of two views of one table the newer wins. Both directions matter: a
+/// writer takes up the version the table's previous writer left, and a copy that
+/// read a newer version off the log leaves it for the table's next writer.
+fn keep_newer(target: &mut Arc<TableVersion>, candidate: &Arc<TableVersion>) {
+    if candidate.snapshot.version() > target.snapshot.version() {
+        *target = candidate.clone();
+    }
+}
+
+/// What every copy of one table shares: the identity and storage that are fixed
+/// for the table's life, and the latest version committed in this process, behind
+/// the lock a writer commits under.
+struct SharedTable {
     /// The table's durable identity, from the Delta `metaData.id` (minted once at
     /// creation, stable across renames and every commit). The catalog indexes by
     /// this.
     id: uuid::Uuid,
     /// Where the table's Parquet data lives in the object store.
     location: ObjectPath,
-    /// The Delta snapshot this copy is at: the version its `files` were built
-    /// from, and the base every commit from this copy is written on top of. It is
-    /// this copy's alone: a refresh advances it, a commit replaces it with the one
-    /// the commit produced, and neither reads a log another copy is holding.
-    snapshot: Arc<delta_kernel::Snapshot>,
-    /// The table's declared columns (schema).
-    columns: Vec<Column>,
-    /// Partition columns, in order; empty = unpartitioned.
-    partition_by: Vec<String>,
-    /// Sort columns, in order; empty = unsorted.
-    sort_by: Vec<String>,
-    /// The active files: each a log entry (identity + partition + stats) paired
-    /// with its materialized footers.
-    pub(super) files: Vec<TableFile>,
     store: Arc<dyn ObjectStore>,
     /// The pool a reload/commit fetches footers on, so the mutators need no
     /// dispatcher passed in.
@@ -84,11 +151,67 @@ pub struct CatalogTable {
     /// The Kernel engine this table's log is read and written through, shared
     /// with every other table of the datastore that opened it.
     engine: crate::delta::DeltaEngine,
+    /// The newest version this process holds, and the lock a commit takes for its
+    /// whole duration. Writers of one table therefore take it in turn, each
+    /// building on the version the one before produced, so two in-process writers
+    /// never aim at the same log version: the compare-and-swap is left to settle
+    /// races against *other* processes only. Without it, every concurrent writer
+    /// but one loses its swap and pays a full reload (a log listing plus the
+    /// footers of the winner's files) before retrying, which is quadratic in the
+    /// number of writers committing at once.
+    committed: Mutex<Arc<TableVersion>>,
+}
+
+impl SharedTable {
+    /// Take the commit lock, waiting for the writer that holds it.
+    ///
+    /// Poisoning is recovered from rather than propagated: the slot only ever
+    /// holds a whole committed version, installed as the last step of a commit
+    /// that already won its swap, so a panic mid-commit leaves the value intact
+    /// and the next writer can build on it. Failing every later commit and
+    /// refresh of the table instead would turn one panicking write into a table
+    /// that never advances again.
+    fn lock_committed(&self) -> std::sync::MutexGuard<'_, Arc<TableVersion>> {
+        self.committed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Take the commit lock only if no writer holds it. A refresh syncs with the
+    /// shared version through this: reading the log is what a refresh is for, and
+    /// it is never worth parking a reader (or a runtime worker) behind a commit's
+    /// object-store I/O for a step that only saves work.
+    fn try_lock_committed(&self) -> Option<std::sync::MutexGuard<'_, Arc<TableVersion>>> {
+        match self.committed.try_lock() {
+            Ok(committed) => Some(committed),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+}
+
+/// The catalog's master record of one table: its declared schema, partitioning,
+/// version, and its active [`TableFile`]s.
+///
+/// A copy reads a **frozen** version: cloning one is two pointer bumps and never
+/// blocks, and the version it reads cannot move under it, so a query binds,
+/// scans, and late-materializes against one consistent file set. Writing is the
+/// other half: a writer (INSERT, compaction) clones one out of the catalog and
+/// commits its uploaded files or a compaction swap, which advances the version
+/// this copy reads and the one [`SharedTable::committed`] hands the table's next
+/// writer. [`refresh`](Self::refresh) advances a copy onto the latest committed
+/// version, re-reading only the footers it doesn't already hold.
+#[derive(Clone)]
+pub struct CatalogTable {
+    shared: Arc<SharedTable>,
+    /// The version this copy reads: whatever the table stood at when the copy was
+    /// made, held frozen until this copy refreshes or commits.
+    version: Arc<TableVersion>,
 }
 
 impl CatalogTable {
     /// Reassemble a persisted table from its table-level metadata and the per-file
-    /// [`TableFile`]s (log entry + footers) just built for it — the reopen path.
+    /// [`TableFile`]s (log entry + footers) just built for it -- the reopen path.
     /// Does not persist anything; the log it was loaded from is already durable.
     #[allow(clippy::too_many_arguments)] // an internal constructor; each field is needed
     pub(super) fn new(
@@ -103,17 +226,39 @@ impl CatalogTable {
         dispatcher: DataFlowDispatcher,
         engine: crate::delta::DeltaEngine,
     ) -> Self {
-        Self {
+        Self::at_version(
             id,
             location,
-            snapshot,
-            columns,
-            partition_by,
-            sort_by,
-            files,
+            TableVersion::new(snapshot, columns, partition_by, sort_by, files),
             store,
             dispatcher,
             engine,
+        )
+    }
+
+    /// Open a table at `version`, minting the state its copies share. Every later
+    /// copy comes from cloning this one, so they all commit through the one lock;
+    /// calling this twice for the same table would give the two families separate
+    /// locks, which is why only the load and create paths do.
+    fn at_version(
+        id: uuid::Uuid,
+        location: ObjectPath,
+        version: TableVersion,
+        store: Arc<dyn ObjectStore>,
+        dispatcher: DataFlowDispatcher,
+        engine: crate::delta::DeltaEngine,
+    ) -> Self {
+        let version = Arc::new(version);
+        Self {
+            shared: Arc::new(SharedTable {
+                id,
+                location,
+                store,
+                dispatcher,
+                engine,
+                committed: Mutex::new(version.clone()),
+            }),
+            version,
         }
     }
 
@@ -165,26 +310,51 @@ impl CatalogTable {
             &sort_by,
             &entries,
         )?;
-        Ok(Self {
+        Ok(Self::at_version(
             id,
             location,
-            snapshot,
-            columns,
-            partition_by,
-            sort_by,
-            files,
+            TableVersion::new(snapshot, columns, partition_by, sort_by, files),
             store,
             dispatcher,
             engine,
-        })
+        ))
     }
 
     /// Advance this copy to the latest committed version, reconciling its files
     /// to it. Returns whether it advanced; `Ok(false)` means this copy was
     /// already current, which costs one log listing and no file reads (Kernel
     /// updates the snapshot in hand rather than rebuilding it).
+    ///
+    /// Syncs with the version the table's writers share, in both directions:
+    /// starting from a version a writer in this process already committed spares
+    /// the log read that version's files (they are materialized, sort bounds and
+    /// all), and a version read off the log is left for the table's next writer,
+    /// so a commit another process wrote is picked up here rather than by that
+    /// writer losing a swap to discover it. Both steps skip a table under an
+    /// in-flight commit rather than wait for it: they only save work, and the log
+    /// read below reaches the same version either way.
     pub fn refresh(&mut self) -> crate::Result<bool> {
-        let Some(state) = crate::delta::refresh_table(&self.snapshot, &self.engine)? else {
+        let mut advanced = false;
+        if let Some(committed) = self.shared.try_lock_committed() {
+            let before = self.version();
+            keep_newer(&mut self.version, &committed);
+            advanced = self.version() > before;
+        }
+        if !self.advance_to_latest()? {
+            return Ok(advanced);
+        }
+        if let Some(mut committed) = self.shared.try_lock_committed() {
+            keep_newer(&mut committed, &self.version);
+        }
+        Ok(true)
+    }
+
+    /// Advance this copy alone onto the latest committed version, leaving the
+    /// shared state untouched. The commit loop refreshes through this, since it
+    /// already holds the commit lock and publishes what it commits.
+    fn advance_to_latest(&mut self) -> crate::Result<bool> {
+        let Some(state) = crate::delta::refresh_table(&self.version.snapshot, &self.shared.engine)?
+        else {
             return Ok(false);
         };
         let crate::delta::DeltaTableState {
@@ -197,60 +367,104 @@ impl CatalogTable {
         // Reconcile the files first: it is the only step that can fail, and it
         // leaves this copy untouched when it does, so a copy never ends up at a
         // version whose files it does not hold.
-        self.rebuild_files(file_entries, &columns)?;
-        self.snapshot = snapshot;
-        self.columns = columns;
-        self.partition_by = partition_by;
-        self.sort_by = sort_by;
+        let files = self.reconcile_files(file_entries, &columns)?;
+        self.version = Arc::new(TableVersion::new(
+            snapshot,
+            columns,
+            partition_by,
+            sort_by,
+            files,
+        ));
         Ok(true)
     }
 
-    /// The commit loop every mutation runs: check each `removed` path is still
-    /// present (else [`Error::CommitConflict`] -- a concurrent writer swapped it
-    /// out), then commit the removes plus `added`'s log entries through Delta
-    /// Kernel on top of this copy's own snapshot. A win therefore lands exactly
-    /// one version above the state `self.files` describes, so `added` (each a log
-    /// entry *and* its footers) folds straight onto them -- no footer re-read, and
-    /// no other writer's files to miss. A writer that got there first conflicts
+    /// The commit loop every mutation runs, under the table's commit lock: check
+    /// each `removed` path is still present (else [`Error::CommitConflict`] -- a
+    /// concurrent writer swapped it out), then commit the removes plus `added`'s
+    /// log entries through Delta Kernel on top of the newest version this process
+    /// holds. A win therefore lands exactly one version above the state that
+    /// version's files describe, so `added` (each a log entry *and* its footers)
+    /// folds straight onto them -- no footer re-read, and no other writer's files
+    /// to miss. A writer in *another* process that got there first conflicts
     /// instead, and this copy reloads onto the newer version and retries; so does
-    /// a removal another writer already swapped out.
+    /// a removal such a writer already swapped out.
     ///
-    /// Runs off the dispatch workers: the retry's `refresh` drives a footer-fetch
-    /// dataflow, and every commit path commits from a blocking thread, never a
-    /// pinned worker (which would deadlock driving a dataflow from inside one).
+    /// Holding the lock across the whole commit is what keeps in-process writers
+    /// off each other (see [`SharedTable::committed`]).
+    ///
+    /// Runs off the dispatch workers: a retry drives a footer-fetch dataflow, and
+    /// every commit path commits from a blocking thread, never a pinned worker
+    /// (which would deadlock driving a dataflow from inside one).
     pub(crate) fn commit_files(
         &mut self,
         removed: &[ObjectPath],
         added: Vec<TableFile>,
         data_change: bool,
     ) -> crate::Result<()> {
-        loop {
-            if let Some(missing) = removed.iter().find(|path| {
-                !self
-                    .files
-                    .iter()
-                    .any(|f| f.entry.file.path.as_str() == path.as_str())
-            }) {
-                return Err(Error::CommitConflict {
-                    location: self.location.as_str().to_string(),
-                    file: missing.to_string(),
-                });
-            }
-            let entries: Vec<DeltaFileEntry> = added.iter().map(|f| f.entry.clone()).collect();
-            if let Some(committed) = crate::delta::commit_file_changes(
-                &self.engine,
-                &self.snapshot,
+        let entries: Vec<DeltaFileEntry> = added.iter().map(|f| f.entry.clone()).collect();
+        self.commit_and_publish(removed, &entries, data_change, |_| Ok(added))
+    }
+
+    /// The one commit protocol both entry points run: take the table's commit
+    /// lock, build on the version its last writer left, retry the swap until it
+    /// lands, then install what it produced. `files_of` supplies the added files
+    /// paired with their footers, and runs only once the swap has won.
+    fn commit_and_publish(
+        &mut self,
+        removed: &[ObjectPath],
+        entries: &[DeltaFileEntry],
+        data_change: bool,
+        files_of: impl FnOnce(&Self) -> crate::Result<Vec<TableFile>>,
+    ) -> crate::Result<()> {
+        let shared = self.shared.clone();
+        let mut committed = shared.lock_committed();
+        keep_newer(&mut self.version, &committed);
+        let snapshot = loop {
+            self.check_still_present(removed)?;
+            if let Some(snapshot) = crate::delta::commit_file_changes(
+                &shared.engine,
+                &self.version.snapshot,
                 removed,
-                &entries,
+                entries,
                 data_change,
             )? {
-                self.snapshot = committed;
-                self.files.retain(|f| !removed.contains(&f.entry.file.path));
-                self.files.extend(added);
-                return Ok(());
+                break snapshot;
             }
-            self.refresh()?;
-        }
+            // The swap did not land, so the log must have moved for the retry to
+            // stand a different chance. It always has when another writer took
+            // the version; a swap refused with the log where we left it would
+            // otherwise have this loop reissue the same commit forever, holding
+            // the table's commit lock while it spun.
+            if !self.advance_to_latest()? {
+                return Err(Error::CommitStalled {
+                    location: shared.location.as_str().to_string(),
+                    version: self.version(),
+                });
+            }
+        };
+        let added = files_of(self)?;
+        self.version = Arc::new(self.version.advance(snapshot, removed, added));
+        *committed = self.version.clone();
+        Ok(())
+    }
+
+    /// Fail with [`Error::CommitConflict`] if any of `removed` is no longer among
+    /// this copy's files: a writer this commit cannot win against already swapped
+    /// it out, so the removal has nothing to remove.
+    fn check_still_present(&self, removed: &[ObjectPath]) -> crate::Result<()> {
+        let Some(missing) = removed.iter().find(|path| {
+            !self
+                .version
+                .files
+                .iter()
+                .any(|f| f.entry.file.path.as_str() == path.as_str())
+        }) else {
+            return Ok(());
+        };
+        Err(Error::CommitConflict {
+            location: self.shared.location.as_str().to_string(),
+            file: missing.to_string(),
+        })
     }
 
     /// Commit freshly-uploaded files whose footers are already built — the INSERT
@@ -273,69 +487,47 @@ impl CatalogTable {
         added: &[DeltaFileEntry],
         data_change: bool,
     ) -> crate::Result<()> {
-        loop {
-            if let Some(missing) = removed.iter().find(|path| {
-                !self
-                    .files
-                    .iter()
-                    .any(|f| f.entry.file.path.as_str() == path.as_str())
-            }) {
-                return Err(Error::CommitConflict {
-                    location: self.location.as_str().to_string(),
-                    file: missing.to_string(),
-                });
+        // The footers are read by `files_of`, so they are read only once the swap
+        // has won, and are built whole before this copy moves onto the committed
+        // version: a failed read leaves it where it was rather than at a version
+        // whose files it does not hold.
+        self.commit_and_publish(removed, added, data_change, |table| {
+            let mut footers: HashMap<ObjectPath, Vec<Arc<RowGroupMetadata>>> = table
+                .fetch_footers(added, &table.version.columns)?
+                .into_iter()
+                .map(|f| (f.file.path.clone(), f.row_groups))
+                .collect();
+            let mut committed_files = Vec::with_capacity(added.len());
+            for entry in added {
+                let row_groups =
+                    footers
+                        .remove(&entry.file.path)
+                        .ok_or_else(|| Error::FooterNotLoaded {
+                            location: table.shared.location.as_str().to_string(),
+                            file: entry.file.path.as_str().to_string(),
+                        })?;
+                committed_files.push(TableFile::new(entry.clone(), row_groups));
             }
-            if let Some(committed) = crate::delta::commit_file_changes(
-                &self.engine,
-                &self.snapshot,
-                removed,
-                added,
-                data_change,
-            )? {
-                // We won; only now read the added files' footers. They are built
-                // whole before this copy moves onto the committed version, so a
-                // failed read leaves it where it was rather than at a version
-                // whose files it does not hold.
-                let mut footers: HashMap<ObjectPath, Vec<Arc<RowGroupMetadata>>> = self
-                    .fetch_footers(added, &self.columns)?
-                    .into_iter()
-                    .map(|f| (f.file.path.clone(), f.row_groups))
-                    .collect();
-                let mut committed_files = Vec::with_capacity(added.len());
-                for entry in added {
-                    let row_groups =
-                        footers
-                            .remove(&entry.file.path)
-                            .ok_or_else(|| Error::FooterNotLoaded {
-                                location: self.location.as_str().to_string(),
-                                file: entry.file.path.as_str().to_string(),
-                            })?;
-                    committed_files.push(TableFile::new(entry.clone(), row_groups));
-                }
-                self.snapshot = committed;
-                self.files.retain(|f| !removed.contains(&f.entry.file.path));
-                self.files.extend(committed_files);
-                return Ok(());
-            }
-            self.refresh()?;
-        }
+            Ok(committed_files)
+        })
     }
 
-    /// Reconcile `self.files` to the log `entries` of a version whose schema is
-    /// `columns`: keep the footers this copy already read (carrying forward their
-    /// sort bounds, which the log does not persist), fetch the footers for files
-    /// not yet held, and drop files no longer present.
+    /// The file list of a version whose log `entries` and schema are given,
+    /// reconciled against the one this copy holds: keep the footers it already
+    /// read (carrying forward their sort bounds, which the log does not persist),
+    /// fetch the footers for files not yet held, and drop files no longer present.
     ///
-    /// The new file list is built whole before `self.files` is touched, so a
-    /// footer fetch that fails leaves this copy exactly as it was. A copy left
-    /// holding a version's files only partially would never recover: its next
-    /// refresh finds that version already current and reconciles nothing.
-    fn rebuild_files(
-        &mut self,
+    /// Returned rather than assigned, so a footer fetch that fails leaves this
+    /// copy exactly as it was. A copy left holding a version's files only
+    /// partially would never recover: its next refresh finds that version already
+    /// current and reconciles nothing.
+    fn reconcile_files(
+        &self,
         entries: Vec<DeltaFileEntry>,
         columns: &[Column],
-    ) -> crate::Result<()> {
+    ) -> crate::Result<Vec<TableFile>> {
         let held: HashMap<&ObjectPath, &TableFile> = self
+            .version
             .files
             .iter()
             .map(|file| (&file.entry.file.path, file))
@@ -363,14 +555,13 @@ impl CatalogTable {
                 None => fetched
                     .remove(&entry.file.path)
                     .ok_or_else(|| Error::FooterNotLoaded {
-                        location: self.location.as_str().to_string(),
+                        location: self.shared.location.as_str().to_string(),
                         file: entry.file.path.as_str().to_string(),
                     })?,
             };
             files.push(TableFile::new(entry, row_groups));
         }
-        self.files = files;
-        Ok(())
+        Ok(files)
     }
 
     /// Fetch the footers for `entries` — the row groups of the files this copy
@@ -387,48 +578,53 @@ impl CatalogTable {
             .map(|e| {
                 e.file
                     .clone()
-                    .into_data_file(self.store.as_ref(), &self.location)
+                    .into_data_file(self.shared.store.as_ref(), &self.shared.location)
             })
             .collect::<store::Result<_>>()?;
         Ok(crate::parquet::load_file_row_groups(
-            &self.dispatcher,
+            &self.shared.dispatcher,
             &to_fetch,
             columns.to_vec().into(),
         )?)
     }
 
     pub fn files(&self) -> &[TableFile] {
-        &self.files
+        &self.version.files
     }
 
     /// The table's durable identity (Delta `metaData.id`), stable across renames
     /// and commits. The catalog indexes by this.
     pub fn id(&self) -> uuid::Uuid {
-        self.id
+        self.shared.id
     }
 
     /// The table's partition columns, in order (empty = unpartitioned). A
     /// partitioning writer routes each row to a file by these columns' values.
     pub fn partition_by(&self) -> &[String] {
-        &self.partition_by
+        &self.version.partition_by
     }
 
     /// The table's sort columns, in order (empty = unsorted). A writer sorts each
     /// file's rows by these before encoding.
     pub fn sort_by(&self) -> &[String] {
-        &self.sort_by
+        &self.version.sort_by
     }
 
     /// The table's current files as [`FileRef`]s — what a compacter scans to pick
     /// merge candidates, and names in a compaction swap.
     pub fn file_refs(&self) -> Vec<FileRef> {
-        self.files.iter().map(|f| f.entry.file.clone()).collect()
+        self.version
+            .files
+            .iter()
+            .map(|f| f.entry.file.clone())
+            .collect()
     }
 
     /// Each committed file paired with the typed partition tuple recorded for
     /// it (or `None`), reflecting the current committed version.
     pub fn file_partitions(&self) -> Vec<(ObjectPath, Option<PartitionValues>)> {
-        self.files
+        self.version
+            .files
             .iter()
             .map(|f| (f.entry.file.path.clone(), f.entry.partition.clone()))
             .collect()
@@ -440,6 +636,7 @@ impl CatalogTable {
     pub fn parquet_table_for(&self, wanted: &[FileRef]) -> Arc<ParquetTable> {
         let want: HashSet<&ObjectPath> = wanted.iter().map(|f| &f.path).collect();
         let row_groups = self
+            .version
             .files
             .iter()
             .filter(|f| want.contains(&f.entry.file.path))
@@ -452,7 +649,9 @@ impl CatalogTable {
     /// location like any [`FileRef`] path), returning its [`FileRef`] to be
     /// committed into the manifest.
     pub fn write_data_file(&self, path: ObjectPath, bytes: &[u8]) -> crate::Result<FileRef> {
-        self.store.put(&self.location.resolve(&path), bytes)?;
+        self.shared
+            .store
+            .put(&self.shared.location.resolve(&path), bytes)?;
         Ok(FileRef {
             path,
             size: bytes.len() as u64,
@@ -462,7 +661,9 @@ impl CatalogTable {
     /// Delete a data file (a compaction input swapped out of the manifest).
     /// `path` resolves against the table's location like any [`FileRef`] path.
     pub fn delete_data_file(&self, path: &ObjectPath) -> crate::Result<()> {
-        self.store.delete(&self.location.resolve(path))?;
+        self.shared
+            .store
+            .delete(&self.shared.location.resolve(path))?;
         Ok(())
     }
 
@@ -470,7 +671,7 @@ impl CatalogTable {
     /// delete it: the table's `delta.deletedFileRetentionDuration`, or Delta's
     /// default when unset. Vacuum ages unreferenced files against this window.
     pub fn deleted_file_retention(&self) -> std::time::Duration {
-        crate::delta::deleted_file_retention(&self.snapshot)
+        crate::delta::deleted_file_retention(&self.version.snapshot)
     }
 
     /// Delete commit JSONs from this table's `_delta_log` that a checkpoint has
@@ -481,9 +682,9 @@ impl CatalogTable {
     /// code in [`crate::delta`]; returns how many files were deleted.
     pub fn cleanup_log(&self, now_ms: u64) -> crate::Result<usize> {
         Ok(crate::delta::cleanup_log(
-            self.store.as_ref(),
-            &self.location,
-            &self.snapshot,
+            self.shared.store.as_ref(),
+            &self.shared.location,
+            &self.version.snapshot,
             now_ms,
         )?)
     }
@@ -498,8 +699,9 @@ impl CatalogTable {
     /// expects.
     pub fn list_data_files(&self) -> crate::Result<Vec<(ObjectPath, u64)>> {
         Ok(self
+            .shared
             .store
-            .list(&self.location)?
+            .list(&self.shared.location)?
             .into_iter()
             .filter(|object| object.file.path.as_str().ends_with(".parquet"))
             .map(|object| (object.file.path, object.modified_unix_ms))
@@ -510,7 +712,7 @@ impl CatalogTable {
     /// Monotonic per table; used to decide whether a published copy is newer than
     /// the catalog's.
     pub fn version(&self) -> u64 {
-        self.snapshot.version()
+        self.version.snapshot.version()
     }
 
     /// A flat scan view of the files a query's pushed-down predicates cannot rule
@@ -535,11 +737,12 @@ impl CatalogTable {
     ) -> crate::Result<Arc<ParquetTable>> {
         let mut row_groups = Vec::new();
         for file in self
+            .version
             .files
             .iter()
             .filter(|f| {
                 f.entry
-                    .maybe_matches_partition(&self.partition_by, partition_filters)
+                    .maybe_matches_partition(&self.version.partition_by, partition_filters)
             })
             .filter(|f| f.entry.maybe_matches_stats(stat_filters))
         {
@@ -550,7 +753,7 @@ impl CatalogTable {
 
     /// The table's columns (schema), as the planner's [`Column`]s.
     pub fn columns(&self) -> Vec<Column> {
-        self.columns.clone()
+        self.version.columns.to_vec()
     }
 
     /// Whether each column (in [`columns`](Self::columns) order) can hold SQL
@@ -559,9 +762,10 @@ impl CatalogTable {
     /// null-aware execution paths, so they must reflect whether the data can
     /// actually hold NULLs. An empty table reports every column nullable.
     pub fn nullability(&self) -> Vec<bool> {
-        self.columns
+        self.version
+            .columns
             .iter()
-            .map(|column| self.files.is_empty() || self.column_may_hold_nulls(&column.name))
+            .map(|column| self.version.files.is_empty() || self.column_may_hold_nulls(&column.name))
             .collect()
     }
 
@@ -571,7 +775,8 @@ impl CatalogTable {
     /// the chunk's `null_count` statistic when the schema is flat enough to map
     /// fields to leaves; a file missing the column entirely reads as all-NULL.
     fn column_may_hold_nulls(&self, name: &str) -> bool {
-        self.files
+        self.version
+            .files
             .iter()
             .flat_map(|file| file.row_groups.iter())
             .any(|rg| {
@@ -598,7 +803,7 @@ impl CatalogTable {
     /// The declared schema as one shareable slice: what a footer load
     /// reconciles each file's parsed schema against.
     fn declared_columns(&self) -> Arc<[Column]> {
-        self.columns.clone().into()
+        self.version.columns.clone()
     }
 
     /// Where the table's data lives, relative to the database root (an absolute
@@ -606,15 +811,15 @@ impl CatalogTable {
     /// (see [`DeltaDatastore::store_description`](crate::DeltaDatastore::store_description))
     /// to know the physical location.
     pub fn location(&self) -> &str {
-        self.location.as_str()
+        self.shared.location.as_str()
     }
 
     pub(crate) fn object_location(&self) -> &ObjectPath {
-        &self.location
+        &self.shared.location
     }
 
     pub(crate) fn store(&self) -> Arc<dyn ObjectStore> {
-        self.store.clone()
+        self.shared.store.clone()
     }
 
     /// Merge `inputs` into fresh target-sized files and atomically swap them in
@@ -640,7 +845,7 @@ impl CatalogTable {
         let parquet = self.parquet_table_for(inputs);
         let columns = parquet.schema().fields().len();
         let scan = crate::parquet::table_input(
-            &self.dispatcher,
+            &self.shared.dispatcher,
             &parquet,
             Projection::all(columns),
             false,
@@ -648,16 +853,16 @@ impl CatalogTable {
         let uploaded_files = Arc::new(Injector::new());
         let spec = super::insert_sink::encode_and_upload_spec(
             self.store(),
-            self.location.clone(),
+            self.shared.location.clone(),
             self.id(),
             self.declared_columns(),
             uploaded_files.clone(),
             scan,
-            Arc::from(self.partition_by()),
-            Arc::from(self.sort_by()),
+            self.version.partition_by.clone(),
+            self.version.sort_by.clone(),
             target_rows_per_group,
             target_row_groups_per_file,
-            &self.dispatcher,
+            &self.shared.dispatcher,
         );
         // Drive encode → upload to completion; the emitted row-count batch is
         // ignored, and the uploaded files arrive on `uploaded_files`.

@@ -1102,6 +1102,75 @@ fn one_copy_commits_repeatedly_without_reloading_between_commits() {
     );
 }
 
+/// Every copy of a table commits through the lock they share, so writers going
+/// at one table concurrently take the log in turn: each append lands on its own
+/// version, built on the one the writer before it produced, and none is lost.
+#[test]
+fn concurrent_appends_from_many_copies_each_land_on_their_own_version() {
+    const WRITERS: usize = 8;
+
+    let (dir, columns) = three_row_table();
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
+    let name = SchemaQualifiedTableName::in_default_schema("t");
+    let start = datastore.table_handle(&name).unwrap().version();
+    // Write the files up front, so what the threads race on is the commit.
+    let files: Vec<(String, Vec<u8>)> = (0..WRITERS)
+        .map(|id| {
+            let file_name = format!("extra{id}.parquet");
+            let path = write_ids(dir.path(), &file_name, &[id as i32]);
+            (file_name, std::fs::read(path).unwrap())
+        })
+        .collect();
+
+    std::thread::scope(|scope| {
+        for (file_name, bytes) in &files {
+            let mut handle = datastore.table_handle(&name).unwrap();
+            scope.spawn(move || {
+                handle
+                    .append_data_file(ObjectPath::new(file_name.clone()), bytes, None, None)
+                    .unwrap();
+            });
+        }
+    });
+
+    let mut table = datastore.table_handle(&name).unwrap();
+    table.refresh().unwrap();
+    assert_eq!(table.version(), start + WRITERS as u64);
+    assert_eq!(
+        table.file_refs().len(),
+        WRITERS + 1,
+        "the seed file plus one per writer"
+    );
+}
+
+/// A path is carried by one file, however many commits name it: a writer that
+/// re-adds a path another copy already committed replaces that file rather than
+/// listing it twice, which would scan (and count) its rows twice.
+#[test]
+fn re_adding_a_committed_path_replaces_its_file_rather_than_duplicating_it() {
+    let (dir, columns) = three_row_table();
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
+    let name = SchemaQualifiedTableName::in_default_schema("t");
+    let bytes = std::fs::read(write_ids(dir.path(), "extra.parquet", &[40])).unwrap();
+    // A copy taken before the append does not know the path is already live.
+    let mut stale = datastore.table_handle(&name).unwrap();
+
+    append(&datastore, "t", &dir.path().join("extra.parquet"));
+    stale
+        .append_data_file(ObjectPath::new("extra.parquet"), &bytes, None, None)
+        .unwrap();
+    datastore.publish_table(stale.clone());
+
+    assert_eq!(stale.file_refs().len(), 2, "the seed file plus the append");
+    assert_eq!(
+        common::extract_count(&run_sql(&datastore, "SELECT COUNT(*) FROM t")),
+        4,
+        "three seed rows plus one appended row, counted once"
+    );
+}
+
 /// A copy refreshes onto a version another copy committed, picking up its file;
 /// refreshing an already-current copy reports no change.
 #[test]

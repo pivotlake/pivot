@@ -98,6 +98,10 @@ pub enum Error {
     FooterNotLoaded { location: String, file: String },
     #[error("table at `{location}` commit conflict: input file `{file}` is no longer active")]
     CommitConflict { location: String, file: String },
+    #[error(
+        "table at `{location}` refused a commit at version {version} without the log advancing; retrying would not make progress"
+    )]
+    CommitStalled { location: String, version: u64 },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -205,19 +209,22 @@ impl DatastoreIndex {
 /// After that, a table evolves by manifest commits on a [`CatalogTable`] *copy*:
 /// a writer takes one with
 /// [`table_handle`](Self::table_handle) and appends its uploaded files or swaps
-/// them (compaction), which CAS a new version into the store. Copies drift; every query resolve refreshes its copy
-/// to the latest committed version, so a commit by another process (or this one)
-/// becomes visible to the next query.
+/// them (compaction), which CAS a new version into the store. Every copy of one
+/// table commits through that table's own lock, so writers in this process take
+/// the log in turn rather than racing each other for one version. Copies drift;
+/// every query resolve refreshes its copy to the latest committed version, so a
+/// commit by another process (or this one) becomes visible to the next query.
 ///
 /// Cloneable (every field is an `Arc`, a `String`, or the shared dispatcher
 /// handle), so a commit that writes can hand a clone to the blocking pool.
 #[derive(Clone)]
 pub struct DeltaDatastore {
     /// The in-memory schema and table sets. The lock guards the *index* (add on
-    /// `CREATE`, swap-in on a resolve's refresh); each [`CatalogTable`] is itself
-    /// a lock-free value that callers clone out and evolve independently. One
-    /// lock covers both halves so the two `CREATE` paths cannot interleave their
-    /// updates to the shared manifest document.
+    /// `CREATE`, swap-in on a resolve's refresh); each [`CatalogTable`] is a
+    /// frozen value callers clone out and read without blocking, and brings its
+    /// own lock for the writers that evolve it. One lock covers both halves so
+    /// the two `CREATE` paths cannot interleave their updates to the shared
+    /// manifest document.
     tables_index: Arc<RwLock<DatastoreIndex>>,
     /// The database's object store: the table index, Delta logs, and tables'
     /// Parquet data. The datastore reads and writes a table's data through this
