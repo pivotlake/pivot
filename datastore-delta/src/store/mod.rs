@@ -1,13 +1,14 @@
-//! A generic key→bytes object store — local filesystem or S3 — and nothing
+//! A generic key→bytes object store — local filesystem, S3, or GCS — and nothing
 //! catalog-specific. It knows how to `get`/`put`/`list`/`delete` objects, do a
 //! conditional create ([`ObjectStore::put_if_absent`], the table log's CAS),
 //! and turn a key into a ring-readable [`DataFile`]; the table manifest,
 //! table log, and catalog build on it one layer up.
 //!
 //! Everything here is **synchronous** and pulls in no async runtime: local
-//! access is plain `std::fs`; S3 goes over [`ureq`] (blocking HTTP + rustls).
-//! S3 requests are signed with `aws_sigv4::http_request::sign` — a pure function
-//! we call inline (the tokio it transitively links is never driven). Credentials
+//! access is plain `std::fs`; S3 and GCS go over [`ureq`] (blocking HTTP +
+//! rustls). S3 requests are signed with `aws_sigv4::http_request::sign` — a pure
+//! function we call inline (the tokio it transitively links is never driven);
+//! GCS requests carry an OAuth2 bearer token. Credentials
 //! come from whoever opened the store: a metastore hands them in per datastore,
 //! and [`open_store`] falls back to the environment. A backend also builds the
 //! async client Delta Kernel reads the same location's `_delta_log` with
@@ -22,9 +23,11 @@ use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod gcs;
 mod local;
 mod object_path;
 mod s3;
+pub use gcs::GcsStore;
 pub use local::LocalStore;
 pub use object_path::ObjectPath;
 pub use s3::{S3Credentials, S3Store};
@@ -39,7 +42,7 @@ pub enum StoreError {
     },
     #[error("http error talking to object store: {0}")]
     Http(String),
-    #[error("unsupported catalog uri `{0}` (expected a local path, file://, or s3://)")]
+    #[error("unsupported catalog uri `{0}` (expected a local path, file://, s3://, or gs://)")]
     UnsupportedUri(String),
     #[error("missing credential/config: {0}")]
     Config(String),
@@ -229,7 +232,7 @@ pub trait ObjectStore: Debug + Send + Sync {
     fn create_dir(&self, prefix: &ObjectPath) -> Result<()>;
 
     /// A human-readable description of where this store is rooted - e.g.
-    /// `file:///var/lib/pivot` or `s3://bucket/prefix`.
+    /// `file:///var/lib/pivot`, `s3://bucket/prefix`, or `gs://bucket/prefix`.
     /// Purely for diagnostics and introspection (a dashboard showing whether a
     /// table lives on local disk or object storage); never an addressable key.
     /// The default falls back to the backend's `Debug` form.
@@ -238,7 +241,8 @@ pub trait ObjectStore: Debug + Send + Sync {
     }
 
     /// The machine-addressable URI this store is rooted at — `file:///path` for
-    /// a local store, the `s3://bucket/prefix` it was opened with for S3. This
+    /// a local store, the `s3://bucket/prefix` or `gs://bucket/prefix` it was
+    /// opened with for a remote one. This
     /// is what a durable reference to the store's contents (e.g. a table's
     /// Delta log location) is derived from, so it must be a parseable URL whose
     /// path includes the store's key prefix; contrast [`describe`](Self::describe),
@@ -256,11 +260,13 @@ pub trait ObjectStore: Debug + Send + Sync {
     fn build_delta_object_store(&self) -> Result<Arc<DynObjectStore>>;
 }
 
-/// Open the object store for a catalog root URI: `s3://bucket/prefix` or a
-/// local path (optionally `file://`).
+/// Open the object store for a catalog root URI: `s3://bucket/prefix`,
+/// `gs://bucket/prefix`, or a local path (optionally `file://`).
 pub fn open_store(uri: &str) -> Result<Box<dyn ObjectStore>> {
     if uri.starts_with("s3://") || uri.starts_with("s3a://") {
         Ok(Box::new(S3Store::from_uri(uri)?))
+    } else if uri.starts_with("gs://") {
+        Ok(Box::new(GcsStore::from_uri(uri)?))
     } else {
         let path = uri.strip_prefix("file://").unwrap_or(uri);
         Ok(Box::new(LocalStore::new(path)))
@@ -288,6 +294,31 @@ pub(crate) fn object_key(prefix: &str, key: &ObjectPath) -> String {
             format!("{prefix}/{}", key.as_str())
         }
     }
+}
+
+/// Percent-encode one object-key component for a URL path segment or query
+/// value per RFC 3986: unreserved characters pass through, everything else
+/// (including `/`) is escaped.
+pub(crate) fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &byte in s.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// Parse an object store's listing timestamp (RFC 3339, always UTC — S3's
+/// `LastModified`, GCS's `updated`) into Unix milliseconds. Returns `None` on
+/// any malformed field, which the caller turns into a listing error rather than
+/// a silently-wrong (too-old) timestamp.
+pub(crate) fn parse_iso8601_millis(s: &str) -> Option<u64> {
+    let nanos = arrow_cast::parse::string_to_timestamp_nanos(s).ok()?;
+    u64::try_from(nanos / 1_000_000).ok()
 }
 
 #[cfg(test)]

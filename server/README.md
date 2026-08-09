@@ -61,7 +61,8 @@ becomes the current database (the target of unqualified table names). Every
 datastore is attached as a database of its own name, so a query reads any other
 one by qualifying it: `SELECT * FROM warm.main.tbl`. `kind` is the datastore
 format (`delta` today); the storage backend is inferred from `location` (a plain
-path is local, an `s3://` URI is S3). Compaction is configured per datastore
+path is local, an `s3://` URI is S3, a `gs://` URI is Google Cloud Storage).
+Compaction is configured per datastore
 with `compact` (and the optional `compact_bytes` / `compact_min_files` tuning);
 it is off by default and should run in only one process per datastore:
 
@@ -81,6 +82,10 @@ metastore:
       access_key_id: AKIA...
       secret_access_key: "..."
       # endpoint: http://localhost:9000
+    cold:
+      kind: delta
+      location: gs://analytics/cold/  # Google Cloud Storage store
+      # credentials_file: /etc/pivot/gcs-key.json
 ```
 
 Start the server with:
@@ -98,6 +103,12 @@ publish their commits immediately.
 An S3 datastore's `region`, `access_key_id`, and `secret_access_key` are
 required and given inline. Protect files containing inline credentials
 appropriately.
+
+A GCS datastore names a service-account (or authorized-user) JSON key file with
+`credentials_file`. Omit it to resolve credentials from the ambient Application
+Default Credentials chain instead: `GOOGLE_APPLICATION_CREDENTIALS`, the file
+`gcloud auth application-default login` writes, or the workload identity of the
+Google compute instance.
 
 ### Users
 

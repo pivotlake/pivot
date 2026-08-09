@@ -8,8 +8,9 @@
 //!
 //! `kind` is the datastore format (only `delta` today). The storage backend is
 //! chosen from `location`: a plain path (or `file://`) opens a local store, an
-//! `s3://` URI opens an S3 store. The S3 credential fields apply only to an
-//! `s3://` location.
+//! `s3://` URI opens an S3 store, a `gs://` URI opens a Google Cloud Storage
+//! store. The S3 credential fields apply only to an `s3://` location, and
+//! `credentials_file` only to a `gs://` one.
 //!
 //! Exactly one datastore must set `default = true`; it becomes the current
 //! database, so unqualified table names and DDL resolve against it. Its name is
@@ -31,6 +32,10 @@
 //!       secret_access_key: "..."
 //!       # endpoint: http://localhost:9000
 //!       # compact: true              # optional
+//!     cold:
+//!       kind: delta
+//!       location: gs://my-bucket/pivot/
+//!       # credentials_file: /etc/pivot/gcs-key.json   # else ambient ADC
 //! ```
 //!
 //! Each entry under `users` names a user that may authenticate to the
@@ -62,7 +67,8 @@
 //! configured allowlist.
 //!
 //! An S3 datastore's credentials are inline, so the file holds secrets and should
-//! be readable only by the PivotDB process. A verifier is not a password (the
+//! be readable only by the PivotDB process (a GCS datastore's key stays in the
+//! file `credentials_file` points at). A verifier is not a password (the
 //! password cannot be recovered from it), but it is still worth the same care.
 
 use std::collections::HashMap;
@@ -70,7 +76,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use catalog::Datastore;
-use datastore_delta::store::{LocalStore, ObjectStore, S3Credentials, S3Store};
+use datastore_delta::store::{GcsStore, LocalStore, ObjectStore, S3Credentials, S3Store};
 use datastore_delta::{
     CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL, DEFAULT_MIN_FILES_TO_MERGE,
     DEFAULT_REFRESH_INTERVAL, DEFAULT_VACUUM_POLL, DeltaDatastore, MaintenanceConfig, VacuumConfig,
@@ -313,6 +319,10 @@ struct DatastoreConfig {
     access_key_id: Option<String>,
     secret_access_key: Option<String>,
     endpoint: Option<String>,
+    /// A Google service-account (or authorized-user) JSON key file, for a
+    /// `gs://` location. Omit to resolve credentials from the ambient
+    /// Application Default Credentials chain instead.
+    credentials_file: Option<String>,
 }
 
 /// Serde default for the `compact` and `vacuum` toggles: both maintenance loops
@@ -378,6 +388,11 @@ impl DatastoreConfig {
                 &self.location,
                 credentials,
             )?))
+        } else if is_gcs_location(&self.location) {
+            Ok(Arc::new(match &self.credentials_file {
+                Some(path) => GcsStore::with_credentials_file(&self.location, path)?,
+                None => GcsStore::from_uri(&self.location)?,
+            }))
         } else {
             let path = self
                 .location
@@ -388,10 +403,16 @@ impl DatastoreConfig {
     }
 }
 
-/// Whether a location is an S3 URI (`s3://` / `s3a://`); otherwise it is a local
-/// path. The storage backend is inferred from the scheme, not configured.
+/// Whether a location is an S3 URI (`s3://` / `s3a://`). The storage backend is
+/// inferred from the scheme, not configured.
 fn is_s3_location(location: &str) -> bool {
     location.starts_with("s3://") || location.starts_with("s3a://")
+}
+
+/// Whether a location is a Google Cloud Storage URI (`gs://`); a location that
+/// is neither this nor [`is_s3_location`] is a local path.
+fn is_gcs_location(location: &str) -> bool {
+    location.starts_with("gs://")
 }
 
 /// Return a required credential, pointing at the environment alternative when
@@ -575,7 +596,7 @@ datastores:
     }
 
     #[test]
-    fn local_and_s3_locations_open_stores() {
+    fn local_s3_and_gcs_locations_open_stores() {
         let yaml = r#"
 datastores:
   default:
@@ -588,6 +609,9 @@ datastores:
     region: eu-west-1
     access_key_id: AKIA
     secret_access_key: secret
+  cold:
+    kind: delta
+    location: gs://bucket/prefix
 "#;
 
         let store = YamlMetastore::from_yaml(yaml, "test").unwrap();
@@ -598,6 +622,10 @@ datastores:
                 .is_ok()
         );
         assert!(store.datastore_configs["warm"].open_store("warm").is_ok());
+        // A GCS store resolves its credentials lazily (at the first request),
+        // so opening one needs no ambient Google credentials.
+        let cold = store.datastore_configs["cold"].open_store("cold").unwrap();
+        assert_eq!(cold.location_uri(), "gs://bucket/prefix");
     }
 
     /// A metastore with a default datastore and whatever `users` adds.

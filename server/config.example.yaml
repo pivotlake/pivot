@@ -17,7 +17,7 @@ server:
   # dashboard.
   # http_bind: 127.0.0.1:8081
 
-  # Cache remote (S3) reads on local disk. The whole section is optional; `dir`
+  # Cache remote (S3 / GCS) reads on local disk. The whole section is optional; `dir`
   # is required once it is present, and the contents survive a restart.
   # disk_cache:
   #   dir: /var/cache/pivot
@@ -52,6 +52,16 @@ metastore:
       access_key_id: replace-me
       secret_access_key: replace-me
       # endpoint: http://localhost:9000 # MinIO / S3-compatible
+
+    # A `gs://` location opens a Google Cloud Storage store. Credentials come
+    # from `credentials_file` (a service-account or authorized-user JSON key);
+    # omit it to use the ambient Application Default Credentials instead
+    # (GOOGLE_APPLICATION_CREDENTIALS, `gcloud auth application-default login`,
+    # or the workload identity of the Google compute instance).
+    cold:
+      kind: delta
+      location: gs://example-bucket/cold/
+      # credentials_file: /etc/pivot/gcs-key.json
 
   # Users are an allowlist. The built-in configuration provides `pivot` without a
   # password so a fresh server remains easy to connect to. Trust proves no

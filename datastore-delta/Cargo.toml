@@ -47,13 +47,17 @@ serde_json = { workspace = true }
 # never spins up an async runtime.
 # `ureq` is blocking HTTP + rustls; `aws-sigv4::sign` is a pure sync function we
 # call to sign S3 requests (the tokio it transitively pulls is never driven).
-# Credentials are read from the environment ourselves. The hot data path uses
-# none of this; it's on the ring.
+# Credentials are read from the environment ourselves. GCS uses an OAuth bearer
+# over the JSON API. The hot data path uses none of this; it's on the ring.
 ureq = { workspace = true, features = ["json"] }
 aws-sigv4 = "1"
 aws-credential-types = "1"
-# Parse S3 ListObjectsV2 XML.
+# Parse S3 ListObjectsV2 XML; GCS listing is JSON via serde_json.
 quick-xml = { version = "0.37", features = ["serialize"] }
+# GCS OAuth: sign service-account JWTs (RS256) with ring (already in the tree via
+# rustls) and base64-encode the JWT segments.
+ring = "0.17"
+base64 = { workspace = true }
 # Build/parse the concrete URLs handed to the io_uring HTTP reader.
 url = { workspace = true }
 # Delta Kernel owns per-table snapshot semantics.  The catalog index remains
@@ -63,15 +67,15 @@ delta_kernel = { version = "0.25.0", features = ["arrow-conversion", "internal-a
 delta_kernel_default_engine = { version = "0.25.0", features = ["rustls", "arrow-58"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 # Optional, behind the `test-support` feature: the in-Docker object-store test
-# harness exposed as `catalog::test_support`. testcontainers brings up MinIO;
-# tempfile backs the local() backend. (The harness's other needs, ureq,
-# aws-sigv4, aws-credential-types, url, are already deps above.)
+# harness exposed as `catalog::test_support`. testcontainers brings up MinIO and
+# fake-gcs-server; tempfile backs the local() backend. (The harness's other
+# needs, ureq, aws-sigv4, aws-credential-types, url, are already deps above.)
 testcontainers = { version = "0.24", features = ["blocking"], optional = true }
 testcontainers-modules = { version = "0.12", features = ["minio"], optional = true }
 tempfile = { workspace = true, optional = true }
 
 [features]
-# Exposes `catalog::test_support`, a MinIO object-store harness used by
+# Exposes `catalog::test_support`, a MinIO/fake-gcs object-store harness used by
 # this crate's object-store integration tests and by downstream crates (e.g.
 # `server`) that want to run a catalog rooted in a real bucket.
 test-support = ["dep:testcontainers", "dep:testcontainers-modules", "dep:tempfile"]

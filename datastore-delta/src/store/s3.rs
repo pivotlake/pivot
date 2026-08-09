@@ -16,7 +16,7 @@
 
 use super::{
     DataFileLocation, FileRef, ListedObject, ObjectPath, ObjectStore, Result, StoreError,
-    object_key,
+    object_key, parse_iso8601_millis, percent_encode,
 };
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
@@ -417,14 +417,6 @@ struct Contents {
     last_modified: String,
 }
 
-/// Parse an S3 `LastModified` timestamp (RFC 3339, always UTC) into Unix
-/// milliseconds. Returns `None` on any malformed field, which the caller turns
-/// into a listing error rather than a silently-wrong (too-old) timestamp.
-fn parse_iso8601_millis(s: &str) -> Option<u64> {
-    let nanos = arrow_cast::parse::string_to_timestamp_nanos(s).ok()?;
-    u64::try_from(nanos / 1_000_000).ok()
-}
-
 /// Split an `s3://bucket/prefix` (or `s3a://…`) URI into its bucket and
 /// in-bucket prefix (empty when the URI names only a bucket).
 fn parse_s3_uri(uri: &str) -> Result<(&str, &str)> {
@@ -442,21 +434,6 @@ fn env_any(keys: &[&str]) -> Option<String> {
 fn env_req(key: &str) -> Result<String> {
     std::env::var(key)
         .map_err(|_| StoreError::Config(format!("environment variable {key} not set")))
-}
-
-/// Percent-encode an S3 object key for a query-string value per RFC 3986
-/// (unreserved chars pass through; `/` is encoded since it's a query value).
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 #[cfg(test)]
