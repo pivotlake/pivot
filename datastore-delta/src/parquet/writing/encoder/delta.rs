@@ -28,6 +28,7 @@ use crate::parquet::{DecimalWriteStorage, decimal_write_storage};
 
 use dispatch::memory::SlabAllocator;
 
+use super::super::compression::Compression;
 use super::super::error::WriteResult;
 use super::super::types::EncodedPage;
 use super::leaves::Leaf;
@@ -53,6 +54,7 @@ const VALUES_PER_MINIBLOCK: usize = VALUES_PER_BLOCK / MINIBLOCKS_PER_BLOCK;
 /// gets it back rather than having to ask again.
 pub(super) fn try_encode_chunk(
     leaf: &Leaf,
+    compression: Compression,
     allocator: &mut SlabAllocator,
 ) -> WriteResult<Option<(Encoding, Vec<EncodedPage>)>> {
     let Some(encoding) = encoding_for(leaf.values.data_type()) else {
@@ -60,7 +62,7 @@ pub(super) fn try_encode_chunk(
     };
     let pages = pages::page_ranges(leaf)?
         .into_iter()
-        .map(|range| encode_data_page(leaf, range, encoding, allocator))
+        .map(|range| encode_data_page(leaf, range, encoding, compression, allocator))
         .collect::<WriteResult<Vec<_>>>()?;
     Ok(Some((encoding, pages)))
 }
@@ -100,6 +102,7 @@ fn encode_data_page(
     leaf: &Leaf,
     range: PageRange,
     encoding: Encoding,
+    compression: Compression,
     allocator: &mut SlabAllocator,
 ) -> WriteResult<EncodedPage> {
     let num_rows = range.rows.len();
@@ -121,6 +124,7 @@ fn encode_data_page(
             num_values: num_rows,
             encoding,
         },
+        compression,
         allocator,
     )
 }

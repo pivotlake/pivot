@@ -17,6 +17,8 @@ use dispatch::{Identifier, WorkerIdOutput};
 use thriftparquet::footer::Statistics;
 use thriftparquet::general::Encoding;
 
+use super::compression::Compression;
+
 /// Identifies a row group across the pipeline so its column chunks reassemble
 /// together.
 pub(crate) type RowGroupId = u64;
@@ -121,6 +123,9 @@ pub(crate) struct EncodedLeaf {
     /// reader knows which decoder to use.
     pub(crate) data_page_encoding: Encoding,
     pub(crate) data_pages: Vec<EncodedPage>,
+    /// The codec this leaf's pages were compressed with, which the footer
+    /// records per column chunk.
+    pub(crate) compression: Compression,
 }
 
 /// A fully-encoded column chunk, routed back to its row group's owner worker for

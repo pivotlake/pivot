@@ -18,6 +18,7 @@ use dispatch::memory::SlabAllocator;
 
 use crate::parquet::DecimalWriteStorage;
 
+use super::super::compression::Compression;
 use super::super::error::{WriteError, WriteResult};
 use super::super::types::EncodedPage;
 use super::leaves::Leaf;
@@ -26,11 +27,12 @@ use super::pages::{self, PageKind, PageRange};
 /// PLAIN-encode a leaf: cut it into pages and encode each.
 pub(super) fn encode_chunk(
     leaf: &Leaf,
+    compression: Compression,
     allocator: &mut SlabAllocator,
 ) -> WriteResult<Vec<EncodedPage>> {
     pages::page_ranges(leaf)?
         .into_iter()
-        .map(|range| encode_data_page(leaf, range, allocator))
+        .map(|range| encode_data_page(leaf, range, compression, allocator))
         .collect()
 }
 
@@ -40,6 +42,7 @@ pub(super) fn encode_chunk(
 fn encode_data_page(
     leaf: &Leaf,
     range: PageRange,
+    compression: Compression,
     allocator: &mut SlabAllocator,
 ) -> WriteResult<EncodedPage> {
     let num_rows = range.rows.len();
@@ -56,6 +59,7 @@ fn encode_data_page(
             num_values: num_rows,
             encoding: Encoding::PLAIN,
         },
+        compression,
         allocator,
     )
 }
