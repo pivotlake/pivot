@@ -23,6 +23,7 @@
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_set.hpp"
 #include "duckdb/planner/operator/logical_reset.hpp"
+#include "duckdb/planner/operator/logical_compact.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -789,6 +790,24 @@ rust::String lo_set_value(const LogicalOperator &op) {
 
 rust::String lo_reset_name(const LogicalOperator &op) {
 	return rust::String::lossy(as<duckdb::LogicalReset>(op).name);
+}
+
+// ---- Compact ----
+
+rust::String lo_compact_datastore(const LogicalOperator &op) {
+	return rust::String::lossy(as<duckdb::LogicalCompact>(op).table.catalog);
+}
+
+rust::String lo_compact_schema(const LogicalOperator &op) {
+	return rust::String::lossy(as<duckdb::LogicalCompact>(op).table.schema);
+}
+
+rust::String lo_compact_table(const LogicalOperator &op) {
+	return rust::String::lossy(as<duckdb::LogicalCompact>(op).table.name);
+}
+
+bool lo_compact_final(const LogicalOperator &op) {
+	return as<duckdb::LogicalCompact>(op).final_sweep;
 }
 
 // ---- ComparisonJoin: late materialization ----

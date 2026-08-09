@@ -118,6 +118,8 @@ pub enum Error {
     Insert(#[source] crate::catalog::Error),
     #[error("SET/RESET is a session command, not a compilable query")]
     SetVariableNotCompilable,
+    #[error("COMPACT runs as its own statement and cannot be part of a query")]
+    CompactNotCompilable,
     #[error("Unsupported table function: {0}")]
     UnsupportedTableFunction(String),
     #[error("Invalid argument to table function {function}: {message}")]
@@ -280,6 +282,9 @@ impl PlanNode {
             // SET/RESET is intercepted by the server after planning (it toggles
             // session state, not data), so it should never reach compilation.
             crate::Operator::SetVariable(_) => Err(Error::SetVariableNotCompilable),
+            // So is COMPACT: its sweeps drive dataflows of their own, so the
+            // server runs them on the coordinator, never inside a dataflow.
+            crate::Operator::Compact(_) => Err(Error::CompactNotCompilable),
         }
     }
 }

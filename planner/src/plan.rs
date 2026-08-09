@@ -11,7 +11,7 @@
 use crate::catalog::CatalogTransaction;
 use crate::compile;
 use crate::expression::Expression;
-use crate::operator::{self, Operator, OrderByDirection, SetVariable};
+use crate::operator::{self, Compact, Operator, OrderByDirection, SetVariable};
 use crate::types::Type;
 use dispatch::{GroupLimit, RowDelivery};
 use std::fmt;
@@ -70,6 +70,7 @@ impl PlanNode {
                 | Operator::CreateTable(_)
                 | Operator::CreateSchema(_)
                 | Operator::SetVariable(_)
+                | Operator::Compact(_)
                 | Operator::TableFunctionScan(_)
         ) && self.inputs.iter().all(PlanNode::is_cacheable)
     }
@@ -355,19 +356,13 @@ impl Plan {
         }
     }
 
-    /// This plan as a `COMPACT` statement, if its root is the bound `compact`
-    /// table function the parser's rewrite produces. Like a `SET`, the server
-    /// checks this before compiling: compaction runs coordinator-side, off the
-    /// worker pool, because it drives dataflows of its own.
-    pub fn as_compact(&self) -> Option<crate::operator::CompactRequest> {
-        // DuckDB leaves the bound call under a column-pruning projection or
-        // two; peel those, the request is the leaf scan.
-        let mut node = &self.root;
-        while matches!(node.operator, Operator::Projection(_)) && node.inputs.len() == 1 {
-            node = &node.inputs[0];
-        }
-        match &node.operator {
-            Operator::TableFunctionScan(scan) if node.inputs.is_empty() => scan.compact_request(),
+    /// This plan as a `COMPACT` statement, if that's what it is. Like a `SET`,
+    /// the server checks this before compiling: compaction runs
+    /// coordinator-side, off the worker pool, because it drives dataflows of
+    /// its own.
+    pub fn as_compact(&self) -> Option<&Compact> {
+        match &self.root.operator {
+            Operator::Compact(compact) => Some(compact),
             _ => None,
         }
     }

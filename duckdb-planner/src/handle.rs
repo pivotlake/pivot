@@ -199,6 +199,7 @@ impl<'plan> LogicalOp<'plan> {
             L::LOGICAL_CREATE_SCHEMA => Operator::CreateSchema(CreateSchema { raw: self.raw }),
             L::LOGICAL_SET => Operator::Set(Set { raw: self.raw }),
             L::LOGICAL_RESET => Operator::Reset(Reset { raw: self.raw }),
+            L::LOGICAL_COMPACT => Operator::Compact(Compact { raw: self.raw }),
             L::LOGICAL_COMPARISON_JOIN => {
                 Operator::ComparisonJoin(ComparisonJoin { raw: self.raw })
             }
@@ -237,6 +238,8 @@ pub enum Operator<'plan> {
     Set(Set<'plan>),
     /// `RESET name`.
     Reset(Reset<'plan>),
+    /// `COMPACT <table> [FINAL]`.
+    Compact(Compact<'plan>),
     /// A comparison join; the consumer only handles the late-materialization
     /// shape (see [`ComparisonJoin::is_late_materialization`]).
     ComparisonJoin(ComparisonJoin<'plan>),
@@ -296,6 +299,8 @@ define_handles! { ffi::LogicalOperator;
     Set,
     /// A `LogicalReset`: `RESET name`.
     Reset,
+    /// A `LogicalCompact`: `COMPACT <table> [FINAL]`.
+    Compact,
     /// A `LogicalComparisonJoin`.
     ComparisonJoin,
     /// A `LogicalMaterializedCTE`: the CTE's definition above the query using it.
@@ -663,6 +668,31 @@ impl<'plan> Set<'plan> {
 impl<'plan> Reset<'plan> {
     pub fn name(self) -> Result<String> {
         Ok(ffi::lo_reset_name(self.raw)?)
+    }
+}
+
+impl<'plan> Compact<'plan> {
+    /// The datastore the statement named, or `None` when unqualified (routes
+    /// to the default datastore).
+    pub fn datastore(self) -> Result<Option<String>> {
+        let datastore = ffi::lo_compact_datastore(self.raw)?;
+        Ok((!datastore.is_empty()).then_some(datastore))
+    }
+
+    /// The schema the statement named, or `None` when unqualified (routes to
+    /// the default schema).
+    pub fn schema(self) -> Result<Option<String>> {
+        let schema = ffi::lo_compact_schema(self.raw)?;
+        Ok((!schema.is_empty()).then_some(schema))
+    }
+
+    pub fn table(self) -> Result<String> {
+        Ok(ffi::lo_compact_table(self.raw)?)
+    }
+
+    /// `COMPACT ... FINAL`: keep sweeping until a pass merges nothing.
+    pub fn final_sweep(self) -> Result<bool> {
+        Ok(ffi::lo_compact_final(self.raw)?)
     }
 }
 

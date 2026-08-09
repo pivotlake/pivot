@@ -12,11 +12,12 @@ use duckdb_planner::DuckDBTable;
 use duckdb_planner::catalog_provider::OptionalTableWrapper;
 use duckdb_planner::duckdb_bridge::duckdb_types::LimitNodeType;
 use duckdb_planner::handle::{
-    Aggregate as AggregateView, BridgeError, CreateSchema as CreateSchemaView,
-    CreateTable as CreateTableView, Filter as FilterView, Insert as InsertView, Limit as LimitView,
-    OrderBy as OrderByView, OrderKey, Projection as ProjectionView, Reset as ResetView,
-    Set as SetView, TableFunctionScan as TableFunctionScanView, TableScan as TableScanView,
-    TopN as TopNView, Values as ValuesView,
+    Aggregate as AggregateView, BridgeError, Compact as CompactView,
+    CreateSchema as CreateSchemaView, CreateTable as CreateTableView, Filter as FilterView,
+    Insert as InsertView, Limit as LimitView, OrderBy as OrderByView, OrderKey,
+    Projection as ProjectionView, Reset as ResetView, Set as SetView,
+    TableFunctionScan as TableFunctionScanView, TableScan as TableScanView, TopN as TopNView,
+    Values as ValuesView,
 };
 
 use super::{BuildCtx, build_scan_columns};
@@ -25,8 +26,8 @@ use crate::catalog::{
 };
 use crate::expression::{Error as ExpressionError, Expression};
 use crate::operator::{
-    Aggregate, CreateSchema, CreateTable, Error as OperatorError, Filter, Input, Insert, Limit,
-    OrderBy, OrderByNode, Projection, SetVariable, TableFunctionScan, TopN, Values,
+    Aggregate, Compact, CreateSchema, CreateTable, Error as OperatorError, Filter, Input, Insert,
+    Limit, OrderBy, OrderByNode, Projection, SetVariable, TableFunctionScan, TopN, Values,
 };
 use crate::types::type_from_logical;
 
@@ -237,6 +238,17 @@ impl SetVariable {
         Ok(SetVariable {
             name: view.name()?,
             value: None,
+        })
+    }
+}
+
+impl Compact {
+    pub(crate) fn from_handle(view: CompactView<'_>) -> Result<Compact, BridgeError> {
+        Ok(Compact {
+            datastore: view.datastore()?,
+            schema: view.schema()?,
+            table: view.table()?,
+            final_sweep: view.final_sweep()?,
         })
     }
 }

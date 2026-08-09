@@ -14,6 +14,7 @@
 //! the dynamic-filter slot helper used by more than one operator.
 
 mod aggregate;
+mod compact;
 mod create_schema;
 mod create_table;
 mod cte;
@@ -33,6 +34,7 @@ mod top_n;
 mod values;
 
 pub use aggregate::Aggregate;
+pub use compact::Compact;
 pub use create_schema::CreateSchema;
 pub use create_table::CreateTable;
 pub use cte::{Cte, CteScan};
@@ -47,9 +49,7 @@ pub use materialize::Materialize;
 pub use order_by::{OrderBy, OrderByDirection, OrderByNode};
 pub use projection::Projection;
 pub use set_variable::SetVariable;
-pub use table_function::{
-    CompactRequest, CompactTableFunction, TableFunction, TableFunctionScan, TableFunctionSignature,
-};
+pub use table_function::{TableFunction, TableFunctionScan, TableFunctionSignature};
 pub use top_n::TopN;
 pub use values::Values;
 
@@ -114,6 +114,8 @@ pub enum Operator {
     DummyScan(DummyScan),
     /// `SET`/`RESET` of a session variable — handled by the server, not compiled.
     SetVariable(SetVariable),
+    /// `COMPACT <table> [FINAL]` — handled by the server, not compiled.
+    Compact(Compact),
     /// Late-materialization fetch (synthesized by the rewrite, see [`Materialize`]).
     Materialize(Materialize),
     /// `EXPLAIN <query>`: renders its child plan as text (see [`Explain`]).
@@ -185,9 +187,10 @@ impl Operator {
             // recorded when the definition was walked.
             Operator::CteScan(scan) => Ok(scan.types.clone()),
             // Statements, not queries: no result columns.
-            Operator::CreateTable(_) | Operator::CreateSchema(_) | Operator::SetVariable(_) => {
-                Ok(Vec::new())
-            }
+            Operator::CreateTable(_)
+            | Operator::CreateSchema(_)
+            | Operator::SetVariable(_)
+            | Operator::Compact(_) => Ok(Vec::new()),
         }
     }
 
@@ -258,9 +261,10 @@ impl Operator {
             }
             Operator::Cte(_) => inputs[1].clone(),
             Operator::CteScan(scan) => scan.nullable.clone(),
-            Operator::CreateTable(_) | Operator::CreateSchema(_) | Operator::SetVariable(_) => {
-                Vec::new()
-            }
+            Operator::CreateTable(_)
+            | Operator::CreateSchema(_)
+            | Operator::SetVariable(_)
+            | Operator::Compact(_) => Vec::new(),
         }
     }
 }
@@ -288,6 +292,7 @@ impl fmt::Display for Operator {
             Operator::CreateSchema(c) => write!(f, "{c}"),
             Operator::DummyScan(d) => write!(f, "{d}"),
             Operator::SetVariable(s) => write!(f, "{s}"),
+            Operator::Compact(c) => write!(f, "{c}"),
             Operator::Materialize(m) => write!(f, "{m}"),
             Operator::Explain(e) => write!(f, "{e}"),
             Operator::Cte(c) => write!(f, "{c}"),
