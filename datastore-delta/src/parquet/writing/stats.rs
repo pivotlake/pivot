@@ -11,7 +11,7 @@ use std::sync::Arc;
 use arrow_arith::aggregate::{max, min};
 use arrow_array::{
     Array, ArrayRef, Date32Array, Datum, Decimal64Array, Decimal128Array, Float32Array,
-    Float64Array, Int32Array, Int64Array, Scalar, StringArray, StringViewArray,
+    Float64Array, Int16Array, Int32Array, Int64Array, Scalar, StringArray, StringViewArray,
     TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, TimeUnit};
@@ -49,6 +49,7 @@ pub(super) fn column_min_max(array: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
         // stored in would order everything past the signed maximum below zero,
         // and a reader pruning on those bounds would drop live rows.
         DataType::UInt8 => numeric!(UInt8Array),
+        DataType::Int16 => numeric!(Int16Array),
         DataType::UInt16 => numeric!(UInt16Array),
         DataType::UInt32 => numeric!(UInt32Array),
         DataType::UInt64 => numeric!(UInt64Array),
@@ -129,6 +130,7 @@ pub(super) fn stat_bytes(value: &ArrayRef) -> Option<Vec<u8>> {
         DataType::Int32 => le_bytes!(Int32Array),
         DataType::Int64 => le_bytes!(Int64Array),
         DataType::UInt8 => widened_le_bytes!(UInt8Array, u32),
+        DataType::Int16 => widened_le_bytes!(Int16Array, i32),
         DataType::UInt16 => widened_le_bytes!(UInt16Array, u32),
         DataType::UInt32 => le_bytes!(UInt32Array),
         DataType::UInt64 => le_bytes!(UInt64Array),

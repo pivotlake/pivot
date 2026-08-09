@@ -121,6 +121,7 @@ impl<'a> PlainSizes<'a> {
             // an unsigned value takes the width of the signed physical type it
             // stores its bits in (the narrow ones widened to INT32).
             DataType::Int32
+            | DataType::Int16
             | DataType::Float32
             | DataType::Date32
             | DataType::UInt8
