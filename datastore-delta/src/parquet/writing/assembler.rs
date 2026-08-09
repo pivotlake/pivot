@@ -33,7 +33,7 @@ use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult};
 use thriftparquet::footer::{
     ColumnChunk, ColumnMetaData, FileMetaData, LogicalType, RowGroup, SchemaElement,
 };
-use thriftparquet::general::{CompressionCodec, Encoding};
+use thriftparquet::general::Encoding;
 use thriftparquet::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 
 use dispatch::memory::{FileBytes, Slab, SlabAllocator};
@@ -285,7 +285,7 @@ fn write_leaf_chunk(out: &mut FileBytes, leaf: EncodedLeaf) -> WriteResult<Colum
             physical_type: leaf.physical_type,
             encodings,
             path_in_schema: leaf.path,
-            codec: CompressionCodec::SNAPPY,
+            codec: leaf.compression.codec(),
             num_values,
             total_uncompressed_size: uncompressed,
             total_compressed_size: compressed,
