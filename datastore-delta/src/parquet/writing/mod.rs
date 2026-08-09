@@ -38,6 +38,7 @@
 //! leaving the worker pool.
 
 mod assembler;
+mod compression;
 pub(crate) mod encoder;
 pub(crate) mod error;
 mod indexer;
