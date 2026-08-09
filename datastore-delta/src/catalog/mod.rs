@@ -4,7 +4,7 @@
 //! threads can resolve and create tables concurrently: many readers (lookups)
 //! coexist with infrequent writers (`CREATE TABLE`, file registrations).
 //! Backing the map is the database's [`ObjectStore`], opened on an explicit
-//! local directory or remote `s3://` root.
+//! local directory or remote (`s3://`, `gs://`) root.
 //!
 //! Durable state lives in two places, both in the store:
 //!
@@ -268,7 +268,7 @@ impl DeltaDatastore {
     }
 
     /// Open a persisted database rooted at `uri`, a local directory (or
-    /// `file://…`), or a remote `s3://…` object store, reloading every
+    /// `file://…`), or a remote (`s3://…`, `gs://…`) object store, reloading every
     /// table the manifest records at its latest version: read each table's
     /// manifest (schema + file list) and fetch its files' footers, building the
     /// in-memory [`CatalogTable`]. A database with no manifest yet opens empty.

@@ -14,9 +14,9 @@
 //! ([`ObjectStore::build_delta_object_store`])
 //! instead of letting it resolve its own.
 
+use super::list_bucket::{parse_listing, percent_encode};
 use super::{
-    DataFileLocation, FileRef, ListedObject, ObjectPath, ObjectStore, Result, StoreError,
-    object_key,
+    DataFileLocation, ListedObject, ObjectPath, ObjectStore, Result, StoreError, object_key,
 };
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
@@ -303,28 +303,7 @@ impl ObjectStore for S3Store {
             Err(e) => return Err(StoreError::Http(format!("LIST {object_prefix}: {e}"))),
         };
 
-        let parsed: ListBucketResult = quick_xml::de::from_str(&body)
-            .map_err(|e| StoreError::Http(format!("LIST parse: {e}")))?;
-
-        parsed
-            .contents
-            .into_iter()
-            .map(|c| {
-                let modified_unix_ms = parse_iso8601_millis(&c.last_modified).ok_or_else(|| {
-                    StoreError::Http(format!(
-                        "LIST object `{}` has an unparseable LastModified `{}`",
-                        c.key, c.last_modified
-                    ))
-                })?;
-                Ok(ListedObject {
-                    file: FileRef {
-                        path: ObjectPath::new(super::key_name(&c.key)),
-                        size: c.size,
-                    },
-                    modified_unix_ms,
-                })
-            })
-            .collect()
+        parse_listing(&body)
     }
 
     fn source(&self, key: &ObjectPath) -> Result<DataFileLocation> {
@@ -397,34 +376,6 @@ impl S3Store {
     }
 }
 
-/// ListObjectsV2 XML response (only the keys are needed).
-#[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct ListBucketResult {
-    #[serde(default, rename = "Contents")]
-    contents: Vec<Contents>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct Contents {
-    key: String,
-    #[serde(default)]
-    size: u64,
-    /// ISO-8601 `LastModified` (e.g. `2009-10-12T17:50:30.000Z`), parsed by
-    /// [`parse_iso8601_millis`] for vacuum's orphan sweep.
-    #[serde(default)]
-    last_modified: String,
-}
-
-/// Parse an S3 `LastModified` timestamp (RFC 3339, always UTC) into Unix
-/// milliseconds. Returns `None` on any malformed field, which the caller turns
-/// into a listing error rather than a silently-wrong (too-old) timestamp.
-fn parse_iso8601_millis(s: &str) -> Option<u64> {
-    let nanos = arrow_cast::parse::string_to_timestamp_nanos(s).ok()?;
-    u64::try_from(nanos / 1_000_000).ok()
-}
-
 /// Split an `s3://bucket/prefix` (or `s3a://…`) URI into its bucket and
 /// in-bucket prefix (empty when the URI names only a bucket).
 fn parse_s3_uri(uri: &str) -> Result<(&str, &str)> {
@@ -444,42 +395,16 @@ fn env_req(key: &str) -> Result<String> {
         .map_err(|_| StoreError::Config(format!("environment variable {key} not set")))
 }
 
-/// Percent-encode an S3 object key for a query-string value per RFC 3986
-/// (unreserved chars pass through; `/` is encoded since it's a query value).
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn list_response_parses_keys_and_sizes() {
-        // A trimmed ListObjectsV2 response: each object carries its byte size,
-        // which the remote reader needs to locate a Parquet footer.
-        let xml = r#"<?xml version="1.0"?>
-            <ListBucketResult>
-              <Contents><Key>db/events/a.parquet</Key><Size>123</Size></Contents>
-              <Contents><Key>db/events/b.parquet</Key><Size>4096</Size></Contents>
-            </ListBucketResult>"#;
-        let parsed: ListBucketResult = quick_xml::de::from_str(xml).unwrap();
-        let objects: Vec<_> = parsed.contents.iter().map(|c| (&c.key, c.size)).collect();
-        assert_eq!(
-            objects,
-            vec![
-                (&"db/events/a.parquet".to_string(), 123),
-                (&"db/events/b.parquet".to_string(), 4096),
-            ]
-        );
+    fn s3_uri_splits_into_bucket_and_prefix() {
+        assert_eq!(parse_s3_uri("s3://bucket/db").unwrap(), ("bucket", "db"));
+        assert_eq!(parse_s3_uri("s3a://bucket/db").unwrap(), ("bucket", "db"));
+        // A bucket-only URI has no in-bucket prefix.
+        assert_eq!(parse_s3_uri("s3://bucket").unwrap(), ("bucket", ""));
+        assert!(parse_s3_uri("gs://bucket/db").is_err());
     }
 }

@@ -8,8 +8,8 @@
 //!
 //! `kind` is the datastore format (only `delta` today). The storage backend is
 //! chosen from `location`: a plain path (or `file://`) opens a local store, an
-//! `s3://` URI opens an S3 store. The S3 credential fields apply only to an
-//! `s3://` location.
+//! `s3://` URI opens an S3 store, a `gs://` URI a Google Cloud Storage store.
+//! Each backend's credential fields apply only to its own scheme.
 //!
 //! Exactly one datastore must set `default = true`; it becomes the current
 //! database, so unqualified table names and DDL resolve against it. Its name is
@@ -31,6 +31,12 @@
 //!       secret_access_key: "..."
 //!       # endpoint: http://localhost:9000
 //!       # compact: true              # optional
+//!     cold:
+//!       kind: delta
+//!       location: gs://my-bucket/pivot/
+//!       service_account_path: /etc/pivot/gcs-key.json   # omit on GCE/GKE to
+//!                                                       # use the attached
+//!                                                       # service account
 //! ```
 //!
 //! Each entry under `users` names a user that may authenticate to the
@@ -61,16 +67,19 @@
 //! user named `pivot`. Defining any users replaces that default with the
 //! configured allowlist.
 //!
-//! An S3 datastore's credentials are inline, so the file holds secrets and should
-//! be readable only by the PivotDB process. A verifier is not a password (the
-//! password cannot be recovered from it), but it is still worth the same care.
+//! An S3 datastore's credentials are inline (and a GCS one's may be), so the
+//! file holds secrets and should be readable only by the PivotDB process. A
+//! verifier is not a password (the password cannot be recovered from it), but it
+//! is still worth the same care.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use catalog::Datastore;
-use datastore_delta::store::{LocalStore, ObjectStore, S3Credentials, S3Store};
+use datastore_delta::store::{
+    GcsAuth, GcsCredentials, GcsStore, LocalStore, ObjectStore, S3Credentials, S3Store,
+};
 use datastore_delta::{
     CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL, DEFAULT_MIN_FILES_TO_MERGE,
     DEFAULT_REFRESH_INTERVAL, DEFAULT_VACUUM_POLL, DeltaDatastore, MaintenanceConfig, VacuumConfig,
@@ -279,8 +288,9 @@ enum UserAuthConfig {
 }
 
 /// One datastore's configuration. `kind` is the datastore format; the storage
-/// backend (local filesystem vs S3) is inferred from `location`'s scheme, and
-/// the S3 credential fields apply only when `location` is an `s3://` URI.
+/// backend (local filesystem, S3, or Google Cloud Storage) is inferred from
+/// `location`'s scheme, and each backend's credential fields apply only when
+/// `location` carries its scheme.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DatastoreConfig {
@@ -312,7 +322,15 @@ struct DatastoreConfig {
     region: Option<String>,
     access_key_id: Option<String>,
     secret_access_key: Option<String>,
+    /// An S3-compatible endpoint (`s3://`), or the address of a Google Cloud
+    /// Storage emulator (`gs://`). Absent, each backend addresses its own cloud.
     endpoint: Option<String>,
+    /// A GCS service account JSON key, inline. Mutually exclusive with
+    /// `service_account_path`.
+    service_account_key: Option<String>,
+    /// The path to a GCS service account JSON key file. Mutually exclusive with
+    /// `service_account_key`.
+    service_account_path: Option<String>,
 }
 
 /// Serde default for the `compact` and `vacuum` toggles: both maintenance loops
@@ -364,8 +382,9 @@ impl DatastoreConfig {
     /// Build this datastore's object store. The backend is chosen from
     /// `location`: an `s3://` (or `s3a://`) URI opens an S3 store with the
     /// datastore's inline credentials (`region`, `access_key_id`,
-    /// `secret_access_key` are required); anything else is a local path (an
-    /// optional `file://` scheme is stripped).
+    /// `secret_access_key` are required); a `gs://` (or `gcs://`) URI opens a
+    /// Google Cloud Storage store authenticated by [`gcs_auth`](Self::gcs_auth);
+    /// anything else is a local path (an optional `file://` scheme is stripped).
     fn open_store(&self, name: &str) -> Result<Arc<dyn ObjectStore>> {
         if is_s3_location(&self.location) {
             let credentials = S3Credentials {
@@ -378,6 +397,15 @@ impl DatastoreConfig {
                 &self.location,
                 credentials,
             )?))
+        } else if is_gcs_location(&self.location) {
+            let credentials = GcsCredentials {
+                auth: self.gcs_auth(name)?,
+                endpoint: self.endpoint.clone(),
+            };
+            Ok(Arc::new(GcsStore::with_credentials(
+                &self.location,
+                credentials,
+            )?))
         } else {
             let path = self
                 .location
@@ -386,12 +414,40 @@ impl DatastoreConfig {
             Ok(Arc::new(LocalStore::new(path)))
         }
     }
+
+    /// Where this datastore's GCS access tokens come from: the service account
+    /// key written inline, the one in the file `service_account_path` names, or
+    /// or, with neither configured, the service account the instance itself is
+    /// running as, which is how a GCE or GKE deployment holds no key at all.
+    fn gcs_auth(&self, name: &str) -> Result<GcsAuth> {
+        match (&self.service_account_key, &self.service_account_path) {
+            (Some(_), Some(_)) => Err(Error::Datastore {
+                name: name.to_string(),
+                message: "set only one of `service_account_key` and `service_account_path`"
+                    .to_string(),
+            }),
+            (Some(key), None) => Ok(GcsAuth::ServiceAccountKey(key.clone())),
+            (None, Some(path)) => std::fs::read_to_string(path)
+                .map(GcsAuth::ServiceAccountKey)
+                .map_err(|source| Error::Datastore {
+                    name: name.to_string(),
+                    message: format!("reading `service_account_path` `{path}`: {source}"),
+                }),
+            (None, None) => Ok(GcsAuth::MetadataServer),
+        }
+    }
 }
 
-/// Whether a location is an S3 URI (`s3://` / `s3a://`); otherwise it is a local
-/// path. The storage backend is inferred from the scheme, not configured.
+/// Whether a location is an S3 URI (`s3://` / `s3a://`). The storage backend is
+/// inferred from the scheme, not configured.
 fn is_s3_location(location: &str) -> bool {
     location.starts_with("s3://") || location.starts_with("s3a://")
+}
+
+/// Whether a location is a Google Cloud Storage URI (`gs://` / `gcs://`);
+/// a location matching neither remote scheme is a local path.
+fn is_gcs_location(location: &str) -> bool {
+    location.starts_with("gs://") || location.starts_with("gcs://")
 }
 
 /// Return a required credential, pointing at the environment alternative when
@@ -598,6 +654,65 @@ datastores:
                 .is_ok()
         );
         assert!(store.datastore_configs["warm"].open_store("warm").is_ok());
+    }
+
+    #[test]
+    fn a_gcs_location_opens_a_store_with_no_key_configured() {
+        // On GCE/GKE the instance's own service account authenticates, so a
+        // `gs://` datastore needs no credential fields at all.
+        let yaml = r#"
+datastores:
+  default:
+    kind: delta
+    location: /tmp/default
+    default: true
+  cold:
+    kind: delta
+    location: gs://bucket/prefix
+"#;
+
+        let store = YamlMetastore::from_yaml(yaml, "test").unwrap();
+
+        assert!(store.datastore_configs["cold"].open_store("cold").is_ok());
+    }
+
+    #[test]
+    fn a_gcs_datastore_takes_one_service_account_key_not_two() {
+        let yaml = r#"
+datastores:
+  cold:
+    kind: delta
+    location: gs://bucket/prefix
+    default: true
+    service_account_key: "{}"
+    service_account_path: /etc/pivot/key.json
+"#;
+
+        let store = YamlMetastore::from_yaml(yaml, "test").unwrap();
+        let err = store.datastore_configs["cold"]
+            .open_store("cold")
+            .unwrap_err();
+
+        assert!(err.to_string().contains("set only one of"));
+    }
+
+    #[test]
+    fn a_missing_service_account_file_fails_to_open() {
+        let yaml = r#"
+datastores:
+  cold:
+    kind: delta
+    location: gs://bucket/prefix
+    default: true
+    service_account_path: /nonexistent/key.json
+"#;
+
+        let store = YamlMetastore::from_yaml(yaml, "test").unwrap();
+        let err = store.datastore_configs["cold"]
+            .open_store("cold")
+            .unwrap_err();
+
+        assert!(err.to_string().contains("service_account_path"));
     }
 
     /// A metastore with a default datastore and whatever `users` adds.

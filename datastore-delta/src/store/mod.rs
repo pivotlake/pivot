@@ -1,18 +1,20 @@
-//! A generic key→bytes object store — local filesystem or S3 — and nothing
-//! catalog-specific. It knows how to `get`/`put`/`list`/`delete` objects, do a
-//! conditional create ([`ObjectStore::put_if_absent`], the table log's CAS),
-//! and turn a key into a ring-readable [`DataFile`]; the table manifest,
-//! table log, and catalog build on it one layer up.
+//! A generic key→bytes object store (local filesystem, S3, or Google Cloud
+//! Storage) and nothing catalog-specific. It knows how to
+//! `get`/`put`/`list`/`delete` objects, do a conditional create
+//! ([`ObjectStore::put_if_absent`], the table log's CAS), and turn a key into a
+//! ring-readable [`DataFile`]; the table manifest, table log, and catalog build
+//! on it one layer up.
 //!
 //! Everything here is **synchronous** and pulls in no async runtime: local
-//! access is plain `std::fs`; S3 goes over [`ureq`] (blocking HTTP + rustls).
-//! S3 requests are signed with `aws_sigv4::http_request::sign` — a pure function
-//! we call inline (the tokio it transitively links is never driven). Credentials
-//! come from whoever opened the store: a metastore hands them in per datastore,
-//! and [`open_store`] falls back to the environment. A backend also builds the
-//! async client Delta Kernel reads the same location's `_delta_log` with
-//! ([`ObjectStore::build_delta_object_store`]), so the two address it alike.
-//! This runs off the io_uring ring on purpose: a
+//! access is plain `std::fs`; the remote backends go over [`ureq`] (blocking
+//! HTTP + rustls). S3 requests are signed with `aws_sigv4::http_request::sign`,
+//! a pure function we call inline (the tokio it transitively links is never
+//! driven); GCS requests carry an OAuth2 bearer token this module mints itself.
+//! Credentials come from whoever opened the store: a metastore hands them in per
+//! datastore, and [`open_store`] falls back to the environment. A backend also
+//! builds the async client Delta Kernel reads the same location's `_delta_log`
+//! with ([`ObjectStore::build_delta_object_store`]), so the two address it
+//! alike. This runs off the io_uring ring on purpose: a
 //! LIST isn't a range-GET the ring can serve, and it's rare and tiny (a few KB
 //! per query) next to the hot column-chunk reads, which stay on the ring.
 
@@ -22,9 +24,12 @@ use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod gcs;
+mod list_bucket;
 mod local;
 mod object_path;
 mod s3;
+pub use gcs::{GcsAuth, GcsCredentials, GcsStore};
 pub use local::LocalStore;
 pub use object_path::ObjectPath;
 pub use s3::{S3Credentials, S3Store};
@@ -39,7 +44,7 @@ pub enum StoreError {
     },
     #[error("http error talking to object store: {0}")]
     Http(String),
-    #[error("unsupported catalog uri `{0}` (expected a local path, file://, or s3://)")]
+    #[error("unsupported catalog uri `{0}` (expected a local path, file://, s3://, or gs://)")]
     UnsupportedUri(String),
     #[error("missing credential/config: {0}")]
     Config(String),
@@ -256,11 +261,13 @@ pub trait ObjectStore: Debug + Send + Sync {
     fn build_delta_object_store(&self) -> Result<Arc<DynObjectStore>>;
 }
 
-/// Open the object store for a catalog root URI: `s3://bucket/prefix` or a
-/// local path (optionally `file://`).
+/// Open the object store for a catalog root URI: `s3://bucket/prefix`,
+/// `gs://bucket/prefix`, or a local path (optionally `file://`).
 pub fn open_store(uri: &str) -> Result<Box<dyn ObjectStore>> {
     if uri.starts_with("s3://") || uri.starts_with("s3a://") {
         Ok(Box::new(S3Store::from_uri(uri)?))
+    } else if uri.starts_with("gs://") || uri.starts_with("gcs://") {
+        Ok(Box::new(GcsStore::from_uri(uri)?))
     } else {
         let path = uri.strip_prefix("file://").unwrap_or(uri);
         Ok(Box::new(LocalStore::new(path)))

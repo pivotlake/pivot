@@ -52,7 +52,13 @@ serde_json = { workspace = true }
 ureq = { workspace = true, features = ["json"] }
 aws-sigv4 = "1"
 aws-credential-types = "1"
-# Parse S3 ListObjectsV2 XML.
+# GCS authenticates with an OAuth2 bearer token rather than a signed URL: `ring`
+# signs the RS256 JWT assertion a service account key is exchanged for a token
+# with, and `base64` encodes that assertion's parts (and decodes the key's PEM).
+ring = "0.17"
+base64 = { workspace = true }
+# Parse the ListBucketResult XML both S3 and the GCS XML API answer a listing
+# with.
 quick-xml = { version = "0.37", features = ["serialize"] }
 # Build/parse the concrete URLs handed to the io_uring HTTP reader.
 url = { workspace = true }
@@ -69,12 +75,21 @@ uuid = { version = "1", features = ["v4", "serde"] }
 testcontainers = { version = "0.24", features = ["blocking"], optional = true }
 testcontainers-modules = { version = "0.12", features = ["minio"], optional = true }
 tempfile = { workspace = true, optional = true }
+# The harness's GCS emulator stamps objects with the `Last-Modified` (RFC 2822)
+# and `LastModified` (RFC 3339) timestamps a GCS client expects on them.
+chrono = { version = "0.4", optional = true }
 
 [features]
-# Exposes `catalog::test_support`, a MinIO object-store harness used by
-# this crate's object-store integration tests and by downstream crates (e.g.
-# `server`) that want to run a catalog rooted in a real bucket.
-test-support = ["dep:testcontainers", "dep:testcontainers-modules", "dep:tempfile"]
+# Exposes `catalog::test_support`, an object-store harness (MinIO for S3, an
+# in-process emulator for GCS) used by this crate's object-store integration
+# tests and by downstream crates (e.g. `server`) that want to run a catalog
+# rooted in a real bucket.
+test-support = [
+    "dep:testcontainers",
+    "dep:testcontainers-modules",
+    "dep:tempfile",
+    "dep:chrono",
+]
 
 [dev-dependencies]
 # Self-dependency to turn on `test-support` for this crate's own integration

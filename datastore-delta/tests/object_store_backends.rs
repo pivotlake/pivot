@@ -1,11 +1,11 @@
-//! Blackbox integration tests for the object-store backends, local filesystem
-//! and S3 (MinIO), each a short Setup / Execute / Assert against the public
-//! datastore + store API.
+//! Blackbox integration tests for the object-store backends (local filesystem,
+//! S3 (MinIO), and GCS (an in-process emulator)), each a short Setup / Execute /
+//! Assert against the public datastore + store API.
 //!
 //! Every behaviour is written once (in [`bodies`]) over a `&Backend` and run on
-//! each backend by the [`backend_tests!`] macro. The local case always runs; the
-//! S3 case brings up a container via [`harness`] and skips when Docker is
-//! absent, so `cargo test` stays green offline.
+//! each backend by the [`backend_tests!`] macro. The local and GCS cases always
+//! run; the S3 case brings up a container via [`harness`] and skips when Docker
+//! is absent, so `cargo test` stays green offline.
 //!
 //! Covered: store contract (round-trip `source`, one-level `list`, the
 //! `put_if_absent` CAS), and the table lifecycle end to end — `CREATE TABLE`,
@@ -242,8 +242,8 @@ mod bodies {
 
 // --- backend matrix --------------------------------------------------------
 
-/// Emit `local` / `s3` tests for a [`bodies`] behaviour. S3 skips when Docker
-/// is absent; each gets its own bucket prefix for isolation.
+/// Emit `local` / `s3` / `gcs` tests for a [`bodies`] behaviour. S3 skips when
+/// Docker is absent; each gets its own bucket prefix for isolation.
 macro_rules! backend_tests {
     ($name:ident) => {
         mod $name {
@@ -258,6 +258,10 @@ macro_rules! backend_tests {
                 if let Some(b) = harness::s3(concat!(stringify!($name), "-s3")) {
                     bodies::$name(&b);
                 }
+            }
+            #[test]
+            fn gcs() {
+                bodies::$name(&harness::gcs(concat!(stringify!($name), "-gcs")));
             }
         }
     };

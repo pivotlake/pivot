@@ -41,7 +41,7 @@ server:
   memory: 32g               # default: 80% of total RAM (see PIVOT_MEMORY_PCT)
   workers: 16               # default: number of cores
   http_bind: 127.0.0.1:8081 # serve the web dashboard; omitted means no dashboard
-  disk_cache:               # cache S3 reads on local disk; omitted means no cache
+  disk_cache:               # cache remote reads on local disk; omitted means no cache
     dir: /var/cache/pivot   # required once the section is present
     size: 64g               # default 64g
     max_objects: 65536      # default; one open file descriptor per cached object
@@ -61,9 +61,10 @@ becomes the current database (the target of unqualified table names). Every
 datastore is attached as a database of its own name, so a query reads any other
 one by qualifying it: `SELECT * FROM warm.main.tbl`. `kind` is the datastore
 format (`delta` today); the storage backend is inferred from `location` (a plain
-path is local, an `s3://` URI is S3). Compaction is configured per datastore
-with `compact` (and the optional `compact_bytes` / `compact_min_files` tuning);
-it is off by default and should run in only one process per datastore:
+path is local, an `s3://` URI is S3, a `gs://` URI is Google Cloud Storage).
+Compaction is configured per datastore with `compact` (and the optional
+`compact_bytes` / `compact_min_files` tuning); it is off by default and should
+run in only one process per datastore:
 
 ```yaml
 metastore:
@@ -81,6 +82,10 @@ metastore:
       access_key_id: AKIA...
       secret_access_key: "..."
       # endpoint: http://localhost:9000
+    cold:
+      kind: delta
+      location: gs://analytics/cold/  # Google Cloud Storage store
+      service_account_path: /etc/pivot/gcs-key.json
 ```
 
 Start the server with:
@@ -96,8 +101,11 @@ externally committed data can be; this process's own INSERT and compaction
 publish their commits immediately.
 
 An S3 datastore's `region`, `access_key_id`, and `secret_access_key` are
-required and given inline. Protect files containing inline credentials
-appropriately.
+required and given inline. A GCS datastore authenticates with a service account
+key, named either inline as `service_account_key` or by path as
+`service_account_path`; with neither set it uses the service account the
+instance itself runs as, which is how a GCE or GKE deployment holds no key at
+all. Protect files containing inline credentials appropriately.
 
 ### Users
 

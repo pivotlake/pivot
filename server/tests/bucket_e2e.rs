@@ -1,10 +1,10 @@
 //! End-to-end pgwire tests over object storage: stand up a real `Server` whose
-//! catalog is rooted in a bucket (MinIO, or a local dir), `CREATE
-//! TABLE` over Parquet files sitting in that bucket, and query them through a
-//! Postgres client — the full `CREATE TABLE` → plan → scan-over-presigned-URL →
-//! wire-encode path, against real object storage.
+//! catalog is rooted in a bucket (MinIO, a GCS emulator, or a local dir),
+//! `CREATE TABLE` over Parquet files sitting in that bucket, and query them
+//! through a Postgres client: the full `CREATE TABLE` → plan → scan-over-a-
+//! remote-URL → wire-encode path, against real object storage.
 //!
-//! Each behaviour is written once over a `&Backend` and run on local / S3
+//! Each behaviour is written once over a `&Backend` and run on local / S3 / GCS
 //! by the [`bucket_tests!`] macro; S3 skips when Docker is absent.
 
 mod common;
@@ -141,6 +141,21 @@ mod bodies {
 
         assert_eq!(count, 3);
     }
+
+    /// `INSERT` uploads a new Parquet file into the bucket over the ring (a
+    /// presigned PUT on S3, a bearer-authenticated one on GCS), and the rows it
+    /// wrote are there for the next query.
+    pub async fn insert_uploads_and_reads_back(b: &Backend) {
+        let client = events_server(b).await;
+
+        client
+            .simple_query("INSERT INTO events VALUES ('x', 6), ('y', 7)")
+            .await
+            .unwrap();
+
+        let count = select_one_i64(&client, "SELECT COUNT(value) FROM events").await;
+        assert_eq!(count, 7);
+    }
 }
 
 // --- backend matrix --------------------------------------------------------
@@ -156,8 +171,8 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         .block_on(fut)
 }
 
-/// Emit `local` / `s3` pgwire tests for a [`bodies`] behaviour. S3 skips when
-/// Docker is absent; each gets its own bucket prefix for isolation.
+/// Emit `local` / `s3` / `gcs` pgwire tests for a [`bodies`] behaviour. S3 skips
+/// when Docker is absent; each gets its own bucket prefix for isolation.
 macro_rules! bucket_tests {
     ($name:ident) => {
         mod $name {
@@ -174,12 +189,18 @@ macro_rules! bucket_tests {
                 };
                 block_on(bodies::$name(&b));
             }
+            #[test]
+            fn gcs() {
+                let b = test_support::gcs(concat!(stringify!($name), "-gcs"));
+                block_on(bodies::$name(&b));
+            }
         }
     };
 }
 
 bucket_tests!(create_table_and_count);
 bucket_tests!(count_with_filter);
+bucket_tests!(insert_uploads_and_reads_back);
 
 /// KNOWN BUG (`#[ignore]`d until fixed): `SELECT COUNT(*)` with no predicate
 /// returns 0 instead of the row count. DuckDB scans `COUNT(*)` with a

@@ -17,7 +17,7 @@ server:
   # dashboard.
   # http_bind: 127.0.0.1:8081
 
-  # Cache remote (S3) reads on local disk. The whole section is optional; `dir`
+  # Cache remote (S3/GCS) reads on local disk. The whole section is optional; `dir`
   # is required once it is present, and the contents survive a restart.
   # disk_cache:
   #   dir: /var/cache/pivot
@@ -34,7 +34,8 @@ metastore:
   # unqualified names such as `main.events` resolve against it.
   datastores:
     # `kind` is the datastore format (only `delta` today). The storage backend is
-    # inferred from `location`: a local path here, an S3 URI for `warm` below.
+    # inferred from `location`: a local path here, an S3 URI for `warm` below, a
+    # Google Cloud Storage URI for `cold`.
     default:
       kind: delta
       location: /var/lib/pivot/default
@@ -52,6 +53,14 @@ metastore:
       access_key_id: replace-me
       secret_access_key: replace-me
       # endpoint: http://localhost:9000 # MinIO / S3-compatible
+
+    # A Google Cloud Storage datastore. Point it at a service account key, or
+    # drop both key fields to use the service account the instance runs as.
+    cold:
+      kind: delta
+      location: gs://example-bucket/cold/
+      service_account_path: /etc/pivot/gcs-key.json
+      # service_account_key: '{"client_email": "...", "private_key": "..."}'
 
   # Users are an allowlist. The built-in configuration provides `pivot` without a
   # password so a fresh server remains easy to connect to. Trust proves no
