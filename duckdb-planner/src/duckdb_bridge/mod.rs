@@ -329,6 +329,15 @@ pub mod ffi {
         fn lo_set_value(op: &LogicalOperator) -> Result<String>;
         fn lo_reset_name(op: &LogicalOperator) -> Result<String>;
 
+        // ---- Compact ----
+        /// The datastore `COMPACT db.s.t` named, or empty when unqualified.
+        fn lo_compact_datastore(op: &LogicalOperator) -> Result<String>;
+        /// The schema the statement named, or empty when unqualified.
+        fn lo_compact_schema(op: &LogicalOperator) -> Result<String>;
+        fn lo_compact_table(op: &LogicalOperator) -> Result<String>;
+        /// `COMPACT ... FINAL`: keep sweeping until a pass merges nothing.
+        fn lo_compact_final(op: &LogicalOperator) -> Result<bool>;
+
         // ---- ComparisonJoin: general accessors ----
         /// DuckDB `JoinType` discriminant.
         /// The index a materialized CTE publishes its rows under.

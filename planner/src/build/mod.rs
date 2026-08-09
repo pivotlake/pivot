@@ -29,9 +29,9 @@ use crate::catalog::BoundTable;
 use crate::dynamic_filter::DynamicFilter;
 use crate::expression::{Cast, Error as ExpressionError, Expression, Function, Ref, VariantGet};
 use crate::operator::{
-    Aggregate, CreateSchema, CreateTable, Cte, CteScan, DummyScan, Error as OperatorError, Explain,
-    Filter, Input, Insert, Join, JoinKind, Limit, Materialize, Operator, OrderBy, Projection,
-    SetVariable, TableFunctionScan, TopN, Values,
+    Aggregate, Compact, CreateSchema, CreateTable, Cte, CteScan, DummyScan, Error as OperatorError,
+    Explain, Filter, Input, Insert, Join, JoinKind, Limit, Materialize, Operator, OrderBy,
+    Projection, SetVariable, TableFunctionScan, TopN, Values,
 };
 use crate::plan::{self, PlanNode};
 use crate::types::{Type, physical_arrow_type, type_from_logical};
@@ -200,6 +200,7 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         DuckOperator::CreateSchema(c) => Operator::CreateSchema(CreateSchema::from_handle(c)?),
         DuckOperator::Set(s) => Operator::SetVariable(SetVariable::from_set(s)?),
         DuckOperator::Reset(r) => Operator::SetVariable(SetVariable::from_reset(r)?),
+        DuckOperator::Compact(c) => Operator::Compact(Compact::from_handle(c)?),
         // No view to construct from: these carry no kind-specific payload.
         DuckOperator::DummyScan => Operator::DummyScan(DummyScan),
         DuckOperator::Explain => Operator::Explain(Explain),
