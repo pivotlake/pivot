@@ -85,6 +85,7 @@ pub(crate) fn encode_record_batches_spec(
     partition_by: Arc<[String]>,
     sort_by: Arc<[String]>,
     target_rows_per_group: usize,
+    target_file_bytes: usize,
 ) -> OperatorSpec<AssembledFile, impl OperatorFactory<AssembledFile> + 'static> {
     let spec = spec.project(|| |batch| unshred_batch(batch).expect("a variant column reassembles"));
     let spec = if partition_by.is_empty() && sort_by.is_empty() {
@@ -120,7 +121,12 @@ pub(crate) fn encode_record_batches_spec(
             to_single_worker_mpsc::<RecordBatch>(workers, indexer_host)
                 .into_iter()
                 .collect(),
-            indexer::factories(partition_by, target_rows_per_group, workers),
+            indexer::factories(
+                partition_by,
+                target_rows_per_group,
+                target_file_bytes,
+                workers,
+            ),
         )
         .chain(
             stealable::<ColumnChunkJob>(topology).into_iter().collect(),

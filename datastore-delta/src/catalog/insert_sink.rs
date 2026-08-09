@@ -105,6 +105,11 @@ pub(super) fn build_insert_spec(
 /// each over the ring, pushing every finished file onto `uploaded_files`. Both
 /// INSERT (which stamps the durable schema first) and compaction (which feeds a
 /// table scan) build on this; whoever owns `uploaded_files` decides how the files
+/// Rows a file holds, as bytes rather than as a count: a hundred-column row is
+/// orders of magnitude wider than a narrow one, and what has to stay bounded is
+/// the memory a file's rows occupy while they wait to be written.
+const TARGET_FILE_BYTES: usize = 128 * 1024 * 1024;
+
 /// commit. The finish emits the inserted-row count as a single batch.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn encode_and_upload_spec(
@@ -120,8 +125,14 @@ pub(super) fn encode_and_upload_spec(
     target_rows_per_group: usize,
     dispatcher: &DataFlowDispatcher,
 ) -> RecordBatchOperatorSpec {
-    let encoded =
-        encode_record_batches_spec(input, schema, partition_by, sort_by, target_rows_per_group);
+    let encoded = encode_record_batches_spec(
+        input,
+        schema,
+        partition_by,
+        sort_by,
+        target_rows_per_group,
+        TARGET_FILE_BYTES,
+    );
     let workers = dispatcher.worker_count();
     // One shared total; every worker's `Upload` adds its completions to it and the
     // last worker into `finish` emits it once all uploads have landed, so no

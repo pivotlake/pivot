@@ -25,6 +25,10 @@ use parquet_variant_json::VariantToJson;
 
 use super::{AssembledFile, encode_record_batches_spec};
 
+/// Bytes of rows a test's file holds before the writer cuts it. Small, so a
+/// test can cross it without pushing more through the ring than it has.
+const FILE_BYTES: usize = 8 * 1024 * 1024;
+
 /// A 64 MiB file-cache ring, as the other in-crate write tests use.
 const RING_BUFFERS: usize = 64 * 1024 * 1024 / BUFFER_SIZE;
 
@@ -134,14 +138,18 @@ fn write_grouped<T: IntoBatch>(
     // A file's bytes are the slabs its pages were written into, which only the
     // worker holding them may release, so each one is copied out on the worker
     // that assembled it before this thread ever sees it.
-    let files: Vec<Vec<u8>> =
-        encode_record_batches_spec(spec, schema, partition_by, sort_by, rows_per_group)
-            .map_each(|file: AssembledFile| {
-                file.bytes.runs().flatten().copied().collect::<Vec<u8>>()
-            })
-            .execute()
-            .collect()
-            .unwrap();
+    let files: Vec<Vec<u8>> = encode_record_batches_spec(
+        spec,
+        schema,
+        partition_by,
+        sort_by,
+        rows_per_group,
+        FILE_BYTES,
+    )
+    .map_each(|file: AssembledFile| file.bytes.runs().flatten().copied().collect::<Vec<u8>>())
+    .execute()
+    .collect()
+    .unwrap();
     dispatch.exit();
     files
 }
@@ -968,24 +976,34 @@ fn a_date_column_writes_whichever_encoding_it_takes() {
 /// An unpartitioned insert is one partition however big the table is, so a file
 /// has to be cut on size as well as on a partition boundary. Held whole, a large
 /// insert would buffer every row before writing any of them.
+///
+/// Every row survives the trip, which is the part that matters: a cut that drops
+/// the rows after it is worse than no cut at all.
 #[test]
 fn a_long_insert_is_cut_into_files_as_it_arrives() {
-    let rows_per_group = 1_000;
-    let rows_per_file = rows_per_group * 8;
-    let batches: Vec<ColumnsItem> = (0..5)
-        .map(|batch| {
+    // 8 MiB of rows a batch, so several files' worth arrive.
+    let rows_per_batch: i64 = 1024 * 1024;
+    let batches: Vec<ColumnsItem> = (0..40)
+        .map(|batch: i64| {
             let values: ArrayRef = Arc::new(Int64Array::from(
-                (0..rows_per_file as i64)
-                    .map(|row| batch * 1_000_000 + row)
+                (0..rows_per_batch)
+                    .map(|row| batch * rows_per_batch + row)
                     .collect::<Vec<_>>(),
             ));
             ColumnsItem(vec![("n", values)])
         })
         .collect();
 
-    let files = write(batches, rows_per_group);
+    let files = write(batches, 128 * 1024);
 
-    assert_eq!(files.len(), 5, "five files' worth of rows, five files");
-    let rows: usize = files.iter().map(|file| read_back(file).num_rows()).sum();
-    assert_eq!(rows, 5 * rows_per_file);
+    assert!(
+        files.len() > 1,
+        "expected the insert to be cut into files, got {}",
+        files.len()
+    );
+    let rows: i64 = files
+        .iter()
+        .map(|file| read_back(file).num_rows() as i64)
+        .sum();
+    assert_eq!(rows, 40 * rows_per_batch, "every row was written");
 }

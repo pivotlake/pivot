@@ -31,18 +31,21 @@ use crate::scalar_values_from_row;
 pub(super) struct IndexerFactory {
     partition_by: Arc<[String]>,
     target_rows_per_group: usize,
+    target_file_bytes: usize,
     worker_count: usize,
 }
 
 pub(super) fn factories(
     partition_by: Arc<[String]>,
     target_rows_per_group: usize,
+    target_file_bytes: usize,
     worker_count: usize,
 ) -> Vec<IndexerFactory> {
     (0..worker_count)
         .map(|_| IndexerFactory {
             partition_by: partition_by.clone(),
             target_rows_per_group,
+            target_file_bytes,
             worker_count,
         })
         .collect()
@@ -55,6 +58,7 @@ impl UnaryFactory<RecordBatch, ColumnChunkJob> for IndexerFactory {
         Indexer {
             partition_by: self.partition_by,
             target_rows_per_group: self.target_rows_per_group,
+            target_file_bytes: self.target_file_bytes,
             worker_count: self.worker_count,
             partition_tuple_converter: None,
             open_partition: None,
@@ -64,13 +68,19 @@ impl UnaryFactory<RecordBatch, ColumnChunkJob> for IndexerFactory {
     }
 }
 
-/// Row groups a file holds before the indexer cuts it and starts another.
+/// The default for [`Indexer`]'s file bound: how many bytes of rows a file
+/// holds before the indexer cuts it and starts another.
 ///
 /// A partition's rows are written out as they arrive rather than held until the
 /// partition ends: an unpartitioned insert is one partition however large the
 /// table is, so holding one would mean buffering the whole insert before
 /// writing a byte of it.
-const ROW_GROUPS_PER_FILE: usize = 8;
+///
+/// The bound is bytes rather than rows because rows differ enormously in width
+/// — a hundred-column row is orders of magnitude larger than a narrow one — and
+/// what has to stay bounded is the memory a file's rows occupy while they wait,
+/// not how many of them there are.
+const TARGET_FILE_BYTES: usize = 128 * 1024 * 1024;
 
 /// The partition whose chunks are still arriving: its identity and everything
 /// collected so far.
@@ -78,11 +88,15 @@ struct OpenPartition {
     tuple: Option<OwnedRow>,
     chunks: Vec<RecordBatch>,
     rows: usize,
+    /// What the chunks occupy in memory, which is what the file cut bounds.
+    bytes: usize,
 }
 
 pub(super) struct Indexer {
     partition_by: Arc<[String]>,
     target_rows_per_group: usize,
+    /// Bytes of rows a file holds before it is cut; see [`TARGET_FILE_BYTES`].
+    target_file_bytes: usize,
     worker_count: usize,
     /// Encodes a batch's partition columns into its comparable tuple; built
     /// from the first batch's schema.
@@ -133,8 +147,8 @@ impl Indexer {
 
     /// Send a file's worth of a partition off as one file: identity-gather jobs
     /// over its chunk list, one row group per `target_rows_per_group` window. A
-    /// partition wider than [`ROW_GROUPS_PER_FILE`] row groups becomes several
-    /// files, all carrying its partition values. The
+    /// partition holding more than [`TARGET_FILE_BYTES`] becomes several files,
+    /// all carrying its partition values. The
     /// file's shredding is only *planned* here; every rewrite of row data,
     /// shredding included, belongs to the encode workers.
     fn send_jobs_for_partitioned_file(
@@ -257,10 +271,16 @@ impl Unary<RecordBatch, ColumnChunkJob> for Indexer {
             tuple,
             chunks: Vec::new(),
             rows: 0,
+            bytes: 0,
         });
         open.rows += batch.num_rows();
+        open.bytes += batch
+            .columns()
+            .iter()
+            .map(|column| column.get_array_memory_size())
+            .sum::<usize>();
         open.chunks.push(batch);
-        if open.rows >= self.target_rows_per_group * ROW_GROUPS_PER_FILE {
+        if open.bytes >= self.target_file_bytes {
             let full = self
                 .open_partition
                 .take()

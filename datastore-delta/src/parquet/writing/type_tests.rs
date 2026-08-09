@@ -164,7 +164,7 @@ fn write_cases(dispatch: &Dispatch, cases: &[Case]) -> Vec<u8> {
     // A file's bytes live in ring memory the assembling worker owns, so they are
     // copied out there rather than followed to this thread.
     let mut files: Vec<Vec<u8>> =
-        encode_record_batches_spec(spec, schema, Arc::from([]), Arc::from([]), ROWS)
+        encode_record_batches_spec(spec, schema, Arc::from([]), Arc::from([]), ROWS, usize::MAX)
             .map_each(|file: AssembledFile| {
                 file.bytes.runs().flatten().copied().collect::<Vec<u8>>()
             })
