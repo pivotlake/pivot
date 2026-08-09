@@ -40,6 +40,7 @@
 //! assembly and upload because their bytes occupy worker-owned ring memory.
 
 mod assembler;
+mod compression;
 pub(crate) mod encoder;
 pub(crate) mod error;
 mod file_collector;

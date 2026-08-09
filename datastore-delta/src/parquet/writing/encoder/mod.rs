@@ -25,6 +25,7 @@ use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult};
 use thriftparquet::footer::Statistics;
 use thriftparquet::general::Encoding;
 
+use super::compression::Compression;
 use super::error::{WriteError, WriteResult};
 use super::stats;
 use super::types::{ColumnChunkJob, EncodedColumnChunk, EncodedLeaf};
@@ -97,20 +98,21 @@ pub(in crate::parquet::writing) fn encode_column_chunk(
 /// PLAIN.
 fn encode_leaf(leaf: Leaf, allocator: &mut SlabAllocator) -> WriteResult<EncodedLeaf> {
     let physical_type = crate::parquet::arrow_to_parquet_physical(leaf.values.data_type())?;
+    let compression = Compression::for_leaf(leaf.values.data_type());
     let statistics = leaf_statistics(&leaf);
     let (dictionary_page, data_page_encoding, data_pages) =
-        match dictionary::try_encode(&leaf, allocator)? {
+        match dictionary::try_encode(&leaf, compression, allocator)? {
             Some((dictionary_page, index_page)) => (
                 Some(dictionary_page),
                 Encoding::RLE_DICTIONARY,
                 vec![index_page],
             ),
-            None => match delta::try_encode_chunk(&leaf, allocator)? {
+            None => match delta::try_encode_chunk(&leaf, compression, allocator)? {
                 Some((encoding, pages)) => (None, encoding, pages),
                 None => (
                     None,
                     Encoding::PLAIN,
-                    plain::encode_chunk(&leaf, allocator)?,
+                    plain::encode_chunk(&leaf, compression, allocator)?,
                 ),
             },
         };
@@ -121,6 +123,7 @@ fn encode_leaf(leaf: Leaf, allocator: &mut SlabAllocator) -> WriteResult<Encoded
         dictionary_page,
         data_page_encoding,
         data_pages,
+        compression,
     })
 }
 
