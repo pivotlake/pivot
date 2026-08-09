@@ -262,7 +262,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 /// the datastore's own log CAS, independent of the statement's transaction.
 async fn execute_compact(
     catalog: &Arc<catalog::PivotCatalog>,
-    request: planner::CompactRequest,
+    request: &planner::Compact,
 ) -> Result<u64> {
     let datastore_name = request
         .datastore

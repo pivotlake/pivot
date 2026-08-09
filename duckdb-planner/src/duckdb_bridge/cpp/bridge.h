@@ -173,6 +173,12 @@ rust::String lo_set_name(const LogicalOperator &op);
 rust::String lo_set_value(const LogicalOperator &op);
 rust::String lo_reset_name(const LogicalOperator &op);
 
+// ---- Compact ----
+rust::String lo_compact_datastore(const LogicalOperator &op);
+rust::String lo_compact_schema(const LogicalOperator &op);
+rust::String lo_compact_table(const LogicalOperator &op);
+bool lo_compact_final(const LogicalOperator &op);
+
 // ---- ComparisonJoin: late materialization ----
 bool lo_is_late_materialization_join(const LogicalOperator &op);
 size_t lo_late_materialization_column_count(const LogicalOperator &op);
