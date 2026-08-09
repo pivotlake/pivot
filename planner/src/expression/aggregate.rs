@@ -59,6 +59,10 @@ pub enum AggregateFunc {
     /// Lowered in compilation to a two-level GROUP BY (dedup on the group keys
     /// plus `col`, then count rows per group); see [`crate::compile`].
     CountDistinct(NumericAggregate),
+    /// `FIRST(col)` — one of the column's values, whichever a worker sees
+    /// first. DuckDB emits it when it needs *a* value rather than a fold, most
+    /// notably in the single-row guard it plans around every scalar subquery.
+    First(NumericAggregate),
 }
 
 impl AggregateFunc {
@@ -71,7 +75,8 @@ impl AggregateFunc {
             | AggregateFunc::Min(a)
             | AggregateFunc::Max(a)
             | AggregateFunc::Count(a)
-            | AggregateFunc::CountDistinct(a) => &a.return_type,
+            | AggregateFunc::CountDistinct(a)
+            | AggregateFunc::First(a) => &a.return_type,
         }
     }
 
@@ -86,7 +91,8 @@ impl AggregateFunc {
             | AggregateFunc::Min(a)
             | AggregateFunc::Max(a)
             | AggregateFunc::Count(a)
-            | AggregateFunc::CountDistinct(a) => Some(a.argument.as_ref()),
+            | AggregateFunc::CountDistinct(a)
+            | AggregateFunc::First(a) => Some(a.argument.as_ref()),
         }
         .into_iter()
     }
@@ -101,7 +107,8 @@ impl AggregateFunc {
             | AggregateFunc::Min(a)
             | AggregateFunc::Max(a)
             | AggregateFunc::Count(a)
-            | AggregateFunc::CountDistinct(a) => Some(a.argument.as_mut()),
+            | AggregateFunc::CountDistinct(a)
+            | AggregateFunc::First(a) => Some(a.argument.as_mut()),
         }
         .into_iter()
     }
@@ -117,6 +124,7 @@ impl Display for AggregateFunc {
             AggregateFunc::Max(a) => write!(f, "max({})", a.argument),
             AggregateFunc::Count(a) => write!(f, "count({})", a.argument),
             AggregateFunc::CountDistinct(a) => write!(f, "count(distinct {})", a.argument),
+            AggregateFunc::First(a) => write!(f, "first({})", a.argument),
         }
     }
 }

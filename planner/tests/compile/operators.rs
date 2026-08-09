@@ -2227,3 +2227,46 @@ fn group_by_error_names_the_unsupported_key_not_the_first(mut testing_planner: T
         "group-by error should name the offending column (k_float), got: {err}"
     );
 }
+
+/// A CTE the query reads twice: once row by row in the body, once reduced to
+/// the scalar every row is compared against. DuckDB plans this as a
+/// materialized CTE with two scans, and wraps the scalar subquery in its
+/// single-row guard, so the whole shape runs through Cte/CteScan, the first
+/// aggregate, and the lazy guard lowering together.
+#[rstest]
+fn cte_read_by_body_and_by_scalar_subquery(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "sales",
+        &[
+            ("seller", Type::Int32, int_col(vec![1, 2, 1])),
+            (
+                "amount",
+                Type::Decimal {
+                    precision: 15,
+                    scale: 2,
+                },
+                Arc::new(
+                    arrow_array::Decimal64Array::from(vec![1000i64, 2000, 3000])
+                        .with_precision_and_scale(15, 2)
+                        .unwrap(),
+                ),
+            ),
+        ],
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "WITH totals(seller, total) AS (
+             SELECT seller, sum(amount) FROM sales GROUP BY seller)
+         SELECT seller, total FROM totals
+         WHERE total = (SELECT max(total) FROM totals)",
+    );
+
+    assert_eq!(
+        rows,
+        serde_json::json!([{"seller": 1, "total": 40.0}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}

@@ -248,6 +248,15 @@ enum Slot<A: IntCell> {
         column: usize,
         acc: Option<String>,
     },
+    /// `FIRST(col)`: the first value this worker saw, kept as a one-row slice
+    /// of its column so any value type rides through unchanged (NULL included -
+    /// `FIRST` keeps the first *row's* value, unlike the NULL-skipping folds).
+    /// The declared output type shapes the NULL emitted over zero rows.
+    First {
+        column: usize,
+        output_type: DataType,
+        acc: Option<ArrayRef>,
+    },
 }
 
 impl<A: IntCell + F64Cell + WideCell> Slot<A> {
@@ -273,6 +282,13 @@ impl<A: IntCell + F64Cell + WideCell> Slot<A> {
             AggregationKind::Sum => NumOp::Sum,
             AggregationKind::Min => NumOp::Min,
             AggregationKind::Max => NumOp::Max,
+            AggregationKind::First => {
+                return Slot::First {
+                    column,
+                    output_type: spec.output_type.clone(),
+                    acc: None,
+                };
+            }
         };
         if spec.is_string_extreme() {
             Slot::Str {
@@ -322,6 +338,11 @@ impl<A: IntCell + F64Cell + WideCell> Slot<A> {
                 let reduced = reduce_str_column(*is_max, batch.column(*column).as_ref());
                 fold_into(acc, reduced, str_extreme_fn(*is_max));
             }
+            Slot::First { column, acc, .. } => {
+                if acc.is_none() && batch.num_rows() > 0 {
+                    *acc = Some(batch.column(*column).slice(0, 1));
+                }
+            }
         }
     }
 
@@ -340,6 +361,9 @@ impl<A: IntCell + F64Cell + WideCell> Slot<A> {
             }
             (Slot::Str { is_max, acc, .. }, Slot::Str { acc: other, .. }) => {
                 fold_into(acc, other, str_extreme_fn(*is_max));
+            }
+            (Slot::First { acc, .. }, Slot::First { acc: other, .. }) => {
+                fold_into(acc, other, |mine, _theirs| mine);
             }
             _ => unreachable!("every worker builds its slots from the same specs"),
         }
@@ -369,6 +393,12 @@ impl<A: IntCell + F64Cell + WideCell> Slot<A> {
                 Field::new(if is_max { "max" } else { "min" }, DataType::Utf8View, true),
                 Arc::new(StringViewArray::from_iter(std::iter::once(acc.as_deref()))),
             ),
+            Slot::First {
+                output_type, acc, ..
+            } => {
+                let value = acc.unwrap_or_else(|| arrow_array::new_null_array(&output_type, 1));
+                (Field::new("first", value.data_type().clone(), true), value)
+            }
         }
     }
 }
@@ -836,6 +866,42 @@ mod tests {
         assert_eq!(col_i128(batch, 0), 1700); // 17.00
         assert_eq!(col_i128(batch, 1), 250); // 2.50
         assert_eq!(col_i128(batch, 2), 1050); // 10.50
+    }
+
+    #[test]
+    fn first_keeps_the_first_value_seen() {
+        let ops = build::<i64>(
+            1,
+            vec![AggregationSlot::new(
+                AggregationKind::First,
+                0,
+                DataType::Int32,
+            )],
+        );
+
+        let out = run_consumers(ops, vec![vec![make_batch(&[7, 2]), make_batch(&[9])]]);
+
+        assert_eq!(out.items.len(), 1);
+        assert_eq!(
+            out.items[0].column(0).as_primitive::<Int32Type>().value(0),
+            7
+        );
+    }
+
+    #[test]
+    fn first_over_zero_rows_is_null() {
+        let ops = build::<i64>(
+            1,
+            vec![AggregationSlot::new(
+                AggregationKind::First,
+                0,
+                DataType::Int32,
+            )],
+        );
+
+        let out = run_consumers(ops, vec![vec![]]);
+
+        assert!(out.items[0].column(0).is_null(0));
     }
 
     #[test]

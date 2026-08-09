@@ -240,6 +240,7 @@ fn aggregation_slots(exprs: &[Expression]) -> Result<Vec<AggregationSlot>, Error
                         .ok_or_else(|| Error::UnsupportedAggregateExpression(e.clone()))?,
                     a.column().column_idx,
                 ),
+                AggregateFunc::First(a) => (AggregationKind::First, a.column().column_idx),
                 _ => return Err(Error::UnsupportedAggregateExpression(e.clone())),
             };
             Ok(AggregationSlot::new(
