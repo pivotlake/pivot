@@ -8,9 +8,13 @@
 //!
 //! The compacter is **location-agnostic**: candidates come from the table's
 //! manifest (paths + sizes, no directory scanning), and the merge (read,
-//! upload, swap) runs through [`CatalogTable::compact_files`]. A table under an
-//! `s3://` database root compacts through the exact same code path as a local
-//! one.
+//! upload, swap) runs through [`compact_table_files`]. A table under an `s3://`
+//! database root compacts through the exact same code path as a local one.
+//!
+//! The swapped-out inputs are not deleted with the swap: a query that loaded the
+//! prior version is still reading them, and the swap's Delta `Remove` actions
+//! are their durable tombstones. The objects stay in place until the vacuum
+//! sweep ages them out.
 //!
 //! Merging is **one dataflow** on the dispatch worker pool: the scan stages
 //! decode the inputs' row groups, the encode stages repack them into full-size
@@ -179,25 +183,21 @@ impl Compacter {
             warn!(table = %name, error = %e, "compaction: table refresh failed");
             return;
         }
+        let id = table.id();
         while let Some(inputs) = self.next_batch(&table) {
-            let job = CompactJob {
-                table: table.clone(),
-            };
-            match tokio::task::spawn_blocking(move || job.compact(inputs)).await {
-                Ok(Ok((committed, merged))) => {
-                    // Continue from the copy that performed the swap: it
-                    // already holds the committed version, and it is the only
-                    // copy carrying the merged files' sort bounds (the Delta
-                    // log does not persist them). Publish it so the next
-                    // query's snapshot reads the merged file instead of the
-                    // swapped-out inputs.
-                    table = committed;
+            // `spawn_blocking` needs a `'static` closure, so it gets its own
+            // handle rather than a borrow of `self`.
+            let datastore = self.datastore.clone();
+            match tokio::task::spawn_blocking(move || swap_batch(&datastore, id, &inputs)).await {
+                Ok(Ok((merged, committed))) => {
                     info!(
                         table = %name,
                         files = merged.len(),
                         "compacted batch"
                     );
-                    self.datastore.publish_table(table.clone());
+                    // Continue from the copy the swap published, so the next
+                    // batch is picked from the merged file set.
+                    table = committed;
                 }
                 Ok(Err(e)) => {
                     error!(table = %name, error = %e, "compaction merge failed");
@@ -271,6 +271,73 @@ impl Compacter {
     }
 }
 
+/// Swap one batch of merged files into the table with identity `id`, and hand
+/// back the copy the swap published alongside the files it wrote.
+///
+/// That copy is what lets the caller's loop advance past its own swap: batches
+/// are picked off the table's file list, so a caller still holding its pre-merge
+/// copy would re-pick the very files this swap replaced, and the next removed-files
+/// check would reject them. Picking up another writer's commit is incidental; the
+/// sweep's own `refresh` would catch that on the next round anyway.
+///
+/// It is re-read rather than returned from the commit because
+/// [`DeltaDatastore::publish_table`] consumes the committed copy, so returning it
+/// would put a deep clone on the INSERT path to save one here. Reading it on this
+/// blocking thread rather than in the caller at least keeps that clone off the
+/// reactor.
+fn swap_batch(
+    datastore: &DeltaDatastore,
+    id: uuid::Uuid,
+    inputs: &[FileRef],
+) -> Result<(Vec<FileRef>, CatalogTable), crate::Error> {
+    let merged = compact_table_files(datastore, id, inputs, ROW_GROUP_ROWS)?;
+    let committed = datastore
+        .table_handle_by_id(&id)
+        .ok_or_else(|| crate::Error::TableNotFound(id.to_string()))?;
+    Ok((merged, committed))
+}
+
+/// Merge `inputs` of the table with identity `id` into fresh target-sized files
+/// and swap them in for the inputs, in one log commit labelled a rearrangement.
+/// `inputs` must share one partition tuple; the caller batches them so. Returns
+/// the merged files.
+///
+/// The merge itself (decode, re-encode, upload) runs off a plain read copy of
+/// the table with no commit lock held, so it never blocks a concurrent INSERT's
+/// commit; only the swap that follows takes it. If that swap fails for any
+/// reason, including another writer having swapped the inputs out first, the
+/// uncommitted merge outputs are deleted before the error is returned.
+///
+/// Blocking store I/O, so callers run it on the blocking pool.
+pub fn compact_table_files(
+    datastore: &DeltaDatastore,
+    id: uuid::Uuid,
+    inputs: &[FileRef],
+    target_rows_per_group: usize,
+) -> Result<Vec<FileRef>, crate::Error> {
+    let table = datastore
+        .table_handle_by_id(&id)
+        .ok_or_else(|| crate::Error::TableNotFound(id.to_string()))?;
+    let merged = table.merge_files(inputs, target_rows_per_group)?;
+
+    let files: Vec<FileRef> = merged.iter().map(|file| file.file_ref().clone()).collect();
+    let removed: Vec<ObjectPath> = inputs.iter().map(|file| file.path.clone()).collect();
+    if let Err(error) = datastore.commit_to_table(id, &removed, merged, false) {
+        for file in &files {
+            if let Err(cleanup_error) = table.delete_data_file(&file.path) {
+                warn!(
+                    commit_error = %error,
+                    cleanup_error = %cleanup_error,
+                    file = %file.path,
+                    "compaction: deleting output after commit failure failed (orphan left)"
+                );
+            }
+        }
+        return Err(error);
+    }
+    Ok(files)
+}
+
 fn partition_values_equal(
     left: &Option<crate::PartitionValues>,
     right: &Option<crate::PartitionValues>,
@@ -279,30 +346,6 @@ fn partition_values_equal(
         (None, None) => true,
         (Some(left), Some(right)) => scalar_values_equal(left, right),
         _ => false,
-    }
-}
-
-/// One merge, run on a blocking thread (it drives a dataflow, which blocks the
-/// driving thread while the work itself runs on the dispatch workers).
-struct CompactJob {
-    table: CatalogTable,
-}
-
-impl CompactJob {
-    /// Merge `inputs` into target-sized files and swap them into the table in one
-    /// log commit ([`CatalogTable::compact_files`]). Returns the table copy that
-    /// holds the committed version alongside the merged files written.
-    ///
-    /// The swapped-out inputs are not deleted here: a query that loaded the prior
-    /// version is still reading them, and the swap's Delta Remove actions are
-    /// their durable tombstones. The objects stay in place until the table grows
-    /// VACUUM-style physical cleanup.
-    fn compact(
-        mut self,
-        inputs: Vec<FileRef>,
-    ) -> Result<(CatalogTable, Vec<FileRef>), crate::Error> {
-        let merged = self.table.compact_files(&inputs, ROW_GROUP_ROWS)?;
-        Ok((self.table, merged))
     }
 }
 

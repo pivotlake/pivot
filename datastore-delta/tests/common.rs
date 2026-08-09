@@ -87,6 +87,20 @@ pub fn dispatch_with_buffers(workers: usize, buffers: usize) -> DispatchGuard {
     DispatchGuard(Some(Dispatch::spin_up(workers, buffers, None)))
 }
 
+/// One dispatch pool shared by every test in a binary, spun up on the first
+/// call and left running for the binary's life. This is what a test file wants
+/// when several of its tests each drive dataflows: a [`DispatchGuard`] tears its
+/// pool down when the test that built it ends, while the buffers here are
+/// pre-faulted once and reused. The `workers`/`buffers` of the first caller win.
+pub fn shared_dispatcher(workers: usize, buffers: usize) -> DataFlowDispatcher {
+    static DISPATCH: std::sync::OnceLock<Dispatch> = std::sync::OnceLock::new();
+    init_tracing();
+    DISPATCH
+        .get_or_init(|| Dispatch::spin_up(workers, buffers, None))
+        .dispatcher()
+        .clone()
+}
+
 /// Commit one datastore transaction to completion. Writing commits hop to
 /// Tokio's blocking pool, so direct datastore tests use this small runtime just
 /// as the server's async query handler does.
@@ -259,11 +273,23 @@ pub fn write_parquet_files(
         .unwrap();
     commit_datastore_transaction(creation).unwrap();
 
-    let insert = datastore.begin_transaction();
-    let table = insert
+    insert_batches(dispatch, datastore.begin_transaction(), "written", batches);
+}
+
+/// INSERT `batches` into the table `name` through `transaction` and commit it,
+/// the way one client's statement runs. The transaction comes from the caller so
+/// a test can insert through one it opened earlier (before another statement
+/// committed) rather than a fresh one.
+pub fn insert_batches(
+    dispatch: &DataFlowDispatcher,
+    transaction: Arc<dyn DatastoreTransaction>,
+    name: &str,
+    batches: Vec<RecordBatch>,
+) {
+    let table = transaction
         .bind_table(
             planner::DEFAULT_DATASTORE_NAME,
-            &SchemaQualifiedTableName::in_default_schema("written"),
+            &SchemaQualifiedTableName::in_default_schema(name),
         )
         .expect("the table was created");
     let rows = dispatch::values_input(dispatch, batches).record_batches();
@@ -273,5 +299,5 @@ pub fn write_parquet_files(
         .execute()
         .collect()
         .unwrap();
-    commit_datastore_transaction(insert).unwrap();
+    commit_datastore_transaction(transaction).unwrap();
 }

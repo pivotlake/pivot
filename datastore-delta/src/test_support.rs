@@ -326,7 +326,8 @@ impl CatalogTable {
     /// entries) in one manifest version, reading the added files' footers only if
     /// the swap wins -- so a losing swap errors before touching its output.
     /// Production compaction commits its merged files through
-    /// `compact_files`, which already holds the row groups.
+    /// [`compact_table_files`](crate::compact_table_files), which already holds
+    /// the row groups and takes the table's commit lock.
     pub fn replace_data_files(
         &mut self,
         removed: &[ObjectPath],

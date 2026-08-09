@@ -202,12 +202,12 @@ impl DatastoreIndex {
 /// **once** (in parallel over the worker pool) and stages the materialized table
 /// on its transaction. The transaction's blocking commit initializes the table,
 /// records it in the database index, and publishes the entry in this shared map.
-/// After that, a table evolves by manifest commits on a [`CatalogTable`] *copy*:
-/// a writer takes one with
-/// [`table_handle`](Self::table_handle) and appends its uploaded files or swaps
-/// them (compaction), which CAS a new version into the store. Copies drift; every query resolve refreshes its copy
-/// to the latest committed version, so a commit by another process (or this one)
-/// becomes visible to the next query.
+/// After that, a table evolves by log commits through
+/// [`commit_to_table`](Self::commit_to_table): a writer (INSERT, compaction)
+/// hands its files to the datastore, which appends them to, or swaps them into,
+/// the live copy it holds here and publishes the result. Copies handed out for
+/// reading drift; every query resolve refreshes its copy to the latest committed
+/// version, so a commit by another process becomes visible to the next query.
 ///
 /// Cloneable (every field is an `Arc`, a `String`, or the shared dispatcher
 /// handle), so a commit that writes can hand a clone to the blocking pool.
@@ -471,6 +471,44 @@ impl DeltaDatastore {
         }
     }
 
+    /// In one Delta commit for table `id`, add every file in `added` and remove
+    /// every path in `removed`. `data_change` is `true` for a logical change such
+    /// as INSERT, or `false` for a compaction rearrangement that incremental log
+    /// readers can skip.
+    ///
+    /// This is the sole in-process write path and uses the
+    /// [commit-lock protocol](field@CatalogTable::commit_lock). A caller's
+    /// [`CatalogTable`] copy is a read view, never a commit base.
+    pub(crate) fn commit_to_table(
+        &self,
+        id: Uuid,
+        removed: &[ObjectPath],
+        added: Vec<TableFile>,
+        data_change: bool,
+    ) -> Result<()> {
+        // Look the table up twice on purpose: this first lookup takes nothing
+        // but the lock, because a copy read before the lock would be the version
+        // the previous holder is about to supersede. The index guard is a
+        // temporary in this statement, so it is released at the semicolon,
+        // before the blocking log write; that only type-checks because
+        // `commit_lock` hands back an owned `Arc` rather than a reference.
+        let commit_lock = self
+            .tables_index
+            .read()
+            .unwrap()
+            .get_table_by_id(&id)
+            .ok_or_else(|| Error::TableNotFound(id.to_string()))?
+            .commit_lock();
+        let _committing = commit_lock.lock().unwrap();
+
+        let mut table = self
+            .table_handle_by_id(&id)
+            .ok_or_else(|| Error::TableNotFound(id.to_string()))?;
+        table.commit_files(removed, added, data_change)?;
+        self.publish_table(table);
+        Ok(())
+    }
+
     /// Persist one table creation staged by a completed footer-fetch dataflow:
     /// commit Delta version 0, record the table in the database index, and
     /// publish it into the live set so the next transaction binds it. Called
@@ -558,12 +596,12 @@ impl DeltaDatastore {
         &self.dispatcher
     }
 
-    /// A clone of the named table's current state for a writer (INSERT,
-    /// compaction) to evolve — appending its uploaded files or swapping them
-    /// (compaction). Those commit a new version by CAS to the shared store, so
-    /// this datastore's own copy may
-    /// lag until its next resolve refreshes it (which is fine, the store is the
-    /// source of truth). `None` if no such table exists.
+    /// A clone of the named table's current state, for a caller that reads it
+    /// (a compaction candidate scan, introspection) or refreshes it to the
+    /// latest committed version. A copy drifts as soon as anything commits, and
+    /// it is never a commit base: writes go through
+    /// [`commit_to_table`](Self::commit_to_table). `None` if no such table
+    /// exists.
     pub fn table_handle(&self, name: &SchemaQualifiedTableName) -> Option<CatalogTable> {
         self.tables_index
             .read()
@@ -591,7 +629,7 @@ impl DeltaDatastore {
     }
 
     /// A clone of the table with identity `id`, or `None` if it's gone (dropped,
-    /// or a stale reference outliving the table). Used by INSERT commit to resolve
+    /// or a stale reference outliving the table). This is how a commit resolves
     /// the *live* table its files belong to, regardless of any concurrent rename.
     pub fn table_handle_by_id(&self, id: &Uuid) -> Option<CatalogTable> {
         self.tables_index
@@ -842,17 +880,15 @@ fn commit_table_creations(
     Ok(())
 }
 
-/// Commit the files an INSERT drained from its transaction: group them by table
-/// and append each table's to its Delta log (a CAS over the sync object store).
-/// The commit base is the transaction's frozen snapshot; a stale base just loses
-/// the first CAS attempt and retries on the reloaded latest (see
-/// [`CatalogTable::commit_files`]). The datastore's live set is left
-/// untouched: the background refresh advances it to the committed version, so an
-/// INSERT never writes shared read state. Blocking store I/O, so
-/// [`DeltaTransaction::commit`] runs it on the blocking pool.
+/// Commit the files an INSERT drained from its transaction: group them by the
+/// table they were written for and append each group through
+/// [`DeltaDatastore::commit_to_table`]. The transaction's frozen snapshot is not
+/// the commit base -- it is a read view, and a table it froze versions ago would
+/// lose the compare-and-swap against every INSERT that committed since.
+/// Blocking store I/O, so [`DeltaTransaction::commit`] runs it on the blocking
+/// pool.
 fn commit_uploaded_files(
     datastore: &DeltaDatastore,
-    snapshot: &DeltaSnapshot,
     drained: Vec<insert_sink::UploadedFile>,
 ) -> CatalogResult<()> {
     let mut files_by_table = HashMap::<Uuid, Vec<TableFile>>::new();
@@ -876,16 +912,7 @@ fn commit_uploaded_files(
     }
 
     for (table_id, files) in files_by_table {
-        let mut table = snapshot
-            .catalog_table_by_id(&table_id)
-            .ok_or_else(|| Error::TableNotFound(table_id.to_string()))?;
-        table.commit_uploaded_files(files)?;
-        // The copy that performed the commit is the one holding the new version,
-        // and the only one carrying the uploaded files' sort bounds (the Delta
-        // log does not persist them). Publish it so the next transaction reads
-        // the inserted rows instead of waiting for a background refresh, which
-        // would also reload those files without their bounds.
-        datastore.publish_table(table);
+        datastore.commit_to_table(table_id, &[], files, true)?;
     }
     Ok(())
 }
@@ -1065,13 +1092,6 @@ impl DeltaSnapshot {
         })
     }
 
-    /// A clone of the table with `id`, or `None`. An INSERT commit takes its base
-    /// version from here (the frozen snapshot), so it commits to the log without
-    /// touching the datastore's live set.
-    pub(super) fn catalog_table_by_id(&self, id: &Uuid) -> Option<CatalogTable> {
-        self.index.get_table_by_id(id).cloned()
-    }
-
     /// Whether this snapshot holds a table named `name`; the up-front duplicate
     /// check for `CREATE TABLE`.
     pub(super) fn contains_table(&self, name: &SchemaQualifiedTableName) -> bool {
@@ -1187,7 +1207,6 @@ impl DatastoreTransaction for DeltaTransaction {
         {
             return Ok(());
         }
-        let snapshot = self.snapshot.clone();
         let datastore = self.datastore.clone();
         let pending_schema_creations = drain_injector(&self.pending_schema_creations);
         let pending_table_creations = drain_injector(&self.pending_table_creations);
@@ -1198,7 +1217,7 @@ impl DatastoreTransaction for DeltaTransaction {
             // it.
             commit_schema_creations(&datastore, pending_schema_creations)?;
             commit_table_creations(&datastore, pending_table_creations)?;
-            commit_uploaded_files(&datastore, &snapshot, uploaded_files)
+            commit_uploaded_files(&datastore, uploaded_files)
         })
         .await
         .map_err(|e| CatalogError::Other(format!("commit thread panicked: {e}").into()))?

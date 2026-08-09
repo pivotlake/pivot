@@ -607,10 +607,11 @@ fn write_ids(dir: &Path, file_name: &str, ids: &[i32]) -> std::path::PathBuf {
     path
 }
 
-/// Append the file at `path` to table `name` through a cloned-out handle — the
-/// table-level API a writer uses: it writes the bytes into the table's
-/// location, CAS-commits the file, and publishes the committed copy back so the
-/// next transaction's snapshot sees it. Recorded by its location-relative name.
+/// Append the file at `path` to table `name` through the test-only seeding API:
+/// it writes the bytes into the table's location, CAS-commits the file on a
+/// cloned-out handle, and publishes the committed copy back so the next
+/// transaction's snapshot sees it. Recorded by its location-relative name.
+/// (Production writers instead go through `DeltaDatastore::commit_to_table`.)
 fn append(datastore: &DeltaDatastore, name: &str, path: &Path) {
     let bytes = std::fs::read(path).unwrap();
     let relative = ObjectPath::new(path.file_name().unwrap().to_string_lossy());
@@ -1177,7 +1178,7 @@ fn a_refresh_that_cannot_read_the_new_files_leaves_the_copy_untouched() {
 /// Compaction merges a table's small files into one target-sized file over the
 /// async upload path and swaps them in, preserving every row in one commit.
 #[test]
-fn compact_files_merges_small_files_into_one() {
+fn compact_table_files_merges_small_files_into_one() {
     let dir = TempDir::new().unwrap();
     let columns = vec![Column {
         name: "id".to_string(),
@@ -1194,7 +1195,8 @@ fn compact_files_merges_small_files_into_one() {
     table.refresh().unwrap();
     let inputs = table.file_refs();
     assert_eq!(inputs.len(), 2, "two inserts wrote two files");
-    let merged = table.compact_files(&inputs, 128 * 1024).unwrap();
+    let merged =
+        datastore_delta::compact_table_files(&datastore, table.id(), &inputs, 128 * 1024).unwrap();
 
     assert_eq!(merged.len(), 1, "the two inputs merge into one file");
     let parquet = current_parquet(&datastore, "t");
@@ -1206,7 +1208,7 @@ fn compact_files_merges_small_files_into_one() {
 /// output. The output is not referenced by any log version, so it must be
 /// deleted before the error escapes.
 #[test]
-fn compact_files_deletes_uploaded_outputs_when_delta_commit_fails() {
+fn compact_table_files_deletes_uploaded_outputs_when_delta_commit_fails() {
     let (dir, columns) = three_row_table();
     let (_database, datastore) = empty_datastore();
     create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
@@ -1223,7 +1225,7 @@ fn compact_files_deletes_uploaded_outputs_when_delta_commit_fails() {
     let saved_delta_log = dir.path().join("_delta_log.saved");
     std::fs::rename(&delta_log, &saved_delta_log).unwrap();
     File::create(&delta_log).unwrap();
-    let result = table.compact_files(&inputs, 128 * 1024);
+    let result = datastore_delta::compact_table_files(&datastore, table.id(), &inputs, 128 * 1024);
     std::fs::remove_file(&delta_log).unwrap();
     std::fs::rename(&saved_delta_log, &delta_log).unwrap();
 
