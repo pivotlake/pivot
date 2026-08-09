@@ -11,6 +11,11 @@
 //! thread and reused across queries. When run as a binary, the default is to run with the default
 //! `datastore_delta::DeltaDatastore`.
 //!
+//! Both query protocols are served. A statement sent whole runs on the simple
+//! protocol; one prepared with placeholders (`INSERT INTO t VALUES (?, ?)`)
+//! runs on the extended one, which binds its values into the SQL and is limited
+//! to statements that return no rows (see the `prepared` module).
+//!
 //! The public interface: hand a bind address to [`Server::new`] together with a
 //! [`Dispatch`](dispatch::Dispatch) (from
 //! [`Dispatch::spin_up`](dispatch::Dispatch::spin_up)), your catalog, and the
@@ -59,6 +64,7 @@ mod http;
 mod limits;
 #[cfg(feature = "perf")]
 mod perf;
+mod prepared;
 mod query_handler;
 mod server;
 

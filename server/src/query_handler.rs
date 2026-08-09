@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use crate::arrow_to_pgwire::PGRowBatch;
 use crate::auth::Authenticator;
+use crate::prepared::{self, ParameterizedSql, PlaceholderParser, bound_sql};
 use arrow_array::{Array, Int64Array, RecordBatch};
 use async_trait::async_trait;
 use dispatch::{CancelToken, DataFlowHandle, DataFlowStats};
@@ -36,7 +37,8 @@ use lru::LruCache;
 use metastore::Metastore;
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
-use pgwire::api::query::SimpleQueryHandler;
+use pgwire::api::portal::Portal;
+use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{QueryResponse, Response, Tag};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{
@@ -669,6 +671,35 @@ fn perf_on<C: ClientInfo>(client: &C) -> bool {
     client.metadata().get(PERF_FLAG).is_some_and(|v| v == "on")
 }
 
+/// Turn a finished statement's [`Outcome`] into the response the client gets:
+/// a `SET` is applied to the connection here, and a session that asked for
+/// stats is sent the breakdown as an INFO notice before its rows. Shared by
+/// both the simple and the extended protocol.
+async fn respond<C>(client: &mut C, outcome: Outcome, with_stats: bool) -> PgWireResult<Response>
+where
+    C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    Ok(match outcome {
+        Outcome::Set { name, value } => apply_set(client, &name, value.as_deref()),
+        Outcome::Compact => Response::Execution(Tag::new("COMPACT")),
+        Outcome::Response(response, stats) => {
+            if with_stats {
+                let notice = NoticeResponse::from(ErrorInfo::new(
+                    "INFO".to_string(),
+                    "00000".to_string(),
+                    stats.summary(),
+                ));
+                client
+                    .send(PgWireBackendMessage::NoticeResponse(notice))
+                    .await?;
+            }
+            response
+        }
+    })
+}
+
 #[async_trait]
 impl SimpleQueryHandler for PivotQueryHandler {
     async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
@@ -693,27 +724,65 @@ impl SimpleQueryHandler for PivotQueryHandler {
                 e.into_pgwire()
             })?;
 
-        let res = match outcome {
-            Outcome::Set { name, value } => apply_set(client, &name, value.as_deref()),
-            Outcome::Compact => Response::Execution(Tag::new("COMPACT")),
-            Outcome::Response(res, stats) => {
-                // Send the breakdown as an INFO notice before the rows.
-                if with_stats {
-                    let notice = NoticeResponse::from(ErrorInfo::new(
-                        "INFO".to_string(),
-                        "00000".to_string(),
-                        stats.summary(),
-                    ));
-                    client
-                        .send(PgWireBackendMessage::NoticeResponse(notice))
-                        .await?;
-                }
-                res
-            }
-        };
+        let res = respond(client, outcome, with_stats).await?;
 
         info!(sql = %query, "query succeeded");
         Ok(vec![res])
+    }
+}
+
+/// pgwire `ExtendedQueryHandler`: the prepared-statement protocol
+/// (parse/bind/describe/execute). A `Bind`'s values are rendered into the
+/// statement's SQL as literals (see [`crate::prepared`]) and the result runs
+/// down the same path as a simple query.
+#[async_trait]
+impl ExtendedQueryHandler for PivotQueryHandler {
+    type Statement = ParameterizedSql;
+    type QueryParser = PlaceholderParser;
+
+    fn query_parser(&self) -> Arc<Self::QueryParser> {
+        Arc::new(PlaceholderParser)
+    }
+
+    async fn do_query<C>(
+        &self,
+        client: &mut C,
+        portal: &Portal<Self::Statement>,
+        _max_rows: usize,
+    ) -> PgWireResult<Response>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let with_stats = stats_on(client);
+        #[cfg(feature = "perf")]
+        let with_perf = perf_on(client);
+        #[cfg(not(feature = "perf"))]
+        let with_perf = false;
+
+        let sql = bound_sql(portal).map_err(prepared::Error::into_pgwire)?;
+        info!(sql = %sql, "bound statement received");
+        let outcome = self
+            .run_query(&sql, with_stats, with_perf)
+            .await
+            .map_err(|e| {
+                warn!(error = %e, sql = %sql, "bound statement failed");
+                e.into_pgwire()
+            })?;
+
+        let response = respond(client, outcome, with_stats).await?;
+        // Rows are encoded in text format only (see `arrow_to_pgwire`), while a
+        // portal may ask for binary columns, and the row description would have
+        // to be answered at `Describe` time, before any value is bound.
+        // Statements that return rows therefore stay on the simple protocol.
+        if matches!(response, Response::Query(_)) {
+            return Err(prepared::Error::RowsNotSupported.into_pgwire());
+        }
+
+        info!(sql = %sql, "bound statement succeeded");
+        Ok(response)
     }
 }
 
@@ -767,8 +836,8 @@ impl PgWireServerHandlers for PivotHandlers {
         self.cancel_handler.clone()
     }
 
-    fn extended_query_handler(&self) -> Arc<impl pgwire::api::query::ExtendedQueryHandler> {
-        Arc::new(NoopHandler)
+    fn extended_query_handler(&self) -> Arc<impl ExtendedQueryHandler> {
+        self.query_handler.clone()
     }
 
     fn copy_handler(&self) -> Arc<impl pgwire::api::copy::CopyHandler> {

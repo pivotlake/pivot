@@ -22,6 +22,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use rstest::rstest;
 use tempfile::TempDir;
+use tokio_postgres::types::Type;
 use tokio_postgres::{Client, SimpleQueryMessage};
 
 /// Run `sql` and decode every `DataRow` in the response into
@@ -134,6 +135,144 @@ async fn insert_returns_affected_row_count(#[future] conn: Conn) {
 
     let rows = select_rows(&conn, "SELECT id FROM people_insert ORDER BY id").await;
     assert_eq!(rows.len(), 5);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn prepared_insert_binds_question_mark_parameters(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_prepared", dir.path()).await;
+
+    let inserted = conn
+        .execute(
+            "INSERT INTO people_prepared VALUES (?, ?), (?, ?)",
+            &[&"4", &"dave", &"5", &"eve"],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(inserted, 2);
+    let rows = select_rows(
+        &conn,
+        "SELECT id, name FROM people_prepared WHERE id > 3 ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("4".into()), Some("dave".into())],
+            vec![Some("5".into()), Some("eve".into())],
+        ],
+    );
+}
+
+/// A parameter the client declared a type for arrives in that type's binary
+/// encoding, not as text, so it takes a different route into the statement than
+/// the inferred-`TEXT` parameters above.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn prepared_insert_binds_typed_parameters(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_prepared_typed", dir.path()).await;
+    let statement = conn
+        .prepare_typed(
+            "INSERT INTO people_prepared_typed VALUES ($1, $2)",
+            &[Type::INT8, Type::TEXT],
+        )
+        .await
+        .unwrap();
+
+    let inserted = conn.execute(&statement, &[&6i64, &"frank"]).await.unwrap();
+
+    assert_eq!(inserted, 1);
+    let rows = select_rows(
+        &conn,
+        "SELECT id, name FROM people_prepared_typed WHERE id > 3",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Some("6".into()), Some("frank".into())]]);
+}
+
+/// One prepared statement, executed twice with different values: the second
+/// execution must not see the first one's.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prepared_statement_runs_again_with_new_values(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_prepared_reused", dir.path()).await;
+    let statement = conn
+        .prepare("INSERT INTO people_prepared_reused VALUES ($1, $2)")
+        .await
+        .unwrap();
+
+    conn.execute(&statement, &[&"7", &"grace"]).await.unwrap();
+    conn.execute(&statement, &[&"8", &"heidi"]).await.unwrap();
+
+    let rows = select_rows(
+        &conn,
+        "SELECT id, name FROM people_prepared_reused WHERE id > 3 ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("7".into()), Some("grace".into())],
+            vec![Some("8".into()), Some("heidi".into())],
+        ],
+    );
+}
+
+/// A bound value is data, never SQL: a quote inside one ends up in the column
+/// rather than closing the literal it was substituted into.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quote_in_a_bound_value_stays_data(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_prepared_quotes", dir.path()).await;
+
+    conn.execute(
+        "INSERT INTO people_prepared_quotes VALUES (?, ?)",
+        &[&"9", &"o'brien'); DROP TABLE people_prepared_quotes; --"],
+    )
+    .await
+    .unwrap();
+
+    let rows = select_rows(
+        &conn,
+        "SELECT name FROM people_prepared_quotes WHERE id = 9",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![vec![Some(
+            "o'brien'); DROP TABLE people_prepared_quotes; --".into()
+        )]],
+    );
+}
+
+/// Results are only encoded in text format, and a portal can ask for binary
+/// columns, so a row-returning statement is refused on the extended protocol
+/// instead of being answered in a format the client did not ask for.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prepared_select_is_refused(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_prepared_select", dir.path()).await;
+
+    let error = conn
+        .query("SELECT id FROM people_prepared_select", &[])
+        .await
+        .unwrap_err();
+
+    assert!(
+        extract_db_error_message(&error).contains("simple query"),
+        "unexpected error: {error}"
+    );
 }
 
 #[rstest]
