@@ -964,3 +964,28 @@ fn a_date_column_writes_whichever_encoding_it_takes() {
         .to_vec();
     assert_eq!(read, days);
 }
+
+/// An unpartitioned insert is one partition however big the table is, so a file
+/// has to be cut on size as well as on a partition boundary. Held whole, a large
+/// insert would buffer every row before writing any of them.
+#[test]
+fn a_long_insert_is_cut_into_files_as_it_arrives() {
+    let rows_per_group = 1_000;
+    let rows_per_file = rows_per_group * 8;
+    let batches: Vec<ColumnsItem> = (0..5)
+        .map(|batch| {
+            let values: ArrayRef = Arc::new(Int64Array::from(
+                (0..rows_per_file as i64)
+                    .map(|row| batch * 1_000_000 + row)
+                    .collect::<Vec<_>>(),
+            ));
+            ColumnsItem(vec![("n", values)])
+        })
+        .collect();
+
+    let files = write(batches, rows_per_group);
+
+    assert_eq!(files.len(), 5, "five files' worth of rows, five files");
+    let rows: usize = files.iter().map(|file| read_back(file).num_rows()).sum();
+    assert_eq!(rows, 5 * rows_per_file);
+}

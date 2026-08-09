@@ -64,6 +64,14 @@ impl UnaryFactory<RecordBatch, ColumnChunkJob> for IndexerFactory {
     }
 }
 
+/// Row groups a file holds before the indexer cuts it and starts another.
+///
+/// A partition's rows are written out as they arrive rather than held until the
+/// partition ends: an unpartitioned insert is one partition however large the
+/// table is, so holding one would mean buffering the whole insert before
+/// writing a byte of it.
+const ROW_GROUPS_PER_FILE: usize = 8;
+
 /// The partition whose chunks are still arriving: its identity and everything
 /// collected so far.
 struct OpenPartition {
@@ -123,8 +131,10 @@ impl Indexer {
         Ok(Some(tuple.row(0).owned()))
     }
 
-    /// Send one finished partition off as one file: identity-gather jobs over
-    /// its chunk list, one row group per `target_rows_per_group` window. The
+    /// Send a file's worth of a partition off as one file: identity-gather jobs
+    /// over its chunk list, one row group per `target_rows_per_group` window. A
+    /// partition wider than [`ROW_GROUPS_PER_FILE`] row groups becomes several
+    /// files, all carrying its partition values. The
     /// file's shredding is only *planned* here; every rewrite of row data,
     /// shredding included, belongs to the encode workers.
     fn send_jobs_for_partitioned_file(
@@ -250,6 +260,13 @@ impl Unary<RecordBatch, ColumnChunkJob> for Indexer {
         });
         open.rows += batch.num_rows();
         open.chunks.push(batch);
+        if open.rows >= self.target_rows_per_group * ROW_GROUPS_PER_FILE {
+            let full = self
+                .open_partition
+                .take()
+                .expect("the partition was open a line ago");
+            self.send_jobs_for_partitioned_file(full, sender)?;
+        }
         Ok(())
     }
 
