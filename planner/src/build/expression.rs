@@ -23,8 +23,9 @@ use duckdb_planner::{Expr, LogicalTypeId, ScalarValue};
 use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Conjunction,
     ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide, Error,
-    Expression, Function, InList, IntervalArithmetic, IsNull, Length, Like, Not, NumericAggregate,
-    Prefix, Ref, RegexpFullMatch, RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
+    Expression, Function, InList, IntervalArithmetic, IsNull, Length, Like, MaybeError, Not,
+    NumericAggregate, Prefix, Ref, RegexpFullMatch, RegexpJitReplace, RegexpReplace,
+    TemporalConvert, VariantGet,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
 
@@ -45,7 +46,7 @@ impl Expression {
             DuckExpression::Function(f) => Expression::Function(Function::from_handle(f)?),
             DuckExpression::InList(i) => Expression::InList(InList::from_handle(i)?),
             DuckExpression::Conjunction(c) => Expression::Conjunction(Conjunction::from_handle(c)?),
-            DuckExpression::Case(c) => Expression::Case(Case::from_handle(c)?),
+            DuckExpression::Case(c) => Case::from_handle(c)?,
             DuckExpression::Not(n) => Expression::Not(Not::from_handle(n)?),
             DuckExpression::IsNull(n) => Expression::IsNull(IsNull {
                 negated: n.negated()?,
@@ -137,9 +138,25 @@ impl InList {
 }
 
 impl Case {
-    pub(crate) fn from_handle(view: CaseHandle<'_>) -> Result<Case, Error> {
-        let checks = view
-            .checks()?
+    pub(crate) fn from_handle(view: CaseHandle<'_>) -> Result<Expression, Error> {
+        let arms = view.checks()?;
+
+        // DuckDB guards every scalar subquery with `CASE WHEN too_many_rows
+        // THEN error('…') ELSE value END`. The CASE kernel evaluates all of
+        // its branches eagerly, which would raise the error on every batch, so
+        // this shape lowers to [`MaybeError`], which only raises when a row's
+        // check is actually true.
+        if let [arm] = arms.as_slice()
+            && let Some(message) = error_call_message(arm.then)?
+        {
+            return Ok(Expression::MaybeError(MaybeError {
+                check: Box::new(Expression::from_handle(arm.when)?),
+                message: Box::new(message),
+                value: Box::new(Expression::from_handle(view.else_expr()?)?),
+            }));
+        }
+
+        let checks = arms
             .into_iter()
             .map(|arm| {
                 Ok(CaseCheck {
@@ -148,11 +165,24 @@ impl Case {
                 })
             })
             .collect::<Result<Vec<_>, Error>>()?;
-        Ok(Case {
+        Ok(Expression::Case(Case {
             checks,
             else_expr: Box::new(Expression::from_handle(view.else_expr()?)?),
-        })
+        }))
     }
+}
+
+/// The message argument of an `error(…)` call, or `None` for any other
+/// expression.
+fn error_call_message(e: Expr<'_>) -> Result<Option<Expression>, Error> {
+    let DuckExpression::Function(func) = e.expression()? else {
+        return Ok(None);
+    };
+    if func.name()? != "error" {
+        return Ok(None);
+    }
+    let message = function_args(func, 1)?[0];
+    Ok(Some(Expression::from_handle(message)?))
 }
 
 impl Cast {
@@ -259,6 +289,11 @@ impl AggregateFunc {
                 function,
             )?)),
             "count" => Ok(AggregateFunc::Count(numeric_aggregate(
+                params,
+                return_type,
+                function,
+            )?)),
+            "first" => Ok(AggregateFunc::First(numeric_aggregate(
                 params,
                 return_type,
                 function,

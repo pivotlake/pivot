@@ -27,6 +27,7 @@ mod interval;
 mod is_null;
 mod length;
 mod like;
+mod maybe_error;
 mod not;
 mod prefix;
 mod reference;
@@ -53,6 +54,7 @@ pub use interval::IntervalArithmetic;
 pub use is_null::IsNull;
 pub use length::Length;
 pub use like::Like;
+pub use maybe_error::MaybeError;
 pub use not::Not;
 pub use prefix::Prefix;
 pub use reference::Ref;
@@ -119,6 +121,7 @@ pub enum Expression {
     InList(InList),
     Conjunction(Conjunction),
     Case(Case),
+    MaybeError(MaybeError),
     Not(Not),
     IsNull(IsNull),
     Cast(Cast),
@@ -149,6 +152,8 @@ impl Expression {
                     .sum::<usize>()
                     + c.else_expr.count_kernels()
             }
+            // The message only evaluates on failure, so it costs nothing here.
+            Expression::MaybeError(m) => m.check.count_kernels() + m.value.count_kernels(),
             Expression::Not(n) => 1 + n.input.count_kernels(),
             Expression::IsNull(n) => 1 + n.input.count_kernels(),
             Expression::Cast(c) => 1 + c.source.count_kernels(),
@@ -197,6 +202,11 @@ impl Expression {
                 }
                 c.else_expr.collect_column_refs(out);
             }
+            Expression::MaybeError(m) => {
+                m.check.collect_column_refs(out);
+                m.message.collect_column_refs(out);
+                m.value.collect_column_refs(out);
+            }
             Expression::Not(n) => n.input.collect_column_refs(out),
             Expression::IsNull(n) => n.input.collect_column_refs(out),
             Expression::Cast(c) => c.source.collect_column_refs(out),
@@ -223,6 +233,9 @@ impl Expression {
             // A CASE's branches are unified to one type by DuckDB, so the ELSE
             // branch's type is the whole expression's type.
             Expression::Case(c) => c.else_expr.result_type(),
+            // A tripped guard fails the query instead of yielding a value, so
+            // the value branch's type is the whole expression's type.
+            Expression::MaybeError(m) => m.value.result_type(),
             // A cast yields its target type.
             Expression::Cast(c) => Ok(c.target.clone()),
             // An aggregate carries DuckDB's bound result type.
@@ -261,6 +274,7 @@ impl Expression {
                 c.checks.iter().any(|check| check.then.nullability(input))
                     || c.else_expr.nullability(input)
             }
+            Expression::MaybeError(m) => m.value.nullability(input),
             Expression::Cast(c) => c.source.nullability(input),
             // A count is never NULL; the other aggregates are NULL over zero
             // (non-NULL) rows.
@@ -289,6 +303,7 @@ impl Expression {
             Expression::InList(i) => i.compile(),
             Expression::Conjunction(c) => c.compile(),
             Expression::Case(c) => c.compile(),
+            Expression::MaybeError(m) => m.compile(),
             Expression::Not(n) => n.compile(),
             Expression::IsNull(n) => n.compile(),
             Expression::Cast(c) => c.compile(),
@@ -309,6 +324,7 @@ impl Display for Expression {
             Expression::InList(i) => write!(f, "{i}"),
             Expression::Conjunction(c) => write!(f, "{c}"),
             Expression::Case(c) => write!(f, "{c}"),
+            Expression::MaybeError(m) => write!(f, "{m}"),
             Expression::Not(n) => write!(f, "{n}"),
             Expression::IsNull(n) => write!(f, "{n}"),
             Expression::Cast(c) => write!(f, "{c}"),

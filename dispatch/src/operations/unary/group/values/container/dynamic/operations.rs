@@ -66,6 +66,7 @@ impl<'b> OperationReader<'b> {
                 OperationReader::F64Max,
                 OperationReader::U128Max,
             ),
+            First => unreachable!("the planner rejects FIRST inside a GROUP BY"),
         }
     }
 
@@ -437,6 +438,7 @@ impl<A: IntCell + StringCell + F64Cell + WideCell> MergeCells for A {
             }
             AggregationKind::Max if ty.is_floating() => F64Max::<A>::merge(*self, source),
             AggregationKind::Max => Max::<A>::merge(*self, source),
+            AggregationKind::First => unreachable!("the planner rejects FIRST inside a GROUP BY"),
         };
     }
 }

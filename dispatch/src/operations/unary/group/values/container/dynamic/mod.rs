@@ -604,6 +604,9 @@ impl<A: IntCell + StringCell + F64Cell + WideCell, const ONLY_ADDITIVE: bool, S:
                     F64Max::<A>::finish(name, builder, nulls)
                 }
                 AggregationKind::Max => Max::<A>::finish(name, builder, nulls),
+                AggregationKind::First => {
+                    unreachable!("the planner rejects FIRST inside a GROUP BY")
+                }
             };
             fields.push(field);
             arrays.push(array);

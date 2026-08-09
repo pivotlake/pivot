@@ -54,6 +54,9 @@ pub enum AggregationKind {
     Min,
     /// `MAX(col)`. See [`Min`](AggregationKind::Min).
     Max,
+    /// `FIRST(col)` — one of the column's values, whichever a worker sees
+    /// first. Global aggregates only; the grouped path rejects it at planning.
+    First,
 }
 
 /// One aggregate output slot: which aggregate, over which input column, and the
