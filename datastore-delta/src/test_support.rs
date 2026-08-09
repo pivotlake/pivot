@@ -1,29 +1,30 @@
-//! A MinIO object-store harness for integration tests, gated behind the
-//! `test-support` feature. Used by this crate's own object-store tests and by
-//! downstream crates (e.g. `server`) that want to run a catalog rooted in a
-//! real bucket.
+//! A MinIO / fake-gcs-server object-store harness for integration tests, gated
+//! behind the `test-support` feature. Used by this crate's own object-store
+//! tests and by downstream crates (e.g. `server`) that want to run a catalog
+//! rooted in a real bucket.
 //!
 //! Every backend is addressed the same way — a catalog root URI plus an
 //! [`ObjectStore`] opened on it — so a test written against `(root, store)` runs
-//! unchanged on both:
+//! unchanged on all three:
 //!
 //! - [`local`] always works: a tempdir, no Docker.
-//! - [`s3`] brings up MinIO via testcontainers and returns `Some` only when
-//!   Docker is reachable; otherwise the caller `eprintln!`s and returns, so
-//!   tests stay green offline.
+//! - [`s3`] and [`gcs`] bring up MinIO and `fake-gcs-server` via testcontainers
+//!   and return `Some` only when Docker is reachable; otherwise the caller
+//!   `eprintln!`s and returns, so tests stay green offline.
 //!
-//! The container (and the process-global environment it configures — `AWS_*`)
-//! is brought up **once per test binary** inside a single [`OnceLock`] init:
-//! all `set_var`s happen on one thread before any store is opened, and the
-//! `OnceLock` publishes them with a happens-before to every later reader. Tests
-//! isolate themselves under a unique key prefix within the shared bucket rather
-//! than per-test containers.
+//! The two containers (and the process-global environment they configure —
+//! `AWS_*` for S3, `STORAGE_EMULATOR_HOST` for GCS) are brought up **once per
+//! test binary** inside a single [`OnceLock`] init: all `set_var`s happen on one
+//! thread before any store is opened, and the `OnceLock` publishes them with a
+//! happens-before to every later reader. Tests isolate themselves under a unique
+//! key prefix within the shared bucket rather than per-test containers.
 
 use std::sync::OnceLock;
 
 use crate::store::{DataFileLocation, ObjectPath, ObjectStore, open_store};
-use testcontainers::Container;
+use testcontainers::core::ContainerPort;
 use testcontainers::runners::SyncRunner;
+use testcontainers::{Container, GenericImage, ImageExt};
 use testcontainers_modules::minio::MinIO;
 
 /// The one bucket both emulated backends share; tests namespace under it.
@@ -59,9 +60,20 @@ pub fn s3(prefix: &str) -> Option<Backend> {
     Some(Backend { root, store })
 }
 
+/// A GCS backend rooted at `gs://<bucket>/<prefix>`, or `None` when
+/// `fake-gcs-server` could not be started (no Docker). `prefix` should be unique
+/// per test.
+pub fn gcs(prefix: &str) -> Option<Backend> {
+    containers().gcs.as_ref()?;
+    let root = format!("gs://{BUCKET}/{prefix}");
+    let store = open_store(&root).expect("open gcs store");
+    Some(Backend { root, store })
+}
+
 /// Fetch an object through [`ObjectStore::source`] exactly as the engine would:
-/// a local path is read off disk; a remote URL (a presigned S3 URL) is fetched
-/// over HTTP. Exercises the same read source the io_uring reader is handed.
+/// a local path is read off disk; a remote URL (a presigned S3 URL, a GCS media
+/// URL) is fetched over HTTP. Exercises the same read source the io_uring reader
+/// is handed.
 pub fn read_via_source(store: &dyn ObjectStore, key: &ObjectPath) -> Vec<u8> {
     match store.source(key).expect("source") {
         DataFileLocation::Local(path) => std::fs::read(path).expect("read local source"),
@@ -79,18 +91,40 @@ pub fn read_via_source(store: &dyn ObjectStore, key: &ObjectPath) -> Vec<u8> {
     }
 }
 
+/// Upload an object through [`ObjectStore::sink`] exactly as an INSERT's upload
+/// operator would: a local path is created on disk, a remote URL `PUT` over
+/// HTTP. A backend can address writes differently from reads (GCS reads over the
+/// JSON API and writes over the XML one), so this exercises the write URL the
+/// io_uring uploader is handed rather than assuming `source`'s.
+pub fn write_via_sink(store: &dyn ObjectStore, key: &ObjectPath, bytes: &[u8]) {
+    match store.sink(key).expect("sink") {
+        DataFileLocation::Local(path) => std::fs::write(path, bytes).expect("write local sink"),
+        DataFileLocation::Remote { url, auth } => {
+            let mut request = ureq::put(url.as_str());
+            if let Some(header) = auth.and_then(|mint| mint()) {
+                request = request.set("Authorization", &header);
+            }
+            request.send_bytes(bytes).expect("PUT sink url");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Container lifecycle: one MinIO per test binary.
+// Container lifecycle: one MinIO + one fake-gcs-server per test binary.
 // ---------------------------------------------------------------------------
 
 struct Containers {
     s3: Option<Container<MinIO>>,
+    gcs: Option<Container<GenericImage>>,
 }
 
 static CONTAINERS: OnceLock<Containers> = OnceLock::new();
 
 fn containers() -> &'static Containers {
-    CONTAINERS.get_or_init(|| Containers { s3: start_s3() })
+    CONTAINERS.get_or_init(|| Containers {
+        s3: start_s3(),
+        gcs: start_gcs(),
+    })
 }
 
 fn set_env(key: &str, value: &str) {
@@ -121,6 +155,88 @@ fn start_s3() -> Option<Container<MinIO>> {
         return None;
     }
     Some(container)
+}
+
+/// Bring up `fake-gcs-server` (plain HTTP, in-memory), point
+/// `STORAGE_EMULATOR_HOST` at it, and create the shared bucket.
+///
+/// The image is the fork the `object_store` crate tests its own GCS client
+/// against, because a GCS store is addressed through *two* APIs here: this
+/// crate's control plane speaks the JSON API, while Delta Kernel's client reads
+/// and writes a table's `_delta_log` over the XML API, which the upstream
+/// emulator does not implement.
+///
+/// The host port is chosen up front rather than left to Docker, because the
+/// emulator serves the XML API only for requests whose `Host` matches its
+/// `-public-host`, and that flag has to be passed before the container starts.
+fn start_gcs() -> Option<Container<GenericImage>> {
+    let port = free_port()?;
+    // No log-message wait: `fake-gcs-server`'s banner has shifted across
+    // versions, so we treat "container running" as the gate and poll the JSON
+    // API for actual readiness via the bucket-create retry below.
+    let image = GenericImage::new("tustvold/fake-gcs-server", "latest")
+        .with_exposed_port(ContainerPort::Tcp(4443))
+        .with_mapped_port(port, ContainerPort::Tcp(4443))
+        .with_cmd([
+            "-scheme",
+            "http",
+            "-backend",
+            "memory",
+            "-port",
+            "4443",
+            "-public-host",
+            &format!("localhost:{port}"),
+        ]);
+    let container = match image.start() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[test_support] skipping GCS backend — fake-gcs-server unavailable: {e}");
+            return None;
+        }
+    };
+    let endpoint = format!("http://localhost:{port}");
+    set_env("STORAGE_EMULATOR_HOST", &endpoint);
+    if let Err(e) = gcs_create_bucket(&endpoint) {
+        eprintln!("[test_support] skipping GCS backend — bucket create failed: {e}");
+        return None;
+    }
+    Some(container)
+}
+
+/// A port the OS just handed out and nothing is listening on, for a container
+/// that must know its own host port before it starts.
+fn free_port() -> Option<u16> {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()?
+        .local_addr()
+        .ok()
+        .map(|addr| addr.port())
+}
+
+/// Create the shared bucket on `fake-gcs-server` via its JSON API, retrying
+/// while the server is still coming up. A 409 means it already exists — fine.
+fn gcs_create_bucket(endpoint: &str) -> Result<(), String> {
+    let url = format!("{endpoint}/storage/v1/b?project=pivot-test");
+    let body = format!(r#"{{"name":"{BUCKET}"}}"#);
+    let mut last = String::new();
+    // ~12s of patience: a transport error means "not listening yet"; retry.
+    for _ in 0..60 {
+        match ureq::post(&url)
+            .set("Content-Type", "application/json")
+            .send_string(&body)
+        {
+            Ok(_) => return Ok(()),
+            Err(ureq::Error::Status(409, _)) => return Ok(()),
+            // A non-409 status means the server answered — the request is wrong,
+            // not the readiness; don't keep hammering.
+            Err(e @ ureq::Error::Status(..)) => return Err(format!("create bucket: {e}")),
+            Err(e) => {
+                last = e.to_string();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+    }
+    Err(format!("create bucket: server never became ready ({last})"))
 }
 
 /// `PUT /<bucket>` against MinIO, SigV4-signed (mirrors the datastore's own S3

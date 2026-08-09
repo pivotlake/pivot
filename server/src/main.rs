@@ -25,8 +25,8 @@ struct Args {
     /// Config file (YAML) describing this instance. Its `server` section sets
     /// the endpoint, the memory and worker budgets, and the disk cache; every
     /// setting there has a default, so the section is optional. Its `metastore`
-    /// section defines the datastores to serve, each a local directory or S3
-    /// root, attached as its own database
+    /// section defines the datastores to serve, each a local directory or an S3
+    /// or GCS root, attached as its own database
     /// (`SELECT * FROM <datastore>.main.<table>`), and the users that may
     /// connect. Exactly one datastore must set `default = true`; it is the
     /// current database (unqualified names resolve against it).

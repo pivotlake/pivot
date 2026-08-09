@@ -5,8 +5,8 @@
 //! - [`parquet`], the engines: the per-query scan pipeline and the
 //!   metadata-fetch (table load) pipeline, both dataflows over the dispatch
 //!   worker pool.
-//! - [`store`], the object-store backends (local filesystem and S3) everything
-//!   above persists through.
+//! - [`store`], the object-store backends (local filesystem, S3 and GCS)
+//!   everything above persists through.
 
 // Internal engine crate: the Parquet pipeline's public factories document their
 // behaviour by linking to the private operators they build (e.g.

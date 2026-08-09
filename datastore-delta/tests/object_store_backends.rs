@@ -1,14 +1,14 @@
-//! Blackbox integration tests for the object-store backends, local filesystem
-//! and S3 (MinIO), each a short Setup / Execute / Assert against the public
-//! datastore + store API.
+//! Blackbox integration tests for the object-store backends, local filesystem,
+//! S3 (MinIO) and GCS (`fake-gcs-server`), each a short Setup / Execute / Assert
+//! against the public datastore + store API.
 //!
 //! Every behaviour is written once (in [`bodies`]) over a `&Backend` and run on
 //! each backend by the [`backend_tests!`] macro. The local case always runs; the
-//! S3 case brings up a container via [`harness`] and skips when Docker is
+//! S3/GCS cases bring up containers via [`harness`] and skip when Docker is
 //! absent, so `cargo test` stays green offline.
 //!
-//! Covered: store contract (round-trip `source`, one-level `list`, the
-//! `put_if_absent` CAS), and the table lifecycle end to end — `CREATE TABLE`,
+//! Covered: store contract (round-trip through `source` and `sink`, one-level
+//! `list`, the `put_if_absent` CAS), and the table lifecycle end to end — `CREATE TABLE`,
 //! reopen, **appending a file** (out-of-band registration), and **compaction**
 //! (replacing files) — all over object storage.
 
@@ -193,7 +193,7 @@ mod bodies {
     }
 
     /// A stored object reads back through `source` — the read source the ring is
-    /// handed (a presigned S3 URL or a local path).
+    /// handed (a presigned S3 URL, a GCS media URL, or a local path).
     pub fn source_reads_object_back(b: &Backend) {
         b.store
             .put(&ObjectPath::new("s/o.bin"), b"payload")
@@ -202,6 +202,20 @@ mod bodies {
         let bytes = harness::read_via_source(b.store.as_ref(), &ObjectPath::new("s/o.bin"));
 
         assert_eq!(bytes, b"payload");
+    }
+
+    /// An object written through `sink` — the upload destination the ring is
+    /// handed — lands under the key the store was asked for, and reads back
+    /// through the ordinary `get`.
+    pub fn sink_writes_object_back(b: &Backend) {
+        b.store.create_dir(&ObjectPath::new("w")).unwrap();
+
+        harness::write_via_sink(b.store.as_ref(), &ObjectPath::new("w/o.bin"), b"uploaded");
+
+        assert_eq!(
+            b.store.get(&ObjectPath::new("w/o.bin")).unwrap().unwrap(),
+            b"uploaded"
+        );
     }
 
     /// `list` is one level only: a nested object is not returned.
@@ -242,9 +256,45 @@ mod bodies {
 
 // --- backend matrix --------------------------------------------------------
 
-/// Emit `local` / `s3` tests for a [`bodies`] behaviour. S3 skips when Docker
-/// is absent; each gets its own bucket prefix for isolation.
+/// Emit `local` / `s3` / `gcs` tests for a [`bodies`] behaviour. S3/GCS skip
+/// when Docker is absent; each gets its own bucket prefix for isolation.
 macro_rules! backend_tests {
+    ($name:ident) => {
+        mod $name {
+            use super::*;
+            #[test]
+            fn local() {
+                let (_dir, b) = harness::local();
+                bodies::$name(&b);
+            }
+            #[test]
+            fn s3() {
+                if let Some(b) = harness::s3(concat!(stringify!($name), "-s3")) {
+                    bodies::$name(&b);
+                }
+            }
+            #[test]
+            fn gcs() {
+                if let Some(b) = harness::gcs(concat!(stringify!($name), "-gcs")) {
+                    bodies::$name(&b);
+                }
+            }
+        }
+    };
+}
+
+backend_tests!(create_and_scan);
+backend_tests!(survives_reopen);
+backend_tests!(append_registers_new_file);
+backend_tests!(compaction_replaces_files);
+backend_tests!(source_reads_object_back);
+backend_tests!(sink_writes_object_back);
+backend_tests!(list_is_one_level);
+
+/// CAS-conflict tests, for backends that enforce the precondition. The
+/// `fake-gcs-server` emulator ignores `ifGenerationMatch=0`, so GCS is excluded
+/// (real GCS enforces it — the gap is the emulator's, not the datastore's).
+macro_rules! local_s3_tests {
     ($name:ident) => {
         mod $name {
             use super::*;
@@ -263,11 +313,4 @@ macro_rules! backend_tests {
     };
 }
 
-backend_tests!(create_and_scan);
-backend_tests!(survives_reopen);
-backend_tests!(append_registers_new_file);
-backend_tests!(compaction_replaces_files);
-backend_tests!(source_reads_object_back);
-backend_tests!(list_is_one_level);
-
-backend_tests!(put_if_absent_is_a_cas);
+local_s3_tests!(put_if_absent_is_a_cas);
