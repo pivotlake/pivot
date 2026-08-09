@@ -41,20 +41,26 @@ impl TableFile {
         }
         Self { entry, row_groups }
     }
+
+    /// The file's store identity (path and size), for a caller that names the
+    /// file outside the catalog module (reporting a merge's outputs, deleting
+    /// one whose commit failed).
+    pub(crate) fn file_ref(&self) -> &FileRef {
+        &self.entry.file
+    }
 }
 
 /// The catalog's master record of one table: its declared schema, partitioning,
-/// version, and its active [`TableFile`]s — each a file's Delta log entry paired
-/// with its materialized row groups.
+/// version, and active [`TableFile`]s, each pairing a Delta log entry with its
+/// materialized row groups.
 ///
-/// It is a plain **value** — `Clone`, no interior locks. A writer (INSERT,
-/// compaction) clones one out of the catalog, mutates its own copy, and lets the
-/// Delta log be the source of truth: every mutation (an append of freshly-uploaded
-/// files, or a compaction swap) commits a new version by compare-and-swap,
-/// retrying past a concurrent writer. Copies drift freely;
-/// [`refresh`](Self::refresh) reconciles any copy to the latest version (re-reading
-/// only the footers it doesn't already hold). `store` and `location` are kept so a
-/// copy can persist and reload itself.
+/// This is a cloneable snapshot value. Copies handed out are read views and may
+/// drift as commits land; [`refresh`](Self::refresh) reconciles one to the latest
+/// version. Writers instead go through
+/// [`DeltaDatastore::commit_to_table`](crate::DeltaDatastore::commit_to_table),
+/// following the table's
+/// [commit-lock protocol](field@Self::commit_lock). `store` and `location`
+/// let any copy persist and reload itself.
 #[derive(Clone)]
 pub struct CatalogTable {
     /// The table's durable identity, from the Delta `metaData.id` (minted once at
@@ -84,6 +90,11 @@ pub struct CatalogTable {
     /// The Kernel engine this table's log is read and written through, shared
     /// with every other table of the datastore that opened it.
     engine: crate::delta::DeltaEngine,
+    /// This exists only for throughput: Delta log compare-and-swap already ensures
+    /// correctness, but concurrent in-process writers can all start at `V` and race
+    /// for `V + 1`, forcing every loser to replay the log and fetch the winner's
+    /// footers before retrying.
+    commit_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl CatalogTable {
@@ -114,6 +125,7 @@ impl CatalogTable {
             store,
             dispatcher,
             engine,
+            commit_lock: Arc::default(),
         }
     }
 
@@ -176,7 +188,14 @@ impl CatalogTable {
             store,
             dispatcher,
             engine,
+            commit_lock: Arc::default(),
         })
+    }
+
+    /// An owned handle to this table's
+    /// [commit lock](field@Self::commit_lock).
+    pub(super) fn commit_lock(&self) -> Arc<std::sync::Mutex<()>> {
+        self.commit_lock.clone()
     }
 
     /// Advance this copy to the latest committed version, reconciling its files
@@ -205,15 +224,15 @@ impl CatalogTable {
         Ok(true)
     }
 
-    /// The commit loop every mutation runs: check each `removed` path is still
-    /// present (else [`Error::CommitConflict`] -- a concurrent writer swapped it
-    /// out), then commit the removes plus `added`'s log entries through Delta
-    /// Kernel on top of this copy's own snapshot. A win therefore lands exactly
-    /// one version above the state `self.files` describes, so `added` (each a log
-    /// entry *and* its footers) folds straight onto them -- no footer re-read, and
-    /// no other writer's files to miss. A writer that got there first conflicts
-    /// instead, and this copy reloads onto the newer version and retries; so does
-    /// a removal another writer already swapped out.
+    /// Commit file changes against this copy's snapshot. Each attempt first
+    /// verifies that every `removed` path is still active, returning
+    /// [`Error::CommitConflict`] if another commit removed one. After a successful
+    /// log write, the already-loaded `added` files fold directly into this copy.
+    /// A version conflict refreshes the copy and retries.
+    ///
+    /// In-process callers follow the table's
+    /// [commit-lock protocol](field@Self::commit_lock), so this retry path
+    /// normally handles contention from another process.
     ///
     /// Runs off the dispatch workers: the retry's `refresh` drives a footer-fetch
     /// dataflow, and every commit path commits from a blocking thread, never a
@@ -251,12 +270,6 @@ impl CatalogTable {
             }
             self.refresh()?;
         }
-    }
-
-    /// Commit freshly-uploaded files whose footers are already built — the INSERT
-    /// append. A plain add (`data_change = true`), no removes.
-    pub(crate) fn commit_uploaded_files(&mut self, uploaded: Vec<TableFile>) -> crate::Result<()> {
-        self.commit_files(&[], uploaded, true)
     }
 
     /// Commit bare log `entries` whose footers are not yet in hand: like
@@ -612,22 +625,22 @@ impl CatalogTable {
         self.store.clone()
     }
 
-    /// Merge `inputs` into fresh target-sized files and atomically swap them in
-    /// for the inputs, one Delta version labelled as a rearrangement
-    /// (`data_change = false`, so incremental log readers skip it). The merged
-    /// files are written over the shared io_uring ring by the same upload
-    /// operators an INSERT uses, and their row groups come straight from the
-    /// writer's own footer metadata — no footer is re-read.
+    /// Re-encode `inputs`' rows into fresh target-sized files and return them,
+    /// uploaded but not yet part of the table: the read half of a compaction,
+    /// which [`compact_table_files`](crate::compact_table_files) then swaps in
+    /// for the inputs. The merged files are written over the
+    /// shared io_uring ring by the same upload operators an INSERT uses, and
+    /// their row groups come straight from the writer's own footer metadata, so
+    /// no footer is re-read.
     ///
-    /// Returns the merged files. If the commit fails for any reason, including
-    /// another writer already having swapped the inputs out, the uncommitted
-    /// merge outputs are deleted before the error is returned.
+    /// Nothing here touches the log, so it runs off any read copy that holds the
+    /// inputs, and a merge of a large batch never stalls another writer's commit.
     /// `inputs` must share one partition tuple; the caller batches them so.
-    pub fn compact_files(
-        &mut self,
+    pub(crate) fn merge_files(
+        &self,
         inputs: &[FileRef],
         target_rows_per_group: usize,
-    ) -> crate::Result<Vec<FileRef>> {
+    ) -> crate::Result<Vec<TableFile>> {
         // Scan only the inputs and re-encode their rows. They share one partition
         // tuple, so re-applying the table's partition/sort spec reproduces that
         // tuple and recomputes the merged files' sort bounds.
@@ -680,23 +693,7 @@ impl CatalogTable {
                 Steal::Empty => break,
             }
         }
-        let files: Vec<FileRef> = added.iter().map(|f| f.entry.file.clone()).collect();
-        let removed: Vec<ObjectPath> = inputs.iter().map(|file| file.path.clone()).collect();
-        // A compaction swap rearranges bytes without changing rows.
-        if let Err(error) = self.commit_files(&removed, added, false) {
-            for file in &files {
-                if let Err(cleanup_error) = self.delete_data_file(&file.path) {
-                    tracing::warn!(
-                        commit_error = %error,
-                        cleanup_error = %cleanup_error,
-                        file = %file.path,
-                        "compaction: deleting output after commit failure failed (orphan left)"
-                    );
-                }
-            }
-            return Err(error);
-        }
-        Ok(files)
+        Ok(added)
     }
 }
 
