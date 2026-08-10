@@ -13,22 +13,37 @@
 //!   `eprintln!`s and returns, so tests stay green offline.
 //!
 //! The two containers (and the process-global environment they configure —
-//! `AWS_*` for S3, `STORAGE_EMULATOR_HOST` for GCS) are brought up **once per
+//! `AWS_*` for S3, `STORAGE_EMULATOR_HOST` for GCS) are resolved **once per
 //! test binary** inside a single [`OnceLock`] init: all `set_var`s happen on one
 //! thread before any store is opened, and the `OnceLock` publishes them with a
 //! happens-before to every later reader. Tests isolate themselves under a unique
 //! key prefix within the shared bucket rather than per-test containers.
+//!
+//! The containers themselves are **reused across test binaries and runs**: each
+//! has a fixed name and is started with [`ReuseDirective::Always`], so a binary
+//! attaches to the already-running instance when one exists and starts it
+//! otherwise. Reused containers are deliberately never removed on drop (the
+//! crate's `Drop` declines to reap them), so one MinIO and one fake-gcs-server
+//! serve every test run on the machine instead of a fresh, leaked pair per
+//! binary (Rust never drops statics, so a non-reused container parked in a
+//! `OnceLock` would outlive the process). Because bucket state now survives
+//! across runs, every test prefix is additionally scoped under a per-process
+//! [`run_namespace`], keeping reruns isolated from leftover data.
 
 use std::sync::OnceLock;
 
 use crate::store::{DataFileLocation, ObjectPath, ObjectStore, open_store};
 use testcontainers::core::ContainerPort;
 use testcontainers::runners::SyncRunner;
-use testcontainers::{Container, GenericImage, ImageExt};
+use testcontainers::{Container, GenericImage, ImageExt, ReuseDirective};
 use testcontainers_modules::minio::MinIO;
 
 /// The one bucket both emulated backends share; tests namespace under it.
 const BUCKET: &str = "pivot-it";
+/// Fixed container names, so every test binary attaches to the same reused
+/// instance instead of starting its own.
+const S3_CONTAINER_NAME: &str = "pivot-test-minio";
+const GCS_CONTAINER_NAME: &str = "pivot-test-fake-gcs";
 /// MinIO's default root credentials (the `minio/minio` image, unset env).
 const S3_ACCESS_KEY: &str = "minioadmin";
 const S3_SECRET_KEY: &str = "minioadmin";
@@ -36,7 +51,7 @@ const S3_REGION: &str = "us-east-1";
 
 /// A backend addressable as a catalog root: the root URI and a store opened on
 /// it. Drop order is irrelevant — the store holds no container; the containers
-/// live for the whole binary in [`containers`].
+/// are reused instances that outlive the binary (see [`containers`]).
 pub struct Backend {
     pub root: String,
     pub store: Box<dyn ObjectStore>,
@@ -51,23 +66,39 @@ pub fn local() -> (tempfile::TempDir, Backend) {
     (dir, Backend { root, store })
 }
 
-/// An S3 backend rooted at `s3://<bucket>/<prefix>`, or `None` when MinIO could
-/// not be started (no Docker). `prefix` should be unique per test.
+/// An S3 backend rooted under the shared bucket, or `None` when MinIO could
+/// not be started (no Docker). `prefix` should be unique per test; the harness
+/// scopes it under [`run_namespace`] so reruns never see each other's data.
 pub fn s3(prefix: &str) -> Option<Backend> {
     containers().s3.as_ref()?;
-    let root = format!("s3://{BUCKET}/{prefix}");
+    let root = format!("s3://{BUCKET}/{}/{prefix}", run_namespace());
     let store = open_store(&root).expect("open s3 store");
     Some(Backend { root, store })
 }
 
-/// A GCS backend rooted at `gs://<bucket>/<prefix>`, or `None` when
-/// `fake-gcs-server` could not be started (no Docker). `prefix` should be unique
-/// per test.
+/// A GCS backend rooted under the shared bucket, or `None` when
+/// `fake-gcs-server` could not be started (no Docker). `prefix` should be
+/// unique per test; the harness scopes it under [`run_namespace`] so reruns
+/// never see each other's data.
 pub fn gcs(prefix: &str) -> Option<Backend> {
     containers().gcs.as_ref()?;
-    let root = format!("gs://{BUCKET}/{prefix}");
+    let root = format!("gs://{BUCKET}/{}/{prefix}", run_namespace());
     let store = open_store(&root).expect("open gcs store");
     Some(Backend { root, store })
+}
+
+/// A per-process namespace under the shared bucket. The reused containers (and
+/// so the bucket's contents) outlive any single test run, so a bare static
+/// prefix would collide with state left by an earlier run of the same test.
+fn run_namespace() -> &'static str {
+    static NAMESPACE: OnceLock<String> = OnceLock::new();
+    NAMESPACE.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        format!("run-{}-{nanos}", std::process::id())
+    })
 }
 
 /// Fetch an object through [`ObjectStore::source`] exactly as the engine would:
@@ -110,7 +141,8 @@ pub fn write_via_sink(store: &dyn ObjectStore, key: &ObjectPath, bytes: &[u8]) {
 }
 
 // ---------------------------------------------------------------------------
-// Container lifecycle: one MinIO + one fake-gcs-server per test binary.
+// Container lifecycle: one reused MinIO + one reused fake-gcs-server, shared
+// by every test binary on the machine.
 // ---------------------------------------------------------------------------
 
 struct Containers {
@@ -133,10 +165,15 @@ fn set_env(key: &str, value: &str) {
     unsafe { std::env::set_var(key, value) };
 }
 
-/// Bring up MinIO, point `AWS_*` at it, and create the shared bucket. Returns
-/// `None` (with a note) on any failure so the tests skip rather than fail.
+/// Bring up (or attach to) the reused MinIO, point `AWS_*` at it, and create
+/// the shared bucket. Returns `None` (with a note) on any failure so the tests
+/// skip rather than fail.
 fn start_s3() -> Option<Container<MinIO>> {
-    let container = match MinIO::default().start() {
+    let container = match MinIO::default()
+        .with_container_name(S3_CONTAINER_NAME)
+        .with_reuse(ReuseDirective::Always)
+        .start()
+    {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[test_support] skipping S3 backend — MinIO unavailable: {e}");
@@ -169,6 +206,9 @@ fn start_s3() -> Option<Container<MinIO>> {
 /// The host port is chosen up front rather than left to Docker, because the
 /// emulator serves the XML API only for requests whose `Host` matches its
 /// `-public-host`, and that flag has to be passed before the container starts.
+/// When an already-running instance is reused, the pre-chosen port is simply
+/// ignored: the endpoint is read back from the container's actual host port,
+/// which its `-public-host` was fixed to when it first started.
 fn start_gcs() -> Option<Container<GenericImage>> {
     let port = free_port()?;
     // No log-message wait: `fake-gcs-server`'s banner has shifted across
@@ -186,7 +226,9 @@ fn start_gcs() -> Option<Container<GenericImage>> {
             "4443",
             "-public-host",
             &format!("localhost:{port}"),
-        ]);
+        ])
+        .with_container_name(GCS_CONTAINER_NAME)
+        .with_reuse(ReuseDirective::Always);
     let container = match image.start() {
         Ok(c) => c,
         Err(e) => {
@@ -194,7 +236,10 @@ fn start_gcs() -> Option<Container<GenericImage>> {
             return None;
         }
     };
-    let endpoint = format!("http://localhost:{port}");
+    // Read the port back rather than trusting `port`: an attached, reused
+    // container keeps the mapping (and `-public-host`) it was started with.
+    let actual_port = container.get_host_port_ipv4(4443).ok()?;
+    let endpoint = format!("http://localhost:{actual_port}");
     set_env("STORAGE_EMULATOR_HOST", &endpoint);
     if let Err(e) = gcs_create_bucket(&endpoint) {
         eprintln!("[test_support] skipping GCS backend — bucket create failed: {e}");

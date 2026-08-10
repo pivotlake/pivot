@@ -70,7 +70,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # harness exposed as `catalog::test_support`. testcontainers brings up MinIO and
 # fake-gcs-server; tempfile backs the local() backend. (The harness's other
 # needs, ureq, aws-sigv4, aws-credential-types, url, are already deps above.)
-testcontainers = { version = "0.24", features = ["blocking"], optional = true }
+testcontainers = { version = "0.24", features = ["blocking", "reusable-containers"], optional = true }
 testcontainers-modules = { version = "0.12", features = ["minio"], optional = true }
 tempfile = { workspace = true, optional = true }
 
