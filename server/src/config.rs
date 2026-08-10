@@ -11,12 +11,12 @@
 //!   bind: 0.0.0.0:5432
 //!   memory: 32g
 //!   workers: 16
+//!   refresh_interval: 30s
 //!   disk_cache:
 //!     dir: /var/cache/pivot
 //!     size: 64g
 //!
 //! metastore:
-//!   refresh_interval: 30s
 //!   datastores:
 //!     hot:
 //!       kind: delta
@@ -27,11 +27,16 @@
 //! Every field of `server` has a default, so the section may be omitted whole.
 //! Unknown keys are rejected rather than ignored: a misspelled setting would
 //! otherwise leave the server running on a default nobody asked for.
+//!
+//! The `metastore` section is not the only place datastores and users may be
+//! written: the binary's `--metastore-file` names a second file of the same
+//! shape, which the metastore merges into this section.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-use metastore_yaml::{ByteSize, MetastoreConfig};
+use datastore_delta::DEFAULT_REFRESH_INTERVAL;
+use metastore_disk::{ByteSize, Interval, MetastoreConfig};
 use serde::Deserialize;
 
 /// The address the PostgreSQL endpoint binds to when `bind` is not set. Loopback
@@ -102,6 +107,10 @@ pub struct ServerConfig {
     pub memory: Option<ByteSize>,
     /// Number of dispatch worker threads. Defaults to the machine's core count.
     pub workers: Option<usize>,
+    /// How often every datastore brings its in-memory table set up to date with
+    /// the store. This bounds how stale a query's view of externally committed
+    /// data can be; this process's own commits are visible immediately.
+    pub refresh_interval: Interval,
     /// On-disk cache for remote (object store) reads. Omit to disable it; local
     /// files are never cached, they are read from the filesystem directly.
     pub disk_cache: Option<DiskCacheConfig>,
@@ -114,6 +123,7 @@ impl Default for ServerConfig {
             http_bind: None,
             memory: None,
             workers: None,
+            refresh_interval: Interval::from_duration(DEFAULT_REFRESH_INTERVAL),
             disk_cache: None,
         }
     }
@@ -165,8 +175,10 @@ pub enum Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
     use metastore::Metastore;
-    use metastore_yaml::YamlMetastore;
+    use metastore_disk::DiskMetastore;
 
     const METASTORE_SECTION: &str = "metastore:\n  datastores:\n    hot:\n      kind: delta\n      \
                                      location: /tmp/hot\n      default: true\n";
@@ -179,8 +191,16 @@ mod tests {
 
     #[test]
     fn one_file_configures_both_the_instance_and_its_data() {
-        let config = from_yaml_with("  bind: 0.0.0.0:5433\n  memory: 32g\n  workers: 8\n").unwrap();
-        let metastore = YamlMetastore::from_config(config.metastore).unwrap();
+        let config = from_yaml_with(
+            "  bind: 0.0.0.0:5433\n  memory: 32g\n  workers: 8\n  refresh_interval: 5s\n",
+        )
+        .unwrap();
+        let metastore = DiskMetastore::open(
+            config.metastore,
+            None,
+            config.server.refresh_interval.as_duration(),
+        )
+        .unwrap();
 
         assert_eq!(config.server.bind, "0.0.0.0:5433".parse().unwrap());
         assert_eq!(
@@ -188,6 +208,10 @@ mod tests {
             32 * 1024 * 1024 * 1024
         );
         assert_eq!(config.server.workers, Some(8));
+        assert_eq!(
+            config.server.refresh_interval.as_duration(),
+            Duration::from_secs(5)
+        );
         assert_eq!(metastore.default_datastore_name(), "hot");
     }
 
@@ -197,6 +221,10 @@ mod tests {
 
         assert_eq!(config.server, ServerConfig::default());
         assert_eq!(config.server.bind, "127.0.0.1:5432".parse().unwrap());
+        assert_eq!(
+            config.server.refresh_interval.as_duration(),
+            DEFAULT_REFRESH_INTERVAL
+        );
     }
 
     #[test]

@@ -1,10 +1,22 @@
-//! A YAML-backed [`metastore::Metastore`] provider.
+//! A disk-backed [`metastore::Metastore`] provider.
 //!
 //! This crate owns the `metastore` section of PivotDB's config file: the
 //! datastores to serve and the users that may connect. The server reads the
 //! file, keeps its own `server` section, and hands this section over as a
 //! [`MetastoreConfig`]. The scalars both sections are written with,
 //! [`ByteSize`] and [`Interval`], are defined here too.
+//!
+//! A section of the same shape may also live in a file of its own, which the
+//! server names with `--metastore-file` and this crate reads and merges into
+//! the config file's section ([`DiskMetastore::open`]). The two are peers: a
+//! datastore or a user may be written in either, and the rules below apply to
+//! the merged whole. A name written in both files stops startup rather than one
+//! silently winning, since the two entries are free to disagree about location
+//! or credentials.
+//!
+//! Every datastore and user keeps the [`Origin`] it was merged from, because the
+//! two files are not interchangeable once the server is running: the config file
+//! is the operator's, and the metastore file is the server's own to rewrite.
 //!
 //! `kind` is the datastore format (only `delta` today). The storage backend is
 //! chosen from `location`: a plain path (or `file://`) opens a local store, an
@@ -18,7 +30,6 @@
 //!
 //! ```yaml
 //! metastore:
-//!   refresh_interval: 30s            # how often the table set is refreshed
 //!   datastores:
 //!     hot:
 //!       kind: delta
@@ -62,9 +73,10 @@
 //!         verifier: "pivot-scram-sha-256$4096:cGVwcGVy...$Zm9vYmFy..."
 //! ```
 //!
-//! When `users` is omitted or empty, the provider supplies one built-in trusted
-//! user named `pivot`. Defining any users replaces that default with the
-//! configured allowlist.
+//! A user named `pivot` is always served, so a server is reachable whatever else
+//! its users are. It is trusted unless a file defines `pivot` itself, which
+//! takes over its authentication method entirely: give it a
+//! `scram-sha-256` verifier to require a password of it.
 //!
 //! An S3 datastore's credentials are inline, so the file holds secrets and should
 //! be readable only by the PivotDB process (a GCS datastore's key stays in the
@@ -72,6 +84,7 @@
 //! password cannot be recovered from it), but it is still worth the same care.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -79,7 +92,7 @@ use catalog::Datastore;
 use datastore_delta::store::{GcsStore, LocalStore, ObjectStore, S3Credentials, S3Store};
 use datastore_delta::{
     CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL, DEFAULT_MIN_FILES_TO_MERGE,
-    DEFAULT_REFRESH_INTERVAL, DEFAULT_VACUUM_POLL, DeltaDatastore, MaintenanceConfig, VacuumConfig,
+    DEFAULT_VACUUM_POLL, DeltaDatastore, MaintenanceConfig, VacuumConfig,
 };
 use dispatch::DataFlowDispatcher;
 use metastore::{DEFAULT_USER_NAME, Metastore, UserAuth, parse_scram_verifier};
@@ -89,47 +102,71 @@ mod units;
 
 pub use units::{ByteSize, Interval};
 
-/// A metastore backed by the config file's `metastore` section.
+/// A metastore backed by the config file's `metastore` section, and by the
+/// standalone file merged into it.
 ///
-/// The section is structurally validated by [`from_config`](Self::from_config).
-/// Object stores and their Delta datastores are opened when
+/// The configuration is structurally validated by [`open`](Self::open). Object
+/// stores and their Delta datastores are opened when
 /// [`Metastore::open_datastores`] is called.
-pub struct YamlMetastore {
-    datastore_configs: HashMap<String, DatastoreConfig>,
+pub struct DiskMetastore {
+    datastore_configs: HashMap<String, ConfigDefinition<DatastoreConfig>>,
     default_name: String,
-    /// Every user's authentication method, keyed by user name. A file with no
-    /// users receives the built-in trusted `pivot` user. Verifiers are decoded
-    /// once, by [`from_config`](Self::from_config), so a malformed one fails startup
+    /// Every user's authentication method, keyed by user name. The built-in
+    /// `pivot` user is always among them. Verifiers are
+    /// decoded once, by [`open`](Self::open), so a malformed one fails startup
     /// rather than a login.
-    user_auth: HashMap<String, UserAuth>,
+    user_auth: HashMap<String, ConfigDefinition<UserAuth>>,
     /// How often every datastore this metastore opens refreshes its table set
-    /// from the store. Global (all datastores share the cadence); compaction, in
-    /// contrast, is configured per datastore.
+    /// from the store. Global (all datastores share the cadence, which the
+    /// server takes from its own section); compaction, in contrast, is
+    /// configured per datastore.
     refresh_interval: Duration,
 }
 
-impl YamlMetastore {
-    /// Parse a `metastore` section from YAML text, using `path` in errors. The
-    /// server reads the whole config file in one pass instead; this is for
-    /// callers that hold only this section.
-    pub fn from_yaml(text: &str, path: &str) -> Result<Self> {
-        let config: MetastoreConfig =
-            serde_yaml_ng::from_str(text).map_err(|source| Error::Parse {
-                path: path.to_string(),
-                source,
-            })?;
-        Self::from_config(config)
+impl DiskMetastore {
+    /// Build the metastore from the config file's `metastore` section, merged
+    /// with the datastores and users in `metastore_file` when the server was
+    /// given one.
+    ///
+    /// A `metastore_file` that cannot be read stops startup: a metastore file
+    /// that was asked for and is not there means datastores or users are
+    /// missing, which would otherwise show up as tables that do not exist and
+    /// logins that are refused.
+    pub fn open(
+        config: MetastoreConfig,
+        metastore_file: Option<&Path>,
+        refresh_interval: Duration,
+    ) -> Result<Self> {
+        let mut datastores = into_config_definitions(config.datastores, Origin::ConfigFile);
+        let mut users = into_config_definitions(config.users, Origin::ConfigFile);
+        if let Some(path) = metastore_file {
+            let disk = parse_config(&std::fs::read_to_string(path)?)?;
+            merge_definitions(
+                &mut datastores,
+                into_config_definitions(disk.datastores, Origin::MetastoreFile),
+            )
+            .map_err(|names| Error::ConflictingDatastores { names })?;
+            merge_definitions(
+                &mut users,
+                into_config_definitions(disk.users, Origin::MetastoreFile),
+            )
+            .map_err(|names| Error::ConflictingUsers { names })?;
+        }
+        Self::from_definitions(datastores, users, refresh_interval)
     }
 
-    /// Validate an already-parsed `metastore` section: exactly one default
-    /// datastore, and users whose verifiers decode.
-    pub fn from_config(config: MetastoreConfig) -> Result<Self> {
+    /// Validate the merged definitions: exactly one default datastore, and users
+    /// whose verifiers decode.
+    fn from_definitions(
+        datastores: HashMap<String, ConfigDefinition<DatastoreConfig>>,
+        users: HashMap<String, ConfigDefinition<UserConfig>>,
+        refresh_interval: Duration,
+    ) -> Result<Self> {
         // The default datastore is the one flagged `default = true`, not one with
         // a reserved name. Exactly one is required: it is the current database.
-        let mut defaults: Vec<String> = config
-            .datastores
+        let mut defaults: Vec<String> = datastores
             .iter()
-            .filter(|(_, config)| config.is_default)
+            .filter(|(_, definition)| definition.value.is_default)
             .map(|(name, _)| name.clone())
             .collect();
         if defaults.len() > 1 {
@@ -137,25 +174,37 @@ impl YamlMetastore {
             return Err(Error::MultipleDefaults(defaults));
         }
         let default_name = defaults.pop().ok_or(Error::MissingDefault)?;
-        let mut user_auth = config
-            .users
+        let mut user_auth = users
             .into_iter()
-            .map(|(name, config)| {
-                let auth = config.into_auth().map_err(|message| Error::User {
-                    name: name.clone(),
-                    message,
-                })?;
-                Ok((name, auth))
+            .map(|(name, definition)| {
+                let auth = definition
+                    .value
+                    .into_auth()
+                    .map_err(|message| Error::User {
+                        name: name.clone(),
+                        message,
+                    })?;
+                Ok((
+                    name,
+                    ConfigDefinition {
+                        origin: definition.origin,
+                        value: auth,
+                    },
+                ))
             })
             .collect::<Result<HashMap<_, _>>>()?;
-        if user_auth.is_empty() {
-            user_auth.insert(DEFAULT_USER_NAME.to_string(), UserAuth::Trust);
-        }
+        // The built-in user is always present.
+        user_auth
+            .entry(DEFAULT_USER_NAME.to_string())
+            .or_insert_with(|| ConfigDefinition {
+                origin: Origin::BuiltIn,
+                value: UserAuth::Trust,
+            });
         Ok(Self {
-            datastore_configs: config.datastores,
+            datastore_configs: datastores,
             default_name,
             user_auth,
-            refresh_interval: config.refresh_interval.as_duration(),
+            refresh_interval,
         })
     }
 
@@ -165,7 +214,8 @@ impl YamlMetastore {
     ) -> Result<HashMap<String, Arc<dyn Datastore>>> {
         self.datastore_configs
             .iter()
-            .map(|(name, config)| {
+            .map(|(name, definition)| {
+                let config = &definition.value;
                 let store = config.open_store(name)?;
                 let maintenance = MaintenanceConfig {
                     refresh_interval: self.refresh_interval,
@@ -183,7 +233,57 @@ impl YamlMetastore {
     }
 }
 
-impl Metastore for YamlMetastore {
+/// Where a config definition came from.
+///
+/// The config file is the operator's, so the server never rewrites it and
+/// runtime changes to what it defines are refused; the metastore file is the
+/// server's own to rewrite. Recording the fact rather than the consequence
+/// leaves room for the several rules that read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// The config file's `metastore` section.
+    ConfigFile,
+    /// The file named by `--metastore-file`.
+    MetastoreFile,
+    /// Neither file: the built-in trusted [`DEFAULT_USER_NAME`] user, served
+    /// whenever no file defined one by that name.
+    BuiltIn,
+}
+
+/// One entry as a file defines it, and which file that was.
+struct ConfigDefinition<T> {
+    origin: Origin,
+    value: T,
+}
+
+/// Note every entry of one file's map as defined by that file.
+fn into_config_definitions<T>(
+    entries: HashMap<String, T>,
+    origin: Origin,
+) -> HashMap<String, ConfigDefinition<T>> {
+    entries
+        .into_iter()
+        .map(|(name, value)| (name, ConfigDefinition { origin, value }))
+        .collect()
+}
+
+/// Fold `incoming` into `existing`. A name defined on both sides comes back
+/// instead of being merged: the two entries may disagree about where a datastore
+/// lives or how a user authenticates, and whichever one lost would do so
+/// invisibly.
+fn merge_definitions<T>(
+    existing: &mut HashMap<String, ConfigDefinition<T>>,
+    incoming: HashMap<String, ConfigDefinition<T>>,
+) -> std::result::Result<(), Vec<String>> {
+    let conflicting = find_conflicting_names(existing, &incoming);
+    if !conflicting.is_empty() {
+        return Err(conflicting);
+    }
+    existing.extend(incoming);
+    Ok(())
+}
+
+impl Metastore for DiskMetastore {
     fn open_datastores(
         &self,
         dispatcher: &DataFlowDispatcher,
@@ -197,7 +297,9 @@ impl Metastore for YamlMetastore {
     }
 
     fn user_auth(&self, username: &str) -> Option<UserAuth> {
-        self.user_auth.get(username).cloned()
+        self.user_auth
+            .get(username)
+            .map(|definition| definition.value.clone())
     }
 }
 
@@ -205,11 +307,26 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("parsing the `metastore` section of `{path}`: {source}")]
+    #[error("reading the metastore file: {source}")]
+    Read {
+        #[from]
+        source: std::io::Error,
+    },
+    #[error("parsing the metastore configuration: {source}")]
     Parse {
-        path: String,
+        #[from]
         source: serde_yaml_ng::Error,
     },
+    #[error(
+        "datastores defined both in the config file's `metastore` section and in the metastore file: {}",
+        .names.join(", ")
+    )]
+    ConflictingDatastores { names: Vec<String> },
+    #[error(
+        "users defined both in the config file's `metastore` section and in the metastore file: {}",
+        .names.join(", ")
+    )]
+    ConflictingUsers { names: Vec<String> },
     #[error("datastore `{name}`: {message}")]
     Datastore { name: String, message: String },
     #[error("user `{name}`: {message}")]
@@ -228,7 +345,8 @@ pub enum Error {
     Delta(#[from] datastore_delta::Error),
 }
 
-/// The config file's `metastore` section, as written.
+/// The datastores and users of a metastore, as written: the config file's
+/// `metastore` section, and the standalone metastore file, share this shape.
 ///
 /// Unknown keys are rejected: a misspelled `users` section would otherwise be
 /// dropped in silence and unexpectedly select the built-in trusted `pivot` user.
@@ -239,18 +357,26 @@ pub struct MetastoreConfig {
     datastores: HashMap<String, DatastoreConfig>,
     #[serde(default)]
     users: HashMap<String, UserConfig>,
-    /// How often the background catalog refresh brings the in-memory table set
-    /// up to date with the store: new Delta versions, new files' footers, and
-    /// tables committed by other processes. Queries bind against a snapshot of
-    /// that in-memory set, so this bounds how stale a query's view of
-    /// *externally* committed data can be (this process's own INSERT and
-    /// compaction publish their commits immediately).
-    #[serde(default = "default_refresh_interval")]
-    refresh_interval: Interval,
 }
 
-fn default_refresh_interval() -> Interval {
-    Interval::from_duration(DEFAULT_REFRESH_INTERVAL)
+/// The names `incoming` would overwrite in `existing`, sorted so the error lists
+/// them in the same order every run.
+fn find_conflicting_names<T, U>(
+    existing: &HashMap<String, T>,
+    incoming: &HashMap<String, U>,
+) -> Vec<String> {
+    let mut names: Vec<String> = incoming
+        .keys()
+        .filter(|name| existing.contains_key(*name))
+        .cloned()
+        .collect();
+    names.sort();
+    names
+}
+
+/// Parse one metastore configuration from YAML text, using `path` in errors.
+fn parse_config(text: &str) -> Result<MetastoreConfig> {
+    Ok(serde_yaml_ng::from_str(text)?)
 }
 
 /// One user and the authentication method nested inside it. Keeping the user as
@@ -363,7 +489,7 @@ impl DatastoreConfig {
 
 /// The datastore format. Only [`Delta`](Self::Delta) is supported today; adding
 /// another (Iceberg, ...) is a new variant plus its arm in
-/// [`build_datastores`](YamlMetastore::build_datastores).
+/// [`build_datastores`](DiskMetastore::build_datastores).
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum DatastoreKind {
@@ -428,8 +554,24 @@ fn require(name: &str, value: &Option<String>, field: &str) -> Result<String> {
 mod tests {
     use super::*;
     use catalog::DEFAULT_DATASTORE_NAME;
+    use datastore_delta::DEFAULT_REFRESH_INTERVAL;
     use metastore::ScramVerifier;
+    use std::io::Write;
     use std::time::Duration;
+
+    /// Open a `metastore` section on its own, at whatever refresh cadence the
+    /// tests that do not exercise it would rather not spell out.
+    fn from_yaml(text: &str) -> Result<DiskMetastore> {
+        DiskMetastore::open(parse_config(text)?, None, DEFAULT_REFRESH_INTERVAL)
+    }
+
+    /// Write `text` to a metastore file of its own, kept alive by the returned
+    /// handle.
+    fn metastore_file(text: &str) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+        file
+    }
 
     #[test]
     fn compaction_is_per_datastore() {
@@ -446,10 +588,10 @@ datastores:
     compact: false
 "#;
 
-        let store = YamlMetastore::from_yaml(yaml, "test").unwrap();
+        let store = from_yaml(yaml).unwrap();
 
-        let hot = store.datastore_configs["hot"].compaction();
-        let warm = store.datastore_configs["warm"].compaction();
+        let hot = store.datastore_configs["hot"].value.compaction();
+        let warm = store.datastore_configs["warm"].value.compaction();
         // Compaction is on by default (hot omits `compact`), and off only where a
         // datastore turns it off explicitly (warm).
         assert_eq!(hot.unwrap().target_bytes, 128 * 1024 * 1024);
@@ -457,7 +599,27 @@ datastores:
     }
 
     #[test]
-    fn every_datastore_shares_the_configured_refresh_interval() {
+    fn every_datastore_shares_the_refresh_interval_the_server_configured() {
+        let yaml = r#"
+datastores:
+  hot:
+    kind: delta
+    location: /tmp/hot
+    default: true
+"#;
+
+        let store = DiskMetastore::open(
+            parse_config(yaml).unwrap(),
+            None,
+            Duration::from_millis(500),
+        )
+        .unwrap();
+
+        assert_eq!(store.refresh_interval, Duration::from_millis(500));
+    }
+
+    #[test]
+    fn a_setting_of_the_server_section_is_not_accepted_here() {
         let yaml = r#"
 refresh_interval: 500ms
 datastores:
@@ -467,24 +629,9 @@ datastores:
     default: true
 "#;
 
-        let store = YamlMetastore::from_yaml(yaml, "test").unwrap();
+        let error = from_yaml(yaml).err().unwrap();
 
-        assert_eq!(store.refresh_interval, Duration::from_millis(500));
-    }
-
-    #[test]
-    fn a_section_without_a_refresh_interval_uses_the_default() {
-        let yaml = r#"
-datastores:
-  hot:
-    kind: delta
-    location: /tmp/hot
-    default: true
-"#;
-
-        let store = YamlMetastore::from_yaml(yaml, "test").unwrap();
-
-        assert_eq!(store.refresh_interval, DEFAULT_REFRESH_INTERVAL);
+        assert!(matches!(error, Error::Parse { .. }), "{error}");
     }
 
     #[test]
@@ -498,7 +645,7 @@ datastores:
     compact_byte: 128m
 "#;
 
-        let error = YamlMetastore::from_yaml(yaml, "test").err().unwrap();
+        let error = from_yaml(yaml).err().unwrap();
 
         assert!(matches!(error, Error::Parse { .. }), "{error}");
     }
@@ -512,7 +659,7 @@ datastores:
     location: /tmp/warm
 "#;
 
-        let error = YamlMetastore::from_yaml(yaml, "test")
+        let error = from_yaml(yaml)
             .err()
             .expect("a metastore without a default should be rejected");
 
@@ -532,7 +679,7 @@ datastores:
     location: /tmp/default
 "#;
 
-        let result = YamlMetastore::from_yaml(yaml, "test");
+        let result = from_yaml(yaml);
 
         assert!(matches!(result, Err(Error::Parse { .. })));
     }
@@ -551,7 +698,7 @@ datastores:
     default: true
 "#;
 
-        let result = YamlMetastore::from_yaml(yaml, "test");
+        let result = from_yaml(yaml);
 
         assert!(matches!(result, Err(Error::MultipleDefaults(names)) if names == ["hot", "warm"]));
     }
@@ -569,7 +716,7 @@ datastores:
     location: /tmp/warm
 "#;
 
-        let store = YamlMetastore::from_yaml(yaml, "test").unwrap();
+        let store = from_yaml(yaml).unwrap();
 
         assert_eq!(store.default_datastore_name(), "hot");
     }
@@ -587,8 +734,9 @@ datastores:
     location: s3://bucket/prefix
 "#;
 
-        let store = YamlMetastore::from_yaml(yaml, "test").unwrap();
+        let store = from_yaml(yaml).unwrap();
         let err = store.datastore_configs["warm"]
+            .value
             .open_store("warm")
             .unwrap_err();
 
@@ -614,27 +762,243 @@ datastores:
     location: gs://bucket/prefix
 "#;
 
-        let store = YamlMetastore::from_yaml(yaml, "test").unwrap();
+        let store = from_yaml(yaml).unwrap();
 
         assert!(
             store.datastore_configs[DEFAULT_DATASTORE_NAME]
+                .value
                 .open_store(DEFAULT_DATASTORE_NAME)
                 .is_ok()
         );
-        assert!(store.datastore_configs["warm"].open_store("warm").is_ok());
+        assert!(
+            store.datastore_configs["warm"]
+                .value
+                .open_store("warm")
+                .is_ok()
+        );
         // A GCS store resolves its credentials lazily (at the first request),
         // so opening one needs no ambient Google credentials.
-        let cold = store.datastore_configs["cold"].open_store("cold").unwrap();
+        let cold = store.datastore_configs["cold"]
+            .value
+            .open_store("cold")
+            .unwrap();
         assert_eq!(cold.location_uri(), "gs://bucket/prefix");
     }
 
+    /// A `metastore` section, and a metastore file, opened as one metastore.
+    fn open_merged(section: &str, disk: &str) -> Result<DiskMetastore> {
+        let file = metastore_file(disk);
+        DiskMetastore::open(
+            parse_config(section).unwrap(),
+            Some(file.path()),
+            DEFAULT_REFRESH_INTERVAL,
+        )
+    }
+
+    #[test]
+    fn datastores_and_users_of_both_files_are_served_together() {
+        let section = r#"
+datastores:
+  hot:
+    kind: delta
+    location: /tmp/hot
+    default: true
+users:
+  reader:
+    auth:
+      method: trust
+"#;
+        let disk = r#"
+datastores:
+  warm:
+    kind: delta
+    location: /tmp/warm
+users:
+  writer:
+    auth:
+      method: trust
+"#;
+
+        let store = open_merged(section, disk).unwrap();
+
+        assert_eq!(store.datastore_configs.len(), 2);
+        assert_eq!(store.datastore_configs["warm"].value.location, "/tmp/warm");
+        assert_eq!(store.default_datastore_name(), "hot");
+        assert!(matches!(store.user_auth("reader"), Some(UserAuth::Trust)));
+        assert!(matches!(store.user_auth("writer"), Some(UserAuth::Trust)));
+    }
+
+    #[test]
+    fn every_datastore_and_user_knows_which_file_defined_it() {
+        let section = r#"
+datastores:
+  hot:
+    kind: delta
+    location: /tmp/hot
+    default: true
+users:
+  reader:
+    auth:
+      method: trust
+"#;
+        let disk = r#"
+datastores:
+  warm:
+    kind: delta
+    location: /tmp/warm
+users:
+  writer:
+    auth:
+      method: trust
+"#;
+
+        let store = open_merged(section, disk).unwrap();
+
+        assert_eq!(store.datastore_configs["hot"].origin, Origin::ConfigFile);
+        assert_eq!(
+            store.datastore_configs["warm"].origin,
+            Origin::MetastoreFile
+        );
+        assert_eq!(store.user_auth["reader"].origin, Origin::ConfigFile);
+        assert_eq!(store.user_auth["writer"].origin, Origin::MetastoreFile);
+    }
+
+    #[test]
+    fn the_user_no_file_defined_is_marked_as_built_in() {
+        let store = from_yaml_with("").unwrap();
+
+        assert_eq!(store.user_auth[DEFAULT_USER_NAME].origin, Origin::BuiltIn);
+    }
+
+    #[test]
+    fn the_default_datastore_may_be_the_one_on_disk() {
+        let section = r#"
+datastores:
+  hot:
+    kind: delta
+    location: /tmp/hot
+"#;
+        let disk = r#"
+datastores:
+  warm:
+    kind: delta
+    location: /tmp/warm
+    default: true
+"#;
+
+        let store = open_merged(section, disk).unwrap();
+
+        assert_eq!(store.default_datastore_name(), "warm");
+    }
+
+    #[test]
+    fn a_default_in_each_file_is_rejected() {
+        let section = r#"
+datastores:
+  hot:
+    kind: delta
+    location: /tmp/hot
+    default: true
+"#;
+        let disk = r#"
+datastores:
+  warm:
+    kind: delta
+    location: /tmp/warm
+    default: true
+"#;
+
+        let error = open_merged(section, disk).err().unwrap();
+
+        assert!(
+            matches!(&error, Error::MultipleDefaults(names) if *names == ["hot", "warm"]),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_datastore_defined_in_both_files_is_rejected_rather_than_shadowed() {
+        let section = r#"
+datastores:
+  hot:
+    kind: delta
+    location: /tmp/hot
+    default: true
+  warm:
+    kind: delta
+    location: /tmp/warm
+"#;
+        let disk = r#"
+datastores:
+  warm:
+    kind: delta
+    location: /tmp/elsewhere
+"#;
+
+        let error = open_merged(section, disk).err().unwrap();
+
+        assert!(
+            matches!(&error, Error::ConflictingDatastores { names, .. } if *names == ["warm"]),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_user_defined_in_both_files_is_rejected_rather_than_shadowed() {
+        let section = r#"
+datastores:
+  hot:
+    kind: delta
+    location: /tmp/hot
+    default: true
+users:
+  analytics:
+    auth:
+      method: trust
+"#;
+        let disk = r#"
+users:
+  analytics:
+    auth:
+      method: trust
+"#;
+
+        let error = open_merged(section, disk).err().unwrap();
+
+        assert!(
+            matches!(&error, Error::ConflictingUsers { names, .. } if *names == ["analytics"]),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_metastore_file_that_is_not_there_stops_startup() {
+        let section = r#"
+datastores:
+  hot:
+    kind: delta
+    location: /tmp/hot
+    default: true
+"#;
+
+        let error = DiskMetastore::open(
+            parse_config(section).unwrap(),
+            Some(Path::new("/nonexistent/metastore.yaml")),
+            DEFAULT_REFRESH_INTERVAL,
+        )
+        .err()
+        .unwrap();
+
+        assert!(matches!(&error, Error::Read { .. }), "{error}");
+    }
+
     /// A metastore with a default datastore and whatever `users` adds.
-    fn from_yaml_with(users: &str) -> Result<YamlMetastore> {
+    fn from_yaml_with(users: &str) -> Result<DiskMetastore> {
         let yaml = format!(
             "datastores:\n  default:\n    kind: delta\n    location: /tmp/default\n    \
              default: true\n{users}"
         );
-        YamlMetastore::from_yaml(&yaml, "test")
+        from_yaml(&yaml)
     }
 
     fn verifier_for(password: &str) -> String {
@@ -661,6 +1025,49 @@ datastores:
             ));
             assert!(store.user_auth("analytics").is_none());
         }
+    }
+
+    #[test]
+    fn the_builtin_user_is_served_alongside_the_users_a_file_defines() {
+        let users = r#"
+users:
+  reader:
+    auth:
+      method: trust
+  writer:
+    auth:
+      method: trust
+"#;
+
+        let store = from_yaml_with(users).unwrap();
+
+        assert!(matches!(
+            store.user_auth(DEFAULT_USER_NAME),
+            Some(UserAuth::Trust)
+        ));
+        assert_eq!(store.user_auth[DEFAULT_USER_NAME].origin, Origin::BuiltIn);
+        assert!(store.user_auth("reader").is_some());
+        assert!(store.user_auth("writer").is_some());
+    }
+
+    #[test]
+    fn a_file_that_defines_the_builtin_user_decides_how_it_authenticates() {
+        let users = format!(
+            "users:\n  {DEFAULT_USER_NAME}:\n    auth:\n      method: scram-sha-256\n      \
+             verifier: \"{}\"\n",
+            verifier_for("a")
+        );
+
+        let store = from_yaml_with(&users).unwrap();
+
+        let Some(UserAuth::ScramSha256(verifier)) = store.user_auth(DEFAULT_USER_NAME) else {
+            panic!("a configured `{DEFAULT_USER_NAME}` should keep its own method");
+        };
+        assert_eq!(verifier.salted_password, [b'a'; 32]);
+        assert_eq!(
+            store.user_auth[DEFAULT_USER_NAME].origin,
+            Origin::ConfigFile
+        );
     }
 
     #[test]

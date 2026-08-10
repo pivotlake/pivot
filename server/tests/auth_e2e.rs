@@ -13,9 +13,10 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use catalog::{Datastore, PivotCatalog};
 use common::{CatalogFixture, select_rows, start_server_with_metastore};
+use datastore_delta::DEFAULT_REFRESH_INTERVAL;
 use dispatch::DataFlowDispatcher;
 use metastore::{Metastore, SCRAM_ITERATIONS, ScramVerifier, UserAuth};
-use metastore_yaml::YamlMetastore;
+use metastore_disk::{DiskMetastore, MetastoreConfig};
 use pgwire::api::auth::sasl::scram::gen_salted_password;
 use tempfile::TempDir;
 use tokio_postgres::{Client, NoTls};
@@ -34,10 +35,11 @@ fn scram_auth(password: &str) -> UserAuth {
 }
 
 /// A metastore whose user map can change while the server is running. The
-/// datastore half delegates to YAML; authentication reads the lock on every
-/// login, mirroring a future metastore with live user administration.
+/// datastore half delegates to the disk metastore; authentication reads the
+/// lock on every login, mirroring a future metastore with live user
+/// administration.
 struct MutableMetastore {
-    inner: YamlMetastore,
+    inner: DiskMetastore,
     users: RwLock<HashMap<String, UserAuth>>,
 }
 
@@ -115,7 +117,8 @@ fn authenticating_server() -> &'static AuthServer {
 "#,
             data_dir.path().display(),
         );
-        let inner = YamlMetastore::from_yaml(&yaml, "test").unwrap();
+        let config: MetastoreConfig = serde_yaml_ng::from_str(&yaml).unwrap();
+        let inner = DiskMetastore::open(config, None, DEFAULT_REFRESH_INTERVAL).unwrap();
         let metastore = Arc::new(MutableMetastore {
             inner,
             users: RwLock::new(HashMap::from([
