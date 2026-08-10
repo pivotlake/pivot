@@ -56,18 +56,29 @@ pub use table::CatalogTable;
 pub use table::TableFile;
 use thiserror::Error as ThisError;
 
-const PATH_OPTION: &str = "path";
+/// `WITH (adopt_parquets_at = 'dir')`: a directory of Parquet files the new
+/// table adopts as its initial data, where they already sit.
+const ADOPT_PARQUETS_OPTION: &str = "adopt_parquets_at";
 /// `WITH (partition_by = 'a, b')` — ordered, comma-separated partition columns.
 const PARTITION_BY_OPTION: &str = "partition_by";
 /// `WITH (sort_by = 'a, b')` — ordered, comma-separated sort columns.
 const SORT_BY_OPTION: &str = "sort_by";
 
+/// Every option `CREATE TABLE` understands. An option outside this set is
+/// rejected rather than ignored: a statement that asks for something the
+/// datastore does not implement has not been carried out, and silently
+/// dropping it is how a retired option (or a typo) turns into a table that is
+/// quietly not what was asked for.
+const TABLE_OPTIONS: [&str; 3] = [ADOPT_PARQUETS_OPTION, PARTITION_BY_OPTION, SORT_BY_OPTION];
+
 #[derive(Debug, ThisError)]
 pub enum Error {
     #[error(
-        "table path `{0}` must be a plain path, not a URL: a table's storage is the database's, so the path carries no scheme"
+        "`{option}` path `{path}` must be a plain path, not a URL: it names a directory in the database's own storage, so it carries no scheme"
     )]
-    TablePathWithScheme(String),
+    OptionPathWithScheme { option: String, path: String },
+    #[error("`{option}` is not a table option; this datastore takes {known}")]
+    UnknownOption { option: String, known: String },
     #[error("`{option}` column `{column}` is not a declared column of the table")]
     UnknownSpecColumn { option: String, column: String },
     #[error(transparent)]
@@ -98,6 +109,10 @@ pub enum Error {
     FooterNotLoaded { location: String, file: String },
     #[error("table at `{location}` commit conflict: input file `{file}` is no longer active")]
     CommitConflict { location: String, file: String },
+    #[error(
+        "table at `{location}` cannot delete `{file}`: the file sits outside the table's own storage, so it belongs to whoever the table adopted it from"
+    )]
+    DeletingOutsideStorage { location: String, file: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -706,17 +721,18 @@ impl DeltaTransaction {
 
     /// Resolve a `CREATE TABLE` against this datastore: check the schema exists
     /// and the name is still free, parse the layout options, and locate the
-    /// table's existing data files. Returns a [`DeltaTableCreation`] whose
+    /// Parquet files the table adopts. Returns a [`DeltaTableCreation`] whose
     /// `compile` builds the footer-fetch-and-stage dataflow. This part runs on
     /// the coordinator; compiling needs the pool.
     ///
-    /// The data lives at a directory/prefix: an explicit `WITH (path = '…')`,
-    /// always a plain path, never an object-store URL, or a path derived from
-    /// the table's name under the database root when none is given. An
-    /// empty/absent location yields an empty table (registered with no row
-    /// groups).
+    /// The table's own storage is always a directory of its own under the
+    /// database root, named after its identity. `WITH (adopt_parquets_at = '…')`
+    /// only points at data to adopt; nothing is written to that directory. A
+    /// statement that names none yields an empty table.
     fn bind_create(&self, request: CreateTableRequest) -> Result<DeltaTableCreation> {
         let name = request.schema_qualified_name();
+
+        Self::reject_unknown_options(&request)?;
 
         // A table can only be created in a schema that exists: `CREATE TABLE`
         // never brings its schema into being as a side effect. A schema this
@@ -739,19 +755,10 @@ impl DeltaTransaction {
         // it can name the table's storage and still be the identity the Delta
         // log records for it.
         let id = Uuid::new_v4();
-        let location = Self::location_for_new_table(&request, id)?;
+        let location = ObjectPath::new(id.to_string());
         let partition_by = Self::parse_spec_columns(&request, PARTITION_BY_OPTION)?;
         let sort_by = Self::parse_spec_columns(&request, SORT_BY_OPTION)?;
-
-        // Locate every data file under the table's directory for reading, keeping
-        // its `FileRef` identity so each footer's row groups land on the right
-        // `TableFile`.
-        let store = &self.datastore.store;
-        let files = self
-            .list_file_refs(&location)?
-            .into_iter()
-            .map(|f| f.into_data_file(store.as_ref(), &location))
-            .collect::<store::Result<Vec<DataFile>>>()?;
+        let files = self.adopted_data_files(&request)?;
 
         Ok(DeltaTableCreation {
             pending_table_creations: self.pending_table_creations.clone(),
@@ -789,29 +796,69 @@ impl DeltaTransaction {
         })
     }
 
-    /// Where a new table's data lives: an explicit `path` when the statement
-    /// gave one, or the table's identity when it did not.
+    /// Reject an option this datastore does not implement. A `CREATE TABLE` that
+    /// asks for something unknown is not carried out by ignoring it: the table
+    /// that appears is not the one the statement described, and the caller has no
+    /// way to tell. This is what turns a retired option name, or a typo, into an
+    /// error at the statement rather than a surprise at the first query.
+    fn reject_unknown_options(request: &CreateTableRequest) -> Result<()> {
+        let Some(option) = request
+            .options
+            .keys()
+            .find(|option| !TABLE_OPTIONS.contains(&option.as_str()))
+        else {
+            return Ok(());
+        };
+        Err(Error::UnknownOption {
+            option: option.clone(),
+            known: TABLE_OPTIONS.map(|known| format!("`{known}`")).join(", "),
+        })
+    }
+
+    /// The data files a new table adopts: every Parquet object directly under
+    /// the `adopt_parquets_at` directory, located for reading and keeping its
+    /// `FileRef` identity so each footer's row groups land on the right
+    /// `TableFile`. No such option, or a directory holding no Parquet, gives an
+    /// empty table that fills up as it is written to.
     ///
-    /// Naming the storage after the identity rather than the table means the
-    /// location never has to change: a rename or a move between schemas is a
-    /// catalog edit, and two tables that share a name in different schemas
-    /// cannot collide. The manifest records the mapping, so nothing has to
-    /// re-derive it.
+    /// Each file is recorded by its **store-root-absolute** key, not by a name
+    /// under the new table's own location, since it stays where the user put it:
+    /// the table writes its Delta log and every file it goes on to write under
+    /// its own directory, and leaves the adopted directory untouched.
     ///
-    /// A table path is always a plain path, never a URL (no scheme) — where it
-    /// physically lives is the database's storage, not the path's. A *relative*
-    /// path lives under the database root. An *absolute* path is taken from the
-    /// root of the database's storage medium: on a local database, a directory
-    /// on the server's filesystem; on a remote database, a key from the **bucket
-    /// root** (ignoring the prefix the database was opened at).
-    fn location_for_new_table(request: &CreateTableRequest, id: Uuid) -> Result<ObjectPath> {
-        let Some(path) = request.options.get(PATH_OPTION) else {
-            return Ok(ObjectPath::new(id.to_string()));
+    /// The option is always a plain path, never a URL (no scheme): the data
+    /// lives in the database's own storage, so the path carries none. A
+    /// *relative* path is read under the database root. An *absolute* path is
+    /// taken from the root of the database's storage medium: on a local
+    /// database, a directory on the server's filesystem; on a remote database, a
+    /// key from the **bucket root** (ignoring the prefix the database was opened
+    /// at).
+    fn adopted_data_files(&self, request: &CreateTableRequest) -> Result<Vec<DataFile>> {
+        let Some(path) = request.options.get(ADOPT_PARQUETS_OPTION) else {
+            return Ok(Vec::new());
         };
         if path.contains("://") {
-            return Err(Error::TablePathWithScheme(path.clone()));
+            return Err(Error::OptionPathWithScheme {
+                option: ADOPT_PARQUETS_OPTION.to_string(),
+                path: path.clone(),
+            });
         }
-        Ok(ObjectPath::new(path.clone()))
+        let directory = ObjectPath::new(path.clone());
+        let store = &self.datastore.store;
+        self.list_file_refs(&directory)?
+            .into_iter()
+            .map(|listed| {
+                let path = store.absolute_key(&directory.join(listed.path.as_str()))?;
+                let file = FileRef {
+                    path,
+                    size: listed.size,
+                };
+                // An absolute key reads the same from any table location, so
+                // which one it is resolved against does not matter here.
+                file.into_data_file(store.as_ref(), &directory)
+            })
+            .collect::<store::Result<Vec<DataFile>>>()
+            .map_err(Error::from)
     }
 
     /// Parse a comma-separated column-list option (`partition_by` / `sort_by`)
@@ -837,14 +884,14 @@ impl DeltaTransaction {
             .collect()
     }
 
-    /// List the Parquet data files at `location` through the store. An
-    /// empty/absent location yields no files. Used where the *listing* is the
-    /// source of truth: `CREATE TABLE`.
-    fn list_file_refs(&self, location: &ObjectPath) -> Result<Vec<FileRef>> {
+    /// List the Parquet data files directly under `directory` through the store,
+    /// each named relative to it. A missing directory yields no files. Used where
+    /// the *listing* is the source of truth: `CREATE TABLE`.
+    fn list_file_refs(&self, directory: &ObjectPath) -> Result<Vec<FileRef>> {
         Ok(self
             .datastore
             .store
-            .list(location)?
+            .list(directory)?
             .into_iter()
             .map(|object| object.file)
             .filter(|file| file.path.as_str().ends_with(".parquet"))

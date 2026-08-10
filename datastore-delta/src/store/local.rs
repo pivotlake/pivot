@@ -173,6 +173,16 @@ impl ObjectStore for LocalStore {
         Ok(objects)
     }
 
+    fn absolute_key(&self, key: &ObjectPath) -> Result<ObjectPath> {
+        // A store rooted at a relative directory would otherwise yield a key that
+        // only resolves from the process's working directory.
+        let path = std::path::absolute(self.path_for(key)).map_err(|source| StoreError::Io {
+            key: key.to_string(),
+            source,
+        })?;
+        Ok(ObjectPath::new(path.to_string_lossy().into_owned()))
+    }
+
     fn source(&self, key: &ObjectPath) -> Result<DataFileLocation> {
         Ok(DataFileLocation::Local(self.path_for(key)))
     }

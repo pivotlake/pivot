@@ -28,9 +28,9 @@ use common::{
     dispatch_with_buffers, strings_and_ints,
 };
 use datastore::DatastoreTransaction;
+use datastore_delta::DeltaDatastore;
 use datastore_delta::parquet::table_input;
 use datastore_delta::store::ObjectPath;
-use datastore_delta::{DeltaDatastore, FileRef};
 use dispatch::Projection;
 use harness::Backend;
 use planner::catalog::{Column, CreateTableRequest, SchemaQualifiedTableName};
@@ -52,14 +52,15 @@ fn columns() -> Vec<Column> {
     ]
 }
 
-/// `CREATE TABLE <name> (cols) WITH (path = '<path>')`, `path` store-relative.
-fn path_request(name: &str, path: &str) -> CreateTableRequest {
+/// `CREATE TABLE <name> (cols) WITH (adopt_parquets_at = '<path>')`, `path`
+/// store-relative.
+fn adopting_request(name: &str, path: &str) -> CreateTableRequest {
     CreateTableRequest {
         datastore_name: None,
         schema_name: None,
         name: name.to_string(),
         columns: columns(),
-        options: HashMap::from([("path".to_string(), path.to_string())]),
+        options: HashMap::from([("adopt_parquets_at".to_string(), path.to_string())]),
         if_not_exists: false,
     }
 }
@@ -88,7 +89,7 @@ fn create_events(d: &DispatchGuard, b: &Backend, files: &[(&str, &[i64])]) -> Ar
     let datastore = DeltaDatastore::open(&b.root, d).unwrap();
     let transaction = datastore.clone().begin_transaction();
     transaction
-        .bind_create_table(path_request("events", "events"))
+        .bind_create_table(adopting_request("events", "events"))
         .unwrap()
         .compile(d)
         .unwrap()
@@ -129,7 +130,7 @@ mod bodies {
 
         let transaction = datastore.clone().begin_transaction();
         transaction
-            .bind_create_table(path_request("events", "events"))
+            .bind_create_table(adopting_request("events", "events"))
             .unwrap()
             .compile(&d)
             .unwrap()
@@ -139,6 +140,33 @@ mod bodies {
         commit_datastore_transaction(transaction).unwrap();
 
         assert_eq!(scan(&d, &datastore, "events"), vec![1, 2, 3]);
+    }
+
+    /// An adopt path may be given as an absolute key, taken from the root of the
+    /// store's own medium rather than from the database: a directory on the
+    /// server's filesystem for a local database, a key from the bucket root for a
+    /// remote one. The rows scan back the same either way.
+    pub fn adopts_from_an_absolute_key(b: &Backend) {
+        let d = dispatch_with_buffers(2, 32);
+        b.store
+            .put(&ObjectPath::new("outside/p1.parquet"), &pq(&[7, 8]))
+            .unwrap();
+        let absolute = b.store.absolute_key(&ObjectPath::new("outside")).unwrap();
+        assert!(absolute.is_absolute(), "the store yields an absolute key");
+        let datastore = DeltaDatastore::open(&b.root, &d).unwrap();
+
+        let transaction = datastore.clone().begin_transaction();
+        transaction
+            .bind_create_table(adopting_request("events", absolute.as_str()))
+            .unwrap()
+            .compile(&d)
+            .unwrap()
+            .execute()
+            .collect()
+            .unwrap();
+        commit_datastore_transaction(transaction).unwrap();
+
+        assert_eq!(scan(&d, &datastore, "events"), vec![7, 8]);
     }
 
     /// The table and its data survive reopening the datastore, a server restart.
@@ -171,21 +199,18 @@ mod bodies {
     pub fn compaction_replaces_files(b: &Backend) {
         let d = dispatch_with_buffers(2, 32);
         let datastore = create_events(&d, b, &[("p1.parquet", &[1, 2, 3]), ("p2.parquet", &[4])]);
-        let merged = pq(&[1, 2, 3, 4]);
-        b.store
-            .put(&ObjectPath::new("events/merged.parquet"), &merged)
+        let mut table = datastore
+            .table_handle(&SchemaQualifiedTableName::in_default_schema("events"))
+            .unwrap();
+        // The adopted files are recorded by their store-absolute key; the merged
+        // output is written into the table's own location.
+        let inputs: Vec<ObjectPath> = table.file_refs().into_iter().map(|f| f.path).collect();
+        let merged = table
+            .write_data_file(ObjectPath::new("merged.parquet"), &pq(&[1, 2, 3, 4]))
             .unwrap();
 
-        datastore
-            .table_handle(&SchemaQualifiedTableName::in_default_schema("events"))
-            .unwrap()
-            .replace_data_files(
-                &[ObjectPath::new("p1.parquet"), ObjectPath::new("p2.parquet")],
-                &[datastore_delta::DeltaFileEntry::new(FileRef {
-                    path: ObjectPath::new("merged.parquet"),
-                    size: merged.len() as u64,
-                })],
-            )
+        table
+            .replace_data_files(&inputs, &[datastore_delta::DeltaFileEntry::new(merged)])
             .unwrap();
 
         assert_eq!(scan(&d, &datastore, "events"), vec![1, 2, 3, 4]);
@@ -284,6 +309,7 @@ macro_rules! backend_tests {
 }
 
 backend_tests!(create_and_scan);
+backend_tests!(adopts_from_an_absolute_key);
 backend_tests!(survives_reopen);
 backend_tests!(append_registers_new_file);
 backend_tests!(compaction_replaces_files);

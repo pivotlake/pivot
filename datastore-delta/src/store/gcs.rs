@@ -27,7 +27,7 @@
 
 use super::{
     DataFileLocation, FileRef, ListedObject, ObjectPath, ObjectStore, Result, StoreError,
-    object_key, parse_iso8601_millis, percent_encode,
+    absolute_object_key, object_key, parse_iso8601_millis, percent_encode,
 };
 use base64::Engine;
 use delta_kernel::object_store::DynObjectStore;
@@ -480,6 +480,10 @@ impl ObjectStore for GcsStore {
                 })
             })
             .collect()
+    }
+
+    fn absolute_key(&self, key: &ObjectPath) -> Result<ObjectPath> {
+        Ok(absolute_object_key(&self.prefix, key))
     }
 
     fn source(&self, key: &ObjectPath) -> Result<DataFileLocation> {

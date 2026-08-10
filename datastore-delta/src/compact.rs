@@ -29,6 +29,15 @@
 //! rearrangement, not a data change); a crash before the commit leaves only
 //! *orphan* objects (unlogged merged files), never a double read.
 //!
+//! Merging always writes into the table's own directory, so compacting a file
+//! the table adopted (`adopt_parquets_at`, which leaves the file where its owner
+//! put it) copies those rows under the database root. The adopted original is
+//! dropped from the log but never deleted: it is not the table's to delete, and
+//! the vacuum sweep only reclaims files under the table's own location. A table
+//! that adopts a directory of small files and then compacts them therefore ends
+//! up storing that data twice, once in the user's directory and once in its own.
+//! That is the price of never writing into a directory the user owns.
+//!
 //! A [`DeltaDatastore`] self-manages its own compaction: when opened with a
 //! [`MaintenanceConfig`] that enables it, the datastore spawns a [`Compacter`]
 //! loop bound to itself. The loop polls, each round reloading a table to its
@@ -387,9 +396,9 @@ mod tests {
         writer.close().unwrap();
     }
 
-    /// `CREATE TABLE <name> (Timestamp Int64) WITH (path = dir)` against
-    /// `datastore`, the way the server would run it -- or, when `dir` is `None`, at
-    /// `<name>` under the database root (a store-relative table).
+    /// `CREATE TABLE <name> (Timestamp Int64) WITH (adopt_parquets_at = dir)`
+    /// against `datastore`, the way the server would run it -- or, when `dir` is
+    /// `None`, an empty table adopting nothing.
     fn create_table(
         datastore: &Arc<DeltaDatastore>,
         dispatcher: &DataFlowDispatcher,
@@ -400,7 +409,7 @@ mod tests {
         use planner::catalog::{Column, CreateTableRequest};
         let options = match dir {
             Some(dir) => std::collections::HashMap::from([(
-                "path".to_string(),
+                "adopt_parquets_at".to_string(),
                 dir.to_str().unwrap().to_string(),
             )]),
             None => std::collections::HashMap::new(),
@@ -459,11 +468,11 @@ mod tests {
     fn compaction_merges_registered_files_and_swaps_datastore() {
         let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
         let db = tempfile::tempdir().unwrap();
-        let table_dir = db.path().join("events");
-        std::fs::create_dir_all(&table_dir).unwrap();
-        write_parquet_file(&table_dir, "a.parquet", vec![1, 2, 3]);
-        write_parquet_file(&table_dir, "b.parquet", vec![4, 5]);
-        write_parquet_file(&table_dir, "c.parquet", vec![6, 7, 8, 9]);
+        let adopted_dir = db.path().join("events");
+        std::fs::create_dir_all(&adopted_dir).unwrap();
+        write_parquet_file(&adopted_dir, "a.parquet", vec![1, 2, 3]);
+        write_parquet_file(&adopted_dir, "b.parquet", vec![4, 5]);
+        write_parquet_file(&adopted_dir, "c.parquet", vec![6, 7, 8, 9]);
 
         let datastore =
             DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
@@ -516,30 +525,37 @@ mod tests {
         dispatch.exit();
     }
 
-    /// Compaction is location-agnostic: a **store-relative** table (data under
-    /// the database root, resolved through the store -- the same path a remote
-    /// `s3://` root takes) compacts through the exact same code, with writes and
-    /// deletes going through the table's store handle.
+    /// Compaction is location-agnostic: a table whose adopted files were listed
+    /// **store-relative** (a directory under the database root, resolved through
+    /// the store -- the same path a remote `s3://` root takes) compacts through
+    /// the exact same code, with writes and deletes going through the table's
+    /// store handle.
     #[test]
     fn compaction_works_on_store_relative_tables() {
         let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
         let db = tempfile::tempdir().unwrap();
-        let table_dir = db.path().join("events");
-        std::fs::create_dir_all(&table_dir).unwrap();
+        let adopted_dir = db.path().join("events");
+        std::fs::create_dir_all(&adopted_dir).unwrap();
 
-        // Two small files under the table's prefix inside the database root.
-        write_parquet_file(&table_dir, "a.parquet", vec![1, 2]);
-        write_parquet_file(&table_dir, "b.parquet", vec![3]);
+        // Two small files under a prefix inside the database root.
+        write_parquet_file(&adopted_dir, "a.parquet", vec![1, 2]);
+        write_parquet_file(&adopted_dir, "b.parquet", vec![3]);
 
         let datastore =
             DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
-        // A relative `path`: the table lives at `events` under the store root,
-        // rather than at an absolute path of its own.
+        // A relative adoption path: the files are read at `events` under the
+        // store root, rather than at an absolute path of their own.
         create_table(
             &datastore,
             dispatch.dispatcher(),
             "events",
             Some(Path::new("events")),
+        );
+        let table_dir = db.path().join(
+            datastore
+                .table_handle(&SchemaQualifiedTableName::in_default_schema("events"))
+                .unwrap()
+                .location(),
         );
 
         let total: u64 = datastore
@@ -569,9 +585,11 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.ends_with(".parquet"))
             .collect();
-        // Deferred deletion: the merged object is written to the store; the two
-        // inputs remain as orphans until their version is pruned.
+        // The merged object is written to the table's own directory; the two
+        // adopted inputs are left where they were.
         assert!(on_disk.contains(&files[0].path.as_str().to_string()));
+        assert!(adopted_dir.join("a.parquet").exists());
+        assert!(adopted_dir.join("b.parquet").exists());
 
         let rows = fresh_parquet(&datastore, "events")
             .row_groups()
@@ -592,11 +610,11 @@ mod tests {
     fn compacter_in_another_process_compacts_registered_files() {
         let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
         let db = tempfile::tempdir().unwrap();
-        let table_dir = db.path().join("events");
-        std::fs::create_dir_all(&table_dir).unwrap();
-        write_parquet_file(&table_dir, "a.parquet", vec![1, 2, 3]);
-        write_parquet_file(&table_dir, "b.parquet", vec![4, 5]);
-        write_parquet_file(&table_dir, "c.parquet", vec![6, 7, 8, 9]);
+        let adopted_dir = db.path().join("events");
+        std::fs::create_dir_all(&adopted_dir).unwrap();
+        write_parquet_file(&adopted_dir, "a.parquet", vec![1, 2, 3]);
+        write_parquet_file(&adopted_dir, "b.parquet", vec![4, 5]);
+        write_parquet_file(&adopted_dir, "c.parquet", vec![6, 7, 8, 9]);
 
         // "Writer" process: creates the table over the pre-written files.
         let writer_datastore =

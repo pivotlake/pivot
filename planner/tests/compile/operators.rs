@@ -1814,7 +1814,7 @@ fn create_table_passes_with_options_to_catalog() {
 
     let results = planner
         .plan(
-            "CREATE TABLE created_table (id INTEGER) WITH (existing_path='/asdf')",
+            "CREATE TABLE created_table (id INTEGER) WITH (adopt_parquets_at='/asdf')",
             transaction.clone(),
         )
         .unwrap()
@@ -1832,7 +1832,10 @@ fn create_table_passes_with_options_to_catalog() {
     assert_eq!(created[0].columns[0].name, "id");
     assert_eq!(created[0].columns[0].col_type, Type::Int32);
     assert_eq!(
-        created[0].options.get("existing_path").map(String::as_str),
+        created[0]
+            .options
+            .get("adopt_parquets_at")
+            .map(String::as_str),
         Some("/asdf")
     );
 }

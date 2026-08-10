@@ -152,6 +152,23 @@ pub fn current_parquet(
     table.build_scan_view(&[], &[]).expect("build scan view")
 }
 
+/// Where `name` keeps its own storage under a database rooted at
+/// `database_root`: its Delta log, and every file written into it. A table's
+/// directory is named for its identity, so a test that wants to look at what the
+/// engine wrote asks the table rather than guessing the path.
+pub fn table_dir(
+    database_root: &std::path::Path,
+    datastore: &datastore_delta::DeltaDatastore,
+    name: &str,
+) -> std::path::PathBuf {
+    database_root.join(
+        datastore
+            .table_handle(&SchemaQualifiedTableName::in_default_schema(name))
+            .expect("table exists")
+            .location(),
+    )
+}
+
 /// Load a `ParquetTable` from an already-populated directory. Drives the
 /// metadata-fetch dataflow, so it runs on the coordinator (the test thread), not
 /// inside `run_on_worker`.
@@ -226,18 +243,20 @@ pub fn collect_u64s(batches: &[RecordBatch], col: usize) -> Vec<u64> {
         .collect()
 }
 
-/// Write `batches` into `dir` as Parquet, through the engine's own write path:
-/// a table over that directory, an INSERT of the rows, and a commit. This is how
-/// a test gets files our writer produced, and it exercises what production runs
-/// rather than a separate entry point kept alive for tests.
+/// Write `batches` as Parquet into a database rooted at `database_root`, through
+/// the engine's own write path: a table, an INSERT of the rows, and a commit.
+/// This is how a test gets files our writer produced, and it exercises what
+/// production runs rather than a separate entry point kept alive for tests.
+/// Returns the table's own directory, holding the written files and the Delta
+/// log that records them.
 ///
 /// The columns are taken from the batches' schema, so a caller only has to pass
 /// the rows it wants written.
 pub fn write_parquet_files(
     dispatch: &DispatchGuard,
-    dir: &std::path::Path,
+    database_root: &std::path::Path,
     batches: Vec<RecordBatch>,
-) {
+) -> std::path::PathBuf {
     use planner::catalog::{Column, CreateTableRequest};
 
     let schema = batches[0].schema();
@@ -251,10 +270,7 @@ pub fn write_parquet_files(
         })
         .collect();
 
-    let database = TempDir::new().unwrap();
-    let datastore = datastore_delta::DeltaDatastore::open_local(database.path(), dispatch).unwrap();
-    let mut options = std::collections::HashMap::new();
-    options.insert("path".to_string(), dir.to_string_lossy().into_owned());
+    let datastore = datastore_delta::DeltaDatastore::open_local(database_root, dispatch).unwrap();
     let creation = datastore.clone().begin_transaction();
     creation
         .bind_create_table(CreateTableRequest {
@@ -262,7 +278,7 @@ pub fn write_parquet_files(
             schema_name: None,
             name: "written".to_string(),
             columns,
-            options,
+            options: std::collections::HashMap::new(),
             if_not_exists: false,
         })
         .unwrap()
@@ -273,7 +289,15 @@ pub fn write_parquet_files(
         .unwrap();
     commit_datastore_transaction(creation).unwrap();
 
-    insert_batches(dispatch, datastore.begin_transaction(), "written", batches);
+    let name = SchemaQualifiedTableName::in_default_schema("written");
+    insert_batches(
+        dispatch,
+        datastore.clone().begin_transaction(),
+        &name.table,
+        batches,
+    );
+
+    table_dir(database_root, &datastore, &name.table)
 }
 
 /// INSERT `batches` into the table `name` through `transaction` and commit it,

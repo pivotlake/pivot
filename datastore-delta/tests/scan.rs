@@ -1083,8 +1083,8 @@ fn scan_a_column_our_writer_delta_encoded() {
     )
     .unwrap();
     let dir = TempDir::new().unwrap();
-    write_parquet_files(&dispatch, dir.path(), vec![batch]);
-    let table = parquet_table_from_dir(&dispatch, dir.path());
+    let written = write_parquet_files(&dispatch, dir.path(), vec![batch]);
+    let table = parquet_table_from_dir(&dispatch, &written);
 
     let results = table_input(&dispatch, &table, Projection::all(2), false)
         .collect()

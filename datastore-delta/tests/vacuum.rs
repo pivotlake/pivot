@@ -6,7 +6,7 @@
 mod common;
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -17,10 +17,10 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
-use common::{DispatchGuard, commit_datastore_transaction, dispatch};
+use common::{DispatchGuard, commit_datastore_transaction, dispatch, table_dir};
 use datastore::DatastoreTransaction as _;
 use datastore_delta::{DEFAULT_VACUUM_POLL, DeltaDatastore, Vacuumer};
-use planner::catalog::{Column, CreateTableRequest};
+use planner::catalog::{Column, CreateTableRequest, SchemaQualifiedTableName};
 
 const EIGHT_DAYS_MS: u64 = 8 * 24 * 60 * 60 * 1000;
 
@@ -52,9 +52,15 @@ fn write_parquet(path: &Path) {
     writer.close().unwrap();
 }
 
-/// `CREATE TABLE events (Timestamp Int64) WITH (path = dir)`, adopting whatever
-/// Parquet files already sit under `dir` as the table's initial files.
-fn create_events_table(datastore: &Arc<DeltaDatastore>, dispatch: &DispatchGuard, dir: &Path) {
+/// `CREATE TABLE events (Timestamp Int64)`, adopting the Parquet files already
+/// under `dir`, and return the table's own directory: where its log lives, and
+/// where files written into it land.
+fn create_events_table(
+    datastore: &Arc<DeltaDatastore>,
+    dispatch: &DispatchGuard,
+    db: &Path,
+    dir: &Path,
+) -> PathBuf {
     let request = CreateTableRequest {
         datastore_name: None,
         schema_name: None,
@@ -63,7 +69,10 @@ fn create_events_table(datastore: &Arc<DeltaDatastore>, dispatch: &DispatchGuard
             name: "Timestamp".to_string(),
             col_type: planner::types::Type::Int64,
         }],
-        options: HashMap::from([("path".to_string(), dir.to_string_lossy().into_owned())]),
+        options: HashMap::from([(
+            "adopt_parquets_at".to_string(),
+            dir.to_string_lossy().into_owned(),
+        )]),
         if_not_exists: false,
     };
     let transaction = datastore.clone().begin_transaction();
@@ -76,18 +85,20 @@ fn create_events_table(datastore: &Arc<DeltaDatastore>, dispatch: &DispatchGuard
         .collect()
         .unwrap();
     commit_datastore_transaction(transaction).unwrap();
+    table_dir(db, datastore, "events")
 }
 
 #[test]
 fn unreferenced_file_past_retention_is_deleted_and_the_live_file_is_kept() {
     let dispatch = dispatch(2);
     let db = TempDir::new().unwrap();
-    let table_dir = db.path().join("events");
-    std::fs::create_dir_all(&table_dir).unwrap();
-    write_parquet(&table_dir.join("live.parquet"));
+    let adopted_dir = db.path().join("events");
+    std::fs::create_dir_all(&adopted_dir).unwrap();
+    write_parquet(&adopted_dir.join("live.parquet"));
     let datastore = DeltaDatastore::open_local(db.path(), &dispatch).unwrap();
-    create_events_table(&datastore, &dispatch, &table_dir);
-    // Dropped in after CREATE, so no Add references it: an unreferenced orphan.
+    let table_dir = create_events_table(&datastore, &dispatch, db.path(), &adopted_dir);
+    // Dropped into the table's own directory after CREATE, so no Add references
+    // it: an unreferenced orphan.
     write_parquet(&table_dir.join("orphan.parquet"));
 
     let vacuumer = Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, datastore.clone()));
@@ -98,7 +109,7 @@ fn unreferenced_file_past_retention_is_deleted_and_the_live_file_is_kept() {
         "an unreferenced file past the retention window is deleted"
     );
     assert!(
-        table_dir.join("live.parquet").exists(),
+        adopted_dir.join("live.parquet").exists(),
         "the current version's live file is kept, however old"
     );
 }
@@ -107,11 +118,11 @@ fn unreferenced_file_past_retention_is_deleted_and_the_live_file_is_kept() {
 fn unreferenced_file_within_retention_is_kept() {
     let dispatch = dispatch(2);
     let db = TempDir::new().unwrap();
-    let table_dir = db.path().join("events");
-    std::fs::create_dir_all(&table_dir).unwrap();
-    write_parquet(&table_dir.join("live.parquet"));
+    let adopted_dir = db.path().join("events");
+    std::fs::create_dir_all(&adopted_dir).unwrap();
+    write_parquet(&adopted_dir.join("live.parquet"));
     let datastore = DeltaDatastore::open_local(db.path(), &dispatch).unwrap();
-    create_events_table(&datastore, &dispatch, &table_dir);
+    let table_dir = create_events_table(&datastore, &dispatch, db.path(), &adopted_dir);
     write_parquet(&table_dir.join("orphan.parquet"));
 
     let vacuumer = Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, datastore.clone()));
@@ -121,4 +132,60 @@ fn unreferenced_file_within_retention_is_kept() {
         table_dir.join("orphan.parquet").exists(),
         "an unreferenced file still within the retention window is kept"
     );
+}
+
+/// The adopted directory is never swept: those files are the user's, so an
+/// unreferenced one there survives however old it is.
+#[test]
+fn a_file_in_the_adopted_directory_is_never_deleted() {
+    let dispatch = dispatch(2);
+    let db = TempDir::new().unwrap();
+    let adopted_dir = db.path().join("events");
+    std::fs::create_dir_all(&adopted_dir).unwrap();
+    write_parquet(&adopted_dir.join("live.parquet"));
+    let datastore = DeltaDatastore::open_local(db.path(), &dispatch).unwrap();
+    create_events_table(&datastore, &dispatch, db.path(), &adopted_dir);
+    write_parquet(&adopted_dir.join("theirs.parquet"));
+
+    let vacuumer = Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, datastore.clone()));
+    vacuumer.vacuum_all(now_ms() + EIGHT_DAYS_MS);
+
+    assert!(adopted_dir.join("theirs.parquet").exists());
+}
+
+/// Compaction merges adopted files into the table's own storage and drops them
+/// from the log, and the vacuum sweep that follows still leaves the files
+/// themselves alone, however far past the retention window: they are the
+/// directory owner's, not the table's.
+#[test]
+fn compaction_merges_adopted_files_without_deleting_them() {
+    let dispatch = dispatch(2);
+    let db = TempDir::new().unwrap();
+    let adopted_dir = db.path().join("events");
+    std::fs::create_dir_all(&adopted_dir).unwrap();
+    for name in ["a.parquet", "b.parquet"] {
+        write_parquet(&adopted_dir.join(name));
+    }
+    let datastore = DeltaDatastore::open_local(db.path(), &dispatch).unwrap();
+    let table_dir = create_events_table(&datastore, &dispatch, db.path(), &adopted_dir);
+    let name = SchemaQualifiedTableName::in_default_schema("events");
+    let inputs = datastore.table_files(&name).unwrap();
+    assert_eq!(inputs.len(), 2, "both adopted files are live");
+
+    let id = datastore.table_handle(&name).unwrap().id();
+    datastore_delta::compact_table_files(&datastore, id, &inputs, 128 * 1024).unwrap();
+    Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, datastore.clone()))
+        .vacuum_all(now_ms() + EIGHT_DAYS_MS);
+
+    // One merged file in the table's own directory, holding every row.
+    let merged = datastore.table_files(&name).unwrap();
+    assert_eq!(merged.len(), 1);
+    assert!(table_dir.join(merged[0].path.as_str()).exists());
+    // And both originals still sit where their owner left them.
+    for name in ["a.parquet", "b.parquet"] {
+        assert!(
+            adopted_dir.join(name).exists(),
+            "compaction must not delete {name}"
+        );
+    }
 }

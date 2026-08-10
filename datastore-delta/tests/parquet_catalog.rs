@@ -144,7 +144,10 @@ fn three_row_table() -> (TempDir, Vec<Column>) {
 
 fn create_request(name: &str, path: &Path, columns: Vec<Column>) -> CreateTableRequest {
     let mut options = HashMap::new();
-    options.insert("path".to_string(), path.to_string_lossy().into_owned());
+    options.insert(
+        "adopt_parquets_at".to_string(),
+        path.to_string_lossy().into_owned(),
+    );
     CreateTableRequest {
         datastore_name: None,
         schema_name: None,
@@ -153,6 +156,25 @@ fn create_request(name: &str, path: &Path, columns: Vec<Column>) -> CreateTableR
         options,
         if_not_exists: false,
     }
+}
+
+/// A `CREATE TABLE name (cols)` request that adopts nothing: the table starts
+/// empty and is filled through the engine's own write path.
+fn empty_request(name: &str, columns: Vec<Column>) -> CreateTableRequest {
+    CreateTableRequest {
+        datastore_name: None,
+        schema_name: None,
+        name: name.to_string(),
+        columns,
+        options: HashMap::new(),
+        if_not_exists: false,
+    }
+}
+
+/// Where a created table keeps its own storage under the database root: its
+/// Delta log and every file written into it.
+fn table_dir(database: &TempDir, datastore: &DeltaDatastore, name: &str) -> std::path::PathBuf {
+    common::table_dir(database.path(), datastore, name)
 }
 
 fn int_constant(v: i32) -> Scalar<ArrayRef> {
@@ -216,7 +238,7 @@ fn create_table_succeeds_with_valid_path() {
 #[test]
 fn create_table_is_durable_and_visible_only_after_commit() {
     let (dir, columns) = three_row_table();
-    let (_database, datastore) = empty_datastore();
+    let (database, datastore) = empty_datastore();
     let transaction = datastore.clone().begin_transaction();
     transaction
         .bind_create_table(create_request("t", dir.path(), columns))
@@ -237,11 +259,7 @@ fn create_table_is_durable_and_visible_only_after_commit() {
             )
             .is_none()
     );
-    assert!(
-        !dir.path()
-            .join("_delta_log/00000000000000000000.json")
-            .exists()
-    );
+    assert!(std::fs::read_dir(database.path()).unwrap().next().is_none());
 
     commit_datastore_transaction(transaction).unwrap();
 
@@ -256,16 +274,18 @@ fn create_table_is_durable_and_visible_only_after_commit() {
             .is_some()
     );
     assert!(
-        dir.path()
+        table_dir(&database, &datastore, "t")
             .join("_delta_log/00000000000000000000.json")
             .exists()
     );
+    // The adopted files' own directory holds nothing but them.
+    assert!(!dir.path().join("_delta_log").exists());
 }
 
 #[test]
 fn rolling_back_create_table_discards_the_staged_creation() {
     let (dir, columns) = three_row_table();
-    let (_database, datastore) = empty_datastore();
+    let (database, datastore) = empty_datastore();
     let transaction = datastore.clone().begin_transaction();
     transaction
         .bind_create_table(create_request("t", dir.path(), columns))
@@ -289,6 +309,7 @@ fn rolling_back_create_table_discards_the_staged_creation() {
             .is_none()
     );
     assert!(!dir.path().join("_delta_log").exists());
+    assert!(std::fs::read_dir(database.path()).unwrap().next().is_none());
 }
 
 #[test]
@@ -356,15 +377,15 @@ fn create_table_without_a_path_makes_an_empty_table() {
 }
 
 #[test]
-fn create_table_over_an_unwritable_path_fails() {
-    // CREATE TABLE commits Delta version 0 at the table's location, so a
-    // location that cannot be written is a clean error, not a silently empty
-    // table.
-    let (_dir, columns) = three_row_table();
-    let (_database, datastore) = empty_datastore();
-    let bogus = Path::new("/definitely/not/a/real/path/for/datastore/tests");
+fn create_table_in_an_unwritable_database_fails() {
+    // CREATE TABLE commits Delta version 0 at the table's location under the
+    // database root, so a root that cannot be written is a clean error, not a
+    // silently empty table.
+    let (dir, columns) = three_row_table();
+    let bogus = "/definitely/not/a/real/path/for/datastore/tests";
+    let datastore = DeltaDatastore::open(bogus, &dispatcher()).unwrap();
 
-    let err = create_table(&datastore, create_request("t", bogus, columns))
+    let err = create_table(&datastore, create_request("t", dir.path(), columns))
         .unwrap_err()
         .to_string();
 
@@ -385,7 +406,7 @@ fn create_table_over_an_unwritable_path_fails() {
 }
 
 #[test]
-fn create_table_fails_when_path_is_a_file() {
+fn create_table_fails_when_the_adopt_path_is_a_file() {
     let (dir, columns) = three_row_table();
     let file_path = dir.path().join("data.parquet");
     let (_database, datastore) = empty_datastore();
@@ -403,20 +424,75 @@ fn create_table_fails_when_path_is_a_file() {
 fn create_table_rejects_a_url_path() {
     let (_dir, columns) = three_row_table();
     let (_database, datastore) = empty_datastore();
-    // A table path is always a plain path — its storage is the database's, not the
-    // path's — so a scheme is rejected regardless of the database's storage class.
+    // The adopted files live in the database's own storage, not the path's, so a
+    // scheme is rejected regardless of the database's storage class.
     let req = CreateTableRequest {
         datastore_name: None,
         schema_name: None,
         name: "t".to_string(),
         columns,
-        options: HashMap::from([("path".to_string(), "s3://bucket/data".to_string())]),
+        options: HashMap::from([(
+            "adopt_parquets_at".to_string(),
+            "s3://bucket/data".to_string(),
+        )]),
         if_not_exists: false,
     };
     let err = create_table(&datastore, req).unwrap_err().to_string();
     assert!(
         err.contains("not a URL"),
         "expected scheme rejection: {err}"
+    );
+}
+
+/// An option this datastore does not implement is an error, not something to
+/// drop: a statement carried out with one of its clauses ignored produces a
+/// table nobody asked for. `path`, the option `adopt_parquets_at` replaced, is
+/// exactly the case that matters.
+#[test]
+fn create_table_rejects_an_unknown_option() {
+    let (dir, columns) = three_row_table();
+    let (_database, datastore) = empty_datastore();
+    let req = CreateTableRequest {
+        datastore_name: None,
+        schema_name: None,
+        name: "t".to_string(),
+        columns,
+        options: HashMap::from([(
+            "path".to_string(),
+            dir.path().to_string_lossy().into_owned(),
+        )]),
+        if_not_exists: false,
+    };
+
+    let err = create_table(&datastore, req).unwrap_err().to_string();
+
+    assert!(
+        err.contains("`path` is not a table option"),
+        "expected the unknown option to be named: {err}"
+    );
+    assert!(
+        err.contains("adopt_parquets_at"),
+        "expected the known options to be listed: {err}"
+    );
+}
+
+/// An adopt directory holding no Parquet is not an error: the table is created
+/// empty, exactly as one that names no directory at all, and fills up as it is
+/// written to.
+#[test]
+fn create_table_over_an_empty_adopt_directory_makes_an_empty_table() {
+    let empty = TempDir::new().unwrap();
+    let (_dir, columns) = three_row_table();
+    let (_database, datastore) = empty_datastore();
+
+    create_table(&datastore, create_request("t", empty.path(), columns)).unwrap();
+
+    assert!(current_parquet(&datastore, "t").row_groups().is_empty());
+    run_sql(&datastore, "INSERT INTO t VALUES (1, 'one')");
+    datastore.refresh_from_store().unwrap();
+    assert_eq!(
+        common::extract_count(&run_sql(&datastore, "SELECT COUNT(*) FROM t")),
+        1
     );
 }
 
@@ -668,7 +744,6 @@ fn run_sql_with_stats(
 
 #[test]
 fn insert_rows_are_visible_after_a_refresh() {
-    let data = TempDir::new().unwrap();
     let columns = vec![
         Column {
             name: "id".to_string(),
@@ -680,7 +755,7 @@ fn insert_rows_are_visible_after_a_refresh() {
         },
     ];
     let (_database, datastore) = empty_datastore();
-    create_table(&datastore, create_request("inserted", data.path(), columns)).unwrap();
+    create_table(&datastore, empty_request("inserted", columns)).unwrap();
 
     let (inserted, stats) = run_sql_with_stats(
         &datastore,
@@ -726,7 +801,6 @@ fn insert_rows_are_visible_after_a_refresh() {
 /// if the file records the column's true width and signedness.
 #[test]
 fn unsigned_columns_insert_and_read_back() {
-    let data = TempDir::new().unwrap();
     let columns = vec![
         Column {
             name: "a".to_string(),
@@ -746,7 +820,7 @@ fn unsigned_columns_insert_and_read_back() {
         },
     ];
     let (_database, datastore) = empty_datastore();
-    create_table(&datastore, create_request("unsigned", data.path(), columns)).unwrap();
+    create_table(&datastore, empty_request("unsigned", columns)).unwrap();
 
     let inserted = run_sql(
         &datastore,
@@ -813,13 +887,12 @@ fn narrow_integer_columns_insert_and_read_back() {
 /// covered in `writing::type_tests`.
 #[test]
 fn timestamp_column_inserts_and_reads_back() {
-    let data = TempDir::new().unwrap();
     let columns = vec![Column {
         name: "ts".to_string(),
         col_type: Type::Timestamp,
     }];
     let (_database, datastore) = empty_datastore();
-    create_table(&datastore, create_request("events", data.path(), columns)).unwrap();
+    create_table(&datastore, empty_request("events", columns)).unwrap();
 
     let inserted = run_sql(
         &datastore,
@@ -841,13 +914,12 @@ fn timestamp_column_inserts_and_reads_back() {
 /// values are stored in would drop the rows above the signed maximum.
 #[test]
 fn unsigned_column_filters_on_unsigned_ordering() {
-    let data = TempDir::new().unwrap();
     let columns = vec![Column {
         name: "big".to_string(),
         col_type: Type::UInt64,
     }];
     let (_database, datastore) = empty_datastore();
-    create_table(&datastore, create_request("wide", data.path(), columns)).unwrap();
+    create_table(&datastore, empty_request("wide", columns)).unwrap();
 
     run_sql(
         &datastore,
@@ -870,7 +942,6 @@ fn unsigned_column_filters_on_unsigned_ordering() {
 /// scan compares its partition filters against.
 #[test]
 fn unsigned_partition_column_round_trips() {
-    let data = TempDir::new().unwrap();
     let (_database, datastore) = empty_datastore();
     create_table(
         &datastore,
@@ -888,13 +959,7 @@ fn unsigned_partition_column_round_trips() {
                     col_type: Type::Int32,
                 },
             ],
-            options: HashMap::from([
-                (
-                    "path".to_string(),
-                    data.path().to_string_lossy().into_owned(),
-                ),
-                ("partition_by".to_string(), "bucket".to_string()),
-            ]),
+            options: HashMap::from([("partition_by".to_string(), "bucket".to_string())]),
             if_not_exists: false,
         },
     )
@@ -1066,13 +1131,9 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
 
     let merged = write_ids(dir.path(), "merged.parquet", &[10, 20, 30, 40]);
     let merged_size = std::fs::metadata(&merged).unwrap().len();
-    let removed = vec![
-        ObjectPath::new("data.parquet"),
-        ObjectPath::new("extra.parquet"),
-    ];
     let added = vec![datastore_delta::DeltaFileEntry::new(
         datastore_delta::FileRef {
-            path: ObjectPath::new("merged.parquet"),
+            path: ObjectPath::new(merged.to_str().unwrap()),
             size: merged_size,
         },
     )];
@@ -1086,6 +1147,9 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
         .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
         .unwrap();
     winner.refresh().unwrap();
+    // The two inputs under the paths the table records them by: the adopted file
+    // absolutely, the appended one relative to the table's own location.
+    let removed: Vec<ObjectPath> = winner.file_refs().into_iter().map(|f| f.path).collect();
     winner.replace_data_files(&removed, &added).unwrap();
     // The loser only discovers the inputs are gone after its CAS conflict +
     // refresh and returns a typed commit-conflict error.
@@ -1218,13 +1282,12 @@ fn a_refresh_that_cannot_read_the_new_files_leaves_the_copy_untouched() {
 /// async upload path and swaps them in, preserving every row in one commit.
 #[test]
 fn compact_table_files_merges_small_files_into_one() {
-    let dir = TempDir::new().unwrap();
     let columns = vec![Column {
         name: "id".to_string(),
         col_type: Type::Int32,
     }];
     let (_database, datastore) = empty_datastore();
-    create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
+    create_table(&datastore, empty_request("t", columns)).unwrap();
     run_sql(&datastore, "INSERT INTO t VALUES (10), (20), (30)");
     run_sql(&datastore, "INSERT INTO t VALUES (40), (50)");
 
@@ -1249,8 +1312,9 @@ fn compact_table_files_merges_small_files_into_one() {
 #[test]
 fn compact_table_files_deletes_uploaded_outputs_when_delta_commit_fails() {
     let (dir, columns) = three_row_table();
-    let (_database, datastore) = empty_datastore();
+    let (database, datastore) = empty_datastore();
     create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
+    let table_dir = table_dir(&database, &datastore, "t");
 
     let mut table = datastore
         .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
@@ -1260,8 +1324,8 @@ fn compact_table_files_deletes_uploaded_outputs_when_delta_commit_fails() {
 
     // Replace the Delta log directory with a file so the data upload succeeds
     // but creating the next commit version fails.
-    let delta_log = dir.path().join("_delta_log");
-    let saved_delta_log = dir.path().join("_delta_log.saved");
+    let delta_log = table_dir.join("_delta_log");
+    let saved_delta_log = table_dir.join("_delta_log.saved");
     std::fs::rename(&delta_log, &saved_delta_log).unwrap();
     File::create(&delta_log).unwrap();
     let result = datastore_delta::compact_table_files(&datastore, table.id(), &inputs, 128 * 1024);
@@ -1270,7 +1334,7 @@ fn compact_table_files_deletes_uploaded_outputs_when_delta_commit_fails() {
 
     assert!(result.is_err(), "the Delta commit must fail");
     assert!(
-        std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+        std::fs::read_dir(&table_dir).unwrap().all(|entry| {
             !entry
                 .unwrap()
                 .file_name()
@@ -1386,20 +1450,20 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
     let datastore = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
     create_table(&datastore, create_request("t", data_dir.path(), columns)).unwrap();
 
-    // "Compact" data.parquet into merged.parquet but crash before deleting the
-    // input: both files are on disk, only merged is in the manifest.
+    // "Compact" the adopted file into merged.parquet but crash before deleting
+    // the input: both files are on disk, only merged is in the manifest.
+    let mut table = datastore
+        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
+        .unwrap();
+    let inputs: Vec<ObjectPath> = table.file_refs().into_iter().map(|f| f.path).collect();
     let merged = write_ids(data_dir.path(), "merged.parquet", &[10, 20, 30]);
     let added = vec![datastore_delta::DeltaFileEntry::new(
         datastore_delta::FileRef {
-            path: ObjectPath::new("merged.parquet"),
+            path: ObjectPath::new(merged.to_str().unwrap()),
             size: std::fs::metadata(&merged).unwrap().len(),
         },
     )];
-    datastore
-        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
-        .unwrap()
-        .replace_data_files(&[ObjectPath::new("data.parquet")], &added)
-        .unwrap();
+    table.replace_data_files(&inputs, &added).unwrap();
 
     let reopened = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
     let parquet = current_parquet(&reopened, "t");
@@ -1494,13 +1558,7 @@ fn table_partitioned_by_name() -> (TempDir, TempDir, Arc<DeltaDatastore>) {
                 col_type: Type::Utf8,
             },
         ],
-        options: HashMap::from([
-            (
-                "path".to_string(),
-                dir.path().to_string_lossy().into_owned(),
-            ),
-            ("partition_by".to_string(), "name".to_string()),
-        ]),
+        options: HashMap::from([("partition_by".to_string(), "name".to_string())]),
         if_not_exists: false,
     };
     let (database, datastore) = empty_datastore();
@@ -1650,7 +1708,20 @@ fn file_level_stats_prune_drops_a_whole_file_out_of_range() {
         col_type: Type::Int32,
     }];
     let (_database, datastore) = empty_datastore();
-    create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
+    // Created empty, then each file appended into the table's own location, so
+    // the stats under test are the ones the append path records.
+    create_table(
+        &datastore,
+        CreateTableRequest {
+            datastore_name: None,
+            schema_name: None,
+            name: "t".to_string(),
+            columns,
+            options: HashMap::new(),
+            if_not_exists: false,
+        },
+    )
+    .unwrap();
     let mut table = datastore
         .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
         .unwrap();

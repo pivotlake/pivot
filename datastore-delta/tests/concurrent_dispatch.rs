@@ -62,7 +62,7 @@ fn make_datastore() -> (TempDir, Arc<DeltaDatastore>) {
     let datastore = DeltaDatastore::open_local(dir.path(), &dispatcher()).unwrap();
     let mut options = HashMap::new();
     options.insert(
-        "path".to_string(),
+        "adopt_parquets_at".to_string(),
         dir.path().to_string_lossy().into_owned(),
     );
     let transaction = datastore.clone().begin_transaction();

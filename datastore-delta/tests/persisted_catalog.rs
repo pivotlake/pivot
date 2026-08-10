@@ -64,10 +64,13 @@ fn columns() -> Vec<Column> {
     ]
 }
 
-/// A `CREATE TABLE … WITH (path = '<dir>')` request.
-fn path_request(name: &str, path: &Path, columns: Vec<Column>) -> CreateTableRequest {
+/// A `CREATE TABLE … WITH (adopt_parquets_at = '<dir>')` request.
+fn adopting_request(name: &str, path: &Path, columns: Vec<Column>) -> CreateTableRequest {
     let mut options = HashMap::new();
-    options.insert("path".to_string(), path.to_string_lossy().into_owned());
+    options.insert(
+        "adopt_parquets_at".to_string(),
+        path.to_string_lossy().into_owned(),
+    );
     CreateTableRequest {
         datastore_name: None,
         schema_name: None,
@@ -110,7 +113,7 @@ fn create(
 }
 
 #[test]
-fn create_table_with_path_scans_rows() {
+fn create_table_over_adopted_parquet_scans_rows() {
     let dispatch = dispatch(1);
     let db = TempDir::new().unwrap();
     let data = TempDir::new().unwrap();
@@ -123,7 +126,7 @@ fn create_table_with_path_scans_rows() {
     create(
         &dispatch,
         &datastore,
-        path_request("events", data.path(), columns()),
+        adopting_request("events", data.path(), columns()),
     )
     .unwrap();
 
@@ -163,7 +166,7 @@ fn tables_persist_across_reopen() {
         create(
             &dispatch,
             &datastore,
-            path_request("events", data.path(), columns()),
+            adopting_request("events", data.path(), columns()),
         )
         .unwrap();
     }
@@ -199,19 +202,22 @@ fn background_refresh_advances_to_latest_delta_snapshot() {
     create(
         &dispatch,
         &datastore,
-        path_request("events", data.path(), columns()),
+        adopting_request("events", data.path(), columns()),
     )
     .unwrap();
     assert_eq!(current_parquet(&datastore, "events").row_groups().len(), 1);
 
+    // The table's log lives under the database root, and names the adopted files
+    // by their absolute path, so a hand-written commit does the same.
+    let log_dir = table_dir(db.path(), &datastore, "events");
     write_parquet(&second, &strings_and_ints(&["b"], &[2]));
     let second_size = std::fs::metadata(&second).unwrap().len();
     write_delta_commit(
-        data.path(),
+        &log_dir,
         1,
         &[serde_json::json!({
             "add": {
-                "path": "b.parquet",
+                "path": second.to_str().unwrap(),
                 "partitionValues": {},
                 "size": second_size,
                 "modificationTime": 0,
@@ -224,11 +230,11 @@ fn background_refresh_advances_to_latest_delta_snapshot() {
     assert_eq!(current_parquet(&datastore, "events").row_groups().len(), 2);
 
     write_delta_commit(
-        data.path(),
+        &log_dir,
         2,
         &[serde_json::json!({
             "remove": {
-                "path": "a.parquet",
+                "path": first.to_str().unwrap(),
                 "deletionTimestamp": 0,
                 "dataChange": true
             }
@@ -328,7 +334,7 @@ fn create_fetches_footers_across_workers_before_commit() {
     create(
         &dispatch,
         &datastore,
-        path_request("events", data.path(), columns()),
+        adopting_request("events", data.path(), columns()),
     )
     .unwrap();
 
@@ -356,7 +362,7 @@ fn create_fetches_footers_across_workers_before_commit() {
 }
 
 #[test]
-fn rejects_an_object_store_scheme_in_a_table_path() {
+fn rejects_an_object_store_scheme_in_the_adopt_path() {
     let dispatch = dispatch(1);
     let db = TempDir::new().unwrap();
     let datastore = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
@@ -364,7 +370,7 @@ fn rejects_an_object_store_scheme_in_a_table_path() {
     let err = create(
         &dispatch,
         &datastore,
-        path_request("t", Path::new("s3://bucket/data"), columns()),
+        adopting_request("t", Path::new("s3://bucket/data"), columns()),
     )
     .unwrap_err()
     .to_string();
@@ -380,22 +386,18 @@ fn rejects_an_object_store_scheme_in_a_table_path() {
 #[test]
 fn insert_persists_stats_in_add_stats() {
     let dispatch = dispatch(2);
-    let table_dir = TempDir::new().unwrap();
+    let db = TempDir::new().unwrap();
     // Columns `name` (a,b,c) and `value` (1,2,3), no nulls.
-    write_parquet_files(
+    let table_dir = write_parquet_files(
         &dispatch,
-        table_dir.path(),
+        db.path(),
         vec![strings_and_ints(&["a", "b", "c"], &[1, 2, 3])],
     );
 
     // The insert commit (v1) follows the empty CREATE (v0). Aggregate the stats
     // across however many files the write produced.
-    let commit = std::fs::read_to_string(
-        table_dir
-            .path()
-            .join("_delta_log/00000000000000000001.json"),
-    )
-    .unwrap();
+    let commit =
+        std::fs::read_to_string(table_dir.join("_delta_log/00000000000000000001.json")).unwrap();
     let stats: Vec<serde_json::Value> = commit
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
