@@ -108,7 +108,9 @@ async fn events_server(b: &Backend) -> Client {
         .unwrap();
     let client = connect_client(start_server_on(&b.root)).await;
     client
-        .simple_query("CREATE TABLE events (name VARCHAR, value BIGINT) WITH (path = 'events')")
+        .simple_query(
+            "CREATE TABLE events (name VARCHAR, value BIGINT) WITH (adopt_parquets_at = 'events')",
+        )
         .await
         .unwrap();
     client

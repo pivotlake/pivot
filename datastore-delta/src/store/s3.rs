@@ -16,7 +16,7 @@
 
 use super::{
     DataFileLocation, FileRef, ListedObject, ObjectPath, ObjectStore, Result, StoreError,
-    object_key, parse_iso8601_millis, percent_encode,
+    absolute_object_key, object_key, parse_iso8601_millis, percent_encode,
 };
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
@@ -325,6 +325,10 @@ impl ObjectStore for S3Store {
                 })
             })
             .collect()
+    }
+
+    fn absolute_key(&self, key: &ObjectPath) -> Result<ObjectPath> {
+        Ok(absolute_object_key(&self.prefix, key))
     }
 
     fn source(&self, key: &ObjectPath) -> Result<DataFileLocation> {

@@ -164,14 +164,20 @@ relative to that datastore's configured location:
 
 ```sql
 CREATE TABLE hits (url VARCHAR, ts BIGINT)
-  WITH (path = 'hits');
+  WITH (adopt_parquets_at = 'hits');
 
 CREATE TABLE warm.main.events (id BIGINT, ts BIGINT)
-  WITH (path = 'events');
+  WITH (adopt_parquets_at = 'events');
 
 SELECT COUNT(*) FROM hits WHERE url <> '';
 SELECT * FROM warm.main.events;
 ```
+
+`adopt_parquets_at` takes Parquet files that already sit at that path as the
+table's initial data, instead of starting the table empty.
+
+Adopted files are recorded by their absolute path and are never written to,
+moved, or deleted: they stay the directory owner's.
 
 The catalog is process-global, so a table created on one connection is visible
 to every other connection. A query may join tables from several datastores;

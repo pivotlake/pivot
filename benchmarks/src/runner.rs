@@ -364,34 +364,6 @@ fn check_or_update_expected(query: &Query, actual: &str, update: bool) -> Result
     }
 }
 
-/// Remove the Delta logs a previous run's CREATE TABLEs committed into the
-/// dataset's table directories. The log only re-registers the same parquet
-/// files, but its presence makes a re-run's CREATE TABLE fail ("version 0
-/// already exists"), so a benchmark could never run twice against one
-/// dataset copy.
-///
-/// Both suite layouts are covered. A single-table suite points its table at
-/// `source` itself, so the log lands directly in it; a multi-table suite gives
-/// every table its own directory one level down.
-fn clear_stale_table_logs(source: &std::path::Path) {
-    remove_table_log(source);
-    let Ok(entries) = std::fs::read_dir(source) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        remove_table_log(&entry.path());
-    }
-}
-
-/// Remove `dir`'s Delta log, if it has one.
-fn remove_table_log(dir: &std::path::Path) {
-    let log = dir.join("_delta_log");
-    if log.is_dir() {
-        std::fs::remove_dir_all(&log)
-            .unwrap_or_else(|e| panic!("removing stale table log {}: {e}", log.display()));
-    }
-}
-
 /// Split a setup script into the statements it declares. The server prepares one
 /// statement per query, so a suite that declares more than one table, or loads
 /// one from another, has to send them separately. Line comments come off first:
@@ -564,8 +536,6 @@ pub async fn run_suite(
         .connect(NoTls)
         .await?;
     let conn_handle = tokio::spawn(connection);
-
-    clear_stale_table_logs(&opts.source);
 
     let setup_template = read_to_string(&suite.setup_sql_path)?;
     let setup_sql = setup_template.replace("{source}", &opts.source.display().to_string());

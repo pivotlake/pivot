@@ -50,7 +50,7 @@
 //! set up than it does to encode, so it takes a fraction of the rows.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow_array::builder::StringViewBuilder;
@@ -64,7 +64,7 @@ use parquet_variant_compute::{VariantArray, json_to_variant};
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
 use datastore_delta::DeltaDatastore;
 use dispatch::{Dispatch, RECORD_BATCH_SIZE, values_input};
-use planner::catalog::{Column, CreateTableRequest, TableReference};
+use planner::catalog::{Column, CreateTableRequest, SchemaQualifiedTableName, TableReference};
 use planner::types::{Type, physical_arrow_type};
 use tempfile::TempDir;
 
@@ -490,12 +490,13 @@ fn bench_encode(c: &mut Criterion, dispatch: &Dispatch, rows: usize) {
         // instead of committed, and the files they left behind are cleared
         // between iterations, so the directory holds one run's output at a time.
         let dir = TempDir::new_in(OUTPUT_ROOT).expect("a writable tmpfs directory");
-        let catalog = table_over(dispatch, dir.path(), case.columns.clone(), case.sort_by);
+        let (catalog, table_dir) =
+            table_over(dispatch, dir.path(), case.columns.clone(), case.sort_by);
         group.throughput(Throughput::Elements(case.rows as u64));
         group.bench_function(case.name, |b| {
             b.iter_batched(
                 || {
-                    clear_files(dir.path());
+                    clear_files(&table_dir);
                     // The batches are Arc-backed, so a clone hands the pipeline
                     // its own handles without copying any values.
                     case.input.clone()
@@ -524,26 +525,26 @@ fn columns(names: &[&str], col_type: Type) -> Vec<Column> {
         .collect()
 }
 
-/// A catalog holding one table of `columns` over `dir`, sorted by `sort_by`
-/// where one is given.
+/// A catalog holding one table of `columns` in a database rooted at `dir`,
+/// sorted by `sort_by` where one is given, and the directory that table keeps
+/// its own storage in (where the files an insert writes land).
 fn table_over(
     dispatch: &Dispatch,
     dir: &Path,
     columns: Vec<Column>,
     sort_by: &[&str],
-) -> PivotCatalog {
+) -> (PivotCatalog, PathBuf) {
     let datastore = DeltaDatastore::open_local(dir, dispatch.dispatcher()).unwrap();
     let catalog = PivotCatalog::new(
         HashMap::from([(
             DEFAULT_DATASTORE_NAME.to_string(),
-            datastore as Arc<dyn Datastore>,
+            datastore.clone() as Arc<dyn Datastore>,
         )]),
         DEFAULT_DATASTORE_NAME.to_string(),
     )
     .unwrap();
 
     let mut options = HashMap::new();
-    options.insert("path".to_string(), dir.to_string_lossy().into_owned());
     if !sort_by.is_empty() {
         options.insert("sort_by".to_string(), sort_by.join(", "));
     }
@@ -570,7 +571,16 @@ fn table_over(
         .unwrap()
         .block_on(creation.commit())
         .unwrap();
-    catalog
+
+    // The table's own directory, named for its identity: what an insert writes
+    // into, and so what each iteration clears.
+    let table_dir = dir.join(
+        datastore
+            .table_handle(&SchemaQualifiedTableName::in_default_schema(TABLE))
+            .expect("the table was created")
+            .location(),
+    );
+    (catalog, table_dir)
 }
 
 /// Remove the files a previous iteration wrote, leaving the table's log alone.

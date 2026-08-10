@@ -141,14 +141,50 @@ where
     port
 }
 
+/// The shared server's database root, recorded when [`server_port`] starts it so
+/// a test can look at what the server wrote.
+static DATA_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+/// The shared server's database root. Panics if the server has not started.
+pub fn data_dir() -> &'static std::path::Path {
+    DATA_DIR.get().expect("the shared server has started")
+}
+
+/// Where the shared server keeps `schema.table`'s own storage: its Delta log and
+/// every file written into it. A table's directory is named for its identity,
+/// which the database manifest maps the table's name to, under the schema that
+/// names it: the same table name lives in several schemas here, so the lookup
+/// has to say which one it means.
+pub fn qualified_table_dir(schema: &str, table: &str) -> std::path::PathBuf {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(data_dir().join("_pivot_manifest.json")).unwrap())
+            .unwrap();
+    let id = manifest["schemas"]
+        .as_array()
+        .expect("the manifest lists its schemas")
+        .iter()
+        .find(|entry| entry["name"].as_str() == Some(schema))
+        .unwrap_or_else(|| panic!("no schema named `{schema}` in the manifest"))["table_ids"]
+        [table]
+        .as_str()
+        .unwrap_or_else(|| panic!("no table named `{schema}.{table}` in the manifest"));
+    data_dir().join(id)
+}
+
+/// [`qualified_table_dir`] for a table in the default schema.
+pub fn table_dir(table: &str) -> std::path::PathBuf {
+    qualified_table_dir(planner::DEFAULT_SCHEMA_NAME, table)
+}
+
 /// Lazily start a shared single-datastore server and return its port. A generous
 /// ring absorbs the cached footer/page residue the many tables the suite creates
 /// leave behind.
 pub fn server_port() -> u16 {
     static PORT: OnceLock<u16> = OnceLock::new();
     *PORT.get_or_init(|| {
-        start_server(256, |dispatch| {
-            let data_dir = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        DATA_DIR.set(data_dir.path().to_path_buf()).unwrap();
+        start_server(256, move |dispatch| {
             let datastore: Arc<dyn Datastore> =
                 DeltaDatastore::open_local(data_dir.path(), dispatch.dispatcher()).unwrap();
             let catalog = Arc::new(

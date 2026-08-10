@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use common::{Conn, conn, connect_client, server_port};
+use common::{Conn, conn, connect_client, server_port, table_dir};
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::basic::Compression;
@@ -81,7 +81,7 @@ async fn create_people_table(client: &Client, table: &str, dir: &Path) {
     let path = dir.to_str().unwrap();
     client
         .simple_query(&format!(
-            "CREATE TABLE {table} (id BIGINT, name VARCHAR) WITH (path = '{path}')"
+            "CREATE TABLE {table} (id BIGINT, name VARCHAR) WITH (adopt_parquets_at = '{path}')"
         ))
         .await
         .unwrap();
@@ -281,7 +281,7 @@ async fn global_min_max_over_double_column(#[future] conn: Conn) {
     let f: ArrayRef = Arc::new(arrow_array::Float64Array::from(vec![3.7f64, 9.2, 5.0]));
     let dir = write_parquet(&RecordBatch::try_new(schema, vec![f]).unwrap());
     conn.simple_query(&format!(
-        "CREATE TABLE doubles (f DOUBLE) WITH (path = '{}')",
+        "CREATE TABLE doubles (f DOUBLE) WITH (adopt_parquets_at = '{}')",
         dir.path().to_str().unwrap()
     ))
     .await
@@ -311,7 +311,7 @@ async fn grouped_float_aggregates(#[future] conn: Conn) {
     let r: ArrayRef = Arc::new(arrow_array::Float32Array::from(vec![1.0f32, 3.0, 5.0]));
     let dir = write_parquet(&RecordBatch::try_new(schema, vec![g, d, r]).unwrap());
     conn.simple_query(&format!(
-        "CREATE TABLE fmetrics (g BIGINT, d DOUBLE, r REAL) WITH (path = '{}')",
+        "CREATE TABLE fmetrics (g BIGINT, d DOUBLE, r REAL) WITH (adopt_parquets_at = '{}')",
         dir.path().to_str().unwrap()
     ))
     .await
@@ -354,7 +354,7 @@ async fn decimal_scan_filter_and_wire_format(#[future] conn: Conn) {
     );
     let dir = write_parquet(&RecordBatch::try_new(schema, vec![v]).unwrap());
     conn.simple_query(&format!(
-        "CREATE TABLE prices (v DECIMAL(10,2)) WITH (path = '{}')",
+        "CREATE TABLE prices (v DECIMAL(10,2)) WITH (adopt_parquets_at = '{}')",
         dir.path().to_str().unwrap()
     ))
     .await
@@ -386,7 +386,7 @@ async fn decimal_aggregates(#[future] conn: Conn) {
     );
     let dir = write_parquet(&RecordBatch::try_new(schema, vec![v]).unwrap());
     conn.simple_query(&format!(
-        "CREATE TABLE decimal_metrics (v DECIMAL(10,2)) WITH (path = '{}')",
+        "CREATE TABLE decimal_metrics (v DECIMAL(10,2)) WITH (adopt_parquets_at = '{}')",
         dir.path().to_str().unwrap()
     ))
     .await
@@ -423,7 +423,7 @@ async fn group_by_decimal_key(#[future] conn: Conn) {
     let x: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2, 3]));
     let dir = write_parquet(&RecordBatch::try_new(schema, vec![g, x]).unwrap());
     conn.simple_query(&format!(
-        "CREATE TABLE decimal_groups (g DECIMAL(4,1), x BIGINT) WITH (path = '{}')",
+        "CREATE TABLE decimal_groups (g DECIMAL(4,1), x BIGINT) WITH (adopt_parquets_at = '{}')",
         dir.path().to_str().unwrap()
     ))
     .await
@@ -496,19 +496,16 @@ async fn query_against_unknown_table_errors(#[future] conn: Conn) {
     );
 }
 
-/// Create `table` over `dir` and fill it with `docs`, one document per row.
+/// Create `table` and fill it with `docs`, one document per row.
 ///
-/// The rows go in through the server, so the files under `dir` are what our own
-/// write path produces: the column is annotated VARIANT in the footer and its
-/// shredding is chosen from the documents, which is what a table reading them
-/// back needs. A plain Arrow writer cannot stand in here.
-async fn write_shredded_variant(conn: &Conn, table: &str, dir: &Path, docs: &[String]) {
-    conn.simple_query(&format!(
-        "CREATE TABLE {table} (j VARIANT) WITH (path = '{}')",
-        dir.to_str().unwrap()
-    ))
-    .await
-    .unwrap();
+/// The rows go in through the server, so the files in the table's directory are
+/// what our own write path produces: the column is annotated VARIANT in the
+/// footer and its shredding is chosen from the documents, which is what a table
+/// reading them back needs. A plain Arrow writer cannot stand in here.
+async fn write_shredded_variant(conn: &Conn, table: &str, docs: &[String]) {
+    conn.simple_query(&format!("CREATE TABLE {table} (j VARIANT)"))
+        .await
+        .unwrap();
     let values: Vec<String> = docs
         .iter()
         .map(|doc| format!("('{}')", doc.replace('\'', "''")))
@@ -561,15 +558,10 @@ fn mixed_documents() -> Vec<String> {
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
 async fn insert_from_a_shredded_variant_reassembles_and_reshreds(#[future] conn: Conn) {
-    let source = TempDir::new().unwrap();
-    write_shredded_variant(&conn, "variant_source", source.path(), &mixed_documents()).await;
-    let destination = TempDir::new().unwrap();
-    conn.simple_query(&format!(
-        "CREATE TABLE variant_copy (n BIGINT, j VARIANT) WITH (path = '{}')",
-        destination.path().to_str().unwrap()
-    ))
-    .await
-    .unwrap();
+    write_shredded_variant(&conn, "variant_source", &mixed_documents()).await;
+    conn.simple_query("CREATE TABLE variant_copy (n BIGINT, j VARIANT)")
+        .await
+        .unwrap();
 
     // The computed `1` matters: a select list of nothing but column references
     // is copied through with its fields intact, while one that computes anything
@@ -605,7 +597,7 @@ async fn insert_from_a_shredded_variant_reassembles_and_reshreds(#[future] conn:
     assert_eq!(total, vec![vec![Some("3160".into())]], "0..80 summed");
 
     assert!(
-        !shredded_leaves(destination.path()).is_empty(),
+        !shredded_leaves(&table_dir("variant_copy")).is_empty(),
         "the copy shreds for itself; an unshredded write would answer the same \
          queries while storing every document opaque"
     );
@@ -618,8 +610,7 @@ async fn insert_from_a_shredded_variant_reassembles_and_reshreds(#[future] conn:
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
 async fn dot_access_pushed_into_the_scan_reads_the_same_values(#[future] conn: Conn) {
-    let dir = TempDir::new().unwrap();
-    write_shredded_variant(&conn, "variant_dot", dir.path(), &mixed_documents()).await;
+    write_shredded_variant(&conn, "variant_dot", &mixed_documents()).await;
 
     let pushed = select_rows(
         &conn,
@@ -732,7 +723,7 @@ async fn table_in_a_created_schema_is_queryable(#[future] conn: Conn) {
     conn.simple_query("CREATE SCHEMA analytics").await.unwrap();
 
     conn.simple_query(&format!(
-        "CREATE TABLE analytics.people (id BIGINT, name VARCHAR) WITH (path = '{path}')"
+        "CREATE TABLE analytics.people (id BIGINT, name VARCHAR) WITH (adopt_parquets_at = '{path}')"
     ))
     .await
     .unwrap();
@@ -752,7 +743,7 @@ async fn insert_into_a_schema_qualified_table(#[future] conn: Conn) {
     let path = dir.path().to_str().unwrap();
     conn.simple_query("CREATE SCHEMA staffing").await.unwrap();
     conn.simple_query(&format!(
-        "CREATE TABLE staffing.people (id BIGINT, name VARCHAR) WITH (path = '{path}')"
+        "CREATE TABLE staffing.people (id BIGINT, name VARCHAR) WITH (adopt_parquets_at = '{path}')"
     ))
     .await
     .unwrap();
@@ -781,7 +772,7 @@ async fn a_schema_qualifies_a_table_name(#[future] conn: Conn) {
     let path = dir.path().to_str().unwrap();
     conn.simple_query("CREATE SCHEMA reporting").await.unwrap();
     conn.simple_query(&format!(
-        "CREATE TABLE reporting.staff (id BIGINT, name VARCHAR) WITH (path = '{path}')"
+        "CREATE TABLE reporting.staff (id BIGINT, name VARCHAR) WITH (adopt_parquets_at = '{path}')"
     ))
     .await
     .unwrap();
@@ -856,23 +847,20 @@ fn live_log_files(dir: &std::path::Path) -> std::collections::HashSet<String> {
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
 async fn compact_final_merges_small_insert_files(#[future] conn: Conn) {
-    let dir = tempfile::tempdir().unwrap();
-    conn.simple_query(&format!(
-        "CREATE TABLE compact_me (id BIGINT) WITH (path = '{}')",
-        dir.path().to_str().unwrap()
-    ))
-    .await
-    .unwrap();
+    conn.simple_query("CREATE TABLE compact_me (id BIGINT)")
+        .await
+        .unwrap();
     for i in 0..5 {
         conn.simple_query(&format!("INSERT INTO compact_me VALUES ({i})"))
             .await
             .unwrap();
     }
-    assert_eq!(live_log_files(dir.path()).len(), 5);
+    let dir = table_dir("compact_me");
+    assert_eq!(live_log_files(&dir).len(), 5);
 
     conn.simple_query("COMPACT compact_me FINAL").await.unwrap();
 
-    assert_eq!(live_log_files(dir.path()).len(), 1);
+    assert_eq!(live_log_files(&dir).len(), 1);
     let rows = select_rows(&conn, "SELECT COUNT(*), SUM(id) FROM compact_me").await;
     assert_eq!(rows, vec![vec![Some("5".into()), Some("10".into())]]);
 }
@@ -891,13 +879,9 @@ async fn compact_of_a_missing_table_errors(#[future] conn: Conn) {
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
 async fn compact_accepts_a_fully_qualified_table_name(#[future] conn: Conn) {
-    let dir = tempfile::tempdir().unwrap();
-    conn.simple_query(&format!(
-        "CREATE TABLE compact_qualified (id BIGINT) WITH (path = '{}')",
-        dir.path().to_str().unwrap()
-    ))
-    .await
-    .unwrap();
+    conn.simple_query("CREATE TABLE compact_qualified (id BIGINT)")
+        .await
+        .unwrap();
     for i in 0..4 {
         conn.simple_query(&format!("INSERT INTO compact_qualified VALUES ({i})"))
             .await
@@ -910,7 +894,7 @@ async fn compact_accepts_a_fully_qualified_table_name(#[future] conn: Conn) {
         .await
         .unwrap();
 
-    assert_eq!(live_log_files(dir.path()).len(), 1);
+    assert_eq!(live_log_files(&table_dir("compact_qualified")).len(), 1);
     let rows = select_rows(&conn, "SELECT COUNT(*) FROM compact_qualified").await;
     assert_eq!(rows, vec![vec![Some("4".into())]]);
 }

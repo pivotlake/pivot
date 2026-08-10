@@ -468,10 +468,39 @@ impl CatalogTable {
     }
 
     /// Delete a data file (a compaction input swapped out of the manifest).
-    /// `path` resolves against the table's location like any [`FileRef`] path.
+    /// `path` resolves against the table's location like any [`FileRef`] path,
+    /// and must land inside it: that directory is the only storage the table
+    /// owns.
+    ///
+    /// A file the table *adopted* (`adopt_parquets_at`) lives wherever its owner
+    /// put it, so it is never the table's to delete: compaction may copy its rows
+    /// into the table's own storage and drop it from the log, but the object
+    /// itself stays. The test is where the file lands rather than how the path is
+    /// spelled, so a path that names the table's own directory outright is still
+    /// the table's to delete.
     pub fn delete_data_file(&self, path: &ObjectPath) -> crate::Result<()> {
-        self.store.delete(&self.location.resolve(path))?;
+        let resolved = self.location.resolve(path);
+        if !self.is_in_own_storage(&resolved)? {
+            return Err(crate::Error::DeletingOutsideStorage {
+                location: self.location.as_str().to_string(),
+                file: path.as_str().to_string(),
+            });
+        }
+        self.store.delete(&resolved)?;
         Ok(())
+    }
+
+    /// Whether `key` names an object under the table's own location. Both sides
+    /// are taken to their store-root-absolute form first, so a key that resolves
+    /// into the table's directory counts however it was written.
+    fn is_in_own_storage(&self, key: &ObjectPath) -> crate::Result<bool> {
+        let owned = self.store.absolute_key(&self.location)?;
+        let owned = format!("{}/", owned.as_str().trim_end_matches('/'));
+        Ok(self
+            .store
+            .absolute_key(key)?
+            .as_str()
+            .starts_with(owned.as_str()))
     }
 
     /// How long a file this table no longer references is kept before vacuum may

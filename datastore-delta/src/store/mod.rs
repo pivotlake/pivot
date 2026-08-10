@@ -231,6 +231,13 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// a table root before writing its log — fails if the directory is missing.
     fn create_dir(&self, prefix: &ObjectPath) -> Result<()>;
 
+    /// The same object addressed from the store's own root (the filesystem
+    /// root, or the bucket root) instead of from the database root, as an
+    /// [absolute](ObjectPath::is_absolute) key. A reference recorded this way
+    /// resolves the same from anywhere in the store, which is how a table names
+    /// a data file that sits outside its own location.
+    fn absolute_key(&self, key: &ObjectPath) -> Result<ObjectPath>;
+
     /// A human-readable description of where this store is rooted - e.g.
     /// `file:///var/lib/pivot`, `s3://bucket/prefix`, or `gs://bucket/prefix`.
     /// Purely for diagnostics and introspection (a dashboard showing whether a
@@ -321,9 +328,33 @@ pub(crate) fn parse_iso8601_millis(s: &str) -> Option<u64> {
     u64::try_from(nanos / 1_000_000).ok()
 }
 
+/// The bucket-root-absolute form of a store key, for a backend whose keys live
+/// under an in-bucket `prefix`: the object's own name in the bucket, marked
+/// absolute so reading it back does not put the database's prefix in front of it
+/// a second time. Shared by every bucket backend so they all spell the key the
+/// same way.
+pub(crate) fn absolute_object_key(prefix: &str, key: &ObjectPath) -> ObjectPath {
+    ObjectPath::new(format!("/{}", object_key(prefix, key)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absolute_object_key_is_the_in_bucket_name_from_the_bucket_root() {
+        // A key under the database's prefix keeps that prefix, addressed from
+        // the bucket root rather than from the database.
+        assert_eq!(
+            absolute_object_key("mydb", &ObjectPath::new("events/a.parquet")).as_str(),
+            "/mydb/events/a.parquet"
+        );
+        // One that already escapes the prefix is unchanged by the round trip.
+        assert_eq!(
+            absolute_object_key("mydb", &ObjectPath::new("/shared/a.parquet")).as_str(),
+            "/shared/a.parquet"
+        );
+    }
 
     #[test]
     fn object_key_relative_lives_under_prefix_absolute_at_bucket_root() {

@@ -113,4 +113,4 @@ CREATE TABLE hits (
     RefererHash BIGINT,
     URLHash BIGINT,
     CLID INTEGER
-) WITH (path = '{source}');
+) WITH (adopt_parquets_at = '{source}');
