@@ -1,8 +1,8 @@
 [package]
-name = "metastore-yaml"
+name = "metastore-disk"
 version.workspace = true
 edition.workspace = true
-description = "YAML-backed metastore provider for PivotDB."
+description = "Disk-backed metastore provider for PivotDB."
 
 [dependencies]
 metastore = { workspace = true }
@@ -13,3 +13,6 @@ dispatch = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 serde_yaml_ng = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

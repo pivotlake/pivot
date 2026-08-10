@@ -40,6 +40,7 @@ server:
   bind: 0.0.0.0:5432        # default 127.0.0.1:5432
   memory: 32g               # default: 80% of total RAM (see PIVOT_MEMORY_PCT)
   workers: 16               # default: number of cores
+  refresh_interval: 30s     # default 30s
   http_bind: 127.0.0.1:8081 # serve the web dashboard; omitted means no dashboard
   disk_cache:               # cache S3 reads on local disk; omitted means no cache
     dir: /var/cache/pivot   # required once the section is present
@@ -47,14 +48,13 @@ server:
     max_objects: 65536      # default; one open file descriptor per cached object
 
 metastore:
-  refresh_interval: 30s     # default 30s
   datastores: ...
   users: ...
 ```
 
 ### Datastores
 
-The YAML provider lives in the separate `metastore-yaml` crate, which owns the
+The disk provider lives in the separate `metastore-disk` crate, which owns the
 `metastore` section. At least one datastore is always required, including when
 serving one local directory. Exactly one datastore must set `default = true`; it
 becomes the current database (the target of unqualified table names). Every
@@ -94,8 +94,9 @@ Start the server with:
 pivotdb-server --config pivot.yaml
 ```
 
-`refresh_interval` sets how often the background refresh brings the in-memory
-table set up to date with the store: new Delta versions, new files' footers, and
+The `server` section's `refresh_interval` sets how often the background refresh
+brings the in-memory table set up to date with the store: new Delta versions,
+new files' footers, and
 tables committed by other processes. It bounds how stale a query's view of
 externally committed data can be; this process's own INSERT and compaction
 publish their commits immediately.
@@ -134,9 +135,10 @@ performs no identity proof: anyone who supplies `pivot` as the user name is
 accepted. Variant-specific fields are enforced, so trust cannot contain a
 verifier and SCRAM cannot omit one.
 
-A config file with no users (an omitted or empty `users` section) receives one
-built-in trusted user named `pivot`. Defining any users replaces that default
-with the configured allowlist.
+A user named `pivot` is always served, whatever else the `users` section
+defines, so a server is always reachable. It is trusted unless `pivot` is
+defined explicitly, which takes over its authentication method entirely: give it
+a `scram-sha-256` verifier to require a password of it.
 
 Logging is controlled by `RUST_LOG` (defaults to `info`):
 

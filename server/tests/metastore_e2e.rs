@@ -1,8 +1,8 @@
-//! End-to-end blackbox test of a multi-datastore server: a config file's
-//! `metastore` section defines two local datastores (`default` and `warm`);
-//! each is attached to DuckDB as its own database, so a table created in one is
-//! queryable by its datastore name, and unqualified names resolve against
-//! `default`.
+//! End-to-end blackbox test of a multi-datastore server: two local datastores,
+//! `default` from the config file's `metastore` section and `warm` from the
+//! separate metastore file merged into it. Each is attached to DuckDB as its own
+//! database, so a table created in one is queryable by its datastore name, and
+//! unqualified names resolve against `default`.
 
 mod common;
 
@@ -15,7 +15,7 @@ use arrow_schema::{DataType, Field, Schema};
 use catalog::{DEFAULT_DATASTORE_NAME, PivotCatalog};
 use common::{CatalogFixture, connect_client, select_rows, start_server};
 use metastore::Metastore;
-use metastore_yaml::YamlMetastore;
+use metastore_disk::DiskMetastore;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -74,15 +74,22 @@ async fn queries_bind_tables_by_datastore_name() {
 
     let config_dir = TempDir::new().unwrap();
     let config_path = config_dir.path().join("pivot.yaml");
+    let metastore_path = config_dir.path().join("metastore.yaml");
     // A short refresh interval: an INSERT commits to the log and the refresh
     // brings the new rows into the live set, so the test observes them quickly.
     std::fs::write(
         &config_path,
         format!(
-            "metastore:\n  refresh_interval: 100ms\n  datastores:\n    default:\n      \
-             kind: delta\n      location: \"{}\"\n      default: true\n    warm:\n      \
-             kind: delta\n      location: \"{}\"\n",
+            "server:\n  refresh_interval: 100ms\nmetastore:\n  datastores:\n    default:\n      \
+             kind: delta\n      location: \"{}\"\n      default: true\n",
             default_dir.path().display(),
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        &metastore_path,
+        format!(
+            "datastores:\n  warm:\n    kind: delta\n    location: \"{}\"\n",
             warm_dir.path().display(),
         ),
     )
@@ -90,7 +97,12 @@ async fn queries_bind_tables_by_datastore_name() {
 
     let port = start_server(64, move |dispatch| {
         let config = Config::open(&config_path).unwrap();
-        let metastore = YamlMetastore::from_config(config.metastore).unwrap();
+        let metastore = DiskMetastore::open(
+            config.metastore,
+            Some(&metastore_path),
+            config.server.refresh_interval.as_duration(),
+        )
+        .unwrap();
         let datastores = metastore.open_datastores(dispatch.dispatcher()).unwrap();
         CatalogFixture::new(Arc::new(
             PivotCatalog::new(datastores, DEFAULT_DATASTORE_NAME.to_string()).unwrap(),

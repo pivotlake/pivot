@@ -43,12 +43,12 @@ pub enum Error {
     /// the success path too.
     #[error(transparent)]
     Config(#[from] Box<crate::config::Error>),
-    #[error("invalid `metastore` section of `{path}`: {source}")]
+    #[error("invalid metastore configuration for `{path}`: {source}")]
     Metastore {
         path: PathBuf,
         /// Boxed for the same reason as [`Config`](Self::Config).
         #[source]
-        source: Box<metastore_yaml::Error>,
+        source: Box<metastore_disk::Error>,
     },
     #[error("failed to open the datastores configured in `{path}`: {source}")]
     OpenDatastores {
