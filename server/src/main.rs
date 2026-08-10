@@ -7,13 +7,14 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use catalog::PivotCatalog;
 use clap::Parser;
 use dispatch::env::get_env_var_with_default;
 use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
 use metastore::Metastore;
-use metastore_yaml::{MetastoreConfig, YamlMetastore};
+use metastore_disk::{DiskMetastore, MetastoreConfig};
 use server::config::DiskCacheConfig;
 use server::{Config, Error, Server, raise_open_file_limit};
 use tracing::{error, info};
@@ -32,6 +33,15 @@ struct Args {
     /// current database (unqualified names resolve against it).
     #[arg(long, value_name = "FILE")]
     config: PathBuf,
+
+    /// A second YAML file holding datastores and users, written the same way as
+    /// the config file's `metastore` section but without the `metastore:` key
+    /// above them. Its entries are merged with that section, so a datastore or
+    /// a user may be defined in either file; a name defined in both stops
+    /// startup, as does a file that cannot be read. Omit to serve exactly what
+    /// the config file's `metastore` section defines.
+    #[arg(long, value_name = "FILE")]
+    metastore_file: Option<PathBuf>,
 }
 
 fn init_tracing() {
@@ -81,15 +91,24 @@ fn build_disk_cache(config: Option<DiskCacheConfig>) -> Option<Arc<dispatch::io:
     }
 }
 
-/// Build the process's one metastore from the config's `metastore` section. The
+/// Build the process's one metastore from the config's `metastore` section and
+/// the metastore file merged into it, if `--metastore-file` named one. The
 /// returned object is shared by catalog construction and every later login, so
 /// authentication always reaches the same live source rather than a startup copy
 /// of its users.
-fn build_metastore(config: MetastoreConfig, path: &Path) -> Result<Arc<dyn Metastore>, Error> {
-    let metastore = YamlMetastore::from_config(config).map_err(|source| Error::Metastore {
-        path: path.to_path_buf(),
-        source: Box::new(source),
-    })?;
+fn build_metastore(
+    config: MetastoreConfig,
+    path: &Path,
+    metastore_file: Option<&Path>,
+    refresh_interval: Duration,
+) -> Result<Arc<dyn Metastore>, Error> {
+    let metastore =
+        DiskMetastore::open(config, metastore_file, refresh_interval).map_err(|source| {
+            Error::Metastore {
+                path: path.to_path_buf(),
+                source: Box::new(source),
+            }
+        })?;
     Ok(Arc::new(metastore))
 }
 
@@ -146,7 +165,12 @@ fn run() -> Result<(), Error> {
         .build()?;
 
     rt.block_on(async move {
-        let metastore = build_metastore(config.metastore, &args.config)?;
+        let metastore = build_metastore(
+            config.metastore,
+            &args.config,
+            args.metastore_file.as_deref(),
+            server_config.refresh_interval.as_duration(),
+        )?;
         let catalog = build_catalog(&args.config, metastore.as_ref(), dispatch.dispatcher())?;
 
         let mut server = Server::new(server_config.bind, dispatch, catalog, metastore);

@@ -8,7 +8,7 @@ members = [
     "dispatch",
     "duckdb-planner",
     "metastore",
-    "metastore-yaml",
+    "metastore-disk",
     "planner",
     "server",
     "thriftparquet",
@@ -29,7 +29,7 @@ datastore-delta = { path = "datastore-delta" }
 dispatch = { path = "dispatch" }
 duckdb-planner = { path = "duckdb-planner" }
 metastore = { path = "metastore" }
-metastore-yaml = { path = "metastore-yaml" }
+metastore-disk = { path = "metastore-disk" }
 planner = { path = "planner" }
 server = { path = "server" }
 thriftparquet = { path = "thriftparquet" }

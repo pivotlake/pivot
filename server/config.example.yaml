@@ -13,6 +13,11 @@ server:
   # Dispatch worker threads. Defaults to the machine's core count.
   # workers: 16
 
+  # How often the background refresh brings the in-memory table set up to date
+  # with the store. This bounds how stale a query's view of data committed by
+  # other processes can be. Defaults to 30s.
+  refresh_interval: 30s
+
   # Also serve the bundled web dashboard on this address. Omitted means no
   # dashboard.
   # http_bind: 127.0.0.1:8081
@@ -25,11 +30,6 @@ server:
   #   max_objects: 65536   # one open file descriptor per cached object
 
 metastore:
-  # How often the background refresh brings the in-memory table set up to date
-  # with the store. This bounds how stale a query's view of data committed by
-  # other processes can be. Defaults to 30s.
-  refresh_interval: 30s
-
   # Exactly one datastore must set `default: true`. It is the current database, so
   # unqualified names such as `main.events` resolve against it.
   datastores:
@@ -63,9 +63,10 @@ metastore:
       location: gs://example-bucket/cold/
       # credentials_file: /etc/pivot/gcs-key.json
 
-  # Users are an allowlist. The built-in configuration provides `pivot` without a
-  # password so a fresh server remains easy to connect to. Trust proves no
-  # identity: anyone using this name is accepted.
+  # `pivot` is served whatever this section says, so a server is always
+  # reachable. It is trusted unless defined here, as it is below: trust proves no
+  # identity (anyone using the name is accepted), so give it a `scram-sha-256`
+  # verifier instead to require a password of it.
   users:
     pivot:
       auth:

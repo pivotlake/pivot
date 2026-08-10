@@ -9,7 +9,7 @@ planner = { workspace = true }
 catalog = { workspace = true }
 datastore-delta = { workspace = true }
 metastore = { workspace = true }
-metastore-yaml = { workspace = true }
+metastore-disk = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow = { workspace = true }
