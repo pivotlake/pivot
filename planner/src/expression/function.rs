@@ -138,6 +138,31 @@ impl Function {
             Function::VariantGet(v) => visit(&v.input),
         }
     }
+
+    /// Every child expression of this function mutably, in argument order.
+    /// The mutable companion of [`for_each_argument`](Self::for_each_argument)
+    /// (mirroring `AggregateFunc::arguments_mut`), with the same
+    /// exhaustive-match contract.
+    pub fn arguments_mut(&mut self) -> Vec<&mut Expression> {
+        match self {
+            Function::Contains(c) => vec![&mut c.needle, &mut c.haystack],
+            Function::Prefix(p) => vec![&mut p.haystack, &mut p.prefix],
+            Function::Like(l) => vec![&mut l.input],
+            Function::Arithmetic(a) => vec![&mut a.left, &mut a.right],
+            Function::Length(l) => vec![&mut l.input],
+            Function::RegexpReplace(r) => vec![&mut r.input],
+            // The pattern is a plan-time constant, not a child expression.
+            Function::RegexpFullMatch(r) => vec![&mut r.input],
+            Function::RegexpJitReplace(r) => vec![&mut r.input],
+            Function::Divide(d) => vec![&mut d.left, &mut d.right],
+            Function::DateTrunc(d) => vec![&mut d.source],
+            Function::DatePart(d) => vec![&mut d.source],
+            Function::IntervalArithmetic(i) => vec![&mut i.operand],
+            Function::TemporalConvert(t) => vec![&mut t.source],
+            Function::DropCache | Function::Now => Vec::new(),
+            Function::VariantGet(v) => vec![&mut v.input],
+        }
+    }
 }
 
 impl Display for Function {

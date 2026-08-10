@@ -50,6 +50,20 @@ impl BoundLogicalType {
         BoundLogicalType { id, extra }
     }
 
+    /// Encode into the flat FFI type struct, the inverse of `from_bridge`:
+    /// every parameter field is written flat, zeroed when the id has none.
+    pub(crate) fn to_bridge(&self) -> ffi::BridgeLogicalType {
+        let (decimal_width, decimal_scale) = match self.extra {
+            ExtraTypeInfo::Decimal { width, scale } => (width, scale),
+            ExtraTypeInfo::None => (0, 0),
+        };
+        ffi::BridgeLogicalType {
+            id: self.id.clone() as u8,
+            decimal_width,
+            decimal_scale,
+        }
+    }
+
     /// Encode into the flat FFI column descriptor the DuckDB catalog glue
     /// consumes, the inverse of `from_bridge`: every parameter field is
     /// written flat, zeroed when the id has none.

@@ -3,6 +3,7 @@
 #include "duckdb.hpp"
 #include "duckdb/planner/table_filter_set.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/expression/bound_parameter_data.hpp"
 #include <memory>
 #include <vector>
 
@@ -66,9 +67,44 @@ struct ExpressionList {
 	std::vector<duckdb::unique_ptr<duckdb::Expression>> exprs;
 };
 
+// Prepared-statement parameter values, keyed by the positional identifier
+// (`"1"` for `$1`), handed to the binder so each occurrence binds as a
+// constant. Built value by value through the `param_list_push_*` functions.
+struct ParamValueList {
+	duckdb::case_insensitive_map_t<duckdb::BoundParameterData> values;
+};
+
 std::unique_ptr<DuckPlannerContext> new_context(rust::Box<CatalogContext> catalog);
 ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
                                const TransactionContext &transaction);
+ExtractPlanResult extract_plan_prepare(DuckPlannerContext &ctx, rust::Str query,
+                                       const TransactionContext &transaction);
+ExtractPlanResult extract_plan_with_values(DuckPlannerContext &ctx, rust::Str query,
+                                           const TransactionContext &transaction,
+                                           const ParamValueList &params);
+
+// ---- ParamValueList construction ----
+std::unique_ptr<ParamValueList> param_list_new();
+void param_list_push_bool(ParamValueList &list, uint32_t index, bool v);
+void param_list_push_i8(ParamValueList &list, uint32_t index, int8_t v);
+void param_list_push_i16(ParamValueList &list, uint32_t index, int16_t v);
+void param_list_push_i32(ParamValueList &list, uint32_t index, int32_t v);
+void param_list_push_i64(ParamValueList &list, uint32_t index, int64_t v);
+void param_list_push_u8(ParamValueList &list, uint32_t index, uint8_t v);
+void param_list_push_u16(ParamValueList &list, uint32_t index, uint16_t v);
+void param_list_push_u32(ParamValueList &list, uint32_t index, uint32_t v);
+void param_list_push_u64(ParamValueList &list, uint32_t index, uint64_t v);
+void param_list_push_hugeint(ParamValueList &list, uint32_t index, int64_t hi, uint64_t lo);
+void param_list_push_f32(ParamValueList &list, uint32_t index, float v);
+void param_list_push_f64(ParamValueList &list, uint32_t index, double v);
+void param_list_push_decimal(ParamValueList &list, uint32_t index, int64_t hi, uint64_t lo,
+                             uint8_t width, uint8_t scale);
+void param_list_push_string(ParamValueList &list, uint32_t index, rust::Str v);
+void param_list_push_date(ParamValueList &list, uint32_t index, int32_t days);
+void param_list_push_timestamp(ParamValueList &list, uint32_t index, int64_t micros);
+void param_list_push_interval(ParamValueList &list, uint32_t index, int32_t months, int32_t days,
+                              int64_t micros);
+void param_list_push_null(ParamValueList &list, uint32_t index, BridgeLogicalType ty);
 
 const LogicalOperator &plan_root(const PlanHandle &plan);
 size_t rowid_column_id();
@@ -212,6 +248,8 @@ bool expr_has_alias(const Expression &expr);
 rust::String expr_alias(const Expression &expr);
 
 const Value &expr_constant(const Expression &expr);
+
+rust::String expr_parameter_identifier(const Expression &expr);
 
 BridgeLogicalType value_type(const Value &v);
 bool value_is_null(const Value &v);

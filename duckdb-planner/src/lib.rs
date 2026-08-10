@@ -78,6 +78,27 @@ pub use duckdb_bridge::ffi::DuckDBColumn;
 pub use handle::{BridgeError, Expr, LogicalOp, Plan};
 pub use types::{BoundLogicalType, ExtraTypeInfo, ScalarValue};
 
+/// The outcome of planning a statement in prepare mode
+/// ([`PlannerContext::plan_prepare`]): the parameter and result shapes a wire
+/// protocol describes to the client, plus the plan itself when it is worth
+/// reusing across executions.
+///
+/// A parameterized statement that reads a table carries no plan: a placeholder
+/// blocks the scan pushdown a constant unlocks, so each execution replans with
+/// its values through [`PlannerContext::plan_with_values`] instead.
+pub struct PreparedPlanning {
+    pub plan: Option<Plan>,
+    /// The inferred types of the statement's parameters, ordered `$1..$n`.
+    pub param_types: Vec<BoundLogicalType>,
+    /// The binder-resolved result column names, in output order.
+    pub output_names: Vec<String>,
+    /// The binder-resolved result column types, parallel to `output_names`.
+    pub output_types: Vec<BoundLogicalType>,
+    /// Whether executing the statement produces a result set (a SELECT)
+    /// rather than a command tag (an INSERT).
+    pub returns_rows: bool,
+}
+
 /// Top-level error type for the planner.
 #[derive(Error, Debug)]
 pub enum Error {
@@ -186,4 +207,128 @@ impl PlannerContext {
         } = result;
         Ok(Plan::new(plan, output_names))
     }
+
+    /// Plan a SQL statement with prepared-statement parameters allowed: each
+    /// `$n` binds as a typed placeholder that stays in the plan. See
+    /// [`PreparedPlanning`] for what comes back and when the plan is withheld.
+    pub fn plan_prepare(
+        &mut self,
+        query: &str,
+        transaction: Arc<dyn DuckDBTransaction>,
+    ) -> Result<PreparedPlanning, Error> {
+        let transaction_ctx = catalog_provider::TransactionContext::new(transaction);
+        let result =
+            ffi::extract_plan_prepare(self.cxx_context.pin_mut(), query, &transaction_ctx)?;
+        if !result.error_kind.is_empty() {
+            return Err(bridge_error(&result));
+        }
+
+        let ffi::ExtractPlanResult {
+            plan,
+            output_names,
+            output_types,
+            param_types,
+            returns_rows,
+            ..
+        } = result;
+        Ok(PreparedPlanning {
+            plan: (!plan.is_null()).then(|| Plan::new(plan, output_names.clone())),
+            param_types: param_types
+                .into_iter()
+                .map(BoundLogicalType::from_bridge)
+                .collect(),
+            output_names,
+            output_types: output_types
+                .into_iter()
+                .map(BoundLogicalType::from_bridge)
+                .collect(),
+            returns_rows,
+        })
+    }
+
+    /// Plan a SQL statement with the given parameter values bound as
+    /// constants, ordered `$1..$n`, so the plan is fully optimized for exactly
+    /// these values.
+    pub fn plan_with_values(
+        &mut self,
+        query: &str,
+        transaction: Arc<dyn DuckDBTransaction>,
+        values: &[ScalarValue],
+    ) -> Result<Plan, Error> {
+        let mut params = ffi::param_list_new()?;
+        for (i, value) in values.iter().enumerate() {
+            let index = u32::try_from(i + 1).map_err(|_| {
+                Error::Bridge(format!("too many prepared-statement parameters: {}", i + 1))
+            })?;
+            push_param_value(params.pin_mut(), index, value)?;
+        }
+
+        let transaction_ctx = catalog_provider::TransactionContext::new(transaction);
+        let result = ffi::extract_plan_with_values(
+            self.cxx_context.pin_mut(),
+            query,
+            &transaction_ctx,
+            &params,
+        )?;
+        if !result.error_kind.is_empty() {
+            return Err(bridge_error(&result));
+        }
+
+        let ffi::ExtractPlanResult {
+            plan, output_names, ..
+        } = result;
+        Ok(Plan::new(plan, output_names))
+    }
+}
+
+/// Push one parameter value into the FFI list under its 1-based position,
+/// dispatching to the typed push function for the value's variant.
+fn push_param_value(
+    list: std::pin::Pin<&mut ffi::ParamValueList>,
+    index: u32,
+    value: &ScalarValue,
+) -> Result<(), Error> {
+    match value {
+        ScalarValue::Boolean(v) => ffi::param_list_push_bool(list, index, *v)?,
+        ScalarValue::Int8(v) => ffi::param_list_push_i8(list, index, *v)?,
+        ScalarValue::Int16(v) => ffi::param_list_push_i16(list, index, *v)?,
+        ScalarValue::Int32(v) => ffi::param_list_push_i32(list, index, *v)?,
+        ScalarValue::Int64(v) => ffi::param_list_push_i64(list, index, *v)?,
+        ScalarValue::UInt8(v) => ffi::param_list_push_u8(list, index, *v)?,
+        ScalarValue::UInt16(v) => ffi::param_list_push_u16(list, index, *v)?,
+        ScalarValue::UInt32(v) => ffi::param_list_push_u32(list, index, *v)?,
+        ScalarValue::UInt64(v) => ffi::param_list_push_u64(list, index, *v)?,
+        ScalarValue::Int128(v) => {
+            ffi::param_list_push_hugeint(list, index, (v >> 64) as i64, *v as u64)?
+        }
+        ScalarValue::Float32(v) => ffi::param_list_push_f32(list, index, *v)?,
+        ScalarValue::Float64(v) => ffi::param_list_push_f64(list, index, *v)?,
+        ScalarValue::Decimal {
+            value,
+            width,
+            scale,
+        } => ffi::param_list_push_decimal(
+            list,
+            index,
+            (value >> 64) as i64,
+            *value as u64,
+            *width,
+            *scale,
+        )?,
+        ScalarValue::Utf8(v) => ffi::param_list_push_string(list, index, v)?,
+        ScalarValue::Date(days) => ffi::param_list_push_date(list, index, *days)?,
+        ScalarValue::Timestamp(micros) => ffi::param_list_push_timestamp(list, index, *micros)?,
+        ScalarValue::Interval {
+            months,
+            days,
+            micros,
+        } => ffi::param_list_push_interval(list, index, *months, *days, *micros)?,
+        ScalarValue::Null(ty) => ffi::param_list_push_null(list, index, ty.to_bridge())?,
+        ScalarValue::Variant(_) | ScalarValue::Other(_) => {
+            return Err(Error::Bridge(format!(
+                "unsupported prepared-statement parameter value for ${index}: {value}"
+            )));
+        }
+    }
+    Ok(())
 }

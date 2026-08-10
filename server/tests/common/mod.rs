@@ -12,10 +12,15 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema};
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
 use datastore_delta::DeltaDatastore;
 use dispatch::{DataFlowDispatcher, Dispatch};
 use metastore::{DEFAULT_USER_NAME, Metastore, UserAuth};
+use parquet::arrow::ArrowWriter;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
 use rstest::fixture;
 use server::Server;
 use tempfile::TempDir;
@@ -255,4 +260,45 @@ pub async fn conn() -> Conn {
     let client = connect_client(server_port()).await;
     let _guard = lock_serial();
     Conn { client, _guard }
+}
+
+/// Write `batch` as a single parquet file inside a fresh tempdir and return
+/// the directory (kept alive by the caller; drop it to clean up).
+pub fn write_parquet(batch: &RecordBatch) -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("data.parquet");
+    // The dispatch reader assumes snappy-compressed pages; match that.
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+    let mut writer = ArrowWriter::try_new(
+        std::fs::File::create(&path).unwrap(),
+        batch.schema(),
+        Some(props),
+    )
+    .unwrap();
+    writer.write(batch).unwrap();
+    writer.close().unwrap();
+    dir
+}
+
+/// (id BIGINT, name VARCHAR) batch with three rows.
+pub fn people_batch() -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    let id: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2, 3]));
+    let name: ArrayRef = Arc::new(StringArray::from(vec!["alice", "bob", "carol"]));
+    RecordBatch::try_new(schema, vec![id, name]).unwrap()
+}
+
+pub async fn create_people_table(client: &Client, table: &str, dir: &std::path::Path) {
+    let path = dir.to_str().unwrap();
+    client
+        .simple_query(&format!(
+            "CREATE TABLE {table} (id BIGINT, name VARCHAR) WITH (with_pre_existing_parquets = '{path}')"
+        ))
+        .await
+        .unwrap();
 }

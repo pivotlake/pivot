@@ -27,6 +27,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_parameter_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
@@ -39,6 +40,7 @@
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/common/types/interval.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
+#include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
@@ -187,38 +189,120 @@ PlanHandle::~PlanHandle() {
 	}
 }
 
+static BridgeLogicalType bridge_logical_type(const duckdb::LogicalType &type);
+
+// How a statement's prepared-statement parameters are treated by `run_planner`.
+enum class PlanMode {
+	// Parameters are rejected: a `$n` placeholder is a planning error.
+	Statement,
+	// Parameters bind as typed placeholders that stay in the plan, and their
+	// inferred types are captured. A parameterized plan that reads a table is
+	// discarded (only the parameter/output shapes survive): each execution
+	// replans with its values instead, because a placeholder blocks the scan
+	// pushdown a constant unlocks (DuckDB's own prepared statements make the
+	// same trade, see `PreparedStatement::CanCachePlan`).
+	Prepare,
+	// The provided values bind as plain constants, so the plan is fully
+	// optimized for exactly these values.
+	BindValues,
+};
+
+// What `run_planner` extracted: the plan (null when `Prepare` discarded it)
+// plus the binder-resolved client-facing shapes captured before optimization.
+struct PlanExtraction {
+	duckdb::unique_ptr<duckdb::LogicalOperator> plan;
+	duckdb::vector<std::string> names;
+	duckdb::vector<duckdb::LogicalType> types;
+	duckdb::vector<duckdb::LogicalType> param_types;
+	bool returns_rows = false;
+};
+
 // Replicates `duckdb::ClientContext::ExtractPlan`, additionally returning the
-// binder-resolved result column names (in select order) via `result_names`.
-// The stock `ExtractPlan` computes those names on its local `Planner` and then
-// discards them when it returns only the plan; we reproduce its body here (the
-// binder/optimizer/resolver steps are all public API) so the names can be
-// captured without patching the bundled DuckDB.
-static duckdb::unique_ptr<duckdb::LogicalOperator>
-extract_plan_with_names(duckdb::Connection &con, const std::string &query,
-                        duckdb::vector<std::string> &result_names) {
+// binder-resolved result column names and types (in select order). The stock
+// `ExtractPlan` computes those on its local `Planner` and then discards them
+// when it returns only the plan; we reproduce its body here (the
+// binder/optimizer/resolver steps are all public API) so they can be captured
+// without patching the bundled DuckDB.
+static PlanExtraction run_planner(duckdb::Connection &con, const std::string &query, PlanMode mode,
+                                  const ParamValueList *params) {
 	auto statements = con.ExtractStatements(query);
 	if (statements.size() != 1) {
 		throw duckdb::InvalidInputException("ExtractPlan can only prepare a single statement");
 	}
 	auto &context = *con.context;
-	duckdb::unique_ptr<duckdb::LogicalOperator> plan;
+	PlanExtraction out;
 	context.RunFunctionInTransaction([&]() {
 		duckdb::Planner planner(context);
+		if (mode == PlanMode::BindValues) {
+			// Pre-supplied values make the binder emit each `$n` occurrence as
+			// a constant (see `ExpressionBinder::BindExpression` on
+			// `ParameterExpression`), so no placeholder reaches the plan.
+			planner.parameter_data = params->values;
+		}
 		planner.CreatePlan(std::move(statements[0]));
-		// The binder resolves the client-facing result column names before
-		// optimization rewrites the plan; capture them while still intact.
-		result_names = planner.names;
-		plan = std::move(planner.plan);
+		// The binder resolves the client-facing result column names and types
+		// before optimization rewrites the plan; capture them while intact.
+		out.names = planner.names;
+		out.types = planner.types;
+		// Whether executing the statement produces a result set (a SELECT)
+		// rather than a command tag (an INSERT), which is what a wire
+		// protocol's statement Describe answers.
+		out.returns_rows =
+		    planner.properties.return_type == duckdb::StatementReturnType::QUERY_RESULT;
+
+		auto parameter_count = planner.properties.parameter_count;
+		switch (mode) {
+		case PlanMode::Statement:
+			if (parameter_count > 0) {
+				throw duckdb::BinderException(
+				    "prepared-statement parameters require the extended query protocol");
+			}
+			break;
+		case PlanMode::BindValues:
+			if (params->values.size() != parameter_count) {
+				throw duckdb::BinderException(
+				    "statement takes %llu parameters but %llu were supplied",
+				    static_cast<unsigned long long>(parameter_count),
+				    static_cast<unsigned long long>(params->values.size()));
+			}
+			if (!planner.properties.bound_all_parameters) {
+				throw duckdb::BinderException(
+				    "could not resolve the prepared-statement parameters");
+			}
+			break;
+		case PlanMode::Prepare:
+			if (!planner.properties.bound_all_parameters) {
+				throw duckdb::BinderException(
+				    "could not infer the type of a prepared-statement parameter; "
+				    "add an explicit cast");
+			}
+			for (duckdb::idx_t i = 1; i <= parameter_count; i++) {
+				auto it = planner.value_map.find(std::to_string(i));
+				if (it == planner.value_map.end()) {
+					throw duckdb::BinderException(
+					    "prepared-statement parameters must be numbered $1..$n");
+				}
+				out.param_types.push_back(it->second->return_type);
+			}
+			// DuckDB's own reuse rule: a plan reading any table is not worth
+			// caching across executions with different parameter values.
+			if (parameter_count > 0 && !duckdb::PreparedStatement::CanCachePlan(*planner.plan)) {
+				return;
+			}
+			break;
+		}
+
+		out.plan = std::move(planner.plan);
 		if (context.config.enable_optimizer) {
 			duckdb::Optimizer optimizer(*planner.binder, context);
-			plan = optimizer.Optimize(std::move(plan));
+			out.plan = optimizer.Optimize(std::move(out.plan));
 		}
-		plan->ResolveOperatorTypes();
+		out.plan->ResolveOperatorTypes();
 		duckdb::ColumnBindingResolver resolver;
-		resolver.Verify(*plan);
-		resolver.VisitOperator(*plan);
+		resolver.Verify(*out.plan);
+		resolver.VisitOperator(*out.plan);
 	});
-	return plan;
+	return out;
 }
 
 // Publishes the pivot transaction for the duration of one plan: every table
@@ -237,10 +321,10 @@ struct CurrentTransactionScope {
 	}
 };
 
-ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
-                               const TransactionContext &transaction) {
-	duckdb::unique_ptr<duckdb::LogicalOperator> plan;
-	duckdb::vector<std::string> name_list;
+static ExtractPlanResult extract_plan_impl(DuckPlannerContext &ctx, rust::Str query,
+                                           const TransactionContext &transaction, PlanMode mode,
+                                           const ParamValueList *params) {
+	PlanExtraction extraction;
 	std::optional<ExtractPlanResult> error;
 	CurrentTransactionScope transaction_scope(PivotStorageInfo::Get(*ctx.db.instance), transaction);
 
@@ -248,13 +332,15 @@ ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
 		std::string query_str(query.data(), query.size());
 		// The result column names DuckDB would hand a client, in select order
 		// (e.g. `["hour", "count_star()"]` for `SELECT f(t) AS hour, COUNT(*)`).
-		plan = extract_plan_with_names(ctx.con, query_str, name_list);
-		// Rewrite DuckDB's column *bindings* (table_index, column_index) into
-		// positional BoundReference indices against each operator's actual child
-		// output. This is the standard resolution DuckDB runs before execution;
-		// the Rust walk then reads those positional indices directly.
-		duckdb::ColumnBindingResolver resolver;
-		resolver.VisitOperator(*plan);
+		extraction = run_planner(ctx.con, query_str, mode, params);
+		if (extraction.plan) {
+			// Rewrite DuckDB's column *bindings* (table_index, column_index) into
+			// positional BoundReference indices against each operator's actual child
+			// output. This is the standard resolution DuckDB runs before execution;
+			// the Rust walk then reads those positional indices directly.
+			duckdb::ColumnBindingResolver resolver;
+			resolver.VisitOperator(*extraction.plan);
+		}
 	} catch (duckdb::Exception &e) {
 		error = build_duckdb_error(e);
 	} catch (const UnsupportedPlanError &e) {
@@ -273,14 +359,147 @@ ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
 	}
 
 	ExtractPlanResult result;
-	auto handle = std::make_unique<PlanHandle>();
-	handle->root = std::move(plan);
-	handle->ctx = &ctx;
-	result.plan = std::move(handle);
-	for (auto &name : name_list) {
+	if (extraction.plan) {
+		auto handle = std::make_unique<PlanHandle>();
+		handle->root = std::move(extraction.plan);
+		handle->ctx = &ctx;
+		result.plan = std::move(handle);
+	} else {
+		// Prepare mode discarded the parameterized plan, so no PlanHandle will
+		// drop the per-plan catalog entries; free them now.
+		PivotStorageInfo::Get(*ctx.db.instance).ClearTableEntries();
+	}
+	for (auto &name : extraction.names) {
 		result.output_names.push_back(rust::String::lossy(name));
 	}
+	for (auto &type : extraction.types) {
+		result.output_types.push_back(bridge_logical_type(type));
+	}
+	for (auto &type : extraction.param_types) {
+		result.param_types.push_back(bridge_logical_type(type));
+	}
+	result.returns_rows = extraction.returns_rows;
 	return result;
+}
+
+ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
+                               const TransactionContext &transaction) {
+	return extract_plan_impl(ctx, query, transaction, PlanMode::Statement, nullptr);
+}
+
+ExtractPlanResult extract_plan_prepare(DuckPlannerContext &ctx, rust::Str query,
+                                       const TransactionContext &transaction) {
+	return extract_plan_impl(ctx, query, transaction, PlanMode::Prepare, nullptr);
+}
+
+ExtractPlanResult extract_plan_with_values(DuckPlannerContext &ctx, rust::Str query,
+                                           const TransactionContext &transaction,
+                                           const ParamValueList &params) {
+	return extract_plan_impl(ctx, query, transaction, PlanMode::BindValues, &params);
+}
+
+// ---- ParamValueList construction ----
+
+// Materialize the type behind a BridgeLogicalType. Most ids are complete types
+// on their own; DECIMAL is completed by its width and scale, and VARIANT
+// carries internal type structure, so it must be built through its factory.
+static duckdb::LogicalType logical_type_from_bridge(const BridgeLogicalType &ty) {
+	auto id = static_cast<duckdb::LogicalTypeId>(ty.id);
+	if (id == duckdb::LogicalTypeId::DECIMAL) {
+		return duckdb::LogicalType::DECIMAL(ty.decimal_width, ty.decimal_scale);
+	}
+	if (id == duckdb::LogicalTypeId::VARIANT) {
+		return duckdb::LogicalType::VARIANT();
+	}
+	return duckdb::LogicalType(id);
+}
+
+std::unique_ptr<ParamValueList> param_list_new() {
+	return std::make_unique<ParamValueList>();
+}
+
+static void param_list_push(ParamValueList &list, uint32_t index, duckdb::Value value) {
+	list.values.emplace(std::to_string(index), duckdb::BoundParameterData(std::move(value)));
+}
+
+void param_list_push_bool(ParamValueList &list, uint32_t index, bool v) {
+	param_list_push(list, index, duckdb::Value::BOOLEAN(v));
+}
+
+void param_list_push_i8(ParamValueList &list, uint32_t index, int8_t v) {
+	param_list_push(list, index, duckdb::Value::TINYINT(v));
+}
+
+void param_list_push_i16(ParamValueList &list, uint32_t index, int16_t v) {
+	param_list_push(list, index, duckdb::Value::SMALLINT(v));
+}
+
+void param_list_push_i32(ParamValueList &list, uint32_t index, int32_t v) {
+	param_list_push(list, index, duckdb::Value::INTEGER(v));
+}
+
+void param_list_push_i64(ParamValueList &list, uint32_t index, int64_t v) {
+	param_list_push(list, index, duckdb::Value::BIGINT(v));
+}
+
+void param_list_push_u8(ParamValueList &list, uint32_t index, uint8_t v) {
+	param_list_push(list, index, duckdb::Value::UTINYINT(v));
+}
+
+void param_list_push_u16(ParamValueList &list, uint32_t index, uint16_t v) {
+	param_list_push(list, index, duckdb::Value::USMALLINT(v));
+}
+
+void param_list_push_u32(ParamValueList &list, uint32_t index, uint32_t v) {
+	param_list_push(list, index, duckdb::Value::UINTEGER(v));
+}
+
+void param_list_push_u64(ParamValueList &list, uint32_t index, uint64_t v) {
+	param_list_push(list, index, duckdb::Value::UBIGINT(v));
+}
+
+void param_list_push_hugeint(ParamValueList &list, uint32_t index, int64_t hi, uint64_t lo) {
+	duckdb::hugeint_t value;
+	value.upper = hi;
+	value.lower = lo;
+	param_list_push(list, index, duckdb::Value::HUGEINT(value));
+}
+
+void param_list_push_f32(ParamValueList &list, uint32_t index, float v) {
+	param_list_push(list, index, duckdb::Value::FLOAT(v));
+}
+
+void param_list_push_f64(ParamValueList &list, uint32_t index, double v) {
+	param_list_push(list, index, duckdb::Value::DOUBLE(v));
+}
+
+void param_list_push_decimal(ParamValueList &list, uint32_t index, int64_t hi, uint64_t lo,
+                             uint8_t width, uint8_t scale) {
+	duckdb::hugeint_t value;
+	value.upper = hi;
+	value.lower = lo;
+	param_list_push(list, index, duckdb::Value::DECIMAL(value, width, scale));
+}
+
+void param_list_push_string(ParamValueList &list, uint32_t index, rust::Str v) {
+	param_list_push(list, index, duckdb::Value(std::string(v.data(), v.size())));
+}
+
+void param_list_push_date(ParamValueList &list, uint32_t index, int32_t days) {
+	param_list_push(list, index, duckdb::Value::DATE(duckdb::date_t(days)));
+}
+
+void param_list_push_timestamp(ParamValueList &list, uint32_t index, int64_t micros) {
+	param_list_push(list, index, duckdb::Value::TIMESTAMP(duckdb::timestamp_t(micros)));
+}
+
+void param_list_push_interval(ParamValueList &list, uint32_t index, int32_t months, int32_t days,
+                              int64_t micros) {
+	param_list_push(list, index, duckdb::Value::INTERVAL(months, days, micros));
+}
+
+void param_list_push_null(ParamValueList &list, uint32_t index, BridgeLogicalType ty) {
+	param_list_push(list, index, duckdb::Value(logical_type_from_bridge(ty)));
 }
 
 const LogicalOperator &plan_root(const PlanHandle &plan) {
@@ -962,6 +1181,10 @@ rust::String expr_alias(const Expression &expr) {
 
 const Value &expr_constant(const Expression &expr) {
 	return as_expr<duckdb::BoundConstantExpression>(expr).value;
+}
+
+rust::String expr_parameter_identifier(const Expression &expr) {
+	return rust::String::lossy(as_expr<duckdb::BoundParameterExpression>(expr).identifier);
 }
 
 // Typed accessors for a DuckDB `Value`, shared by query constants and

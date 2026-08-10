@@ -24,7 +24,8 @@ use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Conjunction,
     ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide, Error,
     Expression, Function, InList, IntervalArithmetic, IsNull, Length, Like, Not, NumericAggregate,
-    Prefix, Ref, RegexpFullMatch, RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
+    Parameter, Prefix, Ref, RegexpFullMatch, RegexpJitReplace, RegexpReplace, TemporalConvert,
+    VariantGet,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
 
@@ -38,7 +39,7 @@ impl Expression {
             DuckExpression::Ref(r) => Expression::Ref(Ref::from_handle(r)?),
             DuckExpression::Compare(c) => Expression::Compare(Compare::from_handle(c)?),
             DuckExpression::Between(b) => Expression::Between(Between::from_handle(b)?),
-            DuckExpression::Constant(c) => Expression::Constant(build_scalar_value(c.value()?)?),
+            DuckExpression::Constant(c) => Expression::Constant(build_scalar_value(&c.value()?)?),
             DuckExpression::AggregateFunc(a) => {
                 Expression::AggregateFunc(AggregateFunc::from_handle(a)?)
             }
@@ -52,6 +53,10 @@ impl Expression {
                 input: Box::new(Expression::from_handle(n.input()?)?),
             }),
             DuckExpression::Cast(c) => Cast::from_handle(c)?,
+            DuckExpression::Parameter(p) => Expression::Parameter(Parameter {
+                index: p.index()?,
+                return_type: type_from_logical(p.return_type()?)?,
+            }),
             DuckExpression::Unsupported(t) => return Err(Error::UnsupportedExpressionType(t)),
         })
     }

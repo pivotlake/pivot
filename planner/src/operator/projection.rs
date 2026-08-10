@@ -32,6 +32,7 @@ impl Projection {
     pub fn compile(
         &self,
         input: RecordBatchOperatorSpec,
+        parameters: &[arrow_array::Scalar<ArrayRef>],
     ) -> Result<RecordBatchOperatorSpec, Error> {
         // Fast path: every projection is a plain column reference, so we can
         // select columns zero-copy and preserve the input schema's fields. The
@@ -74,7 +75,7 @@ impl Projection {
         let builders: Arc<Vec<ExprFn>> = Arc::new(
             self.projections
                 .iter()
-                .map(|e| e.compile())
+                .map(|e| e.compile_with_parameters(parameters))
                 .collect::<Result<Vec<_>, _>>()?,
         );
 

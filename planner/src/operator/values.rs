@@ -25,6 +25,7 @@ impl Values {
     pub(crate) fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
+        parameters: &[arrow_array::Scalar<ArrayRef>],
     ) -> Result<RecordBatchOperatorSpec, Error> {
         // Compile on the coordinator so unsupported expressions fail before the
         // dataflow launches. The resulting builder closures are Sync and can be
@@ -34,7 +35,7 @@ impl Values {
             .iter()
             .map(|row| {
                 row.iter()
-                    .map(|expression| expression.compile().map(Arc::new))
+                    .map(|expression| expression.compile_with_parameters(parameters).map(Arc::new))
                     .collect()
             })
             .collect::<Result<_, _>>()?;

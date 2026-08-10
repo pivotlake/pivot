@@ -845,6 +845,7 @@ impl<'plan> Expr<'plan> {
             | T::COMPARE_GREATERTHANOREQUALTO => Expression::Compare(Compare { raw: self.raw }),
             T::COMPARE_BETWEEN => Expression::Between(Between { raw: self.raw }),
             T::VALUE_CONSTANT => Expression::Constant(Constant { raw: self.raw }),
+            T::VALUE_PARAMETER => Expression::Parameter(Parameter { raw: self.raw }),
             T::BOUND_AGGREGATE => Expression::AggregateFunc(AggregateFunc { raw: self.raw }),
             T::BOUND_FUNCTION => Expression::Function(Function { raw: self.raw }),
             T::COMPARE_IN => Expression::InList(InList { raw: self.raw }),
@@ -873,6 +874,9 @@ pub enum Expression<'plan> {
     Compare(Compare<'plan>),
     Between(Between<'plan>),
     Constant(Constant<'plan>),
+    /// A prepared-statement parameter placeholder (`$n`), present only in a
+    /// plan produced in prepare mode (`extract_plan_prepare`).
+    Parameter(Parameter<'plan>),
     /// An aggregate function call (`SUM`, `COUNT`, …).
     AggregateFunc(AggregateFunc<'plan>),
     /// A scalar function call (`BOUND_FUNCTION`).
@@ -901,6 +905,8 @@ define_handles! { ffi::Expression;
     Between,
     /// A constant value.
     Constant,
+    /// A prepared-statement parameter placeholder (`$n`).
+    Parameter,
     /// An aggregate function call.
     AggregateFunc,
     /// A scalar function call.
@@ -1004,6 +1010,24 @@ impl<'plan> Constant<'plan> {
     }
 
     /// The constant's logical type, without decoding its value.
+    pub fn return_type(self) -> Result<BoundLogicalType> {
+        Ok(bound_type_from(ffi::expr_return_type(self.raw)?))
+    }
+}
+
+impl<'plan> Parameter<'plan> {
+    /// The parameter's 1-based position: `$3` returns 3. Prepare mode only
+    /// accepts positional parameters, so the identifier is always numeric.
+    pub fn index(self) -> Result<usize> {
+        let identifier = ffi::expr_parameter_identifier(self.raw)?;
+        identifier.parse().map_err(|_| {
+            BridgeError(format!(
+                "prepared-statement parameter ${identifier} is not positional"
+            ))
+        })
+    }
+
+    /// The type the binder inferred for the parameter.
     pub fn return_type(self) -> Result<BoundLogicalType> {
         Ok(bound_type_from(ffi::expr_return_type(self.raw)?))
     }

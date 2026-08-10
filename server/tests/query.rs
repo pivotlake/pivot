@@ -13,15 +13,14 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
-use common::{Conn, conn, connect_client, server_port, table_dir};
-use parquet::arrow::ArrowWriter;
+use common::{
+    Conn, conn, connect_client, create_people_table, people_batch, server_port, table_dir,
+    write_parquet,
+};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
 use rstest::rstest;
-use tempfile::TempDir;
 use tokio_postgres::{Client, SimpleQueryMessage};
 
 /// Run `sql` and decode every `DataRow` in the response into
@@ -48,43 +47,6 @@ fn extract_db_error_message(error: &tokio_postgres::Error) -> String {
     error
         .as_db_error()
         .map_or_else(|| error.to_string(), |db| db.message().to_string())
-}
-
-/// Write `batch` as a single parquet file inside a fresh tempdir and return
-/// the directory (kept alive by the caller — drop it to clean up).
-fn write_parquet(batch: &RecordBatch) -> TempDir {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("data.parquet");
-    // The dispatch reader assumes snappy-compressed pages — match that.
-    let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .build();
-    let mut writer =
-        ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), Some(props)).unwrap();
-    writer.write(batch).unwrap();
-    writer.close().unwrap();
-    dir
-}
-
-/// (id BIGINT, name VARCHAR) batch with three rows.
-fn people_batch() -> RecordBatch {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("name", DataType::Utf8, false),
-    ]));
-    let id: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2, 3]));
-    let name: ArrayRef = Arc::new(StringArray::from(vec!["alice", "bob", "carol"]));
-    RecordBatch::try_new(schema, vec![id, name]).unwrap()
-}
-
-async fn create_people_table(client: &Client, table: &str, dir: &Path) {
-    let path = dir.to_str().unwrap();
-    client
-        .simple_query(&format!(
-            "CREATE TABLE {table} (id BIGINT, name VARCHAR) WITH (with_pre_existing_parquets = '{path}')"
-        ))
-        .await
-        .unwrap();
 }
 
 #[rstest]

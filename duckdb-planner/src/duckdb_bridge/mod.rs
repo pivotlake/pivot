@@ -115,6 +115,15 @@ pub mod ffi {
         /// in select order (e.g. `["hour", "count_star()"]`). Empty when the
         /// bridge could not recover them.
         pub output_names: Vec<String>,
+        /// The binder-resolved result column types, parallel to `output_names`.
+        pub output_types: Vec<BridgeLogicalType>,
+        /// The inferred types of the statement's prepared-statement parameters,
+        /// ordered `$1..$n`. Filled by `extract_plan_prepare` only.
+        pub param_types: Vec<BridgeLogicalType>,
+        /// Whether executing the statement produces a result set (a SELECT)
+        /// rather than a command tag (an INSERT), which is what a wire
+        /// protocol's statement Describe answers.
+        pub returns_rows: bool,
     }
 
     extern "Rust" {
@@ -173,6 +182,10 @@ pub mod ffi {
         /// Opaque; read via the `value_*` accessors after `value_type`
         /// and `value_is_null`.
         type Value;
+        /// Prepared-statement parameter values keyed by 1-based position,
+        /// built through the `param_list_push_*` functions and handed to
+        /// `extract_plan_with_values` so each `$n` binds as a constant.
+        type ParamValueList;
 
         fn new_context(catalog: Box<CatalogContext>) -> Result<UniquePtr<DuckPlannerContext>>;
         /// Plan `query` with `transaction` published for its duration: every
@@ -185,6 +198,80 @@ pub mod ffi {
             query: &str,
             transaction: &TransactionContext,
         ) -> Result<ExtractPlanResult>;
+        /// Plan `query` with prepared-statement parameters allowed: each `$n`
+        /// binds as a typed placeholder that stays in the plan, and the result
+        /// carries the inferred parameter types. A parameterized plan that
+        /// reads a table comes back with a null `plan` (only the shapes
+        /// survive): executions replan through `extract_plan_with_values`.
+        fn extract_plan_prepare(
+            ctx: Pin<&mut DuckPlannerContext>,
+            query: &str,
+            transaction: &TransactionContext,
+        ) -> Result<ExtractPlanResult>;
+        /// Plan `query` with the given parameter values bound as constants, so
+        /// the plan is fully optimized for exactly these values.
+        fn extract_plan_with_values(
+            ctx: Pin<&mut DuckPlannerContext>,
+            query: &str,
+            transaction: &TransactionContext,
+            params: &ParamValueList,
+        ) -> Result<ExtractPlanResult>;
+
+        // ---- ParamValueList construction. `index` is the 1-based parameter
+        // position: the value pushed under `index` 1 binds `$1`. ----
+        fn param_list_new() -> Result<UniquePtr<ParamValueList>>;
+        fn param_list_push_bool(list: Pin<&mut ParamValueList>, index: u32, v: bool) -> Result<()>;
+        fn param_list_push_i8(list: Pin<&mut ParamValueList>, index: u32, v: i8) -> Result<()>;
+        fn param_list_push_i16(list: Pin<&mut ParamValueList>, index: u32, v: i16) -> Result<()>;
+        fn param_list_push_i32(list: Pin<&mut ParamValueList>, index: u32, v: i32) -> Result<()>;
+        fn param_list_push_i64(list: Pin<&mut ParamValueList>, index: u32, v: i64) -> Result<()>;
+        fn param_list_push_u8(list: Pin<&mut ParamValueList>, index: u32, v: u8) -> Result<()>;
+        fn param_list_push_u16(list: Pin<&mut ParamValueList>, index: u32, v: u16) -> Result<()>;
+        fn param_list_push_u32(list: Pin<&mut ParamValueList>, index: u32, v: u32) -> Result<()>;
+        fn param_list_push_u64(list: Pin<&mut ParamValueList>, index: u32, v: u64) -> Result<()>;
+        fn param_list_push_hugeint(
+            list: Pin<&mut ParamValueList>,
+            index: u32,
+            hi: i64,
+            lo: u64,
+        ) -> Result<()>;
+        fn param_list_push_f32(list: Pin<&mut ParamValueList>, index: u32, v: f32) -> Result<()>;
+        fn param_list_push_f64(list: Pin<&mut ParamValueList>, index: u32, v: f64) -> Result<()>;
+        fn param_list_push_decimal(
+            list: Pin<&mut ParamValueList>,
+            index: u32,
+            hi: i64,
+            lo: u64,
+            width: u8,
+            scale: u8,
+        ) -> Result<()>;
+        fn param_list_push_string(
+            list: Pin<&mut ParamValueList>,
+            index: u32,
+            v: &str,
+        ) -> Result<()>;
+        fn param_list_push_date(
+            list: Pin<&mut ParamValueList>,
+            index: u32,
+            days: i32,
+        ) -> Result<()>;
+        fn param_list_push_timestamp(
+            list: Pin<&mut ParamValueList>,
+            index: u32,
+            micros: i64,
+        ) -> Result<()>;
+        fn param_list_push_interval(
+            list: Pin<&mut ParamValueList>,
+            index: u32,
+            months: i32,
+            days: i32,
+            micros: i64,
+        ) -> Result<()>;
+        fn param_list_push_null(
+            list: Pin<&mut ParamValueList>,
+            index: u32,
+            ty: BridgeLogicalType,
+        ) -> Result<()>;
 
         fn plan_root(plan: &PlanHandle) -> Result<&LogicalOperator>;
 
@@ -407,6 +494,9 @@ pub mod ffi {
 
         // BoundConstantExpression
         fn expr_constant(expr: &Expression) -> Result<&Value>;
+
+        // BoundParameterExpression: the positional identifier (`"1"` for `$1`).
+        fn expr_parameter_identifier(expr: &Expression) -> Result<String>;
 
         // ---- Value: typed accessors (shared by constants and table-function
         // arguments). Read `value_type` and `value_is_null` first, then the

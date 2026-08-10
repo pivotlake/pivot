@@ -272,8 +272,8 @@ fn variant_struct_type() -> DataType {
 
 /// Convert a typed DuckDB [`ScalarValue`] into an arrow [`Scalar<ArrayRef>`]
 /// suitable for use as a constant in the executor.
-pub fn build_scalar_value(value: ScalarValue) -> Result<Scalar<ArrayRef>, Error> {
-    let array: ArrayRef = match value {
+pub fn build_scalar_value(value: &ScalarValue) -> Result<Scalar<ArrayRef>, Error> {
+    let array: ArrayRef = match *value {
         ScalarValue::Boolean(v) => Arc::new(BooleanArray::new_scalar(v).into_inner()),
         ScalarValue::Int8(v) => Arc::new(Int8Array::new_scalar(v).into_inner()),
         ScalarValue::Int16(v) => Arc::new(Int16Array::new_scalar(v).into_inner()),
@@ -314,15 +314,15 @@ pub fn build_scalar_value(value: ScalarValue) -> Result<Scalar<ArrayRef>, Error>
                 .into_inner()
                 .with_precision_and_scale(width, scale as i8)?,
         ),
-        ScalarValue::Utf8(v) => Arc::new(StringViewArray::new_scalar(v).into_inner()),
+        ScalarValue::Utf8(ref v) => Arc::new(StringViewArray::new_scalar(v.as_str()).into_inner()),
         // A VARIANT constant reaches the bridge as the text it was built from:
         // DuckDB's variant-to-VARCHAR gives back the raw string, not its JSON
         // rendering, so parse that document into pivot's variant here. This is
         // how `'{...}'::VARIANT` -- an INSERT of a JSON document -- loads. A
         // malformed document is an error, not a panic: constant folding runs on
         // the compile path, which has an error channel.
-        ScalarValue::Variant(text) => {
-            let json: ArrayRef = Arc::new(arrow_array::StringArray::from(vec![text]));
+        ScalarValue::Variant(ref text) => {
+            let json: ArrayRef = Arc::new(arrow_array::StringArray::from(vec![text.as_str()]));
             crate::expression::json_to_canonical_variant(&json)?
         }
         // DuckDB's DATE is days since the epoch, the same as arrow `Date32`.
@@ -342,13 +342,14 @@ pub fn build_scalar_value(value: ScalarValue) -> Result<Scalar<ArrayRef>, Error>
         // one-element null array of that type's physical shape. An untyped NULL
         // (DuckDB's `SQLNULL`, what a bare `NULL` binds to outside a typed
         // context) has no shape to build and is rejected by `type_from_logical`.
-        ScalarValue::Null(logical_type) => {
-            arrow_array::new_null_array(&physical_arrow_type(&type_from_logical(logical_type)?), 1)
-        }
+        ScalarValue::Null(ref logical_type) => arrow_array::new_null_array(
+            &physical_arrow_type(&type_from_logical(logical_type.clone())?),
+            1,
+        ),
         // INTERVAL never appears as a query constant we materialise (it is
         // consumed by interval arithmetic), and types the bridge doesn't decode
         // arrive as `Other`.
-        other => return Err(Error::UnsupportedScalarConstant(other)),
+        ref other => return Err(Error::UnsupportedScalarConstant(other.clone())),
     };
 
     Ok(Scalar::new(array))

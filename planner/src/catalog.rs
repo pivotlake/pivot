@@ -110,6 +110,12 @@ impl TableReference {
     }
 }
 
+impl std::fmt::Display for TableReference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.datastore, self.schema, self.table)
+    }
+}
+
 /// The immutable identity and snapshot version of one table.
 ///
 /// `identity` distinguishes a dropped/recreated table from its predecessor even

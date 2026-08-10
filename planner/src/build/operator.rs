@@ -71,8 +71,13 @@ impl Insert {
                 "INSERT ... RETURNING is not supported".to_string(),
             ));
         }
+        // The binding resolved here belongs to the planning transaction, so
+        // only its name and schema go into the plan; compile rebinds through
+        // the executing transaction (see the `Insert` operator).
+        let table = bind_table(*view.take_table()?);
         Ok(Insert {
-            table: bind_table(*view.take_table()?),
+            reference: table.table_reference(),
+            columns: table.columns(),
         })
     }
 }

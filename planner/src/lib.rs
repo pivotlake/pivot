@@ -164,6 +164,8 @@ pub enum Error {
     Planning(#[from] duckdb_planner::Error),
     #[error("Error converting plan: {0}")]
     PlanConversion(#[from] plan::Error),
+    #[error("{0}")]
+    Type(#[from] types::Error),
 }
 
 impl From<duckdb_planner::BridgeError> for Error {
@@ -232,16 +234,104 @@ impl Planner {
     ) -> Result<Plan, Error> {
         let adapter = Arc::new(DuckDBTransactionAdapter { transaction });
         let planned = self.planner_context.plan(query, adapter)?;
-        let mut root = build::build_plan(planned.root()?)?;
-        // Push a top-k limit into a grouped aggregate that feeds ORDER BY DESC.
-        root.annotate_group_topn();
-        // Push a plain LIMIT (no ORDER BY) into a grouped aggregate beneath it.
-        root.annotate_group_limit();
-        // Let filters under a LIMIT or Top-N deliver rows as they are selected.
-        root.annotate_filter_delivery();
-        Ok(Plan {
-            root,
-            output_names: planned.into_output_names(),
+        build_annotated_plan(planned)
+    }
+
+    /// Plan a SQL statement with `$n` prepared-statement parameters allowed.
+    ///
+    /// The parameter and result shapes always come back, for the wire protocol
+    /// to describe to the client. The plan itself comes back only when it can
+    /// be reused across executions with placeholders left in it: the statement
+    /// must read no table (replanning with the values as constants unlocks the
+    /// scan pushdown a placeholder blocks) and every placeholder must sit
+    /// where [`compile_with_parameters`](Plan::compile_with_parameters)
+    /// resolves it. An execution of a plan-less prepared statement replans
+    /// through [`plan_with_values`](Self::plan_with_values).
+    pub fn plan_prepare(
+        &mut self,
+        query: &str,
+        transaction: Arc<dyn CatalogTransaction>,
+    ) -> Result<PreparedPlan, Error> {
+        let adapter = Arc::new(DuckDBTransactionAdapter { transaction });
+        let planned = self.planner_context.plan_prepare(query, adapter)?;
+
+        let param_types = planned
+            .param_types
+            .into_iter()
+            .map(types::type_from_logical)
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_types = planned
+            .output_types
+            .into_iter()
+            .map(types::type_from_logical)
+            .collect::<Result<Vec<_>, _>>()?;
+        // A plan comes back only when it will actually be reused: it must be
+        // parameterized (a parameter-free statement executes through the
+        // shared plan cache with its revision checks, so a plan kept here
+        // would be dead weight pinning Parse-time scan snapshots) and every
+        // placeholder must sit where compile resolves it.
+        let plan = match planned.plan {
+            Some(handle) if !param_types.is_empty() => {
+                let plan = build_annotated_plan(handle)?;
+                plan.is_parameter_cacheable().then_some(plan)
+            }
+            _ => None,
+        };
+        Ok(PreparedPlan {
+            plan,
+            param_types,
+            output_names: planned.output_names,
+            output_types,
+            returns_rows: planned.returns_rows,
         })
     }
+
+    /// Plan a SQL statement with the given `$1..$n` parameter values bound as
+    /// constants, so the plan is fully optimized for exactly these values.
+    /// This is how a prepared statement that [`plan_prepare`](Self::plan_prepare)
+    /// returned no plan for executes.
+    pub fn plan_with_values(
+        &mut self,
+        query: &str,
+        transaction: Arc<dyn CatalogTransaction>,
+        values: &[ScalarValue],
+    ) -> Result<Plan, Error> {
+        let adapter = Arc::new(DuckDBTransactionAdapter { transaction });
+        let planned = self
+            .planner_context
+            .plan_with_values(query, adapter, values)?;
+        build_annotated_plan(planned)
+    }
+}
+
+/// The outcome of [`Planner::plan_prepare`]: the parameter and result shapes
+/// the wire protocol describes to the client, plus the reusable plan when the
+/// statement qualifies for one.
+pub struct PreparedPlan {
+    pub plan: Option<Plan>,
+    /// The inferred pivot types of the statement's parameters, ordered `$1..$n`.
+    pub param_types: Vec<types::Type>,
+    /// The binder-resolved result column names, in output order.
+    pub output_names: Vec<String>,
+    /// The binder-resolved result column types, parallel to `output_names`.
+    pub output_types: Vec<types::Type>,
+    /// Whether executing the statement produces a result set (a SELECT)
+    /// rather than a command tag (an INSERT).
+    pub returns_rows: bool,
+}
+
+/// Walk a DuckDB plan handle into an annotated pivot [`Plan`]: the shared tail
+/// of every planning entry point.
+fn build_annotated_plan(planned: duckdb_planner::Plan) -> Result<Plan, Error> {
+    let mut root = build::build_plan(planned.root()?)?;
+    // Push a top-k limit into a grouped aggregate that feeds ORDER BY DESC.
+    root.annotate_group_topn();
+    // Push a plain LIMIT (no ORDER BY) into a grouped aggregate beneath it.
+    root.annotate_group_limit();
+    // Let filters under a LIMIT or Top-N deliver rows as they are selected.
+    root.annotate_filter_delivery();
+    Ok(Plan {
+        root,
+        output_names: planned.into_output_names(),
+    })
 }

@@ -146,7 +146,9 @@ impl Input {
                 }
             })
             .collect();
-        Projection { projections }.compile(scan)
+        // The synthesized extract projection reads scan output columns only, so
+        // it can never contain a prepared-statement parameter.
+        Projection { projections }.compile(scan, &[])
     }
 }
 

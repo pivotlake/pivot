@@ -201,6 +201,12 @@ impl TestCatalog {
             .insert(name.to_string(), TestTable::new(dispatch, name, columns));
     }
 
+    /// Drop a registered table, so transactions begun afterwards no longer
+    /// resolve it.
+    pub fn remove_table(&self, name: &str) {
+        self.tables.lock().unwrap().remove(name);
+    }
+
     /// Register a table whose data spans one parquet file per batch (the files
     /// may differ physically, e.g. a variant column shredded per file).
     pub fn add_table_files(
@@ -310,6 +316,12 @@ impl TestingPlanner {
     /// `Dispatch` so the parquet write/open happens on a worker.
     pub fn add_table(&self, name: &str, columns: &[(&str, Type, ArrayRef)]) {
         self.catalog.add_table(&self.dispatch, name, columns);
+    }
+
+    /// Drop a table from the catalog, so fresh transactions no longer see it.
+    #[allow(dead_code)] // not all test binaries call every helper
+    pub fn remove_table(&self, name: &str) {
+        self.catalog.remove_table(name);
     }
 
     /// Register a table whose data spans one parquet file per batch.

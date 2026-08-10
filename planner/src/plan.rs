@@ -75,6 +75,22 @@ impl PlanNode {
         ) && self.inputs.iter().all(PlanNode::is_cacheable)
     }
 
+    /// Whether every operator in this subtree resolves `$n` placeholders when
+    /// compiled with parameter values. Only the operators whose compile routes
+    /// expressions through parameter resolution qualify; a placeholder under
+    /// any other operator would surface as a compile error, so a plan
+    /// containing one is not kept for reuse (each execution replans with the
+    /// values bound as constants instead).
+    fn resolves_parameters(&self) -> bool {
+        matches!(
+            self.operator,
+            Operator::Insert(_)
+                | Operator::Projection(_)
+                | Operator::Values(_)
+                | Operator::DummyScan(_)
+        ) && self.inputs.iter().all(PlanNode::resolves_parameters)
+    }
+
     /// Whether every table scan still has the same identity and version in
     /// `transaction`.
     pub(crate) fn has_matching_table_revisions(
@@ -333,6 +349,14 @@ pub struct Plan {
 impl Plan {
     pub fn is_cacheable(&self) -> bool {
         self.root.is_cacheable()
+    }
+
+    /// Whether this plan can be kept with `$n` placeholders in it and compiled
+    /// per execution with that execution's bound values
+    /// ([`compile_with_parameters`](Plan::compile_with_parameters)). See
+    /// [`PlanNode::resolves_parameters`] for what qualifies.
+    pub fn is_parameter_cacheable(&self) -> bool {
+        self.root.resolves_parameters()
     }
 
     pub fn has_matching_table_revisions(&self, transaction: &dyn CatalogTransaction) -> bool {

@@ -124,6 +124,36 @@ pub enum Error {
     UnsupportedTableFunction(String),
     #[error("Invalid argument to table function {function}: {message}")]
     InvalidTableFunctionArgument { function: String, message: String },
+    #[error("prepared-statement parameter ${0} was not resolved before compiling")]
+    UnresolvedParameter(usize),
+    #[error("INSERT target {0} no longer exists")]
+    InsertTargetMissing(crate::catalog::TableReference),
+    #[error("the schema of INSERT target {0} changed since the statement was planned")]
+    InsertTargetSchemaChanged(crate::catalog::TableReference),
+    #[error("prepared-statement parameter ${index} has no bound value ({supplied} supplied)")]
+    MissingParameterValue { index: usize, supplied: usize },
+    #[error(
+        "prepared-statement parameter ${index} expects a {expected} value but was bound a {actual}"
+    )]
+    ParameterTypeMismatch {
+        index: usize,
+        expected: arrow_schema::DataType,
+        actual: arrow_schema::DataType,
+    },
+}
+
+impl Error {
+    /// Whether this compile failure means a plan cached across executions went
+    /// stale (its target changed under it), so the caller should drop the plan
+    /// and replan rather than surface the error. Owned here, next to the
+    /// errors, so a caller's retry policy cannot drift when staleness signals
+    /// are added.
+    pub fn invalidates_cached_plan(&self) -> bool {
+        matches!(
+            self,
+            Error::InsertTargetMissing(_) | Error::InsertTargetSchemaChanged(_)
+        )
+    }
 }
 
 impl Plan {
@@ -136,12 +166,27 @@ impl Plan {
         dispatcher: &DataFlowDispatcher,
         transaction: &dyn CatalogTransaction,
     ) -> Result<RecordBatchOperatorSpec, Error> {
+        self.compile_with_parameters(dispatcher, transaction, &[])
+    }
+
+    /// [`compile`](Self::compile) for a plan holding `$n` placeholders: each
+    /// placeholder compiles as the constant at `parameters[n-1]`. The values
+    /// belong to one execution, not to the plan, so a shared plan compiles
+    /// concurrently with different bindings.
+    pub fn compile_with_parameters(
+        &self,
+        dispatcher: &DataFlowDispatcher,
+        transaction: &dyn CatalogTransaction,
+        parameters: &[Scalar<ArrayRef>],
+    ) -> Result<RecordBatchOperatorSpec, Error> {
         // Backend table functions and DDL resolve through `transaction`.
         // Base-table scans carry their planning snapshot and may reach this
         // compile through the plan cache only after the server verifies that
         // every recorded table revision matches this transaction.
         let mut slots = DynamicFilterSlots::new();
-        let compiled = self.root.compile(dispatcher, transaction, &mut slots)?;
+        let compiled = self
+            .root
+            .compile(dispatcher, transaction, &mut slots, parameters)?;
         Ok(stamp_output_names(compiled, &self.output_names))
     }
 }
@@ -210,6 +255,7 @@ impl PlanNode {
         dispatcher: &DataFlowDispatcher,
         transaction: &dyn CatalogTransaction,
         slots: &mut DynamicFilterSlots,
+        parameters: &[Scalar<ArrayRef>],
     ) -> Result<RecordBatchOperatorSpec, Error> {
         // Peephole: an unfiltered global MIN/MAX or COUNT(*) over a bare scan is
         // fully determined by table metadata (e.g. parquet row-group
@@ -236,14 +282,14 @@ impl PlanNode {
 
         let mut inputs = Vec::with_capacity(self.inputs.len());
         for input in &self.inputs {
-            inputs.push(input.compile(dispatcher, transaction, slots)?);
+            inputs.push(input.compile(dispatcher, transaction, slots, parameters)?);
         }
 
         match &self.operator {
             crate::Operator::Input(o) => o.compile(dispatcher, slots),
-            crate::Operator::Values(o) => o.compile(dispatcher),
+            crate::Operator::Values(o) => o.compile(dispatcher, parameters),
             crate::Operator::TableFunctionScan(o) => o.compile(dispatcher, transaction),
-            crate::Operator::Projection(o) => o.compile(inputs.remove(0)),
+            crate::Operator::Projection(o) => o.compile(inputs.remove(0), parameters),
             crate::Operator::Filter(o) => o.compile(inputs.remove(0)),
             crate::Operator::Aggregate(o) => {
                 o.compile(inputs.remove(0), self.inputs[0].output_nullability())
@@ -275,7 +321,7 @@ impl PlanNode {
                 }
                 o.compile(dispatcher, transaction)
             }
-            crate::Operator::Insert(o) => o.compile(inputs.remove(0), dispatcher),
+            crate::Operator::Insert(o) => o.compile(inputs.remove(0), dispatcher, transaction),
             crate::Operator::DummyScan(o) => o.compile(dispatcher),
             // EXPLAIN is handled above, before inputs are compiled.
             crate::Operator::Explain(_) => unreachable!("Explain is compiled before its inputs"),

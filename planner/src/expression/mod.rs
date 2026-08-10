@@ -28,6 +28,7 @@ mod is_null;
 mod length;
 mod like;
 mod not;
+mod parameter;
 mod prefix;
 mod reference;
 mod regexp;
@@ -54,6 +55,7 @@ pub use is_null::IsNull;
 pub use length::Length;
 pub use like::Like;
 pub use not::Not;
+pub use parameter::Parameter;
 pub use prefix::Prefix;
 pub use reference::Ref;
 pub use regexp::{RegexpFullMatch, RegexpReplace};
@@ -114,6 +116,7 @@ pub enum Expression {
     Compare(Compare),
     Between(Between),
     Constant(Scalar<ArrayRef>),
+    Parameter(Parameter),
     AggregateFunc(AggregateFunc),
     Function(Function),
     InList(InList),
@@ -130,7 +133,7 @@ impl Expression {
     /// evaluating it pays for the row gather (see the `Filter` operator).
     pub fn count_kernels(&self) -> usize {
         match self {
-            Expression::Ref(_) | Expression::Constant(_) => 0,
+            Expression::Ref(_) | Expression::Constant(_) | Expression::Parameter(_) => 0,
             Expression::Compare(c) => 1 + c.left.count_kernels() + c.right.count_kernels(),
             Expression::Between(b) => 2 + b.input.count_kernels(),
             Expression::AggregateFunc(_) => 1,
@@ -161,7 +164,7 @@ impl Expression {
     pub fn collect_column_refs(&self, out: &mut Vec<usize>) {
         match self {
             Expression::Ref(r) => out.push(r.column_idx),
-            Expression::Constant(_) => {}
+            Expression::Constant(_) | Expression::Parameter(_) => {}
             Expression::Compare(c) => {
                 c.left.collect_column_refs(out);
                 c.right.collect_column_refs(out);
@@ -213,6 +216,7 @@ impl Expression {
             Expression::Ref(r) => Ok(r.return_type.clone()),
             Expression::Constant(s) => types::type_from_physical(s.get().0.data_type())
                 .ok_or_else(|| compile::Error::IndeterminateResultType(self.clone())),
+            Expression::Parameter(p) => Ok(p.return_type.clone()),
             // Comparisons and the boolean combinators all yield booleans.
             Expression::Compare(_)
             | Expression::Between(_)
@@ -243,6 +247,8 @@ impl Expression {
         match self {
             Expression::Ref(r) => input.get(r.column_idx).copied().unwrap_or(true),
             Expression::Constant(c) => c.get().0.is_null(0),
+            // The bound value is unknown until execution, so it may be NULL.
+            Expression::Parameter(_) => true,
             // `IS NULL` is the one predicate that never yields NULL itself.
             Expression::IsNull(_) => false,
             Expression::Compare(c) => c.left.nullability(input) || c.right.nullability(input),
@@ -292,8 +298,133 @@ impl Expression {
             Expression::Not(n) => n.compile(),
             Expression::IsNull(n) => n.compile(),
             Expression::Cast(c) => c.compile(),
+            Expression::Parameter(p) => Err(compile::Error::UnresolvedParameter(p.index)),
             _ => Err(compile::Error::UnsupportedExpression(self.clone())),
         }
+    }
+
+    /// Compile with every `$n` placeholder first replaced by its bound value
+    /// (`values[n-1]`) as a constant. With no values this is plain
+    /// [`compile`](Self::compile), where a leftover placeholder is an error.
+    pub(crate) fn compile_with_parameters(
+        &self,
+        values: &[Scalar<ArrayRef>],
+    ) -> Result<ExprFn, compile::Error> {
+        // A placeholder-free expression (a literal cell in a mixed VALUES row)
+        // compiles directly: resolution would clone the whole subtree per
+        // execution only to change nothing.
+        if values.is_empty() || !self.contains_parameter() {
+            return self.compile();
+        }
+        let mut resolved = self.clone();
+        resolved.resolve_parameters(values)?;
+        resolved.compile()
+    }
+
+    /// Whether any `$n` placeholder appears in this expression.
+    fn contains_parameter(&self) -> bool {
+        match self {
+            Expression::Parameter(_) => true,
+            Expression::Ref(_) | Expression::Constant(_) => false,
+            Expression::Compare(c) => c.left.contains_parameter() || c.right.contains_parameter(),
+            Expression::Between(b) => {
+                b.input.contains_parameter()
+                    || b.lower.contains_parameter()
+                    || b.upper.contains_parameter()
+            }
+            Expression::AggregateFunc(a) => a.arguments().any(|a| a.contains_parameter()),
+            Expression::Function(f) => {
+                let mut found = false;
+                f.for_each_argument(&mut |argument| found |= argument.contains_parameter());
+                found
+            }
+            Expression::InList(l) => {
+                l.input.contains_parameter() || l.values.iter().any(Self::contains_parameter)
+            }
+            Expression::Conjunction(c) => c.children.iter().any(Self::contains_parameter),
+            Expression::Case(c) => {
+                c.checks
+                    .iter()
+                    .any(|check| check.when.contains_parameter() || check.then.contains_parameter())
+                    || c.else_expr.contains_parameter()
+            }
+            Expression::Not(n) => n.input.contains_parameter(),
+            Expression::IsNull(n) => n.input.contains_parameter(),
+            Expression::Cast(c) => c.source.contains_parameter(),
+        }
+    }
+
+    /// Replace every `$n` placeholder in this expression with its bound value
+    /// (`values[n-1]`) as a constant. Each value must arrive already in the
+    /// placeholder's physical arrow type: a mismatch is an error, not a cast,
+    /// so a decoding bug upstream cannot silently corrupt what gets evaluated.
+    pub fn resolve_parameters(
+        &mut self,
+        values: &[Scalar<ArrayRef>],
+    ) -> Result<(), compile::Error> {
+        match self {
+            Expression::Parameter(p) => {
+                let value =
+                    values
+                        .get(p.index - 1)
+                        .ok_or(compile::Error::MissingParameterValue {
+                            index: p.index,
+                            supplied: values.len(),
+                        })?;
+                let expected = types::physical_arrow_type(&p.return_type);
+                let actual = value.get().0.data_type();
+                if actual != &expected {
+                    return Err(compile::Error::ParameterTypeMismatch {
+                        index: p.index,
+                        expected,
+                        actual: actual.clone(),
+                    });
+                }
+                *self = Expression::Constant(value.clone());
+            }
+            Expression::Ref(_) | Expression::Constant(_) => {}
+            Expression::Compare(c) => {
+                c.left.resolve_parameters(values)?;
+                c.right.resolve_parameters(values)?;
+            }
+            Expression::Between(b) => {
+                b.input.resolve_parameters(values)?;
+                b.lower.resolve_parameters(values)?;
+                b.upper.resolve_parameters(values)?;
+            }
+            Expression::AggregateFunc(a) => {
+                for argument in a.arguments_mut() {
+                    argument.resolve_parameters(values)?;
+                }
+            }
+            Expression::Function(f) => {
+                for argument in f.arguments_mut() {
+                    argument.resolve_parameters(values)?;
+                }
+            }
+            Expression::InList(l) => {
+                l.input.resolve_parameters(values)?;
+                for value in &mut l.values {
+                    value.resolve_parameters(values)?;
+                }
+            }
+            Expression::Conjunction(c) => {
+                for child in &mut c.children {
+                    child.resolve_parameters(values)?;
+                }
+            }
+            Expression::Case(c) => {
+                for check in &mut c.checks {
+                    check.when.resolve_parameters(values)?;
+                    check.then.resolve_parameters(values)?;
+                }
+                c.else_expr.resolve_parameters(values)?;
+            }
+            Expression::Not(n) => n.input.resolve_parameters(values)?,
+            Expression::IsNull(n) => n.input.resolve_parameters(values)?,
+            Expression::Cast(c) => c.source.resolve_parameters(values)?,
+        }
+        Ok(())
     }
 }
 
@@ -304,6 +435,7 @@ impl Display for Expression {
             Expression::Compare(c) => write!(f, "{c}"),
             Expression::Between(b) => write!(f, "{b}"),
             Expression::Constant(c) => f.write_str(&format_constant(c)),
+            Expression::Parameter(p) => write!(f, "{p}"),
             Expression::AggregateFunc(a) => write!(f, "{a}"),
             Expression::Function(fun) => write!(f, "{fun}"),
             Expression::InList(i) => write!(f, "{i}"),

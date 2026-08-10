@@ -28,6 +28,13 @@ rand = { workspace = true }
 sha2 = { workspace = true }
 async-trait = "0.1"
 futures = "0.3"
+# Parses text-format DATE/TIMESTAMP prepared-statement parameters and carries
+# binary-format temporal result values into pgwire's encoder.
+chrono = "0.4"
+# Implements the NUMERIC binary wire encoding for decimal result columns
+# (pgwire's encoder is driven through these traits).
+postgres-types = "0.2"
+bytes = { workspace = true }
 clap = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

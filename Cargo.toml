@@ -73,7 +73,7 @@ sysinfo = "0.38.0"
 tempfile = "3"
 thiserror = "2.0.18"
 tokio = "1.40"
-tokio-postgres = "0.7"
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 ureq = "2"
