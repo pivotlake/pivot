@@ -67,6 +67,12 @@ fn bound_type_from(raw: ffi::BridgeLogicalType) -> BoundLogicalType {
 /// [`ScalarValue::Other`].
 fn scalar_from_value(v: &ffi::Value) -> Result<ScalarValue> {
     use LogicalTypeId as L;
+    // NULL first: none of the typed accessors apply to it.
+    if ffi::value_is_null(v)? {
+        return Ok(ScalarValue::Null(BoundLogicalType::from_bridge(
+            ffi::value_logical_type(v)?,
+        )));
+    }
     Ok(match LogicalTypeId::from_u8(ffi::value_type(v)?) {
         L::BOOLEAN => ScalarValue::Boolean(ffi::value_bool(v)?),
         L::TINYINT => ScalarValue::Int8(ffi::value_i8(v)?),
@@ -108,17 +114,31 @@ fn scalar_from_value(v: &ffi::Value) -> Result<ScalarValue> {
 }
 
 /// Owns DuckDB's resolved plan tree (kept alive while it is walked) plus the
-/// binder-resolved client column names. Hand out the root with [`Plan::root`].
+/// binder-resolved statement metadata: client column names and types, the
+/// `$n` parameter types, and whether execution returns a result set. Hand out
+/// the root with [`Plan::root`].
 pub struct Plan {
     handle: UniquePtr<ffi::PlanHandle>,
     output_names: Vec<String>,
+    output_types: Vec<BoundLogicalType>,
+    parameter_types: Vec<BoundLogicalType>,
+    returns_query_result: bool,
 }
 
 impl Plan {
-    pub(crate) fn new(handle: UniquePtr<ffi::PlanHandle>, output_names: Vec<String>) -> Self {
+    pub(crate) fn new(
+        handle: UniquePtr<ffi::PlanHandle>,
+        output_names: Vec<String>,
+        output_types: Vec<BoundLogicalType>,
+        parameter_types: Vec<BoundLogicalType>,
+        returns_query_result: bool,
+    ) -> Self {
         Self {
             handle,
             output_names,
+            output_types,
+            parameter_types,
+            returns_query_result,
         }
     }
 
@@ -134,6 +154,23 @@ impl Plan {
     /// them.
     pub fn output_names(&self) -> &[String] {
         &self.output_names
+    }
+
+    /// The result column types matching [`output_names`](Self::output_names).
+    pub fn output_types(&self) -> &[BoundLogicalType] {
+        &self.output_types
+    }
+
+    /// The binder-inferred type of each `$n` parameter, ordered by n. Empty
+    /// for an unparameterized statement.
+    pub fn parameter_types(&self) -> &[BoundLogicalType] {
+        &self.parameter_types
+    }
+
+    /// Whether executing the statement produces a result set, as opposed to a
+    /// changed-row count (INSERT) or nothing (DDL, SET).
+    pub fn returns_query_result(&self) -> bool {
+        self.returns_query_result
     }
 
     /// Consume the plan, returning the resolved output names.
@@ -208,6 +245,7 @@ impl<'plan> LogicalOp<'plan> {
             }
             L::LOGICAL_CTE_REF => Operator::CteRef(CteRef { raw: self.raw }),
             L::LOGICAL_DUMMY_SCAN => Operator::DummyScan,
+            L::LOGICAL_EMPTY_RESULT => Operator::EmptyResult(EmptyResult { raw: self.raw }),
             L::LOGICAL_EXPLAIN => Operator::Explain,
             _ => Operator::Unsupported,
         })
@@ -249,6 +287,9 @@ pub enum Operator<'plan> {
     CteRef(CteRef<'plan>),
     /// The single-row source under a `FROM`-less `SELECT`.
     DummyScan,
+    /// A subtree the optimizer proved returns no rows, keeping only its
+    /// output types.
+    EmptyResult(EmptyResult<'plan>),
     /// `EXPLAIN <query>`.
     Explain,
     /// Any operator type the consumer doesn't handle.
@@ -307,6 +348,8 @@ define_handles! { ffi::LogicalOperator;
     MaterializedCte,
     /// A `LogicalCTERef`: one place a CTE's rows are read.
     CteRef,
+    /// A `LogicalEmptyResult`: a subtree proved to return no rows.
+    EmptyResult,
 }
 
 impl<'plan> MaterializedCte<'plan> {
@@ -321,6 +364,20 @@ impl<'plan> CteRef<'plan> {
     /// The CTE these rows come from.
     pub fn cte_index(self) -> Result<usize> {
         Ok(ffi::lo_cte_ref_index(self.raw)?)
+    }
+}
+
+impl<'plan> EmptyResult<'plan> {
+    /// The types of the output columns the replaced subtree would have
+    /// produced, in output order.
+    pub fn column_types(self) -> Result<Vec<BoundLogicalType>> {
+        (0..ffi::lo_empty_result_type_count(self.raw)?)
+            .map(|i| {
+                Ok(BoundLogicalType::from_bridge(ffi::lo_empty_result_type(
+                    self.raw, i,
+                )?))
+            })
+            .collect()
     }
 }
 

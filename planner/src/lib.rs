@@ -154,7 +154,8 @@ use thiserror::Error;
 
 use crate::catalog::{CatalogTransaction, DuckDBScalarFunctionBinder, DuckDBTransactionAdapter};
 pub use duckdb_planner::{
-    DuckDBBind, DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, ScalarValue,
+    DuckDBBind, DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, ParameterValue,
+    ScalarValue,
 };
 
 /// Errors surfaced by [`Planner::plan`].
@@ -164,6 +165,10 @@ pub enum Error {
     Planning(#[from] duckdb_planner::Error),
     #[error("Error converting plan: {0}")]
     PlanConversion(#[from] plan::Error),
+    #[error("statement requires {expected} parameters, {actual} were bound")]
+    ParameterCount { expected: usize, actual: usize },
+    #[error("{0}")]
+    Type(#[from] types::Error),
 }
 
 impl From<duckdb_planner::BridgeError> for Error {
@@ -230,8 +235,31 @@ impl Planner {
         query: &str,
         transaction: Arc<dyn CatalogTransaction>,
     ) -> Result<Plan, Error> {
+        self.plan_with_parameters(query, transaction, &[])
+    }
+
+    /// [`plan`](Self::plan) for a prepared statement's execute: each `$n` in
+    /// the statement is replaced with `parameters[n-1]` before DuckDB's
+    /// optimizer runs, so the resulting plan is the one the statement would
+    /// get with inline literals. `parameters.len()` must match the
+    /// statement's parameter count (so a plain [`plan`](Self::plan) of a
+    /// parameterized statement fails instead of planning placeholders).
+    pub fn plan_with_parameters(
+        &mut self,
+        query: &str,
+        transaction: Arc<dyn CatalogTransaction>,
+        parameters: &[ParameterValue],
+    ) -> Result<Plan, Error> {
         let adapter = Arc::new(DuckDBTransactionAdapter { transaction });
-        let planned = self.planner_context.plan(query, adapter)?;
+        let planned = self
+            .planner_context
+            .plan_with_parameters(query, adapter, parameters)?;
+        if planned.parameter_types().len() != parameters.len() {
+            return Err(Error::ParameterCount {
+                expected: planned.parameter_types().len(),
+                actual: parameters.len(),
+            });
+        }
         let mut root = build::build_plan(planned.root()?)?;
         // Push a top-k limit into a grouped aggregate that feeds ORDER BY DESC.
         root.annotate_group_topn();
@@ -244,4 +272,56 @@ impl Planner {
             output_names: planned.into_output_names(),
         })
     }
+
+    /// Resolve a statement's metadata without executing it: the
+    /// binder-inferred type of each `$n` parameter and the result columns.
+    /// This is what a prepared statement's Describe needs before any
+    /// parameter values exist. Fails when a parameter's type cannot be
+    /// inferred from the statement alone (e.g. a bare `SELECT $1`).
+    pub fn describe(
+        &mut self,
+        query: &str,
+        transaction: Arc<dyn CatalogTransaction>,
+    ) -> Result<StatementDescription, Error> {
+        let adapter = Arc::new(DuckDBTransactionAdapter { transaction });
+        let planned = self
+            .planner_context
+            .plan_with_parameters(query, adapter, &[])?;
+        let parameter_types = planned
+            .parameter_types()
+            .iter()
+            .cloned()
+            .map(types::type_from_logical)
+            .collect::<Result<Vec<_>, _>>()?;
+        let columns = if planned.returns_query_result() {
+            Some(
+                planned
+                    .output_names()
+                    .iter()
+                    .zip(planned.output_types())
+                    .map(|(name, output_type)| {
+                        Ok((name.clone(), types::type_from_logical(output_type.clone())?))
+                    })
+                    .collect::<Result<Vec<_>, types::Error>>()?,
+            )
+        } else {
+            None
+        };
+        Ok(StatementDescription {
+            parameter_types,
+            columns,
+        })
+    }
+}
+
+/// A statement's binder-resolved metadata, the answer to a prepared
+/// statement's Describe: what to bind and what will come back.
+#[derive(Debug, Clone)]
+pub struct StatementDescription {
+    /// The type of each `$n` parameter, ordered by n.
+    pub parameter_types: Vec<types::Type>,
+    /// One `(name, type)` per result column, or `None` when executing the
+    /// statement produces no result set (INSERT's changed-row count, DDL,
+    /// SET).
+    pub columns: Option<Vec<(String, types::Type)>>,
 }

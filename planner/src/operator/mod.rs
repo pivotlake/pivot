@@ -19,6 +19,7 @@ mod create_schema;
 mod create_table;
 mod cte;
 mod dummy_scan;
+mod empty_result;
 mod explain;
 mod filter;
 mod input;
@@ -39,6 +40,7 @@ pub use create_schema::CreateSchema;
 pub use create_table::CreateTable;
 pub use cte::{Cte, CteScan};
 pub use dummy_scan::DummyScan;
+pub use empty_result::EmptyResult;
 pub use explain::Explain;
 pub use filter::Filter;
 pub use input::Input;
@@ -112,6 +114,9 @@ pub enum Operator {
     CreateTable(CreateTable),
     CreateSchema(CreateSchema),
     DummyScan(DummyScan),
+    /// A source that emits no rows (an optimized-away subtree), keeping the
+    /// subtree's output types.
+    EmptyResult(EmptyResult),
     /// `SET`/`RESET` of a session variable — handled by the server, not compiled.
     SetVariable(SetVariable),
     /// `COMPACT <table> [FINAL]` — handled by the server, not compiled.
@@ -178,6 +183,8 @@ impl Operator {
                 .collect()),
             // A FROM-less SELECT's one-row source has no columns of its own.
             Operator::DummyScan(_) => Ok(Vec::new()),
+            // An optimized-away subtree: no rows, but the types survive.
+            Operator::EmptyResult(empty) => Ok(empty.types.clone()),
             // EXPLAIN renders its child plan as text, one line per row.
             Operator::Explain(_) => Ok(vec![Type::Utf8]),
             // A CTE emits what the query reading it emits; the definition
@@ -238,6 +245,7 @@ impl Operator {
                 inputs[0].clone()
             }
             Operator::DummyScan(_) => Vec::new(),
+            Operator::EmptyResult(empty) => vec![true; empty.types.len()],
             Operator::Explain(_) => vec![false],
             // A VALUES row may hold NULL literals; stay conservative.
             Operator::Values(values) => {
@@ -291,6 +299,7 @@ impl fmt::Display for Operator {
             Operator::CreateTable(c) => write!(f, "{c}"),
             Operator::CreateSchema(c) => write!(f, "{c}"),
             Operator::DummyScan(d) => write!(f, "{d}"),
+            Operator::EmptyResult(e) => write!(f, "{e}"),
             Operator::SetVariable(s) => write!(f, "{s}"),
             Operator::Compact(c) => write!(f, "{c}"),
             Operator::Materialize(m) => write!(f, "{m}"),

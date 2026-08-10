@@ -76,7 +76,7 @@ pub use catalog_provider::{DuckDBBind, DuckDBTable, DuckDBTransaction};
 pub use duckdb_bridge::duckdb_types::LogicalTypeId;
 pub use duckdb_bridge::ffi::DuckDBColumn;
 pub use handle::{BridgeError, Expr, LogicalOp, Plan};
-pub use types::{BoundLogicalType, ExtraTypeInfo, ScalarValue};
+pub use types::{BoundLogicalType, ExtraTypeInfo, ParameterValue, ScalarValue};
 
 /// Top-level error type for the planner.
 #[derive(Error, Debug)]
@@ -175,15 +175,58 @@ impl PlannerContext {
         query: &str,
         transaction: Arc<dyn DuckDBTransaction>,
     ) -> Result<Plan, Error> {
+        self.plan_with_parameters(query, transaction, &[])
+    }
+
+    /// [`plan`](Self::plan) with prepared-statement parameter values: each
+    /// `$n` in the statement is substituted with `parameters[n-1]` (cast to
+    /// the parameter's binder-inferred type) before DuckDB's optimizer runs,
+    /// so the resulting plan is indistinguishable from one written with
+    /// inline literals.
+    ///
+    /// An empty `parameters` plans without values; a parameterized statement
+    /// then keeps its `$n` placeholders in the tree, which suits reading the
+    /// statement's metadata ([`Plan::parameter_types`], output names/types)
+    /// but not walking the plan. Either way, planning fails unless the binder
+    /// can infer every parameter's type from the statement alone.
+    pub fn plan_with_parameters(
+        &mut self,
+        query: &str,
+        transaction: Arc<dyn DuckDBTransaction>,
+        parameters: &[ParameterValue],
+    ) -> Result<Plan, Error> {
         let transaction_ctx = catalog_provider::TransactionContext::new(transaction);
-        let result = ffi::extract_plan(self.cxx_context.pin_mut(), query, &transaction_ctx)?;
+        let bridge_parameters = parameters.iter().map(ParameterValue::to_bridge).collect();
+        let result = ffi::extract_plan(
+            self.cxx_context.pin_mut(),
+            query,
+            &transaction_ctx,
+            &bridge_parameters,
+        )?;
         if !result.error_kind.is_empty() {
             return Err(bridge_error(&result));
         }
 
         let ffi::ExtractPlanResult {
-            plan, output_names, ..
+            plan,
+            output_names,
+            output_types,
+            parameter_types,
+            returns_query_result,
+            ..
         } = result;
-        Ok(Plan::new(plan, output_names))
+        Ok(Plan::new(
+            plan,
+            output_names,
+            output_types
+                .into_iter()
+                .map(BoundLogicalType::from_bridge)
+                .collect(),
+            parameter_types
+                .into_iter()
+                .map(BoundLogicalType::from_bridge)
+                .collect(),
+            returns_query_result,
+        ))
     }
 }

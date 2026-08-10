@@ -36,6 +36,7 @@ use lru::LruCache;
 use metastore::Metastore;
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
+use pgwire::api::portal::Format;
 use pgwire::api::query::SimpleQueryHandler;
 use pgwire::api::results::{QueryResponse, Response, Tag};
 use pgwire::api::store::PortalStore;
@@ -119,7 +120,7 @@ impl PlanCache {
     }
 }
 
-fn with_planner<R>(
+pub(crate) fn with_planner<R>(
     catalog: &Arc<catalog::PivotCatalog>,
     f: impl FnOnce(&mut planner::Planner) -> R,
 ) -> Result<R, planner::Error> {
@@ -220,7 +221,7 @@ pub(crate) async fn execute_sql(
 }
 
 #[derive(Debug, Error)]
-enum Error {
+pub(crate) enum Error {
     #[error(transparent)]
     Plan(#[from] planner::Error),
     #[error("compile error: {0}")]
@@ -235,6 +236,8 @@ enum Error {
     PlannerPanic(JoinError),
     #[error("invalid INSERT row-count result: {0}")]
     InvalidInsertResult(String),
+    #[error("failed to encode result row: {0}")]
+    Encode(String),
 }
 
 impl Error {
@@ -314,17 +317,45 @@ async fn plan_query(
     Ok(plan)
 }
 
+/// Plan a prepared statement's execute. The parameter values are substituted
+/// into the plan as constants, so the result is specific to these values and
+/// deliberately never touches the SQL-keyed plan cache.
+async fn plan_prepared_query(
+    catalog: &Arc<catalog::PivotCatalog>,
+    transaction: Arc<dyn planner::catalog::CatalogTransaction>,
+    query: &str,
+    parameters: Vec<planner::ParameterValue>,
+) -> Result<Arc<planner::Plan>> {
+    let catalog = catalog.clone();
+    let query = query.to_string();
+    tokio::task::spawn_blocking(move || -> Result<Arc<planner::Plan>> {
+        with_planner(&catalog, |planner| {
+            Ok(Arc::new(planner.plan_with_parameters(
+                &query,
+                transaction,
+                &parameters,
+            )?))
+        })?
+    })
+    .await
+    .map_err(Error::PlannerPanic)?
+}
+
 /// Output converted before it leaves the dispatch worker. Query
 /// batches become pgwire rows; INSERT's internal one-row result becomes an
 /// owned count that the coordinator turns into an `INSERT 0 n` command tag.
 enum WorkerOutput {
-    QueryRows(PGRowBatch),
+    QueryRows(std::result::Result<PGRowBatch, String>),
     AffectedRows(std::result::Result<usize, String>),
 }
 
-fn build_worker_output(batch: RecordBatch, is_insert: bool) -> WorkerOutput {
+fn build_worker_output(
+    batch: RecordBatch,
+    is_insert: bool,
+    result_format: &Format,
+) -> WorkerOutput {
     if !is_insert {
-        return WorkerOutput::QueryRows(PGRowBatch::from(batch));
+        return WorkerOutput::QueryRows(PGRowBatch::new(batch, result_format));
     }
     let count = (|| {
         if batch.num_rows() != 1 || batch.num_columns() != 1 {
@@ -371,7 +402,7 @@ fn build_pgwire_response(outputs: Vec<WorkerOutput>, is_insert: bool) -> Result<
     let batches = outputs
         .into_iter()
         .map(|output| match output {
-            WorkerOutput::QueryRows(batch) => Ok(batch),
+            WorkerOutput::QueryRows(batch) => batch.map_err(Error::Encode),
             WorkerOutput::AffectedRows(_) => Err(Error::InvalidInsertResult(
                 "received an INSERT count for a query".to_string(),
             )),
@@ -412,12 +443,16 @@ impl Drop for CancelOnDrop {
     }
 }
 
-/// pgwire `SimpleQueryHandler`: plans, compiles, and runs each query on the
+/// pgwire `SimpleQueryHandler` and `ExtendedQueryHandler` (the latter in
+/// [`crate::extended_query`]): plans, compiles, and runs each query on the
 /// blocking pool, surfacing errors and supporting cancellation.
 pub struct PivotQueryHandler {
-    catalog: Arc<catalog::PivotCatalog>,
+    pub(crate) catalog: Arc<catalog::PivotCatalog>,
     dispatcher: dispatch::DataFlowDispatcher,
     plan_cache: Arc<PlanCache>,
+    /// The extended protocol's Parse-time planner, shared with pgwire's
+    /// describe defaults through `ExtendedQueryHandler::query_parser`.
+    pub(crate) query_parser: Arc<crate::extended_query::PivotQueryParser>,
 }
 
 impl PivotQueryHandler {
@@ -427,6 +462,9 @@ impl PivotQueryHandler {
         plan_cache: Arc<PlanCache>,
     ) -> Self {
         Self {
+            query_parser: Arc::new(crate::extended_query::PivotQueryParser::new(
+                catalog.clone(),
+            )),
             catalog,
             dispatcher,
             plan_cache,
@@ -437,12 +475,19 @@ impl PivotQueryHandler {
     /// dataflow's IO/CPU work when `collect_stats`) or — if it turned out to be a
     /// `SET`/`RESET` — return that for the caller to apply to the connection.
     ///
+    /// `parameters` are a prepared statement's bound values (empty for the
+    /// simple protocol and unparameterized statements), and `result_format`
+    /// the client-requested per-column result encoding (always text for the
+    /// simple protocol).
+    ///
     /// The whole statement runs inside one catalog transaction: everything it
     /// binds and compiles reads that snapshot, and the transaction is committed
     /// on success and rolled back on failure (or cancellation).
-    async fn run_query(
+    pub(crate) async fn run_query(
         &self,
         query: &str,
+        parameters: Vec<planner::ParameterValue>,
+        result_format: Format,
         collect_stats: bool,
         with_perf: bool,
     ) -> Result<Outcome> {
@@ -454,13 +499,17 @@ impl PivotQueryHandler {
             let query = query.to_string();
 
             let started = Instant::now();
-            let plan = plan_query(
-                &self.catalog,
-                transaction.clone(),
-                self.plan_cache.as_ref(),
-                &query,
-            )
-            .await?;
+            let plan = if parameters.is_empty() {
+                plan_query(
+                    &self.catalog,
+                    transaction.clone(),
+                    self.plan_cache.as_ref(),
+                    &query,
+                )
+                .await?
+            } else {
+                plan_prepared_query(&self.catalog, transaction.clone(), &query, parameters).await?
+            };
             let plan_time = started.elapsed();
 
             // A `SET`/`RESET` is a session command, not a query — DuckDB parsed and
@@ -516,7 +565,10 @@ impl PivotQueryHandler {
             let handle = tokio::task::spawn_blocking(move || -> Result<DataFlowHandle<_>> {
                 let outputs = plan
                     .compile(&dispatcher, compile_transaction.as_ref())?
-                    .map(move || move |batch| build_worker_output(batch, is_insert));
+                    .map(move || {
+                        let result_format = result_format.clone();
+                        move |batch| build_worker_output(batch, is_insert, &result_format)
+                    });
                 Ok(if collect_stats {
                     outputs.execute_with_stats()
                 } else {
@@ -572,7 +624,7 @@ impl PivotQueryHandler {
 }
 
 /// What [`run_query`](PivotQueryHandler::run_query) resolved a statement to.
-enum Outcome {
+pub(crate) enum Outcome {
     /// A completed statement response plus where its time went.
     Response(Response, QueryStats),
     /// A `SET`/`RESET` of a session variable (DuckDB-parsed). `value` is `None`
@@ -584,7 +636,7 @@ enum Outcome {
 
 /// Where a query's time went — phase wall-clocks plus the dataflow's IO/CPU
 /// tally — formatted into a one-line client `NOTICE` when stats are on.
-struct QueryStats {
+pub(crate) struct QueryStats {
     plan: Duration,
     compile: Duration,
     exec: Duration,
@@ -659,14 +711,46 @@ fn is_truthy(value: &str) -> bool {
 }
 
 /// Whether this connection has `pivot_stats` on.
-fn stats_on<C: ClientInfo>(client: &C) -> bool {
+pub(crate) fn stats_on<C: ClientInfo>(client: &C) -> bool {
     client.metadata().get(STATS_FLAG).is_some_and(|v| v == "on")
 }
 
 /// Whether this connection has `perf` on (set via `SET perf = 1`).
 #[cfg(feature = "perf")]
-fn perf_on<C: ClientInfo>(client: &C) -> bool {
+pub(crate) fn perf_on<C: ClientInfo>(client: &C) -> bool {
     client.metadata().get(PERF_FLAG).is_some_and(|v| v == "on")
+}
+
+/// Turn a completed statement's [`Outcome`] into its wire [`Response`]:
+/// apply a `SET`/`RESET` to the connection, and send the stats breakdown as
+/// an INFO notice before the rows when the session asked for it. Shared by
+/// the simple and extended query handlers.
+pub(crate) async fn build_outcome_response<C>(
+    client: &mut C,
+    outcome: Outcome,
+    with_stats: bool,
+) -> PgWireResult<Response>
+where
+    C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    Ok(match outcome {
+        Outcome::Set { name, value } => apply_set(client, &name, value.as_deref()),
+        Outcome::Compact => Response::Execution(Tag::new("COMPACT")),
+        Outcome::Response(res, stats) => {
+            if with_stats {
+                let notice = NoticeResponse::from(ErrorInfo::new(
+                    "INFO".to_string(),
+                    "00000".to_string(),
+                    stats.summary(),
+                ));
+                client
+                    .send(PgWireBackendMessage::NoticeResponse(notice))
+                    .await?;
+            }
+            res
+        }
+    })
 }
 
 #[async_trait]
@@ -686,31 +770,20 @@ impl SimpleQueryHandler for PivotQueryHandler {
 
         info!(sql = %query, "query received");
         let outcome = self
-            .run_query(query, with_stats, with_perf)
+            .run_query(
+                query,
+                Vec::new(),
+                Format::UnifiedText,
+                with_stats,
+                with_perf,
+            )
             .await
             .map_err(|e| {
                 warn!(error = %e, sql = %query, "query failed");
                 e.into_pgwire()
             })?;
 
-        let res = match outcome {
-            Outcome::Set { name, value } => apply_set(client, &name, value.as_deref()),
-            Outcome::Compact => Response::Execution(Tag::new("COMPACT")),
-            Outcome::Response(res, stats) => {
-                // Send the breakdown as an INFO notice before the rows.
-                if with_stats {
-                    let notice = NoticeResponse::from(ErrorInfo::new(
-                        "INFO".to_string(),
-                        "00000".to_string(),
-                        stats.summary(),
-                    ));
-                    client
-                        .send(PgWireBackendMessage::NoticeResponse(notice))
-                        .await?;
-                }
-                res
-            }
-        };
+        let res = build_outcome_response(client, outcome, with_stats).await?;
 
         info!(sql = %query, "query succeeded");
         Ok(vec![res])
@@ -768,7 +841,7 @@ impl PgWireServerHandlers for PivotHandlers {
     }
 
     fn extended_query_handler(&self) -> Arc<impl pgwire::api::query::ExtendedQueryHandler> {
-        Arc::new(NoopHandler)
+        self.query_handler.clone()
     }
 
     fn copy_handler(&self) -> Arc<impl pgwire::api::copy::CopyHandler> {

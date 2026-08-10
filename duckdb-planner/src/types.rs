@@ -67,6 +67,68 @@ impl BoundLogicalType {
     }
 }
 
+/// A prepared-statement parameter value handed to the planner, which
+/// substitutes it into the plan as a constant of the parameter's
+/// binder-inferred type (a mismatched value fails that cast).
+///
+/// The variants are deliberately few: every integer width rides `Int` and a
+/// type with no natural carrier here (e.g. DECIMAL) rides `Text` in its SQL
+/// text form, both relying on that cast.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ParameterValue {
+    Null,
+    Boolean(bool),
+    Int(i64),
+    Float(f64),
+    Text(String),
+    /// `DATE`: days since the Unix epoch (1970-01-01).
+    Date(i32),
+    /// `TIMESTAMP`: microseconds since the Unix epoch.
+    Timestamp(i64),
+}
+
+impl ParameterValue {
+    /// Encode into the flat FFI struct `extract_plan` takes: the carrier
+    /// fields are written flat and `kind` names the meaningful one.
+    pub(crate) fn to_bridge(&self) -> ffi::BridgeParameterValue {
+        let mut bridge = ffi::BridgeParameterValue {
+            kind: LogicalTypeId::SQLNULL as u8,
+            bool_value: false,
+            int_value: 0,
+            float_value: 0.0,
+            string_value: String::new(),
+        };
+        match self {
+            ParameterValue::Null => {}
+            ParameterValue::Boolean(v) => {
+                bridge.kind = LogicalTypeId::BOOLEAN as u8;
+                bridge.bool_value = *v;
+            }
+            ParameterValue::Int(v) => {
+                bridge.kind = LogicalTypeId::BIGINT as u8;
+                bridge.int_value = *v;
+            }
+            ParameterValue::Float(v) => {
+                bridge.kind = LogicalTypeId::DOUBLE as u8;
+                bridge.float_value = *v;
+            }
+            ParameterValue::Text(v) => {
+                bridge.kind = LogicalTypeId::VARCHAR as u8;
+                bridge.string_value = v.clone();
+            }
+            ParameterValue::Date(v) => {
+                bridge.kind = LogicalTypeId::DATE as u8;
+                bridge.int_value = *v as i64;
+            }
+            ParameterValue::Timestamp(v) => {
+                bridge.kind = LogicalTypeId::TIMESTAMP as u8;
+                bridge.int_value = *v;
+            }
+        }
+        bridge
+    }
+}
+
 /// A constant value from the query (or a table-function argument), extracted from
 /// DuckDB as a typed value rather than a string.
 ///
@@ -76,6 +138,9 @@ impl BoundLogicalType {
 /// report it.
 #[derive(Debug, Clone)]
 pub enum ScalarValue {
+    /// A SQL NULL constant, carrying its full logical type (a NULL is always
+    /// typed in a bound plan, e.g. `NULL::VARCHAR` in a VALUES row).
+    Null(BoundLogicalType),
     Boolean(bool),
     Int8(i8),
     Int16(i16),
@@ -118,6 +183,7 @@ pub enum ScalarValue {
 impl fmt::Display for ScalarValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ScalarValue::Null(_) => write!(f, "NULL"),
             ScalarValue::Boolean(v) => write!(f, "{v}"),
             ScalarValue::Int8(v) => write!(f, "{v}"),
             ScalarValue::Int16(v) => write!(f, "{v}"),

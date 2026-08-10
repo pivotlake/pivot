@@ -13,6 +13,7 @@ struct ExtractPlanResult;
 struct BridgeLogicalType;
 struct BridgeDecimalValue;
 struct BridgeHugeint;
+struct BridgeParameterValue;
 
 // DuckDB exceptions serialize themselves as JSON; returns the embedded
 // exception type and message when present, the raw what() otherwise.
@@ -68,7 +69,8 @@ struct ExpressionList {
 
 std::unique_ptr<DuckPlannerContext> new_context(rust::Box<CatalogContext> catalog);
 ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
-                               const TransactionContext &transaction);
+                               const TransactionContext &transaction,
+                               const rust::Vec<BridgeParameterValue> &parameter_values);
 
 const LogicalOperator &plan_root(const PlanHandle &plan);
 size_t rowid_column_id();
@@ -148,6 +150,10 @@ bool lo_get_has_named_params(const LogicalOperator &op);
 size_t lo_get_param_count(const LogicalOperator &op);
 const Value &lo_get_param(const LogicalOperator &op, size_t index);
 
+// ---- EmptyResult ----
+size_t lo_empty_result_type_count(const LogicalOperator &op);
+BridgeLogicalType lo_empty_result_type(const LogicalOperator &op, size_t index);
+
 // ---- CreateTable ----
 rust::String lo_create_table_name(const LogicalOperator &op);
 rust::String lo_create_table_datastore(const LogicalOperator &op);
@@ -214,6 +220,8 @@ rust::String expr_alias(const Expression &expr);
 const Value &expr_constant(const Expression &expr);
 
 uint8_t value_type(const Value &v);
+bool value_is_null(const Value &v);
+BridgeLogicalType value_logical_type(const Value &v);
 bool value_bool(const Value &v);
 int8_t value_i8(const Value &v);
 int16_t value_i16(const Value &v);

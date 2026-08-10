@@ -1,13 +1,18 @@
 //! Encode an Arrow [`RecordBatch`] into pgwire `FieldInfo` schemas and
 //! `DataRow` streams.
 //!
-//! Only **text format** is emitted (pgwire's [`FieldFormat::Text`]). It is the
-//! universally supported representation, requires no per-type binary encoder,
-//! and matches what `psql` prints. Each Arrow array kind has a dedicated
+//! The simple query protocol always uses **text format** (pgwire's
+//! [`FieldFormat::Text`]), the universally supported representation matching
+//! what `psql` prints. The extended protocol lets a client request **binary**
+//! per result column (a Bind's result-format codes, carried here as a
+//! [`Format`]); the arrow kinds with a natural `ToSql` carrier encode that
+//! way, and a binary request for a kind without one is an error rather than
+//! text bytes mislabelled as binary. Each Arrow array kind has a dedicated
 //! `encode` arm that pushes its native Rust type into [`DataRowEncoder`];
-//! anything we can't represent precisely is shipped as `text` so at least
-//! the value arrives.
+//! in text format, anything we can't represent precisely is shipped as
+//! `text` so at least the value arrives.
 
+use std::str::FromStr;
 use std::sync::Arc;
 
 use arrow_array::{
@@ -18,22 +23,25 @@ use arrow_array::{
 use arrow_schema::{DataType, SchemaRef};
 
 use pgwire::api::Type;
+use pgwire::api::portal::Format;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo};
 use pgwire::messages::data::DataRow;
 
 /// Build a pgwire row schema from an Arrow [`SchemaRef`]. Each Arrow column
-/// becomes one [`FieldInfo`] with the closest matching Postgres [`Type`].
-pub fn build_field_info(schema: &SchemaRef) -> Arc<Vec<FieldInfo>> {
+/// becomes one [`FieldInfo`] with the closest matching Postgres [`Type`] and
+/// the client-requested format for that column.
+pub fn build_field_info(schema: &SchemaRef, format: &Format) -> Arc<Vec<FieldInfo>> {
     let fields = schema
         .fields()
         .iter()
-        .map(|f| {
+        .enumerate()
+        .map(|(idx, f)| {
             FieldInfo::new(
                 f.name().clone(),
                 None,
                 None,
                 pg_type_for_arrow(f.data_type()),
-                FieldFormat::Text,
+                format.format_for(idx),
             )
         })
         .collect();
@@ -45,18 +53,26 @@ pub struct PGRowBatch {
     pub fields: Arc<Vec<FieldInfo>>,
 }
 
-impl From<RecordBatch> for PGRowBatch {
-    fn from(batch: RecordBatch) -> Self {
-        let fields = build_field_info(&batch.schema());
+impl PGRowBatch {
+    /// Encode every row of `batch` in the client-requested per-column
+    /// `format`. Fails when a column's value cannot be represented in its
+    /// requested format (rather than shipping mislabelled bytes).
+    pub fn new(batch: RecordBatch, format: &Format) -> Result<Self, String> {
+        let fields = build_field_info(&batch.schema(), format);
         let mut encoder = DataRowEncoder::new(fields.clone());
         let mut rows = Vec::with_capacity(batch.num_rows());
         for row in 0..batch.num_rows() {
             for col in 0..batch.num_columns() {
-                encode_cell(&mut encoder, batch.column(col).as_ref(), row);
+                encode_cell(
+                    &mut encoder,
+                    batch.column(col).as_ref(),
+                    row,
+                    fields[col].format(),
+                )?;
             }
             rows.push(encoder.take_row());
         }
-        Self { rows, fields }
+        Ok(Self { rows, fields })
     }
 }
 
@@ -83,7 +99,7 @@ macro_rules! arrow_pg_types {
     ) => {
         /// Map an Arrow [`DataType`] to its closest Postgres [`Type`]. Values we
         /// can't represent precisely fall back to [`Type::TEXT`].
-        fn pg_type_for_arrow(dt: &DataType) -> Type {
+        pub(crate) fn pg_type_for_arrow(dt: &DataType) -> Type {
             match dt {
                 $( DataType::$dt => Type::$pg, )+
                 $( DataType::$udt => Type::$upg, )+
@@ -101,16 +117,26 @@ macro_rules! arrow_pg_types {
             }
         }
 
-        /// Encode a single cell. We always feed the encoder a typed Rust value
-        /// (or `Option::None` for SQL NULL) so pgwire's `ToSqlText` impl handles
-        /// the formatting, with no manual `to_string()` round-trips.
-        fn encode_cell(encoder: &mut DataRowEncoder, arr: &dyn Array, row: usize) {
+        /// Encode a single cell in the given format. We always feed the
+        /// encoder a typed Rust value (or `Option::None` for SQL NULL) so
+        /// pgwire's `ToSqlText`/`ToSql` impls handle the formatting, with no
+        /// manual `to_string()` round-trips. The `direct`/`widened` carriers
+        /// encode both formats; the spelled-out arms pick a carrier per
+        /// format, erring when a binary request has no faithful encoding.
+        fn encode_cell(
+            encoder: &mut DataRowEncoder,
+            arr: &dyn Array,
+            row: usize,
+            format: FieldFormat,
+        ) -> Result<(), String> {
             if arr.is_null(row) {
-                // Type is irrelevant for null encoding: the encoder writes -1 length.
-                let _ = encoder.encode_field::<Option<&str>>(&None);
-                return;
+                // Type and format are irrelevant for null encoding: the
+                // encoder writes -1 length.
+                return encoder
+                    .encode_field::<Option<&str>>(&None)
+                    .map_err(|e| e.to_string());
             }
-            let _ = match arr.data_type() {
+            match arr.data_type() {
                 $( DataType::$dt => encoder
                     .encode_field(&arr.as_any().downcast_ref::<$array>().unwrap().value(row)), )+
                 // Unsigned ints widen to the next signed type so the value fits.
@@ -121,34 +147,75 @@ macro_rules! arrow_pg_types {
                 // Decimals in either carrier width (Decimal128 is e.g. the SUM
                 // aggregate output). `value_as_string` renders the
                 // integer/decimal with its scale applied; scale 0 yields a
-                // plain integer like "12345".
-                DataType::Decimal64(_, _) => encoder.encode_field(
-                    &arr.as_any().downcast_ref::<Decimal64Array>().unwrap().value_as_string(row),
+                // plain integer like "12345". Binary NUMERIC rides
+                // `rust_decimal`, whose 28-digit range is narrower than
+                // Decimal128's; an out-of-range value is an error.
+                DataType::Decimal64(_, _) => return encode_decimal(
+                    encoder,
+                    arr.as_any().downcast_ref::<Decimal64Array>().unwrap().value_as_string(row),
+                    format,
                 ),
-                DataType::Decimal128(_, _) => encoder.encode_field(
-                    &arr.as_any().downcast_ref::<Decimal128Array>().unwrap().value_as_string(row),
+                DataType::Decimal128(_, _) => return encode_decimal(
+                    encoder,
+                    arr.as_any().downcast_ref::<Decimal128Array>().unwrap().value_as_string(row),
+                    format,
                 ),
-                // Temporal columns render as their ISO string, Postgres's text
-                // wire form for DATE/TIMESTAMP. A timestamp's fraction goes
-                // through [`trim_fraction`] to match what a server prints.
-                // Handing the encoder the chrono value itself would also
-                // encode, but pgwire's `ToSqlText` fixes the fraction at six
-                // digits, so every whole second would arrive as `.000000`.
-                // Only text format is emitted (see the module doc), so nothing
-                // here rests on the encoder's binary path.
-                DataType::Date32 => encoder.encode_field(
-                    &arr.as_any().downcast_ref::<Date32Array>().unwrap()
-                        .value_as_date(row).map(|d| d.to_string()),
-                ),
-                DataType::Timestamp(_, _) => encoder.encode_field(
-                    &arr.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap()
-                        .value_as_datetime(row).map(|t| trim_fraction(t.to_string())),
-                ),
-                // Best-effort fallback: stringify and ship as text.
-                _ => encoder.encode_field(&format!("{:?}", arr.slice(row, 1))),
-            };
+                // In text format, temporal columns render as their ISO string,
+                // Postgres's text wire form for DATE/TIMESTAMP. A timestamp's
+                // fraction goes through [`trim_fraction`] to match what a
+                // server prints. Handing the encoder the chrono value itself
+                // would also encode, but pgwire's `ToSqlText` fixes the
+                // fraction at six digits, so every whole second would arrive
+                // as `.000000`. In binary format the chrono value is the
+                // carrier.
+                DataType::Date32 => {
+                    let date = arr.as_any().downcast_ref::<Date32Array>().unwrap()
+                        .value_as_date(row);
+                    match format {
+                        FieldFormat::Text => encoder.encode_field(&date.map(|d| d.to_string())),
+                        FieldFormat::Binary => encoder.encode_field(&date),
+                    }
+                }
+                DataType::Timestamp(_, _) => {
+                    let timestamp = arr.as_any().downcast_ref::<TimestampMicrosecondArray>()
+                        .unwrap().value_as_datetime(row);
+                    match format {
+                        FieldFormat::Text => encoder
+                            .encode_field(&timestamp.map(|t| trim_fraction(t.to_string()))),
+                        FieldFormat::Binary => encoder.encode_field(&timestamp),
+                    }
+                }
+                // Best-effort fallback: stringify and ship as text. There is
+                // no faithful binary rendering for these kinds.
+                other => match format {
+                    FieldFormat::Text => encoder.encode_field(&format!("{:?}", arr.slice(row, 1))),
+                    FieldFormat::Binary => {
+                        return Err(format!("binary result format is not supported for {other}"));
+                    }
+                },
+            }
+            .map_err(|e| e.to_string())
         }
     };
+}
+
+/// Encode one decimal cell, already rendered with its scale applied. Text
+/// ships the rendering as-is; binary parses it into a `rust_decimal::Decimal`
+/// (the NUMERIC `ToSql` carrier), failing on values beyond its 28-digit range.
+fn encode_decimal(
+    encoder: &mut DataRowEncoder,
+    rendered: String,
+    format: FieldFormat,
+) -> Result<(), String> {
+    match format {
+        FieldFormat::Text => encoder.encode_field(&rendered),
+        FieldFormat::Binary => {
+            let decimal = rust_decimal::Decimal::from_str(&rendered)
+                .map_err(|e| format!("NUMERIC value {rendered} has no binary encoding: {e}"))?;
+            encoder.encode_field(&decimal)
+        }
+    }
+    .map_err(|e| e.to_string())
 }
 
 /// Drop the trailing zeros from a rendered timestamp's fractional second, and
@@ -228,7 +295,7 @@ mod tests {
     }
 
     fn rows(batch: &RecordBatch) -> Vec<Vec<Option<String>>> {
-        let pg: PGRowBatch = batch.clone().into();
+        let pg = PGRowBatch::new(batch.clone(), &Format::UnifiedText).unwrap();
         pg.rows.iter().map(decode_text_row).collect()
     }
 
@@ -243,7 +310,7 @@ mod tests {
             ("s", DataType::Utf8),
         ]);
 
-        let fields = build_field_info(&schema);
+        let fields = build_field_info(&schema, &Format::UnifiedText);
 
         assert_eq!(fields.len(), 6);
         assert_eq!(fields[0].name(), "flag");
@@ -264,7 +331,7 @@ mod tests {
             ("c", DataType::UInt32),
         ]);
 
-        let fields = build_field_info(&schema);
+        let fields = build_field_info(&schema, &Format::UnifiedText);
 
         assert_eq!(fields[0].datatype(), &Type::INT2);
         assert_eq!(fields[1].datatype(), &Type::INT4);
@@ -366,7 +433,10 @@ mod tests {
 
     #[test]
     fn decimal128_maps_to_numeric() {
-        let fields = build_field_info(&schema(vec![("s", DataType::Decimal128(38, 0))]));
+        let fields = build_field_info(
+            &schema(vec![("s", DataType::Decimal128(38, 0))]),
+            &Format::UnifiedText,
+        );
         assert_eq!(fields[0].datatype(), &Type::NUMERIC);
     }
 
@@ -387,7 +457,10 @@ mod tests {
 
     #[test]
     fn decimal64_maps_to_numeric() {
-        let fields = build_field_info(&schema(vec![("v", DataType::Decimal64(10, 2))]));
+        let fields = build_field_info(
+            &schema(vec![("v", DataType::Decimal64(10, 2))]),
+            &Format::UnifiedText,
+        );
         assert_eq!(fields[0].datatype(), &Type::NUMERIC);
     }
 
@@ -396,7 +469,7 @@ mod tests {
         let col: ArrayRef = Arc::new(Date32Array::from(vec![0, 7]));
         let b = batch(vec![("d", DataType::Date32)], vec![col]);
 
-        let fields = build_field_info(&b.schema());
+        let fields = build_field_info(&b.schema(), &Format::UnifiedText);
         let decoded = rows(&b);
 
         assert_eq!(fields[0].datatype(), &Type::DATE);
@@ -450,7 +523,7 @@ mod tests {
             vec![col],
         );
 
-        let fields = build_field_info(&b.schema());
+        let fields = build_field_info(&b.schema(), &Format::UnifiedText);
         let decoded = rows(&b);
 
         assert_eq!(fields[0].datatype(), &Type::TIMESTAMP);

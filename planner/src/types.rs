@@ -274,6 +274,13 @@ fn variant_struct_type() -> DataType {
 /// suitable for use as a constant in the executor.
 pub fn build_scalar_value(value: ScalarValue) -> Result<Scalar<ArrayRef>, Error> {
     let array: ArrayRef = match value {
+        // A NULL constant is always typed in a bound plan (e.g. a NULL cell in
+        // a VALUES row carries its column's type); it lands on that type's
+        // carrier as a one-row null array.
+        ScalarValue::Null(bound) => {
+            let null_type = type_from_logical(bound)?;
+            arrow_array::new_null_array(&physical_arrow_type(&null_type), 1)
+        }
         ScalarValue::Boolean(v) => Arc::new(BooleanArray::new_scalar(v).into_inner()),
         ScalarValue::Int8(v) => Arc::new(Int8Array::new_scalar(v).into_inner()),
         ScalarValue::Int16(v) => Arc::new(Int16Array::new_scalar(v).into_inner()),

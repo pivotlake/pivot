@@ -16,6 +16,7 @@
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
+#include "duckdb/planner/operator/logical_empty_result.hpp"
 #include "duckdb/planner/operator/logical_create.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
@@ -40,6 +41,8 @@
 #include "duckdb/common/types/interval.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "duckdb/planner/logical_operator_visitor.hpp"
+#include "duckdb/planner/expression/bound_parameter_expression.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
@@ -90,6 +93,8 @@ std::string bridge_exception_message(const std::exception &e) {
 	return e.what();
 }
 
+static BridgeLogicalType bridge_logical_type(const duckdb::LogicalType &type);
+
 static ExtractPlanResult make_error(const string &kind, const string &message,
                                     std::optional<string> position = std::nullopt) {
 	ExtractPlanResult result;
@@ -97,6 +102,7 @@ static ExtractPlanResult make_error(const string &kind, const string &message,
 	result.error_message = rust::String::lossy(message);
 	result.has_error_position = position.has_value();
 	result.error_position = rust::String::lossy(position.value_or(""));
+	result.returns_query_result = false;
 	return result;
 }
 
@@ -187,15 +193,83 @@ PlanHandle::~PlanHandle() {
 	}
 }
 
+// Turn one wire-decoded parameter value into the DuckDB `Value` the plan will
+// carry. The discriminant names which carrier field holds the value (see
+// `BridgeParameterValue`); the value is then cast to the parameter's
+// binder-inferred type, so a mismatch surfaces as a cast error here rather
+// than a mistyped plan downstream.
+static duckdb::Value parameter_value(const BridgeParameterValue &param) {
+	switch (static_cast<duckdb::LogicalTypeId>(param.kind)) {
+	case duckdb::LogicalTypeId::SQLNULL:
+		return duckdb::Value();
+	case duckdb::LogicalTypeId::BOOLEAN:
+		return duckdb::Value::BOOLEAN(param.bool_value);
+	case duckdb::LogicalTypeId::BIGINT:
+		return duckdb::Value::BIGINT(param.int_value);
+	case duckdb::LogicalTypeId::DOUBLE:
+		return duckdb::Value::DOUBLE(param.float_value);
+	case duckdb::LogicalTypeId::VARCHAR:
+		return duckdb::Value(std::string(param.string_value));
+	case duckdb::LogicalTypeId::DATE:
+		return duckdb::Value::DATE(duckdb::date_t(static_cast<int32_t>(param.int_value)));
+	case duckdb::LogicalTypeId::TIMESTAMP:
+		return duckdb::Value::TIMESTAMP(duckdb::timestamp_t(param.int_value));
+	default:
+		throw duckdb::InvalidInputException("unsupported parameter value kind %d",
+		                                    static_cast<int>(param.kind));
+	}
+}
+
+// Rewrites every `$n` (`BoundParameterExpression`) in a bound plan into a
+// `BoundConstantExpression` holding that parameter's value. Runs before the
+// optimizer, so a substituted plan is indistinguishable from one written with
+// inline literals (constant folding, filter pushdown, and the pivot walk's
+// constant expectations all apply).
+class ParameterSubstituter : public duckdb::LogicalOperatorVisitor {
+public:
+	explicit ParameterSubstituter(const duckdb::vector<duckdb::Value> &values) : values(values) {
+	}
+
+protected:
+	duckdb::unique_ptr<duckdb::Expression>
+	VisitReplace(duckdb::BoundParameterExpression &expr,
+	             duckdb::unique_ptr<duckdb::Expression> *expr_ptr) override {
+		// Identifiers were validated as exactly "1".."n" when the parameter
+		// types were collected.
+		idx_t index = std::stoull(expr.identifier);
+		auto value = values[index - 1].DefaultCastAs(expr.return_type);
+		return duckdb::make_uniq<duckdb::BoundConstantExpression>(std::move(value));
+	}
+
+private:
+	const duckdb::vector<duckdb::Value> &values;
+};
+
+// What the planner resolved about a statement beyond the plan tree itself:
+// the client-facing result columns, the `$n` parameter types, and whether
+// executing it produces a result set (vs a changed-row count or nothing).
+struct PlannedStatementInfo {
+	duckdb::vector<std::string> result_names;
+	duckdb::vector<duckdb::LogicalType> result_types;
+	duckdb::vector<duckdb::LogicalType> parameter_types;
+	bool returns_query_result = false;
+};
+
 // Replicates `duckdb::ClientContext::ExtractPlan`, additionally returning the
-// binder-resolved result column names (in select order) via `result_names`.
-// The stock `ExtractPlan` computes those names on its local `Planner` and then
-// discards them when it returns only the plan; we reproduce its body here (the
-// binder/optimizer/resolver steps are all public API) so the names can be
-// captured without patching the bundled DuckDB.
+// binder-resolved statement info via `info`. The stock `ExtractPlan` computes
+// those on its local `Planner` and then discards them when it returns only the
+// plan; we reproduce its body here (the binder/optimizer/resolver steps are
+// all public API) so they can be captured without patching the bundled DuckDB.
+//
+// `parameter_values` are the wire values of a prepared statement's `$1..$n`,
+// substituted into the plan as constants before optimization; empty means
+// plan without values (an execute of an unparameterized statement, or a
+// describe, which only reads `info`). Parameters are supported only when the
+// binder can infer every parameter's type from the statement alone.
 static duckdb::unique_ptr<duckdb::LogicalOperator>
 extract_plan_with_names(duckdb::Connection &con, const std::string &query,
-                        duckdb::vector<std::string> &result_names) {
+                        const rust::Vec<BridgeParameterValue> &parameter_values,
+                        PlannedStatementInfo &info) {
 	auto statements = con.ExtractStatements(query);
 	if (statements.size() != 1) {
 		throw duckdb::InvalidInputException("ExtractPlan can only prepare a single statement");
@@ -205,11 +279,55 @@ extract_plan_with_names(duckdb::Connection &con, const std::string &query,
 	context.RunFunctionInTransaction([&]() {
 		duckdb::Planner planner(context);
 		planner.CreatePlan(std::move(statements[0]));
-		// The binder resolves the client-facing result column names before
+
+		idx_t parameter_count = planner.properties.parameter_count;
+		if (parameter_count > 0 && (!planner.plan || !planner.properties.bound_all_parameters)) {
+			throw duckdb::BinderException(
+			    "the types of the statement's parameters could not be inferred from the "
+			    "statement alone; add casts (e.g. $1::INTEGER)");
+		}
+		if (!planner.plan) {
+			throw duckdb::InvalidInputException("planner produced no plan");
+		}
+		for (idx_t i = 1; i <= parameter_count; i++) {
+			auto entry = planner.value_map.find(std::to_string(i));
+			if (entry == planner.value_map.end()) {
+				throw duckdb::BinderException("prepared statement parameters must be numbered $1..$" +
+				                              std::to_string(parameter_count) + " with no gaps");
+			}
+			info.parameter_types.push_back(entry->second->return_type);
+		}
+
+		// The binder resolves the client-facing result columns before
 		// optimization rewrites the plan; capture them while still intact.
-		result_names = planner.names;
+		info.result_names = planner.names;
+		info.result_types = planner.types;
+		info.returns_query_result =
+		    planner.properties.return_type == duckdb::StatementReturnType::QUERY_RESULT;
+
+		if (!parameter_values.empty()) {
+			if (parameter_values.size() != parameter_count) {
+				throw duckdb::BinderException(
+				    "statement requires " + std::to_string(parameter_count) + " parameters, " +
+				    std::to_string(parameter_values.size()) + " were bound");
+			}
+			duckdb::vector<duckdb::Value> values;
+			for (idx_t i = 0; i < parameter_values.size(); i++) {
+				values.push_back(
+				    parameter_value(parameter_values[i]).DefaultCastAs(info.parameter_types[i]));
+			}
+			ParameterSubstituter substituter(values);
+			substituter.VisitOperator(*planner.plan);
+		}
+
 		plan = std::move(planner.plan);
-		if (context.config.enable_optimizer) {
+		// A parameterized plan without values only answers a describe: its
+		// metadata is captured above, and the optimizer would hand `$n`
+		// placeholders to the catalog callbacks (e.g. filter pushdown), so it
+		// is skipped. The execute path substitutes values first and optimizes
+		// as usual.
+		bool metadata_only = parameter_count > 0 && parameter_values.empty();
+		if (context.config.enable_optimizer && !metadata_only) {
 			duckdb::Optimizer optimizer(*planner.binder, context);
 			plan = optimizer.Optimize(std::move(plan));
 		}
@@ -238,17 +356,16 @@ struct CurrentTransactionScope {
 };
 
 ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
-                               const TransactionContext &transaction) {
+                               const TransactionContext &transaction,
+                               const rust::Vec<BridgeParameterValue> &parameter_values) {
 	duckdb::unique_ptr<duckdb::LogicalOperator> plan;
-	duckdb::vector<std::string> name_list;
+	PlannedStatementInfo info;
 	std::optional<ExtractPlanResult> error;
 	CurrentTransactionScope transaction_scope(PivotStorageInfo::Get(*ctx.db.instance), transaction);
 
 	try {
 		std::string query_str(query.data(), query.size());
-		// The result column names DuckDB would hand a client, in select order
-		// (e.g. `["hour", "count_star()"]` for `SELECT f(t) AS hour, COUNT(*)`).
-		plan = extract_plan_with_names(ctx.con, query_str, name_list);
+		plan = extract_plan_with_names(ctx.con, query_str, parameter_values, info);
 		// Rewrite DuckDB's column *bindings* (table_index, column_index) into
 		// positional BoundReference indices against each operator's actual child
 		// output. This is the standard resolution DuckDB runs before execution;
@@ -277,9 +394,18 @@ ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
 	handle->root = std::move(plan);
 	handle->ctx = &ctx;
 	result.plan = std::move(handle);
-	for (auto &name : name_list) {
+	// The result column names DuckDB would hand a client, in select order
+	// (e.g. `["hour", "count_star()"]` for `SELECT f(t) AS hour, COUNT(*)`).
+	for (auto &name : info.result_names) {
 		result.output_names.push_back(rust::String::lossy(name));
 	}
+	for (auto &type : info.result_types) {
+		result.output_types.push_back(bridge_logical_type(type));
+	}
+	for (auto &type : info.parameter_types) {
+		result.parameter_types.push_back(bridge_logical_type(type));
+	}
+	result.returns_query_result = info.returns_query_result;
 	return result;
 }
 
@@ -664,6 +790,16 @@ const Value &lo_get_param(const LogicalOperator &op, size_t index) {
 	return as<duckdb::LogicalGet>(op).parameters[index];
 }
 
+// ---- EmptyResult ----
+
+size_t lo_empty_result_type_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalEmptyResult>(op).return_types.size();
+}
+
+BridgeLogicalType lo_empty_result_type(const LogicalOperator &op, size_t index) {
+	return bridge_logical_type(as<duckdb::LogicalEmptyResult>(op).return_types[index]);
+}
+
 // ---- CreateTable ----
 
 static duckdb::CreateTableInfo &create_table_info(const LogicalOperator &op) {
@@ -970,6 +1106,14 @@ const Value &expr_constant(const Expression &expr) {
 // the requested type matches the value's own.
 uint8_t value_type(const Value &v) {
 	return static_cast<uint8_t>(v.type().id());
+}
+bool value_is_null(const Value &v) {
+	return v.IsNull();
+}
+// The value's full logical type, for the reads (a NULL constant) where the
+// typed accessors don't apply and `value_type` alone can't complete a DECIMAL.
+BridgeLogicalType value_logical_type(const Value &v) {
+	return bridge_logical_type(v.type());
 }
 bool value_bool(const Value &v) {
 	return v.GetValue<bool>();

@@ -57,6 +57,20 @@ pub mod ffi {
         pub lo: u64,
     }
 
+    /// One prepared-statement parameter value handed into `extract_plan`. CXX
+    /// cannot pass Rust enums, so the value rides flat: `kind` is a DuckDB
+    /// `LogicalTypeId` discriminant naming which carrier field holds the value
+    /// (`SQLNULL` for SQL NULL, `BOOLEAN`, `BIGINT`, `DOUBLE`, `VARCHAR`,
+    /// `DATE` and `TIMESTAMP` in `int_value` as days/microseconds since the
+    /// epoch); the C++ side casts it to the parameter's binder-inferred type.
+    struct BridgeParameterValue {
+        pub kind: u8,
+        pub bool_value: bool,
+        pub int_value: i64,
+        pub float_value: f64,
+        pub string_value: String,
+    }
+
     /// Result of a catalog table lookup, allowing C++ to inspect the outcome.
     struct CatalogGetTableResult {
         pub found: bool,
@@ -115,6 +129,15 @@ pub mod ffi {
         /// in select order (e.g. `["hour", "count_star()"]`). Empty when the
         /// bridge could not recover them.
         pub output_names: Vec<String>,
+        /// The binder-resolved result column types, matching `output_names`.
+        pub output_types: Vec<BridgeLogicalType>,
+        /// The binder-inferred type of each `$n` parameter, ordered by n.
+        /// Planning fails when a parameter's type cannot be inferred from the
+        /// statement alone, so on success every parameter is covered.
+        pub parameter_types: Vec<BridgeLogicalType>,
+        /// Whether executing the statement produces a result set, as opposed
+        /// to a changed-row count (INSERT) or nothing (DDL, SET).
+        pub returns_query_result: bool,
     }
 
     extern "Rust" {
@@ -179,10 +202,15 @@ pub mod ffi {
         /// (see `PivotSchemaCatalogEntry::LookupEntry`). The reference only
         /// needs to outlive this call; the C++ side clears its pointer before
         /// returning.
+        /// `parameter_values` are the wire values for a prepared statement's
+        /// `$1..$n`, substituted into the plan as constants before
+        /// optimization; empty plans without values (no parameters, or a
+        /// describe that only reads the statement metadata).
         fn extract_plan(
             ctx: Pin<&mut DuckPlannerContext>,
             query: &str,
             transaction: &TransactionContext,
+            parameter_values: &Vec<BridgeParameterValue>,
         ) -> Result<ExtractPlanResult>;
 
         fn plan_root(plan: &PlanHandle) -> Result<&LogicalOperator>;
@@ -296,6 +324,12 @@ pub mod ffi {
         fn lo_get_param_count(op: &LogicalOperator) -> Result<usize>;
         fn lo_get_param(op: &LogicalOperator, index: usize) -> Result<&Value>;
 
+        // ---- EmptyResult ----
+        /// The output column types of a `LogicalEmptyResult` (the subtree the
+        /// optimizer proved returns no rows).
+        fn lo_empty_result_type_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_empty_result_type(op: &LogicalOperator, index: usize) -> Result<BridgeLogicalType>;
+
         // ---- CreateTable ----
         fn lo_create_table_name(op: &LogicalOperator) -> Result<String>;
         /// The target database (datastore) of `CREATE TABLE db.schema.t`, or empty
@@ -408,8 +442,13 @@ pub mod ffi {
         fn expr_constant(expr: &Expression) -> Result<&Value>;
 
         // ---- Value: typed accessors (shared by constants and table-function
-        // arguments). Read `value_type` first, then the matching accessor.
+        // arguments). Read `value_is_null` and `value_type` first, then the
+        // matching accessor (none of which apply to a NULL).
         fn value_type(v: &Value) -> Result<u8>;
+        fn value_is_null(v: &Value) -> Result<bool>;
+        /// The value's full logical type, for the reads (a NULL constant)
+        /// where `value_type` alone can't complete a DECIMAL.
+        fn value_logical_type(v: &Value) -> Result<BridgeLogicalType>;
         fn value_bool(v: &Value) -> Result<bool>;
         fn value_i8(v: &Value) -> Result<i8>;
         fn value_i16(v: &Value) -> Result<i16>;
