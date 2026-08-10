@@ -9,7 +9,7 @@
 //! # use arrow_array::{RecordBatch, StringViewArray};
 //! # use dispatch::*;
 //! # use dispatch::table_input;
-//! # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
+//! # let table = Arc::new(ParquetTable::from_files(dispatcher, &["/tmp/data.parquet"], &[]).unwrap());
 //! # let dispatch = Dispatch::spin_up(1, 32, None);
 //! let results = table_input(dispatch.dispatcher(), &table, Projection::columns([0]), false)
 //!     .filter(|| {

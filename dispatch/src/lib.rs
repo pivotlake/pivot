@@ -31,7 +31,7 @@
 //! # use dispatch::table_input;
 //! # let dispatch = Dispatch::spin_up(1, 32, None);
 //! # let dispatcher = dispatch.dispatcher();
-//! # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
+//! # let table = Arc::new(ParquetTable::from_files(dispatcher, &["/tmp/data.parquet"], &[]).unwrap());
 //! // SELECT COUNT(*) FROM events WHERE url LIKE '%google%'
 //! let results = table_input(&dispatcher, &table, Projection::columns([13]), false)
 //!     .filter(|| {
@@ -243,7 +243,7 @@ impl DataFlowDispatcher {
     /// Ship a `FnOnce() -> T` to worker 0 and return its result.
     ///
     /// Useful for one-shot setup work that needs a `MemoryContext` to run
-    /// (e.g. `ParquetTable::from_directory`, which touches the compressed cache)
+    /// (e.g. `ParquetTable::from_files`, which touches the compressed cache)
     /// from a thread that doesn't have one. Builds a single-element
     /// `OperatorSpec` whose nullary fires once, sends one item, and finishes.
     pub fn run_on_worker<T, F>(&self, f: F) -> crate::data_flow::Result<T>

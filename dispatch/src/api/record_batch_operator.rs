@@ -8,7 +8,7 @@
 //! # use arrow_array::{RecordBatch, StringViewArray};
 //! # use dispatch::*;
 //! # use dispatch::table_input;
-//! # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
+//! # let table = Arc::new(ParquetTable::from_files(dispatcher, &["/tmp/data.parquet"], &[]).unwrap());
 //! # let dispatch = Dispatch::spin_up(1, 32, None);
 //! # let dispatcher = dispatch.dispatcher();
 //! // SELECT COUNT(*) FROM events WHERE url LIKE '%google%'
@@ -81,7 +81,7 @@ pub const RECORD_BATCH_SIZE: usize = 8192;
 /// # use arrow_array::{RecordBatch, StringViewArray};
 /// # use dispatch::*;
 /// # use dispatch::table_input;
-/// # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
+/// # let table = Arc::new(ParquetTable::from_files(dispatcher, &["/tmp/data.parquet"], &[]).unwrap());
 /// # let dispatch = Dispatch::spin_up(1, 32, None);
 /// # let dispatcher = dispatch.dispatcher();
 /// let results = table_input(&dispatcher, &table, Projection::columns([0]), false)
@@ -109,7 +109,7 @@ pub const RECORD_BATCH_SIZE: usize = 8192;
 /// # use arrow_array::{RecordBatch, StringViewArray};
 /// # use dispatch::*;
 /// # use dispatch::table_input;
-/// # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
+/// # let table = Arc::new(ParquetTable::from_files(dispatcher, &["/tmp/data.parquet"], &[]).unwrap());
 /// # let dispatch = Dispatch::spin_up(1, 32, None);
 /// # let dispatcher = dispatch.dispatcher();
 /// # let spec = table_input(&dispatcher, &table, Projection::columns([0]), false);
@@ -320,7 +320,7 @@ impl RecordBatchOperatorSpec {
     /// # use arrow_array::{RecordBatch, StringViewArray};
     /// # use dispatch::*;
     /// # use dispatch::table_input;
-    /// # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
+    /// # let table = Arc::new(ParquetTable::from_files(dispatcher, &["/tmp/data.parquet"], &[]).unwrap());
     /// # let dispatch = Dispatch::spin_up(1, 32, None);
     /// # let dispatcher = dispatch.dispatcher();
     /// # let spec = table_input(&dispatcher, &table, Projection::columns([0]), false);
@@ -396,7 +396,7 @@ impl RecordBatchOperatorSpec {
     /// # use std::sync::Arc;
     /// # use arrow_array::{Int64Array, RecordBatch};
     /// # use dispatch::*;
-    /// # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
+    /// # let table = Arc::new(ParquetTable::from_files(dispatcher, &["/tmp/data.parquet"], &[]).unwrap());
     /// # let dispatch = Dispatch::spin_up(1, 32, None);
     /// # let dispatcher = dispatch.dispatcher();
     /// # let spec = table_input(&dispatcher, &table, Projection::columns([0]), false);
@@ -467,7 +467,7 @@ impl RecordBatchOperatorSpec {
     /// # use std::sync::Arc;
     /// # use dispatch::*;
     /// # use dispatch::table_input;
-    /// # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
+    /// # let table = Arc::new(ParquetTable::from_files(dispatcher, &["/tmp/data.parquet"], &[]).unwrap());
     /// # let dispatch = Dispatch::spin_up(1, 32, None);
     /// # let dispatcher = dispatch.dispatcher();
     /// # let spec = table_input(&dispatcher, &table, Projection::columns([0]), false);
@@ -800,7 +800,7 @@ impl RecordBatchOperatorSpec {
     /// # use std::sync::Arc;
     /// # use arrow_array::{RecordBatch, StringViewArray};
     /// # use dispatch::*;
-    /// # let table = Arc::new(ParquetTable::from_directory(std::path::Path::new("/tmp")).unwrap());
+    /// # let table = Arc::new(ParquetTable::from_files(dispatcher, &["/tmp/data.parquet"], &[]).unwrap());
     /// # let dispatch = Dispatch::spin_up(1, 32, None);
     /// # let dispatcher = dispatch.dispatcher();
     /// let batches: Vec<RecordBatch> = table_input(&dispatcher, &table, Projection::columns([0]), false)

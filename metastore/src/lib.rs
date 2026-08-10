@@ -9,8 +9,8 @@
 //!
 //! A user's authentication method crosses that boundary as [`UserAuth`].
 //! SCRAM credentials use [`ScramVerifier`], whose serialised form
-//! ([`format_scram_verifier`] / [`parse_scram_verifier`]) lives here too so
-//! every provider stores the same text.
+//! ([`parse_scram_verifier`]) lives here too so every provider reads the same
+//! text.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -101,19 +101,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// distinct tag rejects it at startup instead.
 const SCRAM_VERIFIER_TAG: &str = "pivot-scram-sha-256";
 
-/// Render `verifier` as the single line a metastore stores for a user:
+/// Parse the line a metastore stores for a SCRAM user:
 /// `pivot-scram-sha-256$<iterations>:<base64 salt>$<base64 salted password>`.
-pub fn format_scram_verifier(verifier: &ScramVerifier) -> String {
-    format!(
-        "{SCRAM_VERIFIER_TAG}${SCRAM_ITERATIONS}:{}${}",
-        BASE64.encode(&verifier.salt),
-        BASE64.encode(&verifier.salted_password)
-    )
-}
-
-/// Parse the stored form produced by [`format_scram_verifier`]. The error is a
-/// message describing what is wrong with `text`, for a provider to attach its
-/// own context (which file, which user) to.
+/// The error is a message describing what is wrong with `text`, for a provider
+/// to attach its own context (which file, which user) to.
 pub fn parse_scram_verifier(text: &str) -> std::result::Result<ScramVerifier, String> {
     let (tag, fields) = text.split_once('$').unwrap_or((text, ""));
     if tag != SCRAM_VERIFIER_TAG {
@@ -175,21 +166,23 @@ pub fn parse_scram_verifier(text: &str) -> std::result::Result<ScramVerifier, St
 mod tests {
     use super::*;
 
-    fn verifier() -> ScramVerifier {
-        ScramVerifier {
-            salt: vec![7; 16],
-            salted_password: vec![9; 32],
-        }
+    /// A stored line in the form a metastore's configuration holds it.
+    fn stored_verifier(iterations: usize, salt: &[u8], salted_password: &[u8]) -> String {
+        format!(
+            "{SCRAM_VERIFIER_TAG}${iterations}:{}${}",
+            BASE64.encode(salt),
+            BASE64.encode(salted_password)
+        )
     }
 
     #[test]
-    fn a_formatted_verifier_parses_back_unchanged() {
-        let original = verifier();
+    fn a_stored_verifier_parses_into_its_salt_and_salted_password() {
+        let stored = stored_verifier(SCRAM_ITERATIONS, &[7; 16], &[9; 32]);
 
-        let parsed = parse_scram_verifier(&format_scram_verifier(&original)).unwrap();
+        let parsed = parse_scram_verifier(&stored).unwrap();
 
-        assert_eq!(parsed.salt, original.salt);
-        assert_eq!(parsed.salted_password, original.salted_password);
+        assert_eq!(parsed.salt, vec![7; 16]);
+        assert_eq!(parsed.salted_password, vec![9; 32]);
     }
 
     #[test]
@@ -203,7 +196,7 @@ mod tests {
 
     #[test]
     fn a_foreign_iteration_count_is_rejected() {
-        let stored = format_scram_verifier(&verifier()).replace("$4096:", "$8192:");
+        let stored = stored_verifier(SCRAM_ITERATIONS * 2, &[7; 16], &[9; 32]);
 
         let error = parse_scram_verifier(&stored).unwrap_err();
 
@@ -212,11 +205,7 @@ mod tests {
 
     #[test]
     fn a_truncated_salted_password_is_rejected() {
-        let stored = format!(
-            "{SCRAM_VERIFIER_TAG}${SCRAM_ITERATIONS}:{}${}",
-            BASE64.encode([7; 16]),
-            BASE64.encode([9; 16])
-        );
+        let stored = stored_verifier(SCRAM_ITERATIONS, &[7; 16], &[9; 16]);
 
         let error = parse_scram_verifier(&stored).unwrap_err();
 

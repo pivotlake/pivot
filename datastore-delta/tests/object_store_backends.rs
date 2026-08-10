@@ -8,7 +8,7 @@
 //! absent, so `cargo test` stays green offline.
 //!
 //! Covered: store contract (round-trip through `source` and `sink`, one-level
-//! `list`, the `put_if_absent` CAS), and the table lifecycle end to end — `CREATE TABLE`,
+//! `list`), and the table lifecycle end to end — `CREATE TABLE`,
 //! reopen, **appending a file** (out-of-band registration), and **compaction**
 //! (replacing files) — all over object storage.
 
@@ -205,9 +205,18 @@ mod bodies {
         // The adopted files are recorded by their store-absolute key; the merged
         // output is written into the table's own location.
         let inputs: Vec<ObjectPath> = table.file_refs().into_iter().map(|f| f.path).collect();
-        let merged = table
-            .write_data_file(ObjectPath::new("merged.parquet"), &pq(&[1, 2, 3, 4]))
+        let merged_path = ObjectPath::new("merged.parquet");
+        let merged_bytes = pq(&[1, 2, 3, 4]);
+        b.store
+            .put(
+                &ObjectPath::new(table.location()).resolve(&merged_path),
+                &merged_bytes,
+            )
             .unwrap();
+        let merged = datastore_delta::FileRef {
+            path: merged_path,
+            size: merged_bytes.len() as u64,
+        };
 
         table
             .replace_data_files(&inputs, &[datastore_delta::DeltaFileEntry::new(merged)])
@@ -258,25 +267,6 @@ mod bodies {
 
         assert_eq!(names, vec!["x.bin".to_string()]);
     }
-
-    /// `put_if_absent` is a CAS: the second writer loses and the first's bytes
-    /// stay — the primitive the manifest commit is built on.
-    pub fn put_if_absent_is_a_cas(b: &Backend) {
-        b.store
-            .put_if_absent(&ObjectPath::new("cas.bin"), b"first")
-            .unwrap();
-
-        let won = b
-            .store
-            .put_if_absent(&ObjectPath::new("cas.bin"), b"second")
-            .unwrap();
-
-        assert!(!won);
-        assert_eq!(
-            b.store.get(&ObjectPath::new("cas.bin")).unwrap().unwrap(),
-            b"first"
-        );
-    }
 }
 
 // --- backend matrix --------------------------------------------------------
@@ -316,27 +306,3 @@ backend_tests!(compaction_replaces_files);
 backend_tests!(source_reads_object_back);
 backend_tests!(sink_writes_object_back);
 backend_tests!(list_is_one_level);
-
-/// CAS-conflict tests, for backends that enforce the precondition. The
-/// `fake-gcs-server` emulator ignores `ifGenerationMatch=0`, so GCS is excluded
-/// (real GCS enforces it — the gap is the emulator's, not the datastore's).
-macro_rules! local_s3_tests {
-    ($name:ident) => {
-        mod $name {
-            use super::*;
-            #[test]
-            fn local() {
-                let (_dir, b) = harness::local();
-                bodies::$name(&b);
-            }
-            #[test]
-            fn s3() {
-                if let Some(b) = harness::s3(concat!(stringify!($name), "-s3")) {
-                    bodies::$name(&b);
-                }
-            }
-        }
-    };
-}
-
-local_s3_tests!(put_if_absent_is_a_cas);

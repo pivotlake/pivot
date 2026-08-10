@@ -574,11 +574,12 @@ mod tests {
             .unwrap();
         let batch = RecordBatch::try_new(schema, vec![Arc::new(values) as ArrayRef]).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("data.parquet"), encode(&batch)).unwrap();
+        let path = dir.path().join("data.parquet");
+        std::fs::write(&path, encode(&batch)).unwrap();
         let dispatch = Dispatch::spin_up(2, 64, None);
 
         let table =
-            Arc::new(ParquetTable::from_directory(dispatch.dispatcher(), dir.path(), &[]).unwrap());
+            Arc::new(ParquetTable::from_files(dispatch.dispatcher(), &[path], &[]).unwrap());
 
         let stats = table.row_groups()[0].column_statistics(0).unwrap();
         let (min, _) = stats.min.as_ref().unwrap().get();

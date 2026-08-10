@@ -35,14 +35,13 @@ pub use binding::TableBinding;
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use uuid::Uuid;
 
 use crate::manifest::{self, CatalogManifest, DeltaFileEntry};
 use crate::parquet::ParquetTableError;
-use crate::store::{self, DataFile, FileRef, LocalStore, ObjectPath, ObjectStore, open_store};
+use crate::store::{self, DataFile, FileRef, ObjectPath, ObjectStore, open_store};
 use async_trait::async_trait;
 use crossbeam_deque::{Injector, Steal};
 use datastore::{Datastore, DatastoreTransaction};
@@ -274,18 +273,6 @@ impl std::fmt::Debug for DeltaDatastore {
 }
 
 impl DeltaDatastore {
-    /// Open the default datastore at an explicit local data directory. The
-    /// caller owns the directory and its lifetime; pivotdb never substitutes a
-    /// generated temporary path. A database with no manifest yet opens empty.
-    /// No background maintenance runs (see [`from_store`](Self::from_store) for
-    /// that seam).
-    pub fn open_local(
-        root: impl Into<PathBuf>,
-        dispatcher: &DataFlowDispatcher,
-    ) -> Result<Arc<Self>> {
-        Self::from_store(Arc::new(LocalStore::new(root)), dispatcher, None)
-    }
-
     /// Open a persisted database rooted at `uri`, a local directory (or
     /// `file://…`), or a remote `s3://…` object store, reloading every
     /// table the manifest records at its latest version: read each table's

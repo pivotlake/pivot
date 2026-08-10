@@ -308,9 +308,13 @@ impl CatalogTable {
         if self.file_refs().iter().any(|file| file.path == path) {
             return Ok(());
         }
-        let file = self.write_data_file(path, bytes)?;
+        self.store()
+            .put(&self.object_location().resolve(&path), bytes)?;
         let entry = DeltaFileEntry {
-            file,
+            file: crate::FileRef {
+                path,
+                size: bytes.len() as u64,
+            },
             partition,
             stats: None,
         };

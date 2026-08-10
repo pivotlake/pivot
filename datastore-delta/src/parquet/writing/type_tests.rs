@@ -178,10 +178,10 @@ fn write_cases(dispatch: &Dispatch, cases: &[Case]) -> Vec<u8> {
 /// Read a file back through pivot's own reader.
 fn read_with_pivot(dispatch: &Dispatch, bytes: Vec<u8>, columns: usize) -> RecordBatch {
     let dir = TempDir::new().unwrap();
-    std::fs::write(dir.path().join("data.parquet"), bytes).unwrap();
+    let path = dir.path().join("data.parquet");
+    std::fs::write(&path, bytes).unwrap();
 
-    let table =
-        Arc::new(ParquetTable::from_directory(dispatch.dispatcher(), dir.path(), &[]).unwrap());
+    let table = Arc::new(ParquetTable::from_files(dispatch.dispatcher(), &[path], &[]).unwrap());
     let batches = table_input(
         dispatch.dispatcher(),
         &table,

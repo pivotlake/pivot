@@ -390,30 +390,6 @@ impl ObjectStore for GcsStore {
         }
     }
 
-    fn put_if_absent(&self, key: &ObjectPath, data: &[u8]) -> Result<bool> {
-        let header = self.auth.header()?;
-        // GCS conditional create: `ifGenerationMatch=0` only succeeds when no
-        // live generation of the object exists; otherwise 412.
-        let url = format!(
-            "{}/upload/storage/v1/b/{}/o?uploadType=media&name={}&ifGenerationMatch=0",
-            self.endpoint,
-            self.bucket,
-            self.object_segment(key)
-        );
-        match self
-            .auth
-            .agent
-            .post(&url)
-            .set("Authorization", &header)
-            .set("Content-Type", "application/octet-stream")
-            .send_bytes(data)
-        {
-            Ok(_) => Ok(true),
-            Err(ureq::Error::Status(412, _)) => Ok(false),
-            Err(e) => Err(StoreError::Http(format!("GCS conditional PUT {key}: {e}"))),
-        }
-    }
-
     fn delete(&self, key: &ObjectPath) -> Result<()> {
         let header = self.auth.header()?;
         let url = format!(

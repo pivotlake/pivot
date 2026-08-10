@@ -1,7 +1,6 @@
 //! A generic key→bytes object store — local filesystem, S3, or GCS — and nothing
-//! catalog-specific. It knows how to `get`/`put`/`list`/`delete` objects, do a
-//! conditional create ([`ObjectStore::put_if_absent`], the table log's CAS),
-//! and turn a key into a ring-readable [`DataFile`]; the table manifest,
+//! catalog-specific. It knows how to `get`/`put`/`list`/`delete` objects and
+//! turn a key into a ring-readable [`DataFile`]; the table manifest,
 //! table log, and catalog build on it one layer up.
 //!
 //! Everything here is **synchronous** and pulls in no async runtime: local
@@ -192,13 +191,6 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// write. (Concurrent writers are last-writer-wins — fine for the database
     /// index, which a single server writes on the occasional `CREATE TABLE`.)
     fn put(&self, key: &ObjectPath, data: &[u8]) -> Result<()>;
-
-    /// Create `key` with `data` only if it does not already exist — the
-    /// compare-and-swap the versioned [table manifest](crate::manifest) builds
-    /// its commits on. `Ok(true)` means this writer created the object; `Ok(false)`
-    /// means the key was already there (the caller lost the race: re-read the
-    /// latest state and retry at the next version).
-    fn put_if_absent(&self, key: &ObjectPath, data: &[u8]) -> Result<bool>;
 
     /// Delete `key`. Deleting an object that does not exist is not an error —
     /// the caller's goal (key absent) is already met.

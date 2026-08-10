@@ -32,7 +32,8 @@ fn shutdown_signal_drains_all_worker_threads() {
         let dispatch = Dispatch::spin_up(workers, 32, None);
         let data_dir = tempfile::tempdir().unwrap();
         let datastore: Arc<dyn Datastore> =
-            DeltaDatastore::open_local(data_dir.path(), dispatch.dispatcher()).unwrap();
+            DeltaDatastore::open(&data_dir.path().to_string_lossy(), dispatch.dispatcher())
+                .unwrap();
         let catalog = Arc::new(
             PivotCatalog::new(
                 HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),
