@@ -56,9 +56,9 @@ pub use table::CatalogTable;
 pub use table::TableFile;
 use thiserror::Error as ThisError;
 
-/// `WITH (adopt_parquets_at = 'dir')`: a directory of Parquet files the new
+/// `WITH (with_pre_existing_parquets = 'dir')`: a directory of Parquet files the new
 /// table adopts as its initial data, where they already sit.
-const ADOPT_PARQUETS_OPTION: &str = "adopt_parquets_at";
+const PRE_EXISTING_PARQUETS_OPTION: &str = "with_pre_existing_parquets";
 /// `WITH (partition_by = 'a, b')` — ordered, comma-separated partition columns.
 const PARTITION_BY_OPTION: &str = "partition_by";
 /// `WITH (sort_by = 'a, b')` — ordered, comma-separated sort columns.
@@ -69,7 +69,11 @@ const SORT_BY_OPTION: &str = "sort_by";
 /// datastore does not implement has not been carried out, and silently
 /// dropping it is how a retired option (or a typo) turns into a table that is
 /// quietly not what was asked for.
-const TABLE_OPTIONS: [&str; 3] = [ADOPT_PARQUETS_OPTION, PARTITION_BY_OPTION, SORT_BY_OPTION];
+const TABLE_OPTIONS: [&str; 3] = [
+    PRE_EXISTING_PARQUETS_OPTION,
+    PARTITION_BY_OPTION,
+    SORT_BY_OPTION,
+];
 
 #[derive(Debug, ThisError)]
 pub enum Error {
@@ -726,7 +730,7 @@ impl DeltaTransaction {
     /// the coordinator; compiling needs the pool.
     ///
     /// The table's own storage is always a directory of its own under the
-    /// database root, named after its identity. `WITH (adopt_parquets_at = '…')`
+    /// database root, named after its identity. `WITH (with_pre_existing_parquets = '…')`
     /// only points at data to adopt; nothing is written to that directory. A
     /// statement that names none yields an empty table.
     fn bind_create(&self, request: CreateTableRequest) -> Result<DeltaTableCreation> {
@@ -816,7 +820,7 @@ impl DeltaTransaction {
     }
 
     /// The data files a new table adopts: every Parquet object directly under
-    /// the `adopt_parquets_at` directory, located for reading and keeping its
+    /// the `with_pre_existing_parquets` directory, located for reading and keeping its
     /// `FileRef` identity so each footer's row groups land on the right
     /// `TableFile`. No such option, or a directory holding no Parquet, gives an
     /// empty table that fills up as it is written to.
@@ -834,12 +838,12 @@ impl DeltaTransaction {
     /// key from the **bucket root** (ignoring the prefix the database was opened
     /// at).
     fn adopted_data_files(&self, request: &CreateTableRequest) -> Result<Vec<DataFile>> {
-        let Some(path) = request.options.get(ADOPT_PARQUETS_OPTION) else {
+        let Some(path) = request.options.get(PRE_EXISTING_PARQUETS_OPTION) else {
             return Ok(Vec::new());
         };
         if path.contains("://") {
             return Err(Error::OptionPathWithScheme {
-                option: ADOPT_PARQUETS_OPTION.to_string(),
+                option: PRE_EXISTING_PARQUETS_OPTION.to_string(),
                 path: path.clone(),
             });
         }

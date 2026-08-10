@@ -1814,7 +1814,7 @@ fn create_table_passes_with_options_to_catalog() {
 
     let results = planner
         .plan(
-            "CREATE TABLE created_table (id INTEGER) WITH (adopt_parquets_at='/asdf')",
+            "CREATE TABLE created_table (id INTEGER) WITH (with_pre_existing_parquets='/asdf')",
             transaction.clone(),
         )
         .unwrap()
@@ -1834,7 +1834,7 @@ fn create_table_passes_with_options_to_catalog() {
     assert_eq!(
         created[0]
             .options
-            .get("adopt_parquets_at")
+            .get("with_pre_existing_parquets")
             .map(String::as_str),
         Some("/asdf")
     );

@@ -22,7 +22,7 @@ CREATE TABLE lineitem (
     l_shipinstruct VARCHAR,
     l_shipmode VARCHAR,
     l_comment VARCHAR
-) WITH (adopt_parquets_at = '{source}/lineitem');
+) WITH (with_pre_existing_parquets = '{source}/lineitem');
 
 CREATE TABLE orders (
     o_orderkey BIGINT,
@@ -34,7 +34,7 @@ CREATE TABLE orders (
     o_clerk VARCHAR,
     o_shippriority INTEGER,
     o_comment VARCHAR
-) WITH (adopt_parquets_at = '{source}/orders');
+) WITH (with_pre_existing_parquets = '{source}/orders');
 
 CREATE TABLE customer (
     c_custkey BIGINT,
@@ -45,7 +45,7 @@ CREATE TABLE customer (
     c_acctbal DECIMAL(15,2),
     c_mktsegment VARCHAR,
     c_comment VARCHAR
-) WITH (adopt_parquets_at = '{source}/customer');
+) WITH (with_pre_existing_parquets = '{source}/customer');
 
 CREATE TABLE part (
     p_partkey BIGINT,
@@ -57,7 +57,7 @@ CREATE TABLE part (
     p_container VARCHAR,
     p_retailprice DECIMAL(15,2),
     p_comment VARCHAR
-) WITH (adopt_parquets_at = '{source}/part');
+) WITH (with_pre_existing_parquets = '{source}/part');
 
 CREATE TABLE partsupp (
     ps_partkey BIGINT,
@@ -65,7 +65,7 @@ CREATE TABLE partsupp (
     ps_availqty INTEGER,
     ps_supplycost DECIMAL(15,2),
     ps_comment VARCHAR
-) WITH (adopt_parquets_at = '{source}/partsupp');
+) WITH (with_pre_existing_parquets = '{source}/partsupp');
 
 CREATE TABLE supplier (
     s_suppkey BIGINT,
@@ -75,17 +75,17 @@ CREATE TABLE supplier (
     s_phone VARCHAR,
     s_acctbal DECIMAL(15,2),
     s_comment VARCHAR
-) WITH (adopt_parquets_at = '{source}/supplier');
+) WITH (with_pre_existing_parquets = '{source}/supplier');
 
 CREATE TABLE nation (
     n_nationkey BIGINT,
     n_name VARCHAR,
     n_regionkey BIGINT,
     n_comment VARCHAR
-) WITH (adopt_parquets_at = '{source}/nation');
+) WITH (with_pre_existing_parquets = '{source}/nation');
 
 CREATE TABLE region (
     r_regionkey BIGINT,
     r_name VARCHAR,
     r_comment VARCHAR
-) WITH (adopt_parquets_at = '{source}/region');
+) WITH (with_pre_existing_parquets = '{source}/region');

@@ -70,7 +70,7 @@ fn create_events_table(
             col_type: planner::types::Type::Int64,
         }],
         options: HashMap::from([(
-            "adopt_parquets_at".to_string(),
+            "with_pre_existing_parquets".to_string(),
             dir.to_string_lossy().into_owned(),
         )]),
         if_not_exists: false,

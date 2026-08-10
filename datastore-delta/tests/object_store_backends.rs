@@ -52,7 +52,7 @@ fn columns() -> Vec<Column> {
     ]
 }
 
-/// `CREATE TABLE <name> (cols) WITH (adopt_parquets_at = '<path>')`, `path`
+/// `CREATE TABLE <name> (cols) WITH (with_pre_existing_parquets = '<path>')`, `path`
 /// store-relative.
 fn adopting_request(name: &str, path: &str) -> CreateTableRequest {
     CreateTableRequest {
@@ -60,7 +60,7 @@ fn adopting_request(name: &str, path: &str) -> CreateTableRequest {
         schema_name: None,
         name: name.to_string(),
         columns: columns(),
-        options: HashMap::from([("adopt_parquets_at".to_string(), path.to_string())]),
+        options: HashMap::from([("with_pre_existing_parquets".to_string(), path.to_string())]),
         if_not_exists: false,
     }
 }

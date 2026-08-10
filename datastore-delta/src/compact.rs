@@ -30,7 +30,7 @@
 //! *orphan* objects (unlogged merged files), never a double read.
 //!
 //! Merging always writes into the table's own directory, so compacting a file
-//! the table adopted (`adopt_parquets_at`, which leaves the file where its owner
+//! the table adopted (`with_pre_existing_parquets`, which leaves the file where its owner
 //! put it) copies those rows under the database root. The adopted original is
 //! dropped from the log but never deleted: it is not the table's to delete, and
 //! the vacuum sweep only reclaims files under the table's own location. A table
@@ -396,7 +396,7 @@ mod tests {
         writer.close().unwrap();
     }
 
-    /// `CREATE TABLE <name> (Timestamp Int64) WITH (adopt_parquets_at = dir)`
+    /// `CREATE TABLE <name> (Timestamp Int64) WITH (with_pre_existing_parquets = dir)`
     /// against `datastore`, the way the server would run it -- or, when `dir` is
     /// `None`, an empty table adopting nothing.
     fn create_table(
@@ -409,7 +409,7 @@ mod tests {
         use planner::catalog::{Column, CreateTableRequest};
         let options = match dir {
             Some(dir) => std::collections::HashMap::from([(
-                "adopt_parquets_at".to_string(),
+                "with_pre_existing_parquets".to_string(),
                 dir.to_str().unwrap().to_string(),
             )]),
             None => std::collections::HashMap::new(),

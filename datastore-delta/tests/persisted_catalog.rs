@@ -64,11 +64,11 @@ fn columns() -> Vec<Column> {
     ]
 }
 
-/// A `CREATE TABLE … WITH (adopt_parquets_at = '<dir>')` request.
+/// A `CREATE TABLE … WITH (with_pre_existing_parquets = '<dir>')` request.
 fn adopting_request(name: &str, path: &Path, columns: Vec<Column>) -> CreateTableRequest {
     let mut options = HashMap::new();
     options.insert(
-        "adopt_parquets_at".to_string(),
+        "with_pre_existing_parquets".to_string(),
         path.to_string_lossy().into_owned(),
     );
     CreateTableRequest {

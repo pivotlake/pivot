@@ -81,7 +81,7 @@ async fn create_people_table(client: &Client, table: &str, dir: &Path) {
     let path = dir.to_str().unwrap();
     client
         .simple_query(&format!(
-            "CREATE TABLE {table} (id BIGINT, name VARCHAR) WITH (adopt_parquets_at = '{path}')"
+            "CREATE TABLE {table} (id BIGINT, name VARCHAR) WITH (with_pre_existing_parquets = '{path}')"
         ))
         .await
         .unwrap();
@@ -281,7 +281,7 @@ async fn global_min_max_over_double_column(#[future] conn: Conn) {
     let f: ArrayRef = Arc::new(arrow_array::Float64Array::from(vec![3.7f64, 9.2, 5.0]));
     let dir = write_parquet(&RecordBatch::try_new(schema, vec![f]).unwrap());
     conn.simple_query(&format!(
-        "CREATE TABLE doubles (f DOUBLE) WITH (adopt_parquets_at = '{}')",
+        "CREATE TABLE doubles (f DOUBLE) WITH (with_pre_existing_parquets = '{}')",
         dir.path().to_str().unwrap()
     ))
     .await
@@ -311,7 +311,7 @@ async fn grouped_float_aggregates(#[future] conn: Conn) {
     let r: ArrayRef = Arc::new(arrow_array::Float32Array::from(vec![1.0f32, 3.0, 5.0]));
     let dir = write_parquet(&RecordBatch::try_new(schema, vec![g, d, r]).unwrap());
     conn.simple_query(&format!(
-        "CREATE TABLE fmetrics (g BIGINT, d DOUBLE, r REAL) WITH (adopt_parquets_at = '{}')",
+        "CREATE TABLE fmetrics (g BIGINT, d DOUBLE, r REAL) WITH (with_pre_existing_parquets = '{}')",
         dir.path().to_str().unwrap()
     ))
     .await
@@ -354,7 +354,7 @@ async fn decimal_scan_filter_and_wire_format(#[future] conn: Conn) {
     );
     let dir = write_parquet(&RecordBatch::try_new(schema, vec![v]).unwrap());
     conn.simple_query(&format!(
-        "CREATE TABLE prices (v DECIMAL(10,2)) WITH (adopt_parquets_at = '{}')",
+        "CREATE TABLE prices (v DECIMAL(10,2)) WITH (with_pre_existing_parquets = '{}')",
         dir.path().to_str().unwrap()
     ))
     .await
@@ -386,7 +386,7 @@ async fn decimal_aggregates(#[future] conn: Conn) {
     );
     let dir = write_parquet(&RecordBatch::try_new(schema, vec![v]).unwrap());
     conn.simple_query(&format!(
-        "CREATE TABLE decimal_metrics (v DECIMAL(10,2)) WITH (adopt_parquets_at = '{}')",
+        "CREATE TABLE decimal_metrics (v DECIMAL(10,2)) WITH (with_pre_existing_parquets = '{}')",
         dir.path().to_str().unwrap()
     ))
     .await
@@ -423,7 +423,7 @@ async fn group_by_decimal_key(#[future] conn: Conn) {
     let x: ArrayRef = Arc::new(Int64Array::from(vec![1i64, 2, 3]));
     let dir = write_parquet(&RecordBatch::try_new(schema, vec![g, x]).unwrap());
     conn.simple_query(&format!(
-        "CREATE TABLE decimal_groups (g DECIMAL(4,1), x BIGINT) WITH (adopt_parquets_at = '{}')",
+        "CREATE TABLE decimal_groups (g DECIMAL(4,1), x BIGINT) WITH (with_pre_existing_parquets = '{}')",
         dir.path().to_str().unwrap()
     ))
     .await
@@ -723,7 +723,7 @@ async fn table_in_a_created_schema_is_queryable(#[future] conn: Conn) {
     conn.simple_query("CREATE SCHEMA analytics").await.unwrap();
 
     conn.simple_query(&format!(
-        "CREATE TABLE analytics.people (id BIGINT, name VARCHAR) WITH (adopt_parquets_at = '{path}')"
+        "CREATE TABLE analytics.people (id BIGINT, name VARCHAR) WITH (with_pre_existing_parquets = '{path}')"
     ))
     .await
     .unwrap();
@@ -743,7 +743,7 @@ async fn insert_into_a_schema_qualified_table(#[future] conn: Conn) {
     let path = dir.path().to_str().unwrap();
     conn.simple_query("CREATE SCHEMA staffing").await.unwrap();
     conn.simple_query(&format!(
-        "CREATE TABLE staffing.people (id BIGINT, name VARCHAR) WITH (adopt_parquets_at = '{path}')"
+        "CREATE TABLE staffing.people (id BIGINT, name VARCHAR) WITH (with_pre_existing_parquets = '{path}')"
     ))
     .await
     .unwrap();
@@ -772,7 +772,7 @@ async fn a_schema_qualifies_a_table_name(#[future] conn: Conn) {
     let path = dir.path().to_str().unwrap();
     conn.simple_query("CREATE SCHEMA reporting").await.unwrap();
     conn.simple_query(&format!(
-        "CREATE TABLE reporting.staff (id BIGINT, name VARCHAR) WITH (adopt_parquets_at = '{path}')"
+        "CREATE TABLE reporting.staff (id BIGINT, name VARCHAR) WITH (with_pre_existing_parquets = '{path}')"
     ))
     .await
     .unwrap();

@@ -109,7 +109,7 @@ async fn events_server(b: &Backend) -> Client {
     let client = connect_client(start_server_on(&b.root)).await;
     client
         .simple_query(
-            "CREATE TABLE events (name VARCHAR, value BIGINT) WITH (adopt_parquets_at = 'events')",
+            "CREATE TABLE events (name VARCHAR, value BIGINT) WITH (with_pre_existing_parquets = 'events')",
         )
         .await
         .unwrap();

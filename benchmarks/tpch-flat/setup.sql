@@ -73,4 +73,4 @@ CREATE TABLE tpch_flat (
     c_region VARCHAR,
     s_nation VARCHAR,
     s_region VARCHAR
-) WITH (adopt_parquets_at = '{source}');
+) WITH (with_pre_existing_parquets = '{source}');

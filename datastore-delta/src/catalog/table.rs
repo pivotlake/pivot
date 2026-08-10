@@ -472,7 +472,7 @@ impl CatalogTable {
     /// and must land inside it: that directory is the only storage the table
     /// owns.
     ///
-    /// A file the table *adopted* (`adopt_parquets_at`) lives wherever its owner
+    /// A file the table *adopted* (`with_pre_existing_parquets`) lives wherever its owner
     /// put it, so it is never the table's to delete: compaction may copy its rows
     /// into the table's own storage and drop it from the log, but the object
     /// itself stays. The test is where the file lands rather than how the path is

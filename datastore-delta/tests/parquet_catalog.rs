@@ -145,7 +145,7 @@ fn three_row_table() -> (TempDir, Vec<Column>) {
 fn create_request(name: &str, path: &Path, columns: Vec<Column>) -> CreateTableRequest {
     let mut options = HashMap::new();
     options.insert(
-        "adopt_parquets_at".to_string(),
+        "with_pre_existing_parquets".to_string(),
         path.to_string_lossy().into_owned(),
     );
     CreateTableRequest {
@@ -432,7 +432,7 @@ fn create_table_rejects_a_url_path() {
         name: "t".to_string(),
         columns,
         options: HashMap::from([(
-            "adopt_parquets_at".to_string(),
+            "with_pre_existing_parquets".to_string(),
             "s3://bucket/data".to_string(),
         )]),
         if_not_exists: false,
@@ -446,7 +446,7 @@ fn create_table_rejects_a_url_path() {
 
 /// An option this datastore does not implement is an error, not something to
 /// drop: a statement carried out with one of its clauses ignored produces a
-/// table nobody asked for. `path`, the option `adopt_parquets_at` replaced, is
+/// table nobody asked for. `path`, the option `with_pre_existing_parquets` replaced, is
 /// exactly the case that matters.
 #[test]
 fn create_table_rejects_an_unknown_option() {
@@ -471,7 +471,7 @@ fn create_table_rejects_an_unknown_option() {
         "expected the unknown option to be named: {err}"
     );
     assert!(
-        err.contains("adopt_parquets_at"),
+        err.contains("with_pre_existing_parquets"),
         "expected the known options to be listed: {err}"
     );
 }
