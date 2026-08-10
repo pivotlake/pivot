@@ -17,8 +17,8 @@
 //! one starting on a byte boundary.
 
 use arrow_array::{
-    Array, BinaryViewArray, Date32Array, Decimal64Array, Decimal128Array, Int32Array, Int64Array,
-    StringArray, StringViewArray, TimestampMicrosecondArray,
+    Array, BinaryViewArray, Date32Array, Decimal64Array, Decimal128Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, StringArray, StringViewArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, TimeUnit};
 use std::borrow::Cow;
@@ -75,7 +75,9 @@ pub(super) fn try_encode_chunk(
 /// dictionary or PLAIN instead, which store its bits at their declared width.
 fn encoding_for(data_type: &DataType) -> Option<Encoding> {
     match data_type {
-        DataType::Int32
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
         | DataType::Int64
         | DataType::Date32
         | DataType::Timestamp(TimeUnit::Microsecond, None) => Some(Encoding::DELTA_BINARY_PACKED),
@@ -134,24 +136,24 @@ fn encode_data_page(
 /// storages have to be walked into a buffer.
 fn integers(array: &dyn Array) -> WriteResult<Cow<'_, [i64]>> {
     let len = array.len();
+    // A storage of another width is walked into an owned buffer at `i64`.
+    macro_rules! widened {
+        ($arr:ty) => {{
+            let a = downcast::<$arr>(array)?;
+            Cow::Owned((0..len).map(|i| a.value(i) as i64).collect())
+        }};
+    }
     Ok(match array.data_type() {
         DataType::Int64 => Cow::Borrowed(downcast::<Int64Array>(array)?.values()),
         DataType::Timestamp(TimeUnit::Microsecond, None) => {
             Cow::Borrowed(downcast::<TimestampMicrosecondArray>(array)?.values())
         }
         DataType::Decimal64(_, _) => Cow::Borrowed(downcast::<Decimal64Array>(array)?.values()),
-        DataType::Int32 => {
-            let a = downcast::<Int32Array>(array)?;
-            Cow::Owned((0..len).map(|i| a.value(i) as i64).collect())
-        }
-        DataType::Date32 => {
-            let a = downcast::<Date32Array>(array)?;
-            Cow::Owned((0..len).map(|i| a.value(i) as i64).collect())
-        }
-        DataType::Decimal128(_, _) => {
-            let a = downcast::<Decimal128Array>(array)?;
-            Cow::Owned((0..len).map(|i| a.value(i) as i64).collect())
-        }
+        DataType::Int8 => widened!(Int8Array),
+        DataType::Int16 => widened!(Int16Array),
+        DataType::Int32 => widened!(Int32Array),
+        DataType::Date32 => widened!(Date32Array),
+        DataType::Decimal128(_, _) => widened!(Decimal128Array),
         other => {
             return Err(super::super::error::WriteError::UnsupportedType(
                 other.clone(),

@@ -8,8 +8,8 @@
 
 use arrow_array::{
     Array, BinaryViewArray, Date32Array, Decimal64Array, Decimal128Array, Float32Array,
-    Float64Array, Int32Array, Int64Array, StringArray, StringViewArray, TimestampMicrosecondArray,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray, StringViewArray,
+    TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, TimeUnit};
 use thriftparquet::general::Encoding;
@@ -83,10 +83,11 @@ pub(super) fn encode_into(array: &dyn Array, out: &mut Vec<u8>) -> WriteResult<(
             (0..len).for_each(|i| out.extend_from_slice(&a.value(i).to_le_bytes()));
         }};
     }
-    // Values narrower than their Parquet physical type: zero-extended to the
-    // physical width, then little-endian. Unsigned values are widened as
-    // unsigned, so the physical integer holds the same bits the annotation
-    // tells a reader to read back as unsigned.
+    // Values narrower than their Parquet physical type: extended to the
+    // physical width, then little-endian. Each is widened in its own
+    // signedness (a signed value sign-extended, an unsigned one zero-extended),
+    // so the physical integer holds the bits the annotation tells a reader to
+    // read back at the column's true width.
     macro_rules! widened {
         ($arr:ty, $physical:ty) => {{
             let a = downcast::<$arr>(array)?;
@@ -106,11 +107,14 @@ pub(super) fn encode_into(array: &dyn Array, out: &mut Vec<u8>) -> WriteResult<(
         }};
     }
     match array.data_type() {
+        // The two narrow signed widths widen to the INT32 that is Parquet's
+        // narrowest integer.
+        DataType::Int8 => widened!(Int8Array, i32),
+        DataType::Int16 => widened!(Int16Array, i32),
         DataType::Int32 => fixed!(Int32Array),
         DataType::Int64 => fixed!(Int64Array),
         // An unsigned value writes into the signed physical type of its width,
-        // widening the two narrow ones to the INT32 that is Parquet's narrowest
-        // integer.
+        // widening the two narrow ones the same way.
         DataType::UInt8 => widened!(UInt8Array, u32),
         DataType::UInt16 => widened!(UInt16Array, u32),
         DataType::UInt32 => fixed!(UInt32Array),

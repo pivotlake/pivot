@@ -17,9 +17,9 @@ use crate::parquet::types::leaves::{OutputRead, reconstruct_column_from_leaves};
 use crate::parquet::types::metadata::ColumnChunkMeta;
 use arrow_array::ArrayRef;
 use arrow_array::types::{
-    BinaryViewType, Date32Type, Decimal64Type, Decimal128Type, Float32Type, Float64Type, Int16Type,
-    Int32Type, Int64Type, StringViewType, TimestampMicrosecondType, UInt8Type, UInt16Type,
-    UInt32Type, UInt64Type,
+    BinaryViewType, Date32Type, Decimal64Type, Decimal128Type, Float32Type, Float64Type, Int8Type,
+    Int16Type, Int32Type, Int64Type, StringViewType, TimestampMicrosecondType, UInt8Type,
+    UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, TimeUnit};
 use dispatch::VariantExtract;
@@ -247,6 +247,7 @@ pub fn create_leaf_decoder(
         DataType::UInt16 => Ok(primitive!(UInt16Type)),
         DataType::UInt32 => Ok(primitive!(UInt32Type)),
         DataType::UInt64 => Ok(primitive!(UInt64Type)),
+        DataType::Int8 => Ok(primitive!(Int8Type)),
         DataType::Int16 => Ok(primitive!(Int16Type)),
         DataType::Int32 => Ok(primitive!(Int32Type)),
         DataType::Int64 => Ok(primitive!(Int64Type)),

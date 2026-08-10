@@ -15,8 +15,8 @@ use std::sync::Arc;
 use crate::parquet::{ParquetTable, table_input};
 use arrow::compute::cast;
 use arrow_array::types::{
-    Date32Type, Decimal64Type, Decimal128Type, Float32Type, Float64Type, Int32Type, Int64Type,
-    TimestampMicrosecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+    Date32Type, Decimal64Type, Decimal128Type, Float32Type, Float64Type, Int8Type, Int16Type,
+    Int32Type, Int64Type, TimestampMicrosecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow_array::{
     Array, ArrayRef, ArrowPrimitiveType, BinaryViewArray, Date32Array, PrimitiveArray, RecordBatch,
@@ -371,6 +371,15 @@ macro_rules! type_tests {
 }
 
 type_tests! {
+    // The narrow signed widths store their bits in an INT32, and read back as
+    // themselves only if the file kept the column's width. Their deltas fit
+    // that width, so distinct values pack like any other whole number.
+    //
+    // An `i8` column is the exception that cannot leave the dictionary: 256 is
+    // every value the type has, well under the share of the rows at which the
+    // encoder gives up, so all three of its shapes take the dictionary.
+    int8 => primitive::<Int8Type>(DICTIONARY, |row| (row % 256) as i8, as_is);
+    int16 => primitive::<Int16Type>(PACKED, |row| -20_000 + row as i16, as_is);
     int32 => primitive::<Int32Type>(PACKED, |row| row as i32 * 7_919, as_is);
     int64 => primitive::<Int64Type>(PACKED, |row| row as i64 * 7_919_483, as_is);
     // Unsigned columns store their bits in a signed physical type, so each of
