@@ -118,9 +118,11 @@ impl<'a> PlainSizes<'a> {
     fn new(values: &'a ArrayRef) -> WriteResult<Self> {
         Ok(match values.data_type() {
             // A date is a day count, stored as the INT32 it is annotated as, and
-            // an unsigned value takes the width of the signed physical type it
-            // stores its bits in (the narrow ones widened to INT32).
-            DataType::Int32
+            // a value narrower than its physical type takes that type's width
+            // (the narrow integers widened to INT32).
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
             | DataType::Float32
             | DataType::Date32
             | DataType::UInt8

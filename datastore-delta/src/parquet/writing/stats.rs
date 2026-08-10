@@ -11,8 +11,8 @@ use std::sync::Arc;
 use arrow_arith::aggregate::{max, min};
 use arrow_array::{
     Array, ArrayRef, Date32Array, Datum, Decimal64Array, Decimal128Array, Float32Array,
-    Float64Array, Int32Array, Int64Array, Scalar, StringArray, StringViewArray,
-    TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Scalar, StringArray,
+    StringViewArray, TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, TimeUnit};
 
@@ -42,6 +42,8 @@ pub(super) fn column_min_max(array: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
         }};
     }
     match array.data_type() {
+        DataType::Int8 => numeric!(Int8Array),
+        DataType::Int16 => numeric!(Int16Array),
         DataType::Int32 => numeric!(Int32Array),
         DataType::Int64 => numeric!(Int64Array),
         // Taking the bounds from the unsigned array is what makes them unsigned
@@ -126,6 +128,8 @@ pub(super) fn stat_bytes(value: &ArrayRef) -> Option<Vec<u8>> {
         };
     }
     Some(match value.data_type() {
+        DataType::Int8 => widened_le_bytes!(Int8Array, i32),
+        DataType::Int16 => widened_le_bytes!(Int16Array, i32),
         DataType::Int32 => le_bytes!(Int32Array),
         DataType::Int64 => le_bytes!(Int64Array),
         DataType::UInt8 => widened_le_bytes!(UInt8Array, u32),

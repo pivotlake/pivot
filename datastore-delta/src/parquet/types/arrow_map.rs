@@ -10,9 +10,9 @@
 //!   arrow DataType    parquet physical   annotation              direction
 //!   --------------    ----------------   ----------------------  ---------
 //!   Boolean           BOOLEAN            -                       read only
-//!   Int8              INT32              Integer{ 8, signed}     read only
+//!   Int8              INT32              Integer{ 8, signed}     read+write
 //!   UInt8             INT32              Integer{ 8, unsigned}   read+write
-//!   Int16             INT32              Integer{16, signed}     read only
+//!   Int16             INT32              Integer{16, signed}     read+write
 //!   UInt16            INT32              Integer{16, unsigned}   read+write
 //!   Int32             INT32              -                       read+write
 //!   UInt32            INT32              Integer{32, unsigned}   read+write
@@ -396,23 +396,27 @@ pub fn arrow_to_annotation(data_type: &DataType) -> LeafAnnotation {
                 scale: Some(scale),
             }
         }
-        // An unsigned leaf stores its bits in a signed physical type, so this
-        // annotation is the only thing keeping a value past the signed maximum
-        // from reading back negative.
-        DataType::UInt8 => unsigned_annotation(8, CONVERTED_UINT_8),
-        DataType::UInt16 => unsigned_annotation(16, CONVERTED_UINT_16),
-        DataType::UInt32 => unsigned_annotation(32, CONVERTED_UINT_32),
-        DataType::UInt64 => unsigned_annotation(64, CONVERTED_UINT_64),
+        // A leaf narrower than the physical type it stores its bits in says so
+        // here, which is what keeps a signed value from reading back as the
+        // wider type it was widened into. For an unsigned leaf the annotation
+        // also carries the signedness, without which a value past the signed
+        // maximum reads back negative.
+        DataType::Int8 => integer_annotation(8, true, CONVERTED_INT_8),
+        DataType::Int16 => integer_annotation(16, true, CONVERTED_INT_16),
+        DataType::UInt8 => integer_annotation(8, false, CONVERTED_UINT_8),
+        DataType::UInt16 => integer_annotation(16, false, CONVERTED_UINT_16),
+        DataType::UInt32 => integer_annotation(32, false, CONVERTED_UINT_32),
+        DataType::UInt64 => integer_annotation(64, false, CONVERTED_UINT_64),
         _ => LeafAnnotation::default(),
     }
 }
 
-/// The INTEGER annotation naming an unsigned leaf's true width.
-fn unsigned_annotation(bit_width: i8, converted_type: i32) -> LeafAnnotation {
+/// The INTEGER annotation naming a leaf's true width and signedness.
+fn integer_annotation(bit_width: i8, is_signed: bool, converted_type: i32) -> LeafAnnotation {
     LeafAnnotation {
         logical_type: Some(LogicalType::Integer {
             bit_width,
-            is_signed: false,
+            is_signed,
         }),
         converted_type: Some(converted_type),
         ..LeafAnnotation::default()
@@ -436,14 +440,19 @@ pub fn arrow_to_parquet_physical(data_type: &DataType) -> Result<i32> {
     Ok(match data_type {
         DataType::Int32 => INT32,
         DataType::Int64 => INT64,
-        // Parquet has no unsigned physical type and nothing narrower than
-        // INT32, so an unsigned column stores its bits in the signed physical
-        // type of the same width (zero-extended for the narrow ones) and the
-        // INTEGER annotation ([`arrow_to_unsigned_annotation`], stamped alongside it)
-        // tells a reader to read those bits as unsigned. A `UInt32`/`UInt64`
-        // value above the signed maximum stores as a negative physical value,
-        // which is exactly what the spec prescribes.
-        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 => INT32,
+        // Parquet has no unsigned physical type and no integer narrower than
+        // INT32, so a column of either kind stores its bits in the signed
+        // physical type of the next width up (sign-extended for a narrow signed
+        // one, zero-extended for a narrow unsigned one) and the INTEGER
+        // annotation ([`arrow_to_annotation`], stamped alongside it) tells a
+        // reader the width and signedness to read those bits back at. A
+        // `UInt32`/`UInt64` value above the signed maximum stores as a negative
+        // physical value, which is exactly what the spec prescribes.
+        DataType::Int8
+        | DataType::Int16
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32 => INT32,
         DataType::UInt64 => INT64,
         // A date is its day count, stored as the INT32 the DATE annotation
         // (stamped alongside it) tells a reader to interpret.

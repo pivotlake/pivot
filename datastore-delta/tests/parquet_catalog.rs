@@ -7,8 +7,8 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use arrow_array::{
-    ArrayRef, Int32Array, Int64Array, RecordBatch, Scalar, StringArray, StringViewArray,
-    TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, Scalar, StringArray,
+    StringViewArray, TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema};
 use dispatch::{DataFlowDispatcher, Dispatch};
@@ -766,6 +766,45 @@ fn unsigned_columns_insert_and_read_back() {
     assert_eq!(
         batch.column(3).as_ref(),
         &UInt64Array::from(vec![18_446_744_073_709_551_615u64])
+    );
+}
+
+/// The two integer widths narrower than a four-byte one: each stores its bits
+/// in the wider physical type Parquet has, so these read back as themselves
+/// only if the file kept the column's declared width. Both ends of each range
+/// pin the sign extension they are written with.
+#[test]
+fn narrow_integer_columns_insert_and_read_back() {
+    let data = TempDir::new().unwrap();
+    let columns = vec![
+        Column {
+            name: "tiny".to_string(),
+            col_type: Type::Int8,
+        },
+        Column {
+            name: "small".to_string(),
+            col_type: Type::Int16,
+        },
+    ];
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, create_request("narrow", data.path(), columns)).unwrap();
+
+    let inserted = run_sql(
+        &datastore,
+        "INSERT INTO narrow VALUES (-128, -32768), (127, 32767)",
+    );
+    assert_eq!(common::extract_count(&inserted), 2);
+    datastore.refresh_from_store().unwrap();
+
+    let rows = run_sql(&datastore, "SELECT tiny, small FROM narrow ORDER BY tiny");
+    let batch = &rows[0];
+    assert_eq!(
+        batch.column(0).as_ref(),
+        &Int8Array::from(vec![-128i8, 127])
+    );
+    assert_eq!(
+        batch.column(1).as_ref(),
+        &Int16Array::from(vec![-32768i16, 32767])
     );
 }
 

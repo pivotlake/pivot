@@ -36,6 +36,15 @@ pub trait ReadLeBytes: ArrowNativeType {
     fn read_le(reader: &mut MultiBufferReader) -> Self;
 }
 
+impl ReadLeBytes for i8 {
+    const PHYSICAL_SIZE: usize = 4;
+
+    #[inline(always)]
+    fn read_le(reader: &mut MultiBufferReader) -> Self {
+        reader.read_u32_le() as i8
+    }
+}
+
 impl ReadLeBytes for u8 {
     const PHYSICAL_SIZE: usize = 4;
 
