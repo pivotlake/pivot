@@ -25,7 +25,7 @@ use parquet::file::properties::WriterProperties;
 
 use common::{
     DispatchGuard, collect_i64s, commit_datastore_transaction, current_parquet,
-    dispatch_with_buffers, strings_and_ints,
+    dispatch_with_buffers, strings_and_ints, wait,
 };
 use datastore::DatastoreTransaction;
 use datastore_delta::DeltaDatastore;
@@ -185,8 +185,7 @@ mod bodies {
         let d = dispatch_with_buffers(2, 32);
         let datastore = create_events(&d, b, &[("p1.parquet", &[1, 2, 3])]);
 
-        datastore
-            .table_handle(&SchemaQualifiedTableName::in_default_schema("events"))
+        wait(datastore.table_handle(&SchemaQualifiedTableName::in_default_schema("events")))
             .unwrap()
             .append_data_file(ObjectPath::new("p2.parquet"), &pq(&[4, 5, 6]), None)
             .unwrap();
@@ -199,9 +198,9 @@ mod bodies {
     pub fn compaction_replaces_files(b: &Backend) {
         let d = dispatch_with_buffers(2, 32);
         let datastore = create_events(&d, b, &[("p1.parquet", &[1, 2, 3]), ("p2.parquet", &[4])]);
-        let mut table = datastore
-            .table_handle(&SchemaQualifiedTableName::in_default_schema("events"))
-            .unwrap();
+        let mut table =
+            wait(datastore.table_handle(&SchemaQualifiedTableName::in_default_schema("events")))
+                .unwrap();
         // The adopted files are recorded by their store-absolute key; the merged
         // output is written into the table's own location.
         let inputs: Vec<ObjectPath> = table.file_refs().into_iter().map(|f| f.path).collect();
@@ -257,6 +256,72 @@ mod bodies {
             .collect();
 
         assert_eq!(names, vec!["x.bin".to_string()]);
+    }
+
+    /// The store's async face addresses the same objects as its synchronous
+    /// one: an async put reads back through the sync get and vice versa, and a
+    /// missing key is `None`, not an error.
+    pub fn async_ops_round_trip(b: &Backend) {
+        wait(async {
+            b.store
+                .put_async(&ObjectPath::new("dir/via-async.bin"), b"async".to_vec())
+                .await
+                .unwrap();
+            b.store
+                .put(&ObjectPath::new("via-sync.bin"), b"sync")
+                .unwrap();
+
+            assert_eq!(
+                b.store
+                    .get(&ObjectPath::new("dir/via-async.bin"))
+                    .unwrap()
+                    .unwrap(),
+                b"async"
+            );
+            assert_eq!(
+                b.store
+                    .get_async(&ObjectPath::new("via-sync.bin"))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                b"sync"
+            );
+            assert!(
+                b.store
+                    .get_async(&ObjectPath::new("missing.bin"))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        });
+    }
+
+    /// The async `put_if_absent` is the same CAS as the synchronous one: the
+    /// second writer loses and the first's bytes stay.
+    pub fn async_put_if_absent_is_a_cas(b: &Backend) {
+        wait(async {
+            assert!(
+                b.store
+                    .put_if_absent_async(&ObjectPath::new("async-cas.bin"), b"first".to_vec())
+                    .await
+                    .unwrap()
+            );
+
+            let won = b
+                .store
+                .put_if_absent_async(&ObjectPath::new("async-cas.bin"), b"second".to_vec())
+                .await
+                .unwrap();
+
+            assert!(!won);
+            assert_eq!(
+                b.store
+                    .get(&ObjectPath::new("async-cas.bin"))
+                    .unwrap()
+                    .unwrap(),
+                b"first"
+            );
+        });
     }
 
     /// `put_if_absent` is a CAS: the second writer loses and the first's bytes
@@ -316,6 +381,7 @@ backend_tests!(compaction_replaces_files);
 backend_tests!(source_reads_object_back);
 backend_tests!(sink_writes_object_back);
 backend_tests!(list_is_one_level);
+backend_tests!(async_ops_round_trip);
 
 /// CAS-conflict tests, for backends that enforce the precondition. The
 /// `fake-gcs-server` emulator ignores `ifGenerationMatch=0`, so GCS is excluded
@@ -340,3 +406,4 @@ macro_rules! local_s3_tests {
 }
 
 local_s3_tests!(put_if_absent_is_a_cas);
+local_s3_tests!(async_put_if_absent_is_a_cas);

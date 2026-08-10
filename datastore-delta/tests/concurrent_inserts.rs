@@ -76,8 +76,7 @@ fn insert_row(datastore: &Arc<DeltaDatastore>, id: i64) {
 /// refreshing it: every commit publishes its result, so this is the version of
 /// the last commit made.
 fn published_version(datastore: &DeltaDatastore) -> u64 {
-    datastore
-        .table_handle(&SchemaQualifiedTableName::in_default_schema(TABLE))
+    common::wait(datastore.table_handle(&SchemaQualifiedTableName::in_default_schema(TABLE)))
         .expect("table exists")
         .version()
 }

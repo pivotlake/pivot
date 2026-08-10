@@ -160,7 +160,7 @@ impl Compacter {
     /// and a future standalone compacter binary, can drive one round without
     /// the loop.)
     pub async fn compact_all(&self) {
-        for (name, table) in self.datastore.tables() {
+        for (name, table) in self.datastore.tables().await {
             self.compact_table(&name, table).await;
         }
     }
@@ -169,15 +169,10 @@ impl Compacter {
     /// statement. Returns whether the table exists; the sweep itself reports
     /// nothing, so the caller judges progress by the table's log version.
     pub async fn sweep_table(&self, name: &SchemaQualifiedTableName) -> bool {
-        let Some((name, table)) = self
-            .datastore
-            .tables()
-            .into_iter()
-            .find(|(candidate, _)| candidate == name)
-        else {
+        let Some(table) = self.datastore.table_handle(name).await else {
             return false;
         };
-        self.compact_table(&name, table).await;
+        self.compact_table(name, table).await;
         true
     }
 
@@ -188,16 +183,22 @@ impl Compacter {
     /// backlog (e.g. after a restart) is worked off with bounded memory.
     /// Errors are logged and end the table's round, the next poll retries.
     async fn compact_table(&self, name: &SchemaQualifiedTableName, mut table: CatalogTable) {
-        if let Err(e) = table.refresh() {
-            warn!(table = %name, error = %e, "compaction: table refresh failed");
-            return;
-        }
+        // The reload reads the log and fetches footers, so it runs on the
+        // blocking pool rather than on the reactor.
+        table = match crate::run_blocking(move || table.refresh().map(|_| table)).await {
+            Ok(table) => table,
+            Err(e) => {
+                warn!(table = %name, error = %e, "compaction: table refresh failed");
+                return;
+            }
+        };
         let id = table.id();
         while let Some(inputs) = self.next_batch(&table) {
-            // `spawn_blocking` needs a `'static` closure, so it gets its own
-            // handle rather than a borrow of `self`.
+            // The swap runs as its own task so a panic in one batch is caught
+            // here and ends the table's round instead of killing the poll loop.
             let datastore = self.datastore.clone();
-            match tokio::task::spawn_blocking(move || swap_batch(&datastore, id, &inputs)).await {
+            let swap = tokio::spawn(async move { swap_batch(&datastore, id, inputs).await });
+            match swap.await {
                 Ok(Ok((merged, committed))) => {
                     info!(
                         table = %name,
@@ -291,17 +292,16 @@ impl Compacter {
 ///
 /// It is re-read rather than returned from the commit because
 /// [`DeltaDatastore::publish_table`] consumes the committed copy, so returning it
-/// would put a deep clone on the INSERT path to save one here. Reading it on this
-/// blocking thread rather than in the caller at least keeps that clone off the
-/// reactor.
-fn swap_batch(
+/// would put a deep clone on the INSERT path to save one here.
+async fn swap_batch(
     datastore: &DeltaDatastore,
     id: uuid::Uuid,
-    inputs: &[FileRef],
+    inputs: Vec<FileRef>,
 ) -> Result<(Vec<FileRef>, CatalogTable), crate::Error> {
-    let merged = compact_table_files(datastore, id, inputs, ROW_GROUP_ROWS)?;
+    let merged = compact_table_files(datastore, id, &inputs, ROW_GROUP_ROWS).await?;
     let committed = datastore
         .table_handle_by_id(&id)
+        .await
         .ok_or_else(|| crate::Error::TableNotFound(id.to_string()))?;
     Ok((merged, committed))
 }
@@ -317,8 +317,9 @@ fn swap_batch(
 /// reason, including another writer having swapped the inputs out first, the
 /// uncommitted merge outputs are deleted before the error is returned.
 ///
-/// Blocking store I/O, so callers run it on the blocking pool.
-pub fn compact_table_files(
+/// The merge dataflow and the store deletes run on the blocking pool; the
+/// function itself stays on the runtime.
+pub async fn compact_table_files(
     datastore: &DeltaDatastore,
     id: uuid::Uuid,
     inputs: &[FileRef],
@@ -326,22 +327,36 @@ pub fn compact_table_files(
 ) -> Result<Vec<FileRef>, crate::Error> {
     let table = datastore
         .table_handle_by_id(&id)
+        .await
         .ok_or_else(|| crate::Error::TableNotFound(id.to_string()))?;
-    let merged = table.merge_files(inputs, target_rows_per_group)?;
+    let (table, merged) = {
+        let inputs = inputs.to_vec();
+        crate::run_blocking(move || {
+            table
+                .merge_files(&inputs, target_rows_per_group)
+                .map(|merged| (table, merged))
+        })
+        .await?
+    };
 
     let files: Vec<FileRef> = merged.iter().map(|file| file.file_ref().clone()).collect();
     let removed: Vec<ObjectPath> = inputs.iter().map(|file| file.path.clone()).collect();
-    if let Err(error) = datastore.commit_to_table(id, &removed, merged, false) {
-        for file in &files {
-            if let Err(cleanup_error) = table.delete_data_file(&file.path) {
-                warn!(
-                    commit_error = %error,
-                    cleanup_error = %cleanup_error,
-                    file = %file.path,
-                    "compaction: deleting output after commit failure failed (orphan left)"
-                );
+    if let Err(error) = datastore.commit_to_table(id, removed, merged, false).await {
+        let outputs = files;
+        let commit_error = error.to_string();
+        crate::run_blocking(move || {
+            for file in &outputs {
+                if let Err(cleanup_error) = table.delete_data_file(&file.path) {
+                    warn!(
+                        commit_error = %commit_error,
+                        cleanup_error = %cleanup_error,
+                        file = %file.path,
+                        "compaction: deleting output after commit failure failed (orphan left)"
+                    );
+                }
             }
-        }
+        })
+        .await;
         return Err(error);
     }
     Ok(files)
@@ -435,19 +450,29 @@ mod tests {
             .collect()
             .unwrap();
         tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .unwrap()
             .block_on(transaction.commit())
             .unwrap();
     }
 
+    /// Drive one of the datastore's async operations from a synchronous test.
+    fn wait<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
     /// Refresh `name` to the latest committed manifest (a writer evolves a
     /// cloned-out handle, so the datastore's own copy lags until a refresh), then
     /// return its current row groups.
     fn fresh_parquet(datastore: &DeltaDatastore, name: &str) -> Arc<ParquetTable> {
-        let mut table = datastore
-            .table_handle(&SchemaQualifiedTableName::in_default_schema(name))
-            .expect("table exists");
+        let mut table =
+            wait(datastore.table_handle(&SchemaQualifiedTableName::in_default_schema(name)))
+                .expect("table exists");
         table.refresh().expect("manifest reload");
         table.build_scan_view(&[], &[]).expect("build scan view")
     }
@@ -483,19 +508,18 @@ mod tests {
             Some(Path::new("events")),
         );
         assert_eq!(
-            datastore
-                .table_files(&SchemaQualifiedTableName::in_default_schema("events"))
+            wait(datastore.table_files(&SchemaQualifiedTableName::in_default_schema("events")))
                 .unwrap()
                 .len(),
             3
         );
 
-        let total: u64 = datastore
-            .table_files(&SchemaQualifiedTableName::in_default_schema("events"))
-            .unwrap()
-            .iter()
-            .map(|f| f.size)
-            .sum();
+        let total: u64 =
+            wait(datastore.table_files(&SchemaQualifiedTableName::in_default_schema("events")))
+                .unwrap()
+                .iter()
+                .map(|f| f.size)
+                .sum();
         let compacter = Compacter::new(
             total,
             DEFAULT_MIN_FILES_TO_MERGE,
@@ -505,8 +529,7 @@ mod tests {
         run_one_sweep(&compacter);
 
         assert_eq!(
-            datastore
-                .table_files(&SchemaQualifiedTableName::in_default_schema("events"))
+            wait(datastore.table_files(&SchemaQualifiedTableName::in_default_schema("events")))
                 .unwrap()
                 .len(),
             1
@@ -515,8 +538,7 @@ mod tests {
         assert_eq!(parquet.row_groups().len(), 1);
         assert_eq!(parquet.row_groups()[0].num_rows, 9);
         assert!(
-            datastore
-                .table_files(&SchemaQualifiedTableName::in_default_schema("events"))
+            wait(datastore.table_files(&SchemaQualifiedTableName::in_default_schema("events")))
                 .unwrap()
                 .iter()
                 .all(|f| f.path.as_str().starts_with("pivot-"))
@@ -552,18 +574,17 @@ mod tests {
             Some(Path::new("events")),
         );
         let table_dir = db.path().join(
-            datastore
-                .table_handle(&SchemaQualifiedTableName::in_default_schema("events"))
+            wait(datastore.table_handle(&SchemaQualifiedTableName::in_default_schema("events")))
                 .unwrap()
                 .location(),
         );
 
-        let total: u64 = datastore
-            .table_files(&SchemaQualifiedTableName::in_default_schema("events"))
-            .unwrap()
-            .iter()
-            .map(|f| f.size)
-            .sum();
+        let total: u64 =
+            wait(datastore.table_files(&SchemaQualifiedTableName::in_default_schema("events")))
+                .unwrap()
+                .iter()
+                .map(|f| f.size)
+                .sum();
         let compacter = Compacter::new(
             total,
             DEFAULT_MIN_FILES_TO_MERGE,
@@ -574,9 +595,9 @@ mod tests {
 
         // One merged object replaced the two inputs, in the store and in the
         // datastore's table view.
-        let files = datastore
-            .table_files(&SchemaQualifiedTableName::in_default_schema("events"))
-            .unwrap();
+        let files =
+            wait(datastore.table_files(&SchemaQualifiedTableName::in_default_schema("events")))
+                .unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].path.as_str().starts_with("pivot-"));
         let on_disk: Vec<_> = std::fs::read_dir(&table_dir)
@@ -630,12 +651,13 @@ mod tests {
         // round reloads the table from the log before scanning.
         let compacter_datastore =
             DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
-        let total: u64 = writer_datastore
-            .table_files(&SchemaQualifiedTableName::in_default_schema("events"))
-            .unwrap()
-            .iter()
-            .map(|f| f.size)
-            .sum();
+        let total: u64 = wait(
+            writer_datastore.table_files(&SchemaQualifiedTableName::in_default_schema("events")),
+        )
+        .unwrap()
+        .iter()
+        .map(|f| f.size)
+        .sum();
         let compacter = Compacter::new(
             total,
             DEFAULT_MIN_FILES_TO_MERGE,
@@ -649,17 +671,21 @@ mod tests {
         assert_eq!(parquet.row_groups().len(), 1);
         assert_eq!(parquet.row_groups()[0].num_rows, 9);
         assert!(
-            writer_datastore
-                .table_files(&SchemaQualifiedTableName::in_default_schema("events"))
-                .unwrap()
-                .iter()
-                .all(|f| f.path.as_str().starts_with("pivot-"))
+            wait(
+                writer_datastore
+                    .table_files(&SchemaQualifiedTableName::in_default_schema("events"))
+            )
+            .unwrap()
+            .iter()
+            .all(|f| f.path.as_str().starts_with("pivot-"))
         );
         assert_eq!(
-            writer_datastore
-                .table_files(&SchemaQualifiedTableName::in_default_schema("events"))
-                .unwrap()
-                .len(),
+            wait(
+                writer_datastore
+                    .table_files(&SchemaQualifiedTableName::in_default_schema("events"))
+            )
+            .unwrap()
+            .len(),
             1
         );
 

@@ -93,8 +93,10 @@ pub struct CatalogTable {
     /// This exists only for throughput: Delta log compare-and-swap already ensures
     /// correctness, but concurrent in-process writers can all start at `V` and race
     /// for `V + 1`, forcing every loser to replay the log and fetch the winner's
-    /// footers before retrying.
-    commit_lock: Arc<std::sync::Mutex<()>>,
+    /// footers before retrying. An async mutex because the holder keeps it across
+    /// the blocking log write, so a waiting writer yields instead of parking a
+    /// runtime thread.
+    commit_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl CatalogTable {
@@ -194,7 +196,7 @@ impl CatalogTable {
 
     /// An owned handle to this table's
     /// [commit lock](field@Self::commit_lock).
-    pub(super) fn commit_lock(&self) -> Arc<std::sync::Mutex<()>> {
+    pub(super) fn commit_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
         self.commit_lock.clone()
     }
 

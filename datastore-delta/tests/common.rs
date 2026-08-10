@@ -107,7 +107,10 @@ pub fn shared_dispatcher(workers: usize, buffers: usize) -> DataFlowDispatcher {
 pub fn commit_datastore_transaction(
     transaction: Arc<dyn DatastoreTransaction>,
 ) -> CatalogResult<()> {
+    // `enable_all`: a remote store's commit writes the manifest over its async
+    // HTTP client, which needs the runtime's IO and timer drivers.
     tokio::runtime::Builder::new_current_thread()
+        .enable_all()
         .build()
         .unwrap()
         .block_on(transaction.commit())
@@ -138,6 +141,18 @@ pub fn parquet_table(
     (dir, table)
 }
 
+/// Drive one of the datastore's async operations to completion from a
+/// synchronous test: the catalog API is async (its locks are tokio locks and
+/// its store I/O hops to the blocking pool), and these tests run on plain
+/// threads with no ambient runtime.
+pub fn wait<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build test runtime")
+        .block_on(future)
+}
+
 /// Reload `name` to its latest committed manifest and return its current row
 /// groups for inspection. The background refresh does the same sweep; here we
 /// drive it on a cloned-out table handle.
@@ -145,9 +160,9 @@ pub fn current_parquet(
     datastore: &datastore_delta::DeltaDatastore,
     name: &str,
 ) -> Arc<ParquetTable> {
-    let mut table = datastore
-        .table_handle(&SchemaQualifiedTableName::in_default_schema(name))
-        .expect("table exists");
+    let mut table =
+        wait(datastore.table_handle(&SchemaQualifiedTableName::in_default_schema(name)))
+            .expect("table exists");
     table.refresh().expect("manifest reload");
     table.build_scan_view(&[], &[]).expect("build scan view")
 }
@@ -162,8 +177,7 @@ pub fn table_dir(
     name: &str,
 ) -> std::path::PathBuf {
     database_root.join(
-        datastore
-            .table_handle(&SchemaQualifiedTableName::in_default_schema(name))
+        wait(datastore.table_handle(&SchemaQualifiedTableName::in_default_schema(name)))
             .expect("table exists")
             .location(),
     )

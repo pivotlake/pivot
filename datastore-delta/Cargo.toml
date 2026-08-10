@@ -32,8 +32,9 @@ async-trait = "0.1"
 # compaction, vacuum), spawning tasks onto the ambient runtime and driving merge
 # dataflows from blocking threads. `rt-multi-thread` also drives Kernel's engine
 # I/O for log writes (checkpoints/commits run a read and a write concurrently,
-# which Kernel's default single-thread executor deadlocks).
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
+# which Kernel's default single-thread executor deadlocks). `sync` provides the
+# async RwLock/Mutex the catalog's table index and commit locks use.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "sync"] }
 bytes = { workspace = true }
 crossbeam-deque = { workspace = true }
 ahash = { workspace = true }
@@ -91,7 +92,7 @@ catalog = { workspace = true }
 # `PivotCatalog::commit_transaction` is async (a commit that wrote files hops to
 # the blocking pool), so the tests block on it with a current-thread runtime; the
 # compaction tests drive a full sweep on a multi-thread runtime.
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "sync", "macros"] }
 # `test-util` exposes dispatch's single-operator test harness for the moved
 # Parquet reader unit/integration tests.
 dispatch = { workspace = true, features = ["test-util"] }

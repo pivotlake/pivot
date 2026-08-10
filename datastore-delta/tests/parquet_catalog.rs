@@ -87,9 +87,12 @@ fn single_catalog(datastore: &Arc<DeltaDatastore>) -> Arc<PivotCatalog> {
 }
 
 /// Drive a transaction commit to completion. A commit that wrote files hops to
-/// the blocking pool, so it needs a Tokio runtime to run under.
+/// the blocking pool, so it needs a Tokio runtime to run under; `enable_all`
+/// because a remote store's commit writes the manifest over its async HTTP
+/// client.
 fn commit_transaction_blocking(transaction: Arc<dyn CatalogTransaction>) {
     tokio::runtime::Builder::new_current_thread()
+        .enable_all()
         .build()
         .unwrap()
         .block_on(transaction.commit())
@@ -489,7 +492,7 @@ fn create_table_over_an_empty_adopt_directory_makes_an_empty_table() {
 
     assert!(current_parquet(&datastore, "t").row_groups().is_empty());
     run_sql(&datastore, "INSERT INTO t VALUES (1, 'one')");
-    datastore.refresh_from_store().unwrap();
+    common::wait(datastore.refresh_from_store()).unwrap();
     assert_eq!(
         common::extract_count(&run_sql(&datastore, "SELECT COUNT(*) FROM t")),
         1
@@ -691,11 +694,11 @@ fn write_ids(dir: &Path, file_name: &str, ids: &[i32]) -> std::path::PathBuf {
 fn append(datastore: &DeltaDatastore, name: &str, path: &Path) {
     let bytes = std::fs::read(path).unwrap();
     let relative = ObjectPath::new(path.file_name().unwrap().to_string_lossy());
-    let mut handle = datastore
-        .table_handle(&SchemaQualifiedTableName::in_default_schema(name))
-        .expect("table exists");
+    let mut handle =
+        common::wait(datastore.table_handle(&SchemaQualifiedTableName::in_default_schema(name)))
+            .expect("table exists");
     handle.append_data_file(relative, &bytes, None).unwrap();
-    datastore.publish_table(handle);
+    common::wait(datastore.publish_table(handle));
 }
 
 /// Run `sql` through a planner over `datastore` (inside a fresh transaction,
@@ -775,7 +778,7 @@ fn insert_rows_are_visible_after_a_refresh() {
 
     // An INSERT commits to the Delta log only; the background refresh brings the
     // new rows into the live set that later transactions bind against.
-    datastore.refresh_from_store().unwrap();
+    common::wait(datastore.refresh_from_store()).unwrap();
 
     let rows = run_sql(&datastore, "SELECT id, name FROM inserted ORDER BY id");
     let ids = rows
@@ -827,7 +830,7 @@ fn unsigned_columns_insert_and_read_back() {
         "INSERT INTO unsigned VALUES (255, 65535, 4294967295, 18446744073709551615)",
     );
     assert_eq!(common::extract_count(&inserted), 1);
-    datastore.refresh_from_store().unwrap();
+    common::wait(datastore.refresh_from_store()).unwrap();
 
     let rows = run_sql(&datastore, "SELECT a, b, c, d FROM unsigned");
     let batch = &rows[0];
@@ -868,7 +871,7 @@ fn narrow_integer_columns_insert_and_read_back() {
         "INSERT INTO narrow VALUES (-128, -32768), (127, 32767)",
     );
     assert_eq!(common::extract_count(&inserted), 2);
-    datastore.refresh_from_store().unwrap();
+    common::wait(datastore.refresh_from_store()).unwrap();
 
     let rows = run_sql(&datastore, "SELECT tiny, small FROM narrow ORDER BY tiny");
     let batch = &rows[0];
@@ -900,7 +903,7 @@ fn timestamp_column_inserts_and_reads_back() {
          (TIMESTAMP '1969-12-31 23:59:58.5')",
     );
     assert_eq!(common::extract_count(&inserted), 2);
-    datastore.refresh_from_store().unwrap();
+    common::wait(datastore.refresh_from_store()).unwrap();
 
     let rows = run_sql(&datastore, "SELECT ts FROM events ORDER BY ts");
     assert_eq!(
@@ -925,7 +928,7 @@ fn unsigned_column_filters_on_unsigned_ordering() {
         &datastore,
         "INSERT INTO wide VALUES (1), (9223372036854775808), (18446744073709551615)",
     );
-    datastore.refresh_from_store().unwrap();
+    common::wait(datastore.refresh_from_store()).unwrap();
 
     let rows = run_sql(
         &datastore,
@@ -966,7 +969,7 @@ fn unsigned_partition_column_round_trips() {
     .unwrap();
 
     run_sql(&datastore, "INSERT INTO parts VALUES (200, 1), (201, 2)");
-    datastore.refresh_from_store().unwrap();
+    common::wait(datastore.refresh_from_store()).unwrap();
 
     let rows = run_sql(&datastore, "SELECT id FROM parts WHERE bucket = 200");
     assert_eq!(rows[0].column(0).as_ref(), &Int32Array::from(vec![1]));
@@ -1012,13 +1015,13 @@ fn insert_files_reach_the_log_only_when_the_transaction_commits() {
 
     // Uncommitted: the files are uploaded but not in the Delta log, so a refresh
     // finds nothing and the rows stay invisible.
-    datastore.refresh_from_store().unwrap();
+    common::wait(datastore.refresh_from_store()).unwrap();
     let before_commit = run_sql(&datastore, "SELECT COUNT(*) FROM pending_insert");
     assert_eq!(common::extract_count(&before_commit), 0);
 
     // Committing writes the files to the log; the refresh then surfaces them.
     commit_transaction_blocking(transaction);
-    datastore.refresh_from_store().unwrap();
+    common::wait(datastore.refresh_from_store()).unwrap();
     let after_commit = run_sql(&datastore, "SELECT COUNT(*) FROM pending_insert");
     assert_eq!(common::extract_count(&after_commit), 2);
 
@@ -1035,7 +1038,7 @@ fn insert_files_reach_the_log_only_when_the_transaction_commits() {
 
     // The rolled-back INSERT never reached the log, so a refresh leaves the count
     // at the two committed rows.
-    datastore.refresh_from_store().unwrap();
+    common::wait(datastore.refresh_from_store()).unwrap();
     let after_rollback = run_sql(&datastore, "SELECT COUNT(*) FROM pending_insert");
     assert_eq!(common::extract_count(&after_rollback), 2);
 }
@@ -1110,9 +1113,10 @@ fn append_data_file_is_idempotent_per_path() {
 fn table_handle_for_a_missing_table_is_none() {
     let (_database, datastore) = empty_datastore();
     assert!(
-        datastore
-            .table_handle(&SchemaQualifiedTableName::in_default_schema("missing"))
-            .is_none()
+        common::wait(
+            datastore.table_handle(&SchemaQualifiedTableName::in_default_schema("missing"))
+        )
+        .is_none()
     );
 }
 
@@ -1139,13 +1143,13 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     )];
     // A losing compacter clones the table out at the version where the inputs
     // are present, before the winning swap lands.
-    let mut loser = datastore
-        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
-        .unwrap();
+    let mut loser =
+        common::wait(datastore.table_handle(&SchemaQualifiedTableName::in_default_schema("t")))
+            .unwrap();
     loser.refresh().unwrap();
-    let mut winner = datastore
-        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
-        .unwrap();
+    let mut winner =
+        common::wait(datastore.table_handle(&SchemaQualifiedTableName::in_default_schema("t")))
+            .unwrap();
     winner.refresh().unwrap();
     // The two inputs under the paths the table records them by: the adopted file
     // absolutely, the appended one relative to the table's own location.
@@ -1183,9 +1187,9 @@ fn one_copy_commits_repeatedly_without_reloading_between_commits() {
     let (dir, columns) = three_row_table();
     let (_database, datastore) = empty_datastore();
     create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
-    let mut table = datastore
-        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
-        .unwrap();
+    let mut table =
+        common::wait(datastore.table_handle(&SchemaQualifiedTableName::in_default_schema("t")))
+            .unwrap();
     let start = table.version();
 
     for id in 0..3 {
@@ -1211,9 +1215,9 @@ fn a_refresh_advances_a_copy_onto_another_copys_commit() {
     let (dir, columns) = three_row_table();
     let (_database, datastore) = empty_datastore();
     create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
-    let mut reader = datastore
-        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
-        .unwrap();
+    let mut reader =
+        common::wait(datastore.table_handle(&SchemaQualifiedTableName::in_default_schema("t")))
+            .unwrap();
     let start = reader.version();
 
     append(
@@ -1246,16 +1250,16 @@ fn a_refresh_that_cannot_read_the_new_files_leaves_the_copy_untouched() {
     let (dir, columns) = three_row_table();
     let (_database, datastore) = empty_datastore();
     create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
-    let mut reader = datastore
-        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
-        .unwrap();
+    let mut reader =
+        common::wait(datastore.table_handle(&SchemaQualifiedTableName::in_default_schema("t")))
+            .unwrap();
     let version = reader.version();
 
     // Another writer commits an `Add` for a file that is not in the store, so
     // any copy reloading onto that version fails to read its footer.
-    let mut writer = datastore
-        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
-        .unwrap();
+    let mut writer =
+        common::wait(datastore.table_handle(&SchemaQualifiedTableName::in_default_schema("t")))
+            .unwrap();
     let absent = vec![datastore_delta::DeltaFileEntry::new(
         datastore_delta::FileRef {
             path: ObjectPath::new("absent.parquet"),
@@ -1291,14 +1295,19 @@ fn compact_table_files_merges_small_files_into_one() {
     run_sql(&datastore, "INSERT INTO t VALUES (10), (20), (30)");
     run_sql(&datastore, "INSERT INTO t VALUES (40), (50)");
 
-    let mut table = datastore
-        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
-        .unwrap();
+    let mut table =
+        common::wait(datastore.table_handle(&SchemaQualifiedTableName::in_default_schema("t")))
+            .unwrap();
     table.refresh().unwrap();
     let inputs = table.file_refs();
     assert_eq!(inputs.len(), 2, "two inserts wrote two files");
-    let merged =
-        datastore_delta::compact_table_files(&datastore, table.id(), &inputs, 128 * 1024).unwrap();
+    let merged = common::wait(datastore_delta::compact_table_files(
+        &datastore,
+        table.id(),
+        &inputs,
+        128 * 1024,
+    ))
+    .unwrap();
 
     assert_eq!(merged.len(), 1, "the two inputs merge into one file");
     let parquet = current_parquet(&datastore, "t");
@@ -1316,9 +1325,9 @@ fn compact_table_files_deletes_uploaded_outputs_when_delta_commit_fails() {
     create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
     let table_dir = table_dir(&database, &datastore, "t");
 
-    let mut table = datastore
-        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
-        .unwrap();
+    let mut table =
+        common::wait(datastore.table_handle(&SchemaQualifiedTableName::in_default_schema("t")))
+            .unwrap();
     table.refresh().unwrap();
     let inputs = table.file_refs();
 
@@ -1328,7 +1337,12 @@ fn compact_table_files_deletes_uploaded_outputs_when_delta_commit_fails() {
     let saved_delta_log = table_dir.join("_delta_log.saved");
     std::fs::rename(&delta_log, &saved_delta_log).unwrap();
     File::create(&delta_log).unwrap();
-    let result = datastore_delta::compact_table_files(&datastore, table.id(), &inputs, 128 * 1024);
+    let result = common::wait(datastore_delta::compact_table_files(
+        &datastore,
+        table.id(),
+        &inputs,
+        128 * 1024,
+    ));
     std::fs::remove_file(&delta_log).unwrap();
     std::fs::rename(&saved_delta_log, &delta_log).unwrap();
 
@@ -1433,8 +1447,7 @@ fn reopened_database_restores_sort_by() {
     let reopened = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
 
     assert_eq!(
-        reopened
-            .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
+        common::wait(reopened.table_handle(&SchemaQualifiedTableName::in_default_schema("t")))
             .unwrap()
             .sort_by(),
         ["id"]
@@ -1452,9 +1465,9 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
 
     // "Compact" the adopted file into merged.parquet but crash before deleting
     // the input: both files are on disk, only merged is in the manifest.
-    let mut table = datastore
-        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
-        .unwrap();
+    let mut table =
+        common::wait(datastore.table_handle(&SchemaQualifiedTableName::in_default_schema("t")))
+            .unwrap();
     let inputs: Vec<ObjectPath> = table.file_refs().into_iter().map(|f| f.path).collect();
     let merged = write_ids(data_dir.path(), "merged.parquet", &[10, 20, 30]);
     let added = vec![datastore_delta::DeltaFileEntry::new(
@@ -1566,9 +1579,9 @@ fn table_partitioned_by_name() -> (TempDir, TempDir, Arc<DeltaDatastore>) {
 
     write_ids_one_group_each(dir.path(), "keep.parquet", &[1]);
     write_ids_one_group_each(dir.path(), "drop.parquet", &[2, 2, 2]);
-    let mut table = datastore
-        .table_handle(&SchemaQualifiedTableName::in_default_schema("p"))
-        .unwrap();
+    let mut table =
+        common::wait(datastore.table_handle(&SchemaQualifiedTableName::in_default_schema("p")))
+            .unwrap();
     table
         .append_data_file(
             ObjectPath::new("keep.parquet"),
@@ -1604,9 +1617,9 @@ fn name_eq(value: &str) -> PartitionEqFilter {
 fn partition_filter_builds_only_the_matching_partitions_files() {
     let (_dir, _database, datastore) = table_partitioned_by_name();
 
-    let mut table = datastore
-        .table_handle(&SchemaQualifiedTableName::in_default_schema("p"))
-        .unwrap();
+    let mut table =
+        common::wait(datastore.table_handle(&SchemaQualifiedTableName::in_default_schema("p")))
+            .unwrap();
     table.refresh().unwrap();
     let kept = table.build_scan_view(&[name_eq("keep")], &[]).unwrap();
 
@@ -1619,9 +1632,9 @@ fn partition_filter_builds_only_the_matching_partitions_files() {
 fn no_partition_filter_builds_every_partitions_files() {
     let (_dir, _database, datastore) = table_partitioned_by_name();
 
-    let mut table = datastore
-        .table_handle(&SchemaQualifiedTableName::in_default_schema("p"))
-        .unwrap();
+    let mut table =
+        common::wait(datastore.table_handle(&SchemaQualifiedTableName::in_default_schema("p")))
+            .unwrap();
     table.refresh().unwrap();
     let all = table.build_scan_view(&[], &[]).unwrap();
 
@@ -1683,9 +1696,9 @@ fn create_over_partitioned_files_stamps_each_file_with_its_partition() {
         .insert("partition_by".to_string(), "part".to_string());
     create_table(&datastore, request).unwrap();
 
-    let mut table = datastore
-        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
-        .unwrap();
+    let mut table =
+        common::wait(datastore.table_handle(&SchemaQualifiedTableName::in_default_schema("t")))
+            .unwrap();
     table.refresh().unwrap();
     let part_is_one = PartitionEqFilter {
         column: "part".to_string(),
@@ -1722,9 +1735,9 @@ fn file_level_stats_prune_drops_a_whole_file_out_of_range() {
         },
     )
     .unwrap();
-    let mut table = datastore
-        .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
-        .unwrap();
+    let mut table =
+        common::wait(datastore.table_handle(&SchemaQualifiedTableName::in_default_schema("t")))
+            .unwrap();
     for name in ["low.parquet", "high.parquet"] {
         table
             .append_data_file(

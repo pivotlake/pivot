@@ -4,20 +4,30 @@
 //! and turn a key into a ring-readable [`DataFile`]; the table manifest,
 //! table log, and catalog build on it one layer up.
 //!
-//! Everything here is **synchronous** and pulls in no async runtime: local
+//! The control plane has a synchronous face and an asynchronous face over the
+//! same objects. The synchronous methods pull in no async runtime: local
 //! access is plain `std::fs`; S3 and GCS go over [`ureq`] (blocking HTTP +
 //! rustls). S3 requests are signed with `aws_sigv4::http_request::sign` — a pure
 //! function we call inline (the tokio it transitively links is never driven);
-//! GCS requests carry an OAuth2 bearer token. Credentials
-//! come from whoever opened the store: a metastore hands them in per datastore,
-//! and [`open_store`] falls back to the environment. A backend also builds the
-//! async client Delta Kernel reads the same location's `_delta_log` with
-//! ([`ObjectStore::build_delta_object_store`]), so the two address it alike.
-//! This runs off the io_uring ring on purpose: a
+//! GCS requests carry an OAuth2 bearer token. The `*_async` counterparts serve
+//! a caller already on the tokio runtime with no blocking-pool hop, delegating
+//! to the async client Delta Kernel reads the same location's `_delta_log` with
+//! ([`ObjectStore::build_delta_object_store`]), so the two faces address every
+//! object alike. Credentials come from whoever opened the store: a metastore
+//! hands them in per datastore, and [`open_store`] falls back to the
+//! environment. All of this runs off the io_uring ring on purpose: a
 //! LIST isn't a range-GET the ring can serve, and it's rare and tiny (a few KB
 //! per query) next to the hot column-chunk reads, which stay on the ring.
 
-use delta_kernel::object_store::DynObjectStore;
+use async_trait::async_trait;
+use delta_kernel::object_store::{
+    DynObjectStore, ObjectStoreExt as _, PutMode, PutOptions, PutPayload,
+};
+
+/// The key type of the store's async client ([`DynObjectStore`]), re-exported
+/// under the role it plays here: what [`ObjectStore::client_key`] resolves an
+/// [`ObjectPath`] into.
+pub use delta_kernel::object_store::path::Path as ClientKey;
 use dispatch::io::{AuthHeader, OpenFile, RemoteFile, open_direct_read};
 use std::fmt::Debug;
 use std::path::PathBuf;
@@ -52,6 +62,14 @@ pub enum StoreError {
         #[source]
         source: delta_kernel::object_store::Error,
     },
+    #[error("async client error on `{key}`: {source}")]
+    Client {
+        key: String,
+        #[source]
+        source: delta_kernel::object_store::Error,
+    },
+    #[error("key `{key}` is not addressable by the store's async client: {reason}")]
+    ClientKey { key: String, reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -182,9 +200,79 @@ impl DataFile {
 
 /// A flat key→bytes object store rooted at one database. [`ObjectPath`] keys are
 /// relative to that root, e.g. `_pivot_manifest.json` or `events/a.parquet`.
+///
+/// The control-plane operations come in two flavors addressing the same
+/// objects: the synchronous `get`/`put`/`put_if_absent` for callers that are
+/// already off the runtime (dataflow workers, the planner's blocking threads),
+/// and their `*_async` counterparts for callers on the runtime, served by the
+/// same asynchronous client Delta Kernel reads the `_delta_log` with
+/// ([`build_delta_object_store`](Self::build_delta_object_store)), so no
+/// blocking-pool hop is involved.
+#[async_trait]
 pub trait ObjectStore: Debug + Send + Sync {
     /// Fetch an object in full, or `None` if it does not exist.
     fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>>;
+
+    /// [`get`](Self::get), asynchronously over the store's async client.
+    async fn get_async(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>> {
+        let client = self.build_delta_object_store()?;
+        match client.get(&self.client_key(key)?).await {
+            Ok(response) => {
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|source| StoreError::Client {
+                        key: key.to_string(),
+                        source,
+                    })?;
+                Ok(Some(bytes.to_vec()))
+            }
+            Err(delta_kernel::object_store::Error::NotFound { .. }) => Ok(None),
+            Err(source) => Err(StoreError::Client {
+                key: key.to_string(),
+                source,
+            }),
+        }
+    }
+
+    /// [`put`](Self::put), asynchronously over the store's async client.
+    async fn put_async(&self, key: &ObjectPath, data: Vec<u8>) -> Result<()> {
+        let client = self.build_delta_object_store()?;
+        client
+            .put(&self.client_key(key)?, PutPayload::from(data))
+            .await
+            .map_err(|source| StoreError::Client {
+                key: key.to_string(),
+                source,
+            })?;
+        Ok(())
+    }
+
+    /// [`put_if_absent`](Self::put_if_absent), asynchronously over the store's
+    /// async client: the same conditional create, expressed as the client's
+    /// create-only put mode.
+    async fn put_if_absent_async(&self, key: &ObjectPath, data: Vec<u8>) -> Result<bool> {
+        let client = self.build_delta_object_store()?;
+        let options = PutOptions::from(PutMode::Create);
+        match client
+            .put_opts(&self.client_key(key)?, PutPayload::from(data), options)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(delta_kernel::object_store::Error::AlreadyExists { .. }) => Ok(false),
+            Err(source) => Err(StoreError::Client {
+                key: key.to_string(),
+                source,
+            }),
+        }
+    }
+
+    /// The same object addressed in the namespace of the store's async client
+    /// ([`build_delta_object_store`](Self::build_delta_object_store)): the full
+    /// in-bucket key for a remote store, the absolute filesystem path for a
+    /// local one. This is what lets the `*_async` operations be provided once,
+    /// here, over each backend's client.
+    fn client_key(&self, key: &ObjectPath) -> Result<ClientKey>;
 
     /// Atomically replace `key` with `data` (overwriting any existing object).
     /// Backs a small, rarely-written mutable control file like the database
@@ -257,13 +345,15 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// cannot silently fall back to something unaddressable.
     fn location_uri(&self) -> String;
 
-    /// Build the separate asynchronous object-store client Delta Kernel uses to
-    /// read this store's `_delta_log`. This returns Delta Kernel's
-    /// [`DynObjectStore`] trait object, not this blocking [`ObjectStore`], but
-    /// configures it from the same location and credentials as this backend.
-    /// Required (no default): a backend cannot silently leave Delta Kernel to
-    /// resolve its own credentials, which for an unconfigured S3 client can mean
-    /// a slow failed probe of the instance metadata service.
+    /// The asynchronous object-store client Delta Kernel reads this store's
+    /// `_delta_log` with, and the `*_async` operations delegate to. This
+    /// returns Delta Kernel's [`DynObjectStore`] trait object, not this
+    /// [`ObjectStore`], but configures it from the same location and
+    /// credentials as this backend; a backend builds it once and hands out the
+    /// shared client thereafter. Required (no default): a backend cannot
+    /// silently leave Delta Kernel to resolve its own credentials, which for an
+    /// unconfigured S3 client can mean a slow failed probe of the instance
+    /// metadata service.
     fn build_delta_object_store(&self) -> Result<Arc<DynObjectStore>>;
 }
 

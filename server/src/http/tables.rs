@@ -78,28 +78,24 @@ async fn files_page_for(
     };
     let limit = page.limit.min(500);
     let offset = page.offset;
-    let result = tokio::task::spawn_blocking(move || {
-        // The path segment is a table name, taken as written: this route
-        // addresses the default schema only.
-        let name = SchemaQualifiedTableName::in_default_schema(name);
-        let Ok(Some(ordered)) = datastore.table_data_files(&name) else {
-            return FilesPage::default();
-        };
-        let total = ordered.len();
-        let items = ordered
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|file| FileOut {
-                path: file.path,
-                size: file.size,
-            })
-            .collect();
-        FilesPage { items, total }
-    })
-    .await
-    .unwrap_or_default();
-    Json(result)
+    // The path segment is a table name, taken as written: this route
+    // addresses the default schema only. The enumeration is async and hops to
+    // the blocking pool for its own store reads.
+    let name = SchemaQualifiedTableName::in_default_schema(name);
+    let Ok(Some(ordered)) = datastore.table_data_files(&name).await else {
+        return Json(FilesPage::default());
+    };
+    let total = ordered.len();
+    let items = ordered
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .map(|file| FileOut {
+            path: file.path,
+            size: file.size,
+        })
+        .collect();
+    Json(FilesPage { items, total })
 }
 
 #[derive(Serialize, Default)]

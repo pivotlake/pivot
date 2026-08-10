@@ -36,7 +36,9 @@ pub use binding::TableBinding;
 use std::any::Any;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
+
+use tokio::sync::RwLock;
 
 use uuid::Uuid;
 
@@ -215,7 +217,7 @@ impl DatastoreIndex {
 ///
 /// `CREATE TABLE` compiles to a dataflow that reads every data file's footer
 /// **once** (in parallel over the worker pool) and stages the materialized table
-/// on its transaction. The transaction's blocking commit initializes the table,
+/// on its transaction. The transaction's commit initializes the table,
 /// records it in the database index, and publishes the entry in this shared map.
 /// After that, a table evolves by log commits through
 /// [`commit_to_table`](Self::commit_to_table): a writer (INSERT, compaction)
@@ -225,14 +227,17 @@ impl DatastoreIndex {
 /// version, so a commit by another process becomes visible to the next query.
 ///
 /// Cloneable (every field is an `Arc`, a `String`, or the shared dispatcher
-/// handle), so a commit that writes can hand a clone to the blocking pool.
+/// handle), so maintenance tasks and spawned commits can hold their own
+/// handles.
 #[derive(Clone)]
 pub struct DeltaDatastore {
     /// The in-memory schema and table sets. The lock guards the *index* (add on
     /// `CREATE`, swap-in on a resolve's refresh); each [`CatalogTable`] is itself
     /// a lock-free value that callers clone out and evolve independently. One
     /// lock covers both halves so the two `CREATE` paths cannot interleave their
-    /// updates to the shared manifest document.
+    /// read-modify-writes of the shared manifest document: a create holds the
+    /// write lock across its store I/O (run on the blocking pool), and every
+    /// other hold is a brief in-memory map update.
     tables_index: Arc<RwLock<DatastoreIndex>>,
     /// The database's object store: the table index, Delta logs, and tables'
     /// Parquet data. The datastore reads and writes a table's data through this
@@ -257,7 +262,8 @@ pub struct DeltaDatastore {
     /// Abort handles for the maintenance tasks [`start`](Datastore::start)
     /// spawned, so [`abort`](Datastore::abort) can stop them on shutdown before
     /// the worker pool is torn down. Behind an `Arc<Mutex<..>>` so the datastore
-    /// stays `Clone` (a writing commit hands a clone to the blocking pool).
+    /// stays `Clone`. Deliberately a std mutex: it is only touched by the
+    /// synchronous `start`/`abort` pair, for an instant, never across an await.
     maintenance_tasks: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
 }
 
@@ -387,9 +393,18 @@ impl DeltaDatastore {
     /// files and table creations. Cheap: clones the map (the row-group metadata
     /// inside is `Arc`-shared), no I/O. The [`Datastore::begin_transaction`]
     /// trait impl delegates here.
+    ///
+    /// Synchronous by design: the planner resolves tables from DuckDB's binder,
+    /// which runs on a blocking-pool thread, so this is the one place the index
+    /// is read with [`RwLock::blocking_read`]. The wait is usually momentary; an
+    /// in-flight `CREATE` holds the write lock across its manifest commit, and a
+    /// begin during one waits it out, exactly as a query binding against
+    /// half-created DDL should. Do not call this from an async task
+    /// (`blocking_read` panics there); async callers hold the index lock through
+    /// the async accessors instead.
     pub fn begin_transaction(self: Arc<Self>) -> Arc<DeltaTransaction> {
         let snapshot = Arc::new(DeltaSnapshot {
-            index: self.tables_index.read().unwrap().clone(),
+            index: self.tables_index.blocking_read().clone(),
         });
         Arc::new(DeltaTransaction {
             snapshot,
@@ -416,13 +431,13 @@ impl DeltaDatastore {
     /// transient store error) must not starve every other table of its
     /// refresh, so per-table failures are logged and the sweep continues; only
     /// a database-index load failure aborts it.
-    pub fn refresh_from_store(&self) -> Result<bool> {
+    pub async fn refresh_from_store(&self) -> Result<bool> {
         let mut changed = false;
 
-        let manifest = CatalogManifest::load(self.store.as_ref())?;
+        let manifest = CatalogManifest::load_async(self.store.as_ref()).await?;
 
         for schema in &manifest.schemas {
-            let mut index = self.tables_index.write().unwrap();
+            let mut index = self.tables_index.write().await;
             if !index.contains_schema(&schema.name) {
                 index.insert_schema(schema.name.clone());
                 changed = true;
@@ -431,23 +446,29 @@ impl DeltaDatastore {
 
         for entry in manifest.tables() {
             let (name, id, location) = entry?;
-            if self.tables_index.read().unwrap().contains_table(&name) {
+            if self.tables_index.read().await.contains_table(&name) {
                 continue;
             }
-            let table = match Self::load_table(
-                &self.dispatcher,
-                &self.store,
-                &self.engine,
-                id,
-                location,
-            ) {
+            // Loading is footer fetches and log reads, so it runs on the
+            // blocking pool, one table per hop; no lock is held meanwhile.
+            let loaded = {
+                let dispatcher = self.dispatcher.clone();
+                let store = self.store.clone();
+                let engine = self.engine.clone();
+                let location = location.clone();
+                crate::run_blocking(move || {
+                    Self::load_table(&dispatcher, &store, &engine, id, &location)
+                })
+                .await
+            };
+            let table = match loaded {
                 Ok(table) => table,
                 Err(e) => {
                     tracing::warn!(table = %name, error = %e, "catalog refresh: loading table failed");
                     continue;
                 }
             };
-            let mut index = self.tables_index.write().unwrap();
+            let mut index = self.tables_index.write().await;
             // An in-process CREATE TABLE may have published it since the read.
             if !index.contains_table(&name) {
                 index.insert_table(name, table);
@@ -456,11 +477,14 @@ impl DeltaDatastore {
         }
 
         // Refresh each table on a clone outside the lock (footer fetches are
-        // I/O), then publish the advanced copy back.
-        for (name, mut table) in self.tables() {
-            match table.refresh() {
-                Ok(true) => changed |= self.publish_table(table),
-                Ok(false) => {}
+        // I/O, run on the blocking pool), then publish the advanced copy back.
+        for (name, mut table) in self.tables().await {
+            let refreshed =
+                crate::run_blocking(move || table.refresh().map(|advanced| (advanced, table)))
+                    .await;
+            match refreshed {
+                Ok((true, table)) => changed |= self.publish_table(table).await,
+                Ok((false, _)) => {}
                 Err(e) => {
                     tracing::warn!(table = %name, error = %e, "catalog refresh: refreshing table failed");
                 }
@@ -475,8 +499,8 @@ impl DeltaDatastore {
     /// after the next background refresh). INSERT and compaction call this
     /// right after their commit. A copy at or behind the map's current version
     /// is dropped (`false`); a newer one replaces it.
-    pub fn publish_table(&self, table: CatalogTable) -> bool {
-        let mut index = self.tables_index.write().unwrap();
+    pub async fn publish_table(&self, table: CatalogTable) -> bool {
+        let mut index = self.tables_index.write().await;
         match index.get_table_by_id(&table.id()) {
             Some(existing) if existing.version() >= table.version() => false,
             _ => {
@@ -494,46 +518,57 @@ impl DeltaDatastore {
     /// This is the sole in-process write path and uses the
     /// [commit-lock protocol](field@CatalogTable::commit_lock). A caller's
     /// [`CatalogTable`] copy is a read view, never a commit base.
-    pub(crate) fn commit_to_table(
+    pub(crate) async fn commit_to_table(
         &self,
         id: Uuid,
-        removed: &[ObjectPath],
+        removed: Vec<ObjectPath>,
         added: Vec<TableFile>,
         data_change: bool,
     ) -> Result<()> {
         // Look the table up twice on purpose: this first lookup takes nothing
         // but the lock, because a copy read before the lock would be the version
-        // the previous holder is about to supersede. The index guard is a
-        // temporary in this statement, so it is released at the semicolon,
-        // before the blocking log write; that only type-checks because
-        // `commit_lock` hands back an owned `Arc` rather than a reference.
+        // the previous holder is about to supersede. The commit lock is an
+        // async mutex precisely because it is held across the blocking log
+        // write below: a second in-process writer awaits its turn instead of
+        // parking a thread.
         let commit_lock = self
             .tables_index
             .read()
-            .unwrap()
+            .await
             .get_table_by_id(&id)
             .ok_or_else(|| Error::TableNotFound(id.to_string()))?
             .commit_lock();
-        let _committing = commit_lock.lock().unwrap();
+        let _committing = commit_lock.lock().await;
 
         let mut table = self
             .table_handle_by_id(&id)
+            .await
             .ok_or_else(|| Error::TableNotFound(id.to_string()))?;
-        table.commit_files(removed, added, data_change)?;
-        self.publish_table(table);
+        // The log write (and a conflict retry's footer fetches) is blocking
+        // store I/O; only that hops to the blocking pool.
+        let table = crate::run_blocking(move || {
+            table
+                .commit_files(&removed, added, data_change)
+                .map(|()| table)
+        })
+        .await?;
+        self.publish_table(table).await;
         Ok(())
     }
 
     /// Persist one table creation staged by a completed footer-fetch dataflow:
     /// commit Delta version 0, record the table in the database index, and
     /// publish it into the live set so the next transaction binds it. Called
-    /// from [`DeltaTransaction::commit`] on the blocking pool, never from a
-    /// dispatch worker.
+    /// from [`DeltaTransaction::commit`], never from a dispatch worker.
     ///
     /// The whole step holds the table-set write lock, which serializes
-    /// in-process creates and their database-index read-modify-write; the name is
-    /// re-checked under it as a race backstop.
-    fn finalize_table_creation(&self, pending: PendingTableCreation) -> Result<()> {
+    /// in-process creates and their database-index read-modify-write; the name
+    /// is re-checked under it as a race backstop. The version-0 commit runs on
+    /// the blocking pool (the Kernel engine is synchronous) with the guard held
+    /// across the hop, and the manifest registration goes over the store's
+    /// async client, so the reactor stays free even while readers wait out the
+    /// create.
+    async fn finalize_table_creation(&self, pending: PendingTableCreation) -> Result<()> {
         let PendingTableCreation {
             name,
             id,
@@ -544,7 +579,7 @@ impl DeltaDatastore {
             if_not_exists,
             loaded,
         } = pending;
-        let mut index = self.tables_index.write().unwrap();
+        let mut index = self.tables_index.write().await;
         if index.contains_table(&name) {
             // A concurrent create won the race. With `IF NOT EXISTS` that is
             // still a success; the fetched footers are dropped.
@@ -553,43 +588,56 @@ impl DeltaDatastore {
             }
             return Err(Error::TableExists(name.to_string()));
         }
-        let table = CatalogTable::create_new(
-            id,
-            location.clone(),
-            loaded,
-            columns,
-            partition_by,
-            sort_by,
-            self.store.clone(),
-            self.dispatcher.clone(),
-            self.engine.clone(),
-        )?;
-        let mut manifest = CatalogManifest::load(self.store.as_ref())?;
+        // Delta's version-0 commit goes through the synchronous Kernel engine,
+        // so it alone hops to the blocking pool; the manifest registration
+        // around it runs on the runtime over the store's async client.
+        let table = {
+            let store = self.store.clone();
+            let dispatcher = self.dispatcher.clone();
+            let engine = self.engine.clone();
+            let location = location.clone();
+            crate::run_blocking(move || {
+                CatalogTable::create_new(
+                    id,
+                    location,
+                    loaded,
+                    columns,
+                    partition_by,
+                    sort_by,
+                    store,
+                    dispatcher,
+                    engine,
+                )
+            })
+            .await?
+        };
+        let mut manifest = CatalogManifest::load_async(self.store.as_ref()).await?;
         manifest.upsert_table(&name, id, location)?;
-        manifest.store(self.store.as_ref())?;
+        manifest.store_async(self.store.as_ref()).await?;
         index.insert_table(name, table);
         Ok(())
     }
 
     /// Whether this datastore defines a schema named `schema`.
-    pub fn contains_schema(&self, schema: &str) -> bool {
-        self.tables_index.read().unwrap().contains_schema(schema)
+    pub async fn contains_schema(&self, schema: &str) -> bool {
+        self.tables_index.read().await.contains_schema(schema)
     }
 
     /// Persist one schema creation staged by a transaction: record it in the
     /// database index and publish it into the live set so the next transaction
-    /// resolves it. Called from [`DeltaTransaction::commit`] on the blocking
-    /// pool, never from a dispatch worker.
+    /// resolves it. Called from [`DeltaTransaction::commit`], never from a
+    /// dispatch worker; the manifest write goes over the store's async client,
+    /// so no blocking-pool hop is involved.
     ///
     /// The whole step holds the index write lock, which serializes in-process
     /// creates (schemas and tables alike) and their read-modify-write of the
     /// shared manifest; the name is re-checked under it as a race backstop.
-    fn finalize_schema_creation(&self, pending: PendingSchemaCreation) -> Result<()> {
+    async fn finalize_schema_creation(&self, pending: PendingSchemaCreation) -> Result<()> {
         let PendingSchemaCreation {
             name,
             if_not_exists,
         } = pending;
-        let mut index = self.tables_index.write().unwrap();
+        let mut index = self.tables_index.write().await;
         if index.contains_schema(&name) {
             // A concurrent create won the race. With `IF NOT EXISTS` that is
             // still a success.
@@ -598,9 +646,9 @@ impl DeltaDatastore {
             }
             return Err(Error::SchemaExists(name));
         }
-        let mut manifest = CatalogManifest::load(self.store.as_ref())?;
+        let mut manifest = CatalogManifest::load_async(self.store.as_ref()).await?;
         manifest.add_schema(name.clone());
-        manifest.store(self.store.as_ref())?;
+        manifest.store_async(self.store.as_ref()).await?;
         index.insert_schema(name);
         Ok(())
     }
@@ -617,10 +665,10 @@ impl DeltaDatastore {
     /// it is never a commit base: writes go through
     /// [`commit_to_table`](Self::commit_to_table). `None` if no such table
     /// exists.
-    pub fn table_handle(&self, name: &SchemaQualifiedTableName) -> Option<CatalogTable> {
+    pub async fn table_handle(&self, name: &SchemaQualifiedTableName) -> Option<CatalogTable> {
         self.tables_index
             .read()
-            .unwrap()
+            .await
             .get_table_by_name(name)
             .cloned()
     }
@@ -628,16 +676,16 @@ impl DeltaDatastore {
     /// Whether a table named `name` exists in the datastore (a cheap membership
     /// check, no clone). Used to fail fast when a table a writer targets
     /// hasn't been created.
-    pub fn contains_table(&self, name: &SchemaQualifiedTableName) -> bool {
-        self.tables_index.read().unwrap().contains_table(name)
+    pub async fn contains_table(&self, name: &SchemaQualifiedTableName) -> bool {
+        self.tables_index.read().await.contains_table(name)
     }
 
     /// A snapshot clone of every table the catalog currently holds — for a sweep
     /// (e.g. the compacter) that refreshes and evolves each one independently.
-    pub fn tables(&self) -> Vec<(SchemaQualifiedTableName, CatalogTable)> {
+    pub async fn tables(&self) -> Vec<(SchemaQualifiedTableName, CatalogTable)> {
         self.tables_index
             .read()
-            .unwrap()
+            .await
             .named_tables()
             .map(|(name, table)| (name, table.clone()))
             .collect()
@@ -646,12 +694,8 @@ impl DeltaDatastore {
     /// A clone of the table with identity `id`, or `None` if it's gone (dropped,
     /// or a stale reference outliving the table). This is how a commit resolves
     /// the *live* table its files belong to, regardless of any concurrent rename.
-    pub fn table_handle_by_id(&self, id: &Uuid) -> Option<CatalogTable> {
-        self.tables_index
-            .read()
-            .unwrap()
-            .get_table_by_id(id)
-            .cloned()
+    pub async fn table_handle_by_id(&self, id: &Uuid) -> Option<CatalogTable> {
+        self.tables_index.read().await.get_table_by_id(id).cloned()
     }
 
     /// A human-readable description of where this database is rooted (local
@@ -664,9 +708,15 @@ impl DeltaDatastore {
     /// BoundTable `name`'s current committed files — refreshing to the latest version
     /// first, so a commit by INSERT/compaction (in this process or another) is
     /// reflected. `None` if no such table exists.
-    pub fn table_files(&self, name: &SchemaQualifiedTableName) -> Option<Vec<FileRef>> {
-        let mut table = self.table_handle(name)?;
-        let _ = table.refresh();
+    pub async fn table_files(&self, name: &SchemaQualifiedTableName) -> Option<Vec<FileRef>> {
+        let mut table = self.table_handle(name).await?;
+        // The refresh reads the log and fetches footers, so it runs on the
+        // blocking pool; a failed refresh still reports the copy in hand.
+        let table = crate::run_blocking(move || {
+            let _ = table.refresh();
+            table
+        })
+        .await;
         Some(table.file_refs())
     }
 
@@ -675,14 +725,14 @@ impl DeltaDatastore {
     /// table exists. Refreshes to the latest committed version first. Sizes come
     /// from the files' `FileRef`s, correlated by path (the two orderings differ,
     /// so a map lookup rather than a zip).
-    pub fn table_data_files(
+    pub async fn table_data_files(
         &self,
         name: &SchemaQualifiedTableName,
     ) -> Result<Option<Vec<DataFileInfo>>> {
-        let Some(mut table) = self.table_handle(name) else {
+        let Some(mut table) = self.table_handle(name).await else {
             return Ok(None);
         };
-        table.refresh()?;
+        let table = crate::run_blocking(move || table.refresh().map(|_| table)).await?;
         let sizes: HashMap<String, u64> = table
             .file_refs()
             .into_iter()
@@ -776,7 +826,7 @@ impl DeltaTransaction {
     /// Resolve a `CREATE SCHEMA` against this datastore and stage it on the
     /// transaction. A schema is a pure naming construct here: it owns no store
     /// state of its own, so there is nothing to locate or load, and creating it
-    /// is just recording the name. The transaction's blocking commit writes it to
+    /// is just recording the name. The transaction's commit writes it to
     /// the database manifest and publishes it.
     ///
     /// Rejects a duplicate up front, unless `IF NOT EXISTS` makes an existing
@@ -901,28 +951,25 @@ impl DeltaTransaction {
 
 /// Commit the schema creations drained from a transaction. Each one records
 /// itself in the database manifest and publishes into the live schema set.
-/// Blocking store I/O, so [`DeltaTransaction::commit`] runs this on the blocking
-/// pool.
-fn commit_schema_creations(
+async fn commit_schema_creations(
     datastore: &DeltaDatastore,
     pending_schema_creations: Vec<PendingSchemaCreation>,
 ) -> CatalogResult<()> {
     for pending in pending_schema_creations {
-        datastore.finalize_schema_creation(pending)?;
+        datastore.finalize_schema_creation(pending).await?;
     }
     Ok(())
 }
 
 /// Commit the table creations drained from a transaction. Each one initializes
 /// its Delta log, registers itself in the database manifest, and publishes into
-/// the live table set. Blocking store I/O, so [`DeltaTransaction::commit`] runs
-/// this on the blocking pool.
-fn commit_table_creations(
+/// the live table set.
+async fn commit_table_creations(
     datastore: &DeltaDatastore,
     pending_table_creations: Vec<PendingTableCreation>,
 ) -> CatalogResult<()> {
     for pending in pending_table_creations {
-        datastore.finalize_table_creation(pending)?;
+        datastore.finalize_table_creation(pending).await?;
     }
     Ok(())
 }
@@ -932,9 +979,7 @@ fn commit_table_creations(
 /// [`DeltaDatastore::commit_to_table`]. The transaction's frozen snapshot is not
 /// the commit base -- it is a read view, and a table it froze versions ago would
 /// lose the compare-and-swap against every INSERT that committed since.
-/// Blocking store I/O, so [`DeltaTransaction::commit`] runs it on the blocking
-/// pool.
-fn commit_uploaded_files(
+async fn commit_uploaded_files(
     datastore: &DeltaDatastore,
     drained: Vec<insert_sink::UploadedFile>,
 ) -> CatalogResult<()> {
@@ -959,7 +1004,9 @@ fn commit_uploaded_files(
     }
 
     for (table_id, files) in files_by_table {
-        datastore.commit_to_table(table_id, &[], files, true)?;
+        datastore
+            .commit_to_table(table_id, Vec::new(), files, true)
+            .await?;
     }
     Ok(())
 }
@@ -1009,10 +1056,11 @@ impl Datastore for DeltaDatastore {
             tick.tick().await;
             loop {
                 tick.tick().await;
-                // The refresh drives footer-fetch dataflows and blocking store
-                // reads, so it runs off the reactor.
+                // The refresh hops to the blocking pool per store read itself;
+                // it runs as its own task so a panicking sweep is logged here
+                // and the next tick still fires.
                 let datastore = Arc::clone(&refresh_datastore);
-                match tokio::task::spawn_blocking(move || datastore.refresh_from_store()).await {
+                match tokio::spawn(async move { datastore.refresh_from_store().await }).await {
                     Ok(Ok(_)) => {}
                     Ok(Err(e)) => tracing::warn!(error = %e, "catalog refresh failed"),
                     Err(e) => tracing::warn!(error = %e, "catalog refresh panicked"),
@@ -1057,14 +1105,16 @@ impl Datastore for DeltaDatastore {
         table: &SchemaQualifiedTableName,
         final_sweep: bool,
     ) -> CatalogResult<u64> {
-        let version_of = |datastore: &DeltaDatastore| {
+        async fn version_of(
+            datastore: &DeltaDatastore,
+            table: &SchemaQualifiedTableName,
+        ) -> Option<u64> {
             datastore
-                .tables()
-                .into_iter()
-                .find(|(name, _)| name == table)
-                .map(|(_, found)| found.version())
-        };
-        if version_of(&self).is_none() {
+                .table_handle(table)
+                .await
+                .map(|found| found.version())
+        }
+        if version_of(&self, table).await.is_none() {
             return Err(CatalogError::Other(
                 format!("COMPACT: no table named `{table}`").into(),
             ));
@@ -1079,10 +1129,10 @@ impl Datastore for DeltaDatastore {
         );
         let mut sweeps = 0;
         loop {
-            let before = version_of(&self);
+            let before = version_of(&self, table).await;
             compacter.sweep_table(table).await;
             sweeps += 1;
-            if !final_sweep || version_of(&self) == before {
+            if !final_sweep || version_of(&self, table).await == before {
                 return Ok(sweeps);
             }
         }
@@ -1245,29 +1295,23 @@ impl DatastoreTransaction for DeltaTransaction {
     }
 
     async fn commit(&self) -> CatalogResult<()> {
-        // A read-only transaction staged nothing: an in-memory no-op, run inline
-        // rather than pay a blocking-pool round trip. Only a commit that writes
-        // durable state hops off the runtime.
+        // A read-only transaction staged nothing: an in-memory no-op. A commit
+        // that writes durable state stays on the runtime too; each write below
+        // hops to the blocking pool only for its own store I/O.
         if self.uploaded_files.is_empty()
             && self.pending_table_creations.is_empty()
             && self.pending_schema_creations.is_empty()
         {
             return Ok(());
         }
-        let datastore = self.datastore.clone();
         let pending_schema_creations = drain_injector(&self.pending_schema_creations);
         let pending_table_creations = drain_injector(&self.pending_table_creations);
         let uploaded_files = drain_injector(&self.uploaded_files);
-        tokio::task::spawn_blocking(move || {
-            // Schemas first: a table is registered into its schema, so the
-            // schema has to be in the manifest before any table write looks for
-            // it.
-            commit_schema_creations(&datastore, pending_schema_creations)?;
-            commit_table_creations(&datastore, pending_table_creations)?;
-            commit_uploaded_files(&datastore, uploaded_files)
-        })
-        .await
-        .map_err(|e| CatalogError::Other(format!("commit thread panicked: {e}").into()))?
+        // Schemas first: a table is registered into its schema, so the schema
+        // has to be in the manifest before any table write looks for it.
+        commit_schema_creations(&self.datastore, pending_schema_creations).await?;
+        commit_table_creations(&self.datastore, pending_table_creations).await?;
+        commit_uploaded_files(&self.datastore, uploaded_files).await
     }
 
     fn rollback(&self) {
@@ -1330,7 +1374,7 @@ struct DeltaTableCreation {
 impl TableCreation for DeltaTableCreation {
     fn compile(&self, dispatcher: &DataFlowDispatcher) -> CatalogResult<RecordBatchOperatorSpec> {
         // The terminal worker only stages the completed creation. Durable writes
-        // and live publication happen later in the transaction's blocking commit.
+        // and live publication happen later in the transaction's commit.
         let pending_table_creations = self.pending_table_creations.clone();
         let name = self.name.clone();
         let id = self.id;

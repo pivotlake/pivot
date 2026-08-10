@@ -165,7 +165,7 @@ pub(crate) async fn execute_sql(
     // (the async block scopes the `?` early-returns so both paths land below).
     let transaction = catalog.begin_transaction();
     let result = async {
-        let plan = plan_query(&catalog, transaction.clone(), plan_cache.as_ref(), &sql)
+        let plan = plan_query(&catalog, transaction.clone(), plan_cache.clone(), &sql)
             .await
             .map_err(|e| e.to_string())?;
         // A SET/RESET compiles to no dataflow; nothing to return.
@@ -290,10 +290,22 @@ async fn execute_compact(
 async fn plan_query(
     catalog: &Arc<catalog::PivotCatalog>,
     transaction: Arc<dyn planner::catalog::CatalogTransaction>,
-    plan_cache: &PlanCache,
+    plan_cache: Arc<PlanCache>,
     query: &str,
 ) -> Result<Arc<planner::Plan>> {
-    if let Some(plan) = plan_cache.get(query, transaction.as_ref()) {
+    // Revalidating a cached plan reads table revisions through the transaction,
+    // which lazily opens datastore sub-transactions; opening one is synchronous
+    // by contract (the planner drives it from blocking threads), so the lookup
+    // hops to the blocking pool the same way planning does.
+    let cached = {
+        let plan_cache = plan_cache.clone();
+        let transaction = transaction.clone();
+        let query = query.to_string();
+        tokio::task::spawn_blocking(move || plan_cache.get(&query, transaction.as_ref()))
+            .await
+            .map_err(Error::PlannerPanic)?
+    };
+    if let Some(plan) = cached {
         return Ok(plan);
     }
 
@@ -457,7 +469,7 @@ impl PivotQueryHandler {
             let plan = plan_query(
                 &self.catalog,
                 transaction.clone(),
-                self.plan_cache.as_ref(),
+                self.plan_cache.clone(),
                 &query,
             )
             .await?;

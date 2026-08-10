@@ -41,3 +41,22 @@ pub use manifest::{
 };
 pub use store::FileRef;
 pub use vacuum::{DEFAULT_VACUUM_POLL, VacuumConfig, Vacuumer};
+
+/// Run one blocking unit of work (store I/O, a Delta log write, a dataflow
+/// drive) on tokio's blocking pool and await it. A panic in the closure is
+/// resumed on the caller rather than swallowed; a cancelled task (runtime
+/// shutdown) panics too, because the caller cannot distinguish "not done" from
+/// "done" and must not carry on as if the work happened.
+pub(crate) async fn run_blocking<T, F>(work: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    match tokio::task::spawn_blocking(work).await {
+        Ok(value) => value,
+        Err(join_error) => match join_error.try_into_panic() {
+            Ok(panic) => std::panic::resume_unwind(panic),
+            Err(join_error) => panic!("blocking task cancelled: {join_error}"),
+        },
+    }
+}

@@ -47,6 +47,9 @@ pub struct S3Store {
     /// `Host` header value for signing.
     host: String,
     agent: ureq::Agent,
+    /// The shared async client, built on first use (see
+    /// [`ObjectStore::build_delta_object_store`]).
+    client: std::sync::OnceLock<Arc<DynObjectStore>>,
 }
 
 /// Explicit S3 credentials and connection parameters for
@@ -119,6 +122,7 @@ impl S3Store {
             base,
             host,
             agent: ureq::AgentBuilder::new().build(),
+            client: std::sync::OnceLock::new(),
         }
     }
 
@@ -200,6 +204,9 @@ impl ObjectStore for S3Store {
     }
 
     fn build_delta_object_store(&self) -> Result<Arc<DynObjectStore>> {
+        if let Some(client) = self.client.get() {
+            return Ok(client.clone());
+        }
         let mut builder = AmazonS3Builder::new()
             .with_url(self.uri.as_str())
             .with_region(&self.region)
@@ -220,7 +227,19 @@ impl ObjectStore for S3Store {
                 uri: self.uri.clone(),
                 source,
             })?;
-        Ok(Arc::new(store))
+        Ok(self
+            .client
+            .get_or_init(|| Arc::new(store) as Arc<DynObjectStore>)
+            .clone())
+    }
+
+    fn client_key(&self, key: &ObjectPath) -> Result<super::ClientKey> {
+        // The async client is rooted at the bucket, so a key addresses it by
+        // its full in-bucket name, prefix included.
+        super::ClientKey::parse(object_key(&self.prefix, key)).map_err(|e| StoreError::ClientKey {
+            key: key.to_string(),
+            reason: e.to_string(),
+        })
     }
 
     fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>> {

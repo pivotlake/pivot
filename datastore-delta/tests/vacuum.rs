@@ -17,7 +17,7 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
-use common::{DispatchGuard, commit_datastore_transaction, dispatch, table_dir};
+use common::{DispatchGuard, commit_datastore_transaction, dispatch, table_dir, wait};
 use datastore::DatastoreTransaction as _;
 use datastore_delta::{DEFAULT_VACUUM_POLL, DeltaDatastore, Vacuumer};
 use planner::catalog::{Column, CreateTableRequest, SchemaQualifiedTableName};
@@ -102,7 +102,7 @@ fn unreferenced_file_past_retention_is_deleted_and_the_live_file_is_kept() {
     write_parquet(&table_dir.join("orphan.parquet"));
 
     let vacuumer = Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, datastore.clone()));
-    vacuumer.vacuum_all(now_ms() + EIGHT_DAYS_MS);
+    wait(vacuumer.vacuum_all(now_ms() + EIGHT_DAYS_MS));
 
     assert!(
         !table_dir.join("orphan.parquet").exists(),
@@ -126,7 +126,7 @@ fn unreferenced_file_within_retention_is_kept() {
     write_parquet(&table_dir.join("orphan.parquet"));
 
     let vacuumer = Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, datastore.clone()));
-    vacuumer.vacuum_all(now_ms());
+    wait(vacuumer.vacuum_all(now_ms()));
 
     assert!(
         table_dir.join("orphan.parquet").exists(),
@@ -148,7 +148,7 @@ fn a_file_in_the_adopted_directory_is_never_deleted() {
     write_parquet(&adopted_dir.join("theirs.parquet"));
 
     let vacuumer = Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, datastore.clone()));
-    vacuumer.vacuum_all(now_ms() + EIGHT_DAYS_MS);
+    wait(vacuumer.vacuum_all(now_ms() + EIGHT_DAYS_MS));
 
     assert!(adopted_dir.join("theirs.parquet").exists());
 }
@@ -169,16 +169,24 @@ fn compaction_merges_adopted_files_without_deleting_them() {
     let datastore = DeltaDatastore::open_local(db.path(), &dispatch).unwrap();
     let table_dir = create_events_table(&datastore, &dispatch, db.path(), &adopted_dir);
     let name = SchemaQualifiedTableName::in_default_schema("events");
-    let inputs = datastore.table_files(&name).unwrap();
+    let inputs = wait(datastore.table_files(&name)).unwrap();
     assert_eq!(inputs.len(), 2, "both adopted files are live");
 
-    let id = datastore.table_handle(&name).unwrap().id();
-    datastore_delta::compact_table_files(&datastore, id, &inputs, 128 * 1024).unwrap();
-    Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, datastore.clone()))
-        .vacuum_all(now_ms() + EIGHT_DAYS_MS);
+    let id = wait(datastore.table_handle(&name)).unwrap().id();
+    wait(datastore_delta::compact_table_files(
+        &datastore,
+        id,
+        &inputs,
+        128 * 1024,
+    ))
+    .unwrap();
+    wait(
+        Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, datastore.clone()))
+            .vacuum_all(now_ms() + EIGHT_DAYS_MS),
+    );
 
     // One merged file in the table's own directory, holding every row.
-    let merged = datastore.table_files(&name).unwrap();
+    let merged = wait(datastore.table_files(&name)).unwrap();
     assert_eq!(merged.len(), 1);
     assert!(table_dir.join(merged[0].path.as_str()).exists());
     // And both originals still sit where their owner left them.

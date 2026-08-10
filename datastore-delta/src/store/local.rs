@@ -4,18 +4,25 @@
 use super::{DataFileLocation, FileRef, ListedObject, ObjectPath, ObjectStore, Result, StoreError};
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::path::Path as ClientKey;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// The local-filesystem backend: keys are paths under `root`.
 #[derive(Debug)]
 pub struct LocalStore {
     root: PathBuf,
+    /// The shared async client, built on first use (see
+    /// [`ObjectStore::build_delta_object_store`]).
+    client: OnceLock<Arc<DynObjectStore>>,
 }
 
 impl LocalStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            client: OnceLock::new(),
+        }
     }
 
     /// The filesystem path for `key`. A relative key lives under the store
@@ -43,7 +50,23 @@ impl ObjectStore for LocalStore {
     fn build_delta_object_store(&self) -> Result<Arc<DynObjectStore>> {
         // Keys reach this client as absolute paths from the table URI, so it is
         // rooted at the filesystem rather than at this store's root.
-        Ok(Arc::new(LocalFileSystem::new()))
+        Ok(self
+            .client
+            .get_or_init(|| Arc::new(LocalFileSystem::new()))
+            .clone())
+    }
+
+    fn client_key(&self, key: &ObjectPath) -> Result<ClientKey> {
+        // The client is rooted at the filesystem, so a key addresses it by its
+        // absolute path (see `build_delta_object_store`).
+        let path = std::path::absolute(self.path_for(key)).map_err(|source| StoreError::Io {
+            key: key.to_string(),
+            source,
+        })?;
+        ClientKey::from_absolute_path(&path).map_err(|e| StoreError::ClientKey {
+            key: key.to_string(),
+            reason: e.to_string(),
+        })
     }
 
     fn create_dir(&self, prefix: &ObjectPath) -> Result<()> {

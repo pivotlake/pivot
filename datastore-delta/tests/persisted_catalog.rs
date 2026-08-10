@@ -226,7 +226,7 @@ fn background_refresh_advances_to_latest_delta_snapshot() {
         })],
     );
 
-    assert!(datastore.refresh_from_store().unwrap());
+    assert!(wait(datastore.refresh_from_store()).unwrap());
     assert_eq!(current_parquet(&datastore, "events").row_groups().len(), 2);
 
     write_delta_commit(
@@ -240,7 +240,7 @@ fn background_refresh_advances_to_latest_delta_snapshot() {
             }
         })],
     );
-    assert!(datastore.refresh_from_store().unwrap());
+    assert!(wait(datastore.refresh_from_store()).unwrap());
     assert_eq!(current_parquet(&datastore, "events").row_groups().len(), 1);
 }
 

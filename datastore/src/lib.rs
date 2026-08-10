@@ -125,6 +125,12 @@ pub trait Datastore: Debug + Send + Sync {
     /// passes it to commit or rollback when the query finishes. The `Arc<Self>`
     /// receiver lets the transaction hold the datastore alive, so a `CREATE TABLE`
     /// it commits can publish the new table straight back into the datastore.
+    ///
+    /// Synchronous by contract, and called only from synchronous contexts (the
+    /// planner's binder runs on blocking-pool threads): an implementation may
+    /// take a blocking snapshot of async-guarded state, which would panic if
+    /// driven from inside an async task. Callers on the runtime hop to the
+    /// blocking pool first, as the server's plan path does.
     fn begin_transaction(self: Arc<Self>) -> Arc<dyn DatastoreTransaction>;
 
     /// Start this datastore's background maintenance (e.g. periodic refresh and

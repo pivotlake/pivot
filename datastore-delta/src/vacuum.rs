@@ -89,24 +89,24 @@ impl Vacuumer {
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            let vacuumer = self.clone();
-            // Store list/get/delete and the log reads are synchronous (blocking
-            // HTTP for S3), so the sweep runs off the reactor.
-            if let Err(e) =
-                tokio::task::spawn_blocking(move || vacuumer.vacuum_all(now_unix_ms())).await
-            {
-                warn!(error = %e, "vacuum sweep panicked");
-            }
+            self.vacuum_all(now_unix_ms()).await;
         }
     }
 
     /// One poll round over every table the datastore knows, evaluated against
     /// `now_ms` (threaded in so tests are deterministic -- there is no mockable
     /// clock). Public so tests and a standalone vacuumer binary can drive one
-    /// round without the loop.
-    pub fn vacuum_all(&self, now_ms: u64) {
-        for (name, table) in self.datastore.tables() {
-            self.vacuum_table(&name, table, now_ms);
+    /// round without the loop. Each table's sweep is store list/get/delete and
+    /// log reads (blocking HTTP for S3), so it runs off the reactor, one
+    /// blocking hop per table; a panicking sweep is caught here so it cannot
+    /// kill the poll loop.
+    pub async fn vacuum_all(&self, now_ms: u64) {
+        for (name, table) in self.datastore.tables().await {
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || Self::vacuum_table(&name, table, now_ms)).await
+            {
+                warn!(error = %e, "vacuum sweep panicked");
+            }
         }
     }
 
@@ -116,7 +116,7 @@ impl Vacuumer {
     /// than the deletion window (the table's `deletedFileRetentionDuration`).
     /// Finally delete the superseded commit JSONs past the log-retention window.
     /// Errors are logged and end the round; the next poll retries.
-    fn vacuum_table(&self, name: &SchemaQualifiedTableName, mut table: CatalogTable, now_ms: u64) {
+    fn vacuum_table(name: &SchemaQualifiedTableName, mut table: CatalogTable, now_ms: u64) {
         if let Err(e) = table.refresh() {
             warn!(table = %name, error = %e, "vacuum: table refresh failed");
             return;

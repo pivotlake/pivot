@@ -323,9 +323,22 @@ impl CatalogManifest {
         }
     }
 
-    /// Write the database manifest, overwriting the previous version.
-    pub fn store(&self, store: &dyn ObjectStore) -> Result<()> {
-        store.put(&ObjectPath::new(MANIFEST_KEY), &serde_json::to_vec(self)?)?;
+    /// [`load`](Self::load), asynchronously over the store's async client, for
+    /// a caller on the runtime (the catalog's refresh and DDL commits).
+    pub async fn load_async(store: &dyn ObjectStore) -> Result<Self> {
+        match store.get_async(&ObjectPath::new(MANIFEST_KEY)).await? {
+            Some(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            None => Ok(Self::default()),
+        }
+    }
+
+    /// Write the database manifest, overwriting the previous version, over the
+    /// store's async client (every manifest writer is on the runtime: the
+    /// catalog's DDL commits).
+    pub async fn store_async(&self, store: &dyn ObjectStore) -> Result<()> {
+        store
+            .put_async(&ObjectPath::new(MANIFEST_KEY), serde_json::to_vec(self)?)
+            .await?;
         Ok(())
     }
 

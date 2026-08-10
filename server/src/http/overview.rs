@@ -56,13 +56,9 @@ pub(super) async fn overview(State(state): State<IntrospectState>) -> Json<Overv
         .expect("the dashboard serves only Delta datastores");
     let store = datastore.store_description();
 
-    // Catalog snapshot (manifest reads may touch object storage) off the runtime.
-    let metas = {
-        let datastore = datastore.clone();
-        tokio::task::spawn_blocking(move || collect_tables(&datastore))
-            .await
-            .unwrap_or_default()
-    };
+    // The datastore's accessors are async and hop to the blocking pool for
+    // their own store reads, so the snapshot is gathered right here.
+    let metas = collect_tables(&datastore).await;
 
     let mut tables = Vec::with_capacity(metas.len());
     for meta in metas {
@@ -87,36 +83,34 @@ pub(super) async fn overview(State(state): State<IntrospectState>) -> Json<Overv
     })
 }
 
-fn collect_tables(datastore: &DeltaDatastore) -> Vec<TableMeta> {
-    datastore
-        .tables()
-        .into_iter()
-        .map(|(name, table)| {
-            let columns = table
-                .columns()
-                .into_iter()
-                .map(|c| ColumnOut {
-                    name: c.name,
-                    col_type: c.col_type.to_string(),
-                })
-                .collect();
-            // Count + total size only; the file *list* is paginated separately
-            // (`/api/tables/{name}/files`) so the polled overview stays small
-            // even for a table with thousands of files.
-            let files = datastore.table_files(&name).unwrap_or_default();
-            let total_bytes = files.iter().map(|f| f.size).sum();
-            let file_count = files.len();
-            TableMeta {
-                name,
-                location: table.location().to_string(),
-                columns,
-                file_count,
-                total_bytes,
-                partition_by: table.partition_by().to_vec(),
-                sort_by: table.sort_by().to_vec(),
-            }
-        })
-        .collect()
+async fn collect_tables(datastore: &DeltaDatastore) -> Vec<TableMeta> {
+    let mut metas = Vec::new();
+    for (name, table) in datastore.tables().await {
+        let columns = table
+            .columns()
+            .into_iter()
+            .map(|c| ColumnOut {
+                name: c.name,
+                col_type: c.col_type.to_string(),
+            })
+            .collect();
+        // Count + total size only; the file *list* is paginated separately
+        // (`/api/tables/{name}/files`) so the polled overview stays small
+        // even for a table with thousands of files.
+        let files = datastore.table_files(&name).await.unwrap_or_default();
+        let total_bytes = files.iter().map(|f| f.size).sum();
+        let file_count = files.len();
+        metas.push(TableMeta {
+            name,
+            location: table.location().to_string(),
+            columns,
+            file_count,
+            total_bytes,
+            partition_by: table.partition_by().to_vec(),
+            sort_by: table.sort_by().to_vec(),
+        });
+    }
+    metas
 }
 
 /// How a table is labelled in the dashboard: bare in the default schema, where

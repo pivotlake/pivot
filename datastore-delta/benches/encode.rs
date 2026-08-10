@@ -567,6 +567,7 @@ fn table_over(
     // The table is only visible to the transactions that insert into it once its
     // creation is committed, and committing is async.
     tokio::runtime::Builder::new_current_thread()
+        .enable_all()
         .build()
         .unwrap()
         .block_on(creation.commit())
@@ -575,8 +576,11 @@ fn table_over(
     // The table's own directory, named for its identity: what an insert writes
     // into, and so what each iteration clears.
     let table_dir = dir.join(
-        datastore
-            .table_handle(&SchemaQualifiedTableName::in_default_schema(TABLE))
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(datastore.table_handle(&SchemaQualifiedTableName::in_default_schema(TABLE)))
             .expect("the table was created")
             .location(),
     );

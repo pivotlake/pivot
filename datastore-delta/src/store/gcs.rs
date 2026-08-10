@@ -63,6 +63,9 @@ pub struct GcsStore {
     /// Shared token state. An `Arc` so [`source`](Self::source) can hand workers
     /// a closure that reads the same cell this store re-mints.
     auth: Arc<GcsAuth>,
+    /// The shared async client, built on first use (see
+    /// [`ObjectStore::build_delta_object_store`]).
+    client: std::sync::OnceLock<Arc<DynObjectStore>>,
 }
 
 /// Shared OAuth2 token state. The token outlives any one query and is identical
@@ -135,6 +138,7 @@ impl GcsStore {
                 credentials_file,
                 emulated,
             }),
+            client: std::sync::OnceLock::new(),
         })
     }
 
@@ -325,6 +329,9 @@ impl ObjectStore for GcsStore {
     }
 
     fn build_delta_object_store(&self) -> Result<Arc<DynObjectStore>> {
+        if let Some(client) = self.client.get() {
+            return Ok(client.clone());
+        }
         let mut builder = GoogleCloudStorageBuilder::from_env().with_url(self.uri.as_str());
         if let Some(path) = &self.auth.credentials_file {
             builder = builder.with_service_account_path(path);
@@ -342,7 +349,19 @@ impl ObjectStore for GcsStore {
                 uri: self.uri.clone(),
                 source,
             })?;
-        Ok(Arc::new(store))
+        Ok(self
+            .client
+            .get_or_init(|| Arc::new(store) as Arc<DynObjectStore>)
+            .clone())
+    }
+
+    fn client_key(&self, key: &ObjectPath) -> Result<super::ClientKey> {
+        // The async client is rooted at the bucket, so a key addresses it by
+        // its full in-bucket name, prefix included.
+        super::ClientKey::parse(object_key(&self.prefix, key)).map_err(|e| StoreError::ClientKey {
+            key: key.to_string(),
+            reason: e.to_string(),
+        })
     }
 
     fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>> {

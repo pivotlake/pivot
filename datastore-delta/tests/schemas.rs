@@ -117,8 +117,8 @@ fn a_new_datastore_defines_only_the_default_schema() {
 
     let datastore = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
 
-    assert!(datastore.contains_schema("main"));
-    assert!(!datastore.contains_schema("analytics"));
+    assert!(wait(datastore.contains_schema("main")));
+    assert!(!wait(datastore.contains_schema("analytics")));
 }
 
 #[test]
@@ -130,7 +130,7 @@ fn created_schema_survives_a_reopen() {
     create_schema(&dispatch, &datastore, "analytics").unwrap();
 
     let reopened = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
-    assert!(reopened.contains_schema("analytics"));
+    assert!(wait(reopened.contains_schema("analytics")));
 }
 
 #[test]
@@ -163,7 +163,7 @@ fn creating_an_existing_schema_if_not_exists_succeeds_once() {
 
     create_schema_if_not_exists(&dispatch, &datastore, "analytics").unwrap();
 
-    assert!(datastore.contains_schema("analytics"));
+    assert!(wait(datastore.contains_schema("analytics")));
     assert_eq!(count_manifest_schemas(db.path(), "analytics"), 1);
 }
 
@@ -192,9 +192,9 @@ fn rolling_back_a_create_schema_discards_the_staged_schema() {
     transaction.rollback();
 
     commit_datastore_transaction(transaction).unwrap();
-    assert!(!datastore.contains_schema("analytics"));
+    assert!(!wait(datastore.contains_schema("analytics")));
     let reopened = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
-    assert!(!reopened.contains_schema("analytics"));
+    assert!(!wait(reopened.contains_schema("analytics")));
 }
 
 /// A datastore that is already open learns about another process's schema only
@@ -208,12 +208,12 @@ fn a_refresh_picks_up_a_schema_another_process_created() {
     // A second handle on the same directory stands in for the other process.
     let other_process = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
     create_schema(&dispatch, &datastore, "analytics").unwrap();
-    assert!(!other_process.contains_schema("analytics"));
+    assert!(!wait(other_process.contains_schema("analytics")));
 
-    let changed = other_process.refresh_from_store().unwrap();
+    let changed = wait(other_process.refresh_from_store()).unwrap();
 
     assert!(changed, "the refresh found a schema it did not hold");
-    assert!(other_process.contains_schema("analytics"));
+    assert!(wait(other_process.contains_schema("analytics")));
 }
 
 #[test]
@@ -316,7 +316,7 @@ fn a_manifest_omitting_its_optional_fields_loads() {
     )
     .unwrap();
     let reopened = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
-    assert!(reopened.contains_schema("main"));
+    assert!(wait(reopened.contains_schema("main")));
 
     std::fs::write(
         &manifest_path,
@@ -333,7 +333,7 @@ fn a_manifest_omitting_its_optional_fields_loads() {
     .unwrap();
 
     let reopened = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
-    assert!(reopened.contains_schema("analytics"));
+    assert!(wait(reopened.contains_schema("analytics")));
     assert!(
         reopened
             .clone()
@@ -378,7 +378,7 @@ fn concurrent_schema_and_table_creates_all_reach_the_manifest() {
     let transaction = reopened.clone().begin_transaction();
     for i in 0..CREATES {
         assert!(
-            reopened.contains_schema(&format!("schema_{i}")),
+            wait(reopened.contains_schema(&format!("schema_{i}"))),
             "schema_{i} was lost from the manifest"
         );
         assert!(
@@ -417,7 +417,7 @@ fn compiling_a_create_schema_does_not_stage_it() {
     // Bound and compiled, but never executed.
     assert!(!transaction.does_schema_exist("analytics"));
     commit_datastore_transaction(transaction).unwrap();
-    assert!(!datastore.contains_schema("analytics"));
+    assert!(!wait(datastore.contains_schema("analytics")));
 
     // Running the same dataflow is what stages it.
     let transaction = datastore.clone().begin_transaction();
@@ -432,5 +432,5 @@ fn compiling_a_create_schema_does_not_stage_it() {
         .unwrap();
     spec.execute().collect().unwrap();
     commit_datastore_transaction(transaction).unwrap();
-    assert!(datastore.contains_schema("analytics"));
+    assert!(wait(datastore.contains_schema("analytics")));
 }
