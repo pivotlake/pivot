@@ -338,6 +338,13 @@ pub fn build_scalar_value(value: ScalarValue) -> Result<Scalar<ArrayRef>, Error>
         ScalarValue::Timestamp(micros) => {
             Arc::new(TimestampMicrosecondArray::new_scalar(micros).into_inner())
         }
+        // A NULL constant carries the type the binder gave it, so it becomes a
+        // one-element null array of that type's physical shape. An untyped NULL
+        // (DuckDB's `SQLNULL`, what a bare `NULL` binds to outside a typed
+        // context) has no shape to build and is rejected by `type_from_logical`.
+        ScalarValue::Null(logical_type) => {
+            arrow_array::new_null_array(&physical_arrow_type(&type_from_logical(logical_type)?), 1)
+        }
         // INTERVAL never appears as a query constant we materialise (it is
         // consumed by interval arithmetic), and types the bridge doesn't decode
         // arrive as `Other`.

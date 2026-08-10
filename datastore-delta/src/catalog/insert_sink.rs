@@ -48,10 +48,16 @@ pub(super) fn build_insert_spec(
             .columns()
             .into_iter()
             .map(|column| {
+                // Every column is nullable: the catalog carries no NOT NULL
+                // constraint, so a row is free to arrive with a NULL in any of
+                // them. Marking the field OPTIONAL is what lets the written
+                // leaves carry definition levels; readers do not lose the
+                // no-NULLs fast path over it, since they refine nullability
+                // from each chunk's null count rather than from this flag.
                 let field = Field::new(
                     column.name,
                     planner::types::physical_arrow_type(&column.col_type),
-                    false,
+                    true,
                 );
                 // The Arrow extension tag lives on the field, not on the data
                 // type, so a variant built from `physical_arrow_type` alone is

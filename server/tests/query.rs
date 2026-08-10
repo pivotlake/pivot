@@ -139,6 +139,31 @@ async fn insert_returns_affected_row_count(#[future] conn: Conn) {
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
+async fn insert_stores_a_null_constant_as_a_null(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_null_insert", dir.path()).await;
+
+    conn.simple_query("INSERT INTO people_null_insert VALUES (4, NULL), (NULL, NULL)")
+        .await
+        .unwrap();
+
+    let typed_null = select_rows(
+        &conn,
+        "SELECT id, name FROM people_null_insert WHERE id = 4",
+    )
+    .await;
+    assert_eq!(typed_null, vec![vec![Some("4".into()), None]]);
+    let all_null = select_rows(
+        &conn,
+        "SELECT id, name FROM people_null_insert WHERE id IS NULL",
+    )
+    .await;
+    assert_eq!(all_null, vec![vec![None, None]]);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
 async fn second_connection_sees_table_created_by_first(#[future] conn: Conn) {
     let dir = write_parquet(&people_batch());
     let reader = connect_client(server_port()).await;

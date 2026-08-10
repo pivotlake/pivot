@@ -408,8 +408,11 @@ pub mod ffi {
         fn expr_constant(expr: &Expression) -> Result<&Value>;
 
         // ---- Value: typed accessors (shared by constants and table-function
-        // arguments). Read `value_type` first, then the matching accessor.
-        fn value_type(v: &Value) -> Result<u8>;
+        // arguments). Read `value_type` and `value_is_null` first, then the
+        // matching accessor: the typed accessors are only valid on a non-NULL
+        // value.
+        fn value_type(v: &Value) -> Result<BridgeLogicalType>;
+        fn value_is_null(v: &Value) -> Result<bool>;
         fn value_bool(v: &Value) -> Result<bool>;
         fn value_i8(v: &Value) -> Result<i8>;
         fn value_i16(v: &Value) -> Result<i16>;

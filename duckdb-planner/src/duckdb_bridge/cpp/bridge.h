@@ -213,7 +213,8 @@ rust::String expr_alias(const Expression &expr);
 
 const Value &expr_constant(const Expression &expr);
 
-uint8_t value_type(const Value &v);
+BridgeLogicalType value_type(const Value &v);
+bool value_is_null(const Value &v);
 bool value_bool(const Value &v);
 int8_t value_i8(const Value &v);
 int16_t value_i16(const Value &v);
