@@ -80,6 +80,7 @@ impl TestTable {
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
             .build();
+        let mut file_paths = Vec::new();
         for (i, batch) in batches.iter().enumerate() {
             let file_path = dir.path().join(format!("part{i}.parquet"));
             let file = std::fs::File::create(&file_path).unwrap();
@@ -87,6 +88,7 @@ impl TestTable {
                 ArrowWriter::try_new(file, batch.schema(), Some(props.clone())).unwrap();
             writer.write(batch).unwrap();
             writer.close().unwrap();
+            file_paths.push(file_path);
         }
 
         // Read the footers once, over the dispatch worker pool. This drives a
@@ -94,8 +96,8 @@ impl TestTable {
         // The declared columns travel with the load, as a catalog table's do,
         // so files storing text as unannotated binary read as text.
         let parquet_table = Arc::new(
-            ParquetTable::from_directory(dispatch.dispatcher(), dir.path(), &columns)
-                .expect("ParquetTable::from_directory failed"),
+            ParquetTable::from_files(dispatch.dispatcher(), &file_paths, &columns)
+                .expect("ParquetTable::from_files failed"),
         );
 
         TestTable {
@@ -349,7 +351,7 @@ impl TestingPlanner {
 /// call [`TestCatalog::add_table`] before planning.
 #[fixture]
 pub fn testing_planner() -> TestingPlanner {
-    // `TestTable::new` calls `ParquetTable::from_directory`, which touches
+    // `TestTable::new` calls `ParquetTable::from_files`, which touches
     // `memory_ctx()` (compressed cache) and so must run on a worker — see
     // `TestTable::new` for the `run_on_worker` hop.
     let dispatch = Dispatch::spin_up(1, 32, None);

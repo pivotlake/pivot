@@ -59,7 +59,7 @@ fn make_datastore() -> (TempDir, Arc<DeltaDatastore>) {
         .unwrap();
     writer.close().unwrap();
 
-    let datastore = DeltaDatastore::open_local(dir.path(), &dispatcher()).unwrap();
+    let datastore = DeltaDatastore::open(&dir.path().to_string_lossy(), &dispatcher()).unwrap();
     let mut options = HashMap::new();
     options.insert(
         "with_pre_existing_parquets".to_string(),

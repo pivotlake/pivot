@@ -169,6 +169,24 @@ pub fn table_dir(
     )
 }
 
+/// Data-file locations for remote files given as fetchable URLs paired with the
+/// total size that locates each footer.
+pub fn remote_files(files: &[(url::Url, u64)]) -> Vec<datastore_delta::store::DataFile> {
+    files
+        .iter()
+        .map(|(url, size)| datastore_delta::store::DataFile::remote(url.clone(), *size))
+        .collect()
+}
+
+/// Every `*.parquet` file directly under `dir`, in listing order.
+pub fn parquet_files_in(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .expect("readable directory")
+        .map(|entry| entry.expect("readable entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "parquet") && path.is_file())
+        .collect()
+}
+
 /// Load a `ParquetTable` from an already-populated directory. Drives the
 /// metadata-fetch dataflow, so it runs on the coordinator (the test thread), not
 /// inside `run_on_worker`.
@@ -177,8 +195,8 @@ pub fn parquet_table_from_dir(
     dir: &std::path::Path,
 ) -> Arc<ParquetTable> {
     Arc::new(
-        ParquetTable::from_directory(dispatch, dir, &[])
-            .expect("ParquetTable::from_directory failed"),
+        ParquetTable::from_files(dispatch, &parquet_files_in(dir), &[])
+            .expect("ParquetTable::from_files failed"),
     )
 }
 
@@ -270,7 +288,8 @@ pub fn write_parquet_files(
         })
         .collect();
 
-    let datastore = datastore_delta::DeltaDatastore::open_local(database_root, dispatch).unwrap();
+    let datastore =
+        datastore_delta::DeltaDatastore::open(&database_root.to_string_lossy(), dispatch).unwrap();
     let creation = datastore.clone().begin_transaction();
     creation
         .bind_create_table(CreateTableRequest {

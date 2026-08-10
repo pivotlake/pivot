@@ -101,30 +101,8 @@ impl Projection {
         Self::all(schema.fields().len())
     }
 
-    /// Resolve field names to column indices via `schema`.
-    ///
-    /// Panics if any name is not found in the schema.
-    pub fn from_field_names<'a>(schema: &Schema, names: impl IntoIterator<Item = &'a str>) -> Self {
-        Self {
-            extracts: Vec::new(),
-            column_indices: names
-                .into_iter()
-                .map(|name| {
-                    schema
-                        .index_of(name)
-                        .unwrap_or_else(|_| panic!("field '{name}' not found in schema"))
-                })
-                .collect(),
-        }
-    }
-
     /// Returns the projected column indices as a slice.
     pub fn indices(&self) -> &[usize] {
         &self.column_indices
-    }
-
-    /// Returns `true` if `column_idx` is part of this projection.
-    pub fn includes(&self, column_idx: &usize) -> bool {
-        self.column_indices.contains(column_idx)
     }
 }

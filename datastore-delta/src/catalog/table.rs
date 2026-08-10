@@ -456,17 +456,6 @@ impl CatalogTable {
         Arc::new(ParquetTable::new(row_groups))
     }
 
-    /// Write `bytes` as a new data file at `path` (resolved against the table's
-    /// location like any [`FileRef`] path), returning its [`FileRef`] to be
-    /// committed into the manifest.
-    pub fn write_data_file(&self, path: ObjectPath, bytes: &[u8]) -> crate::Result<FileRef> {
-        self.store.put(&self.location.resolve(&path), bytes)?;
-        Ok(FileRef {
-            path,
-            size: bytes.len() as u64,
-        })
-    }
-
     /// Delete a data file (a compaction input swapped out of the manifest).
     /// `path` resolves against the table's location like any [`FileRef`] path,
     /// and must land inside it: that directory is the only storage the table

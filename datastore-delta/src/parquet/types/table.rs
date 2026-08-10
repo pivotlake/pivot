@@ -25,7 +25,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, LazyLock};
 use std::{fs, io};
 use thiserror::Error;
-use url::Url;
 
 static EMPTY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| SchemaRef::new(Schema::empty()));
 
@@ -99,8 +98,7 @@ impl ParquetTable {
         &mut self.row_groups
     }
 
-    /// Build a table from every Parquet file in a local directory: list the
-    /// `*.parquet` files, then delegate to [`from_files`](Self::from_files).
+    /// Build a table from an explicit, ordered list of local files.
     ///
     /// Drives the metadata-fetch dataflow, so it must run on the **coordinator**
     /// (the thread holding `dispatcher`), not inside a `run_on_worker` closure —
@@ -109,25 +107,6 @@ impl ParquetTable {
     /// `declared_columns` is the table's declared schema, reconciled with
     /// each file's own schema (see [`apply_declared_types`]); pass `&[]` when
     /// nothing was declared.
-    pub fn from_directory(
-        dispatcher: &DataFlowDispatcher,
-        path: &Path,
-        declared_columns: &[Column],
-    ) -> Result<Self> {
-        let mut paths = Vec::new();
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let path = entry.path();
-            // Only `*.parquet` — skip any sidecar files.
-            if path.extension().is_some_and(|ext| ext == "parquet") && path.is_file() {
-                paths.push(path);
-            }
-        }
-        Self::from_files(dispatcher, &paths, declared_columns)
-    }
-
-    /// Build a table from an explicit, ordered list of local files. Same
-    /// coordinator requirement as [`from_directory`](Self::from_directory).
     pub fn from_files<P: AsRef<Path>>(
         dispatcher: &DataFlowDispatcher,
         paths: &[P],
@@ -144,25 +123,9 @@ impl ParquetTable {
         Self::from_locations(dispatcher, files, declared_columns)
     }
 
-    /// Build a table from remote files: concrete fetchable URLs paired with
-    /// their total size (from the store listing), which locates each footer.
-    /// Same coordinator requirement as [`from_directory`](Self::from_directory).
-    pub fn from_remote_files(
-        dispatcher: &DataFlowDispatcher,
-        files: &[(Url, u64)],
-        declared_columns: &[Column],
-    ) -> Result<Self> {
-        let files = files
-            .iter()
-            .map(|(url, size)| DataFile::remote(url.clone(), *size))
-            .collect();
-        Self::from_locations(dispatcher, files, declared_columns)
-    }
-
     /// Read every file's footer in parallel (the metadata-fetch dataflow) and
     /// assemble the row groups. The locations may freely mix local and remote
-    /// files. Same coordinator requirement as
-    /// [`from_directory`](Self::from_directory).
+    /// files. Same coordinator requirement as [`from_files`](Self::from_files).
     pub fn from_locations(
         dispatcher: &DataFlowDispatcher,
         files: Vec<DataFile>,
@@ -687,7 +650,7 @@ mod tests {
     use tempfile::TempDir;
 
     /// A shared one-worker dispatch pool for this module's tests, so
-    /// `ParquetTable::from_directory` can drive its metadata-fetch dataflow.
+    /// `ParquetTable::from_files` can drive its metadata-fetch dataflow.
     fn test_dispatcher() -> &'static DataFlowDispatcher {
         static DISPATCH: OnceLock<Dispatch> = OnceLock::new();
         DISPATCH
@@ -706,7 +669,7 @@ mod tests {
                 .unwrap();
         writer.write(batch).unwrap();
         writer.close().unwrap();
-        let table = ParquetTable::from_directory(test_dispatcher(), dir.path(), &[]).unwrap();
+        let table = ParquetTable::from_files(test_dispatcher(), &[path], &[]).unwrap();
         (dir, table)
     }
 
@@ -973,7 +936,7 @@ mod tests {
     }
 
     /// End-to-end: write a parquet file with several column types, then read it
-    /// back via `ParquetTable::from_directory` and verify the decoded min/max
+    /// back via `ParquetTable::from_files` and verify the decoded min/max
     /// stats match the values we wrote.
     #[test]
     fn decodes_min_max_from_real_parquet_file() {

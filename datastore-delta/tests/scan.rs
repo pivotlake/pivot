@@ -793,7 +793,7 @@ fn list_columns_are_rejected_at_load() {
     writer.write(&batch).unwrap();
     writer.close().unwrap();
 
-    let result = ParquetTable::from_directory(&dispatch, dir.path(), &[]);
+    let result = ParquetTable::from_files(&dispatch, &parquet_files_in(dir.path()), &[]);
 
     let err = result.expect_err("LIST columns must not load");
     assert!(err.to_string().contains("not supported"), "{err}");
@@ -849,7 +849,9 @@ fn scan_reads_a_microsecond_timestamp_column() {
     }];
 
     for columns in [&declared[..], &[][..]] {
-        let table = Arc::new(ParquetTable::from_directory(&dispatch, dir.path(), columns).unwrap());
+        let table = Arc::new(
+            ParquetTable::from_files(&dispatch, &parquet_files_in(dir.path()), columns).unwrap(),
+        );
         let results = table_input(&dispatch, &table, Projection::all(1), false)
             .collect()
             .unwrap();
@@ -882,7 +884,7 @@ fn a_timestamp_file_in_another_unit_is_rejected() {
     let dispatch = dispatch(1);
     let dir = timestamp_file(TimeUnit::Millisecond, &[1_700_000_000_000]);
 
-    let err = ParquetTable::from_directory(&dispatch, dir.path(), &[])
+    let err = ParquetTable::from_files(&dispatch, &parquet_files_in(dir.path()), &[])
         .expect_err("a millisecond timestamp file must not load");
 
     let message = err.to_string();

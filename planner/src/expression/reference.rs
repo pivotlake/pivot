@@ -25,16 +25,6 @@ impl Display for Ref {
 }
 
 impl Ref {
-    /// The reference shown without its type: the source name when known, else
-    /// the positional `#idx` form. Used where a bare column reference reads
-    /// better than a full `name:Type` (e.g. inside an aggregate call).
-    pub fn name_or_index(&self) -> String {
-        match &self.name {
-            Some(name) => name.clone(),
-            None => format!("#{}", self.column_idx),
-        }
-    }
-
     pub fn compile(&self) -> Result<ExprFn, compile::Error> {
         let column_idx = self.column_idx;
         Ok(stateless_expr(move |batch: &RecordBatch| {
