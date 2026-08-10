@@ -10,6 +10,7 @@ catalog = { workspace = true }
 datastore-delta = { workspace = true }
 metastore = { workspace = true }
 metastore-disk = { workspace = true }
+session = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow = { workspace = true }
@@ -20,7 +21,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
 include_dir = "0.7"
-lru = { workspace = true }
 pgwire = "0.39"
 # Generates per-process secrets for mock authentication of unknown users.
 rand = { workspace = true }
@@ -36,10 +36,6 @@ sysinfo = { workspace = true }
 # Only pulled in by the `perf` feature, for SIGINT-ing the `perf record` child
 # so it flushes its report (a plain `Child::kill` would SIGKILL and lose it).
 libc = { workspace = true, optional = true }
-
-[target.'cfg(unix)'.dependencies]
-# Reads and raises the process's open-file limit at startup (see `limits`).
-nix = { version = "0.31.2", features = ["resource"] }
 
 [features]
 # Staging-only per-query `perf record` profiling: when on, a session that runs

@@ -59,12 +59,10 @@ mod arrow_to_pgwire;
 mod auth;
 pub mod config;
 mod http;
-mod limits;
 #[cfg(feature = "perf")]
 mod perf;
 mod query_handler;
 mod server;
 
 pub use config::Config;
-pub use limits::raise_open_file_limit;
 pub use server::{Error, Server};

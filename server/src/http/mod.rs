@@ -30,11 +30,11 @@ mod tables;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use crate::query_handler::PlanCache;
 use axum::Json;
 use axum::Router;
 use axum::routing::{get, post};
 use catalog::PivotCatalog;
+use session::PlanCache;
 use sysinfo::{Pid, System};
 use tokio::net::TcpListener;
 

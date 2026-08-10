@@ -20,11 +20,12 @@
 //! tasks watch that same exit flag and self-exit, so the server no longer
 //! orchestrates them.
 
-use crate::query_handler::{PivotHandlers, PlanCache};
+use crate::query_handler::PivotHandlers;
 use catalog::PivotCatalog;
 use dispatch::{DataFlowDispatcher, Dispatch, Shutdown};
 use metastore::Metastore;
 use pgwire::tokio::process_socket;
+use session::PlanCache;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;

@@ -11,12 +11,12 @@ use std::time::Duration;
 
 use catalog::PivotCatalog;
 use clap::Parser;
-use dispatch::env::get_env_var_with_default;
 use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
 use metastore::Metastore;
 use metastore_disk::{DiskMetastore, MetastoreConfig};
 use server::config::DiskCacheConfig;
-use server::{Config, Error, Server, raise_open_file_limit};
+use server::{Config, Error, Server};
+use session::raise_open_file_limit;
 use tracing::{error, info};
 
 /// Postgres-wire-compatible server in front of pivotdb's dispatch engine.
@@ -55,14 +55,6 @@ fn init_tracing() {
         .with_env_filter(filter)
         .with_ansi(ansi)
         .init();
-}
-
-/// Returns the total physical memory of the machine in bytes.
-pub fn get_total_memory() -> usize {
-    sysinfo::System::new_with_specifics(
-        sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
-    )
-    .total_memory() as usize
 }
 
 /// Build the remote-read disk cache from the config's `disk_cache` section, or
@@ -145,13 +137,7 @@ fn run() -> Result<(), Error> {
         .unwrap_or_else(dispatch::default_worker_count);
     info!(workers, "initialising dispatch");
     let disk_cache = build_disk_cache(server_config.disk_cache);
-    let pool_bytes = match server_config.memory {
-        Some(size) => size.as_bytes() as usize,
-        None => {
-            let memory_pct: usize = get_env_var_with_default("PIVOT_MEMORY_PCT", 80);
-            get_total_memory() * memory_pct / 100
-        }
-    };
+    let pool_bytes = session::bootstrap::compute_pool_bytes(server_config.memory, 80);
     info!(pool_bytes, "buffer pool memory budget");
     let dispatch = Dispatch::spin_up(workers, pool_bytes / BUFFER_SIZE, disk_cache);
 

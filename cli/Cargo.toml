@@ -1,0 +1,38 @@
+[package]
+name = "cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "pivot-cli"
+path = "src/main.rs"
+
+[dependencies]
+catalog = { workspace = true }
+# `DEFAULT_REFRESH_INTERVAL`: the session datastore refreshes at the same
+# cadence an unconfigured server would.
+datastore-delta = { workspace = true }
+dispatch = { workspace = true }
+metastore = { workspace = true }
+# The session runs on a generated YAML config; `ByteSize` also gives `--memory`
+# the same `8g` spelling as that file.
+metastore-disk = { workspace = true }
+serde = { workspace = true }
+serde_yaml_ng = { workspace = true }
+session = { workspace = true }
+
+# Result batches arrive as arrow arrays; `cast` turns every column into text
+# for the shell's table rendering.
+arrow-array = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-schema = { workspace = true }
+clap = { workspace = true }
+# Line editing and history for the interactive shell. `buffer-redux` carries a
+# read's leftover bytes into the next one: a line arrives with everything typed
+# behind it in the same read, and without the feature that remainder is dropped
+# when the read ends, silently swallowing whatever followed the first line.
+rustyline = { version = "18", features = ["buffer-redux"] }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+tracing-subscriber = { workspace = true }

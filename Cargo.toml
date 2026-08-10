@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "benchmarks",
     "catalog",
+    "cli",
     "datastore",
     "datastore-delta",
     "dispatch",
@@ -11,6 +12,7 @@ members = [
     "metastore-disk",
     "planner",
     "server",
+    "session",
     "thriftparquet",
 ]
 # arrow-rs (vendored submodule) and perfy are workspaces of their own; they
@@ -32,6 +34,7 @@ metastore = { path = "metastore" }
 metastore-disk = { path = "metastore-disk" }
 planner = { path = "planner" }
 server = { path = "server" }
+session = { path = "session" }
 thriftparquet = { path = "thriftparquet" }
 
 # The vendored arrow-rs fork (git submodule). `parquet` is the strict,
