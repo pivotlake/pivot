@@ -45,7 +45,7 @@ fn events_batch() -> RecordBatch {
 }
 
 /// Write `batch` as a snappy parquet file at `<datastore>/<table>/data.parquet`,
-/// so `CREATE TABLE <table> WITH (adopt_parquets_at = '<table>')` finds it
+/// so `CREATE TABLE <table> WITH (with_pre_existing_parquets = '<table>')` finds it
 /// under the datastore's root.
 fn write_table(datastore: &Path, table: &str, batch: &RecordBatch) {
     let dir = datastore.join(table);
@@ -101,13 +101,13 @@ async fn queries_bind_tables_by_datastore_name() {
     // A table in the default datastore (unqualified) and one in `warm`.
     client
         .simple_query(
-            "CREATE TABLE people (id BIGINT, name VARCHAR) WITH (adopt_parquets_at = 'people')",
+            "CREATE TABLE people (id BIGINT, name VARCHAR) WITH (with_pre_existing_parquets = 'people')",
         )
         .await
         .unwrap();
     client
         .simple_query(
-            "CREATE TABLE warm.main.events (id BIGINT, kind VARCHAR) WITH (adopt_parquets_at = 'events')",
+            "CREATE TABLE warm.main.events (id BIGINT, kind VARCHAR) WITH (with_pre_existing_parquets = 'events')",
         )
         .await
         .unwrap();

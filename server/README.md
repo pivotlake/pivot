@@ -164,16 +164,16 @@ relative to that datastore's configured location:
 
 ```sql
 CREATE TABLE hits (url VARCHAR, ts BIGINT)
-  WITH (adopt_parquets_at = 'hits');
+  WITH (with_pre_existing_parquets = 'hits');
 
 CREATE TABLE warm.main.events (id BIGINT, ts BIGINT)
-  WITH (adopt_parquets_at = 'events');
+  WITH (with_pre_existing_parquets = 'events');
 
 SELECT COUNT(*) FROM hits WHERE url <> '';
 SELECT * FROM warm.main.events;
 ```
 
-`adopt_parquets_at` takes Parquet files that already sit at that path as the
+`with_pre_existing_parquets` takes Parquet files that already sit at that path as the
 table's initial data, instead of starting the table empty.
 
 Adopted files are recorded by their absolute path and are never written to,
