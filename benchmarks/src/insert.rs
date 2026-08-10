@@ -12,13 +12,23 @@
 //!
 //! Reading the rows back out of the server keeps this crate free of any Parquet
 //! reader of its own, and the timing excludes it: only the statement is timed.
+//!
+//! Each batch size also has a `-prepared` variant that moves the same rows
+//! through the extended protocol: a multi-row `INSERT INTO <target> VALUES
+//! ($1, ...), ($106, ...), ...` is prepared once, untimed, and an iteration
+//! then executes it over the batch, the row values bound as parameters
+//! instead of rendered into statement text. The Bind message caps a statement
+//! at 65535 parameters, so with the hits schema's 105 columns each execute
+//! carries [`PREPARED_ROWS_PER_STATEMENT`] rows and an iteration is the few
+//! executes that cover the batch. Only the executes are timed.
 
 use std::pin::Pin;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use futures_util::TryStreamExt;
-use tokio_postgres::{Client, SimpleQueryMessage, SimpleQueryRow, SimpleQueryStream};
+use tokio_postgres::types::{IsNull, ToSql, Type, to_sql_checked};
+use tokio_postgres::{Client, SimpleQueryMessage, SimpleQueryRow, SimpleQueryStream, Statement};
 
 use crate::runner::{Error, QueryRun, Result, RunOptions};
 
@@ -40,27 +50,51 @@ struct BatchSize {
     /// one starts from an empty table and a fresh Delta log rather than on top
     /// of what the size before it wrote.
     table: &'static str,
+    /// Insert through a prepared single-row statement, one Execute per row,
+    /// instead of one multi-row statement per iteration.
+    prepared: bool,
 }
 
 /// The batch sizes the suite measures. A thousand-row statement and a
 /// ten-thousand-row one load the write path differently enough (statement text
 /// to parse, batch to build, rows per commit) that one number covering both
 /// would hide which of them moved.
-const BATCH_SIZES: [BatchSize; 3] = [
+const BATCH_SIZES: [BatchSize; 6] = [
     BatchSize {
         id: "insert-1k",
         rows: 1_000,
         table: "hits_inserted_1k",
+        prepared: false,
     },
     BatchSize {
         id: "insert-5k",
         rows: 5_000,
         table: "hits_inserted_5k",
+        prepared: false,
     },
     BatchSize {
         id: "insert-10k",
         rows: 10_000,
         table: "hits_inserted_10k",
+        prepared: false,
+    },
+    BatchSize {
+        id: "insert-1k-prepared",
+        rows: 1_000,
+        table: "hits_inserted_1k_prepared",
+        prepared: true,
+    },
+    BatchSize {
+        id: "insert-5k-prepared",
+        rows: 5_000,
+        table: "hits_inserted_5k_prepared",
+        prepared: true,
+    },
+    BatchSize {
+        id: "insert-10k-prepared",
+        rows: 10_000,
+        table: "hits_inserted_10k_prepared",
+        prepared: true,
     },
 ];
 
@@ -140,6 +174,88 @@ async fn take_batch(
     Ok(batch)
 }
 
+/// A parameter shipped in text format, exactly the bytes the source scan
+/// returned. The server casts each one by the statement's inferred parameter
+/// type, so no per-column client-side typing is needed and NULLs pass through
+/// as NULLs.
+#[derive(Debug)]
+struct TextParam<'a>(Option<&'a str>);
+
+impl ToSql for TextParam<'_> {
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut tokio_postgres::types::private::BytesMut,
+    ) -> std::result::Result<IsNull, Box<dyn std::error::Error + Sync + Send>> {
+        match self.0 {
+            None => Ok(IsNull::Yes),
+            Some(value) => {
+                out.extend_from_slice(value.as_bytes());
+                Ok(IsNull::No)
+            }
+        }
+    }
+
+    fn encode_format(&self, _ty: &Type) -> tokio_postgres::types::Format {
+        tokio_postgres::types::Format::Text
+    }
+
+    fn accepts(_ty: &Type) -> bool {
+        true
+    }
+
+    to_sql_checked!();
+}
+
+/// Rows one prepared execute carries. The Bind message counts parameters in a
+/// u16, capping a statement at 65535 of them; at the hits schema's 105
+/// columns, 500 rows (52500 parameters) is the round count under the cap that
+/// divides every batch size evenly.
+const PREPARED_ROWS_PER_STATEMENT: usize = 500;
+
+/// The multi-row statement a prepared variant executes: one placeholder per
+/// cell, `PREPARED_ROWS_PER_STATEMENT` rows per execute.
+fn build_prepared_insert(table: &str, columns: usize) -> String {
+    let mut sql = format!("INSERT INTO {table} VALUES ");
+    let mut placeholder = 0;
+    for row in 0..PREPARED_ROWS_PER_STATEMENT {
+        if row > 0 {
+            sql.push(',');
+        }
+        sql.push('(');
+        for column in 0..columns {
+            if column > 0 {
+                sql.push(',');
+            }
+            placeholder += 1;
+            sql.push_str(&format!("${placeholder}"));
+        }
+        sql.push(')');
+    }
+    sql
+}
+
+/// Execute the prepared multi-row statement over `batch`, one execute per
+/// `PREPARED_ROWS_PER_STATEMENT` rows. This is the timed body of a prepared
+/// variant's iteration: the Prepare already happened, so the wall-clock covers
+/// exactly the executes.
+async fn execute_batch(
+    client: &Client,
+    statement: &Statement,
+    batch: &[SimpleQueryRow],
+) -> Result<()> {
+    for chunk in batch.chunks(PREPARED_ROWS_PER_STATEMENT) {
+        let params: Vec<TextParam> = chunk
+            .iter()
+            .flat_map(|row| (0..row.len()).map(move |i| TextParam(row.get(i))))
+            .collect();
+        let param_refs: Vec<&(dyn ToSql + Sync)> =
+            params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+        client.execute(statement, &param_refs).await?;
+    }
+    Ok(())
+}
+
 /// Render one batch as a single `INSERT INTO <table> VALUES (...), (...)`.
 fn build_insert(table: &str, quoted: &[bool], rows: &[SimpleQueryRow]) -> String {
     let mut sql = format!("INSERT INTO {table} VALUES ");
@@ -207,9 +323,20 @@ async fn run_batch_size(
     let mut quoted = Vec::new();
 
     println!(
-        "=== Query {} === ({} rows per statement into {})",
-        size.id, size.rows, size.table
+        "=== Query {} === ({} rows per {} into {})",
+        size.id,
+        size.rows,
+        if size.prepared {
+            "iteration of prepared 500-row executes"
+        } else {
+            "statement"
+        },
+        size.table
     );
+    // The prepared variant's statement, prepared once, untimed, after the
+    // first batch reveals the column count. Every iteration reuses it, so the
+    // timings cover executes alone.
+    let mut prepared: Option<Statement> = None;
     for iteration in 0..opts.iterations {
         let batch = take_batch(&mut source_rows, size.rows, &mut quoted).await?;
         if batch.len() < size.rows {
@@ -219,11 +346,25 @@ async fn run_batch_size(
                 wanted: wanted_rows,
             });
         }
-        let sql = build_insert(size.table, &quoted, &batch);
 
-        let start = Instant::now();
-        client.simple_query(&sql).await?;
-        let elapsed = start.elapsed().as_millis();
+        let elapsed = if size.prepared {
+            let statement = match &prepared {
+                Some(statement) => statement,
+                None => prepared.insert(
+                    client
+                        .prepare(&build_prepared_insert(size.table, quoted.len()))
+                        .await?,
+                ),
+            };
+            let start = Instant::now();
+            execute_batch(client, statement, &batch).await?;
+            start.elapsed().as_millis()
+        } else {
+            let sql = build_insert(size.table, &quoted, &batch);
+            let start = Instant::now();
+            client.simple_query(&sql).await?;
+            start.elapsed().as_millis()
+        };
 
         iterations_ms.push(elapsed);
         println!(

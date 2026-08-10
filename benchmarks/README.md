@@ -98,6 +98,19 @@ each is its own result, the way each `qNN.sql` is in a query suite:
 | `insert-1k`  | 1 000  | `hits_inserted_1k` |
 | `insert-5k`  | 5 000  | `hits_inserted_5k` |
 | `insert-10k` | 10 000 | `hits_inserted_10k` |
+| `insert-1k-prepared`  | 1 000  | `hits_inserted_1k_prepared` |
+| `insert-5k-prepared`  | 5 000  | `hits_inserted_5k_prepared` |
+| `insert-10k-prepared` | 10 000 | `hits_inserted_10k_prepared` |
+
+The `-prepared` sizes send the same rows through the extended protocol
+instead: a multi-row `INSERT INTO <target> VALUES ($1, ...), ($106, ...), ...`
+is prepared once, untimed, and each iteration then executes it over the batch
+with the row values bound as parameters rather than rendered into statement
+text. The wire protocol caps one Bind at 65535 parameters, so at the hits
+schema's 105 columns each execute carries 500 rows and an iteration is the few
+executes that cover the batch (2 for 1k, 20 for 10k). Only the executes are
+timed, so a size and its `-prepared` twin move the same rows and differ only
+in how the statements carry them.
 
 `setup.sql` declares the ClickBench schema once per table: `hits` over the
 parquet `--source`, plus an empty target per size, so no size writes on top of
