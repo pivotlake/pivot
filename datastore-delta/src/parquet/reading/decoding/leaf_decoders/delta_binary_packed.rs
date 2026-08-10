@@ -74,7 +74,7 @@ macro_rules! integer_from_delta {
         })*
     };
 }
-integer_from_delta!(u8, i16, u16, i32, u32, i64, u64, i128);
+integer_from_delta!(i8, u8, i16, u16, i32, u32, i64, u64, i128);
 
 macro_rules! float_from_delta {
     ($($ty:ty),*) => {
