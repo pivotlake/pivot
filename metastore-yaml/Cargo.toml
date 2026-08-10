@@ -13,3 +13,6 @@ dispatch = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 serde_yaml_ng = { workspace = true }
+
+[dev-dependencies]
+base64 = { workspace = true }

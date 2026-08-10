@@ -85,35 +85,6 @@ impl ObjectStore for LocalStore {
         })
     }
 
-    fn put_if_absent(&self, key: &ObjectPath, data: &[u8]) -> Result<bool> {
-        let path = self.path_for(key);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| StoreError::Io {
-                key: key.to_string(),
-                source,
-            })?;
-        }
-        // Write the full content to a writer-unique temp file, then `link` it
-        // to the target name: `link` fails with `AlreadyExists` if the target
-        // exists, so creation is atomic *and* a concurrent reader can never see
-        // a partially-written object.
-        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-        std::fs::write(&tmp, data).map_err(|source| StoreError::Io {
-            key: key.to_string(),
-            source,
-        })?;
-        let created = match std::fs::hard_link(&tmp, &path) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-            Err(source) => Err(StoreError::Io {
-                key: key.to_string(),
-                source,
-            }),
-        };
-        let _ = std::fs::remove_file(&tmp);
-        created
-    }
-
     fn delete(&self, key: &ObjectPath) -> Result<()> {
         match std::fs::remove_file(self.path_for(key)) {
             Ok(()) => Ok(()),
@@ -207,16 +178,6 @@ mod tests {
         store.put(&p("k"), b"first").unwrap();
         store.put(&p("k"), b"second").unwrap();
         assert_eq!(store.get(&p("k")).unwrap().unwrap(), b"second");
-    }
-
-    #[test]
-    fn put_if_absent_creates_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LocalStore::new(dir.path());
-        assert!(store.put_if_absent(&p("v/1.json"), b"first").unwrap());
-        assert!(!store.put_if_absent(&p("v/1.json"), b"second").unwrap());
-        // The loser's bytes never land.
-        assert_eq!(store.get(&p("v/1.json")).unwrap().unwrap(), b"first");
     }
 
     #[test]

@@ -255,25 +255,6 @@ impl ObjectStore for S3Store {
         }
     }
 
-    fn put_if_absent(&self, key: &ObjectPath, data: &[u8]) -> Result<bool> {
-        let object = object_key(&self.prefix, key);
-        let url = self.url_for(&object);
-        // S3 conditional write: `If-None-Match: *` fails the PUT with 412 when
-        // the object already exists. A 409 means another conditional write on
-        // the same key is in flight — also "lost the race" to the caller.
-        let signed = self.sign("PUT", &url, &[("if-none-match", "*")], data)?;
-        // `sign` returns only the auth headers it derives (Authorization,
-        // x-amz-date, …); `if-none-match` is a request header we sign but must
-        // also send ourselves. Its name is in the signature's `SignedHeaders`,
-        // so omitting it from the wire fails the signature (a 400), not the CAS.
-        let req = Self::apply(self.agent.put(&url), &signed).set("if-none-match", "*");
-        match req.send_bytes(data) {
-            Ok(_) => Ok(true),
-            Err(ureq::Error::Status(412 | 409, _)) => Ok(false),
-            Err(e) => Err(StoreError::Http(format!("conditional PUT {object}: {e}"))),
-        }
-    }
-
     fn delete(&self, key: &ObjectPath) -> Result<()> {
         let object = object_key(&self.prefix, key);
         let url = self.url_for(&object);

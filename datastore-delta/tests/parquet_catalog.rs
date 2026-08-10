@@ -51,7 +51,8 @@ fn dispatcher() -> DataFlowDispatcher {
 /// guard next to the datastore makes its storage lifetime explicit.
 fn empty_datastore() -> (TempDir, Arc<DeltaDatastore>) {
     let database = TempDir::new().unwrap();
-    let datastore = DeltaDatastore::open_local(database.path(), &dispatcher()).unwrap();
+    let datastore =
+        DeltaDatastore::open(&database.path().to_string_lossy(), &dispatcher()).unwrap();
     (database, datastore)
 }
 

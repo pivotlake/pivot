@@ -534,7 +534,7 @@ fn table_over(
     columns: Vec<Column>,
     sort_by: &[&str],
 ) -> (PivotCatalog, PathBuf) {
-    let datastore = DeltaDatastore::open_local(dir, dispatch.dispatcher()).unwrap();
+    let datastore = DeltaDatastore::open(&dir.to_string_lossy(), dispatch.dispatcher()).unwrap();
     let catalog = PivotCatalog::new(
         HashMap::from([(
             DEFAULT_DATASTORE_NAME.to_string(),

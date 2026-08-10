@@ -428,7 +428,6 @@ fn require(name: &str, value: &Option<String>, field: &str) -> Result<String> {
 mod tests {
     use super::*;
     use catalog::DEFAULT_DATASTORE_NAME;
-    use metastore::ScramVerifier;
     use std::time::Duration;
 
     #[test]
@@ -637,17 +636,23 @@ datastores:
         YamlMetastore::from_yaml(&yaml, "test")
     }
 
+    /// The stored verifier line for a password, in the form a YAML file holds
+    /// it: `pivot-scram-sha-256$<iterations>:<base64 salt>$<base64 salted password>`.
     fn verifier_for(password: &str) -> String {
-        metastore::format_scram_verifier(&ScramVerifier {
-            salt: vec![1; 16],
-            salted_password: password
-                .as_bytes()
-                .iter()
-                .cycle()
-                .take(32)
-                .copied()
-                .collect(),
-        })
+        use base64::Engine;
+        let base64 = base64::engine::general_purpose::STANDARD;
+        let salted_password: Vec<u8> = password
+            .as_bytes()
+            .iter()
+            .cycle()
+            .take(32)
+            .copied()
+            .collect();
+        format!(
+            "pivot-scram-sha-256$4096:{}${}",
+            base64.encode([1u8; 16]),
+            base64.encode(&salted_password)
+        )
     }
 
     #[test]

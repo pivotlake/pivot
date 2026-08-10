@@ -281,7 +281,8 @@ mod tests {
     fn catalog(dispatch: &Dispatch) -> (tempfile::TempDir, Arc<PivotCatalog>) {
         let directory = tempfile::tempdir().unwrap();
         let datastore: Arc<dyn Datastore> =
-            DeltaDatastore::open_local(directory.path(), dispatch.dispatcher()).unwrap();
+            DeltaDatastore::open(&directory.path().to_string_lossy(), dispatch.dispatcher())
+                .unwrap();
         let catalog = PivotCatalog::new(
             HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),
             DEFAULT_DATASTORE_NAME.to_string(),

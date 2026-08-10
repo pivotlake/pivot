@@ -186,7 +186,8 @@ pub fn server_port() -> u16 {
         DATA_DIR.set(data_dir.path().to_path_buf()).unwrap();
         start_server(256, move |dispatch| {
             let datastore: Arc<dyn Datastore> =
-                DeltaDatastore::open_local(data_dir.path(), dispatch.dispatcher()).unwrap();
+                DeltaDatastore::open(&data_dir.path().to_string_lossy(), dispatch.dispatcher())
+                    .unwrap();
             let catalog = Arc::new(
                 PivotCatalog::new(
                     HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),

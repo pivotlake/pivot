@@ -95,7 +95,7 @@ fn unreferenced_file_past_retention_is_deleted_and_the_live_file_is_kept() {
     let adopted_dir = db.path().join("events");
     std::fs::create_dir_all(&adopted_dir).unwrap();
     write_parquet(&adopted_dir.join("live.parquet"));
-    let datastore = DeltaDatastore::open_local(db.path(), &dispatch).unwrap();
+    let datastore = DeltaDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
     let table_dir = create_events_table(&datastore, &dispatch, db.path(), &adopted_dir);
     // Dropped into the table's own directory after CREATE, so no Add references
     // it: an unreferenced orphan.
@@ -121,7 +121,7 @@ fn unreferenced_file_within_retention_is_kept() {
     let adopted_dir = db.path().join("events");
     std::fs::create_dir_all(&adopted_dir).unwrap();
     write_parquet(&adopted_dir.join("live.parquet"));
-    let datastore = DeltaDatastore::open_local(db.path(), &dispatch).unwrap();
+    let datastore = DeltaDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
     let table_dir = create_events_table(&datastore, &dispatch, db.path(), &adopted_dir);
     write_parquet(&table_dir.join("orphan.parquet"));
 
@@ -143,7 +143,7 @@ fn a_file_in_the_adopted_directory_is_never_deleted() {
     let adopted_dir = db.path().join("events");
     std::fs::create_dir_all(&adopted_dir).unwrap();
     write_parquet(&adopted_dir.join("live.parquet"));
-    let datastore = DeltaDatastore::open_local(db.path(), &dispatch).unwrap();
+    let datastore = DeltaDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
     create_events_table(&datastore, &dispatch, db.path(), &adopted_dir);
     write_parquet(&adopted_dir.join("theirs.parquet"));
 
@@ -166,7 +166,7 @@ fn compaction_merges_adopted_files_without_deleting_them() {
     for name in ["a.parquet", "b.parquet"] {
         write_parquet(&adopted_dir.join(name));
     }
-    let datastore = DeltaDatastore::open_local(db.path(), &dispatch).unwrap();
+    let datastore = DeltaDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
     let table_dir = create_events_table(&datastore, &dispatch, db.path(), &adopted_dir);
     let name = SchemaQualifiedTableName::in_default_schema("events");
     let inputs = datastore.table_files(&name).unwrap();

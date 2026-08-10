@@ -33,7 +33,8 @@ fn dispatcher() -> DataFlowDispatcher {
 /// version number counts the commits made since.
 fn open_datastore_with_empty_table() -> (TempDir, Arc<DeltaDatastore>) {
     let database = TempDir::new().unwrap();
-    let datastore = DeltaDatastore::open_local(database.path(), &dispatcher()).unwrap();
+    let datastore =
+        DeltaDatastore::open(&database.path().to_string_lossy(), &dispatcher()).unwrap();
     let transaction = datastore.clone().begin_transaction();
     transaction
         .bind_create_table(CreateTableRequest {
