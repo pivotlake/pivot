@@ -17,6 +17,9 @@ cargo run --release -- --source ~/hits
 # run just q07 and q20, three iterations each, sleeping 500ms between
 cargo run --release -- --source ~/hits --query 7,20 --iterations 3 --sleep 500
 
+# measure insert throughput: one INSERT each of 1k, 5k and 10k rows
+cargo run --release -- --suite clickbench-insert --source ~/hits
+
 # regenerate expected output (use after a deliberate semantic change, or
 # when running against a smaller/different dataset)
 cargo run --release -- --source ~/hits --update-results
@@ -54,6 +57,8 @@ benchmarks/
 │   ├── prep-modes-data.sh prep-clickhouse-native.sh
 │   ├── run-duckdb.sh run-clickhouse.sh
 │   └── duckdb-official/ clickhouse-official/      # vendored native schemas
+├── clickbench-insert/
+│   └── setup.sql                 # the hits schema per table: source + a target per batch size
 ├── tpch/
 │   ├── setup.sql                 # the 8 normalized TPC-H tables
 │   ├── qNN.sql  qNN.tsv          # official TPC-H query texts
@@ -81,6 +86,51 @@ with a plain run. (DuckDB rewrites a few columns - chiefly `EventDate` → a rea
 
 Adding a suite: `mkdir benchmarks/<name>`, fill in `setup.sql` and the
 queries, then run with `--suite <name>`.
+
+## The insert suite
+
+`clickbench-insert` measures the `INSERT` write path instead of query speed.
+It runs three fixed batch sizes - 1k, 5k and 10k rows per statement - and
+each is its own result, the way each `qNN.sql` is in a query suite:
+
+| ID | rows per `INSERT` | writes into |
+|----|------------------|-------------|
+| `insert-1k`  | 1 000  | `hits_inserted_1k` |
+| `insert-5k`  | 5 000  | `hits_inserted_5k` |
+| `insert-10k` | 10 000 | `hits_inserted_10k` |
+
+`setup.sql` declares the ClickBench schema once per table: `hits` over the
+parquet `--source`, plus an empty target per size, so no size writes on top of
+another's rows or another's Delta log. The runner knows the tables and the
+schema's text columns by name, so the suite is the schema and nothing else.
+
+Each iteration takes the next batch off one streamed `SELECT * FROM hits` and
+sends it as a single `INSERT INTO <target> VALUES (...), (...)`. Only the
+statement is timed; reading the rows back out of the server is what keeps the
+harness free of a Parquet reader of its own, and it is excluded from every
+number. Because the rows come from one scan, successive statements are
+successive stretches of the dataset, with nothing repeated or skipped, and only
+one batch is ever resident.
+
+```sh
+# one statement per size: 1k, then 5k, then 10k
+cargo run --release -- --suite clickbench-insert --source ~/hits \
+    --server-bin ~/bin/pivotdb-server
+
+# five statements per size, and just the 10k size
+cargo run --release -- --suite clickbench-insert --source ~/hits \
+    --server-bin ~/bin/pivotdb-server --iterations 5 --query insert-10k
+```
+
+`--iterations` is how many statements each size sends. Every size's timings are
+recorded under its own ID, so the baseline, comparison table and `--show` treat
+them like any other measurement: cold is its first statement (the first commit
+into an empty table), hot the mean of the rest. Each size also prints its total
+rows, total time and rows/sec, and fails if its target's row count doesn't
+match what was sent - a run that lost rows can't pass as a fast one.
+
+The suite may also ship `qNN.sql` files; they run after the load, against what
+was just written.
 
 ## Output verification
 
@@ -147,8 +197,8 @@ isn't a terminal or `NO_COLOR` is set.
 | `--suite <NAME>` | — | `clickbench` | suite directory name |
 | `--suite-dir <PATH>` | — | `<crate>/<suite>` | override the resolved suite path |
 | `--workers <N>` | `WORKER_COUNT` | core count | dispatch worker threads |
-| `--query <IDS>` | `QUERY` | all | comma-separated; `7,20` and `q07,q20` both accepted |
-| `--iterations <N>` | `QUERY_TEST_COUNT` | 1 | per-query iterations |
+| `--query <IDS>` | `QUERY` | all | comma-separated; `7,20` and `q07,q20` both accepted; the insert suite takes its own IDs (`insert-10k`) |
+| `--iterations <N>` | `QUERY_TEST_COUNT` | 1 | per-query iterations; on the insert suite, `INSERT` statements per batch size |
 | `--sleep <MS>` | `SLEEP` | 0 | milliseconds to sleep between iterations |
 | `--baseline <REF>` | — | `<suite_dir>/baseline.json` | local path / `gs://` / `https://` |
 | `--save-if-better` | — | off | save baseline if either cold or hot suite total improved by more than `--regression-pct` |

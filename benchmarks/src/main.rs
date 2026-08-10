@@ -14,9 +14,12 @@
 //! - `qXX.tsv`: the expected TSV output for the matching `qXX.sql`. Compared
 //!   for accuracy on every run; populated/refreshed with `--update-results`.
 //!
-//! Today the only suite is `clickbench`; future suites (e.g. `tpch`) just need
-//! to be a sibling directory — the harness discovers queries by listing
-//! `qXX.sql` files, so adding a query is "drop in two files".
+//! A suite is a sibling directory of `clickbench`. The harness discovers
+//! queries by listing `qXX.sql` files, so adding a query is "drop in two files".
+//!
+//! The `clickbench-insert` suite measures the `INSERT` write path rather than
+//! query speed: `--iterations` statements at each of its fixed batch sizes,
+//! walking through the hits data, one result per size (see [`insert`]).
 //!
 //! # Baselines
 //!
@@ -30,6 +33,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 mod baseline;
+mod insert;
 mod runner;
 mod server_handle;
 
@@ -74,7 +78,8 @@ struct Cli {
     #[arg(long, env = "QUERY", value_delimiter = ',')]
     query: Vec<String>,
 
-    /// Iterations per query.
+    /// Iterations per query. On the insert suite an iteration is one timed
+    /// `INSERT` statement, so this is how many of them the run sends.
     #[arg(long, default_value_t = 1, env = "QUERY_TEST_COUNT")]
     iterations: u32,
 
