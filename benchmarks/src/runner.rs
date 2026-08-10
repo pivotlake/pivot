@@ -20,6 +20,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
+use crate::insert;
 use crate::server_handle::ServerHandle;
 
 /// How many `INSERT`s the load keeps in flight, each on its own connection.
@@ -51,6 +52,21 @@ pub enum Error {
     },
     #[error("no expected result file at {path}; rerun with --update-results to create it")]
     MissingExpected { path: PathBuf },
+    #[error(
+        "{table} holds only {read} of the {wanted} rows the run needs; \
+         lower --iterations, or point --source at more data"
+    )]
+    SourceExhausted {
+        table: String,
+        read: usize,
+        wanted: usize,
+    },
+    #[error("{table} holds {actual} rows after the inserts, expected {expected}")]
+    InsertCountMismatch {
+        table: String,
+        expected: u64,
+        actual: u64,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -86,6 +102,9 @@ pub struct Suite {
     pub queries: Vec<Query>,
     /// Present when the suite loads its data through `INSERT` (see [`LoadSpec`]).
     pub load: Option<LoadSpec>,
+    /// Set when the suite measures the `INSERT` path itself rather than
+    /// queries (see [`insert`]).
+    pub inserts: bool,
 }
 
 /// Read a suite's optional `load.conf`: one line, `<table> <batch_rows>`.
@@ -159,6 +178,7 @@ pub fn discover_suite(name: &str, suite_dir: &Path) -> Result<Suite> {
         setup_sql_path,
         queries,
         load: read_load_spec(suite_dir)?,
+        inserts: name == insert::INSERT_SUITE,
     })
 }
 
@@ -484,7 +504,7 @@ async fn spawn_insert(
 
 /// Open one connection to the benchmark server, driving its protocol task in the
 /// background for as long as the returned client lives.
-async fn connect(port: u16) -> Result<Client> {
+pub(crate) async fn connect(port: u16) -> Result<Client> {
     let (client, connection) = tokio_postgres::Config::new()
         .host("127.0.0.1")
         .port(port)
@@ -567,6 +587,14 @@ pub async fn run_suite(
     }
 
     let mut runs = Vec::with_capacity(suite.queries.len());
+
+    // The insert suite measures the write path itself: one result per batch
+    // size, each under its own ID. Any `qNN.sql` it also ships then runs over
+    // what was just written, so the suite can check the rows it inserted as
+    // well as time them.
+    if suite.inserts {
+        runs.extend(insert::run_inserts(&client, server.port(), opts).await?);
+    }
     for query in &suite.queries {
         if let Some(filter) = &opts.query_filter
             && !filter.contains(&query.id)

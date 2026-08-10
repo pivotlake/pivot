@@ -154,7 +154,7 @@ impl Baseline {
             println!();
             println!("suite: {suite}");
             println!(
-                "{:<8}  {:>10}  {:>10}  {:>5}  last_run",
+                "{:<11}  {:>10}  {:>10}  {:>5}  last_run",
                 "query", "cold_ms", "hot_ms", "runs",
             );
             for (query, stats) in queries {
@@ -189,7 +189,7 @@ impl Baseline {
                         _ => s,
                     }
                 };
-                println!("{:<8}  {cold_cell}  {hot_cell}  {runs:>5}  {last}", query);
+                println!("{:<11}  {cold_cell}  {hot_cell}  {runs:>5}  {last}", query);
             }
         }
         if !self.history.is_empty() {
@@ -545,7 +545,7 @@ impl Comparison {
         println!();
         println!("--- {} comparison vs baseline ---", self.suite);
         println!(
-            "{:<8}  {:>10}  {:>10}  {:>9}  {:>10}  {:>10}  {:>9}  status",
+            "{:<11}  {:>10}  {:>10}  {:>9}  {:>10}  {:>10}  {:>9}  status",
             "query", "cold_base", "cold_new", "cold_Δ%", "hot_base", "hot_new", "hot_Δ%",
         );
         for row in &self.rows {
@@ -586,7 +586,7 @@ impl Comparison {
                 ),
             };
             println!(
-                "{:<8}  {cb}  {cn}  {cd}  {hb}  {hn}  {hd}  {status}",
+                "{:<11}  {cb}  {cn}  {cd}  {hb}  {hn}  {hd}  {status}",
                 row.query
             );
         }

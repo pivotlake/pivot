@@ -733,6 +733,7 @@ dependencies = [
  "chrono",
  "clap",
  "flate2",
+ "futures-util",
  "libc",
  "serde",
  "serde_json",

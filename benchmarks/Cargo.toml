@@ -13,6 +13,7 @@ edition.workspace = true
 clap = { workspace = true, features = ["env"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "sync"] }
 tokio-postgres = { workspace = true }
+futures-util = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 ureq = { workspace = true }
