@@ -65,9 +65,16 @@ fn bound_type_from(raw: ffi::BridgeLogicalType) -> BoundLogicalType {
 /// type, then the matching typed accessor. Shared by query constants and
 /// table-function arguments. A type the bridge doesn't decode lands in
 /// [`ScalarValue::Other`].
+///
+/// The NULL check comes first: a NULL value carries a full logical type but no
+/// payload, and the typed accessors are only defined on a value that has one.
 fn scalar_from_value(v: &ffi::Value) -> Result<ScalarValue> {
     use LogicalTypeId as L;
-    Ok(match LogicalTypeId::from_u8(ffi::value_type(v)?) {
+    let value_type = bound_type_from(ffi::value_type(v)?);
+    if ffi::value_is_null(v)? {
+        return Ok(ScalarValue::Null(value_type));
+    }
+    Ok(match value_type.id {
         L::BOOLEAN => ScalarValue::Boolean(ffi::value_bool(v)?),
         L::TINYINT => ScalarValue::Int8(ffi::value_i8(v)?),
         L::SMALLINT => ScalarValue::Int16(ffi::value_i16(v)?),

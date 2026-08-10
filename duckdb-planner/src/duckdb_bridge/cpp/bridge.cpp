@@ -965,11 +965,19 @@ const Value &expr_constant(const Expression &expr) {
 }
 
 // Typed accessors for a DuckDB `Value`, shared by query constants and
-// table-function arguments. The Rust side reads `value_type` first, then calls
-// the matching accessor; `GetValue<T>` returns the stored value untouched when
-// the requested type matches the value's own.
-uint8_t value_type(const Value &v) {
-	return static_cast<uint8_t>(v.type().id());
+// table-function arguments. The Rust side reads `value_type` and `value_is_null`
+// first, then calls the matching accessor; `GetValue<T>` returns the stored
+// value untouched when the requested type matches the value's own.
+//
+// A NULL value still carries the type the binder resolved for it (the target
+// column's type for an INSERT), and none of the typed accessors below may be
+// called on one: they either throw or, for `value_string`, hand back the text
+// "NULL".
+BridgeLogicalType value_type(const Value &v) {
+	return bridge_logical_type(v.type());
+}
+bool value_is_null(const Value &v) {
+	return v.IsNull();
 }
 bool value_bool(const Value &v) {
 	return v.GetValue<bool>();

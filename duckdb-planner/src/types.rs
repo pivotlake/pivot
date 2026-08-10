@@ -111,6 +111,10 @@ pub enum ScalarValue {
     /// string by wrapping the raw text, and hands it back as that same text
     /// under a variant-to-VARCHAR cast, so the consumer parses it as JSON.
     Variant(String),
+    /// A NULL, carrying the type the binder resolved for it (an INSERT's NULL
+    /// takes the target column's type) so the consumer can build a null of the
+    /// right shape. An untyped NULL keeps DuckDB's own `SQLNULL` id.
+    Null(BoundLogicalType),
     /// A DuckDB type the bridge does not decode into a typed variant.
     Other(LogicalTypeId),
 }
@@ -144,6 +148,7 @@ impl fmt::Display for ScalarValue {
                 micros,
             } => write!(f, "{months} {days} {micros}"),
             ScalarValue::Variant(v) => write!(f, "{v}"),
+            ScalarValue::Null(ty) => write!(f, "NULL as {:?}", ty.id),
             ScalarValue::Other(ty) => write!(f, "{ty:?}"),
         }
     }
