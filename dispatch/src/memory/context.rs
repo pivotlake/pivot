@@ -282,6 +282,30 @@ impl MemoryContext {
         }
     }
 
+    /// Who holds this node's ring slots right now: each cache's share, and what
+    /// is held by neither — memory an operator is using, which no eviction can
+    /// reclaim. Reported when eviction fails, because the two cases call for
+    /// opposite fixes: a cache over its share is a tuning problem, while slots
+    /// held by operators mean a query's own working set does not fit.
+    fn slot_census(&self) -> String {
+        let slots = self.layout.node_slots(self.node);
+        let total = slots.len();
+        let mut compressed = 0;
+        let mut decompressed = 0;
+        for slot in slots {
+            match self.clock.owner(slot) {
+                Some(Owner::Compressed) => compressed += 1,
+                Some(Owner::Decompressed) => decompressed += 1,
+                None => {}
+            }
+        }
+        let in_use = total - compressed - decompressed;
+        format!(
+            "ring slots {total}: compressed cache {compressed}, decompressed cache \
+             {decompressed}, held by operators {in_use}"
+        )
+    }
+
     /// Evict a ring slot via the shared CLOCK and return it writable. Each
     /// iteration re-picks which tier to take from - compressed while its share
     /// of cached slots exceeds the target percentage, decompressed otherwise
@@ -310,14 +334,19 @@ impl MemoryContext {
         loop {
             iterations += 1;
             if panic_at.is_none() && iterations == warn_at {
-                tracing::warn!(iterations, "evict: no memory left to evict, sleeping");
+                tracing::warn!(
+                    iterations,
+                    census = %self.slot_census(),
+                    "evict: no memory left to evict, sleeping"
+                );
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 panic_at = Some(iterations + ring_len);
             } else if panic_at.is_some_and(|limit| iterations >= limit) {
+                let census = self.slot_census();
                 panic!(
                     "evict: still no evictable memory after sleeping ({iterations} \
                      iterations) — aborting query (cache exhausted by an oversized \
-                     working set)"
+                     working set). {census}"
                 );
             }
 

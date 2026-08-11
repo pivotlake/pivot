@@ -76,11 +76,6 @@ struct OpenPartition {
     rows: usize,
     /// What the chunks occupy in memory, which is what the file cut bounds.
     ///
-    /// Two things are counted, and the larger decides: the values' own size, and
-    /// the ring slabs holding them. A batch's column occupies a whole slab
-    /// however little of it the column fills, so a hundred-column table spends a
-    /// hundred slabs a batch — orders of magnitude more ring than the values
-    /// measure, and the reason a wide insert exhausted it.
     bytes: usize,
 }
 
@@ -267,13 +262,11 @@ impl Unary<RecordBatch, ColumnChunkJob> for Indexer {
             bytes: 0,
         });
         open.rows += batch.num_rows();
-        let values = batch
+        open.bytes += batch
             .columns()
             .iter()
             .map(|column| column.get_array_memory_size())
             .sum::<usize>();
-        let slabs = batch.num_columns() * dispatch::BUFFER_SIZE;
-        open.bytes += values.max(slabs);
         open.chunks.push(batch);
         if open.bytes >= self.target_file_bytes {
             let full = self
