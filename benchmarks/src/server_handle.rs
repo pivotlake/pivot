@@ -152,6 +152,12 @@ pub fn start(
         Some(count) => format!("  workers: {count}\n"),
         None => String::new(),
     };
+    // Background maintenance is off: the benchmark datastore adopts
+    // pre-existing parquet, and the compacter would otherwise wake mid-run
+    // (its poll fires seconds after CREATE) and rewrite the tables while
+    // queries are being timed, spending disk reads and cache space the
+    // measurements then absorb. Vacuum only ever follows compaction, but its
+    // poll loop is just as pointless during a measurement, so it is off too.
     let config = format!(
         "\
 server:
@@ -162,6 +168,8 @@ server:
       kind: delta
       location: {data_dir}
       default: true
+      compact: false
+      vacuum: false
   users:
     pivot:
       auth:
