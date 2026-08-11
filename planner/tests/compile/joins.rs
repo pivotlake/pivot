@@ -280,14 +280,21 @@ fn semi_join_residual_scans_past_a_failing_pair_and_emits_once(
 }
 
 #[rstest]
-fn non_equality_join_reports_unsupported(mut testing_planner: TestingPlanner) {
+fn non_equality_on_condition_runs_as_a_range_join(mut testing_planner: TestingPlanner) {
     add_orders_and_items(&testing_planner);
 
-    let error = testing_planner
-        .plan("SELECT i_qty FROM items JOIN orders ON i_order < o_key")
-        .unwrap_err();
+    let mut qtys: Vec<i64> = run(
+        &mut testing_planner,
+        "SELECT i_qty FROM items JOIN orders ON i_order < o_key",
+    )
+    .iter()
+    .map(|r| r["i_qty"].as_i64().unwrap())
+    .collect();
+    qtys.sort();
 
-    assert!(error.to_string().contains("join"), "got: {error}");
+    // Each item pairs with every order whose key is above its i_order:
+    // i_order 1 with orders 2 and 3, i_order 2 with order 3, i_order 9 with none.
+    assert_eq!(qtys, vec![10, 10, 20, 20, 30]);
 }
 
 #[rstest]
@@ -645,5 +652,73 @@ fn a_join_on_an_int_and_a_string_condition_matches_pairwise(mut testing_planner:
         .as_array()
         .unwrap()
         .clone()
+    );
+}
+
+/// A join whose only condition is `<` runs as a range join: each probe row
+/// matches the contiguous run of build keys above it.
+#[rstest]
+fn a_less_than_join_matches_every_greater_key(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "thresholds",
+        &[("t_limit", Type::Int64, int64_col(vec![15, 35]))],
+    );
+    testing_planner.add_table(
+        "readings",
+        &[("r_value", Type::Int64, int64_col(vec![10, 20, 30, 40]))],
+    );
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT t_limit, r_value FROM thresholds, readings WHERE t_limit < r_value",
+    );
+    rows.sort_by_key(|r| {
+        (
+            r["t_limit"].as_i64().unwrap(),
+            r["r_value"].as_i64().unwrap(),
+        )
+    });
+
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"t_limit": 15, "r_value": 20},
+            {"t_limit": 15, "r_value": 30},
+            {"t_limit": 15, "r_value": 40},
+            {"t_limit": 35, "r_value": 40},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
+
+/// A HAVING compared against a scalar subquery: the grouped side joins the
+/// one-row subquery result on `>`, through the range join, with the cast the
+/// planner wraps around the aggregate materialized as a key column.
+#[rstest]
+fn a_having_above_a_scalar_subquery_filters_groups(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "sales",
+        &[
+            ("seller", Type::Int64, int64_col(vec![1, 1, 2, 3])),
+            ("amount", Type::Int64, int64_col(vec![50, 30, 60, 10])),
+        ],
+    );
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT seller, sum(amount) AS total FROM sales GROUP BY seller \
+         HAVING sum(amount) > (SELECT sum(amount) * 0.4 FROM sales)",
+    );
+    rows.sort_by_key(|r| r["seller"].as_i64().unwrap());
+
+    // Totals are 80, 60, 10 against a threshold of 150 * 0.4 = 60.
+    assert_eq!(
+        rows,
+        serde_json::json!([{"seller": 1, "total": 80}])
+            .as_array()
+            .unwrap()
+            .clone()
     );
 }
