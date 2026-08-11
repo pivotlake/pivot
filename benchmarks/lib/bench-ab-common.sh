@@ -187,24 +187,36 @@ save_cache() {
 # explicit --target so build scripts stay unflagged and cached) and a second
 # copy of them drifts from the recipe silently, changing what is measured
 # without changing anything that looks like a measurement.
+# Every build produces both binaries the harnesses need: the pivotdb-server
+# being measured, and the pivot-bench that launches it (--server-bin) and
+# drives it over pgwire. Only the server takes profile flags, mirroring
+# build-ab-servers.sh: the client links no engine code, so instrumenting it
+# would grow the build and rebuild it under every fresh profile for nothing.
+# It gets a plain build in its own target-client dir instead.
 build_gen() {
     local dir="$1"
     mkdir -p "$pgo_dir"
     (cd "$dir/benchmarks" && \
         PGO_DIR="$pgo_dir" PGO_GEN_TARGET_DIR=target-pgogen \
-        just pgo-gen-build build --release)
+        just pgo-gen-build build --release -p server --bin pivotdb-server && \
+        CARGO_TARGET_DIR=target-client RUSTC_WRAPPER= \
+        cargo build --release -p benchmarks --bin pivot-bench)
 }
 
-# Run the instrumented pivot-bench to produce a profile for one side, then merge
-# it to profdata. The suite name, suite dir and source come from the caller so
-# the profile is taken on that suite's own small-scale workload.
+# Produce a profile for one side: the plain client drives the instrumented
+# server, which inherits LLVM_PROFILE_FILE through the environment pivot-bench
+# spawns it with and is stopped with SIGINT so it flushes its counters. The
+# client is not instrumented and writes nothing. The suite name, suite dir and
+# source come from the caller so the profile is taken on that suite's own
+# small-scale workload.
 profile_side() {
     local dir="$1" side="$2" suite="$3" source="$4"
     local prof_dir="$work_dir/prof-$side"
     rm -rf "$prof_dir"; mkdir -p "$prof_dir"
     LLVM_PROFILE_FILE="$prof_dir/%m-%p.profraw" \
-        "$dir/benchmarks/target-pgogen/$host_target/release/pivot-bench" \
+        "$dir/benchmarks/target-client/release/pivot-bench" \
         --suite "$suite" --suite-dir "$dir/benchmarks/$suite" \
+        --server-bin "$dir/benchmarks/target-pgogen/$host_target/release/pivotdb-server" \
         --source "$source" --iterations 2 --skip-check >/dev/null
     "$(dirname "$(rustc --print target-libdir)")/bin/llvm-profdata" \
         merge -o "$work_dir/$side-$run_id.profdata" "$prof_dir"
@@ -214,12 +226,46 @@ build_use() {
     local dir="$1" side="$2"
     (cd "$dir/benchmarks" && \
         PGO_USE_TARGET_DIR=target-pgouse \
-        just pgo-use-with "$work_dir/$side-$run_id.profdata" build --release)
+        just pgo-use-with "$work_dir/$side-$run_id.profdata" build --release -p server --bin pivotdb-server)
+    verify_pgo_applied \
+        "$dir/benchmarks/target-pgouse/$host_target/release/pivotdb-server" \
+        "$work_dir/$side-$run_id.profdata" "$side"
+}
+
+# Tripwire for the profile applying at all, same as build-ab-servers.sh: the
+# decode family's monomorphization hashes in the built server must appear in
+# the profile it was compiled against. Zero overlap means the server was built
+# outside the profiled symbol universe and is effectively un-PGOed, which is
+# silent at compile time and shows up only as a mystery regression.
+verify_pgo_applied() {
+    local server="$1" profdata="$2" side="$3"
+    local family="RleDecoder4read"
+    local binary_hashes profile_hashes covered
+    # The greps legitimately match nothing when the family is fully inlined,
+    # and an empty match must not kill the harness through set -e; the
+    # zero-overlap case below is the loud failure.
+    binary_hashes=$(nm "$server" | grep "$family" | grep -oE '17h[0-9a-f]+E' | sort -u || true)
+    if [[ -z "$binary_hashes" ]]; then
+        echo ">>> $side server: no $family symbols visible to nm, skipping the profile-overlap check"
+        return 0
+    fi
+    profile_hashes=$("$(dirname "$(rustc --print target-libdir)")/bin/llvm-profdata" \
+        show -all-functions "$profdata" 2>/dev/null \
+        | grep "$family" | grep -oE '17h[0-9a-f]+E' | sort -u || true)
+    covered=$(comm -12 <(printf '%s\n' "$binary_hashes") \
+                       <(printf '%s\n' "$profile_hashes") | wc -l)
+    if [[ "$covered" -eq 0 ]]; then
+        echo "error: the $side server shares no $family symbols with its profile;" >&2
+        echo "       the profile did not apply and the binary is effectively un-PGOed" >&2
+        return 1
+    fi
+    echo ">>> $side server: $covered $family monomorphizations carry profile records"
 }
 
 build_release() {
     local dir="$1"
-    (cd "$dir/benchmarks" && RUSTC_WRAPPER= cargo build --release)
+    (cd "$dir/benchmarks" && RUSTC_WRAPPER= \
+        cargo build --release -p server --bin pivotdb-server -p benchmarks --bin pivot-bench)
 }
 
 # Drop the OS page cache (and sync first) so the next read is cold. Needs

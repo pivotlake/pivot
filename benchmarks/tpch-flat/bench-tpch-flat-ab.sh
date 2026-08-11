@@ -111,7 +111,7 @@ fi
 
 ab_common_init
 
-sf_pgo="sf10"
+sf_pgo="sf1"
 sf_measure="sf100"
 pgo_data="$data_root/$sf_pgo/flat"
 measure_data="$data_root/$sf_measure/flat"
@@ -127,10 +127,11 @@ data_dev="" # set after mount, for the io_ticks sanity column
 # the rest ("null" when missing), io_seconds the device's io_ticks delta as a
 # disk-state sanity signal.
 run_pivot() {
-    local bin="$1" dir="$2" query="$3"
+    local bin="$1" server="$2" dir="$3" query="$4"
     local t0 t1 out times
     t0="$(io_ticks)"
     out="$("$bin" --suite tpch-flat --suite-dir "$dir/benchmarks/tpch-flat" \
+        --server-bin "$server" \
         --source "$measure_data" --query "$query" \
         --iterations "$iterations" --skip-check 2>&1)" || true
     t1="$(io_ticks)"
@@ -202,6 +203,8 @@ if [[ "$mode" == "pgo" ]]; then
     restore_cache "pgogen-after" "$after_dir/benchmarks/target-pgogen" & restore_pids+=($!)
     restore_cache "pgouse-before" "$before_dir/benchmarks/target-pgouse" & restore_pids+=($!)
     restore_cache "pgouse-after" "$after_dir/benchmarks/target-pgouse" & restore_pids+=($!)
+    restore_cache "client-before" "$before_dir/benchmarks/target-client" & restore_pids+=($!)
+    restore_cache "client-after" "$after_dir/benchmarks/target-client" & restore_pids+=($!)
 else
     restore_cache "release-before" "$before_dir/target" & restore_pids+=($!)
     restore_cache "release-after" "$after_dir/target" & restore_pids+=($!)
@@ -225,8 +228,10 @@ if [[ "$mode" == "pgo" ]]; then
     build_use "$after_dir" after & b2=$!
     wait "$b1"; wait "$b2"
 
-    before_bin="$before_dir/benchmarks/target-pgouse/$host_target/release/pivot-bench"
-    after_bin="$after_dir/benchmarks/target-pgouse/$host_target/release/pivot-bench"
+    before_bin="$before_dir/benchmarks/target-client/release/pivot-bench"
+    after_bin="$after_dir/benchmarks/target-client/release/pivot-bench"
+    before_server="$before_dir/benchmarks/target-pgouse/$host_target/release/pivotdb-server"
+    after_server="$after_dir/benchmarks/target-pgouse/$host_target/release/pivotdb-server"
 else
     echo ">>> release builds (A and B in parallel)"
     build_release "$before_dir" & b1=$!
@@ -234,8 +239,12 @@ else
     wait "$b1"; wait "$b2"
     before_bin="$before_dir/target/release/pivot-bench"
     after_bin="$after_dir/target/release/pivot-bench"
+    before_server="$before_dir/target/release/pivotdb-server"
+    after_server="$after_dir/target/release/pivotdb-server"
 fi
-[[ -x "$before_bin" && -x "$after_bin" ]] || { echo "error: build produced no binary" >&2; exit 1; }
+for built in "$before_bin" "$after_bin" "$before_server" "$after_server"; do
+    [[ -x "$built" ]] || { echo "error: build produced no $built" >&2; exit 1; }
+done
 
 echo ">>> saving warm caches"
 save_cache "cargo-home" "$HOME/.cargo" registry git &
@@ -244,6 +253,8 @@ if [[ "$mode" == "pgo" ]]; then
     save_cache "pgogen-after" "$after_dir/benchmarks/target-pgogen" &
     save_cache "pgouse-before" "$before_dir/benchmarks/target-pgouse" &
     save_cache "pgouse-after" "$after_dir/benchmarks/target-pgouse" &
+    save_cache "client-before" "$before_dir/benchmarks/target-client" &
+    save_cache "client-after" "$after_dir/benchmarks/target-client" &
 else
     save_cache "release-before" "$before_dir/target" &
     save_cache "release-after" "$after_dir/target" &
@@ -266,9 +277,11 @@ fi
 echo ">>> burn-in + result capture (queries: $queries)"
 drop_caches
 "$before_bin" --suite tpch-flat --suite-dir "$before_dir/benchmarks/tpch-flat" \
+    --server-bin "$before_server" \
     --source "$measure_data" --query "$queries" --iterations 1 --update-results >/dev/null
 drop_caches
 "$after_bin" --suite tpch-flat --suite-dir "$after_dir/benchmarks/tpch-flat" \
+    --server-bin "$after_server" \
     --source "$measure_data" --query "$queries" --iterations 1 --update-results >/dev/null
 
 correctness="ok"
@@ -291,10 +304,10 @@ echo ">>> measuring (iterations=$iterations, passes=$passes, mode=$mode)"
 for pass in $(seq "$passes"); do
     for q in "${qlist[@]}"; do
         drop_caches; sleep 3
-        read -r cold hot io <<<"$(run_pivot "$before_bin" "$before_dir" "$q")"
+        read -r cold hot io <<<"$(run_pivot "$before_bin" "$before_server" "$before_dir" "$q")"
         echo -e "$q\tbefore\t$cold\t$hot\t$io" >>"$rows"
         drop_caches; sleep 3
-        read -r cold hot io <<<"$(run_pivot "$after_bin" "$after_dir" "$q")"
+        read -r cold hot io <<<"$(run_pivot "$after_bin" "$after_server" "$after_dir" "$q")"
         echo -e "$q\tafter\t$cold\t$hot\t$io" >>"$rows"
         if [[ "$run_duckdb" == "1" ]]; then
             drop_caches; sleep 3
