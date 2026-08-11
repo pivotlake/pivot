@@ -16,12 +16,14 @@
 
 use std::collections::HashMap;
 
+use dispatch::RangeCompare;
 use dispatch::RowDelivery;
 use duckdb_planner::BoundLogicalType;
+use duckdb_planner::Expr;
 use duckdb_planner::LogicalOp;
 use duckdb_planner::duckdb_bridge::duckdb_types::{ExpressionType, JoinType};
 use duckdb_planner::handle::{
-    ComparisonJoin as ComparisonJoinView, DynamicFilterRef, JoinConditionEntry,
+    ComparisonJoin as ComparisonJoinView, DynamicFilterRef, JoinCondition, JoinConditionEntry,
     Operator as DuckOperator, TableScan as TableScanView, rowid_column_id,
 };
 
@@ -361,6 +363,7 @@ fn build_join(
     let mut build_keys = Vec::new();
     let mut key_types = Vec::new();
     let mut residual_predicates = Vec::new();
+    let mut inequalities = Vec::new();
     for entry in join.conditions()? {
         let condition = match entry {
             JoinConditionEntry::Comparison(condition) => condition,
@@ -370,10 +373,8 @@ fn build_join(
             }
         };
         if condition.comparison != ExpressionType::COMPARE_EQUAL {
-            return Err(OperatorError::Unsupported(format!(
-                "Unsupported join comparison type: {:?}",
-                condition.comparison
-            )));
+            inequalities.push(condition);
+            continue;
         }
         let (probe_key, probe_key_type) = join_key_ref(Expression::from_handle(condition.left)?)?;
         let (build_key, build_key_type) = join_key_ref(Expression::from_handle(condition.right)?)?;
@@ -388,10 +389,16 @@ fn build_join(
         build_keys.push(build_key);
         key_types.push(probe_key_type);
     }
+    // With no equality to hash on, a single comparison condition runs as a
+    // range join instead.
     if key_types.is_empty() {
-        return Err(OperatorError::Unsupported(
-            "joins must have at least one equality condition".to_string(),
-        ));
+        return build_range_join(op, join, inputs, inequalities, residual_predicates);
+    }
+    if !inequalities.is_empty() {
+        return Err(OperatorError::Unsupported(format!(
+            "Unsupported join comparison type: {:?}",
+            inequalities[0].comparison
+        )));
     }
 
     let residual_filters = residual_predicates
@@ -456,6 +463,164 @@ fn build_join(
             kind,
         }),
     })
+}
+
+/// Build a [`JoinKind::Range`] join: an inner join whose one condition is a
+/// `<`/`<=`/`>`/`>=` comparison, with no equality to hash on.
+fn build_range_join(
+    op: LogicalOp<'_>,
+    join: ComparisonJoinView<'_>,
+    mut inputs: Vec<PlanNode>,
+    inequalities: Vec<JoinCondition<'_>>,
+    residual_predicates: Vec<Expr<'_>>,
+) -> Result<PlanNode, OperatorError> {
+    let [condition] = inequalities.as_slice() else {
+        return Err(OperatorError::Unsupported(format!(
+            "joins must have an equality condition or exactly one comparison, got {} comparisons",
+            inequalities.len()
+        )));
+    };
+    if !residual_predicates.is_empty() {
+        return Err(OperatorError::Unsupported(
+            "a range join does not support extra conditions".to_string(),
+        ));
+    }
+    if join.join_type()? != JoinType::INNER {
+        return Err(OperatorError::Unsupported(format!(
+            "Unsupported range join type: {:?}",
+            join.join_type()?
+        )));
+    }
+    let compare = match &condition.comparison {
+        &ExpressionType::COMPARE_LESSTHAN => RangeCompare::Less,
+        &ExpressionType::COMPARE_LESSTHANOREQUALTO => RangeCompare::LessEq,
+        &ExpressionType::COMPARE_GREATERTHAN => RangeCompare::Greater,
+        &ExpressionType::COMPARE_GREATERTHANOREQUALTO => RangeCompare::GreaterEq,
+        other => {
+            return Err(OperatorError::Unsupported(format!(
+                "Unsupported join comparison type: {other:?}"
+            )));
+        }
+    };
+
+    let probe_key_expr = Expression::from_handle(condition.left)?;
+    let build_key_expr = Expression::from_handle(condition.right)?;
+    let key_type = probe_key_expr.result_type()?;
+    if build_key_expr.result_type()? != key_type {
+        return Err(OperatorError::Unsupported(format!(
+            "join key types differ: {key_type:?} vs {:?} \
+             (the planner casts both sides of a condition to a common type, so this plan \
+             shape is unexpected)",
+            build_key_expr.result_type()?
+        )));
+    }
+    // The sorted build side compares keys by their native values, which
+    // matches SQL ordering only for these types (floats order NaN
+    // differently, strings are not fixed-width).
+    match key_type {
+        Type::Int8
+        | Type::Int16
+        | Type::Int32
+        | Type::Int64
+        | Type::UInt8
+        | Type::UInt16
+        | Type::UInt32
+        | Type::UInt64
+        | Type::Int128
+        | Type::Decimal { .. }
+        | Type::Date
+        | Type::Timestamp => {}
+        other => {
+            return Err(OperatorError::Unsupported(format!(
+                "Unsupported range join key type: {other:?}"
+            )));
+        }
+    }
+
+    let build_node = inputs.pop().expect("a join has two inputs");
+    let probe_node = inputs.pop().expect("a join has two inputs");
+    // The output lists below index the sides' original columns, so they are
+    // sized before a computed key gets materialized as an extra column.
+    let probe_width = probe_node.output_types()?.len();
+    let build_width = build_node.output_types()?.len();
+    let (probe_node, probe_key) = materialize_key_column(probe_node, probe_key_expr)?;
+    let (build_node, build_key) = materialize_key_column(build_node, build_key_expr)?;
+
+    let left_map: Vec<usize> = join.left_projection_map()?;
+    let right_map: Vec<usize> = join.right_projection_map()?;
+    let probe_output: Vec<usize> = if left_map.is_empty() {
+        (0..probe_width).collect()
+    } else {
+        left_map
+    };
+    let build_output: Vec<usize> = if right_map.is_empty() {
+        (0..build_width).collect()
+    } else {
+        right_map
+    };
+
+    let probe_types = probe_node.output_types()?;
+    let build_types = build_node.output_types()?;
+    let probe_nullability = probe_node.output_nullability();
+    let build_nullability = build_node.output_nullability();
+    let probe_column_types = probe_output
+        .iter()
+        .map(|&i| (probe_types[i].clone(), probe_nullability[i]))
+        .collect();
+    let build_column_types = build_output
+        .iter()
+        .map(|&i| (build_types[i].clone(), build_nullability[i]))
+        .collect();
+    Ok(PlanNode {
+        name: op.name()?,
+        inputs: vec![probe_node, build_node],
+        operator: Operator::Join(Join {
+            probe_keys: vec![probe_key],
+            build_keys: vec![build_key],
+            key_types: vec![key_type],
+            probe_output,
+            build_output,
+            probe_column_types,
+            build_column_types,
+            residual_filters: Vec::new(),
+            kind: JoinKind::Range(compare),
+        }),
+    })
+}
+
+/// The column a join key expression is read from. A plain column ref is its
+/// own answer; a computed key (e.g. the cast the planner wraps one side in to
+/// unify types) is materialized by a projection that passes every existing
+/// column through and appends the key as one more.
+fn materialize_key_column(
+    input: PlanNode,
+    key: Expression,
+) -> Result<(PlanNode, usize), OperatorError> {
+    if let Expression::Ref(key) = &key {
+        return Ok((input, key.column_idx));
+    }
+    let types = input.output_types()?;
+    let mut projections: Vec<Expression> = types
+        .iter()
+        .enumerate()
+        .map(|(column_idx, column_type)| {
+            Expression::Ref(Ref {
+                column_idx,
+                return_type: column_type.clone(),
+                name: None,
+            })
+        })
+        .collect();
+    let key_column = projections.len();
+    projections.push(key);
+    Ok((
+        PlanNode {
+            name: "materialize join key".to_string(),
+            inputs: vec![input],
+            operator: Operator::Projection(Projection { projections }),
+        },
+        key_column,
+    ))
 }
 
 /// The column ref a join key must be, with the key type restriction the
