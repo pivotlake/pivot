@@ -2,6 +2,7 @@
 mod common;
 
 mod declared_types;
+mod delim;
 mod expressions;
 mod joins;
 mod operators;

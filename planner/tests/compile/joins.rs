@@ -722,3 +722,107 @@ fn a_having_above_a_scalar_subquery_filters_groups(mut testing_planner: TestingP
             .clone()
     );
 }
+
+fn add_status_orders_and_wide_items(planner: &TestingPlanner) {
+    planner.add_table(
+        "status_orders",
+        &[
+            ("o_key", Type::Int64, int64_col(vec![1, 2, 3])),
+            (
+                "o_status",
+                Type::Utf8,
+                str_col(vec!["open", "closed", "open"]),
+            ),
+        ],
+    );
+    let mut keys = vec![1, 2];
+    let mut quantities = vec![11, 12];
+    keys.extend(std::iter::repeat_n(7, 18));
+    quantities.extend(100..118);
+    planner.add_table(
+        "wide_items",
+        &[
+            ("i_order", Type::Int64, int64_col(keys)),
+            ("i_qty", Type::Int64, int64_col(quantities)),
+        ],
+    );
+}
+
+/// A LEFT JOIN preserving the larger relation stays LEFT in DuckDB's plan
+/// (flipping would build the hash table from the bigger side), so it runs as
+/// a probe-side outer join. 18 of the 20 items reference no order and pad
+/// with a NULL order key, which count(o_key) skips.
+#[rstest]
+fn left_join_pads_the_probe_rows_nothing_matched(mut testing_planner: TestingPlanner) {
+    add_status_orders_and_wide_items(&testing_planner);
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT count(*) AS total, count(o_key) AS matched \
+         FROM wide_items LEFT JOIN status_orders ON i_order = o_key",
+    );
+
+    assert_eq!(
+        rows,
+        serde_json::json!([{"total": 20, "matched": 2}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
+/// The join's OR condition references both sides, so it rides the join as a
+/// residual. Item 11's only key match is order 1 (open, quantity not above
+/// 11), which the residual rejects, and a probe row whose every pair is
+/// rejected pads rather than disappears.
+#[rstest]
+fn left_join_pads_a_probe_row_whose_every_pair_the_residual_rejects(
+    mut testing_planner: TestingPlanner,
+) {
+    add_status_orders_and_wide_items(&testing_planner);
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT count(*) AS total, count(o_key) AS matched \
+         FROM wide_items LEFT JOIN status_orders \
+           ON i_order = o_key AND (o_status = 'closed' OR i_qty > 11)",
+    );
+
+    assert_eq!(
+        rows,
+        serde_json::json!([{"total": 20, "matched": 1}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
+/// A NULL probe key can never match, but a LEFT JOIN still owes the row an
+/// output; it pads instead of being dropped with the null-key filter.
+#[rstest]
+fn left_join_pads_null_keyed_probe_rows(mut testing_planner: TestingPlanner) {
+    add_status_orders_and_wide_items(&testing_planner);
+    let mut keys: Vec<Option<i64>> = vec![Some(1), None];
+    keys.extend(std::iter::repeat_n(Some(7), 18));
+    testing_planner.add_table(
+        "nullable_items",
+        &[
+            ("n_order", Type::Int64, Arc::new(Int64Array::from(keys))),
+            ("n_qty", Type::Int64, int64_col((0..20).collect())),
+        ],
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT count(*) AS total, count(o_key) AS matched \
+         FROM nullable_items LEFT JOIN status_orders ON n_order = o_key",
+    );
+
+    assert_eq!(
+        rows,
+        serde_json::json!([{"total": 20, "matched": 1}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}

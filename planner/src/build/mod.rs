@@ -14,8 +14,6 @@
 //! pushed-down `table_filters` back into a [`Filter`], replaying a filter's
 //! `projection_map`, and stripping the threaded-up row-id column.
 
-use std::collections::HashMap;
-
 use dispatch::RangeCompare;
 use dispatch::RowDelivery;
 use duckdb_planner::BoundLogicalType;
@@ -23,71 +21,30 @@ use duckdb_planner::Expr;
 use duckdb_planner::LogicalOp;
 use duckdb_planner::duckdb_bridge::duckdb_types::{ExpressionType, JoinType};
 use duckdb_planner::handle::{
-    ComparisonJoin as ComparisonJoinView, DynamicFilterRef, JoinCondition, JoinConditionEntry,
-    Operator as DuckOperator, TableScan as TableScanView, rowid_column_id,
+    ComparisonJoin as ComparisonJoinView, DelimGet as DelimGetView, DelimJoin as DelimJoinView,
+    JoinCondition, JoinConditionEntry, Operator as DuckOperator, TableScan as TableScanView,
+    rowid_column_id,
 };
 
 use crate::catalog::BoundTable;
-use crate::dynamic_filter::DynamicFilter;
 use crate::expression::{Cast, Error as ExpressionError, Expression, Function, Ref, VariantGet};
 use crate::operator::{
-    Aggregate, Compact, CreateSchema, CreateTable, CreateUser, Cte, CteScan, DummyScan,
+    Aggregate, Compact, CreateSchema, CreateTable, CreateUser, Cte, CteScan, Distinct, DummyScan,
     Error as OperatorError, Explain, Filter, Input, Insert, Join, JoinKind, Limit, Materialize,
     Operator, OrderBy, Projection, SetVariable, TableFunctionScan, TopN, Values,
 };
 use crate::plan::{self, PlanNode};
 use crate::types::{Type, physical_arrow_type, type_from_logical};
 
+mod context;
 mod expression;
 mod operator;
 
-/// Per-walk state: the dense dynamic-filter slot ids, assigned by the pointer
-/// identity of DuckDB's shared `DynamicFilterData` cell so a Top-N producer and
-/// the scans that consume its filter agree on a slot.
-pub(crate) struct BuildCtx {
-    dynamic_filter_slots: HashMap<usize, usize>,
-    /// What each CTE walked so far produces, keyed by DuckDB's CTE index. A
-    /// scan of a CTE is a leaf, so it takes its output shape from here rather
-    /// than from a child, which is why a CTE's definition is walked before the
-    /// query reading it.
-    cte_outputs: HashMap<usize, (Vec<Type>, Vec<bool>)>,
-    /// How many scans of each CTE have been walked, so the CTE knows how many
-    /// readers to feed.
-    cte_sites: HashMap<usize, usize>,
-}
-
-impl BuildCtx {
-    /// The dense slot id for a shared dynamic-filter cell, assigning a new one on
-    /// first sight. The shared cell can't be passed to Rust, so it is identified
-    /// by its address (`data_id`); this maps each distinct address to a stable
-    /// small integer (first seen `0`, next `1`, ...) so a producer and its
-    /// consumers share a `slot_id` the compile step can wire up.
-    fn slot_for(&mut self, data_id: usize) -> usize {
-        let next_slot = self.dynamic_filter_slots.len();
-        *self
-            .dynamic_filter_slots
-            .entry(data_id)
-            .or_insert(next_slot)
-    }
-
-    /// Build a planner [`DynamicFilter`] from a handle reference, assigning its
-    /// shared slot. Shared by the scan and Top-N construction (see [`operator`]).
-    fn dynamic_filter(&mut self, df: DynamicFilterRef) -> Result<DynamicFilter, ExpressionError> {
-        Ok(DynamicFilter {
-            slot_id: self.slot_for(df.data_id),
-            column_idx: df.column,
-            compare_type: df.comparison.try_into()?,
-        })
-    }
-}
+use context::BuildCtx;
 
 /// Build the whole Pivot plan tree from DuckDB's root operator handle.
 pub(crate) fn build_plan(root: LogicalOp<'_>) -> Result<PlanNode, plan::Error> {
-    let mut ctx = BuildCtx {
-        dynamic_filter_slots: HashMap::new(),
-        cte_outputs: HashMap::new(),
-        cte_sites: HashMap::new(),
-    };
+    let mut ctx = BuildCtx::default();
     let plan = build_node(root, &mut ctx)?;
     Ok(render_variant_outputs(plan)?)
 }
@@ -156,6 +113,13 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         return build_cte(op, cte.cte_index()?, ctx);
     }
 
+    // A delim join walks its children in order too: the subquery side's delim
+    // scans declare the de-duplicated columns of the outer side, which must
+    // have been walked first.
+    if let DuckOperator::DelimJoin(delim) = kind {
+        return build_delim_join(op, delim, ctx);
+    }
+
     let inputs = op
         .children()?
         .into_iter()
@@ -211,7 +175,12 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
             return build_join(op, join, inputs);
         }
         DuckOperator::CteRef(cte_ref) => {
-            Operator::CteScan(build_cte_scan(cte_ref.cte_index()?, ctx)?)
+            Operator::CteScan(ctx.create_cte_scan(cte_ref.cte_index()?)?)
+        }
+        DuckOperator::DelimGet(get) => Operator::CteScan(build_delim_get_scan(get, ctx)?),
+        // A delim join is walked above, before its children.
+        DuckOperator::DelimJoin(_) => {
+            unreachable!("a delim join walks its own children")
         }
         // A CTE is walked above, before its children.
         DuckOperator::MaterializedCte(_) => {
@@ -338,10 +307,12 @@ fn absorb_scan_pushdown_filter(node: PlanNode) -> PlanNode {
 /// full outputs (see its `ColumnBindingResolver`), which is the layout the
 /// dispatch join evaluates it in.
 ///
-/// RIGHT is the outer join whose preserved side is that right child, so it maps
-/// onto the dispatch join's build-side outer mode. A written `LEFT JOIN` lands
-/// here as RIGHT whenever its preserved relation is the smaller one; LEFT
-/// itself (preserving the streamed side) is not supported yet.
+/// RIGHT is the outer join whose preserved side is that right child, so it
+/// maps onto the dispatch join's build-side outer mode, and LEFT onto its
+/// probe-side outer mode. DuckDB writes whichever puts the preserved relation
+/// on the side its cost model wants it: a written `LEFT JOIN` lands here as
+/// RIGHT whenever its preserved relation is the smaller one, and stays LEFT
+/// when it is the larger.
 ///
 /// SEMI keeps rows of the left child, so it is semi on the *probe* side. The
 /// mirrored RIGHT_SEMI, which DuckDB's build-probe-side optimizer produces when
@@ -428,6 +399,7 @@ fn build_join(
     let (kind, build_output) = match join.join_type()? {
         JoinType::INNER => (JoinKind::Inner, kept_build_output),
         JoinType::RIGHT => (JoinKind::BuildOuter, kept_build_output),
+        JoinType::LEFT => (JoinKind::ProbeOuter, kept_build_output),
         // A semi join emits no build column at all. DuckDB agrees, and says so
         // by returning the left bindings alone for such a join rather than
         // through the right projection map, which it never reads here - so the
@@ -712,10 +684,10 @@ fn build_cte(
     let definition = build_node(op.child(0)?, ctx)?;
     let types = definition.output_types()?;
     let nullable = definition.output_nullability();
-    ctx.cte_outputs.insert(cte_index, (types, nullable));
+    ctx.register_cte_output(cte_index, types, nullable);
 
     let body = build_node(op.child(1)?, ctx)?;
-    let sites = ctx.cte_sites.remove(&cte_index).unwrap_or_default();
+    let sites = ctx.take_cte_sites(cte_index);
     if sites == 0 {
         return Err(OperatorError::Unsupported(format!(
             "CTE #{cte_index} is materialized but never read"
@@ -729,18 +701,331 @@ fn build_cte(
     })
 }
 
-/// One scan of a CTE, taking its output shape from the definition walked earlier.
-fn build_cte_scan(cte_index: usize, ctx: &mut BuildCtx) -> Result<CteScan, OperatorError> {
-    let Some((types, nullable)) = ctx.cte_outputs.get(&cte_index) else {
-        return Err(OperatorError::Unsupported(format!(
-            "CTE #{cte_index} is read outside the plan that defines it"
-        )));
+/// One scan of the innermost enclosing delim join's de-duplicated values.
+fn build_delim_get_scan(
+    get: DelimGetView<'_>,
+    ctx: &mut BuildCtx,
+) -> Result<CteScan, OperatorError> {
+    let Some(dedup_keys_cte) = ctx.delim_target() else {
+        return Err(OperatorError::Unsupported(
+            "DELIM_GET outside a delim join".to_string(),
+        ));
     };
-    *ctx.cte_sites.entry(cte_index).or_default() += 1;
-    Ok(CteScan {
-        cte_index,
-        types: types.clone(),
-        nullable: nullable.clone(),
+    let scan = ctx.create_cte_scan(dedup_keys_cte)?;
+    let declared: Vec<Type> = get
+        .column_types()?
+        .into_iter()
+        .map(type_from_logical)
+        .collect::<Result<_, _>>()
+        .map_err(ExpressionError::from)?;
+    if declared != scan.types {
+        return Err(OperatorError::Unsupported(format!(
+            "DELIM_GET declares {declared:?} but the delim join de-duplicates {:?}",
+            scan.types
+        )));
+    }
+    Ok(scan)
+}
+
+/// Translate DuckDB's delim join into ordinary Pivot operators.
+///
+/// A delim join is how DuckDB evaluates many correlated subqueries without
+/// running the subquery separately for every outer row. For example:
+///
+/// ```sql
+/// SELECT ...
+/// FROM sales, parts
+/// WHERE p_key = s_part
+///   AND p_flag = 'a'
+///   AND s_qty < (
+///       SELECT avg(s2.s_qty)
+///       FROM sales s2
+///       WHERE s2.s_part = p_key
+///   )
+/// ```
+///
+/// The inner query is correlated because its `p_key` comes from the outer
+/// query. Another way to read it is: "for each relevant `p_key`, calculate an
+/// average, then attach that average to every outer row with that key."
+///
+/// DuckDB represents this as a delim join with two ordinary children and one
+/// implicit data dependency between them:
+///
+/// * Child 0 is the **outer side**. It produces the candidate rows from
+///   `sales` and `parts`, before applying the predicate that uses the scalar
+///   subquery. These rows can contain the same correlation key many times.
+/// * Child 1 is the **subquery side**. It produces one `(key, answer)` row for
+///   each relevant correlation key. Child 1 has no normal input edge from
+///   child 0, so a `DELIM_GET` leaf supplies it with the distinct keys that
+///   child 0 produced. The delim join's `duplicate_eliminated_columns` say
+///   which child-0 columns make up those keys. A key may be a tuple of several
+///   columns, not just one column.
+///
+/// The dataflow is therefore:
+///
+/// 1. Run the outer side once.
+/// 2. Keep its complete rows for the final join, and separately take the
+///    distinct correlation keys from those rows.
+/// 3. Feed the distinct keys to every `DELIM_GET` in the subquery side.
+/// 4. Run the subquery once for that set of keys, producing `(key, answer)`
+///    rows.
+/// 5. Join those answers back to the complete outer rows. Duplicate outer
+///    keys deliberately reappear here: every original row receives the answer
+///    for its key.
+///
+/// For a concrete example, suppose the outer side produces:
+///
+/// ```text
+/// p_key  s_qty
+///      1      4
+///      1      8
+///      2      9
+/// ```
+///
+/// `DELIM_DEDUP` reduces the correlation-key column to `{1, 2}`. The
+/// subquery's `DELIM_GET` reads those two keys, joins them to `sales s2`, and
+/// produces `(1, avg 6)` and `(2, avg 9)`. The final delim join attaches the
+/// answers to the original rows:
+///
+/// ```text
+/// p_key  s_qty  avg
+///      1      4    6
+///      1      8    6
+///      2      9    9
+/// ```
+///
+/// The `s_qty < avg` filter above the delim join then keeps only the first
+/// row. One batched subquery plan computed the answers for the distinct key
+/// set rather than rerunning the subquery for every outer row.
+///
+/// Pivot has no native delim-join operator, so this function expresses the
+/// implicit dependency with two synthetic CTEs. Here a CTE means "run this
+/// definition once, make its rows available to the scans in its body, and
+/// return the body's output."
+///
+/// * `outer_rows_cte` publishes all outer rows. It has two readers: the
+///   distinct operation and the final join.
+/// * `dedup_keys_cte` publishes only the distinct correlation keys. Each
+///   translated `DELIM_GET` becomes a scan of this CTE.
+///
+/// The complete plan produced here is:
+///
+/// ```text
+/// DELIM_JOIN: Cte(outer_rows_cte)
+/// ├── definition: (outer side)
+/// │                 Produces the complete candidate rows once.
+/// └── body: DELIM_KEY_FEED: Cte(dedup_keys_cte)
+///     ├── definition: DELIM_DEDUP
+///     │   └── DELIM_OUTER_ROWS: CteScan(outer_rows_cte)
+///     │                 First reader of the complete outer rows; emits
+///     │                 only the distinct correlation-key tuples.
+///     └── body: DELIM_SUBQUERY_JOIN
+///         ├── DELIM_OUTER_ROWS: CteScan(outer_rows_cte)
+///         │                 Second reader of the complete outer rows; probes
+///         │                 for its subquery answer.
+///         └── (subquery side)
+///             └── ... DELIM_GET -> CteScan(dedup_keys_cte)
+///                       Reads the keys published by DELIM_DEDUP and
+///                       computes one answer per key, the join's build side.
+/// ```
+///
+/// Every kind keeps that orientation: the subquery side's answer table (one
+/// row per distinct key) is the small side, so it is the one worth building a
+/// hash table from, and the outer rows probe it. LEFT preserves the outer
+/// rows through [`JoinKind::ProbeOuter`], which pads an unmatched probe row
+/// with NULL build columns; SEMI keeps a probing row only when an answer
+/// exists.
+///
+/// DuckDB may express the final delim-join condition as `IS NOT DISTINCT FROM`
+/// because the distinct key set can contain NULL. For the supported shapes,
+/// the subquery reaches this final join through its own ordinary equality
+/// predicate against the key set; that equality does not produce a subquery
+/// key for NULL. We can therefore use plain equality here: non-NULL keys behave
+/// identically, while a NULL-keyed outer row remains unmatched and is padded
+/// for LEFT or discarded for SEMI/INNER, matching DuckDB's result.
+fn build_delim_join(
+    op: LogicalOp<'_>,
+    delim: DelimJoinView<'_>,
+    ctx: &mut BuildCtx,
+) -> Result<PlanNode, OperatorError> {
+    if delim.is_flipped()? {
+        return Err(OperatorError::Unsupported(
+            "flipped delim join (de-duplicating the RHS) is not supported".to_string(),
+        ));
+    }
+    let join = delim.join();
+
+    let outer_side = build_node(op.child(0)?, ctx)?;
+    let outer_types = outer_side.output_types()?;
+    let outer_nullability = outer_side.output_nullability();
+
+    let mut correlation_columns: Vec<(usize, Type)> = Vec::new();
+    for column in delim.delim_columns()? {
+        let column = Expression::from_handle(column)?;
+        let Expression::Ref(reference) = column else {
+            return Err(OperatorError::Unsupported(format!(
+                "delim columns must be plain columns, got: {column:?}"
+            )));
+        };
+        correlation_columns.push((reference.column_idx, reference.return_type));
+    }
+    if correlation_columns.is_empty() {
+        return Err(OperatorError::Unsupported(
+            "a delim join must de-duplicate at least one column".to_string(),
+        ));
+    }
+
+    // The two shared streams, as synthetic CTE channels: the outer side's
+    // rows, and the dedup'd correlation keys the subquery side scans.
+    let outer_rows_cte = ctx.create_synthetic_cte(outer_types.clone(), outer_nullability.clone());
+    let dedup_keys_cte = ctx.create_synthetic_cte(
+        correlation_columns
+            .iter()
+            .map(|(_, ty)| ty.clone())
+            .collect(),
+        correlation_columns
+            .iter()
+            .map(|&(idx, _)| outer_nullability[idx])
+            .collect(),
+    );
+
+    let subquery_child = op.child(1)?;
+    let subquery_side =
+        ctx.with_delim_target(dedup_keys_cte, |ctx| build_node(subquery_child, ctx))?;
+    let delim_scan_sites = ctx.take_cte_sites(dedup_keys_cte);
+    if delim_scan_sites == 0 {
+        return Err(OperatorError::Unsupported(
+            "a delim join whose subquery side reads no DELIM_GET".to_string(),
+        ));
+    }
+
+    let mut outer_keys = Vec::new();
+    let mut subquery_keys = Vec::new();
+    let mut key_types = Vec::new();
+    for entry in join.conditions()? {
+        let condition = match entry {
+            JoinConditionEntry::Comparison(condition) => condition,
+            JoinConditionEntry::Expression(_) => {
+                return Err(OperatorError::Unsupported(
+                    "delim joins with expression-form conditions are not supported".to_string(),
+                ));
+            }
+        };
+        if !matches!(
+            condition.comparison,
+            ExpressionType::COMPARE_EQUAL | ExpressionType::COMPARE_NOT_DISTINCT_FROM
+        ) {
+            return Err(OperatorError::Unsupported(format!(
+                "Unsupported delim join comparison type: {:?}",
+                condition.comparison
+            )));
+        }
+        let (outer_key, outer_key_type) = join_key_ref(Expression::from_handle(condition.left)?)?;
+        let (subquery_key, subquery_key_type) =
+            join_key_ref(Expression::from_handle(condition.right)?)?;
+        if outer_key_type != subquery_key_type {
+            return Err(OperatorError::Unsupported(format!(
+                "join key types differ: {outer_key_type:?} vs {subquery_key_type:?} \
+                 (the planner casts both sides of a condition to a common type, so this plan \
+                 shape is unexpected)"
+            )));
+        }
+        outer_keys.push(outer_key);
+        subquery_keys.push(subquery_key);
+        key_types.push(outer_key_type);
+    }
+    if key_types.is_empty() {
+        return Err(OperatorError::Unsupported(
+            "joins must have at least one equality condition".to_string(),
+        ));
+    }
+
+    let subquery_types = subquery_side.output_types()?;
+    let subquery_nullability = subquery_side.output_nullability();
+    let left_map: Vec<usize> = join.left_projection_map()?;
+    let right_map: Vec<usize> = join.right_projection_map()?;
+    let outer_output: Vec<usize> = if left_map.is_empty() {
+        (0..outer_types.len()).collect()
+    } else {
+        left_map
+    };
+    let subquery_output: Vec<usize> = if right_map.is_empty() {
+        (0..subquery_types.len()).collect()
+    } else {
+        right_map
+    };
+
+    let read_outer_rows = || PlanNode {
+        name: "DELIM_OUTER_ROWS".to_string(),
+        inputs: Vec::new(),
+        operator: Operator::CteScan(CteScan {
+            cte_index: outer_rows_cte,
+            types: outer_types.clone(),
+            nullable: outer_nullability.clone(),
+        }),
+    };
+    let column_types = |output: &[usize], types: &[Type], nullability: &[bool]| {
+        output
+            .iter()
+            .map(|&i| (types[i].clone(), nullability[i]))
+            .collect::<Vec<_>>()
+    };
+
+    let outer_column_types = column_types(&outer_output, &outer_types, &outer_nullability);
+    let subquery_column_types =
+        column_types(&subquery_output, &subquery_types, &subquery_nullability);
+    // Every kind keeps the natural orientation: the outer side probes the
+    // subquery side's (small, one row per distinct key) answer table. LEFT
+    // preserves the outer side through the probe-side outer mode, and a semi
+    // join emits no build column at all (see `build_join`).
+    let (kind, build_output, build_column_types) = match join.join_type()? {
+        JoinType::LEFT => (JoinKind::ProbeOuter, subquery_output, subquery_column_types),
+        JoinType::INNER => (JoinKind::Inner, subquery_output, subquery_column_types),
+        JoinType::SEMI => (JoinKind::ProbeSemi, Vec::new(), Vec::new()),
+        other => {
+            return Err(OperatorError::Unsupported(format!(
+                "Unsupported delim join type: {other:?}"
+            )));
+        }
+    };
+    let join_node = PlanNode {
+        name: "DELIM_SUBQUERY_JOIN".to_string(),
+        inputs: vec![read_outer_rows(), subquery_side],
+        operator: Operator::Join(Join {
+            probe_keys: outer_keys,
+            build_keys: subquery_keys,
+            key_types,
+            probe_output: outer_output,
+            build_output,
+            probe_column_types: outer_column_types,
+            build_column_types,
+            residual_filters: Vec::new(),
+            kind,
+        }),
+    };
+
+    let dedup = PlanNode {
+        name: "DELIM_DEDUP".to_string(),
+        inputs: vec![read_outer_rows()],
+        operator: Operator::Distinct(Distinct {
+            keys: correlation_columns,
+        }),
+    };
+    let key_feed = PlanNode {
+        name: "DELIM_KEY_FEED".to_string(),
+        inputs: vec![dedup, join_node],
+        operator: Operator::Cte(Cte {
+            cte_index: dedup_keys_cte,
+            sites: delim_scan_sites,
+        }),
+    };
+    Ok(PlanNode {
+        name: op.name()?,
+        inputs: vec![outer_side, key_feed],
+        operator: Operator::Cte(Cte {
+            cte_index: outer_rows_cte,
+            sites: 2,
+        }),
     })
 }
 

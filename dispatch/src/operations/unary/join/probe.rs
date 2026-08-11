@@ -5,7 +5,8 @@
 //! batches by row id.
 //!
 //! Matches are collected as two parallel index slices — probe row and build
-//! row id — and appended into a [`BatchAccumulator`] per side, so the
+//! row id — and appended into a
+//! [`BatchAccumulator`](crate::arrays::accumulator::BatchAccumulator) per side, so the
 //! hot loops touch only hashes, the directory, and the key/row arenas, and a
 //! selective join still emits full-size batches.
 //!
@@ -21,6 +22,21 @@
 //! holds its key, found by stopping at the first one that does. Only the probe
 //! accumulator ever fills, since such a join carries no build columns.
 //!
+//! When the join is outer on the probe side, the probe rows nothing matched
+//! are emitted with their build columns null once their batch is fully
+//! probed. Almost every miss is known the moment the probe passes the row: a
+//! row the bloom check rejects has no candidates at all, and a row whose
+//! arena range verifies nothing has only false ones, so those two sites
+//! record the miss on the spot. A residual predicate cannot overturn either
+//! verdict (it only ever rejects pairs), but it does create one further kind
+//! of miss the inline sites cannot see: a row whose verified pairs are all
+//! rejected at drain time. When a residual exists, every row is therefore
+//! also flagged as settled once its fate is known (miss recorded, or a pair
+//! kept), and whatever the batch's last drain leaves unsettled pads too.
+//! Unlike the build-side pass, none of this needs cross-worker state: a
+//! probe row's matches all surface while its own batch is probed, so each
+//! worker settles its own batches.
+//!
 //! A join with a residual predicate ([`JoinSpec::residual_filters`]) weighs
 //! the collected matches once more in the drain: the matched rows of both
 //! sides are gathered into one combined batch, the predicate evaluated over
@@ -30,29 +46,33 @@
 //! duplicate probe rows here.
 
 use crate::RECORD_BATCH_SIZE;
-use crate::arrays::accumulator::BatchAccumulator;
-use crate::memory::{MultiSlabBuffer, SlabAllocator};
+use crate::memory::MultiSlabBuffer;
 use crate::operations::Unary;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
-use crate::operations::unary::join::build::filter_null_keys;
-use crate::operations::unary::join::build_rows::{self, BuildRows};
+use crate::operations::unary::join::build::{filter_null_keys, split_null_keys};
+use crate::operations::unary::join::build_rows;
 use crate::operations::unary::join::directory::{JoinDirectory, prefetch_ptr_l2};
 use crate::operations::unary::join::keys::JoinKey;
+use crate::operations::unary::join::match_outputter::ProbeMatchOutputter;
 use crate::operations::unary::join::residual_filter::ResidualFilter;
-use crate::operations::unary::join::{JoinCell, JoinKind, JoinSpec, JoinTable, UnmatchedScan};
+use crate::operations::unary::join::{JoinKind, JoinSpec, JoinTable, UnmatchedScan};
 use ahash::RandomState;
-use arrow_array::{RecordBatch, new_null_array};
-use arrow_schema::{Field, Schema, SchemaRef};
+use arrow_array::RecordBatch;
 use std::cmp::min;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::Ordering;
 
 const RING_SIZE: usize = 64;
 const MASK: usize = RING_SIZE - 1;
 const PREFETCH_LENGTH: usize = 63;
 
-pub struct Probe<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool> {
+pub struct Probe<
+    K: JoinKey,
+    const OUTER_JOIN_BUILD_SIDE: bool,
+    const SEMI: bool,
+    const OUTER_JOIN_PROBE_SIDE: bool,
+> {
     table: JoinTable<K::Stored>,
     hash_state: RandomState,
     spec: Arc<JoinSpec>,
@@ -64,8 +84,12 @@ pub struct Probe<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool
     probing_done: bool,
 }
 
-impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool>
-    Probe<K, OUTER_JOIN_BUILD_SIDE, SEMI>
+impl<
+    K: JoinKey,
+    const OUTER_JOIN_BUILD_SIDE: bool,
+    const SEMI: bool,
+    const OUTER_JOIN_PROBE_SIDE: bool,
+> Probe<K, OUTER_JOIN_BUILD_SIDE, SEMI, OUTER_JOIN_PROBE_SIDE>
 {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -78,6 +102,8 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool>
         // (see `join_dispatch`): the first key match may fail the predicate,
         // so the first-match exit this instantiation compiles in would be wrong.
         debug_assert!(!(SEMI && spec.residual_filters.is_some()));
+        // A join is outer on one side at most (no FULL OUTER).
+        debug_assert!(!(OUTER_JOIN_BUILD_SIDE && OUTER_JOIN_PROBE_SIDE));
         let residual_filters = spec
             .residual_filters
             .as_ref()
@@ -87,6 +113,7 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool>
             &spec.build_fields,
             table.build_rows.clone(),
             residual_filters,
+            OUTER_JOIN_PROBE_SIDE,
         );
         Self {
             table,
@@ -134,7 +161,10 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool>
         if let Some(residual_filters) = &mut self.match_outputter.residual_filters {
             residual_filters.begin_probe_batch();
         }
-        let probe_window = ProbeWindow::<K, OUTER_JOIN_BUILD_SIDE, SEMI> {
+        if OUTER_JOIN_PROBE_SIDE {
+            self.match_outputter.begin_probe_outer_batch(len);
+        }
+        let probe_window = ProbeWindow::<K, OUTER_JOIN_BUILD_SIDE, SEMI, OUTER_JOIN_PROBE_SIDE> {
             keys,
             rows,
             reader,
@@ -156,12 +186,24 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool>
             matched_idx: 0,
             window: probe_window,
         }
-        .run()
+        .run()?;
+
+        // The batch is fully probed and drained, so finalize its unmatched
+        // probe rows for probe-side outer-join output.
+        if OUTER_JOIN_PROBE_SIDE {
+            self.match_outputter
+                .finish_probe_outer_batch(probe_source, sender)?;
+        }
+        Ok(())
     }
 }
 
-impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool>
-    Unary<RecordBatch, RecordBatch> for Probe<K, OUTER_JOIN_BUILD_SIDE, SEMI>
+impl<
+    K: JoinKey,
+    const OUTER_JOIN_BUILD_SIDE: bool,
+    const SEMI: bool,
+    const OUTER_JOIN_PROBE_SIDE: bool,
+> Unary<RecordBatch, RecordBatch> for Probe<K, OUTER_JOIN_BUILD_SIDE, SEMI, OUTER_JOIN_PROBE_SIDE>
 {
     fn consume(
         &mut self,
@@ -170,11 +212,34 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool>
     ) -> unary::Result<()> {
         let build_rows = unsafe { &*self.table.build_rows.get() };
         if build_rows.is_empty() {
-            // Empty build side, nothing to match
-            return Ok(());
+            if !OUTER_JOIN_PROBE_SIDE {
+                // Empty build side, nothing to match
+                return Ok(());
+            }
+            // An empty build side matches nothing, so every probe row pads.
+            let probe_source = batch.project(&self.spec.probe_output_indices)?;
+            return self
+                .match_outputter
+                .append_probe_rows_padded(&probe_source, sender);
         }
 
-        let batch = filter_null_keys(batch, &self.spec.probe_key_indices);
+        // A null-keyed probe row can never match. A probe-side outer join
+        // still owes it an output row, so it pads directly instead of being
+        // dropped with the rest of the filter.
+        // The split (and its Option local) lives entirely inside the
+        // const-gated arm, so every other kind compiles this method exactly
+        // as if the probe-side outer mode did not exist.
+        let batch = if OUTER_JOIN_PROBE_SIDE {
+            let (batch, null_keyed) = split_null_keys(batch, &self.spec.probe_key_indices);
+            if let Some(null_keyed) = null_keyed {
+                let probe_source = null_keyed.project(&self.spec.probe_output_indices)?;
+                self.match_outputter
+                    .append_probe_rows_padded(&probe_source, sender)?;
+            }
+            batch
+        } else {
+            filter_null_keys(batch, &self.spec.probe_key_indices)
+        };
         if batch.num_rows() == 0 {
             return Ok(());
         }
@@ -186,8 +251,11 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool>
     fn finish(&mut self, sender: &mut dyn Sender<RecordBatch>) -> unary::Result<bool> {
         if !self.probing_done {
             self.probing_done = true;
-            if !self.match_outputter.probe.is_empty() {
+            if self.match_outputter.has_buffered_matches() {
                 self.match_outputter.emit(sender)?;
+            }
+            if OUTER_JOIN_PROBE_SIDE {
+                self.match_outputter.emit_unmatched_probe_rows(sender)?;
             }
             if OUTER_JOIN_BUILD_SIDE {
                 self.unmatched
@@ -212,194 +280,16 @@ impl<K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI: bool>
     }
 }
 
-/// Owns the buffered matches and accumulators that produce the join's output.
-/// Probe and build columns accumulate separately because their rows come from
-/// different sources; every emitted batch splices them under one schema.
-struct ProbeMatchOutputter {
-    /// The probe columns listed in the output, then the build columns.
-    output_schema: SchemaRef,
-    probe: BatchAccumulator,
-    build: BatchAccumulator,
-    allocator: SlabAllocator,
-    build_rows: Arc<JoinCell<BuildRows>>,
-    /// Matched `(probe row, build row id)` pairs waiting to be drained. A semi
-    /// join fills only the probe indices.
-    probe_indices: Vec<u32>,
-    build_indices: Vec<u32>,
-    matched: usize,
-    /// The join's residual predicate, applied to the collected pairs at drain
-    /// time, before any pair is flagged or emitted.
-    residual_filters: Option<ResidualFilter>,
-}
-
-impl ProbeMatchOutputter {
-    fn new(
-        probe_fields: &[Field],
-        build_fields: &[Field],
-        build_rows: Arc<JoinCell<BuildRows>>,
-        residual_filters: Option<ResidualFilter>,
-    ) -> Self {
-        let mut allocator = SlabAllocator::new(false);
-        let fields: Vec<Field> = probe_fields.iter().chain(build_fields).cloned().collect();
-        Self {
-            output_schema: Arc::new(Schema::new(fields)),
-            probe: BatchAccumulator::retaining_source_buffers(
-                Arc::new(Schema::new(probe_fields.to_vec())),
-                &mut allocator,
-            ),
-            build: BatchAccumulator::retaining_source_buffers(
-                Arc::new(Schema::new(build_fields.to_vec())),
-                &mut allocator,
-            ),
-            allocator,
-            build_rows,
-            probe_indices: vec![0; RECORD_BATCH_SIZE],
-            build_indices: vec![0; RECORD_BATCH_SIZE],
-            matched: 0,
-            residual_filters,
-        }
-    }
-
-    /// Emit one combined batch from the two sides' accumulated rows.
-    fn emit(&mut self, sender: &mut dyn Sender<RecordBatch>) -> unary::Result<()> {
-        let probe_part = self.probe.take_batch(&mut self.allocator)?;
-        let build_part = self.build.take_batch(&mut self.allocator)?;
-        let columns = probe_part
-            .columns()
-            .iter()
-            .chain(build_part.columns())
-            .cloned()
-            .collect();
-        let options =
-            arrow_array::RecordBatchOptions::new().with_row_count(Some(probe_part.num_rows()));
-        sender.send(RecordBatch::try_new_with_options(
-            self.output_schema.clone(),
-            columns,
-            &options,
-        )?)?;
-        Ok(())
-    }
-
-    /// Emit one batch of build rows that matched nothing: the accumulated build
-    /// columns, and an all-null column of the right shape for each probe column.
-    fn emit_unmatched_build_rows(
-        &mut self,
-        sender: &mut dyn Sender<RecordBatch>,
-    ) -> unary::Result<()> {
-        if self.build.is_empty() {
-            return Ok(());
-        }
-        let build_part = self.build.take_batch(&mut self.allocator)?;
-        let rows = build_part.num_rows();
-        let columns = self
-            .probe
-            .schema()
-            .fields()
-            .iter()
-            .map(|field| new_null_array(field.data_type(), rows))
-            .chain(build_part.columns().iter().cloned())
-            .collect();
-        let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(rows));
-        sender.send(RecordBatch::try_new_with_options(
-            self.output_schema.clone(),
-            columns,
-            &options,
-        )?)?;
-        Ok(())
-    }
-
-    fn append_unmatched_build_rows(
-        &mut self,
-        batch: &RecordBatch,
-        first_row_id: usize,
-        sender: &mut dyn Sender<RecordBatch>,
-    ) -> unary::Result<()> {
-        let build_rows = unsafe { &*self.build_rows.get() };
-        let mut found = 0;
-        for row in 0..batch.num_rows() {
-            // Branchless, as in the match collector: write the row and keep it
-            // only if its flag is still clear. A stored batch holds at most
-            // one output batch's worth of rows, so a pass never overfills the
-            // accumulator.
-            self.build_indices[found] = row as u32;
-            found += (build_rows.matched[first_row_id + row] == 0) as usize;
-        }
-        if found > 0 {
-            self.build.append_batch_by_indices(
-                batch,
-                &self.build_indices[..found],
-                &mut self.allocator,
-            );
-        }
-        if self.build.has_full_batch() {
-            self.emit_unmatched_build_rows(sender)?;
-        }
-        Ok(())
-    }
-
-    /// Append the collected pairs to the output accumulators, emitting if a
-    /// full batch accumulated.
-    #[inline(never)]
-    fn drain<const OUTER_JOIN_BUILD_SIDE: bool, const SEMI_PROBE_SIDE: bool>(
-        &mut self,
-        probe_source: &RecordBatch,
-        probe_batch: &RecordBatch,
-        sender: &mut dyn Sender<RecordBatch>,
-    ) -> unary::Result<()> {
-        if self.matched == 0 {
-            return Ok(());
-        }
-        let build_rows = unsafe { &*self.build_rows.get() };
-        // The residual runs first: a pair it rejects is not a match, so it
-        // must neither flag its build row nor reach the output.
-        if let Some(residual_filters) = &mut self.residual_filters {
-            self.matched = residual_filters.filter_combined_batch(
-                probe_batch,
-                &build_rows.batches,
-                &mut self.probe_indices,
-                &mut self.build_indices,
-                self.matched,
-            )?;
-            if self.matched == 0 {
-                return Ok(());
-            }
-        }
-        if OUTER_JOIN_BUILD_SIDE {
-            // These indices are the verified matches, so flagging them here
-            // keeps the match loop itself untouched. Relaxed because the flags
-            // are only read after a barrier that orders them, and atomic only
-            // because peer workers write the same bytes concurrently.
-            for &row in &self.build_indices[..self.matched] {
-                let flag = build_rows.matched.ptr_at_index(row as usize);
-                unsafe { AtomicU8::from_ptr(flag) }.store(1, Ordering::Relaxed);
-            }
-        }
-        self.probe.append_batch_by_indices(
-            probe_source,
-            &self.probe_indices[..self.matched],
-            &mut self.allocator,
-        );
-        // A semi join has no build columns and buffered no build rows: its
-        // build side only ever contributes its (empty) column list on emit.
-        if !SEMI_PROBE_SIDE {
-            self.build.append_from_batches(
-                &build_rows.output_columns,
-                build_rows::row_id_shift(),
-                &self.build_indices[..self.matched],
-                &mut self.allocator,
-            );
-        }
-        self.matched = 0;
-        if self.probe.has_full_batch() {
-            self.emit(sender)?;
-        }
-        Ok(())
-    }
-}
-
 /// The per-batch inputs borrowed while the persistent collector records and
 /// emits matches.
-struct ProbeWindow<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> {
+struct ProbeWindow<
+    'a,
+    'b,
+    K: JoinKey,
+    const BUILD_OUTER: bool,
+    const SEMI: bool,
+    const OUTER_JOIN_PROBE_SIDE: bool,
+> {
     keys: &'a MultiSlabBuffer<K::Stored>,
     rows: &'a MultiSlabBuffer<u32>,
     reader: K::Reader<'b>,
@@ -412,16 +302,23 @@ struct ProbeWindow<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool
     sender: &'a mut dyn Sender<RecordBatch>,
 }
 
-impl<'a, 'b, K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI_PROBE_SIDE: bool>
-    ProbeWindow<'a, 'b, K, OUTER_JOIN_BUILD_SIDE, SEMI_PROBE_SIDE>
+impl<
+    'a,
+    'b,
+    K: JoinKey,
+    const OUTER_JOIN_BUILD_SIDE: bool,
+    const SEMI_PROBE_SIDE: bool,
+    const OUTER_JOIN_PROBE_SIDE: bool,
+> ProbeWindow<'a, 'b, K, OUTER_JOIN_BUILD_SIDE, SEMI_PROBE_SIDE, OUTER_JOIN_PROBE_SIDE>
 {
     #[inline(never)]
     fn drain(&mut self) -> unary::Result<()> {
-        self.output.drain::<OUTER_JOIN_BUILD_SIDE, SEMI_PROBE_SIDE>(
-            self.probe_source,
-            self.probe_batch,
-            self.sender,
-        )
+        self.output
+            .drain::<OUTER_JOIN_BUILD_SIDE, SEMI_PROBE_SIDE, OUTER_JOIN_PROBE_SIDE>(
+                self.probe_source,
+                self.probe_batch,
+                self.sender,
+            )
     }
 
     /// Record what probe row `probe_row` matches among the arena range
@@ -435,6 +332,7 @@ impl<'a, 'b, K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI_PROBE_SID
         probe_row: usize,
         probe_key: K::Stored,
     ) -> unary::Result<()> {
+        let mut row_matched_any = false;
         for key_index in keys_start..keys_end {
             let output_idx = self.output.matched;
             debug_assert!(output_idx < self.output.probe_indices.len());
@@ -445,6 +343,11 @@ impl<'a, 'b, K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI_PROBE_SID
                     probe_row,
                     self.rows[key_index],
                 );
+            // Const-gated so the other kinds' candidate loop compiles exactly
+            // as it did before this tracking existed.
+            if OUTER_JOIN_PROBE_SIDE {
+                row_matched_any |= key_matches;
+            }
 
             if SEMI_PROBE_SIDE {
                 // If we're in a semijoin on probe side, we need to exit on first match (since a
@@ -475,6 +378,12 @@ impl<'a, 'b, K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI_PROBE_SID
                 }
             }
         }
+        // The range held only false candidates (the bloom tag or the hash
+        // slot collided), so this row misses: a residual only ever rejects
+        // pairs, and there is no pair here for it to judge.
+        if OUTER_JOIN_PROBE_SIDE && !row_matched_any {
+            self.output.record_missed_probe_row(probe_row);
+        }
         Ok(())
     }
 }
@@ -482,7 +391,14 @@ impl<'a, 'b, K: JoinKey, const OUTER_JOIN_BUILD_SIDE: bool, const SEMI_PROBE_SID
 /// The prefetch-pipelined probe: hashes ahead, bloom-filters into a ring of
 /// matched directory slots, prefetches their arena ranges, then drains matches
 /// a window behind — keeping many independent loads in flight.
-struct ProbeArray<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> {
+struct ProbeArray<
+    'a,
+    'b,
+    K: JoinKey,
+    const BUILD_OUTER: bool,
+    const SEMI: bool,
+    const OUTER_JOIN_PROBE_SIDE: bool,
+> {
     row_idx: usize,
     /// The probed window's row count.
     len: usize,
@@ -499,11 +415,17 @@ struct ProbeArray<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
     matched_size: [usize; 2],
     matched_idx: usize,
 
-    window: ProbeWindow<'a, 'b, K, BUILD_OUTER, SEMI>,
+    window: ProbeWindow<'a, 'b, K, BUILD_OUTER, SEMI, OUTER_JOIN_PROBE_SIDE>,
 }
 
-impl<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
-    ProbeArray<'a, 'b, K, BUILD_OUTER, SEMI>
+impl<
+    'a,
+    'b,
+    K: JoinKey,
+    const BUILD_OUTER: bool,
+    const SEMI: bool,
+    const OUTER_JOIN_PROBE_SIDE: bool,
+> ProbeArray<'a, 'b, K, BUILD_OUTER, SEMI, OUTER_JOIN_PROBE_SIDE>
 {
     #[inline(always)]
     pub fn generate_matched_slots<const HASH: bool>(&mut self, length: usize) {
@@ -541,6 +463,12 @@ impl<'a, 'b, K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>
                 prefetch_ptr_l2(self.directory.ptr_for_slot(slot + 1) as *const u8);
                 next_matched_slots[size & MASK] = (slot, row_idx);
                 size += 1;
+            } else if OUTER_JOIN_PROBE_SIDE {
+                // A probe-side outer join learns most of its misses right
+                // here: a row the bloom check rejects has no candidates in
+                // the directory at all. The else arm costs the loop no extra
+                // comparison.
+                self.window.output.record_missed_probe_row(row_idx);
             }
 
             row_idx += 1;
