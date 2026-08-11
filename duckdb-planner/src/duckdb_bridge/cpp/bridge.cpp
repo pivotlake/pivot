@@ -19,6 +19,7 @@
 #include "duckdb/planner/operator/logical_create.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
+#include "duckdb/planner/operator/logical_delim_get.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
 #include "duckdb/planner/operator/logical_set.hpp"
@@ -948,6 +949,36 @@ size_t lo_join_right_projection_map_count(const LogicalOperator &op) {
 
 size_t lo_join_right_projection_map_index(const LogicalOperator &op, size_t index) {
 	return as<duckdb::LogicalComparisonJoin>(op).right_projection_map[index];
+}
+
+// ---- DelimJoin / DelimGet ----
+
+// A delim join is stored as a LogicalComparisonJoin whose operator type is
+// LOGICAL_DELIM_JOIN, so the general join accessors above work on it too.
+// These read the delim-specific fields.
+
+// The expressions (over the de-duplicated side's output) whose distinct values
+// every DELIM_GET under the other side scans.
+size_t lo_delim_join_column_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalComparisonJoin>(op).duplicate_eliminated_columns.size();
+}
+
+const Expression &lo_delim_join_column(const LogicalOperator &op, size_t index) {
+	return *as<duckdb::LogicalComparisonJoin>(op).duplicate_eliminated_columns[index];
+}
+
+// False: the LHS is de-duplicated and the DELIM_GETs sit under the RHS.
+// True: the join was flipped and the roles reverse.
+bool lo_delim_join_is_flipped(const LogicalOperator &op) {
+	return as<duckdb::LogicalComparisonJoin>(op).delim_flipped;
+}
+
+size_t lo_delim_get_column_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalDelimGet>(op).chunk_types.size();
+}
+
+BridgeLogicalType lo_delim_get_column_type(const LogicalOperator &op, size_t index) {
+	return bridge_logical_type(as<duckdb::LogicalDelimGet>(op).chunk_types[index]);
 }
 
 // ---- ExpressionList ----
