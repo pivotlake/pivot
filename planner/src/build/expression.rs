@@ -24,7 +24,7 @@ use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Conjunction,
     ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide, Error,
     Expression, Function, InList, IntervalArithmetic, IsNull, Length, Like, MaybeError, Not,
-    NumericAggregate, Prefix, Ref, RegexpFullMatch, RegexpJitReplace, RegexpReplace,
+    NumericAggregate, Prefix, Ref, RegexpFullMatch, RegexpJitReplace, RegexpReplace, Suffix,
     TemporalConvert, VariantGet,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
@@ -330,8 +330,10 @@ impl Function {
         let name = func.name()?;
         match name.as_str() {
             "contains" => Ok(Function::Contains(Contains::from_handle(func)?)),
-            // DuckDB's optimizer rewrites `LIKE 'foo%'` into `prefix(col, 'foo')`.
+            // DuckDB's optimizer rewrites `LIKE 'foo%'` into `prefix(col, 'foo')`
+            // and `LIKE '%foo'` into `suffix(col, 'foo')`.
             "prefix" => Ok(Function::Prefix(Prefix::from_handle(func)?)),
+            "suffix" => Ok(Function::Suffix(Suffix::from_handle(func)?)),
             // The patterns that same optimizer leaves alone stay `LIKE` calls:
             // `~~` is the operator's function name, `!~~` the negated form.
             "~~" => Ok(Function::Like(Like::from_handle(func, false)?)),
@@ -438,6 +440,16 @@ impl Prefix {
         Ok(Prefix {
             haystack: Box::new(Expression::from_handle(params[0])?),
             prefix: Box::new(Expression::from_handle(params[1])?),
+        })
+    }
+}
+
+impl Suffix {
+    pub(crate) fn from_handle(func: FunctionHandle<'_>) -> Result<Suffix, Error> {
+        let params = function_args(func, 2)?;
+        Ok(Suffix {
+            haystack: Box::new(Expression::from_handle(params[0])?),
+            suffix: Box::new(Expression::from_handle(params[1])?),
         })
     }
 }

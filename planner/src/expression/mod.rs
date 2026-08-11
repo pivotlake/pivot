@@ -33,6 +33,7 @@ mod prefix;
 mod reference;
 mod regexp;
 mod regexp_jit;
+mod suffix;
 mod variant_get;
 
 pub use aggregate::{AggregateFunc, CountStar, NumericAggregate};
@@ -60,6 +61,7 @@ pub use prefix::Prefix;
 pub use reference::Ref;
 pub use regexp::{RegexpFullMatch, RegexpReplace};
 pub use regexp_jit::RegexpJitReplace;
+pub use suffix::Suffix;
 pub use variant_get::{JsonPath, VariantGet};
 
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};

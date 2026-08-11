@@ -3,7 +3,7 @@
 
 use super::{
     Arithmetic, Contains, DatePart, DateTrunc, Divide, IntervalArithmetic, Length, Like, Prefix,
-    RegexpFullMatch, RegexpJitReplace, RegexpReplace, TemporalConvert, VariantGet,
+    RegexpFullMatch, RegexpJitReplace, RegexpReplace, Suffix, TemporalConvert, VariantGet,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::expression::Expression;
@@ -69,6 +69,7 @@ pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
 pub enum Function {
     Contains(Contains),
     Prefix(Prefix),
+    Suffix(Suffix),
     /// `LIKE` / `NOT LIKE` against a constant pattern, for the patterns DuckDB's
     /// optimizer leaves alone (several wildcards, or a `_`).
     Like(Like),
@@ -116,6 +117,10 @@ impl Function {
                 visit(&p.haystack);
                 visit(&p.prefix);
             }
+            Function::Suffix(s) => {
+                visit(&s.haystack);
+                visit(&s.suffix);
+            }
             Function::Like(l) => visit(&l.input),
             Function::Arithmetic(a) => {
                 visit(&a.left);
@@ -145,6 +150,7 @@ impl Display for Function {
         match self {
             Function::Contains(c) => write!(f, "{c}"),
             Function::Prefix(p) => write!(f, "{p}"),
+            Function::Suffix(s) => write!(f, "{s}"),
             Function::Like(l) => write!(f, "{l}"),
             Function::Arithmetic(a) => write!(f, "{a}"),
             Function::Length(l) => write!(f, "{l}"),
@@ -170,6 +176,7 @@ impl Function {
             // The string matchers yield booleans.
             Function::Contains(_)
             | Function::Prefix(_)
+            | Function::Suffix(_)
             | Function::Like(_)
             | Function::RegexpFullMatch(_) => Type::Boolean,
             // Arithmetic and the extractors carry DuckDB's bound result type.
@@ -198,6 +205,7 @@ impl Function {
         match self {
             Function::Contains(c) => c.compile(),
             Function::Prefix(p) => p.compile(),
+            Function::Suffix(s) => s.compile(),
             Function::Like(l) => l.compile(),
             Function::Arithmetic(a) => a.compile(),
             Function::Length(l) => l.compile(),

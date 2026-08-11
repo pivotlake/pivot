@@ -80,6 +80,10 @@ pub enum Error {
     },
     #[error("Unsupported haystack expression for prefix: {0:?}")]
     UnsupportedExpressionForPrefixHaystack(Expression),
+    #[error("Unsupported pattern expression for suffix: {0:?}")]
+    UnsupportedExpressionForSuffixPattern(Expression),
+    #[error("Unsupported haystack expression for suffix: {0:?}")]
+    UnsupportedExpressionForSuffixHaystack(Expression),
     #[error("Failed to downcast scalar into string: {0:?}")]
     FailedToDowncastScalarIntoString(Scalar<ArrayRef>),
     #[error("Invalid regex pattern '{pattern}': {source}")]
