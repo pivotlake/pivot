@@ -449,6 +449,146 @@ fn a_semi_join_spanning_batches_emits_each_matched_probe_row_once() {
     assert_eq!(ids, probe_ids);
 }
 
+/// A probe-side anti join keyed on column 0 of both sides, emitting the listed
+/// probe columns for every probe row nothing matched, and no build column.
+fn probe_anti_join(probe_columns: Vec<usize>) -> JoinSpec {
+    let probe_fields = int64_fields(probe_columns.len());
+    JoinSpec {
+        probe_key_indices: vec![0],
+        build_key_indices: vec![0],
+        probe_output_indices: probe_columns,
+        build_output_indices: Vec::new(),
+        probe_fields,
+        build_fields: Vec::new(),
+        kind: JoinKind::ProbeAnti,
+        residual_filters: None,
+    }
+}
+
+#[test]
+fn probe_anti_join_emits_only_the_probe_rows_without_a_match() {
+    let d = dispatch(1);
+    let build = values_input(&d, vec![int64_batch("id", &[10, 10, 20])]).record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &[10, 20, 99])]).record_batches();
+
+    let results = probe
+        .join(build, &[DataType::Int64], probe_anti_join(vec![0]))
+        .collect()
+        .unwrap();
+
+    // Key 10 sits in the build side twice and still keeps its probe row out;
+    // only 99 is in neither side.
+    assert_eq!(collect_i64s(&results, 0), vec![99]);
+    assert!(results.iter().all(|batch| batch.num_columns() == 1));
+}
+
+#[test]
+fn probe_anti_join_keeps_every_copy_of_an_unmatched_probe_row() {
+    let d = dispatch(1);
+    let build = values_input(&d, vec![int64_batch("id", &[10])]).record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &[99, 99, 10])]).record_batches();
+
+    let results = probe
+        .join(build, &[DataType::Int64], probe_anti_join(vec![0]))
+        .collect()
+        .unwrap();
+
+    assert_eq!(collect_i64s(&results, 0), vec![99, 99]);
+}
+
+#[test]
+fn probe_anti_join_carries_the_probe_columns_it_lists() {
+    let d = dispatch(1);
+    let build = values_input(&d, vec![int64_batch("id", &[20])]).record_batches();
+    let probe = values_input(
+        &d,
+        vec![two_int64_batch(("id", "payload"), &[10, 20], &[100, 200])],
+    )
+    .record_batches();
+
+    let results = probe
+        .join(build, &[DataType::Int64], probe_anti_join(vec![1]))
+        .collect()
+        .unwrap();
+
+    assert_eq!(collect_i64s(&results, 0), vec![100]);
+}
+
+#[test]
+fn probe_anti_join_over_an_empty_build_side_emits_every_probe_row() {
+    let d = dispatch(1);
+    let build = values_input(&d, vec![int64_batch("id", &[])]).record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &[10, 20])]).record_batches();
+
+    let results = probe
+        .join(build, &[DataType::Int64], probe_anti_join(vec![0]))
+        .collect()
+        .unwrap();
+
+    assert_eq!(collect_i64s(&results, 0), vec![10, 20]);
+}
+
+#[test]
+fn probe_anti_join_emits_a_null_keyed_probe_row() {
+    let d = dispatch(1);
+    let nullable = |values: Vec<Option<i64>>| {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(values))],
+        )
+        .unwrap()
+    };
+    let build = values_input(&d, vec![nullable(vec![Some(10), None])]).record_batches();
+    let probe = values_input(&d, vec![nullable(vec![None, Some(10), Some(30)])]).record_batches();
+
+    // The null-keyed probe row reaches the output, so the output field must
+    // admit nulls.
+    let mut spec = probe_anti_join(vec![0]);
+    spec.probe_fields = vec![Field::new("f0", DataType::Int64, true)];
+    let results = probe
+        .join(build, &[DataType::Int64], spec)
+        .collect()
+        .unwrap();
+
+    // A null key matches nothing, not even the build side's null: the null
+    // probe row and 30 come out, 10 stays in.
+    let mut ids: Vec<Option<i64>> = results
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec![None, Some(30)]);
+}
+
+#[test]
+fn an_anti_join_spanning_batches_emits_each_unmatched_probe_row_once() {
+    let d = dispatch(4);
+    // Every third key three times over on the build side, so the other two
+    // thirds of the probe rows are the anti output.
+    let build_ids: Vec<i64> = (0..30_000).step_by(3).flat_map(|id| [id, id, id]).collect();
+    let probe_ids: Vec<i64> = (0..30_000).collect();
+    let build = values_input(&d, vec![int64_batch("id", &build_ids)]).record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &probe_ids)]).record_batches();
+
+    let results = probe
+        .join(build, &[DataType::Int64], probe_anti_join(vec![0]))
+        .collect()
+        .unwrap();
+
+    let mut ids = collect_i64s(&results, 0);
+    ids.sort();
+    let expected: Vec<i64> = (0..30_000).filter(|id| id % 3 != 0).collect();
+    assert_eq!(ids, expected);
+}
+
 #[test]
 fn join_on_two_key_columns_needs_both_to_match() {
     let d = dispatch(1);
