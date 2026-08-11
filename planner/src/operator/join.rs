@@ -23,7 +23,7 @@ use crate::types::{Type, physical_arrow_type};
 use arrow_array::{Array, BooleanArray, RecordBatch};
 use arrow_schema::Field;
 use dispatch::JoinKind as DispatchJoinKind;
-use dispatch::{JoinResidual, JoinSpec, RecordBatchOperatorSpec};
+use dispatch::{JoinResidual, JoinSpec, RangeCompare, RangeJoinSpec, RecordBatchOperatorSpec};
 use std::fmt;
 use std::sync::Arc;
 
@@ -38,6 +38,11 @@ pub enum JoinKind {
     /// One output row per probe row the build side holds the key of, and no
     /// build columns (see [`Join::build_output`]).
     ProbeSemi,
+    /// Inner join on one `<`/`<=`/`>`/`>=` comparison (`probe key OP build
+    /// key`) instead of equalities: the build side is sorted by key and each
+    /// probe row matches a contiguous run of it. Always a single condition,
+    /// so `probe_keys`/`build_keys`/`key_types` hold exactly one entry.
+    Range(RangeCompare),
 }
 
 /// Hash equi-join on one or more key columns per side, one per equality
@@ -84,6 +89,10 @@ impl fmt::Display for Join {
             JoinKind::Inner => "Join",
             JoinKind::BuildOuter => "Join[build outer]",
             JoinKind::ProbeSemi => "Join[probe semi]",
+            JoinKind::Range(RangeCompare::Less) => "Join[range <]",
+            JoinKind::Range(RangeCompare::LessEq) => "Join[range <=]",
+            JoinKind::Range(RangeCompare::Greater) => "Join[range >]",
+            JoinKind::Range(RangeCompare::GreaterEq) => "Join[range >=]",
         };
         write!(
             f,
@@ -109,11 +118,6 @@ impl Join {
         probe: RecordBatchOperatorSpec,
         build: RecordBatchOperatorSpec,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        let kind = match &self.kind {
-            JoinKind::Inner => DispatchJoinKind::Inner,
-            JoinKind::BuildOuter => DispatchJoinKind::BuildOuter,
-            JoinKind::ProbeSemi => DispatchJoinKind::ProbeSemi,
-        };
         // Both sides' output fields, named by position: an outer join
         // synthesizes NULL probe values, so field names and nullability are
         // the join's to pick rather than any input column's, and every kind
@@ -143,6 +147,24 @@ impl Join {
                 )
             })
             .collect();
+        if let JoinKind::Range(compare) = self.kind {
+            let spec = RangeJoinSpec {
+                probe_key_index: self.probe_keys[0],
+                build_key_index: self.build_keys[0],
+                compare,
+                probe_output_indices: self.probe_output.clone(),
+                build_output_indices: self.build_output.clone(),
+                probe_fields,
+                build_fields,
+            };
+            return Ok(probe.range_join(build, &physical_arrow_type(&self.key_types[0]), spec));
+        }
+        let kind = match &self.kind {
+            JoinKind::Inner => DispatchJoinKind::Inner,
+            JoinKind::BuildOuter => DispatchJoinKind::BuildOuter,
+            JoinKind::ProbeSemi => DispatchJoinKind::ProbeSemi,
+            JoinKind::Range(_) => unreachable!("compiled above"),
+        };
         let spec = JoinSpec {
             probe_key_indices: self.probe_keys.clone(),
             build_key_indices: self.build_keys.clone(),
