@@ -258,7 +258,6 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
         count_only: bool,
         gather: Arc<GatherBarrier<AggregatedTableOutput<K, V>>>,
         partition_jobs_injected: Arc<AtomicBool>,
-        zero_hash_pending: Arc<AtomicBool>,
         radix: RadixConfig,
     ) -> Self {
         let shared_context = <V::SharedContext as SharedContext>::build(&value_slots, &value_arena);
@@ -292,12 +291,12 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
                 node: current_node(),
                 injectors,
                 partition_jobs_injected,
-                zero_hash_pending,
                 key_config,
                 shared_context,
                 value_output_types,
                 output_limit,
                 count_only,
+                zero_hash_pending: false,
                 output_allocator: None,
                 output_accumulator: None,
             },
@@ -327,9 +326,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Consumer<RecordBatch, Record
         Ok(())
     }
 
-    fn into_outputter(self) -> unary::Result<Option<Self::Outputter>> {
+    fn into_outputter(mut self) -> unary::Result<Option<Self::Outputter>> {
         let tables = self.aggregated_table.flush();
-        let _ = self.gather.arrive(tables, |values| {
+        self.gather.arrive(tables, |values| {
             self.outputter.create_partition_jobs(values)
         });
         Ok(Some(self.outputter))
@@ -353,7 +352,6 @@ pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// This worker's node, i.e. which of `injectors` is local to it.
     node: usize,
     partition_jobs_injected: Arc<AtomicBool>,
-    zero_hash_pending: Arc<AtomicBool>,
     key_config: K::Config,
     /// The value's shared context, threaded into each [`PartitionJob`] so the merge
     /// folds existing entries via [`AggregationValue::merge_from`] and the output
@@ -368,6 +366,9 @@ pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// Global `COUNT(DISTINCT)`: emit each partition's distinct-key count instead
     /// of its keys (a downstream `SUM` totals them).
     count_only: bool,
+    /// The final gather arrival saw the hash-only extractor's out-of-band zero
+    /// hash and must emit its extra count row once.
+    zero_hash_pending: bool,
     /// One allocator per worker for the output columns of every partition this
     /// worker handles, so small per-partition outputs pack into shared buffers
     /// instead of each grabbing a fresh 2MB one. Created lazily on the first job.
@@ -539,16 +540,15 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
 impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
     /// Combine every worker's gathered tables, size the merge from the merged
     /// distinct estimate, and publish one [`PartitionJob`] per merge partition to
-    /// the shared injector (plus, for `COUNT(DISTINCT)`, the out-of-band 0-hash count
-    /// row). Run exactly once, by the last worker to reach the gather barrier.
-    fn create_partition_jobs(&self, outputs: Vec<AggregatedTableOutput<K, V>>) {
+    /// the shared injector. Run exactly once, by the last worker to reach the
+    /// gather barrier.
+    fn create_partition_jobs(&mut self, outputs: Vec<AggregatedTableOutput<K, V>>) {
         let node_count = self.injectors.len();
         let mut tables_by_node: Vec<Vec<MultiSlabTable<K::Persisted, V>>> =
             (0..node_count).map(|_| Vec::new()).collect();
         let mut buffers_by_node: Vec<Vec<PartitionBuffers<K::Persisted, V>>> =
             (0..node_count).map(|_| Vec::new()).collect();
         let mut hll = Hll::new();
-        let mut zero_hash_seen = false;
         // A worker only folds its keys into the sketch once it switches to
         // radix; a worker that stayed in-place (`buffers.is_none()`) is absent
         // from the merged HLL. Add its exact distinct count (each table tracks
@@ -568,7 +568,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
                 buffers_by_node[out.node].push(b);
             }
             hll.merge(&out.hll);
-            zero_hash_seen |= out.zero_hash_seen;
+            self.zero_hash_pending |= out.zero_hash_seen;
         }
         let any_switched = buffers_by_node.iter().any(|b| !b.is_empty());
         let partition_floor = merge_partition_floor(contributing_workers);
@@ -739,15 +739,6 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // the flag also sees every job pushed above it. With relaxed ordering
         // another core may observe the flag before the pushes and conclude
         // from a still-empty queue that the merge phase is over.
-        // Exact COUNT(DISTINCT): the keys-only consume excluded the single
-        // key whose bijective hash is 0 (it collides with the empty sentinel)
-        // and flagged it instead. Emit it now as one extra count row so the
-        // downstream SUM includes it. One outputter claims this after the
-        // gather barrier completes.
-        if self.count_only && zero_hash_seen {
-            self.zero_hash_pending.store(true, Ordering::Relaxed);
-        }
-
         self.partition_jobs_injected.store(true, Ordering::Release);
     }
 }
@@ -756,7 +747,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Outputter<RecordBatch>
     for GroupOutputter<K, V>
 {
     fn output(&mut self, sender: &mut dyn Sender<RecordBatch>) -> unary::Result<bool> {
-        if self.zero_hash_pending.swap(false, Ordering::AcqRel) {
+        if self.zero_hash_pending && self.count_only {
+            self.zero_hash_pending = false;
             output::emit_count(1, sender).map_err(unary::Error::from)?;
         }
 
@@ -926,7 +918,6 @@ mod tests {
         let state = RandomState::new();
         let injector = Arc::new(vec![Injector::new()]);
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));
-        let zero_hash_pending = Arc::new(AtomicBool::new(false));
         let gather = Arc::new(GatherBarrier::new(worker_count));
 
         let groups: Vec<_> = (0..worker_count)
@@ -943,7 +934,6 @@ mod tests {
                     false,
                     gather.clone(),
                     partition_jobs_injected.clone(),
-                    zero_hash_pending.clone(),
                     radix,
                 )
             })
@@ -1261,7 +1251,6 @@ mod tests {
         let state = RandomState::new();
         let injector = Arc::new(vec![Injector::new()]);
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));
-        let zero_hash_pending = Arc::new(AtomicBool::new(false));
         let gather = Arc::new(GatherBarrier::new(worker_count));
         let groups: Vec<_> = (0..worker_count)
             .map(|_| {
@@ -1277,7 +1266,6 @@ mod tests {
                     false,
                     gather.clone(),
                     partition_jobs_injected.clone(),
-                    zero_hash_pending.clone(),
                     radix,
                 )
             })
