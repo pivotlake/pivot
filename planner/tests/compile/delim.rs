@@ -230,21 +230,61 @@ fn null_correlation_key_pads_instead_of_matching(mut testing_planner: TestingPla
     );
 }
 
-/// NOT EXISTS decorrelates into an ANTI delim join, which is not translated
-/// yet; it must fail with a clear error rather than run something wrong.
+/// The NOT EXISTS mirror of the q04 shape: DuckDB decorrelates it into an
+/// ANTI delim join, which keeps a probing row only when no subquery answer
+/// exists. Part 1 has a sale above 35, part 2 does not, part 3 is filtered.
 #[rstest]
-fn anti_delim_join_reports_unsupported(mut testing_planner: TestingPlanner) {
+fn filtered_not_exists_runs_as_an_anti_delim_join(mut testing_planner: TestingPlanner) {
     add_parts_and_sales(&testing_planner);
 
-    let error = testing_planner
-        .plan(
-            "SELECT p_key FROM parts WHERE p_flag = 'a' \
-               AND NOT EXISTS (SELECT 1 FROM sales WHERE s_part = p_key AND s_qty > 35)",
-        )
-        .unwrap_err();
+    let rows = run(
+        &mut testing_planner,
+        "SELECT p_key FROM parts WHERE p_flag = 'a' \
+           AND NOT EXISTS (SELECT 1 FROM sales WHERE s_part = p_key AND s_qty > 35)",
+    );
 
-    assert!(
-        error.to_string().contains("delim join"),
-        "unexpected error: {error}"
+    assert_eq!(
+        rows,
+        serde_json::json!([{"p_key": 2}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
+/// An outer row whose correlation column is NULL finds no subquery answer
+/// (its correlated equality compares against NULL), and NOT EXISTS over an
+/// empty subquery holds, so the ANTI delim join must keep the row.
+#[rstest]
+fn null_correlation_key_survives_a_not_exists(mut testing_planner: TestingPlanner) {
+    add_parts_and_sales(&testing_planner);
+    testing_planner.add_table(
+        "nparts",
+        &[
+            ("np_key", Type::Int64, int64_col(vec![1, 2, 3, 4])),
+            (
+                "np_region",
+                Type::Int64,
+                Arc::new(Int64Array::from(vec![Some(10), Some(20), None, Some(10)])),
+            ),
+            ("np_flag", Type::Utf8, str_col(vec!["a", "a", "a", "b"])),
+        ],
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT np_key FROM nparts WHERE np_flag = 'a' \
+           AND NOT EXISTS (SELECT 1 FROM sales WHERE s_region = np_region AND s_qty > 25) \
+         ORDER BY np_key",
+    );
+
+    // Regions 10 and 20 both hold a sale above 25, so only the NULL-region
+    // part survives.
+    assert_eq!(
+        rows,
+        serde_json::json!([{"np_key": 3}])
+            .as_array()
+            .unwrap()
+            .clone()
     );
 }

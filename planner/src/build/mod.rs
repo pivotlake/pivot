@@ -846,7 +846,7 @@ fn build_delim_get_scan(
 /// hash table from, and the outer rows probe it. LEFT preserves the outer
 /// rows through [`JoinKind::ProbeOuter`], which pads an unmatched probe row
 /// with NULL build columns; SEMI keeps a probing row only when an answer
-/// exists.
+/// exists, and ANTI (a decorrelated `NOT EXISTS`) only when none does.
 ///
 /// DuckDB may express the final delim-join condition as `IS NOT DISTINCT FROM`
 /// because the distinct key set can contain NULL. For the supported shapes,
@@ -854,7 +854,9 @@ fn build_delim_get_scan(
 /// predicate against the key set; that equality does not produce a subquery
 /// key for NULL. We can therefore use plain equality here: non-NULL keys behave
 /// identically, while a NULL-keyed outer row remains unmatched and is padded
-/// for LEFT or discarded for SEMI/INNER, matching DuckDB's result.
+/// for LEFT, discarded for SEMI/INNER, and kept for ANTI, matching DuckDB's
+/// result (a `NOT EXISTS` whose correlated equality compares against NULL
+/// finds no row, so it holds).
 fn build_delim_join(
     op: LogicalOp<'_>,
     delim: DelimJoinView<'_>,
@@ -989,11 +991,12 @@ fn build_delim_join(
     // Every kind keeps the natural orientation: the outer side probes the
     // subquery side's (small, one row per distinct key) answer table. LEFT
     // preserves the outer side through the probe-side outer mode, and a semi
-    // join emits no build column at all (see `build_join`).
+    // or anti join emits no build column at all (see `build_join`).
     let (kind, build_output, build_column_types) = match join.join_type()? {
         JoinType::LEFT => (JoinKind::ProbeOuter, subquery_output, subquery_column_types),
         JoinType::INNER => (JoinKind::Inner, subquery_output, subquery_column_types),
         JoinType::SEMI => (JoinKind::ProbeSemi, Vec::new(), Vec::new()),
+        JoinType::ANTI => (JoinKind::ProbeAnti, Vec::new(), Vec::new()),
         other => {
             return Err(OperatorError::Unsupported(format!(
                 "Unsupported delim join type: {other:?}"
