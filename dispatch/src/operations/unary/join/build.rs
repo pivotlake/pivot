@@ -109,6 +109,25 @@ pub(crate) fn filter_null_keys(batch: RecordBatch, key_columns: &[usize]) -> Rec
     filter_record_batch(&batch, &mask).expect("null-key filter mask matches batch length")
 }
 
+/// Split a probe batch into its rows with fully non-null keys and, when any
+/// exist, the null-keyed rest. A probe-side outer join keeps the rest: those
+/// rows can never match, but they still reach the output null-padded.
+pub(crate) fn split_null_keys(
+    batch: RecordBatch,
+    key_columns: &[usize],
+) -> (RecordBatch, Option<RecordBatch>) {
+    let Some(combined_validity) = combined_key_validity(&batch, key_columns) else {
+        return (batch, None);
+    };
+    let keep = BooleanArray::new(combined_validity.inner().clone(), None);
+    let drop = arrow::compute::not(&keep).expect("a validity mask negates");
+    let kept =
+        filter_record_batch(&batch, &keep).expect("null-key filter mask matches batch length");
+    let dropped =
+        filter_record_batch(&batch, &drop).expect("null-key filter mask matches batch length");
+    (kept, (dropped.num_rows() > 0).then_some(dropped))
+}
+
 impl<K: JoinKey, const BUILD_OUTER: bool> Consumer<RecordBatch, ()>
     for JoinBuildConsumer<K, BUILD_OUTER>
 {

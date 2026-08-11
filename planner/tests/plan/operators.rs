@@ -343,6 +343,76 @@ fn add_join_tables(planner: &TestingPlanner) {
     );
 }
 
+/// A filtered correlated scalar subquery decorrelates into a LEFT delim join,
+/// which the walk desugars into two synthetic CTEs: the outer side read by the
+/// join's build and by a Distinct on the correlation column, whose output the
+/// subquery side's delim scan reads. The projection above the join restores
+/// DuckDB's LHS-then-RHS column order around the build-outer orientation.
+#[rstest]
+fn correlated_scalar_subquery_becomes_a_delim_join(mut testing_planner: TestingPlanner) {
+    add_join_tables(&testing_planner);
+
+    let plan = testing_planner
+        .plan(
+            "SELECT sum(i_qty) FROM items, orders WHERE o_key = i_order AND o_total = 10 \
+             AND i_qty < (SELECT avg(i2.i_qty) FROM items i2 WHERE i2.i_order = o_key)",
+        )
+        .unwrap();
+
+    assert_snapshot!(plan.to_string(), @"
+    Projection(sum(i_qty):Int128)
+      Aggregate(groups: [], exprs: [sum(i_qty:Int64)])
+        Projection(#0:Int64)
+          Filter(cast(i_qty:Int64 as Float64) < SUBQUERY:Float64 -> Boolean)
+            Cte(#9223372036854775807, sites: 2)
+              Join(probe_keys: [0], build_keys: [0], probe_output: [0, 1], build_output: [0, 1])
+                Input([i_order:Int64, i_qty:Int64])
+                Filter(o_total:Int64 = 10:Int64 -> Boolean)
+                  Input([o_key:Int64, o_total:Int64])
+              Cte(#9223372036854775808, sites: 1)
+                Distinct(keys: [0])
+                  CteScan(#9223372036854775807)
+                Join[probe outer](probe_keys: [0], build_keys: [1], probe_output: [1], build_output: [0])
+                  CteScan(#9223372036854775807)
+                  Projection(avg(i_qty):Float64, o_key:Int64)
+                    Projection(#0:Int64, (cast(#1:Int128 as Float64) / cast(#2:Int64 as Float64)))
+                      Aggregate(groups: [o_key:Int64], exprs: [sum(i_qty:Int64), count(i_qty:Int64)])
+                        Join(probe_keys: [0], build_keys: [0], probe_output: [0, 1], build_output: [0])
+                          Input([i_order:Int64, i_qty:Int64])
+                          CteScan(#9223372036854775808)
+    ");
+}
+
+/// A LEFT JOIN preserving the larger relation stays LEFT in DuckDB's plan and
+/// lowers to the probe-side outer join: the preserved side streams as probe
+/// and its unmatched rows pad with null build columns.
+#[rstest]
+fn a_left_join_preserving_the_larger_side_is_probe_outer(mut testing_planner: TestingPlanner) {
+    use arrow_array::{ArrayRef, Int64Array};
+    use planner::types::Type;
+    use std::sync::Arc;
+    let int64_col = |values: Vec<i64>| -> ArrayRef { Arc::new(Int64Array::from(values)) };
+    testing_planner.add_table(
+        "small_orders",
+        &[("o_key", Type::Int64, int64_col(vec![1, 2]))],
+    );
+    testing_planner.add_table(
+        "wide_items",
+        &[("i_order", Type::Int64, int64_col(vec![7; 20]))],
+    );
+
+    let plan = testing_planner
+        .plan("SELECT i_order, o_key FROM wide_items LEFT JOIN small_orders ON i_order = o_key")
+        .unwrap();
+
+    assert_snapshot!(plan.to_string(), @"
+    Projection(i_order:Int64, o_key:Int64)
+      Join[probe outer](probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [0])
+        Input([i_order:Int64])
+        Input([o_key:Int64])
+    ");
+}
+
 #[rstest]
 fn count_star_join_keeps_all_columns(mut testing_planner: TestingPlanner) {
     add_join_tables(&testing_planner);

@@ -19,6 +19,7 @@ mod create_schema;
 mod create_table;
 mod create_user;
 mod cte;
+mod distinct;
 mod dummy_scan;
 mod explain;
 mod filter;
@@ -40,6 +41,7 @@ pub use create_schema::CreateSchema;
 pub use create_table::CreateTable;
 pub use create_user::CreateUser;
 pub use cte::{Cte, CteScan};
+pub use distinct::Distinct;
 pub use dummy_scan::DummyScan;
 pub use explain::Explain;
 pub use filter::Filter;
@@ -129,6 +131,8 @@ pub enum Operator {
     Cte(Cte),
     /// One place a CTE's rows are read (see [`CteScan`]).
     CteScan(CteScan),
+    /// The distinct values of a tuple of input columns (see [`Distinct`]).
+    Distinct(Distinct),
 }
 
 impl Operator {
@@ -191,6 +195,10 @@ impl Operator {
             // A scan of a CTE emits what that CTE's definition produces,
             // recorded when the definition was walked.
             Operator::CteScan(scan) => Ok(scan.types.clone()),
+            // A distinct emits its key columns, in key order.
+            Operator::Distinct(distinct) => {
+                Ok(distinct.keys.iter().map(|(_, ty)| ty.clone()).collect())
+            }
             // Statements, not queries: no result columns.
             Operator::CreateTable(_)
             | Operator::CreateSchema(_)
@@ -253,20 +261,30 @@ impl Operator {
             Operator::Insert(_) => vec![false],
             // An inner join only emits rows built from both inputs, so each
             // output column keeps its own side's nullability; so does a semi
-            // join, whose output is probe columns the build side matched. A
-            // build-side outer join also emits unmatched build rows, filling
-            // their probe columns with NULL regardless of the probe input's
-            // declared nullability.
+            // join, whose output is probe columns the build side matched. An
+            // outer join also emits its preserved side's unmatched rows,
+            // filling the other side's columns with NULL regardless of that
+            // input's declared nullability.
             Operator::Join(join) => {
                 let probe_nullable = matches!(join.kind, JoinKind::BuildOuter);
+                let build_nullable = matches!(join.kind, JoinKind::ProbeOuter);
                 join.probe_output
                     .iter()
                     .map(|&i| probe_nullable || inputs[0][i])
-                    .chain(join.build_output.iter().map(|&i| inputs[1][i]))
+                    .chain(
+                        join.build_output
+                            .iter()
+                            .map(|&i| build_nullable || inputs[1][i]),
+                    )
                     .collect()
             }
             Operator::Cte(_) => inputs[1].clone(),
             Operator::CteScan(scan) => scan.nullable.clone(),
+            Operator::Distinct(distinct) => distinct
+                .keys
+                .iter()
+                .map(|&(idx, _)| inputs[0][idx])
+                .collect(),
             Operator::CreateTable(_)
             | Operator::CreateSchema(_)
             | Operator::CreateUser(_)
@@ -305,6 +323,7 @@ impl fmt::Display for Operator {
             Operator::Explain(e) => write!(f, "{e}"),
             Operator::Cte(c) => write!(f, "{c}"),
             Operator::CteScan(c) => write!(f, "{c}"),
+            Operator::Distinct(d) => write!(f, "{d}"),
         }
     }
 }

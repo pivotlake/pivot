@@ -709,7 +709,7 @@ pub(super) fn dispatch_group_by(
 /// [`dispatch_group_by`], so it supports every group-key shape the aggregating path
 /// does. Used as the inner level of the two-level `COUNT(DISTINCT)` lowerings,
 /// which then count the deduped rows per group.
-pub(super) fn build_dedup_operator(
+pub(in crate::operator) fn build_dedup_operator(
     input: RecordBatchOperatorSpec,
     keys: &[(usize, Type)],
     nullability: &[bool],

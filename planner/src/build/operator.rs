@@ -120,7 +120,7 @@ impl OrderBy {
 }
 
 impl TopN {
-    pub(crate) fn from_handle(
+    pub(super) fn from_handle(
         view: TopNView<'_>,
         ctx: &mut BuildCtx,
     ) -> Result<TopN, OperatorError> {
@@ -147,7 +147,7 @@ impl Limit {
 }
 
 impl Input {
-    pub(crate) fn from_handle(
+    pub(super) fn from_handle(
         scan: TableScanView<'_>,
         ctx: &mut BuildCtx,
     ) -> Result<Input, OperatorError> {

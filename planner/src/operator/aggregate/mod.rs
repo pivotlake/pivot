@@ -19,7 +19,7 @@
 
 mod global;
 mod global_distinct;
-mod grouped;
+pub(super) mod grouped;
 mod grouped_distinct;
 mod reinterpret;
 

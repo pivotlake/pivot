@@ -1,5 +1,5 @@
-//! [`Join`] — a hash equi-join of two inputs: inner, outer on the build side,
-//! or semi on the probe side.
+//! [`Join`] — a hash equi-join of two inputs: inner, outer on either side, or
+//! semi on the probe side.
 //!
 //! The first input is the probe side and the second the build side, mirroring
 //! DuckDB's convention of building the hash table from the right child (its
@@ -10,12 +10,12 @@
 //! nothing above the join reads any column (a bare `COUNT(*)`), letting the
 //! dispatch probe skip materialization entirely.
 //!
-//! That same convention is why an outer join arrives here outer on the *build*
-//! side: DuckDB writes `RIGHT` for a `LEFT JOIN` whose preserved relation is
-//! the smaller one and therefore ends up as its right child. A semi join
-//! arrives the other way round — DuckDB's `SEMI` keeps rows of its left child,
-//! the probe — because its cost model wants the subquery it came from, being
-//! the smaller side, on the build side.
+//! That same convention decides which side an outer join preserves: DuckDB
+//! writes `RIGHT` for a `LEFT JOIN` whose preserved relation is the smaller
+//! one and therefore ends up as its right child (the build), and keeps `LEFT`
+//! when the preserved relation is the larger one (the probe). A semi join
+//! always keeps rows of its left child, the probe, because its cost model
+//! wants the subquery it came from, being the smaller side, on the build side.
 
 use crate::compile::{Error, ExprEvalFn};
 use crate::expression::Expression;
@@ -35,6 +35,9 @@ pub enum JoinKind {
     /// Every pair an [`Inner`](JoinKind::Inner) emits, plus every build row no
     /// probe row matched, its probe columns NULL.
     BuildOuter,
+    /// Every pair an [`Inner`](JoinKind::Inner) emits, plus every probe row
+    /// nothing matched, its build columns NULL.
+    ProbeOuter,
     /// One output row per probe row the build side holds the key of, and no
     /// build columns (see [`Join::build_output`]).
     ProbeSemi,
@@ -88,6 +91,7 @@ impl fmt::Display for Join {
         let kind = match self.kind {
             JoinKind::Inner => "Join",
             JoinKind::BuildOuter => "Join[build outer]",
+            JoinKind::ProbeOuter => "Join[probe outer]",
             JoinKind::ProbeSemi => "Join[probe semi]",
             JoinKind::Range(RangeCompare::Less) => "Join[range <]",
             JoinKind::Range(RangeCompare::LessEq) => "Join[range <=]",
@@ -119,10 +123,11 @@ impl Join {
         build: RecordBatchOperatorSpec,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         // Both sides' output fields, named by position: an outer join
-        // synthesizes NULL probe values, so field names and nullability are
-        // the join's to pick rather than any input column's, and every kind
-        // uses the same convention.
-        let outer = matches!(self.kind, JoinKind::BuildOuter);
+        // synthesizes NULL values for its non-preserved side, so field names
+        // and nullability are the join's to pick rather than any input
+        // column's, and every kind uses the same convention.
+        let build_outer = matches!(self.kind, JoinKind::BuildOuter);
+        let probe_outer = matches!(self.kind, JoinKind::ProbeOuter);
         let probe_fields = self
             .probe_column_types
             .iter()
@@ -131,7 +136,7 @@ impl Join {
                 Field::new(
                     format!("probe_{i}"),
                     physical_arrow_type(col_type),
-                    *nullable || outer,
+                    *nullable || build_outer,
                 )
             })
             .collect();
@@ -143,7 +148,7 @@ impl Join {
                 Field::new(
                     format!("build_{i}"),
                     physical_arrow_type(col_type),
-                    *nullable,
+                    *nullable || probe_outer,
                 )
             })
             .collect();
@@ -162,6 +167,7 @@ impl Join {
         let kind = match &self.kind {
             JoinKind::Inner => DispatchJoinKind::Inner,
             JoinKind::BuildOuter => DispatchJoinKind::BuildOuter,
+            JoinKind::ProbeOuter => DispatchJoinKind::ProbeOuter,
             JoinKind::ProbeSemi => DispatchJoinKind::ProbeSemi,
             JoinKind::Range(_) => unreachable!("compiled above"),
         };
