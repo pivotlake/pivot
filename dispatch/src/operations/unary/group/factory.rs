@@ -40,7 +40,6 @@ pub struct GroupFactory<K: KeyExtractor, V: AggregationValue + ?Sized> {
     hash_state: RandomState,
     injectors: Arc<Vec<Injector<PartitionJob<K, V>>>>,
     partition_jobs_injected: Arc<AtomicBool>,
-    zero_hash_pending: Arc<AtomicBool>,
     gather: Arc<GatherBarrier<AggregatedTableOutput<K, V>>>,
     /// Radix scatter config with the per-worker bucket count sized for the pool
     /// (see [`get_scatter_bucket_count_for_worker`](super::get_scatter_bucket_count_for_worker)).
@@ -70,7 +69,6 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupFactory<K, V> {
                 .collect::<Vec<_>>(),
         );
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));
-        let zero_hash_pending = Arc::new(AtomicBool::new(false));
         let gather = Arc::new(GatherBarrier::new(topology.total_workers()));
         let radix = RadixConfig {
             partitions: crate::operations::unary::group::get_scatter_bucket_count_for_worker(
@@ -90,7 +88,6 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupFactory<K, V> {
             hash_state: hash_state.clone(),
             injectors: injectors.clone(),
             partition_jobs_injected: partition_jobs_injected.clone(),
-            zero_hash_pending: zero_hash_pending.clone(),
             gather: gather.clone(),
             radix,
         })
@@ -115,7 +112,6 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> UnaryFactory<RecordBatch, Re
             self.count_only,
             self.gather,
             self.partition_jobs_injected,
-            self.zero_hash_pending,
             self.radix,
         ))
     }
