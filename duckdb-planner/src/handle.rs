@@ -211,6 +211,8 @@ impl<'plan> LogicalOp<'plan> {
             L::LOGICAL_COMPARISON_JOIN => {
                 Operator::ComparisonJoin(ComparisonJoin { raw: self.raw })
             }
+            L::LOGICAL_DELIM_JOIN => Operator::DelimJoin(DelimJoin { raw: self.raw }),
+            L::LOGICAL_DELIM_GET => Operator::DelimGet(DelimGet { raw: self.raw }),
             L::LOGICAL_MATERIALIZED_CTE => {
                 Operator::MaterializedCte(MaterializedCte { raw: self.raw })
             }
@@ -253,6 +255,12 @@ pub enum Operator<'plan> {
     /// A comparison join; the consumer only handles the late-materialization
     /// shape (see [`ComparisonJoin::is_late_materialization`]).
     ComparisonJoin(ComparisonJoin<'plan>),
+    /// A comparison join that additionally de-duplicates correlation columns
+    /// from one side and publishes them to the [`DelimGet`]s under the other.
+    DelimJoin(DelimJoin<'plan>),
+    /// A scan of the distinct correlation values its enclosing [`DelimJoin`]
+    /// de-duplicated.
+    DelimGet(DelimGet<'plan>),
     /// A CTE: its definition, then the query reading it.
     MaterializedCte(MaterializedCte<'plan>),
     /// One place a CTE's rows are read.
@@ -315,6 +323,10 @@ define_handles! { ffi::LogicalOperator;
     CreateUser,
     /// A `LogicalComparisonJoin`.
     ComparisonJoin,
+    /// A `LogicalComparisonJoin` whose operator type is `LOGICAL_DELIM_JOIN`.
+    DelimJoin,
+    /// A `LogicalDelimGet`: a scan of a delim join's de-duplicated values.
+    DelimGet,
     /// A `LogicalMaterializedCTE`: the CTE's definition above the query using it.
     MaterializedCte,
     /// A `LogicalCTERef`: one place a CTE's rows are read.
@@ -783,6 +795,43 @@ impl<'plan> ComparisonJoin<'plan> {
     pub fn right_projection_map(self) -> Result<Vec<usize>> {
         (0..ffi::lo_join_right_projection_map_count(self.raw)?)
             .map(|i| Ok(ffi::lo_join_right_projection_map_index(self.raw, i)?))
+            .collect()
+    }
+}
+
+impl<'plan> DelimJoin<'plan> {
+    /// The underlying comparison join: a delim join is stored as a
+    /// `LogicalComparisonJoin`, so the type, conditions and projection maps all
+    /// read through the plain join view.
+    pub fn join(self) -> ComparisonJoin<'plan> {
+        ComparisonJoin { raw: self.raw }
+    }
+
+    /// The expressions (over the de-duplicated side's output) whose distinct
+    /// values every [`DelimGet`] under the other side scans.
+    pub fn delim_columns(self) -> Result<Vec<Expr<'plan>>> {
+        (0..ffi::lo_delim_join_column_count(self.raw)?)
+            .map(|i| {
+                Ok(Expr {
+                    raw: ffi::lo_delim_join_column(self.raw, i)?,
+                })
+            })
+            .collect()
+    }
+
+    /// False: the LHS is de-duplicated and the [`DelimGet`]s sit under the RHS.
+    /// True: the join was flipped and the roles reverse.
+    pub fn is_flipped(self) -> Result<bool> {
+        Ok(ffi::lo_delim_join_is_flipped(self.raw)?)
+    }
+}
+
+impl<'plan> DelimGet<'plan> {
+    /// The types of the de-duplicated values this scan produces, in column
+    /// order (matching the enclosing delim join's `delim_columns`).
+    pub fn column_types(self) -> Result<Vec<BoundLogicalType>> {
+        (0..ffi::lo_delim_get_column_count(self.raw)?)
+            .map(|i| Ok(bound_type_from(ffi::lo_delim_get_column_type(self.raw, i)?)))
             .collect()
     }
 }

@@ -375,6 +375,20 @@ pub mod ffi {
         fn lo_join_right_projection_map_count(op: &LogicalOperator) -> Result<usize>;
         fn lo_join_right_projection_map_index(op: &LogicalOperator, index: usize) -> Result<usize>;
 
+        // ---- DelimJoin / DelimGet ----
+        /// The expressions (over the de-duplicated side's output) whose distinct
+        /// values every DELIM_GET under the other side scans.
+        fn lo_delim_join_column_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_delim_join_column(op: &LogicalOperator, index: usize) -> Result<&Expression>;
+        /// False: the LHS is de-duplicated and the DELIM_GETs sit under the RHS.
+        /// True: the join was flipped and the roles reverse.
+        fn lo_delim_join_is_flipped(op: &LogicalOperator) -> Result<bool>;
+        fn lo_delim_get_column_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_delim_get_column_type(
+            op: &LogicalOperator,
+            index: usize,
+        ) -> Result<BridgeLogicalType>;
+
         // ---- ComparisonJoin: late materialization ----
         /// Whether this is the SEMI join DuckDB's late_materialization optimizer
         /// produces (vs a user IN/EXISTS), which the bridge collapses into a
