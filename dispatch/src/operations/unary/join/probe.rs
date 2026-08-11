@@ -37,6 +37,10 @@
 //! probe row's matches all surface while its own batch is probed, so each
 //! worker settles its own batches.
 //!
+//! An anti join runs that same probe-side miss tracking and emits the misses
+//! alone: its drain stops once the collected pairs have settled their probe
+//! rows' fates, so a matched pair never reaches the output.
+//!
 //! A join with a residual predicate ([`JoinSpec::residual_filters`]) weighs
 //! the collected matches once more in the drain: the matched rows of both
 //! sides are gathered into one combined batch, the predicate evaluated over
@@ -72,6 +76,7 @@ pub struct Probe<
     const OUTER_JOIN_BUILD_SIDE: bool,
     const SEMI: bool,
     const OUTER_JOIN_PROBE_SIDE: bool,
+    const ANTI: bool,
 > {
     table: JoinTable<K::Stored>,
     hash_state: RandomState,
@@ -89,7 +94,8 @@ impl<
     const OUTER_JOIN_BUILD_SIDE: bool,
     const SEMI: bool,
     const OUTER_JOIN_PROBE_SIDE: bool,
-> Probe<K, OUTER_JOIN_BUILD_SIDE, SEMI, OUTER_JOIN_PROBE_SIDE>
+    const ANTI: bool,
+> Probe<K, OUTER_JOIN_BUILD_SIDE, SEMI, OUTER_JOIN_PROBE_SIDE, ANTI>
 {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -104,6 +110,10 @@ impl<
         debug_assert!(!(SEMI && spec.residual_filters.is_some()));
         // A join is outer on one side at most (no FULL OUTER).
         debug_assert!(!(OUTER_JOIN_BUILD_SIDE && OUTER_JOIN_PROBE_SIDE));
+        // An anti join rides the probe-side miss tracking; it never combines
+        // with the first-match exit, whose skipped candidates could still
+        // pass a residual.
+        debug_assert!(!ANTI || (OUTER_JOIN_PROBE_SIDE && !SEMI));
         let residual_filters = spec
             .residual_filters
             .as_ref()
@@ -164,16 +174,17 @@ impl<
         if OUTER_JOIN_PROBE_SIDE {
             self.match_outputter.begin_probe_outer_batch(len);
         }
-        let probe_window = ProbeWindow::<K, OUTER_JOIN_BUILD_SIDE, SEMI, OUTER_JOIN_PROBE_SIDE> {
-            keys,
-            rows,
-            reader,
-            verifier,
-            probe_batch: batch,
-            probe_source,
-            output: &mut self.match_outputter,
-            sender,
-        };
+        let probe_window =
+            ProbeWindow::<K, OUTER_JOIN_BUILD_SIDE, SEMI, OUTER_JOIN_PROBE_SIDE, ANTI> {
+                keys,
+                rows,
+                reader,
+                verifier,
+                probe_batch: batch,
+                probe_source,
+                output: &mut self.match_outputter,
+                sender,
+            };
 
         ProbeArray {
             row_idx: 0,
@@ -203,7 +214,9 @@ impl<
     const OUTER_JOIN_BUILD_SIDE: bool,
     const SEMI: bool,
     const OUTER_JOIN_PROBE_SIDE: bool,
-> Unary<RecordBatch, RecordBatch> for Probe<K, OUTER_JOIN_BUILD_SIDE, SEMI, OUTER_JOIN_PROBE_SIDE>
+    const ANTI: bool,
+> Unary<RecordBatch, RecordBatch>
+    for Probe<K, OUTER_JOIN_BUILD_SIDE, SEMI, OUTER_JOIN_PROBE_SIDE, ANTI>
 {
     fn consume(
         &mut self,
@@ -289,6 +302,7 @@ struct ProbeWindow<
     const BUILD_OUTER: bool,
     const SEMI: bool,
     const OUTER_JOIN_PROBE_SIDE: bool,
+    const ANTI: bool,
 > {
     keys: &'a MultiSlabBuffer<K::Stored>,
     rows: &'a MultiSlabBuffer<u32>,
@@ -309,12 +323,13 @@ impl<
     const OUTER_JOIN_BUILD_SIDE: bool,
     const SEMI_PROBE_SIDE: bool,
     const OUTER_JOIN_PROBE_SIDE: bool,
-> ProbeWindow<'a, 'b, K, OUTER_JOIN_BUILD_SIDE, SEMI_PROBE_SIDE, OUTER_JOIN_PROBE_SIDE>
+    const ANTI: bool,
+> ProbeWindow<'a, 'b, K, OUTER_JOIN_BUILD_SIDE, SEMI_PROBE_SIDE, OUTER_JOIN_PROBE_SIDE, ANTI>
 {
     #[inline(never)]
     fn drain(&mut self) -> unary::Result<()> {
         self.output
-            .drain::<OUTER_JOIN_BUILD_SIDE, SEMI_PROBE_SIDE, OUTER_JOIN_PROBE_SIDE>(
+            .drain::<OUTER_JOIN_BUILD_SIDE, SEMI_PROBE_SIDE, OUTER_JOIN_PROBE_SIDE, ANTI>(
                 self.probe_source,
                 self.probe_batch,
                 self.sender,
@@ -398,6 +413,7 @@ struct ProbeArray<
     const BUILD_OUTER: bool,
     const SEMI: bool,
     const OUTER_JOIN_PROBE_SIDE: bool,
+    const ANTI: bool,
 > {
     row_idx: usize,
     /// The probed window's row count.
@@ -415,7 +431,7 @@ struct ProbeArray<
     matched_size: [usize; 2],
     matched_idx: usize,
 
-    window: ProbeWindow<'a, 'b, K, BUILD_OUTER, SEMI, OUTER_JOIN_PROBE_SIDE>,
+    window: ProbeWindow<'a, 'b, K, BUILD_OUTER, SEMI, OUTER_JOIN_PROBE_SIDE, ANTI>,
 }
 
 impl<
@@ -425,7 +441,8 @@ impl<
     const BUILD_OUTER: bool,
     const SEMI: bool,
     const OUTER_JOIN_PROBE_SIDE: bool,
-> ProbeArray<'a, 'b, K, BUILD_OUTER, SEMI, OUTER_JOIN_PROBE_SIDE>
+    const ANTI: bool,
+> ProbeArray<'a, 'b, K, BUILD_OUTER, SEMI, OUTER_JOIN_PROBE_SIDE, ANTI>
 {
     #[inline(always)]
     pub fn generate_matched_slots<const HASH: bool>(&mut self, length: usize) {

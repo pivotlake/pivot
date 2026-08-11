@@ -713,17 +713,22 @@ impl RecordBatchOperatorSpec {
     /// runtime test for it.
     fn join_dispatch<K: JoinKey>(self, build: RecordBatchOperatorSpec, spec: JoinSpec) -> Self {
         match spec.kind {
-            JoinKind::Inner => self.join_typed::<K, false, false, false>(build, spec),
-            JoinKind::BuildOuter => self.join_typed::<K, true, false, false>(build, spec),
-            JoinKind::ProbeOuter => self.join_typed::<K, false, false, true>(build, spec),
+            JoinKind::Inner => self.join_typed::<K, false, false, false, false>(build, spec),
+            JoinKind::BuildOuter => self.join_typed::<K, true, false, false, false>(build, spec),
+            JoinKind::ProbeOuter => self.join_typed::<K, false, false, true, false>(build, spec),
             // With a residual predicate the first key match may not be a real
             // match, so the semi join runs on the pair-recording instantiation
             // and drops duplicate probe rows at drain time instead of exiting
             // the match loop early.
             JoinKind::ProbeSemi if spec.residual_filters.is_some() => {
-                self.join_typed::<K, false, false, false>(build, spec)
+                self.join_typed::<K, false, false, false, false>(build, spec)
             }
-            JoinKind::ProbeSemi => self.join_typed::<K, false, true, false>(build, spec),
+            JoinKind::ProbeSemi => self.join_typed::<K, false, true, false, false>(build, spec),
+            // An anti join runs the probe-side outer join's miss tracking and
+            // emits the misses alone. One instantiation serves with and
+            // without a residual: the settled flags already classify the rows
+            // whose every pair a residual rejects.
+            JoinKind::ProbeAnti => self.join_typed::<K, false, false, true, true>(build, spec),
         }
     }
 
@@ -732,6 +737,7 @@ impl RecordBatchOperatorSpec {
         const BUILD_OUTER: bool,
         const SEMI: bool,
         const OUTER_JOIN_PROBE_SIDE: bool,
+        const ANTI: bool,
     >(
         self,
         build: RecordBatchOperatorSpec,
@@ -751,7 +757,7 @@ impl RecordBatchOperatorSpec {
         );
 
         let (build_factories, probe_factories, build_ready) =
-            create_join_factories::<K, BUILD_OUTER, SEMI, OUTER_JOIN_PROBE_SIDE>(
+            create_join_factories::<K, BUILD_OUTER, SEMI, OUTER_JOIN_PROBE_SIDE, ANTI>(
                 spec,
                 worker_count,
             );

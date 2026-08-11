@@ -34,9 +34,10 @@ pub(super) struct ProbeMatchOutputter {
     /// time, before any pair is flagged or emitted.
     pub(super) residual_filters: Option<ResidualFilter>,
     /// The probed batch's rows that matched nothing, collected by a
-    /// probe-side outer join while the batch is probed and padded out once it
-    /// has been. See [`begin_probe_outer_batch`](Self::begin_probe_outer_batch)
-    /// for who records into it.
+    /// probe-side outer or anti join while the batch is probed and emitted
+    /// once it has been. See
+    /// [`begin_probe_outer_batch`](Self::begin_probe_outer_batch) for who
+    /// records into it.
     missed_probe_rows: Vec<u32>,
     /// Whether the join carries a residual predicate, which is what forces
     /// the settled-flag supplement below. Cached off `residual_filters` so
@@ -49,8 +50,9 @@ pub(super) struct ProbeMatchOutputter {
     /// of miss no inline site can see. Maintained (and allocated) only when
     /// a residual exists.
     probe_row_settled: Vec<u8>,
-    /// The probe rows nothing matched, accumulated by a probe-side outer join
-    /// until a full batch of them can be emitted null-padded. `None` for every
+    /// The probe rows nothing matched, accumulated by a probe-side outer or
+    /// anti join until a full batch of them can be emitted (null-padded for
+    /// outer; an anti join lists no build columns to pad). `None` for every
     /// other kind: an accumulator eagerly takes a pooled slab per column, a
     /// real per-query cost no other kind may pay for a path it never runs.
     unmatched_probe: Option<BatchAccumulator>,
@@ -62,7 +64,7 @@ impl ProbeMatchOutputter {
         build_fields: &[Field],
         build_rows: Arc<JoinCell<BuildRows>>,
         residual_filters: Option<ResidualFilter>,
-        outer_join_probe_side: bool,
+        emits_unmatched_probe_rows: bool,
     ) -> Self {
         let mut allocator = SlabAllocator::new(false);
         let fields: Vec<Field> = probe_fields.iter().chain(build_fields).cloned().collect();
@@ -76,7 +78,7 @@ impl ProbeMatchOutputter {
                 Arc::new(Schema::new(build_fields.to_vec())),
                 &mut allocator,
             ),
-            unmatched_probe: outer_join_probe_side.then(|| {
+            unmatched_probe: emits_unmatched_probe_rows.then(|| {
                 BatchAccumulator::retaining_source_buffers(
                     Arc::new(Schema::new(probe_fields.to_vec())),
                     &mut allocator,
@@ -141,7 +143,7 @@ impl ProbeMatchOutputter {
         let unmatched_probe = self
             .unmatched_probe
             .as_mut()
-            .expect("only a probe-side outer join pads probe rows");
+            .expect("only a probe-side outer or anti join emits unmatched probe rows");
         if unmatched_probe.is_empty() {
             return Ok(());
         }
@@ -216,7 +218,7 @@ impl ProbeMatchOutputter {
             let unmatched_probe = self
                 .unmatched_probe
                 .as_mut()
-                .expect("only a probe-side outer join pads probe rows");
+                .expect("only a probe-side outer or anti join emits unmatched probe rows");
             let room = unmatched_probe.capacity() - unmatched_probe.len();
             let (chunk, rest) = remaining.split_at(room.min(remaining.len()));
             unmatched_probe.append_batch_by_indices(probe_source, chunk, &mut self.allocator);
@@ -314,6 +316,7 @@ impl ProbeMatchOutputter {
         const OUTER_JOIN_BUILD_SIDE: bool,
         const SEMI_PROBE_SIDE: bool,
         const OUTER_JOIN_PROBE_SIDE: bool,
+        const ANTI: bool,
     >(
         &mut self,
         probe_source: &RecordBatch,
@@ -355,6 +358,12 @@ impl ProbeMatchOutputter {
                 let flag = build_rows.matched.ptr_at_index(row as usize);
                 unsafe { AtomicU8::from_ptr(flag) }.store(1, Ordering::Relaxed);
             }
+        }
+        if ANTI {
+            // An anti join's matched pairs are not output rows; the settling
+            // above is all a match contributes.
+            self.matched = 0;
+            return Ok(());
         }
         self.probe.append_batch_by_indices(
             probe_source,
