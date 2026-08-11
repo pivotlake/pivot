@@ -37,16 +37,25 @@ as the engine grows the features each needs.
 | q07 | Volume Shipping | 6 tables incl. nation twice, an OR over both nations riding the join as a residual condition |
 | q08 | National Market Share | 7 joins, `extract(year ...)` groups, share of two sums |
 | q09 | Product Type Profit | 6 tables, partsupp joined on two keys (suppkey and partkey), profit per nation per year |
+| q11 | Important Stock | partsupp/supplier/nation computed once as a CTE read twice, HAVING above a scalar subquery via a `>` range join |
 | q12 | Shipping Modes | orders/lineitem, CASE priority buckets per shipmode |
 | q13 | Customer Distribution | customer/orders outer join, orders per customer, then a histogram of those counts |
 | q14 | Promotion Effect | lineitem/part, promo share of revenue |
+| q15 | Top Supplier | a revenue CTE read twice, equality join against its own MAX via a scalar subquery |
 | q18 | Large Volume Customer | orders semi-joined against the order keys whose quantities sum above 300, then the top 100 by price |
 | q19 | Discounted Revenue | lineitem/part, a three-disjunct OR over both sides riding the join as a residual condition |
 
 The rest of the 22 need engine features that are not in yet: the delim joins
-DuckDB plans a correlated subquery into (q04, q17, q20, q21), CTE scans
-(q11, q15), mark joins (q16), and
-the `suffix` / `substring` scalar functions (q02, q16, q22).
+DuckDB plans a correlated subquery into (q04, q17, q20, q21), mark joins
+(q16), and the `suffix` / `substring` scalar functions (q02, q16, q22).
+
+q11's HAVING threshold is the spec's `FRACTION = 0.0001 / SF`, written out for
+SF100 as `0.000001`; adjust it (and regenerate the oracle) for another scale.
+q11 also carries one deviation from the official text: `ps_partkey` as a
+second sort key, because at SF100 several part keys sum to the same `value`
+and the byte-exact oracle comparison needs a deterministic row order. q15
+would emit several rows if suppliers tied on the maximum revenue; none do in
+the reference dataset.
 
 Outer joins are supported only where the preserved side is the one the hash
 table is built from, which is what DuckDB hands over as a RIGHT join. It flips a
