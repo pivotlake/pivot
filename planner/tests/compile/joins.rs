@@ -545,6 +545,133 @@ fn aggregating_over_a_semi_join_counts_each_probe_row_once(mut testing_planner: 
 }
 
 #[rstest]
+fn anti_join_keeps_the_probe_rows_nothing_matched(mut testing_planner: TestingPlanner) {
+    add_wide_orders_and_repeated_keys(&testing_planner);
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT w_key FROM wide_orders ANTI JOIN big_items ON w_key = g_order WHERE w_key < 8",
+    );
+    rows.sort_by_key(|r| r["w_key"].as_i64().unwrap());
+
+    // Order 5 is named by three items and drops out just once; 6 by one; the
+    // other keys below eight match nothing and survive.
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"w_key": 0}, {"w_key": 1}, {"w_key": 2},
+            {"w_key": 3}, {"w_key": 4}, {"w_key": 7},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
+
+#[rstest]
+fn aggregating_over_an_anti_join_counts_each_unmatched_probe_row(
+    mut testing_planner: TestingPlanner,
+) {
+    add_wide_orders_and_repeated_keys(&testing_planner);
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT COUNT(*) AS n FROM wide_orders ANTI JOIN big_items ON w_key = g_order",
+    );
+
+    // Of the thousand orders only 5 and 6 are matched.
+    assert_eq!(rows, vec![serde_json::json!({"n": 998})]);
+}
+
+// An anti join's residual weighs every candidate pair: the probe row is kept
+// only when no pair survives, which its first key match alone cannot decide.
+#[rstest]
+fn anti_join_residual_keeps_a_row_whose_every_pair_fails(mut testing_planner: TestingPlanner) {
+    add_orders_and_items(&testing_planner);
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT o_key FROM orders ANTI JOIN items ON o_key = i_order \
+         AND (i_qty >= 25 OR o_status = 'closed')",
+    );
+    rows.sort_by_key(|r| r["o_key"].as_i64().unwrap());
+
+    // Order 1's items (quantities 10 and 20) all fail the predicate, so the
+    // order counts as unmatched and stays; order 2 passes through its status
+    // and drops; order 3 has no items at all.
+    assert_eq!(
+        rows,
+        serde_json::json!([{"o_key": 1}, {"o_key": 3}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
+// A NULL probe key matches nothing, and matching nothing is exactly what an
+// anti join emits.
+#[rstest]
+fn anti_join_emits_null_keyed_probe_rows(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "maybe_keys",
+        &[
+            (
+                "m_key",
+                Type::Int64,
+                Arc::new(Int64Array::from(vec![Some(5), None, Some(700)])) as ArrayRef,
+            ),
+            ("m_tag", Type::Utf8, str_col(vec!["hit", "none", "miss"])),
+        ],
+    );
+    testing_planner.add_table("hits", &[("h_key", Type::Int64, int64_col(vec![5, 6]))]);
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT m_tag FROM maybe_keys ANTI JOIN hits ON m_key = h_key",
+    );
+    rows.sort_by_key(|r| r["m_tag"].as_str().unwrap().to_string());
+
+    assert_eq!(
+        rows,
+        serde_json::json!([{"m_tag": "miss"}, {"m_tag": "none"}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
+/// An anti join preserving the smaller relation flips in DuckDB's plan: the
+/// hash table builds from the preserved side and the join arrives here as
+/// RIGHT_ANTI, running build-side and emitting the build rows nobody matched.
+#[rstest]
+fn an_anti_join_preserving_the_smaller_side_runs_build_side(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "few_skus",
+        &[
+            ("f_key", Type::Int64, int64_col(vec![5, 6, 5000])),
+            ("f_name", Type::Utf8, str_col(vec!["five", "six", "ghost"])),
+        ],
+    );
+    testing_planner.add_table(
+        "big",
+        &[(
+            "b_key",
+            Type::Int64,
+            int64_col((0..1000).collect::<Vec<i64>>()),
+        )],
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT f_name FROM few_skus ANTI JOIN big ON f_key = b_key",
+    );
+
+    // The selected column is not the key, so the join's build output is
+    // trimmed through the projection map.
+    assert_eq!(rows, vec![serde_json::json!({"f_name": "ghost"})]);
+}
+
+#[rstest]
 fn a_join_on_two_equality_conditions_matches_pairwise(mut testing_planner: TestingPlanner) {
     testing_planner.add_table(
         "assignments",

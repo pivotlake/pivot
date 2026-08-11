@@ -1,5 +1,5 @@
-//! [`Join`] — a hash equi-join of two inputs: inner, outer on either side, or
-//! semi on the probe side.
+//! [`Join`] — a hash equi-join of two inputs: inner, outer on either side,
+//! semi on the probe side, or anti on either side.
 //!
 //! The first input is the probe side and the second the build side, mirroring
 //! DuckDB's convention of building the hash table from the right child (its
@@ -41,6 +41,12 @@ pub enum JoinKind {
     /// One output row per probe row the build side holds the key of, and no
     /// build columns (see [`Join::build_output`]).
     ProbeSemi,
+    /// One output row per probe row with no surviving match, and no build
+    /// columns (see [`Join::build_output`]).
+    ProbeAnti,
+    /// One output row per build row no probe row matched, and no probe
+    /// columns (see [`Join::probe_output`]).
+    BuildAnti,
     /// Inner join on one `<`/`<=`/`>`/`>=` comparison (`probe key OP build
     /// key`) instead of equalities: the build side is sorted by key and each
     /// probe row matches a contiguous run of it. Always a single condition,
@@ -61,12 +67,16 @@ pub struct Join {
     /// condition's mismatched sides to a common type before the join);
     /// together they pick the dispatch join's key instantiation.
     pub key_types: Vec<Type>,
-    /// The probe input columns the join emits, in output order.
+    /// The probe input columns the join emits, in output order. Always empty
+    /// for a [`BuildAnti`](JoinKind::BuildAnti) join, whose output rows have
+    /// no probe row to take values from.
     pub probe_output: Vec<usize>,
     /// The build input columns the join emits after the probe columns. Always
     /// empty for a [`ProbeSemi`](JoinKind::ProbeSemi) join, which emits a probe
     /// row once however many build rows it matched, so no one build row is
-    /// there to take values from.
+    /// there to take values from, and for a
+    /// [`ProbeAnti`](JoinKind::ProbeAnti) join, whose output rows matched no
+    /// build row at all.
     pub build_output: Vec<usize>,
     /// The type and nullability of each listed probe output column, in
     /// `probe_output` order. The dispatch join shapes its output from these
@@ -93,6 +103,8 @@ impl fmt::Display for Join {
             JoinKind::BuildOuter => "Join[build outer]",
             JoinKind::ProbeOuter => "Join[probe outer]",
             JoinKind::ProbeSemi => "Join[probe semi]",
+            JoinKind::ProbeAnti => "Join[probe anti]",
+            JoinKind::BuildAnti => "Join[build anti]",
             JoinKind::Range(RangeCompare::Less) => "Join[range <]",
             JoinKind::Range(RangeCompare::LessEq) => "Join[range <=]",
             JoinKind::Range(RangeCompare::Greater) => "Join[range >]",
@@ -169,6 +181,8 @@ impl Join {
             JoinKind::BuildOuter => DispatchJoinKind::BuildOuter,
             JoinKind::ProbeOuter => DispatchJoinKind::ProbeOuter,
             JoinKind::ProbeSemi => DispatchJoinKind::ProbeSemi,
+            JoinKind::ProbeAnti => DispatchJoinKind::ProbeAnti,
+            JoinKind::BuildAnti => DispatchJoinKind::BuildAnti,
             JoinKind::Range(_) => unreachable!("compiled above"),
         };
         let spec = JoinSpec {

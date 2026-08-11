@@ -319,6 +319,13 @@ fn absorb_scan_pushdown_filter(node: PlanNode) -> PlanNode {
 /// it would rather build the hash table from the left child, is not supported
 /// yet.
 ///
+/// ANTI is SEMI's negation, one output row per left-child row with no
+/// surviving match, so it is anti on the probe side. Here the mirrored
+/// RIGHT_ANTI *is* supported, as anti on the build side: the same optimizer
+/// rewrites an ANTI into it whenever the preserved relation is the cheaper
+/// side to build the hash table from, which for anti joins (preserving the
+/// rows a typically larger side fails to match) is routine rather than rare.
+///
 /// DuckDB's join projection maps (which trim the join's output to the columns
 /// actually used above it) are folded into the join's own output lists, so
 /// the dispatch probe never materializes trimmed columns. An empty map means
@@ -386,7 +393,7 @@ fn build_join(
     // Refs above the join were resolved against the trimmed output (kept left
     // columns, then kept right columns), which is exactly the layout the join
     // emits with these lists.
-    let probe_output: Vec<usize> = if left_map.is_empty() {
+    let kept_probe_output: Vec<usize> = if left_map.is_empty() {
         (0..probe_types.len()).collect()
     } else {
         left_map
@@ -396,15 +403,20 @@ fn build_join(
     } else {
         right_map
     };
-    let (kind, build_output) = match join.join_type()? {
-        JoinType::INNER => (JoinKind::Inner, kept_build_output),
-        JoinType::RIGHT => (JoinKind::BuildOuter, kept_build_output),
-        JoinType::LEFT => (JoinKind::ProbeOuter, kept_build_output),
-        // A semi join emits no build column at all. DuckDB agrees, and says so
-        // by returning the left bindings alone for such a join rather than
-        // through the right projection map, which it never reads here - so the
-        // map's "empty means keep every column" reading must not be applied.
-        JoinType::SEMI => (JoinKind::ProbeSemi, Vec::new()),
+    let (kind, probe_output, build_output) = match join.join_type()? {
+        JoinType::INNER => (JoinKind::Inner, kept_probe_output, kept_build_output),
+        JoinType::RIGHT => (JoinKind::BuildOuter, kept_probe_output, kept_build_output),
+        JoinType::LEFT => (JoinKind::ProbeOuter, kept_probe_output, kept_build_output),
+        // A semi or anti join emits no build column at all. DuckDB agrees, and
+        // says so by returning the left bindings alone for such a join rather
+        // than through the right projection map, which it never reads here -
+        // so the map's "empty means keep every column" reading must not be
+        // applied.
+        JoinType::SEMI => (JoinKind::ProbeSemi, kept_probe_output, Vec::new()),
+        JoinType::ANTI => (JoinKind::ProbeAnti, kept_probe_output, Vec::new()),
+        // The mirror image: a right anti join emits build columns alone, and
+        // DuckDB never reads the left projection map for it.
+        JoinType::RIGHT_ANTI => (JoinKind::BuildAnti, Vec::new(), kept_build_output),
         other => {
             return Err(OperatorError::Unsupported(format!(
                 "Unsupported join type: {other:?}"
