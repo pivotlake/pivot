@@ -32,6 +32,7 @@ as the engine grows the features each needs.
 |-------|-------|-------|
 | q01 | Pricing Summary | no join: group by returnflag/linestatus, 8 aggregates |
 | q03 | Shipping Priority | customer/orders/lineitem, top 10 by revenue |
+| q04 | Order Priority Checking | a correlated EXISTS decorrelated into a SEMI delim join |
 | q05 | Local Supplier Volume | 6 tables, one join on two keys (suppkey and nationkey), revenue per nation |
 | q06 | Forecasting Revenue | no join: one row from a filtered scan |
 | q07 | Volume Shipping | 6 tables incl. nation twice, an OR over both nations riding the join as a residual condition |
@@ -42,12 +43,16 @@ as the engine grows the features each needs.
 | q13 | Customer Distribution | customer/orders outer join, orders per customer, then a histogram of those counts |
 | q14 | Promotion Effect | lineitem/part, promo share of revenue |
 | q15 | Top Supplier | a revenue CTE read twice, equality join against its own MAX via a scalar subquery |
+| q17 | Small-Quantity-Order Revenue | a correlated scalar average decorrelated into a LEFT delim join |
 | q18 | Large Volume Customer | orders semi-joined against the order keys whose quantities sum above 300, then the top 100 by price |
 | q19 | Discounted Revenue | lineitem/part, a three-disjunct OR over both sides riding the join as a residual condition |
 
-The rest of the 22 need engine features that are not in yet: the delim joins
-DuckDB plans a correlated subquery into (q04, q17, q20, q21), mark joins
-(q16), and the `suffix` / `substring` scalar functions (q02, q16, q22).
+The rest of the 22 need engine features that are not in yet: ANTI delim joins
+(q21), mark joins (q16), and the `suffix` / `substring` scalar functions
+(q02, q16, q22). LEFT and SEMI delim joins (the shapes DuckDB decorrelates
+q04 and q17's correlated subqueries into) are supported: the outer side runs
+once and is read both by the join and by a distinct on the correlation
+columns, whose output feeds the subquery side's delim scans.
 
 q11's HAVING threshold is the spec's `FRACTION = 0.0001 / SF`, written out for
 SF100 as `0.000001`; adjust it (and regenerate the oracle) for another scale.
@@ -57,11 +62,10 @@ and the byte-exact oracle comparison needs a deterministic row order. q15
 would emit several rows if suppliers tied on the maximum revenue; none do in
 the reference dataset.
 
-Outer joins are supported only where the preserved side is the one the hash
-table is built from, which is what DuckDB hands over as a RIGHT join. It flips a
-written LEFT JOIN into that shape whenever the preserved relation is the smaller
-one, as in q13, so a query preserving the larger relation still reports the join
-type as unsupported.
+Outer joins are supported on both sides: a RIGHT join preserves the side the
+hash table is built from, a LEFT join the side that probes it. DuckDB flips a
+written LEFT JOIN into RIGHT whenever the preserved relation is the smaller one
+(as in q13) and keeps it LEFT when it is the larger; both shapes run.
 
 Semi joins are supported the other way round: the rows kept are the probe
 side's, which is what DuckDB hands over as SEMI (that join type keeps its left
@@ -69,7 +73,8 @@ child's rows, and the left child is the probe). q18's `IN` subquery arrives in
 that shape, since the aggregate it selects from is the cheaper side to build the
 hash table from at every scale factor. Its mirror image RIGHT_SEMI, which
 DuckDB's build-probe-side optimizer produces when the left child is the cheaper
-one instead, is not supported; q20 needs that as well as a delim join.
+one instead, is not supported; q20 needs it (its delim join itself is the
+supported LEFT shape).
 
 q10 plans and runs, but its `c_comment` group key comes back corrupted at SF100
 (fragments of other rows, with the length prefix of a neighbouring field showing
