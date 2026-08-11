@@ -119,8 +119,10 @@ fi
 ab_common_init
 
 power_sleep=500
-sf_pgo="sf10"
-sf_measure="sf100"
+sf_pgo="sf1"
+# The pivot-written variant of SF100: the same rows as pivot's own writer
+# lays them out after an INSERT, which is what a real table looks like.
+sf_measure="sf100-pivot"
 pgo_data="$data_root/$sf_pgo"
 measure_data="$data_root/$sf_measure"
 
@@ -141,8 +143,9 @@ io_delta() {
 # the stream, so later queries keep whatever earlier ones cached. Echoes
 # "<query> <ms>" per line, in suite order.
 run_power() {
-    local bin="$1" dir="$2" out
+    local bin="$1" server="$2" dir="$3" out
     out="$("$bin" --suite tpch --suite-dir "$dir/benchmarks/tpch" \
+        --server-bin "$server" \
         --source "$measure_data" --query "$queries" \
         --iterations 1 --sleep "$power_sleep" --skip-check 2>&1)" || true
     # Timing lines end in "<ms>ms"; take those alone (the runner also prints a
@@ -198,6 +201,8 @@ if [[ "$mode" == "pgo" ]]; then
     restore_cache "pgogen-after" "$after_dir/benchmarks/target-pgogen" & restore_pids+=($!)
     restore_cache "pgouse-before" "$before_dir/benchmarks/target-pgouse" & restore_pids+=($!)
     restore_cache "pgouse-after" "$after_dir/benchmarks/target-pgouse" & restore_pids+=($!)
+    restore_cache "client-before" "$before_dir/benchmarks/target-client" & restore_pids+=($!)
+    restore_cache "client-after" "$after_dir/benchmarks/target-client" & restore_pids+=($!)
 else
     restore_cache "release-before" "$before_dir/target" & restore_pids+=($!)
     restore_cache "release-after" "$after_dir/target" & restore_pids+=($!)
@@ -221,8 +226,10 @@ if [[ "$mode" == "pgo" ]]; then
     build_use "$after_dir" after & b2=$!
     wait "$b1"; wait "$b2"
 
-    before_bin="$before_dir/benchmarks/target-pgouse/$host_target/release/pivot-bench"
-    after_bin="$after_dir/benchmarks/target-pgouse/$host_target/release/pivot-bench"
+    before_bin="$before_dir/benchmarks/target-client/release/pivot-bench"
+    after_bin="$after_dir/benchmarks/target-client/release/pivot-bench"
+    before_server="$before_dir/benchmarks/target-pgouse/$host_target/release/pivotdb-server"
+    after_server="$after_dir/benchmarks/target-pgouse/$host_target/release/pivotdb-server"
 else
     echo ">>> release builds (A and B in parallel)"
     build_release "$before_dir" & b1=$!
@@ -230,8 +237,12 @@ else
     wait "$b1"; wait "$b2"
     before_bin="$before_dir/target/release/pivot-bench"
     after_bin="$after_dir/target/release/pivot-bench"
+    before_server="$before_dir/target/release/pivotdb-server"
+    after_server="$after_dir/target/release/pivotdb-server"
 fi
-[[ -x "$before_bin" && -x "$after_bin" ]] || { echo "error: build produced no binary" >&2; exit 1; }
+for built in "$before_bin" "$after_bin" "$before_server" "$after_server"; do
+    [[ -x "$built" ]] || { echo "error: build produced no $built" >&2; exit 1; }
+done
 
 echo ">>> saving warm caches"
 save_cache "cargo-home" "$HOME/.cargo" registry git &
@@ -240,6 +251,8 @@ if [[ "$mode" == "pgo" ]]; then
     save_cache "pgogen-after" "$after_dir/benchmarks/target-pgogen" &
     save_cache "pgouse-before" "$before_dir/benchmarks/target-pgouse" &
     save_cache "pgouse-after" "$after_dir/benchmarks/target-pgouse" &
+    save_cache "client-before" "$before_dir/benchmarks/target-client" &
+    save_cache "client-after" "$after_dir/benchmarks/target-client" &
 else
     save_cache "release-before" "$before_dir/target" &
     save_cache "release-after" "$after_dir/target" &
@@ -263,9 +276,11 @@ fi
 echo ">>> burn-in + result capture (queries: $queries)"
 drop_caches
 "$before_bin" --suite tpch --suite-dir "$before_dir/benchmarks/tpch" \
+    --server-bin "$before_server" \
     --source "$measure_data" --query "$queries" --iterations 1 --update-results >/dev/null
 drop_caches
 "$after_bin" --suite tpch --suite-dir "$after_dir/benchmarks/tpch" \
+    --server-bin "$after_server" \
     --source "$measure_data" --query "$queries" --iterations 1 --update-results >/dev/null
 
 correctness="ok"
@@ -286,12 +301,12 @@ echo ">>> measuring (power passes=$passes, ${power_sleep}ms between queries, mod
 for pass in $(seq "$passes"); do
     drop_caches; sleep 3
     io_start="$(io_ticks)"
-    run_power "$before_bin" "$before_dir" >"$stream"
+    run_power "$before_bin" "$before_server" "$before_dir" >"$stream"
     awk -v side=before 'NF == 2 {print $1 "\t" side "\t" $2}' "$stream" >>"$rows"
     echo "    pass $pass before: $(wc -l <"$stream") queries timed, io $(io_delta "$io_start")s"
     drop_caches; sleep 3
     io_start="$(io_ticks)"
-    run_power "$after_bin" "$after_dir" >"$stream"
+    run_power "$after_bin" "$after_server" "$after_dir" >"$stream"
     awk -v side=after 'NF == 2 {print $1 "\t" side "\t" $2}' "$stream" >>"$rows"
     echo "    pass $pass after: $(wc -l <"$stream") queries timed, io $(io_delta "$io_start")s"
     if [[ "$run_duckdb" == "1" ]]; then

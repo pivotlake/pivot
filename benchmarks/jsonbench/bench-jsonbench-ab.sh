@@ -167,9 +167,10 @@ wait_for_download() {
 # one "__load__ <side> <load_ms> <load_ms>" row to $rows. cold is iteration 1
 # (a true cold read off the dropped cache), hot the min of the rest.
 run_suite_side() {
-    local bin="$1" dir="$2" side="$3"
+    local bin="$1" server="$2" dir="$3" side="$4"
     local out
     out="$("$bin" --suite jsonbench --suite-dir "$dir/benchmarks/jsonbench" \
+        --server-bin "$server" \
         --source "$measure_data" --query "$queries" \
         --iterations "$iterations" --drop-caches --skip-check 2>&1)" || true
 
@@ -261,6 +262,8 @@ if [[ "$mode" == "pgo" ]]; then
     restore_cache "pgogen-after" "$after_dir/benchmarks/target-pgogen" & restore_pids+=($!)
     restore_cache "pgouse-before" "$before_dir/benchmarks/target-pgouse" & restore_pids+=($!)
     restore_cache "pgouse-after" "$after_dir/benchmarks/target-pgouse" & restore_pids+=($!)
+    restore_cache "client-before" "$before_dir/benchmarks/target-client" & restore_pids+=($!)
+    restore_cache "client-after" "$after_dir/benchmarks/target-client" & restore_pids+=($!)
 else
     restore_cache "release-before" "$before_dir/target" & restore_pids+=($!)
     restore_cache "release-after" "$after_dir/target" & restore_pids+=($!)
@@ -284,8 +287,10 @@ if [[ "$mode" == "pgo" ]]; then
     build_use "$after_dir" after & b2=$!
     wait "$b1"; wait "$b2"
 
-    before_bin="$before_dir/benchmarks/target-pgouse/$host_target/release/pivot-bench"
-    after_bin="$after_dir/benchmarks/target-pgouse/$host_target/release/pivot-bench"
+    before_bin="$before_dir/benchmarks/target-client/release/pivot-bench"
+    after_bin="$after_dir/benchmarks/target-client/release/pivot-bench"
+    before_server="$before_dir/benchmarks/target-pgouse/$host_target/release/pivotdb-server"
+    after_server="$after_dir/benchmarks/target-pgouse/$host_target/release/pivotdb-server"
 else
     echo ">>> release builds (A and B in parallel)"
     build_release "$before_dir" & b1=$!
@@ -293,8 +298,12 @@ else
     wait "$b1"; wait "$b2"
     before_bin="$before_dir/target/release/pivot-bench"
     after_bin="$after_dir/target/release/pivot-bench"
+    before_server="$before_dir/target/release/pivotdb-server"
+    after_server="$after_dir/target/release/pivotdb-server"
 fi
-[[ -x "$before_bin" && -x "$after_bin" ]] || { echo "error: build produced no binary" >&2; exit 1; }
+for built in "$before_bin" "$after_bin" "$before_server" "$after_server"; do
+    [[ -x "$built" ]] || { echo "error: build produced no $built" >&2; exit 1; }
+done
 
 echo ">>> saving warm caches"
 save_cache "cargo-home" "$HOME/.cargo" registry git &
@@ -303,6 +312,8 @@ if [[ "$mode" == "pgo" ]]; then
     save_cache "pgogen-after" "$after_dir/benchmarks/target-pgogen" &
     save_cache "pgouse-before" "$before_dir/benchmarks/target-pgouse" &
     save_cache "pgouse-after" "$after_dir/benchmarks/target-pgouse" &
+    save_cache "client-before" "$before_dir/benchmarks/target-client" &
+    save_cache "client-after" "$after_dir/benchmarks/target-client" &
 else
     save_cache "release-before" "$before_dir/target" &
     save_cache "release-after" "$after_dir/target" &
@@ -322,8 +333,10 @@ fi
 IFS=',' read -ra qlist <<<"$queries"
 echo ">>> burn-in + result capture (queries: $queries)"
 "$before_bin" --suite jsonbench --suite-dir "$before_dir/benchmarks/jsonbench" \
+    --server-bin "$before_server" \
     --source "$measure_data" --query "$queries" --iterations 1 --update-results >/dev/null
 "$after_bin" --suite jsonbench --suite-dir "$after_dir/benchmarks/jsonbench" \
+    --server-bin "$after_server" \
     --source "$measure_data" --query "$queries" --iterations 1 --update-results >/dev/null
 
 correctness="ok"
@@ -341,8 +354,8 @@ rows="/tmp/ab-rows.tsv"
 : >"$rows"
 echo ">>> measuring (scale=$scale iterations=$iterations passes=$passes mode=$mode)"
 for pass in $(seq "$passes"); do
-    run_suite_side "$before_bin" "$before_dir" before
-    run_suite_side "$after_bin" "$after_dir" after
+    run_suite_side "$before_bin" "$before_server" "$before_dir" before
+    run_suite_side "$after_bin" "$after_server" "$after_dir" after
     if [[ "$run_duckdb" == "1" ]]; then
         run_duckdb_side "$after_dir/benchmarks/jsonbench"
     fi

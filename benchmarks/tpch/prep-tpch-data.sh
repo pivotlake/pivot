@@ -4,6 +4,7 @@
 #
 # The canonical datasets (generated with tpchgen-cli, see the schema comment in
 # setup.sql):
+#   s3://epsio-tpch/sf1/                       SF1,   ~0.4 GB (PGO profiling)
 #   s3://epsio-tpch/sf10/                      SF10,  ~3.9 GB
 #   s3://epsio-tpch/sf100/                     SF100, ~41.5 GB, 7 MiB row groups
 #   s3://epsio-tpch/sf100-large-row-groups/    SF100, ~35.8 GB, 128 MiB row groups
