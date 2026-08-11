@@ -15,8 +15,8 @@ use std::sync::Arc;
 use crate::parquet::{ParquetTable, table_input};
 use arrow::compute::cast;
 use arrow_array::types::{
-    Date32Type, Decimal64Type, Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type,
-    Int64Type, TimestampMicrosecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+    Date32Type, Decimal64Type, Decimal128Type, Float32Type, Float64Type, Int8Type, Int16Type,
+    Int32Type, Int64Type, TimestampMicrosecondType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow_array::{
     Array, ArrayRef, ArrowPrimitiveType, BinaryViewArray, Date32Array, PrimitiveArray, RecordBatch,
@@ -384,8 +384,10 @@ type_tests! {
     // encoder gives up, so all three of its shapes take the dictionary.
     uint8 => primitive::<UInt8Type>(DICTIONARY, |row| (row % 256) as u8, as_is);
     uint16 => primitive::<UInt16Type>(PLAIN, |row| 40_000u16.wrapping_add(row as u16), as_is);
-    // The narrow signed int a SMALLINT column lands on: stored in INT32 and
-    // annotated with its true width, so it reads back narrow.
+    // The narrow signed ints, stored in INT32 and annotated with their true
+    // width, so they read back narrow rather than as what carried them. An i8
+    // holds 256 values at most, so even its distinct shape is a dictionary.
+    int8 => primitive::<Int8Type>(DICTIONARY, |row| (row as i8).wrapping_mul(3), as_is);
     int16 => primitive::<Int16Type>(PLAIN, |row| (row as i16).wrapping_mul(7), as_is);
     uint32 => primitive::<UInt32Type>(PLAIN, |row| 4_000_000_000 + row as u32, as_is);
     uint64 => primitive::<UInt64Type>(

@@ -68,20 +68,6 @@ impl UnaryFactory<RecordBatch, ColumnChunkJob> for IndexerFactory {
     }
 }
 
-/// The default for [`Indexer`]'s file bound: how many bytes of rows a file
-/// holds before the indexer cuts it and starts another.
-///
-/// A partition's rows are written out as they arrive rather than held until the
-/// partition ends: an unpartitioned insert is one partition however large the
-/// table is, so holding one would mean buffering the whole insert before
-/// writing a byte of it.
-///
-/// The bound is bytes rather than rows because rows differ enormously in width
-/// — a hundred-column row is orders of magnitude larger than a narrow one — and
-/// what has to stay bounded is the memory a file's rows occupy while they wait,
-/// not how many of them there are.
-const TARGET_FILE_BYTES: usize = 128 * 1024 * 1024;
-
 /// The partition whose chunks are still arriving: its identity and everything
 /// collected so far.
 struct OpenPartition {
@@ -101,7 +87,8 @@ struct OpenPartition {
 pub(super) struct Indexer {
     partition_by: Arc<[String]>,
     target_rows_per_group: usize,
-    /// Bytes of rows a file holds before it is cut; see [`TARGET_FILE_BYTES`].
+    /// Bytes of rows a file holds before it is cut, counting both the values'
+    /// own size and the ring slabs holding them.
     target_file_bytes: usize,
     worker_count: usize,
     /// Encodes a batch's partition columns into its comparable tuple; built
@@ -153,7 +140,7 @@ impl Indexer {
 
     /// Send a file's worth of a partition off as one file: identity-gather jobs
     /// over its chunk list, one row group per `target_rows_per_group` window. A
-    /// partition holding more than [`TARGET_FILE_BYTES`] becomes several files,
+    /// partition holding more than `target_file_bytes` becomes several files,
     /// all carrying its partition values. The
     /// file's shredding is only *planned* here; every rewrite of row data,
     /// shredding included, belongs to the encode workers.
