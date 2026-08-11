@@ -13,6 +13,7 @@
 #   ./run-duckdb.sh --source ~/tpch-sf100 --no-drop-caches   # skip the cache drop
 #   ./run-duckdb.sh --source ~/tpch-sf100 --query 12 --write-expected  # write q12.tsv
 #   ./run-duckdb.sh --data native --source /mnt/nvme/tpch-native.duckdb --query 12
+#   ./run-duckdb.sh --source ~/tpch-sf100 --sleep 500        # quiet gap between queries
 #
 # We always report DuckDB's own `.timer` "Run Time" (query execution only).
 #
@@ -30,6 +31,13 @@
 #
 # The OS page cache is dropped once before each query (needs root, via sudo),
 # so iteration 1 is a true cold read; --no-drop-caches skips that.
+#
+# --sleep MS leaves a quiet gap before each query but the first (and, in
+# per-iteration mode, between a query's iterations), matching pivot-bench's
+# --sleep.
+#
+# --suite-dir overrides where qNN.sql / qNN.tsv live (default: this script's
+# own directory), so a shipped copy of this script can run a checkout's suite.
 #
 # --write-expected runs each query once and writes its rows to the suite's
 # qNN.tsv in pivot-bench's exact wire format (tab-separated, no header, NULL as
@@ -50,13 +58,14 @@ duckdb_process="single"
 data="parquet"
 
 usage() {
-    sed -n '3,37p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,45p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --source)     source_path="$2"; shift 2 ;;
+        --suite-dir)  suite_dir="$2"; shift 2 ;;
         --query)      queries="$2"; shift 2 ;;
         --iterations) iterations="$2"; shift 2 ;;
         --sleep)      sleep_ms="$2"; shift 2 ;;
@@ -149,6 +158,7 @@ if [[ "$write_expected" != "1" ]]; then
     fi
 fi
 
+queries_timed=0
 for f in "${query_files[@]}"; do
     stem="$(basename "$f" .sql)"
     [[ -f "$suite_dir/$stem-duckdb.sql" ]] && f="$suite_dir/$stem-duckdb.sql"
@@ -166,6 +176,11 @@ for f in "${query_files[@]}"; do
         echo
         continue
     fi
+
+    if [[ "$queries_timed" -gt 0 && "${sleep_ms:-0}" -gt 0 ]]; then
+        sleep "$(awk "BEGIN{print $sleep_ms/1000}")"
+    fi
+    queries_timed=$((queries_timed + 1))
 
     flush_page_cache
     if [[ "$duckdb_process" == "single" ]]; then

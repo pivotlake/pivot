@@ -1,55 +1,64 @@
 #!/usr/bin/env bash
 #
-# bench-tpch-flat-ab.sh - A/B performance comparison of two pivotdb commits on the
-# TPC-H flat suite, run on a freshly launched instance-store machine.
+# bench-tpch-ab.sh - A/B performance comparison of two pivotdb commits on the
+# normalized TPC-H suite, run on a freshly launched instance-store machine.
 #
 # Owns the whole box side: checks both commits out of the AMI-baked repo clone,
-# formats and mounts the instance-store NVMe, syncs the datasets from S3 (small
-# PGO scale first, then the measurement scale) while both sides build, builds a
-# per-side pivot-bench (PGO by default, plain release with --mode release),
-# restores/saves warm cargo target dirs from S3 so only the commit diff and the
-# profile-dependent Rust units recompile, then times the suite cold and hot
-# with the two sides interleaved per query so slow drift in instance-store
-# throughput (fresh boots read measurably faster than steady state) hits both
-# sides equally. Optionally times DuckDB over the same parquet as a reference
-# column; DuckDB never gates the run.
+# formats and mounts the instance-store NVMe, syncs the per-table datasets from
+# S3 (small PGO scale first, then the measurement scale) while both sides
+# build, builds a per-side pivot-bench (PGO by default, plain release with
+# --mode release), and restores/saves warm cargo target dirs from S3 so only
+# the commit diff and the profile-dependent Rust units recompile.
 #
-# The gate: any query whose COLD time regresses after vs before by at least
+# The measurement is a cold power run per side and pass: one pivot-bench
+# process streams the whole suite, each query once, a quiet gap between
+# queries, caches dropped only before the stream starts. Later queries reuse
+# whatever earlier ones left in pivot's file cache and the OS page cache.
+# Sides alternate within each pass and the per-query cold time is the min
+# across passes.
+#
+# The gate: any query whose cold time regresses after vs before by at least
 # --regression-pct fails the run, as does a missing timing or an output
 # mismatch between the two sides.
+#
+# With --duckdb, DuckDB gets the same stream shape as a reference column via
+# run-duckdb.sh: caches dropped once before the stream, the same gap between
+# queries, no drops in between. It never gates.
 #
 # The box-side machinery it shares with the other A/B harnesses (NVMe mount,
 # checkouts, S3 dataset sync, warm-cache restore/save, PGO builds,
 # correctness) lives in benchmarks/lib/bench-ab-common.sh; what is specific to
-# the TPC-H flat suite stays here: the per-query interleaved measurement.
+# the normalized TPC-H suite stays here: the power-run measurement.
 #
 # Meant to be launched detached and polled over ssh, so it writes its PID and
 # emits a sentinel on every exit path.
 #
 # Usage:
-#   bench-tpch-flat-ab.sh \
+#   bench-tpch-ab.sh \
 #     --mirror /opt/pivotdb --repo-url <tokenised fetch url> \
 #     --before <sha> --after <sha> \
-#     --data-bucket s3://bucket/prefix --cache-prefix s3://bucket/cache \
-#     [--mode pgo|release] [--iterations 3] [--passes 2] [--regression-pct 5] \
+#     --data-bucket s3://bucket --cache-prefix s3://bucket/cache \
+#     [--mode pgo|release] [--passes 2] [--regression-pct 5] \
 #     [--query q06,q12] [--duckdb] [--bench-env 'PIVOT_X=1 PIVOT_Y=true'] \
 #     [--report /tmp/ab-report.txt] [--before-label <sha>] [--after-label <sha>]
 
 set -uo pipefail
 
-# The shared library sits at ../lib in the repo, but the workflow ships both
-# files flat into one /tmp directory on the box; find it either way.
+# The shared library and the DuckDB runner sit next to this script in the
+# repo, but the workflow ships all three flat into one /tmp directory on the
+# box; find them either way.
 _here="${BASH_SOURCE[0]%/*}"
 _common="$_here/bench-ab-common.sh"
 [[ -f "$_common" ]] || _common="$_here/../lib/bench-ab-common.sh"
 # shellcheck source=../lib/bench-ab-common.sh
 source "$_common"
+duckdb_runner="$_here/run-duckdb.sh"
 
-pid_file="${PID_FILE:-/tmp/bench-tpch-flat-ab.pid}"
+pid_file="${PID_FILE:-/tmp/bench-tpch-ab.pid}"
 echo $$ >"$pid_file"
 # Fire on every exit path carrying the real exit code, so a poller watching the
 # log never hangs on a silent failure.
-trap 'echo "=== BENCH-TPCH-FLAT-AB COMPLETE exit=$? ==="' EXIT
+trap 'echo "=== BENCH-TPCH-AB COMPLETE exit=$? ==="' EXIT
 set -e
 
 mirror="/opt/pivotdb"
@@ -61,7 +70,6 @@ data_bucket=""
 data_root="/mnt/nvme/tpch"
 cache_prefix=""
 mode="pgo"
-iterations=3
 passes=2
 regression_pct=5
 queries=""
@@ -82,7 +90,6 @@ while [[ $# -gt 0 ]]; do
         --data-root)      data_root="$2"; shift 2 ;;
         --cache-prefix)   cache_prefix="$2"; shift 2 ;;
         --mode)           mode="$2"; shift 2 ;;
-        --iterations)     iterations="$2"; shift 2 ;;
         --passes)         passes="$2"; shift 2 ;;
         --regression-pct) regression_pct="$2"; shift 2 ;;
         --query)          queries="$2"; shift 2 ;;
@@ -111,65 +118,54 @@ fi
 
 ab_common_init
 
+power_sleep=500
 sf_pgo="sf10"
 sf_measure="sf100"
-pgo_data="$data_root/$sf_pgo/flat"
-measure_data="$data_root/$sf_measure/flat"
+pgo_data="$data_root/$sf_pgo"
+measure_data="$data_root/$sf_measure"
 
 # ---------------------------------------------------------------------------
 # Measurement helpers. The dataset sync (sync_scale/wait_for_scale) and the
 # io_ticks disk-state signal come from bench-ab-common.sh.
 # ---------------------------------------------------------------------------
-data_dev="" # set after mount, for the io_ticks sanity column
+data_dev="" # set after mount, for the io sanity signal
 
-# Runs one side's pivot-bench for one query with $iterations tries in one
-# process, echoing "cold hot io_seconds": cold is try 1 in ms, hot the min of
-# the rest ("null" when missing), io_seconds the device's io_ticks delta as a
-# disk-state sanity signal.
-run_pivot() {
-    local bin="$1" dir="$2" query="$3"
-    local t0 t1 out times
-    t0="$(io_ticks)"
-    out="$("$bin" --suite tpch-flat --suite-dir "$dir/benchmarks/tpch-flat" \
-        --source "$measure_data" --query "$query" \
-        --iterations "$iterations" --skip-check 2>&1)" || true
-    t1="$(io_ticks)"
-    # Timing lines end in "<ms>ms"; take the numbers without depending on the
-    # separator glyph the runner prints.
-    times="$(grep -E "Query q[0-9]+" <<<"$out" | grep -oE '[0-9]+ms$' | sed 's/ms//')"
-    local cold="null" hot="null" t
-    while IFS= read -r t; do
-        [[ -n "$t" ]] || continue
-        if [[ "$cold" == "null" ]]; then cold="$t"
-        elif [[ "$hot" == "null" || "$t" -lt "$hot" ]]; then hot="$t"; fi
-    done <<<"$times"
-    echo "$cold $hot $(awk -v a="${t0:-0}" -v b="${t1:-0}" 'BEGIN{printf "%.1f", (b-a)/1000}')"
+io_delta() {
+    awk -v a="${1:-0}" -v b="$(io_ticks)" 'BEGIN{printf "%.1f", (b - a) / 1000}'
 }
 
-# Same contract for DuckDB: one process, the view created once, the query run
-# $iterations times with .timer on; times parsed from "Run Time (s): real X".
-run_duckdb_query() {
-    local sql_file="$1"
-    local script times
-    script="$(mktemp)"
-    {
-        echo ".bail on"
-        echo "CREATE VIEW tpch_flat AS SELECT * FROM read_parquet('$measure_data/*.parquet');"
-        echo ".timer on"
-        for _ in $(seq "$iterations"); do
-            # Exactly one trailing semicolon regardless of how the file ends.
-            sed -e '$ s/[[:space:];]*$/;/' "$sql_file"
-        done
-    } >"$script"
-    times="$(duckdb <"$script" 2>&1 | grep -oE 'real[[:space:]]+[0-9.]+' | awk '{print int($2 * 1000)}')" || true
-    rm -f "$script"
-    local cold="null" hot="null" t
-    while IFS= read -r t; do
-        [[ -n "$t" ]] || continue
-        if [[ "$cold" == "null" ]]; then cold="$t"
-        elif [[ "$hot" == "null" || "$t" -lt "$hot" ]]; then hot="$t"; fi
-    done <<<"$times"
-    echo "$cold $hot"
+# Streams one side's whole suite in a single pivot-bench process: each query
+# once, ${power_sleep}ms of quiet before the next (with --iterations 1 the
+# runner's --sleep fires in its per-query loop, skipping the first query).
+# Caches are NOT dropped between queries; the caller drops them once before
+# the stream, so later queries keep whatever earlier ones cached. Echoes
+# "<query> <ms>" per line, in suite order.
+run_power() {
+    local bin="$1" dir="$2" out
+    out="$("$bin" --suite tpch --suite-dir "$dir/benchmarks/tpch" \
+        --source "$measure_data" --query "$queries" \
+        --iterations 1 --sleep "$power_sleep" --skip-check 2>&1)" || true
+    # Timing lines end in "<ms>ms"; take those alone (the runner also prints a
+    # per-query header) without depending on the separator glyph it prints
+    # between the query id and the time.
+    grep -E "Query q[0-9]+.*[0-9]ms$" <<<"$out" \
+        | sed -E 's/^.*Query (q[0-9]+).*[[:space:]]([0-9]+)ms$/\1 \2/'
+}
+
+# The same stream shape for DuckDB via run-duckdb.sh: the caller drops caches
+# once before the stream, the runner never does (--no-drop-caches), and the
+# same gap separates queries. Query files come from the after checkout.
+# Echoes "<query> <ms>" per line.
+run_duckdb_power() {
+    local out
+    out="$(bash "$duckdb_runner" --suite-dir "$after_dir/benchmarks/tpch" \
+        --source "$measure_data" --query "$queries" \
+        --iterations 1 --sleep "$power_sleep" --no-drop-caches 2>&1)" || true
+    awk '/^=== q[0-9]+ ===$/ { query = $2; next }
+        /Run Time/ {
+            for (i = 1; i <= NF; i++)
+                if ($i == "real") { printf "%s %d\n", query, $(i + 1) * 1000; break }
+        }' <<<"$out"
 }
 
 # ---------------------------------------------------------------------------
@@ -217,8 +213,8 @@ if [[ "$mode" == "pgo" ]]; then
     echo ">>> waiting for the $sf_pgo dataset"
     wait_for_scale "$sf_pgo"
     echo ">>> profiling runs on $sf_pgo"
-    profile_side "$before_dir" before tpch-flat "$pgo_data"
-    profile_side "$after_dir" after tpch-flat "$pgo_data"
+    profile_side "$before_dir" before tpch "$pgo_data"
+    profile_side "$after_dir" after tpch "$pgo_data"
 
     echo ">>> profile-use builds (A and B in parallel)"
     build_use "$before_dir" before & b1=$!
@@ -261,57 +257,59 @@ wait
 # last digit unstable); a real mismatch fails the run.
 # ---------------------------------------------------------------------------
 if [[ -z "$queries" ]]; then
-    queries="$(cd "$after_dir/benchmarks/tpch-flat" && ls q*.sql | sed 's/\.sql$//' | paste -sd,)"
+    queries="$(cd "$after_dir/benchmarks/tpch" \
+        && ls q*.sql | grep -v -- '-duckdb' | sed 's/\.sql$//' | paste -sd,)"
 fi
 echo ">>> burn-in + result capture (queries: $queries)"
 drop_caches
-"$before_bin" --suite tpch-flat --suite-dir "$before_dir/benchmarks/tpch-flat" \
+"$before_bin" --suite tpch --suite-dir "$before_dir/benchmarks/tpch" \
     --source "$measure_data" --query "$queries" --iterations 1 --update-results >/dev/null
 drop_caches
-"$after_bin" --suite tpch-flat --suite-dir "$after_dir/benchmarks/tpch-flat" \
+"$after_bin" --suite tpch --suite-dir "$after_dir/benchmarks/tpch" \
     --source "$measure_data" --query "$queries" --iterations 1 --update-results >/dev/null
 
 correctness="ok"
-if ! compare_outputs "$before_dir/benchmarks/tpch-flat" "$after_dir/benchmarks/tpch-flat"; then
+if ! compare_outputs "$before_dir/benchmarks/tpch" "$after_dir/benchmarks/tpch"; then
     correctness="MISMATCH"
 fi
 
 # ---------------------------------------------------------------------------
-# Phase 3: measurement, sides interleaved per query. Every timed run starts
-# from a dropped page cache; hot iterations reuse the warm process exactly the
-# way the suite is normally run.
+# Phase 3: measurement, one power stream per side and pass, sides alternating
+# within a pass so slow drift in instance-store throughput hits both equally.
+# A stream is a single cold sample per query; several passes with a per-query
+# min give the gate a stable number.
 # ---------------------------------------------------------------------------
-# Cold times off a dropped cache are single samples and instance-store reads
-# drift; several interleaved passes with a per-query min give a stable cold
-# number the gate can trust.
 rows="/tmp/ab-rows.tsv"
 : >"$rows"
-IFS=',' read -ra qlist <<<"$queries"
-echo ">>> measuring (iterations=$iterations, passes=$passes, mode=$mode)"
+stream="/tmp/ab-stream.txt"
+echo ">>> measuring (power passes=$passes, ${power_sleep}ms between queries, mode=$mode)"
 for pass in $(seq "$passes"); do
-    for q in "${qlist[@]}"; do
+    drop_caches; sleep 3
+    io_start="$(io_ticks)"
+    run_power "$before_bin" "$before_dir" >"$stream"
+    awk -v side=before 'NF == 2 {print $1 "\t" side "\t" $2}' "$stream" >>"$rows"
+    echo "    pass $pass before: $(wc -l <"$stream") queries timed, io $(io_delta "$io_start")s"
+    drop_caches; sleep 3
+    io_start="$(io_ticks)"
+    run_power "$after_bin" "$after_dir" >"$stream"
+    awk -v side=after 'NF == 2 {print $1 "\t" side "\t" $2}' "$stream" >>"$rows"
+    echo "    pass $pass after: $(wc -l <"$stream") queries timed, io $(io_delta "$io_start")s"
+    if [[ "$run_duckdb" == "1" ]]; then
         drop_caches; sleep 3
-        read -r cold hot io <<<"$(run_pivot "$before_bin" "$before_dir" "$q")"
-        echo -e "$q\tbefore\t$cold\t$hot\t$io" >>"$rows"
-        drop_caches; sleep 3
-        read -r cold hot io <<<"$(run_pivot "$after_bin" "$after_dir" "$q")"
-        echo -e "$q\tafter\t$cold\t$hot\t$io" >>"$rows"
-        if [[ "$run_duckdb" == "1" ]]; then
-            drop_caches; sleep 3
-            read -r cold hot <<<"$(run_duckdb_query "$after_dir/benchmarks/tpch-flat/$q.sql")"
-            echo -e "$q\tduckdb\t$cold\t$hot\t-" >>"$rows"
-        fi
-        echo "    $q pass $pass done"
-    done
+        run_duckdb_power >"$stream"
+        awk -v side=duckdb 'NF == 2 {print $1 "\t" side "\t" $2}' "$stream" >>"$rows"
+        echo "    pass $pass duckdb: $(wc -l <"$stream") queries timed"
+    fi
 done
 
 # ---------------------------------------------------------------------------
-# Report + gate. Cold is the gate (this suite optimizes cold reads); hot and
-# the io column are informational. DuckDB, when present, is a reference only.
+# Report + gate. Cold, the only number a power stream yields, is the gate.
+# DuckDB, when present, is a reference only.
 # ---------------------------------------------------------------------------
 {
-    echo "=== TPC-H flat A/B: '$before_label' (before) vs '$after_label' (after) ==="
-    echo "mode=$mode source=$measure_data iterations=$iterations passes=$passes regression_pct=$regression_pct (cold/hot are per-query mins across passes)"
+    echo "=== TPC-H A/B: '$before_label' (before) vs '$after_label' (after) ==="
+    echo "mode=$mode source=$measure_data passes=$passes regression_pct=$regression_pct"
+    echo "shape: cold power runs; per side and pass, one process streams every query once, ${power_sleep}ms apart, caches dropped only before the stream; cold = per-query min across passes"
     [[ -n "$bench_env" ]] && echo "bench_env=$bench_env"
     [[ "$mode" == "release" ]] && echo "NOTE: release mode is non-PGO; numbers carry code-alignment noise, use for iteration only"
     echo "correctness (before vs after, 1e-6 relative): $correctness"
@@ -320,22 +318,17 @@ done
 
 failures="$(awk -F'\t' -v t="$regression_pct" -v duck="$run_duckdb" '
 function pct(b, a) { b = (b < 1 ? 1 : b); return (a - b) / b * 100 }
-function valid(x) { return (x != "" && x != "null") }
-function keepmin(arr, k, v) {
-    if (v == "null") { if (!(k in arr)) arr[k] = v; return }
-    if (!(k in arr) || arr[k] == "null" || v + 0 < arr[k] + 0) arr[k] = v
-}
-{ keepmin(c, $1 "," $2, $3); keepmin(h, $1 "," $2, $4); io[$1 "," $2] = $5
-  if (!seen[$1]++) order[n++] = $1 }
+function valid(x) { return (x != "") }
+function keepmin(arr, k, v) { if (!(k in arr) || v + 0 < arr[k] + 0) arr[k] = v }
+{ keepmin(c, $1 "," $2, $3); if (!seen[$1]++) order[n++] = $1 }
 END {
-    hdr = sprintf("%-5s %8s %8s %8s   %8s %8s %8s   %7s", \
-        "query", "cold_b", "cold_a", "coldD%", "hot_b", "hot_a", "hotD%", "io_b/a")
-    if (duck == 1) hdr = hdr sprintf("   %8s %8s %7s", "dk_cold", "dk_hot", "a/dk")
+    hdr = sprintf("%-5s %8s %8s %8s", "query", "cold_b", "cold_a", "coldD%")
+    if (duck == 1) hdr = hdr sprintf("   %8s %7s", "duckdb", "a/dk")
     print hdr "  status" > "/dev/stderr"
     for (i = 0; i < n; i++) {
         q = order[i]
-        cb = c[q ",before"]; ca = c[q ",after"]; hb = h[q ",before"]; ha = h[q ",after"]
-        status = "ok"; cd = "-"; hd = "-"
+        cb = c[q ",before"]; ca = c[q ",after"]
+        status = "ok"; cd = "-"
         if (!valid(cb) || !valid(ca)) {
             status = "ERR"; print q " ERR (missing timing)"
         } else {
@@ -343,18 +336,16 @@ END {
             if (cp >= t) { status = "REGRESSION"; print q " cold " cd }
             else if (cp <= -t) status = "improved"
         }
-        if (valid(hb) && valid(ha)) hd = sprintf("%+.1f%%", pct(hb, ha))
-        line = sprintf("%-5s %8s %8s %8s   %8s %8s %8s   %7s", \
-            q, cb, ca, cd, hb, ha, hd, io[q ",before"] "/" io[q ",after"])
+        line = sprintf("%-5s %8s %8s %8s", q, cb, ca, cd)
         if (duck == 1) {
-            dc = c[q ",duckdb"]; dh = h[q ",duckdb"]; r = "-"
-            if (valid(ca) && valid(dc)) r = sprintf("%.2fx", (ca + 10) / (dc + 10))
-            line = line sprintf("   %8s %8s %7s", dc, dh, r)
+            dc = c[q ",duckdb"]; ratio = "-"
+            if (valid(ca) && valid(dc)) ratio = sprintf("%.2fx", (ca + 10) / (dc + 10))
+            line = line sprintf("   %8s %7s", dc, ratio)
         }
         print line "  " status > "/dev/stderr"
         if (valid(cb) && valid(ca)) {
-            b = (cb < ca ? cb : ca)
-            bcl += log((cb + 10) / (b + 10)); acl += log((ca + 10) / (b + 10)); cn++
+            best = (cb < ca ? cb : ca)
+            bcl += log((cb + 10) / (best + 10)); acl += log((ca + 10) / (best + 10)); cn++
             sb += cb; sa += ca
         }
     }

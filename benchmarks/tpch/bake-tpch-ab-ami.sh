@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# bake-tpch-ab-ami.sh - build the AMI the TPC-H A/B workflow launches
-# (.github/workflows/tpch-ab.yml, which runs benchmarks/tpch/bench-tpch-ab.sh).
+# bake-tpch-ab-ami.sh - build the AMI the A/B workflows launch
+# (.github/workflows/tpch-ab.yml, tpch-flat-ab.yml and jsonbench-ab.yml, which
+# run benchmarks/{tpch,tpch-flat,jsonbench}/bench-*-ab.sh).
 #
 # Bakes everything the box needs so a fresh instance is ready to build within
 # seconds of ssh coming up: the Rust toolchain (+ llvm-tools for profdata),

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # bench-ab-common.sh - shared box-side machinery for the A/B benchmark harnesses
-# (benchmarks/tpch/bench-tpch-ab.sh and benchmarks/jsonbench/bench-jsonbench-ab.sh).
+# (benchmarks/tpch/bench-tpch-ab.sh, benchmarks/tpch-flat/bench-tpch-flat-ab.sh
+# and benchmarks/jsonbench/bench-jsonbench-ab.sh).
 #
 # Sourced, not executed. It defines functions only; it runs nothing at source
 # time and does not set shell options, so each harness keeps its own `set`.
@@ -11,6 +12,9 @@
 #   mirror        - path to the AMI-baked repo clone (source of local checkouts)
 #   work_dir      - scratch dir for checkouts, profiles, profdata
 #   data_root     - root under the instance-store mount (its parent is the mount)
+#   data_bucket   - s3://.../prefix holding one directory per dataset scale
+#   sync_pid      - pid of the backgrounded sync_scale chain (for wait_for_scale)
+#   data_dev      - block device under data_root, without /dev/ (for io_ticks)
 #   cache_prefix  - s3://.../key prefix for warm caches ("" disables them)
 #   cache_key     - compiler+target fingerprint (set by ab_common_init)
 #   host_target   - rustc host target triple (set by ab_common_init)
@@ -82,6 +86,49 @@ checkout_side() {
         submodule update --quiet --init --recursive
     git -C "$dir" restore-mtime --quiet
     git -C "$dir" submodule foreach --quiet --recursive 'git restore-mtime --quiet'
+}
+
+# ---------------------------------------------------------------------------
+# Dataset sync from S3, one directory per scale under $data_bucket. Meant to
+# run backgrounded so the builds overlap it; each finished scale is marked
+# with a .done sentinel that wait_for_scale blocks on. s5cmd parallelises far
+# past what aws-cli does; the second pass catches anything a first pass
+# dropped.
+# ---------------------------------------------------------------------------
+sync_scale() {
+    local scale="$1"
+    if [[ -f "$data_root/$scale.done" ]]; then return; fi
+    mkdir -p "$data_root/$scale"
+    if command -v s5cmd >/dev/null; then
+        for _ in 1 2; do
+            s5cmd --log error sync "$data_bucket/$scale/*" "$data_root/$scale/" >/dev/null
+        done
+    else
+        for _ in 1 2 3; do
+            aws s3 sync --only-show-errors "$data_bucket/$scale" "$data_root/$scale"
+        done
+    fi
+    touch "$data_root/$scale.done"
+    echo ">>> dataset $scale synced"
+}
+
+wait_for_scale() {
+    local scale="$1"
+    while [[ ! -f "$data_root/$scale.done" ]]; do
+        if ! kill -0 "$sync_pid" 2>/dev/null; then
+            echo "error: dataset sync died before $scale finished" >&2
+            exit 1
+        fi
+        sleep 5
+    done
+}
+
+# Milliseconds the data device has spent with IO in flight, cumulative since
+# boot; deltas around a measured run give a disk-state sanity signal. Returns
+# nothing until the harness sets data_dev after mounting.
+io_ticks() {
+    [[ -n "$data_dev" ]] || return 0
+    awk '{print $10}' "/sys/block/$data_dev/stat"
 }
 
 # ---------------------------------------------------------------------------
