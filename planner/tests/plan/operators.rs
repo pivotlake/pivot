@@ -383,6 +383,37 @@ fn correlated_scalar_subquery_becomes_a_delim_join(mut testing_planner: TestingP
     ");
 }
 
+/// NOT EXISTS decorrelates into an ANTI delim join: the same synthetic-CTE
+/// tee and Distinct as the other delim kinds, with the final join anti on the
+/// probe (outer) side and no build columns.
+#[rstest]
+fn a_not_exists_subquery_becomes_an_anti_delim_join(mut testing_planner: TestingPlanner) {
+    add_join_tables(&testing_planner);
+
+    let plan = testing_planner
+        .plan(
+            "SELECT o_key FROM orders WHERE NOT EXISTS \
+             (SELECT 1 FROM items WHERE i_order = o_key AND i_qty > 5)",
+        )
+        .unwrap();
+
+    assert_snapshot!(plan.to_string(), @"
+    Projection(o_key:Int64)
+      Cte(#9223372036854775807, sites: 2)
+        Input([o_key:Int64])
+        Cte(#9223372036854775808, sites: 1)
+          Distinct(keys: [0])
+            CteScan(#9223372036854775807)
+          Join[probe anti](probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [])
+            CteScan(#9223372036854775807)
+            Projection(o_key:Int64)
+              Join(probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [0])
+                Filter(i_qty:Int64 > 5:Int64 -> Boolean)
+                  Input([i_order:Int64, i_qty:Int64])
+                CteScan(#9223372036854775808)
+    ");
+}
+
 /// A LEFT JOIN preserving the larger relation stays LEFT in DuckDB's plan and
 /// lowers to the probe-side outer join: the preserved side streams as probe
 /// and its unmatched rows pad with null build columns.
