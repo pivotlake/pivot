@@ -47,12 +47,15 @@ as the engine grows the features each needs.
 | q18 | Large Volume Customer | orders semi-joined against the order keys whose quantities sum above 300, then the top 100 by price |
 | q19 | Discounted Revenue | lineitem/part, a three-disjunct OR over both sides riding the join as a residual condition |
 
-The rest of the 22 need engine features that are not in yet: ANTI delim joins
-(q21), mark joins (q16), and the `suffix` / `substring` scalar functions
-(q02, q16, q22). LEFT and SEMI delim joins (the shapes DuckDB decorrelates
-q04 and q17's correlated subqueries into) are supported: the outer side runs
-once and is read both by the join and by a distinct on the correlation
-columns, whose output feeds the subquery side's delim scans.
+The rest of the 22 need engine features that are not in yet: flipped delim
+joins, where DuckDB de-duplicates the right-hand side instead of the left
+(q21, q22), mark joins and the constant-chunk scan its IN-list rewrite
+produces (q16), RIGHT_SEMI (q20), and the `suffix` / `substring` scalar
+functions (q02, q22). LEFT, SEMI, and ANTI delim joins (the shapes DuckDB
+decorrelates q04 and q17's correlated subqueries, and a `NOT EXISTS`, into)
+are supported: the outer side runs once and is read both by the join and by
+a distinct on the correlation columns, whose output feeds the subquery
+side's delim scans.
 
 q11's HAVING threshold is the spec's `FRACTION = 0.0001 / SF`, written out for
 SF100 as `0.000001`; adjust it (and regenerate the oracle) for another scale.
@@ -75,6 +78,12 @@ hash table from at every scale factor. Its mirror image RIGHT_SEMI, which
 DuckDB's build-probe-side optimizer produces when the left child is the cheaper
 one instead, is not supported; q20 needs it (its delim join itself is the
 supported LEFT shape).
+
+Anti joins are supported on both sides: ANTI runs probe-side, and the
+RIGHT_ANTI that same optimizer rewrites it into whenever the preserved
+relation is the cheaper build lands build-side. What q21 and q22 still miss
+is not the anti join itself but the flipped delim join above it (q22 also
+needs `substring`).
 
 q10 plans and runs, but its `c_comment` group key comes back corrupted at SF100
 (fragments of other rows, with the length prefix of a neighbouring field showing
