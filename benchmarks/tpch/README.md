@@ -31,6 +31,7 @@ as the engine grows the features each needs.
 | Query | TPC-H | Shape |
 |-------|-------|-------|
 | q01 | Pricing Summary | no join: group by returnflag/linestatus, 8 aggregates |
+| q02 | Minimum Cost Supplier | 5 tables, `suffix()` from `LIKE '%BRASS'`, a correlated MIN subquery decorrelated into a delim join |
 | q03 | Shipping Priority | customer/orders/lineitem, top 10 by revenue |
 | q04 | Order Priority Checking | a correlated EXISTS decorrelated into a SEMI delim join |
 | q05 | Local Supplier Volume | 6 tables, one join on two keys (suppkey and nationkey), revenue per nation |
@@ -38,6 +39,7 @@ as the engine grows the features each needs.
 | q07 | Volume Shipping | 6 tables incl. nation twice, an OR over both nations riding the join as a residual condition |
 | q08 | National Market Share | 7 joins, `extract(year ...)` groups, share of two sums |
 | q09 | Product Type Profit | 6 tables, partsupp joined on two keys (suppkey and partkey), profit per nation per year |
+| q10 | Returned Item Reporting | customer/orders/lineitem/nation, top 20 customers by lost revenue |
 | q11 | Important Stock | partsupp/supplier/nation computed once as a CTE read twice, HAVING above a scalar subquery via a `>` range join |
 | q12 | Shipping Modes | orders/lineitem, CASE priority buckets per shipmode |
 | q13 | Customer Distribution | customer/orders outer join, orders per customer, then a histogram of those counts |
@@ -50,8 +52,8 @@ as the engine grows the features each needs.
 The rest of the 22 need engine features that are not in yet: flipped delim
 joins, where DuckDB de-duplicates the right-hand side instead of the left
 (q21, q22), mark joins and the constant-chunk scan its IN-list rewrite
-produces (q16), RIGHT_SEMI (q20), and the `suffix` / `substring` scalar
-functions (q02, q22). LEFT, SEMI, and ANTI delim joins (the shapes DuckDB
+produces (q16), RIGHT_SEMI (q20), and the `substring` scalar function
+(q22). LEFT, SEMI, and ANTI delim joins (the shapes DuckDB
 decorrelates q04 and q17's correlated subqueries, and a `NOT EXISTS`, into)
 are supported: the outer side runs once and is read both by the join and by
 a distinct on the correlation columns, whose output feeds the subquery
@@ -85,11 +87,13 @@ relation is the cheaper build lands build-side. What q21 and q22 still miss
 is not the anti join itself but the flipped delim join above it (q22 also
 needs `substring`).
 
-q10 plans and runs, but its `c_comment` group key comes back corrupted at SF100
-(fragments of other rows, with the length prefix of a neighbouring field showing
-up inside the string), so it is held back until that is fixed. The corruption
-needs scale: the same query is correct at SF0.05, and it appears whether or not
-the LIMIT reaches the group operator as a Top-K.
+q10 used to come back with a corrupted `c_comment` group key at SF100
+(fragments of other rows, with the length prefix of a neighbouring field
+showing up inside the string) and was held back for it. That no longer
+reproduces: five straight SF100 runs, cold and warm, matched DuckDB's oracle
+byte for byte, so the query is in the suite. Whatever fixed it went in
+unnoticed, so treat any future q10 mismatch as this bug resurfacing rather
+than a new one.
 
 q03 orders by a summed revenue and cuts with a LIMIT, so a tie in that sum would
 make its row order (and therefore the exact-string comparison) arbitrary. No tie
