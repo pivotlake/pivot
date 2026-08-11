@@ -58,7 +58,10 @@ mirror="/opt/pivotdb"
 repo_url=""
 before_sha=""
 after_sha=""
-work_dir="$HOME/ab"
+# Defaults to <nvme mount>/ab once data_root is known: the checkouts and their
+# target dirs run to well over 100GB across the sides while the AMI's root
+# volume is 40GB, so the builds must live on the instance store too.
+work_dir=""
 data_root="/mnt/nvme/jsonbench"
 cache_prefix=""
 scale="10m"
@@ -115,6 +118,8 @@ case "$scale" in
 esac
 
 ab_common_init
+
+work_dir="${work_dir:-$(dirname "$data_root")/ab}"
 
 # One file for the PGO profiling run, the requested scale for measurement, in
 # separate directories because pivot-bench loads every ndjson under --source.
@@ -235,8 +240,8 @@ run_duckdb_side() {
 # ---------------------------------------------------------------------------
 # Phase 0: disk, data, checkouts.
 # ---------------------------------------------------------------------------
-mkdir -p "$work_dir"
 mount_nvme
+mkdir -p "$work_dir"
 mkdir -p "$TMPDIR"
 
 ( download_scale 1 "$pgo_root"; download_scale "$measure_files" "$measure_root" ) &

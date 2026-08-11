@@ -65,7 +65,10 @@ mirror="/opt/pivotdb"
 repo_url=""
 before_sha=""
 after_sha=""
-work_dir="$HOME/ab"
+# Defaults to <nvme mount>/ab once data_root is known: the checkouts and their
+# target dirs run to well over 100GB across the sides while the AMI's root
+# volume is 40GB, so the builds must live on the instance store too.
+work_dir=""
 data_bucket=""
 data_root="/mnt/nvme/tpch"
 cache_prefix=""
@@ -118,6 +121,7 @@ fi
 
 ab_common_init
 
+work_dir="${work_dir:-$(dirname "$data_root")/ab}"
 power_sleep=500
 sf_pgo="sf1"
 # The pivot-written variant of SF100: the same rows as pivot's own writer
@@ -174,8 +178,8 @@ run_duckdb_power() {
 # ---------------------------------------------------------------------------
 # Phase 0: disk, data, checkouts.
 # ---------------------------------------------------------------------------
-mkdir -p "$work_dir"
 mount_nvme
+mkdir -p "$work_dir"
 data_dev="$(df --output=source "$(dirname "$data_root")" | tail -1 | sed 's|/dev/||')"
 
 ( sync_scale "$sf_pgo"; sync_scale "$sf_measure" ) &
