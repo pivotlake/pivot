@@ -157,22 +157,27 @@ impl Sender<()> for DiscardSender {
 
 /// Builds the probe result path and the disconnected build path into one
 /// per-worker operator graph.
-pub struct JoinRecordBatchOperatorFactory<BF, PF> {
+///
+/// Generic over the build channel so each join flavor picks its delivery: the
+/// hash join steals build batches across workers, the range join funnels the
+/// sorted chunks to one worker to keep their order.
+pub struct JoinRecordBatchOperatorFactory<BF, PF, BC = StealableChannelFactory<RecordBatch>> {
     pub probe_head: Box<dyn OperatorFactory<RecordBatch>>,
     pub build_head: Box<dyn OperatorFactory<RecordBatch>>,
     pub build_factory: BF,
     pub probe_factory: PF,
-    pub build_channel_factory: StealableChannelFactory<RecordBatch>,
+    pub build_channel_factory: BC,
     pub probe_channel_factory: StealableChannelFactory<RecordBatch>,
     pub build_siblings_left: Arc<AtomicUsize>,
     pub probe_siblings_left: Arc<AtomicUsize>,
     pub build_ready: Arc<AtomicBool>,
 }
 
-impl<BF, PF> OperatorFactory<RecordBatch> for JoinRecordBatchOperatorFactory<BF, PF>
+impl<BF, PF, BC> OperatorFactory<RecordBatch> for JoinRecordBatchOperatorFactory<BF, PF, BC>
 where
     BF: UnaryFactory<RecordBatch, ()>,
     PF: UnaryFactory<RecordBatch, RecordBatch>,
+    BC: ChannelFactory<RecordBatch>,
 {
     fn build(
         self: Box<Self>,

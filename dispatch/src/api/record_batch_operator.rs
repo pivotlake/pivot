@@ -45,20 +45,21 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{self, AtomicUsize};
 
 use arrow_array::RecordBatch;
 use arrow_schema::DataType;
 
 use crate::api::operator_spec::{OperatorFactory, OperatorSpec};
-use crate::operations::channels::{StealableChannelFactory, stealable};
+use crate::operations::channels::{StealableChannelFactory, stealable, to_single_worker_mpsc};
 use crate::operations::{
     AggregateFactory, AggregationSlot, AggregationValue, CopyOutFactory, CteFactory,
     CteScanFactory, Distinct, DynamicFilterSlot, DynamicRowKey, F64Cell, FilterFactory,
     GroupFactory, GroupLimit, IntCell, JoinKey, JoinKind, JoinRecordBatchOperatorFactory, JoinSpec,
     KeyExtractor, LimitFactory, MapFactory, NoOpNullaryFactory, NullaryFactory,
-    NullaryOperatorFactory, OrderBy, OrderByFactory, OrderByLimitFactory, PackedKey,
+    NullaryOperatorFactory, OrderBy, OrderByFactory, OrderByLimitFactory, PackedKey, RangeJoinSpec,
     SingleColumnKey, UnaryFactory, UnaryOperatorFactory, WideCell, create_join_factories,
+    create_range_join_factories,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle, DataFlowStats};
 pub const RECORD_BATCH_SIZE: usize = 8192;
@@ -749,6 +750,126 @@ impl RecordBatchOperatorSpec {
         let build_siblings_left = Arc::new(AtomicUsize::new(worker_count));
         let probe_siblings_left = Arc::new(AtomicUsize::new(worker_count));
         let build_channels = stealable::<RecordBatch>(self.dispatcher.topology());
+        let probe_channels = stealable::<RecordBatch>(self.dispatcher.topology());
+        let factories = self
+            .factories
+            .into_iter()
+            .zip(build_heads)
+            .zip(build_factories)
+            .zip(probe_factories)
+            .zip(build_channels)
+            .zip(probe_channels)
+            .map(
+                |(
+                    (
+                        (((probe_head, build_head), build_factory), probe_factory),
+                        build_channel_factory,
+                    ),
+                    probe_channel_factory,
+                )| {
+                    Box::new(JoinRecordBatchOperatorFactory {
+                        probe_head,
+                        build_head,
+                        build_factory,
+                        probe_factory,
+                        build_channel_factory,
+                        probe_channel_factory,
+                        build_siblings_left: build_siblings_left.clone(),
+                        probe_siblings_left: probe_siblings_left.clone(),
+                        build_ready: build_ready.clone(),
+                    }) as Box<dyn OperatorFactory<RecordBatch>>
+                },
+            )
+            .collect();
+
+        Self {
+            dispatcher: self.dispatcher,
+            factories,
+        }
+    }
+
+    /// Join `self` (the probe side) with `build` on one `<`/`<=`/`>`/`>=`
+    /// comparison — see [`RangeJoinSpec`]. `key_type` is the arrow type both
+    /// key columns arrive as; it must be a fixed-width ordered type (ints,
+    /// decimals, date, timestamp — the caller casts mismatched sides to a
+    /// common type first). Floats are out: their SQL ordering (NULL/NaN) is
+    /// not their native `Ord`.
+    ///
+    /// Both sides are roots in one dataflow, with the same build-before-probe
+    /// gating as [`join`](Self::join).
+    pub fn range_join(
+        self,
+        build: RecordBatchOperatorSpec,
+        key_type: &DataType,
+        spec: RangeJoinSpec,
+    ) -> Self {
+        use arrow_array::types as t;
+        use arrow_schema::TimeUnit;
+        match key_type {
+            DataType::Int8 => self.range_join_typed::<t::Int8Type>(build, spec),
+            DataType::Int16 => self.range_join_typed::<t::Int16Type>(build, spec),
+            DataType::Int32 => self.range_join_typed::<t::Int32Type>(build, spec),
+            DataType::Int64 => self.range_join_typed::<t::Int64Type>(build, spec),
+            DataType::UInt8 => self.range_join_typed::<t::UInt8Type>(build, spec),
+            DataType::UInt16 => self.range_join_typed::<t::UInt16Type>(build, spec),
+            DataType::UInt32 => self.range_join_typed::<t::UInt32Type>(build, spec),
+            DataType::UInt64 => self.range_join_typed::<t::UInt64Type>(build, spec),
+            DataType::Date32 => self.range_join_typed::<t::Date32Type>(build, spec),
+            DataType::Date64 => self.range_join_typed::<t::Date64Type>(build, spec),
+            DataType::Timestamp(TimeUnit::Second, _) => {
+                self.range_join_typed::<t::TimestampSecondType>(build, spec)
+            }
+            DataType::Timestamp(TimeUnit::Millisecond, _) => {
+                self.range_join_typed::<t::TimestampMillisecondType>(build, spec)
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, _) => {
+                self.range_join_typed::<t::TimestampMicrosecondType>(build, spec)
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                self.range_join_typed::<t::TimestampNanosecondType>(build, spec)
+            }
+            DataType::Decimal64(_, _) => self.range_join_typed::<t::Decimal64Type>(build, spec),
+            DataType::Decimal128(_, _) => self.range_join_typed::<t::Decimal128Type>(build, spec),
+            other => panic!("range join key type {other:?} is unsupported"),
+        }
+    }
+
+    fn range_join_typed<T: arrow_array::types::ArrowPrimitiveType>(
+        self,
+        build: RecordBatchOperatorSpec,
+        spec: RangeJoinSpec,
+    ) -> Self
+    where
+        T::Native: Ord + Send,
+    {
+        let worker_count = self.worker_count();
+        assert_eq!(
+            worker_count,
+            build.worker_count(),
+            "join inputs must use the same worker count"
+        );
+        assert!(
+            self.dispatcher
+                .waker_set
+                .wakes_same_pool(&build.dispatcher.waker_set),
+            "join inputs must use the same worker pool"
+        );
+
+        // Sort the build side by the key (NULLs last, so the join can drop
+        // them as one tail), then funnel the sorted chunks to one worker,
+        // whose consumer receives them in the order the sort emitted them.
+        // Successive range joins take turns hosting that consumer.
+        static NEXT_RANGE_HOST: AtomicUsize = AtomicUsize::new(0);
+        let target = NEXT_RANGE_HOST.fetch_add(1, atomic::Ordering::Relaxed) % worker_count;
+        let build = build.order_by(vec![OrderBy::new(spec.build_key_index, false, false)]);
+
+        let (build_factories, probe_factories, build_ready) =
+            create_range_join_factories::<T>(spec, worker_count, target);
+
+        let (_, build_heads) = build.into_parts();
+        let build_siblings_left = Arc::new(AtomicUsize::new(worker_count));
+        let probe_siblings_left = Arc::new(AtomicUsize::new(worker_count));
+        let build_channels = to_single_worker_mpsc::<RecordBatch>(worker_count, target);
         let probe_channels = stealable::<RecordBatch>(self.dispatcher.topology());
         let factories = self
             .factories
