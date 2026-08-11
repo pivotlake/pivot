@@ -335,6 +335,25 @@ async fn grouped_float_aggregates(#[future] conn: Conn) {
     assert_eq!(parse(&rows[1][1]), 4.0); // SUM(d) group 2
 }
 
+/// DuckDB plans an integer SUM as sum_no_overflow when statistics prove the
+/// accumulation cannot overflow; a CASE over the constants 0 and 1 makes that
+/// provable regardless of table contents, and the plan must still convert.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn integer_sum_planned_as_sum_no_overflow(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "sum_no_overflow_people", dir.path()).await;
+
+    let rows = select_rows(
+        &conn,
+        "SELECT SUM(CASE WHEN name = 'alice' THEN 1 ELSE 0 END) FROM sum_no_overflow_people",
+    )
+    .await;
+
+    assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+}
+
 /// A DECIMAL column scans, filters against a decimal constant, and renders
 /// scale-correct NUMERIC text on the wire. The file is written by arrow-rs,
 /// which stores the decimal as FIXED_LEN_BYTE_ARRAY.
