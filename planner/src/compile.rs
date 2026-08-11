@@ -120,6 +120,10 @@ pub enum Error {
     SetVariableNotCompilable,
     #[error("COMPACT runs as its own statement and cannot be part of a query")]
     CompactNotCompilable,
+    #[error("CREATE USER does not take inputs")]
+    UnexpectedCreateUserInputs,
+    #[error("create user: {0}")]
+    CreateUser(#[source] crate::catalog::Error),
     #[error("Unsupported table function: {0}")]
     UnsupportedTableFunction(String),
     #[error("Invalid argument to table function {function}: {message}")]
@@ -285,6 +289,12 @@ impl PlanNode {
             // So is COMPACT: its sweeps drive dataflows of their own, so the
             // server runs them on the coordinator, never inside a dataflow.
             crate::Operator::Compact(_) => Err(Error::CompactNotCompilable),
+            crate::Operator::CreateUser(o) => {
+                if !inputs.is_empty() {
+                    return Err(Error::UnexpectedCreateUserInputs);
+                }
+                o.compile(dispatcher, transaction)
+            }
         }
     }
 }

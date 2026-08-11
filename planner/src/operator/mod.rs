@@ -17,6 +17,7 @@ mod aggregate;
 mod compact;
 mod create_schema;
 mod create_table;
+mod create_user;
 mod cte;
 mod dummy_scan;
 mod explain;
@@ -37,6 +38,7 @@ pub use aggregate::Aggregate;
 pub use compact::Compact;
 pub use create_schema::CreateSchema;
 pub use create_table::CreateTable;
+pub use create_user::CreateUser;
 pub use cte::{Cte, CteScan};
 pub use dummy_scan::DummyScan;
 pub use explain::Explain;
@@ -111,6 +113,9 @@ pub enum Operator {
     Join(Join),
     CreateTable(CreateTable),
     CreateSchema(CreateSchema),
+    /// `CREATE USER <name> [PASSWORD '<password>']` — compiles into a dataflow
+    /// that stages the user; the transaction's commit creates it.
+    CreateUser(CreateUser),
     DummyScan(DummyScan),
     /// `SET`/`RESET` of a session variable — handled by the server, not compiled.
     SetVariable(SetVariable),
@@ -189,6 +194,7 @@ impl Operator {
             // Statements, not queries: no result columns.
             Operator::CreateTable(_)
             | Operator::CreateSchema(_)
+            | Operator::CreateUser(_)
             | Operator::SetVariable(_)
             | Operator::Compact(_) => Ok(Vec::new()),
         }
@@ -263,6 +269,7 @@ impl Operator {
             Operator::CteScan(scan) => scan.nullable.clone(),
             Operator::CreateTable(_)
             | Operator::CreateSchema(_)
+            | Operator::CreateUser(_)
             | Operator::SetVariable(_)
             | Operator::Compact(_) => Vec::new(),
         }
@@ -290,6 +297,7 @@ impl fmt::Display for Operator {
             Operator::Join(j) => write!(f, "{j}"),
             Operator::CreateTable(c) => write!(f, "{c}"),
             Operator::CreateSchema(c) => write!(f, "{c}"),
+            Operator::CreateUser(c) => write!(f, "{c}"),
             Operator::DummyScan(d) => write!(f, "{d}"),
             Operator::SetVariable(s) => write!(f, "{s}"),
             Operator::Compact(c) => write!(f, "{c}"),

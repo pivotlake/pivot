@@ -21,7 +21,7 @@ serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
 include_dir = "0.7"
 lru = { workspace = true }
-pgwire = "0.39"
+pgwire = { workspace = true }
 # Generates per-process secrets for mock authentication of unknown users.
 rand = { workspace = true }
 # Derives the stand-in verifier answered for an unknown user (see `auth`).

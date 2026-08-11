@@ -63,6 +63,7 @@ fn mutating_session_and_table_function_plans_are_not_cacheable(
         .plan("CREATE TABLE cacheability_test (id INTEGER)")
         .unwrap();
     let set = testing_planner.plan("SET pivot_stats = true").unwrap();
+    let create_user = testing_planner.plan("CREATE USER cache_test_user").unwrap();
     let table_function = testing_planner
         .plan("SELECT * FROM generate_series(1, 2)")
         .unwrap();
@@ -70,6 +71,7 @@ fn mutating_session_and_table_function_plans_are_not_cacheable(
     assert!(!insert.is_cacheable());
     assert!(!create.is_cacheable());
     assert!(!set.is_cacheable());
+    assert!(!create_user.is_cacheable());
     assert!(!table_function.is_cacheable());
 }
 
@@ -212,6 +214,36 @@ fn create_table_propagates_with_options(mut testing_planner: TestingPlanner) {
         @r#"CreateTable(created_table, [id:Int32], options: {"format": "parquet", "path": "/asdf"})
     "#
     );
+}
+
+#[rstest]
+fn create_user_produces_create_user_operator(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner.plan("CREATE USER alice").unwrap();
+
+    assert_snapshot!(plan.to_string(), @"CreateUser(alice)
+    ");
+}
+
+#[rstest]
+fn create_user_with_password_redacts_it(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .plan("CREATE USER alice PASSWORD 'secret'")
+        .unwrap();
+
+    let rendered = plan.to_string();
+
+    assert!(!rendered.contains("secret"));
+    assert_snapshot!(rendered, @"CreateUser(alice PASSWORD [redacted])
+    ");
+}
+
+#[rstest]
+fn create_user_with_invalid_utf8_password_fails_loudly(mut testing_planner: TestingPlanner) {
+    let result = testing_planner.plan(r"CREATE USER alice PASSWORD E'\xff'");
+
+    // Never silently alter an unrepresentable password: the scanner rejects
+    // the bytes today, and the bridge refuses lossy conversion as well.
+    result.expect_err("an unrepresentable password must not be silently altered");
 }
 
 #[rstest]

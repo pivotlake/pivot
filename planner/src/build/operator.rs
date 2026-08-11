@@ -13,9 +13,9 @@ use duckdb_planner::catalog_provider::OptionalTableWrapper;
 use duckdb_planner::duckdb_bridge::duckdb_types::LimitNodeType;
 use duckdb_planner::handle::{
     Aggregate as AggregateView, BridgeError, Compact as CompactView,
-    CreateSchema as CreateSchemaView, CreateTable as CreateTableView, Filter as FilterView,
-    Insert as InsertView, Limit as LimitView, OrderBy as OrderByView, OrderKey,
-    Projection as ProjectionView, Reset as ResetView, Set as SetView,
+    CreateSchema as CreateSchemaView, CreateTable as CreateTableView, CreateUser as CreateUserView,
+    Filter as FilterView, Insert as InsertView, Limit as LimitView, OrderBy as OrderByView,
+    OrderKey, Projection as ProjectionView, Reset as ResetView, Set as SetView,
     TableFunctionScan as TableFunctionScanView, TableScan as TableScanView, TopN as TopNView,
     Values as ValuesView,
 };
@@ -26,8 +26,9 @@ use crate::catalog::{
 };
 use crate::expression::{Error as ExpressionError, Expression};
 use crate::operator::{
-    Aggregate, Compact, CreateSchema, CreateTable, Error as OperatorError, Filter, Input, Insert,
-    Limit, OrderBy, OrderByNode, Projection, SetVariable, TableFunctionScan, TopN, Values,
+    Aggregate, Compact, CreateSchema, CreateTable, CreateUser, Error as OperatorError, Filter,
+    Input, Insert, Limit, OrderBy, OrderByNode, Projection, SetVariable, TableFunctionScan, TopN,
+    Values,
 };
 use crate::types::type_from_logical;
 
@@ -249,6 +250,15 @@ impl Compact {
             schema: view.schema()?,
             table: view.table()?,
             final_sweep: view.final_sweep()?,
+        })
+    }
+}
+
+impl CreateUser {
+    pub(crate) fn from_handle(view: CreateUserView<'_>) -> Result<CreateUser, BridgeError> {
+        Ok(CreateUser {
+            name: view.name()?,
+            password: view.password()?,
         })
     }
 }

@@ -175,6 +175,29 @@ pub struct CreateSchemaRequest {
     pub if_not_exists: bool,
 }
 
+/// Description of a user to be created, produced by translating a
+/// `CREATE USER` statement and consumed by
+/// [`CatalogTransaction::bind_create_user`]. Users are server-wide (they live
+/// in the metastore, not a datastore), so it carries no qualifier.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CreateUserRequest {
+    pub name: String,
+    /// The password the stored credential is derived from, or `None` for a
+    /// trusted user.
+    pub password: Option<String>,
+}
+
+/// Redacted: the password must not reach a log through a `{:?}` of some plan
+/// or transaction that happens to hold a request.
+impl Debug for CreateUserRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateUserRequest")
+            .field("name", &self.name)
+            .field("password", &self.password.as_ref().map(|_| "redacted"))
+            .finish()
+    }
+}
+
 /// One query's transaction: a consistent **snapshot** of the catalog, opened
 /// before the query is planned and held until [`commit`](Self::commit) or
 /// [`rollback`](Self::rollback). Every table the query binds resolves through
@@ -233,6 +256,15 @@ pub trait CatalogTransaction: Debug + Send + Sync {
         .into())
     }
 
+    /// Resolve a `CREATE USER` by routing to wherever users live (the
+    /// metastore); users are server-wide, not a datastore's.
+    fn bind_create_user(&self, _request: CreateUserRequest) -> Result<Box<dyn UserCreation>> {
+        Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "this catalog does not support CREATE USER",
+        )
+        .into())
+    }
+
     /// Commit this transaction: publish whatever it staged (an INSERT's uploaded
     /// files, a CREATE's table). A read-only transaction is a no-op. Async so a
     /// backend can hop blocking store I/O to the blocking pool; the composite
@@ -269,6 +301,17 @@ pub trait TableCreation: Send + Sync {
 /// report an error, to render `EXPLAIN`) would create the schema. Durable
 /// creation belongs to [`CatalogTransaction::commit`], as it does for a table.
 pub trait SchemaCreation: Send + Sync {
+    /// Build the dataflow that stages this creation for the transaction's
+    /// commit. It emits no rows.
+    fn compile(&self, dispatcher: &DataFlowDispatcher) -> Result<RecordBatchOperatorSpec>;
+}
+
+/// A resolved `CREATE USER`, ready to be compiled into the dataflow that
+/// creates it, exactly as [`SchemaCreation`] is for a schema: the dataflow
+/// does nothing but stage the creation, so the user appears when the statement
+/// *runs* rather than when it is planned, and durable creation belongs to
+/// [`CatalogTransaction::commit`].
+pub trait UserCreation: Send + Sync {
     /// Build the dataflow that stages this creation for the transaction's
     /// commit. It emits no rows.
     fn compile(&self, dispatcher: &DataFlowDispatcher) -> Result<RecordBatchOperatorSpec>;

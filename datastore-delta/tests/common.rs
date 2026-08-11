@@ -9,10 +9,39 @@ use std::ops::Deref;
 use std::sync::{Arc, Once};
 use tempfile::TempDir;
 
-use datastore::DatastoreTransaction;
+use datastore::{Datastore, DatastoreTransaction};
 use datastore_delta::parquet::ParquetTable;
 use dispatch::{DataFlowDispatcher, Dispatch};
+use metastore::{DEFAULT_USER_NAME, Metastore, UserAuth};
 use planner::catalog::{Result as CatalogResult, SchemaQualifiedTableName};
+use std::collections::HashMap;
+
+/// A metastore serving no datastores and only the built-in trusted user:
+/// these tests wrap an already-open `DeltaDatastore` in a `PivotCatalog`, so
+/// the catalog never asks the metastore for datastores.
+pub fn trust_metastore() -> Arc<dyn Metastore> {
+    #[derive(Debug)]
+    struct TrustMetastore;
+
+    impl Metastore for TrustMetastore {
+        fn open_datastores(
+            &self,
+            _dispatcher: &DataFlowDispatcher,
+        ) -> metastore::Result<HashMap<String, Arc<dyn Datastore>>> {
+            Ok(HashMap::new())
+        }
+
+        fn default_datastore_name(&self) -> &str {
+            planner::DEFAULT_DATASTORE_NAME
+        }
+
+        fn user_auth(&self, username: &str) -> Option<UserAuth> {
+            (username == DEFAULT_USER_NAME).then_some(UserAuth::Trust)
+        }
+    }
+
+    Arc::new(TrustMetastore)
+}
 
 // The process-wide dispatcher, created on the first `init*` call.
 // static DISPATCHER: OnceLock<Mutex<DataFlowDispatcher>> = OnceLock::new();

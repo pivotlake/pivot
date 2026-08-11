@@ -286,12 +286,14 @@ mod tests {
         let catalog = PivotCatalog::new(
             HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),
             DEFAULT_DATASTORE_NAME.to_string(),
+            metastore(),
         )
         .unwrap();
         (directory, Arc::new(catalog))
     }
 
     fn metastore() -> Arc<dyn Metastore> {
+        #[derive(Debug)]
         struct TestMetastore;
 
         impl Metastore for TestMetastore {

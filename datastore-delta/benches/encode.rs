@@ -64,6 +64,7 @@ use parquet_variant_compute::{VariantArray, json_to_variant};
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
 use datastore_delta::DeltaDatastore;
 use dispatch::{Dispatch, RECORD_BATCH_SIZE, values_input};
+use metastore::{DEFAULT_USER_NAME, Metastore, UserAuth};
 use planner::catalog::{Column, CreateTableRequest, SchemaQualifiedTableName, TableReference};
 use planner::types::{Type, physical_arrow_type};
 use tempfile::TempDir;
@@ -528,6 +529,32 @@ fn columns(names: &[&str], col_type: Type) -> Vec<Column> {
 /// A catalog holding one table of `columns` in a database rooted at `dir`,
 /// sorted by `sort_by` where one is given, and the directory that table keeps
 /// its own storage in (where the files an insert writes land).
+/// A metastore serving no datastores and only the built-in trusted user: the
+/// catalog here gets its datastore handed in directly.
+fn trust_metastore() -> Arc<dyn Metastore> {
+    #[derive(Debug)]
+    struct TrustMetastore;
+
+    impl Metastore for TrustMetastore {
+        fn open_datastores(
+            &self,
+            _dispatcher: &dispatch::DataFlowDispatcher,
+        ) -> metastore::Result<HashMap<String, Arc<dyn Datastore>>> {
+            Ok(HashMap::new())
+        }
+
+        fn default_datastore_name(&self) -> &str {
+            DEFAULT_DATASTORE_NAME
+        }
+
+        fn user_auth(&self, username: &str) -> Option<UserAuth> {
+            (username == DEFAULT_USER_NAME).then_some(UserAuth::Trust)
+        }
+    }
+
+    Arc::new(TrustMetastore)
+}
+
 fn table_over(
     dispatch: &Dispatch,
     dir: &Path,
@@ -541,6 +568,7 @@ fn table_over(
             datastore.clone() as Arc<dyn Datastore>,
         )]),
         DEFAULT_DATASTORE_NAME.to_string(),
+        trust_metastore(),
     )
     .unwrap();
 

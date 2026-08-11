@@ -8,7 +8,7 @@ use dispatch::Dispatch;
 
 use crate::common::*;
 use planner::Error as PlannerError;
-use planner::catalog::{BoundTable, CreateTableRequest};
+use planner::catalog::{BoundTable, CreateTableRequest, CreateUserRequest};
 use planner::types::Type;
 use planner::{DEFAULT_DATASTORE_NAME, Planner};
 use rstest::rstest;
@@ -1663,6 +1663,7 @@ fn group_order_by_key_asc_with_offset(mut testing_planner: TestingPlanner) {
 #[derive(Debug, Default)]
 struct RecordingCatalog {
     created_tables: Arc<Mutex<Vec<CreateTableRequest>>>,
+    created_users: Arc<Mutex<Vec<CreateUserRequest>>>,
 }
 
 /// The CREATE TABLE statements planned here reference no tables, so the
@@ -1671,6 +1672,7 @@ struct RecordingCatalog {
 #[derive(Debug)]
 struct RecordingTransaction {
     created_tables: Arc<Mutex<Vec<CreateTableRequest>>>,
+    created_users: Arc<Mutex<Vec<CreateUserRequest>>>,
 }
 
 impl planner::catalog::CatalogTransaction for RecordingTransaction {
@@ -1699,6 +1701,14 @@ impl planner::catalog::CatalogTransaction for RecordingTransaction {
         self.created_tables.lock().unwrap().push(request);
         Ok(Box::new(NoRowsCreation))
     }
+
+    fn bind_create_user(
+        &self,
+        request: CreateUserRequest,
+    ) -> planner::catalog::Result<Box<dyn planner::catalog::UserCreation>> {
+        self.created_users.lock().unwrap().push(request);
+        Ok(Box::new(NoRowsCreation))
+    }
 }
 
 /// The resolved create a [`RecordingTransaction`] returns: it compiles to a
@@ -1718,10 +1728,24 @@ impl planner::catalog::TableCreation for NoRowsCreation {
     }
 }
 
+/// A CREATE USER's dataflow is the same no-rows shape as a CREATE TABLE's.
+impl planner::catalog::UserCreation for NoRowsCreation {
+    fn compile(
+        &self,
+        dispatcher: &dispatch::DataFlowDispatcher,
+    ) -> planner::catalog::Result<dispatch::RecordBatchOperatorSpec> {
+        Ok(dispatch::RecordBatchOperatorSpec::from_nullary(
+            dispatcher,
+            (0..dispatcher.worker_count()).map(|_| NoRowsNullary::default()),
+        ))
+    }
+}
+
 impl RecordingCatalog {
     fn begin_transaction(&self) -> Arc<dyn planner::catalog::CatalogTransaction> {
         Arc::new(RecordingTransaction {
             created_tables: self.created_tables.clone(),
+            created_users: self.created_users.clone(),
         })
     }
 }
@@ -1799,6 +1823,32 @@ fn create_table_calls_catalog_once() {
     assert_eq!(created[0].columns[1].col_type, Type::Utf8);
     assert!(created[0].options.is_empty());
     assert!(!created[0].if_not_exists);
+}
+
+#[test]
+fn create_user_binds_through_the_transaction() {
+    let dispatch = Dispatch::spin_up(1, 32, None);
+    let catalog = Arc::new(RecordingCatalog::default());
+    let mut planner = Planner::from_datastore_names(
+        vec![DEFAULT_DATASTORE_NAME.to_string()],
+        DEFAULT_DATASTORE_NAME.to_string(),
+    )
+    .expect("planner context");
+    let transaction = catalog.begin_transaction();
+
+    let results = planner
+        .plan("CREATE USER walt PASSWORD 'blue-1'", transaction.clone())
+        .unwrap()
+        .compile(dispatch.dispatcher(), transaction.as_ref())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    assert!(results.is_empty());
+    let created = catalog.created_users.lock().unwrap();
+    assert_eq!(created.len(), 1);
+    assert_eq!(created[0].name, "walt");
+    assert_eq!(created[0].password.as_deref(), Some("blue-1"));
 }
 
 #[test]

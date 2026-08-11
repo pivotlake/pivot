@@ -82,6 +82,7 @@ fn single_catalog(datastore: &Arc<DeltaDatastore>) -> Arc<PivotCatalog> {
                 datastore.clone() as Arc<dyn Datastore>,
             )]),
             DEFAULT_DATASTORE_NAME.to_string(),
+            common::trust_metastore(),
         )
         .unwrap(),
     )

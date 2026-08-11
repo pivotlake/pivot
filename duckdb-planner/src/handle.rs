@@ -207,6 +207,7 @@ impl<'plan> LogicalOp<'plan> {
             L::LOGICAL_SET => Operator::Set(Set { raw: self.raw }),
             L::LOGICAL_RESET => Operator::Reset(Reset { raw: self.raw }),
             L::LOGICAL_COMPACT => Operator::Compact(Compact { raw: self.raw }),
+            L::LOGICAL_CREATE_USER => Operator::CreateUser(CreateUser { raw: self.raw }),
             L::LOGICAL_COMPARISON_JOIN => {
                 Operator::ComparisonJoin(ComparisonJoin { raw: self.raw })
             }
@@ -247,6 +248,8 @@ pub enum Operator<'plan> {
     Reset(Reset<'plan>),
     /// `COMPACT <table> [FINAL]`.
     Compact(Compact<'plan>),
+    /// `CREATE USER <name> [PASSWORD '<password>']`.
+    CreateUser(CreateUser<'plan>),
     /// A comparison join; the consumer only handles the late-materialization
     /// shape (see [`ComparisonJoin::is_late_materialization`]).
     ComparisonJoin(ComparisonJoin<'plan>),
@@ -308,6 +311,8 @@ define_handles! { ffi::LogicalOperator;
     Reset,
     /// A `LogicalCompact`: `COMPACT <table> [FINAL]`.
     Compact,
+    /// A `LogicalCreateUser`: `CREATE USER <name> [PASSWORD '<password>']`.
+    CreateUser,
     /// A `LogicalComparisonJoin`.
     ComparisonJoin,
     /// A `LogicalMaterializedCTE`: the CTE's definition above the query using it.
@@ -700,6 +705,23 @@ impl<'plan> Compact<'plan> {
     /// `COMPACT ... FINAL`: keep sweeping until a pass merges nothing.
     pub fn final_sweep(self) -> Result<bool> {
         Ok(ffi::lo_compact_final(self.raw)?)
+    }
+}
+
+impl<'plan> CreateUser<'plan> {
+    /// The name of the user to create.
+    pub fn name(self) -> Result<String> {
+        Ok(ffi::lo_create_user_name(self.raw)?)
+    }
+
+    /// The password, or `None` when the PASSWORD clause was omitted (the user
+    /// authenticates by trust).
+    pub fn password(self) -> Result<Option<String>> {
+        if ffi::lo_create_user_has_password(self.raw)? {
+            Ok(Some(ffi::lo_create_user_password(self.raw)?))
+        } else {
+            Ok(None)
+        }
     }
 }
 

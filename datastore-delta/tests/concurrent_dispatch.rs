@@ -102,6 +102,7 @@ fn run_count(datastore: &Arc<DeltaDatastore>) -> usize {
                 datastore.clone() as Arc<dyn Datastore>,
             )]),
             DEFAULT_DATASTORE_NAME.to_string(),
+            common::trust_metastore(),
         )
         .unwrap(),
     );

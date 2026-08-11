@@ -69,6 +69,7 @@ impl PlanNode {
             Operator::Insert(_)
                 | Operator::CreateTable(_)
                 | Operator::CreateSchema(_)
+                | Operator::CreateUser(_)
                 | Operator::SetVariable(_)
                 | Operator::Compact(_)
                 | Operator::TableFunctionScan(_)

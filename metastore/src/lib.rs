@@ -9,12 +9,12 @@
 //!
 //! A user's authentication method crosses that boundary as [`UserAuth`].
 //! SCRAM credentials use [`ScramVerifier`], whose serialised form
-//! ([`parse_scram_verifier`]) lives here too so every provider reads the same
-//! text.
+//! ([`format_scram_verifier`] / [`parse_scram_verifier`]) lives here too so
+//! every provider stores the same text.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use catalog::Datastore;
+use datastore::Datastore;
 use dispatch::DataFlowDispatcher;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,6 +29,12 @@ pub const DEFAULT_USER_NAME: &str = "pivot";
 /// rather than carried per user. 4096 is the RFC 5802 minimum and PostgreSQL's
 /// own default.
 pub const SCRAM_ITERATIONS: usize = 4096;
+
+/// The salt width every stored [`ScramVerifier`] is derived with: the one
+/// PostgreSQL itself uses. The salt is public (it goes to the client in the
+/// SCRAM server-first message); its job is to make one precomputed table
+/// useless against every other user's verifier.
+pub const SCRAM_SALT_LEN: usize = 16;
 
 /// A user's stored SCRAM-SHA-256 credential: the salt the password was derived
 /// with, and `SaltedPassword` itself, `Hi(Normalize(password), salt,
@@ -66,7 +72,11 @@ pub enum UserAuth {
 /// The server's configuration source. It defines the datastores to serve and
 /// the users that may authenticate; it is the seam further server configuration
 /// (secrets) would extend.
-pub trait Metastore: Send + Sync {
+///
+/// `Debug` so the structs holding a metastore can derive theirs. A metastore
+/// holds credentials, so implementations must redact: never derive `Debug`
+/// through a field that prints a secret.
+pub trait Metastore: Send + Sync + std::fmt::Debug {
     /// Open every configured datastore, keyed by name. Each is a
     /// [`Datastore`] over the datastore's object store; opening reads the
     /// tables' footers over `dispatcher`. The datastore named by
@@ -86,6 +96,17 @@ pub trait Metastore: Send + Sync {
     /// credentials at startup, so implementations may reflect users added or
     /// passwords changed while the server is running.
     fn user_auth(&self, username: &str) -> Option<UserAuth>;
+
+    /// Add `username`, durably: once this returns, the user survives a
+    /// restart and subsequent logins see it. A password becomes a stored
+    /// SCRAM verifier (deriving it is the implementation's job, so credential
+    /// policy lives with the store); no password means [`UserAuth::Trust`].
+    /// Fails when the user already exists, and on metastores that cannot
+    /// persist users.
+    fn create_user(&self, username: &str, password: Option<&str>) -> Result<()> {
+        let _ = password;
+        Err(format!("this metastore does not support creating users (user `{username}`)").into())
+    }
 }
 
 /// Provider errors cross the trait boundary without making this crate depend on
@@ -101,10 +122,19 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// distinct tag rejects it at startup instead.
 const SCRAM_VERIFIER_TAG: &str = "pivot-scram-sha-256";
 
-/// Parse the line a metastore stores for a SCRAM user:
+/// Render `verifier` as the single line a metastore stores for a user:
 /// `pivot-scram-sha-256$<iterations>:<base64 salt>$<base64 salted password>`.
-/// The error is a message describing what is wrong with `text`, for a provider
-/// to attach its own context (which file, which user) to.
+pub fn format_scram_verifier(verifier: &ScramVerifier) -> String {
+    format!(
+        "{SCRAM_VERIFIER_TAG}${SCRAM_ITERATIONS}:{}${}",
+        BASE64.encode(&verifier.salt),
+        BASE64.encode(&verifier.salted_password)
+    )
+}
+
+/// Parse the stored form produced by [`format_scram_verifier`]. The error is a
+/// message describing what is wrong with `text`, for a provider to attach its
+/// own context (which file, which user) to.
 pub fn parse_scram_verifier(text: &str) -> std::result::Result<ScramVerifier, String> {
     let (tag, fields) = text.split_once('$').unwrap_or((text, ""));
     if tag != SCRAM_VERIFIER_TAG {
@@ -183,6 +213,19 @@ mod tests {
 
         assert_eq!(parsed.salt, vec![7; 16]);
         assert_eq!(parsed.salted_password, vec![9; 32]);
+    }
+
+    #[test]
+    fn a_formatted_verifier_parses_back_unchanged() {
+        let original = ScramVerifier {
+            salt: vec![7; 16],
+            salted_password: vec![9; 32],
+        };
+
+        let parsed = parse_scram_verifier(&format_scram_verifier(&original)).unwrap();
+
+        assert_eq!(parsed.salt, original.salt);
+        assert_eq!(parsed.salted_password, original.salted_password);
     }
 
     #[test]

@@ -13,6 +13,10 @@ dispatch = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 serde_yaml_ng = { workspace = true }
+# The SCRAM salted-password derivation `create_user` stores must match the one
+# pgwire verifies logins against, so it is pgwire's own.
+pgwire = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 base64 = { workspace = true }

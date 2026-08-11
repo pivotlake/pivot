@@ -9,7 +9,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use serde::de::{Deserializer, Visitor};
-use serde::{Deserialize, de};
+use serde::{Deserialize, Serialize, Serializer, de};
 
 /// A byte count written the way an operator thinks of one: `32g`, `512m`, or a
 /// plain number of bytes.
@@ -112,6 +112,26 @@ fn fractional_message(input: &str) -> String {
     format!(
         "`{input}` is fractional; write a whole number of a smaller unit instead (`512m`, `1500ms`)"
     )
+}
+
+/// Written back the way an operator would: the largest base-1024 suffix that
+/// divides the count exactly, or a plain number of bytes. Parses back to the
+/// same count.
+impl Serialize for ByteSize {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let bytes = self.0;
+        for (suffix, multiplier) in [
+            ("t", 1u64 << 40),
+            ("g", 1 << 30),
+            ("m", 1 << 20),
+            ("k", 1 << 10),
+        ] {
+            if bytes != 0 && bytes.is_multiple_of(multiplier) {
+                return serializer.serialize_str(&format!("{}{suffix}", bytes / multiplier));
+            }
+        }
+        serializer.serialize_u64(bytes)
+    }
 }
 
 impl<'de> Deserialize<'de> for ByteSize {

@@ -12,14 +12,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use catalog::{Datastore, PivotCatalog};
-use common::{CatalogFixture, select_rows, start_server_with_metastore};
+use common::{
+    CatalogFixture, login, login_without_password, select_rows, start_server_with_metastore,
+};
 use datastore_delta::DEFAULT_REFRESH_INTERVAL;
 use dispatch::DataFlowDispatcher;
 use metastore::{Metastore, SCRAM_ITERATIONS, ScramVerifier, UserAuth};
 use metastore_disk::{DiskMetastore, MetastoreConfig};
 use pgwire::api::auth::sasl::scram::gen_salted_password;
 use tempfile::TempDir;
-use tokio_postgres::{Client, NoTls};
 
 const USER: &str = "analytics";
 const TRUSTED_USER: &str = "reader";
@@ -38,6 +39,7 @@ fn scram_auth(password: &str) -> UserAuth {
 /// datastore half delegates to the disk metastore; authentication reads the
 /// lock on every login, mirroring a future metastore with live user
 /// administration.
+#[derive(Debug)]
 struct MutableMetastore {
     inner: DiskMetastore,
     users: RwLock<HashMap<String, UserAuth>>,
@@ -64,37 +66,6 @@ impl Metastore for MutableMetastore {
     fn user_auth(&self, username: &str) -> Option<UserAuth> {
         self.users.read().unwrap().get(username).cloned()
     }
-}
-
-/// Connect as `user`/`password`, returning the wire error when the login fails.
-async fn login(port: u16, user: &str, password: &str) -> Result<Client, tokio_postgres::Error> {
-    let (client, connection) = tokio_postgres::Config::new()
-        .host("127.0.0.1")
-        .port(port)
-        .user(user)
-        .password(password)
-        .dbname("test")
-        .connect(NoTls)
-        .await?;
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    Ok(client)
-}
-
-/// Connect without configuring a client password.
-async fn login_without_password(port: u16, user: &str) -> Result<Client, tokio_postgres::Error> {
-    let (client, connection) = tokio_postgres::Config::new()
-        .host("127.0.0.1")
-        .port(port)
-        .user(user)
-        .dbname("test")
-        .connect(NoTls)
-        .await?;
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    Ok(client)
 }
 
 struct AuthServer {
@@ -132,14 +103,15 @@ fn authenticating_server() -> &'static AuthServer {
             let datastores = server_metastore
                 .open_datastores(dispatch.dispatcher())
                 .unwrap();
+            let metastore: Arc<dyn Metastore> = server_metastore.clone();
             let catalog = Arc::new(
                 PivotCatalog::new(
                     datastores,
                     server_metastore.default_datastore_name().to_string(),
+                    metastore.clone(),
                 )
                 .unwrap(),
             );
-            let metastore: Arc<dyn Metastore> = server_metastore;
             (CatalogFixture::with_data_dir(catalog, data_dir), metastore)
         });
         AuthServer { port, metastore }

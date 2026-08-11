@@ -86,8 +86,10 @@ test-support = ["dep:testcontainers", "dep:testcontainers-modules", "dep:tempfil
 datastore-delta = { path = ".", features = ["test-support"] }
 # A dev-dependency cycle (catalog depends on datastore-delta), allowed by Cargo.
 # Integration tests wrap a single `DeltaDatastore` in a `PivotCatalog` to get the
-# `Catalog` the planner binds against.
+# `Catalog` the planner binds against; the catalog requires a metastore, so the
+# tests hand it a trivial trust-only one.
 catalog = { workspace = true }
+metastore = { workspace = true }
 # `PivotCatalog::commit_transaction` is async (a commit that wrote files hops to
 # the blocking pool), so the tests block on it with a current-thread runtime; the
 # compaction tests drive a full sweep on a multi-thread runtime.

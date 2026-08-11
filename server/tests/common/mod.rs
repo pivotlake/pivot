@@ -88,6 +88,7 @@ where
 /// same built-in trusted `pivot` user as an empty YAML user map. Its datastore
 /// methods are not used because those tests pass an already-open catalog.
 pub fn pivot_metastore() -> Arc<dyn Metastore> {
+    #[derive(Debug)]
     struct PivotMetastore;
 
     impl Metastore for PivotMetastore {
@@ -192,6 +193,7 @@ pub fn server_port() -> u16 {
                 PivotCatalog::new(
                     HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),
                     DEFAULT_DATASTORE_NAME.to_string(),
+                    pivot_metastore(),
                 )
                 .unwrap(),
             );
@@ -229,6 +231,42 @@ pub async fn connect_client(port: u16) -> Client {
         let _ = conn.await;
     });
     client
+}
+
+/// Connect as `user`/`password`, returning the wire error when the login fails.
+#[allow(dead_code)]
+pub async fn login(port: u16, user: &str, password: &str) -> Result<Client, tokio_postgres::Error> {
+    let (client, connection) = tokio_postgres::Config::new()
+        .host("127.0.0.1")
+        .port(port)
+        .user(user)
+        .password(password)
+        .dbname("test")
+        .connect(NoTls)
+        .await?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    Ok(client)
+}
+
+/// Connect without configuring a client password.
+#[allow(dead_code)]
+pub async fn login_without_password(
+    port: u16,
+    user: &str,
+) -> Result<Client, tokio_postgres::Error> {
+    let (client, connection) = tokio_postgres::Config::new()
+        .host("127.0.0.1")
+        .port(port)
+        .user(user)
+        .dbname("test")
+        .connect(NoTls)
+        .await?;
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    Ok(client)
 }
 
 /// A test connection: a `tokio_postgres::Client` paired with the serialisation

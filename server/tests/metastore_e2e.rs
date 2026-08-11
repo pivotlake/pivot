@@ -105,7 +105,12 @@ async fn queries_bind_tables_by_datastore_name() {
         .unwrap();
         let datastores = metastore.open_datastores(dispatch.dispatcher()).unwrap();
         CatalogFixture::new(Arc::new(
-            PivotCatalog::new(datastores, DEFAULT_DATASTORE_NAME.to_string()).unwrap(),
+            PivotCatalog::new(
+                datastores,
+                DEFAULT_DATASTORE_NAME.to_string(),
+                Arc::new(metastore),
+            )
+            .unwrap(),
         ))
     });
     let client = connect_client(port).await;
