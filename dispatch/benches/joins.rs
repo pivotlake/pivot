@@ -292,19 +292,21 @@ fn bench<D>(
 }
 
 /// A single-key spec over column 0 of both sides, emitting the listed
-/// output columns as plain i64 fields.
+/// output columns as plain i64 fields. An outer join pads its non-preserved
+/// side's columns with NULLs, so those fields declare nullable.
 fn single_key_spec(probe_out: Vec<usize>, build_out: Vec<usize>, kind: JoinKind) -> JoinSpec {
-    let outer = matches!(kind, JoinKind::BuildOuter);
+    let probe_nullable = matches!(kind, JoinKind::BuildOuter);
+    let build_nullable = matches!(kind, JoinKind::ProbeOuter);
     JoinSpec {
         build_key_indices: vec![0],
         probe_key_indices: vec![0],
         probe_fields: probe_out
             .iter()
-            .map(|i| Field::new(format!("p{i}"), DataType::Int64, outer))
+            .map(|i| Field::new(format!("p{i}"), DataType::Int64, probe_nullable))
             .collect(),
         build_fields: build_out
             .iter()
-            .map(|i| Field::new(format!("b{i}"), DataType::Int64, false))
+            .map(|i| Field::new(format!("b{i}"), DataType::Int64, build_nullable))
             .collect(),
         probe_output_indices: probe_out,
         build_output_indices: build_out,
@@ -833,6 +835,71 @@ fn bench_joins(c: &mut Criterion, d: &DataFlowDispatcher) {
                 residual_filters: None,
             },
         );
+    }
+
+    // (k) Probe-side outer joins across the match-rate spectrum, all one
+    //     shape: 24M probe rows against a 3M-key build carrying one gathered
+    //     column. Only the probe's hit rate varies, which is exactly what
+    //     decides how much of the kind's extra machinery runs. At full match
+    //     the miss list stays empty, so against `probe_outer_inner_twin`
+    //     (identical data through an inner join) the difference reads as the
+    //     kind's pure arming overhead. At no match every probe row takes the
+    //     miss path end to end: recorded at the bloom check's else arm,
+    //     appended into the padding accumulator, emitted under all-null build
+    //     columns. 50% and 90% sit between, the mixes real preserved-side
+    //     joins produce.
+    {
+        let probe_rows = scaled(24_000_000);
+        let build_rows = scaled(3_000_000);
+        for (name, kind, hit_rate, seed) in [
+            ("join/probe_outer_inner_twin", JoinKind::Inner, 1.0, 21),
+            ("join/probe_outer_full_match", JoinKind::ProbeOuter, 1.0, 21),
+            ("join/probe_outer_high_match", JoinKind::ProbeOuter, 0.9, 22),
+            ("join/probe_outer_half_match", JoinKind::ProbeOuter, 0.5, 23),
+            ("join/probe_outer_no_match", JoinKind::ProbeOuter, 0.0, 24),
+        ] {
+            bench(
+                c,
+                d,
+                name,
+                probe_rows,
+                move || {
+                    let psch = schema(vec![i64_field("k"), i64_field("v")]);
+                    let bsch = schema(vec![i64_field("k"), i64_field("b1")]);
+                    let mut rng = Rng::new(seed);
+                    JoinData {
+                        probe: batch_sizes(probe_rows)
+                            .map(|n| {
+                                // `sparse_keys` rolls the hit chance per row,
+                                // wasted work at rate 1.0 where uniform keys
+                                // are the same distribution.
+                                let keys = if hit_rate >= 1.0 {
+                                    uniform_keys(&mut rng, n, build_rows)
+                                } else {
+                                    sparse_keys(&mut rng, n, build_rows, hit_rate)
+                                };
+                                batch(&psch, vec![keys, i64_values(&mut rng, n)])
+                            })
+                            .collect(),
+                        build: {
+                            let mut start = 0;
+                            batch_sizes(build_rows)
+                                .map(|n| {
+                                    let b = batch(
+                                        &bsch,
+                                        vec![unique_keys(start, n), i64_values(&mut rng, n)],
+                                    );
+                                    start += n;
+                                    b
+                                })
+                                .collect()
+                        },
+                    }
+                },
+                vec![DataType::Int64],
+                single_key_spec(vec![1], vec![1], kind),
+            );
+        }
     }
 }
 
