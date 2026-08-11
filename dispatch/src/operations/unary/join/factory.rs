@@ -37,7 +37,12 @@ pub struct JoinBuildFactory<K: JoinKey, const BUILD_OUTER: bool> {
 }
 
 /// Creates one [`Probe`] per worker, all sharing the same [`JoinTable`].
-pub struct JoinProbeFactory<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> {
+pub struct JoinProbeFactory<
+    K: JoinKey,
+    const BUILD_OUTER: bool,
+    const SEMI: bool,
+    const OUTER_JOIN_PROBE_SIDE: bool,
+> {
     pub(crate) table: JoinTable<K::Stored>,
     hash_state: RandomState,
     spec: Arc<JoinSpec>,
@@ -52,17 +57,26 @@ pub struct JoinProbeFactory<K: JoinKey, const BUILD_OUTER: bool, const SEMI: boo
 /// outputters publish readiness only after every partition job has run; the
 /// graph builder uses that flag to gate every root of the probe input.
 ///
-/// The build phase is the same for a semi join as for an inner one, so only the
-/// probe factories carry `SEMI`.
-pub fn create_for_workers<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>(
+/// The build phase is the same for every kind, so only the probe factories
+/// carry `SEMI` and `OUTER_JOIN_PROBE_SIDE`.
+pub fn create_for_workers<
+    K: JoinKey,
+    const BUILD_OUTER: bool,
+    const SEMI: bool,
+    const OUTER_JOIN_PROBE_SIDE: bool,
+>(
     spec: JoinSpec,
     worker_count: usize,
 ) -> (
     impl IntoIterator<Item = JoinBuildFactory<K, BUILD_OUTER>>,
-    impl IntoIterator<Item = JoinProbeFactory<K, BUILD_OUTER, SEMI>>,
+    impl IntoIterator<Item = JoinProbeFactory<K, BUILD_OUTER, SEMI, OUTER_JOIN_PROBE_SIDE>>,
     Arc<AtomicBool>,
 ) {
     debug_assert_eq!(BUILD_OUTER, matches!(spec.kind, JoinKind::BuildOuter));
+    debug_assert_eq!(
+        OUTER_JOIN_PROBE_SIDE,
+        matches!(spec.kind, JoinKind::ProbeOuter)
+    );
     debug_assert!(
         !SEMI || spec.build_output_indices.is_empty(),
         "a semi join emits no build columns"
@@ -137,12 +151,13 @@ impl<K: JoinKey, const BUILD_OUTER: bool> UnaryFactory<RecordBatch, ()>
     }
 }
 
-impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool> UnaryFactory<RecordBatch, RecordBatch>
-    for JoinProbeFactory<K, BUILD_OUTER, SEMI>
+impl<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool, const OUTER_JOIN_PROBE_SIDE: bool>
+    UnaryFactory<RecordBatch, RecordBatch>
+    for JoinProbeFactory<K, BUILD_OUTER, SEMI, OUTER_JOIN_PROBE_SIDE>
 {
-    type Unary = Probe<K, BUILD_OUTER, SEMI>;
+    type Unary = Probe<K, BUILD_OUTER, SEMI, OUTER_JOIN_PROBE_SIDE>;
 
-    fn build_unary(self) -> Probe<K, BUILD_OUTER, SEMI> {
+    fn build_unary(self) -> Probe<K, BUILD_OUTER, SEMI, OUTER_JOIN_PROBE_SIDE> {
         Probe::new(self.table, self.hash_state, self.spec, self.unmatched)
     }
 }

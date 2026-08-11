@@ -266,6 +266,9 @@ impl PlanNode {
                 o.compile(definition, body)
             }
             crate::Operator::CteScan(o) => o.compile(dispatcher),
+            crate::Operator::Distinct(o) => {
+                o.compile(inputs.remove(0), self.inputs[0].output_nullability())
+            }
             crate::Operator::Materialize(o) => o.compile(inputs.remove(0)),
             crate::Operator::CreateTable(o) => {
                 if !inputs.is_empty() {

@@ -609,9 +609,10 @@ impl RecordBatchOperatorSpec {
     /// `spec.probe_output_indices` followed by `spec.build_output_indices`.
     /// Rows with a null value in any key column on either side never match.
     ///
-    /// `spec.kind` picks which rows reach the output: the matching pairs alone,
-    /// those plus one row per build row nothing matched (with null probe
-    /// columns), or one row per probe row that matched anything at all.
+    /// `spec.kind` picks which rows reach the output: the matching pairs
+    /// alone, those plus one row per unmatched build row (with null probe
+    /// columns) or per unmatched probe row (with null build columns), or one
+    /// row per probe row that matched anything at all.
     ///
     /// `key_types` are the Arrow types the key columns arrive as, one per
     /// condition (the planner casts mismatched sides of each condition to a
@@ -712,20 +713,26 @@ impl RecordBatchOperatorSpec {
     /// runtime test for it.
     fn join_dispatch<K: JoinKey>(self, build: RecordBatchOperatorSpec, spec: JoinSpec) -> Self {
         match spec.kind {
-            JoinKind::Inner => self.join_typed::<K, false, false>(build, spec),
-            JoinKind::BuildOuter => self.join_typed::<K, true, false>(build, spec),
+            JoinKind::Inner => self.join_typed::<K, false, false, false>(build, spec),
+            JoinKind::BuildOuter => self.join_typed::<K, true, false, false>(build, spec),
+            JoinKind::ProbeOuter => self.join_typed::<K, false, false, true>(build, spec),
             // With a residual predicate the first key match may not be a real
             // match, so the semi join runs on the pair-recording instantiation
             // and drops duplicate probe rows at drain time instead of exiting
             // the match loop early.
             JoinKind::ProbeSemi if spec.residual_filters.is_some() => {
-                self.join_typed::<K, false, false>(build, spec)
+                self.join_typed::<K, false, false, false>(build, spec)
             }
-            JoinKind::ProbeSemi => self.join_typed::<K, false, true>(build, spec),
+            JoinKind::ProbeSemi => self.join_typed::<K, false, true, false>(build, spec),
         }
     }
 
-    fn join_typed<K: JoinKey, const BUILD_OUTER: bool, const SEMI: bool>(
+    fn join_typed<
+        K: JoinKey,
+        const BUILD_OUTER: bool,
+        const SEMI: bool,
+        const OUTER_JOIN_PROBE_SIDE: bool,
+    >(
         self,
         build: RecordBatchOperatorSpec,
         spec: JoinSpec,
@@ -744,7 +751,10 @@ impl RecordBatchOperatorSpec {
         );
 
         let (build_factories, probe_factories, build_ready) =
-            create_join_factories::<K, BUILD_OUTER, SEMI>(spec, worker_count);
+            create_join_factories::<K, BUILD_OUTER, SEMI, OUTER_JOIN_PROBE_SIDE>(
+                spec,
+                worker_count,
+            );
 
         let (_, build_heads) = build.into_parts();
         let build_siblings_left = Arc::new(AtomicUsize::new(worker_count));

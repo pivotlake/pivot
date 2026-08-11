@@ -10,7 +10,7 @@
 //! [`JoinSpec::probe_output_indices`] (in list order) followed by the listed
 //! build-side columns. The join is an equi-join whose key columns are read,
 //! hashed, and compared through one of the [`JoinKey`] shapes, in one of the
-//! three [`JoinKind`]s below.
+//! [`JoinKind`]s below.
 //!
 //! A build-side outer join ([`JoinKind::BuildOuter`]) also emits every build
 //! row no probe row matched, its probe columns null-filled. Which rows those
@@ -23,6 +23,11 @@
 //! arena range, so the probe stops walking that range at the first key that
 //! matches; nothing else about the phases changes, and no cross-worker state is
 //! involved.
+//!
+//! A probe-side outer join ([`JoinKind::ProbeOuter`]) also emits every probe
+//! row nothing matched, its build columns null-filled. A probe row's matches
+//! all surface while its own batch is probed, so each worker settles its own
+//! batches with no cross-worker state (see the probe module doc).
 
 mod build;
 mod build_rows;
@@ -31,6 +36,7 @@ mod factory;
 pub use factory::JoinRecordBatchOperatorFactory;
 mod keys;
 pub use keys::{DynamicRowKey, JoinKey, PackedKey, SingleColumnKey};
+mod match_outputter;
 mod probe;
 mod range;
 pub(crate) use range::create_range_join_factories;
@@ -58,6 +64,10 @@ pub enum JoinKind {
     /// Every pair an [`Inner`](JoinKind::Inner) emits, plus one row per build
     /// row nothing matched, its probe columns null-filled.
     BuildOuter,
+    /// Every pair an [`Inner`](JoinKind::Inner) emits, plus one row per probe
+    /// row nothing matched (a null key, an empty build side, or every pair
+    /// rejected by the residual), its build columns null-filled.
+    ProbeOuter,
     /// One output row per probe row that has at least one matching build row,
     /// with no duplicates for a probe row that matches several. That is also
     /// why such a join emits no build columns: there is no single build row to
@@ -229,7 +239,7 @@ mod tests {
         build_worker_batches: Vec<Vec<RecordBatch>>,
         probe_batches: Vec<RecordBatch>,
     ) -> JoinResult {
-        run_join::<Int64Key, false>(build_worker_batches, probe_batches, None, vec![0])
+        run_join::<Int64Key, false, false>(build_worker_batches, probe_batches, None, vec![0])
     }
 
     /// Build-side outer: every build row reaches the output, with null probe
@@ -239,12 +249,21 @@ mod tests {
         probe_batches: Vec<RecordBatch>,
         probe_fields: Vec<Field>,
     ) -> JoinResult {
-        run_join::<Int64Key, true>(
+        run_join::<Int64Key, true, false>(
             build_worker_batches,
             probe_batches,
             Some(probe_fields),
             vec![0],
         )
+    }
+
+    /// Probe-side outer: every probe row reaches the output, with null build
+    /// columns when nothing matched.
+    fn build_and_probe_probe_outer(
+        build_worker_batches: Vec<Vec<RecordBatch>>,
+        probe_batches: Vec<RecordBatch>,
+    ) -> JoinResult {
+        run_join::<Int64Key, false, true>(build_worker_batches, probe_batches, None, vec![0])
     }
 
     /// Run one join to completion: one build worker per entry of
@@ -253,7 +272,7 @@ mod tests {
     /// The probe batches all go to the first, so the rest exercise a worker
     /// reaching that pass with no batch of its own. Both sides key on
     /// `key_columns`.
-    fn run_join<K: JoinKey, const BUILD_OUTER: bool>(
+    fn run_join<K: JoinKey, const BUILD_OUTER: bool, const PROBE_OUTER: bool>(
         build_worker_batches: Vec<Vec<RecordBatch>>,
         probe_batches: Vec<RecordBatch>,
         probe_fields: Option<Vec<Field>>,
@@ -263,9 +282,12 @@ mod tests {
         let workers = build_worker_batches.len();
         let probe_column_count = probe_batches[0].num_columns();
         let build_column_count = build_worker_batches[0][0].num_columns();
-        let kind = match probe_fields {
-            Some(_) => super::JoinKind::BuildOuter,
-            None => super::JoinKind::Inner,
+        let kind = if BUILD_OUTER {
+            super::JoinKind::BuildOuter
+        } else if PROBE_OUTER {
+            super::JoinKind::ProbeOuter
+        } else {
+            super::JoinKind::Inner
         };
         let probe_fields = probe_fields.unwrap_or_else(|| {
             probe_batches[0]
@@ -275,11 +297,17 @@ mod tests {
                 .map(|f| f.as_ref().clone())
                 .collect()
         });
+        // A probe-side outer join pads build columns with NULLs, whatever
+        // their input nullability.
         let build_fields: Vec<Field> = build_worker_batches[0][0]
             .schema()
             .fields()
             .iter()
-            .map(|f| f.as_ref().clone())
+            .map(|f| {
+                f.as_ref()
+                    .clone()
+                    .with_nullable(f.is_nullable() || PROBE_OUTER)
+            })
             .collect();
         let spec = super::JoinSpec {
             probe_key_indices: key_columns.clone(),
@@ -292,7 +320,7 @@ mod tests {
             residual_filters: None,
         };
         let (builds, probes, _) =
-            factory::create_for_workers::<K, BUILD_OUTER, false>(spec, workers);
+            factory::create_for_workers::<K, BUILD_OUTER, false, PROBE_OUTER>(spec, workers);
 
         let mut consumers: Vec<_> = builds
             .into_iter()
@@ -794,6 +822,72 @@ mod tests {
         assert_eq!(r.rows(), build_keys.len());
     }
 
+    #[test]
+    fn unmatched_probe_rows_come_out_with_null_build_columns() {
+        let r = build_and_probe_probe_outer(
+            vec![vec![int64_batch(&[20])]],
+            vec![int64_batch(&[10, 20, 30])],
+        );
+
+        assert_eq!(
+            collect_key_pairs(&r.batches),
+            vec![(Some(10), None), (Some(20), Some(20)), (Some(30), None)]
+        );
+    }
+
+    #[test]
+    fn a_probe_row_matching_several_build_rows_is_not_also_padded() {
+        let r = build_and_probe_probe_outer(
+            vec![vec![int64_batch(&[10, 10])]],
+            vec![int64_batch(&[10])],
+        );
+
+        assert_eq!(
+            collect_key_pairs(&r.batches),
+            vec![(Some(10), Some(10)), (Some(10), Some(10))]
+        );
+    }
+
+    #[test]
+    fn null_keyed_probe_rows_are_emitted_padded() {
+        let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, true)]));
+        let probe = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![None, Some(10)]))],
+        )
+        .unwrap();
+
+        let r = build_and_probe_probe_outer(vec![vec![int64_batch(&[10])]], vec![probe]);
+
+        assert_eq!(
+            collect_key_pairs(&r.batches),
+            vec![(None, None), (Some(10), Some(10))]
+        );
+    }
+
+    #[test]
+    fn an_empty_build_side_pads_every_probe_row() {
+        let r =
+            build_and_probe_probe_outer(vec![vec![int64_batch(&[])]], vec![int64_batch(&[1, 2])]);
+
+        assert_eq!(
+            collect_key_pairs(&r.batches),
+            vec![(Some(1), None), (Some(2), None)]
+        );
+    }
+
+    #[test]
+    fn a_probe_side_larger_than_one_batch_pads_every_miss() {
+        let probe_keys: Vec<i64> = (0..crate::RECORD_BATCH_SIZE as i64 * 2 + 5).collect();
+
+        let r = build_and_probe_probe_outer(
+            vec![vec![int64_batch(&[7])]],
+            vec![int64_batch(&probe_keys)],
+        );
+
+        assert_eq!(r.rows(), probe_keys.len());
+    }
+
     fn pair_key_batch(first_keys: &[i64], second_keys: &[i32]) -> RecordBatch {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![
@@ -833,7 +927,7 @@ mod tests {
         let build = pair_key_batch(&[1, 1, 2], &[10, 20, 30]);
         let probe = pair_key_batch(&[1, 2, 7], &[20, 30, 30]);
 
-        let r = run_join::<PackedKey<(Int64Type, Int32Type)>, false>(
+        let r = run_join::<PackedKey<(Int64Type, Int32Type)>, false, false>(
             vec![vec![build]],
             vec![probe],
             None,
@@ -863,7 +957,7 @@ mod tests {
         let build = triple_batch(&[1, 1, 2], &[10, 10, 20], &[100, 101, 200]);
         let probe = triple_batch(&[1, 1, 3], &[10, 10, 30], &[101, 999, 300]);
 
-        let r = run_join::<PackedKey<(Int64Type, Int64Type, Int32Type)>, false>(
+        let r = run_join::<PackedKey<(Int64Type, Int64Type, Int32Type)>, false, false>(
             vec![vec![build]],
             vec![probe],
             None,
@@ -890,7 +984,7 @@ mod tests {
         let probe =
             nullable_pair_batch(vec![Some(1), Some(1), None], vec![Some(10), None, Some(10)]);
 
-        let r = run_join::<PackedKey<(Int64Type, Int32Type)>, false>(
+        let r = run_join::<PackedKey<(Int64Type, Int32Type)>, false, false>(
             vec![vec![build]],
             vec![probe],
             None,
@@ -918,7 +1012,8 @@ mod tests {
         let build = string_key_batch(&["apple", "banana", "a-key-too-long-to-inline"]);
         let probe = string_key_batch(&["banana", "durian", "a-key-too-long-to-inline"]);
 
-        let r = run_join::<DynamicRowKey, false>(vec![vec![build]], vec![probe], None, vec![0]);
+        let r =
+            run_join::<DynamicRowKey, false, false>(vec![vec![build]], vec![probe], None, vec![0]);
 
         let mut keys: Vec<String> = r
             .batches
@@ -942,7 +1037,12 @@ mod tests {
         let build = int_str_batch(&[1, 1, 2], &["a", "b", "a"]);
         let probe = int_str_batch(&[1, 2, 2], &["b", "b", "a"]);
 
-        let r = run_join::<DynamicRowKey, false>(vec![vec![build]], vec![probe], None, vec![0, 1]);
+        let r = run_join::<DynamicRowKey, false, false>(
+            vec![vec![build]],
+            vec![probe],
+            None,
+            vec![0, 1],
+        );
 
         // Only (1, "b") and (2, "a") exist on both sides.
         let mut pairs: Vec<(i64, String)> = r
@@ -968,7 +1068,7 @@ mod tests {
 
     #[test]
     fn a_dynamic_key_outer_build_emits_unmatched_rows() {
-        let r = run_join::<DynamicRowKey, true>(
+        let r = run_join::<DynamicRowKey, true, false>(
             vec![vec![int64_batch(&[10, 20, 30])]],
             vec![int64_batch(&[20])],
             Some(nullable_key_field()),
