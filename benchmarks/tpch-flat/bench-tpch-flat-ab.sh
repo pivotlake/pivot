@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# bench-tpch-ab.sh - A/B performance comparison of two pivotdb commits on the
+# bench-tpch-flat-ab.sh - A/B performance comparison of two pivotdb commits on the
 # TPC-H flat suite, run on a freshly launched instance-store machine.
 #
 # Owns the whole box side: checks both commits out of the AMI-baked repo clone,
@@ -27,7 +27,7 @@
 # emits a sentinel on every exit path.
 #
 # Usage:
-#   bench-tpch-ab.sh \
+#   bench-tpch-flat-ab.sh \
 #     --mirror /opt/pivotdb --repo-url <tokenised fetch url> \
 #     --before <sha> --after <sha> \
 #     --data-bucket s3://bucket/prefix --cache-prefix s3://bucket/cache \
@@ -45,11 +45,11 @@ _common="$_here/bench-ab-common.sh"
 # shellcheck source=../lib/bench-ab-common.sh
 source "$_common"
 
-pid_file="${PID_FILE:-/tmp/bench-tpch-ab.pid}"
+pid_file="${PID_FILE:-/tmp/bench-tpch-flat-ab.pid}"
 echo $$ >"$pid_file"
 # Fire on every exit path carrying the real exit code, so a poller watching the
 # log never hangs on a silent failure.
-trap 'echo "=== BENCH-TPCH-AB COMPLETE exit=$? ==="' EXIT
+trap 'echo "=== BENCH-TPCH-FLAT-AB COMPLETE exit=$? ==="' EXIT
 set -e
 
 mirror="/opt/pivotdb"
@@ -168,7 +168,7 @@ run_pivot() {
     local bin="$1" dir="$2" query="$3"
     local t0 t1 out times
     t0="$(io_ticks)"
-    out="$("$bin" --suite tpch --suite-dir "$dir/benchmarks/tpch" \
+    out="$("$bin" --suite tpch-flat --suite-dir "$dir/benchmarks/tpch-flat" \
         --source "$measure_data" --query "$query" \
         --iterations "$iterations" --skip-check 2>&1)" || true
     t1="$(io_ticks)"
@@ -255,8 +255,8 @@ if [[ "$mode" == "pgo" ]]; then
     echo ">>> waiting for the $sf_pgo dataset"
     wait_for_scale "$sf_pgo"
     echo ">>> profiling runs on $sf_pgo"
-    profile_side "$before_dir" before tpch "$pgo_data"
-    profile_side "$after_dir" after tpch "$pgo_data"
+    profile_side "$before_dir" before tpch-flat "$pgo_data"
+    profile_side "$after_dir" after tpch-flat "$pgo_data"
 
     echo ">>> profile-use builds (A and B in parallel)"
     build_use "$before_dir" before & b1=$!
@@ -299,18 +299,18 @@ wait
 # last digit unstable); a real mismatch fails the run.
 # ---------------------------------------------------------------------------
 if [[ -z "$queries" ]]; then
-    queries="$(cd "$after_dir/benchmarks/tpch" && ls q*.sql | sed 's/\.sql$//' | paste -sd,)"
+    queries="$(cd "$after_dir/benchmarks/tpch-flat" && ls q*.sql | sed 's/\.sql$//' | paste -sd,)"
 fi
 echo ">>> burn-in + result capture (queries: $queries)"
 drop_caches
-"$before_bin" --suite tpch --suite-dir "$before_dir/benchmarks/tpch" \
+"$before_bin" --suite tpch-flat --suite-dir "$before_dir/benchmarks/tpch-flat" \
     --source "$measure_data" --query "$queries" --iterations 1 --update-results >/dev/null
 drop_caches
-"$after_bin" --suite tpch --suite-dir "$after_dir/benchmarks/tpch" \
+"$after_bin" --suite tpch-flat --suite-dir "$after_dir/benchmarks/tpch-flat" \
     --source "$measure_data" --query "$queries" --iterations 1 --update-results >/dev/null
 
 correctness="ok"
-if ! compare_outputs "$before_dir/benchmarks/tpch" "$after_dir/benchmarks/tpch"; then
+if ! compare_outputs "$before_dir/benchmarks/tpch-flat" "$after_dir/benchmarks/tpch-flat"; then
     correctness="MISMATCH"
 fi
 
@@ -336,7 +336,7 @@ for pass in $(seq "$passes"); do
         echo -e "$q\tafter\t$cold\t$hot\t$io" >>"$rows"
         if [[ "$run_duckdb" == "1" ]]; then
             drop_caches; sleep 3
-            read -r cold hot <<<"$(run_duckdb_query "$after_dir/benchmarks/tpch/$q.sql")"
+            read -r cold hot <<<"$(run_duckdb_query "$after_dir/benchmarks/tpch-flat/$q.sql")"
             echo -e "$q\tduckdb\t$cold\t$hot\t-" >>"$rows"
         fi
         echo "    $q pass $pass done"
