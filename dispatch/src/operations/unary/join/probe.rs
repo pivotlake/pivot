@@ -37,9 +37,11 @@
 //! probe row's matches all surface while its own batch is probed, so each
 //! worker settles its own batches.
 //!
-//! An anti join runs that same probe-side miss tracking and emits the misses
-//! alone: its drain stops once the collected pairs have settled their probe
-//! rows' fates, so a matched pair never reaches the output.
+//! An anti join emits only the unmatched rows of its preserved side: a
+//! probe-side anti join runs the probe-side miss tracking, a build-side anti
+//! join the build-side flag array and unmatched scan, and either way the
+//! drain stops once the collected pairs have settled fates, so a matched
+//! pair never reaches the output.
 //!
 //! A join with a residual predicate ([`JoinSpec::residual_filters`]) weighs
 //! the collected matches once more in the drain: the matched rows of both
@@ -110,10 +112,10 @@ impl<
         debug_assert!(!(SEMI && spec.residual_filters.is_some()));
         // A join is outer on one side at most (no FULL OUTER).
         debug_assert!(!(OUTER_JOIN_BUILD_SIDE && OUTER_JOIN_PROBE_SIDE));
-        // An anti join rides the probe-side miss tracking; it never combines
-        // with the first-match exit, whose skipped candidates could still
-        // pass a residual.
-        debug_assert!(!ANTI || (OUTER_JOIN_PROBE_SIDE && !SEMI));
+        // An anti join rides exactly one side's unmatched tracking, and never
+        // the first-match exit, whose skipped candidates could still pass a
+        // residual.
+        debug_assert!(!ANTI || (!SEMI && (OUTER_JOIN_PROBE_SIDE ^ OUTER_JOIN_BUILD_SIDE)));
         let residual_filters = spec
             .residual_filters
             .as_ref()

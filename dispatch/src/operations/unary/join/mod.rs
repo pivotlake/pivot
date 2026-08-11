@@ -33,6 +33,11 @@
 //! rows a probe-side outer join would pad, and nothing else: it runs the same
 //! miss tracking, but a matched pair only settles its probe row's fate and
 //! never becomes an output row.
+//!
+//! A build-side anti join ([`JoinKind::BuildAnti`]) is the same inversion of
+//! the build-side outer join: the flag array and unmatched scan run
+//! unchanged, only the unmatched build rows reach the output, and they carry
+//! no probe columns.
 
 mod build;
 mod build_rows;
@@ -84,6 +89,12 @@ pub enum JoinKind {
     /// build row to take columns from, so
     /// [`JoinSpec::build_output_indices`] must be empty.
     ProbeAnti,
+    /// One output row per build row that has no surviving match (a null key
+    /// or every pair rejected by the residual): exactly the rows a
+    /// [`BuildOuter`](JoinKind::BuildOuter) would pad. There is no probe row
+    /// to take columns from, so [`JoinSpec::probe_output_indices`] must be
+    /// empty.
+    BuildAnti,
 }
 
 /// How a join is configured beyond the key shape it is instantiated for.
@@ -136,7 +147,8 @@ impl fmt::Debug for JoinResidual {
     }
 }
 
-/// The cross-worker state of a build-side outer join's unmatched pass.
+/// The cross-worker state of the build-side unmatched pass an outer or anti
+/// join runs.
 pub(crate) struct UnmatchedScan {
     /// Probe workers that may still mark a matched build row. Each decrements
     /// it once, on entering `finish`, after which that worker never consumes
@@ -292,6 +304,15 @@ mod tests {
         run_join::<Int64Key, false, true, true>(build_worker_batches, probe_batches, None, vec![0])
     }
 
+    /// Build-side anti: exactly the build rows no probe row matched reach the
+    /// output, as build columns alone.
+    fn build_and_probe_build_anti(
+        build_worker_batches: Vec<Vec<RecordBatch>>,
+        probe_batches: Vec<RecordBatch>,
+    ) -> JoinResult {
+        run_join::<Int64Key, true, false, true>(build_worker_batches, probe_batches, None, vec![0])
+    }
+
     /// Run one join to completion: one build worker per entry of
     /// `build_worker_batches`, and as many probe workers, all of whose `finish`
     /// is driven (the unmatched pass only starts once every one has arrived).
@@ -306,14 +327,20 @@ mod tests {
     ) -> JoinResult {
         init_test_free_pool(16);
         let workers = build_worker_batches.len();
-        let probe_column_count = probe_batches[0].num_columns();
-        // An anti join emits no build columns.
-        let build_column_count = if ANTI {
+        // An anti join emits only its preserved side's columns.
+        let probe_column_count = if ANTI && BUILD_OUTER {
+            0
+        } else {
+            probe_batches[0].num_columns()
+        };
+        let build_column_count = if ANTI && PROBE_OUTER {
             0
         } else {
             build_worker_batches[0][0].num_columns()
         };
-        let kind = if ANTI {
+        let kind = if ANTI && BUILD_OUTER {
+            super::JoinKind::BuildAnti
+        } else if ANTI {
             super::JoinKind::ProbeAnti
         } else if BUILD_OUTER {
             super::JoinKind::BuildOuter
@@ -327,6 +354,7 @@ mod tests {
                 .schema()
                 .fields()
                 .iter()
+                .take(probe_column_count)
                 .map(|f| f.as_ref().clone())
                 .collect()
         });
@@ -995,6 +1023,80 @@ mod tests {
         );
 
         assert_eq!(r.rows(), probe_keys.len() - 1);
+    }
+
+    #[test]
+    fn a_build_anti_join_emits_only_the_build_rows_nobody_matched() {
+        let r = build_and_probe_build_anti(
+            vec![vec![int64_batch(&[10, 20, 30])]],
+            vec![int64_batch(&[20])],
+        );
+
+        let mut keys = collect_nullable_keys(&r.batches);
+        keys.sort();
+        assert_eq!(keys, vec![Some(10), Some(30)]);
+    }
+
+    #[test]
+    fn a_build_row_matched_twice_is_not_emitted_by_a_build_anti_join() {
+        let r = build_and_probe_build_anti(
+            vec![vec![int64_batch(&[10, 20])]],
+            vec![int64_batch(&[10, 10])],
+        );
+
+        assert_eq!(collect_nullable_keys(&r.batches), vec![Some(20)]);
+    }
+
+    #[test]
+    fn null_keyed_build_rows_come_out_of_a_build_anti_join() {
+        let schema = Arc::new(Schema::new(vec![Field::new("key", DataType::Int64, true)]));
+        let build = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![None, Some(10), Some(30)]))],
+        )
+        .unwrap();
+
+        let r = build_and_probe_build_anti(vec![vec![build]], vec![int64_batch(&[10])]);
+
+        let mut keys = collect_nullable_keys(&r.batches);
+        keys.sort();
+        assert_eq!(keys, vec![None, Some(30)]);
+    }
+
+    #[test]
+    fn a_probe_side_matching_nothing_makes_a_build_anti_join_emit_every_build_row() {
+        let r = build_and_probe_build_anti(
+            vec![vec![int64_batch(&[1, 2, 3])]],
+            vec![int64_batch(&[99])],
+        );
+
+        let mut keys = collect_nullable_keys(&r.batches);
+        keys.sort();
+        assert_eq!(keys, vec![Some(1), Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn the_build_anti_unmatched_pass_covers_every_build_worker() {
+        let r = build_and_probe_build_anti(
+            vec![vec![int64_batch(&[1, 2])], vec![int64_batch(&[3, 4])]],
+            vec![int64_batch(&[2, 3])],
+        );
+
+        let mut keys = collect_nullable_keys(&r.batches);
+        keys.sort();
+        assert_eq!(keys, vec![Some(1), Some(4)]);
+    }
+
+    #[test]
+    fn a_build_side_larger_than_one_batch_emits_every_unmatched_build_row() {
+        let build_keys: Vec<i64> = (0..crate::RECORD_BATCH_SIZE as i64 * 2 + 5).collect();
+
+        let r = build_and_probe_build_anti(
+            vec![vec![int64_batch(&build_keys)]],
+            vec![int64_batch(&[7])],
+        );
+
+        assert_eq!(r.rows(), build_keys.len() - 1);
     }
 
     fn pair_key_batch(first_keys: &[i64], second_keys: &[i32]) -> RecordBatch {

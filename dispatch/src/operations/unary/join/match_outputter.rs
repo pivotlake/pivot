@@ -361,7 +361,7 @@ impl ProbeMatchOutputter {
         }
         if ANTI {
             // An anti join's matched pairs are not output rows; the settling
-            // above is all a match contributes.
+            // and flagging above is all a match contributes.
             self.matched = 0;
             return Ok(());
         }

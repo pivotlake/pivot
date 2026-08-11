@@ -74,19 +74,29 @@ pub fn create_for_workers<
     impl IntoIterator<Item = JoinProbeFactory<K, BUILD_OUTER, SEMI, OUTER_JOIN_PROBE_SIDE, ANTI>>,
     Arc<AtomicBool>,
 ) {
-    debug_assert_eq!(BUILD_OUTER, matches!(spec.kind, JoinKind::BuildOuter));
+    debug_assert_eq!(
+        BUILD_OUTER,
+        matches!(spec.kind, JoinKind::BuildOuter | JoinKind::BuildAnti)
+    );
     debug_assert_eq!(
         OUTER_JOIN_PROBE_SIDE,
         matches!(spec.kind, JoinKind::ProbeOuter | JoinKind::ProbeAnti)
     );
-    debug_assert_eq!(ANTI, matches!(spec.kind, JoinKind::ProbeAnti));
+    debug_assert_eq!(
+        ANTI,
+        matches!(spec.kind, JoinKind::ProbeAnti | JoinKind::BuildAnti)
+    );
     debug_assert!(
         !SEMI || spec.build_output_indices.is_empty(),
         "a semi join emits no build columns"
     );
     debug_assert!(
-        !ANTI || spec.build_output_indices.is_empty(),
-        "an anti join emits no build columns"
+        !(ANTI && OUTER_JOIN_PROBE_SIDE) || spec.build_output_indices.is_empty(),
+        "a probe-side anti join emits no build columns"
+    );
+    debug_assert!(
+        !(ANTI && BUILD_OUTER) || spec.probe_output_indices.is_empty(),
+        "a build-side anti join emits no probe columns"
     );
     let spec = Arc::new(spec);
     let hash_state = RandomState::with_seeds(0, 0, 0, 0);

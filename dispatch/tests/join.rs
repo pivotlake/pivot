@@ -568,6 +568,60 @@ fn probe_anti_join_emits_a_null_keyed_probe_row() {
     assert_eq!(ids, vec![None, Some(30)]);
 }
 
+/// A build-side anti join keyed on column 0 of both sides, emitting the
+/// listed build columns for every build row no probe row matched, and no
+/// probe column.
+fn build_anti_join(build_columns: Vec<usize>) -> JoinSpec {
+    let build_fields = int64_fields(build_columns.len());
+    JoinSpec {
+        probe_key_indices: vec![0],
+        build_key_indices: vec![0],
+        probe_output_indices: Vec::new(),
+        build_output_indices: build_columns,
+        probe_fields: Vec::new(),
+        build_fields,
+        kind: JoinKind::BuildAnti,
+        residual_filters: None,
+    }
+}
+
+#[test]
+fn build_anti_join_emits_only_the_unmatched_build_rows() {
+    let d = dispatch(4);
+    let build = values_input(&d, vec![int64_batch("id", &[10, 20, 30])]).record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &[20, 20, 99])]).record_batches();
+
+    let results = probe
+        .join(build, &[DataType::Int64], build_anti_join(vec![0]))
+        .collect()
+        .unwrap();
+
+    // 20 is matched (twice, which changes nothing), 99 matches no build row.
+    let mut ids = collect_i64s(&results, 0);
+    ids.sort();
+    assert_eq!(ids, vec![10, 30]);
+    assert!(results.iter().all(|batch| batch.num_columns() == 1));
+}
+
+#[test]
+fn every_unmatched_build_row_reaches_a_build_anti_join_output() {
+    let d = dispatch(4);
+    let build_ids: Vec<i64> = (0..30_000).collect();
+    let probe_ids: Vec<i64> = (0..30_000).step_by(3).collect();
+    let build = values_input(&d, vec![int64_batch("id", &build_ids)]).record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &probe_ids)]).record_batches();
+
+    let results = probe
+        .join(build, &[DataType::Int64], build_anti_join(vec![0]))
+        .collect()
+        .unwrap();
+
+    let mut ids = collect_i64s(&results, 0);
+    ids.sort();
+    let expected: Vec<i64> = (0..30_000).filter(|id| id % 3 != 0).collect();
+    assert_eq!(ids, expected);
+}
+
 #[test]
 fn an_anti_join_spanning_batches_emits_each_unmatched_probe_row_once() {
     let d = dispatch(4);
