@@ -32,6 +32,9 @@ pub use factory::JoinRecordBatchOperatorFactory;
 mod keys;
 pub use keys::{DynamicRowKey, JoinKey, PackedKey, SingleColumnKey};
 mod probe;
+mod range;
+pub(crate) use range::create_range_join_factories;
+pub use range::{RangeCompare, RangeJoinSpec};
 mod residual_filter;
 
 use std::cell::UnsafeCell;
