@@ -14,9 +14,10 @@
 //! silently winning, since the two entries are free to disagree about location
 //! or credentials.
 //!
-//! Every datastore and user keeps the [`Origin`] it was merged from, because the
-//! two files are not interchangeable once the server is running: the config file
-//! is the operator's, and the metastore file is the server's own to rewrite.
+//! Each file's definitions are held as a section of their own, because the two
+//! files are not interchangeable once the server is running: the config file
+//! is the operator's, and the metastore file is the server's own to rewrite
+//! (which is exactly serialising its section back out).
 //!
 //! `kind` is the datastore format (only `delta` today). The storage backend is
 //! chosen from `location`: a plain path (or `file://`) opens a local store, an
@@ -84,8 +85,8 @@
 //! password cannot be recovered from it), but it is still worth the same care.
 
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use catalog::Datastore;
@@ -95,8 +96,12 @@ use datastore_delta::{
     DEFAULT_VACUUM_POLL, DeltaDatastore, MaintenanceConfig, VacuumConfig,
 };
 use dispatch::DataFlowDispatcher;
-use metastore::{DEFAULT_USER_NAME, Metastore, UserAuth, parse_scram_verifier};
-use serde::Deserialize;
+use metastore::{
+    DEFAULT_USER_NAME, Metastore, SCRAM_ITERATIONS, SCRAM_SALT_LEN, ScramVerifier, UserAuth,
+    format_scram_verifier, parse_scram_verifier,
+};
+use pgwire::api::auth::sasl::scram::gen_salted_password;
+use serde::{Deserialize, Serialize};
 
 mod units;
 
@@ -108,14 +113,16 @@ pub use units::{ByteSize, Interval};
 /// The configuration is structurally validated by [`open`](Self::open). Object
 /// stores and their Delta datastores are opened when
 /// [`Metastore::open_datastores`] is called.
+#[derive(Debug)]
 pub struct DiskMetastore {
-    datastore_configs: HashMap<String, ConfigDefinition<DatastoreConfig>>,
+    /// The server config file's `metastore` section: the operator's, never
+    /// rewritten, so it needs no lock.
+    server_config: MetastoreConfig,
+    /// What the metastore file holds: the server's own to rewrite.
+    metastore_config: RwLock<MetastoreConfig>,
+    /// The file named by `--metastore-file`.
+    metastore_file: Option<PathBuf>,
     default_name: String,
-    /// Every user's authentication method, keyed by user name. The built-in
-    /// `pivot` user is always among them. Verifiers are
-    /// decoded once, by [`open`](Self::open), so a malformed one fails startup
-    /// rather than a login.
-    user_auth: HashMap<String, ConfigDefinition<UserAuth>>,
     /// How often every datastore this metastore opens refreshes its table set
     /// from the store. Global (all datastores share the cadence, which the
     /// server takes from its own section); compaction, in contrast, is
@@ -133,89 +140,71 @@ impl DiskMetastore {
     /// missing, which would otherwise show up as tables that do not exist and
     /// logins that are refused.
     pub fn open(
-        config: MetastoreConfig,
+        server_config: MetastoreConfig,
         metastore_file: Option<&Path>,
         refresh_interval: Duration,
     ) -> Result<Self> {
-        let mut datastores = into_config_definitions(config.datastores, Origin::ConfigFile);
-        let mut users = into_config_definitions(config.users, Origin::ConfigFile);
-        if let Some(path) = metastore_file {
-            let disk = parse_config(&std::fs::read_to_string(path)?)?;
-            merge_definitions(
-                &mut datastores,
-                into_config_definitions(disk.datastores, Origin::MetastoreFile),
-            )
-            .map_err(|names| Error::ConflictingDatastores { names })?;
-            merge_definitions(
-                &mut users,
-                into_config_definitions(disk.users, Origin::MetastoreFile),
-            )
-            .map_err(|names| Error::ConflictingUsers { names })?;
-        }
-        Self::from_definitions(datastores, users, refresh_interval)
-    }
-
-    /// Validate the merged definitions: exactly one default datastore, and users
-    /// whose verifiers decode.
-    fn from_definitions(
-        datastores: HashMap<String, ConfigDefinition<DatastoreConfig>>,
-        users: HashMap<String, ConfigDefinition<UserConfig>>,
-        refresh_interval: Duration,
-    ) -> Result<Self> {
-        // The default datastore is the one flagged `default = true`, not one with
-        // a reserved name. Exactly one is required: it is the current database.
-        let mut defaults: Vec<String> = datastores
-            .iter()
-            .filter(|(_, definition)| definition.value.is_default)
-            .map(|(name, _)| name.clone())
-            .collect();
-        if defaults.len() > 1 {
-            defaults.sort();
-            return Err(Error::MultipleDefaults(defaults));
-        }
-        let default_name = defaults.pop().ok_or(Error::MissingDefault)?;
-        let mut user_auth = users
-            .into_iter()
-            .map(|(name, definition)| {
-                let auth = definition
-                    .value
-                    .into_auth()
-                    .map_err(|message| Error::User {
-                        name: name.clone(),
-                        message,
-                    })?;
-                Ok((
-                    name,
-                    ConfigDefinition {
-                        origin: definition.origin,
-                        value: auth,
-                    },
-                ))
-            })
-            .collect::<Result<HashMap<_, _>>>()?;
-        // The built-in user is always present.
-        user_auth
-            .entry(DEFAULT_USER_NAME.to_string())
-            .or_insert_with(|| ConfigDefinition {
-                origin: Origin::BuiltIn,
-                value: UserAuth::Trust,
-            });
+        let metastore_config = match metastore_file {
+            Some(path) => read_config(path)?,
+            None => MetastoreConfig::default(),
+        };
+        check_no_conflicts(&server_config, &metastore_config)?;
+        let default_name = find_default_datastore(&server_config, &metastore_config)?;
         Ok(Self {
-            datastore_configs: datastores,
+            server_config,
+            metastore_config: RwLock::new(metastore_config),
+            metastore_file: metastore_file.map(Path::to_path_buf),
             default_name,
-            user_auth,
             refresh_interval,
         })
+    }
+
+    /// Add a user to the metastore config, durably: refuse a name either
+    /// config (or the built-in) already defines, rewrite the metastore file
+    /// with the user added, then serve the result from memory. A password
+    /// becomes a stored SCRAM verifier over a fresh random salt; no password
+    /// means [`UserAuth::Trust`]. Requires a metastore file: the server
+    /// config file is the operator's, and the server never rewrites it.
+    ///
+    /// The metastore file is this server's own, and nothing else writes it,
+    /// so the config in memory is authoritative and the rewrite simply
+    /// serialises it; the write lock serialises writers.
+    pub fn create_user(&self, username: &str, password: Option<&str>) -> Result<()> {
+        let Some(path) = &self.metastore_file else {
+            return Err(Error::NoMetastoreFile);
+        };
+        if username == DEFAULT_USER_NAME || self.server_config.users.contains_key(username) {
+            return Err(Error::UserExists {
+                name: username.to_string(),
+            });
+        }
+        let mut metastore_config = self.metastore_config.write().unwrap();
+        if metastore_config.users.contains_key(username) {
+            return Err(Error::UserExists {
+                name: username.to_string(),
+            });
+        }
+        let auth = derive_user_auth(password);
+        metastore_config
+            .users
+            .insert(username.to_string(), UserConfig { auth });
+        if let Err(error) = write_config(path, &metastore_config) {
+            metastore_config.users.remove(username);
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn build_datastores(
         &self,
         dispatcher: &DataFlowDispatcher,
     ) -> Result<HashMap<String, Arc<dyn Datastore>>> {
-        self.datastore_configs
+        let metastore_config = self.metastore_config.read().unwrap();
+        self.server_config
+            .datastores
             .iter()
-            .map(|(name, definition)| {
-                let config = &definition.value;
+            .chain(metastore_config.datastores.iter())
+            .map(|(name, config)| {
                 let store = config.open_store(name)?;
                 let maintenance = MaintenanceConfig {
                     refresh_interval: self.refresh_interval,
@@ -233,54 +222,43 @@ impl DiskMetastore {
     }
 }
 
-/// Where a config definition came from.
-///
-/// The config file is the operator's, so the server never rewrites it and
-/// runtime changes to what it defines are refused; the metastore file is the
-/// server's own to rewrite. Recording the fact rather than the consequence
-/// leaves room for the several rules that read it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Origin {
-    /// The config file's `metastore` section.
-    ConfigFile,
-    /// The file named by `--metastore-file`.
-    MetastoreFile,
-    /// Neither file: the built-in trusted [`DEFAULT_USER_NAME`] user, served
-    /// whenever no file defined one by that name.
-    BuiltIn,
-}
-
-/// One entry as a file defines it, and which file that was.
-struct ConfigDefinition<T> {
-    origin: Origin,
-    value: T,
-}
-
-/// Note every entry of one file's map as defined by that file.
-fn into_config_definitions<T>(
-    entries: HashMap<String, T>,
-    origin: Origin,
-) -> HashMap<String, ConfigDefinition<T>> {
-    entries
-        .into_iter()
-        .map(|(name, value)| (name, ConfigDefinition { origin, value }))
-        .collect()
-}
-
-/// Fold `incoming` into `existing`. A name defined on both sides comes back
-/// instead of being merged: the two entries may disagree about where a datastore
-/// lives or how a user authenticates, and whichever one lost would do so
-/// invisibly.
-fn merge_definitions<T>(
-    existing: &mut HashMap<String, ConfigDefinition<T>>,
-    incoming: HashMap<String, ConfigDefinition<T>>,
-) -> std::result::Result<(), Vec<String>> {
-    let conflicting = find_conflicting_names(existing, &incoming);
-    if !conflicting.is_empty() {
-        return Err(conflicting);
+/// Reject a name defined in both configs. The two entries may disagree about
+/// where a datastore lives or how a user authenticates, and whichever one
+/// lost would do so invisibly.
+fn check_no_conflicts(
+    server_config: &MetastoreConfig,
+    metastore_config: &MetastoreConfig,
+) -> Result<()> {
+    let names = find_conflicting_names(&server_config.datastores, &metastore_config.datastores);
+    if !names.is_empty() {
+        return Err(Error::ConflictingDatastores { names });
     }
-    existing.extend(incoming);
+    let names = find_conflicting_names(&server_config.users, &metastore_config.users);
+    if !names.is_empty() {
+        return Err(Error::ConflictingUsers { names });
+    }
     Ok(())
+}
+
+/// The name of the one datastore across the two configs flagged
+/// `default = true` (not one with a reserved name). Exactly one is required:
+/// it is the current database.
+fn find_default_datastore(
+    server_config: &MetastoreConfig,
+    metastore_config: &MetastoreConfig,
+) -> Result<String> {
+    let mut defaults: Vec<String> = server_config
+        .datastores
+        .iter()
+        .chain(metastore_config.datastores.iter())
+        .filter(|(_, datastore)| datastore.is_default)
+        .map(|(name, _)| name.clone())
+        .collect();
+    if defaults.len() > 1 {
+        defaults.sort();
+        return Err(Error::MultipleDefaults(defaults));
+    }
+    defaults.pop().ok_or(Error::MissingDefault)
 }
 
 impl Metastore for DiskMetastore {
@@ -297,10 +275,56 @@ impl Metastore for DiskMetastore {
     }
 
     fn user_auth(&self, username: &str) -> Option<UserAuth> {
-        self.user_auth
-            .get(username)
-            .map(|definition| definition.value.clone())
+        if let Some(user) = self.server_config.users.get(username) {
+            return Some(user.auth.clone());
+        }
+        if let Some(user) = self.metastore_config.read().unwrap().users.get(username) {
+            return Some(user.auth.clone());
+        }
+        // The built-in trusted user, served whenever no file defined one by
+        // that name, so a server is reachable whatever else its users are.
+        (username == DEFAULT_USER_NAME).then_some(UserAuth::Trust)
     }
+
+    fn create_user(&self, username: &str, password: Option<&str>) -> metastore::Result<()> {
+        DiskMetastore::create_user(self, username, password)
+            .map_err(|error| Box::new(error) as metastore::Error)
+    }
+}
+
+/// The [`UserAuth`] a password grants: a SCRAM verifier over a fresh random
+/// salt, or trust when no password was given. The verifier is what gets
+/// stored; the password itself is dropped here.
+///
+/// The salted password is pgwire's own derivation (SASLprep normalisation,
+/// then PBKDF2-HMAC-SHA256), so what this stores is exactly what pgwire
+/// verifies a login's proof against.
+fn derive_user_auth(password: Option<&str>) -> UserAuth {
+    match password {
+        None => UserAuth::Trust,
+        Some(password) => {
+            let salt = rand::random::<[u8; SCRAM_SALT_LEN]>().to_vec();
+            UserAuth::ScramSha256(ScramVerifier {
+                salted_password: gen_salted_password(password, &salt, SCRAM_ITERATIONS),
+                salt,
+            })
+        }
+    }
+}
+
+/// Read and validate the metastore file's section.
+fn read_config(path: &Path) -> Result<MetastoreConfig> {
+    parse_config(&std::fs::read_to_string(path)?)
+}
+
+/// Write `config` as the metastore file's new content, via a sibling
+/// temporary file renamed into place so a crash never leaves the file half
+/// written.
+fn write_config(path: &Path, config: &MetastoreConfig) -> Result<()> {
+    let temporary = path.with_extension("rewrite");
+    std::fs::write(&temporary, serde_yaml_ng::to_string(config)?)?;
+    std::fs::rename(&temporary, path)?;
+    Ok(())
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -329,8 +353,10 @@ pub enum Error {
     ConflictingUsers { names: Vec<String> },
     #[error("datastore `{name}`: {message}")]
     Datastore { name: String, message: String },
-    #[error("user `{name}`: {message}")]
-    User { name: String, message: String },
+    #[error("user `{name}` already exists")]
+    UserExists { name: String },
+    #[error("creating a user requires a metastore file; start the server with --metastore-file")]
+    NoMetastoreFile,
     #[error(
         "no default datastore is configured; mark exactly one entry under `datastores` with `default: true`"
     )]
@@ -350,13 +376,25 @@ pub enum Error {
 ///
 /// Unknown keys are rejected: a misspelled `users` section would otherwise be
 /// dropped in silence and unexpectedly select the built-in trusted `pivot` user.
-#[derive(Deserialize)]
+///
+/// Serialised sorted by name, so rewriting the metastore file is
+/// deterministic rather than in hash order.
+#[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetastoreConfig {
-    #[serde(default)]
+    #[serde(default, serialize_with = "sorted_by_name")]
     datastores: HashMap<String, DatastoreConfig>,
-    #[serde(default)]
+    #[serde(default, serialize_with = "sorted_by_name")]
     users: HashMap<String, UserConfig>,
+}
+
+/// Serialize a map's entries in name order.
+fn sorted_by_name<S: serde::Serializer, T: Serialize>(
+    map: &HashMap<String, T>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    let sorted: std::collections::BTreeMap<&String, &T> = map.iter().collect();
+    sorted.serialize(serializer)
 }
 
 /// The names `incoming` would overwrite in `existing`, sorted so the error lists
@@ -381,19 +419,46 @@ fn parse_config(text: &str) -> Result<MetastoreConfig> {
 
 /// One user and the authentication method nested inside it. Keeping the user as
 /// a struct leaves room for later user-level fields such as roles.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// The verifier is decoded by deserialisation itself (via [`RawUserConfig`]),
+/// so a parsed config holds ready [`UserAuth`]s and a malformed verifier fails
+/// the file's parse rather than a login; serialisation re-encodes it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(try_from = "RawUserConfig", into = "RawUserConfig")]
 struct UserConfig {
+    auth: UserAuth,
+}
+
+/// [`UserConfig`] as the file spells it, the verifier still encoded.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawUserConfig {
     auth: UserAuthConfig,
 }
 
-impl UserConfig {
-    fn into_auth(self) -> std::result::Result<UserAuth, String> {
-        match self.auth {
-            UserAuthConfig::Trust {} => Ok(UserAuth::Trust),
+impl TryFrom<RawUserConfig> for UserConfig {
+    type Error = String;
+
+    fn try_from(raw: RawUserConfig) -> std::result::Result<Self, String> {
+        let auth = match raw.auth {
+            UserAuthConfig::Trust {} => UserAuth::Trust,
             UserAuthConfig::ScramSha256 { verifier } => {
-                parse_scram_verifier(&verifier).map(UserAuth::ScramSha256)
+                UserAuth::ScramSha256(parse_scram_verifier(&verifier)?)
             }
+        };
+        Ok(Self { auth })
+    }
+}
+
+impl From<UserConfig> for RawUserConfig {
+    fn from(user: UserConfig) -> Self {
+        Self {
+            auth: match user.auth {
+                UserAuth::Trust => UserAuthConfig::Trust {},
+                UserAuth::ScramSha256(verifier) => UserAuthConfig::ScramSha256 {
+                    verifier: format_scram_verifier(&verifier),
+                },
+            },
         }
     }
 }
@@ -401,7 +466,7 @@ impl UserConfig {
 /// YAML representation of a user's one authentication method. Variant-specific
 /// fields live inside the variant, so `trust` cannot carry a verifier and SCRAM
 /// cannot omit one.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(tag = "method", deny_unknown_fields)]
 enum UserAuthConfig {
     #[serde(rename = "trust")]
@@ -413,7 +478,7 @@ enum UserAuthConfig {
 /// One datastore's configuration. `kind` is the datastore format; the storage
 /// backend (local filesystem vs S3) is inferred from `location`'s scheme, and
 /// the S3 credential fields apply only when `location` is an `s3://` URI.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct DatastoreConfig {
     kind: DatastoreKind,
@@ -430,10 +495,12 @@ struct DatastoreConfig {
     compact: bool,
     /// Per-table byte threshold compaction merges small files up to (a size such
     /// as `128m` or `1g`). Defaults to [`DEFAULT_COMPACT_BYTES`].
+    #[serde(skip_serializing_if = "Option::is_none")]
     compact_bytes: Option<ByteSize>,
     /// Count trigger for a low-traffic partition's small files (merge once this
     /// many accumulate, even below `compact_bytes`). Defaults to
     /// [`DEFAULT_MIN_FILES_TO_MERGE`].
+    #[serde(skip_serializing_if = "Option::is_none")]
     compact_min_files: Option<usize>,
     /// Run this datastore's own background vacuum. On by default: the vacuumer
     /// deletes unreferenced data files and superseded commit JSONs past their
@@ -441,14 +508,46 @@ struct DatastoreConfig {
     /// process owns physical cleanup.
     #[serde(default = "default_true")]
     vacuum: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     access_key_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     secret_access_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     endpoint: Option<String>,
     /// A Google service-account (or authorized-user) JSON key file, for a
     /// `gs://` location. Omit to resolve credentials from the ambient
     /// Application Default Credentials chain instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
     credentials_file: Option<String>,
+}
+
+/// By hand with the S3 credentials redacted: a datastore's config must not
+/// leak them into a log through a `{:?}` of some struct that holds one.
+impl std::fmt::Debug for DatastoreConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatastoreConfig")
+            .field("kind", &self.kind)
+            .field("location", &self.location)
+            .field("is_default", &self.is_default)
+            .field("compact", &self.compact)
+            .field("compact_bytes", &self.compact_bytes)
+            .field("compact_min_files", &self.compact_min_files)
+            .field("vacuum", &self.vacuum)
+            .field("region", &self.region)
+            .field(
+                "access_key_id",
+                &self.access_key_id.as_ref().map(|_| "redacted"),
+            )
+            .field(
+                "secret_access_key",
+                &self.secret_access_key.as_ref().map(|_| "redacted"),
+            )
+            .field("endpoint", &self.endpoint)
+            .field("credentials_file", &self.credentials_file)
+            .finish()
+    }
 }
 
 /// Serde default for the `compact` and `vacuum` toggles: both maintenance loops
@@ -490,7 +589,7 @@ impl DatastoreConfig {
 /// The datastore format. Only [`Delta`](Self::Delta) is supported today; adding
 /// another (Iceberg, ...) is a new variant plus its arm in
 /// [`build_datastores`](DiskMetastore::build_datastores).
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum DatastoreKind {
     Delta,
@@ -572,6 +671,55 @@ mod tests {
         file
     }
 
+    /// The config serving `name`, or "builtin" for the user neither defines.
+    fn user_source(store: &DiskMetastore, name: &str) -> &'static str {
+        if store.server_config.users.contains_key(name) {
+            "server config"
+        } else if store
+            .metastore_config
+            .read()
+            .unwrap()
+            .users
+            .contains_key(name)
+        {
+            "metastore config"
+        } else if store.user_auth(name).is_some() {
+            "builtin"
+        } else {
+            panic!("no user `{name}`")
+        }
+    }
+
+    /// A datastore's definition, whichever config holds it.
+    fn datastore(store: &DiskMetastore, name: &str) -> DatastoreConfig {
+        if let Some(datastore) = store.server_config.datastores.get(name) {
+            return datastore.clone();
+        }
+        store.metastore_config.read().unwrap().datastores[name].clone()
+    }
+
+    /// Open a config `section` merged with a metastore file holding `disk`,
+    /// keeping the file alive so a test can rewrite and reopen it.
+    fn open_with_file(section: &str, disk: &str) -> (DiskMetastore, tempfile::NamedTempFile) {
+        let file = metastore_file(disk);
+        (reopen(section, &file), file)
+    }
+
+    /// Open `section` merged with the metastore file as a fresh store, as a
+    /// restarted server would.
+    fn reopen(section: &str, file: &tempfile::NamedTempFile) -> DiskMetastore {
+        DiskMetastore::open(
+            parse_config(section).unwrap(),
+            Some(file.path()),
+            DEFAULT_REFRESH_INTERVAL,
+        )
+        .unwrap()
+    }
+
+    /// A minimal config-file `metastore` section: one default datastore.
+    const HOT_SECTION: &str =
+        "datastores:\n  hot:\n    kind: delta\n    location: /tmp/hot\n    default: true\n";
+
     #[test]
     fn compaction_is_per_datastore() {
         let yaml = r#"
@@ -589,8 +737,8 @@ datastores:
 
         let store = from_yaml(yaml).unwrap();
 
-        let hot = store.datastore_configs["hot"].value.compaction();
-        let warm = store.datastore_configs["warm"].value.compaction();
+        let hot = datastore(&store, "hot").compaction();
+        let warm = datastore(&store, "warm").compaction();
         // Compaction is on by default (hot omits `compact`), and off only where a
         // datastore turns it off explicitly (warm).
         assert_eq!(hot.unwrap().target_bytes, 128 * 1024 * 1024);
@@ -658,9 +806,7 @@ datastores:
     location: /tmp/warm
 "#;
 
-        let error = from_yaml(yaml)
-            .err()
-            .expect("a metastore without a default should be rejected");
+        let error = from_yaml(yaml).expect_err("a metastore without a default should be rejected");
 
         assert!(matches!(&error, Error::MissingDefault));
         assert_eq!(
@@ -734,10 +880,7 @@ datastores:
 "#;
 
         let store = from_yaml(yaml).unwrap();
-        let err = store.datastore_configs["warm"]
-            .value
-            .open_store("warm")
-            .unwrap_err();
+        let err = datastore(&store, "warm").open_store("warm").unwrap_err();
 
         assert!(matches!(err, Error::Datastore { .. }));
     }
@@ -764,23 +907,14 @@ datastores:
         let store = from_yaml(yaml).unwrap();
 
         assert!(
-            store.datastore_configs[DEFAULT_DATASTORE_NAME]
-                .value
+            datastore(&store, DEFAULT_DATASTORE_NAME)
                 .open_store(DEFAULT_DATASTORE_NAME)
                 .is_ok()
         );
-        assert!(
-            store.datastore_configs["warm"]
-                .value
-                .open_store("warm")
-                .is_ok()
-        );
+        assert!(datastore(&store, "warm").open_store("warm").is_ok());
         // A GCS store resolves its credentials lazily (at the first request),
         // so opening one needs no ambient Google credentials.
-        let cold = store.datastore_configs["cold"]
-            .value
-            .open_store("cold")
-            .unwrap();
+        let cold = datastore(&store, "cold").open_store("cold").unwrap();
         assert_eq!(cold.location_uri(), "gs://bucket/prefix");
     }
 
@@ -820,8 +954,8 @@ users:
 
         let store = open_merged(section, disk).unwrap();
 
-        assert_eq!(store.datastore_configs.len(), 2);
-        assert_eq!(store.datastore_configs["warm"].value.location, "/tmp/warm");
+        assert_eq!(datastore(&store, "warm").location, "/tmp/warm");
+        assert_eq!(datastore(&store, "hot").location, "/tmp/hot");
         assert_eq!(store.default_datastore_name(), "hot");
         assert!(matches!(store.user_auth("reader"), Some(UserAuth::Trust)));
         assert!(matches!(store.user_auth("writer"), Some(UserAuth::Trust)));
@@ -853,20 +987,24 @@ users:
 
         let store = open_merged(section, disk).unwrap();
 
-        assert_eq!(store.datastore_configs["hot"].origin, Origin::ConfigFile);
-        assert_eq!(
-            store.datastore_configs["warm"].origin,
-            Origin::MetastoreFile
+        assert!(store.server_config.datastores.contains_key("hot"));
+        assert!(
+            store
+                .metastore_config
+                .read()
+                .unwrap()
+                .datastores
+                .contains_key("warm")
         );
-        assert_eq!(store.user_auth["reader"].origin, Origin::ConfigFile);
-        assert_eq!(store.user_auth["writer"].origin, Origin::MetastoreFile);
+        assert_eq!(user_source(&store, "reader"), "server config");
+        assert_eq!(user_source(&store, "writer"), "metastore config");
     }
 
     #[test]
-    fn the_user_no_file_defined_is_marked_as_built_in() {
+    fn the_user_no_file_defined_is_served_as_built_in() {
         let store = from_yaml_with("").unwrap();
 
-        assert_eq!(store.user_auth[DEFAULT_USER_NAME].origin, Origin::BuiltIn);
+        assert_eq!(user_source(&store, DEFAULT_USER_NAME), "builtin");
     }
 
     #[test]
@@ -1020,6 +1158,84 @@ datastores:
     }
 
     #[test]
+    fn a_created_user_is_served_and_survives_reopening() {
+        let disk = "datastores:\n  warm:\n    kind: delta\n    location: /tmp/warm\n    \
+                    compact: false\n    compact_bytes: 128m\n";
+        let (store, file) = open_with_file(HOT_SECTION, disk);
+
+        store.create_user("walt", Some("w")).unwrap();
+
+        assert!(matches!(
+            store.user_auth("walt"),
+            Some(UserAuth::ScramSha256(_))
+        ));
+        assert_eq!(user_source(&store, "walt"), "metastore config");
+        // The rewrite carried the file's datastore through unchanged,
+        // tuning fields included.
+        let reopened = reopen(HOT_SECTION, &file);
+        assert!(matches!(
+            reopened.user_auth("walt"),
+            Some(UserAuth::ScramSha256(_))
+        ));
+        let warm = datastore(&reopened, "warm");
+        assert_eq!(warm.location, "/tmp/warm");
+        assert!(!warm.compact);
+        assert_eq!(
+            warm.compact_bytes.unwrap().as_bytes(),
+            128 * 1024 * 1024,
+            "the size survives re-encoding through its written form"
+        );
+    }
+
+    #[test]
+    fn a_created_trust_user_round_trips() {
+        let (store, file) = open_with_file(HOT_SECTION, "users: {}\n");
+
+        store.create_user("walt", None).unwrap();
+
+        assert!(matches!(
+            reopen(HOT_SECTION, &file).user_auth("walt"),
+            Some(UserAuth::Trust)
+        ));
+    }
+
+    #[test]
+    fn creating_a_second_user_keeps_the_first_and_the_datastore_in_the_file() {
+        let disk = "datastores:\n  warm:\n    kind: delta\n    location: /tmp/warm\n";
+        let (store, file) = open_with_file(HOT_SECTION, disk);
+
+        store.create_user("walt", None).unwrap();
+        store.create_user("jesse", None).unwrap();
+
+        let reopened = reopen(HOT_SECTION, &file);
+        assert!(reopened.user_auth("walt").is_some());
+        assert!(reopened.user_auth("jesse").is_some());
+        assert_eq!(datastore(&reopened, "warm").location, "/tmp/warm");
+    }
+
+    #[test]
+    fn create_user_rejects_every_existing_user() {
+        let section = format!("{HOT_SECTION}users:\n  reader:\n    auth:\n      method: trust\n");
+        let disk = "users:\n  writer:\n    auth:\n      method: trust\n";
+        let (store, _file) = open_with_file(&section, disk);
+
+        for existing in ["reader", "writer", DEFAULT_USER_NAME] {
+            let error = store.create_user(existing, None).unwrap_err();
+
+            assert!(matches!(error, Error::UserExists { .. }), "{error}");
+        }
+    }
+
+    #[test]
+    fn create_user_without_a_metastore_file_is_refused() {
+        let store = from_yaml_with("").unwrap();
+
+        let error = store.create_user("walt", None).unwrap_err();
+
+        assert!(matches!(error, Error::NoMetastoreFile), "{error}");
+    }
+
+    #[test]
     fn a_file_without_users_provides_the_builtin_pivot_user() {
         for users in ["", "users: {}\n"] {
             let store = from_yaml_with(users).unwrap();
@@ -1050,7 +1266,7 @@ users:
             store.user_auth(DEFAULT_USER_NAME),
             Some(UserAuth::Trust)
         ));
-        assert_eq!(store.user_auth[DEFAULT_USER_NAME].origin, Origin::BuiltIn);
+        assert_eq!(user_source(&store, DEFAULT_USER_NAME), "builtin");
         assert!(store.user_auth("reader").is_some());
         assert!(store.user_auth("writer").is_some());
     }
@@ -1069,10 +1285,7 @@ users:
             panic!("a configured `{DEFAULT_USER_NAME}` should keep its own method");
         };
         assert_eq!(verifier.salted_password, [b'a'; 32]);
-        assert_eq!(
-            store.user_auth[DEFAULT_USER_NAME].origin,
-            Origin::ConfigFile
-        );
+        assert_eq!(user_source(&store, DEFAULT_USER_NAME), "server config");
     }
 
     #[test]
@@ -1193,9 +1406,7 @@ users:
 
         let error = from_yaml_with(users).err().unwrap();
 
-        assert!(
-            matches!(&error, Error::User { name, .. } if name == "analytics"),
-            "{error}"
-        );
+        assert!(matches!(&error, Error::Parse { .. }), "{error}");
+        assert!(error.to_string().contains("verifier"), "{error}");
     }
 }

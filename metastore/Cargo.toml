@@ -7,7 +7,7 @@ description = "Provider-neutral metastore interface for resolving PivotDB datast
 [dependencies]
 # The cross-datastore layer owns the closed set of datastore kinds returned by
 # every metastore provider.
-catalog = { workspace = true }
+datastore = { workspace = true }
 # Opening a datastore reads its tables' footers over the worker pool.
 dispatch = { workspace = true }
 # A stored SCRAM verifier's salt and salted password are base64 in its text form.

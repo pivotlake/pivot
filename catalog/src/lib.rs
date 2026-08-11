@@ -18,11 +18,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use crossbeam_deque::{Injector, Steal};
 use datastore::DatastoreTransaction;
+use dispatch::{DataFlowDispatcher, OneShotNullaryFactory, RecordBatchOperatorSpec};
+use metastore::Metastore;
 use planner::TableFunction;
 use planner::catalog::{
-    BoundTable, CatalogTransaction, CreateSchemaRequest, CreateTableRequest, Error as CatalogError,
-    Result as CatalogResult, SchemaCreation, TableCreation, TableReference, TableRevision,
+    BoundTable, CatalogTransaction, CreateSchemaRequest, CreateTableRequest, CreateUserRequest,
+    Error as CatalogError, Result as CatalogResult, SchemaCreation, TableCreation, TableReference,
+    TableRevision, UserCreation,
 };
 
 /// One named data source served by pivotdb. Re-exported from `datastore`, where
@@ -53,6 +57,10 @@ pub struct PivotCatalog {
     /// datastore's sub-transaction lazily, the first time a query touches it.
     datastores: Arc<HashMap<String, Arc<dyn Datastore>>>,
     default_name: String,
+    /// Where metastore-changing statements route. The metastore's definitions
+    /// are server-wide, not a datastore's, so changing them doesn't ride a
+    /// sub-transaction.
+    metastore: Arc<dyn Metastore>,
 }
 
 impl PivotCatalog {
@@ -62,6 +70,7 @@ impl PivotCatalog {
     pub fn new(
         datastores: HashMap<String, Arc<dyn Datastore>>,
         default_name: String,
+        metastore: Arc<dyn Metastore>,
     ) -> Result<Self> {
         if !datastores.contains_key(&default_name) {
             return Err(Error::MissingDefaultDatastore(default_name));
@@ -69,6 +78,7 @@ impl PivotCatalog {
         Ok(Self {
             datastores: Arc::new(datastores),
             default_name,
+            metastore,
         })
     }
 
@@ -117,6 +127,8 @@ impl PivotCatalog {
             datastores: self.datastores.clone(),
             default_name: self.default_name.clone(),
             sub_transactions: Mutex::new(HashMap::new()),
+            metastore: self.metastore.clone(),
+            staged_users: Arc::new(Injector::new()),
         })
     }
 }
@@ -138,6 +150,12 @@ pub struct PivotTransaction {
     /// Populated on first touch during binding (`&self`, hence the lock) and read
     /// back at commit to publish only the datastores the query used.
     sub_transactions: Mutex<HashMap<String, Arc<dyn DatastoreTransaction>>>,
+    /// Where staged users land at commit.
+    metastore: Arc<dyn Metastore>,
+    /// The users this transaction's dataflows staged (see
+    /// [`PivotUserCreation`]), applied to the metastore at commit and dropped
+    /// on rollback. Shared (`Arc`) with the staging dataflow's workers.
+    staged_users: Arc<Injector<CreateUserRequest>>,
 }
 
 impl PivotTransaction {
@@ -237,12 +255,31 @@ impl CatalogTransaction for PivotTransaction {
         sub_transaction.bind_create_schema(request)
     }
 
+    fn bind_create_user(&self, request: CreateUserRequest) -> CatalogResult<Box<dyn UserCreation>> {
+        if self.metastore.user_auth(&request.name).is_some() {
+            return Err(CatalogError::Other(
+                format!("user `{}` already exists", request.name).into(),
+            ));
+        }
+        Ok(Box::new(PivotUserCreation {
+            staged_users: self.staged_users.clone(),
+            request,
+        }))
+    }
+
     /// Commit every sub-transaction the query opened, awaiting each datastore's own
     /// commit. Each datastore decides whether its commit does blocking store I/O
     /// (hopping to the blocking pool) or is an in-memory no-op it finishes inline.
+    /// Staged users land in the metastore last: its file write is a few
+    /// kilobytes, small enough to finish inline.
     async fn commit(&self) -> CatalogResult<()> {
         for (_name, sub_transaction) in self.opened_sub_transactions() {
             sub_transaction.commit().await?;
+        }
+        for request in drain_injector(&self.staged_users) {
+            self.metastore
+                .create_user(&request.name, request.password.as_deref())
+                .map_err(CatalogError::Other)?;
         }
         Ok(())
     }
@@ -251,6 +288,49 @@ impl CatalogTransaction for PivotTransaction {
         for (_name, sub_transaction) in self.opened_sub_transactions() {
             sub_transaction.rollback();
         }
+        drain_injector(&self.staged_users);
+    }
+}
+
+fn drain_injector<T>(injector: &Injector<T>) -> Vec<T> {
+    let mut items = Vec::new();
+    loop {
+        match injector.steal() {
+            Steal::Success(item) => items.push(item),
+            Steal::Retry => continue,
+            Steal::Empty => return items,
+        }
+    }
+}
+
+/// A resolved `CREATE USER`: the request plus the transaction-owned staging
+/// list it will land in. Compiling it builds a dataflow that stages the
+/// request and emits no rows, so the user is created only once the statement
+/// runs and its transaction commits — merely planning one (to report an
+/// error, to render `EXPLAIN`) creates nothing.
+struct PivotUserCreation {
+    staged_users: Arc<Injector<CreateUserRequest>>,
+    request: CreateUserRequest,
+}
+
+impl UserCreation for PivotUserCreation {
+    fn compile(&self, dispatcher: &DataFlowDispatcher) -> CatalogResult<RecordBatchOperatorSpec> {
+        // One nullary per worker, but only the first carries the request; the
+        // rest no-op.
+        let mut request = Some(self.request.clone());
+        let factories: Vec<_> = (0..dispatcher.worker_count())
+            .map(|_| {
+                let staged = request.take();
+                let staged_users = self.staged_users.clone();
+                OneShotNullaryFactory::new(move || {
+                    if let Some(request) = staged {
+                        staged_users.push(request);
+                    }
+                    None
+                })
+            })
+            .collect();
+        Ok(RecordBatchOperatorSpec::from_nullary(dispatcher, factories))
     }
 }
 
@@ -259,11 +339,38 @@ mod tests {
     use super::*;
     use datastore_delta::DeltaDatastore;
     use dispatch::Dispatch;
+    use metastore::{DEFAULT_USER_NAME, UserAuth};
+
+    /// A metastore serving no datastores and only the built-in trusted user:
+    /// the catalogs here get their datastores handed in directly.
+    #[derive(Debug)]
+    struct TrustMetastore;
+
+    impl Metastore for TrustMetastore {
+        fn open_datastores(
+            &self,
+            _dispatcher: &DataFlowDispatcher,
+        ) -> metastore::Result<HashMap<String, Arc<dyn Datastore>>> {
+            Ok(HashMap::new())
+        }
+
+        fn default_datastore_name(&self) -> &str {
+            DEFAULT_DATASTORE_NAME
+        }
+
+        fn user_auth(&self, username: &str) -> Option<UserAuth> {
+            (username == DEFAULT_USER_NAME).then_some(UserAuth::Trust)
+        }
+    }
 
     #[test]
     fn requires_the_default_datastore() {
-        let error =
-            PivotCatalog::new(HashMap::new(), DEFAULT_DATASTORE_NAME.to_string()).unwrap_err();
+        let error = PivotCatalog::new(
+            HashMap::new(),
+            DEFAULT_DATASTORE_NAME.to_string(),
+            Arc::new(TrustMetastore),
+        )
+        .unwrap_err();
 
         assert!(
             matches!(error, Error::MissingDefaultDatastore(name) if name == DEFAULT_DATASTORE_NAME)
@@ -281,6 +388,7 @@ mod tests {
         let catalog = PivotCatalog::new(
             HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),
             DEFAULT_DATASTORE_NAME.to_string(),
+            Arc::new(TrustMetastore),
         )
         .unwrap();
 

@@ -339,6 +339,13 @@ pub mod ffi {
         /// `COMPACT ... FINAL`: keep sweeping until a pass merges nothing.
         fn lo_compact_final(op: &LogicalOperator) -> Result<bool>;
 
+        // ---- CreateUser ----
+        fn lo_create_user_name(op: &LogicalOperator) -> Result<String>;
+        /// Whether a PASSWORD clause was given.
+        fn lo_create_user_has_password(op: &LogicalOperator) -> Result<bool>;
+        /// The password, meaningful only when a PASSWORD clause was given.
+        fn lo_create_user_password(op: &LogicalOperator) -> Result<String>;
+
         // ---- ComparisonJoin: general accessors ----
         /// DuckDB `JoinType` discriminant.
         /// The index a materialized CTE publishes its rows under.

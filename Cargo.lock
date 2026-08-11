@@ -973,9 +973,11 @@ name = "catalog"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "crossbeam-deque",
  "datastore",
  "datastore-delta",
  "dispatch",
+ "metastore",
  "planner",
  "tempfile",
  "thiserror 2.0.18",
@@ -1568,6 +1570,7 @@ dependencies = [
  "delta_kernel",
  "delta_kernel_default_engine",
  "dispatch",
+ "metastore",
  "parquet",
  "parquet-variant",
  "parquet-variant-compute",
@@ -2932,7 +2935,7 @@ name = "metastore"
 version = "0.1.0"
 dependencies = [
  "base64",
- "catalog",
+ "datastore",
  "dispatch",
 ]
 
@@ -2945,6 +2948,8 @@ dependencies = [
  "datastore-delta",
  "dispatch",
  "metastore",
+ "pgwire",
+ "rand 0.10.2",
  "serde",
  "serde_yaml_ng",
  "tempfile",

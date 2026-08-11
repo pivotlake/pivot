@@ -18,7 +18,7 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use futures::Sink;
-use metastore::{Metastore, SCRAM_ITERATIONS, ScramVerifier, UserAuth};
+use metastore::{Metastore, SCRAM_ITERATIONS, SCRAM_SALT_LEN, ScramVerifier, UserAuth};
 use pgwire::api::auth::sasl::SASLAuthStartupHandler;
 use pgwire::api::auth::sasl::scram::ScramAuth;
 use pgwire::api::auth::{AuthSource, DefaultServerParameterProvider, LoginInfo, Password};
@@ -28,11 +28,6 @@ use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use sha2::{Digest, Sha256};
 use tracing::info;
-
-/// The salt width PostgreSQL itself uses for a SCRAM verifier. The salt is
-/// public (it goes to the client in the server-first message); its job is to
-/// make one precomputed table useless against every other user's verifier.
-const SALT_LEN: usize = 16;
 
 /// Width of the per-process secret behind [`mock_verifier`], matching the
 /// SHA-256 block output it is hashed with.
@@ -49,7 +44,7 @@ const MOCK_SECRET_LEN: usize = 32;
 /// infeasible.
 ///
 /// For `H(x) = SHA256(secret || x || username)`, the public salt is the first
-/// [`SALT_LEN`] bytes of `H(0)` and the synthetic salted password is all of
+/// [`SCRAM_SALT_LEN`] bytes of `H(0)` and the synthetic salted password is all of
 /// `H(1)`. The distinct domain bytes keep those values independent. The secret
 /// is generated once per process, making the result unpredictable but stable
 /// for a username across repeated attempts, like a real stored verifier. It
@@ -63,7 +58,7 @@ fn mock_verifier(secret: &[u8; MOCK_SECRET_LEN], username: &str) -> ScramVerifie
         digest.finalize()
     };
     ScramVerifier {
-        salt: derive(0)[..SALT_LEN].to_vec(),
+        salt: derive(0)[..SCRAM_SALT_LEN].to_vec(),
         salted_password: derive(1).to_vec(),
     }
 }

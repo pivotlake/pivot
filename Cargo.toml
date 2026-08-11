@@ -62,6 +62,9 @@ crossbeam-deque = "0.8.6"
 insta = "1"
 libc = "0.2.184"
 lru = "0.18.1"
+# Declared once for the workspace: the SCRAM derivation `metastore-disk` stores
+# with must be the very pgwire the server verifies logins with.
+pgwire = "0.39"
 rand = "0.10.0"
 rstest = "0.26"
 serde = { version = "1", features = ["derive"] }

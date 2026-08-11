@@ -24,6 +24,7 @@
 #include "duckdb/planner/operator/logical_set.hpp"
 #include "duckdb/planner/operator/logical_reset.hpp"
 #include "duckdb/planner/operator/logical_compact.hpp"
+#include "duckdb/planner/operator/logical_create_user.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -808,6 +809,23 @@ rust::String lo_compact_table(const LogicalOperator &op) {
 
 bool lo_compact_final(const LogicalOperator &op) {
 	return as<duckdb::LogicalCompact>(op).final_sweep;
+}
+
+// ---- CreateUser ----
+
+rust::String lo_create_user_name(const LogicalOperator &op) {
+	return rust::String::lossy(as<duckdb::LogicalCreateUser>(op).user);
+}
+
+bool lo_create_user_has_password(const LogicalOperator &op) {
+	return as<duckdb::LogicalCreateUser>(op).has_password;
+}
+
+// Not lossy: replacing invalid bytes would store a different password than
+// the one the user typed. The strict conversion throws on invalid UTF-8,
+// which surfaces as an error on the Rust side.
+rust::String lo_create_user_password(const LogicalOperator &op) {
+	return rust::String(as<duckdb::LogicalCreateUser>(op).password);
 }
 
 // ---- ComparisonJoin: late materialization ----

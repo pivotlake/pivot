@@ -7,6 +7,12 @@ description = "The cross-datastore catalog: presents many named datastores to th
 [dependencies]
 planner = { workspace = true }
 datastore = { workspace = true }
+# `CREATE USER` routes to the metastore: the transaction stages requests and
+# its commit applies them through `Metastore::create_user`.
+metastore = { workspace = true }
+# The staging queue a CREATE USER's dataflow pushes into, the same shape the
+# delta datastore stages its creations with.
+crossbeam-deque = { workspace = true }
 dispatch = { workspace = true }
 datastore-delta = { workspace = true }
 thiserror = { workspace = true }

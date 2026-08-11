@@ -179,6 +179,11 @@ rust::String lo_compact_schema(const LogicalOperator &op);
 rust::String lo_compact_table(const LogicalOperator &op);
 bool lo_compact_final(const LogicalOperator &op);
 
+// ---- CreateUser ----
+rust::String lo_create_user_name(const LogicalOperator &op);
+bool lo_create_user_has_password(const LogicalOperator &op);
+rust::String lo_create_user_password(const LogicalOperator &op);
+
 // ---- ComparisonJoin: late materialization ----
 bool lo_is_late_materialization_join(const LogicalOperator &op);
 size_t lo_late_materialization_column_count(const LogicalOperator &op);

@@ -118,7 +118,7 @@ fn build_metastore(
 /// onto the ambient runtime, so this must run inside `rt.block_on`.
 fn build_catalog(
     path: &Path,
-    metastore: &dyn Metastore,
+    metastore: &Arc<dyn Metastore>,
     dispatcher: &DataFlowDispatcher,
 ) -> Result<Arc<PivotCatalog>, Error> {
     let default_name = metastore.default_datastore_name().to_string();
@@ -129,7 +129,8 @@ fn build_catalog(
                 path: path.to_path_buf(),
                 source,
             })?;
-    Ok(Arc::new(PivotCatalog::new(datastores, default_name)?))
+    let catalog = PivotCatalog::new(datastores, default_name, metastore.clone())?;
+    Ok(Arc::new(catalog))
 }
 
 fn run() -> Result<(), Error> {
@@ -171,7 +172,7 @@ fn run() -> Result<(), Error> {
             args.metastore_file.as_deref(),
             server_config.refresh_interval.as_duration(),
         )?;
-        let catalog = build_catalog(&args.config, metastore.as_ref(), dispatch.dispatcher())?;
+        let catalog = build_catalog(&args.config, &metastore, dispatch.dispatcher())?;
 
         let mut server = Server::new(server_config.bind, dispatch, catalog, metastore);
         if let Some(addr) = server_config.http_bind {

@@ -65,6 +65,7 @@ fn start_server_on(root: &str) -> u16 {
             PivotCatalog::new(
                 HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),
                 DEFAULT_DATASTORE_NAME.to_string(),
+                common::pivot_metastore(),
             )
             .unwrap(),
         );

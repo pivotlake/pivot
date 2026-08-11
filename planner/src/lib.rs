@@ -148,7 +148,9 @@ mod test_support;
 pub mod types;
 use std::sync::Arc;
 
-pub use operator::{Compact, Operator, SetVariable, TableFunction, TableFunctionSignature};
+pub use operator::{
+    Compact, CreateUser, Operator, SetVariable, TableFunction, TableFunctionSignature,
+};
 pub use plan::{Plan, PlanNode};
 use thiserror::Error;
 

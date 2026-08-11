@@ -44,6 +44,7 @@
 //! let catalog = Arc::new(PivotCatalog::new(
 //!     metastore.open_datastores(dispatch.dispatcher())?,
 //!     metastore.default_datastore_name().to_string(),
+//!     metastore.clone(),
 //! )?);
 //!
 //! let server = Server::new(config.server.bind, dispatch, catalog, metastore);
