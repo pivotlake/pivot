@@ -966,7 +966,6 @@ fn drain_injector<T>(injector: &Injector<T>) -> Vec<T> {
     }
 }
 
-#[async_trait]
 impl Datastore for DeltaDatastore {
     /// Open a transaction: freeze the table set as it stands right now. Every
     /// table the transaction binds resolves from that frozen
@@ -1039,27 +1038,31 @@ impl Datastore for DeltaDatastore {
         }
     }
 
-    /// One sweep with the default thresholds, or sweep-to-fixpoint under
-    /// `final_sweep`: a merge changes the file list, so a sweep can leave a
-    /// tail; progress is judged by the table's committed log version, and the
-    /// loop stops at the first sweep that advances nothing.
-    async fn compact(
+    fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+        self
+    }
+}
+
+impl DeltaDatastore {
+    /// One sweep of the table with identity `id` with the default thresholds,
+    /// or sweep-to-fixpoint under `final_sweep`: a merge changes the file
+    /// list, so a sweep can leave a tail; progress is judged by the table's
+    /// committed log version, and the loop stops at the first sweep that
+    /// advances nothing. Backs [`BoundTable::compact`] on [`TableBinding`];
+    /// keying by durable id rather than name keeps the sweeps on the table
+    /// the binding resolved. `None` if no live table carries `id` (it was
+    /// dropped since the caller bound it).
+    pub(crate) async fn compact_table_by_id(
         self: Arc<Self>,
-        table: &SchemaQualifiedTableName,
+        id: Uuid,
         final_sweep: bool,
-    ) -> CatalogResult<u64> {
+    ) -> Option<u64> {
         let version_of = |datastore: &DeltaDatastore| {
             datastore
-                .tables()
-                .into_iter()
-                .find(|(name, _)| name == table)
-                .map(|(_, found)| found.version())
+                .table_handle_by_id(&id)
+                .map(|table| table.version())
         };
-        if version_of(&self).is_none() {
-            return Err(CatalogError::Other(
-                format!("COMPACT: no table named `{table}`").into(),
-            ));
-        }
+        version_of(&self)?;
         let compacter = crate::compact::Compacter::new(
             crate::compact::DEFAULT_COMPACT_BYTES,
             crate::compact::DEFAULT_MIN_FILES_TO_MERGE,
@@ -1071,16 +1074,12 @@ impl Datastore for DeltaDatastore {
         let mut sweeps = 0;
         loop {
             let before = version_of(&self);
-            compacter.sweep_table(table).await;
+            compacter.sweep_table_by_id(&id).await;
             sweeps += 1;
             if !final_sweep || version_of(&self) == before {
-                return Ok(sweeps);
+                return Some(sweeps);
             }
         }
-    }
-
-    fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
-        self
     }
 }
 
@@ -1199,6 +1198,7 @@ impl DeltaTransaction {
             },
             self.snapshot.catalog_table_by_name(name)?,
             self.uploaded_files.clone(),
+            Arc::clone(&self.datastore),
         ))
     }
 }

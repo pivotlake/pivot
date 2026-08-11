@@ -12,6 +12,7 @@ use crate::parquet::{
     scan_order_from, table_input_with_filter_and_eq_predicates,
 };
 use arrow_array::{Array, ArrayRef, Scalar};
+use async_trait::async_trait;
 use crossbeam_deque::Injector;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use planner::catalog::{
@@ -20,8 +21,8 @@ use planner::catalog::{
 };
 use planner::expression::{CompareType, Expression, Function, JsonPath, TableFilter};
 
-use super::CatalogTable;
 use super::insert_sink::{UploadedFile, build_insert_spec};
+use super::{CatalogTable, DeltaDatastore};
 
 /// A single-column constant comparison (`col <cmp> const`) pushed down by
 /// DuckDB during binding. Recorded as-is; applied at [`compile_scan`](BoundTable::compile_scan)
@@ -112,6 +113,11 @@ pub struct TableBinding {
     /// binding, so a file this binding's [`compile_insert`](BoundTable::compile_insert)
     /// pushes is drained by that transaction's commit.
     uploaded_files: Arc<Injector<UploadedFile>>,
+    /// The live datastore this binding's table belongs to. A read never touches
+    /// it (the frozen snapshot copy is self-contained); it is what a `COMPACT`
+    /// sweeps, since compaction rewrites the live table rather than the
+    /// snapshot.
+    datastore: Arc<DeltaDatastore>,
 }
 
 impl std::fmt::Debug for TableBinding {
@@ -131,6 +137,7 @@ impl TableBinding {
         reference: TableReference,
         table: CatalogTable,
         uploaded_files: Arc<Injector<UploadedFile>>,
+        datastore: Arc<DeltaDatastore>,
     ) -> Self {
         let columns = table.columns();
         let nullability = table.nullability();
@@ -141,6 +148,7 @@ impl TableBinding {
             nullability,
             predicates: Vec::new(),
             uploaded_files,
+            datastore,
         }
     }
 
@@ -193,6 +201,7 @@ impl TableBinding {
     }
 }
 
+#[async_trait]
 impl BoundTable for TableBinding {
     fn table_reference(&self) -> TableReference {
         self.reference.clone()
@@ -267,6 +276,27 @@ impl BoundTable for TableBinding {
             input,
             dispatcher,
         )?)
+    }
+
+    /// Sweeps the *live* table carrying this binding's durable id
+    /// ([`CatalogTable::id`]), the same way an INSERT commits: the id survives
+    /// a concurrent rename, so the sweeps land on the exact table the
+    /// transaction resolved, never on a table that has since taken over the
+    /// name. The swaps commit through the table's own log, independent of the
+    /// binding's transaction.
+    async fn compact(&self, final_sweep: bool) -> CatalogResult<u64> {
+        Arc::clone(&self.datastore)
+            .compact_table_by_id(self.table.id(), final_sweep)
+            .await
+            .ok_or_else(|| {
+                CatalogError::Other(
+                    format!(
+                        "COMPACT: table `{}` no longer exists",
+                        self.reference.schema_qualified_name()
+                    )
+                    .into(),
+                )
+            })
     }
 
     fn columns(&self) -> Vec<Column> {

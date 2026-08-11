@@ -322,6 +322,7 @@ pub trait UserCreation: Send + Sync {
 /// Implementations expose their catalog identity and frozen revision, the
 /// column list used during planning, and a way to compile a scan into a
 /// dispatch [`RecordBatchOperatorSpec`].
+#[async_trait]
 pub trait BoundTable: Debug + Send + Sync {
     /// The qualified name the catalog resolved for this binding, as it was bound.
     fn table_reference(&self) -> TableReference;
@@ -378,6 +379,24 @@ pub trait BoundTable: Debug + Send + Sync {
     ) -> Result<RecordBatchOperatorSpec> {
         Err(
             Box::<dyn std::error::Error + Send + Sync>::from("this table does not support INSERT")
+                .into(),
+        )
+    }
+
+    /// Merge this table's small files into target-sized ones now,
+    /// synchronously, the way the backend's background compaction would over
+    /// time. Backs the `COMPACT` statement, so it runs on the coordinator's
+    /// async context, never on a dispatch worker (a sweep drives dataflows of
+    /// its own). The binding supplies the table's durable identity, so the
+    /// sweeps target the exact table the transaction resolved even across a
+    /// concurrent rename; they commit through the backend's own log,
+    /// independent of the binding's transaction. One call is one sweep;
+    /// `final_sweep` keeps sweeping until a sweep advances nothing. Returns
+    /// the number of sweeps performed. The default rejects COMPACT (a
+    /// read-only or virtual table).
+    async fn compact(&self, _final_sweep: bool) -> Result<u64> {
+        Err(
+            Box::<dyn std::error::Error + Send + Sync>::from("this table does not support COMPACT")
                 .into(),
         )
     }

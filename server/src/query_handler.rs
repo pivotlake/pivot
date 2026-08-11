@@ -174,7 +174,7 @@ pub(crate) async fn execute_sql(
         }
         // A COMPACT runs its sweeps here on the coordinator and returns no rows.
         if let Some(request) = plan.as_compact() {
-            execute_compact(&catalog, request)
+            execute_compact(&catalog, transaction.as_ref(), request)
                 .await
                 .map_err(|e| e.to_string())?;
             return Ok(Vec::new());
@@ -254,39 +254,44 @@ impl Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Reuse the exact SQL's plan when its complete table-revision map matches this
-/// transaction; otherwise plan inside the same transaction and cache the result
-/// only when the planner marked it safe.
-/// Run a `COMPACT` statement: resolve the datastore it names (default when
-/// unqualified) and sweep the table synchronously. The sweeps commit through
+/// Run a `COMPACT` statement: resolve the table through the statement's own
+/// transaction (filling in the default datastore and schema when the statement
+/// named none), the same binding path a query's scans take, and sweep it
+/// synchronously. The [`BoundTable`](planner::catalog::BoundTable) pins the
+/// table's durable identity, so the sweeps land on the exact table the
+/// transaction resolved even across a concurrent rename; they commit through
 /// the datastore's own log CAS, independent of the statement's transaction.
 async fn execute_compact(
     catalog: &Arc<catalog::PivotCatalog>,
+    transaction: &dyn planner::catalog::CatalogTransaction,
     request: &planner::Compact,
 ) -> Result<u64> {
-    let datastore_name = request
-        .datastore
-        .as_deref()
-        .unwrap_or_else(|| catalog.default_datastore_name());
-    let datastore = catalog
-        .iter_datastores()
-        .find(|(name, _)| name.as_str() == datastore_name)
-        .map(|(_, datastore)| Arc::clone(datastore))
-        .ok_or_else(|| {
-            planner::catalog::Error::Other(
-                format!("COMPACT: no datastore named `{datastore_name}`").into(),
-            )
-        })?;
-    let table = planner::catalog::SchemaQualifiedTableName::new(
-        request
+    let reference = planner::catalog::TableReference {
+        datastore: request
+            .datastore
+            .clone()
+            .unwrap_or_else(|| catalog.default_datastore_name().to_string()),
+        schema: request
             .schema
-            .as_deref()
-            .unwrap_or(planner::DEFAULT_SCHEMA_NAME),
-        request.table.as_str(),
-    );
-    Ok(datastore.compact(&table, request.final_sweep).await?)
+            .clone()
+            .unwrap_or_else(|| planner::DEFAULT_SCHEMA_NAME.to_string()),
+        table: request.table.clone(),
+    };
+    let table = transaction.bind_table(&reference).ok_or_else(|| {
+        planner::catalog::Error::Other(
+            format!(
+                "COMPACT: no table named `{}.{}` in datastore `{}`",
+                reference.schema, reference.table, reference.datastore
+            )
+            .into(),
+        )
+    })?;
+    Ok(table.compact(request.final_sweep).await?)
 }
 
+/// Reuse the exact SQL's plan when its complete table-revision map matches this
+/// transaction; otherwise plan inside the same transaction and cache the result
+/// only when the planner marked it safe.
 async fn plan_query(
     catalog: &Arc<catalog::PivotCatalog>,
     transaction: Arc<dyn planner::catalog::CatalogTransaction>,
@@ -476,7 +481,7 @@ impl PivotQueryHandler {
             // dataflows of its own, so it runs here on the coordinator, never
             // on a worker.
             if let Some(request) = plan.as_compact() {
-                execute_compact(&self.catalog, request).await?;
+                execute_compact(&self.catalog, transaction.as_ref(), request).await?;
                 return Ok(Outcome::Compact);
             }
             let is_insert = matches!(&plan.root.operator, planner::Operator::Insert(_));

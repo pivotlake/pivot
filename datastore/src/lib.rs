@@ -116,7 +116,6 @@ pub trait DatastoreTransaction: Debug + Send + Sync {
 }
 
 /// One data source the planner can resolve tables against.
-#[async_trait]
 pub trait Datastore: Debug + Send + Sync {
     /// Open a transaction: snapshot this datastore as it stands right now. All
     /// binding for one query resolves through the returned snapshot, so the
@@ -138,19 +137,6 @@ pub trait Datastore: Debug + Send + Sync {
     /// maintenance sweep cannot race the pool's teardown. Default: nothing to
     /// stop.
     fn abort(&self) {}
-
-    /// Merge `table`'s small files into target-sized ones now, synchronously,
-    /// the way this datastore's own background compaction would over time.
-    /// Backs the `COMPACT` statement, so it runs on the coordinator's async
-    /// context, never on a dispatch worker. One call is one sweep;
-    /// `final_sweep` keeps sweeping until a sweep advances no version (a merge
-    /// changes the file list, so one pass can leave a tail). Returns the
-    /// number of sweeps performed, or an error if `table` does not exist.
-    async fn compact(
-        self: Arc<Self>,
-        table: &SchemaQualifiedTableName,
-        final_sweep: bool,
-    ) -> Result<u64>;
 
     /// Downcast hook (owned): recover the concrete backend as an owned `Arc`, for
     /// a server feature specific to one datastore format (the web dashboard's

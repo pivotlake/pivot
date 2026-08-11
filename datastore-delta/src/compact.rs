@@ -165,15 +165,18 @@ impl Compacter {
         }
     }
 
-    /// One manual sweep of the single table `name`, for the `COMPACT`
-    /// statement. Returns whether the table exists; the sweep itself reports
-    /// nothing, so the caller judges progress by the table's log version.
-    pub async fn sweep_table(&self, name: &SchemaQualifiedTableName) -> bool {
+    /// One manual sweep of the single table with identity `id`, for the
+    /// `COMPACT` statement: keyed by durable id so the sweep lands on the
+    /// table the statement's transaction resolved, even if the table was
+    /// renamed since. Returns whether the table exists; the sweep itself
+    /// reports nothing, so the caller judges progress by the table's log
+    /// version.
+    pub async fn sweep_table_by_id(&self, id: &uuid::Uuid) -> bool {
         let Some((name, table)) = self
             .datastore
             .tables()
             .into_iter()
-            .find(|(candidate, _)| candidate == name)
+            .find(|(_, candidate)| candidate.id() == *id)
         else {
             return false;
         };
