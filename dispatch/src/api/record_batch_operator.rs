@@ -729,6 +729,10 @@ impl RecordBatchOperatorSpec {
             // without a residual: the settled flags already classify the rows
             // whose every pair a residual rejects.
             JoinKind::ProbeAnti => self.join_typed::<K, false, false, true, true>(build, spec),
+            // Likewise on the build side: the outer join's flag array and
+            // unmatched scan run unchanged, and only the unmatched build rows
+            // come out.
+            JoinKind::BuildAnti => self.join_typed::<K, true, false, false, true>(build, spec),
         }
     }
 
