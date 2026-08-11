@@ -263,7 +263,10 @@ impl AggregateFunc {
                 params,
                 return_type,
             })),
-            "sum" => Ok(AggregateFunc::Sum(numeric_aggregate(
+            // DuckDB plans SUM over integers and decimals as sum_no_overflow
+            // when column statistics prove the accumulation cannot overflow;
+            // the computation is plain SUM either way.
+            "sum" | "sum_no_overflow" => Ok(AggregateFunc::Sum(numeric_aggregate(
                 params,
                 return_type,
                 function,
