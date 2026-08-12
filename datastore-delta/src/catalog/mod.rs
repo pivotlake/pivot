@@ -937,7 +937,9 @@ fn commit_uploaded_files(
             partition,
             row_groups,
         } = uploaded;
-        let stats = Some(crate::parquet::aggregate_file_stats(&row_groups));
+        let stats = Some(std::sync::Arc::new(crate::parquet::aggregate_file_stats(
+            &row_groups,
+        )));
         let entry = DeltaFileEntry {
             file,
             partition,

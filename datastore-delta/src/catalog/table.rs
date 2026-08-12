@@ -37,7 +37,7 @@ impl TableFile {
     /// adopted at CREATE, or whose log entry recorded no stats.
     pub(crate) fn new(mut entry: DeltaFileEntry, row_groups: Vec<Arc<RowGroupMetadata>>) -> Self {
         if entry.stats.is_none() && !row_groups.is_empty() {
-            entry.stats = Some(crate::parquet::aggregate_file_stats(&row_groups));
+            entry.stats = Some(Arc::new(crate::parquet::aggregate_file_stats(&row_groups)));
         }
         Self { entry, row_groups }
     }
@@ -699,7 +699,9 @@ impl CatalogTable {
                         row_groups,
                         ..
                     } = uploaded;
-                    let stats = Some(crate::parquet::aggregate_file_stats(&row_groups));
+                    let stats = Some(std::sync::Arc::new(crate::parquet::aggregate_file_stats(
+                        &row_groups,
+                    )));
                     let entry = DeltaFileEntry {
                         file,
                         partition,

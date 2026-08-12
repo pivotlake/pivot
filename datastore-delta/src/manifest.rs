@@ -145,7 +145,7 @@ pub struct DeltaFileEntry {
     /// The file's Parquet statistics, persisted into the Delta `Add` action's
     /// `stats`. `None` for a file we did not write (adopted at CREATE) or reloaded
     /// from the log, where the stats are not re-committed.
-    pub stats: Option<FileStats>,
+    pub stats: Option<Arc<FileStats>>,
 }
 
 /// A file's Parquet statistics, aggregated over its row groups, as they are
