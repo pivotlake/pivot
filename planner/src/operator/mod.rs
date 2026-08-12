@@ -178,13 +178,19 @@ impl Operator {
             // An INSERT emits one row: the inserted-row count.
             Operator::Insert(_) => Ok(vec![Type::Int64]),
             // A join emits its listed probe columns followed by its listed
-            // build columns.
-            Operator::Join(join) => Ok(join
-                .probe_output
-                .iter()
-                .map(|&i| inputs[0][i].clone())
-                .chain(join.build_output.iter().map(|&i| inputs[1][i].clone()))
-                .collect()),
+            // build columns; a mark join appends its boolean marker column.
+            Operator::Join(join) => {
+                let mut types: Vec<Type> = join
+                    .probe_output
+                    .iter()
+                    .map(|&i| inputs[0][i].clone())
+                    .chain(join.build_output.iter().map(|&i| inputs[1][i].clone()))
+                    .collect();
+                if matches!(join.kind, JoinKind::ProbeMark) {
+                    types.push(Type::Boolean);
+                }
+                Ok(types)
+            }
             // A FROM-less SELECT's one-row source has no columns of its own.
             Operator::DummyScan(_) => Ok(Vec::new()),
             // EXPLAIN renders its child plan as text, one line per row.
@@ -268,7 +274,8 @@ impl Operator {
             Operator::Join(join) => {
                 let probe_nullable = matches!(join.kind, JoinKind::BuildOuter);
                 let build_nullable = matches!(join.kind, JoinKind::ProbeOuter);
-                join.probe_output
+                let mut nullable: Vec<bool> = join
+                    .probe_output
                     .iter()
                     .map(|&i| probe_nullable || inputs[0][i])
                     .chain(
@@ -276,7 +283,13 @@ impl Operator {
                             .iter()
                             .map(|&i| build_nullable || inputs[1][i]),
                     )
-                    .collect()
+                    .collect();
+                // A mark join's marker column is NULL where three-valued `IN`
+                // leaves a miss unknown.
+                if matches!(join.kind, JoinKind::ProbeMark) {
+                    nullable.push(true);
+                }
+                nullable
             }
             Operator::Cte(_) => inputs[1].clone(),
             Operator::CteScan(scan) => scan.nullable.clone(),

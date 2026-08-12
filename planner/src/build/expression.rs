@@ -44,6 +44,11 @@ impl Expression {
                 Expression::AggregateFunc(AggregateFunc::from_handle(a)?)
             }
             DuckExpression::Function(f) => Expression::Function(Function::from_handle(f)?),
+            // `NOT IN` is the same operator negated; SQL's three-valued NOT
+            // rides the [`Not`] wrapper.
+            DuckExpression::InList(i) if i.negated()? => Expression::Not(Not {
+                input: Box::new(Expression::InList(InList::from_handle(i)?)),
+            }),
             DuckExpression::InList(i) => Expression::InList(InList::from_handle(i)?),
             DuckExpression::Conjunction(c) => Expression::Conjunction(Conjunction::from_handle(c)?),
             DuckExpression::Case(c) => Case::from_handle(c)?,

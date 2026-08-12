@@ -47,6 +47,11 @@ pub enum JoinKind {
     /// One output row per build row no probe row matched, and no probe
     /// columns (see [`Join::probe_output`]).
     BuildAnti,
+    /// One output row per probe row, the listed probe columns plus a nullable
+    /// boolean marker column after them: TRUE on a match, FALSE on a miss,
+    /// NULL where SQL's three-valued `IN` cannot call the miss FALSE. No
+    /// build columns (see [`Join::build_output`]).
+    ProbeMark,
     /// Inner join on one `<`/`<=`/`>`/`>=` comparison (`probe key OP build
     /// key`) instead of equalities: the build side is sorted by key and each
     /// probe row matches a contiguous run of it. Always a single condition,
@@ -105,6 +110,7 @@ impl fmt::Display for Join {
             JoinKind::ProbeSemi => "Join[probe semi]",
             JoinKind::ProbeAnti => "Join[probe anti]",
             JoinKind::BuildAnti => "Join[build anti]",
+            JoinKind::ProbeMark => "Join[probe mark]",
             JoinKind::Range(RangeCompare::Less) => "Join[range <]",
             JoinKind::Range(RangeCompare::LessEq) => "Join[range <=]",
             JoinKind::Range(RangeCompare::Greater) => "Join[range >]",
@@ -183,6 +189,7 @@ impl Join {
             JoinKind::ProbeSemi => DispatchJoinKind::ProbeSemi,
             JoinKind::ProbeAnti => DispatchJoinKind::ProbeAnti,
             JoinKind::BuildAnti => DispatchJoinKind::BuildAnti,
+            JoinKind::ProbeMark => DispatchJoinKind::ProbeMark,
             JoinKind::Range(_) => unreachable!("compiled above"),
         };
         let spec = JoinSpec {

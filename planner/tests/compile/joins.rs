@@ -568,6 +568,87 @@ fn anti_join_keeps_the_probe_rows_nothing_matched(mut testing_planner: TestingPl
     );
 }
 
+// DuckDB rewrites an IN list of five or more constants into a mark join
+// against an in-memory chunk of them, scanned as an inline VALUES source;
+// the filter above reads the marker column.
+#[rstest]
+fn a_long_in_list_runs_as_a_mark_join_against_its_constants(mut testing_planner: TestingPlanner) {
+    add_wide_orders_and_repeated_keys(&testing_planner);
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT w_key FROM wide_orders WHERE w_key IN (5, 6, 7, 8, 2000, 3000)",
+    );
+    rows.sort_by_key(|r| r["w_key"].as_i64().unwrap());
+
+    // 2000 and 3000 name no order; the other four each match exactly one.
+    assert_eq!(
+        rows,
+        serde_json::json!([{"w_key": 5}, {"w_key": 6}, {"w_key": 7}, {"w_key": 8}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
+#[rstest]
+fn a_long_not_in_list_keeps_the_rows_marked_false(mut testing_planner: TestingPlanner) {
+    add_wide_orders_and_repeated_keys(&testing_planner);
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT COUNT(*) AS n FROM wide_orders WHERE w_key NOT IN (5, 6, 7, 8, 2000, 3000)",
+    );
+
+    // Four of the six constants name an order; NOT IN keeps the other 996.
+    assert_eq!(rows, vec![serde_json::json!({"n": 996})]);
+}
+
+// A NULL in the list makes every miss three-valued: NOT TRUE drops the
+// matches and NOT NULL drops the misses, so nothing survives.
+#[rstest]
+fn a_not_in_list_containing_null_keeps_nothing(mut testing_planner: TestingPlanner) {
+    add_wide_orders_and_repeated_keys(&testing_planner);
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT COUNT(*) AS n FROM wide_orders WHERE w_key NOT IN (5, 6, NULL, 7, 8)",
+    );
+
+    assert_eq!(rows, vec![serde_json::json!({"n": 0})]);
+}
+
+// The same NULL leaves IN's matches TRUE: the marker only turns NULL on the
+// misses, which the filter drops either way.
+#[rstest]
+fn an_in_list_containing_null_still_keeps_its_matches(mut testing_planner: TestingPlanner) {
+    add_wide_orders_and_repeated_keys(&testing_planner);
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT COUNT(*) AS n FROM wide_orders WHERE w_key IN (5, 6, NULL, 7, 8)",
+    );
+
+    assert_eq!(rows, vec![serde_json::json!({"n": 4})]);
+}
+
+// An uncorrelated NOT IN subquery stays a mark join (unlike EXISTS shapes it
+// never relaxes: a null in the subquery would make misses unknown).
+#[rstest]
+fn a_not_in_subquery_runs_as_a_mark_join(mut testing_planner: TestingPlanner) {
+    add_wide_orders_and_repeated_keys(&testing_planner);
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT COUNT(*) AS n FROM wide_orders \
+         WHERE w_key NOT IN (SELECT g_order FROM big_items)",
+    );
+
+    // The subquery names orders 5 and 6 (5 three times over) and holds no
+    // NULL, so the other 998 keep a definitive FALSE marker.
+    assert_eq!(rows, vec![serde_json::json!({"n": 998})]);
+}
+
 #[rstest]
 fn aggregating_over_an_anti_join_counts_each_unmatched_probe_row(
     mut testing_planner: TestingPlanner,
