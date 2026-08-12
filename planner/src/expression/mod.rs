@@ -33,6 +33,7 @@ mod prefix;
 mod reference;
 mod regexp;
 mod regexp_jit;
+mod substring;
 mod suffix;
 mod variant_get;
 
@@ -61,6 +62,7 @@ pub use prefix::Prefix;
 pub use reference::Ref;
 pub use regexp::{RegexpFullMatch, RegexpReplace};
 pub use regexp_jit::RegexpJitReplace;
+pub use substring::Substring;
 pub use suffix::Suffix;
 pub use variant_get::{JsonPath, VariantGet};
 
