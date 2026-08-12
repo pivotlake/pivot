@@ -622,6 +622,249 @@ fn every_unmatched_build_row_reaches_a_build_anti_join_output() {
     assert_eq!(ids, expected);
 }
 
+/// A mark join keyed on column 0 of both sides, emitting the listed probe
+/// columns plus the nullable boolean marker column after them.
+fn probe_mark_join(probe_columns: Vec<usize>) -> JoinSpec {
+    let probe_fields = int64_fields(probe_columns.len());
+    JoinSpec {
+        probe_key_indices: vec![0],
+        build_key_indices: vec![0],
+        probe_output_indices: probe_columns,
+        build_output_indices: Vec::new(),
+        probe_fields,
+        build_fields: Vec::new(),
+        kind: JoinKind::ProbeMark,
+        residual_filters: None,
+    }
+}
+
+/// Every output row's first column and marker, sorted.
+fn collect_marked_keys(results: &[RecordBatch]) -> Vec<(Option<i64>, Option<bool>)> {
+    let mut rows: Vec<(Option<i64>, Option<bool>)> = results
+        .iter()
+        .flat_map(|batch| {
+            let keys = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            let marks = batch
+                .column(batch.num_columns() - 1)
+                .as_any()
+                .downcast_ref::<arrow_array::BooleanArray>()
+                .unwrap();
+            (0..batch.num_rows())
+                .map(|i| {
+                    (
+                        keys.is_valid(i).then(|| keys.value(i)),
+                        marks.is_valid(i).then(|| marks.value(i)),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+#[test]
+fn mark_join_flags_each_probe_row_with_its_match() {
+    let d = dispatch(1);
+    let build = values_input(&d, vec![int64_batch("id", &[10, 20])]).record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &[10, 30])]).record_batches();
+
+    let results = probe
+        .join(build, &[DataType::Int64], probe_mark_join(vec![0]))
+        .collect()
+        .unwrap();
+
+    assert_eq!(
+        collect_marked_keys(&results),
+        vec![(Some(10), Some(true)), (Some(30), Some(false)),]
+    );
+}
+
+#[test]
+fn a_probe_row_matching_several_build_rows_is_marked_once() {
+    let d = dispatch(1);
+    let build = values_input(&d, vec![int64_batch("id", &[10, 10, 10])]).record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &[10])]).record_batches();
+
+    let results = probe
+        .join(build, &[DataType::Int64], probe_mark_join(vec![0]))
+        .collect()
+        .unwrap();
+
+    assert_eq!(collect_marked_keys(&results), vec![(Some(10), Some(true))]);
+}
+
+#[test]
+fn a_null_keyed_probe_row_marks_null() {
+    let d = dispatch(1);
+    let nullable = |values: Vec<Option<i64>>| {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(values))],
+        )
+        .unwrap()
+    };
+    let build = values_input(&d, vec![int64_batch("id", &[10])]).record_batches();
+    let probe = values_input(&d, vec![nullable(vec![None, Some(10), Some(30)])]).record_batches();
+
+    let mut spec = probe_mark_join(vec![0]);
+    spec.probe_fields = vec![Field::new("f0", DataType::Int64, true)];
+    let results = probe
+        .join(build, &[DataType::Int64], spec)
+        .collect()
+        .unwrap();
+
+    // The null key compares as unknown against a non-empty build side; the
+    // plain miss stays a definitive FALSE because no build key is null.
+    assert_eq!(
+        collect_marked_keys(&results),
+        vec![
+            (None, None),
+            (Some(10), Some(true)),
+            (Some(30), Some(false)),
+        ]
+    );
+}
+
+#[test]
+fn a_null_keyed_build_row_turns_misses_into_null_marks() {
+    let d = dispatch(1);
+    let nullable = |values: Vec<Option<i64>>| {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(values))],
+        )
+        .unwrap()
+    };
+    let build = values_input(&d, vec![nullable(vec![None, Some(10)])]).record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &[10, 30])]).record_batches();
+
+    let results = probe
+        .join(build, &[DataType::Int64], probe_mark_join(vec![0]))
+        .collect()
+        .unwrap();
+
+    // 30 matches nothing, but the null build key could have been anything,
+    // so its miss is unknown rather than FALSE.
+    assert_eq!(
+        collect_marked_keys(&results),
+        vec![(Some(10), Some(true)), (Some(30), None),]
+    );
+}
+
+#[test]
+fn a_null_key_seen_by_any_build_worker_turns_misses_into_null_marks() {
+    let d = dispatch(4);
+    let nullable = |values: Vec<Option<i64>>| {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(values))],
+        )
+        .unwrap()
+    };
+    let build = values_input(
+        &d,
+        vec![
+            nullable(vec![Some(10)]),
+            nullable(vec![Some(20)]),
+            nullable(vec![None]),
+            nullable(vec![Some(40)]),
+        ],
+    )
+    .record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &[30])]).record_batches();
+
+    let results = probe
+        .join(build, &[DataType::Int64], probe_mark_join(vec![0]))
+        .collect()
+        .unwrap();
+
+    assert_eq!(collect_marked_keys(&results), vec![(Some(30), None)]);
+}
+
+#[test]
+fn an_empty_build_side_marks_every_probe_row_false() {
+    let d = dispatch(1);
+    let nullable = |values: Vec<Option<i64>>| {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)])),
+            vec![Arc::new(Int64Array::from(values))],
+        )
+        .unwrap()
+    };
+    let build = values_input(&d, vec![int64_batch("id", &[])]).record_batches();
+    let probe = values_input(&d, vec![nullable(vec![None, Some(10)])]).record_batches();
+
+    let mut spec = probe_mark_join(vec![0]);
+    spec.probe_fields = vec![Field::new("f0", DataType::Int64, true)];
+    let results = probe
+        .join(build, &[DataType::Int64], spec)
+        .collect()
+        .unwrap();
+
+    // IN over an empty set is FALSE for every row, the null key included.
+    assert_eq!(
+        collect_marked_keys(&results),
+        vec![(None, Some(false)), (Some(10), Some(false)),]
+    );
+}
+
+#[test]
+fn marked_batches_stay_within_the_output_batch_size() {
+    let d = dispatch(1);
+    // One oversized probe batch: the join must re-chunk its marked output,
+    // since downstream accumulators size to RECORD_BATCH_SIZE.
+    let probe_ids: Vec<i64> = (0..dispatch::RECORD_BATCH_SIZE as i64 * 3 + 7).collect();
+    let build = values_input(&d, vec![int64_batch("id", &[5])]).record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &probe_ids)]).record_batches();
+
+    let results = probe
+        .join(build, &[DataType::Int64], probe_mark_join(vec![0]))
+        .collect()
+        .unwrap();
+
+    assert!(
+        results
+            .iter()
+            .all(|batch| batch.num_rows() <= dispatch::RECORD_BATCH_SIZE)
+    );
+    assert_eq!(
+        results.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        probe_ids.len()
+    );
+}
+
+#[test]
+fn a_mark_join_spanning_batches_marks_every_probe_row() {
+    let d = dispatch(4);
+    let build_ids: Vec<i64> = (0..30_000).step_by(3).collect();
+    let probe_ids: Vec<i64> = (0..30_000).collect();
+    let build = values_input(&d, vec![int64_batch("id", &build_ids)]).record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &probe_ids)]).record_batches();
+
+    let results = probe
+        .join(build, &[DataType::Int64], probe_mark_join(vec![0]))
+        .collect()
+        .unwrap();
+
+    let marked = collect_marked_keys(&results);
+    assert_eq!(marked.len(), 30_000);
+    let trues = marked
+        .iter()
+        .filter(|(_, mark)| *mark == Some(true))
+        .count();
+    let falses = marked
+        .iter()
+        .filter(|(_, mark)| *mark == Some(false))
+        .count();
+    assert_eq!(trues, 10_000);
+    assert_eq!(falses, 20_000);
+}
+
 #[test]
 fn an_anti_join_spanning_batches_emits_each_unmatched_probe_row_once() {
     let d = dispatch(4);

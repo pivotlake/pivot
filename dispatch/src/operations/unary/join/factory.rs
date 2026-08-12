@@ -1,10 +1,11 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::sync::{Arc, mpsc};
 
 use ahash::RandomState;
 use arrow_array::RecordBatch;
 use crossbeam_deque::Injector;
 
+use crate::GatherBarrier;
 use crate::api::OperatorGraphBuilder;
 use crate::api::{BuildContext, OperatorFactory};
 use crate::memory::MultiSlabBuffer;
@@ -24,15 +25,12 @@ use crate::operations::unary::pipeline_breaker::PipelineBreaker;
 /// Creates one [`JoinBuildConsumer`] per worker, with shared state wired up.
 pub struct JoinBuildFactory<K: JoinKey, const BUILD_OUTER: bool> {
     spec: Arc<JoinSpec>,
-    worker_id: usize,
     hash_state: RandomState,
-    partition_sizes: Arc<Vec<AtomicUsize>>,
     table: JoinTable<K::Stored>,
     injector: Arc<Injector<JoinPartitionJob<K::Stored>>>,
     jobs_injected: Arc<AtomicBool>,
     build_ready: Arc<AtomicBool>,
-    sender: mpsc::Sender<BuildWorkerOutput<K::Stored>>,
-    receiver: Option<mpsc::Receiver<BuildWorkerOutput<K::Stored>>>,
+    gather: Arc<GatherBarrier<BuildWorkerOutput<K::Stored>>>,
     remaining_jobs: Arc<AtomicUsize>,
 }
 
@@ -40,9 +38,10 @@ pub struct JoinBuildFactory<K: JoinKey, const BUILD_OUTER: bool> {
 pub struct JoinProbeFactory<
     K: JoinKey,
     const BUILD_OUTER: bool,
-    const SEMI: bool,
-    const OUTER_JOIN_PROBE_SIDE: bool,
-    const ANTI: bool,
+    const STOP_AFTER_FIRST_MATCH: bool,
+    const TRACK_UNMATCHED_PROBE_ROWS: bool,
+    const DISCARD_MATCHED_PAIRS: bool,
+    const MARK: bool,
 > {
     pub(crate) table: JoinTable<K::Stored>,
     hash_state: RandomState,
@@ -59,19 +58,30 @@ pub struct JoinProbeFactory<
 /// graph builder uses that flag to gate every root of the probe input.
 ///
 /// The build phase is the same for every kind, so only the probe factories
-/// carry `SEMI`, `OUTER_JOIN_PROBE_SIDE`, and `ANTI`.
+/// carry `STOP_AFTER_FIRST_MATCH`, `TRACK_UNMATCHED_PROBE_ROWS`,
+/// `DISCARD_MATCHED_PAIRS`, and `MARK`.
 pub fn create_for_workers<
     K: JoinKey,
     const BUILD_OUTER: bool,
-    const SEMI: bool,
-    const OUTER_JOIN_PROBE_SIDE: bool,
-    const ANTI: bool,
+    const STOP_AFTER_FIRST_MATCH: bool,
+    const TRACK_UNMATCHED_PROBE_ROWS: bool,
+    const DISCARD_MATCHED_PAIRS: bool,
+    const MARK: bool,
 >(
     spec: JoinSpec,
     worker_count: usize,
 ) -> (
     impl IntoIterator<Item = JoinBuildFactory<K, BUILD_OUTER>>,
-    impl IntoIterator<Item = JoinProbeFactory<K, BUILD_OUTER, SEMI, OUTER_JOIN_PROBE_SIDE, ANTI>>,
+    impl IntoIterator<
+        Item = JoinProbeFactory<
+            K,
+            BUILD_OUTER,
+            STOP_AFTER_FIRST_MATCH,
+            TRACK_UNMATCHED_PROBE_ROWS,
+            DISCARD_MATCHED_PAIRS,
+            MARK,
+        >,
+    >,
     Arc<AtomicBool>,
 ) {
     debug_assert_eq!(
@@ -79,58 +89,65 @@ pub fn create_for_workers<
         matches!(spec.kind, JoinKind::BuildOuter | JoinKind::BuildAnti)
     );
     debug_assert_eq!(
-        OUTER_JOIN_PROBE_SIDE,
-        matches!(spec.kind, JoinKind::ProbeOuter | JoinKind::ProbeAnti)
+        TRACK_UNMATCHED_PROBE_ROWS,
+        matches!(
+            spec.kind,
+            JoinKind::ProbeOuter | JoinKind::ProbeAnti | JoinKind::ProbeMark
+        )
     );
     debug_assert_eq!(
-        ANTI,
+        DISCARD_MATCHED_PAIRS,
         matches!(spec.kind, JoinKind::ProbeAnti | JoinKind::BuildAnti)
     );
+    debug_assert_eq!(MARK, matches!(spec.kind, JoinKind::ProbeMark));
     debug_assert!(
-        !SEMI || spec.build_output_indices.is_empty(),
-        "a semi join emits no build columns"
+        !STOP_AFTER_FIRST_MATCH || spec.build_output_indices.is_empty(),
+        "the first-match path does not record build rows"
     );
     debug_assert!(
-        !(ANTI && OUTER_JOIN_PROBE_SIDE) || spec.build_output_indices.is_empty(),
+        !(DISCARD_MATCHED_PAIRS && TRACK_UNMATCHED_PROBE_ROWS)
+            || spec.build_output_indices.is_empty(),
         "a probe-side anti join emits no build columns"
     );
     debug_assert!(
-        !(ANTI && BUILD_OUTER) || spec.probe_output_indices.is_empty(),
+        !(DISCARD_MATCHED_PAIRS && BUILD_OUTER) || spec.probe_output_indices.is_empty(),
         "a build-side anti join emits no probe columns"
+    );
+    debug_assert!(
+        !MARK
+            || (spec.build_output_indices.is_empty()
+                && spec.residual_filters.is_none()
+                && spec.probe_key_indices.len() == 1),
+        "a mark join emits no build columns and marks on exactly one key, with no residual"
     );
     let spec = Arc::new(spec);
     let hash_state = RandomState::with_seeds(0, 0, 0, 0);
-    let partition_sizes: Arc<Vec<AtomicUsize>> =
-        Arc::new((0..NUM_PARTITIONS).map(|_| AtomicUsize::new(0)).collect());
     let table = JoinTable {
         directory: Arc::new(JoinCell::new(JoinDirectory::initial())),
         keys: Arc::new(JoinCell::new(MultiSlabBuffer::<K::Stored>::new(vec![]))),
         rows: Arc::new(JoinCell::new(MultiSlabBuffer::<u32>::new(vec![]))),
         build_rows: Arc::new(JoinCell::new(BuildRows::empty())),
+        build_saw_null_key: Arc::new(JoinCell::new(false)),
     };
     let injector = Arc::new(Injector::new());
     let jobs_injected = Arc::new(AtomicBool::new(false));
     let build_ready = Arc::new(AtomicBool::new(false));
     let remaining_jobs = Arc::new(AtomicUsize::new(NUM_PARTITIONS));
-    let (tx, rx) = mpsc::channel();
-    let mut rx_opt = Some(rx);
+    let gather = Arc::new(GatherBarrier::new(worker_count));
 
     let table_clone = table.clone();
     let hs_clone = hash_state.clone();
     let probe_gate = build_ready.clone();
     let build_spec = spec.clone();
 
-    let build_factories = (0..worker_count).map(move |worker_id| JoinBuildFactory {
+    let build_factories = (0..worker_count).map(move |_| JoinBuildFactory {
         spec: build_spec.clone(),
-        worker_id,
         hash_state: hash_state.clone(),
-        partition_sizes: partition_sizes.clone(),
         table: table.clone(),
         injector: injector.clone(),
         jobs_injected: jobs_injected.clone(),
         build_ready: build_ready.clone(),
-        sender: tx.clone(),
-        receiver: rx_opt.take(),
+        gather: gather.clone(),
         remaining_jobs: remaining_jobs.clone(),
     });
 
@@ -153,11 +170,8 @@ impl<K: JoinKey, const BUILD_OUTER: bool> UnaryFactory<RecordBatch, ()>
     fn build_unary(self) -> Self::Unary {
         PipelineBreaker::Consuming(JoinBuildConsumer::new(
             self.spec.build_key_indices.clone(),
-            self.worker_id,
             self.hash_state,
-            self.sender,
-            self.receiver,
-            self.partition_sizes,
+            self.gather,
             self.table,
             self.injector,
             self.jobs_injected,
@@ -171,15 +185,39 @@ impl<K: JoinKey, const BUILD_OUTER: bool> UnaryFactory<RecordBatch, ()>
 impl<
     K: JoinKey,
     const BUILD_OUTER: bool,
-    const SEMI: bool,
-    const OUTER_JOIN_PROBE_SIDE: bool,
-    const ANTI: bool,
+    const STOP_AFTER_FIRST_MATCH: bool,
+    const TRACK_UNMATCHED_PROBE_ROWS: bool,
+    const DISCARD_MATCHED_PAIRS: bool,
+    const MARK: bool,
 > UnaryFactory<RecordBatch, RecordBatch>
-    for JoinProbeFactory<K, BUILD_OUTER, SEMI, OUTER_JOIN_PROBE_SIDE, ANTI>
+    for JoinProbeFactory<
+        K,
+        BUILD_OUTER,
+        STOP_AFTER_FIRST_MATCH,
+        TRACK_UNMATCHED_PROBE_ROWS,
+        DISCARD_MATCHED_PAIRS,
+        MARK,
+    >
 {
-    type Unary = Probe<K, BUILD_OUTER, SEMI, OUTER_JOIN_PROBE_SIDE, ANTI>;
+    type Unary = Probe<
+        K,
+        BUILD_OUTER,
+        STOP_AFTER_FIRST_MATCH,
+        TRACK_UNMATCHED_PROBE_ROWS,
+        DISCARD_MATCHED_PAIRS,
+        MARK,
+    >;
 
-    fn build_unary(self) -> Probe<K, BUILD_OUTER, SEMI, OUTER_JOIN_PROBE_SIDE, ANTI> {
+    fn build_unary(
+        self,
+    ) -> Probe<
+        K,
+        BUILD_OUTER,
+        STOP_AFTER_FIRST_MATCH,
+        TRACK_UNMATCHED_PROBE_ROWS,
+        DISCARD_MATCHED_PAIRS,
+        MARK,
+    > {
         Probe::new(self.table, self.hash_state, self.spec, self.unmatched)
     }
 }
