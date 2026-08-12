@@ -383,6 +383,36 @@ fn correlated_scalar_subquery_becomes_a_delim_join(mut testing_planner: TestingP
     ");
 }
 
+/// An IN list of five or more constants is rewritten by DuckDB into a mark
+/// join against an in-memory chunk of them (the rewrite runs after the pass
+/// that would have relaxed the marker into a semi join, so MARK is what
+/// arrives). The chunk scans as an inline VALUES source on the build side
+/// and the filter above reads the marker column.
+#[rstest]
+fn a_long_in_list_becomes_a_mark_join_against_inline_values(mut testing_planner: TestingPlanner) {
+    use arrow_array::{ArrayRef, Int64Array};
+    use planner::types::Type;
+    use std::sync::Arc;
+    let int64_col = |values: Vec<i64>| -> ArrayRef { Arc::new(Int64Array::from(values)) };
+    testing_planner.add_table(
+        "wide_items",
+        &[("i_order", Type::Int64, int64_col(vec![7; 20]))],
+    );
+
+    let plan = testing_planner
+        .plan("SELECT i_order FROM wide_items WHERE i_order IN (1, 2, 3, 4, 5, 7)")
+        .unwrap();
+
+    assert_snapshot!(plan.to_string(), @"
+    Projection(i_order:Int64)
+      Projection(#0:Int64)
+        Filter(IN (...):Boolean)
+          Join[probe mark](probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [])
+            Input([i_order:Int64])
+            Values(rows: 6)
+    ");
+}
+
 /// NOT EXISTS decorrelates into an ANTI delim join: the same synthetic-CTE
 /// tee and Distinct as the other delim kinds, with the final join anti on the
 /// probe (outer) side and no build columns.

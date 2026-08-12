@@ -147,6 +147,7 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
     let operator = match kind {
         DuckOperator::Projection(p) => Operator::Projection(Projection::from_handle(p)?),
         DuckOperator::Values(v) => Operator::Values(Values::from_handle(v)?),
+        DuckOperator::ChunkGet(c) => Operator::Values(Values::from_chunk_get(c)?),
         DuckOperator::Insert(i) => Operator::Insert(Insert::from_handle(i)?),
         DuckOperator::Filter(f) => Operator::Filter(Filter::from_handle(f)?),
         DuckOperator::Aggregate(a) => Operator::Aggregate(Aggregate::from_handle(a)?),
@@ -326,6 +327,12 @@ fn absorb_scan_pushdown_filter(node: PlanNode) -> PlanNode {
 /// side to build the hash table from, which for anti joins (preserving the
 /// rows a typically larger side fails to match) is routine rather than rare.
 ///
+/// MARK keeps every left-child row and appends a boolean marker column, the
+/// three-valued result of `IN (...)`: what DuckDB plans an uncorrelated `IN`
+/// subquery, or the constant chunk its optimizer rewrites a long `IN` list
+/// into, as. The marker is TRUE on a match, FALSE on a miss, and NULL where
+/// a null key leaves the miss unknown.
+///
 /// DuckDB's join projection maps (which trim the join's output to the columns
 /// actually used above it) are folded into the join's own output lists, so
 /// the dispatch probe never materializes trimmed columns. An empty map means
@@ -417,6 +424,18 @@ fn build_join(
         // The mirror image: a right anti join emits build columns alone, and
         // DuckDB never reads the left projection map for it.
         JoinType::RIGHT_ANTI => (JoinKind::BuildAnti, Vec::new(), kept_build_output),
+        // A mark join emits the left bindings plus its marker column, which
+        // the dispatch join appends after the probe columns. The marker's
+        // three-valued semantics are defined per key comparison, so only the
+        // single-equality shape (what `IN` compiles to) translates.
+        JoinType::MARK => {
+            if probe_keys.len() != 1 || !residual_filters.is_empty() {
+                return Err(OperatorError::Unsupported(
+                    "mark joins are supported on exactly one equality condition".to_string(),
+                ));
+            }
+            (JoinKind::ProbeMark, kept_probe_output, Vec::new())
+        }
         other => {
             return Err(OperatorError::Unsupported(format!(
                 "Unsupported join type: {other:?}"

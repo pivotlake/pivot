@@ -12,7 +12,7 @@ use duckdb_planner::DuckDBTable;
 use duckdb_planner::catalog_provider::OptionalTableWrapper;
 use duckdb_planner::duckdb_bridge::duckdb_types::LimitNodeType;
 use duckdb_planner::handle::{
-    Aggregate as AggregateView, BridgeError, Compact as CompactView,
+    Aggregate as AggregateView, BridgeError, ChunkGet as ChunkGetView, Compact as CompactView,
     CreateSchema as CreateSchemaView, CreateTable as CreateTableView, CreateUser as CreateUserView,
     Filter as FilterView, Insert as InsertView, Limit as LimitView, OrderBy as OrderByView,
     OrderKey, Projection as ProjectionView, Reset as ResetView, Set as SetView,
@@ -30,7 +30,7 @@ use crate::operator::{
     Input, Insert, Limit, OrderBy, OrderByNode, Projection, SetVariable, TableFunctionScan, TopN,
     Values,
 };
-use crate::types::type_from_logical;
+use crate::types::{build_scalar_value, type_from_logical};
 
 impl Projection {
     pub(crate) fn from_handle(view: ProjectionView<'_>) -> Result<Projection, OperatorError> {
@@ -54,6 +54,23 @@ impl Values {
                             .map_err(OperatorError::from)
                     })
                     .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Values { rows })
+    }
+
+    /// A CHUNK_GET, DuckDB's scan of an in-memory constant chunk (what its
+    /// optimizer rewrites a long `IN` list into), becomes a VALUES source
+    /// whose cells are the chunk's constants.
+    pub(crate) fn from_chunk_get(view: ChunkGetView<'_>) -> Result<Values, OperatorError> {
+        let rows = (0..view.row_count()?)
+            .map(|row| {
+                (0..view.column_count()?)
+                    .map(|column| {
+                        let cell = view.value(column, row)?;
+                        Ok(Expression::Constant(build_scalar_value(cell)?))
+                    })
+                    .collect::<Result<Vec<_>, OperatorError>>()
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Values { rows })
