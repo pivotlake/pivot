@@ -286,11 +286,18 @@ impl BoundTable for TableBinding {
         input: RecordBatchOperatorSpec,
         projection: Projection,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
-        // Same captured snapshot as the scan and it is immutable, so this reads
-        // an identical view and their global row-group indices line up. Late
-        // materialization re-reads rows by that global index, so it uses the
-        // full table, not the pruned scan view.
-        Ok(materialize(input, self.resolve_files()?, projection))
+        // A row reference is a position in the *scanning* view's flat row-group
+        // list, so this has to build the identical view: same captured
+        // snapshot, same partition pruning, and the same stats pruning
+        // [`compile_scan`](BoundTable::compile_scan) applies. Re-reading from a
+        // view that kept even one row group the scan dropped shifts every later
+        // index and silently returns another row group's rows.
+        let current = self.resolve_files()?;
+        Ok(materialize(
+            input,
+            Arc::new(self.pruned_parquet(&current)),
+            projection,
+        ))
     }
 
     fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {
