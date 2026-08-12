@@ -656,3 +656,68 @@ fn a_flipped_two_key_aggregate_delim_join_pads_its_build_side(mut testing_planne
             .clone()
     );
 }
+
+/// The q22 shape: country codes cut out of a phone column with substring,
+/// filtered by an IN list and an uncorrelated average, under a NOT EXISTS
+/// that flips to a RIGHT_ANTI delim join. Codes 13, 17, 25, 21, and 29 leave
+/// no qualifying orderless customer in this data; the other four do.
+/// Verified against DuckDB on the same rows.
+#[rstest]
+fn substring_country_codes_group_through_a_flipped_anti_delim_join(
+    mut testing_planner: TestingPlanner,
+) {
+    let codes = ["13", "31", "23", "29", "30", "18", "17", "25", "21"];
+    testing_planner.add_table(
+        "customer",
+        &[
+            ("c_custkey", Type::Int64, int64_col((0..3000).collect())),
+            (
+                "c_phone",
+                Type::Utf8,
+                Arc::new(StringViewArray::from_iter_values(
+                    (0..3000).map(|i| format!("{}-{}", codes[i as usize % 9], i)),
+                )) as ArrayRef,
+            ),
+            (
+                "c_acctbal",
+                Type::Int64,
+                int64_col((0..3000).map(|i| i % 2000 - 500).collect()),
+            ),
+        ],
+    );
+    testing_planner.add_table(
+        "orders",
+        &[(
+            "o_custkey",
+            Type::Int64,
+            int64_col((0..2000).map(|i| i * 3 % 3000).collect()),
+        )],
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT cntrycode, count(*) AS numcust, sum(c_acctbal) AS totacctbal \
+         FROM (SELECT substring(c_phone FROM 1 FOR 2) AS cntrycode, c_acctbal \
+               FROM customer \
+               WHERE substring(c_phone FROM 1 FOR 2) IN ('13','31','23','29','30','18','17') \
+                 AND c_acctbal > (SELECT avg(c_acctbal) FROM customer \
+                                  WHERE c_acctbal > 0 \
+                                    AND substring(c_phone FROM 1 FOR 2) \
+                                        IN ('13','31','23','29','30','18','17')) \
+                 AND NOT EXISTS (SELECT * FROM orders WHERE o_custkey = c_custkey)) AS custsale \
+         GROUP BY cntrycode ORDER BY cntrycode",
+    );
+
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"cntrycode": "18", "numcust": 97, "totacctbal": 103014},
+            {"cntrycode": "23", "numcust": 97, "totacctbal": 102723},
+            {"cntrycode": "30", "numcust": 97, "totacctbal": 102917},
+            {"cntrycode": "31", "numcust": 98, "totacctbal": 104125},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}

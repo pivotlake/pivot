@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow_array::Array;
+use arrow_array::ArrowNativeTypeOp;
 use arrow_array::RecordBatch;
 use arrow_array::cast::AsArray;
 use arrow_array::types::ArrowPrimitiveType;
@@ -38,7 +39,7 @@ pub struct RangeBuildFactory<T: ArrowPrimitiveType> {
 
 impl<T: ArrowPrimitiveType> UnaryFactory<RecordBatch, ()> for RangeBuildFactory<T>
 where
-    T::Native: Ord + Send,
+    T::Native: ArrowNativeTypeOp + Send,
 {
     type Unary = RangeBuild<T>;
 
@@ -62,7 +63,7 @@ pub struct RangeProbeFactory<T: ArrowPrimitiveType> {
 
 impl<T: ArrowPrimitiveType> UnaryFactory<RecordBatch, RecordBatch> for RangeProbeFactory<T>
 where
-    T::Native: Ord + Send,
+    T::Native: ArrowNativeTypeOp + Send,
 {
     type Unary = RangeProbe<T>;
 
@@ -85,7 +86,7 @@ pub(crate) fn create_range_join_factories<T: ArrowPrimitiveType>(
     Arc<AtomicBool>,
 )
 where
-    T::Native: Ord + Send,
+    T::Native: ArrowNativeTypeOp + Send,
 {
     let spec = Arc::new(spec);
     let table = RangeTable {
@@ -125,7 +126,7 @@ pub struct RangeBuild<T: ArrowPrimitiveType> {
 
 impl<T: ArrowPrimitiveType> Unary<RecordBatch, ()> for RangeBuild<T>
 where
-    T::Native: Ord + Send,
+    T::Native: ArrowNativeTypeOp + Send,
 {
     fn consume(&mut self, batch: RecordBatch, _sender: &mut dyn Sender<()>) -> unary::Result<()> {
         debug_assert!(self.publisher, "the funnel delivers to one worker only");
@@ -143,7 +144,7 @@ where
         debug_assert!(
             self.chunks
                 .last()
-                .is_none_or(|last| { last.keys.value(last.keys.len() - 1) <= keys.value(0) }),
+                .is_none_or(|last| { last.keys.value(last.keys.len() - 1).is_le(keys.value(0)) }),
             "sorted chunks must arrive in ascending key order"
         );
 

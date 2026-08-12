@@ -47,6 +47,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{self, AtomicUsize};
 
+use arrow_array::ArrowNativeTypeOp;
 use arrow_array::RecordBatch;
 use arrow_schema::DataType;
 
@@ -876,6 +877,12 @@ impl RecordBatchOperatorSpec {
             DataType::UInt16 => self.range_join_typed::<t::UInt16Type>(build, spec),
             DataType::UInt32 => self.range_join_typed::<t::UInt32Type>(build, spec),
             DataType::UInt64 => self.range_join_typed::<t::UInt64Type>(build, spec),
+            // Floats compare by IEEE totalOrder end to end: the build sort's
+            // row encoding and `ArrowNativeTypeOp::compare` agree on it, and
+            // NaN sorting greatest matches SQL's comparison semantics for
+            // every NaN arithmetic produces.
+            DataType::Float32 => self.range_join_typed::<t::Float32Type>(build, spec),
+            DataType::Float64 => self.range_join_typed::<t::Float64Type>(build, spec),
             DataType::Date32 => self.range_join_typed::<t::Date32Type>(build, spec),
             DataType::Date64 => self.range_join_typed::<t::Date64Type>(build, spec),
             DataType::Timestamp(TimeUnit::Second, _) => {
@@ -902,7 +909,7 @@ impl RecordBatchOperatorSpec {
         spec: RangeJoinSpec,
     ) -> Self
     where
-        T::Native: Ord + Send,
+        T::Native: ArrowNativeTypeOp + Send,
     {
         let worker_count = self.worker_count();
         assert_eq!(
