@@ -51,22 +51,25 @@ The link **times out and kills foreground commands** that run more than ~1-2 min
 ## Running benchmarks
 The crate lives in `~/pivotdb/benchmarks`; each benchmark is a suite subdirectory. ClickBench query/oracle pairs are `clickbench/qNN.sql` + `qNN.tsv` (drop in two files to add a query; IDs match ClickBench numbering, e.g. q02, q32). The ClickBench driver scripts live in `clickbench/`; `cargo`/`just` still run from the crate root `~/pivotdb/benchmarks`.
 
-Build the binary first (see PGO below), then point the drivers at it. **None of
-these build** — `--binary` is required, so a measurement can never turn into a
-rebuild halfway through.
+The measured binary is **pivot** (spawned as `pivot server`); `pivot-bench` is
+a thin pgwire client that spawns the server, drives it and times it, and
+carries no engine code. Build both first (see PGO below), then point the
+drivers at them. **None of these build** — `--binary`/`--server-bin` are
+required, so a measurement can never turn into a rebuild halfway through.
 
 ```bash
 T=aarch64-unknown-linux-gnu
-B=~/bench/working/target-pgouse/$T/profiling/pivot-bench
+B=~/bench/target-client/release/pivot-bench             # client (plain build)
+S=~/bench/working/target-pgouse/$T/profiling/pivot      # the binary being measured
 ```
 
-- **pivot only:** `$B --source ~/hits --query q32 --iterations 6`
+- **pivot only:** `$B --server-bin $S --source ~/hits --query q32 --iterations 6`
   Prints `[i/N] Query qNN — Xms`. `--update-results` rewrites the `.tsv` (pivot
   grading itself) — only when adding/changing a query or when its result isn't a
   stable oracle. `--skip-check` skips comparison but still times.
 - **DuckDB only:** `clickbench/run-duckdb.sh --source ~/hits --query 32 --iterations 4 --no-drop-caches` → `Run Time (s): real 0.xxx`.
 - **Side-by-side (pivot vs DuckDB/ClickHouse, cold + hot + speedup):**
-  `clickbench/benchmark.sh --binary $B --source ~/hits --query 32 --iterations 6`
+  `clickbench/benchmark.sh --binary $B --server-bin $S --source ~/hits --query 32 --iterations 6`
   Add `--duckdb`, or `--clickhouse <binary>`; a bare run is pivot-only. The
   canonical invocation is `--restart-server --iterations 3 --skip-check`:
   `--restart-server` restarts the server and drops caches **per query**, so every
@@ -82,7 +85,7 @@ B=~/bench/working/target-pgouse/$T/profiling/pivot-bench
 and the suite's own DuckDB driver, then compare by hand:
 
 ```bash
-$B --suite tpch-flat --source ~/tpch-flat --query q01 --iterations 6
+$B --suite tpch-flat --server-bin $S --source ~/tpch-flat --query q01 --iterations 6
 tpch/run-duckdb.sh --source ~/tpch-flat --query 1 --iterations 6      # also tpch/, jsonbench/
 ```
 
@@ -95,12 +98,16 @@ hot paths.
 When you begin working, to initialize, run:
 `just setup-bench --suite tpch-flat --pgo-source ~/tpch-flat-subset` (replace with your suite and subset)
 
-This will create a directory like so:
+This instruments the pivot server binary (not the client), profiles it over
+the subset through the plain client, builds the profile-use server, and
+verifies the profile actually applied (a symbol-overlap tripwire; zero overlap
+fails the run). It creates:
 ```
 ~/bench/
   pgo/active.profdata              # the profile the compiler reads, for both sides
-  baseline/  pgo/  target-pgogen/  target-pgouse/
-  working/   pgo/  target-pgogen/  target-pgouse/
+  baseline/  pgo/  target-pgogen/  target-pgouse/   # pivot server artifacts
+  working/   pgo/  target-pgogen/  target-pgouse/   # pivot server artifacts
+  target-client/                   # plain-release pivot-bench, shared by both sides
 ```
 
 Every time you want to make a change, you can run
@@ -127,16 +134,17 @@ not TPC-H.)
 
 Then measure each binary against the **full** dataset, never `~/hits-pgo-subset` (or equivalent subsets):
 
-For example, to check q32:
+For example, to check q32 (one client, two servers):
 ```bash
 T=aarch64-unknown-linux-gnu
-~/bench/baseline/target-pgouse/$T/profiling/pivot-bench --source ~/hits --query q32 --iterations 6 --skip-check
-~/bench/working/target-pgouse/$T/profiling/pivot-bench  --source ~/hits --query q32 --iterations 6 --skip-check
+B=~/bench/target-client/release/pivot-bench
+$B --server-bin ~/bench/baseline/target-pgouse/$T/profiling/pivot --source ~/hits --query q32 --iterations 6 --skip-check
+$B --server-bin ~/bench/working/target-pgouse/$T/profiling/pivot  --source ~/hits --query q32 --iterations 6 --skip-check
 ```
 
-⚠️ **Run them one at a time, and never alongside a build.** `pivot-bench` sizes
-its ring at 4/5 of RAM (~24GB of the 30GB a c8g perf box has), so two at once,
-or one next to a compile, triggers the OOM killer and takes both down.
+⚠️ **Run them one at a time, and never alongside a build.** The pivot server
+sizes its ring at 4/5 of RAM (~24GB of the 30GB a c8g perf box has), so two at
+once, or one next to a compile, triggers the OOM killer and takes both down.
 
 ## Reading the numbers
 - **Cold** = iteration 1 (fresh process / page cache). **Hot** = mean of iterations 2..N (steady state) — this is the headline metric.
@@ -146,8 +154,11 @@ or one next to a compile, triggers the OOM killer and takes both down.
 ## Profiling (perf is available, `perf_event_paranoid=-1`)
 Note that for perf to work, you must make sure mem lock limit is high! the default is too low and it hangs.
 
+`perf record` on the client follows the pivot server child it spawns, so one
+command captures both; the engine work all lands in the pivot DSO.
+
 ```bash
-perf record -g -F 499 -o /tmp/p.data -- ./target/release/pivot-bench --source ~/hits --query q32 --iterations 4 --update-results >/dev/null 2>&1
+perf record -g -F 499 -o /tmp/p.data -- $B --server-bin $S --source ~/hits --query q32 --iterations 4 --update-results >/dev/null 2>&1
 perf report -i /tmp/p.data --stdio --no-children | grep -vE '^#' | head -20
 perf diff /tmp/a.data /tmp/b.data        # compare two builds/queries
 ```
