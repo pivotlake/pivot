@@ -57,6 +57,10 @@ pub(super) struct ProbeMatchOutputter {
     /// other kind: an accumulator eagerly takes a pooled slab per column, a
     /// real per-query cost no other kind may pay for a path it never runs.
     unmatched_probe: Option<BatchAccumulator>,
+    /// The matched-flag value the build-row scan keeps: 0 for a build-side
+    /// outer or anti join, which emit the rows no pair ever flagged, and 1
+    /// for a build-side semi join, which emits exactly the flagged ones.
+    scan_kept_flag: u8,
 }
 
 impl ProbeMatchOutputter {
@@ -67,6 +71,7 @@ impl ProbeMatchOutputter {
         residual_filters: Option<ResidualFilter>,
         emits_unmatched_probe_rows: bool,
         mark: bool,
+        scan_keeps_matched_build_rows: bool,
     ) -> Self {
         let mut allocator = SlabAllocator::new(false);
         let mut fields: Vec<Field> = probe_fields.iter().chain(build_fields).cloned().collect();
@@ -98,6 +103,7 @@ impl ProbeMatchOutputter {
             residual_filters,
             missed_probe_rows: Vec::new(),
             probe_row_settled: Vec::new(),
+            scan_kept_flag: scan_keeps_matched_build_rows as u8,
         }
     }
 
@@ -357,6 +363,9 @@ impl ProbeMatchOutputter {
         Ok(())
     }
 
+    /// Append the rows of one stored build batch whose flag holds the value
+    /// the join's scan keeps (see [`scan_kept_flag`](Self::scan_kept_flag)),
+    /// emitting if a full batch accumulated.
     pub(super) fn append_unmatched_build_rows(
         &mut self,
         batch: &RecordBatch,
@@ -367,11 +376,11 @@ impl ProbeMatchOutputter {
         let mut found = 0;
         for row in 0..batch.num_rows() {
             // Branchless, as in the match collector: write the row and keep it
-            // only if its flag is still clear. A stored batch holds at most
-            // one output batch's worth of rows, so a pass never overfills the
-            // accumulator.
+            // only if its flag holds the kept value. A stored batch holds at
+            // most one output batch's worth of rows, so a pass never overfills
+            // the accumulator.
             self.build_indices[found] = row as u32;
-            found += (build_rows.matched[first_row_id + row] == 0) as usize;
+            found += (build_rows.matched[first_row_id + row] == self.scan_kept_flag) as usize;
         }
         if found > 0 {
             self.build.append_batch_by_indices(
@@ -437,8 +446,9 @@ impl ProbeMatchOutputter {
             }
         }
         if DISCARD_MATCHED_PAIRS {
-            // An anti join's matched pairs are not output rows; the settling
-            // and flagging above is all a match contributes.
+            // An anti or build-side semi join's matched pairs are not output
+            // rows; the settling and flagging above is all a match
+            // contributes.
             self.matched = 0;
             return Ok(());
         }

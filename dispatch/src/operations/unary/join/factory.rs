@@ -86,7 +86,10 @@ pub fn create_for_workers<
 ) {
     debug_assert_eq!(
         BUILD_OUTER,
-        matches!(spec.kind, JoinKind::BuildOuter | JoinKind::BuildAnti)
+        matches!(
+            spec.kind,
+            JoinKind::BuildOuter | JoinKind::BuildAnti | JoinKind::BuildSemi
+        )
     );
     debug_assert_eq!(
         TRACK_UNMATCHED_PROBE_ROWS,
@@ -97,7 +100,10 @@ pub fn create_for_workers<
     );
     debug_assert_eq!(
         DISCARD_MATCHED_PAIRS,
-        matches!(spec.kind, JoinKind::ProbeAnti | JoinKind::BuildAnti)
+        matches!(
+            spec.kind,
+            JoinKind::ProbeAnti | JoinKind::BuildAnti | JoinKind::BuildSemi
+        )
     );
     debug_assert_eq!(MARK, matches!(spec.kind, JoinKind::ProbeMark));
     debug_assert!(
@@ -111,7 +117,7 @@ pub fn create_for_workers<
     );
     debug_assert!(
         !(DISCARD_MATCHED_PAIRS && BUILD_OUTER) || spec.probe_output_indices.is_empty(),
-        "a build-side anti join emits no probe columns"
+        "a build-side semi or anti join emits no probe columns"
     );
     debug_assert!(
         !MARK
