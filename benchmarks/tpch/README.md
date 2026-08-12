@@ -49,15 +49,18 @@ as the engine grows the features each needs.
 | q17 | Small-Quantity-Order Revenue | a correlated scalar average decorrelated into a LEFT delim join |
 | q18 | Large Volume Customer | orders semi-joined against the order keys whose quantities sum above 300, then the top 100 by price |
 | q19 | Discounted Revenue | lineitem/part, a three-disjunct OR over both sides riding the join as a residual condition |
+| q20 | Potential Part Promotion | an IN flipped to a build-side semi join because supplier is the cheaper build, over a two-key correlated aggregate decorrelated into a LEFT delim join |
+| q21 | Suppliers Who Kept Orders Waiting | an EXISTS and a NOT EXISTS over lineitem itself, decorrelated into two nested flipped delim joins (build-side semi under build-side anti), each `<>` riding its subquery join as a residual |
 
-The rest of the 22 need engine features that are not in yet: flipped delim
-joins, where DuckDB de-duplicates the right-hand side instead of the left
-(q21, q22), RIGHT_SEMI (q20), and the `substring` scalar function (q22).
-LEFT, SEMI, and ANTI delim joins (the shapes DuckDB
-decorrelates q04 and q17's correlated subqueries, and a `NOT EXISTS`, into)
-are supported: the outer side runs once and is read both by the join and by
-a distinct on the correlation columns, whose output feeds the subquery
-side's delim scans.
+The last of the 22, q22, needs only the `substring` scalar function. Delim
+joins (the shapes DuckDB decorrelates correlated subqueries and [NOT] EXISTS
+into) are supported in both orientations: the outer side runs once and is
+read both by the join and by a distinct on the correlation columns, whose
+output feeds the subquery side's delim scans. When the outer side is the
+cheaper build DuckDB flips the delim join (the outer rows become the RHS and
+the dedup source, the join type mirrored to RIGHT/RIGHT_SEMI/RIGHT_ANTI),
+and the same structure runs with the subquery side probing into the outer
+rows.
 
 q11's HAVING threshold is the spec's `FRACTION = 0.0001 / SF`, written out for
 SF100 as `0.000001`; adjust it (and regenerate the oracle) for another scale.
@@ -72,20 +75,19 @@ hash table is built from, a LEFT join the side that probes it. DuckDB flips a
 written LEFT JOIN into RIGHT whenever the preserved relation is the smaller one
 (as in q13) and keeps it LEFT when it is the larger; both shapes run.
 
-Semi joins are supported the other way round: the rows kept are the probe
-side's, which is what DuckDB hands over as SEMI (that join type keeps its left
-child's rows, and the left child is the probe). q18's `IN` subquery arrives in
-that shape, since the aggregate it selects from is the cheaper side to build the
-hash table from at every scale factor. Its mirror image RIGHT_SEMI, which
-DuckDB's build-probe-side optimizer produces when the left child is the cheaper
-one instead, is not supported; q20 needs it (its delim join itself is the
-supported LEFT shape).
+Semi joins are supported on both sides too. SEMI keeps its left child's rows,
+and the left child is the probe: q18's `IN` subquery arrives that way, since
+the aggregate it selects from is the cheaper side to build the hash table from
+at every scale factor. Its mirror image RIGHT_SEMI, which DuckDB's
+build-probe-side optimizer produces when the left child is the cheaper one
+instead, runs build-side: q20's `IN` arrives in that shape (supplier is far
+smaller than the subquery side), over a delim join that itself keeps the
+supported LEFT orientation.
 
 Anti joins are supported on both sides: ANTI runs probe-side, and the
 RIGHT_ANTI that same optimizer rewrites it into whenever the preserved
-relation is the cheaper build lands build-side. What q21 and q22 still miss
-is not the anti join itself but the flipped delim join above it (q22 also
-needs `substring`).
+relation is the cheaper build lands build-side. With flipped delim joins in,
+that unlocked q21; q22 now misses only `substring`.
 
 Mark joins run probe-side and append the three-valued boolean marker `IN`
 calls for: TRUE on a match, FALSE on a miss, NULL where a null key leaves
