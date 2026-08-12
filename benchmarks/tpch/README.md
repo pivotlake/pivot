@@ -51,16 +51,16 @@ as the engine grows the features each needs.
 | q19 | Discounted Revenue | lineitem/part, a three-disjunct OR over both sides riding the join as a residual condition |
 | q20 | Potential Part Promotion | an IN flipped to a build-side semi join because supplier is the cheaper build, over a two-key correlated aggregate decorrelated into a LEFT delim join |
 | q21 | Suppliers Who Kept Orders Waiting | an EXISTS and a NOT EXISTS over lineitem itself, decorrelated into two nested flipped delim joins (build-side semi under build-side anti), each `<>` riding its subquery join as a residual |
+| q22 | Global Sales Opportunity | country codes cut with `substring`, a mark join over the IN list keyed on that computed expression, a scalar-average comparison run as a float-keyed range join, and a NOT EXISTS flipped to a build-side anti delim join |
 
-The last of the 22, q22, needs only the `substring` scalar function. Delim
-joins (the shapes DuckDB decorrelates correlated subqueries and [NOT] EXISTS
-into) are supported in both orientations: the outer side runs once and is
-read both by the join and by a distinct on the correlation columns, whose
-output feeds the subquery side's delim scans. When the outer side is the
-cheaper build DuckDB flips the delim join (the outer rows become the RHS and
-the dedup source, the join type mirrored to RIGHT/RIGHT_SEMI/RIGHT_ANTI),
-and the same structure runs with the subquery side probing into the outer
-rows.
+All 22 queries run. Delim joins (the shapes DuckDB decorrelates correlated
+subqueries and [NOT] EXISTS into) are supported in both orientations: the
+outer side runs once and is read both by the join and by a distinct on the
+correlation columns, whose output feeds the subquery side's delim scans.
+When the outer side is the cheaper build DuckDB flips the delim join (the
+outer rows become the RHS and the dedup source, the join type mirrored to
+RIGHT/RIGHT_SEMI/RIGHT_ANTI), and the same structure runs with the subquery
+side probing into the outer rows.
 
 q11's HAVING threshold is the spec's `FRACTION = 0.0001 / SF`, written out for
 SF100 as `0.000001`; adjust it (and regenerate the oracle) for another scale.
