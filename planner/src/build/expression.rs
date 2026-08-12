@@ -24,8 +24,8 @@ use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Conjunction,
     ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide, Error,
     Expression, Function, InList, IntervalArithmetic, IsNull, Length, Like, MaybeError, Not,
-    NumericAggregate, Prefix, Ref, RegexpFullMatch, RegexpJitReplace, RegexpReplace, Suffix,
-    TemporalConvert, VariantGet,
+    NumericAggregate, Prefix, Ref, RegexpFullMatch, RegexpJitReplace, RegexpReplace, Substring,
+    Suffix, TemporalConvert, VariantGet,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
 
@@ -353,6 +353,8 @@ impl Function {
             },
             "*" => Ok(Function::Arithmetic(Arithmetic::from_handle(func)?)),
             "length" | "strlen" | "len" => Ok(Function::Length(Length::from_handle(func)?)),
+            // The `substring(x FROM a FOR b)` syntax binds to the same call.
+            "substring" | "substr" => Ok(Function::Substring(Substring::from_handle(func)?)),
             "regexp_replace" => Ok(Function::RegexpReplace(RegexpReplace::from_handle(func)?)),
             "regexp_full_match" => Ok(Function::RegexpFullMatch(RegexpFullMatch::from_handle(
                 func,
@@ -445,6 +447,42 @@ impl Prefix {
         Ok(Prefix {
             haystack: Box::new(Expression::from_handle(params[0])?),
             prefix: Box::new(Expression::from_handle(params[1])?),
+        })
+    }
+}
+
+impl Substring {
+    pub(crate) fn from_handle(func: FunctionHandle<'_>) -> Result<Substring, Error> {
+        let params: Vec<Expr<'_>> = func.children()?;
+        if params.len() != 2 && params.len() != 3 {
+            return Err(Error::InvalidParameterCount {
+                function: func.name()?,
+                expected: 3,
+                actual: params.len(),
+            });
+        }
+        let start = constant_int64(Expression::from_handle(params[1])?)?;
+        if start < 1 {
+            return Err(Error::UnsupportedScalarFunction(format!(
+                "substring start positions below 1 are not supported (got {start})"
+            )));
+        }
+        let length = match params.get(2) {
+            Some(&length) => {
+                let length = constant_int64(Expression::from_handle(length)?)?;
+                if length < 0 {
+                    return Err(Error::UnsupportedScalarFunction(format!(
+                        "substring lengths below 0 are not supported (got {length})"
+                    )));
+                }
+                Some(length as u64)
+            }
+            None => None,
+        };
+        Ok(Substring {
+            input: Box::new(Expression::from_handle(params[0])?),
+            start: start as u64,
+            length,
         })
     }
 }
@@ -736,4 +774,30 @@ fn constant_string(e: Expression) -> Result<String, Error> {
             "expected a string constant, got {other}"
         ))),
     }
+}
+
+/// Extract a constant integer argument (e.g. a substring position) from a
+/// built expression, whichever integer width DuckDB bound it at.
+fn constant_int64(e: Expression) -> Result<i64, Error> {
+    let Expression::Constant(scalar) = e else {
+        return Err(Error::UnsupportedScalarFunction(format!(
+            "expected an integer constant, got {e}"
+        )));
+    };
+    let (arr, _) = scalar.get();
+    if arr.is_null(0) {
+        return Err(Error::UnsupportedScalarFunction(
+            "expected an integer constant, got NULL".to_string(),
+        ));
+    }
+    if let Some(values) = arr.as_primitive_opt::<arrow_array::types::Int64Type>() {
+        return Ok(values.value(0));
+    }
+    if let Some(values) = arr.as_primitive_opt::<arrow_array::types::Int32Type>() {
+        return Ok(values.value(0) as i64);
+    }
+    Err(Error::UnsupportedScalarFunction(format!(
+        "expected an integer constant, got a {} constant",
+        arr.data_type()
+    )))
 }

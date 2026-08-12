@@ -3,7 +3,8 @@
 
 use super::{
     Arithmetic, Contains, DatePart, DateTrunc, Divide, IntervalArithmetic, Length, Like, Prefix,
-    RegexpFullMatch, RegexpJitReplace, RegexpReplace, Suffix, TemporalConvert, VariantGet,
+    RegexpFullMatch, RegexpJitReplace, RegexpReplace, Substring, Suffix, TemporalConvert,
+    VariantGet,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::expression::Expression;
@@ -81,6 +82,8 @@ pub enum Function {
     /// `regexp_jit_replace` — like `RegexpReplace` but always PCRE2 JIT-compiled.
     RegexpJitReplace(RegexpJitReplace),
     Divide(Divide),
+    /// `substring(string, start[, length])` with constant positions.
+    Substring(Substring),
     DateTrunc(DateTrunc),
     DatePart(DatePart),
     /// `date`/`timestamp` ± `INTERVAL` (e.g. `now() - interval '5 days'`).
@@ -135,6 +138,7 @@ impl Function {
                 visit(&d.left);
                 visit(&d.right);
             }
+            Function::Substring(s) => visit(&s.input),
             Function::DateTrunc(d) => visit(&d.source),
             Function::DatePart(d) => visit(&d.source),
             Function::IntervalArithmetic(i) => visit(&i.operand),
@@ -174,6 +178,7 @@ impl Function {
                 visit(&mut d.left);
                 visit(&mut d.right);
             }
+            Function::Substring(s) => visit(&mut s.input),
             Function::DateTrunc(d) => visit(&mut d.source),
             Function::DatePart(d) => visit(&mut d.source),
             Function::IntervalArithmetic(i) => visit(&mut i.operand),
@@ -197,6 +202,7 @@ impl Display for Function {
             Function::RegexpFullMatch(r) => write!(f, "{r}"),
             Function::RegexpJitReplace(r) => write!(f, "{r}"),
             Function::Divide(d) => write!(f, "{d}"),
+            Function::Substring(s) => write!(f, "{s}"),
             Function::DateTrunc(dt) => write!(f, "{dt}"),
             Function::DatePart(d) => write!(f, "{d}"),
             Function::IntervalArithmetic(i) => write!(f, "{i}"),
@@ -222,8 +228,10 @@ impl Function {
             Function::Arithmetic(a) => a.return_type.clone(),
             Function::Length(l) => l.return_type.clone(),
             Function::DatePart(d) => d.return_type.clone(),
-            // The regex replacers rewrite strings.
-            Function::RegexpReplace(_) | Function::RegexpJitReplace(_) => Type::Utf8,
+            // The regex replacers and substring rewrite strings.
+            Function::RegexpReplace(_) | Function::RegexpJitReplace(_) | Function::Substring(_) => {
+                Type::Utf8
+            }
             // `/` computes a float quotient, single- or double-precision.
             Function::Divide(d) => d.return_type.clone(),
             // `date_trunc` and `now()` yield a timestamp.
@@ -252,6 +260,7 @@ impl Function {
             Function::RegexpFullMatch(r) => r.compile(),
             Function::RegexpJitReplace(r) => r.compile(),
             Function::Divide(d) => d.compile(),
+            Function::Substring(s) => s.compile(),
             Function::DateTrunc(dt) => dt.compile(),
             Function::DatePart(d) => d.compile(),
             Function::IntervalArithmetic(i) => i.compile(),
