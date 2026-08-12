@@ -318,9 +318,10 @@ fn absorb_scan_pushdown_filter(node: PlanNode) -> PlanNode {
 /// when it is the larger.
 ///
 /// SEMI keeps rows of the left child, so it is semi on the *probe* side. The
-/// mirrored RIGHT_SEMI, which DuckDB's build-probe-side optimizer produces when
-/// it would rather build the hash table from the left child, is not supported
-/// yet.
+/// mirrored RIGHT_SEMI, which DuckDB's build-probe-side optimizer produces
+/// when it would rather build the hash table from the preserved relation (an
+/// `IN` whose outer table is far smaller than the subquery's), is semi on the
+/// build side.
 ///
 /// ANTI is SEMI's negation, one output row per left-child row with no
 /// surviving match, so it is anti on the probe side. Here the mirrored
@@ -423,8 +424,9 @@ fn build_join(
         // applied.
         JoinType::SEMI => (JoinKind::ProbeSemi, kept_probe_output, Vec::new()),
         JoinType::ANTI => (JoinKind::ProbeAnti, kept_probe_output, Vec::new()),
-        // The mirror image: a right anti join emits build columns alone, and
-        // DuckDB never reads the left projection map for it.
+        // The mirror images: a right semi or anti join emits build columns
+        // alone, and DuckDB never reads the left projection map for either.
+        JoinType::RIGHT_SEMI => (JoinKind::BuildSemi, Vec::new(), kept_build_output),
         JoinType::RIGHT_ANTI => (JoinKind::BuildAnti, Vec::new(), kept_build_output),
         // A mark join emits the left bindings plus its marker column, which
         // the dispatch join appends after the probe columns. The marker's

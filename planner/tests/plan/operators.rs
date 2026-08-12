@@ -533,6 +533,37 @@ fn an_anti_join_preserving_the_smaller_side_is_build_anti(mut testing_planner: T
     ");
 }
 
+/// A SEMI JOIN preserving the smaller relation flips the same way: the
+/// preserved side becomes the build, the join arrives as RIGHT_SEMI, and it
+/// lowers to the build-side semi join, which emits no probe columns.
+#[rstest]
+fn a_semi_join_preserving_the_smaller_side_is_build_semi(mut testing_planner: TestingPlanner) {
+    use arrow_array::{ArrayRef, Int64Array};
+    use planner::types::Type;
+    use std::sync::Arc;
+    let int64_col = |values: Vec<i64>| -> ArrayRef { Arc::new(Int64Array::from(values)) };
+    testing_planner.add_table(
+        "small_orders",
+        &[("o_key", Type::Int64, int64_col(vec![1, 2]))],
+    );
+    testing_planner.add_table(
+        "wide_items",
+        &[("i_order", Type::Int64, int64_col(vec![7; 20]))],
+    );
+
+    let plan = testing_planner
+        .plan("SELECT o_key FROM small_orders SEMI JOIN wide_items ON o_key = i_order")
+        .unwrap();
+
+    assert_snapshot!(plan.to_string(), @"
+    Projection(o_key:Int64)
+      Join[build semi](probe_keys: [0], build_keys: [0], probe_output: [], build_output: [0])
+        Projection(#0:Int64)
+          Input([i_order:Int64])
+        Input([o_key:Int64])
+    ");
+}
+
 #[rstest]
 fn count_star_join_keeps_all_columns(mut testing_planner: TestingPlanner) {
     add_join_tables(&testing_planner);

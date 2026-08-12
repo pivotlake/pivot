@@ -288,3 +288,130 @@ fn null_correlation_key_survives_a_not_exists(mut testing_planner: TestingPlanne
             .clone()
     );
 }
+
+/// The q20 shape: an IN whose outer table is far smaller than its subquery
+/// side, which DuckDB therefore flips to a RIGHT_SEMI (build-side semi)
+/// join, over a subquery that nests a second IN and a correlated aggregate
+/// (a delim join). The tables keep realistic relative sizes: shrinking them
+/// evenly makes DuckDB flip the delim join too, a shape the planner rejects.
+#[rstest]
+fn a_small_outer_in_over_a_correlated_aggregate_runs_build_side_semi(
+    mut testing_planner: TestingPlanner,
+) {
+    testing_planner.add_table(
+        "nation",
+        &[
+            ("n_nationkey", Type::Int64, int64_col((0..25).collect())),
+            (
+                "n_name",
+                Type::Utf8,
+                str_col(
+                    (0..25)
+                        .map(|i| if i == 5 { "CANADA" } else { "OTHER" })
+                        .collect(),
+                ),
+            ),
+        ],
+    );
+    testing_planner.add_table(
+        "supplier",
+        &[
+            ("s_suppkey", Type::Int64, int64_col((0..100).collect())),
+            (
+                "s_nationkey",
+                Type::Int64,
+                int64_col((0..100).map(|i| i % 25).collect()),
+            ),
+        ],
+    );
+    testing_planner.add_table(
+        "part",
+        &[
+            ("p_partkey", Type::Int64, int64_col((0..2000).collect())),
+            (
+                "p_name",
+                Type::Utf8,
+                str_col(
+                    (0..2000)
+                        .map(|i| {
+                            if i % 100 == 0 {
+                                "forest green"
+                            } else {
+                                "misty rose"
+                            }
+                        })
+                        .collect(),
+                ),
+            ),
+        ],
+    );
+    testing_planner.add_table(
+        "partsupp",
+        &[
+            (
+                "ps_partkey",
+                Type::Int64,
+                int64_col((0..8000).map(|i| i % 2000).collect()),
+            ),
+            (
+                "ps_suppkey",
+                Type::Int64,
+                int64_col((0..8000).map(|i| i % 97).collect()),
+            ),
+            (
+                "ps_availqty",
+                Type::Int64,
+                int64_col((0..8000).map(|i| i % 9999).collect()),
+            ),
+        ],
+    );
+    testing_planner.add_table(
+        "lineitem",
+        &[
+            (
+                "l_partkey",
+                Type::Int64,
+                int64_col((0..60000).map(|i| i % 2000).collect()),
+            ),
+            (
+                "l_suppkey",
+                Type::Int64,
+                int64_col((0..60000).map(|i| i % 97).collect()),
+            ),
+            (
+                "l_quantity",
+                Type::Int64,
+                int64_col((0..60000).map(|i| i % 50 + 1).collect()),
+            ),
+            (
+                "l_shipdate",
+                Type::Int64,
+                int64_col((0..60000).map(|i| i % 2557).collect()),
+            ),
+        ],
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT s_suppkey FROM supplier, nation \
+         WHERE s_suppkey IN ( \
+           SELECT ps_suppkey FROM partsupp \
+           WHERE ps_partkey IN (SELECT p_partkey FROM part WHERE p_name LIKE 'forest%') \
+             AND ps_availqty > (SELECT 0.5 * sum(l_quantity) FROM lineitem \
+                                WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey \
+                                  AND l_shipdate >= 730 AND l_shipdate < 1095)) \
+           AND s_nationkey = n_nationkey AND n_name = 'CANADA' \
+         ORDER BY s_suppkey",
+    );
+
+    // Verified against DuckDB on the same data: suppliers 5, 30, and 80 hold
+    // forest stock above half of the window's delivered quantity and sit in
+    // the filtered nation; supplier 55 is in the nation but holds none.
+    assert_eq!(
+        rows,
+        serde_json::json!([{"s_suppkey": 5}, {"s_suppkey": 30}, {"s_suppkey": 80}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
