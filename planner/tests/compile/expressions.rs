@@ -1122,3 +1122,58 @@ fn computed_group_key_with_computed_aggregate_argument(mut testing_planner: Test
     let high = rows.iter().find(|r| r["bucket"] == 0).unwrap();
     assert_eq!(high["s"], 410);
 }
+
+#[rstest]
+fn compares_against_the_empty_string(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "phrases",
+        &[(
+            "s",
+            Type::Utf8,
+            Arc::new(StringViewArray::from(vec![
+                Some("alpha"),
+                Some(""),
+                None,
+                Some("a rather long phrase that spills past the inline view prefix"),
+                Some(""),
+                Some("z"),
+            ])) as ArrayRef,
+        )],
+    );
+
+    let non_empty = testing_planner
+        .plan("SELECT s FROM phrases WHERE s <> ''")
+        .unwrap()
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
+        .unwrap()
+        .collect()
+        .unwrap();
+    let empty = testing_planner
+        .plan("SELECT COUNT(*) AS c FROM phrases WHERE s = ''")
+        .unwrap()
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut names: Vec<String> = batches_to_json(&non_empty)
+        .iter()
+        .map(|r| r["s"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "a rather long phrase that spills past the inline view prefix",
+            "alpha",
+            "z"
+        ]
+    );
+    assert_eq!(batches_to_json(&empty)[0]["c"], 2);
+}
