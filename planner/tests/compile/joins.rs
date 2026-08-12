@@ -752,6 +752,83 @@ fn an_anti_join_preserving_the_smaller_side_runs_build_side(mut testing_planner:
     assert_eq!(rows, vec![serde_json::json!({"f_name": "ghost"})]);
 }
 
+/// The mirror of the q18 shape: a preserved side far smaller than the
+/// subquery side, which DuckDB flips into a RIGHT_SEMI, so the preserved rows
+/// come out of the hash table itself.
+fn add_small_orders_and_wide_items(planner: &TestingPlanner) {
+    planner.add_table(
+        "small_orders",
+        &[
+            ("o_key", Type::Int64, int64_col(vec![1, 2, 3])),
+            (
+                "o_status",
+                Type::Utf8,
+                str_col(vec!["open", "closed", "open"]),
+            ),
+        ],
+    );
+    let mut i_order = vec![1, 1, 2];
+    let mut i_qty = vec![10, 20, 30];
+    i_order.extend(std::iter::repeat_n(9, 1000));
+    i_qty.extend(0..1000);
+    planner.add_table(
+        "wide_items",
+        &[
+            ("i_order", Type::Int64, int64_col(i_order)),
+            ("i_qty", Type::Int64, int64_col(i_qty)),
+        ],
+    );
+}
+
+#[rstest]
+fn a_semi_join_preserving_the_smaller_side_keeps_each_matched_build_row_once(
+    mut testing_planner: TestingPlanner,
+) {
+    add_small_orders_and_wide_items(&testing_planner);
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT o_key FROM small_orders WHERE o_key IN (SELECT i_order FROM wide_items)",
+    );
+    rows.sort_by_key(|r| r["o_key"].as_i64().unwrap());
+
+    // Order 1 is named by two items and still comes out once; order 3 is
+    // named by none and not at all.
+    assert_eq!(
+        rows,
+        serde_json::json!([{"o_key": 1}, {"o_key": 2}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
+// A build-side semi join's residual weighs every candidate pair: a build row
+// is kept only when some pair survives, which marking on the first key match
+// alone could not decide.
+#[rstest]
+fn a_build_semi_join_residual_drops_a_row_whose_every_pair_fails(
+    mut testing_planner: TestingPlanner,
+) {
+    add_small_orders_and_wide_items(&testing_planner);
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT o_key FROM small_orders SEMI JOIN wide_items ON o_key = i_order \
+         AND (i_qty >= 25 OR o_status = 'closed')",
+    );
+
+    // Order 1's items (quantities 10 and 20) all fail the predicate, so it is
+    // not emitted; order 2 passes through its status; order 3 has no items.
+    assert_eq!(
+        rows,
+        serde_json::json!([{"o_key": 2}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
 #[rstest]
 fn a_join_on_two_equality_conditions_matches_pairwise(mut testing_planner: TestingPlanner) {
     testing_planner.add_table(
