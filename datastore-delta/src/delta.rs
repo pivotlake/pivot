@@ -739,7 +739,7 @@ fn read_state(snapshot: Arc<Snapshot>, engine: &DeltaEngine) -> Result<DeltaTabl
         .collect::<Result<Vec<_>, Error>>()?;
     // Join each file's log-persisted stats onto its entry by path.
     for entry in &mut entries {
-        entry.stats = stats_by_path.remove(entry.file.path.as_str());
+        entry.stats = stats_by_path.remove(entry.file.path.as_str()).map(Arc::new);
     }
 
     Ok(DeltaTableState {
@@ -1329,7 +1329,7 @@ mod tests {
                 size: 123,
             },
             partition: None,
-            stats: Some(crate::manifest::FileStats {
+            stats: Some(Arc::new(crate::manifest::FileStats {
                 num_records: Some(5),
                 min_values: HashMap::from([(
                     "value".to_string(),
@@ -1340,7 +1340,7 @@ mod tests {
                     Arc::new(Int64Array::from(vec![20])) as ArrayRef,
                 )]),
                 null_counts: HashMap::from([("value".to_string(), 1)]),
-            }),
+            })),
         };
         commit_file_changes(&table.engine, &table.snapshot, &[], &[entry], true).unwrap();
 
