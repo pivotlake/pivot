@@ -281,9 +281,10 @@ impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> JoinBuilder<K, OUTER_JOI
         // GatherBarrier returns outputs in worker order. Merge the stored
         // build rows in that same order, so each worker-local tuple id gets
         // the corresponding row base during scatter. An empty merge means an
-        // empty build side, and the probe then emits nothing. For an outer
-        // build this also allocates one matched flag per row id (gaps
-        // included); null-keyed rows have no tuple and remain unmatched.
+        // empty build side, and the probe then emits nothing. For a build
+        // whose side is outer, anti, or semi this also allocates one matched
+        // flag per row id (gaps included); null-keyed rows have no tuple and
+        // remain unmatched.
         let (build_rows, row_bases) = BuildRows::new::<OUTER_JOIN_BUILD_SIDE>(
             worker_outputs
                 .iter_mut()

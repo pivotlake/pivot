@@ -622,6 +622,80 @@ fn every_unmatched_build_row_reaches_a_build_anti_join_output() {
     assert_eq!(ids, expected);
 }
 
+/// A build-side semi join keyed on column 0 of both sides, emitting the
+/// listed build columns once for every build row some probe row matched, and
+/// no probe column.
+fn build_semi_join(build_columns: Vec<usize>) -> JoinSpec {
+    let build_fields = int64_fields(build_columns.len());
+    JoinSpec {
+        probe_key_indices: vec![0],
+        build_key_indices: vec![0],
+        probe_output_indices: Vec::new(),
+        build_output_indices: build_columns,
+        probe_fields: Vec::new(),
+        build_fields,
+        kind: JoinKind::BuildSemi,
+        residual_filters: None,
+    }
+}
+
+#[test]
+fn build_semi_join_emits_only_the_matched_build_rows() {
+    let d = dispatch(4);
+    let build = values_input(&d, vec![int64_batch("id", &[10, 20, 30])]).record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &[20, 20, 99])]).record_batches();
+
+    let results = probe
+        .join(build, &[DataType::Int64], build_semi_join(vec![0]))
+        .collect()
+        .unwrap();
+
+    // 20 is matched twice and still comes out once; 99 names no build row.
+    assert_eq!(collect_i64s(&results, 0), vec![20]);
+    assert!(results.iter().all(|batch| batch.num_columns() == 1));
+}
+
+#[test]
+fn every_matched_build_row_reaches_a_build_semi_join_output() {
+    let d = dispatch(4);
+    let build_ids: Vec<i64> = (0..30_000).collect();
+    let probe_ids: Vec<i64> = (0..30_000).step_by(3).collect();
+    let build = values_input(&d, vec![int64_batch("id", &build_ids)]).record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &probe_ids)]).record_batches();
+
+    let results = probe
+        .join(build, &[DataType::Int64], build_semi_join(vec![0]))
+        .collect()
+        .unwrap();
+
+    let mut ids = collect_i64s(&results, 0);
+    ids.sort();
+    let expected: Vec<i64> = (0..30_000).step_by(3).collect();
+    assert_eq!(ids, expected);
+}
+
+#[test]
+fn a_build_semi_join_carries_the_build_columns_it_lists() {
+    let d = dispatch(4);
+    let build = values_input(
+        &d,
+        vec![two_int64_batch(("id", "score"), &[10, 20, 30], &[1, 2, 3])],
+    )
+    .record_batches();
+    let probe = values_input(&d, vec![int64_batch("id", &[30, 10])]).record_batches();
+
+    let results = probe
+        .join(build, &[DataType::Int64], build_semi_join(vec![1]))
+        .collect()
+        .unwrap();
+
+    // Only the listed score column comes out, not the key it was matched on.
+    let mut scores = collect_i64s(&results, 0);
+    scores.sort();
+    assert_eq!(scores, vec![1, 3]);
+    assert!(results.iter().all(|batch| batch.num_columns() == 1));
+}
+
 /// A mark join keyed on column 0 of both sides, emitting the listed probe
 /// columns plus the nullable boolean marker column after them.
 fn probe_mark_join(probe_columns: Vec<usize>) -> JoinSpec {

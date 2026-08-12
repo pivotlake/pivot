@@ -757,6 +757,13 @@ impl RecordBatchOperatorSpec {
             JoinKind::BuildAnti => {
                 self.join_typed::<K, true, false, false, true, false>(build, spec)
             }
+            // A build-side semi join is that anti join with the scan's
+            // polarity flipped, a runtime byte in the outputter, so it rides
+            // the same instantiation: matched pairs only flag their build
+            // row, and the scan emits the flagged rows instead.
+            JoinKind::BuildSemi => {
+                self.join_typed::<K, true, false, false, true, false>(build, spec)
+            }
             // A mark join classifies every probe row: the semi join's
             // first-match exit decides the hits, the probe-side miss tracking
             // the misses, and neither is ever a residual question (a mark
