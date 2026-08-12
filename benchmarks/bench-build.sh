@@ -4,7 +4,9 @@
 #
 # The inner loop of a perf run. setup-bench.sh builds baseline/ once and clones
 # it to working/; this rebuilds working/ against whatever the source tree holds
-# now, and never falls back to a clean rebuild:
+# now, and never falls back to a clean rebuild. The measured binary is pivot,
+# launched as `pivot server`; pivot-bench is the plain pgwire client that
+# drives it (see setup-bench.sh for the split). Costs:
 #
 #   nothing changed                       ~0s
 #   a workspace crate edited            ~229s   (that crate and the ones above it)
@@ -97,12 +99,12 @@ export NO_COLOR=1
 
 baseline="$root/baseline"
 working="$root/working"
+client="$root/target-client/release/pivot-bench"
 # The profile in force. Its contents change; its name and its mtime do not.
 active="$root/pgo/active.profdata"
 # This side's own profile, kept for provenance and copied into the slot above.
 profdata="$working/pgo/merged.profdata"
 host_target="$(rustc -vV | sed -n 's/^host: //p')"
-llvm_profdata="$(dirname "$(rustc --print target-libdir)")/bin/llvm-profdata"
 # Cargo names most profiles' directories after the profile, but not the two
 # built-in ones that predate named profiles.
 case "$cargo_profile" in
@@ -153,11 +155,16 @@ if [[ $regen_profile -eq 1 ]]; then
     # -Cprofile-generate keeps naming baseline's directory so this build has the
     # flags the cloned artifacts were made with and stays incremental. Where the
     # profiles land is settled at run time instead, by LLVM_PROFILE_FILE.
-    begin "building instrumented pivot-bench"
+    begin "building instrumented pivot server"
     ( cd "$crate_dir" \
         && PGO_DIR="$baseline/pgo" PGO_GEN_TARGET_DIR="$working/target-pgogen" \
-           just pgo-gen-build build --release --bin pivot-bench )
+           just pgo-gen-build build --release -p bin --bin pivot )
     elapsed "instrumented build"
+
+    begin "building the client (plain release, no profile flags)"
+    ( cd "$crate_dir" && CARGO_TARGET_DIR="$root/target-client" \
+        cargo build --release -p benchmarks --bin pivot-bench )
+    elapsed "client build"
 
     begin "profiling run over $pgo_source"
     rm -f "$working"/pgo/*.profraw
@@ -166,15 +173,20 @@ if [[ $regen_profile -eq 1 ]]; then
     # PIVOT_SPIN_LIMIT=0 parks idle workers immediately instead of spinning,
     # so the profile records the wait-heavy control-flow mix that cold runs
     # on the full dataset execute, deterministically rather than as a
-    # timing-dependent draw per build.
+    # timing-dependent draw per build. Both variables reach the instrumented
+    # server through the environment pivot-bench spawns it with; the client
+    # itself is not instrumented and writes nothing.
     LLVM_PROFILE_FILE="$working/pgo/default_%m_%p.profraw" PIVOT_SPIN_LIMIT=0 \
-        "$working/target-pgogen/$host_target/release/pivot-bench" \
-        --suite "$suite" --source "$pgo_source" \
+        "$client" --suite "$suite" \
+        --server-bin "$working/target-pgogen/$host_target/release/pivot" \
+        --source "$pgo_source" \
         --iterations "$iterations" --skip-check "${query_args[@]}"
     elapsed "profiling run"
 
     begin "installing the new profile"
-    "$llvm_profdata" merge -o "$profdata" "$working"/pgo/*.profraw
+    # The shared recipe fails loudly when the run produced no .profraw files,
+    # so a build can never quietly proceed un-PGOed.
+    ( cd "$crate_dir" && just pgo-merge "$profdata" "$working/pgo" )
     # Hold on to the slot's mtime across the overwrite. Cargo decides a crate is
     # stale by comparing dep-info entries' mtimes against the artifact, so
     # restoring it is what stops the 326 dependencies from rebuilding. Only the
@@ -198,25 +210,39 @@ if [[ $regen_profile -eq 1 ]]; then
     elapsed "profile install"
 fi
 
-begin "building profile-use pivot-bench (--profile $cargo_profile)"
+begin "building profile-use pivot server (--profile $cargo_profile)"
 ( cd "$crate_dir" \
     && PGO_USE_TARGET_DIR="$working/target-pgouse" \
-       just pgo-use-with "$active" build --profile "$cargo_profile" --bin pivot-bench )
+       just pgo-use-with "$active" build --profile "$cargo_profile" -p bin --bin pivot )
 elapsed "profile-use build"
+
+# Tripwire: fail loudly if the profile did not actually apply to the build.
+( cd "$crate_dir" && just pgo-verify "$working/target-pgouse/$host_target/$profile_dir/pivot" "$active" )
+
+# The client is rebuilt even without --regen-profile so a client-side change
+# (a new flag, a protocol tweak) is picked up; it is a no-op when nothing
+# changed. The regen path above already built it.
+if [[ $regen_profile -eq 0 ]]; then
+    begin "building the client (plain release, no profile flags)"
+    ( cd "$crate_dir" && CARGO_TARGET_DIR="$root/target-client" \
+        cargo build --release -p benchmarks --bin pivot-bench )
+    elapsed "client build"
+fi
 
 echo
 echo "=== ready ==="
-echo "baseline binary : $baseline/target-pgouse/$host_target/release/pivot-bench"
-echo "working  binary : $working/target-pgouse/$host_target/$profile_dir/pivot-bench"
-# An A/B compares the two binaries, so baseline has to have been built under
+echo "client binary   : $client"
+echo "baseline server : $baseline/target-pgouse/$host_target/$profile_dir/pivot"
+echo "working  server : $working/target-pgouse/$host_target/$profile_dir/pivot"
+# An A/B compares the two servers, so baseline has to have been built under
 # the same profile. Say so plainly rather than leaving a missing path to be
 # discovered when the comparison is run.
-if [[ ! -f "$baseline/target-pgouse/$host_target/$profile_dir/pivot-bench" ]]; then
+if [[ ! -f "$baseline/target-pgouse/$host_target/$profile_dir/pivot" ]]; then
     echo
-    echo "warning: baseline has no $cargo_profile binary, so there is nothing to"
+    echo "warning: baseline has no $cargo_profile server, so there is nothing to"
     echo "         compare against. Re-run setup-bench with --profile $cargo_profile."
     echo "         baseline currently holds:"
-    for built in "$baseline/target-pgouse/$host_target"/*/pivot-bench; do
+    for built in "$baseline/target-pgouse/$host_target"/*/pivot; do
         [[ -f "$built" ]] && echo "           $built"
     done
 fi
