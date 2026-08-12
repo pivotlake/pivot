@@ -145,10 +145,35 @@ restore_cache() {
     mkdir -p "$dest"
     if s3_get "$cache_prefix/$cache_key/$name.tar.zst" | tar -I 'zstd -d' -x -C "$dest" 2>/dev/null; then
         echo ">>> cache restored: $name"
+        refresh_sources_changed_since_build "$dest"
     else
         echo ">>> cache miss: $name (cold build)"
         # A partial extract from a truncated stream must not poison the build.
         rm -rf "${dest:?}"/*
+    fi
+}
+
+# Cargo trusts a restored artifact when no source file is newer than it, and
+# after a restore both clocks lie: checkout mtimes are commit times
+# (checkout_side restores them so warm artifacts can hit at all) and artifact
+# mtimes are whenever the tarball's run built them. A file whose last commit
+# predates the tarball then looks fresh even when the tarball was built from
+# a tree that never contained that commit, and cargo links new sources
+# against a stale dependency rlib. save_cache records the tree its artifacts
+# were built from; touching everything that changed since makes exactly those
+# files newer than every artifact. A tarball carrying no record (or one from
+# an unrelated history) gets every tracked file touched, trusting none of the
+# restored workspace units against these sources.
+refresh_sources_changed_since_build() {
+    local dest="$1"
+    local repo_root built_tree
+    repo_root="$(git -C "$dest" rev-parse --show-toplevel 2>/dev/null)" || return 0
+    built_tree="$(cat "$dest/.ab-built-from" 2>/dev/null || true)"
+    if [[ -n "$built_tree" ]] && git -C "$repo_root" cat-file -e "$built_tree" 2>/dev/null; then
+        git -C "$repo_root" diff --name-only -z "$built_tree" HEAD \
+            | (cd "$repo_root" && xargs -0 -r touch -c --)
+    else
+        git -C "$repo_root" ls-files -z | (cd "$repo_root" && xargs -0 -r touch -c --)
     fi
 }
 
@@ -167,6 +192,9 @@ save_cache() {
     local name="$1" src="$2"; shift 2
     local paths=("${@:-.}")
     [[ -n "$cache_prefix" && -d "$src" ]] || return 0
+    # Record which tree built these artifacts, for the restore-side staleness
+    # marking above. Directories outside a checkout (cargo-home) get none.
+    git -C "$src" rev-parse HEAD >"$src/.ab-built-from" 2>/dev/null || true
     (cd "$src" && mkdir -p "${paths[@]}")
     tar -I 'zstd -3 -T0' -c -C "$src" "${paths[@]}" | s3_put "$cache_prefix/$cache_key/$name.tar.zst"
     echo ">>> cache saved: $name"
