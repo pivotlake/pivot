@@ -1,5 +1,5 @@
 //! [`Join`] — a hash equi-join of two inputs: inner, outer on either side,
-//! semi on the probe side, or anti on either side.
+//! or semi or anti on either side.
 //!
 //! The first input is the probe side and the second the build side, mirroring
 //! DuckDB's convention of building the hash table from the right child (its
@@ -47,6 +47,9 @@ pub enum JoinKind {
     /// One output row per build row no probe row matched, and no probe
     /// columns (see [`Join::probe_output`]).
     BuildAnti,
+    /// One output row per build row some probe row matched, once however many
+    /// matched it, and no probe columns (see [`Join::probe_output`]).
+    BuildSemi,
     /// One output row per probe row, the listed probe columns plus a nullable
     /// boolean marker column after them: TRUE on a match, FALSE on a miss,
     /// NULL where SQL's three-valued `IN` cannot call the miss FALSE. No
@@ -74,7 +77,9 @@ pub struct Join {
     pub key_types: Vec<Type>,
     /// The probe input columns the join emits, in output order. Always empty
     /// for a [`BuildAnti`](JoinKind::BuildAnti) join, whose output rows have
-    /// no probe row to take values from.
+    /// no probe row to take values from, and for a
+    /// [`BuildSemi`](JoinKind::BuildSemi) join, whose output rows have no
+    /// single one.
     pub probe_output: Vec<usize>,
     /// The build input columns the join emits after the probe columns. Always
     /// empty for a [`ProbeSemi`](JoinKind::ProbeSemi) join, which emits a probe
@@ -110,6 +115,7 @@ impl fmt::Display for Join {
             JoinKind::ProbeSemi => "Join[probe semi]",
             JoinKind::ProbeAnti => "Join[probe anti]",
             JoinKind::BuildAnti => "Join[build anti]",
+            JoinKind::BuildSemi => "Join[build semi]",
             JoinKind::ProbeMark => "Join[probe mark]",
             JoinKind::Range(RangeCompare::Less) => "Join[range <]",
             JoinKind::Range(RangeCompare::LessEq) => "Join[range <=]",
@@ -189,6 +195,7 @@ impl Join {
             JoinKind::ProbeSemi => DispatchJoinKind::ProbeSemi,
             JoinKind::ProbeAnti => DispatchJoinKind::ProbeAnti,
             JoinKind::BuildAnti => DispatchJoinKind::BuildAnti,
+            JoinKind::BuildSemi => DispatchJoinKind::BuildSemi,
             JoinKind::ProbeMark => DispatchJoinKind::ProbeMark,
             JoinKind::Range(_) => unreachable!("compiled above"),
         };
