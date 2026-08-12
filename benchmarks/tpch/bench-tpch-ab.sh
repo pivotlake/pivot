@@ -23,7 +23,10 @@
 #
 # With --duckdb, DuckDB gets the same stream shape as a reference column via
 # run-duckdb.sh: caches dropped once before the stream, the same gap between
-# queries, no drops in between. It never gates.
+# queries, no drops in between. It never gates. It runs over DuckDB's own
+# native database of the same data (restored from the archive
+# fetch-native-dbs.sh documents), so the column is each engine on its own
+# storage rather than DuckDB penalized by parquet reading.
 #
 # The box-side machinery it shares with the other A/B harnesses (NVMe mount,
 # checkouts, S3 dataset sync, warm-cache restore/save, PGO builds,
@@ -159,14 +162,14 @@ run_power() {
         | sed -E 's/^.*Query (q[0-9]+).*[[:space:]]([0-9]+)ms$/\1 \2/'
 }
 
-# The same stream shape for DuckDB via run-duckdb.sh: the caller drops caches
-# once before the stream, the runner never does (--no-drop-caches), and the
-# same gap separates queries. Query files come from the after checkout.
-# Echoes "<query> <ms>" per line.
+# The same stream shape for DuckDB via run-duckdb.sh, over its native
+# database: the caller drops caches once before the stream, the runner never
+# does (--no-drop-caches), and the same gap separates queries. Query files
+# come from the after checkout. Echoes "<query> <ms>" per line.
 run_duckdb_power() {
     local out
     out="$(bash "$duckdb_runner" --suite-dir "$after_dir/benchmarks/tpch" \
-        --source "$measure_data" --query "$queries" \
+        --data native --source "$native_db" --query "$queries" \
         --iterations 1 --sleep "$power_sleep" --no-drop-caches 2>&1)" || true
     awk '/^=== q[0-9]+ ===$/ { query = $2; next }
         /Run Time/ {
@@ -184,6 +187,17 @@ data_dev="$(df --output=source "$(dirname "$data_root")" | tail -1 | sed 's|/dev
 
 ( sync_scale "$sf_pgo"; sync_scale "$sf_measure" ) &
 sync_pid=$!
+
+# The DuckDB reference column reads a native database of the same data;
+# restore it beside the datasets while the builds run.
+native_db="$(dirname "$data_root")/tpch-native.duckdb"
+native_pid=""
+if [[ "$run_duckdb" == "1" && ! -f "$native_db" ]]; then
+    ( aws s3 cp "s3://epsio-tpch/native/tpch-native-duckdb.tar.zst" - --only-show-errors \
+        | tar -I "zstd -T0" -xf - -C "$(dirname "$data_root")" \
+        && echo ">>> native duckdb database restored" ) &
+    native_pid=$!
+fi
 
 echo ">>> fetching commits into the baked clone"
 if [[ -n "$repo_url" ]]; then
@@ -301,6 +315,10 @@ fi
 rows="/tmp/ab-rows.tsv"
 : >"$rows"
 stream="/tmp/ab-stream.txt"
+if [[ -n "$native_pid" ]] && ! wait "$native_pid"; then
+    echo "error: native duckdb database restore failed" >&2
+    exit 1
+fi
 echo ">>> measuring (power passes=$passes, ${power_sleep}ms between queries, mode=$mode)"
 for pass in $(seq "$passes"); do
     drop_caches; sleep 3
@@ -329,6 +347,7 @@ done
     echo "=== TPC-H A/B: '$before_label' (before) vs '$after_label' (after) ==="
     echo "mode=$mode source=$measure_data passes=$passes regression_pct=$regression_pct"
     echo "shape: cold power runs; per side and pass, one process streams every query once, ${power_sleep}ms apart, caches dropped only before the stream; cold = per-query min across passes"
+    [[ "$run_duckdb" == "1" ]] && echo "duckdb column: DuckDB over its native database of the same data ($native_db)"
     [[ -n "$bench_env" ]] && echo "bench_env=$bench_env"
     [[ "$mode" == "release" ]] && echo "NOTE: release mode is non-PGO; numbers carry code-alignment noise, use for iteration only"
     echo "correctness (before vs after, 1e-6 relative): $correctness"
