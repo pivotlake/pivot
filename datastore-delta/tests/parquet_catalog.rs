@@ -6,6 +6,8 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use arrow_array::cast::AsArray;
+use arrow_array::types::Int32Type;
 use arrow_array::{
     ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, Scalar, StringArray,
     StringViewArray, TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
@@ -1994,4 +1996,124 @@ fn variant_pushdown_prunes_by_a_nested_shredded_path() {
         .unwrap();
 
     assert_eq!(row_group_count(&datastore, "docs", &table), 1);
+}
+
+/// Row `i`'s payload in [`banded_table`], wide enough that a query selecting a
+/// few rows out of it is one DuckDB late-materializes.
+fn payload_of(row: usize) -> String {
+    format!("payload-{row:08}-{}", "x".repeat(200))
+}
+
+/// A table cut into eight row groups whose `band` column is the row group's own
+/// index, so a `band = k` predicate eliminates every other row group by its
+/// statistics. Late materialization addresses rows by their row group's
+/// position, which makes that pruning observable: a re-read that numbered row
+/// groups differently from the scan returns another band's payloads.
+fn banded_table() -> (TempDir, Vec<Column>) {
+    let rows = 4096usize;
+    let per_group = 512usize;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("band", DataType::Int32, false),
+        Field::new("payload", DataType::Utf8View, false),
+        Field::new("note", DataType::Utf8View, false),
+    ]));
+    let payloads: Vec<String> = (0..rows).map(payload_of).collect();
+    let views: Vec<&str> = payloads.iter().map(String::as_str).collect();
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(
+                (0..rows)
+                    .map(|i| (i / per_group) as i32)
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringViewArray::from(views.clone())) as ArrayRef,
+            Arc::new(StringViewArray::from(views)) as ArrayRef,
+        ],
+    )
+    .unwrap();
+
+    let dir = TempDir::new().unwrap();
+    let props = WriterProperties::builder()
+        .set_statistics_enabled(EnabledStatistics::Chunk)
+        .set_compression(parquet::basic::Compression::SNAPPY)
+        .set_max_row_group_row_count(Some(per_group))
+        .build();
+    let file = File::create(dir.path().join("data.parquet")).unwrap();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let columns = vec![
+        Column {
+            name: "band".to_string(),
+            col_type: Type::Int32,
+        },
+        Column {
+            name: "payload".to_string(),
+            col_type: Type::Utf8,
+        },
+        Column {
+            name: "note".to_string(),
+            col_type: Type::Utf8,
+        },
+    ];
+    (dir, columns)
+}
+
+/// A late-materialized query whose predicate also prunes row groups returns the
+/// rows it asked for.
+///
+/// The narrow scan hands the materializer a row group's position in the view it
+/// scanned, which the pushed `band` predicate has pruned. Re-reading from the
+/// unpruned view resolves those positions to different row groups, which shows
+/// up here as another band's payloads rather than as an error.
+#[test]
+fn late_materialization_reads_the_scanned_row_groups() {
+    let (dir, columns) = banded_table();
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
+
+    let batches = run_sql(
+        &datastore,
+        "SELECT payload, note FROM t WHERE band = 6 ORDER BY payload LIMIT 4",
+    );
+
+    let got: Vec<String> = batches
+        .iter()
+        .flat_map(|batch| {
+            let column = batch.column(0).as_string_view();
+            (0..batch.num_rows()).map(move |i| column.value(i).to_string())
+        })
+        .collect();
+    let expected: Vec<String> = (6 * 512..6 * 512 + 4).map(payload_of).collect();
+    assert_eq!(got, expected);
+}
+
+/// The defect stated without reference to any expected row: a `band = 6` query
+/// must not return rows whose `band` is something else.
+///
+/// When the pushed `band` predicate prunes row groups, the late re-read
+/// resolves the scan's row-group positions against an unpruned list and returns
+/// a different row group's rows entirely, so the output contradicts the
+/// predicate that produced it.
+#[test]
+fn late_materialization_rows_satisfy_their_own_predicate() {
+    let (dir, columns) = banded_table();
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
+
+    let batches = run_sql(
+        &datastore,
+        "SELECT band, payload, note FROM t WHERE band = 6 ORDER BY payload LIMIT 4",
+    );
+
+    let bands: Vec<i32> = batches
+        .iter()
+        .flat_map(|batch| {
+            let column = batch.column(0).as_primitive::<Int32Type>();
+            (0..batch.num_rows()).map(move |i| column.value(i))
+        })
+        .collect();
+    assert_eq!(bands, vec![6; 4]);
 }
