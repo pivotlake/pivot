@@ -10,6 +10,7 @@
 use std::ops::Range;
 use std::sync::Arc;
 
+use arrow_array::ArrowNativeTypeOp;
 use arrow_array::cast::AsArray;
 use arrow_array::types::ArrowPrimitiveType;
 use arrow_array::{RecordBatch, RecordBatchOptions};
@@ -32,7 +33,7 @@ pub struct RangeProbe<T: ArrowPrimitiveType> {
 
 impl<T: ArrowPrimitiveType> RangeProbe<T>
 where
-    T::Native: Ord,
+    T::Native: ArrowNativeTypeOp,
 {
     pub(crate) fn new(table: RangeTable<T>, spec: Arc<RangeJoinSpec>) -> Self {
         let batch_builder = JoinedBatchBuilder::new(&spec);
@@ -46,7 +47,7 @@ where
 
 impl<T: ArrowPrimitiveType> Unary<RecordBatch, RecordBatch> for RangeProbe<T>
 where
-    T::Native: Ord + Send,
+    T::Native: ArrowNativeTypeOp + Send,
 {
     fn consume(
         &mut self,
@@ -134,13 +135,13 @@ fn find_build_boundary<T: ArrowPrimitiveType>(
     comparison: RangeCompare,
 ) -> BuildBoundary
 where
-    T::Native: Ord,
+    T::Native: ArrowNativeTypeOp,
 {
     let build_key_is_before_boundary = |build_key: T::Native| {
         if comparison.splits_at_lower_bound() {
-            build_key < probe_key
+            build_key.is_lt(probe_key)
         } else {
-            build_key <= probe_key
+            build_key.is_le(probe_key)
         }
     };
 
