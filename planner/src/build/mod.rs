@@ -348,11 +348,15 @@ fn absorb_scan_pushdown_filter(node: PlanNode) -> PlanNode {
 fn build_join(
     op: LogicalOp<'_>,
     join: ComparisonJoinView<'_>,
-    inputs: Vec<PlanNode>,
+    mut inputs: Vec<PlanNode>,
 ) -> Result<PlanNode, OperatorError> {
+    let probe_types = inputs[0].output_types()?;
+    let build_types = inputs[1].output_types()?;
     let mut probe_keys = Vec::new();
     let mut build_keys = Vec::new();
     let mut key_types = Vec::new();
+    let mut computed_probe_keys = Vec::new();
+    let mut computed_build_keys = Vec::new();
     let mut residual_predicates = Vec::new();
     let mut inequalities = Vec::new();
     for entry in join.conditions()? {
@@ -367,8 +371,16 @@ fn build_join(
             inequalities.push(condition);
             continue;
         }
-        let (probe_key, probe_key_type) = join_key_ref(Expression::from_handle(condition.left)?)?;
-        let (build_key, build_key_type) = join_key_ref(Expression::from_handle(condition.right)?)?;
+        let (probe_key, probe_key_type) = join_key_expression(
+            Expression::from_handle(condition.left)?,
+            probe_types.len(),
+            &mut computed_probe_keys,
+        )?;
+        let (build_key, build_key_type) = join_key_expression(
+            Expression::from_handle(condition.right)?,
+            build_types.len(),
+            &mut computed_build_keys,
+        )?;
         if probe_key_type != build_key_type {
             return Err(OperatorError::Unsupported(format!(
                 "join key types differ: {probe_key_type:?} vs {build_key_type:?} \
@@ -385,12 +397,29 @@ fn build_join(
     if key_types.is_empty() {
         return build_range_join(op, join, inputs, inequalities, residual_predicates);
     }
+    // A computed key moves that side's columns behind a projection, but a
+    // residual's refs were resolved against the sides' unextended widths;
+    // nothing needs the combination yet, so it stays loud rather than
+    // re-binding the residuals around the appended columns.
+    let has_computed_keys = !computed_probe_keys.is_empty() || !computed_build_keys.is_empty();
+    let has_residual_conditions = !residual_predicates.is_empty() || !inequalities.is_empty();
+    if has_computed_keys && has_residual_conditions {
+        return Err(OperatorError::Unsupported(
+            "computed join keys beside residual join conditions are not supported".to_string(),
+        ));
+    }
+    if !computed_probe_keys.is_empty() {
+        let probe = inputs.remove(0);
+        inputs.insert(0, append_computed_keys(probe, computed_probe_keys)?);
+    }
+    if !computed_build_keys.is_empty() {
+        let build = inputs.pop().expect("a join has two inputs");
+        inputs.push(append_computed_keys(build, computed_build_keys)?);
+    }
     let mut residual_filters = residual_predicates
         .into_iter()
         .map(Expression::from_handle)
         .collect::<Result<Vec<_>, _>>()?;
-
-    let probe_types = inputs[0].output_types()?;
     // A non-equality comparison condition beside the hash equalities (e.g.
     // `l = r AND a <> b`) rides the join as one more residual over the
     // key-matched pairs. Its left operand was resolved against the probe
@@ -414,7 +443,6 @@ fn build_join(
             return_type: Type::Boolean,
         }));
     }
-    let build_types = inputs[1].output_types()?;
     let left_map: Vec<usize> = join.left_projection_map()?;
     let right_map: Vec<usize> = join.right_projection_map()?;
 
@@ -658,7 +686,12 @@ fn join_key_ref(key: Expression) -> Result<(usize, Type), OperatorError> {
             "join keys must be plain columns, got: {key:?}"
         )));
     };
-    match key.return_type {
+    Ok((key.column_idx, joinable_key_type(key.return_type)?))
+}
+
+/// The key's type if a hash join can key on it, an error otherwise.
+fn joinable_key_type(key_type: Type) -> Result<Type, OperatorError> {
+    match key_type {
         Type::Int8
         | Type::Int16
         | Type::Int32
@@ -671,12 +704,59 @@ fn join_key_ref(key: Expression) -> Result<(usize, Type), OperatorError> {
         | Type::Decimal { .. }
         | Type::Date
         | Type::Timestamp
-        | Type::Utf8 => Ok((key.column_idx, key.return_type)),
+        | Type::Utf8 => Ok(key_type),
         _ => Err(OperatorError::Unsupported(format!(
-            "Unsupported join key type: {:?}",
-            key.return_type
+            "Unsupported join key type: {key_type:?}"
         ))),
     }
+}
+
+/// One side of a join equality: a plain column keys the join directly, and a
+/// computed expression (e.g. `substring(phone, 1, 2) IN (...)` arriving as a
+/// mark join keyed on the substring) is appended to `computed_keys`, to be
+/// projected onto the end of that side's input, and keys the join at the
+/// appended position.
+fn join_key_expression(
+    key: Expression,
+    input_width: usize,
+    computed_keys: &mut Vec<Expression>,
+) -> Result<(usize, Type), OperatorError> {
+    if matches!(key, Expression::Ref(_)) {
+        return join_key_ref(key);
+    }
+    let key_type = joinable_key_type(key.result_type().map_err(|error| {
+        OperatorError::Unsupported(format!("cannot type the join key {key}: {error}"))
+    })?)?;
+    let index = input_width + computed_keys.len();
+    computed_keys.push(key);
+    Ok((index, key_type))
+}
+
+/// Wrap `input` in a projection that passes its columns through and appends
+/// `computed_keys` after them, so a join can key on the appended columns
+/// while every existing column index stays valid.
+fn append_computed_keys(
+    input: PlanNode,
+    computed_keys: Vec<Expression>,
+) -> Result<PlanNode, OperatorError> {
+    let types = input.output_types()?;
+    let projections = types
+        .iter()
+        .enumerate()
+        .map(|(column_idx, column_type)| {
+            Expression::Ref(Ref {
+                column_idx,
+                return_type: column_type.clone(),
+                name: None,
+            })
+        })
+        .chain(computed_keys)
+        .collect();
+    Ok(PlanNode {
+        name: "JOIN_KEY_COMPUTE".to_string(),
+        inputs: vec![input],
+        operator: Operator::Projection(Projection { projections }),
+    })
 }
 
 /// A scan's projected output columns (and a filter's `projection_map`), each a
