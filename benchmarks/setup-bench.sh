@@ -5,10 +5,19 @@
 # iteration is an incremental rebuild of the working side instead of two PGO
 # builds from scratch.
 #
+# The measured binary is pivot, launched as `pivot server`. pivot-bench is a
+# thin pgwire client that spawns the server, drives the workload and times it,
+# and carries no engine code, so the server is what gets instrumented and
+# profile-used here, mirroring lib/bench-ab-common.sh and build-ab-servers.sh. The
+# client gets one plain release build under target-client/, shared by both
+# sides: it is not what is measured, and giving it profile flags would rebuild
+# it under every fresh profile for nothing.
+#
 # Layout under --root (default ~/bench):
 #
 #   baseline/  pgo/  target-pgogen/  target-pgouse/
 #   working/   pgo/  target-pgogen/  target-pgouse/
+#   target-client/
 #
 # Both sides are built from the one source tree this script lives in, and that
 # tree must stay where it is afterwards. Cargo records absolute paths in its
@@ -17,11 +26,12 @@
 # from scratch and make these warm target dirs worthless. Two artifact trees
 # over one source tree is what keeps the working side incremental.
 #
-# baseline/ is built once: an instrumented pivot-bench, a profiling run over
-# the small subset, the merged profile, then the profile-use build. working/
-# then starts as a byte-identical copy (cp -a preserves mtimes, so cargo sees
-# every unit as fresh), which is what makes the first build after an edit
-# recompile only the crates that changed.
+# baseline/ is built once: an instrumented pivot binary, a profiling run over
+# the small subset (the client driving the instrumented server), the merged
+# profile, then the profile-use build. working/ then starts as a byte-identical
+# copy (cp -a preserves mtimes, so cargo sees every unit as fresh), which is
+# what makes the first build after an edit recompile only the crates that
+# changed.
 #
 # Re-running is cheap: the cargo builds are no-ops when nothing changed, and
 # the profiling run - the one expensive non-cargo step - is skipped when a
@@ -58,7 +68,7 @@ cargo_profile="profiling"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --root)          root="$2"; shift 2 ;;
-        # Small dataset the instrumented binary runs over to produce the
+        # Small dataset the instrumented server runs over to produce the
         # profile. Never a measurement dataset: instrumented code is ~80x
         # slower, and the numbers that matter come off the full one.
         --pgo-source)    pgo_source="$2"; shift 2 ;;
@@ -66,7 +76,7 @@ while [[ $# -gt 0 ]]; do
         --iterations)    iterations="$2"; shift 2 ;;
         # Queries to profile over. Default is every query the suite ships.
         --query)         queries="$2"; shift 2 ;;
-        # Cargo profile for the measured binary. The default, profiling,
+        # Cargo profile for the measured server. The default, profiling,
         # inherits release and adds debug info, so perf can attribute to source
         # lines and resolve inlined frames. Codegen is unchanged, so timings are
         # release timings. Pass the same profile to bench-build, or the two
@@ -105,8 +115,15 @@ pgo_source="$(expand_tilde "$pgo_source")"
 
 # cargo, just and llvm-profdata live under the login home but not on the
 # non-interactive ssh PATH, so add them explicitly.
-export PATH="$PATH:$HOME/.cargo/bin:$HOME/.local/bin"
+export PATH="$PATH:$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin"
 export NO_COLOR=1
+
+command -v ld.lld >/dev/null || {
+    echo "error: ld.lld is not installed, and the instrumented build links with it" >&2
+    echo "       (instrumentation grows the text past the aarch64 128MB branch" >&2
+    echo "       range, which GNU ld fails). Install it: sudo apt-get install -y lld" >&2
+    exit 2
+}
 
 baseline="$root/baseline"
 working="$root/working"
@@ -117,10 +134,10 @@ profdata="$baseline/pgo/merged.profdata"
 # pgo/ directory and copied into this slot when it should be the one in force.
 active="$root/pgo/active.profdata"
 host_target="$(rustc -vV | sed -n 's/^host: //p')"
-llvm_profdata="$(dirname "$(rustc --print target-libdir)")/bin/llvm-profdata"
-# The instrumented binary is always release: the profile records which branches
+# The instrumented server is always release: the profile records which branches
 # are hot, and debug info neither helps that nor survives into the final build.
-instrumented="$baseline/target-pgogen/$host_target/release/pivot-bench"
+instrumented="$baseline/target-pgogen/$host_target/release/pivot"
+client="$root/target-client/release/pivot-bench"
 # Cargo names most profiles' directories after the profile, but not the two
 # built-in ones that predate named profiles.
 case "$cargo_profile" in
@@ -154,26 +171,38 @@ export PGO_DIR="$baseline/pgo"
 export PGO_GEN_TARGET_DIR="$baseline/target-pgogen"
 export PGO_USE_TARGET_DIR="$baseline/target-pgouse"
 
-begin "building instrumented pivot-bench"
-( cd "$crate_dir" && just pgo-gen-build build --release --bin pivot-bench )
+begin "building instrumented pivot server"
+( cd "$crate_dir" && just pgo-gen-build build --release -p bin --bin pivot )
 elapsed "instrumented build"
+
+begin "building the client (plain release, no profile flags)"
+( cd "$crate_dir" && CARGO_TARGET_DIR="$root/target-client" \
+    cargo build --release -p benchmarks --bin pivot-bench )
+elapsed "client build"
 
 if [[ -f "$profdata" && $regen_profile -eq 0 ]]; then
     echo
     echo ">>> reusing existing profile $profdata (pass --regen-profile to rebuild it)"
 else
-    begin "profiling run over $pgo_source (instrumented, expect it to crawl)"
+    begin "profiling run over $pgo_source (instrumented server, expect it to crawl)"
     rm -f "$baseline"/pgo/*.profraw "$profdata"
     query_args=()
     [[ -n "$queries" ]] && query_args=(--query "$queries")
-    "$instrumented" --suite "$suite" --source "$pgo_source" \
-        --iterations "$iterations" --skip-check "${query_args[@]}"
+    # PIVOT_SPIN_LIMIT=0 parks idle workers immediately instead of spinning,
+    # so the profile records the wait-heavy control-flow mix that cold runs
+    # on the full dataset execute, deterministically rather than as a
+    # timing-dependent draw per build. Both variables reach the instrumented
+    # server through the environment pivot-bench spawns it with; the client
+    # itself is not instrumented and writes nothing.
+    LLVM_PROFILE_FILE="$baseline/pgo/%m-%p.profraw" PIVOT_SPIN_LIMIT=0 \
+        "$client" --suite "$suite" --server-bin "$instrumented" \
+        --source "$pgo_source" --iterations "$iterations" --skip-check "${query_args[@]}"
     elapsed "profiling run"
 
     begin "merging profiles"
-    # Merge the raw profiles by name rather than handing over the directory, so
-    # a stale merged.profdata sitting there is never folded back into itself.
-    "$llvm_profdata" merge -o "$profdata" "$baseline"/pgo/*.profraw
+    # The shared recipe fails loudly when the run produced no .profraw files,
+    # so a build can never quietly proceed un-PGOed.
+    ( cd "$crate_dir" && just pgo-merge "$profdata" "$baseline/pgo" )
     elapsed "merge"
 fi
 
@@ -181,9 +210,12 @@ fi
 # genuinely being built against a new profile.
 cp "$profdata" "$active"
 
-begin "building profile-use pivot-bench (--profile $cargo_profile)"
-( cd "$crate_dir" && just pgo-use-with "$active" build --profile "$cargo_profile" --bin pivot-bench )
+begin "building profile-use pivot server (--profile $cargo_profile)"
+( cd "$crate_dir" && just pgo-use-with "$active" build --profile "$cargo_profile" -p bin --bin pivot )
 elapsed "profile-use build"
+
+# Tripwire: fail loudly if the profile did not actually apply to the build.
+( cd "$crate_dir" && just pgo-verify "$baseline/target-pgouse/$host_target/$profile_dir/pivot" "$active" )
 
 baseline_kb="$(du -sk "$baseline" | cut -f1)"
 free_kb="$(df -Pk "$root" | awk 'NR == 2 { print $4 }')"
@@ -201,7 +233,8 @@ elapsed "clone"
 
 echo
 echo "=== ready ==="
-echo "baseline binary : $baseline/target-pgouse/$host_target/$profile_dir/pivot-bench"
-echo "working  binary : $working/target-pgouse/$host_target/$profile_dir/pivot-bench"
+echo "client binary   : $client"
+echo "baseline server : $baseline/target-pgouse/$host_target/$profile_dir/pivot"
+echo "working  server : $working/target-pgouse/$host_target/$profile_dir/pivot"
 echo "baseline profile: $profdata"
 echo "profile in force: $active"
