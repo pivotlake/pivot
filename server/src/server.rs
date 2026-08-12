@@ -20,9 +20,11 @@
 //! tasks watch that same exit flag and self-exit, so the server no longer
 //! orchestrates them.
 
-use crate::query_handler::{PivotHandlers, PlanCache};
+use crate::query_handler::PivotHandlers;
 use catalog::PivotCatalog;
-use dispatch::{DataFlowDispatcher, Dispatch, Shutdown};
+#[cfg(test)]
+use dispatch::DataFlowDispatcher;
+use dispatch::{Dispatch, Shutdown};
 use metastore::Metastore;
 use pgwire::tokio::process_socket;
 use std::io;
@@ -78,11 +80,8 @@ pub struct Server {
     bind: SocketAddr,
     worker_watchers: JoinSet<std::thread::Result<()>>,
     shutdown: Shutdown,
-    /// Planned read queries shared by the PostgreSQL and in-process HTTP paths.
-    plan_cache: Arc<PlanCache>,
-    /// Cloned dispatcher, kept for the query handler (compiling plans) and the
-    /// bundled web console's in-process queries.
-    dispatcher: DataFlowDispatcher,
+    /// Transport-neutral statement executor shared by PostgreSQL and HTTP.
+    query_engine: Arc<engine::Engine>,
     /// Every datastore, presented as one composite catalog. Query binding and
     /// dashboard access start here. [`serve`](Self::serve) starts each datastore's
     /// background maintenance when it begins serving and aborts it on shutdown,
@@ -120,13 +119,12 @@ impl Server {
         for handle in handles {
             watchers.spawn_blocking(move || handle.join());
         }
-        let plan_cache = Arc::new(PlanCache::default());
+        let query_engine = Arc::new(engine::Engine::new(catalog.clone(), dispatcher.clone()));
         Self {
             bind,
             shutdown,
             worker_watchers: watchers,
-            plan_cache,
-            dispatcher,
+            query_engine,
             catalog,
             http_bind: None,
             metastore,
@@ -155,9 +153,7 @@ impl Server {
         info!(addr = %self.bind, "listening for psql connections");
 
         let handlers = Arc::new(PivotHandlers::new(
-            self.catalog.clone(),
-            self.dispatcher.clone(),
-            self.plan_cache.clone(),
+            self.query_engine.clone(),
             self.metastore.clone(),
         ));
 
@@ -177,8 +173,7 @@ impl Server {
             );
             let state = crate::http::IntrospectState::new(
                 self.catalog.clone(),
-                self.dispatcher.clone(),
-                self.plan_cache.clone(),
+                self.query_engine.clone(),
             );
             tokio::spawn(async move {
                 if let Err(e) = crate::http::serve(bind, state, std::future::pending()).await {

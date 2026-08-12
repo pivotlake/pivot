@@ -1,0 +1,27 @@
+[package]
+name = "shell"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "pivot"
+path = "src/main.rs"
+
+[dependencies]
+catalog = { workspace = true }
+datastore-delta = { workspace = true }
+dispatch = { workspace = true }
+engine = { workspace = true }
+metastore = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+
+clap = { workspace = true }
+rustyline = { version = "18", default-features = false }
+sysinfo = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+unicode-width = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

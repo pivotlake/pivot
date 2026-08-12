@@ -134,14 +134,7 @@ pub(super) async fn rowgroups_page(
         limit,
         page.offset,
     );
-    match crate::query_handler::execute_sql(
-        state.catalog.clone(),
-        state.dispatcher.clone(),
-        state.plan_cache.clone(),
-        sql,
-    )
-    .await
-    {
+    match crate::query_handler::execute_sql(state.query_engine.clone(), sql).await {
         Ok(batches) => {
             let (columns, rows) = batches_to_json(&batches);
             let has_more = rows.len() >= limit;

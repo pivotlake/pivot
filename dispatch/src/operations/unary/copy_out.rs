@@ -8,11 +8,11 @@
 //! (possibly on a non-worker thread), `WriteBuffer::drop` runs against
 //! whatever `memory_ctx()` that thread happens to have, which is brittle.
 //!
-//! `CopyOut` sits at the boundary where a batch leaves "ring land" and
+//! [`copy_out`] sits at the boundary where a batch leaves "ring land" and
 //! enters "anyone can hold it" land. For every column it emits, every buffer
 //! is a fresh `Buffer::from_slice_ref` — owned by a plain `Vec<u8>` whose
 //! `Drop` is just `dealloc`. The original `Arc<WriteBuffer>`s drop on *this*
-//! worker thread when `consume` returns, so the ring slots return to the
+//! worker thread when the conversion returns, so the ring slots return to the
 //! right pool immediately.
 //!
 //! Cost is one memcpy per batch's payload. Cheap compared to producing the
@@ -20,47 +20,27 @@
 //! the consumer thread, no cross-thread slot bookkeeping, no surprises in
 //! `Drop`.
 
-use crate::operations::channels::Sender;
-use crate::operations::unary::{self, Unary, UnaryFactory};
+use crate::operations::unary;
 use arrow::array::{Array, ArrayData};
 use arrow_array::{RecordBatch, RecordBatchOptions, make_array};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
 
-/// Stateless factory — one trivial instance per worker.
-pub struct CopyOutFactory;
+/// Deep-copy one ring-backed batch into ordinary heap allocations.
+pub(crate) fn copy_out(batch: RecordBatch) -> unary::Result<RecordBatch> {
+    let schema = batch.schema();
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|column| Ok(make_array(copy_to_malloc(&column.to_data())?)))
+        .collect::<unary::Result<Vec<_>>>()?;
 
-impl UnaryFactory<RecordBatch, RecordBatch> for CopyOutFactory {
-    type Unary = CopyOut;
-
-    fn build_unary(self) -> Self::Unary {
-        CopyOut
-    }
-}
-
-pub struct CopyOut;
-
-impl Unary<RecordBatch, RecordBatch> for CopyOut {
-    fn consume(
-        &mut self,
-        batch: RecordBatch,
-        sender: &mut dyn Sender<RecordBatch>,
-    ) -> unary::Result<()> {
-        let schema = batch.schema();
-        let columns = batch
-            .columns()
-            .iter()
-            .map(|c| Ok(make_array(copy_to_malloc(&c.to_data())?)))
-            .collect::<unary::Result<Vec<_>>>()?;
-
-        // Carry the row count explicitly: a batch with no columns (e.g. a
-        // metadata-only / row-count scan) has no column lengths to infer it from,
-        // and `RecordBatch::try_new` would reject it.
-        let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
-        sender.send(RecordBatch::try_new_with_options(
-            schema, columns, &options,
-        )?)?;
-        Ok(())
-    }
+    // Carry the row count explicitly: a batch with no columns (e.g. a
+    // metadata-only / row-count scan) has no column lengths to infer it from,
+    // and `RecordBatch::try_new` would reject it.
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    Ok(RecordBatch::try_new_with_options(
+        schema, columns, &options,
+    )?)
 }
 
 /// Recursively copy every `Buffer`, null buffer, and child `ArrayData` into
@@ -100,7 +80,6 @@ fn copy_to_malloc(data: &ArrayData) -> unary::Result<ArrayData> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operations::unary::test_utils::run_unary;
     use arrow_array::{
         Array, ArrayRef, Int32Array, Int64Array, ListArray, StringArray, StringViewArray,
     };
@@ -112,7 +91,7 @@ mod tests {
     }
 
     // A batch with no columns carries its row count only in metadata, not in
-    // column lengths. CopyOut must preserve it — round-tripping through plain
+    // column lengths. Copy-out must preserve it; round-tripping through plain
     // `RecordBatch::try_new` would drop the count and fail to rebuild the batch
     // (e.g. a metadata-only / row-count scan feeding `collect`).
     #[test]
@@ -124,11 +103,10 @@ mod tests {
         )
         .unwrap();
 
-        let out = run_unary(CopyOut, vec![input]);
+        let out = copy_out(input).unwrap();
 
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].num_columns(), 0);
-        assert_eq!(out[0].num_rows(), 7);
+        assert_eq!(out.num_columns(), 0);
+        assert_eq!(out.num_rows(), 7);
     }
 
     #[test]
@@ -139,10 +117,9 @@ mod tests {
         )
         .unwrap();
 
-        let out = run_unary(CopyOut, vec![input.clone()]);
+        let out = copy_out(input.clone()).unwrap();
 
-        assert_eq!(out.len(), 1);
-        assert_eq!(&out[0], &input);
+        assert_eq!(out, input);
     }
 
     #[test]
@@ -155,10 +132,10 @@ mod tests {
         )
         .unwrap();
 
-        let out = run_unary(CopyOut, vec![input]);
+        let out = copy_out(input).unwrap();
 
         // Assert: the emitted batch points at a different allocation.
-        let emitted_ptr = out[0].column(0).to_data().buffers()[0].as_ptr();
+        let emitted_ptr = out.column(0).to_data().buffers()[0].as_ptr();
         assert_ne!(original_ptr, emitted_ptr);
     }
 
@@ -170,10 +147,9 @@ mod tests {
         )
         .unwrap();
 
-        let out = run_unary(CopyOut, vec![input.clone()]);
+        let out = copy_out(input.clone()).unwrap();
 
-        assert_eq!(out.len(), 1);
-        assert_eq!(&out[0], &input);
+        assert_eq!(out, input);
     }
 
     #[test]
@@ -185,10 +161,9 @@ mod tests {
         )
         .unwrap();
 
-        let out = run_unary(CopyOut, vec![input.clone()]);
+        let out = copy_out(input.clone()).unwrap();
 
-        assert_eq!(out.len(), 1);
-        assert_eq!(&out[0], &input);
+        assert_eq!(out, input);
     }
 
     #[test]
@@ -206,10 +181,9 @@ mod tests {
         )
         .unwrap();
 
-        let out = run_unary(CopyOut, vec![input.clone()]);
+        let out = copy_out(input.clone()).unwrap();
 
-        assert_eq!(out.len(), 1);
-        assert_eq!(&out[0], &input);
+        assert_eq!(out, input);
     }
 
     #[test]
@@ -224,10 +198,9 @@ mod tests {
         )
         .unwrap();
 
-        let out = run_unary(CopyOut, vec![input.clone()]);
+        let out = copy_out(input.clone()).unwrap();
 
-        assert_eq!(out.len(), 1);
-        assert_eq!(&out[0], &input);
+        assert_eq!(out, input);
     }
 
     #[test]
@@ -238,9 +211,8 @@ mod tests {
         )
         .unwrap();
 
-        let out = run_unary(CopyOut, vec![input.clone()]);
+        let out = copy_out(input.clone()).unwrap();
 
-        assert_eq!(out.len(), 1);
-        assert_eq!(&out[0], &input);
+        assert_eq!(out, input);
     }
 }

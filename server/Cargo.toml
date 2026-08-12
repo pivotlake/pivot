@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 dispatch = { workspace = true }
+engine = { workspace = true }
 planner = { workspace = true }
 catalog = { workspace = true }
 datastore-delta = { workspace = true }
@@ -20,7 +21,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
 include_dir = "0.7"
-lru = { workspace = true }
 pgwire = { workspace = true }
 # Generates per-process secrets for mock authentication of unknown users.
 rand = { workspace = true }
@@ -47,7 +47,7 @@ nix = { version = "0.31.2", features = ["resource"] }
 # directory named by `PIVOT_PERF_DIR`. Without this feature every profiling path
 # is compiled out and `SET perf = 1` is an accepted no-op, so there is no
 # overhead in a normal build.
-perf = ["dep:libc", "dispatch/perf"]
+perf = ["dep:libc", "dispatch/perf", "engine/perf"]
 
 [[bin]]
 name = "pivotdb-server"

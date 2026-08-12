@@ -108,8 +108,9 @@ pub struct ServerConfig {
     /// Number of dispatch worker threads. Defaults to the machine's core count.
     pub workers: Option<usize>,
     /// How often every datastore brings its in-memory table set up to date with
-    /// the store. This bounds how stale a query's view of externally committed
-    /// data can be; this process's own commits are visible immediately.
+    /// the store. For shared remote stores, this bounds how stale a query's view
+    /// of externally committed data can be; this process's own commits are
+    /// visible immediately.
     pub refresh_interval: Interval,
     /// On-disk cache for remote (object store) reads. Omit to disable it; local
     /// files are never cached, they are read from the filesystem directly.

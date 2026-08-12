@@ -3,13 +3,11 @@
 A PostgreSQL-wire-compatible server for pivotdb. Any Postgres client (`psql`,
 `tokio-postgres`, JDBC, …) can connect and query a set of named datastores.
 
-Glue layer: [`pgwire`](https://crates.io/crates/pgwire) drives the wire protocol,
-[`planner`](../planner) turns each SQL string into a Pivot plan (via an embedded
-DuckDB) against the composite [`PivotCatalog`](../catalog), and
-[`dispatch`](../dispatch) runs the resulting dataflow on its thread-per-core
-worker pool. Each query hops to `tokio::task::spawn_blocking` to drive the
-(non-`Send`) DuckDB planner; query execution itself happens on the dispatch
-workers.
+[`engine`](../engine) owns statement transactions, planning, the plan cache,
+dispatch, cancellation, and command classification. The server adds PostgreSQL
+wire and HTTP adapters around that transport-neutral core. The local CLI uses
+the same engine and converts result batches directly to terminal cells on the
+dispatch workers.
 
 See `src/lib.rs` for the library API, or run the binary directly.
 
@@ -94,12 +92,15 @@ Start the server with:
 pivotdb-server --config pivot.yaml
 ```
 
+A local datastore directory may be open in only one Pivot process at a time.
+Pivot holds `.pivot.lock` in that directory until shutdown and reports the
+owning PID if another process tries to open it.
+
 The `server` section's `refresh_interval` sets how often the background refresh
 brings the in-memory table set up to date with the store: new Delta versions,
-new files' footers, and
-tables committed by other processes. It bounds how stale a query's view of
-externally committed data can be; this process's own INSERT and compaction
-publish their commits immediately.
+new files' footers, and, for shared remote stores, tables committed by other
+processes. It bounds how stale a query's view of externally committed data can
+be; this process's own INSERT and compaction publish their commits immediately.
 
 An S3 datastore's `region`, `access_key_id`, and `secret_access_key` are
 required and given inline. Protect files containing inline credentials

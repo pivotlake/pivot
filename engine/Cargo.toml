@@ -1,0 +1,21 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+catalog = { workspace = true }
+dispatch = { workspace = true }
+planner = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+
+lru = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync"] }
+
+[features]
+perf = ["dispatch/perf"]
+
+[dev-dependencies]
+async-trait = "0.1"

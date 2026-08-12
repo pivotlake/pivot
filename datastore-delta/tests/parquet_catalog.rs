@@ -56,6 +56,15 @@ fn empty_datastore() -> (TempDir, Arc<DeltaDatastore>) {
     (database, datastore)
 }
 
+/// Entries written to a datastore other than its process-lifetime lock.
+fn durable_datastore_entries(database: &Path) -> Vec<std::ffi::OsString> {
+    std::fs::read_dir(database)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name != ".pivot.lock")
+        .collect()
+}
+
 /// Create a table, mirroring how the server runs `CREATE TABLE`: execute the
 /// footer-fetch dataflow, then commit the transaction that persists and
 /// publishes the staged table. Returns the datastore's own result so error-path
@@ -261,7 +270,7 @@ fn create_table_is_durable_and_visible_only_after_commit() {
             )
             .is_none()
     );
-    assert!(std::fs::read_dir(database.path()).unwrap().next().is_none());
+    assert!(durable_datastore_entries(database.path()).is_empty());
 
     commit_datastore_transaction(transaction).unwrap();
 
@@ -311,7 +320,7 @@ fn rolling_back_create_table_discards_the_staged_creation() {
             .is_none()
     );
     assert!(!dir.path().join("_delta_log").exists());
-    assert!(std::fs::read_dir(database.path()).unwrap().next().is_none());
+    assert!(durable_datastore_entries(database.path()).is_empty());
 }
 
 #[test]
@@ -379,31 +388,17 @@ fn create_table_without_a_path_makes_an_empty_table() {
 }
 
 #[test]
-fn create_table_in_an_unwritable_database_fails() {
-    // CREATE TABLE commits Delta version 0 at the table's location under the
-    // database root, so a root that cannot be written is a clean error, not a
-    // silently empty table.
-    let (dir, columns) = three_row_table();
+fn opening_an_unwritable_database_fails() {
+    // Opening takes and records the datastore lock before loading catalog state,
+    // so an unwritable root is rejected immediately.
     let bogus = "/definitely/not/a/real/path/for/datastore/tests";
-    let datastore = DeltaDatastore::open(bogus, &dispatcher()).unwrap();
-
-    let err = create_table(&datastore, create_request("t", dir.path(), columns))
+    let err = DeltaDatastore::open(bogus, &dispatcher())
         .unwrap_err()
         .to_string();
 
     assert!(
         err.to_lowercase().contains("permission denied"),
-        "expected the Delta commit's write failure, got: {err}"
-    );
-    assert!(
-        datastore
-            .clone()
-            .begin_transaction()
-            .table(
-                DEFAULT_DATASTORE_NAME,
-                &SchemaQualifiedTableName::in_default_schema("t"),
-            )
-            .is_none()
+        "expected the lock-file write failure, got: {err}"
     );
 }
 
@@ -1402,32 +1397,6 @@ fn pushed_predicate_prunes_latest_files_after_refresh() {
     assert_eq!(row_group_count(&datastore, "t", &table), 1);
 }
 
-/// A second datastore over the same persisted root sees another instance's
-/// append at its next reload: reloading reads the committed manifest, so
-/// cross-process commits surface without any re-`CREATE`.
-#[test]
-fn other_datastore_instance_sees_append_at_next_bind() {
-    let (data_dir, columns) = three_row_table();
-    let db = TempDir::new().unwrap();
-    let writer = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
-    create_table(&writer, create_request("t", data_dir.path(), columns)).unwrap();
-
-    // The reader opens before the new file exists, at version 1.
-    let reader = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
-    assert_eq!(current_parquet(&reader, "t").row_groups().len(), 3);
-
-    let new_file = write_ids(data_dir.path(), "later.parquet", &[40, 50]);
-    append(&writer, "t", &new_file);
-
-    // The reader's next reload picks up version 2 from the committed manifest.
-    let rows = current_parquet(&reader, "t")
-        .row_groups()
-        .iter()
-        .map(|rg| rg.num_rows)
-        .sum::<i64>();
-    assert_eq!(rows, 5);
-}
-
 /// Restart reads the committed manifest, not the directory: files appended
 /// after the `CREATE` survive a reopen.
 #[test]
@@ -1494,6 +1463,8 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
     )];
     table.replace_data_files(&inputs, &added).unwrap();
 
+    drop(table);
+    drop(datastore);
     let reopened = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
     let parquet = current_parquet(&reopened, "t");
     let groups = parquet.row_groups();
