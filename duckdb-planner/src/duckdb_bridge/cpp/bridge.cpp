@@ -22,6 +22,7 @@
 #include "duckdb/planner/operator/logical_delim_get.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
 #include "duckdb/planner/operator/logical_cteref.hpp"
+#include "duckdb/planner/operator/logical_column_data_get.hpp"
 #include "duckdb/planner/operator/logical_set.hpp"
 #include "duckdb/planner/operator/logical_reset.hpp"
 #include "duckdb/planner/operator/logical_compact.hpp"
@@ -900,6 +901,24 @@ size_t lo_cte_table_index(const LogicalOperator &op) {
 // The CTE a reference reads, as the index that CTE was published under.
 size_t lo_cte_ref_index(const LogicalOperator &op) {
 	return as<duckdb::LogicalCTERef>(op).cte_index.index;
+}
+
+// ---- ColumnDataGet (CHUNK_GET): a scan of an in-memory constant chunk ----
+
+size_t lo_chunk_get_row_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalColumnDataGet>(op).collection->Count();
+}
+
+size_t lo_chunk_get_column_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalColumnDataGet>(op).chunk_types.size();
+}
+
+// One cell of the collection, owned because the row view hands values out by
+// value. Materializing the row view per call is fine: these chunks are small
+// by construction (an IN list's constants).
+std::unique_ptr<Value> lo_chunk_get_value(const LogicalOperator &op, size_t column, size_t row) {
+	duckdb::ColumnDataRowCollection rows(*as<duckdb::LogicalColumnDataGet>(op).collection);
+	return std::make_unique<duckdb::Value>(rows.GetValue(column, row));
 }
 
 // ---- ComparisonJoin: general accessors ----

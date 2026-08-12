@@ -217,6 +217,7 @@ impl<'plan> LogicalOp<'plan> {
                 Operator::MaterializedCte(MaterializedCte { raw: self.raw })
             }
             L::LOGICAL_CTE_REF => Operator::CteRef(CteRef { raw: self.raw }),
+            L::LOGICAL_CHUNK_GET => Operator::ChunkGet(ChunkGet { raw: self.raw }),
             L::LOGICAL_DUMMY_SCAN => Operator::DummyScan,
             L::LOGICAL_EXPLAIN => Operator::Explain,
             _ => Operator::Unsupported,
@@ -265,6 +266,8 @@ pub enum Operator<'plan> {
     MaterializedCte(MaterializedCte<'plan>),
     /// One place a CTE's rows are read.
     CteRef(CteRef<'plan>),
+    /// A scan of an in-memory constant chunk (a long `IN` list's rewrite).
+    ChunkGet(ChunkGet<'plan>),
     /// The single-row source under a `FROM`-less `SELECT`.
     DummyScan,
     /// `EXPLAIN <query>`.
@@ -331,6 +334,9 @@ define_handles! { ffi::LogicalOperator;
     MaterializedCte,
     /// A `LogicalCTERef`: one place a CTE's rows are read.
     CteRef,
+    /// A `LogicalColumnDataGet` (CHUNK_GET): a scan of an in-memory constant
+    /// chunk, e.g. what DuckDB rewrites a long `IN` list into.
+    ChunkGet,
 }
 
 impl<'plan> MaterializedCte<'plan> {
@@ -374,6 +380,22 @@ impl<'plan> Values<'plan> {
         Ok(Expr {
             raw: ffi::lo_values_expr(self.raw, row, column)?,
         })
+    }
+}
+
+impl<'plan> ChunkGet<'plan> {
+    pub fn row_count(self) -> Result<usize> {
+        Ok(ffi::lo_chunk_get_row_count(self.raw)?)
+    }
+
+    pub fn column_count(self) -> Result<usize> {
+        Ok(ffi::lo_chunk_get_column_count(self.raw)?)
+    }
+
+    /// One cell of the constant chunk.
+    pub fn value(self, column: usize, row: usize) -> Result<ScalarValue> {
+        let value = ffi::lo_chunk_get_value(self.raw, column, row)?;
+        scalar_from_value(&value)
     }
 }
 
@@ -918,7 +940,7 @@ impl<'plan> Expr<'plan> {
             T::VALUE_CONSTANT => Expression::Constant(Constant { raw: self.raw }),
             T::BOUND_AGGREGATE => Expression::AggregateFunc(AggregateFunc { raw: self.raw }),
             T::BOUND_FUNCTION => Expression::Function(Function { raw: self.raw }),
-            T::COMPARE_IN => Expression::InList(InList { raw: self.raw }),
+            T::COMPARE_IN | T::COMPARE_NOT_IN => Expression::InList(InList { raw: self.raw }),
             T::CONJUNCTION_AND | T::CONJUNCTION_OR => {
                 Expression::Conjunction(Conjunction { raw: self.raw })
             }
@@ -1137,6 +1159,11 @@ impl<'plan> InList<'plan> {
                 })
             })
             .collect()
+    }
+
+    /// `true` for `NOT IN`, `false` for `IN`.
+    pub fn negated(self) -> Result<bool> {
+        Ok(ExpressionType::from_u8(ffi::expr_type(self.raw)?) == ExpressionType::COMPARE_NOT_IN)
     }
 }
 
