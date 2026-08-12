@@ -42,7 +42,10 @@
 //! probe-side anti join runs the probe-side miss tracking, a build-side anti
 //! join the build-side flag array and unmatched scan, and either way the
 //! drain stops once the collected pairs have settled fates, so a matched
-//! pair never reaches the output.
+//! pair never reaches the output. A build-side semi join runs the same flag
+//! array and scan with the polarity flipped, emitting exactly the flagged
+//! build rows; its drain stops at the same point, since a matched pair's
+//! flag store is all of its contribution too.
 //!
 //! A join with a residual predicate ([`JoinSpec::residual_filters`]) weighs
 //! the collected matches once more in the drain: the matched rows of both
@@ -133,16 +136,17 @@ impl<
         );
 
         if DISCARD_MATCHED_PAIRS {
-            // An anti join emits the unmatched rows from exactly one side. It
-            // must inspect every candidate match, so it cannot use the semi
-            // join's first-match shortcut.
+            // An anti or build-side semi join emits rows from exactly one
+            // side, decided by that side's fate tracking. It must inspect
+            // every candidate match, so it cannot use the semi join's
+            // first-match shortcut.
             debug_assert!(
                 !STOP_AFTER_FIRST_MATCH,
-                "an anti join must inspect every candidate match"
+                "a pair-discarding join must inspect every candidate match"
             );
             debug_assert_ne!(
                 OUTER_JOIN_BUILD_SIDE, TRACK_UNMATCHED_PROBE_ROWS,
-                "an anti join must track unmatched rows on exactly one side"
+                "a pair-discarding join must track fates on exactly one side"
             );
         }
 
@@ -183,6 +187,9 @@ impl<
             // A mark join only retains their indices to build its mark column.
             TRACK_UNMATCHED_PROBE_ROWS && !MARK,
             MARK,
+            // A build-side semi join's finish scan keeps the flagged build
+            // rows, where the outer and anti joins keep the unflagged.
+            matches!(spec.kind, JoinKind::BuildSemi),
         );
         Self {
             table,
@@ -194,8 +201,9 @@ impl<
         }
     }
 
-    /// Claim one build row batch, scan its flags, and append its unmatched
-    /// rows to the build accumulator, emitting once a full batch has
+    /// Claim one build row batch, scan its flags, and append the rows the
+    /// join's kind keeps (the unmatched ones, or a build-side semi join's
+    /// matched ones) to the build accumulator, emitting once a full batch has
     /// gathered. Returns whether every batch has been claimed.
     fn send_out_next_unmatched_build_rows(
         &mut self,
