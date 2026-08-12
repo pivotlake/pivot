@@ -547,6 +547,52 @@ fn a_not_exists_subquery_becomes_an_anti_delim_join(mut testing_planner: Testing
     ");
 }
 
+/// The same EXISTS with the outer side far smaller flips in DuckDB's plan:
+/// the outer rows become the RHS and the dedup source, the join arrives as
+/// RIGHT_SEMI, and the walk keeps its CTE tee on the outer side while the
+/// subquery side probes, so the join lands build-side semi.
+#[rstest]
+fn a_small_outer_exists_becomes_a_flipped_delim_join(mut testing_planner: TestingPlanner) {
+    use arrow_array::{ArrayRef, Int64Array};
+    use planner::types::Type;
+    use std::sync::Arc;
+    let int64_col = |values: Vec<i64>| -> ArrayRef { Arc::new(Int64Array::from(values)) };
+    testing_planner.add_table(
+        "small_orders",
+        &[("o_key", Type::Int64, int64_col(vec![1, 2]))],
+    );
+    testing_planner.add_table(
+        "wide_items",
+        &[
+            ("i_order", Type::Int64, int64_col(vec![7; 1000])),
+            ("i_qty", Type::Int64, int64_col((0..1000).collect())),
+        ],
+    );
+
+    let plan = testing_planner
+        .plan(
+            "SELECT o_key FROM small_orders WHERE EXISTS \
+             (SELECT 1 FROM wide_items WHERE i_order = o_key AND i_qty > 5)",
+        )
+        .unwrap();
+
+    assert_snapshot!(plan.to_string(), @"
+    Projection(o_key:Int64)
+      Cte(#9223372036854775807, sites: 2)
+        Input([o_key:Int64])
+        Cte(#9223372036854775808, sites: 1)
+          Distinct(keys: [0])
+            CteScan(#9223372036854775807)
+          Join[build semi](probe_keys: [0], build_keys: [0], probe_output: [], build_output: [0])
+            Projection(o_key:Int64)
+              Join(probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [0])
+                Filter(i_qty:Int64 > 5:Int64 -> Boolean)
+                  Input([i_order:Int64, i_qty:Int64])
+                CteScan(#9223372036854775808)
+            CteScan(#9223372036854775807)
+    ");
+}
+
 /// A LEFT JOIN preserving the larger relation stays LEFT in DuckDB's plan and
 /// lowers to the probe-side outer join: the preserved side streams as probe
 /// and its unmatched rows pad with null build columns.

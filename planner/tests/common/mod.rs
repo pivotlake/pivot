@@ -351,10 +351,18 @@ impl TestingPlanner {
 /// call [`TestCatalog::add_table`] before planning.
 #[fixture]
 pub fn testing_planner() -> TestingPlanner {
+    testing_planner_with_ring_slots(32)
+}
+
+/// The fixture with a caller-sized ring, for the few tests whose plans hold
+/// more live buffers than the default 32 slots (e.g. several nested CTE
+/// tees over multi-thousand-row tables).
+#[allow(dead_code)] // not all test binaries call every helper
+pub fn testing_planner_with_ring_slots(ring_slots: usize) -> TestingPlanner {
     // `TestTable::new` calls `ParquetTable::from_files`, which touches
     // `memory_ctx()` (compressed cache) and so must run on a worker — see
     // `TestTable::new` for the `run_on_worker` hop.
-    let dispatch = Dispatch::spin_up(1, 32, None);
+    let dispatch = Dispatch::spin_up(1, ring_slots, None);
     let catalog = Arc::new(TestCatalog::new());
     catalog.add_table(
         &dispatch,
