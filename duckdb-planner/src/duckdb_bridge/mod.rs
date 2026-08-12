@@ -354,6 +354,17 @@ pub mod ffi {
         /// The CTE index a reference reads.
         fn lo_cte_ref_index(op: &LogicalOperator) -> Result<usize>;
 
+        /// Rows in a CHUNK_GET's constant collection.
+        fn lo_chunk_get_row_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_chunk_get_column_count(op: &LogicalOperator) -> Result<usize>;
+        /// One cell of the collection, owned: DuckDB hands the value out by
+        /// value rather than by reference.
+        fn lo_chunk_get_value(
+            op: &LogicalOperator,
+            column: usize,
+            row: usize,
+        ) -> Result<UniquePtr<Value>>;
+
         fn lo_join_type(op: &LogicalOperator) -> Result<u8>;
         fn lo_join_condition_count(op: &LogicalOperator) -> Result<usize>;
         /// Whether the condition is a left/right comparison. When false, the

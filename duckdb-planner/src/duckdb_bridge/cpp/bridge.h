@@ -193,6 +193,11 @@ size_t lo_late_materialization_column(const LogicalOperator &op, size_t index);
 size_t lo_cte_table_index(const LogicalOperator &op);
 size_t lo_cte_ref_index(const LogicalOperator &op);
 
+// ---- ColumnDataGet (CHUNK_GET) ----
+size_t lo_chunk_get_row_count(const LogicalOperator &op);
+size_t lo_chunk_get_column_count(const LogicalOperator &op);
+std::unique_ptr<Value> lo_chunk_get_value(const LogicalOperator &op, size_t column, size_t row);
+
 // ---- ComparisonJoin: general accessors ----
 uint8_t lo_join_type(const LogicalOperator &op);
 size_t lo_join_condition_count(const LogicalOperator &op);
