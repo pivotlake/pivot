@@ -3,10 +3,12 @@ resolver = "3"
 members = [
     "benchmarks",
     "catalog",
+    "shell",
     "datastore",
     "datastore-delta",
     "dispatch",
     "duckdb-planner",
+    "engine",
     "metastore",
     "metastore-disk",
     "planner",
@@ -24,6 +26,7 @@ edition = "2024"
 [workspace.dependencies]
 # Sibling crates.
 catalog = { path = "catalog" }
+engine = { path = "engine" }
 datastore = { path = "datastore" }
 datastore-delta = { path = "datastore-delta" }
 dispatch = { path = "dispatch" }
@@ -81,6 +84,7 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 ureq = "2"
 url = "2.5"
+unicode-width = "0.2"
 
 # Compiled dataflow operators nest their factory types, so an operator's type name
 # embeds the full name of every stage beneath it. Full DWARF writes each of those

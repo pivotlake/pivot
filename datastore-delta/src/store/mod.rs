@@ -19,7 +19,7 @@
 use delta_kernel::object_store::DynObjectStore;
 use dispatch::io::{AuthHeader, OpenFile, RemoteFile, open_direct_read};
 use std::fmt::Debug;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 mod gcs;
@@ -182,6 +182,13 @@ impl DataFile {
 /// A flat key→bytes object store rooted at one database. [`ObjectPath`] keys are
 /// relative to that root, e.g. `_pivot_manifest.json` or `events/a.parquet`.
 pub trait ObjectStore: Debug + Send + Sync {
+    /// The filesystem directory backing this store, or `None` for a remote
+    /// store. The datastore layer uses this to enforce exclusive ownership of
+    /// local roots without putting that policy in the storage adapter itself.
+    fn local_root(&self) -> Option<&Path> {
+        None
+    }
+
     /// Fetch an object in full, or `None` if it does not exist.
     fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>>;
 

@@ -30,7 +30,6 @@ mod tables;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use crate::query_handler::PlanCache;
 use axum::Json;
 use axum::Router;
 use axum::routing::{get, post};
@@ -48,23 +47,17 @@ use tables::{default_files_page, files_page, rowgroups_page};
 #[derive(Clone)]
 pub(crate) struct IntrospectState {
     pub(super) catalog: Arc<PivotCatalog>,
-    pub(super) dispatcher: dispatch::DataFlowDispatcher,
-    pub(super) plan_cache: Arc<PlanCache>,
+    pub(super) query_engine: Arc<engine::Engine>,
     /// One persistent `System` so CPU usage is measured across polls.
     pub(super) system: Arc<Mutex<System>>,
     pub(super) pid: Option<Pid>,
 }
 
 impl IntrospectState {
-    pub(crate) fn new(
-        catalog: Arc<PivotCatalog>,
-        dispatcher: dispatch::DataFlowDispatcher,
-        plan_cache: Arc<PlanCache>,
-    ) -> Self {
+    pub(crate) fn new(catalog: Arc<PivotCatalog>, query_engine: Arc<engine::Engine>) -> Self {
         Self {
             catalog,
-            dispatcher,
-            plan_cache,
+            query_engine,
             system: Arc::new(Mutex::new(System::new())),
             pid: sysinfo::get_current_pid().ok(),
         }

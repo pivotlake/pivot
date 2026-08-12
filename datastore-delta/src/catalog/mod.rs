@@ -29,12 +29,14 @@
 
 mod binding;
 mod insert_sink;
+mod local_lock;
 mod table;
 
 pub use binding::TableBinding;
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use uuid::Uuid;
@@ -46,6 +48,7 @@ use async_trait::async_trait;
 use crossbeam_deque::{Injector, Steal};
 use datastore::{Datastore, DatastoreTransaction};
 use dispatch::{DataFlowDispatcher, DataFlowError, OneShotNullaryFactory, RecordBatchOperatorSpec};
+use local_lock::LocalDatastoreLock;
 use planner::catalog::{
     BoundTable, CreateSchemaRequest, CreateTableRequest, Error as CatalogError,
     Result as CatalogResult, SchemaCreation, SchemaQualifiedTableName, TableCreation,
@@ -96,6 +99,16 @@ pub enum Error {
     SchemaExists(String),
     #[error("datastore received a transaction created by a different backend")]
     WrongTransactionType,
+    #[error(
+        "datastore directory `{path}` is already in use by another Pivot process{owner}; stop that process or choose another datastore directory"
+    )]
+    DatastoreInUse { path: PathBuf, owner: String },
+    #[error("cannot lock datastore directory `{path}`: {source}")]
+    DatastoreLock {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error(transparent)]
     Arrow(#[from] arrow_schema::ArrowError),
     #[error(transparent)]
@@ -225,7 +238,8 @@ impl DatastoreIndex {
 /// hands its files to the datastore, which appends them to, or swaps them into,
 /// the live copy it holds here and publishes the result. Copies handed out for
 /// reading drift; every query resolve refreshes its copy to the latest committed
-/// version, so a commit by another process becomes visible to the next query.
+/// version, so a commit by another process on a shared remote store becomes
+/// visible to the next query.
 ///
 /// Cloneable (every field is an `Arc`, a `String`, or the shared dispatcher
 /// handle), so a commit that writes can hand a clone to the blocking pool.
@@ -243,6 +257,9 @@ pub struct DeltaDatastore {
     /// database root, an absolute location at the store's own root (the
     /// filesystem root, or the bucket root).
     store: Arc<dyn ObjectStore>,
+    /// The exclusive process lock for a local store. Remote stores have none.
+    /// Shared by datastore clones so one clone cannot unlock active peers.
+    _local_lock: Option<Arc<LocalDatastoreLock>>,
     /// The Delta Kernel engine every table's log is read and written through.
     /// Built once for the store, so a refresh, a commit, or a vacuum sweep reuses
     /// the one object-store client and task executor instead of standing up its
@@ -294,6 +311,13 @@ impl DeltaDatastore {
         dispatcher: &DataFlowDispatcher,
         maintenance: Option<crate::MaintenanceConfig>,
     ) -> Result<Arc<Self>> {
+        // Only local Delta datastores take a process lock; remote stores have
+        // no local root and skip this.
+        let local_lock = store
+            .local_root()
+            .map(LocalDatastoreLock::acquire)
+            .transpose()?
+            .map(Arc::new);
         let manifest = CatalogManifest::load(store.as_ref())?;
         let engine = crate::delta::DeltaEngine::new(store.as_ref())?;
 
@@ -310,6 +334,7 @@ impl DeltaDatastore {
         Ok(Arc::new(Self {
             tables_index: Arc::new(RwLock::new(index)),
             store,
+            _local_lock: local_lock,
             engine,
             dispatcher: dispatcher.clone(),
             maintenance,
@@ -392,9 +417,9 @@ impl DeltaDatastore {
     }
 
     /// Bring the in-memory schema and table sets up to date with the store: pick
-    /// up schemas and tables another process registered in the database index,
-    /// and advance every
-    /// table to its latest committed Delta version, fetching the footers of
+    /// up schemas and tables another process registered in a shared remote
+    /// database index, and advance every table to its latest committed Delta
+    /// version, fetching the footers of
     /// files it doesn't hold yet. This is the **only** place the read path
     /// pays store I/O; the server drives it on a background interval, so
     /// queries always bind against an already-materialized set. Returns whether

@@ -58,17 +58,17 @@ impl<O, OF: OperatorFactory<O>> OperatorSpec<O, OF> {
 
 impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O, OF> {
     pub fn execute(self) -> DataFlowHandle<O> {
-        self.execute_collecting(false)
+        self.execute_inner(false)
     }
 
     /// Like [`execute`](Self::execute) but with per-dataflow stats collection
     /// enabled; read the aggregated tally back via
     /// [`DataFlowHandle::collect_with_stats`](crate::DataFlowHandle::collect_with_stats).
     pub fn execute_with_stats(self) -> DataFlowHandle<O> {
-        self.execute_collecting(true)
+        self.execute_inner(true)
     }
 
-    fn execute_collecting(self, collect_stats: bool) -> DataFlowHandle<O> {
+    fn execute_inner(self, collect_stats: bool) -> DataFlowHandle<O> {
         let (tx, rx) = mpsc_channel();
         let (err_tx, err_rx) = std::sync::mpsc::channel();
         let (stats_tx, stats_rx) = std::sync::mpsc::channel();

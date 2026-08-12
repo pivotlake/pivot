@@ -1,10 +1,10 @@
 //! The local-filesystem [`ObjectStore`] backend: keys are paths under a root
-//! directory, the CAS primitive is an `O_EXCL` create.
+//! directory. A Delta datastore opened over it takes an exclusive root lock.
 
 use super::{DataFileLocation, FileRef, ListedObject, ObjectPath, ObjectStore, Result, StoreError};
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::object_store::local::LocalFileSystem;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// The local-filesystem backend: keys are paths under `root`.
@@ -32,6 +32,10 @@ impl LocalStore {
 }
 
 impl ObjectStore for LocalStore {
+    fn local_root(&self) -> Option<&Path> {
+        Some(&self.root)
+    }
+
     fn describe(&self) -> String {
         format!("file://{}", self.root.display())
     }

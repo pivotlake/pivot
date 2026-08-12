@@ -12,7 +12,7 @@ pub(super) struct ColumnOut {
     pub(super) col_type: String,
 }
 
-/// Render result batches (heap-backed via CopyOut, see [`crate::query_handler`])
+/// Render result batches (copied out on dispatch workers; see [`crate::query_handler`])
 /// as JSON columns + text cells - the universally-safe representation, like the
 /// wire protocol's text format. `null` for SQL NULL.
 pub(super) fn batches_to_json(

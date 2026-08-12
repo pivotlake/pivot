@@ -232,7 +232,8 @@ impl CatalogTable {
     ///
     /// In-process callers follow the table's
     /// [commit-lock protocol](field@Self::commit_lock), so this retry path
-    /// normally handles contention from another process.
+    /// normally handles contention from another process on a shared remote
+    /// store.
     ///
     /// Runs off the dispatch workers: the retry's `refresh` drives a footer-fetch
     /// dataflow, and every commit path commits from a blocking thread, never a

@@ -14,8 +14,8 @@ server:
   # workers: 16
 
   # How often the background refresh brings the in-memory table set up to date
-  # with the store. This bounds how stale a query's view of data committed by
-  # other processes can be. Defaults to 30s.
+  # with the store. For shared remote stores, this bounds how stale a query's
+  # view of data committed by other processes can be. Defaults to 30s.
   refresh_interval: 30s
 
   # Also serve the bundled web dashboard on this address. Omitted means no

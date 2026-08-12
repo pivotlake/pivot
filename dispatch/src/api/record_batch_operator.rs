@@ -53,13 +53,12 @@ use arrow_schema::DataType;
 use crate::api::operator_spec::{OperatorFactory, OperatorSpec};
 use crate::operations::channels::{StealableChannelFactory, stealable, to_single_worker_mpsc};
 use crate::operations::{
-    AggregateFactory, AggregationSlot, AggregationValue, CopyOutFactory, CteFactory,
-    CteScanFactory, Distinct, DynamicFilterSlot, DynamicRowKey, F64Cell, FilterFactory,
-    GroupFactory, GroupLimit, IntCell, JoinKey, JoinKind, JoinRecordBatchOperatorFactory, JoinSpec,
-    KeyExtractor, LimitFactory, MapFactory, NoOpNullaryFactory, NullaryFactory,
-    NullaryOperatorFactory, OrderBy, OrderByFactory, OrderByLimitFactory, PackedKey, RangeJoinSpec,
-    SingleColumnKey, UnaryFactory, UnaryOperatorFactory, WideCell, create_join_factories,
-    create_range_join_factories,
+    AggregateFactory, AggregationSlot, AggregationValue, CteFactory, CteScanFactory, Distinct,
+    DynamicFilterSlot, DynamicRowKey, F64Cell, FilterFactory, GroupFactory, GroupLimit, IntCell,
+    JoinKey, JoinKind, JoinRecordBatchOperatorFactory, JoinSpec, KeyExtractor, LimitFactory,
+    MapFactory, NoOpNullaryFactory, NullaryFactory, NullaryOperatorFactory, OrderBy,
+    OrderByFactory, OrderByLimitFactory, PackedKey, RangeJoinSpec, SingleColumnKey, UnaryFactory,
+    UnaryOperatorFactory, WideCell, copy_out, create_join_factories, create_range_join_factories,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle, DataFlowStats};
 pub const RECORD_BATCH_SIZE: usize = 8192;
@@ -131,6 +130,21 @@ pub const RECORD_BATCH_SIZE: usize = 8192;
 pub struct RecordBatchOperatorSpec {
     dispatcher: DataFlowDispatcher,
     factories: VecDeque<Box<dyn OperatorFactory<RecordBatch>>>,
+}
+
+/// An owned batch representation that can leave a dispatch worker safely.
+///
+/// The conversion runs on the worker that produced the input. Implementations
+/// must not retain ring-backed Arrow buffers; copy or encode everything kept in
+/// the returned value.
+pub trait OutputBatch: Sized + Send + 'static {
+    fn from_record_batch(batch: RecordBatch) -> Self;
+}
+
+impl OutputBatch for RecordBatch {
+    fn from_record_batch(batch: RecordBatch) -> Self {
+        copy_out(batch).expect("copying a valid RecordBatch should succeed")
+    }
 }
 
 /// Return type of [`RecordBatchOperatorSpec::map`]: a generic
@@ -977,56 +991,49 @@ impl RecordBatchOperatorSpec {
     ///     .collect()
     ///     .unwrap();
     /// ```
-    /// Dispatch the pipeline to the workers and return a control handle plus
-    /// a stream of the produced batches.
-    ///
-    /// Batches arrive **ring-backed**: their `Buffer`s point into worker
-    /// `WriteBuffer`s and are only safe to handle on a thread with a matching
-    /// `MemoryContext`. For the usual case prefer
-    /// [`collect`](Self::collect), which inserts a
-    /// `CopyOut` cap so every
-    /// batch leaves the worker as plain heap-backed buffers.
+    /// Dispatch the pipeline and return its ring-backed Arrow output.
     pub fn execute(self) -> DataFlowHandle<RecordBatch> {
         let factories: Vec<_> = self.factories.into_iter().collect();
         OperatorSpec::new(self.dispatcher, factories).execute()
     }
 
-    /// Like [`execute`](Self::execute) but with per-dataflow stats collection on;
-    /// read them back via [`DataFlowHandle::collect_with_stats`].
+    /// Convert each result batch to `T` on its dispatch worker, then launch the
+    /// dataflow.
+    pub fn execute_as<T: OutputBatch>(self) -> DataFlowHandle<T> {
+        self.map(|| T::from_record_batch).execute()
+    }
+
+    /// Like [`execute`](Self::execute), with worker statistics enabled.
     pub fn execute_with_stats(self) -> DataFlowHandle<RecordBatch> {
         let factories: Vec<_> = self.factories.into_iter().collect();
         OperatorSpec::new(self.dispatcher, factories).execute_with_stats()
     }
 
-    /// Run the dataflow and collect every batch into a `Vec`.
-    ///
-    /// Appends a `CopyOut`
-    /// stage before executing, so the batches you receive are plain
-    /// heap-backed (safe to hold on any thread, regardless of
-    /// `MemoryContext`).
+    /// Like [`execute_as`](Self::execute_as), with worker statistics enabled.
+    pub fn execute_with_stats_as<T: OutputBatch>(self) -> DataFlowHandle<T> {
+        self.map(|| T::from_record_batch).execute_with_stats()
+    }
+
+    /// Run the dataflow and collect heap-backed Arrow batches.
     pub fn collect(self) -> crate::data_flow::Result<Vec<RecordBatch>> {
-        let count = self.worker_count();
-        self.unary((0..count).map(|_| CopyOutFactory))
-            .execute()
-            .collect()
+        self.collect_as::<RecordBatch>()
+    }
+
+    /// Run the dataflow and collect output batches converted on their workers.
+    pub fn collect_as<T: OutputBatch>(self) -> crate::data_flow::Result<Vec<T>> {
+        self.execute_as::<T>().collect()
     }
 
     /// Like [`collect`](Self::collect), but also returns the dataflow's IO/CPU
     /// stats folded across workers.
     pub fn collect_with_stats(self) -> crate::data_flow::Result<(Vec<RecordBatch>, DataFlowStats)> {
-        let count = self.worker_count();
-        self.unary((0..count).map(|_| CopyOutFactory))
-            .execute_with_stats()
-            .collect_with_stats()
+        self.collect_with_stats_as::<RecordBatch>()
     }
 
-    /// Append the `CopyOut` cap (like [`collect`](Self::collect)) and launch the
-    /// dataflow, returning the running [`DataFlowHandle`] instead of collecting
-    /// here. Lets the caller drive collection itself and cancel mid-run via
-    /// [`DataFlowHandle::cancel_token`] - the batches it yields are heap-backed,
-    /// safe to hold on any thread.
-    pub fn execute_copying(self) -> DataFlowHandle<RecordBatch> {
-        let count = self.worker_count();
-        self.unary((0..count).map(|_| CopyOutFactory)).execute()
+    /// Like [`collect_as`](Self::collect_as), with worker statistics enabled.
+    pub fn collect_with_stats_as<T: OutputBatch>(
+        self,
+    ) -> crate::data_flow::Result<(Vec<T>, DataFlowStats)> {
+        self.execute_with_stats_as::<T>().collect_with_stats()
     }
 }

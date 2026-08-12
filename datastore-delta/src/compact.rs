@@ -68,8 +68,8 @@ pub const DEFAULT_COMPACT_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_COMPACT_POLL: Duration = Duration::from_secs(10);
 
 /// Default cadence for reloading the tables from the store. This bounds how
-/// stale a query's view of externally committed data is, so it trades freshness
-/// against the listing traffic a remote store sees.
+/// stale a query's view of externally committed data in a shared remote store
+/// is, so it trades freshness against the store's listing traffic.
 pub const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// A partition with at least this many small files is merged even if they don't
@@ -87,15 +87,16 @@ pub const DEFAULT_MIN_FILES_TO_MERGE: usize = 4;
 #[derive(Clone)]
 pub struct MaintenanceConfig {
     /// How often the datastore reloads its tables from the store (new Delta
-    /// versions and new files' footers), so externally committed data becomes
-    /// visible to queries.
+    /// versions and new files' footers), so externally committed data in a
+    /// shared remote store becomes visible to queries.
     pub refresh_interval: Duration,
     /// Compaction settings, or `None` to run no compacter (a read-only server
-    /// or a deployment where another process owns compaction).
+    /// or a remote-store deployment where another process owns compaction).
     pub compaction: Option<CompactionConfig>,
     /// Vacuum settings, or `None` to run no vacuumer (a read-only server, or a
-    /// deployment where another process owns physical cleanup). Deletes
-    /// tombstoned data files and superseded commit JSONs past their retention.
+    /// remote-store deployment where another process owns physical cleanup).
+    /// Deletes tombstoned data files and superseded commit JSONs past their
+    /// retention.
     pub vacuum: Option<crate::vacuum::VacuumConfig>,
 }
 
@@ -182,8 +183,9 @@ impl Compacter {
     }
 
     /// One table's round: reload it to its latest log version (this is what
-    /// lets a compacter in *another process* see files the server
-    /// registered), then merge batches of eligible files until none remain.
+    /// lets a compacter on a shared remote store in *another process* see files
+    /// the server registered), then merge batches of eligible files until none
+    /// remain.
     /// Each batch is capped at roughly one output file's worth, so a long
     /// backlog (e.g. after a restart) is worked off with bounded memory.
     /// Errors are logged and end the table's round, the next poll retries.
@@ -597,71 +599,6 @@ mod tests {
             .map(|rg| rg.num_rows)
             .sum::<i64>();
         assert_eq!(rows, 3);
-
-        dispatch.exit();
-    }
-
-    /// The compacter can live in a **separate process**: it holds nothing but a
-    /// datastore handle, and each poll round reloads the table from its log. Here
-    /// one datastore instance registers files while the compacter works through a
-    /// second instance over the same database root -- and the first sees the swap
-    /// at its next bind.
-    #[test]
-    fn compacter_in_another_process_compacts_registered_files() {
-        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
-        let db = tempfile::tempdir().unwrap();
-        let adopted_dir = db.path().join("events");
-        std::fs::create_dir_all(&adopted_dir).unwrap();
-        write_parquet_file(&adopted_dir, "a.parquet", vec![1, 2, 3]);
-        write_parquet_file(&adopted_dir, "b.parquet", vec![4, 5]);
-        write_parquet_file(&adopted_dir, "c.parquet", vec![6, 7, 8, 9]);
-
-        // "Writer" process: creates the table over the pre-written files.
-        let writer_datastore =
-            DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
-        create_table(
-            &writer_datastore,
-            dispatch.dispatcher(),
-            "events",
-            Some(Path::new("events")),
-        );
-
-        // "Compacter" process: a separate datastore over the same root. Its poll
-        // round reloads the table from the log before scanning.
-        let compacter_datastore =
-            DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
-        let total: u64 = writer_datastore
-            .table_files(&SchemaQualifiedTableName::in_default_schema("events"))
-            .unwrap()
-            .iter()
-            .map(|f| f.size)
-            .sum();
-        let compacter = Compacter::new(
-            total,
-            DEFAULT_MIN_FILES_TO_MERGE,
-            std::time::Duration::from_secs(1),
-            compacter_datastore,
-        );
-        run_one_sweep(&compacter);
-
-        // The writer's next query reloads to the compacted version.
-        let parquet = fresh_parquet(&writer_datastore, "events");
-        assert_eq!(parquet.row_groups().len(), 1);
-        assert_eq!(parquet.row_groups()[0].num_rows, 9);
-        assert!(
-            writer_datastore
-                .table_files(&SchemaQualifiedTableName::in_default_schema("events"))
-                .unwrap()
-                .iter()
-                .all(|f| f.path.as_str().starts_with("pivot-"))
-        );
-        assert_eq!(
-            writer_datastore
-                .table_files(&SchemaQualifiedTableName::in_default_schema("events"))
-                .unwrap()
-                .len(),
-            1
-        );
 
         dispatch.exit();
     }

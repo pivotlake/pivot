@@ -60,6 +60,12 @@ impl From<RecordBatch> for PGRowBatch {
     }
 }
 
+impl dispatch::OutputBatch for PGRowBatch {
+    fn from_record_batch(batch: RecordBatch) -> Self {
+        batch.into()
+    }
+}
+
 /// Generates [`pg_type_for_arrow`] (schema: arrow type -> Postgres OID) and
 /// [`encode_cell`] (data: one cell -> pgwire field) from one table, so the OID a
 /// column advertises and the value its rows carry are declared together and

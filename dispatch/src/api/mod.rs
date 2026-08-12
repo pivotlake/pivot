@@ -88,4 +88,4 @@ mod record_batch_operator;
 pub use data_flow_handle::{CancelToken, DataFlowHandle};
 
 pub use operator_spec::values_input;
-pub use record_batch_operator::{RECORD_BATCH_SIZE, RecordBatchOperatorSpec};
+pub use record_batch_operator::{OutputBatch, RECORD_BATCH_SIZE, RecordBatchOperatorSpec};

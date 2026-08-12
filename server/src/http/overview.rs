@@ -144,14 +144,9 @@ async fn count_rows(state: &IntrospectState, table: &SchemaQualifiedTableName) -
         escape_identifier_quotes(&table.schema),
         escape_identifier_quotes(&table.table)
     );
-    let batches = crate::query_handler::execute_sql(
-        state.catalog.clone(),
-        state.dispatcher.clone(),
-        state.plan_cache.clone(),
-        sql,
-    )
-    .await
-    .ok()?;
+    let batches = crate::query_handler::execute_sql(state.query_engine.clone(), sql)
+        .await
+        .ok()?;
     let batch = batches.first()?;
     if batch.num_rows() == 0 {
         return None;

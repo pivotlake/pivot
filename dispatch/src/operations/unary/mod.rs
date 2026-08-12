@@ -36,7 +36,7 @@
 //! # Concrete unary transforms
 //!
 //! - [`FilterFactory`] — Keeps rows matching a boolean mask.
-//! - [`MapFactory`] — Transforms each batch (column selection, computation).
+//! - [`MapFactory`] — Transforms each batch.
 //! - [`OrderByLimitFactory`] — Top-N sort across workers.
 //! - [`GroupFactory`] — Hash-based group-by with aggregation.
 
@@ -91,7 +91,7 @@ mod limit;
 mod order_by;
 mod order_by_limit;
 
-pub use copy_out::CopyOutFactory;
+pub(crate) use copy_out::copy_out;
 pub(crate) use join::create_join_factories;
 pub(crate) use join::create_range_join_factories;
 pub use join::{

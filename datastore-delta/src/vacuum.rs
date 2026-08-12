@@ -110,10 +110,11 @@ impl Vacuumer {
         }
     }
 
-    /// One table's round: reload it to its latest log version (so a vacuumer in
-    /// another process sees commits the server wrote), then delete every data
-    /// file the current version does not reference whose storage mtime is older
-    /// than the deletion window (the table's `deletedFileRetentionDuration`).
+    /// One table's round: reload it to its latest log version (so a vacuumer on
+    /// a shared remote store sees commits another process wrote), then delete
+    /// every data file the current version does not reference whose storage
+    /// mtime is older than the deletion window (the table's
+    /// `deletedFileRetentionDuration`).
     /// Finally delete the superseded commit JSONs past the log-retention window.
     /// Errors are logged and end the round; the next poll retries.
     fn vacuum_table(&self, name: &SchemaQualifiedTableName, mut table: CatalogTable, now_ms: u64) {

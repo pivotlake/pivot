@@ -12,6 +12,7 @@ use tempfile::TempDir;
 
 use datastore::DatastoreTransaction;
 use datastore_delta::DeltaDatastore;
+use datastore_delta::test_support as harness;
 use planner::DEFAULT_DATASTORE_NAME;
 use planner::catalog::{
     Column, CreateSchemaRequest, CreateTableRequest, Result as CatalogResult,
@@ -129,6 +130,7 @@ fn created_schema_survives_a_reopen() {
 
     create_schema(&dispatch, &datastore, "analytics").unwrap();
 
+    drop(datastore);
     let reopened = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
     assert!(reopened.contains_schema("analytics"));
 }
@@ -193,20 +195,34 @@ fn rolling_back_a_create_schema_discards_the_staged_schema() {
 
     commit_datastore_transaction(transaction).unwrap();
     assert!(!datastore.contains_schema("analytics"));
+    drop(datastore);
     let reopened = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
     assert!(!reopened.contains_schema("analytics"));
 }
 
-/// A datastore that is already open learns about another process's schema only
-/// through a refresh: the manifest is the shared state, and nothing else syncs
-/// the schema set from it once the in-memory one exists.
 #[test]
-fn a_refresh_picks_up_a_schema_another_process_created() {
+fn a_second_local_datastore_is_rejected() {
     let dispatch = dispatch(1);
     let db = TempDir::new().unwrap();
-    let datastore = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
-    // A second handle on the same directory stands in for the other process.
-    let other_process = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    let _datastore = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+
+    let error = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap_err();
+
+    assert!(error.to_string().contains("already in use"));
+    assert!(error.to_string().contains(&std::process::id().to_string()));
+}
+
+/// Shared remote stores still support multiple Pivot processes. A datastore
+/// already open on S3 learns about a schema another process created when it
+/// refreshes the shared manifest.
+#[test]
+fn a_refresh_picks_up_a_schema_another_process_created() {
+    let Some(backend) = harness::s3("schema-refresh-between-processes") else {
+        return;
+    };
+    let dispatch = dispatch(1);
+    let datastore = DeltaDatastore::open(&backend.root, &dispatch).unwrap();
+    let other_process = DeltaDatastore::open(&backend.root, &dispatch).unwrap();
     create_schema(&dispatch, &datastore, "analytics").unwrap();
     assert!(!other_process.contains_schema("analytics"));
 
@@ -310,6 +326,7 @@ fn a_manifest_omitting_its_optional_fields_loads() {
         serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
     let table_ids = manifest["schemas"][0]["table_ids"].clone();
     let table_locations = manifest["table_locations"].clone();
+    drop(datastore);
     std::fs::write(
         &manifest_path,
         serde_json::to_vec(&serde_json::json!({ "version": 1 })).unwrap(),
@@ -317,6 +334,7 @@ fn a_manifest_omitting_its_optional_fields_loads() {
     .unwrap();
     let reopened = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
     assert!(reopened.contains_schema("main"));
+    drop(reopened);
 
     std::fs::write(
         &manifest_path,
@@ -374,6 +392,7 @@ fn concurrent_schema_and_table_creates_all_reach_the_manifest() {
         }
     });
 
+    drop(datastore);
     let reopened = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
     let transaction = reopened.clone().begin_transaction();
     for i in 0..CREATES {
