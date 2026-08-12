@@ -568,9 +568,9 @@ fn build_range_join(
             build_key_expr.result_type()?
         )));
     }
-    // The sorted build side compares keys by their native values, which
-    // matches SQL ordering only for these types (floats order NaN
-    // differently, strings are not fixed-width).
+    // The sorted build side compares keys by a fixed-width total order
+    // (floats by IEEE totalOrder, NaN greatest, matching the build sort);
+    // strings are not fixed-width and stay unsupported.
     match key_type {
         Type::Int8
         | Type::Int16
@@ -582,6 +582,8 @@ fn build_range_join(
         | Type::UInt64
         | Type::Int128
         | Type::Decimal { .. }
+        | Type::Float32
+        | Type::Float64
         | Type::Date
         | Type::Timestamp => {}
         other => {
