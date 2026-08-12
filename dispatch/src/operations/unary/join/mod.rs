@@ -38,6 +38,12 @@
 //! the build-side outer join: the flag array and unmatched scan run
 //! unchanged, only the unmatched build rows reach the output, and they carry
 //! no probe columns.
+//!
+//! A mark join ([`JoinKind::ProbeMark`]) emits every probe row with a
+//! `mark` boolean column instead of filtering: TRUE on a match, FALSE on a
+//! miss, NULL where SQL's three-valued `IN` cannot call the miss FALSE. It
+//! classifies rows with the probe-side miss tracking and the semi join's
+//! first-match exit, and emits batch-at-a-time with no accumulation.
 
 mod build;
 mod build_rows;
@@ -95,6 +101,16 @@ pub enum JoinKind {
     /// to take columns from, so [`JoinSpec::probe_output_indices`] must be
     /// empty.
     BuildAnti,
+    /// One output row per probe row, its listed probe columns followed by a
+    /// nullable `mark` boolean column: TRUE when some build row matched,
+    /// FALSE when none did, and NULL for the unmatched rows whose miss is
+    /// three-valued (a null probe key against a non-empty build side, or a
+    /// null-keyed build row that could have matched). SQL's `IN (...)`
+    /// semantics, which is what DuckDB compiles into this kind. Exactly one
+    /// key column per side, no build columns
+    /// ([`JoinSpec::build_output_indices`] must be empty), and no residual:
+    /// the marker's three-valued logic is defined per key comparison.
+    ProbeMark,
 }
 
 /// How a join is configured beyond the key shape it is instantiated for.
@@ -197,6 +213,11 @@ pub(crate) struct JoinTable<K> {
     pub(crate) keys: Arc<JoinCell<MultiSlabBuffer<K>>>,
     pub(crate) rows: Arc<JoinCell<MultiSlabBuffer<u32>>>,
     pub(crate) build_rows: Arc<JoinCell<BuildRows>>,
+    /// Whether any build worker saw a null key. The final worker at the build
+    /// gather barrier writes it before the table is published; probes read it
+    /// only after that publication. A mark join's misses are NULL rather than
+    /// FALSE when this is true (the null could have matched).
+    pub(crate) build_saw_null_key: Arc<JoinCell<bool>>,
 }
 
 #[cfg(test)]
@@ -382,7 +403,9 @@ mod tests {
             residual_filters: None,
         };
         let (builds, probes, _) =
-            factory::create_for_workers::<K, BUILD_OUTER, false, PROBE_OUTER, ANTI>(spec, workers);
+            factory::create_for_workers::<K, BUILD_OUTER, false, PROBE_OUTER, ANTI, false>(
+                spec, workers,
+            );
 
         let mut consumers: Vec<_> = builds
             .into_iter()
@@ -398,8 +421,13 @@ mod tests {
 
         let mut outputters: Vec<_> = consumers
             .into_iter()
-            .filter_map(|c| c.into_outputter().unwrap())
+            .enumerate()
+            .filter_map(|(worker_index, c)| {
+                crate::worker::WORKER_IDX.set(worker_index);
+                c.into_outputter().unwrap()
+            })
             .collect();
+        crate::worker::WORKER_IDX.set(0);
 
         loop {
             let mut all_done = true;

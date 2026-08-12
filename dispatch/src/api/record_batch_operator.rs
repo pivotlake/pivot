@@ -713,35 +713,53 @@ impl RecordBatchOperatorSpec {
     /// runtime test for it.
     fn join_dispatch<K: JoinKey>(self, build: RecordBatchOperatorSpec, spec: JoinSpec) -> Self {
         match spec.kind {
-            JoinKind::Inner => self.join_typed::<K, false, false, false, false>(build, spec),
-            JoinKind::BuildOuter => self.join_typed::<K, true, false, false, false>(build, spec),
-            JoinKind::ProbeOuter => self.join_typed::<K, false, false, true, false>(build, spec),
+            JoinKind::Inner => self.join_typed::<K, false, false, false, false, false>(build, spec),
+            JoinKind::BuildOuter => {
+                self.join_typed::<K, true, false, false, false, false>(build, spec)
+            }
+            JoinKind::ProbeOuter => {
+                self.join_typed::<K, false, false, true, false, false>(build, spec)
+            }
             // With a residual predicate the first key match may not be a real
             // match, so the semi join runs on the pair-recording instantiation
             // and drops duplicate probe rows at drain time instead of exiting
             // the match loop early.
             JoinKind::ProbeSemi if spec.residual_filters.is_some() => {
-                self.join_typed::<K, false, false, false, false>(build, spec)
+                self.join_typed::<K, false, false, false, false, false>(build, spec)
             }
-            JoinKind::ProbeSemi => self.join_typed::<K, false, true, false, false>(build, spec),
+            JoinKind::ProbeSemi => {
+                self.join_typed::<K, false, true, false, false, false>(build, spec)
+            }
             // An anti join runs the probe-side outer join's miss tracking and
             // emits the misses alone. One instantiation serves with and
             // without a residual: the settled flags already classify the rows
             // whose every pair a residual rejects.
-            JoinKind::ProbeAnti => self.join_typed::<K, false, false, true, true>(build, spec),
+            JoinKind::ProbeAnti => {
+                self.join_typed::<K, false, false, true, true, false>(build, spec)
+            }
             // Likewise on the build side: the outer join's flag array and
             // unmatched scan run unchanged, and only the unmatched build rows
             // come out.
-            JoinKind::BuildAnti => self.join_typed::<K, true, false, false, true>(build, spec),
+            JoinKind::BuildAnti => {
+                self.join_typed::<K, true, false, false, true, false>(build, spec)
+            }
+            // A mark join classifies every probe row: the semi join's
+            // first-match exit decides the hits, the probe-side miss tracking
+            // the misses, and neither is ever a residual question (a mark
+            // join carries none).
+            JoinKind::ProbeMark => {
+                self.join_typed::<K, false, true, true, false, true>(build, spec)
+            }
         }
     }
 
     fn join_typed<
         K: JoinKey,
         const BUILD_OUTER: bool,
-        const SEMI: bool,
-        const OUTER_JOIN_PROBE_SIDE: bool,
-        const ANTI: bool,
+        const STOP_AFTER_FIRST_MATCH: bool,
+        const TRACK_UNMATCHED_PROBE_ROWS: bool,
+        const DISCARD_MATCHED_PAIRS: bool,
+        const MARK: bool,
     >(
         self,
         build: RecordBatchOperatorSpec,
@@ -760,11 +778,14 @@ impl RecordBatchOperatorSpec {
             "join inputs must use the same worker pool"
         );
 
-        let (build_factories, probe_factories, build_ready) =
-            create_join_factories::<K, BUILD_OUTER, SEMI, OUTER_JOIN_PROBE_SIDE, ANTI>(
-                spec,
-                worker_count,
-            );
+        let (build_factories, probe_factories, build_ready) = create_join_factories::<
+            K,
+            BUILD_OUTER,
+            STOP_AFTER_FIRST_MATCH,
+            TRACK_UNMATCHED_PROBE_ROWS,
+            DISCARD_MATCHED_PAIRS,
+            MARK,
+        >(spec, worker_count);
 
         let (_, build_heads) = build.into_parts();
         let build_siblings_left = Arc::new(AtomicUsize::new(worker_count));

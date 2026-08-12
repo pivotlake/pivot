@@ -36,7 +36,8 @@ pub(super) struct ProbeMatchOutputter {
     /// The probed batch's rows that matched nothing, collected by a
     /// probe-side outer or anti join while the batch is probed and emitted
     /// once it has been. See
-    /// [`begin_probe_outer_batch`](Self::begin_probe_outer_batch) for who
+    /// [`begin_unmatched_probe_tracking`](Self::begin_unmatched_probe_tracking)
+    /// for who
     /// records into it.
     missed_probe_rows: Vec<u32>,
     /// Whether the join carries a residual predicate, which is what forces
@@ -65,9 +66,13 @@ impl ProbeMatchOutputter {
         build_rows: Arc<JoinCell<BuildRows>>,
         residual_filters: Option<ResidualFilter>,
         emits_unmatched_probe_rows: bool,
+        mark: bool,
     ) -> Self {
         let mut allocator = SlabAllocator::new(false);
-        let fields: Vec<Field> = probe_fields.iter().chain(build_fields).cloned().collect();
+        let mut fields: Vec<Field> = probe_fields.iter().chain(build_fields).cloned().collect();
+        if mark {
+            fields.push(Field::new("mark", arrow_schema::DataType::Boolean, true));
+        }
         Self {
             output_schema: Arc::new(Schema::new(fields)),
             probe: BatchAccumulator::retaining_source_buffers(
@@ -111,7 +116,7 @@ impl ProbeMatchOutputter {
     /// drain time; the settled flags exist to find those rows (see
     /// [`probe_row_settled`](Self::probe_row_settled)), and a join without a
     /// residual never allocates them.
-    pub(super) fn begin_probe_outer_batch(&mut self, rows: usize) {
+    pub(super) fn begin_unmatched_probe_tracking(&mut self, rows: usize) {
         self.missed_probe_rows.clear();
         self.missed_probe_rows.reserve(rows);
         if self.has_residual {
@@ -122,11 +127,11 @@ impl ProbeMatchOutputter {
 
     /// Record one probed row as matching nothing. The caller guarantees the
     /// verdict is final (see
-    /// [`begin_probe_outer_batch`](Self::begin_probe_outer_batch)).
+    /// [`begin_unmatched_probe_tracking`](Self::begin_unmatched_probe_tracking)).
     #[inline(always)]
     pub(super) fn record_missed_probe_row(&mut self, probe_row: usize) {
-        // Never reallocates: `begin_probe_outer_batch` reserved one slot per
-        // row of the batch.
+        // Never reallocates: `begin_unmatched_probe_tracking` reserved one
+        // slot per row of the batch.
         self.missed_probe_rows.push(probe_row as u32);
         if self.has_residual {
             self.probe_row_settled[probe_row] = 1;
@@ -187,6 +192,78 @@ impl ProbeMatchOutputter {
             }
         }
         self.append_missed_probe_rows(probe_source, sender)
+    }
+
+    /// Emit `probe_source` with a mark column built from the batch's missed
+    /// rows: TRUE for every row the miss tracking never recorded, and for the
+    /// recorded misses FALSE, or NULL when a null-keyed build row exists (the
+    /// null could have matched, so the miss is three-valued unknown).
+    pub(super) fn emit_marked_batch_from_misses(
+        &mut self,
+        probe_source: &RecordBatch,
+        build_saw_null_key: bool,
+        sender: &mut dyn Sender<RecordBatch>,
+    ) -> unary::Result<()> {
+        let rows = probe_source.num_rows();
+        let mut values = arrow_buffer::BooleanBufferBuilder::new(rows);
+        values.append_n(rows, true);
+        for &row in &self.missed_probe_rows {
+            values.set_bit(row as usize, false);
+        }
+        let validity = build_saw_null_key.then(|| {
+            let mut validity = arrow_buffer::BooleanBufferBuilder::new(rows);
+            validity.append_n(rows, true);
+            for &row in &self.missed_probe_rows {
+                validity.set_bit(row as usize, false);
+            }
+            arrow_buffer::NullBuffer::new(validity.finish())
+        });
+        self.missed_probe_rows.clear();
+        let marker = arrow_array::BooleanArray::new(values.finish(), validity);
+        self.send_marked(probe_source, Arc::new(marker), sender)
+    }
+
+    /// Emit `probe_source` with one marker value for every row: FALSE against
+    /// an empty build side, NULL for null-keyed probe rows.
+    pub(super) fn emit_marked_batch_with_constant(
+        &mut self,
+        probe_source: &RecordBatch,
+        mark: Option<bool>,
+        sender: &mut dyn Sender<RecordBatch>,
+    ) -> unary::Result<()> {
+        let marker = arrow_array::BooleanArray::from(vec![mark; probe_source.num_rows()]);
+        self.send_marked(probe_source, Arc::new(marker), sender)
+    }
+
+    /// A probed batch can be larger than an output batch (scans deliver
+    /// whatever size the source produced), and downstream operators size
+    /// their accumulators to [`RECORD_BATCH_SIZE`], so the marked rows go
+    /// out in chunks of at most that many.
+    fn send_marked(
+        &self,
+        probe_source: &RecordBatch,
+        marker: arrow_array::ArrayRef,
+        sender: &mut dyn Sender<RecordBatch>,
+    ) -> unary::Result<()> {
+        let rows = probe_source.num_rows();
+        let mut start = 0;
+        while start < rows {
+            let len = (rows - start).min(RECORD_BATCH_SIZE);
+            let columns = probe_source
+                .columns()
+                .iter()
+                .map(|column| column.slice(start, len))
+                .chain(std::iter::once(marker.slice(start, len)))
+                .collect();
+            let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(len));
+            sender.send(RecordBatch::try_new_with_options(
+                self.output_schema.clone(),
+                columns,
+                &options,
+            )?)?;
+            start += len;
+        }
+        Ok(())
     }
 
     /// Append every row of `probe_source` as missed: for the probe rows a
@@ -314,9 +391,9 @@ impl ProbeMatchOutputter {
     #[inline(never)]
     pub(super) fn drain<
         const OUTER_JOIN_BUILD_SIDE: bool,
-        const SEMI_PROBE_SIDE: bool,
-        const OUTER_JOIN_PROBE_SIDE: bool,
-        const ANTI: bool,
+        const STOP_AFTER_FIRST_MATCH: bool,
+        const TRACK_UNMATCHED_PROBE_ROWS: bool,
+        const DISCARD_MATCHED_PAIRS: bool,
     >(
         &mut self,
         probe_source: &RecordBatch,
@@ -341,7 +418,7 @@ impl ProbeMatchOutputter {
                 return Ok(());
             }
         }
-        if OUTER_JOIN_PROBE_SIDE && self.has_residual {
+        if TRACK_UNMATCHED_PROBE_ROWS && self.has_residual {
             // These indices are the pairs the residual just let through:
             // their rows matched, so settle them. A row none of whose pairs
             // ever survives a drain stays unsettled and pads as a miss.
@@ -359,7 +436,7 @@ impl ProbeMatchOutputter {
                 unsafe { AtomicU8::from_ptr(flag) }.store(1, Ordering::Relaxed);
             }
         }
-        if ANTI {
+        if DISCARD_MATCHED_PAIRS {
             // An anti join's matched pairs are not output rows; the settling
             // and flagging above is all a match contributes.
             self.matched = 0;
@@ -370,9 +447,9 @@ impl ProbeMatchOutputter {
             &self.probe_indices[..self.matched],
             &mut self.allocator,
         );
-        // A semi join has no build columns and buffered no build rows: its
-        // build side only ever contributes its (empty) column list on emit.
-        if !SEMI_PROBE_SIDE {
+        // The first-match path records no build row ids, and every join kind
+        // using it has an empty build-side output projection.
+        if !STOP_AFTER_FIRST_MATCH {
             self.build.append_from_batches(
                 &build_rows.output_columns,
                 build_rows::row_id_shift(),

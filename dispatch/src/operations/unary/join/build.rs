@@ -1,3 +1,4 @@
+use crate::GatherBarrier;
 use crate::memory::{SlabAllocator, SlabVec};
 use crate::operations::channels::Sender;
 use crate::operations::unary::join::JoinTable;
@@ -10,8 +11,8 @@ use ahash::RandomState;
 use arrow::compute::filter_record_batch;
 use arrow_array::{BooleanArray, RecordBatch};
 use crossbeam_deque::{Injector, Steal};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
 use tracing::debug;
 
 pub(crate) const NUM_PARTITIONS: usize = 64;
@@ -30,19 +31,17 @@ pub(crate) struct BuildTuple<K> {
 
 pub(crate) type PartitionBuffers<K> = Vec<SlabVec<BuildTuple<K>>>;
 
-/// Everything one build worker hands to the single [`JoinBuilder`] that
-/// assembles the join table: which worker it was (row ids are globalized in
-/// worker-id order), its partitioned tuples, and the stored build rows those
-/// tuples' ids point into.
+/// Everything one build worker publishes at the gather barrier: its
+/// partitioned tuples, the stored build rows those tuples' ids point into,
+/// and whether any build key was null.
 pub(crate) struct BuildWorkerOutput<K: Copy> {
-    worker_id: usize,
     tuples: PartitionBuffers<K>,
     build_row_batches: Vec<RecordBatch>,
+    saw_null_key: bool,
 }
 
 pub struct JoinBuildConsumer<K: JoinKey, const BUILD_OUTER: bool> {
     key_columns: Vec<usize>,
-    worker_id: usize,
     hash_state: RandomState,
     values: PartitionBuffers<K::Stored>,
     /// This worker's build rows, stored as the batches they arrived in. No
@@ -50,9 +49,11 @@ pub struct JoinBuildConsumer<K: JoinKey, const BUILD_OUTER: bool> {
     /// the arrays the upstream operator produced.
     build_row_batches: Vec<RecordBatch>,
     slab_allocator: SlabAllocator,
-    partition_sizes: Arc<Vec<AtomicUsize>>,
-    sender: mpsc::Sender<BuildWorkerOutput<K::Stored>>,
+    gather: Arc<GatherBarrier<BuildWorkerOutput<K::Stored>>>,
     outputter: JoinBuilder<K::Stored, BUILD_OUTER>,
+    /// Whether this worker saw a null-keyed build row. Published with its
+    /// other build output and combined by the final gather arrival.
+    saw_null_key: bool,
 }
 
 unsafe impl<K: JoinKey, const BUILD_OUTER: bool> Send for JoinBuildConsumer<K, BUILD_OUTER> {}
@@ -61,11 +62,8 @@ impl<K: JoinKey, const BUILD_OUTER: bool> JoinBuildConsumer<K, BUILD_OUTER> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         key_columns: Vec<usize>,
-        worker_id: usize,
         hash_state: RandomState,
-        sender: mpsc::Sender<BuildWorkerOutput<K::Stored>>,
-        receiver: Option<mpsc::Receiver<BuildWorkerOutput<K::Stored>>>,
-        partition_sizes: Arc<Vec<AtomicUsize>>,
+        gather: Arc<GatherBarrier<BuildWorkerOutput<K::Stored>>>,
         table: JoinTable<K::Stored>,
         injector: Arc<Injector<JoinPartitionJob<K::Stored>>>,
         jobs_injected: Arc<AtomicBool>,
@@ -75,23 +73,20 @@ impl<K: JoinKey, const BUILD_OUTER: bool> JoinBuildConsumer<K, BUILD_OUTER> {
     ) -> Self {
         Self {
             key_columns,
-            worker_id,
             hash_state,
             values: (0..NUM_PARTITIONS).map(|_| SlabVec::new()).collect(),
             build_row_batches: Vec::new(),
             slab_allocator: SlabAllocator::new(false),
-            partition_sizes: partition_sizes.clone(),
-            sender,
+            gather,
             outputter: JoinBuilder {
                 table,
-                receiver,
-                partition_sizes,
                 injector,
                 jobs_injected,
                 build_ready,
                 remaining_jobs,
                 build_output_indices,
             },
+            saw_null_key: false,
         }
     }
 }
@@ -140,8 +135,10 @@ impl<K: JoinKey, const BUILD_OUTER: bool> Consumer<RecordBatch, ()>
             for i in 0..stored.num_rows() {
                 // A null-keyed row can never match, so it gets no tuple. It
                 // stays stored, where only an outer build's unmatched pass
-                // ever reaches it.
+                // ever reaches it. A mark join's misses also turn NULL once
+                // such a row exists, so remember having seen one.
                 if K::is_null(&reader, i) {
+                    self.saw_null_key = true;
                     continue;
                 }
                 let key = K::read_stored(&reader, i);
@@ -160,26 +157,25 @@ impl<K: JoinKey, const BUILD_OUTER: bool> Consumer<RecordBatch, ()>
         Ok(())
     }
 
-    fn into_outputter(self) -> unary::Result<Option<Self::Outputter>> {
+    fn into_outputter(mut self) -> unary::Result<Option<Self::Outputter>> {
         debug!("Running into outputter!");
-        for (p, partition) in self.values.iter().enumerate() {
-            self.partition_sizes[p].fetch_add(partition.len(), Ordering::Relaxed);
+        let output = BuildWorkerOutput {
+            tuples: self.values,
+            build_row_batches: self.build_row_batches,
+            saw_null_key: self.saw_null_key,
+        };
+        let gather = self.gather.clone();
+        if let Some(result) = gather.arrive(output, |worker_outputs| {
+            self.outputter.initialize(worker_outputs)
+        }) {
+            result?;
         }
-        self.sender
-            .send(BuildWorkerOutput {
-                worker_id: self.worker_id,
-                tuples: self.values,
-                build_row_batches: self.build_row_batches,
-            })
-            .unwrap();
         Ok(Some(self.outputter))
     }
 }
 
 pub struct JoinBuilder<K: Copy + Send, const BUILD_OUTER: bool> {
     table: JoinTable<K>,
-    receiver: Option<mpsc::Receiver<BuildWorkerOutput<K>>>,
-    partition_sizes: Arc<Vec<AtomicUsize>>,
     injector: Arc<Injector<JoinPartitionJob<K>>>,
     jobs_injected: Arc<AtomicBool>,
     build_ready: Arc<AtomicBool>,
@@ -265,83 +261,88 @@ impl<K: Copy + Send> JoinPartitionJob<K> {
     }
 }
 
+impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> JoinBuilder<K, OUTER_JOIN_BUILD_SIDE> {
+    /// Combine the gathered worker outputs, initialize the shared table, and
+    /// publish its partition jobs. Called only by the final gather arrival.
+    fn initialize(&mut self, mut worker_outputs: Vec<BuildWorkerOutput<K>>) -> unary::Result<()> {
+        let build_saw_null_key = worker_outputs.iter().any(|output| output.saw_null_key);
+        unsafe { *self.table.build_saw_null_key.get() = build_saw_null_key };
+
+        let sizes: Vec<usize> = (0..NUM_PARTITIONS)
+            .map(|partition| {
+                worker_outputs
+                    .iter()
+                    .map(|output| output.tuples[partition].len())
+                    .sum()
+            })
+            .collect();
+        let total: usize = sizes.iter().sum();
+
+        // GatherBarrier returns outputs in worker order. Merge the stored
+        // build rows in that same order, so each worker-local tuple id gets
+        // the corresponding row base during scatter. An empty merge means an
+        // empty build side, and the probe then emits nothing. For an outer
+        // build this also allocates one matched flag per row id (gaps
+        // included); null-keyed rows have no tuple and remain unmatched.
+        let (build_rows, row_bases) = BuildRows::new::<OUTER_JOIN_BUILD_SIDE>(
+            worker_outputs
+                .iter_mut()
+                .map(|output| std::mem::take(&mut output.build_row_batches)),
+            &self.build_output_indices,
+        )?;
+        unsafe { *self.table.build_rows.get() = build_rows };
+
+        // Pre-allocate directory and arenas.
+        let dir_capacity = ((total as f64 * 1.125) as usize)
+            .next_power_of_two()
+            .max(NUM_PARTITIONS);
+        let directory = unsafe { &mut *self.table.directory.get() };
+        let mut directory_alloc = SlabAllocator::new(false);
+        *directory = JoinDirectory::new(
+            directory_alloc.create_multi_slab_buffer(dir_capacity + 1, true),
+            dir_capacity,
+        );
+
+        // Sentinel at entry[capacity] holds the end pointer of the last slot.
+        // Probe reads end_ptr(slot+1) for slot = capacity-1, which lands here.
+        directory.set_entry(dir_capacity, (total as u64) << 16);
+
+        let mut arena_alloc = SlabAllocator::new(false);
+        let keys = unsafe { &mut *self.table.keys.get() };
+        *keys = arena_alloc.create_multi_slab_buffer::<K>(total.max(1), false);
+        let rows = unsafe { &mut *self.table.rows.get() };
+        *rows = arena_alloc.create_multi_slab_buffer::<u32>(total.max(1), false);
+
+        // Prefix sums give each partition its arena offset.
+        let mut offsets = vec![0usize; NUM_PARTITIONS];
+        for p in 1..NUM_PARTITIONS {
+            offsets[p] = offsets[p - 1] + sizes[p - 1];
+        }
+
+        let slots_per_partition = dir_capacity / NUM_PARTITIONS;
+        for (i, &arena_offset) in offsets.iter().enumerate() {
+            let tuples: Vec<(u32, SlabVec<BuildTuple<K>>)> = worker_outputs
+                .iter_mut()
+                .zip(&row_bases)
+                .map(|(output, &row_base)| (row_base, std::mem::take(&mut output.tuples[i])))
+                .collect();
+            self.injector.push(JoinPartitionJob {
+                tuples,
+                table: self.table.clone(),
+                arena_offset,
+                slot_start: i * slots_per_partition,
+                remaining_jobs: self.remaining_jobs.clone(),
+            });
+        }
+        self.jobs_injected.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> Outputter<()>
     for JoinBuilder<K, OUTER_JOIN_BUILD_SIDE>
 {
     fn output(&mut self, _sender: &mut dyn Sender<()>) -> unary::Result<bool> {
-        if let Some(rx) = self.receiver.take() {
-            let mut worker_outputs: Vec<BuildWorkerOutput<K>> = rx.into_iter().collect();
-            // Row ids are globalized in worker-id order, so the merged build
-            // row batches must follow the same order.
-            worker_outputs.sort_by_key(|output| output.worker_id);
-
-            let sizes: Vec<usize> = self
-                .partition_sizes
-                .iter()
-                .map(|a| a.load(Ordering::Relaxed))
-                .collect();
-            let total: usize = sizes.iter().sum();
-
-            // Merge every worker's stored build rows, in worker-id order, and
-            // prepare them once for every probe worker; tuples carry
-            // worker-local ids and get their worker's returned base added
-            // during scatter. An empty merge means an empty build side, and
-            // the probe then emits nothing. For an outer build this also
-            // allocates one matched flag per row id (gaps included);
-            // null-keyed rows have no tuple and therefore remain unmatched.
-            let (build_rows, row_bases) = BuildRows::new::<OUTER_JOIN_BUILD_SIDE>(
-                worker_outputs
-                    .iter_mut()
-                    .map(|output| std::mem::take(&mut output.build_row_batches)),
-                &self.build_output_indices,
-            )?;
-            unsafe { *self.table.build_rows.get() = build_rows };
-
-            // Pre-allocate directory and arenas.
-            let dir_capacity = ((total as f64 * 1.125) as usize)
-                .next_power_of_two()
-                .max(NUM_PARTITIONS);
-            let directory = unsafe { &mut *self.table.directory.get() };
-            let mut directory_alloc = SlabAllocator::new(false);
-            *directory = JoinDirectory::new(
-                directory_alloc.create_multi_slab_buffer(dir_capacity + 1, true),
-                dir_capacity,
-            );
-
-            // Sentinel at entry[capacity] holds the end pointer of the last slot.
-            // Probe reads end_ptr(slot+1) for slot = capacity-1, which lands here.
-            directory.set_entry(dir_capacity, (total as u64) << 16);
-
-            let mut arena_alloc = SlabAllocator::new(false);
-            let keys = unsafe { &mut *self.table.keys.get() };
-            *keys = arena_alloc.create_multi_slab_buffer::<K>(total.max(1), false);
-            let rows = unsafe { &mut *self.table.rows.get() };
-            *rows = arena_alloc.create_multi_slab_buffer::<u32>(total.max(1), false);
-
-            // Prefix sums give each partition its arena offset.
-            let mut offsets = vec![0usize; NUM_PARTITIONS];
-            for p in 1..NUM_PARTITIONS {
-                offsets[p] = offsets[p - 1] + sizes[p - 1];
-            }
-
-            let slots_per_partition = dir_capacity / NUM_PARTITIONS;
-            for (i, &arena_offset) in offsets.iter().enumerate() {
-                let tuples: Vec<(u32, SlabVec<BuildTuple<K>>)> = worker_outputs
-                    .iter_mut()
-                    .zip(&row_bases)
-                    .map(|(output, &row_base)| (row_base, std::mem::take(&mut output.tuples[i])))
-                    .collect();
-                self.injector.push(JoinPartitionJob {
-                    tuples,
-                    table: self.table.clone(),
-                    arena_offset,
-                    slot_start: i * slots_per_partition,
-                    remaining_jobs: self.remaining_jobs.clone(),
-                });
-            }
-            self.jobs_injected.store(true, Ordering::Relaxed);
-        }
-
         match self.injector.steal() {
             Steal::Success(job) => {
                 job.run();
