@@ -45,15 +45,15 @@ as the engine grows the features each needs.
 | q13 | Customer Distribution | customer/orders outer join, orders per customer, then a histogram of those counts |
 | q14 | Promotion Effect | lineitem/part, promo share of revenue |
 | q15 | Top Supplier | a revenue CTE read twice, equality join against its own MAX via a scalar subquery |
+| q16 | Parts/Supplier Relationship | two mark joins (an IN list rewritten into a constant chunk, a NOT IN subquery), count(distinct) per group |
 | q17 | Small-Quantity-Order Revenue | a correlated scalar average decorrelated into a LEFT delim join |
 | q18 | Large Volume Customer | orders semi-joined against the order keys whose quantities sum above 300, then the top 100 by price |
 | q19 | Discounted Revenue | lineitem/part, a three-disjunct OR over both sides riding the join as a residual condition |
 
 The rest of the 22 need engine features that are not in yet: flipped delim
 joins, where DuckDB de-duplicates the right-hand side instead of the left
-(q21, q22), mark joins and the constant-chunk scan its IN-list rewrite
-produces (q16), RIGHT_SEMI (q20), and the `substring` scalar function
-(q22). LEFT, SEMI, and ANTI delim joins (the shapes DuckDB
+(q21, q22), RIGHT_SEMI (q20), and the `substring` scalar function (q22).
+LEFT, SEMI, and ANTI delim joins (the shapes DuckDB
 decorrelates q04 and q17's correlated subqueries, and a `NOT EXISTS`, into)
 are supported: the outer side runs once and is read both by the join and by
 a distinct on the correlation columns, whose output feeds the subquery
@@ -86,6 +86,12 @@ RIGHT_ANTI that same optimizer rewrites it into whenever the preserved
 relation is the cheaper build lands build-side. What q21 and q22 still miss
 is not the anti join itself but the flipped delim join above it (q22 also
 needs `substring`).
+
+Mark joins run probe-side and append the three-valued boolean marker `IN`
+calls for: TRUE on a match, FALSE on a miss, NULL where a null key leaves
+the miss unknown. That covers both of q16's shapes, the uncorrelated
+`NOT IN` subquery and the IN list DuckDB rewrites into a scan of an
+in-memory constant chunk (which runs as an inline VALUES source).
 
 q10 used to come back with a corrupted `c_comment` group key at SF100
 (fragments of other rows, with the length prefix of a neighbouring field
