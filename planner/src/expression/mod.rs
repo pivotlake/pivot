@@ -218,6 +218,61 @@ impl Expression {
         }
     }
 
+    /// Shift every column index this expression reads by `offset`. For
+    /// rebinding an expression resolved against one input so it reads from
+    /// that input's columns placed after `offset` others (e.g. a join
+    /// condition's build-side operand evaluated over probe-then-build
+    /// concatenated columns).
+    pub fn shift_column_refs(&mut self, offset: usize) {
+        match self {
+            Expression::Ref(r) => r.column_idx += offset,
+            Expression::Constant(_) => {}
+            Expression::Compare(c) => {
+                c.left.shift_column_refs(offset);
+                c.right.shift_column_refs(offset);
+            }
+            Expression::Between(b) => {
+                b.input.shift_column_refs(offset);
+                b.lower.shift_column_refs(offset);
+                b.upper.shift_column_refs(offset);
+            }
+            Expression::AggregateFunc(a) => {
+                for argument in a.arguments_mut() {
+                    argument.shift_column_refs(offset);
+                }
+            }
+            Expression::Function(f) => {
+                f.for_each_argument_mut(&mut |argument| argument.shift_column_refs(offset));
+            }
+            Expression::InList(l) => {
+                l.input.shift_column_refs(offset);
+                for value in &mut l.values {
+                    value.shift_column_refs(offset);
+                }
+            }
+            Expression::Conjunction(c) => {
+                for child in &mut c.children {
+                    child.shift_column_refs(offset);
+                }
+            }
+            Expression::Case(c) => {
+                for check in &mut c.checks {
+                    check.when.shift_column_refs(offset);
+                    check.then.shift_column_refs(offset);
+                }
+                c.else_expr.shift_column_refs(offset);
+            }
+            Expression::MaybeError(m) => {
+                m.check.shift_column_refs(offset);
+                m.message.shift_column_refs(offset);
+                m.value.shift_column_refs(offset);
+            }
+            Expression::Not(n) => n.input.shift_column_refs(offset),
+            Expression::IsNull(n) => n.input.shift_column_refs(offset),
+            Expression::Cast(c) => c.source.shift_column_refs(offset),
+        }
+    }
+
     /// Static result type of a computed expression. Used to pick a group-key
     /// extractor when grouping on it (e.g. `GROUP BY CASE …`) and to derive
     /// each operator's output types (see `PlanNode::output_types`).

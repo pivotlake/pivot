@@ -415,3 +415,244 @@ fn a_small_outer_in_over_a_correlated_aggregate_runs_build_side_semi(
             .clone()
     );
 }
+
+/// A tiny outer table against a big subquery table: DuckDB flips the delim
+/// join (the outer rows become the RHS, the dedup source, and the build),
+/// and the join type arrives mirrored. Request 5's part is NULL.
+fn add_requests_and_history(planner: &TestingPlanner) {
+    planner.add_table(
+        "requests",
+        &[
+            ("r_id", Type::Int64, int64_col(vec![1, 2, 3, 4, 5])),
+            (
+                "r_part",
+                Type::Int64,
+                Arc::new(Int64Array::from(vec![
+                    Some(10),
+                    Some(10),
+                    Some(20),
+                    Some(30),
+                    None,
+                ])),
+            ),
+            ("r_grp", Type::Int64, int64_col(vec![1, 2, 1, 2, 1])),
+            ("r_qty", Type::Int64, int64_col(vec![5, 60, 7, 1, 9])),
+        ],
+    );
+    planner.add_table(
+        "history",
+        &[
+            (
+                "h_part",
+                Type::Int64,
+                int64_col((0..1000).map(|i| i % 25 * 10).collect()),
+            ),
+            (
+                "h_grp",
+                Type::Int64,
+                int64_col((0..1000).map(|i| i % 3).collect()),
+            ),
+            (
+                "h_qty",
+                Type::Int64,
+                int64_col((0..1000).map(|i| i % 100).collect()),
+            ),
+        ],
+    );
+}
+
+/// A correlated EXISTS whose outer side is the small one arrives as a flipped
+/// RIGHT_SEMI delim join, running as a build-side semi over the outer rows.
+/// Every non-NULL part holds history above the threshold; the NULL-part
+/// request matches nothing and drops.
+#[rstest]
+fn a_small_outer_exists_runs_as_a_flipped_semi_delim_join(mut testing_planner: TestingPlanner) {
+    add_requests_and_history(&testing_planner);
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT r_id FROM requests \
+         WHERE EXISTS (SELECT 1 FROM history WHERE h_part = r_part AND h_qty > 70) \
+         ORDER BY r_id",
+    );
+
+    assert_eq!(
+        rows,
+        serde_json::json!([{"r_id": 1}, {"r_id": 2}, {"r_id": 3}, {"r_id": 4}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
+/// The NOT EXISTS mirror arrives as a flipped RIGHT_ANTI delim join, running
+/// as a build-side anti over the outer rows. Part 10 peaks at quantity 76 and
+/// so has nothing above the threshold, and the NULL-part request finds no
+/// history at all (its correlated equality compares against NULL); the anti
+/// join keeps those, including the tuple-less NULL-keyed build row.
+#[rstest]
+fn a_small_outer_not_exists_runs_as_a_flipped_anti_delim_join(mut testing_planner: TestingPlanner) {
+    add_requests_and_history(&testing_planner);
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT r_id FROM requests \
+         WHERE NOT EXISTS (SELECT 1 FROM history WHERE h_part = r_part AND h_qty > 76) \
+         ORDER BY r_id",
+    );
+
+    assert_eq!(
+        rows,
+        serde_json::json!([{"r_id": 1}, {"r_id": 2}, {"r_id": 5}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
+/// An EXISTS and a NOT EXISTS over the same big table, correlated on two
+/// columns, decorrelate into two nested flipped delim joins (RIGHT_ANTI over
+/// RIGHT_SEMI) each de-duplicating both. Per (part, group) the history peaks
+/// at quantity 76, 76, 77, and 78 for the four keyed requests, so only the
+/// part-10 requests pass both thresholds.
+#[rstest]
+fn nested_flipped_semi_and_anti_delim_joins_run_the_double_exists(
+    mut testing_planner: TestingPlanner,
+) {
+    add_requests_and_history(&testing_planner);
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT r_id FROM requests \
+         WHERE EXISTS (SELECT 1 FROM history \
+                       WHERE h_part = r_part AND h_grp = r_grp AND h_qty > 70) \
+           AND NOT EXISTS (SELECT 1 FROM history \
+                           WHERE h_part = r_part AND h_grp = r_grp AND h_qty > 76) \
+         ORDER BY r_id",
+    );
+
+    assert_eq!(
+        rows,
+        serde_json::json!([{"r_id": 1}, {"r_id": 2}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
+/// The q21 shape: the EXISTS carries a non-equality correlated condition
+/// beside its key (`h_qty <> r_qty`), which reaches the subquery side's inner
+/// join as a comparison-form condition and must ride it as a residual. The
+/// quantity column joins the correlation key in the two-column dedup.
+#[rstest]
+fn a_correlated_not_equal_rides_the_subquery_join_as_a_residual(
+    mut testing_planner: TestingPlanner,
+) {
+    add_requests_and_history(&testing_planner);
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT r_id FROM requests \
+         WHERE EXISTS (SELECT 1 FROM history \
+                       WHERE h_part = r_part AND h_qty <> r_qty AND h_qty > 70) \
+           AND NOT EXISTS (SELECT 1 FROM history \
+                           WHERE h_part = r_part AND h_qty <> r_qty AND h_qty > 76) \
+         ORDER BY r_id",
+    );
+
+    assert_eq!(
+        rows,
+        serde_json::json!([{"r_id": 1}, {"r_id": 2}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
+/// The q20 shape at small scale, where DuckDB flips the delim join too: a
+/// two-key correlated aggregate arrives as a flipped RIGHT delim join (a
+/// build-side outer over the stock rows) under a build-side semi join over
+/// the suppliers. One stock row's (part, supplier) pair has no deliveries at
+/// all, so its aggregate pads to NULL and the comparison drops it, which is
+/// what keeps supplier delta out.
+#[rstest]
+fn a_flipped_two_key_aggregate_delim_join_pads_its_build_side(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "suppliers",
+        &[
+            ("sup_key", Type::Int64, int64_col(vec![10, 20, 30, 40])),
+            (
+                "sup_name",
+                Type::Utf8,
+                str_col(vec!["alpha", "beta", "gamma", "delta"]),
+            ),
+        ],
+    );
+    testing_planner.add_table(
+        "catalog_parts",
+        &[
+            ("p_key", Type::Int64, int64_col((1..=20).collect())),
+            (
+                "p_flag",
+                Type::Utf8,
+                str_col(
+                    (1..=20)
+                        .map(|i| if i % 2 == 0 { "a" } else { "b" })
+                        .collect(),
+                ),
+            ),
+        ],
+    );
+    let mut stock_parts: Vec<i64> = (0..60).map(|i| i % 20 + 1).collect();
+    let mut stock_suppliers: Vec<i64> = (0..60).map(|i| (i % 3 + 1) * 10).collect();
+    let mut stock_quantities: Vec<i64> = (0..60).map(|i| i * 7 % 60).collect();
+    stock_parts.push(2);
+    stock_suppliers.push(40);
+    stock_quantities.push(99);
+    testing_planner.add_table(
+        "stock",
+        &[
+            ("ps_part", Type::Int64, int64_col(stock_parts)),
+            ("ps_sup", Type::Int64, int64_col(stock_suppliers)),
+            ("ps_avail", Type::Int64, int64_col(stock_quantities)),
+        ],
+    );
+    testing_planner.add_table(
+        "deliveries",
+        &[
+            (
+                "d_part",
+                Type::Int64,
+                int64_col((0..120).map(|i| i % 20 + 1).collect()),
+            ),
+            (
+                "d_sup",
+                Type::Int64,
+                int64_col((0..120).map(|i| (i % 3 + 1) * 10).collect()),
+            ),
+            (
+                "d_qty",
+                Type::Int64,
+                int64_col((0..120).map(|i| i * 13 % 50).collect()),
+            ),
+        ],
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT sup_name FROM suppliers WHERE sup_key IN ( \
+           SELECT ps_sup FROM stock \
+           WHERE ps_part IN (SELECT p_key FROM catalog_parts WHERE p_flag = 'a') \
+             AND ps_avail > (SELECT 0.5 * sum(d_qty) FROM deliveries \
+                             WHERE d_part = ps_part AND d_sup = ps_sup)) \
+         ORDER BY sup_name",
+    );
+
+    assert_eq!(
+        rows,
+        serde_json::json!([{"sup_name": "alpha"}, {"sup_name": "beta"}, {"sup_name": "gamma"}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}

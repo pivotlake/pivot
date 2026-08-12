@@ -143,6 +143,45 @@ impl Function {
             Function::VariantGet(v) => visit(&v.input),
         }
     }
+
+    /// The mutable twin of [`for_each_argument`](Self::for_each_argument),
+    /// for passes that rewrite child expressions in place.
+    pub fn for_each_argument_mut(&mut self, visit: &mut impl FnMut(&mut Expression)) {
+        match self {
+            Function::Contains(c) => {
+                visit(&mut c.needle);
+                visit(&mut c.haystack);
+            }
+            Function::Prefix(p) => {
+                visit(&mut p.haystack);
+                visit(&mut p.prefix);
+            }
+            Function::Suffix(s) => {
+                visit(&mut s.haystack);
+                visit(&mut s.suffix);
+            }
+            Function::Like(l) => visit(&mut l.input),
+            Function::Arithmetic(a) => {
+                visit(&mut a.left);
+                visit(&mut a.right);
+            }
+            Function::Length(l) => visit(&mut l.input),
+            Function::RegexpReplace(r) => visit(&mut r.input),
+            // The pattern is a plan-time constant, not a child expression.
+            Function::RegexpFullMatch(r) => visit(&mut r.input),
+            Function::RegexpJitReplace(r) => visit(&mut r.input),
+            Function::Divide(d) => {
+                visit(&mut d.left);
+                visit(&mut d.right);
+            }
+            Function::DateTrunc(d) => visit(&mut d.source),
+            Function::DatePart(d) => visit(&mut d.source),
+            Function::IntervalArithmetic(i) => visit(&mut i.operand),
+            Function::TemporalConvert(t) => visit(&mut t.source),
+            Function::DropCache | Function::Now => {}
+            Function::VariantGet(v) => visit(&mut v.input),
+        }
+    }
 }
 
 impl Display for Function {

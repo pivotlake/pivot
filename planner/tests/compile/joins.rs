@@ -159,6 +159,137 @@ fn join_sides_flip_with_table_sizes(mut testing_planner: TestingPlanner) {
     assert_eq!(rows, vec![serde_json::json!({"n": 2})]);
 }
 
+/// The q21 shape at realistic relative cardinalities: an EXISTS and a NOT
+/// EXISTS over the probed table itself, each carrying a `<>` beside its
+/// correlation key, arrive as two nested flipped delim joins (a build-side
+/// semi under a build-side anti) whose subquery joins run the `<>` as a
+/// residual, aggregated and top-100'd above. Verified against DuckDB on the
+/// same data.
+#[test]
+fn a_double_exists_with_a_not_equal_runs_as_nested_flipped_delim_joins() {
+    // Two chained delim tees keep more CTE buffers live at once than the
+    // default test ring holds.
+    let mut testing_planner = testing_planner_with_ring_slots(128);
+    testing_planner.add_table(
+        "nation",
+        &[
+            ("n_nationkey", Type::Int64, int64_col((0..25).collect())),
+            (
+                "n_name",
+                Type::Utf8,
+                str_col(
+                    (0..25)
+                        .map(|i| if i == 5 { "CANADA" } else { "OTHER" })
+                        .collect(),
+                ),
+            ),
+        ],
+    );
+    testing_planner.add_table(
+        "supplier",
+        &[
+            ("s_suppkey", Type::Int64, int64_col((0..100).collect())),
+            (
+                "s_nationkey",
+                Type::Int64,
+                int64_col((0..100).map(|i| i % 25).collect()),
+            ),
+        ],
+    );
+    testing_planner.add_table(
+        "orders",
+        &[
+            ("o_orderkey", Type::Int64, int64_col((0..5000).collect())),
+            (
+                "o_orderstatus",
+                Type::Utf8,
+                str_col(
+                    (0..5000)
+                        .map(|i| if i % 2 == 0 { "F" } else { "O" })
+                        .collect(),
+                ),
+            ),
+        ],
+    );
+    testing_planner.add_table(
+        "lineitem",
+        &[
+            (
+                "l_orderkey",
+                Type::Int64,
+                int64_col((0..20000).map(|i| i % 5000).collect()),
+            ),
+            (
+                "l_suppkey",
+                Type::Int64,
+                int64_col((0..20000).map(|i| i % 97).collect()),
+            ),
+            (
+                "l_receiptdate",
+                Type::Int64,
+                int64_col((0..20000).map(|i| i * 13 % 31).collect()),
+            ),
+            (
+                "l_commitdate",
+                Type::Int64,
+                int64_col((0..20000).map(|i| i * 17 % 31).collect()),
+            ),
+        ],
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT s_suppkey, count(*) AS numwait \
+         FROM supplier, lineitem l1, orders, nation \
+         WHERE s_suppkey = l1.l_suppkey AND o_orderkey = l1.l_orderkey \
+           AND o_orderstatus = 'F' AND l1.l_receiptdate > l1.l_commitdate \
+           AND EXISTS (SELECT * FROM lineitem l2 WHERE l2.l_orderkey = l1.l_orderkey \
+                       AND l2.l_suppkey <> l1.l_suppkey) \
+           AND NOT EXISTS (SELECT * FROM lineitem l3 WHERE l3.l_orderkey = l1.l_orderkey \
+                           AND l3.l_suppkey <> l1.l_suppkey \
+                           AND l3.l_receiptdate > l3.l_commitdate) \
+           AND s_nationkey = n_nationkey AND n_name = 'CANADA' \
+         GROUP BY s_suppkey ORDER BY numwait DESC, s_suppkey LIMIT 100",
+    );
+
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"s_suppkey": 55, "numwait": 6},
+            {"s_suppkey": 5, "numwait": 5},
+            {"s_suppkey": 30, "numwait": 5},
+            {"s_suppkey": 80, "numwait": 4},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
+
+// A non-equality comparison beside the key equality arrives as a second
+// comparison-form join condition (not an expression) and rides the join as a
+// residual over the key-matched pairs.
+#[rstest]
+fn join_with_an_inequality_beside_the_key_condition(mut testing_planner: TestingPlanner) {
+    add_orders_and_items(&testing_planner);
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT i_qty, o_status FROM items JOIN orders ON i_order = o_key \
+         AND i_qty < o_key * 15",
+    );
+
+    // Order 1's 10-quantity item sits below its threshold of 15; its
+    // 20-quantity item and order 2's 30-quantity item (threshold 30) do not.
+    assert_eq!(
+        rows,
+        serde_json::json!([{"i_qty": 10, "o_status": "open"}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
 // An ON predicate referencing both sides that is not a bare comparison rides
 // the join as its residual, evaluated on key-matched pairs; only the pairs it
 // accepts are matches.

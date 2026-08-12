@@ -27,7 +27,9 @@ use duckdb_planner::handle::{
 };
 
 use crate::catalog::BoundTable;
-use crate::expression::{Cast, Error as ExpressionError, Expression, Function, Ref, VariantGet};
+use crate::expression::{
+    Cast, Compare, CompareType, Error as ExpressionError, Expression, Function, Ref, VariantGet,
+};
 use crate::operator::{
     Aggregate, Compact, CopyFromStdin, CreateSchema, CreateTable, CreateUser, Cte, CteScan,
     Distinct, DropTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Insert, Join,
@@ -412,19 +414,35 @@ fn build_join(
     if key_types.is_empty() {
         return build_range_join(op, join, inputs, inequalities, residual_predicates);
     }
-    if !inequalities.is_empty() {
-        return Err(OperatorError::Unsupported(format!(
-            "Unsupported join comparison type: {:?}",
-            inequalities[0].comparison
-        )));
-    }
-
-    let residual_filters = residual_predicates
+    let mut residual_filters = residual_predicates
         .into_iter()
         .map(Expression::from_handle)
         .collect::<Result<Vec<_>, _>>()?;
 
     let probe_types = inputs[0].output_types()?;
+    // A non-equality comparison condition beside the hash equalities (e.g.
+    // `l = r AND a <> b`) rides the join as one more residual over the
+    // key-matched pairs. Its left operand was resolved against the probe
+    // input alone and its right against the build input alone, so the build
+    // side's column refs shift past the probe columns into the combined
+    // probe-then-build layout every residual is evaluated in.
+    for condition in inequalities {
+        let message = format!(
+            "Unsupported join comparison type: {:?}",
+            condition.comparison
+        );
+        let compare_type = CompareType::try_from(condition.comparison)
+            .map_err(|_| OperatorError::Unsupported(message))?;
+        let left = Expression::from_handle(condition.left)?;
+        let mut right = Expression::from_handle(condition.right)?;
+        right.shift_column_refs(probe_types.len());
+        residual_filters.push(Expression::Compare(Compare {
+            left: Box::new(left),
+            right: Box::new(right),
+            compare_type,
+            return_type: Type::Boolean,
+        }));
+    }
     let build_types = inputs[1].output_types()?;
     let left_map: Vec<usize> = join.left_projection_map()?;
     let right_map: Vec<usize> = join.right_projection_map()?;
@@ -900,6 +918,20 @@ fn build_delim_get_scan(
 /// with NULL build columns; SEMI keeps a probing row only when an answer
 /// exists, and ANTI (a decorrelated `NOT EXISTS`) only when none does.
 ///
+/// A *flipped* delim join is DuckDB's mirror image of all of the above: its
+/// build-probe-side optimizer swaps the children whenever the outer side is
+/// the cheaper one to build the hash table from, marks the join
+/// `delim_flipped`, and mirrors the join type. The outer rows (and with them
+/// the dedup source) are then the plan's RIGHT child, the subquery side with
+/// the DELIM_GETs the LEFT, and the join arrives as RIGHT, RIGHT_SEMI,
+/// RIGHT_ANTI, or INNER. The translation here is the same CTE structure with
+/// the join's sides swapped: the subquery side probes and the outer rows are
+/// the build, so the mirrored types land on the build-side kinds
+/// ([`JoinKind::BuildOuter`], [`JoinKind::BuildSemi`],
+/// [`JoinKind::BuildAnti`]), each of which preserves (or drops) build rows
+/// exactly as its probe-side twin treats probe rows. No reorder is needed:
+/// probe-then-build columns is LHS-then-RHS, DuckDB's output order.
+///
 /// DuckDB may express the final delim-join condition as `IS NOT DISTINCT FROM`
 /// because the distinct key set can contain NULL. For the supported shapes,
 /// the subquery reaches this final join through its own ordinary equality
@@ -908,20 +940,22 @@ fn build_delim_get_scan(
 /// identically, while a NULL-keyed outer row remains unmatched and is padded
 /// for LEFT, discarded for SEMI/INNER, and kept for ANTI, matching DuckDB's
 /// result (a `NOT EXISTS` whose correlated equality compares against NULL
-/// finds no row, so it holds).
+/// finds no row, so it holds). The flipped kinds inherit the argument: a
+/// NULL-keyed outer row is then a build row without a hash-table tuple, which
+/// the build-side outer join pads, the build-side semi join drops, and the
+/// build-side anti join emits.
 fn build_delim_join(
     op: LogicalOp<'_>,
     delim: DelimJoinView<'_>,
     ctx: &mut BuildCtx,
 ) -> Result<PlanNode, OperatorError> {
-    if delim.is_flipped()? {
-        return Err(OperatorError::Unsupported(
-            "flipped delim join (de-duplicating the RHS) is not supported".to_string(),
-        ));
-    }
+    let flipped = delim.is_flipped()?;
     let join = delim.join();
 
-    let outer_side = build_node(op.child(0)?, ctx)?;
+    // The outer side (the dedup source) is the LHS, or the RHS of a flipped
+    // join; the subquery side holding the DELIM_GETs is the other child.
+    let (outer_child, subquery_child) = if flipped { (1, 0) } else { (0, 1) };
+    let outer_side = build_node(op.child(outer_child)?, ctx)?;
     let outer_types = outer_side.output_types()?;
     let outer_nullability = outer_side.output_nullability();
 
@@ -955,7 +989,7 @@ fn build_delim_join(
             .collect(),
     );
 
-    let subquery_child = op.child(1)?;
+    let subquery_child = op.child(subquery_child)?;
     let subquery_side =
         ctx.with_delim_target(dedup_keys_cte, |ctx| build_node(subquery_child, ctx))?;
     let delim_scan_sites = ctx.take_cte_sites(dedup_keys_cte);
@@ -986,9 +1020,16 @@ fn build_delim_join(
                 condition.comparison
             )));
         }
-        let (outer_key, outer_key_type) = join_key_ref(Expression::from_handle(condition.left)?)?;
+        // A condition's left ref binds to the plan's left child, so on a
+        // flipped join the outer key is the right ref.
+        let (outer_ref, subquery_ref) = if flipped {
+            (condition.right, condition.left)
+        } else {
+            (condition.left, condition.right)
+        };
+        let (outer_key, outer_key_type) = join_key_ref(Expression::from_handle(outer_ref)?)?;
         let (subquery_key, subquery_key_type) =
-            join_key_ref(Expression::from_handle(condition.right)?)?;
+            join_key_ref(Expression::from_handle(subquery_ref)?)?;
         if outer_key_type != subquery_key_type {
             return Err(OperatorError::Unsupported(format!(
                 "join key types differ: {outer_key_type:?} vs {subquery_key_type:?} \
@@ -1010,15 +1051,20 @@ fn build_delim_join(
     let subquery_nullability = subquery_side.output_nullability();
     let left_map: Vec<usize> = join.left_projection_map()?;
     let right_map: Vec<usize> = join.right_projection_map()?;
-    let outer_output: Vec<usize> = if left_map.is_empty() {
+    let (outer_map, subquery_map) = if flipped {
+        (right_map, left_map)
+    } else {
+        (left_map, right_map)
+    };
+    let outer_output: Vec<usize> = if outer_map.is_empty() {
         (0..outer_types.len()).collect()
     } else {
-        left_map
+        outer_map
     };
-    let subquery_output: Vec<usize> = if right_map.is_empty() {
+    let subquery_output: Vec<usize> = if subquery_map.is_empty() {
         (0..subquery_types.len()).collect()
     } else {
-        right_map
+        subquery_map
     };
 
     let read_outer_rows = || PlanNode {
@@ -1040,35 +1086,78 @@ fn build_delim_join(
     let outer_column_types = column_types(&outer_output, &outer_types, &outer_nullability);
     let subquery_column_types =
         column_types(&subquery_output, &subquery_types, &subquery_nullability);
-    // Every kind keeps the natural orientation: the outer side probes the
-    // subquery side's (small, one row per distinct key) answer table. LEFT
-    // preserves the outer side through the probe-side outer mode, and a semi
-    // or anti join emits no build column at all (see `build_join`).
-    let (kind, build_output, build_column_types) = match join.join_type()? {
-        JoinType::LEFT => (JoinKind::ProbeOuter, subquery_output, subquery_column_types),
-        JoinType::INNER => (JoinKind::Inner, subquery_output, subquery_column_types),
-        JoinType::SEMI => (JoinKind::ProbeSemi, Vec::new(), Vec::new()),
-        JoinType::ANTI => (JoinKind::ProbeAnti, Vec::new(), Vec::new()),
-        other => {
-            return Err(OperatorError::Unsupported(format!(
-                "Unsupported delim join type: {other:?}"
-            )));
-        }
+    // Natural orientation: the outer side probes the subquery side's (small,
+    // one row per distinct key) answer table, LEFT preserving the outer side
+    // through the probe-side outer mode. A flipped join swaps the sides, so
+    // the subquery side probes the outer rows and the mirrored types land on
+    // the build-side kinds. Either way a semi or anti join emits its
+    // preserved side's columns alone, and the other side's projection map
+    // must not be read (see `build_join`).
+    let (join_inputs, join_operator) = if flipped {
+        let kind = match join.join_type()? {
+            JoinType::RIGHT => JoinKind::BuildOuter,
+            JoinType::INNER => JoinKind::Inner,
+            JoinType::RIGHT_SEMI => JoinKind::BuildSemi,
+            JoinType::RIGHT_ANTI => JoinKind::BuildAnti,
+            other => {
+                return Err(OperatorError::Unsupported(format!(
+                    "Unsupported flipped delim join type: {other:?}"
+                )));
+            }
+        };
+        let (probe_output, probe_column_types) = match kind {
+            JoinKind::BuildSemi | JoinKind::BuildAnti => (Vec::new(), Vec::new()),
+            _ => (subquery_output, subquery_column_types),
+        };
+        (
+            vec![subquery_side, read_outer_rows()],
+            Join {
+                probe_keys: subquery_keys,
+                build_keys: outer_keys,
+                key_types,
+                probe_output,
+                build_output: outer_output,
+                probe_column_types,
+                build_column_types: outer_column_types,
+                residual_filters: Vec::new(),
+                kind,
+            },
+        )
+    } else {
+        let kind = match join.join_type()? {
+            JoinType::LEFT => JoinKind::ProbeOuter,
+            JoinType::INNER => JoinKind::Inner,
+            JoinType::SEMI => JoinKind::ProbeSemi,
+            JoinType::ANTI => JoinKind::ProbeAnti,
+            other => {
+                return Err(OperatorError::Unsupported(format!(
+                    "Unsupported delim join type: {other:?}"
+                )));
+            }
+        };
+        let (build_output, build_column_types) = match kind {
+            JoinKind::ProbeSemi | JoinKind::ProbeAnti => (Vec::new(), Vec::new()),
+            _ => (subquery_output, subquery_column_types),
+        };
+        (
+            vec![read_outer_rows(), subquery_side],
+            Join {
+                probe_keys: outer_keys,
+                build_keys: subquery_keys,
+                key_types,
+                probe_output: outer_output,
+                build_output,
+                probe_column_types: outer_column_types,
+                build_column_types,
+                residual_filters: Vec::new(),
+                kind,
+            },
+        )
     };
     let join_node = PlanNode {
         name: "DELIM_SUBQUERY_JOIN".to_string(),
-        inputs: vec![read_outer_rows(), subquery_side],
-        operator: Operator::Join(Join {
-            probe_keys: outer_keys,
-            build_keys: subquery_keys,
-            key_types,
-            probe_output: outer_output,
-            build_output,
-            probe_column_types: outer_column_types,
-            build_column_types,
-            residual_filters: Vec::new(),
-            kind,
-        }),
+        inputs: join_inputs,
+        operator: Operator::Join(join_operator),
     };
 
     let dedup = PlanNode {
