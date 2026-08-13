@@ -61,6 +61,9 @@ pub use cte::{CteFactory, CteScanFactory};
 pub mod in_memory;
 pub use in_memory::{Forward, InjectorSourceFactory};
 
+pub mod streamed;
+pub use streamed::{ChannelInputFull, ChannelInputSender, ChannelSourceFactory};
+
 pub mod nullary;
 pub use nullary::*;
 

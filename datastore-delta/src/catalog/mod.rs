@@ -413,6 +413,7 @@ impl DeltaDatastore {
             pending_table_creations: Arc::new(Injector::new()),
             pending_schema_creations: Arc::new(Injector::new()),
             datastore: self,
+            committed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -1199,6 +1200,13 @@ pub struct DeltaTransaction {
     /// publish through it so DDL is visible to the next transaction without
     /// waiting for a refresh.
     datastore: Arc<DeltaDatastore>,
+    /// Whether commit has run. A second commit is refused, and the drop
+    /// safety net below discards the staged writes of a transaction its owner
+    /// never resolved, so no code path can leak them into limbo; deliberate
+    /// paths still resolve explicitly, which keeps the timing (and the thread
+    /// doing the work) chosen rather than wherever the last reference happens
+    /// to drop.
+    committed: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for DeltaTransaction {
@@ -1263,6 +1271,15 @@ impl DatastoreTransaction for DeltaTransaction {
     }
 
     async fn commit(&self) -> CatalogResult<()> {
+        // Marked at entry, not on success: the swap refuses a second commit,
+        // and a failed commit has already drained the staged state, so the
+        // drop net must not "roll back" what is no longer staged.
+        if self
+            .committed
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(CatalogError::Other("transaction already committed".into()));
+        }
         // A read-only transaction staged nothing: an in-memory no-op, run inline
         // rather than pay a blocking-pool round trip. Only a commit that writes
         // durable state hops off the runtime.
@@ -1292,6 +1309,30 @@ impl DatastoreTransaction for DeltaTransaction {
         drain_injector(&self.pending_schema_creations);
         drain_injector(&self.pending_table_creations);
         drain_injector(&self.uploaded_files);
+    }
+}
+
+/// The safety net behind the explicit resolution points: a transaction dropped
+/// with staged writes and neither commit nor rollback run discards them here,
+/// so no owner mistake can leave them in limbo. Reaching this is a bug in the
+/// owner, hence the warning; read-only transactions drop silently (planning
+/// and pure reads resolve nothing by design).
+impl Drop for DeltaTransaction {
+    fn drop(&mut self) {
+        if self.committed.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        // An explicitly rolled-back transaction already drained everything,
+        // so the staged-writes check below keeps it out of the net too.
+        let staged_writes = !self.uploaded_files.is_empty()
+            || !self.pending_table_creations.is_empty()
+            || !self.pending_schema_creations.is_empty();
+        if staged_writes {
+            tracing::warn!(
+                "transaction dropped with staged writes and no resolution; rolling back"
+            );
+            DatastoreTransaction::rollback(self);
+        }
     }
 }
 

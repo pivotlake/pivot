@@ -272,6 +272,12 @@ fn display_output(output: StatementOutput<TextBatch>) -> io::Result<()> {
         StatementOutput::Set { value, .. } => {
             if value.is_some() { "SET\n" } else { "RESET\n" }.to_string()
         }
+        StatementOutput::CopyFromStdin(ingest) => {
+            // The shell has no copy-in channel; dropping the running ingest
+            // aborts it and rolls the statement's transaction back.
+            drop(ingest);
+            "COPY FROM STDIN is not supported in the shell\n".to_string()
+        }
     };
     let mut stdout = io::stdout().lock();
     stdout.write_all(rendered.as_bytes())?;

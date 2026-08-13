@@ -15,6 +15,7 @@
 
 mod aggregate;
 mod compact;
+mod copy_from_stdin;
 mod create_schema;
 mod create_table;
 mod create_user;
@@ -37,6 +38,7 @@ mod values;
 
 pub use aggregate::Aggregate;
 pub use compact::Compact;
+pub use copy_from_stdin::{CopyFormat, CopyFromStdin};
 pub use create_schema::CreateSchema;
 pub use create_table::CreateTable;
 pub use create_user::CreateUser;
@@ -75,6 +77,10 @@ pub enum Error {
     /// non-constant LIMIT, a table function with named parameters, ...).
     #[error("{0}")]
     Unsupported(String),
+    /// A statement whose arguments fail validation (e.g. a COPY option with
+    /// an out-of-spec value).
+    #[error("{0}")]
+    InvalidStatement(String),
     /// A subtree's output columns couldn't be typed while shaping the plan
     /// (the join projection-map replay needs each side's width and types).
     #[error("{0}")]
@@ -123,6 +129,8 @@ pub enum Operator {
     SetVariable(SetVariable),
     /// `COMPACT <table> [FINAL]` — handled by the server, not compiled.
     Compact(Compact),
+    /// `COPY <table> FROM STDIN` — handled by the server, not compiled.
+    CopyFromStdin(CopyFromStdin),
     /// Late-materialization fetch (synthesized by the rewrite, see [`Materialize`]).
     Materialize(Materialize),
     /// `EXPLAIN <query>`: renders its child plan as text (see [`Explain`]).
@@ -210,7 +218,8 @@ impl Operator {
             | Operator::CreateSchema(_)
             | Operator::CreateUser(_)
             | Operator::SetVariable(_)
-            | Operator::Compact(_) => Ok(Vec::new()),
+            | Operator::Compact(_)
+            | Operator::CopyFromStdin(_) => Ok(Vec::new()),
         }
     }
 
@@ -302,7 +311,8 @@ impl Operator {
             | Operator::CreateSchema(_)
             | Operator::CreateUser(_)
             | Operator::SetVariable(_)
-            | Operator::Compact(_) => Vec::new(),
+            | Operator::Compact(_)
+            | Operator::CopyFromStdin(_) => Vec::new(),
         }
     }
 }
@@ -332,6 +342,7 @@ impl fmt::Display for Operator {
             Operator::DummyScan(d) => write!(f, "{d}"),
             Operator::SetVariable(s) => write!(f, "{s}"),
             Operator::Compact(c) => write!(f, "{c}"),
+            Operator::CopyFromStdin(c) => write!(f, "{c}"),
             Operator::Materialize(m) => write!(f, "{m}"),
             Operator::Explain(e) => write!(f, "{e}"),
             Operator::Cte(c) => write!(f, "{c}"),

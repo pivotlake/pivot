@@ -124,6 +124,10 @@ pub enum Error {
     SetVariableNotCompilable,
     #[error("COMPACT runs as its own statement and cannot be part of a query")]
     CompactNotCompilable,
+    #[error(
+        "COPY FROM STDIN compiles to no dataflow; the server drives the ingest from the protocol"
+    )]
+    CopyFromStdinNotCompilable,
     #[error("CREATE USER does not take inputs")]
     UnexpectedCreateUserInputs,
     #[error("create user: {0}")]
@@ -296,6 +300,7 @@ impl PlanNode {
             // So is COMPACT: its sweeps drive dataflows of their own, so the
             // server runs them on the coordinator, never inside a dataflow.
             crate::Operator::Compact(_) => Err(Error::CompactNotCompilable),
+            crate::Operator::CopyFromStdin(_) => Err(Error::CopyFromStdinNotCompilable),
             crate::Operator::CreateUser(o) => {
                 if !inputs.is_empty() {
                     return Err(Error::UnexpectedCreateUserInputs);

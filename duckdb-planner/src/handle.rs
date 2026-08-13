@@ -207,6 +207,7 @@ impl<'plan> LogicalOp<'plan> {
             L::LOGICAL_SET => Operator::Set(Set { raw: self.raw }),
             L::LOGICAL_RESET => Operator::Reset(Reset { raw: self.raw }),
             L::LOGICAL_COMPACT => Operator::Compact(Compact { raw: self.raw }),
+            L::LOGICAL_COPY_FROM_STDIN => Operator::CopyFromStdin(CopyFromStdin { raw: self.raw }),
             L::LOGICAL_CREATE_USER => Operator::CreateUser(CreateUser { raw: self.raw }),
             L::LOGICAL_COMPARISON_JOIN => {
                 Operator::ComparisonJoin(ComparisonJoin { raw: self.raw })
@@ -251,6 +252,8 @@ pub enum Operator<'plan> {
     Reset(Reset<'plan>),
     /// `COMPACT <table> [FINAL]`.
     Compact(Compact<'plan>),
+    /// `COPY <table> [(columns)] FROM STDIN [WITH (...)]`.
+    CopyFromStdin(CopyFromStdin<'plan>),
     /// `CREATE USER <name> [PASSWORD '<password>']`.
     CreateUser(CreateUser<'plan>),
     /// A comparison join; the consumer only handles the late-materialization
@@ -322,6 +325,8 @@ define_handles! { ffi::LogicalOperator;
     Reset,
     /// A `LogicalCompact`: `COMPACT <table> [FINAL]`.
     Compact,
+    /// A `LogicalCopyFromStdin`: `COPY <table> [(columns)] FROM STDIN [WITH (...)]`.
+    CopyFromStdin,
     /// A `LogicalCreateUser`: `CREATE USER <name> [PASSWORD '<password>']`.
     CreateUser,
     /// A `LogicalComparisonJoin`.
@@ -739,6 +744,47 @@ impl<'plan> Compact<'plan> {
     /// `COMPACT ... FINAL`: keep sweeping until a pass merges nothing.
     pub fn final_sweep(self) -> Result<bool> {
         Ok(ffi::lo_compact_final(self.raw)?)
+    }
+}
+
+impl<'plan> CopyFromStdin<'plan> {
+    /// Take the table binding DuckDB resolved for this COPY target.
+    pub fn take_table(self) -> Result<Box<OptionalTableWrapper>> {
+        Ok(ffi::lo_copy_stdin_take_table(self.raw)?)
+    }
+
+    /// The explicit column list resolved to physical column positions; empty
+    /// when the statement targets every table column.
+    pub fn column_indexes(self) -> Result<Vec<usize>> {
+        (0..ffi::lo_copy_stdin_column_count(self.raw)?)
+            .map(|index| Ok(ffi::lo_copy_stdin_column_index(self.raw, index)?))
+            .collect()
+    }
+
+    /// The FORMAT option, or `None` when the statement gave none.
+    pub fn format(self) -> Result<Option<String>> {
+        let format = ffi::lo_copy_stdin_format(self.raw)?;
+        Ok((!format.is_empty()).then_some(format))
+    }
+
+    /// The remaining `WITH (...)` options in name order, each with its bound
+    /// constant values rendered as text (none for a bare flag like `HEADER`).
+    pub fn options(self) -> Result<Vec<(String, Vec<String>)>> {
+        (0..ffi::lo_copy_stdin_option_count(self.raw)?)
+            .map(|index| {
+                let name = ffi::lo_copy_stdin_option_name(self.raw, index)?;
+                let values = (0..ffi::lo_copy_stdin_option_value_count(self.raw, index)?)
+                    .map(|value_index| {
+                        Ok(ffi::lo_copy_stdin_option_value(
+                            self.raw,
+                            index,
+                            value_index,
+                        )?)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((name, values))
+            })
+            .collect()
     }
 }
 

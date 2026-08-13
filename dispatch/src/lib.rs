@@ -124,8 +124,9 @@ pub use operations::{
     StringKeyExtractor, Sum, SumSlot, WideSum,
 };
 pub use operations::{
-    Consumer, DefaultUnaryFactory, MapFactory, Outputter, PipelineBreaker,
-    RootUnaryOperatorFactory, Unary, UnaryFactory, UnaryOperator, UnaryOperatorFactory,
+    ChannelInputFull, ChannelInputSender, Consumer, DefaultUnaryFactory, MapFactory, Outputter,
+    PipelineBreaker, RootUnaryOperatorFactory, Unary, UnaryFactory, UnaryOperator,
+    UnaryOperatorFactory,
 };
 
 // `max_background_threads` is capped well below its default (one per core):
@@ -546,6 +547,46 @@ mod tests {
             counts.iter().all(|&(_, c)| c == 8),
             "every key seen 8 times"
         );
+        dispatch.exit();
+    }
+
+    #[test]
+    fn channel_input_streams_items_fed_while_the_flow_runs() {
+        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None);
+        let claimed = Arc::new((Mutex::new(()), std::sync::Condvar::new()));
+        let on_claim = {
+            let claimed = claimed.clone();
+            Box::new(move || claimed.1.notify_all()) as Box<dyn Fn() + Send + Sync>
+        };
+        let (sender, spec) = channel_input::<i64>(dispatch.dispatcher(), 4, on_claim);
+
+        let producer = std::thread::spawn(move || {
+            for mut item in 0..1000i64 {
+                loop {
+                    match sender.try_send(item) {
+                        Ok(()) => break,
+                        Err(ChannelInputFull(returned)) => {
+                            item = returned;
+                            let guard = claimed.0.lock().unwrap();
+                            // Timed wait: a claim may land between the failed
+                            // send and this park, and the missed notify must
+                            // not strand the producer.
+                            drop(
+                                claimed
+                                    .1
+                                    .wait_timeout(guard, std::time::Duration::from_millis(10)),
+                            );
+                        }
+                    }
+                }
+            }
+            sender.close();
+        });
+        let mut results = spec.map_each(|item| item * 2).collect().unwrap();
+        producer.join().unwrap();
+
+        results.sort();
+        assert_eq!(results, (0..1000i64).map(|i| i * 2).collect::<Vec<_>>());
         dispatch.exit();
     }
 

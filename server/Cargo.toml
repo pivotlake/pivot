@@ -15,13 +15,14 @@ arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow = { workspace = true }
 
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "sync", "signal"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "sync", "signal", "time"] }
 axum = "0.8"
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
 include_dir = "0.7"
 pgwire = { workspace = true }
+bytes = { workspace = true }
 # Generates per-process secrets for mock authentication of unknown users.
 rand = { workspace = true }
 # Derives the stand-in verifier answered for an unknown user (see `auth`).

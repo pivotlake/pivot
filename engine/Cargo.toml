@@ -7,12 +7,15 @@ edition.workspace = true
 catalog = { workspace = true }
 dispatch = { workspace = true }
 planner = { workspace = true }
+# COPY frames arrive as refcounted protocol bytes and decode without copying.
+bytes = { workspace = true }
+arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 
 lru = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt", "sync"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 
 [features]
 perf = ["dispatch/perf"]
