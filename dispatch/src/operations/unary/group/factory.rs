@@ -9,7 +9,7 @@ use crate::GatherBarrier;
 use crate::numa::Topology;
 use crate::operations::UnaryFactory;
 use crate::operations::unary::group::arena::SharedArena;
-use crate::operations::unary::group::hashtables::RadixConfig;
+use crate::operations::unary::group::hashtables::SpillConfig;
 use crate::operations::unary::group::hashtables::{
     AggregatedTableOutput, AggregationValue, KeyExtractor,
 };
@@ -41,9 +41,8 @@ pub struct GroupFactory<K: KeyExtractor, V: AggregationValue + ?Sized> {
     injectors: Arc<Vec<Injector<PartitionJob<K, V>>>>,
     partition_jobs_injected: Arc<AtomicBool>,
     gather: Arc<GatherBarrier<AggregatedTableOutput<K, V>>>,
-    /// Radix scatter config with the per-worker bucket count sized for the pool
-    /// (see [`get_scatter_bucket_count_for_worker`](super::get_scatter_bucket_count_for_worker)).
-    radix: RadixConfig,
+    /// Slot count at which a worker's tables stop growing and start stacking.
+    spill: SpillConfig,
 }
 
 impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupFactory<K, V> {
@@ -70,13 +69,6 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupFactory<K, V> {
         );
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));
         let gather = Arc::new(GatherBarrier::new(topology.total_workers()));
-        let radix = RadixConfig {
-            partitions: crate::operations::unary::group::get_scatter_bucket_count_for_worker(
-                topology.total_workers(),
-            ),
-            ..RadixConfig::DEFAULT
-        };
-
         (0..topology.total_workers()).map(move |_| GroupFactory {
             key_arena: key_arena.clone(),
             value_arena: value_arena.clone(),
@@ -89,7 +81,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupFactory<K, V> {
             injectors: injectors.clone(),
             partition_jobs_injected: partition_jobs_injected.clone(),
             gather: gather.clone(),
-            radix,
+            spill: SpillConfig::DEFAULT,
         })
     }
 }
@@ -112,7 +104,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> UnaryFactory<RecordBatch, Re
             self.count_only,
             self.gather,
             self.partition_jobs_injected,
-            self.radix,
+            self.spill,
         ))
     }
 }

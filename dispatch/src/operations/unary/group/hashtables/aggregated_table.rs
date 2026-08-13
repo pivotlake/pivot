@@ -1,29 +1,25 @@
-//! Per-worker GROUP BY state with adaptive in-place and radix modes.
+//! Per-worker GROUP BY state: a stack of aggregating hash tables.
 //!
-//! Every worker starts by aggregating into hash tables. If the active table
-//! grows beyond [`SWITCH_THRESHOLD`], eligible keys switch to radix scatter.
-//! Remaining rows are partitioned by the high hash bits and aggregated during
-//! merge.
+//! Every row is folded into the active table, so a group is deduplicated as
+//! soon as it repeats. The table grows by quadrupling up to
+//! [`SPILL_CAPACITY`], past which it stops growing: the worker retires the full
+//! table and starts another of the same size. Probe cost therefore stays
+//! bounded however large the input's cardinality grows, at the price of
+//! leaving the merge more tables to combine.
 //!
 //! ```text
-//! consume rows
-//!     |
-//!     v
-//! in-place tables -- threshold crossed --> partitioned scatter rows
-//!     |                                      |
-//!     +------------------+-------------------+
-//!                        v
-//!                  partition merge
+//! consume rows --> active table --(full)--> retired onto the stack
+//!                        ^                           |
+//!                        +-- fresh same-size table   v
+//!                                              partition merge
 //! ```
 
 use crate::RECORD_BATCH_SIZE;
 use crate::memory::SlabAllocator;
-use crate::operations::unary::group::RADIX_PARTITIONS;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
 use crate::operations::unary::group::hashtables::hash_table::BaseHashTable;
 use crate::operations::unary::group::hashtables::{
-    AggregationValue, DEFAULT_CAPACITY, KeyExtractor, LiveKey, MultiSlabTable, PersistedKey,
-    StridedScatterRows,
+    AggregationValue, DEFAULT_CAPACITY, KeyExtractor, MultiSlabTable,
 };
 use crate::operations::unary::group::hll::Hll;
 use crate::operations::unary::group::values::{AggregationSlot, ArityBody, WorkerContext};
@@ -31,52 +27,144 @@ use ahash::RandomState;
 use arrow_array::RecordBatch;
 use std::sync::Arc;
 
-/// Table capacity at which eligible keys switch to radix scatter.
-const SWITCH_THRESHOLD: usize = 32768;
+/// Slot count past which tables stop growing and start stacking.
+///
+/// Two costs pull against each other. A smaller table keeps probes closer to
+/// the core but splits the input into more tables, and the merge picks up every
+/// table once per partition, so its fixed cost scales with the table count. A
+/// larger table deduplicates more and leaves fewer tables to merge, but its
+/// probes reach further out in the hierarchy. Measured across the
+/// high-cardinality group-bys, the total is flat-bottomed around here and
+/// climbs steeply below it.
+const SPILL_CAPACITY: usize = 65536;
 
-/// Configuration for the in-place to radix transition.
+/// Sizing for a worker's table stack.
 #[derive(Copy, Clone)]
-pub struct RadixConfig {
-    /// Table-slot count past which a radix-eligible worker switches to scatter.
-    pub switch_threshold: usize,
-    /// Number of scatter partitions (a power of two).
-    pub partitions: usize,
+pub struct SpillConfig {
+    /// Slot count past which tables stop growing and stack instead.
+    pub spill_capacity: usize,
 }
 
-impl RadixConfig {
+impl SpillConfig {
     pub const DEFAULT: Self = Self {
-        switch_threshold: SWITCH_THRESHOLD,
-        partitions: RADIX_PARTITIONS,
+        spill_capacity: SPILL_CAPACITY,
     };
+}
 
-    /// Disables radix scatter.
-    ///
-    /// String MIN and MAX use this mode so losing strings are compared before
-    /// they are persisted in the value arena.
-    pub const fn without_radix(self) -> Self {
+/// How many recently resolved keys a worker remembers.
+const MEMO_SLOTS: usize = 1024;
+
+/// Remembers, for the current batch, which group a key's storage resolved to.
+///
+/// A dictionary-encoded column decodes every occurrence of a value to the same
+/// view, so the second and later occurrences can fold straight into the group
+/// the first one found, skipping both the probe and the byte comparison that
+/// would reach the same place. A plain-encoded column gives each row its own
+/// bytes, so nothing ever matches and the lookup falls through.
+///
+/// Two things bound how long a remembered answer stays true, and both are
+/// handled by bumping the generation rather than clearing the arrays. A token
+/// only names bytes within the batch that produced it, so it expires at each
+/// batch boundary; and the addresses point into the active table, so they
+/// expire when that table is retired.
+struct KeyMemo {
+    tokens: Box<[u128; MEMO_SLOTS]>,
+    entries: Box<[*mut u8; MEMO_SLOTS]>,
+    generations: Box<[u32; MEMO_SLOTS]>,
+    generation: u32,
+    /// Lookups made and answered while deciding whether to keep going.
+    attempts: u32,
+    hits: u32,
+    /// Cleared for good once the sample shows the lookups are not paying.
+    consult: bool,
+}
+
+/// Lookups to watch before deciding whether the memo earns its keep.
+const MEMO_SAMPLE: u32 = 1 << 16;
+
+/// Hit rate below which the memo is abandoned, as a reciprocal: fewer than one
+/// hit in this many lookups means the token fetch and probe of the memo cost
+/// more than the key comparisons they save.
+const MEMO_MIN_HIT_RATE: u32 = 3;
+
+impl KeyMemo {
+    fn new() -> Self {
         Self {
-            switch_threshold: usize::MAX,
-            partitions: self.partitions,
+            tokens: vec![0u128; MEMO_SLOTS]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap(),
+            entries: vec![std::ptr::null_mut(); MEMO_SLOTS]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap(),
+            generations: vec![0u32; MEMO_SLOTS]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap(),
+            generation: 1,
+            attempts: 0,
+            hits: 0,
+            consult: true,
         }
+    }
+
+    /// Abandons everything remembered so far.
+    #[inline(always)]
+    fn invalidate(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        // Generation 0 is what the arrays start at, so skipping it keeps a
+        // never-written slot from matching after a wrap.
+        if self.generation == 0 {
+            self.generation = 1;
+        }
+    }
+
+    #[inline(always)]
+    fn slot(hash: u64) -> usize {
+        (hash as usize) & (MEMO_SLOTS - 1)
+    }
+
+    /// Whether the memo is still worth consulting for this worker.
+    ///
+    /// Repeated values only share a token when the column arrived
+    /// dictionary-encoded. Plain-encoded input gives every row its own bytes,
+    /// so nothing ever matches and every lookup is wasted; a short sample is
+    /// enough to tell the two apart, after which the memo stops charging for
+    /// itself.
+    #[inline(always)]
+    fn consulting(&self) -> bool {
+        self.consult
+    }
+
+    #[inline(always)]
+    fn lookup(&mut self, hash: u64, token: u128) -> Option<*mut u8> {
+        let slot = Self::slot(hash);
+        let hit = self.generations[slot] == self.generation && self.tokens[slot] == token;
+        self.attempts += 1;
+        self.hits += hit as u32;
+        if self.attempts == MEMO_SAMPLE {
+            self.consult = self.hits * MEMO_MIN_HIT_RATE >= self.attempts;
+        }
+        hit.then(|| self.entries[slot])
+    }
+
+    #[inline(always)]
+    fn record(&mut self, hash: u64, token: u128, entry: *mut u8) {
+        let slot = Self::slot(hash);
+        self.tokens[slot] = token;
+        self.entries[slot] = entry;
+        self.generations[slot] = self.generation;
     }
 }
 
-/// One worker's scatter buffer for each radix partition.
-pub struct PartitionBuffers<KP: PersistedKey, V: AggregationValue + ?Sized>(
-    pub Vec<StridedScatterRows<KP, V>>,
-);
-unsafe impl<KP: PersistedKey, V: AggregationValue + ?Sized> Send for PartitionBuffers<KP, V> {}
-
-/// Tables, optional scatter buffers, and sizing data produced by one worker.
+/// The tables and sizing data one worker produced.
 pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// The NUMA node whose worker flushed this output; the merge groups
     /// sources by it.
     pub node: usize,
-    /// In-place table stack: the full result if the worker never switched,
-    /// otherwise its pre-switch tables.
+    /// Every table this worker filled, the one it was still filling last.
     pub tables: Vec<MultiSlabTable<K::Persisted, V>>,
-    /// Per-partition scatter buffers, present only after a radix transition.
-    pub buffers: Option<PartitionBuffers<K::Persisted, V>>,
     /// Distinct-count sketch over the worker's rows, for sizing the merge targets.
     pub hll: Hll,
     /// `K::DEDUP_BY_HASH` only: this worker saw the (single) key whose bijective
@@ -94,16 +182,14 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// Per-worker value state.
     worker_context: V::WorkerContext,
     allocator: SlabAllocator,
-    /// Tables built before a radix transition.
+    /// Retired tables, with the active one last.
     tables: Vec<MultiSlabTable<K::Persisted, V>>,
-    /// Per-partition buffers allocated on the first radix transition.
-    buffers: Option<Vec<StridedScatterRows<<K as KeyExtractor>::Persisted, V>>>,
     /// Distinct-count sketch used to size merge targets.
     hll: Hll,
-    /// Whether this worker has entered radix mode.
-    switched_to_radix: bool,
-    /// Radix threshold and partition count.
-    radix_config: RadixConfig,
+    /// Slot count at which tables stop growing.
+    spill_config: SpillConfig,
+    /// Batch-local map from key storage to the group it resolved to.
+    memo: KeyMemo,
     /// Scratch buffer for the per-row hashes computed once per batch.
     hashes: Box<[u64; RECORD_BATCH_SIZE]>,
     /// Per-worker reusable key-extraction scratch (e.g. the row extractor's
@@ -123,7 +209,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         key_arena: Arc<SharedArena>,
         shared_context: V::SharedContext,
         worker_context: V::WorkerContext,
-        radix_config: RadixConfig,
+        spill_config: SpillConfig,
     ) -> Self {
         let mut allocator = SlabAllocator::new(true);
         let table = BaseHashTable::new(&mut allocator, DEFAULT_CAPACITY, 0, &shared_context);
@@ -134,10 +220,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             worker_context,
             allocator,
             tables: vec![table],
-            buffers: None,
             hll: Hll::new(),
-            switched_to_radix: false,
-            radix_config,
+            spill_config,
+            memo: KeyMemo::new(),
             hashes: vec![0u64; RECORD_BATCH_SIZE]
                 .into_boxed_slice()
                 .try_into()
@@ -199,13 +284,10 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
                 &mut self.hashes[..length],
             );
 
-            // Fixed-width keys scatter directly after the transition. Keys on
-            // the abandon route continue through the in-place table.
-            if self.switched_to_radix && !K::RADIX_ABANDON {
-                self.scatter_range(0, length, &key_reader, &value_reader);
-            } else {
-                self.consume_in_place(length, &key_reader, &value_reader, shared_context);
-            }
+            // A token names bytes inside one batch's buffers, so nothing
+            // remembered from the last batch can be trusted here.
+            self.memo.invalidate();
+            self.consume_in_place(length, &key_reader, &value_reader, shared_context);
         }
         self.scratch = scratch;
     }
@@ -229,6 +311,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
                     worker_context,
                     hashes,
                     zero_hash_seen,
+                    memo,
                     ..
                 } = self;
                 V::dispatch_arity(
@@ -239,6 +322,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
                         worker_context,
                         hashes,
                         zero_hash_seen,
+                        memo,
                         next_row: &mut i,
                         length,
                         key_reader,
@@ -247,132 +331,63 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
                     },
                 )
             };
-            // The row that crossed the limit has already been folded. Scatter
-            // starts at the following row.
-            if overflowed && self.grow_or_radix() {
-                self.scatter_range(i, length, key_reader, value_reader);
-                return;
+            // The row that crossed the limit has already been folded, so the
+            // next one lands in the replacement table.
+            if overflowed {
+                self.retire_active_table();
             }
         }
     }
 
-    /// Grows the in-place stack or enters radix mode.
+    /// Folds the active table's keys into the distinct-count sketch.
     ///
-    /// Returns `true` when the caller should scatter the remaining raw rows.
-    /// Abandon-route keys instead drain the deduplicated table and return
-    /// `false`, allowing the caller to continue probing with the cleared table.
-    #[inline(always)]
-    fn grow_or_radix(&mut self) -> bool {
-        let next_size = self.tables.last().unwrap().capacity() * 4;
-        // Hash-only keys have no persisted key to scatter.
-        if K::DEDUP_BY_HASH || next_size <= self.radix_config.switch_threshold {
-            self.tables.push(BaseHashTable::new(
-                &mut self.allocator,
-                next_size,
-                0,
-                &self.shared_context,
-            ));
-            return false;
+    /// Called as each table is retired, while it is still cache-warm. The sketch
+    /// is idempotent per hash, so a key that recurs in a later table is counted
+    /// once and the merged estimate is the true distinct count, not the entry
+    /// total (which counts a key once per table that holds it).
+    #[cold]
+    fn fold_active_table_into_hll(&mut self) {
+        let Self { tables, hll, .. } = self;
+        for entry in tables.last().unwrap().iter(0) {
+            hll.add(entry.hash);
         }
-        if self.buffers.is_none() {
-            self.buffers = Some(
-                (0..self.radix_config.partitions)
-                    .map(|_| StridedScatterRows::new())
-                    .collect(),
-            );
-        }
-        self.switched_to_radix = true;
-        if K::RADIX_ABANDON {
-            self.abandon_active_table();
-            false
+    }
+
+    /// Retires the full table and makes a fresh one active.
+    ///
+    /// The replacement is four times larger while that still fits the cache
+    /// budget, and the same size once it does not. Retired tables are kept as
+    /// they are: the merge reads each one's slot range for its partition
+    /// directly, so nothing has to be rewritten here.
+    #[cold]
+    fn retire_active_table(&mut self) {
+        // Remembered addresses point into the table being retired.
+        self.memo.invalidate();
+        self.fold_active_table_into_hll();
+        let capacity = self.tables.last().unwrap().capacity();
+        let next_size = if capacity < self.spill_config.spill_capacity {
+            capacity * 4
         } else {
-            true
-        }
-    }
-
-    /// Scatters rows into radix partitions without deduplicating them.
-    #[inline(always)]
-    fn scatter_range<'b>(
-        &mut self,
-        start: usize,
-        end: usize,
-        key_reader: &K::Reader<'b>,
-        value_reader: &V::Reader<'b>,
-    ) {
-        let shift = u64::BITS - self.radix_config.partitions.trailing_zeros();
-        let Self {
-            key_arena,
-            worker_context,
-            allocator,
-            buffers,
-            hll,
-            hashes,
-            shared_context,
-            ..
-        } = self;
-        V::dispatch_arity(
-            V::storage_metadata(shared_context),
-            ScatterWindow::<K, V> {
-                buffers: buffers.as_mut().unwrap(),
-                key_arena,
-                worker_context,
-                allocator,
-                hll,
-                hashes,
-                shift,
-                start,
-                end,
-                key_reader,
-                value_reader,
-                shared_context,
-            },
-        );
-    }
-
-    /// Moves the active table's partial groups into radix buffers and clears it.
-    #[inline(always)]
-    fn abandon_active_table(&mut self) {
-        let shift = u64::BITS - self.radix_config.partitions.trailing_zeros();
-        let Self {
-            tables,
-            buffers,
-            allocator,
-            hll,
-            shared_context,
-            ..
-        } = self;
-        let table = tables.last_mut().unwrap();
-        let buffers = buffers.as_mut().unwrap();
-        let scatter_layout =
-            StridedScatterRows::<<K as KeyExtractor>::Persisted, V>::layout::<0>(shared_context);
-        for entry in table.iter(0) {
-            let hash = entry.hash;
-            hll.add(hash);
-            let partition = (hash >> shift) as usize;
-            // Entries are already deduplicated within this table.
-            buffers[partition].push_with(scatter_layout, allocator, hash, *entry.key, |stored| {
-                stored.copy_from(entry.stored)
-            });
-        }
-        table.clear();
+            capacity
+        };
+        self.tables.push(BaseHashTable::new(
+            &mut self.allocator,
+            next_size,
+            0,
+            &self.shared_context,
+        ));
     }
 
     /// Finishes worker state for the merge phase.
     pub fn flush(mut self) -> AggregatedTableOutput<K, V> {
-        if self.switched_to_radix {
-            // Add pre-transition groups to the scatter-side estimate.
-            for table in &self.tables {
-                for entry in table.iter(0) {
-                    self.hll.add(entry.hash);
-                }
-            }
-        }
+        // Retired tables were folded in as they were replaced; the active one
+        // still has to be counted.
+        self.fold_active_table_into_hll();
         self.key_arena.flush();
         self.worker_context.flush();
         AggregatedTableOutput {
             node: crate::worker::current_node(),
             tables: self.tables,
-            buffers: self.buffers.map(PartitionBuffers),
             hll: self.hll,
             zero_hash_seen: self.zero_hash_seen,
         }
@@ -389,6 +404,7 @@ struct ProbeWindow<'a, 'b, K: KeyExtractor, V: AggregationValue + ?Sized> {
     worker_context: &'a mut V::WorkerContext,
     hashes: &'a [u64; RECORD_BATCH_SIZE],
     zero_hash_seen: &'a mut bool,
+    memo: &'a mut KeyMemo,
     next_row: &'a mut usize,
     length: usize,
     key_reader: &'a K::Reader<'b>,
@@ -405,6 +421,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> ArityBody<bool> for ProbeWin
             worker_context,
             hashes,
             zero_hash_seen,
+            memo,
             next_row,
             length,
             key_reader,
@@ -417,6 +434,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> ArityBody<bool> for ProbeWin
             worker_context,
             hashes,
             zero_hash_seen,
+            memo,
             next_row,
             length,
             key_reader,
@@ -441,6 +459,7 @@ fn probe_rows<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized>(
     worker_context: &mut V::WorkerContext,
     hashes: &[u64; RECORD_BATCH_SIZE],
     zero_hash_seen: &mut bool,
+    memo: &mut KeyMemo,
     next_row: &mut usize,
     length: usize,
     key_reader: &K::Reader<'_>,
@@ -450,6 +469,17 @@ fn probe_rows<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized>(
     {
         const L1_DISTANCE: usize = 16;
         const L2_DISTANCE: usize = 48;
+        // Sweep knob; the memo is only ever a win when repeated values share a
+        // representation, so it is worth being able to measure both ways.
+        static MEMO_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let memo_enabled = *MEMO_ENABLED
+            .get_or_init(|| std::env::var("PIVOT_GROUP_KEY_MEMO").as_deref() != Ok("0"));
+        let metadata = if N == 0 {
+            V::storage_metadata(shared_context)
+        } else {
+            V::metadata_for_arity::<N>()
+        };
+        let value_offset = super::value_offset_for::<K::Persisted, V>(metadata);
         // Reuse one probe layout for every row in the window.
         let mut prober = if N == 0 {
             table.prober()
@@ -473,9 +503,24 @@ fn probe_rows<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized>(
             if row + L1_DISTANCE < length {
                 prober.prefetch(hashes[row + L1_DISTANCE]);
             }
+            // A value that already resolved this batch folds straight into
+            // the group it found, with no probe and no key comparison.
+            let token = if memo_enabled && memo.consulting() {
+                K::memo_token(key_reader, row)
+            } else {
+                None
+            };
+            if let Some(token) = token
+                && let Some(entry) = memo.lookup(hash, token)
+            {
+                let stored = unsafe { V::from_entry_mut(entry.add(value_offset), metadata) };
+                stored.update(value_reader, row, &mut *worker_context, shared_context);
+                row += 1;
+                continue;
+            }
             // Probe once, then seed a new group or update the matching group.
             let key = K::live_key(key_reader, row, key_arena);
-            prober.probe_fold::<false, _, _, _, _>(
+            let entry = prober.probe_fold::<false, _, _, _, _>(
                 hash,
                 key,
                 &mut *worker_context,
@@ -484,6 +529,9 @@ fn probe_rows<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized>(
                     stored.update(value_reader, row, worker_context, shared_context)
                 },
             );
+            if let Some(token) = token {
+                memo.record(hash, token, entry);
+            }
             row += 1;
             if prober.undersized() {
                 overflowed = true;
@@ -492,58 +540,5 @@ fn probe_rows<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized>(
         }
         *next_row = row;
         overflowed
-    }
-}
-
-/// State passed through arity dispatch for one scatter range.
-struct ScatterWindow<'a, 'b, K: KeyExtractor, V: AggregationValue + ?Sized> {
-    buffers: &'a mut Vec<StridedScatterRows<<K as KeyExtractor>::Persisted, V>>,
-    key_arena: &'a mut WorkerArena,
-    worker_context: &'a mut V::WorkerContext,
-    allocator: &'a mut SlabAllocator,
-    hll: &'a mut Hll,
-    hashes: &'a [u64; RECORD_BATCH_SIZE],
-    shift: u32,
-    start: usize,
-    end: usize,
-    key_reader: &'a K::Reader<'b>,
-    value_reader: &'a V::Reader<'b>,
-    shared_context: &'a V::SharedContext,
-}
-
-impl<K: KeyExtractor, V: AggregationValue + ?Sized> ArityBody<()> for ScatterWindow<'_, '_, K, V> {
-    /// Scatter has little live state, so keeping it inline avoids a window call.
-    #[inline(always)]
-    fn run<const N: usize>(self) {
-        let ScatterWindow {
-            buffers,
-            key_arena,
-            worker_context,
-            allocator,
-            hll,
-            hashes,
-            shift,
-            start,
-            end,
-            key_reader,
-            value_reader,
-            shared_context,
-        } = self;
-        // Every partition shares one row-layout snapshot.
-        let scatter_layout =
-            StridedScatterRows::<<K as KeyExtractor>::Persisted, V>::layout::<N>(shared_context);
-        // Indexing rather than iterating: `i` is the absolute row, used to
-        // read the hash, the key, and the value columns in parallel.
-        #[allow(clippy::needless_range_loop)]
-        for i in start..end {
-            let hash = hashes[i];
-            hll.add(hash);
-            let partition = (hash >> shift) as usize;
-            let key = K::live_key(key_reader, i, key_arena).persist();
-            // Seed directly into the destination row.
-            buffers[partition].push_with(scatter_layout, allocator, hash, key, |stored| {
-                stored.seed(value_reader, i, worker_context)
-            });
-        }
     }
 }

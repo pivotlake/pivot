@@ -23,9 +23,14 @@ use std::sync::Arc;
 pub struct StringKeyExtractor;
 
 impl KeyExtractor for StringKeyExtractor {
-    // Long string keys benefit from abandon (dedup-during-scan avoids copying every
-    // occurrence into the arena); fixed-width keys scatter instead.
-    const RADIX_ABANDON: bool = true;
+    /// The raw view: for a dictionary-encoded column every occurrence of a
+    /// value carries the same one, since the decoder resolves each index to the
+    /// dictionary's own view rather than copying the bytes per row.
+    #[inline(always)]
+    fn memo_token(reader: &Self::Reader<'_>, row: usize) -> Option<u128> {
+        Some(reader.views()[row])
+    }
+
     type Config = ();
     type Persisted = ArenaKey;
     type LiveKey<'a, 'b> = StringKey<'a, 'b>;

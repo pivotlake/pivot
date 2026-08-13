@@ -9,12 +9,6 @@
 //! [`StringKeyExtractor`] does. `eq_persisted` checks the (cheap, `Copy`) integer
 //! first and short-circuits before touching the string.
 //!
-//! Because the key carries an out-of-line string, it radix-scatters exactly like
-//! [`StringKeyExtractor`] (`RADIX_ABANDON` is `true`):
-//! on overflow the active table is abandoned, draining one deduplicated entry per
-//! distinct key, so each string is persisted once instead of re-copied for every
-//! occurrence.
-//!
 //! [`RowKeyExtractor`]: super::RowKeyExtractor
 //! [`StringKeyExtractor`]: super::StringKeyExtractor
 
@@ -162,10 +156,6 @@ impl<T: ArrowPrimitiveType + Send + 'static, const STR_FIRST: bool> KeyExtractor
 where
     T::Native: Copy + Default + Hash + Eq + Send + Sync,
 {
-    // Equivalent to `StringKeyExtractor`: the key owns an out-of-line string, so
-    // abandon (dedup during the scan) persists each string once rather than
-    // re-copying it for every occurrence the way raw scatter would.
-    const RADIX_ABANDON: bool = true;
     type Config = ();
     type Persisted = IntStrKey<T::Native>;
     type LiveKey<'a, 'b> = IntStrLiveKey<'a, 'b, T::Native>;

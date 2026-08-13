@@ -51,19 +51,6 @@ pub use row::{RowKeyExtractor, RowKeySchema};
 /// Defines how to extract, compare, and output group keys for a particular key
 /// shape.
 pub trait KeyExtractor: Send + 'static {
-    /// Which radix route a key takes once its in-place table outgrows the
-    /// cache-resident size: `true` = *abandon* (keep deduplicating in the bounded
-    /// table, flushing each window's distinct partials to the partition buffers),
-    /// `false` = *scatter* (append raw rows to the partition buffers, dedup only
-    /// in the merge). Abandon pays off only when it avoids a per-occurrence
-    /// out-of-line copy (long string keys); fixed-width keys scatter's cheap
-    /// append wins, so this stays `false`.
-    ///
-    /// Radix applies to every key with real bytes to scatter. A key that dedups
-    /// purely by hash ([`DEDUP_BY_HASH`](Self::DEDUP_BY_HASH)) has none, so it
-    /// stays fully in-place regardless of this flag.
-    const RADIX_ABANDON: bool = false;
-
     /// When `true`, the persisted key is a zero-sized `()` and dedup is purely by
     /// the (bijective) hash, so a hash of 0 — which the table reserves as its
     /// empty-slot sentinel — cannot be remapped without aliasing a real key.
@@ -71,6 +58,20 @@ pub trait KeyExtractor: Send + 'static {
     /// single 0-hash key out of band (it never reaches the table). Such a key has
     /// no bytes to scatter, so it never takes the radix path.
     const DEDUP_BY_HASH: bool = false;
+
+    /// A token identifying where this row's key bytes live, valid only inside
+    /// the batch that produced it. Equal tokens mean equal keys, which lets a
+    /// repeated value reuse the group it already resolved to instead of probing
+    /// to the same slot and comparing the same bytes again.
+    ///
+    /// Worth returning `Some` only when repeated values are known to share one
+    /// representation. A dictionary-encoded column decodes every occurrence of a
+    /// value to the same view, so tokens match; a plain-encoded one gives each
+    /// row its own bytes, so they never would and the lookup is pure overhead.
+    #[inline(always)]
+    fn memo_token(_reader: &Self::Reader<'_>, _row: usize) -> Option<u128> {
+        None
+    }
 
     /// Runtime configuration threaded from the operator spec to the per-batch
     /// reader and the output columns. Most extractors are fully determined by

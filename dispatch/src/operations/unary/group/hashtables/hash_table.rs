@@ -12,9 +12,20 @@ use std::ptr;
 use tracing::debug;
 
 /// Maximum fraction of slots that can be occupied before the table is
-/// considered undersized. Used by [`AggregatedTable`](super::AggregatedTable)
-/// to decide when to stop inserting and create a new table.
+/// considered undersized. Used to size the merge's result tables so they fill
+/// without resizing.
 pub const MAX_LOAD_FACTOR: f64 = 0.7;
+
+/// How full a worker's table gets before it is retired and replaced.
+///
+/// Higher than [`MAX_LOAD_FACTOR`] because the two densities are paid for
+/// differently. A worker's table is written once and then read once, whole, by
+/// the merge, so its empty slots are read bandwidth the merge spends on
+/// nothing: at 0.7 that is 43% more bytes than the entries need. The extra
+/// probing a denser table costs walks *consecutive* slots, so it buys those
+/// bytes back for a few comparisons inside cache lines already fetched, rather
+/// than for more misses.
+const SPILL_LOAD_FACTOR: f64 = 0.7;
 
 /// A `LiveKey` is a key that has *not* yet been persisted, and therefore needs to explicitly be
 /// persisted if it is saved within the HashTable. The HashTable may decide not to persist a key
@@ -75,7 +86,7 @@ pub struct EntryView<'a, K, S: ?Sized> {
 
 /// Maximum number of entries allowed for a table with `len` total slots.
 fn max_load_for_len(len: usize) -> usize {
-    (len as f64 * MAX_LOAD_FACTOR).round() as usize
+    (len as f64 * SPILL_LOAD_FACTOR).round() as usize
 }
 
 fn align_up(x: usize, align: usize) -> usize {
@@ -116,6 +127,13 @@ fn adjusted_bases(slabs: &[Slab], entries_per_slab: usize, stride: usize) -> Vec
         .collect()
 }
 
+/// Byte offset of the stored value inside an entry of this key and value type.
+pub(crate) fn value_offset_for<K, V: AggregationValue + ?Sized>(
+    metadata: V::StorageMetadata,
+) -> usize {
+    entry_layout::<K, V>(metadata).value_offset
+}
+
 /// Runtime field offsets, stride, and alignment for one table entry.
 pub(super) struct EntryLayout {
     pub(super) hash_offset: usize,
@@ -123,11 +141,6 @@ pub(super) struct EntryLayout {
     pub(super) value_offset: usize,
     pub(super) stride: usize,
     pub(super) align: usize,
-}
-
-/// Returns the byte stride for one entry of this key and value type.
-pub fn entry_stride<K, V: AggregationValue + ?Sized>(ctx: &V::SharedContext) -> usize {
-    entry_layout::<K, V>(V::storage_metadata(ctx)).stride
 }
 
 pub(super) fn entry_layout<K, V: AggregationValue + ?Sized>(
@@ -172,7 +185,7 @@ pub(super) fn entry_layout<K, V: AggregationValue + ?Sized>(
 
 /// Prefetch the cache line at `ptr` into L1 (x86 `T0` / ARM `pldl1keep`).
 #[inline(always)]
-fn prefetch_l1_line(ptr: *const u8) {
+pub(super) fn prefetch_l1_line(ptr: *const u8) {
     #[cfg(target_arch = "x86_64")]
     unsafe {
         std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr as *const i8);
@@ -306,15 +319,6 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> BaseHashTable<K, V> {
         }
     }
 
-    /// Clears entries and counters while retaining the allocated slabs.
-    pub fn clear(&mut self) {
-        for slab in &mut self.slabs {
-            slab.zero_out();
-        }
-        self.length = 0;
-        self.collisions = 0;
-    }
-
     /// Total number of slots (occupied + empty). Always a power of 2.
     pub fn capacity(&self) -> usize {
         self.slot_mask + 1
@@ -364,7 +368,7 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> BaseHashTable<K, V> {
         }
     }
 
-    /// Returns `true` if the table has exceeded its [`MAX_LOAD_FACTOR`] threshold.
+    /// Returns `true` if the table has exceeded its [`SPILL_LOAD_FACTOR`] threshold.
     pub fn undersized(&self) -> bool {
         self.len() > self.max_load
     }
@@ -534,20 +538,6 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> Prober<'_, K, V> {
         );
     }
 
-    /// Grows the table fourfold after it crosses the load threshold.
-    #[inline(always)]
-    pub fn grow_if_full(&mut self, allocator: &mut SlabAllocator, capacity: &mut usize) {
-        if self.table.undersized() {
-            *capacity *= 4;
-            self.table.resize(allocator, *capacity);
-            // Preserve constant metadata across the uncommon resize branch.
-            self.reader = unsafe {
-                self.table
-                    .reader_with_unchecked_lifetime(self.reader.storage_metadata)
-            };
-        }
-    }
-
     /// Doubles the table when collision pressure exceeds the given ratio.
     #[inline(always)]
     pub fn resize_on_collisions(&mut self, allocator: &mut SlabAllocator, collision_ratio: usize) {
@@ -572,6 +562,9 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> Prober<'_, K, V> {
     /// `COUNT_COLLISIONS`, each occupied non-match increments the table's
     /// collision counter.
     #[inline(always)]
+    /// Returns the address of the entry the key resolved to, which lets a
+    /// caller remember it and fold a later repeat of the same key straight into
+    /// it.
     pub fn probe_fold<const COUNT_COLLISIONS: bool, L, X, S, U>(
         &mut self,
         mut hash: u64,
@@ -579,7 +572,8 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> Prober<'_, K, V> {
         context: X,
         seed: S,
         update: U,
-    ) where
+    ) -> *mut u8
+    where
         L: LiveKey<Persisted = K>,
         S: FnOnce(X, &mut V),
         U: FnOnce(X, &mut V),
@@ -602,7 +596,7 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> Prober<'_, K, V> {
                         context,
                         V::from_entry_mut(entry.add(reader.value_offset), reader.storage_metadata),
                     );
-                    return;
+                    return entry;
                 }
                 if *hash_ptr == hash
                     && key.eq_persisted(&*(entry.add(reader.key_offset) as *const K))
@@ -611,7 +605,7 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> Prober<'_, K, V> {
                         context,
                         V::from_entry_mut(entry.add(reader.value_offset), reader.storage_metadata),
                     );
-                    return;
+                    return entry;
                 }
             }
             if COUNT_COLLISIONS {
@@ -834,7 +828,7 @@ mod tests {
         init_test_free_pool(16);
         let mut allocator = SlabAllocator::new(true);
         let mut table = new_table(&mut allocator, 16);
-        let max_load = (16.0 * MAX_LOAD_FACTOR).round() as usize;
+        let max_load = (16.0 * SPILL_LOAD_FACTOR).round() as usize;
 
         for i in 0..max_load {
             table
