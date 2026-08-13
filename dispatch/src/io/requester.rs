@@ -2,7 +2,13 @@ use crate::Identifier;
 use crate::io::backend::IOBackend;
 use crate::io::cached_http::CachedHttpEngine;
 use crate::io::disk_cache::DiskCache;
-use crate::io::{Completion, DataFlowRequest, FailedRead, FsRequest, HttpRequest, RemoteSplit};
+use crate::io::slot_events::{self, SlotIoEvent, SlotIoOutcome};
+use crate::io::{
+    Completion, DataFlowRequest, FailedRead, FsReadRequest, FsRequest, HttpGetRequest, HttpRequest,
+    OpenFile, RemoteReadTime, RemoteSplit,
+};
+use crate::memory::compressed_cache::{MAX_JOINABLE_WORKERS, WaiterRegistration};
+use crate::memory::memory_ctx;
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
@@ -51,6 +57,19 @@ pub struct IORequester {
     /// Remote reads, optionally served from the on-disk cache. Ring-less like the
     /// underlying `HttpEngine`: it borrows `backend` (and `next_id`) to submit.
     http: CachedHttpEngine,
+    /// Reads *joined* onto another worker's in-flight read of the same extent,
+    /// parked by that extent's ring slot: no IO of this worker's own. A
+    /// [`SlotIoEvent`] for the slot resolves each parked read - served from the
+    /// now-resident bytes, kept parked, or (after an abandonment) performed by
+    /// this worker after all. This worker's bit in the slot's waiter mask is set
+    /// exactly while the slot has an entry in either map.
+    waiting_fs: HashMap<usize, Vec<DataFlowRequest<FsReadRequest>>>,
+    /// The remote counterpart of `waiting_fs`.
+    waiting_http: HashMap<usize, Vec<DataFlowRequest<HttpGetRequest>>>,
+    /// Joined reads that resolved (their bytes are resident) and now await the
+    /// next [`completions`](Self::completions) drain, which yields them exactly
+    /// like ring completions.
+    joined_ready: Vec<std::result::Result<Completion, FailedRead>>,
 }
 
 impl Default for IORequester {
@@ -68,6 +87,9 @@ impl IORequester {
             next_id: 0,
             http: CachedHttpEngine::with_default_config(disk_cache)
                 .expect("Unable to create http engine"),
+            waiting_fs: Default::default(),
+            waiting_http: Default::default(),
+            joined_ready: Default::default(),
         }
     }
 
@@ -83,6 +105,9 @@ impl IORequester {
             next_id: 0,
             http: CachedHttpEngine::new(http_config, disk_cache)
                 .expect("Unable to create http engine"),
+            waiting_fs: Default::default(),
+            waiting_http: Default::default(),
+            joined_ready: Default::default(),
         }
     }
 
@@ -93,7 +118,15 @@ impl IORequester {
 
     /// Submit an operator-owned filesystem operation through the worker's
     /// shared I/O backend. Request-owned storage remains alive until completion.
+    ///
+    /// A read of an extent another worker's read is already filling performs no
+    /// IO here: it joins that read (see [`try_join_fs_read`](Self::try_join_fs_read))
+    /// and completes off its slot event instead.
     pub fn request(&mut self, request: DataFlowRequest<FsRequest>) -> Result<()> {
+        let request = match self.try_join_fs_read(request) {
+            Some(request) => request,
+            None => return Ok(()),
+        };
         match &request.request {
             FsRequest::Read(read) => self.backend.submit_read(
                 read.file.as_raw_fd(),
@@ -126,6 +159,10 @@ impl IORequester {
     /// Submit a read for a remote region, served from the on-disk cache where
     /// possible (only the missing ranges hit the network). Delegates to the
     /// [`CachedHttpEngine`], lending it the shared backend and disk-id counter.
+    ///
+    /// A read of an extent another worker's read is already filling touches no
+    /// transport at all: it joins that read and completes off its slot event,
+    /// reported as an empty [`RemoteSplit`] since no tier served it here.
     pub fn request_http(&mut self, request: DataFlowRequest<HttpRequest>) -> Result<RemoteSplit> {
         let DataFlowRequest {
             data_flow_id,
@@ -134,16 +171,18 @@ impl IORequester {
             submitted_at,
         } = request;
         match request {
-            HttpRequest::Get(request) => self.http.get(
-                &mut self.backend,
-                &mut self.next_id,
-                DataFlowRequest {
+            HttpRequest::Get(request) => {
+                let request = match self.try_join_http_get(DataFlowRequest {
                     data_flow_id,
                     operator_idx,
                     request,
                     submitted_at,
-                },
-            ),
+                }) {
+                    Some(request) => request,
+                    None => return Ok(RemoteSplit::default()),
+                };
+                self.http.get(&mut self.backend, &mut self.next_id, request)
+            }
             HttpRequest::Upload(request) => {
                 let bytes = request.data.len() as u64;
                 self.http.upload(
@@ -164,7 +203,216 @@ impl IORequester {
         }
     }
 
+    /// Try to ride another worker's in-flight read instead of submitting
+    /// `request`: a filesystem read of a non-owner extent (someone else's read
+    /// is responsible for those bytes, see [`MissingExtent`]'s fetch-ownership
+    /// docs) registers this worker as a waiter and parks. Returns the request
+    /// back when it must be submitted after all - it is the extent's owner,
+    /// joining is disabled on this thread, it is a write, or the extent was
+    /// abandoned and the read now falls to us.
+    ///
+    /// [`MissingExtent`]: crate::memory::compressed_cache::MissingExtent
+    fn try_join_fs_read(
+        &mut self,
+        request: DataFlowRequest<FsRequest>,
+    ) -> Option<DataFlowRequest<FsRequest>> {
+        let Some(worker) = joinable_worker() else {
+            return Some(request);
+        };
+        if !matches!(&request.request, FsRequest::Read(read) if !read.block.is_owner()) {
+            return Some(request);
+        }
+        let DataFlowRequest {
+            data_flow_id,
+            operator_idx,
+            request: FsRequest::Read(read),
+            submitted_at,
+        } = request
+        else {
+            unreachable!("matched a non-owner read above");
+        };
+        let read = DataFlowRequest {
+            data_flow_id,
+            operator_idx,
+            request: read,
+            submitted_at,
+        };
+        let open_file = OpenFile::Local(read.request.file.clone());
+        match memory_ctx().compressed_cache().register_waiter(
+            &open_file,
+            &read.request.block,
+            worker,
+        ) {
+            WaiterRegistration::Registered => {
+                self.waiting_fs
+                    .entry(read.request.block.slot_index())
+                    .or_default()
+                    .push(read);
+                None
+            }
+            WaiterRegistration::AlreadyResident => {
+                self.deregister_unless_parked(read.request.block.slot_index(), worker);
+                self.complete_joined_fs_read(read);
+                None
+            }
+            WaiterRegistration::Abandoned => {
+                let DataFlowRequest {
+                    data_flow_id,
+                    operator_idx,
+                    request,
+                    submitted_at,
+                } = read;
+                Some(DataFlowRequest {
+                    data_flow_id,
+                    operator_idx,
+                    request: FsRequest::Read(request),
+                    submitted_at,
+                })
+            }
+        }
+    }
+
+    /// The remote counterpart of [`try_join_fs_read`](Self::try_join_fs_read).
+    fn try_join_http_get(
+        &mut self,
+        request: DataFlowRequest<HttpGetRequest>,
+    ) -> Option<DataFlowRequest<HttpGetRequest>> {
+        let Some(worker) = joinable_worker() else {
+            return Some(request);
+        };
+        if request.request.block.is_owner() {
+            return Some(request);
+        }
+        let open_file = OpenFile::Remote(request.request.remote.clone());
+        match memory_ctx().compressed_cache().register_waiter(
+            &open_file,
+            &request.request.block,
+            worker,
+        ) {
+            WaiterRegistration::Registered => {
+                self.waiting_http
+                    .entry(request.request.block.slot_index())
+                    .or_default()
+                    .push(request);
+                None
+            }
+            WaiterRegistration::AlreadyResident => {
+                self.deregister_unless_parked(request.request.block.slot_index(), worker);
+                self.complete_joined_http_get(request);
+                None
+            }
+            WaiterRegistration::Abandoned => Some(request),
+        }
+    }
+
+    /// Drop this worker's waiter registration on `slot_idx` unless it still has
+    /// a read parked there. Used when a registration resolved without parking
+    /// (the extent was already resident), so a stale bit doesn't draw spurious
+    /// events.
+    fn deregister_unless_parked(&self, slot_idx: usize, worker: usize) {
+        if !self.waiting_fs.contains_key(&slot_idx) && !self.waiting_http.contains_key(&slot_idx) {
+            memory_ctx()
+                .compressed_cache()
+                .deregister_waiter(slot_idx, worker);
+        }
+    }
+
+    /// A joined filesystem read's bytes are resident: stage its completion for
+    /// the next [`completions`](Self::completions) drain. The owner already
+    /// committed the blocks, so unlike a performed read there is nothing to
+    /// commit here.
+    fn complete_joined_fs_read(&mut self, read: DataFlowRequest<FsReadRequest>) {
+        self.joined_ready.push(Ok(Completion::FsRead(read)));
+    }
+
+    /// The remote counterpart of [`complete_joined_fs_read`](Self::complete_joined_fs_read).
+    /// No transport of this worker's served the bytes, so the read time is zero.
+    fn complete_joined_http_get(&mut self, read: DataFlowRequest<HttpGetRequest>) {
+        self.joined_ready
+            .push(Ok(Completion::HttpGet(read, RemoteReadTime::default())));
+    }
+
+    /// A slot this worker waits on made progress: resolve every read parked on
+    /// it. One whose extent is now fully resident completes; after a commit the
+    /// rest keep waiting (their extent is still filling), while after an
+    /// abandonment each is re-routed through [`request`](Self::request) /
+    /// [`request_http`](Self::request_http) - it re-joins if the abandoned
+    /// extent wasn't its own (its owner is still alive), and otherwise this
+    /// worker performs the read itself. A re-performed remote read's tier split
+    /// goes unrecorded (its stats were reported as it was joined); abandonment
+    /// is a cancelled or failed query's teardown, so that undercount is rare.
+    pub fn handle_slot_event(&mut self, event: SlotIoEvent) -> Result<()> {
+        for read in self.waiting_fs.remove(&event.slot_idx).unwrap_or_default() {
+            if read.request.block.is_resident() {
+                self.complete_joined_fs_read(read);
+            } else {
+                match event.outcome {
+                    SlotIoOutcome::Committed => self
+                        .waiting_fs
+                        .entry(event.slot_idx)
+                        .or_default()
+                        .push(read),
+                    SlotIoOutcome::Abandoned => {
+                        let DataFlowRequest {
+                            data_flow_id,
+                            operator_idx,
+                            request,
+                            submitted_at,
+                        } = read;
+                        self.request(DataFlowRequest {
+                            data_flow_id,
+                            operator_idx,
+                            request: FsRequest::Read(request),
+                            submitted_at,
+                        })?;
+                    }
+                }
+            }
+        }
+        for read in self
+            .waiting_http
+            .remove(&event.slot_idx)
+            .unwrap_or_default()
+        {
+            if read.request.block.is_resident() {
+                self.complete_joined_http_get(read);
+            } else {
+                match event.outcome {
+                    SlotIoOutcome::Committed => self
+                        .waiting_http
+                        .entry(event.slot_idx)
+                        .or_default()
+                        .push(read),
+                    SlotIoOutcome::Abandoned => {
+                        let DataFlowRequest {
+                            data_flow_id,
+                            operator_idx,
+                            request,
+                            submitted_at,
+                        } = read;
+                        self.request_http(DataFlowRequest {
+                            data_flow_id,
+                            operator_idx,
+                            request: HttpRequest::Get(request),
+                            submitted_at,
+                        })?;
+                    }
+                }
+            }
+        }
+        // The waiter-mask bit tracks "this worker has something parked on the
+        // slot"; drop it once nothing is.
+        if let Some(worker) = joinable_worker() {
+            self.deregister_unless_parked(event.slot_idx, worker);
+        }
+        Ok(())
+    }
+
     /// Returns `true` if any disk or HTTP operation has not yet completed.
+    /// Joined reads are excluded on purpose: they complete off another worker's
+    /// slot event (whose send wakes this worker's park slot), never off this
+    /// ring, so counting them would park [`wait`](Self::wait) on a ring that may
+    /// stay silent.
     pub fn has_pending(&self) -> bool {
         self.has_file_pending() || self.has_http_pending()
     }
@@ -211,7 +459,9 @@ impl IORequester {
             }
         }
 
-        let mut out = Vec::new();
+        // Joined reads that resolved since the last drain complete first - their
+        // bytes were committed by the worker that performed the read.
+        let mut out = std::mem::take(&mut self.joined_ready);
 
         // Backend disk CQEs: this requester's fs reads, or the engine's cache-file
         // reads / write-backs. Disjoint id spaces, so the id's owning map sorts
@@ -333,6 +583,16 @@ impl IORequester {
         select.ready();
         Ok(())
     }
+}
+
+/// The current worker's global index if read-joining is enabled on this thread:
+/// a slot-event router is installed (so events can reach us) and the index fits
+/// the per-slot waiter mask. `None` on non-worker threads and beyond-mask
+/// workers, where every read simply performs its own IO.
+fn joinable_worker() -> Option<usize> {
+    slot_events::with_router(|_| ())?;
+    let worker = crate::worker::WORKER_IDX.get();
+    (worker < MAX_JOINABLE_WORKERS).then_some(worker)
 }
 
 /// Whether a CQE's `user_data` is a disk read rather than an HTTP socket op. The
@@ -864,6 +1124,146 @@ mod tests {
             results.iter().all(|r| r.is_err()),
             "every http read should fail"
         );
+    }
+
+    /// Enable read-joining on this test thread: install a one-worker slot-event
+    /// router and identify the thread as worker 0, returning the injector the
+    /// events land in.
+    fn enable_joining_for_this_thread() -> crossbeam_channel::Receiver<SlotIoEvent> {
+        let waker = Arc::new(crate::waker::WorkerWaker::new(1));
+        let (router, mut receivers) = crate::io::slot_events::SlotEventRouter::create(
+            1,
+            crate::waker::WakerSet::new(vec![waker], 1),
+        );
+        crate::io::slot_events::install_worker_slot_events(router);
+        crate::worker::WORKER_IDX.set(0);
+        receivers.remove(0)
+    }
+
+    /// A local file holding `len` pattern bytes, plus its open handle.
+    fn pattern_file(dir: &tempfile::TempDir, len: usize) -> Arc<std::fs::File> {
+        let path = dir.path().join("data");
+        std::fs::write(&path, (0..len).map(pattern).collect::<Vec<u8>>()).unwrap();
+        Arc::new(std::fs::File::open(&path).unwrap())
+    }
+
+    /// The one fs read a `get` of `[offset, offset+len)` produces, owning or
+    /// riding the extent according to what the cache resolved.
+    fn fs_read_of(
+        file: &Arc<std::fs::File>,
+        open_file: &OpenFile,
+        offset: usize,
+        len: usize,
+    ) -> FsRequest {
+        let block = memory_ctx().compressed_cache().get(open_file, offset, len)[0]
+            .take_missing()
+            .expect("an unread range yields a missing extent");
+        FsRequest::Read(crate::io::FsReadRequest {
+            file: file.clone(),
+            block,
+        })
+    }
+
+    #[test]
+    fn a_joined_read_completes_off_the_owners_commit() {
+        init_test_free_pool(16);
+        let events = enable_joining_for_this_thread();
+        let dir = tempfile::tempdir().unwrap();
+        let file = pattern_file(&dir, 4096);
+        let open_file = OpenFile::Local(file.clone());
+        memory_ctx()
+            .compressed_cache()
+            .open_entry(open_file.clone());
+        let mut requester = IORequester::default();
+        let owner_read = fs_read_of(&file, &open_file, 0, 4096);
+        let joined_read = fs_read_of(&file, &open_file, 0, 4096);
+
+        requester
+            .request(DataFlowRequest::new(1, 0, owner_read))
+            .unwrap();
+        requester
+            .request(DataFlowRequest::new(2, 0, joined_read))
+            .unwrap();
+        let owner_completions = loop {
+            let completions = requester.completions().unwrap();
+            if !completions.is_empty() {
+                break completions;
+            }
+            requester.wait().unwrap();
+        };
+        // The owner's commit sent the slot event; resolving it completes the
+        // joined read with no IO of its own (nothing further is pending).
+        assert!(!requester.has_pending(), "the joined read submitted no IO");
+        requester
+            .handle_slot_event(events.try_recv().expect("a commit event"))
+            .unwrap();
+        let joined_completions = requester.completions().unwrap();
+
+        let [Ok(Completion::FsRead(owner))] = &owner_completions[..] else {
+            panic!("expected the owner's read to complete first");
+        };
+        let [Ok(Completion::FsRead(joined))] = &joined_completions[..] else {
+            panic!("expected the joined read to complete off the event");
+        };
+        assert_eq!(owner.data_flow_id, 1);
+        assert_eq!(joined.data_flow_id, 2);
+        assert_cached(&open_file, 0, 4096);
+    }
+
+    #[test]
+    fn an_abandoned_extent_is_read_by_its_waiter() {
+        init_test_free_pool(16);
+        let events = enable_joining_for_this_thread();
+        let dir = tempfile::tempdir().unwrap();
+        let file = pattern_file(&dir, 4096);
+        let open_file = OpenFile::Local(file.clone());
+        memory_ctx()
+            .compressed_cache()
+            .open_entry(open_file.clone());
+        let mut requester = IORequester::default();
+        let FsRequest::Read(owner_read) = fs_read_of(&file, &open_file, 0, 4096) else {
+            unreachable!("fs_read_of builds reads");
+        };
+        // Keep the joiner's lookup: after an abandonment the extent is unmapped,
+        // so this retained view is how the taken-over read's bytes are consumed.
+        let mut joiner_lookups = memory_ctx().compressed_cache().get(&open_file, 0, 4096);
+        let joined_read = FsRequest::Read(crate::io::FsReadRequest {
+            file: file.clone(),
+            block: joiner_lookups[0].take_missing().unwrap(),
+        });
+        requester
+            .request(DataFlowRequest::new(7, 3, joined_read))
+            .unwrap();
+        assert!(!requester.has_pending(), "the joined read submitted no IO");
+
+        // The owner is torn down (as a cancelled query's would be) without ever
+        // performing its read; the waiter must take the read over.
+        drop(owner_read);
+        requester
+            .handle_slot_event(events.try_recv().expect("an abandonment event"))
+            .unwrap();
+
+        assert!(
+            requester.has_pending(),
+            "the waiter performs the read itself"
+        );
+        let completions = loop {
+            let completions = requester.completions().unwrap();
+            if !completions.is_empty() {
+                break completions;
+            }
+            requester.wait().unwrap();
+        };
+        let [Ok(Completion::FsRead(taken_over))] = &completions[..] else {
+            panic!("expected the taken-over read to complete");
+        };
+        assert_eq!(taken_over.data_flow_id, 7);
+        assert_eq!(taken_over.operator_idx, 3);
+        let bytes = joiner_lookups.remove(0).into_data();
+        assert_eq!(bytes.len(), 4096);
+        for (i, &b) in bytes.iter().enumerate() {
+            assert_eq!(b, pattern(i), "byte {i}");
+        }
     }
 
     /// Drive every pending read *and* write-back to completion - `fetch` only

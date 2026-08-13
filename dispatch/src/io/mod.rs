@@ -41,6 +41,10 @@ use url::Url;
 mod requester;
 pub use requester::{Error as IORequesterError, IORequester, RING_SIZE};
 
+pub mod request_tracker;
+
+pub mod slot_events;
+
 mod cached_http;
 
 pub mod disk_cache;

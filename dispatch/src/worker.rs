@@ -25,6 +25,7 @@
 use crate::Identifier;
 use crate::api::DataFlowBuilder;
 use crate::data_flow::{DataFlow, WorkStatus};
+use crate::io::slot_events::{SlotEventRouter, SlotIoEvent, install_worker_slot_events};
 use crate::io::{Completion, DiskCache, IORequester};
 use crate::memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 use crate::operations::FinishStatus;
@@ -135,6 +136,10 @@ pub struct Worker {
     /// Last delegated-broadcast epoch this worker has fanned out (see
     /// [`WorkerWaker::finish_delegated_wake`]).
     last_seen_broadcast: u64,
+    /// This worker's injector of cache-slot IO events: reads this worker joined
+    /// onto other workers' in-flight reads resolve off these. The sender side
+    /// lives with every worker via the pool's [`SlotEventRouter`].
+    slot_events: crossbeam_channel::Receiver<SlotIoEvent>,
 }
 
 impl Worker {
@@ -158,6 +163,8 @@ impl Worker {
         ready_barrier: Arc<Barrier>,
         waker: Arc<WorkerWaker>,
         waker_set: WakerSet,
+        slot_event_router: Arc<SlotEventRouter>,
+        slot_events: crossbeam_channel::Receiver<SlotIoEvent>,
     ) -> JoinHandle<()> {
         thread::spawn(move || {
             // Worker startup (io_uring + memory-context setup) can fail. Every worker
@@ -186,6 +193,7 @@ impl Worker {
                 debug!("Initializing worker waker {:?}", idx);
                 init_worker_waker(&waker);
                 init_waker_set(waker_set);
+                install_worker_slot_events(slot_event_router);
                 // Give this worker thread a handle to the shared disk cache so
                 // `drop_cache()` can clear it; the requester takes ownership.
                 crate::io::disk_cache::install_worker_disk_cache(disk_cache.clone());
@@ -200,6 +208,7 @@ impl Worker {
                     last_seen_wake_count,
                     node_local_idx,
                     last_seen_broadcast,
+                    slot_events,
                 };
                 debug!("Initializing memory context for worker {:?}", idx);
                 init_memory_context(memory_context_factory.create_memory_ctx());
@@ -326,6 +335,12 @@ impl Worker {
     /// transport to its own handler; by the time we're here each block's bytes
     /// are already committed to its cache slot.
     fn process_io_completions(&mut self) -> Result<()> {
+        // Slot events from workers whose in-flight reads this worker's reads
+        // joined: resolving them stages completions that the drain below then
+        // delivers exactly like ring completions.
+        while let Ok(event) = self.slot_events.try_recv() {
+            self.io.handle_slot_event(event)?;
+        }
         for completion in self.io.completions()? {
             match completion {
                 // The owning dataflow may already be gone: a finished or

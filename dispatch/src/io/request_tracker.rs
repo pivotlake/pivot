@@ -1,6 +1,6 @@
-//! [`RequestTracker`]: the shared IO bookkeeping for a fetcher that pulls cache
-//! blocks for many in-flight requests at once. Both the column-chunk scan
-//! fetcher and the footer-metadata fetcher build on it.
+//! [`RequestTracker`]: the shared IO bookkeeping for an operator that pulls
+//! cache blocks for many in-flight requests at once - e.g. the parquet
+//! column-chunk scan fetcher and footer-metadata fetcher both build on it.
 //!
 //! It owns the in-flight requests (slot-indexed, with a free list), the routing
 //! from each scheduled read to the slots awaiting it, and the deduped outbox of
@@ -8,8 +8,12 @@
 //! it has generated; the tracker drains, dedups, routes, and counts them, and on
 //! a completion hands back every slot waiting on that read so the fetcher can
 //! advance it.
+//!
+//! The dedup here is within one tracker; reads of an extent some *other*
+//! tracker or worker is already filling are deduplicated below the tracker, in
+//! [`IORequester`](crate::io::IORequester), by joining that in-flight read.
 
-use dispatch::io::{FsReadRequest, FsRequest, HttpGetRequest, HttpRequest, OpenFile, RING_SIZE};
+use crate::io::{FsReadRequest, FsRequest, HttpGetRequest, HttpRequest, OpenFile, RING_SIZE};
 use std::collections::HashMap;
 
 /// Most reads to hand the worker for submission in one pass. The worker submits a
@@ -54,7 +58,7 @@ fn take_batch<R>(pending: &mut Vec<R>) -> Vec<R> {
 /// only when it fills the same bytes of the same slot, so it can never be folded
 /// onto a read filling a different slot - which a file-range-only match could do.
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub(crate) struct ReadRequest {
+pub struct ReadRequest {
     pub open_file: OpenFile,
     pub offset: usize,
     pub len: usize,
@@ -87,13 +91,13 @@ impl ReadRequest {
 /// A request that exposes the not-yet-submitted reads it has generated, for the
 /// tracker to drain. The two vectors are mutually exclusive in practice - a
 /// request reads one file, which is local xor remote.
-pub(crate) trait PendingRequest {
+pub trait PendingRequest {
     fn pending_fs(&mut self) -> &mut Vec<FsRequest>;
     fn pending_http(&mut self) -> &mut Vec<HttpGetRequest>;
 }
 
 /// Tracks in-flight requests and their cache-block reads. See the module doc.
-pub(crate) struct RequestTracker<T: PendingRequest> {
+pub struct RequestTracker<T: PendingRequest> {
     /// In-flight requests, slot-indexed (`None` = free slot).
     in_flight: Vec<Option<T>>,
     /// Reusable freed slot indices.
@@ -164,7 +168,7 @@ impl<T: PendingRequest> RequestTracker<T> {
         for req in fs {
             let read = req
                 .as_read()
-                .expect("the parquet read tracker only issues filesystem reads");
+                .expect("the read tracker only stages filesystem reads");
             if self.schedule_or_join(ReadRequest::of_fs(read), slot) {
                 self.pending_fs.push(req);
                 self.disk_in_flight += 1;
@@ -177,7 +181,7 @@ impl<T: PendingRequest> RequestTracker<T> {
             }
         }
         if !self.pending_fs.is_empty() || !self.pending_http.is_empty() {
-            dispatch::io::note_pending_io();
+            crate::io::note_pending_io();
         }
     }
 
@@ -318,9 +322,9 @@ impl<T: PendingRequest> RequestTracker<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dispatch::io::FsReadRequest;
-    use dispatch::memory::compressed_cache::MissingExtent;
-    use dispatch::memory::{init_test_free_pool, memory_ctx};
+    use crate::io::FsReadRequest;
+    use crate::memory::compressed_cache::MissingExtent;
+    use crate::memory::{init_test_free_pool, memory_ctx};
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -389,9 +393,9 @@ mod tests {
         memory_ctx()
             .compressed_cache()
             .get(open_file, offset, len)
-            .iter()
-            .flat_map(|lookup| lookup.missing())
-            .map(|block| as_fs_request(open_file, block.clone()))
+            .iter_mut()
+            .flat_map(|lookup| lookup.take_missing())
+            .map(|block| as_fs_request(open_file, block))
             .collect()
     }
 
@@ -414,9 +418,13 @@ mod tests {
     fn stage_dedups_an_already_scheduled_read_and_credits_both_waiters() {
         init_test_free_pool(4);
         let (open_file, _dir) = registered_file();
-        let shared = ReadRequest::of_fs(fs_read(&open_file, 0, 4096).as_read().unwrap());
+        // The identity must come from the request that is actually admitted: a
+        // dropped owner request abandons its extent, so a throwaway read would
+        // leave the admitted one filling different slot memory.
+        let first_read = fs_read(&open_file, 0, 4096);
+        let shared = ReadRequest::of_fs(first_read.as_read().unwrap());
         let mut tracker = RequestTracker::default();
-        let first = tracker.admit_request(TestRequest::with_fs(vec![fs_read(&open_file, 0, 4096)]));
+        let first = tracker.admit_request(TestRequest::with_fs(vec![first_read]));
         let second =
             tracker.admit_request(TestRequest::with_fs(vec![fs_read(&open_file, 0, 4096)]));
 
@@ -432,10 +440,10 @@ mod tests {
         let (open_file, _dir) = registered_file();
         // Schedule [0,8192). A later [0,4096) is fully inside it (it refills into
         // the same slot), so it rides on the bigger read instead of issuing its own.
-        let big = ReadRequest::of_fs(fs_read(&open_file, 0, 8192).as_read().unwrap());
+        let big_read = fs_read(&open_file, 0, 8192);
+        let big = ReadRequest::of_fs(big_read.as_read().unwrap());
         let mut tracker = RequestTracker::default();
-        let big_slot =
-            tracker.admit_request(TestRequest::with_fs(vec![fs_read(&open_file, 0, 8192)]));
+        let big_slot = tracker.admit_request(TestRequest::with_fs(vec![big_read]));
         let inner_slot =
             tracker.admit_request(TestRequest::with_fs(vec![fs_read(&open_file, 0, 4096)]));
 

@@ -14,10 +14,10 @@
 //! admitted; a homogeneous scan only fills its medium's pool, so the other never
 //! gates.
 
-use crate::parquet::request_tracker::{ReadRequest, RequestTracker};
 use crate::parquet::types::requests::{RowGroupBuffer, RowGroupRequest};
 use dispatch::Sender;
 use dispatch::Unary;
+use dispatch::io::request_tracker::{ReadRequest, RequestTracker};
 use dispatch::io::{FsReadRequest, FsRequest, HttpGetRequest, HttpRequest};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

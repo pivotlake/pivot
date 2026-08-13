@@ -1,10 +1,10 @@
-use crate::parquet::request_tracker::PendingRequest;
 use crate::parquet::types::leaves::projected_leaves;
 use crate::parquet::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata};
 use crate::parquet::types::projection::Projection;
 use crate::parquet::types::thrift::headers::PageHeader;
 use crate::parquet::types::thrift::parquet_thrift::ThriftReadInputProtocol;
 use bytes::Bytes;
+use dispatch::io::request_tracker::PendingRequest;
 use dispatch::io::{FsReadRequest, FsRequest, HttpGetRequest, OpenFile};
 use dispatch::memory::{CacheLookup, MultiBufferReader, ReaderPosition, Segment, memory_ctx};
 
@@ -126,17 +126,20 @@ fn compressed_lookup(
     fs_requests: &mut Vec<FsRequest>,
     http_requests: &mut Vec<HttpGetRequest>,
 ) -> Vec<CacheLookup> {
-    let parts = memory_ctx().compressed_cache().get(open_file, offset, len);
-    for lookup in &parts {
-        if let Some(block) = lookup.missing() {
+    let mut parts = memory_ctx().compressed_cache().get(open_file, offset, len);
+    for lookup in &mut parts {
+        // Moved, not cloned: the request inherits the extent's fetch ownership,
+        // so tearing the request down without completing the read abandons the
+        // extent for waiting readers (see `MissingExtent`).
+        if let Some(block) = lookup.take_missing() {
             match open_file {
                 OpenFile::Local(file) => fs_requests.push(FsRequest::Read(FsReadRequest {
                     file: file.clone(),
-                    block: block.clone(),
+                    block,
                 })),
                 OpenFile::Remote(remote) => http_requests.push(HttpGetRequest {
                     remote: remote.clone(),
-                    block: block.clone(),
+                    block,
                 }),
             }
         }

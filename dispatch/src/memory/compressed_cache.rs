@@ -45,7 +45,8 @@
 //! Callers feed the fragments into a scattered reader, so more (smaller) fragments
 //! are fine.
 
-use crate::io::OpenFile;
+use crate::io::slot_events::{SlotIoEvent, SlotIoOutcome};
+use crate::io::{OpenFile, slot_events};
 use crate::memory::clock::Owner;
 use crate::memory::context::memory_ctx;
 use crate::memory::fill_cursor::FillCursor;
@@ -154,6 +155,15 @@ impl CacheLookup {
         self.missing.as_ref()
     }
 
+    /// Move the fragment's not-yet-resident part out, to build the read request
+    /// that fills it. Moving (rather than cloning) hands over the extent's
+    /// fetch responsibility: an allocating lookup's [`MissingExtent`] is the
+    /// extent's *owner*, and its abandonment cleanup (see its `Drop`) must fire
+    /// when the read is torn down, not when this lookup is.
+    pub fn take_missing(&mut self) -> Option<MissingExtent> {
+        self.missing.take()
+    }
+
     /// Take the looked-up bytes - valid to read once every [`missing`](Self::missing)
     /// part has been filled. A zero-copy view into the cache slot, kept alive by
     /// the returned [`Bytes`].
@@ -170,21 +180,102 @@ impl CacheLookup {
 /// The pin is shared with the lookup's `data`, so the slot can't be evicted while a
 /// read into it is outstanding - even if the owning query is cancelled first.
 ///
+/// ## Fetch ownership
+///
+/// Exactly one `MissingExtent` per mapped extent is its *owner*: the one the
+/// allocating lookup produced, which is moved into the read request that fills
+/// the extent (see [`CacheLookup::take_missing`]). Every later lookup of the
+/// still-invalid extent yields non-owner refills, and clones/carves are never
+/// owners. Ownership means responsibility for the extent's IO reaching a
+/// conclusion: while the owner is alive, an invalid mapped extent is
+/// *definitely* going to be committed or abandoned, which is what lets another
+/// worker's identical read wait for it instead of duplicating the IO (see
+/// [`CompressedCache::register_waiter`]). Dropping an owner whose extent never
+/// fully committed - the read failed, or its query was cancelled before the
+/// read was performed - abandons the extent: it is removed from the file's map
+/// under the write lock, and every registered waiter is sent an
+/// [`Abandoned`](SlotIoOutcome::Abandoned) event so one of them re-issues the
+/// read itself.
+///
 /// [`dest`]: MissingExtent::dest
 /// [`commit`]: MissingExtent::commit
-#[derive(Clone)]
 pub struct MissingExtent {
     /// The extent to read: which file blocks map to which slot blocks.
     extent: Extent,
     /// Keeps the destination slot pinned for the read's whole lifetime.
     _pin: Arc<ReadBuffer>,
+    /// `Some` on the extent's owner: the file whose map holds the extent, kept
+    /// so abandonment can remove it. `None` on refills, clones, and carves.
+    owner: Option<OpenFile>,
+}
+
+impl Clone for MissingExtent {
+    /// Clones share the placement and pin but never the fetch ownership - the
+    /// owner is the single handle whose teardown must conclude the extent's IO.
+    fn clone(&self) -> Self {
+        MissingExtent {
+            extent: self.extent,
+            _pin: self._pin.clone(),
+            owner: None,
+        }
+    }
+}
+
+impl Drop for MissingExtent {
+    fn drop(&mut self) {
+        let Some(open_file) = self.owner.take() else {
+            return;
+        };
+        if self.is_resident() {
+            return;
+        }
+        memory_ctx()
+            .compressed_cache()
+            .abandon_extent(&open_file, &self.extent);
+    }
 }
 
 impl MissingExtent {
     /// The missing `extent`, backed by the slot `pin` holds; `extent.slot_idx` is `pin`'s
     /// slot, and `pin`'s base address gives [`dest`](Self::dest).
     fn new(extent: Extent, pin: Arc<ReadBuffer>) -> Self {
-        MissingExtent { extent, _pin: pin }
+        MissingExtent {
+            extent,
+            _pin: pin,
+            owner: None,
+        }
+    }
+
+    /// The freshly-allocated `extent`'s owning handle - see the type docs on
+    /// fetch ownership. Only [`try_allocate_lookup`](CompressedCache::try_allocate_lookup)
+    /// creates one.
+    fn new_owner(extent: Extent, pin: Arc<ReadBuffer>, open_file: OpenFile) -> Self {
+        MissingExtent {
+            extent,
+            _pin: pin,
+            owner: Some(open_file),
+        }
+    }
+
+    /// Whether this handle owns the extent's IO - the read built from it must be
+    /// performed, never joined onto someone else's.
+    pub fn is_owner(&self) -> bool {
+        self.owner.is_some()
+    }
+
+    /// The ring slot the extent lives in - the key waiters park under.
+    pub(crate) fn slot_index(&self) -> usize {
+        self.extent.slot_idx as usize
+    }
+
+    /// Whether every block of the extent has been committed.
+    pub fn is_resident(&self) -> bool {
+        let valid = &memory_ctx()
+            .compressed_cache()
+            .slot_metadata(self.extent.slot_idx as usize)
+            .valid;
+        let first = self.extent.first_slot_block as usize;
+        (first..first + self.extent.block_count as usize).all(|slot_block| valid.is_set(slot_block))
     }
 
     /// File offset the extent's bytes are read from - always a multiple of
@@ -221,6 +312,7 @@ impl MissingExtent {
                 block_count: (len / BLOCK_SIZE) as u16,
             },
             _pin: self._pin.clone(),
+            owner: None,
         }
     }
 
@@ -232,16 +324,19 @@ impl MissingExtent {
         (self._pin.ptr as usize + self.extent.first_slot_block as usize * BLOCK_SIZE) as *mut u8
     }
 
-    /// Mark the extent's blocks valid - call once its bytes have been read into the slot.
+    /// Mark the extent's blocks valid - call once its bytes have been read into
+    /// the slot - and tell every worker waiting on the slot, since these blocks
+    /// may be exactly the ones its parked read needs.
     pub fn commit(&self) {
-        memory_ctx()
-            .compressed_cache()
+        let cache = memory_ctx().compressed_cache();
+        cache
             .slot_metadata(self.extent.slot_idx as usize)
             .valid
             .set(
                 self.extent.first_slot_block as usize,
                 self.extent.block_count as usize,
             );
+        cache.notify_slot_waiters(self.extent.slot_idx as usize, SlotIoOutcome::Committed);
     }
 }
 
@@ -285,16 +380,86 @@ impl ValidBitmap {
     }
 }
 
+/// Highest global worker index a [`WaiterMask`] can register. Joining an
+/// in-flight read is skipped for workers past it (they perform their own IO),
+/// which no current machine reaches.
+pub(crate) const MAX_JOINABLE_WORKERS: usize = WAITER_MASK_WORDS * 64;
+/// Number of `u64` words in a slot's waiter mask (4 → 256 workers).
+const WAITER_MASK_WORDS: usize = 4;
+
+/// The workers registered to be told about a slot's IO events, one bit per
+/// global worker index. A worker sets its own bit while it has at least one
+/// read parked on the slot and clears it itself once none remain, so a bit is
+/// never cleared out from under its owner; notifiers only read.
+#[derive(Default)]
+struct WaiterMask([AtomicU64; WAITER_MASK_WORDS]);
+
+impl WaiterMask {
+    /// Register `worker` for the slot's events. `SeqCst`, paired with the fence
+    /// in [`CompressedCache::notify_slot_waiters`]: a registration is ordered
+    /// against the notifier's mask read, so the waiter's follow-up residency
+    /// check and the notifier's snapshot cannot both miss each other.
+    fn register(&self, worker: usize) {
+        self.0[worker / 64].fetch_or(1 << (worker % 64), Ordering::SeqCst);
+    }
+
+    /// Drop `worker`'s registration. Called only by `worker` itself.
+    fn deregister(&self, worker: usize) {
+        self.0[worker / 64].fetch_and(!(1 << (worker % 64)), Ordering::SeqCst);
+    }
+
+    /// Reset every registration. Sound only while the slot is held exclusively:
+    /// a genuinely parked waiter pins the slot, so exclusivity implies any
+    /// remaining bit is a stale leftover (a registration that resolved without
+    /// parking).
+    fn clear(&self) {
+        for word in &self.0 {
+            word.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// The workers currently registered.
+    fn registered_workers(&self) -> Vec<usize> {
+        let mut workers = Vec::new();
+        for (word_idx, word) in self.0.iter().enumerate() {
+            let mut bits = word.load(Ordering::SeqCst);
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                workers.push(word_idx * 64 + bit);
+                bits &= bits - 1;
+            }
+        }
+        workers
+    }
+}
+
 /// Per-slot validity and tenancy. One per ring slot. The CLOCK state (recency
 /// counter, owner, sweep hand) lives in the shared [`Clock`](super::clock::Clock).
 struct SlotMetadata {
     /// Which of the slot's 512 × 4 KB blocks have actually been read in.
     valid: ValidBitmap,
+    /// Workers with a read parked on this slot, waiting for an extent here to
+    /// commit or be abandoned. Every commit/abandonment on the slot sends each
+    /// of them a [`SlotIoEvent`].
+    waiters: WaiterMask,
     /// The extents currently packed here, one per `(file, first_file_block)`, so
     /// eviction can drop them from their files' maps. Written only by the worker
     /// filling the slot (under its fill pin); read only by the evictor (under
     /// `try_write`).
     tenants: UnsafeCell<Vec<Tenant>>,
+}
+
+/// The result of [`CompressedCache::register_waiter`].
+pub enum WaiterRegistration {
+    /// Registered: park the read; a [`SlotIoEvent`] arrives when the slot
+    /// commits blocks or abandons an extent.
+    Registered,
+    /// Every block of the extent is already committed - serve the read from the
+    /// resident bytes, no wait and no IO.
+    AlreadyResident,
+    /// The extent is no longer mapped at this placement (its owner abandoned
+    /// it, or the file was re-registered): perform the read yourself.
+    Abandoned,
 }
 
 /// One step while resolving a cache lookup: the fragment found or allocated at the
@@ -338,6 +503,7 @@ impl CompressedCache {
                 .map(|_| {
                     UnsafeCell::new(SlotMetadata {
                         valid: Default::default(),
+                        waiters: Default::default(),
                         tenants: UnsafeCell::new(Vec::new()),
                     })
                 })
@@ -413,7 +579,11 @@ impl CompressedCache {
         let extents = file_maps.get(open_file)?.read().unwrap();
         let found_extent = find_extent_covering(&extents, file_block)?;
 
-        let pin = Arc::new(memory_ctx().ring().try_read(found_extent.slot_idx as usize)?);
+        let pin = Arc::new(
+            memory_ctx()
+                .ring()
+                .try_read(found_extent.slot_idx as usize)?,
+        );
         memory_ctx().clock().touch(found_extent.slot_idx as usize);
         let valid = &self.slot_metadata(found_extent.slot_idx as usize).valid;
 
@@ -481,7 +651,7 @@ impl CompressedCache {
         Some(CacheLookupStep {
             lookup: CacheLookup {
                 data,
-                missing: Some(MissingExtent::new(extent, pin)),
+                missing: Some(MissingExtent::new_owner(extent, pin, open_file.clone())),
             },
             next_file_block: file_block + extent.block_count as usize,
         })
@@ -571,6 +741,103 @@ impl CompressedCache {
         Some(extent)
     }
 
+    /// Register `worker` to be told when `extent`'s slot commits blocks or
+    /// abandons an extent, so its identical parked read can ride the in-flight
+    /// one instead of duplicating the IO.
+    ///
+    /// The registration is taken under the extent map's read lock, with the
+    /// extent verified to still be mapped at the same placement. An abandoning
+    /// owner removes the extent under the write lock *before* snapshotting the
+    /// mask, so either the removal already happened (seen here as
+    /// [`Abandoned`](WaiterRegistration::Abandoned) - perform the read
+    /// yourself) or the registered bit is guaranteed to be in its snapshot.
+    /// A committing owner takes no lock; the fence pairing described on
+    /// [`WaiterMask::register`] guarantees a commit is either seen by the
+    /// residency check below or happens after the registration and sends the
+    /// event.
+    pub fn register_waiter(
+        &self,
+        open_file: &OpenFile,
+        extent: &MissingExtent,
+        worker: usize,
+    ) -> WaiterRegistration {
+        {
+            let file_maps = self.file_maps.read().unwrap();
+            let Some(extents_lock) = file_maps.get(open_file) else {
+                return WaiterRegistration::Abandoned;
+            };
+            let extents = extents_lock.read().unwrap();
+            let Some(covering) = find_extent_covering(&extents, extent.extent.first_file_block)
+            else {
+                return WaiterRegistration::Abandoned;
+            };
+            // The mapping must be the same physical placement this read fills:
+            // after an abandonment plus a fresh allocation (or an `open_entry`
+            // reset), the same file blocks can map to different slot memory, and
+            // waiting on that unrelated extent would never fill this one.
+            let same_placement = covering.slot_idx == extent.extent.slot_idx
+                && covering.slot_block_of(extent.extent.first_file_block)
+                    == extent.extent.first_slot_block as usize
+                && covering.last_file_block() >= extent.extent.last_file_block();
+            if !same_placement {
+                return WaiterRegistration::Abandoned;
+            }
+            self.slot_metadata(extent.extent.slot_idx as usize)
+                .waiters
+                .register(worker);
+        }
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if extent.is_resident() {
+            WaiterRegistration::AlreadyResident
+        } else {
+            WaiterRegistration::Registered
+        }
+    }
+
+    /// Drop `worker`'s registration on `slot_idx`, once it has no read parked on
+    /// the slot anymore.
+    pub fn deregister_waiter(&self, slot_idx: usize, worker: usize) {
+        self.slot_metadata(slot_idx).waiters.deregister(worker);
+    }
+
+    /// Send `outcome` for `slot_idx` to every worker registered on it. The fence
+    /// pairs with [`WaiterMask::register`]: the caller's preceding writes (valid
+    /// bits, extent removal) are ordered before the mask snapshot, so a waiter
+    /// registering concurrently either lands in the snapshot or observes those
+    /// writes in its post-registration check.
+    fn notify_slot_waiters(&self, slot_idx: usize, outcome: SlotIoOutcome) {
+        slot_events::with_router(|router| {
+            std::sync::atomic::fence(Ordering::SeqCst);
+            for worker in self.slot_metadata(slot_idx).waiters.registered_workers() {
+                router.send(worker, SlotIoEvent { slot_idx, outcome });
+            }
+        });
+    }
+
+    /// An owner is tearing down without having committed its extent (the read
+    /// failed, or its query was cancelled first): unmap the extent so later
+    /// lookups miss and re-read, and tell every waiter on its slot, so a parked
+    /// identical read performs the IO itself. The stale tenant entry is left to
+    /// self-clean on eviction, like an `open_entry` reset's.
+    fn abandon_extent(&self, open_file: &OpenFile, extent: &Extent) {
+        {
+            let file_maps = self.file_maps.read().unwrap();
+            if let Some(extents_lock) = file_maps.get(open_file) {
+                let mut extents = extents_lock.write().unwrap();
+                // Only remove the mapping this owner created: after an
+                // `open_entry` reset the same key can name a fresh extent in
+                // different slot memory, which has its own live owner.
+                if extents.get(&extent.first_file_block).is_some_and(|mapped| {
+                    mapped.slot_idx == extent.slot_idx
+                        && mapped.first_slot_block == extent.first_slot_block
+                }) {
+                    extents.remove(&extent.first_file_block);
+                }
+            }
+        }
+        self.notify_slot_waiters(extent.slot_idx as usize, SlotIoOutcome::Abandoned);
+    }
+
     /// Point the fill cursor at a fresh, empty slot: reset its bitmap and tenant list
     /// while it is held exclusively, then publish it as readable.
     fn rotate_fill_buffer(&self, cursor: &mut FillCursor) {
@@ -578,6 +845,7 @@ impl CompressedCache {
         let slot_idx = write_buffer.slot_idx;
         let metadata = self.slot_metadata(slot_idx);
         metadata.valid.clear();
+        metadata.waiters.clear();
         self.tenants_mut(slot_idx).clear();
         memory_ctx().clock().bind(slot_idx, Owner::Compressed);
         cursor.buffer = Some(Arc::new(ReadBuffer::from(write_buffer))); // used = 1, Release
@@ -606,6 +874,7 @@ impl CompressedCache {
     fn recycle_slot(&self, idx: usize) {
         let metadata = self.slot_metadata(idx);
         metadata.valid.clear();
+        metadata.waiters.clear();
         memory_ctx().clock().release(idx);
     }
 
@@ -1299,6 +1568,112 @@ mod tests {
             memory_ctx().clock().refs(source_slot),
             refs_before + memory_ctx().clock().reinforce_bump(),
             "the now-last copy gained a reinforced bump"
+        );
+    }
+
+    // -- fetch ownership and waiter registration --
+
+    #[test]
+    fn an_allocation_owns_its_extent_and_a_refill_does_not() {
+        init_test_free_pool(4);
+        let file = new_file();
+        cache().open_entry(file.clone());
+
+        let owner = cache().get(&file, 0, SB)[0].take_missing().unwrap();
+        let refill = cache().get(&file, 0, SB)[0].take_missing().unwrap();
+
+        assert!(owner.is_owner());
+        assert!(!refill.is_owner(), "a refill rides the owner's read");
+        assert!(!owner.clone().is_owner(), "clones never carry ownership");
+    }
+
+    #[test]
+    fn dropping_an_uncommitted_owner_abandons_the_extent() {
+        init_test_free_pool(4);
+        let file = new_file();
+        cache().open_entry(file.clone());
+
+        drop(cache().get(&file, 0, SB)[0].take_missing().unwrap());
+        let relookup = cache().get(&file, 0, SB)[0].take_missing().unwrap();
+
+        // The abandoned extent was unmapped, so the re-lookup allocated afresh
+        // and owns the new extent (a live mapping would have made it a refill).
+        assert!(relookup.is_owner());
+    }
+
+    #[test]
+    fn a_committed_owner_leaves_its_extent_mapped() {
+        init_test_free_pool(4);
+        let file = new_file();
+        cache().open_entry(file.clone());
+
+        let owner = cache().get(&file, 0, SB)[0].take_missing().unwrap();
+        owner.commit();
+        drop(owner);
+
+        assert!(
+            cache().get(&file, 0, SB)[0].missing().is_none(),
+            "the committed extent serves a hit"
+        );
+    }
+
+    #[test]
+    fn a_waiter_registration_reflects_the_extent_state() {
+        init_test_free_pool(4);
+        let file = new_file();
+        cache().open_entry(file.clone());
+        let owner = cache().get(&file, 0, SB)[0].take_missing().unwrap();
+        let refill = cache().get(&file, 0, SB)[0].take_missing().unwrap();
+
+        let while_in_flight = cache().register_waiter(&file, &refill, 0);
+        owner.commit();
+        let after_commit = cache().register_waiter(&file, &refill, 0);
+
+        assert!(matches!(while_in_flight, WaiterRegistration::Registered));
+        assert!(matches!(after_commit, WaiterRegistration::AlreadyResident));
+    }
+
+    #[test]
+    fn a_waiter_registration_on_an_abandoned_extent_reports_it() {
+        init_test_free_pool(4);
+        let file = new_file();
+        cache().open_entry(file.clone());
+        let owner = cache().get(&file, 0, SB)[0].take_missing().unwrap();
+        let refill = cache().get(&file, 0, SB)[0].take_missing().unwrap();
+
+        drop(owner);
+        let registration = cache().register_waiter(&file, &refill, 0);
+
+        assert!(
+            matches!(registration, WaiterRegistration::Abandoned),
+            "the waiter must perform the read itself"
+        );
+    }
+
+    #[test]
+    fn slot_events_reach_registered_waiters() {
+        use crate::io::slot_events::{SlotEventRouter, SlotIoOutcome, install_worker_slot_events};
+        init_test_free_pool(4);
+        let file = new_file();
+        cache().open_entry(file.clone());
+        let waker = std::sync::Arc::new(crate::waker::WorkerWaker::new(1));
+        let (router, mut receivers) =
+            SlotEventRouter::create(1, crate::waker::WakerSet::new(vec![waker], 1));
+        install_worker_slot_events(router);
+        let events = receivers.remove(0);
+        let committed_owner = cache().get(&file, 0, SB)[0].take_missing().unwrap();
+        let abandoned_owner = cache().get(&file, SB, SB)[0].take_missing().unwrap();
+        let refill = cache().get(&file, 0, 2 * SB);
+        cache().register_waiter(&file, refill[0].missing().unwrap(), 0);
+
+        committed_owner.commit();
+        drop(abandoned_owner);
+
+        let outcomes: Vec<SlotIoOutcome> =
+            std::iter::from_fn(|| events.try_recv().ok().map(|e| e.outcome)).collect();
+        assert_eq!(
+            outcomes,
+            vec![SlotIoOutcome::Committed, SlotIoOutcome::Abandoned]
         );
     }
 

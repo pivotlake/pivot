@@ -82,6 +82,7 @@ mod profiler;
 mod scan;
 mod stats;
 
+use crate::io::slot_events::SlotEventRouter;
 use crate::waker::{WakerSet, WorkerWaker};
 use crate::worker::Worker;
 pub use api::*;
@@ -363,9 +364,12 @@ impl Dispatch {
             .map(|_| Arc::new(WorkerWaker::new(topology.workers_per_node)))
             .collect();
         let waker_set = WakerSet::new(node_wakers.clone(), topology.workers_per_node);
+        let (slot_event_router, slot_event_receivers) =
+            SlotEventRouter::create(total_workers, waker_set.clone());
 
         let mut threads = vec![];
         let mut senders = vec![];
+        let mut slot_event_receivers = slot_event_receivers.into_iter();
         for (node, group) in core_groups.into_iter().enumerate() {
             for (node_local_idx, core) in group.into_iter().enumerate() {
                 let (tx, rx) = channel();
@@ -382,6 +386,8 @@ impl Dispatch {
                     barrier.clone(),
                     node_wakers[node].clone(),
                     waker_set.clone(),
+                    slot_event_router.clone(),
+                    slot_event_receivers.next().unwrap(),
                 ));
             }
         }

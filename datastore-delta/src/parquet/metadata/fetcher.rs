@@ -8,10 +8,10 @@
 //! overflowed the probe — read it exactly before parsing.
 
 use super::FileRowGroups;
-use crate::parquet::request_tracker::{PendingRequest, ReadRequest, RequestTracker};
 use crate::parquet::types::metadata::RowGroupMetadata;
 use crate::parquet::types::table::{Error, FOOTER_PROBE_BYTES, Result, row_groups_from_footer};
 use crate::store::{DataFile, FileRef};
+use dispatch::io::request_tracker::{PendingRequest, ReadRequest, RequestTracker};
 use dispatch::io::{FsReadRequest, FsRequest, HttpGetRequest, HttpRequest, OpenFile};
 use dispatch::memory::{CacheLookup, memory_ctx};
 use dispatch::{Sender, Unary};
@@ -247,16 +247,18 @@ impl FooterRead {
             .compressed_cache()
             .get(&self.open_file, offset, len);
         self.remaining = 0;
-        for lookup in &self.lookups {
-            if let Some(block) = lookup.missing() {
+        for lookup in &mut self.lookups {
+            // Moved, not cloned: the request inherits the extent's fetch
+            // ownership (see `MissingExtent`).
+            if let Some(block) = lookup.take_missing() {
                 match &self.open_file {
                     OpenFile::Local(file) => self.pending_fs.push(FsRequest::Read(FsReadRequest {
                         file: file.clone(),
-                        block: block.clone(),
+                        block,
                     })),
                     OpenFile::Remote(remote) => self.pending_http.push(HttpGetRequest {
                         remote: remote.clone(),
-                        block: block.clone(),
+                        block,
                     }),
                 }
                 self.remaining += 1;
