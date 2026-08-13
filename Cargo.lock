@@ -1611,6 +1611,7 @@ dependencies = [
  "ureq",
  "url",
  "uuid",
+ "zstd",
 ]
 
 [[package]]

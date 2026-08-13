@@ -217,6 +217,7 @@ pub(crate) fn row_groups_from_metadata(
                         meta.codec,
                         CompressionCodec::SNAPPY
                             | CompressionCodec::LZ4_RAW
+                            | CompressionCodec::ZSTD
                             | CompressionCodec::UNCOMPRESSED
                     ) {
                         return Err(Error::UnsupportedCompression(meta.codec));
