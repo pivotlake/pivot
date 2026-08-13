@@ -158,13 +158,23 @@ impl KeyMemo {
     }
 }
 
+/// A retired table together with the hash-ordered view the merge reads.
+pub struct SealedTable<KP: super::PersistedKey, V: AggregationValue + ?Sized> {
+    pub table: MultiSlabTable<KP, V>,
+    pub run: super::SortedRun,
+}
+
+impl<KP: super::PersistedKey, V: AggregationValue + ?Sized> SealedTable<KP, V> {
+    fn seal(table: MultiSlabTable<KP, V>) -> Self {
+        let run = table.build_sorted_run();
+        Self { table, run }
+    }
+}
+
 /// The tables and sizing data one worker produced.
 pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue + ?Sized> {
-    /// The NUMA node whose worker flushed this output; the merge groups
-    /// sources by it.
-    pub node: usize,
-    /// Every table this worker filled, the one it was still filling last.
-    pub tables: Vec<MultiSlabTable<K::Persisted, V>>,
+    /// Every table this worker filled, each with its hash-ordered run.
+    pub tables: Vec<SealedTable<K::Persisted, V>>,
     /// Distinct-count sketch over the worker's rows, for sizing the merge targets.
     pub hll: Hll,
     /// `K::DEDUP_BY_HASH` only: this worker saw the (single) key whose bijective
@@ -182,8 +192,10 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// Per-worker value state.
     worker_context: V::WorkerContext,
     allocator: SlabAllocator,
-    /// Retired tables, with the active one last.
-    tables: Vec<MultiSlabTable<K::Persisted, V>>,
+    /// The table currently absorbing rows.
+    active: MultiSlabTable<K::Persisted, V>,
+    /// Tables retired at the spill capacity, each with its sorted run.
+    sealed: Vec<SealedTable<K::Persisted, V>>,
     /// Distinct-count sketch used to size merge targets.
     hll: Hll,
     /// Slot count at which tables stop growing.
@@ -219,7 +231,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             key_arena: WorkerArena::new(key_arena),
             worker_context,
             allocator,
-            tables: vec![table],
+            active: table,
+            sealed: Vec::new(),
             hll: Hll::new(),
             spill_config,
             memo: KeyMemo::new(),
@@ -306,7 +319,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         while i < length {
             let overflowed = {
                 let Self {
-                    tables,
+                    active,
                     key_arena,
                     worker_context,
                     hashes,
@@ -317,7 +330,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
                 V::dispatch_arity(
                     metadata,
                     ProbeWindow::<K, V> {
-                        table: tables.last_mut().unwrap(),
+                        table: active,
                         key_arena,
                         worker_context,
                         hashes,
@@ -347,8 +360,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
     /// total (which counts a key once per table that holds it).
     #[cold]
     fn fold_active_table_into_hll(&mut self) {
-        let Self { tables, hll, .. } = self;
-        for entry in tables.last().unwrap().iter(0) {
+        let Self { active, hll, .. } = self;
+        for entry in active.iter(0) {
             hll.add(entry.hash);
         }
     }
@@ -356,38 +369,38 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
     /// Retires the full table and makes a fresh one active.
     ///
     /// The replacement is four times larger while that still fits the cache
-    /// budget, and the same size once it does not. Retired tables are kept as
-    /// they are: the merge reads each one's slot range for its partition
-    /// directly, so nothing has to be rewritten here.
+    /// budget, and the same size once it does not. The retired table is sealed
+    /// with a hash-ordered run while its entries are still cache-warm; the
+    /// merge streams each partition's slice of that run directly.
     #[cold]
     fn retire_active_table(&mut self) {
         // Remembered addresses point into the table being retired.
         self.memo.invalidate();
         self.fold_active_table_into_hll();
-        let capacity = self.tables.last().unwrap().capacity();
+        let capacity = self.active.capacity();
         let next_size = if capacity < self.spill_config.spill_capacity {
             capacity * 4
         } else {
             capacity
         };
-        self.tables.push(BaseHashTable::new(
-            &mut self.allocator,
-            next_size,
-            0,
-            &self.shared_context,
-        ));
+        let retired = std::mem::replace(
+            &mut self.active,
+            BaseHashTable::new(&mut self.allocator, next_size, 0, &self.shared_context),
+        );
+        self.sealed.push(SealedTable::seal(retired));
     }
 
     /// Finishes worker state for the merge phase.
     pub fn flush(mut self) -> AggregatedTableOutput<K, V> {
         // Retired tables were folded in as they were replaced; the active one
-        // still has to be counted.
+        // still has to be counted and sealed.
         self.fold_active_table_into_hll();
         self.key_arena.flush();
         self.worker_context.flush();
+        let mut tables = self.sealed;
+        tables.push(SealedTable::seal(self.active));
         AggregatedTableOutput {
-            node: crate::worker::current_node(),
-            tables: self.tables,
+            tables,
             hll: self.hll,
             zero_hash_seen: self.zero_hash_seen,
         }
@@ -520,7 +533,7 @@ fn probe_rows<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized>(
             }
             // Probe once, then seed a new group or update the matching group.
             let key = K::live_key(key_reader, row, key_arena);
-            let entry = prober.probe_fold::<false, _, _, _, _>(
+            let entry = prober.probe_fold(
                 hash,
                 key,
                 &mut *worker_context,

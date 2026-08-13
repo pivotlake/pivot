@@ -1,459 +1,369 @@
-//! Partition-parallel merge of GROUP BY partial results.
+//! Partition-parallel streaming merge of GROUP BY partial results.
 //!
-//! High hash bits select both the merge partition and the source-table slot
-//! range, so each merge job reads only its own portion of every source table
-//! and folds it into one target: the partition's final result.
+//! Every retired table carries a hash-ordered run of its occupied slots, so a
+//! partition's share of each table is one contiguous slice of that run. The
+//! merge walks all slices at once with a loser tree keyed on the stored hash
+//! and emits each group the moment its last partial has been seen: groups
+//! stream straight into the output sink, and no result table is ever built.
 //!
-//! Tables with equal capacity are scanned together. Linear-probe entries that
-//! crossed the nominal partition boundary are handled by a short overflow scan.
+//! ```text
+//! run 0:  [ h3 h9 ... ]--+
+//! run 1:  [ h1 h9 ... ]--+--> loser tree --> h1, h3, h9(merged), ... --> sink
+//! run 2:  [ h5 ...    ]--+
+//! ```
+//!
+//! A group held by exactly one run (the common case at high cardinality) is
+//! emitted directly from its table entry, with no copies and no value merge.
+//! When several runs hold the same hash, the entries are gathered and grouped
+//! by their real key, so two distinct keys sharing a 64-bit hash stay two
+//! groups.
 
-use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::{
-    AggregationValue, DEFAULT_CAPACITY, MAX_LOAD_FACTOR, MultiSlabTable, PersistedKey, Prober,
-    TableReader,
+    AggregationValue, BUCKET_BITS, LiveKey, PersistedKey, SealedTable, TableReader,
 };
 use crate::operations::unary::group::keys::StoredKey;
 use crate::operations::unary::group::values::ArityBody;
 
-/// Tables grouped by the slot count they were built at. Equal-sized tables share
-/// partition boundaries, so the merge scans them together.
-type TablesByCapacity<'a, S, V> = Vec<(
-    usize,
-    Vec<&'a MultiSlabTable<<S as StoredKey>::Persisted, V>>,
-)>;
+use super::Result;
 
-/// Collision-to-entry ratio at which we double the target table.
-///
-/// For linear probing, the cumulative collision ratio is
-/// `alpha / (2 * (1 - alpha))`. A threshold of two allows dense result tables
-/// without letting probe chains grow without bound.
-const RESIZE_COLLISION_RATIO: f64 = 2.0;
+/// How many entries ahead each cursor warms its run's cache lines.
+const CURSOR_PREFETCH: usize = 8;
 
-/// Slots processed from each equal-sized source before moving to the next.
-///
-/// Only bites when a partition's slice of one table is longer than this: the
-/// slice is then walked in batches, interleaved across tables, so the region of
-/// the target they land in stays cache-warm. A slice shorter than this is
-/// walked whole, one table at a time.
-const SCAN_BATCH_SIZE: usize = 100;
+/// Loser-tree sort key: a live cursor's `hash << 1`; exhausted cursors sort
+/// after every live hash, including `u64::MAX`.
+const EXHAUSTED: u128 = u128::MAX;
 
-/// How many source tables ahead to warm while scanning the current one.
-const TABLE_PREFETCH_DISTANCE: usize = 8;
-
-const PREFETCH_DISTANCE: usize = 8;
-
-/// Try to resize the target if cumulative collision pressure is too high.
-#[inline]
-fn resize_if_needed<KP: PersistedKey, V: AggregationValue + ?Sized>(
-    allocator: &mut SlabAllocator,
-    target: &mut Prober<'_, KP, V>,
-) {
-    // Use the integer form of `collisions / len > ratio`.
-    target.resize_on_collisions(allocator, RESIZE_COLLISION_RATIO as usize);
-}
-
-/// Merge the slots of one source `reader` in `[from, to)` that belong to
-/// `partition` into `target`.
-///
-/// The target prefetch reads a hash from further along this same slice. Looking
-/// past its end would prefetch a target slot for a hash belonging to a
-/// different partition, which no probe here will ever want: pure eviction.
-#[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn merge_slot_range<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
-    allocator: &mut SlabAllocator,
-    arena: &SharedArena,
-    partition: usize,
-    reader: &TableReader<'_, S::Persisted, V>,
-    from: usize,
-    to: usize,
-    target: &mut Prober<'_, S::Persisted, V>,
-    partition_shift: u32,
-    context: &V::SharedContext,
-) {
-    // Locate this partition's entries first, then fold them. Splitting the two
-    // keeps the unpredictable occupancy test out of the loop that does the
-    // work, and leaves a dense list whose target slots can all be prefetched.
-    let mut found: [*const u8; SCAN_BATCH_SIZE] = [std::ptr::null(); SCAN_BATCH_SIZE];
-    let mut scanned = from;
-    while scanned < to {
-        let chunk_end = to.min(scanned + SCAN_BATCH_SIZE);
-        let count = reader.collect_partition_entries(
-            scanned,
-            chunk_end,
-            partition_shift,
-            partition,
-            &mut found,
-        );
-        for (position, &entry) in found[..count].iter().enumerate() {
-            if position + PREFETCH_DISTANCE < count {
-                target.prefetch(reader.hash_of(found[position + PREFETCH_DISTANCE]));
-            }
-            let hash = reader.hash_of(entry);
-            let view = unsafe { reader.view_of(entry, hash) };
-            target.merge_from::<true, _>(
-                hash,
-                S::resolve_persisted(arena, *view.key),
-                view.stored,
-                context,
-            );
-            resize_if_needed::<S::Persisted, V>(allocator, target);
-        }
-        scanned = chunk_end;
-    }
+fn live_key(hash: u64) -> u128 {
+    (hash as u128) << 1
 }
 
-/// Scan the expected slot range `[start, end)` across all source `tables`,
-/// merging entries that belong to `partition` into `target`.
-///
-/// Equal-sized source tables are scanned in small batches so their target
-/// region remains local.
-#[allow(clippy::too_many_arguments)]
-fn merge_within_partition_bounds<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
-    allocator: &mut SlabAllocator,
-    arena: &SharedArena,
-    partition: usize,
-    slot_count: usize,
-    tables: &[&MultiSlabTable<S::Persisted, V>],
-    target: &mut Prober<'_, S::Persisted, V>,
-    partition_bits: u32,
-    context: &V::SharedContext,
-) {
-    let partition_shift = u64::BITS - partition_bits;
-    let start = (partition * slot_count) >> partition_bits;
-    let end = ((partition + 1) * slot_count) >> partition_bits;
-    let mut i = start;
-
-    while i < end {
-        let range = std::cmp::min(SCAN_BATCH_SIZE, end - i);
-        let batch_end = i + range;
-
-        for (index, table) in tables.iter().enumerate() {
-            // Reuse one source reader for this range.
-            let source_reader = table.reader::<N>();
-            // A partition owns a narrow slice of each table, so consecutive
-            // tables are scattered addresses the hardware prefetcher cannot
-            // predict. Warm its whole slice a few tables ahead.
-            if let Some(ahead) = tables.get(index + TABLE_PREFETCH_DISTANCE) {
-                ahead.reader::<N>().prefetch_entries(i, batch_end);
-            }
-            merge_slot_range::<N, S, V>(
-                allocator,
-                arena,
-                partition,
-                &source_reader,
-                i,
-                batch_end,
-                target,
-                partition_shift,
-                context,
-            );
-        }
-
-        i += range;
-    }
-}
-
-/// Takes this partition's entries from one source's probe-chain overflow: the
-/// run of occupied slots starting where its nominal range ends, which is where
-/// linear probing can have pushed them.
-#[allow(clippy::too_many_arguments)]
-#[inline(always)]
-fn merge_overflow_tail<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
-    allocator: &mut SlabAllocator,
-    arena: &SharedArena,
-    partition: usize,
-    reader: &TableReader<'_, S::Persisted, V>,
+/// One run's walk over its partition slice, in hash order.
+struct Cursor<'t, KP, V: AggregationValue + ?Sized> {
+    reader: TableReader<'t, KP, V>,
+    positions: *const u32,
+    pos: usize,
     end: usize,
-    mask: usize,
-    target: &mut Prober<'_, S::Persisted, V>,
-    partition_shift: u32,
-    context: &V::SharedContext,
-) {
-    let mut i = end & mask;
-    loop {
-        let entry = reader.view_at(i);
-        let hash = entry.hash;
-        if hash == 0 {
-            break;
+}
+
+impl<KP: PersistedKey, V: AggregationValue + ?Sized> Cursor<'_, KP, V> {
+    /// The entry the cursor currently points at.
+    #[inline(always)]
+    fn entry(&self) -> *const u8 {
+        let slot = unsafe { *self.positions.add(self.pos) } as usize;
+        self.reader.entry_ptr(slot)
+    }
+
+    /// Steps past the current entry and returns the next sort key.
+    #[inline(always)]
+    fn advance(&mut self) -> u128 {
+        self.pos += 1;
+        if self.pos == self.end {
+            return EXHAUSTED;
         }
-        if (hash >> partition_shift) as usize == partition {
-            target.merge_from::<true, _>(
-                hash,
-                S::resolve_persisted(arena, *entry.key),
-                entry.stored,
-                context,
-            );
-            resize_if_needed::<S::Persisted, V>(allocator, target);
+        if self.pos + CURSOR_PREFETCH < self.end {
+            let ahead = unsafe { *self.positions.add(self.pos + CURSOR_PREFETCH) } as usize;
+            self.reader.prefetch_entry(ahead);
         }
-        i = (i + 1) & mask;
+        live_key(self.reader.hash_of(self.entry()))
     }
 }
 
-/// Scans the probe-chain overflow beyond a partition's nominal slot range.
-#[allow(clippy::too_many_arguments)]
-fn merge_past_partition_bounds<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
-    allocator: &mut SlabAllocator,
-    arena: &SharedArena,
-    partition: usize,
-    slot_count: usize,
-    tables: &[&MultiSlabTable<S::Persisted, V>],
-    target: &mut Prober<'_, S::Persisted, V>,
-    partition_bits: u32,
-    context: &V::SharedContext,
-) {
-    let partition_shift = u64::BITS - partition_bits;
-    let end = ((partition + 1) * slot_count) >> partition_bits;
-    let mask = slot_count - 1;
-
-    for table in tables {
-        merge_overflow_tail::<N, S, V>(
-            allocator,
-            arena,
-            partition,
-            &table.reader::<N>(),
-            end,
-            mask,
-            target,
-            partition_shift,
-            context,
-        );
-    }
+/// A loser tree over the cursors' current sort keys.
+///
+/// Internal nodes hold the loser of their subtree's play-off and the root
+/// holds the overall winner, so replacing the winner's key replays exactly one
+/// leaf-to-root path: log2(leaves) comparisons per emitted entry.
+struct LoserTree {
+    /// Current sort key per leaf, padded to a power of two with [`EXHAUSTED`].
+    keys: Vec<u128>,
+    /// `nodes[0]` is the winner; `nodes[1..]` hold each play-off's loser.
+    nodes: Vec<u32>,
+    leaves: usize,
 }
 
-/// Merge entries from `tables` that belong to `partition` into `target`.
-#[allow(clippy::too_many_arguments)]
-fn merge_into_partition<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
-    allocator: &mut SlabAllocator,
-    arena: &SharedArena,
-    partition: usize,
-    slot_count: usize,
-    tables: Vec<&MultiSlabTable<S::Persisted, V>>,
-    target: &mut Prober<'_, S::Persisted, V>,
-    partition_bits: u32,
-    context: &V::SharedContext,
-) {
-    let start = (partition * slot_count) >> partition_bits;
-    let end = ((partition + 1) * slot_count) >> partition_bits;
-    // With many source tables a partition owns only a few slots of each, and
-    // the two scans below would each walk the whole table list, touching every
-    // table twice from addresses far enough apart that the first visit has been
-    // evicted by the time the second arrives. Short slices are therefore taken
-    // whole -- nominal range and overflow tail together -- in a single visit per
-    // table. Long slices keep the batched form, which interleaves tables to hold
-    // the target region they land in cache-warm.
-    if end - start <= SCAN_BATCH_SIZE {
-        let partition_shift = u64::BITS - partition_bits;
-        let mask = slot_count - 1;
-        for (index, table) in tables.iter().enumerate() {
-            let source_reader = table.reader::<N>();
-            if let Some(ahead) = tables.get(index + TABLE_PREFETCH_DISTANCE) {
-                ahead.reader::<N>().prefetch_entries(start, end);
+impl LoserTree {
+    fn new(keys: Vec<u128>) -> Self {
+        let leaves = keys.len();
+        debug_assert!(leaves.is_power_of_two());
+        let mut nodes = vec![0u32; leaves.max(1)];
+        let mut winners = vec![0u32; 2 * leaves];
+        for (i, winner) in winners[leaves..].iter_mut().enumerate() {
+            *winner = i as u32;
+        }
+        for n in (1..leaves).rev() {
+            let a = winners[2 * n];
+            let b = winners[2 * n + 1];
+            let (winner, loser) = if keys[a as usize] <= keys[b as usize] {
+                (a, b)
+            } else {
+                (b, a)
+            };
+            winners[n] = winner;
+            nodes[n] = loser;
+        }
+        nodes[0] = winners[1.min(2 * leaves - 1)];
+        Self {
+            keys,
+            nodes,
+            leaves,
+        }
+    }
+
+    /// The leaf holding the smallest key.
+    #[inline(always)]
+    fn winner(&self) -> usize {
+        self.nodes[0] as usize
+    }
+
+    #[inline(always)]
+    fn key(&self, leaf: usize) -> u128 {
+        self.keys[leaf]
+    }
+
+    /// Replaces the winner leaf's key and replays its path to the root.
+    #[inline(always)]
+    fn replay(&mut self, leaf: usize, new_key: u128) {
+        self.keys[leaf] = new_key;
+        let mut winner = leaf as u32;
+        let mut node = (leaf + self.leaves) >> 1;
+        while node >= 1 {
+            let loser = self.nodes[node];
+            if self.keys[loser as usize] < self.keys[winner as usize] {
+                self.nodes[node] = winner;
+                winner = loser;
             }
-            merge_slot_range::<N, S, V>(
-                allocator,
-                arena,
-                partition,
-                &source_reader,
-                start,
-                end,
-                target,
-                partition_shift,
-                context,
-            );
-            merge_overflow_tail::<N, S, V>(
-                allocator,
-                arena,
-                partition,
-                &source_reader,
-                end,
-                mask,
-                target,
-                partition_shift,
-                context,
-            );
+            node >>= 1;
         }
-        return;
+        self.nodes[0] = winner;
     }
-    merge_within_partition_bounds::<N, S, V>(
-        allocator,
-        arena,
-        partition,
-        slot_count,
-        &tables,
-        target,
-        partition_bits,
-        context,
-    );
-    merge_past_partition_bounds::<N, S, V>(
-        allocator,
-        arena,
-        partition,
-        slot_count,
-        &tables,
-        target,
-        partition_bits,
-        context,
-    );
 }
 
-/// Merges one partition's share of every source table.
-pub(super) fn merge_combined<S: StoredKey, V: AggregationValue + ?Sized>(
+/// Heap scratch holding one merged aggregation value.
+struct ScratchValue<V: AggregationValue + ?Sized> {
+    buf: *mut u8,
+    layout: std::alloc::Layout,
+    metadata: V::StorageMetadata,
+}
+
+impl<V: AggregationValue + ?Sized> ScratchValue<V> {
+    fn new(metadata: V::StorageMetadata) -> Self {
+        let layout =
+            std::alloc::Layout::from_size_align(V::stored_size(metadata).max(1), V::stored_align())
+                .expect("value layout is valid");
+        // Zeroed to match the slab-zeroed slots `copy_from` normally seeds.
+        let buf = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!buf.is_null(), "scratch value allocation failed");
+        Self {
+            buf,
+            layout,
+            metadata,
+        }
+    }
+
+    #[inline(always)]
+    fn value_mut(&mut self) -> &mut V {
+        unsafe { V::from_entry_mut(self.buf, self.metadata) }
+    }
+
+    #[inline(always)]
+    fn value(&self) -> &V {
+        unsafe { V::from_entry(self.buf, self.metadata) }
+    }
+}
+
+impl<V: AggregationValue + ?Sized> Drop for ScratchValue<V> {
+    fn drop(&mut self) {
+        unsafe { std::alloc::dealloc(self.buf, self.layout) };
+    }
+}
+
+/// Streams one partition's merged groups into `emit`.
+///
+/// `emit` receives each group exactly once and returns whether the merge
+/// should keep going (`false` stops early, for satisfied LIMIT pushdowns).
+pub(super) fn merge_partition<S: StoredKey, V: AggregationValue + ?Sized, E>(
     partition: usize,
-    tables: &[MultiSlabTable<S::Persisted, V>],
-    partition_capacity: usize,
     num_partitions: usize,
+    tables: &[SealedTable<S::Persisted, V>],
     key_arena: &SharedArena,
     context: &V::SharedContext,
-) -> MultiSlabTable<S::Persisted, V> {
+    emit: E,
+) -> Result<()>
+where
+    E: FnMut(&S::Persisted, &V) -> Result<bool>,
+{
     // Dispatch once so every loop in this job shares the specialized arity.
     V::dispatch_arity(
         V::storage_metadata(context),
-        MergeCombined::<S, V> {
+        MergePartition::<S, V, E> {
             partition,
-            tables,
-            partition_capacity,
             num_partitions,
+            tables,
             key_arena,
             context,
+            emit,
         },
     )
 }
 
 /// State passed through arity dispatch for one partition merge.
-struct MergeCombined<'a, S: StoredKey, V: AggregationValue + ?Sized> {
+struct MergePartition<'a, S: StoredKey, V: AggregationValue + ?Sized, E> {
     partition: usize,
-    tables: &'a [MultiSlabTable<S::Persisted, V>],
-    partition_capacity: usize,
     num_partitions: usize,
+    tables: &'a [SealedTable<S::Persisted, V>],
     key_arena: &'a SharedArena,
     context: &'a V::SharedContext,
+    emit: E,
 }
 
-impl<S: StoredKey, V: AggregationValue + ?Sized> ArityBody<MultiSlabTable<S::Persisted, V>>
-    for MergeCombined<'_, S, V>
+impl<S: StoredKey, V: AggregationValue + ?Sized, E> ArityBody<Result<()>>
+    for MergePartition<'_, S, V, E>
+where
+    E: FnMut(&S::Persisted, &V) -> Result<bool>,
 {
     #[inline(always)]
-    fn run<const N: usize>(self) -> MultiSlabTable<S::Persisted, V> {
-        let MergeCombined {
+    fn run<const N: usize>(self) -> Result<()> {
+        let MergePartition {
             partition,
-            tables,
-            partition_capacity,
             num_partitions,
+            tables,
             key_arena,
             context,
+            emit,
         } = self;
-        merge_combined_rows::<N, S, V>(
+        merge_partition_rows::<N, S, V, E>(
             partition,
-            tables,
-            partition_capacity,
             num_partitions,
+            tables,
             key_arena,
             context,
+            emit,
         )
     }
 }
 
 /// Merges one partition after arity dispatch.
-///
-/// Separate reference parameters preserve alias information across raw target
-/// writes, keeping shared state outside the inner loops.
-#[allow(clippy::too_many_arguments)]
-fn merge_combined_rows<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
+#[inline(never)]
+fn merge_partition_rows<const N: usize, S: StoredKey, V: AggregationValue + ?Sized, E>(
     partition: usize,
-    tables: &[MultiSlabTable<S::Persisted, V>],
-    partition_capacity: usize,
     num_partitions: usize,
+    tables: &[SealedTable<S::Persisted, V>],
     key_arena: &SharedArena,
     context: &V::SharedContext,
-) -> MultiSlabTable<S::Persisted, V> {
-    {
-        let partition_bits = num_partitions.trailing_zeros();
-        let mut allocator = SlabAllocator::new(true);
-        let capacity = partition_capacity.max(DEFAULT_CAPACITY);
-        let mut result: MultiSlabTable<S::Persisted, V> = <MultiSlabTable<S::Persisted, V>>::new(
-            &mut allocator,
-            capacity,
-            partition_bits,
-            context,
-        );
-        // Reuse one target probe layout across the partition.
-        let mut target = if N == 0 {
-            result.prober()
-        } else {
-            result.prober_with_metadata(V::metadata_for_arity::<N>())
-        };
+    mut emit: E,
+) -> Result<()>
+where
+    E: FnMut(&S::Persisted, &V) -> Result<bool>,
+{
+    let partition_bits = num_partitions.trailing_zeros();
+    debug_assert!(partition_bits <= BUCKET_BITS);
+    let buckets_per_partition = BUCKET_BITS - partition_bits;
+    let bucket_lo = partition << buckets_per_partition;
+    let bucket_hi = (partition + 1) << buckets_per_partition;
 
-        // Scan equal-sized tables together so they share partition boundaries.
-        let mut tables_by_capacity: TablesByCapacity<'_, S, V> = Vec::new();
-        for table in tables {
-            let slot_count = table.capacity();
-            if let Some((_, same_size_tables)) = tables_by_capacity
-                .iter_mut()
-                .find(|(group_slot_count, _)| *group_slot_count == slot_count)
-            {
-                same_size_tables.push(table);
+    let mut cursors: Vec<Cursor<'_, S::Persisted, V>> = Vec::with_capacity(tables.len());
+    for sealed in tables {
+        let (start, end) = sealed.run.bucket_range(bucket_lo, bucket_hi);
+        if start == end {
+            continue;
+        }
+        cursors.push(Cursor {
+            reader: sealed.table.reader::<N>(),
+            positions: sealed.run.positions_ptr(),
+            pos: start,
+            end,
+        });
+    }
+    if cursors.is_empty() {
+        return Ok(());
+    }
+    // Every table shares one entry layout, so any reader can decode any
+    // entry address; keep one copy for the emit paths.
+    let layout = cursors[0].reader;
+
+    let leaves = cursors.len().next_power_of_two();
+    let mut keys = vec![EXHAUSTED; leaves];
+    for (i, cursor) in cursors.iter().enumerate() {
+        // Warm the head of each slice; the per-advance prefetch takes over
+        // from here.
+        let lookahead = (cursor.end - cursor.pos).min(CURSOR_PREFETCH);
+        for k in cursor.pos..cursor.pos + lookahead {
+            let slot = unsafe { *cursor.positions.add(k) } as usize;
+            cursor.reader.prefetch_entry(slot);
+        }
+        keys[i] = live_key(cursor.reader.hash_of(cursor.entry()));
+    }
+    let mut tree = LoserTree::new(keys);
+
+    let metadata = if N == 0 {
+        V::storage_metadata(context)
+    } else {
+        V::metadata_for_arity::<N>()
+    };
+    let mut scratch = ScratchValue::<V>::new(metadata);
+    let mut cluster: Vec<*const u8> = Vec::new();
+
+    loop {
+        let winner = tree.winner();
+        let winner_key = tree.key(winner);
+        if winner_key == EXHAUSTED {
+            return Ok(());
+        }
+        let entry = cursors[winner].entry();
+        let next_key = cursors[winner].advance();
+        tree.replay(winner, next_key);
+
+        let hash = (winner_key >> 1) as u64;
+        if tree.key(tree.winner()) != winner_key {
+            // Only one run holds this hash: emit straight from the entry.
+            let view = unsafe { layout.view_of(entry, hash) };
+            if !emit(view.key, view.stored)? {
+                return Ok(());
+            }
+            continue;
+        }
+
+        // Several entries share this hash. Gather them, then group by the
+        // real key: distinct keys colliding on a hash stay distinct groups.
+        cluster.clear();
+        cluster.push(entry);
+        while tree.key(tree.winner()) == winner_key {
+            let runner_up = tree.winner();
+            cluster.push(cursors[runner_up].entry());
+            let key = cursors[runner_up].advance();
+            tree.replay(runner_up, key);
+        }
+        while let Some(&first) = cluster.first() {
+            let first_view = unsafe { layout.view_of(first, hash) };
+            let live = S::resolve_persisted(key_arena, *first_view.key);
+            let mut merged = false;
+            let mut i = 1;
+            while i < cluster.len() {
+                let other_view = unsafe { layout.view_of(cluster[i], hash) };
+                if live.eq_persisted(other_view.key) {
+                    if !merged {
+                        scratch.value_mut().copy_from(first_view.stored);
+                        merged = true;
+                    }
+                    scratch.value_mut().merge_from(other_view.stored, context);
+                    cluster.swap_remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+            cluster.swap_remove(0);
+            let value = if merged {
+                scratch.value()
             } else {
-                tables_by_capacity.push((slot_count, vec![table]));
+                first_view.stored
+            };
+            if !emit(first_view.key, value)? {
+                return Ok(());
             }
         }
-        for (slot_count, same_size_tables) in tables_by_capacity {
-            merge_into_partition::<N, S, V>(
-                &mut allocator,
-                key_arena,
-                partition,
-                slot_count,
-                same_size_tables,
-                &mut target,
-                partition_bits,
-                context,
-            );
-        }
-        result
     }
-}
-/// Merges one partition's node-local results.
-///
-/// The largest input is reused when it can hold the combined upper bound.
-/// Otherwise a new table is allocated at the estimated partition capacity.
-pub(super) fn merge_node_aggregated_tables<S: StoredKey, V: AggregationValue + ?Sized>(
-    mut node_tables: Vec<MultiSlabTable<S::Persisted, V>>,
-    partition_capacity: usize,
-    partition_bits: u32,
-    key_arena: &SharedArena,
-    context: &V::SharedContext,
-) -> MultiSlabTable<S::Persisted, V> {
-    let mut allocator = SlabAllocator::new(true);
-    let total: usize = node_tables.iter().map(|table| table.len()).sum();
-    let largest_table_index = node_tables
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, table)| table.len())
-        .map(|(index, _)| index)
-        .expect("a partition always has at least one node_table");
-    let mut target = if total as f64
-        <= node_tables[largest_table_index].capacity() as f64 * MAX_LOAD_FACTOR
-    {
-        node_tables.swap_remove(largest_table_index)
-    } else {
-        let capacity = partition_capacity.max(DEFAULT_CAPACITY);
-        <MultiSlabTable<S::Persisted, V>>::new(&mut allocator, capacity, partition_bits, context)
-    };
-    let mut prober = target.prober();
-    for node_table in &node_tables {
-        for entry in node_table.iter(0) {
-            prober.merge_from::<true, _>(
-                entry.hash,
-                S::resolve_persisted(key_arena, *entry.key),
-                entry.stored,
-                context,
-            );
-            resize_if_needed::<S::Persisted, V>(&mut allocator, &mut prober);
-        }
-    }
-    // The prober's borrow of `target` ends at its last use above.
-    target
 }
 
 #[cfg(test)]
@@ -461,10 +371,10 @@ mod tests {
     use super::super::PARTITIONS;
     use super::*;
     use crate::RECORD_BATCH_SIZE;
-    use crate::memory::init_test_free_pool;
+    use crate::memory::{SlabAllocator, init_test_free_pool};
     use crate::operations::unary::group::arena::SharedArena;
     use crate::operations::unary::group::hashtables::{
-        AggregatedTable, AggregatedTableOutput, SpillConfig,
+        AggregatedTable, MultiSlabTable, SpillConfig,
     };
     use crate::operations::unary::group::keys::{InlineKey, IntKeyExtractor};
     use crate::operations::unary::group::values::{
@@ -489,51 +399,71 @@ mod tests {
         state: &RandomState,
         arena: &Arc<SharedArena>,
         values: &[i32],
-    ) -> Vec<MultiSlabTable<i32, CountValue>> {
+    ) -> Vec<SealedTable<i32, CountValue>> {
+        make_worker_tables_with_spill(state, arena, values, SpillConfig::DEFAULT)
+    }
+
+    fn make_worker_tables_with_spill(
+        state: &RandomState,
+        arena: &Arc<SharedArena>,
+        values: &[i32],
+        spill: SpillConfig,
+    ) -> Vec<SealedTable<i32, CountValue>> {
         let mut agg = AggregatedTable::<IntExtractor, CountValue>::new(
             state.clone(),
             arena.clone(),
             (),
             (),
-            SpillConfig::DEFAULT,
+            spill,
         );
-        let array: ArrayRef = Arc::new(Int32Array::from(values.to_vec()));
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
-        let batch = RecordBatch::try_new(schema, vec![array]).unwrap();
-        agg.consume_batch(
-            &batch,
-            &[0],
-            &[AggregationSlot::new(
-                AggregationKind::CountStar,
-                0,
-                DataType::Int64,
-            )],
-            &(),
-            &COUNT_CFG,
-        );
+        for chunk in values.chunks(RECORD_BATCH_SIZE.max(1)) {
+            let array: ArrayRef = Arc::new(Int32Array::from(chunk.to_vec()));
+            let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+            agg.consume_batch(
+                &batch,
+                &[0],
+                &[AggregationSlot::new(
+                    AggregationKind::CountStar,
+                    0,
+                    DataType::Int64,
+                )],
+                &(),
+                &COUNT_CFG,
+            );
+        }
         agg.flush().tables
     }
 
+    fn collect_partition(
+        tables: &[SealedTable<i32, CountValue>],
+        arena: &SharedArena,
+        partition: usize,
+        num_partitions: usize,
+    ) -> Vec<(i32, usize)> {
+        let mut groups = vec![];
+        merge_partition::<IntStored, CountValue, _>(
+            partition,
+            num_partitions,
+            tables,
+            arena,
+            &COUNT_CFG,
+            |key, value| {
+                groups.push((*key, value.sort_key(0) as usize));
+                Ok(true)
+            },
+        )
+        .unwrap();
+        groups
+    }
+
     fn merge_all_partitions(
-        tables: &[MultiSlabTable<i32, CountValue>],
+        tables: &[SealedTable<i32, CountValue>],
         arena: &SharedArena,
     ) -> Vec<(i32, usize)> {
-        let total_cap: usize = tables.iter().map(|t| t.capacity()).sum::<usize>() / 2;
-        let partition_cap = (total_cap / PARTITIONS).max(1).next_power_of_two();
-
         let mut all_entries = vec![];
         for p in 0..PARTITIONS {
-            let result = merge_combined::<IntStored, CountValue>(
-                p,
-                tables,
-                partition_cap,
-                PARTITIONS,
-                arena,
-                &COUNT_CFG,
-            );
-            for entry in result.iter(0) {
-                all_entries.push((*entry.key, entry.stored.sort_key(0) as usize));
-            }
+            all_entries.extend(collect_partition(tables, arena, p, PARTITIONS));
         }
         all_entries.sort_by_key(|(k, _)| *k);
         all_entries
@@ -623,19 +553,9 @@ mod tests {
         let values: Vec<i32> = (0..200).collect();
         let tables = make_worker_tables(&state, &arena, &values);
 
-        let total_cap: usize = tables.iter().map(|t| t.capacity()).sum::<usize>() / 2;
-        let partition_cap = (total_cap / PARTITIONS).max(1).next_power_of_two();
         let mut total = 0;
         for p in 0..PARTITIONS {
-            let result = merge_combined::<IntStored, CountValue>(
-                p,
-                &tables,
-                partition_cap,
-                PARTITIONS,
-                &arena,
-                &COUNT_CFG,
-            );
-            total += result.iter(0).count();
+            total += collect_partition(&tables, &arena, p, PARTITIONS).len();
         }
 
         assert_eq!(total, 200);
@@ -674,121 +594,143 @@ mod tests {
         assert_eq!(entries[0], (5, 5));
     }
 
-    /// Node-hierarchical merges combine per-node aggregated tables (each a
-    /// `merge_combined` result for the same partition) into one final table;
-    /// keys shared across nodes must combine, node-disjoint keys must all
-    /// survive.
     #[test]
-    fn node_tables_merge_across_nodes() {
+    fn stacked_tables_recombine_across_and_within_workers() {
         init_test_free_pool(64);
         let arena = SharedArena::new(64);
         let state = RandomState::new();
-        let node_a = make_worker_tables(&state, &arena, &[1, 2, 3]);
-        let node_b = make_worker_tables(&state, &arena, &[2, 3, 4]);
+        let spill = SpillConfig {
+            spill_capacity: 256,
+        };
+        let values: Vec<i32> = (0..500).chain(0..500).collect();
+        let mut tables = make_worker_tables_with_spill(&state, &arena, &values, spill);
+        tables.extend(make_worker_tables_with_spill(
+            &state, &arena, &values, spill,
+        ));
 
+        let entries = merge_all_partitions(&tables, &arena);
+
+        assert_eq!(entries.len(), 500);
+        assert!(entries.iter().all(|&(_, count)| count == 4));
+    }
+
+    /// Build a sealed table directly from `(hash, key)` pairs, bypassing the
+    /// extractor so tests control hash collisions and extreme hash values.
+    fn sealed_from_pairs(pairs: &[(u64, i32)]) -> SealedTable<i32, CountValue> {
+        let mut allocator = SlabAllocator::new(true);
+        let mut table: MultiSlabTable<i32, CountValue> =
+            MultiSlabTable::new(&mut allocator, 128, 0, &());
+        for &(hash, key) in pairs {
+            table.prober().merge_from(hash, key, &seeded_count(), &());
+        }
+        let run = table.build_sorted_run();
+        SealedTable { table, run }
+    }
+
+    /// A `CountValue` holding a count of one, as one consumed row seeds it.
+    fn seeded_count() -> CountValue {
+        let mut value = CountValue::default();
+        value.seed(&((),), 0, &mut ());
+        value
+    }
+
+    fn collect_all_from(tables: &[SealedTable<i32, CountValue>]) -> Vec<(i32, usize)> {
+        let arena = SharedArena::new(64);
         let mut entries = vec![];
         for p in 0..PARTITIONS {
-            let node_tables = vec![
-                merge_combined::<IntStored, CountValue>(
-                    p, &node_a, 4, PARTITIONS, &arena, &COUNT_CFG,
-                ),
-                merge_combined::<IntStored, CountValue>(
-                    p, &node_b, 4, PARTITIONS, &arena, &COUNT_CFG,
-                ),
-            ];
-            let folded = merge_node_aggregated_tables::<IntStored, CountValue>(
-                node_tables,
-                DEFAULT_CAPACITY,
-                PARTITIONS.trailing_zeros(),
-                &arena,
-                &COUNT_CFG,
-            );
-            for entry in folded.iter(0) {
-                entries.push((*entry.key, entry.stored.sort_key(0) as usize));
-            }
+            entries.extend(collect_partition(tables, &arena, p, PARTITIONS));
         }
-
         entries.sort();
-        assert_eq!(entries, vec![(1, 1), (2, 2), (3, 2), (4, 1)]);
+        entries
     }
 
-    /// Feed `values` through a worker in batch-sized chunks and hand back its
-    /// finalized output (in-place stack + scatter buffers if it switched).
-    fn make_worker_output(
-        state: &RandomState,
-        arena: &Arc<SharedArena>,
-        values: &[i32],
-    ) -> AggregatedTableOutput<IntExtractor, CountValue> {
-        let mut agg = AggregatedTable::<IntExtractor, CountValue>::new(
-            state.clone(),
-            arena.clone(),
-            (),
-            (),
-            SpillConfig::DEFAULT,
-        );
-        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
-        // Consume one batch at a time because hash scratch has a fixed size.
-        for chunk in values.chunks(RECORD_BATCH_SIZE) {
-            let array: ArrayRef = Arc::new(Int32Array::from(chunk.to_vec()));
-            let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
-            agg.consume_batch(
-                &batch,
-                &[0],
-                &[AggregationSlot::new(
-                    AggregationKind::CountStar,
-                    0,
-                    DataType::Int64,
-                )],
-                &(),
-                &COUNT_CFG,
-            );
-        }
-        agg.flush()
-    }
-
-    /// A worker with enough distinct keys to switch to radix produces scatter
-    /// buffers *and* a pre-switch in-place stack. The radix merge must combine
-    /// both at RADIX_PARTITIONS granularity, landing every key in exactly one
-    /// partition with the right count, losing and double-counting nothing.
-    /// The radix path slot-range-merges in-place stacks at RADIX_PARTITIONS, a
-    /// granularity that can exceed a stack table's slot count, the regime the
-    /// 64-way merge never hits. Exercise it directly: 200 distinct keys (stack
-    /// tables of 128 and 512 slots) merged at `num_partitions = 256`, finer than
-    /// the 128-slot table. Each key must still land in exactly one partition with
-    /// the right count (the degenerate within-range plus probe-chain spillover in
-    /// `merge_past_partition_bounds` has to lose and duplicate nothing).
     #[test]
-    fn slot_range_merge_finer_than_table() {
+    fn same_hash_distinct_keys_stay_distinct_groups() {
+        init_test_free_pool(64);
+        // Three runs hold hash 42: two with key 1, one with key 2. The merged
+        // output must combine the key-1 partials and keep key 2 separate.
+        let tables = vec![
+            sealed_from_pairs(&[(42, 1)]),
+            sealed_from_pairs(&[(42, 2)]),
+            sealed_from_pairs(&[(42, 1)]),
+        ];
+
+        let entries = collect_all_from(&tables);
+
+        assert_eq!(entries, vec![(1, 2), (2, 1)]);
+    }
+
+    #[test]
+    fn same_hash_distinct_keys_within_one_run() {
+        init_test_free_pool(64);
+        let tables = vec![sealed_from_pairs(&[(42, 1), (42, 2), (42, 3)])];
+
+        let entries = collect_all_from(&tables);
+
+        assert_eq!(entries, vec![(1, 1), (2, 1), (3, 1)]);
+    }
+
+    #[test]
+    fn extreme_hash_values_merge_without_sentinel_confusion() {
+        init_test_free_pool(64);
+        // u64::MAX must not collide with the exhausted-cursor sentinel, and
+        // hash 1 (the remapped zero) must land in partition 0.
+        let tables = vec![
+            sealed_from_pairs(&[(u64::MAX, 7), (1, 9)]),
+            sealed_from_pairs(&[(u64::MAX, 7), (u64::MAX - 1, 8)]),
+        ];
+
+        let entries = collect_all_from(&tables);
+
+        assert_eq!(entries, vec![(7, 2), (8, 1), (9, 1)]);
+    }
+
+    #[test]
+    fn sorted_runs_are_hash_ordered_after_wraparound() {
+        init_test_free_pool(64);
+        // Hashes near u64::MAX probe past the last slot and wrap to slot 0;
+        // the run must still come out in ascending hash order.
+        let pairs: Vec<(u64, i32)> = (0..40)
+            .map(|i| (u64::MAX - i as u64, i as i32))
+            .chain((1..40).map(|i| (i as u64, 100 + i as i32)))
+            .collect();
+        let sealed = sealed_from_pairs(&pairs);
+
+        let reader = sealed.table.reader::<0>();
+        let mut previous = 0u64;
+        for i in 0..sealed.run.len() {
+            let slot = unsafe { *sealed.run.positions_ptr().add(i) } as usize;
+            let hash = reader.hash_of(reader.entry_ptr(slot));
+            assert!(hash >= previous, "run out of order at {}", i);
+            previous = hash;
+        }
+        assert_eq!(sealed.run.len(), pairs.len());
+    }
+
+    #[test]
+    fn early_stop_halts_partition_merge() {
         init_test_free_pool(64);
         let arena = SharedArena::new(64);
         let state = RandomState::new();
-        let n = 200i32;
-        let values: Vec<i32> = (0..n).chain(0..n).collect(); // each key twice
-        let out = make_worker_output(&state, &arena, &values);
-        let num_partitions = 256;
-        let mut occurrences = vec![0usize; n as usize];
-        let mut counts = vec![0usize; n as usize];
-        for p in 0..num_partitions {
-            let result = merge_combined::<IntStored, CountValue>(
+        let values: Vec<i32> = (0..1000).collect();
+        let tables = make_worker_tables(&state, &arena, &values);
+
+        let mut seen = 0usize;
+        for p in 0..PARTITIONS {
+            merge_partition::<IntStored, CountValue, _>(
                 p,
-                &out.tables,
-                DEFAULT_CAPACITY,
-                num_partitions,
+                PARTITIONS,
+                &tables,
                 &arena,
-                &COUNT_CFG,
-            );
-            for entry in result.iter(0) {
-                occurrences[*entry.key as usize] += 1;
-                counts[*entry.key as usize] += entry.stored.sort_key(0) as usize;
-            }
+                &(),
+                |_, _| {
+                    seen += 1;
+                    Ok(seen < 10)
+                },
+            )
+            .unwrap();
         }
 
-        for k in 0..n as usize {
-            assert_eq!(
-                occurrences[k], 1,
-                "key {k} must be in exactly one partition"
-            );
-            assert_eq!(counts[k], 2, "key {k} has the wrong count");
-        }
+        assert!(seen < 1000, "merge stopped early");
     }
 }

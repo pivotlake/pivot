@@ -10,13 +10,16 @@ pub use crate::operations::unary::group::values::AggregationValue;
 
 mod hash_table;
 pub(crate) use hash_table::value_offset_for;
-pub use hash_table::{LiveKey, MAX_LOAD_FACTOR, PersistedKey, Prober};
+pub use hash_table::{LiveKey, PersistedKey};
 
 mod table_reader;
 pub(crate) use table_reader::TableReader;
 
+mod sorted_run;
+pub use sorted_run::{BUCKET_BITS, BUCKET_COUNT, SortedRun};
+
 mod aggregated_table;
-pub use aggregated_table::{AggregatedTable, AggregatedTableOutput, SpillConfig};
+pub use aggregated_table::{AggregatedTable, AggregatedTableOutput, SealedTable, SpillConfig};
 
 /// Initial number of slots for a new per-worker hash table.
 pub const DEFAULT_CAPACITY: usize = 128;

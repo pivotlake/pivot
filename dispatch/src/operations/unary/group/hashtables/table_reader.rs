@@ -181,7 +181,7 @@ impl<'table, K: PersistedKey, V: AggregationValue + ?Sized> TableReader<'table, 
 
     /// Returns the address of the entry at `index`.
     #[inline(always)]
-    pub(super) fn entry_ptr(&self, index: usize) -> *mut u8 {
+    pub(crate) fn entry_ptr(&self, index: usize) -> *mut u8 {
         if self.slab_count == 1 {
             return self
                 .first_adjusted_slab_base
@@ -192,59 +192,6 @@ impl<'table, K: PersistedKey, V: AggregationValue + ?Sized> TableReader<'table, 
         assert!(slab_index < self.slab_count);
         let adjusted_slab_base = unsafe { *self.adjusted_slab_bases.add(slab_index) };
         adjusted_slab_base.wrapping_add(index * self.entry_stride) as *mut u8
-    }
-
-    /// Collects the addresses of the entries in `[from, to)` that are occupied
-    /// and whose hash belongs to `partition`, returning how many were written.
-    ///
-    /// `out` must hold at least `to - from` addresses.
-    ///
-    /// Two things make this worth doing separately from the merge that consumes
-    /// the result. The test lands either way often enough to be unpredictable,
-    /// which is the worst case for a branch predictor; storing the address
-    /// unconditionally and advancing the cursor by the test keeps it out of the
-    /// branch unit entirely. And a contiguous run of entries shares a slab, so
-    /// the address can be stepped by the stride instead of recomputed from the
-    /// index through a division for every slot.
-    #[inline(always)]
-    pub(crate) fn collect_partition_entries(
-        &self,
-        from: usize,
-        to: usize,
-        partition_shift: u32,
-        partition: usize,
-        out: &mut [*const u8],
-    ) -> usize {
-        debug_assert!(out.len() >= to.saturating_sub(from));
-        let mut found = 0;
-        let mut index = from;
-        while index < to {
-            // Entries never straddle a slab, so a run stays on one base until
-            // the next slab boundary; stop the stepped walk there.
-            let run_end = if self.slab_count == 1 {
-                to
-            } else {
-                let slab = fast_div(index, self.entries_per_slab_reciprocal);
-                to.min((slab + 1) * self.entries_per_slab())
-            };
-            let mut entry = self.entry_ptr(index) as *const u8;
-            while index < run_end {
-                let hash = unsafe { *(entry.add(self.hash_offset) as *const u64) };
-                let take =
-                    ((hash != 0) & (((hash >> partition_shift) as usize) == partition)) as usize;
-                out[found] = entry;
-                found += take;
-                entry = unsafe { entry.add(self.entry_stride) };
-                index += 1;
-            }
-        }
-        found
-    }
-
-    /// Whole entries per slab, as the table laid them out.
-    #[inline(always)]
-    fn entries_per_slab(&self) -> usize {
-        crate::memory::BUFFER_SIZE / self.entry_stride
     }
 
     /// Reads the hash of an entry the collector already located.
@@ -270,35 +217,17 @@ impl<'table, K: PersistedKey, V: AggregationValue + ?Sized> TableReader<'table, 
         unsafe { self.view(entry, hash) }
     }
 
-    /// Warms every cache line holding the entries in `[from, to)`.
-    ///
-    /// A merge job walks one narrow slot range in each of many tables. The
-    /// ranges are scattered, and each is only a handful of lines long, which is
-    /// too short for the hardware prefetcher to recognise as a stream before it
-    /// ends: with thousands of such ranges interleaved it never gets the
-    /// chance. Issuing the whole range a few tables ahead is what turns those
-    /// demand misses into overlapped ones.
+    /// Warms the cache line holding the entry at `index`.
     #[inline(always)]
-    pub(crate) fn prefetch_entries(&self, from: usize, to: usize) {
-        const LINE_BYTES: usize = 64;
-        // Stepping by whole entries keeps the address arithmetic on the same
-        // path as the scan; one step covers at least one line.
-        let step = (LINE_BYTES / self.entry_stride).max(1);
-        let mut index = from;
-        while index < to {
-            super::hash_table::prefetch_l1_line(self.entry_ptr(index));
-            index += step;
-        }
-        // The final entry can straddle past the last stepped line.
-        if to > from {
-            super::hash_table::prefetch_l1_line(self.entry_ptr(to - 1));
-        }
+    pub(crate) fn prefetch_entry(&self, index: usize) {
+        super::hash_table::prefetch_l1_line(self.entry_ptr(index));
     }
 
     /// Returns a borrowed view of the entry at `index`.
     ///
     /// Empty slots are represented by a view whose `hash` is zero. Callers must
     /// inspect the hash before reading the key or stored value of an empty slot.
+    #[cfg(test)]
     #[inline(always)]
     pub(crate) fn view_at(&self, index: usize) -> EntryView<'table, K, V> {
         let entry = self.entry_ptr(index);

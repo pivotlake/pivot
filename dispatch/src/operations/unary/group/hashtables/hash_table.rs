@@ -7,14 +7,6 @@ use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::TableReader;
 use crate::operations::unary::group::values::AggregationValue;
 use std::marker::PhantomData;
-use std::mem;
-use std::ptr;
-use tracing::debug;
-
-/// Maximum fraction of slots that can be occupied before the table is
-/// considered undersized. Used to size the merge's result tables so they fill
-/// without resizing.
-pub const MAX_LOAD_FACTOR: f64 = 0.7;
 
 /// How full a worker's table gets before it is retired and replaced.
 ///
@@ -260,26 +252,18 @@ fn prefetch_l2_line(ptr: *const u8) {
 pub struct BaseHashTable<K: PersistedKey, V: AggregationValue + ?Sized> {
     slot_mask: usize,
     slot_shift: u32,
-    collisions: usize,
     /// Left-shift applied to hash before computing the slot index.
     /// Set to `PARTITIONS.trailing_zeros()` for merge maps so that the partition
     /// bits (top N) are stripped and the next top bits drive slot placement.
     hash_left_shift: u32,
-    /// Whole entries per 2MB slab (`BUFFER_SIZE / entry_stride`); entries never
-    /// straddle a slab boundary.
-    entries_per_slab: usize,
-    /// Reciprocal used by [`fast_div`] to find a slab without hardware division.
-    entries_per_slab_reciprocal: u64,
     /// Bytes per entry.
     entry_stride: usize,
-    hash_offset: usize,
-    /// Strictest field alignment, for allocating replacement slabs on resize.
-    entry_alignment: usize,
     /// Value layout metadata stored once per table.
     storage_metadata: V::StorageMetadata,
     /// Slab addresses adjusted by their first global entry offset.
     adjusted_slab_bases: Vec<usize>,
-    slabs: Vec<Slab>,
+    /// Owns the table's memory; only ever read through `adjusted_slab_bases`.
+    _slabs: Vec<Slab>,
     length: usize,
     max_load: usize,
     // A raw-pointer marker: a plain `(K, V)` tuple would require `V: Sized`.
@@ -306,16 +290,11 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> BaseHashTable<K, V> {
             max_load: max_load_for_len(expected_capacity),
             hash_left_shift,
             slot_shift: u64::BITS - expected_capacity.trailing_zeros(),
-            entries_per_slab,
-            entries_per_slab_reciprocal: reciprocal(entries_per_slab as u64),
             entry_stride: layout.stride,
-            hash_offset: layout.hash_offset,
-            entry_alignment: layout.align,
             storage_metadata,
             adjusted_slab_bases: adjusted_bases(&slabs, entries_per_slab, layout.stride),
-            slabs,
+            _slabs: slabs,
             _phantom: PhantomData,
-            collisions: 0,
         }
     }
 
@@ -327,34 +306,6 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> BaseHashTable<K, V> {
     /// Returns the number of entries currently stored in the table.
     pub fn len(&self) -> usize {
         self.length
-    }
-
-    /// Cumulative number of probe-chain collisions since the last resize.
-    pub fn collisions(&self) -> usize {
-        self.collisions
-    }
-
-    /// Maps a hash to a slot index using the selected high bits.
-    #[inline(always)]
-    fn slot_for(&self, hash: u64) -> usize {
-        ((hash << self.hash_left_shift) >> self.slot_shift) as usize
-    }
-
-    /// Returns an entry address using the supplied adjusted slab bases.
-    ///
-    /// Entries never cross slab boundaries. [`fast_div`] identifies the slab,
-    /// and the adjusted base allows the byte address to use the global index
-    /// directly.
-    #[inline(always)]
-    fn entry_ptr_in(&self, adjusted_slab_bases: &[usize], index: usize) -> *mut u8 {
-        let slab_index = fast_div(index, self.entries_per_slab_reciprocal);
-        adjusted_slab_bases[slab_index].wrapping_add(index * self.entry_stride) as *mut u8
-    }
-
-    /// The address of this table's entry at `index`.
-    #[inline(always)]
-    fn entry_ptr(&self, index: usize) -> *mut u8 {
-        self.entry_ptr_in(&self.adjusted_slab_bases, index)
     }
 
     /// Returns an iterator over all non-empty entries in the table.
@@ -439,54 +390,31 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> BaseHashTable<K, V> {
         }
     }
 
-    /// Rehash all entries into fresh zeroed slabs of `new_size` slots.
+    /// Builds a hash-ordered view of this table's occupied slots.
     ///
-    /// Every occupied entry is re-probed into the larger table and copied whole
-    /// (`stride` bytes: hash, key, and stored value alike).
-    ///
-    /// The collision counter is reset to `self.length` so that post-resize
-    /// collision tracking reflects only new probing pressure, not historical
-    /// collisions from the smaller table.
-    ///
-    /// # Panics
-    ///
-    /// The underlying allocation may panic if memory allocation fails.
-    #[cold]
-    pub fn resize(&mut self, allocator: &mut SlabAllocator, new_size: usize) {
-        debug!("Resizing map to {:?}...", new_size);
-        let new_slabs =
-            allocator.create_strided_slabs(new_size, self.entry_stride, self.entry_alignment);
-        // Keep the replaced slabs alive until the copy loop below has read
-        // every old entry; `old_adjusted_slab_bases` points into them.
-        let _old_slabs = mem::replace(&mut self.slabs, new_slabs);
-        let old_adjusted_slab_bases = mem::replace(
-            &mut self.adjusted_slab_bases,
-            adjusted_bases(&self.slabs, self.entries_per_slab, self.entry_stride),
-        );
-        let old_slot_mask = self.slot_mask;
-        self.collisions = self.length;
-        self.slot_mask = new_size - 1;
-        self.slot_shift = u64::BITS - new_size.trailing_zeros();
-
-        for idx in 0..=old_slot_mask {
-            let old_entry = self.entry_ptr_in(&old_adjusted_slab_bases, idx);
-            let hash = unsafe { *(old_entry.add(self.hash_offset) as *const u64) };
-            if hash != 0 {
-                let mut new_idx = self.slot_for(hash);
-                loop {
-                    let new_entry = self.entry_ptr(new_idx);
-                    if unsafe { *(new_entry.add(self.hash_offset) as *const u64) } == 0 {
-                        unsafe {
-                            ptr::copy_nonoverlapping(old_entry, new_entry, self.entry_stride)
-                        };
-                        break;
-                    }
-                    new_idx = (new_idx + 1) & self.slot_mask;
-                }
-            }
+    /// Starting the slot scan at an empty slot removes the wrap-around probe
+    /// cluster, so the collected pairs are nearly sorted (each entry is at
+    /// most its probe-chain length past its ideal slot) and the run's
+    /// insertion pass fixes them in near-linear time.
+    pub fn build_sorted_run(&self) -> super::SortedRun {
+        let reader = self.reader::<0>();
+        let capacity = self.capacity();
+        // One slack element keeps the unconditional store below in bounds
+        // when the cursor has already reached the entry count.
+        let mut entries = vec![(0u64, 0u32); self.len() + 1];
+        let mut count = 0usize;
+        // The load factor cap guarantees an empty slot exists.
+        let first_empty = (0..capacity)
+            .find(|&idx| reader.hash_of(reader.entry_ptr(idx)) == 0)
+            .expect("a table below its load cap always has an empty slot");
+        for idx in (first_empty..capacity).chain(0..first_empty) {
+            let hash = reader.hash_of(reader.entry_ptr(idx));
+            entries[count] = (hash, idx as u32);
+            count += (hash != 0) as usize;
         }
-
-        self.max_load = max_load_for_len(new_size);
+        debug_assert_eq!(count, self.len());
+        entries.truncate(count);
+        super::SortedRun::from_nearly_sorted(entries)
     }
 }
 
@@ -518,18 +446,14 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> Prober<'_, K, V> {
         self.table.undersized()
     }
 
-    /// Inserts or merges a stored partial value from another table.
-    #[inline(always)]
-    pub fn merge_from<const COUNT_COLLISIONS: bool, L>(
-        &mut self,
-        hash: u64,
-        key: L,
-        source: &V,
-        ctx: &V::SharedContext,
-    ) where
+    /// Inserts or merges a stored partial value, for tests that build tables
+    /// with chosen hashes.
+    #[cfg(test)]
+    pub fn merge_from<L>(&mut self, hash: u64, key: L, source: &V, ctx: &V::SharedContext)
+    where
         L: LiveKey<Persisted = K>,
     {
-        self.probe_fold::<COUNT_COLLISIONS, L, &V, _, _>(
+        self.probe_fold::<L, &V, _, _>(
             hash,
             key,
             source,
@@ -538,34 +462,19 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> Prober<'_, K, V> {
         );
     }
 
-    /// Doubles the table when collision pressure exceeds the given ratio.
-    #[inline(always)]
-    pub fn resize_on_collisions(&mut self, allocator: &mut SlabAllocator, collision_ratio: usize) {
-        if self.table.collisions() > self.table.len() * collision_ratio {
-            let new_size = self.table.capacity() << 1;
-            self.table.resize(allocator, new_size);
-            // See `grow_if_full` for why this uses the prober's metadata.
-            self.reader = unsafe {
-                self.table
-                    .reader_with_unchecked_lifetime(self.reader.storage_metadata)
-            };
-        }
-    }
-
     /// Probes for a key, then seeds an empty slot or updates the matching slot.
     ///
     /// `context` is moved into whichever closure runs. This avoids a second
     /// lookup and lets update paths, such as string MIN and MAX, skip work when
     /// the new row does not change the group.
     ///
-    /// Hash zero is remapped to one because zero marks an empty slot. With
-    /// `COUNT_COLLISIONS`, each occupied non-match increments the table's
-    /// collision counter.
-    #[inline(always)]
+    /// Hash zero is remapped to one because zero marks an empty slot.
+    ///
     /// Returns the address of the entry the key resolved to, which lets a
     /// caller remember it and fold a later repeat of the same key straight into
     /// it.
-    pub fn probe_fold<const COUNT_COLLISIONS: bool, L, X, S, U>(
+    #[inline(always)]
+    pub fn probe_fold<L, X, S, U>(
         &mut self,
         mut hash: u64,
         key: L,
@@ -607,9 +516,6 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> Prober<'_, K, V> {
                     );
                     return entry;
                 }
-            }
-            if COUNT_COLLISIONS {
-                self.table.collisions += 1;
             }
             idx = (idx + 1) & reader.slot_mask;
         }
@@ -757,9 +663,7 @@ mod tests {
         let mut allocator = SlabAllocator::new(true);
         let mut table = new_table(&mut allocator, 16);
 
-        table
-            .prober()
-            .merge_from::<false, _>(42, 100u64, &Count(1), &());
+        table.prober().merge_from(42, 100u64, &Count(1), &());
 
         assert_eq!(table.len(), 1);
         let entry = table.iter(0).next().unwrap();
@@ -773,15 +677,9 @@ mod tests {
         let mut allocator = SlabAllocator::new(true);
         let mut table = new_table(&mut allocator, 16);
 
-        table
-            .prober()
-            .merge_from::<false, _>(42, 100u64, &Count(1), &());
-        table
-            .prober()
-            .merge_from::<false, _>(42, 100u64, &Count(1), &());
-        table
-            .prober()
-            .merge_from::<false, _>(42, 100u64, &Count(1), &());
+        table.prober().merge_from(42, 100u64, &Count(1), &());
+        table.prober().merge_from(42, 100u64, &Count(1), &());
+        table.prober().merge_from(42, 100u64, &Count(1), &());
 
         assert_eq!(table.len(), 1);
         let entry = table.iter(0).next().unwrap();
@@ -794,12 +692,8 @@ mod tests {
         let mut allocator = SlabAllocator::new(true);
         let mut table = new_table(&mut allocator, 16);
 
-        table
-            .prober()
-            .merge_from::<false, _>(42, 1u64, &Count(1), &());
-        table
-            .prober()
-            .merge_from::<false, _>(42, 2u64, &Count(1), &());
+        table.prober().merge_from(42, 1u64, &Count(1), &());
+        table.prober().merge_from(42, 2u64, &Count(1), &());
 
         assert_eq!(table.len(), 2);
         let keys: Vec<u64> = table.iter(0).map(|e| *e.key).collect();
@@ -813,9 +707,7 @@ mod tests {
         let mut allocator = SlabAllocator::new(true);
         let mut table = new_table(&mut allocator, 16);
 
-        table
-            .prober()
-            .merge_from::<false, _>(0, 99u64, &Count(1), &());
+        table.prober().merge_from(0, 99u64, &Count(1), &());
 
         assert_eq!(table.len(), 1);
         let entry = table.iter(0).next().unwrap();
@@ -833,48 +725,15 @@ mod tests {
         for i in 0..max_load {
             table
                 .prober()
-                .merge_from::<false, _>(i as u64 + 1, i as u64, &Count(1), &());
+                .merge_from(i as u64 + 1, i as u64, &Count(1), &());
             assert!(!table.undersized());
         }
 
         table
             .prober()
-            .merge_from::<false, _>(max_load as u64 + 1, max_load as u64, &Count(1), &());
+            .merge_from(max_load as u64 + 1, max_load as u64, &Count(1), &());
 
         assert!(table.undersized());
-    }
-
-    #[test]
-    fn collision_counting() {
-        init_test_free_pool(16);
-        let mut allocator = SlabAllocator::new(true);
-        let mut table = new_table(&mut allocator, 16);
-
-        table
-            .prober()
-            .merge_from::<true, _>(42, 1u64, &Count(1), &());
-        assert_eq!(table.collisions(), 0);
-
-        table
-            .prober()
-            .merge_from::<true, _>(42, 2u64, &Count(1), &());
-        assert_eq!(table.collisions(), 1);
-    }
-
-    #[test]
-    fn collision_counting_disabled() {
-        init_test_free_pool(16);
-        let mut allocator = SlabAllocator::new(true);
-        let mut table = new_table(&mut allocator, 16);
-
-        table
-            .prober()
-            .merge_from::<false, _>(42, 1u64, &Count(1), &());
-        table
-            .prober()
-            .merge_from::<false, _>(42, 2u64, &Count(1), &());
-
-        assert_eq!(table.collisions(), 0);
     }
 
     #[test]
@@ -883,56 +742,12 @@ mod tests {
         let mut allocator = SlabAllocator::new(true);
         let mut table = new_table(&mut allocator, 128);
 
-        table
-            .prober()
-            .merge_from::<false, _>(1, 10u64, &Count(1), &());
-        table
-            .prober()
-            .merge_from::<false, _>(2, 20u64, &Count(1), &());
+        table.prober().merge_from(1, 10u64, &Count(1), &());
+        table.prober().merge_from(2, 20u64, &Count(1), &());
 
         let entries: Vec<_> = table.iter(0).collect();
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|e| e.hash != 0));
-    }
-
-    #[test]
-    fn resize_preserves_all_entries() {
-        init_test_free_pool(16);
-        let mut allocator = SlabAllocator::new(true);
-        let mut table = new_table(&mut allocator, 16);
-        for i in 0..8u64 {
-            table
-                .prober()
-                .merge_from::<false, _>(i + 1, i, &Count(1), &());
-        }
-
-        table.resize(&mut allocator, 32);
-
-        assert_eq!(table.len(), 8);
-        assert_eq!(table.capacity(), 32);
-        for i in 0..8u64 {
-            let found = table.iter(0).any(|e| *e.key == i);
-            assert!(found, "key {} missing after resize", i);
-        }
-    }
-
-    #[test]
-    fn resize_resets_collision_counter() {
-        init_test_free_pool(16);
-        let mut allocator = SlabAllocator::new(true);
-        let mut table = new_table(&mut allocator, 16);
-        table
-            .prober()
-            .merge_from::<true, _>(42, 1u64, &Count(1), &());
-        table
-            .prober()
-            .merge_from::<true, _>(42, 2u64, &Count(1), &());
-        let pre_resize_collisions = table.collisions();
-        assert!(pre_resize_collisions > 0);
-
-        table.resize(&mut allocator, 32);
-
-        assert_eq!(table.collisions(), table.len());
     }
 
     #[test]
@@ -942,9 +757,7 @@ mod tests {
         let mut table = new_table(&mut allocator, 256);
 
         for i in 0..100u64 {
-            table
-                .prober()
-                .merge_from::<false, _>(i + 1, i, &Count(1), &());
+            table.prober().merge_from(i + 1, i, &Count(1), &());
         }
 
         assert_eq!(table.len(), 100);
@@ -963,13 +776,13 @@ mod tests {
 
         table
             .prober()
-            .merge_from::<false, _>(last_slot_hash, 1u64, &Count(1), &());
+            .merge_from(last_slot_hash, 1u64, &Count(1), &());
         table
             .prober()
-            .merge_from::<false, _>(last_slot_hash, 2u64, &Count(1), &());
+            .merge_from(last_slot_hash, 2u64, &Count(1), &());
         table
             .prober()
-            .merge_from::<false, _>(last_slot_hash, 3u64, &Count(1), &());
+            .merge_from(last_slot_hash, 3u64, &Count(1), &());
 
         assert_eq!(table.len(), 3);
         let keys: Vec<u64> = table.iter(0).map(|e| *e.key).collect();
@@ -990,39 +803,11 @@ mod tests {
     }
 
     #[test]
-    fn merge_after_resize() {
-        init_test_free_pool(16);
-        let mut allocator = SlabAllocator::new(true);
-        let mut table = new_table(&mut allocator, 16);
-        table
-            .prober()
-            .merge_from::<false, _>(42, 1u64, &Count(1), &());
-        table
-            .prober()
-            .merge_from::<false, _>(99, 2u64, &Count(1), &());
-
-        table.resize(&mut allocator, 32);
-        table
-            .prober()
-            .merge_from::<false, _>(42, 1u64, &Count(1), &());
-        table
-            .prober()
-            .merge_from::<false, _>(200, 3u64, &Count(1), &());
-
-        assert_eq!(table.len(), 3);
-        let merged = table.iter(0).find(|e| *e.key == 1).unwrap();
-        assert_eq!(*merged.stored, Count(2));
-        assert!(table.iter(0).any(|e| *e.key == 3));
-    }
-
-    #[test]
     fn view_at_returns_correct_slot() {
         init_test_free_pool(16);
         let mut allocator = SlabAllocator::new(true);
         let mut table = new_table(&mut allocator, 16);
-        table
-            .prober()
-            .merge_from::<false, _>(42, 100u64, &Count(1), &());
+        table.prober().merge_from(42, 100u64, &Count(1), &());
 
         let reader = table.reader::<0>();
         let occupied: Vec<usize> = (0..table.capacity())
@@ -1039,9 +824,7 @@ mod tests {
         let mut allocator = SlabAllocator::new(true);
         let mut table = new_table(&mut allocator, 128);
         for i in 0..20u64 {
-            table
-                .prober()
-                .merge_from::<false, _>(i + 1, i, &Count(1), &());
+            table.prober().merge_from(i + 1, i, &Count(1), &());
         }
 
         let all_count = table.iter(0).count();
