@@ -172,8 +172,11 @@ const MIN_MERGE_INPUT_SLOTS_PER_JOB: usize = 16 * 1024;
 
 /// Merged groups each merge job aims to emit. The job count is derived from
 /// the distinct estimate divided by this, so it is the one knob that decides
-/// job granularity.
-const MERGE_GROUPS_PER_JOB: usize = 24 * 1024;
+/// job granularity. The streaming merge holds no per-job result table, so
+/// jobs only need to be small enough for work-stealing balance; splitting
+/// finer multiplies the per-job cursor and tree setup over every source run
+/// for no cache benefit.
+const MERGE_GROUPS_PER_JOB: usize = 512 * 1024;
 
 /// Compute the merge-phase partition floor. The merge uses at least
 /// [`PARTITIONS`] partitions and at least one job per contributing worker

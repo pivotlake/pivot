@@ -30,34 +30,43 @@ use super::Result;
 /// How many entries ahead each cursor warms its run's cache lines.
 const CURSOR_PREFETCH: usize = 8;
 
-/// Loser-tree sort key: a live cursor's `hash << 1`; exhausted cursors sort
-/// after every live hash, including `u64::MAX`.
-const EXHAUSTED: u128 = u128::MAX;
-
-#[inline(always)]
-fn live_key(hash: u64) -> u128 {
-    (hash as u128) << 1
-}
+/// An exhausted cursor's tree key. A live entry can carry this same hash, so
+/// reaching a `u64::MAX` winner falls into [`drain_max_hash_tail`], which
+/// separates the real entries from the spent cursors.
+const EXHAUSTED: u64 = u64::MAX;
 
 /// One run's walk over its partition slice, in hash order.
 struct Cursor<'t, KP, V: AggregationValue + ?Sized> {
     reader: TableReader<'t, KP, V>,
     positions: *const u32,
+    /// Address of the entry at `pos`, kept current by `advance`.
+    current: *const u8,
     pos: usize,
     end: usize,
 }
 
-impl<KP: PersistedKey, V: AggregationValue + ?Sized> Cursor<'_, KP, V> {
-    /// The entry the cursor currently points at.
-    #[inline(always)]
-    fn entry(&self) -> *const u8 {
-        let slot = unsafe { *self.positions.add(self.pos) } as usize;
-        self.reader.entry_ptr(slot)
+impl<'t, KP: PersistedKey, V: AggregationValue + ?Sized> Cursor<'t, KP, V> {
+    fn new(reader: TableReader<'t, KP, V>, positions: *const u32, pos: usize, end: usize) -> Self {
+        let slot = unsafe { *positions.add(pos) } as usize;
+        let current = reader.entry_ptr(slot);
+        Self {
+            reader,
+            positions,
+            current,
+            pos,
+            end,
+        }
     }
 
-    /// Steps past the current entry and returns the next sort key.
+    /// The hash of the entry the cursor currently points at.
     #[inline(always)]
-    fn advance(&mut self) -> u128 {
+    fn current_hash(&self) -> u64 {
+        self.reader.hash_of(self.current)
+    }
+
+    /// Steps past the current entry and returns the next tree key.
+    #[inline(always)]
+    fn advance(&mut self) -> u64 {
         self.pos += 1;
         if self.pos == self.end {
             return EXHAUSTED;
@@ -66,25 +75,27 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> Cursor<'_, KP, V> {
             let ahead = unsafe { *self.positions.add(self.pos + CURSOR_PREFETCH) } as usize;
             self.reader.prefetch_entry(ahead);
         }
-        live_key(self.reader.hash_of(self.entry()))
+        let slot = unsafe { *self.positions.add(self.pos) } as usize;
+        self.current = self.reader.entry_ptr(slot);
+        self.reader.hash_of(self.current)
     }
 }
 
-/// A loser tree over the cursors' current sort keys.
+/// A loser tree over the cursors' current hashes.
 ///
 /// Internal nodes hold the loser of their subtree's play-off and the root
 /// holds the overall winner, so replacing the winner's key replays exactly one
 /// leaf-to-root path: log2(leaves) comparisons per emitted entry.
 struct LoserTree {
-    /// Current sort key per leaf, padded to a power of two with [`EXHAUSTED`].
-    keys: Vec<u128>,
+    /// Current hash per leaf, padded to a power of two with [`EXHAUSTED`].
+    keys: Vec<u64>,
     /// `nodes[0]` is the winner; `nodes[1..]` hold each play-off's loser.
     nodes: Vec<u32>,
     leaves: usize,
 }
 
 impl LoserTree {
-    fn new(keys: Vec<u128>) -> Self {
+    fn new(keys: Vec<u64>) -> Self {
         let leaves = keys.len();
         debug_assert!(leaves.is_power_of_two());
         let mut nodes = vec![0u32; leaves.max(1)];
@@ -118,13 +129,13 @@ impl LoserTree {
     }
 
     #[inline(always)]
-    fn key(&self, leaf: usize) -> u128 {
+    fn key(&self, leaf: usize) -> u64 {
         self.keys[leaf]
     }
 
     /// Replaces the winner leaf's key and replays its path to the root.
     #[inline(always)]
-    fn replay(&mut self, leaf: usize, new_key: u128) {
+    fn replay(&mut self, leaf: usize, new_key: u64) {
         self.keys[leaf] = new_key;
         let mut winner = leaf as u32;
         let mut node = (leaf + self.leaves) >> 1;
@@ -269,12 +280,12 @@ where
         if start == end {
             continue;
         }
-        cursors.push(Cursor {
-            reader: sealed.table.reader::<N>(),
-            positions: sealed.run.positions_ptr(),
-            pos: start,
+        cursors.push(Cursor::new(
+            sealed.table.reader::<N>(),
+            sealed.run.positions_ptr(),
+            start,
             end,
-        });
+        ));
     }
     if cursors.is_empty() {
         return Ok(());
@@ -293,7 +304,7 @@ where
             let slot = unsafe { *cursor.positions.add(k) } as usize;
             cursor.reader.prefetch_entry(slot);
         }
-        keys[i] = live_key(cursor.reader.hash_of(cursor.entry()));
+        keys[i] = cursor.current_hash();
     }
     let mut tree = LoserTree::new(keys);
 
@@ -307,16 +318,27 @@ where
 
     loop {
         let winner = tree.winner();
-        let winner_key = tree.key(winner);
-        if winner_key == EXHAUSTED {
-            return Ok(());
+        let hash = tree.key(winner);
+        if hash == EXHAUSTED {
+            // Spent cursors and real `u64::MAX` hashes share this key, and
+            // the tree cannot tell them apart. The minimum being `u64::MAX`
+            // means every remaining live entry carries that hash, so one tail
+            // walk over the cursors finishes the partition.
+            return drain_max_hash_tail::<S, V, E>(
+                &cursors,
+                &layout,
+                &mut scratch,
+                &mut cluster,
+                key_arena,
+                context,
+                emit,
+            );
         }
-        let entry = cursors[winner].entry();
+        let entry = cursors[winner].current;
         let next_key = cursors[winner].advance();
         tree.replay(winner, next_key);
 
-        let hash = (winner_key >> 1) as u64;
-        if tree.key(tree.winner()) != winner_key {
+        if tree.key(tree.winner()) != hash {
             // Only one run holds this hash: emit straight from the entry.
             let view = unsafe { layout.view_of(entry, hash) };
             if !emit(view.key, view.stored)? {
@@ -327,43 +349,109 @@ where
 
         // Several entries share this hash. Gather them, then group by the
         // real key: distinct keys colliding on a hash stay distinct groups.
+        // Every cursor whose key matches is live: `hash` is below
+        // `EXHAUSTED` here.
         cluster.clear();
         cluster.push(entry);
-        while tree.key(tree.winner()) == winner_key {
+        while tree.key(tree.winner()) == hash {
             let runner_up = tree.winner();
-            cluster.push(cursors[runner_up].entry());
+            cluster.push(cursors[runner_up].current);
             let key = cursors[runner_up].advance();
             tree.replay(runner_up, key);
         }
-        while let Some(&first) = cluster.first() {
-            let first_view = unsafe { layout.view_of(first, hash) };
-            let live = S::resolve_persisted(key_arena, *first_view.key);
-            let mut merged = false;
-            let mut i = 1;
-            while i < cluster.len() {
-                let other_view = unsafe { layout.view_of(cluster[i], hash) };
-                if live.eq_persisted(other_view.key) {
-                    if !merged {
-                        scratch.value_mut().copy_from(first_view.stored);
-                        merged = true;
-                    }
-                    scratch.value_mut().merge_from(other_view.stored, context);
-                    cluster.swap_remove(i);
-                } else {
-                    i += 1;
-                }
-            }
-            cluster.swap_remove(0);
-            let value = if merged {
-                scratch.value()
-            } else {
-                first_view.stored
-            };
-            if !emit(first_view.key, value)? {
-                return Ok(());
-            }
+        if !emit_cluster::<S, V, E>(
+            &mut cluster,
+            hash,
+            &layout,
+            &mut scratch,
+            key_arena,
+            context,
+            &mut emit,
+        )? {
+            return Ok(());
         }
     }
+}
+
+/// Emits every remaining entry once the tree's minimum is `u64::MAX`.
+///
+/// At that point each live cursor holds only entries whose hash is `u64::MAX`
+/// (its slice is sorted, and its current entry is at the global minimum), so
+/// they all form one hash cluster.
+#[cold]
+#[allow(clippy::too_many_arguments)]
+fn drain_max_hash_tail<S: StoredKey, V: AggregationValue + ?Sized, E>(
+    cursors: &[Cursor<'_, S::Persisted, V>],
+    layout: &TableReader<'_, S::Persisted, V>,
+    scratch: &mut ScratchValue<V>,
+    cluster: &mut Vec<*const u8>,
+    key_arena: &SharedArena,
+    context: &V::SharedContext,
+    mut emit: E,
+) -> Result<()>
+where
+    E: FnMut(&S::Persisted, &V) -> Result<bool>,
+{
+    cluster.clear();
+    for cursor in cursors {
+        for pos in cursor.pos..cursor.end {
+            let slot = unsafe { *cursor.positions.add(pos) } as usize;
+            cluster.push(cursor.reader.entry_ptr(slot));
+        }
+    }
+    if cluster.is_empty() {
+        return Ok(());
+    }
+    emit_cluster::<S, V, E>(
+        cluster, EXHAUSTED, layout, scratch, key_arena, context, &mut emit,
+    )?;
+    Ok(())
+}
+
+/// Groups one hash cluster's entries by their real key and emits each group.
+///
+/// Returns whether the caller should keep merging.
+fn emit_cluster<S: StoredKey, V: AggregationValue + ?Sized, E>(
+    cluster: &mut Vec<*const u8>,
+    hash: u64,
+    layout: &TableReader<'_, S::Persisted, V>,
+    scratch: &mut ScratchValue<V>,
+    key_arena: &SharedArena,
+    context: &V::SharedContext,
+    emit: &mut E,
+) -> Result<bool>
+where
+    E: FnMut(&S::Persisted, &V) -> Result<bool>,
+{
+    while let Some(&first) = cluster.first() {
+        let first_view = unsafe { layout.view_of(first, hash) };
+        let live = S::resolve_persisted(key_arena, *first_view.key);
+        let mut merged = false;
+        let mut i = 1;
+        while i < cluster.len() {
+            let other_view = unsafe { layout.view_of(cluster[i], hash) };
+            if live.eq_persisted(other_view.key) {
+                if !merged {
+                    scratch.value_mut().copy_from(first_view.stored);
+                    merged = true;
+                }
+                scratch.value_mut().merge_from(other_view.stored, context);
+                cluster.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        cluster.swap_remove(0);
+        let value = if merged {
+            scratch.value()
+        } else {
+            first_view.stored
+        };
+        if !emit(first_view.key, value)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
