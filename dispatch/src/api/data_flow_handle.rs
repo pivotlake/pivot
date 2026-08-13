@@ -138,4 +138,11 @@ impl CancelToken {
         self.cancelled.store(true, Ordering::Relaxed);
         self.wakers.notify_all();
     }
+
+    /// Whether cancellation has been signalled (by any clone of this token, or
+    /// by the dataflow itself failing). Lets a producer feeding a running
+    /// dataflow stop instead of waiting on consumers that are gone.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
 }

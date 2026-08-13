@@ -339,6 +339,26 @@ pub mod ffi {
         /// `COMPACT ... FINAL`: keep sweeping until a pass merges nothing.
         fn lo_compact_final(op: &LogicalOperator) -> Result<bool>;
 
+        // ---- CopyFromStdin ----
+        /// Take the table binding DuckDB resolved for this COPY target.
+        fn lo_copy_stdin_take_table(op: &LogicalOperator) -> Result<Box<OptionalTableWrapper>>;
+        /// The explicit column list resolved to physical column positions;
+        /// empty when the statement targets every table column.
+        fn lo_copy_stdin_column_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_copy_stdin_column_index(op: &LogicalOperator, index: usize) -> Result<usize>;
+        /// The FORMAT option as written, empty when the statement gave none.
+        fn lo_copy_stdin_format(op: &LogicalOperator) -> Result<String>;
+        /// The remaining `WITH (...)` options: bound constant values rendered
+        /// as text, in name order; a bare flag (e.g. HEADER) has no values.
+        fn lo_copy_stdin_option_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_copy_stdin_option_name(op: &LogicalOperator, index: usize) -> Result<String>;
+        fn lo_copy_stdin_option_value_count(op: &LogicalOperator, index: usize) -> Result<usize>;
+        fn lo_copy_stdin_option_value(
+            op: &LogicalOperator,
+            index: usize,
+            value_index: usize,
+        ) -> Result<String>;
+
         // ---- CreateUser ----
         fn lo_create_user_name(op: &LogicalOperator) -> Result<String>;
         /// Whether a PASSWORD clause was given.

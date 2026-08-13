@@ -73,6 +73,7 @@ ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
 const LogicalOperator &plan_root(const PlanHandle &plan);
 size_t rowid_column_id();
 
+
 // ---- LogicalOperator: shared structure ----
 uint8_t lo_type(const LogicalOperator &op);
 rust::String lo_name(const LogicalOperator &op);
@@ -178,6 +179,16 @@ rust::String lo_compact_datastore(const LogicalOperator &op);
 rust::String lo_compact_schema(const LogicalOperator &op);
 rust::String lo_compact_table(const LogicalOperator &op);
 bool lo_compact_final(const LogicalOperator &op);
+
+// ---- CopyFromStdin ----
+rust::Box<OptionalTableWrapper> lo_copy_stdin_take_table(const LogicalOperator &op);
+size_t lo_copy_stdin_column_count(const LogicalOperator &op);
+size_t lo_copy_stdin_column_index(const LogicalOperator &op, size_t index);
+rust::String lo_copy_stdin_format(const LogicalOperator &op);
+size_t lo_copy_stdin_option_count(const LogicalOperator &op);
+rust::String lo_copy_stdin_option_name(const LogicalOperator &op, size_t index);
+size_t lo_copy_stdin_option_value_count(const LogicalOperator &op, size_t index);
+rust::String lo_copy_stdin_option_value(const LogicalOperator &op, size_t index, size_t value_index);
 
 // ---- CreateUser ----
 rust::String lo_create_user_name(const LogicalOperator &op);

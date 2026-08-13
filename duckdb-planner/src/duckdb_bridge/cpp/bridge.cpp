@@ -6,6 +6,7 @@
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/planner/operator/logical_copy_from_stdin.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
@@ -828,6 +829,42 @@ bool lo_create_user_has_password(const LogicalOperator &op) {
 // which surfaces as an error on the Rust side.
 rust::String lo_create_user_password(const LogicalOperator &op) {
 	return rust::String(as<duckdb::LogicalCreateUser>(op).password);
+}
+
+// ---- CopyFromStdin ----
+
+rust::Box<OptionalTableWrapper> lo_copy_stdin_take_table(const LogicalOperator &op) {
+	auto &copy = as<duckdb::LogicalCopyFromStdin>(op);
+	auto &pivot_entry = copy.table.Cast<PivotTableCatalogEntry>();
+	return std::move(pivot_entry.table);
+}
+
+size_t lo_copy_stdin_column_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalCopyFromStdin>(op).column_indexes.size();
+}
+
+size_t lo_copy_stdin_column_index(const LogicalOperator &op, size_t index) {
+	return as<duckdb::LogicalCopyFromStdin>(op).column_indexes[index];
+}
+
+rust::String lo_copy_stdin_format(const LogicalOperator &op) {
+	return rust::String::lossy(as<duckdb::LogicalCopyFromStdin>(op).format);
+}
+
+size_t lo_copy_stdin_option_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalCopyFromStdin>(op).options.size();
+}
+
+rust::String lo_copy_stdin_option_name(const LogicalOperator &op, size_t index) {
+	return rust::String::lossy(as<duckdb::LogicalCopyFromStdin>(op).options[index].first);
+}
+
+size_t lo_copy_stdin_option_value_count(const LogicalOperator &op, size_t index) {
+	return as<duckdb::LogicalCopyFromStdin>(op).options[index].second.size();
+}
+
+rust::String lo_copy_stdin_option_value(const LogicalOperator &op, size_t index, size_t value_index) {
+	return rust::String::lossy(as<duckdb::LogicalCopyFromStdin>(op).options[index].second[value_index].ToString());
 }
 
 // ---- ComparisonJoin: late materialization ----

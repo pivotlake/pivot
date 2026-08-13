@@ -295,3 +295,100 @@ pub async fn conn() -> Conn {
     let _guard = lock_serial();
     Conn { client, _guard }
 }
+
+/// A minimal blocking pgwire client speaking the simple protocol, for COPY
+/// FROM STDIN tests: psql runs COPY through the simple protocol, while
+/// `tokio_postgres` insists on the extended protocol this server does not
+/// implement. Messages are returned as `(type byte, payload)` pairs.
+pub struct RawConn {
+    stream: TcpStream,
+}
+
+impl RawConn {
+    pub fn connect(port: u16) -> Self {
+        use std::io::Write;
+
+        let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut conn = Self { stream };
+
+        let mut body = 196608i32.to_be_bytes().to_vec();
+        for (key, value) in [("user", "pivot"), ("database", "test")] {
+            body.extend_from_slice(key.as_bytes());
+            body.push(0);
+            body.extend_from_slice(value.as_bytes());
+            body.push(0);
+        }
+        body.push(0);
+        let mut startup = ((body.len() + 4) as i32).to_be_bytes().to_vec();
+        startup.extend(body);
+        conn.stream.write_all(&startup).unwrap();
+        conn.read_until_ready();
+        conn
+    }
+
+    pub fn read_message(&mut self) -> (u8, Vec<u8>) {
+        use std::io::Read;
+
+        let mut head = [0u8; 5];
+        self.stream.read_exact(&mut head).unwrap();
+        let len = i32::from_be_bytes(head[1..5].try_into().unwrap()) as usize - 4;
+        let mut payload = vec![0u8; len];
+        self.stream.read_exact(&mut payload).unwrap();
+        (head[0], payload)
+    }
+
+    /// Read up to and including the next `ReadyForQuery`.
+    pub fn read_until_ready(&mut self) -> Vec<(u8, Vec<u8>)> {
+        let mut messages = Vec::new();
+        loop {
+            let message = self.read_message();
+            let ready = message.0 == b'Z';
+            messages.push(message);
+            if ready {
+                return messages;
+            }
+        }
+    }
+
+    fn send(&mut self, kind: u8, payload: &[u8]) {
+        use std::io::Write;
+
+        let mut message = vec![kind];
+        message.extend(((payload.len() + 4) as i32).to_be_bytes());
+        message.extend_from_slice(payload);
+        self.stream.write_all(&message).unwrap();
+    }
+
+    pub fn query(&mut self, sql: &str) {
+        let mut payload = sql.as_bytes().to_vec();
+        payload.push(0);
+        self.send(b'Q', &payload);
+    }
+
+    pub fn copy_data(&mut self, data: &[u8]) {
+        self.send(b'd', data);
+    }
+
+    pub fn copy_done(&mut self) {
+        self.send(b'c', &[]);
+    }
+
+    pub fn copy_fail(&mut self, message: &str) {
+        let mut payload = message.as_bytes().to_vec();
+        payload.push(0);
+        self.send(b'f', &payload);
+    }
+}
+
+/// The `CommandComplete` tag in `messages`, e.g. `COPY 2`.
+pub fn command_tag(messages: &[(u8, Vec<u8>)]) -> Option<String> {
+    messages
+        .iter()
+        .find(|(kind, _)| *kind == b'C')
+        .map(|(_, payload)| {
+            String::from_utf8_lossy(payload.strip_suffix(&[0]).unwrap_or(payload)).into_owned()
+        })
+}

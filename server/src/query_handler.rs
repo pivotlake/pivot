@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::arrow_to_pgwire::{PGRowBatch, build_field_info};
 use crate::auth::Authenticator;
+use crate::copy_session;
 use arrow_schema::{Field, Schema};
 use async_trait::async_trait;
 use engine::{Command, ExecuteOptions, Execution, StatementOutput};
@@ -12,14 +13,21 @@ use futures::{Sink, SinkExt, stream};
 use metastore::Metastore;
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
-use pgwire::api::query::SimpleQueryHandler;
-use pgwire::api::results::{QueryResponse, Response, Tag};
+use pgwire::api::copy::CopyHandler;
+use pgwire::api::portal::{Format, Portal};
+use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
+use pgwire::api::results::{
+    CopyResponse, DescribePortalResponse, DescribeStatementResponse, FieldInfo, QueryResponse,
+    Response, Tag,
+};
+use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{
-    ClientInfo, ClientPortalStore, ConnectionManager, NoopHandler, PgWireServerHandlers,
+    ClientInfo, ClientPortalStore, ConnectionManager, PgWireConnectionState, PgWireServerHandlers,
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
+use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::response::NoticeResponse;
 use tracing::{info, warn};
 
@@ -43,27 +51,38 @@ pub(crate) async fn execute_sql(
     match execution.output {
         StatementOutput::Rows { batches, .. } => Ok(batches),
         StatementOutput::Command(_) | StatementOutput::Set { .. } => Ok(Vec::new()),
+        StatementOutput::CopyFromStdin(ingest) => {
+            // Dropping the running ingest aborts it: the dataflow cancels and
+            // the statement's transaction rolls back.
+            drop(ingest);
+            Err("COPY FROM STDIN is only supported over the PostgreSQL protocol".to_string())
+        }
     }
 }
 
 fn into_pgwire_error(error: engine::Error) -> PgWireError {
-    let info = ErrorInfo::new("ERROR".to_string(), "XX000".to_string(), error.to_string());
+    user_error(error.to_string())
+}
+
+fn user_error(message: String) -> PgWireError {
+    let info = ErrorInfo::new("ERROR".to_string(), "XX000".to_string(), message);
     PgWireError::UserError(Box::new(info))
 }
 
+fn fields_for_columns(columns: Vec<engine::ResultColumn>) -> Arc<Vec<FieldInfo>> {
+    let schema = Arc::new(Schema::new(
+        columns
+            .into_iter()
+            .map(|column| Field::new(column.name, column.data_type, true))
+            .collect::<Vec<_>>(),
+    ));
+    build_field_info(&schema)
+}
+
 fn build_query_response(columns: Vec<engine::ResultColumn>, batches: Vec<PGRowBatch>) -> Response {
-    let fields = batches.first().map_or_else(
-        || {
-            let schema = Arc::new(Schema::new(
-                columns
-                    .into_iter()
-                    .map(|column| Field::new(column.name, column.data_type, true))
-                    .collect::<Vec<_>>(),
-            ));
-            build_field_info(&schema)
-        },
-        |batch| batch.fields.clone(),
-    );
+    let fields = batches
+        .first()
+        .map_or_else(|| fields_for_columns(columns), |batch| batch.fields.clone());
     Response::Query(QueryResponse::new(
         fields,
         stream::iter(batches.into_iter().flat_map(|batch| batch.rows).map(Ok)),
@@ -180,11 +199,62 @@ fn perf_on<C: ClientInfo>(client: &C) -> bool {
 }
 
 #[async_trait]
-impl SimpleQueryHandler for PivotQueryHandler {
-    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+impl CopyHandler for PivotQueryHandler {
+    async fn on_copy_data<C>(&self, client: &mut C, data: CopyData) -> PgWireResult<()>
     where
-        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
-        C::PortalStore: PortalStore,
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        copy_session::push_copy(client, data.data)
+            .await
+            .map_err(copy_session::Error::into_pgwire)
+    }
+
+    async fn on_copy_done<C>(&self, client: &mut C, _done: CopyDone) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let count = copy_session::finish_copy(client).await.map_err(|error| {
+            warn!(%error, "copy from stdin failed");
+            error.into_pgwire()
+        })?;
+        info!(rows = count, "copy from stdin committed");
+        client
+            .send(PgWireBackendMessage::CommandComplete(
+                Tag::new("COPY").with_rows(count).into(),
+            ))
+            .await?;
+        // In the extended protocol pgwire leaves the connection in copy-in
+        // state; step out of it so the client's trailing Sync reaches the
+        // extended handler and gets its ReadyForQuery. (The simple-protocol
+        // loop resets the state itself.)
+        if matches!(client.state(), PgWireConnectionState::CopyInProgress(true)) {
+            client.set_state(PgWireConnectionState::ReadyForQuery);
+        }
+        Ok(())
+    }
+
+    async fn on_copy_fail<C>(&self, client: &mut C, fail: CopyFail) -> PgWireError
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        copy_session::abort_copy(client).await;
+        copy_session::Error::ClientAbort(fail.message).into_pgwire()
+    }
+}
+
+impl PivotQueryHandler {
+    /// Execute one statement and build its wire response. Shared by the
+    /// simple and extended protocols; a COPY FROM STDIN switches the
+    /// connection into copy-in mode on the way out.
+    async fn execute_statement<C>(&self, client: &mut C, query: &str) -> PgWireResult<Response>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
@@ -218,10 +288,145 @@ impl SimpleQueryHandler for PivotQueryHandler {
             StatementOutput::Rows { columns, batches } => build_query_response(columns, batches),
             StatementOutput::Command(command) => build_command_response(command),
             StatementOutput::Set { name, value } => apply_set(client, &name, value.as_deref()),
+            StatementOutput::CopyFromStdin(ingest) => {
+                // The CopyInResponse advertises a binary payload (the Arrow
+                // IPC stream), so clients know not to apply text escaping to
+                // the bytes they send.
+                const BINARY_FORMAT: i8 = 1;
+                let columns = copy_session::begin_copy(client, *ingest)
+                    .await
+                    .map_err(|error| {
+                        warn!(%error, sql = %query, "copy from stdin failed to start");
+                        error.into_pgwire()
+                    })?;
+                info!(sql = %query, "copy from stdin started");
+                Response::CopyIn(CopyResponse::new(BINARY_FORMAT, columns, stream::empty()))
+            }
         };
 
         info!(sql = %query, "query succeeded");
-        Ok(vec![response])
+        Ok(response)
+    }
+}
+
+#[async_trait]
+impl SimpleQueryHandler for PivotQueryHandler {
+    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        Ok(vec![self.execute_statement(client, query).await?])
+    }
+}
+
+/// Whether a Bind's result-column format request asks for any binary column.
+fn requests_binary_results(format: &Format) -> bool {
+    match format {
+        Format::UnifiedText => false,
+        Format::UnifiedBinary => true,
+        Format::Individual(codes) => !codes.iter().all(|&code| code == 0),
+    }
+}
+
+#[async_trait]
+impl ExtendedQueryHandler for PivotQueryHandler {
+    type Statement = String;
+    type QueryParser = NoopQueryParser;
+
+    fn query_parser(&self) -> Arc<Self::QueryParser> {
+        Arc::new(NoopQueryParser)
+    }
+
+    async fn do_describe_statement<C>(
+        &self,
+        _client: &mut C,
+        target: &StoredStatement<Self::Statement>,
+    ) -> PgWireResult<DescribeStatementResponse>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        if !target.parameter_types.is_empty() {
+            return Err(user_error(
+                "prepared-statement parameters are not supported yet".to_string(),
+            ));
+        }
+        let columns = self
+            .engine
+            .describe(&target.statement)
+            .await
+            .map_err(into_pgwire_error)?;
+        Ok(match columns {
+            Some(columns) => DescribeStatementResponse::new(
+                Vec::new(),
+                fields_for_columns(columns).as_ref().clone(),
+            ),
+            None => DescribeStatementResponse::new(Vec::new(), Vec::new()),
+        })
+    }
+
+    async fn do_describe_portal<C>(
+        &self,
+        _client: &mut C,
+        target: &Portal<Self::Statement>,
+    ) -> PgWireResult<DescribePortalResponse>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let columns = self
+            .engine
+            .describe(&target.statement.statement)
+            .await
+            .map_err(into_pgwire_error)?;
+        Ok(match columns {
+            Some(columns) => {
+                DescribePortalResponse::new(fields_for_columns(columns).as_ref().clone())
+            }
+            None => DescribePortalResponse::new(Vec::new()),
+        })
+    }
+
+    async fn do_query<C>(
+        &self,
+        client: &mut C,
+        portal: &Portal<Self::Statement>,
+        _max_rows: usize,
+    ) -> PgWireResult<Response>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        if !portal.parameters.is_empty() {
+            return Err(user_error(
+                "prepared-statement parameters are not supported yet".to_string(),
+            ));
+        }
+        let response = self
+            .execute_statement(client, &portal.statement.statement)
+            .await?;
+        // Rows are encoded as text; refuse a binary request loudly instead of
+        // sending text data a client would misparse. Statements that return
+        // no rows ignore the requested format (clients ask for binary
+        // unconditionally, and there is nothing to encode).
+        if matches!(response, Response::Query(_))
+            && requests_binary_results(&portal.result_column_format)
+        {
+            return Err(user_error(
+                "binary result encoding is not supported over the extended protocol yet"
+                    .to_string(),
+            ));
+        }
+        Ok(response)
     }
 }
 
@@ -258,11 +463,11 @@ impl PgWireServerHandlers for PivotHandlers {
     }
 
     fn extended_query_handler(&self) -> Arc<impl pgwire::api::query::ExtendedQueryHandler> {
-        Arc::new(NoopHandler)
+        self.query_handler.clone()
     }
 
     fn copy_handler(&self) -> Arc<impl pgwire::api::copy::CopyHandler> {
-        Arc::new(NoopHandler)
+        self.query_handler.clone()
     }
 }
 

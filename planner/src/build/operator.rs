@@ -13,9 +13,10 @@ use duckdb_planner::catalog_provider::OptionalTableWrapper;
 use duckdb_planner::duckdb_bridge::duckdb_types::LimitNodeType;
 use duckdb_planner::handle::{
     Aggregate as AggregateView, BridgeError, ChunkGet as ChunkGetView, Compact as CompactView,
-    CreateSchema as CreateSchemaView, CreateTable as CreateTableView, CreateUser as CreateUserView,
-    Filter as FilterView, Insert as InsertView, Limit as LimitView, OrderBy as OrderByView,
-    OrderKey, Projection as ProjectionView, Reset as ResetView, Set as SetView,
+    CopyFromStdin as CopyFromStdinView, CreateSchema as CreateSchemaView,
+    CreateTable as CreateTableView, CreateUser as CreateUserView, Filter as FilterView,
+    Insert as InsertView, Limit as LimitView, OrderBy as OrderByView, OrderKey,
+    Projection as ProjectionView, Reset as ResetView, Set as SetView,
     TableFunctionScan as TableFunctionScanView, TableScan as TableScanView, TopN as TopNView,
     Values as ValuesView,
 };
@@ -26,9 +27,9 @@ use crate::catalog::{
 };
 use crate::expression::{Error as ExpressionError, Expression};
 use crate::operator::{
-    Aggregate, Compact, CreateSchema, CreateTable, CreateUser, Error as OperatorError, Filter,
-    Input, Insert, Limit, OrderBy, OrderByNode, Projection, SetVariable, TableFunctionScan, TopN,
-    Values,
+    Aggregate, Compact, CopyFormat, CopyFromStdin, CreateSchema, CreateTable, CreateUser,
+    Error as OperatorError, Filter, Input, Insert, Limit, OrderBy, OrderByNode, Projection,
+    SetVariable, TableFunctionScan, TopN, Values,
 };
 use crate::types::{build_scalar_value, type_from_logical};
 
@@ -267,6 +268,23 @@ impl Compact {
             schema: view.schema()?,
             table: view.table()?,
             final_sweep: view.final_sweep()?,
+        })
+    }
+}
+
+impl CopyFromStdin {
+    pub(crate) fn from_handle(view: CopyFromStdinView<'_>) -> Result<CopyFromStdin, OperatorError> {
+        let table = bind_table(*view.take_table()?);
+        let columns = view.column_indexes()?;
+        // Formats are case-insensitive; canonicalize before interpreting.
+        let format = view.format()?.map(|format| format.to_lowercase());
+        let format = CopyFormat::resolve(format.as_deref(), &view.options()?)
+            .map_err(OperatorError::InvalidStatement)?;
+
+        Ok(CopyFromStdin {
+            table,
+            columns,
+            format,
         })
     }
 }

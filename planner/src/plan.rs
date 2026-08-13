@@ -11,7 +11,7 @@
 use crate::catalog::CatalogTransaction;
 use crate::compile;
 use crate::expression::Expression;
-use crate::operator::{self, Compact, Operator, OrderByDirection, SetVariable};
+use crate::operator::{self, Compact, CopyFromStdin, Operator, OrderByDirection, SetVariable};
 use crate::types::Type;
 use dispatch::{GroupLimit, RowDelivery};
 use std::fmt;
@@ -72,6 +72,7 @@ impl PlanNode {
                 | Operator::CreateUser(_)
                 | Operator::SetVariable(_)
                 | Operator::Compact(_)
+                | Operator::CopyFromStdin(_)
                 | Operator::TableFunctionScan(_)
         ) && self.inputs.iter().all(PlanNode::is_cacheable)
     }
@@ -364,6 +365,17 @@ impl Plan {
     pub fn as_compact(&self) -> Option<&Compact> {
         match &self.root.operator {
             Operator::Compact(compact) => Some(compact),
+            _ => None,
+        }
+    }
+
+    /// This plan as a `COPY ... FROM STDIN` statement, if that's what it is.
+    /// Like a `SET`, the server checks this before compiling: the row data
+    /// arrives over the connection's copy-in sub-protocol, so the server
+    /// drives the ingest itself.
+    pub fn as_copy_from_stdin(&self) -> Option<&CopyFromStdin> {
+        match &self.root.operator {
+            Operator::CopyFromStdin(copy) => Some(copy),
             _ => None,
         }
     }

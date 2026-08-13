@@ -1,10 +1,10 @@
 use crate::api::BuildContext;
 use crate::operations::channels::{
-    ChannelFactory, Sender, StealableChannelFactory, mpsc_channel, stealable,
+    ChannelFactory, RootChannelFactory, Sender, StealableChannelFactory, mpsc_channel, stealable,
 };
 use crate::operations::{
-    DefaultUnaryFactory, Forward, InjectorSourceFactory, MapFactory, RootUnaryOperatorFactory,
-    UnaryFactory, UnaryOperatorFactory,
+    ChannelInputSender, ChannelSourceFactory, DefaultUnaryFactory, Forward, InjectorSourceFactory,
+    MapFactory, RootUnaryOperatorFactory, UnaryFactory, UnaryOperatorFactory,
 };
 use crate::{DataFlowBuilder, DataFlowDispatcher, DataFlowHandle, OperatorGraphBuilder};
 use arrow_array::RecordBatch;
@@ -183,19 +183,54 @@ pub fn values_input<T: Send + 'static>(
     T,
     RootUnaryOperatorFactory<T, T, DefaultUnaryFactory<Forward<T>>, InjectorSourceFactory<T>>,
 > {
+    source_input(dispatcher, InjectorSourceFactory::new(items))
+}
+
+/// One [`Forward`] root per worker over a cloned `source`, sharing the sibling
+/// counter the finish protocol needs: the assembly every stolen-item source
+/// (in-memory or producer-fed) fans out with.
+#[allow(clippy::type_complexity)]
+fn source_input<T: Send + 'static, S: RootChannelFactory<T> + Clone>(
+    dispatcher: &DataFlowDispatcher,
+    source: S,
+) -> OperatorSpec<T, RootUnaryOperatorFactory<T, T, DefaultUnaryFactory<Forward<T>>, S>> {
     let worker_count = dispatcher.worker_count();
-    let injector = InjectorSourceFactory::new(items);
     let siblings_left = Arc::new(AtomicUsize::new(worker_count));
     let factories: Vec<_> = (0..worker_count)
         .map(|_| {
             RootUnaryOperatorFactory::new(
                 DefaultUnaryFactory::<Forward<T>>::new(),
-                injector.clone(),
+                source.clone(),
                 siblings_left.clone(),
             )
         })
         .collect();
     OperatorSpec::new(dispatcher.clone(), factories)
+}
+
+/// Source: stream producer-fed values across the worker pool.
+///
+/// The open-ended counterpart of [`values_input`]: the item set is not known
+/// up front, so the returned [`ChannelInputSender`] feeds the queue while the
+/// dataflow runs and [`close`](ChannelInputSender::close)s it when the stream
+/// ends. Capacity bounds how many unclaimed items may queue; a refused send
+/// hands the item back, and `on_claim` fires on every claim so the producer
+/// can wake and retry.
+#[allow(clippy::type_complexity)]
+pub fn channel_input<T: Send + 'static>(
+    dispatcher: &DataFlowDispatcher,
+    capacity: usize,
+    on_claim: Box<dyn Fn() + Send + Sync>,
+) -> (
+    ChannelInputSender<T>,
+    OperatorSpec<
+        T,
+        RootUnaryOperatorFactory<T, T, DefaultUnaryFactory<Forward<T>>, ChannelSourceFactory<T>>,
+    >,
+) {
+    let (sender, source) =
+        ChannelSourceFactory::new(capacity, on_claim, dispatcher.waker_set.clone());
+    (sender, source_input(dispatcher, source))
 }
 
 impl<OF: OperatorFactory<RecordBatch> + 'static> OperatorSpec<RecordBatch, OF> {
