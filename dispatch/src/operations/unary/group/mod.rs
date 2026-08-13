@@ -107,7 +107,7 @@ use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::group::hashtables::{
-    AggregatedTable, AggregatedTableOutput, BUCKET_COUNT, SealedTable, SpillConfig,
+    AggregatedTable, AggregatedTableOutput, BUCKET_COUNT, DenseRun, SpillConfig,
 };
 use crate::worker::current_node;
 use ahash::RandomState;
@@ -346,9 +346,9 @@ pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue + ?Sized> {
 /// merged groups straight from every worker's sorted runs into the output
 /// sink; no result table is built.
 pub struct PartitionJob<K: KeyExtractor, V: AggregationValue + ?Sized> {
-    /// Every sealed table the pool's workers filled. Jobs read each run's
+    /// One consolidated run per contributing worker. Jobs read each run's
     /// slice for their partition at `num_partitions` granularity.
-    tables: Arc<Vec<SealedTable<K::Persisted, V>>>,
+    runs: Arc<Vec<DenseRun<K::Persisted, V>>>,
     index: usize,
     key_arena: Arc<SharedArena>,
     /// The arena's ring buffers wrapped as Arrow `Buffer`s, built once for the
@@ -387,7 +387,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
             merge::merge_partition::<K::Stored, V, _>(
                 self.index,
                 self.num_partitions,
-                &self.tables,
+                &self.runs,
                 &self.key_arena,
                 &self.shared_context,
                 |_, _| {
@@ -414,7 +414,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
         merge::merge_partition::<K::Stored, V, _>(
             self.index,
             self.num_partitions,
-            &self.tables,
+            &self.runs,
             &self.key_arena,
             &self.shared_context,
             |key, stored| acc.accept_group(key, stored, allocator, &mut *sender),
@@ -429,12 +429,12 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
     /// gather barrier.
     fn create_partition_jobs(&mut self, outputs: Vec<AggregatedTableOutput<K, V>>) {
         let node_count = self.injectors.len();
-        let mut tables: Vec<SealedTable<K::Persisted, V>> = Vec::new();
+        let mut runs: Vec<DenseRun<K::Persisted, V>> = Vec::new();
         let mut hll = Hll::new();
         let mut contributing_workers = 0usize;
         for out in outputs {
             contributing_workers += 1;
-            tables.extend(out.tables);
+            runs.push(out.run);
             hll.merge(&out.hll);
             self.zero_hash_pending |= out.zero_hash_seen;
         }
@@ -442,7 +442,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // Every worker folds each table into the sketch as that table is
         // retired, so this is the distinct group count across the whole pool.
         // The entry total is not a stand-in for it: a key recurring in several
-        // tables is counted once here and once per table there.
+        // workers' runs is counted once here and once per run there.
         let estimate = hll.estimate();
 
         // Decide how many independent merge jobs to run. Each job pays a fixed
@@ -452,7 +452,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // [`BUCKET_COUNT`] hash ranges, which caps how finely jobs can split
         // the key space.
         let num_partitions = {
-            let input_entries: usize = tables.iter().map(|t| t.run.len()).sum();
+            let input_entries: usize = runs.iter().map(|run| run.len()).sum();
             // The count never drops below 2: the merge routes rows by their
             // hash's top `log2(partitions)` bits, and a 0-bit partition id
             // has no valid shift (and no benefit over 2 near-empty jobs).
@@ -480,10 +480,10 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // node queues so all workers share the load. All jobs are pushed
         // before the injected flag flips, so a drained queue means a finished
         // phase.
-        let tables = Arc::new(tables);
+        let runs = Arc::new(runs);
         for i in 0..num_partitions {
             self.injectors[i % node_count].push(PartitionJob {
-                tables: tables.clone(),
+                runs: runs.clone(),
                 index: i,
                 key_arena: self.key_arena.clone(),
                 output_buffers: output_buffers.clone(),

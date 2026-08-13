@@ -171,11 +171,11 @@ impl<KP: super::PersistedKey, V: AggregationValue + ?Sized> SealedTable<KP, V> {
     }
 }
 
-/// The tables and sizing data one worker produced.
+/// The consolidated run and sizing data one worker produced.
 pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue + ?Sized> {
-    /// Every table this worker filled, each with its hash-ordered run.
-    pub tables: Vec<SealedTable<K::Persisted, V>>,
-    /// Distinct-count sketch over the worker's rows, for sizing the merge targets.
+    /// Every group this worker saw, merged into one hash-ordered run.
+    pub run: super::DenseRun<K::Persisted, V>,
+    /// Distinct-count sketch over the worker's rows, for sizing the merge.
     pub hll: Hll,
     /// `K::DEDUP_BY_HASH` only: this worker saw the (single) key whose bijective
     /// hash is 0, which is excluded from the tables. Adds 1 to the distinct count.
@@ -390,17 +390,26 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         self.sealed.push(SealedTable::seal(retired));
     }
 
-    /// Finishes worker state for the merge phase.
+    /// Finishes worker state for the merge phase: seals the active table and
+    /// consolidates the whole stack into one hash-ordered dense run.
     pub fn flush(mut self) -> AggregatedTableOutput<K, V> {
         // Retired tables were folded in as they were replaced; the active one
         // still has to be counted and sealed.
         self.fold_active_table_into_hll();
-        self.key_arena.flush();
-        self.worker_context.flush();
         let mut tables = self.sealed;
         tables.push(SealedTable::seal(self.active));
-        AggregatedTableOutput {
+        // This worker wrote every key its tables reference, so its view of
+        // the shared arena is current before the arena handle is returned.
+        let run = crate::operations::unary::group::merge::consolidate_worker_runs::<K::Stored, V>(
             tables,
+            &mut self.allocator,
+            self.key_arena.shared(),
+            &self.shared_context,
+        );
+        self.key_arena.flush();
+        self.worker_context.flush();
+        AggregatedTableOutput {
+            run,
             hll: self.hll,
             zero_hash_seen: self.zero_hash_seen,
         }
