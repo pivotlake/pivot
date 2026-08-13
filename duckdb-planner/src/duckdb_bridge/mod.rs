@@ -154,6 +154,7 @@ pub mod ffi {
             table: &mut OptionalTableWrapper,
             expr: &Expression,
             scan_column_count: usize,
+            pushed_filter_count: usize,
         ) -> Result<bool>;
         fn table_estimate_row_count(table: &OptionalTableWrapper) -> CardinalityEstimate;
     }

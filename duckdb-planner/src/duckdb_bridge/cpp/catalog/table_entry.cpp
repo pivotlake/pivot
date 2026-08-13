@@ -84,6 +84,11 @@ static void PivotScanPushdownComplexFilter(ClientContext &context, LogicalGet &g
 	auto &data = bind_data->Cast<PivotScanBindData>();
 	const auto &column_ids = get.GetColumnIds();
 
+	// How many conditions are on offer, captured before any are erased: a
+	// table that owns the only one leaves no filter above the scan at all,
+	// which is a different proposition from owning one of several.
+	const auto offered = filters.size();
+
 	// Complex filters: offer each one to Rust. If the table pushes it down,
 	// drop it from the vector so DuckDB doesn't re-apply it on top.
 	for (auto it = filters.begin(); it != filters.end();) {
@@ -95,7 +100,7 @@ static void PivotScanPushdownComplexFilter(ClientContext &context, LogicalGet &g
 		// sole responsibility for a filter uses it to judge how much work the
 		// scan would have to redo per batch, which is what decides whether
 		// owning the filter is worth it.
-		if (pushdown_filter(data.table, *remapped, column_ids.size())) {
+		if (pushdown_filter(data.table, *remapped, column_ids.size(), offered)) {
 			it = filters.erase(it);
 		} else {
 			++it;

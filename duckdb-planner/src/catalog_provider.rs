@@ -42,7 +42,12 @@ pub trait DuckDBTable: Any {
     /// Returns `Ok(true)` when the filter was fully consumed by the table
     /// (DuckDB drops it from the scan), `Ok(false)` to keep it. Errors are
     /// surfaced to C++ as exceptions.
-    fn pushdown_filter(&mut self, _filter: Expr<'_>, _scan_column_count: usize) -> Result<bool> {
+    fn pushdown_filter(
+        &mut self,
+        _filter: Expr<'_>,
+        _scan_column_count: usize,
+        _pushed_filter_count: usize,
+    ) -> Result<bool> {
         Ok(false)
     }
 
@@ -253,12 +258,13 @@ pub(crate) fn pushdown_filter(
     table: &mut OptionalTableWrapper,
     expr: &ffi::Expression,
     scan_column_count: usize,
+    pushed_filter_count: usize,
 ) -> Result<bool> {
     let table = table
         .table
         .as_mut()
         .ok_or_else(|| -> Error { "pushdown_filter called on unbound table".into() })?;
-    table.pushdown_filter(Expr::from_raw(expr), scan_column_count)
+    table.pushdown_filter(Expr::from_raw(expr), scan_column_count, pushed_filter_count)
 }
 
 pub(crate) fn table_estimate_row_count(table: &OptionalTableWrapper) -> ffi::CardinalityEstimate {

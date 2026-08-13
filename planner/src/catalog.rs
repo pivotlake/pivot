@@ -431,7 +431,12 @@ pub trait BoundTable: Debug + Send + Sync {
     ///
     /// Returning `true` means the plan drops the condition entirely, so the
     /// table alone decides which rows survive. The default keeps it.
-    fn pushdown_filter(&mut self, _filter: TableFilter, _scan_column_count: usize) -> Result<bool> {
+    fn pushdown_filter(
+        &mut self,
+        _filter: TableFilter,
+        _scan_column_count: usize,
+        _pushed_filter_count: usize,
+    ) -> Result<bool> {
         Ok(false)
     }
 
@@ -499,13 +504,16 @@ impl DuckDBTable for DuckDBTableAdapter {
         &mut self,
         filter: Expr<'_>,
         scan_column_count: usize,
+        pushed_filter_count: usize,
     ) -> duckdb_planner::catalog_provider::Result<bool> {
         // Translate the borrowed DuckDB filter expression into a Pivot one (the
         // only filter shape the bridge pushes is a bound expression).
         let filter = TableFilter::Expression(Box::new(crate::expression::Expression::from_handle(
             filter,
         )?));
-        Ok(self.table.pushdown_filter(filter, scan_column_count)?)
+        Ok(self
+            .table
+            .pushdown_filter(filter, scan_column_count, pushed_filter_count)?)
     }
 
     fn estimate_row_count(&self) -> Option<u64> {

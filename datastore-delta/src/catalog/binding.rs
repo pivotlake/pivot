@@ -339,6 +339,7 @@ impl BoundTable for TableBinding {
         &mut self,
         filter: TableFilter,
         scan_column_count: usize,
+        pushed_filter_count: usize,
     ) -> CatalogResult<bool> {
         let TableFilter::Expression(expr) = filter else {
             return Ok(false);
@@ -372,7 +373,7 @@ impl BoundTable for TableBinding {
         // scan alone decides which rows survive and the column it reads need
         // not be projected at all. Only shapes the scan can evaluate exactly
         // are claimed; everything else keeps the `Filter` above.
-        if self.can_own_predicate(&predicate, scan_column_count) {
+        if self.can_own_predicate(&predicate, scan_column_count, pushed_filter_count) {
             self.owned_predicates.push(predicate);
             return Ok(true);
         }
@@ -453,15 +454,25 @@ fn scalar_lt(a: &Scalar<ArrayRef>, b: &Scalar<ArrayRef>) -> bool {
 }
 
 impl TableBinding {
-    fn can_own_predicate(&self, predicate: &PushedPredicate, scan_column_count: usize) -> bool {
+    fn can_own_predicate(
+        &self,
+        predicate: &PushedPredicate,
+        scan_column_count: usize,
+        pushed_filter_count: usize,
+    ) -> bool {
         // Owning the comparison means the scan drops the failing rows itself,
         // which gathers every column the batch carries. The plan's `Filter`
         // does that far better - it keeps a selection vector and only
-        // materializes when a cost model says it pays - so owning is only
-        // worth it when there is next to nothing to gather. One column is the
-        // shape that wins: the comparison's own, read for nothing else, which
-        // projection pushdown then drops entirely once the condition is gone.
-        if scan_column_count > 1 {
+        // materializes when a cost model says it pays - so owning has to save
+        // more than that gather costs.
+        //
+        // Two shapes qualify. A one-column scan has nothing much to gather,
+        // and once the condition is gone projection pushdown drops that column
+        // outright. A sole condition leaves no `Filter` above the scan at all,
+        // so the batch is gathered once here instead of once there. Owning one
+        // of several conditions is the case that loses: the `Filter` stays for
+        // the rest and the rows get gathered twice.
+        if scan_column_count > 1 && pushed_filter_count > 1 {
             return false;
         }
         // A variant path reads a shredded leaf that only some files carry, so

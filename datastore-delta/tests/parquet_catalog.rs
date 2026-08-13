@@ -512,9 +512,56 @@ fn pushdown_filter_claims_a_constant_comparison() {
         )
         .unwrap();
     let pushed = table
-        .pushdown_filter(col_neq_filter(0, int_constant(20)), 1)
+        .pushdown_filter(col_neq_filter(0, int_constant(20)), 1, 1)
         .unwrap();
     assert!(pushed);
+}
+
+/// A wide scan is still worth owning when the comparison is the only condition:
+/// the plan then carries no `Filter` at all, so the rows are gathered once in
+/// the scan rather than once above it.
+#[test]
+fn pushdown_filter_claims_a_sole_condition_over_a_wide_scan() {
+    let (dir, columns) = three_row_table();
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
+    let mut table = datastore
+        .clone()
+        .begin_transaction()
+        .table(
+            DEFAULT_DATASTORE_NAME,
+            &SchemaQualifiedTableName::in_default_schema("t"),
+        )
+        .unwrap();
+
+    let pushed = table
+        .pushdown_filter(col_neq_filter(0, int_constant(20)), 5, 1)
+        .unwrap();
+
+    assert!(pushed);
+}
+
+/// One of several conditions over a wide scan is the case that loses: the
+/// `Filter` stays for the rest, so owning this one only adds a second gather.
+#[test]
+fn pushdown_filter_declines_one_of_several_conditions_over_a_wide_scan() {
+    let (dir, columns) = three_row_table();
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
+    let mut table = datastore
+        .clone()
+        .begin_transaction()
+        .table(
+            DEFAULT_DATASTORE_NAME,
+            &SchemaQualifiedTableName::in_default_schema("t"),
+        )
+        .unwrap();
+
+    let pushed = table
+        .pushdown_filter(col_neq_filter(0, int_constant(20)), 5, 3)
+        .unwrap();
+
+    assert!(!pushed);
 }
 
 /// An ordering comparison is not a shape the scan applies, so the `Filter`
@@ -536,6 +583,7 @@ fn pushdown_filter_does_not_claim_an_ordering_comparison() {
     let pushed = table
         .pushdown_filter(
             constant_comparison(0, CompareType::Less, int_constant(20)),
+            1,
             1,
         )
         .unwrap();
@@ -561,7 +609,7 @@ fn pushdown_filter_does_not_claim_a_type_mismatched_constant() {
 
     let string_constant = Scalar::new(Arc::new(StringViewArray::from(vec!["20"])) as ArrayRef);
     let pushed = table
-        .pushdown_filter(col_eq_filter(0, string_constant), 1)
+        .pushdown_filter(col_eq_filter(0, string_constant), 1, 1)
         .unwrap();
 
     assert!(!pushed);
@@ -584,7 +632,7 @@ fn pushdown_filter_prunes_row_group_with_only_excluded_value() {
     assert_eq!(row_group_count(&datastore, "t", &table), 3);
 
     table
-        .pushdown_filter(col_neq_filter(0, int_constant(20)), 1)
+        .pushdown_filter(col_neq_filter(0, int_constant(20)), 1, 1)
         .unwrap();
 
     // Row group whose single value is 20 has min == max == 20 and is pruned.
@@ -608,7 +656,7 @@ fn second_bind_is_independent_of_first_bind_pushdown() {
         )
         .unwrap();
     first
-        .pushdown_filter(col_neq_filter(0, int_constant(20)), 1)
+        .pushdown_filter(col_neq_filter(0, int_constant(20)), 1, 1)
         .unwrap();
     assert_eq!(row_group_count(&datastore, "t", &first), 2);
 
@@ -640,7 +688,7 @@ fn pushdown_filter_eq_prunes_row_groups_when_constant_outside_range() {
         )
         .unwrap();
     table
-        .pushdown_filter(col_eq_filter(0, int_constant(999)), 1)
+        .pushdown_filter(col_eq_filter(0, int_constant(999)), 1, 1)
         .unwrap();
     assert_eq!(row_group_count(&datastore, "t", &table), 0);
 }
@@ -661,7 +709,7 @@ fn pushdown_filter_eq_keeps_only_matching_row_group() {
         )
         .unwrap();
     table
-        .pushdown_filter(col_eq_filter(0, int_constant(20)), 1)
+        .pushdown_filter(col_eq_filter(0, int_constant(20)), 1, 1)
         .unwrap();
     assert_eq!(row_group_count(&datastore, "t", &table), 1);
 }
@@ -680,7 +728,7 @@ fn pushdown_filter_eq_is_claimed() {
         )
         .unwrap();
     let pushed = table
-        .pushdown_filter(col_eq_filter(0, int_constant(20)), 1)
+        .pushdown_filter(col_eq_filter(0, int_constant(20)), 1, 1)
         .unwrap();
     assert!(pushed);
 }
@@ -821,7 +869,7 @@ fn pushdown_filter_keeps_row_groups_when_constant_outside_range() {
         )
         .unwrap();
     table
-        .pushdown_filter(col_neq_filter(0, int_constant(999)), 1)
+        .pushdown_filter(col_neq_filter(0, int_constant(999)), 1, 1)
         .unwrap();
 
     assert_eq!(row_group_count(&datastore, "t", &table), 3);
@@ -1562,7 +1610,7 @@ fn pushed_predicate_prunes_latest_files_after_refresh() {
         )
         .unwrap();
     table
-        .pushdown_filter(col_eq_filter(0, int_constant(20)), 1)
+        .pushdown_filter(col_eq_filter(0, int_constant(20)), 1, 1)
         .unwrap();
     assert_eq!(row_group_count(&datastore, "t", &table), 1);
 
@@ -1704,7 +1752,7 @@ fn filter_on_partition_column_prunes_whole_single_partition_file() {
     assert_eq!(row_group_count(&datastore, "t", &table), 6);
 
     table
-        .pushdown_filter(col_eq_filter(0, int_constant(1)), 1)
+        .pushdown_filter(col_eq_filter(0, int_constant(1)), 1, 1)
         .unwrap();
 
     // `id = 1` excludes the part-2 file's three row groups entirely; only the
@@ -2016,7 +2064,7 @@ fn variant_pushdown_equality_keeps_only_the_matching_row_group() {
     assert_eq!(row_group_count(&datastore, "docs", &table), 3);
 
     table
-        .pushdown_filter(variant_filter(&["age"], CompareType::Equal, 20), 1)
+        .pushdown_filter(variant_filter(&["age"], CompareType::Equal, 20), 1, 1)
         .unwrap();
 
     // Only the row group whose shredded `age` leaf holds 20 survives.
@@ -2029,7 +2077,7 @@ fn variant_pushdown_range_prunes_by_the_shredded_leaf() {
     let (_database, datastore, mut table) = shredded_docs_datastore(dir.path());
 
     table
-        .pushdown_filter(variant_filter(&["age"], CompareType::Less, 20), 1)
+        .pushdown_filter(variant_filter(&["age"], CompareType::Less, 20), 1, 1)
         .unwrap();
 
     // `age < 20` keeps only the group whose min is below 20 (the 10 group).
@@ -2044,7 +2092,7 @@ fn variant_pushdown_keeps_all_groups_for_an_unshredded_path() {
     let (_database, datastore, mut table) = shredded_docs_datastore(dir.path());
 
     table
-        .pushdown_filter(variant_filter(&["salary"], CompareType::Equal, 20), 1)
+        .pushdown_filter(variant_filter(&["salary"], CompareType::Equal, 20), 1, 1)
         .unwrap();
 
     assert_eq!(row_group_count(&datastore, "docs", &table), 3);
@@ -2120,7 +2168,7 @@ fn variant_pushdown_keeps_groups_whose_value_fallback_holds_data() {
     let (_database, datastore, mut table) = shredded_docs_datastore(dir.path());
 
     table
-        .pushdown_filter(variant_filter(&["age"], CompareType::Equal, 20), 1)
+        .pushdown_filter(variant_filter(&["age"], CompareType::Equal, 20), 1, 1)
         .unwrap();
 
     // Group 0's typed stats ([10, 10]) exclude 20, but its fallback row could
@@ -2144,7 +2192,7 @@ fn variant_pushdown_prunes_only_the_file_that_shreds_the_path() {
     assert_eq!(row_group_count(&datastore, "docs", &table), 4);
 
     table
-        .pushdown_filter(variant_filter(&["age"], CompareType::Equal, 20), 1)
+        .pushdown_filter(variant_filter(&["age"], CompareType::Equal, 20), 1, 1)
         .unwrap();
 
     // The shredded file keeps only its age=20 group; the unshredded file's
@@ -2166,7 +2214,11 @@ fn variant_pushdown_prunes_by_a_nested_shredded_path() {
     assert_eq!(row_group_count(&datastore, "docs", &table), 3);
 
     table
-        .pushdown_filter(variant_filter(&["user", "id"], CompareType::Equal, 20), 1)
+        .pushdown_filter(
+            variant_filter(&["user", "id"], CompareType::Equal, 20),
+            1,
+            1,
+        )
         .unwrap();
 
     assert_eq!(row_group_count(&datastore, "docs", &table), 1);

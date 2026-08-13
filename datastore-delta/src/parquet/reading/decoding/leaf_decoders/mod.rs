@@ -49,6 +49,10 @@ use bytes::Bytes;
 /// of any length costs one lookup and a bit-range fill. Nothing here touches a
 /// value builder: the point is to settle the comparison without expanding the
 /// run into values at all.
+/// Bytes of answers packed before each hand-off to the mask builder. Sized to
+/// the decoder's own bit-packing scratch, so a full chunk of keys is one copy.
+const PACKED_KEY_BYTES: usize = 128;
+
 pub struct PredicateMask<'a> {
     entry_matches: &'a [bool],
     out: &'a mut BooleanBufferBuilder,
@@ -66,10 +70,23 @@ impl<'a> PredicateMask<'a> {
     }
 
     /// Record one row per bit-packed key.
-    #[inline(always)]
+    ///
+    /// A bit-packed group has no runs to collapse, so unlike [`push_run`] this
+    /// has to look at every key. It still writes the answers a word at a time:
+    /// the bits are packed into a local buffer first, because appending them
+    /// one at a time makes the builder re-check its capacity per row, which
+    /// costs more than the lookup being recorded.
+    ///
+    /// [`push_run`]: Self::push_run
     pub fn push_keys(&mut self, keys: &[u32]) {
-        for &key in keys {
-            self.out.append(self.entry_matches[key as usize]);
+        let mut packed = [0u8; PACKED_KEY_BYTES];
+        for chunk in keys.chunks(PACKED_KEY_BYTES * 8) {
+            let bytes = chunk.len().div_ceil(8);
+            packed[..bytes].fill(0);
+            for (i, &key) in chunk.iter().enumerate() {
+                packed[i / 8] |= u8::from(self.entry_matches[key as usize]) << (i % 8);
+            }
+            self.out.append_packed_range(0..chunk.len(), &packed);
         }
     }
 }

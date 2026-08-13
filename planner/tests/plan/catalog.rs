@@ -71,6 +71,7 @@ impl BoundTable for RecordingTable {
         &mut self,
         filter: TableFilter,
         _scan_column_count: usize,
+        _pushed_filter_count: usize,
     ) -> planner::catalog::Result<bool> {
         self.received.lock().unwrap().push(filter);
         Ok(self.accept_pushdown)
