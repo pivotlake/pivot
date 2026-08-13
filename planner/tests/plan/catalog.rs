@@ -67,7 +67,11 @@ impl BoundTable for RecordingTable {
         Box::new(self.clone())
     }
 
-    fn pushdown_filter(&mut self, filter: TableFilter) -> planner::catalog::Result<bool> {
+    fn pushdown_filter(
+        &mut self,
+        filter: TableFilter,
+        _scan_column_count: usize,
+    ) -> planner::catalog::Result<bool> {
         self.received.lock().unwrap().push(filter);
         Ok(self.accept_pushdown)
     }

@@ -315,6 +315,10 @@ where
         (0..size).any(|_| T::Native::read_le(&mut reader) == *needle)
     }
 
+    fn equality_bitmap(&self, needle: &T::Native) -> Option<Vec<bool>> {
+        Some((0..self.len).map(|i| self.entries[i] == *needle).collect())
+    }
+
     fn len(&self) -> usize {
         self.len
     }

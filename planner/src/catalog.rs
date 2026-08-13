@@ -422,7 +422,16 @@ pub trait BoundTable: Debug + Send + Sync {
     /// *FULLY* consumed (no upstream `Filter` operator required), `Ok(false)`
     /// if it was kept above. Errors propagate to the FFI boundary as C++
     /// exceptions.
-    fn pushdown_filter(&mut self, _filter: TableFilter) -> Result<bool> {
+    /// Offer a single-table filter for the table to take responsibility for.
+    ///
+    /// `scan_column_count` is how many columns the scan reads at this point,
+    /// which is what tells a table whether owning the filter is worth it: the
+    /// owner must apply it to every batch itself, and that costs a gather of
+    /// every column the batch carries.
+    ///
+    /// Returning `true` means the plan drops the condition entirely, so the
+    /// table alone decides which rows survive. The default keeps it.
+    fn pushdown_filter(&mut self, _filter: TableFilter, _scan_column_count: usize) -> Result<bool> {
         Ok(false)
     }
 
@@ -489,13 +498,14 @@ impl DuckDBTable for DuckDBTableAdapter {
     fn pushdown_filter(
         &mut self,
         filter: Expr<'_>,
+        scan_column_count: usize,
     ) -> duckdb_planner::catalog_provider::Result<bool> {
         // Translate the borrowed DuckDB filter expression into a Pivot one (the
         // only filter shape the bridge pushes is a bound expression).
         let filter = TableFilter::Expression(Box::new(crate::expression::Expression::from_handle(
             filter,
         )?));
-        Ok(self.table.pushdown_filter(filter)?)
+        Ok(self.table.pushdown_filter(filter, scan_column_count)?)
     }
 
     fn estimate_row_count(&self) -> Option<u64> {

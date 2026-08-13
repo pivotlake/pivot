@@ -13,7 +13,7 @@
 //! saved and resumed on the next call, so the decoder can be driven in
 //! arbitrarily sized chunks.
 
-use crate::parquet::reading::decoding::leaf_decoders::{ArrayBuilder, Dict};
+use crate::parquet::reading::decoding::leaf_decoders::{ArrayBuilder, Dict, PredicateMask};
 use bytes::Bytes;
 use dispatch::memory::{MultiBufferReader, ReaderPosition};
 
@@ -263,6 +263,49 @@ impl Run {
         }
     }
 
+    /// Answers a pushed-down comparison for up to `limit` values of this run
+    /// and advances past them, writing nothing but mask bits.
+    ///
+    /// This is [`read_into`](Self::read_into) with the value builder removed:
+    /// an RLE run is settled by one dictionary lookup and a bit-range fill,
+    /// however many rows it covers, so its values are never expanded.
+    ///
+    /// Returns `(consumed, remaining_run)`.
+    pub fn mask_into(
+        self,
+        scratch: &mut [u32; 1024],
+        data: &[Bytes],
+        bit_width: u8,
+        position: &mut ReaderPosition,
+        limit: usize,
+        mask: &mut PredicateMask<'_>,
+    ) -> (usize, Option<Self>) {
+        match self {
+            Run::Rle { value, mut count } => {
+                let emit = count.min(limit);
+                mask.push_run(value, emit);
+                count -= emit;
+                let leftover = (count > 0).then_some(Run::Rle { value, count });
+                (emit, leftover)
+            }
+            Run::BitPacked {
+                remaining_in_run,
+                partial,
+                partial_count,
+            } => decode_bitpacked(
+                remaining_in_run,
+                partial,
+                partial_count,
+                scratch,
+                data,
+                bit_width,
+                position,
+                limit,
+                |scratch, count| mask.push_keys(&scratch[..count]),
+            ),
+        }
+    }
+
     /// Advances past up to `amount` values without writing them.
     ///
     /// Returns `(skipped, remaining_run)` — the number of values actually
@@ -364,6 +407,25 @@ impl RleDecoder {
             );
             self.run = run;
             size -= skipped;
+        }
+    }
+
+    /// Answers a pushed-down comparison for the next `size` values from the
+    /// keys alone, decoding no values.
+    pub fn read_mask(&mut self, size: usize, mask: &mut PredicateMask<'_>) {
+        let mut left = size;
+        while left > 0 {
+            let run = self.get_or_set_next_run();
+            let (consumed, leftover) = run.mask_into(
+                &mut self.buffer,
+                &self.data,
+                self.bit_width,
+                &mut self.position,
+                left,
+                mask,
+            );
+            self.run = leftover;
+            left -= consumed;
         }
     }
 

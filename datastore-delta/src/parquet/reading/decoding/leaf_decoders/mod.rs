@@ -40,7 +40,39 @@ pub use typed::TypedLeafDecoder;
 use crate::parquet::types::page::DecompressedPage;
 use crate::parquet::types::thrift::general::Encoding;
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
+use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use bytes::Bytes;
+
+/// Sink for a pushed-down comparison answered in the *encoded* domain.
+///
+/// `entry_matches` holds the answer for every dictionary entry, so an RLE run
+/// of any length costs one lookup and a bit-range fill. Nothing here touches a
+/// value builder: the point is to settle the comparison without expanding the
+/// run into values at all.
+pub struct PredicateMask<'a> {
+    entry_matches: &'a [bool],
+    out: &'a mut BooleanBufferBuilder,
+}
+
+impl<'a> PredicateMask<'a> {
+    pub fn new(entry_matches: &'a [bool], out: &'a mut BooleanBufferBuilder) -> Self {
+        Self { entry_matches, out }
+    }
+
+    /// Record `count` rows that all carry dictionary entry `key`.
+    #[inline(always)]
+    pub fn push_run(&mut self, key: u32, count: usize) {
+        self.out.append_n(count, self.entry_matches[key as usize]);
+    }
+
+    /// Record one row per bit-packed key.
+    #[inline(always)]
+    pub fn push_keys(&mut self, keys: &[u32]) {
+        for &key in keys {
+            self.out.append(self.entry_matches[key as usize]);
+        }
+    }
+}
 use dispatch::memory::{ReaderPosition, SlabAllocator};
 use thiserror::Error;
 
@@ -92,6 +124,24 @@ pub trait LeafDecoder {
     /// the condition). Once the dictionary is built the constant decides
     /// row-group pruning and scan-side batch filtering.
     fn set_eq_constant(&mut self, value: &Scalar<ArrayRef>);
+
+    /// Prepare this leaf to answer a claimed comparison from its dictionary
+    /// keys alone, `negated` telling `<>` from `=`.
+    fn set_mask_predicate(&mut self, _value: &Scalar<ArrayRef>, _negated: bool) {}
+
+    /// Whether [`read_predicate_mask`](Self::read_predicate_mask) can answer the
+    /// claimed comparison for the next `size` rows without materializing them.
+    /// Checked before anything is consumed, so a `false` leaves the leaf
+    /// untouched for the ordinary decode path.
+    fn can_read_predicate_mask(&self) -> bool {
+        false
+    }
+
+    /// Consume `size` rows, returning only the claimed comparison's answer for
+    /// them. No value is decoded and no array is built.
+    fn read_predicate_mask(&mut self, _size: usize) -> Result<BooleanBuffer> {
+        unreachable!("only called when can_read_predicate_mask() is true")
+    }
 
     /// Whether the loaded dictionary is known to exclude the pushed-down
     /// equality constant, meaning no row of this column can match and the row
@@ -188,6 +238,16 @@ pub trait Dict {
     /// rule anything out; implementations override it to enable the pushdown.
     fn maybe_contains(_data: &[Bytes], _size: usize, _needle: &Self::EqConstant) -> bool {
         true
+    }
+
+    /// One bit per dictionary entry: whether that entry equals `needle`.
+    ///
+    /// Built once when the dictionary page arrives, which is what lets an
+    /// RLE-encoded column answer a pushed-down comparison per *run* rather than
+    /// per row. `None` when the flavour cannot decide equality, which forgoes
+    /// the optimization.
+    fn equality_bitmap(&self, _needle: &Self::EqConstant) -> Option<Vec<bool>> {
+        None
     }
 
     /// Number of entries in the dictionary.

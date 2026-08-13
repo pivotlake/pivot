@@ -150,7 +150,11 @@ pub mod ffi {
             ctx: &CatalogContext,
             name: &str,
         ) -> CatalogGetScalarFunctionResult;
-        fn pushdown_filter(table: &mut OptionalTableWrapper, expr: &Expression) -> Result<bool>;
+        fn pushdown_filter(
+            table: &mut OptionalTableWrapper,
+            expr: &Expression,
+            scan_column_count: usize,
+        ) -> Result<bool>;
         fn table_estimate_row_count(table: &OptionalTableWrapper) -> CardinalityEstimate;
     }
 

@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use arrow_array::Array as _;
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int32Type;
 use arrow_array::{
@@ -495,8 +496,10 @@ fn create_table_over_an_empty_adopt_directory_makes_an_empty_table() {
     );
 }
 
+/// An equality-shaped constant comparison on a plain column is reported as
+/// handled: the plan drops its `Filter` and the scan applies it alone.
 #[test]
-fn pushdown_filter_always_returns_false() {
+fn pushdown_filter_claims_a_constant_comparison() {
     let (dir, columns) = three_row_table();
     let (_database, datastore) = empty_datastore();
     create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
@@ -509,8 +512,58 @@ fn pushdown_filter_always_returns_false() {
         )
         .unwrap();
     let pushed = table
-        .pushdown_filter(col_neq_filter(0, int_constant(20)))
+        .pushdown_filter(col_neq_filter(0, int_constant(20)), 1)
         .unwrap();
+    assert!(pushed);
+}
+
+/// An ordering comparison is not a shape the scan applies, so the `Filter`
+/// above has to stay.
+#[test]
+fn pushdown_filter_does_not_claim_an_ordering_comparison() {
+    let (dir, columns) = three_row_table();
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
+    let mut table = datastore
+        .clone()
+        .begin_transaction()
+        .table(
+            DEFAULT_DATASTORE_NAME,
+            &SchemaQualifiedTableName::in_default_schema("t"),
+        )
+        .unwrap();
+
+    let pushed = table
+        .pushdown_filter(
+            constant_comparison(0, CompareType::Less, int_constant(20)),
+            1,
+        )
+        .unwrap();
+
+    assert!(!pushed);
+}
+
+/// A constant of the wrong type would make the scan's comparison kernel error
+/// with no `Filter` left to fall back on, so it is never claimed.
+#[test]
+fn pushdown_filter_does_not_claim_a_type_mismatched_constant() {
+    let (dir, columns) = three_row_table();
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
+    let mut table = datastore
+        .clone()
+        .begin_transaction()
+        .table(
+            DEFAULT_DATASTORE_NAME,
+            &SchemaQualifiedTableName::in_default_schema("t"),
+        )
+        .unwrap();
+
+    let string_constant = Scalar::new(Arc::new(StringViewArray::from(vec!["20"])) as ArrayRef);
+    let pushed = table
+        .pushdown_filter(col_eq_filter(0, string_constant), 1)
+        .unwrap();
+
     assert!(!pushed);
 }
 
@@ -531,7 +584,7 @@ fn pushdown_filter_prunes_row_group_with_only_excluded_value() {
     assert_eq!(row_group_count(&datastore, "t", &table), 3);
 
     table
-        .pushdown_filter(col_neq_filter(0, int_constant(20)))
+        .pushdown_filter(col_neq_filter(0, int_constant(20)), 1)
         .unwrap();
 
     // Row group whose single value is 20 has min == max == 20 and is pruned.
@@ -555,7 +608,7 @@ fn second_bind_is_independent_of_first_bind_pushdown() {
         )
         .unwrap();
     first
-        .pushdown_filter(col_neq_filter(0, int_constant(20)))
+        .pushdown_filter(col_neq_filter(0, int_constant(20)), 1)
         .unwrap();
     assert_eq!(row_group_count(&datastore, "t", &first), 2);
 
@@ -587,7 +640,7 @@ fn pushdown_filter_eq_prunes_row_groups_when_constant_outside_range() {
         )
         .unwrap();
     table
-        .pushdown_filter(col_eq_filter(0, int_constant(999)))
+        .pushdown_filter(col_eq_filter(0, int_constant(999)), 1)
         .unwrap();
     assert_eq!(row_group_count(&datastore, "t", &table), 0);
 }
@@ -608,13 +661,13 @@ fn pushdown_filter_eq_keeps_only_matching_row_group() {
         )
         .unwrap();
     table
-        .pushdown_filter(col_eq_filter(0, int_constant(20)))
+        .pushdown_filter(col_eq_filter(0, int_constant(20)), 1)
         .unwrap();
     assert_eq!(row_group_count(&datastore, "t", &table), 1);
 }
 
 #[test]
-fn pushdown_filter_eq_returns_false() {
+fn pushdown_filter_eq_is_claimed() {
     let (dir, columns) = three_row_table();
     let (_database, datastore) = empty_datastore();
     create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
@@ -627,9 +680,130 @@ fn pushdown_filter_eq_returns_false() {
         )
         .unwrap();
     let pushed = table
-        .pushdown_filter(col_eq_filter(0, int_constant(20)))
+        .pushdown_filter(col_eq_filter(0, int_constant(20)), 1)
         .unwrap();
-    assert!(!pushed);
+    assert!(pushed);
+}
+
+/// The comparison column is not selected, so projection pushdown drops it and
+/// the scan has to read it anyway to answer the predicate it claimed. The count
+/// is the whole test: get this wrong and the filter silently disappears.
+
+/// The same, for the negated form and over a column that is also selected.
+
+/// Every row fails the claimed comparison, so the scan must emit nothing at all
+/// rather than fall back to passing rows through.
+
+/// Two claimed comparisons on one column combine, rather than the later one
+/// replacing the earlier.
+
+/// The `id` value of every row in `batches`, in order.
+fn ids(batches: &[RecordBatch]) -> Vec<i32> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            let c = b.column(0).as_primitive::<Int32Type>();
+            (0..c.len()).map(|i| c.value(i)).collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// A claimed comparison must not disturb late materialization: the scan stamps
+/// each row's index before dropping any row, so the rows re-read afterwards are
+/// the ones that actually survived.
+
+/// A two-column table filled through the engine's own write path, which the
+/// scan reads back without the hand-written fixtures' quirks.
+fn scannable_table(datastore: &Arc<DeltaDatastore>) {
+    create_table(
+        datastore,
+        empty_request(
+            "vals",
+            vec![
+                Column {
+                    name: "id".to_string(),
+                    col_type: Type::Int32,
+                },
+                Column {
+                    name: "label".to_string(),
+                    col_type: Type::Utf8,
+                },
+            ],
+        ),
+    )
+    .unwrap();
+    run_sql(
+        datastore,
+        "INSERT INTO vals VALUES (10, 'a'), (20, 'b'), (30, 'c')",
+    );
+    datastore.refresh_from_store().unwrap();
+}
+
+/// The comparison column is not selected, so projection pushdown drops it and
+/// the scan has to read it anyway to answer the predicate it claimed. The count
+/// is the whole test: get this wrong and the filter silently disappears.
+#[test]
+fn claimed_filter_applies_when_its_column_is_not_projected() {
+    let (_database, datastore) = empty_datastore();
+    scannable_table(&datastore);
+
+    let rows = run_sql(&datastore, "SELECT COUNT(*) FROM vals WHERE label = 'b'");
+
+    assert_eq!(common::extract_count(&rows), 1);
+}
+
+/// The negated form, over a column that is also selected.
+#[test]
+fn claimed_not_equal_filter_returns_the_other_rows() {
+    let (_database, datastore) = empty_datastore();
+    scannable_table(&datastore);
+
+    let rows = run_sql(&datastore, "SELECT id FROM vals WHERE id <> 20 ORDER BY id");
+
+    assert_eq!(ids(&rows), vec![10, 30]);
+}
+
+/// Every row fails the claimed comparison, so the scan must emit nothing at all
+/// rather than fall back to passing rows through.
+#[test]
+fn claimed_filter_matching_no_row_returns_nothing() {
+    let (_database, datastore) = empty_datastore();
+    scannable_table(&datastore);
+
+    let rows = run_sql(&datastore, "SELECT id FROM vals WHERE id = 999");
+
+    assert_eq!(ids(&rows), Vec::<i32>::new());
+}
+
+/// Two claimed comparisons combine, rather than the later one replacing the
+/// earlier.
+#[test]
+fn two_claimed_filters_both_apply() {
+    let (_database, datastore) = empty_datastore();
+    scannable_table(&datastore);
+
+    let rows = run_sql(
+        &datastore,
+        "SELECT id FROM vals WHERE id <> 20 AND label <> 'c'",
+    );
+
+    assert_eq!(ids(&rows), vec![10]);
+}
+
+/// A claimed comparison must not disturb row addressing: the scan stamps each
+/// row's index before dropping any row, so anything re-reading rows afterwards
+/// lands on the ones that actually survived.
+#[test]
+fn claimed_filter_keeps_row_addressing_intact() {
+    let (_database, datastore) = empty_datastore();
+    scannable_table(&datastore);
+
+    let rows = run_sql(
+        &datastore,
+        "SELECT id FROM vals WHERE label <> 'b' ORDER BY id LIMIT 2",
+    );
+
+    assert_eq!(ids(&rows), vec![10, 30]);
 }
 
 #[test]
@@ -647,7 +821,7 @@ fn pushdown_filter_keeps_row_groups_when_constant_outside_range() {
         )
         .unwrap();
     table
-        .pushdown_filter(col_neq_filter(0, int_constant(999)))
+        .pushdown_filter(col_neq_filter(0, int_constant(999)), 1)
         .unwrap();
 
     assert_eq!(row_group_count(&datastore, "t", &table), 3);
@@ -1388,7 +1562,7 @@ fn pushed_predicate_prunes_latest_files_after_refresh() {
         )
         .unwrap();
     table
-        .pushdown_filter(col_eq_filter(0, int_constant(20)))
+        .pushdown_filter(col_eq_filter(0, int_constant(20)), 1)
         .unwrap();
     assert_eq!(row_group_count(&datastore, "t", &table), 1);
 
@@ -1530,7 +1704,7 @@ fn filter_on_partition_column_prunes_whole_single_partition_file() {
     assert_eq!(row_group_count(&datastore, "t", &table), 6);
 
     table
-        .pushdown_filter(col_eq_filter(0, int_constant(1)))
+        .pushdown_filter(col_eq_filter(0, int_constant(1)), 1)
         .unwrap();
 
     // `id = 1` excludes the part-2 file's three row groups entirely; only the
@@ -1842,7 +2016,7 @@ fn variant_pushdown_equality_keeps_only_the_matching_row_group() {
     assert_eq!(row_group_count(&datastore, "docs", &table), 3);
 
     table
-        .pushdown_filter(variant_filter(&["age"], CompareType::Equal, 20))
+        .pushdown_filter(variant_filter(&["age"], CompareType::Equal, 20), 1)
         .unwrap();
 
     // Only the row group whose shredded `age` leaf holds 20 survives.
@@ -1855,7 +2029,7 @@ fn variant_pushdown_range_prunes_by_the_shredded_leaf() {
     let (_database, datastore, mut table) = shredded_docs_datastore(dir.path());
 
     table
-        .pushdown_filter(variant_filter(&["age"], CompareType::Less, 20))
+        .pushdown_filter(variant_filter(&["age"], CompareType::Less, 20), 1)
         .unwrap();
 
     // `age < 20` keeps only the group whose min is below 20 (the 10 group).
@@ -1870,7 +2044,7 @@ fn variant_pushdown_keeps_all_groups_for_an_unshredded_path() {
     let (_database, datastore, mut table) = shredded_docs_datastore(dir.path());
 
     table
-        .pushdown_filter(variant_filter(&["salary"], CompareType::Equal, 20))
+        .pushdown_filter(variant_filter(&["salary"], CompareType::Equal, 20), 1)
         .unwrap();
 
     assert_eq!(row_group_count(&datastore, "docs", &table), 3);
@@ -1946,7 +2120,7 @@ fn variant_pushdown_keeps_groups_whose_value_fallback_holds_data() {
     let (_database, datastore, mut table) = shredded_docs_datastore(dir.path());
 
     table
-        .pushdown_filter(variant_filter(&["age"], CompareType::Equal, 20))
+        .pushdown_filter(variant_filter(&["age"], CompareType::Equal, 20), 1)
         .unwrap();
 
     // Group 0's typed stats ([10, 10]) exclude 20, but its fallback row could
@@ -1970,7 +2144,7 @@ fn variant_pushdown_prunes_only_the_file_that_shreds_the_path() {
     assert_eq!(row_group_count(&datastore, "docs", &table), 4);
 
     table
-        .pushdown_filter(variant_filter(&["age"], CompareType::Equal, 20))
+        .pushdown_filter(variant_filter(&["age"], CompareType::Equal, 20), 1)
         .unwrap();
 
     // The shredded file keeps only its age=20 group; the unshredded file's
@@ -1992,7 +2166,7 @@ fn variant_pushdown_prunes_by_a_nested_shredded_path() {
     assert_eq!(row_group_count(&datastore, "docs", &table), 3);
 
     table
-        .pushdown_filter(variant_filter(&["user", "id"], CompareType::Equal, 20))
+        .pushdown_filter(variant_filter(&["user", "id"], CompareType::Equal, 20), 1)
         .unwrap();
 
     assert_eq!(row_group_count(&datastore, "docs", &table), 1);
