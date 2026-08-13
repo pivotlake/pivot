@@ -78,6 +78,8 @@ snap = { git = "https://github.com/Epsio-Labs/rust-snappy.git", rev = "c1754fc37
 # Epsio fork: adds `block::decompress_scattered` (vectored pages over cache
 # buffers / ring slots). Default features off = the fast decode path.
 lz4_flex = { git = "https://github.com/Epsio-Labs/lz4_flex.git", rev = "a5cc41c918bbe0a2266db4cb7a1d16a406844d18", default-features = false, features = ["std"] }
+# Same version the vendored parquet crate binds, so one libzstd is built.
+zstd = { version = "0.13", default-features = false }
 sysinfo = "0.38.0"
 tempfile = "3"
 thiserror = "2.0.18"
