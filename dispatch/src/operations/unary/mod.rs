@@ -99,7 +99,10 @@ pub use join::{
     JoinResidualSpec, JoinSpec, PackedKey, RangeCompare, RangeJoinSpec, SingleColumnKey,
 };
 pub use limit::LimitFactory;
-pub use order_by::OrderByFactory;
+pub use order_by::{
+    MultiwayMergeSlice, OrderByFactory, PartitionerFactory, SortedPiece, merge_multiway_slice,
+    plan_multiway_merge_slices,
+};
 pub use order_by_limit::{DynamicFilterSlot, OrderBy, OrderByLimitFactory};
 
 #[derive(Debug, Error)]
@@ -202,6 +205,16 @@ pub trait Unary<I, O> {
         Ok(true)
     }
 
+    /// Whether one scheduling turn should consume everything queued rather
+    /// than a single item. The default (one item per turn) is right for
+    /// transforms whose per-item work is the heavy part; a transform that
+    /// only files items away (the Parquet write collector) opts in so a
+    /// backlog drains at queue speed instead of one item per pass of its
+    /// worker's whole operator graph.
+    fn drains_greedily(&self) -> bool {
+        false
+    }
+
     /// Whether this transform is done consuming *before* its input has run dry,
     /// e.g. a `LIMIT` that has already buffered enough rows. The default is
     /// `false`: an operator finishes only when its input channel drains.
@@ -278,7 +291,21 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
             Some(t) => t,
         };
 
+        let unit_started = std::time::Instant::now();
         self.unary.consume(item, &mut *self.sender)?;
+        if self.unary.drains_greedily() {
+            while let Some(item) = self.receiver.try_recv() {
+                self.unary.consume(item, &mut *self.sender)?;
+            }
+        }
+        let unit_ms = unit_started.elapsed().as_millis() as u64;
+        if unit_ms >= 500 {
+            tracing::warn!(
+                unit_ms,
+                unary = std::any::type_name::<U>(),
+                "slow consume unit"
+            );
+        }
 
         Ok(WorkStatus::Ran)
     }

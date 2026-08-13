@@ -19,7 +19,7 @@ use crate::RECORD_BATCH_SIZE;
 /// anything larger splits ([`plan_merge_slices`]). One batch's worth, so a
 /// slice's output is a well-sized chunk. (Rayon's equivalent, chosen to hide
 /// its scheduling overhead, is the same order of magnitude: 5000.)
-const SEQUENTIAL_MERGE_ROWS: usize = RECORD_BATCH_SIZE;
+pub(super) const SEQUENTIAL_MERGE_ROWS: usize = RECORD_BATCH_SIZE;
 
 /// One independent piece of a merge: these rows of the left run merge with
 /// these rows of the right run, and nothing outside them lands in between.
