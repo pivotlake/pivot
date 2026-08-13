@@ -208,6 +208,13 @@ impl<V: ByteViewType> DecodePlain for PlainPageDecoder<V> {
             }
         }
     }
+
+    fn byte_offset(&self) -> usize {
+        crate::parquet::reading::decoding::leaf_decoders::resume::logical_offset(
+            &self.data,
+            self.position,
+        )
+    }
 }
 #[cfg(test)]
 mod tests {

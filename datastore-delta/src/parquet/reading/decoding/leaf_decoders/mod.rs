@@ -32,16 +32,21 @@ mod levels;
 mod primitive;
 pub use primitive::PrimitiveLeafDecoder;
 
-mod rle;
+pub(crate) mod rle;
+
+pub(crate) mod resume;
+pub use resume::{LeafCheckpoint, PageCheckpoint};
 
 mod typed;
 pub use typed::TypedLeafDecoder;
 
+use crate::parquet::reading::decoding::shared_dictionary::{ChunkKey, SharedDictionaries};
 use crate::parquet::types::page::DecompressedPage;
 use crate::parquet::types::thrift::general::Encoding;
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use bytes::Bytes;
 use dispatch::memory::{ReaderPosition, SlabAllocator};
+use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -87,6 +92,36 @@ pub trait LeafDecoder {
     /// Decodes the next `size` rows into an Arrow array.
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef>;
 
+    /// Where this decoder stands right now, or `None` when its encoding cannot
+    /// be resumed (so no checkpoint is recorded and readers fall back to
+    /// decoding the chunk from its first page).
+    fn checkpoint(&self) -> Option<PageCheckpoint>;
+
+    /// Places this decoder at a previously recorded position, so the next row
+    /// it emits is the one the checkpoint addressed.
+    ///
+    /// `rows_into_page` is how many of that page's rows precede the checkpoint,
+    /// which is what a nullable page's definition levels have to be wound
+    /// forward by.
+    fn resume_from(&mut self, checkpoint: PageCheckpoint, rows_into_page: usize);
+
+    /// Points this decoder at the store holding this chunk's dictionary, so it
+    /// takes an already-built one when a sibling claim on the same chunk has
+    /// built it, and publishes its own otherwise. A decoder given no store
+    /// builds its own, which is always correct.
+    fn share_dictionary_via(&mut self, shared: Arc<SharedDictionaries>, key: ChunkKey);
+
+    /// Discards the first `rows` rows of this chunk before any are emitted.
+    ///
+    /// A scan that splits a row group hands each worker the pages holding its
+    /// own rows, but a split boundary rarely lands on a page boundary: the
+    /// first page usually starts a little before the first row the split owes.
+    /// This drops that overhang, so the split's first emitted row is the right
+    /// one. Skipping costs far less than decoding — for a fixed-width plain
+    /// page it is a pointer bump, and nothing is looked up or built — which is
+    /// what keeps a split from paying for the rows it does not want.
+    fn skip_leading_rows(&mut self, rows: usize);
+
     /// Installs a pushed-down equality constant. A constant whose type does
     /// not match the column is ignored (the query's `Filter` still applies
     /// the condition). Once the dictionary is built the constant decides
@@ -129,7 +164,9 @@ pub trait DecodePlain {
     /// bytes), which reports it as unsupported rather than decoding nonsense.
     type Delta: DecodeDelta<Builder = Self::Builder>;
 
-    /// Creates a decoder starting at `position` within `data`.
+    /// Creates a decoder starting at `position` within `data`. Handed a
+    /// recorded position rather than the page's start, this resumes decoding
+    /// part way through the page.
     fn new(data: Vec<Bytes>, position: ReaderPosition) -> Self;
 
     /// Decodes `size` values into `builder`.
@@ -137,6 +174,14 @@ pub trait DecodePlain {
 
     /// Advances past `size` values without decoding them.
     fn skip(&mut self, size: usize);
+
+    /// How many bytes into the page's payload the next value begins.
+    ///
+    /// Recorded at a checkpoint so a later reader can resume here instead of
+    /// decoding up to it; a plain encoding carries no other state, so this says
+    /// everything. A byte count rather than a [`ReaderPosition`] because the
+    /// payload's split across buffers differs from scan to scan.
+    fn byte_offset(&self) -> usize;
 }
 
 /// Reads `DELTA_BINARY_PACKED` values from raw page bytes into an

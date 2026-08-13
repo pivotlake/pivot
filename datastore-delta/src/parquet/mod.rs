@@ -81,6 +81,12 @@ pub(crate) mod test_utils {
             num_rows: 0,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            page_directories: Arc::new(
+                crate::parquet::types::page_directory::RowGroupPageDirectory::new(0),
+            ),
+            decode_checkpoints: Arc::new(
+                crate::parquet::types::page_directory::RowGroupCheckpoints::new(0),
+            ),
         })
     }
 

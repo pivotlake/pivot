@@ -27,7 +27,7 @@ use bytes::Bytes;
 use crate::parquet::reading::decoding::leaf_decoders::primitive::ElemPtr;
 use crate::parquet::reading::decoding::leaf_decoders::{
     DecimalDeltaDecoder, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error, FromDelta,
-    LeafDecoder, Result, TypedLeafDecoder,
+    LeafDecoder, PageCheckpoint, Result, TypedLeafDecoder,
 };
 use crate::parquet::types::metadata::ColumnChunkMeta;
 use crate::parquet::types::page::DecompressedPage;
@@ -38,7 +38,10 @@ use dispatch::memory::{
 
 /// How a decimal column's unscaled integer is stored on disk. Each storage
 /// decodes through the same sign-extended `i128`.
-pub trait DecimalStorage: 'static {
+/// `Send + Sync` so a built dictionary can be shared with the sibling claims
+/// decoding other row ranges of the same chunk; every implementor is a
+/// zero-sized marker type, so it costs nothing.
+pub trait DecimalStorage: 'static + Send + Sync {
     /// Bytes one value occupies on disk.
     const PHYSICAL_SIZE: usize;
 
@@ -118,7 +121,7 @@ impl<const LEN: usize> DecimalStorage for DecimalFromFixedLen<LEN> {
 /// The in-memory column a decimal column decodes into: [`Decimal64Type`]
 /// (i64) for a declared precision up to 18 digits, [`Decimal128Type`] (i128)
 /// beyond.
-pub trait DecimalCarrier: DecimalType<Native: FromDelta> {
+pub trait DecimalCarrier: DecimalType<Native: FromDelta> + Send + Sync {
     /// Narrows the storage's sign-extended `i128` to the carrier's native
     /// integer. The declared precision guarantees the value fits.
     fn narrow(value: i128) -> Self::Native;
@@ -224,6 +227,13 @@ impl<T: DecimalCarrier, S: DecimalStorage> DecodePlain for DecimalPlainDecoder<T
     fn skip(&mut self, size: usize) {
         let mut reader = MultiBufferReader::new(&self.data, &mut self.position);
         reader.skip(size * S::PHYSICAL_SIZE);
+    }
+
+    fn byte_offset(&self) -> usize {
+        crate::parquet::reading::decoding::leaf_decoders::resume::logical_offset(
+            &self.data,
+            self.position,
+        )
     }
 }
 
@@ -374,6 +384,28 @@ impl<T: DecimalCarrier, S: DecimalStorage> LeafDecoder for DecimalLeafDecoder<T,
 
     fn insert_page(&mut self, page: DecompressedPage, allocator: &mut SlabAllocator) {
         self.inner.insert_page(page, allocator);
+    }
+
+    fn skip_leading_rows(&mut self, rows: usize) {
+        self.inner.skip_leading_rows(rows);
+    }
+
+    fn share_dictionary_via(
+        &mut self,
+        shared: std::sync::Arc<
+            crate::parquet::reading::decoding::shared_dictionary::SharedDictionaries,
+        >,
+        key: crate::parquet::reading::decoding::shared_dictionary::ChunkKey,
+    ) {
+        self.inner.share_dictionary_via(shared, key);
+    }
+
+    fn checkpoint(&self) -> Option<PageCheckpoint> {
+        self.inner.checkpoint()
+    }
+
+    fn resume_from(&mut self, checkpoint: PageCheckpoint, rows_into_page: usize) {
+        self.inner.resume_from(checkpoint, rows_into_page);
     }
 
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef> {

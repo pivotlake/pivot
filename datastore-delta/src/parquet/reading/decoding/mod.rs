@@ -29,7 +29,10 @@ mod column_decoder;
 pub use column_decoder::Error as ColumnDecoderError;
 
 mod row_group_decoder;
+
+pub mod shared_dictionary;
 pub use row_group_decoder::RowGroupDecoder;
+pub use shared_dictionary::SharedDictionaries;
 
 /// A pushed-down equality predicate (`column == value`) used for dictionary
 /// pruning at scan time. When a row group's dictionary for the compared column
@@ -66,6 +69,10 @@ pub struct DecoderFactory {
     /// The scan-wide equivalent, shared with the row-group injector; releases
     /// the speculative-claim throttle of an unarmed Top-N scan.
     pub outstanding_row_groups: Arc<AtomicUsize>,
+    /// Dictionaries built once per column chunk and shared by every claim on
+    /// it, so splitting a row group does not rebuild them per split. Shared by
+    /// every worker of this scan.
+    pub shared_dictionaries: Arc<SharedDictionaries>,
 }
 
 impl UnaryFactory<DecompressedPage, RecordBatch> for DecoderFactory {
@@ -79,6 +86,7 @@ impl UnaryFactory<DecompressedPage, RecordBatch> for DecoderFactory {
             self.eq_predicates,
             self.pending_row_groups,
             self.outstanding_row_groups,
+            self.shared_dictionaries,
         )
     }
 }
@@ -98,9 +106,10 @@ pub struct Decoder {
     allocator: SlabAllocator,
     /// One decoder per in-flight row group.
     row_group_decoders: Vec<RowGroupDecoder>,
-    /// Row groups that have been fully emitted — late-arriving pages for these
-    /// are silently dropped.
-    closed_row_groups: HashSet<usize>,
+    /// Claims that have been fully emitted — late-arriving pages for these are
+    /// silently dropped. Keyed per claim, not per row group: the splits of one
+    /// row group finish independently.
+    closed_row_groups: HashSet<(usize, usize)>,
     add_row_group_metadata: bool,
     /// Pushed-down equality predicates for dictionary pruning (may be empty).
     eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
@@ -111,6 +120,8 @@ pub struct Decoder {
     pending_row_groups: Arc<AtomicUsize>,
     /// The scan-wide count, shared with the row-group injector.
     outstanding_row_groups: Arc<AtomicUsize>,
+    /// Dictionaries shared with the other workers decoding this scan.
+    shared_dictionaries: Arc<SharedDictionaries>,
 }
 
 impl Decoder {
@@ -121,6 +132,7 @@ impl Decoder {
         eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
         pending_row_groups: Arc<AtomicUsize>,
         outstanding_row_groups: Arc<AtomicUsize>,
+        shared_dictionaries: Arc<SharedDictionaries>,
     ) -> Self {
         Self {
             batch_size,
@@ -132,6 +144,7 @@ impl Decoder {
             eq_predicates,
             pending_row_groups,
             outstanding_row_groups,
+            shared_dictionaries,
         }
     }
 
@@ -157,7 +170,7 @@ impl Decoder {
         if let Some(pos) = self
             .row_group_decoders
             .iter()
-            .position(|r| r.row_group_idx() == row_group_metadata.index())
+            .position(|r| r.claim_key() == row_group_metadata.claim_key())
         {
             return Ok(pos);
         }
@@ -168,6 +181,7 @@ impl Decoder {
                 self.batch_size,
                 self.add_row_group_metadata,
                 &self.eq_predicates,
+                &self.shared_dictionaries,
             )
             .map_err(crate::parquet::op_err)?,
         );
@@ -184,7 +198,7 @@ impl Decoder {
         &mut self,
         sender: &mut dyn Sender<RecordBatch>,
     ) -> dispatch::UnaryResult<bool> {
-        let mut exhausted_row_group = None;
+        let mut exhausted_claim = None;
         let mut produced = false;
 
         let allocator = &mut self.allocator;
@@ -195,14 +209,14 @@ impl Decoder {
             {
                 sender.send(batch)?;
                 if decoder.exhausted() {
-                    exhausted_row_group = Some(decoder.row_group_idx());
+                    exhausted_claim = Some(decoder.claim_key());
                 }
                 produced = true;
                 break;
             }
         }
 
-        if let Some(row_group_idx) = exhausted_row_group {
+        if let Some(claim_key) = exhausted_claim {
             // Mark the removed row group closed, exactly like the consume path:
             // a masked row group reaches its total while trailing all-false
             // pages are still in flight, and a late page for an unclosed row
@@ -210,10 +224,10 @@ impl Decoder {
             // rows that were already emitted (and whose eventual removal would
             // release the row group's claim a second time, wrapping the claim
             // counters and wedging the scan).
-            self.closed_row_groups.insert(row_group_idx);
+            self.closed_row_groups.insert(claim_key);
             self.release_claim();
             self.row_group_decoders
-                .retain(|d| d.row_group_idx() != row_group_idx);
+                .retain(|d| d.claim_key() != claim_key);
         }
         Ok(produced)
     }
@@ -227,7 +241,7 @@ impl Unary<DecompressedPage, RecordBatch> for Decoder {
     ) -> dispatch::UnaryResult<()> {
         if self
             .closed_row_groups
-            .contains(&page.query_row_group_metadata.index())
+            .contains(&page.query_row_group_metadata.claim_key())
         {
             return Ok(());
         }
@@ -239,8 +253,8 @@ impl Unary<DecompressedPage, RecordBatch> for Decoder {
         // dictionary excludes a pushed-down equality constant). Drop it without
         // emitting, and ignore its remaining in-flight data pages.
         if self.row_group_decoders[pos].pruned() {
-            let row_group_idx = self.row_group_decoders[pos].row_group_idx();
-            self.closed_row_groups.insert(row_group_idx);
+            let claim_key = self.row_group_decoders[pos].claim_key();
+            self.closed_row_groups.insert(claim_key);
             self.row_group_decoders.remove(pos);
             self.release_claim();
             return Ok(());
@@ -252,8 +266,8 @@ impl Unary<DecompressedPage, RecordBatch> for Decoder {
             .map_err(crate::parquet::op_err)?
         {
             if self.row_group_decoders[pos].exhausted() {
-                let row_group_idx = self.row_group_decoders[pos].row_group_idx();
-                self.closed_row_groups.insert(row_group_idx);
+                let claim_key = self.row_group_decoders[pos].claim_key();
+                self.closed_row_groups.insert(claim_key);
                 self.row_group_decoders.remove(pos);
                 self.release_claim();
             }
@@ -280,7 +294,7 @@ impl Unary<DecompressedPage, RecordBatch> for Decoder {
 
 #[cfg(test)]
 mod tests {
-    use crate::parquet::reading::decoding::{Decoder, ScanEqualityPredicate};
+    use crate::parquet::reading::decoding::{Decoder, ScanEqualityPredicate, SharedDictionaries};
     use crate::parquet::types::metadata::{
         ColumnChunkMeta, QueryRowGroupMetadata, RowGroupMetadata,
     };
@@ -317,6 +331,12 @@ mod tests {
             num_rows,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            page_directories: Arc::new(
+                crate::parquet::types::page_directory::RowGroupPageDirectory::new(num_cols),
+            ),
+            decode_checkpoints: Arc::new(
+                crate::parquet::types::page_directory::RowGroupCheckpoints::new(num_cols),
+            ),
         })]))
     }
 
@@ -403,6 +423,12 @@ mod tests {
             num_rows,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            page_directories: Arc::new(
+                crate::parquet::types::page_directory::RowGroupPageDirectory::new(2),
+            ),
+            decode_checkpoints: Arc::new(
+                crate::parquet::types::page_directory::RowGroupCheckpoints::new(2),
+            ),
         })]))
     }
 
@@ -477,6 +503,7 @@ mod tests {
             // assertion.
             Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX / 2)),
             Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX / 2)),
+            Arc::new(SharedDictionaries::new()),
         )
     }
 
@@ -489,6 +516,7 @@ mod tests {
             // The claim-release counters; seeded like `new_decoder`'s.
             Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX / 2)),
             Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX / 2)),
+            Arc::new(SharedDictionaries::new()),
         )
     }
 

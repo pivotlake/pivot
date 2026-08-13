@@ -8,10 +8,12 @@
 //! the byte-level layout of an individual column chunk needed by the
 //! decompressor to locate pages on disk.
 
+use crate::parquet::types::page_directory::{RowGroupCheckpoints, RowGroupPageDirectory};
 use crate::parquet::types::table::ParquetTable;
 use arrow_array::{ArrayRef, Scalar};
 use arrow_schema::SchemaRef;
 use dispatch::io::OpenFile;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -90,6 +92,18 @@ pub struct RowGroupMetadata {
     /// repeated scan consumes what's already decompressed before its own churn
     /// can evict it.
     pub live_decompressed_pages: Arc<AtomicUsize>,
+    /// Where each leaf chunk's data pages begin, filled in by the first scan
+    /// that reads them. A leaf with a directory can be decoded starting at any
+    /// row, which is what lets a later scan cut this row group into row ranges
+    /// and decode them on separate workers instead of on the one that claimed
+    /// it. Empty until then, and never required for correctness.
+    pub page_directories: Arc<RowGroupPageDirectory>,
+    /// Where each leaf chunk's decode stood at the rows a previous scan emitted
+    /// batches at, filled in by the first scan that decoded this row group
+    /// whole. A split resumes from the recorded position nearest its first row
+    /// instead of decoding its way there. Holds only plain numbers, so unlike a
+    /// built dictionary it pins no buffers.
+    pub decode_checkpoints: Arc<RowGroupCheckpoints>,
 }
 
 impl RowGroupMetadata {
@@ -131,6 +145,15 @@ pub struct QueryRowGroupMetadata {
     /// constant), letting the decompressor skip the remaining, not-yet-touched
     /// pages instead of decompressing them only for the decoder to discard.
     pruned: Arc<AtomicBool>,
+    /// The rows of the row group this claim reads, when the scan cut the row
+    /// group into ranges to decode in parallel; `None` reads all of it. The
+    /// bounds count every row, filtered or not, so they address the file the
+    /// same way the page directory does.
+    row_range: Option<Range<usize>>,
+    /// Distinguishes this claim from the other claims on the same row group.
+    /// Whoever routes or books a claim keys on it together with the row-group
+    /// index, since a split row group has several claims in flight at once.
+    split_idx: usize,
 }
 
 impl QueryRowGroupMetadata {
@@ -140,7 +163,44 @@ impl QueryRowGroupMetadata {
             filtered_indices,
             row_group_index: index,
             pruned: Arc::new(AtomicBool::new(false)),
+            row_range: None,
+            split_idx: 0,
         }
+    }
+
+    /// A claim on just `rows` of this row group, numbered `split_idx` among
+    /// the claims the row group was cut into.
+    ///
+    /// Each split carries its own pruned flag rather than sharing one: the
+    /// flag closes the pages of whoever observes it, and a split must not
+    /// close another split's.
+    pub fn split(&self, rows: Range<usize>, split_idx: usize) -> Self {
+        Self {
+            row_group_metadata: self.row_group_metadata.clone(),
+            filtered_indices: self.filtered_indices.clone(),
+            row_group_index: self.row_group_index,
+            pruned: Arc::new(AtomicBool::new(false)),
+            row_range: Some(rows),
+            split_idx,
+        }
+    }
+
+    /// The rows this claim reads, defaulting to the whole row group.
+    pub fn row_range(&self) -> Range<usize> {
+        self.row_range
+            .clone()
+            .unwrap_or(0..self.row_group_metadata.num_rows as usize)
+    }
+
+    /// Whether this claim reads only part of its row group.
+    pub fn is_split(&self) -> bool {
+        self.row_range.is_some()
+    }
+
+    /// Identifies this claim among all claims in flight. A split row group has
+    /// several, so the row-group index alone does not separate them.
+    pub fn claim_key(&self) -> (usize, usize) {
+        (self.row_group_index, self.split_idx)
     }
 
     /// Whether this row group has been pruned (no row can match a pushed-down

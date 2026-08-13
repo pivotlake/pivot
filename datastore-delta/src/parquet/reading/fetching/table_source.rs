@@ -17,6 +17,7 @@
 //! remote for a later query).
 
 use crate::parquet::RowGroupRequest;
+use crate::parquet::types::leaves::projected_leaves;
 use crate::parquet::types::metadata::{QueryRowGroupMetadata, RowGroupMetadata};
 use crate::parquet::types::projection::Projection;
 use crate::parquet::types::table::ParquetTable;
@@ -25,6 +26,7 @@ use crossbeam_deque::{Injector, Steal};
 use dispatch::{Receiver, RootChannelFactory};
 use std::cmp::{Ordering as CmpOrdering, Reverse};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -241,9 +243,33 @@ impl RowGroupInjectorFactory {
                 remaining: AtomicUsize::new(order.len()),
             })
         });
+        let mut claims = 0;
         for row_group_idx in order {
             let node = affinity_node(&table.row_groups[row_group_idx], node_count);
-            row_group_queues[node].push(QueryRowGroupMetadata::new(table, row_group_idx, None));
+            let row_group = QueryRowGroupMetadata::new(table, row_group_idx, None);
+            // A Top-N scan is handed out most-promising-first so its boundary
+            // converges and prunes the rest; splitting would interleave halves
+            // of one row group into that order and dilute it, so those scans
+            // keep claiming whole row groups.
+            let splits = match speculation {
+                Some(_) => Vec::new(),
+                None => plan_splits(&row_group, &projection),
+            };
+            if splits.is_empty() {
+                claims += 1;
+                row_group_queues[node].push(row_group.clone());
+                continue;
+            }
+            for (idx, rows) in splits.into_iter().enumerate() {
+                claims += 1;
+                row_group_queues[node].push(row_group.split(rows, idx));
+            }
+        }
+        // The gate counts claims, and splitting turns one row group into
+        // several; seeding it with the row-group count would leave it waiting
+        // on claims that never come.
+        if let Some(gate) = &speculation {
+            gate.remaining.store(claims, Ordering::Relaxed);
         }
         Self {
             row_group_queues,
@@ -252,6 +278,127 @@ impl RowGroupInjectorFactory {
             speculation,
         }
     }
+}
+
+/// Rows a single claim aims to cover once a row group is split.
+///
+/// Large enough that the per-claim overhead (each split rebuilds the chunk's
+/// dictionary, since a dictionary is needed by whoever reads any of its rows)
+/// stays small against the decode it enables in parallel, and small enough that
+/// no one claim sets the scan's critical path.
+const SPLIT_TARGET_ROWS: usize = 262_144;
+
+/// Projected compressed bytes a row group must carry before splitting it pays
+/// for the extra claims.
+const SPLIT_MIN_BYTES: usize = 4 << 20;
+
+fn split_min_bytes() -> usize {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("PIVOT_SPLIT_MIN_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(SPLIT_MIN_BYTES)
+    })
+}
+
+fn split_target_rows() -> usize {
+    static TARGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TARGET.get_or_init(|| {
+        std::env::var("PIVOT_SPLIT_TARGET_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&rows| rows > 0)
+            .unwrap_or(SPLIT_TARGET_ROWS)
+    })
+}
+
+/// How the row groups of a scan are cut into claims.
+///
+/// A row group's decode is sequential within a claim and pinned to the worker
+/// that made it, so a scan's wall time is the makespan of placing its claims on
+/// workers - and one oversized row group sets that critical path however many
+/// workers are idle behind it. Cutting it into row ranges evens the claims out.
+///
+/// Returns the ranges to claim, or empty to claim the row group whole. Cutting
+/// needs somewhere to restart each projected chunk part way through, so this is
+/// empty until a first scan has recorded that; the cuts then land on the rows it
+/// recorded positions at, which every column shares, so each split resumes all
+/// of its columns exactly with no rows left to skip.
+fn plan_splits(row_group: &QueryRowGroupMetadata, projection: &Projection) -> Vec<Range<usize>> {
+    let num_rows = row_group.num_rows() as usize;
+    let target = split_target_rows();
+    if num_rows <= target {
+        return Vec::new();
+    }
+    let metadata = row_group.get_metadata();
+    let fields = metadata.schema.fields();
+    let leaves = projected_leaves(fields, row_group, projection);
+    if leaves.is_empty() {
+        return Vec::new();
+    }
+    // Each extra claim costs a fetch request, an indexer pass over its pages and
+    // a decoder to set up, all roughly fixed. Splitting only pays when the
+    // decode it divides is large next to that, and the projected compressed
+    // bytes are the best measure of it on hand: a scan reading one narrow column
+    // spends more on the extra claims than it saves.
+    let projected_bytes: i64 = leaves
+        .iter()
+        .map(|&leaf| metadata.columns[leaf].total_compressed_size)
+        .sum();
+    if (projected_bytes as usize) < split_min_bytes() {
+        return Vec::new();
+    }
+    // Every projected leaf needs both a page directory (to know which pages a
+    // split reads) and recorded positions (to enter them without decoding the
+    // rows before). A leaf missing either cannot be entered part way through, so
+    // the row group reads whole.
+    if !leaves.iter().all(|&leaf| {
+        metadata.page_directories.get(leaf).is_some()
+            && metadata
+                .decode_checkpoints
+                .get(leaf)
+                .is_some_and(|points| !points.is_empty())
+    }) {
+        return Vec::new();
+    }
+    let recorded: Vec<usize> = metadata
+        .decode_checkpoints
+        .get(leaves[0])
+        .expect("just checked every projected leaf has recorded positions")
+        .rows()
+        .collect();
+    recorded_ranges(num_rows, num_rows.div_ceil(target), &recorded)
+}
+
+/// Cuts `num_rows` into about `splits` ranges, each starting on one of the
+/// `recorded` rows. Cuts that collapse onto the same recorded row drop out, so
+/// the result can be shorter than `splits`, and is empty when they all collapse.
+fn recorded_ranges(num_rows: usize, splits: usize, recorded: &[usize]) -> Vec<Range<usize>> {
+    let nearest = |row: usize| match recorded.binary_search(&row) {
+        Ok(exact) => recorded[exact],
+        Err(0) => recorded[0],
+        Err(after) if after == recorded.len() => recorded[after - 1],
+        // Round to whichever recorded row is closer, so cutting perturbs the
+        // requested split as little as possible and the ranges stay even.
+        Err(after) => {
+            let (before, at) = (recorded[after - 1], recorded[after]);
+            if at - row < row - before { at } else { before }
+        }
+    };
+    let mut cuts: Vec<usize> = (1..splits)
+        .map(|idx| nearest(num_rows * idx / splits))
+        .collect();
+    cuts.insert(0, 0);
+    cuts.dedup();
+    if cuts.len() < 2 {
+        return Vec::new();
+    }
+    cuts.push(num_rows);
+    cuts.windows(2)
+        .filter(|w| w[0] < w[1])
+        .map(|w| w[0]..w[1])
+        .collect()
 }
 
 impl RootChannelFactory<RowGroupRequest> for RowGroupInjectorFactory {
@@ -503,7 +650,48 @@ mod tests {
             num_rows: 0,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
+            page_directories: Arc::new(
+                crate::parquet::types::page_directory::RowGroupPageDirectory::new(1),
+            ),
+            decode_checkpoints: Arc::new(
+                crate::parquet::types::page_directory::RowGroupCheckpoints::new(1),
+            ),
         })
+    }
+
+    /// Rows a scan recorded a decode position at, every `stride` rows.
+    fn recorded(num_rows: usize, stride: usize) -> Vec<usize> {
+        (0..num_rows).step_by(stride).collect()
+    }
+
+    /// Splits start on rows a previous scan recorded a position at, so each
+    /// resumes its columns exactly; together they cover every row once.
+    #[test]
+    fn recorded_ranges_cut_on_recorded_rows_and_cover_every_row() {
+        let rows = recorded(1000, 100);
+
+        let ranges = recorded_ranges(1000, 4, &rows);
+
+        // The cuts asked for are 250/500/750; the first and last sit midway
+        // between two recorded rows and round down.
+        assert_eq!(ranges, vec![0..200, 200..500, 500..700, 700..1000]);
+        assert!(ranges.iter().all(|r| rows.contains(&r.start)));
+    }
+
+    /// Positions recorded more coarsely than a split collapse neighbouring cuts
+    /// onto one row; the duplicates drop rather than producing empty claims.
+    #[test]
+    fn recorded_ranges_drop_cuts_that_collapse_together() {
+        let ranges = recorded_ranges(1000, 4, &[0, 600]);
+
+        assert_eq!(ranges, vec![0..600, 600..1000]);
+    }
+
+    /// A single recorded row offers nowhere to cut, so the row group stays
+    /// whole rather than being split where every column would have to skip.
+    #[test]
+    fn recorded_ranges_are_empty_without_an_interior_cut() {
+        assert!(recorded_ranges(1000, 4, &[0]).is_empty());
     }
 
     #[test]

@@ -6,6 +6,7 @@
 //! `RowGroupMetadata` entries with globally unique row-group indices.
 
 use crate::parquet::types::metadata::{ColumnChunkMeta, ColumnStatistics, RowGroupMetadata};
+use crate::parquet::types::page_directory::{RowGroupCheckpoints, RowGroupPageDirectory};
 use crate::parquet::types::thrift::footer::{FileMetaData, PageEncodingStats, Statistics};
 use crate::parquet::types::thrift::general::{Encoding, PageType};
 use crate::parquet::types::thrift::parquet_thrift::{ReadThrift, ThriftSliceInputProtocol};
@@ -200,7 +201,7 @@ pub(crate) fn row_groups_from_metadata(
                 )));
             }
             let num_rows = rg.num_rows;
-            let columns = rg
+            let columns: Vec<ColumnChunkMeta> = rg
                 .columns
                 .into_iter()
                 .enumerate()
@@ -224,6 +225,8 @@ pub(crate) fn row_groups_from_metadata(
                     }
                 })
                 .collect();
+            let page_directories = Arc::new(RowGroupPageDirectory::new(columns.len()));
+            let decode_checkpoints = Arc::new(RowGroupCheckpoints::new(columns.len()));
             Ok(RowGroupMetadata {
                 open_file: open_file.clone(),
                 schema: schema.clone(),
@@ -231,6 +234,8 @@ pub(crate) fn row_groups_from_metadata(
                 num_rows,
                 file_row_group_idx: i,
                 live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
+                page_directories,
+                decode_checkpoints,
             })
         })
         .collect::<Result<_>>()?;

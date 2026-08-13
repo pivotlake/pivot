@@ -253,6 +253,13 @@ where
         let mut reader = MultiBufferReader::new(&self.data, &mut self.position);
         reader.skip(size * T::Native::PHYSICAL_SIZE);
     }
+
+    fn byte_offset(&self) -> usize {
+        crate::parquet::reading::decoding::leaf_decoders::resume::logical_offset(
+            &self.data,
+            self.position,
+        )
+    }
 }
 
 /// [`Dict`] implementation for fixed-width primitives, generic over the

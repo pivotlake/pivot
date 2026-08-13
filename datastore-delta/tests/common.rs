@@ -142,6 +142,33 @@ pub fn commit_datastore_transaction(
         .block_on(transaction.commit())
 }
 
+/// Like [`parquet_table`] but capping how many rows a data page holds, so the
+/// written chunks span many small pages instead of a few large ones.
+pub fn parquet_table_with_page_rows(
+    dispatch: &DispatchGuard,
+    batches: &[RecordBatch],
+    dictionary: bool,
+    page_rows: usize,
+) -> (TempDir, Arc<ParquetTable>) {
+    let dir = TempDir::new().unwrap();
+    let schema = batches[0].schema();
+    let path = dir.path().join("data.parquet");
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_dictionary_enabled(dictionary)
+        .set_data_page_row_count_limit(page_rows)
+        .build();
+    let mut writer =
+        ArrowWriter::try_new(std::fs::File::create(&path).unwrap(), schema, Some(props)).unwrap();
+    for batch in batches {
+        writer.write(batch).unwrap();
+    }
+    writer.close().unwrap();
+
+    let table = parquet_table_from_dir(dispatch, dir.path());
+    (dir, table)
+}
+
 pub fn parquet_table(
     dispatch: &DispatchGuard,
     batches: &[RecordBatch],

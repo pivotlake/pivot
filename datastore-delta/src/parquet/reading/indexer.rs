@@ -26,6 +26,7 @@
 use crate::parquet::types::filter_mask::FilterMask;
 use crate::parquet::types::metadata::QueryRowGroupMetadata;
 use crate::parquet::types::page::CompressedPage;
+use crate::parquet::types::page_directory::{ColumnPageDirectory, PageEntry};
 use crate::parquet::types::requests::{ColumnPart, RowGroupBuffer};
 use crate::parquet::types::thrift::general::PageType;
 use crate::parquet::types::thrift::headers::PageHeader;
@@ -35,6 +36,7 @@ use dispatch::DefaultUnaryFactory;
 use dispatch::Sender;
 use dispatch::Unary;
 use dispatch::memory::{MultiBufferReader, ReaderPosition};
+use std::ops::Range;
 
 pub type IndexerFactory = DefaultUnaryFactory<Indexer>;
 
@@ -46,6 +48,11 @@ pub struct Indexer {}
 /// their rows) have been emitted so far. Threaded across all of a column's parts
 /// so `page_idx` and filter-mask row offsets stay continuous regardless of which
 /// parts came pre-resolved from the decompressed cache.
+///
+/// A split claim starts the cursor at the first row its own pages hold, so the
+/// row offsets stay absolute within the row group (which is what filter masks
+/// and the page directory are expressed in) while `data_page_idx` restarts at
+/// zero, because each split's decoder numbers its pages from its own first one.
 #[derive(Default)]
 struct PageCursor {
     data_page_idx: usize,
@@ -81,6 +88,13 @@ struct ColumnPageBuilder {
     query_row_group_metadata: QueryRowGroupMetadata,
     worker_id: usize,
     cursor: PageCursor,
+    /// Every data page walked so far, in file order, for the page directory
+    /// this column's walk records. Collected unconditionally — the walk has the
+    /// offsets and row counts in hand either way — and discarded by the caller
+    /// when the walk covered only part of the chunk.
+    entries: Vec<PageEntry>,
+    /// The dictionary page's byte range, once one has been walked.
+    dictionary: Option<Range<usize>>,
 }
 
 impl ColumnPageBuilder {
@@ -94,6 +108,16 @@ impl ColumnPageBuilder {
         payload: PagePayload,
     ) -> CompressedPage {
         let (page_idx, row_offset) = self.cursor.advance(&header);
+        match header.r#type {
+            PageType::DATA_PAGE => self.entries.push(PageEntry {
+                file_offset,
+                span,
+                first_row: row_offset as usize,
+                num_rows: header.data_page_num_values() as usize,
+            }),
+            PageType::DICTIONARY_PAGE => self.dictionary = Some(file_offset..file_offset + span),
+            _ => {}
+        }
         let filter_mask = (header.r#type == PageType::DATA_PAGE)
             .then(|| {
                 self.query_row_group_metadata
@@ -172,17 +196,34 @@ impl ColumnPageBuilder {
 }
 
 /// Build one column's pages, in file order, from its resolved parts.
+///
+/// `first_row` is the row its first data page starts on, which is zero unless
+/// this claim reads a later slice of the row group. When the walk covered the
+/// whole chunk it also records the chunk's page directory, so the next scan of
+/// this row group can start decoding at an arbitrary row.
 fn build_column_pages(
     col_idx: usize,
     query_row_group_metadata: QueryRowGroupMetadata,
     parts: Vec<ColumnPart>,
     worker_id: usize,
+    first_row: usize,
+    leaf: usize,
 ) -> Result<Vec<CompressedPage>, ParquetError> {
+    let covers_whole_chunk = !query_row_group_metadata.is_split();
+    let directories = query_row_group_metadata
+        .get_metadata()
+        .page_directories
+        .clone();
     let mut builder = ColumnPageBuilder {
         col_idx,
         query_row_group_metadata,
         worker_id,
-        cursor: PageCursor::default(),
+        cursor: PageCursor {
+            data_page_idx: 0,
+            row_offset: first_row as u32,
+        },
+        entries: Vec::with_capacity(128),
+        dictionary: None,
     };
     let mut pages = Vec::with_capacity(128);
     for part in parts {
@@ -203,6 +244,12 @@ fn build_column_pages(
             )),
         }
     }
+    if covers_whole_chunk {
+        directories.record(
+            leaf,
+            ColumnPageDirectory::new(builder.entries, builder.dictionary),
+        );
+    }
     Ok(pages)
 }
 
@@ -217,7 +264,14 @@ impl Unary<RowGroupBuffer, CompressedPage> for Indexer {
             .into_iter()
             .enumerate()
             .map(|(col_idx, parts)| {
-                build_column_pages(col_idx, buffer.metadata.clone(), parts, buffer.worker_id)
+                build_column_pages(
+                    col_idx,
+                    buffer.metadata.clone(),
+                    parts,
+                    buffer.worker_id,
+                    buffer.first_rows[col_idx],
+                    buffer.leaves[col_idx],
+                )
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(crate::parquet::op_err)?;
@@ -338,11 +392,92 @@ mod tests {
         columns: Vec<Vec<ColumnPart>>,
         filtered_indices: Option<Vec<u32>>,
     ) -> RowGroupBuffer {
+        let leaves = (0..columns.len()).collect();
+        let first_rows = vec![0; columns.len()];
         RowGroupBuffer {
             metadata: dummy_metadata(filtered_indices),
             columns,
             worker_id: 0,
+            leaves,
+            first_rows,
         }
+    }
+
+    /// A row group whose page directory has room for `columns` leaves, so the
+    /// indexer's recording has somewhere to land (the shared dummy carries no
+    /// columns and therefore no slots).
+    fn metadata_recording_directories(columns: usize) -> QueryRowGroupMetadata {
+        use crate::parquet::test_utils::dummy_row_group;
+        use crate::parquet::types::metadata::RowGroupMetadata;
+        use crate::parquet::types::page_directory::RowGroupPageDirectory;
+        use crate::parquet::types::table::ParquetTable;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        let dummy = dummy_row_group();
+        let table = ParquetTable::new(vec![Arc::new(RowGroupMetadata {
+            open_file: dummy.open_file.clone(),
+            schema: dummy.schema.clone(),
+            columns: Vec::new(),
+            num_rows: 0,
+            file_row_group_idx: 0,
+            live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
+            page_directories: Arc::new(RowGroupPageDirectory::new(columns)),
+            decode_checkpoints: Arc::new(
+                crate::parquet::types::page_directory::RowGroupCheckpoints::new(columns),
+            ),
+        })]);
+        QueryRowGroupMetadata::new(&table, 0, None)
+    }
+
+    /// Walking a whole chunk records where each of its data pages begins, which
+    /// is what lets a later scan enter the chunk at an arbitrary row. Dictionary
+    /// pages hold no rows, so they take no directory entry.
+    #[test]
+    fn test_walking_a_chunk_records_its_page_directory() {
+        let col = make_column_buffer(&[
+            (dict_page_header(3, 1), vec![0xDD]),
+            (data_page_header(10, 2), vec![0xA0, 0xA0]),
+            (data_page_header(7, 3), vec![0xA1, 0xA1, 0xA1]),
+        ]);
+        let metadata = metadata_recording_directories(1);
+        let buffer = RowGroupBuffer {
+            metadata: metadata.clone(),
+            columns: vec![col],
+            worker_id: 0,
+            leaves: vec![0],
+            first_rows: vec![0],
+        };
+
+        run_unary(Indexer {}, vec![buffer]);
+
+        let directories = &metadata.get_metadata().page_directories;
+        let directory = directories.get(0).expect("a whole-chunk walk records one");
+        assert_eq!(directory.page_count(), 2);
+        assert_eq!(directory.num_rows(), 17);
+        assert_eq!(directory.first_row_of(0), 0);
+        assert_eq!(directory.first_row_of(1), 10);
+        assert_eq!(directory.skip_into_page(12), 2);
+        assert!(directory.dictionary_span().is_some());
+    }
+
+    /// A split walks only part of a chunk, so what it sees is not the chunk's
+    /// directory and must not be recorded as one.
+    #[test]
+    fn test_a_split_does_not_record_a_page_directory() {
+        let col = make_column_buffer(&[(data_page_header(10, 2), vec![0xA0, 0xA0])]);
+        let metadata = metadata_recording_directories(1).split(5..10, 1);
+        let buffer = RowGroupBuffer {
+            metadata: metadata.clone(),
+            columns: vec![col],
+            worker_id: 0,
+            leaves: vec![0],
+            first_rows: vec![0],
+        };
+
+        run_unary(Indexer {}, vec![buffer]);
+
+        assert!(metadata.get_metadata().page_directories.get(0).is_none());
     }
 
     /// Single data page → 1 CompressedPage with correct column_idx, page_idx, and payload.

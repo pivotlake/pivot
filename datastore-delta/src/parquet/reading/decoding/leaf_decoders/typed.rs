@@ -15,11 +15,13 @@
 //! parameters.
 
 use crate::parquet::reading::decoding::leaf_decoders::levels::decode_def_levels;
-use crate::parquet::reading::decoding::leaf_decoders::rle::RleDecoder;
+use crate::parquet::reading::decoding::leaf_decoders::resume::{PageCheckpoint, position_at};
+use crate::parquet::reading::decoding::leaf_decoders::rle::{RleDecoder, Run};
 use crate::parquet::reading::decoding::leaf_decoders::{
     ArrayBuilder, DecodeDelta, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error,
     LeafDecoder, Result,
 };
+use crate::parquet::reading::decoding::shared_dictionary::{ChunkKey, SharedDictionaries};
 use crate::parquet::types::filter_mask::RunningFilterMask;
 use crate::parquet::types::page::{DataPage, DecompressedPage, DecompressedPageType};
 use crate::parquet::types::thrift::general::Encoding;
@@ -29,6 +31,7 @@ use bytes::Bytes;
 use dispatch::arrays::ValidityBuilder;
 use dispatch::memory::{MultiBufferReader, ReaderPosition, SlabAllocator};
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 /// Which encoding strategy to use for a data page's values.
 pub enum ValueDecoder<P: DecodePlain> {
@@ -61,6 +64,18 @@ fn skip_run<P: DecodePlain>(decoder: &mut ValueDecoder<P>, n: usize) {
         ValueDecoder::Plain(p) => p.skip(n),
         ValueDecoder::Rle(r) => r.skip(n),
         ValueDecoder::Delta(d) => d.skip(n),
+    }
+}
+
+/// Where `decoder` stands in its page: the byte the next value starts at, and
+/// the run it is part way through. `None` for a delta stream, whose every value
+/// is relative to the one before it, so no position short of the page's start
+/// can be resumed from.
+fn snapshot_decoder<P: DecodePlain>(decoder: &ValueDecoder<P>) -> Option<(usize, Option<Run>)> {
+    match decoder {
+        ValueDecoder::Plain(p) => Some((p.byte_offset(), None)),
+        ValueDecoder::Rle(r) => Some(r.state()),
+        ValueDecoder::Delta(_) => None,
     }
 }
 
@@ -194,6 +209,48 @@ impl<P: DecodePlain> ReadPage<P> {
         }
         self.remaining -= builder.len() - start_len;
     }
+
+    /// Where this page's decode stands, for a checkpoint. `None` when the
+    /// encoding cannot be resumed part way through a page.
+    fn snapshot(&self) -> Option<(usize, Option<Run>)> {
+        // A filtered page's mask cursor is query state with nowhere to live in a
+        // cached checkpoint, and a filtered scan is never split, so no
+        // checkpoint is offered for one.
+        if self.running_filter_mask_opt.is_some() {
+            return None;
+        }
+        snapshot_decoder(&self.decoder)
+    }
+
+    /// Advances past `n` of this page's rows without decoding them.
+    ///
+    /// Used to drop the rows ahead of a split's first row inside the page that
+    /// holds it. Only reached on an unfiltered read, since a filtered scan is
+    /// never split, so there is no mask cursor to keep in step here.
+    fn skip_rows(&mut self, n: usize) {
+        debug_assert!(
+            self.running_filter_mask_opt.is_none(),
+            "a filtered page is never split, so skipping past its rows would \
+             desynchronize the mask cursor"
+        );
+        match self.def_levels.as_mut() {
+            // Only present rows have a value in the stream, so a nullable page
+            // advances the value decoder by the present count of each run
+            // while the level cursor walks every row.
+            Some(def) => {
+                let mut left = n;
+                while left > 0 {
+                    let (present, run) = def.next_run(left);
+                    if present {
+                        skip_run(&mut self.decoder, run);
+                    }
+                    left -= run;
+                }
+            }
+            None => skip_run(&mut self.decoder, n),
+        }
+        self.remaining -= n;
+    }
 }
 
 /// Tracks whether a page slot holds decodable data or was fully filtered out.
@@ -248,7 +305,14 @@ where
     /// The page currently being consumed, if any.
     read_page: Option<ReadPage<P>>,
     /// Dictionary built from a dictionary page, if one has been received.
-    dict: Option<DictStorage<DC, DS>>,
+    /// Shared with the other claims on this chunk, so splitting a row group
+    /// builds it once rather than once per split.
+    dict: Option<Arc<DictStorage<DC, DS>>>,
+    /// Where to look for (and publish) this chunk's shared dictionary. Absent
+    /// when the scan does not share them - a pushed equality constant makes a
+    /// decoder install a deliberately empty dictionary when it prunes, and that
+    /// must never reach another reader.
+    shared_dict: Option<(Arc<SharedDictionaries>, ChunkKey)>,
     /// The pushed-down equality constant, in this dictionary flavour's own
     /// representation (see [`Dict::EqConstant`]). Drives row-group pruning
     /// and scan-side batch filtering once the dictionary is built.
@@ -257,6 +321,15 @@ where
     /// [`Self::eq_const`]. Stays `false` until a dictionary page proves the
     /// constant absent.
     dict_excludes_eq_constant: bool,
+    /// Rows still to be discarded before the first one is emitted: the overhang
+    /// between the start of this split's first page and the first row it owes.
+    /// Zero for a decoder that reads its chunk from the beginning.
+    pending_skip: usize,
+    /// A recorded position to enter the chunk at, and how many of that page's
+    /// rows precede it, applied once the page arrives. Held rather than applied
+    /// on the spot because a split's decoder is built before any of its pages
+    /// have been fetched.
+    pending_resume: Option<(PageCheckpoint, usize)>,
     phantom_data: PhantomData<B>,
 }
 
@@ -276,10 +349,35 @@ where
             max_def_level,
             read_page: None,
             dict: None,
+            shared_dict: None,
             eq_const: None,
             dict_excludes_eq_constant: false,
+            pending_skip: 0,
+            pending_resume: None,
             phantom_data: Default::default(),
         }
+    }
+
+    /// Discards the rows still pending a skip, walking pages as needed.
+    ///
+    /// Stops early when the pages holding them have not arrived yet; the next
+    /// call resumes where this one stopped, so the skip is spread over however
+    /// many calls it takes for the pages to show up.
+    fn drain_pending_skip(&mut self) -> Result<()> {
+        while self.pending_skip > 0 {
+            if self.read_page.is_none() && self.create_next_read_page()?.is_none() {
+                return Ok(());
+            }
+            let read_page = self.read_page.as_mut().expect("a page was just prepared");
+            let skipped = self.pending_skip.min(read_page.remaining);
+            read_page.skip_rows(skipped);
+            self.pending_skip -= skipped;
+            if read_page.remaining == 0 {
+                self.read_page = None;
+                self.page_idx += 1;
+            }
+        }
+        Ok(())
     }
 
     /// Selects the appropriate [`ValueDecoder`] (plain, RLE-dictionary, or
@@ -313,11 +411,133 @@ where
         }
     }
 
+    /// Builds the value decoder for a page whose decode is resuming part way
+    /// through, at the byte `checkpoint` recorded for it.
+    ///
+    /// The encoding's own header still has to be read from the page's start —
+    /// the RLE bit width is the payload's first byte — but nothing else is
+    /// decoded, so reaching an arbitrary value costs a header read rather than a
+    /// walk over every value before it.
+    fn resume_decoder(
+        &self,
+        header: DataPageHeader,
+        data: Vec<Bytes>,
+        payload_start: ReaderPosition,
+        checkpoint: PageCheckpoint,
+    ) -> Result<ValueDecoder<P>> {
+        let at = position_at(&data, checkpoint.byte_offset);
+        match header.encoding {
+            Encoding::PLAIN => Ok(ValueDecoder::Plain(P::new(data, at))),
+            Encoding::RLE_DICTIONARY | Encoding::PLAIN_DICTIONARY => {
+                if self.dict.is_none() {
+                    return Err(Error::NoPagesReady);
+                }
+                let mut header_position = payload_start;
+                let bit_width = {
+                    let mut reader = MultiBufferReader::new(&data, &mut header_position);
+                    reader.read_u8()
+                };
+                Ok(ValueDecoder::Rle(RleDecoder::resume(
+                    data,
+                    at,
+                    bit_width,
+                    checkpoint.run,
+                )))
+            }
+            // A checkpoint is only ever recorded for an encoding that can be
+            // resumed, so reaching this means one was recorded against a
+            // different page than it was taken from.
+            other => Err(Error::UnsupportedEncoding(other)),
+        }
+    }
+
+    /// Decodes a nullable page's definition levels, advancing `position` past
+    /// them to where the values begin. `None` for a required column, which has
+    /// no level prefix and takes the faster non-null read path.
+    fn read_def_levels(
+        &self,
+        page: &DataPage,
+        position: &mut ReaderPosition,
+        num_values: usize,
+    ) -> Option<Vec<bool>> {
+        if self.max_def_level == 0 {
+            return None;
+        }
+        let mut reader = MultiBufferReader::new(&page.data, position);
+        let def_level_byte_len = reader.read_u32_le() as usize;
+        decode_def_levels(
+            &mut reader,
+            num_values,
+            def_level_byte_len,
+            self.max_def_level,
+        )
+    }
+
+    /// Rows that will be consumed before any are emitted: those a pending skip
+    /// drops, plus those preceding a recorded position not yet applied.
+    fn withheld(&self) -> usize {
+        self.pending_skip
+            + self
+                .pending_resume
+                .map(|(_, rows_into_page)| rows_into_page)
+                .unwrap_or(0)
+    }
+
+    /// Places the decoder at `checkpoint`, so the next row it reads is the one
+    /// the checkpoint was taken at.
+    ///
+    /// `rows_into_page` is how many of the page's rows precede that row: the
+    /// count its definition levels have to be wound forward by, and what its
+    /// remaining-row count is reduced by. The levels themselves are re-decoded
+    /// from the page's start, which is cheap next to decoding the values.
+    fn resume_at(&mut self, checkpoint: PageCheckpoint, rows_into_page: usize) -> Result<()> {
+        let Some(PageSlot::Data(page)) = self
+            .pages
+            .get_mut(checkpoint.page_idx)
+            .and_then(Option::take)
+        else {
+            return Err(Error::NoPagesReady);
+        };
+        self.page_idx = checkpoint.page_idx;
+        self.pending_resume = None;
+
+        let mut position = ReaderPosition::default();
+        let num_values = page.header.num_values as usize;
+        let def_levels = self
+            .read_def_levels(&page, &mut position, num_values)
+            .map(|present| DefLevels {
+                present,
+                pos: rows_into_page,
+            });
+        let remaining = page.rows().saturating_sub(rows_into_page);
+
+        self.read_page = Some(ReadPage {
+            decoder: self.resume_decoder(page.header, page.data, position, checkpoint)?,
+            // A filtered scan is never resumed from a checkpoint, so there is no
+            // mask cursor to wind forward alongside the value stream.
+            running_filter_mask_opt: None,
+            remaining,
+            def_levels,
+        });
+        Ok(())
+    }
+
     /// Advances to the next buffered data page and prepares it for reading.
     ///
     /// Skipped pages are silently stepped over. Returns `Ok(None)` when there
     /// are no more pages to consume.
     fn create_next_read_page(&mut self) -> Result<Option<()>> {
+        // A parked resume applies to the page it names, entering it at the
+        // recorded byte instead of at its start.
+        if let Some((checkpoint, rows_into_page)) = self.pending_resume
+            && checkpoint.page_idx == self.page_idx
+        {
+            if self.page_idx >= self.pages.len() {
+                return Ok(None);
+            }
+            self.resume_at(checkpoint, rows_into_page)?;
+            return Ok(Some(()));
+        }
         if self.page_idx >= self.pages.len() {
             return Ok(None);
         }
@@ -342,19 +562,9 @@ where
         // A nullable column's pages prefix the values with definition levels;
         // decode them (advancing `position` past them). An all-present page
         // yields `None` and decodes by the fast, non-null path below.
-        let def_levels = if self.max_def_level > 0 {
-            let mut reader = MultiBufferReader::new(&page.data, &mut position);
-            let def_level_byte_len = reader.read_u32_le() as usize;
-            decode_def_levels(
-                &mut reader,
-                num_values,
-                def_level_byte_len,
-                self.max_def_level,
-            )
-            .map(|present| DefLevels { present, pos: 0 })
-        } else {
-            None
-        };
+        let def_levels = self
+            .read_def_levels(&page, &mut position, num_values)
+            .map(|present| DefLevels { present, pos: 0 });
 
         self.read_page = Some(ReadPage {
             decoder: self.create_decoder(page.header, page.data, position)?,
@@ -369,8 +579,13 @@ where
 
 impl<DC, DS, B, P> LeafDecoder for TypedLeafDecoder<DC, DS, B, P>
 where
-    DC: DictFromBytes<Builder = B, Item = B::Element>,
-    DS: DictFromVecBytes<Builder = B, Item = B::Element, EqConstant = DC::EqConstant>,
+    // `Send + Sync + 'static` is what lets a built dictionary be handed to the
+    // sibling claims decoding other row ranges of the same chunk.
+    DC: DictFromBytes<Builder = B, Item = B::Element> + Send + Sync + 'static,
+    DS: DictFromVecBytes<Builder = B, Item = B::Element, EqConstant = DC::EqConstant>
+        + Send
+        + Sync
+        + 'static,
     B: ArrayBuilder,
     P: DecodePlain<Builder = B>,
     B::Element: PartialEq,
@@ -384,7 +599,7 @@ where
     }
 
     fn fast_filter_record_batch(&self, batch: RecordBatch, column: usize) -> RecordBatch {
-        match (&self.eq_const, &self.dict) {
+        match (&self.eq_const, self.dict.as_deref()) {
             (Some(needle), Some(DictStorage::Contiguous(dict))) => {
                 dict.filter_record_batch_by_const(batch, column, needle)
             }
@@ -421,7 +636,56 @@ where
             };
             page_idx += 1;
         }
-        available
+        // Rows consumed before anything is emitted are not available to a
+        // caller: those a pending skip will drop, plus those preceding a
+        // recorded position that has not been applied yet (once it is, the
+        // page's own remaining count already excludes them).
+        available.saturating_sub(self.withheld())
+    }
+
+    fn skip_leading_rows(&mut self, rows: usize) {
+        self.pending_skip += rows;
+    }
+
+    fn share_dictionary_via(&mut self, shared: Arc<SharedDictionaries>, key: ChunkKey) {
+        // A decoder carrying a pushed equality constant installs an empty
+        // dictionary when that constant proves absent, so it must neither
+        // publish nor adopt one.
+        if self.eq_const.is_none() {
+            self.shared_dict = Some((shared, key));
+        }
+    }
+
+    fn checkpoint(&self) -> Option<PageCheckpoint> {
+        match &self.read_page {
+            // Mid-page: the position inside the page currently being consumed.
+            Some(read_page) => {
+                let (byte_offset, run) = read_page.snapshot()?;
+                Some(PageCheckpoint {
+                    page_idx: self.page_idx,
+                    byte_offset,
+                    run,
+                })
+            }
+            // Between pages: the next page's start, which needs no recorded
+            // position because a page always begins a fresh value stream.
+            None => Some(PageCheckpoint {
+                page_idx: self.page_idx,
+                byte_offset: 0,
+                run: None,
+            }),
+        }
+    }
+
+    fn resume_from(&mut self, checkpoint: PageCheckpoint, rows_into_page: usize) {
+        self.page_idx = checkpoint.page_idx;
+        self.read_page = None;
+        // Entering a page at its very start needs no recorded position, and
+        // leaving it unset keeps the ordinary path (which is the one that can
+        // step over skipped pages).
+        if checkpoint.byte_offset > 0 || checkpoint.run.is_some() || rows_into_page > 0 {
+            self.pending_resume = Some((checkpoint, rows_into_page));
+        }
     }
 
     fn insert_page(&mut self, page: DecompressedPage, allocator: &mut SlabAllocator) {
@@ -444,11 +708,20 @@ where
                         // `None` makes `available()` report 0, parking every
                         // worker before the prune completes → lost-wakeup hang.)
                         // The dictionary is never read — the row group is pruned.
-                        self.dict = Some(DictStorage::build(data, 0, allocator));
+                        self.dict = Some(Arc::new(DictStorage::build(data, 0, allocator)));
                         return;
                     }
                 }
-                self.dict = Some(DictStorage::build(data, size, allocator));
+                // Whoever reaches the chunk's dictionary page first builds it;
+                // the rest take that copy instead of rebuilding it.
+                self.dict = Some(match &self.shared_dict {
+                    Some((shared, key)) => match shared.get(*key) {
+                        Some(built) => built,
+                        None => shared
+                            .publish(*key, Arc::new(DictStorage::build(data, size, allocator))),
+                    },
+                    None => Arc::new(DictStorage::build(data, size, allocator)),
+                });
             }
             DecompressedPageType::Data(data) => {
                 let idx = page.idx;
@@ -468,8 +741,9 @@ where
     }
 
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef> {
+        self.drain_pending_skip()?;
         let mut builder = B::with_capacity(allocator, size);
-        match &self.dict {
+        match self.dict.as_deref() {
             Some(DictStorage::Contiguous(d)) => d.register_onto(&mut builder),
             Some(DictStorage::Scattered(d)) => d.register_onto(&mut builder),
             None => {}
@@ -498,7 +772,7 @@ where
                     vb.append_n(builder.len(), true);
                     vb
                 });
-                match &self.dict {
+                match self.dict.as_deref() {
                     Some(DictStorage::Contiguous(d)) => {
                         read_page.read_into_nullable(Some(d), &mut builder, v, remaining)
                     }
@@ -509,7 +783,7 @@ where
                 }
             } else {
                 let before = builder.len();
-                match &self.dict {
+                match self.dict.as_deref() {
                     Some(DictStorage::Contiguous(d)) => {
                         read_page.read_into(Some(d), &mut builder, remaining)
                     }
@@ -818,6 +1092,194 @@ mod tests {
 
         assert_eq!(extract_i32s(&r1), vec![1, 2, 3, 4]);
         assert_eq!(extract_i32s(&r2), vec![5]);
+    }
+
+    // -- Leading skip (entering a chunk part way through, as a split does) --
+
+    /// A skip landing inside the first page: decoding resumes at that row.
+    #[test]
+    fn test_skip_leading_rows_within_first_page() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        let mut dec = Dec::new(0);
+        dec.insert_page(
+            data_page(encode_i32s(&[10, 20, 30, 40, 50]), 5, 0),
+            &mut alloc,
+        );
+        dec.skip_leading_rows(2);
+
+        let result = dec.read(&mut alloc, 3).unwrap();
+
+        assert_eq!(extract_i32s(&result), vec![30, 40, 50]);
+    }
+
+    /// A skip spanning a whole page and landing inside the next one.
+    #[test]
+    fn test_skip_leading_rows_across_pages() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        let mut dec = Dec::new(0);
+        dec.insert_page(data_page(encode_i32s(&[1, 2, 3]), 3, 0), &mut alloc);
+        dec.insert_page(data_page(encode_i32s(&[4, 5, 6, 7]), 4, 1), &mut alloc);
+        dec.skip_leading_rows(5);
+
+        let result = dec.read(&mut alloc, 2).unwrap();
+
+        assert_eq!(extract_i32s(&result), vec![6, 7]);
+    }
+
+    /// Skipped rows are not available to read.
+    #[test]
+    fn test_skip_leading_rows_reduces_available() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        let mut dec = Dec::new(0);
+        dec.insert_page(
+            data_page(encode_i32s(&[10, 20, 30, 40, 50]), 5, 0),
+            &mut alloc,
+        );
+        dec.skip_leading_rows(3);
+
+        assert_eq!(dec.available(), 2);
+    }
+
+    /// The RLE-dictionary path skips by walking runs, so entering mid-run must
+    /// still land on the right key.
+    #[test]
+    fn test_skip_leading_rows_on_dict_encoded_page() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        let mut dec = Dec::new(0);
+        dec.insert_page(dict_page(encode_i32s(&[100, 200, 300]), 3), &mut alloc);
+
+        // bit_width=2, 1 group of 8, indices [0,1,2,0,0,1,2,0]
+        let header = PageHeader::for_data_page(8, Encoding::RLE_DICTIONARY);
+        let rle_page = DecompressedPage {
+            worker_id: 0,
+            query_row_group_metadata: dummy_metadata(None),
+            column_idx: 0,
+            idx: 0,
+            data: DecompressedPageType::Data(DataPage {
+                header: header.data_page_header.unwrap(),
+                data: vec![Bytes::from(vec![2u8, 3, 0x24, 0x24])],
+                filter_mask: None,
+            }),
+        };
+        dec.insert_page(rle_page, &mut alloc);
+        dec.skip_leading_rows(5);
+
+        let result = dec.read(&mut alloc, 3).unwrap();
+
+        assert_eq!(extract_i32s(&result), vec![200, 300, 100]);
+    }
+
+    /// A skip whose pages have not all arrived resumes once they do, rather
+    /// than consuming the wrong rows or losing its place.
+    #[test]
+    fn test_skip_leading_rows_resumes_when_pages_arrive_late() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        let mut dec = Dec::new(0);
+        dec.insert_page(data_page(encode_i32s(&[1, 2, 3]), 3, 0), &mut alloc);
+        dec.skip_leading_rows(5);
+
+        let empty = dec.read(&mut alloc, 2).unwrap();
+        dec.insert_page(data_page(encode_i32s(&[4, 5, 6, 7]), 4, 1), &mut alloc);
+        let result = dec.read(&mut alloc, 2).unwrap();
+
+        assert_eq!(extract_i32s(&empty), Vec::<i32>::new());
+        assert_eq!(extract_i32s(&result), vec![6, 7]);
+    }
+
+    // -- Resuming from a recorded position --
+
+    /// A decoder placed at a position recorded mid-page emits exactly the rows
+    /// from there on, without decoding the ones before it.
+    #[test]
+    fn test_resume_from_a_recorded_position_mid_page() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        let values = [10, 20, 30, 40, 50, 60];
+
+        let mut recorder = Dec::new(0);
+        recorder.insert_page(data_page(encode_i32s(&values), 6, 0), &mut alloc);
+        recorder.read(&mut alloc, 4).unwrap();
+        let at = recorder.checkpoint().unwrap();
+
+        let mut resumed = Dec::new(0);
+        resumed.insert_page(data_page(encode_i32s(&values), 6, 0), &mut alloc);
+        resumed.resume_from(at, 4);
+        let result = resumed.read(&mut alloc, 2).unwrap();
+
+        assert!(at.byte_offset > 0, "the position must be inside the page");
+        assert_eq!(extract_i32s(&result), vec![50, 60]);
+    }
+
+    /// The same, for the RLE-dictionary path, whose position also carries the
+    /// run it stopped part way through.
+    #[test]
+    fn test_resume_from_a_recorded_position_in_a_dict_page() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        // bit_width=2, 5 bit-packed groups (40 values): header (5<<1)|1 = 0x0B,
+        // then 2 packed bytes per group. Several groups is what makes resuming
+        // read bytes rather than replay values buffered from one decoded group.
+        let mut page_bytes = vec![2u8, 0x0B];
+        page_bytes.extend(std::iter::repeat_n(0x24u8, 10));
+        let rle_page = |alloc: &mut SlabAllocator| {
+            let header = PageHeader::for_data_page(40, Encoding::RLE_DICTIONARY);
+            let _ = alloc;
+            DecompressedPage {
+                worker_id: 0,
+                query_row_group_metadata: dummy_metadata(None),
+                column_idx: 0,
+                idx: 0,
+                data: DecompressedPageType::Data(DataPage {
+                    header: header.data_page_header.unwrap(),
+                    data: vec![Bytes::from(page_bytes.clone())],
+                    filter_mask: None,
+                }),
+            }
+        };
+
+        let mut recorder = Dec::new(0);
+        recorder.insert_page(dict_page(encode_i32s(&[100, 200, 300]), 3), &mut alloc);
+        recorder.insert_page(rle_page(&mut alloc), &mut alloc);
+        recorder.read(&mut alloc, 24).unwrap();
+        let at = recorder.checkpoint().unwrap();
+        let expected = extract_i32s(&recorder.read(&mut alloc, 8).unwrap());
+
+        let mut resumed = Dec::new(0);
+        resumed.insert_page(dict_page(encode_i32s(&[100, 200, 300]), 3), &mut alloc);
+        resumed.insert_page(rle_page(&mut alloc), &mut alloc);
+        resumed.resume_from(at, 24);
+        let result = resumed.read(&mut alloc, 8).unwrap();
+
+        assert!(at.byte_offset > 0, "the position must be inside the page");
+        assert_eq!(extract_i32s(&result), expected);
+    }
+
+    /// Resuming is deferred until the page arrives, since a split's decoder is
+    /// built before any of its pages have been fetched.
+    #[test]
+    fn test_resume_waits_for_its_page_to_arrive() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(true);
+        let values = [1, 2, 3, 4, 5, 6];
+
+        let mut recorder = Dec::new(0);
+        recorder.insert_page(data_page(encode_i32s(&values), 6, 0), &mut alloc);
+        recorder.read(&mut alloc, 2).unwrap();
+        let at = recorder.checkpoint().unwrap();
+
+        let mut resumed = Dec::new(0);
+        resumed.resume_from(at, 2);
+        assert_eq!(resumed.available(), 0);
+        resumed.insert_page(data_page(encode_i32s(&values), 6, 0), &mut alloc);
+
+        assert_eq!(resumed.available(), 4);
+        let result = resumed.read(&mut alloc, 4).unwrap();
+        assert_eq!(extract_i32s(&result), vec![3, 4, 5, 6]);
     }
 
     // -- Filter mask --

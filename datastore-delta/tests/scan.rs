@@ -3,7 +3,7 @@ mod common;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::Int64Type;
+use arrow_array::types::{Int64Type, UInt32Type};
 use arrow_array::{
     ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, StringViewArray, StructArray,
 };
@@ -1485,4 +1485,95 @@ fn scan_two_pushed_extracts_on_one_column_share_the_read() {
         results[0].column(1).as_string_view(),
         &StringViewArray::from(vec!["alice", "bob"])
     );
+}
+
+/// A row group is decoded end to end by whichever worker claims it, so one
+/// oversized row group sets a scan's critical path. Once a scan has recorded
+/// where each column's data pages begin, later scans cut the row group into row
+/// ranges that separate workers decode independently — each entering its
+/// columns part way through a page. That must not change a single row.
+///
+/// The row count clears the split threshold and the column spans several data
+/// pages, which are exactly the conditions that make the second scan split; the
+/// first scan is what records the page directory they are read from.
+#[test]
+fn a_split_row_group_scans_to_the_same_rows_as_an_unsplit_one() {
+    let dispatch = dispatch(4);
+    // Enough poorly-compressing bytes to clear the size a row group must carry
+    // before splitting it is worth the extra claims.
+    let values: Vec<i64> = (0..800_000)
+        .map(|i: i64| i.wrapping_mul(2_654_435_761))
+        .collect();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from(values.clone()))],
+    )
+    .unwrap();
+    // A page size that does not divide the 8192-row batch puts the recorded
+    // decode positions inside pages rather than on their starts, which is the
+    // case a split has to seek into rather than simply open a page at.
+    let (_dir, table) = parquet_table_with_page_rows(&dispatch, &[batch], false, 3_000);
+
+    let unsplit = table_input(&dispatch, &table, Projection::columns([0]), false)
+        .collect()
+        .unwrap();
+    let directory_pages = table.row_groups()[0]
+        .page_directories
+        .get(0)
+        .expect("the first scan records the chunk's page directory")
+        .page_count();
+    let split = table_input(&dispatch, &table, Projection::columns([0]), false)
+        .collect()
+        .unwrap();
+
+    assert!(
+        directory_pages > 1,
+        "a single-page chunk offers no split point; this table must span several"
+    );
+    let mut split_values = collect_i64s(&split, 0);
+    split_values.sort();
+    let mut expected = values.clone();
+    expected.sort();
+    assert_eq!(split_values, expected);
+    assert_eq!(
+        collect_i64s(&unsplit, 0).len(),
+        split_values.len(),
+        "both scans emit every row exactly once"
+    );
+}
+
+/// Late materialization addresses a row by its index within its row group, so
+/// a split must still stamp rows with their position in the whole row group -
+/// not with their position inside the split, which would make every split after
+/// the first point at the wrong rows.
+#[test]
+fn a_split_row_group_stamps_row_indices_from_the_row_group_start() {
+    let dispatch = dispatch(4);
+    let rows = 800_000u32;
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from_iter_values(
+            (0..rows as i64).map(|i| i.wrapping_mul(2_654_435_761)),
+        ))],
+    )
+    .unwrap();
+    let (_dir, table) = parquet_table_with_page_rows(&dispatch, &[batch], false, 3_000);
+
+    table_input(&dispatch, &table, Projection::columns([0]), true)
+        .collect()
+        .unwrap();
+    let split = table_input(&dispatch, &table, Projection::columns([0]), true)
+        .collect()
+        .unwrap();
+
+    let row_idx_col = split[0].num_columns() - 1;
+    let mut indices: Vec<u32> = split
+        .iter()
+        .flat_map(|b| {
+            let a = b.column(row_idx_col).as_primitive::<UInt32Type>();
+            (0..a.len()).map(move |i| a.value(i))
+        })
+        .collect();
+    indices.sort();
+    assert_eq!(indices, (0..rows).collect::<Vec<_>>());
 }

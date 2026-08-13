@@ -37,6 +37,11 @@ unsafe fn gather_entries<D: Dict>(dict: &D, keys: &[u32], dest: &mut [D::Item]) 
 }
 
 /// A single run in the RLE/bit-packed stream.
+///
+/// Plain `Copy` data, so a partially consumed run can be recorded at a decode
+/// checkpoint and replayed later to resume mid-run (see
+/// [`RleDecoder::resume`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Run {
     Rle {
         value: u32,
@@ -336,6 +341,37 @@ impl RleDecoder {
             buffer: Box::new([0; 1024]),
             run: None,
         }
+    }
+
+    /// Rebuilds a decoder standing exactly where a previous one stood: at
+    /// `position` in the stream, `run` values into whichever run was in flight
+    /// there. Resuming from a recorded checkpoint means a later reader starts
+    /// at an arbitrary value without decoding the ones before it.
+    pub fn resume(
+        data: Vec<Bytes>,
+        position: ReaderPosition,
+        bit_width: u8,
+        run: Option<Run>,
+    ) -> Self {
+        Self {
+            position,
+            bit_width,
+            data,
+            buffer: Box::new([0; 1024]),
+            run,
+        }
+    }
+
+    /// Where this decoder stands: how many bytes into the payload its stream
+    /// position sits, and the run it is part way through, if any.
+    pub fn state(&self) -> (usize, Option<Run>) {
+        (
+            crate::parquet::reading::decoding::leaf_decoders::resume::logical_offset(
+                &self.data,
+                self.position,
+            ),
+            self.run,
+        )
     }
 
     /// Returns the current in-progress run, or parses the next one from the

@@ -1,12 +1,14 @@
 use crate::parquet::request_tracker::PendingRequest;
 use crate::parquet::types::leaves::projected_leaves;
 use crate::parquet::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata};
+use crate::parquet::types::page_directory::leaf_entry;
 use crate::parquet::types::projection::Projection;
 use crate::parquet::types::thrift::headers::PageHeader;
 use crate::parquet::types::thrift::parquet_thrift::ThriftReadInputProtocol;
 use bytes::Bytes;
 use dispatch::io::{FsReadRequest, FsRequest, HttpGetRequest, OpenFile};
 use dispatch::memory::{CacheLookup, MultiBufferReader, ReaderPosition, Segment, memory_ctx};
+use std::ops::Range;
 
 /// One resolved piece of a column chunk, in file order, named by the form its
 /// bytes are in:
@@ -75,19 +77,23 @@ impl ColumnRequest {
     /// Build a `ColumnRequest` from column chunk metadata, queueing the reads
     /// for any missing sub-blocks onto the filesystem or HTTP request list
     /// according to where the file lives.
+    ///
+    /// `spans` are the byte ranges of the chunk to read, in file order: the
+    /// whole chunk for an ordinary claim, and just the dictionary page plus
+    /// this claim's own data pages for a split one.
     fn from(
-        meta: &ColumnChunkMeta,
+        spans: &[Range<usize>],
         open_file: &OpenFile,
         fs_requests: &mut Vec<FsRequest>,
         http_requests: &mut Vec<HttpGetRequest>,
     ) -> Self {
-        let col_start = meta.dictionary_page_offset.unwrap_or(meta.data_page_offset) as usize;
-        let len = meta.total_compressed_size as usize;
-
-        let parts = memory_ctx()
-            .decompressed_cache()
-            .get_range(open_file, col_start, len)
-            .into_iter()
+        let parts = spans
+            .iter()
+            .flat_map(|span| {
+                memory_ctx()
+                    .decompressed_cache()
+                    .get_range(open_file, span.start, span.len())
+            })
             .map(|segment| match segment {
                 Segment::Gap { offset, len } => ColumnPart::Compressed {
                     offset,
@@ -157,6 +163,13 @@ fn parse_page_header(bytes: &[Bytes]) -> PageHeader {
         .expect("a decompressed-cache hit's header round-trips: this cache wrote it")
 }
 
+/// The chunk's whole byte range: its dictionary page, if any, through its last
+/// data page.
+fn whole_chunk(meta: &ColumnChunkMeta) -> Range<usize> {
+    let start = meta.dictionary_page_offset.unwrap_or(meta.data_page_offset) as usize;
+    start..start + meta.total_compressed_size as usize
+}
+
 /// Tracks the IO state for an entire row group read.
 ///
 /// Created by `from()`, which resolves every projected column against the
@@ -167,6 +180,11 @@ fn parse_page_header(bytes: &[Bytes]) -> PageHeader {
 pub struct RowGroupRequest {
     metadata: QueryRowGroupMetadata,
     column_requests: Vec<ColumnRequest>,
+    /// Each fetched column's leaf index within the row group, which is how the
+    /// page directory is keyed.
+    leaves: Vec<usize>,
+    /// The row each fetched column's first data page starts on.
+    first_rows: Vec<usize>,
     /// Local filesystem reads not yet handed to the fetcher (drained when the
     /// row group is admitted).
     pending_fs: Vec<FsRequest>,
@@ -190,15 +208,41 @@ impl RowGroupRequest {
 
         let mut pending_fs = vec![];
         let mut pending_http = vec![];
+        let rows = metadata_handle.row_range();
+        let directories = &metadata_handle.get_metadata().page_directories;
+        let checkpoints = &metadata_handle.get_metadata().decode_checkpoints;
+        let mut first_rows = Vec::with_capacity(leaves.len());
         let column_requests = leaves
             .iter()
             .map(|&leaf| {
-                ColumnRequest::from(
-                    &columns[leaf],
-                    &open_file,
-                    &mut pending_fs,
-                    &mut pending_http,
-                )
+                let (spans, first_row) = match directories.get(leaf) {
+                    // A split reads only the pages it decodes, plus the
+                    // dictionary every reader of the chunk needs. Its first page
+                    // is wherever it enters the chunk, which is the page holding
+                    // the recorded position it resumes from - earlier than the
+                    // page holding its first row whenever the checkpoint sits in
+                    // the page before it. Without a directory there is nothing to
+                    // seek by, so the whole chunk is read.
+                    Some(directory) if metadata_handle.is_split() => {
+                        let entry = leaf_entry(directory, checkpoints.get(leaf), rows.start);
+                        let pages = entry.page_idx..directory.pages_covering(rows.clone()).end;
+                        let mut spans: Vec<Range<usize>> =
+                            directory.dictionary_span().into_iter().collect();
+                        if let Some(data) = directory.span_of(pages.clone()) {
+                            // Splitting at page zero leaves the dictionary
+                            // directly abutting the data, so the two reads are
+                            // merged rather than issued as neighbours.
+                            match spans.last_mut() {
+                                Some(dict) if dict.end == data.start => dict.end = data.end,
+                                _ => spans.push(data),
+                            }
+                        }
+                        (spans, directory.first_row_of(entry.page_idx))
+                    }
+                    _ => (vec![whole_chunk(&columns[leaf])], 0),
+                };
+                first_rows.push(first_row);
+                ColumnRequest::from(&spans, &open_file, &mut pending_fs, &mut pending_http)
             })
             .collect();
 
@@ -208,6 +252,8 @@ impl RowGroupRequest {
             pending_fs,
             pending_http,
             metadata: metadata_handle,
+            leaves,
+            first_rows,
         }
     }
 
@@ -233,6 +279,8 @@ impl RowGroupRequest {
                 .map(ColumnRequest::into_source)
                 .collect(),
             worker_id: dispatch::worker::WORKER_IDX.get(),
+            leaves: self.leaves,
+            first_rows: self.first_rows,
         }
     }
 }
@@ -257,4 +305,12 @@ pub struct RowGroupBuffer {
     /// `RowGroupFetcher`). The middle stages may run on stealing siblings, so
     /// the id is stamped at claim time, not by whoever runs a stage.
     pub worker_id: usize,
+    /// Each fetched column's leaf index within the row group, parallel to
+    /// `columns`. The indexer records each chunk's page directory under it.
+    pub leaves: Vec<usize>,
+    /// The row each fetched column's first data page starts on, parallel to
+    /// `columns`. Zero for a whole-chunk read; for a split it is where that
+    /// column's own first page begins, which is at or before the first row the
+    /// split emits.
+    pub first_rows: Vec<usize>,
 }

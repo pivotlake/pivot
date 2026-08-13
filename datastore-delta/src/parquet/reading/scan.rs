@@ -18,6 +18,7 @@ use dispatch::{
     stealable,
 };
 
+use crate::parquet::reading::decoding::SharedDictionaries;
 use crate::parquet::{
     CompressedPage, DecoderFactory, DecompressedPage, DecompressorFactory, IndexerFactory,
     MaterializerFactory, ParquetTable, RowGroupBuffer, RowGroupFetcherFactory,
@@ -41,6 +42,11 @@ where
 {
     let n = input.dispatcher().worker_count();
     let topology = input.dispatcher().topology();
+    // One store per scan, shared by every worker: a chunk's dictionary is built
+    // by whichever claim reaches it first and handed to the rest, so splitting a
+    // row group does not rebuild it per split. Scoped here rather than cached on
+    // the row group because a built dictionary pins the slab buffer it lives in.
+    let shared_dictionaries = Arc::new(SharedDictionaries::new());
     let decoded = input
         .chain(
             stealable::<RowGroupBuffer>(topology).into_iter().collect(),
@@ -63,6 +69,7 @@ where
                     eq_predicates: eq_predicates.clone(),
                     pending_row_groups: pending,
                     outstanding_row_groups: outstanding_row_groups.clone(),
+                    shared_dictionaries: shared_dictionaries.clone(),
                 })
                 .collect(),
         );

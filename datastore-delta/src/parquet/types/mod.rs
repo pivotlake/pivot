@@ -3,6 +3,7 @@ pub mod filter_mask;
 pub(crate) mod leaves;
 pub mod metadata;
 pub mod page;
+pub mod page_directory;
 pub mod projection;
 pub mod requests;
 pub mod table;
