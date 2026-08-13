@@ -1,27 +1,27 @@
 //! A CLOCK page cache that *packs* many small file reads into shared ring buffer
 //! slots, tracking validity at 4 KB block granularity.
 //!
-//! Reads are not positional: a missed read is bump-allocated as a contiguous run
+//! Reads are not positional: a missed read is bump-allocated as a contiguous extent
 //! of 4 KB blocks at a per-worker cursor inside whatever shared slot that worker is
 //! currently filling, so hundreds of unrelated reads from many files share one slot
 //! and the working set is measured in *bytes*, not slots. The cache therefore
-//! records each cached run's *physical placement* - which slot and which block
+//! records each cached extent's *physical placement* - which slot and which block
 //! within it - in a per-file [`Extent`] map, decoupled from the file offset.
 //!
 //! ## Extents
 //!
 //! Each file maps `first_file_block` (= `file_offset / 4096`) → [`Extent`]. Extents
 //! are non-overlapping by construction: allocation only ever covers blocks no live
-//! extent already claims. A slot's [`Entry::valid`] bitmap records which of its
-//! 512 × 4 KB blocks have actually been read, so a run can be present in the map yet
-//! still filling.
+//! extent already claims. A slot's [`SlotMetadata::valid`] bitmap records which of its
+//! 512 × 4 KB blocks have actually been read, so an extent can be present in the map
+//! yet still filling.
 //!
 //! ## Multi-tenant slots and eviction
 //!
-//! A slot holds runs from arbitrarily many files. CLOCK eviction reclaims a whole
-//! slot, so it must invalidate every run living in it. A per-slot tenant list - the
-//! `(file, first_file_block)` of every run packed into the slot - records what to
-//! drop. It is written only by the single worker filling the slot (while it holds
+//! A slot holds extents from arbitrarily many files. CLOCK eviction reclaims a whole
+//! slot, so it must invalidate every extent living in it. A per-slot tenant list -
+//! the `(file, first_file_block)` of every extent packed into the slot - records what
+//! to drop. It is written only by the single worker filling the slot (while it holds
 //! the fill pin) and read only by the evictor after `try_write` (which needs every
 //! pin dropped), so the ring's reader-pin atomics provide the happens-before with no
 //! new lock. See [`ReadBuffer`]'s `Drop` for the publication edge.
@@ -35,9 +35,9 @@
 //!
 //! ## Lookups
 //!
-//! [`CompressedCache::get`] takes a file byte range and returns one [`CacheLookup`] per
-//! contiguous run it resolves to - a *hit* run already resident in one slot, a
-//! *refill* run mapped but not yet read, or a freshly *allocated* miss run. Each
+//! [`CompressedCache::get`] takes a file byte range and returns one [`CacheLookup`]
+//! per contiguous fragment it resolves to - a *hit* already resident in one slot, a
+//! *refill* mapped but not yet read, or a freshly *allocated* miss. Each
 //! lookup carries its `data` (a zero-copy view into the slot it lives in) plus its
 //! `missing` blocks (empty on a hit). Concatenating every lookup's `data` in order
 //! reproduces the requested bytes once every [`MissingExtent`] has been read into
@@ -68,9 +68,9 @@ const BLOCKS_PER_SLOT: usize = BUFFER_SIZE / BLOCK_SIZE;
 /// Number of `u64` words in a slot's validity bitmap (8 → 512 bits).
 const BITMAP_WORDS: usize = BLOCKS_PER_SLOT / 64;
 
-/// One cached run: a contiguous stretch of a file living in a contiguous region of
-/// one 2 MB ring slot. The same run seen on two 4 KB-block rulers - file blocks and
-/// slot blocks - offset from each other:
+/// One cached extent: a mapping from a contiguous range of file blocks to a
+/// contiguous range of blocks within one 2 MB ring slot. The same extent appears on
+/// two offset 4 KB-block rulers - file blocks and slot blocks:
 ///
 /// ```text
 ///   file block:   … 48   49   50   51 …    first_file_block = 48, block_count = 4
@@ -78,77 +78,77 @@ const BITMAP_WORDS: usize = BLOCKS_PER_SLOT / 64;
 ///   slot block:     130  131  132  133 …   first_slot_block = 130   (inside slot_idx)
 /// ```
 ///
-/// So the run's Nth block is file block `first_file_block + N` and slot block
+/// So the extent's Nth block is file block `first_file_block + N` and slot block
 /// `first_slot_block + N`. Never spans more than one slot.
 #[derive(Clone, Copy)]
 struct Extent {
-    /// The run's first file block. Also its key in the file's extent map.
+    /// The extent's first file block. Also its key in the file's extent map.
     first_file_block: usize,
-    /// The ring slot holding the run's bytes.
+    /// The ring slot holding the extent's bytes.
     slot_idx: u32,
-    /// The run's first block within that slot (0..512).
+    /// The extent's first block within that slot (0..512).
     first_slot_block: u16,
-    /// Length of the run in 4 KB blocks - the same count on both rulers.
+    /// Length of the extent in 4 KB blocks - the same count on both rulers.
     block_count: u16,
 }
 
 impl Extent {
-    /// The run's last file block (inclusive).
+    /// The extent's last file block (inclusive).
     fn last_file_block(&self) -> usize {
         self.first_file_block + self.block_count as usize - 1
     }
 
-    /// The slot block holding file block `file_block`: the run's slot-block start
-    /// plus how far `file_block` sits into the run. Meaningful only for a
-    /// `file_block` the run covers.
+    /// The slot block holding file block `file_block`: the extent's slot-block start
+    /// plus how far `file_block` sits into the extent. Meaningful only for a
+    /// `file_block` the extent covers.
     fn slot_block_of(&self, file_block: usize) -> usize {
         self.first_slot_block as usize + (file_block - self.first_file_block)
     }
 
-    /// A zero-copy view of the run's bytes that fall within the requested byte range
-    /// `[start_offset, end_offset)`, read straight from its slot. Maps the file window
-    /// onto the matching slice of the slot; `pin` must hold that slot and keeps it
-    /// alive for as long as the returned [`Bytes`] lives.
+    /// A zero-copy view of the extent's bytes that fall within the requested byte
+    /// range `[start_offset, end_offset)`, read straight from its slot. Maps the file
+    /// window onto the matching slice of the slot; `pin` must hold that slot and
+    /// keeps it alive for as long as the returned [`Bytes`] lives.
     fn clipped_bytes(
         &self,
         pin: &Arc<ReadBuffer>,
         start_offset: usize,
         end_offset: usize,
     ) -> Bytes {
-        let run_start = self.first_file_block * BLOCK_SIZE;
-        let clip_start = run_start.max(start_offset);
+        let extent_start = self.first_file_block * BLOCK_SIZE;
+        let clip_start = extent_start.max(start_offset);
         let clip_end =
             ((self.first_file_block + self.block_count as usize) * BLOCK_SIZE).min(end_offset);
-        let slot_start = self.first_slot_block as usize * BLOCK_SIZE + (clip_start - run_start);
+        let slot_start = self.first_slot_block as usize * BLOCK_SIZE + (clip_start - extent_start);
         Bytes::from_owner(SlotPin(pin.clone()))
             .slice(slot_start..slot_start + (clip_end - clip_start))
     }
 }
 
 /// One `(file, first_file_block)` packed into a slot, recorded so the evictor can
-/// drop the run's extent when it recycles the slot.
+/// drop the extent when it recycles the slot.
 struct Tenant {
-    /// The file the packed run belongs to.
+    /// The file the packed extent belongs to.
     open_file: OpenFile,
-    /// The run's first file block - the key into `open_file`'s extent map.
+    /// The extent's first file block - the key into `open_file`'s extent map.
     first_file_block: usize,
 }
 
-/// The result of a [`CompressedCache::get`] over one resolved run: the looked-up bytes
-/// (a zero-copy view into the slot the run lives in) plus the run's missing part, if
-/// any. A run is resolved whole, so it is either fully resident (a hit) or one
+/// One fragment of a [`CompressedCache::get`] result: looked-up bytes (a zero-copy
+/// view into the slot that holds them) plus the fragment's missing part, if any.
+/// A fragment is resolved whole, so it is either fully resident (a hit) or has one
 /// [`MissingExtent`] to read; `data` only becomes valid once that read has committed.
 pub struct CacheLookup {
-    /// Zero-copy view of this run's bytes inside its ring slot (kept alive by the
-    /// pin the `Bytes` owns). Only valid to read once `missing` is filled.
+    /// Zero-copy view of this fragment's bytes inside its ring slot (kept alive by
+    /// the pin the `Bytes` owns). Only valid to read once `missing` is filled.
     data: Bytes,
-    /// The run's not-yet-resident part - read it into its slot and commit. `None`
-    /// on a hit.
+    /// The fragment's not-yet-resident part - read it into its slot and commit.
+    /// `None` on a hit.
     missing: Option<MissingExtent>,
 }
 
 impl CacheLookup {
-    /// The run's not-yet-resident part; it must be read & committed before
+    /// The fragment's not-yet-resident part; it must be read & committed before
     /// [`data`](Self::into_data) is valid. `None` on a hit.
     pub fn missing(&self) -> Option<&MissingExtent> {
         self.missing.as_ref()
@@ -162,10 +162,10 @@ impl CacheLookup {
     }
 }
 
-/// A run still missing from the cache: the [`Extent`] to fill (its file→slot mapping)
-/// plus a pin keeping its slot alive while the read is in flight. The read targets
-/// [`dest`] - a region inside the pinned slot - directly, with no intermediate
-/// buffer, and once it lands [`commit`] marks the whole run valid.
+/// An extent still missing from the cache: the [`Extent`] to fill (its file→slot
+/// mapping) plus a pin keeping its slot alive while the read is in flight. The read
+/// targets [`dest`] - a region inside the pinned slot - directly, with no
+/// intermediate buffer, and once it lands [`commit`] marks the whole extent valid.
 ///
 /// The pin is shared with the lookup's `data`, so the slot can't be evicted while a
 /// read into it is outstanding - even if the owning query is cancelled first.
@@ -174,20 +174,20 @@ impl CacheLookup {
 /// [`commit`]: MissingExtent::commit
 #[derive(Clone)]
 pub struct MissingExtent {
-    /// The run to read: which file blocks map to which slot blocks.
+    /// The extent to read: which file blocks map to which slot blocks.
     extent: Extent,
     /// Keeps the destination slot pinned for the read's whole lifetime.
     _pin: Arc<ReadBuffer>,
 }
 
 impl MissingExtent {
-    /// The run `extent`, backed by the slot `pin` holds; `extent.slot_idx` is `pin`'s
+    /// The missing `extent`, backed by the slot `pin` holds; `extent.slot_idx` is `pin`'s
     /// slot, and `pin`'s base address gives [`dest`](Self::dest).
     fn new(extent: Extent, pin: Arc<ReadBuffer>) -> Self {
         MissingExtent { extent, _pin: pin }
     }
 
-    /// File offset the run's bytes are read from - always a multiple of
+    /// File offset the extent's bytes are read from - always a multiple of
     /// [`BLOCK_SIZE`], the direct-I/O alignment.
     pub fn file_offset(&self) -> usize {
         self.extent.first_file_block * BLOCK_SIZE
@@ -198,15 +198,15 @@ impl MissingExtent {
         self.extent.block_count as usize * BLOCK_SIZE
     }
 
-    /// Whether the run covers zero bytes. Pairs with [`len`](Self::len).
+    /// Whether the extent covers zero bytes. Pairs with [`len`](Self::len).
     pub fn is_empty(&self) -> bool {
         self.extent.block_count == 0
     }
 
-    /// Split off the sub-run covering `[rel_offset, rel_offset + len)` within this run
-    /// (both relative to its start and both `BLOCK_SIZE`-aligned). The sub-run shares
+    /// Split off the sub-extent covering `[rel_offset, rel_offset + len)` within this
+    /// extent (both relative to its start and both `BLOCK_SIZE`-aligned). The sub-extent shares
     /// the slot pin, reads into the matching slice of the same slot, and
-    /// [`commit`](Self::commit)s only its own blocks. Lets one missing run be filled
+    /// [`commit`](Self::commit)s only its own blocks. Lets one missing extent be filled
     /// from several transports, each part writing its own slice.
     pub fn carve(&self, rel_offset: usize, len: usize) -> MissingExtent {
         debug_assert_eq!(rel_offset % BLOCK_SIZE, 0);
@@ -224,19 +224,19 @@ impl MissingExtent {
         }
     }
 
-    /// The destination to read the run's [`len`](Self::len) bytes into: a 4 KB-aligned
+    /// The destination to read the extent's [`len`](Self::len) bytes into: a 4 KB-aligned
     /// region `[dest, dest+len)` inside the pinned slot - a valid O_DIRECT target. The
-    /// slot stays alive because this holds a pin, and only this run's (currently
+    /// slot stays alive because this holds a pin, and only this extent's (currently
     /// invalid) blocks live here, so the read never races a reader of valid bytes.
     pub fn dest(&self) -> *mut u8 {
         (self._pin.ptr as usize + self.extent.first_slot_block as usize * BLOCK_SIZE) as *mut u8
     }
 
-    /// Mark the run's blocks valid - call once its bytes have been read into the slot.
+    /// Mark the extent's blocks valid - call once its bytes have been read into the slot.
     pub fn commit(&self) {
         memory_ctx()
             .compressed_cache()
-            .entry(self.extent.slot_idx as usize)
+            .slot_metadata(self.extent.slot_idx as usize)
             .valid
             .set(
                 self.extent.first_slot_block as usize,
@@ -287,18 +287,19 @@ impl ValidBitmap {
 
 /// Per-slot validity and tenancy. One per ring slot. The CLOCK state (recency
 /// counter, owner, sweep hand) lives in the shared [`Clock`](super::clock::Clock).
-struct Entry {
+struct SlotMetadata {
     /// Which of the slot's 512 × 4 KB blocks have actually been read in.
     valid: ValidBitmap,
-    /// The runs currently packed here, one per `(file, first_file_block)`, so
+    /// The extents currently packed here, one per `(file, first_file_block)`, so
     /// eviction can drop them from their files' maps. Written only by the worker
     /// filling the slot (under its fill pin); read only by the evictor (under
     /// `try_write`).
     tenants: UnsafeCell<Vec<Tenant>>,
 }
 
-/// One resolved run: its [`CacheLookup`] and the next file block to resolve from.
-struct ResolvedRun {
+/// One step while resolving a cache lookup: the fragment found or allocated at the
+/// current file block, and the next file block the lookup should visit.
+struct CacheLookupStep {
     lookup: CacheLookup,
     next_file_block: usize,
 }
@@ -306,15 +307,14 @@ struct ResolvedRun {
 /// A CLOCK-eviction cache over the shared [`Ring`](super::Ring) that packs many
 /// small reads per slot.
 ///
-/// Runs are bucketed by [`OpenFile`], so the same cache serves both local
+/// Extents are bucketed by [`OpenFile`], so the same cache serves both local
 /// files and remote HTTP objects - only the transport that fills a missing block
 /// differs.
 pub struct CompressedCache {
     /// Per-file index of what's cached and where it physically lives: file → (a
-    /// run's first file block → its [`Extent`] placement). Each file's extent map is
-    /// sorted by `first_file_block` and its extents never overlap. Both levels are
-    /// `RwLock`'d - the file map changes rarely (open/prune a file), a file's extent
-    /// map per cached run.
+    /// cached extent's first file block → its [`Extent`] placement). Each per-file map
+    /// is sorted by `first_file_block`, and its extents never overlap. Both the outer
+    /// file map and each per-file extent map are independently `RwLock`'d.
     ///
     /// ```text
     ///   foo.parquet ─┬─ block 0  → Extent { slot 7, slot block 130, 3 blocks }
@@ -324,7 +324,7 @@ pub struct CompressedCache {
     file_maps: RwLock<HashMap<OpenFile, RwLock<BTreeMap<usize, Extent>>>>,
     /// Per-slot metadata, indexed by ring slot. `UnsafeCell` because `tenants` is
     /// mutated through a shared `&self` under the pin/exclusivity discipline.
-    entries: Box<[UnsafeCell<Entry>]>,
+    slot_metadatas: Box<[UnsafeCell<SlotMetadata>]>,
 }
 
 unsafe impl Send for CompressedCache {}
@@ -334,9 +334,9 @@ impl CompressedCache {
     pub fn new(capacity: usize) -> Self {
         Self {
             file_maps: Default::default(),
-            entries: (0..capacity)
+            slot_metadatas: (0..capacity)
                 .map(|_| {
-                    UnsafeCell::new(Entry {
+                    UnsafeCell::new(SlotMetadata {
                         valid: Default::default(),
                         tenants: UnsafeCell::new(Vec::new()),
                     })
@@ -347,9 +347,9 @@ impl CompressedCache {
     }
 
     /// Look up the file byte range `[offset, offset + len)` of `open_file`. The
-    /// range is resolved into a sequence of contiguous runs in file order, yielding
-    /// one [`CacheLookup`] per run: read & fill every lookup's
-    /// [`missing`](CacheLookup::missing) blocks, then concatenate the runs' bytes.
+    /// range is resolved into a sequence of contiguous fragments in file order,
+    /// yielding one [`CacheLookup`] per fragment: read and fill every lookup's
+    /// [`missing`](CacheLookup::missing) blocks, then concatenate the fragments' bytes.
     pub fn get(&self, open_file: &OpenFile, offset: usize, len: usize) -> Vec<CacheLookup> {
         if len == 0 {
             return Vec::new();
@@ -361,103 +361,113 @@ impl CompressedCache {
         let mut lookups = Vec::new();
         let mut file_block = first_file_block;
         while file_block <= last_file_block {
-            // Resolve one run: a hit/refill from an existing extent, or allocate the
-            // uncovered run into the fill slot. Allocation declines only when another
+            // Resolve one lookup fragment from an existing extent, or allocate an
+            // extent for an uncovered fragment. Allocation declines only when another
             // worker just covered `file_block`, so retrying resolves it as a hit.
-            let run = loop {
-                if let Some(run) = self.resolve_from_extent(
+            let step = loop {
+                if let Some(step) = self.try_resolve_lookup_for_location(
                     open_file,
                     file_block,
                     last_file_block,
                     offset,
                     end_offset,
                 ) {
-                    break run;
+                    break step;
                 }
-                if let Some(run) =
-                    self.allocate_run(open_file, file_block, last_file_block, offset, end_offset)
-                {
-                    break run;
+                if let Some(step) = self.try_allocate_lookup(
+                    open_file,
+                    file_block,
+                    last_file_block,
+                    offset,
+                    end_offset,
+                ) {
+                    break step;
                 }
             };
-            file_block = run.next_file_block;
-            lookups.push(run.lookup);
+            file_block = step.next_file_block;
+            lookups.push(step.lookup);
         }
         lookups
     }
 
-    /// Resolve the run starting at `file_block` from the extent covering it, if
-    /// resident: pin its slot and take the maximal span of equal validity (bounded by
-    /// the extent and `last_file_block`). A valid span is a hit (empty `missing`); an
-    /// invalid one is a refill carrying a [`MissingExtent`]. `None` when no extent
-    /// covers `file_block`, or its slot is mid-reclaim - either way, pack it.
-    fn resolve_from_extent(
+    /// Try to resolve the lookup step at `file_block` from an existing extent for
+    /// `open_file`. Pins the extent's slot and takes the maximal span of equal
+    /// validity, bounded by the extent and `last_file_block`. A valid span is a hit
+    /// (empty `missing`); an invalid span is a refill carrying a [`MissingExtent`].
+    ///
+    /// Returns `None` when the location has no extent map (its last extent may have
+    /// been evicted and the empty map pruned), no extent in its map covers
+    /// `file_block`, or the covering extent's slot is already held exclusively for
+    /// reclamation. The caller then falls back to allocation, which recreates a
+    /// pruned map or claims the uncovered range; if another worker claims it first,
+    /// the caller retries this lookup path.
+    fn try_resolve_lookup_for_location(
         &self,
         open_file: &OpenFile,
         file_block: usize,
         last_file_block: usize,
         start_offset: usize,
         end_offset: usize,
-    ) -> Option<ResolvedRun> {
+    ) -> Option<CacheLookupStep> {
         let file_maps = self.file_maps.read().unwrap();
         let extents = file_maps.get(open_file)?.read().unwrap();
-        let covering = find_extent_covering(&extents, file_block)?;
+        let found_extent = find_extent_covering(&extents, file_block)?;
 
-        let pin = Arc::new(memory_ctx().ring().try_read(covering.slot_idx as usize)?);
-        memory_ctx().clock().touch(covering.slot_idx as usize);
-        let valid = &self.entry(covering.slot_idx as usize).valid;
+        let pin = Arc::new(memory_ctx().ring().try_read(found_extent.slot_idx as usize)?);
+        memory_ctx().clock().touch(found_extent.slot_idx as usize);
+        let valid = &self.slot_metadata(found_extent.slot_idx as usize).valid;
 
-        // Grow the run over blocks of the same validity, bounded by the covering extent.
-        let run_last_file_block = covering.last_file_block().min(last_file_block);
-        let is_valid = valid.is_set(covering.slot_block_of(file_block));
-        let mut last = file_block;
-        while last < run_last_file_block
-            && valid.is_set(covering.slot_block_of(last + 1)) == is_valid
+        // Grow the lookup over blocks of the same validity, bounded by the covering
+        // extent.
+        let last_lookup_file_block = found_extent.last_file_block().min(last_file_block);
+        let is_valid = valid.is_set(found_extent.slot_block_of(file_block));
+        let mut last_matching_file_block = file_block;
+        while last_matching_file_block < last_lookup_file_block
+            && valid.is_set(found_extent.slot_block_of(last_matching_file_block + 1)) == is_valid
         {
-            last += 1;
+            last_matching_file_block += 1;
         }
 
         let extent = Extent {
             first_file_block: file_block,
-            slot_idx: covering.slot_idx,
-            first_slot_block: covering.slot_block_of(file_block) as u16,
-            block_count: (last - file_block + 1) as u16,
+            slot_idx: found_extent.slot_idx,
+            first_slot_block: found_extent.slot_block_of(file_block) as u16,
+            block_count: (last_matching_file_block - file_block + 1) as u16,
         };
         let data = extent.clipped_bytes(&pin, start_offset, end_offset);
         let missing = (!is_valid).then(|| MissingExtent::new(extent, pin));
-        Some(ResolvedRun {
+        Some(CacheLookupStep {
             lookup: CacheLookup { data, missing },
             next_file_block: file_block + extent.block_count as usize,
         })
     }
 
-    /// Handle a miss at `file_block`: bump-allocate the uncovered run into this
-    /// worker's fill slot and register its extent, returning the refill lookup - a
-    /// view over the reserved slot region plus the [`MissingExtent`] whose bytes must
-    /// be read in. The run is capped by whichever runs out first, the request or the
-    /// fill slot's remaining room, so a read spilling past the slot boundary continues
-    /// in the next run. `None` if another worker covered `file_block` first (re-resolve
-    /// it as a hit).
-    fn allocate_run(
+    /// Handle a miss at `file_block`: bump-allocate an extent in this worker's fill
+    /// slot and register it, returning the refill lookup: a view over the reserved
+    /// slot region plus the [`MissingExtent`] whose bytes must be read in. The extent
+    /// is capped by whichever runs out first, the request or the fill slot's remaining
+    /// room, so a read spilling past the slot boundary continues in the next lookup.
+    /// `None` if another worker covered `file_block` first (re-resolve it as a hit).
+    fn try_allocate_lookup(
         &self,
         open_file: &OpenFile,
         file_block: usize,
         last_file_block: usize,
         start_offset: usize,
         end_offset: usize,
-    ) -> Option<ResolvedRun> {
+    ) -> Option<CacheLookupStep> {
         let cursor = memory_ctx().compressed_fill_cursor();
         if cursor.is_exhausted() {
             // Rotation may evict, so no map lock is held across it.
             self.rotate_fill_buffer(cursor);
         }
         let first_slot_block = cursor.next_byte / BLOCK_SIZE;
-        // Blocks the run may cover: whichever runs out first, the request or the room
-        // left in the fill slot.
+        // Blocks the extent may cover: whichever runs out first, the request or the
+        // room left in the fill slot.
         let requested_blocks =
             (last_file_block - file_block + 1).min(BLOCKS_PER_SLOT - first_slot_block);
 
-        let extent = self.claim_run(
+        let extent = self.try_add_extent_for_location(
             open_file,
             cursor.slot_idx,
             first_slot_block,
@@ -468,7 +478,7 @@ impl CompressedCache {
         cursor.next_byte = (extent.first_slot_block + extent.block_count) as usize * BLOCK_SIZE;
         let pin = cursor.buffer.clone().unwrap();
         let data = extent.clipped_bytes(&pin, start_offset, end_offset);
-        Some(ResolvedRun {
+        Some(CacheLookupStep {
             lookup: CacheLookup {
                 data,
                 missing: Some(MissingExtent::new(extent, pin)),
@@ -477,15 +487,14 @@ impl CompressedCache {
         })
     }
 
-    /// Reserve a run of up to `requested_blocks` free blocks at `file_block` in
-    /// `open_file`'s extent map, place it at `first_slot_block` of slot `slot_idx`, and
-    /// record its tenant + extent.
+    /// Add an extent of up to `requested_blocks` available blocks for `open_file`,
+    /// recreating its per-file map first if eviction pruned it.
     ///
     /// `None` when another worker already covered `file_block`: two workers can miss
     /// the same block and both try to pack it; the first to take the file's write lock
     /// inserts an extent, so the second finds the block covered and backs off (its
     /// caller then re-resolves it as a hit).
-    fn claim_run(
+    fn try_add_extent_for_location(
         &self,
         open_file: &OpenFile,
         slot_idx: usize,
@@ -493,52 +502,73 @@ impl CompressedCache {
         file_block: usize,
         requested_blocks: usize,
     ) -> Option<Extent> {
-        // Reserve within one file's extent map, held under its own write lock.
-        let reserve = |extents_lock: &RwLock<BTreeMap<usize, Extent>>| -> Option<Extent> {
-            let mut extents = extents_lock.write().unwrap();
-            let block_count = count_claimable_blocks(&extents, file_block, requested_blocks);
-            if block_count == 0 {
-                return None;
-            }
-            let extent = Extent {
-                first_file_block: file_block,
-                slot_idx: slot_idx as u32,
-                first_slot_block: first_slot_block as u16,
-                block_count: block_count as u16,
-            };
-            // Record the tenant before the extent: an extent with no tenant would leak
-            // (eviction only drops runs listed as tenants), while a tenant with no
-            // extent is harmless (eviction skips it).
-            self.tenants_mut(slot_idx).push(Tenant {
-                open_file: open_file.clone(),
-                first_file_block: file_block,
-            });
-            extents.insert(file_block, extent);
-            // Mark it referenced so the fresh run survives one CLOCK sweep.
-            memory_ctx().clock().touch(slot_idx);
-            Some(extent)
-        };
-
         // Fast path: the file's map already exists (`open_entry` registered it), so
-        // reserve under the cheap outer read lock, which blocks a concurrent prune from
-        // dropping the file mid-reservation. The read guard is a named binding so it
-        // drops at the block's end - a thread can't hold this `RwLock` for read and
-        // write at once, so it must be released before the miss path below.
+        // register under the cheap outer read lock, which blocks a concurrent prune
+        // from dropping the file mid-registration. The read guard is a named binding
+        // so it drops at the block's end - a thread can't hold this `RwLock` for read
+        // and write at once, so it must be released before the slow path below.
         {
             let file_maps = self.file_maps.read().unwrap();
             if let Some(extents_lock) = file_maps.get(open_file) {
-                return reserve(extents_lock);
+                return self.try_add_extent_to_map(
+                    open_file,
+                    extents_lock,
+                    slot_idx,
+                    first_slot_block,
+                    file_block,
+                    requested_blocks,
+                );
             }
         }
-        // Rare: a prior eviction pruned the whole file. Recreate its map and reserve
+        // Rare: a prior eviction pruned the whole file. Recreate its map and register
         // under one outer write lock - no lock upgrade, and no prune can race in.
-        reserve(
-            self.file_maps
-                .write()
-                .unwrap()
-                .entry(open_file.clone())
-                .or_default(),
+        let mut file_maps = self.file_maps.write().unwrap();
+        let extents_lock = file_maps.entry(open_file.clone()).or_default();
+        self.try_add_extent_to_map(
+            open_file,
+            extents_lock,
+            slot_idx,
+            first_slot_block,
+            file_block,
+            requested_blocks,
         )
+    }
+
+    /// Atomically add a new extent to an existing per-file map: choose the available
+    /// block prefix, record the slot tenant, insert the mapping, and touch the slot.
+    /// The map's write lock serializes overlapping misses, so only the first worker
+    /// to cover `file_block` succeeds.
+    fn try_add_extent_to_map(
+        &self,
+        open_file: &OpenFile,
+        extents_lock: &RwLock<BTreeMap<usize, Extent>>,
+        slot_idx: usize,
+        first_slot_block: usize,
+        file_block: usize,
+        requested_blocks: usize,
+    ) -> Option<Extent> {
+        let mut extents = extents_lock.write().unwrap();
+        let block_count = count_available_blocks(&extents, file_block, requested_blocks);
+        if block_count == 0 {
+            return None;
+        }
+        let extent = Extent {
+            first_file_block: file_block,
+            slot_idx: slot_idx as u32,
+            first_slot_block: first_slot_block as u16,
+            block_count: block_count as u16,
+        };
+        // Record the tenant before the extent: an extent with no tenant would leak
+        // (eviction only drops extents listed as tenants), while a tenant with no
+        // extent is harmless (eviction skips it).
+        self.tenants_mut(slot_idx).push(Tenant {
+            open_file: open_file.clone(),
+            first_file_block: file_block,
+        });
+        extents.insert(file_block, extent);
+        // Mark it referenced so the fresh extent survives one CLOCK sweep.
+        memory_ctx().clock().touch(slot_idx);
+        Some(extent)
     }
 
     /// Point the fill cursor at a fresh, empty slot: reset its bitmap and tenant list
@@ -546,8 +576,8 @@ impl CompressedCache {
     fn rotate_fill_buffer(&self, cursor: &mut FillCursor) {
         let write_buffer = memory_ctx().get_write_buffer(false);
         let slot_idx = write_buffer.slot_idx;
-        let entry = self.entry(slot_idx);
-        entry.valid.clear();
+        let metadata = self.slot_metadata(slot_idx);
+        metadata.valid.clear();
         self.tenants_mut(slot_idx).clear();
         memory_ctx().clock().bind(slot_idx, Owner::Compressed);
         cursor.buffer = Some(Arc::new(ReadBuffer::from(write_buffer))); // used = 1, Release
@@ -558,32 +588,32 @@ impl CompressedCache {
     /// Borrow ring slot `idx`'s cache metadata. `valid` is always safe to touch;
     /// `tenants` is sound to touch only under the fill pin (filler) or `try_write`
     /// exclusivity (evictor).
-    fn entry(&self, idx: usize) -> &Entry {
-        unsafe { &*self.entries[idx].get() }
+    fn slot_metadata(&self, idx: usize) -> &SlotMetadata {
+        unsafe { &*self.slot_metadatas[idx].get() }
     }
 
     /// Mutable access to slot `idx`'s tenant list. Sound only under the fill pin
     /// (filler) or `try_write` exclusivity (evictor) - the one `unsafe` for the
-    /// `tenants` invariant lives here. See [`entry`](Self::entry).
+    /// `tenants` invariant lives here. See [`slot_metadata`](Self::slot_metadata).
     #[allow(clippy::mut_from_ref)] // interior mutability via UnsafeCell; see above
     fn tenants_mut(&self, idx: usize) -> &mut Vec<Tenant> {
-        unsafe { &mut *self.entry(idx).tenants.get() }
+        unsafe { &mut *self.slot_metadata(idx).tenants.get() }
     }
 
     /// Reset a slot's validity and release it from the clock. Sound only while the
     /// slot is held exclusively (`try_write` succeeded); the caller must have already
     /// taken or cleared its tenant list.
     fn recycle_slot(&self, idx: usize) {
-        let entry = self.entry(idx);
-        entry.valid.clear();
+        let metadata = self.slot_metadata(idx);
+        metadata.valid.clear();
         memory_ctx().clock().release(idx);
     }
 
     /// Reclaim compressed slot `slot_idx` if it can be taken exclusively: drop every
-    /// run packed in it from its file's extent map, recycle it, and return it
+    /// extent packed in it from its file's extent map, recycle it, and return it
     /// writable. `None` when a reader still pins it or it is no longer compressed.
     ///
-    /// Each dropped run's decompressed twins (if any) are reinforced: with the
+    /// Each dropped extent's decompressed twins (if any) are reinforced: with the
     /// compressed copy gone they are the last in-memory copy of those bytes,
     /// and losing them too would turn the next read into disk IO.
     pub(crate) fn reclaim(&self, slot_idx: usize) -> Option<WriteBuffer> {
@@ -603,12 +633,13 @@ impl CompressedCache {
                     continue;
                 };
                 let mut extents = extents_lock.write().unwrap();
-                // Skip a run re-placed into another slot after this tenant was recorded.
+                // Skip an extent re-placed into another slot after this tenant was
+                // recorded.
                 if let Some(extent) = extents
                     .get(&tenant.first_file_block)
                     .filter(|extent| extent.slot_idx as usize == slot_idx)
                 {
-                    // Each dropped run's decompressed twins become the last
+                    // Each dropped extent's decompressed twins become the last
                     // in-memory copy of those bytes; reinforcing takes the
                     // decompressed cache's read locks under our map locks, which
                     // is safe because the decompressed evictor only walks OUR
@@ -631,11 +662,11 @@ impl CompressedCache {
         Some(write_buffer)
     }
 
-    /// Reinforce every cached run overlapping the file byte range
+    /// Reinforce every cached extent overlapping the file byte range
     /// `[offset, offset + len)` - called by the decompressed cache when it
-    /// evicts a block over that range, leaving these runs the last in-memory
+    /// evicts a block over that range, leaving these extents the last in-memory
     /// copy of it. Takes only read locks; slot granularity, so a multi-tenant
-    /// slot's other runs shelter under the same reinforcement.
+    /// slot's other extents shelter under the same reinforcement.
     pub(crate) fn reinforce_range(&self, open_file: &OpenFile, offset: usize, len: usize) {
         if len == 0 {
             return;
@@ -648,8 +679,8 @@ impl CompressedCache {
             return;
         };
         let extents = extents_lock.read().unwrap();
-        // The run covering `first_file_block` may start before it, so begin the
-        // walk at the greatest key at or before it and skip a leading run that
+        // The extent covering `first_file_block` may start before it, so begin the
+        // walk at the greatest key at or before it and skip a leading extent that
         // doesn't actually reach the range.
         let walk_start = extents
             .range(..=first_file_block)
@@ -668,7 +699,7 @@ impl CompressedCache {
     /// `Arc<File>` / `Arc<RemoteFile>`), so without this a dead entry - pinning its
     /// `Arc` and the file/connection it holds - lingers for every file ever opened.
     /// Re-checks emptiness under the write lock so a concurrent `get` that just
-    /// re-cached a run isn't dropped.
+    /// cached a new extent isn't dropped.
     fn prune_empty_file_locations(&self, locations: Vec<OpenFile>) {
         if locations.is_empty() {
             return;
@@ -683,8 +714,8 @@ impl CompressedCache {
         }
     }
 
-    /// Register a [`OpenFile`] (a local fd or a remote object) so its runs can
-    /// be cached. Clears any runs from a previous registration of an equal file
+    /// Register a [`OpenFile`] (a local fd or a remote object) so its extents can
+    /// be cached. Clears any extents from a previous registration of an equal file
     /// (e.g. a reused fd number) by dropping its extent map - the next lookup then
     /// misses. The orphaned tenants in their slots self-clean on eviction (their
     /// extent is gone, so the per-slot guard skips them).
@@ -693,15 +724,16 @@ impl CompressedCache {
         // for the same reason the compressed map is reset below: a reopened fd may
         // now name a different file, so its old pages must not serve a later read.
         memory_ctx().decompressed_cache().invalidate(&open_file);
-        // The `file_maps` write lock serializes with `pack_gap`'s read, so a racing
-        // miss either sees the fresh empty map or has its run dropped here.
+        // The `file_maps` write lock serializes with
+        // `try_add_extent_for_location`'s read, so a racing miss either sees the
+        // fresh empty map or has its extent dropped here.
         self.file_maps
             .write()
             .unwrap()
             .insert(open_file, Default::default());
     }
 
-    /// Evict every cached run: drop all extent maps and recycle the ring slots they
+    /// Evict every cached extent: drop all extent maps and recycle the ring slots they
     /// referenced, so subsequent reads miss and re-read from disk. Registered file
     /// descriptors stay open (their maps are just emptied). Returns the number of
     /// extents dropped.
@@ -709,7 +741,7 @@ impl CompressedCache {
     /// Intended for benchmarking true cold reads (`SELECT drop_cache()`). Sound only
     /// while no query is in flight: it recycles bound slots, which must not race a
     /// reader holding a pin (an actively-filling slot another worker still pins is
-    /// left intact - its runs are already dropped from the map, so it serves no
+    /// left intact - its extents are already dropped from the map, so it serves no
     /// stale hits).
     pub fn clear(&self) -> usize {
         // Release this worker's fill pin first, so its own fill slot is recyclable
@@ -730,7 +762,7 @@ impl CompressedCache {
 
         // Recycle each slot we can take exclusively and that is still ours; one
         // another worker is still filling stays pinned and is left intact (its
-        // runs are already dropped), and one already recycled and re-bound to a
+        // extents are already dropped), and one already recycled and re-bound to a
         // new owner in the window since the drain must not be ripped away from it.
         for slot_idx in slots {
             if let Some(write_buffer) = memory_ctx().ring().try_write(slot_idx) {
@@ -755,8 +787,8 @@ fn find_extent_covering(extents: &BTreeMap<usize, Extent>, file_block: usize) ->
 }
 
 /// How many blocks from `file_block` are free of any extent, up to `want` - the
-/// claimable prefix of the gap. Zero if `file_block` is already covered.
-fn count_claimable_blocks(
+/// available prefix of the gap. Zero if `file_block` is already covered.
+fn count_available_blocks(
     extents: &BTreeMap<usize, Extent>,
     file_block: usize,
     want: usize,
@@ -845,8 +877,8 @@ mod tests {
         }
     }
 
-    /// Every missing run across a set of lookups, cloned.
-    fn missing_blocks(lookups: &[CacheLookup]) -> Vec<MissingExtent> {
+    /// Every missing extent across a set of lookups, cloned.
+    fn missing_extents(lookups: &[CacheLookup]) -> Vec<MissingExtent> {
         lookups
             .iter()
             .filter_map(|l| l.missing().cloned())
@@ -898,12 +930,12 @@ mod tests {
         init_test_free_pool(8);
         cache().open_entry(FD());
 
-        // Three blocks, none present → one freshly-packed run, one missing extent.
+        // Three blocks, none present → one freshly packed extent.
         let miss = cache().get(&FD(), 0, 2 * SB + 1);
-        let blocks = missing_blocks(&miss);
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].extent.block_count, 3);
-        assert_eq!(blocks[0].len(), 3 * SB);
+        let extents = missing_extents(&miss);
+        assert_eq!(extents.len(), 1);
+        assert_eq!(extents[0].extent.block_count, 3);
+        assert_eq!(extents[0].len(), 3 * SB);
     }
 
     #[test]
@@ -918,10 +950,10 @@ mod tests {
 
         // Ask for blocks 0..=2; only 1 and 2 are missing.
         let again = cache().get(&FD(), 0, 2 * SB + 1);
-        let blocks = missing_blocks(&again);
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].file_offset(), SB);
-        assert_eq!(blocks[0].extent.block_count, 2);
+        let extents = missing_extents(&again);
+        assert_eq!(extents.len(), 1);
+        assert_eq!(extents[0].file_offset(), SB);
+        assert_eq!(extents[0].extent.block_count, 2);
     }
 
     #[test]
@@ -969,13 +1001,13 @@ mod tests {
         cache().open_entry(FD());
 
         // One read spanning more than a whole slot (513 blocks) splits at the 2 MB
-        // boundary into two runs in two slots.
+        // boundary into two extents in two slots.
         let miss = cache().get(&FD(), 0, BLOCKS_PER_SLOT * SB + 1);
-        let blocks = missing_blocks(&miss);
-        assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0].extent.block_count as usize, BLOCKS_PER_SLOT);
-        assert_eq!(blocks[1].extent.block_count, 1);
-        assert_ne!(blocks[0].extent.slot_idx, blocks[1].extent.slot_idx);
+        let extents = missing_extents(&miss);
+        assert_eq!(extents.len(), 2);
+        assert_eq!(extents[0].extent.block_count as usize, BLOCKS_PER_SLOT);
+        assert_eq!(extents[1].extent.block_count, 1);
+        assert_ne!(extents[0].extent.slot_idx, extents[1].extent.slot_idx);
 
         fill_pattern(&miss);
         assert_pattern(&assemble(miss), 0);
@@ -993,14 +1025,14 @@ mod tests {
 
         // Read blocks 2..=5: 2,3 hit; only 4,5 are fetched.
         let second = cache().get(&FD(), 2 * SB, 4 * SB);
-        let blocks = missing_blocks(&second);
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].file_offset(), 4 * SB);
-        assert_eq!(blocks[0].extent.block_count, 2);
+        let extents = missing_extents(&second);
+        assert_eq!(extents.len(), 1);
+        assert_eq!(extents[0].file_offset(), 4 * SB);
+        assert_eq!(extents[0].extent.block_count, 2);
     }
 
     #[test]
-    fn hit_reassembles_bytes_across_runs() {
+    fn hit_reassembles_bytes_across_lookups() {
         init_test_free_pool(8);
         cache().open_entry(FD());
         let miss = cache().get(&FD(), SB - 5, SB + 10);
@@ -1077,9 +1109,9 @@ mod tests {
 
         let m = cache().get(&FD(), 0, 2 * SB);
         assert!(has_misses(&m));
-        let blocks = missing_blocks(&m);
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].file_offset(), SB); // only the hole
+        let extents = missing_extents(&m);
+        assert_eq!(extents.len(), 1);
+        assert_eq!(extents[0].file_offset(), SB); // only the hole
         fill_pattern(&m);
         let bytes = assemble(m);
 
@@ -1087,21 +1119,21 @@ mod tests {
     }
 
     #[test]
-    fn get_assembles_a_range_spanning_cached_and_uncached_runs() {
+    fn get_assembles_a_range_spanning_cached_and_uncached_lookups() {
         init_test_free_pool(8);
         cache().open_entry(FD());
         // Cache [0, SB); leave [SB, 2*SB) uncached.
         fill_pattern(&cache().get(&FD(), 0, SB));
 
         let parts = cache().get(&FD(), 0, 2 * SB);
-        assert!(has_misses(&parts), "the second run is a hole");
+        assert!(has_misses(&parts), "the second lookup is a hole");
         fill_pattern(&parts);
 
         assert_pattern(&assemble(parts), 0);
     }
 
     #[test]
-    fn reopening_a_file_forgets_its_cached_runs() {
+    fn reopening_a_file_forgets_its_cached_extents() {
         init_test_free_pool(8);
         cache().open_entry(FD());
         fill_pattern(&cache().get(&FD(), 0, SB));
@@ -1117,7 +1149,7 @@ mod tests {
     fn evict_does_not_steal_a_slot_from_the_free_pool() {
         init_test_free_pool(2);
         cache().open_entry(FD());
-        // A real cached run binds a slot; its set ref_bit makes the CLOCK hand skip
+        // A real cached extent binds a slot; its set ref_bit makes the CLOCK hand skip
         // it once, so the evictor reaches a slot that is still in the pool.
         fill_pattern(&cache().get(&FD(), 0, SB));
         release_fill_cursor();
@@ -1135,7 +1167,7 @@ mod tests {
     }
 
     #[test]
-    fn evicting_a_slot_drops_every_tenants_extent() {
+    fn evicting_a_slot_drops_all_tenant_extents() {
         init_test_free_pool(16);
         let files: Vec<OpenFile> = (0..3).map(|_| new_file()).collect();
         for f in &files {
@@ -1144,7 +1176,7 @@ mod tests {
         }
         release_fill_cursor();
 
-        // The three runs share one slot; evicting it drops all three extents and
+        // The three extents share one slot; evicting it drops all three mappings and
         // prunes their now-empty file_maps entries.
         memory_ctx().evict();
 
@@ -1152,7 +1184,7 @@ mod tests {
         for f in &files {
             assert!(
                 !file_maps.contains_key(f),
-                "an evicted run's file_maps entry was left behind - leak",
+                "an evicted extent's file_maps entry was left behind - leak",
             );
         }
     }
@@ -1164,7 +1196,7 @@ mod tests {
         fill_pattern(&cache().get(&FD(), 0, SB));
         release_fill_cursor();
 
-        // Evict the slot the run lived in; its extent is dropped.
+        // Evict the slot the extent lived in; its mapping is dropped.
         memory_ctx().evict();
 
         // The same range must now miss, not read recycled bytes.
@@ -1182,7 +1214,7 @@ mod tests {
         memory_ctx().evict();
         assert!(
             !cache().file_maps.read().unwrap().contains_key(&f),
-            "evicting the last run should prune the entry",
+            "evicting the last extent should prune the entry",
         );
 
         // Reading f again must tolerate the absent entry: re-create it + miss.
@@ -1209,7 +1241,7 @@ mod tests {
 
         assert!(
             !has_misses(&cache().get(&FD(), 0, SB)),
-            "the under-target compressed run must survive"
+            "the under-target compressed extent must survive"
         );
         assert_eq!(memory_ctx().clock().owned(Owner::Decompressed), 9);
     }
@@ -1229,12 +1261,12 @@ mod tests {
     }
 
     #[test]
-    fn evicting_a_compressed_run_reinforces_its_decompressed_twin() {
+    fn evicting_a_compressed_extent_reinforces_its_decompressed_twin() {
         init_test_free_pool(8);
         cache().open_entry(FD());
         fill_pattern(&cache().get(&FD(), 0, SB));
         release_fill_cursor();
-        // Same file range as the compressed run: its decompressed twin.
+        // Same file range as the compressed extent: its decompressed twin.
         let twin_slot = insert_decompressed(0, SB);
         assert_eq!(memory_ctx().clock().refs(twin_slot), 1);
 
