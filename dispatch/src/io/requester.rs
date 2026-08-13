@@ -169,6 +169,12 @@ impl IORequester {
         self.has_file_pending() || self.has_http_pending()
     }
 
+    /// The handle a waker uses to interrupt this requester's blocking
+    /// [`wait`](Self::wait) from another thread.
+    pub fn wake_handle(&self) -> crate::io::RingWakeHandle {
+        self.backend.wake_handle()
+    }
+
     /// Returns `true` if any disk read is in flight - operator reads here, plus
     /// the engine's cache-file reads / write-backs (all on the shared backend).
     pub fn has_file_pending(&self) -> bool {

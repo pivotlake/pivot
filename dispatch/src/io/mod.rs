@@ -39,6 +39,7 @@ use std::time::Duration;
 use url::Url;
 
 mod requester;
+pub use backend::RingWakeHandle;
 pub use requester::{Error as IORequesterError, IORequester, RING_SIZE};
 
 mod cached_http;

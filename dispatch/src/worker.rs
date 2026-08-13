@@ -201,6 +201,12 @@ impl Worker {
                     node_local_idx,
                     last_seen_broadcast,
                 };
+                // Notifiers must be able to interrupt this worker's blocking
+                // IO wait, not just its thread park; register the ring's wake
+                // line alongside the thread handle.
+                worker
+                    .waker
+                    .register_ring_waker(node_local_idx, worker.io.wake_handle());
                 debug!("Initializing memory context for worker {:?}", idx);
                 init_memory_context(memory_context_factory.create_memory_ctx());
                 debug!("Pre-faulting for worker {:?}", idx);
@@ -560,10 +566,21 @@ impl Worker {
             if !self.did_work_last_iteration {
                 // One ring serves both disk and HTTP, so a single wait wakes on
                 // either kind of completion — no dual-ring coordination needed.
+                // The wait doubles as a select over worker notifications: the
+                // slot published around it lets a notifier interrupt the ring
+                // (see `begin_ring_wait`), so a message sent mid-wait resumes
+                // the loop instead of stalling behind the slowest read.
                 if self.io.has_pending() {
                     debug!("Waiting for IO...");
                     let started = std::time::Instant::now();
-                    self.io.wait()?;
+                    if self
+                        .waker
+                        .begin_ring_wait(self.node_local_idx, self.last_seen_wake_count)
+                    {
+                        self.io.wait()?;
+                        self.waker.end_ring_wait(self.node_local_idx);
+                    }
+                    self.last_seen_wake_count = self.waker.wake_count();
                     warn_slow("io_wait", started);
                     continue;
                 }

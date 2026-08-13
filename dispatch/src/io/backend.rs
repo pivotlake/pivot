@@ -39,6 +39,49 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 /// left off, so the caller must already handle a short completion (it does).
 pub(crate) const MAX_IO_OP_LEN: usize = 0x7fff_f000;
 
+/// The `user_data` of a worker wake-up event, distinct from every disk id (small
+/// counters) and every HTTP id (the `HTTP_TAG` bit plus a counter, which never
+/// reaches all-ones). Both backends filter it out of `completions`, so a wake
+/// never surfaces as an IO completion.
+pub(crate) const WAKE_UD: u64 = u64::MAX;
+
+/// Wakes a worker blocked in its backend's completion wait, from any thread.
+///
+/// On Linux the handle is the worker ring's eventfd: writing it completes the
+/// standing poll the backend keeps armed, so `submit_and_wait` returns. On
+/// other platforms it is a clone of the completion channel's sender, and the
+/// wake is a sentinel message. Either way the woken worker sees an empty-handed
+/// wait and re-runs its loop, which is where it finds the work the waker was
+/// signalling about. The handle stays valid for the worker's lifetime (workers
+/// live until process shutdown).
+#[derive(Clone)]
+pub enum RingWakeHandle {
+    #[cfg(target_os = "linux")]
+    EventFd(std::os::unix::io::RawFd),
+    #[cfg(not(target_os = "linux"))]
+    Channel(crossbeam_channel::Sender<(i32, Identifier)>),
+}
+
+impl RingWakeHandle {
+    pub fn wake(&self) {
+        match self {
+            #[cfg(target_os = "linux")]
+            RingWakeHandle::EventFd(fd) => {
+                let one: u64 = 1;
+                // A full eventfd counter (EAGAIN) already means a wake is
+                // pending, which is all this write is for.
+                unsafe {
+                    libc::write(*fd, (&one as *const u64).cast(), size_of::<u64>());
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            RingWakeHandle::Channel(sender) => {
+                let _ = sender.send((0, WAKE_UD as Identifier));
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Linux: io_uring backend
 // ============================================================================
@@ -47,11 +90,20 @@ pub(crate) const MAX_IO_OP_LEN: usize = 0x7fff_f000;
 mod uring_backend {
     use super::*;
     use io_uring::{IoUring, opcode, types};
+    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::io::RawFd;
 
     /// io_uring based backend for Linux.
     pub struct IOBackend {
         pub ring: IoUring,
+        /// The worker's wake-up line: [`RingWakeHandle::wake`] writes it, the
+        /// standing poll below turns the write into a CQE, and a blocked
+        /// `submit_and_wait` returns.
+        wake_eventfd: std::os::fd::OwnedFd,
+        /// Whether the [`WAKE_UD`] poll on the eventfd is currently in flight.
+        /// Re-armed after every firing (and after a full submission queue made
+        /// arming fail).
+        wake_armed: bool,
     }
 
     impl IOBackend {
@@ -67,7 +119,54 @@ mod uring_backend {
                 }
                 Err(e) => return Err(e),
             };
-            Ok(Self { ring })
+            let raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+            if raw < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let wake_eventfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+            let mut backend = Self {
+                ring,
+                wake_eventfd,
+                wake_armed: false,
+            };
+            backend.arm_wake();
+            Ok(backend)
+        }
+
+        /// The handle a waker uses to interrupt this ring's completion wait.
+        pub fn wake_handle(&self) -> RingWakeHandle {
+            RingWakeHandle::EventFd(self.wake_eventfd.as_raw_fd())
+        }
+
+        /// Keep one poll on the wake eventfd in flight. A full submission
+        /// queue just defers the re-arm to the next submit/completion pass;
+        /// a wake written in the meantime stays in the eventfd counter and
+        /// fires the moment the poll lands.
+        fn arm_wake(&mut self) {
+            if self.wake_armed {
+                return;
+            }
+            let poll = opcode::PollAdd::new(
+                types::Fd(self.wake_eventfd.as_raw_fd()),
+                libc::POLLIN as u32,
+            )
+            .build()
+            .user_data(WAKE_UD);
+            if unsafe { self.ring.submission().push(&poll) }.is_ok() {
+                self.wake_armed = true;
+            }
+        }
+
+        /// Reset the eventfd counter after its poll fired.
+        fn drain_wake(&mut self) {
+            let mut counter = 0u64;
+            unsafe {
+                libc::read(
+                    self.wake_eventfd.as_raw_fd(),
+                    (&mut counter as *mut u64).cast(),
+                    size_of::<u64>(),
+                );
+            }
         }
 
         /// Pushes a read of `length` bytes into `dest` onto the submission queue
@@ -129,11 +228,15 @@ mod uring_backend {
 
         /// Flushes the submission queue to the kernel.
         pub fn submit(&mut self) -> io::Result<usize> {
+            self.arm_wake();
             self.ring.submit()
         }
 
-        /// Flushes and blocks until at least `want` completions are ready.
+        /// Flushes and blocks until at least `want` completions are ready. A
+        /// worker-wake write to the eventfd counts as a completion (its poll
+        /// CQE), so a waker can cut the wait short: see [`RingWakeHandle`].
         pub fn submit_and_wait(&mut self, want: usize) -> io::Result<usize> {
+            self.arm_wake();
             self.ring.submit_and_wait(want)
         }
 
@@ -147,15 +250,25 @@ mod uring_backend {
         pub fn completions(&mut self) -> io::Result<Vec<(i32, Identifier)>> {
             let mut out = Vec::new();
             loop {
+                let mut wake_fired = false;
                 let dropped = {
                     let mut cq = self.ring.completion();
                     for cqe in &mut cq {
+                        if cqe.user_data() == WAKE_UD {
+                            wake_fired = true;
+                            continue;
+                        }
                         out.push((cqe.result(), cqe.user_data() as Identifier));
                     }
                     cq.overflow()
                     // `cq` drops here, publishing the consumed head so the kernel can
                     // refill the ring (and accept the backlog flushed below).
                 };
+                if wake_fired {
+                    self.drain_wake();
+                    self.wake_armed = false;
+                    self.arm_wake();
+                }
                 // A kernel without `IORING_FEAT_NODROP` silently *drops* completions it
                 // can't fit. They're gone, so surface it loudly rather than losing reads.
                 if dropped > 0 {
@@ -482,22 +595,37 @@ mod pread_pool_backend {
             Ok(dispatched)
         }
 
+        /// The handle a waker uses to interrupt this backend's completion wait:
+        /// a sender onto the completion channel, carrying the [`WAKE_UD`]
+        /// sentinel the drains below filter out.
+        pub fn wake_handle(&self) -> RingWakeHandle {
+            RingWakeHandle::Channel(self.sink.clone())
+        }
+
         /// Moves every completion the pool has delivered so far off the channel
-        /// into `ready` (non-blocking).
+        /// into `ready` (non-blocking). Wake sentinels are dropped: they exist
+        /// only to end a blocking wait, and are not in-flight ops.
         fn drain_ready(&mut self) {
             while let Ok(completion) = self.rx.try_recv() {
+                if completion.1 == WAKE_UD as Identifier {
+                    continue;
+                }
                 self.ready.push_back(completion);
                 self.in_flight -= 1;
             }
         }
 
         /// Buffers completions into `ready`, blocking, until at least `want` are
-        /// held or nothing is left in flight. `self.sink` keeps a sender alive, so
-        /// `recv` only ever blocks; it never errors on a closed channel.
+        /// held, nothing is left in flight, or a wake sentinel arrives. `self.sink`
+        /// keeps a sender alive, so `recv` only ever blocks; it never errors on a
+        /// closed channel.
         fn block_until_ready(&mut self, want: usize) {
             self.drain_ready();
             while self.ready.len() < want && self.in_flight > 0 {
                 let completion = self.rx.recv().expect("backend holds a sender");
+                if completion.1 == WAKE_UD as Identifier {
+                    return;
+                }
                 self.ready.push_back(completion);
                 self.in_flight -= 1;
             }
