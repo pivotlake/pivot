@@ -18,13 +18,14 @@ use crate::parquet::reading::decoding::leaf_decoders::levels::decode_def_levels;
 use crate::parquet::reading::decoding::leaf_decoders::rle::RleDecoder;
 use crate::parquet::reading::decoding::leaf_decoders::{
     ArrayBuilder, DecodeDelta, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error,
-    LeafDecoder, Result,
+    LeafDecoder, PredicateMask, Result,
 };
 use crate::parquet::types::filter_mask::RunningFilterMask;
 use crate::parquet::types::page::{DataPage, DecompressedPage, DecompressedPageType};
 use crate::parquet::types::thrift::general::Encoding;
 use crate::parquet::types::thrift::headers::DataPageHeader;
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
+use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use bytes::Bytes;
 use dispatch::arrays::ValidityBuilder;
 use dispatch::memory::{MultiBufferReader, ReaderPosition, SlabAllocator};
@@ -257,6 +258,12 @@ where
     /// [`Self::eq_const`]. Stays `false` until a dictionary page proves the
     /// constant absent.
     dict_excludes_eq_constant: bool,
+    /// The claimed comparison this leaf answers from its keys alone, when the
+    /// column is read for nothing else. `negated` tells `<>` from `=`.
+    mask_const: Option<(DC::EqConstant, bool)>,
+    /// That comparison's answer per dictionary entry, built when the dictionary
+    /// page arrives. `None` until then, or when the flavour cannot decide it.
+    entry_matches: Option<Vec<bool>>,
     phantom_data: PhantomData<B>,
 }
 
@@ -278,8 +285,31 @@ where
             dict: None,
             eq_const: None,
             dict_excludes_eq_constant: false,
+            mask_const: None,
+            entry_matches: None,
             phantom_data: Default::default(),
         }
+    }
+
+    /// Answer the claimed comparison once per dictionary entry, so the decode
+    /// loop settles a whole RLE run with one lookup. `None` when there is no
+    /// claimed constant, the leaf is nullable (a null satisfies no comparison,
+    /// and the mask path does not read definition levels), or the dictionary
+    /// flavour cannot decide equality.
+    fn build_entry_matches(&self) -> Option<Vec<bool>> {
+        if self.max_def_level > 0 {
+            return None;
+        }
+        let (needle, negated) = self.mask_const.as_ref()?;
+        let mut matches = match &self.dict {
+            Some(DictStorage::Contiguous(dict)) => dict.equality_bitmap(needle),
+            Some(DictStorage::Scattered(dict)) => dict.equality_bitmap(needle),
+            None => None,
+        }?;
+        if *negated {
+            matches.iter_mut().for_each(|m| *m = !*m);
+        }
+        Some(matches)
     }
 
     /// Selects the appropriate [`ValueDecoder`] (plain, RLE-dictionary, or
@@ -379,6 +409,47 @@ where
         self.eq_const = DC::eq_constant_from_scalar(value);
     }
 
+    fn set_mask_predicate(&mut self, value: &Scalar<ArrayRef>, negated: bool) {
+        self.mask_const = DC::eq_constant_from_scalar(value).map(|needle| (needle, negated));
+    }
+
+    fn can_read_predicate_mask(&self) -> bool {
+        self.entry_matches.is_some()
+    }
+
+    fn read_predicate_mask(&mut self, size: usize) -> Result<BooleanBuffer> {
+        let entry_matches = self
+            .entry_matches
+            .clone()
+            .expect("checked by can_read_predicate_mask");
+        let mut bits = BooleanBufferBuilder::new(size);
+        let mut produced = 0;
+        while produced < size {
+            if self.read_page.is_none() {
+                match self.create_next_read_page()? {
+                    Some(()) => {}
+                    None => break,
+                }
+            }
+            let read_page = self.read_page.as_mut().expect("a page was just prepared");
+            let take = (size - produced).min(read_page.remaining);
+            let mut mask = PredicateMask::new(&entry_matches, &mut bits);
+            match &mut read_page.decoder {
+                ValueDecoder::Rle(rle) => rle.read_mask(take, &mut mask),
+                // Gated out at install time: a claimed leaf takes this path only
+                // when every data page of its chunk is dictionary encoded.
+                _ => unreachable!("mask path requires an RLE-dictionary page"),
+            }
+            read_page.remaining -= take;
+            produced += take;
+            if read_page.remaining == 0 {
+                self.read_page = None;
+                self.page_idx += 1;
+            }
+        }
+        Ok(bits.finish())
+    }
+
     fn dict_excludes_eq_constant(&self) -> bool {
         self.dict_excludes_eq_constant
     }
@@ -449,6 +520,7 @@ where
                     }
                 }
                 self.dict = Some(DictStorage::build(data, size, allocator));
+                self.entry_matches = self.build_entry_matches();
             }
             DecompressedPageType::Data(data) => {
                 let idx = page.idx;

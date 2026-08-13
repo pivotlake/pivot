@@ -15,11 +15,13 @@ use crate::parquet::DecompressedPage;
 use crate::parquet::types::metadata::QueryRowGroupMetadata;
 use crate::parquet::types::projection::Projection;
 use ahash::HashSet;
-use arrow_array::{ArrayRef, RecordBatch, Scalar};
+use arrow_array::{ArrayRef, BooleanArray, RecordBatch, Scalar};
+use arrow_schema::ArrowError;
 use dispatch::Sender;
 use dispatch::WorkStatus;
 use dispatch::memory::SlabAllocator;
 use dispatch::{Unary, UnaryFactory};
+use planner::expression::CompareType;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -48,6 +50,37 @@ pub struct ScanEqualityPredicate {
     pub value: Scalar<ArrayRef>,
 }
 
+/// A comparison the scan applies itself, because the plan reported it as
+/// handled and carries no `Filter` for it.
+///
+/// Unlike [`ScanEqualityPredicate`], which only ever removes rows a `Filter`
+/// above would have removed anyway, this one is the sole thing standing between
+/// the query and a wrong answer: every emitted row must satisfy it.
+#[derive(Clone, Debug)]
+pub struct AppliedPredicate {
+    /// The compared column's position in the scan's (possibly extended)
+    /// projection. It may sit past the columns the plan asked for, when the
+    /// column is read only to answer this comparison.
+    pub output_idx: usize,
+    pub compare_type: CompareType,
+    pub value: Scalar<ArrayRef>,
+}
+
+impl AppliedPredicate {
+    /// The mask of rows in `column` that satisfy this comparison. A NULL input
+    /// makes the comparison NULL, which Arrow's filter treats as `false`, so a
+    /// null row is dropped exactly as SQL requires.
+    pub fn evaluate(&self, column: &ArrayRef) -> Result<BooleanArray, ArrowError> {
+        match self.compare_type {
+            CompareType::Equal => arrow_ord::cmp::eq(column, &self.value),
+            CompareType::NotEqual => arrow_ord::cmp::neq(column, &self.value),
+            other => Err(ArrowError::InvalidArgumentError(format!(
+                "scan cannot apply {other} itself"
+            ))),
+        }
+    }
+}
+
 /// Factory for creating [`Decoder`] instances, one per worker thread.
 pub struct DecoderFactory {
     /// Maximum number of rows per output [`RecordBatch`].
@@ -59,6 +92,11 @@ pub struct DecoderFactory {
     pub add_row_group_metadata: bool,
     /// Pushed-down equality predicates for dictionary pruning (may be empty).
     pub eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+    /// Comparisons the scan is solely responsible for (see [`AppliedPredicate`]).
+    pub applied_predicates: Arc<Vec<AppliedPredicate>>,
+    /// How many leading projected columns the batch should carry; any beyond
+    /// this were added only so a claimed comparison could read them.
+    pub output_columns: usize,
     /// This worker's claimed-but-not-fully-decoded row-group count, shared
     /// with its fetcher; decremented as row groups finish so the fetcher's
     /// claim backpressure releases (see `RowGroupFetcher`).
@@ -77,6 +115,8 @@ impl UnaryFactory<DecompressedPage, RecordBatch> for DecoderFactory {
             self.projection,
             self.add_row_group_metadata,
             self.eq_predicates,
+            self.applied_predicates,
+            self.output_columns,
             self.pending_row_groups,
             self.outstanding_row_groups,
         )
@@ -104,6 +144,11 @@ pub struct Decoder {
     add_row_group_metadata: bool,
     /// Pushed-down equality predicates for dictionary pruning (may be empty).
     eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+    /// Comparisons this scan applies itself (may be empty).
+    applied_predicates: Arc<Vec<AppliedPredicate>>,
+    /// Leading projected columns to emit; extras were read only for a claimed
+    /// comparison.
+    output_columns: usize,
     /// How many claimed row groups this worker has not fully decoded yet.
     /// Shared with the worker's fetcher, which consults it as claim
     /// backpressure; decremented once per row group as it completes
@@ -119,6 +164,8 @@ impl Decoder {
         projection: Projection,
         add_row_group_metadata: bool,
         eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+        applied_predicates: Arc<Vec<AppliedPredicate>>,
+        output_columns: usize,
         pending_row_groups: Arc<AtomicUsize>,
         outstanding_row_groups: Arc<AtomicUsize>,
     ) -> Self {
@@ -130,6 +177,8 @@ impl Decoder {
             closed_row_groups: Default::default(),
             add_row_group_metadata,
             eq_predicates,
+            applied_predicates,
+            output_columns,
             pending_row_groups,
             outstanding_row_groups,
         }
@@ -168,6 +217,8 @@ impl Decoder {
                 self.batch_size,
                 self.add_row_group_metadata,
                 &self.eq_predicates,
+                self.applied_predicates.clone(),
+                self.output_columns,
             )
             .map_err(crate::parquet::op_err)?,
         );
@@ -467,11 +518,16 @@ mod tests {
     }
 
     fn new_decoder(table: &Arc<ParquetTable>, batch_size: usize) -> Decoder {
+        let columns = Projection::all_from_schema(table.schema())
+            .column_indices
+            .len();
         Decoder::new(
             batch_size,
             Projection::all_from_schema(table.schema()),
             false,
             Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            columns,
             // A standalone decoder has no fetcher making claims, so seed the
             // counters high enough that releases never hit the underflow
             // assertion.
@@ -481,11 +537,16 @@ mod tests {
     }
 
     fn decoder_with_eq(table: &Arc<ParquetTable>, predicate: ScanEqualityPredicate) -> Decoder {
+        let columns = Projection::all_from_schema(table.schema())
+            .column_indices
+            .len();
         Decoder::new(
             1024,
             Projection::all_from_schema(table.schema()),
             false,
             Arc::new(vec![predicate]),
+            Arc::new(Vec::new()),
+            columns,
             // The claim-release counters; seeded like `new_decoder`'s.
             Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX / 2)),
             Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX / 2)),

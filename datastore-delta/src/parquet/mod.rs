@@ -34,9 +34,9 @@ mod request_tracker;
 
 pub(crate) mod reading;
 pub use reading::{
-    ColumnDecoderError, DecoderFactory, DecompressorError, DecompressorFactory, IndexerFactory,
-    MaterializerFactory, RowGroupFetcherFactory, RowGroupInjectorFactory, ScanEqualityPredicate,
-    materialize, pending_claim_bound, table_input, table_input_with_filter,
+    AppliedPredicate, ColumnDecoderError, DecoderFactory, DecompressorError, DecompressorFactory,
+    IndexerFactory, MaterializerFactory, RowGroupFetcherFactory, RowGroupInjectorFactory,
+    ScanEqualityPredicate, materialize, pending_claim_bound, table_input, table_input_with_filter,
     table_input_with_filter_and_eq_predicates,
 };
 

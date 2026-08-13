@@ -91,7 +91,11 @@ static void PivotScanPushdownComplexFilter(ClientContext &context, LogicalGet &g
 		RewriteRefsToStorage(*remapped, column_ids);
 		// Hand the (storage-remapped) DuckDB expression straight to Rust, which
 		// reads it through the same `expr_*` accessors the plan walk uses.
-		if (pushdown_filter(data.table, *remapped)) {
+		// How many columns the scan reads at this point. A table that takes
+		// sole responsibility for a filter uses it to judge how much work the
+		// scan would have to redo per batch, which is what decides whether
+		// owning the filter is worth it.
+		if (pushdown_filter(data.table, *remapped, column_ids.size())) {
 			it = filters.erase(it);
 		} else {
 			++it;

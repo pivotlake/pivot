@@ -1294,6 +1294,7 @@ fn scan_pushed_extract_filters_by_an_equality_constant() {
         value: Scalar::new(Arc::new(StringViewArray::from(vec!["bob"])) as ArrayRef),
     };
 
+    let projection_len = projection.column_indices.len();
     let results = table_input_with_filter_and_eq_predicates(
         &dispatch,
         &table,
@@ -1302,6 +1303,8 @@ fn scan_pushed_extract_filters_by_an_equality_constant() {
         None,
         None,
         Arc::new(vec![predicate]),
+        Arc::new(Vec::new()),
+        projection_len,
     )
     .collect()
     .unwrap();
@@ -1355,6 +1358,7 @@ fn scan_pushed_extract_ignores_an_equality_constant_it_cannot_apply() {
         value: Scalar::new(Arc::new(StringViewArray::from(vec!["bob"])) as ArrayRef),
     };
 
+    let projection_len = projection.column_indices.len();
     let results = table_input_with_filter_and_eq_predicates(
         &dispatch,
         &table,
@@ -1363,6 +1367,8 @@ fn scan_pushed_extract_ignores_an_equality_constant_it_cannot_apply() {
         None,
         None,
         Arc::new(vec![predicate]),
+        Arc::new(Vec::new()),
+        projection_len,
     )
     .collect()
     .unwrap();
@@ -1416,6 +1422,7 @@ fn scan_pushed_extract_ignores_an_equality_constant_across_a_cast() {
         value: Scalar::new(Arc::new(StringViewArray::from(vec!["bob"])) as ArrayRef),
     };
 
+    let projection_len = projection.column_indices.len();
     let results = table_input_with_filter_and_eq_predicates(
         &dispatch,
         &table,
@@ -1424,6 +1431,8 @@ fn scan_pushed_extract_ignores_an_equality_constant_across_a_cast() {
         None,
         None,
         Arc::new(vec![predicate]),
+        Arc::new(Vec::new()),
+        projection_len,
     )
     .collect()
     .unwrap();

@@ -19,8 +19,8 @@ use dispatch::{
 };
 
 use crate::parquet::{
-    CompressedPage, DecoderFactory, DecompressedPage, DecompressorFactory, IndexerFactory,
-    MaterializerFactory, ParquetTable, RowGroupBuffer, RowGroupFetcherFactory,
+    AppliedPredicate, CompressedPage, DecoderFactory, DecompressedPage, DecompressorFactory,
+    IndexerFactory, MaterializerFactory, ParquetTable, RowGroupBuffer, RowGroupFetcherFactory,
     RowGroupInjectorFactory, RowGroupRequest, ScanEqualityPredicate, ScanOrder,
     pending_claim_bound,
 };
@@ -33,6 +33,8 @@ pub(crate) fn read_parquet<OF>(
     batch_size: usize,
     add_row_group_metadata: bool,
     eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+    applied_predicates: Arc<Vec<AppliedPredicate>>,
+    output_columns: usize,
     pending_row_groups: Vec<Arc<AtomicUsize>>,
     outstanding_row_groups: Arc<AtomicUsize>,
 ) -> RecordBatchOperatorSpec
@@ -61,6 +63,8 @@ where
                     projection: projection.clone(),
                     add_row_group_metadata,
                     eq_predicates: eq_predicates.clone(),
+                    applied_predicates: applied_predicates.clone(),
+                    output_columns,
                     pending_row_groups: pending,
                     outstanding_row_groups: outstanding_row_groups.clone(),
                 })
@@ -84,6 +88,7 @@ pub fn table_input(
     projection: Projection,
     add_row_group_metadata: bool,
 ) -> RecordBatchOperatorSpec {
+    let projection_len = projection.column_indices.len();
     table_input_with_filter_and_eq_predicates(
         dispatcher,
         table,
@@ -92,6 +97,8 @@ pub fn table_input(
         None,
         None,
         Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+        projection_len,
     )
 }
 
@@ -104,6 +111,7 @@ pub fn table_input_with_filter(
     add_row_group_metadata: bool,
     filter: Option<RowGroupFilter>,
 ) -> RecordBatchOperatorSpec {
+    let projection_len = projection.column_indices.len();
     table_input_with_filter_and_eq_predicates(
         dispatcher,
         table,
@@ -112,6 +120,8 @@ pub fn table_input_with_filter(
         filter,
         None,
         Arc::new(Vec::new()),
+        Arc::new(Vec::new()),
+        projection_len,
     )
 }
 
@@ -126,6 +136,8 @@ pub fn table_input_with_filter_and_eq_predicates(
     filter: Option<RowGroupFilter>,
     scan_order: Option<ScanOrder>,
     eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+    applied_predicates: Arc<Vec<AppliedPredicate>>,
+    output_columns: usize,
 ) -> RecordBatchOperatorSpec {
     let n = dispatcher.worker_count();
     // A projection with no data columns can't go through the column-driven page
@@ -172,6 +184,8 @@ pub fn table_input_with_filter_and_eq_predicates(
         RECORD_BATCH_SIZE,
         add_row_group_metadata,
         eq_predicates,
+        applied_predicates,
+        output_columns,
         pending_row_groups,
         outstanding_row_groups,
     )
@@ -211,6 +225,7 @@ pub fn materialize(
             )
         })
         .collect();
+    let materialized_columns = projection.column_indices.len();
     let input = OperatorSpec::new(dispatcher, factories);
     read_parquet(
         input,
@@ -218,6 +233,11 @@ pub fn materialize(
         RECORD_BATCH_SIZE,
         false,
         Arc::new(Vec::new()),
+        // Re-reading rows that already survived every filter: applying a
+        // comparison again here would drop rows the caller is addressing by
+        // position.
+        Arc::new(Vec::new()),
+        materialized_columns,
         pending_row_groups,
         // The materializer path claims by explicit row-group requests, not the
         // injector, so this count is never consulted.

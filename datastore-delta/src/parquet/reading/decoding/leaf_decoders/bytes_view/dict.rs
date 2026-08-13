@@ -178,6 +178,20 @@ impl<V: ByteViewType> Dict for ViewDict<V> {
         (strings.len() == 1 && strings.is_valid(0)).then(|| strings.value(0).as_bytes().to_vec())
     }
 
+    /// One pass over the dictionary's distinct values, not over the rows, so
+    /// the generic byte-view comparison is cheap enough to pay per page.
+    fn equality_bitmap(&self, needle: &Vec<u8>) -> Option<Vec<bool>> {
+        let entries = self.as_arrow_array();
+        let needle_entry = GenericByteViewArray::<V>::new(
+            ScalarBuffer::from(vec![make_view(needle, 0, 0)]),
+            vec![Buffer::from(needle.as_slice())],
+            None,
+        );
+        let matches = arrow_ord::cmp::eq(&entries, &Scalar::new(&needle_entry))
+            .expect("the needle entry is built as the entries' own type");
+        Some((0..matches.len()).map(|i| matches.value(i)).collect())
+    }
+
     fn len(&self) -> usize {
         self.views.len()
     }

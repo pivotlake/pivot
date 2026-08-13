@@ -8,8 +8,8 @@ use crate::manifest::{ColumnStatFilter, PartitionEqFilter};
 use crate::parquet::types::leaves::{first_leaf, variant_shredded_leaves};
 use crate::parquet::types::metadata::RowGroupMetadata;
 use crate::parquet::{
-    ParquetTable, ScanEqualityPredicate, materialize, row_group_eliminated, row_group_filter_from,
-    scan_order_from, table_input_with_filter_and_eq_predicates,
+    AppliedPredicate, ParquetTable, ScanEqualityPredicate, materialize, row_group_eliminated,
+    row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
 };
 use arrow_array::{Array, ArrayRef, Scalar};
 use crossbeam_deque::Injector;
@@ -19,6 +19,7 @@ use planner::catalog::{
     TableReference, TableRevision,
 };
 use planner::expression::{CompareType, Expression, Function, JsonPath, TableFilter};
+use planner::types::physical_arrow_type;
 
 use super::CatalogTable;
 use super::insert_sink::{UploadedFile, build_insert_spec};
@@ -107,6 +108,10 @@ pub struct TableBinding {
     /// because the `BoundTable` trait gives no channel from `pushdown_filter` to
     /// `compile`); applied as a filter when the scan is compiled.
     predicates: Vec<PushedPredicate>,
+    /// The subset of `predicates` this binding reported as fully handled, so
+    /// the plan carries no `Filter` for them and the scan must apply each one
+    /// exactly to every row it emits.
+    owned_predicates: Vec<PushedPredicate>,
     /// The transaction's shared queue of finished INSERT files. Shared (`Arc`)
     /// with the [`DeltaTransaction`](super::DeltaTransaction) that produced this
     /// binding, so a file this binding's [`compile_insert`](BoundTable::compile_insert)
@@ -140,6 +145,7 @@ impl TableBinding {
             columns,
             nullability,
             predicates: Vec::new(),
+            owned_predicates: Vec::new(),
             uploaded_files,
         }
     }
@@ -236,6 +242,33 @@ impl BoundTable for TableBinding {
             })
             .collect();
 
+        // A claimed predicate has no `Filter` above it any more, so the scan
+        // must read its column even when the projection dropped it (a column
+        // nothing else selects, e.g. `COUNT(*) WHERE col <> 'x'`). Extra
+        // columns go on the end, and the decoder emits only the leading
+        // `output_columns` so the batch keeps the schema the plan expects.
+        let output_columns = projection.column_indices.len();
+        let mut projection = projection;
+        let mut applied: Vec<AppliedPredicate> = Vec::new();
+        for predicate in &self.owned_predicates {
+            let position = projection
+                .column_indices
+                .iter()
+                .position(|&c| c == predicate.column_idx)
+                .unwrap_or_else(|| {
+                    projection.column_indices.push(predicate.column_idx);
+                    if !projection.extracts.is_empty() {
+                        projection.extracts.push(None);
+                    }
+                    projection.column_indices.len() - 1
+                });
+            applied.push(AppliedPredicate {
+                output_idx: position,
+                compare_type: predicate.compare_type,
+                value: predicate.value.clone(),
+            });
+        }
+
         // Prune the row groups by the pushed-down predicates' stats.
         let parquet = Arc::new(self.pruned_parquet(&current));
         // Order the scan by the Top-N's key so its boundary tightens after the
@@ -249,6 +282,8 @@ impl BoundTable for TableBinding {
             row_group_filter_from(dynamic_filters),
             scan_order,
             Arc::new(eq_predicates),
+            Arc::new(applied),
+            output_columns,
         ))
     }
 
@@ -300,7 +335,11 @@ impl BoundTable for TableBinding {
         ))
     }
 
-    fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {
+    fn pushdown_filter(
+        &mut self,
+        filter: TableFilter,
+        scan_column_count: usize,
+    ) -> CatalogResult<bool> {
         let TableFilter::Expression(expr) = filter else {
             return Ok(false);
         };
@@ -317,16 +356,26 @@ impl BoundTable for TableBinding {
             _ => return Ok(false),
         };
 
-        // Just record it. The actual pruning (min/max row-group elimination and
-        // equality/dictionary pruning) happens in `compile`, once the row-group
-        // metadata exists. The upstream `Filter` is kept (we return `Ok(false)`),
-        // so this is purely an optimization and never affects correctness.
-        self.predicates.push(PushedPredicate {
+        let predicate = PushedPredicate {
             column_idx,
             path,
             compare_type: compare.compare_type,
             value: constant.clone(),
-        });
+        };
+
+        // Record it either way: min/max row-group elimination and
+        // equality/dictionary pruning read `predicates` when the scan is
+        // compiled, whoever ends up applying the comparison per row.
+        self.predicates.push(predicate.clone());
+
+        // Claiming it removes the plan's `Filter` for this condition, so the
+        // scan alone decides which rows survive and the column it reads need
+        // not be projected at all. Only shapes the scan can evaluate exactly
+        // are claimed; everything else keeps the `Filter` above.
+        if self.can_own_predicate(&predicate, scan_column_count) {
+            self.owned_predicates.push(predicate);
+            return Ok(true);
+        }
 
         Ok(false)
     }
@@ -404,6 +453,66 @@ fn scalar_lt(a: &Scalar<ArrayRef>, b: &Scalar<ArrayRef>) -> bool {
 }
 
 impl TableBinding {
+    fn can_own_predicate(&self, predicate: &PushedPredicate, scan_column_count: usize) -> bool {
+        // Owning the comparison means the scan drops the failing rows itself,
+        // which gathers every column the batch carries. The plan's `Filter`
+        // does that far better - it keeps a selection vector and only
+        // materializes when a cost model says it pays - so owning is only
+        // worth it when there is next to nothing to gather. One column is the
+        // shape that wins: the comparison's own, read for nothing else, which
+        // projection pushdown then drops entirely once the condition is gone.
+        if scan_column_count > 1 {
+            return false;
+        }
+        // A variant path reads a shredded leaf that only some files carry, so
+        // the scan cannot promise to evaluate it everywhere.
+        if !predicate.path.is_empty() {
+            return false;
+        }
+        // Equality is the whole vocabulary here: an ordering comparison would
+        // be just as easy to apply, but keeping the claim narrow keeps the set
+        // of shapes the scan must get exactly right small.
+        if !matches!(
+            predicate.compare_type,
+            CompareType::Equal | CompareType::NotEqual
+        ) {
+            return false;
+        }
+        // The comparison runs as an Arrow kernel against the decoded column, so
+        // the constant has to already be the column's physical type; a mismatch
+        // would error at scan time, with no `Filter` left to fall back on.
+        let Some(column) = self.columns.get(predicate.column_idx) else {
+            return false;
+        };
+        let arrow_type = physical_arrow_type(&column.col_type);
+        if arrow_array::Datum::get(&predicate.value).0.data_type() != &arrow_type {
+            return false;
+        }
+        // Owning only pays when the comparison can be answered from the
+        // chunk's dictionary keys, which needs every data page dictionary
+        // encoded. A column whose values are too varied for a dictionary (a
+        // user id, a hash) falls back to plain pages, and then owning buys
+        // nothing over the `Filter` while still costing it a gather.
+        self.column_is_all_dictionary(predicate.column_idx)
+    }
+
+    /// Whether every row group encodes `column_idx` entirely with its
+    /// dictionary, so the scan can answer a comparison from the keys. An
+    /// unreadable file set or a missing chunk reads as `false`.
+    fn column_is_all_dictionary(&self, column_idx: usize) -> bool {
+        let Ok(parquet) = self.resolve_files() else {
+            return false;
+        };
+        let row_groups = parquet.row_groups();
+        !row_groups.is_empty()
+            && row_groups.iter().all(|rg| {
+                let leaf = first_leaf(rg.schema.fields(), column_idx);
+                rg.columns
+                    .get(leaf)
+                    .is_some_and(|chunk| chunk.data_pages_all_dictionary)
+            })
+    }
+
     /// Clone `parquet`'s row groups and keep only those that survive this
     /// binding's pushed-down predicates — i.e. what [`BoundTable::compile_scan`] actually
     /// scans over the table's current files. A min/max stat that proves no row in
