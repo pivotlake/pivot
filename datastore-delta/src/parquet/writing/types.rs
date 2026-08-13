@@ -1,19 +1,23 @@
 //! Messages that flow between the write pipeline's stages.
 //!
-//! The unit of encode work is one **column chunk** (a single column's values for
-//! one row group): the [`indexer`](super::indexer) stage emits a
-//! [`ColumnChunkJob`], the [`encoder`](super::encoder) turns it into an
+//! The [`collector`](super::collector) cuts the stream into files: a [`FileJob`]
+//! is one file's rows on their way to being in order: already sorted, or one
+//! slice of the file's planned k-way merge. The unit of encode work is one
+//! **column chunk** (a single column's values for one row group): the
+//! [`sorter`](super::sorter) stage emits a [`ColumnChunkJob`] per column per
+//! row-group window, the [`encoder`](super::encoder) turns it into an
 //! [`EncodedColumnChunk`] holding one [`EncodedLeaf`] per leaf of that column
 //! (PLAIN, or dictionary-encoded), and the [`assembler`](super::assembler) lays
 //! the leaves out into a file. Each carries the row group's shared
 //! [`RowGroupHeader`] for routing and provenance.
 
-use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, OnceLock};
 
-use arrow_array::ArrayRef;
+use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::SchemaRef;
 use dispatch::memory::{FileBytes, Slab};
-use dispatch::{Identifier, WorkerIdOutput};
+use dispatch::{Identifier, MultiwayMergeSlice, OrderBy, WorkerIdOutput};
 use thriftparquet::footer::Statistics;
 use thriftparquet::general::Encoding;
 
@@ -25,7 +29,7 @@ pub(crate) type RowGroupId = u64;
 /// together (and route to one worker).
 pub(crate) type FileId = u64;
 
-/// Per-row-group provenance threaded from the [`indexer`](super::indexer)
+/// Per-row-group provenance threaded from the [`sorter`](super::sorter)
 /// stage to the [`assembler`](super::assembler). Every field is file-level, so a
 /// file's row groups all carry the same one. Always present (an unpartitioned
 /// write carries one with `partition` `None`). `Arc` so the chunk stages clone
@@ -57,7 +61,7 @@ pub(crate) struct AssembledFile {
 
 /// The per-row-group metadata every column chunk of a row group shares: its
 /// identity and owner worker (for routing), schema, and [`PartitionTag`]. Built
-/// once by the [`indexer`](super::indexer) stage and shared by `Arc`, so each
+/// once by the [`sorter`](super::sorter) stage and shared by `Arc`, so each
 /// column job clones a single pointer instead of re-copying all of this. The row
 /// group is complete once the assembler has one chunk per `schema` column.
 pub(crate) struct RowGroupHeader {
@@ -69,9 +73,55 @@ pub(crate) struct RowGroupHeader {
     pub(crate) tag: Arc<PartitionTag>,
 }
 
+/// File-level facts fixed when the [`collector`](super::collector) cuts a
+/// file, threaded to the [`sorter`](super::sorter) so whichever worker
+/// finishes the file's rows can deal its column-chunk jobs.
+pub(crate) struct FilePlan {
+    pub(crate) file_id: FileId,
+    /// The pipeline-wide id of the file's first row group; window `i` of the
+    /// file's rows is row group `base_row_group_id + i`. Files cut later get
+    /// higher bases, so ids stay unique across files however jobs interleave.
+    pub(crate) base_row_group_id: RowGroupId,
+    /// Worker the file's encoded chunks assemble on.
+    pub(crate) dest_worker: usize,
+    pub(crate) partition: Option<crate::PartitionValues>,
+    pub(crate) target_rows_per_group: usize,
+}
+
+/// A file whose rows are already in order (a single run, or a table with no
+/// sort keys), so the sorter deals it into column-chunk jobs as it is.
+pub(crate) struct SortedFile {
+    pub(crate) plan: FilePlan,
+    pub(crate) chunks: Vec<RecordBatch>,
+    pub(crate) rows: usize,
+}
+
+/// One file's k-way merge, shared (`Arc`) by its slice jobs. Each slice's
+/// worker sets its output slot; the worker completing the last slice sees
+/// them all (the counter is the barrier) and deals the merged file.
+pub(crate) struct FileMerge {
+    pub(crate) plan: FilePlan,
+    pub(crate) sort_keys: Arc<[OrderBy]>,
+    /// The file's sorted runs, exactly as the merge was planned over them.
+    pub(crate) runs: Vec<Vec<RecordBatch>>,
+    pub(crate) rows: usize,
+    pub(crate) slices: Vec<MultiwayMergeSlice>,
+    /// Each slice's merged chunk, set once by whichever worker ran it; index
+    /// order is output order.
+    pub(crate) merged: Vec<OnceLock<RecordBatch>>,
+    pub(crate) slices_remaining: AtomicUsize,
+}
+
+/// Work for the [`sorter`](super::sorter) stage: one file ready to deal, or
+/// one stealable slice of a file's merge.
+pub(crate) enum FileJob {
+    Sorted(SortedFile),
+    MergeSlice { merge: Arc<FileMerge>, slice: usize },
+}
+
 /// One column of one row group, to encode into a column chunk. The rows ride
 /// as the chunks whose concatenation they are, not as a finished array: the
-/// [`indexer`](super::indexer) never touches row data, and the encode worker
+/// [`sorter`](super::sorter) never touches row data, and the encode worker
 /// materializes the row group itself — the stream's batch-sized chunks
 /// appended back to back — right before encoding it, while the values are
 /// hot.

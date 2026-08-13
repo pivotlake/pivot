@@ -23,7 +23,9 @@ use arrow_schema::ArrowError;
 use crossbeam_deque::Injector;
 use thiserror::Error;
 
+mod injector;
 mod stealable;
+pub use injector::{InjectorChannelFactory, injector};
 pub use stealable::{StealableChannelFactory, stealable};
 
 mod mpsc;

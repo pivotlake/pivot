@@ -11,8 +11,8 @@
 //! into its leaves ([`leaves`]) and each is encoded on its own. A flat column is
 //! its own single leaf and takes the same path it always did; a shredded variant
 //! yields one leaf per primitive under it. Flattening here rather than in the
-//! upstream [`indexer`](super::indexer) keeps that stage cheap and serial —
-//! the levels and the encoding are computed on the parallel side.
+//! upstream [`sorter`](super::sorter) keeps that stage's dealing cheap; the
+//! levels and the encoding are computed on the parallel side.
 //!
 //! The two strategies live in [`plain`] and [`dictionary`]; both frame their
 //! pages with [`pages`] (which also cuts a leaf into pages) — see those modules

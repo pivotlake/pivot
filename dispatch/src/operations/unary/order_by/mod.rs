@@ -16,12 +16,9 @@
 //!    with fork-join. Dispatch has no fork-join, it has work stealing, so
 //!    every worker delivers its runs to a [`GatherBarrier`] (the same
 //!    gathering GROUP BY and ORDER BY LIMIT use), and the final worker to
-//!    arrive builds the trees once as [`MergeForest`]: each node merges its
+//!    arrive builds the tree once as [`MergeForest`]: each node merges its
 //!    two children's runs, and a node becomes runnable when both children
-//!    complete. With partition keys the
-//!    forest holds one tree per partition tuple — runs are kept per
-//!    partition from the start, so sort keys are compared only within a
-//!    partition, and the finished partitions emit grouped, in tuple order.
+//!    complete.
 //!
 //! 3. **Parallel merges.** A merge of two large runs is not one serial walk:
 //!    following rayon's `par_merge`, it splits at the larger run's midpoint
@@ -43,13 +40,17 @@
 
 mod keys;
 mod merge;
+mod multiway;
+mod partitioner;
+
+pub use multiway::{MultiwayMergeSlice, merge_multiway_slice, plan_multiway_merge_slices};
+pub use partitioner::{PartitionerFactory, SortedPiece};
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use arrow_array::{ArrayRef, RecordBatch};
-use arrow_row::{OwnedRow, RowConverter, SortField};
 use crossbeam_deque::{Injector, Steal, Stealer, Worker as SliceDeque};
 
 use crate::arrays::take::{take, take_chunked};
@@ -80,6 +81,7 @@ macro_rules! with_key_ordering {
         }
     };
 }
+pub(super) use with_key_ordering;
 
 /// A maximal stretch of rows already in key order, held as the batch-sized
 /// chunks it arrived (or was merged) in.
@@ -143,11 +145,11 @@ impl SortedRun {
 }
 
 /// Where a merge node's finished run goes: into a parent node as one side of
-/// its merge, or — at a tree's root — out as its partition's finished chunks.
+/// its merge, or — at the tree's root — out as the sort's finished chunks.
 #[derive(Clone, Copy)]
 enum MergeResultDestination {
     Node { node: usize, side: ChildSide },
-    Partition(usize),
+    Output,
 }
 
 /// One node of a merge tree: merges the runs its two children deliver, and
@@ -202,24 +204,16 @@ struct MergeSliceTask {
     rows: MergeSliceRows,
 }
 
-/// A partition's identity within the sort: its encoded partition-column
-/// tuple, or `None` when the operator has no partition keys and everything is
-/// one partition. Arrow's row encoding compares bytewise in value order, so
-/// sorting tuples orders the partitions.
-type PartitionTuple = Option<OwnedRow>;
-
 /// Everything one worker sorted, delivered to the gather barrier when its
-/// consume phase ends: its runs, each with its partition tuple. The barrier
-/// gathers in worker order, so a delivery's position names the worker whose
-/// cache holds its runs.
-type WorkerRuns = Vec<(PartitionTuple, SortedRun)>;
+/// consume phase ends. The barrier gathers in worker order, so a delivery's
+/// position names the worker whose cache holds its runs.
+type WorkerRuns = Vec<SortedRun>;
 
-/// The state every worker's operator shares: the merge forest over the
-/// gathered runs (one tree per partition) and each worker's merge-slice
-/// queues. Everything here synchronizes through set-once slots and atomic
-/// counters — each writer owns exactly one slot, and the counters are the
-/// barriers that publish the slots to whoever acts last — so no worker ever
-/// blocks on a lock.
+/// The state every worker's operator shares: the merge tree over the
+/// gathered runs and each worker's merge-slice queues. Everything here
+/// synchronizes through set-once slots and atomic counters — each writer
+/// owns exactly one slot, and the counters are the barriers that publish
+/// the slots to whoever acts last — so no worker ever blocks on a lock.
 struct SharedMergeState {
     order_by: Arc<[OrderBy]>,
     forest: OnceLock<MergeForest>,
@@ -230,96 +224,57 @@ struct SharedMergeState {
     /// The stealing side of every worker's deque, for workers with nothing
     /// of their own left.
     slice_stealers: Vec<Stealer<MergeSliceTask>>,
-    /// The finished output — every partition's chunks, partitions in tuple
-    /// order, rows within a partition in key order. The worker winning
+    /// The finished output, rows in key order. The worker winning
     /// `output_claimed` emits it.
     sorted_output: OnceLock<Vec<RecordBatch>>,
     merges_complete: AtomicBool,
     output_claimed: AtomicBool,
 }
 
-/// The merge trees of every partition, sharing one node arena and one task
-/// queue so any worker helps any partition's merges.
+/// The merge tree over every worker's runs, one node arena shared so any
+/// worker helps any merge.
 struct MergeForest {
     nodes: Vec<MergeNode>,
-    /// Each partition's finished chunks, each slot set once as its tree's
-    /// root completes; index order is partition-tuple order.
-    finished_partitions: Vec<OnceLock<Vec<RecordBatch>>>,
-    partitions_remaining: AtomicUsize,
 }
 
 impl SharedMergeState {
-    /// Lay the merge forest over every worker's runs and queue the merges that
+    /// Lay the merge tree over every worker's runs and queue the merges that
     /// are ready. Called by the worker holding the run channel's receiver,
-    /// once every worker has delivered. Partitions with nothing to merge (a
-    /// single run, or no sort keys at all) finish here on the spot.
+    /// once every worker has delivered. A sort with nothing to merge (a
+    /// single run, or no sort keys at all) finishes here on the spot.
     fn build_merge_forest(&self, gathered_by_worker: Vec<WorkerRuns>) {
-        let mut gathered: Vec<(usize, PartitionTuple, SortedRun)> = Vec::new();
-        for (owner, runs) in gathered_by_worker.into_iter().enumerate() {
-            for (tuple, run) in runs {
-                gathered.push((owner, tuple, run));
+        let mut runs: Vec<(usize, SortedRun)> = Vec::new();
+        for (owner, worker_runs) in gathered_by_worker.into_iter().enumerate() {
+            for run in worker_runs {
+                runs.push((owner, run));
             }
         }
-        if gathered.is_empty() {
-            self.sorted_output
-                .set(Vec::new())
-                .unwrap_or_else(|_| unreachable!("only the builder sets an empty output"));
-            self.merges_complete.store(true, Ordering::Release);
+        // No sort keys means the rows have no order to establish: the runs
+        // simply concatenate. A single run needs no merge either way.
+        if self.order_by.is_empty() || runs.len() <= 1 {
+            let chunks = runs
+                .into_iter()
+                .flat_map(|(_, run)| run.chunks)
+                .collect::<Vec<RecordBatch>>();
+            self.finish_output(chunks);
             return;
         }
 
-        let mut runs_by_partition: HashMap<PartitionTuple, Vec<(usize, SortedRun)>> =
-            HashMap::new();
-        for (owner, tuple, run) in gathered {
-            runs_by_partition
-                .entry(tuple)
-                .or_default()
-                .push((owner, run));
-        }
-        let mut partition_order: Vec<PartitionTuple> = runs_by_partition.keys().cloned().collect();
-        partition_order.sort();
-
         let mut nodes = Vec::new();
         let mut leaf_deliveries = Vec::new();
-        let mut finished_at_build: Vec<(usize, Vec<RecordBatch>)> = Vec::new();
-        let mut run_pool: Vec<Option<(usize, SortedRun)>> = Vec::new();
-        for (partition, tuple) in partition_order.iter().enumerate() {
-            let mut runs = runs_by_partition
-                .remove(tuple)
-                .expect("every ordered tuple was gathered");
-            // No sort keys means the partition's rows have no order to
-            // establish: its runs simply concatenate. A single run needs no
-            // merge either way.
-            if self.order_by.is_empty() || runs.len() == 1 {
-                let chunks = runs
-                    .drain(..)
-                    .flat_map(|(_, run)| run.chunks)
-                    .collect::<Vec<RecordBatch>>();
-                finished_at_build.push((partition, chunks));
-                continue;
-            }
-            let first_run = run_pool.len();
-            run_pool.extend(runs.into_iter().map(Some));
-            build_subtree(
-                &mut nodes,
-                &mut leaf_deliveries,
-                first_run,
-                run_pool.len(),
-                MergeResultDestination::Partition(partition),
-            );
-        }
+        let mut run_pool: Vec<Option<(usize, SortedRun)>> = runs.into_iter().map(Some).collect();
+        build_subtree(
+            &mut nodes,
+            &mut leaf_deliveries,
+            0,
+            run_pool.len(),
+            MergeResultDestination::Output,
+        );
 
         self.forest
-            .set(MergeForest {
-                nodes,
-                finished_partitions: partition_order.iter().map(|_| OnceLock::new()).collect(),
-                partitions_remaining: AtomicUsize::new(partition_order.len()),
-            })
+            .set(MergeForest { nodes })
             .unwrap_or_else(|_| unreachable!("only the last sorting worker builds"));
 
-        for (partition, chunks) in finished_at_build {
-            self.finish_partition(partition, chunks);
-        }
         // Deliver the leaf runs. A node whose two inputs are both leaves gets
         // its merge planned right here; its slices are assigned to the worker
         // that sorted the larger input, where more of the data is warm.
@@ -348,30 +303,11 @@ impl SharedMergeState {
         // the new assignments need no notify of their own.
     }
 
-    /// Record one partition's finished chunks; the last partition to finish
-    /// assembles the whole output in partition order.
-    fn finish_partition(&self, partition: usize, chunks: Vec<RecordBatch>) {
-        let forest = self.forest.get().expect("finishing follows the build");
-        forest.finished_partitions[partition]
-            .set(chunks)
-            .unwrap_or_else(|_| unreachable!("each partition finishes once"));
-        if forest.partitions_remaining.fetch_sub(1, Ordering::AcqRel) > 1 {
-            return;
-        }
-        let output: Vec<RecordBatch> = forest
-            .finished_partitions
-            .iter()
-            .flat_map(|finished| {
-                finished
-                    .get()
-                    .expect("every partition finished")
-                    .iter()
-                    .cloned()
-            })
-            .collect();
+    /// Record the sort's finished chunks and wake everyone to emit them.
+    fn finish_output(&self, chunks: Vec<RecordBatch>) {
         self.sorted_output
-            .set(output)
-            .unwrap_or_else(|_| unreachable!("only the last partition assembles"));
+            .set(chunks)
+            .unwrap_or_else(|_| unreachable!("the output finishes once"));
         self.merges_complete.store(true, Ordering::Release);
         // Parked workers must observe the completion to emit and finish; wake
         // them all.
@@ -476,8 +412,8 @@ impl SharedMergeState {
     }
 
     /// All of a node's slices are merged: assemble its run and deliver it
-    /// upward, or finish its partition at the root. Returns the parent's
-    /// slice tasks when this delivery unblocked its merge.
+    /// upward, or finish the sort at the root. Returns the parent's slice
+    /// tasks when this delivery unblocked its merge.
     fn complete_node(&self, node_index: usize) -> Option<Vec<MergeSliceTask>> {
         let tree = self.forest.get().expect("completion follows the build");
         let node = &tree.nodes[node_index];
@@ -492,15 +428,15 @@ impl SharedMergeState {
             MergeResultDestination::Node { node: parent, side } => {
                 self.deliver_run(parent, side, SortedRun::from_chunks(chunks))
             }
-            MergeResultDestination::Partition(partition) => {
-                self.finish_partition(partition, chunks);
+            MergeResultDestination::Output => {
+                self.finish_output(chunks);
                 None
             }
         }
     }
 }
 
-/// Lay out one partition's merge tree over `runs[first..past_last]` of the
+/// Lay out the merge tree over `runs[first..past_last]` of the
 /// run pool, rayon's recursive halving of the run list: one node per merge,
 /// children built first so a node knows where its result goes. Records which
 /// node each leaf run feeds.
@@ -541,7 +477,6 @@ fn build_subtree(
 /// the merge state and one run channel. The first factory holds the channel's
 /// receiver; the rest get `None`.
 pub struct OrderByFactory {
-    partition_keys: Arc<[usize]>,
     order_by: Arc<[OrderBy]>,
     shared: Arc<SharedMergeState>,
     runs_gather: Arc<GatherBarrier<WorkerRuns>>,
@@ -551,17 +486,8 @@ pub struct OrderByFactory {
 }
 
 impl OrderByFactory {
-    /// One factory per worker, sharing the run pool and merge queue. Rows sort
-    /// by `order_by` within each distinct `partition_keys` tuple, partitions
-    /// emitted grouped and in tuple order; no partition keys means one
-    /// partition, no sort keys means partitions only group without an order
-    /// inside them.
-    pub fn create_for_workers(
-        partition_keys: Vec<usize>,
-        order_by: Vec<OrderBy>,
-        worker_count: usize,
-    ) -> Vec<OrderByFactory> {
-        let partition_keys: Arc<[usize]> = partition_keys.into();
+    /// One factory per worker, sharing the run pool and merge queue.
+    pub fn create_for_workers(order_by: Vec<OrderBy>, worker_count: usize) -> Vec<OrderByFactory> {
         let order_by: Arc<[OrderBy]> = order_by.into();
         let local_deques: Vec<SliceDeque<MergeSliceTask>> =
             (0..worker_count).map(|_| SliceDeque::new_lifo()).collect();
@@ -578,7 +504,6 @@ impl OrderByFactory {
         local_deques
             .into_iter()
             .map(|local_slices| OrderByFactory {
-                partition_keys: partition_keys.clone(),
                 order_by: order_by.clone(),
                 shared: shared.clone(),
                 runs_gather: runs_gather.clone(),
@@ -593,156 +518,76 @@ impl UnaryFactory<RecordBatch, RecordBatch> for OrderByFactory {
 
     fn build_unary(self) -> Self::Unary {
         PipelineBreaker::Consuming(OrderBySorter {
-            partition_keys: self.partition_keys,
             order_by: self.order_by,
             shared: self.shared,
             runs_gather: self.runs_gather,
             local_slices: self.local_slices,
-            partition_tuple_converter: None,
-            open_runs: HashMap::new(),
+            open_run: None,
             completed_runs: Vec::new(),
             allocator: None,
         })
     }
 }
 
-/// One worker's consume phase: split each arriving batch by partition, sort
-/// each partition's rows, grow per-partition sorted runs; ship the runs into
-/// the shared pool when the input drains.
+/// One worker's consume phase: sort each arriving batch and grow sorted
+/// runs; ship the runs into the shared pool when the input drains.
 pub struct OrderBySorter {
-    partition_keys: Arc<[usize]>,
     order_by: Arc<[OrderBy]>,
     shared: Arc<SharedMergeState>,
     runs_gather: Arc<GatherBarrier<WorkerRuns>>,
     /// This worker's own merge-slice deque, carried through to its
     /// [`RunMerger`].
     local_slices: SliceDeque<MergeSliceTask>,
-    /// Encodes a row's partition columns into its comparable tuple; built from
-    /// the first batch's schema.
-    partition_tuple_converter: Option<RowConverter>,
-    /// Each partition's run the next batch may extend.
-    open_runs: HashMap<PartitionTuple, SortedRun>,
-    completed_runs: Vec<(PartitionTuple, SortedRun)>,
+    /// The run the next batch may extend.
+    open_run: Option<SortedRun>,
+    completed_runs: Vec<SortedRun>,
     /// Ring memory the sorted copies of unsorted batches land in. Taken on
     /// first use, so a worker whose batches all arrive sorted holds none.
     allocator: Option<SlabAllocator>,
 }
 
 impl OrderBySorter {
-    /// Cut `batch` into one single-partition piece per distinct tuple it
-    /// holds. A batch of one tuple (always, when there are no partition keys)
-    /// passes through whole; a mixed batch is clustered by its tuples first —
-    /// stably, so each partition keeps its arrival order — and sliced.
-    fn split_by_partition(
-        &mut self,
-        batch: RecordBatch,
-    ) -> unary::Result<Vec<(PartitionTuple, RecordBatch)>> {
-        if self.partition_keys.is_empty() {
-            return Ok(vec![(None, batch)]);
-        }
-        let partition_columns: Vec<ArrayRef> = self
-            .partition_keys
-            .iter()
-            .map(|&column| batch.column(column).clone())
-            .collect();
-        let converter = match &self.partition_tuple_converter {
-            Some(converter) => converter,
-            None => self.partition_tuple_converter.insert(
-                RowConverter::new(
-                    partition_columns
-                        .iter()
-                        .map(|column| SortField::new(column.data_type().clone()))
-                        .collect(),
-                )
-                .map_err(unary::Error::from)?,
-            ),
-        };
-        let tuples = converter
-            .convert_columns(&partition_columns)
-            .map_err(unary::Error::from)?;
-
-        let single_tuple = (1..batch.num_rows()).all(|row| tuples.row(row) == tuples.row(0));
-        if single_tuple {
-            return Ok(vec![(Some(tuples.row(0).owned()), batch)]);
-        }
-
-        // Cluster the rows by tuple, each tuple's rows keeping arrival order,
-        // and slice the runs off the clustered copy.
-        let mut clustered_order: Vec<u32> = (0..batch.num_rows() as u32).collect();
-        clustered_order.sort_unstable_by(|&a, &b| {
-            tuples
-                .row(a as usize)
-                .cmp(&tuples.row(b as usize))
-                .then(a.cmp(&b))
+    /// The batch with its rows in key order: the batch itself when they
+    /// already are, a slab-backed sorted copy otherwise. The copy shares what
+    /// it can with the source (a view column's value bytes stay where they
+    /// were); a pipeline breaker retains its whole input regardless, so
+    /// there is nothing to gain from a self-contained one.
+    fn sort_batch(&mut self, batch: RecordBatch) -> unary::Result<RecordBatch> {
+        let chunks = std::slice::from_ref(&batch);
+        let selected = select_key_ordering(&self.order_by, chunks, chunks)?;
+        let sorted_indices = with_key_ordering!(selected, |ordering| {
+            if batch_arrives_sorted(&mut ordering, batch.num_rows()) {
+                return Ok(batch);
+            }
+            sorted_row_indices(&mut ordering, batch.num_rows())
         });
+
         let allocator = self
             .allocator
             .get_or_insert_with(|| SlabAllocator::new(false));
         let columns = batch
             .columns()
             .iter()
-            .map(|column| take(allocator, column, &clustered_order))
-            .collect::<Result<Vec<ArrayRef>, _>>()?;
-        let clustered =
-            RecordBatch::try_new(batch.schema(), columns).map_err(unary::Error::from)?;
-
-        let mut pieces = Vec::new();
-        let mut run_start = 0;
-        for row in 1..=clustered_order.len() {
-            let run_ends = row == clustered_order.len()
-                || tuples.row(clustered_order[row] as usize)
-                    != tuples.row(clustered_order[run_start] as usize);
-            if run_ends {
-                pieces.push((
-                    Some(tuples.row(clustered_order[run_start] as usize).owned()),
-                    clustered.slice(run_start, row - run_start),
-                ));
-                run_start = row;
-            }
-        }
-        Ok(pieces)
-    }
-
-    /// The piece with its rows in key order: the piece itself when they
-    /// already are, a slab-backed sorted copy otherwise.
-    fn sort_piece(&mut self, piece: RecordBatch) -> unary::Result<RecordBatch> {
-        let chunks = std::slice::from_ref(&piece);
-        let selected = select_key_ordering(&self.order_by, chunks, chunks)?;
-        let sorted_indices = with_key_ordering!(selected, |ordering| {
-            if batch_arrives_sorted(&mut ordering, piece.num_rows()) {
-                return Ok(piece);
-            }
-            sorted_row_indices(&mut ordering, piece.num_rows())
-        });
-
-        let allocator = self
-            .allocator
-            .get_or_insert_with(|| SlabAllocator::new(false));
-        let columns = piece
-            .columns()
-            .iter()
             .map(|column| take(allocator, column, &sorted_indices))
             .collect::<Result<Vec<ArrayRef>, _>>()?;
-        RecordBatch::try_new(piece.schema(), columns).map_err(unary::Error::from)
+        RecordBatch::try_new(batch.schema(), columns).map_err(unary::Error::from)
     }
 
-    /// Whether `piece`'s first row sorts at or after its partition's open
-    /// run's last row, so appending keeps the run sorted. With no sort keys
-    /// every comparison is equal and every piece extends, which is exactly
-    /// right: the run is then just the partition's chunks in arrival order.
-    fn extends_open_run(&self, tuple: &PartitionTuple, piece: &RecordBatch) -> unary::Result<bool> {
-        let Some(run) = self.open_runs.get(tuple) else {
+    /// Whether `batch`'s first row sorts at or after the open run's last row,
+    /// so appending keeps the run sorted.
+    fn extends_open_run(&self, batch: &RecordBatch) -> unary::Result<bool> {
+        let Some(run) = &self.open_run else {
             return Ok(false);
         };
         let run_tail = std::slice::from_ref(run.last_chunk());
-        let selected = select_key_ordering(&self.order_by, run_tail, std::slice::from_ref(piece))?;
+        let selected = select_key_ordering(&self.order_by, run_tail, std::slice::from_ref(batch))?;
         let last_of_run = RunRow {
             chunk: 0,
             row: run.last_chunk().num_rows() - 1,
         };
-        let first_of_piece = RunRow { chunk: 0, row: 0 };
+        let first_of_batch = RunRow { chunk: 0, row: 0 };
         Ok(with_key_ordering!(selected, |ordering| {
-            ordering.compare(last_of_run, first_of_piece) != std::cmp::Ordering::Greater
+            ordering.compare(last_of_run, first_of_batch) != std::cmp::Ordering::Greater
         }))
     }
 }
@@ -758,28 +603,24 @@ impl Consumer<RecordBatch, RecordBatch> for OrderBySorter {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        for (tuple, piece) in self.split_by_partition(batch)? {
-            let sorted = self.sort_piece(piece)?;
-            if self.extends_open_run(&tuple, &sorted)? {
-                self.open_runs
-                    .get_mut(&tuple)
-                    .expect("extends_open_run saw a run")
-                    .extend_with(sorted);
-            } else {
-                if let Some(finished) = self.open_runs.remove(&tuple) {
-                    self.completed_runs.push((tuple.clone(), finished));
-                }
-                self.open_runs
-                    .insert(tuple, SortedRun::starting_with(sorted));
+        let sorted = self.sort_batch(batch)?;
+        if self.extends_open_run(&sorted)? {
+            self.open_run
+                .as_mut()
+                .expect("extends_open_run saw a run")
+                .extend_with(sorted);
+        } else {
+            if let Some(finished) = self.open_run.take() {
+                self.completed_runs.push(finished);
             }
+            self.open_run = Some(SortedRun::starting_with(sorted));
         }
         Ok(())
     }
 
     fn into_outputter(mut self) -> unary::Result<Option<Self::Outputter>> {
-        for (tuple, open) in self.open_runs.drain() {
-            self.completed_runs.push((tuple, open));
-        }
+        self.completed_runs.extend(self.open_run.take());
+        let allocator = self.allocator.take();
         // The final worker to arrive sees every worker's runs in worker order
         // and builds the forest; the barrier then wakes everyone to merge.
         self.runs_gather
@@ -790,7 +631,7 @@ impl Consumer<RecordBatch, RecordBatch> for OrderBySorter {
         Ok(Some(RunMerger {
             shared: self.shared,
             local_slices: self.local_slices,
-            allocator: self.allocator.unwrap_or_else(|| SlabAllocator::new(false)),
+            allocator: allocator.unwrap_or_else(|| SlabAllocator::new(false)),
         }))
     }
 }
@@ -887,7 +728,7 @@ mod tests {
     use arrow_schema::{DataType, Field, Schema};
 
     fn consumers(order_by: Vec<OrderBy>, worker_count: usize) -> Vec<OrderBySorter> {
-        OrderByFactory::create_for_workers(Vec::new(), order_by, worker_count)
+        OrderByFactory::create_for_workers(order_by, worker_count)
             .into_iter()
             .map(|factory| match factory.build_unary() {
                 PipelineBreaker::Consuming(sorter) => sorter,
@@ -1041,81 +882,6 @@ mod tests {
         let output = run_consumers(consumers(ascending_by_key(), 1), worker_batches);
 
         assert_eq!(output.i64_column(1), vec![10, 20, 30, 40]);
-    }
-
-    fn consumers_per_partition(
-        partition_keys: Vec<usize>,
-        order_by: Vec<OrderBy>,
-        worker_count: usize,
-    ) -> Vec<OrderBySorter> {
-        OrderByFactory::create_for_workers(partition_keys, order_by, worker_count)
-            .into_iter()
-            .map(|factory| match factory.build_unary() {
-                PipelineBreaker::Consuming(sorter) => sorter,
-                _ => unreachable!("factories build consuming breakers"),
-            })
-            .collect()
-    }
-
-    /// Partition keys group the output: every emitted batch holds one
-    /// partition, partitions come out in tuple order, and each partition's
-    /// rows are sorted by the key.
-    #[test]
-    fn partitions_come_out_grouped_and_each_sorted() {
-        init_test_free_pool(16);
-        let worker_batches = vec![
-            vec![string_int_batch(&["b", "a", "b"], &[9, 5, 1])],
-            vec![string_int_batch(&["a", "b", "a"], &[2, 4, 8])],
-        ];
-
-        let output = run_consumers(
-            consumers_per_partition(vec![0], vec![OrderBy::new(1, false, true)], 2),
-            worker_batches,
-        );
-
-        for batch in &output.items {
-            let names = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringViewArray>()
-                .unwrap();
-            assert!((0..batch.num_rows()).all(|row| names.value(row) == names.value(0)));
-        }
-        assert_eq!(output.string_column(0), vec!["a", "a", "a", "b", "b", "b"]);
-        assert_eq!(output.i64_column(1), vec![2, 5, 8, 1, 4, 9]);
-    }
-
-    /// No sort keys: partitions still group in tuple order, rows inside each
-    /// keeping their arrival order.
-    #[test]
-    fn partition_keys_alone_group_without_sorting() {
-        init_test_free_pool(16);
-        let worker_batches = vec![vec![string_int_batch(&["b", "a", "b", "a"], &[9, 5, 1, 3])]];
-
-        let output = run_consumers(
-            consumers_per_partition(vec![0], Vec::new(), 1),
-            worker_batches,
-        );
-
-        assert_eq!(output.string_column(0), vec!["a", "a", "b", "b"]);
-        assert_eq!(output.i64_column(1), vec![5, 3, 9, 1]);
-    }
-
-    /// A batch already holding one partition with sorted keys passes through
-    /// as the same arrays: neither the split nor the sort copies it.
-    #[test]
-    fn a_single_partition_sorted_batch_passes_through_untouched() {
-        init_test_free_pool(16);
-        let batch = string_int_batch(&["only", "only"], &[1, 2]);
-        let worker_batches = vec![vec![batch.clone()]];
-
-        let output = run_consumers(
-            consumers_per_partition(vec![0], vec![OrderBy::new(1, false, true)], 1),
-            worker_batches,
-        );
-
-        assert_eq!(output.items.len(), 1);
-        assert!(Arc::ptr_eq(output.items[0].column(1), batch.column(1)));
     }
 
     #[test]

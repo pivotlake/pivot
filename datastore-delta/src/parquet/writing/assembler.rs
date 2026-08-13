@@ -1,6 +1,6 @@
 //! Assembles encoded column chunks into one Parquet file per output file.
 //!
-//! A plain `Unary` map: the [`indexer`](super::indexer) stage routes every
+//! A plain `Unary` map: the [`sorter`](super::sorter) stage routes every
 //! column chunk of a file to `file_id % worker_count`, so all of a file's chunks
 //! arrive at one [`FileAssembler`]. It gathers a row group's chunks (by
 //! `row_group_id`, one per schema column), assembles the row group — laying each
@@ -10,8 +10,8 @@
 //! and emits it as an [`AssembledFile`] tagged with
 //! the partition tuple to record in the manifest. Nothing
 //! crosses workers and there is no finish phase: every file completes in
-//! `consume`. (The upstream [`indexer`](super::indexer) is what makes
-//! this possible — it hands down file-sized units with a known row-group count.)
+//! `consume`. (The upstream [`collector`](super::collector) is what makes
+//! this possible — it cuts file-sized units with a known row-group count.)
 //!
 //! The footer is fully populated (column `type`/`encodings`/`path_in_schema`/
 //! `codec`/`num_values`/sizes/stats, `dictionary_page_offset` for dict chunks, row
@@ -145,6 +145,11 @@ impl Unary<EncodedColumnChunk, AssembledFile> for FileAssembler {
         // when the table has a sort key.
         groups.sort_by_key(|group| group.row_group_id);
         let (bytes, metadata) = build_file(&header.schema, groups)?;
+        tracing::debug!(
+            file_id,
+            compressed_bytes = bytes.len(),
+            "assembled a finished file"
+        );
         sender.send(AssembledFile {
             bytes,
             metadata,

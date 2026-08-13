@@ -525,30 +525,7 @@ impl RecordBatchOperatorSpec {
     /// See the `operations::unary::order_by` module.
     pub fn order_by(self, order_by: Vec<OrderBy>) -> Self {
         let worker_count = self.worker_count();
-        self.unary(OrderByFactory::create_for_workers(
-            Vec::new(),
-            order_by,
-            worker_count,
-        ))
-    }
-
-    /// Like [`order_by`](Self::order_by), grouped: rows come out clustered by
-    /// their `partition_columns` tuple (partitions in tuple order, every
-    /// emitted batch single-partition) and sorted by `order_by` within each
-    /// partition. Sorting happens per partition, so partition columns are
-    /// never compared row against row. An empty `order_by` groups without
-    /// ordering inside partitions.
-    pub fn order_by_per_partition(
-        self,
-        partition_columns: Vec<usize>,
-        order_by: Vec<OrderBy>,
-    ) -> Self {
-        let worker_count = self.worker_count();
-        self.unary(OrderByFactory::create_for_workers(
-            partition_columns,
-            order_by,
-            worker_count,
-        ))
+        self.unary(OrderByFactory::create_for_workers(order_by, worker_count))
     }
 
     /// SQL `LIMIT … OFFSET …` with no ORDER BY: keep `limit` rows after skipping

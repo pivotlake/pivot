@@ -107,13 +107,18 @@ pub use scan::{
 pub use stats::DataFlowStats;
 
 pub use operations::channels::{
-    ChannelFactory, FanInChannelFactory, MpscReceiver, Receiver, ReturnToWorkerMpscFactory,
-    RootChannelFactory, StealableChannelFactory, WorkerAwareSender, WorkerIdOutput, fan_in,
-    mpsc_channel, return_to_worker_mpsc, stealable, to_single_worker_mpsc,
+    ChannelFactory, FanInChannelFactory, InjectorChannelFactory, MpscReceiver, Receiver,
+    ReturnToWorkerMpscFactory, RootChannelFactory, StealableChannelFactory, WorkerAwareSender,
+    WorkerIdOutput, fan_in, injector, mpsc_channel, return_to_worker_mpsc, stealable,
+    to_single_worker_mpsc,
 };
 #[cfg(any(test, feature = "test-util"))]
 pub use operations::unary::test_utils;
 pub use operations::unary::{Error as UnaryError, Result as UnaryResult};
+pub use operations::unary::{
+    MultiwayMergeSlice, PartitionerFactory, SortedPiece, merge_multiway_slice,
+    plan_multiway_merge_slices,
+};
 pub use operations::{
     AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot,
     CountValidSlot, Distinct, Dynamic, DynamicFilterSlot, Fold, GroupLimit,
