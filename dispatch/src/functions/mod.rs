@@ -1,8 +1,10 @@
+mod constant_match;
 mod contains;
 mod needle;
 mod prefix;
 mod segments;
 mod suffix;
+pub use constant_match::ConstantMatch;
 pub use contains::Contains;
 pub use prefix::Prefix;
 pub use segments::SegmentMatcher;
