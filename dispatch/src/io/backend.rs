@@ -180,9 +180,17 @@ mod uring_backend {
             request_id: Identifier,
         ) -> Result<()> {
             let length = length.min(MAX_IO_OP_LEN);
+            // ASYNC skips the inline execution attempt: an O_DIRECT read
+            // executed inline walks into the block layer during
+            // `io_uring_enter`, and on a device whose queue is full the
+            // kernel's request allocation SLEEPS there, blocking the worker
+            // loop for as long as the oldest in-flight IO. Punting straight
+            // to io-wq moves that wait onto a kernel worker, so submission
+            // always returns immediately.
             let read_op = opcode::Read::new(types::Fd(fd), dest, length as u32)
                 .offset(offset)
                 .build()
+                .flags(io_uring::squeue::Flags::ASYNC)
                 .user_data(request_id as u64);
 
             unsafe {
