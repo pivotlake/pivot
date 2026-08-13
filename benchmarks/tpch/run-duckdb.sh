@@ -23,9 +23,13 @@
 #   native:  --source is a .duckdb database file holding the base tables (see
 #     fetch-native-dbs.sh); opened read-only.
 #
-# --duckdb-process per-iteration|single  (default single)
-#   single: all of a query's iterations in ONE duckdb process, so iterations
-#     2+ reuse DuckDB's warm buffer pool - symmetric with pivot's warm server.
+# --duckdb-process per-run|per-query|per-iteration  (default per-run)
+#   per-run: ONE duckdb process executes the whole query list, so every query
+#     after the first reuses DuckDB's warm buffer pool - symmetric with
+#     pivot's one server streaming the same list. Gaps (and cache drops,
+#     unless --no-drop-caches) are issued from inside the process via .shell.
+#   per-query: a fresh duckdb process per query, all of that query's
+#     iterations inside it ("single" is accepted as an alias).
 #   per-iteration: a FRESH duckdb process per timed iteration (engine-cold,
 #     page cache warm after iteration 1).
 #
@@ -54,7 +58,7 @@ iterations=1
 drop_caches=1
 write_expected=0
 sleep_ms=0
-duckdb_process="single"
+duckdb_process="per-run"
 data="parquet"
 
 usage() {
@@ -79,8 +83,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$duckdb_process" in
-    per-iteration|single) ;;
-    *) echo "error: --duckdb-process must be per-iteration|single (got '$duckdb_process')" >&2; usage 1 ;;
+    per-run|per-query|per-iteration) ;;
+    single) duckdb_process="per-query" ;;
+    *) echo "error: --duckdb-process must be per-run|per-query|per-iteration (got '$duckdb_process')" >&2; usage 1 ;;
 esac
 
 case "$data" in
@@ -147,7 +152,7 @@ echo
 # fresh each iteration with parquet metadata caching on, so a timed run
 # doesn't pay the view re-creation. Native mode opens the database itself,
 # read-only so a run can never dirty it.
-if [[ "$write_expected" != "1" ]]; then
+if [[ "$write_expected" != "1" && "$duckdb_process" != "per-run" ]]; then
     if [[ "$data" == "parquet" ]]; then
         query_db="$(mktemp -u)-tpch.db"
         trap 'rm -f "$query_db" "$query_db".wal' EXIT
@@ -156,6 +161,44 @@ if [[ "$write_expected" != "1" ]]; then
     else
         iter_cmd=(duckdb -readonly "$source_path" -c ".timer on")
     fi
+fi
+
+# The whole run in one duckdb process: a dot-command script carries the
+# markers, gaps, and optional per-query cache drops, so the process (and its
+# buffer pool) lives across the list the way pivot's one server does. The
+# stdout markers match the per-process modes', so consumers parse all three
+# the same way.
+if [[ "$write_expected" != "1" && "$duckdb_process" == "per-run" ]]; then
+    script="$(mktemp)"
+    flush_helper="$(mktemp)"
+    trap 'rm -f "$script" "$flush_helper"' EXIT
+    printf 'sync\necho 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null\n' >"$flush_helper"
+    {
+        if [[ "$data" == "parquet" ]]; then
+            printf '%s' "$setup"
+            echo "SET parquet_metadata_cache=true;"
+        fi
+        echo ".timer on"
+        first=1
+        for f in "${query_files[@]}"; do
+            stem="$(basename "$f" .sql)"
+            [[ -f "$suite_dir/$stem-duckdb.sql" ]] && f="$suite_dir/$stem-duckdb.sql"
+            if [[ "$first" != "1" && "${sleep_ms:-0}" -gt 0 ]]; then
+                echo ".shell sleep $(awk "BEGIN{print $sleep_ms/1000}")"
+            fi
+            first=0
+            [[ "$drop_caches" == "1" ]] && echo ".shell bash $flush_helper"
+            echo ".print === $stem ==="
+            for ((i = 1; i <= iterations; i++)); do
+                cat "$f"
+                echo
+            done
+        done
+    } >"$script"
+    run_cmd=(duckdb)
+    [[ "$data" == "native" ]] && run_cmd=(duckdb -readonly "$source_path")
+    "${run_cmd[@]}" <"$script" 2>&1 | grep -E '=== q|Run Time|Error' || true
+    exit 0
 fi
 
 queries_timed=0
