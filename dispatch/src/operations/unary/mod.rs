@@ -99,7 +99,10 @@ pub use join::{
     JoinResidualSpec, JoinSpec, PackedKey, RangeCompare, RangeJoinSpec, SingleColumnKey,
 };
 pub use limit::LimitFactory;
-pub use order_by::OrderByFactory;
+pub use order_by::{
+    KWayMergePlan, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput, OrderByFactory,
+    batch_sort_indices,
+};
 pub use order_by_limit::{DynamicFilterSlot, OrderBy, OrderByLimitFactory};
 
 #[derive(Debug, Error)]

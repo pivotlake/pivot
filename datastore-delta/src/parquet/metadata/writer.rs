@@ -1,15 +1,15 @@
 //! Terminal (write) stage: the fan-in side of the dataflow. Every worker's
-//! [`FileRowGroups`] arrive on worker 0, which accumulates them and — at `finish` —
-//! hands the `Vec<FileRowGroups>` to the staging closure. Workers `1..n` receive
-//! nothing (empty receiver, no commit) and no-op. Emits no rows.
+//! [`FileRowGroups`] arrives on one selected worker, which accumulates them and
+//! hands the complete vector to the staging closure. The other workers receive
+//! nothing and no-op. Emits no rows.
 
 use super::FileRowGroups;
 use arrow_array::RecordBatch;
 use dispatch::{Sender, Unary, UnaryFactory};
 use std::mem;
 
-/// Per-worker factory for [`FileRowGroupsSink`]. Only the worker-0 factory carries
-/// the staging closure (the rest are `None`).
+/// Per-worker factory for [`FileRowGroupsSink`]. Only the selected worker's
+/// factory carries the staging closure.
 pub(super) struct FileRowGroupsSinkFactory<C> {
     stage: Option<C>,
 }

@@ -1,29 +1,15 @@
-//! Assembles encoded column chunks into one Parquet file per output file.
+//! Assembles encoded column chunks into complete Parquet files.
 //!
-//! A plain `Unary` map: the [`indexer`](super::indexer) stage routes every
-//! column chunk of a file to `file_id % worker_count`, so all of a file's chunks
-//! arrive at one [`FileAssembler`]. It gathers a row group's chunks (by
-//! `row_group_id`, one per schema column), assembles the row group — laying each
-//! chunk's dictionary page (if any) and data pages out contiguously and stamping
-//! sort columns' footer `Statistics` — and once a `file_id` has all its
-//! `n_row_groups`, builds the file, its row groups in the order they were cut,
-//! and emits it as an [`AssembledFile`] tagged with
-//! the partition tuple to record in the manifest. Nothing
-//! crosses workers and there is no finish phase: every file completes in
-//! `consume`. (The upstream [`indexer`](super::indexer) is what makes
-//! this possible — it hands down file-sized units with a known row-group count.)
+//! Every encoded chunk carries an assembly-worker id. Routing all chunks for a
+//! file to that worker lets [`FileAssembler`] gather them without shared state.
+//! It first assembles each row group, then orders the completed row groups and
+//! writes the file footer. A file is emitted from `consume` as soon as its last
+//! expected row group arrives.
 //!
-//! The footer is fully populated (column `type`/`encodings`/`path_in_schema`/
-//! `codec`/`num_values`/sizes/stats, `dictionary_page_offset` for dict chunks, row
-//! group `total_byte_size`, file `version`/`num_rows`, string columns marked
-//! UTF8), so the output round-trips through pivot's reader and through strict
-//! readers like arrow-rs and DuckDB.
-//!
-//! A row group holds one column chunk per *leaf*, while a job (and so an arriving
-//! [`EncodedColumnChunk`]) covers one top-level column: a flat column is its own
-//! leaf, and a shredded variant is a group of them. So the gathering still counts
-//! one chunk per schema column, and a chunk lays its leaves down in the
-//! depth-first order the footer schema numbers them in.
+//! An [`EncodedColumnChunk`] represents one top-level schema column and may
+//! contain several primitive leaves. Leaves are written in schema order, with
+//! dictionary pages before data pages, and their offsets and statistics are
+//! recorded in the footer.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,7 +26,7 @@ use dispatch::memory::{FileBytes, Slab, SlabAllocator};
 
 use super::error::{WriteError, WriteResult};
 use super::types::{
-    AssembledFile, EncodedColumnChunk, EncodedLeaf, FileId, RowGroupHeader, RowGroupId,
+    AssembledFile, EncodedColumnChunk, EncodedLeaf, FileId, RowGroupContext, RowGroupId,
 };
 
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
@@ -57,30 +43,27 @@ const PARQUET_VERSION: i32 = 1;
 pub(super) type FileAssemblerFactory = DefaultUnaryFactory<FileAssembler>;
 
 pub(super) fn factories(worker_count: usize) -> Vec<FileAssemblerFactory> {
-    (0..worker_count)
-        .map(|_| DefaultUnaryFactory::new())
-        .collect()
+    DefaultUnaryFactory::create_for_workers(worker_count)
 }
 
-/// Items collected under one key until all `remaining` have arrived, carrying the
-/// row group `header` they share. Used twice: a row group's column chunks (keyed
-/// by row-group id) and a file's assembled row groups (keyed by file id).
+/// Items accumulated until an expected count is reached. The same helper is
+/// used for columns within a row group and row groups within a file.
 struct Gathering<V> {
     remaining: usize,
-    header: Arc<RowGroupHeader>,
+    context: Arc<RowGroupContext>,
     items: Vec<V>,
 }
 
 impl<V> Gathering<V> {
-    fn new(remaining: usize, header: Arc<RowGroupHeader>) -> Self {
+    fn new(remaining: usize, context: Arc<RowGroupContext>) -> Self {
         Self {
             remaining,
-            header,
+            context,
             items: Vec::new(),
         }
     }
 
-    /// Add `item`; returns `true` once the last expected item has arrived.
+    /// Returns `true` when this item completes the collection.
     fn push(&mut self, item: V) -> bool {
         self.items.push(item);
         self.remaining -= 1;
@@ -88,8 +71,7 @@ impl<V> Gathering<V> {
     }
 }
 
-/// Per-worker consumer: gather a file's column chunks (all routed here by
-/// `file_id`) and emit the finished file once they have all arrived.
+/// Per-worker state for row groups and files that are still being assembled.
 #[derive(Default)]
 pub(super) struct FileAssembler {
     chunks_by_row_group: HashMap<RowGroupId, Gathering<EncodedColumnChunk>>,
@@ -102,62 +84,57 @@ impl Unary<EncodedColumnChunk, AssembledFile> for FileAssembler {
         chunk: EncodedColumnChunk,
         sender: &mut dyn Sender<AssembledFile>,
     ) -> UnaryResult<()> {
-        // Gather this row group's column chunks (one per schema column).
-        let row_group_id = chunk.header.row_group_id;
-        let columns = chunk.header.schema.fields().len();
-        let header = chunk.header.clone();
+        // A row group is ready once one encoded chunk has arrived for every
+        // top-level schema column.
+        let row_group_id = chunk.context.row_group_id;
+        let column_count = chunk.context.schema.fields().len();
+        let context = chunk.context.clone();
         if !self
             .chunks_by_row_group
             .entry(row_group_id)
-            .or_insert_with(|| Gathering::new(columns, header))
+            .or_insert_with(|| Gathering::new(column_count, context))
             .push(chunk)
         {
             return Ok(());
         }
 
-        // Row group done: assemble it with its sort columns' footer statistics.
         let Gathering {
-            header,
+            context,
             items: chunks,
             ..
         } = self.chunks_by_row_group.remove(&row_group_id).unwrap();
         let group = AssembledRowGroup::new(row_group_id, chunks)?;
 
-        // Add it to its file; emit the file once all its row groups are in.
-        let file_id = header.tag.file_id;
-        let n_row_groups = header.tag.n_row_groups;
+        let file_id = context.file_info.file_id;
+        let row_group_count = context.file_info.row_group_count;
         if !self
             .row_groups_by_file
             .entry(file_id)
-            .or_insert_with(|| Gathering::new(n_row_groups, header))
+            .or_insert_with(|| Gathering::new(row_group_count, context))
             .push(group)
         {
             return Ok(());
         }
 
         let Gathering {
-            header,
+            context,
             items: mut groups,
             ..
         } = self.row_groups_by_file.remove(&file_id).unwrap();
-        // Work-stealing finishes row groups in any order; the file lays them
-        // back out in the order they were cut, which is the sorted row order
-        // when the table has a sort key.
+        // Parallel encoding may complete row groups out of order.
         groups.sort_by_key(|group| group.row_group_id);
-        let (bytes, metadata) = build_file(&header.schema, groups)?;
+        let (bytes, metadata) = build_file(&context.schema, groups)?;
         sender.send(AssembledFile {
             bytes,
             metadata,
-            partition: header.tag.partition.clone(),
+            partition: context.file_info.partition.clone(),
         })?;
         Ok(())
     }
 }
 
-/// One fully-encoded row group: the runs its pages were encoded into, in the
-/// order they belong in the file, plus the chunk metadata with offsets relative
-/// to the start of the group (rebased by [`build_file`]). The id orders the
-/// groups back into the sequence they were cut in once the whole file gathers.
+/// Encoded bytes and footer column metadata for one row group. Column offsets
+/// are relative to the row group until `build_file` rebases them.
 struct AssembledRowGroup {
     row_group_id: RowGroupId,
     bytes: FileBytes,
@@ -165,13 +142,11 @@ struct AssembledRowGroup {
 }
 
 impl AssembledRowGroup {
-    /// Assemble one row group from its column chunks (one per schema column, any
-    /// order). Each leaf brings its own footer statistics from the encoder.
+    /// Writes a row group's encoded columns in schema order.
     fn new(row_group_id: RowGroupId, mut chunks: Vec<EncodedColumnChunk>) -> WriteResult<Self> {
-        // Footer column chunks must be in schema order; work-stealing delivers
-        // them in any order. Within a column, its leaves are already in footer
-        // order.
-        chunks.sort_by_key(|c| c.column);
+        // Workers may return columns in any order. Leaves within each column
+        // are already ordered by the encoder.
+        chunks.sort_by_key(|chunk| chunk.column_index);
 
         let mut bytes = FileBytes::new();
         let mut columns = Vec::with_capacity(chunks.len());
@@ -396,7 +371,7 @@ mod tests {
     use crate::parquet::ParquetTable;
     use crate::parquet::types::arrow_map::CONVERTED_DECIMAL;
     use crate::parquet::writing::encoder::encode_column_chunk;
-    use crate::parquet::writing::types::{EncodedColumnChunk, PartitionTag};
+    use crate::parquet::writing::types::{EncodedColumnChunk, FileAssemblyInfo};
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Decimal64Type, Int64Type};
     use arrow_array::{
@@ -408,15 +383,14 @@ mod tests {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::sync::Arc;
 
-    /// A minimal header for assembling one standalone row group in a test.
-    fn header(schema: &SchemaRef) -> Arc<RowGroupHeader> {
-        Arc::new(RowGroupHeader {
+    fn context(schema: &SchemaRef) -> Arc<RowGroupContext> {
+        Arc::new(RowGroupContext {
             row_group_id: 0,
-            dest_worker: 0,
+            assembly_worker: 0,
             schema: schema.clone(),
-            tag: Arc::new(PartitionTag {
+            file_info: Arc::new(FileAssemblyInfo {
                 file_id: 0,
-                n_row_groups: 1,
+                row_group_count: 1,
                 partition: None,
             }),
         })
@@ -437,12 +411,12 @@ mod tests {
                     dispatch::memory::init_test_free_pool(64);
                     let mut allocator = SlabAllocator::new(false);
                     let schema = batch.schema();
-                    let header = header(&schema);
+                    let context = context(&schema);
                     let chunks: Vec<EncodedColumnChunk> = (0..batch.num_columns())
                         .map(|column| {
                             Ok(EncodedColumnChunk {
-                                header: header.clone(),
-                                column,
+                                context: context.clone(),
+                                column_index: column,
                                 leaves: encode_column_chunk(
                                     schema.field(column),
                                     batch.column(column),

@@ -1,46 +1,51 @@
-//! The streaming, page-parallel Parquet **write** pipeline — the write-side
-//! mirror of dispatch's read pipeline (indexer → decompressor → decoder), built
-//! from the same operator/channel toolkit. Each pipeline stage is its own module
-//! (a file, or a directory when it has private helpers of its own); the modules
-//! genuinely shared across stages sit beside them: the message [`types`] and the
-//! pipeline's [`WriteError`](error::WriteError) in [`error`].
+//! Streaming Parquet file construction for INSERT and compaction.
 //!
-//! A `RecordBatch` dataflow flows through these stages, and finished Parquet
-//! files stream out the far end:
+//! The pipeline sorts and writes data as follows:
 //!
-//! 1. **ORDER BY** (dispatch's, present when the table is partitioned or
-//!    sorted) — batches leave it holding one partition each, partitions
-//!    grouped in tuple order, rows within a partition in key order.
-//! 2. [`indexer`] (`RecordBatch → ColumnChunkJob`) — every batch funnels to
-//!    one worker's indexer in creation order (the single-worker channel), so
-//!    it sees the stream whole and ordered. It cuts one file per partition as
-//!    each partition's batches end, emitting one job per column per
-//!    `target_rows_per_group` window; a job carries a gather recipe over the
-//!    stream's chunks, never row data. This is also where each file's variant
-//!    columns pick their [`shredding`] — the only stage that sees a whole
-//!    file's rows at once.
-//! 3. [`encoder`] (`ColumnChunkJob → EncodedColumnChunk`) — materialize each
-//!    job's rows by its gather, then encode: flatten the column into the
-//!    leaves Parquet stores, dictionary-encode where it pays, else PLAIN; cut
-//!    into pages and snappy-compress. The one heavy stage, and the only one
-//!    that touches row data; finished chunks route back to their file's owner
-//!    worker. (Leaf flattening, page cutting and index RLE live in the
-//!    `encoder` directory.)
-//! 4. [`assembler`] (`EncodedColumnChunk → AssembledFile`) — gather a file's
-//!    column chunks, lay each out (the dictionary page, then the data pages)
-//!    with sort-column footer statistics, and emit the finished file.
+//! 1. [`partition_sorter`] splits each input batch by table partition, sorts
+//!    each piece, and copies it into independent memory. Each piece is one
+//!    sorted run located on the NUMA node that produced it.
+//! 2. [`file_collector`] chooses the runs belonging to each output file and
+//!    groups them by source node. Its byte target applies to the retained Arrow
+//!    data of each pending partition file.
+//! 3. The local planner in [`file_merge`] reads the sort keys of one node's runs
+//!    and divides their k-way merge into independent output slices. It does not
+//!    copy rows. A node-local work queue keeps this planning beside the input
+//!    data and distributes the resulting slice jobs among workers on that node.
+//! 4. The local executors heap-merge each slice, gather every column, and
+//!    produce one sorted run for the node.
+//! 5. The global planner waits for all participating nodes, then divides the
+//!    k-way merge of their node-level runs into global output slices. A shared
+//!    queue is appropriate here because the inputs already span nodes.
+//! 6. The global executors materialize those slices on their selected NUMA
+//!    nodes. Together, in slice order, they are the fully sorted file input.
+//! 7. [`row_group_planner`] divides the ordered file into column jobs.
+//! 8. [`encoder`] materializes and encodes those jobs as Parquet pages.
+//! 9. [`assembler`] returns encoded column chunks to one worker per file and
+//!    produces the final file bytes and footer metadata.
 //!
-//! An unpartitioned, unsorted write skips stage 1; the whole stream is the one
-//! partition and becomes one file. The pipeline is reached by inserting into a
-//! table: [`encode_record_batches_spec`] attaches these stages to a
-//! `RecordBatch` dataflow and the caller continues into the upload operators,
-//! which is how both INSERT and compaction write without a file's bytes ever
-//! leaving the worker pool.
+//! In outline, the two merge levels are:
+//!
+//! ```text
+//! node 0 runs ── local k-way merge ── node 0 run ─┐
+//! node 1 runs ── local k-way merge ── node 1 run ─┼─ global k-way merge ─ file
+//! node N runs ── local k-way merge ── node N run ─┘
+//! ```
+//!
+//! A merge level with one run is a zero-copy identity. Files without sort
+//! columns pass through all merge stages without planning or copying rows.
+//!
+//! Unpartitioned and unsorted tables use the same stages with one implicit
+//! partition and no merge ordering. Files remain on dispatch workers through
+//! assembly and upload because their bytes occupy worker-owned ring memory.
 
 mod assembler;
 pub(crate) mod encoder;
 pub(crate) mod error;
-mod indexer;
+mod file_collector;
+mod file_merge;
+mod partition_sorter;
+mod row_group_planner;
 mod shredding;
 mod stats;
 pub(crate) use stats::aggregate_file_stats;
@@ -50,86 +55,120 @@ pub(crate) use shredding::unshred_batch;
 pub(crate) use types::AssembledFile;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use dispatch::{
-    OperatorFactory, OperatorSpec, RecordBatchOperatorSpec, return_to_worker_mpsc, stealable,
-    to_single_worker_mpsc,
+    DefaultUnaryFactory, OperatorFactory, OperatorSpec, OrderBy, RecordBatchOperatorSpec,
+    node_work_queue, return_to_worker_mpsc, shared_work_queue, stealable, to_single_worker_mpsc,
 };
 
-use types::{ColumnChunkJob, EncodedColumnChunk};
+use partition_sorter::{PartitionSorterFactory, SortedPartitionRun};
+use types::{
+    ColumnChunkJob, EncodedColumnChunk, FileOrderInput, GlobalMergeJob, LocalMergeJob,
+    LocalMergeResult, ReadyFile,
+};
 
-/// Which worker hosts the next pipeline's [`indexer`]. Every batch of a write
-/// funnels to one worker's indexer; rotating the host spreads concurrent
-/// writes' serial stages across the pool instead of stacking them on worker 0.
-static NEXT_INDEXER_HOST: AtomicUsize = AtomicUsize::new(0);
-
-/// Attach the whole Parquet write pipeline to a `RecordBatch` dataflow
-/// without executing it, finished files streaming out the far end. Catalog
-/// INSERT and compaction use this to continue directly into asynchronous
-/// upload and commit operators on the same workers.
+/// Appends Parquet construction to an existing record-batch dataflow.
 ///
-/// A partitioned or sorted table's rows go through the grouped ORDER BY
-/// first: batches leave it holding one partition each, partitions grouped in
-/// tuple order, rows within a partition in key order. Everything then funnels
-/// in that order to one worker's [`indexer`], which cuts the stream into one
-/// file per partition. Variant columns fold back to their plain pair ahead of
-/// all of it, so batches read back from differently-shredded files agree on a
-/// schema before any of them regroup.
+/// Variant columns are first restored to their logical representation so input
+/// files with different physical layouts can be combined. INSERT supplies a
+/// finite `target_in_memory_bytes_per_file`; compaction uses `usize::MAX` when
+/// it needs one globally ordered output file per partition.
 pub(crate) fn encode_record_batches_spec(
     spec: RecordBatchOperatorSpec,
     schema: SchemaRef,
-    partition_by: Arc<[String]>,
-    sort_by: Arc<[String]>,
+    partition_column_names: Arc<[String]>,
+    sort_column_names: Arc<[String]>,
     target_rows_per_group: usize,
+    target_in_memory_bytes_per_file: usize,
 ) -> OperatorSpec<AssembledFile, impl OperatorFactory<AssembledFile> + 'static> {
     let spec = spec.project(|| |batch| unshred_batch(batch).expect("a variant column reassembles"));
-    let spec = if partition_by.is_empty() && sort_by.is_empty() {
-        spec
-    } else {
-        let partition_columns = partition_by
-            .iter()
-            .map(|name| {
-                schema
-                    .index_of(name)
-                    .expect("partition columns name declared columns")
-            })
-            .collect();
-        let sort_keys = sort_by
-            .iter()
-            .map(|name| {
-                let column = schema
-                    .index_of(name)
-                    .expect("sort columns name declared columns");
-                dispatch::OrderBy::new(column, false, true)
-            })
-            .collect();
-        spec.order_by_per_partition(partition_columns, sort_keys)
-    };
+    let partition_column_indices: Vec<usize> = partition_column_names
+        .iter()
+        .map(|name| {
+            schema
+                .index_of(name)
+                .expect("partition columns name declared columns")
+        })
+        .collect();
+    let order_by: Vec<OrderBy> = sort_column_names
+        .iter()
+        .map(|name| {
+            let column = schema
+                .index_of(name)
+                .expect("sort columns name declared columns");
+            OrderBy::new(column, false, true)
+        })
+        .collect();
 
     let (dispatcher, heads) = spec.into_parts();
-    let workers = heads.len();
-    let indexer_host = NEXT_INDEXER_HOST.fetch_add(1, Ordering::Relaxed) % workers;
-    let batches = OperatorSpec::new(dispatcher, heads.into_iter().collect::<Vec<_>>());
-    let topology = batches.dispatcher().topology();
-    batches
+    let worker_count = heads.len();
+    let file_collector_worker = dispatcher.next_worker();
+    let input_batches = OperatorSpec::new(dispatcher, heads.into_iter().collect::<Vec<_>>());
+    let topology = input_batches.dispatcher().topology();
+    input_batches
         .chain(
-            to_single_worker_mpsc::<RecordBatch>(workers, indexer_host)
-                .into_iter()
-                .collect(),
-            indexer::factories(partition_by, target_rows_per_group, workers),
+            stealable::<RecordBatch>(topology).into_iter().collect(),
+            PartitionSorterFactory::create_for_workers(
+                partition_column_indices,
+                order_by.clone(),
+                topology,
+            ),
         )
         .chain(
-            stealable::<ColumnChunkJob>(topology).into_iter().collect(),
-            encoder::factories(workers),
-        )
-        .chain(
-            return_to_worker_mpsc::<EncodedColumnChunk>(workers)
+            to_single_worker_mpsc::<SortedPartitionRun>(worker_count, file_collector_worker)
                 .into_iter()
                 .collect(),
-            assembler::factories(workers),
+            file_collector::factories(
+                partition_column_names,
+                order_by.into(),
+                target_rows_per_group,
+                target_in_memory_bytes_per_file,
+                topology,
+            ),
+        )
+        .chain(
+            node_work_queue::<FileOrderInput>(topology)
+                .into_iter()
+                .collect(),
+            DefaultUnaryFactory::<file_merge::LocalMergePlanner>::create_for_workers(worker_count),
+        )
+        .chain(
+            node_work_queue::<LocalMergeJob>(topology)
+                .into_iter()
+                .collect(),
+            DefaultUnaryFactory::<file_merge::LocalMergeExecutor>::create_for_workers(worker_count),
+        )
+        .chain(
+            shared_work_queue::<LocalMergeResult>(worker_count)
+                .into_iter()
+                .collect(),
+            DefaultUnaryFactory::<file_merge::GlobalMergePlanner>::create_for_workers(worker_count),
+        )
+        .chain(
+            node_work_queue::<GlobalMergeJob>(topology)
+                .into_iter()
+                .collect(),
+            DefaultUnaryFactory::<file_merge::GlobalMergeExecutor>::create_for_workers(
+                worker_count,
+            ),
+        )
+        .chain(
+            node_work_queue::<ReadyFile>(topology).into_iter().collect(),
+            row_group_planner::factories(topology),
+        )
+        .chain(
+            node_work_queue::<ColumnChunkJob>(topology)
+                .into_iter()
+                .collect(),
+            encoder::factories(worker_count),
+        )
+        .chain(
+            return_to_worker_mpsc::<EncodedColumnChunk>(worker_count)
+                .into_iter()
+                .collect(),
+            assembler::factories(worker_count),
         )
 }
 

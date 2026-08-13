@@ -22,9 +22,9 @@
 //!   and pass straight through; compaction's come from files that each
 //!   shredded differently, and this is what makes them one schema again so
 //!   they can be regrouped into fresh files.
-//! - [`plan_file_shredding`] runs on the [`indexer`](super::indexer) once a
-//!   file's rows are known: it picks the file's layout from all of its rows,
-//!   without rewriting any of them.
+//! - [`plan_file_shredding`] runs in the
+//!   [`row_group_planner`](super::row_group_planner) once a file's rows are
+//!   known. It picks the file's layout without rewriting the rows.
 //! - [`shred_gathered_column`] applies the plan, on the encode workers, to
 //!   each materialized row group's variant column — the rewrite is the heavy
 //!   half, and it parallelizes there.

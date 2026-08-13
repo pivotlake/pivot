@@ -54,7 +54,7 @@
 #![allow(rustdoc::private_intra_doc_links)]
 
 use core_affinity::CoreId;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender as StdSender, channel};
 use std::sync::{Arc, Barrier};
 use std::thread::JoinHandle;
@@ -93,7 +93,7 @@ pub use memory::BUFFER_SIZE;
 pub use memory::ReadBuffer;
 pub use memory::{MemoryBlockState, MemoryBlockStatus, block_size_bytes};
 pub use memory::{MemoryContextFactory, init_memory_context, memory_ctx};
-pub use numa::{Topology, default_worker_count};
+pub use numa::{Topology, default_worker_count, dominant_node};
 pub use operations::channels::{MpscSender, Sender};
 pub use operations::nullary::Result as NullaryResult;
 pub use operations::unary::filter::{RowDelivery, RowSelection, collect_selected_indices};
@@ -108,13 +108,17 @@ pub use scan::{
 pub use stats::DataFlowStats;
 
 pub use operations::channels::{
-    ChannelFactory, FanInChannelFactory, MpscReceiver, Receiver, ReturnToWorkerMpscFactory,
-    RootChannelFactory, StealableChannelFactory, WorkerAwareSender, WorkerIdOutput, fan_in,
-    mpsc_channel, return_to_worker_mpsc, stealable, to_single_worker_mpsc,
+    ChannelFactory, FanInChannelFactory, MpscReceiver, NodeIdOutput, NodeWorkQueueChannelFactory,
+    Receiver, ReturnToWorkerMpscFactory, RootChannelFactory, SharedWorkQueueChannelFactory,
+    StealableChannelFactory, WorkerAwareSender, WorkerIdOutput, fan_in, mpsc_channel,
+    node_work_queue, return_to_worker_mpsc, shared_work_queue, stealable, to_single_worker_mpsc,
 };
 #[cfg(any(test, feature = "test-util"))]
 pub use operations::unary::test_utils;
 pub use operations::unary::{Error as UnaryError, Result as UnaryResult};
+pub use operations::unary::{
+    KWayMergePlan, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput, batch_sort_indices,
+};
 pub use operations::{
     AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot,
     CountValidSlot, Distinct, Dynamic, DynamicFilterSlot, Fold, GroupLimit,
@@ -175,6 +179,9 @@ pub struct DataFlowDispatcher {
     waker_set: WakerSet,
     /// Total ring slots across all nodes, used to size group-by working memory.
     buffers: usize,
+    /// Shared by every clone so arbitrary single-worker stages rotate across
+    /// this pool rather than accumulating on its first worker.
+    next_worker: Arc<AtomicUsize>,
     /// The pool's shared exit flag, the same `Arc<AtomicBool>` the [`Shutdown`]
     /// handle flips. Lets long-lived background work owned elsewhere (per-table
     /// refresh and compaction loops) observe that the pool is tearing down and
@@ -208,12 +215,10 @@ impl DataFlowDispatcher {
 impl DataFlowDispatcher {
     /// Dispatch one pre-built `DataFlow` bundle across the node groups.
     /// Builder `i` goes to global worker `i` (node `i / workers_per_node`). A
-    /// full bundle has one builder per worker; a shorter one (e.g.
-    /// [`run_on_worker`](Self::run_on_worker)'s single builder) reaches only
-    /// the first workers, which is consistent with the dense `0..builder_count`
-    /// worker indexing its channels are built for. Returns the wakers of every
-    /// node, so cancellation (which may fire from a non-worker thread) can
-    /// wake parked workers on any node.
+    /// full bundle has one builder per worker; a shorter one reaches only the
+    /// first workers, consistent with the dense `0..builder_count` indexing its
+    /// channels were built for. Returns the wakers of every node, so cancellation
+    /// can wake parked workers on any node.
     pub fn push_data_flow(&self, builders: impl IntoIterator<Item = DataFlowBuilder>) -> WakerSet {
         for (worker, builder) in builders.into_iter().enumerate() {
             self.senders[worker].send(builder).unwrap();
@@ -231,6 +236,11 @@ impl DataFlowDispatcher {
         self.topology.total_workers()
     }
 
+    /// Choose the next worker for a stage that needs one arbitrary host.
+    pub fn next_worker(&self) -> usize {
+        self.next_worker.fetch_add(1, Ordering::Relaxed) % self.worker_count()
+    }
+
     /// The worker/node shape of the pool, for code that partitions per-worker
     /// state by node (e.g. work-stealing channels, scan queues).
     pub fn topology(&self) -> numa::Topology {
@@ -244,23 +254,25 @@ impl DataFlowDispatcher {
         self.shutdown_flag.load(Ordering::Relaxed)
     }
 
-    /// Ship a `FnOnce() -> T` to worker 0 and return its result.
+    /// Ship a `FnOnce() -> T` to one worker and return its result.
     ///
     /// Useful for one-shot setup work that needs a `MemoryContext` to run
     /// (e.g. `ParquetTable::from_files`, which touches the compressed cache)
-    /// from a thread that doesn't have one. Builds a single-element
-    /// `OperatorSpec` whose nullary fires once, sends one item, and finishes.
+    /// from a thread that doesn't have one. Successive calls rotate across the
+    /// worker pool.
     pub fn run_on_worker<T, F>(&self, f: F) -> crate::data_flow::Result<T>
     where
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
-        let spec = OperatorSpec::new(
-            self.clone(),
-            std::iter::once(NullaryOperatorFactory::new(OneShotNullaryFactory::new(
-                move || Some(f()),
-            ))),
-        );
+        let worker_count = self.worker_count();
+        let target = self.next_worker();
+        let mut task = Some(f);
+        let factories = (0..worker_count).map(|worker| {
+            let task = if worker == target { task.take() } else { None };
+            NullaryOperatorFactory::new(OneShotNullaryFactory::new(move || task.map(|task| task())))
+        });
+        let spec = OperatorSpec::new(self.clone(), factories);
         let mut results = spec.collect()?;
         Ok(results
             .pop()
@@ -396,6 +408,7 @@ impl Dispatch {
                 topology,
                 waker_set: waker_set.clone(),
                 buffers: layout.total_slots(),
+                next_worker: Arc::new(AtomicUsize::new(0)),
                 shutdown_flag: should_exit.clone(),
                 #[cfg(feature = "perf")]
                 profiled: false,
@@ -493,6 +506,20 @@ mod tests {
 
         indices.sort();
         assert_eq!(indices, vec![0, 1, 2, 3]);
+        dispatch.exit();
+    }
+
+    #[test]
+    fn single_worker_hosts_rotate_across_dispatcher_clones() {
+        let dispatch = Dispatch::spin_up_groups(synthetic_groups(1, 3), 16, None);
+        let first_handle = dispatch.dispatcher().clone();
+        let second_handle = first_handle.clone();
+
+        assert_eq!(first_handle.next_worker(), 0);
+        assert_eq!(second_handle.next_worker(), 1);
+        assert_eq!(first_handle.next_worker(), 2);
+        assert_eq!(second_handle.next_worker(), 0);
+
         dispatch.exit();
     }
 

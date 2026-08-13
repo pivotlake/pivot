@@ -150,14 +150,17 @@ where
         fetch_file_row_group_factories(files, dispatcher.worker_count(), declared_columns),
     );
 
-    // `fan_in` funnels every worker's row groups to worker 0; only worker 0 gets
-    // the staging closure, so it alone enqueues the completed creation (the rest
-    // no-op). The channel closing is the "all fetched" signal.
+    // One worker receives every row group and the staging closure; the channel
+    // closing is the "all fetched" signal. Rotate that role across creations.
+    let worker_count = dispatcher.worker_count();
+    let target = dispatcher.next_worker();
     let mut stage = Some(stage);
-    let sinks: Vec<_> = (0..dispatcher.worker_count())
-        .map(|_| FileRowGroupsSinkFactory::new(stage.take()))
+    let sinks: Vec<_> = (0..worker_count)
+        .map(|worker| {
+            FileRowGroupsSinkFactory::new(if worker == target { stage.take() } else { None })
+        })
         .collect();
     RecordBatchOperatorSpec::from_spec(
-        fetch.chain(fan_in::<FileRowGroups>(dispatcher.worker_count()), sinks),
+        fetch.chain(fan_in::<FileRowGroups>(worker_count, target), sinks),
     )
 }

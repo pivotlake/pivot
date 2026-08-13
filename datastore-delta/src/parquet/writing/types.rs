@@ -1,138 +1,215 @@
-//! Messages that flow between the write pipeline's stages.
+//! Data passed between the Parquet write stages.
 //!
-//! The unit of encode work is one **column chunk** (a single column's values for
-//! one row group): the [`indexer`](super::indexer) stage emits a
-//! [`ColumnChunkJob`], the [`encoder`](super::encoder) turns it into an
-//! [`EncodedColumnChunk`] holding one [`EncodedLeaf`] per leaf of that column
-//! (PLAIN, or dictionary-encoded), and the [`assembler`](super::assembler) lays
-//! the leaves out into a file. Each carries the row group's shared
-//! [`RowGroupHeader`] for routing and provenance.
+//! Merge jobs carry file-ordering work between the node-local and global
+//! stages. [`ColumnChunkJob`] then describes one top-level column of one row
+//! group. The encoder turns it into [`EncodedColumnChunk`], and the assembler
+//! combines those results into a Parquet file.
 
-use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, OnceLock};
 
 use arrow_array::ArrayRef;
 use arrow_schema::SchemaRef;
 use dispatch::memory::{FileBytes, Slab};
-use dispatch::{Identifier, WorkerIdOutput};
+use dispatch::{
+    Identifier, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput, NodeIdOutput, OrderBy,
+    WorkerIdOutput,
+};
 use thriftparquet::footer::Statistics;
 use thriftparquet::general::Encoding;
 
-/// Identifies a row group across the pipeline so its column chunks reassemble
-/// together.
+/// Unique identity of a row group within one write pipeline.
 pub(crate) type RowGroupId = u64;
 
-/// Identifies an output file across the pipeline so its row groups assemble
-/// together (and route to one worker).
+/// Unique identity of an output file within one write pipeline.
 pub(crate) type FileId = u64;
 
-/// Per-row-group provenance threaded from the [`indexer`](super::indexer)
-/// stage to the [`assembler`](super::assembler). Every field is file-level, so a
-/// file's row groups all carry the same one. Always present (an unpartitioned
-/// write carries one with `partition` `None`). `Arc` so the chunk stages clone
-/// it cheaply.
-pub(crate) struct PartitionTag {
-    /// The output file this row group belongs to; the assembler packs all row
-    /// groups of one `file_id` into a single Parquet file.
+/// File-level information shared by all row groups during assembly.
+pub(crate) struct FileAssemblyInfo {
     pub(crate) file_id: FileId,
-    /// Total row groups in this file, so the assembler knows when it's complete.
-    pub(crate) n_row_groups: usize,
+    pub(crate) row_group_count: usize,
     pub(crate) partition: Option<crate::PartitionValues>,
 }
 
-/// A finished Parquet file from the write pipeline, with the manifest metadata to
-/// record for it (`partition` is `None` for an unpartitioned write).
+/// A complete Parquet file and the metadata needed to add it to the table.
 ///
-/// The bytes are the slabs its pages were encoded into, in file order, so the
-/// file is never assembled into one buffer. They are ring memory, so this must
-/// be dropped on the dispatch worker that assembled it, which is where the
-/// upload operators consume it.
+/// `bytes` references worker-owned ring slabs and must be released by the
+/// worker that assembled the file.
 pub(crate) struct AssembledFile {
     pub bytes: FileBytes,
-    /// The footer metadata written into `bytes`. Kept so a consumer that records
-    /// the file's row groups can build them straight from here instead of parsing
-    /// the footer back out of a file it just produced.
+    /// Retained to avoid parsing the footer immediately after writing it.
     pub metadata: thriftparquet::footer::FileMetaData,
     pub partition: Option<crate::PartitionValues>,
 }
 
-/// The per-row-group metadata every column chunk of a row group shares: its
-/// identity and owner worker (for routing), schema, and [`PartitionTag`]. Built
-/// once by the [`indexer`](super::indexer) stage and shared by `Arc`, so each
-/// column job clones a single pointer instead of re-copying all of this. The row
-/// group is complete once the assembler has one chunk per `schema` column.
-pub(crate) struct RowGroupHeader {
+/// Shared routing and schema information for every column chunk in one row
+/// group.
+pub(crate) struct RowGroupContext {
     pub(crate) row_group_id: RowGroupId,
-    /// Worker that owns this row group; its chunks all route there for assembly
-    /// (`file_id % worker_count`, so a file's row groups co-locate).
-    pub(crate) dest_worker: usize,
+    pub(crate) assembly_worker: usize,
     pub(crate) schema: SchemaRef,
-    pub(crate) tag: Arc<PartitionTag>,
+    pub(crate) file_info: Arc<FileAssemblyInfo>,
 }
 
-/// One column of one row group, to encode into a column chunk. The rows ride
-/// as the chunks whose concatenation they are, not as a finished array: the
-/// [`indexer`](super::indexer) never touches row data, and the encode worker
-/// materializes the row group itself — the stream's batch-sized chunks
-/// appended back to back — right before encoding it, while the values are
-/// hot.
+/// Identities, routing, and row-group sizing assigned when a file candidate is
+/// completed.
+#[derive(Clone)]
+pub(crate) struct FilePlan {
+    pub(crate) file_id: FileId,
+    pub(crate) base_row_group_id: RowGroupId,
+    pub(crate) assembly_worker: usize,
+    pub(crate) partition: Option<crate::PartitionValues>,
+    pub(crate) target_rows_per_group: usize,
+}
+
+/// A file whose row order is final and ready for row-group planning.
+pub(crate) struct ReadyFile {
+    pub(crate) plan: FilePlan,
+    pub(crate) batches: Vec<LocatedBatch>,
+    pub(crate) row_count: usize,
+    pub(crate) target_node: usize,
+}
+
+impl NodeIdOutput for ReadyFile {
+    fn node_id(&self) -> usize {
+        self.target_node
+    }
+}
+
+/// Shared state linking the node-local merge results for one file.
+pub(crate) struct FileMergeContext {
+    pub(crate) plan: FilePlan,
+    pub(crate) order_by: Arc<[OrderBy]>,
+    pub(crate) row_count: usize,
+    pub(crate) local_outputs: Box<[OnceLock<MergedOutput>]>,
+    pub(crate) nodes_remaining: AtomicUsize,
+}
+
+pub(crate) struct NodeMergeRequest {
+    pub(crate) context: Arc<FileMergeContext>,
+    pub(crate) node_id: usize,
+    pub(crate) runs: Vec<MergeRun>,
+}
+
+/// Either an unordered file that bypasses merging or one node's sorted runs.
+pub(crate) enum FileOrderInput {
+    Ready(ReadyFile),
+    Merge(NodeMergeRequest),
+}
+
+impl NodeIdOutput for FileOrderInput {
+    fn node_id(&self) -> usize {
+        match self {
+            Self::Ready(file) => file.node_id(),
+            Self::Merge(request) => request.node_id,
+        }
+    }
+}
+
+/// Work emitted by a node-local merge planner.
+pub(crate) enum LocalMergeJob {
+    Ready(ReadyFile),
+    Identity {
+        context: Arc<FileMergeContext>,
+        node_id: usize,
+        output: MergedOutput,
+    },
+    Task {
+        context: Arc<FileMergeContext>,
+        node_id: usize,
+        task: KWayMergeTask,
+    },
+}
+
+impl NodeIdOutput for LocalMergeJob {
+    fn node_id(&self) -> usize {
+        match self {
+            Self::Ready(file) => file.node_id(),
+            Self::Identity { node_id, .. } | Self::Task { node_id, .. } => *node_id,
+        }
+    }
+}
+
+/// One completed node-local result, or an unordered file passing through.
+pub(crate) enum LocalMergeResult {
+    Ready(ReadyFile),
+    Merged {
+        context: Arc<FileMergeContext>,
+        node_id: usize,
+        output: MergedOutput,
+    },
+}
+
+/// Work emitted after every participating node has completed its local merge.
+pub(crate) enum GlobalMergeJob {
+    Ready(ReadyFile),
+    Identity {
+        context: Arc<FileMergeContext>,
+        output: MergedOutput,
+        node_id: usize,
+    },
+    Task {
+        context: Arc<FileMergeContext>,
+        task: KWayMergeTask,
+    },
+}
+
+impl NodeIdOutput for GlobalMergeJob {
+    fn node_id(&self) -> usize {
+        match self {
+            Self::Ready(file) => file.node_id(),
+            Self::Identity { node_id, .. } => *node_id,
+            Self::Task { task, .. } => task.node_id(),
+        }
+    }
+}
+
+/// One top-level column of one row group, ready for materialization and Parquet
+/// encoding.
 pub(crate) struct ColumnChunkJob {
-    pub(crate) header: Arc<RowGroupHeader>,
-    /// Index of this column in the schema.
-    pub(crate) column: usize,
-    /// This row group's rows: this column's slices of the stream chunks the
-    /// row group's window covers, in order.
-    pub(crate) chunks: Arc<[ArrayRef]>,
-    /// The shredding the file's plan chose for this column, applied to the
-    /// materialized rows before encoding; `None` for plain columns and
-    /// variants left as the plain pair.
+    pub(crate) context: Arc<RowGroupContext>,
+    pub(crate) column_index: usize,
+    /// Array slices in row order. The encoder concatenates them before
+    /// encoding the column chunk.
+    pub(crate) batches: Arc<[ArrayRef]>,
     pub(crate) shredding: Option<Arc<arrow_schema::DataType>>,
+    pub(crate) target_node: usize,
 }
 
-/// An encoded page (data or dictionary): its snappy-compressed body behind a
-/// thrift header. The sizes feed the column-chunk footer metadata.
+impl NodeIdOutput for ColumnChunkJob {
+    fn node_id(&self) -> usize {
+        self.target_node
+    }
+}
+
+/// One encoded Parquet page, including its Thrift header and compressed body.
 pub(crate) struct EncodedPage {
     pub(crate) num_rows: i64,
-    /// Uncompressed size of the page body (before snappy).
     pub(crate) uncompressed_size: usize,
-    /// Size of the page's thrift header (precedes the compressed body).
     pub(crate) header_len: usize,
-    /// The page on the wire, header followed by the compressed body, in one
-    /// slab. Every stage after this moves the slab rather than its bytes, so
-    /// this is the only place a page's bytes are written.
     pub(crate) bytes: Slab,
 }
 
-/// One leaf's encoded pages. Parquet stores a chunk per *leaf*, not per column:
-/// a flat column has exactly one, and a shredded variant one per primitive under
-/// its `{metadata, value, typed_value{..}}` struct. A dictionary-encoded leaf
-/// holds its distinct values in `dictionary_page` and RLE-encoded indices in
-/// `data_pages`; otherwise the data pages carry the values themselves, in
-/// whichever encoding `data_page_encoding` names.
+/// Encoded pages and footer data for one primitive Parquet leaf.
 pub(crate) struct EncodedLeaf {
-    /// The leaf's path from its top-level column down, e.g. `["attrs",
-    /// "typed_value", "user", "typed_value"]` — the footer's `path_in_schema`.
     pub(crate) path: Vec<String>,
     pub(crate) physical_type: i32,
-    /// This leaf's min/max and null count over the row group, for the footer.
-    /// Every leaf carries them, so a reader can prune by any column.
     pub(crate) statistics: Statistics,
     pub(crate) dictionary_page: Option<EncodedPage>,
-    /// How the data pages encode their values, which the footer reports so a
-    /// reader knows which decoder to use.
     pub(crate) data_page_encoding: Encoding,
     pub(crate) data_pages: Vec<EncodedPage>,
 }
 
-/// A fully-encoded column chunk, routed back to its row group's owner worker for
-/// assembly: one column's leaves, in the depth-first order Parquet numbers them.
+/// One fully encoded top-level column, containing its primitive leaves in
+/// schema order.
 pub(crate) struct EncodedColumnChunk {
-    pub(crate) header: Arc<RowGroupHeader>,
-    pub(crate) column: usize,
+    pub(crate) context: Arc<RowGroupContext>,
+    pub(crate) column_index: usize,
     pub(crate) leaves: Vec<EncodedLeaf>,
 }
 
 impl WorkerIdOutput for EncodedColumnChunk {
     fn worker_id(&self) -> Identifier {
-        self.header.dest_worker
+        self.context.assembly_worker
     }
 }

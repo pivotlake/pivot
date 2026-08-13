@@ -398,8 +398,9 @@ fn opening_an_unwritable_database_fails() {
         .unwrap_err()
         .to_string();
 
+    let err_lower = err.to_lowercase();
     assert!(
-        err.to_lowercase().contains("permission denied"),
+        err_lower.contains("permission denied") || err_lower.contains("read-only file system"),
         "expected the lock-file write failure, got: {err}"
     );
 }

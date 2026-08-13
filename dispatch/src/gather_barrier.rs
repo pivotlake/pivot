@@ -59,7 +59,19 @@ impl<T> GatherBarrier<T> {
     /// Panics if the calling thread has no valid worker index or that worker has
     /// already arrived.
     pub fn arrive<R>(&self, value: T, on_complete: impl FnOnce(Vec<T>) -> R) -> Option<R> {
-        let worker_index = WORKER_IDX.get();
+        self.arrive_at(WORKER_IDX.get(), value, on_complete)
+    }
+
+    /// Publishes `value` in an explicitly selected slot.
+    ///
+    /// This is useful for node-local barriers, whose slots are indexed by a
+    /// worker's position within its NUMA node instead of its global worker ID.
+    pub fn arrive_at<R>(
+        &self,
+        worker_index: usize,
+        value: T,
+        on_complete: impl FnOnce(Vec<T>) -> R,
+    ) -> Option<R> {
         assert!(
             worker_index < self.values.len(),
             "worker {worker_index} is outside this gather barrier"

@@ -105,21 +105,20 @@ fn write<T: IntoBatch>(items: Vec<T>, rows_per_group: usize) -> Vec<Vec<u8>> {
     write_grouped(items, &[], &[], rows_per_group)
 }
 
-/// As [`write`], with each file's rows ordered by `sort_by`.
+/// Writes files ordered by the named columns.
 fn write_sorted<T: IntoBatch>(
     items: Vec<T>,
-    sort_by: &[&str],
+    sort_column_names: &[&str],
     rows_per_group: usize,
 ) -> Vec<Vec<u8>> {
-    write_grouped(items, &[], sort_by, rows_per_group)
+    write_grouped(items, &[], sort_column_names, rows_per_group)
 }
 
-/// As [`write`], split into one file per distinct `partition_by` tuple, each
-/// file's rows ordered by `sort_by` when one is given.
+/// Writes one ordered file for each partition represented by the input.
 fn write_grouped<T: IntoBatch>(
     items: Vec<T>,
-    partition_by: &[&str],
-    sort_by: &[&str],
+    partition_column_names: &[&str],
+    sort_column_names: &[&str],
     rows_per_group: usize,
 ) -> Vec<Vec<u8>> {
     let dispatch = Dispatch::spin_up(2, RING_BUFFERS, None);
@@ -129,19 +128,28 @@ fn write_grouped<T: IntoBatch>(
         .collect();
     let schema = batches[0].schema();
     let spec = values_input(dispatch.dispatcher(), batches).record_batches();
-    let partition_by: Arc<[String]> = partition_by.iter().map(|name| name.to_string()).collect();
-    let sort_by: Arc<[String]> = sort_by.iter().map(|name| name.to_string()).collect();
-    // A file's bytes are the slabs its pages were written into, which only the
-    // worker holding them may release, so each one is copied out on the worker
-    // that assembled it before this thread ever sees it.
-    let files: Vec<Vec<u8>> =
-        encode_record_batches_spec(spec, schema, partition_by, sort_by, rows_per_group)
-            .map_each(|file: AssembledFile| {
-                file.bytes.runs().flatten().copied().collect::<Vec<u8>>()
-            })
-            .execute()
-            .collect()
-            .unwrap();
+    let partition_column_names: Arc<[String]> = partition_column_names
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+    let sort_column_names: Arc<[String]> = sort_column_names
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+    // Copy worker-owned ring memory before returning the bytes to the test
+    // thread.
+    let files: Vec<Vec<u8>> = encode_record_batches_spec(
+        spec,
+        schema,
+        partition_column_names,
+        sort_column_names,
+        rows_per_group,
+        usize::MAX,
+    )
+    .map_each(|file: AssembledFile| file.bytes.runs().flatten().copied().collect::<Vec<u8>>())
+    .execute()
+    .collect()
+    .unwrap();
     dispatch.exit();
     files
 }
@@ -667,6 +675,61 @@ fn a_sort_key_orders_a_files_rows() {
     for (row, key) in read_keys.iter().enumerate() {
         assert_eq!(read_names.value(row), format!("row {key}"));
     }
+}
+
+/// A small in-memory target produces several internally ordered files without
+/// dropping or duplicating rows. Parallel batch arrival makes the exact file
+/// count nondeterministic.
+#[test]
+fn a_stream_past_the_file_target_cuts_several_sorted_files() {
+    let keys: Vec<i64> = (0..3_000).map(|i| (i * 7_919) % 3_000).collect();
+    let items: Vec<ColumnsItem> = keys
+        .chunks(500)
+        .map(|chunk| {
+            ColumnsItem(vec![(
+                "key",
+                Arc::new(Int64Array::from(chunk.to_vec())) as ArrayRef,
+            )])
+        })
+        .collect();
+
+    let dispatch = Dispatch::spin_up(2, RING_BUFFERS, None);
+    let batches: Vec<RecordBatch> = items
+        .into_iter()
+        .map(|item| item.into_batch().unwrap())
+        .collect();
+    let schema = batches[0].schema();
+    let spec = values_input(dispatch.dispatcher(), batches).record_batches();
+    let files: Vec<Vec<u8>> = encode_record_batches_spec(
+        spec,
+        schema,
+        Arc::from([]),
+        Arc::from(["key".to_string()]),
+        500,
+        8 * 1024,
+    )
+    .map_each(|file: AssembledFile| file.bytes.runs().flatten().copied().collect::<Vec<u8>>())
+    .execute()
+    .collect()
+    .unwrap();
+    dispatch.exit();
+
+    assert!(files.len() >= 2, "24KB of rows against an 8KB file target");
+    let mut all_keys = Vec::new();
+    for file in &files {
+        let batch = read_back(file);
+        let file_keys: Vec<i64> = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec();
+        assert!(file_keys.windows(2).all(|pair| pair[0] <= pair[1]));
+        all_keys.extend(file_keys);
+    }
+    all_keys.sort();
+    assert_eq!(all_keys, (0..3_000).collect::<Vec<i64>>());
 }
 
 /// A partitioned, sorted write cuts one file per partition tuple, each file
