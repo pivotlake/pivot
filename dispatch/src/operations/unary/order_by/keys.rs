@@ -18,13 +18,14 @@
 //!   loads and an integer compare.
 //! - [`ViewBytesKeyOrdering`]: one null-free byte-view column (strings,
 //!   binary). A comparison resolves each view to its bytes and memcmps.
-//! - [`ComparatorKeyOrdering`]: everything else — several key columns, nulls,
-//!   wider types. Arrow comparators are built per pair of chunks and cached,
-//!   and a comparison walks the key columns until one differs. The merge walk
-//!   advances through chunks monotonically, so the cache rebuilds at chunk
-//!   transitions rather than per row.
+//! - [`ComparatorKeyOrdering`]: everything else, meaning several key columns,
+//!   nulls, or wider types. Arrow comparators are built per pair of chunks
+//!   and cached by pair, and a comparison walks the key columns until one
+//!   differs. A k-way merge heap interleaves chunk pairs, so the cache keeps
+//!   every pair the walk revisits instead of only the latest one.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 use arrow_array::{Array, ArrayRef, RecordBatch};
 use arrow_ord::ord::{DynComparator, make_comparator};
@@ -44,8 +45,7 @@ pub(super) struct RunRow {
 /// `&mut self`.
 pub(super) trait KeyOrdering {
     /// How the left run's row at `left` orders against the right run's row at
-    /// `right`. `Equal` means the caller decides (a stable merge takes the
-    /// left row).
+    /// `right`. `Equal` means either row may be emitted first.
     fn compare(&mut self, left: RunRow, right: RunRow) -> Ordering;
 }
 
@@ -57,6 +57,19 @@ pub(super) enum SelectedKeyOrdering<'chunks> {
     ViewBytes(ViewBytesKeyOrdering<'chunks>),
     General(ComparatorKeyOrdering<'chunks>),
 }
+
+/// Dispatches to the selected key representation while keeping the comparison
+/// loop monomorphized.
+macro_rules! with_key_ordering {
+    ($selected:expr, |$ordering:ident| $body:expr) => {
+        match $selected {
+            SelectedKeyOrdering::FixedWidth(mut $ordering) => $body,
+            SelectedKeyOrdering::ViewBytes(mut $ordering) => $body,
+            SelectedKeyOrdering::General(mut $ordering) => $body,
+        }
+    };
+}
+pub(super) use with_key_ordering;
 
 /// Pick the fastest ordering the key allows for these chunks (see the module
 /// docs). The chunks must all share the schema the key columns index into.
@@ -94,8 +107,7 @@ pub(super) fn select_key_ordering<'chunks>(
         order_by: order_by.to_vec(),
         left_chunks,
         right_chunks,
-        comparators_for: None,
-        comparators: Vec::new(),
+        comparators_by_chunks: HashMap::new(),
     }))
 }
 
@@ -309,23 +321,27 @@ impl KeyOrdering for ViewBytesKeyOrdering<'_> {
     }
 }
 
-/// The general fallback: Arrow comparators per key column, built for the pair
-/// of chunks being compared and cached until either side moves to another
-/// chunk.
+/// How many `(left chunk, right chunk)` comparator sets
+/// [`ComparatorKeyOrdering`] retains before starting over. A k-way merge heap
+/// revisits a small working set of pairs, so the bound exists only to keep a
+/// merge over thousands of chunks from holding comparators for every pair it
+/// ever touched.
+const MAX_CACHED_COMPARATOR_PAIRS: usize = 1024;
+
+/// The general fallback: Arrow comparators per key column, built for each pair
+/// of chunks as it is first compared and cached. A k-way merge interleaves
+/// many chunk pairs, so the cache is a map rather than the last pair alone.
 pub(super) struct ComparatorKeyOrdering<'chunks> {
     order_by: Vec<OrderBy>,
     left_chunks: &'chunks [RecordBatch],
     right_chunks: &'chunks [RecordBatch],
-    /// Which `(left chunk, right chunk)` pair `comparators` was built for.
-    comparators_for: Option<(usize, usize)>,
-    /// One comparator per key column, in key order.
-    comparators: Vec<DynComparator>,
+    /// One comparator per key column, in key order, per chunk pair compared.
+    comparators_by_chunks: HashMap<(usize, usize), Vec<DynComparator>>,
 }
 
 impl ComparatorKeyOrdering<'_> {
-    fn rebuild_comparators(&mut self, left_chunk: usize, right_chunk: usize) {
-        self.comparators = self
-            .order_by
+    fn build_comparators(&self, left_chunk: usize, right_chunk: usize) -> Vec<DynComparator> {
+        self.order_by
             .iter()
             .map(|key| {
                 make_comparator(
@@ -342,17 +358,21 @@ impl ComparatorKeyOrdering<'_> {
                 )
                 .expect("both chunks share the schema the key was planned against")
             })
-            .collect();
-        self.comparators_for = Some((left_chunk, right_chunk));
+            .collect()
     }
 }
 
 impl KeyOrdering for ComparatorKeyOrdering<'_> {
     fn compare(&mut self, left: RunRow, right: RunRow) -> Ordering {
-        if self.comparators_for != Some((left.chunk, right.chunk)) {
-            self.rebuild_comparators(left.chunk, right.chunk);
+        let chunk_pair = (left.chunk, right.chunk);
+        if !self.comparators_by_chunks.contains_key(&chunk_pair) {
+            if self.comparators_by_chunks.len() >= MAX_CACHED_COMPARATOR_PAIRS {
+                self.comparators_by_chunks.clear();
+            }
+            let comparators = self.build_comparators(left.chunk, right.chunk);
+            self.comparators_by_chunks.insert(chunk_pair, comparators);
         }
-        for comparator in &self.comparators {
+        for comparator in &self.comparators_by_chunks[&chunk_pair] {
             let ordering = comparator(left.row, right.row);
             if ordering != Ordering::Equal {
                 return ordering;

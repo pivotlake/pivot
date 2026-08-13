@@ -37,6 +37,7 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 /// also the kernel's own per-syscall transfer cap (`MAX_RW_COUNT`). A transfer
 /// bigger than this is submitted in successive ops, each resuming where the last
 /// left off, so the caller must already handle a short completion (it does).
+#[cfg(target_os = "linux")]
 pub(crate) const MAX_IO_OP_LEN: usize = 0x7fff_f000;
 
 // ============================================================================

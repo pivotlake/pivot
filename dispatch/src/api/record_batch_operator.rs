@@ -45,14 +45,16 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{self, AtomicUsize};
+use std::sync::atomic::AtomicUsize;
 
 use arrow_array::ArrowNativeTypeOp;
 use arrow_array::RecordBatch;
 use arrow_schema::DataType;
 
 use crate::api::operator_spec::{OperatorFactory, OperatorSpec};
-use crate::operations::channels::{StealableChannelFactory, stealable, to_single_worker_mpsc};
+use crate::operations::channels::{
+    SingleWorkerMpscFactory, StealableChannelFactory, stealable, to_single_worker_mpsc,
+};
 use crate::operations::{
     AggregateFactory, AggregationSlot, AggregationValue, CteFactory, CteScanFactory, Distinct,
     DynamicFilterSlot, DynamicRowKey, F64Cell, FilterFactory, GroupFactory, GroupLimit, IntCell,
@@ -131,6 +133,10 @@ pub const RECORD_BATCH_SIZE: usize = 8192;
 pub struct RecordBatchOperatorSpec {
     dispatcher: DataFlowDispatcher,
     factories: VecDeque<Box<dyn OperatorFactory<RecordBatch>>>,
+    /// Whether batches form one ordered stream. Downstream stages must then
+    /// consume through FIFO rather than work-stealing queues, which may reorder
+    /// batches even when every batch is internally sorted.
+    stream_ordered: bool,
 }
 
 /// An owned batch representation that can leave a dispatch worker safely.
@@ -161,6 +167,19 @@ type MapOperatorSpec<T, F> = OperatorSpec<
     >,
 >;
 
+/// FIFO counterpart to [`MapOperatorSpec`], used when mapping a stream whose
+/// batch order is already significant.
+type OrderedMapOperatorSpec<T, F> = OperatorSpec<
+    T,
+    UnaryOperatorFactory<
+        RecordBatch,
+        T,
+        MapFactory<F>,
+        SingleWorkerMpscFactory<RecordBatch>,
+        Box<dyn OperatorFactory<RecordBatch>>,
+    >,
+>;
+
 impl RecordBatchOperatorSpec {
     /// Convert a generic [`OperatorSpec`] into a type-erased `RecordBatchOperatorSpec`.
     ///
@@ -176,6 +195,7 @@ impl RecordBatchOperatorSpec {
                 .into_iter()
                 .map(|f| Box::new(f) as Box<dyn OperatorFactory<RecordBatch>>)
                 .collect(),
+            stream_ordered: false,
         }
     }
 
@@ -241,6 +261,7 @@ impl RecordBatchOperatorSpec {
         Self {
             dispatcher: dispatcher.clone(),
             factories,
+            stream_ordered: false,
         }
     }
 
@@ -279,6 +300,7 @@ impl RecordBatchOperatorSpec {
         Self {
             dispatcher: self.dispatcher,
             factories,
+            stream_ordered: self.stream_ordered,
         }
     }
 
@@ -296,22 +318,40 @@ impl RecordBatchOperatorSpec {
         unary_factories: impl IntoIterator<Item = UF>,
     ) -> Self {
         let siblings_left = Arc::new(AtomicUsize::new(self.worker_count()));
-        let factories = stealable::<RecordBatch>(self.dispatcher.topology())
-            .into_iter()
-            .zip(unary_factories)
-            .zip(self.factories)
-            .map(|((channel_factory, unary_factory), head)| {
-                Box::new(UnaryOperatorFactory::new(
-                    head,
-                    unary_factory,
-                    channel_factory,
-                    siblings_left.clone(),
-                )) as Box<dyn OperatorFactory<RecordBatch>>
-            })
-            .collect();
+        let factories = if self.stream_ordered {
+            let target = self.dispatcher.next_worker();
+            to_single_worker_mpsc::<RecordBatch>(self.worker_count(), target)
+                .into_iter()
+                .zip(unary_factories)
+                .zip(self.factories)
+                .map(|((channel_factory, unary_factory), head)| {
+                    Box::new(UnaryOperatorFactory::new(
+                        head,
+                        unary_factory,
+                        channel_factory,
+                        siblings_left.clone(),
+                    )) as Box<dyn OperatorFactory<RecordBatch>>
+                })
+                .collect()
+        } else {
+            stealable::<RecordBatch>(self.dispatcher.topology())
+                .into_iter()
+                .zip(unary_factories)
+                .zip(self.factories)
+                .map(|((channel_factory, unary_factory), head)| {
+                    Box::new(UnaryOperatorFactory::new(
+                        head,
+                        unary_factory,
+                        channel_factory,
+                        siblings_left.clone(),
+                    )) as Box<dyn OperatorFactory<RecordBatch>>
+                })
+                .collect()
+        };
         Self {
             dispatcher: self.dispatcher,
             factories,
+            stream_ordered: self.stream_ordered,
         }
     }
 
@@ -447,17 +487,48 @@ impl RecordBatchOperatorSpec {
         OperatorSpec::new(self.dispatcher, factories)
     }
 
+    /// Apply a type-changing map without changing an already-established
+    /// batch order. The ordered producer emits from one worker, and the FIFO
+    /// channel delivers those batches to one consumer in the same sequence.
+    fn map_ordered<T, F, FB>(self, builder: FB) -> OrderedMapOperatorSpec<T, F>
+    where
+        T: Send + 'static,
+        F: FnMut(RecordBatch) -> T + Send + 'static,
+        FB: Fn() -> F,
+    {
+        let worker_count = self.worker_count();
+        let siblings_left = Arc::new(AtomicUsize::new(worker_count));
+        let target = self.dispatcher.next_worker();
+        let factories: Vec<_> = to_single_worker_mpsc::<RecordBatch>(worker_count, target)
+            .into_iter()
+            .zip((0..worker_count).map(|_| MapFactory(builder())))
+            .zip(self.factories)
+            .map(|((channel_factory, unary_factory), head)| {
+                UnaryOperatorFactory::new(
+                    head,
+                    unary_factory,
+                    channel_factory,
+                    siblings_left.clone(),
+                )
+            })
+            .collect();
+        OperatorSpec::new(self.dispatcher, factories)
+    }
+
     /// Sugar for [`map`](Self::map) when the output is `RecordBatch`: applies
     /// the transform and stays in `RecordBatchOperatorSpec` so you can keep
     /// chaining RB-only methods like `.aggregate()` / `.order_by_limit()`.
     ///
-    /// Equivalent to `self.map(builder).record_batches()`.
+    /// Unordered streams use the same work-stealing delivery as [`map`](Self::map).
+    /// After `ORDER BY`, the stage instead reads the batches through one FIFO
+    /// consumer so their global row order is preserved.
     pub fn project<F, FB>(self, builder: FB) -> Self
     where
         F: FnMut(RecordBatch) -> RecordBatch + Send + 'static,
         FB: Fn() -> F,
     {
-        self.map(builder).record_batches()
+        let worker_count = self.worker_count();
+        self.unary((0..worker_count).map(|_| MapFactory(builder())))
     }
 
     /// Global aggregates (no GROUP BY): one or more `SUM`/`COUNT` slots over
@@ -507,49 +578,29 @@ impl RecordBatchOperatorSpec {
         dynamic_filter: Option<Arc<DynamicFilterSlot>>,
     ) -> Self {
         let worker_count = self.worker_count();
-        self.unary(OrderByLimitFactory::create_for_workers(
+        let mut result = self.unary(OrderByLimitFactory::create_for_workers(
             order_by,
             limit,
             offset,
             worker_count,
             dynamic_filter,
-        ))
+        ));
+        result.stream_ordered = true;
+        result
     }
 
     /// SQL `ORDER BY` with no LIMIT: emit the whole input sorted by
     /// `order_by`.
     ///
-    /// A parallel merge sort modeled on rayon's: each worker sorts batches as
-    /// they arrive (batches already in order pass through untouched), and the
-    /// workers' sorted runs merge through a tree whose merges split into
-    /// stealable slices, so even the final merge runs across every worker.
+    /// Each worker sorts batches as they arrive. Sorted runs first merge within
+    /// each NUMA node, then one k-way merge combines the node results. Both
+    /// levels split large outputs into parallel, node-routed slices.
     /// See the `operations::unary::order_by` module.
     pub fn order_by(self, order_by: Vec<OrderBy>) -> Self {
-        let worker_count = self.worker_count();
-        self.unary(OrderByFactory::create_for_workers(
-            Vec::new(),
-            order_by,
-            worker_count,
-        ))
-    }
-
-    /// Like [`order_by`](Self::order_by), grouped: rows come out clustered by
-    /// their `partition_columns` tuple (partitions in tuple order, every
-    /// emitted batch single-partition) and sorted by `order_by` within each
-    /// partition. Sorting happens per partition, so partition columns are
-    /// never compared row against row. An empty `order_by` groups without
-    /// ordering inside partitions.
-    pub fn order_by_per_partition(
-        self,
-        partition_columns: Vec<usize>,
-        order_by: Vec<OrderBy>,
-    ) -> Self {
-        let worker_count = self.worker_count();
-        self.unary(OrderByFactory::create_for_workers(
-            partition_columns,
-            order_by,
-            worker_count,
-        ))
+        let topology = self.dispatcher.topology();
+        let mut result = self.unary(OrderByFactory::create_for_workers(order_by, topology));
+        result.stream_ordered = true;
+        result
     }
 
     /// SQL `LIMIT … OFFSET …` with no ORDER BY: keep `limit` rows after skipping
@@ -848,6 +899,7 @@ impl RecordBatchOperatorSpec {
         Self {
             dispatcher: self.dispatcher,
             factories,
+            stream_ordered: false,
         }
     }
 
@@ -927,9 +979,8 @@ impl RecordBatchOperatorSpec {
         // Sort the build side by the key (NULLs last, so the join can drop
         // them as one tail), then funnel the sorted chunks to one worker,
         // whose consumer receives them in the order the sort emitted them.
-        // Successive range joins take turns hosting that consumer.
-        static NEXT_RANGE_HOST: AtomicUsize = AtomicUsize::new(0);
-        let target = NEXT_RANGE_HOST.fetch_add(1, atomic::Ordering::Relaxed) % worker_count;
+        // Successive single-consumer stages take turns hosting that work.
+        let target = self.dispatcher.next_worker();
         let build = build.order_by(vec![OrderBy::new(spec.build_key_index, false, false)]);
 
         let (build_factories, probe_factories, build_ready) =
@@ -974,6 +1025,7 @@ impl RecordBatchOperatorSpec {
         Self {
             dispatcher: self.dispatcher,
             factories,
+            stream_ordered: false,
         }
     }
 
@@ -1014,7 +1066,11 @@ impl RecordBatchOperatorSpec {
     /// Convert each result batch to `T` on its dispatch worker, then launch the
     /// dataflow.
     pub fn execute_as<T: OutputBatch>(self) -> DataFlowHandle<T> {
-        self.map(|| T::from_record_batch).execute()
+        if self.stream_ordered {
+            self.map_ordered(|| T::from_record_batch).execute()
+        } else {
+            self.map(|| T::from_record_batch).execute()
+        }
     }
 
     /// Like [`execute`](Self::execute), with worker statistics enabled.
@@ -1025,7 +1081,12 @@ impl RecordBatchOperatorSpec {
 
     /// Like [`execute_as`](Self::execute_as), with worker statistics enabled.
     pub fn execute_with_stats_as<T: OutputBatch>(self) -> DataFlowHandle<T> {
-        self.map(|| T::from_record_batch).execute_with_stats()
+        if self.stream_ordered {
+            self.map_ordered(|| T::from_record_batch)
+                .execute_with_stats()
+        } else {
+            self.map(|| T::from_record_batch).execute_with_stats()
+        }
     }
 
     /// Run the dataflow and collect heap-backed Arrow batches.

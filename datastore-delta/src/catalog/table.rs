@@ -683,6 +683,9 @@ impl CatalogTable {
             Arc::from(self.partition_by()),
             Arc::from(self.sort_by()),
             target_rows_per_group,
+            // Compaction produces one ordered output file for each selected
+            // partition, so it disables the INSERT file-size target.
+            usize::MAX,
             &self.dispatcher,
         );
         // Drive encode → upload to completion; the emitted row-count batch is

@@ -1,22 +1,15 @@
-//! The encoder stage: encode one column chunk into Parquet column chunks —
-//! [`dictionary`]-encoded where it pays, else [`plain`].
+//! Encodes one row-group column at a time as Parquet pages.
 //!
-//! A parallel 1→1 map (one [`ColumnChunkJob`] in, one [`EncodedColumnChunk`]
-//! out), parallel across chunks; finished chunks route back to the worker that
-//! owns their row group (`return_to_worker`, keyed by
-//! [`EncodedColumnChunk::worker_id`](super::types::EncodedColumnChunk)) so a file
-//! assembles in one place.
+//! Each [`ColumnChunkJob`] becomes one [`EncodedColumnChunk`]. Jobs run in
+//! parallel, then the output channel routes each result to its file's assembly
+//! worker.
 //!
-//! Parquet stores a chunk per *leaf*, so the job's column is first flattened
-//! into its leaves ([`leaves`]) and each is encoded on its own. A flat column is
-//! its own single leaf and takes the same path it always did; a shredded variant
-//! yields one leaf per primitive under it. Flattening here rather than in the
-//! upstream [`indexer`](super::indexer) keeps that stage cheap and serial —
-//! the levels and the encoding are computed on the parallel side.
+//! Parquet encodes primitive leaves rather than top-level Arrow columns. The
+//! encoder therefore applies any selected variant shredding, flattens the
+//! resulting value into leaves, and encodes each leaf independently.
 //!
-//! The two strategies live in [`plain`] and [`dictionary`]; both frame their
-//! pages with [`pages`] (which also cuts a leaf into pages) — see those modules
-//! for the on-the-wire format.
+//! Encoding prefers a dictionary when it is beneficial, then a supported delta
+//! encoding, and finally PLAIN. [`pages`] frames and compresses the output.
 
 pub(crate) mod delta;
 mod dictionary;
@@ -41,16 +34,12 @@ use leaves::Leaf;
 pub(super) type ColumnEncoderFactory = DefaultUnaryFactory<ColumnEncoder>;
 
 pub(super) fn factories(worker_count: usize) -> Vec<ColumnEncoderFactory> {
-    (0..worker_count)
-        .map(|_| DefaultUnaryFactory::new())
-        .collect()
+    DefaultUnaryFactory::create_for_workers(worker_count)
 }
 
 #[derive(Default)]
 pub(super) struct ColumnEncoder {
-    /// The ring memory this worker's pages are written into, taken on the first
-    /// page rather than when the operator is built, so a worker that encodes
-    /// nothing holds no buffer.
+    /// Initialized on first use so an inactive encoder holds no ring buffer.
     allocator: Option<SlabAllocator>,
 }
 
@@ -60,22 +49,22 @@ impl Unary<ColumnChunkJob, EncodedColumnChunk> for ColumnEncoder {
         job: ColumnChunkJob,
         sender: &mut dyn Sender<EncodedColumnChunk>,
     ) -> UnaryResult<()> {
-        let field = job.header.schema.field(job.column);
+        let field = job.context.schema.field(job.column_index);
         let allocator = self
             .allocator
             .get_or_insert_with(|| SlabAllocator::new(false));
-        // The row group's rows arrive as the chunks they concatenate from:
-        // materializing them is per-column work, so it parallelizes with the
-        // encoding, and the stitched values are encoded while hot.
-        let values = concat_chunks(allocator, &job.chunks).map_err(WriteError::from)?;
-        let values = match &job.shredding {
-            Some(shredding) => super::shredding::shred_gathered_column(&values, shredding)?,
-            None => values,
+        let materialized_values =
+            concat_chunks(allocator, &job.batches).map_err(WriteError::from)?;
+        let physical_values = match &job.shredding {
+            Some(shredding) => {
+                super::shredding::shred_gathered_column(&materialized_values, shredding)?
+            }
+            None => materialized_values,
         };
-        let leaves = encode_column_chunk(field, &values, allocator)?;
+        let leaves = encode_column_chunk(field, &physical_values, allocator)?;
         sender.send(EncodedColumnChunk {
-            header: job.header,
-            column: job.column,
+            context: job.context,
+            column_index: job.column_index,
             leaves,
         })?;
         Ok(())
