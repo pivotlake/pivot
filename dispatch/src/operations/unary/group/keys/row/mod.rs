@@ -91,13 +91,7 @@ use arrow_array::RecordBatch;
 pub struct RowKeyExtractor;
 
 impl KeyExtractor for RowKeyExtractor {
-    // Radix-abandon like the string and (int, string) extractors: the persisted
-    // key is an out-of-line `ArenaKey`, so on overflow the active table is
-    // abandoned (draining one deduplicated entry per distinct key) rather than
-    // scattering raw rows. Abandon persists each row blob once instead of once
-    // per occurrence, sidestepping the arena blow-up that raw scatter would cause
-    // at high cardinality while still radix-partitioning the overflow.
-    const RADIX_ABANDON: bool = true;
+    const RADIX_DEDUP_BEFORE_SCATTER: bool = true;
     type Config = RowKeySchema;
     type Persisted = ArenaKey;
     type LiveKey<'a, 'b> = RowKey<'a, 'b>;

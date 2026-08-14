@@ -165,7 +165,7 @@ where
     // Equivalent to `StringKeyExtractor`: the key owns an out-of-line string, so
     // abandon (dedup during the scan) persists each string once rather than
     // re-copying it for every occurrence the way raw scatter would.
-    const RADIX_ABANDON: bool = true;
+    const RADIX_DEDUP_BEFORE_SCATTER: bool = true;
     type Config = ();
     type Persisted = IntStrKey<T::Native>;
     type LiveKey<'a, 'b> = IntStrLiveKey<'a, 'b, T::Native>;
