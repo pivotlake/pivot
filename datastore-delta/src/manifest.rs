@@ -276,6 +276,15 @@ pub struct CatalogManifestSchemaEntry {
     pub(crate) table_ids: HashMap<String, TableId>,
 }
 
+/// A table removed from the live name index whose managed storage is waiting
+/// for its retention window to pass. The table identity is the key in
+/// [`CatalogManifest::dropped_tables`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DroppedTableEntry {
+    pub(crate) location: ObjectPath,
+    pub(crate) delete_after_unix_ms: u64,
+}
+
 impl CatalogManifestSchemaEntry {
     fn new(name: String) -> Self {
         Self {
@@ -301,6 +310,10 @@ pub struct CatalogManifest {
     /// names it.
     #[serde(default)]
     pub(crate) table_locations: HashMap<TableId, ObjectPath>,
+    /// Managed table roots awaiting deferred physical deletion. Keeping these
+    /// in the durable manifest lets vacuum finish cleanup after a restart.
+    #[serde(default)]
+    pub(crate) dropped_tables: HashMap<TableId, DroppedTableEntry>,
 }
 
 impl Default for CatalogManifest {
@@ -310,6 +323,7 @@ impl Default for CatalogManifest {
             version: 0,
             schemas: default_schemas(),
             table_locations: HashMap::new(),
+            dropped_tables: HashMap::new(),
         }
     }
 }
@@ -345,8 +359,83 @@ impl CatalogManifest {
             .ok_or_else(|| Error::MissingSchema(name.schema.clone()))?;
         schema.table_ids.insert(name.table.clone(), id);
         self.table_locations.insert(id, location);
+        self.dropped_tables.remove(&id);
         self.version += 1;
         Ok(())
+    }
+
+    /// The identity currently registered under `name`, if any.
+    pub(crate) fn table_id(&self, name: &SchemaQualifiedTableName) -> Option<TableId> {
+        self.schemas
+            .iter()
+            .find(|schema| schema.name == name.schema)?
+            .table_ids
+            .get(&name.table)
+            .copied()
+    }
+
+    /// Remove `name` only when it still resolves to `expected_id`, moving its
+    /// location into the durable dropped-table set for deferred vacuum. Returns
+    /// `false` without changing anything when the name is absent or has been
+    /// rebound to another table incarnation.
+    pub(crate) fn tombstone_table(
+        &mut self,
+        name: &SchemaQualifiedTableName,
+        expected_id: TableId,
+        delete_after_unix_ms: u64,
+    ) -> Result<bool> {
+        if self.table_id(name) != Some(expected_id) {
+            return Ok(false);
+        }
+        let location = self
+            .table_locations
+            .get(&expected_id)
+            .cloned()
+            .ok_or_else(|| Error::MissingTableLocation {
+                table: name.to_string(),
+                id: expected_id,
+            })?;
+        let schema = self
+            .schemas
+            .iter_mut()
+            .find(|schema| schema.name == name.schema)
+            .expect("the table lookup found its schema");
+        schema.table_ids.remove(&name.table);
+        self.table_locations.remove(&expected_id);
+        self.dropped_tables.insert(
+            expected_id,
+            DroppedTableEntry {
+                location,
+                delete_after_unix_ms,
+            },
+        );
+        self.version += 1;
+        Ok(true)
+    }
+
+    /// Every managed table root waiting for deferred physical deletion.
+    pub(crate) fn dropped_tables(&self) -> impl Iterator<Item = (TableId, &DroppedTableEntry)> {
+        self.dropped_tables.iter().map(|(id, entry)| (*id, entry))
+    }
+
+    pub(crate) fn dropped_table(&self, id: TableId) -> Option<&DroppedTableEntry> {
+        self.dropped_tables.get(&id)
+    }
+
+    /// Forget a tombstone after vacuum has deleted its managed storage. The
+    /// expected entry guard prevents an old vacuum candidate from removing a
+    /// newer record that happens to use the same identity.
+    pub(crate) fn remove_dropped_table(
+        &mut self,
+        id: TableId,
+        expected: &DroppedTableEntry,
+    ) -> bool {
+        if self.dropped_tables.get(&id) != Some(expected) {
+            return false;
+        }
+        self.dropped_tables.remove(&id);
+        self.version += 1;
+        true
     }
 
     /// Every table the database holds: its schema-qualified name, its identity,

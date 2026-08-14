@@ -25,8 +25,8 @@ use metastore::Metastore;
 use planner::TableFunction;
 use planner::catalog::{
     BoundTable, CatalogTransaction, CreateSchemaRequest, CreateTableRequest, CreateUserRequest,
-    Error as CatalogError, Result as CatalogResult, SchemaCreation, TableCreation, TableReference,
-    TableRevision, UserCreation,
+    DropTableRequest, Error as CatalogError, Result as CatalogResult, SchemaCreation,
+    TableCreation, TableDrop, TableReference, TableRevision, UserCreation,
 };
 
 /// One named data source served by pivotdb. Re-exported from `datastore`, where
@@ -233,6 +233,19 @@ impl CatalogTransaction for PivotTransaction {
                 CatalogError::Other(Box::new(Error::UnknownDatastore(target.clone())))
             })?;
         sub_transaction.bind_create_table(request)
+    }
+
+    fn bind_drop_table(&self, request: DropTableRequest) -> CatalogResult<Box<dyn TableDrop>> {
+        let target = request
+            .datastore_name
+            .clone()
+            .unwrap_or_else(|| self.default_name.clone());
+        let sub_transaction = self
+            .find_or_create_sub_transaction(&target)
+            .ok_or_else(|| {
+                CatalogError::Other(Box::new(Error::UnknownDatastore(target.clone())))
+            })?;
+        sub_transaction.bind_drop_table(request)
     }
 
     fn bind_create_schema(

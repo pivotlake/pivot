@@ -169,6 +169,14 @@ bool lo_create_temporary(const LogicalOperator &op);
 bool lo_create_has_query(const LogicalOperator &op);
 size_t lo_create_constraint_count(const LogicalOperator &op);
 
+// ---- DropTable ----
+bool lo_drop_is_table(const LogicalOperator &op);
+rust::String lo_drop_table_name(const LogicalOperator &op);
+rust::String lo_drop_table_datastore(const LogicalOperator &op);
+rust::String lo_drop_table_schema(const LogicalOperator &op);
+bool lo_drop_table_if_exists(const LogicalOperator &op);
+bool lo_drop_table_cascade(const LogicalOperator &op);
+
 // ---- Set / Reset ----
 rust::String lo_set_name(const LogicalOperator &op);
 rust::String lo_set_value(const LogicalOperator &op);

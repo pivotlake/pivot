@@ -1,6 +1,7 @@
 use crate::common::*;
 use dispatch::RowDelivery;
 use insta::assert_snapshot;
+use planner::operator::Operator;
 use rstest::rstest;
 
 // A user `IN`/`EXISTS` subquery lowers to a semi-join, which pivot runs as a
@@ -62,6 +63,7 @@ fn mutating_session_and_table_function_plans_are_not_cacheable(
     let create = testing_planner
         .plan("CREATE TABLE cacheability_test (id INTEGER)")
         .unwrap();
+    let drop = testing_planner.plan("DROP TABLE example_table").unwrap();
     let set = testing_planner.plan("SET pivot_stats = true").unwrap();
     let create_user = testing_planner.plan("CREATE USER cache_test_user").unwrap();
     let table_function = testing_planner
@@ -70,6 +72,7 @@ fn mutating_session_and_table_function_plans_are_not_cacheable(
 
     assert!(!insert.is_cacheable());
     assert!(!create.is_cacheable());
+    assert!(!drop.is_cacheable());
     assert!(!set.is_cacheable());
     assert!(!create_user.is_cacheable());
     assert!(!table_function.is_cacheable());
@@ -214,6 +217,29 @@ fn create_table_propagates_with_options(mut testing_planner: TestingPlanner) {
         @r#"CreateTable(created_table, [id:Int32], options: {"format": "parquet", "path": "/asdf"})
     "#
     );
+}
+
+#[rstest]
+fn drop_table_preserves_qualifiers_and_behavior_clauses(mut testing_planner: TestingPlanner) {
+    let default = testing_planner.plan("DROP TABLE example_table").unwrap();
+    let cascade = testing_planner
+        .plan("DROP TABLE IF EXISTS \"default\".main.example_table CASCADE")
+        .unwrap();
+    let restrict = testing_planner
+        .plan("DROP TABLE example_table RESTRICT")
+        .unwrap();
+
+    assert_snapshot!(default.to_string(), @"DropTable(main.example_table, if_exists: false, cascade: false)
+    ");
+    assert_snapshot!(cascade.to_string(), @"DropTable(main.example_table, if_exists: true, cascade: true)
+    ");
+    assert_snapshot!(restrict.to_string(), @"DropTable(main.example_table, if_exists: false, cascade: false)
+    ");
+    let Operator::DropTable(drop) = &cascade.root.operator else {
+        panic!("expected a drop-table root");
+    };
+    assert_eq!(drop.request.datastore_name.as_deref(), Some("default"));
+    assert_eq!(drop.request.schema_name.as_deref(), Some("main"));
 }
 
 #[rstest]

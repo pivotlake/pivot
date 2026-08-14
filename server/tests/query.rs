@@ -117,6 +117,74 @@ async fn create_table_if_not_exists_is_a_noop_on_an_existing_table(#[future] con
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
+async fn drop_table_removes_the_table_and_returns_command_complete(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "people_to_drop", dir.path()).await;
+
+    let messages = conn
+        .simple_query("DROP TABLE people_to_drop")
+        .await
+        .unwrap();
+
+    assert_eq!(messages.len(), 1);
+    match &messages[0] {
+        SimpleQueryMessage::CommandComplete(rows) => assert_eq!(*rows, 0),
+        other => panic!("expected DROP TABLE command completion, got {other:?}"),
+    }
+    let error = conn
+        .simple_query("SELECT * FROM people_to_drop")
+        .await
+        .unwrap_err();
+    assert!(extract_db_error_message(&error).contains("does not exist"));
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn drop_table_missing_without_if_exists_returns_an_error(#[future] conn: Conn) {
+    let error = conn
+        .simple_query("DROP TABLE never_created_for_drop_error")
+        .await
+        .unwrap_err();
+
+    assert!(extract_db_error_message(&error).contains("does not exist"));
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn drop_table_accepts_if_exists_cascade_restrict_and_qualified_names(#[future] conn: Conn) {
+    conn.simple_query("DROP TABLE IF EXISTS never_created_for_drop")
+        .await
+        .unwrap();
+    conn.simple_query("CREATE SCHEMA drop_behavior_schema")
+        .await
+        .unwrap();
+    conn.simple_query("CREATE TABLE drop_behavior_schema.cascade_table (id BIGINT)")
+        .await
+        .unwrap();
+    conn.simple_query("CREATE TABLE restrict_table (id BIGINT)")
+        .await
+        .unwrap();
+
+    conn.simple_query("DROP TABLE drop_behavior_schema.cascade_table CASCADE")
+        .await
+        .unwrap();
+    conn.simple_query("DROP TABLE restrict_table RESTRICT")
+        .await
+        .unwrap();
+
+    conn.simple_query("DROP TABLE IF EXISTS drop_behavior_schema.cascade_table")
+        .await
+        .unwrap();
+    conn.simple_query("DROP TABLE IF EXISTS restrict_table")
+        .await
+        .unwrap();
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
 async fn insert_returns_affected_row_count(#[future] conn: Conn) {
     let dir = write_parquet(&people_batch());
     create_people_table(&conn, "people_insert", dir.path()).await;

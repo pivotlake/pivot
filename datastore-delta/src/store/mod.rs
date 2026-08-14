@@ -203,6 +203,13 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// the caller's goal (key absent) is already met.
     fn delete(&self, key: &ObjectPath) -> Result<()>;
 
+    /// Remove an empty directory represented by `prefix`. Object stores have
+    /// no physical directories and use this no-op default; the local backend
+    /// removes the directory after its objects have been deleted.
+    fn delete_dir(&self, _prefix: &ObjectPath) -> Result<()> {
+        Ok(())
+    }
+
     /// List objects directly under `prefix` (one level, not recursive), each as
     /// a [`ListedObject`] — a **relative** [`ObjectPath`] (the object's name
     /// within `prefix`) with its size and its storage modification time (Unix

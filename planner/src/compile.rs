@@ -112,6 +112,10 @@ pub enum Error {
     TableScan(#[source] crate::catalog::Error),
     #[error("creating table: {0}")]
     CreateTable(#[source] crate::catalog::Error),
+    #[error("DROP TABLE nodes should not have input operators")]
+    UnexpectedDropTableInputs,
+    #[error("dropping table: {0}")]
+    DropTable(#[source] crate::catalog::Error),
     #[error("CREATE OR REPLACE SCHEMA is not supported")]
     UnsupportedCreateSchemaOrReplace,
     #[error("CREATE SCHEMA does not take inputs")]
@@ -281,6 +285,12 @@ impl PlanNode {
             crate::Operator::CreateTable(o) => {
                 if !inputs.is_empty() {
                     return Err(Error::UnexpectedCreateTableInputs);
+                }
+                o.compile(dispatcher, transaction)
+            }
+            crate::Operator::DropTable(o) => {
+                if !inputs.is_empty() {
+                    return Err(Error::UnexpectedDropTableInputs);
                 }
                 o.compile(dispatcher, transaction)
             }

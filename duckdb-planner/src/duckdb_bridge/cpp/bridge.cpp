@@ -18,7 +18,9 @@
 #include "duckdb/planner/operator/logical_expression_get.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_create.hpp"
+#include "duckdb/planner/operator/logical_simple.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
+#include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_delim_get.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
@@ -780,6 +782,36 @@ bool lo_create_has_query(const LogicalOperator &op) {
 
 size_t lo_create_constraint_count(const LogicalOperator &op) {
 	return as<duckdb::LogicalCreateTable>(op).info->constraints.size();
+}
+
+// ---- DropTable ----
+
+static duckdb::DropInfo &get_drop_info(const LogicalOperator &op) {
+	return as<duckdb::LogicalSimple>(op).info->Cast<duckdb::DropInfo>();
+}
+
+bool lo_drop_is_table(const LogicalOperator &op) {
+	return get_drop_info(op).type == duckdb::CatalogType::TABLE_ENTRY;
+}
+
+rust::String lo_drop_table_name(const LogicalOperator &op) {
+	return rust::String::lossy(get_drop_info(op).name);
+}
+
+rust::String lo_drop_table_datastore(const LogicalOperator &op) {
+	return rust::String::lossy(get_drop_info(op).catalog);
+}
+
+rust::String lo_drop_table_schema(const LogicalOperator &op) {
+	return rust::String::lossy(get_drop_info(op).schema);
+}
+
+bool lo_drop_table_if_exists(const LogicalOperator &op) {
+	return get_drop_info(op).if_not_found == duckdb::OnEntryNotFound::RETURN_NULL;
+}
+
+bool lo_drop_table_cascade(const LogicalOperator &op) {
+	return get_drop_info(op).cascade;
 }
 
 // ---- Set / Reset ----

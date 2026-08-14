@@ -158,6 +158,36 @@ impl CreateTableRequest {
     }
 }
 
+/// Description of a table to drop, produced by translating a `DROP TABLE`
+/// statement and consumed by [`CatalogTransaction::bind_drop_table`].
+///
+/// `cascade` preserves the SQL behavior through planning: `true` for
+/// `CASCADE`, `false` for `RESTRICT` or the default (which is restrictive).
+/// It currently has no behavioral effect because the catalog has no dependent
+/// object kinds, but it remains part of the request so adding dependency
+/// handling does not require changing the planner boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropTableRequest {
+    pub datastore_name: Option<String>,
+    pub schema_name: Option<String>,
+    pub name: String,
+    pub if_exists: bool,
+    pub cascade: bool,
+}
+
+impl DropTableRequest {
+    /// The name the target datastore resolves: the schema the statement named,
+    /// or the default schema when it named none.
+    pub fn schema_qualified_name(&self) -> SchemaQualifiedTableName {
+        SchemaQualifiedTableName::new(
+            self.schema_name
+                .as_deref()
+                .unwrap_or(crate::DEFAULT_SCHEMA_NAME),
+            self.name.clone(),
+        )
+    }
+}
+
 /// Description of a schema to be created, produced by translating a
 /// `CREATE SCHEMA` statement and consumed by
 /// [`CatalogTransaction::bind_create_schema`], which routes it to the target
@@ -246,6 +276,15 @@ pub trait CatalogTransaction: Debug + Send + Sync {
         .into())
     }
 
+    /// Resolve a `DROP TABLE` by routing to the named datastore and binding the
+    /// exact table incarnation visible in this transaction's snapshot.
+    fn bind_drop_table(&self, _request: DropTableRequest) -> Result<Box<dyn TableDrop>> {
+        Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "this catalog does not support DROP TABLE",
+        )
+        .into())
+    }
+
     /// Resolve a `CREATE SCHEMA` by routing to the datastore
     /// [`CreateSchemaRequest::datastore_name`] names (the default when
     /// unqualified) and deferring to that datastore's own `bind_create_schema`.
@@ -287,6 +326,14 @@ pub trait CatalogTransaction: Debug + Send + Sync {
 pub trait TableCreation: Send + Sync {
     /// Build the dataflow that fetches the new table's file footers over the pool
     /// and stages the completed creation for the transaction's commit.
+    fn compile(&self, dispatcher: &DataFlowDispatcher) -> Result<RecordBatchOperatorSpec>;
+}
+
+/// A resolved `DROP TABLE`, bound to the table incarnation visible in the
+/// transaction and ready to stage that drop in an execution dataflow. Durable
+/// removal belongs to [`CatalogTransaction::commit`].
+pub trait TableDrop: Send + Sync {
+    /// Build the no-row dataflow that stages this drop for transaction commit.
     fn compile(&self, dispatcher: &DataFlowDispatcher) -> Result<RecordBatchOperatorSpec>;
 }
 

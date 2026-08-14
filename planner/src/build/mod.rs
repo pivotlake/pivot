@@ -30,9 +30,9 @@ use crate::catalog::BoundTable;
 use crate::expression::{Cast, Error as ExpressionError, Expression, Function, Ref, VariantGet};
 use crate::operator::{
     Aggregate, Compact, CopyFromStdin, CreateSchema, CreateTable, CreateUser, Cte, CteScan,
-    Distinct, DummyScan, Error as OperatorError, Explain, Filter, Input, Insert, Join, JoinKind,
-    Limit, Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan, TopN,
-    Values,
+    Distinct, DropTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Insert, Join,
+    JoinKind, Limit, Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan,
+    TopN, Values,
 };
 use crate::plan::{self, PlanNode};
 use crate::types::{Type, physical_arrow_type, type_from_logical};
@@ -165,6 +165,7 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
             Operator::TableFunctionScan(TableFunctionScan::from_handle(view)?)
         }
         DuckOperator::CreateTable(c) => Operator::CreateTable(CreateTable::from_handle(c)?),
+        DuckOperator::DropTable(d) => Operator::DropTable(DropTable::from_handle(d)?),
         DuckOperator::CreateSchema(c) => Operator::CreateSchema(CreateSchema::from_handle(c)?),
         DuckOperator::Set(s) => Operator::SetVariable(SetVariable::from_set(s)?),
         DuckOperator::Reset(r) => Operator::SetVariable(SetVariable::from_reset(r)?),

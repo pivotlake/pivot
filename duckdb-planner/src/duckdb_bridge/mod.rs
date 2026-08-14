@@ -317,6 +317,20 @@ pub mod ffi {
         fn lo_create_has_query(op: &LogicalOperator) -> Result<bool>;
         fn lo_create_constraint_count(op: &LogicalOperator) -> Result<usize>;
 
+        // ---- DropTable ----
+        /// Whether this `LOGICAL_DROP` targets a table. Other DROP object kinds
+        /// remain unsupported by the Rust plan builder.
+        fn lo_drop_is_table(op: &LogicalOperator) -> Result<bool>;
+        fn lo_drop_table_name(op: &LogicalOperator) -> Result<String>;
+        /// The resolved target database, or empty when DuckDB left it
+        /// unqualified (which routes to the default datastore).
+        fn lo_drop_table_datastore(op: &LogicalOperator) -> Result<String>;
+        /// The resolved target schema, or empty when unqualified (which routes
+        /// to the default schema).
+        fn lo_drop_table_schema(op: &LogicalOperator) -> Result<String>;
+        fn lo_drop_table_if_exists(op: &LogicalOperator) -> Result<bool>;
+        fn lo_drop_table_cascade(op: &LogicalOperator) -> Result<bool>;
+
         // ---- CreateSchema ----
         fn lo_create_schema_name(op: &LogicalOperator) -> Result<String>;
         /// The target database (datastore) of `CREATE SCHEMA db.s`, or empty when

@@ -54,6 +54,7 @@ pub struct ResultColumn {
 pub enum Command {
     Insert { rows: usize },
     CreateTable,
+    DropTable,
     CreateSchema,
     CreateUser,
     Compact,
@@ -65,6 +66,7 @@ impl Command {
         match self {
             Self::Insert { rows } => format!("INSERT 0 {rows}"),
             Self::CreateTable => "CREATE TABLE".to_string(),
+            Self::DropTable => "DROP TABLE".to_string(),
             Self::CreateSchema => "CREATE SCHEMA".to_string(),
             Self::CreateUser => "CREATE USER".to_string(),
             Self::Compact => "COMPACT".to_string(),
@@ -361,6 +363,9 @@ impl Engine {
             (StatementKind::CreateTable, StatementResults::Batches(_)) => {
                 StatementOutput::Command(Command::CreateTable)
             }
+            (StatementKind::DropTable, StatementResults::Batches(_)) => {
+                StatementOutput::Command(Command::DropTable)
+            }
             (StatementKind::CreateSchema, StatementResults::Batches(_)) => {
                 StatementOutput::Command(Command::CreateSchema)
             }
@@ -418,6 +423,7 @@ enum StatementKind {
     Query,
     Insert,
     CreateTable,
+    DropTable,
     CreateSchema,
     CreateUser,
 }
@@ -427,6 +433,7 @@ impl StatementKind {
         match &plan.root.operator {
             planner::Operator::Insert(_) => Self::Insert,
             planner::Operator::CreateTable(_) => Self::CreateTable,
+            planner::Operator::DropTable(_) => Self::DropTable,
             planner::Operator::CreateSchema(_) => Self::CreateSchema,
             planner::Operator::CreateUser(_) => Self::CreateUser,
             _ => Self::Query,

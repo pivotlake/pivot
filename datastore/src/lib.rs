@@ -15,8 +15,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use planner::TableFunction;
 use planner::catalog::{
-    BoundTable, CreateSchemaRequest, CreateTableRequest, Result, SchemaCreation,
-    SchemaQualifiedTableName, TableCreation, TableRevision,
+    BoundTable, CreateSchemaRequest, CreateTableRequest, DropTableRequest, Result, SchemaCreation,
+    SchemaQualifiedTableName, TableCreation, TableDrop, TableRevision,
 };
 
 /// One query's transaction against a **single datastore**: a consistent
@@ -88,6 +88,15 @@ pub trait DatastoreTransaction: Debug + Send + Sync {
         .into())
     }
 
+    /// Resolve a `DROP TABLE` against this datastore. The returned operation is
+    /// staged only when its dataflow runs and made durable by [`commit`](Self::commit).
+    fn bind_drop_table(&self, _request: DropTableRequest) -> Result<Box<dyn TableDrop>> {
+        Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "this datastore does not support DROP TABLE",
+        )
+        .into())
+    }
+
     /// Resolve a `CREATE SCHEMA` against this datastore into a [`SchemaCreation`]
     /// the caller compiles into the dataflow that stages it. Split the same way
     /// [`bind_create_table`](Self::bind_create_table) is, so that resolving a
@@ -102,10 +111,10 @@ pub trait DatastoreTransaction: Debug + Send + Sync {
         .into())
     }
 
-    /// Commit this transaction: publish whatever it staged against this datastore
-    /// (the files an INSERT injected). A read-only transaction is a no-op. Async
-    /// so the backend can hop the blocking store I/O of a writing commit to the
-    /// blocking pool and finish a read-only one inline.
+    /// Commit this transaction: publish whatever it staged against this
+    /// datastore (DML files and catalog changes). A read-only transaction is a
+    /// no-op. Async so the backend can hop the blocking store I/O of a writing
+    /// commit to the blocking pool and finish a read-only one inline.
     async fn commit(&self) -> Result<()> {
         Ok(())
     }

@@ -17,10 +17,12 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
-use common::{DispatchGuard, commit_datastore_transaction, dispatch, table_dir};
+use common::{DispatchGuard, commit_datastore_transaction, dispatch, insert_batches, table_dir};
 use datastore::DatastoreTransaction as _;
 use datastore_delta::{DEFAULT_VACUUM_POLL, DeltaDatastore, Vacuumer};
-use planner::catalog::{Column, CreateTableRequest, SchemaQualifiedTableName};
+use dispatch::Projection;
+use planner::DEFAULT_DATASTORE_NAME;
+use planner::catalog::{Column, CreateTableRequest, DropTableRequest, SchemaQualifiedTableName};
 
 const EIGHT_DAYS_MS: u64 = 8 * 24 * 60 * 60 * 1000;
 
@@ -86,6 +88,25 @@ fn create_events_table(
         .unwrap();
     commit_datastore_transaction(transaction).unwrap();
     table_dir(db, datastore, "events")
+}
+
+fn drop_events_table(datastore: &Arc<DeltaDatastore>, dispatch: &DispatchGuard) {
+    let transaction = datastore.clone().begin_transaction();
+    transaction
+        .bind_drop_table(DropTableRequest {
+            datastore_name: None,
+            schema_name: None,
+            name: "events".to_string(),
+            if_exists: false,
+            cascade: false,
+        })
+        .unwrap()
+        .compile(dispatch)
+        .unwrap()
+        .execute()
+        .collect()
+        .unwrap();
+    commit_datastore_transaction(transaction).unwrap();
 }
 
 #[test]
@@ -188,4 +209,86 @@ fn compaction_merges_adopted_files_without_deleting_them() {
             "compaction must not delete {name}"
         );
     }
+}
+
+#[test]
+fn dropped_table_storage_is_deferred_then_vacuumed_without_touching_adopted_files() {
+    let dispatch = dispatch(2);
+    let db = TempDir::new().unwrap();
+    let adopted_dir = db.path().join("adopted_events");
+    std::fs::create_dir_all(&adopted_dir).unwrap();
+    let adopted_file = adopted_dir.join("live.parquet");
+    write_parquet(&adopted_file);
+    let datastore = DeltaDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+    let table_dir = create_events_table(&datastore, &dispatch, db.path(), &adopted_dir);
+    write_parquet(&table_dir.join("owned_orphan.parquet"));
+    drop_events_table(&datastore, &dispatch);
+    let vacuumer = Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, datastore.clone()));
+
+    vacuumer.vacuum_all(now_ms());
+
+    assert!(
+        table_dir.exists(),
+        "the table root remains during retention"
+    );
+    assert!(adopted_file.exists());
+    drop(vacuumer);
+    drop(datastore);
+    let reopened = DeltaDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+    let vacuumer = Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, reopened));
+
+    vacuumer.vacuum_all(u64::MAX);
+
+    assert!(!table_dir.exists(), "expired managed storage is removed");
+    assert!(
+        adopted_file.exists(),
+        "adopted storage remains owned externally"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(db.path().join("_pivot_manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["dropped_tables"], serde_json::json!({}));
+}
+
+#[test]
+fn a_snapshot_opened_before_drop_can_finish_scanning() {
+    let dispatch = dispatch(2);
+    let db = TempDir::new().unwrap();
+    let adopted_dir = db.path().join("snapshot_events");
+    std::fs::create_dir_all(&adopted_dir).unwrap();
+    write_parquet(&adopted_dir.join("live.parquet"));
+    let datastore = DeltaDatastore::open(&db.path().to_string_lossy(), &dispatch).unwrap();
+    create_events_table(&datastore, &dispatch, db.path(), &adopted_dir);
+    let inserted = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "Timestamp",
+            DataType::Int64,
+            false,
+        )])),
+        vec![Arc::new(Int64Array::from(vec![4i64, 5, 6])) as _],
+    )
+    .unwrap();
+    insert_batches(
+        &dispatch,
+        datastore.clone().begin_transaction(),
+        "events",
+        vec![inserted],
+    );
+    let reader = datastore.clone().begin_transaction();
+    let table = reader
+        .bind_table(
+            DEFAULT_DATASTORE_NAME,
+            &SchemaQualifiedTableName::in_default_schema("events"),
+        )
+        .unwrap();
+
+    drop_events_table(&datastore, &dispatch);
+    let batches = table
+        .compile_scan(&dispatch, Projection::all(1), Vec::new(), false)
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 6);
+    reader.rollback();
 }

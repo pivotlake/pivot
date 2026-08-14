@@ -1,5 +1,5 @@
-//! Physical cleanup of a table's unreferenced Parquet files and superseded log
-//! commits.
+//! Physical cleanup of live tables' unreferenced files and dropped tables'
+//! retained managed storage.
 //!
 //! Compaction (and, in time, DELETE) retires a file by writing a Delta `Remove`
 //! action for it, but leaves the object in place: a query that loaded the prior
@@ -61,11 +61,11 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Deletes every datastore table's unreferenced Parquet objects and superseded
-/// commit JSONs, entirely off the tables' directories and logs. Holds nothing
-/// but a datastore handle, so it is a deployment detail: the datastore bundles
-/// one when maintenance enables it, and a dedicated process could run another
-/// over the same database root.
+/// Deletes every live table's unreferenced Parquet objects and superseded
+/// commit JSONs, then reclaims expired dropped-table roots. Holds nothing but a
+/// datastore handle, so it is a deployment detail: the datastore bundles one
+/// when maintenance enables it, and a dedicated process could run another over
+/// the same database root.
 pub struct Vacuumer {
     /// How often to re-scan the tables for files to delete.
     poll_interval: Duration,
@@ -107,6 +107,27 @@ impl Vacuumer {
     pub fn vacuum_all(&self, now_ms: u64) {
         for (name, table) in self.datastore.tables() {
             self.vacuum_table(&name, table, now_ms);
+        }
+
+        let dropped_tables = match self.datastore.dropped_tables() {
+            Ok(dropped_tables) => dropped_tables,
+            Err(e) => {
+                warn!(error = %e, "vacuum: loading dropped tables failed");
+                return;
+            }
+        };
+        for (id, dropped) in dropped_tables {
+            if dropped.delete_after_unix_ms > now_ms {
+                continue;
+            }
+            match self.datastore.vacuum_dropped_table(id, &dropped) {
+                Ok(deleted) => {
+                    info!(table_id = %id, objects = deleted, "vacuumed dropped table");
+                }
+                Err(e) => {
+                    warn!(table_id = %id, error = %e, "vacuum: deleting dropped table failed")
+                }
+            }
         }
     }
 

@@ -204,6 +204,9 @@ impl<'plan> LogicalOp<'plan> {
             L::LOGICAL_GET => Operator::TableFunctionScan(TableFunctionScan { raw: self.raw }),
             L::LOGICAL_CREATE_TABLE => Operator::CreateTable(CreateTable { raw: self.raw }),
             L::LOGICAL_CREATE_SCHEMA => Operator::CreateSchema(CreateSchema { raw: self.raw }),
+            L::LOGICAL_DROP if ffi::lo_drop_is_table(self.raw)? => {
+                Operator::DropTable(DropTable { raw: self.raw })
+            }
             L::LOGICAL_SET => Operator::Set(Set { raw: self.raw }),
             L::LOGICAL_RESET => Operator::Reset(Reset { raw: self.raw }),
             L::LOGICAL_COMPACT => Operator::Compact(Compact { raw: self.raw }),
@@ -246,6 +249,8 @@ pub enum Operator<'plan> {
     TableFunctionScan(TableFunctionScan<'plan>),
     CreateTable(CreateTable<'plan>),
     CreateSchema(CreateSchema<'plan>),
+    /// `DROP TABLE [IF EXISTS] <name> [CASCADE | RESTRICT]`.
+    DropTable(DropTable<'plan>),
     /// `SET name = value`.
     Set(Set<'plan>),
     /// `RESET name`.
@@ -319,6 +324,8 @@ define_handles! { ffi::LogicalOperator;
     CreateTable,
     /// A `LogicalCreate` for `CREATE SCHEMA`.
     CreateSchema,
+    /// A table-targeting `LogicalSimple(LOGICAL_DROP)`.
+    DropTable,
     /// A `LogicalSet`: `SET name = value`.
     Set,
     /// A `LogicalReset`: `RESET name`.
@@ -703,6 +710,32 @@ impl<'plan> CreateTable<'plan> {
 
     pub fn constraint_count(self) -> Result<usize> {
         Ok(ffi::lo_create_constraint_count(self.raw)?)
+    }
+}
+
+impl<'plan> DropTable<'plan> {
+    pub fn name(self) -> Result<String> {
+        Ok(ffi::lo_drop_table_name(self.raw)?)
+    }
+
+    /// The target database (datastore), or `None` when unqualified.
+    pub fn datastore(self) -> Result<Option<String>> {
+        let datastore = ffi::lo_drop_table_datastore(self.raw)?;
+        Ok((!datastore.is_empty()).then_some(datastore))
+    }
+
+    /// The target schema, or `None` when unqualified.
+    pub fn schema(self) -> Result<Option<String>> {
+        let schema = ffi::lo_drop_table_schema(self.raw)?;
+        Ok((!schema.is_empty()).then_some(schema))
+    }
+
+    pub fn if_exists(self) -> Result<bool> {
+        Ok(ffi::lo_drop_table_if_exists(self.raw)?)
+    }
+
+    pub fn cascade(self) -> Result<bool> {
+        Ok(ffi::lo_drop_table_cascade(self.raw)?)
     }
 }
 

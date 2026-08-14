@@ -100,6 +100,17 @@ impl ObjectStore for LocalStore {
         }
     }
 
+    fn delete_dir(&self, prefix: &ObjectPath) -> Result<()> {
+        match std::fs::remove_dir(self.path_for(prefix)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(StoreError::Io {
+                key: prefix.to_string(),
+                source,
+            }),
+        }
+    }
+
     fn list(&self, prefix: &ObjectPath) -> Result<Vec<ListedObject>> {
         let dir = self.path_for(prefix);
         let entries = match std::fs::read_dir(&dir) {

@@ -68,6 +68,7 @@ impl PlanNode {
             self.operator,
             Operator::Insert(_)
                 | Operator::CreateTable(_)
+                | Operator::DropTable(_)
                 | Operator::CreateSchema(_)
                 | Operator::CreateUser(_)
                 | Operator::SetVariable(_)

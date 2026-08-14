@@ -28,12 +28,12 @@ use common::{
     dispatch_with_buffers, strings_and_ints,
 };
 use datastore::DatastoreTransaction;
-use datastore_delta::DeltaDatastore;
 use datastore_delta::parquet::table_input;
 use datastore_delta::store::ObjectPath;
+use datastore_delta::{DEFAULT_VACUUM_POLL, DeltaDatastore, Vacuumer};
 use dispatch::Projection;
 use harness::Backend;
-use planner::catalog::{Column, CreateTableRequest, SchemaQualifiedTableName};
+use planner::catalog::{Column, CreateTableRequest, DropTableRequest, SchemaQualifiedTableName};
 use planner::types::Type;
 
 // --- helpers (not tests) ---------------------------------------------------
@@ -226,6 +226,44 @@ mod bodies {
         assert_eq!(row_groups(&datastore, "events"), 1);
     }
 
+    /// An expired dropped table loses its managed objects while the files it
+    /// adopted from another directory remain untouched.
+    pub fn drop_vacuums_only_managed_storage(b: &Backend) {
+        let d = dispatch_with_buffers(2, 32);
+        let datastore = create_events(&d, b, &[("p1.parquet", &[1, 2, 3])]);
+        let table = datastore
+            .table_handle(&SchemaQualifiedTableName::in_default_schema("events"))
+            .unwrap();
+        let owned = ObjectPath::new(table.location()).join("owned.bin");
+        b.store.put(&owned, b"owned").unwrap();
+        let transaction = datastore.clone().begin_transaction();
+        transaction
+            .bind_drop_table(DropTableRequest {
+                datastore_name: None,
+                schema_name: None,
+                name: "events".to_string(),
+                if_exists: false,
+                cascade: false,
+            })
+            .unwrap()
+            .compile(&d)
+            .unwrap()
+            .execute()
+            .collect()
+            .unwrap();
+        commit_datastore_transaction(transaction).unwrap();
+
+        Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, datastore)).vacuum_all(u64::MAX);
+
+        assert!(b.store.get(&owned).unwrap().is_none());
+        assert!(
+            b.store
+                .get(&ObjectPath::new("events/p1.parquet"))
+                .unwrap()
+                .is_some()
+        );
+    }
+
     /// A stored object reads back through `source` — the read source the ring is
     /// handed (a presigned S3 URL, a GCS media URL, or a local path).
     pub fn source_reads_object_back(b: &Backend) {
@@ -303,6 +341,7 @@ backend_tests!(adopts_from_an_absolute_key);
 backend_tests!(survives_reopen);
 backend_tests!(append_registers_new_file);
 backend_tests!(compaction_replaces_files);
+backend_tests!(drop_vacuums_only_managed_storage);
 backend_tests!(source_reads_object_back);
 backend_tests!(sink_writes_object_back);
 backend_tests!(list_is_one_level);

@@ -1,8 +1,9 @@
 //! A concrete [`datastore::Datastore`] implementation backed by Parquet.
 //!
 //! The datastore stores tables in a `RwLock<HashMap>` keyed by name, so multiple
-//! threads can resolve and create tables concurrently: many readers (lookups)
-//! coexist with infrequent writers (`CREATE TABLE`, file registrations).
+//! threads can resolve and change tables concurrently: many readers (lookups)
+//! coexist with infrequent writers (`CREATE TABLE`, `DROP TABLE`, file
+//! registrations).
 //! Backing the map is the database's [`ObjectStore`], opened on an explicit
 //! local directory or remote `s3://` root.
 //!
@@ -38,10 +39,11 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
 
-use crate::manifest::{self, CatalogManifest, DeltaFileEntry};
+use crate::manifest::{self, CatalogManifest, DeltaFileEntry, DroppedTableEntry};
 use crate::parquet::ParquetTableError;
 use crate::store::{self, DataFile, FileRef, ObjectPath, ObjectStore, open_store};
 use async_trait::async_trait;
@@ -50,8 +52,8 @@ use datastore::{Datastore, DatastoreTransaction};
 use dispatch::{DataFlowDispatcher, DataFlowError, OneShotNullaryFactory, RecordBatchOperatorSpec};
 use local_lock::LocalDatastoreLock;
 use planner::catalog::{
-    BoundTable, CreateSchemaRequest, CreateTableRequest, Error as CatalogError,
-    Result as CatalogResult, SchemaCreation, SchemaQualifiedTableName, TableCreation,
+    BoundTable, CreateSchemaRequest, CreateTableRequest, DropTableRequest, Error as CatalogError,
+    Result as CatalogResult, SchemaCreation, SchemaQualifiedTableName, TableCreation, TableDrop,
     TableRevision,
 };
 pub use table::CatalogTable;
@@ -77,6 +79,25 @@ const TABLE_OPTIONS: [&str; 3] = [
     SORT_BY_OPTION,
 ];
 
+fn read_unix_time_ms() -> Result<u64> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|source| Error::SystemClockBeforeUnixEpoch { source })?;
+    u64::try_from(elapsed.as_millis()).map_err(|_| Error::SystemClockOutOfRange)
+}
+
+fn build_table_identity_changed_error(
+    name: &SchemaQualifiedTableName,
+    expected: Uuid,
+    actual: Option<Uuid>,
+) -> Error {
+    Error::TableIdentityChanged {
+        name: name.to_string(),
+        expected,
+        actual: actual.map_or_else(|| "no table".to_string(), |id| id.to_string()),
+    }
+}
+
 #[derive(Debug, ThisError)]
 pub enum Error {
     #[error(
@@ -93,6 +114,25 @@ pub enum Error {
     TableExists(String),
     #[error("table `{0}` does not exist")]
     TableNotFound(String),
+    #[error(
+        "table `{name}` changed since the transaction began: expected identity {expected}, found {actual}"
+    )]
+    TableIdentityChanged {
+        name: String,
+        expected: Uuid,
+        actual: String,
+    },
+    #[error("system clock is before the Unix epoch: {source}")]
+    SystemClockBeforeUnixEpoch {
+        #[source]
+        source: std::time::SystemTimeError,
+    },
+    #[error("system clock is too far after the Unix epoch to represent in milliseconds")]
+    SystemClockOutOfRange,
+    #[error("table `{0}` has a deletion-retention duration too large to represent in milliseconds")]
+    DeletionRetentionOutOfRange(String),
+    #[error("table `{0}` has a deletion-retention deadline outside the supported range")]
+    DeletionDeadlineOutOfRange(String),
     #[error("schema `{0}` does not exist")]
     SchemaNotFound(String),
     #[error("schema `{0}` already exists")]
@@ -150,6 +190,10 @@ impl From<Error> for CatalogError {
 /// commit or publish never has to update two copies.
 #[derive(Clone, Default)]
 struct DatastoreIndex {
+    /// Latest database-manifest version observed while publishing this index.
+    /// Refresh uses it as an optimistic token: store I/O happens without the
+    /// index lock, then a newer in-memory version rejects the stale result.
+    manifest_version: u64,
     /// Every schema the datastore defines, always including
     /// [`DEFAULT_SCHEMA_NAME`](planner::DEFAULT_SCHEMA_NAME), each mapping its
     /// table names to identities. A schema with no tables in it is still a
@@ -159,6 +203,14 @@ struct DatastoreIndex {
 }
 
 impl DatastoreIndex {
+    fn has_seen_newer_manifest(&self, version: u64) -> bool {
+        self.manifest_version > version
+    }
+
+    fn observe_manifest_version(&mut self, version: u64) {
+        self.manifest_version = self.manifest_version.max(version);
+    }
+
     /// Add a table under `name` and its own identity, registering the schema if
     /// the index does not already list it. A table whose schema is missing would
     /// be present but unresolvable, so the index keeps itself consistent rather
@@ -206,6 +258,20 @@ impl DatastoreIndex {
         self.table_id(name).is_some()
     }
 
+    /// Remove `name` only if it still resolves to `expected_id`, returning the
+    /// table that lost its registration.
+    fn remove_table(
+        &mut self,
+        name: &SchemaQualifiedTableName,
+        expected_id: Uuid,
+    ) -> Option<CatalogTable> {
+        if self.table_id(name) != Some(expected_id) {
+            return None;
+        }
+        self.schemas.get_mut(&name.schema)?.remove(&name.table);
+        self.tables_by_id.remove(&expected_id)
+    }
+
     /// Every table with the schema-qualified name it is currently indexed under.
     fn named_tables(&self) -> impl Iterator<Item = (SchemaQualifiedTableName, &CatalogTable)> {
         self.schemas.iter().flat_map(move |(schema, tables)| {
@@ -249,7 +315,9 @@ pub struct DeltaDatastore {
     /// `CREATE`, swap-in on a resolve's refresh); each [`CatalogTable`] is itself
     /// a lock-free value that callers clone out and evolve independently. One
     /// lock covers both halves so the two `CREATE` paths cannot interleave their
-    /// updates to the shared manifest document.
+    /// updates to the shared manifest document. Its manifest version also lets
+    /// refresh fetch from the store before taking the lock and reject a stale
+    /// result when it finally publishes.
     tables_index: Arc<RwLock<DatastoreIndex>>,
     /// The database's object store: the table index, Delta logs, and tables'
     /// Parquet data. The datastore reads and writes a table's data through this
@@ -322,6 +390,7 @@ impl DeltaDatastore {
         let engine = crate::delta::DeltaEngine::new(store.as_ref())?;
 
         let mut index = DatastoreIndex::default();
+        index.observe_manifest_version(manifest.version);
         for schema in &manifest.schemas {
             index.insert_schema(schema.name.clone());
         }
@@ -411,6 +480,7 @@ impl DeltaDatastore {
             snapshot,
             uploaded_files: Arc::new(Injector::new()),
             pending_table_creations: Arc::new(Injector::new()),
+            pending_table_drops: Arc::new(Injector::new()),
             pending_schema_creations: Arc::new(Injector::new()),
             datastore: self,
             committed: std::sync::atomic::AtomicBool::new(false),
@@ -426,9 +496,6 @@ impl DeltaDatastore {
     /// queries always bind against an already-materialized set. Returns whether
     /// anything changed.
     ///
-    /// Tables are never removed here: there is no `DROP TABLE`, and removing a
-    /// map entry on a manifest miss could race a concurrent in-process create.
-    ///
     /// One table failing to load or refresh (an unsupported Delta feature, a
     /// transient store error) must not starve every other table of its
     /// refresh, so per-table failures are logged and the sweep continues; only
@@ -436,19 +503,76 @@ impl DeltaDatastore {
     pub fn refresh_from_store(&self) -> Result<bool> {
         let mut changed = false;
 
+        // Store I/O stays outside the table-index lock. Local catalog writers
+        // publish the manifest version under that lock, so a writer that lands
+        // between this GET and publication makes this snapshot detectably stale.
         let manifest = CatalogManifest::load(self.store.as_ref())?;
+        let manifest_version = manifest.version;
+        let manifest_tables = manifest
+            .tables()
+            .map(|entry| {
+                let (name, id, location) = entry?;
+                Ok((name, id, location.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let manifest_ids: HashMap<SchemaQualifiedTableName, Uuid> = manifest_tables
+            .iter()
+            .map(|(name, id, _)| (name.clone(), *id))
+            .collect();
 
-        for schema in &manifest.schemas {
+        let stale_tables = {
             let mut index = self.tables_index.write().unwrap();
-            if !index.contains_schema(&schema.name) {
-                index.insert_schema(schema.name.clone());
+            if index.has_seen_newer_manifest(manifest_version) {
+                return Ok(false);
+            }
+            index.observe_manifest_version(manifest_version);
+
+            for schema in &manifest.schemas {
+                changed |= index.insert_schema(schema.name.clone());
+            }
+
+            // A missing name was dropped elsewhere. A changed identity is a
+            // drop followed by a recreate under the same name. Remove either
+            // stale incarnation before loading any replacement.
+            index
+                .named_tables()
+                .filter_map(|(name, table)| {
+                    (manifest_ids.get(&name) != Some(&table.id())).then_some((
+                        name,
+                        table.id(),
+                        table.commit_lock(),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Use the same per-table commit lock as local DROP TABLE. A refresh
+        // that observes a remote drop cannot remove an identity halfway
+        // through an in-process INSERT or compaction commit.
+        for (name, id, commit_lock) in stale_tables {
+            let _committing = commit_lock.lock().unwrap();
+            if self.tables_index.read().unwrap().table_id(&name) != Some(id) {
+                continue;
+            }
+            let current_manifest = CatalogManifest::load(self.store.as_ref())?;
+            let current_manifest_version = current_manifest.version;
+            let current_id = current_manifest.table_id(&name);
+            let mut index = self.tables_index.write().unwrap();
+            if index.has_seen_newer_manifest(current_manifest_version) {
+                continue;
+            }
+            index.observe_manifest_version(current_manifest_version);
+            if index.table_id(&name) != Some(id) {
+                continue;
+            }
+            if current_id != Some(id) {
+                index.remove_table(&name, id);
                 changed = true;
             }
         }
 
-        for entry in manifest.tables() {
-            let (name, id, location) = entry?;
-            if self.tables_index.read().unwrap().contains_table(&name) {
+        for (name, id, location) in manifest_tables {
+            if self.tables_index.read().unwrap().table_id(&name) == Some(id) {
                 continue;
             }
             let table = match Self::load_table(
@@ -456,7 +580,7 @@ impl DeltaDatastore {
                 &self.store,
                 &self.engine,
                 id,
-                location,
+                &location,
             ) {
                 Ok(table) => table,
                 Err(e) => {
@@ -464,9 +588,20 @@ impl DeltaDatastore {
                     continue;
                 }
             };
+            let current_manifest = CatalogManifest::load(self.store.as_ref())?;
+            let current_manifest_version = current_manifest.version;
+            let current_id = current_manifest.table_id(&name);
             let mut index = self.tables_index.write().unwrap();
-            // An in-process CREATE TABLE may have published it since the read.
-            if !index.contains_table(&name) {
+            if index.has_seen_newer_manifest(current_manifest_version) {
+                continue;
+            }
+            index.observe_manifest_version(current_manifest_version);
+            // An in-process CREATE TABLE may have claimed this name since the
+            // manifest snapshot above. Never replace that newer local binding
+            // with the table loaded from an older snapshot. The table may also
+            // have been dropped while its log was loading, so revalidate its
+            // durable identity before publishing it.
+            if current_id == Some(id) && !index.contains_table(&name) {
                 index.insert_table(name, table);
                 changed = true;
             }
@@ -496,10 +631,13 @@ impl DeltaDatastore {
         let mut index = self.tables_index.write().unwrap();
         match index.get_table_by_id(&table.id()) {
             Some(existing) if existing.version() >= table.version() => false,
-            _ => {
+            Some(_) => {
                 index.replace_table(table);
                 true
             }
+            // A stale refresh or writer can outlive DROP TABLE. Publishing it
+            // must not put that dropped identity back into the by-id map.
+            None => false,
         }
     }
 
@@ -538,6 +676,20 @@ impl DeltaDatastore {
             .ok_or_else(|| Error::TableNotFound(id.to_string()))?;
         table.commit_files(removed, added, data_change)?;
         self.publish_table(table);
+        Ok(())
+    }
+
+    /// Persist a database-manifest mutation and publish its version before the
+    /// caller releases the table-index write guard. Refresh relies on this
+    /// ordering to reject a store snapshot fetched before a local catalog
+    /// commit.
+    fn store_catalog_manifest(
+        &self,
+        index: &mut DatastoreIndex,
+        manifest: &CatalogManifest,
+    ) -> Result<()> {
+        manifest.store(self.store.as_ref())?;
+        index.observe_manifest_version(manifest.version);
         Ok(())
     }
 
@@ -583,9 +735,136 @@ impl DeltaDatastore {
         )?;
         let mut manifest = CatalogManifest::load(self.store.as_ref())?;
         manifest.upsert_table(&name, id, location)?;
-        manifest.store(self.store.as_ref())?;
+        self.store_catalog_manifest(&mut index, &manifest)?;
         index.insert_table(name, table);
         Ok(())
+    }
+
+    /// Persist one staged table drop. The identity captured from the
+    /// transaction snapshot must still own the name in both the live index and
+    /// the durable manifest, so a concurrent drop and recreate cannot lose the
+    /// replacement. The table's commit lock serializes this removal with INSERT
+    /// and compaction commits against the same identity.
+    fn finalize_table_drop(&self, pending: PendingTableDrop) -> Result<()> {
+        let PendingTableDrop {
+            name,
+            expected,
+            if_exists,
+        } = pending;
+        let Some(expected) = expected else {
+            // `IF EXISTS` bound no table in the transaction snapshot. It stays
+            // a no-op even if another transaction creates that name before this
+            // one commits.
+            return Ok(());
+        };
+        let expected_id = expected.id;
+
+        let _committing = expected.commit_lock.lock().unwrap();
+        let mut index = self.tables_index.write().unwrap();
+        let actual_id = index.table_id(&name);
+        if actual_id.is_some() && actual_id != Some(expected_id) {
+            return Err(build_table_identity_changed_error(
+                &name,
+                expected_id,
+                actual_id,
+            ));
+        }
+
+        let mut manifest = CatalogManifest::load(self.store.as_ref())?;
+        index.observe_manifest_version(manifest.version);
+        let manifest_id = manifest.table_id(&name);
+        if manifest_id != Some(expected_id) {
+            if let Some(manifest_id) = manifest_id {
+                return Err(build_table_identity_changed_error(
+                    &name,
+                    expected_id,
+                    Some(manifest_id),
+                ));
+            }
+            if if_exists {
+                index.remove_table(&name, expected_id);
+                return Ok(());
+            }
+            return Err(Error::TableNotFound(name.to_string()));
+        }
+
+        let delete_after_unix_ms = read_unix_time_ms()?
+            .checked_add(expected.retention_ms)
+            .ok_or_else(|| Error::DeletionDeadlineOutOfRange(name.to_string()))?;
+        let removed = manifest.tombstone_table(&name, expected_id, delete_after_unix_ms)?;
+        debug_assert!(
+            removed,
+            "the identity was checked immediately before removal"
+        );
+        self.store_catalog_manifest(&mut index, &manifest)?;
+        let removed_from_index = index.remove_table(&name, expected_id);
+        debug_assert!(
+            actual_id.is_none() || removed_from_index.is_some(),
+            "the live identity was checked immediately before removal"
+        );
+        Ok(())
+    }
+
+    /// Durable dropped-table candidates for the vacuum loop.
+    pub(crate) fn dropped_tables(&self) -> Result<Vec<(Uuid, DroppedTableEntry)>> {
+        let manifest = CatalogManifest::load(self.store.as_ref())?;
+        Ok(manifest
+            .dropped_tables()
+            .map(|(id, entry)| (id, entry.clone()))
+            .collect())
+    }
+
+    /// Delete one expired dropped table's managed objects, then remove its
+    /// tombstone. Every data file written by Pivot is flat under `location`, and
+    /// every Delta log object is flat under `_delta_log`; adopted files use
+    /// absolute paths outside this location and are therefore never listed.
+    pub(crate) fn vacuum_dropped_table(
+        &self,
+        id: Uuid,
+        expected: &DroppedTableEntry,
+    ) -> Result<usize> {
+        // Revalidate a candidate read at the start of the sweep before touching
+        // its storage. UUID locations are never reused, so no catalog write
+        // needs to be blocked while the potentially long object deletion runs.
+        let manifest = CatalogManifest::load(self.store.as_ref())?;
+        if manifest.dropped_table(id) != Some(expected) {
+            return Ok(0);
+        }
+
+        let mut deleted = self.delete_objects_under(&expected.location)?;
+        let log_directory = expected.location.join("_delta_log");
+        deleted += self.delete_objects_under(&log_directory)?;
+        self.store.delete_dir(&log_directory)?;
+        self.store.delete_dir(&expected.location)?;
+
+        // Catalog-manifest writers in this process all use this lock. Reload
+        // under it so removing the tombstone cannot overwrite a concurrent
+        // CREATE or DROP read-modify-write.
+        let mut index = self.tables_index.write().unwrap();
+        let mut manifest = CatalogManifest::load(self.store.as_ref())?;
+        if manifest.remove_dropped_table(id, expected) {
+            self.store_catalog_manifest(&mut index, &manifest)?;
+        } else {
+            index.observe_manifest_version(manifest.version);
+        }
+        Ok(deleted)
+    }
+
+    /// Delete every directly contained object, repeatedly listing the first
+    /// page until empty so stores whose list API caps a page still drain all
+    /// objects.
+    fn delete_objects_under(&self, prefix: &ObjectPath) -> Result<usize> {
+        let mut deleted = 0;
+        loop {
+            let objects = self.store.list(prefix)?;
+            if objects.is_empty() {
+                return Ok(deleted);
+            }
+            for object in objects {
+                self.store.delete(&prefix.join(object.file.path.as_str()))?;
+                deleted += 1;
+            }
+        }
     }
 
     /// Whether this datastore defines a schema named `schema`.
@@ -617,7 +896,7 @@ impl DeltaDatastore {
         }
         let mut manifest = CatalogManifest::load(self.store.as_ref())?;
         manifest.add_schema(name.clone());
-        manifest.store(self.store.as_ref())?;
+        self.store_catalog_manifest(&mut index, &manifest)?;
         index.insert_schema(name);
         Ok(())
     }
@@ -790,6 +1069,40 @@ impl DeltaTransaction {
         })
     }
 
+    /// Resolve a `DROP TABLE` against the table incarnation in this
+    /// transaction's frozen snapshot. Execution only stages the resolved
+    /// operation; commit verifies that the same identity still owns the name
+    /// before removing it.
+    fn bind_drop(&self, request: DropTableRequest) -> Result<DeltaTableDrop> {
+        let name = request.schema_qualified_name();
+
+        if !request.if_exists && !self.contains_schema(&name.schema) {
+            return Err(Error::SchemaNotFound(name.schema));
+        }
+
+        let expected = match self.snapshot.catalog_table_by_name(&name) {
+            Some(table) => Some(PendingTableIdentity {
+                id: table.id(),
+                retention_ms: u64::try_from(table.deleted_file_retention().as_millis())
+                    .map_err(|_| Error::DeletionRetentionOutOfRange(name.to_string()))?,
+                commit_lock: table.commit_lock(),
+            }),
+            None => None,
+        };
+        if expected.is_none() && !request.if_exists {
+            return Err(Error::TableNotFound(name.to_string()));
+        }
+
+        Ok(DeltaTableDrop {
+            pending_table_drops: self.pending_table_drops.clone(),
+            drop: PendingTableDrop {
+                name,
+                expected,
+                if_exists: request.if_exists,
+            },
+        })
+    }
+
     /// Resolve a `CREATE SCHEMA` against this datastore and stage it on the
     /// transaction. A schema is a pure naming construct here: it owns no store
     /// state of its own, so there is nothing to locate or load, and creating it
@@ -940,6 +1253,19 @@ fn commit_table_creations(
 ) -> CatalogResult<()> {
     for pending in pending_table_creations {
         datastore.finalize_table_creation(pending)?;
+    }
+    Ok(())
+}
+
+/// Commit the table drops drained from a transaction. Each drop removes its
+/// name immediately and leaves its managed storage under a durable tombstone
+/// for the vacuum loop.
+fn commit_table_drops(
+    datastore: &DeltaDatastore,
+    pending_table_drops: Vec<PendingTableDrop>,
+) -> CatalogResult<()> {
+    for pending in pending_table_drops {
+        datastore.finalize_table_drop(pending)?;
     }
     Ok(())
 }
@@ -1188,17 +1514,37 @@ struct PendingTableCreation {
     loaded: Vec<crate::parquet::FileRowGroups>,
 }
 
+/// One table drop resolved against a transaction snapshot and waiting for
+/// commit. `expected` is absent only for `DROP TABLE IF EXISTS` when the
+/// snapshot did not contain the name.
+#[derive(Clone)]
+struct PendingTableDrop {
+    name: SchemaQualifiedTableName,
+    expected: Option<PendingTableIdentity>,
+    if_exists: bool,
+}
+
+/// The exact table incarnation a drop resolved, plus the state commit needs
+/// even if a background refresh removes that incarnation from the live index.
+#[derive(Clone)]
+struct PendingTableIdentity {
+    id: Uuid,
+    retention_ms: u64,
+    commit_lock: Arc<Mutex<()>>,
+}
+
 /// The [`DatastoreTransaction`] a [`DeltaDatastore`] opens: one query's frozen
-/// [`DeltaSnapshot`] plus injectors of uploaded files and completed table
-/// creations awaiting commit.
+/// [`DeltaSnapshot`] plus injectors of uploaded files and completed catalog
+/// changes awaiting commit.
 pub struct DeltaTransaction {
     pub(super) snapshot: Arc<DeltaSnapshot>,
     pub(super) uploaded_files: Arc<Injector<insert_sink::UploadedFile>>,
     pending_table_creations: Arc<Injector<PendingTableCreation>>,
+    pending_table_drops: Arc<Injector<PendingTableDrop>>,
     pending_schema_creations: Arc<Injector<PendingSchemaCreation>>,
-    /// The datastore this transaction reads and writes back to. CREATE commits
-    /// publish through it so DDL is visible to the next transaction without
-    /// waiting for a refresh.
+    /// The datastore this transaction reads and writes back to. DDL commits
+    /// publish through it so changes are visible to the next transaction
+    /// without waiting for a refresh.
     datastore: Arc<DeltaDatastore>,
     /// Whether commit has run. A second commit is refused, and the drop
     /// safety net below discards the staged writes of a transaction its owner
@@ -1263,6 +1609,10 @@ impl DatastoreTransaction for DeltaTransaction {
         Ok(Box::new(self.bind_create(request)?))
     }
 
+    fn bind_drop_table(&self, request: DropTableRequest) -> CatalogResult<Box<dyn TableDrop>> {
+        Ok(Box::new(self.bind_drop(request)?))
+    }
+
     fn bind_create_schema(
         &self,
         request: CreateSchemaRequest,
@@ -1285,12 +1635,14 @@ impl DatastoreTransaction for DeltaTransaction {
         // durable state hops off the runtime.
         if self.uploaded_files.is_empty()
             && self.pending_table_creations.is_empty()
+            && self.pending_table_drops.is_empty()
             && self.pending_schema_creations.is_empty()
         {
             return Ok(());
         }
         let datastore = self.datastore.clone();
         let pending_schema_creations = drain_injector(&self.pending_schema_creations);
+        let pending_table_drops = drain_injector(&self.pending_table_drops);
         let pending_table_creations = drain_injector(&self.pending_table_creations);
         let uploaded_files = drain_injector(&self.uploaded_files);
         tokio::task::spawn_blocking(move || {
@@ -1298,6 +1650,7 @@ impl DatastoreTransaction for DeltaTransaction {
             // schema has to be in the manifest before any table write looks for
             // it.
             commit_schema_creations(&datastore, pending_schema_creations)?;
+            commit_table_drops(&datastore, pending_table_drops)?;
             commit_table_creations(&datastore, pending_table_creations)?;
             commit_uploaded_files(&datastore, uploaded_files)
         })
@@ -1307,6 +1660,7 @@ impl DatastoreTransaction for DeltaTransaction {
 
     fn rollback(&self) {
         drain_injector(&self.pending_schema_creations);
+        drain_injector(&self.pending_table_drops);
         drain_injector(&self.pending_table_creations);
         drain_injector(&self.uploaded_files);
     }
@@ -1326,6 +1680,7 @@ impl Drop for DeltaTransaction {
         // so the staged-writes check below keeps it out of the net too.
         let staged_writes = !self.uploaded_files.is_empty()
             || !self.pending_table_creations.is_empty()
+            || !self.pending_table_drops.is_empty()
             || !self.pending_schema_creations.is_empty();
         if staged_writes {
             tracing::warn!(
@@ -1358,6 +1713,33 @@ impl SchemaCreation for DeltaSchemaCreation {
                 OneShotNullaryFactory::new(move || {
                     if let Some(creation) = staged {
                         pending_schema_creations.push(creation);
+                    }
+                    None
+                })
+            })
+            .collect();
+        Ok(RecordBatchOperatorSpec::from_nullary(dispatcher, factories))
+    }
+}
+
+/// A resolved `DROP TABLE` for a [`DeltaDatastore`]. Its no-row dataflow stages
+/// the snapshot identity, leaving the durable catalog change to transaction
+/// commit.
+struct DeltaTableDrop {
+    pending_table_drops: Arc<Injector<PendingTableDrop>>,
+    drop: PendingTableDrop,
+}
+
+impl TableDrop for DeltaTableDrop {
+    fn compile(&self, dispatcher: &DataFlowDispatcher) -> CatalogResult<RecordBatchOperatorSpec> {
+        let mut pending = Some(self.drop.clone());
+        let factories: Vec<_> = (0..dispatcher.worker_count())
+            .map(|_| {
+                let staged = pending.take();
+                let pending_table_drops = self.pending_table_drops.clone();
+                OneShotNullaryFactory::new(move || {
+                    if let Some(drop) = staged {
+                        pending_table_drops.push(drop);
                     }
                     None
                 })
