@@ -19,6 +19,7 @@ use crate::operations::unary::group::hashtables::sorted_run::bucket_bits_for;
 use crate::operations::unary::group::hashtables::{
     AggregationValue, BUCKET_BITS, MultiSlabTable, PersistedKey, TableReader,
 };
+use crate::operations::unary::group::hll::Hll;
 use std::marker::PhantomData;
 
 /// One worker's consolidated entries, grouped by hash bucket.
@@ -42,18 +43,16 @@ unsafe impl<KP: PersistedKey, V: AggregationValue + ?Sized> Send for DenseRun<KP
 unsafe impl<KP: PersistedKey, V: AggregationValue + ?Sized> Sync for DenseRun<KP, V> {}
 
 impl<KP: PersistedKey, V: AggregationValue + ?Sized> DenseRun<KP, V> {
-    /// Copies every entry of `tables` into one bucket-grouped run.
+    /// Copies every entry of `tables` into one bucket-grouped run, folding
+    /// each hash into the worker's distinct-count sketch on the way.
     ///
-    /// `histograms` holds each table's per-bucket entry counts at
-    /// [`BUCKET_BITS`] resolution (offset by one, as
-    /// [`bucket_histogram`](MultiSlabTable::bucket_histogram) builds them),
-    /// counted while the table was cache-warm; a single placement pass over
-    /// the tables remains.
+    /// Two branchless slot scans: one to count each bucket, one to place the
+    /// entries.
     pub fn consolidate(
         tables: &[MultiSlabTable<KP, V>],
-        histograms: &[Vec<u32>],
         allocator: &mut SlabAllocator,
         metadata: V::StorageMetadata,
+        hll: &mut Hll,
     ) -> Self {
         let layout = entry_layout::<KP, V>(metadata);
         let entries_per_slab = BUFFER_SIZE / layout.stride;
@@ -63,16 +62,20 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> DenseRun<KP, V> {
         let bucket_bits = bucket_bits_for(len);
         let bucket_count = 1usize << bucket_bits;
         let bucket_shift = 64 - bucket_bits;
-        // Histograms are counted at full resolution; a coarser run folds each
-        // group of adjacent counts into one bucket.
-        let fold = (BUCKET_BITS - bucket_bits) as usize;
 
         let mut bucket_starts = vec![0u32; bucket_count + 1];
-        for histogram in histograms {
-            for (bucket, &count) in histogram[1..].iter().enumerate() {
-                bucket_starts[(bucket >> fold) + 1] += count;
+        for table in tables {
+            let reader = table.reader::<0>();
+            for slot in 0..table.capacity() {
+                let hash = reader.hash_of(reader.entry_ptr(slot));
+                // Count 0 of the histogram absorbs the empty slots (hash 0 is
+                // the empty sentinel); real buckets are offset by one so the
+                // occupied prefix sums stay exact, with no branch per slot.
+                let bucket = (hash >> bucket_shift) as usize;
+                bucket_starts[(bucket + 1) * (hash != 0) as usize] += 1;
             }
         }
+        bucket_starts[0] = 0;
         for b in 0..bucket_count {
             bucket_starts[b + 1] += bucket_starts[b];
         }
@@ -91,6 +94,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> DenseRun<KP, V> {
                 if hash == 0 {
                     continue;
                 }
+                hll.add(hash);
                 let bucket = (hash >> bucket_shift) as usize;
                 let dst = entry_at(cursors[bucket] as usize);
                 unsafe { std::ptr::copy_nonoverlapping(src, dst, layout.stride) };
