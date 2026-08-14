@@ -217,12 +217,6 @@ impl<'table, K: PersistedKey, V: AggregationValue + ?Sized> TableReader<'table, 
         unsafe { self.view(entry, hash) }
     }
 
-    /// Warms the cache line holding the entry at `index`.
-    #[inline(always)]
-    pub(crate) fn prefetch_entry(&self, index: usize) {
-        super::hash_table::prefetch_l1_line(self.entry_ptr(index));
-    }
-
     /// Returns a borrowed view of the entry at `index`.
     ///
     /// Empty slots are represented by a view whose `hash` is zero. Callers must

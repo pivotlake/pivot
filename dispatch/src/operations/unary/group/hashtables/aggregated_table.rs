@@ -165,8 +165,8 @@ pub struct SealedTable<KP: super::PersistedKey, V: AggregationValue + ?Sized> {
 }
 
 impl<KP: super::PersistedKey, V: AggregationValue + ?Sized> SealedTable<KP, V> {
-    fn seal(table: MultiSlabTable<KP, V>) -> Self {
-        let run = table.build_sorted_run();
+    fn seal(table: MultiSlabTable<KP, V>, hll: &mut Hll) -> Self {
+        let run = table.build_sorted_run(hll);
         Self { table, run }
     }
 }
@@ -355,20 +355,6 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         }
     }
 
-    /// Folds the active table's keys into the distinct-count sketch.
-    ///
-    /// Called as each table is retired, while it is still cache-warm. The sketch
-    /// is idempotent per hash, so a key that recurs in a later table is counted
-    /// once and the merged estimate is the true distinct count, not the entry
-    /// total (which counts a key once per table that holds it).
-    #[cold]
-    fn fold_active_table_into_hll(&mut self) {
-        let Self { active, hll, .. } = self;
-        for entry in active.iter(0) {
-            hll.add(entry.hash);
-        }
-    }
-
     /// Retires the full table and makes a fresh one active.
     ///
     /// The replacement is four times larger while that still fits the cache
@@ -379,7 +365,6 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
     fn retire_active_table(&mut self) {
         // Remembered addresses point into the table being retired.
         self.memo.invalidate();
-        self.fold_active_table_into_hll();
         let capacity = self.active.capacity();
         let next_size = if capacity < self.spill_config.spill_capacity {
             capacity * 4
@@ -390,18 +375,20 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             &mut self.active,
             BaseHashTable::new(&mut self.allocator, next_size, 0, &self.shared_context),
         );
-        self.sealed.push(SealedTable::seal(retired));
+        // Sealing folds each entry's hash into the sketch. The sketch is
+        // idempotent per hash, so a key recurring in a later table is counted
+        // once and the merged estimate is the true distinct count.
+        self.sealed.push(SealedTable::seal(retired, &mut self.hll));
     }
 
     /// Finishes worker state for the merge phase.
     pub fn flush(mut self) -> AggregatedTableOutput<K, V> {
         // Retired tables were folded in as they were replaced; the active one
         // still has to be counted.
-        self.fold_active_table_into_hll();
         self.key_arena.flush();
         self.worker_context.flush();
         let mut tables = self.sealed;
-        tables.push(SealedTable::seal(self.active));
+        tables.push(SealedTable::seal(self.active, &mut self.hll));
         AggregatedTableOutput {
             node: crate::worker::current_node(),
             tables,

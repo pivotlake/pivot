@@ -423,31 +423,22 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> BaseHashTable<K, V> {
         }
     }
 
-    /// Builds a hash-ordered view of this table's occupied slots.
-    ///
-    /// Starting the slot scan at an empty slot removes the wrap-around probe
-    /// cluster, so the collected pairs are nearly sorted (each entry is at
-    /// most its probe-chain length past its ideal slot) and the run's
-    /// insertion pass fixes them in near-linear time.
-    pub fn build_sorted_run(&self) -> super::SortedRun {
+    /// Builds a bucket-grouped view of this table's occupied slots, folding
+    /// every stored hash into the worker's distinct-count sketch on the way.
+    pub fn build_sorted_run(&self, hll: &mut super::super::hll::Hll) -> super::SortedRun {
         let reader = self.reader::<0>();
         let capacity = self.capacity();
         // One slack element keeps the unconditional store below in bounds
         // when the cursor has already reached the entry count.
         let mut entries = vec![(0u64, 0u32); self.len() + 1];
         let mut count = 0usize;
-        // The load factor cap guarantees an empty slot exists.
-        let first_empty = (0..capacity)
-            .find(|&idx| reader.hash_of(reader.entry_ptr(idx)) == 0)
-            .expect("a table below its load cap always has an empty slot");
-        for idx in (first_empty..capacity).chain(0..first_empty) {
+        for idx in 0..capacity {
             let hash = reader.hash_of(reader.entry_ptr(idx));
             entries[count] = (hash, idx as u32);
             count += (hash != 0) as usize;
         }
         debug_assert_eq!(count, self.len());
-        entries.truncate(count);
-        super::SortedRun::from_nearly_sorted(entries)
+        super::SortedRun::from_slot_scan(&entries[..count], hll)
     }
 
     /// Creates a probing handle with a local layout snapshot.

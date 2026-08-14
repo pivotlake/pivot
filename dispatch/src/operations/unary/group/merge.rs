@@ -1,12 +1,12 @@
 //! Partition-parallel merge of GROUP BY partial results.
 //!
 //! High hash bits select the merge partition, and every sealed table carries
-//! a hash-ordered run of its occupied slots, so a partition's share of each
+//! a bucket-grouped run of its occupied slots, so a partition's share of each
 //! table is one contiguous slice of that run. Each merge job walks its slice
-//! of every source densely, in ascending hash order, and folds the entries
-//! into one target table: the partition's final result. No slot is ever
-//! tested for occupancy or partition membership, and the ordered walk sweeps
-//! each source and the target left to right.
+//! of every source densely and folds the entries into one target table: the
+//! partition's final result. No slot is ever tested for occupancy or
+//! partition membership, and the nearly slot-ordered slices keep both the
+//! source reads and the target's probed range sweeping left to right.
 
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::SharedArena;
@@ -24,11 +24,11 @@ use crate::operations::unary::group::values::ArityBody;
 /// without letting probe chains grow without bound.
 const RESIZE_COLLISION_RATIO: f64 = 2.0;
 
-/// How far ahead of the fold to warm the target's slot and the source blob.
-const PREFETCH_DISTANCE: usize = 8;
-
-/// How far ahead of the fold to warm the source's entry lines.
-const SOURCE_PREFETCH_DISTANCE: usize = 16;
+/// Entries gathered per fold batch. The gather pass reads each batch's
+/// entries (nearly sequential in the source) and issues their target-slot
+/// prefetches together, so by the time the fold pass probes a target line it
+/// has had a whole batch of lead time.
+const FOLD_BATCH: usize = 48;
 
 /// Try to resize the target if cumulative collision pressure is too high.
 #[inline]
@@ -42,9 +42,11 @@ fn resize_if_needed<KP: PersistedKey, V: AggregationValue + ?Sized>(
 
 /// Folds one sealed table's run slice `[from, to)` into `target`.
 ///
-/// The slice is dense (only occupied entries, all belonging to this
-/// partition) and hash-ordered, so the walk reads the source nearly
-/// sequentially and its inserts sweep the target's slot range left to right.
+/// The slice is dense: only occupied entries, all belonging to this
+/// partition, in nearly ascending slot order. Each batch is gathered first
+/// (reading the source close to sequentially and prefetching every target
+/// slot it will probe), then folded, so the fold's probes land on lines whose
+/// fetch started a batch earlier.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn merge_run_slice<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
@@ -57,34 +59,32 @@ fn merge_run_slice<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
     target: &mut Prober<'_, S::Persisted, V>,
     context: &V::SharedContext,
 ) {
-    let entry_at = |index: usize| {
-        let slot = unsafe { *positions.add(index) } as usize;
-        reader.entry_ptr(slot) as *const u8
-    };
-    for i in from..to {
-        if i + SOURCE_PREFETCH_DISTANCE < to {
-            reader.prefetch_entry(unsafe { *positions.add(i + SOURCE_PREFETCH_DISTANCE) } as usize);
-        }
-        if i + PREFETCH_DISTANCE < to {
-            // The line this hash load touches was warmed by the source
-            // prefetch several entries ago.
-            let ahead = entry_at(i + PREFETCH_DISTANCE);
-            target.prefetch(reader.hash_of(ahead));
+    let mut batch: [(*const u8, u64); FOLD_BATCH] = [(std::ptr::null(), 0); FOLD_BATCH];
+    let mut i = from;
+    while i < to {
+        let batch_len = (to - i).min(FOLD_BATCH);
+        for (j, slot_index) in (i..i + batch_len).enumerate() {
+            let slot = unsafe { *positions.add(slot_index) } as usize;
+            let entry = reader.entry_ptr(slot) as *const u8;
+            let hash = reader.hash_of(entry);
+            batch[j] = (entry, hash);
+            target.prefetch(hash);
             if <S::Persisted as PersistedKey>::HAS_BLOB {
-                let view = unsafe { reader.view_of(ahead, 1) };
+                let view = unsafe { reader.view_of(entry, hash) };
                 view.key.prefetch_blob(arena);
             }
         }
-        let entry = entry_at(i);
-        let hash = reader.hash_of(entry);
-        let view = unsafe { reader.view_of(entry, hash) };
-        target.merge_from::<true, _>(
-            hash,
-            S::resolve_persisted(arena, *view.key),
-            view.stored,
-            context,
-        );
-        resize_if_needed::<S::Persisted, V>(allocator, target);
+        for &(entry, hash) in &batch[..batch_len] {
+            let view = unsafe { reader.view_of(entry, hash) };
+            target.merge_from::<true, _>(
+                hash,
+                S::resolve_persisted(arena, *view.key),
+                view.stored,
+                context,
+            );
+            resize_if_needed::<S::Persisted, V>(allocator, target);
+        }
+        i += batch_len;
     }
 }
 
@@ -539,7 +539,7 @@ mod tests {
                 .prober()
                 .merge_from::<false, _>(hash, key, &seeded_count(), &());
         }
-        let run = table.build_sorted_run();
+        let run = table.build_sorted_run(&mut crate::operations::unary::group::hll::Hll::new());
         SealedTable { table, run }
     }
 
@@ -601,10 +601,11 @@ mod tests {
     }
 
     #[test]
-    fn sorted_runs_are_hash_ordered_after_wraparound() {
+    fn runs_group_wrapped_entries_into_their_hash_buckets() {
         init_test_free_pool(64);
         // Hashes near u64::MAX probe past the last slot and wrap to slot 0;
-        // the run must still come out in ascending hash order.
+        // the run must still deliver every entry inside its hash bucket, in
+        // ascending bucket order.
         let pairs: Vec<(u64, i32)> = (0..40)
             .map(|i| (u64::MAX - i as u64, i as i32))
             .chain((1..40).map(|i| (i as u64, 100 + i as i32)))
@@ -612,12 +613,16 @@ mod tests {
         let sealed = sealed_from_pairs(&pairs);
 
         let reader = sealed.table.reader::<0>();
-        let mut previous = 0u64;
+        let mut previous_bucket = 0u64;
         for i in 0..sealed.run.len() {
             let slot = unsafe { *sealed.run.positions_ptr().add(i) } as usize;
-            let hash = reader.hash_of(reader.entry_ptr(slot));
-            assert!(hash >= previous, "run out of order at {}", i);
-            previous = hash;
+            let bucket = reader.hash_of(reader.entry_ptr(slot)) >> (64 - BUCKET_BITS);
+            assert!(
+                bucket >= previous_bucket,
+                "run out of bucket order at {}",
+                i
+            );
+            previous_bucket = bucket;
         }
         assert_eq!(sealed.run.len(), pairs.len());
     }
