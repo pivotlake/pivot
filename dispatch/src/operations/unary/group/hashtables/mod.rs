@@ -9,8 +9,8 @@ pub use crate::operations::unary::group::keys::KeyExtractor;
 pub use crate::operations::unary::group::values::AggregationValue;
 
 mod hash_table;
-pub(crate) use hash_table::value_offset_for;
-pub use hash_table::{LiveKey, MAX_LOAD_FACTOR, PersistedKey, Prober};
+pub use hash_table::{LiveKey, MAX_LOAD_FACTOR, PersistedKey};
+pub(crate) use hash_table::{prefetch_l1_line, value_offset_for};
 
 mod table_reader;
 pub(crate) use table_reader::TableReader;

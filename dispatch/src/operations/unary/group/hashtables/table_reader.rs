@@ -1,4 +1,6 @@
-use super::hash_table::{EntryLayout, EntryView, fast_div, reciprocal};
+#[cfg(test)]
+use super::hash_table::EntryView;
+use super::hash_table::{EntryLayout, fast_div, reciprocal};
 use super::{AggregationValue, PersistedKey};
 use std::marker::PhantomData;
 
@@ -200,6 +202,34 @@ impl<'table, K: PersistedKey, V: AggregationValue + ?Sized> TableReader<'table, 
         unsafe { *(entry.add(self.hash_offset) as *const u64) }
     }
 
+    /// The value layout metadata this reader decodes entries with.
+    #[inline(always)]
+    pub(crate) fn metadata(&self) -> V::StorageMetadata {
+        self.storage_metadata
+    }
+
+    /// Borrows the persisted key of an occupied entry.
+    ///
+    /// # Safety
+    ///
+    /// `entry` must be an occupied entry laid out with this reader's layout,
+    /// alive for `'table`.
+    #[inline(always)]
+    pub(crate) unsafe fn key_of(&self, entry: *const u8) -> &'table K {
+        unsafe { &*(entry.add(self.key_offset) as *const K) }
+    }
+
+    /// Borrows the stored value of an occupied entry.
+    ///
+    /// # Safety
+    ///
+    /// `entry` must be an occupied entry laid out with this reader's layout,
+    /// alive for `'table`.
+    #[inline(always)]
+    pub(crate) unsafe fn value_of(&self, entry: *const u8) -> &'table V {
+        unsafe { V::from_entry(entry.add(self.value_offset), self.storage_metadata) }
+    }
+
     /// Returns the hash stored at `index`, or zero when the slot is empty.
     #[cfg(test)]
     #[inline(always)]
@@ -212,6 +242,7 @@ impl<'table, K: PersistedKey, V: AggregationValue + ?Sized> TableReader<'table, 
     /// # Safety
     ///
     /// `entry` must be an occupied entry address from this reader's table.
+    #[cfg(test)]
     #[inline(always)]
     pub(crate) unsafe fn view_of(&self, entry: *const u8, hash: u64) -> EntryView<'table, K, V> {
         unsafe { self.view(entry, hash) }
@@ -234,6 +265,7 @@ impl<'table, K: PersistedKey, V: AggregationValue + ?Sized> TableReader<'table, 
     /// # Safety
     ///
     /// `entry` must point to an initialized entry in the borrowed table.
+    #[cfg(test)]
     #[inline(always)]
     pub(super) unsafe fn view(&self, entry: *const u8, hash: u64) -> EntryView<'table, K, V> {
         unsafe {

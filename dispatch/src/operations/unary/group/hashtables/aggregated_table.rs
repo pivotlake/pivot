@@ -581,7 +581,7 @@ fn probe_rows<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized>(
             }
             // Probe once, then seed a new group or update the matching group.
             let key = K::live_key(key_reader, row, key_arena);
-            let entry = prober.probe_fold::<false, _, _, _, _>(
+            let entry = prober.probe_fold(
                 hash,
                 key,
                 &mut *worker_context,
