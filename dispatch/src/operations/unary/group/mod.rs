@@ -107,7 +107,7 @@ use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::group::hashtables::{
-    AggregatedTable, AggregatedTableOutput, DEFAULT_CAPACITY, MAX_LOAD_FACTOR, MergeSource,
+    AggregatedTable, AggregatedTableOutput, DEFAULT_CAPACITY, MAX_LOAD_FACTOR, SealedTable,
     SpillConfig,
 };
 use crate::worker::current_node;
@@ -346,7 +346,7 @@ pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue + ?Sized> {
 pub struct PartitionJob<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// One source per contributing worker. Jobs walk each source's partition
     /// slice at `num_partitions` granularity.
-    sources: Arc<Vec<MergeSource<K::Persisted, V>>>,
+    sources: Arc<Vec<SealedTable<K::Persisted, V>>>,
     index: usize,
     key_arena: Arc<SharedArena>,
     /// The arena's ring buffers wrapped as Arrow `Buffer`s, built once for the
@@ -432,13 +432,13 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
     /// gather barrier.
     fn create_partition_jobs(&mut self, outputs: Vec<AggregatedTableOutput<K, V>>) {
         let node_count = self.injectors.len();
-        let mut sources_by_node: Vec<Vec<MergeSource<K::Persisted, V>>> =
+        let mut sources_by_node: Vec<Vec<SealedTable<K::Persisted, V>>> =
             (0..node_count).map(|_| Vec::new()).collect();
         let mut hll = Hll::new();
         let mut contributing_workers = 0usize;
         for out in outputs {
             contributing_workers += 1;
-            sources_by_node[out.node].push(out.source);
+            sources_by_node[out.node].extend(out.tables);
             hll.merge(&out.hll);
             self.zero_hash_pending |= out.zero_hash_seen;
         }
@@ -460,7 +460,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // further always shrinks the targets, so there is no upper bound here
         // beyond what the input volume justifies.
         let (num_partitions, partition_capacity) = {
-            let input_entries: usize = sources_by_node.iter().flatten().map(|s| s.len()).sum();
+            let input_entries: usize = sources_by_node.iter().flatten().map(|s| s.run.len()).sum();
             // The count never drops below 2: the merge routes rows by their
             // hash's top `log2(partitions)` bits, and a 0-bit partition id
             // has no valid shift (and no benefit over 2 near-empty jobs).
@@ -480,7 +480,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
             let min_source_bits = sources_by_node
                 .iter()
                 .flatten()
-                .map(|s| s.bucket_bits())
+                .map(|s| s.run.bucket_bits())
                 .min()
                 .unwrap_or(0);
             let partitions = by_target.max(floor).min(1 << min_source_bits);
