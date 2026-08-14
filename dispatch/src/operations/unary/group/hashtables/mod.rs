@@ -18,6 +18,9 @@ pub(crate) use table_reader::TableReader;
 mod sorted_run;
 pub use sorted_run::{BUCKET_BITS, BUCKET_COUNT, SortedRun};
 
+mod dense_run;
+pub use dense_run::DenseRun;
+
 mod aggregated_table;
 pub use aggregated_table::{AggregatedTable, AggregatedTableOutput, SealedTable, SpillConfig};
 

@@ -107,8 +107,8 @@ use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::group::hashtables::{
-    AggregatedTable, AggregatedTableOutput, BUCKET_COUNT, DEFAULT_CAPACITY, MAX_LOAD_FACTOR,
-    MultiSlabTable, SealedTable, SpillConfig,
+    AggregatedTable, AggregatedTableOutput, BUCKET_COUNT, DEFAULT_CAPACITY, DenseRun,
+    MAX_LOAD_FACTOR, MultiSlabTable, SpillConfig,
 };
 use crate::worker::current_node;
 use ahash::RandomState;
@@ -349,9 +349,9 @@ pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue + ?Sized> {
 /// table and merges them into the final one. That last merge is the only step
 /// that reads another node's memory.
 pub struct PartitionJob<K: KeyExtractor, V: AggregationValue + ?Sized> {
-    /// Every sealed table this node's workers filled. Jobs walk each run's
-    /// partition slice at `num_partitions` granularity.
-    tables: Arc<Vec<SealedTable<K::Persisted, V>>>,
+    /// One consolidated run per contributing worker on this job's node set.
+    /// Jobs walk each run's partition slice at `num_partitions` granularity.
+    runs: Arc<Vec<DenseRun<K::Persisted, V>>>,
     index: usize,
     /// One shared instance per partition on a multi-node hierarchical merge;
     /// `None` when this job's merge result is already final (single-node pool
@@ -440,7 +440,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
     ) -> Result<()> {
         let result_map = merge::merge_combined::<K::Stored, V>(
             self.index,
-            &self.tables,
+            &self.runs,
             self.partition_capacity,
             self.num_partitions,
             &self.key_arena,
@@ -491,18 +491,18 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
     /// gather barrier.
     fn create_partition_jobs(&mut self, outputs: Vec<AggregatedTableOutput<K, V>>) {
         let node_count = self.injectors.len();
-        let mut tables_by_node: Vec<Vec<SealedTable<K::Persisted, V>>> =
+        let mut runs_by_node: Vec<Vec<DenseRun<K::Persisted, V>>> =
             (0..node_count).map(|_| Vec::new()).collect();
         let mut hll = Hll::new();
         let mut contributing_workers = 0usize;
         for out in outputs {
             contributing_workers += 1;
-            tables_by_node[out.node].extend(out.tables);
+            runs_by_node[out.node].push(out.run);
             hll.merge(&out.hll);
             self.zero_hash_pending |= out.zero_hash_seen;
         }
         let partition_floor = merge_partition_floor(contributing_workers);
-        let total_in_place: usize = tables_by_node.iter().flatten().map(|t| t.table.len()).sum();
+        let total_in_place: usize = runs_by_node.iter().flatten().map(|run| run.len()).sum();
         // Every worker folds each table into the sketch as that table is
         // retired, so this is the distinct group count across the whole pool.
         // The entry total is not a stand-in for it: a key recurring in several
@@ -520,15 +520,11 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // further always shrinks the targets, so there is no upper bound here
         // beyond what the input volume justifies.
         let (num_partitions, partition_capacity) = {
-            let input_slots: usize = tables_by_node
-                .iter()
-                .flatten()
-                .map(|t| t.table.capacity())
-                .sum();
+            let input_entries: usize = runs_by_node.iter().flatten().map(|run| run.len()).sum();
             // The count never drops below 2: the merge routes rows by their
             // hash's top `log2(partitions)` bits, and a 0-bit partition id
             // has no valid shift (and no benefit over 2 near-empty jobs).
-            let volume_cap = (input_slots / MIN_MERGE_INPUT_SLOTS_PER_JOB)
+            let volume_cap = (input_entries / MIN_MERGE_INPUT_SLOTS_PER_JOB)
                 .max(2)
                 .next_power_of_two();
             let groups_per_target = ((MERGE_TARGET_SLOTS as f64 * MAX_LOAD_FACTOR) as usize).max(1);
@@ -577,9 +573,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         let push_job = |injector: &Injector<PartitionJob<K, V>>,
                         index: usize,
                         cross_node_merge: Option<Arc<CrossNodeMerge<K, V>>>,
-                        tables: Arc<Vec<SealedTable<K::Persisted, V>>>| {
+                        runs: Arc<Vec<DenseRun<K::Persisted, V>>>| {
             injector.push(PartitionJob {
-                tables,
+                runs,
                 index,
                 cross_node_merge,
                 key_arena: self.key_arena.clone(),
@@ -603,7 +599,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
             // partition's full distinct count. A per-node share would
             // guarantee a mid-merge resize; the full size only costs
             // transient memory the final cross-node merge frees.
-            let tables_by_node: Vec<_> = tables_by_node.into_iter().map(Arc::new).collect();
+            let runs_by_node: Vec<_> = runs_by_node.into_iter().map(Arc::new).collect();
             for i in 0..num_partitions {
                 let cross_node_merge = Arc::new(CrossNodeMerge::new(node_count));
                 for (node, injector) in self.injectors.iter().enumerate() {
@@ -611,16 +607,16 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
                         injector,
                         i,
                         Some(cross_node_merge.clone()),
-                        tables_by_node[node].clone(),
+                        runs_by_node[node].clone(),
                     );
                 }
             }
         } else {
             // One job per partition over every node's sources, spread across
             // the node queues so all workers share the load.
-            let tables = Arc::new(tables_by_node.into_iter().flatten().collect::<Vec<_>>());
+            let runs = Arc::new(runs_by_node.into_iter().flatten().collect::<Vec<_>>());
             for i in 0..num_partitions {
-                push_job(&self.injectors[i % node_count], i, None, tables.clone());
+                push_job(&self.injectors[i % node_count], i, None, runs.clone());
             }
         }
 

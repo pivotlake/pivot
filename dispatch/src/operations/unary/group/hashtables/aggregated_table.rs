@@ -176,8 +176,10 @@ pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue + ?Sized> 
     /// The NUMA node whose worker flushed this output; the merge groups
     /// sources by it.
     pub node: usize,
-    /// Every table this worker filled, each sealed with its hash-ordered run.
-    pub tables: Vec<SealedTable<K::Persisted, V>>,
+    /// Every group entry this worker produced, consolidated into one
+    /// bucket-grouped dense run (worker-internal repeats included; the merge
+    /// combines them).
+    pub run: super::DenseRun<K::Persisted, V>,
     /// Distinct-count sketch over the worker's rows, for sizing the merge targets.
     pub hll: Hll,
     /// `K::DEDUP_BY_HASH` only: this worker saw the (single) key whose bijective
@@ -383,15 +385,23 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
 
     /// Finishes worker state for the merge phase.
     pub fn flush(mut self) -> AggregatedTableOutput<K, V> {
-        // Retired tables were folded in as they were replaced; the active one
-        // still has to be counted.
+        // Retired tables were folded into the sketch as they were sealed; the
+        // active one still has to be counted and sealed.
         self.key_arena.flush();
         self.worker_context.flush();
         let mut tables = self.sealed;
         tables.push(SealedTable::seal(self.active, &mut self.hll));
+        // Consolidating the stack into one dense run keeps the merge's
+        // fan-in at the worker count and drops the tables' empty slots; the
+        // tables are freed here, as soon as their entries are copied out.
+        let run = super::DenseRun::consolidate(
+            &tables,
+            &mut self.allocator,
+            V::storage_metadata(&self.shared_context),
+        );
         AggregatedTableOutput {
             node: crate::worker::current_node(),
-            tables,
+            run,
             hll: self.hll,
             zero_hash_seen: self.zero_hash_seen,
         }

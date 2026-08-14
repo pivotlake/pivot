@@ -1,18 +1,18 @@
 //! Partition-parallel merge of GROUP BY partial results.
 //!
-//! High hash bits select the merge partition, and every sealed table carries
-//! a bucket-grouped run of its occupied slots, so a partition's share of each
-//! table is one contiguous slice of that run. Each merge job walks its slice
-//! of every source densely and folds the entries into one target table: the
-//! partition's final result. No slot is ever tested for occupancy or
-//! partition membership, and the nearly slot-ordered slices keep both the
-//! source reads and the target's probed range sweeping left to right.
+//! High hash bits select the merge partition, and every worker's flush
+//! consolidates its table stack into one bucket-grouped [`DenseRun`], so a
+//! partition's share of each worker is one contiguous byte range. Each merge
+//! job reads worker-count sources sequentially and folds their entries into
+//! one target table: the partition's final result. No slot is ever tested
+//! for occupancy or partition membership, and the nearly hash-ordered slices
+//! keep the target's probed range sweeping left to right.
 
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::{
-    AggregationValue, BUCKET_BITS, DEFAULT_CAPACITY, MAX_LOAD_FACTOR, MultiSlabTable, PersistedKey,
-    Prober, SealedTable, TableReader,
+    AggregationValue, BUCKET_BITS, DEFAULT_CAPACITY, DenseRun, MAX_LOAD_FACTOR, MultiSlabTable,
+    PersistedKey, Prober, TableReader,
 };
 use crate::operations::unary::group::keys::StoredKey;
 use crate::operations::unary::group::values::ArityBody;
@@ -40,20 +40,18 @@ fn resize_if_needed<KP: PersistedKey, V: AggregationValue + ?Sized>(
     target.resize_on_collisions(allocator, RESIZE_COLLISION_RATIO as usize);
 }
 
-/// Folds one sealed table's run slice `[from, to)` into `target`.
+/// Folds one dense run's slice `[from, to)` into `target`.
 ///
-/// The slice is dense: only occupied entries, all belonging to this
-/// partition, in nearly ascending slot order. Each batch is gathered first
-/// (reading the source close to sequentially and prefetching every target
-/// slot it will probe), then folded, so the fold's probes land on lines whose
-/// fetch started a batch earlier.
+/// The slice is a contiguous byte range holding only this partition's
+/// entries. Each batch is gathered first (reading the source sequentially
+/// and prefetching every target slot it will probe), then folded, so the
+/// fold's probes land on lines whose fetch started a batch earlier.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn merge_run_slice<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
     allocator: &mut SlabAllocator,
     arena: &SharedArena,
     reader: &TableReader<'_, S::Persisted, V>,
-    positions: *const u32,
     from: usize,
     to: usize,
     target: &mut Prober<'_, S::Persisted, V>,
@@ -63,9 +61,8 @@ fn merge_run_slice<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
     let mut i = from;
     while i < to {
         let batch_len = (to - i).min(FOLD_BATCH);
-        for (j, slot_index) in (i..i + batch_len).enumerate() {
-            let slot = unsafe { *positions.add(slot_index) } as usize;
-            let entry = reader.entry_ptr(slot) as *const u8;
+        for (j, index) in (i..i + batch_len).enumerate() {
+            let entry = reader.entry_ptr(index) as *const u8;
             let hash = reader.hash_of(entry);
             batch[j] = (entry, hash);
             target.prefetch(hash);
@@ -88,10 +85,10 @@ fn merge_run_slice<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
     }
 }
 
-/// Merges one partition's share of every source table.
+/// Merges one partition's share of every worker's run.
 pub(super) fn merge_combined<S: StoredKey, V: AggregationValue + ?Sized>(
     partition: usize,
-    tables: &[SealedTable<S::Persisted, V>],
+    runs: &[DenseRun<S::Persisted, V>],
     partition_capacity: usize,
     num_partitions: usize,
     key_arena: &SharedArena,
@@ -102,7 +99,7 @@ pub(super) fn merge_combined<S: StoredKey, V: AggregationValue + ?Sized>(
         V::storage_metadata(context),
         MergeCombined::<S, V> {
             partition,
-            tables,
+            runs,
             partition_capacity,
             num_partitions,
             key_arena,
@@ -114,7 +111,7 @@ pub(super) fn merge_combined<S: StoredKey, V: AggregationValue + ?Sized>(
 /// State passed through arity dispatch for one partition merge.
 struct MergeCombined<'a, S: StoredKey, V: AggregationValue + ?Sized> {
     partition: usize,
-    tables: &'a [SealedTable<S::Persisted, V>],
+    runs: &'a [DenseRun<S::Persisted, V>],
     partition_capacity: usize,
     num_partitions: usize,
     key_arena: &'a SharedArena,
@@ -128,7 +125,7 @@ impl<S: StoredKey, V: AggregationValue + ?Sized> ArityBody<MultiSlabTable<S::Per
     fn run<const N: usize>(self) -> MultiSlabTable<S::Persisted, V> {
         let MergeCombined {
             partition,
-            tables,
+            runs,
             partition_capacity,
             num_partitions,
             key_arena,
@@ -136,7 +133,7 @@ impl<S: StoredKey, V: AggregationValue + ?Sized> ArityBody<MultiSlabTable<S::Per
         } = self;
         merge_combined_rows::<N, S, V>(
             partition,
-            tables,
+            runs,
             partition_capacity,
             num_partitions,
             key_arena,
@@ -151,7 +148,7 @@ impl<S: StoredKey, V: AggregationValue + ?Sized> ArityBody<MultiSlabTable<S::Per
 /// writes, keeping shared state outside the inner loops.
 fn merge_combined_rows<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
     partition: usize,
-    tables: &[SealedTable<S::Persisted, V>],
+    runs: &[DenseRun<S::Persisted, V>],
     partition_capacity: usize,
     num_partitions: usize,
     key_arena: &SharedArena,
@@ -179,16 +176,15 @@ fn merge_combined_rows<const N: usize, S: StoredKey, V: AggregationValue + ?Size
             result.prober_with_metadata(V::metadata_for_arity::<N>())
         };
 
-        for sealed in tables {
-            let (from, to) = sealed.run.bucket_range(bucket_lo, bucket_hi);
+        for run in runs {
+            let (from, to) = run.bucket_range(bucket_lo, bucket_hi);
             if from == to {
                 continue;
             }
             merge_run_slice::<N, S, V>(
                 &mut allocator,
                 key_arena,
-                &sealed.table.reader::<N>(),
-                sealed.run.positions_ptr(),
+                &run.reader::<N>(),
                 from,
                 to,
                 &mut target,
@@ -248,9 +244,8 @@ mod tests {
     use crate::RECORD_BATCH_SIZE;
     use crate::memory::init_test_free_pool;
     use crate::operations::unary::group::arena::SharedArena;
-    use crate::operations::unary::group::hashtables::{
-        AggregatedTable, AggregatedTableOutput, SpillConfig,
-    };
+    use crate::operations::unary::group::hashtables::{AggregatedTable, SealedTable, SpillConfig};
+    use crate::operations::unary::group::hll::Hll;
     use crate::operations::unary::group::keys::{InlineKey, IntKeyExtractor};
     use crate::operations::unary::group::values::{
         AggregationKind, AggregationSlot, AggregationValue, Compiled, CountSlot,
@@ -270,20 +265,20 @@ mod tests {
     type CountValue = Compiled<(CountSlot,), u8>;
     const COUNT_CFG: <CountValue as AggregationValue>::SharedContext = ();
 
-    fn make_worker_tables(
+    fn make_worker_run(
         state: &RandomState,
         arena: &Arc<SharedArena>,
         values: &[i32],
-    ) -> Vec<SealedTable<i32, CountValue>> {
-        make_worker_tables_with_spill(state, arena, values, SpillConfig::DEFAULT)
+    ) -> DenseRun<i32, CountValue> {
+        make_worker_run_with_spill(state, arena, values, SpillConfig::DEFAULT)
     }
 
-    fn make_worker_tables_with_spill(
+    fn make_worker_run_with_spill(
         state: &RandomState,
         arena: &Arc<SharedArena>,
         values: &[i32],
         spill: SpillConfig,
-    ) -> Vec<SealedTable<i32, CountValue>> {
+    ) -> DenseRun<i32, CountValue> {
         let mut agg = AggregatedTable::<IntExtractor, CountValue>::new(
             state.clone(),
             arena.clone(),
@@ -307,21 +302,21 @@ mod tests {
                 &COUNT_CFG,
             );
         }
-        agg.flush().tables
+        agg.flush().run
     }
 
     fn merge_all_partitions(
-        tables: &[SealedTable<i32, CountValue>],
+        runs: &[DenseRun<i32, CountValue>],
         arena: &SharedArena,
     ) -> Vec<(i32, usize)> {
-        let total_cap: usize = tables.iter().map(|t| t.table.capacity()).sum::<usize>() / 2;
-        let partition_cap = (total_cap / PARTITIONS).max(1).next_power_of_two();
+        let total: usize = runs.iter().map(|run| run.len()).sum();
+        let partition_cap = (total / PARTITIONS).max(1).next_power_of_two();
 
         let mut all_entries = vec![];
         for p in 0..PARTITIONS {
             let result = merge_combined::<IntStored, CountValue>(
                 p,
-                tables,
+                runs,
                 partition_cap,
                 PARTITIONS,
                 arena,
@@ -340,9 +335,9 @@ mod tests {
         init_test_free_pool(64);
         let arena = SharedArena::new(64);
         let state = RandomState::new();
-        let tables = make_worker_tables(&state, &arena, &[1, 2, 3, 4, 5]);
+        let runs = vec![make_worker_run(&state, &arena, &[1, 2, 3, 4, 5])];
 
-        let entries = merge_all_partitions(&tables, &arena);
+        let entries = merge_all_partitions(&runs, &arena);
 
         assert_eq!(entries.len(), 5);
         for (key, count) in &entries {
@@ -355,10 +350,12 @@ mod tests {
         init_test_free_pool(64);
         let arena = SharedArena::new(64);
         let state = RandomState::new();
-        let mut tables = make_worker_tables(&state, &arena, &[1, 2, 3]);
-        tables.extend(make_worker_tables(&state, &arena, &[4, 5, 6]));
+        let runs = vec![
+            make_worker_run(&state, &arena, &[1, 2, 3]),
+            make_worker_run(&state, &arena, &[4, 5, 6]),
+        ];
 
-        let entries = merge_all_partitions(&tables, &arena);
+        let entries = merge_all_partitions(&runs, &arena);
 
         assert_eq!(entries.len(), 6);
     }
@@ -368,10 +365,12 @@ mod tests {
         init_test_free_pool(64);
         let arena = SharedArena::new(64);
         let state = RandomState::new();
-        let mut tables = make_worker_tables(&state, &arena, &[1, 2, 3]);
-        tables.extend(make_worker_tables(&state, &arena, &[2, 3, 4]));
+        let runs = vec![
+            make_worker_run(&state, &arena, &[1, 2, 3]),
+            make_worker_run(&state, &arena, &[2, 3, 4]),
+        ];
 
-        let entries = merge_all_partitions(&tables, &arena);
+        let entries = merge_all_partitions(&runs, &arena);
 
         assert_eq!(entries.len(), 4);
         let count_for = |k: i32| entries.iter().find(|(key, _)| *key == k).unwrap().1;
@@ -382,13 +381,13 @@ mod tests {
     }
 
     #[test]
-    fn empty_tables_produce_no_entries() {
+    fn empty_runs_produce_no_entries() {
         init_test_free_pool(64);
         let arena = SharedArena::new(64);
         let state = RandomState::new();
-        let tables = make_worker_tables(&state, &arena, &[]);
+        let runs = vec![make_worker_run(&state, &arena, &[])];
 
-        let entries = merge_all_partitions(&tables, &arena);
+        let entries = merge_all_partitions(&runs, &arena);
 
         assert_eq!(entries.len(), 0);
     }
@@ -398,12 +397,11 @@ mod tests {
         init_test_free_pool(64);
         let arena = SharedArena::new(64);
         let state = RandomState::new();
-        let mut tables = vec![];
-        for _ in 0..8 {
-            tables.extend(make_worker_tables(&state, &arena, &[10, 20, 30]));
-        }
+        let runs: Vec<_> = (0..8)
+            .map(|_| make_worker_run(&state, &arena, &[10, 20, 30]))
+            .collect();
 
-        let entries = merge_all_partitions(&tables, &arena);
+        let entries = merge_all_partitions(&runs, &arena);
 
         assert_eq!(entries.len(), 3);
         for (_, count) in &entries {
@@ -417,16 +415,14 @@ mod tests {
         let arena = SharedArena::new(64);
         let state = RandomState::new();
         let values: Vec<i32> = (0..200).collect();
-        let tables = make_worker_tables(&state, &arena, &values);
+        let runs = vec![make_worker_run(&state, &arena, &values)];
 
-        let total_cap: usize = tables.iter().map(|t| t.table.capacity()).sum::<usize>() / 2;
-        let partition_cap = (total_cap / PARTITIONS).max(1).next_power_of_two();
         let mut total = 0;
         for p in 0..PARTITIONS {
             let result = merge_combined::<IntStored, CountValue>(
                 p,
-                &tables,
-                partition_cap,
+                &runs,
+                DEFAULT_CAPACITY,
                 PARTITIONS,
                 &arena,
                 &COUNT_CFG,
@@ -438,53 +434,35 @@ mod tests {
     }
 
     #[test]
-    fn mixed_size_tables_merge_correctly() {
-        init_test_free_pool(64);
-        let arena = SharedArena::new(64);
-        let state = RandomState::new();
-        let small = make_worker_tables(&state, &arena, &[1, 2]);
-        let big_values: Vec<i32> = (0..500).collect();
-        let big = make_worker_tables(&state, &arena, &big_values);
-        let mut tables = small;
-        tables.extend(big);
-
-        let entries = merge_all_partitions(&tables, &arena);
-
-        assert_eq!(entries.len(), 500);
-        let count_for = |k: i32| entries.iter().find(|(key, _)| *key == k).unwrap().1;
-        assert_eq!(count_for(1), 2);
-        assert_eq!(count_for(2), 2);
-        assert_eq!(count_for(499), 1);
-    }
-
-    #[test]
     fn duplicates_within_single_worker_carry_through_merge() {
         init_test_free_pool(64);
         let arena = SharedArena::new(64);
         let state = RandomState::new();
-        let tables = make_worker_tables(&state, &arena, &[5, 5, 5, 5, 5]);
+        let runs = vec![make_worker_run(&state, &arena, &[5, 5, 5, 5, 5])];
 
-        let entries = merge_all_partitions(&tables, &arena);
+        let entries = merge_all_partitions(&runs, &arena);
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0], (5, 5));
     }
 
     #[test]
-    fn stacked_tables_recombine_across_and_within_workers() {
+    fn consolidation_carries_a_workers_stacked_tables() {
         init_test_free_pool(64);
         let arena = SharedArena::new(64);
         let state = RandomState::new();
         let spill = SpillConfig {
             spill_capacity: 256,
         };
+        // Each key appears twice, spread across the stack the small capacity
+        // forces; the merge must combine the per-table partials.
         let values: Vec<i32> = (0..500).chain(0..500).collect();
-        let mut tables = make_worker_tables_with_spill(&state, &arena, &values, spill);
-        tables.extend(make_worker_tables_with_spill(
-            &state, &arena, &values, spill,
-        ));
+        let runs = vec![
+            make_worker_run_with_spill(&state, &arena, &values, spill),
+            make_worker_run_with_spill(&state, &arena, &values, spill),
+        ];
 
-        let entries = merge_all_partitions(&tables, &arena);
+        let entries = merge_all_partitions(&runs, &arena);
 
         assert_eq!(entries.len(), 500);
         assert!(entries.iter().all(|&(_, count)| count == 4));
@@ -499,8 +477,8 @@ mod tests {
         init_test_free_pool(64);
         let arena = SharedArena::new(64);
         let state = RandomState::new();
-        let node_a = make_worker_tables(&state, &arena, &[1, 2, 3]);
-        let node_b = make_worker_tables(&state, &arena, &[2, 3, 4]);
+        let node_a = vec![make_worker_run(&state, &arena, &[1, 2, 3])];
+        let node_b = vec![make_worker_run(&state, &arena, &[2, 3, 4])];
 
         let mut entries = vec![];
         for p in 0..PARTITIONS {
@@ -528,19 +506,24 @@ mod tests {
         assert_eq!(entries, vec![(1, 1), (2, 2), (3, 2), (4, 1)]);
     }
 
-    /// Build a sealed table directly from `(hash, key)` pairs, bypassing the
-    /// extractor so tests control hash collisions and extreme hash values.
-    fn sealed_from_pairs(pairs: &[(u64, i32)]) -> SealedTable<i32, CountValue> {
-        let mut allocator = SlabAllocator::new(true);
-        let mut table: MultiSlabTable<i32, CountValue> =
-            MultiSlabTable::new(&mut allocator, 128, 0, &());
-        for &(hash, key) in pairs {
-            table
-                .prober()
-                .merge_from::<false, _>(hash, key, &seeded_count(), &());
+    /// Consolidate hand-built tables of `(hash, key)` pairs into one worker
+    /// run, bypassing the extractor so tests control hash collisions and
+    /// extreme hash values.
+    fn run_from_pair_tables(tables: &[&[(u64, i32)]]) -> DenseRun<i32, CountValue> {
+        let mut allocator = crate::memory::SlabAllocator::new(true);
+        let mut sealed = vec![];
+        for pairs in tables {
+            let mut table: MultiSlabTable<i32, CountValue> =
+                MultiSlabTable::new(&mut allocator, 128, 0, &());
+            for &(hash, key) in *pairs {
+                table
+                    .prober()
+                    .merge_from::<false, _>(hash, key, &seeded_count(), &());
+            }
+            let run = table.build_sorted_run(&mut Hll::new());
+            sealed.push(SealedTable { table, run });
         }
-        let run = table.build_sorted_run(&mut crate::operations::unary::group::hll::Hll::new());
-        SealedTable { table, run }
+        DenseRun::consolidate(&sealed, &mut allocator, ())
     }
 
     /// A `CountValue` holding a count of one, as one consumed row seeds it.
@@ -550,13 +533,13 @@ mod tests {
         value
     }
 
-    fn collect_all_from(tables: &[SealedTable<i32, CountValue>]) -> Vec<(i32, usize)> {
+    fn collect_all_from(runs: &[DenseRun<i32, CountValue>]) -> Vec<(i32, usize)> {
         let arena = SharedArena::new(64);
         let mut entries = vec![];
         for p in 0..PARTITIONS {
             let result = merge_combined::<IntStored, CountValue>(
                 p,
-                tables,
+                runs,
                 DEFAULT_CAPACITY,
                 PARTITIONS,
                 &arena,
@@ -573,29 +556,42 @@ mod tests {
     #[test]
     fn same_hash_distinct_keys_stay_distinct_groups() {
         init_test_free_pool(64);
-        // Three tables hold hash 42: two with key 1, one with key 2. The
+        // Three sources hold hash 42: two with key 1, one with key 2. The
         // merged output must combine the key-1 partials and keep key 2
         // separate.
-        let tables = vec![
-            sealed_from_pairs(&[(42, 1)]),
-            sealed_from_pairs(&[(42, 2)]),
-            sealed_from_pairs(&[(42, 1)]),
+        let runs = vec![
+            run_from_pair_tables(&[&[(42, 1)]]),
+            run_from_pair_tables(&[&[(42, 2)]]),
+            run_from_pair_tables(&[&[(42, 1)]]),
         ];
 
-        let entries = collect_all_from(&tables);
+        let entries = collect_all_from(&runs);
 
         assert_eq!(entries, vec![(1, 2), (2, 1)]);
     }
 
     #[test]
-    fn extreme_hash_values_merge_in_the_last_partition() {
+    fn same_hash_partials_within_one_worker_combine() {
         init_test_free_pool(64);
-        let tables = vec![
-            sealed_from_pairs(&[(u64::MAX, 7), (1, 9)]),
-            sealed_from_pairs(&[(u64::MAX, 7), (u64::MAX - 1, 8)]),
+        // One worker's stack holds the same (hash, key) twice plus a
+        // colliding distinct key; consolidation keeps all three entries and
+        // the fold combines exactly the matching ones.
+        let runs = vec![run_from_pair_tables(&[&[(42, 1), (42, 2)], &[(42, 1)]])];
+
+        let entries = collect_all_from(&runs);
+
+        assert_eq!(entries, vec![(1, 2), (2, 1)]);
+    }
+
+    #[test]
+    fn extreme_hash_values_land_in_the_last_partition() {
+        init_test_free_pool(64);
+        let runs = vec![
+            run_from_pair_tables(&[&[(u64::MAX, 7), (1, 9)]]),
+            run_from_pair_tables(&[&[(u64::MAX, 7), (u64::MAX - 1, 8)]]),
         ];
 
-        let entries = collect_all_from(&tables);
+        let entries = collect_all_from(&runs);
 
         assert_eq!(entries, vec![(7, 2), (8, 1), (9, 1)]);
     }
@@ -604,19 +600,18 @@ mod tests {
     fn runs_group_wrapped_entries_into_their_hash_buckets() {
         init_test_free_pool(64);
         // Hashes near u64::MAX probe past the last slot and wrap to slot 0;
-        // the run must still deliver every entry inside its hash bucket, in
-        // ascending bucket order.
+        // the consolidated run must still deliver every entry inside its hash
+        // bucket, in ascending bucket order.
         let pairs: Vec<(u64, i32)> = (0..40)
             .map(|i| (u64::MAX - i as u64, i as i32))
             .chain((1..40).map(|i| (i as u64, 100 + i as i32)))
             .collect();
-        let sealed = sealed_from_pairs(&pairs);
+        let run = run_from_pair_tables(&[&pairs]);
 
-        let reader = sealed.table.reader::<0>();
+        let reader = run.reader::<0>();
         let mut previous_bucket = 0u64;
-        for i in 0..sealed.run.len() {
-            let slot = unsafe { *sealed.run.positions_ptr().add(i) } as usize;
-            let bucket = reader.hash_of(reader.entry_ptr(slot)) >> (64 - BUCKET_BITS);
+        for i in 0..run.len() {
+            let bucket = reader.hash_of(reader.entry_ptr(i)) >> (64 - BUCKET_BITS);
             assert!(
                 bucket >= previous_bucket,
                 "run out of bucket order at {}",
@@ -624,61 +619,27 @@ mod tests {
             );
             previous_bucket = bucket;
         }
-        assert_eq!(sealed.run.len(), pairs.len());
-    }
-
-    /// Feed `values` through a worker in batch-sized chunks and hand back its
-    /// finalized output.
-    fn make_worker_output(
-        state: &RandomState,
-        arena: &Arc<SharedArena>,
-        values: &[i32],
-    ) -> AggregatedTableOutput<IntExtractor, CountValue> {
-        let mut agg = AggregatedTable::<IntExtractor, CountValue>::new(
-            state.clone(),
-            arena.clone(),
-            (),
-            (),
-            SpillConfig::DEFAULT,
-        );
-        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
-        // Consume one batch at a time because hash scratch has a fixed size.
-        for chunk in values.chunks(RECORD_BATCH_SIZE) {
-            let array: ArrayRef = Arc::new(Int32Array::from(chunk.to_vec()));
-            let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
-            agg.consume_batch(
-                &batch,
-                &[0],
-                &[AggregationSlot::new(
-                    AggregationKind::CountStar,
-                    0,
-                    DataType::Int64,
-                )],
-                &(),
-                &COUNT_CFG,
-            );
-        }
-        agg.flush()
+        assert_eq!(run.len(), pairs.len());
     }
 
     /// The merge routes by run buckets at `num_partitions` granularity, which
     /// can be finer than a small table's slot count ever resolved. Each key
     /// must still land in exactly one partition with the right count.
     #[test]
-    fn slot_range_merge_finer_than_table() {
+    fn bucket_merge_finer_than_table() {
         init_test_free_pool(64);
         let arena = SharedArena::new(64);
         let state = RandomState::new();
         let n = 200i32;
         let values: Vec<i32> = (0..n).chain(0..n).collect(); // each key twice
-        let out = make_worker_output(&state, &arena, &values);
+        let runs = vec![make_worker_run(&state, &arena, &values)];
         let num_partitions = 256;
         let mut occurrences = vec![0usize; n as usize];
         let mut counts = vec![0usize; n as usize];
         for p in 0..num_partitions {
             let result = merge_combined::<IntStored, CountValue>(
                 p,
-                &out.tables,
+                &runs,
                 DEFAULT_CAPACITY,
                 num_partitions,
                 &arena,

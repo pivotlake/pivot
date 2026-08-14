@@ -74,7 +74,6 @@ impl SortedRun {
     }
 
     /// Number of entries in the run.
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.positions.len()
     }

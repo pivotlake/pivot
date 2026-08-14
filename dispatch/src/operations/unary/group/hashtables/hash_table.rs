@@ -117,7 +117,7 @@ pub(super) fn fast_div(n: usize, m: u64) -> usize {
 /// With these bases, an entry address is `bases[slab] + index * stride`.
 /// Adjusted addresses may numerically precede an allocation, but only the
 /// reconstructed in-bounds address is dereferenced.
-fn adjusted_bases(slabs: &[Slab], entries_per_slab: usize, stride: usize) -> Vec<usize> {
+pub(super) fn adjusted_bases(slabs: &[Slab], entries_per_slab: usize, stride: usize) -> Vec<usize> {
     slabs
         .iter()
         .enumerate()
