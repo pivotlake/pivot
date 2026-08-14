@@ -194,7 +194,12 @@ impl<KP: super::PersistedKey, V: AggregationValue + ?Sized> SealedTable<KP, V> {
 /// them into one dense run so the merge visits one source per worker.
 pub enum MergeSource<KP: super::PersistedKey, V: AggregationValue + ?Sized> {
     Sealed(SealedTable<KP, V>),
-    Dense(super::DenseRun<KP, V>),
+    /// A stacked worker's tables, kept alive and read in place, with one
+    /// consolidated routing-stub run over all of them.
+    Stubs {
+        tables: Vec<MultiSlabTable<KP, V>>,
+        run: super::StubRun,
+    },
 }
 
 impl<KP: super::PersistedKey, V: AggregationValue + ?Sized> MergeSource<KP, V> {
@@ -202,7 +207,7 @@ impl<KP: super::PersistedKey, V: AggregationValue + ?Sized> MergeSource<KP, V> {
     pub fn len(&self) -> usize {
         match self {
             MergeSource::Sealed(sealed) => sealed.run.len(),
-            MergeSource::Dense(run) => run.len(),
+            MergeSource::Stubs { run, .. } => run.len(),
         }
     }
 
@@ -210,7 +215,7 @@ impl<KP: super::PersistedKey, V: AggregationValue + ?Sized> MergeSource<KP, V> {
     pub fn bucket_bits(&self) -> u32 {
         match self {
             MergeSource::Sealed(sealed) => sealed.run.bucket_bits(),
-            MergeSource::Dense(run) => run.bucket_bits(),
+            MergeSource::Stubs { run, .. } => run.bucket_bits(),
         }
     }
 }
@@ -427,24 +432,20 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
     pub fn flush(mut self) -> AggregatedTableOutput<K, V> {
         self.key_arena.flush();
         self.worker_context.flush();
-        // Sealing and consolidation both fold every entry's hash into the
-        // sketch. The sketch is idempotent per hash, so a key recurring in
-        // several tables is counted once and the merged estimate is the true
-        // distinct count.
+        // Sealing and stub consolidation both fold every entry's hash into
+        // the sketch. The sketch is idempotent per hash, so a key recurring
+        // in several tables is counted once and the merged estimate is the
+        // true distinct count.
         let source = if self.retired.is_empty() {
             MergeSource::Sealed(SealedTable::seal(self.active, &mut self.hll))
         } else {
             let mut tables = self.retired;
             tables.push(self.active);
-            // Consolidating the stack into one dense run keeps the merge's
-            // fan-in at the worker count and drops the tables' empty slots;
-            // the tables are freed here, once their entries are copied out.
-            MergeSource::Dense(super::DenseRun::consolidate(
-                &tables,
-                &mut self.allocator,
-                V::storage_metadata(&self.shared_context),
-                &mut self.hll,
-            ))
+            // Consolidating the routing stubs keeps the merge's fan-in at
+            // the worker count while every key and value stays in the table
+            // it was aggregated into; the output reads them there.
+            let run = super::StubRun::consolidate(&tables, &mut self.allocator, &mut self.hll);
+            MergeSource::Stubs { tables, run }
         };
         AggregatedTableOutput {
             node: crate::worker::current_node(),

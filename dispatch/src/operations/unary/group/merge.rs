@@ -21,7 +21,7 @@
 
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::{
-    AggregationValue, BUCKET_BITS, DEFAULT_CAPACITY, LiveKey, MergeSource, PersistedKey,
+    AggregationValue, BUCKET_BITS, DEFAULT_CAPACITY, LiveKey, MergeSource, PersistedKey, Stub,
     TableReader, prefetch_l1_line,
 };
 use crate::operations::unary::group::keys::StoredKey;
@@ -309,6 +309,38 @@ fn fold_slice<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
     }
 }
 
+/// Folds one contiguous run of routing stubs into the reference table.
+///
+/// The stub stream already carries each entry's hash, so nothing reads the
+/// source tables here; each batch first warms the reference slots it will
+/// probe and the entries it references (for the rare key compare, and for
+/// the emit that follows this range), then folds.
+#[inline(always)]
+fn fold_stubs<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
+    reader: &TableReader<'_, S::Persisted, V>,
+    stubs: &[Stub],
+    table: &mut RefTable,
+    scratch: &mut ScratchValues,
+    key_arena: &SharedArena,
+    context: &V::SharedContext,
+) {
+    let mut i = 0;
+    while i < stubs.len() {
+        let batch_len = (stubs.len() - i).min(FOLD_BATCH);
+        for stub in &stubs[i..i + batch_len] {
+            table.prefetch(stub.hash);
+            prefetch_l1_line(stub.entry);
+        }
+        for stub in &stubs[i..i + batch_len] {
+            fold_entry::<N, S, V>(
+                reader, stub.entry, stub.hash, table, scratch, key_arena, context,
+            );
+            table.resize_if_needed();
+        }
+        i += batch_len;
+    }
+}
+
 /// Inserts one source entry: seeds an empty slot with a reference, or folds
 /// the value into the matching group's scratch accumulator.
 #[inline(always)]
@@ -414,7 +446,7 @@ where
     let mut table = RefTable::new(step_capacity, step_bits);
     let mut scratch = ScratchValues::new(V::stored_size(metadata), V::stored_align());
     let Some(layout) = sources.first().map(|source| match source {
-        MergeSource::Dense(run) => run.reader::<N>(),
+        MergeSource::Stubs { tables, .. } => tables[0].reader::<N>(),
         MergeSource::Sealed(sealed) => sealed.table.reader::<N>(),
     }) else {
         return Ok(());
@@ -424,22 +456,22 @@ where
         let hi = lo + step_width;
         for source in sources {
             match source {
-                MergeSource::Dense(run) => {
+                MergeSource::Stubs { tables, run } => {
                     let (from, to) = run.bucket_range(lo, hi);
                     if from == to {
                         continue;
                     }
-                    let reader = run.reader::<N>();
-                    fold_slice::<N, S, V>(
-                        &reader,
-                        |index| reader.entry_ptr(index) as *const u8,
-                        from,
-                        to,
-                        &mut table,
-                        &mut scratch,
-                        key_arena,
-                        context,
-                    );
+                    let reader = tables[0].reader::<N>();
+                    run.slices(from, to, |stubs| {
+                        fold_stubs::<N, S, V>(
+                            &reader,
+                            stubs,
+                            &mut table,
+                            &mut scratch,
+                            key_arena,
+                            context,
+                        );
+                    });
                 }
                 MergeSource::Sealed(sealed) => {
                     let (from, to) = sealed.run.bucket_range(lo, hi);
@@ -496,7 +528,7 @@ mod tests {
     use crate::memory::{SlabAllocator, init_test_free_pool};
     use crate::operations::unary::group::arena::SharedArena;
     use crate::operations::unary::group::hashtables::{
-        AggregatedTable, DenseRun, MultiSlabTable, SpillConfig,
+        AggregatedTable, MultiSlabTable, SpillConfig, StubRun,
     };
     use crate::operations::unary::group::hll::Hll;
     use crate::operations::unary::group::keys::{InlineKey, IntKeyExtractor};
@@ -753,12 +785,8 @@ mod tests {
             }
             tables.push(table);
         }
-        MergeSource::Dense(DenseRun::consolidate(
-            &tables,
-            &mut allocator,
-            (),
-            &mut Hll::new(),
-        ))
+        let run = StubRun::consolidate(&tables, &mut allocator, &mut Hll::new());
+        MergeSource::Stubs { tables, run }
     }
 
     /// A `CountValue` holding a count of one, as one consumed row seeds it.
