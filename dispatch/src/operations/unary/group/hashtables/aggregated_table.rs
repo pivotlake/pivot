@@ -201,7 +201,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
 
             // Fixed-width keys scatter directly after the transition. Keys on
             // the abandon route continue through the in-place table.
-            if self.switched_to_radix && !K::RADIX_ABANDON {
+            if self.switched_to_radix && !K::RADIX_DEDUP_BEFORE_SCATTER {
                 self.scatter_range(0, length, &key_reader, &value_reader);
             } else {
                 self.consume_in_place(length, &key_reader, &value_reader, shared_context);
@@ -282,8 +282,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             );
         }
         self.switched_to_radix = true;
-        if K::RADIX_ABANDON {
-            self.abandon_active_table();
+        if K::RADIX_DEDUP_BEFORE_SCATTER {
+            self.scatter_active_table_to_radix_partitions();
             false
         } else {
             true
@@ -331,7 +331,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
 
     /// Moves the active table's partial groups into radix buffers and clears it.
     #[inline(always)]
-    fn abandon_active_table(&mut self) {
+    fn scatter_active_table_to_radix_partitions(&mut self) {
         let shift = u64::BITS - self.radix_config.partitions.trailing_zeros();
         let Self {
             tables,

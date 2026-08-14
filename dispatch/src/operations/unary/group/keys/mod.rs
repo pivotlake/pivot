@@ -51,18 +51,22 @@ pub use row::{RowKeyExtractor, RowKeySchema};
 /// Defines how to extract, compare, and output group keys for a particular key
 /// shape.
 pub trait KeyExtractor: Send + 'static {
-    /// Which radix route a key takes once its in-place table outgrows the
-    /// cache-resident size: `true` = *abandon* (keep deduplicating in the bounded
-    /// table, flushing each window's distinct partials to the partition buffers),
-    /// `false` = *scatter* (append raw rows to the partition buffers, dedup only
-    /// in the merge). Abandon pays off only when it avoids a per-occurrence
-    /// out-of-line copy (long string keys); fixed-width keys scatter's cheap
-    /// append wins, so this stays `false`.
+    /// Whether radix mode deduplicates keys before scattering them to partitions.
     ///
-    /// Radix applies to every key with real bytes to scatter. A key that dedups
-    /// purely by hash ([`DEDUP_BY_HASH`](Self::DEDUP_BY_HASH)) has none, so it
-    /// stays fully in-place regardless of this flag.
-    const RADIX_ABANDON: bool = false;
+    /// `true`: keep deduplicating in the bounded, cache-sized table. When it fills,
+    /// flush that window's distinct keys to the radix partitions, clear the table,
+    /// and continue.
+    ///
+    /// `false`: scatter every row directly to its radix partition and deduplicate
+    /// only during the merge.
+    ///
+    /// Deduplicating before scatter can avoid repeated out-of-line copies for long
+    /// string keys. For fixed-width keys, raw scattering is cheaper, so this is
+    /// `false`.
+    ///
+    /// Keys using [`DEDUP_BY_HASH`](Self::DEDUP_BY_HASH) have no key bytes to
+    /// scatter and remain fully in-place regardless of this setting.
+    const RADIX_DEDUP_BEFORE_SCATTER: bool = false;
 
     /// When `true`, the persisted key is a zero-sized `()` and dedup is purely by
     /// the (bijective) hash, so a hash of 0 — which the table reserves as its
