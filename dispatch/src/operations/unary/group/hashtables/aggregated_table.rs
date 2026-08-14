@@ -172,6 +172,10 @@ impl KeyMemo {
     }
 }
 
+/// A table retired at the spill capacity, alongside the per-bucket entry
+/// histogram counted while it was cache-warm.
+type RetiredTable<KP, V> = (MultiSlabTable<KP, V>, Vec<u32>);
+
 /// A retired table together with the bucket-grouped view the merge reads.
 pub struct SealedTable<KP: super::PersistedKey, V: AggregationValue + ?Sized> {
     pub table: MultiSlabTable<KP, V>,
@@ -243,7 +247,7 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// The table currently absorbing rows.
     active: MultiSlabTable<K::Persisted, V>,
     /// Tables retired at the spill capacity, consolidated at flush.
-    retired: Vec<MultiSlabTable<K::Persisted, V>>,
+    retired: Vec<RetiredTable<K::Persisted, V>>,
     /// Distinct-count sketch used to size merge targets.
     hll: Hll,
     /// Slot count at which tables stop growing.
@@ -420,30 +424,35 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             &mut self.active,
             BaseHashTable::new(&mut self.allocator, next_size, 0, &self.shared_context),
         );
-        self.retired.push(retired);
+        // Counting the histogram folds each entry's hash into the sketch.
+        // The sketch is idempotent per hash, so a key recurring in several
+        // tables is counted once and the merged estimate is the true
+        // distinct count.
+        let histogram = retired.bucket_histogram(&mut self.hll);
+        self.retired.push((retired, histogram));
     }
 
     /// Finishes worker state for the merge phase.
     pub fn flush(mut self) -> AggregatedTableOutput<K, V> {
         self.key_arena.flush();
         self.worker_context.flush();
-        // Sealing and consolidation both fold every entry's hash into the
-        // sketch. The sketch is idempotent per hash, so a key recurring in
-        // several tables is counted once and the merged estimate is the true
-        // distinct count.
         let source = if self.retired.is_empty() {
+            // Sealing folds every entry's hash into the sketch, like the
+            // retire-time histograms do for a stacked worker.
             MergeSource::Sealed(SealedTable::seal(self.active, &mut self.hll))
         } else {
-            let mut tables = self.retired;
+            let active_histogram = self.active.bucket_histogram(&mut self.hll);
+            let (mut tables, mut histograms): (Vec<_>, Vec<_>) = self.retired.into_iter().unzip();
             tables.push(self.active);
+            histograms.push(active_histogram);
             // Consolidating the stack into one dense run keeps the merge's
             // fan-in at the worker count and drops the tables' empty slots;
             // the tables are freed here, once their entries are copied out.
             MergeSource::Dense(super::DenseRun::consolidate(
                 &tables,
+                &histograms,
                 &mut self.allocator,
                 V::storage_metadata(&self.shared_context),
-                &mut self.hll,
             ))
         };
         AggregatedTableOutput {

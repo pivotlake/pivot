@@ -428,6 +428,31 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> BaseHashTable<K, V> {
         }
     }
 
+    /// Counts this table's entries per hash bucket at [`super::BUCKET_BITS`]
+    /// resolution, folding every stored hash into the worker's distinct-count
+    /// sketch on the way.
+    ///
+    /// Called as a table is retired, while its entries are still cache-warm,
+    /// so consolidation at flush only has to place entries, not count them.
+    pub fn bucket_histogram(&self, hll: &mut super::super::hll::Hll) -> Vec<u32> {
+        let reader = self.reader::<0>();
+        let bucket_shift = 64 - super::BUCKET_BITS;
+        let mut counts = vec![0u32; (1usize << super::BUCKET_BITS) + 1];
+        for slot in 0..self.capacity() {
+            let hash = reader.hash_of(reader.entry_ptr(slot));
+            // Count 0 absorbs the empty slots (hash 0 is the empty sentinel,
+            // which the sketch must not see); real buckets are offset by one,
+            // with no branch per slot.
+            let bucket = (hash >> bucket_shift) as usize;
+            counts[(bucket + 1) * (hash != 0) as usize] += 1;
+            if hash != 0 {
+                hll.add(hash);
+            }
+        }
+        counts[0] = 0;
+        counts
+    }
+
     /// Builds a bucket-grouped view of this table's occupied slots, folding
     /// every stored hash into the worker's distinct-count sketch on the way.
     pub fn build_sorted_run(&self, hll: &mut super::super::hll::Hll) -> super::SortedRun {

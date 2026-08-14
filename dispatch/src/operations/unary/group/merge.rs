@@ -576,11 +576,15 @@ mod tests {
             }
             tables.push(table);
         }
+        let histograms: Vec<Vec<u32>> = tables
+            .iter()
+            .map(|table| table.bucket_histogram(&mut Hll::new()))
+            .collect();
         MergeSource::Dense(DenseRun::consolidate(
             &tables,
+            &histograms,
             &mut allocator,
             (),
-            &mut Hll::new(),
         ))
     }
 
