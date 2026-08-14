@@ -46,7 +46,7 @@ mod merge;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_row::{OwnedRow, RowConverter, SortField};
@@ -154,19 +154,25 @@ enum MergeResultDestination {
 /// delivers the result onward.
 struct MergeNode {
     delivers_to: MergeResultDestination,
-    left: OnceLock<SortedRun>,
-    right: OnceLock<SortedRun>,
+    left: Mutex<Option<Arc<SortedRun>>>,
+    right: Mutex<Option<Arc<SortedRun>>>,
     /// How many of the two inputs have arrived; the worker delivering the
     /// second one plans the node's merge.
     inputs_delivered: AtomicUsize,
     /// Slices still to merge; the worker finishing the last one completes the
     /// node.
     slices_remaining: AtomicUsize,
-    /// Each slice's output chunk, in output order: the planning worker sets
-    /// the row of slots, each slice fills exactly its own, and the counter
-    /// above is the barrier that makes them all visible to the completer —
-    /// disjoint set-once writes, so no lock anywhere.
-    slice_results: OnceLock<Vec<OnceLock<RecordBatch>>>,
+    /// Each slice's output chunk, in output order: the planning worker sets the
+    /// row of slots, each slice fills exactly its own, and the counter above is
+    /// the barrier that makes them all visible to the completer — disjoint
+    /// set-once writes, so the lock is taken only to reach the row, never held
+    /// across a merge.
+    ///
+    /// Taken (not just read) at completion: the chunks are the same batches the
+    /// parent then holds as its input run, so a slot left set here would keep
+    /// every level of the tree resident for the whole sort rather than the two
+    /// levels a merge is actually working on.
+    slice_results: Mutex<Option<Vec<OnceLock<RecordBatch>>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -179,18 +185,40 @@ impl MergeNode {
     fn awaiting_children(delivers_to: MergeResultDestination) -> Self {
         Self {
             delivers_to,
-            left: OnceLock::new(),
-            right: OnceLock::new(),
+            left: Mutex::new(None),
+            right: Mutex::new(None),
             inputs_delivered: AtomicUsize::new(0),
             slices_remaining: AtomicUsize::new(0),
-            slice_results: OnceLock::new(),
+            slice_results: Mutex::new(None),
         }
     }
 
-    fn input(&self, side: ChildSide) -> &OnceLock<SortedRun> {
+    fn input(&self, side: ChildSide) -> &Mutex<Option<Arc<SortedRun>>> {
         match side {
             ChildSide::Left => &self.left,
             ChildSide::Right => &self.right,
+        }
+    }
+
+    /// This node's input run, as a handle the caller holds for as long as it
+    /// needs. The lock spans only the clone, so slice merges still run against
+    /// the run concurrently and lock-free.
+    fn run(&self, side: ChildSide) -> Arc<SortedRun> {
+        self.input(side)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("the input was delivered before it is read")
+    }
+
+    /// Let go of both input runs. Their rows have been gathered into this
+    /// node's output, so the only thing keeping them alive is the tree itself —
+    /// and the tree outlives the whole sort. Holding them would keep every
+    /// level of the merge resident at once, so a sort would cost its data times
+    /// the tree's depth rather than a couple of levels.
+    fn release_inputs(&self) {
+        for side in [ChildSide::Left, ChildSide::Right] {
+            *self.input(side).lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
     }
 }
@@ -390,15 +418,18 @@ impl SharedMergeState {
     ) -> Option<Vec<MergeSliceTask>> {
         let tree = self.forest.get().expect("delivery follows the build");
         let node = &tree.nodes[node_index];
-        node.input(side)
-            .set(run)
-            .unwrap_or_else(|_| unreachable!("each side is delivered exactly once"));
+        {
+            let mut slot = node.input(side).lock().unwrap_or_else(|e| e.into_inner());
+            assert!(slot.is_none(), "each side is delivered exactly once");
+            *slot = Some(Arc::new(run));
+        }
         if node.inputs_delivered.fetch_add(1, Ordering::AcqRel) + 1 < 2 {
             return None;
         }
 
-        let left = node.left.get().expect("both inputs delivered");
-        let right = node.right.get().expect("both inputs delivered");
+        let left = node.run(ChildSide::Left);
+        let right = node.run(ChildSide::Right);
+        let (left, right) = (left.as_ref(), right.as_ref());
         let selected = select_key_ordering(&self.order_by, left.chunks(), right.chunks())
             .expect("both runs share the input schema");
         let slices = with_key_ordering!(selected, |ordering| plan_merge_slices(
@@ -406,9 +437,11 @@ impl SharedMergeState {
             left,
             right
         ));
-        node.slice_results
-            .set((0..slices.len()).map(|_| OnceLock::new()).collect())
-            .unwrap_or_else(|_| unreachable!("only the second delivery plans"));
+        {
+            let mut results = node.slice_results.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(results.is_none(), "only the second delivery plans");
+            *results = Some((0..slices.len()).map(|_| OnceLock::new()).collect());
+        }
         node.slices_remaining.store(slices.len(), Ordering::Release);
         Some(
             slices
@@ -432,8 +465,9 @@ impl SharedMergeState {
     ) -> unary::Result<()> {
         let tree = self.forest.get().expect("tasks follow the build");
         let node = &tree.nodes[task.node];
-        let left = node.left.get().expect("planned nodes have both inputs");
-        let right = node.right.get().expect("planned nodes have both inputs");
+        let left = node.run(ChildSide::Left);
+        let right = node.run(ChildSide::Right);
+        let (left, right) = (left.as_ref(), right.as_ref());
 
         let selected = select_key_ordering(&self.order_by, left.chunks(), right.chunks())?;
         let mapping = with_key_ordering!(selected, |ordering| merge_slice_mapping(
@@ -458,7 +492,11 @@ impl SharedMergeState {
         }
         let merged = RecordBatch::try_new(schema, columns).map_err(unary::Error::from)?;
 
-        node.slice_results.get().expect("tasks follow the plan")[task.slice]
+        node.slice_results
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .expect("tasks follow the plan")[task.slice]
             .set(merged)
             .unwrap_or_else(|_| unreachable!("each slice completes once"));
         if node.slices_remaining.fetch_sub(1, Ordering::AcqRel) == 1
@@ -483,11 +521,17 @@ impl SharedMergeState {
         let node = &tree.nodes[node_index];
         let chunks: Vec<RecordBatch> = node
             .slice_results
-            .get()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
             .expect("completion follows the plan")
-            .iter()
-            .map(|slot| slot.get().expect("every slice finished").clone())
+            .into_iter()
+            .map(|slot| slot.into_inner().expect("every slice finished"))
             .collect();
+        // Every slice has written its output, so nothing will read the inputs
+        // again. Drop them here rather than with the tree, so a merge holds a
+        // couple of levels instead of all of them at once.
+        node.release_inputs();
         match node.delivers_to {
             MergeResultDestination::Node { node: parent, side } => {
                 self.deliver_run(parent, side, SortedRun::from_chunks(chunks))
