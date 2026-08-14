@@ -17,9 +17,11 @@ use crate::operations::unary::group::hll::Hll;
 
 /// Most hash-prefix bits a run's bucket index resolves.
 ///
-/// Fine enough that one bucket's slice of a large merge target stays inside
-/// L1 while every source folds into it.
-pub const BUCKET_BITS: u32 = 16;
+/// Fine enough that a large merge splits into cache-resident targets and
+/// folds them in cache-resident steps, while consolidation's per-bucket
+/// write cursors still fit in L2: at this resolution the placement pass
+/// keeps at most 8192 open write streams.
+pub const BUCKET_BITS: u32 = 13;
 
 /// Fewest hash-prefix bits a run's bucket index resolves. Bounds how far the
 /// merge can split the key space, so it stays above the partition floor a
