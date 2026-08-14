@@ -29,8 +29,9 @@ use duckdb_planner::handle::{
 use crate::catalog::BoundTable;
 use crate::expression::{Cast, Error as ExpressionError, Expression, Function, Ref, VariantGet};
 use crate::operator::{
-    Aggregate, Compact, CopyFromStdin, CreateSchema, CreateTable, CreateUser, Cte, CteScan,
-    Distinct, DropTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Insert, Join,
+    Aggregate, Compact, CopyFromStdin, CreateSchema, CreateTable, CreateUser, CrossJoin, Cte,
+    CteScan, Distinct, DropTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Insert,
+    Join,
     JoinKind, Limit, Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan,
     TopN, Values,
 };
@@ -188,6 +189,15 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         DuckOperator::Explain => Operator::Explain(Explain),
         DuckOperator::ComparisonJoin(join) => {
             return build_join(op, join, inputs);
+        }
+        DuckOperator::CrossProduct => {
+            if inputs.len() != 2 {
+                return Err(OperatorError::Unsupported(format!(
+                    "a cross product must have two inputs, got {}",
+                    inputs.len()
+                )));
+            }
+            Operator::CrossJoin(CrossJoin)
         }
         DuckOperator::CteRef(cte_ref) => {
             Operator::CteScan(ctx.create_cte_scan(cte_ref.cte_index()?)?)

@@ -274,6 +274,22 @@ impl PlanNode {
                 let build = inputs.remove(0);
                 o.compile(probe, build)
             }
+            crate::Operator::CrossJoin(o) => {
+                let left_types = self.inputs[0].output_types()?;
+                let left_nullability = self.inputs[0].output_nullability();
+                let right_types = self.inputs[1].output_types()?;
+                let right_nullability = self.inputs[1].output_nullability();
+                let left = inputs.remove(0);
+                let right = inputs.remove(0);
+                o.compile(
+                    left,
+                    right,
+                    &left_types,
+                    &left_nullability,
+                    &right_types,
+                    &right_nullability,
+                )
+            }
             crate::Operator::Cte(o) => {
                 let definition = inputs.remove(0);
                 let body = inputs.remove(0);
