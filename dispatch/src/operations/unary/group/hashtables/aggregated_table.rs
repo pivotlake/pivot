@@ -49,6 +49,20 @@ impl SpillConfig {
     pub const DEFAULT: Self = Self {
         spill_capacity: SPILL_CAPACITY,
     };
+
+    /// The default sizing, overridable for capacity sweeps via
+    /// `PIVOT_SPILL_CAPACITY` (a power-of-two slot count).
+    pub fn from_env() -> Self {
+        static SPILL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let spill_capacity = *SPILL.get_or_init(|| {
+            std::env::var("PIVOT_SPILL_CAPACITY")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|capacity| capacity.is_power_of_two())
+                .unwrap_or(Self::DEFAULT.spill_capacity)
+        });
+        Self { spill_capacity }
+    }
 }
 
 /// How many recently resolved keys a worker remembers.
@@ -158,7 +172,7 @@ impl KeyMemo {
     }
 }
 
-/// A retired table together with the hash-ordered view the merge reads.
+/// A retired table together with the bucket-grouped view the merge reads.
 pub struct SealedTable<KP: super::PersistedKey, V: AggregationValue + ?Sized> {
     pub table: MultiSlabTable<KP, V>,
     pub run: super::SortedRun,
@@ -171,15 +185,36 @@ impl<KP: super::PersistedKey, V: AggregationValue + ?Sized> SealedTable<KP, V> {
     }
 }
 
+/// One worker's merge input: its single table sealed in place, or its whole
+/// stack consolidated into a dense run.
+///
+/// A worker that never outgrew one table (the common low and mid cardinality
+/// case) hands the merge that table with a bucket-grouped slot view: one
+/// sealing pass, no entry copies. A worker that stacked tables consolidates
+/// them into one dense run so the merge visits one source per worker.
+pub enum MergeSource<KP: super::PersistedKey, V: AggregationValue + ?Sized> {
+    Sealed(SealedTable<KP, V>),
+    Dense(super::DenseRun<KP, V>),
+}
+
+impl<KP: super::PersistedKey, V: AggregationValue + ?Sized> MergeSource<KP, V> {
+    /// Number of entries this source contributes to the merge.
+    pub fn len(&self) -> usize {
+        match self {
+            MergeSource::Sealed(sealed) => sealed.run.len(),
+            MergeSource::Dense(run) => run.len(),
+        }
+    }
+}
+
 /// The tables and sizing data one worker produced.
 pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// The NUMA node whose worker flushed this output; the merge groups
     /// sources by it.
     pub node: usize,
-    /// Every group entry this worker produced, consolidated into one
-    /// bucket-grouped dense run (worker-internal repeats included; the merge
-    /// combines them).
-    pub run: super::DenseRun<K::Persisted, V>,
+    /// Every group entry this worker produced (worker-internal repeats
+    /// included; the merge combines them).
+    pub source: MergeSource<K::Persisted, V>,
     /// Distinct-count sketch over the worker's rows, for sizing the merge targets.
     pub hll: Hll,
     /// `K::DEDUP_BY_HASH` only: this worker saw the (single) key whose bijective
@@ -199,8 +234,8 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     allocator: SlabAllocator,
     /// The table currently absorbing rows.
     active: MultiSlabTable<K::Persisted, V>,
-    /// Tables retired at the spill capacity, each sealed with its sorted run.
-    sealed: Vec<SealedTable<K::Persisted, V>>,
+    /// Tables retired at the spill capacity, consolidated at flush.
+    retired: Vec<MultiSlabTable<K::Persisted, V>>,
     /// Distinct-count sketch used to size merge targets.
     hll: Hll,
     /// Slot count at which tables stop growing.
@@ -237,7 +272,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             worker_context,
             allocator,
             active: table,
-            sealed: Vec::new(),
+            retired: Vec::new(),
             hll: Hll::new(),
             spill_config,
             memo: KeyMemo::new(),
@@ -377,31 +412,35 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             &mut self.active,
             BaseHashTable::new(&mut self.allocator, next_size, 0, &self.shared_context),
         );
-        // Sealing folds each entry's hash into the sketch. The sketch is
-        // idempotent per hash, so a key recurring in a later table is counted
-        // once and the merged estimate is the true distinct count.
-        self.sealed.push(SealedTable::seal(retired, &mut self.hll));
+        self.retired.push(retired);
     }
 
     /// Finishes worker state for the merge phase.
     pub fn flush(mut self) -> AggregatedTableOutput<K, V> {
-        // Retired tables were folded into the sketch as they were sealed; the
-        // active one still has to be counted and sealed.
         self.key_arena.flush();
         self.worker_context.flush();
-        let mut tables = self.sealed;
-        tables.push(SealedTable::seal(self.active, &mut self.hll));
-        // Consolidating the stack into one dense run keeps the merge's
-        // fan-in at the worker count and drops the tables' empty slots; the
-        // tables are freed here, as soon as their entries are copied out.
-        let run = super::DenseRun::consolidate(
-            &tables,
-            &mut self.allocator,
-            V::storage_metadata(&self.shared_context),
-        );
+        // Sealing and consolidation both fold every entry's hash into the
+        // sketch. The sketch is idempotent per hash, so a key recurring in
+        // several tables is counted once and the merged estimate is the true
+        // distinct count.
+        let source = if self.retired.is_empty() {
+            MergeSource::Sealed(SealedTable::seal(self.active, &mut self.hll))
+        } else {
+            let mut tables = self.retired;
+            tables.push(self.active);
+            // Consolidating the stack into one dense run keeps the merge's
+            // fan-in at the worker count and drops the tables' empty slots;
+            // the tables are freed here, once their entries are copied out.
+            MergeSource::Dense(super::DenseRun::consolidate(
+                &tables,
+                &mut self.allocator,
+                V::storage_metadata(&self.shared_context),
+                &mut self.hll,
+            ))
+        };
         AggregatedTableOutput {
             node: crate::worker::current_node(),
-            run,
+            source,
             hll: self.hll,
             zero_hash_seen: self.zero_hash_seen,
         }

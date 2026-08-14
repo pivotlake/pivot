@@ -11,7 +11,7 @@
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::{
-    AggregationValue, BUCKET_BITS, DEFAULT_CAPACITY, DenseRun, MAX_LOAD_FACTOR, MultiSlabTable,
+    AggregationValue, BUCKET_BITS, DEFAULT_CAPACITY, MAX_LOAD_FACTOR, MergeSource, MultiSlabTable,
     PersistedKey, Prober, TableReader,
 };
 use crate::operations::unary::group::keys::StoredKey;
@@ -40,18 +40,21 @@ fn resize_if_needed<KP: PersistedKey, V: AggregationValue + ?Sized>(
     target.resize_on_collisions(allocator, RESIZE_COLLISION_RATIO as usize);
 }
 
-/// Folds one dense run's slice `[from, to)` into `target`.
+/// Folds one source slice `[from, to)` into `target`.
 ///
-/// The slice is a contiguous byte range holding only this partition's
-/// entries. Each batch is gathered first (reading the source sequentially
-/// and prefetching every target slot it will probe), then folded, so the
-/// fold's probes land on lines whose fetch started a batch earlier.
+/// `entry_at` maps a slice index to its entry address: direct indexing for a
+/// dense run, slot indirection for a sealed table. Either way the slice holds
+/// only this partition's entries. Each batch is gathered first (reading the
+/// source close to sequentially and prefetching every target slot it will
+/// probe), then folded, so the fold's probes land on lines whose fetch
+/// started a batch earlier.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn merge_run_slice<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
     allocator: &mut SlabAllocator,
     arena: &SharedArena,
     reader: &TableReader<'_, S::Persisted, V>,
+    entry_at: impl Fn(usize) -> *const u8,
     from: usize,
     to: usize,
     target: &mut Prober<'_, S::Persisted, V>,
@@ -62,7 +65,7 @@ fn merge_run_slice<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
     while i < to {
         let batch_len = (to - i).min(FOLD_BATCH);
         for (j, index) in (i..i + batch_len).enumerate() {
-            let entry = reader.entry_ptr(index) as *const u8;
+            let entry = entry_at(index);
             let hash = reader.hash_of(entry);
             batch[j] = (entry, hash);
             target.prefetch(hash);
@@ -85,10 +88,10 @@ fn merge_run_slice<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
     }
 }
 
-/// Merges one partition's share of every worker's run.
+/// Merges one partition's share of every worker's source.
 pub(super) fn merge_combined<S: StoredKey, V: AggregationValue + ?Sized>(
     partition: usize,
-    runs: &[DenseRun<S::Persisted, V>],
+    sources: &[MergeSource<S::Persisted, V>],
     partition_capacity: usize,
     num_partitions: usize,
     key_arena: &SharedArena,
@@ -99,7 +102,7 @@ pub(super) fn merge_combined<S: StoredKey, V: AggregationValue + ?Sized>(
         V::storage_metadata(context),
         MergeCombined::<S, V> {
             partition,
-            runs,
+            sources,
             partition_capacity,
             num_partitions,
             key_arena,
@@ -111,7 +114,7 @@ pub(super) fn merge_combined<S: StoredKey, V: AggregationValue + ?Sized>(
 /// State passed through arity dispatch for one partition merge.
 struct MergeCombined<'a, S: StoredKey, V: AggregationValue + ?Sized> {
     partition: usize,
-    runs: &'a [DenseRun<S::Persisted, V>],
+    sources: &'a [MergeSource<S::Persisted, V>],
     partition_capacity: usize,
     num_partitions: usize,
     key_arena: &'a SharedArena,
@@ -125,7 +128,7 @@ impl<S: StoredKey, V: AggregationValue + ?Sized> ArityBody<MultiSlabTable<S::Per
     fn run<const N: usize>(self) -> MultiSlabTable<S::Persisted, V> {
         let MergeCombined {
             partition,
-            runs,
+            sources,
             partition_capacity,
             num_partitions,
             key_arena,
@@ -133,7 +136,7 @@ impl<S: StoredKey, V: AggregationValue + ?Sized> ArityBody<MultiSlabTable<S::Per
         } = self;
         merge_combined_rows::<N, S, V>(
             partition,
-            runs,
+            sources,
             partition_capacity,
             num_partitions,
             key_arena,
@@ -148,7 +151,7 @@ impl<S: StoredKey, V: AggregationValue + ?Sized> ArityBody<MultiSlabTable<S::Per
 /// writes, keeping shared state outside the inner loops.
 fn merge_combined_rows<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
     partition: usize,
-    runs: &[DenseRun<S::Persisted, V>],
+    sources: &[MergeSource<S::Persisted, V>],
     partition_capacity: usize,
     num_partitions: usize,
     key_arena: &SharedArena,
@@ -176,20 +179,47 @@ fn merge_combined_rows<const N: usize, S: StoredKey, V: AggregationValue + ?Size
             result.prober_with_metadata(V::metadata_for_arity::<N>())
         };
 
-        for run in runs {
-            let (from, to) = run.bucket_range(bucket_lo, bucket_hi);
-            if from == to {
-                continue;
+        for source in sources {
+            match source {
+                MergeSource::Dense(run) => {
+                    let (from, to) = run.bucket_range(bucket_lo, bucket_hi);
+                    if from == to {
+                        continue;
+                    }
+                    let reader = run.reader::<N>();
+                    merge_run_slice::<N, S, V>(
+                        &mut allocator,
+                        key_arena,
+                        &reader,
+                        |index| reader.entry_ptr(index) as *const u8,
+                        from,
+                        to,
+                        &mut target,
+                        context,
+                    );
+                }
+                MergeSource::Sealed(sealed) => {
+                    let (from, to) = sealed.run.bucket_range(bucket_lo, bucket_hi);
+                    if from == to {
+                        continue;
+                    }
+                    let reader = sealed.table.reader::<N>();
+                    let positions = sealed.run.positions_ptr();
+                    merge_run_slice::<N, S, V>(
+                        &mut allocator,
+                        key_arena,
+                        &reader,
+                        |index| {
+                            let slot = unsafe { *positions.add(index) } as usize;
+                            reader.entry_ptr(slot) as *const u8
+                        },
+                        from,
+                        to,
+                        &mut target,
+                        context,
+                    );
+                }
             }
-            merge_run_slice::<N, S, V>(
-                &mut allocator,
-                key_arena,
-                &run.reader::<N>(),
-                from,
-                to,
-                &mut target,
-                context,
-            );
         }
         result
     }
@@ -244,7 +274,7 @@ mod tests {
     use crate::RECORD_BATCH_SIZE;
     use crate::memory::init_test_free_pool;
     use crate::operations::unary::group::arena::SharedArena;
-    use crate::operations::unary::group::hashtables::{AggregatedTable, SealedTable, SpillConfig};
+    use crate::operations::unary::group::hashtables::{AggregatedTable, DenseRun, SpillConfig};
     use crate::operations::unary::group::hll::Hll;
     use crate::operations::unary::group::keys::{InlineKey, IntKeyExtractor};
     use crate::operations::unary::group::values::{
@@ -269,7 +299,7 @@ mod tests {
         state: &RandomState,
         arena: &Arc<SharedArena>,
         values: &[i32],
-    ) -> DenseRun<i32, CountValue> {
+    ) -> MergeSource<i32, CountValue> {
         make_worker_run_with_spill(state, arena, values, SpillConfig::DEFAULT)
     }
 
@@ -278,7 +308,7 @@ mod tests {
         arena: &Arc<SharedArena>,
         values: &[i32],
         spill: SpillConfig,
-    ) -> DenseRun<i32, CountValue> {
+    ) -> MergeSource<i32, CountValue> {
         let mut agg = AggregatedTable::<IntExtractor, CountValue>::new(
             state.clone(),
             arena.clone(),
@@ -302,11 +332,11 @@ mod tests {
                 &COUNT_CFG,
             );
         }
-        agg.flush().run
+        agg.flush().source
     }
 
     fn merge_all_partitions(
-        runs: &[DenseRun<i32, CountValue>],
+        runs: &[MergeSource<i32, CountValue>],
         arena: &SharedArena,
     ) -> Vec<(i32, usize)> {
         let total: usize = runs.iter().map(|run| run.len()).sum();
@@ -509,10 +539,10 @@ mod tests {
     /// Consolidate hand-built tables of `(hash, key)` pairs into one worker
     /// run, bypassing the extractor so tests control hash collisions and
     /// extreme hash values.
-    fn run_from_pair_tables(tables: &[&[(u64, i32)]]) -> DenseRun<i32, CountValue> {
+    fn run_from_pair_tables(pair_tables: &[&[(u64, i32)]]) -> MergeSource<i32, CountValue> {
         let mut allocator = crate::memory::SlabAllocator::new(true);
-        let mut sealed = vec![];
-        for pairs in tables {
+        let mut tables = vec![];
+        for pairs in pair_tables {
             let mut table: MultiSlabTable<i32, CountValue> =
                 MultiSlabTable::new(&mut allocator, 128, 0, &());
             for &(hash, key) in *pairs {
@@ -520,10 +550,14 @@ mod tests {
                     .prober()
                     .merge_from::<false, _>(hash, key, &seeded_count(), &());
             }
-            let run = table.build_sorted_run(&mut Hll::new());
-            sealed.push(SealedTable { table, run });
+            tables.push(table);
         }
-        DenseRun::consolidate(&sealed, &mut allocator, ())
+        MergeSource::Dense(DenseRun::consolidate(
+            &tables,
+            &mut allocator,
+            (),
+            &mut Hll::new(),
+        ))
     }
 
     /// A `CountValue` holding a count of one, as one consumed row seeds it.
@@ -533,7 +567,7 @@ mod tests {
         value
     }
 
-    fn collect_all_from(runs: &[DenseRun<i32, CountValue>]) -> Vec<(i32, usize)> {
+    fn collect_all_from(runs: &[MergeSource<i32, CountValue>]) -> Vec<(i32, usize)> {
         let arena = SharedArena::new(64);
         let mut entries = vec![];
         for p in 0..PARTITIONS {
@@ -606,7 +640,9 @@ mod tests {
             .map(|i| (u64::MAX - i as u64, i as i32))
             .chain((1..40).map(|i| (i as u64, 100 + i as i32)))
             .collect();
-        let run = run_from_pair_tables(&[&pairs]);
+        let MergeSource::Dense(run) = run_from_pair_tables(&[&pairs]) else {
+            unreachable!("pair tables consolidate into a dense run");
+        };
 
         let reader = run.reader::<0>();
         let mut previous_bucket = 0u64;

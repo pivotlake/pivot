@@ -17,8 +17,9 @@ use crate::memory::{BUFFER_SIZE, Slab, SlabAllocator};
 use crate::operations::unary::group::hashtables::hash_table::{adjusted_bases, entry_layout};
 use crate::operations::unary::group::hashtables::sorted_run::BUCKET_COUNT;
 use crate::operations::unary::group::hashtables::{
-    AggregationValue, PersistedKey, SealedTable, TableReader,
+    AggregationValue, MultiSlabTable, PersistedKey, TableReader,
 };
+use crate::operations::unary::group::hll::Hll;
 use std::marker::PhantomData;
 
 /// One worker's consolidated entries, grouped by hash bucket.
@@ -40,29 +41,37 @@ unsafe impl<KP: PersistedKey, V: AggregationValue + ?Sized> Send for DenseRun<KP
 unsafe impl<KP: PersistedKey, V: AggregationValue + ?Sized> Sync for DenseRun<KP, V> {}
 
 impl<KP: PersistedKey, V: AggregationValue + ?Sized> DenseRun<KP, V> {
-    /// Copies every entry of `tables` into one bucket-grouped run.
+    /// Copies every entry of `tables` into one bucket-grouped run, folding
+    /// each hash into the worker's distinct-count sketch on the way.
     ///
-    /// Each sealed run's positions are already bucket-ascending, so a single
-    /// pass per table advances each bucket's write cursor monotonically.
+    /// Two branchless slot scans: one to count each bucket, one to place the
+    /// entries.
     pub fn consolidate(
-        tables: &[SealedTable<KP, V>],
+        tables: &[MultiSlabTable<KP, V>],
         allocator: &mut SlabAllocator,
         metadata: V::StorageMetadata,
+        hll: &mut Hll,
     ) -> Self {
         let layout = entry_layout::<KP, V>(metadata);
         let entries_per_slab = BUFFER_SIZE / layout.stride;
-        let len: usize = tables.iter().map(|sealed| sealed.run.len()).sum();
+        let len: usize = tables.iter().map(|table| table.len()).sum();
         let slabs = allocator.create_strided_slabs(len.max(1), layout.stride, layout.align);
         let adjusted_slab_bases = adjusted_bases(&slabs, entries_per_slab, layout.stride);
+        let bucket_shift = 64 - super::sorted_run::BUCKET_BITS;
 
-        // Per-bucket totals are the sum of each table run's bucket widths.
         let mut bucket_starts = vec![0u32; BUCKET_COUNT + 1];
-        for sealed in tables {
-            for b in 0..BUCKET_COUNT {
-                let (from, to) = sealed.run.bucket_range(b, b + 1);
-                bucket_starts[b + 1] += (to - from) as u32;
+        for table in tables {
+            let reader = table.reader::<0>();
+            for slot in 0..table.capacity() {
+                let hash = reader.hash_of(reader.entry_ptr(slot));
+                // Count 0 of the histogram absorbs the empty slots (hash 0 is
+                // the empty sentinel); real buckets are offset by one so the
+                // occupied prefix sums stay exact, with no branch per slot.
+                let bucket = (hash >> bucket_shift) as usize;
+                bucket_starts[(bucket + 1) * (hash != 0) as usize] += 1;
             }
         }
+        bucket_starts[0] = 0;
         for b in 0..BUCKET_COUNT {
             bucket_starts[b + 1] += bucket_starts[b];
         }
@@ -73,14 +82,16 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> DenseRun<KP, V> {
             base.wrapping_add(index * layout.stride) as *mut u8
         };
         let mut cursors = bucket_starts.clone();
-        let bucket_shift = 64 - super::sorted_run::BUCKET_BITS;
-        for sealed in tables {
-            let reader = sealed.table.reader::<0>();
-            let positions = sealed.run.positions_ptr();
-            for i in 0..sealed.run.len() {
-                let slot = unsafe { *positions.add(i) } as usize;
+        for table in tables {
+            let reader = table.reader::<0>();
+            for slot in 0..table.capacity() {
                 let src = reader.entry_ptr(slot);
-                let bucket = (reader.hash_of(src) >> bucket_shift) as usize;
+                let hash = reader.hash_of(src);
+                if hash == 0 {
+                    continue;
+                }
+                hll.add(hash);
+                let bucket = (hash >> bucket_shift) as usize;
                 let dst = entry_at(cursors[bucket] as usize);
                 unsafe { std::ptr::copy_nonoverlapping(src, dst, layout.stride) };
                 cursors[bucket] += 1;

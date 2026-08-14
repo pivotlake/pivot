@@ -81,7 +81,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupFactory<K, V> {
             injectors: injectors.clone(),
             partition_jobs_injected: partition_jobs_injected.clone(),
             gather: gather.clone(),
-            spill: SpillConfig::DEFAULT,
+            spill: SpillConfig::from_env(),
         })
     }
 }

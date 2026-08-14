@@ -22,7 +22,7 @@ mod dense_run;
 pub use dense_run::DenseRun;
 
 mod aggregated_table;
-pub use aggregated_table::{AggregatedTable, AggregatedTableOutput, SealedTable, SpillConfig};
+pub use aggregated_table::{AggregatedTable, AggregatedTableOutput, MergeSource, SpillConfig};
 
 /// Initial number of slots for a new per-worker hash table.
 pub const DEFAULT_CAPACITY: usize = 128;
