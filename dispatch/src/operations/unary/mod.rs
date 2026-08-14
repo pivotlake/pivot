@@ -92,6 +92,7 @@ mod order_by;
 mod order_by_limit;
 
 pub(crate) use copy_out::copy_out;
+pub(crate) use join::CrossJoinKey;
 pub(crate) use join::create_join_factories;
 pub(crate) use join::create_range_join_factories;
 pub use join::{

@@ -1,5 +1,5 @@
-//! End-to-end inner hash equi-join tests: SQL through DuckDB planning, the
-//! pivot plan walk, and dispatch execution.
+//! End-to-end join tests: SQL through DuckDB planning, the pivot plan walk,
+//! and dispatch execution.
 
 use std::sync::Arc;
 
@@ -15,6 +15,44 @@ fn int64_col(values: Vec<i64>) -> ArrayRef {
 
 fn str_col(values: Vec<&'static str>) -> ArrayRef {
     Arc::new(StringViewArray::from(values))
+}
+
+#[rstest]
+fn cross_join_emits_every_pair(mut testing_planner: TestingPlanner) {
+    // Setup
+    testing_planner.add_table("sizes", &[("size", Type::Int64, int64_col(vec![1, 2]))]);
+    testing_planner.add_table(
+        "colors",
+        &[("color", Type::Utf8, str_col(vec!["red", "green", "blue"]))],
+    );
+
+    // Execute
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT size, color FROM sizes CROSS JOIN colors",
+    );
+    rows.sort_by_key(|row| {
+        (
+            row["size"].as_i64().unwrap(),
+            row["color"].as_str().unwrap().to_string(),
+        )
+    });
+
+    // Assert
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"size": 1, "color": "blue"},
+            {"size": 1, "color": "green"},
+            {"size": 1, "color": "red"},
+            {"size": 2, "color": "blue"},
+            {"size": 2, "color": "green"},
+            {"size": 2, "color": "red"},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
 }
 
 fn add_orders_and_items(planner: &TestingPlanner) {

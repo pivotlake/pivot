@@ -19,6 +19,7 @@ mod copy_from_stdin;
 mod create_schema;
 mod create_table;
 mod create_user;
+mod cross_join;
 mod cte;
 mod distinct;
 mod drop_table;
@@ -43,6 +44,7 @@ pub use copy_from_stdin::{CopyFormat, CopyFromStdin};
 pub use create_schema::CreateSchema;
 pub use create_table::CreateTable;
 pub use create_user::CreateUser;
+pub use cross_join::CrossJoin;
 pub use cte::{Cte, CteScan};
 pub use distinct::Distinct;
 pub use drop_table::DropTable;
@@ -121,6 +123,8 @@ pub enum Operator {
     Limit(Limit),
     /// Inner hash equi-join: probe (first input) against build (second input).
     Join(Join),
+    /// Every pair of rows from the left and right inputs.
+    CrossJoin(CrossJoin),
     CreateTable(CreateTable),
     CreateSchema(CreateSchema),
     /// `DROP TABLE <name>` — compiles into a dataflow that stages the drop;
@@ -202,6 +206,11 @@ impl Operator {
                 if matches!(join.kind, JoinKind::ProbeMark) {
                     types.push(Type::Boolean);
                 }
+                Ok(types)
+            }
+            Operator::CrossJoin(_) => {
+                let mut types = inputs[0].clone();
+                types.extend(inputs[1].iter().cloned());
                 Ok(types)
             }
             // A FROM-less SELECT's one-row source has no columns of its own.
@@ -306,6 +315,11 @@ impl Operator {
                 }
                 nullable
             }
+            Operator::CrossJoin(_) => {
+                let mut nullability = inputs[0].clone();
+                nullability.extend(inputs[1].iter().copied());
+                nullability
+            }
             Operator::Cte(_) => inputs[1].clone(),
             Operator::CteScan(scan) => scan.nullable.clone(),
             Operator::Distinct(distinct) => distinct
@@ -343,6 +357,7 @@ impl fmt::Display for Operator {
             Operator::TopN(t) => write!(f, "{t}"),
             Operator::Limit(l) => write!(f, "{l}"),
             Operator::Join(j) => write!(f, "{j}"),
+            Operator::CrossJoin(j) => write!(f, "{j}"),
             Operator::CreateTable(c) => write!(f, "{c}"),
             Operator::CreateSchema(c) => write!(f, "{c}"),
             Operator::DropTable(d) => write!(f, "{d}"),

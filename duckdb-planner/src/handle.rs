@@ -213,6 +213,7 @@ impl<'plan> LogicalOp<'plan> {
             L::LOGICAL_COMPARISON_JOIN => {
                 Operator::ComparisonJoin(ComparisonJoin { raw: self.raw })
             }
+            L::LOGICAL_CROSS_PRODUCT => Operator::CrossProduct,
             L::LOGICAL_DELIM_JOIN => Operator::DelimJoin(DelimJoin { raw: self.raw }),
             L::LOGICAL_DELIM_GET => Operator::DelimGet(DelimGet { raw: self.raw }),
             L::LOGICAL_MATERIALIZED_CTE => {
@@ -263,6 +264,8 @@ pub enum Operator<'plan> {
     /// A comparison join; the consumer only handles the late-materialization
     /// shape (see [`ComparisonJoin::is_late_materialization`]).
     ComparisonJoin(ComparisonJoin<'plan>),
+    /// A Cartesian product of two inputs.
+    CrossProduct,
     /// A comparison join that additionally de-duplicates correlation columns
     /// from one side and publishes them to the [`DelimGet`]s under the other.
     DelimJoin(DelimJoin<'plan>),

@@ -48,15 +48,15 @@ use std::sync::Arc;
 use std::sync::atomic::{self, AtomicUsize};
 
 use arrow_array::RecordBatch;
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field};
 
 use crate::api::operator_spec::{OperatorFactory, OperatorSpec};
 use crate::operations::channels::{StealableChannelFactory, stealable, to_single_worker_mpsc};
 use crate::operations::{
-    AggregateFactory, AggregationSlot, AggregationValue, CteFactory, CteScanFactory, Distinct,
-    DynamicFilterSlot, DynamicRowKey, F64Cell, FilterFactory, GroupFactory, GroupLimit, IntCell,
-    JoinKey, JoinKind, JoinRecordBatchOperatorFactory, JoinSpec, KeyExtractor, LimitFactory,
-    MapFactory, NoOpNullaryFactory, NullaryFactory, NullaryOperatorFactory, OrderBy,
+    AggregateFactory, AggregationSlot, AggregationValue, CrossJoinKey, CteFactory, CteScanFactory,
+    Distinct, DynamicFilterSlot, DynamicRowKey, F64Cell, FilterFactory, GroupFactory, GroupLimit,
+    IntCell, JoinKey, JoinKind, JoinRecordBatchOperatorFactory, JoinSpec, KeyExtractor,
+    LimitFactory, MapFactory, NoOpNullaryFactory, NullaryFactory, NullaryOperatorFactory, OrderBy,
     OrderByFactory, OrderByLimitFactory, PackedKey, RangeJoinSpec, SingleColumnKey, UnaryFactory,
     UnaryOperatorFactory, WideCell, copy_out, create_join_factories, create_range_join_factories,
 };
@@ -614,6 +614,32 @@ impl RecordBatchOperatorSpec {
             topology,
             buffers,
         ))
+    }
+
+    /// Cartesian product of `self` and `right`, emitting every left column
+    /// followed by every right column for each pair of input rows.
+    ///
+    /// This uses the parallel hash join with an implicit unit key. Since every
+    /// row has that key, each left row walks every stored right row. Keeping it
+    /// as a separate API makes the zero-key shape explicit and prevents an
+    /// ordinary equi-join from selecting it accidentally.
+    pub fn cross_join(
+        self,
+        right: RecordBatchOperatorSpec,
+        left_fields: Vec<Field>,
+        right_fields: Vec<Field>,
+    ) -> Self {
+        let spec = JoinSpec {
+            probe_key_indices: Vec::new(),
+            build_key_indices: Vec::new(),
+            probe_output_indices: (0..left_fields.len()).collect(),
+            build_output_indices: (0..right_fields.len()).collect(),
+            probe_fields: left_fields,
+            build_fields: right_fields,
+            kind: JoinKind::Inner,
+            residual_filters: None,
+        };
+        self.join_typed::<CrossJoinKey, false, false, false, false, false>(right, spec)
     }
 
     /// Hash equi-join: build a hash table from `build`'s rows keyed on

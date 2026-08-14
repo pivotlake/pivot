@@ -15,13 +15,16 @@
 //! the match loop untouched.
 //!
 //! One implementation per shape, each in its own module:
+//! [`CrossJoinKey`] for the implicit unit key of a Cartesian product,
 //! [`SingleColumnKey`] for one primitive column, [`PackedKey`] for tuples of
 //! integer-natured columns, and [`DynamicRowKey`] for everything else.
 
+mod cross;
 mod dynamic;
 mod packed;
 mod single_column;
 
+pub(crate) use cross::CrossJoinKey;
 pub use dynamic::DynamicRowKey;
 pub use packed::PackedKey;
 pub use single_column::SingleColumnKey;

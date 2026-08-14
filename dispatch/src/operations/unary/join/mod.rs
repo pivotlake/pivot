@@ -51,6 +51,7 @@ mod directory;
 mod factory;
 pub use factory::JoinRecordBatchOperatorFactory;
 mod keys;
+pub(crate) use keys::CrossJoinKey;
 pub use keys::{DynamicRowKey, JoinKey, PackedKey, SingleColumnKey};
 mod match_outputter;
 mod probe;
