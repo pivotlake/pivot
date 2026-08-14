@@ -331,6 +331,15 @@ fn fold_stubs<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
             table.prefetch(stub.hash);
             prefetch_l1_line(stub.entry);
         }
+        if <S::Persisted as PersistedKey>::HAS_BLOB {
+            // A hash match memcmps the key's arena blob. The entry lines
+            // were just requested above, so their handles are cheap to read
+            // here, and the blobs get a batch of lead time before the fold
+            // compares them.
+            for stub in &stubs[i..i + batch_len] {
+                unsafe { reader.key_of(stub.entry) }.prefetch_blob(key_arena);
+            }
+        }
         for stub in &stubs[i..i + batch_len] {
             fold_entry::<N, S, V>(
                 reader, stub.entry, stub.hash, table, scratch, key_arena, context,
