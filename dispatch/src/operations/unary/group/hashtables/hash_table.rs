@@ -381,14 +381,9 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> BaseHashTable<K, V> {
         }
     }
 
-    /// Builds a bucket-grouped view of this table's occupied slots at the
-    /// given resolution, folding every stored hash into the worker's
-    /// distinct-count sketch on the way.
-    pub fn build_sorted_run(
-        &self,
-        hll: &mut super::super::hll::Hll,
-        bucket_bits: u32,
-    ) -> super::SortedRun {
+    /// Builds a bucket-grouped view of this table's occupied slots, folding
+    /// every stored hash into the worker's distinct-count sketch on the way.
+    pub fn build_sorted_run(&self, hll: &mut super::super::hll::Hll) -> super::SortedRun {
         let reader = self.reader::<0>();
         let capacity = self.capacity();
         // One slack element keeps the unconditional store below in bounds
@@ -401,7 +396,7 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> BaseHashTable<K, V> {
             count += (hash != 0) as usize;
         }
         debug_assert_eq!(count, self.len());
-        super::SortedRun::from_slot_scan(&entries[..count], hll, bucket_bits)
+        super::SortedRun::from_slot_scan(&entries[..count], hll)
     }
 
     /// Creates a probing handle with a local layout snapshot.

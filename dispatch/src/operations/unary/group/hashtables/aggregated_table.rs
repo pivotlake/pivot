@@ -179,9 +179,39 @@ pub struct SealedTable<KP: super::PersistedKey, V: AggregationValue + ?Sized> {
 }
 
 impl<KP: super::PersistedKey, V: AggregationValue + ?Sized> SealedTable<KP, V> {
-    fn seal(table: MultiSlabTable<KP, V>, hll: &mut Hll, bucket_bits: u32) -> Self {
-        let run = table.build_sorted_run(hll, bucket_bits);
+    fn seal(table: MultiSlabTable<KP, V>, hll: &mut Hll) -> Self {
+        let run = table.build_sorted_run(hll);
         Self { table, run }
+    }
+}
+
+/// One worker's merge input: its single table sealed in place, or its whole
+/// stack consolidated into a dense run.
+///
+/// A worker that never outgrew one table (the common low and mid cardinality
+/// case) hands the merge that table with a bucket-grouped slot view: one
+/// sealing pass, no entry copies. A worker that stacked tables consolidates
+/// them into one dense run so the merge visits one source per worker.
+pub enum MergeSource<KP: super::PersistedKey, V: AggregationValue + ?Sized> {
+    Sealed(SealedTable<KP, V>),
+    Dense(super::DenseRun<KP, V>),
+}
+
+impl<KP: super::PersistedKey, V: AggregationValue + ?Sized> MergeSource<KP, V> {
+    /// Number of entries this source contributes to the merge.
+    pub fn len(&self) -> usize {
+        match self {
+            MergeSource::Sealed(sealed) => sealed.run.len(),
+            MergeSource::Dense(run) => run.len(),
+        }
+    }
+
+    /// Hash-prefix bits this source's bucket index resolves.
+    pub fn bucket_bits(&self) -> u32 {
+        match self {
+            MergeSource::Sealed(sealed) => sealed.run.bucket_bits(),
+            MergeSource::Dense(run) => run.bucket_bits(),
+        }
     }
 }
 
@@ -190,10 +220,9 @@ pub struct AggregatedTableOutput<K: KeyExtractor, V: AggregationValue + ?Sized> 
     /// The NUMA node whose worker flushed this output; the merge groups
     /// sources by it.
     pub node: usize,
-    /// Every table this worker filled, sealed in place: entries stay in the
-    /// tables (worker-internal repeats included; the merge combines them),
-    /// each with a bucket index over its occupied slots.
-    pub tables: Vec<SealedTable<K::Persisted, V>>,
+    /// Every group entry this worker produced (worker-internal repeats
+    /// included; the merge combines them).
+    pub source: MergeSource<K::Persisted, V>,
     /// Distinct-count sketch over the worker's rows, for sizing the merge targets.
     pub hll: Hll,
     /// `K::DEDUP_BY_HASH` only: this worker saw the (single) key whose bijective
@@ -398,32 +427,28 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
     pub fn flush(mut self) -> AggregatedTableOutput<K, V> {
         self.key_arena.flush();
         self.worker_context.flush();
-        // Entries never leave their tables: sealing only builds a bucket
-        // index over each table's occupied slots (and folds every hash into
-        // the distinct sketch, which is idempotent per hash, so a key
-        // recurring in several tables is counted once). A lone table sizes
-        // its index to its entries; a stack seals every table at full
-        // resolution, since the coarsest source bounds how finely the merge
-        // can split the key space and a stack implies high cardinality.
-        let stacked = !self.retired.is_empty();
-        let bits_for = |table: &MultiSlabTable<K::Persisted, V>| {
-            if stacked {
-                super::BUCKET_BITS
-            } else {
-                super::sorted_run::bucket_bits_for(table.len())
-            }
+        // Sealing and consolidation both fold every entry's hash into the
+        // sketch. The sketch is idempotent per hash, so a key recurring in
+        // several tables is counted once and the merged estimate is the true
+        // distinct count.
+        let source = if self.retired.is_empty() {
+            MergeSource::Sealed(SealedTable::seal(self.active, &mut self.hll))
+        } else {
+            let mut tables = self.retired;
+            tables.push(self.active);
+            // Consolidating the stack into one dense run keeps the merge's
+            // fan-in at the worker count and drops the tables' empty slots;
+            // the tables are freed here, once their entries are copied out.
+            MergeSource::Dense(super::DenseRun::consolidate(
+                &tables,
+                &mut self.allocator,
+                V::storage_metadata(&self.shared_context),
+                &mut self.hll,
+            ))
         };
-        let retired = std::mem::take(&mut self.retired);
-        let mut tables = Vec::with_capacity(retired.len() + 1);
-        for table in retired {
-            let bits = bits_for(&table);
-            tables.push(SealedTable::seal(table, &mut self.hll, bits));
-        }
-        let bits = bits_for(&self.active);
-        tables.push(SealedTable::seal(self.active, &mut self.hll, bits));
         AggregatedTableOutput {
             node: crate::worker::current_node(),
-            tables,
+            source,
             hll: self.hll,
             zero_hash_seen: self.zero_hash_seen,
         }

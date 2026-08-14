@@ -28,12 +28,10 @@ pub const BUCKET_BITS: u32 = 13;
 /// full worker pool asks for.
 pub const MIN_BUCKET_BITS: u32 = 10;
 
-/// Bucket resolution for a lone table of `len` entries: roughly 64 entries
-/// per bucket, clamped to `[MIN_BUCKET_BITS, BUCKET_BITS]`. Small runs get
-/// small index arrays, so the fixed cost of building and walking them never
-/// outweighs the entries themselves. Tables in a stack always seal at full
-/// resolution instead: a stack implies high cardinality, and the coarsest
-/// source bounds how finely the merge can split the key space.
+/// Bucket resolution for a run of `len` entries: roughly 64 entries per
+/// bucket, clamped to `[MIN_BUCKET_BITS, BUCKET_BITS]`. Small runs get small
+/// index arrays, so the fixed cost of building and walking them never
+/// outweighs the entries themselves.
 pub(super) fn bucket_bits_for(len: usize) -> u32 {
     let magnitude = usize::BITS - len.max(1).leading_zeros();
     magnitude
@@ -57,7 +55,8 @@ impl SortedRun {
     /// the worker's distinct-count sketch on the way.
     ///
     /// The pairs arrive in slot-scan order; each bucket keeps that order.
-    pub(super) fn from_slot_scan(entries: &[(u64, u32)], hll: &mut Hll, bucket_bits: u32) -> Self {
+    pub(super) fn from_slot_scan(entries: &[(u64, u32)], hll: &mut Hll) -> Self {
+        let bucket_bits = bucket_bits_for(entries.len());
         let bucket_count = 1usize << bucket_bits;
         let mut bucket_starts = vec![0u32; bucket_count + 1];
         for &(hash, _) in entries {
