@@ -4,11 +4,9 @@ use super::Error;
 use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use crate::types::Type;
-use arrow_array::cast::AsArray;
-use arrow_array::{Array, ArrayRef, BooleanArray, Datum, RecordBatch};
+use arrow_array::{ArrayRef, BooleanArray, Datum, RecordBatch};
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::ArrowError;
-use dispatch::ConstantMatch;
 use duckdb_planner::duckdb_bridge::duckdb_types::ExpressionType;
 use std::fmt::{self, Display};
 use std::sync::Arc;
@@ -77,10 +75,6 @@ impl Display for Compare {
 
 impl Compare {
     pub fn compile(&self) -> Result<ExprFn, compile::Error> {
-        if let Some(compiled) = self.compile_string_constant()? {
-            return Ok(compiled);
-        }
-
         let kernel: CmpKernel = match self.compare_type {
             CompareType::Equal => eq,
             CompareType::NotEqual => neq,
@@ -102,55 +96,6 @@ impl Compare {
                 ExprResult::Array(Arc::new(mask) as ArrayRef)
             }) as ExprEvalFn
         }))
-    }
-
-    /// `col = 'k'` / `col <> 'k'` on a string column, compiled to a dedicated
-    /// view kernel. The generic comparison reaches every row through a function
-    /// pointer and re-reads the array's buffer list per row; [`ConstantMatch`]
-    /// walks the views directly instead. `None` for any other shape, which then
-    /// takes the generic path.
-    fn compile_string_constant(&self) -> Result<Option<ExprFn>, compile::Error> {
-        let negate = match self.compare_type {
-            CompareType::Equal => false,
-            CompareType::NotEqual => true,
-            _ => return Ok(None),
-        };
-        // Equality is symmetric, so the constant may sit on either side.
-        let (column, constant) = match (self.left.as_ref(), self.right.as_ref()) {
-            (Expression::Ref(r), Expression::Constant(k)) if r.return_type == Type::Utf8 => {
-                (self.left.as_ref(), k)
-            }
-            (Expression::Constant(k), Expression::Ref(r)) if r.return_type == Type::Utf8 => {
-                (self.right.as_ref(), k)
-            }
-            _ => return Ok(None),
-        };
-        let (constant_array, _) = constant.get();
-        let Some(strings) = constant_array.as_string_view_opt() else {
-            return Ok(None);
-        };
-        // A NULL constant makes the comparison NULL for every row, which is
-        // three-valued logic the generic kernel already gets right.
-        if strings.len() != 1 || strings.is_null(0) {
-            return Ok(None);
-        }
-        let needle = strings.value(0).as_bytes().to_vec();
-
-        let column_builder = column.compile()?;
-        Ok(Some(Box::new(move || {
-            let mut column_expr = column_builder();
-            let matcher = ConstantMatch::new(&needle);
-            Box::new(move |batch: &RecordBatch| {
-                let column = column_expr(batch);
-                let (array, _) = column.as_datum().get();
-                let strings = array.as_string_view();
-                let mask = match negate {
-                    true => matcher.run_not_equal(strings),
-                    false => matcher.run_equal(strings),
-                };
-                ExprResult::Array(Arc::new(mask) as ArrayRef)
-            }) as ExprEvalFn
-        })))
     }
 }
 
