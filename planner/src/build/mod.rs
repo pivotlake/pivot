@@ -30,10 +30,9 @@ use crate::catalog::BoundTable;
 use crate::expression::{Cast, Error as ExpressionError, Expression, Function, Ref, VariantGet};
 use crate::operator::{
     Aggregate, Compact, CopyFromStdin, CreateSchema, CreateTable, CreateUser, CrossJoin, Cte,
-    CteScan, Distinct, DropTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Insert,
-    Join,
-    JoinKind, Limit, Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan,
-    TopN, Values,
+    CteScan, Distinct, DropTable, DummyScan, Error as OperatorError, Explain, Filter, Input,
+    Insert, Join, JoinKind, Limit, Materialize, Operator, OrderBy, Projection, SetVariable,
+    TableFunctionScan, TopN, Values,
 };
 use crate::plan::{self, PlanNode};
 use crate::types::{Type, physical_arrow_type, type_from_logical};
@@ -677,7 +676,8 @@ fn join_key_ref(key: Expression) -> Result<(usize, Type), OperatorError> {
         )));
     };
     match key.return_type {
-        Type::Int8
+        Type::Boolean
+        | Type::Int8
         | Type::Int16
         | Type::Int32
         | Type::Int64

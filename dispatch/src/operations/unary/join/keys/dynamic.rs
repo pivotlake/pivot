@@ -5,7 +5,7 @@ use crate::operations::unary::join::build_rows::split_row_id;
 use ahash::RandomState;
 use arrow::array::ArrayData;
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, ArrayRef, RecordBatch, StringViewArray};
+use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, StringViewArray};
 use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
 use std::hash::{BuildHasher, Hasher};
@@ -20,12 +20,14 @@ enum DynamicKeyColumn {
         values: ArrayData,
         width: usize,
     },
+    Boolean(BooleanArray),
     Utf8View(StringViewArray),
 }
 
 impl DynamicKeyColumn {
     fn bind(column: &ArrayRef) -> Self {
         match column.data_type() {
+            DataType::Boolean => Self::Boolean(column.as_boolean().clone()),
             DataType::Utf8View => Self::Utf8View(column.as_string_view().clone()),
             data_type => {
                 let width = data_type.primitive_width().unwrap_or_else(|| {
@@ -42,23 +44,49 @@ impl DynamicKeyColumn {
     }
 
     #[inline]
-    fn value_bytes(&self, idx: usize) -> &[u8] {
+    fn write_row_to_hasher(&self, idx: usize, hasher: &mut impl Hasher) {
         match self {
             Self::Fixed { values, width } => {
                 let start = (values.offset() + idx) * width;
-                &values.buffers()[0].as_slice()[start..start + width]
+                let bytes = &values.buffers()[0].as_slice()[start..start + width];
+                hasher.write_usize(bytes.len());
+                hasher.write(bytes);
             }
-            Self::Utf8View(strings) => strings.value(idx).as_bytes(),
+            Self::Boolean(values) => {
+                hasher.write_usize(1);
+                hasher.write_u8(u8::from(values.value(idx)));
+            }
+            Self::Utf8View(strings) => {
+                let bytes = strings.value(idx).as_bytes();
+                hasher.write_usize(bytes.len());
+                hasher.write(bytes);
+            }
         }
     }
 
     #[inline]
-    fn write_row_to_hasher(&self, idx: usize, hasher: &mut impl Hasher) {
-        let bytes = self.value_bytes(idx);
-        // The length keeps adjacent variable-length values from aliasing
-        // across column boundaries; for fixed-width columns it is constant.
-        hasher.write_usize(bytes.len());
-        hasher.write(bytes);
+    fn value_equals(&self, left_idx: usize, other: &Self, right_idx: usize) -> bool {
+        match (self, other) {
+            (
+                Self::Fixed {
+                    values: left,
+                    width,
+                },
+                Self::Fixed { values: right, .. },
+            ) => {
+                let left_start = (left.offset() + left_idx) * width;
+                let right_start = (right.offset() + right_idx) * width;
+                left.buffers()[0].as_slice()[left_start..left_start + width]
+                    == right.buffers()[0].as_slice()[right_start..right_start + width]
+            }
+            (Self::Boolean(left), Self::Boolean(right)) => {
+                left.value(left_idx) == right.value(right_idx)
+            }
+            (Self::Utf8View(left), Self::Utf8View(right)) => {
+                left.value(left_idx) == right.value(right_idx)
+            }
+            _ => unreachable!("probe and build dynamic join key variants must match"),
+        }
     }
 }
 
@@ -157,7 +185,7 @@ impl JoinKey for DynamicRowKey {
             .iter()
             .zip(&verifier.columns)
             .all(|(probe_column, build_batches)| {
-                probe_column.value_bytes(probe_idx) == build_batches[batch_idx].value_bytes(row)
+                probe_column.value_equals(probe_idx, &build_batches[batch_idx], row)
             })
     }
 }
