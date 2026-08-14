@@ -130,6 +130,14 @@ impl RefTable {
             self.grow();
         }
     }
+
+    /// Empties the table for the next hash range, keeping its allocation
+    /// (and any growth the previous range forced).
+    fn reset(&mut self) {
+        self.slots.fill(RefSlot::EMPTY);
+        self.len = 0;
+        self.collisions = 0;
+    }
 }
 
 /// Bump storage for merged values, with stable addresses.
@@ -138,6 +146,9 @@ impl RefTable {
 /// for the arena's lifetime.
 struct ScratchValues {
     chunks: Vec<Vec<u8>>,
+    /// Chunk currently allocated from; earlier chunks are full (or retired
+    /// by a reset).
+    current: usize,
     cursor: usize,
     cell: usize,
     align: usize,
@@ -149,6 +160,7 @@ impl ScratchValues {
         let cell = value_size.max(1).next_multiple_of(align);
         Self {
             chunks: Vec::new(),
+            current: 0,
             cursor: 0,
             cell,
             align,
@@ -156,10 +168,11 @@ impl ScratchValues {
         }
     }
 
-    /// Hands out one zeroed, aligned value cell.
+    /// Hands out one aligned value cell. The caller fully initialises it
+    /// with [`AggregationValue::copy_from`], so reused cells need no wipe.
     fn alloc(&mut self) -> *mut u8 {
         loop {
-            if let Some(chunk) = self.chunks.last_mut() {
+            if let Some(chunk) = self.chunks.get_mut(self.current) {
                 let base = chunk.as_mut_ptr() as usize;
                 let aligned = (base + self.cursor).next_multiple_of(self.align);
                 let offset = aligned - base;
@@ -167,10 +180,20 @@ impl ScratchValues {
                     self.cursor = offset + self.cell;
                     return aligned as *mut u8;
                 }
+                self.current += 1;
+                self.cursor = 0;
+                continue;
             }
             self.chunks.push(vec![0u8; self.chunk_bytes + self.align]);
-            self.cursor = 0;
         }
+    }
+
+    /// Makes every cell reusable for the next hash range. Handed-out
+    /// pointers become dangling, so the previous range must be fully
+    /// emitted first.
+    fn reset(&mut self) {
+        self.current = 0;
+        self.cursor = 0;
     }
 }
 
@@ -369,15 +392,15 @@ where
         V::metadata_for_arity::<N>()
     };
     let capacity = partition_capacity.max(DEFAULT_CAPACITY);
-    let mut table = RefTable::new(capacity, partition_bits);
-    let mut scratch = ScratchValues::new(V::stored_size(metadata), V::stored_align());
-
-    // Fold hash range by hash range, every source in turn, rather than
-    // source by source across the whole partition: one range's references
-    // land in a narrow region of the table, so all sources hit that region
-    // while it is cache-warm. The step count follows the table's footprint
-    // (small tables take one pass, so small queries pay no per-step cost)
-    // and never splits finer than any source resolves.
+    // The partition is folded and emitted one hash range at a time: a
+    // range's groups are complete once every source folded its slice, so
+    // they are emitted immediately, while the reference slots and the
+    // entries they point at are still cache-warm. One range-sized table is
+    // reused (reset, not reallocated) across ranges, so the merge's working
+    // table stays cache-resident by construction however large the
+    // partition is. The step count follows the partition's footprint (small
+    // partitions take one pass) and never splits finer than any source
+    // resolves.
     const STEP_TARGET_BYTES: usize = 32 * 1024;
     let target_bytes = capacity * size_of::<RefSlot>();
     let desired_steps = (target_bytes / STEP_TARGET_BYTES)
@@ -386,6 +409,16 @@ where
     let max_steps = 1usize << (min_source_bits - partition_bits);
     let steps = desired_steps.min(max_steps);
     let step_width = partition_width / steps;
+    let step_capacity = (capacity / steps).max(DEFAULT_CAPACITY);
+    let step_bits = partition_bits + steps.trailing_zeros();
+    let mut table = RefTable::new(step_capacity, step_bits);
+    let mut scratch = ScratchValues::new(V::stored_size(metadata), V::stored_align());
+    let Some(layout) = sources.first().map(|source| match source {
+        MergeSource::Dense(run) => run.reader::<N>(),
+        MergeSource::Sealed(sealed) => sealed.table.reader::<N>(),
+    }) else {
+        return Ok(());
+    };
     for step in 0..steps {
         let lo = bucket_lo + step * step_width;
         let hi = lo + step_width;
@@ -431,41 +464,26 @@ where
                 }
             }
         }
-    }
-
-    // Emit every group once: single partials straight from their source
-    // entry, combined groups from their scratch accumulator. Any source
-    // reader can decode any entry address; they all share one layout.
-    let Some(layout) = sources.first().map(|source| match source {
-        MergeSource::Dense(run) => run.reader::<N>(),
-        MergeSource::Sealed(sealed) => sealed.table.reader::<N>(),
-    }) else {
-        return Ok(());
-    };
-    // The referenced entries sit in bucket order across the runs, so this
-    // walk reads them nearly sequentially; the lookahead keeps their lines
-    // arriving a few groups early.
-    const EMIT_PREFETCH: usize = 8;
-    let slots = &table.slots;
-    for i in 0..slots.len() {
-        let slot = slots[i];
-        if slot.hash == 0 {
-            continue;
+        // Emit this range's groups while everything is hot: single partials
+        // straight from their source entry, combined groups from their
+        // scratch accumulator. Any source reader can decode any entry
+        // address; they all share one layout.
+        for slot in &table.slots {
+            if slot.hash == 0 {
+                continue;
+            }
+            let key = unsafe { layout.key_of(slot.entry) };
+            let value = if slot.merged.is_null() {
+                unsafe { layout.value_of(slot.entry) }
+            } else {
+                unsafe { V::from_entry(slot.merged, metadata) }
+            };
+            if !emit(key, value)? {
+                return Ok(());
+            }
         }
-        if let Some(ahead) = slots.get(i + EMIT_PREFETCH)
-            && ahead.hash != 0
-        {
-            prefetch_l1_line(ahead.entry);
-        }
-        let key = unsafe { layout.key_of(slot.entry) };
-        let value = if slot.merged.is_null() {
-            unsafe { layout.value_of(slot.entry) }
-        } else {
-            unsafe { V::from_entry(slot.merged, metadata) }
-        };
-        if !emit(key, value)? {
-            return Ok(());
-        }
+        table.reset();
+        scratch.reset();
     }
     Ok(())
 }
