@@ -1063,6 +1063,7 @@ mod tests {
         let radix = RadixConfig {
             switch_threshold: 256,
             partitions: 16,
+            ..RadixConfig::DEFAULT
         };
         let mut values: Vec<i32> = (0..500).collect();
         values.extend(0..500);
@@ -1082,6 +1083,7 @@ mod tests {
         let radix = RadixConfig {
             switch_threshold: 256,
             partitions: 16,
+            ..RadixConfig::DEFAULT
         };
         let worker = || vec![batch_with_column(&(0..500).collect::<Vec<_>>())];
 
@@ -1684,6 +1686,7 @@ mod tests {
         let radix = RadixConfig {
             switch_threshold: 256,
             partitions: 16,
+            ..RadixConfig::DEFAULT
         };
         let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
             vec![vec![batch]],
@@ -1802,6 +1805,7 @@ mod tests {
         let radix = RadixConfig {
             switch_threshold: 256,
             partitions: 16,
+            ..RadixConfig::DEFAULT
         };
 
         let sender = run_group_full::<StringKeyExtractor, CountValue>(
@@ -1826,6 +1830,7 @@ mod tests {
         let radix = RadixConfig {
             switch_threshold: 256,
             partitions: 16,
+            ..RadixConfig::DEFAULT
         };
         let worker = || vec![string_key_batch(&names)];
 
@@ -1862,6 +1867,7 @@ mod tests {
         let radix = RadixConfig {
             switch_threshold: 256,
             partitions: 16,
+            ..RadixConfig::DEFAULT
         };
 
         let sender = run_row_key_group_radix::<CountValue>(
@@ -1888,6 +1894,7 @@ mod tests {
         let radix = RadixConfig {
             switch_threshold: 256,
             partitions: 16,
+            ..RadixConfig::DEFAULT
         };
 
         let sender = run_group_full::<IntExtractor, CountValue>(

@@ -38,6 +38,10 @@ impl<T: ArrowPrimitiveType + Send + 'static> KeyExtractor for IntKeyExtractor<T>
 where
     T::Native: PersistedKey + Hash + Eq,
 {
+    // Keep deduplicating in the bounded table after the radix transition so
+    // repeated keys fold in place instead of scattering one raw row each.
+    const RADIX_DEDUP_BEFORE_SCATTER: bool = true;
+
     type Config = ();
     type Persisted = T::Native;
     type LiveKey<'a, 'b> = T::Native;

@@ -34,6 +34,11 @@ use std::sync::Arc;
 /// Table capacity at which eligible keys switch to radix scatter.
 const SWITCH_THRESHOLD: usize = 32768;
 
+/// Distinct-to-rows percentage at or above which a dedup-before-scatter fill is
+/// judged to have deduplicated nothing worth the probe cost (see
+/// [`RadixConfig::scatter_fallback_distinct_pct`]).
+const SCATTER_FALLBACK_DISTINCT_PCT: usize = 90;
+
 /// Configuration for the in-place to radix transition.
 #[derive(Copy, Clone)]
 pub struct RadixConfig {
@@ -41,12 +46,18 @@ pub struct RadixConfig {
     pub switch_threshold: usize,
     /// Number of scatter partitions (a power of two).
     pub partitions: usize,
+    /// Dedup-before-scatter fills whose distinct-entry count reaches this percentage
+    /// of the rows consumed make the worker fall back to raw scatter: when
+    /// almost every row seeds a new group, probing and re-draining each entry
+    /// costs more than appending the row directly.
+    pub scatter_fallback_distinct_pct: usize,
 }
 
 impl RadixConfig {
     pub const DEFAULT: Self = Self {
         switch_threshold: SWITCH_THRESHOLD,
         partitions: RADIX_PARTITIONS,
+        scatter_fallback_distinct_pct: SCATTER_FALLBACK_DISTINCT_PCT,
     };
 
     /// Disables radix scatter.
@@ -56,7 +67,7 @@ impl RadixConfig {
     pub const fn without_radix(self) -> Self {
         Self {
             switch_threshold: usize::MAX,
-            partitions: self.partitions,
+            ..self
         }
     }
 }
@@ -102,6 +113,13 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     hll: Hll,
     /// Whether this worker has entered radix mode.
     switched_to_radix: bool,
+    /// Whether rows bypass the in-place table and scatter raw: set at the
+    /// switch for scatter-route keys, and later for dedup-before-scatter keys whose
+    /// fills stopped deduplicating.
+    scatter_raw: bool,
+    /// Rows folded into the active table since it was last cleared, the
+    /// denominator of the raw-scatter fallback's dedup check.
+    rows_since_clear: usize,
     /// Radix threshold and partition count.
     radix_config: RadixConfig,
     /// Scratch buffer for the per-row hashes computed once per batch.
@@ -137,6 +155,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             buffers: None,
             hll: Hll::new(),
             switched_to_radix: false,
+            scatter_raw: false,
+            rows_since_clear: 0,
             radix_config,
             hashes: vec![0u64; RECORD_BATCH_SIZE]
                 .into_boxed_slice()
@@ -199,9 +219,10 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
                 &mut self.hashes[..length],
             );
 
-            // Fixed-width keys scatter directly after the transition. Keys on
-            // the abandon route continue through the in-place table.
-            if self.switched_to_radix && !K::RADIX_DEDUP_BEFORE_SCATTER {
+            // Scatter-route keys bypass the table after the transition, as do
+            // dedup-before-scatter keys whose fills stopped deduplicating.
+            // Everything else continues through the in-place table.
+            if self.scatter_raw {
                 self.scatter_range(0, length, &key_reader, &value_reader);
             } else {
                 self.consume_in_place(length, &key_reader, &value_reader, shared_context);
@@ -222,6 +243,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         let metadata = V::storage_metadata(shared_context);
         let mut i = 0;
         while i < length {
+            let window_start = i;
             let overflowed = {
                 let Self {
                     tables,
@@ -247,6 +269,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
                     },
                 )
             };
+            self.rows_since_clear += i - window_start;
             // The row that crossed the limit has already been folded. Scatter
             // starts at the following row.
             if overflowed && self.grow_or_radix() {
@@ -259,8 +282,10 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
     /// Grows the in-place stack or enters radix mode.
     ///
     /// Returns `true` when the caller should scatter the remaining raw rows.
-    /// Abandon-route keys instead drain the deduplicated table and return
-    /// `false`, allowing the caller to continue probing with the cleared table.
+    /// Dedup-before-scatter keys instead drain the deduplicated table and return
+    /// `false`, allowing the caller to continue probing with the cleared table,
+    /// unless the drained fill deduplicated almost nothing, in which case the
+    /// worker permanently falls back to raw scatter and returns `true`.
     #[inline(always)]
     fn grow_or_radix(&mut self) -> bool {
         let next_size = self.tables.last().unwrap().capacity() * 4;
@@ -281,11 +306,23 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
                     .collect(),
             );
         }
-        self.switched_to_radix = true;
         if K::RADIX_DEDUP_BEFORE_SCATTER {
+            // On fills after the switch (the table restarted from empty), a
+            // distinct count near the fill's row count means almost nothing
+            // deduplicated: fall back to raw scatter rather than keep paying
+            // the probe and per-entry drain for it. The switch-time drain is
+            // exempt because its rows accumulated across the growing stack.
+            let almost_no_dedup = self.switched_to_radix
+                && self.tables.last().unwrap().len() * 100
+                    >= self.rows_since_clear * self.radix_config.scatter_fallback_distinct_pct;
+            self.switched_to_radix = true;
             self.scatter_active_table_to_radix_partitions();
-            false
+            self.rows_since_clear = 0;
+            self.scatter_raw = almost_no_dedup;
+            almost_no_dedup
         } else {
+            self.switched_to_radix = true;
+            self.scatter_raw = true;
             true
         }
     }
@@ -492,6 +529,106 @@ fn probe_rows<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized>(
         }
         *next_row = row;
         overflowed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::init_test_free_pool;
+    use crate::operations::unary::group::keys::IntKeyExtractor;
+    use crate::operations::unary::group::values::{
+        AggregationKind, AggregationSlot, Compiled, CountSlot,
+    };
+    use arrow_array::types::Int32Type;
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    type IntExtractor = IntKeyExtractor<Int32Type>;
+    type CountValue = Compiled<(CountSlot,), u8>;
+
+    /// A config whose first in-place overflow already crosses the switch
+    /// threshold, so radix behavior is reached within a few hundred rows.
+    const SMALL_RADIX: RadixConfig = RadixConfig {
+        switch_threshold: 256,
+        partitions: 16,
+        ..RadixConfig::DEFAULT
+    };
+
+    fn consume_all(table: &mut AggregatedTable<IntExtractor, CountValue>, values: &[i32]) {
+        let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
+        for chunk in values.chunks(RECORD_BATCH_SIZE) {
+            let array: ArrayRef = Arc::new(Int32Array::from(chunk.to_vec()));
+            let batch = RecordBatch::try_new(schema.clone(), vec![array]).unwrap();
+            table.consume_batch(
+                &batch,
+                &[0],
+                &[AggregationSlot::new(
+                    AggregationKind::CountStar,
+                    0,
+                    DataType::Int64,
+                )],
+                &(),
+                &(),
+            );
+        }
+    }
+
+    fn scatter_row_count(output: &AggregatedTableOutput<IntExtractor, CountValue>) -> usize {
+        let layout = StridedScatterRows::<i32, CountValue>::layout::<0>(&());
+        let mut rows = 0;
+        for bucket in &output.buffers.as_ref().expect("worker switched").0 {
+            bucket.for_each(layout, |_, _, _| rows += 1);
+        }
+        rows
+    }
+
+    #[test]
+    fn unique_fills_fall_back_to_raw_scatter() {
+        init_test_free_pool(64);
+        let mut table = AggregatedTable::<IntExtractor, CountValue>::new(
+            ahash::RandomState::new(),
+            SharedArena::new(64),
+            (),
+            (),
+            SMALL_RADIX,
+        );
+
+        // Unique keys make every post-switch fill 100% distinct, tripping the
+        // fallback; the duplicate tail must then be scattered one row each.
+        let mut values: Vec<i32> = (0..4000).collect();
+        values.extend(std::iter::repeat_n(999_999, 1000));
+        consume_all(&mut table, &values);
+        let output = table.flush();
+
+        assert!(
+            scatter_row_count(&output) > 4500,
+            "duplicates should be scattered raw after the fallback"
+        );
+    }
+
+    #[test]
+    fn deduplicating_fills_stay_on_the_dedup_route() {
+        init_test_free_pool(64);
+        let mut table = AggregatedTable::<IntExtractor, CountValue>::new(
+            ahash::RandomState::new(),
+            SharedArena::new(64),
+            (),
+            (),
+            SMALL_RADIX,
+        );
+
+        // Each key repeats twice back to back, so every fill dedups half its
+        // rows and stays comfortably under the fallback threshold.
+        let values: Vec<i32> = (0..2000).flat_map(|k| [k, k]).collect();
+        consume_all(&mut table, &values);
+        let output = table.flush();
+
+        assert!(
+            scatter_row_count(&output) < 2500,
+            "dedup before scatter should persist across repeat-heavy fills"
+        );
     }
 }
 
