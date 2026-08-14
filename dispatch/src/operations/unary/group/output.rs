@@ -1,4 +1,4 @@
-//! Assembles streamed merge groups into output [`RecordBatch`]es.
+//! Assembles a merged partition table into output [`RecordBatch`]es.
 //!
 //! This module combines key columns with aggregation columns. Neither side
 //! needs to know the other's concrete representation.
@@ -16,6 +16,7 @@ use crate::memory::{
 };
 use crate::operations::channels::Sender;
 use crate::operations::unary::group::arena::SharedArena;
+use crate::operations::unary::group::hashtables::Table;
 use crate::operations::unary::group::keys::{KeyColumnBuilder, KeyExtractor};
 use crate::operations::unary::group::values::{
     AggregationValue, ValueColumnBuilder, WorkerContext, cast_value_column,
@@ -59,16 +60,14 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> TopKHeap<K, V> {
     }
 }
 
-/// Offers one merged group to a top-k heap.
+/// Offers every group in a table to a top-k heap.
 ///
 /// The retention check precedes [`AggregationValue::to_owned`], so dynamic
 /// cells are copied only for candidates the heap can keep.
-#[inline(always)]
-fn offer_group<K, V, A>(
+fn offer_all<K, V, A>(
     heap: &mut SlabTopK<V::SortKey, (K::Persisted, V::Owned), A>,
     slot: usize,
-    key: &K::Persisted,
-    stored: &V,
+    table: &Table<K::Persisted, V>,
     allocator: &mut SlabAllocator,
     context: &V::SharedContext,
     owned_context: &mut Option<V::WorkerContext>,
@@ -77,10 +76,12 @@ fn offer_group<K, V, A>(
     V: AggregationValue + ?Sized,
     A: HeapBuffer<Ranked<V::SortKey, (K::Persisted, V::Owned)>>,
 {
-    let sort_key = stored.sort_key(slot);
-    if heap.would_retain(sort_key) {
-        let value = stored.to_owned(context, owned_context);
-        heap.offer(allocator, sort_key, (*key, value));
+    for entry in table.iter(0) {
+        let sort_key = entry.stored.sort_key(slot);
+        if heap.would_retain(sort_key) {
+            let value = entry.stored.to_owned(context, owned_context);
+            heap.offer(allocator, sort_key, (*entry.key, value));
+        }
     }
 }
 
@@ -178,17 +179,14 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
         self.len += 1;
     }
 
-    /// Accepts one merged group, applying worker-wide pruning when enabled.
-    ///
-    /// Returns whether the caller should keep sending groups: `false` once an
-    /// unordered LIMIT's budget is spent, so the merge can stop early.
-    pub(crate) fn accept_group(
+    /// Appends one partition table, applying worker-wide pruning when enabled.
+    pub(crate) fn extend_from_table(
         &mut self,
-        key: &K::Persisted,
-        stored: &V,
+        table: Table<K::Persisted, V>,
         allocator: &mut SlabAllocator,
         sender: &mut dyn Sender<RecordBatch>,
-    ) -> Result<bool> {
+    ) -> Result<()> {
+        // Match the top-k backing once per table, not once per row.
         {
             let Self {
                 mode,
@@ -198,41 +196,54 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
             } = self;
             match mode {
                 OutputMode::TopK(TopKHeap::Single { slot, heap }) => {
-                    offer_group::<K, V, _>(
+                    offer_all::<K, V, _>(
                         heap,
                         *slot,
-                        key,
-                        stored,
+                        &table,
                         allocator,
                         shared_context,
                         owned_copy_context,
                     );
-                    return Ok(true);
+                    return Ok(());
                 }
                 OutputMode::TopK(TopKHeap::Multi { slot, heap }) => {
-                    offer_group::<K, V, _>(
+                    offer_all::<K, V, _>(
                         heap,
                         *slot,
-                        key,
-                        stored,
+                        &table,
                         allocator,
                         shared_context,
                         owned_copy_context,
                     );
-                    return Ok(true);
+                    return Ok(());
                 }
-                OutputMode::First { remaining } => {
-                    if *remaining == 0 {
-                        return Ok(false);
-                    }
-                    *remaining -= 1;
-                }
-                OutputMode::Unlimited => {}
+                OutputMode::First { .. } | OutputMode::Unlimited => {}
             }
         }
-        self.push_entry(key, stored);
-        self.flush_if_full(allocator, sender)?;
-        Ok(true)
+        match &mut self.mode {
+            // Preserve the remaining budget for later partitions.
+            OutputMode::First { remaining } => {
+                let mut remaining = *remaining;
+                for entry in table.iter(0) {
+                    if remaining == 0 {
+                        break;
+                    }
+                    remaining -= 1;
+                    self.push_entry(entry.key, entry.stored);
+                    self.flush_if_full(allocator, sender)?;
+                }
+                self.mode = OutputMode::First { remaining };
+            }
+            // Without pushdown, stream every group.
+            OutputMode::Unlimited => {
+                for entry in table.iter(0) {
+                    self.push_entry(entry.key, entry.stored);
+                    self.flush_if_full(allocator, sender)?;
+                }
+            }
+            OutputMode::TopK(_) => unreachable!("top-k handled above"),
+        }
+        Ok(())
     }
 
     #[inline]

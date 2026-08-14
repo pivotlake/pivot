@@ -10,17 +10,13 @@ pub use crate::operations::unary::group::values::AggregationValue;
 
 mod hash_table;
 pub(crate) use hash_table::value_offset_for;
-pub use hash_table::{LiveKey, PersistedKey};
+pub use hash_table::{LiveKey, MAX_LOAD_FACTOR, PersistedKey, Prober};
 
 mod table_reader;
 pub(crate) use table_reader::TableReader;
 
 mod sorted_run;
 pub use sorted_run::{BUCKET_BITS, BUCKET_COUNT, SortedRun};
-
-mod dense_run;
-pub use dense_run::DenseRun;
-pub(crate) use dense_run::DenseRunBuilder;
 
 mod aggregated_table;
 pub use aggregated_table::{AggregatedTable, AggregatedTableOutput, SealedTable, SpillConfig};
