@@ -5,7 +5,8 @@ mod common;
 
 use std::sync::Arc;
 
-use arrow_array::{Array, Int64Array, RecordBatch};
+use arrow_array::cast::AsArray;
+use arrow_array::{Array, BooleanArray, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 
 use common::*;
@@ -115,6 +116,78 @@ fn join_on_int32_keys() {
         .collect();
     keys.sort();
     assert_eq!(keys, vec![20, 30]);
+}
+
+#[test]
+fn join_on_boolean_keys() {
+    let d = dispatch(1);
+    let boolean_key_batch = |keys: Vec<Option<bool>>, values: Vec<i64>| {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Boolean, true),
+                Field::new("value", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(BooleanArray::from(keys)),
+                Arc::new(Int64Array::from(values)),
+            ],
+        )
+        .unwrap()
+    };
+    let build = values_input(
+        &d,
+        vec![boolean_key_batch(
+            vec![Some(true), Some(false), None],
+            vec![10, 20, 30],
+        )],
+    )
+    .record_batches();
+    let probe = values_input(
+        &d,
+        vec![boolean_key_batch(
+            vec![Some(false), Some(true), None],
+            vec![200, 100, 300],
+        )],
+    )
+    .record_batches();
+
+    let results = probe
+        .join(
+            build,
+            &[DataType::Boolean],
+            JoinSpec {
+                probe_key_indices: vec![0],
+                build_key_indices: vec![0],
+                probe_output_indices: vec![1],
+                build_output_indices: vec![1],
+                probe_fields: int64_fields(1),
+                build_fields: int64_fields(1),
+                kind: JoinKind::Inner,
+                residual_filters: None,
+            },
+        )
+        .collect()
+        .unwrap();
+    let mut rows: Vec<(i64, i64)> = results
+        .iter()
+        .flat_map(|batch| {
+            let probe_values = batch
+                .column(0)
+                .as_primitive::<arrow_array::types::Int64Type>();
+            let build_values = batch
+                .column(1)
+                .as_primitive::<arrow_array::types::Int64Type>();
+            probe_values
+                .values()
+                .iter()
+                .zip(build_values.values())
+                .map(|(&probe, &build)| (probe, build))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    rows.sort();
+
+    assert_eq!(rows, vec![(100, 10), (200, 20)]);
 }
 
 #[test]

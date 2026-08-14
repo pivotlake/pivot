@@ -17,6 +17,31 @@ fn str_col(values: Vec<&'static str>) -> ArrayRef {
     Arc::new(StringViewArray::from(values))
 }
 
+// The tables ride VALUES rather than the parquet fixture because the test
+// parquet reader has no boolean decoder; the join itself is what matters.
+#[rstest]
+fn joins_on_boolean_keys(mut testing_planner: TestingPlanner) {
+    let mut rows = run(
+        &mut testing_planner,
+        "WITH toggles(t_id, t_on) AS (VALUES (1, true), (2, false), (3, true)), \
+         labels(l_on, l_name) AS (VALUES (true, 'on'), (false, 'off')) \
+         SELECT t_id, l_name FROM toggles JOIN labels ON t_on = l_on",
+    );
+    rows.sort_by_key(|row| row["t_id"].as_i64().unwrap());
+
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"t_id": 1, "l_name": "on"},
+            {"t_id": 2, "l_name": "off"},
+            {"t_id": 3, "l_name": "on"},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
+
 #[rstest]
 fn cross_join_emits_every_pair(mut testing_planner: TestingPlanner) {
     // Setup
