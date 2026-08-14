@@ -14,22 +14,23 @@ use duckdb_planner::duckdb_bridge::duckdb_types::LimitNodeType;
 use duckdb_planner::handle::{
     Aggregate as AggregateView, BridgeError, ChunkGet as ChunkGetView, Compact as CompactView,
     CopyFromStdin as CopyFromStdinView, CreateSchema as CreateSchemaView,
-    CreateTable as CreateTableView, CreateUser as CreateUserView, Filter as FilterView,
-    Insert as InsertView, Limit as LimitView, OrderBy as OrderByView, OrderKey,
-    Projection as ProjectionView, Reset as ResetView, Set as SetView,
+    CreateTable as CreateTableView, CreateUser as CreateUserView, Drop as DropView,
+    Filter as FilterView, Insert as InsertView, Limit as LimitView, OrderBy as OrderByView,
+    OrderKey, Projection as ProjectionView, Reset as ResetView, Set as SetView,
     TableFunctionScan as TableFunctionScanView, TableScan as TableScanView, TopN as TopNView,
     Values as ValuesView,
 };
 
 use super::{BuildCtx, build_scan_columns};
 use crate::catalog::{
-    BoundTable, Column, CreateSchemaRequest, CreateTableRequest, DuckDBTableAdapter,
+    BoundTable, Column, CreateSchemaRequest, CreateTableRequest, DropTableRequest,
+    DuckDBTableAdapter,
 };
 use crate::expression::{Error as ExpressionError, Expression};
 use crate::operator::{
     Aggregate, Compact, CopyFormat, CopyFromStdin, CreateSchema, CreateTable, CreateUser,
-    Error as OperatorError, Filter, Input, Insert, Limit, OrderBy, OrderByNode, Projection,
-    SetVariable, TableFunctionScan, TopN, Values,
+    DropTable, Error as OperatorError, Filter, Input, Insert, Limit, OrderBy, OrderByNode,
+    Projection, SetVariable, TableFunctionScan, TopN, Values,
 };
 use crate::types::{build_scalar_value, type_from_logical};
 
@@ -211,6 +212,20 @@ impl CreateSchema {
                 if_not_exists: view.if_not_exists()?,
             },
             or_replace: view.or_replace()?,
+        })
+    }
+}
+
+impl DropTable {
+    pub(crate) fn from_handle(view: DropView<'_>) -> Result<DropTable, OperatorError> {
+        Ok(DropTable {
+            request: DropTableRequest {
+                datastore_name: view.datastore()?,
+                schema_name: view.schema()?,
+                name: view.name()?,
+                if_exists: view.if_exists()?,
+            },
+            cascade: view.cascade()?,
         })
     }
 }

@@ -19,6 +19,8 @@
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_create.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
+#include "duckdb/planner/operator/logical_simple.hpp"
+#include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_delim_get.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
@@ -713,6 +715,44 @@ bool lo_create_schema_if_not_exists(const LogicalOperator &op) {
 
 bool lo_create_schema_or_replace(const LogicalOperator &op) {
 	return create_schema_info(op).on_conflict == duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
+}
+
+// ---- Drop ----
+
+static duckdb::DropInfo &drop_info(const LogicalOperator &op) {
+	return as<duckdb::LogicalSimple>(op).info->Cast<duckdb::DropInfo>();
+}
+
+bool lo_drop_is_table(const LogicalOperator &op) {
+	return drop_info(op).type == duckdb::CatalogType::TABLE_ENTRY;
+}
+
+rust::String lo_drop_entry_kind(const LogicalOperator &op) {
+	return rust::String::lossy(duckdb::CatalogTypeToString(drop_info(op).type));
+}
+
+rust::String lo_drop_name(const LogicalOperator &op) {
+	return rust::String::lossy(drop_info(op).name);
+}
+
+rust::String lo_drop_schema(const LogicalOperator &op) {
+	// The binder fills `schema` with the resolved entry's parent schema; for an
+	// `IF EXISTS` drop of a missing entry it stays as written, possibly empty.
+	return rust::String::lossy(drop_info(op).schema);
+}
+
+rust::String lo_drop_datastore(const LogicalOperator &op) {
+	// DuckDB stores the resolved datastore/database in its native `catalog`
+	// field. It is empty when the statement is unqualified and nothing resolved.
+	return rust::String::lossy(drop_info(op).catalog);
+}
+
+bool lo_drop_if_exists(const LogicalOperator &op) {
+	return drop_info(op).if_not_found == duckdb::OnEntryNotFound::RETURN_NULL;
+}
+
+bool lo_drop_cascade(const LogicalOperator &op) {
+	return drop_info(op).cascade;
 }
 
 size_t lo_create_column_count(const LogicalOperator &op) {

@@ -217,6 +217,44 @@ fn create_table_propagates_with_options(mut testing_planner: TestingPlanner) {
 }
 
 #[rstest]
+fn drop_table_produces_drop_table_operator(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner.plan("DROP TABLE example_table").unwrap();
+
+    assert_snapshot!(plan.to_string(), @"DropTable(example_table)
+    ");
+}
+
+#[rstest]
+fn drop_table_if_exists_of_a_missing_table_still_plans(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .plan("DROP TABLE IF EXISTS no_such_table")
+        .unwrap();
+
+    assert_snapshot!(plan.to_string(), @"DropTable(no_such_table)
+    ");
+}
+
+#[rstest]
+fn drop_of_a_missing_table_without_if_exists_fails_at_binding(mut testing_planner: TestingPlanner) {
+    let err = testing_planner
+        .plan("DROP TABLE no_such_table")
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("no_such_table"), "{err}");
+}
+
+#[rstest]
+fn drop_of_a_non_table_entry_is_unsupported(mut testing_planner: TestingPlanner) {
+    let err = testing_planner
+        .plan("DROP SCHEMA some_schema")
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("DROP Schema is not supported"), "{err}");
+}
+
+#[rstest]
 fn create_user_produces_create_user_operator(mut testing_planner: TestingPlanner) {
     let plan = testing_planner.plan("CREATE USER alice").unwrap();
 

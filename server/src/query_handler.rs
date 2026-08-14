@@ -97,6 +97,7 @@ fn build_command_response(command: Command) -> Response {
         Command::CreateTable => Response::Execution(Tag::new("CREATE TABLE")),
         Command::CreateSchema => Response::Execution(Tag::new("CREATE SCHEMA")),
         Command::CreateUser => Response::Execution(Tag::new("CREATE USER")),
+        Command::DropTable => Response::Execution(Tag::new("DROP TABLE")),
         Command::Compact => Response::Execution(Tag::new("COMPACT")),
     }
 }

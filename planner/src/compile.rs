@@ -112,6 +112,12 @@ pub enum Error {
     TableScan(#[source] crate::catalog::Error),
     #[error("creating table: {0}")]
     CreateTable(#[source] crate::catalog::Error),
+    #[error("DROP TABLE does not support CASCADE: there are no dependent objects to cascade over")]
+    UnsupportedDropTableCascade,
+    #[error("DROP TABLE does not take inputs")]
+    UnexpectedDropTableInputs,
+    #[error("dropping table: {0}")]
+    DropTable(#[source] crate::catalog::Error),
     #[error("CREATE OR REPLACE SCHEMA is not supported")]
     UnsupportedCreateSchemaOrReplace,
     #[error("CREATE SCHEMA does not take inputs")]
@@ -287,6 +293,12 @@ impl PlanNode {
             crate::Operator::CreateSchema(o) => {
                 if !inputs.is_empty() {
                     return Err(Error::UnexpectedCreateSchemaInputs);
+                }
+                o.compile(dispatcher, transaction)
+            }
+            crate::Operator::DropTable(o) => {
+                if !inputs.is_empty() {
+                    return Err(Error::UnexpectedDropTableInputs);
                 }
                 o.compile(dispatcher, transaction)
             }

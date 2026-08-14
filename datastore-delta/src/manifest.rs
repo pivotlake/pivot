@@ -36,6 +36,10 @@ pub enum Error {
     /// the table's registration is missing, so the manifest is inconsistent.
     #[error("table `{table}`: the manifest records identity {id} but no location for it")]
     MissingTableLocation { table: String, id: TableId },
+    /// A table was removed by a name the manifest does not hold. The caller
+    /// resolved the table against live state, so the manifest is out of sync.
+    #[error("table `{0}` does not exist")]
+    MissingTable(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -285,6 +289,20 @@ impl CatalogManifestSchemaEntry {
     }
 }
 
+/// A dropped table's tombstone: the identity and storage location the table
+/// held, kept so vacuum can delete the storage once the retention window has
+/// passed (a query that bound the table before the drop may still be reading
+/// its files). `retention_ms` is the table's own `deletedFileRetentionDuration`,
+/// captured at drop time because the Delta log it lived in is itself part of
+/// the storage awaiting deletion.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct DroppedTableEntry {
+    pub(crate) id: TableId,
+    pub(crate) location: ObjectPath,
+    pub(crate) dropped_at_ms: u64,
+    pub(crate) retention_ms: u64,
+}
+
 /// The database manifest: the index of which schemas and tables exist and where
 /// each table's data lives. A monotonically increasing `version` records how
 /// many times it has changed.
@@ -301,6 +319,11 @@ pub struct CatalogManifest {
     /// names it.
     #[serde(default)]
     pub(crate) table_locations: HashMap<TableId, ObjectPath>,
+    /// Tables that were dropped but whose storage has not been reclaimed yet.
+    /// Vacuum deletes each one's storage after its retention window and then
+    /// removes the tombstone.
+    #[serde(default)]
+    pub(crate) dropped_tables: Vec<DroppedTableEntry>,
 }
 
 impl Default for CatalogManifest {
@@ -310,6 +333,7 @@ impl Default for CatalogManifest {
             version: 0,
             schemas: default_schemas(),
             table_locations: HashMap::new(),
+            dropped_tables: Vec::new(),
         }
     }
 }
@@ -347,6 +371,70 @@ impl CatalogManifest {
         self.table_locations.insert(id, location);
         self.version += 1;
         Ok(())
+    }
+
+    /// Unregister the table `name` resolves to, leaving a tombstone so vacuum
+    /// can delete the table's storage once `retention_ms` has passed (counted
+    /// from `dropped_at_ms`). Errors if the schema or the name is missing: the
+    /// caller resolved the table against live state, so a manifest that
+    /// disagrees is out of sync, not a no-op.
+    pub(crate) fn remove_table(
+        &mut self,
+        name: &SchemaQualifiedTableName,
+        dropped_at_ms: u64,
+        retention_ms: u64,
+    ) -> Result<TableId> {
+        let schema = self
+            .schemas
+            .iter_mut()
+            .find(|s| s.name == name.schema)
+            .ok_or_else(|| Error::MissingSchema(name.schema.clone()))?;
+        let id = schema
+            .table_ids
+            .remove(&name.table)
+            .ok_or_else(|| Error::MissingTable(name.to_string()))?;
+        let location =
+            self.table_locations
+                .remove(&id)
+                .ok_or_else(|| Error::MissingTableLocation {
+                    table: name.to_string(),
+                    id,
+                })?;
+        self.dropped_tables.push(DroppedTableEntry {
+            id,
+            location,
+            dropped_at_ms,
+            retention_ms,
+        });
+        self.version += 1;
+        Ok(id)
+    }
+
+    /// The dropped-table tombstones awaiting storage reclamation.
+    pub(crate) fn dropped_tables(&self) -> &[DroppedTableEntry] {
+        &self.dropped_tables
+    }
+
+    /// Forget the tombstone for dropped table `id`: its storage has been
+    /// deleted, so there is nothing left to reclaim. Unknown ids are a no-op,
+    /// so reclaiming a tombstone another writer already forgot converges.
+    pub(crate) fn remove_dropped_table(&mut self, id: &TableId) {
+        let before = self.dropped_tables.len();
+        self.dropped_tables.retain(|entry| entry.id != *id);
+        if self.dropped_tables.len() != before {
+            self.version += 1;
+        }
+    }
+
+    /// The identity `name` currently resolves to, or `None`: how a refresh
+    /// decides whether the table it holds is still the one the manifest names.
+    pub(crate) fn table_id(&self, name: &SchemaQualifiedTableName) -> Option<TableId> {
+        self.schemas
+            .iter()
+            .find(|s| s.name == name.schema)?
+            .table_ids
+            .get(&name.table)
+            .copied()
     }
 
     /// Every table the database holds: its schema-qualified name, its identity,

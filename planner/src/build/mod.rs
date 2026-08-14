@@ -30,9 +30,9 @@ use crate::catalog::BoundTable;
 use crate::expression::{Cast, Error as ExpressionError, Expression, Function, Ref, VariantGet};
 use crate::operator::{
     Aggregate, Compact, CopyFromStdin, CreateSchema, CreateTable, CreateUser, Cte, CteScan,
-    Distinct, DummyScan, Error as OperatorError, Explain, Filter, Input, Insert, Join, JoinKind,
-    Limit, Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan, TopN,
-    Values,
+    Distinct, DropTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Insert, Join,
+    JoinKind, Limit, Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan,
+    TopN, Values,
 };
 use crate::plan::{self, PlanNode};
 use crate::types::{Type, physical_arrow_type, type_from_logical};
@@ -166,6 +166,18 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         }
         DuckOperator::CreateTable(c) => Operator::CreateTable(CreateTable::from_handle(c)?),
         DuckOperator::CreateSchema(c) => Operator::CreateSchema(CreateSchema::from_handle(c)?),
+        DuckOperator::Drop(d) => {
+            // Tables are the only entry kind pivot can drop; any other kind
+            // reports what was asked rather than a generic unsupported-operator
+            // error.
+            if !d.is_table()? {
+                return Err(OperatorError::Unsupported(format!(
+                    "DROP {} is not supported",
+                    d.entry_kind()?
+                )));
+            }
+            Operator::DropTable(DropTable::from_handle(d)?)
+        }
         DuckOperator::Set(s) => Operator::SetVariable(SetVariable::from_set(s)?),
         DuckOperator::Reset(r) => Operator::SetVariable(SetVariable::from_reset(r)?),
         DuckOperator::Compact(c) => Operator::Compact(Compact::from_handle(c)?),

@@ -158,6 +158,38 @@ impl CreateTableRequest {
     }
 }
 
+/// Description of a table to be dropped, produced by translating a
+/// `DROP TABLE` statement and consumed by
+/// [`CatalogTransaction::bind_drop_table`], which routes it to the datastore
+/// holding the table.
+///
+/// `datastore_name` and `schema_name` are the qualifiers DuckDB resolved while
+/// binding the statement, so in practice each is `Some` whenever the table was
+/// found. They stay optional both for a caller building a request by hand and
+/// for an `IF EXISTS` drop of a missing table, where DuckDB has nothing to
+/// resolve and leaves the qualifiers as written (possibly absent); the catalog
+/// reads a `None` as the default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropTableRequest {
+    pub datastore_name: Option<String>,
+    pub schema_name: Option<String>,
+    pub name: String,
+    pub if_exists: bool,
+}
+
+impl DropTableRequest {
+    /// The name the target datastore resolves the dropped table by: the schema
+    /// the statement named, or the default when it named none.
+    pub fn schema_qualified_name(&self) -> SchemaQualifiedTableName {
+        SchemaQualifiedTableName::new(
+            self.schema_name
+                .as_deref()
+                .unwrap_or(crate::DEFAULT_SCHEMA_NAME),
+            self.name.clone(),
+        )
+    }
+}
+
 /// Description of a schema to be created, produced by translating a
 /// `CREATE SCHEMA` statement and consumed by
 /// [`CatalogTransaction::bind_create_schema`], which routes it to the target
@@ -246,6 +278,16 @@ pub trait CatalogTransaction: Debug + Send + Sync {
         .into())
     }
 
+    /// Resolve a `DROP TABLE` by routing to the datastore
+    /// [`DropTableRequest::datastore_name`] names (the default when unqualified)
+    /// and deferring to that datastore's own `bind_drop_table`.
+    fn bind_drop_table(&self, _request: DropTableRequest) -> Result<Box<dyn TableDrop>> {
+        Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "this catalog does not support DROP TABLE",
+        )
+        .into())
+    }
+
     /// Resolve a `CREATE SCHEMA` by routing to the datastore
     /// [`CreateSchemaRequest::datastore_name`] names (the default when
     /// unqualified) and deferring to that datastore's own `bind_create_schema`.
@@ -287,6 +329,21 @@ pub trait CatalogTransaction: Debug + Send + Sync {
 pub trait TableCreation: Send + Sync {
     /// Build the dataflow that fetches the new table's file footers over the pool
     /// and stages the completed creation for the transaction's commit.
+    fn compile(&self, dispatcher: &DataFlowDispatcher) -> Result<RecordBatchOperatorSpec>;
+}
+
+/// A resolved `DROP TABLE`, bound to the datastore holding the table and ready
+/// to be compiled into the dataflow that stages the drop.
+///
+/// A drop reads no data, so the dataflow this compiles to does nothing but
+/// stage it. It exists so that the catalog changes when the statement *runs*
+/// rather than when it is planned: resolving and compiling a statement must
+/// leave the catalog untouched, or merely planning one (to report an error, to
+/// render `EXPLAIN`) would drop the table. Durable removal belongs to
+/// [`CatalogTransaction::commit`], as durable creation does for a table.
+pub trait TableDrop: Send + Sync {
+    /// Build the dataflow that stages this drop for the transaction's commit.
+    /// It emits no rows.
     fn compile(&self, dispatcher: &DataFlowDispatcher) -> Result<RecordBatchOperatorSpec>;
 }
 

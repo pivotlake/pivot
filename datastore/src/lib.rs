@@ -15,8 +15,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use planner::TableFunction;
 use planner::catalog::{
-    BoundTable, CreateSchemaRequest, CreateTableRequest, Result, SchemaCreation,
-    SchemaQualifiedTableName, TableCreation, TableRevision,
+    BoundTable, CreateSchemaRequest, CreateTableRequest, DropTableRequest, Result, SchemaCreation,
+    SchemaQualifiedTableName, TableCreation, TableDrop, TableRevision,
 };
 
 /// One query's transaction against a **single datastore**: a consistent
@@ -84,6 +84,19 @@ pub trait DatastoreTransaction: Debug + Send + Sync {
     fn bind_create_table(&self, _request: CreateTableRequest) -> Result<Box<dyn TableCreation>> {
         Err(Box::<dyn std::error::Error + Send + Sync>::from(
             "this datastore does not support CREATE TABLE",
+        )
+        .into())
+    }
+
+    /// Resolve a `DROP TABLE` against this datastore into a [`TableDrop`] the
+    /// caller compiles into the dataflow that stages it. Split the same way
+    /// [`bind_create_table`](Self::bind_create_table) is, so that resolving a
+    /// statement never changes the catalog by itself: the drop is staged when
+    /// the compiled dataflow runs, and made durable by [`commit`](Self::commit).
+    /// The default rejects DDL (a read-only datastore).
+    fn bind_drop_table(&self, _request: DropTableRequest) -> Result<Box<dyn TableDrop>> {
+        Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "this datastore does not support DROP TABLE",
         )
         .into())
     }
