@@ -16,7 +16,11 @@
 use crate::operations::unary::group::hll::Hll;
 
 /// Bits of hash prefix resolved by the per-run bucket index.
-pub const BUCKET_BITS: u32 = 12;
+///
+/// Fine enough that one bucket's slice of the merge target stays inside L1
+/// while every source folds into it, and that the partition count never hits
+/// the bucket ceiling.
+pub const BUCKET_BITS: u32 = 16;
 
 /// Number of equal hash ranges each run's bucket index resolves.
 pub const BUCKET_COUNT: usize = 1 << BUCKET_BITS;

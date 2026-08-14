@@ -179,45 +179,52 @@ fn merge_combined_rows<const N: usize, S: StoredKey, V: AggregationValue + ?Size
             result.prober_with_metadata(V::metadata_for_arity::<N>())
         };
 
-        for source in sources {
-            match source {
-                MergeSource::Dense(run) => {
-                    let (from, to) = run.bucket_range(bucket_lo, bucket_hi);
-                    if from == to {
-                        continue;
+        // Fold bucket by bucket, every source in turn, rather than source by
+        // source across the whole partition: one bucket's entries land in a
+        // narrow region of the target, so all sources hit that region while
+        // it is cache-warm instead of each source refetching the whole
+        // target's slot range.
+        for bucket in bucket_lo..bucket_hi {
+            for source in sources {
+                match source {
+                    MergeSource::Dense(run) => {
+                        let (from, to) = run.bucket_range(bucket, bucket + 1);
+                        if from == to {
+                            continue;
+                        }
+                        let reader = run.reader::<N>();
+                        merge_run_slice::<N, S, V>(
+                            &mut allocator,
+                            key_arena,
+                            &reader,
+                            |index| reader.entry_ptr(index) as *const u8,
+                            from,
+                            to,
+                            &mut target,
+                            context,
+                        );
                     }
-                    let reader = run.reader::<N>();
-                    merge_run_slice::<N, S, V>(
-                        &mut allocator,
-                        key_arena,
-                        &reader,
-                        |index| reader.entry_ptr(index) as *const u8,
-                        from,
-                        to,
-                        &mut target,
-                        context,
-                    );
-                }
-                MergeSource::Sealed(sealed) => {
-                    let (from, to) = sealed.run.bucket_range(bucket_lo, bucket_hi);
-                    if from == to {
-                        continue;
+                    MergeSource::Sealed(sealed) => {
+                        let (from, to) = sealed.run.bucket_range(bucket, bucket + 1);
+                        if from == to {
+                            continue;
+                        }
+                        let reader = sealed.table.reader::<N>();
+                        let positions = sealed.run.positions_ptr();
+                        merge_run_slice::<N, S, V>(
+                            &mut allocator,
+                            key_arena,
+                            &reader,
+                            |index| {
+                                let slot = unsafe { *positions.add(index) } as usize;
+                                reader.entry_ptr(slot) as *const u8
+                            },
+                            from,
+                            to,
+                            &mut target,
+                            context,
+                        );
                     }
-                    let reader = sealed.table.reader::<N>();
-                    let positions = sealed.run.positions_ptr();
-                    merge_run_slice::<N, S, V>(
-                        &mut allocator,
-                        key_arena,
-                        &reader,
-                        |index| {
-                            let slot = unsafe { *positions.add(index) } as usize;
-                            reader.entry_ptr(slot) as *const u8
-                        },
-                        from,
-                        to,
-                        &mut target,
-                        context,
-                    );
                 }
             }
         }

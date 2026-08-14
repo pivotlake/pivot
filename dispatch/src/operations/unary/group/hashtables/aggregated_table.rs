@@ -30,13 +30,13 @@ use std::sync::Arc;
 /// Slot count past which tables stop growing and start stacking.
 ///
 /// Two costs pull against each other. A smaller table keeps probes closer to
-/// the core but splits the input into more tables, and the merge picks up every
-/// table once per partition, so its fixed cost scales with the table count. A
-/// larger table deduplicates more and leaves fewer tables to merge, but its
-/// probes reach further out in the hierarchy. Measured across the
-/// high-cardinality group-bys, the total is flat-bottomed around here and
-/// climbs steeply below it.
-const SPILL_CAPACITY: usize = 65536;
+/// the core but splits the input into more tables, which consolidation and
+/// the merge pay for per entry copied and per source slice. A larger table
+/// deduplicates more but its probes reach further out in the hierarchy.
+/// Swept across the high-cardinality group-bys: 32768 beats 65536 on every
+/// one of them (the stack is consolidated per worker, so the merge no longer
+/// charges per table), and 16384 measures the same as 32768.
+const SPILL_CAPACITY: usize = 32768;
 
 /// Sizing for a worker's table stack.
 #[derive(Copy, Clone)]
