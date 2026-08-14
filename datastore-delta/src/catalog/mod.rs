@@ -50,8 +50,8 @@ use datastore::{Datastore, DatastoreTransaction};
 use dispatch::{DataFlowDispatcher, DataFlowError, OneShotNullaryFactory, RecordBatchOperatorSpec};
 use local_lock::LocalDatastoreLock;
 use planner::catalog::{
-    BoundTable, CreateSchemaRequest, CreateTableRequest, Error as CatalogError,
-    Result as CatalogResult, SchemaCreation, SchemaQualifiedTableName, TableCreation,
+    BoundTable, CreateSchemaRequest, CreateTableRequest, DropTableRequest, Error as CatalogError,
+    Result as CatalogResult, SchemaCreation, SchemaQualifiedTableName, TableCreation, TableDrop,
     TableRevision,
 };
 pub use table::CatalogTable;
@@ -176,6 +176,16 @@ impl DatastoreIndex {
     /// unchanged, so neither the schema nor the name index needs touching.
     fn replace_table(&mut self, table: CatalogTable) {
         self.tables_by_id.insert(table.id(), table);
+    }
+
+    /// Remove the table `name` resolves to from both halves of the index,
+    /// returning its identity, or `None` if no such table is indexed. Removing
+    /// the name alone would leave the table reachable by id (a commit resolves
+    /// tables that way), so the two maps are always updated together.
+    fn remove_table(&mut self, name: &SchemaQualifiedTableName) -> Option<Uuid> {
+        let id = self.schemas.get_mut(&name.schema)?.remove(&name.table)?;
+        self.tables_by_id.remove(&id);
+        Some(id)
     }
 
     /// Register a schema, reporting whether it was new.
@@ -412,6 +422,7 @@ impl DeltaDatastore {
             uploaded_files: Arc::new(Injector::new()),
             pending_table_creations: Arc::new(Injector::new()),
             pending_schema_creations: Arc::new(Injector::new()),
+            pending_table_drops: Arc::new(Injector::new()),
             datastore: self,
             committed: std::sync::atomic::AtomicBool::new(false),
         })
@@ -426,8 +437,13 @@ impl DeltaDatastore {
     /// queries always bind against an already-materialized set. Returns whether
     /// anything changed.
     ///
-    /// Tables are never removed here: there is no `DROP TABLE`, and removing a
-    /// map entry on a manifest miss could race a concurrent in-process create.
+    /// A table another process dropped (or dropped and recreated, changing its
+    /// identity) is removed here. The removal never trusts the sweep's first
+    /// manifest read: that read races in-process DDL, so each candidate is
+    /// re-checked against a manifest reloaded *under* the index write lock,
+    /// the same lock every in-process DDL commit holds across its own
+    /// read-modify-write. Only that fresh copy can prove a table is really
+    /// gone rather than created after the first read.
     ///
     /// One table failing to load or refresh (an unsupported Delta feature, a
     /// transient store error) must not starve every other table of its
@@ -443,6 +459,31 @@ impl DeltaDatastore {
             if !index.contains_schema(&schema.name) {
                 index.insert_schema(schema.name.clone());
                 changed = true;
+            }
+        }
+
+        // A held table whose name the manifest no longer maps to the same
+        // identity was dropped (or dropped and recreated) out of process.
+        // Candidates come from this sweep's first manifest read; the paid-for
+        // fresh read happens only when there is something to remove.
+        let stale_names: Vec<SchemaQualifiedTableName> = {
+            let index = self.tables_index.read().unwrap();
+            index
+                .named_tables()
+                .filter(|(name, table)| manifest.table_id(name) != Some(table.id()))
+                .map(|(name, _)| name)
+                .collect()
+        };
+        if !stale_names.is_empty() {
+            let mut index = self.tables_index.write().unwrap();
+            let fresh_manifest = CatalogManifest::load(self.store.as_ref())?;
+            for name in stale_names {
+                let held_id = index.table_id(&name);
+                let still_stale = held_id.is_some() && fresh_manifest.table_id(&name) != held_id;
+                if still_stale {
+                    index.remove_table(&name);
+                    changed = true;
+                }
             }
         }
 
@@ -585,6 +626,105 @@ impl DeltaDatastore {
         manifest.upsert_table(&name, id, location)?;
         manifest.store(self.store.as_ref())?;
         index.insert_table(name, table);
+        Ok(())
+    }
+
+    /// Persist one table drop staged by a transaction: unregister the table
+    /// from the database index (leaving a tombstone for vacuum to reclaim the
+    /// storage after the retention window) and remove it from the live set, so
+    /// the next transaction no longer binds it. The table's files stay in
+    /// place: a query that bound the table before the drop may still be
+    /// reading them. Called from [`DeltaTransaction::commit`] on the blocking
+    /// pool, never from a dispatch worker.
+    ///
+    /// The whole step holds the index write lock, which serializes in-process
+    /// DDL and its read-modify-write of the shared manifest; the name is
+    /// re-checked under it as a race backstop, honouring `IF EXISTS` there too.
+    fn finalize_table_drop(&self, pending: PendingTableDrop) -> Result<()> {
+        let PendingTableDrop { name, if_exists } = pending;
+        let mut index = self.tables_index.write().unwrap();
+        let Some(id) = index.table_id(&name) else {
+            // A concurrent drop won the race. With `IF EXISTS` that is still a
+            // success.
+            if if_exists {
+                return Ok(());
+            }
+            return Err(Error::TableNotFound(name.to_string()));
+        };
+        let retention = index
+            .get_table_by_id(&id)
+            .expect("the name index resolved the id, so the table is held")
+            .deleted_file_retention();
+        let mut manifest = CatalogManifest::load(self.store.as_ref())?;
+        manifest.remove_table(
+            &name,
+            crate::vacuum::now_unix_ms(),
+            retention.as_millis() as u64,
+        )?;
+        manifest.store(self.store.as_ref())?;
+        index.remove_table(&name);
+        Ok(())
+    }
+
+    /// Delete the storage of every dropped table whose retention window has
+    /// passed (evaluated against `now_ms`), forgetting each tombstone once its
+    /// storage is gone. Returns how many tables were reclaimed. Driven by the
+    /// vacuum sweep; a tombstone whose deletion fails midway stays, and the
+    /// next sweep retries (deletes are idempotent).
+    pub fn reclaim_dropped_tables(&self, now_ms: u64) -> Result<u64> {
+        let expired: Vec<manifest::DroppedTableEntry> = CatalogManifest::load(self.store.as_ref())?
+            .dropped_tables()
+            .iter()
+            .filter(|entry| entry.dropped_at_ms.saturating_add(entry.retention_ms) <= now_ms)
+            .cloned()
+            .collect();
+        let mut reclaimed = 0;
+        for entry in expired {
+            self.delete_table_storage(&entry.location)?;
+            // Forget the tombstone only now, so a failure above leaves it for
+            // the next sweep. Under the index write lock like every other
+            // read-modify-write of the shared manifest.
+            let _index = self.tables_index.write().unwrap();
+            let mut manifest = CatalogManifest::load(self.store.as_ref())?;
+            manifest.remove_dropped_table(&entry.id);
+            manifest.store(self.store.as_ref())?;
+            reclaimed += 1;
+        }
+        Ok(reclaimed)
+    }
+
+    /// Delete every object under a dropped table's own storage directory: its
+    /// data files and its `_delta_log`. Only objects *listed under that
+    /// directory* are deleted, so a file the table adopted from elsewhere
+    /// (`with_pre_existing_parquets`) is never touched: it lives outside the
+    /// location and no listing here returns it.
+    fn delete_table_storage(&self, location: &ObjectPath) -> Result<()> {
+        assert!(
+            !location.is_empty(),
+            "a table's location is its own directory, never the database root"
+        );
+        let log_dir = location.join("_delta_log");
+        for directory in [location, &log_dir] {
+            for object in self.store.list(directory)? {
+                self.store
+                    .delete(&directory.join(object.file.path.as_str()))?;
+            }
+        }
+        // A local filesystem keeps directories as real entries even once every
+        // object in them is deleted, so remove the emptied ones; object stores
+        // have no directories to remove. A directory that turns out non-empty
+        // (unexpected nested content the one-level listings above never
+        // returned) fails here, keeping the tombstone for investigation rather
+        // than silently leaving unreclaimed storage behind.
+        if let Some(root) = self.store.local_root() {
+            for directory in [&log_dir, location] {
+                match std::fs::remove_dir(root.join(directory.as_str())) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
         Ok(())
     }
 
@@ -790,6 +930,25 @@ impl DeltaTransaction {
         })
     }
 
+    fn bind_drop(&self, request: DropTableRequest) -> Result<DeltaTableDrop> {
+        let name = request.schema_qualified_name();
+        if !request.if_exists {
+            if !self.contains_schema(&name.schema) {
+                return Err(Error::SchemaNotFound(name.schema));
+            }
+            if !self.snapshot.contains_table(&name) {
+                return Err(Error::TableNotFound(name.to_string()));
+            }
+        }
+        Ok(DeltaTableDrop {
+            pending_table_drops: self.pending_table_drops.clone(),
+            drop: PendingTableDrop {
+                name,
+                if_exists: request.if_exists,
+            },
+        })
+    }
+
     /// Resolve a `CREATE SCHEMA` against this datastore and stage it on the
     /// transaction. A schema is a pure naming construct here: it owns no store
     /// state of its own, so there is nothing to locate or load, and creating it
@@ -940,6 +1099,19 @@ fn commit_table_creations(
 ) -> CatalogResult<()> {
     for pending in pending_table_creations {
         datastore.finalize_table_creation(pending)?;
+    }
+    Ok(())
+}
+
+/// Commit the table drops drained from a transaction. Each one unregisters
+/// itself from the database manifest and the live table set. Blocking store
+/// I/O, so [`DeltaTransaction::commit`] runs this on the blocking pool.
+fn commit_table_drops(
+    datastore: &DeltaDatastore,
+    pending_table_drops: Vec<PendingTableDrop>,
+) -> CatalogResult<()> {
+    for pending in pending_table_drops {
+        datastore.finalize_table_drop(pending)?;
     }
     Ok(())
 }
@@ -1175,6 +1347,17 @@ struct PendingSchemaCreation {
     if_not_exists: bool,
 }
 
+/// One table drop resolved by a transaction and waiting for it to commit.
+/// Removal is pure catalog bookkeeping, so it is staged as soon as its
+/// dataflow runs.
+#[derive(Clone)]
+struct PendingTableDrop {
+    name: SchemaQualifiedTableName,
+    /// Whether the statement used `IF EXISTS`, so the commit treats a table
+    /// that vanished since resolution as a success rather than an error.
+    if_exists: bool,
+}
+
 /// One table creation whose footer metadata has been loaded successfully and is
 /// waiting for its transaction to commit it.
 struct PendingTableCreation {
@@ -1196,6 +1379,7 @@ pub struct DeltaTransaction {
     pub(super) uploaded_files: Arc<Injector<insert_sink::UploadedFile>>,
     pending_table_creations: Arc<Injector<PendingTableCreation>>,
     pending_schema_creations: Arc<Injector<PendingSchemaCreation>>,
+    pending_table_drops: Arc<Injector<PendingTableDrop>>,
     /// The datastore this transaction reads and writes back to. CREATE commits
     /// publish through it so DDL is visible to the next transaction without
     /// waiting for a refresh.
@@ -1270,6 +1454,10 @@ impl DatastoreTransaction for DeltaTransaction {
         Ok(Box::new(self.bind_schema_creation(request)?))
     }
 
+    fn bind_drop_table(&self, request: DropTableRequest) -> CatalogResult<Box<dyn TableDrop>> {
+        Ok(Box::new(self.bind_drop(request)?))
+    }
+
     async fn commit(&self) -> CatalogResult<()> {
         // Marked at entry, not on success: the swap refuses a second commit,
         // and a failed commit has already drained the staged state, so the
@@ -1286,12 +1474,14 @@ impl DatastoreTransaction for DeltaTransaction {
         if self.uploaded_files.is_empty()
             && self.pending_table_creations.is_empty()
             && self.pending_schema_creations.is_empty()
+            && self.pending_table_drops.is_empty()
         {
             return Ok(());
         }
         let datastore = self.datastore.clone();
         let pending_schema_creations = drain_injector(&self.pending_schema_creations);
         let pending_table_creations = drain_injector(&self.pending_table_creations);
+        let pending_table_drops = drain_injector(&self.pending_table_drops);
         let uploaded_files = drain_injector(&self.uploaded_files);
         tokio::task::spawn_blocking(move || {
             // Schemas first: a table is registered into its schema, so the
@@ -1299,6 +1489,7 @@ impl DatastoreTransaction for DeltaTransaction {
             // it.
             commit_schema_creations(&datastore, pending_schema_creations)?;
             commit_table_creations(&datastore, pending_table_creations)?;
+            commit_table_drops(&datastore, pending_table_drops)?;
             commit_uploaded_files(&datastore, uploaded_files)
         })
         .await
@@ -1308,6 +1499,7 @@ impl DatastoreTransaction for DeltaTransaction {
     fn rollback(&self) {
         drain_injector(&self.pending_schema_creations);
         drain_injector(&self.pending_table_creations);
+        drain_injector(&self.pending_table_drops);
         drain_injector(&self.uploaded_files);
     }
 }
@@ -1326,7 +1518,8 @@ impl Drop for DeltaTransaction {
         // so the staged-writes check below keeps it out of the net too.
         let staged_writes = !self.uploaded_files.is_empty()
             || !self.pending_table_creations.is_empty()
-            || !self.pending_schema_creations.is_empty();
+            || !self.pending_schema_creations.is_empty()
+            || !self.pending_table_drops.is_empty();
         if staged_writes {
             tracing::warn!(
                 "transaction dropped with staged writes and no resolution; rolling back"
@@ -1358,6 +1551,36 @@ impl SchemaCreation for DeltaSchemaCreation {
                 OneShotNullaryFactory::new(move || {
                     if let Some(creation) = staged {
                         pending_schema_creations.push(creation);
+                    }
+                    None
+                })
+            })
+            .collect();
+        Ok(RecordBatchOperatorSpec::from_nullary(dispatcher, factories))
+    }
+}
+
+/// A resolved `DROP TABLE` for a [`DeltaDatastore`]: the validated drop plus
+/// the transaction-owned staging queue it will land in. Compiling it builds a
+/// dataflow that stages the drop and emits no rows, so the drop lands on the
+/// transaction only once that dataflow runs.
+struct DeltaTableDrop {
+    pending_table_drops: Arc<Injector<PendingTableDrop>>,
+    drop: PendingTableDrop,
+}
+
+impl TableDrop for DeltaTableDrop {
+    fn compile(&self, dispatcher: &DataFlowDispatcher) -> CatalogResult<RecordBatchOperatorSpec> {
+        // One nullary per worker, but only the first carries the drop; the
+        // rest no-op, exactly as the schema-creation sink stages.
+        let mut drop = Some(self.drop.clone());
+        let factories: Vec<_> = (0..dispatcher.worker_count())
+            .map(|_| {
+                let staged = drop.take();
+                let pending_table_drops = self.pending_table_drops.clone();
+                OneShotNullaryFactory::new(move || {
+                    if let Some(drop) = staged {
+                        pending_table_drops.push(drop);
                     }
                     None
                 })

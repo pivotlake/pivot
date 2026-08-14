@@ -56,6 +56,7 @@ pub enum Command {
     CreateTable,
     CreateSchema,
     CreateUser,
+    DropTable,
     Compact,
 }
 
@@ -67,6 +68,7 @@ impl Command {
             Self::CreateTable => "CREATE TABLE".to_string(),
             Self::CreateSchema => "CREATE SCHEMA".to_string(),
             Self::CreateUser => "CREATE USER".to_string(),
+            Self::DropTable => "DROP TABLE".to_string(),
             Self::Compact => "COMPACT".to_string(),
         }
     }
@@ -367,6 +369,9 @@ impl Engine {
             (StatementKind::CreateUser, StatementResults::Batches(_)) => {
                 StatementOutput::Command(Command::CreateUser)
             }
+            (StatementKind::DropTable, StatementResults::Batches(_)) => {
+                StatementOutput::Command(Command::DropTable)
+            }
             _ => unreachable!("statement kind and worker output must agree"),
         };
         Ok(Execution {
@@ -420,6 +425,7 @@ enum StatementKind {
     CreateTable,
     CreateSchema,
     CreateUser,
+    DropTable,
 }
 
 impl StatementKind {
@@ -429,6 +435,7 @@ impl StatementKind {
             planner::Operator::CreateTable(_) => Self::CreateTable,
             planner::Operator::CreateSchema(_) => Self::CreateSchema,
             planner::Operator::CreateUser(_) => Self::CreateUser,
+            planner::Operator::DropTable(_) => Self::DropTable,
             _ => Self::Query,
         }
     }

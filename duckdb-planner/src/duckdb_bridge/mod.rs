@@ -325,6 +325,21 @@ pub mod ffi {
         fn lo_create_schema_if_not_exists(op: &LogicalOperator) -> Result<bool>;
         fn lo_create_schema_or_replace(op: &LogicalOperator) -> Result<bool>;
 
+        // ---- Drop ----
+        /// Whether the `LOGICAL_DROP` targets a table (vs. a schema, view, ...).
+        fn lo_drop_is_table(op: &LogicalOperator) -> Result<bool>;
+        /// The kind of catalog entry the drop targets, as DuckDB spells it
+        /// (`TABLE`, `SCHEMA`, `VIEW`, ...): for the unsupported-kind error.
+        fn lo_drop_entry_kind(op: &LogicalOperator) -> Result<String>;
+        fn lo_drop_name(op: &LogicalOperator) -> Result<String>;
+        /// The schema of the dropped entry, or empty when unresolved (an
+        /// `IF EXISTS` drop of a missing entry keeps whatever was written).
+        fn lo_drop_schema(op: &LogicalOperator) -> Result<String>;
+        /// The target database (datastore), or empty when unresolved.
+        fn lo_drop_datastore(op: &LogicalOperator) -> Result<String>;
+        fn lo_drop_if_exists(op: &LogicalOperator) -> Result<bool>;
+        fn lo_drop_cascade(op: &LogicalOperator) -> Result<bool>;
+
         // ---- Set / Reset ----
         fn lo_set_name(op: &LogicalOperator) -> Result<String>;
         fn lo_set_value(op: &LogicalOperator) -> Result<String>;

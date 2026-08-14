@@ -11,7 +11,10 @@
 //! `deletedFileRetentionDuration`. In the same sweep it also deletes the commit
 //! JSONs a checkpoint has folded in that are past the log-retention window (the
 //! checkpoints are written inline on the commit path, in [`crate::delta`], not
-//! here), so the `_delta_log` does not grow unbounded either.
+//! here), so the `_delta_log` does not grow unbounded either. A dropped table
+//! follows the same shape one level up: `DROP TABLE` removes only the catalog
+//! entries and leaves a manifest tombstone, and the sweep deletes the whole
+//! table's storage once the tombstone is older than the table's retention.
 //!
 //! Like the compacter it is **location-agnostic** and **deployment-agnostic**:
 //! it holds nothing but a datastore handle, reads each table's directory, and
@@ -54,7 +57,7 @@ impl Default for VacuumConfig {
     }
 }
 
-fn now_unix_ms() -> u64 {
+pub(crate) fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -107,6 +110,16 @@ impl Vacuumer {
     pub fn vacuum_all(&self, now_ms: u64) {
         for (name, table) in self.datastore.tables() {
             self.vacuum_table(&name, table, now_ms);
+        }
+        // Dropped tables are no longer in the live set above; their storage is
+        // reclaimed off the manifest's tombstones once each retention window
+        // has passed.
+        match self.datastore.reclaim_dropped_tables(now_ms) {
+            Ok(reclaimed) if reclaimed > 0 => {
+                info!(tables = reclaimed, "reclaimed dropped tables' storage");
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "vacuum: reclaiming dropped tables failed"),
         }
     }
 

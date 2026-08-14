@@ -21,6 +21,7 @@ mod create_table;
 mod create_user;
 mod cte;
 mod distinct;
+mod drop_table;
 mod dummy_scan;
 mod explain;
 mod filter;
@@ -44,6 +45,7 @@ pub use create_table::CreateTable;
 pub use create_user::CreateUser;
 pub use cte::{Cte, CteScan};
 pub use distinct::Distinct;
+pub use drop_table::DropTable;
 pub use dummy_scan::DummyScan;
 pub use explain::Explain;
 pub use filter::Filter;
@@ -121,6 +123,9 @@ pub enum Operator {
     Join(Join),
     CreateTable(CreateTable),
     CreateSchema(CreateSchema),
+    /// `DROP TABLE <name>` — compiles into a dataflow that stages the drop;
+    /// the transaction's commit removes the table.
+    DropTable(DropTable),
     /// `CREATE USER <name> [PASSWORD '<password>']` — compiles into a dataflow
     /// that stages the user; the transaction's commit creates it.
     CreateUser(CreateUser),
@@ -216,6 +221,7 @@ impl Operator {
             // Statements, not queries: no result columns.
             Operator::CreateTable(_)
             | Operator::CreateSchema(_)
+            | Operator::DropTable(_)
             | Operator::CreateUser(_)
             | Operator::SetVariable(_)
             | Operator::Compact(_)
@@ -309,6 +315,7 @@ impl Operator {
                 .collect(),
             Operator::CreateTable(_)
             | Operator::CreateSchema(_)
+            | Operator::DropTable(_)
             | Operator::CreateUser(_)
             | Operator::SetVariable(_)
             | Operator::Compact(_)
@@ -338,6 +345,7 @@ impl fmt::Display for Operator {
             Operator::Join(j) => write!(f, "{j}"),
             Operator::CreateTable(c) => write!(f, "{c}"),
             Operator::CreateSchema(c) => write!(f, "{c}"),
+            Operator::DropTable(d) => write!(f, "{d}"),
             Operator::CreateUser(c) => write!(f, "{c}"),
             Operator::DummyScan(d) => write!(f, "{d}"),
             Operator::SetVariable(s) => write!(f, "{s}"),

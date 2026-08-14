@@ -117,6 +117,116 @@ async fn create_table_if_not_exists_is_a_noop_on_an_existing_table(#[future] con
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
+async fn drop_table_removes_the_table(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE drop_me (id BIGINT)")
+        .await
+        .unwrap();
+
+    conn.simple_query("DROP TABLE drop_me").await.unwrap();
+
+    let err = conn
+        .simple_query("SELECT * FROM drop_me")
+        .await
+        .unwrap_err();
+    let message = extract_db_error_message(&err);
+    assert!(message.contains("drop_me"), "{message}");
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn drop_table_keeps_the_files_for_vacuum(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE drop_keeps_files (id BIGINT)")
+        .await
+        .unwrap();
+    conn.simple_query("INSERT INTO drop_keeps_files VALUES (1)")
+        .await
+        .unwrap();
+    let dir = table_dir("drop_keeps_files");
+    let live = live_log_files(&dir);
+    assert_eq!(live.len(), 1);
+
+    conn.simple_query("DROP TABLE drop_keeps_files")
+        .await
+        .unwrap();
+
+    // A query planned before the drop may still be reading the table, so the
+    // drop leaves its storage in place; vacuum reclaims it after retention.
+    for file in live {
+        assert!(dir.join(file).exists());
+    }
+    assert!(dir.join("_delta_log").exists());
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn drop_then_recreate_serves_the_new_table(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE drop_phoenix (id BIGINT)")
+        .await
+        .unwrap();
+    conn.simple_query("INSERT INTO drop_phoenix VALUES (1), (2)")
+        .await
+        .unwrap();
+    // Prime the plan cache against the first incarnation.
+    let rows = select_rows(&conn, "SELECT COUNT(*) FROM drop_phoenix").await;
+    assert_eq!(rows, vec![vec![Some("2".into())]]);
+
+    conn.simple_query("DROP TABLE drop_phoenix").await.unwrap();
+    conn.simple_query("CREATE TABLE drop_phoenix (id BIGINT)")
+        .await
+        .unwrap();
+
+    // The recreated table is empty; a cached plan bound to the dropped
+    // incarnation must not answer for it.
+    let rows = select_rows(&conn, "SELECT COUNT(*) FROM drop_phoenix").await;
+    assert_eq!(rows, vec![vec![Some("0".into())]]);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn drop_of_a_missing_table_errors(#[future] conn: Conn) {
+    let err = conn
+        .simple_query("DROP TABLE no_such_table_to_drop")
+        .await
+        .unwrap_err();
+
+    let message = extract_db_error_message(&err);
+    assert!(message.contains("no_such_table_to_drop"), "{message}");
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn drop_if_exists_of_a_missing_table_succeeds(#[future] conn: Conn) {
+    conn.simple_query("DROP TABLE IF EXISTS no_such_table_to_drop")
+        .await
+        .unwrap();
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn drop_table_cascade_is_rejected(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE drop_cascade (id BIGINT)")
+        .await
+        .unwrap();
+
+    let err = conn
+        .simple_query("DROP TABLE drop_cascade CASCADE")
+        .await
+        .unwrap_err();
+
+    let message = extract_db_error_message(&err);
+    assert!(message.contains("CASCADE"), "{message}");
+    let rows = select_rows(&conn, "SELECT COUNT(*) FROM drop_cascade").await;
+    assert_eq!(rows, vec![vec![Some("0".into())]]);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
 async fn insert_returns_affected_row_count(#[future] conn: Conn) {
     let dir = write_parquet(&people_batch());
     create_people_table(&conn, "people_insert", dir.path()).await;

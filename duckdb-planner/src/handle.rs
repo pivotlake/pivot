@@ -204,6 +204,7 @@ impl<'plan> LogicalOp<'plan> {
             L::LOGICAL_GET => Operator::TableFunctionScan(TableFunctionScan { raw: self.raw }),
             L::LOGICAL_CREATE_TABLE => Operator::CreateTable(CreateTable { raw: self.raw }),
             L::LOGICAL_CREATE_SCHEMA => Operator::CreateSchema(CreateSchema { raw: self.raw }),
+            L::LOGICAL_DROP => Operator::Drop(Drop { raw: self.raw }),
             L::LOGICAL_SET => Operator::Set(Set { raw: self.raw }),
             L::LOGICAL_RESET => Operator::Reset(Reset { raw: self.raw }),
             L::LOGICAL_COMPACT => Operator::Compact(Compact { raw: self.raw }),
@@ -246,6 +247,9 @@ pub enum Operator<'plan> {
     TableFunctionScan(TableFunctionScan<'plan>),
     CreateTable(CreateTable<'plan>),
     CreateSchema(CreateSchema<'plan>),
+    /// `DROP <kind> name` of any catalog entry kind; the consumer checks the
+    /// kind and supports only table drops.
+    Drop(Drop<'plan>),
     /// `SET name = value`.
     Set(Set<'plan>),
     /// `RESET name`.
@@ -319,6 +323,8 @@ define_handles! { ffi::LogicalOperator;
     CreateTable,
     /// A `LogicalCreate` for `CREATE SCHEMA`.
     CreateSchema,
+    /// A `LogicalSimple` for `DROP <kind> name` carrying DuckDB's `DropInfo`.
+    Drop,
     /// A `LogicalSet`: `SET name = value`.
     Set,
     /// A `LogicalReset`: `RESET name`.
@@ -641,6 +647,45 @@ impl<'plan> CreateSchema<'plan> {
 
     pub fn or_replace(self) -> Result<bool> {
         Ok(ffi::lo_create_schema_or_replace(self.raw)?)
+    }
+}
+
+impl<'plan> Drop<'plan> {
+    /// Whether the drop targets a table (the only kind the consumer supports).
+    pub fn is_table(self) -> Result<bool> {
+        Ok(ffi::lo_drop_is_table(self.raw)?)
+    }
+
+    /// The kind of catalog entry the drop targets, as DuckDB spells it
+    /// (`TABLE`, `SCHEMA`, `VIEW`, ...): for the unsupported-kind error.
+    pub fn entry_kind(self) -> Result<String> {
+        Ok(ffi::lo_drop_entry_kind(self.raw)?)
+    }
+
+    pub fn name(self) -> Result<String> {
+        Ok(ffi::lo_drop_name(self.raw)?)
+    }
+
+    /// The schema holding the dropped entry, or `None` when the statement named
+    /// none and nothing resolved (an `IF EXISTS` drop of a missing entry).
+    pub fn schema(self) -> Result<Option<String>> {
+        let schema = ffi::lo_drop_schema(self.raw)?;
+        Ok((!schema.is_empty()).then_some(schema))
+    }
+
+    /// The target database (datastore), or `None` when the statement was
+    /// unqualified and nothing resolved (routes to the default datastore).
+    pub fn datastore(self) -> Result<Option<String>> {
+        let datastore = ffi::lo_drop_datastore(self.raw)?;
+        Ok((!datastore.is_empty()).then_some(datastore))
+    }
+
+    pub fn if_exists(self) -> Result<bool> {
+        Ok(ffi::lo_drop_if_exists(self.raw)?)
+    }
+
+    pub fn cascade(self) -> Result<bool> {
+        Ok(ffi::lo_drop_cascade(self.raw)?)
     }
 }
 
