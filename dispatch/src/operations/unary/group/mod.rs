@@ -107,8 +107,8 @@ use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
 use crate::operations::unary::group::hashtables::{
-    AggregatedTable, AggregatedTableOutput, BUCKET_COUNT, DEFAULT_CAPACITY, MAX_LOAD_FACTOR,
-    MergeSource, MultiSlabTable, SpillConfig,
+    AggregatedTable, AggregatedTableOutput, DEFAULT_CAPACITY, MAX_LOAD_FACTOR, MergeSource,
+    MultiSlabTable, SpillConfig,
 };
 use crate::worker::current_node;
 use ahash::RandomState;
@@ -535,9 +535,15 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
                 .max(1)
                 .next_power_of_two();
             let floor = partition_floor.min(volume_cap).max(2);
-            // The per-run bucket index resolves `BUCKET_COUNT` hash ranges,
-            // which caps how finely jobs can split the key space.
-            let partitions = by_target.max(floor).min(BUCKET_COUNT);
+            // The coarsest source's bucket index bounds how finely jobs can
+            // split the key space.
+            let min_source_bits = sources_by_node
+                .iter()
+                .flatten()
+                .map(|s| s.bucket_bits())
+                .min()
+                .unwrap_or(0);
+            let partitions = by_target.max(floor).min(1 << min_source_bits);
             (
                 partitions,
                 // Start each target big enough to hold its share at

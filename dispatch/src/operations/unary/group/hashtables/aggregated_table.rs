@@ -205,6 +205,14 @@ impl<KP: super::PersistedKey, V: AggregationValue + ?Sized> MergeSource<KP, V> {
             MergeSource::Dense(run) => run.len(),
         }
     }
+
+    /// Hash-prefix bits this source's bucket index resolves.
+    pub fn bucket_bits(&self) -> u32 {
+        match self {
+            MergeSource::Sealed(sealed) => sealed.run.bucket_bits(),
+            MergeSource::Dense(run) => run.bucket_bits(),
+        }
+    }
 }
 
 /// The tables and sizing data one worker produced.

@@ -159,10 +159,15 @@ fn merge_combined_rows<const N: usize, S: StoredKey, V: AggregationValue + ?Size
 ) -> MultiSlabTable<S::Persisted, V> {
     {
         let partition_bits = num_partitions.trailing_zeros();
-        debug_assert!(partition_bits <= BUCKET_BITS);
-        let buckets_per_partition = BUCKET_BITS - partition_bits;
-        let bucket_lo = partition << buckets_per_partition;
-        let bucket_hi = (partition + 1) << buckets_per_partition;
+        let min_source_bits = sources
+            .iter()
+            .map(|source| source.bucket_bits())
+            .min()
+            .unwrap_or(BUCKET_BITS);
+        debug_assert!(partition_bits <= min_source_bits);
+        // Global bucket units, at the finest resolution any run can have.
+        let partition_width = 1usize << (BUCKET_BITS - partition_bits);
+        let bucket_lo = partition * partition_width;
 
         let mut allocator = SlabAllocator::new(true);
         let capacity = partition_capacity.max(DEFAULT_CAPACITY);
@@ -172,6 +177,7 @@ fn merge_combined_rows<const N: usize, S: StoredKey, V: AggregationValue + ?Size
             partition_bits,
             context,
         );
+        let target_bytes = capacity * result.entry_stride();
         // Reuse one target probe layout across the partition.
         let mut target = if N == 0 {
             result.prober()
@@ -179,16 +185,27 @@ fn merge_combined_rows<const N: usize, S: StoredKey, V: AggregationValue + ?Size
             result.prober_with_metadata(V::metadata_for_arity::<N>())
         };
 
-        // Fold bucket by bucket, every source in turn, rather than source by
-        // source across the whole partition: one bucket's entries land in a
-        // narrow region of the target, so all sources hit that region while
-        // it is cache-warm instead of each source refetching the whole
-        // target's slot range.
-        for bucket in bucket_lo..bucket_hi {
+        // Fold hash range by hash range, every source in turn, rather than
+        // source by source across the whole partition: one range's entries
+        // land in a narrow region of the target, so all sources hit that
+        // region while it is cache-warm instead of each source refetching
+        // the whole target's slot range. The step count follows the target's
+        // footprint (small targets take one pass, so small queries pay no
+        // per-step cost) and never splits finer than any source resolves.
+        const STEP_TARGET_BYTES: usize = 32 * 1024;
+        let desired_steps = (target_bytes / STEP_TARGET_BYTES)
+            .max(1)
+            .next_power_of_two();
+        let max_steps = 1usize << (min_source_bits - partition_bits);
+        let steps = desired_steps.min(max_steps);
+        let step_width = partition_width / steps;
+        for step in 0..steps {
+            let lo = bucket_lo + step * step_width;
+            let hi = lo + step_width;
             for source in sources {
                 match source {
                     MergeSource::Dense(run) => {
-                        let (from, to) = run.bucket_range(bucket, bucket + 1);
+                        let (from, to) = run.bucket_range(lo, hi);
                         if from == to {
                             continue;
                         }
@@ -205,7 +222,7 @@ fn merge_combined_rows<const N: usize, S: StoredKey, V: AggregationValue + ?Size
                         );
                     }
                     MergeSource::Sealed(sealed) => {
-                        let (from, to) = sealed.run.bucket_range(bucket, bucket + 1);
+                        let (from, to) = sealed.run.bucket_range(lo, hi);
                         if from == to {
                             continue;
                         }

@@ -16,7 +16,7 @@ mod table_reader;
 pub(crate) use table_reader::TableReader;
 
 mod sorted_run;
-pub use sorted_run::{BUCKET_BITS, BUCKET_COUNT, SortedRun};
+pub use sorted_run::{BUCKET_BITS, SortedRun};
 
 mod dense_run;
 pub use dense_run::DenseRun;

@@ -329,6 +329,11 @@ impl<K: PersistedKey, V: AggregationValue + ?Sized> BaseHashTable<K, V> {
         self.length
     }
 
+    /// Bytes from one entry to the next.
+    pub fn entry_stride(&self) -> usize {
+        self.entry_stride
+    }
+
     /// Cumulative number of probe-chain collisions since the last resize.
     pub fn collisions(&self) -> usize {
         self.collisions

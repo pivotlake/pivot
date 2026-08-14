@@ -15,9 +15,9 @@
 
 use crate::memory::{BUFFER_SIZE, Slab, SlabAllocator};
 use crate::operations::unary::group::hashtables::hash_table::{adjusted_bases, entry_layout};
-use crate::operations::unary::group::hashtables::sorted_run::BUCKET_COUNT;
+use crate::operations::unary::group::hashtables::sorted_run::bucket_bits_for;
 use crate::operations::unary::group::hashtables::{
-    AggregationValue, MultiSlabTable, PersistedKey, TableReader,
+    AggregationValue, BUCKET_BITS, MultiSlabTable, PersistedKey, TableReader,
 };
 use crate::operations::unary::group::hll::Hll;
 use std::marker::PhantomData;
@@ -33,6 +33,8 @@ pub struct DenseRun<KP: PersistedKey, V: AggregationValue + ?Sized> {
     /// `bucket_starts[b]` is the first entry of bucket `b`; the extra final
     /// element is `len`.
     bucket_starts: Vec<u32>,
+    /// Hash-prefix bits this run's index resolves.
+    bucket_bits: u32,
     metadata: V::StorageMetadata,
     _phantom: PhantomData<(KP, *const V)>,
 }
@@ -57,9 +59,11 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> DenseRun<KP, V> {
         let len: usize = tables.iter().map(|table| table.len()).sum();
         let slabs = allocator.create_strided_slabs(len.max(1), layout.stride, layout.align);
         let adjusted_slab_bases = adjusted_bases(&slabs, entries_per_slab, layout.stride);
-        let bucket_shift = 64 - super::sorted_run::BUCKET_BITS;
+        let bucket_bits = bucket_bits_for(len);
+        let bucket_count = 1usize << bucket_bits;
+        let bucket_shift = 64 - bucket_bits;
 
-        let mut bucket_starts = vec![0u32; BUCKET_COUNT + 1];
+        let mut bucket_starts = vec![0u32; bucket_count + 1];
         for table in tables {
             let reader = table.reader::<0>();
             for slot in 0..table.capacity() {
@@ -72,7 +76,7 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> DenseRun<KP, V> {
             }
         }
         bucket_starts[0] = 0;
-        for b in 0..BUCKET_COUNT {
+        for b in 0..bucket_count {
             bucket_starts[b + 1] += bucket_starts[b];
         }
 
@@ -104,9 +108,16 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> DenseRun<KP, V> {
             entries_per_slab,
             len,
             bucket_starts,
+            bucket_bits,
             metadata,
             _phantom: PhantomData,
         }
+    }
+
+    /// Hash-prefix bits this run's index resolves.
+    #[inline(always)]
+    pub(crate) fn bucket_bits(&self) -> u32 {
+        self.bucket_bits
     }
 
     /// Number of entries in the run.
@@ -114,12 +125,17 @@ impl<KP: PersistedKey, V: AggregationValue + ?Sized> DenseRun<KP, V> {
         self.len
     }
 
-    /// This run's entry range within the half-open bucket range `[lo, hi)`.
+    /// This run's entry range within the global bucket range `[lo, hi)`.
+    ///
+    /// `lo` and `hi` are indices at [`BUCKET_BITS`] resolution and must be
+    /// aligned to this run's coarser resolution, which the merge guarantees
+    /// by never splitting finer than any source resolves.
     #[inline(always)]
     pub(crate) fn bucket_range(&self, lo: usize, hi: usize) -> (usize, usize) {
+        let shift = BUCKET_BITS - self.bucket_bits;
         (
-            self.bucket_starts[lo] as usize,
-            self.bucket_starts[hi] as usize,
+            self.bucket_starts[lo >> shift] as usize,
+            self.bucket_starts[hi >> shift] as usize,
         )
     }
 

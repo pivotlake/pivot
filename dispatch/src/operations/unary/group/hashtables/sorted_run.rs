@@ -15,15 +15,27 @@
 
 use crate::operations::unary::group::hll::Hll;
 
-/// Bits of hash prefix resolved by the per-run bucket index.
+/// Most hash-prefix bits a run's bucket index resolves.
 ///
-/// Fine enough that one bucket's slice of the merge target stays inside L1
-/// while every source folds into it, and that the partition count never hits
-/// the bucket ceiling.
+/// Fine enough that one bucket's slice of a large merge target stays inside
+/// L1 while every source folds into it.
 pub const BUCKET_BITS: u32 = 16;
 
-/// Number of equal hash ranges each run's bucket index resolves.
-pub const BUCKET_COUNT: usize = 1 << BUCKET_BITS;
+/// Fewest hash-prefix bits a run's bucket index resolves. Bounds how far the
+/// merge can split the key space, so it stays above the partition floor a
+/// full worker pool asks for.
+pub const MIN_BUCKET_BITS: u32 = 10;
+
+/// Bucket resolution for a run of `len` entries: roughly 64 entries per
+/// bucket, clamped to `[MIN_BUCKET_BITS, BUCKET_BITS]`. Small runs get small
+/// index arrays, so the fixed cost of building and walking them never
+/// outweighs the entries themselves.
+pub(super) fn bucket_bits_for(len: usize) -> u32 {
+    let magnitude = usize::BITS - len.max(1).leading_zeros();
+    magnitude
+        .saturating_sub(6)
+        .clamp(MIN_BUCKET_BITS, BUCKET_BITS)
+}
 
 /// Occupied slots of one retired table, grouped by hash bucket.
 pub struct SortedRun {
@@ -32,6 +44,8 @@ pub struct SortedRun {
     /// `bucket_starts[b]` is the first position of bucket `b`; the extra
     /// final element is the total entry count.
     bucket_starts: Vec<u32>,
+    /// Hash-prefix bits this run's index resolves.
+    bucket_bits: u32,
 }
 
 impl SortedRun {
@@ -40,34 +54,48 @@ impl SortedRun {
     ///
     /// The pairs arrive in slot-scan order; each bucket keeps that order.
     pub(super) fn from_slot_scan(entries: &[(u64, u32)], hll: &mut Hll) -> Self {
-        let mut bucket_starts = vec![0u32; BUCKET_COUNT + 1];
+        let bucket_bits = bucket_bits_for(entries.len());
+        let bucket_count = 1usize << bucket_bits;
+        let mut bucket_starts = vec![0u32; bucket_count + 1];
         for &(hash, _) in entries {
             hll.add(hash);
-            let bucket = (hash >> (64 - BUCKET_BITS)) as usize;
+            let bucket = (hash >> (64 - bucket_bits)) as usize;
             bucket_starts[bucket + 1] += 1;
         }
-        for b in 0..BUCKET_COUNT {
+        for b in 0..bucket_count {
             bucket_starts[b + 1] += bucket_starts[b];
         }
         let mut cursors = bucket_starts.clone();
         let mut positions = vec![0u32; entries.len()];
         for &(hash, slot) in entries {
-            let bucket = (hash >> (64 - BUCKET_BITS)) as usize;
+            let bucket = (hash >> (64 - bucket_bits)) as usize;
             positions[cursors[bucket] as usize] = slot;
             cursors[bucket] += 1;
         }
         Self {
             positions,
             bucket_starts,
+            bucket_bits,
         }
     }
 
-    /// This run's positions within the half-open bucket range `[lo, hi)`.
+    /// Hash-prefix bits this run's index resolves.
+    #[inline(always)]
+    pub(crate) fn bucket_bits(&self) -> u32 {
+        self.bucket_bits
+    }
+
+    /// This run's positions within the global bucket range `[lo, hi)`.
+    ///
+    /// `lo` and `hi` are indices at [`BUCKET_BITS`] resolution and must be
+    /// aligned to this run's coarser resolution, which the merge guarantees
+    /// by never splitting finer than any source resolves.
     #[inline(always)]
     pub(crate) fn bucket_range(&self, lo: usize, hi: usize) -> (usize, usize) {
+        let shift = BUCKET_BITS - self.bucket_bits;
         (
-            self.bucket_starts[lo] as usize,
-            self.bucket_starts[hi] as usize,
+            self.bucket_starts[lo >> shift] as usize,
+            self.bucket_starts[hi >> shift] as usize,
         )
     }
 
