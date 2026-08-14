@@ -442,9 +442,20 @@ where
     }) else {
         return Ok(());
     };
-    for slot in &table.slots {
+    // The referenced entries sit in bucket order across the runs, so this
+    // walk reads them nearly sequentially; the lookahead keeps their lines
+    // arriving a few groups early.
+    const EMIT_PREFETCH: usize = 8;
+    let slots = &table.slots;
+    for i in 0..slots.len() {
+        let slot = slots[i];
         if slot.hash == 0 {
             continue;
+        }
+        if let Some(ahead) = slots.get(i + EMIT_PREFETCH)
+            && ahead.hash != 0
+        {
+            prefetch_l1_line(ahead.entry);
         }
         let key = unsafe { layout.key_of(slot.entry) };
         let value = if slot.merged.is_null() {

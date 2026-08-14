@@ -182,6 +182,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
     ///
     /// Returns whether the caller should keep sending groups: `false` once an
     /// unordered LIMIT's budget is spent, so the merge can stop early.
+    #[inline(always)]
     pub(crate) fn accept_group(
         &mut self,
         key: &K::Persisted,
