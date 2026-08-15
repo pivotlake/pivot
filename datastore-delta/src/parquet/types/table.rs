@@ -28,6 +28,41 @@ use thiserror::Error;
 
 static EMPTY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| SchemaRef::new(Schema::empty()));
 
+/// The schemas handed out by [`deduplicate_schema`], held weakly so an entry
+/// lives exactly as long as some row group still points at it.
+static DEDUPLICATED_SCHEMAS: LazyLock<std::sync::Mutex<Vec<std::sync::Weak<Schema>>>> =
+    LazyLock::new(Default::default);
+
+/// Share one allocation between every file that parses to the same schema.
+///
+/// Each file's footer yields its own `Schema`, and every file of a table yields
+/// the same one; without deduplication, a table's resident metadata carries a
+/// separate copy per file, for as long as the catalog holds that file. Distinct
+/// schemas are bounded by the tables in the process (plus any schema evolution),
+/// and dead entries are dropped on the way past, so the list stays short enough
+/// to scan.
+fn deduplicate_schema(schema: Schema) -> SchemaRef {
+    let mut deduplicated = DEDUPLICATED_SCHEMAS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut found = None;
+    deduplicated.retain(|weak| match weak.upgrade() {
+        None => false,
+        Some(live) => {
+            if found.is_none() && *live == schema {
+                found = Some(live);
+            }
+            true
+        }
+    });
+    if let Some(live) = found {
+        return live;
+    }
+    let schema = Arc::new(schema);
+    deduplicated.push(Arc::downgrade(&schema));
+    schema
+}
+
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("{0}")]
@@ -181,7 +216,8 @@ pub(crate) fn row_groups_from_metadata(
 ) -> Result<Vec<RowGroupMetadata>> {
     let (schema, leaf_infos) = schema_elements_to_arrow(&file_meta.schema)?;
     // Use reconciled types for statistics, decoders, and output fields.
-    let schema = Arc::new(apply_declared_types(schema, declared_columns)?);
+    // Deduplicated so the table's files share one schema rather than a copy each.
+    let schema = deduplicate_schema(apply_declared_types(schema, declared_columns)?);
     // Statistics belong to leaf chunks, not top-level columns.
     let leaves = super::leaves::leaf_fields(schema.fields());
 

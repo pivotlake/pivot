@@ -16,12 +16,75 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, TimeUnit};
 
+/// How many bytes of a string bound are worth keeping.
+///
+/// A bound only has to *contain* the column's range, never equal it, so a long
+/// value can be replaced by a short one that still encloses everything it
+/// bounded. Anything shorter than this is kept exactly, which covers the
+/// identifier-like columns that pruning actually uses; it is free-text columns
+/// (a log body, a serialized document) that would otherwise pin a whole value
+/// per column per file, in memory for as long as the catalog holds the file and
+/// again in every log commit and checkpoint.
+const MAX_STAT_BYTES: usize = 64;
+
+/// The longest prefix of `value` within [`MAX_STAT_BYTES`] that ends on a
+/// character boundary, or `None` when `value` already fits.
+fn stat_prefix(value: &str) -> Option<&str> {
+    if value.len() <= MAX_STAT_BYTES {
+        return None;
+    }
+    let mut end = MAX_STAT_BYTES;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(&value[..end])
+}
+
+/// The code point after `c`, stepping over the surrogate range that is not a
+/// legal `char`. `None` only at the top of the Unicode range.
+fn next_code_point(c: char) -> Option<char> {
+    let next = match c as u32 + 1 {
+        0xD800 => 0xE000,
+        code => code,
+    };
+    char::from_u32(next)
+}
+
+/// A shortened stand-in for a `min` bound: a prefix of the true minimum. Cutting
+/// the tail off a string can only lower it, so the result still sits at or below
+/// every value the original bounded. `None` leaves the value as it is.
+fn shorten_lower_bound(value: &str) -> Option<String> {
+    stat_prefix(value).map(str::to_owned)
+}
+
+/// A shortened stand-in for a `max` bound: a prefix of the true maximum with its
+/// last character raised to the next code point, which sorts above every string
+/// that starts with that prefix (UTF-8 compares byte-wise in code point order).
+/// Characters that cannot be raised are dropped and the one before them is
+/// raised instead; `None` when nothing can be (an all-`char::MAX` prefix), and
+/// the caller then keeps the value untouched rather than record a bound that
+/// could sit below a real one.
+fn shorten_upper_bound(value: &str) -> Option<String> {
+    let mut bound = stat_prefix(value)?.to_owned();
+    while let Some(last) = bound.pop() {
+        if let Some(raised) = next_code_point(last) {
+            bound.push(raised);
+            return Some(bound);
+        }
+    }
+    None
+}
+
 /// A column's min and max, as single-element Arrow arrays.
 ///
 /// `None` when the column is empty or all-null, or when its type is not one the
 /// write path (and so the reader's `decode_scalar`) supports — a binary leaf, for
 /// instance. Such a column simply records no min/max and is never pruned by
 /// range, which costs a scan but is never unsound.
+///
+/// String bounds past [`MAX_STAT_BYTES`] are widened to short ones (see
+/// [`shorten_lower_bound`] / [`shorten_upper_bound`]); the range they describe
+/// still encloses the column, so pruning stays sound and only gets coarser.
 pub(super) fn column_min_max(array: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
     macro_rules! numeric {
         ($arr:ty) => {{
@@ -36,8 +99,11 @@ pub(super) fn column_min_max(array: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
             let a = array.as_any().downcast_ref::<$arr>()?;
             // Rust `&str` ordering is byte-lexicographic, matching Parquet's
             // unsigned-byte ordering for UTF8 columns.
-            let lo: ArrayRef = Arc::new(<$arr>::from(vec![a.iter().flatten().min()?]));
-            let hi: ArrayRef = Arc::new(<$arr>::from(vec![a.iter().flatten().max()?]));
+            let lo = a.iter().flatten().min()?;
+            let hi = a.iter().flatten().max()?;
+            let (lo_short, hi_short) = (shorten_lower_bound(lo), shorten_upper_bound(hi));
+            let lo: ArrayRef = Arc::new(<$arr>::from(vec![lo_short.as_deref().unwrap_or(lo)]));
+            let hi: ArrayRef = Arc::new(<$arr>::from(vec![hi_short.as_deref().unwrap_or(hi)]));
             Some((lo, hi))
         }};
     }
@@ -251,4 +317,81 @@ pub(crate) fn aggregate_file_stats(
 fn scalar_lt(a: &Scalar<ArrayRef>, b: &Scalar<ArrayRef>) -> bool {
     arrow_ord::cmp::lt(a as &dyn Datum, b as &dyn Datum)
         .is_ok_and(|result| result.len() == 1 && result.is_valid(0) && result.value(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bounds(values: Vec<&str>) -> (String, String) {
+        let array: ArrayRef = Arc::new(StringViewArray::from(values));
+        let (lo, hi) = column_min_max(&array).unwrap();
+        let text = |a: ArrayRef| {
+            a.as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap()
+                .value(0)
+                .to_owned()
+        };
+        (text(lo), text(hi))
+    }
+
+    #[test]
+    fn short_string_bounds_are_kept_exactly() {
+        let (lo, hi) = bounds(vec!["banana", "apple", "cherry"]);
+
+        assert_eq!(lo, "apple");
+        assert_eq!(hi, "cherry");
+    }
+
+    #[test]
+    fn long_string_bounds_shrink_but_still_enclose_the_column() {
+        let low = format!("aaa{}", "x".repeat(200));
+        let high = format!("zzz{}", "x".repeat(200));
+
+        let (lo, hi) = bounds(vec![&low, &high]);
+
+        assert!(lo.len() <= MAX_STAT_BYTES);
+        assert!(
+            lo.as_str() <= low.as_str(),
+            "{lo:?} must not exceed the min"
+        );
+        assert!(
+            hi.as_str() >= high.as_str(),
+            "{hi:?} must not fall below the max"
+        );
+    }
+
+    /// Shortening both bounds to the same prefix would make them compare equal,
+    /// which `NotEqual` pruning reads as "every row holds this one value".
+    /// Raising the upper bound is what keeps the range non-empty.
+    #[test]
+    fn bounds_sharing_a_prefix_stay_distinct() {
+        let shared = "s".repeat(100);
+
+        let (lo, hi) = bounds(vec![&format!("{shared}a"), &format!("{shared}b")]);
+
+        assert!(lo < hi, "{lo:?} must sort below {hi:?}");
+    }
+
+    /// Three-byte characters straddle the byte limit, so a naive cut lands
+    /// mid-character and yields bytes that are not a string at all.
+    #[test]
+    fn shortening_splits_on_character_boundaries() {
+        let value = "\u{4e2d}".repeat(100);
+
+        let lo = shorten_lower_bound(&value).unwrap();
+        let hi = shorten_upper_bound(&value).unwrap();
+
+        assert!(value.starts_with(&lo));
+        assert!(lo.len() <= MAX_STAT_BYTES);
+        assert!(hi.as_str() > value.as_str());
+    }
+
+    #[test]
+    fn an_upper_bound_at_the_top_of_unicode_keeps_the_value() {
+        let value = char::MAX.to_string().repeat(40);
+
+        assert_eq!(shorten_upper_bound(&value), None);
+    }
 }
