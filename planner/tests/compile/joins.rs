@@ -185,6 +185,32 @@ fn join_with_or_condition_across_both_sides(mut testing_planner: TestingPlanner)
     );
 }
 
+#[rstest]
+fn joins_non_nullable_keys_with_is_not_distinct_from(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "left_values",
+        &[("l_key", Type::Int64, int64_col(vec![1, 2, 3]))],
+    );
+    testing_planner.add_table(
+        "right_values",
+        &[("r_key", Type::Int64, int64_col(vec![2, 3, 4]))],
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT l_key FROM left_values JOIN right_values \
+         ON l_key IS NOT DISTINCT FROM r_key ORDER BY l_key",
+    );
+
+    assert_eq!(
+        rows,
+        serde_json::json!([{"l_key": 2}, {"l_key": 3}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
 // Columns referenced only by the residual are trimmed from the join's
 // declared output; the residual reads them off the inputs at match time, so
 // the trim costs it nothing.
