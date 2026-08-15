@@ -359,6 +359,8 @@ fn build_join(
     join: ComparisonJoinView<'_>,
     inputs: Vec<PlanNode>,
 ) -> Result<PlanNode, OperatorError> {
+    let probe_nullability = inputs[0].output_nullability();
+    let build_nullability = inputs[1].output_nullability();
     let mut probe_keys = Vec::new();
     let mut build_keys = Vec::new();
     let mut key_types = Vec::new();
@@ -372,7 +374,10 @@ fn build_join(
                 continue;
             }
         };
-        if condition.comparison != ExpressionType::COMPARE_EQUAL {
+        if !matches!(
+            condition.comparison,
+            ExpressionType::COMPARE_EQUAL | ExpressionType::COMPARE_NOT_DISTINCT_FROM
+        ) {
             inequalities.push(condition);
             continue;
         }
@@ -384,6 +389,17 @@ fn build_join(
                  (the planner casts both sides of a condition to a common type, so this plan \
                  shape is unexpected)"
             )));
+        }
+        // Pivot's hash join implements ordinary equality, which is equivalent
+        // to IS NOT DISTINCT FROM only when neither key can be NULL. DuckDB
+        // emits the latter while decorrelating subqueries, so accept its safe
+        // non-nullable form and reject the genuinely null-aware case.
+        if condition.comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM
+            && (probe_nullability[probe_key] || build_nullability[build_key])
+        {
+            return Err(OperatorError::Unsupported(
+                "IS NOT DISTINCT FROM join keys must be non-nullable".to_string(),
+            ));
         }
         probe_keys.push(probe_key);
         build_keys.push(build_key);
