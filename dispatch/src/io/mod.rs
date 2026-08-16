@@ -23,6 +23,7 @@
 //! - [`backend::IOBackend`] — platform-specific submission/completion engine.
 
 mod backend;
+pub(crate) mod hardware_queues;
 
 use crate::Identifier;
 use crate::memory::FileBytes;
@@ -55,7 +56,40 @@ pub use disk_cache::{DiskCache, clear_disk_cache};
 
 pub mod http;
 
-/// An open file the engine can read: a local file (the `Arc<File>` keeps the
+/// A local file descriptor together with the block-device index resolved when
+/// it was opened. Cloning this wrapper keeps the descriptor alive without
+/// repeating the device lookup on the I/O submission path.
+#[derive(Clone)]
+pub struct LocalFile {
+    file: Arc<File>,
+    device_idx: hardware_queues::DeviceIndex,
+}
+
+impl LocalFile {
+    /// Wrap a newly opened file and register its block device once.
+    pub fn new(file: File) -> std::io::Result<Self> {
+        let file = Arc::new(file);
+        let device_idx = hardware_queues::register_file_device(&file)?;
+        Ok(Self { file, device_idx })
+    }
+
+    pub(crate) fn device_idx(&self) -> hardware_queues::DeviceIndex {
+        self.device_idx
+    }
+
+    #[cfg(test)]
+    pub(crate) fn strong_count(&self) -> usize {
+        Arc::strong_count(&self.file)
+    }
+}
+
+impl AsRawFd for LocalFile {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.file.as_raw_fd()
+    }
+}
+
+/// An open file the engine can read: a local file (the [`LocalFile`] keeps the
 /// descriptor alive for as long as anything — a table, an in-flight request, a
 /// cached region — still references it), or a remote HTTP(S) object fetched
 /// via range requests.
@@ -63,13 +97,13 @@ pub mod http;
 /// This is also the key the [`CompressedCache`](crate::memory::compressed_cache::CompressedCache)
 /// uses to bucket 2 MB regions, so it must be cheap to `Hash`/`Eq` — the
 /// cache's pin re-check runs on every hit. `Local` compares the raw fd (an
-/// `i32`; stable while the `Arc<File>` is held, and holding it in the key means
+/// `i32`; stable while the `LocalFile` is held, and holding it in the key means
 /// a cached file's fd can never be closed and reused under the cache); `Remote`
 /// carries an [`Arc<RemoteFile>`] whose `Hash`/`Eq` delegate to a single
 /// interned id (never the URL string).
 #[derive(Clone)]
 pub enum OpenFile {
-    Local(Arc<File>),
+    Local(LocalFile),
     Remote(Arc<RemoteFile>),
 }
 
@@ -332,10 +366,10 @@ pub(crate) fn clear_pending_io() {
 }
 
 /// A filesystem read: read `block` from `file` into its pinned cache slot.
-/// Owning the `Arc<File>` keeps the descriptor alive for the read's whole
-/// flight.
+/// Owning the [`LocalFile`] keeps the descriptor alive for the read's whole
+/// flight and carries its pre-resolved device index.
 pub struct FsReadRequest {
-    pub file: Arc<File>,
+    pub file: LocalFile,
     pub block: MissingExtent,
 }
 
@@ -344,7 +378,7 @@ pub struct FsReadRequest {
 /// run at a time: holding it as runs is what keeps a file's bytes on the ring
 /// instead of in one heap allocation.
 pub struct FsWriteRequest {
-    pub file: Arc<File>,
+    pub file: LocalFile,
     pub data: Arc<FileBytes>,
 }
 
@@ -530,14 +564,15 @@ pub struct FailedRead {
 /// - **Linux**: uses `O_DIRECT`.
 /// - **macOS**: uses `F_NOCACHE` (best-effort, not true direct I/O).
 /// - **Other**: falls back to normal cached reads.
-pub fn open_direct_read(path: &Path) -> std::io::Result<File> {
+pub fn open_direct_read(path: &Path) -> std::io::Result<LocalFile> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECT)
-            .open(path)
+            .open(path)?;
+        LocalFile::new(file)
     }
 
     #[cfg(target_os = "macos")]
@@ -548,16 +583,18 @@ pub fn open_direct_read(path: &Path) -> std::io::Result<File> {
         if rc == -1 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(file)
+        LocalFile::new(file)
     }
 
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     {
-        return OpenOptions::new().read(true).open(path);
+        let file = OpenOptions::new().read(true).open(path)?;
+        return LocalFile::new(file);
     }
 
     #[cfg(not(unix))]
     {
-        return OpenOptions::new().read(true).open(path);
+        let file = OpenOptions::new().read(true).open(path)?;
+        return LocalFile::new(file);
     }
 }

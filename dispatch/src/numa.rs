@@ -204,11 +204,13 @@ fn read_node_cpulists() -> Option<Vec<Vec<usize>>> {
     None
 }
 
-/// Parse a Linux cpulist such as `"0-95"` or `"0-23,48-71"` or `"5"` into cpu indices.
+/// Parse a Linux cpulist such as `"0-95"` or `"0-23,48-71"` or `"5"` into cpu
+/// indices. Entries may carry whitespace: a block device's `mq/<n>/cpu_list`
+/// separates with `", "`.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn parse_cpulist(list: &str) -> Vec<usize> {
+pub(crate) fn parse_cpulist(list: &str) -> Vec<usize> {
     let mut cpus = Vec::new();
-    for part in list.trim().split(',').filter(|p| !p.is_empty()) {
+    for part in list.split(',').map(str::trim).filter(|p| !p.is_empty()) {
         match part.split_once('-') {
             Some((start, end)) => {
                 let (start, end) = (
@@ -242,6 +244,7 @@ mod tests {
         assert_eq!(parse_cpulist("0-3"), vec![0, 1, 2, 3]);
         assert_eq!(parse_cpulist("0-2,5,7-8"), vec![0, 1, 2, 5, 7, 8]);
         assert_eq!(parse_cpulist("4\n"), vec![4]);
+        assert_eq!(parse_cpulist("0, 1, 2\n"), vec![0, 1, 2]);
     }
 
     #[test]

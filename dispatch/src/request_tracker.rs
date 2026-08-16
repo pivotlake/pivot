@@ -322,7 +322,7 @@ impl RegisteredRead {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::{FileRange, OperatorIO, ReadRequestId};
+    use crate::io::{FileRange, LocalFile, OperatorIO, ReadRequestId};
     use crate::memory::{BlockKey, init_test_free_pool};
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
@@ -337,7 +337,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("data");
         std::fs::write(&path, vec![0u8; 1 << 20]).unwrap();
-        let open_file = OpenFile::Local(Arc::new(std::fs::File::open(path).unwrap()));
+        let open_file =
+            OpenFile::Local(LocalFile::new(std::fs::File::open(path).unwrap()).unwrap());
         memory_ctx()
             .compressed_cache()
             .open_entry(open_file.clone());
