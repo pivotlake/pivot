@@ -7,6 +7,7 @@
 
 use std::any::Any;
 
+use arrow_array::{Scalar, new_null_array};
 use dispatch::RowDelivery;
 use duckdb_planner::DuckDBTable;
 use duckdb_planner::catalog_provider::OptionalTableWrapper;
@@ -26,13 +27,13 @@ use crate::catalog::{
     BoundTable, Column, CreateSchemaRequest, CreateTableRequest, DropTableRequest,
     DuckDBTableAdapter,
 };
-use crate::expression::{Error as ExpressionError, Expression};
+use crate::expression::{Error as ExpressionError, Expression, Ref};
 use crate::operator::{
     Aggregate, Compact, CopyFormat, CopyFromStdin, CreateSchema, CreateTable, CreateUser,
     DropTable, Error as OperatorError, Filter, Input, Insert, Limit, OrderBy, OrderByNode,
     Projection, SetVariable, TableFunctionScan, TopN, Values,
 };
-use crate::types::{build_scalar_value, type_from_logical};
+use crate::types::{build_scalar_value, physical_arrow_type, type_from_logical};
 
 impl Projection {
     pub(crate) fn from_handle(view: ProjectionView<'_>) -> Result<Projection, OperatorError> {
@@ -80,21 +81,86 @@ impl Values {
 }
 
 impl Insert {
-    pub(crate) fn from_handle(view: InsertView<'_>) -> Result<Insert, OperatorError> {
-        if view.has_column_map()? {
-            return Err(OperatorError::Unsupported(
-                "INSERT with an explicit target-column list is not supported".to_string(),
-            ));
-        }
+    /// Build the insert, along with the projection that reshapes its child when
+    /// the statement named its target columns (see
+    /// [`build_column_list_projection`]). The walk in [`super`] puts that
+    /// projection between the two.
+    pub(crate) fn from_handle(
+        view: InsertView<'_>,
+    ) -> Result<(Insert, Option<Projection>), OperatorError> {
         if view.returns_rows()? {
             return Err(OperatorError::Unsupported(
                 "INSERT ... RETURNING is not supported".to_string(),
             ));
         }
-        Ok(Insert {
-            table: bind_table(*view.take_table()?),
-        })
+        let column_map = view.column_map()?;
+        let table = bind_table(*view.take_table()?);
+        let column_list = build_column_list_projection(&column_map, &table.columns())?;
+        Ok((Insert { table }, column_list))
     }
+}
+
+/// Reshape the child of an `INSERT INTO t (b, a) ...`, which emits only the
+/// listed columns in the order they were written, into the table's full column
+/// list: every table column reads the child column that fills it, and a column
+/// the statement leaves out becomes a NULL of that column's type. Unfilled can
+/// only mean NULL here, since the catalog carries no DEFAULT values.
+///
+/// `None` when the statement named no columns: its child already emits the
+/// table's columns in order, which is what the insert path expects.
+fn build_column_list_projection(
+    column_map: &[Option<usize>],
+    columns: &[Column],
+) -> Result<Option<Projection>, OperatorError> {
+    if column_map.is_empty() {
+        return Ok(None);
+    }
+    if column_map.len() != columns.len() {
+        return Err(OperatorError::InvalidStatement(format!(
+            "INSERT names {} columns of a table that has {}",
+            column_map.len(),
+            columns.len()
+        )));
+    }
+    let listed = column_map.iter().flatten().count();
+    if listed == 0 {
+        // The column map is all-unfilled only for DEFAULT VALUES: a written
+        // column list always fills at least one column.
+        return Err(OperatorError::Unsupported(
+            "INSERT ... DEFAULT VALUES is not supported".to_string(),
+        ));
+    }
+    // The binder resolved the names, so each source is a distinct child column;
+    // check anyway, so a disagreement fails loudly instead of scrambling
+    // columns or reading past the child's width.
+    let mut filled = vec![false; listed];
+    let projections = columns
+        .iter()
+        .zip(column_map)
+        .map(|(column, source)| {
+            let Some(&column_idx) = source.as_ref() else {
+                let null = new_null_array(&physical_arrow_type(&column.col_type), 1);
+                return Ok(Expression::Constant(Scalar::new(null)));
+            };
+            let taken = filled.get_mut(column_idx).ok_or_else(|| {
+                OperatorError::InvalidStatement(format!(
+                    "INSERT column \"{}\" reads value {column_idx} of {listed}",
+                    column.name
+                ))
+            })?;
+            if std::mem::replace(taken, true) {
+                return Err(OperatorError::InvalidStatement(format!(
+                    "INSERT fills more than one column from value {column_idx}"
+                )));
+            }
+            Ok(Expression::Ref(Ref {
+                column_idx,
+                return_type: column.col_type.clone(),
+                name: Some(column.name.clone()),
+            }))
+        })
+        .collect::<Result<Vec<_>, OperatorError>>()?;
+    Ok(Some(Projection { projections }))
 }
 
 impl Filter {

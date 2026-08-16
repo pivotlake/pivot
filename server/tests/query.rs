@@ -274,6 +274,45 @@ async fn insert_stores_a_null_constant_as_a_null(#[future] conn: Conn) {
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
+async fn insert_with_a_column_list_fills_only_the_named_columns(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE listed_insert (id BIGINT, name VARCHAR, note VARCHAR)")
+        .await
+        .unwrap();
+
+    conn.simple_query("INSERT INTO listed_insert (note, id) VALUES ('first', 1)")
+        .await
+        .unwrap();
+
+    let rows = select_rows(&conn, "SELECT id, name, note FROM listed_insert").await;
+    assert_eq!(
+        rows,
+        vec![vec![Some("1".into()), None, Some("first".into())]]
+    );
+}
+
+/// A variant column the statement leaves out has to travel the write path as a
+/// variant all the same: it is a struct of two leaves that only the Arrow
+/// extension tag tells apart from any other struct, and the shredding stage
+/// reads that tag.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_with_a_column_list_leaves_an_unnamed_variant_null(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE listed_variant (n BIGINT, j VARIANT)")
+        .await
+        .unwrap();
+
+    conn.simple_query("INSERT INTO listed_variant (n) VALUES (1)")
+        .await
+        .unwrap();
+
+    let rows = select_rows(&conn, "SELECT n, j FROM listed_variant").await;
+    assert_eq!(rows, vec![vec![Some("1".into()), None]]);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
 async fn second_connection_sees_table_created_by_first(#[future] conn: Conn) {
     let dir = write_parquet(&people_batch());
     let reader = connect_client(server_port()).await;

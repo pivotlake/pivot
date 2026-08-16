@@ -416,9 +416,19 @@ impl<'plan> Insert<'plan> {
         Ok(ffi::lo_insert_take_table(self.raw)?)
     }
 
-    /// Empty means DuckDB bound an insert into every physical column by position.
-    pub fn has_column_map(self) -> Result<bool> {
-        Ok(ffi::lo_insert_column_map_count(self.raw)? != 0)
+    /// Where each physical table column takes its values from in the child's
+    /// output: `None` for a column the statement leaves out. An empty result
+    /// means DuckDB bound an insert into every physical column by position, so
+    /// the child already emits the table's columns in order.
+    pub fn column_map(self) -> Result<Vec<Option<usize>>> {
+        (0..ffi::lo_insert_column_map_count(self.raw)?)
+            .map(
+                |index| match ffi::lo_insert_column_map_has_source(self.raw, index)? {
+                    true => Ok(Some(ffi::lo_insert_column_map_source(self.raw, index)?)),
+                    false => Ok(None),
+                },
+            )
+            .collect()
     }
 
     pub fn returns_rows(self) -> Result<bool> {

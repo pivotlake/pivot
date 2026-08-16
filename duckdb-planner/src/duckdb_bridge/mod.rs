@@ -211,7 +211,13 @@ pub mod ffi {
 
         // ---- Insert ----
         fn lo_insert_take_table(op: &LogicalOperator) -> Result<Box<OptionalTableWrapper>>;
+        /// A `LogicalInsert`'s `column_index_map`: one entry per physical table
+        /// column, empty when the statement gave no column list. Each entry is
+        /// the child column that fills that table column, or "no source" for a
+        /// column the statement leaves out.
         fn lo_insert_column_map_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_insert_column_map_has_source(op: &LogicalOperator, index: usize) -> Result<bool>;
+        fn lo_insert_column_map_source(op: &LogicalOperator, index: usize) -> Result<usize>;
         fn lo_insert_returns_rows(op: &LogicalOperator) -> Result<bool>;
 
         // ---- Filter ----

@@ -121,7 +121,7 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         return build_delim_join(op, delim, ctx);
     }
 
-    let inputs = op
+    let mut inputs = op
         .children()?
         .into_iter()
         .map(|child| build_node(child, ctx))
@@ -149,7 +149,24 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         DuckOperator::Projection(p) => Operator::Projection(Projection::from_handle(p)?),
         DuckOperator::Values(v) => Operator::Values(Values::from_handle(v)?),
         DuckOperator::ChunkGet(c) => Operator::Values(Values::from_chunk_get(c)?),
-        DuckOperator::Insert(i) => Operator::Insert(Insert::from_handle(i)?),
+        DuckOperator::Insert(i) => {
+            let (insert, column_list) = Insert::from_handle(i)?;
+            // An INSERT that named its target columns binds a child emitting
+            // just those, in the order written. Widen it to the table's full
+            // column list here, so the insert itself always writes a child row
+            // straight through, column for column.
+            if let Some(projection) = column_list {
+                let child = inputs
+                    .pop()
+                    .expect("an INSERT with a column list has a source of rows");
+                inputs.push(PlanNode {
+                    name: "INSERT_COLUMN_LIST".to_string(),
+                    inputs: vec![child],
+                    operator: Operator::Projection(projection),
+                });
+            }
+            Operator::Insert(insert)
+        }
         DuckOperator::Filter(f) => Operator::Filter(Filter::from_handle(f)?),
         DuckOperator::Aggregate(a) => Operator::Aggregate(Aggregate::from_handle(a)?),
         DuckOperator::OrderBy(o) => Operator::OrderBy(OrderBy::from_handle(o)?),

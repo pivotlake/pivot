@@ -351,6 +351,15 @@ size_t lo_insert_column_map_count(const LogicalOperator &op) {
 	return as<duckdb::LogicalInsert>(op).column_index_map.size();
 }
 
+bool lo_insert_column_map_has_source(const LogicalOperator &op, size_t index) {
+	auto source = as<duckdb::LogicalInsert>(op).column_index_map[duckdb::PhysicalIndex(index)];
+	return source != duckdb::DConstants::INVALID_INDEX;
+}
+
+size_t lo_insert_column_map_source(const LogicalOperator &op, size_t index) {
+	return as<duckdb::LogicalInsert>(op).column_index_map[duckdb::PhysicalIndex(index)];
+}
+
 bool lo_insert_returns_rows(const LogicalOperator &op) {
 	return as<duckdb::LogicalInsert>(op).return_chunk;
 }

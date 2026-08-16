@@ -802,6 +802,64 @@ fn insert_rows_are_visible_after_a_refresh() {
     );
 }
 
+/// A three-column table for the INSERT column-list tests: values arrive out of
+/// table order and never fill `note`.
+fn column_list_table() -> Vec<Column> {
+    vec![
+        Column {
+            name: "id".to_string(),
+            col_type: Type::Int32,
+        },
+        Column {
+            name: "name".to_string(),
+            col_type: Type::Utf8,
+        },
+        Column {
+            name: "note".to_string(),
+            col_type: Type::Utf8,
+        },
+    ]
+}
+
+#[test]
+fn insert_with_a_column_list_reorders_values_and_nulls_the_rest() {
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, empty_request("listed", column_list_table())).unwrap();
+
+    let inserted = run_sql(
+        &datastore,
+        "INSERT INTO listed (name, id) VALUES ('two', 2), ('one', 1)",
+    );
+    datastore.refresh_from_store().unwrap();
+
+    assert_eq!(common::extract_count(&inserted), 2);
+    let rows = run_sql(&datastore, "SELECT name FROM listed ORDER BY id");
+    assert_eq!(common::collect_strings(&rows, 0), vec!["one", "two"]);
+    let unfilled = run_sql(&datastore, "SELECT COUNT(*) FROM listed WHERE note IS NULL");
+    assert_eq!(common::extract_count(&unfilled), 2);
+}
+
+#[test]
+fn insert_select_with_a_column_list_reorders_the_selected_rows() {
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, empty_request("listed", column_list_table())).unwrap();
+    create_table(&datastore, empty_request("source", column_list_table())).unwrap();
+    run_sql(&datastore, "INSERT INTO source VALUES (1, 'one', 'first')");
+    datastore.refresh_from_store().unwrap();
+
+    let inserted = run_sql(
+        &datastore,
+        "INSERT INTO listed (note, id) SELECT name, id FROM source",
+    );
+    datastore.refresh_from_store().unwrap();
+
+    assert_eq!(common::extract_count(&inserted), 1);
+    let rows = run_sql(&datastore, "SELECT note FROM listed");
+    assert_eq!(common::collect_strings(&rows, 0), vec!["one"]);
+    let unfilled = run_sql(&datastore, "SELECT COUNT(*) FROM listed WHERE name IS NULL");
+    assert_eq!(common::extract_count(&unfilled), 1);
+}
+
 /// Every unsigned width, each inserted at a value past the signed maximum of
 /// the type Parquet stores it in — the values that only survive the round trip
 /// if the file records the column's true width and signedness.
