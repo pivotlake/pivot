@@ -12,11 +12,13 @@ use std::sync::Arc;
 /// `substring` (the `substring(x FROM a FOR b)` syntax binds to the same
 /// three-argument call).
 ///
-/// The supported surface is a constant one-based `start >= 1` and a constant
-/// `length >= 0` (or no length at all, which reads to the end of the string);
-/// the zero and negative positions DuckDB also accepts have wrap-around
-/// semantics nothing needs yet, so they fail loudly at plan time. Positions
-/// count characters, not bytes, matching DuckDB on multi-byte input.
+/// The supported surface is a constant `start >= 0` and a constant `length >=
+/// 0` (or no length at all, which reads to the end of the string). DuckDB's
+/// zero start denotes one position before the string, consuming one unit of an
+/// explicit length; the builder canonicalizes that to an equivalent one-based
+/// range so execution needs no special case. Negative positions, which count
+/// back from the end, fail loudly at plan time. Positions count characters,
+/// not bytes, matching DuckDB on multi-byte input.
 #[derive(Debug, Clone)]
 pub struct Substring {
     pub input: Box<Expression>,
@@ -202,11 +204,40 @@ mod tests {
     }
 
     #[rstest]
-    fn a_non_positive_start_is_rejected(mut testing_planner: TestingPlanner) {
+    fn a_zero_start_matches_duckdb_without_a_runtime_special_case(
+        mut testing_planner: TestingPlanner,
+    ) {
+        phones_table(&mut testing_planner);
+
+        let rows = run(
+            &mut testing_planner,
+            "SELECT substring(number, 0, 4) AS four, \
+                    substring(number, 0, 1) AS one, \
+                    substring(number, 0, 0) AS zero, \
+                    substring(number, 0) AS rest \
+             FROM phones WHERE number LIKE '13%'",
+        );
+
+        assert_eq!(
+            rows,
+            serde_json::json!([{
+                "four": "13-",
+                "one": "",
+                "zero": "",
+                "rest": "13-715-945-6730"
+            }])
+            .as_array()
+            .unwrap()
+            .clone()
+        );
+    }
+
+    #[rstest]
+    fn a_negative_start_is_rejected(mut testing_planner: TestingPlanner) {
         phones_table(&mut testing_planner);
 
         let error = testing_planner
-            .plan("SELECT substring(number, 0, 2) FROM phones")
+            .plan("SELECT substring(number, -1, 2) FROM phones")
             .unwrap_err()
             .to_string();
 

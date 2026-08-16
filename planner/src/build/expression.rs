@@ -462,12 +462,12 @@ impl Substring {
             });
         }
         let start = constant_int64(Expression::from_handle(params[1])?)?;
-        if start < 1 {
+        if start < 0 {
             return Err(Error::UnsupportedScalarFunction(format!(
-                "substring start positions below 1 are not supported (got {start})"
+                "substring start positions below 0 are not supported (got {start})"
             )));
         }
-        let length = match params.get(2) {
+        let mut length = match params.get(2) {
             Some(&length) => {
                 let length = constant_int64(Expression::from_handle(length)?)?;
                 if length < 0 {
@@ -479,9 +479,19 @@ impl Substring {
             }
             None => None,
         };
+        // DuckDB treats zero as one position before the first character: the
+        // slice starts at the first character, but that virtual position uses
+        // one unit of an explicit length. Canonicalize it here so the hot
+        // execution path remains the same branch-free positive-start path.
+        let start = if start == 0 {
+            length = length.map(|length| length.saturating_sub(1));
+            1
+        } else {
+            start as u64
+        };
         Ok(Substring {
             input: Box::new(Expression::from_handle(params[0])?),
-            start: start as u64,
+            start,
             length,
         })
     }
