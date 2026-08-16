@@ -1282,3 +1282,31 @@ async fn compact_accepts_a_fully_qualified_table_name(#[future] conn: Conn) {
     let rows = select_rows(&conn, "SELECT COUNT(*) FROM compact_qualified").await;
     assert_eq!(rows, vec![vec![Some("4".into())]]);
 }
+
+// The extended-statistics footer of `\d` as psql before 14 renders it,
+// captured verbatim: it reads pg_catalog-qualified unnest, string_agg, and
+// quote_ident over pg_statistic_ext.stxkeys, where psql 14+ calls
+// pg_get_statisticsobjdef_columns instead. Replayed directly so the shape
+// stays covered without an old psql client installed.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn pre_14_psql_extended_statistics_query_binds(#[future] conn: Conn) {
+    let rows = select_rows(
+        &conn,
+        "SELECT oid, stxrelid::pg_catalog.regclass, \
+         stxnamespace::pg_catalog.regnamespace AS nsp, stxname, \
+         (SELECT pg_catalog.string_agg(pg_catalog.quote_ident(attname),', ') \
+          FROM pg_catalog.unnest(stxkeys) s(attnum) \
+          JOIN pg_catalog.pg_attribute a ON (stxrelid = a.attrelid AND \
+               a.attnum = s.attnum AND NOT attisdropped)) AS columns, \
+         'd' = any(stxkind) AS ndist_enabled, \
+         'f' = any(stxkind) AS deps_enabled, \
+         'm' = any(stxkind) AS mcv_enabled \
+         FROM pg_catalog.pg_statistic_ext stat WHERE stxrelid = '2147483663' \
+         ORDER BY 1",
+    )
+    .await;
+
+    assert!(rows.is_empty(), "{rows:?}");
+}
