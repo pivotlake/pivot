@@ -15,7 +15,8 @@ name: Perf A/B
 # Required secrets:
 #   PERF_AWS_ACCESS_KEY_ID / PERF_AWS_SECRET_ACCESS_KEY
 #       AWS credentials allowed to ec2:DescribeInstances / StartInstances /
-#       StopInstances on the perf box.
+#       StopInstances (plus ec2:ModifyInstanceAttribute when the instance_type
+#       input is used) on the perf box.
 #   PERF_SSH_KEY
 #       Private key authorised for the box's login user.
 # The ClickBench harness fork (Epsio-Labs/ClickBench) is public, so it is
@@ -68,6 +69,13 @@ on:
         description: "Extra env for both server builds/runs, space-separated KEY=VALUE (e.g. PIVOT_DECOMPRESSED_CACHE=true PIVOT_RING_GB=20)."
         required: false
         default: ""
+      instance_type:
+        description: "EC2 instance type to run the perf box as; it is switched before starting if it differs, and the box is always restored to c8g.4xlarge after the run."
+        type: choice
+        options:
+          - c8g.4xlarge
+          - c8g.metal-48xl
+        default: c8g.4xlarge
 
 jobs:
   perf-ab:
@@ -129,6 +137,7 @@ jobs:
         env:
           INSTANCE_ID: ${{ vars.PERF_AWS_INSTANCE_ID }}
           NAME_FILTER: ${{ vars.PERF_NAME_FILTER || 'perf-*' }}
+          INSTANCE_TYPE: ${{ inputs.instance_type }}
         run: |
           set -euo pipefail
           id="$INSTANCE_ID"
@@ -151,6 +160,23 @@ jobs:
           state=$(aws ec2 describe-instances --instance-ids "$id" \
             --query 'Reservations[0].Instances[0].State.Name' --output text)
           echo "Current state: $state"
+
+          current_type=$(aws ec2 describe-instances --instance-ids "$id" \
+            --query 'Reservations[0].Instances[0].InstanceType' --output text)
+          if [ "$INSTANCE_TYPE" != "$current_type" ]; then
+            # EC2 only allows a type change on a stopped instance; a box that is
+            # already running is likely in use, so never stop it just for this.
+            if [ "$state" != "stopped" ]; then
+              echo "::error::instance type change ($current_type -> $INSTANCE_TYPE) requested but $id is $state, not stopped."
+              exit 1
+            fi
+            echo "Changing instance type: $current_type -> $INSTANCE_TYPE"
+            aws ec2 modify-instance-attribute --instance-id "$id" \
+              --instance-type "Value=$INSTANCE_TYPE"
+          else
+            echo "Instance type: $current_type"
+          fi
+
           if [ "$state" != "running" ]; then
             aws ec2 start-instances --instance-ids "$id" >/dev/null
           fi
@@ -412,7 +438,21 @@ jobs:
 
       - name: Stop the perf box
         if: ${{ always() && env.INSTANCE_ID != '' }}
+        env:
+          RESTORE_TYPE: c8g.4xlarge
         run: |
           set -euo pipefail
           echo "Stopping ${INSTANCE_ID}"
           aws ec2 stop-instances --instance-ids "$INSTANCE_ID" >/dev/null || true
+
+          # Always park the box as RESTORE_TYPE, so a run on a bigger type never
+          # leaves it behind for whoever starts the box next. The type can only
+          # be changed once the instance has fully stopped.
+          current_type=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].InstanceType' --output text)
+          if [ "$current_type" != "$RESTORE_TYPE" ]; then
+            aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
+            echo "Restoring instance type: $current_type -> $RESTORE_TYPE"
+            aws ec2 modify-instance-attribute --instance-id "$INSTANCE_ID" \
+              --instance-type "Value=$RESTORE_TYPE"
+          fi
