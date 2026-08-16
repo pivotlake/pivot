@@ -55,9 +55,18 @@ pub struct WorkerWaker {
     /// Monotonic wrapping counter bumped on every notification. Workers poll it
     /// while spinning before they park.
     wake_count: AtomicU64,
-    /// Number of workers currently parked. The no-sleeper send path checks this
-    /// before scanning slots.
+    /// Monotonic counter bumped only by notifications that may interrupt a
+    /// ring wait ([`notify`](Self::notify), [`notify_slot`](Self::notify_slot),
+    /// [`notify_delegated`](Self::notify_delegated)). Data-availability sends
+    /// ([`notify_one`](Self::notify_one)) leave it alone, so a worker with IO
+    /// in flight can still block: it is guaranteed a kernel wakeup when its
+    /// own IO completes and picks the new work up then.
+    ring_wake_count: AtomicU64,
+    /// Number of workers currently thread-parked. The no-sleeper send path
+    /// checks this before scanning slots.
     parked_workers: AtomicUsize,
+    /// Number of workers currently blocked in their IO ring wait.
+    ring_parked_workers: AtomicUsize,
     slots: Box<[ParkSlot]>,
     /// Rotates [`notify_one`](Self::notify_one)'s scan start so wake-ups spread
     /// over parked workers instead of always choosing the lowest index.
@@ -72,7 +81,9 @@ impl WorkerWaker {
     pub fn new(worker_count: usize) -> Self {
         Self {
             wake_count: AtomicU64::new(0),
+            ring_wake_count: AtomicU64::new(0),
             parked_workers: AtomicUsize::new(0),
+            ring_parked_workers: AtomicUsize::new(0),
             slots: (0..worker_count)
                 .map(|_| ParkSlot {
                     parked: AtomicBool::new(false),
@@ -110,13 +121,21 @@ impl WorkerWaker {
     /// whenever possible.
     fn wake_slot(&self, slot: &ParkSlot) -> bool {
         if slot.ring_parked.swap(false, Ordering::SeqCst) {
-            self.parked_workers.fetch_sub(1, Ordering::SeqCst);
+            self.ring_parked_workers.fetch_sub(1, Ordering::SeqCst);
             slot.ring_wake
                 .get()
                 .expect("a ring-parked worker registered its ring waker")
                 .wake();
             return true;
         }
+        self.wake_thread_parked_slot(slot)
+    }
+
+    /// Claim `slot` only if its worker is thread-parked and unpark it. A worker
+    /// blocked in its IO ring is left alone: it wakes on its own IO completion,
+    /// and interrupting the ring costs an eventfd round-trip per wake, which
+    /// data-availability sends fire far too often to afford.
+    fn wake_thread_parked_slot(&self, slot: &ParkSlot) -> bool {
         if slot.parked.swap(false, Ordering::SeqCst) {
             self.parked_workers.fetch_sub(1, Ordering::SeqCst);
             if let Some(thread) = slot.thread.get() {
@@ -127,11 +146,14 @@ impl WorkerWaker {
         false
     }
 
-    /// Record a notification and wake one parked worker, if any.
+    /// Record a data-availability notification and wake one thread-parked
+    /// worker, if any.
     ///
     /// This is used when one new stealable item needs one same-node consumer.
-    /// Returns whether a parked worker was woken so callers can try another node
-    /// when they need to grow the pool-wide working set.
+    /// Workers blocked in their IO ring wait are deliberately not interrupted:
+    /// their own IO completion wakes them promptly, and they scan for new work
+    /// then. Returns whether a parked worker was woken so callers can try
+    /// another node when they need to grow the pool-wide working set.
     pub fn notify_one(&self) -> bool {
         self.wake_count.fetch_add(1, Ordering::SeqCst);
         if self.parked_workers.load(Ordering::SeqCst) == 0 {
@@ -139,35 +161,44 @@ impl WorkerWaker {
         }
         let start = self.next_wake.fetch_add(1, Ordering::Relaxed);
         for i in 0..self.slots.len() {
-            if self.wake_slot(&self.slots[(start + i) % self.slots.len()]) {
+            if self.wake_thread_parked_slot(&self.slots[(start + i) % self.slots.len()]) {
                 return true;
             }
         }
         false
     }
 
-    /// Record a notification and wake worker `local_idx` if it is parked.
-    /// Used for messages addressed to a specific worker.
+    /// Record a notification and wake worker `local_idx` if it is parked,
+    /// interrupting its ring wait when necessary. Used for messages addressed
+    /// to a specific worker, which no other worker can handle for it.
     pub fn notify_slot(&self, local_idx: usize) {
         self.wake_count.fetch_add(1, Ordering::SeqCst);
-        if self.parked_workers.load(Ordering::SeqCst) == 0 {
-            return;
+        self.ring_wake_count.fetch_add(1, Ordering::SeqCst);
+        if self.any_parked() {
+            self.wake_slot(&self.slots[local_idx]);
         }
-        self.wake_slot(&self.slots[local_idx]);
     }
 
-    /// Record a notification and wake every parked worker in this node.
+    /// Record a notification and wake every parked worker in this node,
+    /// interrupting ring waits.
     ///
     /// Used for events any local worker may be waiting on, such as cancellation
     /// or a sibling counter reaching zero.
     pub fn notify(&self) {
         self.wake_count.fetch_add(1, Ordering::SeqCst);
+        self.ring_wake_count.fetch_add(1, Ordering::SeqCst);
         self.wake_all_parked();
     }
 
-    /// Unpark every currently parked worker without changing the wake count.
+    /// Whether any worker is thread-parked or blocked in its ring wait.
+    fn any_parked(&self) -> bool {
+        self.parked_workers.load(Ordering::SeqCst) != 0
+            || self.ring_parked_workers.load(Ordering::SeqCst) != 0
+    }
+
+    /// Unpark every currently parked worker without changing the wake counts.
     fn wake_all_parked(&self) {
-        if self.parked_workers.load(Ordering::SeqCst) == 0 {
+        if !self.any_parked() {
             return;
         }
         for slot in &self.slots {
@@ -183,8 +214,9 @@ impl WorkerWaker {
     /// on the unpinned coordinator.
     pub fn notify_delegated(&self) {
         self.wake_count.fetch_add(1, Ordering::SeqCst);
+        self.ring_wake_count.fetch_add(1, Ordering::SeqCst);
         self.broadcast_epoch.fetch_add(1, Ordering::SeqCst);
-        if self.parked_workers.load(Ordering::SeqCst) == 0 {
+        if !self.any_parked() {
             return;
         }
         // The delegate also scans in slot order, preserving the wake order of a
@@ -244,26 +276,36 @@ impl WorkerWaker {
         self.wake_count.load(Ordering::SeqCst)
     }
 
+    /// Current ring wake count. Workers snapshot it around their ring waits the
+    /// way [`wake_count`](Self::wake_count) is snapshotted around parks.
+    pub fn ring_wake_count(&self) -> u64 {
+        self.ring_wake_count.load(Ordering::SeqCst)
+    }
+
     /// Publish worker `local_idx` as blocked in its IO ring wait, unless the
-    /// wake count moved past `last_seen` first. Returns whether the caller
+    /// ring wake count moved past `last_seen` first. Returns whether the caller
     /// should proceed into the blocking wait; `false` means a notification
     /// raced in and the worker should re-run its loop instead.
     ///
-    /// Same no-lost-wake protocol as [`wait_if_unchanged`](Self::wait_if_unchanged):
-    /// notifiers bump the count before scanning slots, this publishes the slot
-    /// before rechecking the count, so a concurrent notification either shows
-    /// in the recheck or claims the slot and interrupts the ring (see
-    /// [`wake_slot`](Self::wake_slot)). The caller must pair a `true` return
-    /// with [`end_ring_wait`](Self::end_ring_wait) after the wait returns.
+    /// Same no-lost-wake protocol as [`wait_if_unchanged`](Self::wait_if_unchanged),
+    /// against [`ring_wake_count`](Self::ring_wake_count): ring-interrupting
+    /// notifiers bump that count before scanning slots, this publishes the slot
+    /// before rechecking it, so a concurrent notification either shows in the
+    /// recheck or claims the slot and interrupts the ring (see
+    /// [`wake_slot`](Self::wake_slot)). Data-availability sends do not bump the
+    /// ring count and do not interrupt the wait: the caller only enters it with
+    /// IO in flight, whose completion is a guaranteed wakeup. The caller must
+    /// pair a `true` return with [`end_ring_wait`](Self::end_ring_wait) after
+    /// the wait returns.
     pub fn begin_ring_wait(&self, local_idx: usize, last_seen: u64) -> bool {
         let slot = &self.slots[local_idx];
         slot.ring_parked.store(true, Ordering::SeqCst);
-        self.parked_workers.fetch_add(1, Ordering::SeqCst);
-        if self.wake_count.load(Ordering::SeqCst) != last_seen {
+        self.ring_parked_workers.fetch_add(1, Ordering::SeqCst);
+        if self.ring_wake_count.load(Ordering::SeqCst) != last_seen {
             // Withdraw the slot unless a notifier already claimed it (and woke
             // the ring; the spurious wake drains harmlessly).
             if slot.ring_parked.swap(false, Ordering::SeqCst) {
-                self.parked_workers.fetch_sub(1, Ordering::SeqCst);
+                self.ring_parked_workers.fetch_sub(1, Ordering::SeqCst);
             }
             return false;
         }
@@ -276,7 +318,7 @@ impl WorkerWaker {
     pub fn end_ring_wait(&self, local_idx: usize) {
         let slot = &self.slots[local_idx];
         if slot.ring_parked.swap(false, Ordering::SeqCst) {
-            self.parked_workers.fetch_sub(1, Ordering::SeqCst);
+            self.ring_parked_workers.fetch_sub(1, Ordering::SeqCst);
         }
     }
 }
@@ -520,6 +562,47 @@ mod tests {
         assert_eq!(remote.parked_workers.load(Ordering::SeqCst), 1);
         remote.notify();
         b.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_data_send_does_not_interrupt_a_ring_wait() {
+        let waker = Arc::new(WorkerWaker::new(1));
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        waker.register_ring_waker(0, crate::io::RingWakeHandle::EventFd(fd));
+        assert!(waker.begin_ring_wait(0, waker.ring_wake_count()));
+
+        let woke = waker.notify_one();
+
+        let mut counter = 0u64;
+        let drained = unsafe { libc::read(fd, (&mut counter as *mut u64).cast(), 8) };
+        assert!(!woke);
+        assert_eq!(drained, -1, "a data send must not write the ring eventfd");
+        waker.notify();
+        let drained = unsafe { libc::read(fd, (&mut counter as *mut u64).cast(), 8) };
+        assert_eq!(drained, 8, "a broadcast still interrupts the ring wait");
+        waker.end_ring_wait(0);
+        unsafe { libc::close(fd) };
+    }
+
+    #[test]
+    fn only_ring_capable_notifies_block_entering_a_ring_wait() {
+        let waker = Arc::new(WorkerWaker::new(1));
+        let snapshot = waker.ring_wake_count();
+
+        waker.notify_one();
+
+        assert!(
+            waker.begin_ring_wait(0, snapshot),
+            "a data send must not keep a worker with IO in flight from sleeping"
+        );
+        waker.end_ring_wait(0);
+        waker.notify_slot(0);
+        assert!(
+            !waker.begin_ring_wait(0, snapshot),
+            "a targeted notify raced in and the worker must re-run its loop"
+        );
+        waker.end_ring_wait(0);
     }
 
     #[test]
