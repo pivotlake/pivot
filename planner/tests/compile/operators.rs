@@ -1769,6 +1769,7 @@ impl dispatch::Nullary<RecordBatch> for NoRowsNullary {
     fn run(
         &mut self,
         _sender: &mut dyn dispatch::Sender<RecordBatch>,
+        _io: &mut dispatch::OperatorIO,
     ) -> dispatch::NullaryResult<dispatch::WorkStatus> {
         if self.ran {
             return Ok(dispatch::WorkStatus::Pending);

@@ -509,7 +509,11 @@ impl CompressedCache {
         let extents = file_maps.get(open_file)?.read().unwrap();
         let found_extent = find_extent_covering(&extents, file_block)?;
 
-        let pin = Arc::new(memory_ctx().ring().try_read(found_extent.slot_idx as usize)?);
+        let pin = Arc::new(
+            memory_ctx()
+                .ring()
+                .try_read(found_extent.slot_idx as usize)?,
+        );
         memory_ctx().clock().touch(found_extent.slot_idx as usize);
         let valid = &self.slot_metadata(found_extent.slot_idx as usize).valid;
 
