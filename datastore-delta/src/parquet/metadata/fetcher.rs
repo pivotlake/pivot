@@ -94,7 +94,7 @@ impl Unary<DataFile, FileRowGroups> for FileRowGroupsFetcher {
             reading_exact: false,
         };
         self.unanswered_requests += 1;
-        io.push(footer_read.read_region(size - probe, probe));
+        io.push_read(footer_read.read_region(size - probe, probe));
         Ok(())
     }
 
@@ -119,7 +119,7 @@ impl Unary<DataFile, FileRowGroups> for FileRowGroupsFetcher {
             }
             // The footer overflowed the probe; the exact re-read goes back
             // through the same staging path, and its response lands here again.
-            Parsed::ExactReadNeeded(request) => io.push(request),
+            Parsed::ExactReadNeeded(request) => io.push_read(request),
         }
         Ok(())
     }

@@ -57,9 +57,7 @@ mod factory;
 pub use factory::*;
 
 use crate::data_flow::WorkStatus;
-use crate::io::{
-    CompletedIoRequest, FsRequest, FsWriteRequest, HttpRequest, HttpUploadRequest, OperatorIO,
-};
+use crate::io::{CompletedIoRequest, FsWriteRequest, HttpUploadRequest, OperatorIO};
 use arrow_schema::ArrowError;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -131,18 +129,6 @@ pub trait Unary<I, O> {
     /// them back through [`process_io_response`](Self::process_io_response).
     fn consume(&mut self, object: I, sender: &mut dyn Sender<O>, io: &mut OperatorIO)
     -> Result<()>;
-
-    /// Return any pending filesystem write requests. See
-    /// [`Operator::next_fs_requests`].
-    fn next_fs_requests(&mut self) -> Result<Vec<FsRequest>> {
-        Ok(vec![])
-    }
-
-    /// Return any pending HTTP upload requests. See
-    /// [`Operator::next_http_requests`].
-    fn next_http_requests(&mut self) -> Result<Vec<HttpRequest>> {
-        Ok(vec![])
-    }
 
     /// Whether this unary is ready to accept another input. Returns `false` when
     /// backpressured (e.g. waiting for IO to complete before consuming more).
@@ -276,14 +262,6 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
         self.unary.consume(item, &mut *self.sender, io)?;
 
         Ok(WorkStatus::Ran)
-    }
-
-    fn next_fs_requests(&mut self) -> super::Result<Vec<FsRequest>> {
-        Ok(self.unary.next_fs_requests()?)
-    }
-
-    fn next_http_requests(&mut self) -> super::Result<Vec<HttpRequest>> {
-        Ok(self.unary.next_http_requests()?)
     }
 
     fn process_io_response(

@@ -18,13 +18,20 @@
 //! reads across operators and dataflows alike: a read identical to, or fully
 //! contained in, one already in flight joins its waiter list instead of issuing
 //! its own IO (see [`RequestTracker::schedule_or_join`]).
+//!
+//! Writes and uploads pass through too, but only as far as the submission
+//! queues ([`stage_write`](RequestTracker::stage_write) /
+//! [`stage_upload`](RequestTracker::stage_upload)): they carry their payloads
+//! and complete straight back to their issuing operators, so they need none of
+//! the cache or routing machinery.
 
 use crate::Identifier;
 use crate::io::operator_io::{
     CacheTiers, CompletedIoRequest, FileRange, PendingIoRequest, RangePart,
 };
 use crate::io::{
-    DataFlowRequest, FsReadRequest, FsRequest, HttpGetRequest, HttpRequest, OpenFile, RING_SIZE,
+    DataFlowRequest, FsReadRequest, FsRequest, FsWriteRequest, HttpGetRequest, HttpRequest,
+    HttpUploadRequest, OpenFile, RING_SIZE,
 };
 use crate::memory::compressed_cache::MissingExtent;
 use crate::memory::{CacheLookup, Segment, memory_ctx};
@@ -220,10 +227,12 @@ pub struct RequestTracker {
     /// to one file's reads rather than every file's - a footer scan keeps
     /// dozens of files in flight at once.
     routing: HashMap<OpenFile, HashMap<ReadKey, Vec<usize>>>,
-    /// Deduped local reads queued for submission, each tagged with the dataflow
-    /// and operator whose request first scheduled it (for stats attribution).
+    /// Local operations queued for submission: deduped reads, each tagged with
+    /// the dataflow and operator whose request first scheduled it (for stats
+    /// attribution), plus staged writes.
     to_submit_fs: Vec<DataFlowRequest<FsRequest>>,
-    /// Deduped remote reads queued for submission.
+    /// Remote operations queued for submission: deduped reads plus staged
+    /// uploads.
     to_submit_http: Vec<DataFlowRequest<HttpRequest>>,
     /// Scheduled-but-not-landed reads, per medium - the worker budgets disk and
     /// HTTP registration separately since their latencies differ.
@@ -439,21 +448,53 @@ impl RequestTracker {
         }
     }
 
-    /// Take up to [`MAX_SUBMIT_BATCH`] of the deduped local reads queued for
+    /// Queue a filesystem write for submission. A write carries its payload
+    /// and needs no cache resolution or routing state - its completion routes
+    /// straight back to the issuing operator - so it only rides the submission
+    /// queue.
+    pub fn stage_write(
+        &mut self,
+        data_flow_id: Identifier,
+        operator_idx: Identifier,
+        write: FsWriteRequest,
+    ) {
+        self.to_submit_fs.push(DataFlowRequest::new(
+            data_flow_id,
+            operator_idx,
+            FsRequest::Write(write),
+        ));
+    }
+
+    /// Queue an object upload for submission. Like a write, it only rides the
+    /// submission queue.
+    pub fn stage_upload(
+        &mut self,
+        data_flow_id: Identifier,
+        operator_idx: Identifier,
+        upload: HttpUploadRequest,
+    ) {
+        self.to_submit_http.push(DataFlowRequest::new(
+            data_flow_id,
+            operator_idx,
+            HttpRequest::Upload(upload),
+        ));
+    }
+
+    /// Take up to [`MAX_SUBMIT_BATCH`] of the local operations queued for
     /// submission to the ring; the rest stay queued for the next pass so we
     /// never overrun the ring.
     pub fn take_fs_submissions(&mut self) -> Vec<DataFlowRequest<FsRequest>> {
         take_batch(&mut self.to_submit_fs)
     }
 
-    /// Take up to [`MAX_SUBMIT_BATCH`] of the deduped remote reads queued for
+    /// Take up to [`MAX_SUBMIT_BATCH`] of the remote operations queued for
     /// submission; the rest stay queued for the next pass.
     pub fn take_http_submissions(&mut self) -> Vec<DataFlowRequest<HttpRequest>> {
         take_batch(&mut self.to_submit_http)
     }
 
-    /// Whether any deduped read is still queued for submission.
-    pub fn has_reads_to_submit(&self) -> bool {
+    /// Whether any operation is still queued for submission.
+    pub fn has_requests_to_submit(&self) -> bool {
         !self.to_submit_fs.is_empty() || !self.to_submit_http.is_empty()
     }
 

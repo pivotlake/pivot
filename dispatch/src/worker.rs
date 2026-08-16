@@ -118,7 +118,8 @@ pub type Result<T, E = Error> = result::Result<T, E>;
 ///
 /// 1. Process any outstanding IO completions — we want to always have IO running in background, so
 ///    we clear any pending if possible
-/// 2. Saturate IO - if we have space now, submit new IO
+/// 2. Register pending IO - drain the requests operators staged in their `OperatorIO`s into the
+///    tracker, then submit the resulting operations onto the ring
 /// 3. Run any CPU work available - this will run a single operation if available
 /// 4. Try running trough all dataflows and finishing then
 ///
@@ -256,88 +257,13 @@ impl Worker {
         crate::profiler::profiling_active() && !flow.is_profiled()
     }
 
-    /// Submit disk reads from dataflows until the disk queue is busy or no more
-    /// requests remain. Returns whether the pass visited every dataflow and
-    /// found nothing - only such a pass proves no disk request is waiting.
-    fn saturate_io(&mut self) -> Result<bool> {
-        let mut clean = true;
-        for flow in self.data_flows.values_mut() {
-            #[cfg(feature = "perf")]
-            if Self::paused_for_profiling(flow) {
-                clean = false;
-                continue;
-            }
-            if self.io.has_file_pending() {
-                return Ok(false);
-            }
-
-            while let Some(mut requests) = flow.get_next_fs_request() {
-                clean = false;
-                flow.stats().record_issued_disk(&mut requests);
-                for r in requests {
-                    self.io.request(r)?;
-                }
-
-                if self.io.has_file_pending() {
-                    return Ok(false);
-                }
-            }
-        }
-        Ok(clean)
-    }
-
-    /// Submit HTTP operations from dataflows onto the same ring until this worker
-    /// has `HTTP_INFLIGHT_TARGET` requests in flight or none remain. Gated
-    /// on HTTP activity only (not disk) so the two queues fill independently.
-    ///
-    /// Remote objects sit behind ~tens-of-ms RTTs, so a deep read-ahead is what
-    /// hides the latency. Stopping at the *first* outstanding read serialises a
-    /// scan to one read at a time per worker — catastrophic over a table of many
-    /// small files, where the whole query becomes round-trip bound.
-    fn saturate_http(&mut self) -> Result<bool> {
-        let mut clean = true;
-        'flows: for flow in self.data_flows.values_mut() {
-            #[cfg(feature = "perf")]
-            if Self::paused_for_profiling(flow) {
-                clean = false;
-                continue;
-            }
-            if self.io.http_in_flight() >= http_inflight_target() {
-                return Ok(false);
-            }
-
-            while let Some(mut requests) = flow.get_next_http_request() {
-                clean = false;
-                flow.stats().stamp_issued(&mut requests);
-                for r in requests {
-                    // Submitting an HTTP operation can fail (socket exhaustion,
-                    // TLS setup). Fail just this dataflow rather than propagating,
-                    // which would panic the worker and take the whole server down.
-                    // Every operation reports how to charge its transport stats:
-                    // GETs can split across cache tiers; uploads are all HTTP.
-                    match self.io.request_http(r) {
-                        Ok(split) => flow.stats().record_issued_remote(split),
-                        Err(e) => {
-                            flow.bail_and_cancel(e.into());
-                            continue 'flows;
-                        }
-                    }
-                }
-
-                if self.io.http_in_flight() >= http_inflight_target() {
-                    break;
-                }
-            }
-        }
-        Ok(clean)
-    }
-
-    /// Register the cache-backed read requests operators staged in their
-    /// [`OperatorIO`](crate::io::OperatorIO)s with this worker's tracker, one
-    /// dataflow at a time, until the per-medium in-flight budget is spent.
-    /// Requests whose ranges were all cache-resident complete and are delivered
-    /// during the pass. Returns whether every dataflow's staged requests were
-    /// fully drained.
+    /// Drain the IO operators staged in their
+    /// [`OperatorIO`](crate::io::OperatorIO)s into this worker's tracker, one
+    /// dataflow at a time: reads register against the caches (until the
+    /// per-medium in-flight budget is spent), writes and uploads queue for
+    /// submission. Requests whose ranges were all cache-resident complete and
+    /// are delivered during the pass. Returns whether every dataflow's staged
+    /// IO was fully drained.
     fn register_pending_io(&mut self) -> bool {
         let caps = RegistrationCaps {
             disk_reads: MAX_DISK_READS_IN_FLIGHT,
@@ -359,16 +285,18 @@ impl Worker {
         clean
     }
 
-    /// Submit the tracker's deduped reads onto the ring: disk reads while the
-    /// disk queue is free (the tracker batches them so the ring's completion
-    /// queue can't overflow), remote reads up to the in-flight ceiling. Each
-    /// read is charged to the stats of the dataflow whose request first
-    /// scheduled it.
+    /// Submit the tracker's queued operations onto the ring: filesystem
+    /// reads/writes while the disk queue is free (the tracker batches them so
+    /// the ring's completion queue can't overflow), remote operations up to the
+    /// in-flight ceiling - remote objects sit behind ~tens-of-ms RTTs, so that
+    /// depth of read-ahead is what hides the latency. Each operation is charged
+    /// to the stats of the dataflow that staged it (for a deduped read, the one
+    /// whose request first scheduled it).
     ///
     /// Reads whose dataflow has since been cancelled are submitted regardless:
     /// the read may have waiters in other dataflows, and its cache slot is
     /// already allocated and pinned either way.
-    fn submit_tracker_reads(&mut self) -> Result<()> {
+    fn submit_staged_requests(&mut self) -> Result<()> {
         while !self.io.has_file_pending() {
             let batch = self.tracker.take_fs_submissions();
             if batch.is_empty() {
@@ -394,23 +322,29 @@ impl Worker {
                 }
                 let data_flow_id = request.data_flow_id;
                 let read = match &request.request {
-                    crate::io::HttpRequest::Get(get) => ReadKey::of_http_get(get),
-                    crate::io::HttpRequest::Upload(_) => {
-                        unreachable!("the tracker submits only GETs")
-                    }
+                    crate::io::HttpRequest::Get(get) => Some(ReadKey::of_http_get(get)),
+                    crate::io::HttpRequest::Upload(_) => None,
                 };
                 // Submitting an HTTP operation can fail (socket exhaustion,
-                // TLS setup). The read never went out, so fail it through the
-                // tracker - cancelling every dataflow that waited on it -
-                // rather than propagating, which would panic the worker and
-                // take the whole server down.
+                // TLS setup). The operation never went out, so fail it where
+                // it's accounted: a read through the tracker (cancelling every
+                // dataflow that waited on it), an upload against its issuing
+                // dataflow alone. Never propagated - that would panic the
+                // worker and take the whole server down.
                 match self.io.request_http(request) {
                     Ok(split) => {
                         if let Some(flow) = self.data_flows.get_mut(&data_flow_id) {
                             flow.stats().record_issued_remote(split);
                         }
                     }
-                    Err(e) => self.fail_tracker_read(&read, &e),
+                    Err(e) => match read {
+                        Some(read) => self.fail_tracker_read(&read, &e),
+                        None => {
+                            if let Some(flow) = self.data_flows.get_mut(&data_flow_id) {
+                                flow.bail_and_cancel(e.into());
+                            }
+                        }
+                    },
                 }
             }
         }
@@ -671,24 +605,17 @@ impl Worker {
             self.cancel_upstream_in_dataflows();
 
             self.process_io_completions()?;
-            // Walk the operator graphs for staged IO only while some operator
-            // has flagged it; on an IO-free hot path the walks are the whole
-            // cost. Clearing only after every pass came back clean keeps a
-            // request that was skipped by an early break (spent registration
-            // budget, busy disk queue, full HTTP window) flagged for the next
-            // pass.
-            if crate::io::has_pending_io() {
-                let register_clean = self.register_pending_io();
-                let disk_clean = self.saturate_io()?;
-                let http_clean = self.saturate_http()?;
-                if register_clean && disk_clean && http_clean {
-                    crate::io::clear_pending_io();
-                }
+            // Walk the dataflows for staged IO only while some operator has
+            // flagged it; on an IO-free hot path the walks are the whole cost.
+            // Clearing only after a fully clean pass keeps IO that was left
+            // staged by a spent registration budget flagged for the next pass.
+            if crate::io::has_pending_io() && self.register_pending_io() {
+                crate::io::clear_pending_io();
             }
-            // Reads the register stage scheduled (and any leftovers a busy ring
-            // deferred) go out now.
-            if self.tracker.has_reads_to_submit() {
-                self.submit_tracker_reads()?;
+            // Operations the register stage queued (and any leftovers a busy
+            // ring or full HTTP window deferred) go out now.
+            if self.tracker.has_requests_to_submit() {
+                self.submit_staged_requests()?;
             }
 
             self.step_run_ready_cpu_work();

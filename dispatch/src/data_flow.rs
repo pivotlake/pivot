@@ -13,25 +13,21 @@
 //!   attempting to steal from peer workers' channels. Root-to-leaf (upstream first)
 //!   means the stealing worker picks up data early in the dataflow, to not interrupt current
 //!   hot-in-cache processing
-//! - [`register_pending_io`](DataFlow::register_pending_io) — drain the
-//!   cache-backed read requests operators staged in their nodes' [`OperatorIO`]s
-//!   into the worker's [`RequestTracker`], and
+//! - [`register_pending_io`](DataFlow::register_pending_io) — drain the IO
+//!   operators staged in their nodes' [`OperatorIO`]s into the worker's
+//!   [`RequestTracker`] (reads register against the caches; writes and uploads
+//!   queue for submission), and
 //!   [`process_io_response`](DataFlow::process_io_response) — deliver a resolved
-//!   request back to the operator that staged it.
-//! - [`get_next_fs_request`](DataFlow::get_next_fs_request) /
-//!   [`get_next_http_request`](DataFlow::get_next_http_request) — collect pending
-//!   write/upload requests from operators.
+//!   read request back to the operator that staged it.
 //! - [`process_fs_write`](DataFlow::process_fs_write) /
 //!   [`process_http_upload_response`](DataFlow::process_http_upload_response) —
 //!   deliver completed writes/uploads to the operator that requested them.
 //! - [`maybe_finish`](DataFlow::maybe_finish) — check if all operators have completed.
 
 use crate::Identifier;
+use crate::io::operator_io::{PendingFsRequest, PendingHttpRequest};
 use crate::io::request_tracker::{RegistrationCaps, RequestTracker};
-use crate::io::{
-    CompletedIoRequest, DataFlowRequest, FsRequest, FsWriteRequest, HttpRequest, HttpUploadRequest,
-    OperatorIO,
-};
+use crate::io::{CompletedIoRequest, FsWriteRequest, HttpUploadRequest, OperatorIO};
 use crate::operations::{FinishStatus, Operator};
 use crate::stats::{DataFlowStats, StatsCollector};
 use crate::waker::waker_set;
@@ -539,13 +535,16 @@ impl DataFlow {
         });
     }
 
-    /// Register the cache-backed read requests operators have staged in their
-    /// nodes' [`OperatorIO`]s with the worker's `tracker`, stopping once a
-    /// medium's in-flight reads hit its cap (`caps`) - the rest stay staged for
-    /// the next pass. A request whose ranges were all cache-resident completes
-    /// during registration, and its response is delivered to the operator right
-    /// here (which may stage follow-up requests; the drain keeps going until
-    /// the node's queues are empty or the budget runs out).
+    /// Drain the IO operators have staged in their nodes' [`OperatorIO`]s into
+    /// the worker's `tracker`: reads register (resolving against the caches),
+    /// writes and uploads go straight to the submission queues. A lane stops
+    /// draining once its next operation is a read and the medium's in-flight
+    /// reads sit at the cap (`caps`) - the rest stay staged for the next pass.
+    ///
+    /// A read whose ranges were all cache-resident completes during
+    /// registration, and its response is delivered to the operator right here
+    /// (which may stage follow-up requests; the drain keeps going until the
+    /// node's queues are empty or the budget runs out).
     pub fn register_pending_io(
         &mut self,
         tracker: &mut RequestTracker,
@@ -562,26 +561,34 @@ impl DataFlow {
                 let mut clean = true;
                 for node in &mut d.graph.operators {
                     loop {
-                        let request = if tracker.disk_in_flight() < caps.disk_reads
-                            && node.io.has_fs_requests()
+                        if node.io.has_fs_requests()
+                            && (!node.io.fs_front_is_read()
+                                || tracker.disk_in_flight() < caps.disk_reads)
                         {
-                            node.io.pop_fs_request()
-                        } else if tracker.http_in_flight() < caps.http_reads
-                            && node.io.has_http_requests()
+                            match node.io.pop_fs_request().unwrap() {
+                                PendingFsRequest::Read(request) => {
+                                    delivered |=
+                                        register_read(tracker, data_flow_id, node, request)?;
+                                }
+                                PendingFsRequest::Write(write) => {
+                                    tracker.stage_write(data_flow_id, node.id, write)
+                                }
+                            }
+                        } else if node.io.has_http_requests()
+                            && (!node.io.http_front_is_read()
+                                || tracker.http_in_flight() < caps.http_reads)
                         {
-                            node.io.pop_http_request()
+                            match node.io.pop_http_request().unwrap() {
+                                PendingHttpRequest::Read(request) => {
+                                    delivered |=
+                                        register_read(tracker, data_flow_id, node, request)?;
+                                }
+                                PendingHttpRequest::Upload(upload) => {
+                                    tracker.stage_upload(data_flow_id, node.id, upload)
+                                }
+                            }
                         } else {
                             break;
-                        };
-                        let Some(request) = request else { break };
-                        if let Some(completed) = tracker.register(data_flow_id, node.id, request) {
-                            delivered = true;
-                            // The node may have retired while its request was
-                            // staged (an abandoned scan); nobody wants the
-                            // response then.
-                            if let Some(operator) = node.operator.as_deref_mut() {
-                                operator.process_io_response(&mut node.io, completed)?;
-                            }
                         }
                     }
                     clean &= node.io.is_empty();
@@ -660,50 +667,26 @@ impl DataFlow {
                 })
         })
     }
+}
 
-    /// Collect pending filesystem read requests from operators (leaf-to-root).
-    /// Returns the first batch found, or `None` if no operator needs disk IO.
-    pub fn get_next_fs_request(&mut self) -> Option<Vec<DataFlowRequest<FsRequest>>> {
-        self.try_run_or(None, |d| {
-            d.graph
-                .traverse_backwards(|id, operator, _io| {
-                    let requests = operator.next_fs_requests()?;
-                    if !requests.is_empty() {
-                        Ok(ControlFlow::Break(
-                            requests
-                                .into_iter()
-                                .map(|r| DataFlowRequest::new(d.id, id, r))
-                                .collect(),
-                        ))
-                    } else {
-                        Ok(ControlFlow::Continue(()))
-                    }
-                })
-                .map(|c| c.break_value())
-        })
+/// Register one staged read with the tracker and, if it completed straight
+/// from cache, deliver its response to the node's operator right away.
+/// Returns whether a response was delivered.
+fn register_read(
+    tracker: &mut RequestTracker,
+    data_flow_id: Identifier,
+    node: &mut OperatorNode,
+    request: crate::io::PendingIoRequest,
+) -> Result<bool> {
+    let Some(completed) = tracker.register(data_flow_id, node.id, request) else {
+        return Ok(false);
+    };
+    // The node may have retired while its request was staged (an abandoned
+    // scan); nobody wants the response then.
+    if let Some(operator) = node.operator.as_deref_mut() {
+        operator.process_io_response(&mut node.io, completed)?;
     }
-
-    /// Collect pending HTTP requests from operators (leaf-to-root). Mirrors
-    /// [`get_next_fs_request`](Self::get_next_fs_request).
-    pub fn get_next_http_request(&mut self) -> Option<Vec<DataFlowRequest<HttpRequest>>> {
-        self.try_run_or(None, |d| {
-            d.graph
-                .traverse_backwards(|id, operator, _io| {
-                    let requests = operator.next_http_requests()?;
-                    if !requests.is_empty() {
-                        Ok(ControlFlow::Break(
-                            requests
-                                .into_iter()
-                                .map(|r| DataFlowRequest::new(d.id, id, r))
-                                .collect(),
-                        ))
-                    } else {
-                        Ok(ControlFlow::Continue(()))
-                    }
-                })
-                .map(|c| c.break_value())
-        })
-    }
+    Ok(true)
 }
 
 #[cfg(test)]

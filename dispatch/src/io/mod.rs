@@ -45,7 +45,8 @@ mod cached_http;
 
 pub mod operator_io;
 pub use operator_io::{
-    CacheTiers, CompletedIoRequest, FileRange, OperatorIO, PendingIoRequest, RangePart,
+    CacheTiers, CompletedIoRequest, FileRange, OperatorIO, PendingFsRequest, PendingHttpRequest,
+    PendingIoRequest, RangePart,
 };
 
 pub mod request_tracker;

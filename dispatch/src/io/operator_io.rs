@@ -1,14 +1,21 @@
-//! The operator-facing side of the cache-backed read path.
+//! The operator-facing side of the IO subsystem.
 //!
-//! An operator that needs bytes from a file does not talk to the caches or the
-//! ring itself. It describes *where in the file* the bytes are - a
-//! [`PendingIoRequest`] naming one file and the byte ranges it needs - and
-//! pushes it into its node's [`OperatorIO`]. The worker's `register_pending_io`
-//! stage later drains those requests into its
-//! [`RequestTracker`](super::request_tracker::RequestTracker), which resolves
-//! each range against the decompressed and compressed caches, issues reads for
-//! whatever is missing, and hands the operator back a [`CompletedIoRequest`]
-//! (through `Operator::process_io_response`) once every byte is resident.
+//! An operator never talks to the caches or the ring itself: every IO it wants
+//! is pushed into its node's [`OperatorIO`] and drained by the worker's
+//! `register_pending_io` stage.
+//!
+//! - A **read** is a [`PendingIoRequest`] describing *where in the file* the
+//!   bytes are - one file and the byte ranges needed, no memory addresses. The
+//!   worker's [`RequestTracker`](super::request_tracker::RequestTracker)
+//!   resolves each range against the decompressed and compressed caches,
+//!   issues reads for whatever is missing, and hands the operator back a
+//!   [`CompletedIoRequest`] (through `Operator::process_io_response`) once
+//!   every byte is resident.
+//! - A **write** ([`FsWriteRequest`]) or **upload** ([`HttpUploadRequest`])
+//!   already carries its payload and needs no cache resolution; the worker
+//!   submits it as-is and completes it back through
+//!   `Operator::process_fs_write_response` /
+//!   `Operator::process_http_upload_response`.
 //!
 //! Splitting "which file bytes" (here) from "which cache slots" (the tracker)
 //! is deliberate: the request an operator stages carries no memory addresses,
@@ -16,7 +23,7 @@
 //! bookkeeping all live in one place, per worker, instead of inside every
 //! operator that reads.
 
-use crate::io::OpenFile;
+use crate::io::{FsWriteRequest, HttpUploadRequest, OpenFile};
 use bytes::Bytes;
 use std::any::Any;
 
@@ -88,43 +95,84 @@ pub struct CompletedIoRequest {
     pub ranges: Vec<Vec<RangePart>>,
 }
 
-/// The staging area each operator node owns for cache-backed reads. Operator
-/// methods receive it as `io: &mut OperatorIO` and push requests; the worker's
-/// `register_pending_io` stage drains it, budget permitting, into its
-/// [`RequestTracker`](super::request_tracker::RequestTracker).
+/// One staged filesystem operation: a cache-backed read awaiting registration,
+/// or a write ready for submission.
+pub enum PendingFsRequest {
+    Read(PendingIoRequest),
+    Write(FsWriteRequest),
+}
+
+/// One staged HTTP operation: a cache-backed read of a remote object awaiting
+/// registration, or an upload ready for submission.
+pub enum PendingHttpRequest {
+    Read(PendingIoRequest),
+    Upload(HttpUploadRequest),
+}
+
+/// The staging area each operator node owns for its IO. Operator methods
+/// receive it as `io: &mut OperatorIO` and push reads, writes, and uploads;
+/// the worker's `register_pending_io` stage drains it, budget permitting, into
+/// its [`RequestTracker`](super::request_tracker::RequestTracker).
 ///
 /// Filesystem and HTTP requests queue separately because the worker budgets
 /// them separately: disk and object storage have very different latencies, so
 /// each medium fills its own in-flight window without gating the other.
 #[derive(Default)]
 pub struct OperatorIO {
-    /// Requests against local files, awaiting registration.
-    pending_fs_requests: Vec<PendingIoRequest>,
-    /// Requests against remote (HTTP) objects, awaiting registration.
-    pending_http_requests: Vec<PendingIoRequest>,
+    /// Operations against local files, awaiting drain.
+    pending_fs_requests: Vec<PendingFsRequest>,
+    /// Operations against remote (HTTP) objects, awaiting drain.
+    pending_http_requests: Vec<PendingHttpRequest>,
 }
 
 impl OperatorIO {
-    /// Stage `request` for registration, on the queue matching where its file
-    /// lives.
-    pub fn push(&mut self, request: PendingIoRequest) {
+    /// Stage a cache-backed read, on the queue matching where its file lives.
+    pub fn push_read(&mut self, request: PendingIoRequest) {
         // Flag the worker to walk the dataflows for staged IO on its next pass
         // (the walk is skipped entirely while nothing is staged).
         super::note_pending_io();
         match request.file {
-            OpenFile::Local(_) => self.pending_fs_requests.push(request),
-            OpenFile::Remote(_) => self.pending_http_requests.push(request),
+            OpenFile::Local(_) => self
+                .pending_fs_requests
+                .push(PendingFsRequest::Read(request)),
+            OpenFile::Remote(_) => self
+                .pending_http_requests
+                .push(PendingHttpRequest::Read(request)),
         }
     }
 
-    /// Take the next staged filesystem request, oldest first.
-    pub(crate) fn pop_fs_request(&mut self) -> Option<PendingIoRequest> {
-        pop_front(&mut self.pending_fs_requests)
+    /// Stage a filesystem write for submission.
+    pub fn push_write(&mut self, write: FsWriteRequest) {
+        super::note_pending_io();
+        self.pending_fs_requests
+            .push(PendingFsRequest::Write(write));
     }
 
-    /// Take the next staged HTTP request, oldest first.
-    pub(crate) fn pop_http_request(&mut self) -> Option<PendingIoRequest> {
-        pop_front(&mut self.pending_http_requests)
+    /// Stage an object upload for submission.
+    pub fn push_upload(&mut self, upload: HttpUploadRequest) {
+        super::note_pending_io();
+        self.pending_http_requests
+            .push(PendingHttpRequest::Upload(upload));
+    }
+
+    /// Take the next staged filesystem operation, oldest first. Operations
+    /// drain in the order they were pushed, so a budget-limited drain makes
+    /// progress on the front of the queue rather than starving it.
+    pub(crate) fn pop_fs_request(&mut self) -> Option<PendingFsRequest> {
+        if self.pending_fs_requests.is_empty() {
+            None
+        } else {
+            Some(self.pending_fs_requests.remove(0))
+        }
+    }
+
+    /// Take the next staged HTTP operation, oldest first.
+    pub(crate) fn pop_http_request(&mut self) -> Option<PendingHttpRequest> {
+        if self.pending_http_requests.is_empty() {
+            None
+        } else {
+            Some(self.pending_http_requests.remove(0))
+        }
     }
 
     pub(crate) fn has_fs_requests(&self) -> bool {
@@ -135,21 +183,27 @@ impl OperatorIO {
         !self.pending_http_requests.is_empty()
     }
 
-    /// Whether any request is still staged (registration ran out of budget
-    /// before draining it).
+    /// Whether the next filesystem operation is a read (which the worker's
+    /// read budget gates; a write drains regardless).
+    pub(crate) fn fs_front_is_read(&self) -> bool {
+        matches!(
+            self.pending_fs_requests.first(),
+            Some(PendingFsRequest::Read(_))
+        )
+    }
+
+    /// Whether the next HTTP operation is a read.
+    pub(crate) fn http_front_is_read(&self) -> bool {
+        matches!(
+            self.pending_http_requests.first(),
+            Some(PendingHttpRequest::Read(_))
+        )
+    }
+
+    /// Whether anything is still staged (registration ran out of budget before
+    /// draining it).
     pub(crate) fn is_empty(&self) -> bool {
         self.pending_fs_requests.is_empty() && self.pending_http_requests.is_empty()
-    }
-}
-
-/// Pop the oldest staged request. Requests are registered in the order they
-/// were pushed, so a budget-limited drain makes progress on the front of the
-/// queue rather than starving it.
-fn pop_front(requests: &mut Vec<PendingIoRequest>) -> Option<PendingIoRequest> {
-    if requests.is_empty() {
-        None
-    } else {
-        Some(requests.remove(0))
     }
 }
 
@@ -169,7 +223,7 @@ mod tests {
     }
 
     #[test]
-    fn a_request_queues_on_the_lane_matching_its_file() {
+    fn a_read_queues_on_the_lane_matching_its_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data");
         std::fs::write(&path, b"bytes").unwrap();
@@ -184,12 +238,18 @@ mod tests {
         ));
 
         let mut io = OperatorIO::default();
-        io.push(request_for(local));
-        io.push(request_for(remote));
+        io.push_read(request_for(local));
+        io.push_read(request_for(remote));
 
-        assert!(io.pop_fs_request().is_some());
+        assert!(matches!(
+            io.pop_fs_request(),
+            Some(PendingFsRequest::Read(_))
+        ));
         assert!(io.pop_fs_request().is_none());
-        assert!(io.pop_http_request().is_some());
+        assert!(matches!(
+            io.pop_http_request(),
+            Some(PendingHttpRequest::Read(_))
+        ));
         assert!(io.is_empty());
     }
 }

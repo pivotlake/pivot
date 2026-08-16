@@ -85,7 +85,7 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
     ) -> dispatch::UnaryResult<()> {
         self.pending_row_groups.fetch_add(1, Ordering::Relaxed);
         self.unanswered_requests += 1;
-        io.push(request.into_pending_io());
+        io.push_read(request.into_pending_io());
         Ok(())
     }
 

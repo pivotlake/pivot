@@ -32,10 +32,9 @@
 //!    resolved bytes back through
 //!    [`process_io_response`](Operator::process_io_response).
 //!
-//! 2. [`next_fs_requests`](Operator::next_fs_requests) /
-//!    [`next_http_requests`](Operator::next_http_requests) — return any pending write/upload
-//!    requests (e.g. writing a parquet file to disk or uploading it to object
-//!    storage). The worker submits these asynchronously and delivers completions via
+//! 2. Writes and uploads (e.g. writing a parquet file to disk or uploading it
+//!    to object storage) are pushed into the same [`OperatorIO`]; the worker
+//!    submits them asynchronously and delivers completions via
 //!    [`process_fs_write_response`](Operator::process_fs_write_response) or
 //!    [`process_http_upload_response`](Operator::process_http_upload_response).
 //!
@@ -47,9 +46,7 @@
 //!    idle. The operator attempts to steal from a peer worker's input channel.
 
 use crate::data_flow::WorkStatus;
-use crate::io::{
-    CompletedIoRequest, FsRequest, FsWriteRequest, HttpRequest, HttpUploadRequest, OperatorIO,
-};
+use crate::io::{CompletedIoRequest, FsWriteRequest, HttpUploadRequest, OperatorIO};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use thiserror::Error;
@@ -115,21 +112,6 @@ pub trait Operator {
     /// Cache-backed reads are staged by pushing into `io`; the worker hands
     /// them back through [`process_io_response`](Self::process_io_response).
     fn run_cpu_work(&mut self, io: &mut OperatorIO) -> Result<WorkStatus>;
-
-    /// Return any pending filesystem requests (writes - cache-backed reads go
-    /// through the [`OperatorIO`] instead). The worker submits them and later
-    /// calls [`process_fs_write_response`](Self::process_fs_write_response).
-    fn next_fs_requests(&mut self) -> Result<Vec<FsRequest>> {
-        Ok(vec![])
-    }
-
-    /// Return any pending HTTP requests (uploads - cache-backed remote reads go
-    /// through the [`OperatorIO`] instead). The worker submits these on the
-    /// same per-core io_uring and calls
-    /// [`process_http_upload_response`](Self::process_http_upload_response).
-    fn next_http_requests(&mut self) -> Result<Vec<HttpRequest>> {
-        Ok(vec![])
-    }
 
     /// Handle a completed cache-backed read request this operator pushed into
     /// its [`OperatorIO`]: every requested range has resolved and the response

@@ -7,7 +7,7 @@
 use super::{FinishStatus, Operator};
 use crate::api::{BuildContext, OperatorFactory, OperatorGraphBuilder};
 use crate::data_flow::WorkStatus;
-use crate::io::{FsRequest, FsWriteRequest, HttpRequest, HttpUploadRequest, OperatorIO};
+use crate::io::{FsWriteRequest, HttpUploadRequest, OperatorIO};
 use crate::operations::channels::Sender;
 use std::marker::PhantomData;
 use thiserror::Error;
@@ -33,17 +33,6 @@ pub trait Nullary<O> {
     /// Run one unit of work, possibly sending output. Cache-backed reads are
     /// staged by pushing into `io`.
     fn run(&mut self, sender: &mut dyn Sender<O>, io: &mut OperatorIO) -> Result<WorkStatus>;
-
-    /// Return any pending filesystem write requests.
-    fn next_fs_requests(&mut self) -> Result<Vec<FsRequest>> {
-        Ok(vec![])
-    }
-
-    /// Return any pending HTTP upload requests. See
-    /// [`Operator::next_http_requests`].
-    fn next_http_requests(&mut self) -> Result<Vec<HttpRequest>> {
-        Ok(vec![])
-    }
 
     /// Handle a completed filesystem write.
     fn process_fs_write_response(
@@ -89,14 +78,6 @@ impl<O, N: Nullary<O>> NullaryOperator<O, N> {
 impl<O, N: Nullary<O>> Operator for NullaryOperator<O, N> {
     fn run_cpu_work(&mut self, io: &mut OperatorIO) -> super::Result<WorkStatus> {
         Ok(self.nullary.run(&mut *self.sender, io)?)
-    }
-
-    fn next_fs_requests(&mut self) -> super::Result<Vec<FsRequest>> {
-        Ok(self.nullary.next_fs_requests()?)
-    }
-
-    fn next_http_requests(&mut self) -> super::Result<Vec<HttpRequest>> {
-        Ok(self.nullary.next_http_requests()?)
     }
 
     fn process_fs_write_response(&mut self, request: FsWriteRequest) -> super::Result<()> {
