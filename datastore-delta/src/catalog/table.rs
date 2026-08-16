@@ -63,9 +63,9 @@ impl TableFile {
 /// let any copy persist and reload itself.
 #[derive(Clone)]
 pub struct CatalogTable {
-    /// The table's durable identity, from the Delta `metaData.id` (minted once at
-    /// creation, stable across renames and every commit). The catalog indexes by
-    /// this.
+    /// The table's durable identity from the Pivot manifest, minted once at
+    /// creation and stable across renames and every commit. The catalog indexes
+    /// by this; Delta Kernel independently owns the log's `metaData.id`.
     id: uuid::Uuid,
     /// Where the table's Parquet data lives in the object store.
     location: ObjectPath,
@@ -410,8 +410,8 @@ impl CatalogTable {
         &self.files
     }
 
-    /// The table's durable identity (Delta `metaData.id`), stable across renames
-    /// and commits. The catalog indexes by this.
+    /// The table's durable identity from the Pivot manifest, stable across
+    /// renames and commits. The catalog indexes by this.
     pub fn id(&self) -> uuid::Uuid {
         self.id
     }

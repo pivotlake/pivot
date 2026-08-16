@@ -63,6 +63,21 @@ fn write_table(datastore: &Path, table: &str, batch: &RecordBatch) {
     writer.close().unwrap();
 }
 
+fn manifest_table_id(datastore: &Path, schema: &str, table: &str) -> String {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(datastore.join("_pivot_manifest.json")).unwrap())
+            .unwrap();
+    manifest["schemas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"].as_str() == Some(schema))
+        .unwrap()["table_ids"][table]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn queries_bind_tables_by_datastore_name() {
     // Two local datastores, each holding one table's parquet files. The dirs must
@@ -141,6 +156,59 @@ async fn queries_bind_tables_by_datastore_name() {
     // a keyword) name, the same tables as the unqualified form.
     let default_count = select_rows(&client, "SELECT COUNT(id) FROM \"default\".main.people").await;
     assert_eq!(default_count, vec![vec![Some("3".into())]]);
+
+    // `system` is a global schema: resolving it through either datastore returns
+    // the same deterministic inventory, including the durable IDs stored in
+    // each datastore's manifest.
+    let default_id = manifest_table_id(default_dir.path(), "main", "people");
+    let warm_id = manifest_table_id(warm_dir.path(), "main", "events");
+    let expected_inventory = vec![
+        vec![
+            Some("default".into()),
+            Some("main".into()),
+            Some("people".into()),
+            Some(default_id),
+        ],
+        // The system datastore describes itself, so its own relations are part
+        // of the inventory. They are not stored, hence the qualified name in
+        // place of a durable id.
+        vec![
+            Some("system".into()),
+            Some("main".into()),
+            Some("table_files".into()),
+            Some("system.table_files".into()),
+        ],
+        vec![
+            Some("system".into()),
+            Some("main".into()),
+            Some("tables".into()),
+            Some("system.tables".into()),
+        ],
+        vec![
+            Some("warm".into()),
+            Some("main".into()),
+            Some("events".into()),
+            Some(warm_id),
+        ],
+    ];
+    // The inventory spans both datastores whichever way it is named: `system`
+    // is a datastore of its own, so the bare spelling and the schema-qualified
+    // one are the same relation.
+    let inventory_sql = "SELECT datastore_name, schema_name, table_name, id \
+                         FROM system.tables \
+                         ORDER BY datastore_name, schema_name, table_name";
+    assert_eq!(
+        select_rows(&client, inventory_sql).await,
+        expected_inventory
+    );
+
+    let qualified_inventory_sql = "SELECT datastore_name, schema_name, table_name, id \
+                                   FROM system.main.tables \
+                                   ORDER BY datastore_name, schema_name, table_name";
+    assert_eq!(
+        select_rows(&client, qualified_inventory_sql).await,
+        expected_inventory,
+    );
 
     // One statement can read from one datastore and write to another. The
     // source and target bindings must compile against different child snapshots,

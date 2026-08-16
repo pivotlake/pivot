@@ -114,7 +114,8 @@ impl TableReference {
 ///
 /// `identity` distinguishes a dropped/recreated table from its predecessor even
 /// when both are at version zero. It is deliberately opaque to the planner; a
-/// backend chooses a stable representation (Delta uses its metadata UUID).
+/// backend chooses a stable representation (Pivot's Delta datastore uses its
+/// manifest table ID).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableRevision {
     pub identity: String,
@@ -386,6 +387,22 @@ pub trait BoundTable: Debug + Send + Sync {
     /// The exact table snapshot captured by this binding.
     fn table_revision(&self) -> TableRevision;
 
+    /// Whether a plan containing this binding may be retained after the query.
+    /// Virtual metadata tables return `false` because their rows were captured
+    /// from the catalog transactions that planned the query.
+    fn is_plan_cacheable(&self) -> bool {
+        true
+    }
+
+    /// Whether DuckDB may rewrite this table's scan into a narrow row-ID scan
+    /// followed by [`materialize`](BoundTable::materialize).
+    ///
+    /// Implementations opting in must honor `emit_row_group_metadata` in
+    /// [`compile_scan`](BoundTable::compile_scan) and implement `materialize`.
+    fn supports_late_materialization(&self) -> bool {
+        false
+    }
+
     /// Build a dispatch scan spec that reads this table.
     ///
     /// `dynamic_filters` are logical single-column predicates whose constants are
@@ -541,6 +558,10 @@ impl DuckDBTable for DuckDBTableAdapter {
 
     fn duckdb_typed_columns(&self) -> Vec<DuckDBColumn> {
         duckdb_columns(&self.table.columns())
+    }
+
+    fn supports_late_materialization(&self) -> bool {
+        self.table.supports_late_materialization()
     }
 
     fn pushdown_filter(

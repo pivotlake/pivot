@@ -46,7 +46,7 @@ use crate::parquet::ParquetTableError;
 use crate::store::{self, DataFile, FileRef, ObjectPath, ObjectStore, open_store};
 use async_trait::async_trait;
 use crossbeam_deque::{Injector, Steal};
-use datastore::{Datastore, DatastoreTransaction};
+use datastore::{Datastore, DatastoreFileMetadata, DatastoreTableMetadata, DatastoreTransaction};
 use dispatch::{DataFlowDispatcher, DataFlowError, OneShotNullaryFactory, RecordBatchOperatorSpec};
 use local_lock::LocalDatastoreLock;
 use planner::catalog::{
@@ -908,9 +908,9 @@ impl DeltaTransaction {
             return Err(Error::TableExists(name.to_string()));
         }
 
-        // The table's identity is minted here, before anything is written, so
-        // it can name the table's storage and still be the identity the Delta
-        // log records for it.
+        // The manifest identity is minted here, before anything is written, so
+        // it can name the table's storage. Delta Kernel independently mints the
+        // log's `metaData.id` when version 0 is written.
         let id = Uuid::new_v4();
         let location = ObjectPath::new(id.to_string());
         let partition_by = Self::parse_spec_columns(&request, PARTITION_BY_OPTION)?;
@@ -1319,8 +1319,8 @@ impl DeltaSnapshot {
         self.index.contains_schema(schema)
     }
 
-    /// The cache revision of `name` in this frozen snapshot. The Delta metadata
-    /// UUID distinguishes table incarnations; the log version distinguishes
+    /// The cache revision of `name` in this frozen snapshot. The Pivot manifest
+    /// ID distinguishes table incarnations; the Delta log version distinguishes
     /// every committed snapshot of one incarnation.
     fn table_revision(&self, name: &SchemaQualifiedTableName) -> Option<TableRevision> {
         let table = self.index.get_table_by_name(name)?;
@@ -1328,6 +1328,26 @@ impl DeltaSnapshot {
             identity: table.id().to_string(),
             version: table.version(),
         })
+    }
+
+    /// Every table in this frozen index, with its Pivot manifest ID and the
+    /// files it holds at this version.
+    fn tables(&self) -> Vec<DatastoreTableMetadata> {
+        self.index
+            .named_tables()
+            .map(|(name, table)| DatastoreTableMetadata {
+                name,
+                id: table.id().to_string(),
+                files: table
+                    .file_refs()
+                    .into_iter()
+                    .map(|file| DatastoreFileMetadata {
+                        path: file.path.as_str().to_string(),
+                        size_bytes: file.size,
+                    })
+                    .collect(),
+            })
+            .collect()
     }
 
     /// Whether this snapshot holds a table named `name`; the up-front duplicate
@@ -1438,6 +1458,10 @@ impl DatastoreTransaction for DeltaTransaction {
 
     fn table_revision(&self, name: &SchemaQualifiedTableName) -> Option<TableRevision> {
         self.snapshot.table_revision(name)
+    }
+
+    fn tables(&self) -> Vec<DatastoreTableMetadata> {
+        self.snapshot.tables()
     }
 
     fn bind_create_table(

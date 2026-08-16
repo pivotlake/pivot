@@ -976,6 +976,7 @@ dependencies = [
  "crossbeam-deque",
  "datastore",
  "datastore-delta",
+ "datastore-system",
  "dispatch",
  "metastore",
  "planner",
@@ -1610,6 +1611,19 @@ dependencies = [
  "ureq",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "datastore-system"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-schema",
+ "async-trait",
+ "datastore",
+ "dispatch",
+ "planner",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

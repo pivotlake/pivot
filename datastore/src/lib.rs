@@ -19,6 +19,37 @@ use planner::catalog::{
     SchemaQualifiedTableName, TableCreation, TableDrop, TableRevision,
 };
 
+/// One table exposed by a datastore transaction's frozen catalog view, with the
+/// data files it holds at that snapshot.
+///
+/// The cross-datastore catalog uses this backend-neutral description to build
+/// virtual metadata relations without reaching into a concrete datastore's
+/// manifest or in-memory index. `id` is the datastore catalog's durable table
+/// identifier; Delta datastores return the ID recorded in their Pivot manifest,
+/// not the independent ID in the Delta log's `metaData` action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatastoreTableMetadata {
+    pub name: SchemaQualifiedTableName,
+    pub id: String,
+    /// The table's committed files, in the order its datastore holds them.
+    /// Files a pending write staged are not committed to the snapshot and so
+    /// are absent, exactly as a table the same transaction is still creating is.
+    pub files: Vec<DatastoreFileMetadata>,
+}
+
+/// One data file of a [`DatastoreTableMetadata`], described the same
+/// backend-neutral way as the table that owns it.
+///
+/// The owning table is the one this hangs off, so a file names no table of its
+/// own. `path` names the file the way its datastore does, relative to that
+/// datastore's storage root, and `size_bytes` is the size the catalog recorded
+/// when the file was committed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatastoreFileMetadata {
+    pub path: String,
+    pub size_bytes: u64,
+}
+
 /// One query's transaction against a **single datastore**: a consistent
 /// snapshot of that datastore, opened by [`Datastore::begin_transaction`] before
 /// the query is planned and held until its own [`commit`](Self::commit) or
@@ -63,6 +94,12 @@ pub trait DatastoreTransaction: Debug + Send + Sync {
     /// snapshot, or `None` if no such table exists. This must return `Some` for
     /// every table returned by [`bind_table`](Self::bind_table).
     fn table_revision(&self, name: &SchemaQualifiedTableName) -> Option<TableRevision>;
+
+    /// Every stored table defined by this transaction's frozen snapshot.
+    ///
+    /// Virtual catalog relations are not datastore objects and therefore are not
+    /// included.
+    fn tables(&self) -> Vec<DatastoreTableMetadata>;
 
     /// A backend-specific table-valued function by `name`, or `None`. This is
     /// how a backend contributes functions only it can answer (e.g. `metadata`,
