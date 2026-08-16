@@ -208,6 +208,45 @@ fn order_by_limit_exceeds_row_count() {
 }
 
 #[test]
+fn order_by_without_limit_sorts_the_whole_stream() {
+    let dispatch = dispatch(2);
+    let batches = vec![
+        strings_and_ints(&["nine", "one", "five"], &[9, 1, 5]),
+        strings_and_ints(&["eight", "two", "four"], &[8, 2, 4]),
+    ];
+
+    let results = values_input(&dispatch, batches)
+        .record_batches()
+        .order_by(vec![OrderBy::new(1, false, false)])
+        .collect()
+        .unwrap();
+
+    assert_eq!(collect_i64s(&results, 1), vec![1, 2, 4, 5, 8, 9]);
+    assert_eq!(
+        collect_strings(&results, 0),
+        vec!["one", "two", "four", "five", "eight", "nine"]
+    );
+}
+
+#[test]
+fn ordered_batches_stay_ordered_through_projection_and_copy_out() {
+    let dispatch = dispatch(1);
+    let batches = vec![
+        strings_and_ints(&["one", "two"], &[1, 2]),
+        strings_and_ints(&["three", "four"], &[3, 4]),
+    ];
+
+    let results = values_input(&dispatch, batches)
+        .record_batches()
+        .order_by(vec![OrderBy::new(1, false, false)])
+        .project(|| |batch| batch)
+        .collect()
+        .unwrap();
+
+    assert_eq!(collect_i64s(&results, 1), vec![1, 2, 3, 4]);
+}
+
+#[test]
 fn group_by_count_string_keys() {
     let dispatch = dispatch(1);
     let batch = strings_and_ints(

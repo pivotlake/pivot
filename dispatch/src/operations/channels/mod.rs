@@ -11,6 +11,13 @@
 //!   deque (LIFO for cache locality), while idle workers can steal from peers. Used for
 //!   most intermediate stages.
 //!
+//! - **[`mod@shared_work_queue`]** — One queue polled by every worker in a
+//!   stage. Used when work should be distributed without waiting for an
+//!   idle-time steal pass.
+//!
+//! - **[`mod@node_work_queue`]** — One shared queue per NUMA node. Messages
+//!   name their target node and workers only poll their local queue.
+//!
 //! - **[`mpsc`]** — Multi-producer, single-consumer. Used for the final output channel
 //!   (collecting results) and internally by [`return_to_worker`].
 //!
@@ -23,9 +30,11 @@ use arrow_schema::ArrowError;
 use crossbeam_deque::Injector;
 use thiserror::Error;
 
-mod injector;
+mod node_work_queue;
+mod shared_work_queue;
 mod stealable;
-pub use injector::{InjectorChannelFactory, injector};
+pub use node_work_queue::{NodeIdOutput, NodeWorkQueueChannelFactory, node_work_queue};
+pub use shared_work_queue::{SharedWorkQueueChannelFactory, shared_work_queue};
 pub use stealable::{StealableChannelFactory, stealable};
 
 mod mpsc;
@@ -39,6 +48,7 @@ mod to_single_worker;
 pub use return_to_worker::{
     ReturnToWorkerMpscFactory, WorkerAwareSender, WorkerIdOutput, return_to_worker_mpsc,
 };
+pub(crate) use to_single_worker::SingleWorkerMpscFactory;
 pub use to_single_worker::to_single_worker_mpsc;
 
 #[derive(Debug, Error)]

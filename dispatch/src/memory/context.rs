@@ -314,27 +314,6 @@ impl MemoryContext {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 panic_at = Some(iterations + ring_len);
             } else if panic_at.is_some_and(|limit| iterations >= limit) {
-                // Tally who holds this node's ring before aborting: a slot
-                // with no cache owner is either sitting in the free pool or,
-                // once the pools have drained (which is how eviction was
-                // reached), a live allocation some operator still references.
-                let mut compressed: u64 = 0;
-                let mut decompressed: u64 = 0;
-                let mut unowned: u64 = 0;
-                for slot in self.layout.node_slots(self.node) {
-                    match self.clock.owner(slot) {
-                        Some(Owner::Compressed) => compressed += 1,
-                        Some(Owner::Decompressed) => decompressed += 1,
-                        None => unowned += 1,
-                    }
-                }
-                tracing::error!(
-                    compressed,
-                    decompressed,
-                    unowned,
-                    "ring at evict exhaustion, in 2MB slots; unowned means live \
-                     allocations (or free-pool, empty by now)"
-                );
                 panic!(
                     "evict: still no evictable memory after sleeping ({iterations} \
                      iterations) — aborting query (cache exhausted by an oversized \

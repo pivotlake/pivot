@@ -683,9 +683,8 @@ impl CatalogTable {
             Arc::from(self.partition_by()),
             Arc::from(self.sort_by()),
             target_rows_per_group,
-            // Compaction exists to merge a partition's files into one globally
-            // sorted file, so it never cuts early; it buffers the partition
-            // whole.
+            // Compaction produces one ordered output file for each selected
+            // partition, so it disables the INSERT file-size target.
             usize::MAX,
             &self.dispatcher,
         );

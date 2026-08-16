@@ -524,58 +524,37 @@ impl Worker {
             // LIMIT's scan issues no further reads.
             self.cancel_upstream_in_dataflows();
 
-            let warn_slow = |phase: &str, started: std::time::Instant| {
-                let phase_ms = started.elapsed().as_millis() as u64;
-                if phase_ms >= 500 {
-                    tracing::warn!(phase, phase_ms, "slow worker loop phase");
-                }
-            };
-
-            let started = std::time::Instant::now();
             self.process_io_completions()?;
-            warn_slow("io_completions", started);
             // Walk the operator graphs for IO submissions only while some
             // operator has flagged staged IO; on an IO-free hot path the walks
             // are the whole cost. Clearing only after both passes came back
             // clean keeps a request that was skipped by an early break (busy
             // disk queue, full HTTP window) flagged for the next pass.
             if crate::io::has_pending_io() {
-                let started = std::time::Instant::now();
                 let disk_clean = self.saturate_io()?;
                 let http_clean = self.saturate_http()?;
                 if disk_clean && http_clean {
                     crate::io::clear_pending_io();
                 }
-                warn_slow("saturate_io", started);
             }
 
-            let started = std::time::Instant::now();
             self.step_run_ready_cpu_work();
-            warn_slow("cpu_work", started);
 
-            let started = std::time::Instant::now();
             self.try_finishing_dataflows();
-            warn_slow("try_finish", started);
 
             if !self.did_work_last_iteration {
                 // One ring serves both disk and HTTP, so a single wait wakes on
                 // either kind of completion — no dual-ring coordination needed.
                 if self.io.has_pending() {
                     debug!("Waiting for IO...");
-                    let started = std::time::Instant::now();
                     self.io.wait()?;
-                    warn_slow("io_wait", started);
                     continue;
                 }
 
-                let started = std::time::Instant::now();
                 self.try_steal_work();
-                warn_slow("steal", started);
 
                 if !self.did_work_last_iteration {
-                    let started = std::time::Instant::now();
                     self.clear_dirty_buffer_or_park();
-                    warn_slow("park", started);
                 }
             }
         }

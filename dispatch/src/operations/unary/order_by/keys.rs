@@ -44,8 +44,7 @@ pub(super) struct RunRow {
 /// `&mut self`.
 pub(super) trait KeyOrdering {
     /// How the left run's row at `left` orders against the right run's row at
-    /// `right`. `Equal` means the caller decides (a stable merge takes the
-    /// left row).
+    /// `right`. `Equal` means either row may be emitted first.
     fn compare(&mut self, left: RunRow, right: RunRow) -> Ordering;
 }
 

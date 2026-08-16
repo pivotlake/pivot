@@ -92,14 +92,11 @@ pub(super) fn build_insert_spec(
     });
 
     const TARGET_ROWS_PER_GROUP: usize = 128 * 1024;
-    // A partition's pieces cut into a file per this many raw in-memory bytes
-    // gathered, which is also the most raw data an INSERT buffers per open
-    // partition however wide its rows; an oversized partition becomes
-    // several sorted files the compacter can merge later. Arrow's in-memory
-    // representation runs several times larger than the encoded, compressed
-    // file (view structs alone are 16 bytes per row per string column), so
-    // the files come out well under this target.
-    const TARGET_BYTES_PER_FILE: usize = 900 * 1024 * 1024;
+    // This target measures retained Arrow data, not encoded Parquet bytes. The
+    // collector applies it to each pending partition file and cuts only after
+    // adding a complete batch. Compression and encoding normally make the
+    // resulting files substantially smaller on disk.
+    const TARGET_IN_MEMORY_BYTES_PER_FILE: usize = 900 * 1024 * 1024;
     Ok(encode_and_upload_spec(
         store,
         table.object_location().clone(),
@@ -111,7 +108,7 @@ pub(super) fn build_insert_spec(
         table.partition_by().to_vec().into(),
         table.sort_by().to_vec().into(),
         TARGET_ROWS_PER_GROUP,
-        TARGET_BYTES_PER_FILE,
+        TARGET_IN_MEMORY_BYTES_PER_FILE,
         dispatcher,
     ))
 }
@@ -130,19 +127,19 @@ pub(super) fn encode_and_upload_spec(
     uploaded_files: Arc<Injector<UploadedFile>>,
     input: RecordBatchOperatorSpec,
     schema: SchemaRef,
-    partition_by: Arc<[String]>,
-    sort_by: Arc<[String]>,
+    partition_column_names: Arc<[String]>,
+    sort_column_names: Arc<[String]>,
     target_rows_per_group: usize,
-    target_bytes_per_file: usize,
+    target_in_memory_bytes_per_file: usize,
     dispatcher: &DataFlowDispatcher,
 ) -> RecordBatchOperatorSpec {
     let encoded = encode_record_batches_spec(
         input,
         schema,
-        partition_by,
-        sort_by,
+        partition_column_names,
+        sort_column_names,
         target_rows_per_group,
-        target_bytes_per_file,
+        target_in_memory_bytes_per_file,
     );
     let workers = dispatcher.worker_count();
     // One shared total; every worker's `Upload` adds its completions to it and the
@@ -316,11 +313,6 @@ impl Upload {
         // Relaxed: the finish barrier (AcqRel on the sibling counter) publishes
         // this add to whichever worker reads the total.
         self.rows.fetch_add(num_rows, Ordering::Relaxed);
-        tracing::debug!(
-            rows = num_rows,
-            still_in_flight = self.in_flight.len(),
-            "a data-file write landed"
-        );
         Ok(())
     }
 }
