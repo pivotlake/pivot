@@ -44,6 +44,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// µs-scale gaps between a small query's stages; a longer real stall still falls
 /// through to a park. Large queries keep workers busy and rarely reach this path.
 const IN_FLIGHT_SPIN_LIMIT: u32 = 120_000;
+
+/// The spin limit, overridable through `PIVOT_SPIN_LIMIT` for measuring what
+/// the spin costs and buys on a given workload. `0` parks immediately.
+fn in_flight_spin_limit() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        crate::env::get_env_var_with_default("PIVOT_SPIN_LIMIT", IN_FLIGHT_SPIN_LIMIT)
+    })
+}
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Barrier};
 use std::thread::JoinHandle;
@@ -415,8 +424,16 @@ impl Worker {
         // wake count and resumes in nanoseconds when the next notify lands (the
         // core is idle at the barrier anyway). With no dataflow running we're
         // genuinely idle between queries — park immediately rather than burn CPU.
-        if !self.data_flows.is_empty() {
-            for _ in 0..IN_FLIGHT_SPIN_LIMIT {
+        // Spin only while no worker anywhere is waiting on the disk: in an
+        // IO-bound phase the next wake arrives at IO latency, far past any
+        // useful spin budget, so burning the budget buys nothing and an idle
+        // worker should park at once. In a pure CPU phase (a hot query's
+        // stage handoffs) wakes arrive in microseconds and the spin is what
+        // keeps them off the futex path.
+        if !self.data_flows.is_empty()
+            && crate::io::requester::INFLIGHT_FS_OPS.load(Ordering::Relaxed) == 0
+        {
+            for _ in 0..in_flight_spin_limit() {
                 let now = self.waker.wake_count();
                 if now != self.last_seen_wake_count {
                     self.last_seen_wake_count = now;
