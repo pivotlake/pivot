@@ -34,6 +34,7 @@ const RELATIONS: &[&str] = &[
     "pg_namespace",
     "pg_policy",
     "pg_publication",
+    "pg_publication_namespace",
     "pg_publication_rel",
     "pg_roles",
     "pg_statistic_ext",
@@ -205,11 +206,22 @@ pub fn bind_table(
                 column("puballtables", Type::Boolean),
             ],
         ),
+        "pg_publication_namespace" => build_empty(
+            &reference,
+            &[
+                column("oid", Type::UInt32),
+                column("pnpubid", Type::UInt32),
+                column("pnnspid", Type::UInt32),
+            ],
+        ),
         "pg_publication_rel" => build_empty(
             &reference,
             &[
+                column("oid", Type::UInt32),
                 column("prpubid", Type::UInt32),
                 column("prrelid", Type::UInt32),
+                column("prqual", Type::Utf8),
+                column("prattrs", Type::List(Box::new(Type::Int16))),
             ],
         ),
         _ => return None,
