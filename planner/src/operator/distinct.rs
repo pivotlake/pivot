@@ -8,6 +8,7 @@
 
 use crate::compile::Error;
 use crate::operator::aggregate::grouped::build_dedup_operator;
+use crate::operator::aggregate::restore_group_key_columns;
 use crate::types::Type;
 use dispatch::RecordBatchOperatorSpec;
 use std::fmt;
@@ -33,6 +34,12 @@ impl Distinct {
         input: RecordBatchOperatorSpec,
         input_nullability: Vec<bool>,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        build_dedup_operator(input, &self.keys, &input_nullability)
+        let dedup = build_dedup_operator(input, &self.keys, &input_nullability)?;
+        let key_types: Vec<_> = self
+            .keys
+            .iter()
+            .map(|(_, key_type)| key_type.clone())
+            .collect();
+        Ok(restore_group_key_columns(dedup, &key_types))
     }
 }

@@ -20,19 +20,20 @@ On context creation (`new_context`):
 
 1. Register a `PivotExtension` storage extension (in `extension.cpp`)
 2. Create a `PivotStorageInfo` that holds a pointer to the Rust `CatalogContext`
-3. `ATTACH '' AS pv (TYPE pivotdb)` — DuckDB calls our `pivot_catalog_attach`,
-   which creates a `PivotCatalog` backed by the Rust catalog
-4. `USE pv` — makes it the default catalog so all unqualified table references
-   go through our catalog
+3. Attach one `PivotCatalog` per datastore, using the datastore name as the
+   DuckDB catalog name
+4. Put the default datastore's `main` and `pg_catalog` schemas on DuckDB's
+   search path. DuckDB resolves Pivot's catalog entries first and uses its
+   system `pg_catalog` as the fallback for entries Pivot does not expose
 
 When DuckDB plans a query and encounters a table name, it walks:
 
 ```
 DuckDB binder
-  -> PivotCatalog::LookupSchema("main")    -- we only have one schema
+  -> PivotCatalog::LookupSchema("main")
   -> PivotSchemaCatalogEntry::LookupEntry("users")
-       calls Rust FFI: catalog_get_table(ctx, "users")
-       Rust calls DuckDBBind::try_bind("users")
+       calls Rust FFI: catalog_get_table(ctx, datastore, "main", "users")
+       Rust calls DuckDBTransaction::bind_table(datastore, "main", "users")
        returns CatalogGetTableResult {
            found: true,
            columns: [...],                    // from duckdb_typed_columns()
@@ -76,7 +77,7 @@ Rust PlannerContext::plan()
 The `PivotStorageInfo::table_entries` vector keeps the catalog entries alive
 during planning. Because the Rust walk moves the table handles out of the
 entries (it runs after `extract_plan` returns), the entries are only cleared by
-`ClearTableEntries()` when the `PlanHandle` is dropped, not at the end of
+`ClearCatalogEntries()` when the `PlanHandle` is dropped, not at the end of
 `extract_plan`. By that point the `Box<OptionalTableWrapper>`s have already been
 moved out into the Rust tables vector.
 
@@ -85,7 +86,7 @@ moved out into the Rust tables vector.
 ```
 bridge.h / bridge.cpp             DuckPlannerContext, extract_plan, plan normalization + accessors
 catalog/
-  catalog.h / .cpp                PivotCatalog (single-schema catalog)
+  catalog.h / .cpp                PivotCatalog (schema-aware attached catalog)
   schema_entry.h / .cpp           PivotSchemaCatalogEntry (calls Rust on table lookup)
   table_entry.h / .cpp            PivotTableCatalogEntry (holds Box<OptionalTableWrapper>)
 storage_info.h / .cpp             PivotStorageInfo (keeps table entries alive during planning)

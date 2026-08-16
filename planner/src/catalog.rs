@@ -23,6 +23,7 @@ use arrow_array::{ArrayRef, Scalar};
 use dispatch::{DataFlowDispatcher, DynamicFilterSlot, Projection, RecordBatchOperatorSpec};
 use duckdb_planner::DuckDBColumn;
 use duckdb_planner::Expr;
+use duckdb_planner::LogicalTypeId;
 use duckdb_planner::catalog_provider::{
     DuckDBBind, DuckDBTable, DuckDBTransaction, ScalarFunctionDef, TableFunctionDef,
 };
@@ -386,6 +387,24 @@ pub trait BoundTable: Debug + Send + Sync {
     /// The exact table snapshot captured by this binding.
     fn table_revision(&self) -> TableRevision;
 
+    /// Whether a plan containing this binding may be retained after the query.
+    /// Virtual metadata tables return `false` because their rows describe the
+    /// transaction snapshot that produced the binding.
+    fn is_plan_cacheable(&self) -> bool {
+        true
+    }
+
+    /// Whether this table can emit stable row metadata from
+    /// [`compile_scan`](BoundTable::compile_scan) and use it to fetch columns
+    /// through [`materialize`](BoundTable::materialize).
+    ///
+    /// Returning `true` lets the SQL planner rewrite eligible scans into a
+    /// narrow scan followed by late materialization. Implementations that opt
+    /// in must honor `emit_row_group_metadata` and override `materialize`.
+    fn supports_late_materialization(&self) -> bool {
+        false
+    }
+
     /// Build a dispatch scan spec that reads this table.
     ///
     /// `dynamic_filters` are logical single-column predicates whose constants are
@@ -543,6 +562,10 @@ impl DuckDBTable for DuckDBTableAdapter {
         duckdb_columns(&self.table.columns())
     }
 
+    fn supports_late_materialization(&self) -> bool {
+        self.table.supports_late_materialization()
+    }
+
     fn pushdown_filter(
         &mut self,
         filter: Expr<'_>,
@@ -557,6 +580,10 @@ impl DuckDBTable for DuckDBTableAdapter {
 
     fn estimate_row_count(&self) -> Option<u64> {
         self.table.estimate_row_count()
+    }
+
+    fn exact_row_count(&self) -> Option<u64> {
+        self.table.row_count().and_then(|rows| rows.try_into().ok())
     }
 }
 
@@ -614,17 +641,22 @@ impl DuckDBTransaction for DuckDBTransactionAdapter {
 }
 
 impl DuckDBBind for DuckDBScalarFunctionBinder {
-    fn scalar_function(&self, name: &str) -> Option<ScalarFunctionDef> {
-        // Pivot's own scalar functions (e.g. drop_cache) are generic, not
-        // catalog-specific, so their signatures live in the planner rather than
-        // on the catalog.
-        let signature = crate::expression::builtin_scalar_function(name)?;
+    fn scalar_function(&self, schema: &str, name: &str) -> Option<ScalarFunctionDef> {
+        // Scalar signatures are static planner metadata rather than catalog
+        // snapshot state, but their schemas still determine which qualified
+        // calls Pivot shadows and which calls fall through to DuckDB.
+        let signature = crate::expression::builtin_scalar_function(schema, name)?;
         Some(ScalarFunctionDef {
             arg_type_ids: signature
                 .arguments
                 .iter()
                 .map(|arg_type| logical_from_type(arg_type).id as u8)
                 .collect(),
+            vararg_type_id: signature
+                .varargs
+                .as_ref()
+                .map(|arg_type| logical_from_type(arg_type).id as u8)
+                .unwrap_or(LogicalTypeId::INVALID as u8),
             return_type_id: logical_from_type(&signature.return_type).id as u8,
             is_volatile: signature.volatile,
         })

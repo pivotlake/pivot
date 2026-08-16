@@ -110,6 +110,7 @@ fn scalar_from_value(v: &ffi::Value) -> Result<ScalarValue> {
             days: ffi::value_interval_days(v)?,
             micros: ffi::value_interval_micros(v)?,
         },
+        L::LIST if ffi::value_list_size(v)? == 0 => ScalarValue::EmptyList(value_type),
         other => ScalarValue::Other(other),
     })
 }
@@ -221,6 +222,7 @@ impl<'plan> LogicalOp<'plan> {
             }
             L::LOGICAL_CTE_REF => Operator::CteRef(CteRef { raw: self.raw }),
             L::LOGICAL_CHUNK_GET => Operator::ChunkGet(ChunkGet { raw: self.raw }),
+            L::LOGICAL_EMPTY_RESULT => Operator::EmptyResult(EmptyResult { raw: self.raw }),
             L::LOGICAL_DUMMY_SCAN => Operator::DummyScan,
             L::LOGICAL_EXPLAIN => Operator::Explain,
             _ => Operator::Unsupported,
@@ -278,6 +280,8 @@ pub enum Operator<'plan> {
     CteRef(CteRef<'plan>),
     /// A scan of an in-memory constant chunk (a long `IN` list's rewrite).
     ChunkGet(ChunkGet<'plan>),
+    /// A statically empty input whose output types remain known.
+    EmptyResult(EmptyResult<'plan>),
     /// The single-row source under a `FROM`-less `SELECT`.
     DummyScan,
     /// `EXPLAIN <query>`.
@@ -351,6 +355,16 @@ define_handles! { ffi::LogicalOperator;
     /// A `LogicalColumnDataGet` (CHUNK_GET): a scan of an in-memory constant
     /// chunk, e.g. what DuckDB rewrites a long `IN` list into.
     ChunkGet,
+    /// A `LogicalEmptyResult` produced when optimization proves an input empty.
+    EmptyResult,
+}
+
+impl<'plan> EmptyResult<'plan> {
+    pub fn output_types(self) -> Result<Vec<BoundLogicalType>> {
+        (0..ffi::lo_empty_result_type_count(self.raw)?)
+            .map(|index| Ok(bound_type_from(ffi::lo_empty_result_type(self.raw, index)?)))
+            .collect()
+    }
 }
 
 impl<'plan> MaterializedCte<'plan> {

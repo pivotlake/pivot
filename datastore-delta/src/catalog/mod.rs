@@ -46,7 +46,7 @@ use crate::parquet::ParquetTableError;
 use crate::store::{self, DataFile, FileRef, ObjectPath, ObjectStore, open_store};
 use async_trait::async_trait;
 use crossbeam_deque::{Injector, Steal};
-use datastore::{Datastore, DatastoreTransaction};
+use datastore::{Datastore, DatastoreTableMetadata, DatastoreTransaction};
 use dispatch::{DataFlowDispatcher, DataFlowError, OneShotNullaryFactory, RecordBatchOperatorSpec};
 use local_lock::LocalDatastoreLock;
 use planner::catalog::{
@@ -219,11 +219,13 @@ impl DatastoreIndex {
     /// Every table with the schema-qualified name it is currently indexed under.
     fn named_tables(&self) -> impl Iterator<Item = (SchemaQualifiedTableName, &CatalogTable)> {
         self.schemas.iter().flat_map(move |(schema, tables)| {
-            tables.iter().filter_map(move |(table, id)| {
-                Some((
+            tables.iter().map(move |(table, id)| {
+                (
                     SchemaQualifiedTableName::new(schema.clone(), table.clone()),
-                    self.tables_by_id.get(id)?,
-                ))
+                    self.tables_by_id
+                        .get(id)
+                        .expect("schema table index must reference an existing table identity"),
+                )
             })
         })
     }
@@ -1330,6 +1332,33 @@ impl DeltaSnapshot {
         })
     }
 
+    /// Every schema in this frozen index, ordered by name.
+    fn schema_names(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.index.schemas.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Every table in this frozen index, ordered by schema and table name.
+    fn tables(&self) -> Vec<DatastoreTableMetadata> {
+        let mut tables: Vec<_> = self
+            .index
+            .named_tables()
+            .map(|(name, table)| DatastoreTableMetadata {
+                name,
+                revision: TableRevision {
+                    identity: table.id().to_string(),
+                    version: table.version(),
+                },
+                columns: table.columns(),
+            })
+            .collect();
+        tables.sort_by(|left, right| {
+            (&left.name.schema, &left.name.table).cmp(&(&right.name.schema, &right.name.table))
+        });
+        tables
+    }
+
     /// Whether this snapshot holds a table named `name`; the up-front duplicate
     /// check for `CREATE TABLE`.
     pub(super) fn contains_table(&self, name: &SchemaQualifiedTableName) -> bool {
@@ -1438,6 +1467,14 @@ impl DatastoreTransaction for DeltaTransaction {
 
     fn table_revision(&self, name: &SchemaQualifiedTableName) -> Option<TableRevision> {
         self.snapshot.table_revision(name)
+    }
+
+    fn schema_names(&self) -> Vec<String> {
+        self.snapshot.schema_names()
+    }
+
+    fn tables(&self) -> Vec<DatastoreTableMetadata> {
+        self.snapshot.tables()
     }
 
     fn bind_create_table(

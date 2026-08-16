@@ -16,6 +16,7 @@
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_expression_get.hpp"
+#include "duckdb/planner/operator/logical_empty_result.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_create.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
@@ -113,8 +114,7 @@ static ExtractPlanResult build_duckdb_error(const duckdb::Exception &e) {
 	std::optional<string> position;
 
 	if (parsed.is_object()) {
-		if (auto message_it = parsed.find("exception_message");
-		    message_it != parsed.end() && message_it->is_string()) {
+		if (auto message_it = parsed.find("exception_message"); message_it != parsed.end() && message_it->is_string()) {
 			message = message_it->get<string>();
 		}
 		if (auto position_it = parsed.find("position"); position_it != parsed.end()) {
@@ -135,14 +135,11 @@ static ExtractPlanResult build_duckdb_error(const duckdb::Exception &e) {
 
 // Create new context for an in-memory DB
 DuckPlannerContext::DuckPlannerContext(rust::Box<CatalogContext> catalog)
-    : catalog(std::move(catalog)),
-      db(nullptr, &this->config),
-      con(db) {
-        auto disable_result = con.Query(
-            "SET disabled_optimizers='compressed_materialization,empty_result_pullup,regex_range'");
-        if (disable_result->HasError()) {
-                throw std::runtime_error(disable_result->GetError());
-        }
+    : catalog(std::move(catalog)), db(nullptr, &this->config), con(db) {
+	auto disable_result = con.Query("SET disabled_optimizers='compressed_materialization,regex_range'");
+	if (disable_result->HasError()) {
+		throw std::runtime_error(disable_result->GetError());
+	}
 
 	// Point the pivotdb storage extension at our catalog context, then attach one
 	// DuckDB database per datastore. All attached databases share this one
@@ -150,46 +147,45 @@ DuckPlannerContext::DuckPlannerContext(rust::Box<CatalogContext> catalog)
 	// schema-entry lookups pass back so a table lookup routes to that datastore's
 	// snapshot in the current transaction. Finally make the default datastore the
 	// current database, so unqualified names resolve against it.
-	auto ext = duckdb::StorageExtension::Find(
-	    duckdb::DBConfig::GetConfig(*db.instance), "pivotdb");
+	auto ext = duckdb::StorageExtension::Find(duckdb::DBConfig::GetConfig(*db.instance), "pivotdb");
 	ext->storage_info = duckdb::make_shared_ptr<PivotStorageInfo>(&*this->catalog);
 
 	for (const auto &name : catalog_context_names(*this->catalog)) {
 		std::string db_name(name);
-		std::string sql = "ATTACH " + duckdb::KeywordHelper::WriteQuoted(db_name, '\'') +
-		                  " AS " + duckdb::KeywordHelper::WriteQuoted(db_name, '"') +
-		                  " (TYPE pivotdb)";
+		std::string sql = "ATTACH " + duckdb::KeywordHelper::WriteQuoted(db_name, '\'') + " AS " +
+		                  duckdb::KeywordHelper::WriteQuoted(db_name, '"') + " (TYPE pivotdb)";
 		auto attach_result = con.Query(sql);
 		if (attach_result->HasError()) {
 			throw std::runtime_error(attach_result->GetError());
 		}
 	}
 
-	// Make the default datastore the current database. Set the search path
-	// directly rather than through `USE`: the binder verifies a `USE` target's
-	// schema through the catalog, and schema lookups need a published
-	// transaction, which only exists while a plan is being extracted. The
-	// unverified path is checked at bind time by every plan that resolves an
-	// unqualified name through it.
+	// Make the default datastore the current database and let its pg_catalog
+	// entries shadow DuckDB's compatibility catalog. DuckDB keeps the system
+	// pg_catalog behind this explicit path as a fallback for entries Pivot does
+	// not provide. Set the paths directly rather than through `USE`: the binder
+	// verifies a `USE` target's schema through the catalog, and schema lookups
+	// need a published transaction, which only exists while a plan is being
+	// extracted. The unverified paths are checked at bind time.
 	std::string default_name(catalog_context_default(*this->catalog));
+	duckdb::vector<duckdb::CatalogSearchEntry> search_paths;
+	search_paths.emplace_back(default_name, DEFAULT_SCHEMA);
+	search_paths.emplace_back(default_name, "pg_catalog");
 	duckdb::ClientData::Get(*con.context)
-	    .catalog_search_path->Set(
-	        duckdb::CatalogSearchEntry(default_name, DEFAULT_SCHEMA),
-	        duckdb::CatalogSetPathType::SET_DIRECTLY);
+	    .catalog_search_path->Set(std::move(search_paths), duckdb::CatalogSetPathType::SET_DIRECTLY);
 }
 
 std::unique_ptr<DuckPlannerContext> new_context(rust::Box<CatalogContext> catalog) {
-	return std::unique_ptr<DuckPlannerContext>(
-	    new DuckPlannerContext(std::move(catalog)));
+	return std::unique_ptr<DuckPlannerContext>(new DuckPlannerContext(std::move(catalog)));
 }
 
-// The Rust walk takes the pivot table handles out of the catalog entries, so the
-// entries are only cleared once the walk is done and this handle drops. Destroy
-// the plan tree first (it references the entries), then clear them.
+// The DuckDB plan references the temporary catalog entries, while the Rust walk
+// takes the pivot table handles out of them. Clear every entry only after the
+// walk is done and the plan tree has been destroyed.
 PlanHandle::~PlanHandle() {
 	root.reset();
 	if (ctx) {
-		PivotStorageInfo::Get(*ctx->db.instance).ClearTableEntries();
+		PivotStorageInfo::Get(*ctx->db.instance).ClearCatalogEntries();
 	}
 }
 
@@ -200,8 +196,7 @@ PlanHandle::~PlanHandle() {
 // binder/optimizer/resolver steps are all public API) so the names can be
 // captured without patching the bundled DuckDB.
 static duckdb::unique_ptr<duckdb::LogicalOperator>
-extract_plan_with_names(duckdb::Connection &con, const std::string &query,
-                        duckdb::vector<std::string> &result_names) {
+extract_plan_with_names(duckdb::Connection &con, const std::string &query, duckdb::vector<std::string> &result_names) {
 	auto statements = con.ExtractStatements(query);
 	if (statements.size() != 1) {
 		throw duckdb::InvalidInputException("ExtractPlan can only prepare a single statement");
@@ -243,8 +238,7 @@ struct CurrentTransactionScope {
 	}
 };
 
-ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
-                               const TransactionContext &transaction) {
+ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query, const TransactionContext &transaction) {
 	duckdb::unique_ptr<duckdb::LogicalOperator> plan;
 	duckdb::vector<std::string> name_list;
 	std::optional<ExtractPlanResult> error;
@@ -272,9 +266,8 @@ ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
 	}
 
 	if (error) {
-		// No plan was produced, so nothing took the table handles; free the
-		// per-plan catalog entries now.
-		PivotStorageInfo::Get(*ctx.db.instance).ClearTableEntries();
+		// No plan was produced, so free the per-plan catalog entries now.
+		PivotStorageInfo::Get(*ctx.db.instance).ClearCatalogEntries();
 		return std::move(*error);
 	}
 
@@ -373,16 +366,26 @@ size_t lo_filter_projection_map_index(const LogicalOperator &op, size_t index) {
 	return as<duckdb::LogicalFilter>(op).projection_map[index];
 }
 
-// Read a DuckDB LogicalType into the FFI struct: the id discriminant plus the
-// width/scale that complete a DECIMAL (zero for every other id).
+// Read a DuckDB LogicalType into the flat FFI struct, including the parameters
+// for DECIMAL and one-dimensional LIST types.
 static BridgeLogicalType bridge_logical_type(const duckdb::LogicalType &type) {
 	BridgeLogicalType out;
 	out.id = static_cast<uint8_t>(type.id());
 	out.decimal_width = 0;
 	out.decimal_scale = 0;
+	out.list_child_type_id = 0;
+	out.list_child_decimal_width = 0;
+	out.list_child_decimal_scale = 0;
 	if (type.id() == duckdb::LogicalTypeId::DECIMAL) {
 		out.decimal_width = duckdb::DecimalType::GetWidth(type);
 		out.decimal_scale = duckdb::DecimalType::GetScale(type);
+	} else if (type.id() == duckdb::LogicalTypeId::LIST) {
+		auto &child = duckdb::ListType::GetChildType(type);
+		out.list_child_type_id = static_cast<uint8_t>(child.id());
+		if (child.id() == duckdb::LogicalTypeId::DECIMAL) {
+			out.list_child_decimal_width = duckdb::DecimalType::GetWidth(child);
+			out.list_child_decimal_scale = duckdb::DecimalType::GetScale(child);
+		}
 	}
 	return out;
 }
@@ -592,7 +595,7 @@ static void collect_filter(duckdb::TableFilter &filter, duckdb::idx_t proj_idx, 
 		if (dynamic_filters) {
 			auto *filter_data = df->filter_data.get();
 			auto storage_idx = get.GetColumnIds()[proj_idx].GetPrimaryIndex();
-			dynamic_filters->push_back(DynFilterInfo{
+			dynamic_filters->push_back(DynFilterInfo {
 			    reinterpret_cast<uintptr_t>(filter_data),
 			    storage_idx,
 			    static_cast<uint8_t>(filter_data->filter->comparison_type),
@@ -656,6 +659,14 @@ uint8_t lo_get_dynamic_filter_comparison(const LogicalOperator &op, size_t index
 
 rust::String lo_get_function_name(const LogicalOperator &op) {
 	return rust::String::lossy(as<duckdb::LogicalGet>(op).function.name);
+}
+
+size_t lo_empty_result_type_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalEmptyResult>(op).return_types.size();
+}
+
+BridgeLogicalType lo_empty_result_type(const LogicalOperator &op, size_t index) {
+	return bridge_logical_type(as<duckdb::LogicalEmptyResult>(op).return_types[index]);
 }
 
 bool lo_get_has_named_params(const LogicalOperator &op) {
@@ -786,8 +797,7 @@ size_t lo_create_option_count(const LogicalOperator &op) {
 
 // CreateTableInfo::options is an unordered map; index into it deterministically
 // by iteration order so key and value accessors agree within one plan.
-static std::pair<const string &, duckdb::ParsedExpression &> create_option_at(const LogicalOperator &op,
-                                                                              size_t index) {
+static std::pair<const string &, duckdb::ParsedExpression &> create_option_at(const LogicalOperator &op, size_t index) {
 	auto &options = create_table_info(op).options;
 	auto it = options.begin();
 	std::advance(it, index);
@@ -913,8 +923,7 @@ rust::String lo_copy_stdin_option_value(const LogicalOperator &op, size_t index,
 // produces (vs a user IN/EXISTS): its LHS is a bare LogicalGet carrying a column
 // tagged with COLUMN_IDENTIFIER_ROW_ID.
 static bool is_late_materialization_join(duckdb::LogicalComparisonJoin &join) {
-	if (join.children.empty() ||
-	    join.children[0]->type != duckdb::LogicalOperatorType::LOGICAL_GET) {
+	if (join.children.empty() || join.children[0]->type != duckdb::LogicalOperatorType::LOGICAL_GET) {
 		return false;
 	}
 	auto &lhs_get = join.children[0]->Cast<duckdb::LogicalGet>();
@@ -1123,6 +1132,9 @@ BridgeLogicalType value_type(const Value &v) {
 }
 bool value_is_null(const Value &v) {
 	return v.IsNull();
+}
+size_t value_list_size(const Value &v) {
+	return duckdb::ListValue::GetChildren(v).size();
 }
 bool value_bool(const Value &v) {
 	return v.GetValue<bool>();

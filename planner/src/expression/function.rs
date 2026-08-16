@@ -2,8 +2,10 @@
 //! to the per-function expression types.
 
 use super::{
-    Arithmetic, Contains, DatePart, DateTrunc, Divide, IntervalArithmetic, Length, Like, Prefix,
-    RegexpFullMatch, RegexpJitReplace, RegexpReplace, Suffix, TemporalConvert, VariantGet,
+    Arithmetic, Contains, DatePart, DateTrunc, Divide, IntervalArithmetic, Length, Like,
+    PgFormatType, PgGetExpr, PgGetStatisticsObjDefColumns, PgGetUserById, PgRelationIsPublishable,
+    PgTableIsVisible, Prefix, RegexpFullMatch, RegexpJitReplace, RegexpReplace, Suffix,
+    TemporalConvert, VariantGet,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::expression::Expression;
@@ -18,20 +20,22 @@ use std::sync::Arc;
 /// function needs no C++ registration.
 pub struct ScalarFunctionSignature {
     pub arguments: Vec<Type>,
+    pub varargs: Option<Type>,
     pub return_type: Type,
     /// `true` marks the function `VOLATILE` so DuckDB can't constant-fold the
     /// call away before pivot re-plans it (e.g. a no-arg `drop_cache()`).
     pub volatile: bool,
 }
 
-/// The binding signature for a pivot-defined scalar function `name`, or `None`
-/// for names pivot doesn't define (DuckDB's own built-ins like `+`/`length`,
-/// which DuckDB binds itself and pivot only intercepts at compile time). The
-/// compile-time mapping of the same names lives in `Function::from_handle`.
-pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
-    match name {
-        "drop_cache" => Some(ScalarFunctionSignature {
+/// The binding signature for a pivot-defined scalar function in `schema`, or
+/// `None` for names pivot doesn't define. DuckDB's own built-ins then resolve
+/// against later catalogs on its search path. The compile-time mapping of the
+/// same names lives in `Function::from_handle`.
+pub fn builtin_scalar_function(schema: &str, name: &str) -> Option<ScalarFunctionSignature> {
+    match (schema, name) {
+        ("main", "drop_cache") => Some(ScalarFunctionSignature {
             arguments: vec![],
+            varargs: None,
             return_type: Type::Int64,
             volatile: true,
         }),
@@ -41,23 +45,66 @@ pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
         // its time path counts in. (The bare `CURRENT_TIMESTAMP` keyword is a separate
         // DuckDB value-function that yields a TZ type pivot doesn't model, so
         // only the `now()` call form is intercepted here.)
-        "now" => Some(ScalarFunctionSignature {
+        ("main", "now") => Some(ScalarFunctionSignature {
             arguments: vec![],
+            varargs: None,
             return_type: Type::Timestamp,
             volatile: true,
         }),
         // Not a DuckDB built-in (unlike `regexp_replace`), so its signature is
-        // registered here for DuckDB's binder.
-        "regexp_jit_replace" => Some(ScalarFunctionSignature {
+        // registered here for DuckDB's binder. Its binding stub is a no-op and
+        // must not be folded before Pivot lowers the call.
+        ("main", "regexp_jit_replace") => Some(ScalarFunctionSignature {
             arguments: vec![Type::Utf8, Type::Utf8, Type::Utf8],
+            varargs: None,
             return_type: Type::Utf8,
-            volatile: false,
+            volatile: true,
         }),
         // DuckDB binds `doc->'key'` as `json_extract`. The stub is a no-op, so
         // mark it volatile to prevent DuckDB from evaluating or folding it.
-        "json_extract" => Some(ScalarFunctionSignature {
+        ("main", "json_extract") => Some(ScalarFunctionSignature {
             arguments: vec![Type::Variant, Type::Utf8],
+            varargs: None,
             return_type: Type::Variant,
+            volatile: true,
+        }),
+        // DuckDB's binding stubs return NULL and exist only to carry these
+        // calls into Pivot's plan. Mark every compatibility function volatile
+        // so DuckDB cannot execute a constant call during optimization.
+        ("pg_catalog", "pg_get_userbyid") => Some(ScalarFunctionSignature {
+            arguments: vec![Type::UInt32],
+            varargs: None,
+            return_type: Type::Utf8,
+            volatile: true,
+        }),
+        ("pg_catalog", "pg_table_is_visible") => Some(ScalarFunctionSignature {
+            arguments: vec![Type::UInt32],
+            varargs: None,
+            return_type: Type::Boolean,
+            volatile: true,
+        }),
+        ("pg_catalog", "format_type") => Some(ScalarFunctionSignature {
+            arguments: vec![Type::UInt32, Type::Int64],
+            varargs: None,
+            return_type: Type::Utf8,
+            volatile: true,
+        }),
+        ("pg_catalog", "pg_get_expr") => Some(ScalarFunctionSignature {
+            arguments: vec![Type::Utf8, Type::UInt32],
+            varargs: Some(Type::Boolean),
+            return_type: Type::Utf8,
+            volatile: true,
+        }),
+        ("pg_catalog", "pg_relation_is_publishable") => Some(ScalarFunctionSignature {
+            arguments: vec![Type::UInt32],
+            varargs: None,
+            return_type: Type::Boolean,
+            volatile: true,
+        }),
+        ("pg_catalog", "pg_get_statisticsobjdef_columns") => Some(ScalarFunctionSignature {
+            arguments: vec![Type::UInt32],
+            varargs: None,
+            return_type: Type::Utf8,
             volatile: true,
         }),
         _ => None,
@@ -98,6 +145,13 @@ pub enum Function {
     /// compiles, so every row of the statement sees the same instant. Result is
     /// a `TIMESTAMP` (epoch microseconds).
     Now,
+    /// PostgreSQL compatibility functions used while reading virtual catalogs.
+    PgGetUserById(PgGetUserById),
+    PgTableIsVisible(PgTableIsVisible),
+    PgFormatType(PgFormatType),
+    PgGetExpr(PgGetExpr),
+    PgRelationIsPublishable(PgRelationIsPublishable),
+    PgGetStatisticsObjDefColumns(PgGetStatisticsObjDefColumns),
     /// A variant (JSON) path read: `doc->'key'` chains, optionally typed by a
     /// fused `CAST`.
     VariantGet(VariantGet),
@@ -140,6 +194,12 @@ impl Function {
             Function::IntervalArithmetic(i) => visit(&i.operand),
             Function::TemporalConvert(t) => visit(&t.source),
             Function::DropCache | Function::Now => {}
+            Function::PgGetUserById(function) => function.for_each_argument(visit),
+            Function::PgTableIsVisible(function) => function.for_each_argument(visit),
+            Function::PgFormatType(function) => function.for_each_argument(visit),
+            Function::PgGetExpr(function) => function.for_each_argument(visit),
+            Function::PgRelationIsPublishable(function) => function.for_each_argument(visit),
+            Function::PgGetStatisticsObjDefColumns(function) => function.for_each_argument(visit),
             Function::VariantGet(v) => visit(&v.input),
         }
     }
@@ -164,6 +224,12 @@ impl Display for Function {
             Function::TemporalConvert(c) => write!(f, "{c}"),
             Function::DropCache => write!(f, "drop_cache()"),
             Function::Now => write!(f, "now()"),
+            Function::PgGetUserById(function) => write!(f, "{function}"),
+            Function::PgTableIsVisible(function) => write!(f, "{function}"),
+            Function::PgFormatType(function) => write!(f, "{function}"),
+            Function::PgGetExpr(function) => write!(f, "{function}"),
+            Function::PgRelationIsPublishable(function) => write!(f, "{function}"),
+            Function::PgGetStatisticsObjDefColumns(function) => write!(f, "{function}"),
             Function::VariantGet(v) => write!(f, "{v}"),
         }
     }
@@ -198,6 +264,12 @@ impl Function {
             Function::VariantGet(v) => v.result_type(),
             // `drop_cache()` returns the evicted-entry count.
             Function::DropCache => Type::Int64,
+            Function::PgGetUserById(function) => function.result_type(),
+            Function::PgTableIsVisible(function) => function.result_type(),
+            Function::PgFormatType(function) => function.result_type(),
+            Function::PgGetExpr(function) => function.result_type(),
+            Function::PgRelationIsPublishable(function) => function.result_type(),
+            Function::PgGetStatisticsObjDefColumns(function) => function.result_type(),
         }
     }
 
@@ -218,6 +290,12 @@ impl Function {
             Function::IntervalArithmetic(i) => i.compile(),
             Function::TemporalConvert(c) => c.compile(),
             Function::VariantGet(v) => v.compile(),
+            Function::PgGetUserById(function) => function.compile(),
+            Function::PgTableIsVisible(function) => function.compile(),
+            Function::PgFormatType(function) => function.compile(),
+            Function::PgGetExpr(function) => function.compile(),
+            Function::PgRelationIsPublishable(function) => function.compile(),
+            Function::PgGetStatisticsObjDefColumns(function) => function.compile(),
             // `drop_cache()` evicts pivot's in-memory compressed cache *and* the on-disk
             // cache (so remote reads go cold to the network) as a side effect, then
             // returns the total entries dropped. Evaluated over the single

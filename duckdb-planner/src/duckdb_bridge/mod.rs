@@ -12,6 +12,7 @@ use crate::catalog_provider::{
     CatalogContext, OptionalTableWrapper, TransactionContext, catalog_context_default,
     catalog_context_names, catalog_does_schema_exist, catalog_get_scalar_function,
     catalog_get_table, catalog_get_table_function, pushdown_filter, table_estimate_row_count,
+    table_supports_late_materialization,
 };
 
 /// CXX bridge to the hand-written C++ glue in `bridge.cpp` / `bridge.h`.
@@ -24,22 +25,29 @@ use crate::catalog_provider::{
 #[cxx::bridge]
 pub mod ffi {
     /// Column definition for FFI, carrying the type as a `u8` discriminant
-    /// because CXX cannot pass Rust enums across the bridge. When the type is
-    /// `DECIMAL` the width and scale complete it; they are zero otherwise.
+    /// because CXX cannot pass Rust enums across the bridge. Parameter fields
+    /// complete `DECIMAL` and one-dimensional `LIST` types and are zero for
+    /// every other type.
     struct DuckDBColumn {
         pub name: String,
         pub duckdb_logical_type_id: u8,
         pub decimal_width: u8,
         pub decimal_scale: u8,
+        pub list_child_type_id: u8,
+        pub list_child_decimal_width: u8,
+        pub list_child_decimal_scale: u8,
     }
 
     /// A DuckDB `LogicalType` read off a bound plan object: the
-    /// `LogicalTypeId` discriminant, plus the width and scale that complete a
-    /// `DECIMAL` (zero for every other id, which the id alone fully describes).
+    /// `LogicalTypeId` discriminant and the flat parameters needed by
+    /// `DECIMAL` and one-dimensional `LIST` types.
     struct BridgeLogicalType {
         pub id: u8,
         pub decimal_width: u8,
         pub decimal_scale: u8,
+        pub list_child_type_id: u8,
+        pub list_child_decimal_width: u8,
+        pub list_child_decimal_scale: u8,
     }
 
     /// A `DECIMAL` constant: the unscaled 128-bit integer split into halves
@@ -80,6 +88,8 @@ pub mod ffi {
     /// the call away before pivot re-plans it.
     struct ScalarFunctionDef {
         pub arg_type_ids: Vec<u8>,
+        /// Repeated trailing argument type, or `LogicalTypeId::INVALID`.
+        pub vararg_type_id: u8,
         pub return_type_id: u8,
         pub is_volatile: bool,
     }
@@ -91,11 +101,12 @@ pub mod ffi {
         pub function: ScalarFunctionDef,
     }
 
-    /// A table's estimated total row count for DuckDB's cost model.
-    /// `known = false` when the backend has no metadata-only answer; DuckDB
-    /// then uses its own defaults.
+    /// A table's total row count for DuckDB's cost model, optionally proven
+    /// exact from metadata. `known = false` keeps DuckDB's own defaults.
     struct CardinalityEstimate {
         pub known: bool,
+        /// Whether `rows` is also a guaranteed upper bound.
+        pub exact: bool,
         pub rows: u64,
     }
 
@@ -148,10 +159,12 @@ pub mod ffi {
         ) -> CatalogGetTableFunctionResult;
         fn catalog_get_scalar_function(
             ctx: &CatalogContext,
+            schema: &str,
             name: &str,
         ) -> CatalogGetScalarFunctionResult;
         fn pushdown_filter(table: &mut OptionalTableWrapper, expr: &Expression) -> Result<bool>;
         fn table_estimate_row_count(table: &OptionalTableWrapper) -> CardinalityEstimate;
+        fn table_supports_late_materialization(table: &OptionalTableWrapper) -> bool;
     }
 
     unsafe extern "C++" {
@@ -293,6 +306,9 @@ pub mod ffi {
 
         // ---- Get: table function ----
         fn lo_get_function_name(op: &LogicalOperator) -> Result<String>;
+
+        fn lo_empty_result_type_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_empty_result_type(op: &LogicalOperator, index: usize) -> Result<BridgeLogicalType>;
         fn lo_get_has_named_params(op: &LogicalOperator) -> Result<bool>;
         fn lo_get_param_count(op: &LogicalOperator) -> Result<usize>;
         fn lo_get_param(op: &LogicalOperator, index: usize) -> Result<&Value>;
@@ -481,6 +497,7 @@ pub mod ffi {
         // value.
         fn value_type(v: &Value) -> Result<BridgeLogicalType>;
         fn value_is_null(v: &Value) -> Result<bool>;
+        fn value_list_size(v: &Value) -> Result<usize>;
         fn value_bool(v: &Value) -> Result<bool>;
         fn value_i8(v: &Value) -> Result<i8>;
         fn value_i16(v: &Value) -> Result<i16>;

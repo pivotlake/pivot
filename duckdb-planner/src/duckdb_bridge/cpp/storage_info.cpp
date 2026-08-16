@@ -29,7 +29,7 @@ ScalarFunctionCatalogEntry *PivotStorageInfo::AddScalarFunctionEntry(
 	return ptr;
 }
 
-void PivotStorageInfo::ClearTableEntries() {
+void PivotStorageInfo::ClearCatalogEntries() {
 	table_entries.clear();
 	function_entries.clear();
 	scalar_function_entries.clear();

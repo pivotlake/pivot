@@ -142,6 +142,7 @@ pub mod compile;
 pub mod dynamic_filter;
 pub mod expression;
 pub mod operator;
+pub mod pg_catalog;
 pub mod plan;
 #[cfg(test)]
 mod test_support;

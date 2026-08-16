@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use catalog::PivotCatalog;
-use common::{CatalogFixture, login, login_without_password, start_server_with_metastore};
+use common::{
+    CatalogFixture, login, login_without_password, select_rows, start_server_with_metastore,
+};
 use datastore_delta::DEFAULT_REFRESH_INTERVAL;
 use metastore::{DEFAULT_USER_NAME, Metastore};
 use metastore_disk::{DiskMetastore, MetastoreConfig};
@@ -89,6 +91,22 @@ async fn a_created_user_logs_in_and_lands_in_the_metastore_file() {
     let client = login(server.port, "walt", "blue-1").await.unwrap();
     client.simple_query("SELECT 1").await.unwrap();
     assert!(login(server.port, "walt", "wrong").await.is_err());
+    let roles = select_rows(
+        &admin,
+        "SELECT rolname, oid FROM pg_catalog.pg_roles \
+         WHERE rolname IN ('pivot', 'walt') ORDER BY 1",
+    )
+    .await;
+    assert_eq!(roles.len(), 2);
+    assert_eq!(roles[0][0], Some(DEFAULT_USER_NAME.to_string()));
+    assert_eq!(roles[0][1], Some("10".to_string()));
+    assert_eq!(roles[1][0], Some("walt".to_string()));
+    let walt_oid = roles[1][1]
+        .as_deref()
+        .expect("walt has a role OID")
+        .parse::<u32>()
+        .expect("role OIDs are unsigned 32-bit values");
+    assert_ne!(walt_oid, 10);
     let file = std::fs::read_to_string(&server.metastore_path).unwrap();
     assert!(file.contains("walt"), "{file}");
     assert!(

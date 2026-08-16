@@ -29,6 +29,7 @@ mod length;
 mod like;
 mod maybe_error;
 mod not;
+mod postgres;
 mod prefix;
 mod reference;
 mod regexp;
@@ -57,6 +58,10 @@ pub use length::Length;
 pub use like::Like;
 pub use maybe_error::MaybeError;
 pub use not::Not;
+pub use postgres::{
+    PgFormatType, PgGetExpr, PgGetStatisticsObjDefColumns, PgGetUserById, PgRelationIsPublishable,
+    PgTableIsVisible,
+};
 pub use prefix::Prefix;
 pub use reference::Ref;
 pub use regexp::{RegexpFullMatch, RegexpReplace};
@@ -88,6 +93,15 @@ pub enum Error {
     InvalidParameterCount {
         function: String,
         expected: usize,
+        actual: usize,
+    },
+    #[error(
+        "Invalid parameter count for {function}: expected {minimum} to {maximum}, got {actual}"
+    )]
+    InvalidParameterCountRange {
+        function: String,
+        minimum: usize,
+        maximum: usize,
         actual: usize,
     },
     #[error("Unsupported interval arithmetic: {0}")]

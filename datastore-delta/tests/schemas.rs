@@ -283,6 +283,57 @@ fn same_table_name_in_two_schemas_resolves_separately() {
 }
 
 #[test]
+fn enumerates_catalog_metadata_deterministically_from_frozen_snapshot() {
+    // Setup
+    let dispatch = dispatch(1);
+    let db = TempDir::new().unwrap();
+    let datastore = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    create_schema(&dispatch, &datastore, "analytics").unwrap();
+    create_table(&dispatch, &datastore, create_table_request(None, "events")).unwrap();
+    create_table(
+        &dispatch,
+        &datastore,
+        create_table_request(Some("analytics"), "events"),
+    )
+    .unwrap();
+    let snapshot = datastore.clone().begin_transaction();
+    create_schema(&dispatch, &datastore, "reporting").unwrap();
+    create_table(
+        &dispatch,
+        &datastore,
+        create_table_request(Some("reporting"), "later"),
+    )
+    .unwrap();
+
+    // Execute
+    let snapshot_schemas = snapshot.schema_names();
+    let snapshot_tables = snapshot.tables();
+    let current = datastore.clone().begin_transaction();
+
+    // Assert
+    assert_eq!(snapshot_schemas, vec!["analytics", "main"]);
+    assert_eq!(
+        snapshot_tables
+            .iter()
+            .map(|table| (table.name.schema.as_str(), table.name.table.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("analytics", "events"), ("main", "events")]
+    );
+    for table in &snapshot_tables {
+        assert_eq!(
+            snapshot.table_revision(&table.name),
+            Some(table.revision.clone())
+        );
+        assert_eq!(table.columns, columns());
+    }
+    assert_eq!(
+        current.schema_names(),
+        vec!["analytics", "main", "reporting"]
+    );
+    assert_eq!(current.tables().len(), 3);
+}
+
+#[test]
 fn a_table_is_stored_at_its_identity() {
     let dispatch = dispatch(1);
     let db = TempDir::new().unwrap();

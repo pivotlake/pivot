@@ -84,7 +84,7 @@
 //! file `credentials_file` points at). A verifier is not a password (the
 //! password cannot be recovered from it), but it is still worth the same care.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -284,6 +284,20 @@ impl Metastore for DiskMetastore {
         // The built-in trusted user, served whenever no file defined one by
         // that name, so a server is reachable whatever else its users are.
         (username == DEFAULT_USER_NAME).then_some(UserAuth::Trust)
+    }
+
+    fn user_names(&self) -> Vec<String> {
+        let metastore_config = self.metastore_config.read().unwrap();
+        self.server_config
+            .users
+            .keys()
+            .chain(metastore_config.users.keys())
+            .map(String::as_str)
+            .chain(std::iter::once(DEFAULT_USER_NAME))
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     fn create_user(&self, username: &str, password: Option<&str>) -> metastore::Result<()> {
@@ -959,6 +973,10 @@ users:
         assert_eq!(store.default_datastore_name(), "hot");
         assert!(matches!(store.user_auth("reader"), Some(UserAuth::Trust)));
         assert!(matches!(store.user_auth("writer"), Some(UserAuth::Trust)));
+        assert_eq!(
+            store.user_names(),
+            [DEFAULT_USER_NAME, "reader", "writer"].map(str::to_string)
+        );
     }
 
     #[test]
@@ -1269,6 +1287,10 @@ users:
         assert_eq!(user_source(&store, DEFAULT_USER_NAME), "builtin");
         assert!(store.user_auth("reader").is_some());
         assert!(store.user_auth("writer").is_some());
+        assert_eq!(
+            store.user_names(),
+            [DEFAULT_USER_NAME, "reader", "writer"].map(str::to_string)
+        );
     }
 
     #[test]

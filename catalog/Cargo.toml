@@ -14,6 +14,8 @@ metastore = { workspace = true }
 # delta datastore stages its creations with.
 crossbeam-deque = { workspace = true }
 dispatch = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
 datastore-delta = { workspace = true }
 thiserror = { workspace = true }
 # `Catalog::commit_transaction` is async: the composite awaits each touched
