@@ -35,5 +35,18 @@ What the example is really showing:
   2MB slab, which for a variable-width column works out at 131,072 rows.
   `BATCH_ROWS=100000` sits under it.
 
+### Where it starts reading
+
+A new consumer group starts at the live edge and ignores the existing backlog
+(`OFFSET_RESET=latest`); set `OFFSET_RESET=earliest` to load the topic's whole
+history instead.
+
+That setting only decides where a group with **no committed offset** begins. A
+group that has run before resumes where it left off, so a restart works through
+whatever accumulated while it was down. To begin every boot at the live edge
+regardless, set `SKIP_BACKLOG_ON_START=true` — it seeks past the backlog after
+joining, which means messages produced while the consumer was stopped are never
+loaded.
+
 Run several processes in one consumer group for concurrent copies; Kafka
 divides the partitions between them.

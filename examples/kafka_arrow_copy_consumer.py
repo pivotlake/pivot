@@ -47,7 +47,20 @@ from kafka import KafkaConsumer
 KAFKA_BOOTSTRAP = os.environ.get("KAFKA_BOOTSTRAP", "localhost:9092")
 TOPIC = os.environ.get("TOPIC", "otel-logs")
 GROUP_ID = os.environ.get("GROUP_ID", "pivot-copy")
-OFFSET_RESET = os.environ.get("OFFSET_RESET", "earliest")
+# Where a group with no committed offset starts. `latest` means a fresh group
+# picks up messages produced from now on and ignores whatever is already in the
+# topic, which is what you want when the backlog is history rather than work.
+OFFSET_RESET = os.environ.get("OFFSET_RESET", "latest")
+# `auto_offset_reset` only decides where a group starts when it has *no*
+# committed offset, so a group that has run before resumes mid-topic and works
+# through whatever piled up while it was down -- usually right, but not if you
+# want every boot to begin at the live edge. Setting this seeks past the backlog
+# on every start, at the cost of skipping messages produced while stopped.
+SKIP_BACKLOG_ON_START = os.environ.get("SKIP_BACKLOG_ON_START", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 PG_HOST = os.environ.get("PG_HOST", "localhost")
 PG_PORT = int(os.environ.get("PG_PORT", "5432"))
@@ -303,6 +316,13 @@ def main():
         consumer_timeout_ms=2000,
         value_deserializer=lambda b: b,
     )
+    if SKIP_BACKLOG_ON_START:
+        # Partitions are only assigned once the group has joined, and joining
+        # takes a poll, so the seek has to follow one. Anything that poll
+        # returned is dropped with it, which is the point.
+        consumer.poll(timeout_ms=10000)
+        consumer.seek_to_end()
+        print(f"[{LABEL}] skipped the backlog, starting at the live edge", flush=True)
 
     buffer = ColumnBuffer()
     started = time.time()
