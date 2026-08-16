@@ -174,6 +174,7 @@ rust::String lo_create_schema_datastore(const LogicalOperator &op);
 bool lo_create_schema_if_not_exists(const LogicalOperator &op);
 bool lo_create_schema_or_replace(const LogicalOperator &op);
 bool lo_drop_is_table(const LogicalOperator &op);
+bool lo_drop_is_schema(const LogicalOperator &op);
 rust::String lo_drop_entry_kind(const LogicalOperator &op);
 rust::String lo_drop_name(const LogicalOperator &op);
 rust::String lo_drop_schema(const LogicalOperator &op);
@@ -221,6 +222,9 @@ rust::String lo_copy_stdin_option_value(const LogicalOperator &op, size_t index,
 rust::String lo_create_user_name(const LogicalOperator &op);
 bool lo_create_user_has_password(const LogicalOperator &op);
 rust::String lo_create_user_password(const LogicalOperator &op);
+
+// ---- DropUser ----
+rust::String lo_drop_user_name(const LogicalOperator &op);
 
 // ---- CTE ----
 size_t lo_cte_table_index(const LogicalOperator &op);

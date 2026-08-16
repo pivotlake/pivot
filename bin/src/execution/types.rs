@@ -37,7 +37,9 @@ pub enum Command {
     CreateTable,
     CreateSchema,
     CreateUser,
+    DropUser,
     DropTable,
+    DropSchema,
     Compact,
     /// `BEGIN`, `COMMIT` or `ROLLBACK`, answered without doing anything:
     /// every statement commits individually, so there is no transaction to
@@ -56,7 +58,9 @@ impl Command {
             Self::CreateTable => "CREATE TABLE".to_string(),
             Self::CreateSchema => "CREATE SCHEMA".to_string(),
             Self::CreateUser => "CREATE USER".to_string(),
+            Self::DropUser => "DROP USER".to_string(),
             Self::DropTable => "DROP TABLE".to_string(),
+            Self::DropSchema => "DROP SCHEMA".to_string(),
             Self::Compact => "COMPACT".to_string(),
             Self::Begin => "BEGIN".to_string(),
             Self::Commit => "COMMIT".to_string(),

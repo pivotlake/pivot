@@ -207,6 +207,27 @@ pub struct CreateSchemaRequest {
     pub if_not_exists: bool,
 }
 
+/// Description of a schema to be dropped, produced by translating a
+/// `DROP SCHEMA` statement and consumed by
+/// [`CatalogTransaction::bind_drop_schema`], which routes it to the target
+/// datastore.
+///
+/// `datastore_name` is the qualifier the statement wrote (`DROP SCHEMA db.s`),
+/// or `None` when unqualified, which routes to the default datastore. As with
+/// a `CREATE SCHEMA`, DuckDB binds a schema drop without looking the schema
+/// up, so the qualifier stays as written and existence is the datastore's to
+/// validate (honouring `if_exists` there).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropSchemaRequest {
+    pub datastore_name: Option<String>,
+    pub name: String,
+    pub if_exists: bool,
+    /// Whether the statement asked to drop the schema's tables along with it
+    /// (`CASCADE`); without it, dropping a schema that still holds tables is
+    /// an error.
+    pub cascade: bool,
+}
+
 /// Description of a user to be created, produced by translating a
 /// `CREATE USER` statement and consumed by
 /// [`CatalogTransaction::bind_create_user`]. Users are server-wide (they live
@@ -228,6 +249,15 @@ impl Debug for CreateUserRequest {
             .field("password", &self.password.as_ref().map(|_| "redacted"))
             .finish()
     }
+}
+
+/// Description of a user to be dropped, produced by translating a
+/// `DROP USER` statement and consumed by
+/// [`CatalogTransaction::bind_drop_user`]. Users are server-wide (they live
+/// in the metastore, not a datastore), so it carries no qualifier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropUserRequest {
+    pub name: String,
 }
 
 /// One query's transaction: a consistent **snapshot** of the catalog, opened
@@ -307,11 +337,30 @@ pub trait CatalogTransaction: Debug + Send + Sync {
         .into())
     }
 
+    /// Resolve a `DROP SCHEMA` by routing to the datastore
+    /// [`DropSchemaRequest::datastore_name`] names (the default when
+    /// unqualified) and deferring to that datastore's own `bind_drop_schema`.
+    fn bind_drop_schema(&self, _request: DropSchemaRequest) -> Result<Box<dyn SchemaDrop>> {
+        Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "this catalog does not support DROP SCHEMA",
+        )
+        .into())
+    }
+
     /// Resolve a `CREATE USER` by routing to wherever users live (the
     /// metastore); users are server-wide, not a datastore's.
     fn bind_create_user(&self, _request: CreateUserRequest) -> Result<Box<dyn UserCreation>> {
         Err(Box::<dyn std::error::Error + Send + Sync>::from(
             "this catalog does not support CREATE USER",
+        )
+        .into())
+    }
+
+    /// Resolve a `DROP USER` by routing to wherever users live (the
+    /// metastore); users are server-wide, not a datastore's.
+    fn bind_drop_user(&self, _request: DropUserRequest) -> Result<Box<dyn UserDrop>> {
+        Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "this catalog does not support DROP USER",
         )
         .into())
     }
@@ -372,6 +421,17 @@ pub trait SchemaCreation: Send + Sync {
     fn compile(&self, dispatcher: &DataFlowDispatcher) -> Result<RecordBatchOperatorSpec>;
 }
 
+/// A resolved `DROP SCHEMA`, bound to the datastore holding the schema and
+/// ready to be compiled into the dataflow that stages the drop, exactly as
+/// [`TableDrop`] is for a table: the dataflow does nothing but stage it, so
+/// the catalog changes when the statement *runs* rather than when it is
+/// planned, and durable removal belongs to [`CatalogTransaction::commit`].
+pub trait SchemaDrop: Send + Sync {
+    /// Build the dataflow that stages this drop for the transaction's commit.
+    /// It emits no rows.
+    fn compile(&self, dispatcher: &DataFlowDispatcher) -> Result<RecordBatchOperatorSpec>;
+}
+
 /// A resolved `CREATE USER`, ready to be compiled into the dataflow that
 /// creates it, exactly as [`SchemaCreation`] is for a schema: the dataflow
 /// does nothing but stage the creation, so the user appears when the statement
@@ -380,6 +440,17 @@ pub trait SchemaCreation: Send + Sync {
 pub trait UserCreation: Send + Sync {
     /// Build the dataflow that stages this creation for the transaction's
     /// commit. It emits no rows.
+    fn compile(&self, dispatcher: &DataFlowDispatcher) -> Result<RecordBatchOperatorSpec>;
+}
+
+/// A resolved `DROP USER`, ready to be compiled into the dataflow that stages
+/// the drop, exactly as [`UserCreation`] is for a creation: the dataflow does
+/// nothing but stage it, so the user disappears when the statement *runs*
+/// rather than when it is planned, and durable removal belongs to
+/// [`CatalogTransaction::commit`].
+pub trait UserDrop: Send + Sync {
+    /// Build the dataflow that stages this drop for the transaction's commit.
+    /// It emits no rows.
     fn compile(&self, dispatcher: &DataFlowDispatcher) -> Result<RecordBatchOperatorSpec>;
 }
 

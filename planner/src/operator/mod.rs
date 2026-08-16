@@ -21,7 +21,9 @@ mod create_table;
 mod create_user;
 mod cte;
 mod distinct;
+mod drop_schema;
 mod drop_table;
+mod drop_user;
 mod dummy_scan;
 mod explain;
 mod filter;
@@ -46,7 +48,9 @@ pub use create_table::CreateTable;
 pub use create_user::CreateUser;
 pub use cte::{Cte, CteScan};
 pub use distinct::Distinct;
+pub use drop_schema::DropSchema;
 pub use drop_table::DropTable;
+pub use drop_user::DropUser;
 pub use dummy_scan::DummyScan;
 pub use explain::Explain;
 pub use filter::Filter;
@@ -129,9 +133,16 @@ pub enum Operator {
     /// `DROP TABLE <name>` — compiles into a dataflow that stages the drop;
     /// the transaction's commit removes the table.
     DropTable(DropTable),
+    /// `DROP SCHEMA <name>`: compiles into a dataflow that stages the drop;
+    /// the transaction's commit removes the schema (and, with `CASCADE`, its
+    /// tables).
+    DropSchema(DropSchema),
     /// `CREATE USER <name> [PASSWORD '<password>']` — compiles into a dataflow
     /// that stages the user; the transaction's commit creates it.
     CreateUser(CreateUser),
+    /// `DROP USER <name>`: compiles into a dataflow that stages the drop; the
+    /// transaction's commit removes the user.
+    DropUser(DropUser),
     DummyScan(DummyScan),
     /// `SET`/`RESET` of a session variable — handled by the server, not compiled.
     SetVariable(SetVariable),
@@ -221,7 +232,9 @@ impl Operator {
             Operator::CreateTable(_)
             | Operator::CreateSchema(_)
             | Operator::DropTable(_)
+            | Operator::DropSchema(_)
             | Operator::CreateUser(_)
+            | Operator::DropUser(_)
             | Operator::SetVariable(_)
             | Operator::Compact(_)
             | Operator::CopyFromStdin(_)
@@ -316,7 +329,9 @@ impl Operator {
             Operator::CreateTable(_)
             | Operator::CreateSchema(_)
             | Operator::DropTable(_)
+            | Operator::DropSchema(_)
             | Operator::CreateUser(_)
+            | Operator::DropUser(_)
             | Operator::SetVariable(_)
             | Operator::Compact(_)
             | Operator::CopyFromStdin(_)
@@ -347,7 +362,9 @@ impl fmt::Display for Operator {
             Operator::CreateTable(c) => write!(f, "{c}"),
             Operator::CreateSchema(c) => write!(f, "{c}"),
             Operator::DropTable(d) => write!(f, "{d}"),
+            Operator::DropSchema(d) => write!(f, "{d}"),
             Operator::CreateUser(c) => write!(f, "{c}"),
+            Operator::DropUser(d) => write!(f, "{d}"),
             Operator::DummyScan(d) => write!(f, "{d}"),
             Operator::SetVariable(s) => write!(f, "{s}"),
             Operator::Compact(c) => write!(f, "{c}"),

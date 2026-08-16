@@ -35,6 +35,7 @@
 #include "duckdb/planner/operator/logical_reset.hpp"
 #include "duckdb/planner/operator/logical_compact.hpp"
 #include "duckdb/planner/operator/logical_create_user.hpp"
+#include "duckdb/planner/operator/logical_drop_user.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -788,6 +789,10 @@ bool lo_drop_is_table(const LogicalOperator &op) {
 	return drop_info(op).type == duckdb::CatalogType::TABLE_ENTRY;
 }
 
+bool lo_drop_is_schema(const LogicalOperator &op) {
+	return drop_info(op).type == duckdb::CatalogType::SCHEMA_ENTRY;
+}
+
 rust::String lo_drop_entry_kind(const LogicalOperator &op) {
 	return rust::String::lossy(duckdb::CatalogTypeToString(drop_info(op).type));
 }
@@ -942,6 +947,12 @@ bool lo_create_user_has_password(const LogicalOperator &op) {
 // which surfaces as an error on the Rust side.
 rust::String lo_create_user_password(const LogicalOperator &op) {
 	return rust::String(as<duckdb::LogicalCreateUser>(op).password);
+}
+
+// ---- DropUser ----
+
+rust::String lo_drop_user_name(const LogicalOperator &op) {
+	return rust::String::lossy(as<duckdb::LogicalDropUser>(op).user);
 }
 
 // ---- CopyFromStdin ----

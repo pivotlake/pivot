@@ -37,8 +37,9 @@ use metastore::Metastore;
 use object_storage::ExternalStoreFactory;
 use planner::catalog::{
     BoundTable, CatalogTransaction, CreateSchemaRequest, CreateTableRequest, CreateUserRequest,
-    DropTableRequest, Error as CatalogError, Result as CatalogResult, SchemaCreation,
-    TableCreation, TableDrop, TableReference, TableRevision, UserCreation,
+    DropSchemaRequest, DropTableRequest, DropUserRequest, Error as CatalogError,
+    Result as CatalogResult, SchemaCreation, SchemaDrop, TableCreation, TableDrop, TableReference,
+    TableRevision, UserCreation, UserDrop,
 };
 use system::{DatastoreEntry, SystemTransaction};
 
@@ -186,6 +187,7 @@ impl PivotCatalog {
             metastore: self.metastore.clone(),
             external_parquet_read_context: self.external_parquet_read_context.clone(),
             staged_users: Arc::new(Injector::new()),
+            staged_dropped_users: Arc::new(Injector::new()),
         })
     }
 }
@@ -215,6 +217,10 @@ pub struct PivotTransaction {
     /// [`PivotUserCreation`]), applied to the metastore at commit and dropped
     /// on rollback. Shared (`Arc`) with the staging dataflow's workers.
     staged_users: Arc<Injector<CreateUserRequest>>,
+    /// The user drops this transaction's dataflows staged (see
+    /// [`PivotUserDrop`]), applied to the metastore at commit and dropped on
+    /// rollback. Shared (`Arc`) with the staging dataflow's workers.
+    staged_dropped_users: Arc<Injector<DropUserRequest>>,
 }
 
 impl PivotTransaction {
@@ -236,6 +242,22 @@ impl PivotTransaction {
         let sub_transaction = self.datastores.get(datastore)?.clone().begin_transaction();
         sub_transactions.insert(datastore.to_string(), sub_transaction.clone());
         Some(sub_transaction)
+    }
+
+    /// The sub-transaction of the datastore a DDL statement names, or the
+    /// default datastore's when it names none. DuckDB leaves an unqualified
+    /// DDL statement's catalog unresolved in the logical operator and normally
+    /// applies the current database during physical execution; pivot executes
+    /// the logical operator itself, so it applies the same default here. An
+    /// explicit name that matches no datastore is an internal inconsistency.
+    fn ddl_sub_transaction(
+        &self,
+        datastore_name: Option<&str>,
+    ) -> CatalogResult<Arc<dyn DatastoreTransaction>> {
+        let target = datastore_name.unwrap_or(&self.default_name);
+        self.find_or_create_sub_transaction(target).ok_or_else(|| {
+            CatalogError::Other(Box::new(Error::UnknownDatastore(target.to_string())))
+        })
     }
 
     /// The `system` sub-transaction, which reads every other datastore and so
@@ -340,54 +362,26 @@ impl CatalogTransaction for PivotTransaction {
         &self,
         request: CreateTableRequest,
     ) -> CatalogResult<Box<dyn TableCreation>> {
-        // Route to the datastore the statement named (`CREATE TABLE db.t`), or the
-        // default when unqualified. An explicit name that matches no datastore is
-        // an internal inconsistency.
-        let target = request
-            .datastore_name
-            .clone()
-            .unwrap_or_else(|| self.default_name.clone());
-        let sub_transaction = self
-            .find_or_create_sub_transaction(&target)
-            .ok_or_else(|| {
-                CatalogError::Other(Box::new(Error::UnknownDatastore(target.clone())))
-            })?;
-        sub_transaction.bind_create_table(request)
+        self.ddl_sub_transaction(request.datastore_name.as_deref())?
+            .bind_create_table(request)
     }
 
     fn bind_drop_table(&self, request: DropTableRequest) -> CatalogResult<Box<dyn TableDrop>> {
-        // Route to the datastore the statement resolved (`DROP TABLE db.t`), or
-        // the default when unqualified.
-        let target = request
-            .datastore_name
-            .clone()
-            .unwrap_or_else(|| self.default_name.clone());
-        let sub_transaction = self
-            .find_or_create_sub_transaction(&target)
-            .ok_or_else(|| {
-                CatalogError::Other(Box::new(Error::UnknownDatastore(target.clone())))
-            })?;
-        sub_transaction.bind_drop_table(request)
+        self.ddl_sub_transaction(request.datastore_name.as_deref())?
+            .bind_drop_table(request)
     }
 
     fn bind_create_schema(
         &self,
         request: CreateSchemaRequest,
     ) -> CatalogResult<Box<dyn SchemaCreation>> {
-        // DuckDB keeps an unqualified CREATE SCHEMA's catalog unresolved in the
-        // logical operator and normally applies the current database during
-        // physical execution. Pivot executes the logical operator itself, so it
-        // applies the same default here.
-        let target = request
-            .datastore_name
-            .clone()
-            .unwrap_or_else(|| self.default_name.clone());
-        let sub_transaction = self
-            .find_or_create_sub_transaction(&target)
-            .ok_or_else(|| {
-                CatalogError::Other(Box::new(Error::UnknownDatastore(target.clone())))
-            })?;
-        sub_transaction.bind_create_schema(request)
+        self.ddl_sub_transaction(request.datastore_name.as_deref())?
+            .bind_create_schema(request)
+    }
+
+    fn bind_drop_schema(&self, request: DropSchemaRequest) -> CatalogResult<Box<dyn SchemaDrop>> {
+        self.ddl_sub_transaction(request.datastore_name.as_deref())?
+            .bind_drop_schema(request)
     }
 
     fn bind_create_user(&self, request: CreateUserRequest) -> CatalogResult<Box<dyn UserCreation>> {
@@ -398,6 +392,21 @@ impl CatalogTransaction for PivotTransaction {
         }
         Ok(Box::new(PivotUserCreation {
             staged_users: self.staged_users.clone(),
+            request,
+        }))
+    }
+
+    fn bind_drop_user(&self, request: DropUserRequest) -> CatalogResult<Box<dyn UserDrop>> {
+        // The metastore re-checks at commit (and rejects the users that can
+        // never be dropped); this pre-check only reports a missing user at
+        // the statement rather than at commit.
+        if self.metastore.user_auth(&request.name).is_none() {
+            return Err(CatalogError::Other(
+                format!("user `{}` does not exist", request.name).into(),
+            ));
+        }
+        Ok(Box::new(PivotUserDrop {
+            staged_dropped_users: self.staged_dropped_users.clone(),
             request,
         }))
     }
@@ -416,6 +425,11 @@ impl CatalogTransaction for PivotTransaction {
                 .create_user(&request.name, request.password.as_deref())
                 .map_err(CatalogError::Other)?;
         }
+        for request in drain_injector(&self.staged_dropped_users) {
+            self.metastore
+                .drop_user(&request.name)
+                .map_err(CatalogError::Other)?;
+        }
         Ok(())
     }
 
@@ -424,6 +438,7 @@ impl CatalogTransaction for PivotTransaction {
             sub_transaction.rollback();
         }
         drain_injector(&self.staged_users);
+        drain_injector(&self.staged_dropped_users);
     }
 }
 
@@ -460,6 +475,36 @@ impl UserCreation for PivotUserCreation {
                 OneShotNullaryFactory::new(move || {
                     if let Some(request) = staged {
                         staged_users.push(request);
+                    }
+                    None
+                })
+            })
+            .collect();
+        Ok(RecordBatchOperatorSpec::from_nullary(dispatcher, factories))
+    }
+}
+
+/// A resolved `DROP USER`: the request plus the transaction-owned staging
+/// list it will land in, exactly as [`PivotUserCreation`] stages a creation:
+/// the user is removed only once the statement runs and its transaction
+/// commits.
+struct PivotUserDrop {
+    staged_dropped_users: Arc<Injector<DropUserRequest>>,
+    request: DropUserRequest,
+}
+
+impl UserDrop for PivotUserDrop {
+    fn compile(&self, dispatcher: &DataFlowDispatcher) -> CatalogResult<RecordBatchOperatorSpec> {
+        // One nullary per worker, but only the first carries the request; the
+        // rest no-op.
+        let mut request = Some(self.request.clone());
+        let factories: Vec<_> = (0..dispatcher.worker_count())
+            .map(|_| {
+                let staged = request.take();
+                let staged_dropped_users = self.staged_dropped_users.clone();
+                OneShotNullaryFactory::new(move || {
+                    if let Some(request) = staged {
+                        staged_dropped_users.push(request);
                     }
                     None
                 })

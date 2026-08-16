@@ -689,6 +689,106 @@ async fn system_memory_blocks_shows_a_scan_caching_bytes(#[future] conn: Conn) {
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
+async fn drop_schema_removes_the_schema(#[future] conn: Conn) {
+    conn.simple_query("CREATE SCHEMA dropped_schema")
+        .await
+        .unwrap();
+
+    conn.simple_query("DROP SCHEMA dropped_schema")
+        .await
+        .unwrap();
+
+    let err = conn
+        .simple_query("CREATE TABLE dropped_schema.t (id BIGINT)")
+        .await
+        .unwrap_err();
+    let message = extract_db_error_message(&err);
+    assert!(message.contains("dropped_schema"), "{message}");
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn drop_schema_of_a_non_empty_schema_errors(#[future] conn: Conn) {
+    conn.simple_query("CREATE SCHEMA occupied_schema")
+        .await
+        .unwrap();
+    conn.simple_query("CREATE TABLE occupied_schema.t (id BIGINT)")
+        .await
+        .unwrap();
+
+    let err = conn
+        .simple_query("DROP SCHEMA occupied_schema")
+        .await
+        .unwrap_err();
+
+    let message = extract_db_error_message(&err);
+    assert!(message.contains("not empty"), "{message}");
+    let rows = select_rows(&conn, "SELECT COUNT(*) FROM occupied_schema.t").await;
+    assert_eq!(rows, vec![vec![Some("0".into())]]);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn drop_schema_cascade_drops_its_tables(#[future] conn: Conn) {
+    conn.simple_query("CREATE SCHEMA cascaded_schema")
+        .await
+        .unwrap();
+    conn.simple_query("CREATE TABLE cascaded_schema.t (id BIGINT)")
+        .await
+        .unwrap();
+    conn.simple_query("INSERT INTO cascaded_schema.t VALUES (1)")
+        .await
+        .unwrap();
+
+    conn.simple_query("DROP SCHEMA cascaded_schema CASCADE")
+        .await
+        .unwrap();
+
+    let err = conn
+        .simple_query("SELECT * FROM cascaded_schema.t")
+        .await
+        .unwrap_err();
+    let message = extract_db_error_message(&err);
+    assert!(message.contains("cascaded_schema"), "{message}");
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn drop_of_a_missing_schema_errors(#[future] conn: Conn) {
+    let err = conn
+        .simple_query("DROP SCHEMA no_such_schema_to_drop")
+        .await
+        .unwrap_err();
+
+    let message = extract_db_error_message(&err);
+    assert!(message.contains("no_such_schema_to_drop"), "{message}");
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn drop_schema_if_exists_of_a_missing_schema_succeeds(#[future] conn: Conn) {
+    conn.simple_query("DROP SCHEMA IF EXISTS no_such_schema_to_drop")
+        .await
+        .unwrap();
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn drop_of_the_default_schema_is_rejected(#[future] conn: Conn) {
+    let err = conn.simple_query("DROP SCHEMA main").await.unwrap_err();
+
+    let message = extract_db_error_message(&err);
+    assert!(message.contains("default schema"), "{message}");
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
 async fn insert_returns_affected_row_count(#[future] conn: Conn) {
     let dir = write_parquet(&people_batch());
     create_people_table(&conn, "people_insert", dir.path()).await;

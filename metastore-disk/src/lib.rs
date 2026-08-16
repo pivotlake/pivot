@@ -268,6 +268,41 @@ impl DiskMetastore {
         Ok(())
     }
 
+    /// Remove a user from the metastore config, durably: rewrite the metastore
+    /// file without the user, then serve the result from memory. Only a user
+    /// the metastore file defines can be removed; the built-in `pivot` and any
+    /// user in the server config file are refused (that file is the
+    /// operator's, and the server never rewrites it). Mirrors
+    /// [`create_user`](Self::create_user), including the write-lock protocol
+    /// and the re-insert when the rewrite fails.
+    pub fn drop_user(&self, username: &str) -> Result<()> {
+        if username == DEFAULT_USER_NAME {
+            return Err(Error::DropBuiltinUser);
+        }
+        if self.server_config.users.contains_key(username) {
+            return Err(Error::DropConfigFileUser {
+                name: username.to_string(),
+            });
+        }
+        let mut metastore_config = self.metastore_config.write().unwrap();
+        let Some(removed) = metastore_config.users.remove(username) else {
+            return Err(Error::NoSuchUser {
+                name: username.to_string(),
+            });
+        };
+        // A user can only have entered the metastore config through the file,
+        // so the file exists whenever the removal above found one.
+        let path = self
+            .metastore_file
+            .as_ref()
+            .expect("a metastore user was loaded from the metastore file");
+        if let Err(error) = write_config(path, &metastore_config) {
+            metastore_config.users.insert(username.to_string(), removed);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn build_datastores(
         &self,
         dispatcher: &DataFlowDispatcher,
@@ -371,6 +406,11 @@ impl Metastore for DiskMetastore {
         DiskMetastore::create_user(self, username, password)
             .map_err(|error| Box::new(error) as catalog::metastore::Error)
     }
+
+    fn drop_user(&self, username: &str) -> catalog::metastore::Result<()> {
+        DiskMetastore::drop_user(self, username)
+            .map_err(|error| Box::new(error) as catalog::metastore::Error)
+    }
 }
 
 /// The [`UserAuth`] a password grants: a SCRAM verifier over a fresh random
@@ -455,6 +495,17 @@ pub enum Error {
     NoSecret { name: String, location: String },
     #[error("user `{name}` already exists")]
     UserExists { name: String },
+    #[error("user `{name}` does not exist")]
+    NoSuchUser { name: String },
+    #[error(
+        "cannot drop user `{}`: it is the built-in default user",
+        DEFAULT_USER_NAME
+    )]
+    DropBuiltinUser,
+    #[error(
+        "cannot drop user `{name}`: it is defined in the server config file, which the server does not rewrite"
+    )]
+    DropConfigFileUser { name: String },
     #[error("creating a user requires a metastore file; start the server with --metastore-file")]
     NoMetastoreFile,
     #[error(
@@ -1724,6 +1775,46 @@ datastores:
         let error = store.create_user("walt", None).unwrap_err();
 
         assert!(matches!(error, Error::NoMetastoreFile), "{error}");
+    }
+
+    #[test]
+    fn a_dropped_user_is_no_longer_served_and_stays_gone_after_reopening() {
+        let (store, file) = open_with_file(HOT_SECTION, "users: {}\n");
+        store.create_user("walt", Some("w")).unwrap();
+
+        store.drop_user("walt").unwrap();
+
+        assert!(store.user_auth("walt").is_none());
+        assert!(reopen(HOT_SECTION, &file).user_auth("walt").is_none());
+    }
+
+    #[test]
+    fn dropping_a_missing_user_fails() {
+        let (store, _file) = open_with_file(HOT_SECTION, "users: {}\n");
+
+        let error = store.drop_user("walt").unwrap_err();
+
+        assert!(matches!(error, Error::NoSuchUser { .. }), "{error}");
+    }
+
+    #[test]
+    fn dropping_the_builtin_user_is_refused() {
+        let (store, _file) = open_with_file(HOT_SECTION, "users: {}\n");
+
+        let error = store.drop_user(DEFAULT_USER_NAME).unwrap_err();
+
+        assert!(matches!(error, Error::DropBuiltinUser), "{error}");
+    }
+
+    #[test]
+    fn dropping_a_server_config_user_is_refused() {
+        let section = format!("{HOT_SECTION}users:\n  reader:\n    auth:\n      method: trust\n");
+        let (store, _file) = open_with_file(&section, "users: {}\n");
+
+        let error = store.drop_user("reader").unwrap_err();
+
+        assert!(matches!(error, Error::DropConfigFileUser { .. }), "{error}");
+        assert!(store.user_auth("reader").is_some());
     }
 
     #[test]

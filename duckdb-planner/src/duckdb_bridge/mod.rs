@@ -364,6 +364,8 @@ pub mod ffi {
         // ---- Drop ----
         /// Whether the `LOGICAL_DROP` targets a table (vs. a schema, view, ...).
         fn lo_drop_is_table(op: &LogicalOperator) -> Result<bool>;
+        /// Whether the `LOGICAL_DROP` targets a schema.
+        fn lo_drop_is_schema(op: &LogicalOperator) -> Result<bool>;
         /// The kind of catalog entry the drop targets, as DuckDB spells it
         /// (`TABLE`, `SCHEMA`, `VIEW`, ...): for the unsupported-kind error.
         fn lo_drop_entry_kind(op: &LogicalOperator) -> Result<String>;
@@ -427,6 +429,9 @@ pub mod ffi {
         fn lo_create_user_has_password(op: &LogicalOperator) -> Result<bool>;
         /// The password, meaningful only when a PASSWORD clause was given.
         fn lo_create_user_password(op: &LogicalOperator) -> Result<String>;
+
+        // ---- DropUser ----
+        fn lo_drop_user_name(op: &LogicalOperator) -> Result<String>;
 
         // ---- ComparisonJoin: general accessors ----
         /// DuckDB `JoinType` discriminant.

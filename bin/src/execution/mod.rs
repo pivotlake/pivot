@@ -253,6 +253,12 @@ impl Executor {
             (StatementKind::DropTable, StatementResults::Batches(_)) => {
                 StatementOutput::Command(Command::DropTable)
             }
+            (StatementKind::DropSchema, StatementResults::Batches(_)) => {
+                StatementOutput::Command(Command::DropSchema)
+            }
+            (StatementKind::DropUser, StatementResults::Batches(_)) => {
+                StatementOutput::Command(Command::DropUser)
+            }
             _ => unreachable!("statement kind and worker output must agree"),
         };
         Ok(Execution {

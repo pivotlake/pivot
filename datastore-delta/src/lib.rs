@@ -70,9 +70,9 @@ use manifest::CatalogManifest;
 use object_storage::{self, DataFile, ObjectPath, ObjectStore, open_store};
 use parquet_engine::ParquetTableError;
 use planner::catalog::{
-    BoundTable, CreateSchemaRequest, CreateTableRequest, DropTableRequest, Error as CatalogError,
-    Result as CatalogResult, SchemaCreation, SchemaQualifiedTableName, TableCreation, TableDrop,
-    TableRevision,
+    BoundTable, CreateSchemaRequest, CreateTableRequest, DropSchemaRequest, DropTableRequest,
+    Error as CatalogError, Result as CatalogResult, SchemaCreation, SchemaDrop,
+    SchemaQualifiedTableName, TableCreation, TableDrop, TableRevision,
 };
 pub use table::CatalogTable;
 pub use table::TableFile;
@@ -117,6 +117,8 @@ pub enum Error {
     SchemaNotFound(String),
     #[error("schema `{0}` already exists")]
     SchemaExists(String),
+    #[error("schema `{0}` is not empty; add CASCADE to drop it along with its tables")]
+    SchemaNotEmpty(String),
     #[error("datastore received a transaction created by a different backend")]
     WrongTransactionType,
     #[error(
@@ -212,6 +214,19 @@ impl DatastoreIndex {
         Some(id)
     }
 
+    /// Remove `schema` and every table it still names from both halves of the
+    /// index, reporting whether such a schema was indexed. Tables go with their
+    /// schema so nothing stays reachable by id once its name is gone.
+    fn remove_schema(&mut self, schema: &str) -> bool {
+        let Some(tables) = self.schemas.remove(schema) else {
+            return false;
+        };
+        for id in tables.values() {
+            self.tables_by_id.remove(id);
+        }
+        true
+    }
+
     /// Register a schema, reporting whether it was new.
     fn insert_schema(&mut self, schema: String) -> bool {
         !self.schemas.contains_key(&schema) && {
@@ -222,6 +237,32 @@ impl DatastoreIndex {
 
     fn contains_schema(&self, schema: &str) -> bool {
         self.schemas.contains_key(schema)
+    }
+
+    /// The names of every schema the index defines.
+    fn schema_names(&self) -> impl Iterator<Item = &String> {
+        self.schemas.keys()
+    }
+
+    /// Whether `schema` currently names any tables.
+    fn schema_has_tables(&self, schema: &str) -> bool {
+        self.schemas
+            .get(schema)
+            .is_some_and(|tables| !tables.is_empty())
+    }
+
+    /// Every table `schema` currently names, schema-qualified. Empty for a
+    /// schema with no tables, and for one the index does not define.
+    fn schema_table_names(&self, schema: &str) -> Vec<SchemaQualifiedTableName> {
+        self.schemas
+            .get(schema)
+            .into_iter()
+            .flat_map(|tables| {
+                tables
+                    .keys()
+                    .map(|table| SchemaQualifiedTableName::new(schema.to_string(), table.clone()))
+            })
+            .collect()
     }
 
     fn table_id(&self, name: &SchemaQualifiedTableName) -> Option<Uuid> {
@@ -490,6 +531,7 @@ impl DeltaDatastore {
             pending_table_creations: Arc::new(Injector::new()),
             pending_schema_creations: Arc::new(Injector::new()),
             pending_table_drops: Arc::new(Injector::new()),
+            pending_schema_drops: Arc::new(Injector::new()),
             datastore: self,
             committed: std::sync::atomic::AtomicBool::new(false),
         })
@@ -504,13 +546,13 @@ impl DeltaDatastore {
     /// queries always bind against an already-materialized set. Returns whether
     /// anything changed.
     ///
-    /// A table another process dropped (or dropped and recreated, changing its
-    /// identity) is removed here. The removal never trusts the sweep's first
-    /// manifest read: that read races in-process DDL, so each candidate is
-    /// re-checked against a manifest reloaded *under* the index write lock,
-    /// the same lock every in-process DDL commit holds across its own
-    /// read-modify-write. Only that fresh copy can prove a table is really
-    /// gone rather than created after the first read.
+    /// A table or schema another process dropped (or dropped and recreated,
+    /// changing a table's identity) is removed here. The removal never trusts
+    /// the sweep's first manifest read: that read races in-process DDL, so
+    /// each candidate is re-checked against a manifest reloaded *under* the
+    /// index write lock, the same lock every in-process DDL commit holds
+    /// across its own read-modify-write. Only that fresh copy can prove an
+    /// entry is really gone rather than created after the first read.
     ///
     /// One table failing to load or refresh (an unsupported Delta feature, a
     /// transient store error) must not starve every other table of its
@@ -530,18 +572,27 @@ impl DeltaDatastore {
         }
 
         // A held table whose name the manifest no longer maps to the same
-        // identity was dropped (or dropped and recreated) out of process.
+        // identity was dropped (or dropped and recreated) out of process, and
+        // a held schema the manifest no longer lists was dropped; its tables
+        // went with it (the manifest cannot name a table outside a schema).
         // Candidates come from this sweep's first manifest read; the paid-for
-        // fresh read happens only when there is something to remove.
-        let stale_names: Vec<SchemaQualifiedTableName> = {
+        // fresh read happens only when there is something to remove, once for
+        // both kinds (an out-of-process `DROP SCHEMA CASCADE` produces both).
+        let (stale_names, stale_schemas) = {
             let index = self.tables_index.read().unwrap();
-            index
+            let stale_names: Vec<SchemaQualifiedTableName> = index
                 .named_tables()
                 .filter(|(name, table)| manifest.table_id(name) != Some(table.id()))
                 .map(|(name, _)| name)
-                .collect()
+                .collect();
+            let stale_schemas: Vec<String> = index
+                .schema_names()
+                .filter(|schema| !manifest.contains_schema(schema))
+                .cloned()
+                .collect();
+            (stale_names, stale_schemas)
         };
-        if !stale_names.is_empty() {
+        if !stale_names.is_empty() || !stale_schemas.is_empty() {
             let mut index = self.tables_index.write().unwrap();
             let fresh_manifest = CatalogManifest::load(self.store.as_ref())?;
             for name in stale_names {
@@ -549,6 +600,11 @@ impl DeltaDatastore {
                 let still_stale = held_id.is_some() && fresh_manifest.table_id(&name) != held_id;
                 if still_stale {
                     index.remove_table(&name);
+                    changed = true;
+                }
+            }
+            for schema in stale_schemas {
+                if !fresh_manifest.contains_schema(&schema) && index.remove_schema(&schema) {
                     changed = true;
                 }
             }
@@ -828,6 +884,58 @@ impl DeltaDatastore {
         Ok(())
     }
 
+    /// Persist one schema drop staged by a transaction: unregister the schema,
+    /// and with `CASCADE` every table it still holds, from the database index
+    /// and the live sets, so the next transaction no longer resolves them.
+    /// Each cascaded table leaves a tombstone for vacuum, exactly as its own
+    /// `DROP TABLE` would: a query that bound it before the drop may still be
+    /// reading its files. Called from [`DeltaTransaction::commit`] on the
+    /// blocking pool, never from a dispatch worker.
+    ///
+    /// The whole step holds the index write lock, which serializes in-process
+    /// DDL and its read-modify-write of the shared manifest; every bind-time
+    /// check is re-run under it as a race backstop, honouring `IF EXISTS`
+    /// there too.
+    fn finalize_schema_drop(&self, pending: PendingSchemaDrop) -> Result<()> {
+        let PendingSchemaDrop {
+            name,
+            if_exists,
+            cascade,
+        } = pending;
+        let mut index = self.tables_index.write().unwrap();
+        if !index.contains_schema(&name) {
+            // A concurrent drop won the race. With `IF EXISTS` that is still a
+            // success.
+            if if_exists {
+                return Ok(());
+            }
+            return Err(Error::SchemaNotFound(name));
+        }
+        let table_names = index.schema_table_names(&name);
+        if !cascade && !table_names.is_empty() {
+            return Err(Error::SchemaNotEmpty(name));
+        }
+        let dropped_at_ms = crate::vacuum::now_unix_ms();
+        let retentions: Vec<(SchemaQualifiedTableName, u64)> = table_names
+            .into_iter()
+            .map(|table_name| {
+                let retention = index
+                    .get_table_by_name(&table_name)
+                    .expect("the schema names the table, so the index holds it")
+                    .deleted_file_retention();
+                (table_name, retention.as_millis() as u64)
+            })
+            .collect();
+        CatalogManifest::update(self.store.as_ref(), |manifest| {
+            for (table_name, retention_ms) in &retentions {
+                manifest.remove_table(table_name, dropped_at_ms, *retention_ms)?;
+            }
+            manifest.remove_schema(&name)
+        })?;
+        index.remove_schema(&name);
+        Ok(())
+    }
+
     /// The worker pool this datastore fetches footers on, shared with callers
     /// (the compacter) that drive their own dataflows over the same tables.
     pub fn dispatcher(&self) -> &DataFlowDispatcher {
@@ -1038,6 +1146,31 @@ impl DeltaTransaction {
         })
     }
 
+    /// Resolve a `DROP SCHEMA` against this datastore and stage it on the
+    /// transaction. DuckDB binds a schema drop without looking the schema up,
+    /// so every check is this datastore's: a missing schema is an error unless
+    /// `IF EXISTS`, and a schema that still holds tables is an error unless
+    /// `CASCADE` drops them along with it. The checks run against the
+    /// transaction's frozen snapshot; the datastore re-checks under its write
+    /// lock at commit as the real race backstop. (The default schema never
+    /// gets here: the planner rejects dropping it for every datastore.)
+    fn bind_schema_drop(&self, request: DropSchemaRequest) -> Result<DeltaSchemaDrop> {
+        if !request.if_exists && !self.contains_schema(&request.name) {
+            return Err(Error::SchemaNotFound(request.name));
+        }
+        if !request.cascade && self.snapshot.schema_has_tables(&request.name) {
+            return Err(Error::SchemaNotEmpty(request.name));
+        }
+        Ok(DeltaSchemaDrop {
+            pending_schema_drops: self.pending_schema_drops.clone(),
+            drop: PendingSchemaDrop {
+                name: request.name,
+                if_exists: request.if_exists,
+                cascade: request.cascade,
+            },
+        })
+    }
+
     /// Reject an option this datastore does not implement. A `CREATE TABLE` that
     /// asks for something unknown is not carried out by ignoring it: the table
     /// that appears is not the one the statement described, and the caller has no
@@ -1179,6 +1312,20 @@ fn commit_table_drops(
 ) -> CatalogResult<()> {
     for pending in pending_table_drops {
         datastore.finalize_table_drop(pending)?;
+    }
+    Ok(())
+}
+
+/// Commit the schema drops drained from a transaction. Each one unregisters
+/// itself (and, with `CASCADE`, its tables) from the database manifest and the
+/// live sets. Blocking store I/O, so [`DeltaTransaction::commit`] runs this on
+/// the blocking pool.
+fn commit_schema_drops(
+    datastore: &DeltaDatastore,
+    pending_schema_drops: Vec<PendingSchemaDrop>,
+) -> CatalogResult<()> {
+    for pending in pending_schema_drops {
+        datastore.finalize_schema_drop(pending)?;
     }
     Ok(())
 }
@@ -1351,6 +1498,12 @@ impl DeltaSnapshot {
         self.index.contains_schema(schema)
     }
 
+    /// Whether `schema` names any tables in this frozen snapshot; the up-front
+    /// non-empty check for a `DROP SCHEMA` without `CASCADE`.
+    fn schema_has_tables(&self, schema: &str) -> bool {
+        self.index.schema_has_tables(schema)
+    }
+
     /// The cache revision of `name` in this frozen snapshot. The Pivot manifest
     /// ID distinguishes table incarnations; the Delta log version distinguishes
     /// every committed snapshot of one incarnation.
@@ -1399,6 +1552,20 @@ struct PendingTableDrop {
     if_exists: bool,
 }
 
+/// One schema drop resolved by a transaction and waiting for it to commit.
+/// Removal is pure catalog bookkeeping, so it is staged as soon as its
+/// dataflow runs.
+#[derive(Clone)]
+struct PendingSchemaDrop {
+    name: String,
+    /// Whether the statement used `IF EXISTS`, so the commit treats a schema
+    /// that vanished since resolution as a success rather than an error.
+    if_exists: bool,
+    /// Whether the statement used `CASCADE`, dropping the schema's tables
+    /// along with it; without it a schema that still holds tables is an error.
+    cascade: bool,
+}
+
 /// One table creation whose footer metadata has been loaded successfully and is
 /// waiting for its transaction to commit it.
 struct PendingTableCreation {
@@ -1421,6 +1588,7 @@ pub struct DeltaTransaction {
     pending_table_creations: Arc<Injector<PendingTableCreation>>,
     pending_schema_creations: Arc<Injector<PendingSchemaCreation>>,
     pending_table_drops: Arc<Injector<PendingTableDrop>>,
+    pending_schema_drops: Arc<Injector<PendingSchemaDrop>>,
     /// The datastore this transaction reads and writes back to. CREATE commits
     /// publish through it so DDL is visible to the next transaction without
     /// waiting for a refresh.
@@ -1503,6 +1671,10 @@ impl DatastoreTransaction for DeltaTransaction {
         Ok(Box::new(self.bind_drop(request)?))
     }
 
+    fn bind_drop_schema(&self, request: DropSchemaRequest) -> CatalogResult<Box<dyn SchemaDrop>> {
+        Ok(Box::new(self.bind_schema_drop(request)?))
+    }
+
     async fn compact(
         &self,
         name: &SchemaQualifiedTableName,
@@ -1535,6 +1707,7 @@ impl DatastoreTransaction for DeltaTransaction {
             && self.pending_table_creations.is_empty()
             && self.pending_schema_creations.is_empty()
             && self.pending_table_drops.is_empty()
+            && self.pending_schema_drops.is_empty()
         {
             return Ok(());
         }
@@ -1542,14 +1715,17 @@ impl DatastoreTransaction for DeltaTransaction {
         let pending_schema_creations = drain_injector(&self.pending_schema_creations);
         let pending_table_creations = drain_injector(&self.pending_table_creations);
         let pending_table_drops = drain_injector(&self.pending_table_drops);
+        let pending_schema_drops = drain_injector(&self.pending_schema_drops);
         let uploaded_files = drain_injector(&self.uploaded_files);
         tokio::task::spawn_blocking(move || {
             // Schemas first: a table is registered into its schema, so the
             // schema has to be in the manifest before any table write looks for
-            // it.
+            // it. Schema drops after table drops, so a transaction can empty a
+            // schema and then drop it.
             commit_schema_creations(&datastore, pending_schema_creations)?;
             commit_table_creations(&datastore, pending_table_creations)?;
             commit_table_drops(&datastore, pending_table_drops)?;
+            commit_schema_drops(&datastore, pending_schema_drops)?;
             commit_uploaded_files(&datastore, uploaded_files)
         })
         .await
@@ -1560,6 +1736,7 @@ impl DatastoreTransaction for DeltaTransaction {
         drain_injector(&self.pending_schema_creations);
         drain_injector(&self.pending_table_creations);
         drain_injector(&self.pending_table_drops);
+        drain_injector(&self.pending_schema_drops);
         drain_injector(&self.uploaded_files);
     }
 }
@@ -1579,7 +1756,8 @@ impl Drop for DeltaTransaction {
         let staged_writes = !self.uploaded_files.is_empty()
             || !self.pending_table_creations.is_empty()
             || !self.pending_schema_creations.is_empty()
-            || !self.pending_table_drops.is_empty();
+            || !self.pending_table_drops.is_empty()
+            || !self.pending_schema_drops.is_empty();
         if staged_writes {
             tracing::warn!(
                 "transaction dropped with staged writes and no resolution; rolling back"
@@ -1587,6 +1765,32 @@ impl Drop for DeltaTransaction {
             DatastoreTransaction::rollback(self);
         }
     }
+}
+
+/// Build the dataflow every staged-DDL sink compiles to: one nullary per
+/// worker, but only the first carries `staged` into the transaction-owned
+/// `injector`; the rest no-op. It emits no rows. Handing the item out here
+/// rather than racing for it at run time is how the table-creation sink picks
+/// its staging worker too.
+fn compile_staging_dataflow<T: Clone + Send + 'static>(
+    dispatcher: &DataFlowDispatcher,
+    injector: &Arc<Injector<T>>,
+    staged: &T,
+) -> RecordBatchOperatorSpec {
+    let mut staged = Some(staged.clone());
+    let factories: Vec<_> = (0..dispatcher.worker_count())
+        .map(|_| {
+            let staged = staged.take();
+            let injector = injector.clone();
+            OneShotNullaryFactory::new(move || {
+                if let Some(staged) = staged {
+                    injector.push(staged);
+                }
+                None
+            })
+        })
+        .collect();
+    RecordBatchOperatorSpec::from_nullary(dispatcher, factories)
 }
 
 /// A resolved `CREATE SCHEMA` for a [`DeltaDatastore`]: the validated creation
@@ -1600,23 +1804,11 @@ struct DeltaSchemaCreation {
 
 impl SchemaCreation for DeltaSchemaCreation {
     fn compile(&self, dispatcher: &DataFlowDispatcher) -> CatalogResult<RecordBatchOperatorSpec> {
-        // One nullary per worker, but only the first carries the creation; the
-        // rest no-op. Handing it out here rather than racing for it at run time
-        // is how the table-creation sink picks its staging worker too.
-        let mut creation = Some(self.creation.clone());
-        let factories: Vec<_> = (0..dispatcher.worker_count())
-            .map(|_| {
-                let staged = creation.take();
-                let pending_schema_creations = self.pending_schema_creations.clone();
-                OneShotNullaryFactory::new(move || {
-                    if let Some(creation) = staged {
-                        pending_schema_creations.push(creation);
-                    }
-                    None
-                })
-            })
-            .collect();
-        Ok(RecordBatchOperatorSpec::from_nullary(dispatcher, factories))
+        Ok(compile_staging_dataflow(
+            dispatcher,
+            &self.pending_schema_creations,
+            &self.creation,
+        ))
     }
 }
 
@@ -1631,22 +1823,30 @@ struct DeltaTableDrop {
 
 impl TableDrop for DeltaTableDrop {
     fn compile(&self, dispatcher: &DataFlowDispatcher) -> CatalogResult<RecordBatchOperatorSpec> {
-        // One nullary per worker, but only the first carries the drop; the
-        // rest no-op, exactly as the schema-creation sink stages.
-        let mut drop = Some(self.drop.clone());
-        let factories: Vec<_> = (0..dispatcher.worker_count())
-            .map(|_| {
-                let staged = drop.take();
-                let pending_table_drops = self.pending_table_drops.clone();
-                OneShotNullaryFactory::new(move || {
-                    if let Some(drop) = staged {
-                        pending_table_drops.push(drop);
-                    }
-                    None
-                })
-            })
-            .collect();
-        Ok(RecordBatchOperatorSpec::from_nullary(dispatcher, factories))
+        Ok(compile_staging_dataflow(
+            dispatcher,
+            &self.pending_table_drops,
+            &self.drop,
+        ))
+    }
+}
+
+/// A resolved `DROP SCHEMA` for a [`DeltaDatastore`]: the validated drop plus
+/// the transaction-owned staging queue it will land in. Compiling it builds a
+/// dataflow that stages the drop and emits no rows, so the drop lands on the
+/// transaction only once that dataflow runs.
+struct DeltaSchemaDrop {
+    pending_schema_drops: Arc<Injector<PendingSchemaDrop>>,
+    drop: PendingSchemaDrop,
+}
+
+impl SchemaDrop for DeltaSchemaDrop {
+    fn compile(&self, dispatcher: &DataFlowDispatcher) -> CatalogResult<RecordBatchOperatorSpec> {
+        Ok(compile_staging_dataflow(
+            dispatcher,
+            &self.pending_schema_drops,
+            &self.drop,
+        ))
     }
 }
 

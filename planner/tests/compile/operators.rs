@@ -8,7 +8,7 @@ use dispatch::Dispatch;
 
 use crate::common::*;
 use planner::Error as PlannerError;
-use planner::catalog::{BoundTable, CreateTableRequest, CreateUserRequest};
+use planner::catalog::{BoundTable, CreateTableRequest, CreateUserRequest, DropUserRequest};
 use planner::types::Type;
 use planner::{DEFAULT_DATASTORE_NAME, Planner};
 use rstest::rstest;
@@ -1660,10 +1660,29 @@ fn group_order_by_key_asc_with_offset(mut testing_planner: TestingPlanner) {
     assert_eq!(keys, vec![2, 3]);
 }
 
+// The planner rejects dropping the default schema for every datastore, before
+// the request reaches one.
+#[rstest]
+fn drop_of_the_default_schema_fails_at_compile(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner.plan("DROP SCHEMA main").unwrap();
+
+    let result = plan.compile(
+        testing_planner.dispatcher(),
+        testing_planner.transaction().as_ref(),
+    );
+
+    let err = result
+        .err()
+        .expect("dropping the default schema must not compile")
+        .to_string();
+    assert!(err.contains("default schema"), "{err}");
+}
+
 #[derive(Debug, Default)]
 struct RecordingCatalog {
     created_tables: Arc<Mutex<Vec<CreateTableRequest>>>,
     created_users: Arc<Mutex<Vec<CreateUserRequest>>>,
+    dropped_users: Arc<Mutex<Vec<DropUserRequest>>>,
 }
 
 /// The CREATE TABLE statements planned here reference no tables, so the
@@ -1673,6 +1692,7 @@ struct RecordingCatalog {
 struct RecordingTransaction {
     created_tables: Arc<Mutex<Vec<CreateTableRequest>>>,
     created_users: Arc<Mutex<Vec<CreateUserRequest>>>,
+    dropped_users: Arc<Mutex<Vec<DropUserRequest>>>,
 }
 
 impl planner::catalog::CatalogTransaction for RecordingTransaction {
@@ -1709,6 +1729,14 @@ impl planner::catalog::CatalogTransaction for RecordingTransaction {
         self.created_users.lock().unwrap().push(request);
         Ok(Box::new(NoRowsCreation))
     }
+
+    fn bind_drop_user(
+        &self,
+        request: DropUserRequest,
+    ) -> planner::catalog::Result<Box<dyn planner::catalog::UserDrop>> {
+        self.dropped_users.lock().unwrap().push(request);
+        Ok(Box::new(NoRowsCreation))
+    }
 }
 
 /// The resolved create a [`RecordingTransaction`] returns: it compiles to a
@@ -1741,11 +1769,25 @@ impl planner::catalog::UserCreation for NoRowsCreation {
     }
 }
 
+/// A DROP USER's dataflow is the same no-rows shape too.
+impl planner::catalog::UserDrop for NoRowsCreation {
+    fn compile(
+        &self,
+        dispatcher: &dispatch::DataFlowDispatcher,
+    ) -> planner::catalog::Result<dispatch::RecordBatchOperatorSpec> {
+        Ok(dispatch::RecordBatchOperatorSpec::from_nullary(
+            dispatcher,
+            (0..dispatcher.worker_count()).map(|_| NoRowsNullary::default()),
+        ))
+    }
+}
+
 impl RecordingCatalog {
     fn begin_transaction(&self) -> Arc<dyn planner::catalog::CatalogTransaction> {
         Arc::new(RecordingTransaction {
             created_tables: self.created_tables.clone(),
             created_users: self.created_users.clone(),
+            dropped_users: self.dropped_users.clone(),
         })
     }
 }
@@ -1850,6 +1892,31 @@ fn create_user_binds_through_the_transaction() {
     assert_eq!(created.len(), 1);
     assert_eq!(created[0].name, "walt");
     assert_eq!(created[0].password.as_deref(), Some("blue-1"));
+}
+
+#[test]
+fn drop_user_binds_through_the_transaction() {
+    let dispatch = Dispatch::spin_up(1, 32, None);
+    let catalog = Arc::new(RecordingCatalog::default());
+    let mut planner = Planner::from_datastore_names(
+        vec![DEFAULT_DATASTORE_NAME.to_string()],
+        DEFAULT_DATASTORE_NAME.to_string(),
+    )
+    .expect("planner context");
+    let transaction = catalog.begin_transaction();
+
+    let results = planner
+        .plan("DROP USER walt", transaction.clone())
+        .unwrap()
+        .compile(dispatch.dispatcher(), transaction.as_ref())
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    assert!(results.is_empty());
+    let dropped = catalog.dropped_users.lock().unwrap();
+    assert_eq!(dropped.len(), 1);
+    assert_eq!(dropped[0].name, "walt");
 }
 
 #[test]

@@ -225,6 +225,7 @@ impl<'plan> LogicalOp<'plan> {
             L::LOGICAL_COMPACT => Operator::Compact(Compact { raw: self.raw }),
             L::LOGICAL_COPY_FROM_STDIN => Operator::CopyFromStdin(CopyFromStdin { raw: self.raw }),
             L::LOGICAL_CREATE_USER => Operator::CreateUser(CreateUser { raw: self.raw }),
+            L::LOGICAL_DROP_USER => Operator::DropUser(DropUser { raw: self.raw }),
             L::LOGICAL_COMPARISON_JOIN => {
                 Operator::ComparisonJoin(ComparisonJoin { raw: self.raw })
             }
@@ -278,6 +279,7 @@ pub enum Operator<'plan> {
     CopyFromStdin(CopyFromStdin<'plan>),
     /// `CREATE USER <name> [PASSWORD '<password>']`.
     CreateUser(CreateUser<'plan>),
+    DropUser(DropUser<'plan>),
     /// A user IN/EXISTS comparison join.
     ComparisonJoin(ComparisonJoin<'plan>),
     /// The late-materialization rewrite's fetch: child 0 is the wide get
@@ -360,6 +362,8 @@ define_handles! { ffi::LogicalOperator;
     CopyFromStdin,
     /// A `LogicalCreateUser`: `CREATE USER <name> [PASSWORD '<password>']`.
     CreateUser,
+    /// A `LogicalDropUser`: `DROP USER <name>`.
+    DropUser,
     /// A `LogicalComparisonJoin`.
     ComparisonJoin,
     /// A `LogicalComparisonJoin` whose operator type is `LOGICAL_DELIM_JOIN`.
@@ -720,9 +724,16 @@ impl<'plan> Explain<'plan> {
 }
 
 impl<'plan> Drop<'plan> {
-    /// Whether the drop targets a table (the only kind the consumer supports).
+    /// Whether the drop targets a table.
     pub fn is_table(self) -> Result<bool> {
         Ok(ffi::lo_drop_is_table(self.raw)?)
+    }
+
+    /// Whether the drop targets a schema. For `DROP SCHEMA` the schema's own
+    /// name arrives in [`name`](Self::name), never in [`schema`](Self::schema):
+    /// DuckDB's parser fills the drop's `name` with whatever entry is dropped.
+    pub fn is_schema(self) -> Result<bool> {
+        Ok(ffi::lo_drop_is_schema(self.raw)?)
     }
 
     /// The kind of catalog entry the drop targets, as DuckDB spells it
@@ -908,6 +919,13 @@ impl<'plan> CopyFromStdin<'plan> {
                 Ok((name, values))
             })
             .collect()
+    }
+}
+
+impl<'plan> DropUser<'plan> {
+    /// The name of the user to drop.
+    pub fn name(self) -> Result<String> {
+        Ok(ffi::lo_drop_user_name(self.raw)?)
     }
 }
 

@@ -107,6 +107,16 @@ pub trait Metastore: Send + Sync + std::fmt::Debug {
         let _ = password;
         Err(format!("this metastore does not support creating users (user `{username}`)").into())
     }
+
+    /// Remove `username`, durably: once this returns, the user is gone from
+    /// the store and subsequent logins are refused (already-open sessions are
+    /// untouched, since credentials are read per login). Fails when no such
+    /// user exists, when the user cannot be removed (the built-in default
+    /// user, or one defined in a config file the server does not rewrite),
+    /// and on metastores that cannot persist users.
+    fn drop_user(&self, username: &str) -> Result<()> {
+        Err(format!("this metastore does not support dropping users (user `{username}`)").into())
+    }
 }
 
 /// Provider errors cross the trait boundary without making this crate depend on

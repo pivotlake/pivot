@@ -40,6 +40,10 @@ pub enum Error {
     /// resolved the table against live state, so the manifest is out of sync.
     #[error("table `{0}` does not exist")]
     MissingTable(String),
+    /// A schema was removed while it still names tables. The caller must
+    /// remove them first, or the manifest would strand each one's registration.
+    #[error("schema `{0}` still holds tables")]
+    SchemaNotEmpty(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -396,6 +400,25 @@ impl CatalogManifest {
         }
         self.schemas.push(CatalogManifestSchemaEntry::new(schema));
         self.version += 1;
+    }
+
+    /// Unregister `schema` and bump the manifest version. Errors if the schema
+    /// is missing (the caller resolved it against live state, so a manifest
+    /// that disagrees is out of sync) or still names tables (the caller
+    /// removes them first via [`remove_table`](Self::remove_table), so a drop
+    /// never strands a table's registration).
+    pub(crate) fn remove_schema(&mut self, schema: &str) -> Result<()> {
+        let position = self
+            .schemas
+            .iter()
+            .position(|s| s.name == schema)
+            .ok_or_else(|| Error::MissingSchema(schema.to_string()))?;
+        if !self.schemas[position].table_ids.is_empty() {
+            return Err(Error::SchemaNotEmpty(schema.to_string()));
+        }
+        self.schemas.remove(position);
+        self.version += 1;
+        Ok(())
     }
 }
 

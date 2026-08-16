@@ -118,6 +118,12 @@ pub enum Error {
     UnexpectedDropTableInputs,
     #[error("dropping table: {0}")]
     DropTable(#[source] crate::catalog::Error),
+    #[error("cannot drop schema `{0}`: it is the default schema every datastore defines")]
+    DropDefaultSchema(String),
+    #[error("DROP SCHEMA does not take inputs")]
+    UnexpectedDropSchemaInputs,
+    #[error("dropping schema: {0}")]
+    DropSchema(#[source] crate::catalog::Error),
     #[error("CREATE OR REPLACE SCHEMA is not supported")]
     UnsupportedCreateSchemaOrReplace,
     #[error("CREATE SCHEMA does not take inputs")]
@@ -140,6 +146,10 @@ pub enum Error {
     UnexpectedCreateUserInputs,
     #[error("create user: {0}")]
     CreateUser(#[source] crate::catalog::Error),
+    #[error("DROP USER does not take inputs")]
+    UnexpectedDropUserInputs,
+    #[error("dropping user: {0}")]
+    DropUser(#[source] crate::catalog::Error),
     #[error("Unsupported table function: {0}")]
     UnsupportedTableFunction(String),
     #[error("Invalid argument to table function {function}: {message}")]
@@ -313,6 +323,12 @@ impl PlanNode {
                 }
                 o.compile(dispatcher, transaction)
             }
+            crate::Operator::DropSchema(o) => {
+                if !inputs.is_empty() {
+                    return Err(Error::UnexpectedDropSchemaInputs);
+                }
+                o.compile(dispatcher, transaction)
+            }
             crate::Operator::Insert(o) => o.compile(inputs.remove(0), dispatcher),
             crate::Operator::DummyScan(o) => o.compile(dispatcher),
             // EXPLAIN is handled above, before inputs are compiled.
@@ -330,6 +346,12 @@ impl PlanNode {
             crate::Operator::CreateUser(o) => {
                 if !inputs.is_empty() {
                     return Err(Error::UnexpectedCreateUserInputs);
+                }
+                o.compile(dispatcher, transaction)
+            }
+            crate::Operator::DropUser(o) => {
+                if !inputs.is_empty() {
+                    return Err(Error::UnexpectedDropUserInputs);
                 }
                 o.compile(dispatcher, transaction)
             }

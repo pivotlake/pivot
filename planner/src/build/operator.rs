@@ -16,22 +16,22 @@ use duckdb_planner::handle::{
     Aggregate as AggregateView, BridgeError, ChunkGet as ChunkGetView, Compact as CompactView,
     CopyFromStdin as CopyFromStdinView, CreateSchema as CreateSchemaView,
     CreateTable as CreateTableView, CreateUser as CreateUserView, Drop as DropView,
-    Filter as FilterView, Insert as InsertView, Limit as LimitView, OrderBy as OrderByView,
-    OrderKey, Projection as ProjectionView, Reset as ResetView, Set as SetView,
-    TableFunctionScan as TableFunctionScanView, TableScan as TableScanView, TopN as TopNView,
-    Values as ValuesView,
+    DropUser as DropUserView, Filter as FilterView, Insert as InsertView, Limit as LimitView,
+    OrderBy as OrderByView, OrderKey, Projection as ProjectionView, Reset as ResetView,
+    Set as SetView, TableFunctionScan as TableFunctionScanView, TableScan as TableScanView,
+    TopN as TopNView, Values as ValuesView,
 };
 
 use super::{BuildCtx, build_scan_columns};
 use crate::catalog::{
-    BoundTable, Column, CreateSchemaRequest, CreateTableRequest, DropTableRequest,
-    DuckDBTableAdapter,
+    BoundTable, Column, CreateSchemaRequest, CreateTableRequest, DropSchemaRequest,
+    DropTableRequest, DuckDBTableAdapter,
 };
 use crate::expression::{Error as ExpressionError, Expression, Ref};
 use crate::operator::{
     Aggregate, Compact, CopyFormat, CopyFromStdin, CreateSchema, CreateTable, CreateUser,
-    DropTable, Error as OperatorError, Filter, Input, Insert, Limit, OrderBy, OrderByNode,
-    Projection, SetVariable, TableFunctionScan, TopN, Values,
+    DropSchema, DropTable, DropUser, Error as OperatorError, Filter, Input, Insert, Limit, OrderBy,
+    OrderByNode, Projection, SetVariable, TableFunctionScan, TopN, Values,
 };
 use crate::types::{build_scalar_value, physical_arrow_type, type_from_logical};
 
@@ -309,6 +309,21 @@ impl DropTable {
     }
 }
 
+impl DropSchema {
+    pub(crate) fn from_handle(view: DropView<'_>) -> Result<DropSchema, OperatorError> {
+        // For `DROP SCHEMA` the dropped entry *is* the schema, so its name
+        // arrives in the drop's `name` field; the `schema` field stays empty.
+        Ok(DropSchema {
+            request: DropSchemaRequest {
+                datastore_name: view.datastore()?,
+                name: view.name()?,
+                if_exists: view.if_exists()?,
+                cascade: view.cascade()?,
+            },
+        })
+    }
+}
+
 impl CreateTable {
     pub(crate) fn from_handle(view: CreateTableView<'_>) -> Result<CreateTable, OperatorError> {
         Ok(CreateTable {
@@ -389,6 +404,12 @@ impl CreateUser {
             name: view.name()?,
             password: view.password()?,
         })
+    }
+}
+
+impl DropUser {
+    pub(crate) fn from_handle(view: DropUserView<'_>) -> Result<DropUser, BridgeError> {
+        Ok(DropUser { name: view.name()? })
     }
 }
 

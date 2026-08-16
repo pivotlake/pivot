@@ -279,13 +279,24 @@ fn drop_of_a_missing_table_without_if_exists_fails_at_binding(mut testing_planne
 }
 
 #[rstest]
-fn drop_of_a_non_table_entry_is_unsupported(mut testing_planner: TestingPlanner) {
+fn drop_schema_produces_drop_schema_operator(mut testing_planner: TestingPlanner) {
+    // The schema does not exist, and the statement still plans: DuckDB binds a
+    // schema drop without looking the schema up, so existence is validated by
+    // the datastore when the statement runs, not at planning.
+    let plan = testing_planner.plan("DROP SCHEMA some_schema").unwrap();
+
+    assert_snapshot!(plan.to_string(), @"DropSchema(some_schema)
+    ");
+}
+
+#[rstest]
+fn drop_of_an_unsupported_entry_kind_reports_it(mut testing_planner: TestingPlanner) {
     let err = testing_planner
-        .plan("DROP SCHEMA some_schema")
+        .plan("DROP VIEW IF EXISTS some_view")
         .unwrap_err()
         .to_string();
 
-    assert!(err.contains("DROP Schema is not supported"), "{err}");
+    assert!(err.contains("DROP View is not supported"), "{err}");
 }
 
 #[rstest]
@@ -293,6 +304,14 @@ fn create_user_produces_create_user_operator(mut testing_planner: TestingPlanner
     let plan = testing_planner.plan("CREATE USER alice").unwrap();
 
     assert_snapshot!(plan.to_string(), @"CreateUser(alice)
+    ");
+}
+
+#[rstest]
+fn drop_user_produces_drop_user_operator(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner.plan("DROP USER alice").unwrap();
+
+    assert_snapshot!(plan.to_string(), @"DropUser(alice)
     ");
 }
 

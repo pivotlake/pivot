@@ -1,6 +1,7 @@
-//! End-to-end blackbox test of CREATE USER: the statement arrives over the
-//! postgres protocol, is applied to the metastore when it commits, and both
-//! later logins and the rewritten metastore file see the user.
+//! End-to-end blackbox tests of CREATE USER and DROP USER: the statement
+//! arrives over the postgres protocol, is applied to the metastore when it
+//! commits, and both later logins and the rewritten metastore file see the
+//! change.
 
 mod common;
 
@@ -119,4 +120,45 @@ async fn creating_an_existing_user_is_refused() {
 
     let message = error.as_db_error().unwrap().message();
     assert!(message.contains("already exists"), "{message}");
+}
+
+#[tokio::test]
+async fn a_dropped_user_can_no_longer_log_in() {
+    let server = create_user_server();
+    let admin = admin().await;
+    admin
+        .simple_query("CREATE USER gus PASSWORD 'pollos'")
+        .await
+        .unwrap();
+    login(server.port, "gus", "pollos").await.unwrap();
+
+    admin.simple_query("DROP USER gus").await.unwrap();
+
+    assert!(login(server.port, "gus", "pollos").await.is_err());
+    let file = std::fs::read_to_string(&server.metastore_path).unwrap();
+    assert!(!file.contains("gus"), "{file}");
+}
+
+#[tokio::test]
+async fn dropping_a_missing_user_errors() {
+    let admin = admin().await;
+
+    let error = admin.simple_query("DROP USER nobody").await.unwrap_err();
+
+    let message = error.as_db_error().unwrap().message();
+    assert!(message.contains("does not exist"), "{message}");
+}
+
+#[tokio::test]
+async fn dropping_the_builtin_user_is_refused() {
+    let admin = admin().await;
+
+    // Quoted because the built-in user's name, `pivot`, is also a keyword.
+    let error = admin
+        .simple_query(&format!("DROP USER \"{DEFAULT_USER_NAME}\""))
+        .await
+        .unwrap_err();
+
+    let message = error.as_db_error().unwrap().message();
+    assert!(message.contains("built-in"), "{message}");
 }

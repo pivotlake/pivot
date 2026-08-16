@@ -149,7 +149,7 @@ pub mod types;
 use std::sync::Arc;
 
 pub use operator::{
-    Compact, CopyFormat, CopyFromStdin, CreateUser, Operator, SetVariable, TableFunction,
+    Compact, CopyFormat, CopyFromStdin, CreateUser, DropUser, Operator, SetVariable, TableFunction,
     TableFunctionSignature,
 };
 pub use plan::{Plan, PlanNode};

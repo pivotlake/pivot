@@ -14,8 +14,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use planner::catalog::{
-    BoundTable, CreateSchemaRequest, CreateTableRequest, DropTableRequest, Result, SchemaCreation,
-    SchemaQualifiedTableName, TableCreation, TableDrop, TableRevision,
+    BoundTable, CreateSchemaRequest, CreateTableRequest, DropSchemaRequest, DropTableRequest,
+    Result, SchemaCreation, SchemaDrop, SchemaQualifiedTableName, TableCreation, TableDrop,
+    TableRevision,
 };
 use planner::types::Type;
 
@@ -187,6 +188,19 @@ pub trait DatastoreTransaction: Debug + Send + Sync {
     fn bind_create_schema(&self, _request: CreateSchemaRequest) -> Result<Box<dyn SchemaCreation>> {
         Err(Box::<dyn std::error::Error + Send + Sync>::from(
             "this datastore does not support CREATE SCHEMA",
+        )
+        .into())
+    }
+
+    /// Resolve a `DROP SCHEMA` against this datastore into a [`SchemaDrop`]
+    /// the caller compiles into the dataflow that stages it. Split the same
+    /// way [`bind_drop_table`](Self::bind_drop_table) is, so that resolving a
+    /// statement never changes the catalog by itself: the drop is staged when
+    /// the compiled dataflow runs, and made durable by [`commit`](Self::commit).
+    /// The default rejects DDL (a read-only datastore).
+    fn bind_drop_schema(&self, _request: DropSchemaRequest) -> Result<Box<dyn SchemaDrop>> {
+        Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "this datastore does not support DROP SCHEMA",
         )
         .into())
     }
