@@ -25,18 +25,16 @@
 //! some hold `Rc` or other non-`Send` state). Once created, the worker's event loop
 //! repeatedly calls:
 //!
-//! 1. [`run_cpu_work`](Operator::run_cpu_work) — does one 'unit' of CPU work, optionally.
+//! 1. [`run_cpu_work`](Operator::run_cpu_work) — does one unit of CPU work and
+//!    may append logical requests to its [`OperatorIO`].
 //!    Returns [`WorkStatus::Ran`] if it did anything, [`WorkStatus::Pending`] if no work was available
 //!    to do.
 //!
-//! 2. [`next_fs_requests`](Operator::next_fs_requests) /
-//!    [`next_http_requests`](Operator::next_http_requests) — return any pending IO requests
-//!    (e.g. read a parquet page from disk, or a byte range over HTTP). The worker submits
-//!    these asynchronously and delivers completions via
-//!    [`process_fs_read_response`](Operator::process_fs_read_response) /
-//!    [`process_fs_write_response`](Operator::process_fs_write_response) /
-//!    [`process_http_get_response`](Operator::process_http_get_response) or
-//!    [`process_http_upload_response`](Operator::process_http_upload_response).
+//! 2. The worker drains every node's `OperatorIO`, resolves logical reads through
+//!    the decompressed and compressed caches, allocates missing extents, and
+//!    submits the resulting physical IO. It delivers complete logical reads via
+//!    [`process_read_response`](Operator::process_read_response); write and upload
+//!    completions retain their transport-specific callbacks.
 //!
 //! 3. [`try_finish`](Operator::try_finish) — called when the input channel is drained
 //!    and all sibling operators (across workers) have also drained. The operator does
@@ -46,9 +44,7 @@
 //!    idle. The operator attempts to steal from a peer worker's input channel.
 
 use crate::data_flow::WorkStatus;
-use crate::io::{
-    FsReadRequest, FsRequest, FsWriteRequest, HttpGetRequest, HttpRequest, HttpUploadRequest,
-};
+use crate::io::{FsWriteRequest, HttpUploadRequest, OperatorIO, ReadResponse};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use thiserror::Error;
@@ -111,33 +107,20 @@ pub enum FinishStatus {
 pub trait Operator {
     /// Try to consume one item from the input and produce output.
     /// Returns [`WorkStatus::Ran`] if work was done, [`Pending`](WorkStatus::Pending) otherwise.
-    fn run_cpu_work(&mut self) -> Result<WorkStatus>;
+    fn run_cpu_work(&mut self, io: &mut OperatorIO) -> Result<WorkStatus>;
 
-    /// Return any pending filesystem requests. The worker submits them and later
-    /// calls [`process_fs_read_response`](Self::process_fs_read_response) or
-    /// [`process_fs_write_response`](Self::process_fs_write_response).
-    fn next_fs_requests(&mut self) -> Result<Vec<FsRequest>>;
-
-    /// Return any pending HTTP requests (reads of [`Remote`](crate::io::OpenFile::Remote)
-    /// regions). The worker submits these on the same per-core io_uring and
-    /// delivers completions via the handler matching the request variant. By the
-    /// time [`process_http_get_response`](Self::process_http_get_response) is
-    /// called, GET bytes are already committed to the cache slot, identical to a
-    /// disk read.
-    fn next_http_requests(&mut self) -> Result<Vec<HttpRequest>> {
-        Ok(vec![])
+    /// Handle a completed logical read. Dispatch has already resolved all cache
+    /// tiers and committed any physical reads before making this callback.
+    fn process_read_response(
+        &mut self,
+        _io: &mut OperatorIO,
+        _response: ReadResponse,
+    ) -> Result<()> {
+        unreachable!()
     }
-
-    /// Handle a completed filesystem read; its bytes are already committed to
-    /// the cache slot.
-    fn process_fs_read_response(&mut self, request: FsReadRequest) -> Result<()>;
 
     /// Handle a completed filesystem write.
     fn process_fs_write_response(&mut self, request: FsWriteRequest) -> Result<()>;
-
-    /// Handle a completed HTTP GET; its bytes are already committed to the
-    /// cache. Called by the worker when the read finishes.
-    fn process_http_get_response(&mut self, request: HttpGetRequest) -> Result<()>;
 
     /// Handle a completed HTTP upload. Called by the worker when the upload
     /// finishes.
@@ -149,7 +132,7 @@ pub trait Operator {
     fn try_finish(&mut self) -> Result<FinishStatus>;
 
     /// Try to steal work from a peer worker's channel. Default: no stealing.
-    fn try_steal_work(&mut self) -> Result<WorkStatus> {
+    fn try_steal_work(&mut self, _io: &mut OperatorIO) -> Result<WorkStatus> {
         Ok(WorkStatus::Pending)
     }
 

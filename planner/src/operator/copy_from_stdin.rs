@@ -257,6 +257,7 @@ impl Unary<RecordBatch, RecordBatch> for ConformArrowBatch {
         &mut self,
         batch: RecordBatch,
         sender: &mut dyn dispatch::Sender<RecordBatch>,
+        _io: &mut dispatch::OperatorIO,
     ) -> UnaryResult<()> {
         let batch = conform_arrow_batch(&batch, &self.layout)
             .map_err(|message| UnaryError::Operator(message.into()))?;

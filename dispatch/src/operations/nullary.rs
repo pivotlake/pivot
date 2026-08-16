@@ -7,9 +7,7 @@
 use super::{FinishStatus, Operator};
 use crate::api::{BuildContext, OperatorFactory, OperatorGraphBuilder};
 use crate::data_flow::WorkStatus;
-use crate::io::{
-    FsReadRequest, FsRequest, FsWriteRequest, HttpGetRequest, HttpRequest, HttpUploadRequest,
-};
+use crate::io::{FsWriteRequest, HttpUploadRequest, OperatorIO, ReadResponse};
 use crate::operations::channels::Sender;
 use std::marker::PhantomData;
 use thiserror::Error;
@@ -33,25 +31,15 @@ pub trait NullaryFactory<O>: Send + 'static {
 /// A source-like transform that receives no input and may emit items of type `O`.
 pub trait Nullary<O> {
     /// Run one unit of work, possibly sending output.
-    fn run(&mut self, sender: &mut dyn Sender<O>) -> Result<WorkStatus>;
+    fn run(&mut self, sender: &mut dyn Sender<O>, io: &mut OperatorIO) -> Result<WorkStatus>;
 
-    /// Return any pending filesystem requests.
-    fn next_fs_requests(&mut self) -> Result<Vec<FsRequest>> {
-        Ok(vec![])
-    }
-
-    /// Return any pending HTTP requests (reads of remote regions). See
-    /// [`Operator::next_http_requests`].
-    fn next_http_requests(&mut self) -> Result<Vec<HttpRequest>> {
-        Ok(vec![])
-    }
-
-    /// Handle a completed filesystem read; its bytes are already committed to
-    /// the cache slot.
-    fn process_fs_read_response(
+    /// Handle a completed logical read. Dispatch has already resolved cache
+    /// hits and committed any physical reads.
+    fn process_read_response(
         &mut self,
         _sender: &mut dyn Sender<O>,
-        _request: FsReadRequest,
+        _io: &mut OperatorIO,
+        _response: ReadResponse,
     ) -> Result<()> {
         unreachable!()
     }
@@ -61,16 +49,6 @@ pub trait Nullary<O> {
         &mut self,
         _sender: &mut dyn Sender<O>,
         _request: FsWriteRequest,
-    ) -> Result<()> {
-        unreachable!()
-    }
-
-    /// Handle a completed HTTP GET; its bytes are already committed to the
-    /// cache slot.
-    fn process_http_get_response(
-        &mut self,
-        _sender: &mut dyn Sender<O>,
-        _request: HttpGetRequest,
     ) -> Result<()> {
         unreachable!()
     }
@@ -108,34 +86,24 @@ impl<O, N: Nullary<O>> NullaryOperator<O, N> {
 }
 
 impl<O, N: Nullary<O>> Operator for NullaryOperator<O, N> {
-    fn run_cpu_work(&mut self) -> super::Result<WorkStatus> {
-        Ok(self.nullary.run(&mut *self.sender)?)
+    fn run_cpu_work(&mut self, io: &mut OperatorIO) -> super::Result<WorkStatus> {
+        Ok(self.nullary.run(&mut *self.sender, io)?)
     }
 
-    fn next_fs_requests(&mut self) -> super::Result<Vec<FsRequest>> {
-        Ok(self.nullary.next_fs_requests()?)
-    }
-
-    fn next_http_requests(&mut self) -> super::Result<Vec<HttpRequest>> {
-        Ok(self.nullary.next_http_requests()?)
-    }
-
-    fn process_fs_read_response(&mut self, request: FsReadRequest) -> super::Result<()> {
+    fn process_read_response(
+        &mut self,
+        io: &mut OperatorIO,
+        response: ReadResponse,
+    ) -> super::Result<()> {
         Ok(self
             .nullary
-            .process_fs_read_response(&mut *self.sender, request)?)
+            .process_read_response(&mut *self.sender, io, response)?)
     }
 
     fn process_fs_write_response(&mut self, request: FsWriteRequest) -> super::Result<()> {
         Ok(self
             .nullary
             .process_fs_write_response(&mut *self.sender, request)?)
-    }
-
-    fn process_http_get_response(&mut self, request: HttpGetRequest) -> super::Result<()> {
-        Ok(self
-            .nullary
-            .process_http_get_response(&mut *self.sender, request)?)
     }
 
     fn process_http_upload_response(&mut self, request: HttpUploadRequest) -> super::Result<()> {
@@ -200,7 +168,7 @@ impl<O: 'static> NullaryFactory<O> for NoOpNullaryFactory {
 pub struct NoOpNullary;
 
 impl<O> Nullary<O> for NoOpNullary {
-    fn run(&mut self, _sender: &mut dyn Sender<O>) -> Result<WorkStatus> {
+    fn run(&mut self, _sender: &mut dyn Sender<O>, _io: &mut OperatorIO) -> Result<WorkStatus> {
         Ok(WorkStatus::Pending)
     }
 }
@@ -253,7 +221,7 @@ pub struct OneShotNullary<O, F: FnOnce() -> Option<O>> {
 }
 
 impl<O, F: FnOnce() -> Option<O> + Send> Nullary<O> for OneShotNullary<O, F> {
-    fn run(&mut self, sender: &mut dyn Sender<O>) -> Result<WorkStatus> {
+    fn run(&mut self, sender: &mut dyn Sender<O>, _io: &mut OperatorIO) -> Result<WorkStatus> {
         match self.func.take() {
             Some(f) => {
                 if let Some(output) = f() {
@@ -283,7 +251,11 @@ mod tests {
     }
 
     impl Nullary<i32> for EmitOne {
-        fn run(&mut self, sender: &mut dyn Sender<i32>) -> Result<WorkStatus> {
+        fn run(
+            &mut self,
+            sender: &mut dyn Sender<i32>,
+            _io: &mut OperatorIO,
+        ) -> Result<WorkStatus> {
             if self.emitted {
                 return Ok(WorkStatus::Pending);
             }
@@ -304,11 +276,15 @@ mod tests {
             EmitOne::default(),
             Box::new(SharedCollectSender(items.clone())),
         );
+        let mut io = OperatorIO::default();
 
-        assert!(matches!(operator.run_cpu_work().unwrap(), WorkStatus::Ran));
+        assert!(matches!(
+            operator.run_cpu_work(&mut io).unwrap(),
+            WorkStatus::Ran
+        ));
         assert_eq!(*items.borrow(), vec![7]);
         assert!(matches!(
-            operator.run_cpu_work().unwrap(),
+            operator.run_cpu_work(&mut io).unwrap(),
             WorkStatus::Pending
         ));
         assert_eq!(operator.try_finish().unwrap(), FinishStatus::Done);
@@ -319,9 +295,10 @@ mod tests {
         let items = std::rc::Rc::new(std::cell::RefCell::new(Vec::<i32>::new()));
         let mut operator =
             NullaryOperator::new(NoOpNullary, Box::new(SharedCollectSender(items.clone())));
+        let mut io = OperatorIO::default();
 
         assert!(matches!(
-            operator.run_cpu_work().unwrap(),
+            operator.run_cpu_work(&mut io).unwrap(),
             WorkStatus::Pending
         ));
 

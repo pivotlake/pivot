@@ -13,21 +13,16 @@
 //!   attempting to steal from peer workers' channels. Root-to-leaf (upstream first)
 //!   means the stealing worker picks up data early in the dataflow, to not interrupt current
 //!   hot-in-cache processing
-//! - [`get_next_fs_request`](DataFlow::get_next_fs_request) /
-//!   [`get_next_http_request`](DataFlow::get_next_http_request) — collect pending IO
-//!   requests from operators (e.g. parquet page reads, or HTTP range reads).
-//! - [`process_fs_read`](DataFlow::process_fs_read) /
-//!   [`process_fs_write`](DataFlow::process_fs_write),
-//!   [`process_http_get_response`](DataFlow::process_http_get_response), and
+//! - [`register_pending_io`](DataFlow::register_pending_io) — pass each node's
+//!   logical IO to the worker's requester for immediate registration and submission.
+//! - [`process_read_response`](DataFlow::process_read_response),
+//!   [`process_fs_write`](DataFlow::process_fs_write), and
 //!   [`process_http_upload_response`](DataFlow::process_http_upload_response) —
 //!   deliver completed IO to the operator that requested it.
 //! - [`maybe_finish`](DataFlow::maybe_finish) — check if all operators have completed.
 
 use crate::Identifier;
-use crate::io::{
-    DataFlowRequest, FsReadRequest, FsRequest, FsWriteRequest, HttpGetRequest, HttpRequest,
-    HttpUploadRequest,
-};
+use crate::io::{FsWriteRequest, HttpUploadRequest, IORequester, OperatorIO, ReadResponse};
 use crate::operations::{FinishStatus, Operator};
 use crate::stats::{DataFlowStats, StatsCollector};
 use crate::waker::waker_set;
@@ -56,6 +51,9 @@ struct OperatorNode {
     /// every edge index stable: traversals skip a retired node and move on, and
     /// a late IO completion routed to one lands nowhere.
     operator: Option<Box<dyn Operator>>,
+    /// Logical requests produced by this node. The worker passes these to its
+    /// requester during `register_pending_io`.
+    io: OperatorIO,
     /// One-shot publication gates. Open gates are removed after an Acquire
     /// observation, leaving no atomic loads on this node's steady-state path.
     gates: Vec<Arc<AtomicBool>>,
@@ -74,14 +72,14 @@ impl OperatorNode {
     #[inline]
     fn run<T>(
         &mut self,
-        f: &mut impl FnMut(Identifier, &mut dyn Operator) -> Result<ControlFlow<T>>,
+        f: &mut impl FnMut(Identifier, &mut dyn Operator, &mut OperatorIO) -> Result<ControlFlow<T>>,
     ) -> Result<Option<ControlFlow<T>>> {
         if self.is_gated() {
             return Ok(None);
         }
         let id = self.id;
         match self.operator.as_deref_mut() {
-            Some(operator) => f(id, operator).map(Some),
+            Some(operator) => f(id, operator, &mut self.io).map(Some),
             None => Ok(None),
         }
     }
@@ -167,6 +165,7 @@ impl OperatorGraph {
             .map(|(id, operator)| OperatorNode {
                 id,
                 operator: Some(operator),
+                io: OperatorIO::default(),
                 gates: gates.remove(&id).unwrap_or_default(),
             })
             .collect();
@@ -188,7 +187,7 @@ impl OperatorGraph {
     /// the walk carries on through it to its publishers.
     pub fn traverse_backwards<
         T,
-        F: FnMut(Identifier, &mut dyn Operator) -> Result<ControlFlow<T>>,
+        F: FnMut(Identifier, &mut dyn Operator, &mut OperatorIO) -> Result<ControlFlow<T>>,
     >(
         &mut self,
         mut f: F,
@@ -208,7 +207,7 @@ impl OperatorGraph {
     /// The root-to-leaf twin of [`traverse_backwards`](Self::traverse_backwards).
     pub fn traverse_forwards<
         T,
-        F: FnMut(Identifier, &mut dyn Operator) -> Result<ControlFlow<T>>,
+        F: FnMut(Identifier, &mut dyn Operator, &mut OperatorIO) -> Result<ControlFlow<T>>,
     >(
         &mut self,
         mut f: F,
@@ -519,12 +518,12 @@ impl DataFlow {
         });
     }
 
-    /// Notify the operator that requested it that one of its filesystem reads
-    /// has landed (already committed into the cache slot by the requester).
-    pub fn process_fs_read(&mut self, node_id: Identifier, request: FsReadRequest) {
+    /// Deliver a fully resolved logical read to its operator.
+    pub fn process_read_response(&mut self, node_id: Identifier, response: ReadResponse) {
         self.try_run(|d| {
-            if let Some(operator) = d.graph.operators[node_id].operator.as_deref_mut() {
-                operator.process_fs_read_response(request)?;
+            let node = &mut d.graph.operators[node_id];
+            if let Some(operator) = node.operator.as_deref_mut() {
+                operator.process_read_response(&mut node.io, response)?;
             }
             Ok(())
         });
@@ -534,19 +533,9 @@ impl DataFlow {
     /// has completed.
     pub fn process_fs_write(&mut self, node_id: Identifier, request: FsWriteRequest) {
         self.try_run(|d| {
-            if let Some(operator) = d.graph.operators[node_id].operator.as_deref_mut() {
+            let node = &mut d.graph.operators[node_id];
+            if let Some(operator) = node.operator.as_deref_mut() {
                 operator.process_fs_write_response(request)?;
-            }
-            Ok(())
-        });
-    }
-
-    /// Notify the operator that requested it that one of its HTTP GETs has
-    /// landed (already committed into the cache slot by the requester).
-    pub fn process_http_get_response(&mut self, node_id: Identifier, request: HttpGetRequest) {
-        self.try_run(|d| {
-            if let Some(operator) = d.graph.operators[node_id].operator.as_deref_mut() {
-                operator.process_http_get_response(request)?;
             }
             Ok(())
         });
@@ -560,7 +549,8 @@ impl DataFlow {
         request: HttpUploadRequest,
     ) {
         self.try_run(|d| {
-            if let Some(operator) = d.graph.operators[node_id].operator.as_deref_mut() {
+            let node = &mut d.graph.operators[node_id];
+            if let Some(operator) = node.operator.as_deref_mut() {
                 operator.process_http_upload_response(request)?;
             }
             Ok(())
@@ -572,7 +562,7 @@ impl DataFlow {
     pub fn run_ready_cpu_work(&mut self) -> WorkStatus {
         self.try_run_or(WorkStatus::Ran, |d| {
             d.graph
-                .traverse_backwards(|_, operator| match operator.run_cpu_work()? {
+                .traverse_backwards(|_, operator, io| match operator.run_cpu_work(io)? {
                     WorkStatus::Pending => Ok(ControlFlow::Continue(())),
                     WorkStatus::Ran => Ok(ControlFlow::Break(())),
                 })
@@ -588,7 +578,7 @@ impl DataFlow {
     pub fn try_stealing_work(&mut self) -> WorkStatus {
         self.try_run_or(WorkStatus::Ran, |d| {
             d.graph
-                .traverse_forwards(|_, operator| match operator.try_steal_work()? {
+                .traverse_forwards(|_, operator, io| match operator.try_steal_work(io)? {
                     WorkStatus::Pending => Ok(ControlFlow::Continue(())),
                     WorkStatus::Ran => Ok(ControlFlow::Break(())),
                 })
@@ -599,48 +589,21 @@ impl DataFlow {
         })
     }
 
-    /// Collect pending filesystem read requests from operators (leaf-to-root).
-    /// Returns the first batch found, or `None` if no operator needs disk IO.
-    pub fn get_next_fs_request(&mut self) -> Option<Vec<DataFlowRequest<FsRequest>>> {
-        self.try_run_or(None, |d| {
-            d.graph
-                .traverse_backwards(|id, operator| {
-                    let requests = operator.next_fs_requests()?;
-                    if !requests.is_empty() {
-                        Ok(ControlFlow::Break(
-                            requests
-                                .into_iter()
-                                .map(|r| DataFlowRequest::new(d.id, id, r))
-                                .collect(),
-                        ))
-                    } else {
-                        Ok(ControlFlow::Continue(()))
-                    }
-                })
-                .map(|c| c.break_value())
-        })
-    }
-
-    /// Collect pending HTTP requests from operators (leaf-to-root). Mirrors
-    /// [`get_next_fs_request`](Self::get_next_fs_request).
-    pub fn get_next_http_request(&mut self) -> Option<Vec<DataFlowRequest<HttpRequest>>> {
-        self.try_run_or(None, |d| {
-            d.graph
-                .traverse_backwards(|id, operator| {
-                    let requests = operator.next_http_requests()?;
-                    if !requests.is_empty() {
-                        Ok(ControlFlow::Break(
-                            requests
-                                .into_iter()
-                                .map(|r| DataFlowRequest::new(d.id, id, r))
-                                .collect(),
-                        ))
-                    } else {
-                        Ok(ControlFlow::Continue(()))
-                    }
-                })
-                .map(|c| c.break_value())
-        })
+    /// Drain every node's newly-created logical requests into the worker requester.
+    pub(crate) fn register_pending_io(&mut self, requester: &mut IORequester) {
+        self.try_run(|data_flow| {
+            let data_flow_id = data_flow.id;
+            let stats = &mut data_flow.stats;
+            for node in &mut data_flow.graph.operators {
+                for request in node.io.take_pending_read_requests() {
+                    requester.request_read(data_flow_id, node.id, request, stats)?;
+                }
+                for request in node.io.take_pending_write_requests() {
+                    requester.request_write(data_flow_id, node.id, request, stats)?;
+                }
+            }
+            Ok(())
+        });
     }
 }
 
@@ -653,27 +616,12 @@ mod tests {
     /// own, so a node still holding one is visibly "live".
     struct LiveOperator;
     impl Operator for LiveOperator {
-        fn run_cpu_work(&mut self) -> crate::operations::Result<WorkStatus> {
+        fn run_cpu_work(&mut self, _io: &mut OperatorIO) -> crate::operations::Result<WorkStatus> {
             Ok(WorkStatus::Ran)
-        }
-        fn next_fs_requests(&mut self) -> crate::operations::Result<Vec<FsRequest>> {
-            Ok(vec![])
-        }
-        fn process_fs_read_response(
-            &mut self,
-            _request: FsReadRequest,
-        ) -> crate::operations::Result<()> {
-            Ok(())
         }
         fn process_fs_write_response(
             &mut self,
             _request: FsWriteRequest,
-        ) -> crate::operations::Result<()> {
-            Ok(())
-        }
-        fn process_http_get_response(
-            &mut self,
-            _request: HttpGetRequest,
         ) -> crate::operations::Result<()> {
             Ok(())
         }
@@ -720,27 +668,12 @@ mod tests {
     }
 
     impl Operator for FinishOperator {
-        fn run_cpu_work(&mut self) -> crate::operations::Result<WorkStatus> {
+        fn run_cpu_work(&mut self, _io: &mut OperatorIO) -> crate::operations::Result<WorkStatus> {
             Ok(WorkStatus::Pending)
-        }
-        fn next_fs_requests(&mut self) -> crate::operations::Result<Vec<FsRequest>> {
-            Ok(vec![])
-        }
-        fn process_fs_read_response(
-            &mut self,
-            _request: FsReadRequest,
-        ) -> crate::operations::Result<()> {
-            Ok(())
         }
         fn process_fs_write_response(
             &mut self,
             _request: FsWriteRequest,
-        ) -> crate::operations::Result<()> {
-            Ok(())
-        }
-        fn process_http_get_response(
-            &mut self,
-            _request: HttpGetRequest,
         ) -> crate::operations::Result<()> {
             Ok(())
         }
@@ -757,28 +690,13 @@ mod tests {
 
     struct CountingOperator(Arc<AtomicUsize>);
     impl Operator for CountingOperator {
-        fn run_cpu_work(&mut self) -> crate::operations::Result<WorkStatus> {
+        fn run_cpu_work(&mut self, _io: &mut OperatorIO) -> crate::operations::Result<WorkStatus> {
             self.0.fetch_add(1, Ordering::Relaxed);
             Ok(WorkStatus::Ran)
-        }
-        fn next_fs_requests(&mut self) -> crate::operations::Result<Vec<FsRequest>> {
-            Ok(vec![])
-        }
-        fn process_fs_read_response(
-            &mut self,
-            _request: FsReadRequest,
-        ) -> crate::operations::Result<()> {
-            Ok(())
         }
         fn process_fs_write_response(
             &mut self,
             _request: FsWriteRequest,
-        ) -> crate::operations::Result<()> {
-            Ok(())
-        }
-        fn process_http_get_response(
-            &mut self,
-            _request: HttpGetRequest,
         ) -> crate::operations::Result<()> {
             Ok(())
         }

@@ -80,7 +80,12 @@ pub enum PipelineBreaker<I, O, C: Consumer<I, O>> {
 }
 
 impl<I, O, C: Consumer<I, O>> Unary<I, O> for PipelineBreaker<I, O, C> {
-    fn consume(&mut self, object: I, sender: &mut dyn Sender<O>) -> unary::Result<()> {
+    fn consume(
+        &mut self,
+        object: I,
+        sender: &mut dyn Sender<O>,
+        _io: &mut crate::io::OperatorIO,
+    ) -> unary::Result<()> {
         match self {
             PipelineBreaker::Consuming(c) => c.consume(object, sender),
             // A breaker that finished *early* (e.g. a satisfied `LIMIT`) can still

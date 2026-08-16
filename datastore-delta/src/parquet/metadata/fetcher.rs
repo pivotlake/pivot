@@ -1,33 +1,30 @@
-//! Fetch stage: reads each file's Parquet footer — through the io_uring ring and
-//! the compressed cache, exactly like a column-chunk read — and emits one [`FileRowGroups`]
-//! per file (its [`FileRef`] paired with its row groups). The footer-reading
-//! analog of the column-chunk scan fetcher: it keeps many footer reads in flight,
-//! bounded per medium, and shares the same slot/routing/in-flight bookkeeping
-//! ([`RequestTracker`]). The footer-specific part is the per-file state machine
-//! ([`FooterRead`]): read the tail probe window, parse the footer, and — if it
-//! overflowed the probe — read it exactly before parsing.
+//! Fetch stage for Parquet footers.
+//!
+//! The operator submits logical file ranges through `OperatorIO`; dispatch's
+//! requester's tracker resolves cache hits and allocates missing compressed-cache
+//! extents, then the requester immediately performs the physical reads. This
+//! module owns only the footer-specific two-step state machine: probe the tail,
+//! then request the exact footer when it is larger than the probe.
 
 use super::FileRowGroups;
-use crate::parquet::request_tracker::{PendingRequest, ReadRequest, RequestTracker};
 use crate::parquet::types::metadata::RowGroupMetadata;
 use crate::parquet::types::table::{Error, FOOTER_PROBE_BYTES, Result, row_groups_from_footer};
 use crate::store::{DataFile, FileRef};
-use dispatch::io::{FsReadRequest, FsRequest, HttpGetRequest, HttpRequest, OpenFile};
-use dispatch::memory::{CacheLookup, memory_ctx};
+use dispatch::io::{FileRange, OpenFile, OperatorIO, ReadRequestId, ReadResponse};
+use dispatch::memory::memory_ctx;
 use dispatch::{Sender, Unary};
 use planner::catalog::Column;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 const PARQUET_MAGIC: [u8; 4] = *b"PAR1";
 
-/// Disk-backed footer-read blocks outstanding per worker before admitting
-/// another file. Larger than a column-chunk read's depth: footers are small and
-/// scattered, so keeping many in flight hides per-file read latency.
+/// Local footer reads outstanding before another file is admitted. Footers are
+/// small and scattered, so modest concurrency hides per-file latency.
 const MAX_DISK_IN_FLIGHT: usize = 32;
 
 /// Parse the 4-byte footer length from a file's `tail` (whose final 8 bytes are
-/// `[footer_len][PAR1]`). The reader fetches the tail through the cache, so it
-/// has the bytes in hand rather than `seek`+`read`ing them.
+/// `[footer_len][PAR1]`).
 pub(super) fn footer_len_from_tail(tail: &[u8]) -> Result<usize> {
     if tail.len() < 8 || tail[tail.len() - 4..] != PARQUET_MAGIC {
         return Err(Error::InvalidFooter("missing PAR1 magic".to_string()));
@@ -36,61 +33,23 @@ pub(super) fn footer_len_from_tail(tail: &[u8]) -> Result<usize> {
     Ok(u32::from_le_bytes(len.try_into().unwrap()) as usize)
 }
 
-/// Reads files' footers and emits one [`FileRowGroups`] per file, keeping many
-/// reads in flight (bounded by `MAX_DISK_IN_FLIGHT`/`MAX_HTTP_IN_FLIGHT` via the
-/// shared [`RequestTracker`]).
 pub(super) struct FileRowGroupsFetcher {
-    tracker: RequestTracker<FooterRead>,
-    /// The table's declared schema, reconciled with each parsed footer's
-    /// schema (see `apply_declared_types`); empty when the table declares
-    /// none.
+    /// Footer domain state keyed by the node-local logical request id.
+    in_flight: HashMap<ReadRequestId, FooterRead>,
     declared_columns: Arc<[Column]>,
 }
 
 impl FileRowGroupsFetcher {
     pub(super) fn new(declared_columns: Arc<[Column]>) -> Self {
         Self {
-            tracker: RequestTracker::default(),
+            in_flight: HashMap::new(),
             declared_columns,
         }
     }
 
-    /// Advance the read in `slot` as far as it can without blocking on IO: while
-    /// its current region is fully present, parse it and either emit the file's
-    /// [`FileRowGroups`] (done) or issue the next region's read (the exact-footer
-    /// re-read). Stop once a region has reads outstanding or the file is finished.
-    ///
-    /// Called from `consume` (after the probe) and on each completion — both just
-    /// "make a read happen, then advance" — so the pending-vs-cached decision
-    /// lives only here.
-    fn advance(
-        &mut self,
-        slot: usize,
-        sender: &mut dyn Sender<FileRowGroups>,
-    ) -> dispatch::UnaryResult<()> {
-        while !self.tracker.request_for_slot(slot).unwrap().is_pending() {
-            let parsed = self
-                .tracker
-                .request_for_slot(slot)
-                .unwrap()
-                .parse_region(&self.declared_columns)
-                .map_err(crate::parquet::op_err)?;
-            match parsed {
-                // The footer overflowed the probe; an exact read was queued. Stage
-                // it; the loop re-checks whether it needs IO or was already cached.
-                None => self.tracker.stage_reads_for_slot(slot),
-                Some(row_groups) => {
-                    let request = self.tracker.take_request_at_slot(slot);
-                    let row_groups = row_groups.into_iter().map(Arc::new).collect();
-                    sender.send(FileRowGroups {
-                        file: request.file,
-                        row_groups,
-                    })?;
-                    return Ok(());
-                }
-            }
-        }
-        Ok(())
+    fn request_region(&mut self, request: FooterRead, range: FileRange, io: &mut OperatorIO) {
+        let id = io.read(request.open_file.clone(), [range]);
+        self.in_flight.insert(id, request);
     }
 }
 
@@ -98,13 +57,9 @@ impl Unary<DataFile, FileRowGroups> for FileRowGroupsFetcher {
     fn consume(
         &mut self,
         file: DataFile,
-        sender: &mut dyn Sender<FileRowGroups>,
+        _sender: &mut dyn Sender<FileRowGroups>,
+        io: &mut OperatorIO,
     ) -> dispatch::UnaryResult<()> {
-        // Open the file's transport. The size — which locates the footer's tail
-        // window with no HEAD/suffix probe — is already carried by the data
-        // file (`stat`ed at listing time for a local file, from the store
-        // listing for a remote one). The `file_ref` rides through to the emitted
-        // `FileRowGroups`.
         let DataFile {
             file: file_ref,
             source,
@@ -114,181 +69,93 @@ impl Unary<DataFile, FileRowGroups> for FileRowGroupsFetcher {
             .open_read(file_ref.size)
             .map_err(crate::parquet::op_err)?;
 
-        let slot = self
-            .tracker
-            .admit_request(FooterRead::start(file_ref, open_file, size));
-        self.advance(slot, sender)
-    }
+        // This is the one registration point for a newly-opened descriptor.
+        // It prevents stale cache entries from an equal, reused fd serving the
+        // new file. Later logical ranges must not call `open_entry`, because it
+        // intentionally clears the file's old extent map.
+        memory_ctx()
+            .compressed_cache()
+            .open_entry(open_file.clone());
 
-    fn next_fs_requests(&mut self) -> dispatch::UnaryResult<Vec<FsRequest>> {
-        Ok(self.tracker.take_fs_requests())
-    }
-
-    fn next_http_requests(&mut self) -> dispatch::UnaryResult<Vec<HttpRequest>> {
-        Ok(self.tracker.take_http_requests())
-    }
-
-    fn ready_for_more_work(&mut self) -> bool {
-        self.tracker.disk_in_flight() < MAX_DISK_IN_FLIGHT
-            && self.tracker.http_in_flight() < crate::parquet::http_readahead()
-    }
-
-    fn process_fs_read_response(
-        &mut self,
-        sender: &mut dyn Sender<FileRowGroups>,
-        request: FsReadRequest,
-    ) -> dispatch::UnaryResult<()> {
-        for slot in self.tracker.complete(&ReadRequest::of_fs(&request)) {
-            self.tracker.request_for_slot(slot).unwrap().record_block();
-            self.advance(slot, sender)?;
-        }
+        let request = FooterRead::new(file_ref, open_file, size);
+        let range = request.probe_range();
+        self.request_region(request, range, io);
         Ok(())
     }
 
-    fn process_http_get_response(
+    fn ready_for_more_work(&mut self) -> bool {
+        let disk_in_flight = self
+            .in_flight
+            .values()
+            .filter(|request| matches!(request.open_file, OpenFile::Local(_)))
+            .count();
+        let http_in_flight = self.in_flight.len() - disk_in_flight;
+        disk_in_flight < MAX_DISK_IN_FLIGHT && http_in_flight < crate::parquet::http_readahead()
+    }
+
+    fn process_read_response(
         &mut self,
         sender: &mut dyn Sender<FileRowGroups>,
-        request: HttpGetRequest,
+        io: &mut OperatorIO,
+        response: ReadResponse,
     ) -> dispatch::UnaryResult<()> {
-        for slot in self.tracker.complete(&ReadRequest::of_http_get(&request)) {
-            self.tracker.request_for_slot(slot).unwrap().record_block();
-            self.advance(slot, sender)?;
+        let mut request = self
+            .in_flight
+            .remove(&response.id())
+            .expect("response for an unknown footer request");
+        let bytes = response.into_bytes();
+
+        match request
+            .parse_region(&bytes, &self.declared_columns)
+            .map_err(crate::parquet::op_err)?
+        {
+            FooterProgress::ReadExact(range) => self.request_region(request, range, io),
+            FooterProgress::Done(row_groups) => sender.send(FileRowGroups {
+                file: request.file,
+                row_groups: row_groups.into_iter().map(Arc::new).collect(),
+            })?,
         }
         Ok(())
     }
 
     fn finish(&mut self, _sender: &mut dyn Sender<FileRowGroups>) -> dispatch::UnaryResult<bool> {
-        Ok(self.tracker.is_idle())
+        Ok(self.in_flight.is_empty())
     }
 }
 
-/// One file's in-flight footer read.
-///
-/// It reads a region of the file (first the tail probe window, then — only if
-/// the footer overflows it — the exact footer) into the compressed cache, tracking the
-/// blocks still outstanding for the current region. Once a region's blocks have
-/// all landed, [`parse_region`](Self::parse_region) turns it into the file's row
-/// groups (or issues the exact re-read).
+/// Domain state for one file's footer read. Physical block accounting lives in
+/// dispatch; this remembers only how the next completed byte range is parsed.
 struct FooterRead {
-    /// The file's durable identity, stamped onto the emitted [`FileRowGroups`].
     file: FileRef,
-    /// The open file (it keeps the handle alive, and travels into the row
-    /// groups as their file).
     open_file: OpenFile,
-    /// Total file size, known when the read starts.
     size: usize,
-    /// Cache lookups pinning the region currently being read.
-    lookups: Vec<CacheLookup>,
-    pending_fs: Vec<FsRequest>,
-    pending_http: Vec<HttpGetRequest>,
-    /// Blocks still outstanding for the current region.
-    remaining: usize,
-    /// `false` while reading the tail probe window; `true` once the footer was
-    /// found to overflow the probe and the exact footer is being read.
     reading_exact: bool,
 }
 
-impl PendingRequest for FooterRead {
-    fn pending_fs(&mut self) -> &mut Vec<FsRequest> {
-        &mut self.pending_fs
-    }
-
-    fn pending_http(&mut self) -> &mut Vec<HttpGetRequest> {
-        &mut self.pending_http
-    }
-}
-
 impl FooterRead {
-    /// Register the file in the cache and issue the tail probe read
-    /// `[size - probe, size)`.
-    fn start(file: FileRef, open_file: OpenFile, size: usize) -> Self {
-        memory_ctx()
-            .compressed_cache()
-            .open_entry(open_file.clone());
-        let mut request = Self {
+    fn new(file: FileRef, open_file: OpenFile, size: usize) -> Self {
+        Self {
             file,
             open_file,
             size,
-            lookups: Vec::new(),
-            pending_fs: Vec::new(),
-            pending_http: Vec::new(),
-            remaining: 0,
             reading_exact: false,
-        };
-        let probe = size.min(FOOTER_PROBE_BYTES);
-        request.read_region(size - probe, probe);
-        request
-    }
-
-    /// Whether the current region still has blocks in flight.
-    fn is_pending(&self) -> bool {
-        self.remaining > 0
-    }
-
-    /// Record one block of the current region as landed.
-    fn record_block(&mut self) {
-        debug_assert!(
-            self.remaining > 0,
-            "completion for a region with no pending blocks"
-        );
-        self.remaining -= 1;
-    }
-
-    /// Look up `[offset, offset + len)` in the cache and queue any missing blocks
-    /// as the current region. The previous region's blocks must already be
-    /// drained (staged) and completed — the tracker counts staged reads, so a
-    /// leftover would be double-counted.
-    fn read_region(&mut self, offset: usize, len: usize) {
-        debug_assert!(
-            self.pending_fs.is_empty() && self.pending_http.is_empty(),
-            "read_region over un-drained pending reads"
-        );
-        self.lookups = memory_ctx()
-            .compressed_cache()
-            .get(&self.open_file, offset, len);
-        self.remaining = 0;
-        for lookup in &self.lookups {
-            if let Some(block) = lookup.missing() {
-                match &self.open_file {
-                    OpenFile::Local(file) => self.pending_fs.push(FsRequest::Read(FsReadRequest {
-                        file: file.clone(),
-                        block: block.clone(),
-                    })),
-                    OpenFile::Remote(remote) => self.pending_http.push(HttpGetRequest {
-                        remote: remote.clone(),
-                        block: block.clone(),
-                    }),
-                }
-                self.remaining += 1;
-            }
         }
     }
 
-    /// The current region's bytes (concatenated), consuming the lookups.
-    fn region_bytes(&mut self) -> Vec<u8> {
-        let mut out = Vec::new();
-        for lookup in std::mem::take(&mut self.lookups) {
-            out.extend_from_slice(&lookup.into_data());
-        }
-        out
+    fn probe_range(&self) -> FileRange {
+        let probe = self.size.min(FOOTER_PROBE_BYTES);
+        FileRange::new(self.size - probe, probe)
     }
 
-    /// Parse the just-completed region. Returns the file's row groups, or `None`
-    /// if the footer overflowed the probe window and an exact re-read was issued
-    /// (its completion will call back here).
     fn parse_region(
         &mut self,
+        bytes: &[u8],
         declared_columns: &[Column],
-    ) -> Result<Option<Vec<RowGroupMetadata>>> {
-        let bytes = self.region_bytes();
-
-        let footer: &[u8] = if self.reading_exact {
-            // The exact read returned precisely the footer.
-            &bytes
+    ) -> Result<FooterProgress> {
+        let footer = if self.reading_exact {
+            bytes
         } else {
-            let footer_len = footer_len_from_tail(&bytes)?;
-            // A footer that can't fit within the file is corrupt — reject it
-            // before the offset math below can underflow.
+            let footer_len = footer_len_from_tail(bytes)?;
             if footer_len + 8 > self.size {
                 return Err(Error::InvalidFooter(format!(
                     "footer length {footer_len} exceeds file size {}",
@@ -296,20 +163,25 @@ impl FooterRead {
                 )));
             }
             if footer_len + 8 > bytes.len() {
-                // Footer overflowed the probe window — read it exactly, then wait.
-                let exact_offset = self.size - 8 - footer_len;
                 self.reading_exact = true;
-                self.read_region(exact_offset, footer_len);
-                return Ok(None);
+                return Ok(FooterProgress::ReadExact(FileRange::new(
+                    self.size - 8 - footer_len,
+                    footer_len,
+                )));
             }
             let start = bytes.len() - 8 - footer_len;
             &bytes[start..bytes.len() - 8]
         };
 
-        Ok(Some(row_groups_from_footer(
+        Ok(FooterProgress::Done(row_groups_from_footer(
             footer,
             self.open_file.clone(),
             declared_columns,
         )?))
     }
+}
+
+enum FooterProgress {
+    ReadExact(FileRange),
+    Done(Vec<RowGroupMetadata>),
 }
