@@ -2,7 +2,13 @@ use crate::Identifier;
 use crate::io::backend::IOBackend;
 use crate::io::cached_http::CachedHttpEngine;
 use crate::io::disk_cache::DiskCache;
-use crate::io::{Completion, DataFlowRequest, FailedRead, FsRequest, HttpRequest, RemoteSplit};
+use crate::io::{
+    Completion, DataFlowRequest, FailedRead, FsRequest, FsWriteRequest, HttpRequest,
+    HttpUploadRequest, OpenFile, PendingReadRequest, PendingWriteRequest, RemoteSplit,
+};
+use crate::request_tracker::{RegisteredRead, RequestRoute, RequestTracker, RoutedReadResponse};
+use crate::stats::StatsCollector;
+use crate::worker::WORKER_IDX;
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
@@ -19,13 +25,15 @@ pub enum Error {
     IO(#[from] std::io::Error),
     #[error("{0}")]
     Http(#[from] crate::io::http::Error),
+    #[error("the cache fill this read was following failed on another worker's I/O ring")]
+    PiggybackedReadFailed,
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Number of submission-queue entries in each worker's io_uring. The completion
-/// queue is twice this (the io_uring default), which bounds how many reads may be
-/// outstanding before completions overflow it - see callers that batch submissions.
+/// Number of submission-queue entries in each worker's io_uring. Logical
+/// registration submits through this requester immediately; the backend flushes
+/// each accepted operation to the kernel.
 pub const RING_SIZE: u32 = 64;
 
 /// Bridges dataflow operators and the I/O backend, holding state on outstanding
@@ -40,11 +48,19 @@ pub const RING_SIZE: u32 = 64;
 /// Held one per worker.
 pub struct IORequester {
     backend: IOBackend,
+    /// Resolves operators' logical file ranges and routes physical read
+    /// completions back to them. Registration submits returned operations
+    /// immediately, so the tracker itself owns no transport outbox.
+    tracker: RequestTracker,
     /// In-flight operator-owned local-file operations, keyed by backend id,
     /// each with the bytes already completed by earlier submissions (nonzero
     /// only for a write whose prior completion came up short and was
     /// resubmitted).
     pending_io_requests: HashMap<Identifier, (DataFlowRequest<FsRequest>, usize)>,
+    /// Logical reads following extents currently being filled by another
+    /// worker. They need no transport request of their own; the worker polls
+    /// their shared extent state once per loop.
+    piggybacked_reads: Vec<RegisteredRead>,
     /// Allocates backend disk-op ids - shared by fs reads here and the engine's
     /// cache-file reads/write-backs, so a completion routes by which map holds it.
     next_id: Identifier,
@@ -64,7 +80,9 @@ impl IORequester {
     pub fn new(disk_cache: Option<Arc<DiskCache>>) -> Self {
         Self {
             backend: IOBackend::new(RING_SIZE).expect("Unable to create backend"),
+            tracker: RequestTracker::default(),
             pending_io_requests: Default::default(),
+            piggybacked_reads: Vec::new(),
             next_id: 0,
             http: CachedHttpEngine::with_default_config(disk_cache)
                 .expect("Unable to create http engine"),
@@ -79,7 +97,9 @@ impl IORequester {
     ) -> Self {
         Self {
             backend: IOBackend::new(RING_SIZE).expect("Unable to create backend"),
+            tracker: RequestTracker::default(),
             pending_io_requests: Default::default(),
+            piggybacked_reads: Vec::new(),
             next_id: 0,
             http: CachedHttpEngine::new(http_config, disk_cache)
                 .expect("Unable to create http engine"),
@@ -91,9 +111,126 @@ impl IORequester {
         Self::with_config(http_config, None)
     }
 
+    /// Resolve one logical read through the memory caches and immediately submit
+    /// every physical cache fill it still needs.
+    pub fn request_read(
+        &mut self,
+        data_flow_id: Identifier,
+        operator_idx: Identifier,
+        request: PendingReadRequest,
+        stats: &mut StatsCollector,
+    ) -> Result<()> {
+        let route = RequestRoute {
+            data_flow_id,
+            operator_idx,
+        };
+        let mut fs_requests = Vec::new();
+        let mut http_requests = Vec::new();
+        for request in self.tracker.register_read(route, request) {
+            if !request.missing_extent().fill_owner() {
+                request.missing_extent().subscribe(WORKER_IDX.get());
+                self.piggybacked_reads.push(request);
+                continue;
+            }
+            match request {
+                RegisteredRead::Fs(request) => fs_requests.push(request),
+                RegisteredRead::Http(request) => http_requests.push(request),
+            }
+        }
+
+        stats.record_issued_disk(&mut fs_requests);
+        for request in fs_requests {
+            let tracked_read_id = request.tracked_read_id;
+            let failed_extent = match &request.request {
+                FsRequest::Read(read) => {
+                    Some((OpenFile::Local(read.file.clone()), read.block.clone()))
+                }
+                FsRequest::Write(_) => None,
+            };
+            if let Err(error) = self.submit_fs_request_to_backend(request) {
+                if let Some((open_file, block)) = failed_extent {
+                    block.remove_from_cache(&open_file);
+                }
+                if let Some(id) = tracked_read_id {
+                    let _ = self.tracker.fail(id);
+                }
+                return Err(error);
+            }
+        }
+
+        stats.stamp_issued(&mut http_requests);
+        for request in http_requests {
+            let tracked_read_id = request.tracked_read_id;
+            let failed_extent = match &request.request {
+                HttpRequest::Get(read) => {
+                    Some((OpenFile::Remote(read.remote.clone()), read.block.clone()))
+                }
+                HttpRequest::Upload(_) => None,
+            };
+            match self.submit_http_request_to_backend(request) {
+                Ok(split) => stats.record_issued_remote(split),
+                Err(error) => {
+                    if let Some((open_file, block)) = failed_extent {
+                        block.remove_from_cache(&open_file);
+                    }
+                    if let Some(id) = tracked_read_id {
+                        let _ = self.tracker.fail(id);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Select the transport for one logical write and submit it immediately.
+    pub fn request_write(
+        &mut self,
+        data_flow_id: Identifier,
+        operator_idx: Identifier,
+        request: PendingWriteRequest,
+        stats: &mut StatsCollector,
+    ) -> Result<()> {
+        let PendingWriteRequest { open_file, data } = request;
+        match open_file {
+            OpenFile::Local(file) => {
+                let mut request = DataFlowRequest::new(
+                    data_flow_id,
+                    operator_idx,
+                    FsRequest::Write(FsWriteRequest { file, data }),
+                );
+                stats.record_issued_disk(std::slice::from_mut(&mut request));
+                self.submit_fs_request_to_backend(request)
+            }
+            OpenFile::Remote(remote) => {
+                let mut request = DataFlowRequest::new(
+                    data_flow_id,
+                    operator_idx,
+                    HttpRequest::Upload(HttpUploadRequest { remote, data }),
+                );
+                stats.stamp_issued(std::slice::from_mut(&mut request));
+                let split = self.submit_http_request_to_backend(request)?;
+                stats.record_issued_remote(split);
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn take_ready_reads(&mut self) -> Vec<RoutedReadResponse> {
+        self.tracker.take_ready()
+    }
+
+    /// Discard logical read state for a dataflow that is no longer running.
+    pub fn cancel_dataflow(&mut self, data_flow_id: Identifier) {
+        self.tracker.cancel_dataflow(data_flow_id);
+        self.piggybacked_reads
+            .retain(|request| request.data_flow_id() != data_flow_id);
+    }
+
     /// Submit an operator-owned filesystem operation through the worker's
     /// shared I/O backend. Request-owned storage remains alive until completion.
-    pub fn request(&mut self, request: DataFlowRequest<FsRequest>) -> Result<()> {
+    fn submit_fs_request_to_backend(&mut self, request: DataFlowRequest<FsRequest>) -> Result<()> {
         match &request.request {
             FsRequest::Read(read) => self.backend.submit_read(
                 read.file.as_raw_fd(),
@@ -126,11 +263,15 @@ impl IORequester {
     /// Submit a read for a remote region, served from the on-disk cache where
     /// possible (only the missing ranges hit the network). Delegates to the
     /// [`CachedHttpEngine`], lending it the shared backend and disk-id counter.
-    pub fn request_http(&mut self, request: DataFlowRequest<HttpRequest>) -> Result<RemoteSplit> {
+    fn submit_http_request_to_backend(
+        &mut self,
+        request: DataFlowRequest<HttpRequest>,
+    ) -> Result<RemoteSplit> {
         let DataFlowRequest {
             data_flow_id,
             operator_idx,
             request,
+            tracked_read_id,
             submitted_at,
         } = request;
         match request {
@@ -141,6 +282,7 @@ impl IORequester {
                     data_flow_id,
                     operator_idx,
                     request,
+                    tracked_read_id,
                     submitted_at,
                 },
             ),
@@ -152,6 +294,7 @@ impl IORequester {
                         data_flow_id,
                         operator_idx,
                         request,
+                        tracked_read_id,
                         submitted_at,
                     },
                 )?;
@@ -164,9 +307,15 @@ impl IORequester {
         }
     }
 
-    /// Returns `true` if any disk or HTTP operation has not yet completed.
+    /// Returns `true` if any physical operation or piggybacked read is unresolved.
     pub fn has_pending(&self) -> bool {
-        self.has_file_pending() || self.has_http_pending()
+        self.has_file_pending() || self.has_http_pending() || !self.piggybacked_reads.is_empty()
+    }
+
+    /// The handle a waker uses to interrupt this requester's blocking
+    /// [`wait`](Self::wait) from another thread.
+    pub fn wake_handle(&self) -> crate::io::RingWakeHandle {
+        self.backend.wake_handle()
     }
 
     /// Returns `true` if any disk read is in flight - operator reads here, plus
@@ -184,6 +333,43 @@ impl IORequester {
     /// worker uses to decide whether to submit more.
     pub fn http_in_flight(&self) -> usize {
         self.http.network_in_flight()
+    }
+
+    /// Resolve reads following another worker's cache fill. Successful fills
+    /// only advance the logical tracker; failures must also be surfaced to the
+    /// worker so it can cancel the affected dataflow.
+    fn resolve_piggybacked(
+        &mut self,
+        out: &mut Vec<std::result::Result<Completion, FailedRead>>,
+    ) {
+        let mut index = 0;
+        while index < self.piggybacked_reads.len() {
+            let request = &self.piggybacked_reads[index];
+            if request.missing_extent().failed() {
+                let request = self.piggybacked_reads.swap_remove(index);
+                let tracked_read_id = request.tracked_read_id();
+                let (data_flow_id, operator_idx) = match &request {
+                    RegisteredRead::Fs(request) => (request.data_flow_id, request.operator_idx),
+                    RegisteredRead::Http(request) => (request.data_flow_id, request.operator_idx),
+                };
+                if self.tracker.fail(tracked_read_id).is_some() {
+                    out.push(Err(FailedRead {
+                        data_flow_id,
+                        operator_idx,
+                        // Logical routing was resolved above, so the failure
+                        // carries no tracked read.
+                        tracked_read_id: None,
+                        error: Error::PiggybackedReadFailed,
+                    }));
+                }
+            } else if request.missing_extent().is_committed() {
+                let request = self.piggybacked_reads.swap_remove(index);
+                let tracked_read_id = request.tracked_read_id();
+                self.tracker.complete(tracked_read_id);
+            } else {
+                index += 1;
+            }
+        }
     }
 
     /// Drain finished reads, one per-read result each. The outer `Result` is for
@@ -263,9 +449,16 @@ impl IORequester {
                     _ => None,
                 };
                 if let Some(error) = failure {
+                    if let FsRequest::Read(read) = &request.request {
+                        read.block
+                            .remove_from_cache(&OpenFile::Local(read.file.clone()));
+                    }
+                    let data_flow_id = request.data_flow_id;
+                    let operator_idx = request.operator_idx;
                     out.push(Err(FailedRead {
-                        data_flow_id: request.data_flow_id,
-                        operator_idx: request.operator_idx,
+                        data_flow_id,
+                        operator_idx,
+                        tracked_read_id: request.tracked_read_id,
                         error: error.into(),
                     }));
                 } else {
@@ -273,6 +466,7 @@ impl IORequester {
                         data_flow_id,
                         operator_idx,
                         request: fs_request,
+                        tracked_read_id,
                         submitted_at,
                     } = request;
                     let completion = match fs_request {
@@ -282,6 +476,7 @@ impl IORequester {
                                 data_flow_id,
                                 operator_idx,
                                 request: read,
+                                tracked_read_id,
                                 submitted_at,
                             })
                         }
@@ -289,6 +484,7 @@ impl IORequester {
                             data_flow_id,
                             operator_idx,
                             request: write,
+                            tracked_read_id,
                             submitted_at,
                         }),
                     };
@@ -303,6 +499,33 @@ impl IORequester {
         // HTTP reads the engine finished this pass (and any write-backs they queue).
         self.http
             .drain(&mut self.backend, &mut self.next_id, &mut out)?;
+
+        // Physical transport is complete. Resolve the requester's private
+        // logical routing before the worker sees completions or failures.
+        for completion in &out {
+            match completion {
+                Ok(Completion::FsRead(request)) => {
+                    request.request.block.wake_subscribers();
+                    if let Some(id) = request.tracked_read_id {
+                        self.tracker.complete(id);
+                    }
+                }
+                Ok(Completion::HttpGet(request, _)) => {
+                    request.request.block.wake_subscribers();
+                    if let Some(id) = request.tracked_read_id {
+                        self.tracker.complete(id);
+                    }
+                }
+                Ok(Completion::FsWrite(_) | Completion::HttpUpload(_)) => {}
+                Err(failed) => {
+                    if let Some(id) = failed.tracked_read_id {
+                        let _ = self.tracker.fail(id);
+                    }
+                }
+            }
+        }
+
+        self.resolve_piggybacked(&mut out);
 
         Ok(out)
     }
@@ -358,10 +581,14 @@ mod tests {
     //! issuing a second read for a different region of the same object.
 
     use super::*;
-    use crate::io::{HttpGetRequest, HttpUploadRequest, OpenFile, RemoteFile};
+    use crate::io::{
+        FileRange, HttpGetRequest, HttpUploadRequest, OpenFile, PendingReadRequest, ReadRequestId,
+        RemoteFile,
+    };
     use crate::memory::{init_test_free_pool, memory_ctx};
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use url::Url;
@@ -426,6 +653,107 @@ mod tests {
         .with_custom_certificate_verifier(Arc::new(NoVerify))
         .with_no_client_auth();
         Arc::new(config)
+    }
+
+    fn pending_local_read(open_file: OpenFile) -> PendingReadRequest {
+        PendingReadRequest {
+            id: ReadRequestId(0),
+            open_file,
+            locations: vec![FileRange::new(0, 4096)],
+        }
+    }
+
+    fn disabled_stats() -> StatsCollector {
+        let (tx, _rx) = mpsc::channel();
+        StatsCollector::new(tx, false)
+    }
+
+    #[test]
+    fn a_read_piggybacks_on_an_existing_fill() {
+        init_test_free_pool(4);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        std::fs::write(&path, vec![7; 4096]).unwrap();
+        let open_file = OpenFile::Local(Arc::new(std::fs::File::open(path).unwrap()));
+        memory_ctx()
+            .compressed_cache()
+            .open_entry(open_file.clone());
+        let mut owner = IORequester::default();
+        let mut follower = IORequester::default();
+
+        owner
+            .request_read(
+                1,
+                2,
+                pending_local_read(open_file.clone()),
+                &mut disabled_stats(),
+            )
+            .unwrap();
+        follower
+            .request_read(3, 4, pending_local_read(open_file), &mut disabled_stats())
+            .unwrap();
+        let owner_has_physical_read = owner.has_file_pending();
+        let follower_has_physical_read = follower.has_file_pending();
+        owner.wait().unwrap();
+        let owner_completions = owner.completions().unwrap();
+        let follower_completions = follower.completions().unwrap();
+        let response = follower.take_ready_reads().pop().unwrap().response;
+
+        assert!(owner_has_physical_read);
+        assert!(!follower_has_physical_read);
+        assert_eq!(owner_completions.len(), 1);
+        assert!(follower_completions.is_empty());
+        assert_eq!(response.into_bytes(), vec![7; 4096]);
+    }
+
+    #[test]
+    fn a_failed_fill_fails_its_follower() {
+        init_test_free_pool(4);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        std::fs::write(&path, vec![0; 4096]).unwrap();
+        let write_only = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        let open_file = OpenFile::Local(Arc::new(write_only));
+        memory_ctx()
+            .compressed_cache()
+            .open_entry(open_file.clone());
+        let mut owner = IORequester::default();
+        let mut follower = IORequester::default();
+        let mut retry = IORequester::default();
+
+        owner
+            .request_read(
+                1,
+                2,
+                pending_local_read(open_file.clone()),
+                &mut disabled_stats(),
+            )
+            .unwrap();
+        follower
+            .request_read(
+                3,
+                4,
+                pending_local_read(open_file.clone()),
+                &mut disabled_stats(),
+            )
+            .unwrap();
+        owner.wait().unwrap();
+        let owner_failure = owner.completions().unwrap().pop().unwrap();
+        let follower_failure = follower.completions().unwrap().pop().unwrap();
+        let follower_failed_from_owner = matches!(
+            follower_failure,
+            Err(FailedRead {
+                error: Error::PiggybackedReadFailed,
+                ..
+            })
+        );
+        retry
+            .request_read(5, 6, pending_local_read(open_file), &mut disabled_stats())
+            .unwrap();
+
+        assert!(owner_failure.is_err());
+        assert!(follower_failed_from_owner);
+        assert!(retry.has_file_pending());
     }
 
     /// A self-signed TLS server config for the loopback test server.
@@ -520,7 +848,7 @@ mod tests {
             }),
         );
         upload.submitted_at = Some(submitted_at);
-        let split = requester.request_http(upload).unwrap();
+        let split = requester.submit_http_request_to_backend(upload).unwrap();
         assert_eq!(
             split,
             RemoteSplit {
@@ -712,7 +1040,7 @@ mod tests {
                     block: block.clone(),
                 });
                 let piece = requester
-                    .request_http(DataFlowRequest::new(0, 0, req))
+                    .submit_http_request_to_backend(DataFlowRequest::new(0, 0, req))
                     .unwrap();
                 split.disk_cache_requests += piece.disk_cache_requests;
                 split.disk_cache_bytes += piece.disk_cache_bytes;
@@ -832,7 +1160,7 @@ mod tests {
                     block: block.clone(),
                 });
                 requester
-                    .request_http(DataFlowRequest::new(0, 0, req))
+                    .submit_http_request_to_backend(DataFlowRequest::new(0, 0, req))
                     .unwrap();
                 submitted += 1;
             }

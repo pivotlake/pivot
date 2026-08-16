@@ -84,6 +84,7 @@ impl Unary<RecordBatch, SortedPartitionRun> for PartitionSorter {
         &mut self,
         batch: RecordBatch,
         sender: &mut dyn Sender<SortedPartitionRun>,
+        _io: &mut dispatch::OperatorIO,
     ) -> UnaryResult<()> {
         if batch.num_rows() == 0 {
             return Ok(());
@@ -257,7 +258,11 @@ mod tests {
         let mut sender = CollectSender::new();
 
         partition_sorter
-            .consume(two_column_batch(&[2, 1, 2, 1], &[9, 5, 3, 8]), &mut sender)
+            .consume(
+                two_column_batch(&[2, 1, 2, 1], &[9, 5, 3, 8]),
+                &mut sender,
+                &mut dispatch::TestOperatorIO::default().io(),
+            )
             .unwrap();
 
         let mut partition_runs: Vec<(Vec<i64>, usize)> = sender
@@ -283,7 +288,11 @@ mod tests {
         let batch = two_column_batch(&[1, 1], &[1, 2]);
 
         partition_sorter
-            .consume(batch.clone(), &mut sender)
+            .consume(
+                batch.clone(),
+                &mut sender,
+                &mut dispatch::TestOperatorIO::default().io(),
+            )
             .unwrap();
 
         assert_eq!(sender.items.len(), 1);
@@ -324,7 +333,13 @@ mod tests {
         .build_unary();
         let mut sender = CollectSender::new();
 
-        partition_sorter.consume(batch, &mut sender).unwrap();
+        partition_sorter
+            .consume(
+                batch,
+                &mut sender,
+                &mut dispatch::TestOperatorIO::default().io(),
+            )
+            .unwrap();
 
         let output_strings = sender.items[0].batches[0].column(1).to_data();
         let input_strings = input_strings.to_data();

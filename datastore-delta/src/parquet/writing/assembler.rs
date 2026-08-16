@@ -83,6 +83,7 @@ impl Unary<EncodedColumnChunk, AssembledFile> for FileAssembler {
         &mut self,
         chunk: EncodedColumnChunk,
         sender: &mut dyn Sender<AssembledFile>,
+        _io: &mut dispatch::OperatorIO,
     ) -> UnaryResult<()> {
         // A row group is ready once one encoded chunk has arrived for every
         // top-level schema column.

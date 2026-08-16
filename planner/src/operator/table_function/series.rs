@@ -190,7 +190,11 @@ impl SeriesSource {
 }
 
 impl Nullary<RecordBatch> for SeriesSource {
-    fn run(&mut self, sender: &mut dyn Sender<RecordBatch>) -> NullaryResult<WorkStatus> {
+    fn run(
+        &mut self,
+        sender: &mut dyn Sender<RecordBatch>,
+        _io: &mut dispatch::OperatorIO,
+    ) -> NullaryResult<WorkStatus> {
         if self.done {
             return Ok(WorkStatus::Pending);
         }

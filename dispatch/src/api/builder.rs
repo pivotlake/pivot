@@ -244,7 +244,7 @@ impl DataFlowBuilder {
 mod tests {
     use super::*;
     use crate::data_flow::WorkStatus;
-    use crate::io::{FsReadRequest, FsRequest, FsWriteRequest, HttpGetRequest, HttpUploadRequest};
+    use crate::io::{FsWriteRequest, HttpUploadRequest, OperatorIO};
     use crate::operations::{FinishStatus, Result};
 
     /// Stand-in for a real operator: these tests only assert on the shape of the
@@ -252,19 +252,10 @@ mod tests {
     struct InertOperator;
 
     impl Operator for InertOperator {
-        fn run_cpu_work(&mut self) -> Result<WorkStatus> {
+        fn run_cpu_work(&mut self, _io: &mut OperatorIO) -> Result<WorkStatus> {
             Ok(WorkStatus::Pending)
         }
-        fn next_fs_requests(&mut self) -> Result<Vec<FsRequest>> {
-            Ok(vec![])
-        }
-        fn process_fs_read_response(&mut self, _request: FsReadRequest) -> Result<()> {
-            Ok(())
-        }
         fn process_fs_write_response(&mut self, _request: FsWriteRequest) -> Result<()> {
-            Ok(())
-        }
-        fn process_http_get_response(&mut self, _request: HttpGetRequest) -> Result<()> {
             Ok(())
         }
         fn process_http_upload_response(&mut self, _request: HttpUploadRequest) -> Result<()> {

@@ -79,6 +79,7 @@ mod numa;
 mod operations;
 #[cfg(feature = "perf")]
 mod profiler;
+mod request_tracker;
 mod scan;
 mod stats;
 
@@ -88,7 +89,9 @@ pub use api::*;
 pub use data_flow::{Error as DataFlowError, WorkStatus};
 pub use functions::*;
 pub use gather_barrier::GatherBarrier;
-pub use io::{FsRequest, HttpRequest};
+pub use io::{
+    FileRange, FsRequest, HttpRequest, OperatorIO, ReadData, ReadRequestId, ReadResponse,
+};
 pub use memory::BUFFER_SIZE;
 pub use memory::ReadBuffer;
 pub use memory::{MemoryBlockState, MemoryBlockStatus, block_size_bytes};
@@ -106,6 +109,8 @@ pub use scan::{
     Projection, ROW_GROUP_IDX_FIELD, ROW_IDX_FIELD, VariantExtract, trailing_metadata_columns,
 };
 pub use stats::DataFlowStats;
+#[cfg(feature = "test-util")]
+pub use stats::StatsCollector;
 
 pub use operations::channels::{
     ChannelFactory, FanInChannelFactory, MpscReceiver, NodeIdOutput, NodeWorkQueueChannelFactory,

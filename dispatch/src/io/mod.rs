@@ -39,7 +39,14 @@ use std::time::Duration;
 use url::Url;
 
 mod requester;
+pub use backend::RingWakeHandle;
 pub use requester::{Error as IORequesterError, IORequester, RING_SIZE};
+
+mod operator;
+pub use operator::{
+    FileRange, OperatorIO, PendingReadRequest, PendingWriteRequest, ReadData, ReadRequestId,
+    ReadResponse,
+};
 
 mod cached_http;
 
@@ -435,6 +442,9 @@ pub struct DataFlowRequest<R> {
     pub data_flow_id: Identifier,
     pub operator_idx: Identifier,
     pub request: R,
+    /// Identity assigned by the requester's logical-read tracker. Writes,
+    /// uploads, and callers using the transport API directly leave this unset.
+    pub(crate) tracked_read_id: Option<Identifier>,
     /// When the issuing dataflow handed this operation off, stamped only when
     /// the query opted into stats. `None` (no clock read) otherwise.
     pub submitted_at: Option<std::time::Instant>,
@@ -446,8 +456,14 @@ impl<R> DataFlowRequest<R> {
             data_flow_id,
             operator_idx,
             request,
+            tracked_read_id: None,
             submitted_at: None,
         }
+    }
+
+    pub(crate) fn with_tracked_read_id(mut self, id: Identifier) -> Self {
+        self.tracked_read_id = Some(id);
+        self
     }
 
     /// Transform the request payload while preserving its routing and timing.
@@ -456,6 +472,7 @@ impl<R> DataFlowRequest<R> {
             data_flow_id: self.data_flow_id,
             operator_idx: self.operator_idx,
             request: f(self.request),
+            tracked_read_id: self.tracked_read_id,
             submitted_at: self.submitted_at,
         }
     }
@@ -504,6 +521,7 @@ pub enum Completion {
 pub struct FailedRead {
     pub data_flow_id: Identifier,
     pub operator_idx: Identifier,
+    pub(crate) tracked_read_id: Option<Identifier>,
     pub error: IORequesterError,
 }
 
