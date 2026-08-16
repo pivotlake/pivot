@@ -33,7 +33,7 @@ use crate::catalog::{
 use crate::types::{Type, physical_arrow_type};
 use crate::{DEFAULT_DATASTORE_NAME, Planner};
 use dispatch::{
-    DataFlowDispatcher, Dispatch, Nullary, NullaryFactory, NullaryResult, Projection,
+    DataFlowDispatcher, Dispatch, Nullary, NullaryFactory, NullaryResult, OperatorIO, Projection,
     RecordBatchOperatorSpec, Sender, WorkStatus,
 };
 
@@ -56,7 +56,11 @@ struct Replay {
 }
 
 impl Nullary<RecordBatch> for Replay {
-    fn run(&mut self, sender: &mut dyn Sender<RecordBatch>) -> NullaryResult<WorkStatus> {
+    fn run(
+        &mut self,
+        sender: &mut dyn Sender<RecordBatch>,
+        _io: &mut OperatorIO,
+    ) -> NullaryResult<WorkStatus> {
         match self.batch.take() {
             Some(batch) => {
                 sender.send(batch)?;
