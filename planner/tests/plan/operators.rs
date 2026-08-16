@@ -322,6 +322,71 @@ fn insert_select_keeps_distinct_target_and_scan_bindings(mut testing_planner: Te
 }
 
 #[rstest]
+fn insert_with_a_column_list_widens_its_values_to_the_whole_table(
+    mut testing_planner: TestingPlanner,
+) {
+    let plan = testing_planner
+        .plan("INSERT INTO example_table (name, a) VALUES ('eve', 6)")
+        .unwrap();
+    assert_snapshot!(plan.to_string(), @"
+    Insert
+      Projection(a:Int32, NULL:Int32, NULL:Int32, name:Utf8)
+        Projection(name:Utf8, a:Int32)
+          Values(rows: 1)
+            DummyScan
+    ");
+}
+
+#[rstest]
+fn insert_select_with_a_column_list_widens_the_select(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .plan("INSERT INTO example_table (c, b) SELECT c, b FROM example_table")
+        .unwrap();
+    assert_snapshot!(plan.to_string(), @"
+    Insert
+      Projection(NULL:Int32, b:Int32, c:Int32, NULL:Utf8View)
+        Projection(c:Int32, b:Int32)
+          Input([c:Int32, b:Int32])
+    ");
+}
+
+#[rstest]
+fn insert_by_name_matches_the_select_output_names(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .plan("INSERT INTO example_table BY NAME SELECT name, a FROM example_table")
+        .unwrap();
+    assert_snapshot!(plan.to_string(), @"
+    Insert
+      Projection(a:Int32, NULL:Int32, NULL:Int32, name:Utf8)
+        Projection(name:Utf8, a:Int32)
+          Input([name:Utf8, a:Int32])
+    ");
+}
+
+#[rstest]
+fn insert_default_values_is_rejected(mut testing_planner: TestingPlanner) {
+    let error = testing_planner
+        .plan("INSERT INTO example_table DEFAULT VALUES")
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("DEFAULT VALUES is not supported"),
+        "{error}"
+    );
+}
+
+#[rstest]
+fn insert_naming_an_unknown_column_is_rejected(mut testing_planner: TestingPlanner) {
+    let error = testing_planner
+        .plan("INSERT INTO example_table (nope) VALUES (1)")
+        .unwrap_err();
+
+    assert!(error.to_string().contains("nope"), "{error}");
+}
+
+#[rstest]
 fn combined_filter_order_limit(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
         .plan("SELECT a FROM example_table WHERE a <> b ORDER BY a DESC LIMIT 2")

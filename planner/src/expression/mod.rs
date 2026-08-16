@@ -103,7 +103,10 @@ pub enum Error {
 /// display. Falls back to `?:DataType` for unsupported arrow types.
 fn format_constant(s: &Scalar<ArrayRef>) -> String {
     let (arr, _is_scalar) = s.get();
-    let formatter = ArrayFormatter::try_new(arr, &FormatOptions::default());
+    // Arrow renders a null as the empty string by default, which reads as a
+    // missing value rather than a NULL one.
+    let options = FormatOptions::default().with_null("NULL");
+    let formatter = ArrayFormatter::try_new(arr, &options);
     let value = match formatter {
         Ok(f) => f.value(0).to_string(),
         Err(_) => "?".to_string(),
