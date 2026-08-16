@@ -227,6 +227,136 @@ async fn drop_table_cascade_is_rejected(#[future] conn: Conn) {
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
+async fn system_tables_refreshes_after_catalog_changes(#[future] conn: Conn) {
+    let sql = "SELECT datastore_name, schema_name, table_name \
+               FROM system.tables \
+               WHERE table_name = 'system_catalog_refresh'";
+
+    assert!(select_rows(&conn, sql).await.is_empty());
+
+    conn.simple_query("CREATE TABLE system_catalog_refresh (id BIGINT)")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        select_rows(&conn, sql).await,
+        vec![vec![
+            Some("default".into()),
+            Some("main".into()),
+            Some("system_catalog_refresh".into()),
+        ]],
+    );
+}
+
+/// `system` is a datastore, not a schema every datastore carries: its tables
+/// answer to their own qualified name and to no other datastore's.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn system_tables_belong_to_the_system_datastore(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE system_qualified (id BIGINT)")
+        .await
+        .unwrap();
+
+    let rows = select_rows(
+        &conn,
+        "SELECT table_name FROM system.main.tables WHERE table_name = 'system_qualified'",
+    )
+    .await;
+    assert_eq!(rows, vec![vec![Some("system_qualified".into())]]);
+
+    // `default` is a keyword, so the datastore it names has to be quoted.
+    let shadowed = conn
+        .simple_query("SELECT * FROM \"default\".system.tables")
+        .await
+        .unwrap_err();
+    let shadowed_message = extract_db_error_message(&shadowed).to_lowercase();
+    assert!(
+        shadowed_message.contains("system") && shadowed_message.contains("does not exist"),
+        "a datastore must not carry a `system` schema of its own: {shadowed_message}",
+    );
+}
+
+/// `system.table_files` reports the files a table holds, keyed by the same id
+/// `system.tables` gives that table, so the two join.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn system_table_files_lists_the_files_of_a_table(#[future] conn: Conn) {
+    let sql = "SELECT f.size_bytes \
+               FROM system.table_files f JOIN system.tables t ON f.table_id = t.id \
+               WHERE t.table_name = 'system_files'";
+    conn.simple_query("CREATE TABLE system_files (id BIGINT)")
+        .await
+        .unwrap();
+    assert!(select_rows(&conn, sql).await.is_empty());
+
+    conn.simple_query("INSERT INTO system_files VALUES (1), (2)")
+        .await
+        .unwrap();
+
+    let sizes: Vec<i64> = select_rows(&conn, sql)
+        .await
+        .into_iter()
+        .map(|row| row[0].as_ref().unwrap().parse().unwrap())
+        .collect();
+    assert!(
+        !sizes.is_empty() && sizes.iter().all(|&size| size > 0),
+        "expected the inserted file to be listed with its size, got: {sizes:?}",
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn system_datastore_is_read_only(#[future] conn: Conn) {
+    let create_table = conn
+        .simple_query("CREATE TABLE system.not_allowed (id BIGINT)")
+        .await
+        .unwrap_err();
+    let create_table_message = extract_db_error_message(&create_table).to_lowercase();
+    assert!(
+        create_table_message.contains("system") && create_table_message.contains("read-only"),
+        "expected a read-only system datastore error, got: {create_table_message}",
+    );
+
+    let insert = conn
+        .simple_query(
+            "INSERT INTO system.tables \
+             VALUES ('default', 'main', 'not_allowed', 'not-an-id')",
+        )
+        .await
+        .unwrap_err();
+    let insert_message = extract_db_error_message(&insert).to_lowercase();
+    assert!(
+        insert_message.contains("does not support insert"),
+        "expected a read-only virtual table error, got: {insert_message}",
+    );
+
+    let bare_tables = conn.simple_query("SELECT * FROM tables").await.unwrap_err();
+    let bare_tables_message = extract_db_error_message(&bare_tables).to_lowercase();
+    assert!(
+        bare_tables_message.contains("tables") && bare_tables_message.contains("not exist"),
+        "bare `tables` must not fall back to `system.tables`: {bare_tables_message}",
+    );
+
+    // `system` names Pivot's own datastore, which serves one schema, so this
+    // reaches neither a DuckDB-internal catalog nor a second Pivot schema.
+    let duckdb_system = conn
+        .simple_query("SELECT * FROM system.information_schema.tables")
+        .await
+        .unwrap_err();
+    let duckdb_system_message = extract_db_error_message(&duckdb_system).to_lowercase();
+    assert!(
+        duckdb_system_message.contains("information_schema")
+            && duckdb_system_message.contains("does not exist"),
+        "the system datastore must serve no other schema, got: {duckdb_system_message}",
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
 async fn insert_returns_affected_row_count(#[future] conn: Conn) {
     let dir = write_parquet(&people_batch());
     create_people_table(&conn, "people_insert", dir.path()).await;

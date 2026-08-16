@@ -151,17 +151,15 @@ TableFunction PivotTableCatalogEntry::GetScanFunction(ClientContext &context, un
 	// only the referenced leaves. Gated by the optimizer on `func.statistics`
 	// being unset, which it is.
 	func.supports_pushdown_extract = PivotScanSupportsPushdownExtract;
-	// Advertise row-id / late-materialization support so DuckDB's
-	// `late_materialization` optimizer fires for `SELECT <wide> ... ORDER BY ...
-	// LIMIT n` queries over this table: it rewrites them into a SEMI join on the
-	// row-id whose narrow side scans only the predicate/sort columns. The bridge
-	// recognizes that join and collapses it onto pivot's own materializer. We
-	// only PLAN with DuckDB (never execute its scan), so the row-id is purely a
-	// plan-time marker; the default `rowid` virtual column from TableCatalogEntry
-	// is enough.
-	func.late_materialization = true;
-	func.get_virtual_columns = PivotScanGetVirtualColumns;
-	func.get_row_id_columns = PivotScanGetRowIdColumns;
+	// A capable table lets DuckDB rewrite a wide Top-N into a narrow row-id
+	// scan whose survivors Pivot materializes. The row-id is a plan-time marker;
+	// the default virtual column from TableCatalogEntry is sufficient. Tables
+	// without a materialization implementation must not advertise these hooks.
+	if (table_supports_late_materialization(*table)) {
+		func.late_materialization = true;
+		func.get_virtual_columns = PivotScanGetVirtualColumns;
+		func.get_row_id_columns = PivotScanGetRowIdColumns;
+	}
 	func.cardinality = PivotScanCardinality;
 	return func;
 }

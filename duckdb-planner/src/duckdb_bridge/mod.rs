@@ -12,6 +12,7 @@ use crate::catalog_provider::{
     CatalogContext, OptionalTableWrapper, TransactionContext, catalog_context_default,
     catalog_context_names, catalog_does_schema_exist, catalog_get_scalar_function,
     catalog_get_table, catalog_get_table_function, pushdown_filter, table_estimate_row_count,
+    table_supports_late_materialization,
 };
 
 /// CXX bridge to the hand-written C++ glue in `bridge.cpp` / `bridge.h`.
@@ -152,6 +153,7 @@ pub mod ffi {
         ) -> CatalogGetScalarFunctionResult;
         fn pushdown_filter(table: &mut OptionalTableWrapper, expr: &Expression) -> Result<bool>;
         fn table_estimate_row_count(table: &OptionalTableWrapper) -> CardinalityEstimate;
+        fn table_supports_late_materialization(table: &OptionalTableWrapper) -> bool;
     }
 
     unsafe extern "C++" {

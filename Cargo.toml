@@ -6,6 +6,7 @@ members = [
     "shell",
     "datastore",
     "datastore-delta",
+    "datastore-system",
     "dispatch",
     "duckdb-planner",
     "engine",
@@ -29,6 +30,7 @@ catalog = { path = "catalog" }
 engine = { path = "engine" }
 datastore = { path = "datastore" }
 datastore-delta = { path = "datastore-delta" }
+datastore-system = { path = "datastore-system" }
 dispatch = { path = "dispatch" }
 duckdb-planner = { path = "duckdb-planner" }
 metastore = { path = "metastore" }

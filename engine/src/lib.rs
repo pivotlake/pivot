@@ -540,16 +540,10 @@ fn with_planner<R>(
     PLANNER.with_borrow_mut(|slot| {
         let planner = match slot {
             Some(planner) => planner,
-            None => {
-                let datastore_names = catalog
-                    .iter_datastores()
-                    .map(|(name, _)| name.clone())
-                    .collect();
-                slot.insert(planner::Planner::from_datastore_names(
-                    datastore_names,
-                    catalog.default_datastore_name().to_string(),
-                )?)
-            }
+            None => slot.insert(planner::Planner::from_datastore_names(
+                catalog.datastore_names(),
+                catalog.default_datastore_name().to_string(),
+            )?),
         };
         Ok(function(planner))
     })

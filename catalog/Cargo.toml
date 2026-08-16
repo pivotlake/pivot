@@ -15,6 +15,8 @@ metastore = { workspace = true }
 crossbeam-deque = { workspace = true }
 dispatch = { workspace = true }
 datastore-delta = { workspace = true }
+# The `system` datastore the composite serves alongside the configured ones.
+datastore-system = { workspace = true }
 thiserror = { workspace = true }
 # `Catalog::commit_transaction` is async: the composite awaits each touched
 # datastore's own commit (each datastore self-offloads its blocking I/O).

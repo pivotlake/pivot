@@ -1,0 +1,16 @@
+[package]
+name = "datastore-system"
+version.workspace = true
+edition.workspace = true
+description = "The `system` datastore: read-only relations describing the server's own catalog, assembled per query from the datastores it is composed with."
+
+[dependencies]
+planner = { workspace = true }
+datastore = { workspace = true }
+dispatch = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+thiserror = { workspace = true }
+# `DatastoreTransaction::commit` is async, so implementing the trait needs it
+# even though a read-only commit is a no-op.
+async-trait = "0.1"

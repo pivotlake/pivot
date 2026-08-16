@@ -35,6 +35,12 @@ pub trait DuckDBTable: Any {
     /// the one resolved table out.
     fn clone_box(&self) -> Box<dyn DuckDBTable>;
 
+    /// Whether DuckDB may rewrite this table's scan into a narrow row-ID scan
+    /// followed by late materialization in the execution planner.
+    fn supports_late_materialization(&self) -> bool {
+        false
+    }
+
     /// Called from DuckDB's `pushdown_complex_filter` hook with a borrowed
     /// handle to the current scan-local filter expression. The implementor reads
     /// the handle (translating it however it likes) to decide eligibility.
@@ -272,4 +278,14 @@ pub(crate) fn table_estimate_row_count(table: &OptionalTableWrapper) -> ffi::Car
             rows: 0,
         },
     }
+}
+
+/// Whether the currently bound table implements the materialization half of
+/// DuckDB's late-materialization rewrite.
+pub(crate) fn table_supports_late_materialization(table: &OptionalTableWrapper) -> bool {
+    table
+        .table
+        .as_ref()
+        .expect("supports_late_materialization called on unbound table")
+        .supports_late_materialization()
 }

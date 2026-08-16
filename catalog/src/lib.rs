@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use crossbeam_deque::{Injector, Steal};
 use datastore::DatastoreTransaction;
+use datastore_system::SystemTransaction;
 use dispatch::{DataFlowDispatcher, OneShotNullaryFactory, RecordBatchOperatorSpec};
 use metastore::Metastore;
 use planner::TableFunction;
@@ -97,10 +98,16 @@ impl PivotCatalog {
         &self.default_name
     }
 
-    /// Every datastore, name and handle: for wiring the planner's attach list
-    /// and for introspection.
+    /// Every datastore, name and handle: for reaching one by name and for
+    /// introspection.
     pub fn iter_datastores(&self) -> impl Iterator<Item = (&String, &Arc<dyn Datastore>)> {
         self.datastores.iter()
+    }
+
+    pub fn datastore_names(&self) -> Vec<String> {
+        let mut names: Vec<_> = self.datastores.keys().cloned().collect();
+        names.push(datastore_system::DATASTORE_NAME.to_string());
+        names
     }
 
     /// Start every datastore's background maintenance. Called once when the
@@ -135,13 +142,15 @@ impl PivotCatalog {
 
 /// The [`CatalogTransaction`] a [`PivotCatalog`] opens. It holds the datastore
 /// map and opens a datastore's sub-transaction [`DatastoreTransaction`] **lazily**, the
-/// first time the query touches that datastore (reusing it thereafter), so a
-/// query that reads one datastore never snapshots the others. The `bind_table`
-/// / `bind_table_function` resolutions route by name (the path DuckDB's
-/// per-database binding takes); the unqualified `bind_default_table_function`
-/// and `create_table` fall to the default datastore. Each resolved table binding
-/// is self-contained: it captures its datastore's snapshot at bind time, so the
-/// composite needs no downcast back to a per-datastore transaction at compile.
+/// first time the query touches that datastore (reusing it thereafter), so an
+/// ordinary query that reads one datastore never snapshots the others. Global
+/// virtual catalog relations deliberately request every datastore transaction.
+/// The `bind_table` / `bind_table_function` resolutions route by name (the path
+/// DuckDB's per-database binding takes); the unqualified
+/// `bind_default_table_function` and `create_table` fall to the default
+/// datastore. Each resolved table binding is self-contained: it captures its
+/// datastore's snapshot at bind time, so the composite needs no downcast back
+/// to a per-datastore transaction at compile.
 #[derive(Debug)]
 pub struct PivotTransaction {
     datastores: Arc<HashMap<String, Arc<dyn Datastore>>>,
@@ -167,6 +176,9 @@ impl PivotTransaction {
         &self,
         datastore: &str,
     ) -> Option<Arc<dyn DatastoreTransaction>> {
+        if datastore == datastore_system::DATASTORE_NAME {
+            return Some(self.find_or_create_system_transaction());
+        }
         let mut sub_transactions = self.sub_transactions.lock().unwrap();
         if let Some(existing) = sub_transactions.get(datastore) {
             return Some(existing.clone());
@@ -174,6 +186,36 @@ impl PivotTransaction {
         let sub_transaction = self.datastores.get(datastore)?.clone().begin_transaction();
         sub_transactions.insert(datastore.to_string(), sub_transaction.clone());
         Some(sub_transaction)
+    }
+
+    /// The `system` sub-transaction, which reads every other datastore and so
+    /// opens them all. They are opened before the map is locked: opening one
+    /// locks it too, and this lock is not reentrant.
+    fn find_or_create_system_transaction(&self) -> Arc<dyn DatastoreTransaction> {
+        if let Some(existing) = self
+            .sub_transactions
+            .lock()
+            .unwrap()
+            .get(datastore_system::DATASTORE_NAME)
+        {
+            return existing.clone();
+        }
+        let datastores = self
+            .list_datastores()
+            .into_iter()
+            .map(|datastore_name| {
+                let sub_transaction = self
+                    .find_or_create_sub_transaction(&datastore_name)
+                    .expect("a configured datastore can always open a transaction");
+                (datastore_name, sub_transaction)
+            })
+            .collect();
+        self.sub_transactions
+            .lock()
+            .unwrap()
+            .entry(datastore_system::DATASTORE_NAME.to_string())
+            .or_insert_with(|| Arc::new(SystemTransaction::new(datastores)))
+            .clone()
     }
 
     /// The sub-transactions opened so far, as `(name, sub-transaction)` pairs, with
@@ -187,6 +229,13 @@ impl PivotTransaction {
             .map(|(name, sub)| (name.clone(), sub.clone()))
             .collect()
     }
+
+    /// Every configured datastore name in deterministic order.
+    fn list_datastores(&self) -> Vec<String> {
+        let mut datastore_names: Vec<_> = self.datastores.keys().cloned().collect();
+        datastore_names.sort();
+        datastore_names
+    }
 }
 
 #[async_trait]
@@ -197,13 +246,13 @@ impl CatalogTransaction for PivotTransaction {
     }
 
     fn bind_table(&self, reference: &TableReference) -> Option<Box<dyn BoundTable>> {
-        self.find_or_create_sub_transaction(&reference.datastore)?
-            .bind_table(&reference.datastore, &reference.schema_qualified_name())
+        let sub_transaction = self.find_or_create_sub_transaction(&reference.datastore)?;
+        sub_transaction.bind_table(&reference.datastore, &reference.schema_qualified_name())
     }
 
     fn table_revision(&self, reference: &TableReference) -> Option<TableRevision> {
-        self.find_or_create_sub_transaction(&reference.datastore)?
-            .table_revision(&reference.schema_qualified_name())
+        let sub_transaction = self.find_or_create_sub_transaction(&reference.datastore)?;
+        sub_transaction.table_revision(&reference.schema_qualified_name())
     }
 
     fn bind_table_function(&self, datastore: &str, name: &str) -> Option<Box<dyn TableFunction>> {

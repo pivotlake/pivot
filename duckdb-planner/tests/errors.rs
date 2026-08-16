@@ -102,6 +102,35 @@ fn nonexistent_table() {
     }
 }
 
+/// The catalog holding DuckDB's built-in functions and types carries an
+/// internal name in our fork, so `system` names nothing but Pivot's virtual
+/// schema and no query reaches the built-in catalog by naming it.
+#[test]
+fn system_is_not_a_catalog() {
+    let mut p = create_simple_context();
+
+    for query in [
+        "SELECT * FROM system.information_schema.tables",
+        "SELECT * FROM system.main.duckdb_tables()",
+        "SELECT system.main.current_database()",
+        "DROP TABLE system.main.not_allowed",
+    ] {
+        match plan(&mut p, query) {
+            Ok(_) => panic!("expected `{query}` to be rejected"),
+            Err(Error::DuckDBPlanning(e)) => assert!(
+                e.exception_message.contains("system"),
+                "unexpected message for `{query}`: {}",
+                e.exception_message
+            ),
+            Err(e) => panic!("unexpected error for `{query}`: {e}"),
+        }
+    }
+
+    // Built-ins still resolve through that catalog internally: this macro
+    // expands to a call qualified with it.
+    plan(&mut p, "SELECT current_database()").unwrap();
+}
+
 /// Pivot cannot install or load DuckDB extensions, so stock DuckDB's "it
 /// exists in the json extension, run INSTALL/LOAD" error steers users to a
 /// dead end. Our duckdb fork strips those suggestions; this pins the plain
