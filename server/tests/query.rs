@@ -1310,3 +1310,63 @@ async fn pre_14_psql_extended_statistics_query_binds(#[future] conn: Conn) {
 
     assert!(rows.is_empty(), "{rows:?}");
 }
+
+// The table-listing query the PostgreSQL JDBC driver builds for
+// DatabaseMetaData.getTables, captured verbatim: JDBC clients (e.g. the Kafka
+// Connect JDBC sink) existence-check their target table through it.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn jdbc_table_listing_metadata_query(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE IF NOT EXISTS jdbc_people (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+
+    let rows = select_rows(
+        &conn,
+        "SELECT current_database() AS \"TABLE_CAT\", n.nspname AS \"TABLE_SCHEM\", c.relname AS \"TABLE_NAME\", \
+         CASE n.nspname ~ '^pg_' OR n.nspname = 'information_schema' \
+         WHEN true THEN CASE WHEN n.nspname = 'pg_catalog' OR n.nspname = 'information_schema' THEN CASE c.relkind WHEN 'r' THEN 'SYSTEM TABLE' WHEN 'v' THEN 'SYSTEM VIEW' WHEN 'i' THEN 'SYSTEM INDEX' ELSE NULL END \
+         WHEN n.nspname = 'pg_toast' THEN CASE c.relkind WHEN 'r' THEN 'SYSTEM TOAST TABLE' WHEN 'i' THEN 'SYSTEM TOAST INDEX' ELSE NULL END \
+         ELSE CASE c.relkind WHEN 'r' THEN 'TEMPORARY TABLE' WHEN 'p' THEN 'TEMPORARY TABLE' WHEN 'i' THEN 'TEMPORARY INDEX' WHEN 'S' THEN 'TEMPORARY SEQUENCE' WHEN 'v' THEN 'TEMPORARY VIEW' ELSE NULL END END \
+         WHEN false THEN CASE c.relkind WHEN 'r' THEN 'TABLE' WHEN 'p' THEN 'PARTITIONED TABLE' WHEN 'i' THEN 'INDEX' WHEN 'P' THEN 'PARTITIONED INDEX' WHEN 'S' THEN 'SEQUENCE' WHEN 'v' THEN 'VIEW' WHEN 'c' THEN 'TYPE' WHEN 'f' THEN 'FOREIGN TABLE' WHEN 'm' THEN 'MATERIALIZED VIEW' ELSE NULL END \
+         ELSE NULL END AS \"TABLE_TYPE\", d.description AS \"REMARKS\", '' as \"TYPE_CAT\", '' as \"TYPE_SCHEM\", '' as \"TYPE_NAME\", '' AS \"SELF_REFERENCING_COL_NAME\", '' AS \"REF_GENERATION\" \
+         FROM pg_catalog.pg_namespace n, pg_catalog.pg_class c LEFT JOIN pg_catalog.pg_description d ON (c.oid = d.objoid AND d.objsubid = 0 AND d.classoid = 'pg_class'::regclass) \
+         WHERE c.relnamespace = n.oid AND c.relname LIKE 'jdbc_people' AND (false OR (c.relkind = 'r' AND n.nspname !~ '^pg_' AND n.nspname <> 'information_schema')) \
+         ORDER BY \"TABLE_TYPE\", \"TABLE_SCHEM\", \"TABLE_NAME\"",
+    )
+    .await;
+
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0][1], Some("main".into()));
+    assert_eq!(rows[0][2], Some("jdbc_people".into()));
+    assert_eq!(rows[0][3], Some("TABLE".into()));
+    assert_eq!(rows[0][4], None);
+}
+
+// The primary-key query the PostgreSQL JDBC driver builds for
+// DatabaseMetaData.getPrimaryKeys, captured verbatim. Pivot tables have no
+// primary keys, so it must bind and answer with no rows.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn jdbc_primary_keys_metadata_query(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE IF NOT EXISTS jdbc_people (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+
+    let rows = select_rows(
+        &conn,
+        "SELECT result.TABLE_CAT AS \"TABLE_CAT\", result.TABLE_SCHEM AS \"TABLE_SCHEM\", result.TABLE_NAME AS \"TABLE_NAME\", result.COLUMN_NAME AS \"COLUMN_NAME\", result.KEY_SEQ AS \"KEY_SEQ\", result.PK_NAME AS \"PK_NAME\" FROM \
+         (SELECT current_database() AS TABLE_CAT, n.nspname AS TABLE_SCHEM, ct.relname AS TABLE_NAME, a.attname AS COLUMN_NAME, \
+         (information_schema._pg_expandarray(con.conkey)).n AS KEY_SEQ, con.conname AS PK_NAME, \
+         information_schema._pg_expandarray(con.conkey) AS KEYS, a.attnum AS A_ATTNUM \
+         FROM pg_catalog.pg_constraint con JOIN pg_catalog.pg_class ct ON (con.conrelid = ct.oid) JOIN pg_catalog.pg_namespace n ON (ct.relnamespace = n.oid) JOIN pg_catalog.pg_attribute a ON (a.attrelid = ct.oid) \
+         WHERE con.contype = 'p' AND ct.relname = 'jdbc_people') result \
+         WHERE result.A_ATTNUM = (result.KEYS).x \
+         ORDER BY result.table_name, result.pk_name, result.key_seq",
+    )
+    .await;
+
+    assert!(rows.is_empty(), "{rows:?}");
+}
