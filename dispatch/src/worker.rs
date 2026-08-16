@@ -129,6 +129,10 @@ pub struct Worker {
     /// refresh it — any `notify` they missed will simply make the next park
     /// observe a mismatch and return immediately, so no wake is lost.
     last_seen_wake_count: u64,
+    /// Ring-wake-count snapshot used the same way for the blocking IO wait.
+    /// Only ring-interrupting notifications bump that count, so data sends do
+    /// not stop a worker with IO in flight from sleeping until a completion.
+    last_seen_ring_wake_count: u64,
     /// This worker's index within its node group, which is also its park
     /// slot in the waker.
     node_local_idx: usize,
@@ -182,6 +186,7 @@ impl Worker {
                 let node_local_idx = idx % waker_set.workers_per_node();
                 waker.register(node_local_idx);
                 let last_seen_wake_count = waker.wake_count();
+                let last_seen_ring_wake_count = waker.ring_wake_count();
                 let last_seen_broadcast = waker.broadcast_epoch();
                 debug!("Initializing worker waker {:?}", idx);
                 init_worker_waker(&waker);
@@ -198,6 +203,7 @@ impl Worker {
                     should_exit,
                     waker,
                     last_seen_wake_count,
+                    last_seen_ring_wake_count,
                     node_local_idx,
                     last_seen_broadcast,
                 };
@@ -515,11 +521,12 @@ impl Worker {
                     debug!("Waiting for IO...");
                     if self
                         .waker
-                        .begin_ring_wait(self.node_local_idx, self.last_seen_wake_count)
+                        .begin_ring_wait(self.node_local_idx, self.last_seen_ring_wake_count)
                     {
                         self.io.wait()?;
                         self.waker.end_ring_wait(self.node_local_idx);
                     }
+                    self.last_seen_ring_wake_count = self.waker.ring_wake_count();
                     self.last_seen_wake_count = self.waker.wake_count();
                     continue;
                 }
