@@ -5,11 +5,14 @@ mod common;
 
 use std::sync::Arc;
 
-use arrow_array::{Array, Int64Array, RecordBatch};
+use arrow_array::{Array, ArrayRef, BooleanArray, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 
 use common::*;
-use dispatch::{AggregationKind, AggregationSlot, JoinKind, JoinSpec, values_input};
+use dispatch::{
+    AggregationKind, AggregationSlot, JoinKind, JoinResidualFn, JoinResidualSpec, JoinSpec,
+    values_input,
+};
 
 /// Non-nullable `Int64` output fields, which is what every column of these
 /// tests' batches is.
@@ -53,6 +56,129 @@ fn two_int64_batch(names: (&str, &str), left: &[i64], right: &[i64]) -> RecordBa
         ],
     )
     .unwrap()
+}
+
+fn int64_columns(columns: &[(&str, &[i64])]) -> RecordBatch {
+    RecordBatch::try_from_iter(columns.iter().map(|(name, values)| {
+        (
+            *name,
+            Arc::new(Int64Array::from(values.to_vec())) as ArrayRef,
+        )
+    }))
+    .unwrap()
+}
+
+fn residual_input(output: &[i64], predicate: Option<&[i64]>) -> RecordBatch {
+    match predicate {
+        Some(predicate) => int64_columns(&[
+            ("key", &[1, 2]),
+            ("output", output),
+            ("predicate", predicate),
+        ]),
+        None => int64_columns(&[("key", &[1, 2]), ("output", output)]),
+    }
+}
+
+fn residual(
+    probe_column_indices: Vec<usize>,
+    build_column_indices: Vec<usize>,
+    evaluate: fn(&RecordBatch) -> BooleanArray,
+) -> JoinResidualSpec {
+    JoinResidualSpec::new(
+        Arc::new(move || Box::new(evaluate) as JoinResidualFn),
+        probe_column_indices,
+        build_column_indices,
+    )
+}
+
+fn int64_column(batch: &RecordBatch, index: usize) -> &Int64Array {
+    batch
+        .column(index)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+}
+
+fn first_less_than_second(batch: &RecordBatch) -> BooleanArray {
+    let first = int64_column(batch, 0);
+    let second = int64_column(batch, 1);
+    BooleanArray::from_iter(
+        (0..batch.num_rows()).map(|row| Some(first.value(row) < second.value(row))),
+    )
+}
+
+fn first_above_ten(batch: &RecordBatch) -> BooleanArray {
+    let first = int64_column(batch, 0);
+    BooleanArray::from_iter((0..batch.num_rows()).map(|row| Some(first.value(row) > 10)))
+}
+
+fn true_without_columns(batch: &RecordBatch) -> BooleanArray {
+    assert_eq!(batch.num_columns(), 0);
+    BooleanArray::from(vec![true; batch.num_rows()])
+}
+
+fn run_residual_join(
+    probe_batch: RecordBatch,
+    build_batch: RecordBatch,
+    residual: JoinResidualSpec,
+) -> Vec<RecordBatch> {
+    let d = dispatch(1);
+    let probe = values_input(&d, vec![probe_batch]).record_batches();
+    let build = values_input(&d, vec![build_batch]).record_batches();
+    let mut spec = inner_join(vec![1], vec![1]);
+    spec.residual_filters = Some(residual);
+    probe
+        .join(build, &[DataType::Int64], spec)
+        .collect()
+        .unwrap()
+}
+
+#[test]
+fn a_residual_gathers_only_its_selected_columns() {
+    let probe = residual_input(&[7, 8], Some(&[5, 25]));
+    let build = residual_input(&[100, 200], Some(&[10, 20]));
+    let residual = residual(vec![2], vec![2], first_less_than_second);
+
+    let results = run_residual_join(probe, build, residual);
+
+    assert_eq!(collect_i64s(&results, 0), vec![7]);
+    assert_eq!(collect_i64s(&results, 1), vec![100]);
+}
+
+#[test]
+fn a_probe_only_residual_needs_no_build_columns() {
+    let probe = residual_input(&[7, 8], Some(&[5, 15]));
+    let build = residual_input(&[100, 200], None);
+    let residual = residual(vec![2], vec![], first_above_ten);
+
+    let results = run_residual_join(probe, build, residual);
+
+    assert_eq!(collect_i64s(&results, 0), vec![8]);
+    assert_eq!(collect_i64s(&results, 1), vec![200]);
+}
+
+#[test]
+fn a_build_only_residual_needs_no_probe_columns() {
+    let probe = residual_input(&[7, 8], None);
+    let build = residual_input(&[100, 200], Some(&[5, 15]));
+    let residual = residual(vec![], vec![2], first_above_ten);
+
+    let results = run_residual_join(probe, build, residual);
+
+    assert_eq!(collect_i64s(&results, 0), vec![8]);
+    assert_eq!(collect_i64s(&results, 1), vec![200]);
+}
+
+#[test]
+fn a_column_free_residual_preserves_the_candidate_count() {
+    let probe = residual_input(&[7, 8], None);
+    let build = residual_input(&[100, 200], None);
+    let residual = residual(vec![], vec![], true_without_columns);
+
+    let results = run_residual_join(probe, build, residual);
+
+    assert_eq!(collect_i64s(&results, 0), vec![7, 8]);
+    assert_eq!(collect_i64s(&results, 1), vec![100, 200]);
 }
 
 #[test]

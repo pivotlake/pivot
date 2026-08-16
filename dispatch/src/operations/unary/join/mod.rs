@@ -147,17 +147,11 @@ pub struct JoinSpec {
     pub build_fields: Vec<Field>,
     /// Which rows reach the output.
     pub kind: JoinKind,
-    /// A predicate over key-matched pairs; a pair it rejects is not a match.
-    /// Evaluated batch-wise on the collected pairs, over every probe input
-    /// column followed by every build input column (the layout the caller
-    /// bound the predicate's column refs against). For a
-    /// [`BuildOuter`](JoinKind::BuildOuter) join a build row whose every pair
-    /// is rejected counts as unmatched; for a
-    /// [`ProbeSemi`](JoinKind::ProbeSemi) join a probe row is emitted only if
-    /// some pair passes, and for a [`ProbeAnti`](JoinKind::ProbeAnti) join
-    /// only if none does. A [`BuildSemi`](JoinKind::BuildSemi) join likewise
-    /// emits a build row only if some surviving pair names it.
-    pub residual_filters: Option<JoinResidual>,
+    /// An optional predicate evaluated over key-matched pairs.
+    ///
+    /// The residual declares the probe and build columns needed for evaluation.
+    /// A candidate pair counts as a match only when the predicate returns `TRUE`.
+    pub residual_filters: Option<JoinResidualSpec>,
 }
 
 /// One evaluation instance of a join's residual predicate: batch of paired
@@ -165,14 +159,37 @@ pub struct JoinSpec {
 /// SQL's treatment of a non-TRUE condition).
 pub type JoinResidualFn = Box<dyn FnMut(&RecordBatch) -> BooleanArray + Send>;
 
-/// A factory of residual-predicate evaluation instances, one per probe
-/// worker (evaluation is stateful, so workers cannot share one instance).
+/// A residual-predicate factory and the minimal input projection it evaluates.
+/// Each probe worker gets its own evaluator because evaluation is stateful.
+/// The evaluator's batch contains `probe_column_indices` first, followed by
+/// `build_column_indices`, in the order listed here.
 #[derive(Clone)]
-pub struct JoinResidual(pub Arc<dyn Fn() -> JoinResidualFn + Send + Sync>);
+pub struct JoinResidualSpec {
+    evaluator: Arc<dyn Fn() -> JoinResidualFn + Send + Sync>,
+    probe_column_indices: Arc<[usize]>,
+    build_column_indices: Arc<[usize]>,
+}
 
-impl fmt::Debug for JoinResidual {
+impl JoinResidualSpec {
+    pub fn new(
+        evaluator: Arc<dyn Fn() -> JoinResidualFn + Send + Sync>,
+        probe_column_indices: Vec<usize>,
+        build_column_indices: Vec<usize>,
+    ) -> Self {
+        Self {
+            evaluator,
+            probe_column_indices: probe_column_indices.into(),
+            build_column_indices: build_column_indices.into(),
+        }
+    }
+}
+
+impl fmt::Debug for JoinResidualSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("JoinResidual")
+        f.debug_struct("JoinResidualSpec")
+            .field("probe_column_indices", &self.probe_column_indices)
+            .field("build_column_indices", &self.build_column_indices)
+            .finish_non_exhaustive()
     }
 }
 

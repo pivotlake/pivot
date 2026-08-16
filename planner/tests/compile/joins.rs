@@ -290,6 +290,30 @@ fn join_with_an_inequality_beside_the_key_condition(mut testing_planner: Testing
     );
 }
 
+// Computed keys on both sides guarantee that whichever input DuckDB chooses
+// to probe has an internal key appended to it. The comparison-form residual's
+// build operand must skip that column in the combined layout.
+#[rstest]
+fn computed_join_key_with_a_comparison_residual(mut testing_planner: TestingPlanner) {
+    add_orders_and_items(&testing_planner);
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT i_qty, o_status FROM items JOIN orders \
+         ON i_order * 2 = o_key + o_key AND i_qty < o_key * 15",
+    );
+
+    // Order 1's quantity-10 item is below its threshold of 15; quantity 20 and
+    // order 2's quantity 30 do not pass their thresholds.
+    assert_eq!(
+        rows,
+        serde_json::json!([{"i_qty": 10, "o_status": "open"}])
+            .as_array()
+            .unwrap()
+            .clone()
+    );
+}
+
 // An ON predicate referencing both sides that is not a bare comparison rides
 // the join as its residual, evaluated on key-matched pairs; only the pairs it
 // accepts are matches.
@@ -301,6 +325,34 @@ fn join_with_or_condition_across_both_sides(mut testing_planner: TestingPlanner)
         &mut testing_planner,
         "SELECT i_qty, o_status FROM items JOIN orders ON i_order = o_key \
          AND ((i_qty < 15 AND o_status = 'open') OR (i_qty > 25 AND o_status = 'closed'))",
+    );
+    rows.sort_by_key(|r| r["i_qty"].as_i64().unwrap());
+
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"i_qty": 10, "o_status": "open"},
+            {"i_qty": 30, "o_status": "closed"},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
+
+// The same both-computed key shape with an expression-form residual, which is
+// already bound against the original combined input. Appending the probe key
+// moves its build-side refs right without changing its probe-side refs.
+#[rstest]
+fn computed_join_key_with_an_expression_residual(mut testing_planner: TestingPlanner) {
+    add_orders_and_items(&testing_planner);
+
+    let mut rows = run(
+        &mut testing_planner,
+        "SELECT i_qty, o_status FROM items JOIN orders \
+         ON i_order * 2 = o_key + o_key \
+         AND ((i_qty < 15 AND o_status = 'open') \
+              OR (i_qty > 25 AND o_status = 'closed'))",
     );
     rows.sort_by_key(|r| r["i_qty"].as_i64().unwrap());
 

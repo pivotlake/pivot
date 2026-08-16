@@ -23,7 +23,7 @@ use crate::types::{Type, physical_arrow_type};
 use arrow_array::{Array, BooleanArray, RecordBatch};
 use arrow_schema::Field;
 use dispatch::JoinKind as DispatchJoinKind;
-use dispatch::{JoinResidual, JoinSpec, RangeCompare, RangeJoinSpec, RecordBatchOperatorSpec};
+use dispatch::{JoinResidualSpec, JoinSpec, RangeCompare, RangeJoinSpec, RecordBatchOperatorSpec};
 use std::fmt;
 use std::sync::Arc;
 
@@ -98,10 +98,16 @@ pub struct Join {
     pub build_column_types: Vec<(Type, bool)>,
     /// Conditions of the join that are not left/right equalities (e.g. an OR
     /// referencing both sides), implicitly ANDed; a key-matched pair they
-    /// reject is not a match. Their column refs are bound against the
-    /// concatenation of both inputs' full outputs (probe columns first), the
-    /// layout the dispatch join evaluates them in.
+    /// reject is not a match. Their refs address the compact concatenation of
+    /// [`residual_probe_columns`](Self::residual_probe_columns) followed by
+    /// [`residual_build_columns`](Self::residual_build_columns).
     pub residual_filters: Vec<Expression>,
+    /// Probe input columns gathered for residual evaluation, in compact-batch
+    /// order. Empty when the join has no residual or it reads no probe column.
+    pub residual_probe_columns: Vec<usize>,
+    /// Build input columns gathered after `residual_probe_columns` for residual
+    /// evaluation.
+    pub residual_build_columns: Vec<usize>,
     /// Which rows reach the output.
     pub kind: JoinKind,
 }
@@ -217,43 +223,49 @@ impl Join {
     /// predicate: each condition evaluated over the gathered pair batch, the
     /// verdicts ANDed with SQL null semantics (the dispatch side rejects a
     /// NULL verdict, like any non-TRUE condition).
-    fn compile_residual_filters(&self) -> Result<Option<JoinResidual>, Error> {
+    fn compile_residual_filters(&self) -> Result<Option<JoinResidualSpec>, Error> {
         if self.residual_filters.is_empty() {
             return Ok(None);
         }
+
         let factories = Arc::new(
             self.residual_filters
                 .iter()
                 .map(|condition| condition.compile())
                 .collect::<Result<Vec<_>, _>>()?,
         );
-        Ok(Some(JoinResidual(Arc::new(move || {
-            let mut evals: Vec<ExprEvalFn> = factories.iter().map(|factory| factory()).collect();
-            Box::new(move |pairs: &RecordBatch| {
-                let mut combined: Option<BooleanArray> = None;
-                for eval in &mut evals {
-                    let result = eval(pairs);
-                    let (array, is_scalar) = result.as_datum().get();
-                    let mask = array
-                        .as_any()
-                        .downcast_ref::<BooleanArray>()
-                        .expect("join residual conditions evaluate to booleans");
-                    // A constant-folded condition comes back as one scalar
-                    // verdict; broadcast it over the pairs.
-                    let mask = if is_scalar {
-                        let verdict = mask.is_valid(0).then(|| mask.value(0));
-                        BooleanArray::from(vec![verdict; pairs.num_rows()])
-                    } else {
-                        mask.clone()
-                    };
-                    combined = Some(match combined {
-                        None => mask,
-                        Some(so_far) => arrow::compute::and_kleene(&so_far, &mask)
-                            .expect("residual verdicts have one row per pair"),
-                    });
-                }
-                combined.expect("a compiled residual has at least one condition")
-            })
-        }))))
+        Ok(Some(JoinResidualSpec::new(
+            Arc::new(move || {
+                let mut evals: Vec<ExprEvalFn> =
+                    factories.iter().map(|factory| factory()).collect();
+                Box::new(move |pairs: &RecordBatch| {
+                    let mut combined: Option<BooleanArray> = None;
+                    for eval in &mut evals {
+                        let result = eval(pairs);
+                        let (array, is_scalar) = result.as_datum().get();
+                        let mask = array
+                            .as_any()
+                            .downcast_ref::<BooleanArray>()
+                            .expect("join residual conditions evaluate to booleans");
+                        // A constant-folded condition comes back as one scalar
+                        // verdict; broadcast it over the pairs.
+                        let mask = if is_scalar {
+                            let verdict = mask.is_valid(0).then(|| mask.value(0));
+                            BooleanArray::from(vec![verdict; pairs.num_rows()])
+                        } else {
+                            mask.clone()
+                        };
+                        combined = Some(match combined {
+                            None => mask,
+                            Some(so_far) => arrow::compute::and_kleene(&so_far, &mask)
+                                .expect("residual verdicts have one row per pair"),
+                        });
+                    }
+                    combined.expect("a compiled residual has at least one condition")
+                })
+            }),
+            self.residual_probe_columns.clone(),
+            self.residual_build_columns.clone(),
+        )))
     }
 }

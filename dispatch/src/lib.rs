@@ -97,7 +97,7 @@ pub use operations::channels::{MpscSender, Sender};
 pub use operations::nullary::Result as NullaryResult;
 pub use operations::unary::filter::{RowDelivery, RowSelection, collect_selected_indices};
 pub use operations::{
-    JoinKind, JoinResidual, JoinResidualFn, JoinSpec, RangeCompare, RangeJoinSpec,
+    JoinKind, JoinResidualFn, JoinResidualSpec, JoinSpec, RangeCompare, RangeJoinSpec,
 };
 #[cfg(feature = "perf")]
 pub use profiler::worker_tids;
