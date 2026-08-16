@@ -217,58 +217,57 @@ impl Expression {
         }
     }
 
-    /// Shift every column index this expression reads by `offset`. For
-    /// rebinding an expression resolved against one input so it reads from
-    /// that input's columns placed after `offset` others (e.g. a join
-    /// condition's build-side operand evaluated over probe-then-build
-    /// concatenated columns).
-    pub fn shift_column_refs(&mut self, offset: usize) {
+    /// Visit every column reference in this expression, in expression order.
+    /// An exhaustive walk keeps transformations over bound references in one
+    /// place instead of making each transformation know every expression
+    /// shape.
+    pub fn visit_column_refs_mut(&mut self, visit: &mut impl FnMut(&mut Ref)) {
         match self {
-            Expression::Ref(r) => r.column_idx += offset,
+            Expression::Ref(r) => visit(r),
             Expression::Constant(_) => {}
             Expression::Compare(c) => {
-                c.left.shift_column_refs(offset);
-                c.right.shift_column_refs(offset);
+                c.left.visit_column_refs_mut(visit);
+                c.right.visit_column_refs_mut(visit);
             }
             Expression::Between(b) => {
-                b.input.shift_column_refs(offset);
-                b.lower.shift_column_refs(offset);
-                b.upper.shift_column_refs(offset);
+                b.input.visit_column_refs_mut(visit);
+                b.lower.visit_column_refs_mut(visit);
+                b.upper.visit_column_refs_mut(visit);
             }
             Expression::AggregateFunc(a) => {
                 for argument in a.arguments_mut() {
-                    argument.shift_column_refs(offset);
+                    argument.visit_column_refs_mut(visit);
                 }
             }
             Expression::Function(f) => {
-                f.for_each_argument_mut(&mut |argument| argument.shift_column_refs(offset));
+                f.for_each_argument_mut(&mut |argument| argument.visit_column_refs_mut(visit));
             }
             Expression::InList(l) => {
-                l.input.shift_column_refs(offset);
+                l.input.visit_column_refs_mut(visit);
                 for value in &mut l.values {
-                    value.shift_column_refs(offset);
+                    value.visit_column_refs_mut(visit);
                 }
             }
             Expression::Conjunction(c) => {
                 for child in &mut c.children {
-                    child.shift_column_refs(offset);
+                    child.visit_column_refs_mut(visit);
                 }
             }
             Expression::Case(c) => {
                 for check in &mut c.checks {
-                    check.when.shift_column_refs(offset);
-                    check.then.shift_column_refs(offset);
+                    check.when.visit_column_refs_mut(visit);
+                    check.then.visit_column_refs_mut(visit);
                 }
-                c.else_expr.shift_column_refs(offset);
+                c.else_expr.visit_column_refs_mut(visit);
             }
             Expression::MaybeError(m) => {
-                m.check.shift_column_refs(offset);
-                m.message.shift_column_refs(offset);
-                m.value.shift_column_refs(offset);
+                m.check.visit_column_refs_mut(visit);
+                m.message.visit_column_refs_mut(visit);
+                m.value.visit_column_refs_mut(visit);
             }
-            Expression::Not(n) => n.input.shift_column_refs(offset),
-            Expression::IsNull(n) => n.input.shift_column_refs(offset),
-            Expression::Cast(c) => c.source.shift_column_refs(offset),
+            Expression::Not(n) => n.input.visit_column_refs_mut(visit),
+            Expression::IsNull(n) => n.input.visit_column_refs_mut(visit),
+            Expression::Cast(c) => c.source.visit_column_refs_mut(visit),
         }
     }
 
