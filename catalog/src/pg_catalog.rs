@@ -192,6 +192,7 @@ pub fn bind_table(
                 column("stxrelid", Type::UInt32),
                 column("stxnamespace", Type::UInt32),
                 column("stxname", Type::Utf8),
+                column("stxkeys", Type::List(Box::new(Type::Int16))),
                 column("stxkind", Type::List(Box::new(Type::Utf8))),
                 column("stxstattarget", Type::Int32),
             ],
