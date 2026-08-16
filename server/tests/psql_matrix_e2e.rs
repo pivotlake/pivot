@@ -20,6 +20,7 @@ const PSQL_IMAGES: &[&str] = &[
     "postgres:15-alpine",
     "postgres:16-alpine",
     "postgres:17-alpine",
+    "postgres:18-alpine",
 ];
 
 /// The meta-commands every supported psql client must answer, each with a

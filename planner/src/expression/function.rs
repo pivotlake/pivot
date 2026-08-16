@@ -101,6 +101,16 @@ pub fn builtin_scalar_function(schema: &str, name: &str) -> Option<ScalarFunctio
             return_type: Type::Boolean,
             volatile: true,
         }),
+        // psql 18's reverse-foreign-key footer of \d filters pg_constraint
+        // through this set-returning function. The statically empty
+        // pg_constraint folds the whole subquery after binding, so the stub is
+        // never compiled.
+        ("pg_catalog", "pg_partition_ancestors") => Some(ScalarFunctionSignature {
+            arguments: vec![Type::UInt32],
+            varargs: None,
+            return_type: Type::UInt32,
+            volatile: true,
+        }),
         ("pg_catalog", "pg_get_statisticsobjdef_columns") => Some(ScalarFunctionSignature {
             arguments: vec![Type::UInt32],
             varargs: None,
