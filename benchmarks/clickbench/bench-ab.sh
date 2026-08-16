@@ -167,6 +167,22 @@ run_harness() {
     ) >"$out" 2>&1 || true   # a nonzero exit (e.g. the QPS watchdog) is fine; we read the timings
     # Make sure the server is down before the other side reuses the box.
     ( cd "$adapter"; PIVOT_PORT="$port" ./stop >/dev/null 2>&1 || true )
+    # The adapter's stop is an async kill, and a server whose buffer pool
+    # filled up (the concurrent phase gets it to the full budget, most of the
+    # machine's RAM) can take a while to hand that memory back. The next
+    # side's server pre-faults its whole pool at startup, so starting it while
+    # the old one is still tearing down races the two footprints and the
+    # kernel OOM-kills the booting server. Memory is released before the pid
+    # leaves the process table, so an empty table means teardown is done.
+    local teardown_waited=0
+    while ps -C pivotdb-server >/dev/null 2>&1; do
+        if (( teardown_waited >= 120 )); then
+            echo "warning: pivotdb-server still in the process table after ${teardown_waited}s; starting the next side anyway" >&2
+            break
+        fi
+        sleep 1
+        teardown_waited=$((teardown_waited + 1))
+    done
 }
 
 # Run the DuckDB (parquet, partitioned) ClickBench adapter once, writing its raw
