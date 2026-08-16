@@ -3,22 +3,20 @@
 //! It accepts [`RowGroupRequest`]s and reads each one's projected column chunks
 //! — local files via io_uring disk reads, remote objects via HTTP range reads on
 //! the same ring — emitting a [`RowGroupBuffer`] once a row group's last block
-//! lands. The slot/routing/dedup/in-flight bookkeeping lives in the shared
-//! [`RequestTracker`]; this type adds only the row-group-specific bits: count a
-//! landed block off the waiting row group, and emit it once complete.
+//! lands. The slot/routing/in-flight bookkeeping lives in the
+//! dispatch requester's private tracker; this type retains only the row-group
+//! metadata keyed by the logical request id.
 //!
-//! Disk and HTTP have very different latencies, so the tracker bounds the
-//! outstanding reads of each kind independently: at most `MAX_DISK_IN_FLIGHT`
-//! disk-backed and `MAX_HTTP_IN_FLIGHT` remote-backed blocks. The cap is soft
-//! (a row group may push over it) and gates only whether the *next* row group is
-//! admitted; a homogeneous scan only fills its medium's pool, so the other never
-//! gates.
+//! Disk and HTTP have very different latencies, so the fetcher bounds logical
+//! row-group reads for each medium independently. Dispatch separately bounds the
+//! resulting physical submission batches. A homogeneous scan only fills its
+//! own medium's pool, so the other never gates it.
 
-use crate::parquet::request_tracker::{ReadRequest, RequestTracker};
 use crate::parquet::types::requests::{RowGroupBuffer, RowGroupRequest};
 use dispatch::Sender;
 use dispatch::Unary;
-use dispatch::io::{FsReadRequest, FsRequest, HttpGetRequest, HttpRequest};
+use dispatch::io::{OperatorIO, ReadRequestId, ReadResponse};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -62,7 +60,7 @@ pub fn pending_claim_bound(table: &crate::parquet::ParquetTable) -> usize {
 }
 
 pub struct RowGroupFetcher {
-    tracker: RequestTracker<RowGroupRequest>,
+    in_flight: HashMap<ReadRequestId, RowGroupRequest>,
     /// How many row groups this worker has claimed but not fully decoded.
     /// Incremented here per claim, decremented by the worker's `Decoder` when
     /// a row group finishes (or prunes), and consulted as claim backpressure.
@@ -74,46 +72,10 @@ pub struct RowGroupFetcher {
 impl RowGroupFetcher {
     pub fn new(pending_row_groups: Arc<AtomicUsize>, max_pending_row_groups: usize) -> Self {
         Self {
-            tracker: RequestTracker::default(),
+            in_flight: HashMap::new(),
             pending_row_groups,
             max_pending_row_groups,
         }
-    }
-
-    /// A completed read: credit *every* row group waiting on it (they all need
-    /// exactly that run, whose bytes are now committed), then emit any that are
-    /// done. Credit all before emitting, so a row group listed twice — it needed
-    /// this read for two columns — is fully counted before it emits.
-    fn deliver(
-        &mut self,
-        read: ReadRequest,
-        sender: &mut dyn Sender<RowGroupBuffer>,
-    ) -> dispatch::UnaryResult<()> {
-        let waiters = self.tracker.complete(&read);
-        for &slot in &waiters {
-            self.tracker.request_for_slot(slot).unwrap().complete_one();
-        }
-        for slot in waiters {
-            self.emit_if_complete(slot, sender)?;
-        }
-        Ok(())
-    }
-
-    /// If the row group in `slot` has all its blocks, free it and emit it.
-    fn emit_if_complete(
-        &mut self,
-        slot: usize,
-        sender: &mut dyn Sender<RowGroupBuffer>,
-    ) -> dispatch::UnaryResult<()> {
-        if self
-            .tracker
-            .request_for_slot(slot)
-            .is_some_and(|r| r.complete())
-        {
-            let request = self.tracker.take_request_at_slot(slot);
-            sender.send(request.into_row_group_buffer())?;
-        }
-        Ok(())
     }
 }
 
@@ -122,45 +84,45 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
         &mut self,
         request: RowGroupRequest,
         sender: &mut dyn Sender<RowGroupBuffer>,
+        io: &mut OperatorIO,
     ) -> dispatch::UnaryResult<()> {
         self.pending_row_groups.fetch_add(1, Ordering::Relaxed);
-        let slot = self.tracker.admit_request(request);
-        // A fully-cached row group has no pending reads and is already done.
-        self.emit_if_complete(slot, sender)?;
+        let id = io.read(
+            request.open_file().clone(),
+            request.locations().iter().copied(),
+        );
+        self.in_flight.insert(id, request);
+        let _ = sender;
         Ok(())
     }
 
-    fn next_fs_requests(&mut self) -> dispatch::UnaryResult<Vec<FsRequest>> {
-        Ok(self.tracker.take_fs_requests())
-    }
-
-    fn next_http_requests(&mut self) -> dispatch::UnaryResult<Vec<HttpRequest>> {
-        Ok(self.tracker.take_http_requests())
-    }
-
     fn ready_for_more_work(&mut self) -> bool {
-        self.tracker.disk_in_flight() < MAX_DISK_IN_FLIGHT
-            && self.tracker.http_in_flight() < crate::parquet::http_readahead()
+        let disk_in_flight = self
+            .in_flight
+            .values()
+            .filter(|request| matches!(request.open_file(), dispatch::io::OpenFile::Local(_)))
+            .count();
+        let http_in_flight = self.in_flight.len() - disk_in_flight;
+        disk_in_flight < MAX_DISK_IN_FLIGHT
+            && http_in_flight < crate::parquet::http_readahead()
             && self.pending_row_groups.load(Ordering::Relaxed) < self.max_pending_row_groups
     }
 
-    fn process_fs_read_response(
+    fn process_read_response(
         &mut self,
         sender: &mut dyn Sender<RowGroupBuffer>,
-        request: FsReadRequest,
+        _io: &mut OperatorIO,
+        response: ReadResponse,
     ) -> dispatch::UnaryResult<()> {
-        self.deliver(ReadRequest::of_fs(&request), sender)
-    }
-
-    fn process_http_get_response(
-        &mut self,
-        sender: &mut dyn Sender<RowGroupBuffer>,
-        request: HttpGetRequest,
-    ) -> dispatch::UnaryResult<()> {
-        self.deliver(ReadRequest::of_http_get(&request), sender)
+        let request = self
+            .in_flight
+            .remove(&response.id())
+            .expect("response for an unknown row-group request");
+        sender.send(request.into_row_group_buffer(response))?;
+        Ok(())
     }
 
     fn finish(&mut self, _sender: &mut dyn Sender<RowGroupBuffer>) -> dispatch::UnaryResult<bool> {
-        Ok(self.tracker.is_idle())
+        Ok(self.in_flight.is_empty())
     }
 }

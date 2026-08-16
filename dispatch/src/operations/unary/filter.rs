@@ -182,6 +182,7 @@ where
         &mut self,
         batch: RecordBatch,
         output: &mut dyn Sender<RecordBatch>,
+        _io: &mut crate::io::OperatorIO,
     ) -> unary::Result<()> {
         self.selection.clear();
         let selection = (self.func)(&batch, &mut self.allocator, &mut self.selection);

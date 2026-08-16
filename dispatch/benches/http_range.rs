@@ -53,10 +53,10 @@ use criterion::{BatchSize, Criterion, Throughput, black_box};
 use url::Url;
 
 use dispatch::io::{
-    DataFlowRequest, HttpGetRequest, HttpRequest, IORequester, OpenFile, RemoteFile,
+    FileRange, IORequester, OpenFile, PendingReadRequest, ReadRequestId, RemoteFile,
 };
 use dispatch::memory::init_test_free_pool;
-use dispatch::{BUFFER_SIZE, memory_ctx};
+use dispatch::{BUFFER_SIZE, StatsCollector, memory_ctx};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -262,50 +262,39 @@ fn spawn_backend(tls: bool) -> u16 {
 // Driver
 // ---------------------------------------------------------------------------
 
-/// Submit `reads` range requests at advancing (always-missing) offsets, then
-/// drive them all to completion. Lookups are held until their blocks commit so
-/// the pinned slots can't be evicted mid-read. Returns bytes fetched.
+/// Submit `reads` logical ranges at advancing (always-missing) offsets, then
+/// drive them all to completion. The request tracker pins their cache lookups
+/// until the completed logical responses are discarded. Returns bytes fetched.
 fn run_batch(
     requester: &mut IORequester,
+    stats: &mut StatsCollector,
     loc: &OpenFile,
-    remote: &Arc<RemoteFile>,
     reads: usize,
     block: usize,
     offset: &AtomicU64,
 ) -> usize {
-    // Hold every lookup (and thus every slot pin) for the whole batch.
-    let mut pins = Vec::with_capacity(reads);
-    let mut submitted = 0usize;
-    let mut bytes = 0usize;
-
     for _ in 0..reads {
         let off = offset.fetch_add(block as u64, Ordering::Relaxed) as usize;
-        let lookups = memory_ctx().compressed_cache().get(loc, off, block);
-        for lookup in &lookups {
-            if let Some(missing) = lookup.missing() {
-                bytes += missing.len();
-                let req = HttpRequest::Get(HttpGetRequest {
-                    remote: remote.clone(),
-                    block: missing.clone(),
-                });
-                requester
-                    .request_http(DataFlowRequest::new(0, 0, req))
-                    .unwrap();
-                submitted += 1;
-            }
-        }
-        pins.push(lookups);
+        requester
+            .request_read(
+                0,
+                0,
+                PendingReadRequest {
+                    id: ReadRequestId(off),
+                    open_file: loc.clone(),
+                    locations: vec![FileRange::new(off, block)],
+                },
+                stats,
+            )
+            .unwrap();
     }
 
-    let mut completed = 0usize;
-    while completed < submitted {
-        if requester.has_pending() {
-            requester.wait().unwrap();
-        }
-        completed += requester.completions().unwrap().len();
+    while requester.has_pending() {
+        requester.wait().unwrap();
+        requester.completions().unwrap();
     }
-    drop(pins); // unpin only after every read has committed
-    bytes
+    requester.cancel_dataflow(0);
+    reads * block
 }
 
 fn bench_transport(c: &mut Criterion, name: &str, tls: bool) {
@@ -317,12 +306,13 @@ fn bench_transport(c: &mut Criterion, name: &str, tls: bool) {
     memory_ctx().compressed_cache().open_entry(loc.clone());
 
     let mut requester = IORequester::with_http_config(client_config());
+    let mut stats = StatsCollector::disabled();
     let block = block_bytes();
     let reads = reads_per_batch();
     let offset = AtomicU64::new(0);
 
     // Warm up the keep-alive pool (first batch pays connect + TLS handshake).
-    run_batch(&mut requester, &loc, &remote, reads, block, &offset);
+    run_batch(&mut requester, &mut stats, &loc, reads, block, &offset);
 
     let mut g = c.benchmark_group("http_range");
     g.throughput(Throughput::Bytes((reads * block) as u64));
@@ -337,7 +327,7 @@ fn bench_transport(c: &mut Criterion, name: &str, tls: bool) {
                 memory_ctx().compressed_cache().clear();
             },
             |_| {
-                let bytes = run_batch(&mut requester, &loc, &remote, reads, block, &offset);
+                let bytes = run_batch(&mut requester, &mut stats, &loc, reads, block, &offset);
                 black_box(bytes);
             },
             BatchSize::PerIteration,

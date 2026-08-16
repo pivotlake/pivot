@@ -43,6 +43,7 @@ impl Unary<ReadyFile, ColumnChunkJob> for RowGroupPlanner {
         &mut self,
         file: ReadyFile,
         sender: &mut dyn Sender<ColumnChunkJob>,
+        _io: &mut dispatch::OperatorIO,
     ) -> UnaryResult<()> {
         emit_column_chunk_jobs(file, self.node_count, sender)
     }

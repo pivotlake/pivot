@@ -1,32 +1,29 @@
-use crate::parquet::request_tracker::PendingRequest;
 use crate::parquet::types::leaves::projected_leaves;
 use crate::parquet::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata};
 use crate::parquet::types::projection::Projection;
 use crate::parquet::types::thrift::headers::PageHeader;
 use crate::parquet::types::thrift::parquet_thrift::ThriftReadInputProtocol;
 use bytes::Bytes;
-use dispatch::io::{FsReadRequest, FsRequest, HttpGetRequest, OpenFile};
-use dispatch::memory::{CacheLookup, MultiBufferReader, ReaderPosition, Segment, memory_ctx};
+use dispatch::io::{FileRange, OpenFile, ReadData, ReadResponse};
+use dispatch::memory::{MultiBufferReader, ReaderPosition};
 
 /// One resolved piece of a column chunk, in file order, named by the form its
 /// bytes are in:
 ///
 /// - [`Compressed`](Self::Compressed): raw compressed bytes for the indexer to
-///   Thrift-parse into pages. They may be fully resident in the compressed
-///   cache or partly read from disk/HTTP; `Payload` tracks that IO state -
-///   [`CacheLookup`]s while this row group's reads may still be in flight,
-///   plain [`Bytes`] once every read has landed (see
-///   [`into_ready`](Self::into_ready)).
+///   Thrift-parse into pages. Dispatch has already resolved any compressed-cache
+///   misses before constructing this value, so every byte run is pinned and
+///   ready to read.
 /// - [`Decompressed`](Self::Decompressed): a page served straight from the
 ///   decompressed cache before any IO was issued: its identity (`offset`,
 ///   `span`), its header (parsed back out of the hit - see
 ///   [`parse_page_header`]), and its decompressed bytes, pinned. The indexer
 ///   builds a `CompressedPage` from it directly, no parsing or decompression
 ///   needed.
-pub enum ColumnPart<Payload = Vec<Bytes>> {
+pub enum ColumnPart {
     Compressed {
         offset: usize,
-        bytes: Payload,
+        bytes: Vec<Bytes>,
     },
     Decompressed {
         offset: usize,
@@ -36,116 +33,8 @@ pub enum ColumnPart<Payload = Vec<Bytes>> {
     },
 }
 
-impl ColumnPart<Vec<CacheLookup>> {
-    /// Resolve the IO state away, one landed [`Bytes`] run per lookup. Only
-    /// valid once every queued read has landed.
-    fn into_ready(self) -> ColumnPart {
-        match self {
-            Self::Compressed { offset, bytes } => ColumnPart::Compressed {
-                offset,
-                bytes: bytes.into_iter().map(CacheLookup::into_data).collect(),
-            },
-            Self::Decompressed {
-                offset,
-                span,
-                header,
-                data,
-            } => ColumnPart::Decompressed {
-                offset,
-                span,
-                header,
-                data,
-            },
-        }
-    }
-}
-
-/// Tracks the IO state for a single column chunk within a row group.
-///
-/// The chunk's byte range is resolved against the decompressed cache first
-/// ([`get_range`](dispatch::memory::DecompressedCache::get_range)): any page
-/// already decompressed there is pinned on the spot and needs no IO at all. What's
-/// left is looked up in the compressed cache exactly as before, one
-/// [`CacheLookup`] per contiguous cached/missing run, and queued for IO.
-struct ColumnRequest {
-    parts: Vec<ColumnPart<Vec<CacheLookup>>>,
-}
-
-impl ColumnRequest {
-    /// Build a `ColumnRequest` from column chunk metadata, queueing the reads
-    /// for any missing sub-blocks onto the filesystem or HTTP request list
-    /// according to where the file lives.
-    fn from(
-        meta: &ColumnChunkMeta,
-        open_file: &OpenFile,
-        fs_requests: &mut Vec<FsRequest>,
-        http_requests: &mut Vec<HttpGetRequest>,
-    ) -> Self {
-        let col_start = meta.dictionary_page_offset.unwrap_or(meta.data_page_offset) as usize;
-        let len = meta.total_compressed_size as usize;
-
-        let parts = memory_ctx()
-            .decompressed_cache()
-            .get_range(open_file, col_start, len)
-            .into_iter()
-            .map(|segment| match segment {
-                Segment::Gap { offset, len } => ColumnPart::Compressed {
-                    offset,
-                    bytes: compressed_lookup(open_file, offset, len, fs_requests, http_requests),
-                },
-                Segment::Cached {
-                    offset,
-                    span,
-                    header,
-                    data,
-                } => ColumnPart::Decompressed {
-                    offset,
-                    span,
-                    header: Box::new(parse_page_header(&header)),
-                    data,
-                },
-            })
-            .collect();
-        Self { parts }
-    }
-
-    /// Consume this request into the column's resolved parts, in file order. Only
-    /// valid once every queued read has landed.
-    fn into_source(self) -> Vec<ColumnPart> {
-        self.parts.into_iter().map(ColumnPart::into_ready).collect()
-    }
-}
-
-/// Look up `[offset, offset+len)` of `open_file` in the compressed cache, queueing
-/// any missing blocks onto the filesystem or HTTP request list according to where
-/// the file lives.
-fn compressed_lookup(
-    open_file: &OpenFile,
-    offset: usize,
-    len: usize,
-    fs_requests: &mut Vec<FsRequest>,
-    http_requests: &mut Vec<HttpGetRequest>,
-) -> Vec<CacheLookup> {
-    let parts = memory_ctx().compressed_cache().get(open_file, offset, len);
-    for lookup in &parts {
-        if let Some(block) = lookup.missing() {
-            match open_file {
-                OpenFile::Local(file) => fs_requests.push(FsRequest::Read(FsReadRequest {
-                    file: file.clone(),
-                    block: block.clone(),
-                })),
-                OpenFile::Remote(remote) => http_requests.push(HttpGetRequest {
-                    remote: remote.clone(),
-                    block: block.clone(),
-                }),
-            }
-        }
-    }
-    parts
-}
-
 /// Parse a page's Thrift header back out of the bytes a decompressed-cache hit
-/// returned (see [`Segment::Cached`], which
+/// returned (see [`dispatch::memory::Segment::Cached`], which
 /// stores whatever the `Decompressor`
 /// serialized at insert time) - cheap, a few bytes, entirely in memory; no disk
 /// access and nothing to do with the (possibly much larger) page payload.
@@ -159,22 +48,13 @@ fn parse_page_header(bytes: &[Bytes]) -> PageHeader {
 
 /// Tracks the IO state for an entire row group read.
 ///
-/// Created by `from()`, which resolves every projected column against the
-/// decompressed cache and then the compressed cache, queuing read requests for any
-/// still-missing sub-blocks. As completions arrive the requester fills the blocks
-/// directly into their cache slots and the fetcher counts down via
-/// [`complete_one`](Self::complete_one) until [`complete`](Self::complete) holds.
+/// It contains only durable file locations. Cache lookup, extent allocation,
+/// physical reads happen later in dispatch's worker-local requester and its
+/// private tracker.
 pub struct RowGroupRequest {
     metadata: QueryRowGroupMetadata,
-    column_requests: Vec<ColumnRequest>,
-    /// Local filesystem reads not yet handed to the fetcher (drained when the
-    /// row group is admitted).
-    pending_fs: Vec<FsRequest>,
-    /// Remote HTTP reads not yet handed to the fetcher.
-    pending_http: Vec<HttpGetRequest>,
-    /// Outstanding read count (decremented as each of this row group's reads
-    /// lands).
-    remaining: usize,
+    open_file: OpenFile,
+    locations: Vec<FileRange>,
 }
 
 impl RowGroupRequest {
@@ -188,62 +68,66 @@ impl RowGroupRequest {
         let fields = metadata_handle.get_metadata().schema.fields();
         let leaves = projected_leaves(fields, &metadata_handle, projection);
 
-        let mut pending_fs = vec![];
-        let mut pending_http = vec![];
-        let column_requests = leaves
+        let locations = leaves
             .iter()
             .map(|&leaf| {
-                ColumnRequest::from(
-                    &columns[leaf],
-                    &open_file,
-                    &mut pending_fs,
-                    &mut pending_http,
+                let meta: &ColumnChunkMeta = &columns[leaf];
+                FileRange::new(
+                    meta.dictionary_page_offset.unwrap_or(meta.data_page_offset) as usize,
+                    meta.total_compressed_size as usize,
                 )
             })
             .collect();
 
         Self {
-            column_requests,
-            remaining: pending_fs.len() + pending_http.len(),
-            pending_fs,
-            pending_http,
             metadata: metadata_handle,
+            open_file,
+            locations,
         }
     }
 
-    /// Record that one queued read has landed (and been committed to its slot).
-    pub fn complete_one(&mut self) {
-        self.remaining -= 1;
+    pub fn open_file(&self) -> &OpenFile {
+        &self.open_file
     }
 
-    /// True when every read has completed and the row group is ready to consume.
-    pub fn complete(&self) -> bool {
-        self.remaining == 0
+    pub fn locations(&self) -> &[FileRange] {
+        &self.locations
     }
 
-    /// Consume this request into a `RowGroupBuffer`.
+    /// Pair this row group's domain metadata with dispatch's resolved response.
     /// Runs on the claiming worker (the fetcher emits from the worker that
     /// admitted the request), so the buffer records it as the decode owner.
-    pub fn into_row_group_buffer(self) -> RowGroupBuffer {
+    pub fn into_row_group_buffer(self, response: ReadResponse) -> RowGroupBuffer {
+        let locations = response.into_locations();
+        assert_eq!(locations.len(), self.locations.len());
         RowGroupBuffer {
             metadata: self.metadata,
-            columns: self
-                .column_requests
+            columns: locations
                 .into_iter()
-                .map(ColumnRequest::into_source)
+                .map(|parts| {
+                    parts
+                        .into_iter()
+                        .map(|part| match part {
+                            ReadData::Compressed { offset, bytes } => {
+                                ColumnPart::Compressed { offset, bytes }
+                            }
+                            ReadData::Decompressed {
+                                offset,
+                                span,
+                                header,
+                                data,
+                            } => ColumnPart::Decompressed {
+                                offset,
+                                span,
+                                header: Box::new(parse_page_header(&header)),
+                                data,
+                            },
+                        })
+                        .collect()
+                })
                 .collect(),
             worker_id: dispatch::worker::WORKER_IDX.get(),
         }
-    }
-}
-
-impl PendingRequest for RowGroupRequest {
-    fn pending_fs(&mut self) -> &mut Vec<FsRequest> {
-        &mut self.pending_fs
-    }
-
-    fn pending_http(&mut self) -> &mut Vec<HttpGetRequest> {
-        &mut self.pending_http
     }
 }
 

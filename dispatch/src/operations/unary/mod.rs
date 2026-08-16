@@ -57,9 +57,7 @@ mod factory;
 pub use factory::*;
 
 use crate::data_flow::WorkStatus;
-use crate::io::{
-    FsReadRequest, FsRequest, FsWriteRequest, HttpGetRequest, HttpRequest, HttpUploadRequest,
-};
+use crate::io::{FsWriteRequest, HttpUploadRequest, OperatorIO, ReadResponse};
 use arrow_schema::ArrowError;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -130,18 +128,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 /// but the parquet pipeline uses other types (e.g. `CompressedPage -> DecompressedPage`).
 pub trait Unary<I, O> {
     /// Process one input item, sending zero or more output items to `sender`.
-    fn consume(&mut self, object: I, sender: &mut dyn Sender<O>) -> Result<()>;
-
-    /// Return any pending filesystem requests. See [`Operator::next_fs_requests`].
-    fn next_fs_requests(&mut self) -> Result<Vec<FsRequest>> {
-        Ok(vec![])
-    }
-
-    /// Return any pending HTTP requests (reads of remote regions). See
-    /// [`Operator::next_http_requests`].
-    fn next_http_requests(&mut self) -> Result<Vec<HttpRequest>> {
-        Ok(vec![])
-    }
+    fn consume(&mut self, object: I, sender: &mut dyn Sender<O>, io: &mut OperatorIO)
+    -> Result<()>;
 
     /// Whether this unary is ready to accept another input. Returns `false` when
     /// backpressured (e.g. waiting for IO to complete before consuming more).
@@ -149,12 +137,13 @@ pub trait Unary<I, O> {
         true
     }
 
-    /// Handle a completed filesystem operation. Read bytes are already
-    /// committed to the cache slot.
-    fn process_fs_read_response(
+    /// Handle a completed logical read. Dispatch has already resolved cache
+    /// hits and committed any physical reads.
+    fn process_read_response(
         &mut self,
         _sender: &mut dyn Sender<O>,
-        _request: FsReadRequest,
+        _io: &mut OperatorIO,
+        _response: ReadResponse,
     ) -> Result<()> {
         unreachable!()
     }
@@ -163,16 +152,6 @@ pub trait Unary<I, O> {
         &mut self,
         _sender: &mut dyn Sender<O>,
         _request: FsWriteRequest,
-    ) -> Result<()> {
-        unreachable!()
-    }
-
-    /// Handle a completed HTTP GET; its bytes are already committed to the
-    /// cache slot.
-    fn process_http_get_response(
-        &mut self,
-        _sender: &mut dyn Sender<O>,
-        _request: HttpGetRequest,
     ) -> Result<()> {
         unreachable!()
     }
@@ -271,7 +250,7 @@ impl<I, O, U: Unary<I, O>, R: Receiver<I>> UnaryOperator<I, O, U, R> {
 }
 
 impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, IN> {
-    fn run_cpu_work(&mut self) -> super::Result<WorkStatus> {
+    fn run_cpu_work(&mut self, io: &mut OperatorIO) -> super::Result<WorkStatus> {
         if !self.unary.ready_for_more_work() {
             return Ok(WorkStatus::Pending);
         }
@@ -281,35 +260,25 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
             Some(t) => t,
         };
 
-        self.unary.consume(item, &mut *self.sender)?;
+        self.unary.consume(item, &mut *self.sender, io)?;
 
         Ok(WorkStatus::Ran)
     }
 
-    fn next_fs_requests(&mut self) -> super::Result<Vec<FsRequest>> {
-        Ok(self.unary.next_fs_requests()?)
-    }
-
-    fn next_http_requests(&mut self) -> super::Result<Vec<HttpRequest>> {
-        Ok(self.unary.next_http_requests()?)
-    }
-
-    fn process_fs_read_response(&mut self, request: FsReadRequest) -> super::Result<()> {
+    fn process_read_response(
+        &mut self,
+        io: &mut OperatorIO,
+        response: ReadResponse,
+    ) -> super::Result<()> {
         Ok(self
             .unary
-            .process_fs_read_response(&mut *self.sender, request)?)
+            .process_read_response(&mut *self.sender, io, response)?)
     }
 
     fn process_fs_write_response(&mut self, request: FsWriteRequest) -> super::Result<()> {
         Ok(self
             .unary
             .process_fs_write_response(&mut *self.sender, request)?)
-    }
-
-    fn process_http_get_response(&mut self, request: HttpGetRequest) -> super::Result<()> {
-        Ok(self
-            .unary
-            .process_http_get_response(&mut *self.sender, request)?)
     }
 
     fn process_http_upload_response(&mut self, request: HttpUploadRequest) -> super::Result<()> {
@@ -377,13 +346,13 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
         Ok(FinishStatus::Pending)
     }
 
-    fn try_steal_work(&mut self) -> super::Result<WorkStatus> {
+    fn try_steal_work(&mut self, io: &mut OperatorIO) -> super::Result<WorkStatus> {
         if !self.unary.ready_for_more_work() {
             return Ok(WorkStatus::Pending);
         }
         match self.receiver.steal() {
             Some(s) => {
-                self.unary.consume(s, &mut *self.sender)?;
+                self.unary.consume(s, &mut *self.sender, io)?;
                 Ok(WorkStatus::Ran)
             }
             None => Ok(WorkStatus::Pending),

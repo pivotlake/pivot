@@ -140,7 +140,12 @@ impl<T> Default for Forward<T> {
 }
 
 impl<T> Unary<T, T> for Forward<T> {
-    fn consume(&mut self, item: T, sender: &mut dyn Sender<T>) -> unary::Result<()> {
+    fn consume(
+        &mut self,
+        item: T,
+        sender: &mut dyn Sender<T>,
+        _io: &mut crate::io::OperatorIO,
+    ) -> unary::Result<()> {
         sender.send(item)?;
         Ok(())
     }

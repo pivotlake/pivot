@@ -48,6 +48,7 @@ impl Unary<ColumnChunkJob, EncodedColumnChunk> for ColumnEncoder {
         &mut self,
         job: ColumnChunkJob,
         sender: &mut dyn Sender<EncodedColumnChunk>,
+        _io: &mut dispatch::OperatorIO,
     ) -> UnaryResult<()> {
         let field = job.context.schema.field(job.column_index);
         let allocator = self

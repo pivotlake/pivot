@@ -116,8 +116,9 @@ impl<T> Sender<T> for CollectSender<T> {
 /// Feed `inputs` through a [`Unary`] operator and return all output items.
 pub fn run_unary<I, O, U: Unary<I, O>>(mut unary: U, inputs: Vec<I>) -> Vec<O> {
     let mut sender = CollectSender::new();
+    let mut io = crate::io::OperatorIO::default();
     for item in inputs {
-        unary.consume(item, &mut sender).unwrap();
+        unary.consume(item, &mut sender, &mut io).unwrap();
     }
     sender.items
 }
@@ -129,8 +130,9 @@ pub fn run_unary<I, O, U: Unary<I, O>>(mut unary: U, inputs: Vec<I>) -> Vec<O> {
 /// Decoder which batches across multiple pages).
 pub fn run_unary_to_completion<I, O, U: Unary<I, O>>(mut unary: U, inputs: Vec<I>) -> Vec<O> {
     let mut sender = CollectSender::new();
+    let mut io = crate::io::OperatorIO::default();
     for item in inputs {
-        unary.consume(item, &mut sender).unwrap();
+        unary.consume(item, &mut sender, &mut io).unwrap();
     }
     loop {
         unary.run(&mut sender).unwrap();
