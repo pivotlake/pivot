@@ -23,6 +23,7 @@ impl Unary<FileOrderInput, LocalMergeJob> for LocalMergePlanner {
         &mut self,
         input: FileOrderInput,
         sender: &mut dyn Sender<LocalMergeJob>,
+        _io: &mut dispatch::OperatorIO,
     ) -> UnaryResult<()> {
         let request = match input {
             FileOrderInput::Ready(file) => {
@@ -72,6 +73,7 @@ impl Unary<LocalMergeJob, LocalMergeResult> for LocalMergeExecutor {
         &mut self,
         job: LocalMergeJob,
         sender: &mut dyn Sender<LocalMergeResult>,
+        _io: &mut dispatch::OperatorIO,
     ) -> UnaryResult<()> {
         match job {
             LocalMergeJob::Ready(file) => sender.send(LocalMergeResult::Ready(file))?,
@@ -113,6 +115,7 @@ impl Unary<LocalMergeResult, GlobalMergeJob> for GlobalMergePlanner {
         &mut self,
         result: LocalMergeResult,
         sender: &mut dyn Sender<GlobalMergeJob>,
+        _io: &mut dispatch::OperatorIO,
     ) -> UnaryResult<()> {
         let (context, node_id, output) = match result {
             LocalMergeResult::Ready(file) => {
@@ -182,6 +185,7 @@ impl Unary<GlobalMergeJob, ReadyFile> for GlobalMergeExecutor {
         &mut self,
         job: GlobalMergeJob,
         sender: &mut dyn Sender<ReadyFile>,
+        _io: &mut dispatch::OperatorIO,
     ) -> UnaryResult<()> {
         match job {
             GlobalMergeJob::Ready(file) => sender.send(file)?,
@@ -270,24 +274,48 @@ mod tests {
         let mut local_planner = LocalMergePlanner;
         let mut local_jobs = CollectSender::new();
         for input in inputs {
-            local_planner.consume(input, &mut local_jobs).unwrap();
+            local_planner
+                .consume(
+                    input,
+                    &mut local_jobs,
+                    &mut dispatch::TestOperatorIO::default().io(),
+                )
+                .unwrap();
         }
         let mut local_executor = LocalMergeExecutor::default();
         let mut local_results = CollectSender::new();
         for job in local_jobs.items {
-            local_executor.consume(job, &mut local_results).unwrap();
+            local_executor
+                .consume(
+                    job,
+                    &mut local_results,
+                    &mut dispatch::TestOperatorIO::default().io(),
+                )
+                .unwrap();
         }
         assert_eq!(local_results.items.len(), 2);
 
         let mut global_planner = GlobalMergePlanner;
         let mut global_jobs = CollectSender::new();
         for result in local_results.items {
-            global_planner.consume(result, &mut global_jobs).unwrap();
+            global_planner
+                .consume(
+                    result,
+                    &mut global_jobs,
+                    &mut dispatch::TestOperatorIO::default().io(),
+                )
+                .unwrap();
         }
         let mut global_executor = GlobalMergeExecutor::default();
         let mut ready_files = CollectSender::new();
         for job in global_jobs.items {
-            global_executor.consume(job, &mut ready_files).unwrap();
+            global_executor
+                .consume(
+                    job,
+                    &mut ready_files,
+                    &mut dispatch::TestOperatorIO::default().io(),
+                )
+                .unwrap();
         }
 
         assert_eq!(ready_files.items.len(), 1);

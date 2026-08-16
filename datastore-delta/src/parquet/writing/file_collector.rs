@@ -189,6 +189,7 @@ impl Unary<SortedPartitionRun, FileOrderInput> for FileCollector {
         &mut self,
         partition_run: SortedPartitionRun,
         sender: &mut dyn Sender<FileOrderInput>,
+        _io: &mut dispatch::OperatorIO,
     ) -> UnaryResult<()> {
         let run_row_count: usize = partition_run
             .batches

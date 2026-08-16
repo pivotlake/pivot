@@ -39,11 +39,11 @@
 //! per contiguous fragment it resolves to - a *hit* already resident in one slot, a
 //! *refill* mapped but not yet read, or a freshly *allocated* miss. Each
 //! lookup carries its `data` (a zero-copy view into the slot it lives in) plus its
-//! `missing` blocks (empty on a hit). Concatenating every lookup's `data` in order
-//! reproduces the requested bytes once every [`MissingExtent`] has been read into
-//! its slot at [`MissingExtent::dest`] and marked valid via [`MissingExtent::commit`].
-//! Callers feed the fragments into a scattered reader, so more (smaller) fragments
-//! are fine.
+//! `missing` blocks (empty on a hit). A new extent owns its fill; an invalid extent
+//! already in the map follows that owner's request. Concatenating every lookup's
+//! `data` in order reproduces the requested bytes once every [`MissingExtent`] is
+//! committed. Callers feed the fragments into a scattered reader, so more (smaller)
+//! fragments are fine.
 
 use crate::io::OpenFile;
 use crate::memory::clock::Owner;
@@ -54,9 +54,10 @@ use crate::memory::ring::BUFFER_SIZE;
 use crate::memory::write_buffer::WriteBuffer;
 use ahash::HashMap;
 use bytes::Bytes;
+use crossbeam_deque::{Injector, Steal};
 use std::cell::UnsafeCell;
 use std::collections::{BTreeMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Block granularity for validity tracking and disk reads (the direct-I/O
@@ -80,7 +81,7 @@ const BITMAP_WORDS: usize = BLOCKS_PER_SLOT / 64;
 ///
 /// So the extent's Nth block is file block `first_file_block + N` and slot block
 /// `first_slot_block + N`. Never spans more than one slot.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Extent {
     /// The extent's first file block. Also its key in the file's extent map.
     first_file_block: usize,
@@ -90,6 +91,12 @@ struct Extent {
     first_slot_block: u16,
     /// Length of the extent in 4 KB blocks - the same count on both rulers.
     block_count: u16,
+    /// Set when the worker filling this extent fails. Followers retain this
+    /// shared flag after the failed extent is removed from the map.
+    failed: Arc<AtomicBool>,
+    /// Workers waiting for this extent's fill to finish. The owner drains the
+    /// queue after either committing bytes or reporting failure.
+    subscribing_workers: Arc<Injector<usize>>,
 }
 
 impl Extent {
@@ -137,7 +144,8 @@ struct Tenant {
 /// One fragment of a [`CompressedCache::get`] result: looked-up bytes (a zero-copy
 /// view into the slot that holds them) plus the fragment's missing part, if any.
 /// A fragment is resolved whole, so it is either fully resident (a hit) or has one
-/// [`MissingExtent`] to read; `data` only becomes valid once that read has committed.
+/// [`MissingExtent`] to resolve; its fill owner reads it while later lookups wait
+/// for that owner. `data` only becomes valid once the extent has committed.
 pub struct CacheLookup {
     /// Zero-copy view of this fragment's bytes inside its ring slot (kept alive by
     /// the pin the `Bytes` owns). Only valid to read once `missing` is filled.
@@ -148,8 +156,8 @@ pub struct CacheLookup {
 }
 
 impl CacheLookup {
-    /// The fragment's not-yet-resident part; it must be read & committed before
-    /// [`data`](Self::into_data) is valid. `None` on a hit.
+    /// The fragment's not-yet-resident part. Its fill owner must read and commit
+    /// it; a follower waits for that owner. `None` on a hit.
     pub fn missing(&self) -> Option<&MissingExtent> {
         self.missing.as_ref()
     }
@@ -162,10 +170,11 @@ impl CacheLookup {
     }
 }
 
-/// An extent still missing from the cache: the [`Extent`] to fill (its file→slot
-/// mapping) plus a pin keeping its slot alive while the read is in flight. The read
-/// targets [`dest`] - a region inside the pinned slot - directly, with no
-/// intermediate buffer, and once it lands [`commit`] marks the whole extent valid.
+/// An extent still missing from the cache: its file→slot mapping, whether this
+/// lookup owns the fill, and a pin keeping its slot alive. The owning read targets
+/// [`dest`] directly, with no intermediate buffer, and once it lands [`commit`]
+/// marks the whole extent valid. A follower retains the same mapping and waits for
+/// either those valid bits or the shared failure flag.
 ///
 /// The pin is shared with the lookup's `data`, so the slot can't be evicted while a
 /// read into it is outstanding - even if the owning query is cancelled first.
@@ -176,6 +185,9 @@ impl CacheLookup {
 pub struct MissingExtent {
     /// The extent to read: which file blocks map to which slot blocks.
     extent: Extent,
+    /// Whether this lookup inserted the extent and therefore owns its fill.
+    /// An invalid extent found in the map is already being filled elsewhere.
+    fill_owner: bool,
     /// Keeps the destination slot pinned for the read's whole lifetime.
     _pin: Arc<ReadBuffer>,
 }
@@ -183,8 +195,44 @@ pub struct MissingExtent {
 impl MissingExtent {
     /// The missing `extent`, backed by the slot `pin` holds; `extent.slot_idx` is `pin`'s
     /// slot, and `pin`'s base address gives [`dest`](Self::dest).
-    fn new(extent: Extent, pin: Arc<ReadBuffer>) -> Self {
-        MissingExtent { extent, _pin: pin }
+    fn new(extent: Extent, pin: Arc<ReadBuffer>, fill_owner: bool) -> Self {
+        MissingExtent {
+            extent,
+            fill_owner,
+            _pin: pin,
+        }
+    }
+
+    /// Whether this lookup is responsible for filling the extent. A non-owner
+    /// follows the request that inserted the extent instead of issuing another.
+    pub(crate) fn fill_owner(&self) -> bool {
+        self.fill_owner
+    }
+
+    /// Register a worker to be woken when the owning fill finishes.
+    pub(crate) fn subscribe(&self, worker_id: usize) {
+        self.extent.subscribing_workers.push(worker_id);
+        // If the outcome was published and its subscriber queue drained just
+        // before this push, no owner remains to wake us. Notify ourselves so
+        // the worker reaches its next normal completions pass without sleeping.
+        if self.failed() || self.is_committed() {
+            crate::waker::waker_set().notify_worker(worker_id);
+        }
+    }
+
+    /// Whether every block covered by this view has been committed.
+    pub(crate) fn is_committed(&self) -> bool {
+        let valid = &memory_ctx()
+            .compressed_cache()
+            .slot_metadata(self.extent.slot_idx as usize)
+            .valid;
+        (0..self.extent.block_count as usize)
+            .all(|block| valid.is_set(self.extent.first_slot_block as usize + block))
+    }
+
+    /// Whether the worker owning the shared fill reported failure.
+    pub(crate) fn failed(&self) -> bool {
+        self.extent.failed.load(Ordering::Acquire)
     }
 
     /// File offset the extent's bytes are read from - always a multiple of
@@ -219,7 +267,10 @@ impl MissingExtent {
                 slot_idx: self.extent.slot_idx,
                 first_slot_block: self.extent.first_slot_block + blocks_in as u16,
                 block_count: (len / BLOCK_SIZE) as u16,
+                failed: self.extent.failed.clone(),
+                subscribing_workers: self.extent.subscribing_workers.clone(),
             },
+            fill_owner: self.fill_owner,
             _pin: self._pin.clone(),
         }
     }
@@ -242,6 +293,25 @@ impl MissingExtent {
                 self.extent.first_slot_block as usize,
                 self.extent.block_count as usize,
             );
+    }
+
+    /// Mark this fill failed, remove its extent, and wake its followers. A later
+    /// lookup can then allocate a fresh extent and issue a new request.
+    pub(crate) fn remove_from_cache(&self, open_file: &OpenFile) {
+        memory_ctx()
+            .compressed_cache()
+            .remove_extent(open_file, self);
+        self.wake_subscribers();
+    }
+
+    pub(crate) fn wake_subscribers(&self) {
+        loop {
+            match self.extent.subscribing_workers.steal() {
+                Steal::Success(worker_id) => crate::waker::waker_set().notify_worker(worker_id),
+                Steal::Retry => continue,
+                Steal::Empty => return,
+            }
+        }
     }
 }
 
@@ -390,6 +460,32 @@ impl CompressedCache {
         lookups
     }
 
+    fn remove_extent(&self, open_file: &OpenFile, missing: &MissingExtent) {
+        let file_maps = self.file_maps.read().unwrap();
+        let Some(extents_lock) = file_maps.get(open_file) else {
+            missing.extent.failed.store(true, Ordering::Release);
+            return;
+        };
+        let mut extents = extents_lock.write().unwrap();
+        // Publish failure while holding the map write lock that excludes a new
+        // lookup from discovering this extent. New readers can allocate a fresh
+        // fill after removal; existing followers retain this shared flag.
+        missing.extent.failed.store(true, Ordering::Release);
+        let key = extents
+            .range(..=missing.extent.first_file_block)
+            .next_back()
+            .filter(|(_, extent)| {
+                extent.last_file_block() >= missing.extent.first_file_block
+                    && extent.slot_idx == missing.extent.slot_idx
+                    && extent.slot_block_of(missing.extent.first_file_block)
+                        == missing.extent.first_slot_block as usize
+            })
+            .map(|(&key, _)| key);
+        if let Some(key) = key {
+            extents.remove(&key);
+        }
+    }
+
     /// Try to resolve the lookup step at `file_block` from an existing extent for
     /// `open_file`. Pins the extent's slot and takes the maximal span of equal
     /// validity, bounded by the extent and `last_file_block`. A valid span is a hit
@@ -433,9 +529,11 @@ impl CompressedCache {
             slot_idx: found_extent.slot_idx,
             first_slot_block: found_extent.slot_block_of(file_block) as u16,
             block_count: (last_matching_file_block - file_block + 1) as u16,
+            failed: found_extent.failed.clone(),
+            subscribing_workers: found_extent.subscribing_workers.clone(),
         };
         let data = extent.clipped_bytes(&pin, start_offset, end_offset);
-        let missing = (!is_valid).then(|| MissingExtent::new(extent, pin));
+        let missing = (!is_valid).then(|| MissingExtent::new(extent.clone(), pin, false));
         Some(CacheLookupStep {
             lookup: CacheLookup { data, missing },
             next_file_block: file_block + extent.block_count as usize,
@@ -481,7 +579,7 @@ impl CompressedCache {
         Some(CacheLookupStep {
             lookup: CacheLookup {
                 data,
-                missing: Some(MissingExtent::new(extent, pin)),
+                missing: Some(MissingExtent::new(extent.clone(), pin, true)),
             },
             next_file_block: file_block + extent.block_count as usize,
         })
@@ -557,6 +655,8 @@ impl CompressedCache {
             slot_idx: slot_idx as u32,
             first_slot_block: first_slot_block as u16,
             block_count: block_count as u16,
+            failed: Arc::new(AtomicBool::new(false)),
+            subscribing_workers: Arc::new(Injector::new()),
         };
         // Record the tenant before the extent: an extent with no tenant would leak
         // (eviction only drops extents listed as tenants), while a tenant with no
@@ -565,7 +665,7 @@ impl CompressedCache {
             open_file: open_file.clone(),
             first_file_block: file_block,
         });
-        extents.insert(file_block, extent);
+        extents.insert(file_block, extent.clone());
         // Mark it referenced so the fresh extent survives one CLOCK sweep.
         memory_ctx().clock().touch(slot_idx);
         Some(extent)
@@ -782,8 +882,8 @@ impl CompressedCache {
 /// The extent covering file block `file_block`, if any: the greatest-keyed extent at
 /// or before it that reaches it. Extents never overlap, so at most one qualifies.
 fn find_extent_covering(extents: &BTreeMap<usize, Extent>, file_block: usize) -> Option<Extent> {
-    let (_, &extent) = extents.range(..=file_block).next_back()?;
-    (extent.last_file_block() >= file_block).then_some(extent)
+    let (_, extent) = extents.range(..=file_block).next_back()?;
+    (extent.last_file_block() >= file_block).then(|| extent.clone())
 }
 
 /// How many blocks from `file_block` are free of any extent, up to `want` - the

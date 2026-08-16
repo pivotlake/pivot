@@ -478,6 +478,7 @@ impl Unary<RecordBatch, RecordBatch> for OrderByLimit {
         &mut self,
         batch: RecordBatch,
         _sender: &mut dyn Sender<RecordBatch>,
+        _io: &mut crate::io::OperatorIO,
     ) -> unary::Result<()> {
         debug!("Received batch of length {:?}", batch.num_rows());
         // Local stages keep `limit + offset` candidates (skip = 0); only the
@@ -636,7 +637,9 @@ mod tests {
         {
             crate::worker::WORKER_IDX.set(worker_index);
             for batch in batches {
-                operator.consume(batch, &mut sender).unwrap();
+                operator
+                    .consume(batch, &mut sender, &mut crate::io::OperatorIO::default())
+                    .unwrap();
             }
         }
         for (worker_index, operator) in operators.iter_mut().enumerate() {
@@ -666,13 +669,28 @@ mod tests {
         let mut op = order_by_limit(vec![OrderBy::new(0, true, false)], 2, 0, Some(slot.clone()));
         let mut sink = CollectSender::new();
 
-        op.consume(batch(&[10, 20, 30]), &mut sink).unwrap();
+        op.consume(
+            batch(&[10, 20, 30]),
+            &mut sink,
+            &mut crate::io::OperatorIO::default(),
+        )
+        .unwrap();
         assert_eq!(slot_value(&slot), Some(20)); // running top-2 [30, 20]
 
-        op.consume(batch(&[100, 5]), &mut sink).unwrap();
+        op.consume(
+            batch(&[100, 5]),
+            &mut sink,
+            &mut crate::io::OperatorIO::default(),
+        )
+        .unwrap();
         assert_eq!(slot_value(&slot), Some(30)); // running top-2 now [100, 30]
 
-        op.consume(batch(&[50, 60]), &mut sink).unwrap();
+        op.consume(
+            batch(&[50, 60]),
+            &mut sink,
+            &mut crate::io::OperatorIO::default(),
+        )
+        .unwrap();
         assert_eq!(slot_value(&slot), Some(60)); // running top-2 now [100, 60]
     }
 
@@ -683,7 +701,12 @@ mod tests {
         let mut sink = CollectSender::new();
 
         // Only 2 rows for a LIMIT 3 — no full window yet, nothing to bound on.
-        op.consume(batch(&[10, 20]), &mut sink).unwrap();
+        op.consume(
+            batch(&[10, 20]),
+            &mut sink,
+            &mut crate::io::OperatorIO::default(),
+        )
+        .unwrap();
 
         assert_eq!(slot_value(&slot), None);
     }
@@ -698,9 +721,21 @@ mod tests {
         let mut sink = CollectSender::new();
 
         // Neither worker alone sees 3 rows, but the pooled window does.
-        first.consume(batch(&[10, 20]), &mut sink).unwrap();
+        first
+            .consume(
+                batch(&[10, 20]),
+                &mut sink,
+                &mut crate::io::OperatorIO::default(),
+            )
+            .unwrap();
         assert_eq!(slot_value(&slot), None);
-        second.consume(batch(&[30, 5]), &mut sink).unwrap();
+        second
+            .consume(
+                batch(&[30, 5]),
+                &mut sink,
+                &mut crate::io::OperatorIO::default(),
+            )
+            .unwrap();
 
         // Pooled keys {10, 20, 30, 5}: best 3 ascending are [5, 10, 20].
         assert_eq!(slot_value(&slot), Some(20));
@@ -722,11 +757,17 @@ mod tests {
 
         // Three rows for a LIMIT 2, but only one non-null key: nulls are no
         // evidence of rows beating a boundary, so the window must not arm.
-        op.consume(nullable, &mut sink).unwrap();
+        op.consume(nullable, &mut sink, &mut crate::io::OperatorIO::default())
+            .unwrap();
         assert_eq!(slot_value(&slot), None);
 
         // Two more real keys arm it: pooled {5, 7, 9}, best 2 are [5, 7].
-        op.consume(batch(&[9, 7]), &mut sink).unwrap();
+        op.consume(
+            batch(&[9, 7]),
+            &mut sink,
+            &mut crate::io::OperatorIO::default(),
+        )
+        .unwrap();
         assert_eq!(slot_value(&slot), Some(7));
     }
 
@@ -743,7 +784,12 @@ mod tests {
         let mut sink = CollectSender::new();
 
         let values: Vec<i32> = (0..fetch as i32 + 10).collect();
-        op.consume(batch(&values), &mut sink).unwrap();
+        op.consume(
+            batch(&values),
+            &mut sink,
+            &mut crate::io::OperatorIO::default(),
+        )
+        .unwrap();
 
         // Too large for the pooled window, so the boundary comes from this
         // worker's own full window: its fetch-th smallest key.
@@ -771,8 +817,12 @@ mod tests {
         let mut op = order_by_limit(order_by, 2, 0, Some(slot.clone()));
         let mut sink = CollectSender::new();
 
-        op.consume(two_key_batch(&[(5, 2), (1, 9), (3, 4)]), &mut sink)
-            .unwrap();
+        op.consume(
+            two_key_batch(&[(5, 2), (1, 9), (3, 4)]),
+            &mut sink,
+            &mut crate::io::OperatorIO::default(),
+        )
+        .unwrap();
 
         // Top-2 rows are (1, 9) and (3, 4); the boundary is the leading key 3.
         assert_eq!(slot_value(&slot), Some(3));

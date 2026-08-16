@@ -224,6 +224,7 @@ impl Unary<DecompressedPage, RecordBatch> for Decoder {
         &mut self,
         page: DecompressedPage,
         output: &mut dyn Sender<RecordBatch>,
+        _io: &mut dispatch::OperatorIO,
     ) -> dispatch::UnaryResult<()> {
         if self
             .closed_row_groups
@@ -688,12 +689,24 @@ mod tests {
         // The first page holds every kept row; consuming it emits one bounded
         // batch (2 of 3) and leaves the decoder one row short of its total.
         let kept = make_data_page(metadata.clone(), 0, encode_i32s(&[10, 20, 30]), 3, 0);
-        dispatch::Unary::consume(&mut decoder, kept, &mut sink).unwrap();
+        dispatch::Unary::consume(
+            &mut decoder,
+            kept,
+            &mut sink,
+            &mut dispatch::OperatorIO::default(),
+        )
+        .unwrap();
         // The drain pass emits the last row, exhausting the row group while
         // its trailing skipped page has not arrived yet.
         dispatch::Unary::run(&mut decoder, &mut sink).unwrap();
         let late_skipped = make_skipped_page(metadata, 0, 2, 1);
-        dispatch::Unary::consume(&mut decoder, late_skipped, &mut sink).unwrap();
+        dispatch::Unary::consume(
+            &mut decoder,
+            late_skipped,
+            &mut sink,
+            &mut dispatch::OperatorIO::default(),
+        )
+        .unwrap();
 
         assert_eq!(sink.items.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
         assert!(dispatch::Unary::finish(&mut decoder, &mut sink).unwrap());
