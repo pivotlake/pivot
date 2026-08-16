@@ -31,6 +31,7 @@ const RELATIONS: &[&str] = &[
     "pg_class",
     "pg_collation",
     "pg_constraint",
+    "pg_description",
     "pg_inherits",
     "pg_namespace",
     "pg_policy",
@@ -187,6 +188,15 @@ pub fn bind_table(
                 column("conkey", Type::List(Box::new(Type::Int16))),
                 column("confkey", Type::List(Box::new(Type::Int16))),
                 column("conbin", Type::Utf8),
+            ],
+        ),
+        "pg_description" => build_empty(
+            &reference,
+            &[
+                column("objoid", Type::UInt32),
+                column("classoid", Type::UInt32),
+                column("objsubid", Type::Int32),
+                column("description", Type::Utf8),
             ],
         ),
         "pg_inherits" => build_empty(
@@ -615,6 +625,11 @@ fn build_pg_type(
             oid_column("typelem", row_count, 0),
             oid_column("typarray", row_count, 0),
             oid_column("typcollation", row_count, 0),
+            // Domain-type bookkeeping the JDBC driver's column metadata query
+            // reads: none of pivot's types are domains.
+            bool_column("typnotnull", row_count, false),
+            oid_column("typbasetype", row_count, 0),
+            int32_column("typtypmod", row_count, -1),
         ],
     )
 }
