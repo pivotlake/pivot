@@ -299,7 +299,7 @@ mod tests {
 
     fn make_test_table(schema: SchemaRef, num_rows: i64) -> Arc<ParquetTable> {
         let num_cols = schema.fields().len();
-        let file = Arc::new(std::fs::File::open("/dev/null").unwrap());
+        let file = dispatch::io::LocalFile::new(std::fs::File::open("/dev/null").unwrap()).unwrap();
         Arc::new(ParquetTable::new(vec![Arc::new(RowGroupMetadata {
             open_file: dispatch::io::OpenFile::Local(file),
             schema,
@@ -386,7 +386,7 @@ mod tests {
             Field::new("s", DataType::Utf8View, false),
             Field::new("v", DataType::Int32, false),
         ]));
-        let file = Arc::new(std::fs::File::open("/dev/null").unwrap());
+        let file = dispatch::io::LocalFile::new(std::fs::File::open("/dev/null").unwrap()).unwrap();
         let column = |dict| ColumnChunkMeta {
             dictionary_page_offset: None,
             data_page_offset: 0,

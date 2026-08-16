@@ -9,7 +9,9 @@ use arrow_array::{Int64Array, RecordBatch};
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use crossbeam_deque::Injector;
-use dispatch::io::{FsWriteRequest, HttpUploadRequest, OpenFile, OperatorIO, RemoteFile};
+use dispatch::io::{
+    FsWriteRequest, HttpUploadRequest, LocalFile, OpenFile, OperatorIO, RemoteFile,
+};
 use dispatch::{
     DataFlowDispatcher, RecordBatchOperatorSpec, Sender, Unary, UnaryFactory, stealable,
 };
@@ -335,7 +337,7 @@ impl Unary<AssembledFile, RecordBatch> for Upload {
                     .write(true)
                     .open(path)
                     .map_err(crate::parquet::op_err)?;
-                OpenFile::Local(Arc::new(file_handle))
+                OpenFile::Local(LocalFile::new(file_handle).map_err(crate::parquet::op_err)?)
             }
             DataFileLocation::Remote { url, auth } => {
                 let remote = RemoteFile::open(url, auth, data.len() as u64)

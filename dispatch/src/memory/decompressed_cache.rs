@@ -591,7 +591,7 @@ impl DecompressedCache {
     }
 
     /// Remove `open_file`'s table if it is now empty, so its never-reused
-    /// `OpenFile` (an `Arc<File>`/`Arc<RemoteFile>` pinning the file/connection
+    /// `OpenFile` (a `LocalFile`/`Arc<RemoteFile>` pinning the file/connection
     /// it holds) isn't kept alive for every file ever opened. Re-checks emptiness
     /// under the outer write lock so a concurrent `claim` that just re-created the
     /// table isn't dropped.
@@ -679,12 +679,13 @@ fn build_transient_views(write_buffers: Vec<WriteBuffer>, total_len: usize) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::LocalFile;
     use crate::memory::context::{init_test_free_pool, memory_ctx};
     use std::sync::{Arc, OnceLock};
 
     /// A fresh, independent local file (distinct cache key bucket).
     fn new_file() -> OpenFile {
-        OpenFile::Local(Arc::new(std::fs::File::open("/dev/null").unwrap()))
+        OpenFile::Local(LocalFile::new(std::fs::File::open("/dev/null").unwrap()).unwrap())
     }
 
     fn key_for(open_file: &OpenFile) -> BlockKey {
@@ -698,9 +699,9 @@ mod tests {
     /// One shared local file, reused across tests that key by `offset` alone.
     #[allow(non_snake_case)]
     fn FD() -> OpenFile {
-        static FILE: OnceLock<Arc<std::fs::File>> = OnceLock::new();
+        static FILE: OnceLock<LocalFile> = OnceLock::new();
         OpenFile::Local(
-            FILE.get_or_init(|| Arc::new(std::fs::File::open("/dev/null").unwrap()))
+            FILE.get_or_init(|| LocalFile::new(std::fs::File::open("/dev/null").unwrap()).unwrap())
                 .clone(),
         )
     }
@@ -960,7 +961,7 @@ mod tests {
         cache.reclaim(slot);
 
         assert_eq!(
-            Arc::strong_count(file),
+            file.strong_count(),
             1,
             "evicting a file's last block drops the cache's clone of its fd, not just the block"
         );
