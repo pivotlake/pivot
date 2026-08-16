@@ -426,17 +426,7 @@ fn build_join(
     if key_types.is_empty() {
         return build_range_join(op, join, inputs, inequalities, residual_predicates);
     }
-    // A computed key moves that side's columns behind a projection, but a
-    // residual's refs were resolved against the sides' unextended widths;
-    // nothing needs the combination yet, so it stays loud rather than
-    // re-binding the residuals around the appended columns.
-    let has_computed_keys = !computed_probe_keys.is_empty() || !computed_build_keys.is_empty();
-    let has_residual_conditions = !residual_predicates.is_empty() || !inequalities.is_empty();
-    if has_computed_keys && has_residual_conditions {
-        return Err(OperatorError::Unsupported(
-            "computed join keys beside residual join conditions are not supported".to_string(),
-        ));
-    }
+    let computed_probe_key_count = computed_probe_keys.len();
     if !computed_probe_keys.is_empty() {
         let probe = inputs.remove(0);
         inputs.insert(0, append_computed_keys(probe, computed_probe_keys)?);
@@ -449,6 +439,21 @@ fn build_join(
         .into_iter()
         .map(Expression::from_handle)
         .collect::<Result<Vec<_>, _>>()?;
+    // An expression-form residual was resolved against the original combined
+    // layout [probe, build]. Appended probe keys move the build block right;
+    // appended build keys sit after it and move nothing. Rebase only the refs
+    // that named the original build block. This is a plan-time walk and adds
+    // no work to residual evaluation.
+    if computed_probe_key_count != 0 {
+        for residual in &mut residual_filters {
+            residual.visit_column_refs_mut(&mut |reference| {
+                if reference.column_idx >= probe_types.len() {
+                    reference.column_idx += computed_probe_key_count;
+                }
+            });
+        }
+    }
+    let residual_probe_width = probe_types.len() + computed_probe_key_count;
     // A non-equality comparison condition beside the hash equalities (e.g.
     // `l = r AND a <> b`) rides the join as one more residual over the
     // key-matched pairs. Its left operand was resolved against the probe
@@ -465,7 +470,7 @@ fn build_join(
         let left = Expression::from_handle(condition.left)?;
         let mut right = Expression::from_handle(condition.right)?;
         right.visit_column_refs_mut(&mut |reference| {
-            reference.column_idx += probe_types.len();
+            reference.column_idx += residual_probe_width;
         });
         residual_filters.push(Expression::Compare(Compare {
             left: Box::new(left),
@@ -474,6 +479,8 @@ fn build_join(
             return_type: Type::Boolean,
         }));
     }
+    let (residual_probe_columns, residual_build_columns) =
+        compact_join_residuals(&mut residual_filters, residual_probe_width);
     let left_map: Vec<usize> = join.left_projection_map()?;
     let right_map: Vec<usize> = join.right_projection_map()?;
 
@@ -545,9 +552,58 @@ fn build_join(
             probe_column_types,
             build_column_types,
             residual_filters,
+            residual_probe_columns,
+            residual_build_columns,
             kind,
         }),
     })
+}
+
+/// Narrow residual evaluation from the join's full `[probe, build]` input to
+/// just the columns its expressions read. Returns the input-column projections
+/// and rewrites refs in place to address their compact concatenation. This runs
+/// once while building the plan; every execution then gathers the minimal
+/// candidate-pair batch directly.
+fn compact_join_residuals(
+    residuals: &mut [Expression],
+    probe_width: usize,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut referenced_columns = Vec::new();
+    for residual in residuals.iter() {
+        residual.collect_column_refs(&mut referenced_columns);
+    }
+
+    let mut probe_columns = Vec::new();
+    let mut build_columns = Vec::new();
+    for column_idx in referenced_columns {
+        if column_idx < probe_width {
+            probe_columns.push(column_idx);
+        } else {
+            build_columns.push(column_idx - probe_width);
+        }
+    }
+    probe_columns.sort_unstable();
+    probe_columns.dedup();
+    build_columns.sort_unstable();
+    build_columns.dedup();
+
+    for residual in residuals {
+        residual.visit_column_refs_mut(&mut |reference| {
+            reference.column_idx = if reference.column_idx < probe_width {
+                probe_columns
+                    .binary_search(&reference.column_idx)
+                    .expect("every residual probe ref was collected")
+            } else {
+                let build_column_idx = reference.column_idx - probe_width;
+                probe_columns.len()
+                    + build_columns
+                        .binary_search(&build_column_idx)
+                        .expect("every residual build ref was collected")
+            };
+        });
+    }
+
+    (probe_columns, build_columns)
 }
 
 /// Build a [`JoinKind::Range`] join: an inner join whose one condition is a
@@ -670,6 +726,8 @@ fn build_range_join(
             probe_column_types,
             build_column_types,
             residual_filters: Vec::new(),
+            residual_probe_columns: Vec::new(),
+            residual_build_columns: Vec::new(),
             kind: JoinKind::Range(compare),
         }),
     })
@@ -1204,6 +1262,8 @@ fn build_delim_join(
                 probe_column_types,
                 build_column_types: outer_column_types,
                 residual_filters: Vec::new(),
+                residual_probe_columns: Vec::new(),
+                residual_build_columns: Vec::new(),
                 kind,
             },
         )
@@ -1234,6 +1294,8 @@ fn build_delim_join(
                 probe_column_types: outer_column_types,
                 build_column_types,
                 residual_filters: Vec::new(),
+                residual_probe_columns: Vec::new(),
+                residual_build_columns: Vec::new(),
                 kind,
             },
         )

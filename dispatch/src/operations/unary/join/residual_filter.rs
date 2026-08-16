@@ -4,7 +4,7 @@
 
 use crate::operations::unary;
 use crate::operations::unary::join::build_rows;
-use crate::operations::unary::join::{JoinResidual, JoinResidualFn};
+use crate::operations::unary::join::{JoinResidualFn, JoinResidualSpec};
 use arrow_array::{Array, RecordBatch, RecordBatchOptions, UInt32Array};
 use arrow_schema::{Field, Schema, SchemaRef};
 use std::sync::Arc;
@@ -13,6 +13,7 @@ use std::sync::Arc;
 /// drain: gathers the matched rows of both sides into one combined batch,
 /// evaluates, and compacts the index lists to the passing matches.
 pub(super) struct ResidualFilter {
+    spec: JoinResidualSpec,
     eval: JoinResidualFn,
     /// The combined batch's schema, shaped by the first drain's arrays and
     /// reused after (every drain gathers the same columns).
@@ -27,9 +28,10 @@ pub(super) struct ResidualFilter {
 }
 
 impl ResidualFilter {
-    pub(super) fn new(residual_filters: &JoinResidual, semi: bool) -> Self {
+    pub(super) fn new(spec: &JoinResidualSpec, semi: bool) -> Self {
         Self {
-            eval: (residual_filters.0)(),
+            spec: spec.clone(),
+            eval: (spec.evaluator)(),
             schema: None,
             semi,
             last_emitted_probe_row: None,
@@ -83,10 +85,10 @@ impl ResidualFilter {
         Ok(unique)
     }
 
-    /// The combined batch of the matched rows: every probe input column taken
-    /// at the probe indices, then every build input column gathered at the
-    /// build row ids. That column order is the layout the predicate's column
-    /// refs were bound against.
+    /// The compact batch of matched rows: the residual's selected probe
+    /// columns taken at the probe indices, followed by its selected build
+    /// columns gathered at the build row ids. Its refs were rebound to this
+    /// layout once by the caller.
     fn gather_combined_batch(
         &mut self,
         probe_batch: &RecordBatch,
@@ -94,22 +96,32 @@ impl ResidualFilter {
         probe_indices: &[u32],
         build_indices: &[u32],
     ) -> unary::Result<RecordBatch> {
-        let build_column_count = build_batches[0].num_columns();
-        let mut columns = Vec::with_capacity(probe_batch.num_columns() + build_column_count);
-        let take_indices = UInt32Array::from(probe_indices.to_vec());
-        for column in probe_batch.columns() {
-            columns.push(arrow::compute::take(column, &take_indices, None)?);
+        let mut columns = Vec::with_capacity(
+            self.spec.probe_column_indices.len() + self.spec.build_column_indices.len(),
+        );
+        if !self.spec.probe_column_indices.is_empty() {
+            let take_indices = UInt32Array::from(probe_indices.to_vec());
+            for &column_idx in self.spec.probe_column_indices.iter() {
+                columns.push(arrow::compute::take(
+                    probe_batch.column(column_idx),
+                    &take_indices,
+                    None,
+                )?);
+            }
         }
-        let locations: Vec<(usize, usize)> = build_indices
-            .iter()
-            .map(|&row_id| build_rows::split_row_id(row_id))
-            .collect();
-        for column_idx in 0..build_column_count {
-            let arrays: Vec<&dyn Array> = build_batches
+
+        if !self.spec.build_column_indices.is_empty() {
+            let locations: Vec<(usize, usize)> = build_indices
                 .iter()
-                .map(|batch| batch.column(column_idx).as_ref())
+                .map(|&row_id| build_rows::split_row_id(row_id))
                 .collect();
-            columns.push(arrow::compute::interleave(&arrays, &locations)?);
+            for &column_idx in self.spec.build_column_indices.iter() {
+                let arrays: Vec<&dyn Array> = build_batches
+                    .iter()
+                    .map(|batch| batch.column(column_idx).as_ref())
+                    .collect();
+                columns.push(arrow::compute::interleave(&arrays, &locations)?);
+            }
         }
         let schema = self
             .schema
