@@ -306,6 +306,10 @@ mod tests {
             fn user_auth(&self, username: &str) -> Option<metastore::UserAuth> {
                 (username == metastore::DEFAULT_USER_NAME).then_some(metastore::UserAuth::Trust)
             }
+
+            fn user_names(&self) -> Vec<String> {
+                vec![metastore::DEFAULT_USER_NAME.to_string()]
+            }
         }
 
         Arc::new(TestMetastore)

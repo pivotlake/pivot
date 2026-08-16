@@ -29,6 +29,9 @@ LogicalType logical_type_from(uint8_t type_id) {
 	if (id == LogicalTypeId::DECIMAL) {
 		throw InternalException("a DECIMAL column needs a width and scale, not just a type id");
 	}
+	if (id == LogicalTypeId::LIST) {
+		throw InternalException("a LIST column needs its child type, not just a type id");
+	}
 	if (id == LogicalTypeId::VARIANT) {
 		return LogicalType::VARIANT();
 	}
@@ -40,6 +43,13 @@ LogicalType logical_type_from(uint8_t type_id) {
 LogicalType logical_type_from_column(const DuckDBColumn &col) {
 	if (static_cast<LogicalTypeId>(col.duckdb_logical_type_id) == LogicalTypeId::DECIMAL) {
 		return LogicalType::DECIMAL(col.decimal_width, col.decimal_scale);
+	}
+	if (static_cast<LogicalTypeId>(col.duckdb_logical_type_id) == LogicalTypeId::LIST) {
+		if (static_cast<LogicalTypeId>(col.list_child_type_id) == LogicalTypeId::DECIMAL) {
+			return LogicalType::LIST(
+			    LogicalType::DECIMAL(col.list_child_decimal_width, col.list_child_decimal_scale));
+		}
+		return LogicalType::LIST(logical_type_from(col.list_child_type_id));
 	}
 	return logical_type_from(col.duckdb_logical_type_id);
 }
@@ -55,8 +65,7 @@ struct PivotTableFunctionInfo : public TableFunctionInfo {
 struct PivotTableFunctionBindData : public TableFunctionData {};
 
 unique_ptr<FunctionData> pivot_table_function_bind(ClientContext &, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types,
-                                                   vector<string> &names) {
+                                                   vector<LogicalType> &return_types, vector<string> &names) {
 	auto &info = input.info->Cast<PivotTableFunctionInfo>();
 	names = info.names;
 	return_types = info.return_types;
@@ -64,8 +73,7 @@ unique_ptr<FunctionData> pivot_table_function_bind(ClientContext &, TableFunctio
 }
 
 // Body of a pivot scalar function stub. It never runs: pivot re-plans the call
-// into its own expression, and the only pivot scalar (drop_cache) is VOLATILE so
-// the optimizer can't fold it. Emits a constant NULL so DuckDB has a valid,
+// into its own expression. Emits a constant NULL so DuckDB has a valid,
 // type-agnostic result if it ever does evaluate the call.
 void pivot_scalar_function_stub(DataChunk &, ExpressionState &, Vector &result) {
 	result.SetVectorType(VectorType::CONSTANT_VECTOR);
@@ -95,7 +103,7 @@ static const ::TransactionContext &pivot_transaction_ctx(duckdb::Catalog &catalo
 }
 
 optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransaction transaction,
-                                                         const EntryLookupInfo &lookup_info) {
+                                                                const EntryLookupInfo &lookup_info) {
 	auto &table_name = lookup_info.GetEntryName();
 	auto &pivot_catalog = ParentCatalog().Cast<PivotCatalog>();
 
@@ -105,8 +113,8 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
 	// binder falls through to the system catalog. The function's schema comes
 	// entirely from Rust; nothing about it is declared in this bridge.
 	if (lookup_info.GetCatalogType() == CatalogType::TABLE_FUNCTION_ENTRY) {
-		auto function = catalog_get_table_function(
-		    pivot_transaction_ctx(ParentCatalog()), ParentCatalog().GetName(), table_name);
+		auto function =
+		    catalog_get_table_function(pivot_transaction_ctx(ParentCatalog()), ParentCatalog().GetName(), table_name);
 		if (!function.found) {
 			return nullptr;
 		}
@@ -121,13 +129,11 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
 			info->return_types.emplace_back(logical_type_from_column(col));
 		}
 
-		TableFunction func(std::string(table_name), std::move(arguments), nullptr,
-		                   pivot_table_function_bind);
+		TableFunction func(std::string(table_name), std::move(arguments), nullptr, pivot_table_function_bind);
 		func.function_info = info;
 
 		CreateTableFunctionInfo create_info(func);
-		auto entry =
-		    make_uniq<TableFunctionCatalogEntry>(ParentCatalog(), *this, create_info);
+		auto entry = make_uniq<TableFunctionCatalogEntry>(ParentCatalog(), *this, create_info);
 		auto &db_instance = ParentCatalog().GetAttached().GetDatabase();
 		return PivotStorageInfo::Get(db_instance).AddFunctionEntry(std::move(entry));
 	}
@@ -136,7 +142,7 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
 	// functions. Unknown names (DuckDB's own built-ins like `+`/`length`) return
 	// nullptr and resolve against the system catalog.
 	if (lookup_info.GetCatalogType() == CatalogType::SCALAR_FUNCTION_ENTRY) {
-		auto function = catalog_get_scalar_function(*pivot_catalog.catalog_ctx, table_name);
+		auto function = catalog_get_scalar_function(*pivot_catalog.catalog_ctx, this->name, table_name);
 		if (!function.found) {
 			return nullptr;
 		}
@@ -147,15 +153,16 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
 		}
 		LogicalType return_type = logical_type_from(function.function.return_type_id);
 
-		ScalarFunction func(std::string(table_name), std::move(arguments), return_type,
-		                    pivot_scalar_function_stub);
+		ScalarFunction func(std::string(table_name), std::move(arguments), return_type, pivot_scalar_function_stub);
+		if (static_cast<LogicalTypeId>(function.function.vararg_type_id) != LogicalTypeId::INVALID) {
+			func.varargs = logical_type_from(function.function.vararg_type_id);
+		}
 		if (function.function.is_volatile) {
 			func.SetStability(FunctionStability::VOLATILE);
 		}
 
 		CreateScalarFunctionInfo create_info(func);
-		auto entry =
-		    make_uniq<ScalarFunctionCatalogEntry>(ParentCatalog(), *this, create_info);
+		auto entry = make_uniq<ScalarFunctionCatalogEntry>(ParentCatalog(), *this, create_info);
 		auto &db_instance = ParentCatalog().GetAttached().GetDatabase();
 		return PivotStorageInfo::Get(db_instance).AddScalarFunctionEntry(std::move(entry));
 	}
@@ -170,8 +177,8 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
 	// A base-table reference: resolve it through the transaction's snapshot,
 	// within this schema. The catalog only hands out an entry for a schema the
 	// datastore defines, so `name` here is always one of its own schemas.
-	auto result = catalog_get_table(
-	    pivot_transaction_ctx(ParentCatalog()), ParentCatalog().GetName(), this->name, table_name);
+	auto result =
+	    catalog_get_table(pivot_transaction_ctx(ParentCatalog()), ParentCatalog().GetName(), this->name, table_name);
 
 	if (!result.found) {
 		return nullptr;
@@ -180,8 +187,7 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
 	CreateTableInfo table_info(*this, table_name);
 	for (const auto &col : result.columns) {
 		auto col_name = std::string(col.name);
-		table_info.columns.AddColumn(
-		    ColumnDefinition(col_name, logical_type_from_column(col)));
+		table_info.columns.AddColumn(ColumnDefinition(col_name, logical_type_from_column(col)));
 	}
 
 	auto &db_instance = ParentCatalog().GetAttached().GetDatabase();
@@ -192,22 +198,47 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
 }
 
 void PivotSchemaCatalogEntry::Scan(ClientContext &context, CatalogType type,
-                            const std::function<void(CatalogEntry &)> &callback) {
+                                   const std::function<void(CatalogEntry &)> &callback) {
 }
 
-void PivotSchemaCatalogEntry::Scan(CatalogType type,
-                            const std::function<void(CatalogEntry &)> &callback) {
+void PivotSchemaCatalogEntry::Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) {
 }
 
-optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreateTable(CatalogTransaction, BoundCreateTableInfo &) { RUST_NOT_IMPLEMENTED; }
-optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreateFunction(CatalogTransaction, CreateFunctionInfo &) { RUST_NOT_IMPLEMENTED; }
-optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreateIndex(CatalogTransaction, CreateIndexInfo &, TableCatalogEntry &) { RUST_NOT_IMPLEMENTED; }
-optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreateView(CatalogTransaction, CreateViewInfo &) { RUST_NOT_IMPLEMENTED; }
-optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreateSequence(CatalogTransaction, CreateSequenceInfo &) { RUST_NOT_IMPLEMENTED; }
-optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreateTableFunction(CatalogTransaction, CreateTableFunctionInfo &) { RUST_NOT_IMPLEMENTED; }
-optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreateCopyFunction(CatalogTransaction, CreateCopyFunctionInfo &) { RUST_NOT_IMPLEMENTED; }
-optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreatePragmaFunction(CatalogTransaction, CreatePragmaFunctionInfo &) { RUST_NOT_IMPLEMENTED; }
-optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreateCollation(CatalogTransaction, CreateCollationInfo &) { RUST_NOT_IMPLEMENTED; }
-optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreateType(CatalogTransaction, CreateTypeInfo &) { RUST_NOT_IMPLEMENTED; }
-void PivotSchemaCatalogEntry::DropEntry(ClientContext &, DropInfo &) { RUST_NOT_IMPLEMENTED; }
-void PivotSchemaCatalogEntry::Alter(CatalogTransaction, AlterInfo &) { RUST_NOT_IMPLEMENTED; }
+optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreateTable(CatalogTransaction, BoundCreateTableInfo &) {
+	RUST_NOT_IMPLEMENTED;
+}
+optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreateFunction(CatalogTransaction, CreateFunctionInfo &) {
+	RUST_NOT_IMPLEMENTED;
+}
+optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreateIndex(CatalogTransaction, CreateIndexInfo &,
+                                                                TableCatalogEntry &) {
+	RUST_NOT_IMPLEMENTED;
+}
+optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreateView(CatalogTransaction, CreateViewInfo &) {
+	RUST_NOT_IMPLEMENTED;
+}
+optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreateSequence(CatalogTransaction, CreateSequenceInfo &) {
+	RUST_NOT_IMPLEMENTED;
+}
+optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreateTableFunction(CatalogTransaction, CreateTableFunctionInfo &) {
+	RUST_NOT_IMPLEMENTED;
+}
+optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreateCopyFunction(CatalogTransaction, CreateCopyFunctionInfo &) {
+	RUST_NOT_IMPLEMENTED;
+}
+optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreatePragmaFunction(CatalogTransaction,
+                                                                         CreatePragmaFunctionInfo &) {
+	RUST_NOT_IMPLEMENTED;
+}
+optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreateCollation(CatalogTransaction, CreateCollationInfo &) {
+	RUST_NOT_IMPLEMENTED;
+}
+optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::CreateType(CatalogTransaction, CreateTypeInfo &) {
+	RUST_NOT_IMPLEMENTED;
+}
+void PivotSchemaCatalogEntry::DropEntry(ClientContext &, DropInfo &) {
+	RUST_NOT_IMPLEMENTED;
+}
+void PivotSchemaCatalogEntry::Alter(CatalogTransaction, AlterInfo &) {
+	RUST_NOT_IMPLEMENTED;
+}

@@ -21,6 +21,7 @@ use metastore::{Metastore, SCRAM_ITERATIONS, ScramVerifier, UserAuth};
 use metastore_disk::{DiskMetastore, MetastoreConfig};
 use pgwire::api::auth::sasl::scram::gen_salted_password;
 use tempfile::TempDir;
+use tokio_postgres::NoTls;
 
 const USER: &str = "analytics";
 const TRUSTED_USER: &str = "reader";
@@ -65,6 +66,12 @@ impl Metastore for MutableMetastore {
 
     fn user_auth(&self, username: &str) -> Option<UserAuth> {
         self.users.read().unwrap().get(username).cloned()
+    }
+
+    fn user_names(&self) -> Vec<String> {
+        let mut users: Vec<_> = self.users.read().unwrap().keys().cloned().collect();
+        users.sort();
+        users
     }
 }
 
@@ -144,6 +151,29 @@ async fn an_explicitly_trusted_user_can_query_without_a_password() {
         select_rows(&client, "SELECT 1 AS ok").await,
         vec![vec![Some("1".to_string())]]
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_explicitly_trusted_user_receives_pivots_search_path() {
+    let port = authenticating_server_port();
+    let (client, connection) = tokio_postgres::Config::new()
+        .host("127.0.0.1")
+        .port(port)
+        .user(TRUSTED_USER)
+        .dbname("test")
+        .connect(NoTls)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        connection.parameter("search_path"),
+        Some(planner::DEFAULT_SCHEMA_NAME)
+    );
+
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    drop(client);
 }
 
 #[tokio::test(flavor = "multi_thread")]

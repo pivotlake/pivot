@@ -2167,6 +2167,34 @@ fn count_star_over_empty_series(mut testing_planner: TestingPlanner) {
 }
 
 #[rstest]
+fn correlated_array_over_an_optimizer_proven_empty_input(mut testing_planner: TestingPlanner) {
+    let rows = run(
+        &mut testing_planner,
+        "SELECT outer_table.a, ARRAY(SELECT name FROM example_table inner_table \
+         WHERE inner_table.a = outer_table.a AND false) AS members \
+         FROM example_table outer_table WHERE outer_table.a <= 2 ORDER BY 1",
+    );
+
+    assert_eq!(
+        rows,
+        vec![
+            serde_json::json!({"a": 1, "members": []}),
+            serde_json::json!({"a": 2, "members": []}),
+        ]
+    );
+}
+
+#[rstest]
+fn grouped_aggregate_over_an_optimizer_proven_empty_input(mut testing_planner: TestingPlanner) {
+    let rows = run(
+        &mut testing_planner,
+        "SELECT a, count(*) FROM example_table WHERE false GROUP BY a",
+    );
+
+    assert!(rows.is_empty());
+}
+
+#[rstest]
 fn generate_series_composes_with_aggregate(mut testing_planner: TestingPlanner) {
     let results = testing_planner
         .plan("SELECT count(*), sum(generate_series) FROM generate_series(1, 4)")

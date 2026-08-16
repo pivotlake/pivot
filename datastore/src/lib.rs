@@ -15,9 +15,22 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use planner::TableFunction;
 use planner::catalog::{
-    BoundTable, CreateSchemaRequest, CreateTableRequest, DropTableRequest, Result, SchemaCreation,
-    SchemaQualifiedTableName, TableCreation, TableDrop, TableRevision,
+    BoundTable, Column, CreateSchemaRequest, CreateTableRequest, DropTableRequest, Result,
+    SchemaCreation, SchemaQualifiedTableName, TableCreation, TableDrop, TableRevision,
 };
+
+/// One table exposed by a datastore transaction's frozen catalog view.
+///
+/// This is deliberately backend-neutral: the cross-datastore catalog uses it
+/// to build virtual metadata relations without reaching into a concrete
+/// datastore's index. `revision.identity` is the table's durable identity, not
+/// a number derived from enumeration order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatastoreTableMetadata {
+    pub name: SchemaQualifiedTableName,
+    pub revision: TableRevision,
+    pub columns: Vec<Column>,
+}
 
 /// One query's transaction against a **single datastore**: a consistent
 /// snapshot of that datastore, opened by [`Datastore::begin_transaction`] before
@@ -63,6 +76,19 @@ pub trait DatastoreTransaction: Debug + Send + Sync {
     /// snapshot, or `None` if no such table exists. This must return `Some` for
     /// every table returned by [`bind_table`](Self::bind_table).
     fn table_revision(&self, name: &SchemaQualifiedTableName) -> Option<TableRevision>;
+
+    /// Every schema defined by this transaction's frozen snapshot.
+    ///
+    /// The returned order is deterministic for diagnostics and tests, but
+    /// callers must identify schemas by name rather than position.
+    fn schema_names(&self) -> Vec<String>;
+
+    /// Every table defined by this transaction's frozen snapshot.
+    ///
+    /// The returned descriptions contain only logical catalog metadata. A
+    /// caller that needs table data still resolves a [`BoundTable`] through
+    /// [`bind_table`](Self::bind_table).
+    fn tables(&self) -> Vec<DatastoreTableMetadata>;
 
     /// A backend-specific table-valued function by `name`, or `None`. This is
     /// how a backend contributes functions only it can answer (e.g. `metadata`,

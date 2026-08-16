@@ -126,6 +126,10 @@ impl BoundTable for TestTable {
         }
     }
 
+    fn supports_late_materialization(&self) -> bool {
+        true
+    }
+
     fn compile_scan(
         &self,
         dispatcher: &DataFlowDispatcher,
@@ -402,6 +406,21 @@ pub fn run_batches(planner: &mut TestingPlanner, sql: &str) -> Vec<RecordBatch> 
         .unwrap()
         .collect()
         .unwrap()
+}
+
+/// Plan, compile, and run `sql`, returning its execution error.
+#[allow(dead_code)]
+pub fn run_expecting_error(planner: &mut TestingPlanner, sql: &str) -> String {
+    let transaction = planner.transaction();
+    planner
+        .planner
+        .plan(sql, transaction.clone())
+        .unwrap()
+        .compile(planner.dispatcher(), transaction.as_ref())
+        .unwrap()
+        .collect()
+        .unwrap_err()
+        .to_string()
 }
 
 /// The value of a row's single column, by position rather than name. For tests

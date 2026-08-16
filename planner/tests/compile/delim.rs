@@ -192,6 +192,75 @@ fn string_correlation_key_deduplicates_text(mut testing_planner: TestingPlanner)
     );
 }
 
+#[rstest]
+fn propagates_nullable_results_through_chained_scalar_subqueries(
+    mut testing_planner: TestingPlanner,
+) {
+    testing_planner.add_table("parents", &[("p_key", Type::Int64, int64_col(vec![1, 2]))]);
+    testing_planner.add_table(
+        "first_lookup",
+        &[
+            ("f_key", Type::Int64, int64_col(vec![1])),
+            ("f_value", Type::Int64, int64_col(vec![10])),
+        ],
+    );
+    testing_planner.add_table(
+        "second_lookup",
+        &[
+            ("s_key", Type::Int64, int64_col(vec![2])),
+            ("s_value", Type::Int64, int64_col(vec![20])),
+        ],
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT p_key, \
+           (SELECT f_value FROM first_lookup WHERE f_key = p_key) AS first_value, \
+           (SELECT s_value FROM second_lookup WHERE s_key = p_key) AS second_value \
+         FROM parents ORDER BY p_key",
+    );
+
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"p_key": 1, "first_value": 10},
+            {"p_key": 2, "second_value": 20},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
+
+#[rstest]
+fn scalar_subquery_emits_every_matching_row(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table("parents", &[("p_key", Type::Int64, int64_col(vec![1]))]);
+    testing_planner.add_table(
+        "duplicate_lookup",
+        &[
+            ("d_key", Type::Int64, int64_col(vec![1, 1])),
+            ("d_value", Type::Int64, int64_col(vec![10, 20])),
+        ],
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT (SELECT d_value FROM duplicate_lookup WHERE d_key = p_key) AS lookup_value \
+         FROM parents ORDER BY lookup_value",
+    );
+
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            {"lookup_value": 10},
+            {"lookup_value": 20},
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    );
+}
+
 /// An outer row whose correlation column is NULL cannot match any subquery
 /// answer; the LEFT delim join must still emit it, with a NULL answer, rather
 /// than lose it.

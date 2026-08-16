@@ -24,8 +24,9 @@ use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Conjunction,
     ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide, Error,
     Expression, Function, InList, IntervalArithmetic, IsNull, Length, Like, MaybeError, Not,
-    NumericAggregate, Prefix, Ref, RegexpFullMatch, RegexpJitReplace, RegexpReplace, Suffix,
-    TemporalConvert, VariantGet,
+    NumericAggregate, PgFormatType, PgGetExpr, PgGetStatisticsObjDefColumns, PgGetUserById,
+    PgRelationIsPublishable, PgTableIsVisible, Prefix, Ref, RegexpFullMatch, RegexpJitReplace,
+    RegexpReplace, Suffix, TemporalConvert, VariantGet,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
 
@@ -381,6 +382,18 @@ impl Function {
                 function_args(func, 0)?;
                 Ok(Function::Now)
             }
+            "pg_get_userbyid" => Ok(Function::PgGetUserById(PgGetUserById::from_handle(func)?)),
+            "pg_table_is_visible" => Ok(Function::PgTableIsVisible(PgTableIsVisible::from_handle(
+                func,
+            )?)),
+            "format_type" => Ok(Function::PgFormatType(PgFormatType::from_handle(func)?)),
+            "pg_get_expr" => Ok(Function::PgGetExpr(PgGetExpr::from_handle(func)?)),
+            "pg_relation_is_publishable" => Ok(Function::PgRelationIsPublishable(
+                PgRelationIsPublishable::from_handle(func)?,
+            )),
+            "pg_get_statisticsobjdef_columns" => Ok(Function::PgGetStatisticsObjDefColumns(
+                PgGetStatisticsObjDefColumns::from_handle(func)?,
+            )),
             // `extract(<part> FROM ts)` lowers to a function named after the part
             // (`minute`, `year`, `dayofweek`, …).
             _ => match DatePartKind::from_function_name(&name) {
@@ -388,6 +401,89 @@ impl Function {
                 None => Err(Error::UnsupportedScalarFunction(name)),
             },
         }
+    }
+}
+
+fn function_expression_arguments(
+    function: FunctionHandle<'_>,
+    argument_count: usize,
+) -> Result<Vec<Expression>, Error> {
+    let arguments = function_args(function, argument_count)?
+        .into_iter()
+        .map(Expression::from_handle)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(arguments)
+}
+
+impl PgGetUserById {
+    fn from_handle(function: FunctionHandle<'_>) -> Result<Self, Error> {
+        let mut arguments = function_expression_arguments(function, 1)?;
+        Ok(Self {
+            role_oid: Box::new(arguments.remove(0)),
+        })
+    }
+}
+
+impl PgTableIsVisible {
+    fn from_handle(function: FunctionHandle<'_>) -> Result<Self, Error> {
+        let mut arguments = function_expression_arguments(function, 1)?;
+        Ok(Self {
+            relation_oid: Box::new(arguments.remove(0)),
+        })
+    }
+}
+
+impl PgFormatType {
+    fn from_handle(function: FunctionHandle<'_>) -> Result<Self, Error> {
+        let mut arguments = function_expression_arguments(function, 2)?;
+        Ok(Self {
+            type_oid: Box::new(arguments.remove(0)),
+            type_modifier: Box::new(arguments.remove(0)),
+        })
+    }
+}
+
+impl PgGetExpr {
+    fn from_handle(function: FunctionHandle<'_>) -> Result<Self, Error> {
+        let parameters = function.children()?;
+        if !(2..=3).contains(&parameters.len()) {
+            return Err(Error::InvalidParameterCountRange {
+                function: function.name()?,
+                minimum: 2,
+                maximum: 3,
+                actual: parameters.len(),
+            });
+        }
+        let mut arguments = parameters
+            .into_iter()
+            .map(Expression::from_handle)
+            .collect::<Result<Vec<_>, _>>()?;
+        let expression = Box::new(arguments.remove(0));
+        let relation_oid = Box::new(arguments.remove(0));
+        let pretty = arguments.pop().map(Box::new);
+        Ok(Self {
+            expression,
+            relation_oid,
+            pretty,
+        })
+    }
+}
+
+impl PgRelationIsPublishable {
+    fn from_handle(function: FunctionHandle<'_>) -> Result<Self, Error> {
+        let mut arguments = function_expression_arguments(function, 1)?;
+        Ok(Self {
+            relation_oid: Box::new(arguments.remove(0)),
+        })
+    }
+}
+
+impl PgGetStatisticsObjDefColumns {
+    fn from_handle(function: FunctionHandle<'_>) -> Result<Self, Error> {
+        let mut arguments = function_expression_arguments(function, 1)?;
+        Ok(Self {
+            statistics_oid: Box::new(arguments.remove(0)),
+        })
     }
 }
 

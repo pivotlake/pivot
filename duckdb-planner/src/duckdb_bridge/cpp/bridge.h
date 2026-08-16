@@ -145,6 +145,8 @@ uint8_t lo_get_dynamic_filter_comparison(const LogicalOperator &op, size_t index
 
 // ---- Get: table function ----
 rust::String lo_get_function_name(const LogicalOperator &op);
+size_t lo_empty_result_type_count(const LogicalOperator &op);
+BridgeLogicalType lo_empty_result_type(const LogicalOperator &op, size_t index);
 bool lo_get_has_named_params(const LogicalOperator &op);
 size_t lo_get_param_count(const LogicalOperator &op);
 const Value &lo_get_param(const LogicalOperator &op, size_t index);
@@ -250,6 +252,7 @@ const Value &expr_constant(const Expression &expr);
 
 BridgeLogicalType value_type(const Value &v);
 bool value_is_null(const Value &v);
+size_t value_list_size(const Value &v);
 bool value_bool(const Value &v);
 int8_t value_i8(const Value &v);
 int16_t value_i16(const Value &v);

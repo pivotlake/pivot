@@ -97,6 +97,12 @@ pub trait Metastore: Send + Sync + std::fmt::Debug {
     /// passwords changed while the server is running.
     fn user_auth(&self, username: &str) -> Option<UserAuth>;
 
+    /// The names of every user that may authenticate, with no credential
+    /// material attached. Implementations return a sorted, duplicate-free
+    /// snapshot so catalog consumers can safely expose the names through
+    /// PostgreSQL's `pg_roles` view without ever seeing password verifiers.
+    fn user_names(&self) -> Vec<String>;
+
     /// Add `username`, durably: once this returns, the user survives a
     /// restart and subsequent logins see it. A password becomes a stored
     /// SCRAM verifier (deriving it is the implementation's job, so credential

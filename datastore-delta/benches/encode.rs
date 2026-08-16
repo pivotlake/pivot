@@ -550,6 +550,10 @@ fn trust_metastore() -> Arc<dyn Metastore> {
         fn user_auth(&self, username: &str) -> Option<UserAuth> {
             (username == DEFAULT_USER_NAME).then_some(UserAuth::Trust)
         }
+
+        fn user_names(&self) -> Vec<String> {
+            vec![DEFAULT_USER_NAME.to_string()]
+        }
     }
 
     Arc::new(TrustMetastore)

@@ -21,17 +21,17 @@ use duckdb_planner::Expr;
 use duckdb_planner::LogicalOp;
 use duckdb_planner::duckdb_bridge::duckdb_types::{ExpressionType, JoinType};
 use duckdb_planner::handle::{
-    ComparisonJoin as ComparisonJoinView, DelimGet as DelimGetView, DelimJoin as DelimJoinView,
-    JoinCondition, JoinConditionEntry, Operator as DuckOperator, TableScan as TableScanView,
-    rowid_column_id,
+    Aggregate as AggregateView, ComparisonJoin as ComparisonJoinView, DelimGet as DelimGetView,
+    DelimJoin as DelimJoinView, Expression as DuckExpression, JoinCondition, JoinConditionEntry,
+    Operator as DuckOperator, TableScan as TableScanView, rowid_column_id,
 };
 
 use crate::catalog::BoundTable;
 use crate::expression::{Cast, Error as ExpressionError, Expression, Function, Ref, VariantGet};
 use crate::operator::{
     Aggregate, Compact, CopyFromStdin, CreateSchema, CreateTable, CreateUser, CrossJoin, Cte,
-    CteScan, Distinct, DropTable, DummyScan, Error as OperatorError, Explain, Filter, Input,
-    Insert, Join, JoinKind, Limit, Materialize, Operator, OrderBy, Projection, SetVariable,
+    CteScan, Distinct, DropTable, DummyScan, EmptyResult, Error as OperatorError, Explain, Filter,
+    Input, Insert, Join, JoinKind, Limit, Materialize, Operator, OrderBy, Projection, SetVariable,
     TableFunctionScan, TopN, Values,
 };
 use crate::plan::{self, PlanNode};
@@ -136,6 +136,34 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         return Ok(inputs.into_iter().next().unwrap());
     }
 
+    // This is a really ugly, temporary psql-compatibility hack for the role
+    // memberships column of psql's `\du`:
+    //
+    //   ARRAY(SELECT b.rolname
+    //         FROM pg_catalog.pg_auth_members m
+    //         JOIN pg_catalog.pg_roles b ON (m.roleid = b.oid)
+    //         WHERE m.member = r.oid) as memberof
+    //
+    // DuckDB decorrelates that subquery into a delim join whose subquery side
+    // is a lone `array_agg` grouped by the correlation key, and the statically
+    // empty virtual pg_auth_members table collapses everything below the
+    // aggregate into an EmptyResult. Pivot cannot compile `array_agg` yet,
+    // even though DuckDB proved its input empty, so this shortcut replaces
+    // exactly that aggregate node with its zero-row result (a grouped
+    // aggregate over no rows has no groups, so no rows) before the unsupported
+    // function is compiled; the delim join above then produces the NULL that
+    // DuckDB's planted `CASE ... THEN []` projection turns into the empty
+    // array. Aggregates Pivot actually supports handle empty inputs normally
+    // and never take this path. Remove it once Pivot has real list and
+    // `array_agg` support.
+    if let DuckOperator::Aggregate(aggregate) = kind
+        && inputs.len() == 1
+        && matches!(inputs[0].operator, Operator::EmptyResult(_))
+        && is_grouped_lone_array_agg(aggregate)?
+    {
+        return build_array_agg_over_empty(op.name()?, aggregate);
+    }
+
     // DuckDB's optimizer pushes simple `column <op> constant` predicates down
     // into the scan itself (its `table_filters`), so the `Filter` operator that
     // would sit above the scan disappears. Pivot wants that explicit `Filter`
@@ -185,6 +213,7 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         DuckOperator::CreateUser(c) => Operator::CreateUser(CreateUser::from_handle(c)?),
         // No view to construct from: these carry no kind-specific payload.
         DuckOperator::DummyScan => Operator::DummyScan(DummyScan),
+        DuckOperator::EmptyResult(empty) => Operator::EmptyResult(EmptyResult::from_handle(empty)?),
         DuckOperator::Explain => Operator::Explain(Explain),
         DuckOperator::ComparisonJoin(join) => {
             return build_join(op, join, inputs);
@@ -274,6 +303,53 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
     }
 
     Ok(node)
+}
+
+/// Whether the aggregate is a grouped, lone `array_agg`: the exact shape a
+/// decorrelated ARRAY(subquery) lowers to (psql's `\du` role memberships).
+fn is_grouped_lone_array_agg(aggregate: AggregateView<'_>) -> Result<bool, OperatorError> {
+    if aggregate.groups()?.is_empty() {
+        return Ok(false);
+    }
+    let expressions = aggregate.expressions()?;
+    let [expression] = expressions.as_slice() else {
+        return Ok(false);
+    };
+    match expression.expression()? {
+        DuckExpression::AggregateFunc(function) => Ok(function.name()? == "array_agg"),
+        _ => Ok(false),
+    }
+}
+
+/// The result of a grouped `array_agg` over zero rows: zero groups, so zero
+/// rows, carried as an [`EmptyResult`] with the aggregate's output schema.
+fn build_array_agg_over_empty(
+    name: String,
+    aggregate: AggregateView<'_>,
+) -> Result<PlanNode, OperatorError> {
+    let groups = aggregate.groups()?;
+    let expressions = aggregate.expressions()?;
+    let [expression] = expressions.as_slice() else {
+        return Err(OperatorError::Unsupported(
+            "an empty-input array_agg shortcut needs exactly one aggregate expression".to_string(),
+        ));
+    };
+    let DuckExpression::AggregateFunc(function) = expression.expression()? else {
+        return Err(OperatorError::Unsupported(
+            "a logical aggregate contained a non-aggregate expression".to_string(),
+        ));
+    };
+
+    let mut output_types = Vec::with_capacity(groups.len() + 1);
+    for group in groups {
+        output_types.push(Expression::from_handle(group)?.result_type()?);
+    }
+    output_types.push(type_from_logical(function.return_type()?)?);
+    Ok(PlanNode {
+        name,
+        inputs: Vec::new(),
+        operator: Operator::EmptyResult(EmptyResult { output_types }),
+    })
 }
 
 /// Fold the synthetic pushdown filter under `node` into `node` itself.
@@ -452,7 +528,15 @@ fn build_join(
     let (kind, probe_output, build_output) = match join.join_type()? {
         JoinType::INNER => (JoinKind::Inner, kept_probe_output, kept_build_output),
         JoinType::RIGHT => (JoinKind::BuildOuter, kept_probe_output, kept_build_output),
-        JoinType::LEFT => (JoinKind::ProbeOuter, kept_probe_output, kept_build_output),
+        // Pivot intentionally treats DuckDB's SINGLE join as probe-side outer:
+        // misses still pad, and every matching build row reaches the output.
+        // TODO: give SINGLE its own join kind that fails on multiple matches
+        // per probe row, like PostgreSQL's "more than one row returned by a
+        // subquery used as an expression"; a plain probe-side outer silently
+        // emits every pair instead.
+        JoinType::LEFT | JoinType::SINGLE => {
+            (JoinKind::ProbeOuter, kept_probe_output, kept_build_output)
+        }
         // A semi or anti join emits no build column at all. DuckDB agrees, and
         // says so by returning the left bindings alone for such a join rather
         // than through the right projection map, which it never reads here -
@@ -1052,7 +1136,13 @@ fn build_delim_join(
     // preserves the outer side through the probe-side outer mode, and a semi
     // or anti join emits no build column at all (see `build_join`).
     let (kind, build_output, build_column_types) = match join.join_type()? {
-        JoinType::LEFT => (JoinKind::ProbeOuter, subquery_output, subquery_column_types),
+        // SINGLE deliberately has the same relaxed multi-match semantics as
+        // the regular join path above.
+        // TODO: fail on multiple matches per probe row instead; see the SINGLE
+        // TODO in `build_join`.
+        JoinType::LEFT | JoinType::SINGLE => {
+            (JoinKind::ProbeOuter, subquery_output, subquery_column_types)
+        }
         JoinType::INNER => (JoinKind::Inner, subquery_output, subquery_column_types),
         JoinType::SEMI => (JoinKind::ProbeSemi, Vec::new(), Vec::new()),
         JoinType::ANTI => (JoinKind::ProbeAnti, Vec::new(), Vec::new()),

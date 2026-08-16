@@ -3,17 +3,37 @@ use std::fmt;
 use crate::duckdb_bridge::duckdb_types::LogicalTypeId;
 use crate::duckdb_bridge::ffi;
 
+impl ffi::DuckDBColumn {
+    /// Build a column whose logical type has no parameters.
+    pub fn plain(name: impl Into<String>, logical_type: LogicalTypeId) -> Self {
+        Self {
+            name: name.into(),
+            duckdb_logical_type_id: logical_type as u8,
+            decimal_width: 0,
+            decimal_scale: 0,
+            list_child_type_id: LogicalTypeId::INVALID as u8,
+            list_child_decimal_width: 0,
+            list_child_decimal_scale: 0,
+        }
+    }
+}
+
 /// The payload that completes a parameterized DuckDB type, mirroring
 /// DuckDB's own `ExtraTypeInfo`. Most ids fully describe their type and
-/// carry [`ExtraTypeInfo::None`]; a parameterized id (today only `DECIMAL`)
-/// carries its parameters here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// carry [`ExtraTypeInfo::None`]; parameterized ids carry their parameters
+/// here.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtraTypeInfo {
     None,
     /// `DECIMAL(width, scale)`: total digits and fractional digits.
     Decimal {
         width: u8,
         scale: u8,
+    },
+    /// One-dimensional `LIST(child)` used by PostgreSQL-compatible catalog
+    /// array columns.
+    List {
+        child: Box<BoundLogicalType>,
     },
 }
 
@@ -45,6 +65,22 @@ impl BoundLogicalType {
                 width: raw.decimal_width,
                 scale: raw.decimal_scale,
             },
+            LogicalTypeId::LIST => {
+                let child_id = LogicalTypeId::from_u8(raw.list_child_type_id);
+                let child_extra = match child_id {
+                    LogicalTypeId::DECIMAL => ExtraTypeInfo::Decimal {
+                        width: raw.list_child_decimal_width,
+                        scale: raw.list_child_decimal_scale,
+                    },
+                    _ => ExtraTypeInfo::None,
+                };
+                ExtraTypeInfo::List {
+                    child: Box::new(BoundLogicalType {
+                        id: child_id,
+                        extra: child_extra,
+                    }),
+                }
+            }
             _ => ExtraTypeInfo::None,
         };
         BoundLogicalType { id, extra }
@@ -54,15 +90,34 @@ impl BoundLogicalType {
     /// consumes, the inverse of `from_bridge`: every parameter field is
     /// written flat, zeroed when the id has none.
     pub fn to_duckdb_column(&self, name: String) -> ffi::DuckDBColumn {
-        let (decimal_width, decimal_scale) = match self.extra {
-            ExtraTypeInfo::Decimal { width, scale } => (width, scale),
-            ExtraTypeInfo::None => (0, 0),
+        let (decimal_width, decimal_scale) = match &self.extra {
+            ExtraTypeInfo::Decimal { width, scale } => (*width, *scale),
+            ExtraTypeInfo::None | ExtraTypeInfo::List { .. } => (0, 0),
         };
+        let (list_child_type_id, list_child_decimal_width, list_child_decimal_scale) =
+            match &self.extra {
+                ExtraTypeInfo::List { child } => {
+                    let (width, scale) = match &child.extra {
+                        ExtraTypeInfo::Decimal { width, scale } => (*width, *scale),
+                        ExtraTypeInfo::None => (0, 0),
+                        ExtraTypeInfo::List { .. } => {
+                            panic!("nested list columns are not supported by the planner bridge")
+                        }
+                    };
+                    (child.id.clone() as u8, width, scale)
+                }
+                ExtraTypeInfo::None | ExtraTypeInfo::Decimal { .. } => {
+                    (LogicalTypeId::INVALID as u8, 0, 0)
+                }
+            };
         ffi::DuckDBColumn {
             name,
             duckdb_logical_type_id: self.id.clone() as u8,
             decimal_width,
             decimal_scale,
+            list_child_type_id,
+            list_child_decimal_width,
+            list_child_decimal_scale,
         }
     }
 }
@@ -115,6 +170,9 @@ pub enum ScalarValue {
     /// takes the target column's type) so the consumer can build a null of the
     /// right shape. An untyped NULL keeps DuckDB's own `SQLNULL` id.
     Null(BoundLogicalType),
+    /// A typed empty LIST. Non-empty nested constants remain unsupported, but
+    /// the empty value has no children to decode and preserves its element type.
+    EmptyList(BoundLogicalType),
     /// A DuckDB type the bridge does not decode into a typed variant.
     Other(LogicalTypeId),
 }
@@ -149,6 +207,7 @@ impl fmt::Display for ScalarValue {
             } => write!(f, "{months} {days} {micros}"),
             ScalarValue::Variant(v) => write!(f, "{v}"),
             ScalarValue::Null(ty) => write!(f, "NULL as {:?}", ty.id),
+            ScalarValue::EmptyList(ty) => write!(f, "[] as {:?}", ty.id),
             ScalarValue::Other(ty) => write!(f, "{ty:?}"),
         }
     }

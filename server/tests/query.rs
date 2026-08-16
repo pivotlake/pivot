@@ -11,6 +11,7 @@ mod common;
 
 use std::fs::File;
 use std::path::Path;
+use std::process::{Command, Output};
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
@@ -28,7 +29,10 @@ use tokio_postgres::{Client, SimpleQueryMessage};
 /// `Vec<Option<String>>` (text format). Non-row messages (e.g. `RowDescription`,
 /// `CommandComplete`) are dropped — tests assert on data only.
 async fn select_rows(client: &Client, sql: &str) -> Vec<Vec<Option<String>>> {
-    let msgs = client.simple_query(sql).await.unwrap();
+    let msgs = client
+        .simple_query(sql)
+        .await
+        .unwrap_or_else(|error| panic!("query failed: {sql}\n{error:?}"));
     msgs.into_iter()
         .filter_map(|m| match m {
             SimpleQueryMessage::Row(r) => Some(
@@ -85,6 +89,43 @@ async fn create_people_table(client: &Client, table: &str, dir: &Path) {
         ))
         .await
         .unwrap();
+}
+
+fn run_psql(port: u16, command: &str) -> Option<Output> {
+    let output = match Command::new("psql")
+        .args([
+            "-X",
+            "--no-password",
+            "--echo-hidden",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--username",
+            "pivot",
+            "--dbname",
+            "test",
+            "--set",
+            "ON_ERROR_STOP=1",
+            "--command",
+            command,
+        ])
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("skipping psql compatibility check because psql is not installed");
+            return None;
+        }
+        Err(error) => panic!("failed to run psql: {error}"),
+    };
+    assert!(
+        output.status.success(),
+        "psql command `{command}` failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    Some(output)
 }
 
 #[rstest]
@@ -289,6 +330,220 @@ async fn second_connection_sees_table_created_by_first(#[future] conn: Conn) {
             vec![Some("3".into()), Some("carol".into())],
         ],
     );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn describes_datastore_tables_through_virtual_postgres_catalog(#[future] conn: Conn) {
+    conn.simple_query("CREATE SCHEMA catalog_metadata")
+        .await
+        .unwrap();
+    conn.simple_query(
+        "CREATE TABLE catalog_metadata.catalog_people (id BIGINT, name VARCHAR, active BOOLEAN, score DECIMAL(18, 4))",
+    )
+    .await
+    .unwrap();
+
+    let relation = select_rows(
+        &conn,
+        "SELECT c.oid, n.nspname, c.relname, pg_catalog.pg_get_userbyid(c.relowner) \
+         FROM pg_catalog.pg_class c \
+         JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relname = 'catalog_people'",
+    )
+    .await;
+    let repeated_relation_id = select_rows(
+        &conn,
+        "SELECT oid FROM pg_catalog.pg_class WHERE relname = 'catalog_people'",
+    )
+    .await;
+    let catalog_schema = select_rows(
+        &conn,
+        "SELECT nspname, pg_catalog.pg_get_userbyid(nspowner) \
+         FROM pg_catalog.pg_namespace WHERE nspname = 'pg_catalog'",
+    )
+    .await;
+    let oid_types = select_rows(
+        &conn,
+        "SELECT typeof(oid), typeof(relnamespace) \
+         FROM pg_catalog.pg_class WHERE relname = 'catalog_people'",
+    )
+    .await;
+    let attributes = select_rows(
+        &conn,
+        "SELECT a.attname, pg_catalog.format_type(a.atttypid, a.atttypmod) \
+         FROM pg_catalog.pg_attribute a \
+         JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+         WHERE c.relname = 'catalog_people' \
+         ORDER BY a.attnum",
+    )
+    .await;
+    let formatted_constant = select_rows(
+        &conn,
+        "SELECT pg_catalog.format_type(20::UINTEGER, -1::BIGINT)",
+    )
+    .await;
+    let relation_flags = select_rows(
+        &conn,
+        "SELECT relhasindex, relhasrules, relhastriggers \
+         FROM pg_catalog.pg_class WHERE relname = 'catalog_people'",
+    )
+    .await;
+    let catalog_types = select_rows(
+        &conn,
+        "SELECT t.typname, pg_catalog.pg_get_userbyid(t.typowner) \
+         FROM pg_catalog.pg_type t \
+         JOIN pg_catalog.pg_attribute a ON a.atttypid = t.oid \
+         JOIN pg_catalog.pg_class c ON c.oid = a.attrelid \
+         WHERE c.relname = 'catalog_people' ORDER BY t.typname",
+    )
+    .await;
+
+    assert_eq!(relation.len(), 1);
+    let relation_id = relation[0][0].clone().expect("relation OID");
+    assert!(relation_id.parse::<u32>().unwrap() > 0);
+    assert_eq!(
+        &relation[0][1..],
+        &[
+            Some("catalog_metadata".into()),
+            Some("catalog_people".into()),
+            Some("pivot".into()),
+        ]
+    );
+    assert_eq!(repeated_relation_id, vec![vec![Some(relation_id)]]);
+    assert_eq!(
+        catalog_schema,
+        vec![vec![Some("pg_catalog".into()), Some("pivot".into())]]
+    );
+    assert_eq!(
+        oid_types,
+        vec![vec![Some("UINTEGER".into()), Some("UINTEGER".into())]]
+    );
+    assert_eq!(formatted_constant, vec![vec![Some("bigint".into())]]);
+    assert_eq!(
+        relation_flags,
+        vec![vec![Some("f".into()), Some("f".into()), Some("f".into()),]]
+    );
+    assert_eq!(
+        catalog_types,
+        vec![
+            vec![Some("bool".into()), Some("pivot".into())],
+            vec![Some("int8".into()), Some("pivot".into())],
+            vec![Some("numeric".into()), Some("pivot".into())],
+            vec![Some("text".into()), Some("pivot".into())],
+        ]
+    );
+    assert_eq!(
+        attributes,
+        vec![
+            vec![Some("id".into()), Some("bigint".into())],
+            vec![Some("name".into()), Some("text".into())],
+            vec![Some("active".into()), Some("boolean".into())],
+            vec![Some("score".into()), Some("numeric(18,4)".into())],
+        ]
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn orders_and_limits_a_wide_virtual_catalog_scan(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE catalog_ordered_limit (id BIGINT)")
+        .await
+        .unwrap();
+
+    let rows = select_rows(
+        &conn,
+        "SELECT * FROM pg_catalog.pg_class ORDER BY relname LIMIT 1",
+    )
+    .await;
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].len(), 31);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn describes_datastore_tables_with_psql_meta_commands(#[future] conn: Conn) {
+    conn.simple_query("CREATE SCHEMA psql_metadata")
+        .await
+        .unwrap();
+    conn.simple_query(
+        "CREATE TABLE psql_metadata.psql_people (id BIGINT, display_name VARCHAR, active BOOLEAN)",
+    )
+    .await
+    .unwrap();
+    conn.simple_query("CREATE TABLE psql_visible_in_main (id BIGINT)")
+        .await
+        .unwrap();
+
+    let Some(namespaces) = run_psql(server_port(), "\\dn psql_metadata") else {
+        return;
+    };
+    let relations = run_psql(server_port(), "\\dt psql_metadata.*").unwrap();
+    let visible_relations = run_psql(server_port(), "\\dt").unwrap();
+    let description = run_psql(server_port(), "\\d psql_metadata.psql_people").unwrap();
+    let roles = run_psql(server_port(), "\\du").unwrap();
+
+    let namespaces = String::from_utf8(namespaces.stdout).unwrap();
+    let relations = String::from_utf8(relations.stdout).unwrap();
+    let visible_relations = String::from_utf8(visible_relations.stdout).unwrap();
+    let description = String::from_utf8(description.stdout).unwrap();
+    let roles = String::from_utf8(roles.stdout).unwrap();
+    assert!(namespaces.contains("psql_metadata"), "{namespaces}");
+    assert!(namespaces.contains("pivot"), "{namespaces}");
+    assert!(relations.contains("psql_people"), "{relations}");
+    assert!(relations.contains("pivot"), "{relations}");
+    assert!(
+        visible_relations.contains("psql_visible_in_main"),
+        "{visible_relations}"
+    );
+    assert!(
+        !visible_relations.contains("psql_people"),
+        "{visible_relations}"
+    );
+    assert!(
+        description.contains("psql_metadata.psql_people"),
+        "{description}"
+    );
+    assert!(description.contains("display_name"), "{description}");
+    assert!(description.contains("boolean"), "{description}");
+    assert!(roles.contains("List of roles"), "{roles}");
+    assert!(roles.contains("pivot"), "{roles}");
+    // These hidden queries are emitted only by the newer describe path. Keep
+    // the real pgwire server version advertised instead of restoring the old
+    // 9.4 compatibility override to make this test pass.
+    assert!(
+        description.contains("pg_catalog.pg_policy"),
+        "{description}"
+    );
+    assert!(
+        description.contains("pg_catalog.pg_statistic_ext"),
+        "{description}"
+    );
+    assert!(
+        description.contains("pg_catalog.pg_publication"),
+        "{description}"
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn refreshes_virtual_postgres_catalog_between_transactions(#[future] conn: Conn) {
+    let catalog_query =
+        "SELECT COUNT(*) FROM pg_catalog.pg_class WHERE relname = 'catalog_refresh_table'";
+
+    let before_create = select_one_i64(&conn, catalog_query).await;
+    conn.simple_query("CREATE TABLE catalog_refresh_table (id BIGINT)")
+        .await
+        .unwrap();
+    let after_create = select_one_i64(&conn, catalog_query).await;
+
+    assert_eq!(before_create, 0);
+    assert_eq!(after_create, 1);
 }
 
 /// Decode a one-row, one-column integer result (e.g. `SELECT drop_cache()`).

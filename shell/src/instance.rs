@@ -28,6 +28,10 @@ impl Metastore for EphemeralMetastore {
     fn user_auth(&self, _username: &str) -> Option<UserAuth> {
         None
     }
+
+    fn user_names(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 struct DispatchOwner(Option<Dispatch>);

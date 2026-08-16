@@ -320,6 +320,7 @@ impl PlanNode {
             }
             crate::Operator::Insert(o) => o.compile(inputs.remove(0), dispatcher),
             crate::Operator::DummyScan(o) => o.compile(dispatcher),
+            crate::Operator::EmptyResult(o) => o.compile(dispatcher),
             // EXPLAIN is handled above, before inputs are compiled.
             crate::Operator::Explain(_) => unreachable!("Explain is compiled before its inputs"),
             // SET/RESET is intercepted by the server after planning (it toggles

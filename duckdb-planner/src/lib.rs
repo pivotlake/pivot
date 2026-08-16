@@ -22,12 +22,7 @@
 //! impl DuckDBTable for UsersTable {
 //!     fn clone_box(&self) -> Box<dyn DuckDBTable> { Box::new(UsersTable) }
 //!     fn duckdb_typed_columns(&self) -> Vec<DuckDBColumn> {
-//!         vec![DuckDBColumn {
-//!             name: "name".to_string(),
-//!             duckdb_logical_type_id: LogicalTypeId::VARCHAR as u8,
-//!             decimal_width: 0,
-//!             decimal_scale: 0,
-//!         }]
+//!         vec![DuckDBColumn::plain("name", LogicalTypeId::VARCHAR)]
 //!     }
 //! }
 //!

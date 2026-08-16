@@ -14,6 +14,8 @@
 //! one's own commit; a datastore decides for itself whether that commit does
 //! blocking store I/O or is an in-memory no-op.
 
+mod pg_catalog;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -61,6 +63,9 @@ pub struct PivotCatalog {
     /// are server-wide, not a datastore's, so changing them doesn't ride a
     /// sub-transaction.
     metastore: Arc<dyn Metastore>,
+    /// Process-local PostgreSQL OIDs, shared by every query transaction and
+    /// discarded when this catalog is dropped at server shutdown.
+    oid_registry: Arc<pg_catalog::OidRegistry>,
 }
 
 impl PivotCatalog {
@@ -79,6 +84,7 @@ impl PivotCatalog {
             datastores: Arc::new(datastores),
             default_name,
             metastore,
+            oid_registry: Arc::new(pg_catalog::OidRegistry::default()),
         })
     }
 
@@ -129,6 +135,7 @@ impl PivotCatalog {
             sub_transactions: Mutex::new(HashMap::new()),
             metastore: self.metastore.clone(),
             staged_users: Arc::new(Injector::new()),
+            oid_registry: self.oid_registry.clone(),
         })
     }
 }
@@ -156,6 +163,9 @@ pub struct PivotTransaction {
     /// [`PivotUserCreation`]), applied to the metastore at commit and dropped
     /// on rollback. Shared (`Arc`) with the staging dataflow's workers.
     staged_users: Arc<Injector<CreateUserRequest>>,
+    /// Shared with the owning catalog so virtual OIDs remain stable between
+    /// query transactions for this server process.
+    oid_registry: Arc<pg_catalog::OidRegistry>,
 }
 
 impl PivotTransaction {
@@ -193,17 +203,30 @@ impl PivotTransaction {
 impl CatalogTransaction for PivotTransaction {
     fn does_schema_exist(&self, datastore: &str, schema: &str) -> bool {
         self.find_or_create_sub_transaction(datastore)
-            .is_some_and(|sub_transaction| sub_transaction.does_schema_exist(schema))
+            .is_some_and(|sub_transaction| {
+                schema == pg_catalog::SCHEMA_NAME || sub_transaction.does_schema_exist(schema)
+            })
     }
 
     fn bind_table(&self, reference: &TableReference) -> Option<Box<dyn BoundTable>> {
-        self.find_or_create_sub_transaction(&reference.datastore)?
-            .bind_table(&reference.datastore, &reference.schema_qualified_name())
+        let sub_transaction = self.find_or_create_sub_transaction(&reference.datastore)?;
+        if reference.schema == pg_catalog::SCHEMA_NAME {
+            return pg_catalog::bind_table(
+                reference.clone(),
+                sub_transaction.as_ref(),
+                &self.oid_registry,
+                self.metastore.as_ref(),
+            );
+        }
+        sub_transaction.bind_table(&reference.datastore, &reference.schema_qualified_name())
     }
 
     fn table_revision(&self, reference: &TableReference) -> Option<TableRevision> {
-        self.find_or_create_sub_transaction(&reference.datastore)?
-            .table_revision(&reference.schema_qualified_name())
+        let sub_transaction = self.find_or_create_sub_transaction(&reference.datastore)?;
+        if reference.schema == pg_catalog::SCHEMA_NAME {
+            return pg_catalog::table_revision(&reference.datastore, &reference.table);
+        }
+        sub_transaction.table_revision(&reference.schema_qualified_name())
     }
 
     fn bind_table_function(&self, datastore: &str, name: &str) -> Option<Box<dyn TableFunction>> {
@@ -220,6 +243,11 @@ impl CatalogTransaction for PivotTransaction {
         &self,
         request: CreateTableRequest,
     ) -> CatalogResult<Box<dyn TableCreation>> {
+        if request.schema_name.as_deref() == Some(pg_catalog::SCHEMA_NAME) {
+            return Err(CatalogError::Other(
+                "the pg_catalog schema is read-only".into(),
+            ));
+        }
         // Route to the datastore the statement named (`CREATE TABLE db.t`), or the
         // default when unqualified. An explicit name that matches no datastore is
         // an internal inconsistency.
@@ -254,6 +282,11 @@ impl CatalogTransaction for PivotTransaction {
         &self,
         request: CreateSchemaRequest,
     ) -> CatalogResult<Box<dyn SchemaCreation>> {
+        if request.name == pg_catalog::SCHEMA_NAME {
+            return Err(CatalogError::Other(
+                "the pg_catalog schema is reserved".into(),
+            ));
+        }
         // DuckDB keeps an unqualified CREATE SCHEMA's catalog unresolved in the
         // logical operator and normally applies the current database during
         // physical execution. Pivot executes the logical operator itself, so it
@@ -375,6 +408,10 @@ mod tests {
 
         fn user_auth(&self, username: &str) -> Option<UserAuth> {
             (username == DEFAULT_USER_NAME).then_some(UserAuth::Trust)
+        }
+
+        fn user_names(&self) -> Vec<String> {
+            vec![DEFAULT_USER_NAME.to_string()]
         }
     }
 

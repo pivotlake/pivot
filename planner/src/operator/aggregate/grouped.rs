@@ -393,6 +393,7 @@ pub(super) fn column_nullable(nullability: &[bool], column: usize) -> bool {
 /// rather than silently coercing it.
 fn canonical_input_type(result_type: &Type) -> Option<Type> {
     match result_type {
+        Type::Boolean => Some(Type::Boolean),
         Type::Utf8 => Some(Type::Utf8),
         Type::Date => Some(Type::Date),
         Type::Timestamp => Some(Type::Timestamp),
@@ -754,10 +755,41 @@ mod tests {
     use crate::types::Type;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Date32Type, Float64Type, Int64Type};
-    use arrow_array::{ArrayRef, Float32Array, Float64Array, Int32Array, RecordBatch};
+    use arrow_array::{
+        ArrayRef, BooleanArray, Float32Array, Float64Array, Int32Array, RecordBatch,
+    };
     use arrow_schema::DataType;
     use rstest::rstest;
     use std::sync::Arc;
+
+    #[rstest]
+    fn groups_by_boolean_columns(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "flags",
+            &[(
+                "enabled",
+                Type::Boolean,
+                Arc::new(BooleanArray::from(vec![true, false, true])) as ArrayRef,
+            )],
+        );
+
+        let mut rows = run(
+            &mut testing_planner,
+            "SELECT enabled, COUNT(*) AS total FROM flags GROUP BY enabled",
+        );
+        rows.sort_by_key(|row| row["enabled"].as_bool().unwrap());
+
+        assert_eq!(
+            rows,
+            serde_json::json!([
+                {"enabled": false, "total": 1},
+                {"enabled": true, "total": 2},
+            ])
+            .as_array()
+            .unwrap()
+            .clone()
+        );
+    }
 
     #[rstest]
     fn grouped_aggregates_over_double_are_float64(mut testing_planner: TestingPlanner) {

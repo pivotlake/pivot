@@ -15,10 +15,10 @@ use duckdb_planner::handle::{
     Aggregate as AggregateView, BridgeError, ChunkGet as ChunkGetView, Compact as CompactView,
     CopyFromStdin as CopyFromStdinView, CreateSchema as CreateSchemaView,
     CreateTable as CreateTableView, CreateUser as CreateUserView, Drop as DropView,
-    Filter as FilterView, Insert as InsertView, Limit as LimitView, OrderBy as OrderByView,
-    OrderKey, Projection as ProjectionView, Reset as ResetView, Set as SetView,
-    TableFunctionScan as TableFunctionScanView, TableScan as TableScanView, TopN as TopNView,
-    Values as ValuesView,
+    EmptyResult as EmptyResultView, Filter as FilterView, Insert as InsertView, Limit as LimitView,
+    OrderBy as OrderByView, OrderKey, Projection as ProjectionView, Reset as ResetView,
+    Set as SetView, TableFunctionScan as TableFunctionScanView, TableScan as TableScanView,
+    TopN as TopNView, Values as ValuesView,
 };
 
 use super::{BuildCtx, build_scan_columns};
@@ -29,8 +29,8 @@ use crate::catalog::{
 use crate::expression::{Error as ExpressionError, Expression};
 use crate::operator::{
     Aggregate, Compact, CopyFormat, CopyFromStdin, CreateSchema, CreateTable, CreateUser,
-    DropTable, Error as OperatorError, Filter, Input, Insert, Limit, OrderBy, OrderByNode,
-    Projection, SetVariable, TableFunctionScan, TopN, Values,
+    DropTable, EmptyResult, Error as OperatorError, Filter, Input, Insert, Limit, OrderBy,
+    OrderByNode, Projection, SetVariable, TableFunctionScan, TopN, Values,
 };
 use crate::types::{build_scalar_value, type_from_logical};
 
@@ -126,6 +126,18 @@ impl Aggregate {
                 .into_iter()
                 .map(Expression::from_handle)
                 .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+}
+
+impl EmptyResult {
+    pub(crate) fn from_handle(view: EmptyResultView<'_>) -> Result<EmptyResult, OperatorError> {
+        Ok(EmptyResult {
+            output_types: view
+                .output_types()?
+                .into_iter()
+                .map(type_from_logical)
+                .collect::<Result<_, _>>()?,
         })
     }
 }

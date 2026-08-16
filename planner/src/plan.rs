@@ -64,18 +64,20 @@ impl PlanNode {
     /// retain state tied to the transaction that planned them. Table functions
     /// resolve again at compile time and do not expose revision dependencies.
     pub(crate) fn is_cacheable(&self) -> bool {
-        !matches!(
-            self.operator,
+        let operator_is_cacheable = match &self.operator {
+            Operator::Input(input) => input.table.is_plan_cacheable(),
             Operator::Insert(_)
-                | Operator::CreateTable(_)
-                | Operator::CreateSchema(_)
-                | Operator::DropTable(_)
-                | Operator::CreateUser(_)
-                | Operator::SetVariable(_)
-                | Operator::Compact(_)
-                | Operator::CopyFromStdin(_)
-                | Operator::TableFunctionScan(_)
-        ) && self.inputs.iter().all(PlanNode::is_cacheable)
+            | Operator::CreateTable(_)
+            | Operator::CreateSchema(_)
+            | Operator::DropTable(_)
+            | Operator::CreateUser(_)
+            | Operator::SetVariable(_)
+            | Operator::Compact(_)
+            | Operator::CopyFromStdin(_)
+            | Operator::TableFunctionScan(_) => false,
+            _ => true,
+        };
+        operator_is_cacheable && self.inputs.iter().all(PlanNode::is_cacheable)
     }
 
     /// Whether every table scan still has the same identity and version in

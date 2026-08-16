@@ -12,18 +12,8 @@ impl DuckDBTable for TTable {
 
     fn duckdb_typed_columns(&self) -> Vec<DuckDBColumn> {
         vec![
-            DuckDBColumn {
-                name: "id".to_string(),
-                duckdb_logical_type_id: LogicalTypeId::INTEGER as u8,
-                decimal_width: 0,
-                decimal_scale: 0,
-            },
-            DuckDBColumn {
-                name: "name".to_string(),
-                duckdb_logical_type_id: LogicalTypeId::VARCHAR as u8,
-                decimal_width: 0,
-                decimal_scale: 0,
-            },
+            DuckDBColumn::plain("id", LogicalTypeId::INTEGER),
+            DuckDBColumn::plain("name", LogicalTypeId::VARCHAR),
         ]
     }
 }

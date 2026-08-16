@@ -16,10 +16,10 @@
 
 use arrow_array::{
     ArrayRef, BooleanArray, Decimal64Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, Scalar, StringViewArray, TimestampMicrosecondArray,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Int16Array, Int32Array, Int64Array, ListArray, Scalar, StringViewArray,
+    TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, new_empty_array,
 };
-use arrow_schema::{DataType, TimeUnit};
+use arrow_schema::{DataType, Field, TimeUnit};
 use duckdb_planner::duckdb_bridge::duckdb_types::LogicalTypeId;
 use duckdb_planner::{BoundLogicalType, ExtraTypeInfo, ScalarValue};
 use std::fmt;
@@ -71,6 +71,15 @@ pub enum Type {
     /// resolution, so a value crosses the two engines unscaled. The executor
     /// sees that count in an `Int64`-shaped timestamp column.
     Timestamp,
+    /// A one-dimensional list, supported as metadata only. It exists so the
+    /// PostgreSQL-compatible catalog relations can declare their array-valued
+    /// columns (policy roles, statistics kinds, role config) and psql's
+    /// describe queries bind against them; those columns only ever hold NULLs
+    /// or sit in statically empty relations. No list value is ever computed,
+    /// stored, or emitted: list literals, `array_agg`, list columns in CREATE
+    /// TABLE, and list-typed parquet columns are all rejected with explicit
+    /// errors before execution.
+    List(Box<Type>),
     /// A Parquet `variant` (semi-structured / JSON) column, presented to DuckDB
     /// as its native `VARIANT` type: `d.age`, `d->'age'`, and casts all bind
     /// natively. The executor sees the Arrow struct of leaves the file stores.
@@ -98,6 +107,7 @@ impl fmt::Display for Type {
             Type::Utf8 => "Utf8",
             Type::Date => "Date",
             Type::Timestamp => "Timestamp",
+            Type::List(_) => "List",
             Type::Variant => "Variant",
         };
         f.write_str(name)
@@ -155,6 +165,9 @@ pub fn type_from_logical(bound: BoundLogicalType) -> Result<Type, Error> {
         (LogicalTypeId::VARCHAR, ExtraTypeInfo::None) => Ok(Type::Utf8),
         (LogicalTypeId::DATE, ExtraTypeInfo::None) => Ok(Type::Date),
         (LogicalTypeId::TIMESTAMP, ExtraTypeInfo::None) => Ok(Type::Timestamp),
+        (LogicalTypeId::LIST, ExtraTypeInfo::List { child }) => {
+            Ok(Type::List(Box::new(type_from_logical(*child)?)))
+        }
         (LogicalTypeId::VARIANT, ExtraTypeInfo::None) => Ok(Type::Variant),
         _ => Err(Error::UnsupportedLogicalType(bound.id.clone())),
     }
@@ -186,6 +199,12 @@ pub fn logical_from_type(pivot_type: &Type) -> BoundLogicalType {
         Type::Utf8 => BoundLogicalType::plain(LogicalTypeId::VARCHAR),
         Type::Date => BoundLogicalType::plain(LogicalTypeId::DATE),
         Type::Timestamp => BoundLogicalType::plain(LogicalTypeId::TIMESTAMP),
+        Type::List(child) => BoundLogicalType {
+            id: LogicalTypeId::LIST,
+            extra: ExtraTypeInfo::List {
+                child: Box::new(logical_from_type(child)),
+            },
+        },
         Type::Variant => BoundLogicalType::plain(LogicalTypeId::VARIANT),
     }
 }
@@ -222,6 +241,11 @@ pub fn physical_arrow_type(pivot_type: &Type) -> DataType {
         Type::Utf8 => DataType::Utf8View,
         Type::Date => DataType::Date32,
         Type::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
+        Type::List(child) => DataType::List(Arc::new(Field::new(
+            "item",
+            physical_arrow_type(child),
+            true,
+        ))),
         Type::Variant => variant_struct_type(),
     }
 }
@@ -253,6 +277,9 @@ pub fn type_from_physical(data_type: &DataType) -> Option<Type> {
         DataType::Utf8View => Some(Type::Utf8),
         DataType::Date32 => Some(Type::Date),
         DataType::Timestamp(TimeUnit::Microsecond, None) => Some(Type::Timestamp),
+        DataType::List(field) => {
+            type_from_physical(field.data_type()).map(|child| Type::List(Box::new(child)))
+        }
         other if *other == variant_struct_type() => Some(Type::Variant),
         _ => None,
     }
@@ -345,6 +372,18 @@ pub fn build_scalar_value(value: ScalarValue) -> Result<Scalar<ArrayRef>, Error>
         ScalarValue::Null(logical_type) => {
             arrow_array::new_null_array(&physical_arrow_type(&type_from_logical(logical_type)?), 1)
         }
+        ScalarValue::EmptyList(logical_type) => {
+            let list_type = physical_arrow_type(&type_from_logical(logical_type)?);
+            let DataType::List(field) = list_type else {
+                unreachable!("an empty-list scalar carries a LIST type")
+            };
+            Arc::new(ListArray::new(
+                field.clone(),
+                arrow::buffer::OffsetBuffer::new(vec![0_i32, 0].into()),
+                new_empty_array(field.data_type()),
+                None,
+            ))
+        }
         // INTERVAL never appears as a query constant we materialise (it is
         // consumed by interval arithmetic), and types the bridge doesn't decode
         // arrive as `Other`.
@@ -385,6 +424,7 @@ mod tests {
             Type::Utf8,
             Type::Date,
             Type::Timestamp,
+            Type::List(Box::new(Type::UInt32)),
             Type::Variant,
         ]
     }

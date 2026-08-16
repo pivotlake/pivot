@@ -1,6 +1,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use crate::duckdb_bridge::duckdb_types::LogicalTypeId;
 use crate::duckdb_bridge::ffi;
 use crate::duckdb_bridge::ffi::CatalogGetScalarFunctionResult;
 use crate::duckdb_bridge::ffi::CatalogGetTableFunctionResult;
@@ -35,6 +36,13 @@ pub trait DuckDBTable: Any {
     /// the one resolved table out.
     fn clone_box(&self) -> Box<dyn DuckDBTable>;
 
+    /// Whether DuckDB may rewrite this table's scan into a narrow row-id scan
+    /// followed by late materialization. The execution planner must provide the
+    /// corresponding row metadata and materialization implementation.
+    fn supports_late_materialization(&self) -> bool {
+        false
+    }
+
     /// Called from DuckDB's `pushdown_complex_filter` hook with a borrowed
     /// handle to the current scan-local filter expression. The implementor reads
     /// the handle (translating it however it likes) to decide eligibility.
@@ -52,6 +60,12 @@ pub trait DuckDBTable: Any {
     /// table sizes. `None` means unknown; DuckDB then falls back to its own
     /// defaults.
     fn estimate_row_count(&self) -> Option<u64> {
+        None
+    }
+
+    /// The table's exact row count when metadata proves it without scanning.
+    /// DuckDB may use this as both its estimate and its maximum cardinality.
+    fn exact_row_count(&self) -> Option<u64> {
         None
     }
 }
@@ -78,10 +92,10 @@ pub struct TableFunctionDef {
 pub use crate::duckdb_bridge::ffi::ScalarFunctionDef;
 
 pub trait DuckDBBind {
-    /// Given a scalar function name (e.g. `drop_cache`), return its binding
-    /// signature. Names the provider doesn't define return `None` and resolve
-    /// against DuckDB's own built-ins. Default: none.
-    fn scalar_function(&self, _name: &str) -> Option<ScalarFunctionDef> {
+    /// Given a scalar function name in `schema` (e.g. `main.drop_cache`),
+    /// return its binding signature. Names the provider doesn't define return
+    /// `None` and resolve against later catalogs on DuckDB's search path.
+    fn scalar_function(&self, _schema: &str, _name: &str) -> Option<ScalarFunctionDef> {
         None
     }
 }
@@ -127,8 +141,8 @@ pub trait DuckDBTransaction: Send + Sync {
 ///
 /// The static provider is a single one shared by every attached datastore:
 /// scalar functions are generic (not per-datastore). `database_names` are the
-/// datastores to `ATTACH` (one DuckDB database each) and `default_name` the one
-/// to `USE` as the current database.
+/// datastores to `ATTACH` (one DuckDB database each) and `default_name` is the
+/// one whose `main` and `pg_catalog` schemas lead the search path.
 pub struct CatalogContext {
     provider: Arc<dyn DuckDBBind>,
     database_names: Vec<String>,
@@ -155,8 +169,8 @@ pub(crate) fn catalog_context_names(ctx: &CatalogContext) -> Vec<String> {
     ctx.database_names.clone()
 }
 
-/// The datastore DuckDB should make its current database (`USE`). Called from the
-/// C++ context constructor.
+/// The datastore whose schemas should lead DuckDB's search path. Called from
+/// the C++ context constructor.
 pub(crate) fn catalog_context_default(ctx: &CatalogContext) -> String {
     ctx.default_name.clone()
 }
@@ -231,9 +245,10 @@ pub(crate) fn catalog_get_table_function(
 
 pub(crate) fn catalog_get_scalar_function(
     ctx: &CatalogContext,
+    schema: &str,
     name: &str,
 ) -> CatalogGetScalarFunctionResult {
-    match ctx.provider.scalar_function(name) {
+    match ctx.provider.scalar_function(schema, name) {
         Some(function) => CatalogGetScalarFunctionResult {
             found: true,
             function,
@@ -242,6 +257,7 @@ pub(crate) fn catalog_get_scalar_function(
             found: false,
             function: ScalarFunctionDef {
                 arg_type_ids: Vec::new(),
+                vararg_type_id: LogicalTypeId::INVALID as u8,
                 return_type_id: 0,
                 is_volatile: false,
             },
@@ -265,11 +281,31 @@ pub(crate) fn table_estimate_row_count(table: &OptionalTableWrapper) -> ffi::Car
         .table
         .as_ref()
         .expect("estimate_row_count called on unbound table");
+    if let Some(rows) = table.exact_row_count() {
+        return ffi::CardinalityEstimate {
+            known: true,
+            exact: true,
+            rows,
+        };
+    }
     match table.estimate_row_count() {
-        Some(rows) => ffi::CardinalityEstimate { known: true, rows },
+        Some(rows) => ffi::CardinalityEstimate {
+            known: true,
+            exact: false,
+            rows,
+        },
         None => ffi::CardinalityEstimate {
             known: false,
+            exact: false,
             rows: 0,
         },
     }
+}
+
+pub(crate) fn table_supports_late_materialization(table: &OptionalTableWrapper) -> bool {
+    table
+        .table
+        .as_ref()
+        .expect("supports_late_materialization called on unbound table")
+        .supports_late_materialization()
 }

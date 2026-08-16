@@ -19,18 +19,21 @@ static BindInfo PivotScanGetBindInfo(const optional_ptr<FunctionData> bind_data)
 	return BindInfo(data.catalog_entry);
 }
 
-// Feed DuckDB's cost model the table's real size. The optimizer reaches this
-// through LogicalGet::EstimateCardinality, and the join order optimizer's
-// relation stats build on it — so join ordering (and with it the hash join's
-// build/probe side choice) sees actual row counts instead of the default
-// guess. Returning null means "unknown" and keeps DuckDB's defaults.
+// Feed DuckDB's cost model the table's metadata row count. The optimizer
+// reaches this through LogicalGet::EstimateCardinality, and the join order
+// optimizer's relation stats build on it. Only an exact answer is also exposed
+// as a maximum cardinality; an estimate remains a cost hint. Returning null
+// means "unknown" and keeps DuckDB's defaults.
 static unique_ptr<NodeStatistics> PivotScanCardinality(ClientContext &context, const FunctionData *bind_data) {
 	auto &data = bind_data->Cast<PivotScanBindData>();
 	auto estimate = table_estimate_row_count(data.table);
 	if (!estimate.known) {
 		return nullptr;
 	}
-	return make_uniq<NodeStatistics>(estimate.rows, estimate.rows);
+	if (estimate.exact) {
+		return make_uniq<NodeStatistics>(estimate.rows, estimate.rows);
+	}
+	return make_uniq<NodeStatistics>(estimate.rows);
 }
 
 // Walk an expression tree and rewrite every BoundReferenceExpression's index
@@ -151,17 +154,15 @@ TableFunction PivotTableCatalogEntry::GetScanFunction(ClientContext &context, un
 	// only the referenced leaves. Gated by the optimizer on `func.statistics`
 	// being unset, which it is.
 	func.supports_pushdown_extract = PivotScanSupportsPushdownExtract;
-	// Advertise row-id / late-materialization support so DuckDB's
-	// `late_materialization` optimizer fires for `SELECT <wide> ... ORDER BY ...
-	// LIMIT n` queries over this table: it rewrites them into a SEMI join on the
-	// row-id whose narrow side scans only the predicate/sort columns. The bridge
-	// recognizes that join and collapses it onto pivot's own materializer. We
-	// only PLAN with DuckDB (never execute its scan), so the row-id is purely a
-	// plan-time marker; the default `rowid` virtual column from TableCatalogEntry
-	// is enough.
-	func.late_materialization = true;
-	func.get_virtual_columns = PivotScanGetVirtualColumns;
-	func.get_row_id_columns = PivotScanGetRowIdColumns;
+	// A capable table lets DuckDB rewrite a wide Top-N into a narrow row-id
+	// scan whose survivors Pivot materializes. The row-id is a plan-time marker;
+	// the default virtual column from TableCatalogEntry is sufficient. Tables
+	// without a materialization implementation must not advertise these hooks.
+	if (table_supports_late_materialization(*table)) {
+		func.late_materialization = true;
+		func.get_virtual_columns = PivotScanGetVirtualColumns;
+		func.get_row_id_columns = PivotScanGetRowIdColumns;
+	}
 	func.cardinality = PivotScanCardinality;
 	return func;
 }

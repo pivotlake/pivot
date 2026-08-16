@@ -27,7 +27,7 @@ struct PivotStorageInfo : public duckdb::StorageExtensionInfo {
 	    duckdb::unique_ptr<duckdb::TableFunctionCatalogEntry> entry);
 	duckdb::ScalarFunctionCatalogEntry *AddScalarFunctionEntry(
 	    duckdb::unique_ptr<duckdb::ScalarFunctionCatalogEntry> entry);
-	void ClearTableEntries();
+	void ClearCatalogEntries();
 
 	static PivotStorageInfo &Get(duckdb::DatabaseInstance &db);
 };

@@ -17,14 +17,17 @@ use std::fmt::Debug;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use futures::Sink;
+use futures::{Sink, SinkExt};
 use metastore::{Metastore, SCRAM_ITERATIONS, SCRAM_SALT_LEN, ScramVerifier, UserAuth};
 use pgwire::api::auth::sasl::SASLAuthStartupHandler;
 use pgwire::api::auth::sasl::scram::ScramAuth;
-use pgwire::api::auth::{AuthSource, DefaultServerParameterProvider, LoginInfo, Password};
-use pgwire::api::auth::{StartupHandler, noop::NoopStartupHandler};
+use pgwire::api::auth::{
+    AuthSource, DefaultServerParameterProvider, LoginInfo, Password, StartupHandler,
+    noop::NoopStartupHandler,
+};
 use pgwire::api::{ClientInfo, ConnectionManager};
 use pgwire::error::{PgWireError, PgWireResult};
+use pgwire::messages::startup::ParameterStatus;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use sha2::{Digest, Sha256};
 use tracing::info;
@@ -119,12 +122,14 @@ impl Authenticator {
     /// Build authentication over the live metastore.
     pub fn new(metastore: Arc<dyn Metastore>, manager: Arc<ConnectionManager>) -> Self {
         info!("authenticating connections against the metastore");
+        let mut parameters = DefaultServerParameterProvider::default();
+        parameters.search_path = planner::DEFAULT_SCHEMA_NAME.to_string();
         Self {
             auth_source: Arc::new(MetastoreAuthSource {
                 metastore,
                 mock_secret: rand::random(),
             }),
-            parameters: Arc::new(DefaultServerParameterProvider::default()),
+            parameters: Arc::new(parameters),
             manager,
         }
     }
@@ -220,8 +225,32 @@ struct UnauthenticatedStartupHandler {
     manager: Arc<ConnectionManager>,
 }
 
+#[async_trait]
 impl NoopStartupHandler for UnauthenticatedStartupHandler {
     fn connection_manager(&self) -> Option<Arc<ConnectionManager>> {
         Some(self.manager.clone())
+    }
+
+    async fn post_startup<C>(
+        &self,
+        client: &mut C,
+        _message: PgWireFrontendMessage,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        // pgwire's no-auth path intentionally owns protocol negotiation,
+        // cancellation registration, and authentication framing. Its parameter
+        // provider is fixed to the default `public` search path, though, so
+        // replace only that status before it sends ReadyForQuery.
+        client
+            .send(PgWireBackendMessage::ParameterStatus(ParameterStatus::new(
+                "search_path".to_string(),
+                planner::DEFAULT_SCHEMA_NAME.to_string(),
+            )))
+            .await?;
+        Ok(())
     }
 }

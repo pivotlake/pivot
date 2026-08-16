@@ -1117,7 +1117,7 @@ fn delta_type(column: &str, data_type: &Type) -> Result<DeltaDataType, Error> {
         Type::Date => PrimitiveType::Date,
         Type::Timestamp => PrimitiveType::TimestampNtz,
         Type::Decimal { precision, scale } => PrimitiveType::decimal(*precision, *scale as u8)?,
-        Type::Int128 | Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64 => {
+        Type::Int128 | Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64 | Type::List(_) => {
             return Err(Error::UnsupportedType {
                 column: column.to_string(),
                 data_type: data_type.to_string(),

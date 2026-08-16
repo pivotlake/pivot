@@ -262,10 +262,11 @@ struct TestTransaction {
 }
 
 impl CatalogTransaction for TestTransaction {
-    // Every test table lives in the default schema, so that is the only schema
-    // this catalog defines.
+    // Test tables live in the default schema. Expose pg_catalog too so the
+    // planner's PostgreSQL compatibility scalar functions resolve through the
+    // same attached-catalog path production transactions use.
     fn does_schema_exist(&self, _datastore: &str, schema: &str) -> bool {
-        schema == crate::DEFAULT_SCHEMA_NAME
+        schema == crate::DEFAULT_SCHEMA_NAME || schema == "pg_catalog"
     }
 
     fn bind_table(&self, reference: &TableReference) -> Option<Box<dyn BoundTable>> {

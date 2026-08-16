@@ -24,6 +24,7 @@ mod cte;
 mod distinct;
 mod drop_table;
 mod dummy_scan;
+mod empty_result;
 mod explain;
 mod filter;
 mod input;
@@ -49,6 +50,7 @@ pub use cte::{Cte, CteScan};
 pub use distinct::Distinct;
 pub use drop_table::DropTable;
 pub use dummy_scan::DummyScan;
+pub use empty_result::EmptyResult;
 pub use explain::Explain;
 pub use filter::Filter;
 pub use input::Input;
@@ -134,6 +136,8 @@ pub enum Operator {
     /// that stages the user; the transaction's commit creates it.
     CreateUser(CreateUser),
     DummyScan(DummyScan),
+    /// A statically empty source with a known output schema.
+    EmptyResult(EmptyResult),
     /// `SET`/`RESET` of a session variable — handled by the server, not compiled.
     SetVariable(SetVariable),
     /// `COMPACT <table> [FINAL]` — handled by the server, not compiled.
@@ -215,6 +219,7 @@ impl Operator {
             }
             // A FROM-less SELECT's one-row source has no columns of its own.
             Operator::DummyScan(_) => Ok(Vec::new()),
+            Operator::EmptyResult(empty) => Ok(empty.output_types.clone()),
             // EXPLAIN renders its child plan as text, one line per row.
             Operator::Explain(_) => Ok(vec![Type::Utf8]),
             // A CTE emits what the query reading it emits; the definition
@@ -282,6 +287,10 @@ impl Operator {
                 inputs[0].clone()
             }
             Operator::DummyScan(_) => Vec::new(),
+            // With no rows, no column can contain a NULL. Reporting this exact
+            // fact also lets null-aware joins over an optimizer-proven-empty
+            // side take their ordinary no-match path.
+            Operator::EmptyResult(empty) => vec![false; empty.output_types.len()],
             Operator::Explain(_) => vec![false],
             // A VALUES row may hold NULL literals; stay conservative.
             Operator::Values(values) => {
@@ -363,6 +372,7 @@ impl fmt::Display for Operator {
             Operator::DropTable(d) => write!(f, "{d}"),
             Operator::CreateUser(c) => write!(f, "{c}"),
             Operator::DummyScan(d) => write!(f, "{d}"),
+            Operator::EmptyResult(e) => write!(f, "{e}"),
             Operator::SetVariable(s) => write!(f, "{s}"),
             Operator::Compact(c) => write!(f, "{c}"),
             Operator::CopyFromStdin(c) => write!(f, "{c}"),
