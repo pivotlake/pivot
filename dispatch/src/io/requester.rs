@@ -9,7 +9,7 @@ use crate::io::{
 use crate::request_tracker::{RegisteredRead, RequestRoute, RequestTracker, RoutedReadResponse};
 use crate::stats::StatsCollector;
 use crate::worker::WORKER_IDX;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use thiserror::Error;
@@ -45,6 +45,17 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 /// each accepted operation to the kernel.
 pub const RING_SIZE: u32 = 64;
 
+/// Cap on one worker's in-flight local-file operations; operations accepted
+/// past it wait in the requester's backlog until a completion frees capacity.
+/// The device's tag budget is far smaller than the rings could fill (63
+/// scheduler tags on an EBS nvme volume against 16 workers x RING_SIZE
+/// entries, with the block layer splitting each operation further), and a
+/// submission into a saturated queue either sleeps in the kernel's request
+/// allocation or pays an io-wq punt. Bounding in-flight work per worker keeps
+/// the queue deep enough to saturate the device while leaving inline
+/// submission - the cheap path - safe.
+const MAX_INFLIGHT_FS_OPS: usize = 8;
+
 /// Bridges dataflow operators and the I/O backend, holding state on outstanding
 /// requests and returning responses together with the original requested context.
 ///
@@ -66,6 +77,9 @@ pub struct IORequester {
     /// only for a write whose prior completion came up short and was
     /// resubmitted).
     pending_io_requests: HashMap<Identifier, (DataFlowRequest<FsRequest>, usize)>,
+    /// Local-file operations accepted past [`MAX_INFLIGHT_FS_OPS`], submitted
+    /// in order as completions free capacity.
+    fs_backlog: VecDeque<DataFlowRequest<FsRequest>>,
     /// Logical reads following extents currently being filled by another
     /// worker. They need no transport request of their own; the worker polls
     /// their shared extent state once per loop.
@@ -91,6 +105,7 @@ impl IORequester {
             backend: IOBackend::new(RING_SIZE).expect("Unable to create backend"),
             tracker: RequestTracker::default(),
             pending_io_requests: Default::default(),
+            fs_backlog: VecDeque::new(),
             piggybacked_reads: Vec::new(),
             next_id: 0,
             http: CachedHttpEngine::with_default_config(disk_cache)
@@ -108,6 +123,7 @@ impl IORequester {
             backend: IOBackend::new(RING_SIZE).expect("Unable to create backend"),
             tracker: RequestTracker::default(),
             pending_io_requests: Default::default(),
+            fs_backlog: VecDeque::new(),
             piggybacked_reads: Vec::new(),
             next_id: 0,
             http: CachedHttpEngine::new(http_config, disk_cache)
@@ -231,15 +247,59 @@ impl IORequester {
     }
 
     /// Discard logical read state for a dataflow that is no longer running.
+    /// Dropping a backlogged read drops its extent's fill owner, which removes
+    /// the extent and wakes any followers, exactly like a cancelled in-flight
+    /// owner.
     pub fn cancel_dataflow(&mut self, data_flow_id: Identifier) {
         self.tracker.cancel_dataflow(data_flow_id);
         self.piggybacked_reads
             .retain(|request| request.data_flow_id() != data_flow_id);
+        self.fs_backlog
+            .retain(|request| request.data_flow_id != data_flow_id);
     }
 
-    /// Submit an operator-owned filesystem operation through the worker's
-    /// shared I/O backend. Request-owned storage remains alive until completion.
+    /// Refill the backend from the backlog as far as the in-flight cap allows.
+    /// A submission failure fails that operation the same way a registration-
+    /// time failure does, then surfaces the error.
+    fn drain_fs_backlog(&mut self) -> Result<()> {
+        while self.pending_io_requests.len() < MAX_INFLIGHT_FS_OPS {
+            let Some(request) = self.fs_backlog.pop_front() else {
+                break;
+            };
+            let tracked_read_id = request.tracked_read_id;
+            let failed_extent = match &request.request {
+                FsRequest::Read(read) => {
+                    Some((OpenFile::Local(read.file.clone()), read.block.clone()))
+                }
+                FsRequest::Write(_) => None,
+            };
+            if let Err(error) = self.submit_fs_request_now(request) {
+                if let Some((open_file, block)) = failed_extent {
+                    block.remove_from_cache(&open_file);
+                }
+                if let Some(id) = tracked_read_id {
+                    let _ = self.tracker.fail(id);
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Accept an operator-owned filesystem operation: submit it through the
+    /// worker's shared I/O backend, or hold it in the backlog while the
+    /// in-flight cap is reached. Request-owned storage remains alive until
+    /// completion.
     fn submit_fs_request_to_backend(&mut self, request: DataFlowRequest<FsRequest>) -> Result<()> {
+        if self.pending_io_requests.len() >= MAX_INFLIGHT_FS_OPS {
+            self.fs_backlog.push_back(request);
+            return Ok(());
+        }
+        self.submit_fs_request_now(request)
+    }
+
+    /// Unconditionally submit one filesystem operation to the backend.
+    fn submit_fs_request_now(&mut self, request: DataFlowRequest<FsRequest>) -> Result<()> {
         match &request.request {
             FsRequest::Read(read) => self.backend.submit_read(
                 read.file.as_raw_fd(),
@@ -328,10 +388,14 @@ impl IORequester {
         self.backend.wake_handle()
     }
 
-    /// Returns `true` if any disk read is in flight - operator reads here, plus
-    /// the engine's cache-file reads / write-backs (all on the shared backend).
+    /// Returns `true` if any disk read is in flight or waiting in the backlog -
+    /// operator reads here, plus the engine's cache-file reads / write-backs
+    /// (all on the shared backend). A non-empty backlog implies the in-flight
+    /// cap is reached, so a blocking wait always has a completion to wake on.
     pub fn has_file_pending(&self) -> bool {
-        !self.pending_io_requests.is_empty() || self.http.has_disk_pending()
+        !self.pending_io_requests.is_empty()
+            || !self.fs_backlog.is_empty()
+            || self.http.has_disk_pending()
     }
 
     /// Returns `true` if any HTTP operation is in flight.
@@ -505,6 +569,10 @@ impl IORequester {
             }
         }
 
+        // Completions freed in-flight capacity; put backlogged operations on
+        // the device before doing anything else with this pass.
+        self.drain_fs_backlog()?;
+
         // HTTP reads the engine finished this pass (and any write-backs they queue).
         self.http
             .drain(&mut self.backend, &mut self.next_id, &mut out)?;
@@ -675,6 +743,51 @@ mod tests {
     fn disabled_stats() -> StatsCollector {
         let (tx, _rx) = mpsc::channel();
         StatsCollector::new(tx, false)
+    }
+
+    #[test]
+    fn reads_past_the_in_flight_cap_wait_their_turn_and_still_complete() {
+        init_test_free_pool(4);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        let blocks = MAX_INFLIGHT_FS_OPS + 4;
+        let content: Vec<u8> = (0..blocks).flat_map(|b| vec![b as u8; 4096]).collect();
+        std::fs::write(&path, &content).unwrap();
+        let open_file = OpenFile::Local(Arc::new(std::fs::File::open(path).unwrap()));
+        memory_ctx()
+            .compressed_cache()
+            .open_entry(open_file.clone());
+        let mut requester = IORequester::default();
+
+        for block in 0..blocks {
+            requester
+                .request_read(
+                    1,
+                    2,
+                    PendingReadRequest {
+                        id: ReadRequestId(block),
+                        open_file: open_file.clone(),
+                        locations: vec![FileRange::new(block * 4096, 4096)],
+                    },
+                    &mut disabled_stats(),
+                )
+                .unwrap();
+        }
+        let mut responses = Vec::new();
+        for _ in 0..100 {
+            if responses.len() == blocks {
+                break;
+            }
+            requester.wait().unwrap();
+            requester.completions().unwrap();
+            responses.extend(requester.take_ready_reads());
+        }
+
+        assert_eq!(responses.len(), blocks);
+        for routed in responses {
+            let block = routed.response.id().0;
+            assert_eq!(routed.response.into_bytes(), vec![block as u8; 4096]);
+        }
     }
 
     #[test]
