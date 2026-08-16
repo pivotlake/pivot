@@ -85,6 +85,12 @@ harness = false
 name = "joins"
 harness = false
 
+# Full ORDER BY at scale (`benches/order_by.rs`): sorts and re-emits at least
+# 1 GiB per scenario. Same custom-`main` Criterion setup as `operators`.
+[[bench]]
+name = "order_by"
+harness = false
+
 # HTTP(S) range-read throughput (`benches/http_range.rs`): stands up a loopback
 # backend and drives the HTTP engine via a standalone `IORequester`. Needs
 # `test-util` for `init_test_free_pool` (the out-of-crate single-worker context).
