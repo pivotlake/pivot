@@ -464,7 +464,9 @@ fn build_join(
             .map_err(|_| OperatorError::Unsupported(message))?;
         let left = Expression::from_handle(condition.left)?;
         let mut right = Expression::from_handle(condition.right)?;
-        right.shift_column_refs(probe_types.len());
+        right.visit_column_refs_mut(&mut |reference| {
+            reference.column_idx += probe_types.len();
+        });
         residual_filters.push(Expression::Compare(Compare {
             left: Box::new(left),
             right: Box::new(right),
