@@ -28,6 +28,8 @@ const SUPPORTED_COMMANDS: &[(&str, &str)] = &[
     ("\\dn", "matrix_schema"),
     ("\\dt matrix_schema.*", "matrix_people"),
     ("\\dt", "matrix_visible"),
+    ("\\d", "matrix_visible"),
+    ("\\d matrix_visible", "id"),
     ("\\d matrix_schema.matrix_people", "display_name"),
     ("\\du", "List of roles"),
     ("\\du+", "pivot"),
