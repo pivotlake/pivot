@@ -642,6 +642,24 @@ mod pread_pool_backend {
             }
         }
 
+        /// Blocks until every dispatched op has reported back, ignoring wake
+        /// sentinels. [`block_until_ready`](Self::block_until_ready) treats a
+        /// sentinel as "stop waiting", which is right for a worker's park but
+        /// wrong for teardown: a sentinel sent moments before shutdown (a
+        /// notifier claims the slot first and sends second, so one can arrive
+        /// after the worker already decided to exit) must not end this wait
+        /// while a pool thread still holds a pointer into a cache slot.
+        fn drain_all_in_flight(&mut self) {
+            while self.in_flight > 0 {
+                let completion = self.rx.recv().expect("backend holds a sender");
+                if completion.1 == WAKE_UD as Identifier {
+                    continue;
+                }
+                self.ready.push_back(completion);
+                self.in_flight -= 1;
+            }
+        }
+
         /// Drains finished ops as `(bytes_transferred, request_id)`, mirroring the
         /// io_uring backend's `(result, id)` (negative is `-errno`).
         pub fn completions(&mut self) -> io::Result<Vec<(i32, Identifier)>> {
@@ -670,9 +688,7 @@ mod pread_pool_backend {
         /// the requester's pending-request map, so it drops first, meaning the
         /// slots are still pinned here. Ops target local files and always finish.
         fn drop(&mut self) {
-            // `want = usize::MAX` is unreachable, so this blocks until in_flight
-            // hits 0, draining every dispatched op into `ready` (then discarded).
-            self.block_until_ready(usize::MAX);
+            self.drain_all_in_flight();
         }
     }
 

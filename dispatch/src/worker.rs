@@ -540,8 +540,16 @@ impl Worker {
                         .waker
                         .begin_ring_wait(self.node_local_idx, self.last_seen_ring_wake_count)
                     {
-                        self.io.wait()?;
+                        // Withdraw the slot before propagating a wait error.
+                        // If the error tears this worker down while the slot
+                        // still reads as parked, notifiers keep claiming it:
+                        // each claimed wake is swallowed by a dead worker
+                        // instead of reaching a live parked one, and the wake
+                        // itself writes to an eventfd this thread closed on
+                        // its way out.
+                        let wait_result = self.io.wait();
                         self.waker.end_ring_wait(self.node_local_idx);
+                        wait_result?;
                     }
                     self.last_seen_ring_wake_count = self.waker.ring_wake_count();
                     self.last_seen_wake_count = self.waker.wake_count();

@@ -7,6 +7,7 @@ use crate::io::{
     Completion, DataFlowRequest, FailedRead, FsRequest, FsWriteRequest, HttpRequest,
     HttpUploadRequest, OpenFile, PendingReadRequest, PendingWriteRequest, RemoteSplit,
 };
+use crate::memory::compressed_cache::MissingExtent;
 use crate::request_tracker::{RegisteredRead, RequestRoute, RequestTracker, RoutedReadResponse};
 use crate::stats::StatsCollector;
 use crate::worker::WORKER_IDX;
@@ -175,49 +176,75 @@ impl IORequester {
         }
 
         stats.record_issued_disk(&mut fs_requests);
-        for request in fs_requests {
+        let mut fs_queue = fs_requests.into_iter();
+        while let Some(request) = fs_queue.next() {
+            let cache_extent = fs_cache_extent(&request);
             let tracked_read_id = request.tracked_read_id;
-            let failed_extent = match &request.request {
-                FsRequest::Read(read) => {
-                    Some((OpenFile::Local(read.file.clone()), read.block.clone()))
-                }
-                FsRequest::Write(_) => None,
-            };
             if let Err(error) = self.submit_fs_request_to_backend(request) {
-                if let Some((open_file, block)) = failed_extent {
-                    block.remove_from_cache(&open_file);
-                }
-                if let Some(id) = tracked_read_id {
-                    let _ = self.tracker.fail(id);
-                }
+                self.withdraw_registered_read(cache_extent, tracked_read_id);
+                self.withdraw_unsubmitted_reads(fs_queue, http_requests);
                 return Err(error);
             }
         }
 
         stats.stamp_issued(&mut http_requests);
-        for request in http_requests {
+        let mut http_queue = http_requests.into_iter();
+        while let Some(request) = http_queue.next() {
+            let cache_extent = http_cache_extent(&request);
             let tracked_read_id = request.tracked_read_id;
-            let failed_extent = match &request.request {
-                HttpRequest::Get(read) => {
-                    Some((OpenFile::Remote(read.remote.clone()), read.block.clone()))
-                }
-                HttpRequest::Upload(_) => None,
-            };
             match self.submit_http_request_to_backend(request) {
                 Ok(split) => stats.record_issued_remote(split),
                 Err(error) => {
-                    if let Some((open_file, block)) = failed_extent {
-                        block.remove_from_cache(&open_file);
-                    }
-                    if let Some(id) = tracked_read_id {
-                        let _ = self.tracker.fail(id);
-                    }
+                    self.withdraw_registered_read(cache_extent, tracked_read_id);
+                    self.withdraw_unsubmitted_reads(std::iter::empty(), http_queue);
                     return Err(error);
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Undo the bookkeeping `register_read` created for a read that will never
+    /// be submitted (its own submit failed, or an earlier read's in the same
+    /// batch did).
+    ///
+    /// Removing the extent from the shared cache is the critical part:
+    /// registration published it as "a fill is in flight", so every other
+    /// query touching the range subscribes to it and sleeps until it commits
+    /// or fails. Once we know no submission will happen, nothing can ever
+    /// commit or fail it, and those subscribers would sleep forever. Removing
+    /// it lets the next reader start a fill of its own.
+    fn withdraw_registered_read(
+        &mut self,
+        cache_extent: Option<(OpenFile, MissingExtent)>,
+        tracked_read_id: Option<Identifier>,
+    ) {
+        if let Some((open_file, block)) = cache_extent {
+            block.remove_from_cache(&open_file);
+        }
+        if let Some(id) = tracked_read_id {
+            let _ = self.tracker.fail(id);
+        }
+    }
+
+    /// Withdraw every read left in a batch after one submit failed. A single
+    /// logical read can register several physical reads; returning the error
+    /// after cleaning up only the failing one would leave the rest holding
+    /// cache extents no submission will ever fill.
+    fn withdraw_unsubmitted_reads(
+        &mut self,
+        fs_requests: impl IntoIterator<Item = DataFlowRequest<FsRequest>>,
+        http_requests: impl IntoIterator<Item = DataFlowRequest<HttpRequest>>,
+    ) {
+        for request in fs_requests {
+            let cache_extent = fs_cache_extent(&request);
+            self.withdraw_registered_read(cache_extent, request.tracked_read_id);
+        }
+        for request in http_requests {
+            let cache_extent = http_cache_extent(&request);
+            self.withdraw_registered_read(cache_extent, request.tracked_read_id);
+        }
     }
 
     /// Select the transport for one logical write and submit it immediately.
@@ -694,6 +721,25 @@ impl IORequester {
         select.recv(self.http.completion_receiver());
         select.ready();
         Ok(())
+    }
+}
+
+/// The cache extent a queued filesystem operation registered, paired with the
+/// file it belongs to, so a failed batch can remove it again. Writes register
+/// nothing.
+fn fs_cache_extent(request: &DataFlowRequest<FsRequest>) -> Option<(OpenFile, MissingExtent)> {
+    request
+        .request
+        .as_read()
+        .map(|read| (OpenFile::Local(read.file.clone()), read.block.clone()))
+}
+
+/// The HTTP counterpart of [`fs_cache_extent`]: the extent a range GET
+/// registered. Uploads register nothing.
+fn http_cache_extent(request: &DataFlowRequest<HttpRequest>) -> Option<(OpenFile, MissingExtent)> {
+    match &request.request {
+        HttpRequest::Get(read) => Some((OpenFile::Remote(read.remote.clone()), read.block.clone())),
+        HttpRequest::Upload(_) => None,
     }
 }
 
