@@ -796,7 +796,7 @@ impl CompressedCache {
 
     /// Remove `file_maps` entries for the given locations whose extent map is now
     /// empty. `file_maps` is keyed by a never-reused [`OpenFile`] (an
-    /// `Arc<File>` / `Arc<RemoteFile>`), so without this a dead entry - pinning its
+    /// `LocalFile` / `Arc<RemoteFile>`), so without this a dead entry - pinning its
     /// `Arc` and the file/connection it holds - lingers for every file ever opened.
     /// Re-checks emptiness under the write lock so a concurrent `get` that just
     /// cached a new extent isn't dropped.
@@ -907,6 +907,7 @@ fn count_available_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::LocalFile;
     use crate::memory::context::{init_test_free_pool, memory_ctx};
 
     const SB: usize = BLOCK_SIZE;
@@ -916,18 +917,16 @@ mod tests {
     #[allow(non_snake_case)]
     fn FD() -> OpenFile {
         use std::sync::OnceLock;
-        static FILE: OnceLock<std::sync::Arc<std::fs::File>> = OnceLock::new();
+        static FILE: OnceLock<LocalFile> = OnceLock::new();
         OpenFile::Local(
-            FILE.get_or_init(|| std::sync::Arc::new(std::fs::File::open("/dev/null").unwrap()))
+            FILE.get_or_init(|| LocalFile::new(std::fs::File::open("/dev/null").unwrap()).unwrap())
                 .clone(),
         )
     }
 
     /// A fresh, independent local file (distinct cache bucket).
     fn new_file() -> OpenFile {
-        OpenFile::Local(std::sync::Arc::new(
-            std::fs::File::open("/dev/null").unwrap(),
-        ))
+        OpenFile::Local(LocalFile::new(std::fs::File::open("/dev/null").unwrap()).unwrap())
     }
 
     fn cache() -> &'static CompressedCache {

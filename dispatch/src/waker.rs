@@ -348,6 +348,10 @@ impl WakerSet {
         self.workers_per_node
     }
 
+    pub(crate) fn worker_count(&self) -> usize {
+        self.node_wakers.len() * self.workers_per_node
+    }
+
     /// Whether `other` wakes the same workers, i.e. both sets came from the
     /// same worker pool.
     pub fn wakes_same_pool(&self, other: &WakerSet) -> bool {

@@ -131,7 +131,7 @@ impl DataFileLocation {
     /// it. This is the read (`GET`) counterpart; a `sink()` location is a `PUT`.
     pub(crate) fn open_read(self, size: u64) -> std::io::Result<OpenFile> {
         Ok(match self {
-            DataFileLocation::Local(path) => OpenFile::Local(Arc::new(open_direct_read(&path)?)),
+            DataFileLocation::Local(path) => OpenFile::Local(open_direct_read(&path)?),
             DataFileLocation::Remote { url, auth } => {
                 OpenFile::Remote(Arc::new(RemoteFile::open(url, auth, size)?))
             }

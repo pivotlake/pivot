@@ -2,6 +2,7 @@ use crate::Identifier;
 use crate::io::backend::IOBackend;
 use crate::io::cached_http::CachedHttpEngine;
 use crate::io::disk_cache::DiskCache;
+use crate::io::hardware_queues::{InFlightPermit, WorkerHardwareQueues};
 use crate::io::{
     Completion, DataFlowRequest, FailedRead, FsRequest, FsWriteRequest, HttpRequest,
     HttpUploadRequest, OpenFile, PendingReadRequest, PendingWriteRequest, RemoteSplit,
@@ -9,7 +10,7 @@ use crate::io::{
 use crate::request_tracker::{RegisteredRead, RequestRoute, RequestTracker, RoutedReadResponse};
 use crate::stats::StatsCollector;
 use crate::worker::WORKER_IDX;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use thiserror::Error;
@@ -36,6 +37,18 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 /// each accepted operation to the kernel.
 pub const RING_SIZE: u32 = 64;
 
+/// One in-flight operator-owned local-file operation.
+struct InFlightFsOp {
+    request: DataFlowRequest<FsRequest>,
+    /// Bytes already completed by earlier submissions (nonzero only for a
+    /// write whose prior completion came up short and was resubmitted).
+    bytes_done: usize,
+    /// The hardware-queue slot the operation holds. Dropping it releases the
+    /// slot and wakes any workers waiting on the queue, so it lives exactly
+    /// as long as the operation (a resubmitted write keeps it).
+    permit: InFlightPermit,
+}
+
 /// Bridges dataflow operators and the I/O backend, holding state on outstanding
 /// requests and returning responses together with the original requested context.
 ///
@@ -52,11 +65,14 @@ pub struct IORequester {
     /// completions back to them. Registration submits returned operations
     /// immediately, so the tracker itself owns no transport outbox.
     tracker: RequestTracker,
-    /// In-flight operator-owned local-file operations, keyed by backend id,
-    /// each with the bytes already completed by earlier submissions (nonzero
-    /// only for a write whose prior completion came up short and was
-    /// resubmitted).
-    pending_io_requests: HashMap<Identifier, (DataFlowRequest<FsRequest>, usize)>,
+    /// In-flight operator-owned local-file operations, keyed by backend id.
+    pending_io_requests: HashMap<Identifier, InFlightFsOp>,
+    /// Local-file operations accepted while their hardware queue was at
+    /// capacity, submitted in order as slots free.
+    fs_backlog: VecDeque<DataFlowRequest<FsRequest>>,
+    /// This worker's per-device hardware-queue counters, shared with every
+    /// worker whose CPU submits into the same queue.
+    fs_queues: WorkerHardwareQueues,
     /// Logical reads following extents currently being filled by another
     /// worker. They need no transport request of their own; the worker polls
     /// their shared extent state once per loop.
@@ -82,6 +98,8 @@ impl IORequester {
             backend: IOBackend::new(RING_SIZE).expect("Unable to create backend"),
             tracker: RequestTracker::default(),
             pending_io_requests: Default::default(),
+            fs_backlog: VecDeque::new(),
+            fs_queues: WorkerHardwareQueues::new(),
             piggybacked_reads: Vec::new(),
             next_id: 0,
             http: CachedHttpEngine::with_default_config(disk_cache)
@@ -99,6 +117,8 @@ impl IORequester {
             backend: IOBackend::new(RING_SIZE).expect("Unable to create backend"),
             tracker: RequestTracker::default(),
             pending_io_requests: Default::default(),
+            fs_backlog: VecDeque::new(),
+            fs_queues: WorkerHardwareQueues::new(),
             piggybacked_reads: Vec::new(),
             next_id: 0,
             http: CachedHttpEngine::new(http_config, disk_cache)
@@ -109,6 +129,13 @@ impl IORequester {
     /// Build a requester with a specific HTTP client config and no disk cache.
     pub fn with_http_config(http_config: Arc<rustls::ClientConfig>) -> Self {
         Self::with_config(http_config, None)
+    }
+
+    /// Route every local-file operation through `queue`, so a test controls
+    /// the in-flight capacity and which requesters share it.
+    #[cfg(test)]
+    fn force_fs_queue(&mut self, queue: Arc<crate::io::hardware_queues::HardwareQueue>) {
+        self.fs_queues.force(queue);
     }
 
     /// Resolve one logical read through the memory caches and immediately submit
@@ -222,15 +249,88 @@ impl IORequester {
     }
 
     /// Discard logical read state for a dataflow that is no longer running.
+    /// Dropping a backlogged read drops its extent's fill owner, which removes
+    /// the extent and wakes any followers, exactly like a cancelled in-flight
+    /// owner.
     pub fn cancel_dataflow(&mut self, data_flow_id: Identifier) {
         self.tracker.cancel_dataflow(data_flow_id);
         self.piggybacked_reads
             .retain(|request| request.data_flow_id() != data_flow_id);
+        self.fs_backlog
+            .retain(|request| request.data_flow_id != data_flow_id);
     }
 
-    /// Submit an operator-owned filesystem operation through the worker's
-    /// shared I/O backend. Request-owned storage remains alive until completion.
+    /// Reserve a slot on the hardware queue the file's device serves this
+    /// worker with. `None` means the queue is full and the operation must
+    /// wait in the backlog; this worker is then registered for a ring wake on
+    /// the next slot release, so it can park with nothing of its own in
+    /// flight.
+    fn acquire_fs_slot(&mut self, request: &DataFlowRequest<FsRequest>) -> Option<InFlightPermit> {
+        let device_idx = match &request.request {
+            FsRequest::Read(read) => read.file.device_idx(),
+            FsRequest::Write(write) => write.file.device_idx(),
+        };
+        let queue = self.fs_queues.queue_for_device(device_idx);
+        if let Some(permit) = queue.try_acquire() {
+            return Some(permit);
+        }
+        // Register before the deciding attempt so a release between the two
+        // cannot be missed (see `register_waiter`); a successful retry means
+        // no one needs to wake us after all.
+        let worker_idx = WORKER_IDX.get();
+        queue.register_waiter(worker_idx);
+        match queue.try_acquire() {
+            Some(permit) => {
+                queue.deregister_waiter(worker_idx);
+                Some(permit)
+            }
+            None => None,
+        }
+    }
+
+    /// Refill the backend from the backlog as far as the freed slots allow. A
+    /// failure fails that operation the same way a registration-time failure
+    /// does, then surfaces the error.
+    fn drain_fs_backlog(&mut self) -> Result<()> {
+        while let Some(request) = self.fs_backlog.pop_front() {
+            let tracked_read_id = request.tracked_read_id;
+            let failed_extent = fs_cache_extent(&request);
+            let permit = match self.acquire_fs_slot(&request) {
+                Some(permit) => permit,
+                None => {
+                    self.fs_backlog.push_front(request);
+                    break;
+                }
+            };
+            if let Err(error) = self.submit_fs_request_now(request, permit) {
+                self.withdraw_registered_read(failed_extent, tracked_read_id);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Accept an operator-owned filesystem operation: submit it through the
+    /// worker's shared I/O backend, or hold it in the backlog while its
+    /// hardware queue is at capacity. Request-owned storage remains alive
+    /// until completion.
     fn submit_fs_request_to_backend(&mut self, request: DataFlowRequest<FsRequest>) -> Result<()> {
+        match self.acquire_fs_slot(&request) {
+            Some(permit) => self.submit_fs_request_now(request, permit),
+            None => {
+                self.fs_backlog.push_back(request);
+                Ok(())
+            }
+        }
+    }
+
+    /// Unconditionally submit one filesystem operation to the backend,
+    /// carrying the hardware-queue slot it holds.
+    fn submit_fs_request_now(
+        &mut self,
+        request: DataFlowRequest<FsRequest>,
+        permit: InFlightPermit,
+    ) -> Result<()> {
         match &request.request {
             FsRequest::Read(read) => self.backend.submit_read(
                 read.file.as_raw_fd(),
@@ -253,7 +353,14 @@ impl IORequester {
                 )?
             }
         }
-        self.pending_io_requests.insert(self.next_id, (request, 0));
+        self.pending_io_requests.insert(
+            self.next_id,
+            InFlightFsOp {
+                request,
+                bytes_done: 0,
+                permit,
+            },
+        );
         self.next_id += 1;
         self.backend.submit()?;
 
@@ -318,10 +425,16 @@ impl IORequester {
         self.backend.wake_handle()
     }
 
-    /// Returns `true` if any disk read is in flight - operator reads here, plus
-    /// the engine's cache-file reads / write-backs (all on the shared backend).
+    /// Returns `true` if any disk read is in flight or waiting in the backlog -
+    /// operator reads here, plus the engine's cache-file reads / write-backs
+    /// (all on the shared backend). A blocking wait is safe with a non-empty
+    /// backlog: either this worker has operations of its own in flight, or it
+    /// is registered on the full hardware queue and the release of a slot
+    /// wakes its ring.
     pub fn has_file_pending(&self) -> bool {
-        !self.pending_io_requests.is_empty() || self.http.has_disk_pending()
+        !self.pending_io_requests.is_empty()
+            || !self.fs_backlog.is_empty()
+            || self.http.has_disk_pending()
     }
 
     /// Returns `true` if any HTTP operation is in flight.
@@ -403,7 +516,12 @@ impl IORequester {
             if !disk_completion(ud) {
                 continue; // HTTP socket op, already routed above
             }
-            if let Some((request, done)) = self.pending_io_requests.remove(&ud) {
+            if let Some(InFlightFsOp {
+                request,
+                bytes_done: done,
+                permit,
+            }) = self.pending_io_requests.remove(&ud)
+            {
                 // A write covers one run, and may complete shorter still (the
                 // kernel caps a single write at ~2 GiB, among other reasons);
                 // resubmit from where it stopped, at the matching file offset,
@@ -420,8 +538,14 @@ impl IORequester {
                             run.len(),
                             self.next_id,
                         )?;
-                        self.pending_io_requests
-                            .insert(self.next_id, (request, done));
+                        self.pending_io_requests.insert(
+                            self.next_id,
+                            InFlightFsOp {
+                                request,
+                                bytes_done: done,
+                                permit,
+                            },
+                        );
                         self.next_id += 1;
                         self.backend.submit()?;
                         continue;
@@ -492,6 +616,12 @@ impl IORequester {
                 self.http.complete_disk(ud, result, &mut out);
             }
         }
+
+        // The completions above released their hardware-queue slots (and this
+        // worker may have been ring-woken by another worker's release); put
+        // backlogged operations on the device before doing anything else with
+        // this pass.
+        self.drain_fs_backlog()?;
 
         // HTTP reads the engine finished this pass (and any write-backs they queue).
         self.http
@@ -578,9 +708,10 @@ mod tests {
     //! issuing a second read for a different region of the same object.
 
     use super::*;
+    use crate::io::hardware_queues::HardwareQueue;
     use crate::io::{
-        FileRange, HttpGetRequest, HttpUploadRequest, OpenFile, PendingReadRequest, ReadRequestId,
-        RemoteFile,
+        FileRange, HttpGetRequest, HttpUploadRequest, LocalFile, OpenFile, PendingReadRequest,
+        ReadRequestId, RemoteFile,
     };
     use crate::memory::{init_test_free_pool, memory_ctx};
     use std::io::{Read, Write};
@@ -666,12 +797,127 @@ mod tests {
     }
 
     #[test]
+    fn reads_past_the_in_flight_cap_wait_their_turn_and_still_complete() {
+        init_test_free_pool(4);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        let capacity = 8;
+        let blocks = capacity + 4;
+        let content: Vec<u8> = (0..blocks).flat_map(|b| vec![b as u8; 4096]).collect();
+        std::fs::write(&path, &content).unwrap();
+        let open_file =
+            OpenFile::Local(LocalFile::new(std::fs::File::open(path).unwrap()).unwrap());
+        memory_ctx()
+            .compressed_cache()
+            .open_entry(open_file.clone());
+        let mut requester = IORequester::default();
+        requester.force_fs_queue(HardwareQueue::with_capacity(capacity));
+
+        for block in 0..blocks {
+            requester
+                .request_read(
+                    1,
+                    2,
+                    PendingReadRequest {
+                        id: ReadRequestId(block),
+                        open_file: open_file.clone(),
+                        locations: vec![FileRange::new(block * 4096, 4096)],
+                    },
+                    &mut disabled_stats(),
+                )
+                .unwrap();
+        }
+        let mut responses = Vec::new();
+        for _ in 0..100 {
+            if responses.len() == blocks {
+                break;
+            }
+            requester.wait().unwrap();
+            requester.completions().unwrap();
+            responses.extend(requester.take_ready_reads());
+        }
+
+        assert_eq!(responses.len(), blocks);
+        for routed in responses {
+            let block = routed.response.id().0;
+            assert_eq!(routed.response.into_bytes(), vec![block as u8; 4096]);
+        }
+    }
+
+    #[test]
+    fn a_released_shared_queue_slot_wakes_the_waiting_worker() {
+        init_test_free_pool(4);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        std::fs::write(&path, [vec![1u8; 4096], vec![2u8; 4096]].concat()).unwrap();
+        let open_file =
+            OpenFile::Local(LocalFile::new(std::fs::File::open(path).unwrap()).unwrap());
+        memory_ctx()
+            .compressed_cache()
+            .open_entry(open_file.clone());
+        let shared_queue = HardwareQueue::with_capacity(1);
+        let mut first = IORequester::default();
+        let mut second = IORequester::default();
+        first.force_fs_queue(shared_queue.clone());
+        second.force_fs_queue(shared_queue);
+
+        first
+            .request_read(
+                1,
+                2,
+                PendingReadRequest {
+                    id: ReadRequestId(0),
+                    open_file: open_file.clone(),
+                    locations: vec![FileRange::new(0, 4096)],
+                },
+                &mut disabled_stats(),
+            )
+            .unwrap();
+        second
+            .request_read(
+                3,
+                4,
+                PendingReadRequest {
+                    id: ReadRequestId(1),
+                    open_file,
+                    locations: vec![FileRange::new(4096, 4096)],
+                },
+                &mut disabled_stats(),
+            )
+            .unwrap();
+        let second_backlogged = second.pending_io_requests.is_empty() && second.has_file_pending();
+        first.wait().unwrap();
+        let waker = crate::waker::worker_waker();
+        waker.register_ring_waker(0, second.wake_handle());
+        let last_seen = waker.ring_wake_count();
+        assert!(waker.begin_ring_wait(0, last_seen));
+        first.completions().unwrap(); // completes the read, releasing the slot and waking `second`
+        second.wait().unwrap(); // returns on the wake, with nothing of its own in flight
+        waker.end_ring_wait(0);
+        second.completions().unwrap(); // the drain puts the backlogged read on the device
+        let mut responses = Vec::new();
+        for _ in 0..100 {
+            if !responses.is_empty() {
+                break;
+            }
+            second.wait().unwrap();
+            second.completions().unwrap();
+            responses.extend(second.take_ready_reads());
+        }
+
+        assert!(second_backlogged);
+        let response = responses.pop().unwrap().response;
+        assert_eq!(response.into_bytes(), vec![2u8; 4096]);
+    }
+
+    #[test]
     fn a_read_piggybacks_on_an_existing_fill() {
         init_test_free_pool(4);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("data");
         std::fs::write(&path, vec![7; 4096]).unwrap();
-        let open_file = OpenFile::Local(Arc::new(std::fs::File::open(path).unwrap()));
+        let open_file =
+            OpenFile::Local(LocalFile::new(std::fs::File::open(path).unwrap()).unwrap());
         memory_ctx()
             .compressed_cache()
             .open_entry(open_file.clone());
@@ -710,7 +956,7 @@ mod tests {
         let path = dir.path().join("data");
         std::fs::write(&path, vec![0; 4096]).unwrap();
         let write_only = std::fs::OpenOptions::new().write(true).open(path).unwrap();
-        let open_file = OpenFile::Local(Arc::new(write_only));
+        let open_file = OpenFile::Local(LocalFile::new(write_only).unwrap());
         memory_ctx()
             .compressed_cache()
             .open_entry(open_file.clone());

@@ -181,17 +181,19 @@ mod uring_backend {
             request_id: Identifier,
         ) -> Result<()> {
             let length = length.min(MAX_IO_OP_LEN);
-            // ASYNC skips the inline execution attempt: an O_DIRECT read
-            // executed inline walks into the block layer during
-            // `io_uring_enter`, and on a device whose queue is full the
-            // kernel's request allocation SLEEPS there, blocking the worker
-            // loop for as long as the oldest in-flight IO. Punting straight
-            // to io-wq moves that wait onto a kernel worker, so submission
-            // always returns immediately.
+            // Reads execute inline in `io_uring_enter`: the kernel issues them
+            // with nowait semantics and punts a would-block request to io-wq
+            // itself, so submission does not sleep in the block layer's
+            // request allocation even when the device queue is full. An
+            // unconditional `Flags::ASYNC` punt would avoid even the inline
+            // attempt, but pays an io-wq dispatch and a kernel-worker wakeup
+            // per read, which costs latency-bound queries several percent of
+            // cold time. The per-hardware-queue in-flight cap the requesters
+            // share additionally bounds how hard the workers together can push
+            // the device queue.
             let read_op = opcode::Read::new(types::Fd(fd), dest, length as u32)
                 .offset(offset)
                 .build()
-                .flags(io_uring::squeue::Flags::ASYNC)
                 .user_data(request_id as u64);
 
             unsafe {
