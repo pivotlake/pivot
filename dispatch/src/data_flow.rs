@@ -13,20 +13,24 @@
 //!   attempting to steal from peer workers' channels. Root-to-leaf (upstream first)
 //!   means the stealing worker picks up data early in the dataflow, to not interrupt current
 //!   hot-in-cache processing
+//! - [`register_pending_io`](DataFlow::register_pending_io) — drain the
+//!   cache-backed read requests operators staged in their nodes' [`OperatorIO`]s
+//!   into the worker's [`RequestTracker`], and
+//!   [`process_io_response`](DataFlow::process_io_response) — deliver a resolved
+//!   request back to the operator that staged it.
 //! - [`get_next_fs_request`](DataFlow::get_next_fs_request) /
-//!   [`get_next_http_request`](DataFlow::get_next_http_request) — collect pending IO
-//!   requests from operators (e.g. parquet page reads, or HTTP range reads).
-//! - [`process_fs_read`](DataFlow::process_fs_read) /
-//!   [`process_fs_write`](DataFlow::process_fs_write),
-//!   [`process_http_get_response`](DataFlow::process_http_get_response), and
+//!   [`get_next_http_request`](DataFlow::get_next_http_request) — collect pending
+//!   write/upload requests from operators.
+//! - [`process_fs_write`](DataFlow::process_fs_write) /
 //!   [`process_http_upload_response`](DataFlow::process_http_upload_response) —
-//!   deliver completed IO to the operator that requested it.
+//!   deliver completed writes/uploads to the operator that requested them.
 //! - [`maybe_finish`](DataFlow::maybe_finish) — check if all operators have completed.
 
 use crate::Identifier;
+use crate::io::request_tracker::{RegistrationCaps, RequestTracker};
 use crate::io::{
-    DataFlowRequest, FsReadRequest, FsRequest, FsWriteRequest, HttpGetRequest, HttpRequest,
-    HttpUploadRequest,
+    CompletedIoRequest, DataFlowRequest, FsRequest, FsWriteRequest, HttpRequest, HttpUploadRequest,
+    OperatorIO,
 };
 use crate::operations::{FinishStatus, Operator};
 use crate::stats::{DataFlowStats, StatsCollector};
@@ -59,6 +63,11 @@ struct OperatorNode {
     /// One-shot publication gates. Open gates are removed after an Acquire
     /// observation, leaving no atomic loads on this node's steady-state path.
     gates: Vec<Arc<AtomicBool>>,
+    /// The node's staging area for cache-backed reads. The operator pushes
+    /// [`PendingIoRequest`](crate::io::PendingIoRequest)s into it; the worker's
+    /// `register_pending_io` stage drains it (see
+    /// [`DataFlow::register_pending_io`]).
+    io: OperatorIO,
 }
 
 impl OperatorNode {
@@ -74,14 +83,14 @@ impl OperatorNode {
     #[inline]
     fn run<T>(
         &mut self,
-        f: &mut impl FnMut(Identifier, &mut dyn Operator) -> Result<ControlFlow<T>>,
+        f: &mut impl FnMut(Identifier, &mut dyn Operator, &mut OperatorIO) -> Result<ControlFlow<T>>,
     ) -> Result<Option<ControlFlow<T>>> {
         if self.is_gated() {
             return Ok(None);
         }
         let id = self.id;
         match self.operator.as_deref_mut() {
-            Some(operator) => f(id, operator).map(Some),
+            Some(operator) => f(id, operator, &mut self.io).map(Some),
             None => Ok(None),
         }
     }
@@ -113,6 +122,16 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = result::Result<T, E>;
+
+/// What one [`register_pending_io`](DataFlow::register_pending_io) pass over a
+/// dataflow accomplished.
+pub struct RegistrationPass {
+    /// Every staged request was drained; nothing was left behind by the budget.
+    pub clean: bool,
+    /// At least one request resolved fully from cache and its response was
+    /// delivered during the pass.
+    pub delivered: bool,
+}
 
 /// Whether an operator did useful work in this step.
 #[derive(PartialEq, Eq, Copy, Clone)]
@@ -168,6 +187,7 @@ impl OperatorGraph {
                 id,
                 operator: Some(operator),
                 gates: gates.remove(&id).unwrap_or_default(),
+                io: OperatorIO::default(),
             })
             .collect();
 
@@ -188,7 +208,7 @@ impl OperatorGraph {
     /// the walk carries on through it to its publishers.
     pub fn traverse_backwards<
         T,
-        F: FnMut(Identifier, &mut dyn Operator) -> Result<ControlFlow<T>>,
+        F: FnMut(Identifier, &mut dyn Operator, &mut OperatorIO) -> Result<ControlFlow<T>>,
     >(
         &mut self,
         mut f: F,
@@ -208,7 +228,7 @@ impl OperatorGraph {
     /// The root-to-leaf twin of [`traverse_backwards`](Self::traverse_backwards).
     pub fn traverse_forwards<
         T,
-        F: FnMut(Identifier, &mut dyn Operator) -> Result<ControlFlow<T>>,
+        F: FnMut(Identifier, &mut dyn Operator, &mut OperatorIO) -> Result<ControlFlow<T>>,
     >(
         &mut self,
         mut f: F,
@@ -519,12 +539,65 @@ impl DataFlow {
         });
     }
 
-    /// Notify the operator that requested it that one of its filesystem reads
-    /// has landed (already committed into the cache slot by the requester).
-    pub fn process_fs_read(&mut self, node_id: Identifier, request: FsReadRequest) {
+    /// Register the cache-backed read requests operators have staged in their
+    /// nodes' [`OperatorIO`]s with the worker's `tracker`, stopping once a
+    /// medium's in-flight reads hit its cap (`caps`) - the rest stay staged for
+    /// the next pass. A request whose ranges were all cache-resident completes
+    /// during registration, and its response is delivered to the operator right
+    /// here (which may stage follow-up requests; the drain keeps going until
+    /// the node's queues are empty or the budget runs out).
+    pub fn register_pending_io(
+        &mut self,
+        tracker: &mut RequestTracker,
+        caps: &RegistrationCaps,
+    ) -> RegistrationPass {
+        let data_flow_id = self.id;
+        self.try_run_or(
+            RegistrationPass {
+                clean: true,
+                delivered: false,
+            },
+            |d| {
+                let mut delivered = false;
+                let mut clean = true;
+                for node in &mut d.graph.operators {
+                    loop {
+                        let request = if tracker.disk_in_flight() < caps.disk_reads
+                            && node.io.has_fs_requests()
+                        {
+                            node.io.pop_fs_request()
+                        } else if tracker.http_in_flight() < caps.http_reads
+                            && node.io.has_http_requests()
+                        {
+                            node.io.pop_http_request()
+                        } else {
+                            break;
+                        };
+                        let Some(request) = request else { break };
+                        if let Some(completed) = tracker.register(data_flow_id, node.id, request) {
+                            delivered = true;
+                            // The node may have retired while its request was
+                            // staged (an abandoned scan); nobody wants the
+                            // response then.
+                            if let Some(operator) = node.operator.as_deref_mut() {
+                                operator.process_io_response(&mut node.io, completed)?;
+                            }
+                        }
+                    }
+                    clean &= node.io.is_empty();
+                }
+                Ok(RegistrationPass { clean, delivered })
+            },
+        )
+    }
+
+    /// Deliver a resolved read request back to the operator that staged it. The
+    /// operator may stage follow-up requests into its node's [`OperatorIO`].
+    pub fn process_io_response(&mut self, node_id: Identifier, response: CompletedIoRequest) {
         self.try_run(|d| {
-            if let Some(operator) = d.graph.operators[node_id].operator.as_deref_mut() {
-                operator.process_fs_read_response(request)?;
+            let node = &mut d.graph.operators[node_id];
+            if let Some(operator) = node.operator.as_deref_mut() {
+                operator.process_io_response(&mut node.io, response)?;
             }
             Ok(())
         });
@@ -536,17 +609,6 @@ impl DataFlow {
         self.try_run(|d| {
             if let Some(operator) = d.graph.operators[node_id].operator.as_deref_mut() {
                 operator.process_fs_write_response(request)?;
-            }
-            Ok(())
-        });
-    }
-
-    /// Notify the operator that requested it that one of its HTTP GETs has
-    /// landed (already committed into the cache slot by the requester).
-    pub fn process_http_get_response(&mut self, node_id: Identifier, request: HttpGetRequest) {
-        self.try_run(|d| {
-            if let Some(operator) = d.graph.operators[node_id].operator.as_deref_mut() {
-                operator.process_http_get_response(request)?;
             }
             Ok(())
         });
@@ -572,7 +634,7 @@ impl DataFlow {
     pub fn run_ready_cpu_work(&mut self) -> WorkStatus {
         self.try_run_or(WorkStatus::Ran, |d| {
             d.graph
-                .traverse_backwards(|_, operator| match operator.run_cpu_work()? {
+                .traverse_backwards(|_, operator, io| match operator.run_cpu_work(io)? {
                     WorkStatus::Pending => Ok(ControlFlow::Continue(())),
                     WorkStatus::Ran => Ok(ControlFlow::Break(())),
                 })
@@ -588,7 +650,7 @@ impl DataFlow {
     pub fn try_stealing_work(&mut self) -> WorkStatus {
         self.try_run_or(WorkStatus::Ran, |d| {
             d.graph
-                .traverse_forwards(|_, operator| match operator.try_steal_work()? {
+                .traverse_forwards(|_, operator, io| match operator.try_steal_work(io)? {
                     WorkStatus::Pending => Ok(ControlFlow::Continue(())),
                     WorkStatus::Ran => Ok(ControlFlow::Break(())),
                 })
@@ -604,7 +666,7 @@ impl DataFlow {
     pub fn get_next_fs_request(&mut self) -> Option<Vec<DataFlowRequest<FsRequest>>> {
         self.try_run_or(None, |d| {
             d.graph
-                .traverse_backwards(|id, operator| {
+                .traverse_backwards(|id, operator, _io| {
                     let requests = operator.next_fs_requests()?;
                     if !requests.is_empty() {
                         Ok(ControlFlow::Break(
@@ -626,7 +688,7 @@ impl DataFlow {
     pub fn get_next_http_request(&mut self) -> Option<Vec<DataFlowRequest<HttpRequest>>> {
         self.try_run_or(None, |d| {
             d.graph
-                .traverse_backwards(|id, operator| {
+                .traverse_backwards(|id, operator, _io| {
                     let requests = operator.next_http_requests()?;
                     if !requests.is_empty() {
                         Ok(ControlFlow::Break(
@@ -653,35 +715,8 @@ mod tests {
     /// own, so a node still holding one is visibly "live".
     struct LiveOperator;
     impl Operator for LiveOperator {
-        fn run_cpu_work(&mut self) -> crate::operations::Result<WorkStatus> {
+        fn run_cpu_work(&mut self, _io: &mut OperatorIO) -> crate::operations::Result<WorkStatus> {
             Ok(WorkStatus::Ran)
-        }
-        fn next_fs_requests(&mut self) -> crate::operations::Result<Vec<FsRequest>> {
-            Ok(vec![])
-        }
-        fn process_fs_read_response(
-            &mut self,
-            _request: FsReadRequest,
-        ) -> crate::operations::Result<()> {
-            Ok(())
-        }
-        fn process_fs_write_response(
-            &mut self,
-            _request: FsWriteRequest,
-        ) -> crate::operations::Result<()> {
-            Ok(())
-        }
-        fn process_http_get_response(
-            &mut self,
-            _request: HttpGetRequest,
-        ) -> crate::operations::Result<()> {
-            Ok(())
-        }
-        fn process_http_upload_response(
-            &mut self,
-            _request: HttpUploadRequest,
-        ) -> crate::operations::Result<()> {
-            Ok(())
         }
         fn try_finish(&mut self) -> crate::operations::Result<FinishStatus> {
             Ok(FinishStatus::Pending)
@@ -720,35 +755,8 @@ mod tests {
     }
 
     impl Operator for FinishOperator {
-        fn run_cpu_work(&mut self) -> crate::operations::Result<WorkStatus> {
+        fn run_cpu_work(&mut self, _io: &mut OperatorIO) -> crate::operations::Result<WorkStatus> {
             Ok(WorkStatus::Pending)
-        }
-        fn next_fs_requests(&mut self) -> crate::operations::Result<Vec<FsRequest>> {
-            Ok(vec![])
-        }
-        fn process_fs_read_response(
-            &mut self,
-            _request: FsReadRequest,
-        ) -> crate::operations::Result<()> {
-            Ok(())
-        }
-        fn process_fs_write_response(
-            &mut self,
-            _request: FsWriteRequest,
-        ) -> crate::operations::Result<()> {
-            Ok(())
-        }
-        fn process_http_get_response(
-            &mut self,
-            _request: HttpGetRequest,
-        ) -> crate::operations::Result<()> {
-            Ok(())
-        }
-        fn process_http_upload_response(
-            &mut self,
-            _request: HttpUploadRequest,
-        ) -> crate::operations::Result<()> {
-            Ok(())
         }
         fn try_finish(&mut self) -> crate::operations::Result<FinishStatus> {
             Ok(self.status)
@@ -757,36 +765,9 @@ mod tests {
 
     struct CountingOperator(Arc<AtomicUsize>);
     impl Operator for CountingOperator {
-        fn run_cpu_work(&mut self) -> crate::operations::Result<WorkStatus> {
+        fn run_cpu_work(&mut self, _io: &mut OperatorIO) -> crate::operations::Result<WorkStatus> {
             self.0.fetch_add(1, Ordering::Relaxed);
             Ok(WorkStatus::Ran)
-        }
-        fn next_fs_requests(&mut self) -> crate::operations::Result<Vec<FsRequest>> {
-            Ok(vec![])
-        }
-        fn process_fs_read_response(
-            &mut self,
-            _request: FsReadRequest,
-        ) -> crate::operations::Result<()> {
-            Ok(())
-        }
-        fn process_fs_write_response(
-            &mut self,
-            _request: FsWriteRequest,
-        ) -> crate::operations::Result<()> {
-            Ok(())
-        }
-        fn process_http_get_response(
-            &mut self,
-            _request: HttpGetRequest,
-        ) -> crate::operations::Result<()> {
-            Ok(())
-        }
-        fn process_http_upload_response(
-            &mut self,
-            _request: HttpUploadRequest,
-        ) -> crate::operations::Result<()> {
-            Ok(())
         }
         fn try_finish(&mut self) -> crate::operations::Result<FinishStatus> {
             Ok(FinishStatus::Pending)

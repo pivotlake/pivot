@@ -211,6 +211,7 @@ impl Unary<RowGroupBuffer, CompressedPage> for Indexer {
         &mut self,
         buffer: RowGroupBuffer,
         sender: &mut dyn Sender<CompressedPage>,
+        _io: &mut dispatch::io::OperatorIO,
     ) -> dispatch::UnaryResult<()> {
         let mut pages_per_column: Vec<_> = buffer
             .columns

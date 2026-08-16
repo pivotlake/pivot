@@ -267,6 +267,10 @@ impl IORequester {
                         data_flow_id: request.data_flow_id,
                         operator_idx: request.operator_idx,
                         error: error.into(),
+                        request: match request.request {
+                            FsRequest::Read(read) => crate::io::FailedRequest::FsRead(read),
+                            FsRequest::Write(_) => crate::io::FailedRequest::FsWrite,
+                        },
                     }));
                 } else {
                     let DataFlowRequest {

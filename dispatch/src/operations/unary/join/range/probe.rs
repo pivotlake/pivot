@@ -7,6 +7,7 @@
 //! then appended as whole Arrow ranges while the corresponding probe row is
 //! repeated beside them.
 
+use crate::io::OperatorIO;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -52,6 +53,7 @@ where
         &mut self,
         probe_batch: RecordBatch,
         sender: &mut dyn Sender<RecordBatch>,
+        _io: &mut OperatorIO,
     ) -> unary::Result<()> {
         // The build operator publishes this table with a Release store before
         // the probe gate's Acquire load allows this operator to run.

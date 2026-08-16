@@ -227,6 +227,7 @@ impl Unary<RecordBatch, ColumnChunkJob> for Indexer {
         &mut self,
         batch: RecordBatch,
         sender: &mut dyn Sender<ColumnChunkJob>,
+        _io: &mut dispatch::io::OperatorIO,
     ) -> UnaryResult<()> {
         if batch.num_rows() == 0 {
             return Ok(());

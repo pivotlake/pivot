@@ -8,6 +8,7 @@
 //! The output type lives in the closure signature, which means every `send`
 //! downstream is monomorphized — no dyn dispatch.
 
+use crate::io::OperatorIO;
 use crate::operations::channels::Sender;
 use crate::operations::unary::{self, Unary, UnaryFactory};
 
@@ -35,7 +36,12 @@ impl<I, O, F> Unary<I, O> for Map<F>
 where
     F: FnMut(I) -> O + Send,
 {
-    fn consume(&mut self, item: I, sender: &mut dyn Sender<O>) -> unary::Result<()> {
+    fn consume(
+        &mut self,
+        item: I,
+        sender: &mut dyn Sender<O>,
+        _io: &mut OperatorIO,
+    ) -> unary::Result<()> {
         sender.send((self.func)(item))?;
         Ok(())
     }
@@ -65,8 +71,10 @@ mod tests {
 
         // Execute
         let mut collector: CollectSender<String> = CollectSender::new();
-        map.consume(1, &mut collector).unwrap();
-        map.consume(2, &mut collector).unwrap();
+        map.consume(1, &mut collector, &mut OperatorIO::default())
+            .unwrap();
+        map.consume(2, &mut collector, &mut OperatorIO::default())
+            .unwrap();
 
         // Assert
         assert_eq!(collector.items, vec!["v=1".to_string(), "v=2".to_string()]);

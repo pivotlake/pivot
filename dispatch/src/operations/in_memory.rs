@@ -10,6 +10,7 @@
 //! a perfectly parallel job pipeline — e.g. one Parquet *page* encode per item,
 //! stolen across workers.
 
+use crate::io::OperatorIO;
 use crate::operations::channels::{Receiver, RootChannelFactory, Sender};
 use crate::operations::unary::{self, Unary};
 use crate::waker::waker_set;
@@ -140,7 +141,12 @@ impl<T> Default for Forward<T> {
 }
 
 impl<T> Unary<T, T> for Forward<T> {
-    fn consume(&mut self, item: T, sender: &mut dyn Sender<T>) -> unary::Result<()> {
+    fn consume(
+        &mut self,
+        item: T,
+        sender: &mut dyn Sender<T>,
+        _io: &mut OperatorIO,
+    ) -> unary::Result<()> {
         sender.send(item)?;
         Ok(())
     }

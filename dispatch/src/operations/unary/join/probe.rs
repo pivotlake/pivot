@@ -53,6 +53,7 @@
 //! duplicate probe rows here.
 
 use crate::RECORD_BATCH_SIZE;
+use crate::io::OperatorIO;
 use crate::memory::MultiSlabBuffer;
 use crate::operations::Unary;
 use crate::operations::channels::Sender;
@@ -303,6 +304,7 @@ impl<
         &mut self,
         batch: RecordBatch,
         sender: &mut dyn Sender<RecordBatch>,
+        _io: &mut OperatorIO,
     ) -> unary::Result<()> {
         let build_rows = unsafe { &*self.table.build_rows.get() };
         if build_rows.is_empty() {

@@ -101,6 +101,7 @@ impl Unary<EncodedColumnChunk, AssembledFile> for FileAssembler {
         &mut self,
         chunk: EncodedColumnChunk,
         sender: &mut dyn Sender<AssembledFile>,
+        _io: &mut dispatch::io::OperatorIO,
     ) -> UnaryResult<()> {
         // Gather this row group's column chunks (one per schema column).
         let row_group_id = chunk.header.row_group_id;

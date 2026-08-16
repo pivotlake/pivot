@@ -17,6 +17,7 @@
 //! 3. **Complete** — The outputter has emitted everything.
 
 use crate::data_flow::WorkStatus;
+use crate::io::OperatorIO;
 use crate::operations::channels::Sender;
 use crate::operations::{Unary, unary};
 use std::marker::PhantomData;
@@ -80,7 +81,12 @@ pub enum PipelineBreaker<I, O, C: Consumer<I, O>> {
 }
 
 impl<I, O, C: Consumer<I, O>> Unary<I, O> for PipelineBreaker<I, O, C> {
-    fn consume(&mut self, object: I, sender: &mut dyn Sender<O>) -> unary::Result<()> {
+    fn consume(
+        &mut self,
+        object: I,
+        sender: &mut dyn Sender<O>,
+        _io: &mut OperatorIO,
+    ) -> unary::Result<()> {
         match self {
             PipelineBreaker::Consuming(c) => c.consume(object, sender),
             // A breaker that finished *early* (e.g. a satisfied `LIMIT`) can still
@@ -93,7 +99,11 @@ impl<I, O, C: Consumer<I, O>> Unary<I, O> for PipelineBreaker<I, O, C> {
         }
     }
 
-    fn run(&mut self, sender: &mut dyn Sender<O>) -> unary::Result<WorkStatus> {
+    fn run(
+        &mut self,
+        sender: &mut dyn Sender<O>,
+        _io: &mut OperatorIO,
+    ) -> unary::Result<WorkStatus> {
         match self {
             PipelineBreaker::Outputting(o, ..) => {
                 if o.output(sender)? {

@@ -151,6 +151,7 @@ impl Unary<CompressedPage, DecompressedPage> for Decompressor {
         &mut self,
         page: CompressedPage,
         output: &mut dyn Sender<DecompressedPage>,
+        _io: &mut dispatch::io::OperatorIO,
     ) -> dispatch::UnaryResult<()> {
         // A data page whose row group was pruned downstream (dictionary pushdown
         // set the shared flag) is never read: the decoder has already dropped the
@@ -554,7 +555,11 @@ mod tests {
         };
 
         let mut sender = CollectSender::new();
-        let result = Decompressor::default().consume(page, &mut sender);
+        let result = Decompressor::default().consume(
+            page,
+            &mut sender,
+            &mut dispatch::io::OperatorIO::default(),
+        );
 
         assert!(result.is_err());
     }

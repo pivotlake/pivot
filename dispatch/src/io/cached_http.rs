@@ -348,18 +348,20 @@ impl CachedHttpEngine {
         }
         for (id, error) in self.http.take_failed() {
             if let Some(http_read) = self.http_reads.remove(&id)
-                && let Some((data_flow_id, operator_idx)) = self.fail_read(http_read.read)
+                && let Some(request) = self.fail_read(http_read.read)
             {
                 out.push(Err(FailedRead {
-                    data_flow_id,
-                    operator_idx,
+                    data_flow_id: request.data_flow_id,
+                    operator_idx: request.operator_idx,
                     error: error.into(),
+                    request: crate::io::FailedRequest::HttpGet(request.request),
                 }));
             } else if let Some(upload) = self.http_uploads.remove(&id) {
                 out.push(Err(FailedRead {
                     data_flow_id: upload.data_flow_id,
                     operator_idx: upload.operator_idx,
                     error: error.into(),
+                    request: crate::io::FailedRequest::HttpUpload,
                 }));
             }
         }
@@ -414,7 +416,7 @@ impl CachedHttpEngine {
         // serve stale slot bytes - symmetric with the write-back's `result == len`
         // guard.
         if result < 0 || result as usize != cache_read.block.len() {
-            if let Some((data_flow_id, operator_idx)) = self.fail_read(cache_read.read) {
+            if let Some(request) = self.fail_read(cache_read.read) {
                 let error = if result < 0 {
                     std::io::Error::from_raw_os_error(-result)
                 } else {
@@ -424,9 +426,10 @@ impl CachedHttpEngine {
                     )
                 };
                 out.push(Err(FailedRead {
-                    data_flow_id,
-                    operator_idx,
+                    data_flow_id: request.data_flow_id,
+                    operator_idx: request.operator_idx,
                     error: error.into(),
+                    request: crate::io::FailedRequest::HttpGet(request.request),
                 }));
             }
             return;
@@ -510,9 +513,7 @@ impl CachedHttpEngine {
 
     /// Tear down a requested read whose piece failed, returning the dataflow to
     /// cancel (or `None` if an earlier failed piece already tore it down).
-    fn fail_read(&mut self, read: Identifier) -> Option<(Identifier, Identifier)> {
-        self.requested_reads
-            .remove(&read)
-            .map(|r| (r.request.data_flow_id, r.request.operator_idx))
+    fn fail_read(&mut self, read: Identifier) -> Option<DataFlowRequest<HttpGetRequest>> {
+        self.requested_reads.remove(&read).map(|r| r.request)
     }
 }

@@ -25,7 +25,8 @@
 use crate::Identifier;
 use crate::api::DataFlowBuilder;
 use crate::data_flow::{DataFlow, WorkStatus};
-use crate::io::{Completion, DiskCache, IORequester};
+use crate::io::request_tracker::{ReadKey, RegistrationCaps, RequestTracker};
+use crate::io::{Completion, DiskCache, FailedRequest, IORequester};
 use crate::memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 use crate::operations::FinishStatus;
 use crate::waker::{WakerSet, WorkerWaker, init_waker_set, init_worker_waker};
@@ -44,6 +45,28 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// µs-scale gaps between a small query's stages; a longer real stall still falls
 /// through to a park. Large queries keep workers busy and rarely reach this path.
 const IN_FLIGHT_SPIN_LIMIT: u32 = 120_000;
+
+/// Scheduled-but-not-landed disk read blocks per worker before the
+/// `register_pending_io` stage stops registering further filesystem requests.
+/// Sized to the ring: one full submission batch can be outstanding without
+/// overflowing the completion queue (see the tracker's submission batching), so
+/// registration keeps the ring fed without piling up pinned cache slots beyond
+/// what the ring can absorb.
+const MAX_DISK_READS_IN_FLIGHT: usize = crate::io::RING_SIZE as usize;
+
+/// Per-worker remote in-flight ceiling, tunable via `PIVOT_HTTP_INFLIGHT`. Caps
+/// both the registration of staged HTTP read requests and the submission of
+/// HTTP operations (reads and uploads) onto the ring.
+///
+/// Remote objects sit behind ~tens-of-ms RTTs, so a deep read-ahead is what
+/// hides the latency: stopping at the first outstanding read would serialise a
+/// scan to one read at a time per worker — catastrophic over a table of many
+/// small files, where the whole query becomes round-trip bound.
+fn http_inflight_target() -> usize {
+    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| crate::env::get_env_var_with_default("PIVOT_HTTP_INFLIGHT", 100))
+}
+
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Barrier};
 use std::thread::JoinHandle;
@@ -112,6 +135,11 @@ pub struct Worker {
     /// A requester (through a single per-core uring) for all IO — both disk reads
     /// and HTTP(S) reads of remote regions share the one ring.
     io: IORequester,
+    /// This worker's tracker for cache-backed reads: the `register_pending_io`
+    /// stage drains operators' staged requests into it, it resolves them
+    /// against the caches and dedups the physical reads, and completions are
+    /// routed through it back to the operators that staged them.
+    tracker: RequestTracker,
     /// A queue of dataflows for the worker to work on. The worker can work on many dataflows
     /// simultaneously
     data_flow_queue: Receiver<DataFlowBuilder>,
@@ -191,6 +219,7 @@ impl Worker {
                 crate::io::disk_cache::install_worker_disk_cache(disk_cache.clone());
                 let worker = Self {
                     io: IORequester::new(disk_cache),
+                    tracker: RequestTracker::default(),
                     id: core.id,
                     data_flows: HashMap::new(),
                     data_flow_queue: receiver,
@@ -266,10 +295,6 @@ impl Worker {
     /// scan to one read at a time per worker — catastrophic over a table of many
     /// small files, where the whole query becomes round-trip bound.
     fn saturate_http(&mut self) -> Result<bool> {
-        // Per-worker remote read-ahead ceiling, tunable via `PIVOT_HTTP_INFLIGHT`.
-        static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let http_inflight_target =
-            *VALUE.get_or_init(|| crate::env::get_env_var_with_default("PIVOT_HTTP_INFLIGHT", 100));
         let mut clean = true;
         'flows: for flow in self.data_flows.values_mut() {
             #[cfg(feature = "perf")]
@@ -277,7 +302,7 @@ impl Worker {
                 clean = false;
                 continue;
             }
-            if self.io.http_in_flight() >= http_inflight_target {
+            if self.io.http_in_flight() >= http_inflight_target() {
                 return Ok(false);
             }
 
@@ -299,12 +324,121 @@ impl Worker {
                     }
                 }
 
-                if self.io.http_in_flight() >= http_inflight_target {
+                if self.io.http_in_flight() >= http_inflight_target() {
                     break;
                 }
             }
         }
         Ok(clean)
+    }
+
+    /// Register the cache-backed read requests operators staged in their
+    /// [`OperatorIO`](crate::io::OperatorIO)s with this worker's tracker, one
+    /// dataflow at a time, until the per-medium in-flight budget is spent.
+    /// Requests whose ranges were all cache-resident complete and are delivered
+    /// during the pass. Returns whether every dataflow's staged requests were
+    /// fully drained.
+    fn register_pending_io(&mut self) -> bool {
+        let caps = RegistrationCaps {
+            disk_reads: MAX_DISK_READS_IN_FLIGHT,
+            http_reads: http_inflight_target(),
+        };
+        let mut clean = true;
+        for flow in self.data_flows.values_mut() {
+            #[cfg(feature = "perf")]
+            if Self::paused_for_profiling(flow) {
+                clean = false;
+                continue;
+            }
+            let pass = flow.register_pending_io(&mut self.tracker, &caps);
+            clean &= pass.clean;
+            // A cache-served delivery is work: the operator consumed its
+            // response (and possibly emitted downstream), so don't park.
+            self.did_work_last_iteration |= pass.delivered;
+        }
+        clean
+    }
+
+    /// Submit the tracker's deduped reads onto the ring: disk reads while the
+    /// disk queue is free (the tracker batches them so the ring's completion
+    /// queue can't overflow), remote reads up to the in-flight ceiling. Each
+    /// read is charged to the stats of the dataflow whose request first
+    /// scheduled it.
+    ///
+    /// Reads whose dataflow has since been cancelled are submitted regardless:
+    /// the read may have waiters in other dataflows, and its cache slot is
+    /// already allocated and pinned either way.
+    fn submit_tracker_reads(&mut self) -> Result<()> {
+        while !self.io.has_file_pending() {
+            let batch = self.tracker.take_fs_submissions();
+            if batch.is_empty() {
+                break;
+            }
+            for mut request in batch {
+                if let Some(flow) = self.data_flows.get_mut(&request.data_flow_id) {
+                    flow.stats()
+                        .record_issued_disk(std::slice::from_mut(&mut request));
+                }
+                self.io.request(request)?;
+            }
+        }
+        while self.io.http_in_flight() < http_inflight_target() {
+            let batch = self.tracker.take_http_submissions();
+            if batch.is_empty() {
+                break;
+            }
+            for mut request in batch {
+                if let Some(flow) = self.data_flows.get_mut(&request.data_flow_id) {
+                    flow.stats()
+                        .stamp_issued(std::slice::from_mut(&mut request));
+                }
+                let data_flow_id = request.data_flow_id;
+                let read = match &request.request {
+                    crate::io::HttpRequest::Get(get) => ReadKey::of_http_get(get),
+                    crate::io::HttpRequest::Upload(_) => {
+                        unreachable!("the tracker submits only GETs")
+                    }
+                };
+                // Submitting an HTTP operation can fail (socket exhaustion,
+                // TLS setup). The read never went out, so fail it through the
+                // tracker - cancelling every dataflow that waited on it -
+                // rather than propagating, which would panic the worker and
+                // take the whole server down.
+                match self.io.request_http(request) {
+                    Ok(split) => {
+                        if let Some(flow) = self.data_flows.get_mut(&data_flow_id) {
+                            flow.stats().record_issued_remote(split);
+                        }
+                    }
+                    Err(e) => self.fail_tracker_read(&read, &e),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A tracker-managed read failed terminally: cancel every dataflow that had
+    /// a request waiting on it.
+    fn fail_tracker_read(&mut self, read: &ReadKey, error: &crate::io::IORequesterError) {
+        let message = error.to_string();
+        for data_flow_id in self.tracker.fail(read) {
+            if let Some(flow) = self.data_flows.get_mut(&data_flow_id) {
+                let error =
+                    crate::io::IORequesterError::from(std::io::Error::other(message.clone()));
+                flow.bail_and_cancel(error.into());
+            }
+        }
+    }
+
+    /// Hand every request that `read`'s landing completed back to its operator.
+    /// A request's dataflow may already be gone (finished or cancelled); its
+    /// response is dropped, and the cache pins it holds release with it.
+    fn deliver_completed_requests(&mut self, read: ReadKey) {
+        for delivery in self.tracker.complete(&read) {
+            if let Some(flow) = self.data_flows.get_mut(&delivery.data_flow_id) {
+                flow.process_io_response(delivery.operator_idx, delivery.completed);
+            }
+        }
     }
 
     /// Run one unit of CPU work from the first dataflow that has work ready.
@@ -322,33 +456,36 @@ impl Worker {
         }
     }
 
-    /// Deliver completed reads back to the operators that requested them, each
-    /// transport to its own handler; by the time we're here each block's bytes
-    /// are already committed to its cache slot.
+    /// Deliver completed IO back to where it's tracked: reads resolve through
+    /// this worker's tracker (which knows every request waiting on each read),
+    /// writes and uploads go straight to the operator that issued them. By the
+    /// time we're here each read's bytes are already committed to its cache
+    /// slot.
     fn process_io_completions(&mut self) -> Result<()> {
         for completion in self.io.completions()? {
             match completion {
-                // The owning dataflow may already be gone: a finished or
-                // cancelled query/compaction leaves its read-ahead reads in
-                // flight, and their completions land here afterwards. The block
-                // was already committed in the requester, so a missing dataflow
-                // just means drop the completion (the slot pin releases with it).
                 Ok(Completion::FsRead(r)) => {
+                    // The read's issuing dataflow may already be gone (a
+                    // finished or cancelled query leaves its read-ahead reads
+                    // in flight); its stats are simply lost, but the tracker
+                    // delivery below still serves any other waiting dataflow.
                     if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
                         data_flow.stats().record_disk_read_time(r.submitted_at);
-                        data_flow.process_fs_read(r.operator_idx, r.request);
                     }
-                }
-                Ok(Completion::FsWrite(r)) => {
-                    if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
-                        data_flow.stats().record_disk_write_time(r.submitted_at);
-                        data_flow.process_fs_write(r.operator_idx, r.request);
-                    }
+                    self.deliver_completed_requests(ReadKey::of_fs(&r.request));
                 }
                 Ok(Completion::HttpGet(r, time)) => {
                     if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
                         data_flow.stats().record_http_get_time(time);
-                        data_flow.process_http_get_response(r.operator_idx, r.request);
+                    }
+                    self.deliver_completed_requests(ReadKey::of_http_get(&r.request));
+                }
+                // Writes and uploads are operator-owned; a missing dataflow
+                // means the query is gone and the completion is dropped.
+                Ok(Completion::FsWrite(r)) => {
+                    if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
+                        data_flow.stats().record_disk_write_time(r.submitted_at);
+                        data_flow.process_fs_write(r.operator_idx, r.request);
                     }
                 }
                 Ok(Completion::HttpUpload(r)) => {
@@ -357,16 +494,25 @@ impl Worker {
                         data_flow.process_http_upload_response(r.operator_idx, r.request);
                     }
                 }
-                Err(failed) => {
-                    // A read failed terminally (an HTTP read past its retries, or
-                    // a disk read whose CQE came back negative). Cancel just the
-                    // owning dataflow — its query errors out to the client while
-                    // the worker and every other query keep running. The dataflow
-                    // may already be gone if the query was cancelled meanwhile.
-                    if let Some(data_flow) = self.data_flows.get_mut(&failed.data_flow_id) {
-                        data_flow.bail_and_cancel(failed.error.into());
+                Err(failed) => match failed.request {
+                    // A failed read may have requests waiting on it across
+                    // several dataflows; the tracker knows them all.
+                    FailedRequest::FsRead(read) => {
+                        self.fail_tracker_read(&ReadKey::of_fs(&read), &failed.error)
                     }
-                }
+                    FailedRequest::HttpGet(get) => {
+                        self.fail_tracker_read(&ReadKey::of_http_get(&get), &failed.error)
+                    }
+                    // A failed write/upload cancels just the owning dataflow —
+                    // its query errors out to the client while the worker and
+                    // every other query keep running. The dataflow may already
+                    // be gone if the query was cancelled meanwhile.
+                    FailedRequest::FsWrite | FailedRequest::HttpUpload => {
+                        if let Some(data_flow) = self.data_flows.get_mut(&failed.data_flow_id) {
+                            data_flow.bail_and_cancel(failed.error.into());
+                        }
+                    }
+                },
             }
         }
         Ok(())
@@ -525,17 +671,24 @@ impl Worker {
             self.cancel_upstream_in_dataflows();
 
             self.process_io_completions()?;
-            // Walk the operator graphs for IO submissions only while some
-            // operator has flagged staged IO; on an IO-free hot path the walks
-            // are the whole cost. Clearing only after both passes came back
-            // clean keeps a request that was skipped by an early break (busy
-            // disk queue, full HTTP window) flagged for the next pass.
+            // Walk the operator graphs for staged IO only while some operator
+            // has flagged it; on an IO-free hot path the walks are the whole
+            // cost. Clearing only after every pass came back clean keeps a
+            // request that was skipped by an early break (spent registration
+            // budget, busy disk queue, full HTTP window) flagged for the next
+            // pass.
             if crate::io::has_pending_io() {
+                let register_clean = self.register_pending_io();
                 let disk_clean = self.saturate_io()?;
                 let http_clean = self.saturate_http()?;
-                if disk_clean && http_clean {
+                if register_clean && disk_clean && http_clean {
                     crate::io::clear_pending_io();
                 }
+            }
+            // Reads the register stage scheduled (and any leftovers a busy ring
+            // deferred) go out now.
+            if self.tracker.has_reads_to_submit() {
+                self.submit_tracker_reads()?;
             }
 
             self.step_run_ready_cpu_work();

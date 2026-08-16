@@ -309,6 +309,7 @@ impl Unary<AssembledFile, RecordBatch> for Upload {
         &mut self,
         encoded: AssembledFile,
         _sender: &mut dyn Sender<RecordBatch>,
+        _io: &mut dispatch::io::OperatorIO,
     ) -> dispatch::UnaryResult<()> {
         let path = ObjectPath::new(format!("pivot-{}.parquet", uuid::Uuid::new_v4()));
         let key = self.location.resolve(&path);

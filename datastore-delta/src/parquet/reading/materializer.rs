@@ -85,6 +85,7 @@ impl Unary<RecordBatch, RowGroupRequest> for Materializer {
         &mut self,
         batch: RecordBatch,
         _sender: &mut dyn Sender<RowGroupRequest>,
+        _io: &mut dispatch::io::OperatorIO,
     ) -> dispatch::UnaryResult<()> {
         // The row-group column is a `RunArray` (consecutive same-group rows = one
         // run). The batch may be a logical slice (e.g. a `LIMIT` above the scan),
@@ -168,7 +169,13 @@ mod tests {
             Arc::new(ParquetTable::new(vec![])),
         );
         let mut sink = CollectSender::<RowGroupRequest>::default();
-        dispatch::Unary::consume(&mut materializer, batch, &mut sink).unwrap();
+        dispatch::Unary::consume(
+            &mut materializer,
+            batch,
+            &mut sink,
+            &mut dispatch::io::OperatorIO::default(),
+        )
+        .unwrap();
         materializer.pending_row_groups
     }
 

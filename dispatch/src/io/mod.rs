@@ -43,6 +43,14 @@ pub use requester::{Error as IORequesterError, IORequester, RING_SIZE};
 
 mod cached_http;
 
+pub mod operator_io;
+pub use operator_io::{
+    CacheTiers, CompletedIoRequest, FileRange, OperatorIO, PendingIoRequest, RangePart,
+};
+
+pub mod request_tracker;
+pub use request_tracker::{CompletedIoDelivery, ReadKey, RequestTracker};
+
 pub mod disk_cache;
 pub use disk_cache::{DiskCache, clear_disk_cache};
 
@@ -496,15 +504,30 @@ pub enum Completion {
 /// An operation that failed transport-side — an HTTP operation that exhausted
 /// its retries (or hit a non-retryable error), or a disk operation whose CQE
 /// came back negative.
-/// Carries the dataflow/operator that issued it so the worker can cancel just
-/// that dataflow, plus the error to report. Surfaced as the `Err` arm of a
-/// per-read result from [`IORequester::completions`], so one failed read never
-/// aborts the whole completion drain or tears down the worker. The block is
-/// left uncommitted.
+/// Carries the dataflow/operator that issued it, the error to report, and the
+/// failed operation itself. Surfaced as the `Err` arm of a per-read result from
+/// [`IORequester::completions`], so one failed read never aborts the whole
+/// completion drain or tears down the worker. The block is left uncommitted.
+///
+/// The operation matters for cache-backed reads: those are tracked in the
+/// worker's [`RequestTracker`], where one read can have waiting requests across
+/// several dataflows, so the worker resolves the failed read against the
+/// tracker (cancelling every waiting dataflow) rather than only the issuer.
 pub struct FailedRead {
     pub data_flow_id: Identifier,
     pub operator_idx: Identifier,
     pub error: IORequesterError,
+    pub request: FailedRequest,
+}
+
+/// The operation a [`FailedRead`] is about. Reads carry their request so the
+/// worker can identify them in its [`RequestTracker`]; writes and uploads are
+/// resolved by the issuing dataflow alone, so the kind suffices.
+pub enum FailedRequest {
+    FsRead(FsReadRequest),
+    FsWrite,
+    HttpGet(HttpGetRequest),
+    HttpUpload,
 }
 
 /// Opens a file for direct (uncached) reads.

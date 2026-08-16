@@ -15,6 +15,7 @@
 
 use crate::RECORD_BATCH_SIZE;
 use crate::arrays::accumulator::BatchAccumulator;
+use crate::io::OperatorIO;
 use crate::memory::SlabAllocator;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
@@ -182,6 +183,7 @@ where
         &mut self,
         batch: RecordBatch,
         output: &mut dyn Sender<RecordBatch>,
+        _io: &mut OperatorIO,
     ) -> unary::Result<()> {
         self.selection.clear();
         let selection = (self.func)(&batch, &mut self.allocator, &mut self.selection);

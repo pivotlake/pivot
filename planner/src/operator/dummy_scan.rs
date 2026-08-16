@@ -67,7 +67,11 @@ struct DummyScanDispatchOperator {
 }
 
 impl Nullary<RecordBatch> for DummyScanDispatchOperator {
-    fn run(&mut self, sender: &mut dyn Sender<RecordBatch>) -> NullaryResult<WorkStatus> {
+    fn run(
+        &mut self,
+        sender: &mut dyn Sender<RecordBatch>,
+        _io: &mut dispatch::io::OperatorIO,
+    ) -> NullaryResult<WorkStatus> {
         if !self.emitted.swap(true, Ordering::Relaxed) {
             let batch = RecordBatch::try_new_with_options(
                 Arc::new(Schema::empty()),

@@ -49,6 +49,7 @@ where
         &mut self,
         file: FileRowGroups,
         _sender: &mut dyn Sender<RecordBatch>,
+        _io: &mut dispatch::io::OperatorIO,
     ) -> dispatch::UnaryResult<()> {
         self.files.push(file);
         Ok(())
