@@ -35,7 +35,12 @@ impl<I, O, F> Unary<I, O> for Map<F>
 where
     F: FnMut(I) -> O + Send,
 {
-    fn consume(&mut self, item: I, sender: &mut dyn Sender<O>) -> unary::Result<()> {
+    fn consume(
+        &mut self,
+        item: I,
+        sender: &mut dyn Sender<O>,
+        _io: &mut crate::io::OperatorIO,
+    ) -> unary::Result<()> {
         sender.send((self.func)(item))?;
         Ok(())
     }
@@ -65,8 +70,9 @@ mod tests {
 
         // Execute
         let mut collector: CollectSender<String> = CollectSender::new();
-        map.consume(1, &mut collector).unwrap();
-        map.consume(2, &mut collector).unwrap();
+        let mut io = crate::io::OperatorIO::default();
+        map.consume(1, &mut collector, &mut io).unwrap();
+        map.consume(2, &mut collector, &mut io).unwrap();
 
         // Assert
         assert_eq!(collector.items, vec!["v=1".to_string(), "v=2".to_string()]);

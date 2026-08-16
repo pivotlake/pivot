@@ -127,7 +127,12 @@ impl<T: ArrowPrimitiveType> Unary<RecordBatch, ()> for RangeBuild<T>
 where
     T::Native: Ord + Send,
 {
-    fn consume(&mut self, batch: RecordBatch, _sender: &mut dyn Sender<()>) -> unary::Result<()> {
+    fn consume(
+        &mut self,
+        batch: RecordBatch,
+        _sender: &mut dyn Sender<()>,
+        _io: &mut crate::io::OperatorIO,
+    ) -> unary::Result<()> {
         debug_assert!(self.publisher, "the funnel delivers to one worker only");
         if batch.num_rows() == 0 || self.saw_null_tail {
             return Ok(());

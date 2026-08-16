@@ -95,7 +95,7 @@ pub type Result<T, E = Error> = result::Result<T, E>;
 ///
 /// 1. Process any outstanding IO completions — we want to always have IO running in background, so
 ///    we clear any pending if possible
-/// 2. Saturate IO - if we have space now, submit new IO
+/// 2. Register operators' pending IO with the requester, which submits it immediately
 /// 3. Run any CPU work available - this will run a single operation if available
 /// 4. Try running trough all dataflows and finishing then
 ///
@@ -201,6 +201,12 @@ impl Worker {
                     node_local_idx,
                     last_seen_broadcast,
                 };
+                // Notifiers must be able to interrupt this worker's blocking
+                // IO wait, not just its thread park; register the ring's wake
+                // line alongside the thread handle.
+                worker
+                    .waker
+                    .register_ring_waker(node_local_idx, worker.io.wake_handle());
                 debug!("Initializing memory context for worker {:?}", idx);
                 init_memory_context(memory_context_factory.create_memory_ctx());
                 debug!("Pre-faulting for worker {:?}", idx);
@@ -227,84 +233,41 @@ impl Worker {
         crate::profiler::profiling_active() && !flow.is_profiled()
     }
 
-    /// Submit disk reads from dataflows until the disk queue is busy or no more
-    /// requests remain. Returns whether the pass visited every dataflow and
-    /// found nothing - only such a pass proves no disk request is waiting.
-    fn saturate_io(&mut self) -> Result<bool> {
-        let mut clean = true;
-        for flow in self.data_flows.values_mut() {
+    /// Pass every node's `OperatorIO` to the requester. Cache-only responses are
+    /// delivered immediately; physical operations are submitted during the same
+    /// registration call. A callback may enqueue a follow-up read (the Parquet
+    /// footer overflow path), so repeat until no node staged another request.
+    fn register_pending_io(&mut self) {
+        while crate::io::has_pending_io() {
+            crate::io::clear_pending_io();
             #[cfg(feature = "perf")]
-            if Self::paused_for_profiling(flow) {
-                clean = false;
-                continue;
-            }
-            if self.io.has_file_pending() {
-                return Ok(false);
-            }
-
-            while let Some(mut requests) = flow.get_next_fs_request() {
-                clean = false;
-                flow.stats().record_issued_disk(&mut requests);
-                for r in requests {
-                    self.io.request(r)?;
+            let mut skipped_for_profiling = false;
+            for flow in self.data_flows.values_mut() {
+                #[cfg(feature = "perf")]
+                if Self::paused_for_profiling(flow) {
+                    skipped_for_profiling = true;
+                    crate::io::note_pending_io();
+                    continue;
                 }
-
-                if self.io.has_file_pending() {
-                    return Ok(false);
-                }
+                flow.register_pending_io(&mut self.io);
+            }
+            self.deliver_ready_reads();
+            // A paused flow deliberately keeps the flag raised. Do not spin on
+            // it here; lifting exclusive profiling wakes every worker, and the
+            // next pass registers the deferred requests.
+            #[cfg(feature = "perf")]
+            if skipped_for_profiling {
+                return;
             }
         }
-        Ok(clean)
     }
 
-    /// Submit HTTP operations from dataflows onto the same ring until this worker
-    /// has `HTTP_INFLIGHT_TARGET` requests in flight or none remain. Gated
-    /// on HTTP activity only (not disk) so the two queues fill independently.
-    ///
-    /// Remote objects sit behind ~tens-of-ms RTTs, so a deep read-ahead is what
-    /// hides the latency. Stopping at the *first* outstanding read serialises a
-    /// scan to one read at a time per worker — catastrophic over a table of many
-    /// small files, where the whole query becomes round-trip bound.
-    fn saturate_http(&mut self) -> Result<bool> {
-        // Per-worker remote read-ahead ceiling, tunable via `PIVOT_HTTP_INFLIGHT`.
-        static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let http_inflight_target =
-            *VALUE.get_or_init(|| crate::env::get_env_var_with_default("PIVOT_HTTP_INFLIGHT", 100));
-        let mut clean = true;
-        'flows: for flow in self.data_flows.values_mut() {
-            #[cfg(feature = "perf")]
-            if Self::paused_for_profiling(flow) {
-                clean = false;
-                continue;
-            }
-            if self.io.http_in_flight() >= http_inflight_target {
-                return Ok(false);
-            }
-
-            while let Some(mut requests) = flow.get_next_http_request() {
-                clean = false;
-                flow.stats().stamp_issued(&mut requests);
-                for r in requests {
-                    // Submitting an HTTP operation can fail (socket exhaustion,
-                    // TLS setup). Fail just this dataflow rather than propagating,
-                    // which would panic the worker and take the whole server down.
-                    // Every operation reports how to charge its transport stats:
-                    // GETs can split across cache tiers; uploads are all HTTP.
-                    match self.io.request_http(r) {
-                        Ok(split) => flow.stats().record_issued_remote(split),
-                        Err(e) => {
-                            flow.bail_and_cancel(e.into());
-                            continue 'flows;
-                        }
-                    }
-                }
-
-                if self.io.http_in_flight() >= http_inflight_target {
-                    break;
-                }
+    fn deliver_ready_reads(&mut self) {
+        for ready in self.io.take_ready_reads() {
+            if let Some(flow) = self.data_flows.get_mut(&ready.route.data_flow_id) {
+                flow.process_read_response(ready.route.operator_idx, ready.response);
             }
         }
-        Ok(clean)
     }
 
     /// Run one unit of CPU work from the first dataflow that has work ready.
@@ -336,7 +299,6 @@ impl Worker {
                 Ok(Completion::FsRead(r)) => {
                     if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
                         data_flow.stats().record_disk_read_time(r.submitted_at);
-                        data_flow.process_fs_read(r.operator_idx, r.request);
                     }
                 }
                 Ok(Completion::FsWrite(r)) => {
@@ -348,7 +310,6 @@ impl Worker {
                 Ok(Completion::HttpGet(r, time)) => {
                     if let Some(data_flow) = self.data_flows.get_mut(&r.data_flow_id) {
                         data_flow.stats().record_http_get_time(time);
-                        data_flow.process_http_get_response(r.operator_idx, r.request);
                     }
                 }
                 Ok(Completion::HttpUpload(r)) => {
@@ -363,13 +324,20 @@ impl Worker {
                     // owning dataflow — its query errors out to the client while
                     // the worker and every other query keep running. The dataflow
                     // may already be gone if the query was cancelled meanwhile.
-                    if let Some(data_flow) = self.data_flows.get_mut(&failed.data_flow_id) {
-                        data_flow.bail_and_cancel(failed.error.into());
-                    }
+                    self.cancel_failed_dataflow(failed.data_flow_id, failed.error.to_string());
                 }
             }
         }
+        self.deliver_ready_reads();
         Ok(())
+    }
+
+    /// Report one physical I/O failure to the dataflow owning its logical request.
+    fn cancel_failed_dataflow(&mut self, data_flow_id: Identifier, message: String) {
+        if let Some(data_flow) = self.data_flows.get_mut(&data_flow_id) {
+            let error = std::io::Error::other(message);
+            data_flow.bail_and_cancel(crate::io::IORequesterError::from(error).into());
+        }
     }
 
     /// Check each dataflow for completion and remove finished ones.
@@ -460,17 +428,22 @@ impl Worker {
     }
 
     fn clear_cancelled_dataflows(&mut self) {
-        self.data_flows.retain(|_, d| {
+        let mut cancelled = Vec::new();
+        self.data_flows.retain(|id, d| {
             if d.cancelled() {
                 // Ship this worker's partial tally before dropping the flow, so a
                 // failed or cancelled query's IO stats still reach the handle (a
                 // finished flow reports in `try_finishing_dataflows`).
                 d.stats().report();
+                cancelled.push(*id);
                 false
             } else {
                 true
             }
-        })
+        });
+        for id in cancelled {
+            self.io.cancel_dataflow(id);
+        }
     }
 
     /// Let any operator that's done with its upstream (e.g. a satisfied `LIMIT`)
@@ -525,18 +498,7 @@ impl Worker {
             self.cancel_upstream_in_dataflows();
 
             self.process_io_completions()?;
-            // Walk the operator graphs for IO submissions only while some
-            // operator has flagged staged IO; on an IO-free hot path the walks
-            // are the whole cost. Clearing only after both passes came back
-            // clean keeps a request that was skipped by an early break (busy
-            // disk queue, full HTTP window) flagged for the next pass.
-            if crate::io::has_pending_io() {
-                let disk_clean = self.saturate_io()?;
-                let http_clean = self.saturate_http()?;
-                if disk_clean && http_clean {
-                    crate::io::clear_pending_io();
-                }
-            }
+            self.register_pending_io();
 
             self.step_run_ready_cpu_work();
 
@@ -545,9 +507,20 @@ impl Worker {
             if !self.did_work_last_iteration {
                 // One ring serves both disk and HTTP, so a single wait wakes on
                 // either kind of completion — no dual-ring coordination needed.
+                // The wait doubles as a select over worker notifications: the
+                // slot published around it lets a notifier interrupt the ring
+                // (see `begin_ring_wait`), so a message sent mid-wait resumes
+                // the loop instead of stalling behind the slowest read.
                 if self.io.has_pending() {
                     debug!("Waiting for IO...");
-                    self.io.wait()?;
+                    if self
+                        .waker
+                        .begin_ring_wait(self.node_local_idx, self.last_seen_wake_count)
+                    {
+                        self.io.wait()?;
+                        self.waker.end_ring_wait(self.node_local_idx);
+                    }
+                    self.last_seen_wake_count = self.waker.wake_count();
                     continue;
                 }
 

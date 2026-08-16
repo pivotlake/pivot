@@ -30,6 +30,14 @@ struct ParkSlot {
     parked: AtomicBool,
     /// The worker's thread handle, registered once at worker startup.
     thread: OnceLock<Thread>,
+    /// Whether this worker is blocked inside its IO ring's completion wait
+    /// (see [`begin_ring_wait`](WorkerWaker::begin_ring_wait)). Claimed with
+    /// the same `true -> false` discipline as `parked`; the claimer wakes the
+    /// ring through `ring_wake` instead of unparking the thread.
+    ring_parked: AtomicBool,
+    /// How to interrupt this worker's ring wait, registered once at worker
+    /// startup.
+    ring_wake: OnceLock<crate::io::RingWakeHandle>,
 }
 
 /// Wake-up coordination for the workers in one NUMA node.
@@ -69,6 +77,8 @@ impl WorkerWaker {
                 .map(|_| ParkSlot {
                     parked: AtomicBool::new(false),
                     thread: OnceLock::new(),
+                    ring_parked: AtomicBool::new(false),
+                    ring_wake: OnceLock::new(),
                 })
                 .collect(),
             next_wake: AtomicUsize::new(0),
@@ -85,9 +95,28 @@ impl WorkerWaker {
             .expect("worker slot registered twice");
     }
 
-    /// Claim `slot` if it is parked and wake its thread. The atomic claim makes
-    /// concurrent notifiers choose different sleepers whenever possible.
+    /// Register how to interrupt worker `local_idx`'s IO ring wait. Must be
+    /// called once, before its first [`begin_ring_wait`](Self::begin_ring_wait).
+    pub fn register_ring_waker(&self, local_idx: usize, handle: crate::io::RingWakeHandle) {
+        self.slots[local_idx]
+            .ring_wake
+            .set(handle)
+            .unwrap_or_else(|_| panic!("worker ring waker registered twice"));
+    }
+
+    /// Claim `slot` if it is parked and wake it: a worker blocked in its IO
+    /// ring is woken through the ring, a thread-parked worker by unpark. The
+    /// atomic claim makes concurrent notifiers choose different sleepers
+    /// whenever possible.
     fn wake_slot(&self, slot: &ParkSlot) -> bool {
+        if slot.ring_parked.swap(false, Ordering::SeqCst) {
+            self.parked_workers.fetch_sub(1, Ordering::SeqCst);
+            slot.ring_wake
+                .get()
+                .expect("a ring-parked worker registered its ring waker")
+                .wake();
+            return true;
+        }
         if slot.parked.swap(false, Ordering::SeqCst) {
             self.parked_workers.fetch_sub(1, Ordering::SeqCst);
             if let Some(thread) = slot.thread.get() {
@@ -213,6 +242,42 @@ impl WorkerWaker {
             self.parked_workers.fetch_sub(1, Ordering::SeqCst);
         }
         self.wake_count.load(Ordering::SeqCst)
+    }
+
+    /// Publish worker `local_idx` as blocked in its IO ring wait, unless the
+    /// wake count moved past `last_seen` first. Returns whether the caller
+    /// should proceed into the blocking wait; `false` means a notification
+    /// raced in and the worker should re-run its loop instead.
+    ///
+    /// Same no-lost-wake protocol as [`wait_if_unchanged`](Self::wait_if_unchanged):
+    /// notifiers bump the count before scanning slots, this publishes the slot
+    /// before rechecking the count, so a concurrent notification either shows
+    /// in the recheck or claims the slot and interrupts the ring (see
+    /// [`wake_slot`](Self::wake_slot)). The caller must pair a `true` return
+    /// with [`end_ring_wait`](Self::end_ring_wait) after the wait returns.
+    pub fn begin_ring_wait(&self, local_idx: usize, last_seen: u64) -> bool {
+        let slot = &self.slots[local_idx];
+        slot.ring_parked.store(true, Ordering::SeqCst);
+        self.parked_workers.fetch_add(1, Ordering::SeqCst);
+        if self.wake_count.load(Ordering::SeqCst) != last_seen {
+            // Withdraw the slot unless a notifier already claimed it (and woke
+            // the ring; the spurious wake drains harmlessly).
+            if slot.ring_parked.swap(false, Ordering::SeqCst) {
+                self.parked_workers.fetch_sub(1, Ordering::SeqCst);
+            }
+            return false;
+        }
+        true
+    }
+
+    /// Withdraw worker `local_idx`'s ring-wait publication after its wait
+    /// returned, whether it was woken by an IO completion (the slot is still
+    /// claimed here) or by a notifier (who already claimed it).
+    pub fn end_ring_wait(&self, local_idx: usize) {
+        let slot = &self.slots[local_idx];
+        if slot.ring_parked.swap(false, Ordering::SeqCst) {
+            self.parked_workers.fetch_sub(1, Ordering::SeqCst);
+        }
     }
 }
 

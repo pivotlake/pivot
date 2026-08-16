@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -10,7 +9,7 @@ use arrow_array::{Int64Array, RecordBatch};
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use crossbeam_deque::Injector;
-use dispatch::io::{FsRequest, FsWriteRequest, HttpRequest, HttpUploadRequest, RemoteFile};
+use dispatch::io::{FsWriteRequest, HttpUploadRequest, OpenFile, OperatorIO, RemoteFile};
 use dispatch::{
     DataFlowDispatcher, RecordBatchOperatorSpec, Sender, Unary, UnaryFactory, stealable,
 };
@@ -219,8 +218,6 @@ impl UnaryFactory<AssembledFile, RecordBatch> for UploadFactory {
             rows: self.rows,
             remaining_workers: self.remaining_workers,
             in_flight: HashMap::new(),
-            pending_fs: Vec::new(),
-            pending_http: Vec::new(),
         }
     }
 }
@@ -257,10 +254,6 @@ pub(super) struct Upload {
     /// right away and they all run concurrently (some disks and object stores
     /// have enough latency that serializing would leave throughput on the table).
     in_flight: HashMap<usize, PendingUpload>,
-    /// Writes/uploads staged by `consume`, drained by
-    /// [`next_fs_requests`](Self::next_fs_requests) / `next_http_requests`.
-    pending_fs: Vec<FsRequest>,
-    pending_http: Vec<HttpRequest>,
 }
 
 impl Upload {
@@ -309,6 +302,7 @@ impl Unary<AssembledFile, RecordBatch> for Upload {
         &mut self,
         encoded: AssembledFile,
         _sender: &mut dyn Sender<RecordBatch>,
+        io: &mut OperatorIO,
     ) -> dispatch::UnaryResult<()> {
         let path = ObjectPath::new(format!("pivot-{}.parquet", uuid::Uuid::new_v4()));
         let key = self.location.resolve(&path);
@@ -321,30 +315,23 @@ impl Unary<AssembledFile, RecordBatch> for Upload {
             size: data.len() as u64,
         };
 
-        match self.store.sink(&key).map_err(crate::parquet::op_err)? {
+        let open_file = match self.store.sink(&key).map_err(crate::parquet::op_err)? {
             DataFileLocation::Local(path) => {
                 let file_handle = OpenOptions::new()
                     .create_new(true)
                     .write(true)
                     .open(path)
                     .map_err(crate::parquet::op_err)?;
-                self.pending_fs.push(FsRequest::Write(FsWriteRequest {
-                    file: Arc::new(file_handle),
-                    data: data.clone(),
-                }));
+                OpenFile::Local(Arc::new(file_handle))
             }
             DataFileLocation::Remote { url, auth } => {
                 let remote = RemoteFile::open(url, auth, data.len() as u64)
                     .map(Arc::new)
                     .map_err(crate::parquet::op_err)?;
-                self.pending_http
-                    .push(HttpRequest::Upload(HttpUploadRequest {
-                        remote,
-                        data: data.clone(),
-                    }));
+                OpenFile::Remote(remote)
             }
-        }
-        dispatch::io::note_pending_io();
+        };
+        io.write(open_file, data.clone());
         self.in_flight.insert(
             id,
             PendingUpload {
@@ -355,14 +342,6 @@ impl Unary<AssembledFile, RecordBatch> for Upload {
             },
         );
         Ok(())
-    }
-
-    fn next_fs_requests(&mut self) -> dispatch::UnaryResult<Vec<FsRequest>> {
-        Ok(mem::take(&mut self.pending_fs))
-    }
-
-    fn next_http_requests(&mut self) -> dispatch::UnaryResult<Vec<HttpRequest>> {
-        Ok(mem::take(&mut self.pending_http))
     }
 
     fn process_fs_write_response(

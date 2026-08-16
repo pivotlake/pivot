@@ -52,6 +52,7 @@ where
         &mut self,
         probe_batch: RecordBatch,
         sender: &mut dyn Sender<RecordBatch>,
+        _io: &mut crate::io::OperatorIO,
     ) -> unary::Result<()> {
         // The build operator publishes this table with a Release store before
         // the probe gate's Acquire load allows this operator to run.

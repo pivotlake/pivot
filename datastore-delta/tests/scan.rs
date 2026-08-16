@@ -38,6 +38,36 @@ fn scan_all_columns() {
 }
 
 #[test]
+fn limit_can_abandon_parquet_reads() {
+    let dispatch = dispatch(4);
+    let dir = TempDir::new().unwrap();
+    let batch = strings_and_ints(
+        &["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"],
+        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+    );
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+    for part in 0..8 {
+        let file = std::fs::File::create(dir.path().join(format!("part{part}.parquet"))).unwrap();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props.clone())).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+    let table = parquet_table_from_dir(&dispatch, dir.path());
+
+    let results = table_input(&dispatch, &table, Projection::all(2), false)
+        .limit(10, 0)
+        .collect()
+        .unwrap();
+
+    assert_eq!(
+        results.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+        10
+    );
+}
+
+#[test]
 fn scan_column_subset() {
     let dispatch = dispatch(1);
     let batch = RecordBatch::try_new(

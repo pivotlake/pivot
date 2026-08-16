@@ -30,8 +30,6 @@ pub(crate) fn http_readahead() -> usize {
     *VALUE.get_or_init(|| dispatch::env::get_env_var_with_default("PIVOT_HTTP_READAHEAD", 64))
 }
 
-mod request_tracker;
-
 pub(crate) mod reading;
 pub use reading::{
     ColumnDecoderError, DecoderFactory, DecompressorError, DecompressorFactory, IndexerFactory,

@@ -114,6 +114,13 @@ impl StatsCollector {
         }
     }
 
+    /// Build a no-op collector for standalone test and benchmark drivers.
+    #[cfg(feature = "test-util")]
+    pub fn disabled() -> Self {
+        let (tx, _rx) = mpsc::channel();
+        Self { stats: None, tx }
+    }
+
     /// Whether collection is on, so a caller can skip a clock read it would only
     /// hand to a no-op.
     pub fn enabled(&self) -> bool {

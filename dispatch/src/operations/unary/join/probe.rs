@@ -303,6 +303,7 @@ impl<
         &mut self,
         batch: RecordBatch,
         sender: &mut dyn Sender<RecordBatch>,
+        _io: &mut crate::io::OperatorIO,
     ) -> unary::Result<()> {
         let build_rows = unsafe { &*self.table.build_rows.get() };
         if build_rows.is_empty() {

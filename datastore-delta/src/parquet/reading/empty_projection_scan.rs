@@ -72,7 +72,11 @@ struct EmptyProjectionScan {
 }
 
 impl Nullary<RecordBatch> for EmptyProjectionScan {
-    fn run(&mut self, sender: &mut dyn Sender<RecordBatch>) -> NullaryResult<WorkStatus> {
+    fn run(
+        &mut self,
+        sender: &mut dyn Sender<RecordBatch>,
+        _io: &mut dispatch::OperatorIO,
+    ) -> NullaryResult<WorkStatus> {
         let rg = match self.row_groups.steal() {
             Steal::Success(rg) => rg,
             Steal::Empty | Steal::Retry => return Ok(WorkStatus::Pending),
