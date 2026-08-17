@@ -199,6 +199,44 @@ fn fold_primitive_column<A, V, T: ArrowPrimitiveType>(
 where
     T::Native: Into<V>,
 {
+    // A portable (no -Ctarget-cpu) build vectorises this loop with NEON only;
+    // compiled with SVE available it runs measurably faster on SVE machines.
+    // Compile a second copy of the loop with SVE enabled and pick it when the
+    // running CPU has SVE, the same pattern memchr/crc32fast use. The check is
+    // per column reduce (never per row) and caches after the first call.
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("sve") {
+        // SAFETY: SVE support was just detected on the running CPU.
+        return unsafe { fold_primitive_column_sve(arr, seed, update) };
+    }
+    fold_primitive_column_impl(arr, seed, update)
+}
+
+/// The SVE-enabled clone of [`fold_primitive_column_impl`]: `#[target_feature]`
+/// recompiles the inlined loop body with SVE codegen, and the `unsafe` at the
+/// call site is the promise that the CPU was checked.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "sve")]
+fn fold_primitive_column_sve<A, V, T: ArrowPrimitiveType>(
+    arr: &PrimitiveArray<T>,
+    seed: impl Fn(V) -> A,
+    update: impl Fn(A, V) -> A,
+) -> Option<A>
+where
+    T::Native: Into<V>,
+{
+    fold_primitive_column_impl(arr, seed, update)
+}
+
+#[inline(always)]
+fn fold_primitive_column_impl<A, V, T: ArrowPrimitiveType>(
+    arr: &PrimitiveArray<T>,
+    seed: impl Fn(V) -> A,
+    update: impl Fn(A, V) -> A,
+) -> Option<A>
+where
+    T::Native: Into<V>,
+{
     if arr.null_count() == 0 {
         let mut values = arr.values().iter().map(|&v| v.into());
         let first = values.next()?;
