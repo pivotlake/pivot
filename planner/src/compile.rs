@@ -266,13 +266,23 @@ impl PlanNode {
             crate::Operator::Aggregate(o) => {
                 o.compile(inputs.remove(0), self.inputs[0].output_nullability())
             }
-            crate::Operator::OrderBy(o) => o.compile(inputs.remove(0)),
+            crate::Operator::OrderBy(o) => {
+                let normalize_variants = self.inputs[0]
+                    .output_types()?
+                    .iter()
+                    .any(|ty| matches!(ty, crate::types::Type::Variant));
+                o.compile(inputs.remove(0), normalize_variants)
+            }
             crate::Operator::TopN(o) => o.compile(inputs.remove(0), slots),
             crate::Operator::Limit(o) => o.compile(inputs.remove(0)),
             crate::Operator::Join(o) => {
+                let normalize_build_variants = self.inputs[1]
+                    .output_types()?
+                    .iter()
+                    .any(|ty| matches!(ty, crate::types::Type::Variant));
                 let probe = inputs.remove(0);
                 let build = inputs.remove(0);
-                o.compile(probe, build)
+                o.compile(probe, build, normalize_build_variants)
             }
             crate::Operator::Cte(o) => {
                 let definition = inputs.remove(0);

@@ -19,8 +19,10 @@
 //! ## Gathering
 //!
 //! As in `order_by_limit`, each worker funnels its buffer over an mpsc channel
-//! to the single worker holding the receiver; that receiver worker concatenates,
-//! skips `offset`, and emits `limit` rows. Because every worker caps its own
+//! to the single worker holding the receiver; that receiver worker skips
+//! `offset` rows and emits `limit` rows, slicing across the gathered batches
+//! (never concatenating them: a variant column's physical layout differs per
+//! file, so its batches routinely cannot be merged). Because every worker caps its own
 //! buffer at `fetch` and we count *buffered* (not merely seen) rows, the
 //! receiver worker is guaranteed to hold at least `fetch` rows by the time
 //! `reached` latches, so it never has to block waiting on a straggler.
@@ -30,7 +32,6 @@ use crate::operations::unary;
 use crate::operations::unary::factory::UnaryFactory;
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
 use crate::waker::waker_set;
-use arrow::compute::concat_batches;
 use arrow_array::RecordBatch;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -172,7 +173,8 @@ impl Consumer<RecordBatch, RecordBatch> for Limit {
 }
 
 /// Output phase: the receiver worker collects every worker's buffer, then
-/// concatenates and applies `OFFSET`/`LIMIT` once all senders have disconnected.
+/// applies `OFFSET`/`LIMIT` across the batches once all senders have
+/// disconnected.
 pub struct LimitOutputter {
     rx: Receiver<RecordBatch>,
     batches: Vec<RecordBatch>,
@@ -189,14 +191,25 @@ impl Outputter<RecordBatch> for LimitOutputter {
             }
             Err(TryRecvError::Empty) => Ok(false),
             Err(TryRecvError::Disconnected) => {
-                if !self.batches.is_empty() {
-                    let schema = self.batches[0].schema();
-                    let merged = concat_batches(&schema, &self.batches)?;
-                    // No ORDER BY, so any `limit` rows past `offset` satisfy the
-                    // query. Both bounds are clamped to what we actually have.
-                    let start = self.offset.min(merged.num_rows());
-                    let len = self.limit.min(merged.num_rows() - start);
-                    sender.send(merged.slice(start, len))?;
+                // No ORDER BY, so any `limit` rows past `offset` satisfy the
+                // query. Emit them by slicing across the collected batches
+                // rather than concatenating: a variant column's physical
+                // layout differs per file (each shreds independently), so its
+                // batches routinely cannot be concatenated into one array.
+                let mut skip = self.offset;
+                let mut remaining = self.limit;
+                for batch in &self.batches {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if skip >= batch.num_rows() {
+                        skip -= batch.num_rows();
+                        continue;
+                    }
+                    let len = (batch.num_rows() - skip).min(remaining);
+                    sender.send(batch.slice(skip, len))?;
+                    skip = 0;
+                    remaining -= len;
                 }
                 Ok(true)
             }

@@ -313,6 +313,15 @@ impl<
         sender: &mut dyn Sender<RecordBatch>,
         _io: &mut crate::io::OperatorIO,
     ) -> unary::Result<()> {
+        // The accumulators must hold this batch's physical types before any of
+        // its rows are appended (see the `ProbeMatchOutputter` docs). The build
+        // schema settles once from the rows the build phase published; the
+        // probe schema follows the batch about to be probed.
+        self.match_outputter.set_build_schema_from_rows();
+        let probe_schema = batch.project(&self.spec.probe_output_indices)?.schema();
+        self.match_outputter
+            .switch_probe_schema(&probe_schema, sender)?;
+
         let build_rows = unsafe { &*self.table.build_rows.get() };
         if build_rows.is_empty() {
             if MARK {
@@ -374,6 +383,9 @@ impl<
     fn finish(&mut self, sender: &mut dyn Sender<RecordBatch>) -> unary::Result<bool> {
         if !self.probing_done {
             self.probing_done = true;
+            // A worker that consumed no probe batches reaches the unmatched
+            // build scan below with its accumulators still spec-typed.
+            self.match_outputter.set_build_schema_from_rows();
             if self.match_outputter.has_buffered_matches() {
                 self.match_outputter.emit(sender)?;
             }

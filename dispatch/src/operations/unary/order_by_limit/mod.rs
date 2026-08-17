@@ -247,6 +247,10 @@ fn get_top_k_from_top_ks(
         panic!("get_top_k_from_top_ks called with no batches");
     }
 
+    // A variant column arrives with a per-file physical layout, so top-ks from
+    // different files cannot concatenate until their mismatched variant
+    // columns are unshredded. A no-op when the layouts already agree.
+    let batches = crate::arrays::variant::unify_variant_layouts(batches)?;
     let schema = batches[0].schema();
     let final_pool = arrow::compute::concat_batches(&schema, &batches)?;
     debug!("Final pool size: {:?}", final_pool.num_rows());

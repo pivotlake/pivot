@@ -61,7 +61,9 @@ use crate::operations::{
     JoinKey, JoinKind, JoinRecordBatchOperatorFactory, JoinSpec, KeyExtractor, LimitFactory,
     MapFactory, NoOpNullaryFactory, NullaryFactory, NullaryOperatorFactory, OrderBy,
     OrderByFactory, OrderByLimitFactory, PackedKey, RangeJoinSpec, SingleColumnKey, UnaryFactory,
-    UnaryOperatorFactory, WideCell, copy_out, create_join_factories, create_range_join_factories,
+    UnaryOperatorFactory, WideCell, copy_out, create_join_factories,
+    create_normalizing_join_factories, create_normalizing_order_by_factories,
+    create_range_join_factories,
 };
 use crate::{DataFlowDispatcher, DataFlowHandle, DataFlowStats};
 pub const RECORD_BATCH_SIZE: usize = 8192;
@@ -603,6 +605,78 @@ impl RecordBatchOperatorSpec {
         result
     }
 
+    /// Full ORDER BY with the optional variant-layout normalization breaker
+    /// inserted between the worker-local sorters and the ordinary run merger.
+    pub fn order_by_normalizing(self, order_by: Vec<OrderBy>) -> Self {
+        let topology = self.dispatcher.topology();
+        let worker_count = self.worker_count();
+        let collector_worker = self.dispatcher.next_worker();
+        let (sorters, collectors) =
+            create_normalizing_order_by_factories(order_by, topology, collector_worker);
+        let input_siblings = Arc::new(AtomicUsize::new(worker_count));
+        let collector_siblings = Arc::new(AtomicUsize::new(worker_count));
+        let group_channels = to_single_worker_mpsc(worker_count, collector_worker);
+
+        let factories = if self.stream_ordered {
+            let input_worker = self.dispatcher.next_worker();
+            let input_channels = to_single_worker_mpsc::<RecordBatch>(worker_count, input_worker);
+            self.factories
+                .into_iter()
+                .zip(sorters)
+                .zip(collectors)
+                .zip(input_channels)
+                .zip(group_channels)
+                .map(
+                    |((((head, sorter), collector), input_channel), group_channel)| {
+                        let sorter = UnaryOperatorFactory::new(
+                            head,
+                            sorter,
+                            input_channel,
+                            input_siblings.clone(),
+                        );
+                        Box::new(UnaryOperatorFactory::new(
+                            sorter,
+                            collector,
+                            group_channel,
+                            collector_siblings.clone(),
+                        )) as Box<dyn OperatorFactory<RecordBatch>>
+                    },
+                )
+                .collect()
+        } else {
+            let input_channels = stealable::<RecordBatch>(topology);
+            self.factories
+                .into_iter()
+                .zip(sorters)
+                .zip(collectors)
+                .zip(input_channels)
+                .zip(group_channels)
+                .map(
+                    |((((head, sorter), collector), input_channel), group_channel)| {
+                        let sorter = UnaryOperatorFactory::new(
+                            head,
+                            sorter,
+                            input_channel,
+                            input_siblings.clone(),
+                        );
+                        Box::new(UnaryOperatorFactory::new(
+                            sorter,
+                            collector,
+                            group_channel,
+                            collector_siblings.clone(),
+                        )) as Box<dyn OperatorFactory<RecordBatch>>
+                    },
+                )
+                .collect()
+        };
+
+        Self {
+            dispatcher: self.dispatcher,
+            factories,
+            stream_ordered: true,
+        }
+    }
+
     /// SQL `LIMIT … OFFSET …` with no ORDER BY: keep `limit` rows after skipping
     /// the first `offset`, in arbitrary (input) order.
     ///
@@ -695,6 +769,29 @@ impl RecordBatchOperatorSpec {
         key_types: &[DataType],
         spec: JoinSpec,
     ) -> Self {
+        self.join_with_optional_normalizer(build, key_types, spec, false)
+    }
+
+    /// Hash join variant of [`join`](Self::join) that inserts the reusable
+    /// batch-group normalizer on the build side. Callers should select this
+    /// only when the build schema contains variant columns; variant-free joins
+    /// retain the direct one-breaker build path.
+    pub fn join_normalizing_build(
+        self,
+        build: RecordBatchOperatorSpec,
+        key_types: &[DataType],
+        spec: JoinSpec,
+    ) -> Self {
+        self.join_with_optional_normalizer(build, key_types, spec, true)
+    }
+
+    fn join_with_optional_normalizer(
+        self,
+        build: RecordBatchOperatorSpec,
+        key_types: &[DataType],
+        spec: JoinSpec,
+        normalize_build: bool,
+    ) -> Self {
         use arrow_array::types as t;
         use arrow_schema::TimeUnit;
         assert_eq!(
@@ -722,106 +819,163 @@ impl RecordBatchOperatorSpec {
         // PackedKey tuple; the impls already exist for every arity.
         match key_types {
             [DataType::Int32, DataType::Int32] => {
-                return self.join_dispatch::<PackedKey<(t::Int32Type, t::Int32Type)>>(build, spec);
+                return self.join_dispatch::<PackedKey<(t::Int32Type, t::Int32Type)>>(
+                    build,
+                    spec,
+                    normalize_build,
+                );
             }
             [DataType::Int32, DataType::Int64] => {
-                return self.join_dispatch::<PackedKey<(t::Int32Type, t::Int64Type)>>(build, spec);
+                return self.join_dispatch::<PackedKey<(t::Int32Type, t::Int64Type)>>(
+                    build,
+                    spec,
+                    normalize_build,
+                );
             }
             [DataType::Int64, DataType::Int32] => {
-                return self.join_dispatch::<PackedKey<(t::Int64Type, t::Int32Type)>>(build, spec);
+                return self.join_dispatch::<PackedKey<(t::Int64Type, t::Int32Type)>>(
+                    build,
+                    spec,
+                    normalize_build,
+                );
             }
             [DataType::Int64, DataType::Int64] => {
-                return self.join_dispatch::<PackedKey<(t::Int64Type, t::Int64Type)>>(build, spec);
+                return self.join_dispatch::<PackedKey<(t::Int64Type, t::Int64Type)>>(
+                    build,
+                    spec,
+                    normalize_build,
+                );
             }
             _ => {}
         }
         // Every shape without a compiled instantiation: 3+ keys, mixed types,
         // strings. Hash-stored with per-candidate verification.
         let [key_type] = key_types else {
-            return self.join_dispatch::<DynamicRowKey>(build, spec);
+            return self.join_dispatch::<DynamicRowKey>(build, spec, normalize_build);
         };
         match key_type {
-            DataType::Int8 => self.join_dispatch::<SingleColumnKey<t::Int8Type>>(build, spec),
-            DataType::Int16 => self.join_dispatch::<SingleColumnKey<t::Int16Type>>(build, spec),
-            DataType::Int32 => self.join_dispatch::<SingleColumnKey<t::Int32Type>>(build, spec),
-            DataType::Int64 => self.join_dispatch::<SingleColumnKey<t::Int64Type>>(build, spec),
-            DataType::UInt8 => self.join_dispatch::<SingleColumnKey<t::UInt8Type>>(build, spec),
-            DataType::UInt16 => self.join_dispatch::<SingleColumnKey<t::UInt16Type>>(build, spec),
-            DataType::UInt32 => self.join_dispatch::<SingleColumnKey<t::UInt32Type>>(build, spec),
-            DataType::UInt64 => self.join_dispatch::<SingleColumnKey<t::UInt64Type>>(build, spec),
-            DataType::Date32 => self.join_dispatch::<SingleColumnKey<t::Date32Type>>(build, spec),
-            DataType::Date64 => self.join_dispatch::<SingleColumnKey<t::Date64Type>>(build, spec),
-            DataType::Timestamp(TimeUnit::Second, _) => {
-                self.join_dispatch::<SingleColumnKey<t::TimestampSecondType>>(build, spec)
+            DataType::Int8 => {
+                self.join_dispatch::<SingleColumnKey<t::Int8Type>>(build, spec, normalize_build)
             }
-            DataType::Timestamp(TimeUnit::Millisecond, _) => {
-                self.join_dispatch::<SingleColumnKey<t::TimestampMillisecondType>>(build, spec)
+            DataType::Int16 => {
+                self.join_dispatch::<SingleColumnKey<t::Int16Type>>(build, spec, normalize_build)
             }
-            DataType::Timestamp(TimeUnit::Microsecond, _) => {
-                self.join_dispatch::<SingleColumnKey<t::TimestampMicrosecondType>>(build, spec)
+            DataType::Int32 => {
+                self.join_dispatch::<SingleColumnKey<t::Int32Type>>(build, spec, normalize_build)
             }
-            DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-                self.join_dispatch::<SingleColumnKey<t::TimestampNanosecondType>>(build, spec)
+            DataType::Int64 => {
+                self.join_dispatch::<SingleColumnKey<t::Int64Type>>(build, spec, normalize_build)
             }
-            DataType::Decimal64(_, _) => {
-                self.join_dispatch::<SingleColumnKey<t::Decimal64Type>>(build, spec)
+            DataType::UInt8 => {
+                self.join_dispatch::<SingleColumnKey<t::UInt8Type>>(build, spec, normalize_build)
             }
-            DataType::Decimal128(_, _) => {
-                self.join_dispatch::<SingleColumnKey<t::Decimal128Type>>(build, spec)
+            DataType::UInt16 => {
+                self.join_dispatch::<SingleColumnKey<t::UInt16Type>>(build, spec, normalize_build)
             }
+            DataType::UInt32 => {
+                self.join_dispatch::<SingleColumnKey<t::UInt32Type>>(build, spec, normalize_build)
+            }
+            DataType::UInt64 => {
+                self.join_dispatch::<SingleColumnKey<t::UInt64Type>>(build, spec, normalize_build)
+            }
+            DataType::Date32 => {
+                self.join_dispatch::<SingleColumnKey<t::Date32Type>>(build, spec, normalize_build)
+            }
+            DataType::Date64 => {
+                self.join_dispatch::<SingleColumnKey<t::Date64Type>>(build, spec, normalize_build)
+            }
+            DataType::Timestamp(TimeUnit::Second, _) => self
+                .join_dispatch::<SingleColumnKey<t::TimestampSecondType>>(
+                    build,
+                    spec,
+                    normalize_build,
+                ),
+            DataType::Timestamp(TimeUnit::Millisecond, _) => self.join_dispatch::<SingleColumnKey<
+                t::TimestampMillisecondType,
+            >>(
+                build, spec, normalize_build
+            ),
+            DataType::Timestamp(TimeUnit::Microsecond, _) => self.join_dispatch::<SingleColumnKey<
+                t::TimestampMicrosecondType,
+            >>(
+                build, spec, normalize_build
+            ),
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => self.join_dispatch::<SingleColumnKey<
+                t::TimestampNanosecondType,
+            >>(
+                build, spec, normalize_build
+            ),
+            DataType::Decimal64(_, _) => self.join_dispatch::<SingleColumnKey<t::Decimal64Type>>(
+                build,
+                spec,
+                normalize_build,
+            ),
+            DataType::Decimal128(_, _) => self.join_dispatch::<SingleColumnKey<t::Decimal128Type>>(
+                build,
+                spec,
+                normalize_build,
+            ),
             // A single-column key of any other type (a string) also takes the
             // dynamic shape.
-            _ => self.join_dispatch::<DynamicRowKey>(build, spec),
+            _ => self.join_dispatch::<DynamicRowKey>(build, spec, normalize_build),
         }
     }
 
     /// Pick the kind's instantiation, so the probe's match loop carries no
     /// runtime test for it.
-    fn join_dispatch<K: JoinKey>(self, build: RecordBatchOperatorSpec, spec: JoinSpec) -> Self {
+    fn join_dispatch<K: JoinKey>(
+        self,
+        build: RecordBatchOperatorSpec,
+        spec: JoinSpec,
+        normalize_build: bool,
+    ) -> Self {
         match spec.kind {
-            JoinKind::Inner => self.join_typed::<K, false, false, false, false, false>(build, spec),
+            JoinKind::Inner => self.join_typed::<K, false, false, false, false, false>(
+                build,
+                spec,
+                normalize_build,
+            ),
             JoinKind::BuildOuter => {
-                self.join_typed::<K, true, false, false, false, false>(build, spec)
+                self.join_typed::<K, true, false, false, false, false>(build, spec, normalize_build)
             }
             JoinKind::ProbeOuter => {
-                self.join_typed::<K, false, false, true, false, false>(build, spec)
+                self.join_typed::<K, false, false, true, false, false>(build, spec, normalize_build)
             }
             // With a residual predicate the first key match may not be a real
             // match, so the semi join runs on the pair-recording instantiation
             // and drops duplicate probe rows at drain time instead of exiting
             // the match loop early.
-            JoinKind::ProbeSemi if spec.residual_filters.is_some() => {
-                self.join_typed::<K, false, false, false, false, false>(build, spec)
-            }
+            JoinKind::ProbeSemi if spec.residual_filters.is_some() => self
+                .join_typed::<K, false, false, false, false, false>(build, spec, normalize_build),
             JoinKind::ProbeSemi => {
-                self.join_typed::<K, false, true, false, false, false>(build, spec)
+                self.join_typed::<K, false, true, false, false, false>(build, spec, normalize_build)
             }
             // An anti join runs the probe-side outer join's miss tracking and
             // emits the misses alone. One instantiation serves with and
             // without a residual: the settled flags already classify the rows
             // whose every pair a residual rejects.
             JoinKind::ProbeAnti => {
-                self.join_typed::<K, false, false, true, true, false>(build, spec)
+                self.join_typed::<K, false, false, true, true, false>(build, spec, normalize_build)
             }
             // Likewise on the build side: the outer join's flag array and
             // unmatched scan run unchanged, and only the unmatched build rows
             // come out.
             JoinKind::BuildAnti => {
-                self.join_typed::<K, true, false, false, true, false>(build, spec)
+                self.join_typed::<K, true, false, false, true, false>(build, spec, normalize_build)
             }
             // A build-side semi join is that anti join with the scan's
             // polarity flipped, a runtime byte in the outputter, so it rides
             // the same instantiation: matched pairs only flag their build
             // row, and the scan emits the flagged rows instead.
             JoinKind::BuildSemi => {
-                self.join_typed::<K, true, false, false, true, false>(build, spec)
+                self.join_typed::<K, true, false, false, true, false>(build, spec, normalize_build)
             }
             // A mark join classifies every probe row: the semi join's
             // first-match exit decides the hits, the probe-side miss tracking
             // the misses, and neither is ever a residual question (a mark
             // join carries none).
             JoinKind::ProbeMark => {
-                self.join_typed::<K, false, true, true, false, true>(build, spec)
+                self.join_typed::<K, false, true, true, false, true>(build, spec, normalize_build)
             }
         }
     }
@@ -837,6 +991,7 @@ impl RecordBatchOperatorSpec {
         self,
         build: RecordBatchOperatorSpec,
         spec: JoinSpec,
+        normalize_build: bool,
     ) -> Self {
         let worker_count = self.worker_count();
         assert_eq!(
@@ -851,50 +1006,117 @@ impl RecordBatchOperatorSpec {
             "join inputs must use the same worker pool"
         );
 
-        let (build_factories, probe_factories, build_ready) = create_join_factories::<
-            K,
-            BUILD_OUTER,
-            STOP_AFTER_FIRST_MATCH,
-            TRACK_UNMATCHED_PROBE_ROWS,
-            DISCARD_MATCHED_PAIRS,
-            MARK,
-        >(spec, worker_count);
-
+        let topology = self.dispatcher.topology();
         let (_, build_heads) = build.into_parts();
-        let build_siblings_left = Arc::new(AtomicUsize::new(worker_count));
         let probe_siblings_left = Arc::new(AtomicUsize::new(worker_count));
-        let build_channels = stealable::<RecordBatch>(self.dispatcher.topology());
-        let probe_channels = stealable::<RecordBatch>(self.dispatcher.topology());
-        let factories = self
-            .factories
-            .into_iter()
-            .zip(build_heads)
-            .zip(build_factories)
-            .zip(probe_factories)
-            .zip(build_channels)
-            .zip(probe_channels)
-            .map(
-                |(
-                    (
-                        (((probe_head, build_head), build_factory), probe_factory),
-                        build_channel_factory,
-                    ),
-                    probe_channel_factory,
-                )| {
-                    Box::new(JoinRecordBatchOperatorFactory {
-                        probe_head,
-                        build_head,
-                        build_factory,
-                        probe_factory,
-                        build_channel_factory,
+        let probe_channels = stealable::<RecordBatch>(topology);
+
+        let factories = if normalize_build {
+            let collector_worker = self.dispatcher.next_worker();
+            let (build_factories, collector_factories, probe_factories, build_ready) =
+                create_normalizing_join_factories::<
+                    K,
+                    BUILD_OUTER,
+                    STOP_AFTER_FIRST_MATCH,
+                    TRACK_UNMATCHED_PROBE_ROWS,
+                    DISCARD_MATCHED_PAIRS,
+                    MARK,
+                >(spec, worker_count, collector_worker);
+            let build_siblings_left = Arc::new(AtomicUsize::new(worker_count));
+            let collector_siblings_left = Arc::new(AtomicUsize::new(worker_count));
+            let build_channels = stealable::<RecordBatch>(topology);
+            let group_channels = to_single_worker_mpsc(worker_count, collector_worker);
+
+            self.factories
+                .into_iter()
+                .zip(build_heads)
+                .zip(build_factories)
+                .zip(collector_factories)
+                .zip(probe_factories)
+                .zip(build_channels)
+                .zip(group_channels)
+                .zip(probe_channels)
+                .map(
+                    |(
+                        (
+                            (
+                                (
+                                    (((probe_head, build_head), build_factory), collector_factory),
+                                    probe_factory,
+                                ),
+                                build_channel,
+                            ),
+                            group_channel,
+                        ),
                         probe_channel_factory,
-                        build_siblings_left: build_siblings_left.clone(),
-                        probe_siblings_left: probe_siblings_left.clone(),
-                        build_ready: build_ready.clone(),
-                    }) as Box<dyn OperatorFactory<RecordBatch>>
-                },
-            )
-            .collect();
+                    )| {
+                        let first_breaker = UnaryOperatorFactory::new(
+                            build_head,
+                            build_factory,
+                            build_channel,
+                            build_siblings_left.clone(),
+                        );
+                        let build_graph = Box::new(UnaryOperatorFactory::new(
+                            first_breaker,
+                            collector_factory,
+                            group_channel,
+                            collector_siblings_left.clone(),
+                        ))
+                            as Box<dyn OperatorFactory<()>>;
+                        Box::new(JoinRecordBatchOperatorFactory {
+                            probe_head,
+                            build_graph,
+                            probe_factory,
+                            probe_channel_factory,
+                            probe_siblings_left: probe_siblings_left.clone(),
+                            build_ready: build_ready.clone(),
+                        }) as Box<dyn OperatorFactory<RecordBatch>>
+                    },
+                )
+                .collect()
+        } else {
+            let (build_factories, probe_factories, build_ready) = create_join_factories::<
+                K,
+                BUILD_OUTER,
+                STOP_AFTER_FIRST_MATCH,
+                TRACK_UNMATCHED_PROBE_ROWS,
+                DISCARD_MATCHED_PAIRS,
+                MARK,
+            >(spec, worker_count);
+            let build_siblings_left = Arc::new(AtomicUsize::new(worker_count));
+            let build_channels = stealable::<RecordBatch>(topology);
+
+            self.factories
+                .into_iter()
+                .zip(build_heads)
+                .zip(build_factories)
+                .zip(probe_factories)
+                .zip(build_channels)
+                .zip(probe_channels)
+                .map(
+                    |(
+                        ((((probe_head, build_head), build_factory), probe_factory), build_channel),
+                        probe_channel_factory,
+                    )| {
+                        let build_graph = Box::new(UnaryOperatorFactory::new(
+                            build_head,
+                            build_factory,
+                            build_channel,
+                            build_siblings_left.clone(),
+                        ))
+                            as Box<dyn OperatorFactory<()>>;
+                        Box::new(JoinRecordBatchOperatorFactory {
+                            probe_head,
+                            build_graph,
+                            probe_factory,
+                            probe_channel_factory,
+                            probe_siblings_left: probe_siblings_left.clone(),
+                            build_ready: build_ready.clone(),
+                        }) as Box<dyn OperatorFactory<RecordBatch>>
+                    },
+                )
+                .collect()
+        };
 
         Self {
             dispatcher: self.dispatcher,
@@ -918,39 +1140,78 @@ impl RecordBatchOperatorSpec {
         key_type: &DataType,
         spec: RangeJoinSpec,
     ) -> Self {
+        self.range_join_with_optional_normalizer(build, key_type, spec, false)
+    }
+
+    /// Range join whose build-side ORDER BY uses the variant normalization
+    /// composition before publishing its sorted chunks.
+    pub fn range_join_normalizing_build(
+        self,
+        build: RecordBatchOperatorSpec,
+        key_type: &DataType,
+        spec: RangeJoinSpec,
+    ) -> Self {
+        self.range_join_with_optional_normalizer(build, key_type, spec, true)
+    }
+
+    fn range_join_with_optional_normalizer(
+        self,
+        build: RecordBatchOperatorSpec,
+        key_type: &DataType,
+        spec: RangeJoinSpec,
+        normalize_build: bool,
+    ) -> Self {
         use arrow_array::types as t;
         use arrow_schema::TimeUnit;
         match key_type {
-            DataType::Int8 => self.range_join_typed::<t::Int8Type>(build, spec),
-            DataType::Int16 => self.range_join_typed::<t::Int16Type>(build, spec),
-            DataType::Int32 => self.range_join_typed::<t::Int32Type>(build, spec),
-            DataType::Int64 => self.range_join_typed::<t::Int64Type>(build, spec),
-            DataType::UInt8 => self.range_join_typed::<t::UInt8Type>(build, spec),
-            DataType::UInt16 => self.range_join_typed::<t::UInt16Type>(build, spec),
-            DataType::UInt32 => self.range_join_typed::<t::UInt32Type>(build, spec),
-            DataType::UInt64 => self.range_join_typed::<t::UInt64Type>(build, spec),
+            DataType::Int8 => self.range_join_typed::<t::Int8Type>(build, spec, normalize_build),
+            DataType::Int16 => self.range_join_typed::<t::Int16Type>(build, spec, normalize_build),
+            DataType::Int32 => self.range_join_typed::<t::Int32Type>(build, spec, normalize_build),
+            DataType::Int64 => self.range_join_typed::<t::Int64Type>(build, spec, normalize_build),
+            DataType::UInt8 => self.range_join_typed::<t::UInt8Type>(build, spec, normalize_build),
+            DataType::UInt16 => {
+                self.range_join_typed::<t::UInt16Type>(build, spec, normalize_build)
+            }
+            DataType::UInt32 => {
+                self.range_join_typed::<t::UInt32Type>(build, spec, normalize_build)
+            }
+            DataType::UInt64 => {
+                self.range_join_typed::<t::UInt64Type>(build, spec, normalize_build)
+            }
             // Floats compare by IEEE totalOrder end to end: the build sort's
             // row encoding and `ArrowNativeTypeOp::compare` agree on it, and
             // NaN sorting greatest matches SQL's comparison semantics for
             // every NaN arithmetic produces.
-            DataType::Float32 => self.range_join_typed::<t::Float32Type>(build, spec),
-            DataType::Float64 => self.range_join_typed::<t::Float64Type>(build, spec),
-            DataType::Date32 => self.range_join_typed::<t::Date32Type>(build, spec),
-            DataType::Date64 => self.range_join_typed::<t::Date64Type>(build, spec),
+            DataType::Float32 => {
+                self.range_join_typed::<t::Float32Type>(build, spec, normalize_build)
+            }
+            DataType::Float64 => {
+                self.range_join_typed::<t::Float64Type>(build, spec, normalize_build)
+            }
+            DataType::Date32 => {
+                self.range_join_typed::<t::Date32Type>(build, spec, normalize_build)
+            }
+            DataType::Date64 => {
+                self.range_join_typed::<t::Date64Type>(build, spec, normalize_build)
+            }
             DataType::Timestamp(TimeUnit::Second, _) => {
-                self.range_join_typed::<t::TimestampSecondType>(build, spec)
+                self.range_join_typed::<t::TimestampSecondType>(build, spec, normalize_build)
             }
             DataType::Timestamp(TimeUnit::Millisecond, _) => {
-                self.range_join_typed::<t::TimestampMillisecondType>(build, spec)
+                self.range_join_typed::<t::TimestampMillisecondType>(build, spec, normalize_build)
             }
             DataType::Timestamp(TimeUnit::Microsecond, _) => {
-                self.range_join_typed::<t::TimestampMicrosecondType>(build, spec)
+                self.range_join_typed::<t::TimestampMicrosecondType>(build, spec, normalize_build)
             }
             DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-                self.range_join_typed::<t::TimestampNanosecondType>(build, spec)
+                self.range_join_typed::<t::TimestampNanosecondType>(build, spec, normalize_build)
             }
-            DataType::Decimal64(_, _) => self.range_join_typed::<t::Decimal64Type>(build, spec),
-            DataType::Decimal128(_, _) => self.range_join_typed::<t::Decimal128Type>(build, spec),
+            DataType::Decimal64(_, _) => {
+                self.range_join_typed::<t::Decimal64Type>(build, spec, normalize_build)
+            }
+            DataType::Decimal128(_, _) => {
+                self.range_join_typed::<t::Decimal128Type>(build, spec, normalize_build)
+            }
             other => panic!("range join key type {other:?} is unsupported"),
         }
     }
@@ -959,6 +1220,7 @@ impl RecordBatchOperatorSpec {
         self,
         build: RecordBatchOperatorSpec,
         spec: RangeJoinSpec,
+        normalize_build: bool,
     ) -> Self
     where
         T::Native: ArrowNativeTypeOp + Send,
@@ -981,7 +1243,12 @@ impl RecordBatchOperatorSpec {
         // whose consumer receives them in the order the sort emitted them.
         // Successive single-consumer stages take turns hosting that work.
         let target = self.dispatcher.next_worker();
-        let build = build.order_by(vec![OrderBy::new(spec.build_key_index, false, false)]);
+        let order = vec![OrderBy::new(spec.build_key_index, false, false)];
+        let build = if normalize_build {
+            build.order_by_normalizing(order)
+        } else {
+            build.order_by(order)
+        };
 
         let (build_factories, probe_factories, build_ready) =
             create_range_join_factories::<T>(spec, worker_count, target);
@@ -1007,14 +1274,17 @@ impl RecordBatchOperatorSpec {
                     ),
                     probe_channel_factory,
                 )| {
-                    Box::new(JoinRecordBatchOperatorFactory {
-                        probe_head,
+                    let build_graph = Box::new(UnaryOperatorFactory::new(
                         build_head,
                         build_factory,
-                        probe_factory,
                         build_channel_factory,
+                        build_siblings_left.clone(),
+                    )) as Box<dyn OperatorFactory<()>>;
+                    Box::new(JoinRecordBatchOperatorFactory {
+                        probe_head,
+                        build_graph,
+                        probe_factory,
                         probe_channel_factory,
-                        build_siblings_left: build_siblings_left.clone(),
                         probe_siblings_left: probe_siblings_left.clone(),
                         build_ready: build_ready.clone(),
                     }) as Box<dyn OperatorFactory<RecordBatch>>

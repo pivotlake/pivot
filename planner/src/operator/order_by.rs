@@ -77,6 +77,7 @@ impl OrderBy {
     pub(crate) fn compile(
         &self,
         input: RecordBatchOperatorSpec,
+        normalize_variants: bool,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let orders = self
             .order_bys
@@ -90,6 +91,10 @@ impl OrderBy {
                 Ok(DispatchOrderBy::new(col, descending, false))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(input.order_by(orders))
+        Ok(if normalize_variants {
+            input.order_by_normalizing(orders)
+        } else {
+            input.order_by(orders)
+        })
     }
 }

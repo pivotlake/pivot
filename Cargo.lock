@@ -1773,6 +1773,7 @@ dependencies = [
  "libc",
  "memchr",
  "nix",
+ "parquet-variant-compute",
  "rand 0.10.2",
  "rcgen",
  "rustls",

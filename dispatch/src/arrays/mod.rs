@@ -164,6 +164,7 @@ impl<T: ArrowPrimitiveType> ArrayBuilder for PrimitiveBuilder<T> {
 pub mod accumulator;
 mod int_bits;
 pub mod take;
+pub mod variant;
 pub use int_bits::IntBits;
 
 /// Hand a slab's first `byte_len` bytes to Arrow as a zero-copy [`Buffer`].

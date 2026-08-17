@@ -138,6 +138,12 @@ where
         if batch.num_rows() == 0 || self.saw_null_tail {
             return Ok(());
         }
+        // Matches gather build rows across the stored chunks: a variant
+        // column's per-file layouts must agree before rows are spliced, or a
+        // shredded row lands under another file's layout and silently loses
+        // its typed leaves.
+        let batch =
+            crate::arrays::variant::unshred_batch_variants(batch).map_err(unary::Error::from)?;
 
         let keys = batch.column(self.spec.build_key_index).as_primitive::<T>();
         let non_null = keys.len() - keys.null_count();
