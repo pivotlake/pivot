@@ -4,7 +4,7 @@ use super::slot_for;
 use crate::catalog::{BoundTable, DynamicScanPredicate};
 use crate::compile::{DynamicFilterSlots, Error};
 use crate::dynamic_filter::DynamicFilter;
-use crate::expression::{Expression, Function, Ref, VariantGet};
+use crate::expression::{Expression, Function, Ref, VariantGet, VariantOutput};
 use crate::operator::Projection;
 use crate::types::{Type, physical_arrow_type};
 use dispatch::{
@@ -89,11 +89,20 @@ impl Input {
                     };
                     // A cast pushes a typed scalar read; a bare extract (no
                     // cast) pushes a sub-variant read. The scan resolves either
-                    // against each file's shredding.
+                    // against each file's shredding. A text read never lands in
+                    // a scan's columns (only `->` chains and fused casts are
+                    // pushed down), so it is rejected like any other expression.
+                    let as_type = match &vg.output {
+                        VariantOutput::SubVariant => None,
+                        VariantOutput::Typed(target) => Some(physical_arrow_type(target)),
+                        VariantOutput::Text => {
+                            return Err(Error::UnexpectedInputExpression(expr.clone()));
+                        }
+                    };
                     column_indices.push(r.column_idx);
                     extracts.push(Some(VariantExtract {
                         path: vg.path.clone(),
-                        as_type: vg.as_type.as_ref().map(physical_arrow_type),
+                        as_type,
                     }));
                     above_scan.push((r.return_type.clone(), Some(vg)));
                 }
@@ -141,7 +150,7 @@ impl Input {
                     Some(vg) => Expression::Function(Function::VariantGet(VariantGet {
                         input: Box::new(column),
                         path: vg.path.clone(),
-                        as_type: vg.as_type.clone(),
+                        output: vg.output.clone(),
                     })),
                 }
             })

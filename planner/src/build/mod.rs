@@ -29,6 +29,7 @@ use duckdb_planner::handle::{
 use crate::catalog::BoundTable;
 use crate::expression::{
     Cast, Compare, CompareType, Error as ExpressionError, Expression, Function, Ref, VariantGet,
+    VariantOutput,
 };
 use crate::operator::{
     Aggregate, Compact, CopyFromStdin, CreateSchema, CreateTable, CreateUser, Cte, CteScan,
@@ -881,9 +882,9 @@ fn build_scan_columns(
             // column so the reader resolves the path to a single shredded leaf
             // instead of materializing the whole variant. A `VARIANT` output is
             // a bare extraction (the sub-variant); any other type is a typed read.
-            let as_type = match return_type {
-                Type::Variant => None,
-                typed => Some(typed),
+            let output = match return_type {
+                Type::Variant => VariantOutput::SubVariant,
+                typed => VariantOutput::Typed(typed),
             };
             Ok(Expression::Function(Function::VariantGet(VariantGet {
                 input: Box::new(Expression::Ref(Ref {
@@ -892,7 +893,7 @@ fn build_scan_columns(
                     name: None,
                 })),
                 path,
-                as_type,
+                output,
             })))
         })
         .collect()

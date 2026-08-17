@@ -25,7 +25,7 @@ use crate::expression::{
     ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide, Error,
     Expression, FormatBytes, Function, InList, IntervalArithmetic, IsNull, Length, Like,
     MaybeError, NormalizedInterval, Not, Now, NumericAggregate, Prefix, Ref, RegexpFullMatch,
-    RegexpJitReplace, RegexpReplace, Substring, Suffix, TemporalConvert, VariantGet,
+    RegexpJitReplace, RegexpReplace, Substring, Suffix, TemporalConvert, VariantGet, VariantOutput,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
 
@@ -214,7 +214,7 @@ impl Cast {
             return Ok(Expression::Function(Function::VariantGet(VariantGet {
                 input: Box::new(input),
                 path,
-                as_type: Some(target),
+                output: VariantOutput::Typed(target),
             })));
         }
 
@@ -235,7 +235,9 @@ impl Cast {
 /// over a variant column).
 fn collapse_extractions(e: Expression) -> (Expression, Vec<String>) {
     match e {
-        Expression::Function(Function::VariantGet(extraction)) if extraction.as_type.is_none() => {
+        Expression::Function(Function::VariantGet(extraction))
+            if matches!(extraction.output, VariantOutput::SubVariant) =>
+        {
             let (input, mut path) = collapse_extractions(*extraction.input);
             path.extend(extraction.path);
             (input, path)
@@ -382,6 +384,10 @@ impl Function {
             "variant_extract" | "json_extract" => {
                 Ok(Function::VariantGet(VariantGet::from_handle(func)?))
             }
+            // PostgreSQL's `->>`: extract the field and render the value as
+            // text. DuckDB keeps the operator's own spelling as the function
+            // name, which resolves against pivot's registry.
+            "->>" => Ok(Function::VariantGet(VariantGet::text_from_handle(func)?)),
             "drop_cache" => {
                 function_args(func, 0)?;
                 Ok(Function::DropCache)
@@ -422,7 +428,21 @@ impl VariantGet {
         Ok(VariantGet {
             input: Box::new(Expression::from_handle(params[0])?),
             path: vec![field],
-            as_type: None,
+            output: VariantOutput::SubVariant,
+        })
+    }
+
+    /// A `doc->>'key'`: the extracted value rendered as text, PostgreSQL
+    /// style. A bare `->` chain underneath fuses into the same read.
+    pub(crate) fn text_from_handle(func: FunctionHandle<'_>) -> Result<VariantGet, Error> {
+        let params = function_args(func, 2)?;
+        let field = constant_string(Expression::from_handle(params[1])?)?;
+        let (input, mut path) = collapse_extractions(Expression::from_handle(params[0])?);
+        path.push(field);
+        Ok(VariantGet {
+            input: Box::new(input),
+            path,
+            output: VariantOutput::Text,
         })
     }
 }

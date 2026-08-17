@@ -70,6 +70,30 @@ fn casts_a_shredded_path_from_parquet(mut testing_planner: TestingPlanner) {
     assert_eq!(got, vec![None, Some(30)]);
 }
 
+/// `->>` reads the value as text whether or not the file shreds the path:
+/// numbers render as their JSON text, strings come out bare.
+#[rstest]
+fn double_arrow_reads_text_from_a_shredded_file(mut testing_planner: TestingPlanner) {
+    shredded_docs_table(
+        &mut testing_planner,
+        vec![r#"{"age":30}"#, r#"{"name":"bob"}"#],
+        "age",
+        &DataType::Int64,
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT d->>'age' AS a, d->>'name' AS n FROM docs",
+    );
+
+    let mut got: Vec<(Option<&str>, Option<&str>)> = rows
+        .iter()
+        .map(|r| (r["a"].as_str(), r["n"].as_str()))
+        .collect();
+    got.sort();
+    assert_eq!(got, vec![(None, Some("bob")), (Some("30"), None)]);
+}
+
 /// A single-column `docs(d)` batch holding `rows`, shredding `path` into a
 /// typed leaf when given.
 fn docs_batch_shredded_as(rows: Vec<&str>, shred: Option<(&str, &DataType)>) -> RecordBatch {

@@ -29,7 +29,7 @@ use planner::catalog::{
     SchemaQualifiedTableName,
 };
 use planner::expression::{
-    Compare, CompareType, Expression, Function, Ref, TableFilter, VariantGet,
+    Compare, CompareType, Expression, Function, Ref, TableFilter, VariantGet, VariantOutput,
 };
 use planner::types::Type;
 
@@ -1868,7 +1868,7 @@ fn variant_filter(path: &[&str], cmp: CompareType, value: i64) -> TableFilter {
                 name: None,
             })),
             path: path.iter().map(|s| s.to_string()).collect(),
-            as_type: Some(Type::Int64),
+            output: VariantOutput::Typed(Type::Int64),
         }))),
         right: Box::new(Expression::Constant(constant)),
         compare_type: cmp,

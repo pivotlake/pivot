@@ -18,7 +18,9 @@ use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Error as CatalogError, Result as CatalogResult,
     TableReference, TableRevision,
 };
-use planner::expression::{CompareType, Expression, Function, JsonPath, TableFilter};
+use planner::expression::{
+    CompareType, Expression, Function, JsonPath, TableFilter, VariantOutput,
+};
 
 use super::CatalogTable;
 use super::insert_sink::{UploadedFile, build_insert_spec};
@@ -71,7 +73,9 @@ impl PushedPredicate {
 fn get_prunable_column_and_json_path(expr: &Expression) -> Option<(usize, JsonPath)> {
     match expr {
         Expression::Ref(r) => Some((r.column_idx, Vec::new())),
-        Expression::Function(Function::VariantGet(read)) if read.as_type.is_some() => {
+        Expression::Function(Function::VariantGet(read))
+            if matches!(read.output, VariantOutput::Typed(_)) =>
+        {
             match read.input.as_ref() {
                 Expression::Ref(r) => Some((r.column_idx, read.path.clone())),
                 _ => None,

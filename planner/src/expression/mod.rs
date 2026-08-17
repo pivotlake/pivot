@@ -70,7 +70,7 @@ pub use regexp::{RegexpFullMatch, RegexpReplace};
 pub use regexp_jit::RegexpJitReplace;
 pub use substring::Substring;
 pub use suffix::Suffix;
-pub use variant_get::{JsonPath, VariantGet};
+pub use variant_get::{JsonPath, VariantGet, VariantOutput};
 
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::types::{self, Type};

@@ -1,15 +1,18 @@
 //! Reads paths from variant columns.
 //!
 //! A bare `->` returns a sub-variant. A cast turns the full path into one typed
-//! [`VariantGet`], which can read a shredded leaf directly.
+//! [`VariantGet`], which can read a shredded leaf directly. `->>` renders the
+//! value at the path as text, the way PostgreSQL defines the operator.
 
 use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use crate::types::{Type, physical_arrow_type};
-use arrow_array::RecordBatch;
+use arrow_array::builder::StringViewBuilder;
+use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{Field, FieldRef};
-use parquet_variant::{VariantPath, VariantPathElement};
-use parquet_variant_compute::{GetOptions, variant_get};
+use parquet_variant::{Variant, VariantPath, VariantPathElement};
+use parquet_variant_compute::{GetOptions, VariantArray, unshred_variant, variant_get};
+use parquet_variant_json::VariantToJson as ToJson;
 use std::fmt::{self, Display};
 use std::sync::Arc;
 
@@ -18,19 +21,35 @@ use std::sync::Arc;
 /// document.
 pub type JsonPath = Vec<String>;
 
-/// A variant path read, optionally converted to a concrete type.
+/// What a [`VariantGet`] yields for the value at its path.
+#[derive(Debug, Clone)]
+pub enum VariantOutput {
+    /// The sub-variant itself (a bare `->` chain).
+    SubVariant,
+    /// The value read as a concrete type (a `CAST` fused over the path).
+    Typed(Type),
+    /// The value rendered as text, following PostgreSQL's `->>`: a string
+    /// comes out bare (no quotes), any other value as its JSON text, and a
+    /// JSON null as SQL NULL.
+    Text,
+}
+
+/// A variant path read, yielding the sub-variant, a concrete type, or text.
 #[derive(Debug, Clone)]
 pub struct VariantGet {
     pub input: Box<Expression>,
     pub path: JsonPath,
-    pub as_type: Option<Type>,
+    pub output: VariantOutput,
 }
 
 impl VariantGet {
-    /// The pivot type the read yields: the cast's target for a typed read, the
-    /// sub-variant otherwise.
+    /// The pivot type the read yields.
     pub fn result_type(&self) -> Type {
-        self.as_type.clone().unwrap_or(Type::Variant)
+        match &self.output {
+            VariantOutput::SubVariant => Type::Variant,
+            VariantOutput::Typed(target) => target.clone(),
+            VariantOutput::Text => Type::Utf8,
+        }
     }
 
     /// Returns whether a variant can be read as `t`.
@@ -41,16 +60,20 @@ impl VariantGet {
     pub fn compile(&self) -> Result<ExprFn, compile::Error> {
         let input_builder = self.input.compile()?;
         let segments: Arc<[String]> = self.path.clone().into();
+        let output = self.output.clone();
         // A typed read asks the kernel directly for the pivot type's physical
-        // arrow column.
-        let as_field: Option<FieldRef> = self
-            .as_type
-            .as_ref()
-            .map(|ty| Arc::new(Field::new("item", physical_arrow_type(ty), true)));
+        // arrow column; the other outputs read the sub-variant.
+        let as_field: Option<FieldRef> = match &self.output {
+            VariantOutput::Typed(ty) => {
+                Some(Arc::new(Field::new("item", physical_arrow_type(ty), true)))
+            }
+            VariantOutput::SubVariant | VariantOutput::Text => None,
+        };
         Ok(Box::new(move || {
             let mut input_expr = input_builder();
             let segments = segments.clone();
             let as_field = as_field.clone();
+            let output = output.clone();
             Box::new(move |batch: &RecordBatch| {
                 let input = input_expr(batch);
                 let variant = match &input {
@@ -73,20 +96,76 @@ impl VariantGet {
                 let array = variant_get(&variant, options).unwrap_or_else(|e| {
                     panic!("variant path extraction failed (corrupt variant data?): {e}")
                 });
+                let array = match output {
+                    VariantOutput::SubVariant | VariantOutput::Typed(_) => array,
+                    VariantOutput::Text => render_variant_text(&array),
+                };
                 ExprResult::Array(array)
             }) as ExprEvalFn
         }))
     }
 }
 
+/// Render each variant value as PostgreSQL's `->>` does: a string comes out
+/// bare, any other value as its JSON text, and a JSON null (like a missing
+/// path) as SQL NULL.
+fn render_variant_text(array: &ArrayRef) -> ArrayRef {
+    let variant = VariantArray::try_new(array).expect("a variant-typed input is a variant struct");
+    // Row-wise reads can't reassemble a shredded OBJECT from its typed leaves,
+    // so fold any typed leaves back into the binary value column first. A
+    // no-op for unshredded input.
+    let variant =
+        unshred_variant(&variant).expect("shredded variant folds back to its binary form");
+
+    let mut text_column = StringViewBuilder::with_capacity(variant.len());
+    // One buffer reused across rows for the JSON-rendered values.
+    let mut json_text = Vec::new();
+    for row in 0..variant.len() {
+        if variant.is_null(row) {
+            text_column.append_null();
+            continue;
+        }
+        // The failures below are data-dependent (a corrupt variant blob);
+        // compiled expressions have no error channel, so the dataflow catches
+        // the panic and fails the query.
+        let value = variant
+            .try_value(row)
+            .unwrap_or_else(|e| panic!("corrupt variant value at row {row}: {e}"));
+        if matches!(value, Variant::Null) {
+            text_column.append_null();
+            continue;
+        }
+        match value.as_string() {
+            Some(text) => text_column.append_value(text),
+            None => {
+                json_text.clear();
+                value
+                    .to_json(&mut json_text)
+                    .unwrap_or_else(|e| panic!("variant value failed to render as JSON: {e}"));
+                text_column
+                    .append_value(std::str::from_utf8(&json_text).expect("JSON output is UTF-8"));
+            }
+        }
+    }
+    Arc::new(text_column.finish())
+}
+
 impl Display for VariantGet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "({}", self.input)?;
-        for segment in &self.path {
+        // A text read spells its last step `->>`, the operator it came from.
+        let (text_leaf, chain) = match (&self.output, self.path.split_last()) {
+            (VariantOutput::Text, Some((last, front))) => (Some(last), front),
+            _ => (None, self.path.as_slice()),
+        };
+        for segment in chain {
             write!(f, "->'{segment}'")?;
         }
+        if let Some(segment) = text_leaf {
+            write!(f, "->>'{segment}'")?;
+        }
         write!(f, ")")?;
-        if let Some(ty) = &self.as_type {
+        if let VariantOutput::Typed(ty) = &self.output {
             write!(f, "::{ty}")?;
         }
         Ok(())
@@ -397,6 +476,80 @@ mod tests {
         );
 
         assert!(rows[0]["day"].is_null(), "got: {:?}", rows[0]["day"]);
+    }
+
+    /// `->>` reads a string value bare, PostgreSQL's text extraction rather
+    /// than quoted JSON.
+    #[rstest]
+    fn double_arrow_reads_a_string_bare(mut testing_planner: TestingPlanner) {
+        docs_table(&mut testing_planner, vec![r#"{"name":"bob"}"#]);
+
+        let rows = run(&mut testing_planner, "SELECT d->>'name' AS n FROM docs");
+
+        assert_eq!(only_column(&rows[0]).as_str().unwrap(), "bob");
+    }
+
+    /// Non-string scalars render as their JSON text under `->>`.
+    #[rstest]
+    fn double_arrow_renders_scalars_as_text(mut testing_planner: TestingPlanner) {
+        docs_table(&mut testing_planner, vec![r#"{"v":30}"#, r#"{"v":true}"#]);
+
+        let rows = run(&mut testing_planner, "SELECT d->>'v' AS v FROM docs");
+
+        let mut got: Vec<String> = rows
+            .iter()
+            .map(|r| r["v"].as_str().unwrap().to_string())
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["30", "true"]);
+    }
+
+    /// A nested object under `->>` renders as its JSON text.
+    #[rstest]
+    fn double_arrow_renders_an_object_as_json(mut testing_planner: TestingPlanner) {
+        docs_table(&mut testing_planner, vec![r#"{"user":{"id":7}}"#]);
+
+        let rows = run(&mut testing_planner, "SELECT d->>'user' AS u FROM docs");
+
+        assert_eq!(only_column(&rows[0]).as_str().unwrap(), r#"{"id":7}"#);
+    }
+
+    /// A JSON null and a missing key both read as SQL NULL under `->>`, as in
+    /// PostgreSQL.
+    #[rstest]
+    fn double_arrow_null_and_missing_are_null(mut testing_planner: TestingPlanner) {
+        docs_table(&mut testing_planner, vec![r#"{"v":null}"#, r#"{}"#]);
+
+        let rows = run(&mut testing_planner, "SELECT d->>'v' AS v FROM docs");
+
+        assert!(rows.iter().all(|r| r["v"].is_null()), "got: {rows:?}");
+    }
+
+    /// `->>` after a `->` chain fuses into one read of the nested path.
+    #[rstest]
+    fn double_arrow_chains_after_arrows(mut testing_planner: TestingPlanner) {
+        docs_table(&mut testing_planner, vec![r#"{"user":{"id":7}}"#]);
+
+        let rows = run(
+            &mut testing_planner,
+            "SELECT d->'user'->>'id' AS i FROM docs",
+        );
+
+        assert_eq!(only_column(&rows[0]).as_str().unwrap(), "7");
+    }
+
+    /// `->>` yields text, so the PostgreSQL idiom of casting the extracted
+    /// text onward works.
+    #[rstest]
+    fn casts_a_double_arrow_text(mut testing_planner: TestingPlanner) {
+        docs_table(&mut testing_planner, vec![r#"{"age":30}"#]);
+
+        let rows = run(
+            &mut testing_planner,
+            "SELECT CAST(d->>'age' AS BIGINT) AS a FROM docs",
+        );
+
+        assert_eq!(only_column(&rows[0]).as_i64().unwrap(), 30);
     }
 
     /// The extracted field name must be a constant string.

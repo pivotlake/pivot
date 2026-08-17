@@ -61,6 +61,15 @@ pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
             return_type: Type::Variant,
             volatile: true,
         }),
+        // PostgreSQL's `doc->>'key'`: the extracted value rendered as text.
+        // DuckDB keeps the operator's own spelling as the function name, so
+        // the registry entry is spelled `->>`. Volatile for the same reason as
+        // `json_extract`.
+        "->>" => Some(ScalarFunctionSignature {
+            arguments: vec![Type::Variant, Type::Utf8],
+            return_type: Type::Utf8,
+            volatile: true,
+        }),
         _ => None,
     }
 }
