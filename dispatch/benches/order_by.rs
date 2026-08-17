@@ -7,6 +7,9 @@
 //! `PIVOT_BENCH_SORT_MB` (default 1024, i.e. 1 GiB) of Arrow data through a
 //! single `order_by` dataflow: large enough that the sort works far outside
 //! cache and the merge output is written batch by batch across the ring.
+//! Output batches are dropped on their producing workers (only row counts
+//! leave the dataflow), so result delivery and the ring-to-heap output copy
+//! are excluded: the numbers isolate the sort operator itself.
 //!
 //! # Scenarios
 //!
@@ -264,22 +267,22 @@ fn generate_until(
 // `batches` is cloned per iteration (cheap Arc bumps); the engine is reused.
 // ---------------------------------------------------------------------------
 
-/// Sort `batches` through one dataflow and return the collected output. The
-/// row-count check catches a sort that drops or duplicates rows, which would
-/// otherwise read as a throughput change. Returning the output hands its
-/// teardown to the caller, so a benchmark can drop it outside the timed
-/// window.
-fn run_sort(
-    d: &DataFlowDispatcher,
-    batches: &[RecordBatch],
-    order_by: &[OrderBy],
-) -> Vec<RecordBatch> {
+/// Sort `batches` through one dataflow, dropping every output batch on the
+/// worker that produced it. Only per-batch row counts leave the dataflow, so
+/// the measurement covers the sort alone: no ring-to-heap copy of the result
+/// and no delivery funnel, and the slabs return to the ring where they were
+/// filled. The row-count check still catches a sort that drops or duplicates
+/// rows, which would otherwise read as a throughput change.
+fn run_sort(d: &DataFlowDispatcher, batches: &[RecordBatch], order_by: &[OrderBy]) {
     let spec = values_input(d, batches.to_vec()).record_batches();
-    let out = spec.order_by(order_by.to_vec()).collect().unwrap();
+    let batch_rows = spec
+        .order_by(order_by.to_vec())
+        .map(|| |batch: RecordBatch| batch.num_rows())
+        .collect()
+        .unwrap();
     let input_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
-    let output_rows: usize = out.iter().map(|batch| batch.num_rows()).sum();
+    let output_rows: usize = batch_rows.iter().sum();
     assert_eq!(output_rows, input_rows, "sort did not re-emit every row");
-    out
 }
 
 /// Register one scenario. `make_data` runs only when the benchmark is selected
@@ -299,9 +302,6 @@ fn register<D>(
         let batches = cache.get_or_insert_with(&make_data);
         // Per-iteration setup (UNTIMED): re-zero the buffers the previous
         // query dirtied, so allocation cost stays out of the measured window.
-        // The routine returns the collected output, which criterion drops
-        // only after stopping the timer, keeping the gigabyte-scale free out
-        // of the samples as well.
         b.iter_batched(
             || {
                 d.run_on_workers(|| {
