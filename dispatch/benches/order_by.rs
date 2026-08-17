@@ -18,7 +18,7 @@
 //!   input fast path and the cost floor of re-emitting the input.
 //! * `i64_wide_payload` - the `i64` key with four `i64` payload columns and a
 //!   ~32 B string payload column. Compare cost matches `i64_random`, but each
-//!   reordered row drags ~80 B through the gather, so take/scatter dominates.
+//!   reordered row drags ~88 B through the gather, so take/scatter dominates.
 //! * `string_random` - a ~32 B `Utf8View` key (dictionary-shared views whose
 //!   bytes diverge early) plus one `i64` payload; byte-wise key comparisons
 //!   dominate.
@@ -26,7 +26,10 @@
 //! Scenario sizes count logical row bytes (fixed widths; views plus payload
 //! bytes for strings) independent of dictionary sharing, and generation stops
 //! at the first batch to cross the target, so reported bytes/s throughput is
-//! against the target size and accurate to within one batch.
+//! against the target size and accurate to within one batch. The string
+//! scenarios' input is dictionary-shared, so its resident footprint is below
+//! the logical size; the merge gather still materializes every payload byte,
+//! which is what the logical denominator tracks.
 //!
 //! # Running
 //!
@@ -41,25 +44,27 @@
 //!
 //! Tunables (env): `PIVOT_BENCH_SORT_MB` (MiB of data per scenario, default
 //! 1024), `PIVOT_BENCH_WORKERS` (default: all cores), `PIVOT_BENCH_BUFFERS`
-//! (ring slots of 2 MiB each, default 8192).
+//! (ring slots of 2 MiB each; defaults to 16x the scenario size, i.e. 8192
+//! slots at the 1 GiB default).
 //!
 //! Sizing the ring: the sorted output and the intermediate merge runs live on
-//! ring buffers, so the ring must hold several multiples of the input size
-//! (an 8 GiB ring evicts on the 1 GiB default; the default 8192 slots, a
-//! 16 GiB ring, do not). Scale `PIVOT_BENCH_BUFFERS` with
-//! `PIVOT_BENCH_SORT_MB`, and keep `buffers x 2 MiB` (the ring is one
-//! pre-faulted mmap; the caches share its slots) plus the generated input
-//! under box RAM.
+//! ring buffers, so the ring must hold several multiples of the input size.
+//! An undersized ring does not degrade gracefully: a worker aborts with an
+//! `Evicting` panic (8x the input has been seen to run out; the 16x default
+//! has not). The default tracks `PIVOT_BENCH_SORT_MB`, so override
+//! `PIVOT_BENCH_BUFFERS` only to probe headroom, and keep `buffers x 2 MiB`
+//! (the ring is one pre-faulted mmap; the caches share its slots) plus the
+//! generated input under box RAM.
 
-use std::cell::RefCell;
 use std::sync::Arc;
 
 use arrow_array::builder::StringViewBuilder;
 use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringViewArray};
 use arrow_schema::{DataType, Field, Schema};
-use criterion::{BatchSize, Criterion, SamplingMode, Throughput, black_box};
+use criterion::measurement::WallTime;
+use criterion::{BatchSize, BenchmarkGroup, Criterion, SamplingMode, Throughput};
 
-use dispatch::{DataFlowDispatcher, Dispatch, OrderBy, memory_ctx, values_input};
+use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch, OrderBy, memory_ctx, values_input};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -69,16 +74,29 @@ use dispatch::{DataFlowDispatcher, Dispatch, OrderBy, memory_ctx, values_input};
 /// out across workers through the work-stealing injector.
 const BATCH_ROWS: usize = 64 * 1024;
 
+/// Ring slots per byte of scenario data: the sorted output and the
+/// intermediate merge runs both live on ring buffers, and 8x the input has
+/// been seen to run out (an `Evicting` worker panic), so default to 16x.
+const RING_HEADROOM: usize = 16;
+
+/// Read an env override, falling back to `default` only when the variable is
+/// unset. A set-but-unparseable value aborts rather than silently reverting,
+/// so a typo cannot benchmark a different configuration than the one asked
+/// for.
 fn read_env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
+    match std::env::var(key) {
+        Ok(value) => value
+            .parse()
+            .unwrap_or_else(|_| panic!("{key} must be an integer, got {value:?}")),
+        Err(_) => default,
+    }
 }
 
 /// Bytes of Arrow data each scenario streams through the sort.
 fn target_sort_bytes() -> usize {
-    read_env_usize("PIVOT_BENCH_SORT_MB", 1024) * (1 << 20)
+    let mb = read_env_usize("PIVOT_BENCH_SORT_MB", 1024);
+    assert!(mb > 0, "PIVOT_BENCH_SORT_MB must be at least 1");
+    mb * (1 << 20)
 }
 
 fn worker_count() -> usize {
@@ -89,7 +107,10 @@ fn worker_count() -> usize {
 }
 
 fn ring_buffers() -> usize {
-    read_env_usize("PIVOT_BENCH_BUFFERS", 8192)
+    read_env_usize(
+        "PIVOT_BENCH_BUFFERS",
+        target_sort_bytes() * RING_HEADROOM / BUFFER_SIZE,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -125,20 +146,20 @@ impl Rng {
 
 /// `i64` column of full-range random values (effectively all-distinct keys).
 fn generate_i64_random(rng: &mut Rng, n: usize) -> ArrayRef {
-    let v: Int64Array = (0..n).map(|_| rng.next_u64() as i64).collect();
-    Arc::new(v)
+    let values: Int64Array = (0..n).map(|_| rng.next_u64() as i64).collect();
+    Arc::new(values)
 }
 
 /// `i64` column continuing a globally ascending sequence from `*next`.
 fn generate_i64_ascending(next: &mut i64, n: usize) -> ArrayRef {
-    let v: Int64Array = (0..n)
+    let values: Int64Array = (0..n)
         .map(|_| {
-            let k = *next;
+            let key = *next;
             *next += 3;
-            k
+            key
         })
         .collect();
-    Arc::new(v)
+    Arc::new(values)
 }
 
 /// Build `n_distinct` distinct strings averaging ~`avg_len` bytes whose bytes
@@ -190,21 +211,13 @@ fn build_dict_block(dict: &[String]) -> DictBlock {
 
 /// An `n`-row `StringViewArray` of uniformly drawn dictionary-shared views.
 fn generate_string_col(rng: &mut Rng, n: usize, block: &DictBlock) -> ArrayRef {
-    let mut b = StringViewBuilder::with_capacity(n);
-    let blk = b.append_block(block.buffer.clone());
+    let mut builder = StringViewBuilder::with_capacity(n);
+    let block_id = builder.append_block(block.buffer.clone());
     for _ in 0..n {
-        let (off, len) = block.spans[rng.below(block.spans.len())];
-        b.try_append_view(blk, off, len).unwrap();
+        let (offset, len) = block.spans[rng.below(block.spans.len())];
+        builder.try_append_view(block_id, offset, len).unwrap();
     }
-    Arc::new(b.finish())
-}
-
-fn make_schema(fields: Vec<Field>) -> Arc<Schema> {
-    Arc::new(Schema::new(fields))
-}
-
-fn make_batch(schema: &Arc<Schema>, cols: Vec<ArrayRef>) -> RecordBatch {
-    RecordBatch::try_new(schema.clone(), cols).unwrap()
+    Arc::new(builder.finish())
 }
 
 /// Logical bytes of one batch: fixed widths for primitives, view plus payload
@@ -214,14 +227,15 @@ fn count_logical_bytes(batch: &RecordBatch) -> usize {
     batch
         .columns()
         .iter()
-        .map(|c| match c.data_type() {
-            DataType::Int64 => 8 * c.len(),
+        .map(|column| match column.data_type() {
+            DataType::Int64 => 8 * column.len(),
             DataType::Utf8View => {
-                let a = c.as_any().downcast_ref::<StringViewArray>().unwrap();
-                16 * a.len()
-                    + a.views()
+                let strings = column.as_any().downcast_ref::<StringViewArray>().unwrap();
+                16 * strings.len()
+                    + strings
+                        .views()
                         .iter()
-                        .map(|&v| (v as u32) as usize)
+                        .map(|&view| (view as u32) as usize)
                         .sum::<usize>()
             }
             other => panic!("no logical size rule for bench column type {other}"),
@@ -238,9 +252,9 @@ fn generate_until(
     let mut total = 0;
     let mut batches = Vec::new();
     while total < target {
-        let b = make_batch(schema, make_cols(BATCH_ROWS));
-        total += count_logical_bytes(&b);
-        batches.push(b);
+        let batch = RecordBatch::try_new(schema.clone(), make_cols(BATCH_ROWS)).unwrap();
+        total += count_logical_bytes(&batch);
+        batches.push(batch);
     }
     batches
 }
@@ -250,41 +264,44 @@ fn generate_until(
 // `batches` is cloned per iteration (cheap Arc bumps); the engine is reused.
 // ---------------------------------------------------------------------------
 
-fn run_sort(d: &DataFlowDispatcher, batches: &[RecordBatch], order_by: &[OrderBy]) {
+/// Sort `batches` through one dataflow and return the collected output. The
+/// row-count check catches a sort that drops or duplicates rows, which would
+/// otherwise read as a throughput change. Returning the output hands its
+/// teardown to the caller, so a benchmark can drop it outside the timed
+/// window.
+fn run_sort(
+    d: &DataFlowDispatcher,
+    batches: &[RecordBatch],
+    order_by: &[OrderBy],
+) -> Vec<RecordBatch> {
     let spec = values_input(d, batches.to_vec()).record_batches();
     let out = spec.order_by(order_by.to_vec()).collect().unwrap();
-    black_box(out);
+    let input_rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    let output_rows: usize = out.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(output_rows, input_rows, "sort did not re-emit every row");
+    out
 }
 
 /// Register one scenario. `make_data` runs only when the benchmark is selected
 /// and its result is cached across iterations, so a filtered run builds just
 /// the one scenario's dataset.
 fn register<D>(
-    c: &mut Criterion,
+    group: &mut BenchmarkGroup<'_, WallTime>,
     d: &DataFlowDispatcher,
     name: &str,
     make_data: D,
     keys: Vec<OrderBy>,
 ) where
-    D: FnOnce() -> Vec<RecordBatch>,
+    D: Fn() -> Vec<RecordBatch>,
 {
-    let make_data = RefCell::new(Some(make_data));
-    let cache: RefCell<Option<Vec<RecordBatch>>> = RefCell::new(None);
-    let mut g = c.benchmark_group("order_by");
-    g.throughput(Throughput::Bytes(target_sort_bytes() as u64));
-    // Whole-input sorts run seconds per iteration: a handful of flat samples
-    // beats criterion's default hundred.
-    g.sample_size(10);
-    g.sampling_mode(SamplingMode::Flat);
-    g.bench_function(name, |b| {
-        if cache.borrow().is_none() {
-            let data = make_data.borrow_mut().take().expect("make_data missing")();
-            *cache.borrow_mut() = Some(data);
-        }
-        let cached = cache.borrow();
-        let batches = cached.as_ref().unwrap();
+    let mut cache: Option<Vec<RecordBatch>> = None;
+    group.bench_function(name, move |b| {
+        let batches = cache.get_or_insert_with(&make_data);
         // Per-iteration setup (UNTIMED): re-zero the buffers the previous
         // query dirtied, so allocation cost stays out of the measured window.
+        // The routine returns the collected output, which criterion drops
+        // only after stopping the timer, keeping the gigabyte-scale free out
+        // of the samples as well.
         b.iter_batched(
             || {
                 d.run_on_workers(|| {
@@ -295,7 +312,6 @@ fn register<D>(
             BatchSize::PerIteration,
         );
     });
-    g.finish();
 }
 
 // ---------------------------------------------------------------------------
@@ -305,17 +321,25 @@ fn register<D>(
 fn bench_order_by_large(c: &mut Criterion, d: &DataFlowDispatcher) {
     let target = target_sort_bytes();
 
+    // One group for all four scenarios, so criterion's group summary compares
+    // them and the throughput/sampling config is stated once.
+    let mut group = c.benchmark_group("order_by");
+    group.throughput(Throughput::Bytes(target as u64));
+    // Whole-input sorts run seconds per iteration: flat sampling keeps every
+    // sample at one iteration instead of criterion's scaled linear ramp.
+    group.sampling_mode(SamplingMode::Flat);
+
     register(
-        c,
+        &mut group,
         d,
         "i64_random",
-        || {
-            let sch = make_schema(vec![
+        move || {
+            let schema = Arc::new(Schema::new(vec![
                 Field::new("k", DataType::Int64, false),
                 Field::new("v", DataType::Int64, false),
-            ]);
+            ]));
             let mut rng = Rng::new(1);
-            generate_until(target, &sch, |n| {
+            generate_until(target, &schema, |n| {
                 vec![
                     generate_i64_random(&mut rng, n),
                     generate_i64_random(&mut rng, n),
@@ -326,17 +350,17 @@ fn bench_order_by_large(c: &mut Criterion, d: &DataFlowDispatcher) {
     );
 
     register(
-        c,
+        &mut group,
         d,
         "i64_presorted",
-        || {
-            let sch = make_schema(vec![
+        move || {
+            let schema = Arc::new(Schema::new(vec![
                 Field::new("k", DataType::Int64, false),
                 Field::new("v", DataType::Int64, false),
-            ]);
+            ]));
             let mut rng = Rng::new(2);
             let mut next_key = 0;
-            generate_until(target, &sch, |n| {
+            generate_until(target, &schema, |n| {
                 vec![
                     generate_i64_ascending(&mut next_key, n),
                     generate_i64_random(&mut rng, n),
@@ -347,22 +371,21 @@ fn bench_order_by_large(c: &mut Criterion, d: &DataFlowDispatcher) {
     );
 
     register(
-        c,
+        &mut group,
         d,
         "i64_wide_payload",
-        || {
-            let sch = make_schema(vec![
+        move || {
+            let schema = Arc::new(Schema::new(vec![
                 Field::new("k", DataType::Int64, false),
                 Field::new("v0", DataType::Int64, false),
                 Field::new("v1", DataType::Int64, false),
                 Field::new("v2", DataType::Int64, false),
                 Field::new("v3", DataType::Int64, false),
                 Field::new("s", DataType::Utf8View, false),
-            ]);
-            let dict = build_string_dict(1_000_000, "payload ", 32);
-            let block = build_dict_block(&dict);
+            ]));
+            let block = build_dict_block(&build_string_dict(1_000_000, "payload ", 32));
             let mut rng = Rng::new(3);
-            generate_until(target, &sch, |n| {
+            generate_until(target, &schema, |n| {
                 vec![
                     generate_i64_random(&mut rng, n),
                     generate_i64_random(&mut rng, n),
@@ -377,18 +400,17 @@ fn bench_order_by_large(c: &mut Criterion, d: &DataFlowDispatcher) {
     );
 
     register(
-        c,
+        &mut group,
         d,
         "string_random",
-        || {
-            let sch = make_schema(vec![
+        move || {
+            let schema = Arc::new(Schema::new(vec![
                 Field::new("k", DataType::Utf8View, false),
                 Field::new("v", DataType::Int64, false),
-            ]);
-            let dict = build_string_dict(1_000_000, "series/", 32);
-            let block = build_dict_block(&dict);
+            ]));
+            let block = build_dict_block(&build_string_dict(1_000_000, "series/", 32));
             let mut rng = Rng::new(4);
-            generate_until(target, &sch, |n| {
+            generate_until(target, &schema, |n| {
                 vec![
                     generate_string_col(&mut rng, n, &block),
                     generate_i64_random(&mut rng, n),
@@ -397,6 +419,8 @@ fn bench_order_by_large(c: &mut Criterion, d: &DataFlowDispatcher) {
         },
         vec![OrderBy::new(0, false, false)],
     );
+
+    group.finish();
 }
 
 // ---------------------------------------------------------------------------
@@ -414,7 +438,9 @@ fn main() {
     let dispatch = Dispatch::spin_up(workers, buffers, None);
     let dispatcher = dispatch.dispatcher().clone();
 
-    let mut c = Criterion::default().configure_from_args();
+    // Default to a handful of samples (each is a whole multi-second sort); a
+    // `--sample-size` on the command line still overrides this.
+    let mut c = Criterion::default().sample_size(10).configure_from_args();
     bench_order_by_large(&mut c, &dispatcher);
     c.final_summary();
 
