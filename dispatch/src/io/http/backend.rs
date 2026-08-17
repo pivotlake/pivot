@@ -277,7 +277,7 @@ mod blocking_engine {
                 )));
             }
             acc.extend_from_slice(&chunk[..n]);
-            match proto::parse_get_response_head(&acc, read.len) {
+            match proto::parse_get_response_head(&acc, read.expected_body_len()) {
                 Ok(proto::HeadParse::Complete(h)) => break h,
                 Ok(proto::HeadParse::Incomplete) => continue,
                 Err(e) => {
@@ -300,8 +300,8 @@ mod blocking_engine {
 
         let body_len = head.content_length as usize;
         // SAFETY: dest points into the pinned cache slot for exactly this block's
-        // currently-invalid sub-blocks; body_len <= read.len <= the block length
-        // (validated in parse_get_response_head).
+        // currently-invalid sub-blocks; body_len == the expected body length <=
+        // read.len <= the block length (validated in parse_get_response_head).
         let dest = unsafe { std::slice::from_raw_parts_mut(read.dest, body_len) };
 
         // Drive the body through the sans-IO decoder. The range policy guarantees
@@ -586,7 +586,9 @@ mod uring_engine {
         conn: Conn,
         id: Identifier,
         dest: *mut u8,
-        req_len: usize,
+        /// The exact body size a well-formed response must carry (the requested
+        /// range clamped to the object's end); head parsing rejects any other.
+        expected_body_len: usize,
         request_bytes: Vec<u8>,
         request_queued: bool,
         /// The originating operation, retained for transparent reconnects and
@@ -625,8 +627,8 @@ mod uring_engine {
 
     impl HttpExchange {
         fn new(conn: Conn, id: Identifier, request: RemoteRequest, state: State) -> Self {
-            let (dest, req_len) = match &request {
-                RemoteRequest::Read(read) => (read.dest, read.len),
+            let (dest, expected_body_len) = match &request {
+                RemoteRequest::Read(read) => (read.dest, read.expected_body_len()),
                 RemoteRequest::Upload(_) => (std::ptr::null_mut(), 0),
             };
             let request_bytes = request.request_head();
@@ -634,7 +636,7 @@ mod uring_engine {
                 conn,
                 id,
                 dest,
-                req_len,
+                expected_body_len,
                 request_bytes,
                 request_queued: false,
                 request,
@@ -718,7 +720,7 @@ mod uring_engine {
                 body,
                 request,
                 dest,
-                req_len,
+                expected_body_len,
                 body_written,
                 conn_reusable,
                 ..
@@ -727,7 +729,7 @@ mod uring_engine {
                 transport, in_buf, ..
             } = conn;
             let dest = *dest;
-            let req_len = *req_len;
+            let expected_body_len = *expected_body_len;
 
             match transport {
                 // Reached only in the header phase; once the head parses, `pump`
@@ -751,7 +753,7 @@ mod uring_engine {
                             body,
                             request,
                             dest,
-                            req_len,
+                            expected_body_len,
                             body_written,
                             conn_reusable,
                             &in_buf[..n],
@@ -803,8 +805,9 @@ mod uring_engine {
                                     break;
                                 }
                                 // SAFETY: writing this block's currently-invalid,
-                                // pinned slot region; content_length <= req_len ==
-                                // block length (validated when parsing the head).
+                                // pinned slot region; content_length ==
+                                // expected_body_len <= the block length (validated
+                                // when parsing the head).
                                 let dst = unsafe {
                                     std::slice::from_raw_parts_mut(
                                         dest.add(*body_written),
@@ -832,7 +835,7 @@ mod uring_engine {
                                             body,
                                             request,
                                             dest,
-                                            req_len,
+                                            expected_body_len,
                                             body_written,
                                             conn_reusable,
                                             &header_scratch[..m],
@@ -870,14 +873,14 @@ mod uring_engine {
         body: &mut Option<http1::BodyDecoder>,
         request: &RemoteRequest,
         dest: *mut u8,
-        req_len: usize,
+        expected_body_len: usize,
         body_written: &mut usize,
         conn_reusable: &mut bool,
         chunk: &[u8],
     ) -> Result<()> {
         head_acc.extend_from_slice(chunk);
         let parsed = match request {
-            RemoteRequest::Read(_) => proto::parse_get_response_head(head_acc, req_len)?,
+            RemoteRequest::Read(_) => proto::parse_get_response_head(head_acc, expected_body_len)?,
             RemoteRequest::Upload(_) => proto::parse_upload_response_head(head_acc)?,
         };
         if let proto::HeadParse::Complete(h) = parsed {
@@ -893,7 +896,8 @@ mod uring_engine {
                     return;
                 }
                 // SAFETY: as in consume_received — pinned, currently-invalid slot
-                // region; total body (content_length) <= req_len == block length.
+                // region; total body (content_length) == expected_body_len <= the
+                // block length.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         bytes.as_ptr(),
@@ -1234,7 +1238,8 @@ mod uring_engine {
                         };
                         exchange.recv_in_dest = true;
                         // SAFETY: pinned, currently-invalid slot region; remaining
-                        // bytes are within the block (content_length <= req_len).
+                        // bytes are within the block (content_length ==
+                        // expected_body_len <= the block length).
                         let a = unsafe { exchange.dest.add(exchange.body_written) } as usize;
                         (false, a, remaining, fd)
                     } else {

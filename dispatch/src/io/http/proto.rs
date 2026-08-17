@@ -18,8 +18,8 @@ pub enum ProtoError {
     UnexpectedStatus(u16),
     #[error("range response missing Content-Length")]
     MissingContentLength,
-    #[error("range response body ({got} bytes) larger than requested ({want} bytes)")]
-    BodyTooLarge { got: u64, want: usize },
+    #[error("range response body ({got} bytes) does not match the expected {want} bytes")]
+    BodyLengthMismatch { got: u64, want: usize },
     #[error("unexpected upload status {0} (expected a 2xx response)")]
     UnexpectedUploadStatus(u16),
 }
@@ -97,9 +97,11 @@ pub enum HeadParse {
 /// if the header section hasn't fully arrived yet.
 ///
 /// Validates that the status is `206 Partial Content` and that a `Content-Length`
-/// is present and no larger than `requested_len` — range responses are never
-/// chunked and must fit the destination slot region.
-pub fn parse_get_response_head(buf: &[u8], requested_len: usize) -> Result<HeadParse, ProtoError> {
+/// is present and equals `expected_len` - the requested range clamped to the
+/// object's size. A shorter body (a truncating proxy, a replaced object) would
+/// leave part of the destination slot region unwritten, and a longer one would
+/// overflow it; both are rejected here, before any body byte lands.
+pub fn parse_get_response_head(buf: &[u8], expected_len: usize) -> Result<HeadParse, ProtoError> {
     let head = match http1::parse_response_head(buf)? {
         http1::HeadStatus::Incomplete => return Ok(HeadParse::Incomplete),
         http1::HeadStatus::Complete(head) => head,
@@ -116,10 +118,10 @@ pub fn parse_get_response_head(buf: &[u8], requested_len: usize) -> Result<HeadP
         .content_length
         .ok_or(ProtoError::MissingContentLength)?;
 
-    if content_length > requested_len as u64 {
-        return Err(ProtoError::BodyTooLarge {
+    if content_length != expected_len as u64 {
+        return Err(ProtoError::BodyLengthMismatch {
             got: content_length,
-            want: requested_len,
+            want: expected_len,
         });
     }
 
@@ -177,7 +179,7 @@ mod tests {
     #[test]
     fn parses_complete_206_head() {
         let raw = b"HTTP/1.1 206 Partial Content\r\nContent-Length: 10\r\nContent-Range: bytes 0-9/100\r\n\r\nXXXXXXXXXX";
-        match parse_get_response_head(raw, 4096).unwrap() {
+        match parse_get_response_head(raw, 10).unwrap() {
             HeadParse::Complete(h) => {
                 assert_eq!(h.content_length, 10);
                 // head_len points at the first body byte.
@@ -229,11 +231,26 @@ mod tests {
     }
 
     #[test]
-    fn rejects_body_larger_than_requested() {
+    fn rejects_body_larger_than_expected() {
         let raw = b"HTTP/1.1 206 Partial Content\r\nContent-Length: 9000\r\n\r\n";
         assert!(matches!(
             parse_get_response_head(raw, 4096),
-            Err(ProtoError::BodyTooLarge { .. })
+            Err(ProtoError::BodyLengthMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_body_shorter_than_expected() {
+        let raw = b"HTTP/1.1 206 Partial Content\r\nContent-Length: 2048\r\n\r\n";
+
+        let result = parse_get_response_head(raw, 4096);
+
+        assert!(matches!(
+            result,
+            Err(ProtoError::BodyLengthMismatch {
+                got: 2048,
+                want: 4096
+            })
         ));
     }
 }

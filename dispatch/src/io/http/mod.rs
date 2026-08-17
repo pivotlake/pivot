@@ -63,6 +63,23 @@ pub(crate) struct RemoteRead {
     pub dest: *mut u8,
 }
 
+impl RemoteRead {
+    /// Expected response-body length for this block-aligned range, based on the
+    /// object size recorded when `RemoteFile` was opened.
+    ///
+    /// A range wholly inside the object should return `len` bytes. A range
+    /// overlapping EOF should return only the bytes remaining after `offset`.
+    /// An offset at or beyond EOF yields zero, though a conforming server will
+    /// normally reject that range with `416`.
+    ///
+    /// The response parser requires this exact length. A mismatch indicates a
+    /// truncated response or that the remote object no longer matches its recorded
+    /// size.
+    pub fn expected_body_len(&self) -> usize {
+        (self.len as u64).min(self.remote.size().saturating_sub(self.offset)) as usize
+    }
+}
+
 // SAFETY: `dest` points into a cache slot kept alive for the read's whole
 // lifetime by the originating block's `Arc<ReadBuffer>` pin; only this read
 // writes to `[dest, dest+len)` (currently-invalid sub-blocks), so moving the
