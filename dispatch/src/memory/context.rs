@@ -228,10 +228,18 @@ impl MemoryContext {
     ///
     /// Used by background buffer-clean passes that should not pull buffers off
     /// peer workers - see [`crate::worker::Worker`]'s `clear_dirty_buffer_or_park`.
+    ///
+    /// A popped slot can be transiently locked (e.g. by an evictor probing it
+    /// before backing off). The contender never re-pools an index it did not
+    /// pop, so the index is pushed back - dropping it would leak the slot from
+    /// every pool - and `None` is returned; the next pass retries.
     pub fn pop_dirty_buffer(&self) -> Option<WriteBuffer> {
-        self.dirty_pool
-            .pop(false)
-            .and_then(|i| memory_ctx().ring().try_write(i))
+        let idx = self.dirty_pool.pop(false)?;
+        let buffer = memory_ctx().ring().try_write(idx);
+        if buffer.is_none() {
+            self.dirty_pool.push(idx);
+        }
+        buffer
     }
 
     /// Drain this worker's dirty buffers, zeroing each and returning it to the
@@ -263,7 +271,14 @@ impl MemoryContext {
     /// If the popped index's ring slot is contended, retries with a fresh index rather
     /// than evicting.
     pub fn get_write_buffer(&self, prefer_zeroed: bool) -> WriteBuffer {
-        loop {
+        // Indices popped for slots that turned out transiently locked (e.g. an
+        // evictor probing a pooled slot before backing off). Set aside here and
+        // pushed back once a buffer is in hand: the contender never re-pools an
+        // index it did not pop, so dropping one would leak the slot from every
+        // pool. Held out of the pools during the loop so the retry pops a
+        // *different* index instead of spinning on the locked one.
+        let mut contended = Vec::new();
+        let buffer = loop {
             if let Some(idx) = self.pop_free_idx(prefer_zeroed) {
                 // A slot listed in the free pool must genuinely be free, i.e. owned
                 // by no cache. If a cache still owns it, it leaked into the pool
@@ -273,12 +288,12 @@ impl MemoryContext {
                     None,
                     "pooled slot {idx} still owned by a cache",
                 );
-                if let Some(r) = memory_ctx().ring().try_write(idx) {
-                    return r;
-                } else {
-                    // Let's try again to get a free idx, we don't want to start evicting yet
-                    continue;
+                match memory_ctx().ring().try_write(idx) {
+                    Some(buffer) => break buffer,
+                    // Try again to get a free idx, we don't want to start evicting yet
+                    None => contended.push(idx),
                 }
+                continue;
             }
 
             // Pool empty: evict via the shared clock, which takes from whichever
@@ -290,8 +305,12 @@ impl MemoryContext {
             if *PANIC_ON_EVICT && self.decompressed_cache.is_empty() {
                 panic!("Evicting");
             }
-            return self.evict();
+            break self.evict();
+        };
+        for idx in contended {
+            self.push_free_idx(idx, memory_ctx().ring().slot_zeroed(idx));
         }
+        buffer
     }
 
     /// Evict a ring slot via the shared CLOCK and return it writable. Each
@@ -521,6 +540,39 @@ mod tests {
 
         // Assert
         assert!(popped.is_none());
+    }
+
+    #[test]
+    fn pop_dirty_buffer_keeps_a_contended_slot_pooled() {
+        // Setup: slot 0's index sits in the dirty pool while an evictor probe
+        // transiently holds the slot itself.
+        init_test_free_pool(1);
+        let probe = memory_ctx().ring().try_write(0).unwrap();
+
+        let while_contended = memory_ctx().pop_dirty_buffer();
+        probe.release_in_place();
+        let after_release = memory_ctx().pop_dirty_buffer();
+
+        // Assert: the contended pop yields nothing, but the slot is still
+        // poolable once the probe backs off.
+        assert!(while_contended.is_none());
+        assert_eq!(after_release.map(|b| b.slot_idx), Some(0));
+    }
+
+    #[test]
+    fn get_write_buffer_repools_a_contended_slot() {
+        // Setup: two dirty slots; an evictor probe transiently holds slot 1.
+        init_test_free_pool(2);
+        let probe = memory_ctx().ring().try_write(1).unwrap();
+
+        let handed_out = memory_ctx().get_write_buffer(false);
+        probe.release_in_place();
+        let repooled = memory_ctx().pop_free_idx(false);
+
+        // Assert: the free slot is handed out and the contended one is back in
+        // a pool rather than leaked.
+        assert_eq!(handed_out.slot_idx, 0);
+        assert_eq!(repooled, Some(1));
     }
 
     #[test]
