@@ -2,9 +2,9 @@
 //! to the per-function expression types.
 
 use super::{
-    Arithmetic, Contains, DatePart, DateTrunc, Divide, IntervalArithmetic, Length, Like, Prefix,
-    RegexpFullMatch, RegexpJitReplace, RegexpReplace, Substring, Suffix, TemporalConvert,
-    VariantGet,
+    Arithmetic, Contains, DatePart, DateTrunc, Divide, FormatBytes, IntervalArithmetic, Length,
+    Like, Prefix, RegexpFullMatch, RegexpJitReplace, RegexpReplace, Substring, Suffix,
+    TemporalConvert, VariantGet,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::expression::Expression;
@@ -76,6 +76,8 @@ pub enum Function {
     Like(Like),
     Arithmetic(Arithmetic),
     Length(Length),
+    /// `format_bytes(bytes)` — a byte count rendered in binary units.
+    FormatBytes(FormatBytes),
     RegexpReplace(RegexpReplace),
     /// `regexp_full_match` — also the `~` / `!~` operators and `SIMILAR TO`.
     RegexpFullMatch(RegexpFullMatch),
@@ -130,6 +132,7 @@ impl Function {
                 visit(&a.right);
             }
             Function::Length(l) => visit(&l.input),
+            Function::FormatBytes(b) => visit(&b.input),
             Function::RegexpReplace(r) => visit(&r.input),
             // The pattern is a plan-time constant, not a child expression.
             Function::RegexpFullMatch(r) => visit(&r.input),
@@ -170,6 +173,7 @@ impl Function {
                 visit(&mut a.right);
             }
             Function::Length(l) => visit(&mut l.input),
+            Function::FormatBytes(b) => visit(&mut b.input),
             Function::RegexpReplace(r) => visit(&mut r.input),
             // The pattern is a plan-time constant, not a child expression.
             Function::RegexpFullMatch(r) => visit(&mut r.input),
@@ -198,6 +202,7 @@ impl Display for Function {
             Function::Like(l) => write!(f, "{l}"),
             Function::Arithmetic(a) => write!(f, "{a}"),
             Function::Length(l) => write!(f, "{l}"),
+            Function::FormatBytes(b) => write!(f, "{b}"),
             Function::RegexpReplace(r) => write!(f, "{r}"),
             Function::RegexpFullMatch(r) => write!(f, "{r}"),
             Function::RegexpJitReplace(r) => write!(f, "{r}"),
@@ -228,10 +233,12 @@ impl Function {
             Function::Arithmetic(a) => a.return_type.clone(),
             Function::Length(l) => l.return_type.clone(),
             Function::DatePart(d) => d.return_type.clone(),
-            // The regex replacers and substring rewrite strings.
-            Function::RegexpReplace(_) | Function::RegexpJitReplace(_) | Function::Substring(_) => {
-                Type::Utf8
-            }
+            // The regex replacers and substring rewrite strings, and a
+            // formatted byte count is one.
+            Function::RegexpReplace(_)
+            | Function::RegexpJitReplace(_)
+            | Function::Substring(_)
+            | Function::FormatBytes(_) => Type::Utf8,
             // `/` computes a float quotient, single- or double-precision.
             Function::Divide(d) => d.return_type.clone(),
             // `date_trunc` and `now()` yield a timestamp.
@@ -256,6 +263,7 @@ impl Function {
             Function::Like(l) => l.compile(),
             Function::Arithmetic(a) => a.compile(),
             Function::Length(l) => l.compile(),
+            Function::FormatBytes(b) => b.compile(),
             Function::RegexpReplace(r) => r.compile(),
             Function::RegexpFullMatch(r) => r.compile(),
             Function::RegexpJitReplace(r) => r.compile(),

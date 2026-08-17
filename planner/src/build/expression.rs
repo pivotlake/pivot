@@ -23,9 +23,9 @@ use duckdb_planner::{Expr, LogicalTypeId, ScalarValue};
 use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Conjunction,
     ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide, Error,
-    Expression, Function, InList, IntervalArithmetic, IsNull, Length, Like, MaybeError, Not,
-    NumericAggregate, Prefix, Ref, RegexpFullMatch, RegexpJitReplace, RegexpReplace, Substring,
-    Suffix, TemporalConvert, VariantGet,
+    Expression, FormatBytes, Function, InList, IntervalArithmetic, IsNull, Length, Like,
+    MaybeError, Not, NumericAggregate, Prefix, Ref, RegexpFullMatch, RegexpJitReplace,
+    RegexpReplace, Substring, Suffix, TemporalConvert, VariantGet,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
 
@@ -353,6 +353,7 @@ impl Function {
             },
             "*" => Ok(Function::Arithmetic(Arithmetic::from_handle(func)?)),
             "length" | "strlen" | "len" => Ok(Function::Length(Length::from_handle(func)?)),
+            "format_bytes" => Ok(Function::FormatBytes(FormatBytes::from_handle(func)?)),
             // The `substring(x FROM a FOR b)` syntax binds to the same call.
             "substring" | "substr" => Ok(Function::Substring(Substring::from_handle(func)?)),
             "regexp_replace" => Ok(Function::RegexpReplace(RegexpReplace::from_handle(func)?)),
@@ -544,6 +545,15 @@ impl Length {
         let params = function_args(func, 1)?;
         Ok(Length {
             return_type: type_from_logical(func.return_type()?)?,
+            input: Box::new(Expression::from_handle(params[0])?),
+        })
+    }
+}
+
+impl FormatBytes {
+    pub(crate) fn from_handle(func: FunctionHandle<'_>) -> Result<FormatBytes, Error> {
+        let params = function_args(func, 1)?;
+        Ok(FormatBytes {
             input: Box::new(Expression::from_handle(params[0])?),
         })
     }
