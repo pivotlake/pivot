@@ -162,3 +162,30 @@ fn case_expression_group_key(mut testing_planner: TestingPlanner) {
         Input([a:Int32])
     ");
 }
+
+/// A type Pivot cannot plan is reported by DuckDB's name for it, not by its
+/// numeric type id.
+#[rstest]
+fn an_unsupported_type_is_named_in_the_error(mut testing_planner: TestingPlanner) {
+    let err = testing_planner
+        .plan("SELECT CAST(a AS TIME) FROM example_table")
+        .unwrap_err()
+        .to_string();
+
+    assert_eq!(err, "Error converting plan: Unsupported logical type: TIME");
+}
+
+/// An expression kind Pivot cannot plan is reported by DuckDB's name for it,
+/// not by its numeric expression type.
+#[rstest]
+fn an_unsupported_expression_kind_is_named_in_the_error(mut testing_planner: TestingPlanner) {
+    let err = testing_planner
+        .plan("SELECT a FROM example_table WHERE a IS DISTINCT FROM b")
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        err.ends_with("Unsupported expression type: DISTINCT_FROM"),
+        "{err}"
+    );
+}

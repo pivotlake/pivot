@@ -194,6 +194,16 @@ pub mod ffi {
         /// row-id stripping to recognise the threaded-up row-id column.
         fn rowid_column_id() -> Result<usize>;
 
+        /// DuckDB's own name for a discriminant of each mirrored enum, e.g.
+        /// `"TIME"` for a logical type id. Each errors for a discriminant
+        /// DuckDB does not know.
+        fn logical_type_id_name(id: u8) -> Result<String>;
+        fn expression_type_name(type_id: u8) -> Result<String>;
+        fn join_type_name(type_id: u8) -> Result<String>;
+        fn logical_operator_type_name(type_id: u8) -> Result<String>;
+        fn limit_node_type_name(type_id: u8) -> Result<String>;
+        fn order_type_name(type_id: u8) -> Result<String>;
+
         // ---- LogicalOperator: shared structure ----
         /// DuckDB `LogicalOperatorType` discriminant.
         fn lo_type(op: &LogicalOperator) -> Result<u8>;

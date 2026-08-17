@@ -146,7 +146,7 @@ impl fmt::Display for ScalarValue {
                 months,
                 days,
                 micros,
-            } => write!(f, "{months} {days} {micros}"),
+            } => write!(f, "INTERVAL {months} months {days} days {micros} micros"),
             ScalarValue::Variant(v) => write!(f, "{v}"),
             ScalarValue::Null(ty) => write!(f, "NULL as {:?}", ty.id),
             ScalarValue::Other(ty) => write!(f, "{ty:?}"),

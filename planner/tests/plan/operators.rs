@@ -363,6 +363,24 @@ fn insert_by_name_matches_the_select_output_names(mut testing_planner: TestingPl
     ");
 }
 
+/// A join Pivot cannot plan is reported by DuckDB's name for the join type,
+/// not by its numeric type.
+#[rstest]
+fn an_unsupported_join_type_is_named_in_the_error(mut testing_planner: TestingPlanner) {
+    let error = testing_planner
+        .plan(
+            "SELECT (SELECT max(b) FROM example_table inner_table \
+             WHERE inner_table.a = example_table.a) FROM example_table",
+        )
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        error.ends_with("Unsupported range join type: LEFT"),
+        "{error}"
+    );
+}
+
 #[rstest]
 fn insert_default_values_is_rejected(mut testing_planner: TestingPlanner) {
     let error = testing_planner

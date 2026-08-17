@@ -2,6 +2,7 @@
 #include "duckdb-planner/src/duckdb_bridge/cpp/bridge.h"
 #include "duckdb-planner/src/duckdb_bridge/cpp/storage_info.h"
 #include "duckdb-planner/src/duckdb_bridge/cpp/catalog/table_entry.h"
+#include "duckdb/common/enum_util.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
@@ -296,6 +297,30 @@ const LogicalOperator &plan_root(const PlanHandle &plan) {
 
 size_t rowid_column_id() {
 	return static_cast<size_t>(duckdb::COLUMN_IDENTIFIER_ROW_ID);
+}
+
+rust::String logical_type_id_name(uint8_t id) {
+	return rust::String::lossy(duckdb::LogicalTypeIdToString(static_cast<duckdb::LogicalTypeId>(id)));
+}
+
+rust::String expression_type_name(uint8_t type) {
+	return rust::String::lossy(duckdb::ExpressionTypeToString(static_cast<duckdb::ExpressionType>(type)));
+}
+
+rust::String join_type_name(uint8_t type) {
+	return rust::String::lossy(duckdb::JoinTypeToString(static_cast<duckdb::JoinType>(type)));
+}
+
+rust::String logical_operator_type_name(uint8_t type) {
+	return rust::String::lossy(duckdb::EnumUtil::ToString(static_cast<duckdb::LogicalOperatorType>(type)));
+}
+
+rust::String limit_node_type_name(uint8_t type) {
+	return rust::String::lossy(duckdb::EnumUtil::ToString(static_cast<duckdb::LimitNodeType>(type)));
+}
+
+rust::String order_type_name(uint8_t type) {
+	return rust::String::lossy(duckdb::EnumUtil::ToString(static_cast<duckdb::OrderType>(type)));
 }
 
 // ---- LogicalOperator: shared structure ----
