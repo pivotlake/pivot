@@ -1550,7 +1550,7 @@ mod tests {
             let mut tls = rustls::StreamOwned::new(conn, tcp);
             let head = read_head(&mut tls);
             let (start, end) = parse_range(&head);
-            let len = (end - start + 1) / 2;
+            let len = (end - start).div_ceil(2);
             let body: Vec<u8> = (0..len).map(|i| pattern(start + i)).collect();
             let resp = format!(
                 "HTTP/1.1 206 Partial Content\r\n\
