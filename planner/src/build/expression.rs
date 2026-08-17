@@ -211,6 +211,18 @@ impl Cast {
                 )));
             }
             let (input, path) = collapse_extractions(source);
+            // A text cast of the whole document renders it as JSON (a `Cast`),
+            // not a typed read: an empty-path read as text yields the value
+            // only where the document's root IS a string, so a column of
+            // objects would come back all-NULL. A text cast of a path stays a
+            // typed read, which yields the bare (unquoted) string value.
+            if path.is_empty() && target == Type::Utf8 {
+                return Ok(Expression::Cast(Cast {
+                    target_arrow: physical_arrow_type(&target),
+                    target,
+                    source: Box::new(input),
+                }));
+            }
             return Ok(Expression::Function(Function::VariantGet(VariantGet {
                 input: Box::new(input),
                 path,

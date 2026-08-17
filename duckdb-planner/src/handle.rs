@@ -877,14 +877,6 @@ impl<'plan> ComparisonJoin<'plan> {
         Ok(ffi::lo_is_late_materialization_join(self.raw)?)
     }
 
-    /// The full-column (LHS) side's output storage columns (row-id excluded) that
-    /// the late-materialization fetch re-reads for the surviving rows.
-    pub fn columns(self) -> Result<Vec<usize>> {
-        (0..ffi::lo_late_materialization_column_count(self.raw)?)
-            .map(|i| Ok(ffi::lo_late_materialization_column(self.raw, i)?))
-            .collect()
-    }
-
     /// The join's [`JoinType`] (INNER/SEMI/...).
     pub fn join_type(self) -> Result<JoinType> {
         Ok(JoinType::from_u8(ffi::lo_join_type(self.raw)?))

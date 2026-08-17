@@ -1,8 +1,10 @@
 //! [`Materialize`] — late-materialization fetch of extra columns.
 
+use super::input::{describe_scan_columns, plan_scan_projection};
 use crate::catalog::BoundTable;
 use crate::compile::Error;
-use dispatch::{Projection as DispatchProjection, RecordBatchOperatorSpec};
+use crate::expression::Expression;
+use dispatch::RecordBatchOperatorSpec;
 use std::fmt;
 
 /// Late-materialization fetch: re-reads `columns` from the table for the rows
@@ -19,18 +21,16 @@ use std::fmt;
 #[derive(Debug)]
 pub struct Materialize {
     pub table: Box<dyn BoundTable>,
-    /// BoundTable-schema (storage) column indices to fetch, in output order.
-    pub columns: Vec<usize>,
+    /// Output columns to fetch, in output order: each a [`Ref`](crate::expression::Ref)
+    /// into the table schema or a pushed variant field extract (a
+    /// [`VariantGet`](crate::expression::VariantGet) over one), exactly the
+    /// shape an [`Input`](super::Input)'s columns take.
+    pub columns: Vec<Expression>,
 }
 
 impl fmt::Display for Materialize {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let cols = self
-            .columns
-            .iter()
-            .map(|c| format!("#{c}"))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let cols = describe_scan_columns(self.table.as_ref(), &self.columns);
         write!(f, "Materialize([{cols}])")
     }
 }
@@ -40,9 +40,15 @@ impl Materialize {
         &self,
         input: RecordBatchOperatorSpec,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        let projection = DispatchProjection::columns(self.columns.iter().copied());
-        self.table
+        let (projection, extract_projection) =
+            plan_scan_projection(&self.columns, self.table.as_ref())?;
+        let fetched = self
+            .table
             .materialize(input, projection)
-            .map_err(Error::TableScan)
+            .map_err(Error::TableScan)?;
+        match extract_projection {
+            Some(extract_projection) => extract_projection.compile(fetched),
+            None => Ok(fetched),
+        }
     }
 }

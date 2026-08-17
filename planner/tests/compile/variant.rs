@@ -430,3 +430,103 @@ fn orders_and_limits_by_a_cast_path(mut testing_planner: TestingPlanner) {
     let got: Vec<Option<i64>> = rows.iter().map(|r| r["a"].as_i64()).collect();
     assert_eq!(got, vec![Some(10), Some(25)]);
 }
+
+/// The whole document renders as JSON when the file shreds a nested path, so
+/// the typed leaves sit under an object typed_value with its own object child.
+#[rstest]
+fn selects_the_whole_document_with_nested_shredding(mut testing_planner: TestingPlanner) {
+    shredded_docs_table(
+        &mut testing_planner,
+        vec![r#"{"user":{"id":7}}"#],
+        "user.id",
+        &DataType::Int64,
+    );
+
+    let rows = run(&mut testing_planner, "SELECT d FROM docs");
+
+    let got: Vec<Option<&str>> = rows.iter().map(|r| only_column(r).as_str()).collect();
+    assert_eq!(got, vec![Some(r#"{"user":{"id":7}}"#)]);
+}
+
+/// A bare extraction of a shredded object renders the sub-variant as JSON.
+#[rstest]
+fn bare_extraction_of_a_shredded_object_renders_json(mut testing_planner: TestingPlanner) {
+    shredded_docs_table(
+        &mut testing_planner,
+        vec![r#"{"user":{"id":7}}"#],
+        "user.id",
+        &DataType::Int64,
+    );
+
+    let rows = run(&mut testing_planner, "SELECT d->'user' AS u FROM docs");
+
+    let got: Vec<Option<&str>> = rows.iter().map(|r| r["u"].as_str()).collect();
+    assert_eq!(got, vec![Some(r#"{"id":7}"#)]);
+}
+
+/// Casting the whole document to VARCHAR over a shredded file renders it as
+/// JSON, folding the typed leaves back into the text.
+#[rstest]
+fn casts_the_whole_shredded_document_to_string(mut testing_planner: TestingPlanner) {
+    shredded_docs_table(
+        &mut testing_planner,
+        vec![r#"{"user":{"id":7}}"#],
+        "user.id",
+        &DataType::Int64,
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT CAST(d AS VARCHAR) AS j FROM docs",
+    );
+
+    let got: Vec<Option<&str>> = rows.iter().map(|r| r["j"].as_str()).collect();
+    assert_eq!(got, vec![Some(r#"{"user":{"id":7}}"#)]);
+}
+
+/// A cast path under a plain LIMIT with OFFSET: DuckDB late-materializes the
+/// scan into a narrow row-id pipeline plus a fetch of the surviving rows, and
+/// the fetch must keep the pushed field extract rather than hand back the
+/// whole document column.
+#[rstest]
+fn casts_a_path_under_late_materialization(mut testing_planner: TestingPlanner) {
+    shredded_docs_table(
+        &mut testing_planner,
+        vec![
+            r#"{"age":30}"#,
+            r#"{"age":25}"#,
+            r#"{"age":40}"#,
+            r#"{"age":10}"#,
+        ],
+        "age",
+        &DataType::Int64,
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT CAST(d->'age' AS BIGINT) AS a FROM docs LIMIT 2 OFFSET 1",
+    );
+
+    let got: Vec<Option<i64>> = rows.iter().map(|r| r["a"].as_i64()).collect();
+    assert_eq!(got, vec![Some(25), Some(40)]);
+}
+
+/// A bare extraction under a late-materialized LIMIT renders the sub-variant
+/// as JSON text, exactly as it does without the limit.
+#[rstest]
+fn bare_extraction_under_late_materialization(mut testing_planner: TestingPlanner) {
+    shredded_docs_table(
+        &mut testing_planner,
+        vec![r#"{"age":30}"#, r#"{"age":25}"#, r#"{"age":40}"#],
+        "age",
+        &DataType::Int64,
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT d->'age' AS a FROM docs LIMIT 2 OFFSET 1",
+    );
+
+    let got: Vec<Option<&str>> = rows.iter().map(|r| r["a"].as_str()).collect();
+    assert_eq!(got, vec![Some("25"), Some("40")]);
+}

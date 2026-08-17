@@ -34,23 +34,7 @@ pub struct Input {
 
 impl fmt::Display for Input {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Resolve each scanned column's positional index back to its real name
-        // from the table schema, so a plan dump reads like the source query
-        // (e.g. `Input([URL:Utf8])`) rather than `Input([#2:Utf8])`. Falls back
-        // to the bare reference for the COUNT(*) sentinel index or any non-`Ref`.
-        let schema = self.table.columns();
-        let cols = self
-            .columns
-            .iter()
-            .map(|c| match c {
-                Expression::Ref(r) => match schema.get(r.column_idx) {
-                    Some(column) => format!("{}:{}", column.name, r.return_type),
-                    None => r.to_string(),
-                },
-                _ => c.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
+        let cols = describe_scan_columns(self.table.as_ref(), &self.columns);
         write!(f, "Input([{cols}])")
     }
 }
@@ -61,56 +45,8 @@ impl Input {
         dispatcher: &DataFlowDispatcher,
         slots: &mut DynamicFilterSlots,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        // Each output column is either a plain column read (`Ref`) or a pushed
-        // variant field extract (`VariantGet` over a `Ref`), where DuckDB's
-        // projection-pushdown pushed the path into the scan so the reader emits
-        // only the referenced leaf. `column_indices` and `extracts` stay
-        // parallel: the extract at each position, or `None` for a plain read.
-        let mut column_indices: Vec<usize> = Vec::with_capacity(self.columns.len());
-        let mut extracts: Vec<Option<VariantExtract>> = Vec::with_capacity(self.columns.len());
-        // For a table that does not apply extracts itself: the type the scan
-        // emits at each position, and the extraction to run over it. Kept in
-        // step with `column_indices`.
-        let mut above_scan: Vec<(Type, Option<&VariantGet>)> =
-            Vec::with_capacity(self.columns.len());
-        for expr in &self.columns {
-            match expr {
-                // DuckDB emits column_idx == usize::MAX as a sentinel for "no
-                // column needed" (e.g. COUNT(*) scans). Skip these.
-                Expression::Ref(r) if r.column_idx == usize::MAX => {}
-                Expression::Ref(r) => {
-                    column_indices.push(r.column_idx);
-                    extracts.push(None);
-                    above_scan.push((r.return_type.clone(), None));
-                }
-                Expression::Function(Function::VariantGet(vg)) => {
-                    let Expression::Ref(r) = vg.input.as_ref() else {
-                        return Err(Error::UnexpectedInputExpression(expr.clone()));
-                    };
-                    // A cast pushes a typed scalar read; a bare extract (no
-                    // cast) pushes a sub-variant read. The scan resolves either
-                    // against each file's shredding.
-                    column_indices.push(r.column_idx);
-                    extracts.push(Some(VariantExtract {
-                        path: vg.path.clone(),
-                        as_type: vg.as_type.as_ref().map(physical_arrow_type),
-                    }));
-                    above_scan.push((r.return_type.clone(), Some(vg)));
-                }
-                _ => return Err(Error::UnexpectedInputExpression(expr.clone())),
-            }
-        }
-
-        let pushed = !extracts.iter().all(Option::is_none);
-        // A table that does not resolve paths itself reads the whole variant
-        // column, and the extraction runs as an ordinary projection above the
-        // scan. The answer is the same either way; only the bytes read differ.
-        let extract_above_scan = pushed && !self.table.applies_variant_extracts();
-        let projection = if pushed && !extract_above_scan {
-            DispatchProjection::columns_with_extracts(column_indices, extracts)
-        } else {
-            DispatchProjection::columns(column_indices)
-        };
+        let (projection, extract_projection) =
+            plan_scan_projection(&self.columns, self.table.as_ref())?;
         let dynamic_filters = build_dynamic_scan_predicates(&self.dynamic_filters, slots);
         let scan = self
             .table
@@ -121,33 +57,119 @@ impl Input {
                 self.emit_row_group_metadata,
             )
             .map_err(Error::TableScan)?;
-        if !extract_above_scan {
-            return Ok(scan);
+        match extract_projection {
+            Some(extract_projection) => extract_projection.compile(scan),
+            None => Ok(scan),
         }
-        // Each projection entry reads the scan's own output positionally, which
-        // is where the variant column landed regardless of its index in the
-        // table's schema.
-        let projections = above_scan
-            .into_iter()
-            .enumerate()
-            .map(|(position, (return_type, extraction))| {
-                let column = Expression::Ref(Ref {
-                    column_idx: position,
-                    return_type,
-                    name: None,
-                });
-                match extraction {
-                    None => column,
-                    Some(vg) => Expression::Function(Function::VariantGet(VariantGet {
-                        input: Box::new(column),
-                        path: vg.path.clone(),
-                        as_type: vg.as_type.clone(),
-                    })),
-                }
-            })
-            .collect();
-        Projection { projections }.compile(scan)
     }
+}
+
+/// Turns a table read's output expressions into the [`DispatchProjection`] to
+/// hand the table and, for a table that does not apply variant extracts
+/// itself, the projection to run above the emitted columns. Shared by
+/// [`Input`] (the scan) and [`Materialize`](super::Materialize) (the
+/// late-materialization fetch), which read the same column expression shape.
+///
+/// Each output column is either a plain column read (`Ref`) or a pushed
+/// variant field extract (`VariantGet` over a `Ref`), where DuckDB's
+/// projection-pushdown pushed the path into the read so it emits only the
+/// referenced leaf.
+pub(crate) fn plan_scan_projection(
+    columns: &[Expression],
+    table: &dyn BoundTable,
+) -> Result<(DispatchProjection, Option<Projection>), Error> {
+    // `column_indices` and `extracts` stay parallel: the extract at each
+    // position, or `None` for a plain read.
+    let mut column_indices: Vec<usize> = Vec::with_capacity(columns.len());
+    let mut extracts: Vec<Option<VariantExtract>> = Vec::with_capacity(columns.len());
+    // For a table that does not apply extracts itself: the type the read
+    // emits at each position, and the extraction to run over it. Kept in
+    // step with `column_indices`.
+    let mut above_scan: Vec<(Type, Option<&VariantGet>)> = Vec::with_capacity(columns.len());
+    for expr in columns {
+        match expr {
+            // DuckDB emits column_idx == usize::MAX as a sentinel for "no
+            // column needed" (e.g. COUNT(*) scans). Skip these.
+            Expression::Ref(r) if r.column_idx == usize::MAX => {}
+            Expression::Ref(r) => {
+                column_indices.push(r.column_idx);
+                extracts.push(None);
+                above_scan.push((r.return_type.clone(), None));
+            }
+            Expression::Function(Function::VariantGet(vg)) => {
+                let Expression::Ref(r) = vg.input.as_ref() else {
+                    return Err(Error::UnexpectedInputExpression(expr.clone()));
+                };
+                // A cast pushes a typed scalar read; a bare extract (no
+                // cast) pushes a sub-variant read. The read resolves either
+                // against each file's shredding.
+                column_indices.push(r.column_idx);
+                extracts.push(Some(VariantExtract {
+                    path: vg.path.clone(),
+                    as_type: vg.as_type.as_ref().map(physical_arrow_type),
+                }));
+                above_scan.push((r.return_type.clone(), Some(vg)));
+            }
+            _ => return Err(Error::UnexpectedInputExpression(expr.clone())),
+        }
+    }
+
+    let pushed = !extracts.iter().all(Option::is_none);
+    // A table that does not resolve paths itself reads the whole variant
+    // column, and the extraction runs as an ordinary projection above the
+    // read. The answer is the same either way; only the bytes read differ.
+    let extract_above_scan = pushed && !table.applies_variant_extracts();
+    let projection = if pushed && !extract_above_scan {
+        DispatchProjection::columns_with_extracts(column_indices, extracts)
+    } else {
+        DispatchProjection::columns(column_indices)
+    };
+    if !extract_above_scan {
+        return Ok((projection, None));
+    }
+    // Each projection entry reads the emitted output positionally, which is
+    // where the variant column landed regardless of its index in the table's
+    // schema.
+    let projections = above_scan
+        .into_iter()
+        .enumerate()
+        .map(|(position, (return_type, extraction))| {
+            let column = Expression::Ref(Ref {
+                column_idx: position,
+                return_type,
+                name: None,
+            });
+            match extraction {
+                None => column,
+                Some(vg) => Expression::Function(Function::VariantGet(VariantGet {
+                    input: Box::new(column),
+                    path: vg.path.clone(),
+                    as_type: vg.as_type.clone(),
+                })),
+            }
+        })
+        .collect();
+    Ok((projection, Some(Projection { projections })))
+}
+
+/// Renders a table read's output expressions for a plan dump, resolving each
+/// column reference back to its real name from the table schema (e.g.
+/// `URL:Utf8` rather than `#2:Utf8`). Falls back to the bare expression for
+/// the COUNT(*) sentinel index or any non-`Ref`. Shared by the [`Input`] and
+/// [`Materialize`](super::Materialize) displays.
+pub(crate) fn describe_scan_columns(table: &dyn BoundTable, columns: &[Expression]) -> String {
+    let schema = table.columns();
+    columns
+        .iter()
+        .map(|c| match c {
+            Expression::Ref(r) => match schema.get(r.column_idx) {
+                Some(column) => format!("{}:{}", column.name, r.return_type),
+                None => r.to_string(),
+            },
+            _ => c.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Lower the Top-N's dynamic filters into logical [`DynamicScanPredicate`]s the
