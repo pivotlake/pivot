@@ -75,12 +75,22 @@ impl NumOp {
             DataType::Int8 => self.reduce_int_primitive::<A, Int8Type>(arr.as_primitive()),
             DataType::Int16 => self.reduce_int_primitive::<A, Int16Type>(arr.as_primitive()),
             DataType::Int32 => self.reduce_int_primitive::<A, Int32Type>(arr.as_primitive()),
-            DataType::Int64 => self.reduce_int_primitive::<A, Int64Type>(arr.as_primitive()),
+            DataType::Int64 => {
+                let arr = arr.as_primitive::<Int64Type>();
+                if matches!(self, NumOp::Sum) && arr.null_count() == 0 {
+                    return sum_i64_exact(arr.values()).map(A::from_i128_sum);
+                }
+                self.reduce_int_primitive::<A, Int64Type>(arr)
+            }
             DataType::UInt8 => self.reduce_int_primitive::<A, UInt8Type>(arr.as_primitive()),
             DataType::UInt16 => self.reduce_int_primitive::<A, UInt16Type>(arr.as_primitive()),
             DataType::UInt32 => self.reduce_int_primitive::<A, UInt32Type>(arr.as_primitive()),
             DataType::Decimal64(_, _) => {
-                self.reduce_int_primitive::<A, Decimal64Type>(arr.as_primitive())
+                let arr = arr.as_primitive::<Decimal64Type>();
+                if matches!(self, NumOp::Sum) && arr.null_count() == 0 {
+                    return sum_i64_exact(arr.values()).map(A::from_i128_sum);
+                }
+                self.reduce_int_primitive::<A, Decimal64Type>(arr)
             }
             DataType::Decimal128(_, _) => self.reduce_wide_primitive::<A>(arr.as_primitive()),
             other => panic!("aggregate: unsupported column type {other:?}"),
@@ -191,6 +201,45 @@ impl NumOp {
 /// [`F64Sum`]/[`F64Min`]/[`F64Max`] methods (`V = f64`, a serial `fadd`/select chain -
 /// FP arithmetic is not reassociated without fast-math - so branch-free and inlined,
 /// but not SIMD).
+/// Exact `SUM` of a null-free `i64` column as `i128`, or `None` if it is empty,
+/// in a shape the autovectoriser lifts. Folding through the generic path
+/// accumulates `i128` directly, and a serial `i128` add chain neither
+/// vectorises nor pipelines. Instead each lane keeps a wrapping `u64` sum plus
+/// a carry count and a negative count, all lane-independent: a two's-complement
+/// `v` contributes `u64(v) - 2^64·[v < 0]` to the true total, and a wrapping
+/// lane sum drops exactly `2^64` per carry-out, so
+/// `lane total = wrap + ((carries - negatives) << 64)` is exact. The counts
+/// cannot themselves overflow below `2^64` rows, and the `i128` total is
+/// bounded by `rows · 2^63`.
+fn sum_i64_exact(values: &[i64]) -> Option<i128> {
+    if values.is_empty() {
+        return None;
+    }
+    const LANES: usize = 8;
+    let mut wrap = [0u64; LANES];
+    let mut carries = [0u64; LANES];
+    let mut negatives = [0u64; LANES];
+    let chunks = values.chunks_exact(LANES);
+    let tail = chunks.remainder();
+    for chunk in chunks {
+        for lane in 0..LANES {
+            let v = chunk[lane];
+            let (sum, carry) = wrap[lane].overflowing_add(v as u64);
+            wrap[lane] = sum;
+            carries[lane] += carry as u64;
+            negatives[lane] += (v < 0) as u64;
+        }
+    }
+    let mut total: i128 = 0;
+    for lane in 0..LANES {
+        total += wrap[lane] as i128 + ((carries[lane] as i128 - negatives[lane] as i128) << 64);
+    }
+    for &v in tail {
+        total += v as i128;
+    }
+    Some(total)
+}
+
 fn fold_primitive_column<A, V, T: ArrowPrimitiveType>(
     arr: &PrimitiveArray<T>,
     seed: impl Fn(V) -> A,
@@ -729,6 +778,27 @@ mod tests {
         match kind {
             AggregationKind::Sum => arrow_schema::DataType::Decimal128(38, 0),
             _ => arrow_schema::DataType::Int64,
+        }
+    }
+
+    #[test]
+    fn sum_i64_exact_matches_reference() {
+        let cases: Vec<Vec<i64>> = vec![
+            vec![],
+            vec![i64::MIN],
+            vec![i64::MAX; 17],
+            vec![i64::MIN, i64::MAX, -1, 0, 1, i64::MIN, i64::MIN],
+            (-4000..4001).map(|v| v * 0x1234_5678_9ABC).collect(),
+        ];
+
+        for values in cases {
+            let expected = if values.is_empty() {
+                None
+            } else {
+                Some(values.iter().map(|&v| v as i128).sum::<i128>())
+            };
+
+            assert_eq!(sum_i64_exact(&values), expected, "len {}", values.len());
         }
     }
 

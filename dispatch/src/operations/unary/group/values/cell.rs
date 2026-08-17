@@ -47,8 +47,17 @@ pub trait IntCell: Cell + Ord + std::ops::Add<Output = Self> + From<i64> + Into<
     /// A single-row array — the global (no-GROUP-BY) output. `None` is a SQL NULL
     /// (an aggregate over zero rows), so the column is nullable.
     fn scalar_array(value: Option<Self>) -> ArrayRef;
+    /// Store an exactly-computed `i128` `SUM` total in this width. The wide cell
+    /// keeps it whole; the narrow cell truncates, which matches what folding the
+    /// same values through release-mode `i64` `+` would have produced — the
+    /// planner widens any sum that could actually overflow, so a narrow cell
+    /// only ever receives a fitting total.
+    fn from_i128_sum(v: i128) -> Self;
 }
 impl IntCell for i64 {
+    fn from_i128_sum(v: i128) -> Self {
+        v as i64
+    }
     type Arrow = Int64Type;
     const MAX_VALUE: Self = i64::MAX;
     const MIN_VALUE: Self = i64::MIN;
@@ -69,6 +78,9 @@ impl IntCell for i64 {
 }
 
 impl IntCell for i128 {
+    fn from_i128_sum(v: i128) -> Self {
+        v
+    }
     type Arrow = Decimal128Type;
     const MAX_VALUE: Self = i128::MAX;
     const MIN_VALUE: Self = i128::MIN;
