@@ -21,6 +21,7 @@ use dispatch::io::{AuthHeader, OpenFile, RemoteFile, open_direct_read};
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 mod gcs;
 mod local;
@@ -45,6 +46,11 @@ pub enum StoreError {
     UnsupportedUri(String),
     #[error("missing credential/config: {0}")]
     Config(String),
+    /// A conditional replace lost to a concurrent writer: the object changed
+    /// between the read and the swap. [`update_by_version_swap`] retries on it;
+    /// it surfaces only when the retries are exhausted.
+    #[error("object `{key}` was changed by another writer")]
+    VersionConflict { key: String },
     #[error("cannot open `{uri}` for Delta: {source}")]
     DeltaObjectStore {
         uri: String,
@@ -193,11 +199,30 @@ pub trait ObjectStore: Debug + Send + Sync {
     fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>>;
 
     /// Atomically replace `key` with `data` (overwriting any existing object).
-    /// Backs a small, rarely-written mutable control file like the database
-    /// manifest; reads see either the old or the new object whole, never a torn
-    /// write. (Concurrent writers are last-writer-wins — fine for the database
-    /// index, which a single server writes on the occasional `CREATE TABLE`.)
+    /// Reads see either the old or the new object whole, never a torn write.
+    /// Concurrent writers are last-writer-wins, so this backs objects with a
+    /// single writer (a table's data files); a shared mutable document goes
+    /// through [`update`](Self::update) instead.
     fn put(&self, key: &ObjectPath, data: &[u8]) -> Result<()>;
+
+    /// Atomically read-modify-write the object at `key`, so no concurrent
+    /// update through this method — from this or any other process — is ever
+    /// lost: `apply` receives the current object (`None` if it does not exist)
+    /// and returns the bytes to replace it with, or `None` to leave the store
+    /// untouched.
+    ///
+    /// A local backend holds an exclusive advisory file lock across the whole
+    /// cycle, so two writers never interleave. A remote backend replaces the
+    /// object with a version-conditional PUT (compare-and-swap on its ETag /
+    /// generation) and re-runs `apply` against the fresh object when a
+    /// concurrent writer wins the swap — so `apply` must tolerate running more
+    /// than once. Backs a small, rarely-written control document like the
+    /// database manifest.
+    fn update(
+        &self,
+        key: &ObjectPath,
+        apply: &mut dyn FnMut(Option<Vec<u8>>) -> Option<Vec<u8>>,
+    ) -> Result<()>;
 
     /// Delete `key`. Deleting an object that does not exist is not an error —
     /// the caller's goal (key absent) is already met.
@@ -311,6 +336,71 @@ pub fn local_path(uri: &str) -> &str {
     uri.strip_prefix("file://").unwrap_or(uri)
 }
 
+/// A remote backend's own token for one stored version of an object — an S3
+/// ETag, a GCS generation — presented back on a conditional replace so the swap
+/// fails (instead of clobbering) when another writer got there first.
+#[derive(Debug, Clone)]
+pub(crate) struct ObjectVersion(pub(crate) String);
+
+/// How many times a remote backend re-runs its read-apply-swap cycle when a
+/// concurrent writer swaps the object first. A retry normally follows someone
+/// else's *completed* write, so the update converges under any realistic
+/// contention; the cap turns a backend that reports conflicts forever into an
+/// error instead of a spin.
+const VERSION_SWAP_ATTEMPTS: u32 = 10;
+/// Full-jitter exponential backoff slept between swap attempts, doubling from
+/// the base up to the cap: racing writers decorrelate instead of re-colliding,
+/// and a conflict reported while a concurrent conditional write is still
+/// settling (S3's 409) gets time to clear before the next attempt.
+const VERSION_SWAP_BACKOFF_BASE: Duration = Duration::from_millis(10);
+const VERSION_SWAP_BACKOFF_CAP: Duration = Duration::from_secs(1);
+
+/// A sleep drawn from `[0, ceiling)` to decorrelate retries. Seeded from the
+/// clock's subsecond nanoseconds: not statistically random, but plenty to keep
+/// two writers that just conflicted from retrying in lockstep.
+fn jittered(ceiling: Duration) -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .subsec_nanos() as u64;
+    Duration::from_nanos(nanos % (ceiling.as_nanos() as u64).max(1))
+}
+
+/// A remote backend's optimistic [`ObjectStore::update`]: `read` the object
+/// with its version token, `apply` the modification, and `swap` the result in
+/// conditionally on that token (`None`: the object must not exist). A swap that
+/// loses to a concurrent writer re-runs the cycle against the fresh object,
+/// after a jittered backoff. Blocking sleeps, like every store call here: this
+/// runs on the blocking pool or control thread, never on the reactor.
+pub(crate) fn update_by_version_swap(
+    read: impl Fn() -> Result<Option<(Vec<u8>, ObjectVersion)>>,
+    swap: impl Fn(&[u8], Option<&ObjectVersion>) -> Result<()>,
+    apply: &mut dyn FnMut(Option<Vec<u8>>) -> Option<Vec<u8>>,
+) -> Result<()> {
+    let mut conflict = None;
+    for attempt in 0..VERSION_SWAP_ATTEMPTS {
+        let (bytes, version) = match read()? {
+            Some((bytes, version)) => (Some(bytes), Some(version)),
+            None => (None, None),
+        };
+        let Some(replacement) = apply(bytes) else {
+            return Ok(());
+        };
+        match swap(&replacement, version.as_ref()) {
+            Ok(()) => return Ok(()),
+            Err(error @ StoreError::VersionConflict { .. }) => conflict = Some(error),
+            Err(error) => return Err(error),
+        }
+        if attempt + 1 < VERSION_SWAP_ATTEMPTS {
+            let ceiling = VERSION_SWAP_BACKOFF_BASE
+                .saturating_mul(1 << attempt)
+                .min(VERSION_SWAP_BACKOFF_CAP);
+            std::thread::sleep(jittered(ceiling));
+        }
+    }
+    Err(conflict.expect("a retry only follows a recorded conflict"))
+}
+
 /// Open the object store for a catalog root URI: `s3://bucket/prefix`,
 /// `gs://bucket/prefix`, or a local path (optionally `file://`). Credentials
 /// come from the environment; a caller holding its own opens the backend
@@ -420,6 +510,45 @@ mod tests {
             object_key("", &ObjectPath::new("/shared/a.parquet")),
             "shared/a.parquet"
         );
+    }
+
+    #[test]
+    fn version_swap_update_reapplies_over_a_concurrent_winner() {
+        use std::cell::{Cell, RefCell};
+        // A fake remote object: (bytes, version). The first swap loses to a
+        // concurrent writer that lands "7" and bumps the version.
+        let stored = RefCell::new((b"1".to_vec(), 1u64));
+        let conflicts = Cell::new(1);
+        let read = || {
+            let stored = stored.borrow();
+            Ok(Some((
+                stored.0.clone(),
+                ObjectVersion(stored.1.to_string()),
+            )))
+        };
+        let swap = |data: &[u8], expected: Option<&ObjectVersion>| {
+            let mut stored = stored.borrow_mut();
+            if conflicts.get() > 0 {
+                conflicts.set(conflicts.get() - 1);
+                *stored = (b"7".to_vec(), stored.1 + 1);
+                return Err(StoreError::VersionConflict { key: "k".into() });
+            }
+            assert_eq!(expected.unwrap().0, stored.1.to_string());
+            *stored = (data.to_vec(), stored.1 + 1);
+            Ok(())
+        };
+
+        update_by_version_swap(read, swap, &mut |current| {
+            let value: u64 = String::from_utf8(current.unwrap())
+                .unwrap()
+                .parse()
+                .unwrap();
+            Some((value + 1).to_string().into_bytes())
+        })
+        .unwrap();
+
+        // The increment re-applied over the winner's "7", not over the stale "1".
+        assert_eq!(stored.borrow().0, b"8");
     }
 
     #[test]

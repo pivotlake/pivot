@@ -8,7 +8,7 @@
 //! absent, so `cargo test` stays green offline.
 //!
 //! Covered: store contract (round-trip through `source` and `sink`, one-level
-//! `list`), and the table lifecycle end to end — `CREATE TABLE`,
+//! `list`, lost-update-free `update`), and the table lifecycle end to end — `CREATE TABLE`,
 //! reopen, **appending a file** (out-of-band registration), and **compaction**
 //! (replacing files) — all over object storage.
 
@@ -252,6 +252,38 @@ mod bodies {
         );
     }
 
+    /// Concurrent `update`s of one object never lose a write: each writer bumps
+    /// a counter in the object's body, and every bump survives. Locally the
+    /// writers serialize on the update's file lock; remotely each replace is a
+    /// compare-and-swap on the object's version, retried until it wins.
+    pub fn update_never_loses_a_write(b: &Backend) {
+        let key = ObjectPath::new("control/counter.txt");
+        let (writers, bumps) = (4, 8);
+
+        std::thread::scope(|scope| {
+            for _ in 0..writers {
+                scope.spawn(|| {
+                    for _ in 0..bumps {
+                        b.store
+                            .update(&key, &mut |current| {
+                                let count: u64 = current
+                                    .map(|bytes| String::from_utf8(bytes).unwrap().parse().unwrap())
+                                    .unwrap_or(0);
+                                Some((count + 1).to_string().into_bytes())
+                            })
+                            .unwrap();
+                    }
+                });
+            }
+        });
+
+        let bytes = b.store.get(&key).unwrap().unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            (writers * bumps).to_string()
+        );
+    }
+
     /// `list` is one level only: a nested object is not returned.
     pub fn list_is_one_level(b: &Backend) {
         b.store.put(&ObjectPath::new("d/x.bin"), b"abc").unwrap();
@@ -305,4 +337,5 @@ backend_tests!(append_registers_new_file);
 backend_tests!(compaction_replaces_files);
 backend_tests!(source_reads_object_back);
 backend_tests!(sink_writes_object_back);
+backend_tests!(update_never_loses_a_write);
 backend_tests!(list_is_one_level);
