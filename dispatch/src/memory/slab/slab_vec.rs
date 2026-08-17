@@ -6,6 +6,15 @@ use super::{SlabAllocator, SlabBuffer};
 /// chunks rather than one contiguous allocation, so appends never reallocate. A
 /// cached base pointer into the current chunk keeps [`push`](Self::push) and
 /// [`for_each`](Self::for_each) sequential (no per-element index math).
+///
+/// A `SlabVec` follows its element's thread-safety: it is `Send` only for
+/// `T: Send`. A `Copy` type that must not cross threads (a raw pointer, say)
+/// keeps blocking the impl:
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<dispatch::memory::SlabVec<*const u8>>();
+/// ```
 pub struct SlabVec<T: Copy> {
     chunks: Vec<SlabBuffer<T>>,
     cur_base: *mut T,
@@ -160,6 +169,15 @@ impl<T: Copy> SlabVec<T> {
 mod tests {
     use super::*;
     use crate::memory::init_test_free_pool;
+
+    /// The `T: Send` side of the bound the struct doc's `compile_fail` example
+    /// guards: an ordinary element type must keep the vec sendable.
+    #[test]
+    fn a_slab_vec_of_send_elements_is_send() {
+        fn assert_send<T: Send>() {}
+
+        assert_send::<SlabVec<u64>>();
+    }
 
     /// A `SlabVec<u64>` holding `0..n`, plus the allocator that owns the slab
     /// memory its chunks point into (kept alive for the vec's lifetime).

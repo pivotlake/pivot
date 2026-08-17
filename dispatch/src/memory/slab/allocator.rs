@@ -242,6 +242,28 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "align was 3")]
+    fn get_aligned_slab_rejects_a_non_power_of_two_align() {
+        // The align-up mask arithmetic is only correct for powers of two; a
+        // release build would otherwise mis-align silently.
+        init_test_free_pool(2);
+        let mut alloc = SlabAllocator::new(false);
+
+        alloc.get_aligned_slab(64, 3, false);
+    }
+
+    #[test]
+    #[should_panic(expected = "size 2097152 + align 4096")]
+    fn get_aligned_slab_rejects_a_request_larger_than_one_buffer() {
+        // Without the guard a release build would carve past the 2MB slot into
+        // its neighbor.
+        init_test_free_pool(2);
+        let mut alloc = SlabAllocator::new(false);
+
+        alloc.get_aligned_slab(BUFFER_SIZE, 4096, false);
+    }
+
+    #[test]
     fn slabs_holding_parts_reassemble_across_buffers() {
         init_test_free_pool(4);
         let mut alloc = SlabAllocator::new(false);
