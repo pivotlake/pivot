@@ -44,9 +44,21 @@ struct Args {
     metastore_file: Option<PathBuf>,
 }
 
+/// Targets whose `INFO` output is noise for an operator reading the server's
+/// log: `delta_kernel` logs a multi-kilobyte snapshot dump on every log replay
+/// and a scan-metadata summary on every table refresh, which the refresh loop
+/// does for every table every few seconds. They are silenced to `WARN` by
+/// default; because these directives are parsed *before* `RUST_LOG`, naming one
+/// of them there (`RUST_LOG=info,delta_kernel=debug`) still wins.
+const QUIET_TARGETS: &str = "delta_kernel=warn,delta_kernel_default_engine=warn";
+
 fn init_tracing() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let requested = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+    let filter = tracing_subscriber::EnvFilter::try_new(format!("{QUIET_TARGETS},{requested}"))
+        .unwrap_or_else(|e| {
+            eprintln!("ignoring unparsable RUST_LOG ({requested:?}): {e}");
+            tracing_subscriber::EnvFilter::new(format!("{QUIET_TARGETS},info"))
+        });
     // Only emit ANSI colour codes to an interactive terminal; when stdout (the
     // fmt subscriber's default writer) is redirected to a log file the escape
     // sequences are just noise that breaks grep/awk and bloats the file.
