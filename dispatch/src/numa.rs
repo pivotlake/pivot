@@ -17,6 +17,18 @@ use crate::env::get_env_var_with_default;
 use core_affinity::CoreId;
 use std::collections::HashMap;
 
+/// The node contributing the most rows in a per-node tally.
+///
+/// An empty tally selects node 0. Equal nonempty tallies select the
+/// highest-indexed node, matching [`Iterator::max_by_key`].
+pub fn dominant_node(rows_by_node: &[usize]) -> usize {
+    rows_by_node
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, rows)| **rows)
+        .map_or(0, |(node_id, _)| node_id)
+}
+
 /// Describes the shape of the worker pool: equal-sized groups of workers,
 /// one group per NUMA node. Worker indices are global and dense
 /// (`0..total_workers()`), with node 0's workers first, so
@@ -48,6 +60,12 @@ impl Topology {
     /// The NUMA node group `worker` belongs to.
     pub fn node_of_worker(&self, worker: usize) -> usize {
         worker / self.workers_per_node
+    }
+
+    /// `worker`'s position within its NUMA node group, the counterpart of
+    /// [`node_of_worker`](Self::node_of_worker) for indexing per-node state.
+    pub fn local_index_of_worker(&self, worker: usize) -> usize {
+        worker % self.workers_per_node
     }
 
     /// Global indices of the workers on the same node as `worker`, itself included.

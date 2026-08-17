@@ -43,9 +43,7 @@ const PARQUET_VERSION: i32 = 1;
 pub(super) type FileAssemblerFactory = DefaultUnaryFactory<FileAssembler>;
 
 pub(super) fn factories(worker_count: usize) -> Vec<FileAssemblerFactory> {
-    (0..worker_count)
-        .map(|_| DefaultUnaryFactory::new())
-        .collect()
+    DefaultUnaryFactory::create_for_workers(worker_count)
 }
 
 /// Items accumulated until an expected count is reached. The same helper is

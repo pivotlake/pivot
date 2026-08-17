@@ -143,11 +143,7 @@ impl FileCollector {
                     batches.push(LocatedBatch::new(batch, node_id));
                 }
             }
-            let target_node = rows_by_node
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, rows)| *rows)
-                .map_or(0, |(node_id, _)| node_id);
+            let target_node = dispatch::dominant_node(&rows_by_node);
             sender.send(FileOrderInput::Ready(ReadyFile {
                 plan,
                 batches,

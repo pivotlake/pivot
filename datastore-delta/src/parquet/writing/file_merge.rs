@@ -9,38 +9,11 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use dispatch::memory::SlabAllocator;
-use dispatch::{DefaultUnaryFactory, KWayMergePlan, MergedOutput, Sender, Unary, UnaryResult};
+use dispatch::{KWayMergePlan, MergedOutput, Sender, Unary, UnaryResult};
 
 use super::types::{
     FileMergeContext, FileOrderInput, GlobalMergeJob, LocalMergeJob, LocalMergeResult, ReadyFile,
 };
-
-pub(super) type LocalMergePlannerFactory = DefaultUnaryFactory<LocalMergePlanner>;
-pub(super) type LocalMergeExecutorFactory = DefaultUnaryFactory<LocalMergeExecutor>;
-pub(super) type GlobalMergePlannerFactory = DefaultUnaryFactory<GlobalMergePlanner>;
-pub(super) type GlobalMergeExecutorFactory = DefaultUnaryFactory<GlobalMergeExecutor>;
-
-pub(super) fn local_planner_factories(worker_count: usize) -> Vec<LocalMergePlannerFactory> {
-    default_factories(worker_count)
-}
-
-pub(super) fn local_executor_factories(worker_count: usize) -> Vec<LocalMergeExecutorFactory> {
-    default_factories(worker_count)
-}
-
-pub(super) fn global_planner_factories(worker_count: usize) -> Vec<GlobalMergePlannerFactory> {
-    default_factories(worker_count)
-}
-
-pub(super) fn global_executor_factories(worker_count: usize) -> Vec<GlobalMergeExecutorFactory> {
-    default_factories(worker_count)
-}
-
-fn default_factories<T: Default>(worker_count: usize) -> Vec<DefaultUnaryFactory<T>> {
-    (0..worker_count)
-        .map(|_| DefaultUnaryFactory::new())
-        .collect()
-}
 
 #[derive(Default)]
 pub(super) struct LocalMergePlanner;
@@ -234,11 +207,7 @@ fn ready_file(context: &Arc<FileMergeContext>, output: MergedOutput) -> ReadyFil
     for batch in output.batches() {
         rows_by_node[batch.node_id()] += batch.batch().num_rows();
     }
-    let target_node = rows_by_node
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, rows)| *rows)
-        .map_or(0, |(node_id, _)| node_id);
+    let target_node = dispatch::dominant_node(&rows_by_node);
     ReadyFile {
         plan: context.plan.clone(),
         batches: output.into_batches(),

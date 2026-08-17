@@ -308,10 +308,10 @@ fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
 #[test]
 fn create_fetches_footers_across_workers_before_commit() {
     // Production runs CREATE TABLE with workers = cores: the files are stolen
-    // and their footers read by many workers, the row groups fan in to worker 0,
-    // and only worker 0 stages the completed creation. The coordinator commits
-    // it after the dataflow finishes. Cover that shape (the other tests are
-    // single-worker).
+    // and their footers read by many workers, the row groups fan in to one
+    // selected worker, and only that worker stages the completed creation. The
+    // coordinator commits it after the dataflow finishes. Cover that shape
+    // (the other tests are single-worker).
     //
     // Tests run with eviction disabled (`PANIC_ON_EVICT` defaults to true), so a
     // cached footer/row-group region pins its ring slot for the lifetime of the
@@ -346,7 +346,7 @@ fn create_fetches_footers_across_workers_before_commit() {
     assert_eq!(results.iter().map(|b| b.num_rows()).sum::<usize>(), 24);
 
     // The no-data case drives the same fan-in with nothing to fetch: every
-    // worker's sink finishes empty and worker 0 still commits.
+    // worker's sink finishes empty and the selected worker still commits.
     create(&dispatch, &datastore, rooted_request("empty", columns())).unwrap();
     assert!(
         datastore

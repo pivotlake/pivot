@@ -45,7 +45,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{self, AtomicUsize};
+use std::sync::atomic::AtomicUsize;
 
 use arrow_array::ArrowNativeTypeOp;
 use arrow_array::RecordBatch;
@@ -319,7 +319,8 @@ impl RecordBatchOperatorSpec {
     ) -> Self {
         let siblings_left = Arc::new(AtomicUsize::new(self.worker_count()));
         let factories = if self.stream_ordered {
-            to_single_worker_mpsc::<RecordBatch>(self.worker_count(), 0)
+            let target = self.dispatcher.next_worker();
+            to_single_worker_mpsc::<RecordBatch>(self.worker_count(), target)
                 .into_iter()
                 .zip(unary_factories)
                 .zip(self.factories)
@@ -497,7 +498,8 @@ impl RecordBatchOperatorSpec {
     {
         let worker_count = self.worker_count();
         let siblings_left = Arc::new(AtomicUsize::new(worker_count));
-        let factories: Vec<_> = to_single_worker_mpsc::<RecordBatch>(worker_count, 0)
+        let target = self.dispatcher.next_worker();
+        let factories: Vec<_> = to_single_worker_mpsc::<RecordBatch>(worker_count, target)
             .into_iter()
             .zip((0..worker_count).map(|_| MapFactory(builder())))
             .zip(self.factories)
@@ -977,9 +979,8 @@ impl RecordBatchOperatorSpec {
         // Sort the build side by the key (NULLs last, so the join can drop
         // them as one tail), then funnel the sorted chunks to one worker,
         // whose consumer receives them in the order the sort emitted them.
-        // Successive range joins take turns hosting that consumer.
-        static NEXT_RANGE_HOST: AtomicUsize = AtomicUsize::new(0);
-        let target = NEXT_RANGE_HOST.fetch_add(1, atomic::Ordering::Relaxed) % worker_count;
+        // Successive single-consumer stages take turns hosting that work.
+        let target = self.dispatcher.next_worker();
         let build = build.order_by(vec![OrderBy::new(spec.build_key_index, false, false)]);
 
         let (build_factories, probe_factories, build_ready) =

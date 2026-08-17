@@ -104,11 +104,7 @@ fn emit_column_chunk_jobs(
                 rows_consumed_from_batch = 0;
             }
         }
-        let target_node = rows_by_node
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, rows)| *rows)
-            .map_or(0, |(node_id, _)| node_id);
+        let target_node = dispatch::dominant_node(&rows_by_node);
 
         let context = Arc::new(RowGroupContext {
             row_group_id: plan.base_row_group_id + row_group_index as u64,

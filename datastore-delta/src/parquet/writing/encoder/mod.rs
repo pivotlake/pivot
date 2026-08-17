@@ -34,9 +34,7 @@ use leaves::Leaf;
 pub(super) type ColumnEncoderFactory = DefaultUnaryFactory<ColumnEncoder>;
 
 pub(super) fn factories(worker_count: usize) -> Vec<ColumnEncoderFactory> {
-    (0..worker_count)
-        .map(|_| DefaultUnaryFactory::new())
-        .collect()
+    DefaultUnaryFactory::create_for_workers(worker_count)
 }
 
 #[derive(Default)]

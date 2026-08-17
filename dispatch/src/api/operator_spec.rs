@@ -118,7 +118,7 @@ impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O,
     /// the channel kind lets a stage fan out work ([`stealable`]) or pin items
     /// to a worker (`return_to_worker_mpsc`); per-worker `unaries` let a
     /// pipeline breaker give one worker a distinct role (e.g. the receiver end
-    /// of a worker-0 merge). The `siblings_left` finishing counter is set up for
+    /// of a single-worker merge). The `siblings_left` finishing counter is set up for
     /// you.
     pub fn chain<O2, UF, C>(
         self,

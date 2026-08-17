@@ -17,6 +17,11 @@ impl<U> DefaultUnaryFactory<U> {
             _phantom: Default::default(),
         }
     }
+
+    /// Creates one default factory for each dispatch worker.
+    pub fn create_for_workers(worker_count: usize) -> Vec<Self> {
+        (0..worker_count).map(|_| Self::new()).collect()
+    }
 }
 
 impl<U> Default for DefaultUnaryFactory<U> {

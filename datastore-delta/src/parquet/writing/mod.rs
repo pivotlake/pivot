@@ -55,13 +55,12 @@ pub(crate) use shredding::unshred_batch;
 pub(crate) use types::AssembledFile;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use dispatch::{
-    OperatorFactory, OperatorSpec, OrderBy, RecordBatchOperatorSpec, node_work_queue,
-    return_to_worker_mpsc, shared_work_queue, stealable, to_single_worker_mpsc,
+    DefaultUnaryFactory, OperatorFactory, OperatorSpec, OrderBy, RecordBatchOperatorSpec,
+    node_work_queue, return_to_worker_mpsc, shared_work_queue, stealable, to_single_worker_mpsc,
 };
 
 use partition_sorter::{PartitionSorterFactory, SortedPartitionRun};
@@ -69,10 +68,6 @@ use types::{
     ColumnChunkJob, EncodedColumnChunk, FileOrderInput, GlobalMergeJob, LocalMergeJob,
     LocalMergeResult, ReadyFile,
 };
-
-/// Rotates the single file-collector stage across workers for successive
-/// writes.
-static NEXT_FILE_COLLECTOR_HOST: AtomicUsize = AtomicUsize::new(0);
 
 /// Appends Parquet construction to an existing record-batch dataflow.
 ///
@@ -109,8 +104,7 @@ pub(crate) fn encode_record_batches_spec(
 
     let (dispatcher, heads) = spec.into_parts();
     let worker_count = heads.len();
-    let file_collector_worker =
-        NEXT_FILE_COLLECTOR_HOST.fetch_add(1, Ordering::Relaxed) % worker_count;
+    let file_collector_worker = dispatcher.next_worker();
     let input_batches = OperatorSpec::new(dispatcher, heads.into_iter().collect::<Vec<_>>());
     let topology = input_batches.dispatcher().topology();
     input_batches
@@ -138,25 +132,27 @@ pub(crate) fn encode_record_batches_spec(
             node_work_queue::<FileOrderInput>(topology)
                 .into_iter()
                 .collect(),
-            file_merge::local_planner_factories(worker_count),
+            DefaultUnaryFactory::<file_merge::LocalMergePlanner>::create_for_workers(worker_count),
         )
         .chain(
             node_work_queue::<LocalMergeJob>(topology)
                 .into_iter()
                 .collect(),
-            file_merge::local_executor_factories(worker_count),
+            DefaultUnaryFactory::<file_merge::LocalMergeExecutor>::create_for_workers(worker_count),
         )
         .chain(
             shared_work_queue::<LocalMergeResult>(worker_count)
                 .into_iter()
                 .collect(),
-            file_merge::global_planner_factories(worker_count),
+            DefaultUnaryFactory::<file_merge::GlobalMergePlanner>::create_for_workers(worker_count),
         )
         .chain(
             node_work_queue::<GlobalMergeJob>(topology)
                 .into_iter()
                 .collect(),
-            file_merge::global_executor_factories(worker_count),
+            DefaultUnaryFactory::<file_merge::GlobalMergeExecutor>::create_for_workers(
+                worker_count,
+            ),
         )
         .chain(
             node_work_queue::<ReadyFile>(topology).into_iter().collect(),
