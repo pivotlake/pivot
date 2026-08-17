@@ -29,7 +29,20 @@ use crate::operations::channels::NodeIdOutput;
 use crate::operations::unary::order_by_limit::OrderBy;
 
 use super::batch_sort::MERGE_SLICE_ROWS;
-use super::keys::{KeyOrdering, RunRow, SelectedKeyOrdering, select_key_ordering};
+use super::keys::{
+    KeyOrdering, RunRow, SelectedKeyOrdering, select_key_ordering, with_key_ordering,
+};
+
+/// The node contributing the most rows in a per-node tally, node 0 when the
+/// tally is empty or all zero. Merge and write stages route their output work
+/// through this one policy.
+pub fn dominant_node(rows_by_node: &[usize]) -> usize {
+    rows_by_node
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, rows)| **rows)
+        .map_or(0, |(node_id, _)| node_id)
+}
 
 /// The range contributed by every input run to one independently executable
 /// part of the merged output.
@@ -89,17 +102,15 @@ impl ParallelKWayMerge {
                 });
             }
         } else {
-            match select_key_ordering(&order_by, &batches, &batches)? {
-                SelectedKeyOrdering::FixedWidth(mut ordering) => {
-                    split_into_slices(&mut ordering, &run_indexes, all_run_rows, &mut slices)
-                }
-                SelectedKeyOrdering::ViewBytes(mut ordering) => {
-                    split_into_slices(&mut ordering, &run_indexes, all_run_rows, &mut slices)
-                }
-                SelectedKeyOrdering::General(mut ordering) => {
-                    split_into_slices(&mut ordering, &run_indexes, all_run_rows, &mut slices)
-                }
-            }
+            with_key_ordering!(
+                select_key_ordering(&order_by, &batches, &batches)?,
+                |ordering| split_into_slices(
+                    &mut ordering,
+                    &run_indexes,
+                    all_run_rows,
+                    &mut slices
+                )
+            )
         }
 
         for slice in &mut slices {
@@ -107,11 +118,7 @@ impl ParallelKWayMerge {
             for (run_index, rows) in slice.run_rows.iter().enumerate() {
                 rows_by_node[run_nodes[run_index]] += rows.len();
             }
-            slice.target_node = rows_by_node
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, rows)| *rows)
-                .map_or(0, |(node, _)| node);
+            slice.target_node = dominant_node(&rows_by_node);
         }
 
         Ok(Self {
@@ -146,17 +153,10 @@ impl ParallelKWayMerge {
                 self.slices.len()
             ))
         })?;
-        let mapping = match select_key_ordering(&self.order_by, &self.batches, &self.batches)? {
-            SelectedKeyOrdering::FixedWidth(mut ordering) => {
-                slice_mapping(&mut ordering, &self.run_indexes, &slice.run_rows)
-            }
-            SelectedKeyOrdering::ViewBytes(mut ordering) => {
-                slice_mapping(&mut ordering, &self.run_indexes, &slice.run_rows)
-            }
-            SelectedKeyOrdering::General(mut ordering) => {
-                slice_mapping(&mut ordering, &self.run_indexes, &slice.run_rows)
-            }
-        };
+        let mapping = with_key_ordering!(
+            select_key_ordering(&self.order_by, &self.batches, &self.batches)?,
+            |ordering| slice_mapping(&mut ordering, &self.run_indexes, &slice.run_rows)
+        );
 
         let schema = self.batches[0].schema();
         let mut output_columns = Vec::with_capacity(schema.fields().len());
@@ -188,10 +188,6 @@ impl MergeRun {
             row_count,
             node_id,
         }
-    }
-
-    pub fn row_count(&self) -> usize {
-        self.row_count
     }
 
     pub fn node_id(&self) -> usize {
@@ -344,17 +340,10 @@ fn runs_concatenate_in_order(order_by: &[OrderBy], runs: &[MergeRun]) -> Result<
             row: left_batch.num_rows() - 1,
         };
         let right_row = RunRow { chunk: 0, row: 0 };
-        let in_order = match select_key_ordering(order_by, left, right)? {
-            SelectedKeyOrdering::FixedWidth(mut ordering) => {
+        let in_order =
+            with_key_ordering!(select_key_ordering(order_by, left, right)?, |ordering| {
                 ordering.compare(left_row, right_row) != Ordering::Greater
-            }
-            SelectedKeyOrdering::ViewBytes(mut ordering) => {
-                ordering.compare(left_row, right_row) != Ordering::Greater
-            }
-            SelectedKeyOrdering::General(mut ordering) => {
-                ordering.compare(left_row, right_row) != Ordering::Greater
-            }
-        };
+            });
         if !in_order {
             return Ok(false);
         }
@@ -461,50 +450,64 @@ fn build_run_indexes(runs: &[Vec<RecordBatch>]) -> Vec<RunIndex> {
 fn split_into_slices<K: KeyOrdering>(
     ordering: &mut K,
     run_indexes: &[RunIndex],
-    run_rows: Vec<Range<usize>>,
+    mut run_rows: Vec<Range<usize>>,
     slices: &mut Vec<KWayMergeSlice>,
 ) {
-    let row_count: usize = run_rows.iter().map(Range::len).sum();
-    if row_count == 0 {
-        return;
-    }
-    if row_count <= MERGE_SLICE_ROWS {
-        slices.push(KWayMergeSlice {
-            run_rows,
-            target_node: 0,
-        });
-        return;
-    }
+    loop {
+        let row_count: usize = run_rows.iter().map(Range::len).sum();
+        if row_count == 0 {
+            return;
+        }
+        if row_count <= MERGE_SLICE_ROWS {
+            slices.push(KWayMergeSlice {
+                run_rows,
+                target_node: 0,
+            });
+            return;
+        }
 
-    let pivot_run = run_rows
-        .iter()
-        .enumerate()
-        .max_by_key(|(_, rows)| rows.len())
-        .expect("a nonempty merge has at least one run")
-        .0;
-    let pivot_row = run_rows[pivot_run].start + run_rows[pivot_run].len() / 2;
-    let pivot = run_indexes[pivot_run].locate(pivot_row);
+        let pivot_run = run_rows
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, rows)| rows.len())
+            .expect("a nonempty merge has at least one run")
+            .0;
+        let pivot_row = run_rows[pivot_run].start + run_rows[pivot_run].len() / 2;
+        let pivot = run_indexes[pivot_run].locate(pivot_row);
 
-    let mut rows_before_pivot = Vec::with_capacity(run_rows.len());
-    let mut rows_from_pivot = Vec::with_capacity(run_rows.len());
-    for (run_index, rows) in run_rows.iter().enumerate() {
-        // Run number gives equal keys one consistent side of every boundary.
-        let cut = if run_index == pivot_run {
-            pivot_row
-        } else {
-            search_cut(
-                ordering,
-                &run_indexes[run_index],
-                rows,
-                pivot,
-                run_index < pivot_run,
-            )
-        };
-        rows_before_pivot.push(rows.start..cut);
-        rows_from_pivot.push(cut..rows.end);
+        let mut rows_before_pivot = Vec::with_capacity(run_rows.len());
+        let mut rows_from_pivot = Vec::with_capacity(run_rows.len());
+        for (run_index, rows) in run_rows.iter().enumerate() {
+            // Run number gives equal keys one consistent side of every boundary.
+            let cut = if run_index == pivot_run {
+                pivot_row
+            } else {
+                search_cut(
+                    ordering,
+                    &run_indexes[run_index],
+                    rows,
+                    pivot,
+                    run_index < pivot_run,
+                )
+            };
+            rows_before_pivot.push(rows.start..cut);
+            rows_from_pivot.push(cut..rows.end);
+        }
+        // A single-row pivot run puts nothing before its own pivot, and when
+        // that pivot is also the smallest remaining key every other cut lands
+        // at its window's start too. The split would then repeat with the
+        // same input forever, so the pivot row itself becomes the left side:
+        // it precedes every remaining row, and every equal key belongs to a
+        // later run.
+        if rows_before_pivot.iter().all(|rows| rows.is_empty()) {
+            rows_before_pivot[pivot_run] = pivot_row..pivot_row + 1;
+            rows_from_pivot[pivot_run] = pivot_row + 1..run_rows[pivot_run].end;
+        }
+        split_into_slices(ordering, run_indexes, rows_before_pivot, slices);
+        // Iterating on the second half keeps the stack bounded when a split
+        // strips only a few rows.
+        run_rows = rows_from_pivot;
     }
-    split_into_slices(ordering, run_indexes, rows_before_pivot, slices);
-    split_into_slices(ordering, run_indexes, rows_from_pivot, slices);
 }
 
 /// Finds the run-local boundary corresponding to `pivot`.
@@ -754,6 +757,21 @@ mod tests {
         let keys = int_column(&merged_batches, 0);
         assert!(keys.windows(2).all(|pair| pair[0] <= pair[1]));
         assert_eq!(keys.len(), 36_000);
+    }
+
+    #[test]
+    fn descending_single_row_runs_still_split_into_bounded_slices() {
+        init_test_free_pool(64);
+        let run_count = MERGE_SLICE_ROWS + 1;
+        let runs: Vec<Vec<RecordBatch>> = (0..run_count)
+            .map(|run_index| vec![int_batch(&[(run_count - run_index) as i64])])
+            .collect();
+
+        let merged_batches = merge_all(&ascending(), &runs);
+
+        let keys = int_column(&merged_batches, 0);
+        assert_eq!(keys.len(), run_count);
+        assert!(keys.windows(2).all(|pair| pair[0] <= pair[1]));
     }
 
     #[test]

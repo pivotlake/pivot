@@ -50,6 +50,12 @@ impl Topology {
         worker / self.workers_per_node
     }
 
+    /// `worker`'s position within its NUMA node group, the counterpart of
+    /// [`node_of_worker`](Self::node_of_worker) for indexing per-node state.
+    pub fn local_index_of_worker(&self, worker: usize) -> usize {
+        worker % self.workers_per_node
+    }
+
     /// Global indices of the workers on the same node as `worker`, itself included.
     pub fn node_siblings(&self, worker: usize) -> std::ops::Range<usize> {
         let node = self.node_of_worker(worker);

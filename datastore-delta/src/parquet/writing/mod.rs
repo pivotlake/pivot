@@ -138,25 +138,25 @@ pub(crate) fn encode_record_batches_spec(
             node_work_queue::<FileOrderInput>(topology)
                 .into_iter()
                 .collect(),
-            file_merge::local_planner_factories(worker_count),
+            file_merge::factories::<file_merge::LocalMergePlanner>(worker_count),
         )
         .chain(
             node_work_queue::<LocalMergeJob>(topology)
                 .into_iter()
                 .collect(),
-            file_merge::local_executor_factories(worker_count),
+            file_merge::factories::<file_merge::LocalMergeExecutor>(worker_count),
         )
         .chain(
             shared_work_queue::<LocalMergeResult>(worker_count)
                 .into_iter()
                 .collect(),
-            file_merge::global_planner_factories(worker_count),
+            file_merge::factories::<file_merge::GlobalMergePlanner>(worker_count),
         )
         .chain(
             node_work_queue::<GlobalMergeJob>(topology)
                 .into_iter()
                 .collect(),
-            file_merge::global_executor_factories(worker_count),
+            file_merge::factories::<file_merge::GlobalMergeExecutor>(worker_count),
         )
         .chain(
             node_work_queue::<ReadyFile>(topology).into_iter().collect(),

@@ -141,9 +141,12 @@ impl PartitionSorter {
 
         let mut partition_row_order: Vec<u32> = (0..batch.num_rows() as u32).collect();
         partition_row_order.sort_unstable_by(|&left, &right| {
+            // The index tiebreak keeps each partition's rows in arrival order,
+            // which is the row order written when the table has no sort key.
             partition_keys
                 .row(left as usize)
                 .cmp(&partition_keys.row(right as usize))
+                .then(left.cmp(&right))
         });
         let allocator = self
             .allocator

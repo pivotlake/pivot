@@ -11,11 +11,11 @@
 //!   deque (LIFO for cache locality), while idle workers can steal from peers. Used for
 //!   most intermediate stages.
 //!
-//! - **[`mod@shared_work_queue`]** — One queue polled by every worker in a
+//! - **[`mod@shared_work_queue`]** - One queue polled by every worker in a
 //!   stage. Used when work should be distributed without waiting for an
 //!   idle-time steal pass.
 //!
-//! - **[`mod@node_work_queue`]** — One shared queue per NUMA node. Messages
+//! - **[`mod@node_work_queue`]** - One shared queue per NUMA node. Messages
 //!   name their target node and workers only poll their local queue.
 //!
 //! - **[`mpsc`]** — Multi-producer, single-consumer. Used for the final output channel

@@ -101,7 +101,7 @@ pub use join::{
 pub use limit::LimitFactory;
 pub use order_by::{
     KWayMergePlan, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput, OrderByFactory,
-    batch_sort_indices,
+    batch_sort_indices, dominant_node,
 };
 pub use order_by_limit::{DynamicFilterSlot, OrderBy, OrderByLimitFactory};
 

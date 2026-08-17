@@ -117,6 +117,7 @@ pub use operations::unary::test_utils;
 pub use operations::unary::{Error as UnaryError, Result as UnaryResult};
 pub use operations::unary::{
     KWayMergePlan, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput, batch_sort_indices,
+    dominant_node,
 };
 pub use operations::{
     AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot,

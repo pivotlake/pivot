@@ -14,7 +14,9 @@ mod batch_sort;
 mod k_way_merge;
 mod keys;
 
-pub use k_way_merge::{KWayMergePlan, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput};
+pub use k_way_merge::{
+    KWayMergePlan, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput, dominant_node,
+};
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -34,19 +36,8 @@ use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBr
 use crate::waker::waker_set;
 
 use batch_sort::{batch_arrives_sorted, sorted_row_indices};
-use keys::{KeyOrdering, RunRow, SelectedKeyOrdering, select_key_ordering};
+use keys::{KeyOrdering, RunRow, SelectedKeyOrdering, select_key_ordering, with_key_ordering};
 
-/// Dispatches to the selected key representation while keeping the comparison
-/// loop monomorphized.
-macro_rules! with_key_ordering {
-    ($selected:expr, |$ordering:ident| $body:expr) => {
-        match $selected {
-            SelectedKeyOrdering::FixedWidth(mut $ordering) => $body,
-            SelectedKeyOrdering::ViewBytes(mut $ordering) => $body,
-            SelectedKeyOrdering::General(mut $ordering) => $body,
-        }
-    };
-}
 /// Returns a valid row order for one batch. The identity order is returned
 /// when the batch already satisfies `order_by`.
 pub fn batch_sort_indices(
@@ -147,13 +138,7 @@ impl SharedMergeState {
             KWayMergePlan::Parallel(tasks) => {
                 for merge in tasks {
                     let node_id = merge.node_id();
-                    self.tasks_by_node[node_id].push(MergeTask {
-                        level: match level {
-                            MergeLevel::Local(node_id) => MergeLevel::Local(node_id),
-                            MergeLevel::Global => MergeLevel::Global,
-                        },
-                        merge,
-                    });
+                    self.tasks_by_node[node_id].push(MergeTask { level, merge });
                     waker_set().notify_one_near(node_id);
                 }
                 Ok(())
@@ -253,7 +238,7 @@ impl OrderByFactory {
                 order_by: order_by.clone(),
                 shared: shared.clone(),
                 node_id: topology.node_of_worker(worker_id),
-                local_worker_id: worker_id % topology.workers_per_node,
+                local_worker_id: topology.local_index_of_worker(worker_id),
             })
             .collect()
     }
