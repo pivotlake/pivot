@@ -89,6 +89,45 @@ impl ObjectStore for LocalStore {
         })
     }
 
+    /// Read-modify-write under an exclusive advisory lock, so two writers —
+    /// in-process or across processes — never interleave their cycles. The lock
+    /// lives on a sibling `<name>.lock` file, because the object itself is
+    /// replaced by rename and a lock on it would not survive the swap; it is
+    /// held from the read until the replacing rename lands.
+    fn update(
+        &self,
+        key: &ObjectPath,
+        apply: &mut dyn FnMut(Option<Vec<u8>>) -> Option<Vec<u8>>,
+    ) -> Result<()> {
+        let io_error = |source| StoreError::Io {
+            key: key.to_string(),
+            source,
+        };
+        let path = self.path_for(key);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(io_error)?;
+        }
+        let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(io_error)?;
+        lock.lock().map_err(io_error)?;
+        let current = match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => return Err(io_error(source)),
+        };
+        let Some(replacement) = apply(current) else {
+            return Ok(());
+        };
+        self.put(key, &replacement)
+        // Dropping `lock` releases the advisory lock.
+    }
+
     fn delete(&self, key: &ObjectPath) -> Result<()> {
         match std::fs::remove_file(self.path_for(key)) {
             Ok(()) => Ok(()),
@@ -192,6 +231,38 @@ mod tests {
         store.delete(&p("k")).unwrap();
         assert!(store.get(&p("k")).unwrap().is_none());
         store.delete(&p("k")).unwrap();
+    }
+
+    #[test]
+    fn update_creates_a_missing_object_and_applies_over_the_current_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path());
+
+        store
+            .update(&p("k"), &mut |current| {
+                assert!(current.is_none());
+                Some(b"1".to_vec())
+            })
+            .unwrap();
+        store
+            .update(&p("k"), &mut |current| {
+                assert_eq!(current.unwrap(), b"1");
+                Some(b"2".to_vec())
+            })
+            .unwrap();
+
+        assert_eq!(store.get(&p("k")).unwrap().unwrap(), b"2");
+    }
+
+    #[test]
+    fn update_returning_none_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalStore::new(dir.path());
+        store.put(&p("k"), b"kept").unwrap();
+
+        store.update(&p("k"), &mut |_| None).unwrap();
+
+        assert_eq!(store.get(&p("k")).unwrap().unwrap(), b"kept");
     }
 
     #[test]

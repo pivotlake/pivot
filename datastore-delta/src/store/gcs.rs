@@ -26,8 +26,8 @@
 //! the same object name.
 
 use super::{
-    DataFileLocation, FileRef, ListedObject, ObjectPath, ObjectStore, Result, StoreError,
-    absolute_object_key, object_key, parse_iso8601_millis, percent_encode,
+    DataFileLocation, FileRef, ListedObject, ObjectPath, ObjectStore, ObjectVersion, Result,
+    StoreError, absolute_object_key, object_key, parse_iso8601_millis, percent_encode,
 };
 use base64::Engine;
 use delta_kernel::object_store::DynObjectStore;
@@ -347,27 +347,7 @@ impl ObjectStore for GcsStore {
     }
 
     fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>> {
-        let header = self.auth.header()?;
-        match self
-            .auth
-            .agent
-            .get(&self.media_url(key))
-            .set("Authorization", &header)
-            .call()
-        {
-            Ok(response) => {
-                let mut buf = Vec::new();
-                std::io::Read::read_to_end(&mut response.into_reader(), &mut buf).map_err(
-                    |source| StoreError::Io {
-                        key: key.to_string(),
-                        source,
-                    },
-                )?;
-                Ok(Some(buf))
-            }
-            Err(ureq::Error::Status(404, _)) => Ok(None),
-            Err(e) => Err(StoreError::Http(format!("GCS GET {key}: {e}"))),
-        }
+        Ok(self.fetch(key)?.map(|(bytes, _)| bytes))
     }
 
     fn put(&self, key: &ObjectPath, data: &[u8]) -> Result<()> {
@@ -389,6 +369,18 @@ impl ObjectStore for GcsStore {
             Ok(_) => Ok(()),
             Err(e) => Err(StoreError::Http(format!("GCS PUT {key}: {e}"))),
         }
+    }
+
+    fn update(
+        &self,
+        key: &ObjectPath,
+        apply: &mut dyn FnMut(Option<Vec<u8>>) -> Option<Vec<u8>>,
+    ) -> Result<()> {
+        super::update_by_version_swap(
+            || self.read_versioned(key),
+            |data, expected| self.put_if_generation(key, data, expected),
+            apply,
+        )
     }
 
     fn delete(&self, key: &ObjectPath) -> Result<()> {
@@ -478,6 +470,104 @@ impl ObjectStore for GcsStore {
 }
 
 impl GcsStore {
+    /// GET an object's media, returning its bytes and the `x-goog-generation`
+    /// header when the service sent one; `None` if the object does not exist.
+    fn fetch(&self, key: &ObjectPath) -> Result<Option<(Vec<u8>, Option<String>)>> {
+        let header = self.auth.header()?;
+        match self
+            .auth
+            .agent
+            .get(&self.media_url(key))
+            .set("Authorization", &header)
+            .call()
+        {
+            Ok(response) => {
+                let generation = response.header("x-goog-generation").map(str::to_string);
+                let mut buf = Vec::new();
+                std::io::Read::read_to_end(&mut response.into_reader(), &mut buf).map_err(
+                    |source| StoreError::Io {
+                        key: key.to_string(),
+                        source,
+                    },
+                )?;
+                Ok(Some((buf, generation)))
+            }
+            Err(ureq::Error::Status(404, _)) => Ok(None),
+            Err(e) => Err(StoreError::Http(format!("GCS GET {key}: {e}"))),
+        }
+    }
+
+    /// The object's bytes with the [`ObjectVersion`] a conditional replace
+    /// presents back. An object served without a generation cannot anchor a
+    /// compare-and-swap, so that is an error rather than an unguarded write.
+    fn read_versioned(&self, key: &ObjectPath) -> Result<Option<(Vec<u8>, ObjectVersion)>> {
+        match self.fetch(key)? {
+            None => Ok(None),
+            Some((bytes, Some(generation))) => Ok(Some((bytes, ObjectVersion(generation)))),
+            Some((_, None)) => Err(StoreError::Http(format!(
+                "GCS GET {key}: response carries no x-goog-generation to condition a replace on"
+            ))),
+        }
+    }
+
+    /// Upload that succeeds only while the stored object is still at `expected`
+    /// (`None`: the object must not exist yet). GCS speaks this as
+    /// `ifGenerationMatch` — generation `0` means "no live object" — and answers
+    /// a lost race with 412, mapped to [`StoreError::VersionConflict`] so the
+    /// caller retries. Goes through the JSON API's *multipart* upload (the
+    /// object name rides in a metadata part) rather than the plain media one:
+    /// the emulator the tests run against enforces upload preconditions only on
+    /// that path, and real GCS enforces both alike.
+    fn put_if_generation(
+        &self,
+        key: &ObjectPath,
+        data: &[u8],
+        expected: Option<&ObjectVersion>,
+    ) -> Result<()> {
+        let header = self.auth.header()?;
+        let generation = expected.map(|version| version.0.as_str()).unwrap_or("0");
+        let url = format!(
+            "{}/upload/storage/v1/b/{}/o?uploadType=multipart&ifGenerationMatch={}",
+            self.endpoint, self.bucket, generation
+        );
+        let metadata = serde_json::json!({"name": object_key(&self.prefix, key)}).to_string();
+        // A separator provably absent from both parts, grown until it is.
+        let mut boundary = "pivot-object-update".to_string();
+        while data
+            .windows(boundary.len())
+            .any(|window| window == boundary.as_bytes())
+            || metadata.contains(&boundary)
+        {
+            boundary.push('x');
+        }
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{metadata}\r\n--{boundary}\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(data);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        match self
+            .auth
+            .agent
+            .post(&url)
+            .set("Authorization", &header)
+            .set(
+                "Content-Type",
+                &format!("multipart/related; boundary={boundary}"),
+            )
+            .send_bytes(&body)
+        {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::Status(412 | 409, _)) => Err(StoreError::VersionConflict {
+                key: key.to_string(),
+            }),
+            Err(e) => Err(StoreError::Http(format!("GCS PUT {key}: {e}"))),
+        }
+    }
+
     /// Pair a stable object URL with the token closure workers read per request.
     /// Primes the token here on the control thread (a blocking mint is fine off
     /// the ring) so the query's worker reads find a fresh one and never mint.

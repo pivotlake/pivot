@@ -15,8 +15,8 @@
 //! instead of letting it resolve its own.
 
 use super::{
-    DataFileLocation, FileRef, ListedObject, ObjectPath, ObjectStore, Result, StoreError,
-    absolute_object_key, object_key, parse_iso8601_millis, percent_encode,
+    DataFileLocation, FileRef, ListedObject, ObjectPath, ObjectStore, ObjectVersion, Result,
+    StoreError, absolute_object_key, object_key, parse_iso8601_millis, percent_encode,
 };
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
@@ -224,24 +224,7 @@ impl ObjectStore for S3Store {
     }
 
     fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>> {
-        let object = object_key(&self.prefix, key);
-        let url = self.url_for(&object);
-        let signed = self.sign("GET", &url, &[], &[])?;
-        let req = Self::apply(self.agent.get(&url), &signed);
-        match req.call() {
-            Ok(resp) => {
-                let mut buf = Vec::new();
-                resp.into_reader()
-                    .read_to_end(&mut buf)
-                    .map_err(|source| StoreError::Io {
-                        key: key.to_string(),
-                        source,
-                    })?;
-                Ok(Some(buf))
-            }
-            Err(ureq::Error::Status(404, _)) => Ok(None),
-            Err(e) => Err(StoreError::Http(format!("GET {object}: {e}"))),
-        }
+        Ok(self.fetch(key)?.map(|(bytes, _)| bytes))
     }
 
     fn put(&self, key: &ObjectPath, data: &[u8]) -> Result<()> {
@@ -253,6 +236,18 @@ impl ObjectStore for S3Store {
             Ok(_) => Ok(()),
             Err(e) => Err(StoreError::Http(format!("PUT {object}: {e}"))),
         }
+    }
+
+    fn update(
+        &self,
+        key: &ObjectPath,
+        apply: &mut dyn FnMut(Option<Vec<u8>>) -> Option<Vec<u8>>,
+    ) -> Result<()> {
+        super::update_by_version_swap(
+            || self.read_versioned(key),
+            |data, expected| self.put_if_version(key, data, expected),
+            apply,
+        )
     }
 
     fn delete(&self, key: &ObjectPath) -> Result<()> {
@@ -329,6 +324,71 @@ impl ObjectStore for S3Store {
 }
 
 impl S3Store {
+    /// GET an object, returning its bytes and the `ETag` header when the
+    /// service sent one; `None` if the object does not exist.
+    fn fetch(&self, key: &ObjectPath) -> Result<Option<(Vec<u8>, Option<String>)>> {
+        let object = object_key(&self.prefix, key);
+        let url = self.url_for(&object);
+        let signed = self.sign("GET", &url, &[], &[])?;
+        let req = Self::apply(self.agent.get(&url), &signed);
+        match req.call() {
+            Ok(resp) => {
+                let etag = resp.header("etag").map(str::to_string);
+                let mut buf = Vec::new();
+                resp.into_reader()
+                    .read_to_end(&mut buf)
+                    .map_err(|source| StoreError::Io {
+                        key: key.to_string(),
+                        source,
+                    })?;
+                Ok(Some((buf, etag)))
+            }
+            Err(ureq::Error::Status(404, _)) => Ok(None),
+            Err(e) => Err(StoreError::Http(format!("GET {object}: {e}"))),
+        }
+    }
+
+    /// The object's bytes with the [`ObjectVersion`] a conditional replace
+    /// presents back. An object served without an `ETag` cannot anchor a
+    /// compare-and-swap, so that is an error rather than an unguarded write.
+    fn read_versioned(&self, key: &ObjectPath) -> Result<Option<(Vec<u8>, ObjectVersion)>> {
+        match self.fetch(key)? {
+            None => Ok(None),
+            Some((bytes, Some(etag))) => Ok(Some((bytes, ObjectVersion(etag)))),
+            Some((_, None)) => Err(StoreError::Http(format!(
+                "GET {key}: response carries no ETag to condition a replace on"
+            ))),
+        }
+    }
+
+    /// PUT that succeeds only while the stored object is still at `expected`
+    /// (`None`: the object must not exist yet). S3 speaks this as `If-Match` /
+    /// `If-None-Match: *`; a lost race comes back 412 — or 409 while the
+    /// concurrent write is still settling — both mapped to
+    /// [`StoreError::VersionConflict`] so the caller retries.
+    fn put_if_version(
+        &self,
+        key: &ObjectPath,
+        data: &[u8],
+        expected: Option<&ObjectVersion>,
+    ) -> Result<()> {
+        let object = object_key(&self.prefix, key);
+        let url = self.url_for(&object);
+        let (header, value) = match expected {
+            Some(version) => ("if-match", version.0.as_str()),
+            None => ("if-none-match", "*"),
+        };
+        let signed = self.sign("PUT", &url, &[(header, value)], data)?;
+        let req = Self::apply(self.agent.put(&url), &signed).set(header, value);
+        match req.send_bytes(data) {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::Status(412 | 409, _)) => Err(StoreError::VersionConflict {
+                key: key.to_string(),
+            }),
+            Err(e) => Err(StoreError::Http(format!("PUT {object}: {e}"))),
+        }
+    }
+
     /// A time-limited GET URL for `key`, signed in the query string so the
     /// io_uring HTTP reader can range-read it with no auth headers.
     fn presign_get(&self, key: &ObjectPath) -> Result<url::Url> {

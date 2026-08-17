@@ -622,9 +622,9 @@ impl DeltaDatastore {
             self.dispatcher.clone(),
             self.engine.clone(),
         )?;
-        let mut manifest = CatalogManifest::load(self.store.as_ref())?;
-        manifest.upsert_table(&name, id, location)?;
-        manifest.store(self.store.as_ref())?;
+        CatalogManifest::update(self.store.as_ref(), |manifest| {
+            manifest.upsert_table(&name, id, location.clone())
+        })?;
         index.insert_table(name, table);
         Ok(())
     }
@@ -655,13 +655,10 @@ impl DeltaDatastore {
             .get_table_by_id(&id)
             .expect("the name index resolved the id, so the table is held")
             .deleted_file_retention();
-        let mut manifest = CatalogManifest::load(self.store.as_ref())?;
-        manifest.remove_table(
-            &name,
-            crate::vacuum::now_unix_ms(),
-            retention.as_millis() as u64,
-        )?;
-        manifest.store(self.store.as_ref())?;
+        let dropped_at_ms = crate::vacuum::now_unix_ms();
+        CatalogManifest::update(self.store.as_ref(), |manifest| {
+            manifest.remove_table(&name, dropped_at_ms, retention.as_millis() as u64)
+        })?;
         index.remove_table(&name);
         Ok(())
     }
@@ -685,9 +682,10 @@ impl DeltaDatastore {
             // the next sweep. Under the index write lock like every other
             // read-modify-write of the shared manifest.
             let _index = self.tables_index.write().unwrap();
-            let mut manifest = CatalogManifest::load(self.store.as_ref())?;
-            manifest.remove_dropped_table(&entry.id);
-            manifest.store(self.store.as_ref())?;
+            CatalogManifest::update(self.store.as_ref(), |manifest| {
+                manifest.remove_dropped_table(&entry.id);
+                Ok(())
+            })?;
             reclaimed += 1;
         }
         Ok(reclaimed)
@@ -755,9 +753,10 @@ impl DeltaDatastore {
             }
             return Err(Error::SchemaExists(name));
         }
-        let mut manifest = CatalogManifest::load(self.store.as_ref())?;
-        manifest.add_schema(name.clone());
-        manifest.store(self.store.as_ref())?;
+        CatalogManifest::update(self.store.as_ref(), |manifest| {
+            manifest.add_schema(name.clone());
+            Ok(())
+        })?;
         index.insert_schema(name);
         Ok(())
     }

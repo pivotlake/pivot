@@ -347,10 +347,40 @@ impl CatalogManifest {
         }
     }
 
-    /// Write the database manifest, overwriting the previous version.
-    pub fn store(&self, store: &dyn ObjectStore) -> Result<()> {
-        store.put(&ObjectPath::new(MANIFEST_KEY), &serde_json::to_vec(self)?)?;
-        Ok(())
+    /// Read-modify-write the database manifest as one atomic update: `mutate`
+    /// runs against the current document (an empty one if the database is brand
+    /// new) and the result replaces it without losing any concurrent writer's
+    /// update — the store serializes the whole cycle behind a file lock (local)
+    /// or retries it under a version-conditional swap (remote), so `mutate` may
+    /// run more than once, each time on a fresh document.
+    pub(crate) fn update<T>(
+        store: &dyn ObjectStore,
+        mut mutate: impl FnMut(&mut CatalogManifest) -> Result<T>,
+    ) -> Result<T> {
+        let mut outcome = None;
+        store.update(&ObjectPath::new(MANIFEST_KEY), &mut |current| {
+            let loaded = match current {
+                Some(bytes) => serde_json::from_slice(&bytes).map_err(Error::Json),
+                None => Ok(Self::default()),
+            };
+            let result = loaded.and_then(|mut manifest| {
+                let value = mutate(&mut manifest)?;
+                let bytes = serde_json::to_vec(&manifest)?;
+                Ok((value, bytes))
+            });
+            match result {
+                Ok((value, bytes)) => {
+                    outcome = Some(Ok(value));
+                    Some(bytes)
+                }
+                // A failed mutation writes nothing; the error surfaces below.
+                Err(error) => {
+                    outcome = Some(Err(error));
+                    None
+                }
+            }
+        })?;
+        outcome.expect("the store ran the update closure at least once")
     }
 
     /// Register a table inside its schema under `id`, replacing whatever that
@@ -564,6 +594,36 @@ mod tests {
             manifest_entry(HashMap::new())
                 .maybe_matches_partition(&partition_by, &[filter("worker")])
         );
+    }
+
+    #[test]
+    fn update_creates_the_manifest_and_mutates_it_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::LocalStore::new(dir.path());
+
+        CatalogManifest::update(&store, |manifest| {
+            manifest.add_schema("logs".to_string());
+            Ok(())
+        })
+        .unwrap();
+
+        let manifest = CatalogManifest::load(&store).unwrap();
+        assert!(manifest.contains_schema("logs"));
+        assert_eq!(manifest.version, 1);
+    }
+
+    #[test]
+    fn a_failed_mutation_stores_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::LocalStore::new(dir.path());
+
+        let error = CatalogManifest::update(&store, |_| {
+            Err::<(), _>(Error::MissingSchema("nope".to_string()))
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, Error::MissingSchema(_)));
+        assert!(store.get(&ObjectPath::new(MANIFEST_KEY)).unwrap().is_none());
     }
 
     #[test]
