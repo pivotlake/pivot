@@ -54,9 +54,10 @@ fn copy_to_malloc(data: &ArrayData) -> unary::Result<ArrayData> {
         .collect();
 
     let nulls = data.nulls().map(|nb| {
-        let bytes = Buffer::from(nb.buffer().as_slice());
-        // `nb.buffer().as_slice()` returns the same logical range the original
-        // BooleanBuffer covers, starting at bit 0, so we rebuild with offset 0.
+        // The validity bits may start at a non-zero bit offset (a sliced
+        // array). `sliced()` re-packs exactly the covered range to start at
+        // bit 0, so rebuilding with offset 0 is correct.
+        let bytes = Buffer::from(nb.inner().sliced().as_slice());
         NullBuffer::new(BooleanBuffer::new(bytes, 0, nb.len()))
     });
 
@@ -194,6 +195,23 @@ mod tests {
         let sliced = full.slice(2, 2); // values "c", "d"
         let input = RecordBatch::try_new(
             schema(vec![Field::new("s", DataType::Utf8, false)]),
+            vec![Arc::new(sliced) as ArrayRef],
+        )
+        .unwrap();
+
+        let out = copy_out(input.clone()).unwrap();
+
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn preserves_nulls_on_sliced_arrays() {
+        // slicing at a non-byte-aligned offset leaves the validity bits
+        // starting mid-byte; the copy must keep them lined up with values.
+        let full = Int64Array::from(vec![None, None, Some(2), None, Some(4), Some(5)]);
+        let sliced = full.slice(2, 3); // Some(2), None, Some(4)
+        let input = RecordBatch::try_new(
+            schema(vec![Field::new("v", DataType::Int64, true)]),
             vec![Arc::new(sliced) as ArrayRef],
         )
         .unwrap();
