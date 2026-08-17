@@ -106,7 +106,7 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
     if let DuckOperator::ComparisonJoin(join) = kind
         && join.is_late_materialization()?
     {
-        return build_late_materialization(op, join, ctx);
+        return build_late_materialization(op, ctx);
     }
 
     // A CTE's two children are walked in order for a reason, so it can't go
@@ -1345,10 +1345,27 @@ fn build_delim_join(
 /// materializer re-reads the LHS columns for the surviving rows.
 fn build_late_materialization(
     op: LogicalOp<'_>,
-    join: ComparisonJoinView<'_>,
     ctx: &mut BuildCtx,
 ) -> Result<PlanNode, OperatorError> {
-    let columns: Vec<usize> = join.columns()?;
+    // The LHS is the wide Get whose columns the fetch re-reads. Read its full
+    // output description (storage index, type, pushed extract path) so a
+    // variant field extract DuckDB pushed into the Get survives the collapse;
+    // fetching by bare storage index would hand back the whole document column
+    // where the query asked for a single field. The row-id column only served
+    // the SEMI join being discarded, so it is dropped.
+    let DuckOperator::TableScan(wide_scan) = op.child(0)?.operator()? else {
+        return Err(OperatorError::Unsupported(
+            "late materialization without a base-table wide scan is not supported".to_string(),
+        ));
+    };
+    let rowid = rowid_column_id();
+    let columns = build_scan_columns(
+        wide_scan
+            .output_columns()?
+            .into_iter()
+            .filter(|(column_idx, _, _)| *column_idx != rowid)
+            .collect(),
+    )?;
 
     // The narrow pipeline is the RHS; translate it normally, then drop the row-id
     // column DuckDB threaded through it for the join we're discarding.

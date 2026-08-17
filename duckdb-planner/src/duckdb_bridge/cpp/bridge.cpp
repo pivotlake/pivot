@@ -976,39 +976,6 @@ bool lo_is_late_materialization_join(const LogicalOperator &op) {
 	return join.join_type == duckdb::JoinType::SEMI && is_late_materialization_join(join);
 }
 
-// The LHS (full-column) side's output storage columns, row-id excluded, in
-// output order so the Projection kept above the former join lines up positionally.
-static std::vector<size_t> late_materialization_columns(const LogicalOperator &op) {
-	auto &join = as<duckdb::LogicalComparisonJoin>(op);
-	auto &lhs_get = join.children[0]->Cast<duckdb::LogicalGet>();
-	auto &col_ids = lhs_get.GetColumnIds();
-	std::vector<size_t> columns;
-	auto emit = [&](size_t pos) {
-		auto storage = col_ids[pos].GetPrimaryIndex();
-		if (storage != duckdb::COLUMN_IDENTIFIER_ROW_ID) {
-			columns.push_back(storage);
-		}
-	};
-	if (!lhs_get.projection_ids.empty()) {
-		for (auto pid : lhs_get.projection_ids) {
-			emit(pid);
-		}
-	} else {
-		for (size_t i = 0; i < col_ids.size(); i++) {
-			emit(i);
-		}
-	}
-	return columns;
-}
-
-size_t lo_late_materialization_column_count(const LogicalOperator &op) {
-	return late_materialization_columns(op).size();
-}
-
-size_t lo_late_materialization_column(const LogicalOperator &op, size_t index) {
-	return late_materialization_columns(op)[index];
-}
-
 // ---- CTE ----
 
 // The index a materialized CTE publishes its rows under, which every reference

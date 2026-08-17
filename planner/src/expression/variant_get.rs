@@ -327,6 +327,21 @@ mod tests {
         assert_eq!(only_column(&rows[0]).as_i64().unwrap(), 55);
     }
 
+    /// Casting the whole document to VARCHAR renders it as JSON text, exactly
+    /// like a bare variant output column does. It must NOT become a typed
+    /// string read, which would yield NULL for every object-rooted document.
+    #[rstest]
+    fn casts_the_whole_document_to_string(mut testing_planner: TestingPlanner) {
+        docs_table(&mut testing_planner, vec![r#"{"name":"bob","age":30}"#]);
+
+        let rows = run(
+            &mut testing_planner,
+            "SELECT CAST(d AS VARCHAR) AS j FROM docs",
+        );
+
+        assert_eq!(rows[0]["j"].as_str().unwrap(), r#"{"age":30,"name":"bob"}"#);
+    }
+
     /// Casting to VARCHAR yields pivot's string columns (`Utf8View`), the bare
     /// value rather than JSON text (no quotes).
     #[rstest]
