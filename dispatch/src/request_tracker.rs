@@ -322,7 +322,7 @@ impl RegisteredRead {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::{FileRange, LocalFile, OperatorIO, ReadRequestId};
+    use crate::io::{FileRange, LocalFile, ReadRequestId};
     use crate::memory::{BlockKey, init_test_free_pool};
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
@@ -349,10 +349,13 @@ mod tests {
         file: OpenFile,
         locations: impl IntoIterator<Item = FileRange>,
     ) -> (ReadRequestId, PendingReadRequest) {
-        let mut io = OperatorIO::default();
-        let id = io.read(file, locations);
-
-        (id, io.take_pending_read_requests().pop().unwrap())
+        let id = ReadRequestId(0);
+        let request = PendingReadRequest {
+            id,
+            open_file: file,
+            locations: locations.into_iter().collect(),
+        };
+        (id, request)
     }
 
     fn register_local(
