@@ -194,17 +194,17 @@ async fn queries_bind_tables_by_datastore_name() {
     // The inventory spans both datastores whichever way it is named: `system`
     // is a datastore of its own, so the bare spelling and the schema-qualified
     // one are the same relation.
-    let inventory_sql = "SELECT datastore_name, schema_name, table_name, id \
+    let inventory_sql = "SELECT datastore_name, schema_name, name, id \
                          FROM system.tables \
-                         ORDER BY datastore_name, schema_name, table_name";
+                         ORDER BY datastore_name, schema_name, name";
     assert_eq!(
         select_rows(&client, inventory_sql).await,
         expected_inventory
     );
 
-    let qualified_inventory_sql = "SELECT datastore_name, schema_name, table_name, id \
+    let qualified_inventory_sql = "SELECT datastore_name, schema_name, name, id \
                                    FROM system.main.tables \
-                                   ORDER BY datastore_name, schema_name, table_name";
+                                   ORDER BY datastore_name, schema_name, name";
     assert_eq!(
         select_rows(&client, qualified_inventory_sql).await,
         expected_inventory,
