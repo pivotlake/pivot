@@ -278,6 +278,14 @@ fi
 # The uploads overlap the wait for the measurement dataset; collect them
 # before measuring so they don't steal bandwidth or CPU from the timed runs.
 wait_for_scale "$sf_measure"
+# Reap the native restore explicitly first, while its exit status is still
+# retrievable. The bare wait below collects every remaining background job at
+# once and returns success even if one of them failed, so a later wait on this
+# pid would find it already reaped and report a spurious failure.
+if [[ -n "$native_pid" ]] && ! wait "$native_pid"; then
+    echo "error: native duckdb database restore failed" >&2
+    exit 1
+fi
 wait
 
 # ---------------------------------------------------------------------------
@@ -315,10 +323,6 @@ fi
 rows="/tmp/ab-rows.tsv"
 : >"$rows"
 stream="/tmp/ab-stream.txt"
-if [[ -n "$native_pid" ]] && ! wait "$native_pid"; then
-    echo "error: native duckdb database restore failed" >&2
-    exit 1
-fi
 echo ">>> measuring (power passes=$passes, ${power_sleep}ms between queries, mode=$mode)"
 for pass in $(seq "$passes"); do
     drop_caches; sleep 3
