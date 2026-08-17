@@ -196,14 +196,23 @@ impl Compacter {
         }
         let id = table.id();
         while let Some(inputs) = self.next_batch(&table) {
+            // The batch moves into the merge, so its shape is recorded here for
+            // the log line that follows.
+            let input_sizes: Vec<u64> = inputs.iter().map(|file| file.size).collect();
             // `spawn_blocking` needs a `'static` closure, so it gets its own
             // handle rather than a borrow of `self`.
             let datastore = self.datastore.clone();
             match tokio::task::spawn_blocking(move || swap_batch(&datastore, id, &inputs)).await {
                 Ok(Ok((merged, committed))) => {
+                    let output_sizes: Vec<u64> = merged.iter().map(|file| file.size).collect();
                     info!(
                         table = %name,
-                        files = merged.len(),
+                        inputs = input_sizes.len(),
+                        input_sizes = ?input_sizes,
+                        input_bytes = input_sizes.iter().sum::<u64>(),
+                        outputs = output_sizes.len(),
+                        output_sizes = ?output_sizes,
+                        output_bytes = output_sizes.iter().sum::<u64>(),
                         "compacted batch"
                     );
                     // Continue from the copy the swap published, so the next
