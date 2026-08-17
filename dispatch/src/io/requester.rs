@@ -19,15 +19,6 @@ use thiserror::Error;
 #[cfg(target_os = "linux")]
 use crate::io::http::HTTP_TAG;
 
-/// Physical local-file operations currently in flight across every worker's
-/// ring, mirroring each requester's `pending_io_requests` map. The pre-park
-/// spin consults it: while any worker waits on the disk, wake-ups arrive at IO
-/// latency and spinning for them burns CPU for nothing, so idle workers park
-/// immediately instead. HTTP and cache-file ops are not counted; phases where
-/// only those are in flight keep today's spin behavior.
-pub(crate) static INFLIGHT_FS_OPS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("{0}")]
@@ -397,7 +388,6 @@ impl IORequester {
                 permit,
             },
         );
-        INFLIGHT_FS_OPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.next_id += 1;
         self.backend.submit()?;
 
@@ -559,7 +549,6 @@ impl IORequester {
                 permit,
             }) = self.pending_io_requests.remove(&ud)
             {
-                INFLIGHT_FS_OPS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 // A write covers one run, and may complete shorter still (the
                 // kernel caps a single write at ~2 GiB, among other reasons);
                 // resubmit from where it stopped, at the matching file offset,
@@ -584,7 +573,6 @@ impl IORequester {
                                 permit,
                             },
                         );
-                        INFLIGHT_FS_OPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         self.next_id += 1;
                         self.backend.submit()?;
                         continue;

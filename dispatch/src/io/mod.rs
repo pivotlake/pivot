@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use url::Url;
 
-pub(crate) mod requester;
+mod requester;
 pub use backend::RingWakeHandle;
 pub use requester::{Error as IORequesterError, IORequester, RING_SIZE};
 
