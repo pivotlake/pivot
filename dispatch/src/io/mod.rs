@@ -43,6 +43,8 @@ pub use backend::RingWakeHandle;
 pub use requester::{Error as IORequesterError, IORequester, RING_SIZE};
 
 mod operator;
+#[cfg(any(test, feature = "test-util"))]
+pub use operator::TestOperatorIO;
 pub use operator::{
     FileRange, OperatorIO, PendingReadRequest, PendingWriteRequest, ReadData, ReadRequestId,
     ReadResponse,
@@ -300,35 +302,6 @@ impl Hash for RemoteFile {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.id.hash(state);
     }
-}
-
-std::thread_local! {
-    /// Whether any operator on this worker may hold IO requests it has not yet
-    /// handed over for submission. Set by whatever stages a request (see
-    /// [`note_pending_io`]); the worker clears it once a full collection pass
-    /// over every dataflow yields nothing, and skips the per-pass operator-graph
-    /// walks entirely while it is off - on queries whose hot path does no IO,
-    /// those walks are pure overhead.
-    static HAS_PENDING_IO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Tell this worker that an operator staged an IO request (or still holds
-/// some back), so its next pass walks the operator graphs for submissions.
-/// Must be called on the worker thread that owns the operator, which is the
-/// thread every operator method runs on.
-pub fn note_pending_io() {
-    HAS_PENDING_IO.with(|flag| flag.set(true));
-}
-
-/// Whether [`note_pending_io`] was called since the last [`clear_pending_io`].
-pub(crate) fn has_pending_io() -> bool {
-    HAS_PENDING_IO.with(std::cell::Cell::get)
-}
-
-/// Called by the worker after a collection pass that visited every dataflow
-/// without finding a request or breaking off early.
-pub(crate) fn clear_pending_io() {
-    HAS_PENDING_IO.with(|flag| flag.set(false));
 }
 
 /// A filesystem read: read `block` from `file` into its pinned cache slot.

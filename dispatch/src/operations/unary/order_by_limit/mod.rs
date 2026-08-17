@@ -638,7 +638,11 @@ mod tests {
             crate::worker::WORKER_IDX.set(worker_index);
             for batch in batches {
                 operator
-                    .consume(batch, &mut sender, &mut crate::io::OperatorIO::default())
+                    .consume(
+                        batch,
+                        &mut sender,
+                        &mut crate::io::TestOperatorIO::default().io(),
+                    )
                     .unwrap();
             }
         }
@@ -672,7 +676,7 @@ mod tests {
         op.consume(
             batch(&[10, 20, 30]),
             &mut sink,
-            &mut crate::io::OperatorIO::default(),
+            &mut crate::io::TestOperatorIO::default().io(),
         )
         .unwrap();
         assert_eq!(slot_value(&slot), Some(20)); // running top-2 [30, 20]
@@ -680,7 +684,7 @@ mod tests {
         op.consume(
             batch(&[100, 5]),
             &mut sink,
-            &mut crate::io::OperatorIO::default(),
+            &mut crate::io::TestOperatorIO::default().io(),
         )
         .unwrap();
         assert_eq!(slot_value(&slot), Some(30)); // running top-2 now [100, 30]
@@ -688,7 +692,7 @@ mod tests {
         op.consume(
             batch(&[50, 60]),
             &mut sink,
-            &mut crate::io::OperatorIO::default(),
+            &mut crate::io::TestOperatorIO::default().io(),
         )
         .unwrap();
         assert_eq!(slot_value(&slot), Some(60)); // running top-2 now [100, 60]
@@ -704,7 +708,7 @@ mod tests {
         op.consume(
             batch(&[10, 20]),
             &mut sink,
-            &mut crate::io::OperatorIO::default(),
+            &mut crate::io::TestOperatorIO::default().io(),
         )
         .unwrap();
 
@@ -725,7 +729,7 @@ mod tests {
             .consume(
                 batch(&[10, 20]),
                 &mut sink,
-                &mut crate::io::OperatorIO::default(),
+                &mut crate::io::TestOperatorIO::default().io(),
             )
             .unwrap();
         assert_eq!(slot_value(&slot), None);
@@ -733,7 +737,7 @@ mod tests {
             .consume(
                 batch(&[30, 5]),
                 &mut sink,
-                &mut crate::io::OperatorIO::default(),
+                &mut crate::io::TestOperatorIO::default().io(),
             )
             .unwrap();
 
@@ -757,15 +761,19 @@ mod tests {
 
         // Three rows for a LIMIT 2, but only one non-null key: nulls are no
         // evidence of rows beating a boundary, so the window must not arm.
-        op.consume(nullable, &mut sink, &mut crate::io::OperatorIO::default())
-            .unwrap();
+        op.consume(
+            nullable,
+            &mut sink,
+            &mut crate::io::TestOperatorIO::default().io(),
+        )
+        .unwrap();
         assert_eq!(slot_value(&slot), None);
 
         // Two more real keys arm it: pooled {5, 7, 9}, best 2 are [5, 7].
         op.consume(
             batch(&[9, 7]),
             &mut sink,
-            &mut crate::io::OperatorIO::default(),
+            &mut crate::io::TestOperatorIO::default().io(),
         )
         .unwrap();
         assert_eq!(slot_value(&slot), Some(7));
@@ -787,7 +795,7 @@ mod tests {
         op.consume(
             batch(&values),
             &mut sink,
-            &mut crate::io::OperatorIO::default(),
+            &mut crate::io::TestOperatorIO::default().io(),
         )
         .unwrap();
 
@@ -820,7 +828,7 @@ mod tests {
         op.consume(
             two_key_batch(&[(5, 2), (1, 9), (3, 4)]),
             &mut sink,
-            &mut crate::io::OperatorIO::default(),
+            &mut crate::io::TestOperatorIO::default().io(),
         )
         .unwrap();
 

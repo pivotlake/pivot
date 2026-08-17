@@ -276,7 +276,8 @@ mod tests {
             EmitOne::default(),
             Box::new(SharedCollectSender(items.clone())),
         );
-        let mut io = OperatorIO::default();
+        let mut test_io = crate::io::TestOperatorIO::default();
+        let mut io = test_io.io();
 
         assert!(matches!(
             operator.run_cpu_work(&mut io).unwrap(),
@@ -295,7 +296,8 @@ mod tests {
         let items = std::rc::Rc::new(std::cell::RefCell::new(Vec::<i32>::new()));
         let mut operator =
             NullaryOperator::new(NoOpNullary, Box::new(SharedCollectSender(items.clone())));
-        let mut io = OperatorIO::default();
+        let mut test_io = crate::io::TestOperatorIO::default();
+        let mut io = test_io.io();
 
         assert!(matches!(
             operator.run_cpu_work(&mut io).unwrap(),

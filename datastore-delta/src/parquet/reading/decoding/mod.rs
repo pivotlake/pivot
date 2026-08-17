@@ -693,7 +693,7 @@ mod tests {
             &mut decoder,
             kept,
             &mut sink,
-            &mut dispatch::OperatorIO::default(),
+            &mut dispatch::TestOperatorIO::default().io(),
         )
         .unwrap();
         // The drain pass emits the last row, exhausting the row group while
@@ -704,7 +704,7 @@ mod tests {
             &mut decoder,
             late_skipped,
             &mut sink,
-            &mut dispatch::OperatorIO::default(),
+            &mut dispatch::TestOperatorIO::default().io(),
         )
         .unwrap();
 

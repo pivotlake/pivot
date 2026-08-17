@@ -13,8 +13,6 @@
 //!   attempting to steal from peer workers' channels. Root-to-leaf (upstream first)
 //!   means the stealing worker picks up data early in the dataflow, to not interrupt current
 //!   hot-in-cache processing
-//! - [`register_pending_io`](DataFlow::register_pending_io) — pass each node's
-//!   logical IO to the worker's requester for immediate registration and submission.
 //! - [`process_read_response`](DataFlow::process_read_response),
 //!   [`process_fs_write`](DataFlow::process_fs_write), and
 //!   [`process_http_upload_response`](DataFlow::process_http_upload_response) —
@@ -51,9 +49,7 @@ struct OperatorNode {
     /// every edge index stable: traversals skip a retired node and move on, and
     /// a late IO completion routed to one lands nowhere.
     operator: Option<Box<dyn Operator>>,
-    /// Logical requests produced by this node. The worker passes these to its
-    /// requester during `register_pending_io`.
-    io: OperatorIO,
+
     /// One-shot publication gates. Open gates are removed after an Acquire
     /// observation, leaving no atomic loads on this node's steady-state path.
     gates: Vec<Arc<AtomicBool>>,
@@ -72,28 +68,21 @@ impl OperatorNode {
     #[inline]
     fn run<T>(
         &mut self,
-        f: &mut impl FnMut(Identifier, &mut dyn Operator, &mut OperatorIO) -> Result<ControlFlow<T>>,
+        f: &mut impl FnMut(Identifier, &mut dyn Operator) -> Result<ControlFlow<T>>,
     ) -> Result<Option<ControlFlow<T>>> {
         if self.is_gated() {
             return Ok(None);
         }
         let id = self.id;
         match self.operator.as_deref_mut() {
-            Some(operator) => f(id, operator, &mut self.io).map(Some),
+            Some(operator) => f(id, operator).map(Some),
             None => Ok(None),
         }
     }
 
     #[inline]
     fn is_gated(&mut self) -> bool {
-        let gated_before = self.gates.len();
         self.gates.retain(|gate| !gate.load(Ordering::Acquire));
-        // A gate opened since the last look. While gated, this operator was
-        // skipped by every IO collection pass, so IO it staged may sit behind
-        // a cleared pending-IO flag; re-flag so the next pass walks to it.
-        if self.gates.len() != gated_before {
-            crate::io::note_pending_io();
-        }
         !self.gates.is_empty()
     }
 }
@@ -165,7 +154,6 @@ impl OperatorGraph {
             .map(|(id, operator)| OperatorNode {
                 id,
                 operator: Some(operator),
-                io: OperatorIO::default(),
                 gates: gates.remove(&id).unwrap_or_default(),
             })
             .collect();
@@ -187,7 +175,7 @@ impl OperatorGraph {
     /// the walk carries on through it to its publishers.
     pub fn traverse_backwards<
         T,
-        F: FnMut(Identifier, &mut dyn Operator, &mut OperatorIO) -> Result<ControlFlow<T>>,
+        F: FnMut(Identifier, &mut dyn Operator) -> Result<ControlFlow<T>>,
     >(
         &mut self,
         mut f: F,
@@ -207,7 +195,7 @@ impl OperatorGraph {
     /// The root-to-leaf twin of [`traverse_backwards`](Self::traverse_backwards).
     pub fn traverse_forwards<
         T,
-        F: FnMut(Identifier, &mut dyn Operator, &mut OperatorIO) -> Result<ControlFlow<T>>,
+        F: FnMut(Identifier, &mut dyn Operator) -> Result<ControlFlow<T>>,
     >(
         &mut self,
         mut f: F,
@@ -327,6 +315,11 @@ pub struct DataFlow {
     /// Collects this worker's execution stats for the dataflow. Inert unless the
     /// query opted in; driven by the worker through [`stats`](Self::stats).
     stats: StatsCollector,
+    /// Logical read-id counter shared by every node, borrowed into the
+    /// [`OperatorIO`] handed to operators. Responses route by
+    /// `(dataflow, operator)` before the id, so one counter keeps identifiers
+    /// unique everywhere an operator can observe them.
+    next_read_id: usize,
     /// Whether this dataflow is being profiled. While any profiled dataflow is
     /// live the worker runs *only* profiled dataflows (see
     /// [`crate::profiler`]), so a `perf` capture isn't polluted by other work
@@ -389,6 +382,7 @@ impl DataFlow {
             cancelled: canceled,
             err_tx,
             stats: StatsCollector::new(stats_tx, collect_stats),
+            next_read_id: 0,
             #[cfg(feature = "perf")]
             profiled: false,
         }
@@ -519,11 +513,23 @@ impl DataFlow {
     }
 
     /// Deliver a fully resolved logical read to its operator.
-    pub fn process_read_response(&mut self, node_id: Identifier, response: ReadResponse) {
+    pub fn process_read_response(
+        &mut self,
+        node_id: Identifier,
+        response: ReadResponse,
+        requester: &mut IORequester,
+    ) {
         self.try_run(|d| {
+            let data_flow_id = d.id;
+            let stats = &mut d.stats;
+            let next_read_id = &mut d.next_read_id;
             let node = &mut d.graph.operators[node_id];
             if let Some(operator) = node.operator.as_deref_mut() {
-                operator.process_read_response(&mut node.io, response)?;
+                let mut io = OperatorIO::new(requester, data_flow_id, node.id, stats, next_read_id);
+                operator.process_read_response(&mut io, response)?;
+                if let Some(error) = io.take_error() {
+                    return Err(error.into());
+                }
             }
             Ok(())
         });
@@ -559,12 +565,20 @@ impl DataFlow {
 
     /// Run one unit of CPU work, traversing leaf-to-root (downstream first for cache locality).
     /// Returns [`WorkStatus::Ran`] if any operator did work.
-    pub fn run_ready_cpu_work(&mut self) -> WorkStatus {
+    pub fn run_ready_cpu_work(&mut self, requester: &mut IORequester) -> WorkStatus {
         self.try_run_or(WorkStatus::Ran, |d| {
+            let mut io = OperatorIO::new(requester, d.id, 0, &mut d.stats, &mut d.next_read_id);
             d.graph
-                .traverse_backwards(|_, operator, io| match operator.run_cpu_work(io)? {
-                    WorkStatus::Pending => Ok(ControlFlow::Continue(())),
-                    WorkStatus::Ran => Ok(ControlFlow::Break(())),
+                .traverse_backwards(|node_id, operator| {
+                    io.set_operator_idx(node_id);
+                    let status = operator.run_cpu_work(&mut io)?;
+                    if let Some(error) = io.take_error() {
+                        return Err(error.into());
+                    }
+                    match status {
+                        WorkStatus::Pending => Ok(ControlFlow::Continue(())),
+                        WorkStatus::Ran => Ok(ControlFlow::Break(())),
+                    }
                 })
                 .map(|c| match c {
                     ControlFlow::Continue(_) => WorkStatus::Pending,
@@ -575,35 +589,26 @@ impl DataFlow {
 
     /// Attempt to steal work from peer workers, traversing root-to-leaf (upstream first
     /// so the original worker's downstream data stays hot).
-    pub fn try_stealing_work(&mut self) -> WorkStatus {
+    pub fn try_stealing_work(&mut self, requester: &mut IORequester) -> WorkStatus {
         self.try_run_or(WorkStatus::Ran, |d| {
+            let mut io = OperatorIO::new(requester, d.id, 0, &mut d.stats, &mut d.next_read_id);
             d.graph
-                .traverse_forwards(|_, operator, io| match operator.try_steal_work(io)? {
-                    WorkStatus::Pending => Ok(ControlFlow::Continue(())),
-                    WorkStatus::Ran => Ok(ControlFlow::Break(())),
+                .traverse_forwards(|node_id, operator| {
+                    io.set_operator_idx(node_id);
+                    let status = operator.try_steal_work(&mut io)?;
+                    if let Some(error) = io.take_error() {
+                        return Err(error.into());
+                    }
+                    match status {
+                        WorkStatus::Pending => Ok(ControlFlow::Continue(())),
+                        WorkStatus::Ran => Ok(ControlFlow::Break(())),
+                    }
                 })
                 .map(|c| match c {
                     ControlFlow::Continue(_) => WorkStatus::Pending,
                     ControlFlow::Break(_) => WorkStatus::Ran,
                 })
         })
-    }
-
-    /// Drain every node's newly-created logical requests into the worker requester.
-    pub(crate) fn register_pending_io(&mut self, requester: &mut IORequester) {
-        self.try_run(|data_flow| {
-            let data_flow_id = data_flow.id;
-            let stats = &mut data_flow.stats;
-            for node in &mut data_flow.graph.operators {
-                for request in node.io.take_pending_read_requests() {
-                    requester.request_read(data_flow_id, node.id, request, stats)?;
-                }
-                for request in node.io.take_pending_write_requests() {
-                    requester.request_write(data_flow_id, node.id, request, stats)?;
-                }
-            }
-            Ok(())
-        });
     }
 }
 
@@ -774,11 +779,18 @@ mod tests {
             false,
         );
 
-        assert!(matches!(flow.run_ready_cpu_work(), WorkStatus::Pending));
+        let mut requester = IORequester::default();
+        assert!(matches!(
+            flow.run_ready_cpu_work(&mut requester),
+            WorkStatus::Pending
+        ));
         assert_eq!(runs.load(Ordering::Relaxed), 0);
 
         gate.store(true, Ordering::Release);
-        assert!(matches!(flow.run_ready_cpu_work(), WorkStatus::Ran));
+        assert!(matches!(
+            flow.run_ready_cpu_work(&mut requester),
+            WorkStatus::Ran
+        ));
         assert_eq!(runs.load(Ordering::Relaxed), 1);
         assert!(flow.graph.operators[0].gates.is_empty());
     }

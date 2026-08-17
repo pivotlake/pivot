@@ -70,7 +70,8 @@ mod tests {
 
         // Execute
         let mut collector: CollectSender<String> = CollectSender::new();
-        let mut io = crate::io::OperatorIO::default();
+        let mut test_io = crate::io::TestOperatorIO::default();
+        let mut io = test_io.io();
         map.consume(1, &mut collector, &mut io).unwrap();
         map.consume(2, &mut collector, &mut io).unwrap();
 
