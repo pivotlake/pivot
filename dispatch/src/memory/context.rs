@@ -237,7 +237,7 @@ impl MemoryContext {
         let idx = self.dirty_pool.pop(false)?;
         let buffer = memory_ctx().ring().try_write(idx);
         if buffer.is_none() {
-            self.dirty_pool.push(idx);
+            self.push_free_idx(idx, false);
         }
         buffer
     }
@@ -271,14 +271,10 @@ impl MemoryContext {
     /// If the popped index's ring slot is contended, retries with a fresh index rather
     /// than evicting.
     pub fn get_write_buffer(&self, prefer_zeroed: bool) -> WriteBuffer {
-        // Indices popped for slots that turned out transiently locked (e.g. an
-        // evictor probing a pooled slot before backing off). Set aside here and
-        // pushed back once a buffer is in hand: the contender never re-pools an
-        // index it did not pop, so dropping one would leak the slot from every
-        // pool. Held out of the pools during the loop so the retry pops a
-        // *different* index instead of spinning on the locked one.
-        let mut contended = Vec::new();
-        let buffer = loop {
+        // Held out of the pools during the loop so the retry pops a *different*
+        // index instead of spinning on the locked one at the LIFO top.
+        let mut contended = ContendedIndices::new(self);
+        loop {
             if let Some(idx) = self.pop_free_idx(prefer_zeroed) {
                 // A slot listed in the free pool must genuinely be free, i.e. owned
                 // by no cache. If a cache still owns it, it leaked into the pool
@@ -289,28 +285,35 @@ impl MemoryContext {
                     "pooled slot {idx} still owned by a cache",
                 );
                 match memory_ctx().ring().try_write(idx) {
-                    Some(buffer) => break buffer,
-                    // Try again to get a free idx, we don't want to start evicting yet
-                    None => contended.push(idx),
+                    Some(buffer) => return buffer,
+                    None => {
+                        // Try again with a fresh idx, we don't want to start
+                        // evicting yet.
+                        contended.set_aside(idx);
+                        continue;
+                    }
                 }
-                continue;
             }
 
-            // Pool empty: evict via the shared clock, which takes from whichever
-            // tier is over its target share (decompressed, in the common case of
-            // a large decompressed working set). Panic only when there is nothing
+            // Pool empty: one last attempt at the set-aside indices (their
+            // contenders hold slots only transiently), then hand the rest back
+            // so peers can pop them while this worker is busy evicting.
+            if let Some(buffer) = contended.pop_writable() {
+                return buffer;
+            }
+            contended.release();
+
+            // Evict via the shared clock, which takes from whichever tier is
+            // over its target share (decompressed, in the common case of a
+            // large decompressed working set). Panic only when there is nothing
             // cheap to reclaim - an empty decompressed cache means we would be
             // evicting the compressed cache, the memory-pressure signal
             // `PANIC_ON_EVICT` guards.
             if *PANIC_ON_EVICT && self.decompressed_cache.is_empty() {
                 panic!("Evicting");
             }
-            break self.evict();
-        };
-        for idx in contended {
-            self.push_free_idx(idx, memory_ctx().ring().slot_zeroed(idx));
+            return self.evict();
         }
-        buffer
     }
 
     /// Evict a ring slot via the shared CLOCK and return it writable. Each
@@ -379,6 +382,57 @@ impl MemoryContext {
                 None => ticks_without_success += 1,
             }
         }
+    }
+}
+
+/// Free-pool indices set aside because their ring slot was transiently locked
+/// (e.g. an evictor probing the slot before backing off). The contender never
+/// re-pools an index it did not pop, so the popper must return every set-aside
+/// index or the slot leaks from every pool. Dropping the holder returns them,
+/// keeping the invariant across early returns and unwinds (eviction panics).
+struct ContendedIndices<'a> {
+    ctx: &'a MemoryContext,
+    indices: Vec<usize>,
+}
+
+impl<'a> ContendedIndices<'a> {
+    fn new(ctx: &'a MemoryContext) -> Self {
+        Self {
+            ctx,
+            indices: Vec::new(),
+        }
+    }
+
+    fn set_aside(&mut self, idx: usize) {
+        self.indices.push(idx);
+    }
+
+    /// One more `try_write` attempt at each set-aside index, in case its
+    /// contender already backed off. A single pass per index, so a long-held
+    /// slot cannot spin the caller.
+    fn pop_writable(&mut self) -> Option<WriteBuffer> {
+        for i in 0..self.indices.len() {
+            if let Some(buffer) = self.ctx.ring().try_write(self.indices[i]) {
+                self.indices.swap_remove(i);
+                return Some(buffer);
+            }
+        }
+        None
+    }
+
+    /// Return every remaining index to its pool now rather than at drop, so
+    /// peers can pop the slots while the holder is still alive.
+    fn release(&mut self) {
+        for idx in self.indices.drain(..) {
+            self.ctx
+                .push_free_idx(idx, self.ctx.ring().slot_zeroed(idx));
+        }
+    }
+}
+
+impl Drop for ContendedIndices<'_> {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -567,12 +621,33 @@ mod tests {
 
         let handed_out = memory_ctx().get_write_buffer(false);
         probe.release_in_place();
-        let repooled = memory_ctx().pop_free_idx(false);
+        // Pop the zeroed pool directly: the contended slot's ring flag is still
+        // `zeroed`, so the push-back routes it there, while a slot the loop
+        // never popped would have stayed in the dirty pool. Popping either pool
+        // here would pass even if the contended branch never ran.
+        let repooled = memory_ctx().zeroed_pool.pop(false);
 
         // Assert: the free slot is handed out and the contended one is back in
         // a pool rather than leaked.
         assert_eq!(handed_out.slot_idx, 0);
         assert_eq!(repooled, Some(1));
+    }
+
+    #[test]
+    fn get_write_buffer_repools_contended_slots_when_it_panics() {
+        // Setup: the only pooled slot is transiently locked by an evictor
+        // probe, so get_write_buffer runs out of pool and panics on evict.
+        init_test_free_pool(1);
+        let probe = memory_ctx().ring().try_write(0).unwrap();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            memory_ctx().get_write_buffer(false)
+        }));
+        probe.release_in_place();
+
+        // Assert: the panic unwound without leaking the set-aside slot.
+        assert!(result.is_err());
+        assert_eq!(memory_ctx().pop_free_idx(false), Some(0));
     }
 
     #[test]
