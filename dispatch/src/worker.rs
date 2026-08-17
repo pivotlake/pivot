@@ -248,39 +248,24 @@ impl Worker {
         crate::profiler::profiling_active() && !flow.is_profiled()
     }
 
-    /// Pass every node's `OperatorIO` to the requester. Cache-only responses are
-    /// delivered immediately; physical operations are submitted during the same
-    /// registration call. A callback may enqueue a follow-up read (the Parquet
-    /// footer overflow path), so repeat until no node staged another request.
-    fn register_pending_io(&mut self) {
-        while crate::io::has_pending_io() {
-            crate::io::clear_pending_io();
-            #[cfg(feature = "perf")]
-            let mut skipped_for_profiling = false;
-            for flow in self.data_flows.values_mut() {
-                #[cfg(feature = "perf")]
-                if Self::paused_for_profiling(flow) {
-                    skipped_for_profiling = true;
-                    crate::io::note_pending_io();
-                    continue;
-                }
-                flow.register_pending_io(&mut self.io);
-            }
-            self.deliver_ready_reads();
-            // A paused flow deliberately keeps the flag raised. Do not spin on
-            // it here; lifting exclusive profiling wakes every worker, and the
-            // next pass registers the deferred requests.
-            #[cfg(feature = "perf")]
-            if skipped_for_profiling {
+    /// Deliver resolved logical reads to their operators until none remain.
+    /// Delivery can produce more ready reads synchronously: an operator's
+    /// response callback may submit a follow-up (the Parquet footer overflow
+    /// path) that resolves straight from the caches, so loop until quiescent.
+    fn deliver_ready_reads(&mut self) {
+        loop {
+            let ready = self.io.take_ready_reads();
+            if ready.is_empty() {
                 return;
             }
-        }
-    }
-
-    fn deliver_ready_reads(&mut self) {
-        for ready in self.io.take_ready_reads() {
-            if let Some(flow) = self.data_flows.get_mut(&ready.route.data_flow_id) {
-                flow.process_read_response(ready.route.operator_idx, ready.response);
+            for ready in ready {
+                if let Some(flow) = self.data_flows.get_mut(&ready.route.data_flow_id) {
+                    flow.process_read_response(
+                        ready.route.operator_idx,
+                        ready.response,
+                        &mut self.io,
+                    );
+                }
             }
         }
     }
@@ -294,7 +279,7 @@ impl Worker {
             if Self::paused_for_profiling(flow) {
                 continue;
             }
-            if let WorkStatus::Ran = flow.run_ready_cpu_work() {
+            if let WorkStatus::Ran = flow.run_ready_cpu_work(&mut self.io) {
                 self.did_work_last_iteration = true;
             }
         }
@@ -384,7 +369,7 @@ impl Worker {
             if Self::paused_for_profiling(flow) {
                 continue;
             }
-            if let WorkStatus::Ran = flow.try_stealing_work() {
+            if let WorkStatus::Ran = flow.try_stealing_work(&mut self.io) {
                 self.did_work_last_iteration = true;
             }
         }
@@ -521,7 +506,7 @@ impl Worker {
             self.cancel_upstream_in_dataflows();
 
             self.process_io_completions()?;
-            self.register_pending_io();
+            self.deliver_ready_reads();
 
             self.step_run_ready_cpu_work();
 

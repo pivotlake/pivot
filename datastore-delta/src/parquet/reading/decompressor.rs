@@ -558,7 +558,7 @@ mod tests {
         let result = Decompressor::default().consume(
             page,
             &mut sender,
-            &mut dispatch::OperatorIO::default(),
+            &mut dispatch::TestOperatorIO::default().io(),
         );
 
         assert!(result.is_err());

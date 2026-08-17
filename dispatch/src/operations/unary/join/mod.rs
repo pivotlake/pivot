@@ -501,7 +501,8 @@ mod tests {
 
         let mut probers: Vec<_> = probes.into_iter().map(|p| p.build_unary()).collect();
         let mut sender = CollectSender::new();
-        let mut io = crate::io::OperatorIO::default();
+        let mut test_io = crate::io::TestOperatorIO::default();
+        let mut io = test_io.io();
         for batch in probe_batches {
             probers[0].consume(batch, &mut sender, &mut io).unwrap();
         }

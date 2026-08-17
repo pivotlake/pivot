@@ -173,7 +173,7 @@ mod tests {
             &mut materializer,
             batch,
             &mut sink,
-            &mut dispatch::OperatorIO::default(),
+            &mut dispatch::TestOperatorIO::default().io(),
         )
         .unwrap();
         materializer.pending_row_groups
