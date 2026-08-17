@@ -463,10 +463,6 @@ pub mod ffi {
         /// produces (vs a user IN/EXISTS), which the bridge collapses into a
         /// Materialize.
         fn lo_is_late_materialization_join(op: &LogicalOperator) -> Result<bool>;
-        /// The full-column (LHS) side's output storage columns (row-id excluded),
-        /// which the Materialize re-reads for the surviving rows.
-        fn lo_late_materialization_column_count(op: &LogicalOperator) -> Result<usize>;
-        fn lo_late_materialization_column(op: &LogicalOperator, index: usize) -> Result<usize>;
 
         // ---- ExpressionList (owned synthesized expressions) ----
         fn expr_list_count(list: &ExpressionList) -> Result<usize>;

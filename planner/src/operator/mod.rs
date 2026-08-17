@@ -162,15 +162,9 @@ impl Operator {
             // part of the logical schema.)
             Operator::Input(input) => expression_types(&input.columns),
             Operator::TableFunctionScan(scan) => scan.output_types(),
-            // A materialize re-fetches table columns by storage index.
-            Operator::Materialize(materialize) => {
-                let columns = materialize.table.columns();
-                Ok(materialize
-                    .columns
-                    .iter()
-                    .map(|&i| columns[i].col_type.clone())
-                    .collect())
-            }
+            // A materialize re-fetches columns like a scan: its outputs are
+            // its column expressions.
+            Operator::Materialize(materialize) => expression_types(&materialize.columns),
             // A projection reshapes its input into its expressions.
             Operator::Projection(projection) => expression_types(&projection.projections),
             // An aggregate emits its group keys, then one column per aggregate.
@@ -251,11 +245,11 @@ impl Operator {
                 vec![true; scan.output_types().map_or(0, |t| t.len())]
             }
             Operator::Materialize(materialize) => {
-                let nullability = materialize.table.nullability();
+                let table = materialize.table.nullability();
                 materialize
                     .columns
                     .iter()
-                    .map(|&i| nullability[i])
+                    .map(|e| e.nullability(&table))
                     .collect()
             }
             Operator::Projection(projection) => projection
