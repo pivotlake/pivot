@@ -178,6 +178,7 @@ rust::String lo_drop_schema(const LogicalOperator &op);
 rust::String lo_drop_datastore(const LogicalOperator &op);
 bool lo_drop_if_exists(const LogicalOperator &op);
 bool lo_drop_cascade(const LogicalOperator &op);
+bool lo_explain_is_analyze(const LogicalOperator &op);
 size_t lo_create_column_count(const LogicalOperator &op);
 rust::String lo_create_column_name(const LogicalOperator &op, size_t index);
 BridgeLogicalType lo_create_column_type(const LogicalOperator &op, size_t index);

@@ -221,7 +221,7 @@ impl<'plan> LogicalOp<'plan> {
             L::LOGICAL_CTE_REF => Operator::CteRef(CteRef { raw: self.raw }),
             L::LOGICAL_CHUNK_GET => Operator::ChunkGet(ChunkGet { raw: self.raw }),
             L::LOGICAL_DUMMY_SCAN => Operator::DummyScan,
-            L::LOGICAL_EXPLAIN => Operator::Explain,
+            L::LOGICAL_EXPLAIN => Operator::Explain(Explain { raw: self.raw }),
             _ => Operator::Unsupported,
         })
     }
@@ -277,8 +277,9 @@ pub enum Operator<'plan> {
     ChunkGet(ChunkGet<'plan>),
     /// The single-row source under a `FROM`-less `SELECT`.
     DummyScan,
-    /// `EXPLAIN <query>`.
-    Explain,
+    /// `EXPLAIN [ANALYZE] <query>`; the consumer checks
+    /// [`Explain::is_analyze`] and supports only plain `EXPLAIN`.
+    Explain(Explain<'plan>),
     /// Any operator type the consumer doesn't handle.
     Unsupported,
 }
@@ -348,6 +349,8 @@ define_handles! { ffi::LogicalOperator;
     /// A `LogicalColumnDataGet` (CHUNK_GET): a scan of an in-memory constant
     /// chunk, e.g. what DuckDB rewrites a long `IN` list into.
     ChunkGet,
+    /// A `LogicalExplain`: `EXPLAIN [ANALYZE] <query>`.
+    Explain,
 }
 
 impl<'plan> MaterializedCte<'plan> {
@@ -657,6 +660,13 @@ impl<'plan> CreateSchema<'plan> {
 
     pub fn or_replace(self) -> Result<bool> {
         Ok(ffi::lo_create_schema_or_replace(self.raw)?)
+    }
+}
+
+impl<'plan> Explain<'plan> {
+    /// Whether the statement is `EXPLAIN ANALYZE` (vs plain `EXPLAIN`).
+    pub fn is_analyze(self) -> Result<bool> {
+        Ok(ffi::lo_explain_is_analyze(self.raw)?)
     }
 }
 

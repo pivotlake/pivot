@@ -88,6 +88,20 @@ fn explain_wraps_the_explained_plan(mut testing_planner: TestingPlanner) {
 }
 
 #[rstest]
+fn explain_analyze_is_rejected(mut testing_planner: TestingPlanner) {
+    let error = testing_planner
+        .plan("EXPLAIN ANALYZE SELECT a, b FROM example_table")
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("EXPLAIN ANALYZE is not supported"),
+        "{error}"
+    );
+}
+
+#[rstest]
 fn filter(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
         .plan("SELECT a FROM example_table WHERE a <> b")
