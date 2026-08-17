@@ -3,11 +3,11 @@
 //! A bare `->` returns a sub-variant. A cast turns the full path into one typed
 //! [`VariantGet`], which can read a shredded leaf directly.
 
-use super::Expression;
+use super::{Expression, cast_variant_array};
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
 use crate::types::{Type, physical_arrow_type};
 use arrow_array::RecordBatch;
-use arrow_schema::{Field, FieldRef};
+use arrow_schema::DataType;
 use parquet_variant::{VariantPath, VariantPathElement};
 use parquet_variant_compute::{GetOptions, variant_get};
 use std::fmt::{self, Display};
@@ -41,16 +41,11 @@ impl VariantGet {
     pub fn compile(&self) -> Result<ExprFn, compile::Error> {
         let input_builder = self.input.compile()?;
         let segments: Arc<[String]> = self.path.clone().into();
-        // A typed read asks the kernel directly for the pivot type's physical
-        // arrow column.
-        let as_field: Option<FieldRef> = self
-            .as_type
-            .as_ref()
-            .map(|ty| Arc::new(Field::new("item", physical_arrow_type(ty), true)));
+        let target: Option<DataType> = self.as_type.as_ref().map(physical_arrow_type);
         Ok(Box::new(move || {
             let mut input_expr = input_builder();
             let segments = segments.clone();
-            let as_field = as_field.clone();
+            let target = target.clone();
             Box::new(move |batch: &RecordBatch| {
                 let input = input_expr(batch);
                 let variant = match &input {
@@ -67,12 +62,17 @@ impl VariantGet {
                     .iter()
                     .map(|segment| VariantPathElement::field(segment.as_str()))
                     .collect();
-                let options = GetOptions::new_with_path(vpath).with_as_type(as_field.clone());
+                let options = GetOptions::new_with_path(vpath);
                 // Compiled expressions have no error channel; the dataflow
                 // catches the panic and fails the query with this message.
-                let array = variant_get(&variant, options).unwrap_or_else(|e| {
+                let extracted = variant_get(&variant, options).unwrap_or_else(|e| {
                     panic!("variant path extraction failed (corrupt variant data?): {e}")
                 });
+                let array = match &target {
+                    Some(target) => cast_variant_array(&extracted, target)
+                        .unwrap_or_else(|e| panic!("variant cast failed: {e}")),
+                    None => extracted,
+                };
                 ExprResult::Array(array)
             }) as ExprEvalFn
         }))
@@ -273,23 +273,23 @@ mod tests {
         assert_eq!(got, vec![None, Some(30)]);
     }
 
-    /// A value of the wrong type reads as NULL (like a missing path), not an
-    /// error.
+    /// A value of the wrong type fails an explicit SQL cast.
     #[rstest]
-    fn type_mismatch_is_null(mut testing_planner: TestingPlanner) {
+    fn type_mismatch_is_an_error(mut testing_planner: TestingPlanner) {
+        // Setup
         docs_table(
             &mut testing_planner,
             vec![r#"{"age":30}"#, r#"{"age":"unknown"}"#],
         );
 
-        let rows = run(
+        // Execute
+        let error = run_expecting_error(
             &mut testing_planner,
             "SELECT CAST(d->'age' AS BIGINT) AS a FROM docs",
         );
 
-        let mut got: Vec<Option<i64>> = rows.iter().map(|r| r["a"].as_i64()).collect();
-        got.sort();
-        assert_eq!(got, vec![None, Some(30)]);
+        // Assert
+        assert!(error.contains("cannot cast variant value"));
     }
 
     /// Because the cast types the path BIGINT, the GROUP BY is built for an
@@ -400,18 +400,20 @@ mod tests {
         assert_eq!(got, vec![19723, 19724]);
     }
 
-    /// A value whose variant type doesn't match a temporal target reads as
-    /// NULL: a JSON document stores `"2024-01-05"` as a string, not a date.
+    /// A value whose variant type doesn't match a temporal target fails.
     #[rstest]
-    fn date_cast_of_a_string_value_is_null(mut testing_planner: TestingPlanner) {
+    fn date_cast_of_a_string_value_is_an_error(mut testing_planner: TestingPlanner) {
+        // Setup
         docs_table(&mut testing_planner, vec![r#"{"day":"2024-01-05"}"#]);
 
-        let rows = run(
+        // Execute
+        let error = run_expecting_error(
             &mut testing_planner,
             "SELECT CAST(d->'day' AS DATE) AS day FROM docs",
         );
 
-        assert!(rows[0]["day"].is_null(), "got: {:?}", rows[0]["day"]);
+        // Assert
+        assert!(error.contains("cannot cast variant value"));
     }
 
     /// The extracted field name must be a constant string.

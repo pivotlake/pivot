@@ -24,7 +24,8 @@ use arrow_array::types::{
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, TimeUnit};
 use dispatch::VariantExtract;
 use parquet_variant::{VariantPath, VariantPathElement};
-use parquet_variant_compute::{GetOptions, variant_get};
+use parquet_variant_compute::{GetOptions, cast_to_variant, variant_get};
+use planner::expression::cast_variant_array;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -44,8 +45,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 ///
 /// Plain output columns do not need a transform.
 enum OutputTransform {
-    /// Casts a directly decoded typed leaf to the requested output type.
-    Cast(DataType),
+    /// Applies a SQL variant cast to a directly decoded typed leaf.
+    CastTypedVariant(DataType),
     /// Extracts a path from a reconstructed variant.
     ///
     /// A requested `as_type` produces a scalar. Without one, this produces the
@@ -59,7 +60,10 @@ enum OutputTransform {
 impl OutputTransform {
     fn apply(&self, column: &ArrayRef) -> Result<ArrayRef> {
         match self {
-            OutputTransform::Cast(as_type) => Ok(arrow_cast::cast(column, as_type)?),
+            OutputTransform::CastTypedVariant(as_type) => {
+                let variant: ArrayRef = Arc::new(cast_to_variant(column.as_ref())?.into_inner());
+                Ok(cast_variant_array(&variant, as_type)?)
+            }
             OutputTransform::Extract { path, as_type } => {
                 Ok(extract_variant_path(column, path, as_type)?)
             }
@@ -80,13 +84,11 @@ fn extract_variant_path(
         .iter()
         .map(|segment| VariantPathElement::field(segment.as_str()))
         .collect();
-    let target_field = as_type
-        .as_ref()
-        .map(|data_type| Arc::new(Field::new("item", data_type.clone(), true)));
-    variant_get(
-        column,
-        GetOptions::new_with_path(variant_path).with_as_type(target_field),
-    )
+    let extracted = variant_get(column, GetOptions::new_with_path(variant_path))?;
+    match as_type {
+        Some(as_type) => cast_variant_array(&extracted, as_type),
+        None => Ok(extracted),
+    }
 }
 
 /// Decodes one output column of a row group's batches.
@@ -98,7 +100,7 @@ fn extract_variant_path(
 pub struct ColumnDecoder {
     /// The positions within the row group's decoded leaves that this output
     /// folds, in Parquet's depth-first order.
-    leaf_positions: Vec<usize>,
+    leaf_positions: Vec<Option<usize>>,
     /// The folded leaves land under this field. It is the output field for a
     /// plain column, and for an extract it is whatever the read leaves
     /// reconstruct: the typed leaf, a pruned variant, or the whole variant.
@@ -121,7 +123,7 @@ impl ColumnDecoder {
         column: usize,
         extract: Option<&VariantExtract>,
         read: &OutputRead,
-        leaf_positions: Vec<usize>,
+        leaf_positions: Vec<Option<usize>>,
         leaf_fields: &[FieldRef],
         fields: &Fields,
     ) -> Result<Self> {
@@ -138,7 +140,8 @@ impl ColumnDecoder {
                 let leaf_type = leaf_fields[*leaf].data_type();
                 (
                     create_output_field(leaf_type.clone()),
-                    (*leaf_type != *as_type).then(|| OutputTransform::Cast(as_type.clone())),
+                    (leaf_type != as_type)
+                        .then(|| OutputTransform::CastTypedVariant(as_type.clone())),
                     create_output_field(as_type.clone()),
                 )
             }
@@ -152,12 +155,12 @@ impl ColumnDecoder {
                 reconstructed_variant_field.clone(),
                 Some(OutputTransform::Extract {
                     path: extract.path.clone().into(),
-                    as_type: None,
+                    as_type: extract.as_type.clone(),
                 }),
-                create_output_field(variant_path_output_type(
-                    reconstructed_variant_field,
-                    &extract.path,
-                )?),
+                create_output_field(match &extract.as_type {
+                    Some(as_type) => as_type.clone(),
+                    None => variant_path_output_type(reconstructed_variant_field, &extract.path)?,
+                }),
             ),
             (Some(extract), OutputRead::WholeColumn(_)) => {
                 let whole_variant_field = fields[column].clone();
@@ -198,7 +201,7 @@ impl ColumnDecoder {
     /// entirely, so it can use neither.
     pub fn untransformed_leaf(&self) -> Option<usize> {
         match (self.transform.is_some(), self.leaf_positions.as_slice()) {
-            (false, [position]) => Some(*position),
+            (false, [Some(position)]) => Some(*position),
             _ => None,
         }
     }
@@ -206,10 +209,19 @@ impl ColumnDecoder {
     /// Folds this column's share of the row group's `decoded` leaves into its
     /// output array.
     pub fn read(&self, decoded: &[ArrayRef]) -> Result<ArrayRef> {
-        let mut leaf_arrays = self
+        let len = self
             .leaf_positions
             .iter()
-            .map(|&position| decoded[position].clone());
+            .find_map(|position| position.map(|position| decoded[position].len()))
+            .expect("every output reads at least one physical leaf");
+        let fields = Fields::from(vec![self.pre_transform_field.clone()]);
+        let mut leaf_arrays = crate::parquet::types::leaves::leaf_fields(&fields)
+            .into_iter()
+            .zip(&self.leaf_positions)
+            .map(|(field, position)| match position {
+                Some(position) => decoded[*position].clone(),
+                None => arrow_array::new_null_array(field.data_type(), len),
+            });
         let column = reconstruct_column_from_leaves(&self.pre_transform_field, &mut leaf_arrays);
         match &self.transform {
             Some(transform) => transform.apply(&column),

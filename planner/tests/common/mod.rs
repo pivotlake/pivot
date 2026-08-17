@@ -412,6 +412,21 @@ pub fn run_batches(planner: &mut TestingPlanner, sql: &str) -> Vec<RecordBatch> 
         .unwrap()
 }
 
+/// Plan, compile, and run `sql`, returning its execution error.
+#[allow(dead_code)]
+pub fn run_expecting_error(planner: &mut TestingPlanner, sql: &str) -> String {
+    let transaction = planner.transaction();
+    planner
+        .planner
+        .plan(sql, transaction.clone())
+        .unwrap()
+        .compile(planner.dispatcher(), transaction.as_ref())
+        .unwrap()
+        .collect()
+        .expect_err("query should fail")
+        .to_string()
+}
+
 /// The value of a row's single column, by position rather than name. For tests
 /// that check a computed select item's value, not its (DuckDB-derived) name.
 #[allow(dead_code)]
