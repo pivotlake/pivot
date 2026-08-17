@@ -81,12 +81,15 @@ impl SlabAllocator {
         let mut slabs = vec![];
         let mut remaining = size;
         while remaining > 0 {
-            let slab_size = std::cmp::min(remaining, self.remaining_in_buffer());
-            slabs.push(self.get_slab_from_current_buffer(slab_size, zeroed));
-            remaining -= slab_size;
+            // Acquire a fresh buffer only when more bytes are actually needed:
+            // an exact fit must not grab (and possibly evict for) a surplus
+            // buffer that nothing will use.
             if self.remaining_in_buffer() == 0 {
                 self.advance_to_new_buffer(zeroed);
             }
+            let slab_size = std::cmp::min(remaining, self.remaining_in_buffer());
+            slabs.push(self.get_slab_from_current_buffer(slab_size, zeroed));
+            remaining -= slab_size;
         }
 
         slabs
@@ -150,8 +153,11 @@ impl SlabAllocator {
 
     /// Allocates one slab at an explicitly aligned address.
     ///
-    /// `size + align` must fit in one backing buffer.
+    /// `size + align` must fit in one backing buffer, and `align` must be a
+    /// power of two.
     pub fn get_aligned_slab(&mut self, size: usize, align: usize, zeroed: bool) -> Slab {
+        assert!(align.is_power_of_two(), "align was {align}");
+        assert!(size + align <= BUFFER_SIZE, "size {size} + align {align}");
         if self.remaining_in_buffer() < size + align {
             self.advance_to_new_buffer(zeroed);
         }
@@ -208,6 +214,20 @@ mod tests {
 
         let distance = (b.ptr as usize).abs_diff(a.ptr as usize);
         assert!(distance >= BUFFER_SIZE);
+    }
+
+    #[test]
+    fn an_exact_fit_takes_no_surplus_buffer() {
+        init_test_free_pool(2);
+        let mut alloc = SlabAllocator::new(false);
+
+        let slabs = alloc.get_slabs_of_size(BUFFER_SIZE, false);
+
+        assert_eq!(slabs.len(), 1);
+        assert!(
+            crate::memory::memory_ctx().pop_free_idx(false).is_some(),
+            "an exact fit must leave the second buffer pooled"
+        );
     }
 
     #[test]

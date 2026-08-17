@@ -15,10 +15,10 @@ pub struct SlabVec<T: Copy> {
 // SAFETY: the cached `cur_base` raw pointer is the only thing blocking the auto
 // `Send`. It points into a slab owned by `chunks` — address-stable pool memory the
 // `SlabBuffer`s keep alive — so it stays valid when the `SlabVec` moves to another
-// thread. `Send` is asserted for every `Copy` `T`, including `T`s that embed raw
-// pointers; the caller is then responsible for those pointers being valid to use
-// from the receiving thread.
-unsafe impl<T: Copy> Send for SlabVec<T> {}
+// thread. `T: Send` is still required: the vec hands out its elements on the
+// receiving thread, so a `T` that is unsound to move across threads (e.g. one
+// borrowing a `Cell`) must keep blocking the impl.
+unsafe impl<T: Copy + Send> Send for SlabVec<T> {}
 
 impl<T: Copy> Default for SlabVec<T> {
     fn default() -> Self {

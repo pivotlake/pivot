@@ -86,41 +86,29 @@ impl<'a, 'b> MultiBufferReader<'a, 'b> {
     #[inline(always)]
     pub fn read_fixed_slice<const N: usize>(&mut self) -> [u8; N] {
         let mut slice: [u8; N] = [0u8; N];
-
-        let copy_from_cur = std::cmp::min(self.remaining_in_cur(), N);
-        unsafe {
-            copy_nonoverlapping(
-                self.current_slice().as_ptr(),
-                slice.as_mut_ptr(),
-                copy_from_cur,
-            )
-        };
-        self.position.offset += copy_from_cur;
-
-        let remaining = N - copy_from_cur;
-        if remaining > 0 {
-            self.advance_buffer();
-            slice[copy_from_cur..].copy_from_slice(&self.current_slice()[..remaining]);
-            self.position.offset = remaining;
-        }
+        self.read_into_unfixed_slice(&mut slice);
         slice
     }
 
-    /// Read `s.len()` bytes into the provided slice, crossing buffer
-    /// boundaries if needed.
+    /// Read `s.len()` bytes into the provided slice, crossing as many buffer
+    /// boundaries as the read spans.
     #[inline(always)]
     fn read_into_unfixed_slice(&mut self, s: &mut [u8]) {
-        let copy_from_cur = std::cmp::min(self.remaining_in_cur(), s.len());
-        unsafe {
-            copy_nonoverlapping(self.current_slice().as_ptr(), s.as_mut_ptr(), copy_from_cur)
-        };
-        self.position.offset += copy_from_cur;
-
-        let remaining = s.len() - copy_from_cur;
-        if remaining > 0 {
-            self.advance_buffer();
-            s[copy_from_cur..].copy_from_slice(&self.current_slice()[..remaining]);
-            self.position.offset = remaining;
+        let mut written = 0;
+        while written < s.len() {
+            let take = std::cmp::min(self.remaining_in_cur(), s.len() - written);
+            unsafe {
+                copy_nonoverlapping(
+                    self.current_slice().as_ptr(),
+                    s.as_mut_ptr().add(written),
+                    take,
+                )
+            };
+            self.position.offset += take;
+            written += take;
+            if written < s.len() {
+                self.advance_buffer();
+            }
         }
     }
 
@@ -225,9 +213,31 @@ impl<'a, 'b> MultiBufferReader<'a, 'b> {
 }
 
 impl<'a, 'b> Read for MultiBufferReader<'a, 'b> {
+    /// Read up to `buf.len()` bytes, crossing buffer boundaries, and report how
+    /// many actually landed - `Ok(0)` at end-of-stream, per the `Read` contract,
+    /// so a consumer sees a truncated stream as an error instead of a panic (or
+    /// as garbage claimed to be fully read).
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.read_into_unfixed_slice(buf);
-        Ok(buf.len())
+        let mut written = 0;
+        while written < buf.len() {
+            if self.remaining_in_cur() == 0 {
+                if self.position.buffer_index + 1 >= self.buffers.len() {
+                    break;
+                }
+                self.advance_buffer();
+            }
+            let take = std::cmp::min(self.remaining_in_cur(), buf.len() - written);
+            unsafe {
+                copy_nonoverlapping(
+                    self.current_slice().as_ptr(),
+                    buf.as_mut_ptr().add(written),
+                    take,
+                )
+            };
+            self.position.offset += take;
+            written += take;
+        }
+        Ok(written)
     }
 }
 
@@ -422,6 +432,36 @@ mod tests {
         let n = reader.read(&mut buf).unwrap();
         assert_eq!(n, 4);
         assert_eq!(buf, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_read_trait_stops_at_end_of_stream() {
+        let data = vec![Bytes::from(vec![1, 2]), Bytes::from(vec![3])];
+        let mut pos = ReaderPosition::default();
+        let mut reader = MultiBufferReader::new(&data, &mut pos);
+
+        let mut buf = [0u8; 8];
+        let first = reader.read(&mut buf).unwrap();
+        let second = reader.read(&mut buf).unwrap();
+
+        assert_eq!(first, 3, "a short stream reports what actually landed");
+        assert_eq!(&buf[..3], &[1, 2, 3]);
+        assert_eq!(second, 0, "end-of-stream is Ok(0), not a panic");
+    }
+
+    #[test]
+    fn test_read_bytes_across_three_buffers() {
+        let data = vec![
+            Bytes::from(vec![1u8]),
+            Bytes::from(vec![2u8]),
+            Bytes::from(vec![3u8, 4]),
+        ];
+        let mut pos = ReaderPosition::default();
+        let mut reader = MultiBufferReader::new(&data, &mut pos);
+
+        let bytes = reader.read_bytes(4);
+
+        assert_eq!(bytes, vec![1, 2, 3, 4]);
     }
 
     #[test]
