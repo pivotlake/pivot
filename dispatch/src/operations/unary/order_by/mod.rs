@@ -14,7 +14,9 @@ mod batch_sort;
 mod k_way_merge;
 mod keys;
 
-pub use k_way_merge::{KWayMergePlan, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput};
+pub use k_way_merge::{
+    KWayMergePlan, KWayMergeStep, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput,
+};
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -134,13 +136,18 @@ impl SharedMergeState {
             KWayMergePlan::Empty => self.complete_level(level, MergedOutput::empty()),
             KWayMergePlan::Identity(output) => self.complete_level(level, output),
             KWayMergePlan::Parallel(tasks) => {
-                for merge in tasks {
-                    let node_id = merge.node_id();
-                    self.tasks_by_node[node_id].push(MergeTask { level, merge });
-                    waker_set().notify_one_near(node_id);
-                }
+                self.enqueue(level, tasks);
                 Ok(())
             }
+        }
+    }
+
+    /// Push one level's tasks onto their nodes' deques and wake workers there.
+    fn enqueue(&self, level: MergeLevel, tasks: Vec<KWayMergeTask>) {
+        for merge in tasks {
+            let node_id = merge.node_id();
+            self.tasks_by_node[node_id].push(MergeTask { level, merge });
+            waker_set().notify_one_near(node_id);
         }
     }
 
@@ -181,10 +188,14 @@ impl SharedMergeState {
 
     fn execute(&self, task: MergeTask, allocator: &mut SlabAllocator) -> unary::Result<()> {
         let MergeTask { level, merge } = task;
-        if let Some(output) = merge.execute(allocator)? {
-            self.complete_level(level, output)?;
+        match merge.execute(allocator)? {
+            KWayMergeStep::Pending => Ok(()),
+            KWayMergeStep::FollowUp(tasks) => {
+                self.enqueue(level, tasks);
+                Ok(())
+            }
+            KWayMergeStep::Finished(output) => self.complete_level(level, output),
         }
-        Ok(())
     }
 
     fn claim_task(&self, node_id: usize) -> Option<MergeTask> {

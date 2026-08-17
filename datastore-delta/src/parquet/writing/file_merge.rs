@@ -9,7 +9,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use dispatch::memory::SlabAllocator;
-use dispatch::{KWayMergePlan, MergedOutput, Sender, Unary, UnaryResult};
+use dispatch::{
+    KWayMergePlan, KWayMergeStep, KWayMergeTask, MergedOutput, Sender, Unary, UnaryResult,
+};
 
 use super::types::{
     FileMergeContext, FileOrderInput, GlobalMergeJob, LocalMergeJob, LocalMergeResult, ReadyFile,
@@ -92,7 +94,7 @@ impl Unary<LocalMergeJob, LocalMergeResult> for LocalMergeExecutor {
                 let allocator = self
                     .allocator
                     .get_or_insert_with(|| SlabAllocator::new(false));
-                if let Some(output) = task.execute(allocator)? {
+                if let Some(output) = run_merge_task(task, allocator)? {
                     sender.send(LocalMergeResult::Merged {
                         context,
                         node_id,
@@ -192,13 +194,34 @@ impl Unary<GlobalMergeJob, ReadyFile> for GlobalMergeExecutor {
                 let allocator = self
                     .allocator
                     .get_or_insert_with(|| SlabAllocator::new(false));
-                if let Some(output) = task.execute(allocator)? {
+                if let Some(output) = run_merge_task(task, allocator)? {
                     sender.send(ready_file(&context, output))?;
                 }
             }
         }
         Ok(())
     }
+}
+
+/// Run one distributed merge task to completion, follow-up tasks included.
+///
+/// A follow-up arises only when a plan's batches disagreed on a variant
+/// column's layout, which the write pipeline's up-front unshredding makes a
+/// rare, restamp-only case; the spawned slice tasks then run inline here
+/// rather than being redistributed.
+fn run_merge_task(
+    task: KWayMergeTask,
+    allocator: &mut SlabAllocator,
+) -> Result<Option<MergedOutput>, arrow_schema::ArrowError> {
+    let mut pending = vec![task];
+    while let Some(task) = pending.pop() {
+        match task.execute(allocator)? {
+            KWayMergeStep::Pending => {}
+            KWayMergeStep::FollowUp(tasks) => pending.extend(tasks),
+            KWayMergeStep::Finished(output) => return Ok(Some(output)),
+        }
+    }
+    Ok(None)
 }
 
 fn ready_file(context: &Arc<FileMergeContext>, output: MergedOutput) -> ReadyFile {

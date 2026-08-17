@@ -55,6 +55,17 @@ struct ParallelKWayMerge {
     run_indexes: Vec<RunIndex>,
     slices: Vec<KWayMergeSlice>,
     row_count: usize,
+    /// The variant columns whose physical layout differs between batches (see
+    /// [`Self::try_new_on_nodes`]). Empty in the common case of agreeing
+    /// layouts; otherwise one fold task per batch fills [`Self::folded`]
+    /// before any slice gathers.
+    fold_columns: Vec<usize>,
+    /// The folded replacement of each batch, filled by the fold tasks.
+    /// Empty when `fold_columns` is.
+    folded: Box<[OnceLock<RecordBatch>]>,
+    /// Per batch, the NUMA node its run was sorted on: where its fold task
+    /// runs. Empty when `fold_columns` is.
+    batch_nodes: Vec<usize>,
 }
 
 impl ParallelKWayMerge {
@@ -77,7 +88,27 @@ impl ParallelKWayMerge {
         assert!(run_nodes.iter().all(|&node| node < node_count));
         let run_indexes = build_run_indexes(&runs);
         let row_count = run_indexes.iter().map(|index| index.row_count).sum();
-        let batches = runs.into_iter().flatten().collect::<Vec<_>>();
+        let batches: Vec<RecordBatch> = runs.into_iter().flatten().collect();
+        // A merge slice gathers every column across all runs' batches at once,
+        // so each column must hold one physical type. Only a variant column
+        // can disagree (its layout is chosen per file), and only on an actual
+        // mismatch, so runs whose files all shred alike keep their layout.
+        // Detection is schema-only work; the folding itself runs as one task
+        // per batch, ahead of the slice tasks (see [`KWayMergeTask`]).
+        let fold_columns = crate::arrays::variant::mismatched_variant_columns(&batches);
+        let (folded, batch_nodes) = if fold_columns.is_empty() {
+            (Box::default(), Vec::new())
+        } else {
+            let batch_nodes = run_indexes
+                .iter()
+                .zip(&run_nodes)
+                .flat_map(|(index, &node)| std::iter::repeat_n(node, index.rows_by_batch.len()))
+                .collect();
+            (
+                (0..batches.len()).map(|_| OnceLock::new()).collect(),
+                batch_nodes,
+            )
+        };
         let all_run_rows = run_indexes
             .iter()
             .map(|index| 0..index.row_count)
@@ -117,7 +148,34 @@ impl ParallelKWayMerge {
             run_indexes,
             slices,
             row_count,
+            fold_columns,
+            folded,
+            batch_nodes,
         })
+    }
+
+    /// The batch at `idx` as a slice gathers it: the folded replacement once a
+    /// fold task produced one, the stored batch otherwise. Keys never fold (a
+    /// variant cannot be a sort key), so key ordering reads the stored batches
+    /// directly.
+    fn batch(&self, idx: usize) -> &RecordBatch {
+        self.folded
+            .get(idx)
+            .and_then(OnceLock::get)
+            .unwrap_or(&self.batches[idx])
+    }
+
+    /// Fold one batch's mismatched variant columns to the canonical layout.
+    /// Each batch folds exactly once, from one fold task.
+    fn fold_batch(&self, idx: usize) -> Result<(), ArrowError> {
+        let folded = crate::arrays::variant::fold_batch_columns_to_canonical(
+            &self.batches[idx],
+            &self.fold_columns,
+        )?;
+        self.folded[idx]
+            .set(folded)
+            .unwrap_or_else(|_| panic!("batch {idx} folded twice"));
+        Ok(())
     }
 
     /// Number of independently executable slices in this plan.
@@ -148,13 +206,11 @@ impl ParallelKWayMerge {
             |ordering| slice_mapping(&mut ordering, &self.run_indexes, &slice.run_rows)
         );
 
-        let schema = self.batches[0].schema();
+        let schema = self.batch(0).schema();
         let mut output_columns = Vec::with_capacity(schema.fields().len());
         for column_index in 0..schema.fields().len() {
-            let input_columns: Vec<ArrayRef> = self
-                .batches
-                .iter()
-                .map(|batch| batch.column(column_index).clone())
+            let input_columns: Vec<ArrayRef> = (0..self.batches.len())
+                .map(|batch| self.batch(batch).column(column_index).clone())
                 .collect();
             output_columns.push(take_chunked(allocator, &input_columns, &mapping)?);
         }
@@ -300,20 +356,38 @@ impl KWayMergePlan {
         let batches = runs.into_iter().map(|run| run.batches).collect();
         let plan = ParallelKWayMerge::try_new_on_nodes(order_by, batches, run_nodes, node_count)?;
         let slice_count = plan.slice_count();
+        let fold_count = plan.folded.len();
         let stage = Arc::new(KWayMergeStage {
             output: (0..slice_count).map(|_| OnceLock::new()).collect(),
             remaining: AtomicUsize::new(slice_count),
+            folds_remaining: AtomicUsize::new(fold_count),
             plan,
         });
-        Ok(Self::Parallel(
-            (0..slice_count)
-                .map(|slice_index| KWayMergeTask {
+        // A plan whose batches need variant folding starts with the fold
+        // tasks; the last fold to land spawns the slice tasks (see
+        // [`KWayMergeTask::execute`]). Otherwise the slices start directly.
+        let tasks = if fold_count > 0 {
+            (0..fold_count)
+                .map(|batch_idx| KWayMergeTask {
                     stage: stage.clone(),
-                    slice_index,
+                    step: MergeStep::FoldBatch(batch_idx),
                 })
-                .collect(),
-        ))
+                .collect()
+        } else {
+            slice_tasks(&stage)
+        };
+        Ok(Self::Parallel(tasks))
     }
+}
+
+/// One slice task per output slice of `stage`'s plan.
+fn slice_tasks(stage: &Arc<KWayMergeStage>) -> Vec<KWayMergeTask> {
+    (0..stage.plan.slice_count())
+        .map(|slice_index| KWayMergeTask {
+            stage: stage.clone(),
+            step: MergeStep::MergeSlice(slice_index),
+        })
+        .collect()
 }
 
 fn runs_concatenate_in_order(order_by: &[OrderBy], runs: &[MergeRun]) -> Result<bool, ArrowError> {
@@ -345,48 +419,86 @@ struct KWayMergeStage {
     plan: ParallelKWayMerge,
     output: Box<[OnceLock<LocatedBatch>]>,
     remaining: AtomicUsize,
+    /// Fold tasks still to land before the slice tasks may run. Zero from the
+    /// start when the batches' layouts already agree.
+    folds_remaining: AtomicUsize,
 }
 
-/// One independently executable output slice of a merge level.
+/// One independently executable unit of a merge level: a variant fold of one
+/// batch (all of which run first), or one output slice's merge.
 pub struct KWayMergeTask {
     stage: Arc<KWayMergeStage>,
-    slice_index: usize,
+    step: MergeStep,
+}
+
+enum MergeStep {
+    FoldBatch(usize),
+    MergeSlice(usize),
+}
+
+/// What executing one task produced.
+pub enum KWayMergeStep {
+    /// Other tasks of this level are still outstanding.
+    Pending,
+    /// The last fold landed; these slice tasks run next.
+    FollowUp(Vec<KWayMergeTask>),
+    /// The last slice landed; the level's merged output.
+    Finished(MergedOutput),
 }
 
 impl KWayMergeTask {
-    pub fn execute(
-        self,
-        allocator: &mut SlabAllocator,
-    ) -> Result<Option<MergedOutput>, ArrowError> {
-        let batch = self.stage.plan.merge_slice(allocator, self.slice_index)?;
-        self.stage.output[self.slice_index]
-            .set(LocatedBatch::new(batch, self.node_id()))
-            .unwrap_or_else(|_| panic!("merge slice {} executed twice", self.slice_index));
-        if self.stage.remaining.fetch_sub(1, AtomicOrdering::AcqRel) != 1 {
-            return Ok(None);
-        }
+    pub fn execute(self, allocator: &mut SlabAllocator) -> Result<KWayMergeStep, ArrowError> {
+        match self.step {
+            MergeStep::FoldBatch(batch_idx) => {
+                self.stage.plan.fold_batch(batch_idx)?;
+                // AcqRel orders every fold's write before the slice tasks the
+                // last fold spawns.
+                if self
+                    .stage
+                    .folds_remaining
+                    .fetch_sub(1, AtomicOrdering::AcqRel)
+                    != 1
+                {
+                    return Ok(KWayMergeStep::Pending);
+                }
+                Ok(KWayMergeStep::FollowUp(slice_tasks(&self.stage)))
+            }
+            MergeStep::MergeSlice(slice_index) => {
+                let node_id = self.node_id();
+                let batch = self.stage.plan.merge_slice(allocator, slice_index)?;
+                self.stage.output[slice_index]
+                    .set(LocatedBatch::new(batch, node_id))
+                    .unwrap_or_else(|_| panic!("merge slice {slice_index} executed twice"));
+                if self.stage.remaining.fetch_sub(1, AtomicOrdering::AcqRel) != 1 {
+                    return Ok(KWayMergeStep::Pending);
+                }
 
-        let batches = self
-            .stage
-            .output
-            .iter()
-            .map(|batch| {
-                batch
-                    .get()
-                    .expect("the final merge task observes every output slice")
-                    .clone()
-            })
-            .collect();
-        Ok(Some(MergedOutput {
-            batches,
-            row_count: self.stage.plan.row_count(),
-        }))
+                let batches = self
+                    .stage
+                    .output
+                    .iter()
+                    .map(|batch| {
+                        batch
+                            .get()
+                            .expect("the final merge task observes every output slice")
+                            .clone()
+                    })
+                    .collect();
+                Ok(KWayMergeStep::Finished(MergedOutput {
+                    batches,
+                    row_count: self.stage.plan.row_count(),
+                }))
+            }
+        }
     }
 }
 
 impl NodeIdOutput for KWayMergeTask {
     fn node_id(&self) -> usize {
-        self.stage.plan.slices[self.slice_index].target_node
+        match self.step {
+            MergeStep::FoldBatch(batch_idx) => self.stage.plan.batch_nodes[batch_idx],
+            MergeStep::MergeSlice(slice_index) => self.stage.plan.slices[slice_index].target_node,
+        }
     }
 }
 
