@@ -228,9 +228,9 @@ async fn drop_table_cascade_is_rejected(#[future] conn: Conn) {
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
 async fn system_tables_refreshes_after_catalog_changes(#[future] conn: Conn) {
-    let sql = "SELECT datastore_name, schema_name, table_name \
+    let sql = "SELECT datastore_name, schema_name, name \
                FROM system.tables \
-               WHERE table_name = 'system_catalog_refresh'";
+               WHERE name = 'system_catalog_refresh'";
 
     assert!(select_rows(&conn, sql).await.is_empty());
 
@@ -260,7 +260,7 @@ async fn system_tables_belong_to_the_system_datastore(#[future] conn: Conn) {
 
     let rows = select_rows(
         &conn,
-        "SELECT table_name FROM system.main.tables WHERE table_name = 'system_qualified'",
+        "SELECT name FROM system.main.tables WHERE name = 'system_qualified'",
     )
     .await;
     assert_eq!(rows, vec![vec![Some("system_qualified".into())]]);
@@ -285,7 +285,7 @@ async fn system_tables_belong_to_the_system_datastore(#[future] conn: Conn) {
 async fn system_table_files_lists_the_files_of_a_table(#[future] conn: Conn) {
     let sql = "SELECT f.size_bytes \
                FROM system.table_files f JOIN system.tables t ON f.table_id = t.id \
-               WHERE t.table_name = 'system_files'";
+               WHERE t.name = 'system_files'";
     conn.simple_query("CREATE TABLE system_files (id BIGINT)")
         .await
         .unwrap();

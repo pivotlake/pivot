@@ -174,7 +174,7 @@ fn build_tables_relation(
         .iter()
         .map(|entry| entry.table.name.schema.as_str())
         .collect();
-    let table_names: Vec<_> = tables
+    let names: Vec<_> = tables
         .iter()
         .map(|entry| entry.table.name.table.as_str())
         .collect();
@@ -185,7 +185,7 @@ fn build_tables_relation(
         vec![
             string_column("datastore_name", datastore_names),
             string_column("schema_name", schema_names),
-            string_column("table_name", table_names),
+            string_column("name", names),
             string_column("id", ids),
         ],
     )
