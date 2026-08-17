@@ -143,6 +143,11 @@ impl Ring {
         self.slots[idx].zeroed.store(zeroed, Ordering::Relaxed)
     }
 
+    /// Whether slot `idx` currently contains zeroed memory.
+    pub fn slot_zeroed(&self, idx: usize) -> bool {
+        self.slots[idx].zeroed.load(Ordering::Relaxed)
+    }
+
     /// Tries to acquire exclusive write access to slot `idx`.
     ///
     /// Succeeds only if the slot is completely free (`used == 0`). On success,
