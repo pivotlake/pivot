@@ -151,6 +151,15 @@ fn run() -> Result<(), Error> {
     let config = Config::open(&args.config).map_err(Box::new)?;
     let server_config = config.server;
 
+    // Read the certificate before anything expensive is built: a key that is
+    // missing or does not match should stop startup here, rather than surface on
+    // whichever client first asks to encrypt its connection.
+    let tls = server_config
+        .tls
+        .as_ref()
+        .map(server::tls::build_acceptor)
+        .transpose()?;
+
     raise_open_file_limit();
 
     let workers = server_config
@@ -189,6 +198,9 @@ fn run() -> Result<(), Error> {
         let mut server = Server::new(server_config.bind, dispatch, catalog, metastore);
         if let Some(addr) = server_config.http_bind {
             server = server.with_http_bind(addr);
+        }
+        if let Some(acceptor) = tls {
+            server = server.with_tls(acceptor);
         }
         let shutdown = Box::pin(async {
             let _ = tokio::signal::ctrl_c().await;

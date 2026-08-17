@@ -117,6 +117,20 @@ pub fn start_server_with_metastore<F>(ring_slots: usize, build_catalog: F) -> u1
 where
     F: FnOnce(&Dispatch) -> (CatalogFixture, Arc<dyn Metastore>) + Send + 'static,
 {
+    start_server_with_tls(ring_slots, None, build_catalog)
+}
+
+/// As [`start_server_with_metastore`], but the server offers `tls`'s certificate
+/// to connections that ask to encrypt themselves. `None` leaves it refusing
+/// them, which is what the other starters do.
+pub fn start_server_with_tls<F>(
+    ring_slots: usize,
+    tls: Option<pgwire::tokio::TlsAcceptor>,
+    build_catalog: F,
+) -> u16
+where
+    F: FnOnce(&Dispatch) -> (CatalogFixture, Arc<dyn Metastore>) + Send + 'static,
+{
     let port = pick_free_port();
     let workers = core_affinity::get_core_ids().unwrap().len().clamp(1, 4);
     let bind: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
@@ -131,7 +145,10 @@ where
             // Build the datastores inside the runtime: a datastore that
             // self-manages maintenance spawns its tasks onto the ambient runtime.
             let (CatalogFixture { catalog, data_dirs }, metastore) = build_catalog(&dispatch);
-            let server = Server::new(bind, dispatch, catalog, metastore);
+            let mut server = Server::new(bind, dispatch, catalog, metastore);
+            if let Some(acceptor) = tls {
+                server = server.with_tls(acceptor);
+            }
             let result = server.serve(Box::pin(std::future::pending::<()>())).await;
             drop(data_dirs);
             let _ = result;

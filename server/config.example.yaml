@@ -29,6 +29,15 @@ server:
   #   size: 64g            # default
   #   max_objects: 65536   # one open file descriptor per cached object
 
+  # Certificate to present to a client that asks to encrypt its connection
+  # (`psql "sslmode=require"`). Omitted means those requests are turned down and
+  # every session is plaintext. Both files are PEM; both are required once the
+  # section is present. Present makes SSL available, not compulsory: a client
+  # that asks for plaintext still gets it.
+  # tls:
+  #   cert: /etc/pivot/server.crt   # the server's certificate, then any intermediates
+  #   key: /etc/pivot/server.key    # its private key; keep it readable only by the server
+
 metastore:
   # Exactly one datastore must set `default: true`. It is the current database, so
   # unqualified names such as `main.events` resolve against it.

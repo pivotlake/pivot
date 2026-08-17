@@ -15,6 +15,9 @@
 //!   disk_cache:
 //!     dir: /var/cache/pivot
 //!     size: 64g
+//!   tls:
+//!     cert: /etc/pivot/server.crt
+//!     key: /etc/pivot/server.key
 //!
 //! metastore:
 //!   datastores:
@@ -115,6 +118,10 @@ pub struct ServerConfig {
     /// On-disk cache for remote (object store) reads. Omit to disable it; local
     /// files are never cached, they are read from the filesystem directly.
     pub disk_cache: Option<DiskCacheConfig>,
+    /// Certificate the PostgreSQL endpoint presents to a client that asks to
+    /// encrypt its connection. Omit to answer every such request with a refusal,
+    /// leaving the endpoint plaintext-only.
+    pub tls: Option<TlsConfig>,
 }
 
 impl Default for ServerConfig {
@@ -126,8 +133,28 @@ impl Default for ServerConfig {
             workers: None,
             refresh_interval: Interval::from_duration(DEFAULT_REFRESH_INTERVAL),
             disk_cache: None,
+            tls: None,
         }
     }
+}
+
+/// The `server.tls` section. Both fields are required: an endpoint that offers
+/// encryption has to present a certificate, and a certificate is worth nothing
+/// without the key that proves the server holds it.
+///
+/// Writing the section turns SSL on; it does not make it compulsory. A client
+/// that asks to upgrade gets an encrypted session, and one that does not still
+/// gets a plaintext one, which is how PostgreSQL's own `ssl = on` behaves.
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// PEM file holding the certificate to present: the server's own first,
+    /// followed by whatever intermediates a client needs to reach a root it
+    /// trusts.
+    pub cert: PathBuf,
+    /// PEM file holding that certificate's private key, in any of PKCS#8,
+    /// PKCS#1 or SEC1. Readable by the server's user and by nobody else.
+    pub key: PathBuf,
 }
 
 /// The `server.disk_cache` section. `dir` is required: the section exists to
@@ -270,6 +297,27 @@ mod tests {
         assert_eq!(cache.dir, PathBuf::from("/var/cache/pivot"));
         assert_eq!(cache.size, DEFAULT_DISK_CACHE_SIZE);
         assert_eq!(cache.max_objects, DEFAULT_DISK_CACHE_MAX_OBJECTS);
+    }
+
+    #[test]
+    fn a_tls_section_names_the_certificate_to_present() {
+        let config = from_yaml_with(
+            "  tls:\n    cert: /etc/pivot/server.crt\n    key: /etc/pivot/server.key\n",
+        )
+        .unwrap();
+
+        let tls = config.server.tls.unwrap();
+        assert_eq!(tls.cert, PathBuf::from("/etc/pivot/server.crt"));
+        assert_eq!(tls.key, PathBuf::from("/etc/pivot/server.key"));
+    }
+
+    #[test]
+    fn a_certificate_without_its_key_is_rejected() {
+        let error = from_yaml_with("  tls:\n    cert: /etc/pivot/server.crt\n")
+            .err()
+            .expect("a certificate the server cannot prove it holds should be rejected");
+
+        assert!(error.to_string().contains("missing field `key`"), "{error}");
     }
 
     #[test]

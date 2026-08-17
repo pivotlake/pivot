@@ -44,6 +44,9 @@ server:
     dir: /var/cache/pivot   # required once the section is present
     size: 64g               # default 64g
     max_objects: 65536      # default; one open file descriptor per cached object
+  tls:                      # offer SSL to clients that ask; omitted means no SSL
+    cert: /etc/pivot/server.crt
+    key: /etc/pivot/server.key
 
 metastore:
   datastores: ...
@@ -161,6 +164,40 @@ connect without a password. The built-in configuration therefore connects as:
 ```sh
 psql -h 127.0.0.1 -p 5432 -U pivot
 ```
+
+### SSL
+
+Give the `server` section a `tls` block and the endpoint offers encryption to
+clients that ask for it:
+
+```yaml
+server:
+  tls:
+    cert: /etc/pivot/server.crt   # the server's certificate, then any intermediates
+    key: /etc/pivot/server.key    # its private key, in PKCS#8, PKCS#1 or SEC1
+```
+
+Both files are PEM and both are read at startup, so a certificate that is
+missing, malformed, or paired with the wrong key stops the server rather than
+surfacing on the first client that asks to encrypt. Keep the key readable only
+by the user the server runs as.
+
+Clients then connect as they would to PostgreSQL:
+
+```sh
+psql "host=pivot.example.com port=5432 user=pivot sslmode=verify-full sslrootcert=/etc/ssl/ca.crt"
+```
+
+Turning SSL on makes it available, not compulsory, the same way PostgreSQL's own
+`ssl = on` does: a client asking for plaintext still gets a plaintext session on
+the same port. There is no server-side setting yet that refuses those, so a
+deployment that must have every session encrypted should keep the port off any
+untrusted network.
+
+Encrypted sessions authenticate exactly as plaintext ones do, with trust or
+SCRAM-SHA-256. Channel binding (`SCRAM-SHA-256-PLUS`) is not offered, so a
+client passing `channel_binding=require` is turned away; `prefer`, the libpq
+default, negotiates plain SCRAM-SHA-256 and connects.
 
 Tables are registered in a datastore with `CREATE TABLE`. A table path is
 relative to that datastore's configured location:
