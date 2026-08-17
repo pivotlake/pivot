@@ -434,6 +434,19 @@ pub fn run_expecting_error(planner: &mut TestingPlanner, sql: &str) -> String {
     collect_batches(planner, sql).unwrap_err().to_string()
 }
 
+/// The error compiling `sql`'s plan reports, for tests pinning a shape pivot
+/// declines to execute. Planning must succeed and compiling must not.
+pub fn compile_expecting_error(planner: &mut TestingPlanner, sql: &str) -> String {
+    let plan = planner.plan(sql).unwrap();
+    plan.compile(
+        planner.dispatch.dispatcher(),
+        planner.transaction().as_ref(),
+    )
+    .err()
+    .expect("compiling was expected to fail")
+    .to_string()
+}
+
 /// The shared plan-compile-collect pipeline behind [`run_batches`] and
 /// [`run_expecting_error`]: planning and compilation must succeed, running the
 /// dataflow may fail.

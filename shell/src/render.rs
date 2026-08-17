@@ -3,11 +3,13 @@
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use arrow_array::{
     Array, BooleanArray, Date32Array, Decimal64Array, Decimal128Array, Float32Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray, StringViewArray,
-    TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Int8Array, Int16Array, Int32Array, Int64Array, IntervalMonthDayNanoArray, RecordBatch,
+    StringArray, StringViewArray, TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
 };
 use arrow_schema::DataType;
 use engine::ResultColumn;
+use planner::types::render_interval;
 use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug)]
@@ -163,6 +165,13 @@ fn format_cell(
                 .value_as_datetime(row)
                 .unwrap()
                 .to_string(),
+        ),
+        DataType::Interval(_) => render_interval(
+            array
+                .as_any()
+                .downcast_ref::<IntervalMonthDayNanoArray>()
+                .unwrap()
+                .value(row),
         ),
         _ => fallback
             .map(|formatter| formatter.value(row).to_string())

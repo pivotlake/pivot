@@ -1117,7 +1117,17 @@ fn delta_type(column: &str, data_type: &Type) -> Result<DeltaDataType, Error> {
         Type::Date => PrimitiveType::Date,
         Type::Timestamp => PrimitiveType::TimestampNtz,
         Type::Decimal { precision, scale } => PrimitiveType::decimal(*precision, *scale as u8)?,
-        Type::Int128 | Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64 => {
+        // A Delta *table schema* has no interval primitive: the kernel reads
+        // `interval day`/`interval second` as an unsupported table type, even
+        // though the SQL dialects over Delta do have an INTERVAL expression
+        // type. Nothing is lost, as an interval only ever arises here as a
+        // computed result (a timestamp difference), never as a stored column.
+        Type::Interval
+        | Type::Int128
+        | Type::UInt8
+        | Type::UInt16
+        | Type::UInt32
+        | Type::UInt64 => {
             return Err(Error::UnsupportedType {
                 column: column.to_string(),
                 data_type: data_type.to_string(),

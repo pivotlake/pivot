@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+arrow-buffer = { workspace = true }
 arrow-ord = { workspace = true }
 arrow-arith = { workspace = true }
 arrow = { workspace = true }

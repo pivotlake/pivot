@@ -2,11 +2,12 @@
 
 use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
-use crate::types::{MAX_DECIMAL64_PRECISION, Type};
+use crate::types::{MAX_DECIMAL64_PRECISION, MICROS_PER_DAY, NANOS_PER_MICRO, Type};
 use arrow::compute::kernels::numeric::{add_wrapping, mul_wrapping, sub_wrapping};
 use arrow_array::cast::AsArray;
-use arrow_array::types::{Decimal64Type, Decimal128Type, DecimalType};
-use arrow_array::{ArrayRef, Datum, RecordBatch};
+use arrow_array::types::{Decimal64Type, Decimal128Type, DecimalType, DurationMicrosecondType};
+use arrow_array::{ArrayRef, Datum, IntervalMonthDayNanoArray, RecordBatch};
+use arrow_buffer::IntervalMonthDayNano;
 use arrow_schema::{ArrowError, DataType};
 use std::fmt::{self, Display};
 use std::sync::Arc;
@@ -63,6 +64,10 @@ impl Arithmetic {
             Type::Decimal { precision, scale } => Some((*precision, *scale)),
             _ => None,
         };
+        // `timestamp - timestamp` is bound to an INTERVAL, but arrow's kernel
+        // answers a `Duration` of microseconds, so the difference is rebuilt
+        // into interval fields below.
+        let yields_interval = self.return_type == Type::Interval;
         let left_builder = self.left.compile()?;
         let right_builder = self.right.compile()?;
         Ok(Box::new(move || {
@@ -77,10 +82,36 @@ impl Arithmetic {
                     Some((precision, scale)) => restamp_decimal(out, precision, scale),
                     None => out,
                 };
+                let out = if yields_interval {
+                    interval_from_duration(&out)
+                } else {
+                    out
+                };
                 ExprResult::Array(out)
             }) as ExprEvalFn
         }))
     }
+}
+
+/// Rebuild a microsecond `Duration`, what arrow's kernel answers for
+/// `timestamp - timestamp`, into interval fields: whole days split out, the
+/// remainder left as sub-day time.
+///
+/// Months stay zero, as in DuckDB's `Interval::FromMicro` and Postgres's
+/// `timestamp_mi`. How many months a span covers depends on which months they
+/// were, so naming one breaks `a + (b - a) = b`: 2020-01-01 to 2020-04-10 is
+/// 100 days, and `3 mons 10 days` added back lands a day late.
+///
+/// Splitting the days off also keeps the nanoseconds under a day, well inside
+/// the ~292 years the field holds.
+fn interval_from_duration(duration: &ArrayRef) -> ArrayRef {
+    let micros = duration.as_primitive::<DurationMicrosecondType>();
+    let spans: IntervalMonthDayNanoArray = micros.unary(|total| IntervalMonthDayNano {
+        months: 0,
+        days: (total / MICROS_PER_DAY) as i32,
+        nanoseconds: total % MICROS_PER_DAY * NANOS_PER_MICRO,
+    });
+    Arc::new(spans)
 }
 
 /// Restamp a decimal kernel result to the plan's bound result type.
@@ -138,7 +169,118 @@ fn restamp_decimal(array: ArrayRef, precision: u8, scale: i8) -> ArrayRef {
 #[cfg(test)]
 mod tests {
     use crate::test_support::*;
+    use crate::types::Type;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::IntervalMonthDayNanoType;
+    use arrow_array::{ArrayRef, Int64Array};
+    use arrow_buffer::IntervalMonthDayNano;
+    use arrow_schema::{DataType, IntervalUnit};
     use rstest::rstest;
+    use std::sync::Arc;
+
+    /// 1970-01-01 00:00:00 and 2 days 03:04:05.5 later, in microseconds.
+    const EPOCH: i64 = 0;
+    const LATER: i64 = 183_845_500_000;
+
+    /// The same 2 days 03:04:05.5, as the interval fields it lands on.
+    fn later_as_interval() -> IntervalMonthDayNano {
+        IntervalMonthDayNano {
+            months: 0,
+            days: 2,
+            nanoseconds: 11_045_500_000_000,
+        }
+    }
+
+    fn events_table(planner: &TestingPlanner) {
+        planner.add_table(
+            "events",
+            &[(
+                "ts",
+                Type::Timestamp,
+                Arc::new(Int64Array::from(vec![EPOCH, LATER])) as ArrayRef,
+            )],
+        );
+    }
+
+    #[rstest]
+    fn subtracting_two_timestamps_yields_an_interval(mut testing_planner: TestingPlanner) {
+        events_table(&testing_planner);
+
+        let batches = run_batches(&mut testing_planner, "SELECT max(ts) - min(ts) FROM events");
+
+        // DuckDB binds `timestamp - timestamp` to an INTERVAL, and splits the
+        // difference's whole days out of its sub-day remainder.
+        let col = batches[0].column(0);
+        assert_eq!(
+            col.data_type(),
+            &DataType::Interval(IntervalUnit::MonthDayNano)
+        );
+        assert_eq!(
+            col.as_primitive::<IntervalMonthDayNanoType>().value(0),
+            later_as_interval()
+        );
+    }
+
+    #[rstest]
+    fn now_minus_a_timestamp_measures_the_age_of_a_row(mut testing_planner: TestingPlanner) {
+        events_table(&testing_planner);
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+
+        let batches = run_batches(&mut testing_planner, "SELECT now() - max(ts) FROM events");
+
+        let age = batches[0]
+            .column(0)
+            .as_primitive::<IntervalMonthDayNanoType>()
+            .value(0);
+        let elapsed_days = ((before - LATER) / 86_400_000_000) as i32;
+        assert!(
+            age.days >= elapsed_days,
+            "{age:?} is before the query started"
+        );
+    }
+
+    /// Sorting by an interval is rejected cleanly rather than sorted wrongly.
+    /// DuckDB keys the sort on `normalized_interval(age)`, and an ORDER BY key
+    /// has to be a plain column reference here, so the carried value has
+    /// nowhere to live. Supporting it means computing the key into an appended
+    /// column, the way a join's computed keys already are
+    /// (`append_computed_keys`), and projecting it back off after the sort.
+    /// Sorting the uncarried column instead would be wrong: `1 mon` and
+    /// `100 days` rank one way as stored and the other way once carried.
+    #[rstest]
+    fn ordering_by_an_interval_is_not_supported_yet(mut testing_planner: TestingPlanner) {
+        events_table(&testing_planner);
+
+        let error = compile_expecting_error(
+            &mut testing_planner,
+            "SELECT ts - TIMESTAMP '1970-01-01' AS age FROM events ORDER BY age DESC",
+        );
+
+        assert!(
+            error.contains("Unsupported order by expression"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[rstest]
+    fn an_interval_compares_against_an_interval_constant(mut testing_planner: TestingPlanner) {
+        events_table(&testing_planner);
+
+        // The 2 days 03:04:05.5 span sits between the two constants, and the
+        // month is DuckDB's fixed 30 days.
+        let rows = run(
+            &mut testing_planner,
+            "SELECT max(ts) - min(ts) > INTERVAL '2 days' AS over_two_days,
+                    max(ts) - min(ts) < INTERVAL '1 month' AS under_a_month
+             FROM events",
+        );
+
+        assert_eq!(rows[0]["over_two_days"], true);
+        assert_eq!(rows[0]["under_a_month"], true);
+    }
 
     #[rstest]
     fn nested_add_and_mul_in_projection(mut testing_planner: TestingPlanner) {

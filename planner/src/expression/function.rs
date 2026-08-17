@@ -3,13 +3,13 @@
 
 use super::{
     Arithmetic, Contains, DatePart, DateTrunc, Divide, FormatBytes, IntervalArithmetic, Length,
-    Like, Prefix, RegexpFullMatch, RegexpJitReplace, RegexpReplace, Substring, Suffix,
-    TemporalConvert, VariantGet,
+    Like, NormalizedInterval, Now, Prefix, RegexpFullMatch, RegexpJitReplace, RegexpReplace,
+    Substring, Suffix, TemporalConvert, VariantGet,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::expression::Expression;
 use crate::types::Type;
-use arrow_array::{Int64Array, RecordBatch, TimestampMicrosecondArray};
+use arrow_array::{Int64Array, RecordBatch};
 use std::fmt::{self, Display};
 use std::sync::Arc;
 
@@ -99,10 +99,14 @@ pub enum Function {
     ///
     /// [`DummyScan`]: crate::operator::DummyScan
     DropCache,
+    /// `normalized_interval(span)` — an interval carried into the canonical
+    /// form its fields must take before they compare. DuckDB's binder wraps
+    /// every interval it orders, compares or hashes in this.
+    NormalizedInterval(NormalizedInterval),
     /// `now()` yields the wall-clock time captured once when the query
     /// compiles, so every row of the statement sees the same instant. Result is
     /// a `TIMESTAMP` (epoch microseconds).
-    Now,
+    Now(Now),
     /// A variant (JSON) path read: `doc->'key'` chains, optionally typed by a
     /// fused `CAST`.
     VariantGet(VariantGet),
@@ -146,7 +150,8 @@ impl Function {
             Function::DatePart(d) => visit(&d.source),
             Function::IntervalArithmetic(i) => visit(&i.operand),
             Function::TemporalConvert(t) => visit(&t.source),
-            Function::DropCache | Function::Now => {}
+            Function::NormalizedInterval(n) => visit(&n.input),
+            Function::DropCache | Function::Now(_) => {}
             Function::VariantGet(v) => visit(&v.input),
         }
     }
@@ -187,7 +192,8 @@ impl Function {
             Function::DatePart(d) => visit(&mut d.source),
             Function::IntervalArithmetic(i) => visit(&mut i.operand),
             Function::TemporalConvert(t) => visit(&mut t.source),
-            Function::DropCache | Function::Now => {}
+            Function::NormalizedInterval(n) => visit(&mut n.input),
+            Function::DropCache | Function::Now(_) => {}
             Function::VariantGet(v) => visit(&mut v.input),
         }
     }
@@ -212,8 +218,9 @@ impl Display for Function {
             Function::DatePart(d) => write!(f, "{d}"),
             Function::IntervalArithmetic(i) => write!(f, "{i}"),
             Function::TemporalConvert(c) => write!(f, "{c}"),
+            Function::NormalizedInterval(n) => write!(f, "{n}"),
             Function::DropCache => write!(f, "drop_cache()"),
-            Function::Now => write!(f, "now()"),
+            Function::Now(n) => write!(f, "{n}"),
             Function::VariantGet(v) => write!(f, "{v}"),
         }
     }
@@ -242,7 +249,9 @@ impl Function {
             // `/` computes a float quotient, single- or double-precision.
             Function::Divide(d) => d.return_type.clone(),
             // `date_trunc` and `now()` yield a timestamp.
-            Function::DateTrunc(_) | Function::Now => Type::Timestamp,
+            Function::DateTrunc(_) | Function::Now(_) => Type::Timestamp,
+            // Canonicalising a span rewrites its fields, not its type.
+            Function::NormalizedInterval(_) => Type::Interval,
             // `date`/`timestamp` ± interval keeps the temporal operand's type,
             // and `make_date`/`make_timestamp` produce the type they convert to.
             Function::IntervalArithmetic(i) => i.result.clone(),
@@ -273,6 +282,8 @@ impl Function {
             Function::DatePart(d) => d.compile(),
             Function::IntervalArithmetic(i) => i.compile(),
             Function::TemporalConvert(c) => c.compile(),
+            Function::NormalizedInterval(n) => n.compile(),
+            Function::Now(n) => n.compile(),
             Function::VariantGet(v) => v.compile(),
             // `drop_cache()` evicts pivot's in-memory compressed cache *and* the on-disk
             // cache (so remote reads go cold to the network) as a side effect, then
@@ -287,21 +298,6 @@ impl Function {
                 let evicted = (extents + decompressed + objects) as i64;
                 ExprResult::Array(Arc::new(Int64Array::from(vec![evicted; batch.num_rows()])))
             })),
-            // Capture the instant once, here at compile time, so every worker and
-            // every row of the statement observes the same `now()`. Emitted as a
-            // real `Timestamp` (epoch microseconds, pivot's timestamp
-            // representation). Negative (pre-epoch) clocks are clamped to 0,
-            // which can't happen on a sane host.
-            Function::Now => {
-                let now_micros = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|elapsed| i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX))
-                    .unwrap_or(0);
-                Ok(stateless_expr(move |batch: &RecordBatch| {
-                    let values = vec![now_micros; batch.num_rows()];
-                    ExprResult::Array(Arc::new(TimestampMicrosecondArray::from(values)))
-                }))
-            }
         }
     }
 }
@@ -309,9 +305,6 @@ impl Function {
 #[cfg(test)]
 mod tests {
     use crate::test_support::*;
-    use arrow_array::cast::AsArray;
-    use arrow_array::types::TimestampMicrosecondType;
-    use arrow_schema::{DataType, TimeUnit};
     use rstest::rstest;
 
     #[rstest]
@@ -322,33 +315,5 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert!(only_column(&rows[0]).as_i64().unwrap() >= 0);
-    }
-
-    #[rstest]
-    fn now_returns_current_time_as_a_timestamp(mut testing_planner: TestingPlanner) {
-        let before = micros_since_epoch();
-
-        let batches = run_batches(&mut testing_planner, "SELECT now()");
-
-        let after = micros_since_epoch();
-        let col = batches[0].column(0);
-        // `now()` surfaces as a real TIMESTAMP carrying the captured instant at
-        // the microsecond resolution a timestamp counts in.
-        assert_eq!(
-            col.data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, None)
-        );
-        let now = col.as_primitive::<TimestampMicrosecondType>().value(0);
-        assert!(
-            (before..=after).contains(&now),
-            "{now} not in [{before}, {after}]"
-        );
-    }
-
-    fn micros_since_epoch() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as i64
     }
 }
