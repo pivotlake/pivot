@@ -16,10 +16,11 @@
 
 use arrow_array::{
     ArrayRef, BooleanArray, Decimal64Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, Scalar, StringViewArray, TimestampMicrosecondArray,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Int16Array, Int32Array, Int64Array, IntervalMonthDayNanoArray, Scalar, StringViewArray,
+    TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow_schema::{DataType, TimeUnit};
+use arrow_buffer::IntervalMonthDayNano;
+use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 use duckdb_planner::duckdb_bridge::duckdb_types::LogicalTypeId;
 use duckdb_planner::{BoundLogicalType, ExtraTypeInfo, ScalarValue};
 use std::fmt;
@@ -71,6 +72,22 @@ pub enum Type {
     /// resolution, so a value crosses the two engines unscaled. The executor
     /// sees that count in an `Int64`-shaped timestamp column.
     Timestamp,
+    /// DuckDB `INTERVAL`: a span carried as the three independent fields
+    /// DuckDB's own `interval_t` keeps, months / days / sub-day time, on arrow's
+    /// matching `Interval(MonthDayNano)`.
+    ///
+    /// The fields stay separate because neither a month nor a day has a fixed
+    /// length: a month runs 28 to 31 days, and a day is not 24 hours across a
+    /// DST boundary. Collapsing them at parse time would lose the unit the
+    /// query asked for, which calendar arithmetic needs. The cost is that the
+    /// three fields only compare once carried into a canonical form, which is
+    /// what [`NormalizedInterval`] does.
+    ///
+    /// Arrow counts the sub-day field in nanoseconds where DuckDB counts
+    /// microseconds, so the two cross with a factor of `NANOS_PER_MICRO`.
+    ///
+    /// [`NormalizedInterval`]: crate::expression::NormalizedInterval
+    Interval,
     /// A Parquet `variant` (semi-structured / JSON) column, presented to DuckDB
     /// as its native `VARIANT` type: `d.age`, `d->'age'`, and casts all bind
     /// natively. The executor sees the Arrow struct of leaves the file stores.
@@ -98,6 +115,7 @@ impl fmt::Display for Type {
             Type::Utf8 => "Utf8",
             Type::Date => "Date",
             Type::Timestamp => "Timestamp",
+            Type::Interval => "Interval",
             Type::Variant => "Variant",
         };
         f.write_str(name)
@@ -125,6 +143,25 @@ pub const MAX_DECIMAL_PRECISION: u8 = 38;
 /// and its binder casts every operand of a mixed-width operation to the wide
 /// type, so kernels never see a `Decimal64`/`Decimal128` mix.
 pub const MAX_DECIMAL64_PRECISION: u8 = 18;
+
+/// The factor between DuckDB's interval, whose sub-day field counts
+/// microseconds, and arrow's, which counts nanoseconds. Every interval crossing
+/// the bridge scales by this.
+pub(crate) const NANOS_PER_MICRO: i64 = 1_000;
+
+/// Nanoseconds in a day, the boundary a [`Type::Interval`]'s sub-day field
+/// carries into whole days at.
+pub(crate) const NANOS_PER_DAY: i64 = 24 * 60 * 60 * 1_000_000_000;
+
+/// The same boundary in microseconds, for splitting a timestamp difference
+/// (which arrow answers in microseconds) into days and a remainder.
+pub(crate) const MICROS_PER_DAY: i64 = NANOS_PER_DAY / NANOS_PER_MICRO;
+
+/// The fixed month DuckDB carries days into when it canonicalises an interval
+/// (its `Interval::DAYS_PER_MONTH`). It is a normalisation convention, not a
+/// claim that a month is 30 days: real calendar arithmetic keeps the months
+/// field intact instead of folding it through this.
+pub(crate) const DAYS_PER_MONTH: i32 = 30;
 
 /// DuckDB [`BoundLogicalType`] -> Pivot [`Type`] (fallible, returns `Err` for
 /// unmapped DuckDB types, including an id whose [`ExtraTypeInfo`] payload
@@ -155,6 +192,7 @@ pub fn type_from_logical(bound: BoundLogicalType) -> Result<Type, Error> {
         (LogicalTypeId::VARCHAR, ExtraTypeInfo::None) => Ok(Type::Utf8),
         (LogicalTypeId::DATE, ExtraTypeInfo::None) => Ok(Type::Date),
         (LogicalTypeId::TIMESTAMP, ExtraTypeInfo::None) => Ok(Type::Timestamp),
+        (LogicalTypeId::INTERVAL, ExtraTypeInfo::None) => Ok(Type::Interval),
         (LogicalTypeId::VARIANT, ExtraTypeInfo::None) => Ok(Type::Variant),
         _ => Err(Error::UnsupportedLogicalType(bound.id.clone())),
     }
@@ -186,6 +224,7 @@ pub fn logical_from_type(pivot_type: &Type) -> BoundLogicalType {
         Type::Utf8 => BoundLogicalType::plain(LogicalTypeId::VARCHAR),
         Type::Date => BoundLogicalType::plain(LogicalTypeId::DATE),
         Type::Timestamp => BoundLogicalType::plain(LogicalTypeId::TIMESTAMP),
+        Type::Interval => BoundLogicalType::plain(LogicalTypeId::INTERVAL),
         Type::Variant => BoundLogicalType::plain(LogicalTypeId::VARIANT),
     }
 }
@@ -193,8 +232,9 @@ pub fn logical_from_type(pivot_type: &Type) -> BoundLogicalType {
 /// The arrow [`DataType`] a column of this `Type` carries.
 ///
 /// This is where the "logical vs physical" facts live, once: `Date` is
-/// `Date32`, `Timestamp` is `Timestamp(Microsecond)`, and the wide aggregate type
-/// `Int128` lands on `Decimal128(38, 0)`. This is the single arrow type a
+/// `Date32`, `Timestamp` is `Timestamp(Microsecond)`, `Interval` is
+/// `Interval(MonthDayNano)`, and the wide aggregate type `Int128` lands on
+/// `Decimal128(38, 0)`. This is the single arrow type a
 /// value carries everywhere; only the group-by drops a temporal column to its
 /// backing int (`temporal_to_int`) to hash/encode it, restoring the type on
 /// its output.
@@ -222,6 +262,7 @@ pub fn physical_arrow_type(pivot_type: &Type) -> DataType {
         Type::Utf8 => DataType::Utf8View,
         Type::Date => DataType::Date32,
         Type::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
+        Type::Interval => DataType::Interval(IntervalUnit::MonthDayNano),
         Type::Variant => variant_struct_type(),
     }
 }
@@ -253,6 +294,7 @@ pub fn type_from_physical(data_type: &DataType) -> Option<Type> {
         DataType::Utf8View => Some(Type::Utf8),
         DataType::Date32 => Some(Type::Date),
         DataType::Timestamp(TimeUnit::Microsecond, None) => Some(Type::Timestamp),
+        DataType::Interval(IntervalUnit::MonthDayNano) => Some(Type::Interval),
         other if *other == variant_struct_type() => Some(Type::Variant),
         _ => None,
     }
@@ -268,6 +310,58 @@ fn variant_struct_type() -> DataType {
         arrow_schema::Field::new("metadata", DataType::BinaryView, false),
         arrow_schema::Field::new("value", DataType::BinaryView, true),
     ]))
+}
+
+/// Render a [`Type::Interval`] as text, the way a Postgres server prints an
+/// `INTERVAL`: each field that carries a value, in descending order, then a
+/// signed `HH:MM:SS` clock part holding any fraction of a second. So a span
+/// reads `1 year 2 mons 3 days 04:05:06`, `-00:00:05`, or `00:00:00` when it is
+/// zero. Both output boundaries (the pgwire encoder and the shell's table
+/// renderer) format intervals through this, so a span reads the same over
+/// either.
+///
+/// The fields are printed as stored, not canonicalised: `INTERVAL '25 hours'`
+/// prints `25:00:00`, as Postgres and DuckDB both do, rather than being carried
+/// into a day. Only a comparison canonicalises, through
+/// [`NormalizedInterval`](crate::expression::NormalizedInterval).
+pub fn render_interval(interval: IntervalMonthDayNano) -> String {
+    let IntervalMonthDayNano {
+        months,
+        days,
+        nanoseconds,
+    } = interval;
+    // Postgres splits the months field into years and months for display, and
+    // pluralises off each signed count, so -1 prints "-1 mons".
+    let mut parts: Vec<String> = Vec::new();
+    let mut push = |count: i64, singular: &str, plural: &str| {
+        if count != 0 {
+            let unit = if count == 1 { singular } else { plural };
+            parts.push(format!("{count} {unit}"));
+        }
+    };
+    push(i64::from(months / 12), "year", "years");
+    push(i64::from(months % 12), "mon", "mons");
+    push(i64::from(days), "day", "days");
+
+    // A span made only of whole date fields drops the clock part, but a zero
+    // span still has to print something.
+    if nanoseconds != 0 || parts.is_empty() {
+        // The sign rides the clock part as a whole (`-02:00:00`), so its fields
+        // are rendered from the magnitude.
+        let sign = if nanoseconds < 0 { "-" } else { "" };
+        let magnitude = nanoseconds.unsigned_abs();
+        let hours = magnitude / 3_600_000_000_000;
+        let minutes = magnitude % 3_600_000_000_000 / 60_000_000_000;
+        let seconds = magnitude % 60_000_000_000 / 1_000_000_000;
+        let fraction = magnitude % 1_000_000_000;
+        let mut clock = format!("{sign}{hours:02}:{minutes:02}:{seconds:02}");
+        if fraction != 0 {
+            clock.push('.');
+            clock.push_str(format!("{fraction:09}").trim_end_matches('0'));
+        }
+        parts.push(clock);
+    }
+    parts.join(" ")
 }
 
 /// Convert a typed DuckDB [`ScalarValue`] into an arrow [`Scalar<ArrayRef>`]
@@ -338,6 +432,42 @@ pub fn build_scalar_value(value: ScalarValue) -> Result<Scalar<ArrayRef>, Error>
         ScalarValue::Timestamp(micros) => {
             Arc::new(TimestampMicrosecondArray::new_scalar(micros).into_inner())
         }
+        // An INTERVAL constant keeps DuckDB's three fields as they were
+        // written, so `INTERVAL '1 month'` stays a month rather than becoming
+        // 30 days; only the sub-day field is rescaled, microseconds to arrow's
+        // nanoseconds. A constant reaches here as a value in its own right
+        // (`age > INTERVAL '1 day'`); one added to a temporal value is folded
+        // into a unit offset at build time instead (see [`IntervalArithmetic`]).
+        //
+        // i64 nanoseconds span about 292 years, far less than the ~292,000 the
+        // microseconds held, so a constant written entirely in sub-day units
+        // past that is rejected rather than silently wrapped. A computed span
+        // cannot hit this: it carries its whole days into the days field, which
+        // leaves under 24 hours here.
+        //
+        // [`IntervalArithmetic`]: crate::expression::IntervalArithmetic
+        ScalarValue::Interval {
+            months,
+            days,
+            micros,
+        } => {
+            let nanoseconds =
+                micros
+                    .checked_mul(NANOS_PER_MICRO)
+                    .ok_or(Error::UnsupportedScalarConstant(ScalarValue::Interval {
+                        months,
+                        days,
+                        micros,
+                    }))?;
+            Arc::new(
+                IntervalMonthDayNanoArray::new_scalar(IntervalMonthDayNano {
+                    months,
+                    days,
+                    nanoseconds,
+                })
+                .into_inner(),
+            )
+        }
         // A NULL constant carries the type the binder gave it, so it becomes a
         // one-element null array of that type's physical shape. An untyped NULL
         // (DuckDB's `SQLNULL`, what a bare `NULL` binds to outside a typed
@@ -345,9 +475,7 @@ pub fn build_scalar_value(value: ScalarValue) -> Result<Scalar<ArrayRef>, Error>
         ScalarValue::Null(logical_type) => {
             arrow_array::new_null_array(&physical_arrow_type(&type_from_logical(logical_type)?), 1)
         }
-        // INTERVAL never appears as a query constant we materialise (it is
-        // consumed by interval arithmetic), and types the bridge doesn't decode
-        // arrive as `Other`.
+        // Types the bridge doesn't decode arrive as `Other`.
         other => return Err(Error::UnsupportedScalarConstant(other)),
     };
 
@@ -385,6 +513,7 @@ mod tests {
             Type::Utf8,
             Type::Date,
             Type::Timestamp,
+            Type::Interval,
             Type::Variant,
         ]
     }
@@ -414,6 +543,49 @@ mod tests {
     }
 
     #[test]
+    fn an_interval_renders_the_way_postgres_prints_one() {
+        fn span(months: i32, days: i32, nanoseconds: i64) -> IntervalMonthDayNano {
+            IntervalMonthDayNano {
+                months,
+                days,
+                nanoseconds,
+            }
+        }
+        const HOUR: i64 = 3_600_000_000_000;
+
+        let rendered: Vec<String> = [
+            span(0, 0, 0),
+            span(0, 1, 0),
+            span(0, 2, 11_045_500_000_000),
+            span(0, 0, -5_000_000_000),
+            span(0, -1, -2 * HOUR),
+            // Months print split into years, and are kept as written rather
+            // than carried into days.
+            span(14, 0, 0),
+            span(1, 0, 0),
+            // 25 hours stays 25 hours; only a comparison canonicalises.
+            span(0, 0, 25 * HOUR),
+        ]
+        .into_iter()
+        .map(render_interval)
+        .collect();
+
+        assert_eq!(
+            rendered,
+            [
+                "00:00:00",
+                "1 day",
+                "2 days 03:04:05.5",
+                "-00:00:05",
+                "-1 days -02:00:00",
+                "1 year 2 mons",
+                "1 mon",
+                "25:00:00",
+            ]
+        );
+    }
+
+    #[test]
     fn a_mismatched_extra_type_info_is_rejected() {
         let bound = BoundLogicalType {
             id: LogicalTypeId::BIGINT,
@@ -430,10 +602,10 @@ mod tests {
 
     #[test]
     fn an_unsupported_type_is_reported_by_its_duckdb_name() {
-        let bound = BoundLogicalType::plain(LogicalTypeId::INTERVAL);
+        let bound = BoundLogicalType::plain(LogicalTypeId::TIME);
 
         let message = type_from_logical(bound).unwrap_err().to_string();
 
-        assert_eq!(message, "Unsupported logical type: INTERVAL");
+        assert_eq!(message, "Unsupported logical type: TIME");
     }
 }

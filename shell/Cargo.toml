@@ -13,6 +13,7 @@ datastore-delta = { workspace = true }
 dispatch = { workspace = true }
 engine = { workspace = true }
 metastore = { workspace = true }
+planner = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }

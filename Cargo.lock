@@ -3573,6 +3573,7 @@ dependencies = [
  "arrow",
  "arrow-arith",
  "arrow-array",
+ "arrow-buffer",
  "arrow-json",
  "arrow-ord",
  "arrow-schema",
@@ -4630,6 +4631,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "arrow-array",
+ "arrow-buffer",
  "arrow-schema",
  "async-trait",
  "axum",
@@ -4700,6 +4702,7 @@ dependencies = [
  "dispatch",
  "engine",
  "metastore",
+ "planner",
  "rustyline",
  "sysinfo",
  "tempfile",

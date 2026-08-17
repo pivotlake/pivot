@@ -24,8 +24,8 @@ use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Conjunction,
     ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide, Error,
     Expression, FormatBytes, Function, InList, IntervalArithmetic, IsNull, Length, Like,
-    MaybeError, Not, NumericAggregate, Prefix, Ref, RegexpFullMatch, RegexpJitReplace,
-    RegexpReplace, Substring, Suffix, TemporalConvert, VariantGet,
+    MaybeError, NormalizedInterval, Not, Now, NumericAggregate, Prefix, Ref, RegexpFullMatch,
+    RegexpJitReplace, RegexpReplace, Substring, Suffix, TemporalConvert, VariantGet,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
 
@@ -334,6 +334,12 @@ impl Function {
     pub(crate) fn from_handle(func: FunctionHandle<'_>) -> Result<Function, Error> {
         let name = func.name()?;
         match name.as_str() {
+            // DuckDB's binder wraps every interval it has to order, compare or
+            // hash in this, and pivot has to honour it: an interval's fields
+            // only compare once carried into their canonical form.
+            "normalized_interval" => Ok(Function::NormalizedInterval(NormalizedInterval {
+                input: Box::new(Expression::from_handle(function_args(func, 1)?[0])?),
+            })),
             "contains" => Ok(Function::Contains(Contains::from_handle(func)?)),
             // DuckDB's optimizer rewrites `LIKE 'foo%'` into `prefix(col, 'foo')`
             // and `LIKE '%foo'` into `suffix(col, 'foo')`.
@@ -382,7 +388,7 @@ impl Function {
             }
             "now" => {
                 function_args(func, 0)?;
-                Ok(Function::Now)
+                Ok(Function::Now(Now))
             }
             // `extract(<part> FROM ts)` lowers to a function named after the part
             // (`minute`, `year`, `dayofweek`, …).

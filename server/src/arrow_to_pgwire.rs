@@ -12,10 +12,12 @@ use std::sync::Arc;
 
 use arrow_array::{
     Array, BooleanArray, Date32Array, Decimal64Array, Decimal128Array, Float32Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, StringArray, StringViewArray,
-    TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Int8Array, Int16Array, Int32Array, Int64Array, IntervalMonthDayNanoArray, RecordBatch,
+    StringArray, StringViewArray, TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
 };
 use arrow_schema::{DataType, SchemaRef};
+use planner::types::render_interval;
 
 use pgwire::api::Type;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo};
@@ -100,6 +102,7 @@ macro_rules! arrow_pg_types {
                 // the output boundary (see `encode_cell`).
                 DataType::Date32 => Type::DATE,
                 DataType::Timestamp(_, _) => Type::TIMESTAMP,
+                DataType::Interval(_) => Type::INTERVAL,
                 // Advertised but encoded via the text fallback below.
                 DataType::LargeUtf8 => Type::TEXT,
                 DataType::Binary | DataType::LargeBinary | DataType::BinaryView => Type::BYTEA,
@@ -150,6 +153,11 @@ macro_rules! arrow_pg_types {
                     &arr.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap()
                         .value_as_datetime(row).map(|t| trim_fraction(t.to_string())),
                 ),
+                // A time span renders as the text a Postgres server prints for
+                // an INTERVAL.
+                DataType::Interval(_) => encoder.encode_field(&render_interval(
+                    arr.as_any().downcast_ref::<IntervalMonthDayNanoArray>().unwrap().value(row),
+                )),
                 // Best-effort fallback: stringify and ship as text.
                 _ => encoder.encode_field(&format!("{:?}", arr.slice(row, 1))),
             };
@@ -439,6 +447,30 @@ mod tests {
             vec![Some("2020-01-01 00:00:00.000001".to_string())]
         );
         assert_eq!(decoded[3], vec![Some("1969-12-31 23:59:58.5".to_string())]);
+    }
+
+    #[test]
+    fn interval_maps_to_interval_and_renders_dates_and_a_clock() {
+        let col: ArrayRef = Arc::new(IntervalMonthDayNanoArray::from(vec![
+            arrow_buffer::IntervalMonthDayNano::new(0, 2, 11_045_500_000_000),
+            arrow_buffer::IntervalMonthDayNano::new(0, 0, -5_000_000_000),
+            arrow_buffer::IntervalMonthDayNano::new(14, 0, 0),
+        ]));
+        let b = batch(
+            vec![(
+                "age",
+                DataType::Interval(arrow_schema::IntervalUnit::MonthDayNano),
+            )],
+            vec![col],
+        );
+
+        let fields = build_field_info(&b.schema());
+        let decoded = rows(&b);
+
+        assert_eq!(fields[0].datatype(), &Type::INTERVAL);
+        assert_eq!(decoded[0], vec![Some("2 days 03:04:05.5".to_string())]);
+        assert_eq!(decoded[1], vec![Some("-00:00:05".to_string())]);
+        assert_eq!(decoded[2], vec![Some("1 year 2 mons".to_string())]);
     }
 
     #[test]
