@@ -139,11 +139,15 @@ impl FreePool {
         let start = self.last_stealer_idx.fetch_add(1, Ordering::Relaxed);
         for i in 0..self.stealers.len() {
             let stealer = &self.stealers[(start + i) % self.stealers.len()];
-            if stealer.is_empty() {
-                continue;
-            }
-            if let Steal::Success(idx) = stealer.steal() {
-                return Some(idx);
+            // Retry on a benign CAS collision rather than treating it as empty:
+            // a spurious `None` here sends the caller to eviction while free
+            // slots exist.
+            while !stealer.is_empty() {
+                match stealer.steal() {
+                    Steal::Success(idx) => return Some(idx),
+                    Steal::Retry => continue,
+                    Steal::Empty => break,
+                }
             }
         }
 
