@@ -584,6 +584,27 @@ mod tests {
     }
 
     #[test]
+    fn pool_exhaustion_with_the_cache_disabled_evicts_instead_of_panicking() {
+        // With PIVOT_DECOMPRESSED_CACHE=false the decompressed cache is empty
+        // by construction; exhausting the pool must reclaim compressed slots
+        // normally rather than read that emptiness as memory pressure.
+        unsafe { std::env::set_var("PIVOT_DECOMPRESSED_CACHE", "false") };
+        init_test_free_pool(1);
+        unsafe { std::env::remove_var("PIVOT_DECOMPRESSED_CACHE") };
+        let loc = crate::io::OpenFile::Local(
+            crate::io::LocalFile::new(std::fs::File::open("/dev/null").unwrap()).unwrap(),
+        );
+        memory_ctx().compressed_cache().open_entry(loc.clone());
+        drop(memory_ctx().compressed_cache().get(&loc, 0, 100));
+        memory_ctx().compressed_fill_cursor().buffer = None;
+
+        let buffer = memory_ctx().get_write_buffer(false);
+
+        assert_eq!(memory_ctx().clock().owned(Owner::Compressed), 0);
+        drop(buffer);
+    }
+
+    #[test]
     fn pop_dirty_buffer_keeps_a_contended_slot_pooled() {
         // Setup: slot 0's index sits in the dirty pool while an evictor probe
         // transiently holds the slot itself.
