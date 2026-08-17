@@ -62,6 +62,10 @@ parquet = { workspace = true }
 parquet-variant-compute = { workspace = true }
 core_affinity = { workspace = true }
 rstest = { workspace = true }
+# The SSL end-to-end test issues its own throwaway certificate and then connects
+# through it, so it needs a certificate generator and TLS for `tokio-postgres`.
+rcgen = { workspace = true }
+tokio-postgres-rustls = "0.14"
 # Pull catalog's `test_support` (MinIO / fake-gcs object-store harness) in for
 # the bucket-backed end-to-end tests; the bin build keeps the plain catalog dep.
 datastore-delta = { workspace = true, features = ["test-support"] }

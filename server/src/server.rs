@@ -26,7 +26,7 @@ use catalog::PivotCatalog;
 use dispatch::DataFlowDispatcher;
 use dispatch::{Dispatch, Shutdown};
 use metastore::Metastore;
-use pgwire::tokio::process_socket;
+use pgwire::tokio::{TlsAcceptor, process_socket};
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -60,6 +60,8 @@ pub enum Error {
     },
     #[error("invalid metastore configuration: {0}")]
     InvalidCatalog(#[from] catalog::Error),
+    #[error(transparent)]
+    Tls(#[from] crate::tls::Error),
     #[error("worker watcher panic: {0}")]
     WorkerWatcherPanic(JoinError),
     #[error("dispatch worker failed: {0}")]
@@ -94,6 +96,10 @@ pub struct Server {
     /// The metastore consulted for every connection's current user and
     /// authentication method.
     metastore: Arc<dyn Metastore>,
+    /// Certificate to offer a connection that asks to encrypt itself. `None`
+    /// (the default) turns those requests down and leaves every session
+    /// plaintext; set it with [`with_tls`](Self::with_tls).
+    tls: Option<TlsAcceptor>,
 }
 
 impl Server {
@@ -128,6 +134,7 @@ impl Server {
             catalog,
             http_bind: None,
             metastore,
+            tls: None,
         }
     }
 
@@ -135,6 +142,16 @@ impl Server {
     /// while the server runs. Off by default.
     pub fn with_http_bind(mut self, addr: SocketAddr) -> Self {
         self.http_bind = Some(addr);
+        self
+    }
+
+    /// Offer `acceptor`'s certificate to connections that ask to encrypt
+    /// themselves, instead of turning them down. Build one with
+    /// [`tls::build_acceptor`](crate::tls::build_acceptor). Off by default, and
+    /// on or off it leaves a client that asks for plaintext with a plaintext
+    /// session.
+    pub fn with_tls(mut self, acceptor: TlsAcceptor) -> Self {
+        self.tls = Some(acceptor);
         self
     }
 
@@ -150,7 +167,8 @@ impl Server {
         mut shutdown: impl std::future::Future<Output = ()> + Unpin,
     ) -> Result<()> {
         let listener = TcpListener::bind(self.bind).await?;
-        info!(addr = %self.bind, "listening for psql connections");
+        let tls = self.tls.clone();
+        info!(addr = %self.bind, ssl = tls.is_some(), "listening for psql connections");
 
         let handlers = Arc::new(PivotHandlers::new(
             self.query_engine.clone(),
@@ -229,9 +247,13 @@ impl Server {
                     match accept {
                         Ok((socket, peer)) => {
                             let handlers = handlers.clone();
+                            // `process_socket` reads the client's `SSLRequest`
+                            // and upgrades the socket itself; handing it the
+                            // acceptor is the whole of enabling SSL.
+                            let tls = tls.clone();
                             tokio::spawn(async move {
                                 info!(?peer, "connection accepted");
-                                if let Err(e) = process_socket(socket, None, handlers).await {
+                                if let Err(e) = process_socket(socket, tls, handlers).await {
                                     warn!(?e, ?peer, "connection error");
                                 } else {
                                     info!(?peer, "connection closed");

@@ -15,8 +15,9 @@
 //! [`Dispatch`](dispatch::Dispatch) (from
 //! [`Dispatch::spin_up`](dispatch::Dispatch::spin_up)), your catalog, and the
 //! metastore that produced it; then call [`Server::serve`] with a shutdown
-//! future. The returned future runs the accept loop until shutdown is signalled
-//! or a worker dies. Each datastore self-manages its own refresh and (optional)
+//! future. Add [`Server::with_tls`] to let clients encrypt their connections
+//! (see the [`tls`] module). The returned future runs the accept loop until
+//! shutdown is signalled or a worker dies. Each datastore self-manages its own refresh and (optional)
 //! compaction, re-encoding Parquet on the same dispatch workers; those tasks
 //! watch the shared exit flag the server flips on shutdown and stop before the
 //! workers do.
@@ -66,6 +67,7 @@ mod limits;
 mod perf;
 mod query_handler;
 mod server;
+pub mod tls;
 
 pub use config::Config;
 pub use limits::raise_open_file_limit;
