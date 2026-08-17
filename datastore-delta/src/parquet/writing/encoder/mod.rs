@@ -98,23 +98,32 @@ pub(in crate::parquet::writing) fn encode_column_chunk(
 /// PLAIN.
 fn encode_leaf(leaf: Leaf, allocator: &mut SlabAllocator) -> WriteResult<EncodedLeaf> {
     let physical_type = crate::parquet::arrow_to_parquet_physical(leaf.values.data_type())?;
-    let compression = Compression::for_leaf(leaf.values.data_type());
+    // The codec may differ between a dictionary-encoded chunk and one that
+    // fell to a delta form or PLAIN, so it is settled together with the
+    // encoding: the dictionary attempt compresses with its own codec, and only
+    // the losing paths use the plain-leaf codec.
+    let dictionary_compression = Compression::for_dictionary_leaf(leaf.values.data_type());
     let statistics = leaf_statistics(&leaf);
-    let (dictionary_page, data_page_encoding, data_pages) =
-        match dictionary::try_encode(&leaf, compression, allocator)? {
+    let (compression, dictionary_page, data_page_encoding, data_pages) =
+        match dictionary::try_encode(&leaf, dictionary_compression, allocator)? {
             Some((dictionary_page, index_page)) => (
+                dictionary_compression,
                 Some(dictionary_page),
                 Encoding::RLE_DICTIONARY,
                 vec![index_page],
             ),
-            None => match delta::try_encode_chunk(&leaf, compression, allocator)? {
-                Some((encoding, pages)) => (None, encoding, pages),
-                None => (
-                    None,
-                    Encoding::PLAIN,
-                    plain::encode_chunk(&leaf, compression, allocator)?,
-                ),
-            },
+            None => {
+                let compression = Compression::for_leaf(leaf.values.data_type());
+                match delta::try_encode_chunk(&leaf, compression, allocator)? {
+                    Some((encoding, pages)) => (compression, None, encoding, pages),
+                    None => (
+                        compression,
+                        None,
+                        Encoding::PLAIN,
+                        plain::encode_chunk(&leaf, compression, allocator)?,
+                    ),
+                }
+            }
         };
     Ok(EncodedLeaf {
         path: leaf.path,
