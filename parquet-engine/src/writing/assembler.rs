@@ -285,7 +285,9 @@ fn build_file(
     groups: Vec<AssembledRowGroup>,
 ) -> WriteResult<(FileBytes, FileMetaData)> {
     let mut out = FileBytes::new();
-    out.push(run_of(PARQUET_MAGIC)?);
+    for run in runs_of(PARQUET_MAGIC) {
+        out.push(run);
+    }
 
     let mut row_groups = Vec::with_capacity(groups.len());
     let mut num_rows = 0i64;
@@ -348,7 +350,9 @@ fn write_leaf_chunk(out: &mut FileBytes, leaf: EncodedLeaf) -> WriteResult<Colum
     let dictionary_page_offset = leaf.dictionary_page.map(|dict| {
         let offset = out.len() as i64;
         uncompressed += (dict.header_len + dict.uncompressed_size) as i64;
-        out.push(dict.bytes);
+        for run in dict.bytes {
+            out.push(run);
+        }
         offset
     });
 
@@ -357,7 +361,9 @@ fn write_leaf_chunk(out: &mut FileBytes, leaf: EncodedLeaf) -> WriteResult<Colum
     for page in leaf.data_pages {
         num_values += page.num_rows;
         uncompressed += (page.header_len + page.uncompressed_size) as i64;
-        out.push(page.bytes);
+        for run in page.bytes {
+            out.push(run);
+        }
     }
     let compressed = out.len() as i64 - chunk_start;
 
@@ -458,23 +464,25 @@ fn push_schema_element(field: &FieldRef, elements: &mut Vec<SchemaElement>) -> W
     Ok(())
 }
 
-/// Write the trailing footer: `[FileMetaData][u32 LE footer length][PAR1]`. It
-/// is one more run of the file, small enough to build in one piece.
+/// Write the trailing footer: `[FileMetaData][u32 LE footer length][PAR1]`.
+/// Usually one more small run of the file, but a wide schema over many row
+/// groups can serialize past one 2MB buffer, so it is laid down as however
+/// many runs it takes.
 fn write_footer(out: &mut FileBytes, file_meta: &FileMetaData) -> WriteResult<()> {
     let mut footer = Vec::new();
     file_meta.write_thrift(&mut ThriftCompactOutputProtocol::new(&mut footer))?;
     footer.extend_from_slice(&(footer.len() as u32).to_le_bytes());
     footer.extend_from_slice(PARQUET_MAGIC);
-    out.push(run_of(&footer)?);
+    for run in runs_of(&footer) {
+        out.push(run);
+    }
     Ok(())
 }
 
-/// A run holding a copy of `bytes`, for the small pieces of a file that are not
-/// pages: the leading magic, and the footer.
-fn run_of(bytes: &[u8]) -> WriteResult<Slab> {
-    let mut run = SlabAllocator::new(false).get_slab_of_size(bytes.len(), false);
-    run.as_mut_slice().copy_from_slice(bytes);
-    Ok(run)
+/// Runs holding a copy of `bytes`, for the pieces of a file that are not pages:
+/// the leading magic, and the footer.
+fn runs_of(bytes: &[u8]) -> Vec<Slab> {
+    SlabAllocator::new(false).get_slabs_holding(&[bytes])
 }
 
 #[cfg(test)]
@@ -645,6 +653,37 @@ mod tests {
             structs.column(0).as_primitive::<Int64Type>(),
             &Int64Array::from(vec![Some(10), None, None])
         );
+    }
+
+    /// Pseudo-random printable bytes: no repeats for snappy to exploit, so the
+    /// compressed page stays about as large as the raw one.
+    fn incompressible_text(len: usize) -> String {
+        let mut state = 0x9E3779B97F4A7C15u64;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                char::from(b' ' + (state >> 58) as u8)
+            })
+            .collect()
+    }
+
+    /// A single value larger than one 2MB slab: its page must span slabs, and
+    /// the file must still round-trip through a strict reader.
+    #[test]
+    fn a_value_larger_than_one_slab_round_trips() {
+        let big = incompressible_text(3 * 1024 * 1024);
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow_array::StringArray::from(vec![big.as_str()])) as ArrayRef],
+        )
+        .unwrap();
+
+        let got = round_trip(&batch);
+
+        assert_eq!(got.column(0).as_string::<i32>().value(0), big);
     }
 
     /// A decimal leaf's schema element carries the full decimal description:

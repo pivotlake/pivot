@@ -216,16 +216,14 @@ pub(super) fn assemble_page(
     };
 
     // The page on the wire is the thrift header followed by the compressed body.
-    // Both are written once, into a slab sized to hold exactly them: this is the
-    // only copy a page's bytes make, since the assembler moves the slab rather
-    // than concatenating what is in it.
+    // Both are written once, into slabs sized to hold exactly them: this is the
+    // only copy a page's bytes make, since the assembler moves the slabs rather
+    // than concatenating what is in them. Slabs, plural: a page holding a huge
+    // single value can exceed one 2MB buffer.
     let mut head = Vec::new();
     header.write_thrift(&mut ThriftCompactOutputProtocol::new(&mut head))?;
     let header_len = head.len();
-    let mut bytes = allocator.get_slab_of_size(header_len + compressed.len(), false);
-    let page = bytes.as_mut_slice();
-    page[..header_len].copy_from_slice(&head);
-    page[header_len..].copy_from_slice(&compressed);
+    let bytes = allocator.get_slabs_holding(&[&head, &compressed]);
 
     Ok(EncodedPage {
         num_rows,

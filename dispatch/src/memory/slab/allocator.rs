@@ -95,6 +95,31 @@ impl SlabAllocator {
         slabs
     }
 
+    /// Allocates slabs holding exactly the concatenation of `parts`, in order -
+    /// the multi-slab way to write out a byte payload that may exceed one 2MB
+    /// buffer (see [`get_slabs_of_size`](Self::get_slabs_of_size)).
+    pub fn get_slabs_holding(&mut self, parts: &[&[u8]]) -> Vec<Slab> {
+        let total = parts.iter().map(|part| part.len()).sum();
+        let mut slabs = self.get_slabs_of_size(total, false);
+        let mut parts = parts.iter().copied();
+        let mut part: &[u8] = &[];
+        for slab in &mut slabs {
+            let dest = slab.as_mut_slice();
+            let mut filled = 0;
+            while filled < dest.len() {
+                if part.is_empty() {
+                    part = parts.next().expect("the parts cover the allocation");
+                    continue;
+                }
+                let take = part.len().min(dest.len() - filled);
+                dest[filled..filled + take].copy_from_slice(&part[..take]);
+                part = &part[take..];
+                filled += take;
+            }
+        }
+        slabs
+    }
+
     /// Rounds `self.offset` up so that the next allocation starts at an address satisfying
     /// `align_of::<T>()`. Without this, a prior odd-sized allocation (e.g. `SlabBuffer<u8>`)
     /// would leave the bump pointer misaligned for types with stricter requirements (e.g.
@@ -214,6 +239,24 @@ mod tests {
 
         let distance = (b.ptr as usize).abs_diff(a.ptr as usize);
         assert!(distance >= BUFFER_SIZE);
+    }
+
+    #[test]
+    fn slabs_holding_parts_reassemble_across_buffers() {
+        init_test_free_pool(4);
+        let mut alloc = SlabAllocator::new(false);
+        alloc.get_slab_of_size(BUFFER_SIZE - 10, false); // leave a 10-byte tail
+        let head = [7u8; 4];
+        let body: Vec<u8> = (0..BUFFER_SIZE).map(|i| i as u8).collect();
+
+        let slabs = alloc.get_slabs_holding(&[&head, &body]);
+
+        let flat: Vec<u8> = slabs
+            .iter()
+            .flat_map(|s| s.as_slice().iter().copied())
+            .collect();
+        assert_eq!(&flat[..4], &head);
+        assert_eq!(&flat[4..], &body[..]);
     }
 
     #[test]

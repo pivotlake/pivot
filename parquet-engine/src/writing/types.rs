@@ -192,7 +192,11 @@ pub(crate) struct EncodedPage {
     pub(crate) num_rows: i64,
     pub(crate) uncompressed_size: usize,
     pub(crate) header_len: usize,
-    pub(crate) bytes: Slab,
+    /// The page on the wire, header followed by the compressed body, in one or
+    /// more slabs (a page holding a huge single value can exceed one 2MB
+    /// buffer). Every stage after this moves the slabs rather than their
+    /// bytes, so this is the only place a page's bytes are written.
+    pub(crate) bytes: Vec<Slab>,
 }
 
 /// Encoded pages and footer data for one primitive Parquet leaf.
