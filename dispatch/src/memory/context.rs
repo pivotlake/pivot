@@ -372,6 +372,29 @@ impl MemoryContext {
     }
 }
 
+impl Drop for MemoryContext {
+    fn drop(&mut self) {
+        // Fields drop in declaration order, so without this the fill cursors'
+        // ring pins would drop AFTER `ring`: ReadBuffer::drop resolves the ring
+        // through the thread's context pointer, which is a write through the
+        // already-dropped Arc - and through an unmapped region once the last
+        // worker's ring Arc goes. Release the pins first, while every field is
+        // still alive.
+        self.compressed_fill_cursor.get_mut().buffer = None;
+        self.decompressed_fill_cursor.get_mut().buffer = None;
+        // Leave no dangling context pointer behind: anything ring-backed that
+        // outlives the context (it must not) then fails on a null deref
+        // deterministically instead of writing through freed memory. try_with:
+        // this runs during TLS destruction, when the pointer cell itself may
+        // already be gone.
+        let _ = MEMORY_CTX_PTR.try_with(|ptr| {
+            if std::ptr::eq(ptr.get(), self) {
+                ptr.set(std::ptr::null());
+            }
+        });
+    }
+}
+
 /// Free-pool indices set aside because their ring slot was transiently locked
 /// (e.g. an evictor probing the slot before backing off). The contender never
 /// re-pools an index it did not pop, so the popper must return every set-aside
@@ -581,6 +604,23 @@ mod tests {
 
         // Assert
         assert!(popped.is_none());
+    }
+
+    #[test]
+    fn a_worker_thread_with_a_pinned_fill_cursor_shuts_down_cleanly() {
+        // Thread exit drops the MemoryContext while its fill cursor still pins
+        // a ring slot; releasing that pin must not write through the ring after
+        // the ring itself has been dropped and unmapped.
+        std::thread::spawn(|| {
+            init_test_free_pool(4);
+            let loc = crate::io::OpenFile::Local(
+                crate::io::LocalFile::new(std::fs::File::open("/dev/null").unwrap()).unwrap(),
+            );
+            memory_ctx().compressed_cache().open_entry(loc.clone());
+            drop(memory_ctx().compressed_cache().get(&loc, 0, 10));
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
