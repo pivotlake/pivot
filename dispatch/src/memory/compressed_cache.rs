@@ -51,7 +51,7 @@ use crate::memory::context::memory_ctx;
 use crate::memory::fill_cursor::FillCursor;
 use crate::memory::read_buffer::ReadBuffer;
 use crate::memory::ring::BUFFER_SIZE;
-use crate::memory::write_buffer::WriteBuffer;
+use crate::memory::write_buffer::{ProbedSlot, WriteBuffer};
 use ahash::HashMap;
 use bytes::Bytes;
 use crossbeam_deque::{Injector, Steal};
@@ -742,9 +742,11 @@ impl CompressedCache {
     /// compressed copy gone they are the last in-memory copy of those bytes,
     /// and losing them too would turn the next read into disk IO.
     pub(crate) fn reclaim(&self, slot_idx: usize) -> Option<WriteBuffer> {
-        let write_buffer = memory_ctx().ring().try_write(slot_idx)?;
+        // The probe guard releases the hold in place if anything below unwinds
+        // (e.g. a poisoned map lock): a slot the cache still references must
+        // never fall into the free pool via WriteBuffer::drop.
+        let probe = ProbedSlot::new(memory_ctx().ring().try_write(slot_idx)?);
         if memory_ctx().clock().owner(slot_idx) != Some(Owner::Compressed) {
-            write_buffer.release_in_place();
             return None;
         }
 
@@ -784,7 +786,7 @@ impl CompressedCache {
         }
         self.prune_empty_file_locations(emptied_files);
         self.recycle_slot(slot_idx);
-        Some(write_buffer)
+        Some(probe.take_for_reuse())
     }
 
     /// Reinforce every cached extent overlapping the file byte range
@@ -891,13 +893,13 @@ impl CompressedCache {
         // new owner in the window since the drain must not be ripped away from it.
         for slot_idx in slots {
             if let Some(write_buffer) = memory_ctx().ring().try_write(slot_idx) {
+                let probe = ProbedSlot::new(write_buffer);
                 if memory_ctx().clock().owner(slot_idx) != Some(Owner::Compressed) {
-                    write_buffer.release_in_place();
-                    continue;
+                    continue; // the probe's drop releases the hold in place
                 }
                 self.tenants_mut(slot_idx).clear();
                 self.recycle_slot(slot_idx);
-                drop(write_buffer); // returns the slot to the free pool
+                drop(probe.take_for_reuse()); // returns the slot to the free pool
             }
         }
         dropped
@@ -1082,6 +1084,41 @@ mod tests {
         let hit = cache().get(&FD(), 0, 10);
         assert!(!has_misses(&hit), "filled range should hit");
         assert_pattern(&assemble(hit), 0);
+    }
+
+    #[test]
+    fn an_unwinding_reclaim_leaves_the_slot_cached_and_out_of_the_pool() {
+        // Poison the outer map lock so reclaim unwinds mid-probe; the slot the
+        // cache still references must not fall into the free pool (it would be
+        // handed out as scratch memory under two owners). The pool's only slot
+        // becomes the fill slot, so a leak into the pool is directly visible.
+        init_test_free_pool(1);
+        cache().open_entry(FD());
+        let miss = cache().get(&FD(), 0, 10);
+        fill_pattern(&miss);
+        drop(miss);
+        let slot = memory_ctx().compressed_fill_cursor().slot_idx;
+        release_fill_cursor();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _poisoning = cache().file_maps.write().unwrap();
+            panic!("poison the file map lock");
+        }));
+
+        let reclaim = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cache().reclaim(slot);
+        }));
+
+        assert!(reclaim.is_err(), "reclaim unwinds on the poisoned lock");
+        assert_eq!(
+            memory_ctx().pop_free_idx(false),
+            None,
+            "the slot must not reach the free pool"
+        );
+        assert_eq!(memory_ctx().clock().owner(slot), Some(Owner::Compressed));
+        assert!(
+            memory_ctx().ring().try_write(slot).is_some(),
+            "the probe hold must have been released"
+        );
     }
 
     #[test]

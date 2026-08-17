@@ -68,7 +68,7 @@ use crate::memory::context::memory_ctx;
 use crate::memory::fill_cursor::FillCursor;
 use crate::memory::read_buffer::ReadBuffer;
 use crate::memory::ring::BUFFER_SIZE;
-use crate::memory::write_buffer::WriteBuffer;
+use crate::memory::write_buffer::{ProbedSlot, WriteBuffer};
 use ahash::HashMap;
 use bytes::Bytes;
 use std::cell::UnsafeCell;
@@ -531,10 +531,12 @@ impl DecompressedCache {
     /// stay unreachable until those slots recycle. Returns the slot writable;
     /// `None` if a reader still pins it or it is no longer this cache's.
     pub fn reclaim(&self, slot: usize) -> Option<WriteBuffer> {
-        let victim = memory_ctx().ring().try_write(slot)?;
+        // The probe guard releases the hold in place if anything below unwinds
+        // (e.g. a poisoned map lock): a slot the cache still references must
+        // never fall into the free pool via WriteBuffer::drop.
+        let probe = ProbedSlot::new(memory_ctx().ring().try_write(slot)?);
         if memory_ctx().clock().owner(slot) != Some(Owner::Decompressed) {
             // Raced to the free pool or another cache between the sweep and try_write.
-            victim.release_in_place();
             return None;
         }
         let dropped = self.purge_slot_tenants(slot);
@@ -551,7 +553,7 @@ impl DecompressedCache {
                 .compressed_cache()
                 .reinforce_range(&open_file, offset, len);
         }
-        Some(victim)
+        Some(probe.take_for_reuse())
     }
 
     /// Drop every tenant block of `slot` whose current map entry still references
@@ -648,15 +650,15 @@ impl DecompressedCache {
             let Some(buffer) = memory_ctx().ring().try_write(slot) else {
                 continue;
             };
+            let probe = ProbedSlot::new(buffer);
             if memory_ctx().clock().owner(slot) != Some(Owner::Decompressed) {
-                buffer.release_in_place();
-                continue;
+                continue; // the probe's drop releases the hold in place
             }
             // The map was drained, so tenants are stale unless a concurrent
             // worker re-packed the slot - the guard inside handles both.
             self.purge_slot_tenants(slot);
             memory_ctx().clock().release(slot);
-            drop(buffer); // returns the slot to the pool
+            drop(probe.take_for_reuse()); // returns the slot to the pool
         }
         dropped
     }

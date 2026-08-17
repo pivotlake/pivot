@@ -105,3 +105,35 @@ impl Drop for WriteBuffer {
         memory_ctx().push_free_idx(self.slot_idx, false);
     }
 }
+
+/// An evictor's exclusive hold on a slot it is *deciding* about. Unlike a bare
+/// [`WriteBuffer`], whose `Drop` pushes the slot into the free pool, dropping
+/// this - including an unwind out of the decision (a poisoned map lock, any
+/// panic mid-surgery) - releases the hold in place, leaving the slot owned by
+/// whatever cache holds it. A slot the cache still references must never reach
+/// the pool: it would be handed out as scratch memory under two owners.
+///
+/// The decision is made explicit: [`take_for_reuse`](Self::take_for_reuse) once
+/// the slot is fully detached from its cache, or plain `drop` to leave it
+/// cached.
+pub(crate) struct ProbedSlot(Option<WriteBuffer>);
+
+impl ProbedSlot {
+    pub fn new(buffer: WriteBuffer) -> Self {
+        Self(Some(buffer))
+    }
+
+    /// The probe decided to evict: hand the buffer out for reuse. Only sound
+    /// once no cache metadata references the slot any more.
+    pub fn take_for_reuse(mut self) -> WriteBuffer {
+        self.0.take().expect("a live probe always holds its buffer")
+    }
+}
+
+impl Drop for ProbedSlot {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.0.take() {
+            buffer.release_in_place();
+        }
+    }
+}
