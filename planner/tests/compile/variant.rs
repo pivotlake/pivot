@@ -216,11 +216,9 @@ fn casts_a_path_across_mixed_shredding(mut testing_planner: TestingPlanner) {
     assert_eq!(got, vec![None, Some(25), Some(30), Some(40)]);
 }
 
-/// The same path shredded as a DIFFERENT type per file: each file's typed
-/// leaf is read as its own type, and a cast that doesn't match a leaf's
-/// values yields null for those rows rather than an error.
 #[rstest]
 fn casts_a_path_shredded_as_different_types_per_file(mut testing_planner: TestingPlanner) {
+    // Setup
     let ints = docs_batch_shredded_as(
         vec![r#"{"age":30}"#, r#"{"age":25}"#],
         Some(("age", &DataType::Int64)),
@@ -228,21 +226,73 @@ fn casts_a_path_shredded_as_different_types_per_file(mut testing_planner: Testin
     let texts = docs_batch_shredded_as(vec![r#"{"age":"forty"}"#], Some(("age", &DataType::Utf8)));
     docs_table_files(&mut testing_planner, &[ints, texts]);
 
-    let ints = run(
-        &mut testing_planner,
-        "SELECT CAST(d->'age' AS BIGINT) AS a FROM docs",
-    );
-    let texts = run(
+    // Execute
+    let rows = run(
         &mut testing_planner,
         "SELECT CAST(d->'age' AS VARCHAR) AS a FROM docs",
     );
 
-    let mut got: Vec<Option<i64>> = ints.iter().map(|r| r["a"].as_i64()).collect();
+    // Assert
+    let mut got: Vec<&str> = rows.iter().filter_map(|r| r["a"].as_str()).collect();
     got.sort();
-    assert_eq!(got, vec![None, Some(25), Some(30)]);
-    let mut got: Vec<Option<&str>> = texts.iter().map(|r| r["a"].as_str()).collect();
-    got.sort();
-    assert_eq!(got, vec![None, None, Some("forty")]);
+    assert_eq!(got, vec!["25", "30", "forty"]);
+}
+
+#[rstest]
+fn rejects_an_invalid_cast_from_a_shredded_leaf(mut testing_planner: TestingPlanner) {
+    // Setup
+    shredded_docs_table(
+        &mut testing_planner,
+        vec![r#"{"age":"forty"}"#],
+        "age",
+        &DataType::Utf8,
+    );
+
+    // Execute
+    let error = run_expecting_error(
+        &mut testing_planner,
+        "SELECT CAST(d->'age' AS BIGINT) FROM docs",
+    );
+
+    // Assert
+    assert!(error.contains("cannot cast variant value"));
+}
+
+#[rstest]
+fn casts_typed_and_fallback_values_in_one_shredded_file(mut testing_planner: TestingPlanner) {
+    // Setup
+    shredded_docs_table(
+        &mut testing_planner,
+        vec![r#"{"x":30}"#, r#"{"x":"thirty"}"#, r#"{"x":null}"#, r#"{}"#],
+        "x",
+        &DataType::Int64,
+    );
+
+    // Execute
+    let rows = run(
+        &mut testing_planner,
+        "SELECT CAST(d->'x' AS VARCHAR) AS x FROM docs",
+    );
+
+    // Assert
+    let got: Vec<Option<&str>> = rows.iter().map(|row| row["x"].as_str()).collect();
+    assert_eq!(got, vec![Some("30"), Some("thirty"), Some("null"), None]);
+}
+
+#[rstest]
+fn distinguishes_a_text_cast_from_variant_output(mut testing_planner: TestingPlanner) {
+    // Setup
+    docs_table(&mut testing_planner, vec![r#""bob""#]);
+
+    // Execute
+    let rows = run(
+        &mut testing_planner,
+        "SELECT CAST(d AS VARCHAR) AS cast, d AS output FROM docs",
+    );
+
+    // Assert
+    assert_eq!(rows[0]["cast"], "bob");
+    assert_eq!(rows[0]["output"], r#""bob""#);
 }
 
 /// A nested path (`user.id`) shredded two levels deep reads its typed leaf.

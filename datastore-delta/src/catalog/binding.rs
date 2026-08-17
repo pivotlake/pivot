@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use crate::manifest::{ColumnStatFilter, PartitionEqFilter};
-use crate::parquet::types::leaves::{first_leaf, variant_shredded_leaves};
+use crate::parquet::types::leaves::{first_leaf, leaf_fields, variant_shredded_leaves};
 use crate::parquet::types::metadata::RowGroupMetadata;
 use crate::parquet::{
     ParquetTable, ScanEqualityPredicate, materialize, row_group_eliminated, row_group_filter_from,
@@ -19,6 +19,7 @@ use planner::catalog::{
     TableReference, TableRevision,
 };
 use planner::expression::{CompareType, Expression, Function, JsonPath, TableFilter};
+use planner::types::physical_arrow_type;
 
 use super::CatalogTable;
 use super::insert_sink::{UploadedFile, build_insert_spec};
@@ -37,6 +38,9 @@ struct PushedPredicate {
     /// The path inside the variant column (`CAST(col->'a'->'b' AS T) <cmp>
     /// const`), empty for a plain column comparison.
     path: JsonPath,
+    /// The SQL cast's physical output type for a variant path. Pruning against
+    /// the raw typed leaf is sound only when this is a semantic identity.
+    as_type: Option<arrow_schema::DataType>,
     compare_type: CompareType,
     value: Scalar<ArrayRef>,
 }
@@ -55,6 +59,13 @@ impl PushedPredicate {
             return Some(first_leaf(fields, self.column_idx));
         }
         let leaves = variant_shredded_leaves(fields, self.column_idx, &self.path)?;
+        let target = self
+            .as_type
+            .as_ref()
+            .expect("a variant path predicate has a cast target");
+        if leaf_fields(fields)[leaves.typed_leaf].data_type() != target {
+            return None;
+        }
         let all_value_leaves_null = leaves.value_leaves.iter().all(|&leaf| {
             rg.leaf_statistics(leaf)
                 .and_then(|stats| stats.null_count)
@@ -68,12 +79,18 @@ impl PushedPredicate {
 ///
 /// Plain columns use an empty path. Typed variant reads use the corresponding
 /// shredded leaf. Untyped variant reads cannot be compared and are ignored.
-fn get_prunable_column_and_json_path(expr: &Expression) -> Option<(usize, JsonPath)> {
+fn get_prunable_column_and_json_path(
+    expr: &Expression,
+) -> Option<(usize, JsonPath, Option<arrow_schema::DataType>)> {
     match expr {
-        Expression::Ref(r) => Some((r.column_idx, Vec::new())),
+        Expression::Ref(r) => Some((r.column_idx, Vec::new(), None)),
         Expression::Function(Function::VariantGet(read)) if read.as_type.is_some() => {
             match read.input.as_ref() {
-                Expression::Ref(r) => Some((r.column_idx, read.path.clone())),
+                Expression::Ref(r) => Some((
+                    r.column_idx,
+                    read.path.clone(),
+                    read.as_type.as_ref().map(physical_arrow_type),
+                )),
                 _ => None,
             }
         }
@@ -311,15 +328,16 @@ impl BoundTable for TableBinding {
         let Expression::Compare(compare) = expr.as_ref() else {
             return Ok(false);
         };
-        let ((column_idx, path), constant) = match (compare.left.as_ref(), compare.right.as_ref()) {
-            (column, Expression::Constant(k)) | (Expression::Constant(k), column) => {
-                let Some(prunable) = get_prunable_column_and_json_path(column) else {
-                    return Ok(false);
-                };
-                (prunable, k)
-            }
-            _ => return Ok(false),
-        };
+        let ((column_idx, path, as_type), constant) =
+            match (compare.left.as_ref(), compare.right.as_ref()) {
+                (column, Expression::Constant(k)) | (Expression::Constant(k), column) => {
+                    let Some(prunable) = get_prunable_column_and_json_path(column) else {
+                        return Ok(false);
+                    };
+                    (prunable, k)
+                }
+                _ => return Ok(false),
+            };
 
         // Just record it. The actual pruning (min/max row-group elimination and
         // equality/dictionary pruning) happens in `compile`, once the row-group
@@ -328,6 +346,7 @@ impl BoundTable for TableBinding {
         self.predicates.push(PushedPredicate {
             column_idx,
             path,
+            as_type,
             compare_type: compare.compare_type,
             value: constant.clone(),
         });
