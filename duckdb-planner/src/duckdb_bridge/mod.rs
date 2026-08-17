@@ -358,6 +358,11 @@ pub mod ffi {
         fn lo_drop_if_exists(op: &LogicalOperator) -> Result<bool>;
         fn lo_drop_cascade(op: &LogicalOperator) -> Result<bool>;
 
+        // ---- Explain ----
+        /// Whether the `LOGICAL_EXPLAIN` is `EXPLAIN ANALYZE` (vs plain
+        /// `EXPLAIN`).
+        fn lo_explain_is_analyze(op: &LogicalOperator) -> Result<bool>;
+
         // ---- Set / Reset ----
         fn lo_set_name(op: &LogicalOperator) -> Result<String>;
         fn lo_set_value(op: &LogicalOperator) -> Result<String>;

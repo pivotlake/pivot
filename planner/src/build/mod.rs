@@ -202,9 +202,18 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         DuckOperator::Compact(c) => Operator::Compact(Compact::from_handle(c)?),
         DuckOperator::CopyFromStdin(c) => Operator::CopyFromStdin(CopyFromStdin::from_handle(c)?),
         DuckOperator::CreateUser(c) => Operator::CreateUser(CreateUser::from_handle(c)?),
-        // No view to construct from: these carry no kind-specific payload.
+        // No view to construct from: this carries no kind-specific payload.
         DuckOperator::DummyScan => Operator::DummyScan(DummyScan),
-        DuckOperator::Explain => Operator::Explain(Explain),
+        DuckOperator::Explain(explain) => {
+            // EXPLAIN ANALYZE would print the plan without ever running the
+            // query; reject it rather than silently answer as plain EXPLAIN.
+            if explain.is_analyze()? {
+                return Err(OperatorError::Unsupported(
+                    "EXPLAIN ANALYZE is not supported".to_string(),
+                ));
+            }
+            Operator::Explain(Explain)
+        }
         DuckOperator::ComparisonJoin(join) => {
             return build_join(op, join, inputs);
         }
