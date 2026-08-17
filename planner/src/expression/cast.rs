@@ -5,11 +5,10 @@
 //! arrow [`DataType`] at runtime. A temporal target casts to its real arrow type
 //! (`Date32`/`Timestamp`), every other to its physical storage type.
 //!
-//! Two casts cross the variant boundary and are handled here rather than by
-//! arrow's kernel: text into a `VARIANT` parses each string as a JSON document,
-//! and a `VARIANT` into text renders each document back to JSON. (A cast of a
-//! `VARIANT` to a *non-text* type is a typed path read, built as a
-//! [`VariantGet`](super::VariantGet), so it never reaches here.)
+//! Text into a `VARIANT` is handled here rather than by Arrow's kernel and
+//! parses each string as a JSON document. Variant-to-scalar casts are typed
+//! path reads built as a [`VariantGet`](super::VariantGet). A synthetic cast
+//! used only at the query boundary renders an uncast variant output as JSON.
 
 use super::Expression;
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
@@ -17,7 +16,9 @@ use crate::types::{Type, physical_arrow_type};
 use arrow_array::builder::StringViewBuilder;
 use arrow_array::{Array, ArrayRef, RecordBatch, Scalar, StructArray};
 use arrow_schema::{ArrowError, DataType};
-use parquet_variant_compute::{VariantArray, json_to_variant, unshred_variant};
+use parquet_variant_compute::{
+    GetOptions, VariantArray, json_to_variant, unshred_variant, variant_get,
+};
 use parquet_variant_json::VariantToJson as ToJson;
 use std::fmt::{self, Display};
 use std::sync::Arc;
@@ -107,44 +108,99 @@ impl Cast {
         Ok(Box::new(move || {
             let mut source_expr = source_builder();
             Box::new(move |batch: &RecordBatch| {
-                let input = source_expr(batch);
-                let (arr, _) = input.as_datum().get();
-                // `VariantArray` reads any physical layout, shredded or not,
-                // so batches from differently-shredded files render the same.
-                let variant =
-                    VariantArray::try_new(arr).expect("a variant-typed input is a variant struct");
-                // Row-wise rendering can't reassemble a shredded OBJECT from
-                // its typed leaves (`value()` only handles typed scalars), so
-                // fold the typed leaves back into the binary value column
-                // first. A no-op for unshredded input.
-                let variant = unshred_variant(&variant)
-                    .expect("shredded variant folds back to its binary form");
-
-                let mut json = StringViewBuilder::with_capacity(variant.len());
-                // One text buffer reused across rows, instead of a fresh
-                // `String` per rendered value.
-                let mut text = Vec::new();
-                for row in 0..variant.len() {
-                    if variant.is_null(row) {
-                        json.append_null();
-                        continue;
-                    }
-                    // Both failures are data-dependent (a corrupt metadata or
-                    // value blob); compiled expressions have no error channel,
-                    // so the dataflow catches the panic and fails the query.
-                    let value = variant
-                        .try_value(row)
-                        .unwrap_or_else(|e| panic!("corrupt variant value at row {row}: {e}"));
-                    text.clear();
-                    value
-                        .to_json(&mut text)
-                        .unwrap_or_else(|e| panic!("variant value failed to render as JSON: {e}"));
-                    json.append_value(std::str::from_utf8(&text).expect("JSON output is UTF-8"));
-                }
-                ExprResult::Array(Arc::new(json.finish()))
+                let input = source_expr(batch).into_array(batch.num_rows());
+                let out = variant_to_json_array(&input, &DataType::Utf8View)
+                    .unwrap_or_else(|e| panic!("variant cast failed: {e}"));
+                ExprResult::Array(out)
             }) as ExprEvalFn
         }))
     }
+}
+
+/// Cast a variant array with Pivot's SQL semantics.
+///
+/// The Parquet variant kernel's strict mode preserves JSON null as Arrow null
+/// and rejects every other invalid conversion. Text uses extraction semantics:
+/// strings lose their JSON quotes, while other values use their JSON
+/// representation.
+pub fn cast_variant_array(input: &ArrayRef, target: &DataType) -> Result<ArrayRef, ArrowError> {
+    if matches!(
+        target,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    ) {
+        return variant_to_text_array(input, target);
+    }
+
+    let target_field = Arc::new(arrow_schema::Field::new("item", target.clone(), true));
+    variant_get(
+        input,
+        GetOptions::new()
+            .with_as_type(Some(target_field))
+            .with_cast_options(arrow::compute::CastOptions {
+                safe: false,
+                ..Default::default()
+            }),
+    )
+    .map_err(|error| match error {
+        ArrowError::CastError(message) => {
+            ArrowError::CastError(format!("cannot cast variant value to {target}: {message}"))
+        }
+        error => error,
+    })
+}
+
+/// Render a variant as extraction text: JSON strings become their unquoted
+/// contents; every other value uses its JSON representation.
+fn variant_to_text_array(input: &ArrayRef, target: &DataType) -> Result<ArrayRef, ArrowError> {
+    render_variant_text(input, target, true)
+}
+
+/// Render any physical variant layout as JSON text, then restamp it to the
+/// requested Arrow string representation.
+fn variant_to_json_array(input: &ArrayRef, target: &DataType) -> Result<ArrayRef, ArrowError> {
+    render_variant_text(input, target, false)
+}
+
+fn render_variant_text(
+    input: &ArrayRef,
+    target: &DataType,
+    unquote_strings: bool,
+) -> Result<ArrayRef, ArrowError> {
+    let variant = VariantArray::try_new(input)?;
+    let variant = unshred_variant(&variant)?;
+    let mut json = StringViewBuilder::with_capacity(variant.len());
+    let mut text = Vec::new();
+    for row in 0..variant.len() {
+        if variant.is_null(row) {
+            json.append_null();
+            continue;
+        }
+        let value = variant.try_value(row)?;
+        if unquote_strings && let Some(value) = value.as_string() {
+            json.append_value(value);
+            continue;
+        }
+        text.clear();
+        value.to_json(&mut text).map_err(|e| {
+            ArrowError::ComputeError(format!("variant value failed to render as JSON: {e}"))
+        })?;
+        json.append_value(
+            std::str::from_utf8(&text)
+                .map_err(|e| ArrowError::ComputeError(format!("variant JSON is not UTF-8: {e}")))?,
+        );
+    }
+    let json: ArrayRef = Arc::new(json.finish());
+    if target == &DataType::Utf8View {
+        return Ok(json);
+    }
+    arrow::compute::cast_with_options(
+        &json,
+        target,
+        &arrow::compute::CastOptions {
+            safe: false,
+            ..Default::default()
+        },
+    )
 }
 
 /// Parse an array of JSON-document strings into a variant of the canonical

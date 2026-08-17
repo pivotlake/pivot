@@ -1191,8 +1191,8 @@ fn scan_pushed_extract_reads_a_shredded_leaf_directly() {
     );
 }
 
-/// A pushed extract on a path that is not shredded here cannot read a typed
-/// leaf, so the decoder rebuilds the whole variant and reads the path per row.
+/// A pushed extract on a path that is not shredded here reads its binary
+/// fallback and applies the SQL cast per row.
 #[test]
 fn scan_pushed_extract_falls_back_for_an_unshredded_path() {
     use dispatch::VariantExtract;
@@ -1432,7 +1432,8 @@ fn scan_pushed_extract_ignores_an_equality_constant_across_a_cast() {
     )
     .unwrap();
     let (_dir, table) = parquet_table(&dispatch, &[batch], true);
-    // The leaf is Utf8View, so emitting Utf8 casts it after decoding.
+    // The leaf is Utf8View, so emitting Utf8 casts its representation after
+    // decoding while preserving the extracted text.
     let projection = Projection::columns_with_extracts(
         vec![0],
         vec![Some(VariantExtract {

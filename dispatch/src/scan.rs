@@ -41,9 +41,9 @@ pub fn trailing_metadata_columns(schema: &Schema) -> usize {
 pub struct VariantExtract {
     /// Object-field path from the variant root to the referenced field.
     pub path: Vec<String>,
-    /// The physical arrow type to emit the extracted value as, when the path
-    /// is cast to a scalar. `None` for a bare extraction, which yields a
-    /// sub-variant (the object at the path) rather than a typed leaf.
+    /// The physical Arrow output type of the SQL cast applied to the extracted
+    /// variant value. `None` for a bare extraction, which yields a sub-variant
+    /// rather than a scalar.
     pub as_type: Option<arrow_schema::DataType>,
 }
 

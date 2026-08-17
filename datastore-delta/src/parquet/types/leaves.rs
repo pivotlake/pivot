@@ -64,10 +64,14 @@ pub(crate) enum OutputRead {
     /// The one shredded typed leaf holding every value for a scalar extract's
     /// path.
     TypedLeaf(usize),
-    /// The pruned path subtree a bare extract needs, folded into
+    /// The pruned path subtree an extract needs when one complete typed leaf
+    /// cannot answer it, folded into
     /// `reconstructed_variant_field`.
     PrunedVariant {
-        file_leaves: Vec<usize>,
+        /// One source per primitive leaf in the reconstructed field. An
+        /// all-null source proven by row-group statistics is omitted and
+        /// synthesized by the decoder instead of fetched.
+        leaf_sources: Vec<Option<usize>>,
         reconstructed_variant_field: FieldRef,
     },
 }
@@ -101,9 +105,8 @@ impl OutputRead {
         Some(OutputRead::TypedLeaf(leaves.typed_leaf))
     }
 
-    /// The read that satisfies a bare extract of `path` from the path's subtree
-    /// alone, or `None` when this file does not shred the path and the caller
-    /// has to read the whole variant.
+    /// The read that satisfies an extract of `path` from its on-path subtree
+    /// alone.
     ///
     /// Only the metadata, the untyped `value` at each level along the path, and
     /// the whole subtree at the path are read; sibling fields are skipped.
@@ -116,25 +119,58 @@ impl OutputRead {
         column: usize,
         path: &[String],
     ) -> Option<Self> {
-        let mut file_leaves = Vec::new();
+        let mut leaf_sources = Vec::new();
         let reconstructed_variant_field = prune_variant_node(
             &fields[column],
             path,
             first_leaf(fields, column),
-            &mut file_leaves,
+            &mut leaf_sources,
         )?;
         Some(OutputRead::PrunedVariant {
-            file_leaves,
+            leaf_sources,
             reconstructed_variant_field,
         })
     }
 
-    /// The file leaves this output reads, in depth-first order.
-    fn file_leaves(&self) -> Vec<usize> {
+    /// Drops all-null path leaves that row-group statistics prove carry no
+    /// data. The decoder recreates them as null arrays, keeping reconstruction
+    /// correct without fetching their Parquet chunks.
+    fn omit_all_null_leaves(&mut self, metadata: &QueryRowGroupMetadata) {
+        let OutputRead::PrunedVariant {
+            leaf_sources,
+            reconstructed_variant_field,
+        } = self
+        else {
+            return;
+        };
+        let reconstructed_leaves =
+            leaf_fields(&Fields::from(vec![reconstructed_variant_field.clone()]));
+        for (field, source) in reconstructed_leaves.iter().zip(leaf_sources) {
+            let Some(leaf) = *source else {
+                continue;
+            };
+            // The metadata blob is needed to decode any binary fallback. All
+            // other all-null leaves carry no data and can be reconstructed as
+            // null arrays without reading their column chunks.
+            if field.name() != "metadata"
+                && metadata
+                    .get_metadata()
+                    .leaf_statistics(leaf)
+                    .and_then(|statistics| statistics.null_count)
+                    == Some(metadata.num_rows())
+            {
+                *source = None;
+            }
+        }
+    }
+
+    /// The file source for each leaf this output reconstructs, in depth-first
+    /// order. `None` is an all-null leaf synthesized by the decoder.
+    fn leaf_sources(&self) -> Vec<Option<usize>> {
         match self {
-            OutputRead::WholeColumn(leaves) => leaves.clone().collect(),
-            OutputRead::TypedLeaf(leaf) => vec![*leaf],
-            OutputRead::PrunedVariant { file_leaves, .. } => file_leaves.clone(),
+            OutputRead::WholeColumn(leaves) => leaves.clone().map(Some).collect(),
+            OutputRead::TypedLeaf(leaf) => vec![Some(*leaf)],
+            OutputRead::PrunedVariant { leaf_sources, .. } => leaf_sources.clone(),
         }
     }
 }
@@ -151,28 +187,22 @@ pub(crate) fn resolve_output_reads(
         .enumerate()
         .map(|(output_idx, &column)| {
             if let Some(extract) = projection.extract_at(output_idx) {
-                match &extract.as_type {
-                    // A scalar extract can use a typed leaf only when it
-                    // contains every value for the path.
-                    Some(_) => {
-                        if let Some(read) = OutputRead::try_create_typed_leaf(
-                            fields,
-                            metadata,
-                            column,
-                            &extract.path,
-                        ) {
-                            return read;
-                        }
-                    }
-                    // A bare extract can use the path subtree when this file
-                    // shreds the path.
-                    None => {
-                        if let Some(read) =
-                            OutputRead::try_create_pruned_variant(fields, column, &extract.path)
-                        {
-                            return read;
-                        }
-                    }
+                // A scalar extract can use one typed leaf only when it
+                // contains every value for the path.
+                if extract.as_type.is_some()
+                    && let Some(read) =
+                        OutputRead::try_create_typed_leaf(fields, metadata, column, &extract.path)
+                {
+                    return read;
+                }
+                // Otherwise reconstruct only the on-path variant branch. It
+                // preserves binary fallbacks for a SQL cast without pulling
+                // unrelated shredded siblings.
+                if let Some(mut read) =
+                    OutputRead::try_create_pruned_variant(fields, column, &extract.path)
+                {
+                    read.omit_all_null_leaves(metadata);
+                    return read;
                 }
             }
             OutputRead::WholeColumn(leaf_range(fields, column))
@@ -186,7 +216,7 @@ pub(crate) struct LeafPlan {
     pub file_leaves: Vec<usize>,
     /// Per output column, the positions within `file_leaves` it folds, in
     /// depth-first order.
-    pub output_positions: Vec<Vec<usize>>,
+    pub output_positions: Vec<Vec<Option<usize>>>,
 }
 
 /// Collects `reads` into the distinct leaves to fetch and each output's view of
@@ -202,12 +232,14 @@ pub(crate) fn plan_leaves(reads: &[OutputRead]) -> LeafPlan {
     let output_positions = reads
         .iter()
         .map(|read| {
-            read.file_leaves()
+            read.leaf_sources()
                 .into_iter()
-                .map(|leaf| {
-                    *position_of.entry(leaf).or_insert_with(|| {
-                        file_leaves.push(leaf);
-                        file_leaves.len() - 1
+                .map(|source| {
+                    source.map(|leaf| {
+                        *position_of.entry(leaf).or_insert_with(|| {
+                            file_leaves.push(leaf);
+                            file_leaves.len() - 1
+                        })
                     })
                 })
                 .collect()
@@ -288,12 +320,12 @@ pub(crate) fn variant_shredded_leaves(
 /// The function retains metadata and untyped `value` children. It narrows
 /// `typed_value` to the on-path child until the path ends, then retains the
 /// complete remaining subtree. It appends the retained absolute leaf indices
-/// to `file_leaves` in depth-first order.
+/// to `leaf_sources` in depth-first order.
 fn prune_variant_node(
     field: &FieldRef,
     path: &[String],
     first_leaf: usize,
-    file_leaves: &mut Vec<usize>,
+    leaf_sources: &mut Vec<Option<usize>>,
 ) -> Option<FieldRef> {
     let DataType::Struct(children) = field.data_type() else {
         return None;
@@ -305,13 +337,17 @@ fn prune_variant_node(
         if child.name() == "typed_value" {
             if path.is_empty() {
                 // The path ends here, so the entire subtree is retained.
-                file_leaves.extend(child_first_leaf..child_first_leaf + child_leaf_count);
+                leaf_sources
+                    .extend((child_first_leaf..child_first_leaf + child_leaf_count).map(Some));
                 pruned_children.push(child.clone());
             } else {
                 // Only the on-path child of the shredded object is retained.
                 let DataType::Struct(object_fields) = child.data_type() else {
-                    // The path continues but this level is a typed leaf.
-                    return None;
+                    // The path continues but this level is a typed leaf. The
+                    // current node's `value` is still sufficient to resolve a
+                    // binary fallback, so simply omit this unusable branch.
+                    child_first_leaf += child_leaf_count;
+                    continue;
                 };
                 let mut object_child_first_leaf = child_first_leaf;
                 let mut pruned_path_field = None;
@@ -321,22 +357,23 @@ fn prune_variant_node(
                             object_child,
                             &path[1..],
                             object_child_first_leaf,
-                            file_leaves,
+                            leaf_sources,
                         )?);
                         break;
                     }
                     object_child_first_leaf += leaf_count(object_child);
                 }
-                let pruned_path_field = pruned_path_field?;
-                pruned_children.push(Arc::new(Field::new(
-                    child.name(),
-                    DataType::Struct(Fields::from(vec![pruned_path_field.as_ref().clone()])),
-                    child.is_nullable(),
-                )));
+                if let Some(pruned_path_field) = pruned_path_field {
+                    pruned_children.push(Arc::new(Field::new(
+                        child.name(),
+                        DataType::Struct(Fields::from(vec![pruned_path_field.as_ref().clone()])),
+                        child.is_nullable(),
+                    )));
+                }
             }
         } else {
             // Metadata and untyped `value` children are always retained.
-            file_leaves.extend(child_first_leaf..child_first_leaf + child_leaf_count);
+            leaf_sources.extend((child_first_leaf..child_first_leaf + child_leaf_count).map(Some));
             pruned_children.push(child.clone());
         }
         child_first_leaf += child_leaf_count;
@@ -644,7 +681,11 @@ mod tests {
         assert_eq!(plan.file_leaves, vec![0, 1, 2]);
         assert_eq!(
             plan.output_positions,
-            vec![vec![0, 1, 2], vec![0, 1, 2], vec![1]]
+            vec![
+                vec![Some(0), Some(1), Some(2)],
+                vec![Some(0), Some(1), Some(2)],
+                vec![Some(1)]
+            ]
         );
     }
 
@@ -661,7 +702,10 @@ mod tests {
         let plan = plan_leaves(&reads);
 
         assert_eq!(plan.file_leaves, vec![4, 1]);
-        assert_eq!(plan.output_positions, vec![vec![0], vec![1], vec![0]]);
+        assert_eq!(
+            plan.output_positions,
+            vec![vec![Some(0)], vec![Some(1)], vec![Some(0)]]
+        );
     }
 
     #[test]
@@ -702,15 +746,15 @@ mod tests {
         // The read takes metadata=0, value=1, age.value=2, and age.typed_value=3.
         // It skips both leaves for name.
         let OutputRead::PrunedVariant {
-            file_leaves,
+            leaf_sources,
             reconstructed_variant_field,
         } = read
         else {
             panic!("a shredded path prunes to its own subtree");
         };
-        assert_eq!(file_leaves, vec![0, 1, 2, 3]);
+        assert_eq!(leaf_sources, vec![Some(0), Some(1), Some(2), Some(3)]);
         // The pruned field folds exactly the read leaves and nothing else.
-        assert_eq!(leaf_count(&reconstructed_variant_field), file_leaves.len());
+        assert_eq!(leaf_count(&reconstructed_variant_field), leaf_sources.len());
     }
 
     #[test]
@@ -758,23 +802,30 @@ mod tests {
         // user.id.typed_value=4. Reading every untyped value keeps the extract
         // sound.
         let OutputRead::PrunedVariant {
-            file_leaves,
+            leaf_sources,
             reconstructed_variant_field,
         } = read
         else {
             panic!("a shredded path prunes to its own subtree");
         };
-        assert_eq!(file_leaves, vec![0, 1, 2, 3, 4]);
-        assert_eq!(leaf_count(&reconstructed_variant_field), file_leaves.len());
+        assert_eq!(
+            leaf_sources,
+            vec![Some(0), Some(1), Some(2), Some(3), Some(4)]
+        );
+        assert_eq!(leaf_count(&reconstructed_variant_field), leaf_sources.len());
     }
 
     #[test]
-    fn verifies_unshredded_path_has_no_pruned_variant() {
+    fn verifies_unshredded_path_prunes_to_the_binary_fallback() {
         let fields = Fields::from(vec![build_variant_field(&[("age", DataType::Int64)])]);
 
-        assert!(
-            OutputRead::try_create_pruned_variant(&fields, 0, &build_path(&["missing"])).is_none()
-        );
+        let read =
+            OutputRead::try_create_pruned_variant(&fields, 0, &build_path(&["missing"])).unwrap();
+
+        let OutputRead::PrunedVariant { leaf_sources, .. } = read else {
+            panic!("the root binary value can contain the unshredded path");
+        };
+        assert_eq!(leaf_sources, vec![Some(0), Some(1)]);
     }
 
     #[test]
