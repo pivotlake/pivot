@@ -314,6 +314,16 @@ impl PageHeader {
                 "Required field compressed_page_size is missing"
             ));
         };
+        // A size is a byte count; a negative one can only come from a corrupt
+        // (or adversarial) header, and callers cast these to usize to size
+        // buffer reservations and page walks.
+        if uncompressed_page_size < 0 || compressed_page_size < 0 {
+            return Err(general_err!(
+                "Page sizes must be non-negative (uncompressed {}, compressed {})",
+                uncompressed_page_size,
+                compressed_page_size
+            ));
+        }
         Ok(Self {
             r#type: type_,
             uncompressed_page_size,
@@ -324,6 +334,26 @@ impl PageHeader {
             dictionary_page_header,
             data_page_header_v2,
         })
+    }
+
+    #[cfg(test)]
+    fn for_size_test(uncompressed_page_size: i32, compressed_page_size: i32) -> Self {
+        Self {
+            r#type: PageType::DATA_PAGE,
+            uncompressed_page_size,
+            compressed_page_size,
+            crc: None,
+            data_page_header: Some(DataPageHeader {
+                num_values: 1,
+                encoding: Encoding::PLAIN,
+                definition_level_encoding: Encoding::RLE,
+                repetition_level_encoding: Encoding::RLE,
+                statistics: None,
+            }),
+            index_page_header: None,
+            dictionary_page_header: None,
+            data_page_header_v2: None,
+        }
     }
 
     pub fn data_page_num_values(&self) -> i32 {
@@ -381,5 +411,44 @@ impl PageHeader {
             }),
             data_page_header_v2: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parquet_thrift::{ThriftCompactOutputProtocol, ThriftSliceInputProtocol};
+
+    /// Serialize `header` and parse it back.
+    fn round_trip(header: PageHeader) -> Result<PageHeader> {
+        let mut bytes = Vec::new();
+        header
+            .write_thrift(&mut ThriftCompactOutputProtocol::new(&mut bytes))
+            .unwrap();
+        PageHeader::read_thrift_without_stats(&mut ThriftSliceInputProtocol::new(&bytes))
+    }
+
+    #[test]
+    fn a_negative_page_size_fails_to_parse() {
+        // Callers cast the sizes to usize to size buffer reservations and page
+        // walks, so a corrupt negative value must be rejected at parse time.
+        let negative_uncompressed = PageHeader::for_size_test(-1, 10);
+        let negative_compressed = PageHeader::for_size_test(10, -1);
+
+        let uncompressed_result = round_trip(negative_uncompressed);
+        let compressed_result = round_trip(negative_compressed);
+
+        assert!(uncompressed_result.is_err());
+        assert!(compressed_result.is_err());
+    }
+
+    #[test]
+    fn non_negative_page_sizes_parse() {
+        let header = PageHeader::for_size_test(10, 8);
+
+        let parsed = round_trip(header).unwrap();
+
+        assert_eq!(parsed.uncompressed_page_size, 10);
+        assert_eq!(parsed.compressed_page_size, 8);
     }
 }

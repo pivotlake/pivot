@@ -27,6 +27,8 @@ pub enum Error {
     Snappy(#[from] snap::Error),
     #[error("{0}")]
     UnsupportedPageType(PageType),
+    #[error("page header declares {declared} uncompressed bytes but the page holds {actual}")]
+    UncompressedSizeMismatch { declared: i64, actual: usize },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -82,17 +84,29 @@ impl Decompressor {
                 // its typed leaf). Nothing to cache either.
                 None if page.header.uncompressed_page_size == 0 => Vec::new(),
                 None => {
+                    // The reservation below is sized by the header's declared
+                    // uncompressed size, so validate it against the length the
+                    // snappy stream itself declares BEFORE reserving: a corrupt
+                    // (negative or inflated) header value would otherwise carve
+                    // out - and pin - an arbitrary amount of cache memory.
+                    let input: Vec<&[u8]> = page.data.iter().map(|b: &Bytes| b.as_ref()).collect();
+                    let declared = page.header.uncompressed_page_size;
+                    let uncompressed_size = read_decompressed_len(&input)?;
+                    if declared < 0 || declared as usize != uncompressed_size {
+                        return Err(Error::UncompressedSizeMismatch {
+                            declared: declared as i64,
+                            actual: uncompressed_size,
+                        });
+                    }
                     // Reserve the page's output region in the cache (packed into
                     // shared slots via this worker's fill cursor), decompress
                     // straight into it, and insert. The header is stored
                     // alongside it, opaque to the cache, so a later `get_range`
                     // hit can hand a caller a full page identity without touching
                     // disk (see `requests::parse_page_header`).
-                    let uncompressed_size = page.header.uncompressed_page_size as usize;
                     let mut reservation = memory_ctx()
                         .decompressed_cache()
                         .reserve(&key, uncompressed_size);
-                    let input: Vec<&[u8]> = page.data.iter().map(|b: &Bytes| b.as_ref()).collect();
                     self.decoder
                         .decompress_scattered(&input, reservation.as_mut_slices())?;
                     memory_ctx().decompressed_cache().insert(
@@ -129,6 +143,24 @@ impl Decompressor {
             idx: page.page_idx,
         })
     }
+}
+
+/// The decompressed length the snappy stream itself declares (a varint at its
+/// head). The head may straddle the scattered input's first chunks, so up to a
+/// varint's worth of leading bytes is gathered before asking snappy.
+fn read_decompressed_len(input: &[&[u8]]) -> Result<usize> {
+    let mut prefix = [0u8; 8];
+    let mut len = 0;
+    'gather: for chunk in input {
+        for &byte in *chunk {
+            prefix[len] = byte;
+            len += 1;
+            if len == prefix.len() {
+                break 'gather;
+            }
+        }
+    }
+    Ok(snap::raw::decompress_len(&prefix[..len])?)
 }
 
 /// Serialize a page's header back to Thrift compact bytes, to store alongside its
@@ -521,6 +553,34 @@ mod tests {
             ptr(&b[0]),
             "same physical column should reuse cached bytes"
         );
+    }
+
+    /// A header whose declared uncompressed size disagrees with the page's own
+    /// snappy stream must error before reserving cache memory - a negative or
+    /// inflated value would otherwise carve out and pin an arbitrary amount of
+    /// the ring, up to a whole-process crash.
+    #[test]
+    fn test_a_corrupt_uncompressed_size_is_an_error() {
+        init_test_free_pool(4);
+        let mut negative = compressed_data_page(&[1u8; 64], 10, None);
+        negative.header.uncompressed_page_size = -1;
+        let mut inflated = compressed_data_page(&[1u8; 64], 10, None);
+        inflated.header.uncompressed_page_size = i32::MAX;
+
+        let mut sender = CollectSender::new();
+        let negative_result = Decompressor::default().consume(
+            negative,
+            &mut sender,
+            &mut dispatch::TestOperatorIO::default().io(),
+        );
+        let inflated_result = Decompressor::default().consume(
+            inflated,
+            &mut sender,
+            &mut dispatch::TestOperatorIO::default().io(),
+        );
+
+        assert!(negative_result.is_err());
+        assert!(inflated_result.is_err());
     }
 
     /// Unsupported page type → error.
