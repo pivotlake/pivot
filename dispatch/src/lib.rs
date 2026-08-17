@@ -91,6 +91,7 @@ pub use gather_barrier::GatherBarrier;
 pub use io::{FsRequest, HttpRequest};
 pub use memory::BUFFER_SIZE;
 pub use memory::ReadBuffer;
+pub use memory::{MemoryBlockState, MemoryBlockStatus, block_size_bytes};
 pub use memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 pub use numa::{Topology, default_worker_count};
 pub use operations::channels::{MpscSender, Sender};

@@ -175,6 +175,12 @@ async fn queries_bind_tables_by_datastore_name() {
         vec![
             Some("system".into()),
             Some("main".into()),
+            Some("memory_blocks".into()),
+            Some("system.memory_blocks".into()),
+        ],
+        vec![
+            Some("system".into()),
+            Some("main".into()),
             Some("table_files".into()),
             Some("system.table_files".into()),
         ],

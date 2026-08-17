@@ -4,6 +4,7 @@ use crate::memory::compressed_cache::CompressedCache;
 use crate::memory::decompressed_cache::DecompressedCache;
 use crate::memory::fill_cursor::FillCursor;
 use crate::memory::free_pool::{FreePool, PoolFactory};
+use crate::memory::status::{MemoryBlockStatus, read_block_status};
 use crate::memory::{BUFFER_SIZE, Ring, RingLayout, WriteBuffer};
 use crate::worker::WORKER_IDX;
 use std::cell::{Cell, RefCell, UnsafeCell};
@@ -152,6 +153,17 @@ impl MemoryContext {
             }
             write.zero_out();
         }
+    }
+
+    /// Read what every block of the ring currently holds, in ring order.
+    ///
+    /// The whole ring, from whichever worker asks: a worker may only *acquire*
+    /// and evict blocks in its own node's region, but reading crosses regions
+    /// freely, and reading is all this does.
+    pub fn read_all_blocks(&self) -> Vec<MemoryBlockStatus> {
+        (0..self.ring.len())
+            .map(|slot| read_block_status(&self.ring, &self.clock, &self.layout, slot))
+            .collect()
     }
 
     pub fn compressed_cache(&self) -> &CompressedCache {

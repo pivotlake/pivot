@@ -41,6 +41,16 @@ async fn select_rows(client: &Client, sql: &str) -> Vec<Vec<Option<String>>> {
         .collect()
 }
 
+/// Run `sql` and return the single value of its single row, for the counts and
+/// aggregates a test asserts one number from.
+async fn single_value(client: &Client, sql: &str) -> String {
+    let rows = select_rows(client, sql).await;
+    let [row] = rows.as_slice() else {
+        panic!("expected one row from `{sql}`, got {}", rows.len());
+    };
+    row[0].clone().expect("a single non-null value")
+}
+
 /// The server-side message of a failed query. `tokio_postgres::Error` renders
 /// as a bare "db error", so assertions on what the server said have to read the
 /// `DbError` it carries.
@@ -352,6 +362,88 @@ async fn system_datastore_is_read_only(#[future] conn: Conn) {
             && duckdb_system_message.contains("does not exist"),
         "the system datastore must serve no other schema, got: {duckdb_system_message}",
     );
+}
+
+/// The rows must be the whole ring: every block once, none twice, none missed,
+/// however many workers the scan is compiled across. Contiguous slots from zero
+/// with no duplicates is exactly that.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn system_memory_blocks_reports_the_whole_ring_exactly_once(#[future] conn: Conn) {
+    let slots: Vec<i64> = select_rows(&conn, "SELECT slot FROM system.memory_blocks ORDER BY slot")
+        .await
+        .into_iter()
+        .map(|row| row[0].as_ref().unwrap().parse().unwrap())
+        .collect();
+
+    assert!(!slots.is_empty(), "the ring must have blocks");
+    assert_eq!(
+        slots,
+        (0..slots.len() as i64).collect::<Vec<_>>(),
+        "the workers together must report every block of the ring exactly once",
+    );
+}
+
+/// `system.memory_blocks` reports one row per block of the memory ring, so
+/// counting rows measures memory: every block is the same size, and every one
+/// of them is accounted for under exactly one state.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn system_memory_blocks_accounts_for_every_block(#[future] conn: Conn) {
+    let total: i64 = single_value(&conn, "SELECT count(*) FROM system.memory_blocks")
+        .await
+        .parse()
+        .unwrap();
+
+    let by_state = select_rows(
+        &conn,
+        "SELECT state, count(*), sum(size_bytes) \
+         FROM system.memory_blocks GROUP BY state ORDER BY state",
+    )
+    .await;
+
+    assert!(total > 0, "the ring must have blocks");
+    let counted: i64 = by_state
+        .iter()
+        .map(|row| row[1].as_ref().unwrap().parse::<i64>().unwrap())
+        .sum();
+    assert_eq!(counted, total, "every block must have exactly one state");
+    for row in &by_state {
+        let state = row[0].as_ref().unwrap();
+        assert!(
+            ["free", "pinned", "compressed_cache", "decompressed_cache"].contains(&state.as_str()),
+            "unexpected block state: {state}",
+        );
+        let blocks: i64 = row[1].as_ref().unwrap().parse().unwrap();
+        let bytes: i64 = row[2].as_ref().unwrap().parse().unwrap();
+        assert_eq!(bytes % blocks, 0, "blocks must all be one size");
+    }
+}
+
+/// Reading a table puts its bytes in the caches, which the ring reports as
+/// blocks lent to a cache rather than free ones.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn system_memory_blocks_shows_a_scan_caching_bytes(#[future] conn: Conn) {
+    let dir = write_parquet(&people_batch());
+    create_people_table(&conn, "memory_blocks_people", dir.path()).await;
+
+    conn.simple_query("SELECT name FROM memory_blocks_people")
+        .await
+        .unwrap();
+
+    let cached: i64 = single_value(
+        &conn,
+        "SELECT count(*) FROM system.memory_blocks \
+         WHERE state IN ('compressed_cache', 'decompressed_cache')",
+    )
+    .await
+    .parse()
+    .unwrap();
+    assert!(cached > 0, "reading a table must leave its bytes cached");
 }
 
 #[rstest]
