@@ -26,8 +26,8 @@ use crate::io::backend::IOBackend;
 use crate::io::disk_cache::{DiskCache, Object, Segment};
 use crate::io::http::{HttpEngine, RemoteRead, RemoteUpload, default_client_config};
 use crate::io::{
-    Completion, DataFlowRequest, FailedIO, HttpGetRequest, HttpUploadRequest, RemoteReadTime,
-    RemoteSplit,
+    Completion, DataFlowRequest, FailedIO, HttpGetRequest, HttpUploadRequest, OpenFile,
+    RemoteReadTime, RemoteSplit,
 };
 use crate::memory::compressed_cache::MissingExtent;
 use std::collections::HashMap;
@@ -95,6 +95,10 @@ struct HttpRead {
     read: Identifier,
     block: MissingExtent,
     object: Option<Arc<Object>>,
+    /// The exact body size the transport requires before reporting completion -
+    /// the block's length, clamped to the object's end when the block-aligned run
+    /// overhangs it.
+    expected_body_len: usize,
 }
 
 /// A write-back populating the cache file after an HTTP piece landed.
@@ -206,6 +210,7 @@ impl CachedHttpEngine {
                     len: block.len(),
                     dest: block.dest(),
                 };
+                let expected_body_len = remote_read.expected_body_len();
                 self.start_http(backend, id, remote_read)?;
                 self.http_reads.insert(
                     id,
@@ -213,6 +218,7 @@ impl CachedHttpEngine {
                         read,
                         block,
                         object: object.clone(),
+                        expected_body_len,
                     },
                 );
             }
@@ -461,7 +467,37 @@ impl CachedHttpEngine {
         http_read: HttpRead,
         out: &mut Vec<ReadResult>,
     ) -> Result<()> {
-        http_read.block.commit();
+        // The transport reports completion only after exactly `expected_body_len`
+        // bytes arrive; a shorter response fails in the protocol/body path. That
+        // expected length can still be shorter than the block-aligned extent when
+        // the known object EOF clamps it. Require the clamped prefix to reach the
+        // extent's final block. If it does not, the logical range extends past the
+        // current object size far enough to leave a whole cache block unwritten.
+        if !http_read
+            .block
+            .prefix_reaches_last_block(http_read.expected_body_len)
+        {
+            if let Some(request) = self.fail_read(http_read.read) {
+                request
+                    .request
+                    .block
+                    .remove_from_cache(&OpenFile::Remote(request.request.remote.clone()));
+                out.push(Err(FailedIO {
+                    data_flow_id: request.data_flow_id,
+                    operator_idx: request.operator_idx,
+                    tracked_read_id: request.tracked_read_id,
+                    error: std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "read reaches past the end of the remote object",
+                    )
+                    .into(),
+                }));
+            }
+            return Ok(());
+        }
+        // The validated body reached the final block, so committing its touched
+        // prefix commits every block in this extent.
+        http_read.block.commit_prefix(http_read.expected_body_len);
 
         if let Some(object) = http_read.object {
             let id = *disk_id;

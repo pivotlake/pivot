@@ -79,6 +79,13 @@ impl LocalFile {
         self.device_idx
     }
 
+    /// Attributes of the underlying file - notably its current size, which the
+    /// requester consults to tell a read that stopped at end-of-file from one
+    /// that genuinely came up short.
+    pub(crate) fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        self.file.metadata()
+    }
+
     #[cfg(test)]
     pub(crate) fn strong_count(&self) -> usize {
         Arc::strong_count(&self.file)
