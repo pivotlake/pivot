@@ -474,6 +474,14 @@ impl DecompressedCache {
         if let Some(table) = files.get(open_file) {
             let table = table.read().unwrap();
             for (&block_offset, block) in table.range(offset..end) {
+                // A block starting inside the previous block's span, or running
+                // past the queried range, can only come from overlapping spans
+                // (a corrupt footer). Leave it inside the surrounding gap - the
+                // caller then re-reads those bytes and surfaces the corruption
+                // when decoding - instead of underflowing the gap arithmetic.
+                if block_offset < cursor || block_offset + block.compressed_len > end {
+                    continue;
+                }
                 push_gap(&mut segments, cursor, block_offset - cursor);
                 cursor = block_offset + block.compressed_len;
                 match block.pin_views() {
@@ -1094,6 +1102,60 @@ mod tests {
                 Shape::Gap(15, 5)
             ]
         );
+    }
+
+    #[test]
+    fn get_range_skips_a_block_overlapping_the_previous_one() {
+        // Overlapping spans only arise from a corrupt footer; the overlapped
+        // block must be left as gap, not underflow the gap arithmetic.
+        init_test_free_pool(2);
+        let cache = for_test(true);
+        insert_page(
+            &cache,
+            BlockKey {
+                len: 20,
+                ..test_key(0)
+            },
+            8,
+            1,
+        );
+        insert_page(
+            &cache,
+            BlockKey {
+                len: 5,
+                ..test_key(10)
+            },
+            8,
+            2,
+        );
+        release_cursor(&cache);
+
+        let segments = cache.get_range(&FD(), 0, 30);
+
+        assert_eq!(
+            shapes(&segments),
+            vec![Shape::Cached(0, 20, 1), Shape::Gap(20, 10)]
+        );
+    }
+
+    #[test]
+    fn get_range_skips_a_block_running_past_the_range_end() {
+        init_test_free_pool(2);
+        let cache = for_test(true);
+        insert_page(
+            &cache,
+            BlockKey {
+                len: 20,
+                ..test_key(0)
+            },
+            8,
+            1,
+        );
+        release_cursor(&cache);
+
+        let segments = cache.get_range(&FD(), 0, 10);
+
+        assert_eq!(shapes(&segments), vec![Shape::Gap(0, 10)]);
     }
 
     #[test]
