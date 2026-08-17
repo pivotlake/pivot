@@ -312,6 +312,15 @@ impl<
         batch: RecordBatch,
         sender: &mut dyn Sender<RecordBatch>,
     ) -> unary::Result<()> {
+        // The accumulators must hold this batch's actual layout before any of
+        // its rows are appended (see the `ProbeMatchOutputter` docs). The
+        // build side settles once, from the rows the build phase published;
+        // the probe side follows the batch about to be probed.
+        self.match_outputter.align_build_layout();
+        let probe_layout = batch.project(&self.spec.probe_output_indices)?.schema();
+        self.match_outputter
+            .align_probe_layout(&probe_layout, sender)?;
+
         let build_rows = unsafe { &*self.table.build_rows.get() };
         if build_rows.is_empty() {
             if MARK {
@@ -373,6 +382,9 @@ impl<
     fn finish(&mut self, sender: &mut dyn Sender<RecordBatch>) -> unary::Result<bool> {
         if !self.probing_done {
             self.probing_done = true;
+            // A worker that consumed no probe batches reaches the unmatched
+            // build scan below with its accumulators still spec-typed.
+            self.match_outputter.align_build_layout();
             if self.match_outputter.has_buffered_matches() {
                 self.match_outputter.emit(sender)?;
             }

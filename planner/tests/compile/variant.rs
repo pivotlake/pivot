@@ -539,6 +539,154 @@ fn fully_sorts_whole_documents_across_mixed_shredding(mut testing_planner: Testi
     assert_eq!(got, expected);
 }
 
+/// A join whose probe side carries the whole document, spanning
+/// differently-shredded files: the match outputter splices probe rows from
+/// raw variant batches with per-file layouts.
+#[rstest]
+fn joins_whole_documents_across_mixed_shredding(mut testing_planner: TestingPlanner) {
+    let shredded = docs_batch(vec![r#"{"age":31}"#, r#"{"age":33}"#], true);
+    let unshredded = docs_batch(vec![r#"{"age":32}"#, r#"{"age":30}"#], false);
+    docs_table_files(&mut testing_planner, &[shredded, unshredded]);
+    testing_planner.add_table(
+        "wanted",
+        &[(
+            "age",
+            Type::Int64,
+            Arc::new(arrow_array::Int64Array::from(vec![30, 31])) as ArrayRef,
+        )],
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT d FROM docs JOIN wanted ON CAST(d->'age' AS BIGINT) = wanted.age",
+    );
+
+    let mut got: Vec<Option<String>> = rows
+        .iter()
+        .map(|r| only_column(r).as_str().map(str::to_string))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            Some(r#"{"age":30}"#.to_string()),
+            Some(r#"{"age":31}"#.to_string()),
+        ]
+    );
+}
+
+/// The mirror of [`joins_whole_documents_across_mixed_shredding`]: the variant
+/// table is the smaller (build) side, whose stored rows are gathered across
+/// its differently-shredded batches when matches emit.
+#[rstest]
+fn joins_whole_documents_on_the_build_side(mut testing_planner: TestingPlanner) {
+    let shredded = docs_batch(vec![r#"{"age":31}"#, r#"{"age":33}"#], true);
+    let unshredded = docs_batch(vec![r#"{"age":32}"#, r#"{"age":30}"#], false);
+    docs_table_files(&mut testing_planner, &[shredded, unshredded]);
+    testing_planner.add_table(
+        "wanted",
+        &[(
+            "age",
+            Type::Int64,
+            Arc::new(arrow_array::Int64Array::from(vec![
+                30, 31, 34, 35, 36, 37, 38, 39, 40, 41,
+            ])) as ArrayRef,
+        )],
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT d FROM wanted JOIN docs ON CAST(d->'age' AS BIGINT) = wanted.age",
+    );
+
+    let mut got: Vec<Option<String>> = rows
+        .iter()
+        .map(|r| only_column(r).as_str().map(str::to_string))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            Some(r#"{"age":30}"#.to_string()),
+            Some(r#"{"age":31}"#.to_string()),
+        ]
+    );
+}
+
+/// Files that all shred alike keep their layout through the join: the same
+/// query as the mixed tests, but with nothing to unify.
+#[rstest]
+fn joins_whole_documents_with_uniform_shredding(mut testing_planner: TestingPlanner) {
+    let first = docs_batch(vec![r#"{"age":31}"#, r#"{"age":33}"#], true);
+    let second = docs_batch(vec![r#"{"age":32}"#, r#"{"age":30}"#], true);
+    docs_table_files(&mut testing_planner, &[first, second]);
+    testing_planner.add_table(
+        "wanted",
+        &[(
+            "age",
+            Type::Int64,
+            Arc::new(arrow_array::Int64Array::from(vec![30, 31])) as ArrayRef,
+        )],
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT d FROM docs JOIN wanted ON CAST(d->'age' AS BIGINT) = wanted.age",
+    );
+
+    let mut got: Vec<Option<String>> = rows
+        .iter()
+        .map(|r| only_column(r).as_str().map(str::to_string))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            Some(r#"{"age":30}"#.to_string()),
+            Some(r#"{"age":31}"#.to_string()),
+        ]
+    );
+}
+
+/// An outer join whose unmatched probe rows are whole documents from
+/// differently-shredded files: the padding accumulator crosses the layout
+/// change too.
+#[rstest]
+fn outer_joins_whole_documents_across_mixed_shredding(mut testing_planner: TestingPlanner) {
+    let shredded = docs_batch(vec![r#"{"age":31}"#, r#"{"age":33}"#], true);
+    let unshredded = docs_batch(vec![r#"{"age":32}"#, r#"{"age":30}"#], false);
+    docs_table_files(&mut testing_planner, &[shredded, unshredded]);
+    testing_planner.add_table(
+        "wanted",
+        &[(
+            "age",
+            Type::Int64,
+            Arc::new(arrow_array::Int64Array::from(vec![30, 31])) as ArrayRef,
+        )],
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT d, wanted.age AS w FROM docs \
+         LEFT JOIN wanted ON CAST(d->'age' AS BIGINT) = wanted.age",
+    );
+
+    let mut got: Vec<(String, Option<i64>)> = rows
+        .iter()
+        .map(|r| (r["d"].as_str().unwrap().to_string(), r["w"].as_i64()))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            (r#"{"age":30}"#.to_string(), Some(30)),
+            (r#"{"age":31}"#.to_string(), Some(31)),
+            (r#"{"age":32}"#.to_string(), None),
+            (r#"{"age":33}"#.to_string(), None),
+        ]
+    );
+}
+
 /// Casting the whole document to VARCHAR over a shredded file renders it as
 /// JSON, folding the typed leaves back into the text.
 #[rstest]

@@ -13,7 +13,7 @@ use crate::operations::UnaryFactory;
 use crate::operations::channels::{ChannelFactory, Sender, StealableChannelFactory};
 use crate::operations::unary::UnaryOperator;
 use crate::operations::unary::join::build::{
-    BuildWorkerOutput, JoinBuildConsumer, JoinPartitionJob, NUM_PARTITIONS,
+    BuildWorkerOutput, JoinBuildConsumer, JoinBuildJob, NUM_PARTITIONS,
 };
 use crate::operations::unary::join::build_rows::BuildRows;
 use crate::operations::unary::join::directory::JoinDirectory;
@@ -27,11 +27,12 @@ pub struct JoinBuildFactory<K: JoinKey, const BUILD_OUTER: bool> {
     spec: Arc<JoinSpec>,
     hash_state: RandomState,
     table: JoinTable<K::Stored>,
-    injector: Arc<Injector<JoinPartitionJob<K::Stored>>>,
+    injector: Arc<Injector<JoinBuildJob<K::Stored>>>,
     jobs_injected: Arc<AtomicBool>,
     build_ready: Arc<AtomicBool>,
     gather: Arc<GatherBarrier<BuildWorkerOutput<K::Stored>>>,
     remaining_jobs: Arc<AtomicUsize>,
+    finish_claimed: Arc<AtomicBool>,
 }
 
 /// Creates one [`Probe`] per worker, all sharing the same [`JoinTable`].
@@ -139,6 +140,7 @@ pub fn create_for_workers<
     let jobs_injected = Arc::new(AtomicBool::new(false));
     let build_ready = Arc::new(AtomicBool::new(false));
     let remaining_jobs = Arc::new(AtomicUsize::new(NUM_PARTITIONS));
+    let finish_claimed = Arc::new(AtomicBool::new(false));
     let gather = Arc::new(GatherBarrier::new(worker_count));
 
     let table_clone = table.clone();
@@ -155,6 +157,7 @@ pub fn create_for_workers<
         build_ready: build_ready.clone(),
         gather: gather.clone(),
         remaining_jobs: remaining_jobs.clone(),
+        finish_claimed: finish_claimed.clone(),
     });
 
     let unmatched = Arc::new(UnmatchedScan::new(worker_count));
@@ -183,6 +186,7 @@ impl<K: JoinKey, const BUILD_OUTER: bool> UnaryFactory<RecordBatch, ()>
             self.jobs_injected,
             self.build_ready,
             self.remaining_jobs,
+            self.finish_claimed,
             self.spec.build_output_indices.clone(),
         ))
     }

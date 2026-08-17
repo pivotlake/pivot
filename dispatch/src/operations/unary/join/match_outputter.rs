@@ -18,9 +18,23 @@ use crate::operations::unary::join::residual_filter::ResidualFilter;
 /// Owns the buffered matches and accumulators that produce the join's output.
 /// Probe and build columns accumulate separately because their rows come from
 /// different sources; every emitted batch splices them under one schema.
+///
+/// The accumulators start from the spec's declared fields but follow the
+/// *actual* layout of what they accumulate, because a variant column's
+/// physical struct type is chosen per file and only known from the data:
+/// [`align_build_layout`](Self::align_build_layout) points the build side at
+/// the published build rows' layout once, and
+/// [`align_probe_layout`](Self::align_probe_layout) re-points the probe side
+/// whenever the probe stream crosses into a differently-laid-out file,
+/// flushing the rows buffered under the old layout first. Appending a batch
+/// into an accumulator of another layout would silently drop the fields the
+/// accumulator has no slot for, so both sides must align before any append.
 pub(super) struct ProbeMatchOutputter {
-    /// The probe columns listed in the output, then the build columns.
+    /// The probe accumulator's fields, then the build accumulator's, then a
+    /// mark join's marker. Refreshed whenever either side re-aligns.
     output_schema: SchemaRef,
+    /// Whether the output carries a mark join's trailing marker column.
+    mark: bool,
     probe: BatchAccumulator,
     build: BatchAccumulator,
     allocator: SlabAllocator,
@@ -80,6 +94,7 @@ impl ProbeMatchOutputter {
         }
         Self {
             output_schema: Arc::new(Schema::new(fields)),
+            mark,
             probe: BatchAccumulator::retaining_source_buffers(
                 Arc::new(Schema::new(probe_fields.to_vec())),
                 &mut allocator,
@@ -109,6 +124,75 @@ impl ProbeMatchOutputter {
 
     pub(super) fn has_buffered_matches(&self) -> bool {
         !self.probe.is_empty()
+    }
+
+    /// Point the build accumulator at the published build rows' layout. A
+    /// no-op once aligned (or for an empty build side); called before probing
+    /// touches the accumulator, which is therefore still empty when it is
+    /// replaced.
+    pub(super) fn align_build_layout(&mut self) {
+        let build_rows = unsafe { &*self.build_rows.get() };
+        let Some(first) = build_rows.output_batches.first() else {
+            return;
+        };
+        if follows_layout(self.build.schema(), first.schema_ref()) {
+            return;
+        }
+        debug_assert!(
+            self.build.is_empty(),
+            "the build layout settles before any build row accumulates"
+        );
+        let schema = adopt_layout(self.build.schema(), first.schema_ref());
+        self.build = BatchAccumulator::retaining_source_buffers(schema, &mut self.allocator);
+        self.refresh_output_schema();
+    }
+
+    /// Point the probe-side accumulators at `layout`, the projected schema of
+    /// the batch about to be probed. A no-op while the layout is unchanged,
+    /// which is every batch until the probe stream crosses into a
+    /// differently-laid-out file; on a change, the rows buffered under the
+    /// old layout are emitted first (matched pairs flush both sides together,
+    /// since their rows are paired).
+    pub(super) fn align_probe_layout(
+        &mut self,
+        layout: &SchemaRef,
+        sender: &mut dyn Sender<RecordBatch>,
+    ) -> unary::Result<()> {
+        if follows_layout(self.probe.schema(), layout) {
+            return Ok(());
+        }
+        if !self.probe.is_empty() {
+            self.emit(sender)?;
+        }
+        let schema = adopt_layout(self.probe.schema(), layout);
+        self.probe =
+            BatchAccumulator::retaining_source_buffers(schema.clone(), &mut self.allocator);
+        if self.unmatched_probe.is_some() {
+            self.emit_unmatched_probe_rows(sender)?;
+            self.unmatched_probe = Some(BatchAccumulator::retaining_source_buffers(
+                schema,
+                &mut self.allocator,
+            ));
+        }
+        self.refresh_output_schema();
+        Ok(())
+    }
+
+    /// Rebuild [`output_schema`](Self::output_schema) from the accumulators'
+    /// current layouts.
+    fn refresh_output_schema(&mut self) {
+        let mut fields: Vec<Field> = self
+            .probe
+            .schema()
+            .fields()
+            .iter()
+            .chain(self.build.schema().fields())
+            .map(|field| field.as_ref().clone())
+            .collect();
+        if self.mark {
+            fields.push(Field::new("mark", arrow_schema::DataType::Boolean, true));
+        }
+        self.output_schema = Arc::new(Schema::new(fields));
     }
 
     /// Start miss tracking for the next probed batch of `rows` rows.
@@ -473,4 +557,34 @@ impl ProbeMatchOutputter {
         }
         Ok(())
     }
+}
+
+/// Whether an accumulator declared as `declared` already holds the physical
+/// layout of `actual`. Only the data types matter: the accumulator keeps its
+/// own nullability (an outer join declares columns nullable for padding even
+/// when the stored data has no nulls).
+fn follows_layout(declared: &SchemaRef, actual: &SchemaRef) -> bool {
+    declared
+        .fields()
+        .iter()
+        .zip(actual.fields())
+        .all(|(declared, actual)| declared.data_type() == actual.data_type())
+}
+
+/// `declared` with each field's data type replaced by `actual`'s: the
+/// accumulator adopts the batch's physical layout while keeping its declared
+/// name, nullability, and metadata.
+fn adopt_layout(declared: &SchemaRef, actual: &SchemaRef) -> SchemaRef {
+    let fields: Vec<Field> = declared
+        .fields()
+        .iter()
+        .zip(actual.fields())
+        .map(|(declared, actual)| {
+            declared
+                .as_ref()
+                .clone()
+                .with_data_type(actual.data_type().clone())
+        })
+        .collect();
+    Arc::new(Schema::new(fields))
 }

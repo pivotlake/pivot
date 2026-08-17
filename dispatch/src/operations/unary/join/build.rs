@@ -65,10 +65,11 @@ impl<K: JoinKey, const BUILD_OUTER: bool> JoinBuildConsumer<K, BUILD_OUTER> {
         hash_state: RandomState,
         gather: Arc<GatherBarrier<BuildWorkerOutput<K::Stored>>>,
         table: JoinTable<K::Stored>,
-        injector: Arc<Injector<JoinPartitionJob<K::Stored>>>,
+        injector: Arc<Injector<JoinBuildJob<K::Stored>>>,
         jobs_injected: Arc<AtomicBool>,
         build_ready: Arc<AtomicBool>,
         remaining_jobs: Arc<AtomicUsize>,
+        finish_claimed: Arc<AtomicBool>,
         build_output_indices: Vec<usize>,
     ) -> Self {
         Self {
@@ -84,6 +85,7 @@ impl<K: JoinKey, const BUILD_OUTER: bool> JoinBuildConsumer<K, BUILD_OUTER> {
                 jobs_injected,
                 build_ready,
                 remaining_jobs,
+                finish_claimed,
                 build_output_indices,
             },
             saw_null_key: false,
@@ -176,14 +178,62 @@ impl<K: JoinKey, const BUILD_OUTER: bool> Consumer<RecordBatch, ()>
 
 pub struct JoinBuilder<K: Copy + Send, const BUILD_OUTER: bool> {
     table: JoinTable<K>,
-    injector: Arc<Injector<JoinPartitionJob<K>>>,
+    injector: Arc<Injector<JoinBuildJob<K>>>,
     jobs_injected: Arc<AtomicBool>,
     build_ready: Arc<AtomicBool>,
     remaining_jobs: Arc<AtomicUsize>,
+    /// Claimed (once) by the worker that observes the last job land; that
+    /// worker finishes any deferred output views and then opens `build_ready`.
+    finish_claimed: Arc<AtomicBool>,
     build_output_indices: Vec<usize>,
 }
 
 unsafe impl<K: Copy + Send, const BUILD_OUTER: bool> Send for JoinBuilder<K, BUILD_OUTER> {}
+
+/// One unit of the parallel table-build phase, stolen and run by any build
+/// worker between the gather barrier and the `build_ready` gate.
+pub enum JoinBuildJob<K: Copy + Send> {
+    /// Scatter one radix partition's tuples into the directory and arenas.
+    Partition(JoinPartitionJob<K>),
+    /// Fold one stored batch's mismatched variant columns to the canonical
+    /// layout (see [`BuildRows::fold_columns`]). One job per batch, so a large
+    /// mixed-layout build side folds across every worker instead of on one.
+    FoldBatch(FoldBatchJob<K>),
+}
+
+impl<K: Copy + Send> JoinBuildJob<K> {
+    fn run(self) -> unary::Result<()> {
+        match self {
+            JoinBuildJob::Partition(job) => {
+                job.run();
+                Ok(())
+            }
+            JoinBuildJob::FoldBatch(job) => job.run(),
+        }
+    }
+}
+
+pub struct FoldBatchJob<K: Copy + Send> {
+    table: JoinTable<K>,
+    batch_idx: usize,
+    columns: Arc<[usize]>,
+    remaining_jobs: Arc<AtomicUsize>,
+}
+
+unsafe impl<K: Copy + Send> Send for FoldBatchJob<K> {}
+
+impl<K: Copy + Send> FoldBatchJob<K> {
+    fn run(self) -> unary::Result<()> {
+        // Jobs fold disjoint batch indices, the same disjoint-writes protocol
+        // the partition jobs use on the directory.
+        let build_rows = unsafe { &mut *self.table.build_rows.get() };
+        build_rows.fold_columns(self.batch_idx, &self.columns)?;
+        // Release-publish this job's writes; the gate flip's Acquire load of
+        // the drained counter is what makes the folded batch readable.
+        self.remaining_jobs.fetch_sub(1, Ordering::Release);
+        Ok(())
+    }
+}
 
 pub struct JoinPartitionJob<K: Copy + Send> {
     /// This partition's tuples, one entry per build worker, paired with that
@@ -285,13 +335,34 @@ impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> JoinBuilder<K, OUTER_JOI
         // whose side is outer, anti, or semi this also allocates one matched
         // flag per row id (gaps included); null-keyed rows have no tuple and
         // remain unmatched.
-        let (build_rows, row_bases) = BuildRows::new::<OUTER_JOIN_BUILD_SIDE>(
+        let (mut build_rows, row_bases, fold_columns) = BuildRows::new::<OUTER_JOIN_BUILD_SIDE>(
             worker_outputs
                 .iter_mut()
                 .map(|output| std::mem::take(&mut output.build_row_batches)),
-            &self.build_output_indices,
-        )?;
+        );
+        // With every batch already in its final layout, the output views can
+        // be built right here; otherwise they wait for the fold jobs pushed
+        // below, and the worker that flips the gate builds them (see
+        // `output`).
+        let fold_jobs = if fold_columns.is_empty() {
+            build_rows.finish_output_views(&self.build_output_indices)?;
+            0
+        } else {
+            build_rows.batches.len()
+        };
         unsafe { *self.table.build_rows.get() = build_rows };
+        // The counter starts at NUM_PARTITIONS; fold jobs join it before
+        // `jobs_injected` is set, so no worker can conclude completion early.
+        self.remaining_jobs.fetch_add(fold_jobs, Ordering::Relaxed);
+        let fold_columns: Arc<[usize]> = fold_columns.into();
+        for batch_idx in 0..fold_jobs {
+            self.injector.push(JoinBuildJob::FoldBatch(FoldBatchJob {
+                table: self.table.clone(),
+                batch_idx,
+                columns: fold_columns.clone(),
+                remaining_jobs: self.remaining_jobs.clone(),
+            }));
+        }
 
         // Pre-allocate directory and arenas.
         let dir_capacity = ((total as f64 * 1.125) as usize)
@@ -327,13 +398,14 @@ impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> JoinBuilder<K, OUTER_JOI
                 .zip(&row_bases)
                 .map(|(output, &row_base)| (row_base, std::mem::take(&mut output.tuples[i])))
                 .collect();
-            self.injector.push(JoinPartitionJob {
-                tuples,
-                table: self.table.clone(),
-                arena_offset,
-                slot_start: i * slots_per_partition,
-                remaining_jobs: self.remaining_jobs.clone(),
-            });
+            self.injector
+                .push(JoinBuildJob::Partition(JoinPartitionJob {
+                    tuples,
+                    table: self.table.clone(),
+                    arena_offset,
+                    slot_start: i * slots_per_partition,
+                    remaining_jobs: self.remaining_jobs.clone(),
+                }));
         }
         self.jobs_injected.store(true, Ordering::Relaxed);
         Ok(())
@@ -346,7 +418,7 @@ impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> Outputter<()>
     fn output(&mut self, _sender: &mut dyn Sender<()>) -> unary::Result<bool> {
         match self.injector.steal() {
             Steal::Success(job) => {
-                job.run();
+                job.run()?;
             }
             Steal::Empty => {
                 // An empty queue is not completion: a job stolen by another
@@ -356,10 +428,19 @@ impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> Outputter<()>
                     && self.remaining_jobs.load(Ordering::Acquire) == 0
                 {
                     if self
-                        .build_ready
-                        .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
+                        .finish_claimed
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
                         .is_ok()
                     {
+                        // Output views deferred behind fold jobs are built
+                        // here, by the one finishing worker, before the gate
+                        // opens: the counter's Acquire load above ordered
+                        // every fold before this.
+                        let build_rows = unsafe { &mut *self.table.build_rows.get() };
+                        if build_rows.output_batches.len() != build_rows.batches.len() {
+                            build_rows.finish_output_views(&self.build_output_indices)?;
+                        }
+                        self.build_ready.store(true, Ordering::Release);
                         worker_waker().notify();
                     }
                     return Ok(true);

@@ -15,6 +15,8 @@ use crate::memory::{MultiSlabBuffer, SlabAllocator};
 use arrow_array::RecordBatch;
 use arrow_schema::ArrowError;
 
+type ArrowResult<T> = Result<T, ArrowError>;
+
 /// Rows a stored batch holds at most.
 const ROWS_PER_BATCH: usize = crate::RECORD_BATCH_SIZE;
 /// A row id is `build_row_batch_idx << BATCH_SHIFT | row_in_batch`.
@@ -40,13 +42,17 @@ pub(crate) struct BuildRows {
 
 impl BuildRows {
     /// Merge every worker's stored rows, in the given order, into the
-    /// published whole, and prepare them for probing. No bytes move in the
-    /// merge. Alongside the rows, returns each worker's row id base: the
-    /// single `u32` added to that worker's local ids at scatter time.
+    /// published whole. No bytes move in the merge. Alongside the rows,
+    /// returns each worker's row id base (the single `u32` added to that
+    /// worker's local ids at scatter time) and the variant columns whose
+    /// physical layout differs between batches (see
+    /// [`fold_columns`](Self::fold_columns)).
+    ///
+    /// The output views are prepared separately by
+    /// [`finish_output_views`](Self::finish_output_views), after any folding.
     pub(crate) fn new<const TRACK_MATCHES: bool>(
         workers: impl IntoIterator<Item = Vec<RecordBatch>>,
-        output_indices: &[usize],
-    ) -> Result<(Self, Vec<u32>), ArrowError> {
+    ) -> (Self, Vec<u32>, Vec<usize>) {
         let mut batches = Vec::new();
         let mut row_id_bases = Vec::new();
         for worker in workers {
@@ -57,35 +63,62 @@ impl BuildRows {
             batches.len() <= MAX_BATCHES,
             "join build side exceeds the row id space"
         );
-        let output_batches: Vec<RecordBatch> = batches
-            .iter()
-            .map(|batch| batch.project(output_indices))
-            .collect::<Result<_, _>>()?;
-        let output_columns = (0..output_indices.len())
-            .map(|column| {
-                ChunkedColumn::new(
-                    output_batches
-                        .iter()
-                        .map(|batch| batch.column(column).to_data())
-                        .collect(),
-                )
-            })
-            .collect();
+        // Matches gather stored rows by row id in probe order, interleaving
+        // rows from arbitrary stored batches into one output array, so every
+        // batch must agree on each column's physical type. Only a variant
+        // column can disagree (its layout is chosen per file), and only on an
+        // actual mismatch, so a build side whose files all shred alike keeps
+        // its layout. Detection is schema-only work; the folding itself is
+        // spread over the build workers, one batch per job.
+        let fold_columns = crate::arrays::variant::mismatched_variant_columns(&batches);
         let matched = if TRACK_MATCHES {
             let mut allocator = SlabAllocator::new(false);
             allocator.create_multi_slab_buffer::<u8>(row_id_space(&batches).max(1), true)
         } else {
             MultiSlabBuffer::new(Vec::new())
         };
-        Ok((
+        (
             Self {
                 batches,
-                output_batches,
-                output_columns,
+                output_batches: Vec::new(),
+                output_columns: Vec::new(),
                 matched,
             },
             row_id_bases,
-        ))
+            fold_columns,
+        )
+    }
+
+    /// Fold `columns` of the stored batch at `batch_idx` to the canonical
+    /// variant layout, in place. Folding rewrites only column contents, so
+    /// the row ids stay valid; disjoint batch indices are safe to fold from
+    /// different workers concurrently.
+    pub(crate) fn fold_columns(&mut self, batch_idx: usize, columns: &[usize]) -> ArrowResult<()> {
+        let batch = &mut self.batches[batch_idx];
+        *batch = crate::arrays::variant::fold_batch_columns_to_canonical(batch, columns)?;
+        Ok(())
+    }
+
+    /// Build the projected views the probe phase gathers matched rows from.
+    /// Called once, after every stored batch holds its final layout (i.e.
+    /// after any [`fold_columns`](Self::fold_columns) work has finished).
+    pub(crate) fn finish_output_views(&mut self, output_indices: &[usize]) -> ArrowResult<()> {
+        self.output_batches = self
+            .batches
+            .iter()
+            .map(|batch| batch.project(output_indices))
+            .collect::<Result<_, _>>()?;
+        self.output_columns = (0..output_indices.len())
+            .map(|column| {
+                ChunkedColumn::new(
+                    self.output_batches
+                        .iter()
+                        .map(|batch| batch.column(column).to_data())
+                        .collect(),
+                )
+            })
+            .collect();
+        Ok(())
     }
 
     pub(crate) fn empty() -> Self {
