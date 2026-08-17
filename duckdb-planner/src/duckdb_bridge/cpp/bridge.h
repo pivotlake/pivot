@@ -73,6 +73,18 @@ ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
 const LogicalOperator &plan_root(const PlanHandle &plan);
 size_t rowid_column_id();
 
+// DuckDB's own name for a discriminant of each enum the Rust side mirrors (a
+// logical type id of 27 is "INTERVAL"), so a message naming one of them prints
+// the name and not a number. The first three have a DuckDB spelling meant for
+// messages; the rest are named after their enumerator. Throw for a
+// discriminant DuckDB does not know.
+rust::String logical_type_id_name(uint8_t id);
+rust::String expression_type_name(uint8_t type);
+rust::String join_type_name(uint8_t type);
+rust::String logical_operator_type_name(uint8_t type);
+rust::String limit_node_type_name(uint8_t type);
+rust::String order_type_name(uint8_t type);
+
 
 // ---- LogicalOperator: shared structure ----
 uint8_t lo_type(const LogicalOperator &op);

@@ -34,13 +34,12 @@ pub use ffi::duckdb::TableFilterType;
 
 use std::fmt;
 
-/// Give each DuckDB enum a `from_u8` decoder plus numeric `Debug`/`Display`.
-/// DuckDB defines them as `enum class : uint8_t`, so the `u8` discriminant the
-/// bridge reports round-trips exactly through a transmute, and the formatting
-/// impls just render that discriminant. `from_u8` is `pub(crate)` on purpose:
-/// only the handle layer decodes raw bytes, and callers get typed accessors
-/// rather than a way to forge an invalid enum.
-macro_rules! impl_duckdb_enum {
+/// Give each DuckDB enum a `from_u8` decoder. DuckDB defines them as
+/// `enum class : uint8_t`, so the `u8` discriminant the bridge reports
+/// round-trips exactly through a transmute. `from_u8` is `pub(crate)` on
+/// purpose: only the handle layer decodes raw bytes, and callers get typed
+/// accessors rather than a way to forge an invalid enum.
+macro_rules! impl_from_u8 {
     ($($ty:ty),+ $(,)?) => {
         $(
             impl $ty {
@@ -48,27 +47,53 @@ macro_rules! impl_duckdb_enum {
                     unsafe { std::mem::transmute::<u8, $ty>(value) }
                 }
             }
+        )+
+    };
+}
 
-            impl fmt::Debug for $ty {
+/// Render a DuckDB enum as the name DuckDB itself prints for it (`TIME`,
+/// `COMPARE_DISTINCT_FROM`, `SINGLE`, ...), read back through `$name_fn`, so
+/// a message about something the planner rejects names it instead of printing
+/// a discriminant. A discriminant DuckDB has no name for falls back to the
+/// number: formatting cannot fail, and the number still identifies the value.
+macro_rules! impl_named_format {
+    ($($ty:ty => $name_fn:ident),+ $(,)?) => {
+        $(
+            impl fmt::Display for $ty {
                 fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                    write!(f, "{}", self.clone() as u8)
+                    let discriminant = self.clone() as u8;
+                    // Fully qualified: `include_cpp!` above defines its own
+                    // `ffi` module in this one.
+                    match crate::duckdb_bridge::ffi::$name_fn(discriminant) {
+                        Ok(name) => f.write_str(&name),
+                        Err(_) => write!(f, "{discriminant}"),
+                    }
                 }
             }
 
-            impl fmt::Display for $ty {
+            impl fmt::Debug for $ty {
                 fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                    write!(f, "{}", self.clone() as u8)
+                    fmt::Display::fmt(self, f)
                 }
             }
         )+
     };
 }
 
-impl_duckdb_enum!(
+impl_from_u8!(
     LogicalOperatorType,
     ExpressionType,
     JoinType,
     LimitNodeType,
     LogicalTypeId,
     OrderType,
+);
+
+impl_named_format!(
+    LogicalTypeId => logical_type_id_name,
+    ExpressionType => expression_type_name,
+    JoinType => join_type_name,
+    LogicalOperatorType => logical_operator_type_name,
+    LimitNodeType => limit_node_type_name,
+    OrderType => order_type_name,
 );

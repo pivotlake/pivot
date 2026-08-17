@@ -106,7 +106,7 @@ impl fmt::Display for Type {
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("Unsupported logical type: {0:?}")]
+    #[error("Unsupported logical type: {0}")]
     UnsupportedLogicalType(LogicalTypeId),
     #[error("Unsupported scalar constant: {0}")]
     UnsupportedScalarConstant(ScalarValue),
@@ -426,5 +426,14 @@ mod tests {
         let result = type_from_logical(bound);
 
         assert!(matches!(result, Err(Error::UnsupportedLogicalType(_))));
+    }
+
+    #[test]
+    fn an_unsupported_type_is_reported_by_its_duckdb_name() {
+        let bound = BoundLogicalType::plain(LogicalTypeId::INTERVAL);
+
+        let message = type_from_logical(bound).unwrap_err().to_string();
+
+        assert_eq!(message, "Unsupported logical type: INTERVAL");
     }
 }
