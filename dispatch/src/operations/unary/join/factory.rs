@@ -1,3 +1,4 @@
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
@@ -11,9 +12,8 @@ use crate::api::{BuildContext, OperatorFactory};
 use crate::memory::MultiSlabBuffer;
 use crate::operations::UnaryFactory;
 use crate::operations::channels::{ChannelFactory, Sender, StealableChannelFactory};
-use crate::operations::unary::UnaryOperator;
 use crate::operations::unary::join::build::{
-    BuildWorkerOutput, JoinBuildConsumer, JoinPartitionJob, NUM_PARTITIONS,
+    BuildWorkerOutput, JoinBuildConsumer, JoinBuilder, NUM_PARTITIONS,
 };
 use crate::operations::unary::join::build_rows::BuildRows;
 use crate::operations::unary::join::directory::JoinDirectory;
@@ -21,18 +21,80 @@ use crate::operations::unary::join::keys::JoinKey;
 use crate::operations::unary::join::probe::Probe;
 use crate::operations::unary::join::{JoinCell, JoinKind, JoinSpec, JoinTable, UnmatchedScan};
 use crate::operations::unary::pipeline_breaker::PipelineBreaker;
+use crate::operations::unary::{BatchesOutputter, CollectorFactory, Normalizer, UnaryOperator};
 
 /// Creates one [`JoinBuildConsumer`] per worker, with shared state wired up.
-pub struct JoinBuildFactory<K: JoinKey, const BUILD_OUTER: bool> {
-    spec: Arc<JoinSpec>,
+pub struct JoinBuildFactory<K: JoinKey, const BUILD_OUTER: bool, O> {
+    key_columns: Vec<usize>,
     hash_state: RandomState,
-    table: JoinTable<K::Stored>,
-    injector: Arc<Injector<JoinPartitionJob<K::Stored>>>,
-    jobs_injected: Arc<AtomicBool>,
-    build_ready: Arc<AtomicBool>,
-    gather: Arc<GatherBarrier<BuildWorkerOutput<K::Stored>>>,
-    remaining_jobs: Arc<AtomicUsize>,
+    outputter: O,
+    _key: PhantomData<fn() -> K>,
 }
+
+type DirectJoinBuildFactory<K, const BUILD_OUTER: bool> =
+    JoinBuildFactory<K, BUILD_OUTER, JoinBuilder<<K as JoinKey>::Stored, BUILD_OUTER>>;
+type NormalizingJoinBuildFactory<K, const BUILD_OUTER: bool> =
+    JoinBuildFactory<K, BUILD_OUTER, Normalizer<BuildWorkerOutput<<K as JoinKey>::Stored>>>;
+type JoinBuildCollector<K, const BUILD_OUTER: bool> = CollectorFactory<
+    BuildWorkerOutput<<K as JoinKey>::Stored>,
+    JoinBuilder<<K as JoinKey>::Stored, BUILD_OUTER>,
+>;
+type JoinProbeFactories<
+    K,
+    const BUILD_OUTER: bool,
+    const STOP_AFTER_FIRST_MATCH: bool,
+    const TRACK_UNMATCHED_PROBE_ROWS: bool,
+    const DISCARD_MATCHED_PAIRS: bool,
+    const MARK: bool,
+> = Vec<
+    JoinProbeFactory<
+        K,
+        BUILD_OUTER,
+        STOP_AFTER_FIRST_MATCH,
+        TRACK_UNMATCHED_PROBE_ROWS,
+        DISCARD_MATCHED_PAIRS,
+        MARK,
+    >,
+>;
+type DirectJoinFactories<
+    K,
+    const BUILD_OUTER: bool,
+    const STOP_AFTER_FIRST_MATCH: bool,
+    const TRACK_UNMATCHED_PROBE_ROWS: bool,
+    const DISCARD_MATCHED_PAIRS: bool,
+    const MARK: bool,
+> = (
+    Vec<DirectJoinBuildFactory<K, BUILD_OUTER>>,
+    JoinProbeFactories<
+        K,
+        BUILD_OUTER,
+        STOP_AFTER_FIRST_MATCH,
+        TRACK_UNMATCHED_PROBE_ROWS,
+        DISCARD_MATCHED_PAIRS,
+        MARK,
+    >,
+    Arc<AtomicBool>,
+);
+type NormalizingJoinFactories<
+    K,
+    const BUILD_OUTER: bool,
+    const STOP_AFTER_FIRST_MATCH: bool,
+    const TRACK_UNMATCHED_PROBE_ROWS: bool,
+    const DISCARD_MATCHED_PAIRS: bool,
+    const MARK: bool,
+> = (
+    Vec<NormalizingJoinBuildFactory<K, BUILD_OUTER>>,
+    Vec<JoinBuildCollector<K, BUILD_OUTER>>,
+    JoinProbeFactories<
+        K,
+        BUILD_OUTER,
+        STOP_AFTER_FIRST_MATCH,
+        TRACK_UNMATCHED_PROBE_ROWS,
+        DISCARD_MATCHED_PAIRS,
+        MARK,
+    >,
+    Arc<AtomicBool>,
+);
 
 /// Creates one [`Probe`] per worker, all sharing the same [`JoinTable`].
 pub struct JoinProbeFactory<
@@ -70,20 +132,14 @@ pub fn create_for_workers<
 >(
     spec: JoinSpec,
     worker_count: usize,
-) -> (
-    impl IntoIterator<Item = JoinBuildFactory<K, BUILD_OUTER>>,
-    impl IntoIterator<
-        Item = JoinProbeFactory<
-            K,
-            BUILD_OUTER,
-            STOP_AFTER_FIRST_MATCH,
-            TRACK_UNMATCHED_PROBE_ROWS,
-            DISCARD_MATCHED_PAIRS,
-            MARK,
-        >,
-    >,
-    Arc<AtomicBool>,
-) {
+) -> DirectJoinFactories<
+    K,
+    BUILD_OUTER,
+    STOP_AFTER_FIRST_MATCH,
+    TRACK_UNMATCHED_PROBE_ROWS,
+    DISCARD_MATCHED_PAIRS,
+    MARK,
+> {
     debug_assert_eq!(
         BUILD_OUTER,
         matches!(
@@ -144,46 +200,104 @@ pub fn create_for_workers<
     let table_clone = table.clone();
     let hs_clone = hash_state.clone();
     let probe_gate = build_ready.clone();
-    let build_spec = spec.clone();
-
-    let build_factories = (0..worker_count).map(move |_| JoinBuildFactory {
-        spec: build_spec.clone(),
-        hash_state: hash_state.clone(),
-        table: table.clone(),
-        injector: injector.clone(),
-        jobs_injected: jobs_injected.clone(),
-        build_ready: build_ready.clone(),
-        gather: gather.clone(),
-        remaining_jobs: remaining_jobs.clone(),
-    });
+    let build_factories = (0..worker_count)
+        .map(|_| {
+            let outputter = JoinBuilder::new(
+                table.clone(),
+                injector.clone(),
+                jobs_injected.clone(),
+                build_ready.clone(),
+                remaining_jobs.clone(),
+                gather.clone(),
+                spec.build_output_indices.clone(),
+            );
+            JoinBuildFactory {
+                key_columns: spec.build_key_indices.clone(),
+                hash_state: hash_state.clone(),
+                outputter,
+                _key: PhantomData,
+            }
+        })
+        .collect::<Vec<_>>();
 
     let unmatched = Arc::new(UnmatchedScan::new(worker_count));
-    let probe_factories = (0..worker_count).map(move |_| JoinProbeFactory {
-        table: table_clone.clone(),
-        hash_state: hs_clone.clone(),
-        spec: spec.clone(),
-        unmatched: unmatched.clone(),
-    });
+    let probe_factories = (0..worker_count)
+        .map(move |_| JoinProbeFactory {
+            table: table_clone.clone(),
+            hash_state: hs_clone.clone(),
+            spec: spec.clone(),
+            unmatched: unmatched.clone(),
+        })
+        .collect();
 
     (build_factories, probe_factories, probe_gate)
 }
 
-impl<K: JoinKey, const BUILD_OUTER: bool> UnaryFactory<RecordBatch, ()>
-    for JoinBuildFactory<K, BUILD_OUTER>
+/// The two-breaker build path used when the build schema contains variants.
+/// The first breaker pairs [`JoinBuildConsumer`] with [`Normalizer`]; the
+/// second funnels the normalized groups to one [`CollectorFactory`] whose
+/// outputter is the ordinary [`JoinBuilder`].
+pub(crate) fn create_normalizing_for_workers<
+    K: JoinKey,
+    const BUILD_OUTER: bool,
+    const STOP_AFTER_FIRST_MATCH: bool,
+    const TRACK_UNMATCHED_PROBE_ROWS: bool,
+    const DISCARD_MATCHED_PAIRS: bool,
+    const MARK: bool,
+>(
+    spec: JoinSpec,
+    worker_count: usize,
+    collector_worker: usize,
+) -> NormalizingJoinFactories<
+    K,
+    BUILD_OUTER,
+    STOP_AFTER_FIRST_MATCH,
+    TRACK_UNMATCHED_PROBE_ROWS,
+    DISCARD_MATCHED_PAIRS,
+    MARK,
+> {
+    let (build_factories, probe_factories, build_ready) = create_for_workers::<
+        K,
+        BUILD_OUTER,
+        STOP_AFTER_FIRST_MATCH,
+        TRACK_UNMATCHED_PROBE_ROWS,
+        DISCARD_MATCHED_PAIRS,
+        MARK,
+    >(spec, worker_count);
+    let normalizers = Normalizer::create_for_workers(worker_count);
+    let mut normalized_builds = Vec::with_capacity(worker_count);
+    let mut collectors = Vec::with_capacity(worker_count);
+    for (worker, (build, normalizer)) in build_factories.into_iter().zip(normalizers).enumerate() {
+        let JoinBuildFactory {
+            key_columns,
+            hash_state,
+            outputter,
+            _key,
+        } = build;
+        normalized_builds.push(JoinBuildFactory {
+            key_columns,
+            hash_state,
+            outputter: normalizer,
+            _key,
+        });
+        collectors.push(CollectorFactory::new(outputter, worker == collector_worker));
+    }
+    (normalized_builds, collectors, probe_factories, build_ready)
+}
+
+impl<K: JoinKey, const BUILD_OUTER: bool, O, Out> UnaryFactory<RecordBatch, Out>
+    for JoinBuildFactory<K, BUILD_OUTER, O>
+where
+    O: BatchesOutputter<BuildWorkerOutput<K::Stored>, Out> + Send + 'static,
+    Out: 'static,
 {
-    type Unary = PipelineBreaker<RecordBatch, (), JoinBuildConsumer<K, BUILD_OUTER>>;
+    type Unary = PipelineBreaker<RecordBatch, Out, JoinBuildConsumer<K, BUILD_OUTER, O>>;
 
     fn build_unary(self) -> Self::Unary {
         PipelineBreaker::Consuming(JoinBuildConsumer::new(
-            self.spec.build_key_indices.clone(),
+            self.key_columns,
             self.hash_state,
-            self.gather,
-            self.table,
-            self.injector,
-            self.jobs_injected,
-            self.build_ready,
-            self.remaining_jobs,
-            self.spec.build_output_indices.clone(),
+            self.outputter,
         ))
     }
 }
@@ -239,26 +353,21 @@ impl Sender<()> for DiscardSender {
 /// Builds the probe result path and the disconnected build path into one
 /// per-worker operator graph.
 ///
-/// Generic over the build channel so each join flavor picks its delivery: the
-/// hash join steals build batches across workers, the range join funnels the
-/// sorted chunks to one worker to keep their order.
-pub struct JoinRecordBatchOperatorFactory<BF, PF, BC = StealableChannelFactory<RecordBatch>> {
+/// The build side is already assembled as an erased operator graph factory:
+/// hash joins choose either their direct breaker or the two-breaker normalized
+/// composition, while range joins retain their ordered single-worker build.
+pub struct JoinRecordBatchOperatorFactory<PF> {
     pub probe_head: Box<dyn OperatorFactory<RecordBatch>>,
-    pub build_head: Box<dyn OperatorFactory<RecordBatch>>,
-    pub build_factory: BF,
+    pub build_graph: Box<dyn OperatorFactory<()>>,
     pub probe_factory: PF,
-    pub build_channel_factory: BC,
     pub probe_channel_factory: StealableChannelFactory<RecordBatch>,
-    pub build_siblings_left: Arc<AtomicUsize>,
     pub probe_siblings_left: Arc<AtomicUsize>,
     pub build_ready: Arc<AtomicBool>,
 }
 
-impl<BF, PF, BC> OperatorFactory<RecordBatch> for JoinRecordBatchOperatorFactory<BF, PF, BC>
+impl<PF> OperatorFactory<RecordBatch> for JoinRecordBatchOperatorFactory<PF>
 where
-    BF: UnaryFactory<RecordBatch, ()>,
     PF: UnaryFactory<RecordBatch, RecordBatch>,
-    BC: ChannelFactory<RecordBatch>,
 {
     fn build(
         self: Box<Self>,
@@ -277,16 +386,7 @@ where
                 self.probe_siblings_left,
             )));
 
-        let (build_tx, build_rx) = self.build_channel_factory.build();
-        let build_graph = self
-            .build_head
-            .build(Box::new(build_tx), context)
-            .with(Box::new(UnaryOperator::new(
-                self.build_factory.build_unary(),
-                build_rx,
-                Box::new(DiscardSender),
-                self.build_siblings_left,
-            )));
+        let build_graph = self.build_graph.build(Box::new(DiscardSender), context);
 
         probe_graph.with_side_graph(build_graph)
     }

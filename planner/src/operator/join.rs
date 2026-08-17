@@ -151,6 +151,7 @@ impl Join {
         &self,
         probe: RecordBatchOperatorSpec,
         build: RecordBatchOperatorSpec,
+        normalize_build_variants: bool,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         // Both sides' output fields, named by position: an outer join
         // synthesizes NULL values for its non-preserved side, so field names
@@ -192,7 +193,12 @@ impl Join {
                 probe_fields,
                 build_fields,
             };
-            return Ok(probe.range_join(build, &physical_arrow_type(&self.key_types[0]), spec));
+            let key_type = physical_arrow_type(&self.key_types[0]);
+            return Ok(if normalize_build_variants {
+                probe.range_join_normalizing_build(build, &key_type, spec)
+            } else {
+                probe.range_join(build, &key_type, spec)
+            });
         }
         let kind = match &self.kind {
             JoinKind::Inner => DispatchJoinKind::Inner,
@@ -216,7 +222,11 @@ impl Join {
             residual_filters: self.compile_residual_filters()?,
         };
         let key_types: Vec<_> = self.key_types.iter().map(physical_arrow_type).collect();
-        Ok(probe.join(build, &key_types, spec))
+        Ok(if normalize_build_variants {
+            probe.join_normalizing_build(build, &key_types, spec)
+        } else {
+            probe.join(build, &key_types, spec)
+        })
     }
 
     /// Compile the residual conditions into the dispatch join's pair

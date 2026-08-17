@@ -76,6 +76,7 @@ use crate::memory::MultiSlabBuffer;
 use crate::operations::unary::join::build_rows::BuildRows;
 use crate::operations::unary::join::directory::JoinDirectory;
 pub(crate) use factory::create_for_workers as create_join_factories;
+pub(crate) use factory::create_normalizing_for_workers;
 
 /// Which rows a join emits.
 #[derive(Debug, Clone)]

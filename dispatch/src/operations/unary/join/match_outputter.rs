@@ -18,9 +18,24 @@ use crate::operations::unary::join::residual_filter::ResidualFilter;
 /// Owns the buffered matches and accumulators that produce the join's output.
 /// Probe and build columns accumulate separately because their rows come from
 /// different sources; every emitted batch splices them under one schema.
+///
+/// The accumulators start from the spec's declared fields but follow the
+/// *actual* layout of what they accumulate, because a variant column's
+/// physical struct type is chosen per file and only known from the data:
+/// [`set_build_schema_from_rows`](Self::set_build_schema_from_rows) sets the
+/// build side's physical types from the published rows once, and
+/// [`switch_probe_schema`](Self::switch_probe_schema) switches the probe side
+/// whenever the probe stream crosses into a differently-laid-out file. The
+/// switch flushes rows buffered under the old schema first. Appending a batch
+/// into an accumulator with different physical types would silently drop
+/// fields for which the accumulator has no slot, so both sides must have the
+/// source's types before any append.
 pub(super) struct ProbeMatchOutputter {
-    /// The probe columns listed in the output, then the build columns.
+    /// The probe accumulator's fields, then the build accumulator's, then a
+    /// mark join's marker. Refreshed whenever either side's schema changes.
     output_schema: SchemaRef,
+    /// Whether the output carries a mark join's trailing marker column.
+    mark: bool,
     probe: BatchAccumulator,
     build: BatchAccumulator,
     allocator: SlabAllocator,
@@ -80,6 +95,7 @@ impl ProbeMatchOutputter {
         }
         Self {
             output_schema: Arc::new(Schema::new(fields)),
+            mark,
             probe: BatchAccumulator::retaining_source_buffers(
                 Arc::new(Schema::new(probe_fields.to_vec())),
                 &mut allocator,
@@ -109,6 +125,75 @@ impl ProbeMatchOutputter {
 
     pub(super) fn has_buffered_matches(&self) -> bool {
         !self.probe.is_empty()
+    }
+
+    /// Set the build accumulator's physical types from the published build
+    /// rows. A no-op once they match (or for an empty build side); called before
+    /// probing touches the accumulator, which is therefore still empty when it
+    /// is replaced.
+    pub(super) fn set_build_schema_from_rows(&mut self) {
+        let build_rows = unsafe { &*self.build_rows.get() };
+        let Some(first) = build_rows.output_batches.first() else {
+            return;
+        };
+        if schemas_have_same_types(self.build.schema(), first.schema_ref()) {
+            return;
+        }
+        debug_assert!(
+            self.build.is_empty(),
+            "the build schema settles before any build row accumulates"
+        );
+        let schema = schema_with_types_from(self.build.schema(), first.schema_ref());
+        self.build = BatchAccumulator::retaining_source_buffers(schema, &mut self.allocator);
+        self.refresh_output_schema();
+    }
+
+    /// Switch the probe-side accumulators to `source_schema`, the projected
+    /// schema of the batch about to be probed. A no-op while its physical types
+    /// are unchanged, which is every batch until the probe stream crosses into
+    /// a differently-laid-out file; on a change, rows buffered under the old
+    /// schema are emitted first (matched pairs flush both sides together, since
+    /// their rows are paired).
+    pub(super) fn switch_probe_schema(
+        &mut self,
+        source_schema: &SchemaRef,
+        sender: &mut dyn Sender<RecordBatch>,
+    ) -> unary::Result<()> {
+        if schemas_have_same_types(self.probe.schema(), source_schema) {
+            return Ok(());
+        }
+        if !self.probe.is_empty() {
+            self.emit(sender)?;
+        }
+        let schema = schema_with_types_from(self.probe.schema(), source_schema);
+        self.probe =
+            BatchAccumulator::retaining_source_buffers(schema.clone(), &mut self.allocator);
+        if self.unmatched_probe.is_some() {
+            self.emit_unmatched_probe_rows(sender)?;
+            self.unmatched_probe = Some(BatchAccumulator::retaining_source_buffers(
+                schema,
+                &mut self.allocator,
+            ));
+        }
+        self.refresh_output_schema();
+        Ok(())
+    }
+
+    /// Rebuild [`output_schema`](Self::output_schema) from the accumulators'
+    /// current layouts.
+    fn refresh_output_schema(&mut self) {
+        let mut fields: Vec<Field> = self
+            .probe
+            .schema()
+            .fields()
+            .iter()
+            .chain(self.build.schema().fields())
+            .map(|field| field.as_ref().clone())
+            .collect();
+        if self.mark {
+            fields.push(Field::new("mark", arrow_schema::DataType::Boolean, true));
+        }
+        self.output_schema = Arc::new(Schema::new(fields));
     }
 
     /// Start miss tracking for the next probed batch of `rows` rows.
@@ -473,4 +558,33 @@ impl ProbeMatchOutputter {
         }
         Ok(())
     }
+}
+
+/// Whether `current` and `source` have the same field data types. Names,
+/// nullability, and metadata deliberately do not participate: the accumulator
+/// retains those from the join's declared schema (an outer join declares
+/// columns nullable for padding even when the stored data has no nulls).
+fn schemas_have_same_types(current: &SchemaRef, source: &SchemaRef) -> bool {
+    current
+        .fields()
+        .iter()
+        .zip(source.fields())
+        .all(|(current, source)| current.data_type() == source.data_type())
+}
+
+/// Returns `declared` with each field's data type replaced by `source`'s while
+/// preserving the declared name, nullability, and metadata.
+fn schema_with_types_from(declared: &SchemaRef, source: &SchemaRef) -> SchemaRef {
+    let fields: Vec<Field> = declared
+        .fields()
+        .iter()
+        .zip(source.fields())
+        .map(|(declared, source)| {
+            declared
+                .as_ref()
+                .clone()
+                .with_data_type(source.data_type().clone())
+        })
+        .collect();
+    Arc::new(Schema::new(fields))
 }

@@ -5,6 +5,7 @@ use crate::operations::unary::join::JoinTable;
 use crate::operations::unary::join::build_rows::{self, BuildRows};
 use crate::operations::unary::join::directory::JoinDirectory;
 use crate::operations::unary::join::keys::{JoinKey, combined_key_validity};
+use crate::operations::unary::{BatchesOutputter, InitializableOutputter, NormalizationBatches};
 use crate::operations::{Consumer, Outputter, unary};
 use crate::waker::worker_waker;
 use ahash::RandomState;
@@ -40,7 +41,19 @@ pub(crate) struct BuildWorkerOutput<K: Copy> {
     saw_null_key: bool,
 }
 
-pub struct JoinBuildConsumer<K: JoinKey, const BUILD_OUTER: bool> {
+impl<K: Copy + Send + 'static> NormalizationBatches for BuildWorkerOutput<K> {
+    fn visit_batches_mut(&mut self, visit: &mut dyn FnMut(&mut RecordBatch)) {
+        for batch in &mut self.build_row_batches {
+            visit(batch);
+        }
+    }
+}
+
+pub struct JoinBuildConsumer<
+    K: JoinKey,
+    const BUILD_OUTER: bool,
+    O = JoinBuilder<<K as JoinKey>::Stored, BUILD_OUTER>,
+> {
     key_columns: Vec<usize>,
     hash_state: RandomState,
     values: PartitionBuffers<K::Stored>,
@@ -49,43 +62,26 @@ pub struct JoinBuildConsumer<K: JoinKey, const BUILD_OUTER: bool> {
     /// the arrays the upstream operator produced.
     build_row_batches: Vec<RecordBatch>,
     slab_allocator: SlabAllocator,
-    gather: Arc<GatherBarrier<BuildWorkerOutput<K::Stored>>>,
-    outputter: JoinBuilder<K::Stored, BUILD_OUTER>,
+    outputter: O,
     /// Whether this worker saw a null-keyed build row. Published with its
     /// other build output and combined by the final gather arrival.
     saw_null_key: bool,
 }
 
-unsafe impl<K: JoinKey, const BUILD_OUTER: bool> Send for JoinBuildConsumer<K, BUILD_OUTER> {}
+unsafe impl<K: JoinKey, const BUILD_OUTER: bool, O: Send> Send
+    for JoinBuildConsumer<K, BUILD_OUTER, O>
+{
+}
 
-impl<K: JoinKey, const BUILD_OUTER: bool> JoinBuildConsumer<K, BUILD_OUTER> {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        key_columns: Vec<usize>,
-        hash_state: RandomState,
-        gather: Arc<GatherBarrier<BuildWorkerOutput<K::Stored>>>,
-        table: JoinTable<K::Stored>,
-        injector: Arc<Injector<JoinPartitionJob<K::Stored>>>,
-        jobs_injected: Arc<AtomicBool>,
-        build_ready: Arc<AtomicBool>,
-        remaining_jobs: Arc<AtomicUsize>,
-        build_output_indices: Vec<usize>,
-    ) -> Self {
+impl<K: JoinKey, const BUILD_OUTER: bool, O> JoinBuildConsumer<K, BUILD_OUTER, O> {
+    pub(crate) fn new(key_columns: Vec<usize>, hash_state: RandomState, outputter: O) -> Self {
         Self {
             key_columns,
             hash_state,
             values: (0..NUM_PARTITIONS).map(|_| SlabVec::new()).collect(),
             build_row_batches: Vec::new(),
             slab_allocator: SlabAllocator::new(false),
-            gather,
-            outputter: JoinBuilder {
-                table,
-                injector,
-                jobs_injected,
-                build_ready,
-                remaining_jobs,
-                build_output_indices,
-            },
+            outputter,
             saw_null_key: false,
         }
     }
@@ -123,12 +119,14 @@ pub(crate) fn split_null_keys(
     (kept, (dropped.num_rows() > 0).then_some(dropped))
 }
 
-impl<K: JoinKey, const BUILD_OUTER: bool> Consumer<RecordBatch, ()>
-    for JoinBuildConsumer<K, BUILD_OUTER>
+impl<K: JoinKey, const BUILD_OUTER: bool, O, Out> Consumer<RecordBatch, Out>
+    for JoinBuildConsumer<K, BUILD_OUTER, O>
+where
+    O: BatchesOutputter<BuildWorkerOutput<K::Stored>, Out>,
 {
-    type Outputter = JoinBuilder<K::Stored, BUILD_OUTER>;
+    type Outputter = O;
 
-    fn consume(&mut self, batch: RecordBatch, _sender: &mut dyn Sender<()>) -> unary::Result<()> {
+    fn consume(&mut self, batch: RecordBatch, _sender: &mut dyn Sender<Out>) -> unary::Result<()> {
         debug!("Consuming build");
         for (first_row_id, stored) in build_rows::adopt(&mut self.build_row_batches, batch) {
             let reader = K::make_reader(&stored, &self.key_columns, &self.hash_state);
@@ -164,28 +162,26 @@ impl<K: JoinKey, const BUILD_OUTER: bool> Consumer<RecordBatch, ()>
             build_row_batches: self.build_row_batches,
             saw_null_key: self.saw_null_key,
         };
-        let gather = self.gather.clone();
-        if let Some(result) = gather.arrive(output, |worker_outputs| {
-            self.outputter.initialize(worker_outputs)
-        }) {
-            result?;
-        }
+        self.outputter.accept(output)?;
         Ok(Some(self.outputter))
     }
 }
 
 pub struct JoinBuilder<K: Copy + Send, const BUILD_OUTER: bool> {
     table: JoinTable<K>,
-    injector: Arc<Injector<JoinPartitionJob<K>>>,
+    injector: Arc<Injector<JoinBuildJob<K>>>,
     jobs_injected: Arc<AtomicBool>,
     build_ready: Arc<AtomicBool>,
     remaining_jobs: Arc<AtomicUsize>,
+    gather: Arc<GatherBarrier<BuildWorkerOutput<K>>>,
     build_output_indices: Vec<usize>,
 }
 
 unsafe impl<K: Copy + Send, const BUILD_OUTER: bool> Send for JoinBuilder<K, BUILD_OUTER> {}
 
-pub struct JoinPartitionJob<K: Copy + Send> {
+/// One unit of the parallel table-build phase, stolen and run by any build
+/// worker between the gather barrier and the `build_ready` gate.
+pub struct JoinBuildJob<K: Copy + Send> {
     /// This partition's tuples, one entry per build worker, paired with that
     /// worker's row id base (added to each tuple's local row id).
     tuples: Vec<(u32, SlabVec<BuildTuple<K>>)>,
@@ -196,9 +192,9 @@ pub struct JoinPartitionJob<K: Copy + Send> {
     remaining_jobs: Arc<AtomicUsize>,
 }
 
-unsafe impl<K: Copy + Send> Send for JoinPartitionJob<K> {}
+unsafe impl<K: Copy + Send> Send for JoinBuildJob<K> {}
 
-impl<K: Copy + Send> JoinPartitionJob<K> {
+impl<K: Copy + Send> JoinBuildJob<K> {
     fn run(self) {
         debug!("Running partition job");
         let directory = unsafe { &*self.table.directory.get() };
@@ -262,9 +258,33 @@ impl<K: Copy + Send> JoinPartitionJob<K> {
 }
 
 impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> JoinBuilder<K, OUTER_JOIN_BUILD_SIDE> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        table: JoinTable<K>,
+        injector: Arc<Injector<JoinBuildJob<K>>>,
+        jobs_injected: Arc<AtomicBool>,
+        build_ready: Arc<AtomicBool>,
+        remaining_jobs: Arc<AtomicUsize>,
+        gather: Arc<GatherBarrier<BuildWorkerOutput<K>>>,
+        build_output_indices: Vec<usize>,
+    ) -> Self {
+        Self {
+            table,
+            injector,
+            jobs_injected,
+            build_ready,
+            remaining_jobs,
+            gather,
+            build_output_indices,
+        }
+    }
+
     /// Combine the gathered worker outputs, initialize the shared table, and
     /// publish its partition jobs. Called only by the final gather arrival.
-    fn initialize(&mut self, mut worker_outputs: Vec<BuildWorkerOutput<K>>) -> unary::Result<()> {
+    fn initialize_groups(
+        &mut self,
+        mut worker_outputs: Vec<BuildWorkerOutput<K>>,
+    ) -> unary::Result<()> {
         let build_saw_null_key = worker_outputs.iter().any(|output| output.saw_null_key);
         unsafe { *self.table.build_saw_null_key.get() = build_saw_null_key };
 
@@ -327,7 +347,7 @@ impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> JoinBuilder<K, OUTER_JOI
                 .zip(&row_bases)
                 .map(|(output, &row_base)| (row_base, std::mem::take(&mut output.tuples[i])))
                 .collect();
-            self.injector.push(JoinPartitionJob {
+            self.injector.push(JoinBuildJob {
                 tuples,
                 table: self.table.clone(),
                 arena_offset,
@@ -337,6 +357,26 @@ impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> JoinBuilder<K, OUTER_JOI
         }
         self.jobs_injected.store(true, Ordering::Relaxed);
         Ok(())
+    }
+}
+
+impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> BatchesOutputter<BuildWorkerOutput<K>, ()>
+    for JoinBuilder<K, OUTER_JOIN_BUILD_SIDE>
+{
+    fn accept(&mut self, group: BuildWorkerOutput<K>) -> unary::Result<()> {
+        let gather = self.gather.clone();
+        if let Some(result) = gather.arrive(group, |groups| self.initialize_groups(groups)) {
+            result?;
+        }
+        Ok(())
+    }
+}
+
+impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool>
+    InitializableOutputter<BuildWorkerOutput<K>, ()> for JoinBuilder<K, OUTER_JOIN_BUILD_SIDE>
+{
+    fn initialize(&mut self, groups: Vec<BuildWorkerOutput<K>>) -> unary::Result<()> {
+        self.initialize_groups(groups)
     }
 }
 

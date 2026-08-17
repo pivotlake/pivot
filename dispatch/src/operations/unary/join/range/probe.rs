@@ -62,6 +62,10 @@ where
             return Ok(());
         }
 
+        // Matched probe rows accumulate across input batches under one output
+        // schema, so a variant column's per-file layouts must agree first.
+        let probe_batch = crate::arrays::variant::unshred_batch_variants(probe_batch)
+            .map_err(unary::Error::from)?;
         let probe_batch = filter_null_keys(probe_batch, &[self.spec.probe_key_index]);
         if probe_batch.num_rows() == 0 {
             return Ok(());

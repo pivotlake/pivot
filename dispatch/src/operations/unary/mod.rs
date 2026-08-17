@@ -86,17 +86,23 @@ pub use default_unary_factory::DefaultUnaryFactory;
 mod copy_out;
 mod join;
 mod limit;
+mod normalizer;
 mod order_by;
 mod order_by_limit;
 
 pub(crate) use copy_out::copy_out;
 pub(crate) use join::create_join_factories;
+pub(crate) use join::create_normalizing_for_workers as create_normalizing_join_factories;
 pub(crate) use join::create_range_join_factories;
 pub use join::{
     DynamicRowKey, JoinKey, JoinKind, JoinRecordBatchOperatorFactory, JoinResidualFn,
     JoinResidualSpec, JoinSpec, PackedKey, RangeCompare, RangeJoinSpec, SingleColumnKey,
 };
 pub use limit::LimitFactory;
+pub(crate) use normalizer::{
+    BatchesOutputter, CollectorFactory, InitializableOutputter, NormalizationBatches, Normalizer,
+};
+pub(crate) use order_by::create_normalizing_for_workers as create_normalizing_order_by_factories;
 pub use order_by::{
     KWayMergePlan, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput, OrderByFactory,
     batch_sort_indices,

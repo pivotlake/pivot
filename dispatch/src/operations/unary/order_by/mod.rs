@@ -31,6 +31,9 @@ use crate::operations::unary;
 use crate::operations::unary::factory::UnaryFactory;
 use crate::operations::unary::order_by_limit::OrderBy;
 use crate::operations::unary::pipeline_breaker::{Consumer, Outputter, PipelineBreaker};
+use crate::operations::unary::{
+    BatchesOutputter, CollectorFactory, InitializableOutputter, NormalizationBatches, Normalizer,
+};
 use crate::waker::waker_set;
 
 use batch_sort::{batch_arrives_sorted, sorted_row_indices};
@@ -55,7 +58,7 @@ pub fn batch_sort_indices(
 
 /// A maximal stretch of rows already in key order, held as the batch-sized
 /// chunks in which it arrived.
-struct SortedRun {
+pub(crate) struct SortedRun {
     chunks: Vec<RecordBatch>,
 }
 
@@ -81,8 +84,23 @@ impl SortedRun {
     }
 }
 
-/// Runs produced by one worker during the consume phase.
-type WorkerRuns = Vec<SortedRun>;
+/// Runs and ownership context produced by one worker during the consume phase.
+pub(crate) struct WorkerRuns {
+    runs: Vec<SortedRun>,
+    node_id: usize,
+    local_worker_id: usize,
+    allocator: Option<SlabAllocator>,
+}
+
+impl NormalizationBatches for WorkerRuns {
+    fn visit_batches_mut(&mut self, visit: &mut dyn FnMut(&mut RecordBatch)) {
+        for run in &mut self.runs {
+            for batch in &mut run.chunks {
+                visit(batch);
+            }
+        }
+    }
+}
 
 /// Coordination shared by every worker participating in one ORDER BY.
 struct SharedMergeState {
@@ -122,7 +140,7 @@ impl SharedMergeState {
     ) -> unary::Result<()> {
         let runs = gathered_by_worker
             .into_iter()
-            .flatten()
+            .flat_map(|worker| worker.runs)
             .map(|run| MergeRun::new(run.into_chunks(), node_id))
             .collect();
         let plan = KWayMergePlan::try_new(self.order_by.clone(), runs, self.topology.node_count)?;
@@ -134,13 +152,18 @@ impl SharedMergeState {
             KWayMergePlan::Empty => self.complete_level(level, MergedOutput::empty()),
             KWayMergePlan::Identity(output) => self.complete_level(level, output),
             KWayMergePlan::Parallel(tasks) => {
-                for merge in tasks {
-                    let node_id = merge.node_id();
-                    self.tasks_by_node[node_id].push(MergeTask { level, merge });
-                    waker_set().notify_one_near(node_id);
-                }
+                self.enqueue(level, tasks);
                 Ok(())
             }
+        }
+    }
+
+    /// Push one level's tasks onto their nodes' deques and wake workers there.
+    fn enqueue(&self, level: MergeLevel, tasks: Vec<KWayMergeTask>) {
+        for merge in tasks {
+            let node_id = merge.node_id();
+            self.tasks_by_node[node_id].push(MergeTask { level, merge });
+            waker_set().notify_one_near(node_id);
         }
     }
 
@@ -207,14 +230,18 @@ impl SharedMergeState {
 }
 
 /// Builds one worker's [`OrderBySorter`].
-pub struct OrderByFactory {
+pub struct OrderByFactory<O = RunMerger> {
     order_by: Arc<[OrderBy]>,
-    shared: Arc<SharedMergeState>,
     node_id: usize,
     local_worker_id: usize,
+    outputter: O,
 }
 
-impl OrderByFactory {
+type NormalizingOrderByFactory = OrderByFactory<Normalizer<WorkerRuns>>;
+type OrderByCollectorFactory = CollectorFactory<WorkerRuns, RunMerger>;
+type NormalizingOrderByFactories = (Vec<NormalizingOrderByFactory>, Vec<OrderByCollectorFactory>);
+
+impl OrderByFactory<RunMerger> {
     /// Creates one factory per worker with shared merge coordination.
     pub fn create_for_workers(order_by: Vec<OrderBy>, topology: Topology) -> Vec<OrderByFactory> {
         let order_by: Arc<[OrderBy]> = order_by.into();
@@ -232,37 +259,78 @@ impl OrderByFactory {
             output_claimed: AtomicBool::new(false),
         });
         (0..topology.total_workers())
-            .map(|worker_id| OrderByFactory {
-                order_by: order_by.clone(),
-                shared: shared.clone(),
-                node_id: topology.node_of_worker(worker_id),
-                local_worker_id: topology.local_index_of_worker(worker_id),
+            .map(|worker_id| {
+                let node_id = topology.node_of_worker(worker_id);
+                let local_worker_id = topology.local_index_of_worker(worker_id);
+                OrderByFactory {
+                    order_by: order_by.clone(),
+                    node_id,
+                    local_worker_id,
+                    outputter: RunMerger {
+                        shared: shared.clone(),
+                        node_id,
+                        allocator: None,
+                    },
+                }
             })
             .collect()
     }
 }
 
-impl UnaryFactory<RecordBatch, RecordBatch> for OrderByFactory {
-    type Unary = PipelineBreaker<RecordBatch, RecordBatch, OrderBySorter>;
+/// Build the two-breaker ORDER BY composition used for variant-bearing input.
+/// The sorter first outputs through [`Normalizer`]; a single collector then
+/// initializes the ordinary shared [`RunMerger`] outputters.
+pub(crate) fn create_normalizing_for_workers(
+    order_by: Vec<OrderBy>,
+    topology: Topology,
+    collector_worker: usize,
+) -> NormalizingOrderByFactories {
+    let direct = OrderByFactory::create_for_workers(order_by, topology);
+    let normalizers = Normalizer::create_for_workers(topology.total_workers());
+    let mut sorters = Vec::with_capacity(topology.total_workers());
+    let mut collectors = Vec::with_capacity(topology.total_workers());
+    for (worker, (factory, normalizer)) in direct.into_iter().zip(normalizers).enumerate() {
+        let OrderByFactory {
+            order_by,
+            node_id,
+            local_worker_id,
+            outputter,
+        } = factory;
+        sorters.push(OrderByFactory {
+            order_by,
+            node_id,
+            local_worker_id,
+            outputter: normalizer,
+        });
+        collectors.push(CollectorFactory::new(outputter, worker == collector_worker));
+    }
+    (sorters, collectors)
+}
+
+impl<O, Out> UnaryFactory<RecordBatch, Out> for OrderByFactory<O>
+where
+    O: BatchesOutputter<WorkerRuns, Out> + Send + 'static,
+    Out: 'static,
+{
+    type Unary = PipelineBreaker<RecordBatch, Out, OrderBySorter<O>>;
 
     fn build_unary(self) -> Self::Unary {
         PipelineBreaker::Consuming(OrderBySorter {
             order_by: self.order_by,
-            shared: self.shared,
             node_id: self.node_id,
             local_worker_id: self.local_worker_id,
             open_run: None,
             completed_runs: Vec::new(),
             allocator: None,
+            outputter: self.outputter,
         })
     }
 }
 
 /// Sorts batches received by one worker and combines adjacent ordered batches
 /// into runs.
-pub struct OrderBySorter {
+pub struct OrderBySorter<O = RunMerger> {
     order_by: Arc<[OrderBy]>,
-    shared: Arc<SharedMergeState>,
     node_id: usize,
     local_worker_id: usize,
     /// Most recent run, retained separately so the next batch can extend it.
@@ -271,9 +339,10 @@ pub struct OrderBySorter {
     /// Ring memory the sorted copies of unsorted batches land in. Taken on
     /// first use, so a worker whose batches all arrive sorted holds none.
     allocator: Option<SlabAllocator>,
+    outputter: O,
 }
 
-impl OrderBySorter {
+impl<O> OrderBySorter<O> {
     /// Returns the input unchanged when it is already ordered; otherwise
     /// returns a reordered batch backed by ring memory.
     fn sort_batch(&mut self, batch: RecordBatch) -> unary::Result<RecordBatch> {
@@ -315,14 +384,13 @@ impl OrderBySorter {
     }
 }
 
-impl Consumer<RecordBatch, RecordBatch> for OrderBySorter {
-    type Outputter = RunMerger;
+impl<O, Out> Consumer<RecordBatch, Out> for OrderBySorter<O>
+where
+    O: BatchesOutputter<WorkerRuns, Out>,
+{
+    type Outputter = O;
 
-    fn consume(
-        &mut self,
-        batch: RecordBatch,
-        _sender: &mut dyn Sender<RecordBatch>,
-    ) -> unary::Result<()> {
+    fn consume(&mut self, batch: RecordBatch, _sender: &mut dyn Sender<Out>) -> unary::Result<()> {
         if batch.num_rows() == 0 {
             return Ok(());
         }
@@ -343,19 +411,14 @@ impl Consumer<RecordBatch, RecordBatch> for OrderBySorter {
 
     fn into_outputter(mut self) -> unary::Result<Option<Self::Outputter>> {
         self.completed_runs.extend(self.open_run.take());
-        let allocator = self.allocator.take();
-        if let Some(result) = self.shared.node_gathers[self.node_id].arrive_at(
-            self.local_worker_id,
-            std::mem::take(&mut self.completed_runs),
-            |gathered| self.shared.start_local_merge(self.node_id, gathered),
-        ) {
-            result?;
-        }
-        Ok(Some(RunMerger {
-            shared: self.shared,
+        let group = WorkerRuns {
+            runs: std::mem::take(&mut self.completed_runs),
             node_id: self.node_id,
-            allocator: allocator.unwrap_or_else(|| SlabAllocator::new(false)),
-        }))
+            local_worker_id: self.local_worker_id,
+            allocator: self.allocator.take(),
+        };
+        self.outputter.accept(group)?;
+        Ok(Some(self.outputter))
     }
 }
 
@@ -364,13 +427,55 @@ impl Consumer<RecordBatch, RecordBatch> for OrderBySorter {
 pub struct RunMerger {
     shared: Arc<SharedMergeState>,
     node_id: usize,
-    allocator: SlabAllocator,
+    allocator: Option<SlabAllocator>,
+}
+
+impl BatchesOutputter<WorkerRuns, RecordBatch> for RunMerger {
+    fn accept(&mut self, mut group: WorkerRuns) -> unary::Result<()> {
+        debug_assert_eq!(group.node_id, self.node_id);
+        self.allocator = group.allocator.take();
+        let shared = self.shared.clone();
+        if let Some(result) = self.shared.node_gathers[group.node_id].arrive_at(
+            group.local_worker_id,
+            group,
+            |groups| shared.start_local_merge(self.node_id, groups),
+        ) {
+            result?;
+        }
+        Ok(())
+    }
+}
+
+impl InitializableOutputter<WorkerRuns, RecordBatch> for RunMerger {
+    fn initialize(&mut self, groups: Vec<WorkerRuns>) -> unary::Result<()> {
+        let mut by_node: Vec<Vec<WorkerRuns>> = (0..self.shared.topology.node_count)
+            .map(|_| Vec::new())
+            .collect();
+        let mut kept_allocator = false;
+        for mut group in groups {
+            if !kept_allocator
+                && group.node_id == self.node_id
+                && let Some(allocator) = group.allocator.take()
+            {
+                self.allocator = Some(allocator);
+                kept_allocator = true;
+            }
+            by_node[group.node_id].push(group);
+        }
+        for (node_id, groups) in by_node.into_iter().enumerate() {
+            self.shared.start_local_merge(node_id, groups)?;
+        }
+        Ok(())
+    }
 }
 
 impl Outputter<RecordBatch> for RunMerger {
     fn output(&mut self, sender: &mut dyn Sender<RecordBatch>) -> unary::Result<bool> {
         if let Some(task) = self.shared.claim_task(self.node_id) {
-            self.shared.execute(task, &mut self.allocator)?;
+            let allocator = self
+                .allocator
+                .get_or_insert_with(|| SlabAllocator::new(false));
+            self.shared.execute(task, allocator)?;
             // One slice per call keeps the worker responsive to the rest of
             // its dataflow.
             return Ok(false);
