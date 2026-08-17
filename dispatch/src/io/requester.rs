@@ -590,6 +590,34 @@ impl IORequester {
                     FsRequest::Read(_) if result < 0 => {
                         Some(std::io::Error::from_raw_os_error(-result))
                     }
+                    // Cache fills are block-aligned, so a tail fill can
+                    // legitimately return fewer bytes than its physical extent
+                    // when it reaches EOF. Accept a short result only when it
+                    // stopped exactly at the file's current EOF (ruling out an
+                    // unexpected mid-file short read) and the returned prefix
+                    // reached the extent's final block (so no whole cache block
+                    // remains unwritten). Because the extent contains exactly
+                    // the blocks intersecting the logical range, stopping at EOF
+                    // before its final block means the logical range is out of
+                    // bounds against the current file size, possibly because the
+                    // file shrank after the range was formed.
+                    FsRequest::Read(read) if (result as usize) < read.block.len() => {
+                        match read.file.metadata() {
+                            Err(error) => Some(error),
+                            Ok(meta)
+                                if result > 0
+                                    && read.block.file_offset() as u64 + result as u64
+                                        == meta.len()
+                                    && read.block.prefix_reaches_last_block(result as usize) =>
+                            {
+                                None
+                            }
+                            Ok(_) => Some(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "file read stopped short of the requested range",
+                            )),
+                        }
+                    }
                     FsRequest::Write(write)
                         if result < 0 || done + result as usize != write.data.len() =>
                     {
@@ -627,7 +655,10 @@ impl IORequester {
                     } = request;
                     let completion = match fs_request {
                         FsRequest::Read(read) => {
-                            read.block.commit();
+                            // Full reads cover the extent. An accepted short read
+                            // reached EOF inside its final block, so committing
+                            // the touched prefix commits every extent block.
+                            read.block.commit_prefix(result as usize);
                             Completion::FsRead(DataFlowRequest {
                                 data_flow_id,
                                 operator_idx,
@@ -766,7 +797,7 @@ mod tests {
     use crate::io::hardware_queues::HardwareQueue;
     use crate::io::{
         FileRange, HttpGetRequest, HttpUploadRequest, LocalFile, OpenFile, PendingReadRequest,
-        ReadRequestId, RemoteFile,
+        ReadRequestId, RemoteFile, open_direct_read,
     };
     use crate::memory::{init_test_free_pool, memory_ctx};
     use std::io::{Read, Write};
@@ -1503,6 +1534,222 @@ mod tests {
             results.extend(requester.completions().unwrap());
         }
         results
+    }
+
+    /// Spawn a server whose `206` carries a Content-Length shorter than the
+    /// requested range (a truncating proxy, or an object replaced by a smaller
+    /// one), followed by that many body bytes.
+    fn spawn_truncating_server() -> u16 {
+        let server_config = server_tls_config();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let conn = rustls::ServerConnection::new(server_config).unwrap();
+            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            let head = read_head(&mut tls);
+            let (start, end) = parse_range(&head);
+            let len = (end - start + 1) / 2;
+            let body: Vec<u8> = (0..len).map(|i| pattern(start + i)).collect();
+            let resp = format!(
+                "HTTP/1.1 206 Partial Content\r\n\
+                 Content-Length: {len}\r\n\
+                 Content-Range: bytes {start}-{}/1000000\r\n\
+                 Connection: keep-alive\r\n\r\n",
+                start + len - 1
+            );
+            tls.write_all(resp.as_bytes()).unwrap();
+            tls.write_all(&body).unwrap();
+            tls.flush().unwrap();
+        });
+
+        port
+    }
+
+    /// Spawn a server that clamps each requested range to `object_size`, the way
+    /// a real object store serves a block-aligned read overhanging the object's
+    /// end.
+    fn spawn_clamping_server(object_size: usize) -> u16 {
+        let server_config = server_tls_config();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let conn = rustls::ServerConnection::new(server_config).unwrap();
+            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            let head = read_head(&mut tls);
+            let (start, end) = parse_range(&head);
+            let end = end.min(object_size - 1);
+            let len = end - start + 1;
+            let body: Vec<u8> = (0..len).map(|i| pattern(start + i)).collect();
+            let resp = format!(
+                "HTTP/1.1 206 Partial Content\r\n\
+                 Content-Length: {len}\r\n\
+                 Content-Range: bytes {start}-{end}/{object_size}\r\n\
+                 Connection: keep-alive\r\n\r\n"
+            );
+            tls.write_all(resp.as_bytes()).unwrap();
+            tls.write_all(&body).unwrap();
+            tls.flush().unwrap();
+        });
+
+        port
+    }
+
+    /// A `206` whose body is shorter than the requested range must fail the read
+    /// and leave every block uncommitted - committing would let later lookups
+    /// serve whatever bytes the slot already held as file content.
+    #[test]
+    fn a_truncated_range_response_fails_instead_of_committing() {
+        init_test_free_pool(16);
+        let loc = remote_loc(spawn_truncating_server());
+        let mut requester = IORequester::with_http_config(client_config());
+
+        let results = fetch_results(&mut requester, &loc, 0, 4096);
+
+        assert!(results.iter().all(|r| r.is_err()), "the read must fail");
+        let lookups = memory_ctx().compressed_cache().get(&loc, 0, 4096);
+        assert!(lookups[0].missing().is_some(), "no block may be committed");
+    }
+
+    /// A block-aligned read overhanging the object's end is served clamped by the
+    /// store; the clamped body must land and commit rather than be rejected.
+    #[test]
+    fn a_tail_read_clamped_to_the_object_size_commits() {
+        const SIZE: usize = 6000;
+        init_test_free_pool(16);
+        let url = Url::parse(&format!(
+            "https://127.0.0.1:{}/obj",
+            spawn_clamping_server(SIZE)
+        ))
+        .unwrap();
+        let loc = OpenFile::Remote(Arc::new(RemoteFile::open(url, None, SIZE as u64).unwrap()));
+        memory_ctx().compressed_cache().open_entry(loc.clone());
+        let mut requester = IORequester::with_http_config(client_config());
+
+        fetch(&mut requester, &loc, 4096, SIZE - 4096);
+
+        assert_cached(&loc, 4096, SIZE - 4096);
+    }
+
+    /// A remote fill whose EOF-clamped body ends before its final cache block
+    /// must fail for the owner and followers rather than expose a wholly
+    /// unwritten block.
+    #[test]
+    fn a_remote_fill_ending_before_its_last_block_fails() {
+        const SIZE: usize = 2000;
+        init_test_free_pool(16);
+        let url = Url::parse(&format!(
+            "https://127.0.0.1:{}/obj",
+            spawn_clamping_server(SIZE)
+        ))
+        .unwrap();
+        let loc = OpenFile::Remote(Arc::new(RemoteFile::open(url, None, SIZE as u64).unwrap()));
+        memory_ctx().compressed_cache().open_entry(loc.clone());
+        let mut requester = IORequester::with_http_config(client_config());
+
+        let results = fetch_results(&mut requester, &loc, 0, 2 * 4096);
+
+        assert!(results.iter().all(|r| r.is_err()), "the read must fail");
+        let lookups = memory_ctx().compressed_cache().get(&loc, 0, 2 * 4096);
+        assert!(lookups[0].missing().is_some(), "no block may be committed");
+    }
+
+    /// Submit one logical read of `[offset, offset + len)` of `loc` and drive it
+    /// until it either delivers its bytes or fails, returning the outcome.
+    fn drive_fs_read(
+        requester: &mut IORequester,
+        loc: &OpenFile,
+        offset: usize,
+        len: usize,
+    ) -> std::result::Result<Vec<u8>, FailedIO> {
+        requester
+            .request_read(
+                0,
+                0,
+                PendingReadRequest {
+                    id: ReadRequestId(0),
+                    open_file: loc.clone(),
+                    locations: vec![FileRange::new(offset, len)],
+                },
+                &mut disabled_stats(),
+            )
+            .unwrap();
+        for _ in 0..100 {
+            if requester.has_pending() {
+                requester.wait().unwrap();
+            }
+            for completion in requester.completions().unwrap() {
+                completion?;
+            }
+            if let Some(routed) = requester.take_ready_reads().into_iter().next() {
+                return Ok(routed.response.into_bytes());
+            }
+        }
+        panic!("the read neither completed nor failed");
+    }
+
+    /// A registered direct-I/O file holding `pattern` bytes, `size` bytes long.
+    fn patterned_local_file(dir: &tempfile::TempDir, size: usize) -> OpenFile {
+        let path = dir.path().join("data");
+        let body: Vec<u8> = (0..size).map(pattern).collect();
+        std::fs::write(&path, body).unwrap();
+        let loc = OpenFile::Local(open_direct_read(&path).unwrap());
+        memory_ctx().compressed_cache().open_entry(loc.clone());
+        loc
+    }
+
+    /// A block-aligned tail fill may stop at EOF inside its final block; because
+    /// it reached that block, the extent must commit and serve later hits.
+    #[test]
+    fn a_block_aligned_tail_fill_commits_when_eof_is_in_last_block() {
+        const SIZE: usize = 6000;
+        init_test_free_pool(16);
+        let dir = tempfile::tempdir().unwrap();
+        let loc = patterned_local_file(&dir, SIZE);
+        let mut requester = IORequester::default();
+
+        let bytes = match drive_fs_read(&mut requester, &loc, 0, SIZE) {
+            Ok(bytes) => bytes,
+            Err(failed) => panic!("the read must succeed: {}", failed.error),
+        };
+
+        assert_eq!(bytes, (0..SIZE).map(pattern).collect::<Vec<u8>>());
+        assert_cached(&loc, 0, SIZE);
+    }
+
+    /// A read whose blocks lie wholly past the file's end gets no bytes; it must
+    /// fail and leave the blocks uncommitted, not serve stale slot contents.
+    #[test]
+    fn a_local_read_wholly_past_eof_fails_instead_of_committing() {
+        init_test_free_pool(16);
+        let dir = tempfile::tempdir().unwrap();
+        let loc = patterned_local_file(&dir, 2000);
+        let mut requester = IORequester::default();
+
+        let result = drive_fs_read(&mut requester, &loc, 4096, 4096);
+
+        assert!(result.is_err(), "the read must fail");
+        let lookups = memory_ctx().compressed_cache().get(&loc, 4096, 4096);
+        assert!(lookups[0].missing().is_some(), "no block may be committed");
+    }
+
+    /// A local fill leaving a whole cache block unwritten must fail for the
+    /// owner and followers rather than complete with a garbage tail.
+    #[test]
+    fn a_local_fill_leaving_a_whole_block_unwritten_fails() {
+        init_test_free_pool(16);
+        let dir = tempfile::tempdir().unwrap();
+        let loc = patterned_local_file(&dir, 2000);
+        let mut requester = IORequester::default();
+
+        let result = drive_fs_read(&mut requester, &loc, 0, 2 * 4096);
+
+        assert!(result.is_err(), "the read must fail");
+        let lookups = memory_ctx().compressed_cache().get(&loc, 0, 2 * 4096);
+        assert!(lookups[0].missing().is_some(), "no block may be committed");
     }
 
     /// A terminal transport failure surfaces as a `FailedIO`, never a committed

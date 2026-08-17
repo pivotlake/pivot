@@ -285,14 +285,35 @@ impl MissingExtent {
 
     /// Mark the extent's blocks valid - call once its bytes have been read into the slot.
     pub fn commit(&self) {
+        self.commit_prefix(self.len());
+    }
+
+    /// Mark valid only the leading blocks the first `bytes` bytes landed in -
+    /// every block that received at least one byte. For a run whose block-aligned
+    /// tail overhangs the end of its file, the fully-unwritten blocks stay
+    /// invalid, so a later lookup re-reads them instead of consuming whatever the
+    /// slot already held.
+    pub fn commit_prefix(&self, bytes: usize) {
+        let blocks = bytes
+            .div_ceil(BLOCK_SIZE)
+            .min(self.extent.block_count as usize);
         memory_ctx()
             .compressed_cache()
             .slot_metadata(self.extent.slot_idx as usize)
             .valid
-            .set(
-                self.extent.first_slot_block as usize,
-                self.extent.block_count as usize,
-            );
+            .set(self.extent.first_slot_block as usize, blocks);
+    }
+
+    /// Whether a contiguous `bytes`-byte prefix reaches the extent's final 4 KB
+    /// block. Because the transfer starts at the extent's beginning, reaching
+    /// the final block means every extent block received at least one byte. It
+    /// does not mean every byte in the extent, or every logical byte requested,
+    /// was read. Since an extent contains exactly the blocks intersecting its
+    /// logical range, a prefix ending at EOF before the final block means that
+    /// logical range is out of bounds against the current file size (or became
+    /// stale because the file shrank after the range was formed).
+    pub fn prefix_reaches_last_block(&self, bytes: usize) -> bool {
+        bytes.div_ceil(BLOCK_SIZE) >= self.extent.block_count as usize
     }
 
     /// Mark this fill failed, remove its extent, and wake its followers. A later
