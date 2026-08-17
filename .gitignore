@@ -1,4 +1,8 @@
 target/
+# per-flavor PGO build dirs (pgo.just) and pivot-bench's client dir
+target-pgogen/
+target-pgouse/
+target-client/
 .idea/
 .tmp/
 .DS_Store

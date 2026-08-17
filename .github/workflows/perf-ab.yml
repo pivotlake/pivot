@@ -132,6 +132,7 @@ jobs:
         run: |
           cp benchmarks/clickbench/bench-ab.sh /tmp/bench-ab.sh
           cp benchmarks/clickbench/build-ab-servers.sh /tmp/build-ab-servers.sh
+          cp benchmarks/build-pgo-server.sh /tmp/build-pgo-server.sh
 
       - name: Start the perf box
         env:
@@ -279,6 +280,7 @@ jobs:
 
           scp -F "$HOME/.ssh/config" /tmp/bench-ab.sh perf:/tmp/bench-ab.sh
           scp -F "$HOME/.ssh/config" /tmp/build-ab-servers.sh perf:/tmp/build-ab-servers.sh
+          scp -F "$HOME/.ssh/config" /tmp/build-pgo-server.sh perf:/tmp/build-pgo-server.sh
 
       - name: Run A/B benchmark (detached, polled)
         env:

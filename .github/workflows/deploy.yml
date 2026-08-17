@@ -16,14 +16,21 @@ on:
         type: boolean
         default: true
       use_gcp_runner:
-        description: "Build on the self-hosted GCP runners (ci-runner-x86 for x86_64, ci-runner-aarch64 for aarch64). On by default; uncheck to use GitHub-hosted runners."
+        description: "Build on the self-hosted GCP runners (ci-runner-x86 for x86_64, ci-runner-aarch64 for aarch64). Must stay on: the PGO training data and run don't fit GitHub-hosted runners."
         type: boolean
         default: true
       push_docker:
-        description: "Build the pivot server image and push it to Docker Hub (giladkl/pivot)."
+        description: "Build the pivot server image and push it to Docker Hub (giladkl/pivot). Ships the PGO x86_64 binary, so it needs build_x86_64."
         type: boolean
         default: true
 
+# Every shipped binary is PGO-optimized: the deploy leg instruments the
+# server, runs the full benchmark-suite roster against the training bundle,
+# and rebuilds the server from the merged profile (benchmarks/
+# build-pgo-server.sh). A deploy whose training run or profile verification
+# fails ships nothing: an un-PGOed binary silently posing as an optimized one
+# is worse than a failed run.
+#
 # Required secrets:
 #   GCP_SA_KEY  — JSON key for a service account with objectAdmin on the bucket.
 #                 For use_gcp_runner it also needs to bring the runner VMs online:
@@ -32,6 +39,10 @@ on:
 #                 attached service account (starting a stopped VM requires it).
 # Required repository variables (unless overridden via the `bucket` input):
 #   DEPLOY_GCS_BUCKET  — gs://bucket/optional/prefix to upload the binary under.
+#   PGO_TRAINING_GCS   — gs:// path of the PGO training bundle; build and
+#                        upload it with benchmarks/prep-pgo-training-data.sh.
+#                        Runners keep a checksum-synced copy on disk, so only
+#                        the first deploy after a bundle change re-downloads.
 # For the Docker Hub push (push_docker), the org-level DOCKERHUB_USERNAME /
 # DOCKERHUB_TOKEN secrets are used; that account must have push access to
 # giladkl/pivot.
@@ -51,6 +62,14 @@ jobs:
     steps:
       - id: gen
         run: |
+          if [ "${{ inputs.use_gcp_runner }}" != "true" ]; then
+            echo "::error::PGO release builds need the self-hosted GCP runners: the training bundle (~70GB) and the training run don't fit GitHub-hosted runners. Leave use_gcp_runner on."
+            exit 1
+          fi
+          if [ "${{ inputs.push_docker }}" = "true" ] && [ "${{ inputs.build_x86_64 }}" != "true" ]; then
+            echo "::error::push_docker ships the PGO x86_64 binary built by the x86_64 leg; select build_x86_64 too."
+            exit 1
+          fi
           legs=()
           if [ "${{ inputs.build_x86_64 }}" = "true" ]; then
             legs+=('{"arch":"x86_64","runner":"ubuntu-24.04"}')
@@ -98,7 +117,7 @@ jobs:
     # The start jobs are skipped unless opted in, so accept their skipped
     # results too.
     if: ${{ always() && needs.matrix.result == 'success' && (needs.start-ci.result == 'success' || needs.start-ci.result == 'skipped') && (needs.start-ci-arm.result == 'success' || needs.start-ci-arm.result == 'skipped') }}
-    name: Build ${{ matrix.arch }} release + upload to GCS
+    name: Build ${{ matrix.arch }} PGO release + upload to GCS
     # Each arch builds on its native self-hosted box when opted in (gcp-builder
     # is X64, gcp-builder-arm is ARM64); otherwise on the hosted runner from the
     # matrix. Native runners per arch — no emulation.
@@ -114,33 +133,30 @@ jobs:
           submodules: recursive
 
       # C toolchain for the duckdb / arrow-rs native deps (mirrors the bench
-      # Dockerfile's build stage).
+      # Dockerfile's build stage), plus lld: the instrumented PGO build links
+      # with it (see pgo.just).
       - name: Install build dependencies
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake clang libclang-dev pkg-config git ca-certificates
+            build-essential cmake clang libclang-dev pkg-config git ca-certificates lld
 
+      # llvm-tools carries llvm-profdata, which merges the training profiles.
       - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: .
+          components: llvm-tools
 
-      - name: Build release binary (${{ matrix.arch }})
-        working-directory: server
+      # just runs the pgo.just recipes. Pinned release binary: the runners'
+      # apt archives are too old to carry it, and cargo install would compile
+      # it on every fresh box.
+      - name: Install just
         run: |
-          # ci-runner-x86 is Ubuntu 20.04 with gcc 9.4, which aws-lc-sys rejects
-          # (GCC bug 95189). Build the C/C++ deps with clang there; GitHub-hosted
-          # runners have a newer, unaffected gcc, so leave them on the default.
-          if [ "${{ inputs.use_gcp_runner && matrix.arch == 'x86_64' }}" = "true" ]; then
-            export CC=clang CXX=clang++
-          fi
-          # Bypass the kache rustc wrapper (.cargo/config.toml): the shipped
-          # binary is always compiled fresh, never restored from cache.
-          export RUSTC_WRAPPER=
-          cargo build --release --bin pivotdb-server
+          set -euo pipefail
+          if command -v just >/dev/null; then just --version; exit 0; fi
+          curl -fsSL "https://github.com/casey/just/releases/download/1.36.0/just-1.36.0-$(uname -m)-unknown-linux-musl.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin just
+          just --version
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
@@ -149,11 +165,82 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
+      - name: Sync PGO training data
+        env:
+          TRAINING_GCS: ${{ vars.PGO_TRAINING_GCS }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TRAINING_GCS" ]; then
+            echo "::error::Set the PGO_TRAINING_GCS repo variable to the training bundle's gs:// path (build it with benchmarks/prep-pgo-training-data.sh)."
+            exit 1
+          fi
+          DATA_DIR="$HOME/pgo-training-data"
+          mkdir -p "$DATA_DIR"
+
+          # Preflight, so a shrunk box fails here with numbers instead of
+          # thrashing mid-benchmark: the SF100 queries want ~30GB of RAM, and
+          # disk must hold the ~70GB bundle plus ~80GB of PGO target dirs and
+          # profiles (the 150 below). Data already on disk from a previous
+          # deploy counts toward it.
+          mem_gb=$(awk '/MemTotal/ {printf "%d", $2 / 1024 / 1024}' /proc/meminfo)
+          if [ "$mem_gb" -lt 25 ]; then
+            echo "::error::runner has ${mem_gb}GB of RAM; the training run needs at least 25GB"
+            exit 1
+          fi
+          present_gb=$(du -s -BG "$DATA_DIR" | cut -f1 | tr -d 'G')
+          avail_gb=$(df -BG --output=avail "$DATA_DIR" | tail -1 | tr -d ' G')
+          need_gb=$(( 150 - present_gb ))
+          [ "$need_gb" -ge 80 ] || need_gb=80
+          if [ "$avail_gb" -lt "$need_gb" ]; then
+            echo "::error::runner has ${avail_gb}GB free at $DATA_DIR but the PGO build needs ~${need_gb}GB"
+            exit 1
+          fi
+
+          # Checksum-based sync: a no-op when the bundle is unchanged, and it
+          # also deletes strays (e.g. _delta_log dirs a previous training run's
+          # CREATE TABLE left inside the source directories).
+          gcloud storage rsync --recursive --delete-unmatched-destination-objects \
+            "$TRAINING_GCS" "$DATA_DIR"
+          du -sh "$DATA_DIR"/*
+          echo "DATA_DIR=$DATA_DIR" >> "$GITHUB_ENV"
+
+      - name: Build PGO release binary (${{ matrix.arch }})
+        id: build
+        run: |
+          set -euo pipefail
+          # ci-runner-x86 is Ubuntu 20.04 with gcc 9.4, which aws-lc-sys rejects
+          # (GCC bug 95189). Build the C/C++ deps with clang there; GitHub-hosted
+          # runners have a newer, unaffected gcc, so leave them on the default.
+          if [ "${{ inputs.use_gcp_runner && matrix.arch == 'x86_64' }}" = "true" ]; then
+            export CC=clang CXX=clang++
+          fi
+          # Shipped binaries stay portable: no -Ctarget-cpu, unlike the bench
+          # boxes' native default (see pgo.just).
+          export PGO_TARGET_CPU=
+          # Target dirs live outside the workspace: checkout's clean would wipe
+          # them from the tree, while out here they persist on the runner disk
+          # and keep the per-flavor builds incremental across deploys.
+          export PGO_GEN_TARGET_DIR="$HOME/deploy-pgo/target-pgogen"
+          export PGO_USE_TARGET_DIR="$HOME/deploy-pgo/target-pgouse"
+          export PIVOT_BENCH_TARGET_DIR="$HOME/deploy-pgo/target-client"
+
+          out=$(benchmarks/build-pgo-server.sh \
+            --pgo-dir "$HOME/deploy-pgo/profiles" \
+            --suite "clickbench=$DATA_DIR/hits" \
+            --suite "clickbench-insert=$DATA_DIR/hits" \
+            --suite "tpch=$DATA_DIR/tpch-sf100" \
+            --suite "tpch-flat=$DATA_DIR/tpch-flat-sf10" \
+            --suite "jsonbench=$DATA_DIR/jsonbench-10m" \
+            --iterations 2)
+          echo "$out"
+          echo "server_bin=${out#SERVER_BIN=}" >> "$GITHUB_OUTPUT"
+
       - name: Upload binary to GCS
         env:
           BUCKET: ${{ inputs.bucket != '' && inputs.bucket || vars.DEPLOY_GCS_BUCKET }}
           SHA: ${{ github.sha }}
           ARCH: ${{ matrix.arch }}
+          BIN: ${{ steps.build.outputs.server_bin }}
         run: |
           set -euo pipefail
           if [ -z "$BUCKET" ]; then
@@ -162,7 +249,6 @@ jobs:
           fi
           # Strip any trailing slash so we control the joins below.
           BUCKET="${BUCKET%/}"
-          BIN=target/release/pivotdb-server
 
           # Upload an immutable, SHA-pinned copy plus a moving `latest` pointer.
           gcloud storage cp "$BIN" "$BUCKET/pivotdb-server-$ARCH-$SHA"
@@ -172,15 +258,26 @@ jobs:
           echo "  $BUCKET/pivotdb-server-$ARCH-$SHA"
           echo "  $BUCKET/pivotdb-server-$ARCH-latest"
 
+      # The Docker job ships this same binary, so the image is PGO-optimized
+      # without running a training pass of its own.
+      - name: Save binary for the Docker image
+        if: ${{ matrix.arch == 'x86_64' && inputs.push_docker }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgo-server-x86_64
+          path: ${{ steps.build.outputs.server_bin }}
+          if-no-files-found: error
+
   # Build the pivot server image and push it to Docker Hub (giladkl/pivot),
-  # tagged with both the commit SHA and `latest`. Independent of the binary
-  # matrix above, but shares the self-hosted gcp-builder when opted in, so it
-  # waits on start-ci to resume the box.
+  # tagged with both the commit SHA and `latest`. The image copies in the
+  # PGO-optimized x86_64 binary the deploy matrix built, so it waits on the
+  # whole matrix and shares the self-hosted gcp-builder when opted in.
   docker:
     name: Build & push Docker image
-    needs: [start-ci]
+    needs: [start-ci, deploy]
     # start-ci is skipped unless opted in, so accept its skipped result too.
-    if: ${{ always() && inputs.push_docker && (needs.start-ci.result == 'success' || needs.start-ci.result == 'skipped') }}
+    # deploy must have succeeded: the image ships the x86_64 leg's binary.
+    if: ${{ always() && inputs.push_docker && needs.deploy.result == 'success' && (needs.start-ci.result == 'success' || needs.start-ci.result == 'skipped') }}
     # Build on the self-hosted gcp-builder when opted in (like the binary legs);
     # otherwise fall back to a hosted runner.
     runs-on: ${{ inputs.use_gcp_runner && 'gcp-builder' || 'ubuntu-latest' }}
@@ -188,6 +285,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Fetch the PGO binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pgo-server-x86_64
+          path: prebuilt
 
       - uses: docker/setup-buildx-action@v3
 
@@ -203,6 +306,9 @@ jobs:
           context: .
           file: server/Dockerfile
           push: true
+          build-args: |
+            BINARY_SOURCE=prebuilt
+            PREBUILT_BIN=prebuilt/pivotdb-server
           tags: |
             giladkl/pivot:${{ github.sha }}
             giladkl/pivot:latest

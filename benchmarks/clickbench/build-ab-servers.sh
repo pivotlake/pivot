@@ -5,8 +5,9 @@
 # bench-ab.sh measures prebuilt binaries and no longer builds anything; this is
 # what builds them. Each side gets its own profile directory, so neither has to
 # wipe a shared one and the two profiles cannot be confused for each other. The
-# build goes through the pgo.just recipes rather than repeating their RUSTFLAGS,
-# so it cannot drift from them.
+# instrument/train/optimize/verify pipeline itself is build-pgo-server.sh
+# (which in turn goes through the pgo.just recipes), so the A/B and deploy
+# builds cannot drift from each other.
 #
 # Prints `BEFORE_BIN=<path>` and `AFTER_BIN=<path>` on stdout, ready to be
 # sourced; all build chatter goes to stderr.
@@ -51,77 +52,40 @@ pgo_subset="$(expand_tilde "$pgo_subset")"
 export PATH="$PATH:$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin"
 export NO_COLOR=1
 
-command -v ld.lld >/dev/null || {
-    echo "error: ld.lld is not installed, and the instrumented build links with it" >&2
-    echo "       (instrumentation grows the text past the aarch64 128MB branch" >&2
-    echo "       range, which GNU ld fails). Install it: sudo apt-get install -y lld" >&2
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The delegate may sit beside this script (perf-ab.yml ships both standalone
+# to /tmp on the box, staged from the run's commit so an older 'before' tree
+# can't miss them) or one directory up in the repo layout
+# (benchmarks/clickbench/ -> benchmarks/).
+if [[ -x "$script_dir/build-pgo-server.sh" ]]; then
+    build_pgo_server="$script_dir/build-pgo-server.sh"
+elif [[ -x "$script_dir/../build-pgo-server.sh" ]]; then
+    build_pgo_server="$script_dir/../build-pgo-server.sh"
+else
+    echo "error: build-pgo-server.sh not found beside $script_dir or one directory up" >&2
     exit 2
-}
+fi
 
-host_target="$(rustc -vV | sed -n 's/^host: //p')"
-llvm_profdata="$(dirname "$(rustc --print target-libdir)")/bin/llvm-profdata"
-
-# Instrument the server itself, drive it through pivot-bench (a pure pgwire
-# client carrying no engine code and no instrumentation), and build the
-# optimized server from the profile the server process wrote. Profiling the artifact being measured is what makes
-# the profile's symbol names match by construction; PGO matches records to
-# functions by exact mangled name, and a mismatch silently disables it.
+# Instrument the server itself, drive it through pivot-bench over the hits
+# subset, and build the optimized server from the profile the server process
+# wrote - all delegated to build-pgo-server.sh, which also verifies the
+# profile applied. This launcher's copy of that script builds both trees, so
+# the two sides go through identical logic even when the trees differ in age.
 build_side() {
     local tree="$1" side="$2"
     # Beside the tree, never inside it: the launcher rsyncs each tree with
     # --delete and only excludes the target dirs, so a profile directory in
     # there would be deleted out from under the build.
     local pgo="$(dirname "$tree")/pgo-$side"
-    if ! (
-        cd "$tree/benchmarks"
-        rm -rf "$pgo"
-        mkdir -p "$pgo"
-        PGO_DIR="$pgo" PGO_GEN_TARGET_DIR=target-pgogen \
-            just pgo-gen-build build --release -p server --bin pivotdb-server
-        # The client is a plain build in its own target dir: it takes no
-        # profile flags, and sharing a flagged dir would rebuild it for
-        # nothing on every flavor switch.
-        CARGO_TARGET_DIR=target-client RUSTC_WRAPPER= \
-            cargo build --release -p benchmarks --bin pivot-bench
-        # LLVM_PROFILE_FILE reaches the instrumented server through the
-        # environment pivot-bench spawns it with; the client itself is not
-        # instrumented and writes nothing.
-        LLVM_PROFILE_FILE="$pgo/%m-%p.profraw" \
-            "target-client/release/pivot-bench" \
-            --server-bin "target-pgogen/$host_target/release/pivotdb-server" \
-            --source "$pgo_subset" --iterations 2 --skip-check >/dev/null
-        "$llvm_profdata" merge -o "$pgo/merged.profdata" "$pgo"/*.profraw
-        PGO_USE_TARGET_DIR=target-pgouse \
-            just pgo-use-with "$pgo/merged.profdata" build --release -p server --bin pivotdb-server
-    ) >&2; then
-        # Without this the subshell's failure is swallowed by the printf below,
-        # and the run only trips at the final existence check, which then names
-        # whichever side is checked first rather than the one that broke.
+    local out
+    if ! out="$("$build_pgo_server" \
+            --tree "$tree" --pgo-dir "$pgo" --iterations 2 \
+            --suite "clickbench=$pgo_subset")"; then
         echo "error: building the $side server from $tree failed" >&2
         return 1
     fi
-    local server="$tree/benchmarks/target-pgouse/$host_target/release/pivotdb-server"
-    # Tripwire for the profile applying at all: the decode family's
-    # monomorphization hashes in the built server must appear in the profile
-    # it was compiled against. Zero overlap means the server was built outside
-    # the profiled symbol universe and is effectively un-PGOed, which is
-    # silent at compile time and shows up only as a mystery regression.
-    local family="RleDecoder4read"
-    local binary_hashes profile_hashes covered
-    binary_hashes=$(nm "$server" | grep "$family" | grep -oE '17h[0-9a-f]+E' | sort -u)
-    if [[ -n "$binary_hashes" ]]; then
-        profile_hashes=$("$llvm_profdata" show -all-functions "$pgo/merged.profdata" \
-            2>/dev/null | grep "$family" | grep -oE '17h[0-9a-f]+E' | sort -u)
-        covered=$(comm -12 <(printf '%s\n' "$binary_hashes") \
-                           <(printf '%s\n' "$profile_hashes") | wc -l)
-        if [[ "$covered" -eq 0 ]]; then
-            echo "error: the $side server shares no $family symbols with its profile;" >&2
-            echo "       the profile did not apply and the binary is effectively un-PGOed" >&2
-            return 1
-        fi
-        echo "$side server: $covered $family monomorphizations carry profile records" >&2
-    fi
-    printf '%s' "$server"
+    printf '%s' "${out#SERVER_BIN=}"
 }
 
 echo ">>> building BEFORE server" >&2

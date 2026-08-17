@@ -12,7 +12,8 @@
 # --files <n>                 that many files instead, for a caller that counts
 #                             rather than names a scale
 # --dir <path>                where data lives (default ~/data/jsonbench)
-# --engines pivot,duckdb      which loads to build (default both)
+# --engines pivot,duckdb      which loads to build (default both); `none`
+#                             downloads the ndjson and builds neither load
 #
 # Layout under --dir:
 #   ndjson/file_NNNN.json.gz   the download, shared by both engines
@@ -146,5 +147,8 @@ fi
 
 echo
 echo "ready:"
-want pivot  && echo "  pivot-bench   --suite jsonbench --source $pivot_dir"
-want duckdb && echo "  ./run-duckdb.sh --native $duck_db"
+# `if`, not bare `want x && echo`: a skipped engine would otherwise leak the
+# failed test as the script's exit status.
+if want pivot;  then echo "  pivot-bench   --suite jsonbench --source $pivot_dir"; fi
+if want duckdb; then echo "  ./run-duckdb.sh --native $duck_db"; fi
+if ! want pivot && ! want duckdb; then echo "  ndjson only:  $ndjson_dir"; fi

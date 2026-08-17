@@ -13,6 +13,15 @@
 pgogen_target_dir := env_var_or_default("PGO_GEN_TARGET_DIR", "target-pgogen")
 pgouse_target_dir := env_var_or_default("PGO_USE_TARGET_DIR", "target-pgouse")
 
+# Microarchitecture the PGO builds target. Bench boxes keep the default,
+# native: the binary runs on the machine that built it, so it may use every
+# instruction that machine has. Builds that ship (deploy.yml) set
+# PGO_TARGET_CPU= (empty, meaning no -Ctarget-cpu flag at all) to keep rustc's
+# portable baseline: a shipped binary must run on any machine of its
+# architecture, and a native build SIGILLs on an older one.
+pgo_target_cpu := env_var_or_default("PGO_TARGET_CPU", "native")
+pgo_cpu_flag := if pgo_target_cpu == "" { "" } else { "-Ctarget-cpu=" + pgo_target_cpu }
+
 # Run a cargo command instrumented for PGO profile generation, then merge the profiles.
 #
 #   just pgo-gen bench --bench clickbench
@@ -22,7 +31,7 @@ pgo-gen *args:
     mkdir -p {{pgo_dir}}
     # RUSTC_WRAPPER= bypasses the kache rustc wrapper (.cargo/config.toml): these
     # optimized PGO builds are compiled fresh, never restored from cache.
-    RUSTC_WRAPPER= RUSTFLAGS="-Cprofile-generate={{pgo_dir}} -Ctarget-cpu=native" \
+    RUSTC_WRAPPER= RUSTFLAGS="-Cprofile-generate={{pgo_dir}} {{pgo_cpu_flag}}" \
         CARGO_TARGET_DIR={{pgogen_target_dir}} cargo {{args}}
     $(dirname "$(rustc --print target-libdir)")/bin/llvm-profdata merge -o {{pgo_dir}}/merged.profdata {{pgo_dir}}
 
@@ -30,7 +39,7 @@ pgo-gen *args:
 #
 #   just pgo-use bench --bench clickbench
 pgo-use *args:
-    RUSTC_WRAPPER= RUSTFLAGS="-Cprofile-use={{pgo_dir}}/merged.profdata -Ctarget-cpu=native" \
+    RUSTC_WRAPPER= RUSTFLAGS="-Cprofile-use={{pgo_dir}}/merged.profdata {{pgo_cpu_flag}}" \
         CARGO_TARGET_DIR={{pgouse_target_dir}} cargo {{args}}
 
 
@@ -49,7 +58,7 @@ host_target := `rustc -vV | sed -n 's/^host: //p'`
 # branch range, which GNU ld fails with relocation overflows.
 pgo-gen-build subcmd *args:
     mkdir -p {{pgo_dir}}
-    RUSTC_WRAPPER= RUSTFLAGS="-Cprofile-generate={{pgo_dir}} -Ctarget-cpu=native -Clink-arg=-fuse-ld=lld" \
+    RUSTC_WRAPPER= RUSTFLAGS="-Cprofile-generate={{pgo_dir}} {{pgo_cpu_flag}} -Clink-arg=-fuse-ld=lld" \
         CARGO_TARGET_DIR={{pgogen_target_dir}} cargo {{subcmd}} --target {{host_target}} {{args}}
 
 # Like pgo-use but with a caller-supplied profdata path. rustc records the
@@ -60,7 +69,7 @@ pgo-gen-build subcmd *args:
 # thanks to the explicit --target) stay cached either way. Binaries land
 # under target-pgouse/{{host_target}}/.
 pgo-use-with profdata subcmd *args:
-    RUSTC_WRAPPER= RUSTFLAGS="-Cprofile-use={{profdata}} -Ctarget-cpu=native" \
+    RUSTC_WRAPPER= RUSTFLAGS="-Cprofile-use={{profdata}} {{pgo_cpu_flag}}" \
         CARGO_TARGET_DIR={{pgouse_target_dir}} cargo {{subcmd}} --target {{host_target}} {{args}}
 
 # Remove all PGO profiles and merged data.

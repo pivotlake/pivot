@@ -7,6 +7,14 @@
 # be checked out before docker build. Build from the repo root with:
 #
 #   docker build -t pivot -f server/Dockerfile .
+#
+# BINARY_SOURCE picks where /usr/local/bin/pivotdb-server comes from:
+#   builder (default)  compile it in-image, as above
+#   prebuilt           copy the file named by PREBUILT_BIN from the build
+#                      context. deploy.yml passes the PGO-optimized release
+#                      binary this way, so the image ships the same artifact
+#                      the GCS upload does instead of a plain in-image build.
+ARG BINARY_SOURCE=builder
 
 FROM rust:1-slim-bookworm AS builder
 
@@ -26,10 +34,20 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release -p server --bin pivotdb-server \
  && cp target/release/pivotdb-server /usr/local/bin/pivotdb-server
 
+FROM scratch AS prebuilt
+ARG PREBUILT_BIN
+# --chmod because the binary may arrive through a CI artifact download, which
+# drops the executable bit.
+COPY --chmod=755 ${PREBUILT_BIN} /usr/local/bin/pivotdb-server
+
+# Alias resolving to whichever stage carries the binary; the unused stage is
+# never built.
+FROM ${BINARY_SOURCE} AS binary
+
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /usr/local/bin/pivotdb-server /usr/local/bin/pivotdb-server
+COPY --from=binary /usr/local/bin/pivotdb-server /usr/local/bin/pivotdb-server
 
 ENV RUST_LOG=info
 # Mount a config file and point the server at it. Set `server.bind` to

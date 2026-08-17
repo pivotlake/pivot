@@ -208,6 +208,16 @@ isn't a terminal or `NO_COLOR` is set.
 | `--skip-check` | — | off | skip the output-vs-expected comparison (still records timings) |
 | `--show` | — | off | print the baseline's recorded results and exit; no server, no run |
 
+## PGO
+
+The suites double as PGO training workloads. `build-pgo-server.sh` builds one
+optimized `pivotdb-server`: it instruments the server, drives it through the
+suites you name with pivot-bench, merges the profiles, rebuilds from them, and
+verifies the profile applied. `clickbench/build-ab-servers.sh` uses it to
+build both sides of an A/B, and `.github/workflows/deploy.yml` uses it so
+every shipped binary is PGO-optimized (trained on the full-suite bundle that
+`prep-pgo-training-data.sh` assembles and uploads to GCS).
+
 ## Notes
 
 - Run with `--release` for meaningful numbers — debug builds are easily 10×
