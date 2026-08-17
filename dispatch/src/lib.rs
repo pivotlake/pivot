@@ -89,6 +89,8 @@ pub use api::*;
 pub use data_flow::{Error as DataFlowError, WorkStatus};
 pub use functions::*;
 pub use gather_barrier::GatherBarrier;
+#[cfg(any(test, feature = "test-util"))]
+pub use io::TestOperatorIO;
 pub use io::{
     FileRange, FsRequest, HttpRequest, OperatorIO, ReadData, ReadRequestId, ReadResponse,
 };

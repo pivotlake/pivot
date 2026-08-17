@@ -115,7 +115,7 @@ impl StatsCollector {
     }
 
     /// Build a no-op collector for standalone test and benchmark drivers.
-    #[cfg(feature = "test-util")]
+    #[cfg(any(test, feature = "test-util"))]
     pub fn disabled() -> Self {
         let (tx, _rx) = mpsc::channel();
         Self { stats: None, tx }
