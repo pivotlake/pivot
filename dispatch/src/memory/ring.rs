@@ -48,6 +48,21 @@ pub struct BufferSlot {
 unsafe impl Send for BufferSlot {}
 unsafe impl Sync for BufferSlot {}
 
+/// Who is holding a slot right now.
+///
+/// The three cases are exactly what [`BufferSlot::used`] encodes, read as one
+/// word so the writer flag and the reader count can never disagree. `Idle` is
+/// a slot nobody holds, which is either free or cached and evictable - that
+/// distinction is the [`Clock`](super::Clock)'s, not the ring's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SlotUsage {
+    Idle,
+    /// Held exclusively by a [`WriteBuffer`].
+    Writing,
+    /// Shared by this many live [`ReadBuffer`]s.
+    Reading(u32),
+}
+
 /// A contiguous mmap-backed arena divided into fixed-size slots.
 ///
 /// Constructed once at startup via [`Ring::new`]. Individual slots are acquired for
@@ -130,6 +145,23 @@ impl Ring {
     /// Whether the ring has no slots.
     pub fn is_empty(&self) -> bool {
         self.slots.is_empty()
+    }
+
+    /// How slot `idx` is held right now.
+    ///
+    /// One relaxed load of the word that packs the writer flag with the reader
+    /// count, taking no hold of its own: peer workers keep acquiring and
+    /// releasing while this reads, so the answer describes the slot at the
+    /// instant it was read. Reporting memory pressure needs nothing stronger.
+    pub fn slot_usage(&self, idx: usize) -> SlotUsage {
+        let used = self.slots[idx].used.load(Ordering::Relaxed);
+        if used & WRITING != 0 {
+            SlotUsage::Writing
+        } else if used == 0 {
+            SlotUsage::Idle
+        } else {
+            SlotUsage::Reading(used)
+        }
     }
 
     /// Overwrites the `used` word for slot `idx` (writer flag + reader count).
