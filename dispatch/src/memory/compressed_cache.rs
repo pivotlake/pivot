@@ -1246,6 +1246,20 @@ mod tests {
         assert!(has_misses(&cache().get(&FD(), 0, SB)));
     }
 
+    #[test]
+    fn get_write_buffer_evicts_compressed_data_when_the_pool_is_empty() {
+        init_test_free_pool(1);
+        cache().open_entry(FD());
+        fill_pattern(&cache().get(&FD(), 0, SB));
+        release_fill_cursor();
+
+        let write = memory_ctx().get_write_buffer(false);
+
+        assert_eq!(memory_ctx().clock().owned(Owner::Compressed), 0);
+        drop(write);
+        assert!(has_misses(&cache().get(&FD(), 0, SB)));
+    }
+
     /// The CLOCK evictor must not reclaim a ring slot that is still parked in
     /// the free pool (unbound).
     #[test]

@@ -38,11 +38,8 @@ use planner::types::Type;
 /// metadata-fetch dataflow) when the table is defined.
 fn dispatcher() -> DataFlowDispatcher {
     static DISPATCH: OnceLock<Dispatch> = OnceLock::new();
-    // The compressed cache is process-global and accumulates a resident region per
-    // distinct file scanned across the whole binary; with `PANIC_ON_EVICT` on
-    // (the test default), running out of ring slots panics instead of evicting.
-    // Size it well above the suite's distinct-file count so adding tests doesn't
-    // tip a later one over.
+    // The compressed cache is process-global, so size it well above the suite's
+    // distinct-file count to avoid cross-test eviction churn.
     DISPATCH
         .get_or_init(|| Dispatch::spin_up(1, 128, None))
         .dispatcher()

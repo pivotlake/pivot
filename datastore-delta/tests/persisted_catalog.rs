@@ -313,13 +313,10 @@ fn create_fetches_footers_across_workers_before_commit() {
     // coordinator commits it after the dataflow finishes. Cover that shape
     // (the other tests are single-worker).
     //
-    // Tests run with eviction disabled (`PANIC_ON_EVICT` defaults to true), so a
-    // cached footer/row-group region pins its ring slot for the lifetime of the
-    // dispatch — nothing returns it to the free pool. The working set is therefore
-    // every distinct region read across this test (8 files × footer + column
-    // chunks, plus transient decompression buffers), which lands around ~32 slots
-    // and varies with worker timing. 32 was right on that edge and tipped into an
-    // "Evicting" panic under CI scheduling; 64 leaves comfortable headroom.
+    // The working set (8 files × footer + column chunks, plus transient
+    // decompression buffers) lands around ~32 slots and varies with worker
+    // timing. 64 leaves enough headroom to avoid eviction churn under CI
+    // scheduling.
     let dispatch = dispatch_with_buffers(4, 64);
     let db = TempDir::new().unwrap();
     let data = TempDir::new().unwrap();
