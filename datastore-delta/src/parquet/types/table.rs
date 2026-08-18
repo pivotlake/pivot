@@ -11,9 +11,9 @@ use crate::parquet::types::thrift::general::{Encoding, PageType};
 use crate::parquet::types::thrift::parquet_thrift::{ReadThrift, ThriftSliceInputProtocol};
 use crate::store::DataFile;
 use arrow_array::{
-    ArrayRef, BooleanArray, Date32Array, Decimal64Array, Decimal128Array, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Scalar, StringViewArray,
-    TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    ArrayRef, BinaryViewArray, BooleanArray, Date32Array, Decimal64Array, Decimal128Array,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Scalar,
+    StringViewArray, TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use dispatch::DataFlowDispatcher;
@@ -350,6 +350,7 @@ fn decode_scalar(
         DataType::Utf8View => std::str::from_utf8(bytes)
             .ok()
             .map(|s| erase_type(StringViewArray::new_scalar(s))),
+        DataType::BinaryView => Some(erase_type(BinaryViewArray::new_scalar(bytes))),
         // Temporal stats share their physical int's encoding (Date32 the i32
         // days, Timestamp(Microsecond) the i64 count).
         DataType::Date32 => read_le::<4>(bytes)
@@ -639,7 +640,8 @@ pub fn is_variant_field(field: &Field) -> bool {
 mod tests {
     use super::*;
     use arrow_array::{
-        BooleanArray, Datum, Float64Array, Int32Array, Int64Array, RecordBatch, StringViewArray,
+        BinaryViewArray, BooleanArray, Datum, Float64Array, Int32Array, Int64Array, RecordBatch,
+        StringViewArray,
     };
     use arrow_schema::Field;
     use dispatch::{DataFlowDispatcher, Dispatch};
@@ -678,6 +680,41 @@ mod tests {
             .statistics
             .clone()
             .expect("stats should be present")
+    }
+
+    #[test]
+    fn binary_view_statistics_decode_as_raw_bytes() {
+        // Setup
+        let values: ArrayRef = Arc::new(BinaryViewArray::from(vec![
+            &[0_u8][..],
+            &[2_u8][..],
+            &[1_u8][..],
+        ]));
+        let batch = RecordBatch::try_from_iter([("value", values)]).unwrap();
+
+        // Execute
+        let (_dir, table) = write_parquet(&batch, EnabledStatistics::Chunk);
+        let stats = col_stats(&table, 0);
+
+        // Assert
+        let min = stats.min.unwrap();
+        let max = stats.max.unwrap();
+        let (min, _) = min.get();
+        let (max, _) = max.get();
+        assert_eq!(
+            min.as_any()
+                .downcast_ref::<BinaryViewArray>()
+                .unwrap()
+                .value(0),
+            &[0]
+        );
+        assert_eq!(
+            max.as_any()
+                .downcast_ref::<BinaryViewArray>()
+                .unwrap()
+                .value(0),
+            &[2]
+        );
     }
 
     fn enc_stat(page_type: PageType, encoding: Encoding, count: i32) -> PageEncodingStats {

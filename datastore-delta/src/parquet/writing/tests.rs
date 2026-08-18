@@ -12,8 +12,8 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    ArrayRef, Date32Array, Float64Array, Int64Array, RecordBatch, StringArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
+    ArrayRef, BinaryViewArray, Date32Array, Float64Array, Int64Array, RecordBatch, StringArray,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{ArrowError, DataType, Field, Schema};
 use dispatch::{BUFFER_SIZE, Dispatch, values_input};
@@ -191,7 +191,9 @@ impl IntoBatch for ColumnsItem {
         let fields: Vec<_> = self
             .0
             .iter()
-            .map(|(name, array)| arrow_schema::Field::new(*name, array.data_type().clone(), false))
+            .map(|(name, array)| {
+                arrow_schema::Field::new(*name, array.data_type().clone(), array.null_count() != 0)
+            })
             .collect();
         let arrays = self.0.into_iter().map(|(_, array)| array).collect();
         RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
@@ -423,8 +425,8 @@ fn already_shredded_input_re_shreds_to_the_merged_rows() {
 }
 
 /// Every leaf carries footer statistics, shredded or not, so a reader can prune
-/// row groups by any of them. The typed leaves get a range; the binary
-/// `metadata`/`value` leaves have no orderable type and get a null count alone.
+/// row groups by any of them. Typed leaves get a range; binary variant leaves
+/// always get a null count and get a range only for canonical JSON nulls.
 #[test]
 fn every_leaf_carries_footer_statistics() {
     let files = write(
@@ -467,6 +469,44 @@ fn an_unused_fallback_leaf_records_a_full_null_count() {
         "every row shredded, so the fallback is null throughout: {stats:?}"
     );
     assert!(!fallback.2, "an all-null leaf has no min/max to report");
+}
+
+#[test]
+fn a_json_null_only_binary_leaf_records_its_canonical_bounds() {
+    // Setup
+    let nulls: ArrayRef = Arc::new(BinaryViewArray::from(vec![
+        Some(&[0_u8][..]),
+        None,
+        Some(&[0_u8][..]),
+    ]));
+    let mixed: ArrayRef = Arc::new(BinaryViewArray::from(vec![
+        &[0_u8][..],
+        &[1_u8][..],
+        &[0_u8][..],
+    ]));
+
+    // Execute
+    let files = write(
+        vec![ColumnsItem(vec![("nulls", nulls), ("mixed", mixed)])],
+        100_000,
+    );
+    let reader =
+        ParquetRecordBatchReaderBuilder::try_new(bytes::Bytes::copy_from_slice(&files[0])).unwrap();
+    let row_group = reader.metadata().row_group(0);
+    let null_stats = row_group.column(0).statistics();
+    let mixed_stats = row_group.column(1).statistics();
+
+    // Assert
+    assert_eq!(
+        null_stats.and_then(|stats| stats.min_bytes_opt()),
+        Some(&[0_u8][..])
+    );
+    assert_eq!(
+        null_stats.and_then(|stats| stats.max_bytes_opt()),
+        Some(&[0_u8][..])
+    );
+    assert_eq!(mixed_stats.and_then(|stats| stats.min_bytes_opt()), None);
+    assert_eq!(mixed_stats.and_then(|stats| stats.max_bytes_opt()), None);
 }
 
 /// A nested path shreds into nested groups, and the document still reads back
