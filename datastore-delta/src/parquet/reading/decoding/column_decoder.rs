@@ -100,7 +100,7 @@ fn extract_variant_path(
 pub struct ColumnDecoder {
     /// The positions within the row group's decoded leaves that this output
     /// folds, in Parquet's depth-first order.
-    leaf_positions: Vec<Option<usize>>,
+    leaf_positions: Vec<usize>,
     /// The folded leaves land under this field. It is the output field for a
     /// plain column, and for an extract it is whatever the read leaves
     /// reconstruct: the typed leaf, a pruned variant, or the whole variant.
@@ -123,7 +123,7 @@ impl ColumnDecoder {
         column: usize,
         extract: Option<&VariantExtract>,
         read: &OutputRead,
-        leaf_positions: Vec<Option<usize>>,
+        leaf_positions: Vec<usize>,
         leaf_fields: &[FieldRef],
         fields: &Fields,
     ) -> Result<Self> {
@@ -201,7 +201,7 @@ impl ColumnDecoder {
     /// entirely, so it can use neither.
     pub fn untransformed_leaf(&self) -> Option<usize> {
         match (self.transform.is_some(), self.leaf_positions.as_slice()) {
-            (false, [Some(position)]) => Some(*position),
+            (false, [position]) => Some(*position),
             _ => None,
         }
     }
@@ -209,19 +209,10 @@ impl ColumnDecoder {
     /// Folds this column's share of the row group's `decoded` leaves into its
     /// output array.
     pub fn read(&self, decoded: &[ArrayRef]) -> Result<ArrayRef> {
-        let len = self
+        let mut leaf_arrays = self
             .leaf_positions
             .iter()
-            .find_map(|position| position.map(|position| decoded[position].len()))
-            .expect("every output reads at least one physical leaf");
-        let fields = Fields::from(vec![self.pre_transform_field.clone()]);
-        let mut leaf_arrays = crate::parquet::types::leaves::leaf_fields(&fields)
-            .into_iter()
-            .zip(&self.leaf_positions)
-            .map(|(field, position)| match position {
-                Some(position) => decoded[*position].clone(),
-                None => arrow_array::new_null_array(field.data_type(), len),
-            });
+            .map(|&position| decoded[position].clone());
         let column = reconstruct_column_from_leaves(&self.pre_transform_field, &mut leaf_arrays);
         match &self.transform {
             Some(transform) => transform.apply(&column),

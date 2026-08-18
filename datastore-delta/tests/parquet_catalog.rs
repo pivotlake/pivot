@@ -1921,6 +1921,28 @@ fn variant_pushdown_range_prunes_by_the_shredded_leaf() {
     assert_eq!(row_group_count(&datastore, "docs", &table), 1);
 }
 
+#[test]
+fn variant_pushdown_prunes_json_null_and_missing_groups() {
+    // Setup
+    let dir = TempDir::new().unwrap();
+    let docs = vec![
+        r#"{"age":10}"#.to_string(),
+        r#"{"age":null}"#.to_string(),
+        r#"{}"#.to_string(),
+        r#"{"age":30}"#.to_string(),
+    ];
+    write_docs_file_into(dir.path(), "docs.parquet", &docs, Some("age"));
+    let (_database, datastore, mut table) = shredded_docs_datastore(dir.path());
+
+    // Execute
+    table
+        .pushdown_filter(variant_filter(&["age"], CompareType::Equal, 30))
+        .unwrap();
+
+    // Assert
+    assert_eq!(row_group_count(&datastore, "docs", &table), 1);
+}
+
 /// Soundness: a path this file doesn't shred has no typed leaf to read stats
 /// from, so nothing is pruned and the upstream `Filter` still runs.
 #[test]

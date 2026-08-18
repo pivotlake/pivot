@@ -95,6 +95,12 @@ pub fn row_group_eliminated(
     let Some(stats) = row_group.leaf_statistics(leaf) else {
         return Ok(false);
     };
+    // Every ordinary comparison against SQL NULL is unknown and therefore
+    // cannot pass a WHERE filter. This also handles shredded typed leaves whose
+    // only fallbacks are absent values or JSON nulls.
+    if stats.null_count == Some(row_group.num_rows) {
+        return Ok(true);
+    }
     let (Some(min), Some(max)) = (stats.min.as_ref(), stats.max.as_ref()) else {
         return Ok(false);
     };
