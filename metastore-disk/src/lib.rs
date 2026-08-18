@@ -612,8 +612,10 @@ enum DatastoreKind {
 impl DatastoreConfig {
     /// Build this datastore's object store. The backend is chosen from
     /// `location`: an `s3://` (or `s3a://`) URI opens an S3 store, a `gs://`
-    /// URI a Google Cloud Storage store, anything else a local path (an
-    /// optional `file://` scheme is stripped).
+    /// URI a Google Cloud Storage store, and a path with no scheme (or a
+    /// `file://` one, which is stripped) a local store. A location whose scheme
+    /// names none of these is refused, so the server fails to start rather than
+    /// serving an empty datastore out of a directory named after the URI.
     ///
     /// A remote store is opened with the secret scoped to its location. An S3
     /// location needs one: without it there is nothing to sign a request with.
@@ -621,7 +623,7 @@ impl DatastoreConfig {
     /// Default Credentials chain, which on Google compute is the whole
     /// configuration a store needs.
     fn open_store(&self, name: &str, secrets: &Secrets) -> Result<Arc<dyn ObjectStore>> {
-        match StoreScheme::of(&self.location) {
+        match StoreScheme::of(&self.location)? {
             StoreScheme::S3 => {
                 let credentials =
                     secrets
@@ -901,6 +903,22 @@ secrets:
         let error = open_store(&store, "warm").unwrap_err();
 
         assert!(matches!(&error, Error::NoSecret { .. }), "{error}");
+    }
+
+    #[test]
+    fn a_datastore_located_under_an_unknown_scheme_is_rejected() {
+        let yaml = "\
+datastores:
+  hot:
+    kind: delta
+    location: blob://analytics/hot
+    default: true
+";
+
+        let store = from_yaml(yaml).unwrap();
+        let error = open_store(&store, "hot").unwrap_err();
+
+        assert!(matches!(&error, Error::Store(_)), "{error}");
     }
 
     #[test]

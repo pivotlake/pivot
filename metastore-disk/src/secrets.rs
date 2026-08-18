@@ -112,8 +112,8 @@ struct SecretScope {
 
 impl SecretScope {
     /// The scope `written` spells, for a secret named `name` of `scheme`. A
-    /// scope addressing another backend is refused rather than quietly covering
-    /// nothing.
+    /// scope addressing another backend, or one whose scheme addresses no
+    /// backend at all, is refused rather than quietly covering nothing.
     fn parse(name: &str, written: &Option<String>, scheme: StoreScheme) -> Result<Self> {
         let Some(written) = written else {
             return Ok(Self {
@@ -121,7 +121,7 @@ impl SecretScope {
                 segments: Vec::new(),
             });
         };
-        if StoreScheme::of(written) != scheme {
+        if !matches!(StoreScheme::of(written), Ok(written_scheme) if written_scheme == scheme) {
             return Err(Error::SecretScope {
                 name: name.to_string(),
                 scope: written.clone(),
@@ -250,7 +250,7 @@ impl Secrets {
     /// The credentials an S3 `location` is opened with, from the most specific
     /// scope covering it.
     pub(crate) fn resolve_s3(&self, location: &str) -> Option<S3Credentials> {
-        let secret = &find_most_specific(&self.s3, location)?.secret;
+        let secret = &find_most_specific(&self.s3, StoreScheme::S3, location)?.secret;
         Some(S3Credentials {
             region: secret.region.clone(),
             access_key: secret.access_key_id.clone(),
@@ -264,7 +264,7 @@ impl Secrets {
     /// ambient Application Default Credentials chain.
     pub(crate) fn resolve_gcs(&self, location: &str) -> Option<&str> {
         Some(
-            find_most_specific(&self.gcs, location)?
+            find_most_specific(&self.gcs, StoreScheme::Gcs, location)?
                 .secret
                 .credentials_file
                 .as_str(),
@@ -277,13 +277,14 @@ impl Secrets {
 /// A scope covers a location when it names some prefix of the location's
 /// segments, so the scopes that could cover this one are known outright: there
 /// is a candidate per prefix, and no others. Asking for each in turn, longest
-/// first, finds the most specific without searching what is held. A location of
-/// another backend matches nothing, since the backend is part of the key.
+/// first, finds the most specific without searching what is held. `scheme` is
+/// the backend the caller is resolving credentials for, and is part of the key,
+/// so a secret held for another backend matches nothing.
 fn find_most_specific<'a, T>(
     secrets: &'a HashMap<SecretScope, T>,
+    scheme: StoreScheme,
     location: &str,
 ) -> Option<&'a T> {
-    let scheme = StoreScheme::of(location);
     let segments = split_segments(location);
     (0..=segments.len()).rev().find_map(|depth| {
         secrets.get(&SecretScope {

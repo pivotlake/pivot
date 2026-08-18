@@ -277,15 +277,20 @@ pub enum StoreScheme {
 
 impl StoreScheme {
     /// The backend `uri` addresses. `s3://` and its `s3a://` spelling are the
-    /// same backend over the same buckets; anything that is not a recognised
-    /// object-store URI is a local path.
-    pub fn of(uri: &str) -> Self {
-        if uri.starts_with("s3://") || uri.starts_with("s3a://") {
-            Self::S3
-        } else if uri.starts_with("gs://") {
-            Self::Gcs
-        } else {
-            Self::Local
+    /// same backend over the same buckets; a URI carrying no scheme at all is a
+    /// filesystem path, which `file://` is the explicit spelling of.
+    ///
+    /// A URI whose scheme names no backend is an error rather than a local
+    /// path: a mistyped or unsupported scheme would otherwise open a directory
+    /// named after the URI, and the datastore would come up empty where its
+    /// data was expected.
+    pub fn of(uri: &str) -> Result<Self> {
+        match uri.split_once("://") {
+            Some(("s3" | "s3a", _)) => Ok(Self::S3),
+            Some(("gs", _)) => Ok(Self::Gcs),
+            Some(("file", _)) => Ok(Self::Local),
+            Some(_) => Err(StoreError::UnsupportedUri(uri.to_string())),
+            None => Ok(Self::Local),
         }
     }
 
@@ -311,7 +316,7 @@ pub fn local_path(uri: &str) -> &str {
 /// come from the environment; a caller holding its own opens the backend
 /// directly (`S3Store::with_credentials`, `GcsStore::with_credentials_file`).
 pub fn open_store(uri: &str) -> Result<Box<dyn ObjectStore>> {
-    match StoreScheme::of(uri) {
+    match StoreScheme::of(uri)? {
         StoreScheme::S3 => Ok(Box::new(S3Store::from_uri(uri)?)),
         StoreScheme::Gcs => Ok(Box::new(GcsStore::from_uri(uri)?)),
         StoreScheme::Local => Ok(Box::new(LocalStore::new(local_path(uri)))),
@@ -427,5 +432,17 @@ mod tests {
         let uri = format!("file://{}", dir.path().to_str().unwrap());
         let reopened = open_store(&uri).unwrap();
         assert_eq!(reopened.get(&key).unwrap().unwrap(), b"v");
+    }
+
+    #[test]
+    fn open_store_rejects_a_uri_of_an_unknown_scheme() {
+        let error = open_store("blob://bucket/prefix").unwrap_err();
+
+        assert!(matches!(&error, StoreError::UnsupportedUri(uri) if uri == "blob://bucket/prefix"));
+    }
+
+    #[test]
+    fn a_relative_path_is_a_local_store() {
+        assert_eq!(StoreScheme::of("data/warm").unwrap(), StoreScheme::Local);
     }
 }
