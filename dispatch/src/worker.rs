@@ -44,6 +44,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// µs-scale gaps between a small query's stages; a longer real stall still falls
 /// through to a park. Large queries keep workers busy and rarely reach this path.
 const IN_FLIGHT_SPIN_LIMIT: u32 = 120_000;
+
+/// The spin budget, overridable through `PIVOT_SPIN_LIMIT` (`0` parks
+/// immediately). Instrumented (PGO) profiling runs set `0`. Profiling runs
+/// on a small dataset where waits are short, so the spin usually catches the
+/// next wake and the park path and per-pass event-loop machinery barely
+/// execute; on the full dataset a cold query's IO waits exhaust any spin
+/// budget and every worker parks constantly. A profile taken while spinning
+/// therefore underweights exactly the control-flow mix cold execution runs,
+/// and its branch weights shift with profiling-run timing, which makes every
+/// build a different draw. Parking during profiling records the wait-heavy
+/// mix deterministically. The optimized build runs with the variable unset
+/// and keeps the full budget.
+fn in_flight_spin_limit() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        crate::env::get_env_var_with_default("PIVOT_SPIN_LIMIT", IN_FLIGHT_SPIN_LIMIT)
+    })
+}
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Barrier};
 use std::thread::JoinHandle;
@@ -401,7 +419,7 @@ impl Worker {
         // core is idle at the barrier anyway). With no dataflow running we're
         // genuinely idle between queries — park immediately rather than burn CPU.
         if !self.data_flows.is_empty() {
-            for _ in 0..IN_FLIGHT_SPIN_LIMIT {
+            for _ in 0..in_flight_spin_limit() {
                 let now = self.waker.wake_count();
                 if now != self.last_seen_wake_count {
                     self.last_seen_wake_count = now;

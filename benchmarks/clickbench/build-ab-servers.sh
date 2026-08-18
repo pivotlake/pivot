@@ -86,7 +86,12 @@ build_side() {
         # LLVM_PROFILE_FILE reaches the instrumented server through the
         # environment pivot-bench spawns it with; the client itself is not
         # instrumented and writes nothing.
-        LLVM_PROFILE_FILE="$pgo/%m-%p.profraw" \
+        # PIVOT_SPIN_LIMIT=0 parks idle workers immediately instead of
+        # spinning, so the profile records the wait-heavy control-flow mix
+        # that cold runs on the full dataset execute (where IO waits exhaust
+        # any spin budget), and records it deterministically instead of
+        # drawing a timing-dependent mix per build.
+        LLVM_PROFILE_FILE="$pgo/%m-%p.profraw" PIVOT_SPIN_LIMIT=0 \
             "target-client/release/pivot-bench" \
             --server-bin "target-pgogen/$host_target/release/pivotdb-server" \
             --source "$pgo_subset" --iterations 2 --skip-check >/dev/null
