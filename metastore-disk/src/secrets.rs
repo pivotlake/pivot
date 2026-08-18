@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 
-use datastore_delta::store::S3Credentials;
+use datastore_delta::store::{S3Credentials, StoreScheme};
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};
@@ -96,45 +96,13 @@ impl std::fmt::Debug for SecretConfig {
     }
 }
 
-/// The storage backend a URI addresses, taken from its scheme. A location is
-/// classified with it, and so is a secret's scope: the two must agree for the
-/// secret to cover the location.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StoreScheme {
-    S3,
-    Gcs,
-    Local,
-}
-
-impl StoreScheme {
-    /// The backend `uri` addresses. `s3://` and its `s3a://` spelling are the
-    /// same backend over the same buckets, so they share one scope space;
-    /// anything that is not a recognised object-store URI is a local path.
-    pub(crate) fn of(uri: &str) -> Self {
-        if uri.starts_with("s3://") || uri.starts_with("s3a://") {
-            Self::S3
-        } else if uri.starts_with("gs://") {
-            Self::Gcs
-        } else {
-            Self::Local
-        }
-    }
-
-    /// The URI prefix a location of this backend is written with, and the form
-    /// a scope of it is printed back in.
-    fn uri_prefix(self) -> &'static str {
-        match self {
-            Self::S3 => "s3://",
-            Self::Gcs => "gs://",
-            Self::Local => "file://",
-        }
-    }
-}
-
 /// The paths a secret covers: a backend, then the segments pinned down below
 /// it (the bucket, then any prefix parts). No segments at all is every location
 /// the backend addresses, which is what a secret written without a `scope`
 /// gets.
+///
+/// A scope is classified by the same [`StoreScheme`] a datastore's location is,
+/// so the two agree on what `s3a://` and a `file://` path mean.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SecretScope {
     scheme: StoreScheme,

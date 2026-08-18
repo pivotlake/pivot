@@ -266,16 +266,55 @@ pub trait ObjectStore: Debug + Send + Sync {
     fn build_delta_object_store(&self) -> Result<Arc<DynObjectStore>>;
 }
 
+/// The backend a location URI addresses. The backend is inferred from the
+/// scheme rather than configured, so this is the one place that reads one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreScheme {
+    S3,
+    Gcs,
+    Local,
+}
+
+impl StoreScheme {
+    /// The backend `uri` addresses. `s3://` and its `s3a://` spelling are the
+    /// same backend over the same buckets; anything that is not a recognised
+    /// object-store URI is a local path.
+    pub fn of(uri: &str) -> Self {
+        if uri.starts_with("s3://") || uri.starts_with("s3a://") {
+            Self::S3
+        } else if uri.starts_with("gs://") {
+            Self::Gcs
+        } else {
+            Self::Local
+        }
+    }
+
+    /// The URI prefix a location of this backend is written with, and the form
+    /// one is printed back in.
+    pub fn uri_prefix(self) -> &'static str {
+        match self {
+            Self::S3 => "s3://",
+            Self::Gcs => "gs://",
+            Self::Local => "file://",
+        }
+    }
+}
+
+/// The filesystem path a [local](StoreScheme::Local) location names: `file://`
+/// is an optional spelling of a plain path, not a backend of its own.
+pub fn local_path(uri: &str) -> &str {
+    uri.strip_prefix("file://").unwrap_or(uri)
+}
+
 /// Open the object store for a catalog root URI: `s3://bucket/prefix`,
-/// `gs://bucket/prefix`, or a local path (optionally `file://`).
+/// `gs://bucket/prefix`, or a local path (optionally `file://`). Credentials
+/// come from the environment; a caller holding its own opens the backend
+/// directly (`S3Store::with_credentials`, `GcsStore::with_credentials_file`).
 pub fn open_store(uri: &str) -> Result<Box<dyn ObjectStore>> {
-    if uri.starts_with("s3://") || uri.starts_with("s3a://") {
-        Ok(Box::new(S3Store::from_uri(uri)?))
-    } else if uri.starts_with("gs://") {
-        Ok(Box::new(GcsStore::from_uri(uri)?))
-    } else {
-        let path = uri.strip_prefix("file://").unwrap_or(uri);
-        Ok(Box::new(LocalStore::new(path)))
+    match StoreScheme::of(uri) {
+        StoreScheme::S3 => Ok(Box::new(S3Store::from_uri(uri)?)),
+        StoreScheme::Gcs => Ok(Box::new(GcsStore::from_uri(uri)?)),
+        StoreScheme::Local => Ok(Box::new(LocalStore::new(local_path(uri)))),
     }
 }
 

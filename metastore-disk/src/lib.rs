@@ -116,7 +116,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use catalog::Datastore;
-use datastore_delta::store::{GcsStore, LocalStore, ObjectStore, S3Store};
+use datastore_delta::store::{GcsStore, LocalStore, ObjectStore, S3Store, StoreScheme, local_path};
 use datastore_delta::{
     CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL, DEFAULT_MIN_FILES_TO_MERGE,
     DEFAULT_VACUUM_POLL, DeltaDatastore, MaintenanceConfig, VacuumConfig,
@@ -132,7 +132,7 @@ use serde::{Deserialize, Serialize};
 mod secrets;
 mod units;
 
-use secrets::{SecretConfig, Secrets, StoreScheme};
+use secrets::{SecretConfig, Secrets};
 pub use units::{ByteSize, Interval};
 
 /// A metastore backed by the config file's `metastore` section, and by the
@@ -647,13 +647,7 @@ impl DatastoreConfig {
                 }
                 None => GcsStore::from_uri(&self.location)?,
             })),
-            StoreScheme::Local => {
-                let path = self
-                    .location
-                    .strip_prefix("file://")
-                    .unwrap_or(&self.location);
-                Ok(Arc::new(LocalStore::new(path)))
-            }
+            StoreScheme::Local => Ok(Arc::new(LocalStore::new(local_path(&self.location)))),
         }
     }
 }
@@ -1001,6 +995,43 @@ secrets:
                 .describe()
                 .contains("eu-west-1")
         );
+    }
+
+    #[test]
+    fn a_scope_covers_a_deeper_path_but_not_a_longer_bucket_name() {
+        // One scope, two datastores: `covered` sits under the bucket it names,
+        // `adjacent` in a bucket whose name merely starts with it.
+        let yaml = r#"
+datastores:
+  hot:
+    kind: delta
+    location: /tmp/hot
+    default: true
+  covered:
+    kind: delta
+    location: s3://analytics/warm/data
+  adjacent:
+    kind: delta
+    location: s3://analyticsarchive/warm
+secrets:
+  analytics:
+    type: s3
+    scope: s3://analytics
+    region: eu-west-1
+    access_key_id: AKIA
+    secret_access_key: secret
+"#;
+
+        let store = from_yaml(yaml).unwrap();
+
+        assert!(
+            open_store(&store, "covered")
+                .unwrap()
+                .describe()
+                .contains("eu-west-1")
+        );
+        let error = open_store(&store, "adjacent").unwrap_err();
+        assert!(matches!(&error, Error::NoSecret { .. }), "{error}");
     }
 
     #[test]
