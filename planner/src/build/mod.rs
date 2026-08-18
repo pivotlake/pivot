@@ -674,7 +674,8 @@ fn build_range_join(
         | Type::Float32
         | Type::Float64
         | Type::Date
-        | Type::Timestamp => {}
+        | Type::Timestamp
+        | Type::TimestampTz => {}
         other => {
             return Err(OperatorError::Unsupported(format!(
                 "Unsupported range join key type: {other:?}"
@@ -797,6 +798,7 @@ fn joinable_key_type(key_type: Type) -> Result<Type, OperatorError> {
         | Type::Decimal { .. }
         | Type::Date
         | Type::Timestamp
+        | Type::TimestampTz
         | Type::Utf8 => Ok(key_type),
         _ => Err(OperatorError::Unsupported(format!(
             "Unsupported join key type: {key_type:?}"

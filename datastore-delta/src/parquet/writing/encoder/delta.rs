@@ -80,7 +80,7 @@ fn encoding_for(data_type: &DataType) -> Option<Encoding> {
         | DataType::Int32
         | DataType::Int64
         | DataType::Date32
-        | DataType::Timestamp(TimeUnit::Microsecond, None) => Some(Encoding::DELTA_BINARY_PACKED),
+        | DataType::Timestamp(TimeUnit::Microsecond, _) => Some(Encoding::DELTA_BINARY_PACKED),
         DataType::Decimal64(precision, _) | DataType::Decimal128(precision, _) => {
             match decimal_write_storage(*precision) {
                 DecimalWriteStorage::Int32 | DecimalWriteStorage::Int64 => {
@@ -145,7 +145,7 @@ fn integers(array: &dyn Array) -> WriteResult<Cow<'_, [i64]>> {
     }
     Ok(match array.data_type() {
         DataType::Int64 => Cow::Borrowed(downcast::<Int64Array>(array)?.values()),
-        DataType::Timestamp(TimeUnit::Microsecond, None) => {
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
             Cow::Borrowed(downcast::<TimestampMicrosecondArray>(array)?.values())
         }
         DataType::Decimal64(_, _) => Cow::Borrowed(downcast::<Decimal64Array>(array)?.values()),

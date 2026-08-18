@@ -36,17 +36,19 @@ pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
             return_type: Type::Int64,
             volatile: true,
         }),
-        // `now()`: current wall-clock time. VOLATILE so DuckDB can't fold the
-        // call into its own `TIMESTAMP WITH TIME ZONE` constant; pivot evaluates
-        // it instead, returning the plain microsecond `TIMESTAMP` the rest of
-        // its time path counts in. (The bare `CURRENT_TIMESTAMP` keyword is a separate
-        // DuckDB value-function that yields a TZ type pivot doesn't model, so
-        // only the `now()` call form is intercepted here.)
-        "now" => Some(ScalarFunctionSignature {
-            arguments: vec![],
-            return_type: Type::Timestamp,
-            volatile: true,
-        }),
+        // `now()` and the bare `CURRENT_TIMESTAMP` keyword (which DuckDB's
+        // binder resolves to `get_current_timestamp`, aliased
+        // `transaction_timestamp`): the current wall-clock time as a
+        // `TIMESTAMP WITH TIME ZONE`, Postgres's type for it. VOLATILE so
+        // DuckDB can't fold the call into a plan-time constant; pivot captures
+        // the instant when it compiles the statement instead.
+        "now" | "get_current_timestamp" | "transaction_timestamp" => {
+            Some(ScalarFunctionSignature {
+                arguments: vec![],
+                return_type: Type::TimestampTz,
+                volatile: true,
+            })
+        }
         // Not a DuckDB built-in (unlike `regexp_replace`), so its signature is
         // registered here for DuckDB's binder.
         "regexp_jit_replace" => Some(ScalarFunctionSignature {
@@ -248,8 +250,11 @@ impl Function {
             | Function::FormatBytes(_) => Type::Utf8,
             // `/` computes a float quotient, single- or double-precision.
             Function::Divide(d) => d.return_type.clone(),
-            // `date_trunc` and `now()` yield a timestamp.
-            Function::DateTrunc(_) | Function::Now(_) => Type::Timestamp,
+            // `date_trunc` keeps its source's timestamp type (with or without
+            // a zone), as DuckDB bound it.
+            Function::DateTrunc(d) => d.result.clone(),
+            // `now()` is Postgres's TIMESTAMP WITH TIME ZONE.
+            Function::Now(_) => Type::TimestampTz,
             // Canonicalising a span rewrites its fields, not its type.
             Function::NormalizedInterval(_) => Type::Interval,
             // `date`/`timestamp` ± interval keeps the temporal operand's type,

@@ -154,7 +154,24 @@ impl PivotQueryHandler {
     }
 }
 
-fn apply_set<C: ClientInfo>(client: &mut C, name: &str, value: Option<&str>) -> Response {
+fn apply_set<C: ClientInfo>(
+    client: &mut C,
+    name: &str,
+    value: Option<&str>,
+) -> PgWireResult<Response> {
+    // The session time zone is fixed to UTC: every timestamptz renders,
+    // parses, and truncates in UTC. A `SET TimeZone` to a UTC spelling is
+    // accepted (drivers send one at startup), anything else is refused so a
+    // client never gets UTC answers while believing another zone applies.
+    // `RESET TimeZone` restores the default, which is UTC already.
+    if name.eq_ignore_ascii_case("timezone")
+        && let Some(zone) = value
+        && !is_utc_zone(zone)
+    {
+        return Err(user_error(format!(
+            "unsupported TimeZone {zone:?}: this server runs sessions in UTC only"
+        )));
+    }
     if name.eq_ignore_ascii_case(STATS_FLAG) {
         if value.is_some_and(is_truthy) {
             client
@@ -174,7 +191,21 @@ fn apply_set<C: ClientInfo>(client: &mut C, name: &str, value: Option<&str>) -> 
             client.metadata_mut().remove(PERF_FLAG);
         }
     }
-    Response::Execution(Tag::new(if value.is_none() { "RESET" } else { "SET" }))
+    Ok(Response::Execution(Tag::new(if value.is_none() {
+        "RESET"
+    } else {
+        "SET"
+    })))
+}
+
+/// The `TimeZone` spellings that mean UTC. Offset spellings are not expanded
+/// beyond the common zero offsets; a session asking for any other zone is
+/// refused rather than quietly served UTC.
+fn is_utc_zone(zone: &str) -> bool {
+    matches!(
+        zone.to_ascii_lowercase().trim_matches('\''),
+        "utc" | "etc/utc" | "gmt" | "etc/gmt" | "+00" | "+00:00" | "00:00"
+    )
 }
 
 fn is_truthy(value: &str) -> bool {
@@ -288,7 +319,7 @@ impl PivotQueryHandler {
         let response = match execution.output {
             StatementOutput::Rows { columns, batches } => build_query_response(columns, batches),
             StatementOutput::Command(command) => build_command_response(command),
-            StatementOutput::Set { name, value } => apply_set(client, &name, value.as_deref()),
+            StatementOutput::Set { name, value } => apply_set(client, &name, value.as_deref())?,
             StatementOutput::CopyFromStdin(ingest) => {
                 // The CopyInResponse advertises a binary payload (the Arrow
                 // IPC stream), so clients know not to apply text escaping to

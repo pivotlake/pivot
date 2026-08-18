@@ -39,7 +39,7 @@ fn as_backing_integer(values: &ArrayRef) -> ArrayRef {
                 days.nulls().cloned(),
             ))
         }
-        DataType::Timestamp(TimeUnit::Microsecond, None) => {
+        DataType::Timestamp(TimeUnit::Microsecond, _) => {
             let micros = values.as_primitive::<TimestampMicrosecondType>();
             Arc::new(Int64Array::new(
                 micros.values().clone(),

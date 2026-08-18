@@ -386,7 +386,9 @@ impl Function {
                 function_args(func, 0)?;
                 Ok(Function::DropCache)
             }
-            "now" => {
+            // `CURRENT_TIMESTAMP` binds to `get_current_timestamp`; all the
+            // spellings are pivot's compile-time clock capture.
+            "now" | "get_current_timestamp" | "transaction_timestamp" => {
                 function_args(func, 0)?;
                 Ok(Function::Now(Now))
             }
@@ -569,9 +571,13 @@ impl DateTrunc {
     pub(crate) fn from_handle(func: FunctionHandle<'_>) -> Result<DateTrunc, Error> {
         let params = function_args(func, 2)?;
         let unit = constant_string(Expression::from_handle(params[0])?)?.to_ascii_lowercase();
+        // DuckDB types the call: the result tracks the source's timestamp
+        // type, zone marker included.
+        let result = type_from_logical(func.return_type()?)?;
         Ok(DateTrunc {
             unit,
             source: Box::new(Expression::from_handle(params[1])?),
+            result,
         })
     }
 }
@@ -705,7 +711,9 @@ fn interval_offset(interval: &IntervalParts, result: &Type) -> Result<i64, Error
             }
             Ok(interval.days as i64)
         }
-        Type::Timestamp => {
+        // A day is a fixed 24 hours here even for TIMESTAMPTZ: the session
+        // zone is UTC, which has no DST boundary to stretch a day across.
+        Type::Timestamp | Type::TimestampTz => {
             Ok(interval.days as i64 * SECS_PER_DAY * MICROS_PER_SEC + interval.micros)
         }
         other => Err(Error::UnsupportedInterval(format!(

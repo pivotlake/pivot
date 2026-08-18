@@ -1,11 +1,13 @@
 #include "duckdb/main/extension_helper.hpp"
 #include "core_functions_extension.hpp"
+#include "icu_extension.hpp"
 #include "duckdb-planner/src/duckdb_bridge/cpp/extension.h"
 
 namespace duckdb {
 
 void ExtensionHelper::LoadAllExtensions(DuckDB &db) {
 	db.LoadStaticExtension<CoreFunctionsExtension>();
+	db.LoadStaticExtension<IcuExtension>();
 	db.LoadStaticExtension<PivotExtension>();
 }
 

@@ -908,6 +908,82 @@ fn scan_reads_a_microsecond_timestamp_column() {
 /// A file at any other resolution fails the load: its counts mean something
 /// else, and reading them as microseconds would misplace every value by the
 /// ratio between the two units.
+/// A file whose timestamp leaf is stamped UTC-adjusted, the way most engines
+/// write instants, reads back as a zone-carrying timestamp when nothing is
+/// declared, and as whichever timestamp type the table does declare.
+#[test]
+fn scan_honors_a_files_utc_adjusted_flag() {
+    use arrow_array::TimestampMicrosecondArray;
+    use arrow_array::types::TimestampMicrosecondType;
+    use arrow_schema::TimeUnit;
+
+    let dispatch = dispatch(1);
+    let counts = vec![1_700_000_000_123_456i64, 0];
+    let values: ArrayRef =
+        Arc::new(TimestampMicrosecondArray::from(counts.clone()).with_timezone("UTC"));
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            false,
+        )])),
+        vec![values],
+    )
+    .unwrap();
+    let dir = TempDir::new().unwrap();
+    let file = std::fs::File::create(dir.path().join("instants.parquet")).unwrap();
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let declared_tz = [planner::catalog::Column {
+        name: "ts".to_string(),
+        col_type: planner::types::Type::TimestampTz,
+    }];
+    let declared_naive = [planner::catalog::Column {
+        name: "ts".to_string(),
+        col_type: planner::types::Type::Timestamp,
+    }];
+    let cases: [(&[planner::catalog::Column], DataType); 3] = [
+        (
+            &[],
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        ),
+        (
+            &declared_tz,
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        ),
+        (
+            &declared_naive,
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+        ),
+    ];
+    for (columns, expected_type) in cases {
+        let table = Arc::new(
+            ParquetTable::from_files(&dispatch, &parquet_files_in(dir.path()), columns).unwrap(),
+        );
+        let results = table_input(&dispatch, &table, Projection::all(1), false)
+            .collect()
+            .unwrap();
+
+        assert_eq!(*results[0].column(0).data_type(), expected_type);
+        let read: Vec<i64> = results
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<TimestampMicrosecondType>()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(read, counts);
+    }
+}
+
 #[test]
 fn a_timestamp_file_in_another_unit_is_rejected() {
     use arrow_schema::TimeUnit;

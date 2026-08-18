@@ -141,6 +141,45 @@ fn group_by_minute_of_timestamp(mut testing_planner: TestingPlanner) {
     assert_eq!(minute_one["count_star()"], 2);
 }
 
+#[rstest]
+fn group_by_minute_of_timestamptz(mut testing_planner: TestingPlanner) {
+    use arrow_array::Int64Array;
+    // The same minute-of-hour fixture on a zone-carrying column: extraction
+    // reads the UTC calendar, so the buckets match the zone-less case.
+    testing_planner.add_table(
+        "tz_events",
+        &[(
+            "EventTime",
+            Type::TimestampTz,
+            Arc::new(Int64Array::from(SECOND_MARKS.to_vec())) as ArrayRef,
+        )],
+    );
+
+    let results = testing_planner
+        .plan("SELECT extract(minute FROM EventTime) AS m, COUNT(*) FROM tz_events GROUP BY m")
+        .unwrap()
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let mut rows = batches_to_json(&results);
+    rows.sort_by_key(|r| r["m"].as_i64().unwrap());
+
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        rows.iter()
+            .map(|r| r["m"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    let minute_one = rows.iter().find(|r| r["m"] == 1).unwrap();
+    assert_eq!(minute_one["count_star()"], 2);
+}
+
 /// A table with a minute-of-hour computed group key (`EventTime` 0,90,150,3690 →
 /// minutes 0,1,2,1) and a value column. minute 1 holds two rows (v=20, v=40).
 fn minute_grouped_table(testing_planner: &mut TestingPlanner, name: &str) {

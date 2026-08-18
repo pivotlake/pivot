@@ -276,6 +276,7 @@ BridgeDecimalValue value_decimal(const Value &v);
 BridgeHugeint value_hugeint(const Value &v);
 int32_t value_date(const Value &v);
 int64_t value_timestamp(const Value &v);
+int64_t value_timestamp_tz(const Value &v);
 int32_t value_interval_months(const Value &v);
 int32_t value_interval_days(const Value &v);
 int64_t value_interval_micros(const Value &v);

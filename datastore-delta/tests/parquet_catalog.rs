@@ -971,6 +971,34 @@ fn timestamp_column_inserts_and_reads_back() {
     );
 }
 
+/// A TIMESTAMPTZ column stores UTC instants: a literal with an explicit offset
+/// lands converted to UTC, and the column reads back zone-marked.
+#[test]
+fn timestamptz_column_inserts_and_reads_back_in_utc() {
+    let columns = vec![Column {
+        name: "occurred".to_string(),
+        col_type: Type::TimestampTz,
+    }];
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, empty_request("events", columns)).unwrap();
+
+    let inserted = run_sql(
+        &datastore,
+        "INSERT INTO events VALUES (TIMESTAMPTZ '2020-01-01 02:00:00.5+02'), \
+         (TIMESTAMPTZ '1970-01-01 00:00:01+00')",
+    );
+    assert_eq!(common::extract_count(&inserted), 2);
+    datastore.refresh_from_store().unwrap();
+
+    let rows = run_sql(&datastore, "SELECT occurred FROM events ORDER BY occurred");
+    // 02:00:00.5+02 is 00:00:00.5 UTC on 2020-01-01.
+    assert_eq!(
+        rows[0].column(0).as_ref(),
+        &TimestampMicrosecondArray::from(vec![1_000_000i64, 1_577_836_800_500_000])
+            .with_timezone("UTC")
+    );
+}
+
 /// A value a column's type cannot represent fails the INSERT with an error
 /// naming it, instead of silently landing as NULL.
 #[test]
