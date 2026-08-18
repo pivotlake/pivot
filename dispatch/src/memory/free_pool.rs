@@ -326,6 +326,44 @@ mod tests {
     }
 
     #[test]
+    fn contended_steals_still_drain_every_available_slot() {
+        // Two thieves race to steal from worker 0's deque, which always holds
+        // enough for both; a lost steal race must be retried, not reported as
+        // an empty pool.
+        const ROUNDS: usize = 500;
+        let mut pools = build_pools(3).into_iter();
+        let pool0 = pools.next().unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let thieves: Vec<_> = pools
+            .zip(1..)
+            .map(|(pool, worker)| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    act_as_worker(worker, 3);
+                    let mut got = 0;
+                    for _ in 0..ROUNDS {
+                        barrier.wait();
+                        got += pool.pop(true).is_some() as usize;
+                        barrier.wait();
+                    }
+                    got
+                })
+            })
+            .collect();
+
+        act_as_worker(0, 3);
+        for _ in 0..ROUNDS {
+            pool0.push(0);
+            pool0.push(1);
+            barrier.wait();
+            barrier.wait();
+        }
+
+        let total: usize = thieves.into_iter().map(|t| t.join().unwrap()).sum();
+        assert_eq!(total, 2 * ROUNDS, "every pop had a slot available for it");
+    }
+
+    #[test]
     fn create_pool_via_factory_for_single_worker() {
         // Setup: exercise the factory's barrier path (1-worker barrier returns
         // immediately, so we can do this on a single thread).
