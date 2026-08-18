@@ -14,41 +14,18 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::thread;
 
-use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema};
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
-use common::{connect_client, pick_free_port, pivot_metastore, wait_until_listening};
+use common::{
+    connect_client, parquet_name_value_rows, pick_free_port, pivot_metastore, wait_until_listening,
+};
 use datastore_delta::DeltaDatastore;
 use datastore_delta::store::ObjectPath;
 use datastore_delta::test_support::{self, Backend};
 use dispatch::Dispatch;
-use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
 use server::Server;
 use tokio_postgres::{Client, SimpleQueryMessage};
 
 // --- helpers ---------------------------------------------------------------
-
-/// Snappy Parquet bytes for `(name VARCHAR, value BIGINT)` rows carrying the
-/// given `value`s (names are filler), ready to `put` into a store.
-fn pq(values: &[i64]) -> Vec<u8> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("name", DataType::Utf8, false),
-        Field::new("value", DataType::Int64, false),
-    ]));
-    let name: ArrayRef = Arc::new(StringArray::from(vec!["x"; values.len()]));
-    let value: ArrayRef = Arc::new(Int64Array::from(values.to_vec()));
-    let batch = RecordBatch::try_new(schema.clone(), vec![name, value]).unwrap();
-    let props = WriterProperties::builder()
-        .set_compression(Compression::SNAPPY)
-        .build();
-    let mut buf = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
-    buf
-}
 
 /// Start a server whose catalog is opened on `root` (a bucket URI or local
 /// path), on a dedicated thread, and return the port once it is listening.
@@ -102,10 +79,16 @@ async fn select_one_i64(client: &Client, sql: &str) -> i64 {
 /// and return a connected client.
 async fn events_server(b: &Backend) -> Client {
     b.store
-        .put(&ObjectPath::new("events/p1.parquet"), &pq(&[1, 2, 3]))
+        .put(
+            &ObjectPath::new("events/p1.parquet"),
+            &parquet_name_value_rows(&[1, 2, 3]),
+        )
         .unwrap();
     b.store
-        .put(&ObjectPath::new("events/p2.parquet"), &pq(&[4, 5]))
+        .put(
+            &ObjectPath::new("events/p2.parquet"),
+            &parquet_name_value_rows(&[4, 5]),
+        )
         .unwrap();
     let client = connect_client(start_server_on(&b.root)).await;
     client

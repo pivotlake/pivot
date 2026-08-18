@@ -326,15 +326,16 @@ impl ObjectStore for GcsStore {
 
     fn build_delta_object_store(&self) -> Result<Arc<DynObjectStore>> {
         let mut builder = GoogleCloudStorageBuilder::from_env().with_url(self.uri.as_str());
-        if let Some(path) = &self.auth.credentials_file {
-            builder = builder.with_service_account_path(path);
-        }
         // The emulator ignores credentials and serves plain HTTP on its own
-        // origin, so point Kernel's client at it and skip signing entirely.
+        // origin, so point Kernel's client at it and skip signing entirely. It
+        // is handed no key file either: it parses one the moment it is named,
+        // and a store that mints no tokens has no use for what it would read.
         if self.auth.emulated {
             builder = builder
                 .with_config(GoogleConfigKey::BaseUrl, &self.endpoint)
                 .with_config(GoogleConfigKey::SkipSignature, "true");
+        } else if let Some(path) = &self.auth.credentials_file {
+            builder = builder.with_service_account_path(path);
         }
         let store = builder
             .build()

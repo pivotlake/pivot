@@ -2,9 +2,10 @@
 //!
 //! The file has two sections, each owned by the code that acts on it. `server`
 //! is [`ServerConfig`] below: the endpoint, the memory and worker budgets, the
-//! disk cache. `metastore` is [`MetastoreConfig`]: the datastores to serve and
-//! the users that may connect. Both are read in a single pass, so a mistake in
-//! either one is reported with its place in the file and stops startup.
+//! disk cache. `metastore` is [`MetastoreConfig`]: the datastores to serve, the
+//! secrets they are opened with, and the users that may connect. Both are read
+//! in a single pass, so a mistake in either one is reported with its place in
+//! the file and stops startup.
 //!
 //! ```yaml
 //! server:
@@ -31,9 +32,9 @@
 //! Unknown keys are rejected rather than ignored: a misspelled setting would
 //! otherwise leave the server running on a default nobody asked for.
 //!
-//! The `metastore` section is not the only place datastores and users may be
-//! written: the binary's `--metastore-file` names a second file of the same
-//! shape, which the metastore merges into this section.
+//! The `metastore` section is not the only place datastores, secrets and users
+//! may be written: the binary's `--metastore-file` names a second file of the
+//! same shape, which the metastore merges into this section.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};

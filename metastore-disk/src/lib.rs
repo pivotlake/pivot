@@ -1,18 +1,18 @@
 //! A disk-backed [`metastore::Metastore`] provider.
 //!
 //! This crate owns the `metastore` section of PivotDB's config file: the
-//! datastores to serve and the users that may connect. The server reads the
-//! file, keeps its own `server` section, and hands this section over as a
-//! [`MetastoreConfig`]. The scalars both sections are written with,
-//! [`ByteSize`] and [`Interval`], are defined here too.
+//! datastores to serve, the secrets they are opened with, and the users that
+//! may connect. The server reads the file, keeps its own `server` section, and
+//! hands this section over as a [`MetastoreConfig`]. The scalars both sections
+//! are written with, [`ByteSize`] and [`Interval`], are defined here too.
 //!
 //! A section of the same shape may also live in a file of its own, which the
 //! server names with `--metastore-file` and this crate reads and merges into
 //! the config file's section ([`DiskMetastore::open`]). The two are peers: a
-//! datastore or a user may be written in either, and the rules below apply to
-//! the merged whole. A name written in both files stops startup rather than one
-//! silently winning, since the two entries are free to disagree about location
-//! or credentials.
+//! datastore, a secret or a user may be written in either, and the rules below
+//! apply to the merged whole. A name written in both files stops startup rather
+//! than one silently winning, since the two entries are free to disagree about
+//! location or credentials.
 //!
 //! Each file's definitions are held as a section of their own, because the two
 //! files are not interchangeable once the server is running: the config file
@@ -22,8 +22,8 @@
 //! `kind` is the datastore format (only `delta` today). The storage backend is
 //! chosen from `location`: a plain path (or `file://`) opens a local store, an
 //! `s3://` URI opens an S3 store, a `gs://` URI opens a Google Cloud Storage
-//! store. The S3 credential fields apply only to an `s3://` location, and
-//! `credentials_file` only to a `gs://` one.
+//! store. A datastore carries no credentials of its own; they come from the
+//! `secrets` section below.
 //!
 //! Exactly one datastore must set `default = true`; it becomes the current
 //! database, so unqualified table names and DDL resolve against it. Its name is
@@ -39,16 +39,42 @@
 //!     warm:
 //!       kind: delta
 //!       location: s3://my-bucket/pivot/
-//!       region: us-east-1            # required for s3://
-//!       access_key_id: AKIA...       # required for s3://
-//!       secret_access_key: "..."
-//!       # endpoint: http://localhost:9000
 //!       # compact: true              # optional
 //!     cold:
 //!       kind: delta
 //!       location: gs://my-bucket/pivot/
-//!       # credentials_file: /etc/pivot/gcs-key.json   # else ambient ADC
 //! ```
+//!
+//! Each entry under `secrets` holds the credentials for the paths its `scope`
+//! covers, so a bucket's keys are written once however many datastores sit in
+//! it. `type` names the backend (`s3` or `gcs`) and carries that backend's
+//! fields. The most specific scope covering a location authenticates it; two
+//! secrets may not claim the same scope, so which one that is never depends on
+//! the order they were written in. A secret with no `scope` covers every
+//! location of its type.
+//!
+//! ```yaml
+//! metastore:
+//!   secrets:
+//!     my-bucket:
+//!       type: s3
+//!       scope: s3://my-bucket/       # omit to cover every s3:// location
+//!       region: us-east-1
+//!       access_key_id: AKIA...
+//!       secret_access_key: "..."
+//!       # endpoint: http://localhost:9000   # MinIO / S3-compatible
+//!     google:
+//!       type: gcs
+//!       scope: gs://my-bucket/
+//!       credentials_file: /etc/pivot/gcs-key.json
+//! ```
+//!
+//! An `s3://` datastore needs a secret covering it: without one there is
+//! nothing to sign its requests with, and startup stops. A `gs://` datastore
+//! without one falls back to the ambient Application Default Credentials chain
+//! (`GOOGLE_APPLICATION_CREDENTIALS`, the file
+//! `gcloud auth application-default login` writes, or the workload identity of
+//! the Google compute instance).
 //!
 //! Each entry under `users` names a user that may authenticate to the
 //! PostgreSQL endpoint. Its nested `auth` selects one authentication method. A
@@ -79,10 +105,10 @@
 //! takes over its authentication method entirely: give it a
 //! `scram-sha-256` verifier to require a password of it.
 //!
-//! An S3 datastore's credentials are inline, so the file holds secrets and should
-//! be readable only by the PivotDB process (a GCS datastore's key stays in the
-//! file `credentials_file` points at). A verifier is not a password (the
-//! password cannot be recovered from it), but it is still worth the same care.
+//! An S3 secret's keys are inline, so a file holding one should be readable only
+//! by the PivotDB process (a GCS secret's key stays in the file
+//! `credentials_file` points at). A verifier is not a password (the password
+//! cannot be recovered from it), but it is still worth the same care.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -90,7 +116,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use catalog::Datastore;
-use datastore_delta::store::{GcsStore, LocalStore, ObjectStore, S3Credentials, S3Store};
+use datastore_delta::store::{GcsStore, LocalStore, ObjectStore, S3Store};
 use datastore_delta::{
     CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL, DEFAULT_MIN_FILES_TO_MERGE,
     DEFAULT_VACUUM_POLL, DeltaDatastore, MaintenanceConfig, VacuumConfig,
@@ -103,8 +129,10 @@ use metastore::{
 use pgwire::api::auth::sasl::scram::gen_salted_password;
 use serde::{Deserialize, Serialize};
 
+mod secrets;
 mod units;
 
+use secrets::{SecretConfig, Secrets, StoreScheme};
 pub use units::{ByteSize, Interval};
 
 /// A metastore backed by the config file's `metastore` section, and by the
@@ -122,6 +150,10 @@ pub struct DiskMetastore {
     metastore_config: RwLock<MetastoreConfig>,
     /// The file named by `--metastore-file`.
     metastore_file: Option<PathBuf>,
+    /// The secrets of both configs as one set, resolved against a datastore's
+    /// location when its store is opened. Built once here: nothing the server
+    /// writes back to the metastore file touches secrets.
+    secrets: Secrets,
     default_name: String,
     /// How often every datastore this metastore opens refreshes its table set
     /// from the store. Global (all datastores share the cadence, which the
@@ -149,11 +181,13 @@ impl DiskMetastore {
             None => MetastoreConfig::default(),
         };
         check_no_conflicts(&server_config, &metastore_config)?;
+        let secrets = Secrets::build([&server_config.secrets, &metastore_config.secrets])?;
         let default_name = find_default_datastore(&server_config, &metastore_config)?;
         Ok(Self {
             server_config,
             metastore_config: RwLock::new(metastore_config),
             metastore_file: metastore_file.map(Path::to_path_buf),
+            secrets,
             default_name,
             refresh_interval,
         })
@@ -205,7 +239,7 @@ impl DiskMetastore {
             .iter()
             .chain(metastore_config.datastores.iter())
             .map(|(name, config)| {
-                let store = config.open_store(name)?;
+                let store = config.open_store(name, &self.secrets)?;
                 let maintenance = MaintenanceConfig {
                     refresh_interval: self.refresh_interval,
                     compaction: config.compaction(),
@@ -236,6 +270,10 @@ fn check_no_conflicts(
     let names = find_conflicting_names(&server_config.users, &metastore_config.users);
     if !names.is_empty() {
         return Err(Error::ConflictingUsers { names });
+    }
+    let names = find_conflicting_names(&server_config.secrets, &metastore_config.secrets);
+    if !names.is_empty() {
+        return Err(Error::ConflictingSecrets { names });
     }
     Ok(())
 }
@@ -351,8 +389,27 @@ pub enum Error {
         .names.join(", ")
     )]
     ConflictingUsers { names: Vec<String> },
-    #[error("datastore `{name}`: {message}")]
-    Datastore { name: String, message: String },
+    #[error(
+        "secrets defined both in the config file's `metastore` section and in the metastore file: {}",
+        .names.join(", ")
+    )]
+    ConflictingSecrets { names: Vec<String> },
+    #[error(
+        "secrets `{first}` and `{second}` are both scoped to `{scope}`; a scope may name only one secret"
+    )]
+    DuplicateScope {
+        first: String,
+        second: String,
+        scope: String,
+    },
+    #[error("secret `{name}`: scope `{scope}` must be under `{expected}`")]
+    SecretScope {
+        name: String,
+        scope: String,
+        expected: &'static str,
+    },
+    #[error("datastore `{name}`: no secret is scoped to `{location}`; define one under `secrets`")]
+    NoSecret { name: String, location: String },
     #[error("user `{name}` already exists")]
     UserExists { name: String },
     #[error("creating a user requires a metastore file; start the server with --metastore-file")]
@@ -386,6 +443,8 @@ pub struct MetastoreConfig {
     datastores: HashMap<String, DatastoreConfig>,
     #[serde(default, serialize_with = "sorted_by_name")]
     users: HashMap<String, UserConfig>,
+    #[serde(default, serialize_with = "sorted_by_name")]
+    secrets: HashMap<String, SecretConfig>,
 }
 
 /// Serialize a map's entries in name order.
@@ -476,9 +535,10 @@ enum UserAuthConfig {
 }
 
 /// One datastore's configuration. `kind` is the datastore format; the storage
-/// backend (local filesystem vs S3) is inferred from `location`'s scheme, and
-/// the S3 credential fields apply only when `location` is an `s3://` URI.
-#[derive(Clone, Deserialize, Serialize)]
+/// backend (local filesystem, S3, GCS) is inferred from `location`'s scheme,
+/// and the credentials a remote one is opened with come from the secret scoped
+/// to that location rather than from the datastore itself.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct DatastoreConfig {
     kind: DatastoreKind,
@@ -508,46 +568,6 @@ struct DatastoreConfig {
     /// process owns physical cleanup.
     #[serde(default = "default_true")]
     vacuum: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    region: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    access_key_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    secret_access_key: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    endpoint: Option<String>,
-    /// A Google service-account (or authorized-user) JSON key file, for a
-    /// `gs://` location. Omit to resolve credentials from the ambient
-    /// Application Default Credentials chain instead.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    credentials_file: Option<String>,
-}
-
-/// By hand with the S3 credentials redacted: a datastore's config must not
-/// leak them into a log through a `{:?}` of some struct that holds one.
-impl std::fmt::Debug for DatastoreConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DatastoreConfig")
-            .field("kind", &self.kind)
-            .field("location", &self.location)
-            .field("is_default", &self.is_default)
-            .field("compact", &self.compact)
-            .field("compact_bytes", &self.compact_bytes)
-            .field("compact_min_files", &self.compact_min_files)
-            .field("vacuum", &self.vacuum)
-            .field("region", &self.region)
-            .field(
-                "access_key_id",
-                &self.access_key_id.as_ref().map(|_| "redacted"),
-            )
-            .field(
-                "secret_access_key",
-                &self.secret_access_key.as_ref().map(|_| "redacted"),
-            )
-            .field("endpoint", &self.endpoint)
-            .field("credentials_file", &self.credentials_file)
-            .finish()
-    }
 }
 
 /// Serde default for the `compact` and `vacuum` toggles: both maintenance loops
@@ -597,56 +617,45 @@ enum DatastoreKind {
 
 impl DatastoreConfig {
     /// Build this datastore's object store. The backend is chosen from
-    /// `location`: an `s3://` (or `s3a://`) URI opens an S3 store with the
-    /// datastore's inline credentials (`region`, `access_key_id`,
-    /// `secret_access_key` are required); anything else is a local path (an
+    /// `location`: an `s3://` (or `s3a://`) URI opens an S3 store, a `gs://`
+    /// URI a Google Cloud Storage store, anything else a local path (an
     /// optional `file://` scheme is stripped).
-    fn open_store(&self, name: &str) -> Result<Arc<dyn ObjectStore>> {
-        if is_s3_location(&self.location) {
-            let credentials = S3Credentials {
-                region: require(name, &self.region, "region")?,
-                access_key: require(name, &self.access_key_id, "access_key_id")?,
-                secret_key: require(name, &self.secret_access_key, "secret_access_key")?,
-                endpoint: self.endpoint.clone(),
-            };
-            Ok(Arc::new(S3Store::with_credentials(
-                &self.location,
-                credentials,
-            )?))
-        } else if is_gcs_location(&self.location) {
-            Ok(Arc::new(match &self.credentials_file {
-                Some(path) => GcsStore::with_credentials_file(&self.location, path)?,
+    ///
+    /// A remote store is opened with the secret scoped to its location. An S3
+    /// location needs one: without it there is nothing to sign a request with.
+    /// A GCS location without one falls back to the ambient Application
+    /// Default Credentials chain, which on Google compute is the whole
+    /// configuration a store needs.
+    fn open_store(&self, name: &str, secrets: &Secrets) -> Result<Arc<dyn ObjectStore>> {
+        match StoreScheme::of(&self.location) {
+            StoreScheme::S3 => {
+                let credentials =
+                    secrets
+                        .resolve_s3(&self.location)
+                        .ok_or_else(|| Error::NoSecret {
+                            name: name.to_string(),
+                            location: self.location.clone(),
+                        })?;
+                Ok(Arc::new(S3Store::with_credentials(
+                    &self.location,
+                    credentials,
+                )?))
+            }
+            StoreScheme::Gcs => Ok(Arc::new(match secrets.resolve_gcs(&self.location) {
+                Some(credentials_file) => {
+                    GcsStore::with_credentials_file(&self.location, credentials_file)?
+                }
                 None => GcsStore::from_uri(&self.location)?,
-            }))
-        } else {
-            let path = self
-                .location
-                .strip_prefix("file://")
-                .unwrap_or(&self.location);
-            Ok(Arc::new(LocalStore::new(path)))
+            })),
+            StoreScheme::Local => {
+                let path = self
+                    .location
+                    .strip_prefix("file://")
+                    .unwrap_or(&self.location);
+                Ok(Arc::new(LocalStore::new(path)))
+            }
         }
     }
-}
-
-/// Whether a location is an S3 URI (`s3://` / `s3a://`). The storage backend is
-/// inferred from the scheme, not configured.
-fn is_s3_location(location: &str) -> bool {
-    location.starts_with("s3://") || location.starts_with("s3a://")
-}
-
-/// Whether a location is a Google Cloud Storage URI (`gs://`); a location that
-/// is neither this nor [`is_s3_location`] is a local path.
-fn is_gcs_location(location: &str) -> bool {
-    location.starts_with("gs://")
-}
-
-/// Return a required credential, pointing at the environment alternative when
-/// an inline value is absent.
-fn require(name: &str, value: &Option<String>, field: &str) -> Result<String> {
-    value.clone().ok_or_else(|| Error::Datastore {
-        name: name.to_string(),
-        message: format!("`{field}` is required"),
-    })
 }
 
 #[cfg(test)]
@@ -690,6 +699,12 @@ mod tests {
         }
     }
 
+    /// Open the object store the named datastore addresses, with the secrets
+    /// of the metastore serving it.
+    fn open_store(store: &DiskMetastore, name: &str) -> Result<Arc<dyn ObjectStore>> {
+        datastore(store, name).open_store(name, &store.secrets)
+    }
+
     /// A datastore's definition, whichever config holds it.
     fn datastore(store: &DiskMetastore, name: &str) -> DatastoreConfig {
         if let Some(datastore) = store.server_config.datastores.get(name) {
@@ -719,6 +734,19 @@ mod tests {
     /// A minimal config-file `metastore` section: one default datastore.
     const HOT_SECTION: &str =
         "datastores:\n  hot:\n    kind: delta\n    location: /tmp/hot\n    default: true\n";
+
+    /// A section whose `warm` datastore sits in a bucket, for the secret tests
+    /// to authenticate. Its `secrets` block is whatever each test appends.
+    const WARM_SECTION: &str = "\
+datastores:
+  hot:
+    kind: delta
+    location: /tmp/hot
+    default: true
+  warm:
+    kind: delta
+    location: s3://analytics/warm/data
+";
 
     #[test]
     fn compaction_is_per_datastore() {
@@ -867,22 +895,358 @@ datastores:
     }
 
     #[test]
-    fn s3_location_without_keys_is_rejected() {
+    fn an_s3_datastore_no_secret_covers_is_rejected() {
+        let yaml = format!(
+            "{WARM_SECTION}{}",
+            r#"
+secrets:
+  elsewhere:
+    type: s3
+    scope: s3://other-bucket/
+    region: us-east-1
+    access_key_id: AKIA
+    secret_access_key: secret
+"#
+        );
+
+        let store = from_yaml(&yaml).unwrap();
+        let error = open_store(&store, "warm").unwrap_err();
+
+        assert!(matches!(&error, Error::NoSecret { .. }), "{error}");
+    }
+
+    #[test]
+    fn a_datastore_is_opened_with_the_secret_scoped_to_its_location() {
+        let yaml = format!(
+            "{WARM_SECTION}{}",
+            r#"
+secrets:
+  elsewhere:
+    type: s3
+    scope: s3://other-bucket/
+    region: us-east-1
+    access_key_id: AKIA
+    secret_access_key: secret
+  analytics:
+    type: s3
+    scope: s3://analytics/
+    region: eu-west-1
+    access_key_id: AKIA
+    secret_access_key: secret
+"#
+        );
+
+        let store = from_yaml(&yaml).unwrap();
+
+        // A virtual-hosted S3 origin carries the region, so it names the secret
+        // the store was opened with.
+        assert!(
+            open_store(&store, "warm")
+                .unwrap()
+                .describe()
+                .contains("eu-west-1")
+        );
+    }
+
+    #[test]
+    fn the_most_specific_scope_covering_a_location_authenticates_it() {
+        let yaml = format!(
+            "{WARM_SECTION}{}",
+            r#"
+secrets:
+  bucket:
+    type: s3
+    scope: s3://analytics/
+    region: us-east-1
+    access_key_id: AKIA
+    secret_access_key: secret
+  warm:
+    type: s3
+    scope: s3://analytics/warm
+    region: eu-west-1
+    access_key_id: AKIA
+    secret_access_key: secret
+"#
+        );
+
+        let store = from_yaml(&yaml).unwrap();
+
+        assert!(
+            open_store(&store, "warm")
+                .unwrap()
+                .describe()
+                .contains("eu-west-1")
+        );
+    }
+
+    #[test]
+    fn a_secret_without_a_scope_covers_every_bucket() {
+        let yaml = format!(
+            "{WARM_SECTION}{}",
+            r#"
+secrets:
+  aws:
+    type: s3
+    region: eu-west-1
+    access_key_id: AKIA
+    secret_access_key: secret
+"#
+        );
+
+        let store = from_yaml(&yaml).unwrap();
+
+        assert!(
+            open_store(&store, "warm")
+                .unwrap()
+                .describe()
+                .contains("eu-west-1")
+        );
+    }
+
+    #[test]
+    fn a_scope_covers_whole_path_segments_only() {
+        // `warm` lives under `s3://analytics/warm/`, which this scope shares a
+        // name prefix with and nothing more.
+        let yaml = format!(
+            "{WARM_SECTION}{}",
+            r#"
+secrets:
+  analytics:
+    type: s3
+    scope: s3://analytics/war
+    region: eu-west-1
+    access_key_id: AKIA
+    secret_access_key: secret
+"#
+        );
+
+        let store = from_yaml(&yaml).unwrap();
+        let error = open_store(&store, "warm").unwrap_err();
+
+        assert!(matches!(&error, Error::NoSecret { .. }), "{error}");
+    }
+
+    #[test]
+    fn two_secrets_on_the_same_scope_are_rejected() {
+        // The same bucket in two spellings: `s3a://` addresses what `s3://`
+        // does, and a trailing slash pins down nothing more.
+        let yaml = format!(
+            "{WARM_SECTION}{}",
+            r#"
+secrets:
+  first:
+    type: s3
+    scope: s3://analytics/
+    region: us-east-1
+    access_key_id: AKIA
+    secret_access_key: secret
+  second:
+    type: s3
+    scope: s3a://analytics
+    region: eu-west-1
+    access_key_id: AKIA
+    secret_access_key: secret
+"#
+        );
+
+        let error = from_yaml(&yaml).err().unwrap();
+
+        assert!(
+            matches!(&error, Error::DuplicateScope { first, second, scope }
+                if first == "first" && second == "second" && scope == "s3://analytics"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn two_secrets_covering_a_whole_backend_are_rejected() {
+        let yaml = format!(
+            "{WARM_SECTION}{}",
+            r#"
+secrets:
+  first:
+    type: s3
+    region: us-east-1
+    access_key_id: AKIA
+    secret_access_key: secret
+  second:
+    type: s3
+    scope: s3://
+    region: eu-west-1
+    access_key_id: AKIA
+    secret_access_key: secret
+"#
+        );
+
+        let error = from_yaml(&yaml).err().unwrap();
+
+        assert!(
+            matches!(&error, Error::DuplicateScope { scope, .. } if scope == "s3://"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_secret_scoped_to_another_backend_is_rejected() {
+        let yaml = format!(
+            "{WARM_SECTION}{}",
+            r#"
+secrets:
+  analytics:
+    type: s3
+    scope: gs://analytics/
+    region: eu-west-1
+    access_key_id: AKIA
+    secret_access_key: secret
+"#
+        );
+
+        let error = from_yaml(&yaml).err().unwrap();
+
+        assert!(
+            matches!(&error, Error::SecretScope { name, expected, .. }
+                if name == "analytics" && *expected == "s3://"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_gcs_datastore_no_secret_covers_resolves_its_credentials_ambiently() {
         let yaml = r#"
 datastores:
-  default:
+  hot:
     kind: delta
-    location: /tmp/default
+    location: /tmp/hot
     default: true
-  warm:
+  cold:
     kind: delta
-    location: s3://bucket/prefix
+    location: gs://analytics/cold
 "#;
 
         let store = from_yaml(yaml).unwrap();
-        let err = datastore(&store, "warm").open_store("warm").unwrap_err();
 
-        assert!(matches!(err, Error::Datastore { .. }));
+        assert_eq!(
+            open_store(&store, "cold").unwrap().location_uri(),
+            "gs://analytics/cold"
+        );
+    }
+
+    #[test]
+    fn a_secret_in_the_metastore_file_serves_a_datastore_in_the_config_file() {
+        let disk = r#"
+secrets:
+  analytics:
+    type: s3
+    scope: s3://analytics/
+    region: eu-west-1
+    access_key_id: AKIA
+    secret_access_key: secret
+"#;
+
+        let store = open_merged(WARM_SECTION, disk).unwrap();
+
+        assert!(
+            open_store(&store, "warm")
+                .unwrap()
+                .describe()
+                .contains("eu-west-1")
+        );
+    }
+
+    #[test]
+    fn a_secret_defined_in_both_files_is_rejected_rather_than_shadowed() {
+        let secret = r#"
+secrets:
+  analytics:
+    type: s3
+    region: eu-west-1
+    access_key_id: AKIA
+    secret_access_key: secret
+"#;
+
+        let error = open_merged(&format!("{WARM_SECTION}{secret}"), secret)
+            .err()
+            .unwrap();
+
+        assert!(
+            matches!(&error, Error::ConflictingSecrets { names } if *names == ["analytics"]),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_secret_in_the_metastore_file_survives_a_rewrite() {
+        let disk = "secrets:\n  analytics:\n    type: s3\n    scope: s3://analytics/\n    \
+                    region: eu-west-1\n    access_key_id: AKIA\n    secret_access_key: secret\n";
+        let (store, file) = open_with_file(WARM_SECTION, disk);
+
+        store.create_user("walt", None).unwrap();
+
+        let reopened = reopen(WARM_SECTION, &file);
+        assert!(
+            open_store(&reopened, "warm")
+                .unwrap()
+                .describe()
+                .contains("eu-west-1")
+        );
+    }
+
+    #[test]
+    fn a_secrets_keys_stay_out_of_its_debug_output() {
+        let yaml = format!(
+            "{WARM_SECTION}{}",
+            r#"
+secrets:
+  analytics:
+    type: s3
+    region: eu-west-1
+    access_key_id: AKIAEXPOSED
+    secret_access_key: hunter2
+"#
+        );
+
+        let store = from_yaml(&yaml).unwrap();
+
+        let printed = format!("{:?}", store.server_config);
+        assert!(!printed.contains("AKIAEXPOSED"), "{printed}");
+        assert!(!printed.contains("hunter2"), "{printed}");
+    }
+
+    #[test]
+    fn a_secret_carrying_another_types_field_is_rejected() {
+        let yaml = format!(
+            "{WARM_SECTION}{}",
+            r#"
+secrets:
+  analytics:
+    type: s3
+    region: eu-west-1
+    access_key_id: AKIA
+    secret_access_key: secret
+    credentials_file: /etc/pivot/gcs-key.json
+"#
+        );
+
+        let error = from_yaml(&yaml).err().unwrap();
+
+        assert!(matches!(&error, Error::Parse { .. }), "{error}");
+    }
+
+    #[test]
+    fn an_s3_secret_without_its_keys_is_rejected() {
+        let yaml = format!(
+            "{WARM_SECTION}{}",
+            r#"
+secrets:
+  analytics:
+    type: s3
+    region: eu-west-1
+"#
+        );
+
+        let error = from_yaml(&yaml).err().unwrap();
+
+        assert!(matches!(&error, Error::Parse { .. }), "{error}");
     }
 
     #[test]
@@ -896,25 +1260,25 @@ datastores:
   warm:
     kind: delta
     location: s3://bucket/prefix
-    region: eu-west-1
-    access_key_id: AKIA
-    secret_access_key: secret
   cold:
     kind: delta
     location: gs://bucket/prefix
+secrets:
+  aws:
+    type: s3
+    region: eu-west-1
+    access_key_id: AKIA
+    secret_access_key: secret
 "#;
 
         let store = from_yaml(yaml).unwrap();
 
-        assert!(
-            datastore(&store, DEFAULT_DATASTORE_NAME)
-                .open_store(DEFAULT_DATASTORE_NAME)
-                .is_ok()
-        );
-        assert!(datastore(&store, "warm").open_store("warm").is_ok());
-        // A GCS store resolves its credentials lazily (at the first request),
-        // so opening one needs no ambient Google credentials.
-        let cold = datastore(&store, "cold").open_store("cold").unwrap();
+        assert!(open_store(&store, DEFAULT_DATASTORE_NAME).is_ok());
+        assert!(open_store(&store, "warm").is_ok());
+        // A GCS store no secret covers resolves its credentials lazily from the
+        // ambient chain (at the first request), so opening one needs no
+        // Google credentials here.
+        let cold = open_store(&store, "cold").unwrap();
         assert_eq!(cold.location_uri(), "gs://bucket/prefix");
     }
 
