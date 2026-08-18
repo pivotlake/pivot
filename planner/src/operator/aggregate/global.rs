@@ -104,7 +104,8 @@ impl Aggregate {
                 | Type::Int32
                 | Type::Int64
                 | Type::Date
-                | Type::Timestamp => {}
+                | Type::Timestamp
+                | Type::TimestampTz => {}
                 _ => return Ok(None),
             }
             // The aggregate's ref indexes the scan's output columns; map it back

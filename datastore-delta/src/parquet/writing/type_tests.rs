@@ -297,6 +297,22 @@ fn timestamp_leaf_carries_its_unit() {
     assert_reads_back_as(values, &DataType::Timestamp(TimeUnit::Microsecond, None));
 }
 
+/// A zone-carrying timestamp column stamps `isAdjustedToUTC`, so another
+/// engine reads UTC instants rather than zone-less wall times.
+#[test]
+fn timestamp_tz_leaf_carries_the_utc_flag() {
+    let values: ArrayRef = Arc::new(
+        TimestampMicrosecondArray::from(
+            (0..ROWS as i64)
+                .map(|row| 795_225_600_000_000 + row)
+                .collect::<Vec<_>>(),
+        )
+        .with_timezone(planner::types::UTC_TIMEZONE),
+    );
+
+    assert_reads_back_as(values, &planner::types::timestamp_tz_arrow_type());
+}
+
 /// The same for a date, whose day count is likewise an integer on disk.
 #[test]
 fn date_leaf_carries_its_annotation() {
@@ -407,6 +423,13 @@ type_tests! {
         PACKED,
         |row| 795_225_600_000_000 + row as i64 * 1_500_007,
         as_is
+    );
+    // A zone-carrying timestamp stores the same microsecond count; only the
+    // leaf's UTC flag differs, and it must survive the round trip.
+    timestamp_tz => primitive::<TimestampMicrosecondType>(
+        PACKED,
+        |row| 795_225_600_000_000 + row as i64 * 1_500_007,
+        |array| Arc::new(array.with_timezone(planner::types::UTC_TIMEZONE)) as ArrayRef
     );
     // A float is not a whole number, so it has no delta form and no dictionary
     // cast: it stays plain whatever its values do.

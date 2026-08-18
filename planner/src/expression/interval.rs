@@ -35,8 +35,8 @@ impl IntervalArithmetic {
         // The physical int the temporal result reinterprets through.
         let int_arrow = match self.result {
             Type::Date => DataType::Int32,
-            Type::Timestamp => DataType::Int64,
-            _ => unreachable!("interval result is Date or Timestamp"),
+            Type::Timestamp | Type::TimestampTz => DataType::Int64,
+            _ => unreachable!("interval result is a temporal type"),
         };
         let op = self.op;
         let offset = self.offset;
@@ -133,10 +133,9 @@ mod tests {
 
         let after = micros_since_epoch();
         let col = batches[0].column(0);
-        assert_eq!(
-            col.data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, None)
-        );
+        // `now()` is a TIMESTAMP WITH TIME ZONE, and subtracting an interval
+        // keeps that type.
+        assert_eq!(col.data_type(), &crate::types::timestamp_tz_arrow_type());
         let micros = col.as_primitive::<TimestampMicrosecondType>().value(0);
         let five_days = 5 * 86_400 * 1_000_000;
         assert!(

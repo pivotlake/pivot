@@ -255,10 +255,30 @@ impl ColumnDecoder {
             .iter()
             .map(|&position| decoded[position].clone());
         let column = reconstruct_column_from_leaves(&self.pre_transform_field, &mut leaf_arrays);
-        match &self.transform {
-            Some(transform) => transform.apply(&column),
-            None => Ok(column),
-        }
+        let column = match &self.transform {
+            Some(transform) => transform.apply(&column)?,
+            None => column,
+        };
+        Ok(restamp_timestamp_zone(
+            column,
+            self.output_field.data_type(),
+        ))
+    }
+}
+
+/// The leaf decoders build a timestamp array without zone metadata (parquet
+/// stores only the microsecond count), so a zone-carrying column restamps its
+/// arrays to the declared type for the batch to match its schema. The values
+/// are untouched: both types count microseconds since the epoch in UTC, and
+/// the cast only swaps the type annotation.
+fn restamp_timestamp_zone(column: ArrayRef, declared: &DataType) -> ArrayRef {
+    match (column.data_type(), declared) {
+        (
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, Some(_)),
+        ) => arrow_cast::cast(&column, declared)
+            .expect("a same-unit timestamp zone restamp cannot fail"),
+        _ => column,
     }
 }
 
@@ -296,9 +316,7 @@ pub fn create_leaf_decoder(
         DataType::Int32 => Ok(primitive!(Int32Type)),
         DataType::Int64 => Ok(primitive!(Int64Type)),
         DataType::Date32 => Ok(primitive!(Date32Type)),
-        DataType::Timestamp(TimeUnit::Microsecond, None) => {
-            Ok(primitive!(TimestampMicrosecondType))
-        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => Ok(primitive!(TimestampMicrosecondType)),
         DataType::Float32 => Ok(primitive!(Float32Type)),
         DataType::Float64 => Ok(primitive!(Float64Type)),
         DataType::Decimal64(precision, scale) => {

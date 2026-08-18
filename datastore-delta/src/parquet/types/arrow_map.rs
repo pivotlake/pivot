@@ -23,6 +23,8 @@
 //!   Utf8 / Utf8View   BYTE_ARRAY         converted UTF8 / String read+write
 //!   Date32            INT32              Date                    read+write
 //!   Timestamp(Micro)  INT64              Timestamp{MICROS}       read+write
+//!   Timestamp(Micro,  INT64              Timestamp{MICROS, UTC}  read+write
+//!     "UTC")
 //!   BinaryView        BYTE_ARRAY         unannotated             read+write
 //!   Decimal64(p,s)    INT32              Decimal (p <= 9)        read+write
 //!   Decimal64(p,s)    INT64              Decimal (p <= 18)       read+write
@@ -297,15 +299,25 @@ fn int32_arrow(
 /// resolution it was not written in, which would misplace every value by the
 /// ratio between the two units.
 ///
-/// The annotation's `is_adjusted_to_utc` flag is not carried: a pivot timestamp
-/// has no time zone, so every timestamp column reads as a zone-less one.
+/// The annotation's `is_adjusted_to_utc` flag decides zone-ness: an adjusted
+/// column holds UTC instants (`TIMESTAMP WITH TIME ZONE`), an unadjusted one
+/// zone-less wall times. The legacy `TIMESTAMP_MICROS` spelling carries no
+/// flag and the format defines it as the adjusted one, so a legacy-only file
+/// reads as instants too.
 fn int64_arrow(
     converted_type: Option<i32>,
     logical_type: Option<&LogicalType>,
 ) -> Result<DataType> {
     match logical_type {
-        Some(LogicalType::Timestamp { unit, .. }) => match unit {
-            ParquetTimeUnit::MICROS => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
+        Some(LogicalType::Timestamp {
+            unit,
+            is_adjusted_to_utc,
+        }) => match unit {
+            ParquetTimeUnit::MICROS => Ok(if *is_adjusted_to_utc {
+                planner::types::timestamp_tz_arrow_type()
+            } else {
+                DataType::Timestamp(TimeUnit::Microsecond, None)
+            }),
             other => Err(Error::UnsupportedType(format!(
                 "TIMESTAMP column in {other:?}; pivot reads microsecond timestamps"
             ))),
@@ -322,9 +334,7 @@ fn int64_arrow(
         },
         // No (recognized) LogicalType: fall back to the legacy ConvertedType.
         _ => match converted_type {
-            Some(CONVERTED_TIMESTAMP_MICROS) => {
-                Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
-            }
+            Some(CONVERTED_TIMESTAMP_MICROS) => Ok(planner::types::timestamp_tz_arrow_type()),
             Some(CONVERTED_TIMESTAMP_MILLIS) => Err(Error::UnsupportedType(
                 "TIMESTAMP_MILLIS column; pivot reads microsecond timestamps".to_string(),
             )),
@@ -369,17 +379,18 @@ pub fn arrow_to_annotation(data_type: &DataType) -> LeafAnnotation {
             converted_type: Some(CONVERTED_DATE),
             ..LeafAnnotation::default()
         },
-        // `is_adjusted_to_utc` is false because a pivot timestamp has no time
-        // zone: the flag would tell a reader to shift the value into its
-        // session's. The legacy spelling has no such flag and the format
+        // `is_adjusted_to_utc` carries the column's zone-ness: true for a
+        // `TIMESTAMP WITH TIME ZONE` column of UTC instants, false for a
+        // zone-less one, whose values a reader must not shift into its
+        // session's zone. The legacy spelling has no such flag and the format
         // defines it as the adjusted one, so a reader old enough to resolve
-        // only that one reads these as UTC; it is written anyway because every
+        // only that one reads both as UTC; it is written anyway because every
         // writer in the ecosystem writes it for a microsecond timestamp, and
         // leaving it off would have that reader see a bare INT64 instead.
-        DataType::Timestamp(TimeUnit::Microsecond, None) => LeafAnnotation {
+        DataType::Timestamp(TimeUnit::Microsecond, zone) => LeafAnnotation {
             logical_type: Some(LogicalType::Timestamp {
                 unit: ParquetTimeUnit::MICROS,
-                is_adjusted_to_utc: false,
+                is_adjusted_to_utc: zone.is_some(),
             }),
             converted_type: Some(CONVERTED_TIMESTAMP_MICROS),
             ..LeafAnnotation::default()
@@ -457,7 +468,7 @@ pub fn arrow_to_parquet_physical(data_type: &DataType) -> Result<i32> {
         // A date is its day count, stored as the INT32 the DATE annotation
         // (stamped alongside it) tells a reader to interpret.
         DataType::Date32 => INT32,
-        DataType::Timestamp(TimeUnit::Microsecond, None) => INT64,
+        DataType::Timestamp(TimeUnit::Microsecond, _) => INT64,
         DataType::Float32 => FLOAT,
         DataType::Float64 => DOUBLE,
         DataType::Utf8 | DataType::Utf8View | DataType::BinaryView => BYTE_ARRAY,

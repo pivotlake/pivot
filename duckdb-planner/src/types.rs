@@ -101,6 +101,8 @@ pub enum ScalarValue {
     Date(i32),
     /// `TIMESTAMP`: microseconds since the Unix epoch.
     Timestamp(i64),
+    /// `TIMESTAMP WITH TIME ZONE`: microseconds since the Unix epoch, UTC.
+    TimestampTz(i64),
     /// `INTERVAL` kept as its three independent components.
     Interval {
         months: i32,
@@ -142,6 +144,7 @@ impl fmt::Display for ScalarValue {
             ScalarValue::Utf8(v) => write!(f, "{v}"),
             ScalarValue::Date(v) => write!(f, "{v}"),
             ScalarValue::Timestamp(v) => write!(f, "{v}"),
+            ScalarValue::TimestampTz(v) => write!(f, "{v}"),
             ScalarValue::Interval {
                 months,
                 days,

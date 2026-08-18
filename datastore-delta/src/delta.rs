@@ -1077,10 +1077,13 @@ fn delta_scalar_to_pivot(column: &str, scalar: DeltaScalar) -> Result<Scalar<Arr
         DeltaScalar::String(value) => erased(StringViewArray::from(vec![value])),
         DeltaScalar::Date(value) => erased(Date32Array::from(vec![value])),
         // Delta counts a timestamp in microseconds, the same unit a pivot
-        // timestamp counts in, so the value carries over unscaled.
-        DeltaScalar::Timestamp(value) | DeltaScalar::TimestampNtz(value) => {
-            erased(TimestampMicrosecondArray::from(vec![value]))
-        }
+        // timestamp counts in, so the value carries over unscaled; the
+        // UTC-adjusted kind keeps its zone marker.
+        DeltaScalar::Timestamp(value) => erased(
+            TimestampMicrosecondArray::from(vec![value])
+                .with_timezone(planner::types::UTC_TIMEZONE),
+        ),
+        DeltaScalar::TimestampNtz(value) => erased(TimestampMicrosecondArray::from(vec![value])),
         // A decimal partition value lands on the declared type's carrier,
         // matching `physical_arrow_type`: `Decimal64` up to 18 digits (where
         // the unscaled integer is guaranteed to fit), `Decimal128` beyond.
@@ -1135,6 +1138,9 @@ fn delta_type(column: &str, data_type: &Type) -> Result<DeltaDataType, Error> {
         Type::Utf8 => PrimitiveType::String,
         Type::Date => PrimitiveType::Date,
         Type::Timestamp => PrimitiveType::TimestampNtz,
+        // Delta's `timestamp` primitive is its UTC-adjusted one, the instant
+        // type other engines read as TIMESTAMP WITH TIME ZONE.
+        Type::TimestampTz => PrimitiveType::Timestamp,
         Type::Decimal { precision, scale } => PrimitiveType::decimal(*precision, *scale as u8)?,
         // A Delta *table schema* has no interval primitive: the kernel reads
         // `interval day`/`interval second` as an unsupported table type, even
@@ -1226,7 +1232,10 @@ fn pivot_type_from_field(field: &StructField) -> Result<Type, Error> {
         PrimitiveType::Double => Type::Float64,
         PrimitiveType::Boolean => Type::Boolean,
         PrimitiveType::Date => Type::Date,
-        PrimitiveType::Timestamp | PrimitiveType::TimestampNtz => Type::Timestamp,
+        // Delta's `timestamp` is UTC-adjusted (an instant), `timestampNtz` a
+        // zone-less wall time; the two land on pivot's matching pair.
+        PrimitiveType::Timestamp => Type::TimestampTz,
+        PrimitiveType::TimestampNtz => Type::Timestamp,
         // Delta Kernel already enforces precision 1..=38 and scale <= precision,
         // exactly the shapes Pivot's decimal supports.
         PrimitiveType::Decimal(decimal) => Type::Decimal {
@@ -1762,5 +1771,29 @@ mod tests {
         let field = build_delta_field("id", &Type::Int32).unwrap();
         assert!(!field.metadata.contains_key(PIVOT_LOGICAL_TYPE_KEY));
         assert_eq!(pivot_type_from_field(&field).unwrap(), Type::Int32);
+    }
+
+    /// The two timestamp types land on Delta's matching pair and come back as
+    /// themselves: `timestamp` is the UTC-adjusted instant, `timestampNtz` the
+    /// zone-less wall time.
+    #[test]
+    fn timestamp_types_round_trip_through_deltas_two_primitives() {
+        let stored = |ty: Type| {
+            let field = build_delta_field("t", &ty).unwrap();
+            let primitive = match field.data_type() {
+                DeltaDataType::Primitive(p) => p.clone(),
+                other => panic!("expected primitive, got {other:?}"),
+            };
+            (primitive, pivot_type_from_field(&field).unwrap())
+        };
+
+        assert_eq!(
+            stored(Type::Timestamp),
+            (PrimitiveType::TimestampNtz, Type::Timestamp)
+        );
+        assert_eq!(
+            stored(Type::TimestampTz),
+            (PrimitiveType::Timestamp, Type::TimestampTz)
+        );
     }
 }

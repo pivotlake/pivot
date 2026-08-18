@@ -510,6 +510,7 @@ pub mod ffi {
         fn value_hugeint(v: &Value) -> Result<BridgeHugeint>;
         fn value_date(v: &Value) -> Result<i32>;
         fn value_timestamp(v: &Value) -> Result<i64>;
+        fn value_timestamp_tz(v: &Value) -> Result<i64>;
         fn value_interval_months(v: &Value) -> Result<i32>;
         fn value_interval_days(v: &Value) -> Result<i32>;
         fn value_interval_micros(v: &Value) -> Result<i64>;

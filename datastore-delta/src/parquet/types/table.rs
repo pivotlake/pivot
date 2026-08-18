@@ -357,9 +357,15 @@ fn decode_scalar(
         DataType::Date32 => read_le::<4>(bytes)
             .map(i32::from_le_bytes)
             .map(|v| erase_type(Date32Array::new_scalar(v))),
-        DataType::Timestamp(TimeUnit::Microsecond, None) => read_le::<8>(bytes)
-            .map(i64::from_le_bytes)
-            .map(|v| erase_type(TimestampMicrosecondArray::new_scalar(v))),
+        DataType::Timestamp(TimeUnit::Microsecond, zone) => {
+            read_le::<8>(bytes).map(i64::from_le_bytes).map(|v| {
+                erase_type(Scalar::new(
+                    TimestampMicrosecondArray::new_scalar(v)
+                        .into_inner()
+                        .with_timezone_opt(zone.clone()),
+                ))
+            })
+        }
         // A decimal's unscaled integer follows the column's physical storage;
         // the scalar's carrier follows the column's arrow type.
         DataType::Decimal64(precision, scale) => {
@@ -496,19 +502,26 @@ fn apply_declared_types(schema: Schema, declared_columns: &[Column]) -> Result<S
                     field.as_ref().clone().with_data_type(DataType::Utf8View),
                 ));
             }
-            // A pivot timestamp counts microseconds (see `Type::Timestamp`).
-            // A leaf that carries the TIMESTAMP annotation, which is what the
-            // writer stamps, already parsed to `Timestamp(Microsecond)` and
-            // matches below; any other unit was rejected when the footer was
-            // read. A bare INT64 leaf says nothing about its own unit, so it is
-            // re-labelled as the timestamp the table declares, which is how a
-            // file written by another engine, or by an older pivot, reads.
-            if **declared == Type::Timestamp && *file_type == DataType::Int64 {
+            // A pivot timestamp counts microseconds (see `Type::Timestamp`),
+            // and both timestamp types share that INT64 storage: the file's
+            // `is_adjusted_to_utc` flag and the declaration disagree only
+            // about zone-ness, which the declaration decides. So a declared
+            // timestamp column accepts any microsecond-timestamp leaf, and
+            // also a bare INT64 one (which says nothing about its own unit),
+            // re-labelling it to the declared type; that is how a file written
+            // by another engine, or by an older pivot, reads. Any other
+            // timestamp unit was rejected when the footer was read.
+            if matches!(declared, Type::Timestamp | Type::TimestampTz)
+                && matches!(
+                    file_type,
+                    DataType::Int64 | DataType::Timestamp(TimeUnit::Microsecond, _)
+                )
+            {
                 return Ok(Arc::new(
                     field
                         .as_ref()
                         .clone()
-                        .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, None)),
+                        .with_data_type(planner::types::physical_arrow_type(declared)),
                 ));
             }
             let matches_declared = match declared {

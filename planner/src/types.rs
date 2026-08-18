@@ -72,6 +72,14 @@ pub enum Type {
     /// resolution, so a value crosses the two engines unscaled. The executor
     /// sees that count in an `Int64`-shaped timestamp column.
     Timestamp,
+    /// DuckDB `TIMESTAMP WITH TIME ZONE` — an instant. Like Postgres and
+    /// DuckDB, no zone is stored per value: the column carries the same
+    /// microseconds-since-epoch count as [`Type::Timestamp`], always in UTC,
+    /// and a time zone only enters at the session boundary (rendering and
+    /// literal parsing). The session zone is fixed to UTC for now, so the two
+    /// timestamp types differ only in their wire type and rendered offset
+    /// suffix, and the cast between them is a reinterpret.
+    TimestampTz,
     /// DuckDB `INTERVAL`: a span carried as the three independent fields
     /// DuckDB's own `interval_t` keeps, months / days / sub-day time, on arrow's
     /// matching `Interval(MonthDayNano)`.
@@ -115,6 +123,7 @@ impl fmt::Display for Type {
             Type::Utf8 => "Utf8",
             Type::Date => "Date",
             Type::Timestamp => "Timestamp",
+            Type::TimestampTz => "TimestampTz",
             Type::Interval => "Interval",
             Type::Variant => "Variant",
         };
@@ -143,6 +152,18 @@ pub const MAX_DECIMAL_PRECISION: u8 = 38;
 /// and its binder casts every operand of a mixed-width operation to the wide
 /// type, so kernels never see a `Decimal64`/`Decimal128` mix.
 pub const MAX_DECIMAL64_PRECISION: u8 = 18;
+
+/// The zone name a [`Type::TimestampTz`] column's arrow type carries. The
+/// values are UTC instants, so this is a statement about the data, not a
+/// display preference; rendering in another zone is a session-level concern
+/// that never changes the arrow type.
+pub const UTC_TIMEZONE: &str = "UTC";
+
+/// The arrow type of a [`Type::TimestampTz`] column, for the places that
+/// build one directly rather than through [`physical_arrow_type`].
+pub fn timestamp_tz_arrow_type() -> DataType {
+    DataType::Timestamp(TimeUnit::Microsecond, Some(UTC_TIMEZONE.into()))
+}
 
 /// The factor between DuckDB's interval, whose sub-day field counts
 /// microseconds, and arrow's, which counts nanoseconds. Every interval crossing
@@ -192,6 +213,7 @@ pub fn type_from_logical(bound: BoundLogicalType) -> Result<Type, Error> {
         (LogicalTypeId::VARCHAR, ExtraTypeInfo::None) => Ok(Type::Utf8),
         (LogicalTypeId::DATE, ExtraTypeInfo::None) => Ok(Type::Date),
         (LogicalTypeId::TIMESTAMP, ExtraTypeInfo::None) => Ok(Type::Timestamp),
+        (LogicalTypeId::TIMESTAMP_TZ, ExtraTypeInfo::None) => Ok(Type::TimestampTz),
         (LogicalTypeId::INTERVAL, ExtraTypeInfo::None) => Ok(Type::Interval),
         (LogicalTypeId::VARIANT, ExtraTypeInfo::None) => Ok(Type::Variant),
         _ => Err(Error::UnsupportedLogicalType(bound.id.clone())),
@@ -224,6 +246,7 @@ pub fn logical_from_type(pivot_type: &Type) -> BoundLogicalType {
         Type::Utf8 => BoundLogicalType::plain(LogicalTypeId::VARCHAR),
         Type::Date => BoundLogicalType::plain(LogicalTypeId::DATE),
         Type::Timestamp => BoundLogicalType::plain(LogicalTypeId::TIMESTAMP),
+        Type::TimestampTz => BoundLogicalType::plain(LogicalTypeId::TIMESTAMP_TZ),
         Type::Interval => BoundLogicalType::plain(LogicalTypeId::INTERVAL),
         Type::Variant => BoundLogicalType::plain(LogicalTypeId::VARIANT),
     }
@@ -251,6 +274,7 @@ pub fn sql_type_name(pivot_type: &Type) -> String {
         Type::Utf8 => "VARCHAR",
         Type::Date => "DATE",
         Type::Timestamp => "TIMESTAMP",
+        Type::TimestampTz => "TIMESTAMP WITH TIME ZONE",
         Type::Interval => "INTERVAL",
         Type::Variant => "VARIANT",
     };
@@ -290,6 +314,7 @@ pub fn physical_arrow_type(pivot_type: &Type) -> DataType {
         Type::Utf8 => DataType::Utf8View,
         Type::Date => DataType::Date32,
         Type::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
+        Type::TimestampTz => timestamp_tz_arrow_type(),
         Type::Interval => DataType::Interval(IntervalUnit::MonthDayNano),
         Type::Variant => variant_struct_type(),
     }
@@ -322,6 +347,9 @@ pub fn type_from_physical(data_type: &DataType) -> Option<Type> {
         DataType::Utf8View => Some(Type::Utf8),
         DataType::Date32 => Some(Type::Date),
         DataType::Timestamp(TimeUnit::Microsecond, None) => Some(Type::Timestamp),
+        DataType::Timestamp(TimeUnit::Microsecond, Some(zone)) if zone.as_ref() == UTC_TIMEZONE => {
+            Some(Type::TimestampTz)
+        }
         DataType::Interval(IntervalUnit::MonthDayNano) => Some(Type::Interval),
         other if *other == variant_struct_type() => Some(Type::Variant),
         _ => None,
@@ -460,6 +488,14 @@ pub fn build_scalar_value(value: ScalarValue) -> Result<Scalar<ArrayRef>, Error>
         ScalarValue::Timestamp(micros) => {
             Arc::new(TimestampMicrosecondArray::new_scalar(micros).into_inner())
         }
+        // A TIMESTAMPTZ constant is the same microsecond count as a TIMESTAMP
+        // one, already in UTC on both sides of the bridge; only the arrow type
+        // carries the zone marker.
+        ScalarValue::TimestampTz(micros) => Arc::new(
+            TimestampMicrosecondArray::new_scalar(micros)
+                .into_inner()
+                .with_timezone(UTC_TIMEZONE),
+        ),
         // An INTERVAL constant keeps DuckDB's three fields as they were
         // written, so `INTERVAL '1 month'` stays a month rather than becoming
         // 30 days; only the sub-day field is rescaled, microseconds to arrow's
@@ -541,6 +577,7 @@ mod tests {
             Type::Utf8,
             Type::Date,
             Type::Timestamp,
+            Type::TimestampTz,
             Type::Interval,
             Type::Variant,
         ]

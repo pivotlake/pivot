@@ -280,6 +280,7 @@ fn extreme_kind(ty: &Type, kind: AggregationKind) -> Option<AggregationKind> {
         | Type::Float64
         | Type::Date
         | Type::Timestamp
+        | Type::TimestampTz
         | Type::Decimal { .. } => Some(kind),
         _ => None,
     }

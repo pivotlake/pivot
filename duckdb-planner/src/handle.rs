@@ -105,6 +105,7 @@ fn scalar_from_value(v: &ffi::Value) -> Result<ScalarValue> {
         L::VARIANT => ScalarValue::Variant(ffi::value_string(v)?),
         L::DATE => ScalarValue::Date(ffi::value_date(v)?),
         L::TIMESTAMP => ScalarValue::Timestamp(ffi::value_timestamp(v)?),
+        L::TIMESTAMP_TZ => ScalarValue::TimestampTz(ffi::value_timestamp_tz(v)?),
         L::INTERVAL => ScalarValue::Interval {
             months: ffi::value_interval_months(v)?,
             days: ffi::value_interval_days(v)?,
