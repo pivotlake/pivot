@@ -47,6 +47,7 @@ pub use case::{Case, CaseCheck};
 pub use cast::Cast;
 pub use cast::cast_variant_array;
 pub(crate) use cast::json_to_canonical_variant;
+pub use cast::variant_cast_maps_json_null_to_sql_null;
 pub use compare::{Compare, CompareType};
 pub use conjunction::{Conjunction, ConjunctionOp};
 pub use contains::Contains;

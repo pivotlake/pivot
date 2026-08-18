@@ -1149,6 +1149,40 @@ fn scan_a_column_our_writer_delta_encoded() {
     assert_eq!(read_names, expected_names);
 }
 
+fn shredded_variant_batch(rows: &[&str], path: &str, data_type: &DataType) -> RecordBatch {
+    use parquet_variant_compute::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
+
+    let json: ArrayRef = Arc::new(StringArray::from(rows.to_vec()));
+    let shredding = ShreddedSchemaBuilder::new()
+        .with_path(path, data_type)
+        .unwrap()
+        .build();
+    let shredded = shred_variant(&json_to_variant(&json).unwrap(), &shredding).unwrap();
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![shredded.field("doc")])),
+        vec![Arc::new(shredded.into_inner()) as ArrayRef],
+    )
+    .unwrap()
+}
+
+fn corrupt_parquet_leaves(dir: &std::path::Path, table: &ParquetTable, leaves: &[usize]) {
+    use std::io::{Seek, SeekFrom, Write};
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("data.parquet"))
+        .unwrap();
+    for &leaf in leaves {
+        let chunk = &table.row_groups()[0].columns[leaf];
+        let offset = chunk
+            .dictionary_page_offset
+            .unwrap_or(chunk.data_page_offset);
+        file.seek(SeekFrom::Start(offset as u64)).unwrap();
+        file.write_all(&vec![0xff; chunk.total_compressed_size as usize])
+            .unwrap();
+    }
+}
+
 /// A pushed extract on a path shredded into a typed leaf, with every row's
 /// value in that leaf, reads the leaf directly and emits a plain scalar column
 /// instead of the whole variant.
@@ -1188,6 +1222,104 @@ fn scan_pushed_extract_reads_a_shredded_leaf_directly() {
             .column(0)
             .as_primitive::<arrow_array::types::Int64Type>(),
         &Int64Array::from(vec![30, 25])
+    );
+}
+
+#[test]
+fn scan_pushed_numeric_extract_reads_only_its_typed_leaf() {
+    use dispatch::VariantExtract;
+
+    // Setup
+    let dispatch = dispatch(1);
+    let batch = shredded_variant_batch(
+        &[r#"{"age":30}"#, r#"{"age":null}"#, r#"{}"#],
+        "age",
+        &DataType::Int64,
+    );
+    let (dir, table) = parquet_table(&dispatch, &[batch], true);
+    corrupt_parquet_leaves(dir.path(), &table, &[0, 1, 2]);
+    let projection = Projection::columns_with_extracts(
+        vec![0],
+        vec![Some(VariantExtract {
+            path: vec!["age".to_string()],
+            as_type: Some(DataType::Int64),
+        })],
+    );
+
+    // Execute
+    let results = table_input(&dispatch, &table, projection, false)
+        .collect()
+        .unwrap();
+
+    // Assert
+    assert_eq!(
+        results[0].column(0).as_primitive::<Int64Type>(),
+        &Int64Array::from(vec![Some(30), None, None])
+    );
+}
+
+#[test]
+fn scan_pushed_text_extract_distinguishes_json_null_from_missing() {
+    use dispatch::VariantExtract;
+
+    // Setup
+    let dispatch = dispatch(1);
+    let batch = shredded_variant_batch(
+        &[r#"{"name":"bob"}"#, r#"{"name":null}"#, r#"{}"#],
+        "name",
+        &DataType::Utf8View,
+    );
+    let (_dir, table) = parquet_table(&dispatch, &[batch], true);
+    let projection = Projection::columns_with_extracts(
+        vec![0],
+        vec![Some(VariantExtract {
+            path: vec!["name".to_string()],
+            as_type: Some(DataType::Utf8View),
+        })],
+    );
+
+    // Execute
+    let results = table_input(&dispatch, &table, projection, false)
+        .collect()
+        .unwrap();
+
+    // Assert
+    assert_eq!(
+        results[0].column(0).as_string_view(),
+        &StringViewArray::from(vec![Some("bob"), Some("null"), None])
+    );
+}
+
+#[test]
+fn scan_pushed_text_extract_skips_an_ancestor_json_null() {
+    use dispatch::VariantExtract;
+
+    // Setup
+    let dispatch = dispatch(1);
+    let batch = shredded_variant_batch(
+        &[r#"{"user":{"name":"bob"}}"#, r#"{"user":null}"#, r#"{}"#],
+        "user.name",
+        &DataType::Utf8View,
+    );
+    let (dir, table) = parquet_table(&dispatch, &[batch], true);
+    corrupt_parquet_leaves(dir.path(), &table, &[0, 1, 2, 3]);
+    let projection = Projection::columns_with_extracts(
+        vec![0],
+        vec![Some(VariantExtract {
+            path: vec!["user".to_string(), "name".to_string()],
+            as_type: Some(DataType::Utf8View),
+        })],
+    );
+
+    // Execute
+    let results = table_input(&dispatch, &table, projection, false)
+        .collect()
+        .unwrap();
+
+    // Assert
+    assert_eq!(
+        results[0].column(0).as_string_view(),
+        &StringViewArray::from(vec![Some("bob"), None, None])
     );
 }
 

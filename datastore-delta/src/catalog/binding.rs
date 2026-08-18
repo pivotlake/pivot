@@ -5,7 +5,9 @@
 use std::sync::Arc;
 
 use crate::manifest::{ColumnStatFilter, PartitionEqFilter};
-use crate::parquet::types::leaves::{first_leaf, leaf_fields, variant_shredded_leaves};
+use crate::parquet::types::leaves::{
+    first_leaf, leaf_fields, variant_shredded_leaves, variant_value_leaf_is_semantically_null,
+};
 use crate::parquet::types::metadata::RowGroupMetadata;
 use crate::parquet::{
     ParquetTable, ScanEqualityPredicate, materialize, row_group_eliminated, row_group_filter_from,
@@ -51,8 +53,9 @@ impl PushedPredicate {
     /// a variant path. `None` means pruning isn't sound for this row group
     /// (always safe): the path isn't shredded in this file, or some rows may
     /// hold the path's value in an untyped `value` leaf along the path, where
-    /// the typed leaf's statistics can't see them. The spec only allows
-    /// stats-based skipping when every such value leaf is all-null.
+    /// the typed leaf's statistics can't see them. Stats-based skipping is
+    /// allowed only when every such fallback is proven to contribute SQL NULL
+    /// for this cast.
     fn get_leaf_for_row_group(&self, rg: &RowGroupMetadata) -> Option<usize> {
         let fields = rg.schema.fields();
         if self.path.is_empty() {
@@ -66,12 +69,15 @@ impl PushedPredicate {
         if leaf_fields(fields)[leaves.typed_leaf].data_type() != target {
             return None;
         }
-        let all_value_leaves_null = leaves.value_leaves.iter().all(|&leaf| {
-            rg.leaf_statistics(leaf)
-                .and_then(|stats| stats.null_count)
-                .is_some_and(|null_count| null_count == rg.num_rows)
-        });
-        all_value_leaves_null.then_some(leaves.typed_leaf)
+        let terminal = leaves.value_leaves.len().saturating_sub(1);
+        leaves
+            .value_leaves
+            .iter()
+            .enumerate()
+            .all(|(level, &leaf)| {
+                variant_value_leaf_is_semantically_null(rg, leaf, target, level == terminal)
+            })
+            .then_some(leaves.typed_leaf)
     }
 }
 

@@ -124,10 +124,7 @@ impl Cast {
 /// strings lose their JSON quotes, while other values use their JSON
 /// representation.
 pub fn cast_variant_array(input: &ArrayRef, target: &DataType) -> Result<ArrayRef, ArrowError> {
-    if matches!(
-        target,
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
-    ) {
+    if !variant_cast_maps_json_null_to_sql_null(target) {
         return variant_to_text_array(input, target);
     }
 
@@ -147,6 +144,16 @@ pub fn cast_variant_array(input: &ArrayRef, target: &DataType) -> Result<ArrayRe
         }
         error => error,
     })
+}
+
+/// Whether JSON null and an absent value have the same result under this SQL
+/// cast. Text is the exception: it renders JSON null as `"null"` while an
+/// absent value remains SQL NULL.
+pub fn variant_cast_maps_json_null_to_sql_null(target: &DataType) -> bool {
+    !matches!(
+        target,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    )
 }
 
 /// Render a variant as extraction text: JSON strings become their unquoted
