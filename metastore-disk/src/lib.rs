@@ -29,6 +29,14 @@
 //! database, so unqualified table names and DDL resolve against it. Its name is
 //! free (it need not be called `default`).
 //!
+//! Each entry under `secrets` holds the credentials for the paths its `scope`
+//! covers, so a bucket's keys are written once however many datastores sit in
+//! it. `type` names the backend (`s3` or `gcs`) and carries that backend's
+//! fields. The most specific scope covering a location authenticates it; two
+//! secrets may not claim the same scope, so which one that is never depends on
+//! the order they were written in. A secret with no `scope` covers every
+//! location of its type.
+//!
 //! ```yaml
 //! metastore:
 //!   datastores:
@@ -43,18 +51,6 @@
 //!     cold:
 //!       kind: delta
 //!       location: gs://my-bucket/pivot/
-//! ```
-//!
-//! Each entry under `secrets` holds the credentials for the paths its `scope`
-//! covers, so a bucket's keys are written once however many datastores sit in
-//! it. `type` names the backend (`s3` or `gcs`) and carries that backend's
-//! fields. The most specific scope covering a location authenticates it; two
-//! secrets may not claim the same scope, so which one that is never depends on
-//! the order they were written in. A secret with no `scope` covers every
-//! location of its type.
-//!
-//! ```yaml
-//! metastore:
 //!   secrets:
 //!     my-bucket:
 //!       type: s3
@@ -150,9 +146,7 @@ pub struct DiskMetastore {
     metastore_config: RwLock<MetastoreConfig>,
     /// The file named by `--metastore-file`.
     metastore_file: Option<PathBuf>,
-    /// The secrets of both configs as one set, resolved against a datastore's
-    /// location when its store is opened. Built once here: nothing the server
-    /// writes back to the metastore file touches secrets.
+    /// The secrets of both configs (config file + metastore file) as one set.
     secrets: Secrets,
     default_name: String,
     /// How often every datastore this metastore opens refreshes its table set
