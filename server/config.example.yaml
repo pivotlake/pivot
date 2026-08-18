@@ -57,20 +57,35 @@ metastore:
       location: s3://example-bucket/warm/
       compact: true
       compact_bytes: 128m
+
+    # A `gs://` location opens a Google Cloud Storage store.
+    cold:
+      kind: delta
+      location: gs://example-bucket/cold/
+
+  # The credentials a remote location is opened with, kept apart from the
+  # datastores so a bucket's keys are written once however many datastores sit
+  # in it. `scope` is the path a secret covers; the most specific scope covering
+  # a location authenticates it, and two secrets may not claim the same scope.
+  # Omit `scope` to cover every location of the type.
+  #
+  # An `s3://` datastore needs a secret covering it. A `gs://` one without a
+  # secret falls back to the ambient Application Default Credentials
+  # (GOOGLE_APPLICATION_CREDENTIALS, `gcloud auth application-default login`, or
+  # the workload identity of the Google compute instance).
+  secrets:
+    example-bucket:
+      type: s3
+      scope: s3://example-bucket/
       region: us-east-1
       access_key_id: replace-me
       secret_access_key: replace-me
       # endpoint: http://localhost:9000 # MinIO / S3-compatible
 
-    # A `gs://` location opens a Google Cloud Storage store. Credentials come
-    # from `credentials_file` (a service-account or authorized-user JSON key);
-    # omit it to use the ambient Application Default Credentials instead
-    # (GOOGLE_APPLICATION_CREDENTIALS, `gcloud auth application-default login`,
-    # or the workload identity of the Google compute instance).
-    cold:
-      kind: delta
-      location: gs://example-bucket/cold/
-      # credentials_file: /etc/pivot/gcs-key.json
+    # google:
+    #   type: gcs
+    #   scope: gs://example-bucket/
+    #   credentials_file: /etc/pivot/gcs-key.json
 
   # `pivot` is served whatever this section says, so a server is always
   # reachable. It is trusted unless defined here, as it is below: trust proves no
