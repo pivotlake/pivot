@@ -141,6 +141,11 @@ DuckPlannerContext::DuckPlannerContext(rust::Box<CatalogContext> catalog)
     : catalog(std::move(catalog)),
       db(nullptr, &this->config),
       con(db) {
+        auto timezone_result = con.Query("SET TimeZone='UTC'");
+        if (timezone_result->HasError()) {
+                throw std::runtime_error(timezone_result->GetError());
+        }
+
         auto disable_result = con.Query(
             "SET disabled_optimizers='compressed_materialization,empty_result_pullup,regex_range'");
         if (disable_result->HasError()) {
@@ -1184,6 +1189,10 @@ int32_t value_date(const Value &v) {
 }
 int64_t value_timestamp(const Value &v) {
 	return v.GetValue<duckdb::timestamp_t>().value;
+}
+// TIMESTAMP WITH TIME ZONE holds the same microsecond count, taken as UTC.
+int64_t value_timestamp_tz(const Value &v) {
+	return v.GetValue<duckdb::timestamp_tz_t>().value;
 }
 // INTERVAL keeps its three independent components (months are calendar-variable,
 // so they stay separate from the fixed day/microsecond parts).

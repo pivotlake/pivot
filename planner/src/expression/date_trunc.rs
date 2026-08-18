@@ -2,6 +2,7 @@
 
 use super::{Expression, Function};
 use crate::compile::{self, ExprEvalFn, ExprFn, ExprResult};
+use crate::types::Type;
 use arrow_array::cast::AsArray;
 use arrow_array::types::Int64Type;
 use arrow_array::{ArrayRef, RecordBatch, TimestampMicrosecondArray};
@@ -19,6 +20,9 @@ const MICROS_PER_SEC: i64 = 1_000_000;
 pub struct DateTrunc {
     pub unit: String,
     pub source: Box<Expression>,
+    /// The bound result type ([`Type::Timestamp`] or [`Type::TimestampTz`],
+    /// tracking the source), so truncation never changes zone-ness.
+    pub result: Type,
 }
 
 impl Display for DateTrunc {
@@ -42,26 +46,34 @@ impl DateTrunc {
                         Function::DateTrunc(DateTrunc {
                             unit: other.to_string(),
                             source: self.source.clone(),
+                            result: self.result.clone(),
                         }),
                     )));
                 }
             };
+        // The output timestamp keeps the source's zone-ness; flooring epoch
+        // microseconds is zone-independent under the UTC session.
+        let zone = match crate::types::physical_arrow_type(&self.result) {
+            DataType::Timestamp(_, zone) => zone,
+            other => unreachable!("date_trunc result is a timestamp, not {other}"),
+        };
         let source_builder = self.source.compile()?;
         Ok(Box::new(move || {
             let mut source_expr = source_builder();
+            let zone = zone.clone();
             Box::new(move |batch: &RecordBatch| {
                 let src = source_expr(batch);
                 let (arr, _) = src.as_datum().get();
                 let i64arr = arrow::compute::cast(arr, &DataType::Int64).unwrap();
                 let vals = i64arr.as_primitive::<Int64Type>();
-                // Floor to `step` and emit a real TIMESTAMP (epoch
+                // Floor to `step` and emit a real timestamp (epoch
                 // microseconds), the type date_trunc returns, rather than a
                 // bare int.
                 let truncated: TimestampMicrosecondArray = vals
                     .iter()
                     .map(|v| v.map(|x| x.div_euclid(step) * step))
                     .collect();
-                ExprResult::Array(Arc::new(truncated) as ArrayRef)
+                ExprResult::Array(Arc::new(truncated.with_timezone_opt(zone.clone())) as ArrayRef)
             }) as ExprEvalFn
         }))
     }
@@ -112,5 +124,39 @@ mod tests {
             .to_vec();
         micros.sort();
         assert_eq!(micros, vec![0, 60_000_000, 120_000_000, 3_660_000_000]);
+    }
+
+    #[rstest]
+    fn truncating_a_timestamptz_keeps_its_zone(mut testing_planner: TestingPlanner) {
+        testing_planner.add_table(
+            "events",
+            &[(
+                "EventTime",
+                Type::TimestampTz,
+                Arc::new(Int64Array::from(vec![90_500_000i64, 3_690_000_000])) as ArrayRef,
+            )],
+        );
+
+        let batches = run_batches(
+            &mut testing_planner,
+            "SELECT date_trunc('hour', EventTime) FROM events",
+        );
+
+        // Truncation floors the UTC instant and keeps the zone marker, so the
+        // result is still a TIMESTAMP WITH TIME ZONE.
+        let col = batches[0].column(0);
+        assert_eq!(
+            col.data_type(),
+            &DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some(crate::types::UTC_TIMEZONE.into()),
+            )
+        );
+        let mut micros: Vec<i64> = col
+            .as_primitive::<TimestampMicrosecondType>()
+            .values()
+            .to_vec();
+        micros.sort();
+        assert_eq!(micros, vec![0, 3_600_000_000]);
     }
 }

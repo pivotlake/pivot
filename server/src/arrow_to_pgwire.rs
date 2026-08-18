@@ -99,9 +99,12 @@ macro_rules! arrow_pg_types {
                 DataType::UInt64 => Type::TEXT,
                 DataType::Decimal64(_, _) | DataType::Decimal128(_, _) => Type::NUMERIC,
                 // Temporal types reinterpreted from the executor's int columns at
-                // the output boundary (see `encode_cell`).
+                // the output boundary (see `encode_cell`). A zone-carrying
+                // timestamp is Postgres's TIMESTAMPTZ; a zone-less one its
+                // TIMESTAMP.
                 DataType::Date32 => Type::DATE,
-                DataType::Timestamp(_, _) => Type::TIMESTAMP,
+                DataType::Timestamp(_, None) => Type::TIMESTAMP,
+                DataType::Timestamp(_, Some(_)) => Type::TIMESTAMPTZ,
                 DataType::Interval(_) => Type::INTERVAL,
                 // Advertised but encoded via the text fallback below.
                 DataType::LargeUtf8 => Type::TEXT,
@@ -149,9 +152,18 @@ macro_rules! arrow_pg_types {
                     &arr.as_any().downcast_ref::<Date32Array>().unwrap()
                         .value_as_date(row).map(|d| d.to_string()),
                 ),
-                DataType::Timestamp(_, _) => encoder.encode_field(
+                DataType::Timestamp(_, None) => encoder.encode_field(
                     &arr.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap()
                         .value_as_datetime(row).map(|t| trim_fraction(t.to_string())),
+                ),
+                // A TIMESTAMPTZ renders in the session time zone, which is
+                // fixed to UTC, with the offset suffix a Postgres server
+                // prints: `2020-01-01 00:00:00+00`. `value_as_datetime` reads
+                // the stored count as the UTC instant it is.
+                DataType::Timestamp(_, Some(_)) => encoder.encode_field(
+                    &arr.as_any().downcast_ref::<TimestampMicrosecondArray>().unwrap()
+                        .value_as_datetime(row)
+                        .map(|t| format!("{}+00", trim_fraction(t.to_string()))),
                 ),
                 // A time span renders as the text a Postgres server prints for
                 // an INTERVAL.
@@ -499,6 +511,33 @@ mod tests {
         assert_eq!(
             decoded[2],
             vec![Some("2023-11-14 22:13:20.123456".to_string())]
+        );
+    }
+
+    /// A zone-carrying timestamp advertises TIMESTAMPTZ and renders in the UTC
+    /// session with the offset suffix a Postgres server prints, fraction
+    /// trimming included.
+    #[test]
+    fn timestamptz_maps_to_timestamptz_and_renders_with_a_utc_offset() {
+        let col: ArrayRef = Arc::new(
+            TimestampMicrosecondArray::from(vec![0, 1_577_836_800_500_000]).with_timezone("UTC"),
+        );
+        let b = batch(
+            vec![(
+                "t",
+                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+            )],
+            vec![col],
+        );
+
+        let fields = build_field_info(&b.schema());
+        let decoded = rows(&b);
+
+        assert_eq!(fields[0].datatype(), &Type::TIMESTAMPTZ);
+        assert_eq!(decoded[0], vec![Some("1970-01-01 00:00:00+00".to_string())]);
+        assert_eq!(
+            decoded[1],
+            vec![Some("2020-01-01 00:00:00.5+00".to_string())]
         );
     }
 

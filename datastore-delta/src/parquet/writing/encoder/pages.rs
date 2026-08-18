@@ -131,7 +131,7 @@ impl<'a> PlainSizes<'a> {
             DataType::Int64
             | DataType::Float64
             | DataType::UInt64
-            | DataType::Timestamp(TimeUnit::Microsecond, None) => Self::Fixed(8),
+            | DataType::Timestamp(TimeUnit::Microsecond, _) => Self::Fixed(8),
             // A decimal's width follows its precision-chosen storage.
             DataType::Decimal64(precision, _) | DataType::Decimal128(precision, _) => {
                 Self::Fixed(crate::parquet::decimal_write_storage(*precision).byte_width())

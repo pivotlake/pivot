@@ -30,7 +30,7 @@ pub use delta_binary_packed::{DecimalDeltaDecoder, DeltaDecoder, FromDelta};
 mod levels;
 
 mod primitive;
-pub use primitive::PrimitiveLeafDecoder;
+pub use primitive::{PrimitiveLeafDecoder, TimestampMicrosecondLeafDecoder};
 
 mod rle;
 

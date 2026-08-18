@@ -157,7 +157,7 @@ fn format_cell(
             .value_as_date(row)
             .unwrap()
             .to_string(),
-        DataType::Timestamp(_, _) => trim_timestamp_fraction(
+        DataType::Timestamp(_, None) => trim_timestamp_fraction(
             array
                 .as_any()
                 .downcast_ref::<TimestampMicrosecondArray>()
@@ -165,6 +165,20 @@ fn format_cell(
                 .value_as_datetime(row)
                 .unwrap()
                 .to_string(),
+        ),
+        // A zone-carrying timestamp is a UTC instant; render it with the
+        // offset suffix a Postgres server prints under a UTC session.
+        DataType::Timestamp(_, Some(_)) => format!(
+            "{}+00",
+            trim_timestamp_fraction(
+                array
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap()
+                    .value_as_datetime(row)
+                    .unwrap()
+                    .to_string(),
+            )
         ),
         DataType::Interval(_) => render_interval(
             array

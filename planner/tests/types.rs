@@ -5,6 +5,7 @@ mod common;
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, BooleanArray, Int8Array, Int16Array, Int64Array};
+use arrow_schema::{DataType, TimeUnit};
 use common::*;
 use planner::types::Type;
 use rstest::rstest;
@@ -147,6 +148,70 @@ fn int64_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["value"], 1);
     assert_eq!(rows[1]["value"], 3);
+}
+
+#[rstest]
+fn timestamptz_query_runs_end_to_end(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "events",
+        &[(
+            "occurred",
+            Type::TimestampTz,
+            Arc::new(Int64Array::from(vec![0_i64, 3_600_000_000, 7_200_000_000])) as ArrayRef,
+        )],
+    );
+
+    // The literal carries an explicit offset: 02:30:00+02 is 00:30:00 UTC, so
+    // it keeps the one-hour and two-hour rows.
+    let results = testing_planner
+        .plan("SELECT occurred FROM events WHERE occurred > TIMESTAMPTZ '1970-01-01 02:30:00+02'")
+        .unwrap()
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    let rows = batches_to_json(&results);
+    assert_eq!(rows.len(), 2);
+}
+
+#[rstest]
+fn timestamptz_group_key_keeps_its_zone(mut testing_planner: TestingPlanner) {
+    testing_planner.add_table(
+        "tz_groups",
+        &[(
+            "occurred",
+            Type::TimestampTz,
+            Arc::new(Int64Array::from(vec![0_i64, 0, 3_600_000_000])) as ArrayRef,
+        )],
+    );
+
+    let results = testing_planner
+        .plan("SELECT occurred, COUNT(*) FROM tz_groups GROUP BY occurred")
+        .unwrap()
+        .compile(
+            testing_planner.dispatcher(),
+            testing_planner.transaction().as_ref(),
+        )
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    // The group-by drops a temporal key to its backing int and restores the
+    // declared type on output, zone marker included.
+    let key_type = results[0].schema().field(0).data_type().clone();
+    assert_eq!(
+        key_type,
+        DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some(planner::types::UTC_TIMEZONE.into()),
+        )
+    );
+    let groups: usize = results.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(groups, 2);
 }
 
 #[rstest]

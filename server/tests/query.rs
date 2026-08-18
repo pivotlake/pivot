@@ -921,6 +921,149 @@ async fn decimal_scan_filter_and_wire_format(#[future] conn: Conn) {
     );
 }
 
+/// A TIMESTAMPTZ column scans from a file another engine wrote (arrow-rs
+/// stamps `isAdjustedToUTC`), filters against a literal with an explicit
+/// offset, and renders the UTC session's `+00` text on the wire.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn timestamptz_scan_filter_and_wire_format(#[future] conn: Conn) {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "occurred",
+        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+        false,
+    )]));
+    let at: ArrayRef = Arc::new(
+        arrow_array::TimestampMicrosecondArray::from(vec![
+            0i64,
+            1_577_836_800_000_000,
+            1_577_836_800_500_000,
+        ])
+        .with_timezone("UTC"),
+    );
+    let dir = write_parquet(&RecordBatch::try_new(schema, vec![at]).unwrap());
+    conn.simple_query(&format!(
+        "CREATE TABLE tz_events (occurred TIMESTAMPTZ) WITH (with_pre_existing_parquets = '{}')",
+        dir.path().to_str().unwrap()
+    ))
+    .await
+    .unwrap();
+
+    // 02:00:00+02 is 2020-01-01 00:00:00 UTC, so the epoch row drops.
+    let rows = select_rows(
+        &conn,
+        "SELECT occurred FROM tz_events WHERE occurred >= TIMESTAMPTZ '2020-01-01 02:00:00+02' ORDER BY occurred",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("2020-01-01 00:00:00+00".into())],
+            vec![Some("2020-01-01 00:00:00.5+00".into())],
+        ]
+    );
+}
+
+/// A TIMESTAMPTZ column accepts offset-bearing INSERT values, stores their UTC
+/// microseconds, and reports TIMESTAMPTZ on the PostgreSQL wire.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn timestamptz_columns_accept_offset_inserts(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE inserted_events (occurred TIMESTAMPTZ)")
+        .await
+        .unwrap();
+    conn.simple_query(
+        "INSERT INTO inserted_events VALUES \
+         (TIMESTAMPTZ '2020-01-01 02:00:00.5+02'), \
+         (TIMESTAMPTZ '1970-01-01 00:00:01+00')",
+    )
+    .await
+    .unwrap();
+
+    let rows = select_rows(
+        &conn,
+        "SELECT occurred FROM inserted_events ORDER BY occurred",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some("1970-01-01 00:00:01+00".into())],
+            vec![Some("2020-01-01 00:00:00.5+00".into())],
+        ]
+    );
+}
+
+/// A table declared with a plain TIMESTAMP column reads a file whose leaf is
+/// stamped UTC-adjusted: the declaration decides zone-ness, so the values
+/// render without an offset suffix.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn declared_timestamp_overrides_a_files_utc_flag(#[future] conn: Conn) {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "occurred",
+        DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
+        false,
+    )]));
+    let at: ArrayRef = Arc::new(
+        arrow_array::TimestampMicrosecondArray::from(vec![1_577_836_800_000_000i64])
+            .with_timezone("UTC"),
+    );
+    let dir = write_parquet(&RecordBatch::try_new(schema, vec![at]).unwrap());
+    conn.simple_query(&format!(
+        "CREATE TABLE naive_events (occurred TIMESTAMP) WITH (with_pre_existing_parquets = '{}')",
+        dir.path().to_str().unwrap()
+    ))
+    .await
+    .unwrap();
+
+    let rows = select_rows(&conn, "SELECT occurred FROM naive_events").await;
+
+    assert_eq!(rows, vec![vec![Some("2020-01-01 00:00:00".into())]]);
+}
+
+/// `now()` and `CURRENT_TIMESTAMP` are TIMESTAMP WITH TIME ZONE, so both
+/// render in the UTC session with the offset suffix.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn now_and_current_timestamp_are_timestamptz(#[future] conn: Conn) {
+    let rows = select_rows(&conn, "SELECT now(), CURRENT_TIMESTAMP").await;
+
+    for value in &rows[0] {
+        let rendered = value.as_deref().unwrap();
+        assert!(
+            rendered.ends_with("+00"),
+            "expected a UTC offset suffix, got: {rendered}"
+        );
+    }
+}
+
+/// The session time zone is fixed to UTC: UTC spellings are accepted, any
+/// other zone is refused rather than quietly served UTC answers.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn set_timezone_accepts_only_utc(#[future] conn: Conn) {
+    conn.simple_query("SET TimeZone = 'UTC'").await.unwrap();
+    conn.simple_query("SET timezone = 'GMT'").await.unwrap();
+    conn.simple_query("RESET TimeZone").await.unwrap();
+
+    let error = conn
+        .simple_query("SET TimeZone = 'Europe/Amsterdam'")
+        .await
+        .unwrap_err();
+
+    assert!(
+        extract_db_error_message(&error).contains("UTC only"),
+        "got: {error}"
+    );
+}
+
 /// Global SUM/MIN/MAX over a DECIMAL column keep the exact fixed-point values
 /// and the bound output scale; AVG comes back as a double.
 #[rstest]

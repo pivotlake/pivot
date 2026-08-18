@@ -9,6 +9,7 @@ fn main() {
     let mut duckdb_config = cmake::Config::new("duckdb-sources");
     duckdb_config
         .profile("Release")
+        .define("BUILD_EXTENSIONS", "icu")
         .build_target("duckdb_static");
 
     // Route DuckDB's C/C++ compiles through ccache so a fresh checkout restores
@@ -37,7 +38,7 @@ fn main() {
 
     let duckdb = duckdb_config.build();
 
-    // Build parquet and core_functions extensions
+    // Build the static extensions loaded by extension_loader.cpp.
     let build_dir = duckdb.join("build");
     let status = std::process::Command::new("cmake")
         .args([
@@ -47,6 +48,8 @@ fn main() {
             "parquet_extension",
             "--target",
             "core_functions_extension",
+            "--target",
+            "icu_extension",
             "--config",
             "Release",
             "--parallel",
@@ -71,9 +74,14 @@ fn main() {
         "cargo:rustc-link-search=native={}/build/extension/core_functions",
         duckdb.display()
     );
+    println!(
+        "cargo:rustc-link-search=native={}/build/extension/icu",
+        duckdb.display()
+    );
     println!("cargo:rustc-link-lib=static=duckdb_static");
     println!("cargo:rustc-link-lib=static=parquet_extension");
     println!("cargo:rustc-link-lib=static=core_functions_extension");
+    println!("cargo:rustc-link-lib=static=icu_extension");
 
     let include_path = "duckdb-sources/src/include";
 
@@ -99,6 +107,7 @@ fn main() {
         .file("src/duckdb_bridge/cpp/catalog/table_entry.cpp")
         .include(include_path)
         .include("duckdb-sources/extension/core_functions/include")
+        .include("duckdb-sources/extension/icu/include")
         .include("third_party")
         .std("c++17")
         .warnings(false)

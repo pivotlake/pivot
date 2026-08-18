@@ -121,7 +121,7 @@ pub(super) fn encode_into(array: &dyn Array, out: &mut Vec<u8>) -> WriteResult<(
         DataType::UInt64 => fixed!(UInt64Array),
         // A date writes the day count its INT32 storage holds.
         DataType::Date32 => fixed!(Date32Array),
-        DataType::Timestamp(TimeUnit::Microsecond, None) => fixed!(TimestampMicrosecondArray),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => fixed!(TimestampMicrosecondArray),
         DataType::Float32 => fixed!(Float32Array),
         DataType::Float64 => fixed!(Float64Array),
         // A decimal writes the narrowest storage its precision allows (see

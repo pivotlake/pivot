@@ -1,11 +1,13 @@
 //! [`Now`]: `now()`, the statement's wall-clock instant.
 
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
+use crate::types::UTC_TIMEZONE;
 use arrow_array::{RecordBatch, TimestampMicrosecondArray};
 use std::fmt::{self, Display};
 use std::sync::Arc;
 
-/// `now()` — the current time as a `TIMESTAMP` (epoch microseconds).
+/// `now()` (also `CURRENT_TIMESTAMP`) — the current time as a
+/// `TIMESTAMP WITH TIME ZONE` (UTC epoch microseconds), Postgres's type for it.
 ///
 /// Carries no arguments: the instant it reports is captured when the call is
 /// compiled, not when the expression is built, so the value lives in the
@@ -25,7 +27,9 @@ impl Now {
             .unwrap_or(0);
         Ok(stateless_expr(move |batch: &RecordBatch| {
             let values = vec![now_micros; batch.num_rows()];
-            ExprResult::Array(Arc::new(TimestampMicrosecondArray::from(values)))
+            ExprResult::Array(Arc::new(
+                TimestampMicrosecondArray::from(values).with_timezone(UTC_TIMEZONE),
+            ))
         }))
     }
 }
@@ -45,18 +49,21 @@ mod tests {
     use rstest::rstest;
 
     #[rstest]
-    fn now_returns_current_time_as_a_timestamp(mut testing_planner: TestingPlanner) {
+    fn now_returns_current_time_as_a_timestamptz(mut testing_planner: TestingPlanner) {
         let before = micros_since_epoch();
 
         let batches = run_batches(&mut testing_planner, "SELECT now()");
 
         let after = micros_since_epoch();
         let col = batches[0].column(0);
-        // `now()` surfaces as a real TIMESTAMP carrying the captured instant at
-        // the microsecond resolution a timestamp counts in.
+        // `now()` surfaces as a TIMESTAMP WITH TIME ZONE carrying the captured
+        // UTC instant at the microsecond resolution a timestamp counts in.
         assert_eq!(
             col.data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, None)
+            &DataType::Timestamp(
+                TimeUnit::Microsecond,
+                Some(crate::types::UTC_TIMEZONE.into()),
+            )
         );
         let now = col.as_primitive::<TimestampMicrosecondType>().value(0);
         assert!(

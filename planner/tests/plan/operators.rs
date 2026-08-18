@@ -218,6 +218,18 @@ fn create_table_produces_create_table_operator(mut testing_planner: TestingPlann
 }
 
 #[rstest]
+fn create_table_preserves_timestamp_zone_semantics(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .plan("CREATE TABLE events (local_time TIMESTAMP, occurred TIMESTAMPTZ)")
+        .unwrap();
+    assert_snapshot!(
+        plan.to_string(),
+        @"CreateTable(events, [local_time:Timestamp, occurred:TimestampTz], options: {})
+    "
+    );
+}
+
+#[rstest]
 fn create_table_propagates_with_options(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
         .plan("CREATE TABLE created_table (id INTEGER) WITH (path='/asdf', format='parquet')")

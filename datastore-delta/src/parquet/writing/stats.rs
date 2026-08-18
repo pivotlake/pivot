@@ -56,7 +56,7 @@ pub(super) fn column_min_max(array: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
         DataType::UInt32 => numeric!(UInt32Array),
         DataType::UInt64 => numeric!(UInt64Array),
         DataType::Date32 => numeric!(Date32Array),
-        DataType::Timestamp(TimeUnit::Microsecond, None) => numeric!(TimestampMicrosecondArray),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => numeric!(TimestampMicrosecondArray),
         DataType::Float32 => numeric!(Float32Array),
         DataType::Float64 => numeric!(Float64Array),
         // Ordering decimals by their unscaled integers is the numeric order,
@@ -148,7 +148,7 @@ pub(super) fn stat_bytes(value: &ArrayRef) -> Option<Vec<u8>> {
         DataType::UInt32 => le_bytes!(UInt32Array),
         DataType::UInt64 => le_bytes!(UInt64Array),
         DataType::Date32 => le_bytes!(Date32Array),
-        DataType::Timestamp(TimeUnit::Microsecond, None) => le_bytes!(TimestampMicrosecondArray),
+        DataType::Timestamp(TimeUnit::Microsecond, _) => le_bytes!(TimestampMicrosecondArray),
         DataType::Float32 => le_bytes!(Float32Array),
         DataType::Float64 => le_bytes!(Float64Array),
         // Decimal stats bytes follow the precision-chosen value storage:

@@ -11,15 +11,18 @@
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::Index;
+use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::ArrowPrimitiveType;
-use arrow_array::{ArrayRef, Scalar};
+use arrow_array::types::{ArrowPrimitiveType, TimestampMicrosecondType};
+use arrow_array::{ArrayRef, RecordBatch, Scalar, TimestampMicrosecondArray};
 use arrow_buffer::ArrowNativeType;
 
 use crate::parquet::reading::decoding::leaf_decoders::{
-    DecodePlain, DeltaDecoder, Dict, DictFromBytes, DictFromVecBytes, FromDelta, TypedLeafDecoder,
+    DecodePlain, DeltaDecoder, Dict, DictFromBytes, DictFromVecBytes, FromDelta, LeafDecoder,
+    Result, TypedLeafDecoder,
 };
+use crate::parquet::types::page::DecompressedPage;
 use bytes::Bytes;
 use dispatch::memory::{
     MultiBufferReader, MultiSlabBuffer, ReaderPosition, SlabAllocator, SlabBuffer,
@@ -367,18 +370,83 @@ pub type PrimitiveLeafDecoder<T> = TypedLeafDecoder<
     PrimitiveBuilder<T>,
     PrimitivePlainDecoder<T>,
 >;
+
+/// Decodes a Parquet `INT64` timestamp and attaches its Arrow timezone
+/// metadata without touching the decoded microsecond values.
+///
+/// This mirrors arrow-rs' Parquet reader: decode the physical values first,
+/// then use [`TimestampMicrosecondArray::with_timezone_opt`] to annotate the
+/// finished array. Cloning the primitive array only clones its buffer handles.
+pub struct TimestampMicrosecondLeafDecoder {
+    inner: PrimitiveLeafDecoder<TimestampMicrosecondType>,
+    timezone: Option<Arc<str>>,
+}
+
+impl TimestampMicrosecondLeafDecoder {
+    pub fn new(max_def_level: i16, timezone: Option<Arc<str>>) -> Self {
+        Self {
+            inner: PrimitiveLeafDecoder::new(max_def_level),
+            timezone,
+        }
+    }
+}
+
+fn attach_timestamp_timezone(
+    array: ArrayRef,
+    timezone: Option<Arc<str>>,
+) -> TimestampMicrosecondArray {
+    array
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .expect("timestamp decoder must produce a microsecond timestamp array")
+        .clone()
+        .with_timezone_opt(timezone)
+}
+
+impl LeafDecoder for TimestampMicrosecondLeafDecoder {
+    fn available(&self) -> usize {
+        self.inner.available()
+    }
+
+    fn insert_page(&mut self, page: DecompressedPage, allocator: &mut SlabAllocator) {
+        self.inner.insert_page(page, allocator);
+    }
+
+    fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef> {
+        let array = self.inner.read(allocator, size)?;
+        Ok(Arc::new(attach_timestamp_timezone(
+            array,
+            self.timezone.clone(),
+        )))
+    }
+
+    fn set_eq_constant(&mut self, value: &Scalar<ArrayRef>) {
+        self.inner.set_eq_constant(value);
+    }
+
+    fn dict_excludes_eq_constant(&self) -> bool {
+        self.inner.dict_excludes_eq_constant()
+    }
+
+    fn fast_filter_record_batch(&self, batch: RecordBatch, column: usize) -> RecordBatch {
+        self.inner.fast_filter_record_batch(batch, column)
+    }
+}
 //
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use crate::parquet::types::thrift::general::Encoding;
     use crate::parquet::types::thrift::headers::PageHeader;
     use arrow_array::types::{Float32Type, Int16Type, Int32Type, Int64Type, UInt16Type};
     use arrow_array::{
-        Array, ArrayRef, Float32Array, Int16Array, Int32Array, Int64Array, UInt16Array,
+        Array, ArrayRef, Float32Array, Int16Array, Int32Array, Int64Array,
+        TimestampMicrosecondArray, UInt16Array,
     };
     use bytes::Bytes;
 
-    use super::{Dict, PrimitiveDict, PrimitiveLeafDecoder};
+    use super::{Dict, PrimitiveDict, PrimitiveLeafDecoder, attach_timestamp_timezone};
     use dispatch::memory::SlabBuffer;
 
     /// `maybe_contains` scans raw page bytes, so the buffer flavour is
@@ -388,6 +456,18 @@ mod tests {
     use crate::parquet::test_utils::dummy_metadata;
     use dispatch::memory::SlabAllocator;
     use dispatch::memory::init_test_free_pool;
+
+    #[test]
+    fn attaching_a_timestamp_timezone_preserves_the_value_buffer() {
+        let input = TimestampMicrosecondArray::from(vec![42]);
+        let values = input.values().as_ptr();
+
+        let output = attach_timestamp_timezone(Arc::new(input), Some("UTC".into()));
+
+        assert_eq!(output.timezone(), Some("UTC"));
+        assert_eq!(output.values().as_ptr(), values);
+        assert_eq!(output.value(0), 42);
+    }
 
     #[test]
     fn maybe_contains_finds_present_and_rejects_absent() {

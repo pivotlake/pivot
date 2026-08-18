@@ -11,14 +11,14 @@
 
 use crate::parquet::reading::decoding::leaf_decoders;
 use crate::parquet::reading::decoding::leaf_decoders::{
-    BytesViewDecoder, LeafDecoder, PrimitiveLeafDecoder, decimal_decoder,
+    BytesViewDecoder, LeafDecoder, PrimitiveLeafDecoder, TimestampMicrosecondLeafDecoder,
+    decimal_decoder,
 };
 use crate::parquet::types::leaves::{OutputRead, reconstruct_column_from_leaves};
 use crate::parquet::types::metadata::ColumnChunkMeta;
 use arrow_array::types::{
     BinaryViewType, Date32Type, Decimal64Type, Decimal128Type, Float32Type, Float64Type, Int8Type,
-    Int16Type, Int32Type, Int64Type, StringViewType, TimestampMicrosecondType, UInt8Type,
-    UInt16Type, UInt32Type, UInt64Type,
+    Int16Type, Int32Type, Int64Type, StringViewType, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow_array::{ArrayRef, StructArray, new_null_array};
 use arrow_buffer::NullBuffer;
@@ -296,9 +296,9 @@ pub fn create_leaf_decoder(
         DataType::Int32 => Ok(primitive!(Int32Type)),
         DataType::Int64 => Ok(primitive!(Int64Type)),
         DataType::Date32 => Ok(primitive!(Date32Type)),
-        DataType::Timestamp(TimeUnit::Microsecond, None) => {
-            Ok(primitive!(TimestampMicrosecondType))
-        }
+        DataType::Timestamp(TimeUnit::Microsecond, timezone) => Ok(Box::new(
+            TimestampMicrosecondLeafDecoder::new(max_def_level, timezone.clone()),
+        )),
         DataType::Float32 => Ok(primitive!(Float32Type)),
         DataType::Float64 => Ok(primitive!(Float64Type)),
         DataType::Decimal64(precision, scale) => {

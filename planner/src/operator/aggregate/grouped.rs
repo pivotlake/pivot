@@ -396,6 +396,7 @@ fn canonical_input_type(result_type: &Type) -> Option<Type> {
         Type::Utf8 => Some(Type::Utf8),
         Type::Date => Some(Type::Date),
         Type::Timestamp => Some(Type::Timestamp),
+        Type::TimestampTz => Some(Type::TimestampTz),
         Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64 => Some(Type::Int64),
         // A computed float aggregate argument (`SUM(a * b)`) materialises as the
         // Float64 the float readers consume.
