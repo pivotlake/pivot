@@ -15,7 +15,7 @@ use arrow_array::RecordBatch;
 use dispatch::{
     DataFlowDispatcher, OperatorFactory, OperatorSpec, Projection, RECORD_BATCH_SIZE,
     RecordBatchOperatorSpec, RootUnaryOperatorFactory, UnaryOperatorFactory, return_to_worker_mpsc,
-    stealable,
+    stealable, to_single_worker_mpsc,
 };
 
 use crate::parquet::{
@@ -193,7 +193,17 @@ pub fn materialize(
 
     let pending_row_groups = pending_row_group_counters(n);
     let claim_bound = pending_claim_bound(&table);
-    let factories: Vec<_> = stealable::<RecordBatch>(dispatcher.topology())
+    // Every surviving-row batch funnels to ONE worker's materializer, so each
+    // row group becomes exactly one [`RowGroupRequest`] holding all of its
+    // surviving rows. The decoder relies on that: it tracks row groups by
+    // index and drops pages of a group it already finished, so a second
+    // request for the same group would silently lose its rows. The funneled
+    // stage only merges tiny index lists; the fetch and decode stay spread
+    // over every worker through the stealable request channel. Successive
+    // materializes take turns hosting the merge, so concurrent queries do not
+    // all pin one worker.
+    let host = dispatcher.next_worker();
+    let factories: Vec<_> = to_single_worker_mpsc::<RecordBatch>(n, host)
         .into_iter()
         .zip(stealable::<RowGroupRequest>(dispatcher.topology()))
         .zip(pending_row_groups.iter())
