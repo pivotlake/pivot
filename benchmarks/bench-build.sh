@@ -164,7 +164,11 @@ if [[ $regen_profile -eq 1 ]]; then
     rm -f "$working"/pgo/*.profraw
     query_args=()
     [[ -n "$queries" ]] && query_args=(--query "$queries")
-    LLVM_PROFILE_FILE="$working/pgo/default_%m_%p.profraw" \
+    # PIVOT_SPIN_LIMIT=0 parks idle workers immediately instead of spinning,
+    # so the profile records the wait-heavy control-flow mix that cold runs
+    # on the full dataset execute, deterministically rather than as a
+    # timing-dependent draw per build.
+    LLVM_PROFILE_FILE="$working/pgo/default_%m_%p.profraw" PIVOT_SPIN_LIMIT=0 \
         "$working/target-pgogen/$host_target/release/pivot-bench" \
         --suite "$suite" --source "$pgo_source" \
         --iterations "$iterations" --skip-check "${query_args[@]}"

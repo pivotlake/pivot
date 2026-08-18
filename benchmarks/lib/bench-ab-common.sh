@@ -241,7 +241,11 @@ profile_side() {
     local dir="$1" side="$2" suite="$3" source="$4"
     local prof_dir="$work_dir/prof-$side"
     rm -rf "$prof_dir"; mkdir -p "$prof_dir"
-    LLVM_PROFILE_FILE="$prof_dir/%m-%p.profraw" \
+    # PIVOT_SPIN_LIMIT=0 parks idle workers immediately instead of spinning,
+    # so the profile records the wait-heavy control-flow mix that cold runs
+    # on the full dataset execute, deterministically rather than as a
+    # timing-dependent draw per build.
+    LLVM_PROFILE_FILE="$prof_dir/%m-%p.profraw" PIVOT_SPIN_LIMIT=0 \
         "$dir/benchmarks/target-client/release/pivot-bench" \
         --suite "$suite" --suite-dir "$dir/benchmarks/$suite" \
         --server-bin "$dir/benchmarks/target-pgogen/$host_target/release/pivotdb-server" \
