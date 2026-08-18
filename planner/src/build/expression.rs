@@ -211,6 +211,18 @@ impl Cast {
                 )));
             }
             let (input, path) = collapse_extractions(source);
+            // A whole-document cast to text renders the document as JSON,
+            // which is `Cast::compile`'s variant-to-text path. The typed read
+            // below cannot stand in for it: `variant_get` converts row values
+            // with `as_string`, and an object or array document has no string
+            // value, so every such row would come back NULL.
+            if path.is_empty() && target == Type::Utf8 {
+                return Ok(Expression::Cast(Cast {
+                    target_arrow: physical_arrow_type(&target),
+                    target,
+                    source: Box::new(input),
+                }));
+            }
             return Ok(Expression::Function(Function::VariantGet(VariantGet {
                 input: Box::new(input),
                 path,

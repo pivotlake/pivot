@@ -1029,6 +1029,29 @@ async fn dot_access_pushed_into_the_scan_reads_the_same_values(#[future] conn: C
     );
 }
 
+/// Reading a variant column whole beside a pushed extract of one of its paths:
+/// the extract must not leave the whole-column read empty. The ORDER BY on the
+/// extracted field routes both columns through the Top-N.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn whole_variant_renders_beside_a_pushed_extract(#[future] conn: Conn) {
+    write_shredded_variant(&conn, "variant_whole", &mixed_documents()).await;
+
+    let rows = select_rows(
+        &conn,
+        "SELECT CAST(j AS VARCHAR) AS doc, CAST(j.kind AS VARCHAR) AS kind \
+         FROM variant_whole ORDER BY kind LIMIT 3",
+    )
+    .await;
+
+    for row in &rows {
+        assert_eq!(row[1].as_deref(), Some("commit"));
+        let doc = row[0].as_deref().expect("the whole document renders");
+        assert!(doc.contains("\"kind\":\"commit\""), "got: {doc}");
+    }
+}
+
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]

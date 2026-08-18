@@ -1233,6 +1233,64 @@ fn scan_pushed_extract_falls_back_for_an_unshredded_path() {
     );
 }
 
+/// Reading a shredded variant column whole and rendering each document back to
+/// JSON must yield every document, exactly as extracting one field does. The
+/// same column is read twice, once whole and once as a pushed extract, the
+/// shape of `SELECT CAST(v AS VARCHAR), CAST(v.stat AS VARCHAR)`.
+#[test]
+fn scan_shredded_variant_whole_column_renders_every_document() {
+    use dispatch::VariantExtract;
+    use parquet_variant_compute::{
+        ShreddedSchemaBuilder, VariantArray, json_to_variant, shred_variant, unshred_variant,
+    };
+    use parquet_variant_json::VariantToJson as _;
+
+    let dispatch = dispatch(1);
+    let json: ArrayRef = Arc::new(StringArray::from(vec![
+        r#"{"stat":"BinaryStats"}"#,
+        r#"{"stat":"Other"}"#,
+    ]));
+    let shred = ShreddedSchemaBuilder::new()
+        .with_path("stat", &DataType::Utf8View)
+        .unwrap()
+        .build();
+    let shredded = shred_variant(&json_to_variant(&json).unwrap(), &shred).unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![shredded.field("doc")])),
+        vec![Arc::new(shredded.into_inner()) as _],
+    )
+    .unwrap();
+    let (_dir, table) = parquet_table(&dispatch, &[batch], false);
+
+    let projection = Projection::columns_with_extracts(
+        vec![0, 0],
+        vec![
+            None,
+            Some(VariantExtract {
+                path: vec!["stat".to_string()],
+                as_type: Some(DataType::Utf8View),
+            }),
+        ],
+    );
+    let results = table_input(&dispatch, &table, projection, false)
+        .collect()
+        .unwrap();
+
+    let variant = VariantArray::try_new(results[0].column(0)).unwrap();
+    let variant = unshred_variant(&variant).unwrap();
+    let mut rendered = Vec::new();
+    for row in 0..variant.len() {
+        assert!(variant.is_valid(row), "row {row} lost its document");
+        let mut text = Vec::new();
+        variant.try_value(row).unwrap().to_json(&mut text).unwrap();
+        rendered.push(String::from_utf8(text).unwrap());
+    }
+    assert_eq!(
+        rendered,
+        vec![r#"{"stat":"BinaryStats"}"#, r#"{"stat":"Other"}"#]
+    );
+}
+
 /// A bare extract (no cast) yields the sub-variant at the path, read from only
 /// its subtree; casting the emitted sub-variant recovers the value.
 #[test]
