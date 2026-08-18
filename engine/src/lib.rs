@@ -6,6 +6,8 @@
 //! dispatch worker. The PostgreSQL frontend turns them into wire rows, while a
 //! local frontend can copy Arrow batches or turn cells into terminal text.
 
+mod copy_text;
+
 use std::cell::RefCell;
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -637,14 +639,75 @@ impl PlanCache {
     }
 }
 
+/// Reassembles one COPY format's byte frames into client-schema batches.
+/// Frames split at arbitrary positions in every format, so each variant
+/// carries its partial state between frames.
+enum CopyFrameDecoder {
+    Arrow(StreamDecoder),
+    Text(copy_text::TextRowDecoder),
+}
+
+impl CopyFrameDecoder {
+    fn build(format: &planner::CopyFormat, column_count: usize) -> Self {
+        match format {
+            planner::CopyFormat::ArrowIpc => Self::Arrow(StreamDecoder::new()),
+            planner::CopyFormat::Text => Self::Text(copy_text::TextRowDecoder::new(column_count)),
+        }
+    }
+
+    /// Decode one protocol frame into the batches it completes. The frame
+    /// arrives as refcounted [`Bytes`]; the Arrow decoder slices messages out
+    /// of it without copying, while the text format parses values into fresh
+    /// arrays.
+    fn decode_frame(&mut self, bytes: Bytes) -> Result<Vec<RecordBatch>> {
+        let mut batches = Vec::new();
+        match self {
+            Self::Arrow(decoder) => {
+                let mut buffer = arrow::buffer::Buffer::from(bytes);
+                loop {
+                    match decoder.decode(&mut buffer) {
+                        Ok(Some(batch)) => batches.push(batch),
+                        Ok(None) => break,
+                        Err(e) => {
+                            return Err(Error::Copy(format!("decoding COPY arrow stream: {e}")));
+                        }
+                    }
+                }
+            }
+            Self::Text(decoder) => decoder
+                .decode(&bytes, &mut batches)
+                .map_err(|e| Error::Copy(format!("COPY text data: {e}")))?,
+        }
+        Ok(batches)
+    }
+
+    /// Verify the stream ended cleanly, returning the final partial batch the
+    /// text format still buffers.
+    fn finish(&mut self) -> Result<Option<RecordBatch>> {
+        match self {
+            Self::Arrow(decoder) => {
+                decoder.finish().map_err(|e| {
+                    Error::Copy(format!("COPY arrow stream ended mid-message: {e}"))
+                })?;
+                Ok(None)
+            }
+            Self::Text(decoder) => decoder
+                .finish()
+                .map_err(|e| Error::Copy(format!("COPY text data: {e}"))),
+        }
+    }
+}
+
 /// A running `COPY ... FROM STDIN` ingest, the engine's whole copy surface:
 /// the frontend feeds it protocol bytes and finishes or drops it, and every
 /// dispatch-facing concern (decoding, backpressure, cancellation, the
 /// statement's transaction) stays inside.
 pub struct CopyIngest {
-    /// The sequential half: reassembles the protocol's byte frames into Arrow
-    /// IPC messages and yields client-schema batches.
-    decoder: StreamDecoder,
+    /// The sequential half: reassembles the protocol's byte frames into
+    /// client-schema batches, per the statement's format.
+    decoder: CopyFrameDecoder,
+    /// The statement's validated format, for the frontend's copy-in response.
+    format: planner::CopyFormat,
     sender: ChannelInputSender<RecordBatch>,
     /// Signalled by workers claiming batches; [`push`](Self::push) sleeps on
     /// it while the queue is full.
@@ -675,43 +738,45 @@ impl CopyIngest {
         self.column_count
     }
 
+    /// The statement's validated format, so the frontend's copy-in response
+    /// can advertise the payload kind the client must send.
+    pub fn format(&self) -> &planner::CopyFormat {
+        &self.format
+    }
+
     /// Decode one protocol frame and feed the batches it completes to the
     /// running dataflow, sleeping while the queue is full. The decoder
-    /// carries partial messages across frames, so a batch may span any number
-    /// of frames (and one frame may complete several). An error means the
-    /// stream is malformed; the copy cannot proceed and should be dropped.
-    ///
-    /// The frame arrives as refcounted [`Bytes`], so handing it to the
-    /// decoder copies nothing: a message contained in one frame is sliced in
-    /// place, and the decoded batches keep the frame's allocation alive.
+    /// carries partial rows and messages across frames, so a batch may span
+    /// any number of frames (and one frame may complete several). An error
+    /// means the stream is malformed; the copy cannot proceed and should be
+    /// dropped.
     pub async fn push(&mut self, bytes: Bytes) -> Result<()> {
-        let mut buffer = arrow::buffer::Buffer::from(bytes);
+        for batch in self.decoder.decode_frame(bytes)? {
+            self.send_to_dataflow(batch).await;
+        }
+        Ok(())
+    }
+
+    /// Hand one decoded batch to the running dataflow, sleeping while the
+    /// queue is full.
+    async fn send_to_dataflow(&mut self, mut batch: RecordBatch) {
         loop {
-            let batch = self
-                .decoder
-                .decode(&mut buffer)
-                .map_err(|e| Error::Copy(format!("decoding COPY arrow stream: {e}")))?;
-            let Some(mut batch) = batch else {
-                return Ok(());
-            };
-            loop {
-                // A dead dataflow claims nothing again; stop feeding it. Its
-                // own error surfaces when the flow is collected at finish.
-                if self.cancel.is_cancelled() {
-                    return Ok(());
-                }
-                // Register before trying so a claim racing the failed send
-                // cannot lose the notification. The timeout lets a cancelled
-                // dataflow that will never claim again be observed promptly.
-                let notified = self.space_freed.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                match self.sender.try_send(batch) {
-                    Ok(()) => break,
-                    Err(ChannelInputFull(returned)) => {
-                        batch = returned;
-                        let _ = tokio::time::timeout(Duration::from_millis(50), notified).await;
-                    }
+            // A dead dataflow claims nothing again; stop feeding it. Its
+            // own error surfaces when the flow is collected at finish.
+            if self.cancel.is_cancelled() {
+                return;
+            }
+            // Register before trying so a claim racing the failed send
+            // cannot lose the notification. The timeout lets a cancelled
+            // dataflow that will never claim again be observed promptly.
+            let notified = self.space_freed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match self.sender.try_send(batch) {
+                Ok(()) => return,
+                Err(ChannelInputFull(returned)) => {
+                    batch = returned;
+                    let _ = tokio::time::timeout(Duration::from_millis(50), notified).await;
                 }
             }
         }
@@ -721,11 +786,12 @@ impl CopyIngest {
     /// returning the ingested-row count. Consuming `self` makes completion
     /// single-use; every failure path drops the remains, which aborts.
     pub async fn finish(mut self) -> Result<usize> {
-        // Complete batches were sent as they decoded, so there is nothing to
-        // flush; a stream cut mid-message is an error.
-        self.decoder
-            .finish()
-            .map_err(|e| Error::Copy(format!("COPY arrow stream ended mid-message: {e}")))?;
+        // The row formats buffer rows until a batch fills, so the stream's
+        // end can complete one final batch; a stream cut mid-row or
+        // mid-message is an error.
+        if let Some(batch) = self.decoder.finish()? {
+            self.send_to_dataflow(batch).await;
+        }
         self.sender.close();
         let handle = self.handle.take().expect("a copy finishes only once");
         let outputs = tokio::task::spawn_blocking(move || handle.collect())
@@ -767,11 +833,9 @@ impl Engine {
         statement: planner::CopyFromStdin,
         transaction: Arc<dyn planner::catalog::CatalogTransaction>,
     ) -> Result<CopyIngest> {
-        let column_count = if statement.columns.is_empty() {
-            statement.table.columns().len()
-        } else {
-            statement.columns.len()
-        };
+        let format = statement.format.clone();
+        let column_count = statement.incoming_column_count();
+        let decoder = CopyFrameDecoder::build(&format, column_count);
         let space_freed = Arc::new(Notify::new());
         let on_claim = {
             let space_freed = space_freed.clone();
@@ -791,7 +855,8 @@ impl Engine {
             .await
             .map_err(Error::PlannerPanic)??;
         Ok(CopyIngest {
-            decoder: StreamDecoder::new(),
+            decoder,
+            format,
             cancel: handle.cancel_token(),
             sender,
             space_freed,

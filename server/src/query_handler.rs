@@ -290,10 +290,14 @@ impl PivotQueryHandler {
             StatementOutput::Command(command) => build_command_response(command),
             StatementOutput::Set { name, value } => apply_set(client, &name, value.as_deref()),
             StatementOutput::CopyFromStdin(ingest) => {
-                // The CopyInResponse advertises a binary payload (the Arrow
-                // IPC stream), so clients know not to apply text escaping to
-                // the bytes they send.
-                const BINARY_FORMAT: i8 = 1;
+                // The CopyInResponse advertises the payload kind so clients
+                // know whether to apply text escaping to the bytes they
+                // send: 0 for the text format, 1 for the binary payload of
+                // the Arrow IPC stream.
+                let format: i8 = match ingest.format() {
+                    planner::CopyFormat::Text => 0,
+                    planner::CopyFormat::ArrowIpc => 1,
+                };
                 let columns = copy_session::begin_copy(client, *ingest)
                     .await
                     .map_err(|error| {
@@ -301,7 +305,7 @@ impl PivotQueryHandler {
                         error.into_pgwire()
                     })?;
                 info!(sql = %query, "copy from stdin started");
-                Response::CopyIn(CopyResponse::new(BINARY_FORMAT, columns, stream::empty()))
+                Response::CopyIn(CopyResponse::new(format, columns, stream::empty()))
             }
         };
 

@@ -12,8 +12,9 @@ use dispatch::{
 use std::fmt;
 use std::sync::Arc;
 
-/// `COPY <table> [(columns)] FROM STDIN WITH (FORMAT arrow)`: load rows
-/// arriving over the client protocol into a table.
+/// `COPY <table> [(columns)] FROM STDIN [WITH (FORMAT <format>)]`: load rows
+/// arriving over the client protocol into a table, in the PostgreSQL text
+/// format (the default) or an Arrow IPC stream.
 ///
 /// A statement, not a query: its rows arrive later over the connection's
 /// copy-in sub-protocol, so a plan never compiles it. The engine reads it off
@@ -34,13 +35,16 @@ pub struct CopyFromStdin {
     pub format: CopyFormat,
 }
 
-/// The validated data format of a COPY FROM STDIN. Only Arrow IPC is
-/// supported so far; the PostgreSQL text format (the protocol's default) and
-/// everything else are rejected at plan time.
+/// The validated data format of a COPY FROM STDIN. The PostgreSQL text format
+/// is the default, matching the server the protocol comes from; csv, binary,
+/// and everything else are rejected at plan time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CopyFormat {
     /// An Arrow IPC stream; batches conform to the table schema by position.
     ArrowIpc,
+    /// The PostgreSQL COPY text format: newline-separated rows of
+    /// tab-separated, backslash-escaped fields, `\N` for NULL.
+    Text,
 }
 
 impl CopyFormat {
@@ -50,27 +54,36 @@ impl CopyFormat {
         format: Option<&str>,
         options: &[(String, Vec<String>)],
     ) -> Result<Self, String> {
-        match format {
-            Some("arrow") => {}
-            None | Some("text") => {
-                return Err(
-                    "the COPY text format is not supported yet; use WITH (FORMAT arrow)"
-                        .to_string(),
-                );
+        let format = match format {
+            None | Some("text") => Self::Text,
+            Some("arrow") => Self::ArrowIpc,
+            Some(other @ ("csv" | "binary")) => {
+                return Err(format!(
+                    "the COPY {other} format is not supported; use text or arrow"
+                ));
             }
             Some(other) => {
                 return Err(format!(
-                    "COPY FORMAT {other} is not supported; only arrow is"
+                    "COPY FORMAT {other} is not supported; text and arrow are"
                 ));
             }
-        }
+        };
         if let Some((name, _)) = options.first() {
             return Err(format!(
-                "COPY option \"{}\" is not valid for FORMAT arrow",
-                name.to_lowercase()
+                "COPY option \"{}\" is not valid for FORMAT {}",
+                name.to_lowercase(),
+                format.name()
             ));
         }
-        Ok(Self::ArrowIpc)
+        Ok(format)
+    }
+
+    /// The format's name as written in `WITH (FORMAT <name>)`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::ArrowIpc => "arrow",
+            Self::Text => "text",
+        }
     }
 }
 
@@ -101,10 +114,7 @@ impl fmt::Display for CopyFromStdin {
                 .collect();
             write!(f, " ({})", names.join(", "))?;
         }
-        match &self.format {
-            CopyFormat::ArrowIpc => write!(f, " format: arrow")?,
-        }
-        write!(f, ")")
+        write!(f, " format: {})", self.format.name())
     }
 }
 
@@ -142,7 +152,6 @@ impl CopyFromStdin {
         dispatcher: &DataFlowDispatcher,
         on_claim: Box<dyn Fn() + Send + Sync>,
     ) -> Result<(ChannelInputSender<RecordBatch>, RecordBatchOperatorSpec), CatalogError> {
-        let CopyFormat::ArrowIpc = self.format;
         let layout = Arc::new(self.build_layout().map_err(|message| {
             CatalogError::Other(Box::<dyn std::error::Error + Send + Sync>::from(message))
         })?);
@@ -164,6 +173,16 @@ impl CopyFromStdin {
             .record_batches();
         let insert = self.table.compile_insert(conformed, dispatcher)?;
         Ok((sender, insert))
+    }
+
+    /// Columns each incoming row must carry: the COPY column list's length,
+    /// or the full table width without one.
+    pub fn incoming_column_count(&self) -> usize {
+        if self.columns.is_empty() {
+            self.table.columns().len()
+        } else {
+            self.columns.len()
+        }
     }
 
     /// Resolve the column list (positions resolved and validated by the
@@ -206,10 +225,23 @@ impl CopyFromStdin {
 }
 
 /// Cast one incoming column to its table field's physical type, with a loud
-/// error naming the column when a value does not convert.
+/// error naming the column when a value does not convert. A string column
+/// aimed at a variant field parses as JSON documents; arrow's cast kernel has
+/// no such conversion.
 fn cast_to_field(array: &ArrayRef, field: &Field) -> Result<ArrayRef, String> {
     if field.data_type() == array.data_type() {
         return Ok(array.clone());
+    }
+    if *field.data_type() == physical_arrow_type(&crate::types::Type::Variant)
+        && matches!(
+            array.data_type(),
+            arrow_schema::DataType::Utf8
+                | arrow_schema::DataType::LargeUtf8
+                | arrow_schema::DataType::Utf8View
+        )
+    {
+        return crate::expression::json_to_canonical_variant(array)
+            .map_err(|e| format!("column \"{}\": {e}", field.name()));
     }
     let options = arrow::compute::CastOptions {
         safe: false,
@@ -222,8 +254,10 @@ fn cast_to_field(array: &ArrayRef, field: &Field) -> Result<ArrayRef, String> {
 /// Conform one client-schema Arrow batch to the table's physical schema:
 /// columns map to the statement's column list by position, cast to the
 /// table's physical types, and unlisted table columns fill with NULL.
-/// Variant columns are admitted as sent: clients are trusted to encode them
-/// correctly, and a malformed document surfaces wherever it is first parsed.
+/// Variant columns arriving as variant structs are admitted as sent: clients
+/// are trusted to encode them correctly, and a malformed document surfaces
+/// wherever it is first parsed. Arriving as strings they parse here as JSON
+/// documents, which is how the text and binary formats carry them.
 fn conform_arrow_batch(batch: &RecordBatch, layout: &ColumnLayout) -> Result<RecordBatch, String> {
     let incoming_columns = layout.incoming_columns();
     if batch.num_columns() != incoming_columns {
@@ -274,5 +308,42 @@ impl UnaryFactory<RecordBatch, RecordBatch> for ConformArrowBatch {
 
     fn build_unary(self) -> Self {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_accepts_the_supported_formats_and_defaults_to_text() {
+        assert_eq!(CopyFormat::resolve(None, &[]), Ok(CopyFormat::Text));
+        assert_eq!(CopyFormat::resolve(Some("text"), &[]), Ok(CopyFormat::Text));
+        assert_eq!(
+            CopyFormat::resolve(Some("arrow"), &[]),
+            Ok(CopyFormat::ArrowIpc)
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_other_formats_and_any_option() {
+        let csv = CopyFormat::resolve(Some("csv"), &[]).unwrap_err();
+        assert!(csv.contains("csv format is not supported"), "{csv}");
+
+        let binary = CopyFormat::resolve(Some("binary"), &[]).unwrap_err();
+        assert!(
+            binary.contains("binary format is not supported"),
+            "{binary}"
+        );
+
+        let parquet = CopyFormat::resolve(Some("parquet"), &[]).unwrap_err();
+        assert!(parquet.contains("text and arrow are"), "{parquet}");
+
+        let option = ("DELIMITER".to_string(), vec!["|".to_string()]);
+        let delimiter = CopyFormat::resolve(None, std::slice::from_ref(&option)).unwrap_err();
+        assert_eq!(
+            delimiter,
+            "COPY option \"delimiter\" is not valid for FORMAT text"
+        );
     }
 }

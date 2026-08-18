@@ -392,20 +392,27 @@ async fn copy_format_rejections_name_the_supported_format(#[future] conn: Conn) 
 
     for (sql, expected) in [
         (
-            "COPY copy_format_errors FROM STDIN",
-            "text format is not supported yet",
-        ),
-        (
-            "COPY copy_format_errors FROM STDIN (FORMAT text)",
-            "text format is not supported yet",
-        ),
-        (
             "COPY copy_format_errors FROM STDIN (FORMAT csv)",
-            "only arrow is",
+            "csv format is not supported",
+        ),
+        // The unquoted spelling psql sends for a binary \copy parses (the
+        // grammar accepts BINARY as an option value) and rejects here, so a
+        // psql user reads this message instead of a syntax error.
+        (
+            "COPY copy_format_errors FROM STDIN (FORMAT binary)",
+            "binary format is not supported",
+        ),
+        (
+            "COPY copy_format_errors FROM STDIN (FORMAT parquet)",
+            "text and arrow are",
         ),
         (
             "COPY copy_format_errors FROM STDIN (FORMAT arrow, DELIMITER '|')",
             "not valid for FORMAT arrow",
+        ),
+        (
+            "COPY copy_format_errors FROM STDIN (DELIMITER '|')",
+            "not valid for FORMAT text",
         ),
     ] {
         let messages = with_raw_conn(move |raw| {
