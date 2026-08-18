@@ -29,6 +29,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use datastore_delta::store::{S3Credentials, StoreScheme};
 use serde::{Deserialize, Serialize};
@@ -103,7 +104,7 @@ impl std::fmt::Debug for SecretConfig {
 ///
 /// A scope is classified by the same [`StoreScheme`] a datastore's location is,
 /// so the two agree on what `s3a://` and a `file://` path mean.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SecretScope {
     scheme: StoreScheme,
     segments: Vec<String>,
@@ -131,20 +132,6 @@ impl SecretScope {
             scheme,
             segments: split_segments(written),
         })
-    }
-
-    /// Whether this scope covers `location`: the same backend, and every one of
-    /// the scope's segments matching `location`'s in turn. Whole segments only,
-    /// so `s3://logs/eu` covers `s3://logs/eu/2024` but not `s3://logs/europe`.
-    fn covers(&self, location: &str) -> bool {
-        StoreScheme::of(location) == self.scheme
-            && split_segments(location).starts_with(&self.segments)
-    }
-
-    /// How much of a location this scope pins down. The most specific scope
-    /// covering a location is the one that authenticates it.
-    fn specificity(&self) -> usize {
-        self.segments.len()
     }
 }
 
@@ -193,32 +180,33 @@ struct GcsSecret {
     credentials_file: String,
 }
 
-/// A secret paired with the name it was written under and the scope it covers.
-/// The name is kept for the error a duplicate scope raises.
+/// A secret held under a scope, and the name it was written under, which the
+/// error a second secret on that scope raises needs. The scope itself is the
+/// key this is held at, so it is not repeated here.
 #[derive(Debug)]
 struct Scoped<T> {
     name: String,
-    scope: SecretScope,
     secret: T,
 }
 
 /// Every secret of a metastore, split by the backend it authenticates to and
-/// ready to match a location against.
+/// keyed within each by the scope it covers.
 ///
-/// Scopes are unique within a backend (checked by [`build`](Self::build)), so
-/// the most specific scope covering a location is unambiguous.
+/// A scope keying at most one secret is what makes "the most specific scope
+/// covering a location" one secret rather than a race between two, and it is
+/// the map itself that holds a second secret out.
 #[derive(Debug, Default)]
 pub(crate) struct Secrets {
-    s3: Vec<Scoped<S3Secret>>,
-    gcs: Vec<Scoped<GcsSecret>>,
+    s3: HashMap<SecretScope, Scoped<S3Secret>>,
+    gcs: HashMap<SecretScope, Scoped<GcsSecret>>,
 }
 
 impl Secrets {
-    /// Split the secrets of the config file's section and of the metastore
-    /// file into per-backend lists, refusing a scope two of them claim.
+    /// Key the secrets of the config file's section and of the metastore file
+    /// by the scope each covers, under the backend it authenticates to.
     ///
-    /// Names are visited in sorted order, so a file with two faults is reported
-    /// the same way on every run.
+    /// Names are visited in sorted order, so which of two secrets sharing a
+    /// scope is named as the one already holding it is the same on every run.
     pub(crate) fn build(sections: [&HashMap<String, SecretConfig>; 2]) -> Result<Self> {
         let mut written: Vec<(&String, &SecretConfig)> = sections.into_iter().flatten().collect();
         written.sort_by_key(|(name, _)| *name);
@@ -232,30 +220,30 @@ impl Secrets {
                     access_key_id,
                     secret_access_key,
                     endpoint,
-                } => secrets.s3.push(Scoped {
-                    name: name.clone(),
-                    scope: SecretScope::parse(name, scope, StoreScheme::S3)?,
-                    secret: S3Secret {
+                } => claim(
+                    &mut secrets.s3,
+                    SecretScope::parse(name, scope, StoreScheme::S3)?,
+                    name,
+                    S3Secret {
                         region: region.clone(),
                         access_key_id: access_key_id.clone(),
                         secret_access_key: secret_access_key.clone(),
                         endpoint: endpoint.clone(),
                     },
-                }),
+                )?,
                 SecretConfig::Gcs {
                     scope,
                     credentials_file,
-                } => secrets.gcs.push(Scoped {
-                    name: name.clone(),
-                    scope: SecretScope::parse(name, scope, StoreScheme::Gcs)?,
-                    secret: GcsSecret {
+                } => claim(
+                    &mut secrets.gcs,
+                    SecretScope::parse(name, scope, StoreScheme::Gcs)?,
+                    name,
+                    GcsSecret {
                         credentials_file: credentials_file.clone(),
                     },
-                }),
+                )?,
             }
         }
-        check_unique_scopes(&secrets.s3)?;
-        check_unique_scopes(&secrets.gcs)?;
         Ok(secrets)
     }
 
@@ -285,29 +273,43 @@ impl Secrets {
 }
 
 /// The secret whose scope covers `location` and pins down the most of it.
-/// Scopes being unique, no two covering scopes can be equally specific, so this
-/// is the one secret the location resolves to.
-fn most_specific<'a, T>(secrets: &'a [Scoped<T>], location: &str) -> Option<&'a Scoped<T>> {
-    secrets
-        .iter()
-        .filter(|scoped| scoped.scope.covers(location))
-        .max_by_key(|scoped| scoped.scope.specificity())
+///
+/// A scope covers a location when it names some prefix of the location's
+/// segments, so the scopes that could cover this one are known outright: there
+/// is a candidate per prefix, and no others. Asking for each in turn, longest
+/// first, finds the most specific without searching what is held. A location of
+/// another backend matches nothing, since the backend is part of the key.
+fn most_specific<'a, T>(secrets: &'a HashMap<SecretScope, T>, location: &str) -> Option<&'a T> {
+    let scheme = StoreScheme::of(location);
+    let segments = split_segments(location);
+    (0..=segments.len()).rev().find_map(|depth| {
+        secrets.get(&SecretScope {
+            scheme,
+            segments: segments[..depth].to_vec(),
+        })
+    })
 }
 
-/// Refuse two secrets scoped to the same paths: which one signed a request
-/// there would be arbitrary.
-fn check_unique_scopes<T>(secrets: &[Scoped<T>]) -> Result<()> {
-    for (index, secret) in secrets.iter().enumerate() {
-        let claimed = secrets[..index]
-            .iter()
-            .find(|earlier| earlier.scope == secret.scope);
-        if let Some(claimed) = claimed {
-            return Err(Error::DuplicateScope {
-                first: claimed.name.clone(),
-                second: secret.name.clone(),
-                scope: secret.scope.to_string(),
+/// Give `scope` to a secret, unless another already holds it: which of the two
+/// signed a request there would be arbitrary.
+fn claim<T>(
+    secrets: &mut HashMap<SecretScope, Scoped<T>>,
+    scope: SecretScope,
+    name: &str,
+    secret: T,
+) -> Result<()> {
+    match secrets.entry(scope) {
+        Entry::Occupied(held) => Err(Error::DuplicateScope {
+            first: held.get().name.clone(),
+            second: name.to_string(),
+            scope: held.key().to_string(),
+        }),
+        Entry::Vacant(free) => {
+            free.insert(Scoped {
+                name: name.to_string(),
+                secret,
             });
+            Ok(())
         }
     }
-    Ok(())
 }

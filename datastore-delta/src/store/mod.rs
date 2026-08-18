@@ -268,7 +268,7 @@ pub trait ObjectStore: Debug + Send + Sync {
 
 /// The backend a location URI addresses. The backend is inferred from the
 /// scheme rather than configured, so this is the one place that reads one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StoreScheme {
     S3,
     Gcs,
