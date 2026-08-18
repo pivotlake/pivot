@@ -12,10 +12,15 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema};
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
 use datastore_delta::DeltaDatastore;
 use dispatch::{DataFlowDispatcher, Dispatch};
 use metastore::{DEFAULT_USER_NAME, Metastore, UserAuth};
+use parquet::arrow::ArrowWriter;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
 use rstest::fixture;
 use server::Server;
 use tempfile::TempDir;
@@ -42,6 +47,27 @@ impl CatalogFixture {
             data_dirs: vec![data_dir],
         }
     }
+}
+
+/// Snappy Parquet bytes for a `(name VARCHAR, value BIGINT)` table carrying the
+/// given `value`s (the names are filler), ready to `put` into a store as a
+/// table's pre-existing data file.
+pub fn parquet_name_value_rows(values: &[i64]) -> Vec<u8> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("name", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let name: ArrayRef = Arc::new(StringArray::from(vec!["x"; values.len()]));
+    let value: ArrayRef = Arc::new(Int64Array::from(values.to_vec()));
+    let batch = RecordBatch::try_new(schema.clone(), vec![name, value]).unwrap();
+    let properties = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+    let mut bytes = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(properties)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    bytes
 }
 
 pub fn pick_free_port() -> u16 {

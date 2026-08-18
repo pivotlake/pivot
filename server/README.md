@@ -50,6 +50,7 @@ server:
 
 metastore:
   datastores: ...
+  secrets: ...
   users: ...
 ```
 
@@ -79,14 +80,9 @@ metastore:
       location: s3://analytics/warm/  # S3 store
       compact: true                   # this datastore compacts itself
       compact_bytes: 128m
-      region: us-east-1
-      access_key_id: AKIA...
-      secret_access_key: "..."
-      # endpoint: http://localhost:9000
     cold:
       kind: delta
       location: gs://analytics/cold/  # Google Cloud Storage store
-      # credentials_file: /etc/pivot/gcs-key.json
 ```
 
 Start the server with:
@@ -105,15 +101,50 @@ new files' footers, and, for shared remote stores, tables committed by other
 processes. It bounds how stale a query's view of externally committed data can
 be; this process's own INSERT and compaction publish their commits immediately.
 
-An S3 datastore's `region`, `access_key_id`, and `secret_access_key` are
-required and given inline. Protect files containing inline credentials
-appropriately.
+### Secrets
 
-A GCS datastore names a service-account (or authorized-user) JSON key file with
-`credentials_file`. Omit it to resolve credentials from the ambient Application
-Default Credentials chain instead: `GOOGLE_APPLICATION_CREDENTIALS`, the file
+A datastore carries no credentials of its own. Each entry under `secrets` holds
+the credentials for the paths its `scope` covers, so a bucket's keys are written
+once however many datastores sit in it. `type` names the backend, `s3` or `gcs`,
+and carries exactly that backend's fields:
+
+```yaml
+metastore:
+  secrets:
+    analytics:
+      type: s3
+      scope: s3://analytics/          # this bucket, whatever the prefix
+      region: us-east-1
+      access_key_id: AKIA...
+      secret_access_key: "..."
+      # endpoint: http://localhost:9000   # MinIO / S3-compatible
+    analytics-archive:
+      type: s3
+      scope: s3://analytics/archive/  # more specific: wins under archive/
+      region: us-east-1
+      access_key_id: AKIA...
+      secret_access_key: "..."
+    google:
+      type: gcs                       # no scope: every gs:// location
+      credentials_file: /etc/pivot/gcs-key.json
+```
+
+A scope is matched whole path segments at a time, so `s3://analytics/warm`
+covers `s3://analytics/warm/2024` and not `s3://analytics/warmer`. The most
+specific scope covering a location authenticates it, and no two secrets may
+claim the same scope, so which secret that is never depends on the order they
+were written in. A secret with no `scope` covers every location of its type;
+there can be only one such secret per type.
+
+An `s3://` datastore needs a secret covering it: without one there is nothing to
+sign its requests with, and startup stops. A `gs://` datastore without one falls
+back to the ambient Application Default Credentials chain instead:
+`GOOGLE_APPLICATION_CREDENTIALS`, the file
 `gcloud auth application-default login` writes, or the workload identity of the
 Google compute instance.
+
+An S3 secret's keys are written inline, so protect files containing one
+appropriately.
 
 ### Users
 
