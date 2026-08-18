@@ -1649,3 +1649,51 @@ fn scan_two_pushed_extracts_on_one_column_share_the_read() {
         &StringViewArray::from(vec!["alice", "bob"])
     );
 }
+
+// A late-materialized fetch whose one row group's rows arrive split across
+// many metadata batches (spread over the workers) must still issue exactly one
+// request for the group: the decoder tracks row groups by index and drops
+// pages of a group it already finished, so a second request for the same group
+// silently loses its rows.
+#[test]
+fn materialize_reads_a_row_group_split_across_batches_exactly_once() {
+    use arrow_array::Int64Array;
+    use datastore_delta::parquet::materialize;
+
+    let dispatch = dispatch(4);
+    let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+    let batches: Vec<RecordBatch> = (0..8)
+        .map(|f| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int64Array::from_iter_values(
+                    f * 100_000..(f + 1) * 100_000,
+                ))],
+            )
+            .unwrap()
+        })
+        .collect();
+    let dir = tempfile::TempDir::new().unwrap();
+    for (i, batch) in batches.iter().enumerate() {
+        let file = std::fs::File::create(dir.path().join(format!("f{i}.parquet"))).unwrap();
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_compression(parquet::basic::Compression::SNAPPY)
+            .build();
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
+        writer.write(batch).unwrap();
+        writer.close().unwrap();
+    }
+    let table = parquet_table_from_dir(&dispatch, dir.path());
+    // The LIMIT gathers the metadata batches onto one worker and re-emits them
+    // in a burst, which is what spreads one row group's batches across the
+    // other workers downstream.
+    let narrow = table_input(&dispatch, &table, Projection::columns([]), true).limit(400_000, 0);
+
+    let results = materialize(narrow, table.clone(), Projection::columns([0]))
+        .collect()
+        .unwrap();
+
+    let total: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 400_000);
+}
