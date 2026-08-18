@@ -598,7 +598,11 @@ mod tests {
         page.data = vec![Bytes::from(cut)];
 
         let mut sender = CollectSender::new();
-        let result = Decompressor::default().consume(page, &mut sender);
+        let result = Decompressor::default().consume(
+            page,
+            &mut sender,
+            &mut dispatch::TestOperatorIO::default().io(),
+        );
 
         assert!(result.is_err());
     }
@@ -638,7 +642,11 @@ mod tests {
         page.data = vec![Bytes::from(vec![1u8, 2, 3])];
 
         let mut sender = CollectSender::new();
-        let result = Decompressor::default().consume(page, &mut sender);
+        let result = Decompressor::default().consume(
+            page,
+            &mut sender,
+            &mut dispatch::TestOperatorIO::default().io(),
+        );
 
         assert!(result.is_err());
     }

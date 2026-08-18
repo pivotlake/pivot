@@ -56,6 +56,10 @@ pub struct RowGroupRequest {
     metadata: QueryRowGroupMetadata,
     open_file: OpenFile,
     locations: Vec<FileRange>,
+    /// Each projected leaf's page codec, parallel to `locations`, so the
+    /// buffer built from the response can tag every column's parts with the
+    /// codec its footer entry recorded.
+    codecs: Vec<CompressionCodec>,
 }
 
 impl RowGroupRequest {
@@ -79,11 +83,13 @@ impl RowGroupRequest {
                 )
             })
             .collect();
+        let codecs = leaves.iter().map(|&leaf| columns[leaf].codec).collect();
 
         Self {
             metadata: metadata_handle,
             open_file,
             locations,
+            codecs,
         }
     }
 
@@ -105,8 +111,10 @@ impl RowGroupRequest {
             metadata: self.metadata,
             columns: locations
                 .into_iter()
-                .map(|parts| {
-                    parts
+                .zip(self.codecs)
+                .map(|(parts, codec)| ColumnBuffer {
+                    codec,
+                    parts: parts
                         .into_iter()
                         .map(|part| match part {
                             ReadData::Compressed { offset, bytes } => {
@@ -124,7 +132,7 @@ impl RowGroupRequest {
                                 data,
                             },
                         })
-                        .collect()
+                        .collect(),
                 })
                 .collect(),
             worker_id: dispatch::worker::WORKER_IDX.get(),
