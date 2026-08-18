@@ -245,6 +245,97 @@ fn background_refresh_advances_to_latest_delta_snapshot() {
 }
 
 #[test]
+fn a_refresh_applies_an_add_and_a_remove_from_one_commit() {
+    let dispatch = dispatch(1);
+    let db = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    let first = data.path().join("a.parquet");
+    let second = data.path().join("b.parquet");
+    write_parquet(&first, &strings_and_ints(&["a"], &[1]));
+    let datastore = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    create(
+        &dispatch,
+        &datastore,
+        adopting_request("events", data.path(), columns()),
+    )
+    .unwrap();
+    let log_dir = table_dir(db.path(), &datastore, "events");
+    write_parquet(&second, &strings_and_ints(&["b"], &[2]));
+    let second_size = std::fs::metadata(&second).unwrap().len();
+
+    write_delta_commit(
+        &log_dir,
+        1,
+        &[
+            serde_json::json!({
+                "add": {
+                    "path": second.to_str().unwrap(),
+                    "partitionValues": {},
+                    "size": second_size,
+                    "modificationTime": 0,
+                    "dataChange": true
+                }
+            }),
+            serde_json::json!({
+                "remove": {
+                    "path": first.to_str().unwrap(),
+                    "deletionTimestamp": 0,
+                    "dataChange": true
+                }
+            }),
+        ],
+    );
+    assert!(datastore.refresh_from_store().unwrap());
+
+    assert_eq!(
+        current_parquet(&datastore, "events").row_groups().len(),
+        1,
+        "the swapped-in file replaces the swapped-out one"
+    );
+}
+
+#[test]
+fn a_refresh_holds_one_copy_of_a_file_a_commit_re_added() {
+    let dispatch = dispatch(1);
+    let db = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    let only = data.path().join("a.parquet");
+    write_parquet(&only, &strings_and_ints(&["a"], &[1]));
+    let datastore = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatch).unwrap();
+    create(
+        &dispatch,
+        &datastore,
+        adopting_request("events", data.path(), columns()),
+    )
+    .unwrap();
+    let log_dir = table_dir(db.path(), &datastore, "events");
+    let size = std::fs::metadata(&only).unwrap().len();
+
+    // A re-tagging writer (compaction, clustering) adds a path the table already
+    // holds, with fresh metadata and no matching remove.
+    write_delta_commit(
+        &log_dir,
+        1,
+        &[serde_json::json!({
+            "add": {
+                "path": only.to_str().unwrap(),
+                "partitionValues": {},
+                "size": size,
+                "modificationTime": 1,
+                "dataChange": false
+            }
+        })],
+    );
+    assert!(datastore.refresh_from_store().unwrap());
+
+    assert_eq!(
+        current_parquet(&datastore, "events").row_groups().len(),
+        1,
+        "the re-added file is held once, not twice"
+    );
+}
+
+#[test]
 fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
     let dispatch = dispatch(1);
     let db = TempDir::new().unwrap();

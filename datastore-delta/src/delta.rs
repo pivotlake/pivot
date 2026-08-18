@@ -4,7 +4,7 @@
 //! active `Add` files.  Pivot then fetches those files' Parquet footers into
 //! its existing in-memory scan representation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -26,7 +26,7 @@ use delta_kernel::expressions::Scalar as DeltaScalar;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::scan::state::ScanFile;
 use delta_kernel::schema::{
-    DataType as DeltaDataType, MetadataValue, PrimitiveType, StructField, StructType,
+    DataType as DeltaDataType, MapType, MetadataValue, PrimitiveType, StructField, StructType,
 };
 use delta_kernel::transaction::create_table::create_table;
 use delta_kernel::transaction::data_layout::DataLayout;
@@ -195,9 +195,16 @@ pub(crate) fn commit_file_changes(
     added: &[DeltaFileEntry],
     data_change: bool,
 ) -> Result<Option<Arc<Snapshot>>, Error> {
+    // Name the operation the commit performs. Beyond recording it in the log, it
+    // is what lets the commit's checksum carry usable file statistics: Kernel
+    // tracks those incrementally only for operations whose add/remove counts it
+    // knows are a net change, and treats an unnamed one as unsafe. The
+    // `data_change` flag already draws that exact line.
+    let operation = if data_change { "WRITE" } else { "OPTIMIZE" };
     let mut txn = snapshot
         .clone()
         .transaction(Box::new(FileSystemCommitter::new()), engine.kernel())?
+        .with_operation(operation.to_string())
         .with_data_change(data_change);
 
     if !added.is_empty() {
@@ -225,6 +232,7 @@ pub(crate) fn commit_file_changes(
         match txn.commit(engine.kernel())? {
             CommitResult::CommittedTransaction(committed) => {
                 let advanced = committed_snapshot(&committed, engine, snapshot.table_root())?;
+                let advanced = write_checksum(engine, advanced);
                 return Ok(Some(maybe_checkpoint(engine, advanced)));
             }
             CommitResult::ConflictedTransaction(_) => return Ok(None),
@@ -305,6 +313,44 @@ fn maybe_checkpoint(engine: &DeltaEngine, snapshot: Arc<Snapshot>) -> Arc<Snapsh
                 error = %e,
                 version,
                 "inline checkpoint after commit failed; the next interval will retry"
+            );
+            snapshot
+        }
+    }
+}
+
+/// Write the just-committed version's checksum (`<version>.crc`), a sidecar
+/// carrying the version's protocol, metadata, and file statistics. A later load
+/// that finds one takes its protocol and metadata straight from it instead of
+/// replaying the log for them, which is one whole pass over the checkpoint saved
+/// on every load. Kernel asks writers to do this after each commit, and only a
+/// post-commit snapshot can: the checksum is computed from the transaction that
+/// produced it, never re-derived from the log.
+///
+/// Returns the snapshot to carry forward: the one that records the checksum it
+/// wrote, or the input unchanged.
+///
+/// Best-effort, like the checkpoint below it. The commit already succeeded, and a
+/// missing checksum only costs a later reader the replay it would have skipped,
+/// so a failure is logged rather than surfaced. A snapshot whose in-memory
+/// checksum is incomplete refuses the write, which is expected rather than
+/// exceptional, so it is logged at debug.
+fn write_checksum(engine: &DeltaEngine, snapshot: Arc<Snapshot>) -> Arc<Snapshot> {
+    match snapshot.write_checksum(engine.kernel()) {
+        Ok((_result, written)) => written,
+        Err(delta_kernel::Error::ChecksumWriteUnsupported(reason)) => {
+            tracing::debug!(
+                reason,
+                version = snapshot.version(),
+                "no checksum written for the commit; a load will replay for protocol and metadata"
+            );
+            snapshot
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                version = snapshot.version(),
+                "writing the commit's checksum failed; a load will replay for protocol and metadata"
             );
             snapshot
         }
@@ -673,17 +719,202 @@ pub(crate) fn load_table(uri: &Url, engine: &DeltaEngine) -> Result<DeltaTableSt
 pub(crate) fn refresh_table(
     snapshot: &Arc<Snapshot>,
     engine: &DeltaEngine,
-) -> Result<Option<DeltaTableState>, Error> {
+) -> Result<Option<TableUpdate>, Error> {
     let latest = Snapshot::builder_from(snapshot.clone()).build(engine.kernel())?;
     if latest.version() == snapshot.version() {
         return Ok(None);
     }
-    read_state(latest, engine).map(Some)
+    if let Some(change) = read_change(snapshot, &latest, engine)? {
+        return Ok(Some(TableUpdate::Incremental(change)));
+    }
+    read_state(latest, engine).map(TableUpdate::Full).map(Some)
 }
 
-/// Materialize one snapshot's schema, layout, and active file list: the state a
-/// catalog table is rebuilt from.
-fn read_state(snapshot: Arc<Snapshot>, engine: &DeltaEngine) -> Result<DeltaTableState, Error> {
+/// How a refresh hands the table's new version back: as the diff since the
+/// version in hand where the log can be read as one, and as the whole state
+/// otherwise.
+pub(crate) enum TableUpdate {
+    /// Every file at the new version. The holder rebuilds its file list from
+    /// this, fetching a footer for each file it does not already hold.
+    Full(DeltaTableState),
+    /// Only the files the range added and removed. The holder keeps everything
+    /// else it holds, so no footer it already has is fetched again.
+    Incremental(DeltaTableChange),
+}
+
+/// What one version range did to a table's file list, plus the shape at the end
+/// of it. Applied against the file list held at [`DeltaTableChange::base_version`].
+pub(crate) struct DeltaTableChange {
+    pub snapshot: Arc<Snapshot>,
+    pub columns: Vec<Column>,
+    pub partition_by: Vec<String>,
+    pub sort_by: Vec<String>,
+    /// Files live at the new version that the range added. A path here that the
+    /// holder already has was re-added with fresh metadata, so this entry wins.
+    pub added: Vec<DeltaFileEntry>,
+    /// Paths the range removed, to drop from the held list.
+    pub removed: HashSet<String>,
+}
+
+/// Read `(base.version(), latest.version()]` as a diff, or `None` when it cannot
+/// be read as one and the caller must fall back to a full scan.
+///
+/// A full scan replays the log from the newest checkpoint every time the version
+/// moves, so a table that commits at all re-reads its whole log on every sweep.
+/// Kernel's incremental scan reads only the commits in the range instead, and
+/// never opens the checkpoint. It declines the range itself (returning `None`)
+/// when the target snapshot's commit list cannot cover it -- which is what
+/// happens once a new checkpoint truncates the listing.
+///
+/// The range is also declined here when the table's shape changed across it.
+/// Kernel does not yet surface an in-range schema change, and the held files
+/// were decoded against the old shape, so a changed schema, partitioning, or
+/// sort order takes the full path that re-derives every entry.
+fn read_change(
+    base: &Arc<Snapshot>,
+    latest: &Arc<Snapshot>,
+    engine: &DeltaEngine,
+) -> Result<Option<DeltaTableChange>, Error> {
+    let layout = read_layout(latest)?;
+    let base_layout = read_layout(base)?;
+    if layout.columns != base_layout.columns
+        || layout.partition_by != base_layout.partition_by
+        || layout.sort_by != base_layout.sort_by
+    {
+        return Ok(None);
+    }
+
+    let Some(scan) = latest
+        .clone()
+        .incremental_scan_builder(base.version())
+        .build(engine.kernel())?
+    else {
+        return Ok(None);
+    };
+    let listing = scan.into_listing()?;
+
+    let column_types: HashMap<&str, &Type> = layout
+        .columns
+        .iter()
+        .map(|column| (column.name.as_str(), &column.col_type))
+        .collect();
+    let mut added = Vec::new();
+    for batch in listing.add_files {
+        let (data, live) = batch.into_parts();
+        let mut visitor = AddedFileVisitor {
+            live: &live,
+            files: Vec::new(),
+        };
+        visitor.visit_rows_of(data.as_ref())?;
+        for file in visitor.files {
+            if file.has_deletion_vector {
+                return Err(Error::DeletionVector(file.path));
+            }
+            added.push(file_entry(
+                file.path,
+                file.size,
+                &file.partition_values,
+                &column_types,
+                &layout.delta_types,
+                &layout.partition_by,
+            )?);
+        }
+    }
+
+    Ok(Some(DeltaTableChange {
+        snapshot: latest.clone(),
+        columns: layout.columns,
+        partition_by: layout.partition_by,
+        sort_by: layout.sort_by,
+        added,
+        removed: listing
+            .summary
+            .removes
+            .iter()
+            .map(|key| key.path().to_string())
+            .collect(),
+    }))
+}
+
+/// Reads the fields the catalog needs off each live `add` the incremental scan
+/// streams. The deletion-vector storage type is read only to reject a file that
+/// carries one, which the reader does not support.
+struct AddedFileVisitor<'a> {
+    live: &'a [bool],
+    files: Vec<AddedFile>,
+}
+
+struct AddedFile {
+    path: String,
+    size: i64,
+    partition_values: HashMap<String, String>,
+    has_deletion_vector: bool,
+}
+
+impl RowVisitor for AddedFileVisitor<'_> {
+    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DeltaDataType]) {
+        static NAMES_AND_TYPES: LazyLock<(Vec<ColumnName>, Vec<DeltaDataType>)> =
+            LazyLock::new(|| {
+                (
+                    vec![
+                        ColumnName::new(["add", "path"]),
+                        ColumnName::new(["add", "partitionValues"]),
+                        ColumnName::new(["add", "size"]),
+                        ColumnName::new(["add", "deletionVector", "storageType"]),
+                    ],
+                    vec![
+                        DeltaDataType::STRING,
+                        MapType::new(DeltaDataType::STRING, DeltaDataType::STRING, true).into(),
+                        DeltaDataType::LONG,
+                        DeltaDataType::STRING,
+                    ],
+                )
+            });
+        (&NAMES_AND_TYPES.0, &NAMES_AND_TYPES.1)
+    }
+
+    fn visit<'a>(
+        &mut self,
+        row_count: usize,
+        getters: &[&'a dyn GetData<'a>],
+    ) -> delta_kernel::DeltaResult<()> {
+        for row in 0..row_count {
+            // A masked row is a `remove`, or an `add` a later commit in the
+            // range superseded; neither is live at the target version.
+            if !self.live.get(row).copied().unwrap_or(false) {
+                continue;
+            }
+            let Some(path): Option<String> = getters[0].get_opt(row, "add.path")? else {
+                continue;
+            };
+            let partition_values: HashMap<String, String> = getters[1]
+                .get_opt(row, "add.partitionValues")?
+                .unwrap_or_default();
+            let size: i64 = getters[2].get(row, "add.size")?;
+            let storage_type: Option<String> =
+                getters[3].get_opt(row, "add.deletionVector.storageType")?;
+            self.files.push(AddedFile {
+                path,
+                size,
+                partition_values,
+                has_deletion_vector: storage_type.is_some(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// One snapshot's declared shape: the columns, how the files are laid out under
+/// them, and the Delta types the partition values are decoded against. Read off
+/// the snapshot's metadata alone, so it costs no log read.
+struct TableLayout {
+    columns: Vec<Column>,
+    delta_types: HashMap<String, DeltaDataType>,
+    partition_by: Vec<String>,
+    sort_by: Vec<String>,
+}
+
+fn read_layout(snapshot: &Snapshot) -> Result<TableLayout, Error> {
     let schema = snapshot.schema();
     let delta_types = schema
         .fields()
@@ -710,6 +941,23 @@ fn read_state(snapshot: Arc<Snapshot>, engine: &DeltaEngine) -> Result<DeltaTabl
         .get(SORT_BY_CONFIGURATION_KEY)
         .map(|raw| raw.split(',').map(str::to_string).collect())
         .unwrap_or_default();
+    Ok(TableLayout {
+        columns,
+        delta_types,
+        partition_by,
+        sort_by,
+    })
+}
+
+/// Materialize one snapshot's schema, layout, and active file list: the state a
+/// catalog table is rebuilt from.
+fn read_state(snapshot: Arc<Snapshot>, engine: &DeltaEngine) -> Result<DeltaTableState, Error> {
+    let TableLayout {
+        columns,
+        delta_types,
+        partition_by,
+        sort_by,
+    } = read_layout(&snapshot)?;
 
     // Ask Kernel for the typed `stats_parsed` struct (min/max/nullCount/numRecords)
     // alongside the scan files, so a reloaded file carries its Parquet statistics
@@ -829,9 +1077,32 @@ fn scan_file_entry(
     if file.dv_info.has_vector() {
         return Err(Error::DeletionVector(file.path));
     }
-    let size = u64::try_from(file.size).map_err(|_| Error::InvalidFileSize {
-        path: file.path.clone(),
-        size: file.size,
+    file_entry(
+        file.path,
+        file.size,
+        &file.partition_values,
+        column_types,
+        delta_types,
+        partition_columns,
+    )
+}
+
+/// Build one file's catalog entry from the fields every log action carries it
+/// under: its path, its size, and its raw partition-value map. Shared by the two
+/// ways a file reaches the catalog -- a full scan of a snapshot, and the
+/// incremental scan of a version range -- so both decode a partition tuple the
+/// same way.
+fn file_entry(
+    path: String,
+    raw_size: i64,
+    partition_values: &HashMap<String, String>,
+    column_types: &HashMap<&str, &Type>,
+    delta_types: &HashMap<String, DeltaDataType>,
+    partition_columns: &[String],
+) -> Result<DeltaFileEntry, Error> {
+    let size = u64::try_from(raw_size).map_err(|_| Error::InvalidFileSize {
+        path: path.clone(),
+        size: raw_size,
     })?;
     let partition = if partition_columns.is_empty() {
         None
@@ -839,7 +1110,7 @@ fn scan_file_entry(
         let values = partition_columns
             .iter()
             .filter_map(|name| {
-                let raw = file.partition_values.get(name)?;
+                let raw = partition_values.get(name)?;
                 Some((|| {
                     let pivot_type = column_types.get(name.as_str()).copied().ok_or_else(|| {
                         Error::UnsupportedType {
@@ -867,12 +1138,15 @@ fn scan_file_entry(
     };
     Ok(DeltaFileEntry {
         file: FileRef {
-            path: ObjectPath::new(file.path),
+            path: ObjectPath::new(path),
             size,
         },
         partition,
-        // The caller joins in the log-persisted stats (read as Kernel's typed
-        // `stats_parsed`) by path; a file the log has no stats for stays `None`.
+        // A full scan joins in the log-persisted stats (read as Kernel's typed
+        // `stats_parsed`) by path. Anything left `None` here -- every file the
+        // incremental scan reports, and any file the log has no stats for --
+        // takes its stats from its Parquet footer when the catalog materializes
+        // it, so file-level pruning has bounds either way.
         stats: None,
     })
 }

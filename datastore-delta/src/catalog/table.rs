@@ -203,16 +203,28 @@ impl CatalogTable {
     /// already current, which costs one log listing and no file reads (Kernel
     /// updates the snapshot in hand rather than rebuilding it).
     pub fn refresh(&mut self) -> crate::Result<bool> {
-        let Some(state) = crate::delta::refresh_table(&self.snapshot, &self.engine)? else {
+        let Some(update) = crate::delta::refresh_table(&self.snapshot, &self.engine)? else {
             return Ok(false);
         };
-        let crate::delta::DeltaTableState {
-            snapshot,
-            columns,
-            partition_by,
-            sort_by,
-            file_entries,
-        } = state;
+        let (snapshot, columns, partition_by, sort_by, file_entries) = match update {
+            crate::delta::TableUpdate::Full(state) => (
+                state.snapshot,
+                state.columns,
+                state.partition_by,
+                state.sort_by,
+                state.file_entries,
+            ),
+            crate::delta::TableUpdate::Incremental(change) => {
+                let entries = self.apply_change(change.added, &change.removed);
+                (
+                    change.snapshot,
+                    change.columns,
+                    change.partition_by,
+                    change.sort_by,
+                    entries,
+                )
+            }
+        };
         // Reconcile the files first: it is the only step that can fail, and it
         // leaves this copy untouched when it does, so a copy never ends up at a
         // version whose files it does not hold.
@@ -344,6 +356,30 @@ impl CatalogTable {
     /// footer fetch that fails leaves this copy exactly as it was. A copy left
     /// holding a version's files only partially would never recover: its next
     /// refresh finds that version already current and reconciles nothing.
+    /// The file list a version range leaves this copy holding: what it already
+    /// holds, less the paths the range removed and any it re-added, plus the
+    /// range's added files. Order follows the held list so a rebuild reuses each
+    /// held file's row groups by path and fetches only genuinely new footers.
+    fn apply_change(
+        &self,
+        added: Vec<DeltaFileEntry>,
+        removed: &HashSet<String>,
+    ) -> Vec<DeltaFileEntry> {
+        let readded: HashSet<&str> = added.iter().map(|entry| entry.file.path.as_str()).collect();
+        let mut entries: Vec<DeltaFileEntry> = self
+            .files
+            .iter()
+            .map(|file| &file.entry)
+            .filter(|entry| {
+                let path = entry.file.path.as_str();
+                !removed.contains(path) && !readded.contains(path)
+            })
+            .cloned()
+            .collect();
+        entries.extend(added);
+        entries
+    }
+
     fn rebuild_files(
         &mut self,
         entries: Vec<DeltaFileEntry>,
