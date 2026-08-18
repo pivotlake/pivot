@@ -186,6 +186,23 @@ pub fn materialize(
     table: Arc<ParquetTable>,
     projection: Projection,
 ) -> RecordBatchOperatorSpec {
+    // A fetch of no columns (COUNT(*) over a late-materialized LIMIT) has
+    // nothing to read, and the page-driven pipeline below would emit no rows
+    // for it (the same trap `table_input` routes around). The surviving rows
+    // themselves are the answer: strip the metadata columns and pass their
+    // row counts through.
+    if projection.indices().is_empty() {
+        return spec.project(|| {
+            |batch: RecordBatch| {
+                arrow_array::RecordBatch::try_new_with_options(
+                    Arc::new(arrow_schema::Schema::empty()),
+                    vec![],
+                    &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+                )
+                .expect("an empty batch carries only a row count")
+            }
+        });
+    }
     let (dispatcher, mut heads) = spec.into_parts();
     let n = dispatcher.worker_count();
     let siblings_materializer = Arc::new(AtomicUsize::new(n));

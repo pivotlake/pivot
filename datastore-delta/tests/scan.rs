@@ -1697,3 +1697,29 @@ fn materialize_reads_a_row_group_split_across_batches_exactly_once() {
     let total: usize = results.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 400_000);
 }
+
+// COUNT(*) over a late-materialized LIMIT fetches no columns at all. The
+// page-driven fetch pipeline would emit nothing for an empty projection, so
+// the materialize passes the surviving row counts through instead.
+#[test]
+fn materialize_of_no_columns_emits_the_surviving_row_counts() {
+    use arrow_array::Int64Array;
+    use datastore_delta::parquet::materialize;
+
+    let dispatch = dispatch(2);
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from_iter_values(0..20_000))],
+    )
+    .unwrap();
+    let (_dir, table) = parquet_table(&dispatch, &[batch], true);
+    let narrow = table_input(&dispatch, &table, Projection::columns([]), true).limit(15_000, 0);
+
+    let results = materialize(narrow, table.clone(), Projection::columns([]))
+        .collect()
+        .unwrap();
+
+    let total: usize = results.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 15_000);
+    assert!(results.iter().all(|b| b.num_columns() == 0));
+}

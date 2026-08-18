@@ -243,6 +243,15 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         operator,
     };
 
+    // DuckDB's column pruner can leave the collapsed subquery's projection
+    // holding only the synthesized row id (a projection must project
+    // something, and for `COUNT(*)` nothing real is left). The Materialize
+    // drops that column, which only ever served the discarded row-id join, so
+    // such a reference dangles past the fetched columns. Replace it with a
+    // typed NULL constant: nothing above ever reads the value (whatever
+    // consumed it was pruned away too), only the row count carries meaning.
+    patch_dangling_materialize_refs(&mut node);
+
     // A filter directly above a base-table scan folds the scan's lifted
     // pushed-down conditions into itself (see `absorb_scan_pushdown_filter`).
     // The peek at the DuckDB child is what grounds the fold: only a scan child
@@ -1387,6 +1396,31 @@ fn build_late_materialization(
 }
 
 // ---- Late-materialization tree surgery (operates on the built Pivot tree) ----
+
+/// Replace a projection's bare references past its late-mat Materialize
+/// child's outputs with typed NULL constants. Only the row id ever sits
+/// there (the Materialize keeps every real column), and its value is
+/// unobservable; see the call site.
+fn patch_dangling_materialize_refs(node: &mut PlanNode) {
+    let Operator::Projection(projection) = &mut node.operator else {
+        return;
+    };
+    let Some(child) = node.inputs.first() else {
+        return;
+    };
+    let Operator::Materialize(materialize) = &child.operator else {
+        return;
+    };
+    let fetched = materialize.columns.len();
+    for expr in &mut projection.projections {
+        if let Expression::Ref(r) = expr
+            && r.column_idx >= fetched
+        {
+            let nulls = arrow_array::new_null_array(&physical_arrow_type(&r.return_type), 1);
+            *expr = Expression::Constant(arrow_array::Scalar::new(nulls));
+        }
+    }
+}
 
 /// Whether `node` is a late-mat Materialize whose narrow scan reads no data
 /// columns (the shape of a plain LIMIT, once the row-id column is stripped).
