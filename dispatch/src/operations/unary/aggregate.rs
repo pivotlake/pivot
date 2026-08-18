@@ -107,10 +107,34 @@ impl NumOp {
         arr: &PrimitiveArray<T>,
     ) -> Option<A>
     where
-        T::Native: Into<i64>,
+        T::Native: Ord + Into<i64>,
     {
         match self {
             NumOp::Sum => fold_primitive_column(arr, Sum::<A>::seed, Sum::<A>::update),
+            // A null-free MIN/MAX compares at the column's native width and
+            // widens only the single winner: the Into<i64> widening is
+            // monotonic, so the extreme commutes with it, and the loop packs a
+            // full vector of native-width values per compare instead of
+            // widening every element to i64 first. Only this exact select
+            // shape lowers to vector min/max: `Iterator::min` (its
+            // first-occurrence contract) and even `Ord::min` (its tie-break
+            // argument order) both leave the loop scalar.
+            NumOp::Min if arr.null_count() == 0 => {
+                let extreme = arr
+                    .values()
+                    .iter()
+                    .copied()
+                    .reduce(|a, v| if v < a { v } else { a });
+                extreme.map(|v| A::from(v.into()))
+            }
+            NumOp::Max if arr.null_count() == 0 => {
+                let extreme = arr
+                    .values()
+                    .iter()
+                    .copied()
+                    .reduce(|a, v| if v > a { v } else { a });
+                extreme.map(|v| A::from(v.into()))
+            }
             NumOp::Min => fold_primitive_column(arr, Min::<A>::seed, Min::<A>::update),
             NumOp::Max => fold_primitive_column(arr, Max::<A>::seed, Max::<A>::update),
         }
