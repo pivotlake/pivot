@@ -65,6 +65,7 @@ use tracing::info;
 // lives in `catalog`, not here) can build on it: memory/IO/array-builder
 // primitives and worker identity.
 pub mod arrays;
+pub mod cpu_features;
 pub mod env;
 pub mod gather_barrier;
 pub mod io;
@@ -86,6 +87,7 @@ mod stats;
 use crate::waker::{WakerSet, WorkerWaker};
 use crate::worker::Worker;
 pub use api::*;
+pub use cpu_features::missing_cpu_features;
 pub use data_flow::{Error as DataFlowError, WorkStatus};
 pub use functions::*;
 pub use gather_barrier::GatherBarrier;
@@ -354,6 +356,18 @@ impl Dispatch {
         buffers: usize,
         disk_cache: Option<Arc<crate::io::DiskCache>>,
     ) -> Self {
+        // A CPU missing an extension this binary was compiled for faults with
+        // SIGILL inside whichever vectorised loop reaches the instruction first,
+        // with no message. Fail here, before any worker runs one.
+        let missing = cpu_features::missing_cpu_features();
+        assert!(
+            missing.is_empty(),
+            "this CPU does not implement instruction-set extensions this binary was compiled \
+             to use: {}. Run it on a CPU that has them, or rebuild with a lower floor (the \
+             `[target.aarch64-unknown-linux-gnu]` rustflags in `.cargo/config.toml`)",
+            missing.join(", ")
+        );
+
         // Empty groups would size the ready barrier for one phantom worker and then
         // spawn none, deadlocking the barrier wait below. Fail loudly instead.
         assert!(

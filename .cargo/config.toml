@@ -14,3 +14,23 @@
 #     benchmarks/Dockerfile)
 [build]
 rustc-wrapper = "kache"
+
+# Instruction-set floor for aarch64: Armv8.2-A plus SIMD, crypto, dot product,
+# SSBS, RCpc and BFloat16. The default target assumes only Armv8.0-A, which costs
+# the engine's vectorised loops and inlined LSE atomics.
+#
+# Two naming traps: `+v8.2a` is an unstable flag that warns on every build, so the
+# level is spelled as the features that reach codegen (`+lse,+crc,+rdm,+dpb`); and
+# `crypto` is not a rustc feature name, it is `aes` plus `sha2` (`+crypto` is
+# silently dropped).
+#
+# A CPU below this floor faults with SIGILL and no message, so
+# `dispatch::missing_cpu_features` refuses to start on one - keep the two lists in
+# step (dispatch/src/cpu_features.rs).
+#
+# An explicit `RUSTFLAGS` REPLACES this list rather than adding to it, which is
+# what lets the PGO recipes build with `-Ctarget-cpu=native` (pgo.just).
+[target.aarch64-unknown-linux-gnu]
+rustflags = [
+    "-Ctarget-feature=+lse,+crc,+rdm,+dpb,+neon,+aes,+sha2,+dotprod,+ssbs,+rcpc,+bf16",
+]
