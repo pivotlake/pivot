@@ -244,9 +244,9 @@ impl MemoryContext {
     ///
     /// Must run on the worker thread that owns this context (its `pop`/`push`
     /// touch the per-worker free pool). Returns the number of buffers zeroed.
-    /// Intended for benchmarks: re-zeroing dirtied buffers between iterations is
-    /// allocation/setup work, so doing it eagerly (outside the timed region)
-    /// keeps the next query's hash-table allocation from re-zeroing inline.
+    /// Re-zeroing dirtied buffers is setup work, so doing it eagerly between
+    /// queries keeps the next query's hash-table allocation from re-zeroing
+    /// inline.
     pub fn zero_dirty_buffers(&self) -> usize {
         let mut zeroed = 0;
         while let Some(buf) = self.pop_dirty_buffer() {
@@ -344,7 +344,7 @@ impl MemoryContext {
             } else if panic_at.is_some_and(|limit| iterations >= limit) {
                 panic!(
                     "evict: still no evictable memory after sleeping ({iterations} \
-                     iterations) — aborting query (cache exhausted by an oversized \
+                     iterations) - aborting query (cache exhausted by an oversized \
                      working set)"
                 );
             }

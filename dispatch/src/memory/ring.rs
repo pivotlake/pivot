@@ -107,7 +107,7 @@ impl Ring {
 
         // Back the ring with transparent huge pages. Slots are BUFFER_SIZE (2MB)
         // aligned and sized, so each maps to exactly one 2MB page, cutting TLB
-        // entries ~512x versus the default 4KB pages — worthwhile for a multi-GB
+        // entries ~512x versus the default 4KB pages - worthwhile for a multi-GB
         // region under random access. Best-effort: ignored if THP is unavailable.
         // Linux-only: `MADV_HUGEPAGE` does not exist on macOS/other targets.
         #[cfg(target_os = "linux")]
@@ -234,12 +234,12 @@ impl Drop for Ring {
             let size = self.slots.len() * BUFFER_SIZE;
             // NOTE: do not use `tracing` here. `Ring` is held in an `Arc` inside the
             // per-worker `MemoryContext` thread-local, so the last drop happens during
-            // TLS destruction — and `tracing_subscriber` also relies on TLS. If its
+            // TLS destruction - and `tracing_subscriber` also relies on TLS. If its
             // thread-local has already been destroyed, the macro panics with
             // "cannot access a Thread Local Storage value during or after destruction".
             //
             // SAFETY: `first.buffer` + `size` describe the exact mmap region
-            // created in `Ring::new`. `Drop` is the unique owner — readers
+            // created in `Ring::new`. `Drop` is the unique owner - readers
             // and writers can only borrow slots from a `&'static Ring`, and
             // by the time the `Ring` itself drops there's nothing left to
             // borrow.

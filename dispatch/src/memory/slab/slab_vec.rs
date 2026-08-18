@@ -1,4 +1,4 @@
-//! [`SlabVec`] — a growable, slab-backed, append-only buffer.
+//! [`SlabVec`] - a growable, slab-backed, append-only buffer.
 
 use super::{SlabAllocator, SlabBuffer};
 
@@ -22,8 +22,8 @@ pub struct SlabVec<T: Copy> {
 }
 
 // SAFETY: the cached `cur_base` raw pointer is the only thing blocking the auto
-// `Send`. It points into a slab owned by `chunks` — address-stable pool memory the
-// `SlabBuffer`s keep alive — so it stays valid when the `SlabVec` moves to another
+// `Send`. It points into a slab owned by `chunks` - address-stable pool memory the
+// `SlabBuffer`s keep alive - so it stays valid when the `SlabVec` moves to another
 // thread. `T: Send` is still required: the vec hands out its elements on the
 // receiving thread, so a `T` that is unsound to move across threads (e.g. one
 // borrowing a `Cell`) must keep blocking the impl.
@@ -39,7 +39,7 @@ impl<T: Copy> SlabVec<T> {
     /// Elements per chunk: a ~64 KB target of `T`, derived from `size_of::<T>()`
     /// rather than a fixed element count so a wide `T` can't overflow a single slab
     /// (which `create_slab_buffer` asserts against). Kept well below a full 2 MB
-    /// slab so chunks bump-pack into the shared ring buffers — when many small
+    /// slab so chunks bump-pack into the shared ring buffers - when many small
     /// `SlabVec`s share the pool, a full-slab chunk apiece would pin a whole 2 MB
     /// buffer each, whereas small chunks let memory track total data rather than
     /// the number of vecs.
@@ -54,7 +54,7 @@ impl<T: Copy> SlabVec<T> {
     /// switch allocates `RADIX_PARTITIONS` (thousands of) per-partition buffers, and
     /// at moderate cardinality most hold only a few rows. Chunks bump-pack into the
     /// shared 2MB pool buffers, so a full first chunk apiece would tie up ~8x more of
-    /// the pool — buffers the compressed cache could otherwise use — for partitions that
+    /// the pool - buffers the compressed cache could otherwise use - for partitions that
     /// barely fill them. Buffers that do grow large take full `CHUNK_CAP` chunks from
     /// the second one on, so the per-chunk overhead for big partitions stays
     /// negligible.
@@ -135,7 +135,7 @@ impl<T: Copy> SlabVec<T> {
         }
     }
 
-    /// Visit every element in insertion order — sequentially off each chunk's base.
+    /// Visit every element in insertion order - sequentially off each chunk's base.
     #[inline(always)]
     pub fn for_each(&self, mut f: impl FnMut(T)) {
         self.for_each_chunk(|slice| {

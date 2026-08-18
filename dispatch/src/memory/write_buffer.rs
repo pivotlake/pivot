@@ -7,16 +7,16 @@ use std::sync::atomic::Ordering;
 /// Exclusive, mutable handle to a 2MB slot in the ring buffer.
 ///
 /// Acquired via `Ring::try_write`, which atomically marks the slot as being written.
-/// Only one `WriteBuffer` can exist per slot at a time — the ring's CAS on the `used`
+/// Only one `WriteBuffer` can exist per slot at a time - the ring's CAS on the `used`
 /// field enforces this.
 ///
 /// The buffer can be used as `&[u8]` / `&mut [u8]` through `Deref`/`DerefMut`.
 ///
 /// When done writing, the buffer can either be:
-/// - Dropped — returns the slot to the free pool as dirty (not zeroed).
-/// - Converted into a [`super::ReadBuffer`] via `From` — transitions the slot from exclusive
+/// - Dropped - returns the slot to the free pool as dirty (not zeroed).
+/// - Converted into a [`super::ReadBuffer`] via `From` - transitions the slot from exclusive
 ///   write mode to shared read mode without releasing it.
-/// - Consumed via [`zero_out`](Self::zero_out) — zeroes the memory and returns the slot
+/// - Consumed via [`zero_out`](Self::zero_out) - zeroes the memory and returns the slot
 ///   to the free pool as zeroed.
 pub struct WriteBuffer {
     /// Raw pointer to the start of this slot's 2MB region within the mmap'd ring.

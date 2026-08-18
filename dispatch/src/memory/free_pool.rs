@@ -26,7 +26,7 @@ use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 
-/// Builds a coordinated set of [`FreePool`]s — one per worker — that share
+/// Builds a coordinated set of [`FreePool`]s - one per worker - that share
 /// a global injector array and per-node stealer lists.
 ///
 /// Each factory holds Arc clones of the shared state; calling
@@ -176,8 +176,8 @@ mod tests {
     //! single pool, cross-worker routing through the shared injectors, and
     //! work-stealing from sibling deques.
     //!
-    //! Anything that mixes a *zeroed* and a *dirty* pool — preference,
-    //! fallback — lives in [`crate::memory::context`]'s tests instead, because
+    //! Anything that mixes a *zeroed* and a *dirty* pool - preference,
+    //! fallback - lives in [`crate::memory::context`]'s tests instead, because
     //! that pairing is a `MemoryContext` concept, not a `FreePool` one.
 
     use super::*;
@@ -246,7 +246,7 @@ mod tests {
         pool.push(1);
         let order = [pool.pop(true), pool.pop(true), pool.pop(true)];
 
-        // Assert: last in, first out — cache-friendly reuse.
+        // Assert: last in, first out - cache-friendly reuse.
         assert_eq!(order, [Some(1), Some(0), None]);
     }
 

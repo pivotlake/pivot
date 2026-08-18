@@ -5,10 +5,10 @@ use std::ops::{Index, IndexMut};
 /// Typed buffer backed by a single [`Slab`] (must fit within one 2MB `WriteBuffer`).
 ///
 /// Created via [`super::SlabAllocator::create_slab_buffer`]. Cheaper to index than [`super::MultiSlabBuffer`]
-/// since there's no slab lookup — just a single pointer offset.
+/// since there's no slab lookup - just a single pointer offset.
 ///
 /// Supports `Index<usize>` and `IndexMut<usize>` for typed element access. Like `MultiSlabBuffer`,
-/// does not track its logical length — callers must track how many elements have been written, and
+/// does not track its logical length - callers must track how many elements have been written, and
 /// it is UB to access an index not yet set.
 pub struct SlabBuffer<T> {
     slab: Slab,
@@ -25,7 +25,7 @@ impl<T> SlabBuffer<T> {
     }
 
     /// Returns a raw pointer to the element at `index`.
-    /// Simple pointer arithmetic — no slab lookup needed.
+    /// Simple pointer arithmetic - no slab lookup needed.
     #[inline(always)]
     pub fn ptr_at_index(&self, index: usize) -> *mut T {
         let byte_offset = index * size_of::<T>();

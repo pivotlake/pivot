@@ -61,7 +61,7 @@ impl SlabAllocator {
 
     /// Allocates a single slab of exactly `size` bytes.
     ///
-    /// Panics if `size >= BUFFER_SIZE` (2MB) — use [`get_slabs_of_size`](Self::get_slabs_of_size)
+    /// Panics if `size >= BUFFER_SIZE` (2MB) - use [`get_slabs_of_size`](Self::get_slabs_of_size)
     /// for larger allocations. Advances to a new buffer if the current one doesn't have enough room.
     pub fn get_slab_of_size(&mut self, size: usize, zeroed: bool) -> Slab {
         assert!(size <= BUFFER_SIZE, "Size was {:?}", size);
@@ -75,7 +75,7 @@ impl SlabAllocator {
 
     /// Allocates `size` bytes across one or more slabs, each at most 2MB.
     ///
-    /// Returns the slabs in order — the caller is responsible for treating them as a
+    /// Returns the slabs in order - the caller is responsible for treating them as a
     /// contiguous logical buffer (see [`MultiSlabBuffer`]).
     pub fn get_slabs_of_size(&mut self, size: usize, zeroed: bool) -> Vec<Slab> {
         let mut slabs = vec![];
@@ -140,7 +140,7 @@ impl SlabAllocator {
     /// in every single indexing operation.
     pub fn create_multi_slab_buffer<T>(&mut self, size: usize, zeroed: bool) -> MultiSlabBuffer<T> {
         // `MultiSlabBuffer` packs `elems_per_slab` elements into each slab (it does NOT treat
-        // the slabs as one contiguous byte run — see its docs), so a single slab fits tightly
+        // the slabs as one contiguous byte run - see its docs), so a single slab fits tightly
         // but anything larger takes one full 2MB slab per `elems_per_slab` elements. Sizing by
         // bytes alone would under-allocate by a slab once an element straddles the 2MB point.
         let elems_per_slab = BUFFER_SIZE / size_of::<T>();

@@ -865,11 +865,11 @@ impl CompressedCache {
     /// descriptors stay open (their maps are just emptied). Returns the number of
     /// extents dropped.
     ///
-    /// Intended for benchmarking true cold reads (`SELECT drop_cache()`). Sound only
-    /// while no query is in flight: it recycles bound slots, which must not race a
-    /// reader holding a pin (an actively-filling slot another worker still pins is
-    /// left intact - its extents are already dropped from the map, so it serves no
-    /// stale hits).
+    /// Backs `SELECT drop_cache()`, which forces the next reads to be truly
+    /// cold. Sound only while no query is in flight: it recycles bound slots,
+    /// which must not race a reader holding a pin (an actively-filling slot
+    /// another worker still pins is left intact - its extents are already
+    /// dropped from the map, so it serves no stale hits).
     pub fn clear(&self) -> usize {
         // Release this worker's fill pin first, so its own fill slot is recyclable
         // below rather than skipped as pinned.

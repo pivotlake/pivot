@@ -115,7 +115,7 @@ impl<'a, 'b> MultiBufferReader<'a, 'b> {
     /// Extract `size` bytes as zero-copy [`Bytes`] slices.
     ///
     /// Returns one `Bytes` per underlying buffer touched. Unlike
-    /// [`read_bytes`](Self::read_bytes) this avoids copying — each returned
+    /// [`read_bytes`](Self::read_bytes) this avoids copying - each returned
     /// `Bytes` shares the reference count with the source buffer.
     pub fn copy_out_buffers(&mut self, size: usize) -> Vec<Bytes> {
         let mut remaining = size;
@@ -495,7 +495,7 @@ mod tests {
         assert_eq!(reader.read_u8(), 4);
     }
 
-    /// Skip zero bytes — position must not change.
+    /// Skip zero bytes - position must not change.
     #[test]
     fn test_skip_zero() {
         let data = vec![Bytes::from(vec![1, 2, 3])];

@@ -8,15 +8,15 @@ use std::ops::{Index, IndexMut};
 ///
 /// Created via [`super::SlabAllocator::create_multi_slab_buffer`]. The backing slabs are
 /// *separate* 2MB allocations, not one contiguous run of memory, so each slab holds a whole
-/// number of elements — `BUFFER_SIZE / size_of::<T>()` of them — with the few leftover bytes
+/// number of elements - `BUFFER_SIZE / size_of::<T>()` of them - with the few leftover bytes
 /// at each slab's tail unused. Element `i` therefore lives in slab `i / elems_per_slab` at
 /// offset `(i % elems_per_slab) * size_of::<T>()`. (Indexing the slabs as one contiguous byte
-/// run instead — `byte_offset >> 21` — would let any element whose size doesn't divide 2MB
+/// run instead - `byte_offset >> 21` - would let any element whose size doesn't divide 2MB
 /// straddle a slab boundary and read past the slab into unrelated memory.) `elems_per_slab` is
 /// a constant for a given `T`, so the div/mod lower to a multiply+shift.
 ///
 /// Supports `Index<usize>` and `IndexMut<usize>` for typed element access. The buffer does
-/// not track its logical length — callers must track how many elements have been written. This
+/// not track its logical length - callers must track how many elements have been written. This
 /// means accessing indexes that have not yet been set is UB.
 pub struct MultiSlabBuffer<T> {
     slabs: Vec<Slab>,
@@ -37,7 +37,7 @@ impl<T> MultiSlabBuffer<T> {
     ///
     /// Each slab holds `elems_per_slab = BUFFER_SIZE / size_of::<T>()` elements packed from its
     /// start, so the element lives in slab `index / elems_per_slab` at byte offset
-    /// `(index % elems_per_slab) * size_of::<T>()` — never straddling a slab boundary even when
+    /// `(index % elems_per_slab) * size_of::<T>()` - never straddling a slab boundary even when
     /// `size_of::<T>()` doesn't divide `BUFFER_SIZE`.
     pub fn ptr_at_index(&self, index: usize) -> *mut T {
         let elems_per_slab = BUFFER_SIZE / size_of::<T>();
