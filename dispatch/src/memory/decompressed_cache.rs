@@ -604,9 +604,8 @@ impl DecompressedCache {
         }
     }
 
-    /// Whether the cache holds no blocks at all. `get_write_buffer` checks this
-    /// to decide whether eviction would have to fall through to the compressed
-    /// cache, and `get_range` uses it as its cold fast path.
+    /// Whether the cache holds no blocks at all. `get_range` uses this as its
+    /// cold fast path.
     pub fn is_empty(&self) -> bool {
         self.blocks.load(Ordering::Relaxed) == 0
     }

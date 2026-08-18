@@ -1,4 +1,3 @@
-use crate::env::get_env_var_with_default;
 use crate::memory::clock::{Clock, Owner};
 use crate::memory::compressed_cache::CompressedCache;
 use crate::memory::decompressed_cache::DecompressedCache;
@@ -8,10 +7,7 @@ use crate::memory::status::{MemoryBlockStatus, read_block_status};
 use crate::memory::{BUFFER_SIZE, Ring, RingLayout, WriteBuffer};
 use crate::worker::WORKER_IDX;
 use std::cell::{Cell, RefCell, UnsafeCell};
-use std::sync::{Arc, LazyLock};
-
-static PANIC_ON_EVICT: LazyLock<bool> =
-    LazyLock::new(|| get_env_var_with_default("PANIC_ON_EVICT", true));
+use std::sync::Arc;
 
 thread_local! {
     static MEMORY_CONTEXT_OWNER: RefCell<Option<Box<MemoryContext>>> = const { RefCell::new(None) };
@@ -283,13 +279,7 @@ impl MemoryContext {
 
             // Pool empty: evict via the shared clock, which takes from whichever
             // tier is over its target share (decompressed, in the common case of
-            // a large decompressed working set). Panic only when there is nothing
-            // cheap to reclaim - an empty decompressed cache means we would be
-            // evicting the compressed cache, the memory-pressure signal
-            // `PANIC_ON_EVICT` guards.
-            if *PANIC_ON_EVICT && self.decompressed_cache.is_empty() {
-                panic!("Evicting");
-            }
+            // a large decompressed working set).
             return self.evict();
         }
     }

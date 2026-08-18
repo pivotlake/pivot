@@ -22,8 +22,7 @@ const TABLE: &str = "events";
 
 /// Eight INSERT dataflows run at once here, each pinning ring slots for the file
 /// it writes, so the buffer count is well above the suite's usual default; the
-/// pool runs the ring dry (and, with `PANIC_ON_EVICT`, fails the dataflow)
-/// otherwise.
+/// extra space avoids heavy eviction churn while all eight are active.
 fn dispatcher() -> DataFlowDispatcher {
     shared_dispatcher(4, 128)
 }

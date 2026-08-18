@@ -9,7 +9,7 @@ Box: `ssh ubuntu@parquetsink` (x86_64). Live dir: `~/pivotdb-deploy/` — `run.s
 
 `run.sh` holds all config, so the swap is zero-config:
 export GOOGLE_APPLICATION_CREDENTIALS=/home/ubuntu/parquet_sink/gcs-key.json   # SA parquet-sink-writer@epsio-io (has delete)
-export RUST_LOG=info PANIC_ON_EVICT=false                                       # PANIC_ON_EVICT=false is required
+export RUST_LOG=info
 ./pivotdb-server --path gs://epsio-io-otel-parquet/pivotdb-otel --bind 0.0.0.0:5432 \
 --otel-config /home/ubuntu/pivotdb-deploy/otel.toml --compact --compact-bytes 52428800
 NOTE: the compacter is opt-in. `--compact` must be present or the server refuses `--compact-bytes`/`--compact-min-files` and exits. Older run.sh lacking `--compact` will fail to start after the swap; add it.
