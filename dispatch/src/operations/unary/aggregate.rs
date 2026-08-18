@@ -75,12 +75,22 @@ impl NumOp {
             DataType::Int8 => self.reduce_int_primitive::<A, Int8Type>(arr.as_primitive()),
             DataType::Int16 => self.reduce_int_primitive::<A, Int16Type>(arr.as_primitive()),
             DataType::Int32 => self.reduce_int_primitive::<A, Int32Type>(arr.as_primitive()),
-            DataType::Int64 => self.reduce_int_primitive::<A, Int64Type>(arr.as_primitive()),
+            DataType::Int64 => {
+                let arr = arr.as_primitive::<Int64Type>();
+                if matches!(self, NumOp::Sum) && arr.null_count() == 0 {
+                    return sum_i64_exact(arr.values()).map(A::from_i128_sum);
+                }
+                self.reduce_int_primitive::<A, Int64Type>(arr)
+            }
             DataType::UInt8 => self.reduce_int_primitive::<A, UInt8Type>(arr.as_primitive()),
             DataType::UInt16 => self.reduce_int_primitive::<A, UInt16Type>(arr.as_primitive()),
             DataType::UInt32 => self.reduce_int_primitive::<A, UInt32Type>(arr.as_primitive()),
             DataType::Decimal64(_, _) => {
-                self.reduce_int_primitive::<A, Decimal64Type>(arr.as_primitive())
+                let arr = arr.as_primitive::<Decimal64Type>();
+                if matches!(self, NumOp::Sum) && arr.null_count() == 0 {
+                    return sum_i64_exact(arr.values()).map(A::from_i128_sum);
+                }
+                self.reduce_int_primitive::<A, Decimal64Type>(arr)
             }
             DataType::Decimal128(_, _) => self.reduce_wide_primitive::<A>(arr.as_primitive()),
             other => panic!("aggregate: unsupported column type {other:?}"),
@@ -97,10 +107,34 @@ impl NumOp {
         arr: &PrimitiveArray<T>,
     ) -> Option<A>
     where
-        T::Native: Into<i64>,
+        T::Native: Ord + Into<i64>,
     {
         match self {
             NumOp::Sum => fold_primitive_column(arr, Sum::<A>::seed, Sum::<A>::update),
+            // A null-free MIN/MAX compares at the column's native width and
+            // widens only the single winner: the Into<i64> widening is
+            // monotonic, so the extreme commutes with it, and the loop packs a
+            // full vector of native-width values per compare instead of
+            // widening every element to i64 first. Only this exact select
+            // shape lowers to vector min/max: `Iterator::min` (its
+            // first-occurrence contract) and even `Ord::min` (its tie-break
+            // argument order) both leave the loop scalar.
+            NumOp::Min if arr.null_count() == 0 => {
+                let extreme = arr
+                    .values()
+                    .iter()
+                    .copied()
+                    .reduce(|a, v| if v < a { v } else { a });
+                extreme.map(|v| A::from(v.into()))
+            }
+            NumOp::Max if arr.null_count() == 0 => {
+                let extreme = arr
+                    .values()
+                    .iter()
+                    .copied()
+                    .reduce(|a, v| if v > a { v } else { a });
+                extreme.map(|v| A::from(v.into()))
+            }
             NumOp::Min => fold_primitive_column(arr, Min::<A>::seed, Min::<A>::update),
             NumOp::Max => fold_primitive_column(arr, Max::<A>::seed, Max::<A>::update),
         }
@@ -191,7 +225,84 @@ impl NumOp {
 /// [`F64Sum`]/[`F64Min`]/[`F64Max`] methods (`V = f64`, a serial `fadd`/select chain -
 /// FP arithmetic is not reassociated without fast-math - so branch-free and inlined,
 /// but not SIMD).
+/// Exact `SUM` of a null-free `i64` column as `i128`, or `None` if it is empty,
+/// in a shape the autovectoriser lifts. Folding through the generic path
+/// accumulates `i128` directly, and a serial `i128` add chain neither
+/// vectorises nor pipelines. Instead each lane keeps a wrapping `u64` sum plus
+/// a carry count and a negative count, all lane-independent: a two's-complement
+/// `v` contributes `u64(v) - 2^64·[v < 0]` to the true total, and a wrapping
+/// lane sum drops exactly `2^64` per carry-out, so
+/// `lane total = wrap + ((carries - negatives) << 64)` is exact. The counts
+/// cannot themselves overflow below `2^64` rows, and the `i128` total is
+/// bounded by `rows · 2^63`.
+fn sum_i64_exact(values: &[i64]) -> Option<i128> {
+    if values.is_empty() {
+        return None;
+    }
+    const LANES: usize = 8;
+    let mut wrap = [0u64; LANES];
+    let mut carries = [0u64; LANES];
+    let mut negatives = [0u64; LANES];
+    let chunks = values.chunks_exact(LANES);
+    let tail = chunks.remainder();
+    for chunk in chunks {
+        for lane in 0..LANES {
+            let v = chunk[lane];
+            let (sum, carry) = wrap[lane].overflowing_add(v as u64);
+            wrap[lane] = sum;
+            carries[lane] += carry as u64;
+            negatives[lane] += (v < 0) as u64;
+        }
+    }
+    let mut total: i128 = 0;
+    for lane in 0..LANES {
+        total += wrap[lane] as i128 + ((carries[lane] as i128 - negatives[lane] as i128) << 64);
+    }
+    for &v in tail {
+        total += v as i128;
+    }
+    Some(total)
+}
+
 fn fold_primitive_column<A, V, T: ArrowPrimitiveType>(
+    arr: &PrimitiveArray<T>,
+    seed: impl Fn(V) -> A,
+    update: impl Fn(A, V) -> A,
+) -> Option<A>
+where
+    T::Native: Into<V>,
+{
+    // A portable (no -Ctarget-cpu) build vectorises this loop with NEON only;
+    // compiled with SVE available it runs measurably faster on SVE machines.
+    // Compile a second copy of the loop with SVE enabled and pick it when the
+    // running CPU has SVE, the same pattern memchr/crc32fast use. The check is
+    // per column reduce (never per row) and caches after the first call.
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("sve") {
+        // SAFETY: SVE support was just detected on the running CPU.
+        return unsafe { fold_primitive_column_sve(arr, seed, update) };
+    }
+    fold_primitive_column_impl(arr, seed, update)
+}
+
+/// The SVE-enabled clone of [`fold_primitive_column_impl`]: `#[target_feature]`
+/// recompiles the inlined loop body with SVE codegen, and the `unsafe` at the
+/// call site is the promise that the CPU was checked.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "sve")]
+fn fold_primitive_column_sve<A, V, T: ArrowPrimitiveType>(
+    arr: &PrimitiveArray<T>,
+    seed: impl Fn(V) -> A,
+    update: impl Fn(A, V) -> A,
+) -> Option<A>
+where
+    T::Native: Into<V>,
+{
+    fold_primitive_column_impl(arr, seed, update)
+}
+
+#[inline(always)]
+fn fold_primitive_column_impl<A, V, T: ArrowPrimitiveType>(
     arr: &PrimitiveArray<T>,
     seed: impl Fn(V) -> A,
     update: impl Fn(A, V) -> A,
@@ -691,6 +802,27 @@ mod tests {
         match kind {
             AggregationKind::Sum => arrow_schema::DataType::Decimal128(38, 0),
             _ => arrow_schema::DataType::Int64,
+        }
+    }
+
+    #[test]
+    fn sum_i64_exact_matches_reference() {
+        let cases: Vec<Vec<i64>> = vec![
+            vec![],
+            vec![i64::MIN],
+            vec![i64::MAX; 17],
+            vec![i64::MIN, i64::MAX, -1, 0, 1, i64::MIN, i64::MIN],
+            (-4000..4001).map(|v| v * 0x1234_5678_9ABC).collect(),
+        ];
+
+        for values in cases {
+            let expected = if values.is_empty() {
+                None
+            } else {
+                Some(values.iter().map(|&v| v as i128).sum::<i128>())
+            };
+
+            assert_eq!(sum_i64_exact(&values), expected, "len {}", values.len());
         }
     }
 
