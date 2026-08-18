@@ -2,6 +2,7 @@
 name = "catalog"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "The cross-datastore catalog: presents many named datastores to the planner as one Catalog, opening a per-datastore sub-transaction per query."
 
 [dependencies]

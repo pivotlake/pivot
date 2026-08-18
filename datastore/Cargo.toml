@@ -2,6 +2,7 @@
 name = "datastore"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "The Datastore / DatastoreTransaction traits: one named data source and its per-query snapshot transaction, resolving tables and DDL for the planner."
 
 [dependencies]
