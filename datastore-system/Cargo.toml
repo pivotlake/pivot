@@ -2,6 +2,7 @@
 name = "datastore-system"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "The `system` datastore: read-only relations describing the server's own catalog, assembled per query from the datastores it is composed with."
 
 [dependencies]
