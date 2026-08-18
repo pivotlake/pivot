@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use arrow_arith::aggregate::{max, min};
 use arrow_array::{
-    Array, ArrayRef, Date32Array, Datum, Decimal64Array, Decimal128Array, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Scalar, StringArray,
+    Array, ArrayRef, BinaryViewArray, Date32Array, Datum, Decimal64Array, Decimal128Array,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Scalar, StringArray,
     StringViewArray, TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, TimeUnit};
@@ -19,9 +19,10 @@ use arrow_schema::{DataType, TimeUnit};
 /// A column's min and max, as single-element Arrow arrays.
 ///
 /// `None` when the column is empty or all-null, or when its type is not one the
-/// write path (and so the reader's `decode_scalar`) supports — a binary leaf, for
-/// instance. Such a column simply records no min/max and is never pruned by
-/// range, which costs a scan but is never unsound.
+/// write path (and so the reader's `decode_scalar`) supports. Binary variant
+/// values deliberately record bounds only when every value is canonical JSON
+/// null (`[0x00]`): that exact singleton is useful to classify a shredded
+/// fallback without paying to order arbitrary binary documents at write time.
 pub(super) fn column_min_max(array: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
     macro_rules! numeric {
         ($arr:ty) => {{
@@ -84,6 +85,16 @@ pub(super) fn column_min_max(array: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
         }
         DataType::Utf8 => strings!(StringArray),
         DataType::Utf8View => strings!(StringViewArray),
+        DataType::BinaryView => {
+            let values = array.as_any().downcast_ref::<BinaryViewArray>()?;
+            if values.len() == values.null_count()
+                || values.iter().flatten().any(|value| value != &[0_u8][..])
+            {
+                return None;
+            }
+            let bound: ArrayRef = Arc::new(BinaryViewArray::from(vec![&[0_u8][..]]));
+            Some((bound.clone(), bound))
+        }
         _ => None,
     }
 }
@@ -153,6 +164,11 @@ pub(super) fn stat_bytes(value: &ArrayRef) -> Option<Vec<u8>> {
         }
         DataType::Utf8 => raw_bytes!(StringArray),
         DataType::Utf8View => raw_bytes!(StringViewArray),
+        DataType::BinaryView => value
+            .as_any()
+            .downcast_ref::<BinaryViewArray>()?
+            .value(0)
+            .to_vec(),
         _ => return None,
     })
 }
@@ -172,8 +188,8 @@ fn decimal_stat_bytes(unscaled: i128, precision: u8) -> Vec<u8> {
 /// the row count, and each column's min (min of the groups' mins), max (max of
 /// the maxes), and null count (their sum). A column's bound is kept only when
 /// every row group carries it, so a bound is never claimed from partial coverage.
-/// A column whose type has no decodable min/max (a variant's binary leaf) records
-/// none, which is sound: it is simply never pruned by range.
+/// A column whose type has no decodable min/max records none, which is sound: it
+/// is simply never pruned by range.
 pub(crate) fn aggregate_file_stats(
     row_groups: &[Arc<crate::parquet::RowGroupMetadata>],
 ) -> crate::manifest::FileStats {
