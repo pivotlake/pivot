@@ -257,22 +257,12 @@ impl CatalogTable {
         data_change: bool,
     ) -> crate::Result<()> {
         loop {
-            if let Some(missing) = removed.iter().find(|path| {
-                !self
-                    .files
-                    .iter()
-                    .any(|f| f.entry.file.path.as_str() == path.as_str())
-            }) {
-                return Err(Error::CommitConflict {
-                    location: self.location.as_str().to_string(),
-                    file: missing.to_string(),
-                });
-            }
+            let removed_entries = self.held_entries(removed)?;
             let entries: Vec<DeltaFileEntry> = added.iter().map(|f| f.entry.clone()).collect();
             if let Some(committed) = crate::delta::commit_file_changes(
                 &self.engine,
                 &self.snapshot,
-                removed,
+                &removed_entries,
                 &entries,
                 data_change,
             )? {
@@ -300,21 +290,11 @@ impl CatalogTable {
         data_change: bool,
     ) -> crate::Result<()> {
         loop {
-            if let Some(missing) = removed.iter().find(|path| {
-                !self
-                    .files
-                    .iter()
-                    .any(|f| f.entry.file.path.as_str() == path.as_str())
-            }) {
-                return Err(Error::CommitConflict {
-                    location: self.location.as_str().to_string(),
-                    file: missing.to_string(),
-                });
-            }
+            let removed_entries = self.held_entries(removed)?;
             if let Some(committed) = crate::delta::commit_file_changes(
                 &self.engine,
                 &self.snapshot,
-                removed,
+                &removed_entries,
                 added,
                 data_change,
             )? {
@@ -356,6 +336,27 @@ impl CatalogTable {
     /// footer fetch that fails leaves this copy exactly as it was. A copy left
     /// holding a version's files only partially would never recover: its next
     /// refresh finds that version already current and reconciles nothing.
+    /// The log entries this copy holds for `paths`, which a commit removing them
+    /// writes its `Remove` actions from. A path this copy does not hold cannot be
+    /// removed against its version, so it is reported as a lost race rather than
+    /// committed: either another writer already swapped the file, or this copy is
+    /// being asked to remove a file that was never its to remove.
+    fn held_entries(&self, paths: &[ObjectPath]) -> crate::Result<Vec<DeltaFileEntry>> {
+        paths
+            .iter()
+            .map(|path| {
+                self.files
+                    .iter()
+                    .find(|file| file.entry.file.path == *path)
+                    .map(|file| file.entry.clone())
+                    .ok_or_else(|| Error::CommitConflict {
+                        location: self.location.as_str().to_string(),
+                        file: path.to_string(),
+                    })
+            })
+            .collect()
+    }
+
     /// The file list a version range leaves this copy holding: what it already
     /// holds, less the paths the range removed and any it re-added, plus the
     /// range's added files. Order follows the held list so a rebuild reuses each
