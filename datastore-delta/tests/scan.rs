@@ -1265,7 +1265,11 @@ fn scan_pushed_text_extract_distinguishes_json_null_from_missing() {
     // Setup
     let dispatch = dispatch(1);
     let batch = shredded_variant_batch(
-        &[r#"{"name":"bob"}"#, r#"{"name":null}"#, r#"{}"#],
+        &[
+            r#"{"name":"bob"}"#,
+            r#"{"name":null}"#,
+            r#"{"other":"present"}"#,
+        ],
         "name",
         &DataType::Utf8View,
     );

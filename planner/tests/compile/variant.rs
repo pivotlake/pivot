@@ -359,6 +359,27 @@ fn reads_an_unshredded_path_inside_a_shredded_object(mut testing_planner: Testin
     assert_eq!(got, vec![None, Some("ann")]);
 }
 
+#[rstest]
+fn filters_out_a_missing_imperfectly_shredded_text_path(mut testing_planner: TestingPlanner) {
+    shredded_docs_table(
+        &mut testing_planner,
+        vec![r#"{"stat":"UnaryStats"}"#, r#"{"event.name":"document"}"#],
+        "stat",
+        &DataType::Int64,
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT d FROM docs WHERE CAST(d->'stat' AS VARCHAR) != ''",
+    );
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        only_column(&rows[0]).as_str(),
+        Some(r#"{"stat":"UnaryStats"}"#)
+    );
+}
+
 /// The three shapes of "no value" behave distinctly: an explicit JSON null
 /// renders as `null` text, an absent path and a NULL document yield SQL NULL.
 #[rstest]
