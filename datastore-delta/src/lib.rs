@@ -17,6 +17,7 @@
 mod catalog;
 mod compact;
 mod delta;
+mod log_cache;
 mod manifest;
 pub mod parquet;
 pub mod store;

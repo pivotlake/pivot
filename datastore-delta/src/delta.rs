@@ -781,7 +781,12 @@ impl DeltaEngine {
             _ => ENGINE_RUNTIME.handle().clone(),
         };
         let executor = Arc::new(TokioMultiThreadExecutor::new(handle));
-        let engine = DefaultEngineBuilder::new(store.build_delta_object_store()?)
+        // Kernel reads a log's commits and checkpoints over and over, so its
+        // store is wrapped in the cache that serves those bytes from memory.
+        let log_store: Arc<delta_kernel::object_store::DynObjectStore> = Arc::new(
+            crate::log_cache::CachingLogStore::new(store.build_delta_object_store()?),
+        );
+        let engine = DefaultEngineBuilder::new(log_store)
             .with_task_executor(executor)
             .build();
         Ok(Self {
