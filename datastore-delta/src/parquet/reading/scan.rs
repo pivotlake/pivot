@@ -7,7 +7,7 @@
 //! injection + fetching (source) → index → decompress → decode.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::parquet::RowGroupFilter;
 use crate::parquet::reading::empty_projection_scan::empty_projection_scan;
@@ -199,8 +199,12 @@ pub fn materialize(
     // index and drops pages of a group it already finished, so a second
     // request for the same group would silently lose its rows. The funneled
     // stage only merges tiny index lists; the fetch and decode stay spread
-    // over every worker through the stealable request channel.
-    let factories: Vec<_> = to_single_worker_mpsc::<RecordBatch>(n, 0)
+    // over every worker through the stealable request channel. Successive
+    // materializes take turns hosting the merge (as the write pipeline's
+    // indexer host does), so concurrent queries do not all pin one worker.
+    static NEXT_MATERIALIZER_HOST: AtomicUsize = AtomicUsize::new(0);
+    let host = NEXT_MATERIALIZER_HOST.fetch_add(1, Ordering::Relaxed) % n;
+    let factories: Vec<_> = to_single_worker_mpsc::<RecordBatch>(n, host)
         .into_iter()
         .zip(stealable::<RowGroupRequest>(dispatcher.topology()))
         .zip(pending_row_groups.iter())
