@@ -137,6 +137,28 @@ fn dot_access_across_mixed_shredding(mut testing_planner: TestingPlanner) {
     );
 }
 
+/// `SELECT d.age` across a file that provably lacks `age` (fully shredded on
+/// another field) and one that shreds it: the lacking file's rows come back
+/// SQL NULL and both files' layouts merge into one column.
+#[rstest]
+fn dot_access_across_a_file_provably_lacking_the_path(mut testing_planner: TestingPlanner) {
+    let lacking = docs_batch_shredded_as(
+        vec![r#"{"name":"bob"}"#, r#"{"name":"amy"}"#],
+        Some(("name", &DataType::Utf8View)),
+    );
+    let shredded = docs_batch(vec![r#"{"age":30}"#], true);
+    docs_table_files(&mut testing_planner, &[lacking, shredded]);
+
+    let rows = run(&mut testing_planner, "SELECT d.age AS a FROM docs");
+
+    let mut got: Vec<Option<String>> = rows
+        .iter()
+        .map(|r| r["a"].as_str().map(str::to_string))
+        .collect();
+    got.sort();
+    assert_eq!(got, vec![None, None, Some("30".to_string())]);
+}
+
 /// The `d.age` dot syntax over a real shredded parquet file.
 #[rstest]
 fn dot_access_over_shredded_parquet(mut testing_planner: TestingPlanner) {
