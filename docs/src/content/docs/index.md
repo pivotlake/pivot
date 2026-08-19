@@ -10,7 +10,7 @@ rather than the only way in.
 <figure class="arch-figure">
 <svg viewBox="0 0 920 552" role="img" aria-labelledby="arch-title arch-desc">
 <title id="arch-title">pivotdb architecture</title>
-<desc id="arch-desc">Object storage holds pivotlake tables in Delta Lake format. A pivotdb cluster reads and writes them and serves SQL clients over the Postgres wire. Agents, each embedding its own pivot open, and third-party engines such as DuckDB, read the same files directly without going through the cluster.</desc>
+<desc id="arch-desc">Object storage holds pivotlake tables in Delta Lake format. A Pivot cluster reads and writes them and serves SQL clients over the Postgres wire. Agents, each embedding its own pivot open, and third-party engines such as DuckDB, read the same files directly without going through the cluster.</desc>
 <defs>
 <marker id="arch-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
 <path d="M0,0 L10,5 L0,10 z" class="arch-arrowhead" />
@@ -48,7 +48,7 @@ rather than the only way in.
 <line x1="775" y1="250" x2="775" y2="182" class="arch-line" marker-end="url(#arch-head)" />
 <text x="789" y="220" class="arch-muted">read</text>
 <rect x="40" y="250" width="350" height="160" rx="3" class="arch-panel" />
-<text x="64" y="280" class="arch-title">pivotdb cluster</text>
+<text x="64" y="280" class="arch-title">Pivot cluster</text>
 <text x="366" y="280" text-anchor="end" class="arch-muted">writer</text>
 <rect x="64" y="296" width="94" height="86" rx="2" class="arch-inner" />
 <rect x="65" y="297" width="92" height="23" class="arch-strip" />
