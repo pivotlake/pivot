@@ -94,7 +94,6 @@ rather than the only way in.
 <rect x="426" y="336" width="208" height="30" rx="2" class="arch-inner" />
 <text x="436" y="356" class="arch-prompt">$</text>
 <text x="449" y="356" class="arch-cmd">pivot open s3://pivotlake</text>
-<text x="530" y="396" text-anchor="middle" class="arch-tiny">one process each · no cluster</text>
 <rect x="670" y="250" width="210" height="160" rx="3" class="arch-panel" />
 <text x="775" y="280" text-anchor="middle" class="arch-title">Other engines</text>
 <rect x="684" y="296" width="182" height="32" rx="2" class="arch-inner" />
