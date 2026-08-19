@@ -114,8 +114,8 @@ use std::time::Duration;
 use catalog::Datastore;
 use datastore_delta::store::{GcsStore, LocalStore, ObjectStore, S3Store, StoreScheme, local_path};
 use datastore_delta::{
-    CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL, DEFAULT_MIN_FILES_TO_MERGE,
-    DEFAULT_VACUUM_POLL, DeltaDatastore, MaintenanceConfig, VacuumConfig,
+    CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL, DEFAULT_VACUUM_POLL,
+    DeltaDatastore, MaintenanceConfig, VacuumConfig,
 };
 use dispatch::DataFlowDispatcher;
 use metastore::{
@@ -541,21 +541,16 @@ struct DatastoreConfig {
     /// unqualified table names and DDL. Exactly one datastore must set it.
     #[serde(rename = "default", default)]
     is_default: bool,
-    /// Run this datastore's own background compaction. On by default; the
-    /// `compact_*` tuning fields apply only when it is on. Compaction rewrites a
-    /// table's small Parquet files, so run it in only one process per datastore
-    /// (set `compact: false` on the others).
+    /// Run this datastore's own background compaction. On by default;
+    /// `compact_bytes` applies only when it is on. Compaction rewrites small
+    /// Parquet files and overlapping large ones, so run it in only one process
+    /// per datastore (set `compact: false` on the others).
     #[serde(default = "default_true")]
     compact: bool,
     /// Per-table byte threshold compaction merges small files up to (a size such
     /// as `128m` or `1g`). Defaults to [`DEFAULT_COMPACT_BYTES`].
     #[serde(skip_serializing_if = "Option::is_none")]
     compact_bytes: Option<ByteSize>,
-    /// Count trigger for a low-traffic partition's small files (merge once this
-    /// many accumulate, even below `compact_bytes`). Defaults to
-    /// [`DEFAULT_MIN_FILES_TO_MERGE`].
-    #[serde(skip_serializing_if = "Option::is_none")]
-    compact_min_files: Option<usize>,
     /// Run this datastore's own background vacuum. On by default: the vacuumer
     /// deletes unreferenced data files and superseded commit JSONs past their
     /// retention. Set `vacuum: false` on a read-only server, or where another
@@ -582,7 +577,6 @@ impl DatastoreConfig {
                 .compact_bytes
                 .map(ByteSize::as_bytes)
                 .unwrap_or(DEFAULT_COMPACT_BYTES),
-            min_files: self.compact_min_files.unwrap_or(DEFAULT_MIN_FILES_TO_MERGE),
             poll_interval: DEFAULT_COMPACT_POLL,
         })
     }

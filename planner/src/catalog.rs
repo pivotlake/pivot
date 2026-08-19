@@ -269,6 +269,19 @@ pub trait CatalogTransaction: Debug + Send + Sync {
         None
     }
 
+    /// Compact a table from this transaction's frozen catalog view.
+    async fn compact(
+        &self,
+        _datastore: &str,
+        _table: &SchemaQualifiedTableName,
+        _final_sweep: bool,
+    ) -> Result<u64> {
+        Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "this catalog does not support COMPACT",
+        )
+        .into())
+    }
+
     /// Resolve a `CREATE TABLE` by routing to the datastore
     /// [`CreateTableRequest::datastore_name`] names (the default when unqualified)
     /// and deferring to that datastore's own `bind_create_table`.

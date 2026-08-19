@@ -467,6 +467,12 @@ impl CatalogTable {
         self.files.iter().map(|f| f.entry.file.clone()).collect()
     }
 
+    /// The current committed file entries, including the partition tuple and
+    /// file-level statistics used to choose compaction work.
+    pub(crate) fn file_entries(&self) -> impl Iterator<Item = &DeltaFileEntry> {
+        self.files.iter().map(|file| &file.entry)
+    }
+
     /// This table as the cross-datastore catalog describes it, under the `name`
     /// it is currently indexed by: the columns it declares with what they cost,
     /// and the files it holds.

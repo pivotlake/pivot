@@ -295,7 +295,7 @@ impl Engine {
 
         if let Some(request) = plan.as_compact() {
             let started = Instant::now();
-            execute_compact(&self.catalog, request).await?;
+            execute_compact(&self.catalog, transaction.as_ref(), request).await?;
             return Ok(Execution {
                 output: StatementOutput::Command(Command::Compact),
                 stats: ExecutionStats {
@@ -508,21 +508,13 @@ where
 
 async fn execute_compact(
     catalog: &Arc<catalog::PivotCatalog>,
+    transaction: &dyn planner::catalog::CatalogTransaction,
     request: &planner::Compact,
 ) -> Result<u64> {
     let datastore_name = request
         .datastore
         .as_deref()
         .unwrap_or_else(|| catalog.default_datastore_name());
-    let datastore = catalog
-        .iter_datastores()
-        .find(|(name, _)| name.as_str() == datastore_name)
-        .map(|(_, datastore)| Arc::clone(datastore))
-        .ok_or_else(|| {
-            planner::catalog::Error::Other(
-                format!("COMPACT: no datastore named `{datastore_name}`").into(),
-            )
-        })?;
     let table = planner::catalog::SchemaQualifiedTableName::new(
         request
             .schema
@@ -530,7 +522,9 @@ async fn execute_compact(
             .unwrap_or(planner::DEFAULT_SCHEMA_NAME),
         request.table.as_str(),
     );
-    Ok(datastore.compact(&table, request.final_sweep).await?)
+    Ok(transaction
+        .compact(datastore_name, &table, request.final_sweep)
+        .await?)
 }
 
 fn with_planner<R>(

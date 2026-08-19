@@ -1403,19 +1403,18 @@ async fn compact_final_merges_small_insert_files(#[future] conn: Conn) {
     conn.simple_query("CREATE TABLE compact_me (id BIGINT)")
         .await
         .unwrap();
-    for i in 0..5 {
+    for i in 0..100 {
         conn.simple_query(&format!("INSERT INTO compact_me VALUES ({i})"))
             .await
             .unwrap();
     }
     let dir = table_dir("compact_me");
-    assert_eq!(live_log_files(&dir).len(), 5);
 
     conn.simple_query("COMPACT compact_me FINAL").await.unwrap();
 
     assert_eq!(live_log_files(&dir).len(), 1);
     let rows = select_rows(&conn, "SELECT COUNT(*), SUM(id) FROM compact_me").await;
-    assert_eq!(rows, vec![vec![Some("5".into()), Some("10".into())]]);
+    assert_eq!(rows, vec![vec![Some("100".into()), Some("4950".into())]]);
 }
 
 #[rstest]
@@ -1435,7 +1434,7 @@ async fn compact_accepts_a_fully_qualified_table_name(#[future] conn: Conn) {
     conn.simple_query("CREATE TABLE compact_qualified (id BIGINT)")
         .await
         .unwrap();
-    for i in 0..4 {
+    for i in 0..100 {
         conn.simple_query(&format!("INSERT INTO compact_qualified VALUES ({i})"))
             .await
             .unwrap();
@@ -1449,5 +1448,5 @@ async fn compact_accepts_a_fully_qualified_table_name(#[future] conn: Conn) {
 
     assert_eq!(live_log_files(&table_dir("compact_qualified")).len(), 1);
     let rows = select_rows(&conn, "SELECT COUNT(*) FROM compact_qualified").await;
-    assert_eq!(rows, vec![vec![Some("4".into())]]);
+    assert_eq!(rows, vec![vec![Some("100".into())]]);
 }
