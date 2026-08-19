@@ -1,58 +1,75 @@
 use std::cmp::Ordering;
 
-use arrow_array::{
-    Array, ArrayRef, BinaryViewArray, Date32Array, Decimal64Array, Decimal128Array, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray, StringViewArray,
-    TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-};
-use arrow_schema::{DataType, TimeUnit};
+use arrow_arith::numeric::sub;
+use arrow_array::{Array, ArrayRef, BinaryViewArray, Float64Array, StringArray, StringViewArray};
+use arrow_cast::cast;
+use arrow_ord::cmp;
+use arrow_schema::DataType;
 
 use crate::manifest::DeltaFileEntry;
 
 #[derive(Clone, Copy)]
-enum StatValue<'a> {
-    Signed(i128),
-    Unsigned(u64),
-    Float(f64),
-    Bytes(&'a [u8]),
-}
-
-#[derive(Clone, Copy)]
 struct UniformRange<'a> {
-    min: StatValue<'a>,
-    max: StatValue<'a>,
+    min: &'a ArrayRef,
+    max: &'a ArrayRef,
     rows: f64,
 }
 
-impl StatValue<'_> {
-    fn compare(self, other: Self) -> Option<Ordering> {
-        match (self, other) {
-            (Self::Signed(left), Self::Signed(right)) => Some(left.cmp(&right)),
-            (Self::Unsigned(left), Self::Unsigned(right)) => Some(left.cmp(&right)),
-            (Self::Float(left), Self::Float(right)) => left.partial_cmp(&right),
-            (Self::Bytes(left), Self::Bytes(right)) => Some(left.cmp(right)),
-            _ => None,
+fn compare(left: &ArrayRef, right: &ArrayRef) -> Option<Ordering> {
+    if left.len() != 1
+        || right.len() != 1
+        || left.is_null(0)
+        || right.is_null(0)
+        || left.data_type() != right.data_type()
+    {
+        return None;
+    }
+    if cmp::eq(left, right).ok()?.value(0) {
+        return Some(Ordering::Equal);
+    }
+    Some(if cmp::lt(left, right).ok()?.value(0) {
+        Ordering::Less
+    } else {
+        Ordering::Greater
+    })
+}
+
+/// Natural log of the distance between two ordered values. This distance is
+/// only used to calculate what fraction of one file's uniform distribution
+/// lies in an interval; it is not itself the rank-space width or score.
+fn distance_ln(lower: &ArrayRef, upper: &ArrayRef) -> Option<f64> {
+    match lower.data_type() {
+        DataType::Utf8 | DataType::Utf8View | DataType::BinaryView => {
+            lexicographic_width_ln(bytes(lower)?, bytes(upper)?)
+        }
+        _ => {
+            let lower = cast(lower.as_ref(), &DataType::Float64).ok()?;
+            let upper = cast(upper.as_ref(), &DataType::Float64).ok()?;
+            let width = sub(&upper, &lower).ok()?;
+            let width = width.as_any().downcast_ref::<Float64Array>()?.value(0);
+            (width > 0.0 && width.is_finite()).then(|| width.ln())
         }
     }
+}
 
-    /// Natural log of the distance between two ordered values. This distance is
-    /// only used to calculate what fraction of one file's uniform distribution
-    /// lies in an interval; it is not itself the rank-space width or score.
-    fn distance_ln(self, upper: Self) -> Option<f64> {
-        match (self, upper) {
-            (Self::Signed(lower), Self::Signed(upper)) if lower < upper => {
-                Some((upper.abs_diff(lower) as f64).ln())
-            }
-            (Self::Unsigned(lower), Self::Unsigned(upper)) if lower < upper => {
-                Some(((upper - lower) as f64).ln())
-            }
-            (Self::Float(lower), Self::Float(upper)) if lower < upper => {
-                let width = upper - lower;
-                width.is_finite().then(|| width.ln())
-            }
-            (Self::Bytes(lower), Self::Bytes(upper)) => lexicographic_width_ln(lower, upper),
-            _ => None,
-        }
+fn bytes(array: &ArrayRef) -> Option<&[u8]> {
+    match array.data_type() {
+        DataType::Utf8 => Some(
+            array
+                .as_any()
+                .downcast_ref::<StringArray>()?
+                .value(0)
+                .as_bytes(),
+        ),
+        DataType::Utf8View => Some(
+            array
+                .as_any()
+                .downcast_ref::<StringViewArray>()?
+                .value(0)
+                .as_bytes(),
+        ),
+        DataType::BinaryView => Some(array.as_any().downcast_ref::<BinaryViewArray>()?.value(0)),
+        _ => None,
     }
 }
 
@@ -91,75 +108,15 @@ pub(super) fn highest_scoring_pair<'a>(
     best
 }
 
-fn stat_value(array: &ArrayRef) -> Option<StatValue<'_>> {
-    if array.len() != 1 || array.is_null(0) {
-        return None;
-    }
-    macro_rules! signed {
-        ($array:ty) => {
-            Some(StatValue::Signed(
-                array.as_any().downcast_ref::<$array>()?.value(0) as i128,
-            ))
-        };
-    }
-    macro_rules! unsigned {
-        ($array:ty) => {
-            Some(StatValue::Unsigned(
-                array.as_any().downcast_ref::<$array>()?.value(0) as u64,
-            ))
-        };
-    }
-    match array.data_type() {
-        DataType::Int8 => signed!(Int8Array),
-        DataType::Int16 => signed!(Int16Array),
-        DataType::Int32 => signed!(Int32Array),
-        DataType::Int64 => signed!(Int64Array),
-        DataType::UInt8 => unsigned!(UInt8Array),
-        DataType::UInt16 => unsigned!(UInt16Array),
-        DataType::UInt32 => unsigned!(UInt32Array),
-        DataType::UInt64 => unsigned!(UInt64Array),
-        DataType::Date32 => signed!(Date32Array),
-        DataType::Timestamp(TimeUnit::Microsecond, None) => signed!(TimestampMicrosecondArray),
-        DataType::Decimal64(_, _) => signed!(Decimal64Array),
-        DataType::Decimal128(_, _) => signed!(Decimal128Array),
-        DataType::Float32 => {
-            let value = array.as_any().downcast_ref::<Float32Array>()?.value(0) as f64;
-            value.is_finite().then_some(StatValue::Float(value))
-        }
-        DataType::Float64 => {
-            let value = array.as_any().downcast_ref::<Float64Array>()?.value(0);
-            value.is_finite().then_some(StatValue::Float(value))
-        }
-        DataType::Utf8 => Some(StatValue::Bytes(
-            array
-                .as_any()
-                .downcast_ref::<StringArray>()?
-                .value(0)
-                .as_bytes(),
-        )),
-        DataType::Utf8View => Some(StatValue::Bytes(
-            array
-                .as_any()
-                .downcast_ref::<StringViewArray>()?
-                .value(0)
-                .as_bytes(),
-        )),
-        DataType::BinaryView => Some(StatValue::Bytes(
-            array.as_any().downcast_ref::<BinaryViewArray>()?.value(0),
-        )),
-        _ => None,
-    }
-}
-
 fn uniform_range<'a>(entry: &'a DeltaFileEntry, column: &str) -> Option<UniformRange<'a>> {
     let stats = entry.stats.as_ref()?;
     let rows = stats.num_records?;
     if rows <= 0 {
         return None;
     }
-    let min = stat_value(stats.min_values.get(column)?)?;
-    let max = stat_value(stats.max_values.get(column)?)?;
-    if min.compare(max)? == Ordering::Greater {
+    let min = stats.min_values.get(column)?;
+    let max = stats.max_values.get(column)?;
+    if compare(min, max)? == Ordering::Greater {
         return None;
     }
     Some(UniformRange {
@@ -261,37 +218,37 @@ enum ColumnOverlap {
 /// candidate row count would turn it into a percentile width, but that common
 /// denominator cancels from the overlap score.
 fn estimated_rank_width(
-    interval_min: StatValue<'_>,
-    interval_max: StatValue<'_>,
+    interval_min: &ArrayRef,
+    interval_max: &ArrayRef,
     rank_space: &[UniformRange<'_>],
 ) -> Option<f64> {
     let mut estimated_rows = 0.0;
     for range in rank_space {
-        if range.min.compare(range.max)? == Ordering::Equal {
-            let contained = range.min.compare(interval_min)? != Ordering::Less
-                && range.min.compare(interval_max)? != Ordering::Greater;
+        if compare(range.min, range.max)? == Ordering::Equal {
+            let contained = compare(range.min, interval_min)? != Ordering::Less
+                && compare(range.min, interval_max)? != Ordering::Greater;
             if contained {
                 estimated_rows += range.rows;
             }
             continue;
         }
 
-        let intersection_min = if range.min.compare(interval_min)? == Ordering::Less {
+        let intersection_min = if compare(range.min, interval_min)? == Ordering::Less {
             interval_min
         } else {
             range.min
         };
-        let intersection_max = if range.max.compare(interval_max)? == Ordering::Greater {
+        let intersection_max = if compare(range.max, interval_max)? == Ordering::Greater {
             interval_max
         } else {
             range.max
         };
-        if intersection_min.compare(intersection_max)? != Ordering::Less {
+        if compare(intersection_min, intersection_max)? != Ordering::Less {
             continue;
         }
 
-        let covered_distance = intersection_min.distance_ln(intersection_max)?;
-        let range_distance = range.min.distance_ln(range.max)?;
+        let covered_distance = distance_ln(intersection_min, intersection_max)?;
+        let range_distance = distance_ln(range.min, range.max)?;
         let covered_fraction = (covered_distance - range_distance).exp().min(1.0);
         estimated_rows += range.rows * covered_fraction;
     }
@@ -305,47 +262,43 @@ fn column_overlap(
     right_max: &ArrayRef,
     rank_space: &[UniformRange<'_>],
 ) -> Option<ColumnOverlap> {
-    let left_min = stat_value(left_min)?;
-    let left_max = stat_value(left_max)?;
-    let right_min = stat_value(right_min)?;
-    let right_max = stat_value(right_max)?;
-    if left_min.compare(left_max)? == Ordering::Greater
-        || right_min.compare(right_max)? == Ordering::Greater
+    if compare(left_min, left_max)? == Ordering::Greater
+        || compare(right_min, right_max)? == Ordering::Greater
     {
         return None;
     }
 
-    let left_singleton = left_min.compare(left_max)? == Ordering::Equal;
-    let right_singleton = right_min.compare(right_max)? == Ordering::Equal;
+    let left_singleton = compare(left_min, left_max)? == Ordering::Equal;
+    let right_singleton = compare(right_min, right_max)? == Ordering::Equal;
     if left_singleton && right_singleton {
-        return Some(if left_min.compare(right_min)? == Ordering::Equal {
+        return Some(if compare(left_min, right_min)? == Ordering::Equal {
             ColumnOverlap::NextSortColumn
         } else {
             ColumnOverlap::Score(0.0)
         });
     }
     if left_singleton {
-        let contained = left_min.compare(right_min)? != Ordering::Less
-            && left_min.compare(right_max)? != Ordering::Greater;
+        let contained = compare(left_min, right_min)? != Ordering::Less
+            && compare(left_min, right_max)? != Ordering::Greater;
         return Some(ColumnOverlap::Score(if contained { 1.0 } else { 0.0 }));
     }
     if right_singleton {
-        let contained = right_min.compare(left_min)? != Ordering::Less
-            && right_min.compare(left_max)? != Ordering::Greater;
+        let contained = compare(right_min, left_min)? != Ordering::Less
+            && compare(right_min, left_max)? != Ordering::Greater;
         return Some(ColumnOverlap::Score(if contained { 1.0 } else { 0.0 }));
     }
 
-    let intersection_min = if left_min.compare(right_min)? == Ordering::Less {
+    let intersection_min = if compare(left_min, right_min)? == Ordering::Less {
         right_min
     } else {
         left_min
     };
-    let intersection_max = if left_max.compare(right_max)? == Ordering::Greater {
+    let intersection_max = if compare(left_max, right_max)? == Ordering::Greater {
         right_max
     } else {
         left_max
     };
-    if intersection_min.compare(intersection_max)? != Ordering::Less {
+    if compare(intersection_min, intersection_max)? != Ordering::Less {
         return Some(ColumnOverlap::Score(0.0));
     }
 
@@ -441,13 +394,13 @@ mod tests {
     ) -> Option<ColumnOverlap> {
         let rank_space = [
             UniformRange {
-                min: stat_value(left_min)?,
-                max: stat_value(left_max)?,
+                min: left_min,
+                max: left_max,
                 rows: left_rows,
             },
             UniformRange {
-                min: stat_value(right_min)?,
-                max: stat_value(right_max)?,
+                min: right_min,
+                max: right_max,
                 rows: right_rows,
             },
         ];
