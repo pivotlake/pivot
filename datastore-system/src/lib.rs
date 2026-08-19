@@ -138,8 +138,8 @@ const RELATIONS: [SystemRelation; 5] = [
             ("sorting_keys", Type::Utf8),
             ("partition_key", Type::Utf8),
             ("total_rows", Type::Int64),
-            ("total_bytes", Type::Int64),
-            ("total_bytes_uncompressed", Type::Int64),
+            ("bytes", Type::Int64),
+            ("bytes_uncompressed", Type::Int64),
         ],
         build: build_tables,
     },
@@ -152,8 +152,8 @@ const RELATIONS: [SystemRelation; 5] = [
             ("name", Type::Utf8),
             ("type", Type::Utf8),
             ("position", Type::Int64),
-            ("total_bytes", Type::Int64),
-            ("total_bytes_uncompressed", Type::Int64),
+            ("bytes", Type::Int64),
+            ("bytes_uncompressed", Type::Int64),
             ("is_partition_key", Type::Boolean),
             ("is_sort_key", Type::Boolean),
         ],
@@ -166,8 +166,8 @@ const RELATIONS: [SystemRelation; 5] = [
             ("table", Type::Utf8),
             ("path", Type::Utf8),
             ("partition", Type::Utf8),
-            ("size", Type::Int64),
-            ("total_bytes_uncompressed", Type::Int64),
+            ("bytes", Type::Int64),
+            ("bytes_uncompressed", Type::Int64),
         ],
         build: build_table_files,
     },
@@ -179,7 +179,7 @@ const RELATIONS: [SystemRelation; 5] = [
             ("node", Type::Int64),
             ("state", Type::Utf8),
             ("readers", Type::Int64),
-            ("size", Type::Int64),
+            ("bytes", Type::Int64),
         ],
         build: build_memory_blocks,
     },
@@ -314,8 +314,8 @@ impl DatastoreTransaction for SystemTransaction {
                         name: name.to_string(),
                         column_type: column_type.clone(),
                         position,
-                        total_bytes: 0,
-                        total_bytes_uncompressed: 0,
+                        bytes: 0,
+                        bytes_uncompressed: 0,
                         is_partition_key: false,
                         is_sort_key: false,
                     })
@@ -323,8 +323,8 @@ impl DatastoreTransaction for SystemTransaction {
                 sort_by: Vec::new(),
                 partition_by: Vec::new(),
                 total_rows: 0,
-                total_bytes: 0,
-                total_bytes_uncompressed: 0,
+                bytes: 0,
+                bytes_uncompressed: 0,
                 files: Vec::new(),
             })
             .collect()
@@ -394,11 +394,11 @@ fn build_tables(
                     .map(|entry| entry.table.partition_by.join(",")),
             ),
             int_array(tables.iter().map(|entry| entry.table.total_rows as i64)),
-            int_array(tables.iter().map(|entry| entry.table.total_bytes as i64)),
+            int_array(tables.iter().map(|entry| entry.table.bytes as i64)),
             int_array(
                 tables
                     .iter()
-                    .map(|entry| entry.table.total_bytes_uncompressed as i64),
+                    .map(|entry| entry.table.bytes_uncompressed as i64),
             ),
         ],
     )
@@ -441,11 +441,11 @@ fn build_columns(
                     .map(|(_, column)| sql_type_name(&column.column_type)),
             ),
             int_array(declared.iter().map(|(_, column)| column.position as i64)),
-            int_array(declared.iter().map(|(_, column)| column.total_bytes as i64)),
+            int_array(declared.iter().map(|(_, column)| column.bytes as i64)),
             int_array(
                 declared
                     .iter()
-                    .map(|(_, column)| column.total_bytes_uncompressed as i64),
+                    .map(|(_, column)| column.bytes_uncompressed as i64),
             ),
             boolean_array(declared.iter().map(|(_, column)| column.is_partition_key)),
             boolean_array(declared.iter().map(|(_, column)| column.is_sort_key)),
@@ -476,12 +476,8 @@ fn build_table_files(
             string_array(files.iter().map(|(_, file)| file.partition.clone())),
             // A file is far smaller than an i64 holds, so the cast keeps every
             // size and spares clients an unsigned type they mostly lack.
-            int_array(files.iter().map(|(_, file)| file.size as i64)),
-            int_array(
-                files
-                    .iter()
-                    .map(|(_, file)| file.total_bytes_uncompressed as i64),
-            ),
+            int_array(files.iter().map(|(_, file)| file.bytes as i64)),
+            int_array(files.iter().map(|(_, file)| file.bytes_uncompressed as i64)),
         ],
     )
 }
@@ -536,7 +532,7 @@ fn compile_memory_blocks_scan(
 fn memory_block_arrays(blocks: &[MemoryBlockStatus]) -> Vec<ArrayRef> {
     // Every block is the same size, so the column repeats one value; it is
     // carried anyway so that summing memory needs no knowledge of that size.
-    let size = dispatch::block_size_bytes() as i64;
+    let bytes = dispatch::block_size_bytes() as i64;
 
     vec![
         int_array(blocks.iter().map(|block| block.slot as i64)),
@@ -547,7 +543,7 @@ fn memory_block_arrays(blocks: &[MemoryBlockStatus]) -> Vec<ArrayRef> {
                 .map(|block| state_name(block.state).to_string()),
         ),
         int_array(blocks.iter().map(|block| block.readers as i64)),
-        int_array(std::iter::repeat_n(size, blocks.len())),
+        int_array(std::iter::repeat_n(bytes, blocks.len())),
     ]
 }
 

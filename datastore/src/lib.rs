@@ -42,9 +42,9 @@ pub struct DatastoreTableMetadata {
     /// How many rows the table's committed files hold.
     pub total_rows: u64,
     /// How many bytes those files occupy in storage.
-    pub total_bytes: u64,
+    pub bytes: u64,
     /// What those bytes hold decoded, before the storage format compressed them.
-    pub total_bytes_uncompressed: u64,
+    pub bytes_uncompressed: u64,
     /// The table's committed files, in the order its datastore holds them.
     /// Files a pending write staged are not committed to the snapshot and so
     /// are absent, exactly as a table the same transaction is still creating is.
@@ -60,9 +60,9 @@ pub struct DatastoreColumnMetadata {
     /// The column's position in the table's schema, counted from zero.
     pub position: usize,
     /// How many bytes this column occupies across the table's committed files.
-    pub total_bytes: u64,
+    pub bytes: u64,
     /// What those bytes hold decoded, before the storage format compressed them.
-    pub total_bytes_uncompressed: u64,
+    pub bytes_uncompressed: u64,
     pub is_partition_key: bool,
     pub is_sort_key: bool,
 }
@@ -72,15 +72,15 @@ pub struct DatastoreColumnMetadata {
 ///
 /// The owning table is the one this hangs off, so a file names no table of its
 /// own. `path` names the file the way its datastore does, relative to that
-/// datastore's storage root, and `size` is the size the catalog recorded
-/// when the file was committed.
+/// datastore's storage root, and `bytes` is the size the catalog recorded for
+/// it when the file was committed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatastoreFileMetadata {
     pub path: String,
-    pub size: u64,
+    pub bytes: u64,
     /// What the file's bytes hold decoded, before the storage format compressed
     /// them.
-    pub total_bytes_uncompressed: u64,
+    pub bytes_uncompressed: u64,
     /// The partition the file belongs to: `column=value` pairs in the table's
     /// partition order, comma-separated. Empty when the table is unpartitioned,
     /// or when the file predates its partitioning.

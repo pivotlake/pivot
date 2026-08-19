@@ -293,7 +293,7 @@ async fn system_tables_belong_to_the_system_datastore(#[future] conn: Conn) {
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
 async fn system_table_files_lists_the_files_of_a_table(#[future] conn: Conn) {
-    let sql = "SELECT f.size \
+    let sql = "SELECT f.bytes \
                FROM system.table_files f JOIN system.tables t ON f.\"table\" = t.id \
                WHERE t.name = 'system_files'";
     conn.simple_query("CREATE TABLE system_files (id BIGINT)")
@@ -367,13 +367,13 @@ async fn system_tables_and_columns_describe_a_table(#[future] conn: Conn) {
     let table = select_rows(
         &conn,
         "SELECT datastore, schema, sorting_keys, partition_key, total_rows, \
-                total_bytes > 0, total_bytes_uncompressed > 0 \
+                bytes > 0, bytes_uncompressed > 0 \
          FROM system.tables WHERE name = 'system_described'",
     )
     .await;
     let columns = select_rows(
         &conn,
-        "SELECT c.name, c.type, c.position, c.is_partition_key, c.is_sort_key, c.total_bytes > 0 \
+        "SELECT c.name, c.type, c.position, c.is_partition_key, c.is_sort_key, c.bytes > 0 \
          FROM system.columns c JOIN system.tables t ON c.\"table\" = t.id \
          WHERE t.name = 'system_described' ORDER BY c.position",
     )
@@ -562,7 +562,7 @@ async fn system_memory_blocks_accounts_for_every_block(#[future] conn: Conn) {
 
     let by_state = select_rows(
         &conn,
-        "SELECT state, count(*), sum(size) \
+        "SELECT state, count(*), sum(bytes) \
          FROM system.memory_blocks GROUP BY state ORDER BY state",
     )
     .await;

@@ -52,7 +52,7 @@ impl TableFile {
     }
 
     /// What this file's bytes hold decoded, summed over its column chunks.
-    fn uncompressed_bytes(&self) -> u64 {
+    fn uncompressed_size(&self) -> u64 {
         self.row_groups
             .iter()
             .flat_map(|row_group| row_group.columns.iter())
@@ -477,13 +477,13 @@ impl CatalogTable {
             .iter()
             .enumerate()
             .map(|(position, column)| {
-                let (total_bytes, total_bytes_uncompressed) = column_bytes[position];
+                let (bytes, bytes_uncompressed) = column_bytes[position];
                 DatastoreColumnMetadata {
                     name: column.name.clone(),
                     column_type: column.col_type.clone(),
                     position,
-                    total_bytes,
-                    total_bytes_uncompressed,
+                    bytes,
+                    bytes_uncompressed,
                     is_partition_key: self.partition_by.contains(&column.name),
                     is_sort_key: self.sort_by.contains(&column.name),
                 }
@@ -495,8 +495,8 @@ impl CatalogTable {
             .iter()
             .map(|file| DatastoreFileMetadata {
                 path: file.entry.file.path.as_str().to_string(),
-                size: file.entry.file.size,
-                total_bytes_uncompressed: file.uncompressed_bytes(),
+                bytes: file.entry.file.size,
+                bytes_uncompressed: file.uncompressed_size(),
                 partition: self.format_partition(&file.entry.partition),
             })
             .collect();
@@ -513,8 +513,8 @@ impl CatalogTable {
                 .flat_map(|file| file.row_groups.iter())
                 .map(|row_group| row_group.num_rows.max(0) as u64)
                 .sum(),
-            total_bytes: self.files.iter().map(|file| file.entry.file.size).sum(),
-            total_bytes_uncompressed: self.files.iter().map(TableFile::uncompressed_bytes).sum(),
+            bytes: self.files.iter().map(|file| file.entry.file.size).sum(),
+            bytes_uncompressed: self.files.iter().map(TableFile::uncompressed_size).sum(),
             files,
         }
     }
