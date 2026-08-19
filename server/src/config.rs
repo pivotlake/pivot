@@ -219,6 +219,15 @@ mod tests {
     }
 
     #[test]
+    fn example_config_parses() {
+        let yaml = include_str!("../config.example.yaml");
+
+        let config = Config::from_yaml(yaml, "config.example.yaml").unwrap();
+
+        assert_eq!(config.server.bind, "127.0.0.1:5432".parse().unwrap());
+    }
+
+    #[test]
     fn one_file_configures_both_the_instance_and_its_data() {
         let config = from_yaml_with(
             "  bind: 0.0.0.0:5433\n  memory: 32g\n  workers: 8\n  refresh_interval: 5s\n",
