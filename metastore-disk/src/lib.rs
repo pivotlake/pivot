@@ -114,8 +114,9 @@ use std::time::Duration;
 use catalog::Datastore;
 use datastore_delta::store::{GcsStore, LocalStore, ObjectStore, S3Store, StoreScheme, local_path};
 use datastore_delta::{
-    CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL, DEFAULT_VACUUM_POLL,
-    DeltaDatastore, MaintenanceConfig, VacuumConfig,
+    CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL, DEFAULT_MIN_FILES_TO_MERGE,
+    DEFAULT_VACUUM_POLL, DeltaDatastore, MaintenanceConfig, VacuumConfig,
+    default_merge_target_bytes,
 };
 use dispatch::DataFlowDispatcher;
 use metastore::{
@@ -547,10 +548,18 @@ struct DatastoreConfig {
     /// per datastore (set `compact: false` on the others).
     #[serde(default = "default_true")]
     compact: bool,
-    /// Per-table byte threshold compaction merges small files up to (a size such
-    /// as `128m` or `1g`). Defaults to [`DEFAULT_COMPACT_BYTES`].
+    /// Per-table boundary between small files and layout candidates (a size
+    /// such as `128m` or `1g`). Defaults to [`DEFAULT_COMPACT_BYTES`].
     #[serde(skip_serializing_if = "Option::is_none")]
     compact_bytes: Option<ByteSize>,
+    /// Accumulated small-file bytes that immediately trigger a merge. Defaults
+    /// to 1.3 times `compact_bytes`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compact_merge_bytes: Option<ByteSize>,
+    /// Count at which sub-target small files may use the balance fallback.
+    /// Defaults to [`DEFAULT_MIN_FILES_TO_MERGE`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compact_min_files: Option<usize>,
     /// Run this datastore's own background vacuum. On by default: the vacuumer
     /// deletes unreferenced data files and superseded commit JSONs past their
     /// retention. Set `vacuum: false` on a read-only server, or where another
@@ -572,11 +581,17 @@ impl DatastoreConfig {
         if !self.compact {
             return None;
         }
+        let target_bytes = self
+            .compact_bytes
+            .map(ByteSize::as_bytes)
+            .unwrap_or(DEFAULT_COMPACT_BYTES);
         Some(CompactionConfig {
-            target_bytes: self
-                .compact_bytes
+            target_bytes,
+            merge_target_bytes: self
+                .compact_merge_bytes
                 .map(ByteSize::as_bytes)
-                .unwrap_or(DEFAULT_COMPACT_BYTES),
+                .unwrap_or_else(|| default_merge_target_bytes(target_bytes)),
+            min_files: self.compact_min_files.unwrap_or(DEFAULT_MIN_FILES_TO_MERGE),
             poll_interval: DEFAULT_COMPACT_POLL,
         })
     }
@@ -741,6 +756,8 @@ datastores:
     location: /tmp/hot
     default: true
     compact_bytes: 128m
+    compact_merge_bytes: 160m
+    compact_min_files: 42
   warm:
     kind: delta
     location: /tmp/warm
@@ -749,12 +766,29 @@ datastores:
 
         let store = from_yaml(yaml).unwrap();
 
-        let hot = datastore(&store, "hot").compaction();
+        let hot = datastore(&store, "hot").compaction().unwrap();
         let warm = datastore(&store, "warm").compaction();
+
         // Compaction is on by default (hot omits `compact`), and off only where a
         // datastore turns it off explicitly (warm).
-        assert_eq!(hot.unwrap().target_bytes, 128 * 1024 * 1024);
+        assert_eq!(hot.target_bytes, 128 * 1024 * 1024);
+        assert_eq!(hot.merge_target_bytes, 160 * 1024 * 1024);
+        assert_eq!(hot.min_files, 42);
         assert!(warm.is_none());
+    }
+
+    #[test]
+    fn compaction_knobs_have_defaults() {
+        let store = from_yaml(HOT_SECTION).unwrap();
+
+        let config = datastore(&store, "hot").compaction().unwrap();
+
+        assert_eq!(config.target_bytes, DEFAULT_COMPACT_BYTES);
+        assert_eq!(
+            config.merge_target_bytes,
+            default_merge_target_bytes(DEFAULT_COMPACT_BYTES)
+        );
+        assert_eq!(config.min_files, DEFAULT_MIN_FILES_TO_MERGE);
     }
 
     #[test]
@@ -1561,7 +1595,8 @@ datastores:
     #[test]
     fn a_created_user_is_served_and_survives_reopening() {
         let disk = "datastores:\n  warm:\n    kind: delta\n    location: /tmp/warm\n    \
-                    compact: false\n    compact_bytes: 128m\n";
+                    compact: false\n    compact_bytes: 128m\n    compact_merge_bytes: 160m\n    \
+                    compact_min_files: 42\n";
         let (store, file) = open_with_file(HOT_SECTION, disk);
 
         store.create_user("walt", Some("w")).unwrap();
@@ -1586,6 +1621,11 @@ datastores:
             128 * 1024 * 1024,
             "the size survives re-encoding through its written form"
         );
+        assert_eq!(
+            warm.compact_merge_bytes.unwrap().as_bytes(),
+            160 * 1024 * 1024
+        );
+        assert_eq!(warm.compact_min_files, Some(42));
     }
 
     #[test]

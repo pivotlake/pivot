@@ -369,12 +369,27 @@ impl DeltaDatastore {
             .maintenance
             .as_ref()
             .and_then(|maintenance| maintenance.compaction.as_ref());
-        let target_bytes = configured
-            .map(|config| config.target_bytes)
-            .unwrap_or(crate::compact::DEFAULT_COMPACT_BYTES);
-        let poll_interval = configured.map(|config| config.poll_interval);
-        let (handle, actor) =
-            crate::compact::CompacterHandle::new(target_bytes, poll_interval, Arc::clone(self));
+        let (target_bytes, merge_target_bytes, min_files, poll_interval) = match configured {
+            Some(config) => (
+                config.target_bytes,
+                config.merge_target_bytes,
+                config.min_files,
+                Some(config.poll_interval),
+            ),
+            None => (
+                crate::compact::DEFAULT_COMPACT_BYTES,
+                crate::compact::default_merge_target_bytes(crate::compact::DEFAULT_COMPACT_BYTES),
+                crate::compact::DEFAULT_MIN_FILES_TO_MERGE,
+                None,
+            ),
+        };
+        let (handle, actor) = crate::compact::CompacterHandle::new(
+            target_bytes,
+            merge_target_bytes,
+            min_files,
+            poll_interval,
+            Arc::clone(self),
+        );
         let task = tokio::spawn(actor.run());
         self.maintenance_tasks
             .lock()

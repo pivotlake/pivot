@@ -66,12 +66,12 @@ const ROW_GROUP_ROWS: usize = 128 * 1024;
 /// compaction; files at least this large enter layout optimization.
 pub const DEFAULT_COMPACT_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Leave headroom for compression gains: a group whose input bytes only just
+/// Default headroom for compression gains: a group whose input bytes only just
 /// reach the desired output size can encode to another undersized file.
-const TARGET_SIZE_MULTIPLIER: f64 = 1.3;
+const DEFAULT_MERGE_TARGET_MULTIPLIER: f64 = 1.3;
 
-/// Only a genuinely large pile takes the sub-target fallback path.
-const SMALL_FILE_COUNT_TRIGGER: usize = 100;
+/// Default count at which a sub-target pile may take the balance-check path.
+pub const DEFAULT_MIN_FILES_TO_MERGE: usize = 100;
 
 /// Per-file fixed cost in the balance test. This prevents many similarly small
 /// files from being rejected merely because their byte total is low.
@@ -88,6 +88,11 @@ pub const DEFAULT_COMPACT_POLL: Duration = Duration::from_secs(10);
 /// stale a query's view of externally committed data in a shared remote store
 /// is, so it trades freshness against the store's listing traffic.
 pub const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Default accumulated input size for a small-file merge.
+pub fn default_merge_target_bytes(target_bytes: u64) -> u64 {
+    (target_bytes as f64 * DEFAULT_MERGE_TARGET_MULTIPLIER) as u64
+}
 
 /// What background maintenance a [`DeltaDatastore`] runs for itself once opened.
 /// The datastore spawns its own tasks from this on the ambient tokio runtime;
@@ -113,6 +118,10 @@ pub struct MaintenanceConfig {
 pub struct CompactionConfig {
     /// Output-size target and small/large boundary (see [`DEFAULT_COMPACT_BYTES`]).
     pub target_bytes: u64,
+    /// Accumulated small-file bytes that trigger a merge.
+    pub merge_target_bytes: u64,
+    /// Count at which a sub-target pile may take the balance-check path.
+    pub min_files: usize,
     /// How often to re-check the tables' logs for newly-accumulated files.
     pub poll_interval: Duration,
 }
@@ -135,6 +144,8 @@ struct CompactionCommand {
 pub(crate) struct CompacterActor {
     /// Output-size target and small/large boundary (see [`DEFAULT_COMPACT_BYTES`]).
     target_bytes: u64,
+    merge_target_bytes: u64,
+    min_files: usize,
     /// How often to re-check the tables' logs, or `None` when only explicit
     /// commands drive this actor.
     poll_interval: Option<Duration>,
@@ -145,6 +156,8 @@ pub(crate) struct CompacterActor {
 impl CompacterHandle {
     pub(crate) fn new(
         target_bytes: u64,
+        merge_target_bytes: u64,
+        min_files: usize,
         poll_interval: Option<Duration>,
         datastore: Arc<DeltaDatastore>,
     ) -> (Self, CompacterActor) {
@@ -153,6 +166,8 @@ impl CompacterHandle {
             Self { commands: sender },
             CompacterActor {
                 target_bytes,
+                merge_target_bytes,
+                min_files: min_files.max(2),
                 poll_interval,
                 datastore,
                 commands: receiver,
@@ -161,7 +176,9 @@ impl CompacterHandle {
     }
 
     /// Enqueue one table from the caller's transaction snapshot. `FINAL` keeps
-    /// selecting from each committed result until a round can do no more work.
+    /// selecting from each committed result until a round can do no more work,
+    /// without applying the normal merge-size, file-count, balance, or 30%
+    /// overlap guards.
     pub(crate) async fn compact(
         &self,
         name: SchemaQualifiedTableName,
@@ -234,16 +251,17 @@ impl CompacterActor {
         final_sweep: bool,
     ) -> crate::Result<(CatalogTable, u64)> {
         let mut sweeps = 0;
+        let apply_guards = !final_sweep;
         loop {
             let id = table.id();
             let mut compacted = false;
 
-            if let Some(inputs) = self.next_small_batch(&table) {
+            if let Some(inputs) = self.next_small_batch(&table, apply_guards) {
                 table = self.merge_batch(name, id, inputs, "small files").await?;
                 compacted = true;
             }
 
-            if let Some(inputs) = self.next_layout_optimization(&table) {
+            if let Some(inputs) = self.next_layout_optimization(&table, apply_guards) {
                 table = self
                     .merge_batch(name, id, inputs, "layout optimization")
                     .await?;
@@ -293,11 +311,11 @@ impl CompacterActor {
     }
 
     /// Pick one group of files below the target size from a single partition.
-    /// A normal merge stops as soon as its input reaches 1.3 times the target.
-    /// A pile of at least 100 files that remains below that threshold uses the
-    /// balance test, repeatedly discarding its largest file until the remainder
-    /// is balanced enough to merge or no useful group remains.
-    fn next_small_batch(&self, table: &CatalogTable) -> Option<Vec<FileRef>> {
+    /// A normal merge stops as soon as its input reaches the configured merge
+    /// target. A pile that reaches the configured file-count threshold first
+    /// uses the balance test, repeatedly discarding its largest file until the
+    /// remainder is balanced enough to merge or no useful group remains.
+    fn next_small_batch(&self, table: &CatalogTable, apply_guards: bool) -> Option<Vec<FileRef>> {
         let mut by_partition: Vec<(Option<crate::PartitionValues>, Vec<&DeltaFileEntry>)> =
             Vec::new();
         for entry in table.file_entries() {
@@ -313,15 +331,26 @@ impl CompacterActor {
             }
         }
 
-        by_partition
-            .into_iter()
-            .find_map(|(_, files)| small_file_batch(files, self.target_bytes))
+        by_partition.into_iter().find_map(|(_, files)| {
+            if apply_guards {
+                small_file_batch(files, self.merge_target_bytes, self.min_files)
+            } else {
+                (files.len() >= 2)
+                    .then(|| files.into_iter().map(|entry| entry.file.clone()).collect())
+            }
+        })
     }
 
     /// Find the highest-overlap pair of already-large files. Pairs never cross
     /// partitions. Sort columns are considered in table order; a column only
     /// defers to the next one when both files are the same singleton on it.
-    fn next_layout_optimization(&self, table: &CatalogTable) -> Option<Vec<FileRef>> {
+    /// Guardless selection still requires positive overlap: rewriting disjoint
+    /// ranges cannot improve their layout.
+    fn next_layout_optimization(
+        &self,
+        table: &CatalogTable,
+        apply_guards: bool,
+    ) -> Option<Vec<FileRef>> {
         if table.sort_by().is_empty() {
             return None;
         }
@@ -347,7 +376,8 @@ impl CompacterActor {
             else {
                 continue;
             };
-            if score >= LAYOUT_OVERLAP_THRESHOLD
+            if score > 0.0
+                && (!apply_guards || score >= LAYOUT_OVERLAP_THRESHOLD)
                 && best.as_ref().is_none_or(|(best, _)| score > *best)
             {
                 best = Some((score, vec![left.file.clone(), right.file.clone()]));
@@ -357,19 +387,22 @@ impl CompacterActor {
     }
 }
 
-fn small_file_batch(files: Vec<&DeltaFileEntry>, target_bytes: u64) -> Option<Vec<FileRef>> {
-    let target = target_bytes as f64 * TARGET_SIZE_MULTIPLIER;
+fn small_file_batch(
+    files: Vec<&DeltaFileEntry>,
+    merge_target_bytes: u64,
+    min_files: usize,
+) -> Option<Vec<FileRef>> {
     let mut total = 0u64;
     let mut batch = Vec::with_capacity(files.len());
     for file in files {
         total += file.file.size;
         batch.push(file);
-        if total as f64 >= target {
+        if batch.len() >= 2 && total >= merge_target_bytes {
             return Some(batch.into_iter().map(|entry| entry.file.clone()).collect());
         }
     }
 
-    if batch.len() < SMALL_FILE_COUNT_TRIGGER {
+    if batch.len() < min_files.max(2) {
         return None;
     }
 
@@ -469,9 +502,11 @@ mod tests {
     }
 
     #[test]
-    fn small_files_merge_at_one_point_three_times_target() {
+    fn small_files_merge_at_configured_target() {
         let files = [file_entry("a", 70), file_entry("b", 59), file_entry("c", 1)];
-        let batch = small_file_batch(files.iter().collect(), 100).unwrap();
+
+        let batch = small_file_batch(files.iter().collect(), 130, 100).unwrap();
+
         assert_eq!(
             batch.iter().map(|file| file.size).collect::<Vec<_>>(),
             [70, 59, 1]
@@ -484,17 +519,23 @@ mod tests {
         let mut files = vec![file_entry("outlier", 500 * MIB)];
         files.extend((0..99).map(|index| file_entry(&format!("small-{index}"), MIB)));
 
-        let batch = small_file_batch(files.iter().collect(), 1024 * MIB).unwrap();
+        let batch = small_file_batch(files.iter().collect(), 2 * 1024 * MIB, 100).unwrap();
+
         assert_eq!(batch.len(), 99, "the check continues below 100 files");
         assert!(batch.iter().all(|file| file.path.as_str() != "outlier"));
     }
 
     #[test]
-    fn small_file_fallback_requires_one_hundred_files() {
-        let files: Vec<_> = (0..99)
+    fn small_file_fallback_uses_configured_minimum() {
+        let files: Vec<_> = (0..5)
             .map(|index| file_entry(&format!("small-{index}"), 1))
             .collect();
-        assert!(small_file_batch(files.iter().collect(), 100).is_none());
+
+        let allowed = small_file_batch(files.iter().collect(), 100, 5);
+        let waiting = small_file_batch(files.iter().collect(), 100, 6);
+
+        assert_eq!(allowed.unwrap().len(), 5);
+        assert!(waiting.is_none());
     }
 
     /// Write `values` as a small SNAPPY Parquet file (single Int64 `Timestamp`
@@ -668,7 +709,13 @@ mod tests {
             .unwrap()
             .block_on(async move {
                 let tables = datastore.tables();
-                let (compacter, actor) = CompacterHandle::new(target_bytes, None, datastore);
+                let (compacter, actor) = CompacterHandle::new(
+                    target_bytes,
+                    default_merge_target_bytes(target_bytes),
+                    DEFAULT_MIN_FILES_TO_MERGE,
+                    None,
+                    datastore,
+                );
                 let actor = tokio::spawn(actor.run());
                 for (name, table) in tables {
                     compacter.compact(name, table, false).await.unwrap();
@@ -679,6 +726,8 @@ mod tests {
 
     fn run_command(
         target_bytes: u64,
+        merge_target_bytes: u64,
+        min_files: usize,
         datastore: Arc<DeltaDatastore>,
         name: SchemaQualifiedTableName,
         table: CatalogTable,
@@ -689,7 +738,13 @@ mod tests {
             .build()
             .unwrap()
             .block_on(async move {
-                let (compacter, actor) = CompacterHandle::new(target_bytes, None, datastore);
+                let (compacter, actor) = CompacterHandle::new(
+                    target_bytes,
+                    merge_target_bytes,
+                    min_files,
+                    None,
+                    datastore,
+                );
                 let actor = tokio::spawn(actor.run());
                 let sweeps = compacter.compact(name, table, final_sweep).await.unwrap();
                 actor.abort();
@@ -728,7 +783,15 @@ mod tests {
             .unwrap();
         datastore.refresh_from_store().unwrap();
 
-        let sweeps = run_command(target, datastore.clone(), name.clone(), captured, false);
+        let sweeps = run_command(
+            target,
+            default_merge_target_bytes(target),
+            DEFAULT_MIN_FILES_TO_MERGE,
+            datastore.clone(),
+            name.clone(),
+            captured,
+            false,
+        );
 
         assert_eq!(sweeps, 1);
         assert_eq!(datastore.table_handle(&name).unwrap().file_refs().len(), 3);
@@ -736,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn final_command_compacts_until_no_partition_has_work() {
+    fn final_command_bypasses_small_file_guards() {
         let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
         let db = tempfile::tempdir().unwrap();
         let encoded = tempfile::tempdir().unwrap();
@@ -766,10 +829,84 @@ mod tests {
             .unwrap()
             + 1;
 
-        let sweeps = run_command(target, datastore.clone(), name.clone(), table, true);
+        let guarded_sweeps = run_command(
+            target,
+            u64::MAX,
+            usize::MAX,
+            datastore.clone(),
+            name.clone(),
+            table.clone(),
+            false,
+        );
+        let guarded_files = datastore.table_handle(&name).unwrap().file_refs().len();
+        let final_sweeps = run_command(
+            target,
+            u64::MAX,
+            usize::MAX,
+            datastore.clone(),
+            name.clone(),
+            table,
+            true,
+        );
 
-        assert_eq!(sweeps, 3);
+        assert_eq!(guarded_sweeps, 1);
+        assert_eq!(guarded_files, 4);
+        assert_eq!(final_sweeps, 3);
         assert_eq!(datastore.table_handle(&name).unwrap().file_refs().len(), 2);
+        dispatch.exit();
+    }
+
+    #[test]
+    fn final_command_accepts_only_positive_layout_overlap() {
+        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
+        let db = tempfile::tempdir().unwrap();
+        let adopted = db.path().join("events");
+        std::fs::create_dir_all(&adopted).unwrap();
+        write_parquet_file(&adopted, "a.parquet", vec![0, 17]);
+        write_parquet_file(&adopted, "b.parquet", vec![15, 32]);
+        write_parquet_file(&adopted, "c.parquet", vec![100, 110]);
+        let datastore =
+            DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        create_table(
+            &datastore,
+            dispatch.dispatcher(),
+            "events",
+            Some(&adopted),
+            true,
+        );
+        let name = SchemaQualifiedTableName::in_default_schema("events");
+        let table = datastore.table_handle(&name).unwrap();
+
+        let guarded_sweeps = run_command(
+            1,
+            u64::MAX,
+            usize::MAX,
+            datastore.clone(),
+            name.clone(),
+            table.clone(),
+            false,
+        );
+        let guarded_files = datastore.table_handle(&name).unwrap().file_refs().len();
+        let final_sweeps = run_command(
+            1,
+            u64::MAX,
+            usize::MAX,
+            datastore.clone(),
+            name.clone(),
+            table,
+            true,
+        );
+
+        assert_eq!(guarded_sweeps, 1);
+        assert_eq!(guarded_files, 3);
+        assert_eq!(final_sweeps, 2);
+        let files = datastore.table_handle(&name).unwrap().file_refs();
+        assert_eq!(files.len(), 2);
+        assert!(
+            files
+                .iter()
+                .any(|file| file.path.as_str().ends_with("c.parquet"))
+        );
         dispatch.exit();
     }
 
@@ -809,7 +946,7 @@ mod tests {
             .iter()
             .map(|f| f.size)
             .sum();
-        let target = (total as f64 / TARGET_SIZE_MULTIPLIER).floor() as u64;
+        let target = (total as f64 / DEFAULT_MERGE_TARGET_MULTIPLIER).floor() as u64;
         run_one_sweep(target, datastore.clone());
 
         assert_eq!(
@@ -1044,7 +1181,7 @@ mod tests {
             .iter()
             .map(|f| f.size)
             .sum();
-        let target = (total as f64 / TARGET_SIZE_MULTIPLIER).floor() as u64;
+        let target = (total as f64 / DEFAULT_MERGE_TARGET_MULTIPLIER).floor() as u64;
         run_one_sweep(target, datastore.clone());
 
         // One merged object replaced the two inputs, in the store and in the

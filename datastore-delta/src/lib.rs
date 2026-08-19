@@ -33,7 +33,8 @@ pub use catalog::{
 };
 pub use compact::{
     CompacterHandle, CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL,
-    DEFAULT_REFRESH_INTERVAL, MaintenanceConfig, compact_table_files,
+    DEFAULT_MIN_FILES_TO_MERGE, DEFAULT_REFRESH_INTERVAL, MaintenanceConfig, compact_table_files,
+    default_merge_target_bytes,
 };
 pub use manifest::{
     ColumnStatFilter, DeltaFileEntry, PartitionEqFilter, PartitionValues, pivot_scalar,

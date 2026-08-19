@@ -65,8 +65,10 @@ datastore is attached as a database of its own name, so a query reads any other
 one by qualifying it: `SELECT * FROM warm.main.tbl`. `kind` is the datastore
 format (`delta` today); the storage backend is inferred from `location` (a plain
 path is local, an `s3://` URI is S3, a `gs://` URI is Google Cloud Storage).
-Compaction is configured per datastore
-with `compact` (and the optional `compact_bytes` tuning);
+Compaction is configured per datastore with `compact`. `compact_bytes` sets the
+small-file boundary, `compact_merge_bytes` sets the accumulated bytes that
+immediately trigger a merge (by default 1.3 times that boundary), and
+`compact_min_files` sets when the balance fallback is allowed (100 by default);
 it is off by default and should run in only one process per datastore:
 
 ```yaml
@@ -81,6 +83,8 @@ metastore:
       location: s3://analytics/warm/  # S3 store
       compact: true                   # this datastore compacts itself
       compact_bytes: 128m
+      compact_merge_bytes: 166.4m
+      compact_min_files: 100
     cold:
       kind: delta
       location: gs://analytics/cold/  # Google Cloud Storage store

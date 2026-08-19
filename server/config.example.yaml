@@ -57,6 +57,8 @@ metastore:
       location: s3://example-bucket/warm/
       compact: true
       compact_bytes: 128m
+      compact_merge_bytes: 166.4m
+      compact_min_files: 100
 
     # A `gs://` location opens a Google Cloud Storage store.
     cold:
