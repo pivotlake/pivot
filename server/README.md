@@ -66,7 +66,7 @@ one by qualifying it: `SELECT * FROM warm.main.tbl`. `kind` is the datastore
 format (`delta` today); the storage backend is inferred from `location` (a plain
 path is local, an `s3://` URI is S3, a `gs://` URI is Google Cloud Storage).
 Compaction is configured per datastore
-with `compact` (and the optional `compact_bytes` / `compact_min_files` tuning);
+with `compact` (and the optional `compact_bytes` tuning);
 it is off by default and should run in only one process per datastore:
 
 ```yaml
