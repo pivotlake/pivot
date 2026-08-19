@@ -149,6 +149,24 @@
   font-size: 11px;
 }
 
+/* A command as it appears in a terminal: an inset screen a step away from the
+   card behind it, a dimmed prompt, and the command itself at full contrast. */
+.arch-term {
+  fill: var(--sl-color-black);
+  stroke: var(--docs-code-border);
+  stroke-width: 1;
+}
+
+.arch-prompt {
+  fill: var(--sl-color-gray-4);
+  font-size: 11px;
+}
+
+.arch-cmd {
+  fill: var(--sl-color-gray-1);
+  font-size: 11px;
+}
+
 /* Card internals: header strips, worker cells, terminal lines, badges. */
 .arch-strip {
   fill: var(--sl-color-bg-sidebar);
