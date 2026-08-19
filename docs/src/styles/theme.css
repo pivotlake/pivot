@@ -159,7 +159,10 @@
 }
 
 .arch-cmd {
-  fill: var(--sl-color-gray-1);
+  /* Brighter than the labels around it, so the prompt still reads as a
+     terminal, but no brighter than a table name. At gray-1 a command inside a
+     small card outranked the panel headings above it. */
+  fill: var(--sl-color-gray-2);
   font-size: 11px;
 }
 
