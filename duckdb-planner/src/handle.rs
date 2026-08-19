@@ -213,6 +213,7 @@ impl<'plan> LogicalOp<'plan> {
             L::LOGICAL_COMPARISON_JOIN => {
                 Operator::ComparisonJoin(ComparisonJoin { raw: self.raw })
             }
+            L::LOGICAL_PIVOT_MATERIALIZE => Operator::PivotMaterialize,
             L::LOGICAL_DELIM_JOIN => Operator::DelimJoin(DelimJoin { raw: self.raw }),
             L::LOGICAL_DELIM_GET => Operator::DelimGet(DelimGet { raw: self.raw }),
             L::LOGICAL_MATERIALIZED_CTE => {
@@ -260,9 +261,12 @@ pub enum Operator<'plan> {
     CopyFromStdin(CopyFromStdin<'plan>),
     /// `CREATE USER <name> [PASSWORD '<password>']`.
     CreateUser(CreateUser<'plan>),
-    /// A comparison join; the consumer only handles the late-materialization
-    /// shape (see [`ComparisonJoin::is_late_materialization`]).
+    /// A user IN/EXISTS comparison join.
     ComparisonJoin(ComparisonJoin<'plan>),
+    /// The late-materialization rewrite's fetch: child 0 is the wide get
+    /// describing the columns to fetch for the rows surviving child 1 (the
+    /// narrow pipeline).
+    PivotMaterialize,
     /// A comparison join that additionally de-duplicates correlation columns
     /// from one side and publishes them to the [`DelimGet`]s under the other.
     DelimJoin(DelimJoin<'plan>),
@@ -871,12 +875,6 @@ impl<'plan> CreateUser<'plan> {
 }
 
 impl<'plan> ComparisonJoin<'plan> {
-    /// Whether this is the SEMI join DuckDB's late_materialization optimizer
-    /// produces (vs a user IN/EXISTS), which the consumer collapses into a fetch.
-    pub fn is_late_materialization(self) -> Result<bool> {
-        Ok(ffi::lo_is_late_materialization_join(self.raw)?)
-    }
-
     /// The join's [`JoinType`] (INNER/SEMI/...).
     pub fn join_type(self) -> Result<JoinType> {
         Ok(JoinType::from_u8(ffi::lo_join_type(self.raw)?))

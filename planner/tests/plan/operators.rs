@@ -5,10 +5,9 @@ use rstest::rstest;
 
 // A user `IN`/`EXISTS` subquery lowers to a semi-join, which pivot runs as a
 // probe-side semi join: the probe row comes out once, and no build column comes
-// out at all. It must NOT be mistaken for the row-id semi-join DuckDB's late
-// materialization produces, which the bridge collapses into a Materialize.
+// out at all.
 #[rstest]
-fn in_subquery_semijoin_is_a_join_not_late_materialization(mut testing_planner: TestingPlanner) {
+fn in_subquery_semijoin_is_a_join(mut testing_planner: TestingPlanner) {
     let plan = testing_planner
         .plan("SELECT a FROM example_table WHERE a IN (SELECT b FROM example_table WHERE b > 20)")
         .unwrap();

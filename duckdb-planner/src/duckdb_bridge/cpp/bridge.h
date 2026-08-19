@@ -217,9 +217,6 @@ rust::String lo_create_user_name(const LogicalOperator &op);
 bool lo_create_user_has_password(const LogicalOperator &op);
 rust::String lo_create_user_password(const LogicalOperator &op);
 
-// ---- ComparisonJoin: late materialization ----
-bool lo_is_late_materialization_join(const LogicalOperator &op);
-
 // ---- CTE ----
 size_t lo_cte_table_index(const LogicalOperator &op);
 size_t lo_cte_ref_index(const LogicalOperator &op);

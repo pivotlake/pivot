@@ -9,10 +9,10 @@
 //!
 //! Each node's construction is a `from_handle` on its Pivot type, implemented in
 //! the [`operator`] and [`expression`] submodules; this module drives the walk and
-//! the DuckDB-specific tree shaping that no single node owns: collapsing the
-//! late-materialization SEMI join into a [`Materialize`], lifting a scan's
-//! pushed-down `table_filters` back into a [`Filter`], replaying a filter's
-//! `projection_map`, and stripping the threaded-up row-id column.
+//! the DuckDB-specific tree shaping that no single node owns: building the
+//! late-materialization node into a [`Materialize`], lifting a scan's
+//! pushed-down `table_filters` back into a [`Filter`], and replaying a
+//! filter's `projection_map`.
 
 use dispatch::RangeCompare;
 use dispatch::RowDelivery;
@@ -23,7 +23,6 @@ use duckdb_planner::duckdb_bridge::duckdb_types::{ExpressionType, JoinType};
 use duckdb_planner::handle::{
     ComparisonJoin as ComparisonJoinView, DelimGet as DelimGetView, DelimJoin as DelimJoinView,
     JoinCondition, JoinConditionEntry, Operator as DuckOperator, TableScan as TableScanView,
-    rowid_column_id,
 };
 
 use crate::catalog::BoundTable;
@@ -100,12 +99,12 @@ fn render_variant_outputs(plan: PlanNode) -> Result<PlanNode, crate::compile::Er
 fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, OperatorError> {
     let kind = op.operator()?;
 
-    // DuckDB's late_materialization optimizer rewrites a wide Top-N/Limit scan
-    // into a row-id SEMI join. Collapse that into pivot's Materialize rather than
-    // executing a join (only the late-mat shape, not a user IN/EXISTS semi-join).
-    if let DuckOperator::ComparisonJoin(join) = kind
-        && join.is_late_materialization()?
-    {
+    // DuckDB's late_materialization optimizer emits an explicit materialize
+    // node (see the fork's LogicalPivotMaterialize): child 0 is the wide Get
+    // describing the fetch, child 1 the narrow pipeline. Its children walk
+    // specially (the wide Get is data, not a scan to execute), so it cannot go
+    // through the generic loop below.
+    if matches!(kind, DuckOperator::PivotMaterialize) {
         return build_late_materialization(op, ctx);
     }
 
@@ -128,15 +127,6 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         .into_iter()
         .map(|child| build_node(child, ctx))
         .collect::<Result<Vec<_>, _>>()?;
-
-    // Drop the row-id ORDER BY DuckDB synthesizes above a late-materialized plain
-    // LIMIT: pivot can't run it and doesn't need it. The ORDER BY is a
-    // pass-through, so returning its child keeps column positions unchanged.
-    if matches!(kind, DuckOperator::OrderBy(_))
-        && inputs.first().is_some_and(is_materialize_over_empty_scan)
-    {
-        return Ok(inputs.into_iter().next().unwrap());
-    }
 
     // DuckDB's optimizer pushes simple `column <op> constant` predicates down
     // into the scan itself (its `table_filters`), so the `Filter` operator that
@@ -228,6 +218,9 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         // A CTE is walked above, before its children.
         DuckOperator::MaterializedCte(_) => {
             unreachable!("a CTE walks its own children")
+        }
+        DuckOperator::PivotMaterialize => {
+            unreachable!("a materialize walks its own children")
         }
         DuckOperator::Unsupported => {
             return Err(OperatorError::Unsupported(format!(
@@ -1347,30 +1340,20 @@ fn build_late_materialization(
     op: LogicalOp<'_>,
     ctx: &mut BuildCtx,
 ) -> Result<PlanNode, OperatorError> {
-    // The LHS is the wide Get whose columns the fetch re-reads. Read its full
-    // output description (storage index, type, pushed extract path) so a
-    // variant field extract DuckDB pushed into the Get survives the collapse;
-    // fetching by bare storage index would hand back the whole document column
-    // where the query asked for a single field. The row-id column only served
-    // the SEMI join being discarded, so it is dropped.
+    // Child 0 is the wide Get describing the fetch. Read its full output
+    // description (storage index, type, pushed extract path) so a variant
+    // field extract DuckDB pushed into the Get survives; fetching by bare
+    // storage index would hand back the whole document column where the query
+    // asked for a single field.
     let DuckOperator::TableScan(wide_scan) = op.child(0)?.operator()? else {
         return Err(OperatorError::Unsupported(
             "late materialization without a base-table wide scan is not supported".to_string(),
         ));
     };
-    let rowid = rowid_column_id();
-    let columns = build_scan_columns(
-        wide_scan
-            .output_columns()?
-            .into_iter()
-            .filter(|(column_idx, _, _)| *column_idx != rowid)
-            .collect(),
-    )?;
+    let columns = build_scan_columns(wide_scan.output_columns()?)?;
 
-    // The narrow pipeline is the RHS; translate it normally, then drop the row-id
-    // column DuckDB threaded through it for the join we're discarding.
+    // Child 1 is the narrow pipeline; translate it normally.
     let mut child = build_node(op.child(1)?, ctx)?;
-    strip_trailing_rowid(&mut child);
     // Flag the narrow scan to emit row-group metadata, and clone its table for the
     // Materialize so both read (a clone of) the same table.
     let table = prepare_narrow_scan(&mut child).ok_or_else(|| {
@@ -1386,60 +1369,11 @@ fn build_late_materialization(
     })
 }
 
-// ---- Late-materialization tree surgery (operates on the built Pivot tree) ----
-
-/// Whether `node` is a late-mat Materialize whose narrow scan reads no data
-/// columns (the shape of a plain LIMIT, once the row-id column is stripped).
-fn is_materialize_over_empty_scan(node: &PlanNode) -> bool {
-    if node.name != "Materialize" {
-        return false;
-    }
-    let mut cur = node;
-    while let Some(child) = cur.inputs.first() {
-        cur = child;
-        if let Operator::Input(input) = &cur.operator {
-            return input.columns.is_empty();
-        }
-    }
-    false
-}
-
-/// Remove DuckDB's row-id column from an already-built late-mat narrow subtree.
-/// DuckDB appends the row-id last at every level, so dropping it never shifts
-/// another column's position. Returns the output position that held the row-id.
-fn strip_trailing_rowid(node: &mut PlanNode) -> Option<usize> {
-    let rowid = rowid_column_id();
-    if let Operator::Input(input) = &mut node.operator {
-        let pos = input
-            .columns
-            .iter()
-            .position(|e| matches!(e, Expression::Ref(r) if r.column_idx == rowid))?;
-        input.columns.remove(pos);
-        return Some(pos);
-    }
-
-    let child_rowid = strip_trailing_rowid(node.inputs.first_mut()?);
-
-    // A projection that carried the row-id up references it positionally in its
-    // child's output; drop that one entry. Other operators pass columns through.
-    if let (Operator::Projection(proj), Some(rowid_pos)) = (&mut node.operator, child_rowid)
-        && let Some(pos) = proj
-            .projections
-            .iter()
-            .position(|e| matches!(e, Expression::Ref(r) if r.column_idx == rowid_pos))
-    {
-        proj.projections.remove(pos);
-        return Some(pos);
-    }
-    child_rowid
-}
-
-/// Walk a late-mat narrow subtree to its scan, flag it to emit row-group
+/// Walk the late-mat narrow subtree to its scan, flag it to emit row-group
 /// metadata, and return a clone of its table (which the Materialize re-reads).
-///
-/// HACK: this finds the scan positionally (first input until an `Input` turns
-/// up), which silently tags the wrong scan if the narrow subtree ever branches.
-/// Should be rewritten to key off the row-id scan `strip_trailing_rowid` touched.
+/// The narrow subtree is a straight projection/filter/limit chain over one
+/// scan (the rewrite only fires on that shape), so the first `Input` found is
+/// the one.
 fn prepare_narrow_scan(node: &mut PlanNode) -> Option<Box<dyn BoundTable>> {
     if let Operator::Input(input) = &mut node.operator {
         input.emit_row_group_metadata = true;
