@@ -9,10 +9,12 @@ use crate::manifest::{
 };
 use crate::parquet::{ParquetTable, RowGroupMetadata};
 use crate::store::{self, DataFile, FileRef, ObjectPath, ObjectStore};
-use arrow_array::{ArrayRef, Scalar};
+use arrow_array::{ArrayRef, Datum, Scalar};
+use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use crossbeam_deque::{Injector, Steal};
+use datastore::{DatastoreColumnMetadata, DatastoreFileMetadata, DatastoreTableMetadata};
 use dispatch::{DataFlowDispatcher, Projection};
-use planner::catalog::Column;
+use planner::catalog::{Column, SchemaQualifiedTableName};
 
 /// One data file of a table, materialized: its Delta log entry
 /// ([`DeltaFileEntry`] -- identity, partition tuple, stats) paired with the row
@@ -47,6 +49,15 @@ impl TableFile {
     /// one whose commit failed).
     pub(crate) fn file_ref(&self) -> &FileRef {
         &self.entry.file
+    }
+
+    /// What this file's bytes hold decoded, summed over its column chunks.
+    fn uncompressed_bytes(&self) -> u64 {
+        self.row_groups
+            .iter()
+            .flat_map(|row_group| row_group.columns.iter())
+            .map(|chunk| chunk.total_uncompressed_size.max(0) as u64)
+            .sum()
     }
 }
 
@@ -454,6 +465,106 @@ impl CatalogTable {
     /// merge candidates, and names in a compaction swap.
     pub fn file_refs(&self) -> Vec<FileRef> {
         self.files.iter().map(|f| f.entry.file.clone()).collect()
+    }
+
+    /// This table as the cross-datastore catalog describes it, under the `name`
+    /// it is currently indexed by: the columns it declares with what they cost,
+    /// and the files it holds.
+    pub(crate) fn metadata(&self, name: SchemaQualifiedTableName) -> DatastoreTableMetadata {
+        let column_bytes = self.column_bytes();
+        let columns = self
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(position, column)| {
+                let (total_bytes, total_bytes_uncompressed) = column_bytes[position];
+                DatastoreColumnMetadata {
+                    name: column.name.clone(),
+                    column_type: column.col_type.clone(),
+                    position,
+                    total_bytes,
+                    total_bytes_uncompressed,
+                    is_partition_key: self.partition_by.contains(&column.name),
+                    is_sort_key: self.sort_by.contains(&column.name),
+                }
+            })
+            .collect();
+
+        let files = self
+            .files
+            .iter()
+            .map(|file| DatastoreFileMetadata {
+                path: file.entry.file.path.as_str().to_string(),
+                size: file.entry.file.size,
+                total_bytes_uncompressed: file.uncompressed_bytes(),
+                partition: self.format_partition(&file.entry.partition),
+            })
+            .collect();
+
+        DatastoreTableMetadata {
+            name,
+            id: self.id.to_string(),
+            columns,
+            sort_by: self.sort_by.clone(),
+            partition_by: self.partition_by.clone(),
+            total_rows: self
+                .files
+                .iter()
+                .flat_map(|file| file.row_groups.iter())
+                .map(|row_group| row_group.num_rows.max(0) as u64)
+                .sum(),
+            total_bytes: self.files.iter().map(|file| file.entry.file.size).sum(),
+            total_bytes_uncompressed: self.files.iter().map(TableFile::uncompressed_bytes).sum(),
+            files,
+        }
+    }
+
+    /// What each declared column costs across the table's committed files: the
+    /// bytes it occupies in storage, and what they hold decoded. Chunks are per
+    /// leaf, so a nested column is charged for every leaf it spans; a file that
+    /// does not carry a column contributes nothing to it.
+    fn column_bytes(&self) -> Vec<(u64, u64)> {
+        let position_by_name: HashMap<&str, usize> = self
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(position, column)| (column.name.as_str(), position))
+            .collect();
+
+        let mut totals = vec![(0, 0); self.columns.len()];
+        for row_group in self.files.iter().flat_map(|file| file.row_groups.iter()) {
+            let mut leaf = 0;
+            for field in row_group.schema.fields() {
+                let leaves = crate::parquet::types::leaves::leaf_count(field);
+                if let Some(&position) = position_by_name.get(field.name().as_str()) {
+                    for chunk in &row_group.columns[leaf..leaf + leaves] {
+                        totals[position].0 += chunk.total_compressed_size.max(0) as u64;
+                        totals[position].1 += chunk.total_uncompressed_size.max(0) as u64;
+                    }
+                }
+                leaf += leaves;
+            }
+        }
+        totals
+    }
+
+    /// A file's partition as the catalog reports it: `column=value` pairs in the
+    /// table's partition order, comma-separated. Empty for an unpartitioned
+    /// table, and for a file adopted before the table was partitioned, which
+    /// carries no tuple (or none for some of the columns).
+    fn format_partition(&self, partition: &Option<PartitionValues>) -> String {
+        let Some(values) = partition else {
+            return String::new();
+        };
+        self.partition_by
+            .iter()
+            .filter_map(|column| {
+                let (array, _) = values.get(column)?.get();
+                let formatter = ArrayFormatter::try_new(array, &FormatOptions::default()).ok()?;
+                Some(format!("{column}={}", formatter.value(0)))
+            })
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     /// Each committed file paired with the typed partition tuple recorded for

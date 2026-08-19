@@ -238,7 +238,7 @@ async fn drop_table_cascade_is_rejected(#[future] conn: Conn) {
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
 async fn system_tables_refreshes_after_catalog_changes(#[future] conn: Conn) {
-    let sql = "SELECT datastore_name, schema_name, name \
+    let sql = "SELECT datastore, schema, name \
                FROM system.tables \
                WHERE name = 'system_catalog_refresh'";
 
@@ -293,8 +293,8 @@ async fn system_tables_belong_to_the_system_datastore(#[future] conn: Conn) {
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
 async fn system_table_files_lists_the_files_of_a_table(#[future] conn: Conn) {
-    let sql = "SELECT f.size_bytes \
-               FROM system.table_files f JOIN system.tables t ON f.table_id = t.id \
+    let sql = "SELECT f.size \
+               FROM system.table_files f JOIN system.tables t ON f.\"table\" = t.id \
                WHERE t.name = 'system_files'";
     conn.simple_query("CREATE TABLE system_files (id BIGINT)")
         .await
@@ -316,6 +316,137 @@ async fn system_table_files_lists_the_files_of_a_table(#[future] conn: Conn) {
     );
 }
 
+/// `system.datastores` names every datastore the server serves, the one serving
+/// the relation included.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn system_datastores_lists_every_served_datastore(#[future] conn: Conn) {
+    let rows = select_rows(
+        &conn,
+        "SELECT name, id, type, data_path <> '' FROM system.datastores ORDER BY name",
+    )
+    .await;
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Some("default".into()),
+                Some("default".into()),
+                Some("delta".into()),
+                Some("t".into()),
+            ],
+            vec![
+                Some("system".into()),
+                Some("system".into()),
+                Some("system".into()),
+                Some("f".into()),
+            ],
+        ],
+    );
+}
+
+/// `system.tables` reports how a table is laid out and what it holds, and
+/// `system.columns` describes each of its columns, keyed by the same id the
+/// table answers to.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn system_tables_and_columns_describe_a_table(#[future] conn: Conn) {
+    conn.simple_query(
+        "CREATE TABLE system_described (id BIGINT, region VARCHAR) \
+         WITH (partition_by = 'region', sort_by = 'id')",
+    )
+    .await
+    .unwrap();
+    conn.simple_query("INSERT INTO system_described VALUES (1, 'eu'), (2, 'us')")
+        .await
+        .unwrap();
+
+    let table = select_rows(
+        &conn,
+        "SELECT datastore, schema, sorting_keys, partition_key, total_rows, \
+                total_bytes > 0, total_bytes_uncompressed > 0 \
+         FROM system.tables WHERE name = 'system_described'",
+    )
+    .await;
+    let columns = select_rows(
+        &conn,
+        "SELECT c.name, c.type, c.position, c.is_partition_key, c.is_sort_key, c.total_bytes > 0 \
+         FROM system.columns c JOIN system.tables t ON c.\"table\" = t.id \
+         WHERE t.name = 'system_described' ORDER BY c.position",
+    )
+    .await;
+
+    assert_eq!(
+        table,
+        vec![vec![
+            Some("default".into()),
+            Some("main".into()),
+            Some("id".into()),
+            Some("region".into()),
+            Some("2".into()),
+            Some("t".into()),
+            Some("t".into()),
+        ]],
+    );
+    assert_eq!(
+        columns,
+        vec![
+            vec![
+                Some("id".into()),
+                Some("BIGINT".into()),
+                Some("0".into()),
+                Some("f".into()),
+                Some("t".into()),
+                Some("t".into()),
+            ],
+            vec![
+                Some("region".into()),
+                Some("VARCHAR".into()),
+                Some("1".into()),
+                Some("t".into()),
+                Some("f".into()),
+                Some("t".into()),
+            ],
+        ],
+    );
+}
+
+/// A partitioned table's files report the partition they hold, so the files of
+/// one partition are a query rather than a path convention.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn system_table_files_reports_a_file_partition(#[future] conn: Conn) {
+    conn.simple_query(
+        "CREATE TABLE system_partitioned (id BIGINT, region VARCHAR) \
+         WITH (partition_by = 'region')",
+    )
+    .await
+    .unwrap();
+
+    conn.simple_query("INSERT INTO system_partitioned VALUES (1, 'eu'), (2, 'us')")
+        .await
+        .unwrap();
+
+    let partitions = select_rows(
+        &conn,
+        "SELECT f.partition \
+         FROM system.table_files f JOIN system.tables t ON f.\"table\" = t.id \
+         WHERE t.name = 'system_partitioned' ORDER BY f.partition",
+    )
+    .await;
+    assert_eq!(
+        partitions,
+        vec![
+            vec![Some("region=eu".into())],
+            vec![Some("region=us".into())],
+        ],
+    );
+}
+
 #[rstest]
 #[awt]
 #[tokio::test(flavor = "multi_thread")]
@@ -332,8 +463,8 @@ async fn system_datastore_is_read_only(#[future] conn: Conn) {
 
     let insert = conn
         .simple_query(
-            "INSERT INTO system.tables \
-             VALUES ('default', 'main', 'not_allowed', 'not-an-id')",
+            "INSERT INTO system.datastores \
+             VALUES ('not_allowed', 'not_allowed', 'delta', '/tmp')",
         )
         .await
         .unwrap_err();
@@ -399,7 +530,7 @@ async fn system_memory_blocks_accounts_for_every_block(#[future] conn: Conn) {
 
     let by_state = select_rows(
         &conn,
-        "SELECT state, count(*), sum(size_bytes) \
+        "SELECT state, count(*), sum(size) \
          FROM system.memory_blocks GROUP BY state ORDER BY state",
     )
     .await;

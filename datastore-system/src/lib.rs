@@ -13,10 +13,10 @@
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringViewArray};
+use arrow_array::{ArrayRef, BooleanArray, Int64Array, RecordBatch, StringViewArray};
 use arrow_schema::{Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use datastore::{DatastoreTableMetadata, DatastoreTransaction};
+use datastore::{DatastoreColumnMetadata, DatastoreTableMetadata, DatastoreTransaction};
 use dispatch::{
     DataFlowDispatcher, MemoryBlockState, MemoryBlockStatus, OneShotNullaryFactory, Projection,
     RecordBatchOperatorSpec, memory_ctx, values_input,
@@ -26,12 +26,18 @@ use planner::catalog::{
     DynamicScanPredicate, Error as CatalogError, Result, SchemaCreation, SchemaQualifiedTableName,
     TableCreation, TableDrop, TableReference, TableRevision,
 };
-use planner::types::{Type, physical_arrow_type};
+use planner::types::{Type, physical_arrow_type, sql_type_name};
 
 pub const DATASTORE_NAME: &str = "system";
+const DATASTORES_NAME: &str = "datastores";
 const TABLES_NAME: &str = "tables";
+const COLUMNS_NAME: &str = "columns";
 const TABLE_FILES_NAME: &str = "table_files";
 const MEMORY_BLOCKS_NAME: &str = "memory_blocks";
+
+/// The type `system.datastores` reports this datastore itself as. It stores
+/// nothing, so it is neither a Delta datastore nor any other stored format.
+const SYSTEM_DATASTORE_KIND: &str = "system";
 
 /// A statement this datastore cannot serve. Its relations are assembled per
 /// query from the datastores it is composed with, so there is nothing for a
@@ -46,18 +52,25 @@ pub enum Error {
     CreateSchema(String),
 }
 
-/// How one relation is built from the global inventory. What it returns decides
-/// how the relation is served: rows the inventory already holds, or a scan that
-/// reads them when the query runs.
-type BuildRelation = fn(TableReference, Vec<GlobalTableMetadata>) -> Box<dyn BoundTable>;
+/// One entry in the list this transaction is built from: how the catalog serves
+/// one datastore, and the sub-transaction the query has open against it. The
+/// `system` datastore is never one of these -- it is the datastore these are
+/// handed to, and it describes itself.
+pub struct DatastoreEntry {
+    pub name: String,
+    pub kind: String,
+    pub data_path: String,
+    pub transaction: Arc<dyn DatastoreTransaction>,
+}
 
-/// Every relation this datastore serves. The one place a system table is
-/// registered: binding one, and reporting it in the inventory, both read this.
-const RELATIONS: [(&str, BuildRelation); 3] = [
-    (TABLES_NAME, build_tables_relation),
-    (TABLE_FILES_NAME, build_table_files_relation),
-    (MEMORY_BLOCKS_NAME, build_memory_blocks_relation),
-];
+/// One datastore as `system.datastores` describes it. The datastore serving the
+/// relation describes itself this way too, and it has no transaction, so this
+/// is what the inventory carries rather than the whole [`DatastoreEntry`].
+struct DatastoreDescription {
+    name: String,
+    kind: String,
+    data_path: String,
+}
 
 /// One table paired with the datastore that owns it. Datastores only know their
 /// schema-qualified names; the inventory adds this final qualifier.
@@ -66,32 +79,156 @@ struct GlobalTableMetadata {
     table: DatastoreTableMetadata,
 }
 
+/// Everything the relations are built from: the datastores this transaction
+/// spans, and every table each of them holds. Assembled once per binding, so
+/// the relations of one query describe one view of the catalog.
+struct Inventory {
+    datastores: Vec<DatastoreDescription>,
+    tables: Vec<GlobalTableMetadata>,
+}
+
+/// How one relation is built from the global inventory, over the columns it
+/// declares. What it returns decides how the relation is served: rows the
+/// inventory already holds, or a scan that reads them when the query runs.
+type BuildRelation = fn(TableReference, Vec<Column>, &Inventory) -> Box<dyn BoundTable>;
+
+/// One relation this datastore serves, as it is registered: what reaches it,
+/// the columns it serves in order, and how its rows are come by. The columns
+/// are written out rather than built, so a relation can be described (in
+/// `system.columns`, like any other table) without being built. Contrast
+/// [`Relation`], which is one bound instance of a registered relation.
+struct SystemRelation {
+    name: &'static str,
+    columns: &'static [(&'static str, Type)],
+    build: BuildRelation,
+}
+
+/// Every relation this datastore serves. The one place a system table is
+/// registered: binding one, and reporting it in the inventory, both read this.
+const RELATIONS: [SystemRelation; 5] = [
+    SystemRelation {
+        name: DATASTORES_NAME,
+        columns: &[
+            ("name", Type::Utf8),
+            ("id", Type::Utf8),
+            ("type", Type::Utf8),
+            ("data_path", Type::Utf8),
+        ],
+        build: build_datastores,
+    },
+    SystemRelation {
+        name: TABLES_NAME,
+        columns: &[
+            ("datastore", Type::Utf8),
+            ("schema", Type::Utf8),
+            ("name", Type::Utf8),
+            ("id", Type::Utf8),
+            ("sorting_keys", Type::Utf8),
+            ("partition_key", Type::Utf8),
+            ("total_rows", Type::Int64),
+            ("total_bytes", Type::Int64),
+            ("total_bytes_uncompressed", Type::Int64),
+        ],
+        build: build_tables,
+    },
+    SystemRelation {
+        name: COLUMNS_NAME,
+        columns: &[
+            ("datastore", Type::Utf8),
+            ("table", Type::Utf8),
+            ("name", Type::Utf8),
+            ("type", Type::Utf8),
+            ("position", Type::Int64),
+            ("total_bytes", Type::Int64),
+            ("total_bytes_uncompressed", Type::Int64),
+            ("is_partition_key", Type::Boolean),
+            ("is_sort_key", Type::Boolean),
+        ],
+        build: build_columns,
+    },
+    SystemRelation {
+        name: TABLE_FILES_NAME,
+        columns: &[
+            ("table", Type::Utf8),
+            ("path", Type::Utf8),
+            ("partition", Type::Utf8),
+            ("size", Type::Int64),
+            ("total_bytes_uncompressed", Type::Int64),
+        ],
+        build: build_table_files,
+    },
+    SystemRelation {
+        name: MEMORY_BLOCKS_NAME,
+        columns: &[
+            ("slot", Type::Int64),
+            ("node", Type::Int64),
+            ("state", Type::Utf8),
+            ("readers", Type::Int64),
+            ("size", Type::Int64),
+        ],
+        build: build_memory_blocks,
+    },
+];
+
 /// The `system` datastore's transaction: the sub-transaction of every other
 /// datastore, since each of its relations is assembled from them all. The
 /// composite opens them before building this, so a query that reads a datastore
 /// directly and through `system.tables` reads one snapshot of it either way.
-#[derive(Debug)]
 pub struct SystemTransaction {
-    datastores: Vec<(String, Arc<dyn DatastoreTransaction>)>,
+    datastores: Vec<DatastoreEntry>,
+}
+
+impl Debug for SystemTransaction {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SystemTransaction")
+            .field(
+                "datastores",
+                &self
+                    .datastores
+                    .iter()
+                    .map(|datastore| datastore.name.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl SystemTransaction {
-    pub fn new(datastores: Vec<(String, Arc<dyn DatastoreTransaction>)>) -> Self {
+    pub fn new(datastores: Vec<DatastoreEntry>) -> Self {
         Self { datastores }
     }
 
-    /// Every table of every datastore, this one included: the inventory both
-    /// relations are built from. Listing its own relations is what lets
-    /// `system.tables` describe the datastore serving it.
-    fn global_tables(&self) -> Vec<GlobalTableMetadata> {
-        self.datastores
+    /// Every datastore and every table of every datastore, this one included:
+    /// what all the relations are built from. Describing itself is what lets
+    /// `system.tables` list the datastore serving it.
+    fn inventory(&self) -> Inventory {
+        let datastores = self
+            .datastores
             .iter()
-            .flat_map(|(datastore_name, transaction)| {
-                transaction
+            .map(|datastore| DatastoreDescription {
+                name: datastore.name.clone(),
+                kind: datastore.kind.clone(),
+                data_path: datastore.data_path.clone(),
+            })
+            .chain([DatastoreDescription {
+                name: DATASTORE_NAME.to_string(),
+                kind: SYSTEM_DATASTORE_KIND.to_string(),
+                // It reads the other datastores' catalogs and the running
+                // server, and stores nothing of its own anywhere.
+                data_path: String::new(),
+            }])
+            .collect();
+
+        let tables = self
+            .datastores
+            .iter()
+            .flat_map(|datastore| {
+                datastore
+                    .transaction
                     .tables()
                     .into_iter()
-                    .map(move |table| GlobalTableMetadata {
-                        datastore_name: datastore_name.clone(),
+                    .map(|table| GlobalTableMetadata {
+                        datastore_name: datastore.name.clone(),
                         table,
                     })
             })
@@ -99,7 +236,9 @@ impl SystemTransaction {
                 datastore_name: DATASTORE_NAME.to_string(),
                 table,
             }))
-            .collect()
+            .collect();
+
+        Inventory { datastores, tables }
     }
 }
 
@@ -124,10 +263,14 @@ impl DatastoreTransaction for SystemTransaction {
             schema: name.schema.clone(),
             table: name.table.clone(),
         };
-        let (_, build) = RELATIONS
+        let relation = RELATIONS
             .iter()
-            .find(|(relation, _)| *relation == name.table)?;
-        Some(build(reference, self.global_tables()))
+            .find(|relation| relation.name == name.table)?;
+        Some((relation.build)(
+            reference,
+            declare_columns(relation.columns),
+            &self.inventory(),
+        ))
     }
 
     /// Asked of the binding rather than of a second list of names, so the
@@ -137,14 +280,36 @@ impl DatastoreTransaction for SystemTransaction {
     }
 
     /// The relations this datastore serves. None of them is stored, so none has
-    /// files or a durable identifier; each is named by the qualified name that
-    /// reaches it, which is unique and stable for as long as it is served.
+    /// files, a durable identifier, or bytes to report; each is named by the
+    /// qualified name that reaches it, which is unique and stable for as long as
+    /// it is served. The columns are the very ones binding serves, so
+    /// `system.columns` describes these relations exactly as it does a stored
+    /// table's.
     fn tables(&self) -> Vec<DatastoreTableMetadata> {
         RELATIONS
             .iter()
-            .map(|(relation, _)| DatastoreTableMetadata {
-                name: SchemaQualifiedTableName::new(planner::DEFAULT_SCHEMA_NAME, *relation),
-                id: format!("{DATASTORE_NAME}.{relation}"),
+            .map(|relation| DatastoreTableMetadata {
+                name: SchemaQualifiedTableName::new(planner::DEFAULT_SCHEMA_NAME, relation.name),
+                id: format!("{DATASTORE_NAME}.{}", relation.name),
+                columns: relation
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(position, (name, column_type))| DatastoreColumnMetadata {
+                        name: name.to_string(),
+                        column_type: column_type.clone(),
+                        position,
+                        total_bytes: 0,
+                        total_bytes_uncompressed: 0,
+                        is_partition_key: false,
+                        is_sort_key: false,
+                    })
+                    .collect(),
+                sort_by: Vec::new(),
+                partition_by: Vec::new(),
+                total_rows: 0,
+                total_bytes: 0,
+                total_bytes_uncompressed: 0,
                 files: Vec::new(),
             })
             .collect()
@@ -169,70 +334,139 @@ impl DatastoreTransaction for SystemTransaction {
     }
 }
 
-/// Build the catalog-wide `system.tables` relation.
-fn build_tables_relation(
+/// Build the `system.datastores` relation. A datastore is named once per
+/// server, so its name is its identity; the column is carried anyway, since
+/// that is what the other relations join on.
+fn build_datastores(
     reference: TableReference,
-    tables: Vec<GlobalTableMetadata>,
+    columns: Vec<Column>,
+    inventory: &Inventory,
 ) -> Box<dyn BoundTable> {
-    let datastore_names: Vec<_> = tables
-        .iter()
-        .map(|entry| entry.datastore_name.as_str())
-        .collect();
-    let schema_names: Vec<_> = tables
-        .iter()
-        .map(|entry| entry.table.name.schema.as_str())
-        .collect();
-    let names: Vec<_> = tables
-        .iter()
-        .map(|entry| entry.table.name.table.as_str())
-        .collect();
-    let ids: Vec<_> = tables.iter().map(|entry| entry.table.id.as_str()).collect();
-
+    let datastores = &inventory.datastores;
     build_table(
         reference,
+        columns,
         vec![
-            string_column("datastore_name", datastore_names),
-            string_column("schema_name", schema_names),
-            string_column("name", names),
-            string_column("id", ids),
+            string_array(datastores.iter().map(|entry| entry.name.clone())),
+            string_array(datastores.iter().map(|entry| entry.name.clone())),
+            string_array(datastores.iter().map(|entry| entry.kind.clone())),
+            string_array(datastores.iter().map(|entry| entry.data_path.clone())),
         ],
     )
 }
 
-/// Build the catalog-wide `system.table_files` relation: one row per committed
-/// data file, named by the table that holds it rather than by that table's
-/// datastore, since a file's owning table is what `system.tables` joins on.
-fn build_table_files_relation(
+/// Build the catalog-wide `system.tables` relation.
+fn build_tables(
     reference: TableReference,
-    tables: Vec<GlobalTableMetadata>,
+    columns: Vec<Column>,
+    inventory: &Inventory,
 ) -> Box<dyn BoundTable> {
-    let files: Vec<_> = tables
-        .into_iter()
+    let tables = &inventory.tables;
+    build_table(
+        reference,
+        columns,
+        vec![
+            string_array(tables.iter().map(|entry| entry.datastore_name.clone())),
+            string_array(tables.iter().map(|entry| entry.table.name.schema.clone())),
+            string_array(tables.iter().map(|entry| entry.table.name.table.clone())),
+            string_array(tables.iter().map(|entry| entry.table.id.clone())),
+            // A key list is reported as its column names in order, so an
+            // unsorted or unpartitioned table reports an empty string.
+            string_array(tables.iter().map(|entry| entry.table.sort_by.join(","))),
+            string_array(
+                tables
+                    .iter()
+                    .map(|entry| entry.table.partition_by.join(",")),
+            ),
+            int_array(tables.iter().map(|entry| entry.table.total_rows as i64)),
+            int_array(tables.iter().map(|entry| entry.table.total_bytes as i64)),
+            int_array(
+                tables
+                    .iter()
+                    .map(|entry| entry.table.total_bytes_uncompressed as i64),
+            ),
+        ],
+    )
+}
+
+/// Build the catalog-wide `system.columns` relation: one row per declared
+/// column, named by the table that declares it rather than by that table's
+/// name, since a table's id is what `system.tables` joins on.
+fn build_columns(
+    reference: TableReference,
+    columns: Vec<Column>,
+    inventory: &Inventory,
+) -> Box<dyn BoundTable> {
+    let declared: Vec<_> = inventory
+        .tables
+        .iter()
         .flat_map(|entry| {
-            let table_id = entry.table.id;
             entry
                 .table
-                .files
-                .into_iter()
-                .map(move |file| (table_id.clone(), file))
+                .columns
+                .iter()
+                .map(move |column| (entry, column))
         })
-        .collect();
-
-    let table_ids: Vec<_> = files.iter().map(|(id, _)| id.as_str()).collect();
-    let paths: Vec<_> = files.iter().map(|(_, file)| file.path.as_str()).collect();
-    // A file is far smaller than an i64 holds, so the cast keeps every size and
-    // spares clients an unsigned type they mostly lack.
-    let sizes: Vec<_> = files
-        .iter()
-        .map(|(_, file)| file.size_bytes as i64)
         .collect();
 
     build_table(
         reference,
+        columns,
         vec![
-            string_column("table_id", table_ids),
-            string_column("path", paths),
-            int_column("size_bytes", sizes),
+            string_array(
+                declared
+                    .iter()
+                    .map(|(entry, _)| entry.datastore_name.clone()),
+            ),
+            string_array(declared.iter().map(|(entry, _)| entry.table.id.clone())),
+            string_array(declared.iter().map(|(_, column)| column.name.clone())),
+            string_array(
+                declared
+                    .iter()
+                    .map(|(_, column)| sql_type_name(&column.column_type)),
+            ),
+            int_array(declared.iter().map(|(_, column)| column.position as i64)),
+            int_array(declared.iter().map(|(_, column)| column.total_bytes as i64)),
+            int_array(
+                declared
+                    .iter()
+                    .map(|(_, column)| column.total_bytes_uncompressed as i64),
+            ),
+            boolean_array(declared.iter().map(|(_, column)| column.is_partition_key)),
+            boolean_array(declared.iter().map(|(_, column)| column.is_sort_key)),
+        ],
+    )
+}
+
+/// Build the catalog-wide `system.table_files` relation: one row per data file,
+/// named by the table that holds it rather than by that table's datastore,
+/// since a file's owning table is what `system.tables` joins on.
+fn build_table_files(
+    reference: TableReference,
+    columns: Vec<Column>,
+    inventory: &Inventory,
+) -> Box<dyn BoundTable> {
+    let files: Vec<_> = inventory
+        .tables
+        .iter()
+        .flat_map(|entry| entry.table.files.iter().map(move |file| (entry, file)))
+        .collect();
+
+    build_table(
+        reference,
+        columns,
+        vec![
+            string_array(files.iter().map(|(entry, _)| entry.table.id.clone())),
+            string_array(files.iter().map(|(_, file)| file.path.clone())),
+            string_array(files.iter().map(|(_, file)| file.partition.clone())),
+            // A file is far smaller than an i64 holds, so the cast keeps every
+            // size and spares clients an unsigned type they mostly lack.
+            int_array(files.iter().map(|(_, file)| file.size as i64)),
+            int_array(
+                files
+                    .iter()
+                    .map(|(_, file)| file.total_bytes_uncompressed as i64),
+            ),
         ],
     )
 }
@@ -245,21 +479,12 @@ fn build_table_files_relation(
 /// state is the share of rows in it, and no aggregate has to be anticipated
 /// here. Nothing in the catalog describes memory, so the inventory the other
 /// relations are built from is not read.
-fn build_memory_blocks_relation(
+fn build_memory_blocks(
     reference: TableReference,
-    _tables: Vec<GlobalTableMetadata>,
+    columns: Vec<Column>,
+    _inventory: &Inventory,
 ) -> Box<dyn BoundTable> {
-    build_scanned_table(
-        reference,
-        vec![
-            declare_column("slot", Type::Int64),
-            declare_column("node", Type::Int64),
-            declare_column("state", Type::Utf8),
-            declare_column("readers", Type::Int64),
-            declare_column("size_bytes", Type::Int64),
-        ],
-        compile_memory_blocks_scan,
-    )
+    build_scanned_table(reference, columns, compile_memory_blocks_scan)
 }
 
 /// Compile the scan of the memory ring.
@@ -296,14 +521,18 @@ fn compile_memory_blocks_scan(
 fn memory_block_arrays(blocks: &[MemoryBlockStatus]) -> Vec<ArrayRef> {
     // Every block is the same size, so the column repeats one value; it is
     // carried anyway so that summing memory needs no knowledge of that size.
-    let size_bytes = dispatch::block_size_bytes() as i64;
+    let size = dispatch::block_size_bytes() as i64;
 
     vec![
-        int_array(blocks.iter().map(|block| block.slot as i64).collect()),
-        int_array(blocks.iter().map(|block| block.node as i64).collect()),
-        string_array(blocks.iter().map(|block| state_name(block.state)).collect()),
-        int_array(blocks.iter().map(|block| block.readers as i64).collect()),
-        int_array(vec![size_bytes; blocks.len()]),
+        int_array(blocks.iter().map(|block| block.slot as i64)),
+        int_array(blocks.iter().map(|block| block.node as i64)),
+        string_array(
+            blocks
+                .iter()
+                .map(|block| state_name(block.state).to_string()),
+        ),
+        int_array(blocks.iter().map(|block| block.readers as i64)),
+        int_array(std::iter::repeat_n(size, blocks.len())),
     ]
 }
 
@@ -486,12 +715,13 @@ impl BoundTable for ScannedRelation {
     }
 }
 
-/// Build a relation whose rows the transaction already holds, from ordered
-/// pairs that keep each virtual column's name, logical type, and array
-/// adjacent.
-fn build_table(reference: TableReference, columns: Vec<(Column, ArrayRef)>) -> Box<dyn BoundTable> {
-    let arrays: Vec<_> = columns.iter().map(|(_, array)| array.clone()).collect();
-    let columns: Vec<_> = columns.into_iter().map(|(column, _)| column).collect();
+/// Build a relation whose rows the transaction already holds, from its declared
+/// columns and one array per column, in that same order.
+fn build_table(
+    reference: TableReference,
+    columns: Vec<Column>,
+    arrays: Vec<ArrayRef>,
+) -> Box<dyn BoundTable> {
     Box::new(BoundRelation {
         relation: Relation::new(reference, columns),
         arrays,
@@ -523,25 +753,26 @@ fn build_schema(columns: &[Column]) -> SchemaRef {
     ))
 }
 
-fn string_column(name: &str, values: Vec<&str>) -> (Column, ArrayRef) {
-    (declare_column(name, Type::Utf8), string_array(values))
+/// A relation's declared columns, as the planner's [`Column`]s: the pairs the
+/// registry spells out, in the order it spells them.
+fn declare_columns(columns: &[(&str, Type)]) -> Vec<Column> {
+    columns
+        .iter()
+        .map(|(name, col_type)| Column {
+            name: name.to_string(),
+            col_type: col_type.clone(),
+        })
+        .collect()
 }
 
-fn int_column(name: &str, values: Vec<i64>) -> (Column, ArrayRef) {
-    (declare_column(name, Type::Int64), int_array(values))
+fn string_array(values: impl IntoIterator<Item = String>) -> ArrayRef {
+    Arc::new(StringViewArray::from_iter_values(values))
 }
 
-fn declare_column(name: &str, col_type: Type) -> Column {
-    Column {
-        name: name.to_string(),
-        col_type,
-    }
+fn int_array(values: impl IntoIterator<Item = i64>) -> ArrayRef {
+    Arc::new(Int64Array::from_iter_values(values))
 }
 
-fn string_array(values: Vec<&str>) -> ArrayRef {
-    Arc::new(StringViewArray::from(values))
-}
-
-fn int_array(values: Vec<i64>) -> ArrayRef {
-    Arc::new(Int64Array::from(values))
+fn boolean_array(values: impl IntoIterator<Item = bool>) -> ArrayRef {
+    Arc::new(BooleanArray::from_iter(values.into_iter().map(Some)))
 }

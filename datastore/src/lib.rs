@@ -18,9 +18,10 @@ use planner::catalog::{
     BoundTable, CreateSchemaRequest, CreateTableRequest, DropTableRequest, Result, SchemaCreation,
     SchemaQualifiedTableName, TableCreation, TableDrop, TableRevision,
 };
+use planner::types::Type;
 
 /// One table exposed by a datastore transaction's frozen catalog view, with the
-/// data files it holds at that snapshot.
+/// columns it declares and the data files it holds at that snapshot.
 ///
 /// The cross-datastore catalog uses this backend-neutral description to build
 /// virtual metadata relations without reaching into a concrete datastore's
@@ -31,10 +32,39 @@ use planner::catalog::{
 pub struct DatastoreTableMetadata {
     pub name: SchemaQualifiedTableName,
     pub id: String,
+    /// The columns the table declares, in schema order.
+    pub columns: Vec<DatastoreColumnMetadata>,
+    /// The table's sort columns, in order; empty when the table is unsorted.
+    pub sort_by: Vec<String>,
+    /// The table's partition columns, in order; empty when the table is
+    /// unpartitioned.
+    pub partition_by: Vec<String>,
+    /// How many rows the table's committed files hold.
+    pub total_rows: u64,
+    /// How many bytes those files occupy in storage.
+    pub total_bytes: u64,
+    /// What those bytes hold decoded, before the storage format compressed them.
+    pub total_bytes_uncompressed: u64,
     /// The table's committed files, in the order its datastore holds them.
     /// Files a pending write staged are not committed to the snapshot and so
     /// are absent, exactly as a table the same transaction is still creating is.
     pub files: Vec<DatastoreFileMetadata>,
+}
+
+/// One column of a [`DatastoreTableMetadata`]: what the table declares it as,
+/// and what the table's committed files spend on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatastoreColumnMetadata {
+    pub name: String,
+    pub column_type: Type,
+    /// The column's position in the table's schema, counted from zero.
+    pub position: usize,
+    /// How many bytes this column occupies across the table's committed files.
+    pub total_bytes: u64,
+    /// What those bytes hold decoded, before the storage format compressed them.
+    pub total_bytes_uncompressed: u64,
+    pub is_partition_key: bool,
+    pub is_sort_key: bool,
 }
 
 /// One data file of a [`DatastoreTableMetadata`], described the same
@@ -42,12 +72,19 @@ pub struct DatastoreTableMetadata {
 ///
 /// The owning table is the one this hangs off, so a file names no table of its
 /// own. `path` names the file the way its datastore does, relative to that
-/// datastore's storage root, and `size_bytes` is the size the catalog recorded
+/// datastore's storage root, and `size` is the size the catalog recorded
 /// when the file was committed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatastoreFileMetadata {
     pub path: String,
-    pub size_bytes: u64,
+    pub size: u64,
+    /// What the file's bytes hold decoded, before the storage format compressed
+    /// them.
+    pub total_bytes_uncompressed: u64,
+    /// The partition the file belongs to: `column=value` pairs in the table's
+    /// partition order, comma-separated. Empty when the table is unpartitioned,
+    /// or when the file predates its partitioning.
+    pub partition: String,
 }
 
 /// One query's transaction against a **single datastore**: a consistent
@@ -176,6 +213,16 @@ pub trait Datastore: Debug + Send + Sync {
     /// receiver lets the transaction hold the datastore alive, so a `CREATE TABLE`
     /// it commits can publish the new table straight back into the datastore.
     fn begin_transaction(self: Arc<Self>) -> Arc<dyn DatastoreTransaction>;
+
+    /// The format this datastore stores its data in (`delta`), as
+    /// `system.datastores` reports it. A constant of the backend: what a
+    /// configuration selects the backend by.
+    fn kind(&self) -> &'static str;
+
+    /// Where this datastore's data lives, as a URI (`file:///var/lib/pivot`,
+    /// `s3://bucket/prefix`). Every path a table or a file of this datastore
+    /// reports is relative to it.
+    fn data_path(&self) -> String;
 
     /// Start this datastore's background maintenance (e.g. periodic refresh and
     /// compaction), spawning its tasks onto the ambient async runtime. Called
