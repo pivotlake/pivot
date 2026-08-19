@@ -41,8 +41,15 @@ const MAX_PENDING_LOCAL_ROW_GROUPS: usize = 2;
 /// claim spends most of its life waiting on the network, not decoding, so the
 /// hoarding concern above barely applies while read-ahead depth is the whole
 /// throughput game: a claim's reads must be in flight long before its decode
-/// is due, or every row group pays a full network round trip serially.
-const MAX_PENDING_REMOTE_ROW_GROUPS: usize = 16;
+/// is due, or every row group pays a full network round trip serially. The
+/// effective request concurrency against object storage is this times the
+/// worker count. Tunable via `PIVOT_PENDING_REMOTE_ROW_GROUPS`; resolved once.
+fn max_pending_remote_row_groups() -> usize {
+    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        dispatch::env::get_env_var_with_default("PIVOT_PENDING_REMOTE_ROW_GROUPS", 16)
+    })
+}
 
 /// How many undecoded row groups one worker may hold claims on while
 /// scanning `table`. Local tables keep claims minimal for decode fairness;
@@ -53,7 +60,7 @@ pub fn pending_claim_bound(table: &crate::parquet::ParquetTable) -> usize {
         .iter()
         .any(|rg| matches!(rg.open_file, dispatch::io::OpenFile::Remote(_)));
     if any_remote {
-        MAX_PENDING_REMOTE_ROW_GROUPS
+        max_pending_remote_row_groups()
     } else {
         MAX_PENDING_LOCAL_ROW_GROUPS
     }
