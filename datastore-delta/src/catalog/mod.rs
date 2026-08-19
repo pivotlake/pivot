@@ -129,6 +129,10 @@ pub enum Error {
         "table at `{location}` cannot delete `{file}`: the file sits outside the table's own storage, so it belongs to whoever the table adopted it from"
     )]
     DeletingOutsideStorage { location: String, file: String },
+    #[error("compaction actor stopped")]
+    CompacterStopped,
+    #[error("compaction job panicked: {0}")]
+    CompactionJobPanicked(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -289,6 +293,9 @@ pub struct DeltaDatastore {
     /// the worker pool is torn down. Behind an `Arc<Mutex<..>>` so the datastore
     /// stays `Clone` (a writing commit hands a clone to the blocking pool).
     maintenance_tasks: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
+    /// Handle to the one compaction actor serving both timer ticks and explicit
+    /// commands. Created lazily by maintenance startup or the first command.
+    compacter: Arc<Mutex<Option<crate::compact::Compacter>>>,
 }
 
 impl std::fmt::Debug for DeltaDatastore {
@@ -349,7 +356,32 @@ impl DeltaDatastore {
             dispatcher: dispatcher.clone(),
             maintenance,
             maintenance_tasks: Arc::new(Mutex::new(Vec::new())),
+            compacter: Arc::new(Mutex::new(None)),
         }))
+    }
+
+    fn compacter(self: &Arc<Self>) -> crate::compact::Compacter {
+        let mut compacter = self.compacter.lock().unwrap();
+        if let Some(compacter) = compacter.as_ref() {
+            return compacter.clone();
+        }
+        let configured = self
+            .maintenance
+            .as_ref()
+            .and_then(|maintenance| maintenance.compaction.as_ref());
+        let target_bytes = configured
+            .map(|config| config.target_bytes)
+            .unwrap_or(crate::compact::DEFAULT_COMPACT_BYTES);
+        let poll_interval = configured.map(|config| config.poll_interval);
+        let (handle, actor) =
+            crate::compact::Compacter::new(target_bytes, poll_interval, Arc::clone(self));
+        let task = tokio::spawn(actor.run());
+        self.maintenance_tasks
+            .lock()
+            .unwrap()
+            .push(task.abort_handle());
+        *compacter = Some(handle.clone());
+        handle
     }
 
     /// Build the in-memory [`CatalogTable`] for one persisted table: read its
@@ -1196,6 +1228,9 @@ impl Datastore for DeltaDatastore {
     /// stops it. Their abort handles are kept so shutdown can stop them before the
     /// worker pool is torn down.
     fn start(self: Arc<Self>) {
+        // Explicit COMPACT statements and periodic sweeps share this actor. It
+        // exists even when periodic compaction is disabled.
+        self.compacter();
         let Some(maintenance) = self.maintenance.clone() else {
             return;
         };
@@ -1223,16 +1258,6 @@ impl Datastore for DeltaDatastore {
         });
         tasks.push(refresh.abort_handle());
 
-        if let Some(compaction) = maintenance.compaction {
-            let compacter = Arc::new(crate::compact::Compacter::new(
-                compaction.target_bytes,
-                compaction.poll_interval,
-                Arc::clone(&self),
-            ));
-            let compaction_task = tokio::spawn(compacter.run());
-            tasks.push(compaction_task.abort_handle());
-        }
-
         if let Some(vacuum) = maintenance.vacuum {
             let vacuumer = Arc::new(crate::vacuum::Vacuumer::new(
                 vacuum.poll_interval,
@@ -1244,47 +1269,9 @@ impl Datastore for DeltaDatastore {
     }
 
     fn abort(&self) {
+        self.compacter.lock().unwrap().take();
         for handle in self.maintenance_tasks.lock().unwrap().drain(..) {
             handle.abort();
-        }
-    }
-
-    /// One sweep with the default thresholds, or sweep-to-fixpoint under
-    /// `final_sweep`: a merge changes the file list, so a sweep can leave a
-    /// tail; progress is judged by the table's committed log version, and the
-    /// loop stops at the first sweep that advances nothing.
-    async fn compact(
-        self: Arc<Self>,
-        table: &SchemaQualifiedTableName,
-        final_sweep: bool,
-    ) -> CatalogResult<u64> {
-        let version_of = |datastore: &DeltaDatastore| {
-            datastore
-                .tables()
-                .into_iter()
-                .find(|(name, _)| name == table)
-                .map(|(_, found)| found.version())
-        };
-        if version_of(&self).is_none() {
-            return Err(CatalogError::Other(
-                format!("COMPACT: no table named `{table}`").into(),
-            ));
-        }
-        let compacter = crate::compact::Compacter::new(
-            crate::compact::DEFAULT_COMPACT_BYTES,
-            // The poll interval drives the background loop, which a manual
-            // sweep never enters.
-            std::time::Duration::from_secs(1),
-            Arc::clone(&self),
-        );
-        let mut sweeps = 0;
-        loop {
-            let before = version_of(&self);
-            compacter.sweep_table(table).await;
-            sweeps += 1;
-            if !final_sweep || version_of(&self) == before {
-                return Ok(sweeps);
-            }
         }
     }
 
@@ -1478,6 +1465,21 @@ impl DatastoreTransaction for DeltaTransaction {
 
     fn bind_drop_table(&self, request: DropTableRequest) -> CatalogResult<Box<dyn TableDrop>> {
         Ok(Box::new(self.bind_drop(request)?))
+    }
+
+    async fn compact(
+        &self,
+        name: &SchemaQualifiedTableName,
+        final_sweep: bool,
+    ) -> CatalogResult<u64> {
+        let table = self.snapshot.catalog_table_by_name(name).ok_or_else(|| {
+            CatalogError::Other(format!("COMPACT: no table named `{name}`").into())
+        })?;
+        Ok(self
+            .datastore
+            .compacter()
+            .compact(name.clone(), table, final_sweep)
+            .await?)
     }
 
     async fn commit(&self) -> CatalogResult<()> {

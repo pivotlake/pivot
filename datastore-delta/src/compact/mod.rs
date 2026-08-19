@@ -39,16 +39,16 @@
 //! up storing that data twice, once in the user's directory and once in its own.
 //! That is the price of never writing into a directory the user owns.
 //!
-//! A [`DeltaDatastore`] self-manages its own compaction: when opened with a
-//! [`MaintenanceConfig`] that enables it, the datastore spawns a [`Compacter`]
-//! loop bound to itself. The loop polls, each round reloading a table to its
-//! latest log version before scanning, and stops when the datastore's dispatch
-//! pool begins to shut down (so an in-flight merge finishes before the workers
-//! tear down).
+//! A [`DeltaDatastore`] owns one [`Compacter`] actor. Configured timer ticks and
+//! explicit `COMPACT` commands share its queue, so their rewrites never race in
+//! one process. A timed round reloads each table to its latest log version;
+//! commands carry the table snapshot captured by their query transaction. The
+//! actor stops before the datastore's dispatch pool shuts down.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
@@ -117,89 +117,151 @@ pub struct CompactionConfig {
     pub poll_interval: Duration,
 }
 
-/// Compacts every table of a datastore into target-sized Parquet files,
-/// entirely off the tables' logs: poll, reload, merge what's eligible. Holds
-/// nothing but a datastore handle, so the hosting process is a deployment
-/// detail: the datastore bundles one when maintenance enables it, and a
-/// dedicated process could run another over the same database root.
+/// Handle to the datastore's single compaction actor. Both periodic maintenance
+/// and explicit `COMPACT` statements run through that actor, so two compaction
+/// rounds in one process can never select and rewrite files concurrently.
+#[derive(Clone)]
 pub struct Compacter {
+    commands: mpsc::UnboundedSender<Command>,
+}
+
+struct Command {
+    name: SchemaQualifiedTableName,
+    table: CatalogTable,
+    final_sweep: bool,
+    result: oneshot::Sender<crate::Result<u64>>,
+}
+
+pub(crate) struct CompacterActor {
     /// Output-size target and small/large boundary (see [`DEFAULT_COMPACT_BYTES`]).
     target_bytes: u64,
-    /// How often to re-check the tables' logs for newly-accumulated files.
-    poll_interval: Duration,
+    /// How often to re-check the tables' logs, or `None` when only explicit
+    /// commands drive this actor.
+    poll_interval: Option<Duration>,
     datastore: Arc<DeltaDatastore>,
+    commands: mpsc::UnboundedReceiver<Command>,
 }
 
 impl Compacter {
-    pub fn new(target_bytes: u64, poll_interval: Duration, datastore: Arc<DeltaDatastore>) -> Self {
-        Self {
-            target_bytes,
-            poll_interval,
-            datastore,
+    pub(crate) fn new(
+        target_bytes: u64,
+        poll_interval: Option<Duration>,
+        datastore: Arc<DeltaDatastore>,
+    ) -> (Self, CompacterActor) {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        (
+            Self { commands: sender },
+            CompacterActor {
+                target_bytes,
+                poll_interval,
+                datastore,
+                commands: receiver,
+            },
+        )
+    }
+
+    /// Enqueue one table from the caller's transaction snapshot. `FINAL` keeps
+    /// selecting from each committed result until a round can do no more work.
+    pub(crate) async fn compact(
+        &self,
+        name: SchemaQualifiedTableName,
+        table: CatalogTable,
+        final_sweep: bool,
+    ) -> crate::Result<u64> {
+        let (result, answer) = oneshot::channel();
+        self.commands
+            .send(Command {
+                name,
+                table,
+                final_sweep,
+                result,
+            })
+            .map_err(|_| crate::Error::CompacterStopped)?;
+        answer.await.map_err(|_| crate::Error::CompacterStopped)?
+    }
+}
+
+impl CompacterActor {
+    /// Run timer ticks and commands serially. The first configured tick fires
+    /// immediately, preserving the background compacter's startup sweep.
+    pub(crate) async fn run(mut self) {
+        if let Some(poll_interval) = self.poll_interval {
+            let mut tick = tokio::time::interval(poll_interval);
+            tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    command = self.commands.recv() => match command {
+                        Some(command) => self.handle(command).await,
+                        None => return,
+                    },
+                    _ = tick.tick() => self.compact_all().await,
+                }
+            }
+        }
+        while let Some(command) = self.commands.recv().await {
+            self.handle(command).await;
         }
     }
 
-    /// The compaction loop: every `poll_interval`, sweep the datastore's tables
-    /// and merge whatever is eligible. Runs until the task is aborted on shutdown.
-    /// The first tick fires immediately, so leftovers from a previous run are
-    /// handled at startup.
-    pub async fn run(self: Arc<Self>) {
-        let mut tick = tokio::time::interval(self.poll_interval);
-        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    async fn handle(&self, command: Command) {
+        let answer = self
+            .compact_command(&command.name, command.table, command.final_sweep)
+            .await;
+        let _ = command.result.send(answer);
+    }
+
+    async fn compact_all(&self) {
+        for (name, mut table) in self.datastore.tables() {
+            if let Err(error) = table.refresh() {
+                warn!(table = %name, error = %error, "compaction: table refresh failed");
+                continue;
+            }
+            if let Err(error) = self.compact_table(&name, table).await {
+                error!(table = %name, error = %error, "compaction round failed");
+            }
+        }
+    }
+
+    async fn compact_command(
+        &self,
+        name: &SchemaQualifiedTableName,
+        mut table: CatalogTable,
+        final_sweep: bool,
+    ) -> crate::Result<u64> {
+        let mut sweeps = 0;
         loop {
-            tick.tick().await;
-            self.compact_all().await;
+            let (committed, compacted) = self.compact_table(name, table).await?;
+            table = committed;
+            sweeps += 1;
+            if !final_sweep || !compacted {
+                return Ok(sweeps);
+            }
         }
     }
 
-    /// One poll round over every table the datastore knows. (Public so tests,
-    /// and a future standalone compacter binary, can drive one round without
-    /// the loop.)
-    pub async fn compact_all(&self) {
-        for (name, table) in self.datastore.tables() {
-            self.compact_table(&name, table).await;
-        }
-    }
-
-    /// One manual sweep of the single table `name`, for the `COMPACT`
-    /// statement. Returns whether the table exists; the sweep itself reports
-    /// nothing, so the caller judges progress by the table's log version.
-    pub async fn sweep_table(&self, name: &SchemaQualifiedTableName) -> bool {
-        let Some((name, table)) = self
-            .datastore
-            .tables()
-            .into_iter()
-            .find(|(candidate, _)| candidate == name)
-        else {
-            return false;
-        };
-        self.compact_table(&name, table).await;
-        true
-    }
-
-    /// One table's round: reload it to its latest log version, compact at most
-    /// one small-file group, then optimize at most one overlapping pair of large
-    /// files. The second choice is made from the state committed by the first,
-    /// so it never selects files that the small-file swap just replaced.
-    /// Errors are logged and end the table's round; the next poll retries.
-    async fn compact_table(&self, name: &SchemaQualifiedTableName, mut table: CatalogTable) {
-        if let Err(e) = table.refresh() {
-            warn!(table = %name, error = %e, "compaction: table refresh failed");
-            return;
-        }
+    /// Compact at most one small-file group and then at most one overlapping
+    /// large-file pair, choosing the second batch from the first batch's commit.
+    async fn compact_table(
+        &self,
+        name: &SchemaQualifiedTableName,
+        mut table: CatalogTable,
+    ) -> crate::Result<(CatalogTable, bool)> {
         let id = table.id();
+        let mut compacted = false;
 
         if let Some(inputs) = self.next_small_batch(&table) {
-            let Some(committed) = self.merge_batch(name, id, inputs, "small files").await else {
-                return;
-            };
-            table = committed;
+            table = self.merge_batch(name, id, inputs, "small files").await?;
+            compacted = true;
         }
 
         if let Some(inputs) = self.next_layout_optimization(&table) {
-            self.merge_batch(name, id, inputs, "layout optimization")
-                .await;
+            table = self
+                .merge_batch(name, id, inputs, "layout optimization")
+                .await?;
+            compacted = true;
         }
+        Ok((table, compacted))
     }
 
     async fn merge_batch(
@@ -208,36 +270,28 @@ impl Compacter {
         id: uuid::Uuid,
         inputs: Vec<FileRef>,
         kind: &'static str,
-    ) -> Option<CatalogTable> {
+    ) -> crate::Result<CatalogTable> {
         let input_sizes: Vec<u64> = inputs.iter().map(|file| file.size).collect();
         // `spawn_blocking` needs a `'static` closure, so it gets its own
         // datastore handle rather than a borrow of `self`.
         let datastore = self.datastore.clone();
-        match tokio::task::spawn_blocking(move || swap_batch(&datastore, id, &inputs)).await {
-            Ok(Ok((merged, committed))) => {
-                let output_sizes: Vec<u64> = merged.iter().map(|file| file.size).collect();
-                info!(
-                    table = %name,
-                    kind,
-                    inputs = input_sizes.len(),
-                    input_sizes = ?input_sizes,
-                    input_bytes = input_sizes.iter().sum::<u64>(),
-                    outputs = output_sizes.len(),
-                    output_sizes = ?output_sizes,
-                    output_bytes = output_sizes.iter().sum::<u64>(),
-                    "compacted batch"
-                );
-                Some(committed)
-            }
-            Ok(Err(e)) => {
-                error!(table = %name, kind, error = %e, "compaction merge failed");
-                None
-            }
-            Err(e) => {
-                error!(table = %name, kind, error = %e, "compaction job panicked");
-                None
-            }
-        }
+        let (merged, committed) =
+            tokio::task::spawn_blocking(move || swap_batch(&datastore, id, &inputs))
+                .await
+                .map_err(|error| crate::Error::CompactionJobPanicked(error.to_string()))??;
+        let output_sizes: Vec<u64> = merged.iter().map(|file| file.size).collect();
+        info!(
+            table = %name,
+            kind,
+            inputs = input_sizes.len(),
+            input_sizes = ?input_sizes,
+            input_bytes = input_sizes.iter().sum::<u64>(),
+            outputs = output_sizes.len(),
+            output_sizes = ?output_sizes,
+            output_bytes = output_sizes.iter().sum::<u64>(),
+            "compacted batch"
+        );
+        Ok(committed)
     }
 
     /// Pick one group of files below the target size from a single partition.
@@ -635,12 +689,116 @@ mod tests {
     }
 
     /// Drive one full compaction sweep to completion on a temporary runtime.
-    fn run_one_sweep(compacter: &Compacter) {
+    fn run_one_sweep(target_bytes: u64, datastore: Arc<DeltaDatastore>) {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap()
-            .block_on(compacter.compact_all());
+            .block_on(async move {
+                let tables = datastore.tables();
+                let (compacter, actor) = Compacter::new(target_bytes, None, datastore);
+                let actor = tokio::spawn(actor.run());
+                for (name, table) in tables {
+                    compacter.compact(name, table, false).await.unwrap();
+                }
+                actor.abort();
+            });
+    }
+
+    fn run_command(
+        target_bytes: u64,
+        datastore: Arc<DeltaDatastore>,
+        name: SchemaQualifiedTableName,
+        table: CatalogTable,
+        final_sweep: bool,
+    ) -> u64 {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let (compacter, actor) = Compacter::new(target_bytes, None, datastore);
+                let actor = tokio::spawn(actor.run());
+                let sweeps = compacter.compact(name, table, final_sweep).await.unwrap();
+                actor.abort();
+                sweeps
+            })
+    }
+
+    #[test]
+    fn command_uses_the_supplied_table_snapshot() {
+        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
+        let db = tempfile::tempdir().unwrap();
+        let adopted = db.path().join("events");
+        std::fs::create_dir_all(&adopted).unwrap();
+        write_parquet_file(&adopted, "a.parquet", vec![1]);
+        write_parquet_file(&adopted, "b.parquet", vec![2]);
+        let datastore =
+            DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        create_table(
+            &datastore,
+            dispatch.dispatcher(),
+            "events",
+            Some(&adopted),
+            false,
+        );
+        let name = SchemaQualifiedTableName::in_default_schema("events");
+        let captured = datastore.table_handle(&name).unwrap();
+        let target = captured.file_refs().iter().map(|file| file.size).sum();
+        write_parquet_file(&adopted, "c.parquet", vec![3]);
+        let mut latest = captured.clone();
+        latest
+            .append_data_file(
+                ObjectPath::new("c.parquet"),
+                &std::fs::read(adopted.join("c.parquet")).unwrap(),
+                None,
+            )
+            .unwrap();
+        datastore.refresh_from_store().unwrap();
+
+        let sweeps = run_command(target, datastore.clone(), name.clone(), captured, false);
+
+        assert_eq!(sweeps, 1);
+        assert_eq!(datastore.table_handle(&name).unwrap().file_refs().len(), 3);
+        dispatch.exit();
+    }
+
+    #[test]
+    fn final_command_compacts_until_no_partition_has_work() {
+        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
+        let db = tempfile::tempdir().unwrap();
+        let encoded = tempfile::tempdir().unwrap();
+        let datastore =
+            DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        create_partitioned_table(&datastore, dispatch.dispatcher(), "events");
+        let name = SchemaQualifiedTableName::in_default_schema("events");
+        let mut table = datastore.table_handle(&name).unwrap();
+        for (file, partition) in [("a", 1), ("b", 1), ("c", 2), ("d", 2)] {
+            let file = format!("{file}.parquet");
+            write_partitioned_parquet_file(encoded.path(), &file, vec![partition], partition);
+            table
+                .append_data_file(
+                    ObjectPath::new(&file),
+                    &std::fs::read(encoded.path().join(&file)).unwrap(),
+                    Some(partition_value(partition)),
+                )
+                .unwrap();
+        }
+        datastore.refresh_from_store().unwrap();
+        let table = datastore.table_handle(&name).unwrap();
+        let target = table
+            .file_refs()
+            .iter()
+            .map(|file| file.size)
+            .max()
+            .unwrap()
+            + 1;
+
+        let sweeps = run_command(target, datastore.clone(), name.clone(), table, true);
+
+        assert_eq!(sweeps, 3);
+        assert_eq!(datastore.table_handle(&name).unwrap().file_refs().len(), 2);
+        dispatch.exit();
     }
 
     /// End-to-end compaction: several registered small files merge into one, the
@@ -679,12 +837,8 @@ mod tests {
             .iter()
             .map(|f| f.size)
             .sum();
-        let compacter = Compacter::new(
-            (total as f64 / TARGET_SIZE_MULTIPLIER).floor() as u64,
-            std::time::Duration::from_secs(1),
-            datastore.clone(),
-        );
-        run_one_sweep(&compacter);
+        let target = (total as f64 / TARGET_SIZE_MULTIPLIER).floor() as u64;
+        run_one_sweep(target, datastore.clone());
 
         assert_eq!(
             datastore
@@ -729,10 +883,7 @@ mod tests {
         let name = SchemaQualifiedTableName::in_default_schema("events");
         let files = datastore.table_files(&name).unwrap();
         let target = files.iter().map(|file| file.size).min().unwrap();
-        let compacter =
-            Compacter::new(target, std::time::Duration::from_secs(1), datastore.clone());
-
-        run_one_sweep(&compacter);
+        run_one_sweep(target, datastore.clone());
 
         let files = datastore.table_files(&name).unwrap();
         assert_eq!(files.len(), 2);
@@ -800,14 +951,12 @@ mod tests {
             .max()
             .unwrap()
             + 1;
-        let compacter =
-            Compacter::new(target, std::time::Duration::from_secs(1), datastore.clone());
-        run_one_sweep(&compacter);
+        run_one_sweep(target, datastore.clone());
 
         // A table round performs only one small-file merge. The next round
         // handles the other partition.
         assert_eq!(datastore.table_handle(&name).unwrap().file_refs().len(), 3);
-        run_one_sweep(&compacter);
+        run_one_sweep(target, datastore.clone());
 
         // Reload from Delta rather than trusting the in-memory swap. Exactly one
         // output per partition remains, and every original row is still present.
@@ -923,12 +1072,8 @@ mod tests {
             .iter()
             .map(|f| f.size)
             .sum();
-        let compacter = Compacter::new(
-            (total as f64 / TARGET_SIZE_MULTIPLIER).floor() as u64,
-            std::time::Duration::from_secs(1),
-            datastore.clone(),
-        );
-        run_one_sweep(&compacter);
+        let target = (total as f64 / TARGET_SIZE_MULTIPLIER).floor() as u64;
+        run_one_sweep(target, datastore.clone());
 
         // One merged object replaced the two inputs, in the store and in the
         // datastore's table view.
