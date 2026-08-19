@@ -37,6 +37,8 @@ export default defineConfig({
       components: {
         // Opens light for a first-time reader instead of following the OS.
         ThemeProvider: "./src/components/ThemeProvider.astro",
+        // Draws the wordmark with a cursor that blinks on load.
+        SiteTitle: "./src/components/SiteTitle.astro",
       },
       head: [
         {
