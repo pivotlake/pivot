@@ -1,19 +1,12 @@
-//! An embedded Pivot SQL shell.
-
-mod parser;
-mod render;
-
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
-use std::process::ExitCode;
 use std::time::Instant;
 
-use clap::{Parser, Subcommand};
 use engine::{ExecuteOptions, StatementOutput};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
-use shell::ShellInstance;
 
+use crate::ShellInstance;
 use crate::parser::split_complete;
 use crate::render::{TextBatch, render_table};
 
@@ -26,38 +19,9 @@ Shell commands:
   \\h, \\help         show this help
 ";
 
-#[derive(Parser, Debug)]
-#[command(name = "pivot", about = "Pivot command-line tools", version)]
-struct Args {
-    #[command(subcommand)]
-    command: PivotCommand,
-}
-
-#[derive(Subcommand, Debug)]
-enum PivotCommand {
-    /// Run a local Pivot SQL shell.
-    Shell {
-        /// Directory containing the datastore. It is created if it does not exist.
-        #[arg(value_name = "DATASTORE_DIRECTORY")]
-        datastore_directory: PathBuf,
-    },
-}
-
-#[tokio::main]
-async fn main() -> ExitCode {
-    match run().await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("pivot: {error}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let PivotCommand::Shell {
-        datastore_directory,
-    } = Args::parse().command;
+pub(crate) async fn run_shell(
+    datastore_directory: PathBuf,
+) -> Result<(), Box<dyn std::error::Error>> {
     if !io::stdin().is_terminal() {
         return Err("an interactive terminal is required".into());
     }
@@ -286,26 +250,7 @@ fn display_output(output: StatementOutput<TextBatch>) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
-    use clap::Parser;
-
-    use super::{
-        Args, MetaCommand, ParsedBuffer, PivotCommand, is_quit_statement, parse_buffer,
-        parse_meta_command,
-    };
-
-    #[test]
-    fn requires_the_shell_subcommand_and_a_datastore_directory() {
-        assert!(Args::try_parse_from(["pivot"]).is_err());
-        assert!(Args::try_parse_from(["pivot", "shell"]).is_err());
-
-        let args = Args::try_parse_from(["pivot", "shell", "/var/lib/pivot"]).unwrap();
-        let PivotCommand::Shell {
-            datastore_directory,
-        } = args.command;
-        assert_eq!(datastore_directory, PathBuf::from("/var/lib/pivot"));
-    }
+    use super::{MetaCommand, ParsedBuffer, is_quit_statement, parse_buffer, parse_meta_command};
 
     #[test]
     fn parses_supported_meta_commands() {

@@ -1,0 +1,10 @@
+Package: pivot
+Version: @VERSION@
+Architecture: @ARCHITECTURE@
+Maintainer: Pivot Lake <support@pivotlake.io>
+Installed-Size: @INSTALLED_SIZE@
+Depends: adduser, init-system-helpers, libc6 (>= 2.31), libgcc-s1, libstdc++6
+Section: database
+Priority: optional
+Homepage: https://pivotlake.io
+Description: Pivot analytical database

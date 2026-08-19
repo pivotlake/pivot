@@ -1,0 +1,71 @@
+#![cfg(unix)]
+
+use std::fs;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+#[test]
+fn server_command_runs_until_terminated() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+
+    let directory = tempfile::tempdir().unwrap();
+    let datastore = directory.path().join("datastore");
+    let config = directory.path().join("config.yaml");
+    fs::write(
+        &config,
+        format!(
+            "server:\n  bind: {address}\n  memory: 64m\n  workers: 1\n\
+             metastore:\n  datastores:\n    default:\n      kind: delta\n      location: {}\n      \
+             default: true\n  users:\n    pivot:\n      auth:\n        method: trust\n",
+            datastore.display()
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pivot"))
+        .args(["server", "--config"])
+        .arg(&config)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    wait_until_listening(&mut child, address);
+    let result = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(result, 0, "failed to send SIGTERM");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "pivot server exited with {status}");
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("pivot server did not stop after SIGTERM");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_until_listening(child: &mut std::process::Child, address: SocketAddr) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if TcpStream::connect(address).is_ok() {
+            return;
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("pivot server exited with {status} before listening");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!("pivot server did not listen on {address}");
+}

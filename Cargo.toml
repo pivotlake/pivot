@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "benchmarks",
     "catalog",
+    "cli",
     "shell",
     "datastore",
     "datastore-delta",
@@ -28,6 +29,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 # Sibling crates.
 catalog = { path = "catalog" }
+cli = { path = "cli" }
 engine = { path = "engine" }
 datastore = { path = "datastore" }
 datastore-delta = { path = "datastore-delta" }
@@ -38,6 +40,7 @@ metastore = { path = "metastore" }
 metastore-disk = { path = "metastore-disk" }
 planner = { path = "planner" }
 server = { path = "server" }
+shell = { path = "shell" }
 thriftparquet = { path = "thriftparquet" }
 
 # The vendored arrow-rs fork (git submodule). `parquet` is the strict,
@@ -66,6 +69,7 @@ core_affinity = "0.8.3"
 criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
 crossbeam-deque = "0.8.6"
 crossbeam-queue = "0.3"
+flate2 = "1"
 insta = "1"
 libc = "0.2.184"
 lru = "0.18.1"

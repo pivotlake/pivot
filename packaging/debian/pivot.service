@@ -1,0 +1,20 @@
+[Unit]
+Description=Pivot database server
+Documentation=https://pivotlake.io
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=pivot
+Group=pivot
+WorkingDirectory=/var/lib/pivot
+ExecStart=/usr/bin/pivot server --config /etc/pivot/config.yaml --metastore-file /var/lib/pivot/metastore.yaml
+Restart=on-failure
+RestartSec=2s
+UMask=0077
+LimitNOFILE=1048576
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

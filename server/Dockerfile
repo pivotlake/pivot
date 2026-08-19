@@ -23,18 +23,18 @@ ENV RUSTC_WRAPPER=
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release -p server --bin pivotdb-server \
- && cp target/release/pivotdb-server /usr/local/bin/pivotdb-server
+    cargo build --release -p cli --bin pivot \
+ && cp target/release/pivot /usr/local/bin/pivot
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /usr/local/bin/pivotdb-server /usr/local/bin/pivotdb-server
+COPY --from=builder /usr/local/bin/pivot /usr/local/bin/pivot
 
 ENV RUST_LOG=info
 # Mount a config file and point the server at it. Set `server.bind` to
 # 0.0.0.0:5432 there so the pgwire port is reachable from outside the container
 # (the default, 127.0.0.1, is container-local only).
 EXPOSE 5432
-ENTRYPOINT ["pivotdb-server"]
+ENTRYPOINT ["pivot", "server"]
 CMD ["--config", "/etc/pivot/pivot.yaml"]
