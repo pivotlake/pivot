@@ -12,7 +12,7 @@ license.workspace = true
 
 [dependencies]
 clap = { workspace = true, features = ["env"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "sync"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
 tokio-postgres = { workspace = true }
 futures-util = "0.3"
 serde = { workspace = true }

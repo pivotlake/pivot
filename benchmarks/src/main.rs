@@ -33,6 +33,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 mod baseline;
+mod concurrent;
 mod insert;
 mod runner;
 mod server_handle;
@@ -135,6 +136,31 @@ struct Cli {
     /// exit — does not boot the server or run anything.
     #[arg(long)]
     show: bool,
+
+    /// Run the concurrency benchmark instead of the baseline flow: this many
+    /// clients each run the whole suite at once, and one invocation measures
+    /// one client count (compare counts across invocations). `--clients` with
+    /// no value means 6. Timings only; results are not checked. `--iterations`
+    /// is the number of timed sweeps per client.
+    #[arg(long, num_args = 0..=1, default_missing_value = "6")]
+    clients: Option<usize>,
+
+    /// Query ordering for the concurrent clients: `same` runs the canonical
+    /// order everywhere, `shuffled` gives each client its own deterministic
+    /// permutation (stable between runs).
+    #[arg(long, value_enum, default_value_t = concurrent::OrderMode::Same)]
+    order: concurrent::OrderMode,
+
+    /// Concurrency benchmark only: run one untimed sweep of every query before
+    /// the measured sweep, so it measures a warm server. Without it the
+    /// measured sweep starts cold, like any fresh server would.
+    #[arg(long, requires = "clients")]
+    warmup_sweep: bool,
+
+    /// Where the concurrency benchmark writes its full per-client, per-query
+    /// latencies as JSON. Only the printed report is produced without it.
+    #[arg(long, requires = "clients")]
+    json_out: Option<PathBuf>,
 }
 
 fn init_tracing() {
@@ -210,6 +236,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         drop_caches: cli.drop_caches,
         warmup: cli.warmup.clone(),
     };
+
+    if let Some(clients) = cli.clients {
+        let concurrency_opts = concurrent::Options {
+            clients,
+            order: cli.order,
+            sweeps: cli.iterations.max(1),
+            warmup_sweep: cli.warmup_sweep,
+            json_out: cli.json_out.clone(),
+        };
+        // Multi-threaded so N client connections are driven in parallel and
+        // the harness itself never serialises the load it is generating.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        rt.block_on(concurrent::run(&server, &suite, &opts, &concurrency_opts))?;
+        drop(server);
+        return Ok(());
+    }
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
