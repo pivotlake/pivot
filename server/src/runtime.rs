@@ -78,11 +78,21 @@ async fn wait_for_shutdown_signal() {
 }
 
 /// Return the machine's total physical memory in bytes.
-pub fn get_total_memory() -> usize {
+fn get_total_memory() -> usize {
+    read_memory().total_memory() as usize
+}
+
+/// Return how many bytes a new allocation on this machine can actually get hold
+/// of: free pages plus what the kernel can reclaim without swapping.
+fn get_available_memory() -> usize {
+    read_memory().available_memory() as usize
+}
+
+/// One reading of the machine's memory, as the OS reports it now.
+fn read_memory() -> sysinfo::System {
     sysinfo::System::new_with_specifics(
         sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
     )
-    .total_memory() as usize
 }
 
 fn build_disk_cache(config: Option<DiskCacheConfig>) -> Option<Arc<dispatch::io::DiskCache>> {
@@ -167,7 +177,18 @@ pub fn run(options: ServerOptions) -> Result<(), Error> {
             get_total_memory() * memory_pct / 100
         }
     };
-    info!(pool_bytes, "buffer pool memory budget");
+    // The pool is a share of *total* memory, but every one of its slots is
+    // faulted in while the workers start, so what it has to fit into is what the
+    // machine has free. Asking for more than that is not a slower server: it is
+    // an OOM kill part way through boot, which leaves nobody around to say why.
+    let available_bytes = get_available_memory();
+    info!(pool_bytes, available_bytes, "buffer pool memory budget");
+    if pool_bytes > available_bytes {
+        return Err(Error::InsufficientMemory {
+            requested_bytes: pool_bytes,
+            available_bytes,
+        });
+    }
     let dispatch = Dispatch::spin_up(workers, pool_bytes / BUFFER_SIZE, disk_cache);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
