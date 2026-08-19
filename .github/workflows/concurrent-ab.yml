@@ -1,0 +1,274 @@
+name: Concurrency A/B
+
+# Compare pivotdb behavior under concurrent load across two commits ("before"
+# vs "after") on ClickBench data, on a FRESHLY LAUNCHED instance-store machine
+# that is terminated when the run ends. The box does all the work itself
+# (benchmarks/concurrent/bench-concurrent-ab.sh, sharing
+# benchmarks/lib/bench-ab-common.sh with the TPC-H A/B jobs): checkouts from
+# an AMI-baked repo clone, dataset sync from S3 overlapping the builds, one
+# build per side, then per pass, side and client count a fresh server does a
+# warmup sweep and N shuffled clients run every query concurrently. The gate
+# is the concurrent wall per client count (min across passes): a regression
+# past the threshold fails the run. Aborted executions are reported per side
+# but never gate; query outputs are not checked (timings only).
+#
+# Both sides' servers are driven by the after side's pivot-bench, so a before
+# commit predating the concurrency mode still measures.
+#
+# Manual trigger only.
+#
+# Shares the TPC-H A/B infrastructure: the same baked AMI (TPCH_AB_AMI_ID),
+# secrets, instance profile and cache prefix. The dataset lives beside the
+# TPC-H scales as s3://epsio-tpch/clickbench-quarter/ (the first quarter of
+# ClickBench hits.parquet, 24,999,374 rows).
+
+on:
+  workflow_dispatch:
+    inputs:
+      before_ref:
+        description: "Baseline commit/ref ('before'). Empty = HEAD^ (the parent of the run's commit)."
+        required: false
+        default: ""
+      after_ref:
+        description: "Candidate commit/ref ('after'). Empty = the run's commit (HEAD)."
+        required: false
+        default: ""
+      build_mode:
+        description: "release = plain cargo --release (default; concurrency walls carry per-build PGO variance). pgo = full PGO per side."
+        type: choice
+        options: [release, pgo]
+        default: release
+      clients:
+        description: "Space-separated client counts to measure."
+        required: false
+        default: "1 3 6"
+      order:
+        description: "Query order per client: shuffled (deterministic per-client permutations) or same."
+        type: choice
+        options: [shuffled, same]
+        default: shuffled
+      passes:
+        description: "Measurement passes; the per-count wall is the min across passes."
+        required: false
+        default: "3"
+      regression_pct:
+        description: "Concurrent-wall regression threshold (percent) that fails the run."
+        required: false
+        default: "10"
+      bench_env:
+        description: "Extra env for both sides' runs, space-separated KEY=VALUE (e.g. PIVOT_COMPRESSED_CACHE_PCT=65)."
+        required: false
+        default: ""
+
+jobs:
+  concurrent-ab:
+    name: Concurrency A/B on a fresh box
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.PERF_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.PERF_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ vars.TPCH_AB_REGION || 'eu-central-1' }}
+      DATA_BUCKET: ${{ vars.CONCURRENT_AB_DATA_BUCKET || 's3://epsio-tpch' }}
+      CACHE_PREFIX: ${{ vars.TPCH_AB_CACHE_PREFIX || 's3://epsio-tpch-flat/tpch-ab-cache' }}
+
+    steps:
+      # No submodules: the box resolves sources from its baked clone. The full
+      # history is still needed to resolve arbitrary before/after refs.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve before/after commits
+        env:
+          BEFORE_REF: ${{ inputs.before_ref }}
+          AFTER_REF: ${{ inputs.after_ref }}
+        run: |
+          set -euo pipefail
+          git fetch --all --no-tags --quiet || true
+          after_sha=$(git rev-parse "${AFTER_REF:-HEAD}")
+          before_sha=$(git rev-parse "${BEFORE_REF:-HEAD^}")
+          if [ "$after_sha" = "$before_sha" ]; then
+            echo "::error::before and after resolve to the same commit ($after_sha)"
+            exit 1
+          fi
+          echo "AFTER_SHA=$after_sha"  >> "$GITHUB_ENV"
+          echo "BEFORE_SHA=$before_sha" >> "$GITHUB_ENV"
+          echo "after=$after_sha before=$before_sha"
+
+      - name: Launch a fresh box
+        env:
+          AMI_ID: ${{ vars.TPCH_AB_AMI_ID }}
+          INSTANCE_TYPE: ${{ vars.TPCH_AB_INSTANCE_TYPE || 'c8gd.4xlarge' }}
+          KEY_NAME: ${{ vars.TPCH_AB_KEY_NAME || 'maorgkeypair' }}
+          INSTANCE_PROFILE: ${{ vars.TPCH_AB_INSTANCE_PROFILE }}
+          SUBNET_ID: ${{ vars.TPCH_AB_SUBNET_ID }}
+          SECURITY_GROUP: ${{ vars.TPCH_AB_SECURITY_GROUP }}
+        run: |
+          set -euo pipefail
+          [ -n "$AMI_ID" ] || { echo "::error::TPCH_AB_AMI_ID is unset; bake one with benchmarks/tpch/bake-tpch-ab-ami.sh"; exit 1; }
+          [ -n "$INSTANCE_PROFILE" ] || { echo "::error::TPCH_AB_INSTANCE_PROFILE is unset"; exit 1; }
+
+          # The tag stays under the tpch-ab-* prefix the CI user may
+          # terminate; a tag outside it would leak the box.
+          args=(--image-id "$AMI_ID" --instance-type "$INSTANCE_TYPE" --count 1
+                --key-name "$KEY_NAME"
+                --iam-instance-profile "Name=$INSTANCE_PROFILE"
+                --instance-initiated-shutdown-behavior terminate
+                --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=tpch-ab-concurrent-${GITHUB_RUN_ID}}]")
+          [ -n "$SUBNET_ID" ] && args+=(--subnet-id "$SUBNET_ID")
+          [ -n "$SECURITY_GROUP" ] && args+=(--security-group-ids "$SECURITY_GROUP")
+
+          # Belt-and-braces leak guard: the instance halts itself after 3h and
+          # a halt terminates it (shutdown behavior above), so a runner that
+          # dies mid-job cannot leave the box running forever.
+          id=$(aws ec2 run-instances "${args[@]}" \
+            --user-data '#!/bin/bash
+          shutdown -h +180' \
+            --query 'Instances[0].InstanceId' --output text)
+          echo "INSTANCE_ID=$id" >> "$GITHUB_ENV"
+          echo "Launched $id"
+
+          aws ec2 wait instance-running --instance-ids "$id"
+          ip=$(aws ec2 describe-instances --instance-ids "$id" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          if [ "$ip" = "None" ] || [ -z "$ip" ]; then
+            echo "::error::instance $id has no public IP to ssh to."
+            exit 1
+          fi
+          echo "BOX_IP=$ip" >> "$GITHUB_ENV"
+          echo "Public IP: $ip"
+
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.TPCH_AB_SSH_KEY || secrets.PERF_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ab
+          chmod 600 ~/.ssh/id_ab
+          cat >> ~/.ssh/config <<EOF
+          Host box
+            HostName $BOX_IP
+            User ubuntu
+            IdentityFile ~/.ssh/id_ab
+            IdentitiesOnly yes
+            BatchMode yes
+            StrictHostKeyChecking accept-new
+            ServerAliveInterval 20
+            ConnectTimeout 15
+          EOF
+          for _ in $(seq 1 60); do
+            if ssh box true 2>/dev/null; then
+              echo "SSH is up."; exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::timed out waiting for SSH on $BOX_IP"
+          ssh -v box true 2>&1 | tail -8 || true
+          exit 1
+
+      - name: Run A/B (detached, polled)
+        env:
+          BUILD_MODE: ${{ inputs.build_mode }}
+          CLIENTS: ${{ inputs.clients }}
+          ORDER: ${{ inputs.order }}
+          PASSES: ${{ inputs.passes }}
+          REGRESSION_PCT: ${{ inputs.regression_pct }}
+          BENCH_ENV: ${{ inputs.bench_env }}
+          # Ephemeral, repo-read token: lets the box fetch the two commits into
+          # its baked clone. It expires when the job ends and the box is
+          # terminated regardless.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Ship the harness and its shared library from the run's commit (the
+          # 'before' commit may predate them). The harness finds the library by
+          # relative path, so both land in the same /tmp directory.
+          scp -F "$HOME/.ssh/config" benchmarks/concurrent/bench-concurrent-ab.sh box:/tmp/bench-concurrent-ab.sh
+          scp -F "$HOME/.ssh/config" benchmarks/lib/bench-ab-common.sh box:/tmp/bench-ab-common.sh
+
+          env_arg=""
+          [ -n "$BENCH_ENV" ] && env_arg="--bench-env '$BENCH_ENV'"
+
+          cat > /tmp/launch.sh <<EOF
+          rm -f /tmp/ab.log /tmp/ab-report.txt /tmp/bench-concurrent-ab.pid
+          setsid bash /tmp/bench-concurrent-ab.sh \
+            --mirror /opt/pivotdb \
+            --repo-url 'https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git' \
+            --before '$BEFORE_SHA' --after '$AFTER_SHA' \
+            --before-label '${BEFORE_SHA:0:12}' --after-label '${AFTER_SHA:0:12}' \
+            --data-bucket '$DATA_BUCKET' --cache-prefix '$CACHE_PREFIX' \
+            --mode '$BUILD_MODE' --passes '$PASSES' \
+            --clients '$CLIENTS' --order '$ORDER' \
+            --regression-pct '$REGRESSION_PCT' \
+            --report /tmp/ab-report.txt \
+            $env_arg >/tmp/ab.log 2>&1 </dev/null &
+          EOF
+          scp -F "$HOME/.ssh/config" /tmp/launch.sh box:/tmp/launch.sh
+          ssh box 'bash /tmp/launch.sh && rm -f /tmp/launch.sh'
+          echo "launched A/B run on the box"
+          sleep 10
+
+          # Poll: liveness first, then the sentinel; the EXIT trap writes the
+          # sentinel before the process dies, so "pid gone + no sentinel" only
+          # means an untrappable kill.
+          while true; do
+            state=$(ssh box '
+              if kill -0 "$(cat /tmp/bench-concurrent-ab.pid 2>/dev/null)" 2>/dev/null; then
+                echo alive
+              elif grep -q "BENCH-CONCURRENT-AB COMPLETE" /tmp/ab.log 2>/dev/null; then
+                echo done
+              else
+                echo dead
+              fi')
+            case "$state" in
+              done) break ;;
+              dead)
+                echo "::error::A/B process vanished without a sentinel (likely OOM/kill)."
+                ssh box 'tail -n 60 /tmp/ab.log' || true
+                exit 1 ;;
+              *)
+                ssh box 'tail -n 2 /tmp/ab.log' 2>/dev/null || true
+                sleep 20 ;;
+            esac
+          done
+
+          exit_line=$(ssh box "grep -o 'BENCH-CONCURRENT-AB COMPLETE exit=[0-9]*' /tmp/ab.log | tail -1")
+          code="${exit_line##*=}"
+          echo "A/B exit code: ${code:-unknown}"
+
+          scp -F "$HOME/.ssh/config" box:/tmp/ab-report.txt ab-report.txt || true
+          scp -F "$HOME/.ssh/config" box:/tmp/ab.log ab-full.log || true
+          {
+            echo "## pivotdb concurrency A/B ($BUILD_MODE, $ORDER order)"
+            echo ""
+            echo "before \`${BEFORE_SHA:0:12}\` vs after \`${AFTER_SHA:0:12}\`"
+            echo ""
+            echo '```'
+            cat ab-report.txt 2>/dev/null || echo "(no report captured)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${code:-1}" != "0" ]; then
+            echo "::error::A/B run reported a concurrent-wall regression or failed (exit=$code). See the job summary."
+            exit 1
+          fi
+          echo "No concurrent-wall regression past the threshold."
+
+      - name: Upload A/B report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: concurrent-ab-report
+          path: |
+            ab-report.txt
+            ab-full.log
+          if-no-files-found: ignore
+
+      - name: Terminate the box
+        if: ${{ always() && env.INSTANCE_ID != '' }}
+        run: |
+          set -euo pipefail
+          echo "Terminating ${INSTANCE_ID}"
+          aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" >/dev/null || true
