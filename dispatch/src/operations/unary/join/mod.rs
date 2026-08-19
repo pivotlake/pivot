@@ -416,7 +416,7 @@ mod tests {
         probe_fields: Option<Vec<Field>>,
         key_columns: Vec<usize>,
     ) -> JoinResult {
-        init_test_free_pool(16);
+        init_test_free_pool(64);
         let workers = build_worker_batches.len();
         // A join preserving one side alone emits only that side's columns.
         let probe_column_count = if ANTI && BUILD_OUTER {
@@ -798,6 +798,140 @@ mod tests {
 
         let total: usize = r.batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 1);
+    }
+
+    #[test]
+    fn straddling_drain_remainder_loses_no_pairs() {
+        // A drain remainder left by one probe batch plus the next batch's
+        // full drain accumulates more than one output batch before emitting.
+        // Every pair must still come through; consumers handle the oversized
+        // batch themselves.
+        let repeated = 3_000usize;
+        let distinct = 9_000usize;
+        let mut build_keys = vec![10i64; repeated];
+        build_keys.extend(100i64..100 + distinct as i64);
+        let build_batches = build_keys
+            .chunks(crate::RECORD_BATCH_SIZE)
+            .map(int64_batch)
+            .collect();
+        let probe_distinct: Vec<i64> = (100..100 + distinct as i64).collect();
+
+        let r = build_and_probe(
+            vec![build_batches],
+            vec![int64_batch(&[10]), int64_batch(&probe_distinct)],
+        );
+
+        assert_eq!(r.rows(), repeated + distinct);
+    }
+
+    /// The q20 corruption shape end to end: a join whose straddling drains
+    /// emit a larger-than-one-output batch, feeding a coalescing filter. The
+    /// filter's accumulator must chunk the oversized append itself; before it
+    /// did, the overflow wrote past its slabs and the tail rows came out with
+    /// garbage values.
+    #[test]
+    fn oversized_join_output_through_a_filter_keeps_values() {
+        use crate::operations::unary::filter::{FilterFactory, RowDelivery, RowSelection};
+        use crate::operations::unary::test_utils::run_unary_to_completion;
+
+        let repeated = 3_000usize;
+        let distinct = 9_000usize;
+        let mut build_keys = vec![10i64; repeated];
+        build_keys.extend(100i64..100 + distinct as i64);
+        let build_batches = build_keys
+            .chunks(crate::RECORD_BATCH_SIZE)
+            .map(int64_batch)
+            .collect();
+        let probe_distinct: Vec<i64> = (100..100 + distinct as i64).collect();
+        let joined = build_and_probe(
+            vec![build_batches],
+            vec![int64_batch(&[10]), int64_batch(&probe_distinct)],
+        );
+        assert!(
+            joined
+                .batches
+                .iter()
+                .any(|b| b.num_rows() > crate::RECORD_BATCH_SIZE),
+            "the join emits at least one oversized batch, or this exercises nothing"
+        );
+
+        // Keep all but the first row of each batch: a whole-batch selection
+        // would be forwarded untouched, and only partial selections coalesce
+        // through the accumulator.
+        let drop_first = FilterFactory(
+            |b: &RecordBatch, _: &mut _, indices: &mut Vec<u32>| {
+                indices.clear();
+                indices.extend(1..b.num_rows() as u32);
+                RowSelection::Indices
+            },
+            RowDelivery::Coalesced,
+        )
+        .build_unary();
+        // Same-schema filler rows below the emit threshold first, so the
+        // join's oversized batch lands on a part-full accumulator, as q20's
+        // did.
+        let filler = 8_000usize;
+        let filler_keys: Vec<i64> = (1_000_000..1_000_000 + filler as i64).collect();
+        let filler_schema = joined.batches[0].schema();
+        let filler_columns: Vec<arrow_array::ArrayRef> = (0..filler_schema.fields().len())
+            .map(|_| {
+                std::sync::Arc::new(arrow_array::Int64Array::from(filler_keys.clone()))
+                    as arrow_array::ArrayRef
+            })
+            .collect();
+        let filler_batch = RecordBatch::try_new(filler_schema, filler_columns).unwrap();
+
+        let mut inputs = vec![filler_batch];
+        inputs.extend(joined.batches);
+        let mut expected: Vec<i64> = inputs
+            .iter()
+            .flat_map(|b| collect_i64_column(std::slice::from_ref(b), 0).split_off(1))
+            .collect();
+        expected.sort();
+
+        let filtered = run_unary_to_completion(drop_first, inputs);
+
+        let mut keys = collect_i64_column(&filtered, 0);
+        keys.sort();
+        assert_eq!(keys, expected);
+    }
+
+    #[test]
+    fn build_semi_probe_batch_larger_than_pair_buffer() {
+        // A probe batch bigger than the collector's pair buffers must still
+        // flag every matched build row across the buffer's drain cycles.
+        let n = 20_000;
+        let keys: Vec<i64> = (0..n as i64).collect();
+        let r =
+            build_and_probe_build_semi(vec![vec![int64_batch(&keys)]], vec![int64_batch(&keys)]);
+
+        assert_eq!(r.rows(), n);
+    }
+
+    #[test]
+    fn build_semi_large_build_large_probe_batch() {
+        // The build side is large enough for a multi-slab directory and the
+        // probe batch overflows the pair buffers twice, with repeating keys.
+        let build_n: i64 = 1_000_000;
+        let build_keys: Vec<i64> = (0..build_n).collect();
+        let build_batches: Vec<Vec<RecordBatch>> = vec![
+            build_keys
+                .chunks(crate::RECORD_BATCH_SIZE)
+                .map(int64_batch)
+                .collect(),
+        ];
+        let probe_n = 19_400usize;
+        let probe_keys: Vec<i64> = (0..probe_n as i64).map(|i| (i * 733) % build_n).collect();
+        let expected: usize = {
+            let mut distinct = probe_keys.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            distinct.len()
+        };
+
+        let r = build_and_probe_build_semi(build_batches, vec![int64_batch(&probe_keys)]);
+
+        assert_eq!(r.rows(), expected);
     }
 
     #[test]

@@ -166,8 +166,13 @@ where
         let accumulator = self.accumulator.get_or_insert_with(|| {
             BatchAccumulator::retaining_source_buffers(batch.schema(), &mut self.allocator)
         });
-        accumulator.append_batch_by_indices(&batch, &self.selection, &mut self.allocator);
-        if accumulator.has_full_batch() || self.delivery == RowDelivery::Immediate {
+        accumulator.append_batch_by_indices_flushing::<unary::Error>(
+            &batch,
+            &self.selection,
+            &mut self.allocator,
+            &mut |full| output.send(full).map_err(Into::into),
+        )?;
+        if self.delivery == RowDelivery::Immediate && !accumulator.is_empty() {
             output.send(accumulator.take_batch(&mut self.allocator)?)?;
         }
         Ok(())
@@ -249,6 +254,32 @@ mod tests {
             .unwrap()
             .values()
             .to_vec()
+    }
+
+    #[test]
+    fn oversized_input_batch_survivors_all_emitted() {
+        // An input batch far larger than the accumulator's capacity (join and
+        // group-by outputs can exceed one output batch) must flow through in
+        // full: the accumulator splits the append itself, flushing as it
+        // fills, instead of writing past its slabs.
+        init_test_free_pool(16);
+        let n = 40_000i32;
+        let values: Vec<i32> = (0..n).collect();
+        let filter = filter_operator(
+            |b: &RecordBatch, _: &mut SlabAllocator, indices: &mut Vec<u32>| {
+                indices.clear();
+                // Keep all but every 1000th row, so the survivors are a
+                // gathered (indices) selection rather than a pass-through.
+                indices.extend((0..b.num_rows() as u32).filter(|i| i % 1000 != 0));
+                RowSelection::Indices
+            },
+        );
+
+        let out = run_unary_to_completion(filter, vec![batch(&values)]);
+
+        let got: Vec<i32> = out.iter().flat_map(i32_col).collect();
+        let expected: Vec<i32> = (0..n).filter(|v| v % 1000 != 0).collect();
+        assert_eq!(got, expected);
     }
 
     #[test]
