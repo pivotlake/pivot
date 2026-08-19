@@ -86,9 +86,8 @@ impl OutputRead {
         let Some(extract) = extract else {
             return Self::WholeColumn(leaf_range(fields, column));
         };
-        let value_leaves = extract.as_type.as_ref().and_then(|target| {
-            variant_shredded_leaves(fields, column, &extract.path).map(|leaves| (leaves, target))
-        });
+        let value_leaves =
+            variant_shredded_leaves(fields, column, &extract.path).zip(extract.as_type.as_ref());
         if let Some((leaves, target)) = &value_leaves
             && let Some(read) = Self::try_create_typed_leaf(metadata, leaves, target)
         {
