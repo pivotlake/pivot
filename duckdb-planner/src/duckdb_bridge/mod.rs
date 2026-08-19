@@ -458,12 +458,6 @@ pub mod ffi {
             index: usize,
         ) -> Result<BridgeLogicalType>;
 
-        // ---- ComparisonJoin: late materialization ----
-        /// Whether this is the SEMI join DuckDB's late_materialization optimizer
-        /// produces (vs a user IN/EXISTS), which the bridge collapses into a
-        /// Materialize.
-        fn lo_is_late_materialization_join(op: &LogicalOperator) -> Result<bool>;
-
         // ---- ExpressionList (owned synthesized expressions) ----
         fn expr_list_count(list: &ExpressionList) -> Result<usize>;
         fn expr_list_get(list: &ExpressionList, index: usize) -> Result<&Expression>;

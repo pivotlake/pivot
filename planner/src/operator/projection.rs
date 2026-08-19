@@ -100,11 +100,11 @@ impl Projection {
                 // A constant projection (e.g. `SELECT 1`) yields a length-1 scalar;
                 // `into_array` broadcasts it to the batch's row count so every output
                 // column has the same length.
-                let columns: Vec<ArrayRef> = evals
+                let mut columns: Vec<ArrayRef> = evals
                     .iter_mut()
                     .map(|eval| eval(&batch).into_array(num_rows))
                     .collect();
-                let fields: Vec<Field> = columns
+                let mut fields: Vec<Field> = columns
                     .iter()
                     .enumerate()
                     .map(|(i, c)| {
@@ -119,6 +119,14 @@ impl Projection {
                         }
                     })
                     .collect();
+                // As in the fast path above: carry a late-materialized narrow
+                // scan's trailing row-group metadata columns through untouched,
+                // so the downstream materializer still finds them.
+                let meta = dispatch::trailing_metadata_columns(batch.schema_ref());
+                for column in (batch.num_columns() - meta)..batch.num_columns() {
+                    fields.push(batch.schema().field(column).clone());
+                    columns.push(batch.column(column).clone());
+                }
                 RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
             }
         }))

@@ -949,33 +949,6 @@ rust::String lo_copy_stdin_option_value(const LogicalOperator &op, size_t index,
 	return rust::String::lossy(as<duckdb::LogicalCopyFromStdin>(op).options[index].second[value_index].ToString());
 }
 
-// ---- ComparisonJoin: late materialization ----
-
-// Whether a SEMI join is the one DuckDB's late_materialization optimizer
-// produces (vs a user IN/EXISTS): its LHS is a bare LogicalGet carrying a column
-// tagged with COLUMN_IDENTIFIER_ROW_ID.
-static bool is_late_materialization_join(duckdb::LogicalComparisonJoin &join) {
-	if (join.children.empty() ||
-	    join.children[0]->type != duckdb::LogicalOperatorType::LOGICAL_GET) {
-		return false;
-	}
-	auto &lhs_get = join.children[0]->Cast<duckdb::LogicalGet>();
-	for (auto &cid : lhs_get.GetColumnIds()) {
-		if (cid.GetPrimaryIndex() == duckdb::COLUMN_IDENTIFIER_ROW_ID) {
-			return true;
-		}
-	}
-	return false;
-}
-
-bool lo_is_late_materialization_join(const LogicalOperator &op) {
-	if (op.type != duckdb::LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
-		return false;
-	}
-	auto &join = as<duckdb::LogicalComparisonJoin>(op);
-	return join.join_type == duckdb::JoinType::SEMI && is_late_materialization_join(join);
-}
-
 // ---- CTE ----
 
 // The index a materialized CTE publishes its rows under, which every reference
