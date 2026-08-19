@@ -43,10 +43,10 @@ rather than the only way in.
 <text x="618" y="150" class="arch-tiny">part-00001-9c21….parquet</text>
 <line x1="215" y1="250" x2="215" y2="182" class="arch-line" marker-start="url(#arch-head)" marker-end="url(#arch-head)" />
 <text x="229" y="220" class="arch-muted">read + write</text>
-<line x1="545" y1="250" x2="545" y2="182" class="arch-line" marker-end="url(#arch-head)" />
-<text x="559" y="220" class="arch-muted">read</text>
-<line x1="790" y1="250" x2="790" y2="182" class="arch-line" marker-end="url(#arch-head)" />
-<text x="804" y="220" class="arch-muted">read</text>
+<line x1="530" y1="250" x2="530" y2="182" class="arch-line" marker-end="url(#arch-head)" />
+<text x="544" y="220" class="arch-muted">read</text>
+<line x1="775" y1="250" x2="775" y2="182" class="arch-line" marker-end="url(#arch-head)" />
+<text x="789" y="220" class="arch-muted">read</text>
 <rect x="40" y="250" width="350" height="160" rx="3" class="arch-panel" />
 <text x="64" y="280" class="arch-title">pivotdb cluster</text>
 <text x="366" y="280" text-anchor="end" class="arch-muted">writer</text>
@@ -86,31 +86,31 @@ rather than the only way in.
 <rect x="300" y="354" width="16" height="16" rx="1" class="arch-cell" />
 <rect x="322" y="354" width="16" height="16" rx="1" class="arch-cell" />
 <rect x="344" y="354" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="410" y="250" width="270" height="160" rx="3" class="arch-panel" />
-<text x="545" y="280" text-anchor="middle" class="arch-title">Agents</text>
-<rect x="424" y="296" width="242" height="46" rx="2" class="arch-inner" />
-<rect x="425" y="297" width="240" height="16" class="arch-strip" />
-<line x1="425" y1="313" x2="665" y2="313" class="arch-rule" />
-<text x="432" y="309" class="arch-tiny">agent 1</text>
-<text x="432" y="330" class="arch-prompt">$</text>
-<text x="445" y="330" class="arch-cmd">pivot open s3://pivotlake/events</text>
-<rect x="424" y="352" width="242" height="46" rx="2" class="arch-inner" />
-<rect x="425" y="353" width="240" height="16" class="arch-strip" />
-<line x1="425" y1="369" x2="665" y2="369" class="arch-rule" />
-<text x="432" y="365" class="arch-tiny">agent 2</text>
-<text x="432" y="386" class="arch-prompt">$</text>
-<text x="445" y="386" class="arch-cmd">pivot open s3://pivotlake/orders</text>
-<rect x="700" y="250" width="180" height="160" rx="3" class="arch-panel" />
-<text x="790" y="280" text-anchor="middle" class="arch-title">Other engines</text>
-<rect x="714" y="296" width="152" height="32" rx="2" class="arch-inner" />
-<rect x="726" y="305" width="14" height="14" rx="1" class="arch-cell" />
-<text x="748" y="317" class="arch-muted">DuckDB</text>
-<rect x="714" y="332" width="152" height="32" rx="2" class="arch-inner" />
-<rect x="726" y="341" width="14" height="14" rx="1" class="arch-cell" />
-<text x="748" y="353" class="arch-muted">Spark</text>
-<rect x="714" y="368" width="152" height="32" rx="2" class="arch-inner" />
-<rect x="726" y="377" width="14" height="14" rx="1" class="arch-cell" />
-<text x="748" y="389" class="arch-muted">pandas · Trino</text>
+<rect x="410" y="250" width="240" height="160" rx="3" class="arch-panel" />
+<text x="530" y="280" text-anchor="middle" class="arch-title">Agents</text>
+<rect x="426" y="296" width="208" height="46" rx="2" class="arch-inner" />
+<rect x="427" y="297" width="206" height="16" class="arch-strip" />
+<line x1="427" y1="313" x2="633" y2="313" class="arch-rule" />
+<text x="434" y="309" class="arch-tiny">agent 1</text>
+<text x="434" y="330" class="arch-prompt">$</text>
+<text x="447" y="330" class="arch-cmd">pivot open s3://pivotlake</text>
+<rect x="426" y="352" width="208" height="46" rx="2" class="arch-inner" />
+<rect x="427" y="353" width="206" height="16" class="arch-strip" />
+<line x1="427" y1="369" x2="633" y2="369" class="arch-rule" />
+<text x="434" y="365" class="arch-tiny">agent 2</text>
+<text x="434" y="386" class="arch-prompt">$</text>
+<text x="447" y="386" class="arch-cmd">pivot open s3://pivotlake</text>
+<rect x="670" y="250" width="210" height="160" rx="3" class="arch-panel" />
+<text x="775" y="280" text-anchor="middle" class="arch-title">Other engines</text>
+<rect x="684" y="296" width="182" height="32" rx="2" class="arch-inner" />
+<rect x="696" y="305" width="14" height="14" rx="1" class="arch-cell" />
+<text x="718" y="317" class="arch-muted">DuckDB</text>
+<rect x="684" y="332" width="182" height="32" rx="2" class="arch-inner" />
+<rect x="696" y="341" width="14" height="14" rx="1" class="arch-cell" />
+<text x="718" y="353" class="arch-muted">Spark</text>
+<rect x="684" y="368" width="182" height="32" rx="2" class="arch-inner" />
+<rect x="696" y="377" width="14" height="14" rx="1" class="arch-cell" />
+<text x="718" y="389" class="arch-muted">pandas · Trino</text>
 <line x1="215" y1="460" x2="215" y2="412" class="arch-line" marker-end="url(#arch-head)" />
 <text x="229" y="440" class="arch-muted">Postgres wire</text>
 <rect x="40" y="460" width="350" height="72" rx="3" class="arch-panel" />
