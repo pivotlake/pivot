@@ -170,37 +170,37 @@ async fn queries_bind_tables_by_datastore_name() {
             Some(default_id),
         ],
         // The system datastore describes itself, so its own relations are part
-        // of the inventory. They are not stored, hence the qualified name in
-        // place of a durable id.
+        // of the inventory. They are not stored, so their ids are minted with
+        // the datastore rather than by a manifest, and are constant.
         vec![
             Some("system".into()),
             Some("main".into()),
             Some("columns".into()),
-            Some("system.columns".into()),
+            Some("f1e1d500-da7a-4ce5-bead-e4c77ab1e50f".into()),
         ],
         vec![
             Some("system".into()),
             Some("main".into()),
             Some("datastores".into()),
-            Some("system.datastores".into()),
+            Some("da7aba5e-5e75-4a11-ab1e-5e1ec7edda7a".into()),
         ],
         vec![
             Some("system".into()),
             Some("main".into()),
             Some("memory_blocks".into()),
-            Some("system.memory_blocks".into()),
+            Some("a110ca7e-b10c-4bed-ba5e-b10c54110ca7".into()),
         ],
         vec![
             Some("system".into()),
             Some("main".into()),
             Some("table_files".into()),
-            Some("system.table_files".into()),
+            Some("7ab1ef11-e500-4ded-b10b-de1e7edf11e5".into()),
         ],
         vec![
             Some("system".into()),
             Some("main".into()),
             Some("tables".into()),
-            Some("system.tables".into()),
+            Some("007ab1e5-1157-4c1d-8055-f1e1d50fda7a".into()),
         ],
         vec![
             Some("warm".into()),

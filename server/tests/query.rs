@@ -414,6 +414,38 @@ async fn system_tables_and_columns_describe_a_table(#[future] conn: Conn) {
     );
 }
 
+/// The system relations are described by the same relations they serve, and
+/// keyed the same way: their id is the constant one the datastore mints, so a
+/// join from `system.columns` reaches them exactly as it reaches a stored
+/// table's columns.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn system_columns_describes_the_system_relations_by_their_id(#[future] conn: Conn) {
+    let rows = select_rows(
+        &conn,
+        "SELECT t.id, c.name, c.type \
+         FROM system.columns c JOIN system.tables t ON c.\"table\" = t.id \
+         WHERE t.datastore = 'system' AND t.name = 'datastores' ORDER BY c.position",
+    )
+    .await;
+
+    let id = "da7aba5e-5e75-4a11-ab1e-5e1ec7edda7a";
+    assert_eq!(
+        rows,
+        vec![
+            vec![Some(id.into()), Some("name".into()), Some("VARCHAR".into())],
+            vec![Some(id.into()), Some("id".into()), Some("VARCHAR".into())],
+            vec![Some(id.into()), Some("type".into()), Some("VARCHAR".into())],
+            vec![
+                Some(id.into()),
+                Some("data_path".into()),
+                Some("VARCHAR".into()),
+            ],
+        ],
+    );
+}
+
 /// A partitioned table's files report the partition they hold, so the files of
 /// one partition are a query rather than a path convention.
 #[rstest]
