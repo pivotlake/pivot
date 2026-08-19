@@ -143,19 +143,10 @@
   fill: var(--sl-color-gray-3);
 }
 
-.arch-accent-line {
-  stroke: var(--sl-color-text-accent);
-  stroke-width: 1.5;
-  fill: none;
-}
-
-.arch-accent-head {
-  fill: var(--sl-color-text-accent);
-}
-
-.arch-accent-text {
-  fill: var(--sl-color-text-accent);
-  font-size: 12.5px;
+/* File chips inside a table card, where three have to fit side by side. */
+.arch-tiny {
+  fill: var(--sl-color-gray-3);
+  font-size: 11px;
 }
 
 /* Card internals: header strips, worker cells, terminal lines, badges. */
