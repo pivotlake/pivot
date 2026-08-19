@@ -150,6 +150,12 @@ impl BoundTable for TestTable {
         self.nullability.clone()
     }
 
+    // Test tables scan real parquet files, so they resolve pushed paths
+    // against each file's shredding exactly like a production table.
+    fn applies_variant_extracts(&self) -> bool {
+        true
+    }
+
     fn clone_box(&self) -> Box<dyn BoundTable> {
         Box::new(self.clone())
     }
