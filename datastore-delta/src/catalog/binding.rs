@@ -282,7 +282,7 @@ impl BoundTable for TableBinding {
     fn compile_insert(
         &self,
         input: RecordBatchOperatorSpec,
-        dispatcher: &DataFlowDispatcher,
+        _dispatcher: &DataFlowDispatcher,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
         // The captured snapshot copy stamps the durable schema and target table
         // id onto every written file; the shared injector hands each finished
@@ -292,7 +292,6 @@ impl BoundTable for TableBinding {
             &self.table,
             self.uploaded_files.clone(),
             input,
-            dispatcher,
         )?)
     }
 

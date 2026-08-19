@@ -7,20 +7,20 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow_array::{Int64Array, RecordBatch};
 
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use arrow_schema::{DataType, Field, Schema};
 use crossbeam_deque::Injector;
 use dispatch::io::{
     FsWriteRequest, HttpUploadRequest, LocalFile, OpenFile, OperatorIO, RemoteFile,
 };
 use dispatch::{
-    DataFlowDispatcher, RecordBatchOperatorSpec, Sender, Unary, UnaryFactory, stealable,
+    OperatorFactory, OperatorSpec, RecordBatchOperatorSpec, Sender, Unary, UnaryFactory, stealable,
 };
 use planner::catalog::Column;
 use uuid::Uuid;
 
 use crate::catalog::CatalogTable;
 use crate::parquet::RowGroupMetadata;
-use crate::parquet::writing::{AssembledFile, encode_record_batches_spec, unshred_batch};
+use crate::parquet::writing::{AssembledFile, encode_record_batches_spec, unshred_batches_spec};
 use crate::store::{DataFileLocation, FileRef, ObjectPath, ObjectStore};
 
 /// Build the dataflow that writes `input`'s rows into `table` as Parquet and
@@ -34,7 +34,6 @@ pub(super) fn build_insert_spec(
     table: &CatalogTable,
     uploaded_files: Arc<Injector<UploadedFile>>,
     input: RecordBatchOperatorSpec,
-    dispatcher: &DataFlowDispatcher,
 ) -> crate::Result<RecordBatchOperatorSpec> {
     let store = table.store();
     store.prepare_write()?;
@@ -74,7 +73,7 @@ pub(super) fn build_insert_spec(
             })
             .collect::<Vec<_>>(),
     ));
-    let input = input.project({
+    let input = unshred_batches_spec(input).project({
         let schema = schema.clone();
         move || {
             let schema = schema.clone();
@@ -84,8 +83,6 @@ pub(super) fn build_insert_spec(
                 // declared here is the plain pair. Reassemble the documents, so
                 // the rows are shredded for the file they land in rather than
                 // carrying the source table's layout across.
-                let batch = unshred_batch(batch)
-                    .expect("a variant column reassembles into metadata and value");
                 RecordBatch::try_new(schema.clone(), batch.columns().to_vec())
                     .expect("INSERT binding matches the target table schema")
             }
@@ -98,60 +95,47 @@ pub(super) fn build_insert_spec(
     // adding a complete batch. Compression and encoding normally make the
     // resulting files substantially smaller on disk.
     const TARGET_IN_MEMORY_BYTES_PER_FILE: usize = 900 * 1024 * 1024;
-    Ok(encode_and_upload_spec(
-        store,
-        table.object_location().clone(),
-        table.id(),
-        table.columns().into(),
-        uploaded_files,
+    let encoded = encode_record_batches_spec(
         input,
         schema,
         table.partition_by().to_vec().into(),
         table.sort_by().to_vec().into(),
         TARGET_ROWS_PER_GROUP,
         TARGET_IN_MEMORY_BYTES_PER_FILE,
-        dispatcher,
+    );
+    Ok(upload_files_spec(
+        store,
+        table.object_location().clone(),
+        table.id(),
+        table.columns().into(),
+        uploaded_files,
+        encoded,
     ))
 }
 
-/// The shared write stage: encode `input`'s rows into Parquet files and upload
-/// each over the ring, pushing every finished file onto `uploaded_files`. Both
-/// INSERT (which stamps the durable schema first) and compaction (which feeds a
-/// table scan) build on this; whoever owns `uploaded_files` decides how the files
-/// commit. The finish emits the inserted-row count as a single batch.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn encode_and_upload_spec(
+/// Upload assembled Parquet files over the ring and push every completion onto
+/// `uploaded_files`. INSERT and compaction prepare files through different front
+/// halves of the write pipeline and share this storage-facing tail.
+pub(super) fn upload_files_spec<OF>(
     store: Arc<dyn ObjectStore>,
     location: ObjectPath,
     table_id: Uuid,
     declared_columns: Arc<[Column]>,
     uploaded_files: Arc<Injector<UploadedFile>>,
-    input: RecordBatchOperatorSpec,
-    schema: SchemaRef,
-    partition_column_names: Arc<[String]>,
-    sort_column_names: Arc<[String]>,
-    target_rows_per_group: usize,
-    target_in_memory_bytes_per_file: usize,
-    dispatcher: &DataFlowDispatcher,
-) -> RecordBatchOperatorSpec {
-    let encoded = encode_record_batches_spec(
-        input,
-        schema,
-        partition_column_names,
-        sort_column_names,
-        target_rows_per_group,
-        target_in_memory_bytes_per_file,
-    );
-    let workers = dispatcher.worker_count();
+    encoded: OperatorSpec<AssembledFile, OF>,
+) -> RecordBatchOperatorSpec
+where
+    OF: OperatorFactory<AssembledFile> + 'static,
+{
+    let workers = encoded.dispatcher().worker_count();
+    let topology = encoded.dispatcher().topology();
     // One shared total; every worker's `Upload` adds its completions to it and the
     // last worker into `finish` emits it once all uploads have landed, so no
     // separate fan-in is needed.
     let rows = Arc::new(AtomicUsize::new(0));
     let remaining_workers = Arc::new(AtomicUsize::new(workers));
     let uploads = encoded.chain(
-        stealable::<AssembledFile>(dispatcher.topology())
-            .into_iter()
-            .collect(),
+        stealable::<AssembledFile>(topology).into_iter().collect(),
         (0..workers)
             .map(|_| {
                 UploadFactory::new(

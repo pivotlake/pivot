@@ -682,9 +682,8 @@ impl CatalogTable {
         inputs: &[FileRef],
         target_rows_per_group: usize,
     ) -> crate::Result<Vec<TableFile>> {
-        // Scan only the inputs and re-encode their rows. They share one partition
-        // tuple, so re-applying the table's partition/sort spec reproduces that
-        // tuple and recomputes the merged files' sort bounds.
+        // The selector guarantees that all inputs share one partition, so its
+        // recorded tuple can key every decoded batch without repartitioning it.
         let parquet = self.parquet_table_for(inputs);
         let columns = parquet.schema().fields().len();
         let scan = crate::parquet::table_input(
@@ -693,22 +692,31 @@ impl CatalogTable {
             Projection::all(columns),
             false,
         );
+        let partition = inputs.first().and_then(|input| {
+            self.files
+                .iter()
+                .find(|file| file.entry.file.path == input.path)
+                .expect("a compaction input belongs to this table")
+                .entry
+                .partition
+                .clone()
+        });
         let uploaded_files = Arc::new(Injector::new());
-        let spec = super::insert_sink::encode_and_upload_spec(
+        let encoded = crate::parquet::writing::encode_compaction_batches_spec(
+            scan,
+            parquet.schema().clone(),
+            partition,
+            Arc::from(self.partition_by()),
+            Arc::from(self.sort_by()),
+            target_rows_per_group,
+        );
+        let spec = super::insert_sink::upload_files_spec(
             self.store(),
             self.location.clone(),
             self.id(),
             self.declared_columns(),
             uploaded_files.clone(),
-            scan,
-            parquet.schema().clone(),
-            Arc::from(self.partition_by()),
-            Arc::from(self.sort_by()),
-            target_rows_per_group,
-            // Compaction produces one ordered output file for each selected
-            // partition, so it disables the INSERT file-size target.
-            usize::MAX,
-            &self.dispatcher,
+            encoded,
         );
         // Drive encode → upload to completion; the emitted row-count batch is
         // ignored, and the uploaded files arrive on `uploaded_files`.
