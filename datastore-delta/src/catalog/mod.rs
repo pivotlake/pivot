@@ -1261,7 +1261,11 @@ impl Datastore for DeltaDatastore {
         }
         let compacter = crate::compact::Compacter::new(
             crate::compact::DEFAULT_COMPACT_BYTES,
-            crate::compact::DEFAULT_MIN_FILES_TO_MERGE,
+            if final_sweep {
+                2
+            } else {
+                crate::compact::DEFAULT_MIN_FILES_TO_MERGE
+            },
             // The poll interval drives the background loop, which a manual
             // sweep never enters.
             std::time::Duration::from_secs(1),

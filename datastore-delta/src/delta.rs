@@ -19,9 +19,9 @@ use arrow_schema::{DataType as ArrowDataType, Field as ArrowField, Fields};
 use delta_kernel::EngineData;
 use delta_kernel::Snapshot;
 use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
-use delta_kernel::engine_data::{FilteredEngineData, GetData, RowVisitor, TypedGetData as _};
-use delta_kernel::expressions::ColumnName;
+use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::expressions::Scalar as DeltaScalar;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::scan::state::ScanFile;
@@ -177,8 +177,9 @@ pub(crate) fn initialize_table(
 }
 
 /// Atomically commit a data-file change through Kernel: `add` every entry in
-/// `added`, `remove` every path in `removed`, in one commit. An empty `removed`
-/// is a plain append. `data_change` labels the commit: `true` for a logical
+/// `added`, `remove` every entry in `removed`, in one commit. An empty `removed`
+/// is a plain append. The caller has already verified that each removed entry is
+/// live in `snapshot`. `data_change` labels the commit: `true` for a logical
 /// change (INSERT, DELETE), `false` for a rearrangement that leaves the rows
 /// identical (compaction), which lets incremental readers skip it.
 ///
@@ -191,7 +192,7 @@ pub(crate) fn initialize_table(
 pub(crate) fn commit_file_changes(
     engine: &DeltaEngine,
     snapshot: &Arc<Snapshot>,
-    removed: &[ObjectPath],
+    removed: &[DeltaFileEntry],
     added: &[DeltaFileEntry],
     data_change: bool,
 ) -> Result<Option<Arc<Snapshot>>, Error> {
@@ -207,12 +208,7 @@ pub(crate) fn commit_file_changes(
             .as_millis() as u64;
         txn.add_files(add_files_metadata(added, modification_time)?);
     }
-    // If a file we meant to remove is no longer live, another writer already
-    // swapped it: treat as a lost race so the caller refreshes and retries.
-    let removed_found = stage_removals(&mut txn, snapshot, engine, removed)?;
-    if removed_found < removed.len() {
-        return Ok(None);
-    }
+    stage_removals(&mut txn, removed)?;
 
     // A conflict returns `None` so the caller reloads onto the newer version and
     // retries — progress guaranteed by the advanced version. A retryable (IO)
@@ -311,68 +307,91 @@ fn maybe_checkpoint(engine: &DeltaEngine, snapshot: Arc<Snapshot>) -> Arc<Snapsh
     }
 }
 
-/// Stage removals of `removed` on `txn`. Kernel removes files by selecting rows
-/// of a scan over the table, so scan the snapshot and mark exactly the rows whose
-/// path is in `removed` (intersected with the scan's own live selection).
-/// Returns how many of `removed` were actually found live and selected.
-fn stage_removals(
-    txn: &mut Transaction,
-    snapshot: &Arc<Snapshot>,
-    engine: &DeltaEngine,
-    removed: &[ObjectPath],
-) -> Result<usize, Error> {
+/// Stage removals of `removed` on `txn` from metadata the catalog already holds.
+/// Kernel accepts the same scan-row shape it normally produces while scanning a
+/// snapshot, so constructing those rows directly avoids rereading every active
+/// Add action merely to remove a small compaction batch.
+fn stage_removals(txn: &mut Transaction, removed: &[DeltaFileEntry]) -> Result<(), Error> {
     if removed.is_empty() {
-        return Ok(0);
+        return Ok(());
     }
-    let removed_set: std::collections::HashSet<&str> =
-        removed.iter().map(ObjectPath::as_str).collect();
-    let scan = snapshot.clone().scan_builder().build()?;
-    let mut found = 0;
-    for metadata in scan.scan_metadata(engine.kernel())? {
-        let (data, live) = metadata?.scan_files.into_parts();
-        let mut visitor = ScanPathVisitor { paths: Vec::new() };
-        visitor.visit_rows_of(&*data)?;
-        let selection: Vec<bool> = visitor
-            .paths
-            .iter()
-            .enumerate()
-            .map(|(row, path)| {
-                removed_set.contains(path.as_str()) && live.get(row).copied().unwrap_or(true)
-            })
-            .collect();
-        let selected = selection.iter().filter(|&&s| s).count();
-        if selected > 0 {
-            found += selected;
-            txn.remove_files(FilteredEngineData::try_new(data, selection)?);
-        }
-    }
-    Ok(found)
+    let data = remove_files_metadata(removed)?;
+    txn.remove_files(FilteredEngineData::try_new(
+        data,
+        vec![true; removed.len()],
+    )?);
+    Ok(())
 }
 
-/// Reads the `path` of each scan-file row, so [`stage_removals`] can select the
-/// rows to remove by path.
-struct ScanPathVisitor {
-    paths: Vec<String>,
-}
-
-impl RowVisitor for ScanPathVisitor {
-    fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DeltaDataType]) {
-        static NAMES_AND_TYPES: LazyLock<(Vec<ColumnName>, Vec<DeltaDataType>)> =
-            LazyLock::new(|| (vec![ColumnName::new(["path"])], vec![DeltaDataType::STRING]));
-        (&NAMES_AND_TYPES.0, &NAMES_AND_TYPES.1)
-    }
-
-    fn visit<'a>(
-        &mut self,
-        row_count: usize,
-        getters: &[&'a dyn GetData<'a>],
-    ) -> delta_kernel::DeltaResult<()> {
-        for row in 0..row_count {
-            let path: Option<String> = getters[0].get_opt(row, "path")?;
-            self.paths.push(path.unwrap_or_default());
+/// Build Kernel scan rows for files being removed. Pivot does not support
+/// deletion vectors or row tracking, and its catalog entries preserve the
+/// fields relevant to that supported subset: path, size, and partition values.
+fn remove_files_metadata(
+    entries: &[DeltaFileEntry],
+) -> Result<Box<dyn delta_kernel::EngineData>, Error> {
+    let schema: arrow_schema::Schema = delta_kernel::scan::scan_row_schema()
+        .as_ref()
+        .try_into_arrow()?;
+    let mut paths = StringBuilder::new();
+    let mut sizes = Int64Builder::new();
+    let mut partition_values = MapBuilder::new(
+        Some(MapFieldNames {
+            entry: "key_value".to_string(),
+            key: "key".to_string(),
+            value: "value".to_string(),
+        }),
+        StringBuilder::new(),
+        StringBuilder::new(),
+    );
+    for entry in entries {
+        paths.append_value(entry.file.path.as_str());
+        sizes.append_value(entry.file.size as i64);
+        if let Some(partition) = &entry.partition {
+            for (column, scalar) in partition {
+                partition_values.keys().append_value(column);
+                match format_partition_value(column, scalar)? {
+                    serde_json::Value::String(value) => {
+                        partition_values.values().append_value(value)
+                    }
+                    _ => partition_values.values().append_null(),
+                }
+            }
         }
-        Ok(())
+        partition_values.append(true)?;
     }
+
+    let constants_field = schema.field_with_name("fileConstantValues")?;
+    let ArrowDataType::Struct(constant_fields) = constants_field.data_type() else {
+        unreachable!("Kernel scan fileConstantValues is a struct")
+    };
+    let partitions: ArrayRef = Arc::new(partition_values.finish());
+    let constant_columns = constant_fields
+        .iter()
+        .map(|field| match field.name().as_str() {
+            "partitionValues" => partitions.clone(),
+            _ => new_null_array(field.data_type(), entries.len()),
+        })
+        .collect();
+    let constants: ArrayRef = Arc::new(StructArray::try_new(
+        constant_fields.clone(),
+        constant_columns,
+        None,
+    )?);
+
+    let paths: ArrayRef = Arc::new(paths.finish());
+    let sizes: ArrayRef = Arc::new(sizes.finish());
+    let columns: Vec<ArrayRef> = schema
+        .fields()
+        .iter()
+        .map(|field| match field.name().as_str() {
+            "path" => paths.clone(),
+            "size" => sizes.clone(),
+            "fileConstantValues" => constants.clone(),
+            _ => new_null_array(field.data_type(), entries.len()),
+        })
+        .collect();
+    let batch = RecordBatch::try_new(Arc::new(schema), columns)?;
+    Ok(Box::new(ArrowEngineData::new(batch)))
 }
 
 /// The window an unreferenced data file is kept before the vacuum sweep may
@@ -1470,13 +1489,19 @@ mod tests {
             path: ObjectPath::new("f.parquet"),
             size: 1,
         });
-        let added = commit_file_changes(&table.engine, &table.snapshot, &[], &[entry], true)
-            .unwrap()
-            .expect("the add commits on our own snapshot");
+        let added = commit_file_changes(
+            &table.engine,
+            &table.snapshot,
+            &[],
+            std::slice::from_ref(&entry),
+            true,
+        )
+        .unwrap()
+        .expect("the add commits on our own snapshot");
         let removed = commit_file_changes(
             &table.engine,
             &added,
-            &[ObjectPath::new("f.parquet")],
+            std::slice::from_ref(&entry),
             &[],
             true,
         )
