@@ -1,13 +1,13 @@
 //! Boot-time check that this CPU implements the instruction-set extensions the
 //! binary was compiled to use.
 //!
-//! aarch64 builds compile against a floor above the bare target default (see
-//! `.cargo/config.toml`), and PGO builds go further with `-Ctarget-cpu=native`. A
-//! CPU lacking one of those extensions dies with `SIGILL` at whichever vectorised
-//! loop reaches the instruction first: no message, and a stack pointing at
-//! arithmetic rather than the cause. [`Dispatch::spin_up`](crate::Dispatch::spin_up)
-//! calls this before spawning a worker, so every binary fails there with a named
-//! reason instead.
+//! Linux aarch64 builds compile against a floor above the bare target default
+//! (see `.cargo/config.toml`), and PGO builds go further with
+//! `-Ctarget-cpu=native`. A CPU lacking one of those extensions dies with
+//! `SIGILL` at whichever vectorised loop reaches the instruction first: no
+//! message, and a stack pointing at arithmetic rather than the cause.
+//! [`Dispatch::spin_up`](crate::Dispatch::spin_up) calls this before spawning a
+//! worker, so every binary fails there with a named reason instead.
 //!
 //! Each check pairs "did we build with this" (`cfg!(target_feature = ...)`) with
 //! "does this CPU have it" (a bit in `AT_HWCAP`). Only extensions compiled in are
@@ -16,8 +16,8 @@
 //! `std::arch::is_aarch64_feature_detected!` cannot serve as the runtime half: it
 //! short-circuits to a compile-time `true` whenever the feature is already enabled
 //! statically, exactly the case here, making the pairing a tautology that reports
-//! nothing on any CPU. The auxiliary vector is the only way to learn what the
-//! hardware advertises from inside a binary compiled for it.
+//! nothing on any CPU. On Linux, the auxiliary vector is the way to learn what
+//! the hardware advertises from inside a binary compiled for it.
 //!
 //! A diagnostic, not a guarantee: an illegal instruction in a static initialiser
 //! or above the call site still faults first. It covers the case that matters,
@@ -25,7 +25,7 @@
 
 /// Extensions this process was compiled to use that the CPU does not advertise.
 /// Empty on every supported CPU.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
 pub fn missing_cpu_features() -> Vec<&'static str> {
     // `AT_HWCAP2` bits, which the libc crate still has commented out. Values
     // from the kernel's arch/arm64/include/uapi/asm/hwcap.h; the assignment is
@@ -93,9 +93,9 @@ pub fn missing_cpu_features() -> Vec<&'static str> {
     missing
 }
 
-/// Nothing to check away from aarch64: no other target sets an instruction-set
-/// floor above its default.
-#[cfg(not(target_arch = "aarch64"))]
+/// Nothing to check away from Linux aarch64: no other target sets an
+/// instruction-set floor above its default.
+#[cfg(not(all(target_arch = "aarch64", target_os = "linux")))]
 pub fn missing_cpu_features() -> Vec<&'static str> {
     Vec::new()
 }
