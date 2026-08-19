@@ -93,12 +93,22 @@ struct Inventory {
 type BuildRelation = fn(TableReference, Vec<Column>, &Inventory) -> Box<dyn BoundTable>;
 
 /// One relation this datastore serves, as it is registered: what reaches it,
-/// the columns it serves in order, and how its rows are come by. The columns
-/// are written out rather than built, so a relation can be described (in
-/// `system.columns`, like any other table) without being built. Contrast
-/// [`Relation`], which is one bound instance of a registered relation.
+/// what identifies it, the columns it serves in order, and how its rows are
+/// come by. The columns are written out rather than built, so a relation can be
+/// described (in `system.columns`, like any other table) without being built.
+/// Contrast [`Relation`], which is one bound instance of a registered relation.
 struct SystemRelation {
     name: &'static str,
+    /// The relation's durable identity, in the shape a stored table's is: a
+    /// datastore's manifest mints that one, and these are minted here, once and
+    /// for good. A query keys on `system.tables.id` without caring which
+    /// datastore the row describes, so changing one of these breaks whatever
+    /// recorded it, exactly as reissuing a stored table's would.
+    ///
+    /// They are hand-picked rather than random, and spell what they identify
+    /// where the hex alphabet allows: reading a join's output tells you which
+    /// relation a row belongs to without looking the id up.
+    id: &'static str,
     columns: &'static [(&'static str, Type)],
     build: BuildRelation,
 }
@@ -108,6 +118,7 @@ struct SystemRelation {
 const RELATIONS: [SystemRelation; 5] = [
     SystemRelation {
         name: DATASTORES_NAME,
+        id: "da7aba5e-5e75-4a11-ab1e-5e1ec7edda7a",
         columns: &[
             ("name", Type::Utf8),
             ("id", Type::Utf8),
@@ -118,6 +129,7 @@ const RELATIONS: [SystemRelation; 5] = [
     },
     SystemRelation {
         name: TABLES_NAME,
+        id: "007ab1e5-1157-4c1d-8055-f1e1d50fda7a",
         columns: &[
             ("datastore", Type::Utf8),
             ("schema", Type::Utf8),
@@ -133,6 +145,7 @@ const RELATIONS: [SystemRelation; 5] = [
     },
     SystemRelation {
         name: COLUMNS_NAME,
+        id: "f1e1d500-da7a-4ce5-bead-e4c77ab1e50f",
         columns: &[
             ("datastore", Type::Utf8),
             ("table", Type::Utf8),
@@ -148,6 +161,7 @@ const RELATIONS: [SystemRelation; 5] = [
     },
     SystemRelation {
         name: TABLE_FILES_NAME,
+        id: "7ab1ef11-e500-4ded-b10b-de1e7edf11e5",
         columns: &[
             ("table", Type::Utf8),
             ("path", Type::Utf8),
@@ -159,6 +173,7 @@ const RELATIONS: [SystemRelation; 5] = [
     },
     SystemRelation {
         name: MEMORY_BLOCKS_NAME,
+        id: "a110ca7e-b10c-4bed-ba5e-b10c54110ca7",
         columns: &[
             ("slot", Type::Int64),
             ("node", Type::Int64),
@@ -290,7 +305,7 @@ impl DatastoreTransaction for SystemTransaction {
             .iter()
             .map(|relation| DatastoreTableMetadata {
                 name: SchemaQualifiedTableName::new(planner::DEFAULT_SCHEMA_NAME, relation.name),
-                id: format!("{DATASTORE_NAME}.{}", relation.name),
+                id: relation.id.to_string(),
                 columns: relation
                     .columns
                     .iter()
