@@ -92,30 +92,26 @@ rather than the only way in.
 <rect x="471" y="297" width="92" height="16" class="arch-strip" />
 <line x1="471" y1="313" x2="563" y2="313" class="arch-rule" />
 <text x="517" y="309" text-anchor="middle" class="arch-tiny">agent</text>
-<rect x="471" y="318" width="92" height="20" class="arch-term" />
-<text x="477" y="332" class="arch-prompt">$</text>
-<text x="490" y="332" class="arch-cmd">pivot open</text>
+<text x="477" y="330" class="arch-prompt">$</text>
+<text x="490" y="330" class="arch-cmd">pivot open</text>
 <rect x="576" y="296" width="94" height="46" rx="2" class="arch-inner" />
 <rect x="577" y="297" width="92" height="16" class="arch-strip" />
 <line x1="577" y1="313" x2="669" y2="313" class="arch-rule" />
 <text x="623" y="309" text-anchor="middle" class="arch-tiny">agent</text>
-<rect x="577" y="318" width="92" height="20" class="arch-term" />
-<text x="583" y="332" class="arch-prompt">$</text>
-<text x="596" y="332" class="arch-cmd">pivot open</text>
+<text x="583" y="330" class="arch-prompt">$</text>
+<text x="596" y="330" class="arch-cmd">pivot open</text>
 <rect x="470" y="352" width="94" height="46" rx="2" class="arch-inner" />
 <rect x="471" y="353" width="92" height="16" class="arch-strip" />
 <line x1="471" y1="369" x2="563" y2="369" class="arch-rule" />
 <text x="517" y="365" text-anchor="middle" class="arch-tiny">agent</text>
-<rect x="471" y="374" width="92" height="20" class="arch-term" />
-<text x="477" y="388" class="arch-prompt">$</text>
-<text x="490" y="388" class="arch-cmd">pivot open</text>
+<text x="477" y="386" class="arch-prompt">$</text>
+<text x="490" y="386" class="arch-cmd">pivot open</text>
 <rect x="576" y="352" width="94" height="46" rx="2" class="arch-inner" />
 <rect x="577" y="353" width="92" height="16" class="arch-strip" />
 <line x1="577" y1="369" x2="669" y2="369" class="arch-rule" />
 <text x="623" y="365" text-anchor="middle" class="arch-tiny">agent</text>
-<rect x="577" y="374" width="92" height="20" class="arch-term" />
-<text x="583" y="388" class="arch-prompt">$</text>
-<text x="596" y="388" class="arch-cmd">pivot open</text>
+<text x="583" y="386" class="arch-prompt">$</text>
+<text x="596" y="386" class="arch-cmd">pivot open</text>
 <rect x="710" y="250" width="170" height="160" rx="3" class="arch-panel" />
 <text x="795" y="280" text-anchor="middle" class="arch-title">Other engines</text>
 <rect x="724" y="296" width="142" height="32" rx="2" class="arch-inner" />
