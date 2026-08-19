@@ -140,7 +140,7 @@ jobs:
           # Bypass the kache rustc wrapper (.cargo/config.toml): the shipped
           # binary is always compiled fresh, never restored from cache.
           export RUSTC_WRAPPER=
-          cargo build --release --bin pivotdb-server
+          cargo build --release -p cli --bin pivot
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
@@ -162,15 +162,15 @@ jobs:
           fi
           # Strip any trailing slash so we control the joins below.
           BUCKET="${BUCKET%/}"
-          BIN=target/release/pivotdb-server
+          BIN=target/release/pivot
 
           # Upload an immutable, SHA-pinned copy plus a moving `latest` pointer.
-          gcloud storage cp "$BIN" "$BUCKET/pivotdb-server-$ARCH-$SHA"
-          gcloud storage cp "$BIN" "$BUCKET/pivotdb-server-$ARCH-latest"
+          gcloud storage cp "$BIN" "$BUCKET/pivot-$ARCH-$SHA"
+          gcloud storage cp "$BIN" "$BUCKET/pivot-$ARCH-latest"
 
           echo "Uploaded to:"
-          echo "  $BUCKET/pivotdb-server-$ARCH-$SHA"
-          echo "  $BUCKET/pivotdb-server-$ARCH-latest"
+          echo "  $BUCKET/pivot-$ARCH-$SHA"
+          echo "  $BUCKET/pivot-$ARCH-latest"
 
   # Build the pivot server image and push it to Docker Hub (giladkl/pivot),
   # tagged with both the commit SHA and `latest`. Independent of the binary

@@ -1,20 +1,20 @@
-# pivot shell
+# pivot
 
-`pivot shell` is an interactive, local Pivot SQL shell. It embeds the planner,
+`pivot open` is an interactive, local Pivot SQL shell. It embeds the planner,
 catalog, Delta datastore, and dispatch workers in one process. It does not
-connect to `pivotdb-server` and does not require `psql`.
+connect to a Pivot server and does not require `psql`.
 
 ## Running
 
 ```sh
-cargo run --release -p shell --bin pivot -- shell ./pivot-data
+cargo run --release -p cli --bin pivot -- open ./pivot-data
 ```
 
 The installed binary is named `pivot`:
 
 ```sh
-cargo install --path shell
-pivot shell ./pivot-data
+cargo install --path cli
+pivot open ./pivot-data
 ```
 
 The CLI uses every available dispatch worker and assigns 50% of physical
@@ -23,7 +23,7 @@ options.
 
 ## Datastore directory
 
-Every `pivot shell` invocation requires the path of one local Delta datastore.
+Every `pivot open` invocation requires the path of one local Delta datastore.
 The directory is created when it does not exist. Tables, schemas, and inserted
 data remain in that directory after `\q`, Ctrl+D, and subsequent invocations.
 
@@ -51,3 +51,15 @@ without ending the session. Command history exists only in memory and is not
 written to disk.
 
 Results use psql's aligned layout and are written directly to the terminal.
+
+## Server
+
+The same executable runs a configured server in the foreground:
+
+```sh
+pivot server --config ./pivot.yaml
+```
+
+The Debian package installs this command as a systemd service under a dedicated
+non-login account. See [`../packaging/debian/README.md`](../packaging/debian/README.md)
+for the package layout and lifecycle contract.

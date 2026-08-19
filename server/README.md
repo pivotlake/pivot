@@ -9,23 +9,24 @@ wire and HTTP adapters around that transport-neutral core. The local CLI uses
 the same engine and converts result batches directly to terminal cells on the
 dispatch workers.
 
-See `src/lib.rs` for the library API, or run the binary directly.
+See `src/lib.rs` for the library API, or run the public CLI.
 
 ## Running
 
 ```sh
-cargo run --release -- --config <FILE>
+cargo run --release -p cli --bin pivot -- server --config <FILE>
 ```
 
-Or after `cargo install --path .` / building, the binary is named
-`pivotdb-server`:
+Or after `cargo install --path cli` or installing the Debian package:
 
 ```sh
-pivotdb-server --config <FILE>
+pivot server --config <FILE>
 ```
 
-`--config` is the only flag: one YAML file configures the whole instance. See
-[`config.example.yaml`](config.example.yaml) for a commented file to copy.
+One YAML file configures the whole instance. See
+[`config.example.yaml`](config.example.yaml) for a commented file to copy. The
+optional `--metastore-file` flag merges a second datastore and user file into
+that configuration.
 
 ### The config file
 
@@ -88,7 +89,7 @@ metastore:
 Start the server with:
 
 ```sh
-pivotdb-server --config pivot.yaml
+pivot server --config pivot.yaml
 ```
 
 A local datastore directory may be open in only one Pivot process at a time.
@@ -178,7 +179,7 @@ a `scram-sha-256` verifier to require a password of it.
 Logging is controlled by `RUST_LOG` (defaults to `info`):
 
 ```sh
-RUST_LOG=server=debug,dispatch=info pivotdb-server --config pivot.yaml
+RUST_LOG=server=debug,dispatch=info pivot server --config pivot.yaml
 ```
 
 ## Connecting

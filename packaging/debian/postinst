@@ -1,0 +1,108 @@
+#!/bin/sh
+
+set -e
+
+postinst_action=${1:-}
+previous_version=${2:-}
+
+if [ "$postinst_action" != configure ]; then
+    exit 0
+fi
+
+if ! getent group pivot >/dev/null; then
+    addgroup --system pivot
+fi
+if ! getent passwd pivot >/dev/null; then
+    install -d -m 0700 /var/lib/pivot
+    adduser \
+        --system \
+        --ingroup pivot \
+        --home /var/lib/pivot \
+        --no-create-home \
+        --shell /usr/sbin/nologin \
+        --gecos "Pivot database service" \
+        pivot
+fi
+
+pivot_group=$(getent group pivot)
+old_ifs=$IFS
+IFS=:
+set -- $pivot_group
+IFS=$old_ifs
+if [ "${3:-0}" = 0 ]; then
+    echo 'pivot: refusing to run the service with group ID 0' >&2
+    exit 1
+fi
+
+pivot_user=$(getent passwd pivot)
+IFS=:
+set -- $pivot_user
+IFS=$old_ifs
+if [ "${3:-0}" = 0 ]; then
+    echo 'pivot: refusing to run the service with user ID 0' >&2
+    exit 1
+fi
+if [ "${6:-}" != /var/lib/pivot ]; then
+    echo "pivot: existing pivot user's home must be /var/lib/pivot" >&2
+    exit 1
+fi
+case "${7:-}" in
+    /usr/sbin/nologin|/sbin/nologin|/bin/false) ;;
+    *)
+        echo 'pivot: existing pivot user must have a non-login shell' >&2
+        exit 1
+        ;;
+esac
+
+install -d -o pivot -g pivot -m 0700 \
+    /var/lib/pivot \
+    /var/lib/pivot/datastores \
+    /var/lib/pivot/datastores/default
+
+metastore_file=/var/lib/pivot/metastore.yaml
+if [ -L "$metastore_file" ]; then
+    echo "pivot: refusing to use the metastore file because it is a symbolic link" >&2
+    exit 1
+fi
+if [ ! -e "$metastore_file" ]; then
+    install -o pivot -g pivot -m 0600 /dev/null "$metastore_file"
+    printf 'datastores: {}\nusers: {}\nsecrets: {}\n' > "$metastore_file"
+fi
+if [ ! -f "$metastore_file" ]; then
+    echo "pivot: the metastore path must be a regular file" >&2
+    exit 1
+fi
+chown pivot:pivot "$metastore_file"
+chmod 0600 "$metastore_file"
+
+install -d -o root -g pivot -m 0750 /etc/pivot
+config_file=/etc/pivot/config.yaml
+# The live configuration belongs to the administrator. Seed it on the first
+# install, but never replace or alter an existing file during an upgrade. Test
+# -L separately so a user-provided dangling symlink is also left untouched.
+if [ ! -e "$config_file" ] && [ ! -L "$config_file" ]; then
+    install -o root -g pivot -m 0640 /usr/share/pivot/config.yaml "$config_file"
+fi
+
+# Keep an administrator's enabled/disabled choice across upgrades. On a new
+# installation, was-enabled defaults to true and the service is enabled.
+deb-systemd-helper unmask pivot.service >/dev/null || true
+if deb-systemd-helper --quiet was-enabled pivot.service; then
+    deb-systemd-helper enable pivot.service >/dev/null || true
+else
+    deb-systemd-helper update-state pivot.service >/dev/null || true
+fi
+
+# Only contact systemd when it is the running init system. deb-systemd-invoke
+# respects policy-rc.d, so installations in containers and chroots can suppress
+# service startup. A new installation starts Pivot; an upgrade only restarts an
+# already-running service.
+if [ -d /run/systemd/system ]; then
+    systemctl --system daemon-reload >/dev/null || true
+    if [ -n "$previous_version" ]; then
+        service_action=try-restart
+    else
+        service_action=start
+    fi
+    deb-systemd-invoke "$service_action" pivot.service >/dev/null || true
+fi

@@ -1,0 +1,19 @@
+#!/bin/sh
+
+set -e
+
+if [ "${1:-}" = remove ] && command -v deb-systemd-helper >/dev/null 2>&1; then
+    deb-systemd-helper mask pivot.service >/dev/null || true
+fi
+
+if [ "${1:-}" = purge ] && command -v deb-systemd-helper >/dev/null 2>&1; then
+    deb-systemd-helper purge pivot.service >/dev/null || true
+    deb-systemd-helper unmask pivot.service >/dev/null || true
+fi
+
+if [ -d /run/systemd/system ]; then
+    systemctl --system daemon-reload >/dev/null || true
+fi
+
+# Deliberately preserve /var/lib/pivot and the pivot service account. Database
+# data should only be removed by an explicit administrator action.
