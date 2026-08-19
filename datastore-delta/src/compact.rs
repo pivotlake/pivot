@@ -376,7 +376,7 @@ mod tests {
     use super::*;
     use crate::DeltaDatastore;
     use crate::parquet::ParquetTable;
-    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_array::{ArrayRef, Int64Array, RecordBatch, Scalar};
     use arrow_schema::{DataType, Field, Schema};
     use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
     use parquet::arrow::ArrowWriter;
@@ -401,6 +401,34 @@ mod tests {
         .unwrap();
         let file = std::fs::File::create(dir.join(file_name)).unwrap();
         // SNAPPY, like every pivot-written file -- the decompressor expects it.
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_compression(parquet::basic::Compression::SNAPPY)
+            .build();
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    fn write_partitioned_parquet_file(
+        dir: &Path,
+        file_name: &str,
+        timestamps: Vec<i64>,
+        partition: i64,
+    ) {
+        let row_count = timestamps.len();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("Timestamp", DataType::Int64, false),
+            Field::new("Partition", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(timestamps)) as _,
+                Arc::new(Int64Array::from(vec![partition; row_count])) as _,
+            ],
+        )
+        .unwrap();
+        let file = std::fs::File::create(dir.join(file_name)).unwrap();
         let props = parquet::file::properties::WriterProperties::builder()
             .set_compression(parquet::basic::Compression::SNAPPY)
             .build();
@@ -452,6 +480,57 @@ mod tests {
             .unwrap()
             .block_on(transaction.commit())
             .unwrap();
+    }
+
+    /// Create an empty table partitioned by its `Partition` column.
+    fn create_partitioned_table(
+        datastore: &Arc<DeltaDatastore>,
+        dispatcher: &DataFlowDispatcher,
+        name: &str,
+    ) {
+        use datastore::DatastoreTransaction as _;
+        use planner::catalog::{Column, CreateTableRequest};
+        let request = CreateTableRequest {
+            datastore_name: None,
+            schema_name: None,
+            name: name.to_string(),
+            columns: vec![
+                Column {
+                    name: "Timestamp".to_string(),
+                    col_type: planner::types::Type::Int64,
+                },
+                Column {
+                    name: "Partition".to_string(),
+                    col_type: planner::types::Type::Int64,
+                },
+            ],
+            options: std::collections::HashMap::from([(
+                "partition_by".to_string(),
+                "Partition".to_string(),
+            )]),
+            if_not_exists: false,
+        };
+        let transaction = datastore.clone().begin_transaction();
+        transaction
+            .bind_create_table(request)
+            .unwrap()
+            .compile(dispatcher)
+            .unwrap()
+            .execute()
+            .collect()
+            .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(transaction.commit())
+            .unwrap();
+    }
+
+    fn partition_value(value: i64) -> crate::PartitionValues {
+        std::collections::HashMap::from([(
+            "Partition".to_string(),
+            Scalar::new(Arc::new(Int64Array::from(vec![value])) as ArrayRef),
+        )])
     }
 
     /// Refresh `name` to the latest committed manifest (a writer evolves a
@@ -533,6 +612,129 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|f| f.path.as_str().starts_with("pivot-"))
+        );
+
+        dispatch.exit();
+    }
+
+    /// Partitioned compaction never mixes partitions, and both the replacement
+    /// Adds and input tombstones retain the partition values needed to reload a
+    /// valid Delta snapshot.
+    #[test]
+    fn compaction_preserves_partitioned_table_metadata_and_rows() {
+        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
+        let db = tempfile::tempdir().unwrap();
+        let encoded = tempfile::tempdir().unwrap();
+        let datastore =
+            DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        create_partitioned_table(&datastore, dispatch.dispatcher(), "events");
+
+        // Two inputs in each partition. If batching crossed the partition
+        // boundary, the merged file could not truthfully carry one constant.
+        let inputs = [
+            ("one-a.parquet", 1),
+            ("one-b.parquet", 1),
+            ("two-a.parquet", 2),
+            ("two-b.parquet", 2),
+        ];
+        let name = SchemaQualifiedTableName::in_default_schema("events");
+        let mut table = datastore.table_handle(&name).unwrap();
+        for (file_name, value) in inputs {
+            write_partitioned_parquet_file(
+                encoded.path(),
+                file_name,
+                vec![value * 10, value * 10 + 1],
+                value,
+            );
+            table
+                .append_data_file(
+                    ObjectPath::new(file_name),
+                    &std::fs::read(encoded.path().join(file_name)).unwrap(),
+                    Some(partition_value(value)),
+                )
+                .unwrap();
+        }
+        let before_version = table.version();
+        assert_eq!(table.file_refs().len(), 4);
+        assert!(datastore.refresh_from_store().unwrap());
+
+        let compacter = Compacter::new(
+            u64::MAX,
+            2,
+            std::time::Duration::from_secs(1),
+            datastore.clone(),
+        );
+        run_one_sweep(&compacter);
+
+        // Reload from Delta rather than trusting the in-memory swap. Exactly one
+        // output per partition remains, and every original row is still present.
+        let mut reloaded = datastore.table_handle(&name).unwrap();
+        reloaded.refresh().unwrap();
+        assert_eq!(reloaded.file_refs().len(), 2);
+        let partitions = reloaded.file_partitions();
+        assert_eq!(partitions.len(), 2);
+        for expected in [partition_value(1), partition_value(2)] {
+            assert!(partitions.iter().any(|(_, actual)| {
+                actual
+                    .as_ref()
+                    .is_some_and(|actual| scalar_values_equal(actual, &expected))
+            }));
+        }
+        let parquet = reloaded.build_scan_view(&[], &[]).unwrap();
+        assert_eq!(
+            parquet
+                .row_groups()
+                .iter()
+                .map(|group| group.num_rows)
+                .sum::<i64>(),
+            8
+        );
+
+        // Inspect every compaction commit. Each removes and adds files from one
+        // partition only, and Kernel serialized that value into both actions.
+        let log_dir = db.path().join(reloaded.location()).join("_delta_log");
+        let mut compacted_partitions = std::collections::BTreeSet::new();
+        for version in before_version + 1..=reloaded.version() {
+            let commit =
+                std::fs::read_to_string(log_dir.join(format!("{version:020}.json"))).unwrap();
+            let actions: Vec<serde_json::Value> = commit
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let remove_values: std::collections::BTreeSet<_> = actions
+                .iter()
+                .filter_map(|action| action.get("remove"))
+                .map(|remove| remove["partitionValues"]["Partition"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|action| action.get("remove").is_some())
+                    .count(),
+                2
+            );
+            let add_values: std::collections::BTreeSet<_> = actions
+                .iter()
+                .filter_map(|action| action.get("add"))
+                .map(|add| add["partitionValues"]["Partition"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|action| action.get("add").is_some())
+                    .count(),
+                1
+            );
+            assert_eq!(remove_values.len(), 1, "one partition per compacted batch");
+            assert_eq!(
+                add_values, remove_values,
+                "replacement stays in its partition"
+            );
+            compacted_partitions.extend(remove_values.into_iter().map(str::to_string));
+        }
+        assert_eq!(
+            compacted_partitions,
+            std::collections::BTreeSet::from(["1".to_string(), "2".to_string()])
         );
 
         dispatch.exit();

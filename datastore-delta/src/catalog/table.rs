@@ -256,11 +256,22 @@ impl CatalogTable {
                     file: missing.to_string(),
                 });
             }
+            let removed_entries: Vec<DeltaFileEntry> = removed
+                .iter()
+                .map(|path| {
+                    self.files
+                        .iter()
+                        .find(|file| file.entry.file.path.as_str() == path.as_str())
+                        .expect("removed paths were validated above")
+                        .entry
+                        .clone()
+                })
+                .collect();
             let entries: Vec<DeltaFileEntry> = added.iter().map(|f| f.entry.clone()).collect();
             if let Some(committed) = crate::delta::commit_file_changes(
                 &self.engine,
                 &self.snapshot,
-                removed,
+                &removed_entries,
                 &entries,
                 data_change,
             )? {
@@ -299,10 +310,21 @@ impl CatalogTable {
                     file: missing.to_string(),
                 });
             }
+            let removed_entries: Vec<DeltaFileEntry> = removed
+                .iter()
+                .map(|path| {
+                    self.files
+                        .iter()
+                        .find(|file| file.entry.file.path.as_str() == path.as_str())
+                        .expect("removed paths were validated above")
+                        .entry
+                        .clone()
+                })
+                .collect();
             if let Some(committed) = crate::delta::commit_file_changes(
                 &self.engine,
                 &self.snapshot,
-                removed,
+                &removed_entries,
                 added,
                 data_change,
             )? {
