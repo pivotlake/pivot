@@ -1,0 +1,299 @@
+/*
+ * Monospace-first documentation theme: JetBrains Mono for body text, Space
+ * Grotesk for headings, a neutral ink palette (no colour cast in the greys)
+ * with a single accent reserved for links and the active sidebar entry, and
+ * hairline borders instead of shadows or fills.
+ */
+
+:root {
+  --sl-font: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas,
+    monospace;
+  --sl-font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo,
+    Consolas, monospace;
+  --docs-font-display: "Space Grotesk", var(--sl-font);
+
+  --sl-content-width: 48rem;
+  --sl-sidebar-width: 18.5rem;
+  --sl-nav-height: 3.75rem;
+  --sl-text-body: 0.9375rem;
+  --sl-text-code: 0.8125rem;
+  --sl-line-height: 1.7;
+}
+
+/* Dark theme, the default for a reader who has not used the toggle. */
+:root {
+  --sl-color-white: #f0f0f0;
+  --sl-color-gray-1: #d8d8d8;
+  --sl-color-gray-2: #b9b9b9;
+  --sl-color-gray-3: #7e7e7e;
+  --sl-color-gray-4: #5a5a5a;
+  --sl-color-gray-5: #282828;
+  --sl-color-gray-6: #151515;
+  --sl-color-gray-7: #111111;
+  --sl-color-black: #0d0d0d;
+
+  --sl-color-bg: #0d0d0d;
+  --sl-color-bg-nav: #111111;
+  --sl-color-bg-sidebar: #111111;
+  --sl-color-bg-inline-code: #151515;
+  --sl-color-bg-accent: #78d18b;
+
+  --sl-color-hairline: #282828;
+  --sl-color-hairline-light: #333333;
+  --sl-color-hairline-shade: #1f1f1f;
+
+  --sl-color-accent-low: #16301d;
+  --sl-color-accent: #4fae67;
+  --sl-color-accent-high: #a8e3b6;
+  --sl-color-text-accent: #78d18b;
+
+  /* Code block surfaces. Expressive Code reads these through styleOverrides
+     in astro.config.mjs, so they flip with the theme instead of being frozen
+     to one palette. The title bar must differ from the code area below it. */
+  --docs-code-bg: #151515;
+  --docs-code-titlebar-bg: #111111;
+  --docs-code-titlebar-fg: #7e7e7e;
+  --docs-code-border: #282828;
+}
+
+:root[data-theme="light"] {
+  --sl-color-white: #17181b;
+  --sl-color-gray-1: #26272c;
+  --sl-color-gray-2: #4a4b52;
+  --sl-color-gray-3: #82848c;
+  --sl-color-gray-4: #a8aab1;
+  --sl-color-gray-5: #dcdad4;
+  --sl-color-gray-6: #e2e0da;
+  --sl-color-gray-7: #eae8e3;
+  --sl-color-black: #f7f6f4;
+
+  --sl-color-bg: #f7f6f4;
+  --sl-color-bg-nav: #efeeea;
+  --sl-color-bg-sidebar: #efeeea;
+  --sl-color-bg-inline-code: #eae8e3;
+  --sl-color-bg-accent: #3049c9;
+
+  --sl-color-hairline: #dcdad4;
+  --sl-color-hairline-light: #e6e4de;
+  --sl-color-hairline-shade: #d3d1ca;
+
+  --sl-color-accent-low: #dfe3f8;
+  --sl-color-accent: #3049c9;
+  --sl-color-accent-high: #22349a;
+  --sl-color-text-accent: #3049c9;
+
+  --docs-code-bg: #eae8e3;
+  --docs-code-titlebar-bg: #e2e0da;
+  --docs-code-titlebar-fg: #82848c;
+  --docs-code-border: #dcdad4;
+}
+
+/* Architecture diagram. Colours come from the theme so the drawing follows
+   whichever palette is active. On a narrow screen it scrolls in its own
+   container rather than shrinking its labels into illegibility. */
+.arch-figure {
+  margin: 2rem 0;
+  overflow-x: auto;
+}
+
+.arch-figure svg {
+  display: block;
+  width: 100%;
+  min-width: 620px;
+  height: auto;
+  font-family: var(--sl-font);
+}
+
+.arch-panel {
+  fill: var(--sl-color-bg-sidebar);
+  stroke: var(--sl-color-hairline);
+  stroke-width: 1;
+}
+
+.arch-inner {
+  fill: var(--docs-code-bg);
+  stroke: var(--docs-code-border);
+  stroke-width: 1;
+}
+
+.arch-title {
+  fill: var(--sl-color-white);
+  font-family: var(--docs-font-display);
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.arch-label {
+  fill: var(--sl-color-gray-2);
+  font-size: 13.5px;
+}
+
+.arch-muted {
+  fill: var(--sl-color-gray-3);
+  font-size: 12.5px;
+}
+
+.arch-line {
+  stroke: var(--sl-color-gray-3);
+  stroke-width: 1.5;
+  fill: none;
+}
+
+.arch-arrowhead {
+  fill: var(--sl-color-gray-3);
+}
+
+.arch-accent-line {
+  stroke: var(--sl-color-text-accent);
+  stroke-width: 1.5;
+  fill: none;
+}
+
+.arch-accent-head {
+  fill: var(--sl-color-text-accent);
+}
+
+.arch-accent-text {
+  fill: var(--sl-color-text-accent);
+  font-size: 12.5px;
+}
+
+/* Card internals: header strips, worker cells, terminal lines, badges. */
+.arch-strip {
+  fill: var(--sl-color-bg-sidebar);
+}
+
+.arch-rule {
+  stroke: var(--docs-code-border);
+  stroke-width: 1;
+}
+
+.arch-cell {
+  fill: var(--sl-color-gray-4);
+}
+
+.arch-bar {
+  fill: var(--sl-color-gray-4);
+}
+
+/* Headings and chrome carry the display face; prose stays monospace. */
+.sl-markdown-content h1,
+.sl-markdown-content h2,
+.sl-markdown-content h3,
+.sl-markdown-content h4,
+.sl-markdown-content h5,
+.sl-markdown-content h6,
+.site-title,
+.content-panel h1 {
+  font-family: var(--docs-font-display);
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+
+.site-title {
+  font-size: 1.0625rem;
+  letter-spacing: -0.02em;
+}
+
+/* Square corners and hairline separators throughout. */
+/* Space a code block away from the prose above it. `figcaption` is excluded
+   because inside a frame it is the block's own title bar, which has to sit
+   flush against the code. */
+.sl-markdown-content
+  :not(a, strong, em, del, span, input, code, figcaption)
+  + :is(pre) {
+  margin-top: 1.25rem;
+}
+
+/* The code block's border, corners and fill are left to Expressive Code, which
+   draws them as one piece with the frame's title bar. Overriding them here
+   splits the bar from the block below it. */
+
+.sl-markdown-content :not(pre) > code {
+  border: 1px solid var(--sl-color-hairline);
+  border-radius: 2px;
+  padding: 0.1em 0.35em;
+  font-size: 0.9em;
+}
+
+.sl-markdown-content table {
+  font-size: 0.875rem;
+}
+
+.sl-markdown-content th,
+.sl-markdown-content td {
+  border-color: var(--sl-color-hairline);
+}
+
+/* Sidebar: small, quiet, with the active entry marked by a rule rather than
+   a filled pill. */
+#starlight__sidebar .sidebar-content {
+  font-size: 0.8125rem;
+}
+
+/* Only group headings are set as small caps. Top-level page links also carry
+   Starlight's `.large` class, and uppercasing those makes an ordinary link
+   read as a section heading. */
+#starlight__sidebar summary .large {
+  font-family: var(--docs-font-display);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--sl-color-gray-3);
+}
+
+#starlight__sidebar a {
+  border-radius: 0;
+  border-left: 1px solid transparent;
+  padding-left: 0.75rem;
+  color: var(--sl-color-gray-2);
+}
+
+/* Top-level page links carry Starlight's `.large` class, which sets 1rem at
+   weight 600. Against the 0.8125rem of the entries nested under a group, that
+   jump reads as a different typeface rather than a level of hierarchy. Match
+   the size and separate the levels by weight and colour instead. Declared
+   before the active-page rule so that rule still wins on colour. */
+#starlight__sidebar a.large {
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: var(--sl-color-gray-1);
+}
+
+#starlight__sidebar a:hover {
+  color: var(--sl-color-white);
+  background-color: transparent;
+}
+
+#starlight__sidebar a[aria-current="page"],
+#starlight__sidebar a[aria-current="page"]:hover {
+  background-color: transparent;
+  border-left-color: var(--sl-color-text-accent);
+  color: var(--sl-color-text-accent);
+  font-weight: 500;
+}
+
+/* Header sits on a hairline, no shadow. */
+.header {
+  border-bottom: 1px solid var(--sl-color-hairline);
+  box-shadow: none;
+}
+
+/* Search button reads as a field, matching the ⌘K affordance. */
+site-search button {
+  border-radius: 2px;
+  border-color: var(--sl-color-hairline);
+  background-color: transparent;
+  font-size: 0.8125rem;
+}
+
+/* Right-hand table of contents. */
+starlight-toc a {
+  border-radius: 0;
+  font-size: 0.75rem;
+}
+
+/* ASCII diagrams in fenced blocks need to keep their alignment. */
+.sl-markdown-content pre code {
+  line-height: 1.45;
+}
