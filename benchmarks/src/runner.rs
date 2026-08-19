@@ -252,7 +252,7 @@ async fn cold_clear(client: &Client) -> Result<()> {
     Ok(())
 }
 
-fn read_to_string(path: &Path) -> Result<String> {
+pub(crate) fn read_to_string(path: &Path) -> Result<String> {
     std::fs::read_to_string(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
         source,
@@ -275,7 +275,7 @@ fn write_string(path: &Path, contents: &str) -> Result<()> {
 /// Run a `simple_query` and concatenate every `Row` message as TSV. Tabs
 /// separate columns; rows are newline-terminated. Mirrors the format the
 /// existing dispatch bench uses, so eyeballing diffs is straightforward.
-async fn collect_tsv(client: &Client, sql: &str, id: &str) -> Result<String> {
+pub(crate) async fn collect_tsv(client: &Client, sql: &str, id: &str) -> Result<String> {
     let messages = client.simple_query(sql).await?;
     let mut out = String::new();
     for msg in messages {
@@ -390,7 +390,7 @@ fn check_or_update_expected(query: &Query, actual: &str, update: bool) -> Result
 /// a comment's prose carries semicolons of its own, and they are not statement
 /// ends. This assumes no statement holds `--` or `;` inside a string literal,
 /// which is true of every suite here.
-fn setup_statements(script: &str) -> Vec<String> {
+pub(crate) fn setup_statements(script: &str) -> Vec<String> {
     let statements = script
         .lines()
         .map(|line| line.split_once("--").map_or(line, |(code, _)| code))
