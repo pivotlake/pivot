@@ -10,7 +10,7 @@ rather than the only way in.
 <figure class="arch-figure">
 <svg viewBox="0 0 920 552" role="img" aria-labelledby="arch-title arch-desc">
 <title id="arch-title">pivotdb architecture</title>
-<desc id="arch-desc">Object storage holds pivotlake tables in Delta Lake format. A pivotdb cluster reads and writes them and serves SQL clients over the Postgres wire. Agents, each embedding its own pivot standalone, and third-party engines such as DuckDB, read the same files directly without going through the cluster.</desc>
+<desc id="arch-desc">Object storage holds pivotlake tables in Delta Lake format. A pivotdb cluster reads and writes them and serves SQL clients over the Postgres wire. Agents, each embedding its own pivot open, and third-party engines such as DuckDB, read the same files directly without going through the cluster.</desc>
 <defs>
 <marker id="arch-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
 <path d="M0,0 L10,5 L0,10 z" class="arch-arrowhead" />
@@ -43,10 +43,10 @@ rather than the only way in.
 <text x="618" y="150" class="arch-tiny">part-00001-9c21….parquet</text>
 <line x1="230" y1="250" x2="230" y2="182" class="arch-line" marker-start="url(#arch-head)" marker-end="url(#arch-head)" />
 <text x="244" y="220" class="arch-muted">read + write</text>
-<line x1="595" y1="250" x2="595" y2="182" class="arch-line" marker-end="url(#arch-head)" />
-<text x="609" y="220" class="arch-muted">read</text>
-<line x1="820" y1="250" x2="820" y2="182" class="arch-line" marker-end="url(#arch-head)" />
-<text x="834" y="220" class="arch-muted">read</text>
+<line x1="565" y1="250" x2="565" y2="182" class="arch-line" marker-end="url(#arch-head)" />
+<text x="579" y="220" class="arch-muted">read</text>
+<line x1="790" y1="250" x2="790" y2="182" class="arch-line" marker-end="url(#arch-head)" />
+<text x="804" y="220" class="arch-muted">read</text>
 <rect x="40" y="250" width="380" height="160" rx="3" class="arch-panel" />
 <text x="64" y="280" class="arch-title">pivotdb cluster</text>
 <text x="396" y="280" text-anchor="end" class="arch-muted">writer</text>
@@ -86,39 +86,39 @@ rather than the only way in.
 <rect x="325" y="354" width="16" height="16" rx="1" class="arch-cell" />
 <rect x="347" y="354" width="16" height="16" rx="1" class="arch-cell" />
 <rect x="369" y="354" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="450" y="250" width="290" height="160" rx="3" class="arch-panel" />
-<text x="595" y="280" text-anchor="middle" class="arch-title">Agents</text>
-<rect x="470" y="296" width="119" height="44" rx="2" class="arch-inner" />
-<rect x="471" y="297" width="117" height="16" class="arch-strip" />
-<line x1="471" y1="313" x2="588" y2="313" class="arch-rule" />
-<text x="529" y="309" text-anchor="middle" class="arch-tiny">agent</text>
-<text x="529" y="330" text-anchor="middle" class="arch-tiny">pivot standalone</text>
-<rect x="601" y="296" width="119" height="44" rx="2" class="arch-inner" />
-<rect x="602" y="297" width="117" height="16" class="arch-strip" />
-<line x1="602" y1="313" x2="719" y2="313" class="arch-rule" />
-<text x="660" y="309" text-anchor="middle" class="arch-tiny">agent</text>
-<text x="660" y="330" text-anchor="middle" class="arch-tiny">pivot standalone</text>
-<rect x="470" y="350" width="119" height="44" rx="2" class="arch-inner" />
-<rect x="471" y="351" width="117" height="16" class="arch-strip" />
-<line x1="471" y1="367" x2="588" y2="367" class="arch-rule" />
-<text x="529" y="363" text-anchor="middle" class="arch-tiny">agent</text>
-<text x="529" y="384" text-anchor="middle" class="arch-tiny">pivot standalone</text>
-<rect x="601" y="350" width="119" height="44" rx="2" class="arch-inner" />
-<rect x="602" y="351" width="117" height="16" class="arch-strip" />
-<line x1="602" y1="367" x2="719" y2="367" class="arch-rule" />
-<text x="660" y="363" text-anchor="middle" class="arch-tiny">agent</text>
-<text x="660" y="384" text-anchor="middle" class="arch-tiny">pivot standalone</text>
-<rect x="760" y="250" width="120" height="160" rx="3" class="arch-panel" />
-<text x="820" y="280" text-anchor="middle" class="arch-title">Other engines</text>
-<rect x="772" y="296" width="96" height="32" rx="2" class="arch-inner" />
-<rect x="782" y="305" width="14" height="14" rx="1" class="arch-cell" />
-<text x="804" y="317" class="arch-muted">DuckDB</text>
-<rect x="772" y="332" width="96" height="32" rx="2" class="arch-inner" />
-<rect x="782" y="341" width="14" height="14" rx="1" class="arch-cell" />
-<text x="804" y="353" class="arch-muted">Spark</text>
-<rect x="772" y="368" width="96" height="32" rx="2" class="arch-inner" />
-<rect x="782" y="377" width="14" height="14" rx="1" class="arch-cell" />
-<text x="804" y="389" class="arch-muted">pandas</text>
+<rect x="450" y="250" width="230" height="160" rx="3" class="arch-panel" />
+<text x="565" y="280" text-anchor="middle" class="arch-title">Agents</text>
+<rect x="470" y="296" width="89" height="44" rx="2" class="arch-inner" />
+<rect x="471" y="297" width="87" height="16" class="arch-strip" />
+<line x1="471" y1="313" x2="558" y2="313" class="arch-rule" />
+<text x="514" y="309" text-anchor="middle" class="arch-tiny">agent</text>
+<text x="514" y="330" text-anchor="middle" class="arch-tiny">pivot open</text>
+<rect x="571" y="296" width="89" height="44" rx="2" class="arch-inner" />
+<rect x="572" y="297" width="87" height="16" class="arch-strip" />
+<line x1="572" y1="313" x2="659" y2="313" class="arch-rule" />
+<text x="615" y="309" text-anchor="middle" class="arch-tiny">agent</text>
+<text x="615" y="330" text-anchor="middle" class="arch-tiny">pivot open</text>
+<rect x="470" y="350" width="89" height="44" rx="2" class="arch-inner" />
+<rect x="471" y="351" width="87" height="16" class="arch-strip" />
+<line x1="471" y1="367" x2="558" y2="367" class="arch-rule" />
+<text x="514" y="363" text-anchor="middle" class="arch-tiny">agent</text>
+<text x="514" y="384" text-anchor="middle" class="arch-tiny">pivot open</text>
+<rect x="571" y="350" width="89" height="44" rx="2" class="arch-inner" />
+<rect x="572" y="351" width="87" height="16" class="arch-strip" />
+<line x1="572" y1="367" x2="659" y2="367" class="arch-rule" />
+<text x="615" y="363" text-anchor="middle" class="arch-tiny">agent</text>
+<text x="615" y="384" text-anchor="middle" class="arch-tiny">pivot open</text>
+<rect x="700" y="250" width="180" height="160" rx="3" class="arch-panel" />
+<text x="790" y="280" text-anchor="middle" class="arch-title">Other engines</text>
+<rect x="714" y="296" width="152" height="32" rx="2" class="arch-inner" />
+<rect x="726" y="305" width="14" height="14" rx="1" class="arch-cell" />
+<text x="748" y="317" class="arch-muted">DuckDB</text>
+<rect x="714" y="332" width="152" height="32" rx="2" class="arch-inner" />
+<rect x="726" y="341" width="14" height="14" rx="1" class="arch-cell" />
+<text x="748" y="353" class="arch-muted">Spark</text>
+<rect x="714" y="368" width="152" height="32" rx="2" class="arch-inner" />
+<rect x="726" y="377" width="14" height="14" rx="1" class="arch-cell" />
+<text x="748" y="389" class="arch-muted">pandas · Trino</text>
 <line x1="230" y1="460" x2="230" y2="412" class="arch-line" marker-end="url(#arch-head)" />
 <text x="244" y="440" class="arch-muted">Postgres wire</text>
 <rect x="40" y="460" width="380" height="72" rx="3" class="arch-panel" />
@@ -133,7 +133,7 @@ rather than the only way in.
 </figure>
 
 The cluster owns writes: it lands parquet and commits to the Delta log. Reads
-are not exclusive to it. Each agent embeds its own pivot standalone and reads
+are not exclusive to it. Each agent embeds its own pivot open and reads
 the tables in its own process, so agents scale out without queueing behind a
 shared server, and anything else that speaks Delta Lake can point at the same
 prefix and get the same data. That is why those readers sit next to the
