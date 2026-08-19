@@ -149,6 +149,16 @@ pub trait DatastoreTransaction: Debug + Send + Sync {
         None
     }
 
+    /// Compact `table` from this transaction's frozen catalog view. Backends
+    /// that support compaction use the exact table snapshot this transaction
+    /// resolved, rather than looking it up again from mutable live state.
+    async fn compact(&self, _table: &SchemaQualifiedTableName, _final_sweep: bool) -> Result<u64> {
+        Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "this datastore does not support COMPACT",
+        )
+        .into())
+    }
+
     /// Resolve a `CREATE TABLE` against this datastore into a [`TableCreation`]
     /// the caller compiles into the dataflow that writes the new table. Resolution
     /// runs on the coordinator (validating the request and locating the table's
@@ -235,19 +245,6 @@ pub trait Datastore: Debug + Send + Sync {
     /// maintenance sweep cannot race the pool's teardown. Default: nothing to
     /// stop.
     fn abort(&self) {}
-
-    /// Merge `table`'s small files into target-sized ones now, synchronously,
-    /// the way this datastore's own background compaction would over time.
-    /// Backs the `COMPACT` statement, so it runs on the coordinator's async
-    /// context, never on a dispatch worker. One call is one sweep;
-    /// `final_sweep` keeps sweeping until a sweep advances no version (a merge
-    /// changes the file list, so one pass can leave a tail). Returns the
-    /// number of sweeps performed, or an error if `table` does not exist.
-    async fn compact(
-        self: Arc<Self>,
-        table: &SchemaQualifiedTableName,
-        final_sweep: bool,
-    ) -> Result<u64>;
 
     /// Downcast hook (owned): recover the concrete backend as an owned `Arc`, for
     /// a server feature specific to one datastore format (the web dashboard's

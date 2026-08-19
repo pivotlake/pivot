@@ -271,6 +271,20 @@ impl CatalogTransaction for PivotTransaction {
             .bind_table_function(name)
     }
 
+    async fn compact(
+        &self,
+        datastore: &str,
+        table: &planner::catalog::SchemaQualifiedTableName,
+        final_sweep: bool,
+    ) -> CatalogResult<u64> {
+        let transaction = self
+            .find_or_create_sub_transaction(datastore)
+            .ok_or_else(|| {
+                CatalogError::Other(Box::new(Error::UnknownDatastore(datastore.into())))
+            })?;
+        transaction.compact(table, final_sweep).await
+    }
+
     fn bind_create_table(
         &self,
         request: CreateTableRequest,
