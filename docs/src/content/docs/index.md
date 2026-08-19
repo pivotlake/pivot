@@ -41,79 +41,79 @@ rather than the only way in.
 <text x="844" y="106" text-anchor="end" class="arch-tiny">Delta Lake format</text>
 <text x="618" y="132" class="arch-tiny">part-00000-3f7a….parquet</text>
 <text x="618" y="150" class="arch-tiny">part-00001-9c21….parquet</text>
-<line x1="230" y1="250" x2="230" y2="182" class="arch-line" marker-start="url(#arch-head)" marker-end="url(#arch-head)" />
-<text x="244" y="220" class="arch-muted">read + write</text>
-<line x1="585" y1="250" x2="585" y2="182" class="arch-line" marker-end="url(#arch-head)" />
-<text x="599" y="220" class="arch-muted">read</text>
-<line x1="815" y1="250" x2="815" y2="182" class="arch-line" marker-end="url(#arch-head)" />
-<text x="829" y="220" class="arch-muted">read</text>
-<rect x="40" y="250" width="380" height="160" rx="3" class="arch-panel" />
+<line x1="215" y1="250" x2="215" y2="182" class="arch-line" marker-start="url(#arch-head)" marker-end="url(#arch-head)" />
+<text x="229" y="220" class="arch-muted">read + write</text>
+<line x1="545" y1="250" x2="545" y2="182" class="arch-line" marker-end="url(#arch-head)" />
+<text x="559" y="220" class="arch-muted">read</text>
+<line x1="790" y1="250" x2="790" y2="182" class="arch-line" marker-end="url(#arch-head)" />
+<text x="804" y="220" class="arch-muted">read</text>
+<rect x="40" y="250" width="350" height="160" rx="3" class="arch-panel" />
 <text x="64" y="280" class="arch-title">pivotdb cluster</text>
-<text x="396" y="280" text-anchor="end" class="arch-muted">writer</text>
-<rect x="64" y="296" width="104" height="86" rx="2" class="arch-inner" />
-<rect x="65" y="297" width="102" height="23" class="arch-strip" />
-<line x1="65" y1="320" x2="167" y2="320" class="arch-rule" />
-<text x="116" y="313" text-anchor="middle" class="arch-muted">node 1</text>
-<rect x="75" y="332" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="97" y="332" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="119" y="332" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="141" y="332" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="75" y="354" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="97" y="354" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="119" y="354" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="141" y="354" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="178" y="296" width="104" height="86" rx="2" class="arch-inner" />
-<rect x="179" y="297" width="102" height="23" class="arch-strip" />
-<line x1="179" y1="320" x2="281" y2="320" class="arch-rule" />
-<text x="230" y="313" text-anchor="middle" class="arch-muted">node 2</text>
-<rect x="189" y="332" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="211" y="332" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="233" y="332" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="255" y="332" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="189" y="354" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="211" y="354" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="233" y="354" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="255" y="354" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="292" y="296" width="104" height="86" rx="2" class="arch-inner" />
-<rect x="293" y="297" width="102" height="23" class="arch-strip" />
-<line x1="293" y1="320" x2="395" y2="320" class="arch-rule" />
-<text x="344" y="313" text-anchor="middle" class="arch-muted">node 3</text>
-<rect x="303" y="332" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="325" y="332" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="347" y="332" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="369" y="332" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="303" y="354" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="325" y="354" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="347" y="354" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="369" y="354" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="450" y="250" width="270" height="160" rx="3" class="arch-panel" />
-<text x="585" y="280" text-anchor="middle" class="arch-title">Agents</text>
-<rect x="464" y="296" width="242" height="46" rx="2" class="arch-inner" />
-<rect x="465" y="297" width="240" height="16" class="arch-strip" />
-<line x1="465" y1="313" x2="705" y2="313" class="arch-rule" />
-<text x="472" y="309" class="arch-tiny">agent 1</text>
-<text x="472" y="330" class="arch-prompt">$</text>
-<text x="485" y="330" class="arch-cmd">pivot open s3://pivotlake/events</text>
-<rect x="464" y="352" width="242" height="46" rx="2" class="arch-inner" />
-<rect x="465" y="353" width="240" height="16" class="arch-strip" />
-<line x1="465" y1="369" x2="705" y2="369" class="arch-rule" />
-<text x="472" y="365" class="arch-tiny">agent 2</text>
-<text x="472" y="386" class="arch-prompt">$</text>
-<text x="485" y="386" class="arch-cmd">pivot open s3://pivotlake/orders</text>
-<rect x="750" y="250" width="130" height="160" rx="3" class="arch-panel" />
-<text x="815" y="280" text-anchor="middle" class="arch-title">Other engines</text>
-<rect x="764" y="296" width="102" height="32" rx="2" class="arch-inner" />
-<rect x="776" y="305" width="14" height="14" rx="1" class="arch-cell" />
-<text x="798" y="317" class="arch-muted">DuckDB</text>
-<rect x="764" y="332" width="102" height="32" rx="2" class="arch-inner" />
-<rect x="776" y="341" width="14" height="14" rx="1" class="arch-cell" />
-<text x="798" y="353" class="arch-muted">Spark</text>
-<rect x="764" y="368" width="102" height="32" rx="2" class="arch-inner" />
-<rect x="776" y="377" width="14" height="14" rx="1" class="arch-cell" />
-<text x="798" y="389" class="arch-muted">pandas</text>
-<line x1="230" y1="460" x2="230" y2="412" class="arch-line" marker-end="url(#arch-head)" />
-<text x="244" y="440" class="arch-muted">Postgres wire</text>
-<rect x="40" y="460" width="380" height="72" rx="3" class="arch-panel" />
+<text x="366" y="280" text-anchor="end" class="arch-muted">writer</text>
+<rect x="64" y="296" width="94" height="86" rx="2" class="arch-inner" />
+<rect x="65" y="297" width="92" height="23" class="arch-strip" />
+<line x1="65" y1="320" x2="157" y2="320" class="arch-rule" />
+<text x="111" y="313" text-anchor="middle" class="arch-muted">node 1</text>
+<rect x="70" y="332" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="92" y="332" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="114" y="332" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="136" y="332" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="70" y="354" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="92" y="354" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="114" y="354" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="136" y="354" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="168" y="296" width="94" height="86" rx="2" class="arch-inner" />
+<rect x="169" y="297" width="92" height="23" class="arch-strip" />
+<line x1="169" y1="320" x2="261" y2="320" class="arch-rule" />
+<text x="215" y="313" text-anchor="middle" class="arch-muted">node 2</text>
+<rect x="174" y="332" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="196" y="332" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="218" y="332" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="240" y="332" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="174" y="354" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="196" y="354" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="218" y="354" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="240" y="354" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="272" y="296" width="94" height="86" rx="2" class="arch-inner" />
+<rect x="273" y="297" width="92" height="23" class="arch-strip" />
+<line x1="273" y1="320" x2="365" y2="320" class="arch-rule" />
+<text x="319" y="313" text-anchor="middle" class="arch-muted">node 3</text>
+<rect x="278" y="332" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="300" y="332" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="322" y="332" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="344" y="332" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="278" y="354" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="300" y="354" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="322" y="354" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="344" y="354" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="410" y="250" width="270" height="160" rx="3" class="arch-panel" />
+<text x="545" y="280" text-anchor="middle" class="arch-title">Agents</text>
+<rect x="424" y="296" width="242" height="46" rx="2" class="arch-inner" />
+<rect x="425" y="297" width="240" height="16" class="arch-strip" />
+<line x1="425" y1="313" x2="665" y2="313" class="arch-rule" />
+<text x="432" y="309" class="arch-tiny">agent 1</text>
+<text x="432" y="330" class="arch-prompt">$</text>
+<text x="445" y="330" class="arch-cmd">pivot open s3://pivotlake/events</text>
+<rect x="424" y="352" width="242" height="46" rx="2" class="arch-inner" />
+<rect x="425" y="353" width="240" height="16" class="arch-strip" />
+<line x1="425" y1="369" x2="665" y2="369" class="arch-rule" />
+<text x="432" y="365" class="arch-tiny">agent 2</text>
+<text x="432" y="386" class="arch-prompt">$</text>
+<text x="445" y="386" class="arch-cmd">pivot open s3://pivotlake/orders</text>
+<rect x="700" y="250" width="180" height="160" rx="3" class="arch-panel" />
+<text x="790" y="280" text-anchor="middle" class="arch-title">Other engines</text>
+<rect x="714" y="296" width="152" height="32" rx="2" class="arch-inner" />
+<rect x="726" y="305" width="14" height="14" rx="1" class="arch-cell" />
+<text x="748" y="317" class="arch-muted">DuckDB</text>
+<rect x="714" y="332" width="152" height="32" rx="2" class="arch-inner" />
+<rect x="726" y="341" width="14" height="14" rx="1" class="arch-cell" />
+<text x="748" y="353" class="arch-muted">Spark</text>
+<rect x="714" y="368" width="152" height="32" rx="2" class="arch-inner" />
+<rect x="726" y="377" width="14" height="14" rx="1" class="arch-cell" />
+<text x="748" y="389" class="arch-muted">pandas · Trino</text>
+<line x1="215" y1="460" x2="215" y2="412" class="arch-line" marker-end="url(#arch-head)" />
+<text x="229" y="440" class="arch-muted">Postgres wire</text>
+<rect x="40" y="460" width="350" height="72" rx="3" class="arch-panel" />
 <text x="64" y="484" class="arch-title">SQL clients</text>
 <rect x="64" y="494" width="76" height="26" rx="2" class="arch-inner" />
 <text x="102" y="511" text-anchor="middle" class="arch-muted">backend</text>
