@@ -184,7 +184,7 @@ impl BatchAccumulator {
         indices: &[u32],
         allocator: &mut SlabAllocator,
     ) {
-        debug_assert!(self.len + indices.len() <= self.capacity);
+        assert!(self.len + indices.len() <= self.capacity);
         for (accumulator, column) in self.columns.iter_mut().zip(batch.columns()) {
             accumulator.append_from_indices(column, indices, self.len, allocator);
         }
@@ -203,7 +203,7 @@ impl BatchAccumulator {
         ids: &[u32],
         allocator: &mut SlabAllocator,
     ) {
-        debug_assert!(self.len + ids.len() <= self.capacity);
+        assert!(self.len + ids.len() <= self.capacity);
         for (accumulator, column) in self.columns.iter_mut().zip(columns) {
             accumulator.append_from_batches(column, ids, shift, self.len, allocator);
         }
@@ -223,11 +223,36 @@ impl BatchAccumulator {
         len: usize,
         allocator: &mut SlabAllocator,
     ) {
-        debug_assert!(self.len + len <= self.capacity);
+        assert!(self.len + len <= self.capacity);
         for (accumulator, column) in self.columns.iter_mut().zip(batch.columns()) {
             accumulator.append_from_range(column, start, len, self.len, allocator);
         }
         self.len += len;
+    }
+
+    /// Append indexed rows of `batch` in room-bounded chunks, handing a full
+    /// batch to `flush` whenever one accumulates, so the input's size is
+    /// unbounded: the accumulator itself decides where to split, and no
+    /// producer upstream has to know this side's capacity.
+    pub fn append_batch_by_indices_flushing<E: From<ArrowError>>(
+        &mut self,
+        batch: &RecordBatch,
+        indices: &[u32],
+        allocator: &mut SlabAllocator,
+        flush: &mut dyn FnMut(RecordBatch) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut remaining = indices;
+        while !remaining.is_empty() {
+            let room = self.capacity - self.len;
+            let (chunk, rest) = remaining.split_at(room.min(remaining.len()));
+            self.append_batch_by_indices(batch, chunk, allocator);
+            if self.has_full_batch() {
+                let full = self.take_batch(allocator)?;
+                flush(full)?;
+            }
+            remaining = rest;
+        }
+        Ok(())
     }
 
     /// Emit the accumulated rows as one batch and reset.

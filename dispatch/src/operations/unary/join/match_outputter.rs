@@ -400,7 +400,10 @@ impl ProbeMatchOutputter {
         Ok(())
     }
 
-    /// Emit one combined batch from the two sides' accumulated rows.
+    /// Emit one combined batch from the two sides' accumulated rows. The
+    /// batch can reach one row short of twice [`RECORD_BATCH_SIZE`] (a
+    /// drain's remainder plus the next full drain); consumers own their
+    /// sizing, chunking oversized inputs themselves.
     pub(super) fn emit(&mut self, sender: &mut dyn Sender<RecordBatch>) -> unary::Result<()> {
         let probe_part = self.probe.take_batch(&mut self.allocator)?;
         let build_part = self.build.take_batch(&mut self.allocator)?;
