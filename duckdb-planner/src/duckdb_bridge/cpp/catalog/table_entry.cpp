@@ -132,9 +132,20 @@ static bool PivotScanSupportsPushdownExtract(const FunctionData &, const Logical
 	return true;
 }
 
-TableFunction PivotTableCatalogEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
-	bind_data = make_uniq<PivotScanBindData>(*this, *table);
-	TableFunction func(name, {}, nullptr, nullptr);
+void ConfigurePivotLateMaterialization(TableFunction &func, const OptionalTableWrapper &table) {
+	// A capable table lets DuckDB rewrite a wide Top-N into a narrow row-id
+	// scan whose survivors Pivot materializes. The row-id is a plan-time marker;
+	// the default virtual column from TableCatalogEntry is sufficient. Tables
+	// without a materialization implementation must not advertise these hooks.
+	if (!table_supports_late_materialization(table)) {
+		return;
+	}
+	func.late_materialization = true;
+	func.get_virtual_columns = PivotScanGetVirtualColumns;
+	func.get_row_id_columns = PivotScanGetRowIdColumns;
+}
+
+void ConfigurePivotScanFunction(TableFunction &func) {
 	func.get_bind_info = PivotScanGetBindInfo;
 	func.pushdown_complex_filter = PivotScanPushdownComplexFilter;
 	// Enabling filter_pushdown lets DuckDB's optimizer passes install filters
@@ -151,16 +162,14 @@ TableFunction PivotTableCatalogEntry::GetScanFunction(ClientContext &context, un
 	// only the referenced leaves. Gated by the optimizer on `func.statistics`
 	// being unset, which it is.
 	func.supports_pushdown_extract = PivotScanSupportsPushdownExtract;
-	// A capable table lets DuckDB rewrite a wide Top-N into a narrow row-id
-	// scan whose survivors Pivot materializes. The row-id is a plan-time marker;
-	// the default virtual column from TableCatalogEntry is sufficient. Tables
-	// without a materialization implementation must not advertise these hooks.
-	if (table_supports_late_materialization(*table)) {
-		func.late_materialization = true;
-		func.get_virtual_columns = PivotScanGetVirtualColumns;
-		func.get_row_id_columns = PivotScanGetRowIdColumns;
-	}
 	func.cardinality = PivotScanCardinality;
+}
+
+TableFunction PivotTableCatalogEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
+	bind_data = make_uniq<PivotScanBindData>(*this, *table);
+	TableFunction func(name, {}, nullptr, nullptr);
+	ConfigurePivotScanFunction(func);
+	ConfigurePivotLateMaterialization(func, *table);
 	return func;
 }
 

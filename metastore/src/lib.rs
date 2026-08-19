@@ -15,6 +15,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use datastore::Datastore;
+use datastore_delta::store::ObjectStore;
 use dispatch::DataFlowDispatcher;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -106,6 +107,19 @@ pub trait Metastore: Send + Sync + std::fmt::Debug {
     fn create_user(&self, username: &str, password: Option<&str>) -> Result<()> {
         let _ = password;
         Err(format!("this metastore does not support creating users (user `{username}`)").into())
+    }
+
+    /// Open the object store rooted at `uri`, authenticated the way this
+    /// metastore authenticates that location.
+    ///
+    /// A query reads Parquet from locations no datastore covers, so the
+    /// credentials for one cannot come from a datastore; they come from here,
+    /// where the server's are configured. The default resolves them from the
+    /// environment, which is all a metastore that holds none can offer;
+    /// implementations holding their own secrets override this so the same
+    /// scoping that opens a datastore opens a location.
+    fn open_store(&self, uri: &str) -> Result<Arc<dyn ObjectStore>> {
+        Ok(Arc::from(datastore_delta::store::open_store(uri)?))
     }
 }
 

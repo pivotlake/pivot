@@ -140,8 +140,14 @@ pub enum Error {
     CreateUser(#[source] crate::catalog::Error),
     #[error("Unsupported table function: {0}")]
     UnsupportedTableFunction(String),
-    #[error("Invalid argument to table function {function}: {message}")]
-    InvalidTableFunctionArgument { function: String, message: String },
+    #[error("binding table function {function}: {source}")]
+    BindTableFunction {
+        function: String,
+        #[source]
+        source: crate::catalog::Error,
+    },
+    #[error("table function {0} reads a table, which the plan should scan as one")]
+    TableFunctionBoundAsTable(String),
 }
 
 impl Plan {

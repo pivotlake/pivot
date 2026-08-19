@@ -9,10 +9,10 @@
 pub mod duckdb_types;
 
 use crate::catalog_provider::{
-    CatalogContext, OptionalTableWrapper, TransactionContext, catalog_context_default,
-    catalog_context_names, catalog_does_schema_exist, catalog_get_scalar_function,
-    catalog_get_table, catalog_get_table_function, pushdown_filter, table_estimate_row_count,
-    table_supports_late_materialization,
+    CatalogContext, OptionalTableWrapper, TransactionContext, catalog_bind_table_function,
+    catalog_context_default, catalog_context_names, catalog_does_schema_exist,
+    catalog_get_scalar_function, catalog_get_table, catalog_get_table_function, pushdown_filter,
+    table_estimate_row_count, table_supports_late_materialization,
 };
 
 /// CXX bridge to the hand-written C++ glue in `bridge.cpp` / `bridge.h`.
@@ -66,13 +66,27 @@ pub mod ffi {
         pub table: Box<OptionalTableWrapper>,
     }
 
-    /// Result of a catalog table-function lookup: the function's argument types
-    /// and full output columns (DuckDB logical type id discriminants), or
-    /// `found = false` if the provider has no such function.
+    /// Result of a catalog table-function lookup by name: the argument types
+    /// (DuckDB logical type id discriminants) a call of it is resolved against,
+    /// or `found = false` if the provider has no such function. Its output
+    /// columns are not here — they come from a call's arguments, so they are
+    /// learned by binding one.
     struct CatalogGetTableFunctionResult {
         pub found: bool,
         pub arg_type_ids: Vec<u8>,
+    }
+
+    /// One bound call of a table function: the columns it emits, and the table
+    /// it reads when its arguments named one (`reads_table`, with the handle in
+    /// `table`). A call's columns come from its arguments, so this is where a
+    /// function's schema is learned — the name lookup above only knows what
+    /// arguments it takes.
+    struct CatalogBindTableFunctionResult {
+        pub found: bool,
+        pub display_name: String,
         pub columns: Vec<DuckDBColumn>,
+        pub reads_table: bool,
+        pub table: Box<OptionalTableWrapper>,
     }
 
     /// A scalar function the provider defines, described for DuckDB's binder:
@@ -147,6 +161,14 @@ pub mod ffi {
             datastore: &str,
             name: &str,
         ) -> CatalogGetTableFunctionResult;
+        /// Bind one call of a table function, from that function's bind — the
+        /// first point its arguments, and so the columns it emits, are known.
+        fn catalog_bind_table_function(
+            transaction: &TransactionContext,
+            datastore: &str,
+            name: &str,
+            arguments: &CxxVector<Value>,
+        ) -> Result<CatalogBindTableFunctionResult>;
         fn catalog_get_scalar_function(
             ctx: &CatalogContext,
             name: &str,

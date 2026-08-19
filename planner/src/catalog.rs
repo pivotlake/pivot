@@ -17,15 +17,15 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 
 use crate::expression::{CompareType, TableFilter};
-use crate::operator::TableFunction;
+use crate::operator::{BoundTableFunction, TableFunction};
 use crate::types::{Type, logical_from_type};
 use arrow_array::{ArrayRef, Scalar};
 use dispatch::{DataFlowDispatcher, DynamicFilterSlot, Projection, RecordBatchOperatorSpec};
-use duckdb_planner::DuckDBColumn;
-use duckdb_planner::Expr;
 use duckdb_planner::catalog_provider::{
-    DuckDBBind, DuckDBTable, DuckDBTransaction, ScalarFunctionDef, TableFunctionDef,
+    BoundTableFunctionCall, DuckDBBind, DuckDBTable, DuckDBTransaction, ScalarFunctionDef,
+    TableFunctionDef,
 };
+use duckdb_planner::{DuckDBColumn, Expr, ScalarValue};
 use std::fmt::Debug;
 use std::sync::Arc;
 use thiserror::Error;
@@ -617,20 +617,43 @@ impl DuckDBTransaction for DuckDBTransactionAdapter {
     }
 
     fn bind_table_function(&self, datastore: &str, name: &str) -> Option<TableFunctionDef> {
-        // The function's own signature is the single source of truth; convert its
-        // Pivot types to DuckDB logical type ids for the binder.
-        let signature = self
-            .transaction
-            .bind_table_function(datastore, name)?
-            .signature();
+        // Only the argument types are known from the name: a call's columns come
+        // from its arguments, so they wait for `bind_table_function_call`.
+        let function = self.transaction.bind_table_function(datastore, name)?;
         Some(TableFunctionDef {
-            arg_type_ids: signature
-                .arguments
+            arg_type_ids: function
+                .argument_types()
                 .iter()
                 .map(|arg_type| logical_from_type(arg_type).id as u8)
                 .collect(),
-            columns: duckdb_columns(&signature.columns),
         })
+    }
+
+    fn bind_table_function_call(
+        &self,
+        datastore: &str,
+        name: &str,
+        arguments: &[ScalarValue],
+    ) -> duckdb_planner::catalog_provider::Result<Option<BoundTableFunctionCall>> {
+        let Some(function) = self.transaction.bind_table_function(datastore, name) else {
+            return Ok(None);
+        };
+        let bound = function.bind(arguments)?;
+        let columns = duckdb_columns(&bound.columns());
+        Ok(Some(match bound {
+            BoundTableFunction::Rows(_) => BoundTableFunctionCall {
+                display_name: name.to_string(),
+                columns,
+                table: None,
+            },
+            BoundTableFunction::Table(table) => BoundTableFunctionCall {
+                // The table names itself, so a plan over storage says which
+                // files it reads rather than repeating the function's name.
+                display_name: table.table_reference().table,
+                columns,
+                table: Some(Box::new(DuckDBTableAdapter { table })),
+            },
+        }))
     }
 }
 

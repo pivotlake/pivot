@@ -57,7 +57,7 @@ pub use materialize::Materialize;
 pub use order_by::{OrderBy, OrderByDirection, OrderByNode};
 pub use projection::Projection;
 pub use set_variable::SetVariable;
-pub use table_function::{TableFunction, TableFunctionScan, TableFunctionSignature};
+pub use table_function::{BoundTableFunction, TableFunction, TableFunctionRows, TableFunctionScan};
 pub use top_n::TopN;
 pub use values::Values;
 

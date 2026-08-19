@@ -44,24 +44,20 @@ LogicalType logical_type_from_column(const DuckDBColumn &col) {
 	return logical_type_from(col.duckdb_logical_type_id);
 }
 
-// Carries a table function's output schema from the lookup (where Rust supplied
-// it) through to its bind. pivot only plans, never executes, so the bind just
-// republishes that schema and the bind data is a trivial placeholder.
+// Carries the schema a table function was looked up in through to its bind,
+// which needs it twice: to reach the pivot transaction the call resolves
+// against, and as the schema of the table entry a call reading storage creates.
+// The function's columns are not here - they come from the call's arguments, so
+// only the bind can ask for them.
 struct PivotTableFunctionInfo : public TableFunctionInfo {
-	vector<string> names;
-	vector<LogicalType> return_types;
+	explicit PivotTableFunctionInfo(SchemaCatalogEntry &schema) : schema(schema) {}
+	SchemaCatalogEntry &schema;
 };
 
+// Bind data for a call that computes its rows: pivot only plans, never
+// executes, so nothing about the call has to survive here. A call that reads a
+// table produces `PivotScanBindData` instead, which is what makes it a scan.
 struct PivotTableFunctionBindData : public TableFunctionData {};
-
-unique_ptr<FunctionData> pivot_table_function_bind(ClientContext &, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types,
-                                                   vector<string> &names) {
-	auto &info = input.info->Cast<PivotTableFunctionInfo>();
-	names = info.names;
-	return_types = info.return_types;
-	return make_uniq<PivotTableFunctionBindData>();
-}
 
 // Body of a pivot scalar function stub. It never runs: pivot re-plans the call
 // into its own expression, and the only pivot scalar (drop_cache) is VOLATILE so
@@ -94,16 +90,61 @@ static const ::TransactionContext &pivot_transaction_ctx(duckdb::Catalog &catalo
 	return *storage_info.current_transaction;
 }
 
+// Bind of a pivot table function. The call's arguments are known here and
+// nowhere earlier, and a function is free to derive its columns from them
+// (`read_parquet('s3://bucket/*.parquet')` reads the files' footers), so this is
+// the one place a call's schema comes from.
+//
+// A call whose arguments named a table is turned into the same bind data a table
+// reference produces, over a catalog entry synthesized for it: from here on it
+// is planned as a table scan, with every hook that carries. A call that computes
+// its rows just publishes its columns.
+static unique_ptr<FunctionData> pivot_table_function_bind(ClientContext &, TableFunctionBindInput &input,
+                                                          vector<LogicalType> &return_types,
+                                                          vector<string> &names) {
+	auto &schema = input.info->Cast<PivotTableFunctionInfo>().schema;
+	auto &catalog = schema.ParentCatalog();
+
+	auto result = catalog_bind_table_function(pivot_transaction_ctx(catalog), catalog.GetName(),
+	                                          input.table_function.name, input.inputs);
+	if (!result.found) {
+		throw BinderException("unknown table function \"%s\"", input.table_function.name);
+	}
+
+	CreateTableInfo table_info(schema, std::string(result.display_name));
+	for (const auto &col : result.columns) {
+		auto type = logical_type_from_column(col);
+		names.emplace_back(std::string(col.name));
+		return_types.emplace_back(type);
+		table_info.columns.AddColumn(ColumnDefinition(names.back(), type));
+	}
+	if (!result.reads_table) {
+		return make_uniq<PivotTableFunctionBindData>();
+	}
+
+	auto &db_instance = catalog.GetAttached().GetDatabase();
+	auto entry = make_uniq<PivotTableCatalogEntry>(catalog, schema, table_info, std::move(result.table));
+	auto *stored = PivotStorageInfo::Get(db_instance).AddTableEntry(std::move(entry));
+	// Only a call that reads a table is planned as a scan, and `input.table_function`
+	// is the very function object the LogicalGet is built with, so configuring it
+	// here - after the bind decided which kind of call this is - reaches the plan.
+	ConfigurePivotScanFunction(input.table_function);
+	ConfigurePivotLateMaterialization(input.table_function, *stored->table);
+	return make_uniq<PivotScanBindData>(*stored, *stored->table);
+}
+
 optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransaction transaction,
                                                          const EntryLookupInfo &lookup_info) {
 	auto &table_name = lookup_info.GetEntryName();
 	auto &pivot_catalog = ParentCatalog().Cast<PivotCatalog>();
 
-	// A table-function reference (e.g. `metadata('t')`): resolve it against the
-	// transaction's snapshot, since such a function reads catalog data. Unknown
+	// A table-function reference (e.g. `read_parquet('…')`): resolve it against
+	// the transaction's snapshot, since such a function reads data. Unknown
 	// names (DuckDB built-ins like generate_series) return nullptr, so the
-	// binder falls through to the system catalog. The function's schema comes
-	// entirely from Rust; nothing about it is declared in this bridge.
+	// binder falls through to the system catalog. Only the argument types are
+	// known from the name; what a call of it emits is learned by binding one,
+	// so everything else about the function comes from Rust at bind time and
+	// nothing about it is declared in this bridge.
 	if (lookup_info.GetCatalogType() == CatalogType::TABLE_FUNCTION_ENTRY) {
 		auto function = catalog_get_table_function(
 		    pivot_transaction_ctx(ParentCatalog()), ParentCatalog().GetName(), table_name);
@@ -111,19 +152,13 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
 			return nullptr;
 		}
 
-		auto info = make_shared_ptr<PivotTableFunctionInfo>();
 		vector<LogicalType> arguments;
 		for (auto type_id : function.arg_type_ids) {
 			arguments.emplace_back(logical_type_from(type_id));
 		}
-		for (const auto &col : function.columns) {
-			info->names.emplace_back(std::string(col.name));
-			info->return_types.emplace_back(logical_type_from_column(col));
-		}
 
-		TableFunction func(std::string(table_name), std::move(arguments), nullptr,
-		                   pivot_table_function_bind);
-		func.function_info = info;
+		TableFunction func(std::string(table_name), arguments, nullptr, pivot_table_function_bind);
+		func.function_info = make_shared_ptr<PivotTableFunctionInfo>(*this);
 
 		CreateTableFunctionInfo create_info(func);
 		auto entry =

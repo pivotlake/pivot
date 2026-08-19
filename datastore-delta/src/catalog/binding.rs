@@ -5,104 +5,24 @@
 use std::sync::Arc;
 
 use crate::manifest::{ColumnStatFilter, PartitionEqFilter};
-use crate::parquet::types::leaves::{
-    first_leaf, leaf_fields, variant_shredded_leaves, variant_value_leaf_is_semantically_null,
-};
-use crate::parquet::types::metadata::RowGroupMetadata;
 use crate::parquet::{
-    ParquetTable, ScanEqualityPredicate, materialize, row_group_eliminated, row_group_filter_from,
-    scan_order_from, table_input_with_filter_and_eq_predicates,
+    ParquetTable, materialize, row_group_filter_from, scan_order_from,
+    table_input_with_filter_and_eq_predicates,
 };
-use arrow_array::{Array, ArrayRef, Scalar};
+use crate::pushdown::{
+    self, PushedPredicate, column_min_max, equality_predicates, prune_row_groups,
+};
+use arrow_array::{ArrayRef, Scalar};
 use crossbeam_deque::Injector;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Error as CatalogError, Result as CatalogResult,
     TableReference, TableRevision,
 };
-use planner::expression::{CompareType, Expression, Function, JsonPath, TableFilter};
-use planner::types::physical_arrow_type;
+use planner::expression::{CompareType, TableFilter};
 
 use super::CatalogTable;
 use super::insert_sink::{UploadedFile, build_insert_spec};
-
-/// A single-column constant comparison (`col <cmp> const`) pushed down by
-/// DuckDB during binding. Recorded as-is; applied at [`compile_scan`](BoundTable::compile_scan)
-/// time after the row-group metadata exists: min/max stats prune row groups,
-/// and equality additionally prunes by dictionary contents in the decoder. The
-/// upstream `Filter` always runs, so this is a pure optimization.
-#[derive(Clone, Debug)]
-struct PushedPredicate {
-    /// The top-level column the comparison reads. For a variant path this is
-    /// the variant column; the predicate prunes against the path's shredded
-    /// leaf.
-    column_idx: usize,
-    /// The path inside the variant column (`CAST(col->'a'->'b' AS T) <cmp>
-    /// const`), empty for a plain column comparison.
-    path: JsonPath,
-    /// The SQL cast's physical output type for a variant path. Pruning against
-    /// the raw typed leaf is sound only when this is a semantic identity.
-    as_type: Option<arrow_schema::DataType>,
-    compare_type: CompareType,
-    value: Scalar<ArrayRef>,
-}
-
-impl PushedPredicate {
-    /// The column-chunk index this predicate's statistics live on in `rg`: the
-    /// column's own leaf for a plain predicate, or the shredded typed leaf for
-    /// a variant path. `None` means pruning isn't sound for this row group
-    /// (always safe): the path isn't shredded in this file, or some rows may
-    /// hold the path's value in an untyped `value` leaf along the path, where
-    /// the typed leaf's statistics can't see them. Stats-based skipping is
-    /// allowed only when every such fallback is proven to contribute SQL NULL
-    /// for this cast.
-    fn get_leaf_for_row_group(&self, rg: &RowGroupMetadata) -> Option<usize> {
-        let fields = rg.schema.fields();
-        if self.path.is_empty() {
-            return Some(first_leaf(fields, self.column_idx));
-        }
-        let leaves = variant_shredded_leaves(fields, self.column_idx, &self.path)?;
-        let target = self
-            .as_type
-            .as_ref()
-            .expect("a variant path predicate has a cast target");
-        if leaf_fields(fields)[leaves.typed_leaf].data_type() != target {
-            return None;
-        }
-        let terminal = leaves.value_leaves.len().saturating_sub(1);
-        leaves
-            .value_leaves
-            .iter()
-            .enumerate()
-            .all(|(level, &leaf)| {
-                variant_value_leaf_is_semantically_null(rg, leaf, target, level == terminal)
-            })
-            .then_some(leaves.typed_leaf)
-    }
-}
-
-/// Returns the column and optional variant path that can use row-group stats.
-///
-/// Plain columns use an empty path. Typed variant reads use the corresponding
-/// shredded leaf. Untyped variant reads cannot be compared and are ignored.
-fn get_prunable_column_and_json_path(
-    expr: &Expression,
-) -> Option<(usize, JsonPath, Option<arrow_schema::DataType>)> {
-    match expr {
-        Expression::Ref(r) => Some((r.column_idx, Vec::new(), None)),
-        Expression::Function(Function::VariantGet(read)) if read.as_type.is_some() => {
-            match read.input.as_ref() {
-                Expression::Ref(r) => Some((
-                    r.column_idx,
-                    read.path.clone(),
-                    read.as_type.as_ref().map(physical_arrow_type),
-                )),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
 
 /// A catalog table resolved from one transaction: it captures the snapshot's own
 /// copy of the [`CatalogTable`] (schema, files, and their row groups), this
@@ -250,18 +170,7 @@ impl BoundTable for TableBinding {
         // refresh already materialized every footer.
         let current = self.resolve_files()?;
 
-        // A variant path predicate reaches its shredded typed leaf only in the
-        // files that shred it, so each row group resolves the path itself.
-        let eq_predicates: Vec<ScanEqualityPredicate> = self
-            .predicates
-            .iter()
-            .filter(|p| matches!(p.compare_type, CompareType::Equal))
-            .map(|p| ScanEqualityPredicate {
-                column_idx: p.column_idx,
-                path: p.path.clone(),
-                value: p.value.clone(),
-            })
-            .collect();
+        let eq_predicates = equality_predicates(&self.predicates);
 
         // Prune the row groups by the pushed-down predicates' stats.
         let parquet = Arc::new(self.pruned_parquet(&current));
@@ -328,36 +237,10 @@ impl BoundTable for TableBinding {
     }
 
     fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {
-        let TableFilter::Expression(expr) = filter else {
-            return Ok(false);
-        };
-        let Expression::Compare(compare) = expr.as_ref() else {
-            return Ok(false);
-        };
-        let ((column_idx, path, as_type), constant) =
-            match (compare.left.as_ref(), compare.right.as_ref()) {
-                (column, Expression::Constant(k)) | (Expression::Constant(k), column) => {
-                    let Some(prunable) = get_prunable_column_and_json_path(column) else {
-                        return Ok(false);
-                    };
-                    (prunable, k)
-                }
-                _ => return Ok(false),
-            };
-
-        // Just record it. The actual pruning (min/max row-group elimination and
+        // Just recorded. The actual pruning (min/max row-group elimination and
         // equality/dictionary pruning) happens in `compile`, once the row-group
-        // metadata exists. The upstream `Filter` is kept (we return `Ok(false)`),
-        // so this is purely an optimization and never affects correctness.
-        self.predicates.push(PushedPredicate {
-            column_idx,
-            path,
-            as_type,
-            compare_type: compare.compare_type,
-            value: constant.clone(),
-        });
-
-        Ok(false)
+        // metadata exists.
+        pushdown::record_pushed_filter(filter, &mut self.predicates)
     }
 
     fn column_min_max(&self, column: usize) -> Option<(Scalar<ArrayRef>, Scalar<ArrayRef>)> {
@@ -368,28 +251,7 @@ impl BoundTable for TableBinding {
         }
         // Read the captured snapshot files, the same view a scan would see; an
         // unresolvable view means "scan".
-        let parquet = self.resolve_files().ok()?;
-        let row_groups = parquet.row_groups();
-        if row_groups.is_empty() {
-            return None;
-        }
-        // Every row group must carry both bounds; fold them with the arrow
-        // comparison kernels (stats come back typed as the physical column).
-        let mut min: Option<Scalar<ArrayRef>> = None;
-        let mut max: Option<Scalar<ArrayRef>> = None;
-        for rg in row_groups {
-            let stats = rg.column_statistics(column)?;
-            let (rg_min, rg_max) = (stats.min.as_ref()?, stats.max.as_ref()?);
-            min = Some(match min {
-                Some(m) if scalar_lt(&m, rg_min) => m,
-                _ => rg_min.clone(),
-            });
-            max = Some(match max {
-                Some(m) if scalar_lt(rg_max, &m) => m,
-                _ => rg_max.clone(),
-            });
-        }
-        Some((min?, max?))
+        column_min_max(self.resolve_files().ok()?.as_ref(), column)
     }
 
     fn row_count(&self) -> Option<i64> {
@@ -421,34 +283,11 @@ impl BoundTable for TableBinding {
     }
 }
 
-/// `a < b` over two single-value scalars of the same physical type. A null,
-/// type mismatch, or kernel error reads as `false`. In [`column_min_max`] every
-/// comparison is between two same-typed integer/temporal stat bounds, where the
-/// kernel never errors and the bounds are non-null. (Mirrors the stricter,
-/// private `scalar_lt` in `parquet::reading::fetching`; worth consolidating.)
-///
-/// [`column_min_max`]: TableBinding::column_min_max
-fn scalar_lt(a: &Scalar<ArrayRef>, b: &Scalar<ArrayRef>) -> bool {
-    arrow_ord::cmp::lt(a, b).is_ok_and(|r| r.len() == 1 && r.is_valid(0) && r.value(0))
-}
-
 impl TableBinding {
-    /// Clone `parquet`'s row groups and keep only those that survive this
-    /// binding's pushed-down predicates — i.e. what [`BoundTable::compile_scan`] actually
-    /// scans over the table's current files. A min/max stat that proves no row in
-    /// a group can match drops it; a stats-comparison error means "can't prune"
-    /// (kept) — never wrong, just unoptimized. No footer I/O. Exposed so pruning
-    /// can be asserted directly.
+    /// The row groups of `parquet` this binding's pushed-down predicates leave —
+    /// i.e. what [`BoundTable::compile_scan`] actually scans over the table's
+    /// current files. Exposed so pruning can be asserted directly.
     pub fn pruned_parquet(&self, parquet: &ParquetTable) -> ParquetTable {
-        let mut parquet = parquet.clone();
-        parquet.row_groups_mut().retain(|rg| {
-            !self.predicates.iter().any(|p| {
-                p.get_leaf_for_row_group(rg.as_ref()).is_some_and(|leaf| {
-                    row_group_eliminated(rg.as_ref(), leaf, p.compare_type, &p.value)
-                        .unwrap_or(false)
-                })
-            })
-        });
-        parquet
+        prune_row_groups(parquet, &self.predicates)
     }
 }

@@ -24,10 +24,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod gcs;
+mod glob;
 mod local;
 mod object_path;
 mod s3;
 pub use gcs::GcsStore;
+pub use glob::{LocationPattern, list_matching, name_matches};
 pub use local::LocalStore;
 pub use object_path::ObjectPath;
 pub use s3::{S3Credentials, S3Store};
@@ -44,6 +46,18 @@ pub enum StoreError {
     Http(String),
     #[error("unsupported catalog uri `{0}` (expected a local path, file://, s3://, or gs://)")]
     UnsupportedUri(String),
+    /// A location whose wildcards sit above its final segment. Matching those
+    /// would mean listing every directory below the pattern, which the
+    /// one-level listing here does not do; refused rather than silently
+    /// matching nothing.
+    #[error(
+        "location `{location}` may only carry a `*`/`?` pattern in its final path segment, not in a directory"
+    )]
+    PatternInDirectory { location: String },
+    /// A location naming no object at all: a bare bucket, or a path ending in
+    /// a separator. There is no name to match under the directory it names.
+    #[error("location `{location}` names a directory, not a file or a pattern within one")]
+    LocationWithoutName { location: String },
     #[error("missing credential/config: {0}")]
     Config(String),
     /// A conditional replace lost to a concurrent writer: the object changed
@@ -433,6 +447,20 @@ pub(crate) fn object_key(prefix: &str, key: &ObjectPath) -> String {
         } else {
             format!("{prefix}/{}", key.as_str())
         }
+    }
+}
+
+/// The listing prefix a bucket backend queries for the objects directly under
+/// `key`: the object key, closed with the `/` that separates it from the names
+/// below it. A key naming the store's own root lists with no prefix at all,
+/// rather than with a bare `/`, which addresses nothing in a bucket.
+pub(crate) fn list_prefix(prefix: &str, key: &ObjectPath) -> String {
+    let object = object_key(prefix, key);
+    let object = object.trim_end_matches('/');
+    if object.is_empty() {
+        String::new()
+    } else {
+        format!("{object}/")
     }
 }
 

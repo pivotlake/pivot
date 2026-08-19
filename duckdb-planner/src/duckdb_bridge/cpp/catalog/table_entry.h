@@ -35,3 +35,17 @@ public:
 	                                                         duckdb::column_t column_id) override;
 	duckdb::TableStorageInfo GetStorageInfo(duckdb::ClientContext &context) override;
 };
+
+// Give `func` the hooks a pivot scan is planned with: filter and projection
+// pushdown into the Rust table, pushed field extracts, and the table's real
+// cardinality. Shared by the two ways a pivot scan is reached — a table
+// reference, and a function naming a location (`read_parquet`) whose bind
+// resolves to a table — so both are planned by exactly the same rules.
+void ConfigurePivotScanFunction(duckdb::TableFunction &func);
+
+// Add the hooks that let DuckDB rewrite a wide Top-N over `table` into a narrow
+// row-id scan whose survivors pivot materializes. Separate from
+// `ConfigurePivotScanFunction` because it is the one part that depends on the
+// bound table: a table with no materialization implementation must not
+// advertise them. `entry` supplies the row-id virtual column.
+void ConfigurePivotLateMaterialization(duckdb::TableFunction &func, const OptionalTableWrapper &table);

@@ -16,7 +16,7 @@
 
 use super::{
     DataFileLocation, FileRef, ListedObject, ObjectPath, ObjectStore, ObjectVersion, Result,
-    StoreError, absolute_object_key, object_key, parse_iso8601_millis, percent_encode,
+    StoreError, absolute_object_key, list_prefix, object_key, parse_iso8601_millis, percent_encode,
 };
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
@@ -263,10 +263,10 @@ impl ObjectStore for S3Store {
     }
 
     fn list(&self, prefix: &ObjectPath) -> Result<Vec<ListedObject>> {
-        let object_prefix = object_key(&self.prefix, prefix);
+        let object_prefix = list_prefix(&self.prefix, prefix);
         // ListObjectsV2, one level (delimiter=/), under the object prefix.
         let query = format!(
-            "list-type=2&prefix={}%2F&delimiter=%2F",
+            "list-type=2&prefix={}&delimiter=%2F",
             percent_encode(&object_prefix)
         );
         let url = format!("{}/?{}", self.base, query);

@@ -9,6 +9,9 @@ description = "Provider-neutral metastore interface for resolving PivotDB datast
 # The cross-datastore layer owns the closed set of datastore kinds returned by
 # every metastore provider.
 datastore = { workspace = true }
+# A location a query reads Parquet from is opened as an object store, which is
+# the same backend set (local/S3/GCS) a datastore's storage is opened through.
+datastore-delta = { workspace = true }
 # Opening a datastore reads its tables' footers over the worker pool.
 dispatch = { workspace = true }
 # A stored SCRAM verifier's salt and salted password are base64 in its text form.

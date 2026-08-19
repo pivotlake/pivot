@@ -2,11 +2,13 @@ use std::any::Any;
 use std::sync::Arc;
 
 use crate::duckdb_bridge::ffi;
+use crate::duckdb_bridge::ffi::CatalogBindTableFunctionResult;
 use crate::duckdb_bridge::ffi::CatalogGetScalarFunctionResult;
 use crate::duckdb_bridge::ffi::CatalogGetTableFunctionResult;
 use crate::duckdb_bridge::ffi::CatalogGetTableResult;
 use crate::duckdb_bridge::ffi::DuckDBColumn;
 use crate::handle::Expr;
+use crate::types::ScalarValue;
 
 /// Describes a table that the planner can reference during query planning.
 ///
@@ -78,7 +80,22 @@ pub struct OptionalTableWrapper {
 /// the C++ bridge.
 pub struct TableFunctionDef {
     pub arg_type_ids: Vec<u8>,
+}
+
+/// One bound call of a table-valued function: the columns it emits, and — when
+/// the arguments named a table rather than rows to compute — the table itself.
+///
+/// A call's columns come from its arguments (`read_parquet('…')` reports what
+/// its files hold), so they are known here and not at the name lookup that
+/// preceded this. A call carrying a `table` is planned as a scan of it, with
+/// everything that carries: projection and filter pushdown, cardinality, late
+/// materialization.
+pub struct BoundTableFunctionCall {
+    /// What the scan is named after in a plan: the table's own name when the
+    /// call resolved to one, else the function's.
+    pub display_name: String,
     pub columns: Vec<DuckDBColumn>,
+    pub table: Option<Box<dyn DuckDBTable>>,
 }
 
 pub use crate::duckdb_bridge::ffi::ScalarFunctionDef;
@@ -119,6 +136,24 @@ pub trait DuckDBTransaction: Send + Sync {
     /// elsewhere. Default: none.
     fn bind_table_function(&self, _datastore: &str, _name: &str) -> Option<TableFunctionDef> {
         None
+    }
+
+    /// Bind a call of table function `name` with the arguments the binder
+    /// resolved for it.
+    ///
+    /// Called from the function's DuckDB bind, which is the first point the
+    /// arguments are known — and so the first point the call's columns are,
+    /// since a function is free to derive them from what its arguments name.
+    /// `None` reports a name this provider does not serve after all; an error
+    /// becomes the statement's error, which is how an unreadable argument is
+    /// reported. Default: none.
+    fn bind_table_function_call(
+        &self,
+        _datastore: &str,
+        _name: &str,
+        _arguments: &[ScalarValue],
+    ) -> Result<Option<BoundTableFunctionCall>> {
+        Ok(None)
     }
 }
 
@@ -225,14 +260,52 @@ pub(crate) fn catalog_get_table_function(
         Some(def) => CatalogGetTableFunctionResult {
             found: true,
             arg_type_ids: def.arg_type_ids,
-            columns: def.columns,
         },
         None => CatalogGetTableFunctionResult {
             found: false,
             arg_type_ids: Vec::new(),
-            columns: Vec::new(),
         },
     }
+}
+
+/// Bind one call of a table-valued function, from the C++ bind of the function
+/// DuckDB registered for it. `arguments` are the call's constant arguments as
+/// DuckDB bound them, read through the same accessors the plan walk reads a
+/// constant with.
+///
+/// A name the transaction turns down comes back `found = false`, which is a
+/// bridge-level inconsistency the caller reports; an argument that cannot be
+/// resolved raises, and CXX turns that into the C++ exception the binder
+/// surfaces as the statement's error.
+pub(crate) fn catalog_bind_table_function(
+    transaction: &TransactionContext,
+    datastore: &str,
+    name: &str,
+    arguments: &cxx::CxxVector<ffi::Value>,
+) -> Result<CatalogBindTableFunctionResult> {
+    let arguments = arguments
+        .iter()
+        .map(crate::handle::scalar_from_value)
+        .collect::<std::result::Result<Vec<ScalarValue>, _>>()?;
+    let bound = transaction
+        .transaction
+        .bind_table_function_call(datastore, name, &arguments)?;
+    Ok(match bound {
+        Some(call) => CatalogBindTableFunctionResult {
+            found: true,
+            display_name: call.display_name,
+            columns: call.columns,
+            reads_table: call.table.is_some(),
+            table: Box::new(OptionalTableWrapper { table: call.table }),
+        },
+        None => CatalogBindTableFunctionResult {
+            found: false,
+            display_name: String::new(),
+            columns: Vec::new(),
+            reads_table: false,
+            table: Box::new(OptionalTableWrapper { table: None }),
+        },
+    })
 }
 
 pub(crate) fn catalog_get_scalar_function(

@@ -17,8 +17,10 @@
 mod catalog;
 mod compact;
 mod delta;
+mod external;
 mod manifest;
 pub mod parquet;
+mod pushdown;
 pub mod store;
 /// A Docker-backed object-store test harness (MinIO). Gated
 /// behind the `test-support` feature so it, and its heavy testcontainers deps,
@@ -34,6 +36,10 @@ pub use catalog::{
 pub use compact::{
     Compacter, CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL,
     DEFAULT_MIN_FILES_TO_MERGE, DEFAULT_REFRESH_INTERVAL, MaintenanceConfig, compact_table_files,
+};
+pub use external::{
+    Error as ExternalParquetError, ExternalParquetBinding, bind_external_parquet,
+    list_external_parquet_files,
 };
 pub use manifest::{
     ColumnStatFilter, DeltaFileEntry, PartitionEqFilter, PartitionValues, pivot_scalar,

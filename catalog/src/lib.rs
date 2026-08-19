@@ -30,6 +30,9 @@ use planner::catalog::{
     TableCreation, TableDrop, TableReference, TableRevision, UserCreation,
 };
 
+mod read_parquet;
+use read_parquet::ReadParquet;
+
 /// One named data source served by pivotdb. Re-exported from `datastore`, where
 /// the trait lives; concrete backends (e.g. `datastore_delta::DeltaDatastore`)
 /// implement it and are held here behind `Arc<dyn Datastore>`.
@@ -230,6 +233,22 @@ impl PivotTransaction {
             .collect()
     }
 
+    /// The `read_parquet` function under `name`, or `None` for any other name.
+    ///
+    /// It belongs to no datastore, so it resolves before the routing below: the
+    /// files it reads are the server's to reach, not a datastore's, and which
+    /// database qualified the call decides nothing about them.
+    fn read_parquet_function(&self, name: &str) -> Option<Box<dyn TableFunction>> {
+        ReadParquet::under_name(name, self.metastore.clone(), self.dispatcher().clone())
+            .map(|function| Box::new(function) as Box<dyn TableFunction>)
+    }
+
+    /// The pool every datastore reads through, taken from the default one: they
+    /// all share the server's single dispatcher.
+    fn dispatcher(&self) -> &DataFlowDispatcher {
+        self.datastores[&self.default_name].dispatcher()
+    }
+
     /// Every configured datastore name in deterministic order.
     fn list_datastores(&self) -> Vec<String> {
         let mut datastore_names: Vec<_> = self.datastores.keys().cloned().collect();
@@ -256,13 +275,17 @@ impl CatalogTransaction for PivotTransaction {
     }
 
     fn bind_table_function(&self, datastore: &str, name: &str) -> Option<Box<dyn TableFunction>> {
-        self.find_or_create_sub_transaction(datastore)?
-            .bind_table_function(name)
+        self.read_parquet_function(name).or_else(|| {
+            self.find_or_create_sub_transaction(datastore)?
+                .bind_table_function(name)
+        })
     }
 
     fn bind_default_table_function(&self, name: &str) -> Option<Box<dyn TableFunction>> {
-        self.find_or_create_sub_transaction(&self.default_name)?
-            .bind_table_function(name)
+        self.read_parquet_function(name).or_else(|| {
+            self.find_or_create_sub_transaction(&self.default_name)?
+                .bind_table_function(name)
+        })
     }
 
     fn bind_create_table(

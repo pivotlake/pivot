@@ -5,8 +5,8 @@
 //! [`SERIES_CHUNK_ROWS`] batch each time it is polled, so a huge range never
 //! materializes at once and a downstream `LIMIT`/aggregate stops it early.
 
-use super::{TableFunction, TableFunctionSignature, invalid_argument};
-use crate::catalog::Column;
+use super::{BoundTableFunction, TableFunction, TableFunctionRows, invalid_argument};
+use crate::catalog::{Column, Result as CatalogResult};
 use crate::compile::Error;
 use crate::types::Type;
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
@@ -50,25 +50,14 @@ impl TableFunction for SeriesTableFunction {
         self.name
     }
 
-    fn signature(&self) -> TableFunctionSignature {
+    fn argument_types(&self) -> Vec<Type> {
         // Only consulted for catalog-resolved functions; `range`/`generate_series`
-        // are DuckDB built-ins, so the bridge never binds them through this. The
-        // single output column is named after the function, matching `compile`.
-        TableFunctionSignature {
-            arguments: vec![Type::Int64],
-            columns: vec![Column {
-                name: self.name.to_string(),
-                col_type: Type::Int64,
-            }],
-        }
+        // are DuckDB built-ins, so the bridge never registers them through this.
+        vec![Type::Int64]
     }
 
-    fn compile(
-        &self,
-        args: &[ScalarValue],
-        dispatcher: &DataFlowDispatcher,
-    ) -> Result<RecordBatchOperatorSpec, Error> {
-        let nums = self.parse_i64_args(args)?;
+    fn bind(&self, arguments: &[ScalarValue]) -> CatalogResult<BoundTableFunction> {
+        let nums = self.parse_i64_args(arguments)?;
         let (start, stop, step) = match nums.as_slice() {
             // A single argument is the stop; the series starts at 0, step 1.
             [stop] => (0, *stop, 1),
@@ -87,31 +76,18 @@ impl TableFunction for SeriesTableFunction {
                 "step must not be zero".to_string(),
             ));
         }
-
-        // The column is named after the function so `SELECT *` reports it as
-        // `range` / `generate_series`, matching DuckDB.
-        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
-            self.name,
-            DataType::Int64,
-            false,
-        )]));
-        // The series is a single running counter, so exactly one worker produces
-        // it (claiming the shared flag) and the rest idle, mirroring `DummyScan`.
-        let claimed = Arc::new(AtomicBool::new(false));
-        let factories = (0..dispatcher.worker_count()).map(|_| SeriesSourceFactory {
-            claimed: claimed.clone(),
-            schema: schema.clone(),
+        Ok(BoundTableFunction::Rows(Box::new(BoundSeries {
+            name: self.name,
             start,
             stop,
             step,
             inclusive: self.inclusive,
-        });
-        Ok(RecordBatchOperatorSpec::from_nullary(dispatcher, factories))
+        })))
     }
 }
 
 impl SeriesTableFunction {
-    fn parse_i64_args(&self, args: &[ScalarValue]) -> Result<Vec<i64>, Error> {
+    fn parse_i64_args(&self, args: &[ScalarValue]) -> CatalogResult<Vec<i64>> {
         // DuckDB binds `range`/`generate_series`'s integer overload as BIGINT, so
         // the arguments always arrive as `Int64`; anything else (e.g. the
         // `TIMESTAMP, INTERVAL` overload) pivot doesn't support here.
@@ -124,6 +100,52 @@ impl SeriesTableFunction {
                 )),
             })
             .collect()
+    }
+}
+
+/// One `range`/`generate_series` call, its bounds resolved.
+struct BoundSeries {
+    name: &'static str,
+    start: i64,
+    stop: i64,
+    step: i64,
+    inclusive: bool,
+}
+
+impl BoundSeries {
+    /// The one column, named after the function so `SELECT *` reports it as
+    /// `range` / `generate_series`, matching DuckDB.
+    fn schema(&self) -> SchemaRef {
+        Arc::new(Schema::new(vec![Field::new(
+            self.name,
+            DataType::Int64,
+            false,
+        )]))
+    }
+}
+
+impl TableFunctionRows for BoundSeries {
+    fn columns(&self) -> Vec<Column> {
+        vec![Column {
+            name: self.name.to_string(),
+            col_type: Type::Int64,
+        }]
+    }
+
+    fn compile(&self, dispatcher: &DataFlowDispatcher) -> Result<RecordBatchOperatorSpec, Error> {
+        let schema = self.schema();
+        // The series is a single running counter, so exactly one worker produces
+        // it (claiming the shared flag) and the rest idle, mirroring `DummyScan`.
+        let claimed = Arc::new(AtomicBool::new(false));
+        let factories = (0..dispatcher.worker_count()).map(|_| SeriesSourceFactory {
+            claimed: claimed.clone(),
+            schema: schema.clone(),
+            start: self.start,
+            stop: self.stop,
+            step: self.step,
+            inclusive: self.inclusive,
+        });
+        Ok(RecordBatchOperatorSpec::from_nullary(dispatcher, factories))
     }
 }
 

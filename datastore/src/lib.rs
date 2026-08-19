@@ -13,6 +13,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use dispatch::DataFlowDispatcher;
 use planner::TableFunction;
 use planner::catalog::{
     BoundTable, CreateSchemaRequest, CreateTableRequest, DropTableRequest, Result, SchemaCreation,
@@ -201,6 +202,12 @@ pub trait Datastore: Debug + Send + Sync {
         table: &SchemaQualifiedTableName,
         final_sweep: bool,
     ) -> Result<u64>;
+
+    /// The worker pool this datastore reads through. Exposed so work that is a
+    /// datastore's in kind but not in ownership — reading the footers of files a
+    /// query named directly — runs on the same pool the datastores do, rather
+    /// than the catalog holding a second handle to it.
+    fn dispatcher(&self) -> &DataFlowDispatcher;
 
     /// Downcast hook (owned): recover the concrete backend as an owned `Arc`, for
     /// a server feature specific to one datastore format (the web dashboard's

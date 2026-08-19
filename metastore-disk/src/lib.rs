@@ -322,6 +322,16 @@ impl Metastore for DiskMetastore {
         DiskMetastore::create_user(self, username, password)
             .map_err(|error| Box::new(error) as metastore::Error)
     }
+
+    /// The same scope resolution a datastore's location is opened with: a query
+    /// reading Parquet from a bucket authenticates with the secret covering that
+    /// bucket, whether or not a datastore sits there.
+    fn open_store(&self, uri: &str) -> metastore::Result<Arc<dyn ObjectStore>> {
+        open_store_at(uri, &self.secrets, || Error::NoSecretForLocation {
+            location: uri.to_string(),
+        })
+        .map_err(|error| Box::new(error) as metastore::Error)
+    }
 }
 
 /// The [`UserAuth`] a password grants: a SCRAM verifier over a fresh random
@@ -404,6 +414,8 @@ pub enum Error {
     },
     #[error("datastore `{name}`: no secret is scoped to `{location}`; define one under `secrets`")]
     NoSecret { name: String, location: String },
+    #[error("no secret is scoped to `{location}`; define one under `secrets`")]
+    NoSecretForLocation { location: String },
     #[error("user `{name}` already exists")]
     UserExists { name: String },
     #[error("creating a user requires a metastore file; start the server with --metastore-file")]
@@ -623,28 +635,32 @@ impl DatastoreConfig {
     /// Default Credentials chain, which on Google compute is the whole
     /// configuration a store needs.
     fn open_store(&self, name: &str, secrets: &Secrets) -> Result<Arc<dyn ObjectStore>> {
-        match StoreScheme::of(&self.location)? {
-            StoreScheme::S3 => {
-                let credentials =
-                    secrets
-                        .resolve_s3(&self.location)
-                        .ok_or_else(|| Error::NoSecret {
-                            name: name.to_string(),
-                            location: self.location.clone(),
-                        })?;
-                Ok(Arc::new(S3Store::with_credentials(
-                    &self.location,
-                    credentials,
-                )?))
-            }
-            StoreScheme::Gcs => Ok(Arc::new(match secrets.resolve_gcs(&self.location) {
-                Some(credentials_file) => {
-                    GcsStore::with_credentials_file(&self.location, credentials_file)?
-                }
-                None => GcsStore::from_uri(&self.location)?,
-            })),
-            StoreScheme::Local => Ok(Arc::new(LocalStore::new(local_path(&self.location)))),
+        open_store_at(&self.location, secrets, || Error::NoSecret {
+            name: name.to_string(),
+            location: self.location.clone(),
+        })
+    }
+}
+
+/// Open the store at `location` with the secret scoped to it, calling
+/// `no_secret` for the error when an S3 location has none — the caller names
+/// what it was opening, since a datastore and a location a query read from
+/// point the reader at different things to fix.
+fn open_store_at(
+    location: &str,
+    secrets: &Secrets,
+    no_secret: impl FnOnce() -> Error,
+) -> Result<Arc<dyn ObjectStore>> {
+    match StoreScheme::of(location)? {
+        StoreScheme::S3 => {
+            let credentials = secrets.resolve_s3(location).ok_or_else(no_secret)?;
+            Ok(Arc::new(S3Store::with_credentials(location, credentials)?))
         }
+        StoreScheme::Gcs => Ok(Arc::new(match secrets.resolve_gcs(location) {
+            Some(credentials_file) => GcsStore::with_credentials_file(location, credentials_file)?,
+            None => GcsStore::from_uri(location)?,
+        })),
+        StoreScheme::Local => Ok(Arc::new(LocalStore::new(local_path(location)))),
     }
 }
 

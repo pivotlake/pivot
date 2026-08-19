@@ -68,7 +68,10 @@ fn bound_type_from(raw: ffi::BridgeLogicalType) -> BoundLogicalType {
 ///
 /// The NULL check comes first: a NULL value carries a full logical type but no
 /// payload, and the typed accessors are only defined on a value that has one.
-fn scalar_from_value(v: &ffi::Value) -> Result<ScalarValue> {
+/// The Pivot constant a DuckDB `Value` holds. Shared with the catalog provider,
+/// which reads a table-function call's arguments the same way the plan walk
+/// reads a query constant.
+pub(crate) fn scalar_from_value(v: &ffi::Value) -> Result<ScalarValue> {
     use LogicalTypeId as L;
     let value_type = bound_type_from(ffi::value_type(v)?);
     if ffi::value_is_null(v)? {

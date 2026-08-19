@@ -1278,6 +1278,10 @@ impl Datastore for DeltaDatastore {
         }
     }
 
+    fn dispatcher(&self) -> &DataFlowDispatcher {
+        DeltaDatastore::dispatcher(self)
+    }
+
     fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
         self
     }

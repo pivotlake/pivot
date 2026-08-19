@@ -209,6 +209,55 @@ fn a_gcs_datastore_is_served_with_the_secret_scoped_to_it() {
 }
 
 #[test]
+fn reading_parquet_from_a_bucket_uses_the_secret_scoped_to_it() {
+    let Some(backend) = test_support::s3("secrets-s3-read-parquet") else {
+        return;
+    };
+    // As above, the decoy covers every other `s3://` location with an endpoint
+    // nothing answers on: files a query names are authenticated by the same
+    // scope resolution a datastore's location is, so reading them at all means
+    // the scoped secret signed the request.
+    let config = format!(
+        "{}  secrets:
+    decoy:
+      type: s3
+      scope: s3://
+      region: {region}
+      access_key_id: wrong-key
+      secret_access_key: wrong-secret
+      endpoint: http://127.0.0.1:1
+    minio:
+      type: s3
+      scope: {root}
+      region: {region}
+      access_key_id: {access_key_id}
+      secret_access_key: {secret_access_key}
+      endpoint: {endpoint}
+",
+        datastores_section(&backend.root),
+        root = backend.root,
+        region = std::env::var("AWS_REGION").unwrap(),
+        access_key_id = std::env::var("AWS_ACCESS_KEY_ID").unwrap(),
+        secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY").unwrap(),
+        endpoint = std::env::var("AWS_ENDPOINT_URL").unwrap(),
+    );
+
+    let rows = block_on(async {
+        let client = events_server(&backend, &config).await;
+        select_rows(
+            &client,
+            &format!(
+                "SELECT COUNT(value) FROM read_parquet('{}/events/*.parquet')",
+                backend.root
+            ),
+        )
+        .await
+    });
+
+    assert_eq!(rows, vec![vec![Some("5".to_string())]]);
+}
+
+#[test]
 fn a_gcs_datastore_no_secret_covers_is_served_with_ambient_credentials() {
     let Some(backend) = test_support::gcs("secrets-gcs-ambient") else {
         return;

@@ -27,7 +27,7 @@
 
 use super::{
     DataFileLocation, FileRef, ListedObject, ObjectPath, ObjectStore, ObjectVersion, Result,
-    StoreError, absolute_object_key, object_key, parse_iso8601_millis, percent_encode,
+    StoreError, absolute_object_key, list_prefix, object_key, parse_iso8601_millis, percent_encode,
 };
 use base64::Engine;
 use delta_kernel::object_store::DynObjectStore;
@@ -407,9 +407,9 @@ impl ObjectStore for GcsStore {
     /// One page of objects directly under `prefix`, one level deep.
     fn list(&self, prefix: &ObjectPath) -> Result<Vec<ListedObject>> {
         let header = self.auth.header()?;
-        let object_prefix = object_key(&self.prefix, prefix);
+        let object_prefix = list_prefix(&self.prefix, prefix);
         let url = format!(
-            "{}/storage/v1/b/{}/o?prefix={}%2F&delimiter=%2F",
+            "{}/storage/v1/b/{}/o?prefix={}&delimiter=%2F",
             self.endpoint,
             self.bucket,
             percent_encode(&object_prefix)
