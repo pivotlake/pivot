@@ -3,9 +3,10 @@ mod common;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::Int64Type;
+use arrow_array::types::{Float32Type, Int64Type};
 use arrow_array::{
-    ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, StringViewArray, StructArray,
+    ArrayRef, Float32Array, Float64Array, Int64Array, RecordBatch, StringArray, StringViewArray,
+    StructArray,
 };
 use arrow_schema::{DataType, Field, Fields, Schema};
 use parquet::arrow::ArrowWriter;
@@ -1256,6 +1257,98 @@ fn scan_pushed_numeric_extract_reads_only_its_typed_leaf() {
         results[0].column(0).as_primitive::<Int64Type>(),
         &Int64Array::from(vec![Some(30), None, None])
     );
+}
+
+/// A typed extract of a path that no row has: the file shreds every row
+/// perfectly, so the untyped fallback is statistically all NULL and the path
+/// resolves to SQL NULL everywhere.
+#[test]
+fn scan_pushed_extract_of_an_absent_path_yields_nulls() {
+    use dispatch::VariantExtract;
+
+    let dispatch = dispatch(1);
+    let batch =
+        shredded_variant_batch(&[r#"{"age":30}"#, r#"{"age":25}"#], "age", &DataType::Int64);
+    let (_dir, table) = parquet_table(&dispatch, &[batch], true);
+    let projection = Projection::columns_with_extracts(
+        vec![0],
+        vec![Some(VariantExtract {
+            path: vec!["latency".to_string()],
+            as_type: Some(DataType::Float32),
+        })],
+    );
+
+    let results = table_input(&dispatch, &table, projection, false)
+        .collect()
+        .unwrap();
+
+    assert_eq!(
+        results[0].column(0).as_primitive::<Float32Type>(),
+        &Float32Array::from(vec![None, None])
+    );
+}
+
+/// Like the flat case, but the path diverges below the top level: the file
+/// shreds `user.name`, the extract wants `user.age`, and every untyped
+/// fallback is all NULL.
+#[test]
+fn scan_pushed_extract_of_a_nested_absent_path_yields_nulls() {
+    use dispatch::VariantExtract;
+
+    let dispatch = dispatch(1);
+    let batch = shredded_variant_batch(
+        &[r#"{"user":{"name":"bob"}}"#, r#"{"user":{"name":"amy"}}"#],
+        "user.name",
+        &DataType::Utf8View,
+    );
+    let (_dir, table) = parquet_table(&dispatch, &[batch], true);
+    let projection = Projection::columns_with_extracts(
+        vec![0],
+        vec![Some(VariantExtract {
+            path: vec!["user".to_string(), "age".to_string()],
+            as_type: Some(DataType::Float32),
+        })],
+    );
+
+    let results = table_input(&dispatch, &table, projection, false)
+        .collect()
+        .unwrap();
+
+    assert_eq!(
+        results[0].column(0).as_primitive::<Float32Type>(),
+        &Float32Array::from(vec![None, None])
+    );
+}
+
+/// A bare extract of a provably absent path still emits a variant column with
+/// every row SQL NULL, so it merges with files whose layouts do hold the path.
+#[test]
+fn scan_pushed_bare_extract_of_an_absent_path_yields_a_null_variant() {
+    use dispatch::VariantExtract;
+
+    let dispatch = dispatch(1);
+    let batch =
+        shredded_variant_batch(&[r#"{"age":30}"#, r#"{"age":25}"#], "age", &DataType::Int64);
+    let (_dir, table) = parquet_table(&dispatch, &[batch], true);
+    let projection = Projection::columns_with_extracts(
+        vec![0],
+        vec![Some(VariantExtract {
+            path: vec!["latency".to_string()],
+            as_type: None,
+        })],
+    );
+
+    let results = table_input(&dispatch, &table, projection, false)
+        .collect()
+        .unwrap();
+
+    let column = results[0].column(0);
+    let DataType::Struct(fields) = column.data_type() else {
+        panic!("expected a variant struct, got {:?}", column.data_type());
+    };
+    assert_eq!(fields[0].name(), "metadata");
+    assert_eq!(fields[1].name(), "value");
+    assert_eq!(column.null_count(), 2);
 }
 
 #[test]
