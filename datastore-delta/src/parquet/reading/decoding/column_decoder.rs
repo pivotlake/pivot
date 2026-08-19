@@ -15,12 +15,13 @@ use crate::parquet::reading::decoding::leaf_decoders::{
 };
 use crate::parquet::types::leaves::{OutputRead, reconstruct_column_from_leaves};
 use crate::parquet::types::metadata::ColumnChunkMeta;
-use arrow_array::ArrayRef;
 use arrow_array::types::{
     BinaryViewType, Date32Type, Decimal64Type, Decimal128Type, Float32Type, Float64Type, Int8Type,
     Int16Type, Int32Type, Int64Type, StringViewType, TimestampMicrosecondType, UInt8Type,
     UInt16Type, UInt32Type, UInt64Type,
 };
+use arrow_array::{ArrayRef, StructArray, new_null_array};
+use arrow_buffer::NullBuffer;
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields, TimeUnit};
 use dispatch::VariantExtract;
 use parquet_variant::{VariantPath, VariantPathElement};
@@ -55,6 +56,10 @@ enum OutputTransform {
         path: Arc<[String]>,
         as_type: Option<DataType>,
     },
+    /// Replaces the folded metadata leaf with the all-NULL output of an
+    /// extract whose path the row group proves absent. The leaf supplies the
+    /// row count, and the metadata blob when the output is itself a variant.
+    AbsentPath { as_type: Option<DataType> },
 }
 
 impl OutputTransform {
@@ -67,8 +72,31 @@ impl OutputTransform {
             OutputTransform::Extract { path, as_type } => {
                 Ok(extract_variant_path(column, path, as_type)?)
             }
+            OutputTransform::AbsentPath { as_type } => Ok(match as_type {
+                Some(as_type) => new_null_array(as_type, column.len()),
+                None => all_null_variant(column),
+            }),
         }
     }
+}
+
+/// The canonical unshredded layout an all-NULL variant column uses.
+fn unshredded_variant_fields() -> Fields {
+    Fields::from(vec![
+        Field::new("metadata", DataType::BinaryView, false),
+        Field::new("value", DataType::BinaryView, true),
+    ])
+}
+
+/// An all-NULL variant column over the decoded `metadata` blobs.
+fn all_null_variant(metadata: &ArrayRef) -> ArrayRef {
+    let value = new_null_array(&DataType::BinaryView, metadata.len());
+    let nulls = NullBuffer::new_null(metadata.len());
+    Arc::new(StructArray::new(
+        unshredded_variant_fields(),
+        vec![metadata.clone(), value],
+        Some(nulls),
+    ))
 }
 
 /// Extracts `path` from a reconstructed variant column.
@@ -162,6 +190,19 @@ impl ColumnDecoder {
                     None => variant_path_output_type(reconstructed_variant_field, &extract.path)?,
                 }),
             ),
+            (Some(extract), OutputRead::AbsentPath { metadata_leaf }) => {
+                let output_type = match &extract.as_type {
+                    Some(as_type) => as_type.clone(),
+                    None => DataType::Struct(unshredded_variant_fields()),
+                };
+                (
+                    leaf_fields[*metadata_leaf].clone(),
+                    Some(OutputTransform::AbsentPath {
+                        as_type: extract.as_type.clone(),
+                    }),
+                    create_output_field(output_type),
+                )
+            }
             (Some(extract), OutputRead::WholeColumn(_)) => {
                 let whole_variant_field = fields[column].clone();
                 let output_type = match &extract.as_type {

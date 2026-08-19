@@ -74,6 +74,14 @@ pub(crate) enum OutputRead {
         leaf_sources: Vec<usize>,
         reconstructed_variant_field: FieldRef,
     },
+    /// An extract whose path row-group statistics prove holds SQL NULL in
+    /// every row: nothing on the path can produce a value, so the output is
+    /// all NULL and only the metadata leaf is read.
+    AbsentPath {
+        /// The variant's metadata leaf. It supplies each batch's row count,
+        /// and the metadata blob when the output is itself a variant.
+        metadata_leaf: usize,
+    },
 }
 
 impl OutputRead {
@@ -156,6 +164,14 @@ impl OutputRead {
             metadata,
             value_leaves,
         )?;
+        // Metadata is always retained, and every other retained leaf lies on
+        // the path and can produce values there. A tree that kept nothing
+        // else proves the path all SQL NULL in this row group.
+        let (metadata_offset, _) = find_child_leaf_offset(&fields[column], "metadata")?;
+        let metadata_leaf = first_leaf(fields, column) + metadata_offset;
+        if leaf_sources.iter().all(|&leaf| leaf == metadata_leaf) {
+            return Some(OutputRead::AbsentPath { metadata_leaf });
+        }
         Some(OutputRead::PrunedVariant {
             leaf_sources,
             reconstructed_variant_field,
@@ -169,6 +185,7 @@ impl OutputRead {
             OutputRead::WholeColumn(leaves) => leaves.clone().collect(),
             OutputRead::TypedLeaf(leaf) => vec![*leaf],
             OutputRead::PrunedVariant { leaf_sources, .. } => leaf_sources.clone(),
+            OutputRead::AbsentPath { metadata_leaf } => vec![*metadata_leaf],
         }
     }
 }
@@ -333,7 +350,9 @@ pub(crate) fn variant_shredded_leaves(
 /// The function retains metadata and untyped `value` children. It narrows
 /// `typed_value` to the on-path child until the path ends, then retains the
 /// complete remaining subtree. Leaves proven to be all SQL NULL are omitted
-/// from both the reconstructed field and `leaf_sources`.
+/// from both the reconstructed field and `leaf_sources`, and a branch left
+/// without any leaves is dropped entirely. This returns `None` when `field`
+/// is not a variant struct at all.
 fn prune_variant_node(
     field: &FieldRef,
     path: &[String],
@@ -386,7 +405,12 @@ fn prune_variant_node(
                     }
                     object_child_first_leaf += leaf_count(object_child);
                 }
-                if let Some(pruned_path_field) = pruned_path_field {
+                // A subtree that retained no leaves cannot produce values at
+                // the path (and its bare structs could not even be
+                // reconstructed), so the whole branch is dropped.
+                if let Some(pruned_path_field) = pruned_path_field
+                    && leaf_count(&pruned_path_field) > 0
+                {
                     pruned_children.push(Arc::new(Field::new(
                         child.name(),
                         DataType::Struct(Fields::from(vec![pruned_path_field.as_ref().clone()])),
