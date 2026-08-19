@@ -79,7 +79,9 @@ pub const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 /// the byte trigger (full-size outputs); this count trigger is only the safety
 /// net for a partition whose data trickles in, and a higher bar there means
 /// fewer small sub-target merges.
-pub const DEFAULT_MIN_FILES_TO_MERGE: usize = 4;
+///
+/// Why 96 and not some other number above that bar? No particular reason.
+pub const DEFAULT_MIN_FILES_TO_MERGE: usize = 96;
 
 /// What background maintenance a [`DeltaDatastore`] runs for itself once opened.
 /// The datastore spawns its own tasks from this on the ambient tokio runtime;
