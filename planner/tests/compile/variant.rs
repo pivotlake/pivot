@@ -70,6 +70,26 @@ fn casts_a_shredded_path_from_parquet(mut testing_planner: TestingPlanner) {
     assert_eq!(got, vec![None, Some(30)]);
 }
 
+/// A typed cast of a path the file provably lacks: every row is perfectly
+/// shredded, so the untyped fallback is all NULL and the path resolves to SQL
+/// NULL everywhere instead of failing the scan.
+#[rstest]
+fn casts_an_absent_path_from_a_fully_shredded_parquet(mut testing_planner: TestingPlanner) {
+    shredded_docs_table(
+        &mut testing_planner,
+        vec![r#"{"age":30}"#, r#"{"age":25}"#],
+        "age",
+        &DataType::Int64,
+    );
+
+    let rows = run(
+        &mut testing_planner,
+        "SELECT max(CAST(d->'latency' AS FLOAT)) AS m FROM docs",
+    );
+
+    assert_eq!(rows[0]["m"].as_f64(), None);
+}
+
 /// A single-column `docs(d)` batch holding `rows`, shredding `path` into a
 /// typed leaf when given.
 fn docs_batch_shredded_as(rows: Vec<&str>, shred: Option<(&str, &DataType)>) -> RecordBatch {
