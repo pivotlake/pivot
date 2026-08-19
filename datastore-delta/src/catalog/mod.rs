@@ -46,7 +46,7 @@ use crate::parquet::ParquetTableError;
 use crate::store::{self, DataFile, FileRef, ObjectPath, ObjectStore, open_store};
 use async_trait::async_trait;
 use crossbeam_deque::{Injector, Steal};
-use datastore::{Datastore, DatastoreFileMetadata, DatastoreTableMetadata, DatastoreTransaction};
+use datastore::{Datastore, DatastoreTableMetadata, DatastoreTransaction};
 use dispatch::{DataFlowDispatcher, DataFlowError, OneShotNullaryFactory, RecordBatchOperatorSpec};
 use local_lock::LocalDatastoreLock;
 use planner::catalog::{
@@ -1178,6 +1178,18 @@ impl Datastore for DeltaDatastore {
         DeltaDatastore::begin_transaction(self)
     }
 
+    /// The format this datastore keeps its tables in: Delta, whatever store
+    /// backs it.
+    fn kind(&self) -> &'static str {
+        "delta"
+    }
+
+    /// The URI this database is rooted at; every table location and file path
+    /// it reports is relative to it.
+    fn data_path(&self) -> String {
+        self.store.location_uri()
+    }
+
     /// Spawn this datastore's configured maintenance onto the ambient runtime: a
     /// periodic refresh sweep, and (when configured) a compaction loop. Each task
     /// holds an `Arc` clone of the datastore and runs until [`abort`](Self::abort)
@@ -1333,23 +1345,12 @@ impl DeltaSnapshot {
         })
     }
 
-    /// Every table in this frozen index, with its Pivot manifest ID and the
-    /// files it holds at this version.
+    /// Every table in this frozen index, with its Pivot manifest ID, the
+    /// columns it declares and the files it holds at this version.
     fn tables(&self) -> Vec<DatastoreTableMetadata> {
         self.index
             .named_tables()
-            .map(|(name, table)| DatastoreTableMetadata {
-                name,
-                id: table.id().to_string(),
-                files: table
-                    .file_refs()
-                    .into_iter()
-                    .map(|file| DatastoreFileMetadata {
-                        path: file.path.as_str().to_string(),
-                        size_bytes: file.size,
-                    })
-                    .collect(),
-            })
+            .map(|(name, table)| table.metadata(name))
             .collect()
     }
 

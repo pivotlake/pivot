@@ -229,6 +229,34 @@ pub fn logical_from_type(pivot_type: &Type) -> BoundLogicalType {
     }
 }
 
+/// The SQL name of `pivot_type`: what a `CREATE TABLE` writes to declare a
+/// column of it, and what the catalog reports the column's type as. The
+/// [`Display`](std::fmt::Display) impl instead prints the internal spelling
+/// (`Int64`, `Utf8`), which is for diagnostics rather than for SQL.
+pub fn sql_type_name(pivot_type: &Type) -> String {
+    let name = match pivot_type {
+        Type::Boolean => "BOOLEAN",
+        Type::Int8 => "TINYINT",
+        Type::Int16 => "SMALLINT",
+        Type::Int32 => "INTEGER",
+        Type::Int64 => "BIGINT",
+        Type::UInt8 => "UTINYINT",
+        Type::UInt16 => "USMALLINT",
+        Type::UInt32 => "UINTEGER",
+        Type::UInt64 => "UBIGINT",
+        Type::Int128 => "HUGEINT",
+        Type::Float32 => "REAL",
+        Type::Float64 => "DOUBLE",
+        Type::Decimal { precision, scale } => return format!("DECIMAL({precision},{scale})"),
+        Type::Utf8 => "VARCHAR",
+        Type::Date => "DATE",
+        Type::Timestamp => "TIMESTAMP",
+        Type::Interval => "INTERVAL",
+        Type::Variant => "VARIANT",
+    };
+    name.to_string()
+}
+
 /// The arrow [`DataType`] a column of this `Type` carries.
 ///
 /// This is where the "logical vs physical" facts live, once: `Date` is

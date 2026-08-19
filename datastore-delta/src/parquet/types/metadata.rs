@@ -43,6 +43,8 @@ pub struct ColumnChunkMeta {
     pub data_page_offset: i64,
     /// Total size of all compressed pages in this column chunk (bytes).
     pub total_compressed_size: i64,
+    /// What those pages hold decoded (bytes), before compression.
+    pub total_uncompressed_size: i64,
     /// Maximum definition level for this column (indicates nesting / nullability depth).
     pub max_def_level: i16,
     /// The chunk's Parquet physical type id, disambiguating storages that

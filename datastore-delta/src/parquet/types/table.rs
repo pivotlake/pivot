@@ -216,6 +216,7 @@ pub(crate) fn row_groups_from_metadata(
                         dictionary_page_offset: meta.dictionary_page_offset,
                         data_page_offset: meta.data_page_offset,
                         total_compressed_size: meta.total_compressed_size,
+                        total_uncompressed_size: meta.total_uncompressed_size,
                         max_def_level: leaf_infos[j].def_level,
                         physical_type,
                         fixed_len_byte_width: leaf_infos[j].type_length,

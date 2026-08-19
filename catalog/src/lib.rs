@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use crossbeam_deque::{Injector, Steal};
 use datastore::DatastoreTransaction;
-use datastore_system::SystemTransaction;
+use datastore_system::{DatastoreEntry, SystemTransaction};
 use dispatch::{DataFlowDispatcher, OneShotNullaryFactory, RecordBatchOperatorSpec};
 use metastore::Metastore;
 use planner::TableFunction;
@@ -204,10 +204,16 @@ impl PivotTransaction {
             .list_datastores()
             .into_iter()
             .map(|datastore_name| {
-                let sub_transaction = self
+                let transaction = self
                     .find_or_create_sub_transaction(&datastore_name)
                     .expect("a configured datastore can always open a transaction");
-                (datastore_name, sub_transaction)
+                let datastore = &self.datastores[&datastore_name];
+                DatastoreEntry {
+                    name: datastore_name,
+                    kind: datastore.kind().to_string(),
+                    data_path: datastore.data_path(),
+                    transaction,
+                }
             })
             .collect();
         self.sub_transactions
