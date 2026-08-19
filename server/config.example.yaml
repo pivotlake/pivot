@@ -50,14 +50,14 @@ metastore:
       default: true
 
     # Other entries are attached as databases and can be queried with three-part
-    # names such as `warm.main.events`. Compaction is off by default; run it in
-    # only one process per datastore.
+    # names such as `warm.main.events`. Compaction is on by default; run it in
+    # only one process per datastore (set `compact: false` on the others).
     warm:
       kind: delta
       location: s3://example-bucket/warm/
       compact: true
       compact_bytes: 128m
-      compact_merge_bytes: 166.4m
+      compact_merge_bytes: 192m
       compact_min_files: 100
 
     # A `gs://` location opens a Google Cloud Storage store.

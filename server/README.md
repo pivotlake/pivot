@@ -69,7 +69,8 @@ Compaction is configured per datastore with `compact`. `compact_bytes` sets the
 small-file boundary, `compact_merge_bytes` sets the accumulated bytes that
 immediately trigger a merge (by default 1.3 times that boundary), and
 `compact_min_files` sets when the balance fallback is allowed (100 by default);
-it is off by default and should run in only one process per datastore:
+compaction is on by default and should run in only one process per datastore
+(set `compact: false` on the others):
 
 ```yaml
 metastore:
@@ -83,7 +84,7 @@ metastore:
       location: s3://analytics/warm/  # S3 store
       compact: true                   # this datastore compacts itself
       compact_bytes: 128m
-      compact_merge_bytes: 166.4m
+      compact_merge_bytes: 192m
       compact_min_files: 100
     cold:
       kind: delta
