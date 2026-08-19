@@ -23,7 +23,9 @@ use parquet_variant_compute::{
 };
 use parquet_variant_json::VariantToJson;
 
-use super::{AssembledFile, encode_record_batches_spec};
+use super::{
+    AssembledFile, encode_compaction_batches_spec, encode_record_batches_spec, unshred_batches_spec,
+};
 
 /// A 64 MiB file-cache ring, as the other in-crate write tests use.
 const RING_BUFFERS: usize = 64 * 1024 * 1024 / BUFFER_SIZE;
@@ -127,7 +129,7 @@ fn write_grouped<T: IntoBatch>(
         .map(|item| item.into_batch().unwrap())
         .collect();
     let schema = batches[0].schema();
-    let spec = values_input(dispatch.dispatcher(), batches).record_batches();
+    let spec = unshred_batches_spec(values_input(dispatch.dispatcher(), batches).record_batches());
     let partition_column_names: Arc<[String]> = partition_column_names
         .iter()
         .map(|name| name.to_string())
@@ -715,6 +717,48 @@ fn a_sort_key_orders_a_files_rows() {
     for (row, key) in read_keys.iter().enumerate() {
         assert_eq!(read_names.value(row), format!("row {key}"));
     }
+}
+
+/// Compaction receives runs that are already sorted within their source files.
+/// It must merge overlapping runs globally, but must not need the INSERT stage
+/// that sorts each incoming batch first.
+#[test]
+fn compaction_merges_presorted_source_runs_into_one_sorted_file() {
+    let dispatch = Dispatch::spin_up(2, RING_BUFFERS, None);
+    let batches = [vec![1, 3, 5, 7], vec![2, 4, 6, 8]]
+        .into_iter()
+        .map(|keys| {
+            ColumnsItem(vec![("key", Arc::new(Int64Array::from(keys)) as ArrayRef)])
+                .into_batch()
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let schema = batches[0].schema();
+    let input = values_input(dispatch.dispatcher(), batches).record_batches();
+
+    let files: Vec<Vec<u8>> = encode_compaction_batches_spec(
+        input,
+        schema,
+        None,
+        Arc::from([]),
+        Arc::from(["key".to_string()]),
+        3,
+    )
+    .map_each(|file: AssembledFile| file.bytes.runs().flatten().copied().collect::<Vec<u8>>())
+    .execute()
+    .collect()
+    .unwrap();
+    dispatch.exit();
+
+    assert_eq!(files.len(), 1);
+    let batch = read_back(&files[0]);
+    let keys = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .values();
+    assert_eq!(keys, &[1, 2, 3, 4, 5, 6, 7, 8]);
 }
 
 /// A small in-memory target produces several internally ordered files without

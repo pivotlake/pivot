@@ -1,6 +1,6 @@
 //! Streaming Parquet file construction for INSERT and compaction.
 //!
-//! The pipeline sorts and writes data as follows:
+//! INSERT prepares files as follows:
 //!
 //! 1. [`partition_sorter`] splits each input batch by table partition, sorts
 //!    each piece, and copies it into independent memory. Each piece is one
@@ -8,6 +8,14 @@
 //! 2. [`file_collector`] chooses the runs belonging to each output file and
 //!    groups them by source node. Its byte target applies to the retained Arrow
 //!    data of each pending partition file.
+//!
+//! Compaction replaces those two stages: its selected files already share one
+//! known partition, and every decoded batch retains its source file's sort
+//! order. It wraps each batch as a run without partitioning, sorting, or copying,
+//! then collects all selected runs into one file without a memory-size cutoff.
+//!
+//! Both paths share the remainder:
+//!
 //! 3. The local planner in [`file_merge`] reads the sort keys of one node's runs
 //!    and divides their k-way merge into independent output slices. It does not
 //!    copy rows. A node-local work queue keeps this planning beside the input
@@ -35,9 +43,9 @@
 //! A merge level with one run is a zero-copy identity. Files without sort
 //! columns pass through all merge stages without planning or copying rows.
 //!
-//! Unpartitioned and unsorted tables use the same stages with one implicit
-//! partition and no merge ordering. Files remain on dispatch workers through
-//! assembly and upload because their bytes occupy worker-owned ring memory.
+//! An unsorted file skips the merge work. Files remain on dispatch workers
+//! through assembly and upload because their bytes occupy worker-owned ring
+//! memory.
 
 mod assembler;
 pub(crate) mod encoder;
@@ -45,13 +53,13 @@ pub(crate) mod error;
 mod file_collector;
 mod file_merge;
 mod partition_sorter;
+mod presorted_run;
 mod row_group_planner;
 mod shredding;
 mod stats;
 pub(crate) use stats::aggregate_file_stats;
 mod types;
 
-pub(crate) use shredding::unshred_batch;
 pub(crate) use types::AssembledFile;
 
 use std::sync::Arc;
@@ -64,6 +72,7 @@ use dispatch::{
 };
 
 use partition_sorter::{PartitionSorterFactory, SortedPartitionRun};
+use presorted_run::PresortedRun;
 use types::{
     ColumnChunkJob, EncodedColumnChunk, FileOrderInput, GlobalMergeJob, LocalMergeJob,
     LocalMergeResult, ReadyFile,
@@ -71,10 +80,9 @@ use types::{
 
 /// Appends Parquet construction to an existing record-batch dataflow.
 ///
-/// Variant columns are first restored to their logical representation so input
-/// files with different physical layouts can be combined. INSERT supplies a
-/// finite `target_in_memory_bytes_per_file`; compaction uses `usize::MAX` when
-/// it needs one globally ordered output file per partition.
+/// The retained-memory target cuts each partition's INSERT rows into output
+/// files. Callers first restore shredded variants with
+/// [`unshred_batches_spec`].
 pub(crate) fn encode_record_batches_spec(
     spec: RecordBatchOperatorSpec,
     schema: SchemaRef,
@@ -83,7 +91,6 @@ pub(crate) fn encode_record_batches_spec(
     target_rows_per_group: usize,
     target_in_memory_bytes_per_file: usize,
 ) -> OperatorSpec<AssembledFile, impl OperatorFactory<AssembledFile> + 'static> {
-    let spec = spec.project(|| |batch| unshred_batch(batch).expect("a variant column reassembles"));
     let partition_column_indices: Vec<usize> = partition_column_names
         .iter()
         .map(|name| {
@@ -92,22 +99,14 @@ pub(crate) fn encode_record_batches_spec(
                 .expect("partition columns name declared columns")
         })
         .collect();
-    let order_by: Vec<OrderBy> = sort_column_names
-        .iter()
-        .map(|name| {
-            let column = schema
-                .index_of(name)
-                .expect("sort columns name declared columns");
-            OrderBy::new(column, false, true)
-        })
-        .collect();
+    let order_by = sort_order(&schema, &sort_column_names);
 
     let (dispatcher, heads) = spec.into_parts();
     let worker_count = heads.len();
     let file_collector_worker = dispatcher.next_worker();
     let input_batches = OperatorSpec::new(dispatcher, heads.into_iter().collect::<Vec<_>>());
     let topology = input_batches.dispatcher().topology();
-    input_batches
+    let files = input_batches
         .chain(
             stealable::<RecordBatch>(topology).into_iter().collect(),
             PartitionSorterFactory::create_for_workers(
@@ -127,7 +126,80 @@ pub(crate) fn encode_record_batches_spec(
                 target_in_memory_bytes_per_file,
                 topology,
             ),
+        );
+    encode_files_spec(files)
+}
+
+/// Appends Parquet construction to a compaction scan. Every input batch already
+/// belongs to the selected partition and is ordered as it was in its source
+/// file, so the INSERT-only partition/sort/copy stage is skipped. All batches
+/// form one output file; sorted tables still use the downstream k-way merge to
+/// combine overlapping source-file runs.
+pub(crate) fn encode_compaction_batches_spec(
+    spec: RecordBatchOperatorSpec,
+    schema: SchemaRef,
+    partition: Option<crate::PartitionValues>,
+    partition_column_names: Arc<[String]>,
+    sort_column_names: Arc<[String]>,
+    target_rows_per_group: usize,
+) -> OperatorSpec<AssembledFile, impl OperatorFactory<AssembledFile> + 'static> {
+    let spec = unshred_batches_spec(spec);
+    let order_by = sort_order(&schema, &sort_column_names);
+    let (dispatcher, heads) = spec.into_parts();
+    let worker_count = heads.len();
+    let file_collector_worker = dispatcher.next_worker();
+    let input_batches = OperatorSpec::new(dispatcher, heads.into_iter().collect::<Vec<_>>());
+    let topology = input_batches.dispatcher().topology();
+    let presorted_runs =
+        PresortedRun::create_for_workers(partition.as_ref(), &partition_column_names, topology);
+    let files = input_batches
+        .chain(
+            stealable::<RecordBatch>(topology).into_iter().collect(),
+            presorted_runs,
         )
+        .chain(
+            to_single_worker_mpsc::<SortedPartitionRun>(worker_count, file_collector_worker)
+                .into_iter()
+                .collect(),
+            file_collector::factories(
+                partition_column_names,
+                order_by.into(),
+                target_rows_per_group,
+                usize::MAX,
+                topology,
+            ),
+        );
+    encode_files_spec(files)
+}
+
+pub(crate) fn unshred_batches_spec(spec: RecordBatchOperatorSpec) -> RecordBatchOperatorSpec {
+    spec.project(|| |batch| shredding::unshred_batch(batch).expect("a variant column reassembles"))
+}
+
+fn sort_order(schema: &SchemaRef, sort_column_names: &[String]) -> Vec<OrderBy> {
+    sort_column_names
+        .iter()
+        .map(|name| {
+            let column = schema
+                .index_of(name)
+                .expect("sort columns name declared columns");
+            OrderBy::new(column, false, true)
+        })
+        .collect()
+}
+
+/// Shared half of INSERT and compaction: merge the already-sorted runs for each
+/// output file, divide the result into row groups, encode its columns, and
+/// assemble the Parquet bytes.
+fn encode_files_spec<OF>(
+    files: OperatorSpec<FileOrderInput, OF>,
+) -> OperatorSpec<AssembledFile, impl OperatorFactory<AssembledFile> + 'static>
+where
+    OF: OperatorFactory<FileOrderInput> + 'static,
+{
+    let worker_count = files.dispatcher().worker_count();
+    let topology = files.dispatcher().topology();
+    files
         .chain(
             node_work_queue::<FileOrderInput>(topology)
                 .into_iter()
