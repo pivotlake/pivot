@@ -88,18 +88,13 @@ rather than the only way in.
 <rect x="344" y="354" width="16" height="16" rx="1" class="arch-cell" />
 <rect x="410" y="250" width="240" height="160" rx="3" class="arch-panel" />
 <text x="530" y="280" text-anchor="middle" class="arch-title">Agents</text>
-<rect x="426" y="296" width="208" height="46" rx="2" class="arch-inner" />
-<rect x="427" y="297" width="206" height="16" class="arch-strip" />
-<line x1="427" y1="313" x2="633" y2="313" class="arch-rule" />
-<text x="434" y="309" class="arch-tiny">agent 1</text>
-<text x="434" y="330" class="arch-prompt">$</text>
-<text x="447" y="330" class="arch-cmd">pivot open s3://pivotlake</text>
-<rect x="426" y="352" width="208" height="46" rx="2" class="arch-inner" />
-<rect x="427" y="353" width="206" height="16" class="arch-strip" />
-<line x1="427" y1="369" x2="633" y2="369" class="arch-rule" />
-<text x="434" y="365" class="arch-tiny">agent 2</text>
-<text x="434" y="386" class="arch-prompt">$</text>
-<text x="447" y="386" class="arch-cmd">pivot open s3://pivotlake</text>
+<rect x="426" y="296" width="208" height="30" rx="2" class="arch-inner" />
+<text x="436" y="316" class="arch-prompt">$</text>
+<text x="449" y="316" class="arch-cmd">pivot open s3://pivotlake</text>
+<rect x="426" y="336" width="208" height="30" rx="2" class="arch-inner" />
+<text x="436" y="356" class="arch-prompt">$</text>
+<text x="449" y="356" class="arch-cmd">pivot open s3://pivotlake</text>
+<text x="530" y="396" text-anchor="middle" class="arch-tiny">one process each · no cluster</text>
 <rect x="670" y="250" width="210" height="160" rx="3" class="arch-panel" />
 <text x="775" y="280" text-anchor="middle" class="arch-title">Other engines</text>
 <rect x="684" y="296" width="182" height="32" rx="2" class="arch-inner" />
