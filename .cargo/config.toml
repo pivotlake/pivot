@@ -9,9 +9,10 @@
 #   - CI checks and docs (.github/workflows/ci.yml, pages.yml), which cache
 #     with rust-cache instead
 #   - the release builds, so shipped and optimized binaries are always compiled
-#     fresh, uncached: the release-binary CI job (.github/workflows/deploy.yml),
-#     the PGO recipes (pgo.just), and the Docker images (server/Dockerfile,
-#     benchmarks/Dockerfile)
+#     fresh, uncached: the PGO recipes (pgo.just) and the Docker images
+#     (packaging/debian/Dockerfile, which builds the shipped binary and its
+#     Debian package for .github/workflows/deploy.yml, plus server/Dockerfile
+#     and benchmarks/Dockerfile)
 [build]
 rustc-wrapper = "kache"
 
