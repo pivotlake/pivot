@@ -153,6 +153,11 @@
    full contrast, on the card's own surface. Giving the command its own fill
    reads as a hole in the card rather than as a screen, because the surface a
    step away from the card is lighter in one theme and darker in the other. */
+/* The dot in front of an agent's tool call. */
+.arch-bullet {
+  fill: var(--sl-color-gray-2);
+}
+
 .arch-prompt {
   fill: var(--sl-color-gray-4);
   font-size: 11px;
