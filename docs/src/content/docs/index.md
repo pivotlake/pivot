@@ -8,8 +8,8 @@ object storage in an open format, so the cluster is one reader among several
 rather than the only way in.
 
 <figure class="arch-figure">
-<svg viewBox="0 0 920 552" role="img" aria-labelledby="arch-title arch-desc">
-<title id="arch-title">pivotdb architecture</title>
+<svg viewBox="0 0 920 578" role="img" aria-labelledby="arch-title arch-desc">
+<title id="arch-title">Pivot architecture</title>
 <desc id="arch-desc">Object storage holds pivotlake tables in Delta Lake format. A Pivot cluster reads and writes them and serves SQL clients over the Postgres wire. Agents, each embedding its own pivot open, and third-party engines such as DuckDB, read the same files directly without going through the cluster.</desc>
 <defs>
 <marker id="arch-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
@@ -41,82 +41,85 @@ rather than the only way in.
 <text x="844" y="106" text-anchor="end" class="arch-tiny">Delta Lake format</text>
 <text x="618" y="132" class="arch-tiny">part-00000-3f7a….parquet</text>
 <text x="618" y="150" class="arch-tiny">part-00001-9c21….parquet</text>
-<line x1="215" y1="250" x2="215" y2="182" class="arch-line" marker-start="url(#arch-head)" marker-end="url(#arch-head)" />
-<text x="229" y="220" class="arch-muted">read + write</text>
-<line x1="545" y1="250" x2="545" y2="182" class="arch-line" marker-end="url(#arch-head)" />
-<text x="559" y="220" class="arch-muted">read</text>
-<line x1="790" y1="250" x2="790" y2="182" class="arch-line" marker-end="url(#arch-head)" />
-<text x="804" y="220" class="arch-muted">read</text>
-<rect x="40" y="250" width="350" height="160" rx="3" class="arch-panel" />
+<line x1="182" y1="250" x2="182" y2="182" class="arch-line" marker-start="url(#arch-head)" marker-end="url(#arch-head)" />
+<text x="196" y="220" class="arch-muted">read + write</text>
+<line x1="479" y1="250" x2="479" y2="182" class="arch-line" marker-end="url(#arch-head)" />
+<text x="493" y="220" class="arch-muted">read</text>
+<line x1="757" y1="250" x2="757" y2="182" class="arch-line" marker-end="url(#arch-head)" />
+<text x="771" y="220" class="arch-muted">read</text>
+<rect x="40" y="250" width="284" height="186" rx="3" class="arch-panel" />
 <text x="64" y="280" class="arch-title">Pivot cluster</text>
-<text x="366" y="280" text-anchor="end" class="arch-muted">writer</text>
-<rect x="64" y="296" width="94" height="86" rx="2" class="arch-inner" />
-<rect x="65" y="297" width="92" height="23" class="arch-strip" />
-<line x1="65" y1="320" x2="157" y2="320" class="arch-rule" />
-<text x="111" y="313" text-anchor="middle" class="arch-muted">node 1</text>
+<text x="300" y="280" text-anchor="end" class="arch-muted">writer</text>
+<rect x="64" y="296" width="72" height="100" rx="2" class="arch-inner" />
+<rect x="65" y="297" width="70" height="23" class="arch-strip" />
+<line x1="65" y1="320" x2="135" y2="320" class="arch-rule" />
+<text x="100" y="313" text-anchor="middle" class="arch-tiny">node 1</text>
 <rect x="70" y="332" width="16" height="16" rx="1" class="arch-cell" />
 <rect x="92" y="332" width="16" height="16" rx="1" class="arch-cell" />
 <rect x="114" y="332" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="136" y="332" width="16" height="16" rx="1" class="arch-cell" />
 <rect x="70" y="354" width="16" height="16" rx="1" class="arch-cell" />
 <rect x="92" y="354" width="16" height="16" rx="1" class="arch-cell" />
 <rect x="114" y="354" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="136" y="354" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="168" y="296" width="94" height="86" rx="2" class="arch-inner" />
-<rect x="169" y="297" width="92" height="23" class="arch-strip" />
-<line x1="169" y1="320" x2="261" y2="320" class="arch-rule" />
-<text x="215" y="313" text-anchor="middle" class="arch-muted">node 2</text>
+<rect x="70" y="376" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="92" y="376" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="114" y="376" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="146" y="296" width="72" height="100" rx="2" class="arch-inner" />
+<rect x="147" y="297" width="70" height="23" class="arch-strip" />
+<line x1="147" y1="320" x2="217" y2="320" class="arch-rule" />
+<text x="182" y="313" text-anchor="middle" class="arch-tiny">node 2</text>
+<rect x="152" y="332" width="16" height="16" rx="1" class="arch-cell" />
 <rect x="174" y="332" width="16" height="16" rx="1" class="arch-cell" />
 <rect x="196" y="332" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="218" y="332" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="240" y="332" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="152" y="354" width="16" height="16" rx="1" class="arch-cell" />
 <rect x="174" y="354" width="16" height="16" rx="1" class="arch-cell" />
 <rect x="196" y="354" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="218" y="354" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="240" y="354" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="272" y="296" width="94" height="86" rx="2" class="arch-inner" />
-<rect x="273" y="297" width="92" height="23" class="arch-strip" />
-<line x1="273" y1="320" x2="365" y2="320" class="arch-rule" />
-<text x="319" y="313" text-anchor="middle" class="arch-muted">node 3</text>
+<rect x="152" y="376" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="174" y="376" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="196" y="376" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="228" y="296" width="72" height="100" rx="2" class="arch-inner" />
+<rect x="229" y="297" width="70" height="23" class="arch-strip" />
+<line x1="229" y1="320" x2="299" y2="320" class="arch-rule" />
+<text x="264" y="313" text-anchor="middle" class="arch-tiny">node 3</text>
+<rect x="234" y="332" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="256" y="332" width="16" height="16" rx="1" class="arch-cell" />
 <rect x="278" y="332" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="300" y="332" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="322" y="332" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="344" y="332" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="234" y="354" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="256" y="354" width="16" height="16" rx="1" class="arch-cell" />
 <rect x="278" y="354" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="300" y="354" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="322" y="354" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="344" y="354" width="16" height="16" rx="1" class="arch-cell" />
-<rect x="410" y="250" width="270" height="160" rx="3" class="arch-panel" />
-<text x="545" y="280" text-anchor="middle" class="arch-title">Agents</text>
-<rect x="426" y="296" width="238" height="44" rx="2" class="arch-inner" />
-<circle cx="440" cy="310" r="3.5" class="arch-bullet" />
-<text x="450" y="314" class="arch-cmd">Bash(pivot open s3://pivotlake)</text>
-<text x="450" y="330" class="arch-tiny">└ opened 3 tables</text>
-<rect x="426" y="348" width="238" height="44" rx="2" class="arch-inner" />
-<circle cx="440" cy="362" r="3.5" class="arch-bullet" />
-<text x="450" y="366" class="arch-cmd">Bash(pivot open s3://pivotlake)</text>
-<text x="450" y="382" class="arch-tiny">└ opened 3 tables</text>
-<rect x="700" y="250" width="180" height="160" rx="3" class="arch-panel" />
-<text x="790" y="280" text-anchor="middle" class="arch-title">Other engines</text>
-<rect x="714" y="296" width="152" height="32" rx="2" class="arch-inner" />
-<rect x="726" y="305" width="14" height="14" rx="1" class="arch-cell" />
-<text x="748" y="317" class="arch-muted">DuckDB</text>
-<rect x="714" y="332" width="152" height="32" rx="2" class="arch-inner" />
-<rect x="726" y="341" width="14" height="14" rx="1" class="arch-cell" />
-<text x="748" y="353" class="arch-muted">Spark</text>
-<rect x="714" y="368" width="152" height="32" rx="2" class="arch-inner" />
-<rect x="726" y="377" width="14" height="14" rx="1" class="arch-cell" />
-<text x="748" y="389" class="arch-muted">pandas · Trino</text>
-<line x1="215" y1="460" x2="215" y2="412" class="arch-line" marker-end="url(#arch-head)" />
-<text x="229" y="440" class="arch-muted">Postgres wire</text>
-<rect x="40" y="460" width="350" height="72" rx="3" class="arch-panel" />
-<text x="64" y="484" class="arch-title">SQL clients</text>
-<rect x="64" y="494" width="76" height="26" rx="2" class="arch-inner" />
-<text x="102" y="511" text-anchor="middle" class="arch-muted">backend</text>
-<rect x="150" y="494" width="60" height="26" rx="2" class="arch-inner" />
-<text x="180" y="511" text-anchor="middle" class="arch-muted">psql</text>
-<rect x="220" y="494" width="84" height="26" rx="2" class="arch-inner" />
-<text x="262" y="511" text-anchor="middle" class="arch-muted">BI tools</text>
+<rect x="234" y="376" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="256" y="376" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="278" y="376" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="344" y="250" width="270" height="186" rx="3" class="arch-panel" />
+<text x="479" y="280" text-anchor="middle" class="arch-title">Agents</text>
+<rect x="360" y="296" width="238" height="44" rx="2" class="arch-inner" />
+<circle cx="374" cy="310" r="3.5" class="arch-bullet" />
+<text x="384" y="314" class="arch-cmd">Bash(pivot open s3://pivotlake)</text>
+<text x="384" y="330" class="arch-tiny">└ opened 3 tables</text>
+<rect x="360" y="352" width="238" height="44" rx="2" class="arch-inner" />
+<circle cx="374" cy="366" r="3.5" class="arch-bullet" />
+<text x="384" y="370" class="arch-cmd">Bash(pivot open s3://pivotlake)</text>
+<text x="384" y="386" class="arch-tiny">└ opened 3 tables</text>
+<rect x="634" y="250" width="246" height="186" rx="3" class="arch-panel" />
+<text x="757" y="280" text-anchor="middle" class="arch-title">Other engines</text>
+<rect x="648" y="296" width="218" height="38" rx="2" class="arch-inner" />
+<text x="660" y="312" class="arch-muted">DuckDB</text>
+<text x="660" y="327" class="arch-tiny">delta_scan('s3://pivotlake')</text>
+<rect x="648" y="342" width="218" height="38" rx="2" class="arch-inner" />
+<text x="660" y="358" class="arch-muted">Spark</text>
+<text x="660" y="373" class="arch-tiny">spark.read.format("delta")</text>
+<rect x="648" y="388" width="218" height="38" rx="2" class="arch-inner" />
+<text x="660" y="404" class="arch-muted">pandas</text>
+<text x="660" y="419" class="arch-tiny">DeltaTable("s3://pivotlake")</text>
+<line x1="182" y1="486" x2="182" y2="438" class="arch-line" marker-end="url(#arch-head)" />
+<text x="196" y="466" class="arch-muted">Postgres wire</text>
+<rect x="40" y="486" width="284" height="72" rx="3" class="arch-panel" />
+<text x="64" y="510" class="arch-title">SQL clients</text>
+<rect x="64" y="520" width="72" height="26" rx="2" class="arch-inner" />
+<text x="100" y="537" text-anchor="middle" class="arch-muted">backend</text>
+<rect x="146" y="520" width="56" height="26" rx="2" class="arch-inner" />
+<text x="174" y="537" text-anchor="middle" class="arch-muted">psql</text>
+<rect x="212" y="520" width="80" height="26" rx="2" class="arch-inner" />
+<text x="252" y="537" text-anchor="middle" class="arch-muted">BI tools</text>
 </svg>
 </figure>
 
