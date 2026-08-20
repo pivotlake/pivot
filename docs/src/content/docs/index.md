@@ -10,7 +10,7 @@ rather than the only way in.
 <figure class="arch-figure">
 <svg viewBox="0 0 920 578" role="img" aria-labelledby="arch-title arch-desc">
 <title id="arch-title">Pivot architecture</title>
-<desc id="arch-desc">Object storage holds pivotlake tables in Delta Lake format. A Pivot cluster reads and writes them and serves SQL clients over the Postgres wire. Agents, each embedding its own pivot open, and third-party engines such as DuckDB, read the same files directly without going through the cluster.</desc>
+<desc id="arch-desc">Object storage holds pivotlake tables in Delta Lake format. A Pivot cluster reads and writes them and serves SQL clients over the Postgres wire. Agents, each embedding its own pivot open, and third-party engines such as Snowflake, read and write the same files directly without going through the cluster.</desc>
 <defs>
 <marker id="arch-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
 <path d="M0,0 L10,5 L0,10 z" class="arch-arrowhead" />
@@ -43,13 +43,12 @@ rather than the only way in.
 <text x="618" y="150" class="arch-tiny">part-00001-9c21….parquet</text>
 <line x1="182" y1="250" x2="182" y2="182" class="arch-line" marker-start="url(#arch-head)" marker-end="url(#arch-head)" />
 <text x="196" y="220" class="arch-muted">read + write</text>
-<line x1="479" y1="250" x2="479" y2="182" class="arch-line" marker-end="url(#arch-head)" />
-<text x="493" y="220" class="arch-muted">read</text>
-<line x1="757" y1="250" x2="757" y2="182" class="arch-line" marker-end="url(#arch-head)" />
-<text x="771" y="220" class="arch-muted">read</text>
+<line x1="479" y1="250" x2="479" y2="182" class="arch-line" marker-start="url(#arch-head)" marker-end="url(#arch-head)" />
+<text x="493" y="220" class="arch-muted">read + write</text>
+<line x1="757" y1="250" x2="757" y2="182" class="arch-line" marker-start="url(#arch-head)" marker-end="url(#arch-head)" />
+<text x="771" y="220" class="arch-muted">read + write</text>
 <rect x="40" y="250" width="284" height="186" rx="3" class="arch-panel" />
 <text x="64" y="280" class="arch-title">Pivot cluster</text>
-<text x="300" y="280" text-anchor="end" class="arch-muted">writer</text>
 <rect x="64" y="296" width="72" height="100" rx="2" class="arch-inner" />
 <rect x="65" y="297" width="70" height="23" class="arch-strip" />
 <line x1="65" y1="320" x2="135" y2="320" class="arch-rule" />
@@ -132,12 +131,12 @@ rather than the only way in.
 </svg>
 </figure>
 
-The cluster owns writes: it lands parquet and commits to the Delta log. Reads
-are not exclusive to it. Each agent embeds its own pivot open and reads
-the tables in its own process, so agents scale out without queueing behind a
-shared server, and anything else that speaks Delta Lake can point at the same
-prefix and get the same data. That is why those readers sit next to the
-cluster in the drawing rather than behind it.
+No process owns the tables. The cluster, an agent with its own pivot open, and
+anything else that speaks Delta Lake all read and write the same prefix, and
+they coordinate through the Delta log rather than through a server: a writer
+lands parquet, then commits, and a commit that raced another one is retried
+against the newer version. That is why they sit beside each other in the
+drawing rather than behind one another.
 
 ## Where to start
 
