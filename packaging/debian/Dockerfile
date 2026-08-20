@@ -14,7 +14,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /src
 COPY . .
-ENV RUSTC_WRAPPER=
 
 # `target` is a cache mount, so it is gone by the time the stage is exported:
 # copy the binary out to /out inside the same layer. The deploy workflow ships

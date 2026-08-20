@@ -227,7 +227,7 @@ build_gen() {
     (cd "$dir/benchmarks" && \
         PGO_DIR="$pgo_dir" PGO_GEN_TARGET_DIR=target-pgogen \
         just pgo-gen-build build --release -p server --bin pivotdb-server && \
-        CARGO_TARGET_DIR=target-client RUSTC_WRAPPER= \
+        CARGO_TARGET_DIR=target-client \
         cargo build --release -p benchmarks --bin pivot-bench)
 }
 
@@ -296,7 +296,7 @@ verify_pgo_applied() {
 
 build_release() {
     local dir="$1"
-    (cd "$dir/benchmarks" && RUSTC_WRAPPER= \
+    (cd "$dir/benchmarks" && \
         cargo build --release -p server --bin pivotdb-server -p benchmarks --bin pivot-bench)
 }
 

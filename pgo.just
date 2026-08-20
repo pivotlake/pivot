@@ -20,13 +20,11 @@ pgouse_target_dir := env_var_or_default("PGO_USE_TARGET_DIR", "target-pgouse")
 alias pgo-generate := pgo-gen
 pgo-gen *args:
     mkdir -p {{pgo_dir}}
-    # RUSTC_WRAPPER= bypasses the kache rustc wrapper (.cargo/config.toml): these
-    # optimized PGO builds are compiled fresh, never restored from cache.
     # PIVOT_SPIN_LIMIT=0 parks idle workers immediately during the profiled
     # workload, so the profile records the wait-heavy control-flow mix that
     # cold runs on the full dataset execute, deterministically rather than
     # as a timing-dependent draw per build.
-    RUSTC_WRAPPER= RUSTFLAGS="-Cprofile-generate={{pgo_dir}} -Ctarget-cpu=native" \
+    RUSTFLAGS="-Cprofile-generate={{pgo_dir}} -Ctarget-cpu=native" \
         PIVOT_SPIN_LIMIT=0 \
         CARGO_TARGET_DIR={{pgogen_target_dir}} cargo {{args}}
     $(dirname "$(rustc --print target-libdir)")/bin/llvm-profdata merge -o {{pgo_dir}}/merged.profdata {{pgo_dir}}
@@ -35,7 +33,7 @@ pgo-gen *args:
 #
 #   just pgo-use bench --bench clickbench
 pgo-use *args:
-    RUSTC_WRAPPER= RUSTFLAGS="-Cprofile-use={{pgo_dir}}/merged.profdata -Ctarget-cpu=native" \
+    RUSTFLAGS="-Cprofile-use={{pgo_dir}}/merged.profdata -Ctarget-cpu=native" \
         CARGO_TARGET_DIR={{pgouse_target_dir}} cargo {{args}}
 
 
@@ -54,7 +52,7 @@ host_target := `rustc -vV | sed -n 's/^host: //p'`
 # branch range, which GNU ld fails with relocation overflows.
 pgo-gen-build subcmd *args:
     mkdir -p {{pgo_dir}}
-    RUSTC_WRAPPER= RUSTFLAGS="-Cprofile-generate={{pgo_dir}} -Ctarget-cpu=native -Clink-arg=-fuse-ld=lld" \
+    RUSTFLAGS="-Cprofile-generate={{pgo_dir}} -Ctarget-cpu=native -Clink-arg=-fuse-ld=lld" \
         CARGO_TARGET_DIR={{pgogen_target_dir}} cargo {{subcmd}} --target {{host_target}} {{args}}
 
 # Like pgo-use but with a caller-supplied profdata path. rustc records the
@@ -65,7 +63,7 @@ pgo-gen-build subcmd *args:
 # thanks to the explicit --target) stay cached either way. Binaries land
 # under target-pgouse/{{host_target}}/.
 pgo-use-with profdata subcmd *args:
-    RUSTC_WRAPPER= RUSTFLAGS="-Cprofile-use={{profdata}} -Ctarget-cpu=native" \
+    RUSTFLAGS="-Cprofile-use={{profdata}} -Ctarget-cpu=native" \
         CARGO_TARGET_DIR={{pgouse_target_dir}} cargo {{subcmd}} --target {{host_target}} {{args}}
 
 # Remove all PGO profiles and merged data.
