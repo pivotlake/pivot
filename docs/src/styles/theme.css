@@ -292,13 +292,18 @@
   box-shadow: none;
 }
 
-/* Search field. Starlight fills it with the page background, which is a step
-   away from the header behind it, so the border reads as the edge of a
-   recessed input rather than as a stray rule near the header's hairline.
-   Only the corners and the type size are ours. */
+/* Search field. Colours are Starlight's. It is dropped to the bottom of the
+   header so its lower edge lands on the header's hairline instead of stopping
+   a few pixels short of it, which read as a line failing to line up. Its own
+   bottom border is removed, so the hairline closes the field and the two are
+   one line rather than two. */
 site-search button {
-  border-radius: 2px;
+  border-radius: 2px 2px 0 0;
+  border-bottom: none;
   font-size: 0.8125rem;
+  align-self: flex-end;
+  height: calc(var(--sl-nav-height) - var(--sl-nav-pad-y));
+  margin-bottom: calc(-1 * var(--sl-nav-pad-y));
 }
 
 /* Right-hand table of contents. */
