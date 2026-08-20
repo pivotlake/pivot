@@ -286,24 +286,20 @@
   font-weight: 500;
 }
 
-/* Header sits on a hairline, no shadow. */
-.header {
+/* Header sits on a hairline, no shadow. Scoped to the element: Starlight nests
+   a <div class="header"> inside <header class="header">, so a bare .header
+   rule draws the line twice, the inner one landing a couple of pixels off the
+   search field's own border. */
+header.header {
   border-bottom: 1px solid var(--sl-color-hairline);
   box-shadow: none;
 }
 
-/* Search field. Colours are Starlight's. It is dropped to the bottom of the
-   header so its lower edge lands on the header's hairline instead of stopping
-   a few pixels short of it, which read as a line failing to line up. Its own
-   bottom border is removed, so the hairline closes the field and the two are
-   one line rather than two. */
+/* Search field. Colours, size and position are Starlight's; only the corners
+   and the type size are ours. */
 site-search button {
-  border-radius: 2px 2px 0 0;
-  border-bottom: none;
+  border-radius: 2px;
   font-size: 0.8125rem;
-  align-self: flex-end;
-  height: calc(var(--sl-nav-height) - var(--sl-nav-pad-y));
-  margin-bottom: calc(-1 * var(--sl-nav-pad-y));
 }
 
 /* Right-hand table of contents. */
