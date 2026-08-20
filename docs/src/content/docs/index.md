@@ -3,9 +3,7 @@ title: Introduction
 description: What pivotdb is and how the pieces fit together.
 ---
 
-pivotdb is a columnar analytics engine. It stores tables as parquet files in
-object storage in an open format, so the cluster is one reader among several
-rather than the only way in.
+Pivot is a high-performance analytics engine that runs on open data formats. It delivers low-latency queries and high concurrency without replicating data into a dedicated database or proprietary format.
 
 <figure class="arch-figure">
 <svg viewBox="0 0 920 578" role="img" aria-labelledby="arch-title arch-desc">
@@ -131,21 +129,14 @@ rather than the only way in.
 </svg>
 </figure>
 
-No process owns the tables. The cluster, an agent with its own pivot open, and
-anything else that speaks Delta Lake all read and write the same prefix, and
-they coordinate through the Delta log rather than through a server: a writer
-lands parquet, then commits, and a commit that raced another one is retried
-against the newer version. That is why they sit beside each other in the
-drawing rather than behind one another.
-
+### Key features
+- **Fast** - Written in Rust and built on state-of-the-art columnar execution techniques, including morsel-driven parallelism, SIMD, NUMA-aware execution, and cache-conscious aggregation and joins, with a few novel optimizations (#Why-is-pivot-fast?).
+- **Scalable** - With object storage as its backing store, Pivot can be scaled up, down, or to zero almost instantly.
+- **Portable** -     Pivot can run both as a server serving backends and clients, or as a local engine where users and agents query the source of truth directly—allowing local ad-hoc and agentic analytics to share the same engine and architecture as traditional dashboards and in-app analytics
+- **Open** - Pivot is open source and built on open data formats (Delta Lake, with Iceberg coming soon). This means you can use Pivot with data already stored in your data warehouse, while data ingested by Pivot remains accessible to other query engines.
+ 
 ## Where to start
 
 - [Quickstart](/docs/quickstart/) runs a server and issues a first query.
 - [Architecture](/docs/database/architecture/) explains how a query becomes
   work across the dispatch pool.
-
-## Writing docs
-
-Every page under `docs/src/content/docs/` is a markdown file with a
-`title` in its frontmatter. Directories become sidebar groups. Nothing else is
-required to add a page.
