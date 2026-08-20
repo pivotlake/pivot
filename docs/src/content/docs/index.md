@@ -101,15 +101,24 @@ rather than the only way in.
 <text x="384" y="386" class="arch-tiny">└ opened 3 tables</text>
 <rect x="634" y="250" width="246" height="186" rx="3" class="arch-panel" />
 <text x="757" y="280" text-anchor="middle" class="arch-title">Other engines</text>
-<rect x="648" y="296" width="218" height="38" rx="2" class="arch-inner" />
-<text x="660" y="312" class="arch-muted">DuckDB</text>
-<text x="660" y="327" class="arch-tiny">delta_scan('s3://pivotlake')</text>
-<rect x="648" y="342" width="218" height="38" rx="2" class="arch-inner" />
-<text x="660" y="358" class="arch-muted">Spark</text>
-<text x="660" y="373" class="arch-tiny">spark.read.format("delta")</text>
-<rect x="648" y="388" width="218" height="38" rx="2" class="arch-inner" />
-<text x="660" y="404" class="arch-muted">pandas</text>
-<text x="660" y="419" class="arch-tiny">DeltaTable("s3://pivotlake")</text>
+<rect x="648" y="296" width="104" height="32" rx="2" class="arch-inner" />
+<rect x="658" y="305" width="14" height="14" rx="1" class="arch-cell" />
+<text x="680" y="317" class="arch-muted">DuckDB</text>
+<rect x="762" y="296" width="104" height="32" rx="2" class="arch-inner" />
+<rect x="772" y="305" width="14" height="14" rx="1" class="arch-cell" />
+<text x="794" y="317" class="arch-muted">Spark</text>
+<rect x="648" y="336" width="104" height="32" rx="2" class="arch-inner" />
+<rect x="658" y="345" width="14" height="14" rx="1" class="arch-cell" />
+<text x="680" y="357" class="arch-muted">Trino</text>
+<rect x="762" y="336" width="104" height="32" rx="2" class="arch-inner" />
+<rect x="772" y="345" width="14" height="14" rx="1" class="arch-cell" />
+<text x="794" y="357" class="arch-muted">Polars</text>
+<rect x="648" y="376" width="104" height="32" rx="2" class="arch-inner" />
+<rect x="658" y="385" width="14" height="14" rx="1" class="arch-cell" />
+<text x="680" y="397" class="arch-muted">pandas</text>
+<rect x="762" y="376" width="104" height="32" rx="2" class="arch-inner" />
+<rect x="772" y="385" width="14" height="14" rx="1" class="arch-cell" />
+<text x="794" y="397" class="arch-muted">Athena</text>
 <line x1="182" y1="486" x2="182" y2="438" class="arch-line" marker-end="url(#arch-head)" />
 <text x="196" y="466" class="arch-muted">Postgres wire</text>
 <rect x="40" y="486" width="284" height="72" rx="3" class="arch-panel" />
