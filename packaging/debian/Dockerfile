@@ -16,11 +16,18 @@ WORKDIR /src
 COPY . .
 ENV RUSTC_WRAPPER=
 
+# `target` is a cache mount, so it is gone by the time the stage is exported:
+# copy the binary out to /out inside the same layer. The deploy workflow ships
+# that copy and the package below wraps the very same build.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release -p cli --bin pivot \
-    && PIVOT_BINARY=/src/target/release/pivot packaging/debian/build.sh /packages \
+    && install -D -m 0755 /src/target/release/pivot /out/pivot \
+    && PIVOT_BINARY=/out/pivot packaging/debian/build.sh /packages \
     && packaging/debian/test-package.sh /packages/*.deb
 
+# The `.deb` plus the unstripped binary it was built from. build.sh strips only
+# its copy inside the package, so /pivot keeps its symbols for profiling.
 FROM scratch AS package
 COPY --from=builder /packages/ /
+COPY --from=builder /out/pivot /pivot

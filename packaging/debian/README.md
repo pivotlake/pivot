@@ -45,7 +45,23 @@ The CI build uses `packaging/debian/Dockerfile` on native amd64 and arm64
 runners. Its Debian Bullseye build environment targets glibc 2.31 and produces
 the `.deb` as a workflow artifact; it does not publish an apt repository.
 
-## Why CI builds the package in Docker
+## Release packages
+
+The Deploy Server workflow builds the released server with this same
+Dockerfile, so the `.deb` it publishes contains exactly the binary the release
+uploads. The `package` stage exports both: `dist/pivot` is the binary, and
+`dist/pivot_<version>_<arch>.deb` wraps it. Each release leg uploads
+
+```text
+pivot-<arch>-<sha>          pivot-<arch>-latest
+pivot-<arch>-<sha>.deb      pivot-<arch>-latest.deb
+```
+
+to the destination bucket, and attaches the `.deb` as a workflow artifact.
+Building the release inside Bullseye is what keeps the published binary and
+package on the glibc 2.31 floor described below.
+
+## Why the package is built in Docker
 
 Docker is only used to provide a pinned build environment. It is not included
 in the `.deb`, and users do not need Docker to install or run Pivot.
@@ -56,5 +72,6 @@ produce a binary that does not start on an older supported distribution. The
 Dockerfile compiles Pivot on Debian Bullseye with glibc 2.31, making the package
 compatible with Debian 11+ and Ubuntu 20.04+.
 
-The final `scratch` stage contains only the generated `.deb`. GitHub Actions
-exports that file into `dist/`, tests it, and uploads it as a workflow artifact.
+The final `scratch` stage contains only the generated `.deb` and the binary it
+was built from. GitHub Actions exports both into `dist/`, tests the package, and
+uploads it as a workflow artifact.

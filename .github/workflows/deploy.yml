@@ -53,10 +53,10 @@ jobs:
         run: |
           legs=()
           if [ "${{ inputs.build_x86_64 }}" = "true" ]; then
-            legs+=('{"arch":"x86_64","runner":"ubuntu-24.04"}')
+            legs+=('{"arch":"x86_64","deb_arch":"amd64","runner":"ubuntu-24.04"}')
           fi
           if [ "${{ inputs.build_aarch64 }}" = "true" ]; then
-            legs+=('{"arch":"aarch64","runner":"ubuntu-24.04-arm"}')
+            legs+=('{"arch":"aarch64","deb_arch":"arm64","runner":"ubuntu-24.04-arm"}')
           fi
           if [ ${#legs[@]} -eq 0 ]; then
             echo "::error::Select at least one architecture (build_x86_64 / build_aarch64)."
@@ -98,7 +98,7 @@ jobs:
     # The start jobs are skipped unless opted in, so accept their skipped
     # results too.
     if: ${{ always() && needs.matrix.result == 'success' && (needs.start-ci.result == 'success' || needs.start-ci.result == 'skipped') && (needs.start-ci-arm.result == 'success' || needs.start-ci-arm.result == 'skipped') }}
-    name: Build ${{ matrix.arch }} release + upload to GCS
+    name: Build ${{ matrix.arch }} release + package + upload to GCS
     # Each arch builds on its native self-hosted box when opted in (gcp-builder
     # is X64, gcp-builder-arm is ARM64); otherwise on the hosted runner from the
     # matrix. Native runners per arch — no emulation.
@@ -113,34 +113,31 @@ jobs:
         with:
           submodules: recursive
 
-      # C toolchain for the duckdb / arrow-rs native deps (mirrors the bench
-      # Dockerfile's build stage).
-      - name: Install build dependencies
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake clang libclang-dev pkg-config git ca-certificates
+      - uses: docker/setup-buildx-action@v3
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
+      # One build produces both shipped artifacts: `dist/pivot` is the binary
+      # uploaded to GCS, and `dist/pivot_*.deb` wraps that exact binary, so the
+      # package can never drift from the released server. It runs in the
+      # packaging image's Debian Bullseye environment (glibc 2.31), which keeps
+      # both artifacts usable on Debian 11+ and Ubuntu 20.04+ and sidesteps
+      # ci-runner-x86's gcc 9.4, which aws-lc-sys rejects (GCC bug 95189).
+      - name: Build release binary + Debian package (${{ matrix.arch }})
+        uses: docker/build-push-action@v6
         with:
-          workspaces: .
+          context: .
+          file: packaging/debian/Dockerfile
+          target: package
+          outputs: type=local,dest=dist
+          cache-from: type=gha,scope=debian-${{ matrix.deb_arch }}
+          cache-to: type=gha,scope=debian-${{ matrix.deb_arch }},mode=max
 
-      - name: Build release binary (${{ matrix.arch }})
-        working-directory: server
-        run: |
-          # ci-runner-x86 is Ubuntu 20.04 with gcc 9.4, which aws-lc-sys rejects
-          # (GCC bug 95189). Build the C/C++ deps with clang there; GitHub-hosted
-          # runners have a newer, unaffected gcc, so leave them on the default.
-          if [ "${{ inputs.use_gcp_runner && matrix.arch == 'x86_64' }}" = "true" ]; then
-            export CC=clang CXX=clang++
-          fi
-          # Bypass the kache rustc wrapper (.cargo/config.toml): the shipped
-          # binary is always compiled fresh, never restored from cache.
-          export RUSTC_WRAPPER=
-          cargo build --release -p cli --bin pivot
+      - name: Inspect package
+        run: packaging/debian/test-package.sh dist/pivot_*_${{ matrix.deb_arch }}.deb
+
+      # The install test runs in a throwaway container, so it is safe on the
+      # self-hosted boxes too.
+      - name: Test package installation
+        run: packaging/debian/test-install.sh dist/pivot_*_${{ matrix.deb_arch }}.deb
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
@@ -149,11 +146,12 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      - name: Upload binary to GCS
+      - name: Upload binary and package to GCS
         env:
           BUCKET: ${{ inputs.bucket != '' && inputs.bucket || vars.DEPLOY_GCS_BUCKET }}
           SHA: ${{ github.sha }}
           ARCH: ${{ matrix.arch }}
+          DEB_ARCH: ${{ matrix.deb_arch }}
         run: |
           set -euo pipefail
           if [ -z "$BUCKET" ]; then
@@ -162,15 +160,28 @@ jobs:
           fi
           # Strip any trailing slash so we control the joins below.
           BUCKET="${BUCKET%/}"
-          BIN=target/release/pivot
+          BIN=dist/pivot
+          DEB=$(echo dist/pivot_*_"$DEB_ARCH".deb)
+          [ -f "$DEB" ] || { echo "::error::No .deb for $DEB_ARCH under dist/."; exit 1; }
 
           # Upload an immutable, SHA-pinned copy plus a moving `latest` pointer.
           gcloud storage cp "$BIN" "$BUCKET/pivot-$ARCH-$SHA"
           gcloud storage cp "$BIN" "$BUCKET/pivot-$ARCH-latest"
+          gcloud storage cp "$DEB" "$BUCKET/pivot-$ARCH-$SHA.deb"
+          gcloud storage cp "$DEB" "$BUCKET/pivot-$ARCH-latest.deb"
 
           echo "Uploaded to:"
           echo "  $BUCKET/pivot-$ARCH-$SHA"
           echo "  $BUCKET/pivot-$ARCH-latest"
+          echo "  $BUCKET/pivot-$ARCH-$SHA.deb"
+          echo "  $BUCKET/pivot-$ARCH-latest.deb"
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pivot-deb-${{ matrix.deb_arch }}
+          path: dist/pivot_*_${{ matrix.deb_arch }}.deb
+          if-no-files-found: error
 
   # Build the pivot server image and push it to Docker Hub (giladkl/pivot),
   # tagged with both the commit SHA and `latest`. Independent of the binary
