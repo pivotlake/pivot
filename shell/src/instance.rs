@@ -1,7 +1,6 @@
 //! Lifecycle for one embedded, in-process Pivot instance.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
@@ -86,29 +85,30 @@ impl ShellState {
 /// An embedded Pivot engine over one persistent Delta datastore.
 pub struct ShellInstance {
     state: Option<ShellState>,
-    data_path: PathBuf,
+    location: String,
 }
 
 impl ShellInstance {
     /// Open the production CLI instance on all available workers with half of
-    /// physical memory assigned to dispatch.
-    pub fn open(data_path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
+    /// physical memory assigned to dispatch. `location` is a local directory, or
+    /// an object-store URI (`s3://bucket/prefix`, `gs://bucket/prefix`) whose
+    /// credentials come from the environment.
+    pub fn open(location: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let workers = dispatch::default_worker_count();
         let memory_bytes = total_memory_bytes() / 2;
         let buffers = (memory_bytes / BUFFER_SIZE).max(1);
-        Self::open_with_resources(data_path, workers, buffers)
+        Self::open_with_resources(location, workers, buffers)
     }
 
     /// Open with an explicit dispatch shape. This is useful for embedding and
     /// for small black-box test instances.
     pub fn open_with_resources(
-        data_path: impl AsRef<Path>,
+        location: &str,
         workers: usize,
         buffers: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let data_path = data_path.as_ref().to_path_buf();
         let dispatch = DispatchOwner::new(Dispatch::spin_up(workers, buffers, None));
-        let datastore = DeltaDatastore::open(&data_path.to_string_lossy(), dispatch.dispatcher())?;
+        let datastore = DeltaDatastore::open(location, dispatch.dispatcher())?;
         let metastore: Arc<dyn Metastore> = Arc::new(EphemeralMetastore);
         let catalog = Arc::new(PivotCatalog::new(
             HashMap::from([(
@@ -126,7 +126,7 @@ impl ShellInstance {
                 dispatch,
                 datastore,
             }),
-            data_path,
+            location: location.to_string(),
         })
     }
 
@@ -138,8 +138,10 @@ impl ShellInstance {
             .engine
     }
 
-    pub fn data_path(&self) -> &Path {
-        &self.data_path
+    /// The location this instance was opened on, as it was spelled: a local
+    /// directory or an object-store URI.
+    pub fn location(&self) -> &str {
+        &self.location
     }
 
     fn shutdown(&mut self) {
