@@ -292,14 +292,12 @@
   box-shadow: none;
 }
 
-/* Search button reads as a field, matching the ⌘K affordance. It is filled
-   rather than outlined: an outline puts a hairline 10px above the header's
-   own hairline, in the same colour and weight, and two near-parallel rules
-   read as one line failing to align rather than as two separate edges. */
+/* Search field. Starlight fills it with the page background, which is a step
+   away from the header behind it, so the border reads as the edge of a
+   recessed input rather than as a stray rule near the header's hairline.
+   Only the corners and the type size are ours. */
 site-search button {
   border-radius: 2px;
-  border: none;
-  background-color: var(--sl-color-bg-inline-code);
   font-size: 0.8125rem;
 }
 
