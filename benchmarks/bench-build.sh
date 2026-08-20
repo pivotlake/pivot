@@ -94,7 +94,6 @@ root="$(expand_tilde "$root")"
 
 export PATH="$PATH:$HOME/.cargo/bin:$HOME/.local/bin"
 export NO_COLOR=1
-export RUSTC_WRAPPER=
 
 baseline="$root/baseline"
 working="$root/working"

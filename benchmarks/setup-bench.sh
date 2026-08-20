@@ -107,9 +107,6 @@ pgo_source="$(expand_tilde "$pgo_source")"
 # non-interactive ssh PATH, so add them explicitly.
 export PATH="$PATH:$HOME/.cargo/bin:$HOME/.local/bin"
 export NO_COLOR=1
-# The kache rustc wrapper from .cargo/config.toml is not installed everywhere,
-# and these builds are compiled fresh rather than restored from a cache anyway.
-export RUSTC_WRAPPER=
 
 baseline="$root/baseline"
 working="$root/working"

@@ -11,19 +11,11 @@ fn main() {
         .profile("Release")
         .build_target("duckdb_static");
 
-    // Route DuckDB's C/C++ compiles through the same content-addressed build
-    // cache that wraps rustc, so a fresh checkout restores the object files
-    // instead of recompiling all of DuckDB from scratch. cmake spawns the
-    // compiler directly, so without a launcher the cache never sees these.
-    // Builds that want fresh, uncached output clear RUSTC_WRAPPER and so skip
-    // the launcher automatically.
-    if let Ok(wrapper) = std::env::var("RUSTC_WRAPPER")
-        && !wrapper.is_empty()
-    {
-        duckdb_config
-            .define("CMAKE_C_COMPILER_LAUNCHER", &wrapper)
-            .define("CMAKE_CXX_COMPILER_LAUNCHER", &wrapper);
-    } else if let Some(ccache) = find_ccache() {
+    // Route DuckDB's C/C++ compiles through ccache so a fresh checkout restores
+    // the object files instead of recompiling all of DuckDB from scratch. cmake
+    // spawns the compiler directly, so without a launcher the cache never sees
+    // these compiles.
+    if let Some(ccache) = find_ccache() {
         // DuckDB is around 2400 translation units pinned to a submodule commit,
         // so every checkout sitting on that commit compiles byte-identical
         // objects. ccache turns all but the first of those into cache hits.

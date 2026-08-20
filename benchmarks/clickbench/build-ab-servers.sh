@@ -81,7 +81,7 @@ build_side() {
         # The client is a plain build in its own target dir: it takes no
         # profile flags, and sharing a flagged dir would rebuild it for
         # nothing on every flavor switch.
-        CARGO_TARGET_DIR=target-client RUSTC_WRAPPER= \
+        CARGO_TARGET_DIR=target-client \
             cargo build --release -p benchmarks --bin pivot-bench
         # LLVM_PROFILE_FILE reaches the instrumented server through the
         # environment pivot-bench spawns it with; the client itself is not
