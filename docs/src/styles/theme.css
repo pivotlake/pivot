@@ -292,11 +292,14 @@
   box-shadow: none;
 }
 
-/* Search button reads as a field, matching the ⌘K affordance. */
+/* Search button reads as a field, matching the ⌘K affordance. It is filled
+   rather than outlined: an outline puts a hairline 10px above the header's
+   own hairline, in the same colour and weight, and two near-parallel rules
+   read as one line failing to align rather than as two separate edges. */
 site-search button {
   border-radius: 2px;
-  border-color: var(--sl-color-hairline);
-  background-color: transparent;
+  border: none;
+  background-color: var(--sl-color-bg-inline-code);
   font-size: 0.8125rem;
 }
 
