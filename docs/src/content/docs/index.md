@@ -102,23 +102,23 @@ rather than the only way in.
 <rect x="634" y="250" width="246" height="186" rx="3" class="arch-panel" />
 <text x="757" y="280" text-anchor="middle" class="arch-title">Other engines</text>
 <rect x="648" y="296" width="104" height="32" rx="2" class="arch-inner" />
-<rect x="658" y="305" width="14" height="14" rx="1" class="arch-cell" />
-<text x="680" y="317" class="arch-muted">DuckDB</text>
+<rect x="657" y="305" width="14" height="14" rx="1" class="arch-cell" />
+<text x="677" y="317" class="arch-tiny">Snowflake</text>
 <rect x="762" y="296" width="104" height="32" rx="2" class="arch-inner" />
-<rect x="772" y="305" width="14" height="14" rx="1" class="arch-cell" />
-<text x="794" y="317" class="arch-muted">Spark</text>
+<rect x="771" y="305" width="14" height="14" rx="1" class="arch-cell" />
+<text x="791" y="317" class="arch-tiny">Databricks</text>
 <rect x="648" y="336" width="104" height="32" rx="2" class="arch-inner" />
-<rect x="658" y="345" width="14" height="14" rx="1" class="arch-cell" />
-<text x="680" y="357" class="arch-muted">Trino</text>
+<rect x="657" y="345" width="14" height="14" rx="1" class="arch-cell" />
+<text x="677" y="357" class="arch-tiny">DuckDB</text>
 <rect x="762" y="336" width="104" height="32" rx="2" class="arch-inner" />
-<rect x="772" y="345" width="14" height="14" rx="1" class="arch-cell" />
-<text x="794" y="357" class="arch-muted">Polars</text>
+<rect x="771" y="345" width="14" height="14" rx="1" class="arch-cell" />
+<text x="791" y="357" class="arch-tiny">Spark</text>
 <rect x="648" y="376" width="104" height="32" rx="2" class="arch-inner" />
-<rect x="658" y="385" width="14" height="14" rx="1" class="arch-cell" />
-<text x="680" y="397" class="arch-muted">pandas</text>
+<rect x="657" y="385" width="14" height="14" rx="1" class="arch-cell" />
+<text x="677" y="397" class="arch-tiny">Trino</text>
 <rect x="762" y="376" width="104" height="32" rx="2" class="arch-inner" />
-<rect x="772" y="385" width="14" height="14" rx="1" class="arch-cell" />
-<text x="794" y="397" class="arch-muted">Athena</text>
+<rect x="771" y="385" width="14" height="14" rx="1" class="arch-cell" />
+<text x="791" y="397" class="arch-tiny">Polars</text>
 <line x1="182" y1="486" x2="182" y2="438" class="arch-line" marker-end="url(#arch-head)" />
 <text x="196" y="466" class="arch-muted">Postgres wire</text>
 <rect x="40" y="486" width="284" height="72" rx="3" class="arch-panel" />
