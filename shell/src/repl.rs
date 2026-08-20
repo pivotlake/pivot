@@ -1,5 +1,4 @@
 use std::io::{self, IsTerminal, Write};
-use std::path::PathBuf;
 use std::time::Instant;
 
 use engine::{ExecuteOptions, StatementOutput};
@@ -20,13 +19,13 @@ Shell commands:
 ";
 
 pub(crate) async fn run_shell(
-    datastore_directory: PathBuf,
+    datastore_location: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !io::stdin().is_terminal() {
         return Err("an interactive terminal is required".into());
     }
 
-    let instance = ShellInstance::open(datastore_directory)?;
+    let instance = ShellInstance::open(&datastore_location)?;
     let editor = DefaultEditor::new()?;
 
     println!("pivot shell ({})", env!("CARGO_PKG_VERSION"));

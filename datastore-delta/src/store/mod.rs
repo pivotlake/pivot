@@ -402,13 +402,13 @@ pub(crate) fn update_by_version_swap(
 }
 
 /// Open the object store for a catalog root URI: `s3://bucket/prefix`,
-/// `gs://bucket/prefix`, or a local path (optionally `file://`). Credentials
-/// come from the environment; a caller holding its own opens the backend
-/// directly (`S3Store::with_credentials`, `GcsStore::with_credentials_file`).
+/// `gs://bucket/prefix`, or a local path (optionally `file://`). Credentials are
+/// whatever the process itself can resolve; a caller holding its own opens the
+/// backend directly (`S3Store::with_credentials`, `GcsStore::with_credentials_file`).
 pub fn open_store(uri: &str) -> Result<Box<dyn ObjectStore>> {
     match StoreScheme::of(uri)? {
-        StoreScheme::S3 => Ok(Box::new(S3Store::from_uri(uri)?)),
-        StoreScheme::Gcs => Ok(Box::new(GcsStore::from_uri(uri)?)),
+        StoreScheme::S3 => Ok(Box::new(S3Store::with_env_credentials(uri)?)),
+        StoreScheme::Gcs => Ok(Box::new(GcsStore::with_default_credentials(uri)?)),
         StoreScheme::Local => Ok(Box::new(LocalStore::new(local_path(uri)))),
     }
 }

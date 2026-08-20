@@ -1,6 +1,5 @@
 //! Pivot command-line entry point.
 
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -14,11 +13,23 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum PivotCommand {
-    /// Open a local datastore in the Pivot SQL shell.
+    /// Open a datastore in the Pivot SQL shell.
+    ///
+    /// The datastore is named either by a local directory, which is created if
+    /// it does not exist, or by an object-store URI: s3://bucket/prefix (s3://
+    /// also spelled s3a://), gs://bucket/prefix, or file:///path.
+    ///
+    /// Object-store credentials are read from the environment. S3 takes
+    /// AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY, its region from AWS_REGION
+    /// or AWS_DEFAULT_REGION (us-east-1 when neither is set), and an optional
+    /// AWS_ENDPOINT_URL naming a path-style S3-compatible endpoint such as
+    /// MinIO. GCS follows Application Default Credentials:
+    /// GOOGLE_APPLICATION_CREDENTIALS, then the gcloud login file, then the
+    /// instance metadata server.
     Open {
-        /// Directory containing the datastore. It is created if it does not exist.
-        #[arg(value_name = "DATASTORE_DIRECTORY")]
-        datastore_directory: PathBuf,
+        /// Local directory or object-store URI holding the datastore.
+        #[arg(value_name = "DATASTORE_LOCATION")]
+        datastore_location: String,
     },
     /// Run the Pivot database server in the foreground.
     Server(server::ServerOptions),
@@ -26,9 +37,7 @@ enum PivotCommand {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     match Args::parse().command {
-        PivotCommand::Open {
-            datastore_directory,
-        } => shell::run(datastore_directory),
+        PivotCommand::Open { datastore_location } => shell::run(datastore_location),
         PivotCommand::Server(options) => server::run(options).map_err(Into::into),
     }
 }
@@ -45,26 +54,31 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use clap::Parser;
 
     use super::{Args, PivotCommand};
 
+    fn open_location(argument: &str) -> String {
+        let args = Args::try_parse_from(["pivot", "open", argument]).unwrap();
+        let PivotCommand::Open { datastore_location } = args.command else {
+            panic!("open did not parse as the open command");
+        };
+        datastore_location
+    }
+
     #[test]
-    fn requires_a_command_and_an_open_datastore_directory() {
+    fn requires_a_command_and_an_open_datastore_location() {
         assert!(Args::try_parse_from(["pivot"]).is_err());
         assert!(Args::try_parse_from(["pivot", "open"]).is_err());
         assert!(Args::try_parse_from(["pivot", "shell", "/var/lib/pivot"]).is_err());
 
-        let args = Args::try_parse_from(["pivot", "open", "/var/lib/pivot"]).unwrap();
-        let PivotCommand::Open {
-            datastore_directory,
-        } = args.command
-        else {
-            panic!("open did not parse as the open command");
-        };
-        assert_eq!(datastore_directory, PathBuf::from("/var/lib/pivot"));
+        assert_eq!(open_location("/var/lib/pivot"), "/var/lib/pivot");
+    }
+
+    #[test]
+    fn open_takes_an_object_store_uri_verbatim() {
+        assert_eq!(open_location("s3://bucket/prefix"), "s3://bucket/prefix");
+        assert_eq!(open_location("gs://bucket/prefix"), "gs://bucket/prefix");
     }
 
     #[test]

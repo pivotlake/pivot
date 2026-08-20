@@ -1,13 +1,13 @@
 //! S3 (and S3-compatible) backend: blocking HTTP via [`ureq`], requests signed
 //! with SigV4 via `aws_sigv4::http_request::sign` (a pure function — no runtime).
 //!
-//! Credentials come from one of two places. [`S3Store::from_uri`] reads them from
-//! the environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`; region from
-//! `AWS_REGION`/`AWS_DEFAULT_REGION`; an optional
+//! Credentials come from one of two places. [`S3Store::with_env_credentials`]
+//! reads them from the environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`;
+//! region from `AWS_REGION`/`AWS_DEFAULT_REGION`; an optional
 //! `AWS_ENDPOINT_URL` selects a path-style S3-compatible endpoint like MinIO).
 //! [`S3Store::with_credentials`] takes them explicitly, so a metastore can supply
-//! a datastore's own key/secret/region/endpoint rather than relying on ambient
-//! environment.
+//! a datastore's own key/secret/region/endpoint rather than relying on whatever
+//! the process was started with.
 //!
 //! Either way the resolved parameters are kept on the store, which builds the
 //! Delta Kernel client for the same bucket from them
@@ -61,9 +61,10 @@ pub struct S3Credentials {
 }
 
 impl S3Store {
-    /// Parse `s3://bucket/prefix` and resolve credentials/region/endpoint from
-    /// the environment.
-    pub fn from_uri(uri: &str) -> Result<Self> {
+    /// Open `s3://bucket/prefix` with the credentials, region, and endpoint the
+    /// environment carries. The two keys are required: without something to sign
+    /// a request with there is nothing this store could do.
+    pub fn with_env_credentials(uri: &str) -> Result<Self> {
         let (bucket, prefix) = parse_s3_uri(uri)?;
 
         let region = env_any(&["AWS_REGION", "AWS_DEFAULT_REGION"])

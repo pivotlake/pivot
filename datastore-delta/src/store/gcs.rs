@@ -91,11 +91,13 @@ struct CachedToken {
 }
 
 impl GcsStore {
-    /// Parse `gs://bucket/prefix` and resolve credentials from the Application
-    /// Default Credentials chain. Honors `STORAGE_EMULATOR_HOST` (e.g.
-    /// `http://localhost:4443`) to target a `fake-gcs-server` emulator instead
-    /// of the real service — the scheme is optional and defaults to `http`.
-    pub fn from_uri(uri: &str) -> Result<Self> {
+    /// Open `gs://bucket/prefix` with credentials resolved from the Application
+    /// Default Credentials chain, so a location can authenticate with nothing
+    /// configured at all (a gcloud login, or workload identity on Google
+    /// compute). Honors `STORAGE_EMULATOR_HOST` (e.g. `http://localhost:4443`)
+    /// to target a `fake-gcs-server` emulator instead of the real service: the
+    /// scheme is optional and defaults to `http`.
+    pub fn with_default_credentials(uri: &str) -> Result<Self> {
         Self::build(uri, None)
     }
 
@@ -775,7 +777,7 @@ mod tests {
 
     #[test]
     fn read_and_write_urls_address_the_same_object() {
-        let store = GcsStore::from_uri("gs://bucket/db").unwrap();
+        let store = GcsStore::with_default_credentials("gs://bucket/db").unwrap();
         let key = ObjectPath::new("events/a b.parquet");
 
         let media = store.media_url(&key);
