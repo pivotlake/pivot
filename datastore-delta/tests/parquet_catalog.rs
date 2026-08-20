@@ -206,16 +206,19 @@ fn constant_comparison(
 ) -> TableFilter {
     // Build the same shape DuckDB pushes through the C++ bridge:
     // `TableFilter::Expression(Compare { Ref, Constant })`.
-    TableFilter::Expression(Box::new(Expression::Compare(Compare {
-        left: Box::new(Expression::Ref(Ref {
-            column_idx,
-            return_type: Type::Int32,
-            name: None,
+    TableFilter::Expression {
+        expression: Box::new(Expression::Compare(Compare {
+            left: Box::new(Expression::Ref(Ref {
+                column_idx,
+                return_type: Type::Int32,
+                name: None,
+            })),
+            right: Box::new(Expression::Constant(constant)),
+            compare_type,
+            return_type: Type::Boolean,
         })),
-        right: Box::new(Expression::Constant(constant)),
-        compare_type,
-        return_type: Type::Boolean,
-    })))
+        holds_folded_instant: false,
+    }
 }
 
 // Row groups that survive `table`'s pushed-down predicates over the table's
@@ -695,8 +698,25 @@ fn append(datastore: &DeltaDatastore, name: &str, path: &Path) {
     datastore.publish_table(handle);
 }
 
-/// Plan and compile `sql` over `datastore` inside a fresh transaction (like
-/// the server does per query), leaving execution and commit to the caller.
+/// Plan `sql` over `datastore` inside a fresh transaction (like the server does
+/// per query), handing back both, so a caller can compile the plan or ask the
+/// plan itself a question.
+fn plan_sql(
+    datastore: &Arc<DeltaDatastore>,
+    sql: &str,
+) -> (Arc<dyn CatalogTransaction>, planner::Plan) {
+    let transaction = single_catalog(datastore).begin_transaction();
+    let mut planner = Planner::from_datastore_names(
+        vec![DEFAULT_DATASTORE_NAME.to_string()],
+        DEFAULT_DATASTORE_NAME.to_string(),
+    )
+    .expect("planner context");
+    let plan = planner.plan(sql, transaction.clone()).unwrap();
+    (transaction, plan)
+}
+
+/// Plan and compile `sql` over `datastore`, leaving execution and commit to the
+/// caller.
 fn compile_sql(
     datastore: &Arc<DeltaDatastore>,
     sql: &str,
@@ -704,18 +724,8 @@ fn compile_sql(
     Arc<dyn CatalogTransaction>,
     dispatch::RecordBatchOperatorSpec,
 ) {
-    let catalog = single_catalog(datastore);
-    let transaction = catalog.begin_transaction();
-    let mut planner = Planner::from_datastore_names(
-        vec![DEFAULT_DATASTORE_NAME.to_string()],
-        DEFAULT_DATASTORE_NAME.to_string(),
-    )
-    .expect("planner context");
-    let compiled = planner
-        .plan(sql, transaction.clone())
-        .unwrap()
-        .compile(&dispatcher(), transaction.as_ref())
-        .unwrap();
+    let (transaction, plan) = plan_sql(datastore, sql);
+    let compiled = plan.compile(&dispatcher(), transaction.as_ref()).unwrap();
     (transaction, compiled)
 }
 
@@ -1857,20 +1867,23 @@ fn write_shredded_ages(ages: &[i64]) -> TempDir {
 /// a typed variant comparison (the cast fused into a typed VariantGet).
 fn variant_filter(path: &[&str], cmp: CompareType, value: i64) -> TableFilter {
     let constant = Scalar::new(Arc::new(Int64Array::new_scalar(value).into_inner()) as ArrayRef);
-    TableFilter::Expression(Box::new(Expression::Compare(Compare {
-        left: Box::new(Expression::Function(Function::VariantGet(VariantGet {
-            input: Box::new(Expression::Ref(Ref {
-                column_idx: 0,
-                return_type: Type::Variant,
-                name: None,
-            })),
-            path: path.iter().map(|s| s.to_string()).collect(),
-            as_type: Some(Type::Int64),
-        }))),
-        right: Box::new(Expression::Constant(constant)),
-        compare_type: cmp,
-        return_type: Type::Boolean,
-    })))
+    TableFilter::Expression {
+        expression: Box::new(Expression::Compare(Compare {
+            left: Box::new(Expression::Function(Function::VariantGet(VariantGet {
+                input: Box::new(Expression::Ref(Ref {
+                    column_idx: 0,
+                    return_type: Type::Variant,
+                    name: None,
+                })),
+                path: path.iter().map(|s| s.to_string()).collect(),
+                as_type: Some(Type::Int64),
+            }))),
+            right: Box::new(Expression::Constant(constant)),
+            compare_type: cmp,
+            return_type: Type::Boolean,
+        })),
+        holds_folded_instant: false,
+    }
 }
 
 fn shredded_docs_datastore(dir: &Path) -> (TempDir, Arc<DeltaDatastore>, TableBinding) {
@@ -2194,4 +2207,95 @@ fn late_materialization_rows_satisfy_their_own_predicate() {
         })
         .collect();
     assert_eq!(bands, vec![6; 4]);
+}
+
+/// A `now()` lower bound prunes by file statistics. The instant is resolved
+/// while the filter is pushed down, so the scan skips a file whose rows all
+/// predate it rather than reading them for the `Filter` above to discard.
+#[test]
+fn a_now_lower_bound_prunes_a_file_that_predates_it() {
+    let (_database, datastore) = one_stale_and_one_recent_file();
+
+    // Each INSERT wrote its own file, and this is the first read of either, so
+    // the reads this query issues are exactly the files it did not prune.
+    let (recent, stats) = run_sql_with_stats(
+        &datastore,
+        "SELECT count(*) FROM events WHERE ts > now() - interval '1 hour'",
+    );
+
+    assert_eq!(common::extract_count(&recent), 1);
+    assert_eq!(
+        common::extract_count(&run_sql(&datastore, "SELECT count(*) FROM events")),
+        2,
+        "both rows are in the table"
+    );
+    assert_eq!(
+        stats.disk_requests, 1,
+        "only the in-range file was read, not the year-2000 one"
+    );
+}
+
+/// An upper bound prunes too. A range predicate only ever prunes by statistics
+/// and the `Filter` re-checks what survives, so the direction the bound faces
+/// does not decide whether resolving the instant is sound.
+#[test]
+fn a_now_upper_bound_prunes_a_file_that_postdates_it() {
+    let (_database, datastore) = one_stale_and_one_recent_file();
+
+    let (stale, stats) = run_sql_with_stats(
+        &datastore,
+        "SELECT count(*) FROM events WHERE ts < now() - interval '1 hour'",
+    );
+
+    assert_eq!(common::extract_count(&stale), 1);
+    assert_eq!(
+        stats.disk_requests, 1,
+        "only the year-2000 file was read, not the recent one"
+    );
+}
+
+/// A plan that pruned by `now()` must not be left behind for a later statement
+/// to replay: it holds the planning statement's instant, and by the time it is
+/// reused that instant has moved on. A bound written as a literal keeps its
+/// plan, so ordinary queries still cache.
+#[test]
+fn a_now_bound_costs_the_plan_its_place_in_the_cache() {
+    let (_database, datastore) = one_stale_and_one_recent_file();
+
+    let (_with_now_transaction, with_now) = plan_sql(
+        &datastore,
+        "SELECT count(*) FROM events WHERE ts > now() - interval '1 hour'",
+    );
+    let (_with_literal_transaction, with_literal) = plan_sql(
+        &datastore,
+        "SELECT count(*) FROM events WHERE ts > TIMESTAMP '2000-01-01 00:00:00'",
+    );
+
+    assert!(!with_now.is_cacheable());
+    assert!(with_literal.is_cacheable());
+}
+
+/// An `events` table holding one row from the year 2000 and one from `now()`,
+/// each in its own file, so a bound on either side of the two prunes exactly
+/// one of them.
+fn one_stale_and_one_recent_file() -> (TempDir, Arc<DeltaDatastore>) {
+    let columns = vec![
+        Column {
+            name: "ts".to_string(),
+            col_type: Type::Timestamp,
+        },
+        Column {
+            name: "payload".to_string(),
+            col_type: Type::Int64,
+        },
+    ];
+    let (database, datastore) = empty_datastore();
+    create_table(&datastore, empty_request("events", columns)).unwrap();
+    run_sql(
+        &datastore,
+        "INSERT INTO events VALUES (TIMESTAMP '2000-01-01 00:00:00', 1)",
+    );
+    run_sql(&datastore, "INSERT INTO events SELECT now(), 2");
+    datastore.refresh_from_store().unwrap();
+    (database, datastore)
 }

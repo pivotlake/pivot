@@ -64,9 +64,11 @@ unique_ptr<FunctionData> pivot_table_function_bind(ClientContext &, TableFunctio
 }
 
 // Body of a pivot scalar function stub. It never runs: pivot re-plans the call
-// into its own expression, and the only pivot scalar (drop_cache) is VOLATILE so
-// the optimizer can't fold it. Emits a constant NULL so DuckDB has a valid,
-// type-agnostic result if it ever does evaluate the call.
+// into its own expression, and every pivot scalar whose value DuckDB could ask
+// for is registered VOLATILE so the optimizer can't fold it. Emits a constant
+// NULL so DuckDB has a valid, type-agnostic result if it ever does evaluate the
+// call — a fold that reached here would rewrite the call to NULL, so a new
+// pivot scalar that leaves out the volatile flag is a silently wrong answer.
 void pivot_scalar_function_stub(DataChunk &, ExpressionState &, Vector &result) {
 	result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	ConstantVector::SetNull(result, true);

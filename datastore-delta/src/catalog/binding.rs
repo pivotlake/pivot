@@ -130,6 +130,10 @@ pub struct TableBinding {
     /// because the `BoundTable` trait gives no channel from `pushdown_filter` to
     /// `compile`); applied as a filter when the scan is compiled.
     predicates: Vec<PushedPredicate>,
+    /// Whether any recorded predicate compares against a resolved `now()`, which
+    /// costs the plan holding this binding its place in the plan cache. See
+    /// [`is_plan_cacheable`](BoundTable::is_plan_cacheable).
+    holds_folded_instant: bool,
     /// The transaction's shared queue of finished INSERT files. Shared (`Arc`)
     /// with the [`DeltaTransaction`](super::DeltaTransaction) that produced this
     /// binding, so a file this binding's [`compile_insert`](BoundTable::compile_insert)
@@ -163,6 +167,7 @@ impl TableBinding {
             columns,
             nullability,
             predicates: Vec::new(),
+            holds_folded_instant: false,
             uploaded_files,
         }
     }
@@ -226,6 +231,15 @@ impl BoundTable for TableBinding {
             identity: self.table.id().to_string(),
             version: self.table.version(),
         }
+    }
+
+    /// A plan that pruned by a resolved `now()` cannot be replayed. The instant
+    /// belongs to the statement that planned it, and the file set this binding
+    /// resolves is fixed against it, so a later statement reusing the plan would
+    /// prune against a `now()` that has since moved on — dropping files its own
+    /// `Filter` would have kept.
+    fn is_plan_cacheable(&self) -> bool {
+        !self.holds_folded_instant
     }
 
     fn supports_late_materialization(&self) -> bool {
@@ -327,7 +341,11 @@ impl BoundTable for TableBinding {
     }
 
     fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {
-        let TableFilter::Expression(expr) = filter else {
+        let TableFilter::Expression {
+            expression: expr,
+            holds_folded_instant,
+        } = filter
+        else {
             return Ok(false);
         };
         let Expression::Compare(compare) = expr.as_ref() else {
@@ -348,6 +366,11 @@ impl BoundTable for TableBinding {
         // equality/dictionary pruning) happens in `compile`, once the row-group
         // metadata exists. The upstream `Filter` is kept (we return `Ok(false)`),
         // so this is purely an optimization and never affects correctness.
+        //
+        // A predicate carrying a resolved `now()` fixes this binding to the
+        // instant the statement was planned at, which is what makes the plan
+        // unusable by a later one (see `is_plan_cacheable`).
+        self.holds_folded_instant |= holds_folded_instant;
         self.predicates.push(PushedPredicate {
             column_idx,
             path,

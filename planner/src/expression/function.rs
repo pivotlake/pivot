@@ -36,12 +36,14 @@ pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
             return_type: Type::Int64,
             volatile: true,
         }),
-        // `now()`: current wall-clock time. VOLATILE so DuckDB can't fold the
-        // call into its own `TIMESTAMP WITH TIME ZONE` constant; pivot evaluates
-        // it instead, returning the plain microsecond `TIMESTAMP` the rest of
-        // its time path counts in. (The bare `CURRENT_TIMESTAMP` keyword is a separate
-        // DuckDB value-function that yields a TZ type pivot doesn't model, so
-        // only the `now()` call form is intercepted here.)
+        // `now()`: current wall-clock time, as the plain microsecond `TIMESTAMP`
+        // the rest of pivot's time path counts in. VOLATILE like every stub
+        // below: DuckDB's constant folding would otherwise evaluate the stub and
+        // fold the call to NULL. Pivot evaluates the call itself, and resolves
+        // it into a constant for filter pushdown (see `fold_instant_bounds`).
+        // (The bare `CURRENT_TIMESTAMP` keyword is a separate DuckDB
+        // value-function that yields a TZ type pivot doesn't model, so only the
+        // `now()` call form is intercepted here.)
         "now" => Some(ScalarFunctionSignature {
             arguments: vec![],
             return_type: Type::Timestamp,

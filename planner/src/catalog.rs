@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 
-use crate::expression::{CompareType, TableFilter};
+use crate::expression::{CompareType, TableFilter, fold_instant_bounds};
 use crate::operator::TableFunction;
 use crate::types::{Type, logical_from_type};
 use arrow_array::{ArrayRef, Scalar};
@@ -582,10 +582,15 @@ impl DuckDBTable for DuckDBTableAdapter {
         filter: Expr<'_>,
     ) -> duckdb_planner::catalog_provider::Result<bool> {
         // Translate the borrowed DuckDB filter expression into a Pivot one (the
-        // only filter shape the bridge pushes is a bound expression).
-        let filter = TableFilter::Expression(Box::new(crate::expression::Expression::from_handle(
-            filter,
-        )?));
+        // only filter shape the bridge pushes is a bound expression), resolving
+        // a `now()` bound into the instant it reports so the scan has a constant
+        // to prune its row groups by.
+        let expression = crate::expression::Expression::from_handle(filter)?;
+        let (expression, holds_folded_instant) = fold_instant_bounds(expression);
+        let filter = TableFilter::Expression {
+            expression: Box::new(expression),
+            holds_folded_instant,
+        };
         Ok(self.table.pushdown_filter(filter)?)
     }
 

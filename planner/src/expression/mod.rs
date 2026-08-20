@@ -24,6 +24,7 @@ mod divide;
 mod format_bytes;
 mod function;
 mod in_list;
+mod instant_bound;
 mod interval;
 mod is_null;
 mod length;
@@ -58,6 +59,7 @@ pub use divide::Divide;
 pub use format_bytes::FormatBytes;
 pub use function::{Function, ScalarFunctionSignature, builtin_scalar_function};
 pub use in_list::InList;
+pub use instant_bound::fold_instant_bounds;
 pub use interval::IntervalArithmetic;
 pub use is_null::IsNull;
 pub use length::Length;
@@ -412,14 +414,25 @@ pub struct ConstantComparison {
 /// A filter that was pushed down into a table scan.
 #[derive(Debug)]
 pub enum TableFilter {
-    Expression(Box<Expression>),
+    Expression {
+        expression: Box<Expression>,
+        /// Whether a `now()` bound inside `expression` was resolved into a
+        /// constant on the way here (see
+        /// [`fold_instant_bounds`](fold_instant_bounds)). The instant belongs to
+        /// the statement doing the pushing, so a table that records this filter
+        /// must refuse plan caching
+        /// ([`is_plan_cacheable`](crate::catalog::BoundTable::is_plan_cacheable)):
+        /// a later statement replaying the plan would prune against an instant
+        /// that has since moved on.
+        holds_folded_instant: bool,
+    },
     ConstantComparison(ConstantComparison),
 }
 
 impl Display for TableFilter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TableFilter::Expression(e) => write!(f, "{e}"),
+            TableFilter::Expression { expression, .. } => write!(f, "{expression}"),
             TableFilter::ConstantComparison(c) => write!(
                 f,
                 "{} {} {}",
