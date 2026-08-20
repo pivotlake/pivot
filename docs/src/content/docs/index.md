@@ -143,6 +143,8 @@ drawing rather than behind one another.
 - [Quickstart](/docs/quickstart/) runs a server and issues a first query.
 - [Architecture](/docs/database/architecture/) explains how a query becomes
   work across the dispatch pool.
+- [Reference](/docs/reference/) states the SQL surface, the configuration keys,
+  and the interfaces exactly.
 
 ## Writing docs
 

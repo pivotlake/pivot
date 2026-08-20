@@ -9,4 +9,6 @@ sidebar:
 | --- | --- |
 | Rows per `COPY` batch | 131,072 |
 | Buffer pool | share of system memory, configurable |
-| Supported column types | integer, floating point, text, timestamp, variant |
+| `DECIMAL` precision | 38, of which up to 18 rides a 64-bit column |
+| Open datastore directory | one pivotdb process at a time |
+| Supported column types | see [Data types](/docs/reference/data-types/) |
