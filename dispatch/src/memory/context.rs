@@ -35,6 +35,20 @@ pub fn has_memory_context() -> bool {
     MEMORY_CTX_PTR.with(|p| !p.get().is_null())
 }
 
+/// When the ring's pages are faulted in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RingInit {
+    /// Every worker writes to each of its slots at startup, so the whole ring is
+    /// resident and node-local before the first query runs. Costs a startup pause
+    /// and the ring's full footprint in resident memory. What a long-lived server
+    /// wants: it pays once and never faults on the query path.
+    Prefault,
+    /// Slots go into the free pools untouched and fault in as they are used, so
+    /// startup is immediate and only the memory a workload actually needs becomes
+    /// resident. Placement then follows whichever worker writes to a slot first.
+    OnDemand,
+}
+
 pub struct MemoryContextFactory {
     ring: Arc<Ring>,
     compressed_cache: Arc<CompressedCache>,
@@ -131,23 +145,36 @@ pub struct MemoryContext {
 }
 
 impl MemoryContext {
-    pub fn prefault_buffers(&self) {
-        // Fault in the slots this worker is home to, so under first-touch their
-        // pages land on this worker's (already pinned) core's NUMA node. Homes
-        // partition each node's region across that node's workers, so every
-        // slot is faulted exactly once, by a worker on its own node.
-        // We forget the WriteBuffer to avoid the Drop impl pushing to the dirty pool,
-        // then manually release the slot and push to the zeroed pool.
+    /// Hand the slots this worker is home to over to its free pool, faulting
+    /// their pages in now or leaving that to first use, per `ring_init`.
+    ///
+    /// Homes partition each node's region across that node's workers, so every
+    /// slot is claimed exactly once, by a worker on its own node.
+    pub fn claim_buffers(&self, ring_init: RingInit) {
         let worker = WORKER_IDX.get();
         for i in self.layout.node_slots(self.node) {
             if self.layout.home_worker(i) != worker {
                 continue;
             }
-            let mut write = memory_ctx().ring().try_write(i).unwrap();
-            for j in (0..BUFFER_SIZE).step_by(4096) {
-                write.as_mut()[j] = 1u8;
+            match ring_init {
+                // Touch every page of the slot, so under first-touch it lands on
+                // this worker's (already pinned) core's NUMA node.
+                // We forget the WriteBuffer to avoid the Drop impl pushing to the
+                // dirty pool, then manually release the slot and push to the
+                // zeroed pool.
+                RingInit::Prefault => {
+                    let mut write = memory_ctx().ring().try_write(i).unwrap();
+                    for j in (0..BUFFER_SIZE).step_by(4096) {
+                        write.as_mut()[j] = 1u8;
+                    }
+                    write.zero_out();
+                }
+                // A fresh anonymous mapping already reads as zero and every slot
+                // starts out unused, so the slot is pool-ready untouched: its
+                // pages fault in the first time something writes to it, on
+                // whichever node that writer runs.
+                RingInit::OnDemand => self.push_free_idx(i, true),
             }
-            write.zero_out();
         }
     }
 

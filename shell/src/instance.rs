@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
 use datastore_delta::DeltaDatastore;
-use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
+use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch, RingInit};
 use metastore::{Metastore, UserAuth};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
@@ -107,7 +107,16 @@ impl ShellInstance {
         workers: usize,
         buffers: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let dispatch = DispatchOwner::new(Dispatch::spin_up(workers, buffers, None));
+        // Unlike a server, a shell is opened interactively and often for a single
+        // query, so it faults ring pages in as they are used: the prompt appears
+        // immediately and an instance sized at half of memory only ever occupies
+        // what its queries touch.
+        let dispatch = DispatchOwner::new(Dispatch::spin_up_with_ring_init(
+            workers,
+            buffers,
+            None,
+            RingInit::OnDemand,
+        ));
         let datastore = DeltaDatastore::open(location, dispatch.dispatcher())?;
         let metastore: Arc<dyn Metastore> = Arc::new(EphemeralMetastore);
         let catalog = Arc::new(PivotCatalog::new(

@@ -99,7 +99,7 @@ pub use io::{
 pub use memory::BUFFER_SIZE;
 pub use memory::ReadBuffer;
 pub use memory::{MemoryBlockState, MemoryBlockStatus, block_size_bytes};
-pub use memory::{MemoryContextFactory, init_memory_context, memory_ctx};
+pub use memory::{MemoryContextFactory, RingInit, init_memory_context, memory_ctx};
 pub use numa::{Topology, default_worker_count, dominant_node};
 pub use operations::channels::{MpscSender, Sender};
 pub use operations::nullary::Result as NullaryResult;
@@ -336,15 +336,31 @@ impl Dispatch {
     /// every allocation is node-local while cached data stays visible pool-wide (see
     /// [`memory::RingLayout`]). Every dataflow runs on all workers. `disk_cache` is the
     /// optional disk cache for remote reads, shared by every worker's requester (`None`
-    /// disables it). Blocks until every worker has finished pre-faulting.
+    /// disables it). Every worker pre-faults its share of the ring, and this blocks
+    /// until they all have; see [`spin_up_with_ring_init`](Self::spin_up_with_ring_init)
+    /// to fault the ring in lazily instead.
     pub fn spin_up(
         worker_count: usize,
         buffers: usize,
         disk_cache: Option<Arc<crate::io::DiskCache>>,
     ) -> Self {
+        Self::spin_up_with_ring_init(worker_count, buffers, disk_cache, RingInit::Prefault)
+    }
+
+    /// [`spin_up`](Self::spin_up), with a say in when the ring's pages are faulted
+    /// in. [`RingInit::OnDemand`] trades the node-local placement and fault-free
+    /// query path of pre-faulting for an immediate startup and a resident footprint
+    /// that tracks what the workload actually touches, which is what a short-lived
+    /// embedded instance wants.
+    pub fn spin_up_with_ring_init(
+        worker_count: usize,
+        buffers: usize,
+        disk_cache: Option<Arc<crate::io::DiskCache>>,
+        ring_init: RingInit,
+    ) -> Self {
         let cores = core_affinity::get_core_ids().unwrap();
         let groups = numa::balance_worker_groups(numa::group_cores_by_node(cores), worker_count);
-        Self::spin_up_groups(groups, buffers, disk_cache)
+        Self::spin_up_groups(groups, buffers, disk_cache, ring_init)
     }
 
     /// Spawn one worker group per entry in `core_groups` (every group must be the
@@ -355,6 +371,7 @@ impl Dispatch {
         core_groups: Vec<Vec<CoreId>>,
         buffers: usize,
         disk_cache: Option<Arc<crate::io::DiskCache>>,
+        ring_init: RingInit,
     ) -> Self {
         // A CPU missing an extension this binary was compiled for faults with
         // SIGILL inside whichever vectorised loop reaches the instruction first,
@@ -417,6 +434,7 @@ impl Dispatch {
                     barrier.clone(),
                     node_wakers[node].clone(),
                     waker_set.clone(),
+                    ring_init,
                 ));
             }
         }
@@ -490,7 +508,8 @@ mod tests {
 
     #[test]
     fn a_dataflow_spans_every_node_group() {
-        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None);
+        let dispatch =
+            Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None, RingInit::Prefault);
 
         let nodes = dispatch
             .dispatcher()
@@ -507,7 +526,8 @@ mod tests {
 
     #[test]
     fn all_node_groups_share_one_ring() {
-        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None);
+        let dispatch =
+            Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None, RingInit::Prefault);
 
         let rings = dispatch
             .dispatcher()
@@ -519,7 +539,8 @@ mod tests {
 
     #[test]
     fn workers_carry_dense_global_indices() {
-        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None);
+        let dispatch =
+            Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None, RingInit::Prefault);
 
         let mut indices = dispatch
             .dispatcher()
@@ -532,7 +553,8 @@ mod tests {
 
     #[test]
     fn single_worker_hosts_rotate_across_dispatcher_clones() {
-        let dispatch = Dispatch::spin_up_groups(synthetic_groups(1, 3), 16, None);
+        let dispatch =
+            Dispatch::spin_up_groups(synthetic_groups(1, 3), 16, None, RingInit::Prefault);
         let first_handle = dispatch.dispatcher().clone();
         let second_handle = first_handle.clone();
 
@@ -553,7 +575,8 @@ mod tests {
 
         // Enough ring slots per node region for the group-by's arenas, slab
         // tables, and merge targets.
-        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 256, None);
+        let dispatch =
+            Dispatch::spin_up_groups(synthetic_groups(2, 2), 256, None, RingInit::Prefault);
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
         // Every key appears once per batch, so each of the 8 batches contributes
         // to every group and the per-node aggregated tables must merge across
@@ -601,7 +624,8 @@ mod tests {
 
     #[test]
     fn channel_input_streams_items_fed_while_the_flow_runs() {
-        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None);
+        let dispatch =
+            Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None, RingInit::Prefault);
         let claimed = Arc::new((Mutex::new(()), std::sync::Condvar::new()));
         let on_claim = {
             let claimed = claimed.clone();
@@ -641,7 +665,8 @@ mod tests {
 
     #[test]
     fn run_on_workers_reaches_every_worker() {
-        let dispatch = Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None);
+        let dispatch =
+            Dispatch::spin_up_groups(synthetic_groups(2, 2), 16, None, RingInit::Prefault);
         let seen = Arc::new(Mutex::new(HashSet::new()));
 
         let collector = seen.clone();

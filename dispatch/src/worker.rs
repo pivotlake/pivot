@@ -26,7 +26,7 @@ use crate::Identifier;
 use crate::api::DataFlowBuilder;
 use crate::data_flow::{DataFlow, WorkStatus};
 use crate::io::{Completion, DiskCache, IORequester};
-use crate::memory::{MemoryContextFactory, init_memory_context, memory_ctx};
+use crate::memory::{MemoryContextFactory, RingInit, init_memory_context, memory_ctx};
 use crate::operations::FinishStatus;
 use crate::waker::{WakerSet, WorkerWaker, init_waker_set, init_worker_waker};
 use core_affinity::CoreId;
@@ -180,6 +180,7 @@ impl Worker {
         ready_barrier: Arc<Barrier>,
         waker: Arc<WorkerWaker>,
         waker_set: WakerSet,
+        ring_init: RingInit,
     ) -> JoinHandle<()> {
         thread::spawn(move || {
             // Worker startup (io_uring + memory-context setup) can fail. Every worker
@@ -191,9 +192,9 @@ impl Worker {
                 NUM_WORKERS.set(num_workers);
                 NODE_IDX.set(node);
                 // Pin to this worker's core BEFORE touching any memory, so everything
-                // this worker first-faults - its node-local ring (via `prefault_buffers`),
+                // this worker first-faults - its node-local ring (via `claim_buffers`),
                 // free pools, and io_uring buffers - lands on this core's NUMA node. Pages
-                // are placed where first written under the default policy, so prefaulting
+                // are placed where first written under the default policy, so faulting
                 // before pinning would scatter the ring across nodes and defeat the
                 // per-node split.
                 core_affinity::set_for_current(core);
@@ -233,8 +234,8 @@ impl Worker {
                     .register_ring_waker(node_local_idx, worker.io.wake_handle());
                 debug!("Initializing memory context for worker {:?}", idx);
                 init_memory_context(memory_context_factory.create_memory_ctx());
-                debug!("Pre-faulting for worker {:?}", idx);
-                memory_ctx().prefault_buffers();
+                debug!("Claiming buffers ({ring_init:?}) for worker {idx:?}");
+                memory_ctx().claim_buffers(ring_init);
                 worker
             }));
             debug!("Waiting for barrier for worker {:?}", idx);
