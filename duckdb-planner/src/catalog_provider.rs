@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use crate::duckdb_bridge::ffi;
 use crate::duckdb_bridge::ffi::CatalogGetScalarFunctionResult;
-use crate::duckdb_bridge::ffi::CatalogGetTableFunctionResult;
 use crate::duckdb_bridge::ffi::CatalogGetTableResult;
 use crate::duckdb_bridge::ffi::DuckDBColumn;
 use crate::handle::Expr;
@@ -71,16 +70,6 @@ pub struct OptionalTableWrapper {
     pub table: Option<Box<dyn DuckDBTable>>,
 }
 
-/// A table-valued function the catalog provides, described for DuckDB's binder:
-/// its argument types and full output columns, both as DuckDB logical type id
-/// discriminants. This is all the bridge needs to register and type-check the
-/// function, so the schema is defined once (in the provider) rather than also in
-/// the C++ bridge.
-pub struct TableFunctionDef {
-    pub arg_type_ids: Vec<u8>,
-    pub columns: Vec<DuckDBColumn>,
-}
-
 pub use crate::duckdb_bridge::ffi::ScalarFunctionDef;
 
 pub trait DuckDBBind {
@@ -92,10 +81,10 @@ pub trait DuckDBBind {
     }
 }
 
-/// One planning transaction's binder: resolves table and table-function names
-/// against the snapshot the transaction was opened on, so everything a single
-/// plan binds comes from one consistent view of the catalog. Only names that
-/// are static registry (scalar functions) still resolve through [`DuckDBBind`].
+/// One planning transaction's binder: resolves table names against the snapshot
+/// the transaction was opened on, so everything a single plan binds comes from
+/// one consistent view of the catalog. Only names that are static registry
+/// (scalar functions) resolve through [`DuckDBBind`] instead.
 pub trait DuckDBTransaction: Send + Sync {
     /// Whether datastore `datastore` defines a schema named `schema`. The bridge
     /// asks this when the binder looks a schema up, before any table inside it is
@@ -111,15 +100,6 @@ pub trait DuckDBTransaction: Send + Sync {
     /// several datastores routes by it.
     fn bind_table(&self, datastore: &str, schema: &str, name: &str)
     -> Option<Box<dyn DuckDBTable>>;
-
-    /// Given a function name in datastore `datastore`, return its binding
-    /// signature, or `None` if that datastore has no such table function. The
-    /// bridge registers it on demand during binding; functions it doesn't know
-    /// (e.g. DuckDB built-ins like `generate_series`) return `None` and resolve
-    /// elsewhere. Default: none.
-    fn bind_table_function(&self, _datastore: &str, _name: &str) -> Option<TableFunctionDef> {
-        None
-    }
 }
 
 /// Wraps an `Arc<dyn DuckDBBind>` for the C++ bridge.
@@ -212,25 +192,6 @@ pub(crate) fn catalog_get_table(
             found: false,
             columns: Vec::new(),
             table: Box::new(OptionalTableWrapper { table: None }),
-        },
-    }
-}
-
-pub(crate) fn catalog_get_table_function(
-    transaction: &TransactionContext,
-    datastore: &str,
-    name: &str,
-) -> CatalogGetTableFunctionResult {
-    match transaction.transaction.bind_table_function(datastore, name) {
-        Some(def) => CatalogGetTableFunctionResult {
-            found: true,
-            arg_type_ids: def.arg_type_ids,
-            columns: def.columns,
-        },
-        None => CatalogGetTableFunctionResult {
-            found: false,
-            arg_type_ids: Vec::new(),
-            columns: Vec::new(),
         },
     }
 }

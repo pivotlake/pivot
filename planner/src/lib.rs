@@ -150,7 +150,6 @@ use std::sync::Arc;
 
 pub use operator::{
     Compact, CopyFormat, CopyFromStdin, CreateUser, Operator, SetVariable, TableFunction,
-    TableFunctionSignature,
 };
 pub use plan::{Plan, PlanNode};
 use thiserror::Error;

@@ -6,13 +6,10 @@
 
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
-#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/column_definition.hpp"
-#include "duckdb/catalog/catalog_entry/table_function_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_function_catalog_entry.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
-#include "duckdb/function/table_function.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/exception.hpp"
@@ -44,25 +41,6 @@ LogicalType logical_type_from_column(const DuckDBColumn &col) {
 	return logical_type_from(col.duckdb_logical_type_id);
 }
 
-// Carries a table function's output schema from the lookup (where Rust supplied
-// it) through to its bind. pivot only plans, never executes, so the bind just
-// republishes that schema and the bind data is a trivial placeholder.
-struct PivotTableFunctionInfo : public TableFunctionInfo {
-	vector<string> names;
-	vector<LogicalType> return_types;
-};
-
-struct PivotTableFunctionBindData : public TableFunctionData {};
-
-unique_ptr<FunctionData> pivot_table_function_bind(ClientContext &, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types,
-                                                   vector<string> &names) {
-	auto &info = input.info->Cast<PivotTableFunctionInfo>();
-	names = info.names;
-	return_types = info.return_types;
-	return make_uniq<PivotTableFunctionBindData>();
-}
-
 // Body of a pivot scalar function stub. It never runs: pivot re-plans the call
 // into its own expression, and the only pivot scalar (drop_cache) is VOLATILE so
 // the optimizer can't fold it. Emits a constant NULL so DuckDB has a valid,
@@ -80,12 +58,12 @@ PivotSchemaCatalogEntry::PivotSchemaCatalogEntry(Catalog &catalog, CreateSchemaI
 
 // The pivot transaction of the plan currently being extracted, published on
 // the storage info by `extract_plan` for the duration of that one call
-// (planning is single-threaded per context). Table and table-function lookups
-// resolve through it, so everything one plan binds comes from the same catalog
-// snapshot (never from the live catalog, which a background refresh may be
-// updating concurrently). A lookup without one is a bridge bug, never a
-// legitimate binder probe: the only statements run outside `extract_plan` are
-// the ATTACHes at context construction, which bind no pivot entries.
+// (planning is single-threaded per context). Table lookups resolve through it,
+// so everything one plan binds comes from the same catalog snapshot (never from
+// the live catalog, which a background refresh may be updating concurrently). A
+// lookup without one is a bridge bug, never a legitimate binder probe: the only
+// statements run outside `extract_plan` are the ATTACHes at context
+// construction, which bind no pivot entries.
 static const ::TransactionContext &pivot_transaction_ctx(duckdb::Catalog &catalog) {
 	auto &storage_info = PivotStorageInfo::Get(catalog.GetAttached().GetDatabase());
 	if (!storage_info.current_transaction) {
@@ -99,42 +77,9 @@ optional_ptr<CatalogEntry> PivotSchemaCatalogEntry::LookupEntry(CatalogTransacti
 	auto &table_name = lookup_info.GetEntryName();
 	auto &pivot_catalog = ParentCatalog().Cast<PivotCatalog>();
 
-	// A table-function reference (e.g. `metadata('t')`): resolve it against the
-	// transaction's snapshot, since such a function reads catalog data. Unknown
-	// names (DuckDB built-ins like generate_series) return nullptr, so the
-	// binder falls through to the system catalog. The function's schema comes
-	// entirely from Rust; nothing about it is declared in this bridge.
-	if (lookup_info.GetCatalogType() == CatalogType::TABLE_FUNCTION_ENTRY) {
-		auto function = catalog_get_table_function(
-		    pivot_transaction_ctx(ParentCatalog()), ParentCatalog().GetName(), table_name);
-		if (!function.found) {
-			return nullptr;
-		}
-
-		auto info = make_shared_ptr<PivotTableFunctionInfo>();
-		vector<LogicalType> arguments;
-		for (auto type_id : function.arg_type_ids) {
-			arguments.emplace_back(logical_type_from(type_id));
-		}
-		for (const auto &col : function.columns) {
-			info->names.emplace_back(std::string(col.name));
-			info->return_types.emplace_back(logical_type_from_column(col));
-		}
-
-		TableFunction func(std::string(table_name), std::move(arguments), nullptr,
-		                   pivot_table_function_bind);
-		func.function_info = info;
-
-		CreateTableFunctionInfo create_info(func);
-		auto entry =
-		    make_uniq<TableFunctionCatalogEntry>(ParentCatalog(), *this, create_info);
-		auto &db_instance = ParentCatalog().GetAttached().GetDatabase();
-		return PivotStorageInfo::Get(db_instance).AddFunctionEntry(std::move(entry));
-	}
-
-	// A scalar-function reference (e.g. `drop_cache()`): same idea as table
-	// functions. Unknown names (DuckDB's own built-ins like `+`/`length`) return
-	// nullptr and resolve against the system catalog.
+	// A scalar-function reference (e.g. `drop_cache()`): resolve it against the
+	// provider's own functions. Unknown names (DuckDB's own built-ins like
+	// `+`/`length`) return nullptr and resolve against the system catalog.
 	if (lookup_info.GetCatalogType() == CatalogType::SCALAR_FUNCTION_ENTRY) {
 		auto function = catalog_get_scalar_function(*pivot_catalog.catalog_ctx, table_name);
 		if (!function.found) {

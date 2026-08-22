@@ -5,10 +5,8 @@
 //! [`SERIES_CHUNK_ROWS`] batch each time it is polled, so a huge range never
 //! materializes at once and a downstream `LIMIT`/aggregate stops it early.
 
-use super::{TableFunction, TableFunctionSignature, invalid_argument};
-use crate::catalog::Column;
+use super::{TableFunction, invalid_argument};
 use crate::compile::Error;
-use crate::types::Type;
 use arrow_array::{ArrayRef, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dispatch::{
@@ -48,19 +46,6 @@ impl SeriesTableFunction {
 impl TableFunction for SeriesTableFunction {
     fn name(&self) -> &str {
         self.name
-    }
-
-    fn signature(&self) -> TableFunctionSignature {
-        // Only consulted for catalog-resolved functions; `range`/`generate_series`
-        // are DuckDB built-ins, so the bridge never binds them through this. The
-        // single output column is named after the function, matching `compile`.
-        TableFunctionSignature {
-            arguments: vec![Type::Int64],
-            columns: vec![Column {
-                name: self.name.to_string(),
-                col_type: Type::Int64,
-            }],
-        }
     }
 
     fn compile(

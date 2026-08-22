@@ -15,13 +15,6 @@ PivotTableCatalogEntry *PivotStorageInfo::AddTableEntry(unique_ptr<PivotTableCat
 	return ptr;
 }
 
-TableFunctionCatalogEntry *PivotStorageInfo::AddFunctionEntry(
-    unique_ptr<TableFunctionCatalogEntry> entry) {
-	auto *ptr = entry.get();
-	function_entries.push_back(std::move(entry));
-	return ptr;
-}
-
 ScalarFunctionCatalogEntry *PivotStorageInfo::AddScalarFunctionEntry(
     unique_ptr<ScalarFunctionCatalogEntry> entry) {
 	auto *ptr = entry.get();
@@ -31,6 +24,5 @@ ScalarFunctionCatalogEntry *PivotStorageInfo::AddScalarFunctionEntry(
 
 void PivotStorageInfo::ClearTableEntries() {
 	table_entries.clear();
-	function_entries.clear();
 	scalar_function_entries.clear();
 }

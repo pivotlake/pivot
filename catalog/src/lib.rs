@@ -23,7 +23,6 @@ use datastore::DatastoreTransaction;
 use datastore_system::{DatastoreEntry, SystemTransaction};
 use dispatch::{DataFlowDispatcher, OneShotNullaryFactory, RecordBatchOperatorSpec};
 use metastore::Metastore;
-use planner::TableFunction;
 use planner::catalog::{
     BoundTable, CatalogTransaction, CreateSchemaRequest, CreateTableRequest, CreateUserRequest,
     DropTableRequest, Error as CatalogError, Result as CatalogResult, SchemaCreation,
@@ -145,9 +144,8 @@ impl PivotCatalog {
 /// first time the query touches that datastore (reusing it thereafter), so an
 /// ordinary query that reads one datastore never snapshots the others. Global
 /// virtual catalog relations deliberately request every datastore transaction.
-/// The `bind_table` / `bind_table_function` resolutions route by name (the path
-/// DuckDB's per-database binding takes); the unqualified
-/// `bind_default_table_function` and `create_table` fall to the default
+/// The `bind_table` resolution routes by name (the path DuckDB's per-database
+/// binding takes); the unqualified `create_table` falls to the default
 /// datastore. Each resolved table binding is self-contained: it captures its
 /// datastore's snapshot at bind time, so the composite needs no downcast back
 /// to a per-datastore transaction at compile.
@@ -259,16 +257,6 @@ impl CatalogTransaction for PivotTransaction {
     fn table_revision(&self, reference: &TableReference) -> Option<TableRevision> {
         let sub_transaction = self.find_or_create_sub_transaction(&reference.datastore)?;
         sub_transaction.table_revision(&reference.schema_qualified_name())
-    }
-
-    fn bind_table_function(&self, datastore: &str, name: &str) -> Option<Box<dyn TableFunction>> {
-        self.find_or_create_sub_transaction(datastore)?
-            .bind_table_function(name)
-    }
-
-    fn bind_default_table_function(&self, name: &str) -> Option<Box<dyn TableFunction>> {
-        self.find_or_create_sub_transaction(&self.default_name)?
-            .bind_table_function(name)
     }
 
     async fn compact(

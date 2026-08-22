@@ -17,14 +17,13 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 
 use crate::expression::{CompareType, TableFilter};
-use crate::operator::TableFunction;
 use crate::types::{Type, logical_from_type};
 use arrow_array::{ArrayRef, Scalar};
 use dispatch::{DataFlowDispatcher, DynamicFilterSlot, Projection, RecordBatchOperatorSpec};
 use duckdb_planner::DuckDBColumn;
 use duckdb_planner::Expr;
 use duckdb_planner::catalog_provider::{
-    DuckDBBind, DuckDBTable, DuckDBTransaction, ScalarFunctionDef, TableFunctionDef,
+    DuckDBBind, DuckDBTable, DuckDBTransaction, ScalarFunctionDef,
 };
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -254,20 +253,6 @@ pub trait CatalogTransaction: Debug + Send + Sync {
     /// snapshot of its datastore, or `None` if no such table exists. This must
     /// return `Some` for every table returned by [`bind_table`](Self::bind_table).
     fn table_revision(&self, reference: &TableReference) -> Option<TableRevision>;
-
-    /// A backend-specific table-valued function `name` in datastore `datastore`,
-    /// or `None`. Table functions belong to the datastore rather than to one of
-    /// its schemas: they are code the backend contributes, not stored objects, so
-    /// every schema of that datastore resolves the same set.
-    fn bind_table_function(&self, _datastore: &str, _name: &str) -> Option<Box<dyn TableFunction>> {
-        None
-    }
-
-    /// A backend table function by bare `name`, resolved against the default
-    /// datastore.
-    fn bind_default_table_function(&self, _name: &str) -> Option<Box<dyn TableFunction>> {
-        None
-    }
 
     /// Compact a table from this transaction's frozen catalog view.
     async fn compact(
@@ -597,14 +582,13 @@ impl DuckDBTable for DuckDBTableAdapter {
 /// The DuckDB [`DuckDBBind`] provider: resolves the static
 /// (transaction-independent) names during SQL binding, today only the planner's
 /// built-in scalar functions, which are generic across datastores. It holds no
-/// catalog: tables and table functions resolve through a per-query
-/// [`DuckDBTransactionAdapter`] instead, since both are answered from the
-/// transaction's snapshot.
+/// catalog: tables resolve through a per-query [`DuckDBTransactionAdapter`]
+/// instead, since they are answered from the transaction's snapshot.
 pub struct DuckDBScalarFunctionBinder;
 
 /// Adapts a Pivot [`CatalogTransaction`] to DuckDB's [`DuckDBTransaction`]
-/// trait: table and table-function lookups during one plan's binding resolve
-/// against this transaction's snapshot.
+/// trait: table lookups during one plan's binding resolve against this
+/// transaction's snapshot.
 pub struct DuckDBTransactionAdapter {
     pub transaction: Arc<dyn CatalogTransaction>,
 }
@@ -627,23 +611,6 @@ impl DuckDBTransaction for DuckDBTransactionAdapter {
         };
         let table = self.transaction.bind_table(&reference)?;
         Some(Box::new(DuckDBTableAdapter { table }))
-    }
-
-    fn bind_table_function(&self, datastore: &str, name: &str) -> Option<TableFunctionDef> {
-        // The function's own signature is the single source of truth; convert its
-        // Pivot types to DuckDB logical type ids for the binder.
-        let signature = self
-            .transaction
-            .bind_table_function(datastore, name)?
-            .signature();
-        Some(TableFunctionDef {
-            arg_type_ids: signature
-                .arguments
-                .iter()
-                .map(|arg_type| logical_from_type(arg_type).id as u8)
-                .collect(),
-            columns: duckdb_columns(&signature.columns),
-        })
     }
 }
 

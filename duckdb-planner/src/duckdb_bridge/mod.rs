@@ -11,7 +11,7 @@ pub mod duckdb_types;
 use crate::catalog_provider::{
     CatalogContext, OptionalTableWrapper, TransactionContext, catalog_context_default,
     catalog_context_names, catalog_does_schema_exist, catalog_get_scalar_function,
-    catalog_get_table, catalog_get_table_function, pushdown_filter, table_estimate_row_count,
+    catalog_get_table, pushdown_filter, table_estimate_row_count,
     table_supports_late_materialization,
 };
 
@@ -64,15 +64,6 @@ pub mod ffi {
         pub columns: Vec<DuckDBColumn>,
         /// Opaque handle to the Rust `DuckDBTable` object that was looked up.
         pub table: Box<OptionalTableWrapper>,
-    }
-
-    /// Result of a catalog table-function lookup: the function's argument types
-    /// and full output columns (DuckDB logical type id discriminants), or
-    /// `found = false` if the provider has no such function.
-    struct CatalogGetTableFunctionResult {
-        pub found: bool,
-        pub arg_type_ids: Vec<u8>,
-        pub columns: Vec<DuckDBColumn>,
     }
 
     /// A scalar function the provider defines, described for DuckDB's binder:
@@ -133,20 +124,15 @@ pub mod ffi {
             datastore: &str,
             schema: &str,
         ) -> bool;
-        /// BoundTable / table-function lookups are routed by `datastore` (the datastore
-        /// / database name) to that datastore's snapshot in the transaction; a table
-        /// is then resolved within `schema` of that datastore.
+        /// BoundTable lookups are routed by `datastore` (the datastore / database
+        /// name) to that datastore's snapshot in the transaction; the table is then
+        /// resolved within `schema` of that datastore.
         fn catalog_get_table(
             transaction: &TransactionContext,
             datastore: &str,
             schema: &str,
             name: &str,
         ) -> CatalogGetTableResult;
-        fn catalog_get_table_function(
-            transaction: &TransactionContext,
-            datastore: &str,
-            name: &str,
-        ) -> CatalogGetTableFunctionResult;
         fn catalog_get_scalar_function(
             ctx: &CatalogContext,
             name: &str,
@@ -178,8 +164,8 @@ pub mod ffi {
 
         fn new_context(catalog: Box<CatalogContext>) -> Result<UniquePtr<DuckPlannerContext>>;
         /// Plan `query` with `transaction` published for its duration: every
-        /// table and table-function lookup during binding resolves through it
-        /// (see `PivotSchemaCatalogEntry::LookupEntry`). The reference only
+        /// table lookup during binding resolves through it (see
+        /// `PivotSchemaCatalogEntry::LookupEntry`). The reference only
         /// needs to outlive this call; the C++ side clears its pointer before
         /// returning.
         fn extract_plan(
