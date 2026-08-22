@@ -70,7 +70,6 @@ export default defineConfig({
           label: "Database",
           items: [{ autogenerate: { directory: "database" } }],
         },
-        { label: "Roadmap", slug: "roadmap" },
       ],
       pagination: true,
       lastUpdated: true,
