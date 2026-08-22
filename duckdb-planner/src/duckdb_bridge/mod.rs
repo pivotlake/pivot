@@ -107,6 +107,9 @@ pub mod ffi {
         /// in select order (e.g. `["hour", "count_star()"]`). Empty when the
         /// bridge could not recover them.
         pub output_names: Vec<String>,
+        /// DuckDB found query-dependent state (such as its native `now()`)
+        /// whose optimized value requires a fresh plan for another execution.
+        pub requires_rebind: bool,
     }
 
     extern "Rust" {

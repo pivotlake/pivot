@@ -898,6 +898,7 @@ mod tests {
                 }),
             },
             output_names: Vec::new(),
+            requires_rebind: false,
         })
     }
 
@@ -957,6 +958,7 @@ mod tests {
                 }),
             },
             output_names: Vec::new(),
+            requires_rebind: false,
         });
         let cache = PlanCache::new(2);
         cache.insert("SELECT * FROM analytics.events".to_string(), cached);

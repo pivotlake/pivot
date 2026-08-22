@@ -40,6 +40,11 @@ impl Display for Cast {
 }
 
 impl Cast {
+    /// The expression being converted.
+    pub fn source(&self) -> &Expression {
+        &self.source
+    }
+
     pub fn compile(&self) -> Result<ExprFn, compile::Error> {
         // Casting text to a variant parses each document as JSON.
         if self.target == Type::Variant {

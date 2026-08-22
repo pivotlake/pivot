@@ -36,19 +36,6 @@ pub fn builtin_scalar_function(name: &str) -> Option<ScalarFunctionSignature> {
             return_type: Type::Int64,
             volatile: true,
         }),
-        // `now()` and the bare `CURRENT_TIMESTAMP` keyword (which DuckDB's
-        // binder resolves to `get_current_timestamp`, aliased
-        // `transaction_timestamp`): the current wall-clock time as a
-        // `TIMESTAMP WITH TIME ZONE`, Postgres's type for it. VOLATILE so
-        // DuckDB can't fold the call into a plan-time constant; pivot captures
-        // the instant when it compiles the statement instead.
-        "now" | "get_current_timestamp" | "transaction_timestamp" => {
-            Some(ScalarFunctionSignature {
-                arguments: vec![],
-                return_type: Type::TimestampTz,
-                volatile: true,
-            })
-        }
         // Not a DuckDB built-in (unlike `regexp_replace`), so its signature is
         // registered here for DuckDB's binder.
         "regexp_jit_replace" => Some(ScalarFunctionSignature {
@@ -105,9 +92,9 @@ pub enum Function {
     /// form its fields must take before they compare. DuckDB's binder wraps
     /// every interval it orders, compares or hashes in this.
     NormalizedInterval(NormalizedInterval),
-    /// `now()` yields the wall-clock time captured once when the query
-    /// compiles, so every row of the statement sees the same instant. Result is
-    /// a `TIMESTAMP` (epoch microseconds).
+    /// A current-time function left in an unoptimized DuckDB plan. Normally
+    /// DuckDB folds it to one TIMESTAMPTZ constant during optimization; this is
+    /// the execution fallback when optimization is disabled.
     Now(Now),
     /// A variant (JSON) path read: `doc->'key'` chains, optionally typed by a
     /// fused `CAST`.

@@ -12,8 +12,8 @@ use arrow_array::{
     ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array, RecordBatch, Scalar, StringArray,
     StringViewArray, TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow_schema::{DataType, Field, Schema};
-use dispatch::{DataFlowDispatcher, Dispatch};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
+use dispatch::{DataFlowDispatcher, Dispatch, Projection};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tempfile::TempDir;
@@ -23,6 +23,7 @@ use common::{commit_datastore_transaction, current_parquet};
 use datastore::{Datastore, DatastoreTransaction};
 use datastore_delta::store::ObjectPath;
 use datastore_delta::{ColumnStatFilter, DeltaDatastore, PartitionEqFilter, TableBinding};
+use planner::PlanNode;
 use planner::Planner;
 use planner::catalog::{
     BoundTable, CatalogTransaction, Column, CreateTableRequest, Result as CatalogResult,
@@ -31,6 +32,7 @@ use planner::catalog::{
 use planner::expression::{
     Compare, CompareType, Expression, Function, Ref, TableFilter, VariantGet,
 };
+use planner::operator::{Input, Operator};
 use planner::types::Type;
 
 /// A shared single-worker dispatch pool for the whole test binary, handed to
@@ -226,6 +228,13 @@ fn row_group_count(datastore: &DeltaDatastore, name: &str, table: &TableBinding)
         .pruned_parquet(&current_parquet(datastore, name))
         .row_groups()
         .len()
+}
+
+fn first_input(node: &PlanNode) -> Option<&Input> {
+    if let Operator::Input(input) = &node.operator {
+        return Some(input);
+    }
+    node.inputs.iter().find_map(first_input)
 }
 
 #[test]
@@ -534,6 +543,68 @@ fn pushdown_filter_prunes_row_group_with_only_excluded_value() {
 
     // Row group whose single value is 20 has min == max == 20 and is pruned.
     assert_eq!(row_group_count(&datastore, "t", &table), 2);
+}
+
+/// DuckDB binds a comparison between a zone-less TIMESTAMP column and a
+/// TIMESTAMPTZ constant as `CAST(column AS TIMESTAMPTZ) > constant`. The
+/// planner connection is UTC, so the binding can peel that identity cast and
+/// prune against the column's native timestamp statistics.
+#[test]
+fn timestamp_cast_pushdown_prunes_native_timestamp_row_groups() {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "occurred",
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(TimestampMicrosecondArray::from(vec![
+            0_i64,
+            60_000_000,
+            120_000_000,
+        ])) as ArrayRef],
+    )
+    .unwrap();
+    let dir = write_one_row_per_group(&[batch]);
+    let (_database, datastore) = empty_datastore();
+    create_table(
+        &datastore,
+        create_request(
+            "events",
+            dir.path(),
+            vec![Column {
+                name: "occurred".to_string(),
+                col_type: Type::Timestamp,
+            }],
+        ),
+    )
+    .unwrap();
+
+    let catalog = single_catalog(&datastore);
+    let transaction = catalog.begin_transaction();
+    let mut planner = Planner::from_datastore_names(
+        vec![DEFAULT_DATASTORE_NAME.to_string()],
+        DEFAULT_DATASTORE_NAME.to_string(),
+    )
+    .unwrap();
+    let plan = planner
+        .plan(
+            "SELECT occurred FROM events \
+             WHERE occurred > TIMESTAMPTZ '1970-01-01 00:01:30+00'",
+            transaction,
+        )
+        .unwrap();
+    let input = first_input(&plan.root).expect("query has a table scan");
+
+    // Compile the scan by itself, before the plan's runtime Filter. Only the
+    // 120-second row group should survive statistics pruning.
+    let batches = input
+        .table
+        .compile_scan(&dispatcher(), Projection::all(0), Vec::new(), false)
+        .unwrap()
+        .collect()
+        .unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
 }
 
 /// Each bind hands out a fresh clone, so pushdown applied to one binding

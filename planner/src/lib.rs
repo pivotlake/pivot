@@ -241,9 +241,11 @@ impl Planner {
         root.annotate_group_limit();
         // Let filters under a LIMIT or Top-N deliver rows as they are selected.
         root.annotate_filter_delivery();
+        let requires_rebind = planned.requires_rebind();
         Ok(Plan {
             root,
             output_names: planned.into_output_names(),
+            requires_rebind,
         })
     }
 }
