@@ -1,0 +1,140 @@
+name: Deploy Web
+
+# Puts the docs at pivotlake.io/docs and install.sh at pivotlake.io.
+#
+# Not the binaries. Deploy Server puts those in the release bucket, and
+# install.sh looks up the newest version there when it runs, so a release does
+# not need the site redeployed.
+#
+# Repository variables:
+#   PIVOT_SITE_SSH_HOST  where to publish, e.g. deploy@pivotlake-prod
+#   PIVOT_SITE_DOCROOT   what nginx serves, e.g. /var/www/pivotlake.io
+#   PIVOT_SITE_BASE_URL  optional, defaults to https://pivotlake.io
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_docs:
+        description: "Build the documentation site and publish it to /docs."
+        type: boolean
+        default: true
+      deploy_install_script:
+        description: "Publish install.sh, which is what `curl https://pivotlake.io | sh` runs."
+        type: boolean
+        default: true
+
+concurrency:
+  group: deploy-web
+  cancel-in-progress: false
+
+jobs:
+  # Resume the GCP VM so its runners come online before the deploy dispatches.
+  start-ci:
+    name: Start GCP runner
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/resume-gcp-runner
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+  deploy-web:
+    name: Deploy the site
+    needs: [start-ci]
+    runs-on: gcp-builder
+    env:
+      SSH_HOST: ${{ vars.PIVOT_SITE_SSH_HOST }}
+      DOCROOT: ${{ vars.PIVOT_SITE_DOCROOT }}
+      SITE_URL: ${{ vars.PIVOT_SITE_BASE_URL || 'https://pivotlake.io' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Checked before anything is built or uploaded, including the runner's own
+      # SSH identity, which is ambient rather than configured here: proving it
+      # opens a session now beats discovering it does not mid-deploy.
+      - name: Check the deploy configuration
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.deploy_docs }}" != "true" ] && [ "${{ inputs.deploy_install_script }}" != "true" ]; then
+            echo "::error::Nothing selected to deploy."
+            exit 1
+          fi
+
+          missing=
+          [ -n "$SSH_HOST" ] || missing="$missing\n  PIVOT_SITE_SSH_HOST (variable): user@host to publish to, e.g. deploy@pivotlake-prod"
+          [ -n "$DOCROOT" ] || missing="$missing\n  PIVOT_SITE_DOCROOT (variable): the directory nginx serves, e.g. /var/www/pivotlake.io"
+          if [ -n "$missing" ]; then
+            printf "::error::Deploying the site is not configured yet. Set:%b\n" "$missing"
+            exit 1
+          fi
+
+          command -v rsync >/dev/null 2>&1 ||
+            { echo "::error::rsync is not installed on this runner."; exit 1; }
+
+          ssh -o BatchMode=yes "$SSH_HOST" true ||
+            { echo "::error::This runner cannot open an SSH session to $SSH_HOST. Its ~/.ssh needs a key the site accepts and a known_hosts entry for it."; exit 1; }
+
+      - uses: actions/setup-node@v4
+        if: ${{ inputs.deploy_docs }}
+        with:
+          node-version: "22"
+
+      - name: Build the documentation
+        if: ${{ inputs.deploy_docs }}
+        run: |
+          set -euo pipefail
+          npm --prefix docs ci
+          npm --prefix docs run build
+          [ -f docs/dist/index.html ] ||
+            { echo "::error::The docs build produced no docs/dist/index.html."; exit 1; }
+          du -sh docs/dist
+
+      # `--delete` so a page removed from the repo stops being served. It is
+      # scoped to the docs directory, which holds nothing but this build output.
+      - name: Publish the documentation
+        if: ${{ inputs.deploy_docs }}
+        run: |
+          set -euo pipefail
+          rsync --recursive --links --compress --delete --chmod=D755,F644 \
+            docs/dist/ "$SSH_HOST:$DOCROOT/docs/"
+
+      # Last, so a failed docs deploy does not leave a new script advertising
+      # documentation that was never published.
+      - name: Publish install.sh
+        if: ${{ inputs.deploy_install_script }}
+        run: |
+          set -euo pipefail
+          rsync --compress --chmod=F644 \
+            packaging/install/install.sh "$SSH_HOST:$DOCROOT/install.sh"
+
+      # What the site actually serves, reached the way a person reaches it. If
+      # this fails while the rsyncs above succeeded, the files are on the box
+      # and something between the internet and nginx is in the way.
+      - name: Verify what the site serves
+        run: |
+          set -euo pipefail
+          fail_hint="The uploads succeeded, so the files are on the box. Check that $SITE_URL resolves to it, that 80/443 are open, and that nginx is serving."
+
+          if [ "${{ inputs.deploy_install_script }}" = "true" ]; then
+            # The root path has to hand curl the script itself, which is the one
+            # thing only nginx's configuration can get right.
+            curl --fail --silent --show-error --location "$SITE_URL" > served-install.sh ||
+              { echo "::error::$SITE_URL did not respond. $fail_hint"; exit 1; }
+            cmp --silent packaging/install/install.sh served-install.sh ||
+              { echo "::error::$SITE_URL does not serve install.sh to curl. The site's root path has to hand the script to a curl User-Agent."; exit 1; }
+            echo "$SITE_URL serves install.sh to curl."
+          fi
+
+          if [ "${{ inputs.deploy_docs }}" = "true" ]; then
+            status=$(curl --silent --show-error --location --output served-docs.html \
+              --write-out '%{http_code}' "$SITE_URL/docs/") || true
+            [ "$status" = "200" ] ||
+              { echo "::error::$SITE_URL/docs/ returned $status. $fail_hint"; exit 1; }
+            grep -qi '<html' served-docs.html ||
+              { echo "::error::$SITE_URL/docs/ did not return an HTML page."; exit 1; }
+            echo "$SITE_URL/docs/ serves the documentation."
+          fi
+
+  # NOTE: no stop job. ci-runner-x86 runs an hourly suspend-if-unused cron that
+  # only takes the box down when no run is active, so it cannot be suspended out
+  # from under a concurrent one.
