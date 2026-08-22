@@ -52,6 +52,15 @@ fn table_free_query_is_cacheable(mut testing_planner: TestingPlanner) {
 }
 
 #[rstest]
+fn query_with_now_is_not_cacheable(mut testing_planner: TestingPlanner) {
+    let plan = testing_planner
+        .plan("SELECT now() - interval '4 minutes'")
+        .unwrap();
+
+    assert!(!plan.is_cacheable());
+}
+
+#[rstest]
 fn mutating_session_and_table_function_plans_are_not_cacheable(
     mut testing_planner: TestingPlanner,
 ) {

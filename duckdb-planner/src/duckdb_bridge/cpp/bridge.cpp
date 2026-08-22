@@ -209,7 +209,7 @@ PlanHandle::~PlanHandle() {
 // captured without patching the bundled DuckDB.
 static duckdb::unique_ptr<duckdb::LogicalOperator>
 extract_plan_with_names(duckdb::Connection &con, const std::string &query,
-                        duckdb::vector<std::string> &result_names) {
+                        duckdb::vector<std::string> &result_names, bool &requires_rebind) {
 	auto statements = con.ExtractStatements(query);
 	if (statements.size() != 1) {
 		throw duckdb::InvalidInputException("ExtractPlan can only prepare a single statement");
@@ -222,6 +222,7 @@ extract_plan_with_names(duckdb::Connection &con, const std::string &query,
 		// The binder resolves the client-facing result column names before
 		// optimization rewrites the plan; capture them while still intact.
 		result_names = planner.names;
+		requires_rebind = planner.properties.always_require_rebind;
 		plan = std::move(planner.plan);
 		if (context.config.enable_optimizer) {
 			duckdb::Optimizer optimizer(*planner.binder, context);
@@ -255,6 +256,7 @@ ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
                                const TransactionContext &transaction) {
 	duckdb::unique_ptr<duckdb::LogicalOperator> plan;
 	duckdb::vector<std::string> name_list;
+	bool requires_rebind = false;
 	std::optional<ExtractPlanResult> error;
 	CurrentTransactionScope transaction_scope(PivotStorageInfo::Get(*ctx.db.instance), transaction);
 
@@ -262,7 +264,7 @@ ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
 		std::string query_str(query.data(), query.size());
 		// The result column names DuckDB would hand a client, in select order
 		// (e.g. `["hour", "count_star()"]` for `SELECT f(t) AS hour, COUNT(*)`).
-		plan = extract_plan_with_names(ctx.con, query_str, name_list);
+		plan = extract_plan_with_names(ctx.con, query_str, name_list, requires_rebind);
 		// Rewrite DuckDB's column *bindings* (table_index, column_index) into
 		// positional BoundReference indices against each operator's actual child
 		// output. This is the standard resolution DuckDB runs before execution;
@@ -291,6 +293,7 @@ ExtractPlanResult extract_plan(DuckPlannerContext &ctx, rust::Str query,
 	handle->root = std::move(plan);
 	handle->ctx = &ctx;
 	result.plan = std::move(handle);
+	result.requires_rebind = requires_rebind;
 	for (auto &name : name_list) {
 		result.output_names.push_back(rust::String::lossy(name));
 	}

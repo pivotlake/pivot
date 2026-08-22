@@ -182,8 +182,11 @@ impl PlannerContext {
         }
 
         let ffi::ExtractPlanResult {
-            plan, output_names, ..
+            plan,
+            output_names,
+            requires_rebind,
+            ..
         } = result;
-        Ok(Plan::new(plan, output_names))
+        Ok(Plan::new(plan, output_names, requires_rebind))
     }
 }

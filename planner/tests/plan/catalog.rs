@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use insta::assert_snapshot;
 use planner::catalog::{BoundTable, CatalogTransaction, Column, TableReference, TableRevision};
-use planner::expression::TableFilter;
+use planner::expression::{Expression, TableFilter};
 use planner::types::Type;
 use planner::{DEFAULT_DATASTORE_NAME, DEFAULT_SCHEMA_NAME, Planner};
 
@@ -123,6 +123,13 @@ fn two_int_cols() -> Vec<Column> {
     ]
 }
 
+fn timestamp_col(col_type: Type) -> Vec<Column> {
+    vec![Column {
+        name: "ts".to_string(),
+        col_type,
+    }]
+}
+
 fn build_planner(table: RecordingTable) -> (Planner, Arc<SingleTableCatalog>) {
     let catalog = Arc::new(SingleTableCatalog {
         name: "t".to_string(),
@@ -222,6 +229,88 @@ fn pushdown_accepted_drops_filter_operator() {
     Projection(a:Int32)
       Input([a:Int32])
     ");
+}
+
+/// DuckDB's query-stable `now()` is folded to one TIMESTAMPTZ constant, so
+/// the resulting bare-column comparison reaches the table's pushdown hook.
+/// The same DuckDB property that permits that fold also prevents plan reuse.
+#[test]
+fn now_filter_is_pushed_down_and_plan_is_not_cacheable() {
+    let table = RecordingTable::new(timestamp_col(Type::TimestampTz), false);
+    let (mut planner, catalog) = build_planner(table.clone());
+
+    let plan = plan_sql(
+        &mut planner,
+        &catalog,
+        "SELECT ts FROM t WHERE ts > now() - interval '4 minutes'",
+    )
+    .unwrap();
+
+    let received = table.received.lock().unwrap();
+    assert_eq!(received.len(), 1);
+    let TableFilter::Expression(filter) = &received[0] else {
+        panic!("expected an expression filter, got {}", received[0]);
+    };
+    let Expression::Compare(compare) = filter.as_ref() else {
+        panic!("expected a comparison, got {filter}");
+    };
+    assert!(
+        matches!(compare.left.as_ref(), Expression::Ref(_)),
+        "{filter}"
+    );
+    assert!(
+        matches!(compare.right.as_ref(), Expression::Constant(_)),
+        "{filter}"
+    );
+    drop(received);
+
+    assert!(!plan.is_cacheable());
+    let rendered = plan.to_string();
+    assert!(rendered.contains("Filter(ts:TimestampTz >"), "{rendered}");
+    assert!(rendered.contains("Input([ts:TimestampTz])"), "{rendered}");
+}
+
+/// DuckDB pushes the casted comparison for a zone-less column too. The Delta
+/// binding can peel this exact cast because the planner session is fixed to
+/// UTC, where TIMESTAMP-to-TIMESTAMPTZ preserves the epoch-microsecond value.
+#[test]
+fn now_filter_on_timestamp_without_time_zone_is_pushed_down() {
+    let table = RecordingTable::new(timestamp_col(Type::Timestamp), false);
+    let (mut planner, catalog) = build_planner(table.clone());
+
+    let plan = plan_sql(
+        &mut planner,
+        &catalog,
+        "SELECT ts FROM t WHERE ts > now() - interval '4 minutes'",
+    )
+    .unwrap();
+
+    let received = table.received.lock().unwrap();
+    assert_eq!(received.len(), 1);
+    let TableFilter::Expression(filter) = &received[0] else {
+        panic!("expected an expression filter, got {}", received[0]);
+    };
+    let Expression::Compare(compare) = filter.as_ref() else {
+        panic!("expected a comparison, got {filter}");
+    };
+    let Expression::Cast(cast) = compare.left.as_ref() else {
+        panic!("expected DuckDB's timestamp cast, got {filter}");
+    };
+    assert_eq!(cast.target, Type::TimestampTz);
+    assert!(matches!(cast.source(), Expression::Ref(_)), "{filter}");
+    assert!(
+        matches!(compare.right.as_ref(), Expression::Constant(_)),
+        "{filter}"
+    );
+    drop(received);
+
+    assert!(!plan.is_cacheable());
+    let rendered = plan.to_string();
+    assert!(
+        rendered.contains("Filter(cast(ts:Timestamp as TimestampTz) >"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("Input([ts:Timestamp])"), "{rendered}");
 }
 
 /// Queries without a `WHERE` clause never invoke `pushdown_filter`.

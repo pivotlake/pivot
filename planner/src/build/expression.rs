@@ -386,8 +386,9 @@ impl Function {
                 function_args(func, 0)?;
                 Ok(Function::DropCache)
             }
-            // `CURRENT_TIMESTAMP` binds to `get_current_timestamp`; all the
-            // spellings are pivot's compile-time clock capture.
+            // `CURRENT_TIMESTAMP` binds to `get_current_timestamp`. DuckDB
+            // normally folds all three spellings to a constant; keep this
+            // mapping as the fallback for plans built with optimization off.
             "now" | "get_current_timestamp" | "transaction_timestamp" => {
                 function_args(func, 0)?;
                 Ok(Function::Now(Now))

@@ -333,11 +333,14 @@ pub struct Plan {
     /// schema. Empty when unavailable, in which case the operators' own field
     /// names stand.
     pub output_names: Vec<String>,
+    /// DuckDB embedded query-dependent state while optimizing this statement,
+    /// so a later execution must plan it again.
+    pub requires_rebind: bool,
 }
 
 impl Plan {
     pub fn is_cacheable(&self) -> bool {
-        self.root.is_cacheable()
+        !self.requires_rebind && self.root.is_cacheable()
     }
 
     pub fn has_matching_table_revisions(&self, transaction: &dyn CatalogTransaction) -> bool {

@@ -13,7 +13,8 @@ use crate::parquet::{
     ParquetTable, ScanEqualityPredicate, materialize, row_group_eliminated, row_group_filter_from,
     scan_order_from, table_input_with_filter_and_eq_predicates,
 };
-use arrow_array::{Array, ArrayRef, Scalar};
+use arrow_array::{Array, ArrayRef, Scalar, TimestampMicrosecondArray};
+use arrow_schema::{DataType, TimeUnit};
 use crossbeam_deque::Injector;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use planner::catalog::{
@@ -21,7 +22,7 @@ use planner::catalog::{
     TableReference, TableRevision,
 };
 use planner::expression::{CompareType, Expression, Function, JsonPath, TableFilter};
-use planner::types::physical_arrow_type;
+use planner::types::{Type, UTC_TIMEZONE, physical_arrow_type};
 
 use super::CatalogTable;
 use super::insert_sink::{UploadedFile, build_insert_spec};
@@ -85,23 +86,50 @@ impl PushedPredicate {
 ///
 /// Plain columns use an empty path. Typed variant reads use the corresponding
 /// shredded leaf. Untyped variant reads cannot be compared and are ignored.
-fn get_prunable_column_and_json_path(
-    expr: &Expression,
-) -> Option<(usize, JsonPath, Option<arrow_schema::DataType>)> {
+struct PrunableColumn {
+    column_idx: usize,
+    path: JsonPath,
+    as_type: Option<DataType>,
+}
+
+fn get_prunable_column_and_json_path(expr: &Expression) -> Option<PrunableColumn> {
     match expr {
-        Expression::Ref(r) => Some((r.column_idx, Vec::new(), None)),
+        Expression::Ref(r) => Some(PrunableColumn {
+            column_idx: r.column_idx,
+            path: Vec::new(),
+            as_type: None,
+        }),
         Expression::Function(Function::VariantGet(read)) if read.as_type.is_some() => {
             match read.input.as_ref() {
-                Expression::Ref(r) => Some((
-                    r.column_idx,
-                    read.path.clone(),
-                    read.as_type.as_ref().map(physical_arrow_type),
-                )),
+                Expression::Ref(r) => Some(PrunableColumn {
+                    column_idx: r.column_idx,
+                    path: read.path.clone(),
+                    as_type: read.as_type.as_ref().map(physical_arrow_type),
+                }),
                 _ => None,
             }
         }
         _ => None,
     }
+}
+
+/// Remove the UTC timezone annotation from a one-value TIMESTAMPTZ constant
+/// without touching its value buffer. This mirrors DuckDB's UTC
+/// TIMESTAMP-to-TIMESTAMPTZ cast in the other direction for statistics only.
+fn as_timestamp_constant(value: &Scalar<ArrayRef>) -> Option<Scalar<ArrayRef>> {
+    let array = value.clone().into_inner();
+    let DataType::Timestamp(TimeUnit::Microsecond, Some(timezone)) = array.data_type() else {
+        return None;
+    };
+    if timezone.as_ref() != UTC_TIMEZONE {
+        return None;
+    }
+    let timestamp = array
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()?
+        .clone()
+        .with_timezone_opt(None::<Arc<str>>);
+    Some(Scalar::new(Arc::new(timestamp) as ArrayRef))
 }
 
 /// A catalog table resolved from one transaction: it captures the snapshot's own
@@ -333,27 +361,48 @@ impl BoundTable for TableBinding {
         let Expression::Compare(compare) = expr.as_ref() else {
             return Ok(false);
         };
-        let ((column_idx, path, as_type), constant) =
-            match (compare.left.as_ref(), compare.right.as_ref()) {
-                (column, Expression::Constant(k)) | (Expression::Constant(k), column) => {
-                    let Some(prunable) = get_prunable_column_and_json_path(column) else {
-                        return Ok(false);
-                    };
-                    (prunable, k)
-                }
-                _ => return Ok(false),
-            };
+        let (column_expr, constant) = match (compare.left.as_ref(), compare.right.as_ref()) {
+            (column, Expression::Constant(k)) | (Expression::Constant(k), column) => (column, k),
+            _ => return Ok(false),
+        };
+
+        // DuckDB casts a TIMESTAMP column to TIMESTAMPTZ for a mixed-type
+        // comparison. In UTC, the cast preserves the microsecond value, so retag the
+        // TIMESTAMPTZ constant as TIMESTAMP for statistics pruning.
+        let (column, value) = match column_expr {
+            Expression::Cast(cast)
+                if cast.target == Type::TimestampTz
+                    && matches!(
+                        cast.source(),
+                        Expression::Ref(r) if r.return_type == Type::Timestamp
+                    ) =>
+            {
+                let Some(column) = get_prunable_column_and_json_path(cast.source()) else {
+                    return Ok(false);
+                };
+                let Some(value) = as_timestamp_constant(constant) else {
+                    return Ok(false);
+                };
+                (column, value)
+            }
+            column => {
+                let Some(column) = get_prunable_column_and_json_path(column) else {
+                    return Ok(false);
+                };
+                (column, constant.clone())
+            }
+        };
 
         // Just record it. The actual pruning (min/max row-group elimination and
         // equality/dictionary pruning) happens in `compile`, once the row-group
         // metadata exists. The upstream `Filter` is kept (we return `Ok(false)`),
         // so this is purely an optimization and never affects correctness.
         self.predicates.push(PushedPredicate {
-            column_idx,
-            path,
-            as_type,
+            column_idx: column.column_idx,
+            path: column.path,
+            as_type: column.as_type,
             compare_type: compare.compare_type,
-            value: constant.clone(),
+            value,
         });
 
         Ok(false)

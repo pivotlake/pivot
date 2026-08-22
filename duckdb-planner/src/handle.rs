@@ -120,13 +120,19 @@ fn scalar_from_value(v: &ffi::Value) -> Result<ScalarValue> {
 pub struct Plan {
     handle: UniquePtr<ffi::PlanHandle>,
     output_names: Vec<String>,
+    requires_rebind: bool,
 }
 
 impl Plan {
-    pub(crate) fn new(handle: UniquePtr<ffi::PlanHandle>, output_names: Vec<String>) -> Self {
+    pub(crate) fn new(
+        handle: UniquePtr<ffi::PlanHandle>,
+        output_names: Vec<String>,
+        requires_rebind: bool,
+    ) -> Self {
         Self {
             handle,
             output_names,
+            requires_rebind,
         }
     }
 
@@ -142,6 +148,12 @@ impl Plan {
     /// them.
     pub fn output_names(&self) -> &[String] {
         &self.output_names
+    }
+
+    /// Whether DuckDB requires this statement to be rebound before a later
+    /// execution because optimization embedded query-dependent state.
+    pub fn requires_rebind(&self) -> bool {
+        self.requires_rebind
     }
 
     /// Consume the plan, returning the resolved output names.
