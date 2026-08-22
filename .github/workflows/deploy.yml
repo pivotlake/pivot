@@ -23,6 +23,18 @@ on:
         description: "Build the pivot server image and push it to Docker Hub (giladkl/pivot)."
         type: boolean
         default: true
+      publish_install:
+        description: "Publish the CLI binaries to the release bucket, so `curl https://pivotlake.io | sh` installs this build. Needs both architectures selected: a release missing one is refused."
+        type: boolean
+        default: true
+      release_candidate:
+        description: "Publish as a release candidate: the version carries an -rc<commit> suffix and `latest` is left where it is, so it installs only via PIVOT_VERSION and no one else is affected. Uncheck to cut the real release named in Cargo.toml."
+        type: boolean
+        default: true
+      override:
+        description: "Republish a version the download host already has. Off by default: a published version is meant to be immutable, and rewriting one changes what people have already installed."
+        type: boolean
+        default: false
 
 # Required secrets:
 #   GCP_SA_KEY  — JSON key for a service account with objectAdmin on the bucket.
@@ -35,6 +47,15 @@ on:
 # For the Docker Hub push (push_docker), the org-level DOCKERHUB_USERNAME /
 # DOCKERHUB_TOKEN secrets are used; that account must have push access to
 # giladkl/pivot.
+# publish_install puts the CLI binaries in a public bucket, reusing GCP_SA_KEY,
+# which needs objectAdmin on it. The install script and the docs are published
+# separately by the Deploy Web workflow; the script always resolves the newest
+# version from the bucket, so a release reaches users without the site changing.
+#   PIVOT_DOWNLOAD_BUCKET  (variable) public bucket for the downloads, e.g.
+#                                     gs://pivot-releases. NOT the private
+#                                     DEPLOY_GCS_BUCKET above.
+#   PIVOT_DOWNLOAD_URL     (variable) how that bucket is reached over HTTPS,
+#                                     e.g. https://storage.googleapis.com/pivot-releases
 
 env:
   CARGO_TERM_COLOR: always
@@ -182,6 +203,188 @@ jobs:
           name: pivot-deb-${{ matrix.deb_arch }}
           path: dist/pivot_*_${{ matrix.deb_arch }}.deb
           if-no-files-found: error
+
+      # Handed to publish-install below, which gzips it and uploads it to the
+      # download host. The very binary uploaded to GCS above, so what a user
+      # installs and what we keep for symbolizing a backtrace are one file.
+      - name: Upload the download binary
+        if: ${{ inputs.publish_install }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: pivot-binary-linux-${{ matrix.deb_arch }}
+          path: dist/pivot
+          if-no-files-found: error
+
+  # Publish the CLI download to the release bucket. Only the bucket: the
+  # install script and the docs are the Deploy Web workflow's job, and the
+  # script always resolves the newest version from the bucket, so publishing a
+  # release here reaches users without touching the site at all.
+  publish-install:
+    name: Publish the CLI download
+    needs: [deploy]
+    if: ${{ inputs.publish_install }}
+    runs-on: ubuntu-latest
+    env:
+      BUCKET: ${{ vars.PIVOT_DOWNLOAD_BUCKET }}
+      DOWNLOAD_URL: ${{ vars.PIVOT_DOWNLOAD_URL }}
+      PLATFORMS: linux-amd64 linux-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      # Checked before a single byte is uploaded, so a missing setting fails in
+      # the first ten seconds rather than halfway through publishing a release.
+      - name: Check the publish configuration
+        run: |
+          set -euo pipefail
+          missing=
+          [ -n "$BUCKET" ] || missing="$missing\n  PIVOT_DOWNLOAD_BUCKET (variable): public bucket for the downloads, e.g. gs://pivot-releases"
+          [ -n "$DOWNLOAD_URL" ] || missing="$missing\n  PIVOT_DOWNLOAD_URL (variable): how that bucket is reached over HTTPS, e.g. https://storage.googleapis.com/pivot-releases"
+          if [ -n "$missing" ]; then
+            printf "::error::Publishing is not configured yet. Set:%b\n" "$missing"
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pivot-binary-*
+          path: binaries
+
+      # A release candidate carries the commit so it cannot be confused with the
+      # real thing, and so successive candidates for one version coexist. The
+      # release itself is exactly what Cargo.toml names.
+      - name: Resolve the release version
+        id: release
+        run: |
+          set -euo pipefail
+          workspace_version=$(grep -m1 '^version = ' Cargo.toml | sed 's/^version = "\(.*\)"$/\1/')
+          case "$workspace_version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::Could not read the workspace version from Cargo.toml (got '$workspace_version')."; exit 1 ;;
+          esac
+          if [ "${{ inputs.release_candidate }}" = "true" ]; then
+            version=$workspace_version-rc$(git rev-parse --short=7 HEAD)
+            echo "Publishing Pivot $version, a candidate for $workspace_version"
+          else
+            version=$workspace_version
+            echo "Publishing Pivot $version"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # A published version is immutable: people have it installed, and its
+      # objects are served with a year-long cache lifetime, so rewriting one is
+      # not reliably visible to anyone who already fetched it.
+      - name: Refuse to republish an existing version
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gcloud storage ls "$BUCKET/v$VERSION/" >/dev/null 2>&1; then
+            if [ "${{ inputs.override }}" = "true" ]; then
+              echo "::warning::$VERSION is already published; override is on, so it will be rewritten."
+            else
+              echo "::error::$VERSION is already published at $BUCKET/v$VERSION. Bump the version in Cargo.toml, or re-run with override to rewrite it."
+              exit 1
+            fi
+          fi
+
+      # A release is published whole or not at all: an install script that finds
+      # latest_version.txt pointing at a set missing the caller's platform is
+      # broken for that caller, and nothing in the bucket would say so.
+      - name: Assemble the release tree
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          release_directory=release/v$VERSION
+          mkdir -p "$release_directory"
+          for platform in $PLATFORMS; do
+            binary=binaries/pivot-binary-$platform/pivot
+            [ -f "$binary" ] || {
+              echo "::error::No binary was built for $platform, so this release would be incomplete. Re-run with every architecture selected."
+              exit 1
+            }
+            gzip -9 --stdout "$binary" > "$release_directory/pivot-$platform.gz"
+          done
+          # Checksums are written from inside the release directory so each file
+          # names its sibling rather than a path off the build runner.
+          (cd "$release_directory" && for platform in $PLATFORMS; do
+            sha256sum "pivot-$platform.gz" > "pivot-$platform.gz.sha256"
+          done)
+          ls -l "$release_directory"
+
+      - name: Publish the release to the bucket
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          # A version directory never changes, so it can be cached forever. The
+          # objects are handed out as-is: a bucket that served them with
+          # Content-Encoding: gzip would decompress them in transit and the
+          # installer's checksum would not match.
+          gcloud storage cp --recursive \
+            --cache-control="public, max-age=31536000, immutable" \
+            "release/v$VERSION" "$BUCKET/"
+
+          # A candidate stops here. Its objects exist and are installable by
+          # name, but nothing points at them, so `curl | sh` still resolves the
+          # last real release.
+          if [ "${{ inputs.release_candidate }}" = "true" ]; then
+            echo "Published candidate $VERSION. Install it with:"
+            echo "    curl https://pivotlake.io | PIVOT_VERSION=$VERSION sh"
+            exit 0
+          fi
+
+          # latest_version.txt goes last, on its own: until it moves, the new
+          # release sits complete but unadvertised, and every installer still
+          # resolves the previous one. It must never be cached, or the release
+          # stays invisible for as long as the cache holds.
+          printf '%s\n' "$VERSION" > latest_version.txt
+          gcloud storage cp --cache-control="no-cache" \
+            latest_version.txt "$BUCKET/latest_version.txt"
+
+      # What the bucket actually serves, checked the way the installer reaches
+      # it: the bytes back off the network, then the script from this commit
+      # driven end to end against them.
+      - name: Verify what the bucket serves
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          for platform in $PLATFORMS; do
+            curl --fail --silent --show-error --location \
+              --output "served-pivot-$platform.gz" "$DOWNLOAD_URL/v$VERSION/pivot-$platform.gz"
+            served=$(sha256sum "served-pivot-$platform.gz" | cut -d' ' -f1)
+            published=$(cut -d' ' -f1 < "release/v$VERSION/pivot-$platform.gz.sha256")
+            [ "$served" = "$published" ] ||
+              { echo "::error::$DOWNLOAD_URL/v$VERSION/pivot-$platform.gz does not match what was published. Is the bucket serving it with Content-Encoding: gzip?"; exit 1; }
+          done
+
+          # A candidate is reachable only by name, so drive the installer at it
+          # the way a tester would. `latest` must still be whatever it was.
+          if [ "${{ inputs.release_candidate }}" = "true" ]; then
+            PIVOT_BASE_URL=$DOWNLOAD_URL PIVOT_VERSION=$VERSION sh packaging/install/install.sh
+            "$HOME/.pivot/cli/$VERSION/pivot" --version
+
+            advertised=$(curl --fail --silent --show-error --location "$DOWNLOAD_URL/latest_version.txt" | tr -d '[:space:]')
+            [ "$advertised" != "$VERSION" ] ||
+              { echo "::error::$DOWNLOAD_URL/latest_version.txt advertises the candidate $VERSION. A candidate must not become latest."; exit 1; }
+            echo "latest_version.txt still advertises $advertised, as it should."
+            exit 0
+          fi
+
+          served_version=$(curl --fail --silent --show-error --location "$DOWNLOAD_URL/latest_version.txt" | tr -d '[:space:]')
+          [ "$served_version" = "$VERSION" ] ||
+            { echo "::error::$DOWNLOAD_URL/latest_version.txt serves '$served_version', expected '$VERSION'."; exit 1; }
+
+          PIVOT_BASE_URL=$DOWNLOAD_URL sh packaging/install/install.sh
+          "$HOME/.pivot/cli/latest/pivot" --version
 
   # Build the pivot server image and push it to Docker Hub (giladkl/pivot),
   # tagged with both the commit SHA and `latest`. Independent of the binary
