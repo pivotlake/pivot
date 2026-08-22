@@ -170,15 +170,15 @@ pub(super) unsafe fn gather_fixed_width<T: Copy>(src: *const u8, dst: *mut u8, i
     const STEP: usize = 4;
     unsafe {
         let mut destination = 0;
-        let mut rows = indices.chunks_exact(STEP);
-        for step in &mut rows {
+        let (steps, remainder) = indices.as_chunks::<STEP>();
+        for step in steps {
             for (offset, &row) in step.iter().enumerate() {
                 dst.add(destination + offset)
                     .write_unaligned(src.add(row as usize).read_unaligned());
             }
             destination += STEP;
         }
-        for (offset, &row) in rows.remainder().iter().enumerate() {
+        for (offset, &row) in remainder.iter().enumerate() {
             dst.add(destination + offset)
                 .write_unaligned(src.add(row as usize).read_unaligned());
         }

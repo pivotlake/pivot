@@ -397,8 +397,8 @@ fn unpack_width<const W: usize, N: FromDelta>(
     let base = src.as_ptr();
     let mut running = last;
     let mut byte = 0usize;
-    let mut groups = out.chunks_exact_mut(8);
-    for group in &mut groups {
+    let (groups, remainder) = out.as_chunks_mut::<8>();
+    for group in groups {
         let mut deltas = [0u64; 8];
         for (k, delta) in deltas.iter_mut().enumerate() {
             let bit = k * W;
@@ -424,7 +424,7 @@ fn unpack_width<const W: usize, N: FromDelta>(
     // A miniblock holds a multiple of 32 values, so only a page's last one can
     // leave a partial group.
     let mut bit = byte * 8;
-    for slot in groups.into_remainder() {
+    for slot in remainder {
         // SAFETY: as above.
         let delta = unsafe { load_delta::<W>(base, bit >> 3, bit & 7, mask) };
         running = running.wrapping_add(min_delta).wrapping_add(delta as i64);

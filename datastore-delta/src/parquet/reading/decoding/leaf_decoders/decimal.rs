@@ -150,6 +150,9 @@ impl DecimalCarrier for Decimal128Type {
 /// Slow path: a value that straddles a buffer boundary falls back to a
 /// [`MultiBufferReader`] for that single value, then the fast path resumes.
 #[inline]
+// `as_chunks` wants the width as a const-generic argument, which an associated
+// const of a generic parameter cannot be.
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn read_decimals<T: DecimalCarrier, S: DecimalStorage, B: ElemPtr<T::Native>>(
     data: &[Bytes],
     position: &mut ReaderPosition,
@@ -257,6 +260,9 @@ impl<T: DecimalCarrier, S: DecimalStorage, B: Index<usize, Output = T::Native>> 
     /// dictionary, chunked like [`read_decimals`]: each buffer's whole values
     /// are decoded off its contiguous slice, and only a value straddling a
     /// buffer boundary goes through a reader.
+    // `as_chunks` wants the width as a const-generic argument, which an
+    // associated const of a generic parameter cannot be.
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     fn maybe_contains(data: &[Bytes], size: usize, needle: &T::Native) -> bool {
         let mut position = ReaderPosition::default();
         let mut remaining = size;
