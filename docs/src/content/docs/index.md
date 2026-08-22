@@ -143,8 +143,8 @@ drawing rather than behind one another.
 - [Quickstart](/docs/quickstart/) runs a server and issues a first query.
 - [Architecture](/docs/database/architecture/) explains how a query becomes
   work across the dispatch pool.
-- [SQL statements](/docs/reference/sql-statements/) lists the supported SQL
-  surface and its important constraints.
+- [Reference](/docs/reference/) lists supported SQL, functions, data types,
+  system tables, and configuration.
 
 ## Writing docs
 

@@ -19,10 +19,9 @@ statement. The table below is the SQL surface implemented by pivotdb today.
 | `DROP TABLE` | Remove a table from the catalog. | `DROP TABLE [IF EXISTS] [[datastore.]schema.]table`. `CASCADE` is not supported. Dropping a table does not immediately delete its data files. |
 | `EXPLAIN` | Show the physical plan without running it. | `EXPLAIN query`. `EXPLAIN ANALYZE` is not supported. |
 | `INSERT` | Append rows to a table. | `INSERT INTO table [(columns)] VALUES (...)` and `INSERT INTO table [(columns)] SELECT ...` are supported. `BY NAME` is supported for query inserts. Columns omitted from an explicit target list are filled with `NULL`; `DEFAULT VALUES` is not supported. |
-| `SELECT` | Read and transform rows. | Supports expressions, `WHERE`, CTEs, `DISTINCT`, grouping and aggregates, `HAVING`, `ORDER BY`, and `LIMIT`/`OFFSET`. Joins include inner and left equi-joins, semi and anti joins, and inner range joins. `generate_series` is available as a table function. |
+| `SELECT` | Read and transform rows. | Supports expressions, `WHERE`, CTEs, `DISTINCT`, grouping and aggregates, `HAVING`, `ORDER BY`, and `LIMIT`/`OFFSET`. Joins include inner and left equi-joins, semi and anti joins, and inner range joins. See [Functions](/docs/reference/functions/) for scalar, aggregate, and table functions. |
 | `SET` / `RESET` | Change a setting for the current connection. | `SET pivot_stats = true` includes execution statistics with query results. `RESET pivot_stats` turns them off. |
 | `VALUES` | Produce literal rows without reading a table. | `VALUES (expression, ...), ...`. It can be used as a query or as the input to `INSERT`. |
 
-SQL may parse successfully before pivotdb determines that a particular plan,
-type, expression, or statement variant is not implemented. Keep to the forms
-listed here when portability to pivotdb matters.
+See [Table options](/docs/reference/table-options/) for the three supported
+`CREATE TABLE ... WITH (...)` settings.
