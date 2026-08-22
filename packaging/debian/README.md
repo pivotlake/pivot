@@ -41,10 +41,6 @@ packaging/debian/test-package.sh dist/pivot_*.deb
 packaging/debian/test-install.sh dist/pivot_*.deb
 ```
 
-The CI build uses `packaging/debian/Dockerfile` on native amd64 and arm64
-runners. Its Debian Bullseye build environment targets glibc 2.31 and produces
-the `.deb` as a workflow artifact; it does not publish an apt repository.
-
 ## Release packages
 
 The Deploy Server workflow builds the released server with this same
