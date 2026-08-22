@@ -13,7 +13,6 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use planner::TableFunction;
 use planner::catalog::{
     BoundTable, CreateSchemaRequest, CreateTableRequest, DropTableRequest, Result, SchemaCreation,
     SchemaQualifiedTableName, TableCreation, TableDrop, TableRevision,
@@ -137,17 +136,6 @@ pub trait DatastoreTransaction: Debug + Send + Sync {
     /// Virtual catalog relations are not datastore objects and therefore are not
     /// included.
     fn tables(&self) -> Vec<DatastoreTableMetadata>;
-
-    /// A backend-specific table-valued function by `name`, or `None`. This is
-    /// how a backend contributes functions only it can answer (e.g. `metadata`,
-    /// which needs the backend's row-group metadata). It lives on the
-    /// transaction rather than the datastore because such a function reads data,
-    /// which it captures from this transaction's snapshot when resolved. The
-    /// generic functions (`generate_series`, `range`) are resolved by the
-    /// planner itself and never reach here. Default: none.
-    fn bind_table_function(&self, _name: &str) -> Option<Box<dyn TableFunction>> {
-        None
-    }
 
     /// Compact `table` from this transaction's frozen catalog view. Backends
     /// that support compaction use the exact table snapshot this transaction

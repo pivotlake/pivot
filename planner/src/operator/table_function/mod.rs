@@ -1,13 +1,10 @@
 //! [`TableFunctionScan`]: a scan over a table-valued function such as
-//! `generate_series(start, stop[, step])` or `metadata('table')`.
+//! `generate_series(start, stop[, step])`.
 //!
 //! This module holds the generic machinery: the [`TableFunction`] trait each
 //! function implements, the operator that looks one up and runs it, and the
-//! column projection shared by all of them. The concrete functions live
-//! elsewhere: the generic ones ([`series`]) here, backend-specific ones (e.g.
-//! `metadata`, which only a catalog that has row groups can answer) in the
-//! catalog, contributed through
-//! [`CatalogTransaction::bind_default_table_function`].
+//! column projection shared by all of them. Every function depends only on its
+//! arguments, so they all live here ([`series`]).
 //!
 //! A function produces its *full* output (every column it declares, in order)
 //! as a dataflow; the operator then projects that to the columns DuckDB asked
@@ -18,7 +15,6 @@
 
 mod series;
 
-use crate::catalog::{CatalogTransaction, Column};
 use crate::compile::Error;
 use crate::expression::Expression;
 use crate::types::Type;
@@ -29,15 +25,6 @@ use duckdb_planner::ScalarValue;
 use std::fmt;
 use std::sync::Arc;
 
-/// A table function's binding signature: its argument types and its full output
-/// column schema. This is the single source of truth the DuckDB bridge reads to
-/// register and type-check the function, so the schema lives only here (in Rust)
-/// and not also in the C++ bridge.
-pub struct TableFunctionSignature {
-    pub arguments: Vec<Type>,
-    pub columns: Vec<Column>,
-}
-
 /// One table-valued function: given its bound constant arguments, it builds the
 /// dataflow that emits its rows. Implementors emit their *full* declared output
 /// (every column, in declared order); [`TableFunctionScan`] projects it down to
@@ -46,15 +33,8 @@ pub trait TableFunction: Send + Sync {
     /// The SQL name this function is invoked as (e.g. `"generate_series"`).
     fn name(&self) -> &str;
 
-    /// The argument types and full output schema, used by the bridge to bind the
-    /// function in DuckDB. Must match what [`compile`](Self::compile) emits.
-    fn signature(&self) -> TableFunctionSignature;
-
-    /// Build the dataflow emitting this function's full output. A backend
-    /// function that reads catalog data (e.g. `metadata`) captured the snapshot
-    /// it needs when it was resolved, exactly as a self-contained
-    /// [`BoundTable`](crate::catalog::BoundTable) binding does; pure functions need
-    /// nothing beyond their arguments.
+    /// Build the dataflow emitting this function's full output, from nothing but
+    /// this function's arguments.
     fn compile(
         &self,
         args: &[ScalarValue],
@@ -62,24 +42,10 @@ pub trait TableFunction: Send + Sync {
     ) -> Result<RecordBatchOperatorSpec, Error>;
 }
 
-/// Resolve a table function by name. The transaction is consulted first, then
-/// the generic built-ins, matching the bind-side order (the bridge resolves a
-/// function against the transaction before falling back to DuckDB's system
-/// catalog). Keeping the two layers in the same order means a backend function
-/// and a built-in of the same name can never disagree between bind and compile.
-fn find_table_function(
-    name: &str,
-    transaction: &dyn CatalogTransaction,
-) -> Option<Box<dyn TableFunction>> {
-    transaction
-        .bind_default_table_function(name)
-        .or_else(|| builtin(name))
-}
-
-/// The generic built-in table functions, keyed by name. These depend only on
-/// their arguments (no catalog), so they live in the planner rather than being
-/// contributed by a backend.
-fn builtin(name: &str) -> Option<Box<dyn TableFunction>> {
+/// The built-in table functions, keyed by name. DuckDB binds the call against
+/// its own system catalog; this is where the plan finds the implementation that
+/// runs it.
+fn find_table_function(name: &str) -> Option<Box<dyn TableFunction>> {
     match name {
         "range" => Some(Box::new(series::SeriesTableFunction::range())),
         "generate_series" => Some(Box::new(series::SeriesTableFunction::generate_series())),
@@ -132,9 +98,8 @@ impl TableFunctionScan {
     pub(crate) fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
-        transaction: &dyn CatalogTransaction,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        let function = find_table_function(&self.function_name, transaction)
+        let function = find_table_function(&self.function_name)
             .ok_or_else(|| Error::UnsupportedTableFunction(self.function_name.clone()))?;
         let full = function.compile(&self.args, dispatcher)?;
         self.project(full)

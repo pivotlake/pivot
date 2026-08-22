@@ -231,7 +231,7 @@ extract_plan_with_names(duckdb::Connection &con, const std::string &query,
 }
 
 // Publishes the pivot transaction for the duration of one plan: every table
-// and table-function lookup during binding reads it off the storage info (see
+// lookup during binding reads it off the storage info (see
 // `PivotSchemaCatalogEntry::LookupEntry`) and the destructor clears it, so the
 // pointer never outlives the `extract_plan` call that owns the referent.
 struct CurrentTransactionScope {
