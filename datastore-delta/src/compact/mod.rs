@@ -902,11 +902,7 @@ mod tests {
         assert_eq!(final_sweeps, 2);
         let files = datastore.table_handle(&name).unwrap().file_refs();
         assert_eq!(files.len(), 2);
-        assert!(
-            files
-                .iter()
-                .any(|file| file.path.as_str().ends_with("c.parquet"))
-        );
+        assert!(files.iter().any(|file| file.path.name() == "c.parquet"));
         dispatch.exit();
     }
 
@@ -997,16 +993,13 @@ mod tests {
         let files = datastore.table_files(&name).unwrap();
         assert_eq!(files.len(), 2);
         assert!(
-            files
-                .iter()
-                .any(|file| file.path.as_str().ends_with("c.parquet")),
+            files.iter().any(|file| file.path.name() == "c.parquet"),
             "the disjoint file is not part of the chosen pair"
         );
         assert!(
             files
                 .iter()
-                .all(|file| !file.path.as_str().ends_with("a.parquet")
-                    && !file.path.as_str().ends_with("b.parquet"))
+                .all(|file| file.path.name() != "a.parquet" && file.path.name() != "b.parquet")
         );
 
         dispatch.exit();
