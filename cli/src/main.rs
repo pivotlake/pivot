@@ -54,7 +54,7 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     use super::{Args, PivotCommand};
 
@@ -82,12 +82,112 @@ mod tests {
     }
 
     #[test]
-    fn server_requires_a_config_file() {
+    fn server_accepts_config_or_direct_datastores() {
         assert!(Args::try_parse_from(["pivot", "server"]).is_err());
         assert!(Args::try_parse_from(["pivot", "server", "install"]).is_err());
 
         let args = Args::try_parse_from(["pivot", "server", "--config", "/etc/pivot/config.yaml"])
             .unwrap();
         assert!(matches!(args.command, PivotCommand::Server(_)));
+        let args = Args::try_parse_from([
+            "pivot",
+            "server",
+            "--config",
+            "/etc/pivot/config.yaml",
+            "--metastore-file",
+            "/var/lib/pivot/metastore.yaml",
+        ])
+        .unwrap();
+        assert!(matches!(args.command, PivotCommand::Server(_)));
+
+        for location in [
+            "/var/lib/pivot",
+            "file:///var/lib/pivot",
+            "s3://analytics/warm",
+            "gs://analytics/cold",
+        ] {
+            let args = Args::try_parse_from(["pivot", "server", "--datastore", location]).unwrap();
+            assert!(matches!(args.command, PivotCommand::Server(_)));
+        }
+
+        let args =
+            Args::try_parse_from(["pivot", "server", "--datastore", "hot=/var/lib/pivot/hot"])
+                .unwrap();
+        assert!(matches!(args.command, PivotCommand::Server(_)));
+        let args = Args::try_parse_from([
+            "pivot",
+            "server",
+            "--datastore",
+            "hot=/var/lib/pivot/hot",
+            "--datastore",
+            "warm=s3://analytics/warm",
+            "--default-datastore",
+            "hot",
+        ])
+        .unwrap();
+        assert!(matches!(args.command, PivotCommand::Server(_)));
+    }
+
+    #[test]
+    fn server_rejects_removed_or_mixed_datastore_options() {
+        assert!(Args::try_parse_from(["pivot", "server", "--datastore-type", "s3"]).is_err());
+        assert!(
+            Args::try_parse_from(["pivot", "server", "--datastore-address", "bucket/prefix"])
+                .is_err()
+        );
+        assert!(
+            Args::try_parse_from([
+                "pivot",
+                "server",
+                "--config",
+                "pivot.yaml",
+                "--datastore",
+                "s3://bucket/prefix",
+            ])
+            .is_err()
+        );
+        assert!(
+            Args::try_parse_from([
+                "pivot",
+                "server",
+                "--datastore",
+                "hot=/tmp/hot",
+                "--metastore-file",
+                "metastore.yaml",
+            ])
+            .is_err()
+        );
+        assert!(Args::try_parse_from(["pivot", "server", "--default-datastore", "hot",]).is_err());
+        assert!(
+            Args::try_parse_from(["pivot", "server", "--datastore", "https://example.com/db"])
+                .is_err()
+        );
+        assert!(
+            Args::try_parse_from(["pivot", "server", "--datastore", "system=/tmp/system",])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn server_help_describes_all_startup_forms_and_direct_s3_credentials() {
+        let mut command = Args::command();
+        let server = command.find_subcommand_mut("server").unwrap();
+        let help = server.render_long_help().to_string();
+
+        for text in [
+            "--config <FILE>",
+            "--datastore <[NAME=]LOCATION>",
+            "--default-datastore <NAME>",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            assert!(help.contains(text), "server help omitted {text:?}:\n{help}");
+        }
+        for text in ["--datastore-type", "--datastore-address"] {
+            assert!(
+                !help.contains(text),
+                "server help retained {text:?}:\n{help}"
+            );
+        }
     }
 }

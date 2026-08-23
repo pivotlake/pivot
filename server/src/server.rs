@@ -58,6 +58,10 @@ pub enum Error {
         #[source]
         source: metastore::Error,
     },
+    #[error("failed to open the directly configured datastores: {0}")]
+    OpenDirectDatastores(metastore::Error),
+    #[error("invalid direct datastore options: {0}")]
+    InvalidDirectDatastore(String),
     #[error("invalid metastore configuration: {0}")]
     InvalidCatalog(#[from] catalog::Error),
     #[error(transparent)]

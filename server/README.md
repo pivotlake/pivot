@@ -97,6 +97,43 @@ Start the server with:
 pivot server --config pivot.yaml
 ```
 
+For a single datastore, the server can also run without a config file. Pass a
+local path or a complete object-store URI; the URI scheme selects the remote
+backend:
+
+```sh
+pivot server --datastore /var/lib/pivot
+pivot server --datastore s3://analytics/warm
+pivot server --datastore gs://analytics/cold
+```
+
+This direct form serves the datastore as `default` and trusts the built-in
+`pivot` user. S3 credentials come from `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY`; `AWS_REGION` or `AWS_DEFAULT_REGION` selects the region,
+and `AWS_ENDPOINT_URL` may name an S3-compatible endpoint. GCS uses Application
+Default Credentials. This environment-credential behavior belongs only to the
+direct form: `--config` continues to resolve S3 credentials from its
+`metastore.secrets` entries.
+
+To serve several datastores without a config file, repeat `--datastore` and name
+every entry as `NAME=LOCATION`. Select which one receives unqualified table
+names with `--default-datastore`:
+
+```sh
+pivot server \
+  --datastore hot=/var/lib/pivot/hot \
+  --datastore warm=s3://analytics/warm \
+  --datastore cold=gs://analytics/cold \
+  --default-datastore hot
+```
+
+One `--datastore LOCATION` is implicitly named `default`; a sole named entry is
+also implicitly the default. With more than one entry, names and
+`--default-datastore` are required. Names must be unique, and `system` is
+reserved for Pivot's virtual system datastore. Every directly opened S3
+datastore uses the same process-wide `AWS_*` credentials; use `--config` when
+different datastores need different secrets or other per-datastore settings.
+
 A local datastore directory may be open in only one Pivot process at a time.
 Pivot holds `.pivot.lock` in that directory until shutdown and reports the
 owning PID if another process tries to open it.

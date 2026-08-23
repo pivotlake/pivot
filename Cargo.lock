@@ -4652,6 +4652,7 @@ dependencies = [
  "clap",
  "core_affinity",
  "datastore-delta",
+ "datastore-system",
  "dispatch",
  "engine",
  "futures",

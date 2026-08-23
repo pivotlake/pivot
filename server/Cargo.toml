@@ -10,6 +10,7 @@ engine = { workspace = true }
 planner = { workspace = true }
 catalog = { workspace = true }
 datastore-delta = { workspace = true }
+datastore-system = { workspace = true }
 metastore = { workspace = true }
 metastore-disk = { workspace = true }
 arrow-array = { workspace = true }
