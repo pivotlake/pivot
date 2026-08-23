@@ -24,7 +24,7 @@ use crate::expression::{
     AggregateFunc, Arithmetic, ArithmeticOp, Between, Case, CaseCheck, Cast, Compare, Conjunction,
     ConjunctionOp, Contains, CountStar, DatePart, DatePartKind, DateTrunc, Divide, Error,
     Expression, FormatBytes, Function, InList, IntervalArithmetic, IsNull, Length, Like,
-    MaybeError, NormalizedInterval, Not, Now, NumericAggregate, Prefix, Ref, RegexpFullMatch,
+    MaybeError, NormalizedInterval, Not, NumericAggregate, Prefix, Ref, RegexpFullMatch,
     RegexpJitReplace, RegexpReplace, Substring, Suffix, TemporalConvert, VariantGet,
 };
 use crate::types::{Type, build_scalar_value, physical_arrow_type, type_from_logical};
@@ -385,13 +385,6 @@ impl Function {
             "drop_cache" => {
                 function_args(func, 0)?;
                 Ok(Function::DropCache)
-            }
-            // `CURRENT_TIMESTAMP` binds to `get_current_timestamp`. DuckDB
-            // normally folds all three spellings to a constant; keep this
-            // mapping as the fallback for plans built with optimization off.
-            "now" | "get_current_timestamp" | "transaction_timestamp" => {
-                function_args(func, 0)?;
-                Ok(Function::Now(Now))
             }
             // `extract(<part> FROM ts)` lowers to a function named after the part
             // (`minute`, `year`, `dayofweek`, …).
