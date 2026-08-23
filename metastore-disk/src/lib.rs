@@ -652,7 +652,7 @@ impl DatastoreConfig {
                 }
                 None => GcsStore::with_default_credentials(&self.location)?,
             })),
-            StoreScheme::Local => Ok(Arc::new(LocalStore::new(local_path(&self.location)))),
+            StoreScheme::Local => Ok(Arc::new(LocalStore::new(local_path(&self.location))?)),
         }
     }
 }

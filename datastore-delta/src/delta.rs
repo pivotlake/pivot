@@ -1276,7 +1276,7 @@ mod tests {
         use delta_kernel::transaction::create_table::create_table;
 
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::store::LocalStore::new(dir.path());
+        let store = crate::store::LocalStore::new(dir.path()).unwrap();
         let uri = Url::from_directory_path(dir.path()).unwrap();
         let engine = DeltaEngine::new(&store).unwrap();
         let kernel = engine.kernel();
@@ -1416,7 +1416,7 @@ mod tests {
     /// Create a bare kernel-authored table at a store-relative location (no
     /// `delta.*` maintenance properties, which Kernel forbids setting at CREATE).
     fn create_test_table(dir: &std::path::Path) -> TestTable {
-        let store = crate::store::LocalStore::new(dir);
+        let store = crate::store::LocalStore::new(dir).unwrap();
         let location = ObjectPath::new("t");
         store.create_dir(&location).unwrap();
         let uri = table_uri(&store.location_uri(), &location).unwrap();

@@ -14,8 +14,18 @@ pub struct LocalStore {
 }
 
 impl LocalStore {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+    /// Open a store rooted at `root`, resolving a relative path against the
+    /// process's current directory once. Delta Kernel consumes the root as a
+    /// file URL, for which `file://./data` is not a valid local path (`.` is
+    /// parsed as the URL host); keeping an absolute root also means later I/O
+    /// cannot change meaning if the process changes its working directory.
+    pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
+        let requested = root.into();
+        let root = std::path::absolute(&requested).map_err(|source| StoreError::Io {
+            key: requested.display().to_string(),
+            source,
+        })?;
+        Ok(Self { root })
     }
 
     /// The filesystem path for `key`. A relative key lives under the store
@@ -41,7 +51,9 @@ impl ObjectStore for LocalStore {
     }
 
     fn location_uri(&self) -> String {
-        format!("file://{}", self.root.display())
+        url::Url::from_directory_path(&self.root)
+            .expect("LocalStore roots are made absolute by the constructor")
+            .into()
     }
 
     fn build_delta_object_store(&self) -> Result<Arc<DynObjectStore>> {
@@ -217,7 +229,7 @@ mod tests {
     #[test]
     fn put_overwrites_and_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let store = LocalStore::new(dir.path());
+        let store = LocalStore::new(dir.path()).unwrap();
         store.put(&p("k"), b"first").unwrap();
         store.put(&p("k"), b"second").unwrap();
         assert_eq!(store.get(&p("k")).unwrap().unwrap(), b"second");
@@ -226,7 +238,7 @@ mod tests {
     #[test]
     fn delete_removes_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        let store = LocalStore::new(dir.path());
+        let store = LocalStore::new(dir.path()).unwrap();
         store.put(&p("k"), b"v").unwrap();
         store.delete(&p("k")).unwrap();
         assert!(store.get(&p("k")).unwrap().is_none());
@@ -236,7 +248,7 @@ mod tests {
     #[test]
     fn update_creates_a_missing_object_and_applies_over_the_current_one() {
         let dir = tempfile::tempdir().unwrap();
-        let store = LocalStore::new(dir.path());
+        let store = LocalStore::new(dir.path()).unwrap();
 
         store
             .update(&p("k"), &mut |current| {
@@ -257,7 +269,7 @@ mod tests {
     #[test]
     fn update_returning_none_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let store = LocalStore::new(dir.path());
+        let store = LocalStore::new(dir.path()).unwrap();
         store.put(&p("k"), b"kept").unwrap();
 
         store.update(&p("k"), &mut |_| None).unwrap();
@@ -268,7 +280,7 @@ mod tests {
     #[test]
     fn get_missing_is_none_and_list_of_missing_dir_is_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let store = LocalStore::new(dir.path());
+        let store = LocalStore::new(dir.path()).unwrap();
         assert!(store.get(&p("nope")).unwrap().is_none());
         assert!(store.list(&p("_missing")).unwrap().is_empty());
     }
