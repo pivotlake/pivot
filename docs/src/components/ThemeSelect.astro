@@ -1,0 +1,95 @@
+---
+// Starlight's ThemeSelect, with two changes: a reader who has never touched
+// the picker gets the light theme instead of the operating system's
+// preference, and "auto" is stored under its own name. Starlight writes auto
+// as an empty string, which is indistinguishable from an untouched picker, so
+// its script resolves both to the OS preference and overwrites the light
+// default that ThemeProvider.astro sets.
+import Select from "@astrojs/starlight/components/Select.astro";
+---
+
+<starlight-theme-select>
+  <Select
+    icon="laptop"
+    label={Astro.locals.t("themeSelect.accessibleLabel")}
+    options={[
+      {
+        label: Astro.locals.t("themeSelect.dark"),
+        selected: false,
+        value: "dark",
+      },
+      {
+        label: Astro.locals.t("themeSelect.light"),
+        selected: true,
+        value: "light",
+      },
+      {
+        label: Astro.locals.t("themeSelect.auto"),
+        selected: false,
+        value: "auto",
+      },
+    ]}
+    width="6.25em"
+  />
+</starlight-theme-select>
+
+{/* Inlined to avoid a flash of the wrong theme before hydration. */}
+<script is:inline>
+  StarlightThemeProvider.updatePickers();
+</script>
+
+<script>
+  type Theme = "auto" | "dark" | "light";
+
+  /** Key in `localStorage` to store colour theme preference at. */
+  const storageKey = "starlight-theme";
+
+  /** Anything other than a known theme means the picker was never touched. */
+  const parseTheme = (theme: unknown): Theme =>
+    theme === "auto" || theme === "dark" || theme === "light" ? theme : "light";
+
+  const loadTheme = (): Theme =>
+    parseTheme(
+      typeof localStorage !== "undefined" && localStorage.getItem(storageKey),
+    );
+
+  function storeTheme(theme: Theme): void {
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem(storageKey, theme);
+    }
+  }
+
+  const getPreferredColorScheme = (): Theme =>
+    matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+
+  /** Update the select menu and the document, leaving storage alone. */
+  function applyTheme(theme: Theme): void {
+    StarlightThemeProvider.updatePickers(theme);
+    document.documentElement.dataset.theme =
+      theme === "auto" ? getPreferredColorScheme() : theme;
+  }
+
+  function onThemeChange(theme: Theme): void {
+    applyTheme(theme);
+    storeTheme(theme);
+  }
+
+  matchMedia(`(prefers-color-scheme: light)`).addEventListener("change", () => {
+    if (loadTheme() === "auto") onThemeChange("auto");
+  });
+
+  class StarlightThemeSelect extends HTMLElement {
+    constructor() {
+      super();
+      // Applied without storing, so the default stays a default until the
+      // reader picks something.
+      applyTheme(loadTheme());
+      this.querySelector("select")?.addEventListener("change", (e) => {
+        if (e.currentTarget instanceof HTMLSelectElement) {
+          onThemeChange(parseTheme(e.currentTarget.value));
+        }
+      });
+    }
+  }
+  customElements.define("starlight-theme-select", StarlightThemeSelect);
+</script>

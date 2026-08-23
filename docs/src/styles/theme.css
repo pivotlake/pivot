@@ -312,3 +312,24 @@ starlight-toc a {
 .sl-markdown-content pre code {
   line-height: 1.45;
 }
+
+/* The pre-release note above the title. A quiet strip rather than the filled
+   alert bar Starlight ships, since it sits on every page. */
+.sl-banner {
+  background-color: transparent;
+  border-bottom: 1px solid var(--sl-color-hairline);
+  color: var(--sl-color-gray-3);
+  box-shadow: none;
+  font-size: 0.8125rem;
+  padding: 0.5rem 1.5rem;
+  text-wrap: pretty;
+}
+
+.sl-banner strong {
+  color: var(--sl-color-gray-1);
+  font-weight: 500;
+}
+
+.sl-banner a {
+  color: var(--sl-color-gray-2);
+}

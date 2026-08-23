@@ -1,9 +1,6 @@
 ---
-// The wordmark and its cursor are separate: the cursor is a plain rectangle in
-// the source artwork, so redrawing it as an element keeps it crisp at any size.
-// Its size and offset are expressed as fractions of the wordmark's height,
-// taken from the artwork, so the two stay locked together at any rendered
-// size.
+// The wordmark ships as two files, one per theme, so its ink inverts with the
+// rest of the page.
 import wordmark from "../assets/pivot-wordmark.png";
 import wordmarkDark from "../assets/pivot-wordmark-dark.png";
 
@@ -11,11 +8,8 @@ const { siteTitleHref } = Astro.locals.starlightRoute;
 ---
 
 <a href={siteTitleHref} class="site-title sl-flex" aria-label="pivotdb">
-  <span class="wordmark">
-    <img class="light:sl-hidden print:hidden" alt="" src={wordmarkDark.src} />
-    <img class="dark:sl-hidden print:block" alt="" src={wordmark.src} />
-    <span class="cursor" aria-hidden="true"></span>
-  </span>
+  <img class="light:sl-hidden print:hidden" alt="" src={wordmarkDark.src} />
+  <img class="dark:sl-hidden print:block" alt="" src={wordmark.src} />
 </a>
 
 <style>
@@ -25,23 +19,8 @@ const { siteTitleHref } = Astro.locals.starlightRoute;
     min-width: 0;
   }
 
-  .wordmark {
-    --logo-height: 1.375rem;
-    display: flex;
-    align-items: flex-end;
-    /* Fractions of the wordmark height, measured off the source artwork. */
-    gap: calc(var(--logo-height) * 0.248);
-  }
-
-  .wordmark img {
-    height: var(--logo-height);
+  .site-title img {
+    height: 1.375rem;
     width: auto;
-  }
-
-  .cursor {
-    width: calc(var(--logo-height) * 0.594);
-    height: calc(var(--logo-height) * 0.178);
-    margin-bottom: calc(var(--logo-height) * 0.089);
-    background-color: #3b4fe0;
   }
 </style>
