@@ -140,3 +140,5 @@ Pivot is a high-performance analytics engine that runs on open data formats. It 
 - [Quickstart](/docs/quickstart/) runs a server and issues a first query.
 - [Architecture](/docs/database/architecture/) explains how a query becomes
   work across the dispatch pool.
+- [Reference](/docs/reference/) lists supported SQL, functions, data types,
+  system tables, and configuration.
