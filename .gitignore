@@ -10,3 +10,7 @@ __pycache__/
 
 # insta snapshot leftovers from failed assertions
 *.pending-snap
+
+# binaries the deploy workflow drops next to the runtime image Dockerfile
+server/image/amd64/
+server/image/arm64/

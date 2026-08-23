@@ -1,0 +1,14 @@
+# Default configuration baked into the pivotlake/pivot image. Mount a file
+# over /etc/pivot/pivot.yaml to replace it. See config.example.yaml in the
+# repository for every setting.
+#
+# The datastores and users are not defined here: they live in the metastore
+# file (/var/lib/pivot/metastore.yaml), which the server owns and rewrites,
+# so statements like CREATE USER can persist alongside them.
+server:
+  # Beyond loopback, so published container ports reach the server and the
+  # dashboard. Loopback inside a container is reachable from nowhere.
+  bind: 0.0.0.0:5432
+  http_bind: 0.0.0.0:8081
+
+metastore: {}

@@ -72,6 +72,10 @@ jobs:
     steps:
       - id: gen
         run: |
+          if [ "${{ inputs.push_docker }}" = "true" ] && { [ "${{ inputs.build_x86_64 }}" != "true" ] || [ "${{ inputs.build_aarch64 }}" != "true" ]; }; then
+            echo "::error::The Docker image wraps the released binaries for both architectures. Enable build_x86_64 and build_aarch64, or disable push_docker."
+            exit 1
+          fi
           legs=()
           if [ "${{ inputs.build_x86_64 }}" = "true" ]; then
             legs+=('{"arch":"x86_64","deb_arch":"amd64","runner":"ubuntu-24.04"}')
@@ -88,13 +92,12 @@ jobs:
           echo "Building: $include"
 
   # Bring the self-hosted GCP VMs online when opted in: ci-runner2 (x86_64
-  # binary build + Docker image build) and ci-runner-arm (aarch64 binary
-  # build). Each box only wakes when something that runs on it is selected.
+  # binary build) and ci-runner-arm (aarch64 binary build). Each box only
+  # wakes when something that runs on it is selected. The Docker image job
+  # runs on a hosted runner, so it never needs a box.
   start-ci:
     name: Start GCP runner
-    # Resume the box when anything that runs on it is selected: the x86_64 binary
-    # build or the Docker image build.
-    if: ${{ inputs.use_gcp_runner && (inputs.build_x86_64 || inputs.push_docker) }}
+    if: ${{ inputs.use_gcp_runner && inputs.build_x86_64 }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -206,11 +209,11 @@ jobs:
           path: dist/pivot_*_${{ matrix.deb_arch }}.deb
           if-no-files-found: error
 
-      # Handed to publish-install below, which gzips it and uploads it to the
-      # download host. The very binary uploaded to GCS above, so what a user
-      # installs and what we keep for symbolizing a backtrace are one file.
-      - name: Upload the download binary
-        if: ${{ inputs.publish_install }}
+      # Handed to publish-install below (which gzips it for the download host)
+      # and to the docker job (which wraps it in the server image). The very
+      # binary uploaded to GCS above, so what a user installs, what the image
+      # runs, and what we keep for symbolizing a backtrace are one file.
+      - name: Upload the release binary
         uses: actions/upload-artifact@v4
         with:
           name: pivot-binary-linux-${{ matrix.deb_arch }}
@@ -388,23 +391,23 @@ jobs:
           PIVOT_BASE_URL=$DOWNLOAD_URL sh packaging/install/install.sh
           "$HOME/.pivot/cli/latest/pivot" --version
 
-  # Build the pivot server image and push it to Docker Hub (pivotlake/pivot).
-  # Candidates get their versioned rc tag only. Real releases get their
-  # workspace version and move `latest`. Independent of the binary matrix
-  # above, but shares the self-hosted gcp-builder when opted in, so it waits on
-  # start-ci to resume the box.
+  # Wrap the released binaries in the pivot server image and push it to Docker
+  # Hub (pivotlake/pivot) as a multi-arch (amd64 + arm64) image. Candidates get
+  # their versioned rc tag only. Real releases get their workspace version and
+  # move `latest`. Nothing is compiled here: the image copies the exact
+  # binaries the deploy matrix built, so the pushed image can never drift from
+  # the released server, and the build takes seconds on a hosted runner.
   docker:
     name: Build & push Docker image
-    needs: [start-ci]
-    # start-ci is skipped unless opted in, so accept its skipped result too.
-    if: ${{ always() && inputs.push_docker && (needs.start-ci.result == 'success' || needs.start-ci.result == 'skipped') }}
-    # Build on the self-hosted gcp-builder when opted in (like the binary legs);
-    # otherwise fall back to a hosted runner.
-    runs-on: ${{ inputs.use_gcp_runner && 'gcp-builder' || 'ubuntu-latest' }}
+    needs: [deploy]
+    if: ${{ always() && inputs.push_docker && needs.deploy.result == 'success' }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      # QEMU runs the image's arm64 leg (an apt-get install plus a COPY) on
+      # this amd64 runner.
+      - uses: docker/setup-qemu-action@v3
 
       - uses: docker/setup-buildx-action@v3
 
@@ -439,11 +442,23 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Download the released amd64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pivot-binary-linux-amd64
+          path: server/image/amd64
+
+      - name: Download the released arm64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: pivot-binary-linux-arm64
+          path: server/image/arm64
+
       - name: Build & push
         uses: docker/build-push-action@v5
         with:
-          context: .
-          file: server/Dockerfile
+          context: server/image
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.docker_tags.outputs.tags }}
           cache-from: type=gha,scope=server
