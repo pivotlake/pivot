@@ -449,6 +449,56 @@ jobs:
           cache-from: type=gha,scope=server
           cache-to: type=gha,scope=server,mode=max
 
+  # Every published version gets a git tag pointing at the commit it was
+  # built from, named exactly like the artifacts elsewhere in this workflow:
+  # v0.3.0 for a real release, v0.3.0-rc<sha> for a candidate.
+  tag-release:
+    name: Tag the release
+    needs: [deploy, publish-install, docker]
+    # publish-install and docker are skipped when deselected; tag once at
+    # least one of them published a version and nothing failed.
+    if: ${{ always() && needs.deploy.result == 'success' && (needs.publish-install.result == 'success' || needs.publish-install.result == 'skipped') && (needs.docker.result == 'success' || needs.docker.result == 'skipped') && (needs.publish-install.result == 'success' || needs.docker.result == 'success') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create and push the release tag
+        run: |
+          set -euo pipefail
+          workspace_version=$(grep -m1 '^version = ' Cargo.toml | sed 's/^version = "\(.*\)"$/\1/')
+          case "$workspace_version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::Could not read the workspace version from Cargo.toml (got '$workspace_version')."; exit 1 ;;
+          esac
+          if [ "${{ inputs.release_candidate }}" = "true" ]; then
+            version=$workspace_version-rc$(git rev-parse --short=7 HEAD)
+          else
+            version=$workspace_version
+          fi
+          tag=v$version
+
+          # A tag, like a published version, is immutable: it may only move
+          # when the run explicitly overrides a previous deployment.
+          existing=$(git ls-remote origin "refs/tags/$tag" | cut -f1)
+          if [ -n "$existing" ]; then
+            if [ "$existing" = "${{ github.sha }}" ]; then
+              echo "$tag already points at ${{ github.sha }}; nothing to do."
+              exit 0
+            fi
+            if [ "${{ inputs.override }}" != "true" ]; then
+              echo "::error::$tag already exists at $existing. Bump the version in Cargo.toml, or re-run with override to move it."
+              exit 1
+            fi
+            echo "::warning::$tag already exists at $existing; override is on, so it moves to ${{ github.sha }}."
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag --annotate --message "Pivot $version" "$tag" "${{ github.sha }}"
+          git push --force origin "$tag"
+
   # NOTE: no stop job here. Each self-hosted box runs an hourly if-unused cron
   # (suspend on ci-runner-x86, stop on ci-runner-aarch64) that only takes it down when
   # no ci/deploy run is active, so it can't be killed out from under a
