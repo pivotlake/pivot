@@ -1,9 +1,9 @@
 ---
 // The wordmark and its cursor are separate: the cursor is a plain rectangle in
-// the source artwork, so redrawing it as an element lets it blink the way a
-// terminal cursor does. Its size and offset are expressed as fractions of the
-// wordmark's height, taken from the artwork, so the two stay locked together
-// at any rendered size.
+// the source artwork, so redrawing it as an element keeps it crisp at any size.
+// Its size and offset are expressed as fractions of the wordmark's height,
+// taken from the artwork, so the two stay locked together at any rendered
+// size.
 import wordmark from "../assets/pivot-wordmark.png";
 import wordmarkDark from "../assets/pivot-wordmark-dark.png";
 
@@ -43,27 +43,5 @@ const { siteTitleHref } = Astro.locals.starlightRoute;
     height: calc(var(--logo-height) * 0.178);
     margin-bottom: calc(var(--logo-height) * 0.089);
     background-color: #3b4fe0;
-    /* 530ms per half cycle is the caret rate Windows has defaulted to for
-       decades and roughly what terminals use, so a full cycle is 1.06s. Five
-       whole cycles is 5.3s, close to five seconds without cutting a blink in
-       half, and it rests lit rather than disappearing. */
-    animation: cursor-blink 1.06s steps(1, end) 5;
-  }
-
-  @keyframes cursor-blink {
-    0%,
-    50% {
-      opacity: 1;
-    }
-    50.01%,
-    100% {
-      opacity: 0;
-    }
-  }
-
-  @media (prefers-reduced-motion: reduce) {
-    .cursor {
-      animation: none;
-    }
   }
 </style>
