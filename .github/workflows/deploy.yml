@@ -1,4 +1,4 @@
-name: Deploy Server
+name: Deploy Binaries
 
 on:
   workflow_dispatch:
