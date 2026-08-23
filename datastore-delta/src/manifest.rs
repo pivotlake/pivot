@@ -599,7 +599,7 @@ mod tests {
     #[test]
     fn update_creates_the_manifest_and_mutates_it_in_place() {
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::store::LocalStore::new(dir.path());
+        let store = crate::store::LocalStore::new(dir.path()).unwrap();
 
         CatalogManifest::update(&store, |manifest| {
             manifest.add_schema("logs".to_string());
@@ -615,7 +615,7 @@ mod tests {
     #[test]
     fn a_failed_mutation_stores_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::store::LocalStore::new(dir.path());
+        let store = crate::store::LocalStore::new(dir.path()).unwrap();
 
         let error = CatalogManifest::update(&store, |_| {
             Err::<(), _>(Error::MissingSchema("nope".to_string()))
