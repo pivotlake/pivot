@@ -63,6 +63,11 @@ running server. Its tables are queried with two-part names such as
 | `partition` | `VARCHAR` | File partition value. |
 | `bytes` | `BIGINT` | Compressed file bytes. |
 | `bytes_uncompressed` | `BIGINT` | Uncompressed file bytes. |
+| `min_max_stats` | `VARIANT` | Object mapping each column with file statistics to its `min` and `max` values. |
+
+Bounds retain their value types and can be addressed as variant fields, for
+example `min_max_stats.event_time.min`. Columns without recorded bounds are
+omitted.
 
 ## `system.memory_blocks`
 

@@ -9,8 +9,9 @@ use crate::manifest::{
 };
 use crate::parquet::{ParquetTable, RowGroupMetadata};
 use crate::store::{self, DataFile, FileRef, ObjectPath, ObjectStore};
-use arrow_array::{ArrayRef, Datum, Scalar};
+use arrow_array::{Array, ArrayRef, Datum, Scalar};
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
+use arrow_schema::DataType;
 use crossbeam_deque::{Injector, Steal};
 use datastore::{DatastoreColumnMetadata, DatastoreFileMetadata, DatastoreTableMetadata};
 use dispatch::{DataFlowDispatcher, Projection};
@@ -504,6 +505,7 @@ impl CatalogTable {
                 bytes: file.entry.file.size,
                 bytes_uncompressed: file.uncompressed_size(),
                 partition: self.format_partition(&file.entry.partition),
+                min_max_stats: format_min_max_stats(file.entry.stats.as_deref()),
             })
             .collect();
 
@@ -865,6 +867,60 @@ impl CatalogTable {
             }
         }
         Ok(added)
+    }
+}
+
+/// Render a file's typed column bounds as a stable JSON object. Each column is
+/// one field containing its `min` and `max`; values stay JSON numbers/booleans
+/// where their Arrow type has that shape, while strings and temporal values are
+/// quoted. A column whose pair cannot be rendered is omitted.
+fn format_min_max_stats(stats: Option<&FileStats>) -> String {
+    let Some(stats) = stats else {
+        return "{}".to_string();
+    };
+    let mut names: Vec<_> = stats.min_values.keys().collect();
+    names.sort_unstable();
+
+    let fields = names
+        .into_iter()
+        .filter_map(|name| {
+            let min = format_bound(stats.min_values.get(name)?)?;
+            let max = format_bound(stats.max_values.get(name)?)?;
+            let name = serde_json::to_string(name).expect("a Rust string is valid JSON");
+            Some(format!(r#"{name}:{{"min":{min},"max":{max}}}"#))
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{fields}}}")
+}
+
+/// Render the single value held by a file statistic as one JSON value.
+fn format_bound(array: &ArrayRef) -> Option<String> {
+    if array.len() != 1 || array.is_null(0) {
+        return None;
+    }
+    let formatter = ArrayFormatter::try_new(array.as_ref(), &FormatOptions::default()).ok()?;
+    let rendered = formatter.value(0).to_string();
+    match array.data_type() {
+        DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float16
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Decimal32(_, _)
+        | DataType::Decimal64(_, _)
+        | DataType::Decimal128(_, _)
+        | DataType::Decimal256(_, _) => serde_json::from_str::<serde_json::Value>(&rendered)
+            .ok()
+            .map(|_| rendered),
+        _ => serde_json::to_string(&rendered).ok(),
     }
 }
 

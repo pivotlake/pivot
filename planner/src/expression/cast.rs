@@ -219,9 +219,9 @@ fn render_variant_text(
 /// physical type. `json_to_variant` marks the `value` field non-null (no row's
 /// value is), but a `VARIANT` column's physical type has it nullable; restamp
 /// the canonical fields so the result is exactly what a column declares and an
-/// INSERT accepts. Shared by the text-to-variant cast and by constant folding
-/// of a variant literal.
-pub(crate) fn json_to_canonical_variant(text: &ArrayRef) -> Result<ArrayRef, ArrowError> {
+/// INSERT accepts. Shared by the text-to-variant cast, constant folding of a
+/// variant literal, and metadata relations that synthesize variant objects.
+pub fn json_to_canonical_variant(text: &ArrayRef) -> Result<ArrayRef, ArrowError> {
     let variants = json_to_variant(text)?;
     let structure = variants.into_inner();
     let DataType::Struct(fields) = physical_arrow_type(&Type::Variant) else {
