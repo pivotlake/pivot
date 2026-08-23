@@ -3,8 +3,8 @@
 
 use super::{
     Arithmetic, Contains, DatePart, DateTrunc, Divide, FormatBytes, IntervalArithmetic, Length,
-    Like, NormalizedInterval, Now, Prefix, RegexpFullMatch, RegexpJitReplace, RegexpReplace,
-    Substring, Suffix, TemporalConvert, VariantGet,
+    Like, NormalizedInterval, Prefix, RegexpFullMatch, RegexpJitReplace, RegexpReplace, Substring,
+    Suffix, TemporalConvert, VariantGet,
 };
 use crate::compile::{self, ExprFn, ExprResult, stateless_expr};
 use crate::expression::Expression;
@@ -92,10 +92,6 @@ pub enum Function {
     /// form its fields must take before they compare. DuckDB's binder wraps
     /// every interval it orders, compares or hashes in this.
     NormalizedInterval(NormalizedInterval),
-    /// A current-time function left in an unoptimized DuckDB plan. Normally
-    /// DuckDB folds it to one TIMESTAMPTZ constant during optimization; this is
-    /// the execution fallback when optimization is disabled.
-    Now(Now),
     /// A variant (JSON) path read: `doc->'key'` chains, optionally typed by a
     /// fused `CAST`.
     VariantGet(VariantGet),
@@ -140,7 +136,7 @@ impl Function {
             Function::IntervalArithmetic(i) => visit(&i.operand),
             Function::TemporalConvert(t) => visit(&t.source),
             Function::NormalizedInterval(n) => visit(&n.input),
-            Function::DropCache | Function::Now(_) => {}
+            Function::DropCache => {}
             Function::VariantGet(v) => visit(&v.input),
         }
     }
@@ -182,7 +178,7 @@ impl Function {
             Function::IntervalArithmetic(i) => visit(&mut i.operand),
             Function::TemporalConvert(t) => visit(&mut t.source),
             Function::NormalizedInterval(n) => visit(&mut n.input),
-            Function::DropCache | Function::Now(_) => {}
+            Function::DropCache => {}
             Function::VariantGet(v) => visit(&mut v.input),
         }
     }
@@ -209,7 +205,6 @@ impl Display for Function {
             Function::TemporalConvert(c) => write!(f, "{c}"),
             Function::NormalizedInterval(n) => write!(f, "{n}"),
             Function::DropCache => write!(f, "drop_cache()"),
-            Function::Now(n) => write!(f, "{n}"),
             Function::VariantGet(v) => write!(f, "{v}"),
         }
     }
@@ -240,8 +235,6 @@ impl Function {
             // `date_trunc` keeps its source's timestamp type (with or without
             // a zone), as DuckDB bound it.
             Function::DateTrunc(d) => d.result.clone(),
-            // `now()` is Postgres's TIMESTAMP WITH TIME ZONE.
-            Function::Now(_) => Type::TimestampTz,
             // Canonicalising a span rewrites its fields, not its type.
             Function::NormalizedInterval(_) => Type::Interval,
             // `date`/`timestamp` ± interval keeps the temporal operand's type,
@@ -275,7 +268,6 @@ impl Function {
             Function::IntervalArithmetic(i) => i.compile(),
             Function::TemporalConvert(c) => c.compile(),
             Function::NormalizedInterval(n) => n.compile(),
-            Function::Now(n) => n.compile(),
             Function::VariantGet(v) => v.compile(),
             // `drop_cache()` evicts pivot's in-memory compressed cache *and* the on-disk
             // cache (so remote reads go cold to the network) as a side effect, then
