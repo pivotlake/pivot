@@ -12,6 +12,9 @@ export default defineConfig({
       title: "pivotdb",
       description: "Documentation for pivotdb, a columnar analytics engine.",
       customCss: ["./src/styles/theme.css"],
+      // Puts the pre-release banner on every page. Starlight has no site-wide
+      // banner setting; the middleware fills in the per-page frontmatter one.
+      routeMiddleware: "./src/routeData.ts",
       expressiveCode: {
         themes: [codeThemeDark, codeThemeLight],
         // Pointed at CSS variables rather than literal colours so the code
@@ -39,6 +42,8 @@ export default defineConfig({
         ThemeProvider: "./src/components/ThemeProvider.astro",
         // Draws the wordmark with its cursor as a separate element.
         SiteTitle: "./src/components/SiteTitle.astro",
+        // Leaves the light default alone until the reader picks a theme.
+        ThemeSelect: "./src/components/ThemeSelect.astro",
       },
       head: [
         {

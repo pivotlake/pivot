@@ -11,7 +11,12 @@ import { Icon } from "@astrojs/starlight/components";
     const storedTheme =
       typeof localStorage !== "undefined" &&
       localStorage.getItem("starlight-theme");
-    const theme = storedTheme || "light";
+    const theme =
+      storedTheme === "auto"
+        ? window.matchMedia("(prefers-color-scheme: light)").matches
+          ? "light"
+          : "dark"
+        : storedTheme || "light";
     document.documentElement.dataset.theme =
       theme === "light" ? "light" : "dark";
     return {
