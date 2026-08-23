@@ -46,7 +46,7 @@ on:
 #   DEPLOY_GCS_BUCKET  — gs://bucket/optional/prefix to upload the binary under.
 # For the Docker Hub push (push_docker), the org-level DOCKERHUB_USERNAME /
 # DOCKERHUB_TOKEN secrets are used; that account must have push access to
-# giladkl/pivot.
+# pivotlake/pivot.
 # publish_install puts the CLI binaries in a public bucket, reusing GCP_SA_KEY,
 # which needs objectAdmin on it. The install script and the docs are published
 # separately by the Deploy Web workflow; the script always resolves the newest
@@ -388,7 +388,7 @@ jobs:
           PIVOT_BASE_URL=$DOWNLOAD_URL sh packaging/install/install.sh
           "$HOME/.pivot/cli/latest/pivot" --version
 
-  # Build the pivot server image and push it to Docker Hub (giladkl/pivot),
+  # Build the pivot server image and push it to Docker Hub (pivotlake/pivot),
   # tagged with both the commit SHA and `latest`. Independent of the binary
   # matrix above, but shares the self-hosted gcp-builder when opted in, so it
   # waits on start-ci to resume the box.
@@ -420,8 +420,8 @@ jobs:
           file: server/Dockerfile
           push: true
           tags: |
-            giladkl/pivot:${{ github.sha }}
-            giladkl/pivot:latest
+            pivotlake/pivot:${{ github.sha }}
+            pivotlake/pivot:latest
           cache-from: type=gha,scope=server
           cache-to: type=gha,scope=server,mode=max
 
