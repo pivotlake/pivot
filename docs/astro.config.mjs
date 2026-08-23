@@ -70,6 +70,10 @@ export default defineConfig({
           label: "Database",
           items: [{ autogenerate: { directory: "database" } }],
         },
+        {
+          label: "Reference",
+          items: [{ autogenerate: { directory: "reference" } }],
+        },
       ],
       pagination: true,
       lastUpdated: true,

@@ -9,4 +9,4 @@ sidebar:
 | --- | --- |
 | Rows per `COPY` batch | 131,072 |
 | Buffer pool | share of system memory, configurable |
-| Supported column types | integer, floating point, text, timestamp, variant |
+| Supported column types | See [Data types](/docs/reference/data-types/) |

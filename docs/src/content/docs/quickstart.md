@@ -20,9 +20,12 @@ psql -h 127.0.0.1 -p 5432 -U pivot
 ## Load data
 
 ```sql
-CREATE TABLE events (id BIGINT, name TEXT, ts TIMESTAMPTZ);
-COPY events FROM '/path/to/events.parquet';
+CREATE TABLE events (id BIGINT, name TEXT, ts TIMESTAMP) WITH (
+  with_pre_existing_parquets = '/path/to/events'
+);
 ```
+
+The directory can contain one or more parquet files with the declared schema.
 
 ## Query
 
