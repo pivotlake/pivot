@@ -16,23 +16,23 @@ on:
         type: boolean
         default: true
       use_gcp_runner:
-        description: "Build on the self-hosted GCP runners (ci-runner2 for x86_64, ci-runner-arm for aarch64). On by default; uncheck to use GitHub-hosted runners."
+        description: "Build on the self-hosted GCP runners (run on github runners if off)."
         type: boolean
         default: true
       push_docker:
-        description: "Build the pivot server image and push it to Docker Hub (giladkl/pivot)."
+        description: "publish on dockerhub"
         type: boolean
         default: true
       publish_install:
-        description: "Publish the CLI binaries to the release bucket, so `curl https://pivotlake.io | sh` installs this build. Needs both architectures selected: a release missing one is refused."
+        description: "Publish the CLI binaries"
         type: boolean
         default: true
       release_candidate:
-        description: "Publish as a release candidate: the version carries an -rc<commit> suffix and `latest` is left where it is, so it installs only via PIVOT_VERSION and no one else is affected. Uncheck to cut the real release named in Cargo.toml."
+        description: "Publish as release candidate"
         type: boolean
         default: true
       override:
-        description: "Republish a version the download host already has. Off by default: a published version is meant to be immutable, and rewriting one changes what people have already installed."
+        description: "Override previous version deployment"
         type: boolean
         default: false
 
