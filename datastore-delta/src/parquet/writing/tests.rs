@@ -743,6 +743,7 @@ fn compaction_merges_presorted_source_runs_into_one_sorted_file() {
         Arc::from([]),
         Arc::from(["key".to_string()]),
         3,
+        None,
     )
     .map_each(|file: AssembledFile| file.bytes.runs().flatten().copied().collect::<Vec<u8>>())
     .execute()

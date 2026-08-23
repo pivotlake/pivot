@@ -1,11 +1,13 @@
 //! Background compaction and layout optimization of a table's Parquet files.
 //!
 //! Frequent writes litter a table with small files, and scans pay per file. The
-//! [`CompacterHandle`] merges them: small files are accumulated to a comfortably full
-//! output, with a file-count fallback for pathological piles, while already
-//! large files whose sort-key ranges overlap heavily are rewritten together to
-//! improve their physical layout. Each rewrite swaps its inputs into the table
-//! in a single log commit.
+//! [`CompacterHandle`] merges them: files below half the configured target are
+//! accumulated to a comfortably full output, with a file-count fallback for
+//! pathological piles, while half-full files whose sort-key ranges overlap
+//! heavily are rewritten into target-sized, range-ordered outputs. A row group
+//! that exceeds the target remains one oversized file because row groups are
+//! the smallest independently encoded unit. Each rewrite swaps its inputs into
+//! the table in a single log commit.
 //!
 //! The compacter is **location-agnostic**: candidates come from the table's
 //! manifest (paths, sizes, partition values, and stats; no directory scanning), and the merge (read,
@@ -62,8 +64,9 @@ mod overlap;
 /// Rows per row group in a merged file.
 const ROW_GROUP_ROWS: usize = 128 * 1024;
 
-/// Default output-size target. Files smaller than this enter small-file
-/// compaction; files at least this large enter layout optimization.
+/// Default compacted-file size target. Files smaller than half this size enter
+/// small-file compaction; files at least half this size are full enough to
+/// enter layout optimization instead.
 pub const DEFAULT_COMPACT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Default headroom for compression gains: a group whose input bytes only just
@@ -116,7 +119,9 @@ pub struct MaintenanceConfig {
 /// Tuning for a datastore's self-managed compaction loop.
 #[derive(Clone)]
 pub struct CompactionConfig {
-    /// Output-size target and small/large boundary (see [`DEFAULT_COMPACT_BYTES`]).
+    /// Layout-compaction output target. Half of it is the boundary between
+    /// small-file and layout compaction; a single encoded row group may exceed
+    /// it (see [`DEFAULT_COMPACT_BYTES`]).
     pub target_bytes: u64,
     /// Accumulated small-file bytes that trigger a merge.
     pub merge_target_bytes: u64,
@@ -142,7 +147,7 @@ struct CompactionCommand {
 }
 
 pub(crate) struct CompacterActor {
-    /// Output-size target and small/large boundary (see [`DEFAULT_COMPACT_BYTES`]).
+    /// Output-size target; half of it is the small/layout boundary.
     target_bytes: u64,
     merge_target_bytes: u64,
     min_files: usize,
@@ -257,13 +262,15 @@ impl CompacterActor {
             let mut compacted = false;
 
             if let Some(inputs) = self.next_small_batch(&table, apply_guards) {
-                table = self.merge_batch(name, id, inputs, "small files").await?;
+                table = self
+                    .merge_batch(name, id, inputs, MergeKind::SmallFiles)
+                    .await?;
                 compacted = true;
             }
 
             if let Some(inputs) = self.next_layout_optimization(&table, apply_guards) {
                 table = self
-                    .merge_batch(name, id, inputs, "layout optimization")
+                    .merge_batch(name, id, inputs, MergeKind::LayoutOptimization)
                     .await?;
                 compacted = true;
             }
@@ -280,14 +287,22 @@ impl CompacterActor {
         name: &SchemaQualifiedTableName,
         id: uuid::Uuid,
         inputs: Vec<FileRef>,
-        kind: &'static str,
+        kind: MergeKind,
     ) -> crate::Result<CatalogTable> {
         let input_sizes: Vec<u64> = inputs.iter().map(|file| file.size).collect();
         // `spawn_blocking` needs a `'static` closure, so it gets its own
         // datastore handle rather than a borrow of `self`.
         let datastore = self.datastore.clone();
+        let max_output_file_size =
+            matches!(kind, MergeKind::LayoutOptimization).then_some(self.target_bytes);
         let (merged, committed) = tokio::task::spawn_blocking(move || {
-            let merged = compact_table_files(&datastore, id, &inputs, ROW_GROUP_ROWS)?;
+            let merged = compact_table_files_with_max_output_size(
+                &datastore,
+                id,
+                &inputs,
+                ROW_GROUP_ROWS,
+                max_output_file_size,
+            )?;
             let committed = datastore
                 .table_handle_by_id(&id)
                 .ok_or_else(|| crate::Error::TableNotFound(id.to_string()))?;
@@ -298,7 +313,7 @@ impl CompacterActor {
         let output_sizes: Vec<u64> = merged.iter().map(|file| file.size).collect();
         info!(
             table = %name,
-            kind,
+            kind = kind.label(),
             inputs = input_sizes.len(),
             input_sizes = ?input_sizes,
             input_bytes = input_sizes.iter().sum::<u64>(),
@@ -319,7 +334,7 @@ impl CompacterActor {
         let mut by_partition: Vec<(Option<crate::PartitionValues>, Vec<&DeltaFileEntry>)> =
             Vec::new();
         for entry in table.file_entries() {
-            if entry.file.size >= self.target_bytes {
+            if !is_small_file(entry.file.size, self.target_bytes) {
                 continue;
             }
             match by_partition
@@ -341,7 +356,7 @@ impl CompacterActor {
         })
     }
 
-    /// Find the highest-overlap pair of already-large files. Pairs never cross
+    /// Find the highest-overlap pair of already-half-full files. Pairs never cross
     /// partitions. Sort columns are considered in table order; a column only
     /// defers to the next one when both files are the same singleton on it.
     /// Guardless selection still requires positive overlap: rewriting disjoint
@@ -358,7 +373,7 @@ impl CompacterActor {
         let mut by_partition: Vec<(Option<crate::PartitionValues>, Vec<&DeltaFileEntry>)> =
             Vec::new();
         for entry in table.file_entries() {
-            if entry.file.size < self.target_bytes {
+            if is_small_file(entry.file.size, self.target_bytes) {
                 continue;
             }
             match by_partition
@@ -376,7 +391,11 @@ impl CompacterActor {
             else {
                 continue;
             };
+            let combined_size = left.file.size.saturating_add(right.file.size);
+            let irreducible_singleton = combined_size > self.target_bytes
+                && overlap::same_singleton_sort_key(left, right, table.sort_by());
             if score > 0.0
+                && !irreducible_singleton
                 && (!apply_guards || score >= LAYOUT_OVERLAP_THRESHOLD)
                 && best.as_ref().is_none_or(|(best, _)| score > *best)
             {
@@ -385,6 +404,28 @@ impl CompacterActor {
         }
         best.map(|(_, files)| files)
     }
+}
+
+#[derive(Clone, Copy)]
+enum MergeKind {
+    SmallFiles,
+    LayoutOptimization,
+}
+
+impl MergeKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SmallFiles => "small files",
+            Self::LayoutOptimization => "layout optimization",
+        }
+    }
+}
+
+/// Integer file sizes below the mathematical half-target are genuinely small.
+/// `div_ceil` makes a five-byte target classify sizes 0, 1, and 2 as small,
+/// while an exact half is always full enough for layout work.
+fn is_small_file(size: u64, target_bytes: u64) -> bool {
+    size < target_bytes.div_ceil(2)
 }
 
 fn small_file_batch(
@@ -446,10 +487,20 @@ pub fn compact_table_files(
     inputs: &[FileRef],
     target_rows_per_group: usize,
 ) -> Result<Vec<FileRef>, crate::Error> {
+    compact_table_files_with_max_output_size(datastore, id, inputs, target_rows_per_group, None)
+}
+
+fn compact_table_files_with_max_output_size(
+    datastore: &DeltaDatastore,
+    id: uuid::Uuid,
+    inputs: &[FileRef],
+    target_rows_per_group: usize,
+    max_output_file_size: Option<u64>,
+) -> Result<Vec<FileRef>, crate::Error> {
     let table = datastore
         .table_handle_by_id(&id)
         .ok_or_else(|| crate::Error::TableNotFound(id.to_string()))?;
-    let merged = table.merge_files(inputs, target_rows_per_group)?;
+    let merged = table.merge_files(inputs, target_rows_per_group, max_output_file_size)?;
 
     let files: Vec<FileRef> = merged.iter().map(|file| file.file_ref().clone()).collect();
     let removed: Vec<ObjectPath> = inputs.iter().map(|file| file.path.clone()).collect();
@@ -499,6 +550,16 @@ mod tests {
             path: ObjectPath::new(path),
             size,
         })
+    }
+
+    #[test]
+    fn only_files_strictly_below_half_target_are_small() {
+        assert!(is_small_file(49, 100));
+        assert!(!is_small_file(50, 100));
+        assert!(!is_small_file(80, 100));
+
+        assert!(is_small_file(2, 5));
+        assert!(!is_small_file(3, 5));
     }
 
     #[test]
@@ -554,6 +615,43 @@ mod tests {
         .unwrap();
         let file = std::fs::File::create(dir.join(file_name)).unwrap();
         // SNAPPY, like every pivot-written file -- the decompressor expects it.
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_compression(parquet::basic::Compression::SNAPPY)
+            .build();
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// A sorted range with incompressible non-key payloads. Two seeds write
+    /// the same key range at almost the same byte size while retaining distinct
+    /// rows, which models two 80%-full overlapping files without footer bytes
+    /// dominating the test.
+    fn write_wide_parquet_file(dir: &Path, file_name: &str, rows: usize, seed: u64) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("Timestamp", DataType::Int64, false),
+            Field::new("Payload0", DataType::Int64, false),
+            Field::new("Payload1", DataType::Int64, false),
+            Field::new("Payload2", DataType::Int64, false),
+            Field::new("Payload3", DataType::Int64, false),
+        ]));
+        let keys: Vec<i64> = (1..=rows as i64).collect();
+        let mut columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(keys))];
+        for column in 0..4 {
+            let payload: Vec<i64> = (0..rows)
+                .map(|row| {
+                    let mut value = seed ^ row as u64 ^ ((column as u64) << 48);
+                    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                    value ^= value >> 31;
+                    value as i64
+                })
+                .collect();
+            columns.push(Arc::new(Int64Array::from(payload)));
+        }
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        let file = std::fs::File::create(dir.join(file_name)).unwrap();
         let props = parquet::file::properties::WriterProperties::builder()
             .set_compression(parquet::basic::Compression::SNAPPY)
             .build();
@@ -621,6 +719,65 @@ mod tests {
                 col_type: planner::types::Type::Int64,
             }],
             options,
+            if_not_exists: false,
+        };
+        let transaction = datastore.clone().begin_transaction();
+        transaction
+            .bind_create_table(request)
+            .unwrap()
+            .compile(dispatcher)
+            .unwrap()
+            .execute()
+            .collect()
+            .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(transaction.commit())
+            .unwrap();
+    }
+
+    fn create_wide_sorted_table(
+        datastore: &Arc<DeltaDatastore>,
+        dispatcher: &DataFlowDispatcher,
+        name: &str,
+        dir: &Path,
+    ) {
+        use datastore::DatastoreTransaction as _;
+        use planner::catalog::{Column, CreateTableRequest};
+        let request = CreateTableRequest {
+            datastore_name: None,
+            schema_name: None,
+            name: name.to_string(),
+            columns: vec![
+                Column {
+                    name: "Timestamp".to_string(),
+                    col_type: planner::types::Type::Int64,
+                },
+                Column {
+                    name: "Payload0".to_string(),
+                    col_type: planner::types::Type::Int64,
+                },
+                Column {
+                    name: "Payload1".to_string(),
+                    col_type: planner::types::Type::Int64,
+                },
+                Column {
+                    name: "Payload2".to_string(),
+                    col_type: planner::types::Type::Int64,
+                },
+                Column {
+                    name: "Payload3".to_string(),
+                    col_type: planner::types::Type::Int64,
+                },
+            ],
+            options: std::collections::HashMap::from([
+                (
+                    "with_pre_existing_parquets".to_string(),
+                    dir.to_str().unwrap().to_string(),
+                ),
+                ("sort_by".to_string(), "Timestamp".to_string()),
+            ]),
             if_not_exists: false,
         };
         let transaction = datastore.clone().begin_transaction();
@@ -827,7 +984,8 @@ mod tests {
             .map(|file| file.size)
             .max()
             .unwrap()
-            + 1;
+            .saturating_mul(2)
+            .saturating_add(1);
 
         let guarded_sweeps = run_command(
             target,
@@ -876,9 +1034,19 @@ mod tests {
         );
         let name = SchemaQualifiedTableName::in_default_schema("events");
         let table = datastore.table_handle(&name).unwrap();
+        // Exact-half files belong to layout optimization. Keep all three
+        // inputs out of the small-file path while leaving enough room for the
+        // positively-overlapping pair to produce one replacement.
+        let target = table
+            .file_refs()
+            .iter()
+            .map(|file| file.size)
+            .min()
+            .unwrap()
+            .saturating_mul(2);
 
         let guarded_sweeps = run_command(
-            1,
+            target,
             u64::MAX,
             usize::MAX,
             datastore.clone(),
@@ -888,7 +1056,7 @@ mod tests {
         );
         let guarded_files = datastore.table_handle(&name).unwrap().file_refs().len();
         let final_sweeps = run_command(
-            1,
+            target,
             u64::MAX,
             usize::MAX,
             datastore.clone(),
@@ -1005,6 +1173,195 @@ mod tests {
         dispatch.exit();
     }
 
+    /// Two 80%-full files are layout work, not small-file work. Their globally
+    /// sorted rewrite is too large for one target file, so it becomes two
+    /// balanced, disjoint ranges which neither strategy selects again.
+    #[test]
+    fn overlapping_eighty_percent_files_become_two_stable_range_files() {
+        // Exactly four normal compaction row groups across the two inputs, so
+        // the encoded result has a natural balanced boundary for two files.
+        const ROWS_PER_INPUT: usize = 256_000;
+        let dispatch = Dispatch::spin_up(2, 8 * RING_BUFFERS, None);
+        let db = tempfile::tempdir().unwrap();
+        let adopted = db.path().join("events");
+        std::fs::create_dir_all(&adopted).unwrap();
+        write_wide_parquet_file(&adopted, "left.parquet", ROWS_PER_INPUT, 11);
+        write_wide_parquet_file(&adopted, "right.parquet", ROWS_PER_INPUT, 29);
+
+        let datastore =
+            DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        create_wide_sorted_table(&datastore, dispatch.dispatcher(), "events", &adopted);
+        let name = SchemaQualifiedTableName::in_default_schema("events");
+        let table = datastore.table_handle(&name).unwrap();
+        let inputs = table.file_refs();
+        assert_eq!(inputs.len(), 2);
+        let largest_input = inputs.iter().map(|file| file.size).max().unwrap();
+        let target = largest_input.saturating_mul(5).div_ceil(4);
+        for input in &inputs {
+            let fullness = input.size as f64 / target as f64;
+            assert!(
+                (0.75..=0.81).contains(&fullness),
+                "input {} is {:.1}% of target",
+                input.path,
+                fullness * 100.0
+            );
+        }
+
+        // Verify that the actual uncapped encoding, not merely the sum of the
+        // input sizes, requires two files under this target.
+        let uncapped = table.merge_files(&inputs, ROW_GROUP_ROWS, None).unwrap();
+        assert_eq!(uncapped.len(), 1);
+        let uncapped_size = uncapped[0].file_ref().size;
+        for file in uncapped {
+            table.delete_data_file(&file.file_ref().path).unwrap();
+        }
+        assert!(uncapped_size > target);
+        assert!(uncapped_size <= target * 2);
+
+        let before_version = table.version();
+        run_one_sweep(target, datastore.clone());
+
+        let compacted = datastore.table_handle(&name).unwrap();
+        assert_eq!(compacted.version(), before_version + 1);
+        let outputs = compacted.file_refs();
+        assert_eq!(
+            outputs.len(),
+            2,
+            "target={target}, uncapped={uncapped_size}, outputs={outputs:?}"
+        );
+        assert!(outputs.iter().all(|file| file.size <= target));
+        assert!(outputs.iter().all(|file| !is_small_file(file.size, target)));
+        assert!(
+            outputs
+                .iter()
+                .all(|file| file.path.name().starts_with("pivot-"))
+        );
+
+        let mut ranges: Vec<(i64, i64)> = compacted
+            .file_entries()
+            .map(|entry| {
+                let stats = entry.stats.as_ref().unwrap();
+                let scalar = |values: &std::collections::HashMap<String, ArrayRef>| {
+                    values["Timestamp"]
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0)
+                };
+                (scalar(&stats.min_values), scalar(&stats.max_values))
+            })
+            .collect();
+        ranges.sort_unstable();
+        assert_eq!(ranges.first().unwrap().0, 1);
+        assert_eq!(ranges.last().unwrap().1, ROWS_PER_INPUT as i64);
+        assert!(ranges[0].1 < ranges[1].0, "ranges are disjoint: {ranges:?}");
+
+        let row_count: i64 = compacted
+            .build_scan_view(&[], &[])
+            .unwrap()
+            .row_groups()
+            .iter()
+            .map(|group| group.num_rows)
+            .sum();
+        assert_eq!(row_count, (2 * ROWS_PER_INPUT) as i64);
+
+        let log = db
+            .path()
+            .join(compacted.location())
+            .join("_delta_log")
+            .join(format!("{:020}.json", compacted.version()));
+        let actions: Vec<serde_json::Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| action.get("remove").is_some())
+                .count(),
+            2
+        );
+        assert_eq!(
+            actions
+                .iter()
+                .filter(|action| action.get("add").is_some())
+                .count(),
+            2
+        );
+
+        let stable_version = compacted.version();
+        let stable_paths: std::collections::HashSet<_> =
+            outputs.iter().map(|file| file.path.clone()).collect();
+        run_one_sweep(target, datastore.clone());
+        let after_normal = datastore.table_handle(&name).unwrap();
+        assert_eq!(after_normal.version(), stable_version);
+        assert_eq!(
+            after_normal
+                .file_refs()
+                .into_iter()
+                .map(|file| file.path)
+                .collect::<std::collections::HashSet<_>>(),
+            stable_paths
+        );
+        let final_sweeps = run_command(
+            target,
+            default_merge_target_bytes(target),
+            DEFAULT_MIN_FILES_TO_MERGE,
+            datastore.clone(),
+            name,
+            after_normal,
+            true,
+        );
+        assert_eq!(final_sweeps, 1);
+        assert_eq!(
+            datastore.table_handle_by_id(&table.id()).unwrap().version(),
+            stable_version
+        );
+
+        dispatch.exit();
+    }
+
+    /// The byte target is applied only between independently encoded row
+    /// groups. A group that crosses it is emitted alone without changing the
+    /// normal compaction row-group size or re-encoding the input.
+    #[test]
+    fn one_oversized_row_group_remains_one_output_file() {
+        const ROWS_PER_INPUT: usize = 8_000;
+        let dispatch = Dispatch::spin_up(2, 8 * RING_BUFFERS, None);
+        let db = tempfile::tempdir().unwrap();
+        let adopted = db.path().join("events");
+        std::fs::create_dir_all(&adopted).unwrap();
+        write_wide_parquet_file(&adopted, "left.parquet", ROWS_PER_INPUT, 11);
+        write_wide_parquet_file(&adopted, "right.parquet", ROWS_PER_INPUT, 29);
+
+        let datastore =
+            DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        create_wide_sorted_table(&datastore, dispatch.dispatcher(), "events", &adopted);
+        let table = datastore
+            .table_handle(&SchemaQualifiedTableName::in_default_schema("events"))
+            .unwrap();
+        let inputs = table.file_refs();
+        let target = inputs
+            .iter()
+            .map(|file| file.size)
+            .max()
+            .unwrap()
+            .saturating_mul(5)
+            .div_ceil(4);
+
+        let outputs = table
+            .merge_files(&inputs, ROW_GROUP_ROWS, Some(target))
+            .unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].file_ref().size > target);
+        for output in outputs {
+            table.delete_data_file(&output.file_ref().path).unwrap();
+        }
+        dispatch.exit();
+    }
+
     /// Partitioned compaction never mixes partitions, and both the replacement
     /// Adds and input tombstones retain the partition values needed to reload a
     /// valid Delta snapshot.
@@ -1052,13 +1409,30 @@ mod tests {
             .map(|file| file.size)
             .max()
             .unwrap()
-            + 1;
-        run_one_sweep(target, datastore.clone());
+            .saturating_mul(2)
+            .saturating_add(1);
+        run_command(
+            target,
+            0,
+            DEFAULT_MIN_FILES_TO_MERGE,
+            datastore.clone(),
+            name.clone(),
+            table,
+            false,
+        );
 
         // A table round performs only one small-file merge. The next round
         // handles the other partition.
         assert_eq!(datastore.table_handle(&name).unwrap().file_refs().len(), 3);
-        run_one_sweep(target, datastore.clone());
+        run_command(
+            target,
+            0,
+            DEFAULT_MIN_FILES_TO_MERGE,
+            datastore.clone(),
+            name.clone(),
+            datastore.table_handle(&name).unwrap(),
+            false,
+        );
 
         // Reload from Delta rather than trusting the in-memory swap. Exactly one
         // output per partition remains, and every original row is still present.
@@ -1168,14 +1542,25 @@ mod tests {
                 .location(),
         );
 
-        let total: u64 = datastore
+        let target = datastore
             .table_files(&SchemaQualifiedTableName::in_default_schema("events"))
             .unwrap()
             .iter()
             .map(|f| f.size)
-            .sum();
-        let target = (total as f64 / DEFAULT_MERGE_TARGET_MULTIPLIER).floor() as u64;
-        run_one_sweep(target, datastore.clone());
+            .max()
+            .unwrap()
+            .saturating_mul(2)
+            .saturating_add(1);
+        let name = SchemaQualifiedTableName::in_default_schema("events");
+        run_command(
+            target,
+            default_merge_target_bytes(target),
+            DEFAULT_MIN_FILES_TO_MERGE,
+            datastore.clone(),
+            name.clone(),
+            datastore.table_handle(&name).unwrap(),
+            true,
+        );
 
         // One merged object replaced the two inputs, in the store and in the
         // datastore's table view.

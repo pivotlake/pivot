@@ -108,6 +108,34 @@ pub(super) fn highest_scoring_pair<'a>(
     best
 }
 
+/// Whether both files contain exactly one identical value on every sort
+/// column. If their combined bytes cannot fit under the output ceiling, no
+/// range rewrite can separate them: every replacement file still has that same
+/// singleton key. The caller uses this to avoid an irreducible rewrite loop.
+pub(super) fn same_singleton_sort_key(
+    left: &DeltaFileEntry,
+    right: &DeltaFileEntry,
+    sort_by: &[String],
+) -> bool {
+    let (Some(left_stats), Some(right_stats)) = (&left.stats, &right.stats) else {
+        return false;
+    };
+    !sort_by.is_empty()
+        && sort_by.iter().all(|column| {
+            let (Some(left_min), Some(left_max), Some(right_min), Some(right_max)) = (
+                left_stats.min_values.get(column),
+                left_stats.max_values.get(column),
+                right_stats.min_values.get(column),
+                right_stats.max_values.get(column),
+            ) else {
+                return false;
+            };
+            compare(left_min, left_max) == Some(Ordering::Equal)
+                && compare(right_min, right_max) == Some(Ordering::Equal)
+                && compare(left_min, right_min) == Some(Ordering::Equal)
+        })
+}
+
 fn uniform_range<'a>(entry: &'a DeltaFileEntry, column: &str) -> Option<UniformRange<'a>> {
     let stats = entry.stats.as_ref()?;
     let rows = stats.num_records?;
@@ -515,6 +543,40 @@ mod tests {
             highest_scoring_pair(&files, &["region".into(), "id".into()]).unwrap();
         assert!((overlap - 2.0 / 3.0).abs() < 1e-12);
         assert!(highest_scoring_pair(&files, &["region".into(), "missing".into()]).is_none());
+    }
+
+    #[test]
+    fn irreducible_singleton_requires_the_same_complete_sort_key() {
+        let left = stats_entry(
+            "left",
+            &[
+                ("region", string_stat("us"), string_stat("us")),
+                ("id", int_stat(7), int_stat(7)),
+            ],
+        );
+        let same = stats_entry(
+            "same",
+            &[
+                ("region", string_stat("us"), string_stat("us")),
+                ("id", int_stat(7), int_stat(7)),
+            ],
+        );
+        let different_suffix = stats_entry(
+            "different",
+            &[
+                ("region", string_stat("us"), string_stat("us")),
+                ("id", int_stat(8), int_stat(8)),
+            ],
+        );
+
+        let sort_by = ["region".into(), "id".into()];
+        assert!(same_singleton_sort_key(&left, &same, &sort_by));
+        assert!(!same_singleton_sort_key(&left, &different_suffix, &sort_by));
+        assert!(!same_singleton_sort_key(
+            &left,
+            &same,
+            &["region".into(), "missing".into()]
+        ));
     }
 
     #[test]
