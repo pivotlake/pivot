@@ -2,7 +2,7 @@ name: Deploy Web
 
 # Puts the docs at pivotlake.io/docs and install.sh at pivotlake.io.
 #
-# Not the binaries. Deploy Server puts those in the release bucket, and
+# Not the binaries. Deploy Binaries puts those in the release bucket, and
 # install.sh looks up the newest version there when it runs, so a release does
 # not need the site redeployed.
 #

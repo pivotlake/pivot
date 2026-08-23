@@ -43,7 +43,7 @@ packaging/debian/test-install.sh dist/pivot_*.deb
 
 ## Release packages
 
-The Deploy Server workflow builds the released server with this same
+The Deploy Binaries workflow builds the released server with this same
 Dockerfile, so the `.deb` it publishes contains exactly the binary the release
 uploads. The `package` stage exports both: `dist/pivot` is the binary, and
 `dist/pivot_<version>_<arch>.deb` wraps it. Each release leg uploads
