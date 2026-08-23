@@ -29,6 +29,10 @@ pub(crate) struct FileAssemblyInfo {
     pub(crate) file_id: FileId,
     pub(crate) row_group_count: usize,
     pub(crate) partition: Option<crate::PartitionValues>,
+    /// Compressed row-group body target for compaction output; Parquet headers
+    /// and footers are excluded. `None` for INSERT and untargeted rewrites. An
+    /// individually oversized row group remains one file.
+    pub(crate) max_file_size: Option<usize>,
 }
 
 /// A complete Parquet file and the metadata needed to add it to the table.
@@ -60,6 +64,7 @@ pub(crate) struct FilePlan {
     pub(crate) assembly_worker: usize,
     pub(crate) partition: Option<crate::PartitionValues>,
     pub(crate) target_rows_per_group: usize,
+    pub(crate) max_file_size: Option<usize>,
 }
 
 /// A file whose row order is final and ready for row-group planning.

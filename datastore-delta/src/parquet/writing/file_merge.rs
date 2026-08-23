@@ -246,6 +246,7 @@ mod tests {
                 assembly_worker: 0,
                 partition: None,
                 target_rows_per_group: 1_000,
+                max_file_size: None,
             },
             order_by: Arc::from([OrderBy::new(0, false, true)]),
             row_count: 8,

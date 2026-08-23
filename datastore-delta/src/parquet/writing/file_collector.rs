@@ -29,6 +29,7 @@ pub(super) struct FileCollectorFactory {
     order_by: Arc<[OrderBy]>,
     target_rows_per_group: usize,
     target_in_memory_bytes_per_file: usize,
+    max_file_size: Option<usize>,
     topology: Topology,
 }
 
@@ -37,6 +38,7 @@ pub(super) fn factories(
     order_by: Arc<[OrderBy]>,
     target_rows_per_group: usize,
     target_in_memory_bytes_per_file: usize,
+    max_file_size: Option<usize>,
     topology: Topology,
 ) -> Vec<FileCollectorFactory> {
     (0..topology.total_workers())
@@ -45,6 +47,7 @@ pub(super) fn factories(
             order_by: order_by.clone(),
             target_rows_per_group,
             target_in_memory_bytes_per_file,
+            max_file_size,
             topology,
         })
         .collect()
@@ -59,6 +62,7 @@ impl UnaryFactory<SortedPartitionRun, FileOrderInput> for FileCollectorFactory {
             order_by: self.order_by,
             target_rows_per_group: self.target_rows_per_group,
             target_in_memory_bytes_per_file: self.target_in_memory_bytes_per_file,
+            max_file_size: self.max_file_size,
             topology: self.topology,
             pending_files_by_partition: HashMap::new(),
             next_file_id: 0,
@@ -98,6 +102,7 @@ pub(super) struct FileCollector {
     order_by: Arc<[OrderBy]>,
     target_rows_per_group: usize,
     target_in_memory_bytes_per_file: usize,
+    max_file_size: Option<usize>,
     topology: Topology,
     pending_files_by_partition: HashMap<Option<OwnedRow>, PendingFile>,
     next_file_id: u64,
@@ -132,6 +137,7 @@ impl FileCollector {
             assembly_worker: (file_id as usize) % self.topology.total_workers(),
             partition: partition_values,
             target_rows_per_group: self.target_rows_per_group,
+            max_file_size: self.max_file_size,
         };
 
         if self.order_by.is_empty() {

@@ -75,6 +75,7 @@ fn emit_column_chunk_jobs(
         file_id: plan.file_id,
         row_group_count,
         partition: plan.partition.clone(),
+        max_file_size: plan.max_file_size,
     });
 
     let mut rows_remaining = row_count;

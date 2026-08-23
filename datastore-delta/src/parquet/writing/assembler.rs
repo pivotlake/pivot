@@ -12,6 +12,7 @@
 //! recorded in the footer.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, FieldRef, SchemaRef};
@@ -124,12 +125,14 @@ impl Unary<EncodedColumnChunk, AssembledFile> for FileAssembler {
         } = self.row_groups_by_file.remove(&file_id).unwrap();
         // Parallel encoding may complete row groups out of order.
         groups.sort_by_key(|group| group.row_group_id);
-        let (bytes, metadata) = build_file(&context.schema, groups)?;
-        sender.send(AssembledFile {
-            bytes,
-            metadata,
-            partition: context.file_info.partition.clone(),
-        })?;
+        let files = build_files(&context.schema, groups, context.file_info.max_file_size)?;
+        for (bytes, metadata) in files {
+            sender.send(AssembledFile {
+                bytes,
+                metadata,
+                partition: context.file_info.partition.clone(),
+            })?;
+        }
         Ok(())
     }
 }
@@ -162,6 +165,115 @@ impl AssembledRowGroup {
             columns,
         })
     }
+}
+
+/// Build one untargeted file, or split a compaction result into the fewest
+/// possible byte-balanced files at row-group boundaries. The target applies to
+/// compressed row-group bodies, not Parquet headers and footers. Row groups are
+/// already in global sort order, so consecutive ranges also give consecutive
+/// file key ranges. An individually oversized group stays alone.
+fn build_files(
+    schema: &SchemaRef,
+    groups: Vec<AssembledRowGroup>,
+    target_size: Option<usize>,
+) -> WriteResult<Vec<(FileBytes, FileMetaData)>> {
+    let ranges = match target_size {
+        Some(target_size) if !groups.is_empty() => {
+            let weights = groups
+                .iter()
+                .map(|group| group.bytes.len())
+                .collect::<Vec<_>>();
+            balanced_row_group_ranges(&weights, target_size)
+        }
+        _ => std::iter::once(0..groups.len()).collect(),
+    };
+    let mut groups = groups.into_iter();
+    ranges
+        .into_iter()
+        .map(|range| build_file(schema, groups.by_ref().take(range.len()).collect()))
+        .collect()
+}
+
+/// Balance compressed row-group bodies across the minimum number of files.
+/// Capping planning weights at the target makes every oversized group fill a
+/// partition by itself without letting its excess distort the other ranges.
+fn balanced_row_group_ranges(weights: &[usize], target_size: usize) -> Vec<Range<usize>> {
+    debug_assert!(!weights.is_empty());
+    let weights = weights
+        .iter()
+        .map(|&weight| weight.min(target_size))
+        .collect::<Vec<_>>();
+    let file_count = minimum_file_count_for_target(&weights, target_size);
+    linear_partitions(&weights, file_count)
+}
+
+/// Greedily count the fewest target-sized files that can hold `weights` in
+/// order. Every individual weight must fit.
+fn minimum_file_count_for_target(weights: &[usize], target_size: usize) -> usize {
+    debug_assert!(!weights.is_empty());
+    debug_assert!(weights.iter().all(|&weight| weight <= target_size));
+    let mut file_count = 1;
+    let mut current_size = 0usize;
+    for &weight in weights {
+        if current_size > 0 && current_size.saturating_add(weight) > target_size {
+            file_count += 1;
+            current_size = 0;
+        }
+        current_size += weight;
+    }
+    file_count
+}
+
+/// Split positive `weights` into exactly `parts` contiguous ranges while
+/// minimizing the greatest range sum (the linear-partition problem).
+fn linear_partitions(weights: &[usize], parts: usize) -> Vec<Range<usize>> {
+    debug_assert!(!weights.is_empty());
+    debug_assert!((1..=weights.len()).contains(&parts));
+
+    // Test whether `weights` can fit into at most `parts` ranges under a
+    // candidate limit. Increasing the limit cannot require more ranges, so
+    // binary search finds the smallest feasible limit. If fewer than `parts`
+    // ranges are needed, splitting them reaches the exact count without making
+    // any range larger. For example, with two parts, `[8, 1, 1, 8]` needs three
+    // ranges under a limit of 8, while a limit of 9 permits the balanced ranges
+    // `[8, 1]` and `[1, 8]`.
+    let mut low = *weights.iter().max().unwrap();
+    let mut high = weights.iter().sum();
+    while low < high {
+        let limit = low + (high - low) / 2;
+        let mut needed = 1usize;
+        let mut current = 0usize;
+        for &weight in weights {
+            if current > 0 && current.saturating_add(weight) > limit {
+                needed += 1;
+                current = 0;
+            }
+            current += weight;
+        }
+        if needed <= parts {
+            high = limit;
+        } else {
+            low = limit + 1;
+        }
+    }
+
+    // Reconstruct from the end, filling each range to the optimal limit while
+    // reserving at least one row group for every range still to its left.
+    let mut reversed = Vec::with_capacity(parts);
+    let mut end = weights.len();
+    for remaining_parts in (2..=parts).rev() {
+        let mut start = end - 1;
+        let mut sum = weights[start];
+        while start > remaining_parts - 1 && sum.saturating_add(weights[start - 1]) <= low {
+            start -= 1;
+            sum += weights[start];
+        }
+        reversed.push(start..end);
+        end = start;
+    }
+    reversed.push(0..end);
+    reversed.reverse();
+    reversed
 }
 
 /// Stitch several assembled row groups into one Parquet file, rebasing each row
@@ -393,8 +505,47 @@ mod tests {
                 file_id: 0,
                 row_group_count: 1,
                 partition: None,
+                max_file_size: None,
             }),
         })
+    }
+
+    #[test]
+    fn target_ranges_balance_the_minimum_file_count() {
+        let weights = [8, 1, 1, 8];
+
+        assert_eq!(minimum_file_count_for_target(&weights, 10), 2);
+        assert_eq!(balanced_row_group_ranges(&weights, 10), [0..2, 2..4]);
+    }
+
+    #[test]
+    fn oversized_groups_are_singleton_files() {
+        assert_eq!(
+            balanced_row_group_ranges(&[4, 11, 4, 4], 10),
+            [0..1, 1..2, 2..4]
+        );
+    }
+
+    #[test]
+    fn linear_partitioning_is_contiguous_balanced_and_exact_count() {
+        let weights = [8, 1, 1, 8];
+        let ranges = linear_partitions(&weights, 2);
+
+        assert_eq!(ranges, [0..2, 2..4]);
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|range| weights[range.clone()].iter().sum::<usize>())
+                .collect::<Vec<_>>(),
+            [9, 9]
+        );
+
+        let ranges = linear_partitions(&[1, 1, 1, 1], 3);
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges.first().unwrap().start, 0);
+        assert_eq!(ranges.last().unwrap().end, 4);
+        assert!(ranges.windows(2).all(|pair| pair[0].end == pair[1].start));
+        assert!(ranges.iter().all(|range| !range.is_empty()));
     }
 
     /// Encode a batch the way the pipeline does — flatten each column into leaves
