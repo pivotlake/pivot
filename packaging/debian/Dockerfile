@@ -18,8 +18,11 @@ COPY . .
 # `target` is a cache mount, so it is gone by the time the stage is exported:
 # copy the binary out to /out inside the same layer. The deploy workflow ships
 # that copy and the package below wraps the very same build.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
+# sharing=locked serializes concurrent builds on one machine instead of
+# letting two cargo processes extract crates into the same cache at once,
+# which corrupts the registry.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/src/target,sharing=locked \
     cargo build --release -p cli --bin pivot \
     && install -D -m 0755 /src/target/release/pivot /out/pivot \
     && PIVOT_BINARY=/out/pivot packaging/debian/build.sh /packages \
