@@ -150,7 +150,9 @@ jobs:
           target: package
           outputs: type=local,dest=dist
           cache-from: type=gha,scope=debian-${{ matrix.deb_arch }}
-          cache-to: type=gha,scope=debian-${{ matrix.deb_arch }},mode=max
+          # ignore-error keeps a cache-service outage from failing a build
+          # whose artifacts are already produced; the next run is just colder.
+          cache-to: type=gha,scope=debian-${{ matrix.deb_arch }},mode=max,ignore-error=true
 
       - name: Inspect package
         run: packaging/debian/test-package.sh dist/pivot_*_${{ matrix.deb_arch }}.deb
