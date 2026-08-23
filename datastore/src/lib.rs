@@ -84,6 +84,10 @@ pub struct DatastoreFileMetadata {
     /// partition order, comma-separated. Empty when the table is unpartitioned,
     /// or when the file predates its partitioning.
     pub partition: String,
+    /// The file-level bounds of every column that carries statistics, as a JSON
+    /// object keyed by column name whose values each hold `min` and `max`. An
+    /// empty object means the file records no bounds.
+    pub min_max_stats: String,
 }
 
 /// One query's transaction against a **single datastore**: a consistent

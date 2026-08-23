@@ -316,6 +316,83 @@ async fn system_table_files_lists_the_files_of_a_table(#[future] conn: Conn) {
     );
 }
 
+/// Every listed file exposes its typed per-column lower and upper bounds in one
+/// variant object. Files may be split across workers, so the union of their
+/// ranges is asserted rather than assuming one particular file layout.
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn system_table_files_reports_column_bounds(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE system_file_bounds (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+    conn.simple_query("INSERT INTO system_file_bounds VALUES (3, 'c'), (1, 'a'), (2, 'b')")
+        .await
+        .unwrap();
+
+    let rows = select_rows(
+        &conn,
+        "SELECT f.min_max_stats \
+         FROM system.table_files f JOIN system.tables t ON f.\"table\" = t.id \
+         WHERE t.name = 'system_file_bounds'",
+    )
+    .await;
+    assert!(!rows.is_empty(), "the inserted files carry bounds");
+
+    let mut min_ids = Vec::new();
+    let mut max_ids = Vec::new();
+    let mut min_names = Vec::new();
+    let mut max_names = Vec::new();
+    for row in rows {
+        let stats: serde_json::Value = serde_json::from_str(row[0].as_deref().unwrap()).unwrap();
+        min_ids.push(
+            stats["id"]["min"]
+                .as_i64()
+                .expect("id minimum stays numeric"),
+        );
+        max_ids.push(
+            stats["id"]["max"]
+                .as_i64()
+                .expect("id maximum stays numeric"),
+        );
+        min_names.push(
+            stats["name"]["min"]
+                .as_str()
+                .expect("name minimum stays textual")
+                .to_string(),
+        );
+        max_names.push(
+            stats["name"]["max"]
+                .as_str()
+                .expect("name maximum stays textual")
+                .to_string(),
+        );
+    }
+
+    assert_eq!(min_ids.into_iter().min(), Some(1));
+    assert_eq!(max_ids.into_iter().max(), Some(3));
+    assert_eq!(min_names.into_iter().min().as_deref(), Some("a"));
+    assert_eq!(max_names.into_iter().max().as_deref(), Some("c"));
+
+    let extracted = select_rows(
+        &conn,
+        "SELECT CAST(f.min_max_stats.id.min AS BIGINT), \
+                CAST(f.min_max_stats.id.max AS BIGINT) \
+         FROM system.table_files f JOIN system.tables t ON f.\"table\" = t.id \
+         WHERE t.name = 'system_file_bounds'",
+    )
+    .await;
+    let extracted_min = extracted
+        .iter()
+        .map(|row| row[0].as_deref().unwrap().parse::<i64>().unwrap())
+        .min();
+    let extracted_max = extracted
+        .iter()
+        .map(|row| row[1].as_deref().unwrap().parse::<i64>().unwrap())
+        .max();
+    assert_eq!((extracted_min, extracted_max), (Some(1), Some(3)));
+}
+
 /// `system.datastores` names every datastore the server serves, the one serving
 /// the relation included.
 #[rstest]

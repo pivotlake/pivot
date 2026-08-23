@@ -168,6 +168,7 @@ const RELATIONS: [SystemRelation; 5] = [
             ("partition", Type::Utf8),
             ("bytes", Type::Int64),
             ("bytes_uncompressed", Type::Int64),
+            ("min_max_stats", Type::Variant),
         ],
         build: build_table_files,
     },
@@ -478,6 +479,7 @@ fn build_table_files(
             // size and spares clients an unsigned type they mostly lack.
             int_array(files.iter().map(|(_, file)| file.bytes as i64)),
             int_array(files.iter().map(|(_, file)| file.bytes_uncompressed as i64)),
+            variant_array(files.iter().map(|(_, file)| file.min_max_stats.clone())),
         ],
     )
 }
@@ -778,6 +780,16 @@ fn declare_columns(columns: &[(&str, Type)]) -> Vec<Column> {
 
 fn string_array(values: impl IntoIterator<Item = String>) -> ArrayRef {
     Arc::new(StringViewArray::from_iter_values(values))
+}
+
+/// Parse JSON documents into the canonical physical layout backing `VARIANT`.
+/// File bounds are assembled by their owning datastore and are valid JSON by
+/// construction, so a failure here is an invariant violation rather than a
+/// query error.
+fn variant_array(values: impl IntoIterator<Item = String>) -> ArrayRef {
+    let json = string_array(values);
+    planner::expression::json_to_canonical_variant(&json)
+        .expect("datastore file bounds are valid JSON objects")
 }
 
 fn int_array(values: impl IntoIterator<Item = i64>) -> ArrayRef {
