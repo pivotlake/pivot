@@ -1,6 +1,7 @@
 target/
 .idea/
 .tmp/
+.pivot/
 .DS_Store
 .claude/worktrees/
 

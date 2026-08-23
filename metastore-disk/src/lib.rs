@@ -107,6 +107,7 @@
 //! cannot be recovered from it), but it is still worth the same care.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -157,6 +158,56 @@ pub struct DiskMetastore {
     refresh_interval: Duration,
 }
 
+/// Users persisted in a standalone metastore file, without requiring that file
+/// to define the datastores served by the process.
+///
+/// This is the user half of [`DiskMetastore`] for callers which construct their
+/// datastores elsewhere. The file is created on first use and then rewritten by
+/// [`create_user`](Self::create_user) with the same durable SCRAM representation
+/// as a full disk metastore.
+#[derive(Debug)]
+pub struct DiskUserStore {
+    configured_users: HashMap<String, UserConfig>,
+    metastore_config: RwLock<MetastoreConfig>,
+    metastore_file: PathBuf,
+}
+
+impl DiskUserStore {
+    /// Open `path`, creating its parent directory and an empty metastore file
+    /// when this is the first direct server run in that directory.
+    pub fn open_or_create(path: &Path) -> Result<Self> {
+        create_metastore_file(path)?;
+        let metastore_config = read_config(path)?;
+        if !metastore_config.datastores.is_empty() || !metastore_config.secrets.is_empty() {
+            return Err(Error::UserStoreHasNonUserConfiguration {
+                path: path.to_path_buf(),
+            });
+        }
+        Ok(Self {
+            configured_users: HashMap::new(),
+            metastore_config: RwLock::new(metastore_config),
+            metastore_file: path.to_path_buf(),
+        })
+    }
+
+    /// The authentication method stored for `username`, including the built-in
+    /// trusted `pivot` user when the file does not override it.
+    pub fn user_auth(&self, username: &str) -> Option<UserAuth> {
+        user_auth(&self.configured_users, &self.metastore_config, username)
+    }
+
+    /// Add a user to the file and make it immediately available to logins.
+    pub fn create_user(&self, username: &str, password: Option<&str>) -> Result<()> {
+        create_user(
+            &self.configured_users,
+            &self.metastore_config,
+            Some(&self.metastore_file),
+            username,
+            password,
+        )
+    }
+}
+
 impl DiskMetastore {
     /// Build the metastore from the config file's `metastore` section, merged
     /// with the datastores and users in `metastore_file` when the server was
@@ -199,29 +250,13 @@ impl DiskMetastore {
     /// so the config in memory is authoritative and the rewrite simply
     /// serialises it; the write lock serialises writers.
     pub fn create_user(&self, username: &str, password: Option<&str>) -> Result<()> {
-        let Some(path) = &self.metastore_file else {
-            return Err(Error::NoMetastoreFile);
-        };
-        if username == DEFAULT_USER_NAME || self.server_config.users.contains_key(username) {
-            return Err(Error::UserExists {
-                name: username.to_string(),
-            });
-        }
-        let mut metastore_config = self.metastore_config.write().unwrap();
-        if metastore_config.users.contains_key(username) {
-            return Err(Error::UserExists {
-                name: username.to_string(),
-            });
-        }
-        let auth = derive_user_auth(password);
-        metastore_config
-            .users
-            .insert(username.to_string(), UserConfig { auth });
-        if let Err(error) = write_config(path, &metastore_config) {
-            metastore_config.users.remove(username);
-            return Err(error);
-        }
-        Ok(())
+        create_user(
+            &self.server_config.users,
+            &self.metastore_config,
+            self.metastore_file.as_deref(),
+            username,
+            password,
+        )
     }
 
     fn build_datastores(
@@ -308,21 +343,61 @@ impl Metastore for DiskMetastore {
     }
 
     fn user_auth(&self, username: &str) -> Option<UserAuth> {
-        if let Some(user) = self.server_config.users.get(username) {
-            return Some(user.auth.clone());
-        }
-        if let Some(user) = self.metastore_config.read().unwrap().users.get(username) {
-            return Some(user.auth.clone());
-        }
-        // The built-in trusted user, served whenever no file defined one by
-        // that name, so a server is reachable whatever else its users are.
-        (username == DEFAULT_USER_NAME).then_some(UserAuth::Trust)
+        user_auth(&self.server_config.users, &self.metastore_config, username)
     }
 
     fn create_user(&self, username: &str, password: Option<&str>) -> metastore::Result<()> {
         DiskMetastore::create_user(self, username, password)
             .map_err(|error| Box::new(error) as metastore::Error)
     }
+}
+
+fn user_auth(
+    configured_users: &HashMap<String, UserConfig>,
+    metastore_config: &RwLock<MetastoreConfig>,
+    username: &str,
+) -> Option<UserAuth> {
+    if let Some(user) = configured_users.get(username) {
+        return Some(user.auth.clone());
+    }
+    if let Some(user) = metastore_config.read().unwrap().users.get(username) {
+        return Some(user.auth.clone());
+    }
+    // The built-in trusted user, served whenever no file defined one by that
+    // name, so a server is reachable whatever else its users are.
+    (username == DEFAULT_USER_NAME).then_some(UserAuth::Trust)
+}
+
+fn create_user(
+    configured_users: &HashMap<String, UserConfig>,
+    metastore_config: &RwLock<MetastoreConfig>,
+    metastore_file: Option<&Path>,
+    username: &str,
+    password: Option<&str>,
+) -> Result<()> {
+    let Some(path) = metastore_file else {
+        return Err(Error::NoMetastoreFile);
+    };
+    if username == DEFAULT_USER_NAME || configured_users.contains_key(username) {
+        return Err(Error::UserExists {
+            name: username.to_string(),
+        });
+    }
+    let mut metastore_config = metastore_config.write().unwrap();
+    if metastore_config.users.contains_key(username) {
+        return Err(Error::UserExists {
+            name: username.to_string(),
+        });
+    }
+    let auth = derive_user_auth(password);
+    metastore_config
+        .users
+        .insert(username.to_string(), UserConfig { auth });
+    if let Err(error) = write_config(path, &metastore_config) {
+        metastore_config.users.remove(username);
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// The [`UserAuth`] a password grants: a SCRAM verifier over a fresh random
@@ -350,12 +425,67 @@ fn read_config(path: &Path) -> Result<MetastoreConfig> {
     parse_config(&std::fs::read_to_string(path)?)
 }
 
+/// Create the direct server's private state file without replacing one written
+/// by an earlier run. The containing directory and file hold authentication
+/// state, so keep them private even under a permissive umask.
+fn create_metastore_file(path: &Path) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| Error::InvalidMetastoreFile {
+        path: path.to_path_buf(),
+    })?;
+    std::fs::create_dir_all(parent)?;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(mut file) => {
+            file.write_all(b"datastores: {}\nusers: {}\nsecrets: {}\n")?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(Error::InvalidMetastoreFile {
+            path: path.to_path_buf(),
+        });
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 /// Write `config` as the metastore file's new content, via a sibling
 /// temporary file renamed into place so a crash never leaves the file half
 /// written.
 fn write_config(path: &Path, config: &MetastoreConfig) -> Result<()> {
     let temporary = path.with_extension("rewrite");
-    std::fs::write(&temporary, serde_yaml_ng::to_string(config)?)?;
+    let contents = serde_yaml_ng::to_string(config)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temporary)?;
+    file.write_all(contents.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    drop(file);
     std::fs::rename(&temporary, path)?;
     Ok(())
 }
@@ -409,6 +539,10 @@ pub enum Error {
     UserExists { name: String },
     #[error("creating a user requires a metastore file; start the server with --metastore-file")]
     NoMetastoreFile,
+    #[error("metastore path `{path}` must be a regular file")]
+    InvalidMetastoreFile { path: PathBuf },
+    #[error("direct-mode metastore file `{path}` may contain users, but not datastores or secrets")]
+    UserStoreHasNonUserConfiguration { path: PathBuf },
     #[error(
         "no default datastore is configured; mark exactly one entry under `datastores` with `default: true`"
     )]
@@ -1590,6 +1724,69 @@ datastores:
             base64.encode([1u8; 16]),
             base64.encode(&salted_password)
         )
+    }
+
+    #[test]
+    fn disk_user_store_creates_private_state_and_reopens_created_users() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(".pivot/metastore.yaml");
+        let store = DiskUserStore::open_or_create(&path).unwrap();
+
+        assert!(matches!(
+            store.user_auth(DEFAULT_USER_NAME),
+            Some(UserAuth::Trust)
+        ));
+        store.create_user("walt", Some("blue-1")).unwrap();
+        assert!(matches!(
+            store.user_auth("walt"),
+            Some(UserAuth::ScramSha256(_))
+        ));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("walt"), "{text}");
+        assert!(!text.contains("blue-1"), "{text}");
+
+        drop(store);
+        let reopened = DiskUserStore::open_or_create(&path).unwrap();
+        assert!(matches!(
+            reopened.user_auth("walt"),
+            Some(UserAuth::ScramSha256(_))
+        ));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn disk_user_store_rejects_datastores_and_secrets() {
+        for section in [
+            "datastores:\n  hot:\n    kind: delta\n    location: /tmp/hot\n    default: true\n",
+            "secrets:\n  analytics:\n    type: s3\n    region: us-east-1\n    access_key_id: key\n    secret_access_key: secret\n",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join(".pivot/metastore.yaml");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, section).unwrap();
+
+            let error = DiskUserStore::open_or_create(&path).unwrap_err();
+            assert!(
+                matches!(error, Error::UserStoreHasNonUserConfiguration { .. }),
+                "{error}"
+            );
+        }
     }
 
     #[test]

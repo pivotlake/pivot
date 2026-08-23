@@ -180,6 +180,7 @@ mod tests {
             "--default-datastore <NAME>",
             "AWS_ACCESS_KEY_ID",
             "AWS_SECRET_ACCESS_KEY",
+            "./.pivot/metastore.yaml",
         ] {
             assert!(help.contains(text), "server help omitted {text:?}:\n{help}");
         }

@@ -16,8 +16,8 @@ use datastore_delta::{
 };
 use dispatch::env::get_env_var_with_default;
 use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
-use metastore::{DEFAULT_USER_NAME, Metastore, UserAuth};
-use metastore_disk::{DiskMetastore, MetastoreConfig};
+use metastore::{Metastore, UserAuth};
+use metastore_disk::{DiskMetastore, DiskUserStore, MetastoreConfig};
 use tracing::{error, info};
 
 use crate::config::DiskCacheConfig;
@@ -51,7 +51,8 @@ pub struct ServerOptions {
     /// of `--config`. May be repeated as NAME=LOCATION; one unnamed LOCATION is
     /// served as `default`. S3 entries use AWS_ACCESS_KEY_ID and
     /// AWS_SECRET_ACCESS_KEY, with optional AWS_REGION (or AWS_DEFAULT_REGION)
-    /// and AWS_ENDPOINT_URL.
+    /// and AWS_ENDPOINT_URL. Users created through SQL are persisted in
+    /// ./.pivot/metastore.yaml.
     #[arg(
         long,
         value_name = "[NAME=]LOCATION",
@@ -233,7 +234,7 @@ fn resolve_direct_datastores(
 }
 
 /// Minimal metastore for directly supplied Delta datastores and the same
-/// built-in trusted `pivot` user a file-backed metastore supplies.
+/// persistent user store a config-backed metastore supplies.
 /// Opening through `open_store` is deliberate: its S3 path reads credentials
 /// from `AWS_*`, while `DiskMetastore` continues requiring a configured secret.
 #[derive(Debug)]
@@ -241,9 +242,24 @@ struct DirectMetastore {
     datastores: Vec<DirectDatastore>,
     default_name: String,
     refresh_interval: Duration,
+    users: DiskUserStore,
 }
 
 impl DirectMetastore {
+    fn open(
+        datastores: Vec<DirectDatastore>,
+        default_name: String,
+        refresh_interval: Duration,
+        metastore_path: &Path,
+    ) -> Result<Self, metastore_disk::Error> {
+        Ok(Self {
+            datastores,
+            default_name,
+            refresh_interval,
+            users: DiskUserStore::open_or_create(metastore_path)?,
+        })
+    }
+
     fn maintenance(&self) -> MaintenanceConfig {
         MaintenanceConfig {
             refresh_interval: self.refresh_interval,
@@ -290,7 +306,13 @@ impl Metastore for DirectMetastore {
     }
 
     fn user_auth(&self, username: &str) -> Option<UserAuth> {
-        (username == DEFAULT_USER_NAME).then_some(UserAuth::Trust)
+        self.users.user_auth(username)
+    }
+
+    fn create_user(&self, username: &str, password: Option<&str>) -> metastore::Result<()> {
+        self.users
+            .create_user(username, password)
+            .map_err(|error| Box::new(error) as metastore::Error)
     }
 }
 
@@ -305,6 +327,7 @@ struct DirectDatastoreOpenError {
 
 /// Targets whose `INFO` output is noise for an operator reading the server log.
 const QUIET_TARGETS: &str = "delta_kernel=warn,delta_kernel_default_engine=warn";
+const DIRECT_METASTORE_PATH: &str = ".pivot/metastore.yaml";
 
 fn init_tracing() {
     let requested = std::env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
@@ -490,11 +513,19 @@ pub fn run(options: ServerOptions) -> Result<(), Error> {
                 datastores,
                 default_name,
             } => {
-                let metastore: Arc<dyn Metastore> = Arc::new(DirectMetastore {
+                let metastore_path = PathBuf::from(DIRECT_METASTORE_PATH);
+                let direct = DirectMetastore::open(
                     datastores,
                     default_name,
                     refresh_interval,
-                });
+                    &metastore_path,
+                )
+                .map_err(|source| Error::Metastore {
+                    path: metastore_path.clone(),
+                    source: Box::new(source),
+                })?;
+                info!(path = %metastore_path.display(), "direct metastore ready");
+                let metastore: Arc<dyn Metastore> = Arc::new(direct);
                 let default_name = metastore.default_datastore_name().to_string();
                 let datastores = metastore
                     .open_datastores(dispatch.dispatcher())
@@ -636,8 +667,10 @@ mod tests {
     fn direct_metastore_opens_every_named_datastore() {
         let hot = tempfile::tempdir().unwrap();
         let warm = tempfile::tempdir().unwrap();
-        let metastore = DirectMetastore {
-            datastores: vec![
+        let state = tempfile::tempdir().unwrap();
+        let metastore_path = state.path().join(".pivot/metastore.yaml");
+        let metastore = DirectMetastore::open(
+            vec![
                 DirectDatastore {
                     name: "hot".to_string(),
                     location: hot.path().display().to_string(),
@@ -647,9 +680,11 @@ mod tests {
                     location: warm.path().display().to_string(),
                 },
             ],
-            default_name: "hot".to_string(),
-            refresh_interval: datastore_delta::DEFAULT_REFRESH_INTERVAL,
-        };
+            "hot".to_string(),
+            datastore_delta::DEFAULT_REFRESH_INTERVAL,
+            &metastore_path,
+        )
+        .unwrap();
         let dispatch = Dispatch::spin_up(1, 32, None);
 
         let datastores = metastore.open_datastores(dispatch.dispatcher()).unwrap();
@@ -658,6 +693,12 @@ mod tests {
         assert!(datastores.contains_key("hot"));
         assert!(datastores.contains_key("warm"));
         assert_eq!(metastore.default_datastore_name(), "hot");
+        assert!(metastore_path.is_file());
+        metastore.create_user("reader", None).unwrap();
+        assert!(matches!(
+            metastore.user_auth("reader"),
+            Some(UserAuth::Trust)
+        ));
         drop(datastores);
         dispatch.exit();
     }

@@ -115,6 +115,12 @@ Default Credentials. This environment-credential behavior belongs only to the
 direct form: `--config` continues to resolve S3 credentials from its
 `metastore.secrets` entries.
 
+On its first run in a directory, the direct form creates
+`./.pivot/metastore.yaml`. Users created with `CREATE USER` are written there as
+salted SCRAM verifiers and are available again when the server restarts from the
+same directory. The `.pivot` directory and metastore file are private to the
+current OS user (modes `0700` and `0600` on Unix).
+
 To serve several datastores without a config file, repeat `--datastore` and name
 every entry as `NAME=LOCATION`. Select which one receives unqualified table
 names with `--default-datastore`:
