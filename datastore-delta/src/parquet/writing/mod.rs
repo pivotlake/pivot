@@ -12,7 +12,8 @@
 //! Compaction replaces those two stages: its selected files already share one
 //! known partition, and every decoded batch retains its source file's sort
 //! order. It wraps each batch as a run without partitioning, sorting, or copying,
-//! then collects all selected runs into one file without a memory-size cutoff.
+//! then collects all selected runs into one candidate without a memory-size
+//! cutoff. That candidate is cut into files at the end, by encoded size.
 //!
 //! Both paths share the remainder:
 //!
@@ -29,8 +30,9 @@
 //!    nodes. Together, in slice order, they are the fully sorted file input.
 //! 7. [`row_group_planner`] divides the ordered file into column jobs.
 //! 8. [`encoder`] materializes and encodes those jobs as Parquet pages.
-//! 9. [`assembler`] returns encoded column chunks to one worker per file and
-//!    produces the final file bytes and footer metadata.
+//! 9. [`assembler`] returns encoded column chunks to one worker per candidate,
+//!    cuts the ordered row groups into files no larger than the caller's size
+//!    limit, and produces each file's bytes and footer metadata.
 //!
 //! In outline, the two merge levels are:
 //!
@@ -127,14 +129,18 @@ pub(crate) fn encode_record_batches_spec(
                 topology,
             ),
         );
-    encode_files_spec(files)
+    encode_files_spec(files, usize::MAX)
 }
 
 /// Appends Parquet construction to a compaction scan. Every input batch already
 /// belongs to the selected partition and is ordered as it was in its source
 /// file, so the INSERT-only partition/sort/copy stage is skipped. All batches
-/// form one output file; sorted tables still use the downstream k-way merge to
+/// form one candidate; sorted tables still use the downstream k-way merge to
 /// combine overlapping source-file runs.
+///
+/// The candidate is written as one file per `max_file_bytes` of encoded bytes,
+/// cut once its rows are in their final order, so merging two full files yields
+/// two files covering successive key ranges rather than one of twice the size.
 pub(crate) fn encode_compaction_batches_spec(
     spec: RecordBatchOperatorSpec,
     schema: SchemaRef,
@@ -142,6 +148,7 @@ pub(crate) fn encode_compaction_batches_spec(
     partition_column_names: Arc<[String]>,
     sort_column_names: Arc<[String]>,
     target_rows_per_group: usize,
+    max_file_bytes: usize,
 ) -> OperatorSpec<AssembledFile, impl OperatorFactory<AssembledFile> + 'static> {
     let spec = unshred_batches_spec(spec);
     let order_by = sort_order(&schema, &sort_column_names);
@@ -169,7 +176,7 @@ pub(crate) fn encode_compaction_batches_spec(
                 topology,
             ),
         );
-    encode_files_spec(files)
+    encode_files_spec(files, max_file_bytes)
 }
 
 pub(crate) fn unshred_batches_spec(spec: RecordBatchOperatorSpec) -> RecordBatchOperatorSpec {
@@ -189,10 +196,12 @@ fn sort_order(schema: &SchemaRef, sort_column_names: &[String]) -> Vec<OrderBy> 
 }
 
 /// Shared half of INSERT and compaction: merge the already-sorted runs for each
-/// output file, divide the result into row groups, encode its columns, and
-/// assemble the Parquet bytes.
+/// file candidate, divide the result into row groups, encode its columns, and
+/// assemble the Parquet bytes. A candidate holding more than `max_file_bytes` of
+/// encoded bytes is assembled as several files, in row order.
 fn encode_files_spec<OF>(
     files: OperatorSpec<FileOrderInput, OF>,
+    max_file_bytes: usize,
 ) -> OperatorSpec<AssembledFile, impl OperatorFactory<AssembledFile> + 'static>
 where
     OF: OperatorFactory<FileOrderInput> + 'static,
@@ -240,7 +249,7 @@ where
             return_to_worker_mpsc::<EncodedColumnChunk>(worker_count)
                 .into_iter()
                 .collect(),
-            assembler::factories(worker_count),
+            assembler::factories(worker_count, max_file_bytes),
         )
 }
 

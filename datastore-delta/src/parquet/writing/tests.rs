@@ -743,6 +743,7 @@ fn compaction_merges_presorted_source_runs_into_one_sorted_file() {
         Arc::from([]),
         Arc::from(["key".to_string()]),
         3,
+        usize::MAX,
     )
     .map_each(|file: AssembledFile| file.bytes.runs().flatten().copied().collect::<Vec<u8>>())
     .execute()
@@ -759,6 +760,79 @@ fn compaction_merges_presorted_source_runs_into_one_sorted_file() {
         .unwrap()
         .values();
     assert_eq!(keys, &[1, 2, 3, 4, 5, 6, 7, 8]);
+}
+
+/// A value with no pattern left for the encoder to exploit, so a test's file
+/// sizes follow its row count rather than its columns' regularity.
+fn scattered(value: i64) -> i64 {
+    let mut mixed = (value as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    mixed ^= mixed >> 33;
+    mixed = mixed.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    (mixed >> 1) as i64
+}
+
+/// Merged rows past the size limit continue in the next file: the outputs are
+/// evenly sized and cover successive key ranges, rather than one file holding
+/// everything.
+#[test]
+fn a_compaction_past_the_size_limit_is_cut_into_ordered_files() {
+    const LIMIT: usize = 256 * 1024;
+    let dispatch = Dispatch::spin_up(2, RING_BUFFERS, None);
+    // Two sources covering the same key range, as two files of one table do. The
+    // scattered payload keeps the encoded size in proportion to the rows.
+    let batches = [(0..100_000).step_by(2), (1..100_000).step_by(2)]
+        .into_iter()
+        .map(|keys| {
+            let keys: Vec<i64> = keys.collect();
+            let payload: Vec<i64> = keys.iter().copied().map(scattered).collect();
+            ColumnsItem(vec![
+                ("key", Arc::new(Int64Array::from(keys)) as ArrayRef),
+                ("payload", Arc::new(Int64Array::from(payload)) as ArrayRef),
+            ])
+            .into_batch()
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let schema = batches[0].schema();
+    let input = values_input(dispatch.dispatcher(), batches).record_batches();
+
+    let files: Vec<Vec<u8>> = encode_compaction_batches_spec(
+        input,
+        schema,
+        None,
+        Arc::from([]),
+        Arc::from(["key".to_string()]),
+        1_000,
+        LIMIT,
+    )
+    .map_each(|file: AssembledFile| file.bytes.runs().flatten().copied().collect::<Vec<u8>>())
+    .execute()
+    .collect()
+    .unwrap();
+    dispatch.exit();
+
+    let sizes: Vec<usize> = files.iter().map(Vec::len).collect();
+    assert!(sizes.len() > 1, "one merge wrote several files: {sizes:?}");
+    assert!(sizes.iter().all(|size| *size <= LIMIT), "{sizes:?}");
+    let smallest = sizes.iter().min().unwrap();
+    let largest = sizes.iter().max().unwrap();
+    assert!(smallest * 2 >= *largest, "evenly sized: {sizes:?}");
+    // Workers finish files in any order, so the outputs are read back in key
+    // order: laid end to end they are the whole input, each holding one run of it.
+    let mut by_file: Vec<Vec<i64>> = files
+        .iter()
+        .map(|file| {
+            read_back(file)
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        })
+        .collect();
+    by_file.sort_by_key(|keys| keys[0]);
+    assert_eq!(by_file.concat(), (0..100_000).collect::<Vec<i64>>());
 }
 
 /// A small in-memory target produces several internally ordered files without

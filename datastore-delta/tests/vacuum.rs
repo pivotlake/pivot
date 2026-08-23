@@ -173,7 +173,7 @@ fn compaction_merges_adopted_files_without_deleting_them() {
     assert_eq!(inputs.len(), 2, "both adopted files are live");
 
     let id = datastore.table_handle(&name).unwrap().id();
-    datastore_delta::compact_table_files(&datastore, id, &inputs, 128 * 1024).unwrap();
+    datastore_delta::compact_table_files(&datastore, id, &inputs, 128 * 1024, u64::MAX).unwrap();
     Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, datastore.clone()))
         .vacuum_all(now_ms() + EIGHT_DAYS_MS);
 

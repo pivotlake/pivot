@@ -76,6 +76,9 @@ fn bytes(array: &ArrayRef) -> Option<&[u8]> {
 /// Find the pair with the greatest overlap in the estimated rank space built
 /// from `files`. The caller has already grouped these large-file candidates by
 /// partition, so every file here contributes its rows to the same distribution.
+/// A pair in which one file holds a single value on the deciding key is not a
+/// candidate: that file is already perfectly clustered, and the rewrite would
+/// reproduce it.
 pub(super) fn highest_scoring_pair<'a>(
     files: &[&'a DeltaFileEntry],
     sort_by: &[String],
@@ -209,6 +212,11 @@ enum ColumnOverlap {
     /// Both files contain exactly the same value on this key, so the next key
     /// is the first one that can distinguish their layout.
     NextSortColumn,
+    /// One of the files holds a single value on this key, so it is already as
+    /// clustered as a rewrite could make it. Rewriting the pair would only
+    /// produce the same single-valued file again, since the merged rows are cut
+    /// back into target-sized files in key order.
+    AlreadyClustered,
     Score(f64),
 }
 
@@ -280,12 +288,20 @@ fn column_overlap(
     if left_singleton {
         let contained = compare(left_min, right_min)? != Ordering::Less
             && compare(left_min, right_max)? != Ordering::Greater;
-        return Some(ColumnOverlap::Score(if contained { 1.0 } else { 0.0 }));
+        return Some(if contained {
+            ColumnOverlap::AlreadyClustered
+        } else {
+            ColumnOverlap::Score(0.0)
+        });
     }
     if right_singleton {
         let contained = compare(right_min, left_min)? != Ordering::Less
             && compare(right_min, left_max)? != Ordering::Greater;
-        return Some(ColumnOverlap::Score(if contained { 1.0 } else { 0.0 }));
+        return Some(if contained {
+            ColumnOverlap::AlreadyClustered
+        } else {
+            ColumnOverlap::Score(0.0)
+        });
     }
 
     let intersection_min = if compare(left_min, right_min)? == Ordering::Less {
@@ -331,12 +347,13 @@ fn file_overlap(
             rank_space.get(column_index)?,
         )? {
             ColumnOverlap::NextSortColumn => continue,
+            ColumnOverlap::AlreadyClustered => return None,
             ColumnOverlap::Score(score) => return Some(score),
         }
     }
-    // Every sort key is the same singleton in both files: their layouts overlap
-    // completely even though no key has a non-zero range width.
-    Some(1.0)
+    // Every sort key is the same singleton in both files: they hold one key
+    // between them, and a rewrite would hand back the same two files.
+    None
 }
 
 #[cfg(test)]
@@ -379,7 +396,7 @@ mod tests {
 
     fn score(overlap: Option<ColumnOverlap>) -> Option<f64> {
         match overlap? {
-            ColumnOverlap::NextSortColumn => None,
+            ColumnOverlap::NextSortColumn | ColumnOverlap::AlreadyClustered => None,
             ColumnOverlap::Score(score) => Some(score),
         }
     }
@@ -470,17 +487,17 @@ mod tests {
             )),
             Some(0.0)
         );
-        assert_eq!(
-            score(column_overlap_with_rows(
+        assert!(matches!(
+            column_overlap_with_rows(
                 &int_stat(7),
                 &int_stat(7),
                 1.0,
                 &int_stat(0),
                 &int_stat(10),
                 1.0,
-            )),
-            Some(1.0)
-        );
+            ),
+            Some(ColumnOverlap::AlreadyClustered)
+        ));
         assert_eq!(
             score(column_overlap_with_rows(
                 &int_stat(11),

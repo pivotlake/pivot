@@ -51,6 +51,23 @@ impl TableFile {
         &self.entry.file
     }
 
+    /// The partition tuple this file belongs to, or `None` for an unpartitioned
+    /// table (or a file that does not sit in one partition).
+    pub(crate) fn partition(&self) -> &Option<PartitionValues> {
+        &self.entry.partition
+    }
+
+    /// This file's stored bytes, summed over its column chunks. Leaving out the
+    /// footer, which is most of what a tiny file weighs, is what makes this a
+    /// usable estimate of the same rows inside a merged file.
+    pub(crate) fn compressed_size(&self) -> u64 {
+        self.row_groups
+            .iter()
+            .flat_map(|row_group| row_group.columns.iter())
+            .map(|chunk| chunk.total_compressed_size.max(0) as u64)
+            .sum()
+    }
+
     /// What this file's bytes hold decoded, summed over its column chunks.
     fn uncompressed_size(&self) -> u64 {
         self.row_groups
@@ -783,10 +800,12 @@ impl CatalogTable {
         self.store.clone()
     }
 
-    /// Re-encode `inputs`' rows into fresh target-sized files and return them,
-    /// uploaded but not yet part of the table: the read half of a compaction,
-    /// which [`compact_table_files`](crate::compact_table_files) then swaps in
-    /// for the inputs. The merged files are written over the
+    /// Re-encode `inputs`' rows into fresh files of at most `max_file_bytes` and
+    /// return them, uploaded but not yet part of the table: the read half of a
+    /// compaction, which [`compact_table_files`](crate::compact_table_files) then
+    /// swaps in for the inputs. Merged rows past that size continue in the next
+    /// file rather than growing this one, so a sorted table's outputs cover
+    /// successive key ranges. The merged files are written over the
     /// shared io_uring ring by the same upload operators an INSERT uses, and
     /// their row groups come straight from the writer's own footer metadata, so
     /// no footer is re-read.
@@ -798,6 +817,7 @@ impl CatalogTable {
         &self,
         inputs: &[FileRef],
         target_rows_per_group: usize,
+        max_file_bytes: u64,
     ) -> crate::Result<Vec<TableFile>> {
         // The selector guarantees that all inputs share one partition, so its
         // recorded tuple can key every decoded batch without repartitioning it.
@@ -826,6 +846,7 @@ impl CatalogTable {
             Arc::from(self.partition_by()),
             Arc::from(self.sort_by()),
             target_rows_per_group,
+            usize::try_from(max_file_bytes).unwrap_or(usize::MAX),
         );
         let spec = super::insert_sink::upload_files_spec(
             self.store(),

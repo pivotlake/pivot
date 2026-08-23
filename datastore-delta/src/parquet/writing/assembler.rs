@@ -6,6 +6,11 @@
 //! writes the file footer. A file is emitted from `consume` as soon as its last
 //! expected row group arrives.
 //!
+//! A candidate whose encoded row groups exceed `max_file_bytes` is written as
+//! several files instead of one oversized file. The cut runs along row-group
+//! boundaries of the already ordered candidate, so the outputs stay in row
+//! order and their key ranges do not overlap.
+//!
 //! An [`EncodedColumnChunk`] represents one top-level schema column and may
 //! contain several primitive leaves. Leaves are written in schema order, with
 //! dictionary pages before data pages, and their offsets and statistics are
@@ -15,7 +20,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, FieldRef, SchemaRef};
-use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult};
+use dispatch::{Sender, Unary, UnaryFactory, UnaryResult};
 use thriftparquet::footer::{
     ColumnChunk, ColumnMetaData, FileMetaData, LogicalType, RowGroup, SchemaElement,
 };
@@ -40,10 +45,26 @@ const SNAPPY_CODEC: i32 = 1;
 /// Parquet format version written into the footer.
 const PARQUET_VERSION: i32 = 1;
 
-pub(super) type FileAssemblerFactory = DefaultUnaryFactory<FileAssembler>;
+pub(super) struct FileAssemblerFactory {
+    max_file_bytes: usize,
+}
 
-pub(super) fn factories(worker_count: usize) -> Vec<FileAssemblerFactory> {
-    DefaultUnaryFactory::create_for_workers(worker_count)
+pub(super) fn factories(worker_count: usize, max_file_bytes: usize) -> Vec<FileAssemblerFactory> {
+    (0..worker_count)
+        .map(|_| FileAssemblerFactory { max_file_bytes })
+        .collect()
+}
+
+impl UnaryFactory<EncodedColumnChunk, AssembledFile> for FileAssemblerFactory {
+    type Unary = FileAssembler;
+
+    fn build_unary(self) -> FileAssembler {
+        FileAssembler {
+            max_file_bytes: self.max_file_bytes,
+            chunks_by_row_group: HashMap::new(),
+            row_groups_by_file: HashMap::new(),
+        }
+    }
 }
 
 /// Items accumulated until an expected count is reached. The same helper is
@@ -72,8 +93,10 @@ impl<V> Gathering<V> {
 }
 
 /// Per-worker state for row groups and files that are still being assembled.
-#[derive(Default)]
 pub(super) struct FileAssembler {
+    /// Largest file this assembler writes, in encoded row-group bytes. A
+    /// candidate holding more than this is cut into several files.
+    max_file_bytes: usize,
     chunks_by_row_group: HashMap<RowGroupId, Gathering<EncodedColumnChunk>>,
     row_groups_by_file: HashMap<FileId, Gathering<AssembledRowGroup>>,
 }
@@ -124,12 +147,14 @@ impl Unary<EncodedColumnChunk, AssembledFile> for FileAssembler {
         } = self.row_groups_by_file.remove(&file_id).unwrap();
         // Parallel encoding may complete row groups out of order.
         groups.sort_by_key(|group| group.row_group_id);
-        let (bytes, metadata) = build_file(&context.schema, groups)?;
-        sender.send(AssembledFile {
-            bytes,
-            metadata,
-            partition: context.file_info.partition.clone(),
-        })?;
+        for file_groups in cut_into_files(groups, self.max_file_bytes) {
+            let (bytes, metadata) = build_file(&context.schema, file_groups)?;
+            sender.send(AssembledFile {
+                bytes,
+                metadata,
+                partition: context.file_info.partition.clone(),
+            })?;
+        }
         Ok(())
     }
 }
@@ -142,7 +167,43 @@ struct AssembledRowGroup {
     columns: Vec<ColumnChunk>,
 }
 
+/// The footer space one column chunk takes: its path, statistics, and the fixed
+/// thrift framing around the offsets and sizes describing its pages.
+fn footer_bytes(chunk: &ColumnChunk) -> usize {
+    /// Field headers, offsets, sizes, counts, and the encoding list of one
+    /// `ColumnChunk` entry, none of which vary with the data.
+    const FIXED_COLUMN_CHUNK_BYTES: usize = 96;
+    let Some(meta_data) = chunk.meta_data.as_ref() else {
+        return FIXED_COLUMN_CHUNK_BYTES;
+    };
+    let path: usize = meta_data
+        .path_in_schema
+        .iter()
+        .map(|part| part.len() + 2)
+        .sum();
+    let statistics = meta_data.statistics.as_ref().map_or(0, |statistics| {
+        [
+            &statistics.min,
+            &statistics.max,
+            &statistics.min_value,
+            &statistics.max_value,
+        ]
+        .into_iter()
+        .map(|value| value.as_ref().map_or(0, |value| value.len() + 2))
+        .sum()
+    });
+    FIXED_COLUMN_CHUNK_BYTES + path + statistics
+}
+
 impl AssembledRowGroup {
+    /// What this row group costs the file that takes it: its encoded pages plus
+    /// the footer entry each of its column chunks needs. The footer is written
+    /// after the pages, so counting it here is what keeps a cut file inside the
+    /// caller's size limit rather than that much over it.
+    fn file_bytes(&self) -> usize {
+        self.bytes.len() + self.columns.iter().map(footer_bytes).sum::<usize>()
+    }
+
     /// Writes a row group's encoded columns in schema order.
     fn new(row_group_id: RowGroupId, mut chunks: Vec<EncodedColumnChunk>) -> WriteResult<Self> {
         // Workers may return columns in any order. Leaves within each column
@@ -162,6 +223,47 @@ impl AssembledRowGroup {
             columns,
         })
     }
+}
+
+/// Divide one candidate's row groups, in row order, into the files it is written
+/// as. No file holds more than `max_file_bytes` of row groups and their footer
+/// entries -- only a single row group larger than that is written oversized,
+/// since it cannot be cut further.
+///
+/// The outputs are levelled rather than filled: a candidate at twice the limit
+/// becomes two half-sized files instead of a full one and a sliver. Levelling
+/// aims at the mean of what is left, so the row groups a closed file could not
+/// take are re-divided over the files that remain.
+fn cut_into_files(
+    groups: Vec<AssembledRowGroup>,
+    max_file_bytes: usize,
+) -> Vec<Vec<AssembledRowGroup>> {
+    let mut remaining_bytes: usize = groups.iter().map(AssembledRowGroup::file_bytes).sum();
+    let mut target_bytes = levelled_file_bytes(remaining_bytes, max_file_bytes);
+    let mut files = Vec::new();
+    let mut file: Vec<AssembledRowGroup> = Vec::new();
+    let mut file_bytes = 0;
+    for group in groups {
+        if !file.is_empty() && file_bytes + group.file_bytes() > target_bytes {
+            remaining_bytes -= file_bytes;
+            target_bytes = levelled_file_bytes(remaining_bytes, max_file_bytes);
+            files.push(std::mem::take(&mut file));
+            file_bytes = 0;
+        }
+        file_bytes += group.file_bytes();
+        file.push(group);
+    }
+    // A candidate always holds at least one row group, so the last file is never
+    // empty.
+    files.push(file);
+    files
+}
+
+/// The size to aim each of the remaining files at: `remaining_bytes` spread over
+/// the fewest files that can hold it.
+fn levelled_file_bytes(remaining_bytes: usize, max_file_bytes: usize) -> usize {
+    let file_count = remaining_bytes.div_ceil(max_file_bytes).max(1);
+    remaining_bytes.div_ceil(file_count).max(1)
 }
 
 /// Stitch several assembled row groups into one Parquet file, rebasing each row
