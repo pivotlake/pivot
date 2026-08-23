@@ -388,10 +388,11 @@ jobs:
           PIVOT_BASE_URL=$DOWNLOAD_URL sh packaging/install/install.sh
           "$HOME/.pivot/cli/latest/pivot" --version
 
-  # Build the pivot server image and push it to Docker Hub (pivotlake/pivot),
-  # tagged with both the commit SHA and `latest`. Independent of the binary
-  # matrix above, but shares the self-hosted gcp-builder when opted in, so it
-  # waits on start-ci to resume the box.
+  # Build the pivot server image and push it to Docker Hub (pivotlake/pivot).
+  # Candidates get their versioned rc tag only. Real releases get their
+  # workspace version and move `latest`. Independent of the binary matrix
+  # above, but shares the self-hosted gcp-builder when opted in, so it waits on
+  # start-ci to resume the box.
   docker:
     name: Build & push Docker image
     needs: [start-ci]
@@ -413,15 +414,38 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Resolve Docker tags
+        id: docker_tags
+        run: |
+          set -euo pipefail
+          workspace_version=$(grep -m1 '^version = ' Cargo.toml | sed 's/^version = "\(.*\)"$/\1/')
+          case "$workspace_version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::Could not read the workspace version from Cargo.toml (got '$workspace_version')."; exit 1 ;;
+          esac
+
+          if [ "${{ inputs.release_candidate }}" = "true" ]; then
+            version=$workspace_version-rc$(git rev-parse --short=7 HEAD)
+          else
+            version=$workspace_version
+          fi
+
+          {
+            echo "tags<<EOF"
+            echo "pivotlake/pivot:$version"
+            if [ "${{ inputs.release_candidate }}" != "true" ]; then
+              echo "pivotlake/pivot:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build & push
         uses: docker/build-push-action@v5
         with:
           context: .
           file: server/Dockerfile
           push: true
-          tags: |
-            pivotlake/pivot:${{ github.sha }}
-            pivotlake/pivot:latest
+          tags: ${{ steps.docker_tags.outputs.tags }}
           cache-from: type=gha,scope=server
           cache-to: type=gha,scope=server,mode=max
 
