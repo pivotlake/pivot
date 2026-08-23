@@ -409,7 +409,7 @@ pub fn open_store(uri: &str) -> Result<Box<dyn ObjectStore>> {
     match StoreScheme::of(uri)? {
         StoreScheme::S3 => Ok(Box::new(S3Store::with_env_credentials(uri)?)),
         StoreScheme::Gcs => Ok(Box::new(GcsStore::with_default_credentials(uri)?)),
-        StoreScheme::Local => Ok(Box::new(LocalStore::new(local_path(uri)))),
+        StoreScheme::Local => Ok(Box::new(LocalStore::new(local_path(uri))?)),
     }
 }
 

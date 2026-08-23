@@ -3,6 +3,32 @@ use engine::{Command, ExecuteOptions, StatementOutput};
 use shell::ShellInstance;
 
 #[test]
+fn a_table_can_be_created_in_a_relative_datastore_path() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let current_dir = std::env::current_dir().unwrap();
+    let parent = tempfile::tempdir_in(&current_dir).unwrap();
+    let path = parent.path().join("data");
+    let location = path.strip_prefix(&current_dir).unwrap().to_str().unwrap();
+    let instance = runtime
+        .block_on(async { ShellInstance::open_with_resources(location, 1, 32) })
+        .unwrap();
+
+    let create = runtime.block_on(instance.engine().execute(
+        "CREATE TABLE test (value INT)".to_string(),
+        ExecuteOptions::default(),
+    ));
+
+    assert!(matches!(
+        create.unwrap().output,
+        StatementOutput::Command(Command::CreateTable)
+    ));
+    assert!(path.join("_pivot_manifest.json").is_file());
+}
+
+#[test]
 fn a_datastore_is_created_at_the_requested_path_and_persists() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
