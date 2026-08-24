@@ -3,11 +3,33 @@ title: Quickstart
 description: Start a server, create a table, run a query.
 ---
 
-## Build and run
+## Install on Debian or Ubuntu
 
 ```sh
-cargo build --release -p server
-./target/release/pivotdb-server --config pivot.yaml
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl gnupg
+curl -fsSL https://packages.pivotlake.io/keys/pivotlake-archive-key.asc |
+  sudo gpg --dearmor --yes -o /usr/share/keyrings/pivotlake-archive-keyring.gpg
+
+ARCH=$(dpkg --print-architecture)
+echo "deb [signed-by=/usr/share/keyrings/pivotlake-archive-keyring.gpg arch=${ARCH}] https://packages.pivotlake.io/deb stable main" |
+  sudo tee /etc/apt/sources.list.d/pivotlake.list
+sudo apt-get update
+sudo apt-get install -y pivot
+```
+
+Use `testing` instead of `stable` in the repository line to receive release
+candidates. Then inspect the packaged service:
+
+```sh
+sudo systemctl status pivot
+```
+
+## Build from source
+
+```sh
+cargo build --release -p cli --bin pivot
+./target/release/pivot server --config pivot.yaml
 ```
 
 The server listens on the Postgres wire protocol, so any Postgres client

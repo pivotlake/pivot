@@ -8,6 +8,11 @@
 # amd64 and arm64.
 FROM rust:1-slim-bullseye AS builder
 
+# The binary keeps Cargo's version, while the Debian package can carry an
+# independently ordered release-candidate version supplied by the release
+# workflow (for example 0.2.0~rc.20260824.120000+git.abcdef0).
+ARG PIVOT_DEB_VERSION
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential cmake clang libclang-dev pkg-config git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -25,7 +30,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
     cargo build --release -p cli --bin pivot \
     && install -D -m 0755 /src/target/release/pivot /out/pivot \
-    && PIVOT_BINARY=/out/pivot packaging/debian/build.sh /packages \
+    && PIVOT_BINARY=/out/pivot PIVOT_DEB_VERSION="$PIVOT_DEB_VERSION" \
+        packaging/debian/build.sh /packages \
     && packaging/debian/test-package.sh /packages/*.deb
 
 # The `.deb` plus the unstripped binary it was built from. build.sh strips only
