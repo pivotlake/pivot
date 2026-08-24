@@ -36,7 +36,7 @@ on:
         type: boolean
         default: true
       override:
-        description: "Override previous version deployment"
+        description: "Delete and republish an existing version (installed APT clients will not upgrade)"
         type: boolean
         default: false
 
@@ -427,7 +427,7 @@ jobs:
           "$HOME/.pivot/cli/latest/pivot" --version
 
   # Upload the two already-tested package artifacts. Artifact Registry retains
-  # the immutable packages and generates and signs the APT indexes.
+  # versioned packages and generates and signs the APT indexes.
   publish-apt:
     name: Publish the APT repository (${{ needs.version.outputs.apt_distribution }})
     needs: [deploy, version]
@@ -474,8 +474,11 @@ jobs:
       - name: Publish packages to Artifact Registry
         run: |
           set -euo pipefail
-          packaging/debian/repository/publish.sh \
-            "$APT_PROJECT" "$APT_LOCATION" "$DISTRIBUTION" packages/*.deb
+          arguments=("$APT_PROJECT" "$APT_LOCATION" "$DISTRIBUTION")
+          if [ "${{ inputs.override }}" = true ]; then
+            arguments+=(--override)
+          fi
+          packaging/debian/repository/publish.sh "${arguments[@]}" packages/*.deb
 
       - name: Test apt update and install from the public URL
         run: |
