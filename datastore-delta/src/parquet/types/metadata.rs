@@ -8,6 +8,7 @@
 //! the byte-level layout of an individual column chunk needed by the
 //! decompressor to locate pages on disk.
 
+use crate::parquet::filter_cache::FilterResultCache;
 use crate::parquet::types::table::ParquetTable;
 use arrow_array::{ArrayRef, Scalar};
 use arrow_schema::SchemaRef;
@@ -92,6 +93,13 @@ pub struct RowGroupMetadata {
     /// repeated scan consumes what's already decompressed before its own churn
     /// can evict it.
     pub live_decompressed_pages: Arc<AtomicUsize>,
+    /// Remembered outcomes of pushed-down equality predicates a scan evaluated
+    /// against this row group's data. The next scan consults it at claim time
+    /// and skips the row group when a remembered predicate (or conjunction of
+    /// predicates) matched no row. Shared (`Arc`) like the row group itself, so
+    /// every query sees one cache; dropped with the metadata when the file is
+    /// rewritten.
+    pub filter_cache: Arc<FilterResultCache>,
 }
 
 impl RowGroupMetadata {

@@ -45,6 +45,10 @@ mod metadata;
 pub use metadata::{FileRowGroups, create_load_and_stage_spec};
 pub(crate) use metadata::{file_row_groups_from_metadata, load_file_row_groups};
 
+mod filter_cache;
+pub use filter_cache::FilterResultCache;
+pub(crate) use filter_cache::filter_with_cached_outcomes;
+
 mod row_group_stats;
 pub use row_group_stats::{
     RowGroupFilter, ScanOrder, bounds_eliminate, row_group_eliminated, row_group_filter_from,
@@ -81,6 +85,7 @@ pub(crate) mod test_utils {
             num_rows: 0,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            filter_cache: Default::default(),
         })
     }
 

@@ -1870,3 +1870,108 @@ fn materialize_reads_a_row_group_split_across_batches_exactly_once() {
     let total: usize = results.iter().map(|b| b.num_rows()).sum();
     assert_eq!(total, 400_000);
 }
+
+/// Write each batch as its own single-row-group plain-encoded (no dictionary)
+/// file, so a pushed equality constant can only be proven by decoding rows.
+fn plain_files_table(
+    dispatch: &DispatchGuard,
+    batches: &[RecordBatch],
+) -> (TempDir, Arc<ParquetTable>) {
+    let dir = TempDir::new().unwrap();
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .set_dictionary_enabled(false)
+        .build();
+    for (i, batch) in batches.iter().enumerate() {
+        let file = std::fs::File::create(dir.path().join(format!("f{i}.parquet"))).unwrap();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props.clone())).unwrap();
+        writer.write(batch).unwrap();
+        writer.close().unwrap();
+    }
+    let table = parquet_table_from_dir(dispatch, dir.path());
+    (dir, table)
+}
+
+fn i64_eq_predicate(
+    column_idx: usize,
+    value: i64,
+) -> datastore_delta::parquet::ScanEqualityPredicate {
+    use arrow_array::Scalar;
+    datastore_delta::parquet::ScanEqualityPredicate {
+        column_idx,
+        path: Vec::new(),
+        value: Scalar::new(Arc::new(Int64Array::from(vec![value])) as ArrayRef),
+    }
+}
+
+fn eq_scan(
+    dispatch: &DispatchGuard,
+    table: &Arc<ParquetTable>,
+    predicates: Vec<datastore_delta::parquet::ScanEqualityPredicate>,
+) -> usize {
+    datastore_delta::parquet::table_input_with_filter_and_eq_predicates(
+        dispatch,
+        table,
+        Projection::all(2),
+        false,
+        None,
+        None,
+        Arc::new(predicates),
+    )
+    .collect()
+    .unwrap()
+    .iter()
+    .map(|b| b.num_rows())
+    .sum()
+}
+
+/// A repeated scan skips a row group the first scan proved holds no row for
+/// the pushed equality constant: the first scan emits every row (plain pages
+/// cannot prune), the second only the row group that contains the value.
+#[test]
+fn repeated_scan_skips_row_groups_a_prior_scan_proved_empty() {
+    let dispatch = dispatch(1);
+    let with_value = strings_and_ints(&["a", "b", "c"], &[1, 2, 3]);
+    let without_value = strings_and_ints(&["d", "e", "f"], &[4, 5, 6]);
+    let (_dir, table) = plain_files_table(&dispatch, &[with_value, without_value]);
+
+    let first = eq_scan(&dispatch, &table, vec![i64_eq_predicate(1, 2)]);
+    let second = eq_scan(&dispatch, &table, vec![i64_eq_predicate(1, 2)]);
+
+    assert_eq!(first, 6);
+    assert_eq!(second, 3);
+}
+
+/// A conjunction of predicates that each match some row, but never the same
+/// row, also skips the row group on the next scan carrying both.
+#[test]
+fn repeated_scan_skips_row_groups_via_a_proved_empty_conjunction() {
+    let dispatch = dispatch(1);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int64, false),
+        Field::new("b", DataType::Int64, false),
+    ]));
+    let ints = |a: &[i64], b: &[i64]| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(a.to_vec())),
+                Arc::new(Int64Array::from(b.to_vec())),
+            ],
+        )
+        .unwrap()
+    };
+    let never_together = ints(&[5, 1, 2], &[3, 8, 9]);
+    let together = ints(&[5, 0, 0], &[8, 0, 0]);
+    let (_dir, table) = plain_files_table(&dispatch, &[never_together, together]);
+    let predicates = vec![i64_eq_predicate(0, 5), i64_eq_predicate(1, 8)];
+
+    let first = eq_scan(&dispatch, &table, predicates.clone());
+    let second = eq_scan(&dispatch, &table, predicates.clone());
+    let one_predicate = eq_scan(&dispatch, &table, vec![i64_eq_predicate(0, 5)]);
+
+    assert_eq!(first, 6);
+    assert_eq!(second, 3);
+    // `a = 5` alone matched rows in both row groups, so neither is skipped.
+    assert_eq!(one_predicate, 6);
+}

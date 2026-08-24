@@ -128,6 +128,11 @@ pub fn table_input_with_filter_and_eq_predicates(
     eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
 ) -> RecordBatchOperatorSpec {
     let n = dispatcher.worker_count();
+    // A row group an earlier scan proved empty for these predicates (its
+    // remembered filter outcomes, see `FilterResultCache`) is skipped at claim
+    // time, before any of its pages are fetched. Composed onto the dynamic
+    // filter so both act at the same, index-preserving point.
+    let filter = crate::parquet::filter_with_cached_outcomes(eq_predicates.clone(), filter);
     // A projection with no data columns can't go through the column-driven page
     // pipeline (it would fetch nothing and emit no rows), so route it to a source
     // that emits each row group's rows straight from `num_rows` (no IO, no

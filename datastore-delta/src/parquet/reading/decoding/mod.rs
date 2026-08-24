@@ -319,6 +319,7 @@ mod tests {
             num_rows,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            filter_cache: Default::default(),
         })]))
     }
 
@@ -406,6 +407,7 @@ mod tests {
             num_rows,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            filter_cache: Default::default(),
         })]))
     }
 
@@ -484,15 +486,30 @@ mod tests {
     }
 
     fn decoder_with_eq(table: &Arc<ParquetTable>, predicate: ScanEqualityPredicate) -> Decoder {
+        decoder_with_eqs(table, vec![predicate])
+    }
+
+    fn decoder_with_eqs(
+        table: &Arc<ParquetTable>,
+        predicates: Vec<ScanEqualityPredicate>,
+    ) -> Decoder {
         Decoder::new(
             1024,
             Projection::all_from_schema(table.schema()),
             false,
-            Arc::new(vec![predicate]),
+            Arc::new(predicates),
             // The claim-release counters; seeded like `new_decoder`'s.
             Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX / 2)),
             Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX / 2)),
         )
+    }
+
+    fn i32_eq_predicate(column_idx: usize, value: i32) -> ScanEqualityPredicate {
+        ScanEqualityPredicate {
+            column_idx,
+            path: Vec::new(),
+            value: Scalar::new(Arc::new(Int32Array::from(vec![value])) as ArrayRef),
+        }
     }
 
     fn extract_strings(batch: &RecordBatch, col: usize) -> Vec<String> {
@@ -559,6 +576,130 @@ mod tests {
 
         let rows: Vec<i32> = out.iter().flat_map(|b| extract_i32s(b, 1)).collect();
         assert_eq!(rows, vec![1, 2, 3]);
+    }
+
+    /// A fully decoded row group remembers each pushed equality predicate's
+    /// outcome in its metadata's filter cache: present values as matched,
+    /// absent ones as not.
+    #[test]
+    fn full_decode_records_filter_outcomes() {
+        init_test_free_pool(4);
+        let table = make_test_table(i32_schema(&["a"]), 3);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, None);
+        let page = make_data_page(metadata, 0, encode_i32s(&[10, 20, 30]), 3, 0);
+        let decoder = decoder_with_eq(&table, i32_eq_predicate(0, 83));
+
+        run_unary_to_completion(decoder, vec![page]);
+
+        let cache = &table.row_groups()[0].filter_cache;
+        assert_eq!(cache.lookup(&[&i32_eq_predicate(0, 83)]), Some(false));
+        assert_eq!(cache.lookup(&[&i32_eq_predicate(0, 20)]), None);
+    }
+
+    /// A matched predicate is remembered as matched, so it can never skip the
+    /// row group later.
+    #[test]
+    fn full_decode_records_a_matched_predicate() {
+        init_test_free_pool(4);
+        let table = make_test_table(i32_schema(&["a"]), 3);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, None);
+        let page = make_data_page(metadata, 0, encode_i32s(&[10, 20, 30]), 3, 0);
+
+        run_unary_to_completion(decoder_with_eq(&table, i32_eq_predicate(0, 20)), vec![page]);
+
+        let cache = &table.row_groups()[0].filter_cache;
+        assert_eq!(cache.lookup(&[&i32_eq_predicate(0, 20)]), Some(true));
+        assert!(!cache.proves_no_match(&[i32_eq_predicate(0, 20)]));
+    }
+
+    /// Two predicates that each match some row but never the same row record
+    /// their conjunction as unmatched, alongside both matched singles.
+    #[test]
+    fn full_decode_records_an_unmatched_conjunction() {
+        init_test_free_pool(4);
+        let table = make_test_table(i32_schema(&["a", "b"]), 3);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, None);
+        let page_a = make_data_page(metadata.clone(), 0, encode_i32s(&[5, 1, 2]), 3, 0);
+        let page_b = make_data_page(metadata, 1, encode_i32s(&[3, 8, 9]), 3, 0);
+        let a_is_5 = i32_eq_predicate(0, 5);
+        let b_is_8 = i32_eq_predicate(1, 8);
+        let decoder = decoder_with_eqs(&table, vec![a_is_5.clone(), b_is_8.clone()]);
+
+        run_unary_to_completion(decoder, vec![page_a, page_b]);
+
+        let cache = &table.row_groups()[0].filter_cache;
+        assert_eq!(cache.lookup(&[&a_is_5]), Some(true));
+        assert_eq!(cache.lookup(&[&b_is_8]), Some(true));
+        assert_eq!(cache.lookup(&[&a_is_5, &b_is_8]), Some(false));
+        assert!(cache.proves_no_match(&[a_is_5.clone(), b_is_8]));
+        assert!(!cache.proves_no_match(&[a_is_5]));
+    }
+
+    /// A dictionary that excludes the pushed constant proves the predicate
+    /// without decoding any data page, and the miss is remembered.
+    #[test]
+    fn dictionary_pruning_records_the_miss() {
+        init_test_free_pool(4);
+        let schema = i32_schema(&["a"]);
+        let file = dispatch::io::LocalFile::new(std::fs::File::open("/dev/null").unwrap()).unwrap();
+        let table = Arc::new(ParquetTable::new(vec![Arc::new(RowGroupMetadata {
+            open_file: dispatch::io::OpenFile::Local(file),
+            schema,
+            columns: vec![ColumnChunkMeta {
+                dictionary_page_offset: Some(0),
+                data_page_offset: 0,
+                total_compressed_size: 0,
+                total_uncompressed_size: 0,
+                max_def_level: 0,
+                physical_type: 0,
+                fixed_len_byte_width: None,
+                statistics: None,
+                data_pages_all_dictionary: true,
+            }],
+            num_rows: 3,
+            file_row_group_idx: 0,
+            live_decompressed_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            filter_cache: Default::default(),
+        })]));
+        let metadata = QueryRowGroupMetadata::new(&table, 0, None);
+        let dict_header = PageHeader::for_dict_page(2);
+        let dict = DecompressedPage {
+            worker_id: 0,
+            query_row_group_metadata: metadata,
+            column_idx: 0,
+            idx: 0,
+            data: DecompressedPageType::Dict {
+                header: dict_header.dictionary_page_header.unwrap(),
+                data: vec![Bytes::from(encode_i32s(&[10, 20]))],
+            },
+        };
+        let predicate = i32_eq_predicate(0, 99);
+        let decoder = decoder_with_eq(&table, predicate.clone());
+
+        let out = run_unary_to_completion(decoder, vec![dict]);
+
+        assert!(out.is_empty());
+        let cache = &table.row_groups()[0].filter_cache;
+        assert_eq!(cache.lookup(&[&predicate]), Some(false));
+    }
+
+    /// A filtered read decodes only some rows, which proves nothing about the
+    /// whole row group, so no outcome is remembered.
+    #[test]
+    fn partial_reads_record_no_outcome() {
+        init_test_free_pool(4);
+        let table = make_test_table(i32_schema(&["a"]), 3);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, Some(vec![0, 1]));
+        let page = make_data_page(metadata, 0, encode_i32s(&[10, 20, 30]), 3, 0);
+
+        run_unary_to_completion(decoder_with_eq(&table, i32_eq_predicate(0, 83)), vec![page]);
+
+        assert_eq!(
+            table.row_groups()[0]
+                .filter_cache
+                .lookup(&[&i32_eq_predicate(0, 83)]),
+            None
+        );
     }
 
     /// Single Int32 column, one page → one RecordBatch with correct values.

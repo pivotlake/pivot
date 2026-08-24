@@ -6,6 +6,7 @@
 //! decompressor. When every projected column has enough buffered rows,
 //! [`try_read`](RowGroupDecoder::try_read) decodes the next batch.
 
+use crate::parquet::filter_cache::FilterResultCache;
 use crate::parquet::reading::decoding::ScanEqualityPredicate;
 use crate::parquet::reading::decoding::column_decoder::{
     ColumnDecoder, Result, create_leaf_decoder,
@@ -16,7 +17,7 @@ use crate::parquet::types::leaves::{leaf_fields, plan_leaves, resolve_output_rea
 use crate::parquet::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata};
 use crate::parquet::types::page::DecompressedPage;
 use crate::parquet::types::projection::Projection;
-use arrow_array::RecordBatch;
+use arrow_array::{ArrayRef, BooleanArray, Datum, RecordBatch, Scalar};
 use arrow_schema::{Fields, Schema, SchemaRef};
 use dispatch::memory::SlabAllocator;
 use std::cmp::min;
@@ -31,6 +32,18 @@ struct PrunableColumn {
     output_idx: usize,
     /// The leaf whose dictionary decides the pruning.
     leaf: usize,
+}
+
+/// A pushed equality predicate whose outcome this decoder can prove for the
+/// whole row group: its output column emits the compared leaf unchanged and
+/// every row is decoded, so "no decoded row equals the constant" means the row
+/// group holds no matching row at all.
+struct TrackedPredicate {
+    predicate: ScanEqualityPredicate,
+    /// The column's position in the emitted batch.
+    output_idx: usize,
+    /// Whether any decoded row equaled the constant so far.
+    matched: bool,
 }
 
 /// Decodes pages for a single row group into [`RecordBatch`]es.
@@ -77,6 +90,17 @@ pub struct RowGroupDecoder {
     /// by their position inside the row group, so every row has to stay in
     /// place.
     filter_batches: bool,
+    /// The pushed equality predicates whose outcome this full-row-group decode
+    /// proves (empty when only a subset of rows is read); recorded into
+    /// `filter_cache` so a later scan can skip the row group.
+    tracked_predicates: Vec<TrackedPredicate>,
+    /// Whether any single decoded row satisfied *every* tracked predicate at
+    /// once. Only evaluated with two or more tracked predicates: the recorded
+    /// conjunction lets a later scan skip the row group even when each
+    /// predicate matches some row on its own.
+    conjunction_matched: bool,
+    /// The row group's shared filter-outcome memory, off its metadata.
+    filter_cache: Arc<FilterResultCache>,
 }
 
 impl RowGroupDecoder {
@@ -131,6 +155,15 @@ impl RowGroupDecoder {
             eq_predicates,
         );
 
+        // A filtered read decodes only some rows, which can't prove a value
+        // absent from the whole row group, so nothing is tracked.
+        let tracked_predicates = if row_group_metadata.filtered_indices().is_none() {
+            trackable_predicates(&column_decoders, projection, eq_predicates)
+        } else {
+            Vec::new()
+        };
+        let filter_cache = row_group_metadata.get_metadata().filter_cache.clone();
+
         let output_fields: Fields = column_decoders
             .iter()
             .map(|decoder| decoder.output_field().clone())
@@ -151,6 +184,9 @@ impl RowGroupDecoder {
             prunable,
             pruned,
             filter_batches,
+            tracked_predicates,
+            conjunction_matched: false,
+            filter_cache,
         })
     }
 
@@ -187,6 +223,17 @@ impl RowGroupDecoder {
             // the decoder discards the rest, and the decompressor can skip the
             // row group's remaining, not-yet-decompressed pages.
             self.pruned.store(true, Ordering::Relaxed);
+            // An excluding dictionary covers every row of the chunk, so it
+            // proves the predicate matches no row even though nothing decodes.
+            for tracked in &self.tracked_predicates {
+                let excluded = self.prunable.iter().any(|p| {
+                    p.output_idx == tracked.output_idx
+                        && self.leaf_decoders[p.leaf].dict_excludes_eq_constant()
+                });
+                if excluded {
+                    self.filter_cache.record(&[&tracked.predicate], false);
+                }
+            }
         }
     }
 
@@ -223,6 +270,7 @@ impl RowGroupDecoder {
                 .iter()
                 .map(|decoder| decoder.read(&decoded))
                 .collect::<Result<Vec<_>>>()?;
+            self.evaluate_tracked_predicates(&columns);
             let record_batch = RecordBatch::try_new(self.schema.clone(), columns)?;
             // Give each column carrying a pushed-down equality constant a
             // chance to drop rows that provably fail it, before the batch
@@ -243,11 +291,122 @@ impl RowGroupDecoder {
                 record_batch
             };
             self.row_offset += available;
+            if self.row_offset == self.total {
+                self.record_tracked_outcomes();
+            }
             Ok(Some(batch))
         } else {
             Ok(None)
         }
     }
+
+    /// Check each not-yet-matched tracked predicate against this batch's
+    /// decoded columns, and (with several tracked predicates) whether any row
+    /// satisfies all of them at once. A predicate's first match is recorded to
+    /// the row group's cache immediately, so even a scan abandoned early (a
+    /// LIMIT) remembers what it proved; "matched no row" waits for the full
+    /// decode in [`record_tracked_outcomes`](Self::record_tracked_outcomes).
+    fn evaluate_tracked_predicates(&mut self, columns: &[ArrayRef]) {
+        let need_conjunction = self.tracked_predicates.len() > 1 && !self.conjunction_matched;
+        if !need_conjunction && self.tracked_predicates.iter().all(|t| t.matched) {
+            return;
+        }
+        let mut all_satisfied: Option<BooleanArray> = None;
+        for tracked in &mut self.tracked_predicates {
+            if tracked.matched && !need_conjunction {
+                continue;
+            }
+            let matches =
+                rows_equal_to_constant(&columns[tracked.output_idx], &tracked.predicate.value);
+            if !tracked.matched && matches.true_count() > 0 {
+                tracked.matched = true;
+                self.filter_cache.record(&[&tracked.predicate], true);
+            }
+            if need_conjunction {
+                all_satisfied = Some(match all_satisfied {
+                    None => matches,
+                    Some(so_far) => arrow_arith::boolean::and(&so_far, &matches)
+                        .expect("equal-length match masks over one batch"),
+                });
+            }
+        }
+        if all_satisfied.is_some_and(|rows| rows.true_count() > 0) {
+            self.conjunction_matched = true;
+        }
+    }
+
+    /// The whole row group decoded: every tracked predicate's outcome is now
+    /// proven, so remember the misses (matches were recorded as they were
+    /// found). The conjunction adds information only when every predicate
+    /// matched on its own; any individually-false predicate is the stronger
+    /// fact, pruning every query that pushes it.
+    fn record_tracked_outcomes(&self) {
+        for tracked in &self.tracked_predicates {
+            if !tracked.matched {
+                self.filter_cache.record(&[&tracked.predicate], false);
+            }
+        }
+        if self.tracked_predicates.len() > 1
+            && !self.conjunction_matched
+            && self.tracked_predicates.iter().all(|t| t.matched)
+        {
+            let predicates: Vec<&ScanEqualityPredicate> = self
+                .tracked_predicates
+                .iter()
+                .map(|t| &t.predicate)
+                .collect();
+            self.filter_cache.record(&predicates, false);
+        }
+    }
+}
+
+/// The rows of `column` equal to `constant`, as a boolean mask (a NULL row is
+/// never equal). The caller verified both sides share a type, and every leaf
+/// type the decoder emits is comparable, so the kernel cannot fail.
+fn rows_equal_to_constant(column: &ArrayRef, constant: &Scalar<ArrayRef>) -> BooleanArray {
+    arrow_ord::cmp::eq(&column.as_ref() as &dyn Datum, constant as &dyn Datum)
+        .expect("comparison of same-typed leaf column and constant")
+}
+
+/// The pushed equality predicates whose outcome this decode can prove: each
+/// must read its compared leaf unchanged into the emitted batch (same shape
+/// rule as [`install_eq_constants`]) and its constant must share the emitted
+/// column's type so the comparison kernel applies. A NULL constant is skipped;
+/// it equals nothing and the cache would not remember it anyway.
+fn trackable_predicates(
+    column_decoders: &[ColumnDecoder],
+    projection: &Projection,
+    eq_predicates: &[ScanEqualityPredicate],
+) -> Vec<TrackedPredicate> {
+    let mut tracked = Vec::new();
+    for (output_idx, &column) in projection.column_indices.iter().enumerate() {
+        if column_decoders[output_idx].untransformed_leaf().is_none() {
+            continue;
+        }
+        let path = projection
+            .extract_at(output_idx)
+            .map(|extract| extract.path.as_slice())
+            .unwrap_or_default();
+        let Some(predicate) = eq_predicates
+            .iter()
+            .find(|p| p.column_idx == column && p.path == path)
+        else {
+            continue;
+        };
+        let (constant, _) = predicate.value.get();
+        if constant.len() != 1 || constant.is_null(0) {
+            continue;
+        }
+        if column_decoders[output_idx].output_field().data_type() != constant.data_type() {
+            continue;
+        }
+        tracked.push(TrackedPredicate {
+            predicate: predicate.clone(),
+            output_idx,
+            matched: false,
+        });
+    }
+    tracked
 }
 
 /// Installs each pushed-down equality constant on the leaf that answers it, and

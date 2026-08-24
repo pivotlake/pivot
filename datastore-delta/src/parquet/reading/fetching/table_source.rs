@@ -504,6 +504,7 @@ mod tests {
             num_rows: 0,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
+            filter_cache: Default::default(),
         })
     }
 
