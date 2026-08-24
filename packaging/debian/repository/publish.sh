@@ -9,14 +9,22 @@ fail() {
     exit 1
 }
 
-[ "$#" -ge 5 ] || fail 'usage: publish.sh PROJECT LOCATION stable|testing PACKAGE-amd64.deb PACKAGE-arm64.deb'
+[ "$#" -ge 5 ] || fail 'usage: publish.sh PROJECT LOCATION stable|testing [--override] PACKAGE-amd64.deb PACKAGE-arm64.deb'
 project=$1
 location=$2
 distribution=$3
 shift 3
+override=false
+if [ "${1:-}" = --override ]; then
+    override=true
+    shift
+fi
+
+[ "$#" -ge 2 ] || fail 'both amd64 and arm64 packages are required'
 
 command -v dpkg-deb >/dev/null 2>&1 || fail "required command 'dpkg-deb' was not found"
 command -v gcloud >/dev/null 2>&1 || fail "required command 'gcloud' was not found"
+command -v grep >/dev/null 2>&1 || fail "required command 'grep' was not found"
 command -v sha256sum >/dev/null 2>&1 || fail "required command 'sha256sum' was not found"
 [ -n "$project" ] || fail 'the Artifact Registry project is required'
 [ -n "$location" ] || fail 'the Artifact Registry location is required'
@@ -66,7 +74,7 @@ esac
 # People who opt into testing receive final releases too. Publish finals to
 # testing first so a failure can't advance stable while leaving testing on its
 # previous candidate. Artifact Registry retains older package versions and
-# generates and signs the APT indexes after each immutable upload.
+# generates and signs the APT indexes after each upload.
 repositories=testing
 if [ "$distribution" = stable ]; then
     repositories='testing stable'
@@ -106,6 +114,24 @@ for repository in $repositories; do
     format=$(gcloud artifacts repositories describe "$repository" \
         --project="$project" --location="$location" --format='value(format)')
     [ "$format" = APT ] || fail "'$repository' is not an APT repository in $project/$location"
+
+    if [ "$override" = true ]; then
+        versions=$(gcloud artifacts versions list \
+            --package=pivot \
+            --repository="$repository" \
+            --project="$project" \
+            --location="$location" \
+            --format='value(name.basename())')
+        if printf '%s\n' "$versions" | grep -Fqx "$version"; then
+            printf 'Deleting Pivot %s from %s before override\n' "$version" "$repository"
+            gcloud artifacts versions delete "$version" \
+                --package=pivot \
+                --repository="$repository" \
+                --project="$project" \
+                --location="$location" \
+                --quiet
+        fi
+    fi
 
     # Upload the foreign architecture first. A brief partially updated window
     # can then affect only that architecture; the hosted amd64 publisher and

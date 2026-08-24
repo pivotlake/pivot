@@ -1,7 +1,7 @@
 # PivotLake APT repository
 
-Google Artifact Registry stores the immutable Debian packages and generates
-and signs the repository metadata served at `https://packages.pivotlake.io/deb`.
+Google Artifact Registry stores the versioned Debian packages and generates and
+signs the repository metadata served at `https://packages.pivotlake.io/deb`.
 
 Two public APT repositories in `pivot-packages/us` are the release lines:
 
@@ -30,6 +30,10 @@ package artifacts and uploads them with `gcloud artifacts apt upload`.
 - A final release updates `testing` first and then `stable`.
 - Artifact Registry retains older package versions, so an indexed version can
   be selected with `apt-get install pivot=<version>`.
+- The deploy workflow's emergency `override` option deletes the existing
+  version from each target repository before uploading both architectures
+  again. Clients that already installed that version will not receive the new
+  package from `apt upgrade`.
 - Artifact Registry generates and signs the APT metadata.
 - The workflow tests the exact public URL in a fresh Debian container without
   installing Google's `apt-transport-artifact-registry` helper.
@@ -48,8 +52,9 @@ PIVOT_APT_URL=https://packages.pivotlake.io/deb
 ```
 
 The existing `GCP_SA_KEY` service account needs Artifact Registry Writer on
-the `stable` and `testing` repositories. Both repositories grant Artifact
-Registry Reader to `allUsers`.
+the `stable` and `testing` repositories. Overrides additionally require the
+`artifactregistry.versions.delete` permission. Both repositories grant
+Artifact Registry Reader to `allUsers`.
 
 Publishing no longer uses a repository-signing secret or private reprepro
 state. The previous GCS objects are retained temporarily as rollback data.
