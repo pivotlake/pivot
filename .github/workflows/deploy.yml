@@ -27,6 +27,10 @@ on:
         description: "Publish the CLI binaries"
         type: boolean
         default: true
+      publish_apt:
+        description: "Publish the Debian package repository"
+        type: boolean
+        default: true
       release_candidate:
         description: "Publish as release candidate"
         type: boolean
@@ -56,9 +60,20 @@ on:
 #                                     DEPLOY_GCS_BUCKET above.
 #   PIVOT_DOWNLOAD_URL     (variable) how that bucket is reached over HTTPS,
 #                                     e.g. https://storage.googleapis.com/pivot-releases
+# publish_apt additionally uses:
+#   PIVOT_APT_PROJECT       (variable) Artifact Registry project, e.g. epsio-io
+#   PIVOT_APT_LOCATION      (variable) Artifact Registry location, e.g. us
+#   PIVOT_APT_URL           (variable) public proxy URL, e.g.
+#                                     https://packages.pivotlake.io/deb
 
 env:
   CARGO_TERM_COLOR: always
+
+# Serializing releases prevents stable/testing updates from interleaving and
+# makes candidate package timestamps strictly increase between runs.
+concurrency:
+  group: pivot-release
+  cancel-in-progress: false
 
 jobs:
   # Resolve which arch legs to build from the checkbox inputs. A deselected arch
@@ -76,6 +91,10 @@ jobs:
             echo "::error::The Docker image wraps the released binaries for both architectures. Enable build_x86_64 and build_aarch64, or disable push_docker."
             exit 1
           fi
+          if [ "${{ inputs.publish_apt }}" = "true" ] && { [ "${{ inputs.build_x86_64 }}" != "true" ] || [ "${{ inputs.build_aarch64 }}" != "true" ]; }; then
+            echo "::error::The APT repository publishes amd64 and arm64 atomically. Enable both architectures, or disable publish_apt."
+            exit 1
+          fi
           legs=()
           if [ "${{ inputs.build_x86_64 }}" = "true" ]; then
             legs+=('{"arch":"x86_64","deb_arch":"amd64","runner":"ubuntu-24.04"}')
@@ -90,6 +109,48 @@ jobs:
           include=$(IFS=,; echo "[${legs[*]}]")
           echo "include=$include" >> "$GITHUB_OUTPUT"
           echo "Building: $include"
+
+  # Resolve every public version once so the parallel architecture legs, raw
+  # downloads, Docker tags, git tag, and APT repository cannot disagree. APT
+  # gets Debian ordering syntax; the existing public artifact names stay
+  # backward compatible.
+  version:
+    name: Resolve release versions
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.version.outputs.release }}
+      deb: ${{ steps.version.outputs.deb }}
+      apt_distribution: ${{ steps.version.outputs.apt_distribution }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: version
+        run: |
+          set -euo pipefail
+          workspace_version=$(grep -m1 '^version = ' Cargo.toml | sed 's/^version = "\(.*\)"$/\1/')
+          case "$workspace_version" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::Could not read the workspace version from Cargo.toml (got '$workspace_version')."; exit 1 ;;
+          esac
+          short_sha=$(git rev-parse --short=7 HEAD)
+          if [ "${{ inputs.release_candidate }}" = "true" ]; then
+            timestamp=$(date -u +'%Y%m%d.%H%M%S')
+            release=$workspace_version-rc$short_sha
+            deb=$workspace_version~rc.$timestamp+git.$short_sha
+            apt_distribution=testing
+          else
+            release=$workspace_version
+            deb=$workspace_version
+            apt_distribution=stable
+          fi
+          dpkg --validate-version "$deb"
+          printf 'Release version: %s\nDebian version: %s\nAPT distribution: %s\n' \
+            "$release" "$deb" "$apt_distribution"
+          {
+            echo "release=$release"
+            echo "deb=$deb"
+            echo "apt_distribution=$apt_distribution"
+          } >> "$GITHUB_OUTPUT"
 
   # Bring the self-hosted GCP VMs online when opted in: ci-runner2 (x86_64
   # binary build) and ci-runner-arm (aarch64 binary build). Each box only
@@ -118,10 +179,10 @@ jobs:
           zone: europe-west3-b
 
   deploy:
-    needs: [matrix, start-ci, start-ci-arm]
+    needs: [matrix, version, start-ci, start-ci-arm]
     # The start jobs are skipped unless opted in, so accept their skipped
     # results too.
-    if: ${{ always() && needs.matrix.result == 'success' && (needs.start-ci.result == 'success' || needs.start-ci.result == 'skipped') && (needs.start-ci-arm.result == 'success' || needs.start-ci-arm.result == 'skipped') }}
+    if: ${{ always() && needs.matrix.result == 'success' && needs.version.result == 'success' && (needs.start-ci.result == 'success' || needs.start-ci.result == 'skipped') && (needs.start-ci-arm.result == 'success' || needs.start-ci-arm.result == 'skipped') }}
     name: Build ${{ matrix.arch }} release + package + upload to GCS
     # Each arch builds on its native self-hosted box when opted in (gcp-builder
     # is X64, gcp-builder-arm is ARM64); otherwise on the hosted runner from the
@@ -152,6 +213,8 @@ jobs:
           file: packaging/debian/Dockerfile
           target: package
           outputs: type=local,dest=dist
+          build-args: |
+            PIVOT_DEB_VERSION=${{ needs.version.outputs.deb }}
           cache-from: type=gha,scope=debian-${{ matrix.deb_arch }}
           # ignore-error keeps a cache-service outage from failing a build
           # whose artifacts are already produced; the next run is just colder.
@@ -226,13 +289,14 @@ jobs:
   # release here reaches users without touching the site at all.
   publish-install:
     name: Publish the CLI download
-    needs: [deploy]
+    needs: [deploy, version]
     if: ${{ inputs.publish_install }}
     runs-on: ubuntu-latest
     env:
       BUCKET: ${{ vars.PIVOT_DOWNLOAD_BUCKET }}
       DOWNLOAD_URL: ${{ vars.PIVOT_DOWNLOAD_URL }}
       PLATFORMS: linux-amd64 linux-arm64
+      VERSION: ${{ needs.version.outputs.release }}
     steps:
       - uses: actions/checkout@v4
 
@@ -261,33 +325,10 @@ jobs:
           pattern: pivot-binary-*
           path: binaries
 
-      # A release candidate carries the commit so it cannot be confused with the
-      # real thing, and so successive candidates for one version coexist. The
-      # release itself is exactly what Cargo.toml names.
-      - name: Resolve the release version
-        id: release
-        run: |
-          set -euo pipefail
-          workspace_version=$(grep -m1 '^version = ' Cargo.toml | sed 's/^version = "\(.*\)"$/\1/')
-          case "$workspace_version" in
-            [0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "::error::Could not read the workspace version from Cargo.toml (got '$workspace_version')."; exit 1 ;;
-          esac
-          if [ "${{ inputs.release_candidate }}" = "true" ]; then
-            version=$workspace_version-rc$(git rev-parse --short=7 HEAD)
-            echo "Publishing Pivot $version, a candidate for $workspace_version"
-          else
-            version=$workspace_version
-            echo "Publishing Pivot $version"
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
       # A published version is immutable: people have it installed, and its
       # objects are served with a year-long cache lifetime, so rewriting one is
       # not reliably visible to anyone who already fetched it.
       - name: Refuse to republish an existing version
-        env:
-          VERSION: ${{ steps.release.outputs.version }}
         run: |
           set -euo pipefail
           if gcloud storage ls "$BUCKET/v$VERSION/" >/dev/null 2>&1; then
@@ -303,8 +344,6 @@ jobs:
       # latest_version.txt pointing at a set missing the caller's platform is
       # broken for that caller, and nothing in the bucket would say so.
       - name: Assemble the release tree
-        env:
-          VERSION: ${{ steps.release.outputs.version }}
         run: |
           set -euo pipefail
           release_directory=release/v$VERSION
@@ -325,8 +364,6 @@ jobs:
           ls -l "$release_directory"
 
       - name: Publish the release to the bucket
-        env:
-          VERSION: ${{ steps.release.outputs.version }}
         run: |
           set -euo pipefail
           # A version directory never changes, so it can be cached forever. The
@@ -358,8 +395,6 @@ jobs:
       # it: the bytes back off the network, then the script from this commit
       # driven end to end against them.
       - name: Verify what the bucket serves
-        env:
-          VERSION: ${{ steps.release.outputs.version }}
         run: |
           set -euo pipefail
           for platform in $PLATFORMS; do
@@ -391,6 +426,66 @@ jobs:
           PIVOT_BASE_URL=$DOWNLOAD_URL sh packaging/install/install.sh
           "$HOME/.pivot/cli/latest/pivot" --version
 
+  # Upload the two already-tested package artifacts. Artifact Registry retains
+  # the immutable packages and generates and signs the APT indexes.
+  publish-apt:
+    name: Publish the APT repository (${{ needs.version.outputs.apt_distribution }})
+    needs: [deploy, version]
+    if: ${{ inputs.publish_apt }}
+    runs-on: ubuntu-latest
+    env:
+      APT_PROJECT: ${{ vars.PIVOT_APT_PROJECT }}
+      APT_LOCATION: ${{ vars.PIVOT_APT_LOCATION }}
+      APT_URL: ${{ vars.PIVOT_APT_URL }}
+      DEB_VERSION: ${{ needs.version.outputs.deb }}
+      DISTRIBUTION: ${{ needs.version.outputs.apt_distribution }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the repository configuration
+        run: |
+          set -euo pipefail
+          missing=
+          [ -n "$APT_PROJECT" ] || missing="$missing\n  PIVOT_APT_PROJECT (variable): e.g. epsio-io"
+          [ -n "$APT_LOCATION" ] || missing="$missing\n  PIVOT_APT_LOCATION (variable): e.g. us"
+          [ -n "$APT_URL" ] || missing="$missing\n  PIVOT_APT_URL (variable): e.g. https://packages.pivotlake.io/deb"
+          if [ -n "$missing" ]; then
+            printf "::error::APT publishing is not configured. Set:%b\n" "$missing"
+            exit 1
+          fi
+          case "$APT_PROJECT:$APT_LOCATION:$APT_URL" in
+            *:*:https://*) ;;
+            *) echo "::error::PIVOT_APT_PROJECT/location are required and PIVOT_APT_URL must be HTTPS."; exit 1 ;;
+          esac
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pivot-deb-*
+          path: packages
+          merge-multiple: true
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Publish packages to Artifact Registry
+        run: |
+          set -euo pipefail
+          packaging/debian/repository/publish.sh \
+            "$APT_PROJECT" "$APT_LOCATION" "$DISTRIBUTION" packages/*.deb
+
+      - name: Test apt update and install from the public URL
+        run: |
+          packaging/debian/repository/test-repository.sh \
+            "$APT_URL" "$DISTRIBUTION" "$DEB_VERSION"
+          if [ "$DISTRIBUTION" = stable ]; then
+            packaging/debian/repository/test-repository.sh \
+              "$APT_URL" testing "$DEB_VERSION"
+          fi
+
   # Wrap the released binaries in the pivot server image and push it to Docker
   # Hub (pivotlake/pivot) as a multi-arch (amd64 + arm64) image. Candidates get
   # their versioned rc tag only. Real releases get their workspace version and
@@ -399,7 +494,7 @@ jobs:
   # the released server, and the build takes seconds on a hosted runner.
   docker:
     name: Build & push Docker image
-    needs: [deploy]
+    needs: [deploy, version]
     if: ${{ always() && inputs.push_docker && needs.deploy.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
@@ -419,23 +514,12 @@ jobs:
 
       - name: Resolve Docker tags
         id: docker_tags
+        env:
+          VERSION: ${{ needs.version.outputs.release }}
         run: |
-          set -euo pipefail
-          workspace_version=$(grep -m1 '^version = ' Cargo.toml | sed 's/^version = "\(.*\)"$/\1/')
-          case "$workspace_version" in
-            [0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "::error::Could not read the workspace version from Cargo.toml (got '$workspace_version')."; exit 1 ;;
-          esac
-
-          if [ "${{ inputs.release_candidate }}" = "true" ]; then
-            version=$workspace_version-rc$(git rev-parse --short=7 HEAD)
-          else
-            version=$workspace_version
-          fi
-
           {
             echo "tags<<EOF"
-            echo "pivotlake/pivot:$version"
+            echo "pivotlake/pivot:$VERSION"
             if [ "${{ inputs.release_candidate }}" != "true" ]; then
               echo "pivotlake/pivot:latest"
             fi
@@ -469,10 +553,10 @@ jobs:
   # v0.3.0 for a real release, v0.3.0-rc<sha> for a candidate.
   tag-release:
     name: Tag the release
-    needs: [deploy, publish-install, docker]
-    # publish-install and docker are skipped when deselected; tag once at
-    # least one of them published a version and nothing failed.
-    if: ${{ always() && needs.deploy.result == 'success' && (needs.publish-install.result == 'success' || needs.publish-install.result == 'skipped') && (needs.docker.result == 'success' || needs.docker.result == 'skipped') && (needs.publish-install.result == 'success' || needs.docker.result == 'success') }}
+    needs: [deploy, version, publish-install, publish-apt, docker]
+    # Publishers are skipped when deselected; tag once at least one published a
+    # version and every selected publisher succeeded.
+    if: ${{ always() && needs.deploy.result == 'success' && needs.version.result == 'success' && (needs.publish-install.result == 'success' || needs.publish-install.result == 'skipped') && (needs.publish-apt.result == 'success' || needs.publish-apt.result == 'skipped') && (needs.docker.result == 'success' || needs.docker.result == 'skipped') && (needs.publish-install.result == 'success' || needs.publish-apt.result == 'success' || needs.docker.result == 'success') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -480,19 +564,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Create and push the release tag
+        env:
+          VERSION: ${{ needs.version.outputs.release }}
         run: |
           set -euo pipefail
-          workspace_version=$(grep -m1 '^version = ' Cargo.toml | sed 's/^version = "\(.*\)"$/\1/')
-          case "$workspace_version" in
-            [0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "::error::Could not read the workspace version from Cargo.toml (got '$workspace_version')."; exit 1 ;;
-          esac
-          if [ "${{ inputs.release_candidate }}" = "true" ]; then
-            version=$workspace_version-rc$(git rev-parse --short=7 HEAD)
-          else
-            version=$workspace_version
-          fi
-          tag=v$version
+          tag=v$VERSION
 
           # A tag, like a published version, is immutable: it may only move
           # when the run explicitly overrides a previous deployment.
@@ -511,7 +587,7 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag --annotate --message "Pivot $version" "$tag" "${{ github.sha }}"
+          git tag --annotate --message "Pivot $VERSION" "$tag" "${{ github.sha }}"
           git push --force origin "$tag"
 
   # NOTE: no stop job here. Each self-hosted box runs an hourly if-unused cron
