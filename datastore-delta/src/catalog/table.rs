@@ -7,14 +7,14 @@ use crate::Error;
 use crate::manifest::{
     ColumnStatFilter, DeltaFileEntry, FileStats, PartitionEqFilter, PartitionValues, scalar_equal,
 };
-use crate::parquet::{ParquetTable, RowGroupMetadata};
-use crate::store::{self, DataFile, FileRef, ObjectPath, ObjectStore};
 use arrow_array::{Array, ArrayRef, Datum, Scalar};
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use arrow_schema::DataType;
 use crossbeam_deque::{Injector, Steal};
 use datastore::{DatastoreColumnMetadata, DatastoreFileMetadata, DatastoreTableMetadata};
 use dispatch::{DataFlowDispatcher, Projection};
+use parquet_engine::{ParquetTable, RowGroupMetadata};
+use object_storage::{self, DataFile, FileRef, ObjectPath, ObjectStore};
 use planner::catalog::{Column, SchemaQualifiedTableName};
 
 /// One data file of a table, materialized: its Delta log entry
@@ -40,7 +40,7 @@ impl TableFile {
     /// adopted at CREATE, or whose log entry recorded no stats.
     pub(crate) fn new(mut entry: DeltaFileEntry, row_groups: Vec<Arc<RowGroupMetadata>>) -> Self {
         if entry.stats.is_none() && !row_groups.is_empty() {
-            entry.stats = Some(Arc::new(crate::parquet::aggregate_file_stats(&row_groups)));
+            entry.stats = Some(Arc::new(parquet_engine::aggregate_file_stats(&row_groups)));
         }
         Self { entry, row_groups }
     }
@@ -150,7 +150,7 @@ impl CatalogTable {
     pub(super) fn create_new(
         id: uuid::Uuid,
         location: ObjectPath,
-        loaded: Vec<crate::parquet::FileRowGroups>,
+        loaded: Vec<parquet_engine::FileRowGroups>,
         columns: Vec<Column>,
         partition_by: Vec<String>,
         sort_by: Vec<String>,
@@ -424,7 +424,7 @@ impl CatalogTable {
         &self,
         entries: &[DeltaFileEntry],
         columns: &[Column],
-    ) -> crate::Result<Vec<crate::parquet::FileRowGroups>> {
+    ) -> crate::Result<Vec<parquet_engine::FileRowGroups>> {
         let to_fetch: Vec<DataFile> = entries
             .iter()
             .map(|e| {
@@ -432,8 +432,8 @@ impl CatalogTable {
                     .clone()
                     .into_data_file(self.store.as_ref(), &self.location)
             })
-            .collect::<store::Result<_>>()?;
-        Ok(crate::parquet::load_file_row_groups(
+            .collect::<object_storage::Result<_>>()?;
+        Ok(parquet_engine::load_file_row_groups(
             &self.dispatcher,
             &to_fetch,
             columns.to_vec().into(),
@@ -543,7 +543,7 @@ impl CatalogTable {
         for row_group in self.files.iter().flat_map(|file| file.row_groups.iter()) {
             let mut leaf = 0;
             for field in row_group.schema.fields() {
-                let leaves = crate::parquet::types::leaves::leaf_count(field);
+                let leaves = parquet_engine::leaf_count(field);
                 if let Some(&position) = position_by_name.get(field.name().as_str()) {
                     for chunk in &row_group.columns[leaf..leaf + leaves] {
                         totals[position].0 += chunk.total_compressed_size.max(0) as u64;
@@ -586,7 +586,7 @@ impl CatalogTable {
 
     /// A scannable [`ParquetTable`] over just the `wanted` files (matched by
     /// path) — the compaction read view: feed it to
-    /// [`table_input`](crate::parquet::table_input) to decode their rows.
+    /// [`table_input`](parquet_engine::table_input) to decode their rows.
     pub fn parquet_table_for(&self, wanted: &[FileRef]) -> Arc<ParquetTable> {
         let want: HashSet<&ObjectPath> = wanted.iter().map(|f| &f.path).collect();
         let row_groups = self
@@ -806,7 +806,7 @@ impl CatalogTable {
         // recorded tuple can key every decoded batch without repartitioning it.
         let parquet = self.parquet_table_for(inputs);
         let columns = parquet.schema().fields().len();
-        let scan = crate::parquet::table_input(
+        let scan = parquet_engine::table_input(
             &self.dispatcher,
             &parquet,
             Projection::all(columns),
@@ -824,7 +824,7 @@ impl CatalogTable {
         let max_output_file_size =
             max_output_file_size.map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX));
         let uploaded_files = Arc::new(Injector::new());
-        let encoded = crate::parquet::writing::encode_compaction_batches_spec(
+        let encoded = parquet_engine::writing::encode_compaction_batches_spec(
             scan,
             parquet.schema().clone(),
             partition,
@@ -856,7 +856,7 @@ impl CatalogTable {
                         row_groups,
                         ..
                     } = uploaded;
-                    let stats = Some(std::sync::Arc::new(crate::parquet::aggregate_file_stats(
+                    let stats = Some(std::sync::Arc::new(parquet_engine::aggregate_file_stats(
                         &row_groups,
                     )));
                     let entry = DeltaFileEntry {

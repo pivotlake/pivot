@@ -1,0 +1,31 @@
+[package]
+name = "object-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PivotDB object-store backends and ring-readable data-file locations."
+
+[dependencies]
+dispatch = { workspace = true }
+arrow-cast = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ureq = { workspace = true, features = ["json"] }
+aws-sigv4 = "1"
+aws-credential-types = "1"
+quick-xml = { version = "0.37", features = ["serialize"] }
+ring = "0.17"
+base64 = { workspace = true }
+url = { workspace = true }
+
+testcontainers = { version = "0.24", features = ["blocking"], optional = true }
+testcontainers-modules = { version = "0.12", features = ["minio"], optional = true }
+tempfile = { workspace = true, optional = true }
+
+[features]
+test-support = ["dep:testcontainers", "dep:testcontainers-modules", "dep:tempfile"]
+
+[dev-dependencies]
+dispatch = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }

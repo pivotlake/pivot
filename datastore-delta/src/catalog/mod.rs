@@ -42,13 +42,13 @@ use std::sync::{Arc, Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::manifest::{self, CatalogManifest, DeltaFileEntry};
-use crate::parquet::ParquetTableError;
-use crate::store::{self, DataFile, FileRef, ObjectPath, ObjectStore, open_store};
 use async_trait::async_trait;
 use crossbeam_deque::{Injector, Steal};
 use datastore::{Datastore, DatastoreTableMetadata, DatastoreTransaction};
 use dispatch::{DataFlowDispatcher, DataFlowError, OneShotNullaryFactory, RecordBatchOperatorSpec};
 use local_lock::LocalDatastoreLock;
+use parquet_engine::ParquetTableError;
+use object_storage::{self, DataFile, FileRef, ObjectPath, ObjectStore, open_store};
 use planner::catalog::{
     BoundTable, CreateSchemaRequest, CreateTableRequest, DropTableRequest, Error as CatalogError,
     Result as CatalogResult, SchemaCreation, SchemaQualifiedTableName, TableCreation, TableDrop,
@@ -112,7 +112,7 @@ pub enum Error {
     #[error(transparent)]
     Arrow(#[from] arrow_schema::ArrowError),
     #[error(transparent)]
-    Store(#[from] store::StoreError),
+    Store(#[from] object_storage::StoreError),
     #[error(transparent)]
     Manifest(#[from] manifest::Error),
     #[error(transparent)]
@@ -416,12 +416,12 @@ impl DeltaDatastore {
             .file_entries
             .iter()
             .map(|e| e.file.clone().into_data_file(store.as_ref(), location))
-            .collect::<store::Result<Vec<DataFile>>>()?;
+            .collect::<object_storage::Result<Vec<DataFile>>>()?;
         let declared_columns: Arc<[planner::catalog::Column]> = state.columns.clone().into();
         // The footer fetch returns each file's row groups keyed by identity; join
         // each back to its log entry (partition tuple) by path.
-        let mut footers: HashMap<ObjectPath, Vec<Arc<crate::parquet::RowGroupMetadata>>> =
-            crate::parquet::load_file_row_groups(dispatcher, &data_files, declared_columns)?
+        let mut footers: HashMap<ObjectPath, Vec<Arc<parquet_engine::RowGroupMetadata>>> =
+            parquet_engine::load_file_row_groups(dispatcher, &data_files, declared_columns)?
                 .into_iter()
                 .map(|loaded| (loaded.file.path.clone(), loaded.row_groups))
                 .collect();
@@ -1079,7 +1079,7 @@ impl DeltaTransaction {
                 // which one it is resolved against does not matter here.
                 file.into_data_file(store.as_ref(), &directory)
             })
-            .collect::<store::Result<Vec<DataFile>>>()
+            .collect::<object_storage::Result<Vec<DataFile>>>()
             .map_err(Error::from)
     }
 
@@ -1181,7 +1181,7 @@ fn commit_uploaded_files(
             partition,
             row_groups,
         } = uploaded;
-        let stats = Some(std::sync::Arc::new(crate::parquet::aggregate_file_stats(
+        let stats = Some(std::sync::Arc::new(parquet_engine::aggregate_file_stats(
             &row_groups,
         )));
         let entry = DeltaFileEntry {
@@ -1388,7 +1388,7 @@ struct PendingTableCreation {
     partition_by: Vec<String>,
     sort_by: Vec<String>,
     if_not_exists: bool,
-    loaded: Vec<crate::parquet::FileRowGroups>,
+    loaded: Vec<parquet_engine::FileRowGroups>,
 }
 
 /// The [`DatastoreTransaction`] a [`DeltaDatastore`] opens: one query's frozen
@@ -1661,11 +1661,11 @@ impl TableCreation for DeltaTableCreation {
         let sort_by = self.sort_by.clone();
         let if_not_exists = self.if_not_exists;
         let declared_columns: Arc<[planner::catalog::Column]> = columns.clone().into();
-        Ok(crate::parquet::create_load_and_stage_spec(
+        Ok(parquet_engine::create_load_and_stage_spec(
             dispatcher,
             &self.files,
             declared_columns,
-            move |loaded: Vec<crate::parquet::FileRowGroups>| {
+            move |loaded: Vec<parquet_engine::FileRowGroups>| {
                 pending_table_creations.push(PendingTableCreation {
                     name,
                     id,

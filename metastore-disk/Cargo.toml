@@ -9,6 +9,7 @@ description = "Disk-backed metastore provider for PivotDB."
 metastore = { workspace = true }
 catalog = { workspace = true }
 datastore-delta = { workspace = true }
+object-storage = { workspace = true }
 dispatch = { workspace = true }
 
 serde = { workspace = true }

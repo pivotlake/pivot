@@ -21,8 +21,8 @@ use tempfile::TempDir;
 use catalog::{DEFAULT_DATASTORE_NAME, PivotCatalog};
 use common::{commit_datastore_transaction, current_parquet};
 use datastore::{Datastore, DatastoreTransaction};
-use datastore_delta::store::ObjectPath;
 use datastore_delta::{ColumnStatFilter, DeltaDatastore, PartitionEqFilter, TableBinding};
+use object_storage::ObjectPath;
 use planner::PlanNode;
 use planner::Planner;
 use planner::catalog::{

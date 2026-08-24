@@ -19,15 +19,15 @@ use planner::catalog::Column;
 use uuid::Uuid;
 
 use crate::catalog::CatalogTable;
-use crate::parquet::RowGroupMetadata;
-use crate::parquet::writing::{AssembledFile, encode_record_batches_spec, unshred_batches_spec};
-use crate::store::{DataFileLocation, FileRef, ObjectPath, ObjectStore};
+use parquet_engine::RowGroupMetadata;
+use parquet_engine::writing::{AssembledFile, encode_record_batches_spec, unshred_batches_spec};
+use object_storage::{DataFileLocation, FileRef, ObjectPath, ObjectStore};
 
 /// Build the dataflow that writes `input`'s rows into `table` as Parquet and
 /// emits the inserted-row count. Each finished file is pushed onto `uploaded_files`
 /// for the statement's transaction to commit (by the table's durable id). This is
 /// the write mirror of the scan's
-/// [`table_input_with_filter_and_eq_predicates`](crate::parquet::table_input_with_filter_and_eq_predicates):
+/// [`table_input_with_filter_and_eq_predicates`](parquet_engine::table_input_with_filter_and_eq_predicates):
 /// it wires the encode pipeline into this module's upload operators. Driven by
 /// the binding's `BoundTable::compile_insert` impl (see [`super::binding::TableBinding`]).
 pub(super) fn build_insert_spec(
@@ -66,7 +66,7 @@ pub(super) fn build_insert_spec(
                 // recognize the column and writes the documents unshredded.
                 match column.col_type {
                     planner::types::Type::Variant => {
-                        field.with_metadata(crate::parquet::variant_extension_metadata())
+                        field.with_metadata(parquet_engine::variant_extension_metadata())
                     }
                     _ => field,
                 }
@@ -222,7 +222,7 @@ impl UnaryFactory<AssembledFile, RecordBatch> for UploadFactory {
 }
 
 struct PendingUpload {
-    file: crate::store::FileRef,
+    file: object_storage::FileRef,
     key: ObjectPath,
     partition: Option<crate::PartitionValues>,
     /// The footer metadata the writer produced for this file, used to record its
@@ -267,19 +267,19 @@ impl Upload {
         let source = self
             .store
             .source(&pending.key)
-            .map_err(crate::parquet::op_err)?;
+            .map_err(parquet_engine::op_err)?;
         // Row count is taken from the metadata before it's consumed below.
         let num_rows = pending.metadata.num_rows as usize;
         // Build the row groups from the footer the writer already produced; only
         // the location is bound now, since it names the stored file (which exists
         // only once the upload has landed) that future scans read.
-        let loaded = crate::parquet::file_row_groups_from_metadata(
+        let loaded = parquet_engine::file_row_groups_from_metadata(
             pending.file.clone(),
             source,
             pending.metadata,
             &self.declared_columns,
         )
-        .map_err(crate::parquet::op_err)?;
+        .map_err(parquet_engine::op_err)?;
         // Data-file IO is complete, but publication belongs to the statement's
         // transaction. Its commit drains this queue and appends every file to
         // Delta only after the whole dataflow has succeeded.
@@ -309,24 +309,24 @@ impl Unary<AssembledFile, RecordBatch> for Upload {
         // The write/upload request below shares this `Arc`, so its address keys
         // the in-flight entry a later completion resolves against.
         let id = Arc::as_ptr(&data) as usize;
-        let file = crate::store::FileRef {
+        let file = object_storage::FileRef {
             path,
             size: data.len() as u64,
         };
 
-        let open_file = match self.store.sink(&key).map_err(crate::parquet::op_err)? {
+        let open_file = match self.store.sink(&key).map_err(parquet_engine::op_err)? {
             DataFileLocation::Local(path) => {
                 let file_handle = OpenOptions::new()
                     .create_new(true)
                     .write(true)
                     .open(path)
-                    .map_err(crate::parquet::op_err)?;
-                OpenFile::Local(LocalFile::new(file_handle).map_err(crate::parquet::op_err)?)
+                    .map_err(parquet_engine::op_err)?;
+                OpenFile::Local(LocalFile::new(file_handle).map_err(parquet_engine::op_err)?)
             }
             DataFileLocation::Remote { url, auth } => {
                 let remote = RemoteFile::open(url, auth, data.len() as u64)
                     .map(Arc::new)
-                    .map_err(crate::parquet::op_err)?;
+                    .map_err(parquet_engine::op_err)?;
                 OpenFile::Remote(remote)
             }
         };
@@ -383,7 +383,7 @@ impl Unary<AssembledFile, RecordBatch> for Upload {
             )])),
             vec![Arc::new(Int64Array::from(vec![total]))],
         )
-        .map_err(crate::parquet::op_err)?;
+        .map_err(parquet_engine::op_err)?;
         sender.send(batch)?;
         Ok(true)
     }

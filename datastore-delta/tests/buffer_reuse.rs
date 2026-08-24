@@ -6,8 +6,8 @@ use arrow_array::{Array, Int64Array, RecordBatch, StringViewArray};
 use arrow_schema::{DataType, Field, Schema};
 
 use common::*;
-use datastore_delta::parquet::table_input;
 use dispatch::{AggregationKind, AggregationSlot, Projection, RECORD_BATCH_SIZE};
+use parquet_engine::table_input;
 
 #[test]
 fn subsequent_batches_reuse_write_buffer() {

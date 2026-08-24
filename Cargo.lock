@@ -1576,20 +1576,14 @@ dependencies = [
 name = "datastore-delta"
 version = "0.1.0"
 dependencies = [
- "ahash 0.8.12",
  "arrow",
  "arrow-arith",
  "arrow-array",
- "arrow-buffer",
  "arrow-cast",
  "arrow-ord",
- "arrow-row",
  "arrow-schema",
  "arrow-select",
  "async-trait",
- "aws-credential-types",
- "aws-sigv4",
- "base64",
  "bytes",
  "catalog",
  "core_affinity",
@@ -1601,25 +1595,21 @@ dependencies = [
  "delta_kernel_default_engine",
  "dispatch",
  "metastore",
+ "object-storage",
  "parquet",
+ "parquet-engine",
  "parquet-variant",
  "parquet-variant-compute",
  "parquet-variant-json",
  "planner",
- "quick-xml 0.37.5",
- "ring",
  "serde",
  "serde_json",
- "snap 1.1.1 (git+https://github.com/Epsio-Labs/rust-snappy.git?rev=c1754fc37fe43db77c3b5428d57689cd5f2182a5)",
  "tempfile",
- "testcontainers",
- "testcontainers-modules",
  "thiserror 2.0.18",
  "thriftparquet",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "ureq",
  "url",
  "uuid",
 ]
@@ -3035,6 +3025,7 @@ dependencies = [
  "datastore-delta",
  "dispatch",
  "metastore",
+ "object-storage",
  "pgwire",
  "rand 0.10.2",
  "serde",
@@ -3231,6 +3222,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "object-storage"
+version = "0.1.0"
+dependencies = [
+ "arrow-cast",
+ "aws-credential-types",
+ "aws-sigv4",
+ "base64",
+ "dispatch",
+ "quick-xml 0.37.5",
+ "ring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "testcontainers",
+ "testcontainers-modules",
+ "thiserror 2.0.18",
+ "ureq",
+ "url",
+]
+
+[[package]]
 name = "object_store"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3367,6 +3379,39 @@ dependencies = [
  "tokio",
  "twox-hash",
  "zstd",
+]
+
+[[package]]
+name = "parquet-engine"
+version = "0.1.0"
+dependencies = [
+ "ahash 0.8.12",
+ "arrow",
+ "arrow-arith",
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-cast",
+ "arrow-ord",
+ "arrow-row",
+ "arrow-schema",
+ "arrow-select",
+ "bytes",
+ "core_affinity",
+ "criterion",
+ "crossbeam-deque",
+ "dispatch",
+ "object-storage",
+ "parquet",
+ "parquet-variant",
+ "parquet-variant-compute",
+ "parquet-variant-json",
+ "planner",
+ "snap 1.1.1 (git+https://github.com/Epsio-Labs/rust-snappy.git?rev=c1754fc37fe43db77c3b5428d57689cd5f2182a5)",
+ "tempfile",
+ "thiserror 2.0.18",
+ "thriftparquet",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3596,6 +3641,7 @@ dependencies = [
  "duckdb-planner",
  "insta",
  "parquet",
+ "parquet-engine",
  "parquet-variant",
  "parquet-variant-compute",
  "parquet-variant-json",
@@ -4660,6 +4706,7 @@ dependencies = [
  "metastore",
  "metastore-disk",
  "nix",
+ "object-storage",
  "parquet",
  "parquet-variant-compute",
  "pgwire",

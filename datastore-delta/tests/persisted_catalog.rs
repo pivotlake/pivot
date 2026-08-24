@@ -17,8 +17,8 @@ use tempfile::TempDir;
 
 use datastore::DatastoreTransaction;
 use datastore_delta::DeltaDatastore;
-use datastore_delta::parquet::table_input;
 use dispatch::Projection;
+use parquet_engine::table_input;
 use planner::DEFAULT_DATASTORE_NAME;
 use planner::catalog::{
     Column, CreateTableRequest, Result as CatalogResult, SchemaQualifiedTableName,

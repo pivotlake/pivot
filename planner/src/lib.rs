@@ -28,7 +28,7 @@
 //! use std::path::Path;
 //! use std::sync::Arc;
 //!
-//! use datastore_delta::parquet::{ParquetTable, table_input};
+//! use parquet_engine::{ParquetTable, table_input};
 //! use dispatch::{DataFlowDispatcher, Dispatch, Projection, RecordBatchOperatorSpec};
 //! use planner::Planner;
 //! use planner::catalog::{

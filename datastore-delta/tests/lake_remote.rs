@@ -21,8 +21,8 @@ use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 use url::Url;
 
-use datastore_delta::parquet::{ParquetTable, table_input};
 use dispatch::Projection;
+use parquet_engine::{ParquetTable, table_input};
 
 /// Serve `bytes` over loopback HTTP, answering `Range` requests with `206`.
 /// Returns the bound URL. The server thread is detached and lives for the

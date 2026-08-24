@@ -5,18 +5,17 @@
 use std::sync::Arc;
 
 use crate::manifest::{ColumnStatFilter, PartitionEqFilter};
-use crate::parquet::types::leaves::{
-    first_leaf, leaf_fields, variant_shredded_leaves, variant_value_leaf_is_semantically_null,
-};
-use crate::parquet::types::metadata::RowGroupMetadata;
-use crate::parquet::{
-    ParquetTable, ScanEqualityPredicate, materialize, row_group_eliminated, row_group_filter_from,
-    scan_order_from, table_input_with_filter_and_eq_predicates,
-};
 use arrow_array::{Array, ArrayRef, Scalar, TimestampMicrosecondArray};
 use arrow_schema::{DataType, TimeUnit};
 use crossbeam_deque::Injector;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
+use parquet_engine::{
+    ParquetTable, RowGroupMetadata, ScanEqualityPredicate, materialize, row_group_eliminated,
+    row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
+};
+use parquet_engine::{
+    first_leaf, leaf_fields, variant_shredded_leaves, variant_value_leaf_is_semantically_null,
+};
 use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Error as CatalogError, Result as CatalogResult,
     TableReference, TableRevision,
