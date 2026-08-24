@@ -683,6 +683,24 @@ mod tests {
         assert_eq!(cache.lookup(&[&predicate]), Some(false));
     }
 
+    /// A string dictionary that excludes the pushed constant prunes the row
+    /// group from the dictionary page alone, and the miss is remembered.
+    #[test]
+    fn string_dictionary_pruning_records_the_miss() {
+        init_test_free_pool(4);
+        let table = string_and_i32_table(3, true);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, None);
+        let dict = make_dict_page(metadata.clone(), 0, &["MAIL", "SHIP"]);
+        let predicate = string_eq_predicate(0, "RAIL");
+        let decoder = decoder_with_eq(&table, predicate.clone());
+
+        let out = run_unary_to_completion(decoder, vec![dict]);
+
+        assert!(out.is_empty());
+        let cache = &table.row_groups()[0].filter_cache;
+        assert_eq!(cache.lookup(&[&predicate]), Some(false));
+    }
+
     /// A filtered read decodes only some rows, which proves nothing about the
     /// whole row group, so no outcome is remembered.
     #[test]

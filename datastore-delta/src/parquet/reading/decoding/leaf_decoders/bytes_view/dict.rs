@@ -178,6 +178,42 @@ impl<V: ByteViewType> Dict for ViewDict<V> {
         (strings.len() == 1 && strings.is_valid(0)).then(|| strings.value(0).as_bytes().to_vec())
     }
 
+    /// Scans the raw plain-encoded (length-prefixed) entries for `needle`
+    /// without building the dictionary, so a row group whose dictionary
+    /// excludes a pushed-down string constant is pruned before any of its
+    /// data pages are decoded. Only entries whose length matches the needle's
+    /// are compared; the rest are skipped over. The walk is driven by the
+    /// page's own claimed sizes, so a truncated or malformed page answers
+    /// `true` (cannot rule the value out) instead of reading past the end.
+    fn maybe_contains(data: &[Bytes], size: usize, needle: &Vec<u8>) -> bool {
+        let mut remaining: usize = data.iter().map(Bytes::len).sum();
+        let mut position = ReaderPosition::default();
+        let mut reader = MultiBufferReader::new(data, &mut position);
+        let mut candidate = vec![0u8; needle.len()];
+        for _ in 0..size {
+            if remaining < 4 {
+                return true;
+            }
+            let len = reader.read_u32_le() as usize;
+            remaining -= 4;
+            if remaining < len {
+                return true;
+            }
+            remaining -= len;
+            if len == needle.len() {
+                // The `Read` impl fills the whole slice, crossing buffer
+                // boundaries as needed.
+                let _ = std::io::Read::read(&mut reader, &mut candidate);
+                if candidate == *needle {
+                    return true;
+                }
+            } else {
+                reader.skip(len);
+            }
+        }
+        false
+    }
+
     fn len(&self) -> usize {
         self.views.len()
     }
@@ -332,6 +368,49 @@ mod tests {
         assert_eq!(dict.views.len(), 2);
         assert_eq!(dict.get_str(0), "aa");
         assert_eq!(dict.get_str(1), "bb");
+    }
+
+    fn contains(data: Vec<Bytes>, size: usize, needle: &str) -> bool {
+        ViewDict::<StringViewType>::maybe_contains(&data, size, &needle.as_bytes().to_vec())
+    }
+
+    #[test]
+    fn maybe_contains_finds_present_and_rejects_absent() {
+        let data = vec![Bytes::from(encode_plain(&[
+            "MAIL",
+            "DELIVER IN PERSON",
+            "SHIP",
+        ]))];
+
+        assert!(contains(data.clone(), 3, "MAIL"));
+        assert!(contains(data.clone(), 3, "DELIVER IN PERSON"));
+        assert!(contains(data.clone(), 3, "SHIP"));
+        assert!(!contains(data.clone(), 3, "RAIL"));
+        assert!(!contains(data.clone(), 3, "SHIP "));
+        assert!(!contains(data, 3, ""));
+    }
+
+    #[test]
+    fn maybe_contains_reads_entries_split_across_buffers() {
+        // Split so "hello"'s length prefix and body both straddle boundaries.
+        let all = encode_plain(&["aa", "hello", "zz"]);
+        let data = vec![
+            Bytes::from(all[..8].to_vec()),
+            Bytes::from(all[8..12].to_vec()),
+            Bytes::from(all[12..].to_vec()),
+        ];
+
+        assert!(contains(data.clone(), 3, "hello"));
+        assert!(contains(data.clone(), 3, "zz"));
+        assert!(!contains(data, 3, "world"));
+    }
+
+    #[test]
+    fn maybe_contains_cannot_rule_out_on_a_truncated_page() {
+        let all = encode_plain(&["aa", "bb"]);
+        let truncated = vec![Bytes::from(all[..7].to_vec())];
+
+        assert!(contains(truncated, 2, "cc"));
     }
 
     #[test]
