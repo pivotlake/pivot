@@ -375,7 +375,7 @@ mod tests {
 
     use super::*;
     use crate::manifest::FileStats;
-    use crate::store::{FileRef, ObjectPath};
+    use object_storage::{FileRef, ObjectPath};
 
     fn int_stat(value: i64) -> ArrayRef {
         Arc::new(Int64Array::from(vec![value]))

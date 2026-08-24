@@ -23,6 +23,10 @@ use delta_kernel::engine::arrow_conversion::TryIntoArrow as _;
 use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine_data::FilteredEngineData;
 use delta_kernel::expressions::Scalar as DeltaScalar;
+use delta_kernel::object_store::DynObjectStore;
+use delta_kernel::object_store::aws::AmazonS3Builder;
+use delta_kernel::object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
+use delta_kernel::object_store::local::LocalFileSystem;
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::scan::state::ScanFile;
 use delta_kernel::schema::{
@@ -38,7 +42,7 @@ use planner::types::Type;
 use url::Url;
 
 use crate::manifest::DeltaFileEntry;
-use crate::store::{FileRef, ObjectPath, ObjectStore};
+use object_storage::{FileRef, ObjectPath, ObjectStore, StoreConnection};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -55,7 +59,7 @@ pub enum Error {
     #[error("Delta object store: {0}")]
     ObjectStore(#[from] delta_kernel::object_store::Error),
     #[error("catalog object store: {0}")]
-    CatalogStore(#[from] crate::store::StoreError),
+    CatalogStore(#[from] object_storage::StoreError),
     #[error("Delta table uses unsupported column `{column}` type `{data_type}`")]
     UnsupportedType { column: String, data_type: String },
     #[error("Delta file `{path}` has an invalid negative size {size}")]
@@ -800,7 +804,7 @@ impl DeltaEngine {
             _ => ENGINE_RUNTIME.handle().clone(),
         };
         let executor = Arc::new(TokioMultiThreadExecutor::new(handle));
-        let engine = DefaultEngineBuilder::new(store.build_delta_object_store()?)
+        let engine = DefaultEngineBuilder::new(build_delta_object_store(store.connection())?)
             .with_task_executor(executor)
             .build();
         Ok(Self {
@@ -812,6 +816,42 @@ impl DeltaEngine {
     fn kernel(&self) -> &DefaultEngine<TokioMultiThreadExecutor> {
         &self.inner
     }
+}
+
+fn build_delta_object_store(connection: StoreConnection) -> Result<Arc<DynObjectStore>, Error> {
+    let store: Arc<DynObjectStore> = match connection {
+        StoreConnection::Local => Arc::new(LocalFileSystem::new()),
+        StoreConnection::S3 { uri, credentials } => {
+            let mut builder = AmazonS3Builder::new()
+                .with_url(uri)
+                .with_region(credentials.region)
+                .with_access_key_id(credentials.access_key)
+                .with_secret_access_key(credentials.secret_key);
+            if let Some(endpoint) = credentials.endpoint {
+                builder = builder
+                    .with_endpoint(endpoint)
+                    .with_allow_http(true)
+                    .with_virtual_hosted_style_request(false);
+            }
+            Arc::new(builder.build()?)
+        }
+        StoreConnection::Gcs {
+            uri,
+            credentials_file,
+            emulator_endpoint,
+        } => {
+            let mut builder = GoogleCloudStorageBuilder::from_env().with_url(uri);
+            if let Some(endpoint) = emulator_endpoint {
+                builder = builder
+                    .with_config(GoogleConfigKey::BaseUrl, endpoint)
+                    .with_config(GoogleConfigKey::SkipSignature, "true");
+            } else if let Some(path) = credentials_file {
+                builder = builder.with_service_account_path(path);
+            }
+            Arc::new(builder.build()?)
+        }
+    };
+    Ok(store)
 }
 
 /// Fallback multi-threaded runtime for Kernel's engine I/O (log reads and,
@@ -1276,7 +1316,7 @@ mod tests {
         use delta_kernel::transaction::create_table::create_table;
 
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::store::LocalStore::new(dir.path()).unwrap();
+        let store = object_storage::LocalStore::new(dir.path()).unwrap();
         let uri = Url::from_directory_path(dir.path()).unwrap();
         let engine = DeltaEngine::new(&store).unwrap();
         let kernel = engine.kernel();
@@ -1406,7 +1446,7 @@ mod tests {
     /// the store it lives in, the engine and snapshot a commit rides, and the
     /// location and URI naming it.
     struct TestTable {
-        store: crate::store::LocalStore,
+        store: object_storage::LocalStore,
         engine: DeltaEngine,
         snapshot: Arc<Snapshot>,
         location: ObjectPath,
@@ -1416,7 +1456,7 @@ mod tests {
     /// Create a bare kernel-authored table at a store-relative location (no
     /// `delta.*` maintenance properties, which Kernel forbids setting at CREATE).
     fn create_test_table(dir: &std::path::Path) -> TestTable {
-        let store = crate::store::LocalStore::new(dir).unwrap();
+        let store = object_storage::LocalStore::new(dir).unwrap();
         let location = ObjectPath::new("t");
         store.create_dir(&location).unwrap();
         let uri = table_uri(&store.location_uri(), &location).unwrap();

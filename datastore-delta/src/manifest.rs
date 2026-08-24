@@ -10,14 +10,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid as TableId;
 
-use arrow_array::{
-    Array, ArrayRef, Datum, RecordBatch, Scalar, StringArray, StringViewArray, UInt32Array,
+use arrow_array::{ArrayRef, Scalar};
+pub use parquet_engine::{
+    FileStats, PartitionValues, pivot_scalar, scalar_equal, scalar_values_equal,
+    scalar_values_from_row,
 };
-use arrow_schema::{ArrowError, DataType};
-use arrow_select::take::take;
 
 use crate::FileRef;
-use crate::store::{ObjectPath, ObjectStore};
+use object_storage::{ObjectPath, ObjectStore};
 
 /// Key of the [`CatalogManifest`] document within the database's object store.
 const MANIFEST_KEY: &str = "_pivot_manifest.json";
@@ -25,7 +25,7 @@ const MANIFEST_KEY: &str = "_pivot_manifest.json";
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
-    Store(#[from] crate::store::StoreError),
+    Store(#[from] object_storage::StoreError),
     #[error("manifest json: {0}")]
     Json(#[from] serde_json::Error),
     /// A table was written to a schema the manifest does not hold. Schemas own
@@ -44,99 +44,6 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Select `columns` from one row of `batch` as named, typed Pivot scalars.
-/// Plain Arrow UTF-8 is normalized to Pivot's physical `Utf8View`, matching
-/// SQL string constants and Parquet footer values.
-pub fn scalar_values_from_row(
-    batch: &RecordBatch,
-    columns: &[String],
-    row: usize,
-) -> Result<HashMap<String, Scalar<ArrayRef>>, ArrowError> {
-    if row >= batch.num_rows() {
-        return Err(ArrowError::InvalidArgumentError(format!(
-            "row {row} is outside a batch of {} rows",
-            batch.num_rows()
-        )));
-    }
-    let schema = batch.schema();
-    columns
-        .iter()
-        .map(|name| {
-            let index = schema.index_of(name)?;
-            Ok((name.clone(), pivot_scalar(batch.column(index), row)))
-        })
-        .collect()
-}
-
-/// Equality for two maps of typed Arrow scalars. Arrow scalars intentionally
-/// do not implement Rust's `Eq`, so compare their one-value arrays with Arrow's
-/// typed comparison kernels instead.
-pub fn scalar_values_equal(
-    left: &HashMap<String, Scalar<ArrayRef>>,
-    right: &HashMap<String, Scalar<ArrayRef>>,
-) -> bool {
-    left.len() == right.len()
-        && left.iter().all(|(name, left_value)| {
-            right
-                .get(name)
-                .is_some_and(|right_value| scalar_equal(left_value, right_value) == Some(true))
-        })
-}
-
-/// SQL-style equality between two typed scalars. Two null partition values are
-/// the same partition; one null and one value differ. A type/kernel mismatch is
-/// unknown (`None`) so callers performing soft pruning can retain the file.
-pub(crate) fn scalar_equal(left: &Scalar<ArrayRef>, right: &Scalar<ArrayRef>) -> Option<bool> {
-    let left_array = left.get().0;
-    let right_array = right.get().0;
-    if left_array.data_type() != right_array.data_type() {
-        return None;
-    }
-    match (left_array.is_null(0), right_array.is_null(0)) {
-        (true, true) => Some(true),
-        (true, false) | (false, true) => Some(false),
-        (false, false) => arrow_ord::cmp::eq(left as &dyn Datum, right as &dyn Datum)
-            .ok()
-            .filter(|result| result.is_valid(0))
-            .map(|result| result.value(0)),
-    }
-}
-
-pub fn pivot_scalar(array: &ArrayRef, row: usize) -> Scalar<ArrayRef> {
-    // The scalar must own its memory outright: `array` may be a zero-copy view
-    // into a dispatch worker's read buffer, while the scalar lands in manifest
-    // entries that outlive the scan and drop on non-worker threads. A plain
-    // slice would keep (and later mis-drop) the worker buffer.
-    let value: ArrayRef = match array.data_type() {
-        DataType::Utf8 => {
-            let strings = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("Utf8 array has StringArray representation");
-            Arc::new(StringViewArray::from(vec![
-                (!strings.is_null(row)).then(|| strings.value(row)),
-            ]))
-        }
-        // `slice` would keep referencing the scan-backed string buffers. Here
-        // `gc` copies the selected value into new buffers, detaching the scalar
-        // from the dispatch worker's memory before it enters the manifest.
-        DataType::Utf8View => {
-            let strings = array
-                .as_any()
-                .downcast_ref::<StringViewArray>()
-                .expect("Utf8View array has StringViewArray representation");
-            Arc::new(strings.slice(row, 1).gc())
-        }
-        _ => take(array, &UInt32Array::from(vec![row as u32]), None)
-            .expect("one-row take supports every physical column type"),
-    };
-    Scalar::new(value)
-}
-
-/// A file's partition tuple: each partition column's name mapped to the typed
-/// value every row of the file carries for it.
-pub type PartitionValues = HashMap<String, Scalar<ArrayRef>>;
-
 /// One file at the Delta log level: its store identity ([`FileRef`]), the
 /// optional partition tuple a partitioned INSERT stamps on it, and its Parquet
 /// statistics. Each optional field is `None` when the file carries no such
@@ -150,22 +57,6 @@ pub struct DeltaFileEntry {
     /// `stats`. `None` for a file we did not write (adopted at CREATE) or reloaded
     /// from the log, where the stats are not re-committed.
     pub stats: Option<Arc<FileStats>>,
-}
-
-/// A file's Parquet statistics, aggregated over its row groups, as they are
-/// persisted into the Delta `Add` action's `stats`: the row count, and per-column
-/// min/max and null count for every column whose type carries them (a column
-/// missing from a map simply records no stat, which is sound: it is never pruned).
-#[derive(Debug, Clone)]
-pub struct FileStats {
-    /// The file's row count. `None` when it could not be read (a reload whose log
-    /// entry recorded no `numRecords`), so an unknown count is never mistaken for
-    /// an empty file and a later pass can fill it in.
-    pub num_records: Option<i64>,
-    /// Per-column min/max as single-element Arrow arrays (the value's own type).
-    pub min_values: HashMap<String, ArrayRef>,
-    pub max_values: HashMap<String, ArrayRef>,
-    pub null_counts: HashMap<String, i64>,
 }
 
 impl DeltaFileEntry {
@@ -219,7 +110,7 @@ impl DeltaFileEntry {
             ) else {
                 return true;
             };
-            !crate::parquet::bounds_eliminate(
+            !parquet_engine::bounds_eliminate(
                 &Scalar::new(min.clone()),
                 &Scalar::new(max.clone()),
                 filter.compare_type,
@@ -511,7 +402,7 @@ impl CatalogManifest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int64Array, StringArray, StringViewArray};
+    use arrow_array::{Array, Datum, Int64Array, RecordBatch, StringArray, StringViewArray};
     use arrow_schema::{DataType, Field, Schema};
 
     fn scalar<T: Array + 'static>(array: T) -> Scalar<ArrayRef> {
@@ -599,7 +490,7 @@ mod tests {
     #[test]
     fn update_creates_the_manifest_and_mutates_it_in_place() {
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::store::LocalStore::new(dir.path()).unwrap();
+        let store = object_storage::LocalStore::new(dir.path()).unwrap();
 
         CatalogManifest::update(&store, |manifest| {
             manifest.add_schema("logs".to_string());
@@ -615,7 +506,7 @@ mod tests {
     #[test]
     fn a_failed_mutation_stores_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::store::LocalStore::new(dir.path()).unwrap();
+        let store = object_storage::LocalStore::new(dir.path()).unwrap();
 
         let error = CatalogManifest::update(&store, |_| {
             Err::<(), _>(Error::MissingSchema("nope".to_string()))

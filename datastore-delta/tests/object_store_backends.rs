@@ -29,10 +29,10 @@ use common::{
 };
 use datastore::DatastoreTransaction;
 use datastore_delta::DeltaDatastore;
-use datastore_delta::parquet::table_input;
-use datastore_delta::store::ObjectPath;
 use dispatch::Projection;
 use harness::Backend;
+use parquet_engine::table_input;
+use object_storage::ObjectPath;
 use planner::catalog::{Column, CreateTableRequest, SchemaQualifiedTableName};
 use planner::types::Type;
 

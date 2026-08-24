@@ -13,7 +13,9 @@ members = [
     "engine",
     "metastore",
     "metastore-disk",
+    "parquet-engine",
     "planner",
+    "object-storage",
     "server",
     "thriftparquet",
 ]
@@ -38,7 +40,9 @@ dispatch = { path = "dispatch" }
 duckdb-planner = { path = "duckdb-planner" }
 metastore = { path = "metastore" }
 metastore-disk = { path = "metastore-disk" }
+parquet-engine = { path = "parquet-engine" }
 planner = { path = "planner" }
+object-storage = { path = "object-storage" }
 server = { path = "server" }
 shell = { path = "shell" }
 thriftparquet = { path = "thriftparquet" }

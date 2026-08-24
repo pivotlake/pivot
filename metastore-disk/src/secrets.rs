@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
-use datastore_delta::store::{S3Credentials, StoreScheme};
+use object_storage::{S3Credentials, StoreScheme};
 use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result};

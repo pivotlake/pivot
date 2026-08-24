@@ -55,8 +55,8 @@ use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
 use crate::manifest::DeltaFileEntry;
-use crate::store::ObjectPath;
 use crate::{CatalogTable, DeltaDatastore, FileRef, scalar_values_equal};
+use object_storage::ObjectPath;
 use planner::catalog::SchemaQualifiedTableName;
 
 mod overlap;
@@ -535,11 +535,11 @@ fn partition_values_equal(
 mod tests {
     use super::*;
     use crate::DeltaDatastore;
-    use crate::parquet::ParquetTable;
     use arrow_array::{ArrayRef, Int64Array, RecordBatch, Scalar};
     use arrow_schema::{DataType, Field, Schema};
     use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
     use parquet::arrow::ArrowWriter;
+    use parquet_engine::ParquetTable;
     use planner::catalog::SchemaQualifiedTableName;
     use std::path::Path;
 

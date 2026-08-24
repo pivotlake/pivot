@@ -10,9 +10,9 @@ use std::sync::{Arc, Once};
 use tempfile::TempDir;
 
 use datastore::{Datastore, DatastoreTransaction};
-use datastore_delta::parquet::ParquetTable;
 use dispatch::{DataFlowDispatcher, Dispatch};
 use metastore::{DEFAULT_USER_NAME, Metastore, UserAuth};
+use parquet_engine::ParquetTable;
 use planner::catalog::{Result as CatalogResult, SchemaQualifiedTableName};
 use std::collections::HashMap;
 
@@ -200,10 +200,10 @@ pub fn table_dir(
 
 /// Data-file locations for remote files given as fetchable URLs paired with the
 /// total size that locates each footer.
-pub fn remote_files(files: &[(url::Url, u64)]) -> Vec<datastore_delta::store::DataFile> {
+pub fn remote_files(files: &[(url::Url, u64)]) -> Vec<object_storage::DataFile> {
     files
         .iter()
-        .map(|(url, size)| datastore_delta::store::DataFile::remote(url.clone(), *size))
+        .map(|(url, size)| object_storage::DataFile::remote(url.clone(), *size))
         .collect()
 }
 

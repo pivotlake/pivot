@@ -1,0 +1,45 @@
+[package]
+name = "parquet-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PivotDB's Parquet metadata, scan, materialization, and write engines."
+
+[dependencies]
+planner = { workspace = true }
+dispatch = { workspace = true }
+object-storage = { workspace = true }
+thriftparquet = { workspace = true }
+arrow-array = { workspace = true }
+arrow-ord = { workspace = true }
+arrow-row = { workspace = true }
+arrow-arith = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-select = { workspace = true }
+parquet-variant = { workspace = true }
+parquet-variant-compute = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+crossbeam-deque = { workspace = true }
+ahash = { workspace = true }
+snap = { workspace = true }
+
+[dev-dependencies]
+dispatch = { workspace = true, features = ["test-util"] }
+parquet = { workspace = true, features = ["variant_experimental"] }
+arrow-schema = { workspace = true }
+arrow = { workspace = true, features = ["prettyprint"] }
+parquet-variant = { workspace = true }
+parquet-variant-compute = { workspace = true }
+parquet-variant-json = { workspace = true }
+tempfile = { workspace = true }
+core_affinity = { workspace = true }
+tracing-subscriber = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "decode"
+harness = false

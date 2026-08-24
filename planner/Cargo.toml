@@ -35,6 +35,7 @@ serde = { workspace = true }
 # The Parquet reader, for integration tests that plan over a real on-disk table.
 # A dev-dependency cycle (catalog depends on planner) — allowed by Cargo.
 datastore-delta = { workspace = true }
+parquet-engine = { workspace = true }
 # `variant_experimental` so `ArrowWriter` stamps the VARIANT logical type on an
 # extension-tagged variant field (the variant tests read it back through pivot).
 parquet = { workspace = true, features = ["variant_experimental"] }

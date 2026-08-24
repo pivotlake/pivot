@@ -15,8 +15,8 @@ use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
 use common::*;
-use datastore_delta::parquet::{ParquetTable, table_input};
 use dispatch::{AggregationKind, AggregationSlot, Projection};
+use parquet_engine::{ParquetTable, table_input};
 
 #[test]
 fn scan_all_columns() {
@@ -1593,10 +1593,8 @@ fn scan_pushed_bare_extract_yields_a_subvariant() {
 #[test]
 fn scan_pushed_extract_filters_by_an_equality_constant() {
     use arrow_array::Scalar;
-    use datastore_delta::parquet::{
-        ScanEqualityPredicate, table_input_with_filter_and_eq_predicates,
-    };
     use dispatch::VariantExtract;
+    use parquet_engine::{ScanEqualityPredicate, table_input_with_filter_and_eq_predicates};
     use parquet_variant_compute::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
 
     let dispatch = dispatch(1);
@@ -1655,10 +1653,8 @@ fn scan_pushed_extract_filters_by_an_equality_constant() {
 #[test]
 fn scan_pushed_extract_ignores_an_equality_constant_it_cannot_apply() {
     use arrow_array::Scalar;
-    use datastore_delta::parquet::{
-        ScanEqualityPredicate, table_input_with_filter_and_eq_predicates,
-    };
     use dispatch::VariantExtract;
+    use parquet_engine::{ScanEqualityPredicate, table_input_with_filter_and_eq_predicates};
     use parquet_variant_compute::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
 
     let dispatch = dispatch(1);
@@ -1715,10 +1711,8 @@ fn scan_pushed_extract_ignores_an_equality_constant_it_cannot_apply() {
 #[test]
 fn scan_pushed_extract_ignores_an_equality_constant_across_a_cast() {
     use arrow_array::Scalar;
-    use datastore_delta::parquet::{
-        ScanEqualityPredicate, table_input_with_filter_and_eq_predicates,
-    };
     use dispatch::VariantExtract;
+    use parquet_engine::{ScanEqualityPredicate, table_input_with_filter_and_eq_predicates};
     use parquet_variant_compute::{ShreddedSchemaBuilder, json_to_variant, shred_variant};
 
     let dispatch = dispatch(1);
@@ -1831,7 +1825,7 @@ fn scan_two_pushed_extracts_on_one_column_share_the_read() {
 #[test]
 fn materialize_reads_a_row_group_split_across_batches_exactly_once() {
     use arrow_array::Int64Array;
-    use datastore_delta::parquet::materialize;
+    use parquet_engine::materialize;
 
     let dispatch = dispatch(4);
     let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));

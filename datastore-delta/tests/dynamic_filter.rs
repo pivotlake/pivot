@@ -17,16 +17,16 @@ use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
 use common::*;
-use datastore_delta::parquet::table_input_with_filter;
-use datastore_delta::parquet::{RowGroupFilter, RowGroupMetadata};
 use dispatch::Projection;
+use parquet_engine::table_input_with_filter;
+use parquet_engine::{RowGroupFilter, RowGroupMetadata};
 
 /// Write a single Int64 column with one row group per three rows, so each row
 /// group carries distinct min/max statistics.
 fn row_group_per_three(
     dispatch: &DispatchGuard,
     rows: &[i64],
-) -> (TempDir, Arc<datastore_delta::parquet::ParquetTable>) {
+) -> (TempDir, Arc<parquet_engine::ParquetTable>) {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("data.parquet");
     let schema = Arc::new(Schema::new(vec![Field::new(

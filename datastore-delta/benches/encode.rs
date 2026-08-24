@@ -324,7 +324,7 @@ fn variant_batches(rows: usize) -> Vec<RecordBatch> {
         let column = as_declared_variant(json_to_variant(&json).unwrap());
         let schema = Arc::new(Schema::new(vec![
             Field::new("attrs", column.data_type().clone(), true)
-                .with_metadata(datastore_delta::parquet::variant_extension_metadata()),
+                .with_metadata(parquet_engine::variant_extension_metadata()),
         ]));
         built.push(RecordBatch::try_new(schema, vec![column]).unwrap());
         done += n;

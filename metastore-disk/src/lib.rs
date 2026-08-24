@@ -112,7 +112,6 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use catalog::Datastore;
-use datastore_delta::store::{GcsStore, LocalStore, ObjectStore, S3Store, StoreScheme, local_path};
 use datastore_delta::{
     CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL, DEFAULT_MIN_FILES_TO_MERGE,
     DEFAULT_VACUUM_POLL, DeltaDatastore, MaintenanceConfig, VacuumConfig,
@@ -124,6 +123,7 @@ use metastore::{
     format_scram_verifier, parse_scram_verifier,
 };
 use pgwire::api::auth::sasl::scram::gen_salted_password;
+use object_storage::{GcsStore, LocalStore, ObjectStore, S3Store, StoreScheme, local_path};
 use serde::{Deserialize, Serialize};
 
 mod secrets;
@@ -418,7 +418,7 @@ pub enum Error {
     )]
     MultipleDefaults(Vec<String>),
     #[error(transparent)]
-    Store(#[from] datastore_delta::store::StoreError),
+    Store(#[from] object_storage::StoreError),
     #[error(transparent)]
     Delta(#[from] datastore_delta::Error),
 }

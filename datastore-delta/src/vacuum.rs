@@ -32,8 +32,8 @@ use tracing::{info, warn};
 
 use planner::catalog::SchemaQualifiedTableName;
 
-use crate::store::ObjectPath;
 use crate::{CatalogTable, DeltaDatastore};
+use object_storage::ObjectPath;
 
 /// Default cadence for re-scanning the tables for newly-expired files and
 /// superseded commits. Both expire on the retention timescale (days, by Delta's

@@ -11,8 +11,8 @@ use rstest::fixture;
 use serde_json::Value;
 use tempfile::TempDir;
 
-use datastore_delta::parquet::{ParquetTable, row_group_filter_from, table_input_with_filter};
 use dispatch::{DataFlowDispatcher, Dispatch, Projection, RecordBatchOperatorSpec};
+use parquet_engine::{ParquetTable, row_group_filter_from, table_input_with_filter};
 use planner::catalog::{
     BoundTable, CatalogTransaction, Column, DynamicScanPredicate, TableReference, TableRevision,
 };
@@ -165,7 +165,7 @@ impl BoundTable for TestTable {
         input: RecordBatchOperatorSpec,
         projection: Projection,
     ) -> planner::catalog::Result<RecordBatchOperatorSpec> {
-        Ok(datastore_delta::parquet::materialize(
+        Ok(parquet_engine::materialize(
             input,
             self.parquet_table.clone(),
             projection,
