@@ -304,10 +304,14 @@ impl MemoryContext {
         let warn_at = (2 * max_lives + 2) * ring_len;
         let mut iterations: u64 = 0;
         let mut panic_at: Option<u64> = None;
-        // A hand that has swept the full lives ceiling's worth of revolutions
-        // without reclaiming anything (every candidate pinned) is stuck; fall
-        // through to the other tier regardless of share rather than spinning
-        // into the guard while evictable slots exist there.
+        // A full drain is the most revolutions a hand needs to reach any
+        // victim in its tier: one per life a slot can hold, plus the revolution
+        // that finds it at zero. A hand that swept that much without reclaiming
+        // anything has nothing to give (every candidate is pinned), so the
+        // other tier gets a full drain of its own, regardless of share, and
+        // the two keep alternating in whole drains. Anything shorter for the
+        // other hand cannot reach a slot that still holds lives.
+        let drain = (max_lives + 1) * ring_len;
         let mut ticks_without_success: u64 = 0;
         loop {
             iterations += 1;
@@ -324,18 +328,11 @@ impl MemoryContext {
             }
 
             let mut tier = self.clock.preferred_victim_tier();
-            if ticks_without_success > (max_lives + 1) * ring_len {
+            if (ticks_without_success / drain) % 2 == 1 {
                 tier = match tier {
                     Owner::Compressed => Owner::Decompressed,
                     Owner::Decompressed => Owner::Compressed,
                 };
-                // Re-arm after one fruitless revolution of the other hand too, so
-                // the fallback alternates between the tiers instead of latching
-                // onto one that may be empty while the preferred tier's pins have
-                // long been released.
-                if ticks_without_success > (max_lives + 2) * ring_len {
-                    ticks_without_success = 0;
-                }
             }
 
             let reclaimed = self
