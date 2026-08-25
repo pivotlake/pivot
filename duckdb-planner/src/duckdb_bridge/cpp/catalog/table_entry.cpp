@@ -79,9 +79,8 @@ static void RewriteRefsToStorage(Expression &expr, const vector<ColumnIndex> &co
 // above for the gory details); we clone + remap each filter before handing it
 // to Rust so the catalog sees storage-space column indices and can index into
 // parquet row-group stats correctly.
-static void PivotScanPushdownComplexFilter(ClientContext &context, LogicalGet &get, FunctionData *bind_data,
-                                           vector<unique_ptr<Expression>> &filters) {
-	auto &data = bind_data->Cast<PivotScanBindData>();
+void PivotPushdownComplexFilters(LogicalGet &get, OptionalTableWrapper &table,
+                                 vector<unique_ptr<Expression>> &filters) {
 	const auto &column_ids = get.GetColumnIds();
 
 	// Complex filters: offer each one to Rust. If the table pushes it down,
@@ -91,12 +90,19 @@ static void PivotScanPushdownComplexFilter(ClientContext &context, LogicalGet &g
 		RewriteRefsToStorage(*remapped, column_ids);
 		// Hand the (storage-remapped) DuckDB expression straight to Rust, which
 		// reads it through the same `expr_*` accessors the plan walk uses.
-		if (pushdown_filter(data.table, *remapped)) {
+		if (pushdown_filter(table, *remapped)) {
 			it = filters.erase(it);
 		} else {
 			++it;
 		}
 	}
+}
+
+static void PivotScanPushdownComplexFilter(ClientContext &context, LogicalGet &get,
+                                           FunctionData *bind_data,
+                                           vector<unique_ptr<Expression>> &filters) {
+	auto &data = bind_data->Cast<PivotScanBindData>();
+	PivotPushdownComplexFilters(get, data.table, filters);
 }
 
 // Expose the table's virtual columns (notably the default `rowid`) so DuckDB's

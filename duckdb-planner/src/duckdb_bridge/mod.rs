@@ -9,9 +9,10 @@
 pub mod duckdb_types;
 
 use crate::catalog_provider::{
-    CatalogContext, OptionalTableWrapper, TransactionContext, catalog_context_default,
-    catalog_context_names, catalog_does_schema_exist, catalog_get_scalar_function,
-    catalog_get_table, pushdown_filter, table_estimate_row_count,
+    CatalogContext, OptionalTableWrapper, TransactionContext, catalog_bind_table_function,
+    catalog_context_default, catalog_context_names, catalog_does_schema_exist,
+    catalog_get_scalar_function, catalog_get_table, catalog_table_functions,
+    clone_table_function_table, pushdown_filter, table_estimate_row_count,
     table_supports_late_materialization,
 };
 
@@ -66,7 +67,24 @@ pub mod ffi {
         pub table: Box<OptionalTableWrapper>,
     }
 
-    /// A scalar function the provider defines, described for DuckDB's binder:
+    /// One globally registered table-function overload. Several entries may
+    /// share a name and are grouped into one DuckDB function set.
+    struct TableFunctionDef {
+        pub name: String,
+        pub arg_type_ids: Vec<u8>,
+        /// Whether DuckDB may split this function's scan into a narrow scan
+        /// followed by a late-materialization fetch.
+        pub supports_late_materialization: bool,
+    }
+
+    /// One invocation-specific table-function binding: its footer-derived
+    /// columns and the regular table object carried into the logical scan.
+    struct CatalogBindTableFunctionResult {
+        pub columns: Vec<DuckDBColumn>,
+        pub table: Box<OptionalTableWrapper>,
+    }
+
+    /// A scalar function the current transaction defines for DuckDB's binder:
     /// its argument and return types (DuckDB logical type id discriminants),
     /// plus whether it must be marked `VOLATILE` so the optimizer can't fold
     /// the call away before pivot re-plans it.
@@ -77,7 +95,7 @@ pub mod ffi {
     }
 
     /// Result of a catalog scalar-function lookup, or `found = false` if the
-    /// provider has no such function.
+    /// transaction has no such function.
     struct CatalogGetScalarFunctionResult {
         pub found: bool,
         pub function: ScalarFunctionDef,
@@ -120,6 +138,7 @@ pub mod ffi {
         /// current database, read by the C++ context constructor.
         fn catalog_context_names(ctx: &CatalogContext) -> Vec<String>;
         fn catalog_context_default(ctx: &CatalogContext) -> String;
+        fn catalog_table_functions(ctx: &CatalogContext) -> Vec<TableFunctionDef>;
         /// Whether `datastore` defines `schema`, asked when the binder looks a
         /// schema up so an unknown schema is reported as one.
         fn catalog_does_schema_exist(
@@ -136,8 +155,14 @@ pub mod ffi {
             schema: &str,
             name: &str,
         ) -> CatalogGetTableResult;
+        fn catalog_bind_table_function(
+            transaction: &TransactionContext,
+            name: &str,
+            arguments: &CxxVector<Value>,
+        ) -> Result<CatalogBindTableFunctionResult>;
+        fn clone_table_function_table(table: &OptionalTableWrapper) -> Box<OptionalTableWrapper>;
         fn catalog_get_scalar_function(
-            ctx: &CatalogContext,
+            transaction: &TransactionContext,
             name: &str,
         ) -> CatalogGetScalarFunctionResult;
         fn pushdown_filter(table: &mut OptionalTableWrapper, expr: &Expression) -> Result<bool>;
@@ -303,6 +328,10 @@ pub mod ffi {
         fn lo_get_has_named_params(op: &LogicalOperator) -> Result<bool>;
         fn lo_get_param_count(op: &LogicalOperator) -> Result<usize>;
         fn lo_get_param(op: &LogicalOperator, index: usize) -> Result<&Value>;
+        fn lo_get_has_bound_table_function(op: &LogicalOperator) -> Result<bool>;
+        fn lo_get_clone_bound_table_function(
+            op: &LogicalOperator,
+        ) -> Result<Box<OptionalTableWrapper>>;
 
         // ---- CreateTable ----
         fn lo_create_table_name(op: &LogicalOperator) -> Result<String>;

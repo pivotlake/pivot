@@ -1,9 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use duckdb_planner::{
-    DuckDBBind, DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, PlannerContext,
-};
+use duckdb_planner::{DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, PlannerContext};
 
 struct CountingTable {
     rows: u64,
@@ -32,10 +30,6 @@ impl DuckDBTable for CountingTable {
         Some(self.rows)
     }
 }
-
-struct StatsCatalog;
-
-impl DuckDBBind for StatsCatalog {}
 
 struct StatsTransaction {
     asked: Arc<AtomicUsize>,
@@ -67,12 +61,8 @@ impl DuckDBTransaction for StatsTransaction {
 #[test]
 fn join_planning_consults_table_row_counts() {
     let asked = Arc::new(AtomicUsize::new(0));
-    let mut planner = PlannerContext::new(
-        Arc::new(StatsCatalog),
-        vec!["db".to_string()],
-        "db".to_string(),
-    )
-    .unwrap();
+    let mut planner =
+        PlannerContext::new(Vec::new(), vec!["db".to_string()], "db".to_string()).unwrap();
 
     planner
         .plan(

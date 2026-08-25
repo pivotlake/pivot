@@ -122,8 +122,11 @@ use metastore::{
     DEFAULT_USER_NAME, Metastore, SCRAM_ITERATIONS, SCRAM_SALT_LEN, ScramVerifier, UserAuth,
     format_scram_verifier, parse_scram_verifier,
 };
+use object_storage::{
+    ExternalStoreFactory, GcsStore, LocalStore, ObjectStore, S3Store, StoreError, StoreScheme,
+    local_path,
+};
 use pgwire::api::auth::sasl::scram::gen_salted_password;
-use object_storage::{GcsStore, LocalStore, ObjectStore, S3Store, StoreScheme, local_path};
 use serde::{Deserialize, Serialize};
 
 mod secrets;
@@ -148,13 +151,43 @@ pub struct DiskMetastore {
     /// The file named by `--metastore-file`.
     metastore_file: Option<PathBuf>,
     /// The secrets of both configs (config file + metastore file) as one set.
-    secrets: Secrets,
+    secrets: Arc<Secrets>,
     default_name: String,
     /// How often every datastore this metastore opens refreshes its table set
     /// from the store. Global (all datastores share the cadence, which the
     /// server takes from its own section); compaction, in contrast, is
     /// configured per datastore.
     refresh_interval: Duration,
+}
+
+/// Opens external read-only stores with the same scoped-secret policy as a
+/// configured datastore. The non-wildcard store root selects credentials and
+/// is also the root addressed by the returned store.
+#[derive(Debug)]
+struct SecretExternalStoreFactory {
+    secrets: Arc<Secrets>,
+}
+
+impl ExternalStoreFactory for SecretExternalStoreFactory {
+    fn open(&self, root_uri: &str) -> object_storage::Result<Arc<dyn ObjectStore>> {
+        match StoreScheme::of(root_uri)? {
+            StoreScheme::S3 => {
+                let credentials = self.secrets.resolve_s3(root_uri).ok_or_else(|| {
+                    StoreError::Config(format!(
+                        "no S3 secret covers external store root `{root_uri}`"
+                    ))
+                })?;
+                Ok(Arc::new(S3Store::with_credentials(root_uri, credentials)?))
+            }
+            StoreScheme::Gcs => Ok(Arc::new(match self.secrets.resolve_gcs(root_uri) {
+                Some(credentials_file) => {
+                    GcsStore::with_credentials_file(root_uri, credentials_file)?
+                }
+                None => GcsStore::with_default_credentials(root_uri)?,
+            })),
+            StoreScheme::Local => Ok(Arc::new(LocalStore::new(local_path(root_uri))?)),
+        }
+    }
 }
 
 impl DiskMetastore {
@@ -176,7 +209,10 @@ impl DiskMetastore {
             None => MetastoreConfig::default(),
         };
         check_no_conflicts(&server_config, &metastore_config)?;
-        let secrets = Secrets::build([&server_config.secrets, &metastore_config.secrets])?;
+        let secrets = Arc::new(Secrets::build([
+            &server_config.secrets,
+            &metastore_config.secrets,
+        ])?);
         let default_name = find_default_datastore(&server_config, &metastore_config)?;
         Ok(Self {
             server_config,
@@ -185,6 +221,14 @@ impl DiskMetastore {
             secrets,
             default_name,
             refresh_interval,
+        })
+    }
+
+    /// Open external files with the same scoped-secret policy used by this
+    /// metastore's configured datastores.
+    pub fn external_store_factory(&self) -> Arc<dyn ExternalStoreFactory> {
+        Arc::new(SecretExternalStoreFactory {
+            secrets: self.secrets.clone(),
         })
     }
 

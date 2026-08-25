@@ -123,7 +123,7 @@ fn build_metastore(
     path: &Path,
     metastore_file: Option<&Path>,
     refresh_interval: Duration,
-) -> Result<Arc<dyn Metastore>, Error> {
+) -> Result<Arc<DiskMetastore>, Error> {
     let metastore =
         DiskMetastore::open(config, metastore_file, refresh_interval).map_err(|source| {
             Error::Metastore {
@@ -136,7 +136,7 @@ fn build_metastore(
 
 fn build_catalog(
     path: &Path,
-    metastore: &Arc<dyn Metastore>,
+    metastore: &Arc<DiskMetastore>,
     dispatcher: &DataFlowDispatcher,
 ) -> Result<Arc<PivotCatalog>, Error> {
     let default_name = metastore.default_datastore_name().to_string();
@@ -147,7 +147,8 @@ fn build_catalog(
                 path: path.to_path_buf(),
                 source,
             })?;
-    let catalog = PivotCatalog::new(datastores, default_name, metastore.clone())?;
+    let catalog = PivotCatalog::new(datastores, default_name, metastore.clone())?
+        .with_external_parquet_read_context(dispatcher, metastore.external_store_factory());
     Ok(Arc::new(catalog))
 }
 
@@ -204,7 +205,6 @@ pub fn run(options: ServerOptions) -> Result<(), Error> {
             server_config.refresh_interval.as_duration(),
         )?;
         let catalog = build_catalog(&options.config, &metastore, dispatch.dispatcher())?;
-
         let mut server = Server::new(server_config.bind, dispatch, catalog, metastore);
         if let Some(address) = server_config.http_bind {
             server = server.with_http_bind(address);

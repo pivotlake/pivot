@@ -68,7 +68,7 @@ fn bound_type_from(raw: ffi::BridgeLogicalType) -> BoundLogicalType {
 ///
 /// The NULL check comes first: a NULL value carries a full logical type but no
 /// payload, and the typed accessors are only defined on a value that has one.
-fn scalar_from_value(v: &ffi::Value) -> Result<ScalarValue> {
+pub(crate) fn scalar_from_value(v: &ffi::Value) -> Result<ScalarValue> {
     use LogicalTypeId as L;
     let value_type = bound_type_from(ffi::value_type(v)?);
     if ffi::value_is_null(v)? {
@@ -598,6 +598,18 @@ fn scan_output_columns(
         .collect()
 }
 
+fn scan_dynamic_filters(raw: &ffi::LogicalOperator) -> Result<Vec<DynamicFilterRef>> {
+    (0..ffi::lo_get_dynamic_filter_count(raw)?)
+        .map(|i| {
+            Ok(DynamicFilterRef {
+                data_id: ffi::lo_get_dynamic_filter_data_id(raw, i)?,
+                column: ffi::lo_get_dynamic_filter_column(raw, i)?,
+                comparison: ExpressionType::from_u8(ffi::lo_get_dynamic_filter_comparison(raw, i)?),
+            })
+        })
+        .collect()
+}
+
 impl<'plan> TableScan<'plan> {
     /// Move the pivot table handle out of this scan's catalog entry. Call once
     /// per base-table scan during the walk.
@@ -622,17 +634,7 @@ impl<'plan> TableScan<'plan> {
 
     /// Dynamic-filter consumers attached to this scan's `table_filters`.
     pub fn dynamic_filters(self) -> Result<Vec<DynamicFilterRef>> {
-        (0..ffi::lo_get_dynamic_filter_count(self.raw)?)
-            .map(|i| {
-                Ok(DynamicFilterRef {
-                    data_id: ffi::lo_get_dynamic_filter_data_id(self.raw, i)?,
-                    column: ffi::lo_get_dynamic_filter_column(self.raw, i)?,
-                    comparison: ExpressionType::from_u8(ffi::lo_get_dynamic_filter_comparison(
-                        self.raw, i,
-                    )?),
-                })
-            })
-            .collect()
+        scan_dynamic_filters(self.raw)
     }
 }
 
@@ -652,10 +654,33 @@ impl<'plan> TableFunctionScan<'plan> {
             .collect()
     }
 
+    /// Whether this Pivot table-function invocation bound to a regular table.
+    pub fn has_bound_table(self) -> Result<bool> {
+        Ok(ffi::lo_get_has_bound_table_function(self.raw)?)
+    }
+
+    /// Clone the regular table produced while binding this invocation.
+    pub fn bound_table(self) -> Result<Box<OptionalTableWrapper>> {
+        Ok(ffi::lo_get_clone_bound_table_function(self.raw)?)
+    }
+
     /// The scan's projected output columns, each a generated column index paired
     /// with its type and pushed extract path.
     pub fn output_columns(self) -> Result<Vec<(usize, BoundLogicalType, Vec<String>)>> {
         scan_output_columns(self.raw)
+    }
+
+    /// Dynamic-filter consumers attached to this invocation's `table_filters`.
+    pub fn dynamic_filters(self) -> Result<Vec<DynamicFilterRef>> {
+        scan_dynamic_filters(self.raw)
+    }
+
+    /// The static predicates DuckDB lowered into this invocation's
+    /// `table_filters`. Pivot replays them above the bound table's scan.
+    pub fn pushed_conditions(self) -> Result<PushedConditions> {
+        Ok(PushedConditions {
+            list: ffi::lo_get_pushed_conditions(self.raw)?,
+        })
     }
 }
 

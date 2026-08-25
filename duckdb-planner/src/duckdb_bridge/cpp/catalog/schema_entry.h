@@ -1,6 +1,30 @@
 #pragma once
 #include "duckdb.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb-planner/src/duckdb_bridge/mod.rs.h"
+
+/// A Pivot table function binds to the same Rust table object as a catalog
+/// scan. DuckDB may copy bind data while optimizing, so every copy gets a fresh
+/// wrapper around the bound table's own clone.
+struct PivotTableFunctionBindData : public duckdb::TableFunctionData {
+	explicit PivotTableFunctionBindData(rust::Box<OptionalTableWrapper> table)
+	    : table(std::move(table)) {}
+
+	rust::Box<OptionalTableWrapper> table;
+
+	duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
+		auto copy = duckdb::make_uniq<PivotTableFunctionBindData>(
+		    clone_table_function_table(*table));
+		copy->column_ids = column_ids;
+		return duckdb::unique_ptr_cast<PivotTableFunctionBindData, duckdb::FunctionData>(
+		    std::move(copy));
+	}
+};
+
+/// Register every Pivot-supported table-function overload in DuckDB's system
+/// catalog. Their bind callbacks return regular Rust table handles.
+void RegisterPivotTableFunctions(duckdb::ClientContext &context,
+                                 const CatalogContext &catalog);
 
 class PivotSchemaCatalogEntry : public duckdb::SchemaCatalogEntry {
 public:

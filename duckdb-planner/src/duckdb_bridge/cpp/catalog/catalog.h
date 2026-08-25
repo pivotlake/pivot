@@ -23,9 +23,7 @@ class PivotCatalog : public duckdb::Catalog {
 	bool DoesSchemaExist(const std::string &name);
 
 public:
-	const CatalogContext *catalog_ctx;
-
-	PivotCatalog(duckdb::AttachedDatabase &db, const CatalogContext *catalog_ctx);
+	explicit PivotCatalog(duckdb::AttachedDatabase &db);
 
 	void Initialize(bool load_builtin) override;
 	std::string GetCatalogType() override;

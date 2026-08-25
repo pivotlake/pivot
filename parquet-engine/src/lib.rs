@@ -9,9 +9,10 @@
 //!   file's *footer* into the [`ParquetTable`] whose row groups all later scans
 //!   reuse.
 //!
-//! [`types`] (the table, row-group metadata, pages, requests) and
-//! [`row_group_stats`] (min/max pruning, shared by the catalog's pushdown and
-//! scan-time dynamic filters) are common to both.
+//! [`types`] (the table, row-group metadata, pages, requests), [`pushdown`]
+//! (static filter pushdown shared by catalog and external bindings), and
+//! [`row_group_stats`] (min/max elimination shared by static and dynamic
+//! filters) are common to both.
 
 #![allow(rustdoc::private_intra_doc_links)]
 
@@ -32,6 +33,9 @@ pub(crate) fn http_readahead() -> usize {
     *VALUE.get_or_init(|| dispatch::env::get_env_var_with_default("PIVOT_HTTP_READAHEAD", 64))
 }
 
+mod external;
+pub use external::bind_read_parquet;
+
 pub(crate) mod reading;
 pub use reading::{
     ColumnDecoderError, DecoderFactory, DecompressorError, DecompressorFactory, IndexerFactory,
@@ -46,6 +50,9 @@ pub use writing::aggregate_file_stats;
 mod metadata;
 pub use metadata::{FileRowGroups, create_load_and_stage_spec};
 pub use metadata::{file_row_groups_from_metadata, load_file_row_groups};
+
+mod pushdown;
+pub use pushdown::{PushedPredicate, prune_parquet};
 
 mod row_group_stats;
 pub use row_group_stats::{

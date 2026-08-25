@@ -17,8 +17,7 @@ static unique_ptr<Catalog> pivot_catalog_attach(optional_ptr<StorageExtensionInf
                                                 ClientContext &context, AttachedDatabase &db,
                                                 const string &name, AttachInfo &attach_info,
                                                 AttachOptions &options) {
-	auto &pivot_info = dynamic_cast<PivotStorageInfo &>(*info);
-	return make_uniq<PivotCatalog>(db, pivot_info.catalog_ctx);
+	return make_uniq<PivotCatalog>(db);
 }
 
 void PivotExtension::Load(ExtensionLoader &loader) {

@@ -7,7 +7,7 @@ tree directly through accessor functions (`lo_*` for operators, `expr_*` for
 expressions) to build its `PlanNode` tree; there is no intermediate
 representation. The trick is wiring a Rust catalog into DuckDB so that table
 lookups during planning call back into Rust, and the resulting
-`Arc<dyn GetDuckDBTypedColumns>` objects survive the round-trip through C++
+`Box<dyn DuckDBTable>` objects survive the round-trip through C++
 and come back to Rust attached to the plan.
 
 ## How we hack the DuckDB planner
@@ -29,33 +29,32 @@ When DuckDB plans a query and encounters a table name, it walks:
 
 ```
 DuckDB binder
-  -> PivotCatalog::LookupSchema("main")    -- we only have one schema
+  -> PivotCatalog::LookupSchema("main")
   -> PivotSchemaCatalogEntry::LookupEntry("users")
-       calls Rust FFI: catalog_get_table(ctx, "users")
-       Rust calls DuckDBBind::try_bind("users")
+       calls Rust FFI: catalog_get_table(transaction, datastore, schema, "users")
+       Rust calls DuckDBTransaction::bind_table(...)
        returns CatalogGetTableResult {
            found: true,
-           columns: [...],                    // from duckdb_typed_columns()
-           table: Box<OptionalTableWrapper>   // wraps Option<Arc<dyn GetDuckDBTypedColumns>>
+           columns: [...],                  // from duckdb_typed_columns()
+           table: Box<OptionalTableWrapper> // wraps Option<Box<dyn DuckDBTable>>
        }
 ```
 
 The columns tell DuckDB the schema so it can type-check and plan the query.
 The `Box<OptionalTableWrapper>` is the opaque Rust table object riding along.
 
-## How the Rust catalog object travels through C++
+## How the Rust table object travels through C++
 
-The `Arc<dyn GetDuckDBTypedColumns>` can't cross FFI directly (CXX doesn't support trait
-objects), so it's wrapped in `OptionalTableWrapper` and boxed. Here's the
-full path:
+The `Box<dyn DuckDBTable>` can't cross FFI directly because CXX doesn't
+support trait objects, so it is wrapped in `OptionalTableWrapper`:
 
 ```
-Rust DuckDBBind::try_bind()
-  returns Arc<dyn GetDuckDBTypedColumns>
+Rust DuckDBTransaction::bind_table()
+  returns Box<dyn DuckDBTable>
     |
     v
 catalog_get_table() wraps it:
-  Box<OptionalTableWrapper> (contains Option<Arc<dyn GetDuckDBTypedColumns>>)
+  Box<OptionalTableWrapper> (contains Option<Box<dyn DuckDBTable>>)
     |
     v  (crosses FFI as opaque Box in CatalogGetTableResult)
     |
@@ -69,7 +68,7 @@ lo_get_take_table() during the Rust plan walk
     |
     v
 Rust PlannerContext::plan()
-  unwraps OptionalTableWrapper -> Arc<dyn GetDuckDBTypedColumns>
+  unwraps OptionalTableWrapper -> Box<dyn DuckDBTable>
   attaches to Input nodes while building the plan
 ```
 

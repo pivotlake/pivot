@@ -8,8 +8,7 @@
 
 using namespace duckdb;
 
-PivotCatalog::PivotCatalog(AttachedDatabase &db, const CatalogContext *catalog_ctx)
-    : Catalog(db), catalog_ctx(catalog_ctx) {
+PivotCatalog::PivotCatalog(AttachedDatabase &db) : Catalog(db) {
 }
 
 void PivotCatalog::Initialize(bool load_builtin) {

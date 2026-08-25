@@ -5,13 +5,17 @@
 //! [`SERIES_CHUNK_ROWS`] batch each time it is polled, so a huge range never
 //! materializes at once and a downstream `LIMIT`/aggregate stops it early.
 
-use super::{TableFunction, invalid_argument};
-use crate::compile::Error;
-use arrow_array::{ArrayRef, Int64Array, RecordBatch};
+use super::{TableFunction, TableFunctionSignature, invalid_argument};
+use crate::catalog::{
+    BoundTable, CatalogTransaction, Column, DynamicScanPredicate, Result as CatalogResult,
+    TableReference, TableRevision,
+};
+use crate::types::Type;
+use arrow_array::{ArrayRef, Int64Array, RecordBatch, RecordBatchOptions};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use dispatch::{
-    DataFlowDispatcher, Nullary, NullaryFactory, NullaryResult, RecordBatchOperatorSpec, Sender,
-    WorkStatus,
+    DataFlowDispatcher, Nullary, NullaryFactory, NullaryResult, Projection,
+    RecordBatchOperatorSpec, Sender, WorkStatus,
 };
 use duckdb_planner::ScalarValue;
 use std::sync::Arc;
@@ -28,14 +32,14 @@ pub(super) struct SeriesTableFunction {
 }
 
 impl SeriesTableFunction {
-    pub(super) fn range() -> Self {
+    pub(super) const fn range() -> Self {
         Self {
             name: "range",
             inclusive: false,
         }
     }
 
-    pub(super) fn generate_series() -> Self {
+    pub(super) const fn generate_series() -> Self {
         Self {
             name: "generate_series",
             inclusive: true,
@@ -48,31 +52,77 @@ impl TableFunction for SeriesTableFunction {
         self.name
     }
 
-    fn compile(
+    fn signatures(&self) -> Vec<TableFunctionSignature> {
+        (1..=3)
+            .map(|argument_count| TableFunctionSignature {
+                arguments: vec![Type::Int64; argument_count],
+            })
+            .collect()
+    }
+
+    fn bind(
         &self,
-        args: &[ScalarValue],
-        dispatcher: &DataFlowDispatcher,
-    ) -> Result<RecordBatchOperatorSpec, Error> {
-        let nums = self.parse_i64_args(args)?;
-        let (start, stop, step) = match nums.as_slice() {
+        arguments: &[ScalarValue],
+        _transaction: &dyn CatalogTransaction,
+    ) -> CatalogResult<Box<dyn BoundTable>> {
+        let numbers = self
+            .parse_i64_args(arguments)
+            .map_err(|error| crate::catalog::Error::Other(Box::new(error)))?;
+        let (start, stop, step) = match numbers.as_slice() {
             // A single argument is the stop; the series starts at 0, step 1.
             [stop] => (0, *stop, 1),
             [start, stop] => (*start, *stop, 1),
             [start, stop, step] => (*start, *stop, *step),
             _ => {
-                return Err(invalid_argument(
+                return Err(crate::catalog::Error::Other(Box::new(invalid_argument(
                     self.name,
-                    format!("expected 1 to 3 arguments, got {}", nums.len()),
-                ));
+                    format!("expected 1 to 3 arguments, got {}", numbers.len()),
+                ))));
             }
         };
         if step == 0 {
-            return Err(invalid_argument(
+            return Err(crate::catalog::Error::Other(Box::new(invalid_argument(
                 self.name,
                 "step must not be zero".to_string(),
-            ));
+            ))));
         }
 
+        Ok(Box::new(BoundSeries {
+            name: self.name,
+            inclusive: self.inclusive,
+            start,
+            stop,
+            step,
+        }))
+    }
+}
+
+impl SeriesTableFunction {
+    fn parse_i64_args(&self, arguments: &[ScalarValue]) -> Result<Vec<i64>, crate::compile::Error> {
+        arguments
+            .iter()
+            .map(|argument| match argument {
+                ScalarValue::Int64(value) => Ok(*value),
+                other => Err(invalid_argument(
+                    self.name,
+                    format!("expected an integer, got '{other}'"),
+                )),
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BoundSeries {
+    name: &'static str,
+    inclusive: bool,
+    start: i64,
+    stop: i64,
+    step: i64,
+}
+
+impl BoundSeries {
+    fn compile_full(&self, dispatcher: &DataFlowDispatcher) -> RecordBatchOperatorSpec {
         // The column is named after the function so `SELECT *` reports it as
         // `range` / `generate_series`, matching DuckDB.
         let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
@@ -86,29 +136,98 @@ impl TableFunction for SeriesTableFunction {
         let factories = (0..dispatcher.worker_count()).map(|_| SeriesSourceFactory {
             claimed: claimed.clone(),
             schema: schema.clone(),
-            start,
-            stop,
-            step,
+            start: self.start,
+            stop: self.stop,
+            step: self.step,
             inclusive: self.inclusive,
         });
-        Ok(RecordBatchOperatorSpec::from_nullary(dispatcher, factories))
+        RecordBatchOperatorSpec::from_nullary(dispatcher, factories)
+    }
+
+    fn projected_schema(&self, projection: &Projection) -> SchemaRef {
+        if projection.column_indices.is_empty() {
+            Arc::new(Schema::empty())
+        } else {
+            Arc::new(Schema::new(vec![Field::new(
+                self.name,
+                DataType::Int64,
+                false,
+            )]))
+        }
     }
 }
 
-impl SeriesTableFunction {
-    fn parse_i64_args(&self, args: &[ScalarValue]) -> Result<Vec<i64>, Error> {
-        // DuckDB binds `range`/`generate_series`'s integer overload as BIGINT, so
-        // the arguments always arrive as `Int64`; anything else (e.g. the
-        // `TIMESTAMP, INTERVAL` overload) pivot doesn't support here.
-        args.iter()
-            .map(|arg| match arg {
-                ScalarValue::Int64(v) => Ok(*v),
-                other => Err(invalid_argument(
-                    self.name,
-                    format!("expected an integer, got '{other}'"),
-                )),
-            })
-            .collect()
+impl BoundTable for BoundSeries {
+    fn table_reference(&self) -> TableReference {
+        TableReference {
+            datastore: "system".to_string(),
+            schema: crate::DEFAULT_SCHEMA_NAME.to_string(),
+            table: self.name.to_string(),
+        }
+    }
+
+    fn table_revision(&self) -> TableRevision {
+        TableRevision {
+            identity: format!("{}({},{},{})", self.name, self.start, self.stop, self.step),
+            version: 0,
+        }
+    }
+
+    fn is_plan_cacheable(&self) -> bool {
+        false
+    }
+
+    fn compile_scan(
+        &self,
+        dispatcher: &DataFlowDispatcher,
+        projection: Projection,
+        _dynamic_filters: Vec<DynamicScanPredicate>,
+        _emit_row_group_metadata: bool,
+    ) -> CatalogResult<RecordBatchOperatorSpec> {
+        if !projection
+            .column_indices
+            .iter()
+            .all(|column_index| *column_index == 0)
+        {
+            return Err(crate::catalog::Error::Other(
+                "series projection contains a column other than 0".into(),
+            ));
+        }
+        let projected_schema = self.projected_schema(&projection);
+        let column_indices = Arc::new(projection.column_indices);
+        Ok(self.compile_full(dispatcher).project(move || {
+            let projected_schema = projected_schema.clone();
+            let column_indices = column_indices.clone();
+            move |batch| {
+                if column_indices.is_empty() {
+                    RecordBatch::try_new_with_options(
+                        projected_schema.clone(),
+                        Vec::new(),
+                        &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+                    )
+                    .expect("empty series projection preserves its row count")
+                } else {
+                    batch
+                        .project(&column_indices)
+                        .expect("series projections contain only column 0")
+                }
+            }
+        }))
+    }
+
+    fn columns(&self) -> Vec<Column> {
+        vec![Column {
+            name: self.name.to_string(),
+            col_type: Type::Int64,
+        }]
+    }
+
+    fn nullability(&self) -> Vec<bool> {
+        vec![false]
+    }
+
+    fn clone_box(&self) -> Box<dyn BoundTable> {
+        Box::new(self.clone())
     }
 }
 

@@ -22,7 +22,7 @@ use duckdb_planner::LogicalOp;
 use duckdb_planner::duckdb_bridge::duckdb_types::{ExpressionType, JoinType};
 use duckdb_planner::handle::{
     ComparisonJoin as ComparisonJoinView, DelimGet as DelimGetView, DelimJoin as DelimJoinView,
-    JoinCondition, JoinConditionEntry, Operator as DuckOperator, TableScan as TableScanView,
+    JoinCondition, JoinConditionEntry, Operator as DuckOperator, PushedConditions,
 };
 
 use crate::catalog::BoundTable;
@@ -131,10 +131,9 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
     // DuckDB's optimizer pushes simple `column <op> constant` predicates down
     // into the scan itself (its `table_filters`), so the `Filter` operator that
     // would sit above the scan disappears. Pivot wants that explicit `Filter`
-    // back, so a base-table scan collects the pushed predicates here and, after
-    // the node is built (below), wraps it in a synthetic `Filter` — restoring the
-    // same `Filter -> Input` shape as if pushdown were off. Empty for every other
-    // operator.
+    // back, so every Pivot-backed scan collects the pushed predicates here and,
+    // after the node is built (below), wraps it in a synthetic `Filter`, restoring
+    // the same shape as if pushdown were off. Empty for every other operator.
     let mut pushed_conditions: Vec<Expression> = Vec::new();
 
     let operator = match kind {
@@ -167,11 +166,12 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         DuckOperator::TableScan(scan) => {
             // The pushdown lift is a walk-level transform (it wraps the scan in a
             // Filter below), so it stays here rather than in `Input::from_handle`.
-            pushed_conditions = build_pushed_conditions(scan)?;
+            pushed_conditions = build_pushed_conditions(scan.pushed_conditions()?)?;
             Operator::Input(Input::from_handle(scan, ctx)?)
         }
         DuckOperator::TableFunctionScan(view) => {
-            Operator::TableFunctionScan(TableFunctionScan::from_handle(view)?)
+            pushed_conditions = build_pushed_conditions(view.pushed_conditions()?)?;
+            Operator::TableFunctionScan(TableFunctionScan::from_handle(view, ctx)?)
         }
         DuckOperator::CreateTable(c) => Operator::CreateTable(CreateTable::from_handle(c)?),
         DuckOperator::CreateSchema(c) => Operator::CreateSchema(CreateSchema::from_handle(c)?),
@@ -236,13 +236,16 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         operator,
     };
 
-    // A filter directly above a base-table scan folds the scan's lifted
+    // A filter directly above a Pivot-backed scan folds the scan's lifted
     // pushed-down conditions into itself (see `absorb_scan_pushdown_filter`).
     // The peek at the DuckDB child is what grounds the fold: only a scan child
     // means the built input's Filter can be the synthetic wrapper.
     if matches!(kind, DuckOperator::Filter(_))
         && match op.children()?.first() {
-            Some(child) => matches!(child.operator()?, DuckOperator::TableScan(_)),
+            Some(child) => matches!(
+                child.operator()?,
+                DuckOperator::TableScan(_) | DuckOperator::TableFunctionScan(_)
+            ),
             None => false,
         }
     {
@@ -251,7 +254,7 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
 
     // Reattach the scan's static pushed-down filters as a Filter above it, so the
     // Rust side keeps seeing `Filter -> Input` exactly as with filter_pushdown off.
-    // Only a TableScan ever populates `pushed_conditions`.
+    // Only Pivot-backed scans populate `pushed_conditions`.
     if !pushed_conditions.is_empty() {
         return Ok(PlanNode {
             name: "PUSHDOWN_FILTER".to_string(),
@@ -893,8 +896,7 @@ fn build_scan_columns(
         .collect()
 }
 
-fn build_pushed_conditions(scan: TableScanView<'_>) -> Result<Vec<Expression>, OperatorError> {
-    let list = scan.pushed_conditions()?;
+fn build_pushed_conditions(list: PushedConditions) -> Result<Vec<Expression>, OperatorError> {
     Ok(list
         .exprs()?
         .into_iter()
@@ -1347,12 +1349,18 @@ fn build_late_materialization(
     // field extract DuckDB pushed into the Get survives; fetching by bare
     // storage index would hand back the whole document column where the query
     // asked for a single field.
-    let DuckOperator::TableScan(wide_scan) = op.child(0)?.operator()? else {
-        return Err(OperatorError::Unsupported(
-            "late materialization without a base-table wide scan is not supported".to_string(),
-        ));
+    let columns = match op.child(0)?.operator()? {
+        DuckOperator::TableScan(wide_scan) => build_scan_columns(wide_scan.output_columns()?)?,
+        DuckOperator::TableFunctionScan(wide_scan) => {
+            build_scan_columns(wide_scan.output_columns()?)?
+        }
+        _ => {
+            return Err(OperatorError::Unsupported(
+                "late materialization without a Pivot-backed wide scan is not supported"
+                    .to_string(),
+            ));
+        }
     };
-    let columns = build_scan_columns(wide_scan.output_columns()?)?;
 
     // Child 1 is the narrow pipeline; translate it normally.
     let mut child = build_node(op.child(1)?, ctx)?;
@@ -1360,7 +1368,7 @@ fn build_late_materialization(
     // Materialize so both read (a clone of) the same table.
     let table = prepare_narrow_scan(&mut child).ok_or_else(|| {
         OperatorError::Unsupported(
-            "late materialization without a base-table scan is not supported".to_string(),
+            "late materialization without a Pivot-backed narrow scan is not supported".to_string(),
         )
     })?;
 
@@ -1371,15 +1379,20 @@ fn build_late_materialization(
     })
 }
 
-/// Walk the late-mat narrow subtree to its scan, flag it to emit row-group
-/// metadata, and return a clone of its table (which the Materialize re-reads).
-/// The narrow subtree is a straight projection/filter/limit chain over one
-/// scan (the rewrite only fires on that shape), so the first `Input` found is
-/// the one.
+/// Walk the late-mat narrow subtree to its Pivot-backed scan, flag it to emit
+/// row-group metadata, and return a clone of its table (which the Materialize
+/// re-reads). The narrow subtree is a straight projection/filter/limit chain
+/// over one scan, so the first catalog input or table-function scan is the one.
 fn prepare_narrow_scan(node: &mut PlanNode) -> Option<Box<dyn BoundTable>> {
-    if let Operator::Input(input) = &mut node.operator {
-        input.emit_row_group_metadata = true;
-        return Some(input.table.clone_box());
+    match &mut node.operator {
+        Operator::Input(input) => {
+            input.emit_row_group_metadata = true;
+            return Some(input.table.clone_box());
+        }
+        Operator::TableFunctionScan(scan) => {
+            return Some(scan.prepare_late_materialization());
+        }
+        _ => {}
     }
     prepare_narrow_scan(node.inputs.first_mut()?)
 }

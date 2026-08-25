@@ -37,7 +37,7 @@
 //! let config = Config::open("pivot.yaml")?;
 //! let workers = config.server.workers.unwrap_or_else(dispatch::default_worker_count);
 //! let dispatch = Dispatch::spin_up(workers, 32, None);
-//! let metastore: Arc<dyn Metastore> = Arc::new(DiskMetastore::open(
+//! let metastore = Arc::new(DiskMetastore::open(
 //!     config.metastore,
 //!     None,
 //!     config.server.refresh_interval.as_duration(),
@@ -46,7 +46,10 @@
 //!     metastore.open_datastores(dispatch.dispatcher())?,
 //!     metastore.default_datastore_name().to_string(),
 //!     metastore.clone(),
-//! )?);
+//! )?.with_external_parquet_read_context(
+//!     dispatch.dispatcher(),
+//!     metastore.external_store_factory(),
+//! ));
 //!
 //! let server = Server::new(config.server.bind, dispatch, catalog, metastore);
 //! // Returns when ctrl_c fires, or earlier if a dispatch worker dies.

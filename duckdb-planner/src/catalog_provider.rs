@@ -70,22 +70,30 @@ pub struct OptionalTableWrapper {
     pub table: Option<Box<dyn DuckDBTable>>,
 }
 
+/// One globally registered table-function overload. Each overload repeats the
+/// SQL name so the C++ bridge can group the flat list into DuckDB function
+/// sets while constructing the planner context.
+pub struct TableFunctionDef {
+    pub name: String,
+    pub arg_type_ids: Vec<u8>,
+    pub supports_late_materialization: bool,
+}
+
 pub use crate::duckdb_bridge::ffi::ScalarFunctionDef;
 
-pub trait DuckDBBind {
+/// One planning transaction's binder: resolves table names against the
+/// snapshot the transaction was opened on, so everything a single plan binds
+/// comes from one consistent view of the catalog. Table-function signatures
+/// are static planner registrations, but each invocation binds through this
+/// transaction.
+pub trait DuckDBTransaction: Send + Sync {
     /// Given a scalar function name (e.g. `drop_cache`), return its binding
-    /// signature. Names the provider doesn't define return `None` and resolve
-    /// against DuckDB's own built-ins. Default: none.
+    /// signature. Names the transaction doesn't define return `None` and
+    /// resolve against DuckDB's own built-ins. Default: none.
     fn scalar_function(&self, _name: &str) -> Option<ScalarFunctionDef> {
         None
     }
-}
 
-/// One planning transaction's binder: resolves table names against the snapshot
-/// the transaction was opened on, so everything a single plan binds comes from
-/// one consistent view of the catalog. Only names that are static registry
-/// (scalar functions) resolve through [`DuckDBBind`] instead.
-pub trait DuckDBTransaction: Send + Sync {
     /// Whether datastore `datastore` defines a schema named `schema`. The bridge
     /// asks this when the binder looks a schema up, before any table inside it is
     /// resolved, so a reference into a schema that does not exist fails as an
@@ -100,35 +108,35 @@ pub trait DuckDBTransaction: Send + Sync {
     /// several datastores routes by it.
     fn bind_table(&self, datastore: &str, schema: &str, name: &str)
     -> Option<Box<dyn DuckDBTable>>;
+
+    /// Bind a globally registered table-function invocation through the
+    /// current query transaction.
+    fn bind_table_function(
+        &self,
+        _name: &str,
+        _arguments: Vec<crate::ScalarValue>,
+    ) -> Result<Box<dyn DuckDBTable>> {
+        Err("table-function binding is not supported by this transaction".into())
+    }
 }
 
-/// Wraps an `Arc<dyn DuckDBBind>` for the C++ bridge.
-///
-/// CXX requires owned, concrete types to cross the FFI boundary — it cannot
-/// pass an `Arc<dyn Trait>` directly. `Box<CatalogContext>` satisfies that
-/// constraint while keeping the inner provider cheaply cloneable via `Arc`.
-///
-/// Users don't interact with this type; [`PlannerContext::new`](crate::PlannerContext::new)
-/// accepts the pieces and wraps them internally.
-///
-/// The static provider is a single one shared by every attached datastore:
-/// scalar functions are generic (not per-datastore). `database_names` are the
-/// datastores to `ATTACH` (one DuckDB database each) and `default_name` the one
-/// to `USE` as the current database.
+/// Static configuration owned by the C++ planner context. Table-function
+/// overloads must be registered before any query is planned; invocation binding
+/// and all other catalog resolution use the per-query [`DuckDBTransaction`].
 pub struct CatalogContext {
-    provider: Arc<dyn DuckDBBind>,
+    table_functions: Vec<TableFunctionDef>,
     database_names: Vec<String>,
     default_name: String,
 }
 
 impl CatalogContext {
     pub(crate) fn new(
-        provider: Arc<dyn DuckDBBind>,
+        table_functions: Vec<TableFunctionDef>,
         database_names: Vec<String>,
         default_name: String,
     ) -> Self {
         CatalogContext {
-            provider,
+            table_functions,
             database_names,
             default_name,
         }
@@ -147,11 +155,22 @@ pub(crate) fn catalog_context_default(ctx: &CatalogContext) -> String {
     ctx.default_name.clone()
 }
 
-/// Wraps an `Arc<dyn DuckDBTransaction>` for the C++ bridge, the same way
-/// [`CatalogContext`] wraps the provider. One is created per
+/// The global table-function overloads to install in DuckDB's system catalog.
+pub(crate) fn catalog_table_functions(ctx: &CatalogContext) -> Vec<ffi::TableFunctionDef> {
+    ctx.table_functions
+        .iter()
+        .map(|function| ffi::TableFunctionDef {
+            name: function.name.clone(),
+            arg_type_ids: function.arg_type_ids.clone(),
+            supports_late_materialization: function.supports_late_materialization,
+        })
+        .collect()
+}
+
+/// Wraps an `Arc<dyn DuckDBTransaction>` for the C++ bridge. One is created per
 /// [`PlannerContext::plan`](crate::PlannerContext::plan) call; the C++ side
-/// publishes a pointer to it on the pivot storage info for the duration of
-/// that plan, and table lookups during binding come back through it.
+/// publishes a pointer to it on the pivot storage info for the duration of that
+/// plan, and catalog lookups during binding come back through it.
 pub struct TransactionContext {
     transaction: Arc<dyn DuckDBTransaction>,
 }
@@ -196,11 +215,41 @@ pub(crate) fn catalog_get_table(
     }
 }
 
+pub(crate) fn catalog_bind_table_function(
+    transaction: &TransactionContext,
+    name: &str,
+    arguments: &cxx::CxxVector<ffi::Value>,
+) -> Result<ffi::CatalogBindTableFunctionResult> {
+    let arguments = arguments
+        .iter()
+        .map(crate::handle::scalar_from_value)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let table = transaction
+        .transaction
+        .bind_table_function(name, arguments)?;
+    let columns = table.duckdb_typed_columns();
+    Ok(ffi::CatalogBindTableFunctionResult {
+        columns,
+        table: Box::new(OptionalTableWrapper { table: Some(table) }),
+    })
+}
+
+/// Clone a table handle held in DuckDB function bind data. Optimizer copies of
+/// a logical get must own independent Rust wrappers, while the underlying bound
+/// table decides what state is shared through [`DuckDBTable::clone_box`].
+pub(crate) fn clone_table_function_table(
+    table: &OptionalTableWrapper,
+) -> Box<OptionalTableWrapper> {
+    Box::new(OptionalTableWrapper {
+        table: table.table.as_ref().map(|table| table.clone_box()),
+    })
+}
+
 pub(crate) fn catalog_get_scalar_function(
-    ctx: &CatalogContext,
+    transaction: &TransactionContext,
     name: &str,
 ) -> CatalogGetScalarFunctionResult {
-    match ctx.provider.scalar_function(name) {
+    match transaction.transaction.scalar_function(name) {
         Some(function) => CatalogGetScalarFunctionResult {
             found: true,
             function,

@@ -2,8 +2,8 @@
 //! directory.
 
 use super::{
-    DataFileLocation, FileRef, ListedObject, ObjectPath, ObjectStore, Result, StoreConnection,
-    StoreError,
+    DataFileLocation, DirectoryListing, FileRef, ListedObject, ObjectPath, ObjectStore, Result,
+    StoreConnection, StoreError,
 };
 use std::path::{Path, PathBuf};
 
@@ -147,12 +147,14 @@ impl ObjectStore for LocalStore {
         }
     }
 
-    fn list(&self, prefix: &ObjectPath) -> Result<Vec<ListedObject>> {
+    fn list(&self, prefix: &ObjectPath) -> Result<DirectoryListing> {
         let dir = self.path_for(prefix);
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
             // A not-yet-created directory lists as empty, not an error.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(DirectoryListing::default());
+            }
             Err(source) => {
                 return Err(StoreError::Io {
                     key: prefix.to_string(),
@@ -161,16 +163,27 @@ impl ObjectStore for LocalStore {
             }
         };
         let mut objects = Vec::new();
+        let mut prefixes = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|source| StoreError::Io {
                 key: prefix.to_string(),
                 source,
             })?;
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let file_type = entry.file_type().map_err(|source| StoreError::Io {
+                key: prefix.join(&name).to_string(),
+                source,
+            })?;
+            if file_type.is_dir() {
+                prefixes.push(ObjectPath::new(name));
+                continue;
+            }
             let meta = entry.metadata().map_err(|source| StoreError::Io {
                 key: prefix.to_string(),
                 source,
             })?;
-            // One level only: skip subdirectories (a table's data files are flat).
             if !meta.is_file() {
                 continue;
             }
@@ -182,17 +195,15 @@ impl ObjectStore for LocalStore {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            if let Some(name) = entry.file_name().to_str() {
-                objects.push(ListedObject {
-                    file: FileRef {
-                        path: ObjectPath::new(name),
-                        size: meta.len(),
-                    },
-                    modified_unix_ms,
-                });
-            }
+            objects.push(ListedObject {
+                file: FileRef {
+                    path: ObjectPath::new(name),
+                    size: meta.len(),
+                },
+                modified_unix_ms,
+            });
         }
-        Ok(objects)
+        Ok(DirectoryListing { objects, prefixes })
     }
 
     fn absolute_key(&self, key: &ObjectPath) -> Result<ObjectPath> {
@@ -278,6 +289,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = LocalStore::new(dir.path()).unwrap();
         assert!(store.get(&p("nope")).unwrap().is_none());
-        assert!(store.list(&p("_missing")).unwrap().is_empty());
+        assert_eq!(
+            store.list(&p("_missing")).unwrap(),
+            DirectoryListing::default()
+        );
     }
 }

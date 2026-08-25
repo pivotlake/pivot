@@ -76,6 +76,15 @@ pub struct ListedObject {
     pub modified_unix_ms: u64,
 }
 
+/// One level of an object-store namespace. `objects` are the files directly
+/// under the requested prefix; `prefixes` are its immediate child prefixes,
+/// each named relative to that same requested prefix.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirectoryListing {
+    pub objects: Vec<ListedObject>,
+    pub prefixes: Vec<ObjectPath>,
+}
+
 impl FileRef {
     /// Turn this ref into a [`DataFile`] to read it for a table at `location`:
     /// its path is relative to the table's location (an absolute one escapes to
@@ -220,11 +229,9 @@ pub trait ObjectStore: Debug + Send + Sync {
     /// the caller's goal (key absent) is already met.
     fn delete(&self, key: &ObjectPath) -> Result<()>;
 
-    /// List objects directly under `prefix` (one level, not recursive), each as
-    /// a [`ListedObject`] — a **relative** [`ObjectPath`] (the object's name
-    /// within `prefix`) with its size and its storage modification time (Unix
-    /// ms).
-    fn list(&self, prefix: &ObjectPath) -> Result<Vec<ListedObject>>;
+    /// List one level under `prefix`: direct objects and immediate child
+    /// prefixes, all named relative to `prefix`.
+    fn list(&self, prefix: &ObjectPath) -> Result<DirectoryListing>;
 
     /// How the io_uring reader should fetch object `key`: a local backend yields
     /// a filesystem path, a remote one a GET URL — either presigned or paired
@@ -292,6 +299,24 @@ pub enum StoreConnection {
         credentials_file: Option<String>,
         emulator_endpoint: Option<String>,
     },
+}
+
+/// Opens the store root needed by an external table-function invocation. A
+/// provider resolves credentials against `root_uri`, the longest non-wildcard
+/// parent that the returned store can address.
+pub trait ExternalStoreFactory: Debug + Send + Sync {
+    fn open(&self, root_uri: &str) -> Result<Arc<dyn ObjectStore>>;
+}
+
+/// External store opener for embedded datastores. Credentials come from the
+/// same ambient environment chain as [`open_store`].
+#[derive(Debug, Default)]
+pub struct AmbientExternalStoreFactory;
+
+impl ExternalStoreFactory for AmbientExternalStoreFactory {
+    fn open(&self, root_uri: &str) -> Result<Arc<dyn ObjectStore>> {
+        Ok(Arc::from(open_store(root_uri)?))
+    }
 }
 
 /// The backend a location URI addresses. The backend is inferred from the
@@ -422,6 +447,19 @@ pub(crate) fn key_name(key: &str) -> String {
     key.rsplit('/').next().unwrap_or(key).to_string()
 }
 
+/// Strip the store/list prefix from a recursively listed backend key, yielding
+/// the path callers use relative to the requested listing root.
+pub(crate) fn relative_key(prefix: &str, key: &str) -> String {
+    let prefix = prefix.trim_matches('/');
+    if prefix.is_empty() {
+        return key.trim_start_matches('/').to_string();
+    }
+    key.strip_prefix(prefix)
+        .unwrap_or(key)
+        .trim_start_matches('/')
+        .to_string()
+}
+
 /// The in-bucket object key a remote backend should address for a store key.
 /// An [absolute](ObjectPath::is_absolute) key is taken from the bucket root,
 /// ignoring `prefix` (the database's own prefix within the bucket); any other
@@ -433,6 +471,8 @@ pub(crate) fn object_key(prefix: &str, key: &ObjectPath) -> String {
         let prefix = prefix.trim_matches('/');
         if prefix.is_empty() {
             key.as_str().to_string()
+        } else if key.is_empty() {
+            prefix.to_string()
         } else {
             format!("{prefix}/{}", key.as_str())
         }
@@ -513,6 +553,8 @@ mod tests {
             object_key("", &ObjectPath::new("/shared/a.parquet")),
             "shared/a.parquet"
         );
+        // The empty relative key names the configured store root itself.
+        assert_eq!(object_key("mydb", &ObjectPath::default()), "mydb");
     }
 
     #[test]

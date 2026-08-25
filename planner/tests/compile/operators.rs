@@ -2149,6 +2149,27 @@ fn range_with_single_argument_starts_at_zero(mut testing_planner: TestingPlanner
 }
 
 #[rstest]
+fn timestamp_generate_series_is_not_registered(mut testing_planner: TestingPlanner) {
+    let result = testing_planner.plan(
+        "SELECT * FROM generate_series(\
+            TIMESTAMP '2024-01-01', TIMESTAMP '2024-01-03', INTERVAL '1 day')",
+    );
+
+    let error = result.unwrap_err().to_string();
+
+    assert!(error.contains("generate_series(BIGINT"), "{error}");
+}
+
+#[rstest]
+fn zero_series_step_fails_during_binding(mut testing_planner: TestingPlanner) {
+    let result = testing_planner.plan("SELECT * FROM generate_series(1, 5, 0)");
+
+    let error = result.unwrap_err().to_string();
+
+    assert!(error.contains("step must not be zero"), "{error}");
+}
+
+#[rstest]
 fn count_star_over_empty_series(mut testing_planner: TestingPlanner) {
     // start > stop with a positive step yields no rows; count(*) must still be 0.
     let results = testing_planner

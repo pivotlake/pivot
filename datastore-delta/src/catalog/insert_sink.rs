@@ -19,9 +19,9 @@ use planner::catalog::Column;
 use uuid::Uuid;
 
 use crate::catalog::CatalogTable;
+use object_storage::{DataFileLocation, FileRef, ObjectPath, ObjectStore};
 use parquet_engine::RowGroupMetadata;
 use parquet_engine::writing::{AssembledFile, encode_record_batches_spec, unshred_batches_spec};
-use object_storage::{DataFileLocation, FileRef, ObjectPath, ObjectStore};
 
 /// Build the dataflow that writes `input`'s rows into `table` as Parquet and
 /// emits the inserted-row count. Each finished file is pushed onto `uploaded_files`

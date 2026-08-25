@@ -7,6 +7,7 @@ use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
 use datastore_delta::DeltaDatastore;
 use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
 use metastore::{Metastore, UserAuth};
+use object_storage::AmbientExternalStoreFactory;
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 #[derive(Debug)]
@@ -110,14 +111,20 @@ impl ShellInstance {
         let dispatch = DispatchOwner::new(Dispatch::spin_up(workers, buffers, None));
         let datastore = DeltaDatastore::open(location, dispatch.dispatcher())?;
         let metastore: Arc<dyn Metastore> = Arc::new(EphemeralMetastore);
-        let catalog = Arc::new(PivotCatalog::new(
-            HashMap::from([(
+        let catalog = Arc::new(
+            PivotCatalog::new(
+                HashMap::from([(
+                    DEFAULT_DATASTORE_NAME.to_string(),
+                    datastore.clone() as Arc<dyn Datastore>,
+                )]),
                 DEFAULT_DATASTORE_NAME.to_string(),
-                datastore.clone() as Arc<dyn Datastore>,
-            )]),
-            DEFAULT_DATASTORE_NAME.to_string(),
-            metastore,
-        )?);
+                metastore,
+            )?
+            .with_external_parquet_read_context(
+                dispatch.dispatcher(),
+                Arc::new(AmbientExternalStoreFactory),
+            ),
+        );
         let engine = engine::Engine::new(catalog.clone(), dispatch.dispatcher().clone());
         Ok(Self {
             state: Some(ShellState {

@@ -64,8 +64,14 @@ fn start_server_from_config(config_yaml: &str) -> u16 {
             );
             let datastores = metastore.open_datastores(dispatch.dispatcher()).unwrap();
             let default_name = metastore.default_datastore_name().to_string();
-            let catalog =
-                Arc::new(PivotCatalog::new(datastores, default_name, metastore.clone()).unwrap());
+            let catalog = Arc::new(
+                PivotCatalog::new(datastores, default_name, metastore.clone())
+                    .unwrap()
+                    .with_external_parquet_read_context(
+                        dispatch.dispatcher(),
+                        metastore.external_store_factory(),
+                    ),
+            );
             let server = Server::new(bind, dispatch, catalog, metastore);
             let _ = server.serve(Box::pin(std::future::pending::<()>())).await;
         });
@@ -111,6 +117,13 @@ async fn events_server(backend: &Backend, config_yaml: &str) -> Client {
             &parquet_name_value_rows(&[4, 5]),
         )
         .unwrap();
+    backend
+        .store
+        .put(
+            &ObjectPath::new("external-part.parquet"),
+            &parquet_name_value_rows(&[6, 7]),
+        )
+        .unwrap();
     let client = connect_client(start_server_from_config(config_yaml)).await;
     client
         .simple_query(
@@ -131,6 +144,36 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .build()
         .unwrap()
         .block_on(future)
+}
+
+fn external_parquet_query(root: &str) -> String {
+    format!(
+        "SELECT COUNT(value) FROM read_parquet('{}/external-*.parquet')",
+        root.trim_end_matches('/')
+    )
+}
+
+#[test]
+fn an_external_s3_location_without_a_covering_secret_is_rejected() {
+    let database = TempDir::new().unwrap();
+    let config = datastores_section(&database.path().to_string_lossy());
+
+    let message = block_on(async {
+        let client = connect_client(start_server_from_config(&config)).await;
+        client
+            .simple_query(
+                "SELECT value FROM read_parquet(\
+                 's3://uncovered/events/part-*.parquet')",
+            )
+            .await
+            .unwrap_err()
+            .as_db_error()
+            .unwrap()
+            .message()
+            .to_string()
+    });
+
+    assert!(message.contains("no S3 secret covers"), "{message}");
 }
 
 #[test]
@@ -168,12 +211,15 @@ fn an_s3_datastore_is_served_with_the_secret_scoped_to_it() {
         endpoint = std::env::var("AWS_ENDPOINT_URL").unwrap(),
     );
 
-    let rows = block_on(async {
+    let (table_rows, external_rows) = block_on(async {
         let client = events_server(&backend, &config).await;
-        select_rows(&client, "SELECT COUNT(value) FROM events").await
+        let table_rows = select_rows(&client, "SELECT COUNT(value) FROM events").await;
+        let external_rows = select_rows(&client, &external_parquet_query(&backend.root)).await;
+        (table_rows, external_rows)
     });
 
-    assert_eq!(rows, vec![vec![Some("5".to_string())]]);
+    assert_eq!(table_rows, vec![vec![Some("5".to_string())]]);
+    assert_eq!(external_rows, vec![vec![Some("2".to_string())]]);
 }
 
 #[test]
@@ -200,12 +246,15 @@ fn a_gcs_datastore_is_served_with_the_secret_scoped_to_it() {
         key_path = key_path.display(),
     );
 
-    let rows = block_on(async {
+    let (table_rows, external_rows) = block_on(async {
         let client = events_server(&backend, &config).await;
-        select_rows(&client, "SELECT COUNT(value) FROM events").await
+        let table_rows = select_rows(&client, "SELECT COUNT(value) FROM events").await;
+        let external_rows = select_rows(&client, &external_parquet_query(&backend.root)).await;
+        (table_rows, external_rows)
     });
 
-    assert_eq!(rows, vec![vec![Some("5".to_string())]]);
+    assert_eq!(table_rows, vec![vec![Some("5".to_string())]]);
+    assert_eq!(external_rows, vec![vec![Some("2".to_string())]]);
 }
 
 #[test]
@@ -215,10 +264,13 @@ fn a_gcs_datastore_no_secret_covers_is_served_with_ambient_credentials() {
     };
     let config = datastores_section(&backend.root);
 
-    let rows = block_on(async {
+    let (table_rows, external_rows) = block_on(async {
         let client = events_server(&backend, &config).await;
-        select_rows(&client, "SELECT COUNT(value) FROM events").await
+        let table_rows = select_rows(&client, "SELECT COUNT(value) FROM events").await;
+        let external_rows = select_rows(&client, &external_parquet_query(&backend.root)).await;
+        (table_rows, external_rows)
     });
 
-    assert_eq!(rows, vec![vec![Some("5".to_string())]]);
+    assert_eq!(table_rows, vec![vec![Some("5".to_string())]]);
+    assert_eq!(external_rows, vec![vec![Some("2".to_string())]]);
 }

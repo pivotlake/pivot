@@ -2,6 +2,7 @@
 #include "duckdb-planner/src/duckdb_bridge/cpp/bridge.h"
 #include "duckdb-planner/src/duckdb_bridge/cpp/storage_info.h"
 #include "duckdb-planner/src/duckdb_bridge/cpp/catalog/table_entry.h"
+#include "duckdb-planner/src/duckdb_bridge/cpp/catalog/schema_entry.h"
 #include "duckdb/common/enum_util.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/client_data.hpp"
@@ -160,7 +161,8 @@ DuckPlannerContext::DuckPlannerContext(rust::Box<CatalogContext> catalog)
 	// current database, so unqualified names resolve against it.
 	auto ext = duckdb::StorageExtension::Find(
 	    duckdb::DBConfig::GetConfig(*db.instance), "pivotdb");
-	ext->storage_info = duckdb::make_shared_ptr<PivotStorageInfo>(&*this->catalog);
+	ext->storage_info = duckdb::make_shared_ptr<PivotStorageInfo>();
+	RegisterPivotTableFunctions(*con.context, *this->catalog);
 
 	for (const auto &name : catalog_context_names(*this->catalog)) {
 		std::string db_name(name);
@@ -538,6 +540,20 @@ rust::Box<OptionalTableWrapper> lo_get_take_table(const LogicalOperator &op) {
 	auto &get = as<duckdb::LogicalGet>(op);
 	auto &pivot_entry = get.GetTable()->Cast<PivotTableCatalogEntry>();
 	return std::move(pivot_entry.table);
+}
+
+bool lo_get_has_bound_table_function(const LogicalOperator &op) {
+	auto &get = as<duckdb::LogicalGet>(op);
+	return dynamic_cast<PivotTableFunctionBindData *>(get.bind_data.get()) != nullptr;
+}
+
+rust::Box<OptionalTableWrapper> lo_get_clone_bound_table_function(const LogicalOperator &op) {
+	auto &get = as<duckdb::LogicalGet>(op);
+	auto *bound = dynamic_cast<PivotTableFunctionBindData *>(get.bind_data.get());
+	if (!bound) {
+		throw std::runtime_error("table function has no pivot bound table");
+	}
+	return clone_table_function_table(*bound->table);
 }
 
 // A LogicalGet reads `column_ids` off disk but may *output* only a subset /
