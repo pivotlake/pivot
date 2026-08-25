@@ -105,6 +105,10 @@ mod uring_backend {
         /// Re-armed after every firing (and after a full submission queue made
         /// arming fail).
         wake_armed: bool,
+        /// Fail every read at submission, so a test can exercise the
+        /// synchronous submit-failure path without a full ring.
+        #[cfg(test)]
+        reject_reads: bool,
     }
 
     impl IOBackend {
@@ -129,6 +133,8 @@ mod uring_backend {
                 ring,
                 wake_eventfd,
                 wake_armed: false,
+                #[cfg(test)]
+                reject_reads: false,
             };
             backend.arm_wake();
             Ok(backend)
@@ -170,6 +176,13 @@ mod uring_backend {
             }
         }
 
+        /// Make every following [`submit_read`](Self::submit_read) fail as if
+        /// the submission queue were full.
+        #[cfg(test)]
+        pub(crate) fn reject_reads(&mut self) {
+            self.reject_reads = true;
+        }
+
         /// Pushes a read of `length` bytes into `dest` onto the submission queue
         /// (does not flush). `dest` points into a pinned cache slot.
         pub fn submit_read(
@@ -180,6 +193,10 @@ mod uring_backend {
             length: usize,
             request_id: Identifier,
         ) -> Result<()> {
+            #[cfg(test)]
+            if self.reject_reads {
+                return Err(Error::SubmissionQueueFull);
+            }
             let length = length.min(MAX_IO_OP_LEN);
             // Reads execute inline in `io_uring_enter`: the kernel issues them
             // with nowait semantics and punts a would-block request to io-wq
@@ -516,6 +533,10 @@ mod pread_pool_backend {
         in_flight: usize,
         /// Staged ops not yet handed to the pool; flushed by [`submit`](Self::submit).
         staged: Vec<Job>,
+        /// Fail every read at submission, so a test can exercise the
+        /// synchronous submit-failure path.
+        #[cfg(test)]
+        reject_reads: bool,
     }
 
     impl IOBackend {
@@ -531,7 +552,16 @@ mod pread_pool_backend {
                 ready: VecDeque::new(),
                 in_flight: 0,
                 staged: Vec::new(),
+                #[cfg(test)]
+                reject_reads: false,
             })
+        }
+
+        /// Make every following [`submit_read`](Self::submit_read) fail as if
+        /// the submission queue were full.
+        #[cfg(test)]
+        pub(crate) fn reject_reads(&mut self) {
+            self.reject_reads = true;
         }
 
         /// Stages a read into `dest`; dispatched to the pool at
@@ -544,6 +574,10 @@ mod pread_pool_backend {
             length: usize,
             request_id: Identifier,
         ) -> Result<()> {
+            #[cfg(test)]
+            if self.reject_reads {
+                return Err(Error::SubmissionQueueFull);
+            }
             self.staged.push(Job {
                 fd,
                 offset,
