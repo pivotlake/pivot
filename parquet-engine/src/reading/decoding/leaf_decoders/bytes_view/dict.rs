@@ -6,6 +6,9 @@
 //! and builds a `Vec<u128>` of Arrow views so that each RLE index can be
 //! resolved to a view in O(1).
 
+use crate::reading::decoding::leaf_decoders::bytes_view::plain_page_decoder::{
+    read_u32_le_at, view_at,
+};
 use crate::reading::decoding::leaf_decoders::bytes_view::views_builder::ViewsBuilder;
 use crate::reading::decoding::leaf_decoders::{Dict, DictFromBytes, DictFromVecBytes};
 use arrow_array::builder::make_view;
@@ -50,32 +53,29 @@ impl DictFactory {
     /// Returns `Err(Error::Len)` if a length prefix is split, or
     /// `Err(Error::String(len))` if a string body is split.
     fn decode_entries_for_current_buffer(&mut self) -> Result<(), Error> {
-        let buffer = &self.buffers[self.position.buffer_index];
-        while self.position.offset < buffer.len() {
-            if self.position.offset + 4 > buffer.len() {
+        let block_id = self.position.buffer_index as u32;
+        let buffer: &[u8] = self.buffers[self.position.buffer_index].as_ref();
+        let end = buffer.len();
+        let mut offset = self.position.offset;
+        while offset < end {
+            if offset + 4 > end {
+                self.position.offset = offset;
                 return Err(Error::Len);
             }
-
-            let len_bytes: [u8; 4] = unsafe {
-                buffer
-                    .get_unchecked(self.position.offset..self.position.offset + 4)
-                    .try_into()
-                    .unwrap()
-            };
-            self.position.offset += 4;
-
-            let len = u32::from_le_bytes(len_bytes);
-            if self.position.offset + len as usize > buffer.len() {
+            // SAFETY: `offset + 4 <= end` was just checked.
+            let len = unsafe { read_u32_le_at(buffer, offset) };
+            let start = offset + 4;
+            let stop = start + len as usize;
+            if stop > end {
+                self.position.offset = start;
                 return Err(Error::String(len));
             }
-
-            self.views.push(make_view(
-                &buffer.as_ref()[self.position.offset..self.position.offset + len as usize],
-                self.position.buffer_index as u32,
-                self.position.offset as u32,
-            ));
-            self.position.offset += len as usize;
+            // SAFETY: the entry's bytes lie inside `buffer`.
+            self.views
+                .push(unsafe { view_at(buffer, start, len, block_id) });
+            offset = stop;
         }
+        self.position.offset = offset;
 
         Ok(())
     }
