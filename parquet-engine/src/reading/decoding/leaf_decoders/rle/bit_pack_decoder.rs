@@ -102,7 +102,7 @@ const fn half_bytes(bw: usize) -> usize {
 /// Loads two u128 halves: lo covers vals 0-3, hi covers vals 4-7.
 /// All shift amounts are compile-time constants.
 #[inline(always)]
-unsafe fn unpack8<const BW: usize>(data: &[u8], pos: &mut usize, out: *mut u32) {
+pub(super) unsafe fn unpack8<const BW: usize>(data: &[u8], pos: &mut usize, out: *mut u32) {
     const fn hb(bw: usize) -> usize {
         (4 * bw) % 8
     }
