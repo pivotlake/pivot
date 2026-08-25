@@ -295,7 +295,7 @@ thrift_struct!(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parquet_thrift::tests::test_roundtrip;
+    use crate::thrift::parquet_thrift::tests::test_roundtrip;
 
     #[test]
     fn decimal_schema_element_round_trips() {

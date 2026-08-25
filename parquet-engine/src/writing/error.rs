@@ -4,8 +4,8 @@
 //! helper's `?` lifts straight onto a stage's `unary` error channel with the
 //! typed cause preserved rather than stringified.
 
+use crate::thrift::parquet_thrift::ParquetError;
 use arrow_schema::{ArrowError, DataType};
-use thriftparquet::parquet_thrift::ParquetError;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum WriteError {

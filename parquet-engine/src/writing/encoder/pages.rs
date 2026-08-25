@@ -10,13 +10,13 @@
 
 use std::ops::Range;
 
+use crate::thrift::general::{Encoding, PageType};
+use crate::thrift::headers::{DataPageHeader, DictionaryPageHeader, PageHeader};
+use crate::thrift::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, BinaryViewArray, StringArray, StringViewArray};
 use arrow_schema::{DataType, TimeUnit};
 use snap::raw::Encoder;
-use thriftparquet::general::{Encoding, PageType};
-use thriftparquet::headers::{DataPageHeader, DictionaryPageHeader, PageHeader};
-use thriftparquet::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 
 use dispatch::memory::SlabAllocator;
 

@@ -279,12 +279,12 @@ impl Unary<DecompressedPage, RecordBatch> for Decoder {
 #[cfg(test)]
 mod tests {
     use crate::reading::decoding::{Decoder, ScanEqualityPredicate};
+    use crate::thrift::general::Encoding;
+    use crate::thrift::headers::PageHeader;
     use crate::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata, RowGroupMetadata};
     use crate::types::page::{DataPage, DecompressedPage, DecompressedPageType};
     use crate::types::projection::Projection;
     use crate::types::table::ParquetTable;
-    use crate::types::thrift::general::Encoding;
-    use crate::types::thrift::headers::PageHeader;
     use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, Scalar};
     use arrow_schema::{DataType, Field, Schema, SchemaRef};
     use bytes::Bytes;

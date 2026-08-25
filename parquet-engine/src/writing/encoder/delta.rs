@@ -16,13 +16,13 @@
 //! count per miniblock has to stay a multiple of 32, which is what keeps each
 //! one starting on a byte boundary.
 
+use crate::thrift::general::Encoding;
 use arrow_array::{
     Array, BinaryViewArray, Date32Array, Decimal64Array, Decimal128Array, Int8Array, Int16Array,
     Int32Array, Int64Array, StringArray, StringViewArray, TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, TimeUnit};
 use std::borrow::Cow;
-use thriftparquet::general::Encoding;
 
 use crate::{DecimalWriteStorage, decimal_write_storage};
 

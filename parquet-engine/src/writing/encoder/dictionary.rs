@@ -15,12 +15,12 @@
 
 use std::sync::Arc;
 
+use crate::thrift::general::Encoding;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Date32Type, Int32Type, TimestampMicrosecondType};
 use arrow_array::{Array, ArrayRef, Int32Array, Int64Array};
 use arrow_schema::{DataType, TimeUnit};
 use dispatch::memory::SlabAllocator;
-use thriftparquet::general::Encoding;
 
 use super::super::error::WriteResult;
 use super::super::types::EncodedPage;

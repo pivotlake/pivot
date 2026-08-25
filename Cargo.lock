@@ -1000,7 +1000,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
- "thriftparquet",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -3358,7 +3357,6 @@ dependencies = [
  "snap 1.1.1 (git+https://github.com/Epsio-Labs/rust-snappy.git?rev=c1754fc37fe43db77c3b5428d57689cd5f2182a5)",
  "tempfile",
  "thiserror 2.0.18",
- "thriftparquet",
  "tracing",
  "tracing-subscriber",
 ]
@@ -5107,10 +5105,6 @@ dependencies = [
  "integer-encoding",
  "ordered-float",
 ]
-
-[[package]]
-name = "thriftparquet"
-version = "0.1.0"
 
 [[package]]
 name = "tikv-jemalloc-sys"

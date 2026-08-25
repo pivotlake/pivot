@@ -24,7 +24,7 @@ use std::marker::PhantomData;
 use crate::reading::decoding::leaf_decoders::bytes_view::views_builder::ViewsBuilder;
 use crate::reading::decoding::leaf_decoders::delta_binary_packed::DeltaDecoder;
 use crate::reading::decoding::leaf_decoders::{ArrayBuilder, DecodeDelta};
-use crate::types::thrift::general::Encoding;
+use crate::thrift::general::Encoding;
 
 /// Reads `DELTA_LENGTH_BYTE_ARRAY` pages, producing views for a string or
 /// binary [`ViewsBuilder`] (per `V`).

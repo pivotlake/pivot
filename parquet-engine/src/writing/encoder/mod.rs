@@ -18,12 +18,12 @@ mod pages;
 mod plain;
 mod rle;
 
+use crate::thrift::footer::Statistics;
+use crate::thrift::general::Encoding;
 use arrow_array::ArrayRef;
 use arrow_schema::Field;
 use dispatch::memory::SlabAllocator;
 use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult};
-use thriftparquet::footer::Statistics;
-use thriftparquet::general::Encoding;
 
 use super::error::{WriteError, WriteResult};
 use super::stats;
