@@ -333,3 +333,32 @@ starlight-toc a {
 .sl-banner a {
   color: var(--sl-color-gray-2);
 }
+
+/* The on-this-page rail only holds short heading labels, so it gets a
+   narrower column than the navigation sidebar on the left. */
+@media (min-width: 72rem) {
+  :root {
+    /* Whatever is left beside a full-width content column, within bounds, so
+       a narrow desktop keeps its prose readable and a wide one does not hand
+       half the screen to a few heading labels. */
+    --docs-toc-width: clamp(
+      13rem,
+      100% - var(--sl-content-width) - 2 * var(--sl-content-pad-x),
+      32.5rem
+    );
+  }
+
+  [data-has-sidebar][data-has-toc] .right-sidebar-container {
+    width: var(--docs-toc-width);
+  }
+
+  [data-has-sidebar][data-has-toc] .main-pane {
+    --sl-content-margin-inline: auto;
+    width: calc(100% - var(--docs-toc-width));
+  }
+}
+
+/* Previous/next page links at the foot of each page. */
+.pagination-links .link-title {
+  font-size: var(--sl-text-xl);
+}

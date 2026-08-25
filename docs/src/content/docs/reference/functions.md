@@ -9,7 +9,7 @@ Function names are case-insensitive. The forms and argument restrictions below
 are the implemented surface, even when the SQL binder recognizes additional
 overloads.
 
-## Aggregate functions
+### Aggregate functions
 
 | Function | Result and notes |
 | --- | --- |
@@ -21,7 +21,7 @@ overloads.
 | `min(expression)` / `max(expression)` | Minimum or maximum value. |
 | `sum(number)` | Sum. Integer sums use a `HUGEINT` result to avoid narrow integer overflow. |
 
-## Scalar functions
+### Scalar functions
 
 | Function | Result and notes |
 | --- | --- |
@@ -49,7 +49,7 @@ Binary `+`, `-`, `*`, and `/` arithmetic is supported. A `DATE` or `TIMESTAMP`
 can be adjusted by a constant `INTERVAL`; month and year offsets are not
 supported, and a `DATE` accepts only whole-day offsets.
 
-## Table functions
+### Table functions
 
 | Function | Rows produced |
 | --- | --- |

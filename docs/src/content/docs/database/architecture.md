@@ -14,13 +14,13 @@ SQL ──> planner ──> dispatch pool ──> datastore ──> parquet in o
                          └──> engine operators (scan, filter, group, sort)
 ```
 
-## Planning
+### Planning
 
 The planner resolves the statement against the catalog and pushes predicates
 down to the scan so that row groups can be pruned on their statistics before
 any bytes are read.
 
-## Dispatch
+### Dispatch
 
 Dispatch splits the surviving row groups across worker threads. A single row
 group can be split across workers when its decode is expensive enough to be
