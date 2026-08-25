@@ -294,7 +294,7 @@ async fn system_tables_belong_to_the_system_datastore(#[future] conn: Conn) {
 #[tokio::test(flavor = "multi_thread")]
 async fn system_table_files_lists_the_files_of_a_table(#[future] conn: Conn) {
     let sql = "SELECT f.bytes \
-               FROM system.table_files f JOIN system.tables t ON f.\"table\" = t.id \
+               FROM system.table_files f JOIN system.tables t ON f.table_id = t.id \
                WHERE t.name = 'system_files'";
     conn.simple_query("CREATE TABLE system_files (id BIGINT)")
         .await
@@ -333,7 +333,7 @@ async fn system_table_files_reports_column_bounds(#[future] conn: Conn) {
     let rows = select_rows(
         &conn,
         "SELECT f.min_max_stats \
-         FROM system.table_files f JOIN system.tables t ON f.\"table\" = t.id \
+         FROM system.table_files f JOIN system.tables t ON f.table_id = t.id \
          WHERE t.name = 'system_file_bounds'",
     )
     .await;
@@ -378,7 +378,7 @@ async fn system_table_files_reports_column_bounds(#[future] conn: Conn) {
         &conn,
         "SELECT CAST(f.min_max_stats.id.min AS BIGINT), \
                 CAST(f.min_max_stats.id.max AS BIGINT) \
-         FROM system.table_files f JOIN system.tables t ON f.\"table\" = t.id \
+         FROM system.table_files f JOIN system.tables t ON f.table_id = t.id \
          WHERE t.name = 'system_file_bounds'",
     )
     .await;
@@ -451,7 +451,7 @@ async fn system_tables_and_columns_describe_a_table(#[future] conn: Conn) {
     let columns = select_rows(
         &conn,
         "SELECT c.name, c.type, c.position, c.is_partition_key, c.is_sort_key, c.bytes > 0 \
-         FROM system.columns c JOIN system.tables t ON c.\"table\" = t.id \
+         FROM system.columns c JOIN system.tables t ON c.table_id = t.id \
          WHERE t.name = 'system_described' ORDER BY c.position",
     )
     .await;
@@ -502,7 +502,7 @@ async fn system_columns_describes_the_system_relations_by_their_id(#[future] con
     let rows = select_rows(
         &conn,
         "SELECT t.id, c.name, c.type \
-         FROM system.columns c JOIN system.tables t ON c.\"table\" = t.id \
+         FROM system.columns c JOIN system.tables t ON c.table_id = t.id \
          WHERE t.datastore = 'system' AND t.name = 'datastores' ORDER BY c.position",
     )
     .await;
@@ -543,7 +543,7 @@ async fn system_table_files_reports_a_file_partition(#[future] conn: Conn) {
     let partitions = select_rows(
         &conn,
         "SELECT f.partition \
-         FROM system.table_files f JOIN system.tables t ON f.\"table\" = t.id \
+         FROM system.table_files f JOIN system.tables t ON f.table_id = t.id \
          WHERE t.name = 'system_partitioned' ORDER BY f.partition",
     )
     .await;
