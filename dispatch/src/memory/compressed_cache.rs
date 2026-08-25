@@ -1013,6 +1013,41 @@ mod tests {
         slot
     }
 
+    /// Cache one whole slot of `FD()` compressed bytes at slot-aligned file
+    /// offset `slot_number * BUFFER_SIZE`, read a few times since so it holds
+    /// lives like any page an earlier query used. The contents are irrelevant,
+    /// so the extent is committed without writing them.
+    fn insert_stale_compressed_slot(slot_number: usize) {
+        let lookups = cache().get(&FD(), slot_number * BUFFER_SIZE, BUFFER_SIZE);
+        let missing = lookups[0].missing().unwrap();
+        missing.commit();
+        for _ in 0..3 {
+            memory_ctx().clock().touch(missing.extent.slot_idx as usize);
+        }
+    }
+
+    /// Insert one decompressed block over `[offset, offset + len)` of `FD()` and
+    /// hand back the pinned views a reader of it would hold; while they live the
+    /// block's slot cannot be reclaimed.
+    fn insert_pinned_decompressed(offset: usize, len: usize) -> Vec<Bytes> {
+        use crate::memory::decompressed_cache::BlockKey;
+        insert_decompressed(offset, len);
+        let key = BlockKey {
+            open_file: FD(),
+            offset,
+            len,
+        };
+        memory_ctx().decompressed_cache().get(&key).unwrap()
+    }
+
+    /// Take every slot still in the free pool as working memory, so the next
+    /// request has to evict.
+    fn take_every_free_slot() -> Vec<WriteBuffer> {
+        std::iter::from_fn(|| memory_ctx().pop_free_idx(true))
+            .map(|idx| memory_ctx().ring().try_write(idx).unwrap())
+            .collect()
+    }
+
     #[test]
     fn miss_then_fill_then_hit() {
         init_test_free_pool(8);
@@ -1375,6 +1410,35 @@ mod tests {
 
         assert_eq!(memory_ctx().clock().owned(Owner::Compressed), 0);
         assert_eq!(memory_ctx().clock().owned(Owner::Decompressed), 1);
+    }
+
+    /// The share ratio only moves when an eviction succeeds. With the compressed
+    /// tier at its target share it points at the decompressed tier, and when
+    /// every decompressed page is pinned by the running query's readers nothing
+    /// there can be reclaimed, so the ratio never moves again. A request for
+    /// working memory must still be served from the stale compressed pages
+    /// rather than failing as if the ring were exhausted.
+    #[test]
+    fn working_memory_takes_stale_compressed_pages_when_every_decompressed_page_is_pinned() {
+        init_test_free_pool(128);
+        cache().open_entry(FD());
+        // 30 of 100 cached slots: exactly the compressed tier's default target share.
+        for slot_number in 0..30 {
+            insert_stale_compressed_slot(slot_number);
+        }
+        release_fill_cursor();
+        let _pinned: Vec<Vec<Bytes>> = (0..70)
+            .map(|i| insert_pinned_decompressed((100 + i) * BUFFER_SIZE, SB))
+            .collect();
+        let _working_memory = take_every_free_slot();
+
+        let _buffer = memory_ctx().get_write_buffer(true);
+
+        assert_eq!(
+            memory_ctx().clock().owned(Owner::Compressed),
+            29,
+            "the buffer must come from the stale compressed tier"
+        );
     }
 
     #[test]
