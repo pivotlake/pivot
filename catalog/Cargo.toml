@@ -3,27 +3,86 @@ name = "catalog"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "The cross-datastore catalog: presents many named datastores to the planner as one Catalog, opening a per-datastore sub-transaction per query."
+description = "PivotDB's catalog: the Datastore and Metastore interfaces, the Delta datastore backend, the read-only `system` datastore, and the cross-datastore catalog that presents them all to the planner."
 
 [dependencies]
 planner = { workspace = true }
-datastore = { workspace = true }
-# `CREATE USER` routes to the metastore: the transaction stages requests and
-# its commit applies them through `Metastore::create_user`.
-metastore = { workspace = true }
-# The staging queue a CREATE USER's dataflow pushes into, the same shape the
-# delta datastore stages its creations with.
-crossbeam-deque = { workspace = true }
 dispatch = { workspace = true }
 parquet-engine = { workspace = true }
 object-storage = { workspace = true }
-# The `system` datastore the composite serves alongside the configured ones.
-datastore-system = { workspace = true }
+thriftparquet = { workspace = true }
+arrow-array = { workspace = true }
+arrow-ord = { workspace = true }
+arrow-arith = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-select = { workspace = true }
 thiserror = { workspace = true }
-# `Catalog::commit_transaction` is async: the composite awaits each touched
-# datastore's own commit (each datastore self-offloads its blocking I/O).
+tracing = { workspace = true }
+# `Datastore::commit_transaction` and `CatalogTransaction::commit` are async: the
+# Delta datastore self-offloads a writing commit to the blocking pool and
+# finishes a read-only one inline, and the composite awaits each touched
+# datastore's own commit.
 async-trait = "0.1"
+# A datastore self-manages its background maintenance (periodic refresh,
+# compaction, vacuum), spawning tasks onto the ambient runtime and driving merge
+# dataflows from blocking threads. `rt-multi-thread` also drives Kernel's engine
+# I/O for log writes (checkpoints/commits run a read and a write concurrently,
+# which Kernel's default single-thread executor deadlocks).
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
+bytes = { workspace = true }
+# The staging queue a CREATE USER's dataflow pushes into, the same shape the
+# Delta datastore stages its creations with.
+crossbeam-deque = { workspace = true }
+# The database-level `_pivot_manifest.json` table index is serialized as JSON.
+# Per-table state is standard Delta Lake metadata under each table's `_delta_log`.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Build/parse the concrete URLs handed to the io_uring HTTP reader.
+url = { workspace = true }
+# Delta Kernel owns per-table snapshot semantics.  The catalog index remains
+# Pivot's `_pivot_manifest.json`, while every indexed table is loaded from its
+# standard `_delta_log` through the reference Arrow/object-store engine.
+delta_kernel = { version = "0.25.0", features = ["arrow-conversion", "internal-api"] }
+delta_kernel_default_engine = { version = "0.25.0", features = ["rustls", "arrow-58"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+# A stored SCRAM verifier's salt and salted password are base64 in its text form.
+base64 = { workspace = true }
+
+[features]
+# Re-export the reusable MinIO/fake-gcs harness alongside Delta test helpers.
+test-support = ["object-storage/test-support"]
 
 [dev-dependencies]
+# Self-dependency to turn on `test-support` for this crate's own integration
+# tests (so they can use `catalog::test_support`).
+catalog = { path = ".", features = ["test-support"] }
+# `PivotCatalog::commit_transaction` is async (a commit that wrote files hops to
+# the blocking pool), so the tests block on it with a current-thread runtime; the
+# compaction tests drive a full sweep on a multi-thread runtime.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
+# `test-util` exposes dispatch's single-operator test harness for the Parquet
+# reader unit/integration tests.
+dispatch = { workspace = true, features = ["test-util"] }
+# `variant_experimental` so `ArrowWriter` emits the VARIANT logical type for an
+# extension-tagged variant field (the variant scan test reads it back).
+parquet = { workspace = true, features = ["variant_experimental"] }
+arrow-schema = { workspace = true }
+arrow = { workspace = true, features = ["prettyprint"] }
+# Build a variant column (`json_to_variant`) and extract a path (`variant_get`)
+# in the variant scan test; render a written-back variant to JSON to assert the
+# documents survived shredding, the same way a query renders a variant column.
+parquet-variant = { workspace = true }
+parquet-variant-compute = { workspace = true }
+parquet-variant-json = { workspace = true }
 tempfile = { workspace = true }
-datastore-delta = { workspace = true }
+core_affinity = { workspace = true }
+tracing-subscriber = { workspace = true }
+criterion = { workspace = true }
+
+# The write pipeline end to end (rows in, files out), driven from our own `main`
+# so one `Dispatch` and one set of input batches are built once and reused
+# across the cases.
+[[bench]]
+name = "encode"
+harness = false

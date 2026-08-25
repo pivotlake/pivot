@@ -6,10 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use catalog::PivotCatalog;
+use catalog::metastore::Metastore;
 use clap::Args;
 use dispatch::env::get_env_var_with_default;
 use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
-use metastore::Metastore;
 use metastore_disk::{DiskMetastore, MetastoreConfig};
 use tracing::{error, info};
 

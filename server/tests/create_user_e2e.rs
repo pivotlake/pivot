@@ -8,9 +8,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use catalog::PivotCatalog;
+use catalog::delta::DEFAULT_REFRESH_INTERVAL;
+use catalog::metastore::{DEFAULT_USER_NAME, Metastore};
 use common::{CatalogFixture, login, login_without_password, start_server_with_metastore};
-use datastore_delta::DEFAULT_REFRESH_INTERVAL;
-use metastore::{DEFAULT_USER_NAME, Metastore};
 use metastore_disk::{DiskMetastore, MetastoreConfig};
 use tempfile::TempDir;
 use tokio_postgres::Client;

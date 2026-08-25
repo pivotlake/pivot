@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-arrow-array = { workspace = true }
+# `chrono-tz` so a cast to TIMESTAMP WITH TIME ZONE accepts a named zone such
+# as `UTC`; without it arrow parses only fixed offsets.
+arrow-array = { workspace = true, features = ["chrono-tz"] }
 arrow-schema = { workspace = true }
 arrow-buffer = { workspace = true }
 arrow-ord = { workspace = true }
@@ -33,8 +35,6 @@ serde = { workspace = true }
 
 [dev-dependencies]
 # The Parquet reader, for integration tests that plan over a real on-disk table.
-# A dev-dependency cycle (catalog depends on planner) — allowed by Cargo.
-datastore-delta = { workspace = true }
 parquet-engine = { workspace = true }
 # `variant_experimental` so `ArrowWriter` stamps the VARIANT logical type on an
 # extension-tagged variant field (the variant tests read it back through pivot).
