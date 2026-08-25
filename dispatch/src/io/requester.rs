@@ -486,30 +486,27 @@ impl IORequester {
         self.http.network_in_flight()
     }
 
-    /// Resolve reads following another worker's cache fill. Successful fills
-    /// only advance the logical tracker; failures must also be surfaced to the
-    /// worker so it can cancel the affected dataflow.
+    /// Resolve reads following another fill of their extent. A successful fill
+    /// only advances the logical tracker. A failed one is pushed onto `out` as
+    /// a failed read, so the caller fails its logical read and the worker
+    /// cancels the affected dataflow exactly as for a read this requester
+    /// submitted itself.
     fn resolve_piggybacked(&mut self, out: &mut Vec<std::result::Result<Completion, FailedRead>>) {
         let mut index = 0;
         while index < self.piggybacked_reads.len() {
             let request = &self.piggybacked_reads[index];
             if request.missing_extent().failed() {
                 let request = self.piggybacked_reads.swap_remove(index);
-                let tracked_read_id = request.tracked_read_id();
                 let (data_flow_id, operator_idx) = match &request {
                     RegisteredRead::Fs(request) => (request.data_flow_id, request.operator_idx),
                     RegisteredRead::Http(request) => (request.data_flow_id, request.operator_idx),
                 };
-                if self.tracker.fail(tracked_read_id).is_some() {
-                    out.push(Err(FailedRead {
-                        data_flow_id,
-                        operator_idx,
-                        // Logical routing was resolved above, so the failure
-                        // carries no tracked read.
-                        tracked_read_id: None,
-                        error: Error::PiggybackedReadFailed,
-                    }));
-                }
+                out.push(Err(FailedRead {
+                    data_flow_id,
+                    operator_idx,
+                    tracked_read_id: Some(request.tracked_read_id()),
+                    error: Error::PiggybackedReadFailed,
+                }));
             } else if request.missing_extent().is_committed() {
                 let request = self.piggybacked_reads.swap_remove(index);
                 let tracked_read_id = request.tracked_read_id();
@@ -665,6 +662,9 @@ impl IORequester {
         self.http
             .drain(&mut self.backend, &mut self.next_id, &mut out)?;
 
+        // Reads waiting on fills the ring did not carry for this requester.
+        self.resolve_piggybacked(&mut out);
+
         // Physical transport is complete. Resolve the requester's private
         // logical routing before the worker sees completions or failures.
         for completion in &out {
@@ -689,8 +689,6 @@ impl IORequester {
                 }
             }
         }
-
-        self.resolve_piggybacked(&mut out);
 
         Ok(out)
     }
