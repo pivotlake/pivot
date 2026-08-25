@@ -3,7 +3,7 @@
 use super::slot_for;
 use crate::catalog::{BoundTable, DynamicScanPredicate};
 use crate::compile::{DynamicFilterSlots, Error};
-use crate::dynamic_filter::DynamicFilter;
+use crate::dynamic_filter::{DynamicFilter, JoinFilterScanInfo};
 use crate::expression::{Expression, Function, Ref, VariantGet};
 use crate::operator::Projection;
 use crate::types::{Type, physical_arrow_type};
@@ -20,9 +20,18 @@ pub struct Input {
     pub table: Box<dyn BoundTable>,
     pub columns: Vec<Expression>,
     /// Runtime-populated predicates the scan reads from shared slots — installed
-    /// by a Top-N (or, in future, a hash join) elsewhere in the plan. Each
-    /// prunes row groups against the producer's live boundary value.
+    /// by a Top-N or a hash join elsewhere in the plan. Each prunes row groups
+    /// against the producer's live boundary value.
     pub dynamic_filters: Vec<DynamicFilter>,
+    /// The DuckDB binding table index of the get this scan was built from,
+    /// which plan-level references (e.g. a join's filter-pushdown targets)
+    /// name the scan by. `None` for a scan that has no DuckDB origin (built
+    /// directly rather than from a plan walk).
+    pub duckdb_table_binding_index: Option<usize>,
+    /// Join-filter-pushdown wiring for this scan, when a join above narrows
+    /// it; the join's builder consumes this to append consumer entries to
+    /// `dynamic_filters`. `None` when no join pushes filters here.
+    pub join_filter_info: Option<JoinFilterScanInfo>,
     /// When `true`, the scan tags each emitted row with its global row-group ID
     /// and per-row index (extra metadata columns appended after the data
     /// columns). Set on the narrow scan of a late-materialized query so a
@@ -35,7 +44,17 @@ pub struct Input {
 impl fmt::Display for Input {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let cols = describe_scan_columns(self.table.as_ref(), &self.columns);
-        write!(f, "Input([{cols}])")
+        write!(f, "Input([{cols}]")?;
+        if !self.dynamic_filters.is_empty() {
+            let filters = self
+                .dynamic_filters
+                .iter()
+                .map(|filter| filter.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            write!(f, ", dynamic: [{filters}]")?;
+        }
+        write!(f, ")")
     }
 }
 

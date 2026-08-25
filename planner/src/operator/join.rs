@@ -17,13 +17,18 @@
 //! always keeps rows of its left child, the probe, because its cost model
 //! wants the subquery it came from, being the smaller side, on the build side.
 
-use crate::compile::{Error, ExprEvalFn};
+use super::slot_for;
+use crate::compile::{DynamicFilterSlots, Error, ExprEvalFn};
+use crate::dynamic_filter::JoinProducedFilter;
 use crate::expression::Expression;
 use crate::types::{Type, physical_arrow_type};
 use arrow_array::{Array, BooleanArray, RecordBatch};
 use arrow_schema::Field;
 use dispatch::JoinKind as DispatchJoinKind;
-use dispatch::{JoinResidualSpec, JoinSpec, RangeCompare, RangeJoinSpec, RecordBatchOperatorSpec};
+use dispatch::{
+    JoinBuildFilter, JoinResidualSpec, JoinSpec, RangeCompare, RangeJoinSpec,
+    RecordBatchOperatorSpec,
+};
 use std::fmt;
 use std::sync::Arc;
 
@@ -110,6 +115,10 @@ pub struct Join {
     pub residual_build_columns: Vec<usize>,
     /// Which rows reach the output.
     pub kind: JoinKind,
+    /// Filters this join's build side produces for probe-side scans: when the
+    /// build seals, each listed key's min and max are published into the paired
+    /// slots, and the consumer scans prune row groups outside those bounds.
+    pub produced_filters: Vec<JoinProducedFilter>,
 }
 
 impl fmt::Display for Join {
@@ -142,6 +151,14 @@ impl fmt::Display for Join {
                 .join(" AND ");
             write!(f, ", residual: {conditions}")?;
         }
+        if !self.produced_filters.is_empty() {
+            let keys: Vec<String> = self
+                .produced_filters
+                .iter()
+                .map(|filter| filter.key_position.to_string())
+                .collect();
+            write!(f, ", publishes key bounds: [{}]", keys.join(", "))?;
+        }
         write!(f, ")")
     }
 }
@@ -152,6 +169,7 @@ impl Join {
         probe: RecordBatchOperatorSpec,
         build: RecordBatchOperatorSpec,
         normalize_build_variants: bool,
+        slots: &mut DynamicFilterSlots,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         // Both sides' output fields, named by position: an outer join
         // synthesizes NULL values for its non-preserved side, so field names
@@ -211,6 +229,17 @@ impl Join {
             JoinKind::ProbeMark => DispatchJoinKind::ProbeMark,
             JoinKind::Range(_) => unreachable!("compiled above"),
         };
+        // Resolve each produced filter's slots: the same registry hands the
+        // consumer scans the same `Arc`s, which is the whole wiring.
+        let build_filters = self
+            .produced_filters
+            .iter()
+            .map(|filter| JoinBuildFilter {
+                build_column: self.build_keys[filter.key_position],
+                min_slot: slot_for(slots, filter.min_slot_id),
+                max_slot: slot_for(slots, filter.max_slot_id),
+            })
+            .collect();
         let spec = JoinSpec {
             probe_key_indices: self.probe_keys.clone(),
             build_key_indices: self.build_keys.clone(),
@@ -220,6 +249,7 @@ impl Join {
             build_fields,
             kind,
             residual_filters: self.compile_residual_filters()?,
+            build_filters,
         };
         let key_types: Vec<_> = self.key_types.iter().map(physical_arrow_type).collect();
         Ok(if normalize_build_variants {

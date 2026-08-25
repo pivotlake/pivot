@@ -1,6 +1,7 @@
 use crate::GatherBarrier;
 use crate::memory::{SlabAllocator, SlabVec};
 use crate::operations::channels::Sender;
+use crate::operations::unary::join::JoinBuildFilter;
 use crate::operations::unary::join::JoinTable;
 use crate::operations::unary::join::build_rows::{self, BuildRows};
 use crate::operations::unary::join::directory::JoinDirectory;
@@ -9,8 +10,9 @@ use crate::operations::unary::{BatchesOutputter, InitializableOutputter, Normali
 use crate::operations::{Consumer, Outputter, unary};
 use crate::waker::worker_waker;
 use ahash::RandomState;
-use arrow::compute::filter_record_batch;
-use arrow_array::{BooleanArray, RecordBatch};
+use arrow::compute::{concat, filter_record_batch, sort_to_indices, take};
+use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch};
+use arrow_schema::SortOptions;
 use crossbeam_deque::{Injector, Steal};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -85,6 +87,43 @@ impl<K: JoinKey, const BUILD_OUTER: bool, O> JoinBuildConsumer<K, BUILD_OUTER, O
             saw_null_key: false,
         }
     }
+}
+
+/// The smallest (`largest` false) or largest (`largest` true) non-null value
+/// of `column` across the workers' build row batches, as a one-element array.
+/// `None` when every value is null or there are no rows.
+fn key_column_extreme<K: Copy>(
+    worker_outputs: &[BuildWorkerOutput<K>],
+    column: usize,
+    largest: bool,
+) -> Option<ArrayRef> {
+    let options = SortOptions {
+        descending: largest,
+        nulls_first: false,
+    };
+    // A partial sort of one index selects each batch's extreme in one pass;
+    // the small per-batch winners are then combined the same way.
+    let per_batch: Vec<ArrayRef> = worker_outputs
+        .iter()
+        .flat_map(|output| output.build_row_batches.iter())
+        .filter_map(|batch| {
+            let values = batch.column(column);
+            if values.len() == values.null_count() {
+                return None;
+            }
+            let indices = sort_to_indices(values, Some(options), Some(1))
+                .expect("join key columns support ordering");
+            Some(take(values, &indices, None).expect("a sort index is in bounds"))
+        })
+        .collect();
+    if per_batch.is_empty() {
+        return None;
+    }
+    let candidates: Vec<&dyn Array> = per_batch.iter().map(|array| array.as_ref()).collect();
+    let combined = concat(&candidates).expect("per-batch extremes share one type");
+    let indices = sort_to_indices(&combined, Some(options), Some(1))
+        .expect("join key columns support ordering");
+    Some(take(&combined, &indices, None).expect("a sort index is in bounds"))
 }
 
 /// Drop rows any of whose join key columns is null: an equi-join can never
@@ -175,6 +214,11 @@ pub struct JoinBuilder<K: Copy + Send, const BUILD_OUTER: bool> {
     remaining_jobs: Arc<AtomicUsize>,
     gather: Arc<GatherBarrier<BuildWorkerOutput<K>>>,
     build_output_indices: Vec<usize>,
+    /// Key-bound filters to publish for sibling probe scans once every build
+    /// row is present (the final gather arrival) — publishing any earlier
+    /// would expose bounds tighter than the complete build side and prune
+    /// probe rows that do match.
+    build_filters: Vec<JoinBuildFilter>,
 }
 
 unsafe impl<K: Copy + Send, const BUILD_OUTER: bool> Send for JoinBuilder<K, BUILD_OUTER> {}
@@ -267,6 +311,7 @@ impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> JoinBuilder<K, OUTER_JOI
         remaining_jobs: Arc<AtomicUsize>,
         gather: Arc<GatherBarrier<BuildWorkerOutput<K>>>,
         build_output_indices: Vec<usize>,
+        build_filters: Vec<JoinBuildFilter>,
     ) -> Self {
         Self {
             table,
@@ -276,6 +321,7 @@ impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> JoinBuilder<K, OUTER_JOI
             remaining_jobs,
             gather,
             build_output_indices,
+            build_filters,
         }
     }
 
@@ -287,6 +333,18 @@ impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> JoinBuilder<K, OUTER_JOI
     ) -> unary::Result<()> {
         let build_saw_null_key = worker_outputs.iter().any(|output| output.saw_null_key);
         unsafe { *self.table.build_saw_null_key.get() = build_saw_null_key };
+
+        // Every build row is present here, so each filter's key bounds are
+        // final: publish them for the probe-side scans. A column with no
+        // non-null value publishes nothing, leaving those scans unpruned.
+        for filter in &self.build_filters {
+            if let Some(min) = key_column_extreme(&worker_outputs, filter.build_column, false) {
+                filter.min_slot.publish_value(min);
+            }
+            if let Some(max) = key_column_extreme(&worker_outputs, filter.build_column, true) {
+                filter.max_slot.publish_value(max);
+            }
+        }
 
         let sizes: Vec<usize> = (0..NUM_PARTITIONS)
             .map(|partition| {

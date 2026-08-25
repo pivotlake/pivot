@@ -632,6 +632,28 @@ impl<'plan> TableScan<'plan> {
         })
     }
 
+    /// The get's DuckDB binding table index, which plan-level references
+    /// (e.g. a join's filter-pushdown targets) name the scan by.
+    pub fn table_index(self) -> Result<usize> {
+        Ok(ffi::lo_get_table_index(self.raw)?)
+    }
+
+    /// The pointer identity of the shared filter set a join above pushes
+    /// filters into, matching a [`JoinPushdownTarget`]. `None` when no join
+    /// pushes filters into this scan.
+    pub fn join_filter_set_id(self) -> Result<Option<usize>> {
+        let filter_set_id = ffi::lo_get_join_filter_set_id(self.raw)?;
+        Ok((filter_set_id != 0).then_some(filter_set_id))
+    }
+
+    /// The get's `column_ids` index -> storage column mapping, the space
+    /// join-pushdown probe columns arrive in.
+    pub fn storage_columns(self) -> Result<Vec<usize>> {
+        (0..ffi::lo_get_column_ids_count(self.raw)?)
+            .map(|i| Ok(ffi::lo_get_storage_column(self.raw, i)?))
+            .collect()
+    }
+
     /// Dynamic-filter consumers attached to this scan's `table_filters`.
     pub fn dynamic_filters(self) -> Result<Vec<DynamicFilterRef>> {
         scan_dynamic_filters(self.raw)
@@ -958,6 +980,30 @@ impl<'plan> ComparisonJoin<'plan> {
             .map(|i| Ok(ffi::lo_join_right_projection_map_index(self.raw, i)?))
             .collect()
     }
+
+    /// The optimizer's join-filter-pushdown record: which probe-side scans can
+    /// be narrowed by filters derived from this join's build-side key values.
+    /// Empty when the optimizer created none (unsafe join type, no eligible
+    /// conditions, or no reachable scan).
+    pub fn pushdown_targets(self) -> Result<Vec<JoinPushdownTarget>> {
+        (0..ffi::lo_join_pushdown_target_count(self.raw)?)
+            .map(|t| {
+                let columns = (0..ffi::lo_join_pushdown_column_count(self.raw, t)?)
+                    .map(|i| {
+                        Ok(JoinPushdownColumn {
+                            probe_table_index: ffi::lo_join_pushdown_probe_table(self.raw, t, i)?,
+                            probe_column: ffi::lo_join_pushdown_probe_column(self.raw, t, i)?,
+                            condition_index: ffi::lo_join_pushdown_condition_index(self.raw, i)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(JoinPushdownTarget {
+                    filter_set_id: ffi::lo_join_pushdown_set_id(self.raw, t)?,
+                    columns,
+                })
+            })
+            .collect()
+    }
 }
 
 impl<'plan> DelimJoin<'plan> {
@@ -1029,6 +1075,25 @@ pub struct DynamicFilterRef {
     pub data_id: usize,
     pub column: usize,
     pub comparison: ExpressionType,
+}
+
+/// One join-filter-pushdown target read off a comparison join: the probe-side
+/// scan it narrows (paired by `filter_set_id` with
+/// [`TableScan::join_filter_set_id`]) and the pushed columns.
+pub struct JoinPushdownTarget {
+    pub filter_set_id: usize,
+    pub columns: Vec<JoinPushdownColumn>,
+}
+
+/// One pushed column of a [`JoinPushdownTarget`].
+pub struct JoinPushdownColumn {
+    /// The target scan's table index (a second pairing check besides the set).
+    pub probe_table_index: usize,
+    /// Index into the target get's `column_ids`; resolve to a storage column
+    /// via [`TableScan::storage_column`].
+    pub probe_column: usize,
+    /// The join condition whose build-side values bound this column.
+    pub condition_index: usize,
 }
 
 /// An owning list of synthesized expressions (a scan's pushed-down filter

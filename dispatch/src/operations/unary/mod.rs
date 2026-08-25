@@ -95,8 +95,9 @@ pub(crate) use join::create_join_factories;
 pub(crate) use join::create_normalizing_for_workers as create_normalizing_join_factories;
 pub(crate) use join::create_range_join_factories;
 pub use join::{
-    DynamicRowKey, JoinKey, JoinKind, JoinRecordBatchOperatorFactory, JoinResidualFn,
-    JoinResidualSpec, JoinSpec, PackedKey, RangeCompare, RangeJoinSpec, SingleColumnKey,
+    DynamicRowKey, JoinBuildFilter, JoinKey, JoinKind, JoinRecordBatchOperatorFactory,
+    JoinResidualFn, JoinResidualSpec, JoinSpec, PackedKey, RangeCompare, RangeJoinSpec,
+    SingleColumnKey,
 };
 pub use limit::LimitFactory;
 pub(crate) use normalizer::{

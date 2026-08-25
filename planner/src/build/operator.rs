@@ -27,6 +27,7 @@ use crate::catalog::{
     BoundTable, Column, CreateSchemaRequest, CreateTableRequest, DropTableRequest,
     DuckDBTableAdapter,
 };
+use crate::dynamic_filter::JoinFilterScanInfo;
 use crate::expression::{Error as ExpressionError, Expression, Ref};
 use crate::operator::{
     Aggregate, Compact, CopyFormat, CopyFromStdin, CreateSchema, CreateTable, CreateUser,
@@ -236,6 +237,13 @@ impl Input {
         scan: TableScanView<'_>,
         ctx: &mut BuildCtx,
     ) -> Result<Input, OperatorError> {
+        let join_filter_info = match scan.join_filter_set_id()? {
+            Some(filter_set_id) => Some(JoinFilterScanInfo {
+                filter_set_id,
+                proj_to_storage: scan.storage_columns()?,
+            }),
+            None => None,
+        };
         Ok(Input {
             table: bind_table(*scan.take_table()?),
             columns: build_scan_columns(scan.output_columns()?)?,
@@ -244,6 +252,8 @@ impl Input {
                 .into_iter()
                 .map(|df| ctx.dynamic_filter(df))
                 .collect::<Result<Vec<_>, _>>()?,
+            duckdb_table_binding_index: Some(scan.table_index()?),
+            join_filter_info,
             emit_row_group_metadata: false,
         })
     }

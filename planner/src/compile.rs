@@ -281,7 +281,7 @@ impl PlanNode {
                     .any(|ty| matches!(ty, crate::types::Type::Variant));
                 let probe = inputs.remove(0);
                 let build = inputs.remove(0);
-                o.compile(probe, build, normalize_build_variants)
+                o.compile(probe, build, normalize_build_variants, slots)
             }
             crate::Operator::Cte(o) => {
                 let definition = inputs.remove(0);

@@ -40,6 +40,11 @@
 # per-iteration mode, between a query's iterations), matching pivot-bench's
 # --sleep.
 #
+# --warmup SQL runs the given statement once, untimed, before the first timed
+# query (in the per-process modes: once per process), so the first
+# measurement isn't charged for one-time process costs (buffer pool faults,
+# allocator arenas), matching pivot-bench's --warmup.
+#
 # --suite-dir overrides where qNN.sql / qNN.tsv live (default: this script's
 # own directory), so a shipped copy of this script can run a checkout's suite.
 #
@@ -60,9 +65,10 @@ write_expected=0
 sleep_ms=0
 duckdb_process="per-run"
 data="parquet"
+warmup=""
 
 usage() {
-    sed -n '3,52p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '3,57p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit "${1:-0}"
 }
 
@@ -74,6 +80,7 @@ while [[ $# -gt 0 ]]; do
         --iterations) iterations="$2"; shift 2 ;;
         --sleep)      sleep_ms="$2"; shift 2 ;;
         --data)       data="$2"; shift 2 ;;
+        --warmup)     warmup="$2"; shift 2 ;;
         --duckdb-process) duckdb_process="$2"; shift 2 ;;
         --no-drop-caches) drop_caches=0; shift ;;
         --write-expected) write_expected=1; shift ;;
@@ -157,10 +164,13 @@ if [[ "$write_expected" != "1" && "$duckdb_process" != "per-run" ]]; then
         query_db="$(mktemp -u)-ssb.db"
         trap 'rm -f "$query_db" "$query_db".wal' EXIT
         duckdb "$query_db" -c "$setup" >/dev/null 2>&1
-        iter_cmd=(duckdb "$query_db" -c "SET parquet_metadata_cache=true" -c ".timer on")
+        iter_cmd=(duckdb "$query_db" -c "SET parquet_metadata_cache=true")
     else
-        iter_cmd=(duckdb -readonly "$source_path" -c ".timer on")
+        iter_cmd=(duckdb -readonly "$source_path")
     fi
+    # The warmup runs before `.timer on`, so it never prints a Run Time.
+    [[ -n "$warmup" ]] && iter_cmd+=(-c "$warmup")
+    iter_cmd+=(-c ".timer on")
 fi
 
 # The whole run in one duckdb process: a dot-command script carries the
@@ -178,6 +188,8 @@ if [[ "$write_expected" != "1" && "$duckdb_process" == "per-run" ]]; then
             printf '%s' "$setup"
             echo "SET parquet_metadata_cache=true;"
         fi
+        # Before `.timer on`, so the warmup never prints a Run Time.
+        [[ -n "$warmup" ]] && echo "${warmup%;};"
         echo ".timer on"
         first=1
         for f in "${query_files[@]}"; do
