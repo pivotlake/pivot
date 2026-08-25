@@ -164,29 +164,6 @@ impl GroupLimit {
     }
 }
 
-/// Minimum number of hash partitions for the output merge phase. Each
-/// partition is merged independently, enabling parallel output; the actual
-/// count is raised to the worker count (see [`merge_partition_floor`]) so a
-/// large pool doesn't idle behind too few jobs.
-const PARTITIONS: usize = 64;
-
-/// Minimum merge input (source-table slots scanned) per merge job. Each job
-/// walks its slice of every source table and pays a fixed setup cost (a slab
-/// buffer, a target table, its output batches), so below this much input per
-/// job, more jobs just multiply setup: a group-by with a handful of groups
-/// would otherwise fan out into the full worker-count floor of near-empty
-/// jobs. The cap only bites on small inputs; anything sizable saturates the
-/// floor anyway.
-const MIN_MERGE_INPUT_SLOTS_PER_JOB: usize = 16 * 1024;
-
-/// Compute the merge-phase partition floor. The merge uses at least
-/// [`PARTITIONS`] partitions and at least one job per contributing worker
-/// (rounded up to a power of two, which the hash-top-bits partitioning
-/// requires), so every core has merge work.
-fn merge_partition_floor(contributing_workers: usize) -> usize {
-    PARTITIONS.max(contributing_workers.next_power_of_two())
-}
-
 /// Number of radix partitions for the scatter + merge of high-cardinality
 /// (switched) workers. Larger than [`PARTITIONS`] so each radix target stays
 /// cache-resident at high group counts.
@@ -543,6 +520,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
     /// the shared injector. Run exactly once, by the last worker to reach the
     /// gather barrier.
     fn create_partition_jobs(&mut self, outputs: Vec<AggregatedTableOutput<K, V>>) {
+        // We get worker count by outputs.len() since we don't have access here to the topology
+        let worker_count = outputs.len();
         let node_count = self.injectors.len();
         let mut tables_by_node: Vec<Vec<MultiSlabTable<K::Persisted, V>>> =
             (0..node_count).map(|_| Vec::new()).collect();
@@ -557,9 +536,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // switched worker also holds over-counts, which only over-sizes the
         // merge targets (safe); under-counting is what forces mid-merge resizes.
         let mut non_switched_groups = 0usize;
-        let mut contributing_workers = 0usize;
         for out in outputs {
-            contributing_workers += 1;
             if out.buffers.is_none() {
                 non_switched_groups += out.tables.iter().map(|t| t.len()).sum::<usize>();
             }
@@ -571,44 +548,26 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
             self.zero_hash_pending |= out.zero_hash_seen;
         }
         let any_switched = buffers_by_node.iter().any(|b| !b.is_empty());
-        let partition_floor = merge_partition_floor(contributing_workers);
         let total_in_place: usize = tables_by_node.iter().flatten().map(|t| t.len()).sum();
         // Estimate the global distinct count: the HLL covers switched
         // workers, and a non-switched worker's exact per-table count stands
         // in for its keys (over-counting keys a switched worker also holds,
         // which is safe).
         let estimate = hll.estimate() + non_switched_groups;
-
-        // Decide how many independent merge jobs to run (`num_partitions`) and how
-        // large each job's result table starts (`partition_capacity`). Every job
-        // builds one hash table and probes it at random, so the win is keeping that
-        // table inside a core's private cache: otherwise each probe is a DRAM trip.
-        //
-        // `target_groups_per_partition` is that cache budget expressed as a group
-        // count: (cache bytes) / (bytes per table entry). Because we divide by the
-        // entry width, a wide multi-column key (fat entries) targets fewer groups
-        // per job than a bare integer key.
-        const TARGET_MERGE_PARTITION_BYTES: usize = 256 * 1024; // ~one core's L2
-        // The exact bytes per table entry (hash + key + stored value with
-        // their padding), as the tables themselves lay it out. Undersizing
-        // this inflates the per-partition group target and produces fewer,
-        // larger merge targets that fall out of cache.
-        let entry_bytes = entry_stride::<K::Persisted, V>(&self.shared_context);
-        let target_groups_per_partition =
-            (TARGET_MERGE_PARTITION_BYTES / entry_bytes.max(1)).max(1);
         let (num_partitions, partition_capacity) = if !any_switched {
-            // No worker switched to radix, so every group still sits in an in-place
-            // table. Run a partition_floor-way merge, each job sized to its share of
-            // the total group count - but never fan out further than the input
-            // volume justifies (see MIN_MERGE_INPUT_SLOTS_PER_JOB).
+            // How many entries we want in each table for a partition job
+            const TARGET_SCANNED_ENTRIES_PER_JOB: usize = 16 * 1024;
+            const MINIMUM_SCANNED_ENTRIES_PER_JOB: usize = 1024;
+
             let input_slots: usize = tables_by_node.iter().flatten().map(|t| t.capacity()).sum();
-            // The count never drops below 2: the merge routes rows by their
-            // hash's top `log2(partitions)` bits, and a 0-bit partition id
-            // has no valid shift (and no benefit over 2 near-empty jobs).
-            let volume_cap = (input_slots / MIN_MERGE_INPUT_SLOTS_PER_JOB)
+            let maximum_allowed_jobs = input_slots / MINIMUM_SCANNED_ENTRIES_PER_JOB;
+            let partitions = (input_slots / TARGET_SCANNED_ENTRIES_PER_JOB)
+                // We never want to have less jobs than the worker count, to ensure no cores are idle
+                // we do (and ideally more to prevent one worker from holding up the rest)
+                .max(worker_count * 4)
+                .min(maximum_allowed_jobs)
                 .max(2)
                 .next_power_of_two();
-            let partitions = partition_floor.min(volume_cap);
             (
                 partitions,
                 (total_in_place / partitions)
@@ -616,14 +575,33 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
                     .max(DEFAULT_CAPACITY),
             )
         } else {
+            // Decide how many independent merge jobs to run (`num_partitions`) and how
+            // large each job's result table starts (`partition_capacity`). Every job
+            // builds one hash table and probes it at random, so the win is keeping that
+            // table inside a core's private cache: otherwise each probe is a DRAM trip.
+            // `target_groups_per_partition` is that cache budget expressed as a group
+            // count: (cache bytes) / (bytes per table entry). Because we divide by the
+            // entry width, a wide multi-column key (fat entries) targets fewer groups
+            // per job than a bare integer key.
+            const TARGET_MERGE_PARTITION_BYTES: usize = 256 * 1024; // ~one core's L2
+            // The exact bytes per table entry (hash + key + stored value with
+            // their padding), as the tables themselves lay it out. Undersizing
+            // this inflates the per-partition group target and produces fewer,
+            // larger merge targets that fall out of cache.
+            let entry_bytes = entry_stride::<K::Persisted, V>(&self.shared_context);
+            let target_groups_per_partition =
+                (TARGET_MERGE_PARTITION_BYTES / entry_bytes.max(1)).max(1);
             // A worker switched and scattered its groups into `scatter_buckets`
-            // (RADIX_PARTITIONS) buckets. One merge job per bucket would be thousands
+            // (at most RADIX_PARTITIONS) buckets. One merge job per bucket would be thousands
             // of near-empty jobs at moderate cardinality, so size the job count to the
             // now-exact distinct estimate instead: enough jobs that each target holds
-            // ~target_groups_per_partition groups. Then bound it — at least PARTITIONS
+            // ~target_groups_per_partition groups. Then bound it - at least worker_count
             // so every core has work, and never more than the bucket count, since the
             // merge can't be finer than the scatter (each job folds a contiguous range
             // of buckets, reaching one-bucket-per-job only at very high cardinality).
+
+            // We get the amount of partitions from the first scatterrows, since we don't have
+            // access the topology (should be at most RADIX_PARTITIONS, and can be less)
             let scatter_buckets = buffers_by_node
                 .iter()
                 .flatten()
@@ -631,10 +609,11 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
                 .expect("a worker switched, so some node has scatter buffers")
                 .0
                 .len();
-            let floor = partition_floor.min(scatter_buckets);
             let merge_partitions = (estimate / target_groups_per_partition)
-                .next_power_of_two()
-                .clamp(floor, scatter_buckets);
+                // We never want to have less jobs than the worker count, to ensure no cores are idle
+                // we also can't ha
+                .clamp(worker_count, scatter_buckets)
+                .next_power_of_two();
             // Start each target big enough to hold its share at MAX_LOAD_FACTOR (the
             // merge's resize threshold), so it fills without resizing mid-merge.
             let per_partition = estimate as f64 / merge_partitions as f64;
@@ -1172,7 +1151,6 @@ mod tests {
 
         let pairs = group_counts(&sender);
         assert!(pairs.contains(&(0, 100)), "dominant group kept");
-        assert!(pairs.len() <= PARTITIONS, "at most one row per partition");
         assert!(
             pairs.iter().all(|&(k, c)| k == 0 || c == 1),
             "every survivor is its partition's max"
@@ -1197,10 +1175,6 @@ mod tests {
 
         let pairs = group_counts(&sender);
         assert!(!pairs.is_empty(), "some groups kept");
-        assert!(
-            pairs.len() <= PARTITIONS,
-            "at most `limit` rows per partition"
-        );
         assert!(
             pairs.iter().all(|&(k, c)| (0..1000).contains(&k) && c == 1),
             "every survivor is a real group"
