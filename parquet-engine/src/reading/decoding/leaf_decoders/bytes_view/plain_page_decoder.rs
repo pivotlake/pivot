@@ -19,6 +19,28 @@ use dispatch::memory::{MultiBufferReader, ReaderPosition};
 use std::marker::PhantomData;
 use thiserror::Error;
 
+/// How far ahead of the walk each string's prefetch reaches. Each string's
+/// length load depends on the previous string's end, so the chain runs at
+/// the latency of wherever the next line sits; a few lines ahead keeps that
+/// in L1 while the hardware prefetcher stages further out.
+pub(crate) const WALK_PREFETCH_BYTES: usize = 2048;
+
+/// Prefetches the cache line at `ptr` into L1. A hint with no memory effect.
+#[inline(always)]
+pub(crate) fn prefetch_line(ptr: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(ptr as *const i8);
+    }
+    #[cfg(target_arch = "aarch64")]
+    #[allow(clippy::pointers_in_nomem_asm_block)]
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", in(reg) ptr, options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = ptr;
+}
+
 /// Reads the little-endian `u32` at `offset`.
 ///
 /// # Safety
@@ -172,6 +194,9 @@ impl<V: ByteViewType> PlainPageDecoder<V> {
             if offset + 4 > end {
                 self.position.offset = offset;
                 return Err(Error::Len);
+            }
+            if offset + WALK_PREFETCH_BYTES < end {
+                prefetch_line(unsafe { buf.as_ptr().add(offset + WALK_PREFETCH_BYTES) });
             }
             // SAFETY: `offset + 4 <= end` was just checked.
             let len = unsafe { read_u32_le_at(buf, offset) };
