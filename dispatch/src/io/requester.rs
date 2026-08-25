@@ -169,10 +169,9 @@ impl IORequester {
         stats.record_issued_disk(&mut fs_requests);
         let mut fs_queue = fs_requests.into_iter();
         while let Some(request) = fs_queue.next() {
-            let cache_extent = fs_cache_extent(&request);
-            let tracked_read_id = request.tracked_read_id;
             if let Err(error) = self.submit_fs_request_to_backend(request) {
-                self.withdraw_registered_read(cache_extent, tracked_read_id);
+                // The failed submit withdrew its own registration; the reads
+                // still queued behind it are ours to withdraw.
                 self.withdraw_unsubmitted_reads(fs_queue, http_requests);
                 return Err(error);
             }
@@ -181,12 +180,9 @@ impl IORequester {
         stats.stamp_issued(&mut http_requests);
         let mut http_queue = http_requests.into_iter();
         while let Some(request) = http_queue.next() {
-            let cache_extent = http_cache_extent(&request);
-            let tracked_read_id = request.tracked_read_id;
             match self.submit_http_request_to_backend(request) {
                 Ok(split) => stats.record_issued_remote(split),
                 Err(error) => {
-                    self.withdraw_registered_read(cache_extent, tracked_read_id);
                     self.withdraw_unsubmitted_reads(std::iter::empty(), http_queue);
                     return Err(error);
                 }
@@ -198,7 +194,8 @@ impl IORequester {
 
     /// Undo the bookkeeping `register_read` created for a read that will never
     /// be submitted (its own submit failed, or an earlier read's in the same
-    /// batch did).
+    /// batch did). Writes and uploads register nothing, so for them both
+    /// arguments are `None` and this is a no-op.
     ///
     /// Removing the extent from the shared cache is the critical part:
     /// registration published it as "a fill is in flight", so every other
@@ -320,8 +317,6 @@ impl IORequester {
     /// does, then surfaces the error.
     fn drain_fs_backlog(&mut self) -> Result<()> {
         while let Some(request) = self.fs_backlog.pop_front() {
-            let tracked_read_id = request.tracked_read_id;
-            let failed_extent = fs_cache_extent(&request);
             let permit = match self.acquire_fs_slot(&request) {
                 Some(permit) => permit,
                 None => {
@@ -329,10 +324,7 @@ impl IORequester {
                     break;
                 }
             };
-            if let Err(error) = self.submit_fs_request_now(request, permit) {
-                self.withdraw_registered_read(failed_extent, tracked_read_id);
-                return Err(error);
-            }
+            self.submit_fs_request_now(request, permit)?;
         }
         Ok(())
     }
@@ -352,20 +344,24 @@ impl IORequester {
     }
 
     /// Unconditionally submit one filesystem operation to the backend,
-    /// carrying the hardware-queue slot it holds.
+    /// carrying the hardware-queue slot it holds. A failure withdraws the
+    /// request's read registration before the error is returned, so the
+    /// caller has nothing left to clean up for it.
     fn submit_fs_request_now(
         &mut self,
         request: DataFlowRequest<FsRequest>,
         permit: InFlightPermit,
     ) -> Result<()> {
-        match &request.request {
+        let cache_extent = fs_cache_extent(&request);
+        let tracked_read_id = request.tracked_read_id;
+        let queued = match &request.request {
             FsRequest::Read(read) => self.backend.submit_read(
                 read.file.as_raw_fd(),
                 read.block.file_offset() as u64,
                 read.block.dest(),
                 read.block.len(),
                 self.next_id,
-            )?,
+            ),
             // One op writes one run of the payload, and the completion path
             // below submits the next. A run boundary looks exactly like the
             // short write the kernel can hand back anyway.
@@ -377,8 +373,12 @@ impl IORequester {
                     run.as_ptr(),
                     run.len(),
                     self.next_id,
-                )?
+                )
             }
+        };
+        if let Err(error) = queued {
+            self.withdraw_registered_read(cache_extent, tracked_read_id);
+            return Err(error.into());
         }
         self.pending_io_requests.insert(
             self.next_id,
@@ -389,7 +389,10 @@ impl IORequester {
             },
         );
         self.next_id += 1;
-        self.backend.submit()?;
+        if let Err(error) = self.backend.submit() {
+            self.withdraw_registered_read(cache_extent, tracked_read_id);
+            return Err(error.into());
+        }
 
         Ok(())
     }
@@ -397,10 +400,13 @@ impl IORequester {
     /// Submit a read for a remote region, served from the on-disk cache where
     /// possible (only the missing ranges hit the network). Delegates to the
     /// [`CachedHttpEngine`], lending it the shared backend and disk-id counter.
+    /// A failure withdraws the request's read registration before the error
+    /// is returned, so the caller has nothing left to clean up for it.
     fn submit_http_request_to_backend(
         &mut self,
         request: DataFlowRequest<HttpRequest>,
     ) -> Result<RemoteSplit> {
+        let cache_extent = http_cache_extent(&request);
         let DataFlowRequest {
             data_flow_id,
             operator_idx,
@@ -408,7 +414,7 @@ impl IORequester {
             tracked_read_id,
             submitted_at,
         } = request;
-        match request {
+        let result = match request {
             HttpRequest::Get(request) => self.http.get(
                 &mut self.backend,
                 &mut self.next_id,
@@ -422,23 +428,28 @@ impl IORequester {
             ),
             HttpRequest::Upload(request) => {
                 let bytes = request.data.len() as u64;
-                self.http.upload(
-                    &mut self.backend,
-                    DataFlowRequest {
-                        data_flow_id,
-                        operator_idx,
-                        request,
-                        tracked_read_id,
-                        submitted_at,
-                    },
-                )?;
-                Ok(RemoteSplit {
-                    http_requests: 1,
-                    http_bytes: bytes,
-                    ..RemoteSplit::default()
-                })
+                self.http
+                    .upload(
+                        &mut self.backend,
+                        DataFlowRequest {
+                            data_flow_id,
+                            operator_idx,
+                            request,
+                            tracked_read_id,
+                            submitted_at,
+                        },
+                    )
+                    .map(|()| RemoteSplit {
+                        http_requests: 1,
+                        http_bytes: bytes,
+                        ..RemoteSplit::default()
+                    })
             }
+        };
+        if result.is_err() {
+            self.withdraw_registered_read(cache_extent, tracked_read_id);
         }
+        result
     }
 
     /// Returns `true` if any physical operation or piggybacked read is unresolved.
@@ -1042,6 +1053,36 @@ mod tests {
 
         assert!(owner_failure.is_err());
         assert!(follower_failed_from_owner);
+        assert!(retry.has_file_pending());
+    }
+
+    #[test]
+    fn a_failed_submit_withdraws_its_registration() {
+        init_test_free_pool(4);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        std::fs::write(&path, vec![0; 4096]).unwrap();
+        let readable = std::fs::File::open(path).unwrap();
+        let open_file = OpenFile::Local(LocalFile::new(readable).unwrap());
+        memory_ctx()
+            .compressed_cache()
+            .open_entry(open_file.clone());
+        let mut owner = IORequester::default();
+        let mut retry = IORequester::default();
+        owner.backend.reject_reads();
+
+        let owner_result = owner.request_read(
+            1,
+            2,
+            pending_local_read(open_file.clone()),
+            &mut disabled_stats(),
+        );
+        retry
+            .request_read(3, 4, pending_local_read(open_file), &mut disabled_stats())
+            .unwrap();
+
+        assert!(owner_result.is_err());
+        assert!(!owner.has_pending());
         assert!(retry.has_file_pending());
     }
 
