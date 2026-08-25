@@ -1,8 +1,0 @@
-[package]
-name = "thriftparquet"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-description = "Minimal in-house Thrift compact-protocol codec and Parquet metadata structures (footer, row groups, page headers), shared by the Parquet reader and writer. No dependency on the upstream `parquet` crate."
-
-[dependencies]

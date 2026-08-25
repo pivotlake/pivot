@@ -14,7 +14,7 @@
 //! Each page optionally carries a [`FilterMask`] so decoders can skip rows
 //! that were filtered out upstream.
 
-use super::thrift::headers::{DataPageHeader, DictionaryPageHeader, PageHeader};
+use crate::thrift::headers::{DataPageHeader, DictionaryPageHeader, PageHeader};
 use crate::types::filter_mask::FilterMask;
 use crate::types::metadata::QueryRowGroupMetadata;
 use bytes::Bytes;

@@ -40,10 +40,10 @@ mod tests {
     use crate::reading::decoding::leaf_decoders::LeafDecoder;
     use crate::reading::decoding::leaf_decoders::bytes_view::BytesViewDecoder;
     use crate::test_utils::dummy_metadata;
+    use crate::thrift::general::Encoding;
+    use crate::thrift::headers::PageHeader;
     use crate::types::filter_mask::FilterMask;
     use crate::types::page::{DataPage, DecompressedPage, DecompressedPageType};
-    use crate::types::thrift::general::Encoding;
-    use crate::types::thrift::headers::PageHeader;
     use arrow_array::types::{BinaryViewType, StringViewType};
     use arrow_array::{Array, ArrayRef, BinaryViewArray, StringViewArray};
     use bytes::Bytes;

@@ -15,13 +15,13 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-use arrow_schema::{DataType, FieldRef, SchemaRef};
-use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult};
-use thriftparquet::footer::{
+use crate::thrift::footer::{
     ColumnChunk, ColumnMetaData, FileMetaData, LogicalType, RowGroup, SchemaElement,
 };
-use thriftparquet::general::Encoding;
-use thriftparquet::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
+use crate::thrift::general::Encoding;
+use crate::thrift::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
+use arrow_schema::{DataType, FieldRef, SchemaRef};
+use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult};
 
 use dispatch::memory::{FileBytes, Slab, SlabAllocator};
 
@@ -663,7 +663,7 @@ mod tests {
         let narrow = &elements[1];
         assert_eq!(
             narrow.physical_type,
-            Some(thriftparquet::general::Type::INT64 as i32)
+            Some(crate::thrift::general::Type::INT64 as i32)
         );
         assert_eq!(narrow.type_length, None);
         assert_eq!(narrow.converted_type, Some(CONVERTED_DECIMAL));
@@ -679,7 +679,7 @@ mod tests {
         let wide = &elements[2];
         assert_eq!(
             wide.physical_type,
-            Some(thriftparquet::general::Type::FIXED_LEN_BYTE_ARRAY as i32)
+            Some(crate::thrift::general::Type::FIXED_LEN_BYTE_ARRAY as i32)
         );
         assert_eq!(wide.type_length, Some(16));
     }

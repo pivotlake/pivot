@@ -23,13 +23,13 @@
 //! 2. **Dictionary pages** — sent last so they arrive first, ensuring the decoder has the
 //!    dictionary before any RLE-dictionary-encoded data page.
 
+use crate::thrift::general::PageType;
+use crate::thrift::headers::PageHeader;
+use crate::thrift::parquet_thrift::{ParquetError, ThriftReadInputProtocol};
 use crate::types::filter_mask::FilterMask;
 use crate::types::metadata::QueryRowGroupMetadata;
 use crate::types::page::CompressedPage;
 use crate::types::requests::{ColumnPart, RowGroupBuffer};
-use crate::types::thrift::general::PageType;
-use crate::types::thrift::headers::PageHeader;
-use crate::types::thrift::parquet_thrift::{ParquetError, ThriftReadInputProtocol};
 use bytes::Bytes;
 use dispatch::DefaultUnaryFactory;
 use dispatch::Sender;
@@ -266,11 +266,11 @@ impl Unary<RowGroupBuffer, CompressedPage> for Indexer {
 mod tests {
     use super::*;
     use crate::test_utils::dummy_metadata;
-    use crate::types::thrift::general::Encoding;
-    use crate::types::thrift::headers::{
+    use crate::thrift::general::Encoding;
+    use crate::thrift::headers::{
         DataPageHeader as ThriftDataPageHeader, DictionaryPageHeader as ThriftDictionaryPageHeader,
     };
-    use crate::types::thrift::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
+    use crate::thrift::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
     use bytes::Bytes;
     use dispatch::test_utils::run_unary;
 

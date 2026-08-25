@@ -37,8 +37,8 @@ mod rle;
 mod typed;
 pub use typed::TypedLeafDecoder;
 
+use crate::thrift::general::Encoding;
 use crate::types::page::DecompressedPage;
-use crate::types::thrift::general::Encoding;
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use bytes::Bytes;
 use dispatch::memory::{ReaderPosition, SlabAllocator};

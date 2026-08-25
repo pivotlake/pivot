@@ -33,7 +33,7 @@ use dispatch::memory::{MultiBufferReader, ReaderPosition};
 
 use crate::reading::decoding::leaf_decoders::primitive::PrimitiveBuilder;
 use crate::reading::decoding::leaf_decoders::{DecimalStorage, DecodeDelta};
-use crate::types::thrift::general::Encoding;
+use crate::thrift::general::Encoding;
 
 /// Widest block layout accepted. Writers use four miniblocks of 32 values;
 /// this admits far more while keeping the per-block widths on the stack, and

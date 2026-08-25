@@ -20,10 +20,10 @@ use crate::reading::decoding::leaf_decoders::{
     ArrayBuilder, DecodeDelta, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error,
     LeafDecoder, Result,
 };
+use crate::thrift::general::Encoding;
+use crate::thrift::headers::DataPageHeader;
 use crate::types::filter_mask::RunningFilterMask;
 use crate::types::page::{DataPage, DecompressedPage, DecompressedPageType};
-use crate::types::thrift::general::Encoding;
-use crate::types::thrift::headers::DataPageHeader;
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
 use bytes::Bytes;
 use dispatch::arrays::ValidityBuilder;
@@ -539,10 +539,10 @@ mod tests {
     use super::*;
     use crate::reading::decoding::leaf_decoders::primitive::PrimitiveLeafDecoder;
     use crate::test_utils::dummy_metadata;
+    use crate::thrift::general::Encoding;
+    use crate::thrift::headers::PageHeader;
     use crate::types::filter_mask::FilterMask;
     use crate::types::page::{DataPage, DecompressedPageType};
-    use crate::types::thrift::general::Encoding;
-    use crate::types::thrift::headers::PageHeader;
     use arrow_array::Int32Array;
     use arrow_array::types::Int32Type;
     use dispatch::memory::{SlabAllocator, init_test_free_pool};
