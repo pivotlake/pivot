@@ -329,6 +329,14 @@ pub mod ffi {
         fn lo_get_dynamic_filter_data_id(op: &LogicalOperator, index: usize) -> Result<usize>;
         fn lo_get_dynamic_filter_column(op: &LogicalOperator, index: usize) -> Result<usize>;
         fn lo_get_dynamic_filter_comparison(op: &LogicalOperator, index: usize) -> Result<u8>;
+        /// Join-filter-pushdown pairing data: the pointer identity of the
+        /// scan's shared filter set (0 when no join pushes filters into this
+        /// scan), the scan's table index, and the column_ids -> storage column
+        /// mapping the join's probe column indexes resolve through.
+        fn lo_get_join_filter_set_id(op: &LogicalOperator) -> Result<usize>;
+        fn lo_get_table_index(op: &LogicalOperator) -> Result<usize>;
+        fn lo_get_column_ids_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_get_storage_column(op: &LogicalOperator, column_ids_index: usize) -> Result<usize>;
 
         // ---- Get: table function ----
         fn lo_get_function_name(op: &LogicalOperator) -> Result<String>;
@@ -468,6 +476,28 @@ pub mod ffi {
         fn lo_join_condition_right(op: &LogicalOperator, index: usize) -> Result<&Expression>;
         /// DuckDB `ExpressionType` discriminant of the condition's comparison.
         fn lo_join_condition_comparison(op: &LogicalOperator, index: usize) -> Result<u8>;
+
+        /// Join filter pushdown: the optimizer's record of which probe-side
+        /// scans can be narrowed by filters derived from this join's build-side
+        /// key values. Targets pair with their scan by the pointer identity of
+        /// the shared filter set (`lo_get_join_filter_set_id`); each target
+        /// column names the get's column_ids index to filter plus (via
+        /// `lo_join_pushdown_condition_index`) the join condition whose build
+        /// values bound it.
+        fn lo_join_pushdown_target_count(op: &LogicalOperator) -> Result<usize>;
+        fn lo_join_pushdown_set_id(op: &LogicalOperator, target: usize) -> Result<usize>;
+        fn lo_join_pushdown_column_count(op: &LogicalOperator, target: usize) -> Result<usize>;
+        fn lo_join_pushdown_probe_table(
+            op: &LogicalOperator,
+            target: usize,
+            index: usize,
+        ) -> Result<usize>;
+        fn lo_join_pushdown_probe_column(
+            op: &LogicalOperator,
+            target: usize,
+            index: usize,
+        ) -> Result<usize>;
+        fn lo_join_pushdown_condition_index(op: &LogicalOperator, index: usize) -> Result<usize>;
         /// The join's projection maps: which of each child's output columns
         /// survive in the join's output (empty = all of them).
         fn lo_join_left_projection_map_count(op: &LogicalOperator) -> Result<usize>;

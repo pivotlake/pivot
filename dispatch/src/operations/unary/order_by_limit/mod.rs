@@ -160,6 +160,15 @@ impl DynamicFilterSlot {
         Ok(())
     }
 
+    /// Set the boundary to `boundary` (a one-element array) unconditionally.
+    /// For a producer that computes its exact bound once over complete data,
+    /// like a hash join build publishing a key extreme when it seals; the
+    /// arming window is not involved.
+    pub fn publish_value(&self, boundary: ArrayRef) {
+        debug_assert_eq!(boundary.len(), 1);
+        *self.boundary.write().expect("dynamic filter slot poisoned") = Some(Scalar::new(boundary));
+    }
+
     /// Publish `new_boundary` if it is strictly tighter than the current one.
     /// [`Self::offer`] publishes through here as its window arms and tightens;
     /// operators whose fetch is too large for the shared window call it

@@ -18,8 +18,13 @@ const SYNTHETIC_CTE_BASE: usize = usize::MAX / 2;
 #[derive(Default)]
 pub(super) struct BuildCtx {
     /// Dense dynamic-filter slot IDs, keyed by the pointer identity of DuckDB's
-    /// shared `DynamicFilterData` cell.
+    /// shared `DynamicFilterData` cell. Shares the ID space with the
+    /// join-produced filter slots.
     dynamic_filter_slots: HashMap<usize, usize>,
+    /// How many join-produced filter slots have been allocated. Those slots
+    /// need no keyed lookup (each is wired to its producer and consumer at one
+    /// site), only IDs disjoint from `dynamic_filter_slots`.
+    join_filter_slot_count: usize,
     /// The output shape of every CTE definition walked so far, keyed by its CTE
     /// index. A CTE scan has no child from which to obtain this information.
     cte_outputs: HashMap<usize, (Vec<Type>, Vec<bool>)>,
@@ -39,7 +44,7 @@ impl BuildCtx {
         &mut self,
         df: DynamicFilterRef,
     ) -> Result<DynamicFilter, ExpressionError> {
-        let next_slot = self.dynamic_filter_slots.len();
+        let next_slot = self.dynamic_filter_slots.len() + self.join_filter_slot_count;
         let slot_id = *self
             .dynamic_filter_slots
             .entry(df.data_id)
@@ -49,6 +54,14 @@ impl BuildCtx {
             column_idx: df.column,
             compare_type: df.comparison.try_into()?,
         })
+    }
+
+    /// Allocate a fresh slot ID for one bound of a join-produced filter,
+    /// disjoint from the [`dynamic_filter`](Self::dynamic_filter) IDs.
+    pub(super) fn allocate_join_filter_slot(&mut self) -> usize {
+        let slot_id = self.dynamic_filter_slots.len() + self.join_filter_slot_count;
+        self.join_filter_slot_count += 1;
+        slot_id
     }
 
     /// Record the output shape of a real CTE definition before its body is

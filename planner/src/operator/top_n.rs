@@ -1,7 +1,7 @@
 //! [`TopN`] — combined ORDER BY + LIMIT (returns the top N rows).
 
-use super::{OrderByDirection, OrderByNode, slot_for};
-use crate::compile::{DynamicFilterSlots, Error};
+use super::{OrderByDirection, OrderByNode};
+use crate::compile::{Error, RuntimeFilterSlots};
 use crate::dynamic_filter::DynamicFilter;
 use crate::expression::Expression;
 use dispatch::{OrderBy as DispatchOrderBy, RecordBatchOperatorSpec};
@@ -39,7 +39,7 @@ impl TopN {
     pub(crate) fn compile(
         &self,
         input: RecordBatchOperatorSpec,
-        slots: &mut DynamicFilterSlots,
+        slots: &mut RuntimeFilterSlots,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let orders = self
             .order_bys
@@ -60,7 +60,7 @@ impl TopN {
         let dynamic_filter = self
             .produces_dynamic_filter
             .as_ref()
-            .map(|df| slot_for(slots, df.slot_id));
+            .map(|df| slots.boundary_slot(df.slot_id));
         Ok(input.order_by_limit_offset(orders, self.limit, self.offset, dynamic_filter))
     }
 }

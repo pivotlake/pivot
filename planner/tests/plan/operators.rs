@@ -14,8 +14,8 @@ fn in_subquery_semijoin_is_a_join(mut testing_planner: TestingPlanner) {
 
     assert_snapshot!(plan.to_string(), @"
     Projection(a:Int32)
-      Join[probe semi](probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [])
-        Input([a:Int32])
+      Join[probe semi](probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [], publishes key bounds: [0])
+        Input([a:Int32], dynamic: [DynamicFilter(#0 >= ?), DynamicFilter(#0 <= ?)])
         Projection(b:Int32)
           Filter(b:Int32 > 20:Int32 -> Boolean)
             Input([b:Int32])
@@ -147,7 +147,7 @@ fn order_by_limit_produces_top_n(mut testing_planner: TestingPlanner) {
     assert_snapshot!(plan.to_string(), @r#"
     TopN(limit: 2, offset: 0, order: "default".main.example_table.a:Int32 DESC)
       Projection(a:Int32)
-        Input([a:Int32])
+        Input([a:Int32], dynamic: [DynamicFilter(#0 > ?)])
     "#);
 }
 
@@ -448,7 +448,7 @@ fn combined_filter_order_limit(mut testing_planner: TestingPlanner) {
       Projection(a:Int32)
         Projection(#0:Int32)
           Filter(a:Int32 <> b:Int32 -> Boolean)
-            Input([a:Int32, b:Int32])
+            Input([a:Int32, b:Int32], dynamic: [DynamicFilter(#0 > ?)])
     "#);
 }
 
@@ -520,8 +520,8 @@ fn correlated_scalar_subquery_becomes_a_delim_join(mut testing_planner: TestingP
         Projection(#0:Int64)
           Filter(cast(i_qty:Int64 as Float64) < SUBQUERY:Float64 -> Boolean)
             Cte(#9223372036854775807, sites: 2)
-              Join(probe_keys: [0], build_keys: [0], probe_output: [0, 1], build_output: [0, 1])
-                Input([i_order:Int64, i_qty:Int64])
+              Join(probe_keys: [0], build_keys: [0], probe_output: [0, 1], build_output: [0, 1], publishes key bounds: [0])
+                Input([i_order:Int64, i_qty:Int64], dynamic: [DynamicFilter(#0 >= ?), DynamicFilter(#0 <= ?)])
                 Filter(o_total:Int64 = 10:Int64 -> Boolean)
                   Input([o_key:Int64, o_total:Int64])
               Cte(#9223372036854775808, sites: 1)
@@ -532,8 +532,8 @@ fn correlated_scalar_subquery_becomes_a_delim_join(mut testing_planner: TestingP
                   Projection(avg(i_qty):Float64, o_key:Int64)
                     Projection(#0:Int64, (cast(#1:Int128 as Float64) / cast(#2:Int64 as Float64)))
                       Aggregate(groups: [o_key:Int64], exprs: [sum(i_qty:Int64), count(i_qty:Int64)])
-                        Join(probe_keys: [0], build_keys: [0], probe_output: [0, 1], build_output: [0])
-                          Input([i_order:Int64, i_qty:Int64])
+                        Join(probe_keys: [0], build_keys: [0], probe_output: [0, 1], build_output: [0], publishes key bounds: [0])
+                          Input([i_order:Int64, i_qty:Int64], dynamic: [DynamicFilter(#0 >= ?), DynamicFilter(#0 <= ?)])
                           CteScan(#9223372036854775808)
     ");
 }
@@ -592,9 +592,9 @@ fn a_not_exists_subquery_becomes_an_anti_delim_join(mut testing_planner: Testing
           Join[probe anti](probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [])
             CteScan(#9223372036854775807)
             Projection(o_key:Int64)
-              Join(probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [0])
+              Join(probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [0], publishes key bounds: [0])
                 Filter(i_qty:Int64 > 5:Int64 -> Boolean)
-                  Input([i_order:Int64, i_qty:Int64])
+                  Input([i_order:Int64, i_qty:Int64], dynamic: [DynamicFilter(#0 >= ?), DynamicFilter(#0 <= ?)])
                 CteScan(#9223372036854775808)
     ");
 }
@@ -637,9 +637,9 @@ fn a_small_outer_exists_becomes_a_flipped_delim_join(mut testing_planner: Testin
             CteScan(#9223372036854775807)
           Join[build semi](probe_keys: [0], build_keys: [0], probe_output: [], build_output: [0])
             Projection(o_key:Int64)
-              Join(probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [0])
+              Join(probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [0], publishes key bounds: [0])
                 Filter(i_qty:Int64 > 5:Int64 -> Boolean)
-                  Input([i_order:Int64, i_qty:Int64])
+                  Input([i_order:Int64, i_qty:Int64], dynamic: [DynamicFilter(#0 >= ?), DynamicFilter(#0 <= ?)])
                 CteScan(#9223372036854775808)
             CteScan(#9223372036854775807)
     ");
@@ -758,9 +758,9 @@ fn a_semi_join_preserving_the_smaller_side_is_build_semi(mut testing_planner: Te
 
     assert_snapshot!(plan.to_string(), @"
     Projection(o_key:Int64)
-      Join[build semi](probe_keys: [0], build_keys: [0], probe_output: [], build_output: [0])
+      Join[build semi](probe_keys: [0], build_keys: [0], probe_output: [], build_output: [0], publishes key bounds: [0])
         Projection(#0:Int64)
-          Input([i_order:Int64])
+          Input([i_order:Int64], dynamic: [DynamicFilter(#0 >= ?), DynamicFilter(#0 <= ?)])
         Input([o_key:Int64])
     ");
 }
@@ -776,8 +776,8 @@ fn count_star_join_keeps_all_columns(mut testing_planner: TestingPlanner) {
     assert_snapshot!(plan.to_string(), @"
     Projection(count_star():Int64)
       Aggregate(groups: [], exprs: [count_star()])
-        Join(probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [0])
-          Input([i_order:Int64])
+        Join(probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [0], publishes key bounds: [0])
+          Input([i_order:Int64], dynamic: [DynamicFilter(#0 >= ?), DynamicFilter(#0 <= ?)])
           Input([o_key:Int64])
     ");
 }
@@ -792,8 +792,8 @@ fn join_output_folds_projection_maps(mut testing_planner: TestingPlanner) {
 
     assert_snapshot!(plan.to_string(), @"
     Projection(i_qty:Int64, o_total:Int64)
-      Join(probe_keys: [0], build_keys: [0], probe_output: [1], build_output: [1])
-        Input([i_order:Int64, i_qty:Int64])
+      Join(probe_keys: [0], build_keys: [0], probe_output: [1], build_output: [1], publishes key bounds: [0])
+        Input([i_order:Int64, i_qty:Int64], dynamic: [DynamicFilter(#0 >= ?), DynamicFilter(#0 <= ?)])
         Input([o_key:Int64, o_total:Int64])
     ");
 }
@@ -809,8 +809,8 @@ fn join_with_unread_build_side_keeps_it_anyway(mut testing_planner: TestingPlann
     assert_snapshot!(plan.to_string(), @"
     Projection(sum(i_order):Int128)
       Aggregate(groups: [], exprs: [sum(i_order:Int64)])
-        Join(probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [0])
-          Input([i_order:Int64])
+        Join(probe_keys: [0], build_keys: [0], probe_output: [0], build_output: [0], publishes key bounds: [0])
+          Input([i_order:Int64], dynamic: [DynamicFilter(#0 >= ?), DynamicFilter(#0 <= ?)])
           Input([o_key:Int64])
     ");
 }
@@ -833,9 +833,9 @@ fn join_with_expression_condition_becomes_the_joins_residual(mut testing_planner
     assert_snapshot!(plan.to_string(), @"
     Projection(count_star():Int64)
       Aggregate(groups: [], exprs: [count_star()])
-        Join(probe_keys: [0], build_keys: [0], probe_output: [0, 1], build_output: [0, 1], residual: ((i_qty:Int64 < 6:Int64 -> Boolean AND o_total:Int64 > 5:Int64 -> Boolean) OR (i_qty:Int64 > 6:Int64 -> Boolean AND o_total:Int64 < 25:Int64 -> Boolean)))
+        Join(probe_keys: [0], build_keys: [0], probe_output: [0, 1], build_output: [0, 1], residual: ((i_qty:Int64 < 6:Int64 -> Boolean AND o_total:Int64 > 5:Int64 -> Boolean) OR (i_qty:Int64 > 6:Int64 -> Boolean AND o_total:Int64 < 25:Int64 -> Boolean)), publishes key bounds: [0])
           Filter((i_qty:Int64 < 6:Int64 -> Boolean OR i_qty:Int64 > 6:Int64 -> Boolean))
-            Input([i_order:Int64, i_qty:Int64])
+            Input([i_order:Int64, i_qty:Int64], dynamic: [DynamicFilter(#0 >= ?), DynamicFilter(#0 <= ?)])
           Filter((o_total:Int64 > 5:Int64 -> Boolean OR o_total:Int64 < 25:Int64 -> Boolean))
             Input([o_key:Int64, o_total:Int64])
     ");

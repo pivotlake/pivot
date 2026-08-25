@@ -161,6 +161,10 @@ size_t lo_get_dynamic_filter_count(const LogicalOperator &op);
 size_t lo_get_dynamic_filter_data_id(const LogicalOperator &op, size_t index);
 size_t lo_get_dynamic_filter_column(const LogicalOperator &op, size_t index);
 uint8_t lo_get_dynamic_filter_comparison(const LogicalOperator &op, size_t index);
+size_t lo_get_join_filter_set_id(const LogicalOperator &op);
+size_t lo_get_table_index(const LogicalOperator &op);
+size_t lo_get_column_ids_count(const LogicalOperator &op);
+size_t lo_get_storage_column(const LogicalOperator &op, size_t column_ids_index);
 
 // ---- Get: table function ----
 rust::String lo_get_function_name(const LogicalOperator &op);
@@ -244,6 +248,12 @@ const Expression &lo_join_condition_expression(const LogicalOperator &op, size_t
 const Expression &lo_join_condition_left(const LogicalOperator &op, size_t index);
 const Expression &lo_join_condition_right(const LogicalOperator &op, size_t index);
 uint8_t lo_join_condition_comparison(const LogicalOperator &op, size_t index);
+size_t lo_join_pushdown_target_count(const LogicalOperator &op);
+size_t lo_join_pushdown_set_id(const LogicalOperator &op, size_t target);
+size_t lo_join_pushdown_column_count(const LogicalOperator &op, size_t target);
+size_t lo_join_pushdown_probe_table(const LogicalOperator &op, size_t target, size_t index);
+size_t lo_join_pushdown_probe_column(const LogicalOperator &op, size_t target, size_t index);
+size_t lo_join_pushdown_condition_index(const LogicalOperator &op, size_t index);
 size_t lo_join_left_projection_map_count(const LogicalOperator &op);
 size_t lo_join_left_projection_map_index(const LogicalOperator &op, size_t index);
 size_t lo_join_right_projection_map_count(const LogicalOperator &op);

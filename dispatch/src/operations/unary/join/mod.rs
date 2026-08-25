@@ -73,6 +73,7 @@ use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::Field;
 
 use crate::memory::MultiSlabBuffer;
+use crate::operations::unary::DynamicFilterSlot;
 use crate::operations::unary::join::build_rows::BuildRows;
 use crate::operations::unary::join::directory::JoinDirectory;
 pub(crate) use factory::create_for_workers as create_join_factories;
@@ -153,6 +154,23 @@ pub struct JoinSpec {
     /// The residual declares the probe and build columns needed for evaluation.
     /// A candidate pair counts as a match only when the predicate returns `TRUE`.
     pub residual_filters: Option<JoinResidualSpec>,
+    /// Filters the build side publishes for sibling probe-side scans: when
+    /// the build seals, each listed key column's minimum and maximum are
+    /// published into the paired slots, which those scans read to prune row
+    /// groups whose key range falls entirely outside the bounds.
+    pub build_filters: Vec<JoinBuildFilter>,
+}
+
+/// One filter a join build publishes when it seals: the bounds of one build
+/// key column, into a pair of [`DynamicFilterSlot`]s consumer scans read.
+#[derive(Debug, Clone)]
+pub struct JoinBuildFilter {
+    /// The build input column whose values are bounded (a join key column).
+    pub build_column: usize,
+    /// Receives the smallest non-null build key; consumers compare with `>=`.
+    pub min_slot: Arc<DynamicFilterSlot>,
+    /// Receives the largest non-null build key; consumers compare with `<=`.
+    pub max_slot: Arc<DynamicFilterSlot>,
 }
 
 /// One evaluation instance of a join's residual predicate: batch of paired
@@ -460,6 +478,7 @@ mod tests {
             build_fields,
             kind,
             residual_filters: None,
+            build_filters: Vec::new(),
         };
         let (builds, probes, _) =
             factory::create_for_workers::<K, BUILD_OUTER, false, PROBE_OUTER, ANTI, false>(
