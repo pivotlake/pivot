@@ -27,6 +27,7 @@
 #include "duckdb/planner/operator/logical_simple.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/parser/parsed_data/transaction_info.hpp"
+#include "duckdb/execution/operator/join/join_filter_pushdown.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_delim_get.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
@@ -728,6 +729,26 @@ uint8_t lo_get_dynamic_filter_comparison(const LogicalOperator &op, size_t index
 	return collect_get_dynamic_filters(as<duckdb::LogicalGet>(op))[index].comparison;
 }
 
+// Join-filter-pushdown pairing data: the pointer identity of the scan's shared
+// DynamicTableFilterSet (0 when no join pushes filters into this scan), the
+// scan's table index, and the column_ids -> storage column mapping the join's
+// probe column indexes resolve through.
+size_t lo_get_join_filter_set_id(const LogicalOperator &op) {
+	return reinterpret_cast<uintptr_t>(as<duckdb::LogicalGet>(op).dynamic_filters.get());
+}
+
+size_t lo_get_table_index(const LogicalOperator &op) {
+	return as<duckdb::LogicalGet>(op).table_index.index;
+}
+
+size_t lo_get_column_ids_count(const LogicalOperator &op) {
+	return as<duckdb::LogicalGet>(op).GetColumnIds().size();
+}
+
+size_t lo_get_storage_column(const LogicalOperator &op, size_t column_ids_index) {
+	return as<duckdb::LogicalGet>(op).GetColumnIds()[column_ids_index].GetPrimaryIndex();
+}
+
 // ---- Get: table function ----
 
 rust::String lo_get_function_name(const LogicalOperator &op) {
@@ -1073,6 +1094,48 @@ size_t lo_join_right_projection_map_count(const LogicalOperator &op) {
 
 size_t lo_join_right_projection_map_index(const LogicalOperator &op, size_t index) {
 	return as<duckdb::LogicalComparisonJoin>(op).right_projection_map[index];
+}
+
+// ---- ComparisonJoin: join filter pushdown ----
+
+// DuckDB's join-filter-pushdown optimizer records on the join which probe-side
+// scans can be narrowed by filters derived from the build side's key values.
+// Each target is one probe scan, paired with its LogicalGet by the pointer
+// identity of the shared DynamicTableFilterSet both hold; each target column
+// names the get's column_ids index to filter and the join condition whose
+// build-side values bound it.
+
+static const duckdb::JoinFilterPushdownInfo *join_pushdown(const LogicalOperator &op) {
+	return as<duckdb::LogicalComparisonJoin>(op).filter_pushdown.get();
+}
+
+size_t lo_join_pushdown_target_count(const LogicalOperator &op) {
+	auto *info = join_pushdown(op);
+	return info ? info->probe_info.size() : 0;
+}
+
+size_t lo_join_pushdown_set_id(const LogicalOperator &op, size_t target) {
+	return reinterpret_cast<uintptr_t>(join_pushdown(op)->probe_info[target].dynamic_filters.get());
+}
+
+size_t lo_join_pushdown_column_count(const LogicalOperator &op, size_t target) {
+	auto *info = join_pushdown(op);
+	auto count = info->probe_info[target].columns.size();
+	// The per-target column list mirrors the join_condition list; a mismatch
+	// would desynchronise the condition lookup below, so report none instead.
+	return count == info->join_condition.size() ? count : 0;
+}
+
+size_t lo_join_pushdown_probe_table(const LogicalOperator &op, size_t target, size_t index) {
+	return join_pushdown(op)->probe_info[target].columns[index].probe_column_index.table_index.index;
+}
+
+size_t lo_join_pushdown_probe_column(const LogicalOperator &op, size_t target, size_t index) {
+	return join_pushdown(op)->probe_info[target].columns[index].probe_column_index.column_index.GetIndex();
+}
+
+size_t lo_join_pushdown_condition_index(const LogicalOperator &op, size_t index) {
+	return join_pushdown(op)->join_condition[index];
 }
 
 // ---- DelimJoin / DelimGet ----

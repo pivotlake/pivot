@@ -13,7 +13,7 @@
 //!
 //! This module holds the cross-cutting compile infrastructure: the compile
 //! [`enum@Error`], the [`ExprResult`]/[`ExprFn`] closure types, the
-//! `DynamicFilterSlots` registry, and the recursive [`Plan`]/[`PlanNode`]
+//! [`RuntimeFilterSlots`] registry, and the recursive [`Plan`]/[`PlanNode`]
 //! walk. The per-operator `compile` impls live alongside their AST types in the
 //! [`operator`](crate::operator) submodules, and the per-expression `compile`
 //! impls producing [`ExprFn`]s live in the [`expression`](crate::expression)
@@ -30,16 +30,43 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 
-/// Per-`compile` registry of dynamic-filter slots, keyed by `slot_id`.
+/// Resolves the logical slot IDs in a plan to shared runtime cells for one
+/// execution.
 ///
-/// Each [`Plan::compile`] starts with an empty registry; the producer (`TopN`)
-/// and consumer (`Input`) for a given `slot_id` lazily get-or-create one shared
-/// [`DynamicFilterSlot`] from it, so they end up holding the same `Arc`. The
-/// registry is intentionally *not* part of the `Plan`: a fresh set of empty
-/// slots is minted on every compile, so a re-compiled plan never carries a stale
-/// boundary (or a slice of a previous run's pooled scan buffers) across
-/// executions.
-pub(crate) type DynamicFilterSlots = HashMap<usize, Arc<DynamicFilterSlot>>;
+/// Producers and consumers are stored in different parts of the plan and are
+/// compiled independently. The planner connects them with a small integer
+/// `slot_id`; this registry is their rendezvous point. Whichever end compiles
+/// first creates the cell, and the other end receives a clone of the same
+/// `Arc`:
+///
+/// ```text
+///     logical plan                         compiled execution
+///
+///     TopN(slot_id = 4) ─────┐             producer ─────┐
+///                             ├─ compile ─►                ├─ Arc<DynamicFilterSlot>
+///     Input(slot_id = 4) ────┘             consumer ─────┘
+/// ```
+///
+/// The registry belongs to compilation, not to [`Plan`]. Compiling a cached
+/// plan therefore creates fresh, unarmed slots for every execution instead of
+/// retaining a prior query's boundary.
+#[derive(Default)]
+pub(crate) struct RuntimeFilterSlots {
+    /// Boundary-value slots (Top-N limits, join key bounds), by slot id.
+    boundary: HashMap<usize, Arc<DynamicFilterSlot>>,
+}
+
+impl RuntimeFilterSlots {
+    /// Return the boundary cell named by `slot_id`, creating it if this is the
+    /// first producer or consumer for that ID to compile.
+    pub(crate) fn boundary_slot(&mut self, slot_id: usize) -> Arc<DynamicFilterSlot> {
+        Arc::clone(
+            self.boundary
+                .entry(slot_id)
+                .or_insert_with(|| Arc::new(DynamicFilterSlot::new())),
+        )
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -159,7 +186,7 @@ impl Plan {
         // DDL resolves through `transaction`. Scans carry their planning
         // snapshot. A cached plan reaches this compile only after the server
         // verifies that every recorded table revision matches this transaction.
-        let mut slots = DynamicFilterSlots::new();
+        let mut slots = RuntimeFilterSlots::default();
         let compiled = self.root.compile(dispatcher, transaction, &mut slots)?;
         Ok(stamp_output_names(compiled, &self.output_names))
     }
@@ -228,7 +255,7 @@ impl PlanNode {
         &self,
         dispatcher: &DataFlowDispatcher,
         transaction: &dyn CatalogTransaction,
-        slots: &mut DynamicFilterSlots,
+        slots: &mut RuntimeFilterSlots,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         // Peephole: an unfiltered global MIN/MAX or COUNT(*) over a bare scan is
         // fully determined by table metadata (e.g. parquet row-group
@@ -283,7 +310,7 @@ impl PlanNode {
                     .any(|ty| matches!(ty, crate::types::Type::Variant));
                 let probe = inputs.remove(0);
                 let build = inputs.remove(0);
-                o.compile(probe, build, normalize_build_variants)
+                o.compile(probe, build, normalize_build_variants, slots)
             }
             crate::Operator::Cte(o) => {
                 let definition = inputs.remove(0);
