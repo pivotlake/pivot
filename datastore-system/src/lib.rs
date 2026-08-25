@@ -148,7 +148,7 @@ const RELATIONS: [SystemRelation; 5] = [
         id: "f1e1d500-da7a-4ce5-bead-e4c77ab1e50f",
         columns: &[
             ("datastore", Type::Utf8),
-            ("table", Type::Utf8),
+            ("table_id", Type::Utf8),
             ("name", Type::Utf8),
             ("type", Type::Utf8),
             ("position", Type::Int64),
@@ -163,7 +163,7 @@ const RELATIONS: [SystemRelation; 5] = [
         name: TABLE_FILES_NAME,
         id: "7ab1ef11-e500-4ded-b10b-de1e7edf11e5",
         columns: &[
-            ("table", Type::Utf8),
+            ("table_id", Type::Utf8),
             ("path", Type::Utf8),
             ("partition", Type::Utf8),
             ("bytes", Type::Int64),

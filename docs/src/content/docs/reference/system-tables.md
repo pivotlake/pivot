@@ -45,7 +45,7 @@ running server. Its tables are queried with two-part names such as
 | Column | Type | Description |
 | --- | --- | --- |
 | `datastore` | `VARCHAR` | Owning datastore name. |
-| `table` | `VARCHAR` | Owning table ID. Join to `system.tables.id`. |
+| `table_id` | `VARCHAR` | Owning table ID. Join to `system.tables.id`. |
 | `name` | `VARCHAR` | Column name. |
 | `type` | `VARCHAR` | SQL type name. |
 | `position` | `BIGINT` | Zero-based position in the table schema. |
@@ -58,7 +58,7 @@ running server. Its tables are queried with two-part names such as
 
 | Column | Type | Description |
 | --- | --- | --- |
-| `table` | `VARCHAR` | Owning table ID. Join to `system.tables.id`. |
+| `table_id` | `VARCHAR` | Owning table ID. Join to `system.tables.id`. |
 | `path` | `VARCHAR` | Data file path. |
 | `partition` | `VARCHAR` | File partition value. |
 | `bytes` | `BIGINT` | Compressed file bytes. |
