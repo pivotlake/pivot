@@ -361,8 +361,10 @@ impl CompacterActor {
     /// Find the highest-overlap pair of already-half-full files. Pairs never cross
     /// partitions. Sort columns are considered in table order; a column only
     /// defers to the next one when both files are the same singleton on it.
-    /// Guardless selection still requires positive overlap: rewriting disjoint
-    /// ranges cannot improve their layout.
+    /// Selection itself skips pairs whose rewrite cannot separate their overlap,
+    /// so an irreducible pair never hides a mergeable one behind it. Guardless
+    /// selection still requires positive overlap: rewriting disjoint ranges
+    /// cannot improve their layout.
     fn next_layout_optimization(
         &self,
         table: &CatalogTable,
@@ -389,19 +391,20 @@ impl CompacterActor {
 
         let mut best: Option<(f64, Vec<FileRef>)> = None;
         for (_, files) in by_partition {
-            let Some((score, left, right)) = overlap::highest_scoring_pair(&files, table.sort_by())
+            let Some((score, left, right)) =
+                overlap::highest_scoring_pair(&files, table.sort_by(), self.target_bytes)
             else {
                 continue;
             };
-            let combined_size = left.file.size.saturating_add(right.file.size);
-            let irreducible_singleton = combined_size > self.target_bytes
-                && overlap::same_singleton_sort_key(left, right, table.sort_by());
             if score > 0.0
-                && !irreducible_singleton
                 && (!apply_guards || score >= LAYOUT_OVERLAP_THRESHOLD)
                 && best.as_ref().is_none_or(|(best, _)| score > *best)
             {
                 best = Some((score, vec![left.file.clone(), right.file.clone()]));
+                // The score ceiling; no other partition can displace this pair.
+                if score >= 1.0 {
+                    break;
+                }
             }
         }
         best.map(|(_, files)| files)
