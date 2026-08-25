@@ -28,7 +28,7 @@ sudo systemctl status pivot
 ## Build from source
 
 ```sh
-cargo build --release -p cli --bin pivot
+cargo build --release -p bin --bin pivot
 ./target/release/pivot server --config pivot.yaml
 ```
 

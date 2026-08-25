@@ -63,7 +63,7 @@ struct Cli {
     #[arg(long, env = "SOURCE_DIRECTORY", required_unless_present = "show")]
     source: Option<PathBuf>,
 
-    /// Path to the pivotdb-server binary to launch and measure. The benchmark
+    /// Path to the pivot binary to launch (as `pivot server`) and measure. The benchmark
     /// is a client of this process; the binary named here is the one whose
     /// performance every number describes.
     #[arg(long, env = "PIVOT_SERVER_BIN", required_unless_present = "show")]

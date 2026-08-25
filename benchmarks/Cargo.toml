@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 # Deliberately links nothing from the engine. pivot-bench launches an external
-# pivotdb-server and talks to it over pgwire, so the binary being measured (and
+# `pivot server` and talks to it over pgwire, so the binary being measured (and
 # profiled, for PGO) is exactly the artifact that ships. Adding an engine crate
 # here would recreate a second compiled universe whose performance can silently
 # diverge from the server's.

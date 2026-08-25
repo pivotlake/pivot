@@ -1,11 +1,11 @@
-//! Launch and supervise a pivotdb-server process for benchmarking.
+//! Launch and supervise a `pivot server` process for benchmarking.
 //!
 //! pivot-bench measures the real server binary from the outside: it writes a
-//! minimal config, spawns the given `pivotdb-server`, waits for its listener,
-//! and shuts the process down when the handle drops. Measuring (and, for PGO,
-//! profiling) the same binary that ships is the point: an in-process stand-in
-//! is a differently linked artifact, and its compiled code can diverge from
-//! the server's even when every crate is identical.
+//! minimal config, spawns the given `pivot` binary as `pivot server`, waits for
+//! its listener, and shuts the process down when the handle drops. Measuring
+//! (and, for PGO, profiling) the same binary that ships is the point: an
+//! in-process stand-in is a differently linked artifact, and its compiled code
+//! can diverge from the server's even when every crate is identical.
 
 use std::fs;
 use std::net::{SocketAddr, TcpStream};
@@ -53,14 +53,14 @@ impl ServerHandle {
             }
             if let Some(status) = self.child.try_wait()? {
                 return Err(std::io::Error::other(format!(
-                    "pivotdb-server exited with {status} before listening:\n{}",
+                    "pivot server exited with {status} before listening:\n{}",
                     self.server_log()
                 )));
             }
             thread::sleep(Duration::from_millis(20));
         }
         Err(std::io::Error::other(format!(
-            "timed out waiting for pivotdb-server to listen on {addr}:\n{}",
+            "timed out waiting for pivot server to listen on {addr}:\n{}",
             self.server_log()
         )))
     }
@@ -185,6 +185,7 @@ server:
     // would corrupt it. The log surfaces in errors while the handle is alive.
     let log = fs::File::create(scratch.path().join("server.log"))?;
     let child = Command::new(server_bin)
+        .arg("server")
         .arg("--config")
         .arg(&config_path)
         .stdin(Stdio::null())
