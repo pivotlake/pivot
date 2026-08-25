@@ -227,7 +227,7 @@ struct PendingUpload {
     partition: Option<crate::delta::PartitionValues>,
     /// The footer metadata the writer produced for this file, used to record its
     /// row groups once the upload lands (no re-parsing the file we just wrote).
-    metadata: thriftparquet::footer::FileMetaData,
+    metadata: parquet_engine::thrift::footer::FileMetaData,
 }
 
 pub(super) struct Upload {

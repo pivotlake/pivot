@@ -48,8 +48,8 @@
 use arrow_schema::{DataType, TimeUnit};
 
 use super::table::{Error, Result};
-use super::thrift::footer::{LogicalType, SchemaElement};
-use super::thrift::general::{TimeUnit as ParquetTimeUnit, Type};
+use crate::thrift::footer::{LogicalType, SchemaElement};
+use crate::thrift::general::{TimeUnit as ParquetTimeUnit, Type};
 
 // Parquet physical type ids, named off the same thrift enum the writer emits,
 // so read and write reference one definition rather than bare integers.

@@ -6,13 +6,13 @@
 //! reused by [`dictionary`](super::dictionary) to encode a dictionary page's
 //! distinct values.
 
+use crate::thrift::general::Encoding;
 use arrow_array::{
     Array, BinaryViewArray, Date32Array, Decimal64Array, Decimal128Array, Float32Array,
     Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray, StringViewArray,
     TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, TimeUnit};
-use thriftparquet::general::Encoding;
 
 use dispatch::memory::SlabAllocator;
 

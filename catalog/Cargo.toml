@@ -10,7 +10,6 @@ planner = { workspace = true }
 dispatch = { workspace = true }
 parquet-engine = { workspace = true }
 object-storage = { workspace = true }
-thriftparquet = { workspace = true }
 arrow-array = { workspace = true }
 arrow-ord = { workspace = true }
 arrow-arith = { workspace = true }

@@ -60,6 +60,8 @@ pub use row_group_stats::{
     scan_order_from,
 };
 
+pub mod thrift;
+
 pub(crate) mod types;
 pub use types::arrow_map::{
     DECIMAL_FIXED_LEN, DecimalWriteStorage, LeafAnnotation, arrow_to_annotation,

@@ -415,7 +415,7 @@ pub fn decimal_decoder<T: DecimalCarrier>(
     precision: u8,
     scale: i8,
 ) -> Result<Box<dyn LeafDecoder>> {
-    use crate::types::thrift::general::Type as PhysicalType;
+    use crate::thrift::general::Type as PhysicalType;
     if chunk.physical_type == PhysicalType::INT32 as i32 {
         return Ok(Box::new(DecimalLeafDecoder::<T, DecimalFromInt32>::new(
             chunk.max_def_level,

@@ -67,7 +67,7 @@ impl UnaryFactory<DataFile, FileRowGroups> for MetadataFetcherFactory {
 pub fn file_row_groups_from_metadata(
     file: FileRef,
     source: DataFileLocation,
-    metadata: thriftparquet::footer::FileMetaData,
+    metadata: crate::thrift::footer::FileMetaData,
     declared_columns: &[Column],
 ) -> Result<FileRowGroups, crate::ParquetTableError> {
     let open_file = source

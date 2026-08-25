@@ -13,7 +13,6 @@ members = [
     "planner",
     "object-storage",
     "server",
-    "thriftparquet",
 ]
 # arrow-rs (vendored submodule) and perfy are workspaces of their own; they
 # resolve and lock independently.
@@ -37,7 +36,6 @@ planner = { path = "planner" }
 object-storage = { path = "object-storage" }
 server = { path = "server" }
 shell = { path = "shell" }
-thriftparquet = { path = "thriftparquet" }
 
 # The vendored arrow-rs fork (git submodule). `parquet` is the strict,
 # spec-compliant reader used only as a test oracle by crates with their own

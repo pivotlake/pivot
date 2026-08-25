@@ -437,8 +437,8 @@ impl LeafDecoder for TimestampMicrosecondLeafDecoder {
 mod tests {
     use std::sync::Arc;
 
-    use crate::types::thrift::general::Encoding;
-    use crate::types::thrift::headers::PageHeader;
+    use crate::thrift::general::Encoding;
+    use crate::thrift::headers::PageHeader;
     use arrow_array::types::{Float32Type, Int16Type, Int32Type, Int64Type, UInt16Type};
     use arrow_array::{
         Array, ArrayRef, Float32Array, Int16Array, Int32Array, Int64Array,

@@ -6,5 +6,3 @@ pub mod page;
 pub mod projection;
 pub mod requests;
 pub mod table;
-#[allow(dead_code)]
-pub mod thrift;

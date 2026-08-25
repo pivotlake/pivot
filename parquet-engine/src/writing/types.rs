@@ -8,6 +8,8 @@
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, OnceLock};
 
+use crate::thrift::footer::Statistics;
+use crate::thrift::general::Encoding;
 use arrow_array::ArrayRef;
 use arrow_schema::SchemaRef;
 use dispatch::memory::{FileBytes, Slab};
@@ -15,8 +17,6 @@ use dispatch::{
     Identifier, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput, NodeIdOutput, OrderBy,
     WorkerIdOutput,
 };
-use thriftparquet::footer::Statistics;
-use thriftparquet::general::Encoding;
 
 /// Unique identity of a row group within one write pipeline.
 pub(crate) type RowGroupId = u64;
@@ -42,7 +42,7 @@ pub(crate) struct FileAssemblyInfo {
 pub struct AssembledFile {
     pub bytes: FileBytes,
     /// Retained to avoid parsing the footer immediately after writing it.
-    pub metadata: thriftparquet::footer::FileMetaData,
+    pub metadata: crate::thrift::footer::FileMetaData,
     pub partition: Option<crate::PartitionValues>,
 }
 

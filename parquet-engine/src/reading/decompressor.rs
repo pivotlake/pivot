@@ -9,10 +9,10 @@
 //!
 //! [`FilterMask`]: crate::types::filter_mask::FilterMask
 
+use crate::thrift::general::PageType;
+use crate::thrift::headers::PageHeader;
+use crate::thrift::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 use crate::types::page::{CompressedPage, DataPage, DecompressedPage, DecompressedPageType};
-use crate::types::thrift::general::PageType;
-use crate::types::thrift::headers::PageHeader;
-use crate::types::thrift::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 use bytes::Bytes;
 use dispatch::DefaultUnaryFactory;
 use dispatch::Sender;
@@ -192,9 +192,9 @@ impl Unary<CompressedPage, DecompressedPage> for Decompressor {
 mod tests {
     use super::*;
     use crate::test_utils::dummy_metadata;
+    use crate::thrift::general::Encoding;
+    use crate::thrift::headers::{DataPageHeader, DictionaryPageHeader, PageHeader};
     use crate::types::filter_mask::FilterMask;
-    use crate::types::thrift::general::Encoding;
-    use crate::types::thrift::headers::{DataPageHeader, DictionaryPageHeader, PageHeader};
     use dispatch::memory::init_test_free_pool;
     use dispatch::test_utils::{CollectSender, run_unary};
     use snap::raw::Encoder;

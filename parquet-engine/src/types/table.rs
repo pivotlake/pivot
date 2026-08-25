@@ -5,10 +5,10 @@
 //! Thrift footer, converts the Parquet schema to Arrow, and collects
 //! `RowGroupMetadata` entries with globally unique row-group indices.
 
+use crate::thrift::footer::{FileMetaData, PageEncodingStats, Statistics};
+use crate::thrift::general::{Encoding, PageType};
+use crate::thrift::parquet_thrift::{ReadThrift, ThriftSliceInputProtocol};
 use crate::types::metadata::{ColumnChunkMeta, ColumnStatistics, RowGroupMetadata};
-use crate::types::thrift::footer::{FileMetaData, PageEncodingStats, Statistics};
-use crate::types::thrift::general::{Encoding, PageType};
-use crate::types::thrift::parquet_thrift::{ReadThrift, ThriftSliceInputProtocol};
 use arrow_array::{
     ArrayRef, BinaryViewArray, BooleanArray, Date32Array, Decimal64Array, Decimal128Array,
     Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Scalar,
@@ -389,7 +389,7 @@ fn decode_scalar(
 /// storage: INT32/INT64 stats are little-endian, FIXED_LEN_BYTE_ARRAY stats
 /// are big-endian two's complement in the declared length.
 fn decimal_stat_value(bytes: &[u8], physical_type: i32) -> Option<i128> {
-    use crate::types::thrift::general::Type as PhysicalType;
+    use crate::thrift::general::Type as PhysicalType;
     if physical_type == PhysicalType::INT32 as i32 {
         bytes
             .try_into()
@@ -442,7 +442,7 @@ struct LeafSchemaInfo {
 /// Converts footer schema elements into an Arrow schema and per-leaf schema
 /// facts.
 fn schema_elements_to_arrow(
-    elements: &[crate::types::thrift::footer::SchemaElement],
+    elements: &[crate::thrift::footer::SchemaElement],
 ) -> Result<(Schema, Vec<LeafSchemaInfo>)> {
     if elements.is_empty() {
         return Err(Error::IO(io::Error::new(
@@ -544,13 +544,13 @@ fn apply_declared_types(schema: Schema, declared_columns: &[Column]) -> Result<S
 /// the Arrow field and the index just past this subtree, appending one entry
 /// per leaf to `leaf_infos` in depth-first (column-chunk) order.
 fn parse_schema_element(
-    elements: &[crate::types::thrift::footer::SchemaElement],
+    elements: &[crate::thrift::footer::SchemaElement],
     idx: usize,
     parent_def: i16,
     depth: usize,
     leaf_infos: &mut Vec<LeafSchemaInfo>,
 ) -> Result<(Field, usize)> {
-    use crate::types::thrift::footer::LogicalType;
+    use crate::thrift::footer::LogicalType;
     // The cursor is driven by each group's *claimed* child count, so a
     // malformed footer can point past the element list; fail the load
     // instead of panicking mid-fetch.
@@ -859,8 +859,8 @@ mod tests {
         repetition_type: Option<i32>,
         num_children: Option<i32>,
         physical_type: Option<i32>,
-    ) -> crate::types::thrift::footer::SchemaElement {
-        crate::types::thrift::footer::SchemaElement {
+    ) -> crate::thrift::footer::SchemaElement {
+        crate::thrift::footer::SchemaElement {
             physical_type,
             type_length: None,
             repetition_type,
