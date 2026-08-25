@@ -5,131 +5,21 @@
 use std::sync::Arc;
 
 use crate::manifest::{ColumnStatFilter, PartitionEqFilter};
-use arrow_array::{Array, ArrayRef, Scalar, TimestampMicrosecondArray};
-use arrow_schema::{DataType, TimeUnit};
+use arrow_array::{Array, ArrayRef, Scalar};
 use crossbeam_deque::Injector;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use parquet_engine::{
-    ParquetTable, RowGroupMetadata, ScanEqualityPredicate, materialize, row_group_eliminated,
+    ParquetTable, PushedPredicate, ScanEqualityPredicate, materialize, prune_parquet,
     row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
-};
-use parquet_engine::{
-    first_leaf, leaf_fields, variant_shredded_leaves, variant_value_leaf_is_semantically_null,
 };
 use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Error as CatalogError, Result as CatalogResult,
     TableReference, TableRevision,
 };
-use planner::expression::{CompareType, Expression, Function, JsonPath, TableFilter};
-use planner::types::{Type, UTC_TIMEZONE, physical_arrow_type};
+use planner::expression::{CompareType, TableFilter};
 
 use super::CatalogTable;
 use super::insert_sink::{UploadedFile, build_insert_spec};
-
-/// A single-column constant comparison (`col <cmp> const`) pushed down by
-/// DuckDB during binding. Recorded as-is; applied at [`compile_scan`](BoundTable::compile_scan)
-/// time after the row-group metadata exists: min/max stats prune row groups,
-/// and equality additionally prunes by dictionary contents in the decoder. The
-/// upstream `Filter` always runs, so this is a pure optimization.
-#[derive(Clone, Debug)]
-struct PushedPredicate {
-    /// The top-level column the comparison reads. For a variant path this is
-    /// the variant column; the predicate prunes against the path's shredded
-    /// leaf.
-    column_idx: usize,
-    /// The path inside the variant column (`CAST(col->'a'->'b' AS T) <cmp>
-    /// const`), empty for a plain column comparison.
-    path: JsonPath,
-    /// The SQL cast's physical output type for a variant path. Pruning against
-    /// the raw typed leaf is sound only when this is a semantic identity.
-    as_type: Option<arrow_schema::DataType>,
-    compare_type: CompareType,
-    value: Scalar<ArrayRef>,
-}
-
-impl PushedPredicate {
-    /// The column-chunk index this predicate's statistics live on in `rg`: the
-    /// column's own leaf for a plain predicate, or the shredded typed leaf for
-    /// a variant path. `None` means pruning isn't sound for this row group
-    /// (always safe): the path isn't shredded in this file, or some rows may
-    /// hold the path's value in an untyped `value` leaf along the path, where
-    /// the typed leaf's statistics can't see them. Stats-based skipping is
-    /// allowed only when every such fallback is proven to contribute SQL NULL
-    /// for this cast.
-    fn get_leaf_for_row_group(&self, rg: &RowGroupMetadata) -> Option<usize> {
-        let fields = rg.schema.fields();
-        if self.path.is_empty() {
-            return Some(first_leaf(fields, self.column_idx));
-        }
-        let leaves = variant_shredded_leaves(fields, self.column_idx, &self.path)?;
-        let target = self
-            .as_type
-            .as_ref()
-            .expect("a variant path predicate has a cast target");
-        if leaf_fields(fields)[leaves.typed_leaf].data_type() != target {
-            return None;
-        }
-        let terminal = leaves.value_leaves.len().saturating_sub(1);
-        leaves
-            .value_leaves
-            .iter()
-            .enumerate()
-            .all(|(level, &leaf)| {
-                variant_value_leaf_is_semantically_null(rg, leaf, target, level == terminal)
-            })
-            .then_some(leaves.typed_leaf)
-    }
-}
-
-/// Returns the column and optional variant path that can use row-group stats.
-///
-/// Plain columns use an empty path. Typed variant reads use the corresponding
-/// shredded leaf. Untyped variant reads cannot be compared and are ignored.
-struct PrunableColumn {
-    column_idx: usize,
-    path: JsonPath,
-    as_type: Option<DataType>,
-}
-
-fn get_prunable_column_and_json_path(expr: &Expression) -> Option<PrunableColumn> {
-    match expr {
-        Expression::Ref(r) => Some(PrunableColumn {
-            column_idx: r.column_idx,
-            path: Vec::new(),
-            as_type: None,
-        }),
-        Expression::Function(Function::VariantGet(read)) if read.as_type.is_some() => {
-            match read.input.as_ref() {
-                Expression::Ref(r) => Some(PrunableColumn {
-                    column_idx: r.column_idx,
-                    path: read.path.clone(),
-                    as_type: read.as_type.as_ref().map(physical_arrow_type),
-                }),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-/// Remove the UTC timezone annotation from a one-value TIMESTAMPTZ constant
-/// without touching its value buffer. This mirrors DuckDB's UTC
-/// TIMESTAMP-to-TIMESTAMPTZ cast in the other direction for statistics only.
-fn as_timestamp_constant(value: &Scalar<ArrayRef>) -> Option<Scalar<ArrayRef>> {
-    let array = value.clone().into_inner();
-    let DataType::Timestamp(TimeUnit::Microsecond, Some(timezone)) = array.data_type() else {
-        return None;
-    };
-    if timezone.as_ref() != UTC_TIMEZONE {
-        return None;
-    }
-    let timestamp = array
-        .as_any()
-        .downcast_ref::<TimestampMicrosecondArray>()?
-        .clone()
-        .with_timezone_opt(None::<Arc<str>>);
-    Some(Scalar::new(Arc::new(timestamp) as ArrayRef))
-}
 
 /// A catalog table resolved from one transaction: it captures the snapshot's own
 /// copy of the [`CatalogTable`] (schema, files, and their row groups), this
@@ -354,55 +244,13 @@ impl BoundTable for TableBinding {
     }
 
     fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {
-        let TableFilter::Expression(expr) = filter else {
-            return Ok(false);
-        };
-        let Expression::Compare(compare) = expr.as_ref() else {
-            return Ok(false);
-        };
-        let (column_expr, constant) = match (compare.left.as_ref(), compare.right.as_ref()) {
-            (column, Expression::Constant(k)) | (Expression::Constant(k), column) => (column, k),
-            _ => return Ok(false),
-        };
-
-        // DuckDB casts a TIMESTAMP column to TIMESTAMPTZ for a mixed-type
-        // comparison. In UTC, the cast preserves the microsecond value, so retag the
-        // TIMESTAMPTZ constant as TIMESTAMP for statistics pruning.
-        let (column, value) = match column_expr {
-            Expression::Cast(cast)
-                if cast.target == Type::TimestampTz
-                    && matches!(
-                        cast.source(),
-                        Expression::Ref(r) if r.return_type == Type::Timestamp
-                    ) =>
-            {
-                let Some(column) = get_prunable_column_and_json_path(cast.source()) else {
-                    return Ok(false);
-                };
-                let Some(value) = as_timestamp_constant(constant) else {
-                    return Ok(false);
-                };
-                (column, value)
-            }
-            column => {
-                let Some(column) = get_prunable_column_and_json_path(column) else {
-                    return Ok(false);
-                };
-                (column, constant.clone())
-            }
-        };
-
         // Just record it. The actual pruning (min/max row-group elimination and
         // equality/dictionary pruning) happens in `compile`, once the row-group
         // metadata exists. The upstream `Filter` is kept (we return `Ok(false)`),
         // so this is purely an optimization and never affects correctness.
-        self.predicates.push(PushedPredicate {
-            column_idx: column.column_idx,
-            path: column.path,
-            as_type: column.as_type,
-            compare_type: compare.compare_type,
-            value,
-        });
+        if let Some(predicate) = PushedPredicate::from_filter(filter) {
+            self.predicates.push(predicate);
+        }
 
         Ok(false)
     }
@@ -487,15 +335,6 @@ impl TableBinding {
     /// (kept) — never wrong, just unoptimized. No footer I/O. Exposed so pruning
     /// can be asserted directly.
     pub fn pruned_parquet(&self, parquet: &ParquetTable) -> ParquetTable {
-        let mut parquet = parquet.clone();
-        parquet.row_groups_mut().retain(|rg| {
-            !self.predicates.iter().any(|p| {
-                p.get_leaf_for_row_group(rg.as_ref()).is_some_and(|leaf| {
-                    row_group_eliminated(rg.as_ref(), leaf, p.compare_type, &p.value)
-                        .unwrap_or(false)
-                })
-            })
-        });
-        parquet
+        prune_parquet(parquet, &self.predicates)
     }
 }

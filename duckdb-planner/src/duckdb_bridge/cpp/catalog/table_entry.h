@@ -21,6 +21,13 @@ struct PivotScanBindData : public duckdb::TableFunctionData {
 	}
 };
 
+/// Offer filters from a DuckDB get to a Pivot bound table after translating
+/// projected column indices back to the table's storage indices. Filters the
+/// table fully consumes are removed; all others remain above the scan.
+void PivotPushdownComplexFilters(
+    duckdb::LogicalGet &get, OptionalTableWrapper &table,
+    duckdb::vector<duckdb::unique_ptr<duckdb::Expression>> &filters);
+
 class PivotTableCatalogEntry : public duckdb::TableCatalogEntry {
 public:
 	/// Opaque handle to the Rust `GetDuckDBTypedColumns` object that backs this catalog entry.

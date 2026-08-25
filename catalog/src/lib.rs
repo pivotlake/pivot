@@ -23,6 +23,7 @@ use datastore::DatastoreTransaction;
 use datastore_system::{DatastoreEntry, SystemTransaction};
 use dispatch::{DataFlowDispatcher, OneShotNullaryFactory, RecordBatchOperatorSpec};
 use metastore::Metastore;
+use object_storage::ExternalStoreFactory;
 use planner::catalog::{
     BoundTable, CatalogTransaction, CreateSchemaRequest, CreateTableRequest, CreateUserRequest,
     DropTableRequest, Error as CatalogError, Result as CatalogResult, SchemaCreation,
@@ -48,6 +49,25 @@ pub enum Error {
     UnknownDatastore(String),
 }
 
+/// Process-level dependencies for reading files outside the configured
+/// datastores. Kept on the composite catalog because external Parquet is a
+/// global table function, while the chosen credential policy belongs to the
+/// embedding process.
+#[derive(Clone)]
+struct ExternalParquetContext {
+    dispatcher: DataFlowDispatcher,
+    store_factory: Arc<dyn ExternalStoreFactory>,
+}
+
+impl std::fmt::Debug for ExternalParquetContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExternalParquetContext")
+            .field("store_factory", &self.store_factory)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A set of named datastores presented to the planner. The
 /// datastore named `default_name` is DuckDB's current database, so unqualified
 /// names resolve against it.
@@ -61,6 +81,9 @@ pub struct PivotCatalog {
     /// are server-wide, not a datastore's, so changing them doesn't ride a
     /// sub-transaction.
     metastore: Arc<dyn Metastore>,
+    /// Process-wide external parquet access. This is global to the composite
+    /// catalog rather than associated with one datastore.
+    external_parquet_read_context: Option<ExternalParquetContext>,
 }
 
 impl PivotCatalog {
@@ -79,7 +102,22 @@ impl PivotCatalog {
             datastores: Arc::new(datastores),
             default_name,
             metastore,
+            external_parquet_read_context: None,
         })
+    }
+
+    /// Enable the planner-owned `read_parquet(path)` function with this
+    /// process's dispatcher and external-store credential policy.
+    pub fn with_external_parquet_read_context(
+        mut self,
+        dispatcher: &DataFlowDispatcher,
+        store_factory: Arc<dyn ExternalStoreFactory>,
+    ) -> Self {
+        self.external_parquet_read_context = Some(ExternalParquetContext {
+            dispatcher: dispatcher.clone(),
+            store_factory,
+        });
+        self
     }
 
     /// The datastore named `name`, or `None`.
@@ -134,6 +172,7 @@ impl PivotCatalog {
             default_name: self.default_name.clone(),
             sub_transactions: Mutex::new(HashMap::new()),
             metastore: self.metastore.clone(),
+            external_parquet_read_context: self.external_parquet_read_context.clone(),
             staged_users: Arc::new(Injector::new()),
         })
     }
@@ -159,6 +198,7 @@ pub struct PivotTransaction {
     sub_transactions: Mutex<HashMap<String, Arc<dyn DatastoreTransaction>>>,
     /// Where staged users land at commit.
     metastore: Arc<dyn Metastore>,
+    external_parquet_read_context: Option<ExternalParquetContext>,
     /// The users this transaction's dataflows staged (see
     /// [`PivotUserCreation`]), applied to the metastore at commit and dropped
     /// on rollback. Shared (`Arc`) with the staging dataflow's workers.
@@ -252,6 +292,17 @@ impl CatalogTransaction for PivotTransaction {
     fn bind_table(&self, reference: &TableReference) -> Option<Box<dyn BoundTable>> {
         let sub_transaction = self.find_or_create_sub_transaction(&reference.datastore)?;
         sub_transaction.bind_table(&reference.datastore, &reference.schema_qualified_name())
+    }
+
+    fn bind_read_parquet(&self, location: &str) -> CatalogResult<Box<dyn BoundTable>> {
+        let context = self.external_parquet_read_context.as_ref().ok_or_else(|| {
+            CatalogError::Other("read_parquet is not configured for this catalog".into())
+        })?;
+        parquet_engine::bind_read_parquet(
+            &context.dispatcher,
+            context.store_factory.as_ref(),
+            location,
+        )
     }
 
     fn table_revision(&self, reference: &TableReference) -> Option<TableRevision> {

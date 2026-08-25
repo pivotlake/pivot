@@ -614,7 +614,7 @@ pub(crate) fn cleanup_log(
     let cutoff_ms = now_ms.saturating_sub(retention.as_millis() as u64);
     let log_dir = location.join("_delta_log");
     let mut deleted = 0;
-    for object in store.list(&log_dir)? {
+    for object in store.list(&log_dir)?.objects {
         // Only plain commit JSONs (`{version:020}.json`) are candidates; the
         // checkpoint parquet, `_last_checkpoint`, and CRC files never match the
         // `.json` suffix, and a coalesced commit (`{v}.{v}.compacted.json`) fails

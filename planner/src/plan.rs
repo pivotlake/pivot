@@ -62,7 +62,8 @@ impl PlanNode {
     /// Whether this node and all of its inputs are safe to reuse after their
     /// table revisions have been validated. Mutating and session statements
     /// retain state tied to the transaction that planned them. Table functions
-    /// resolve again at compile time and do not expose revision dependencies.
+    /// can capture invocation-specific data without exposing revision
+    /// dependencies, so their plans are not reused.
     pub(crate) fn is_cacheable(&self) -> bool {
         let operator_is_cacheable = match &self.operator {
             Operator::Input(input) => input.table.is_plan_cacheable(),

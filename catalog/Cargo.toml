@@ -15,7 +15,8 @@ metastore = { workspace = true }
 # delta datastore stages its creations with.
 crossbeam-deque = { workspace = true }
 dispatch = { workspace = true }
-datastore-delta = { workspace = true }
+parquet-engine = { workspace = true }
+object-storage = { workspace = true }
 # The `system` datastore the composite serves alongside the configured ones.
 datastore-system = { workspace = true }
 thiserror = { workspace = true }
@@ -25,3 +26,4 @@ async-trait = "0.1"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+datastore-delta = { workspace = true }

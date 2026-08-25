@@ -26,9 +26,9 @@
 //! the same object name.
 
 use super::{
-    DataFileLocation, FileRef, ListedObject, ObjectPath, ObjectStore, ObjectVersion, Result,
-    StoreConnection, StoreError, absolute_object_key, object_key, parse_iso8601_millis,
-    percent_encode,
+    DataFileLocation, DirectoryListing, FileRef, ListedObject, ObjectPath, ObjectStore,
+    ObjectVersion, Result, StoreConnection, StoreError, absolute_object_key, object_key,
+    parse_iso8601_millis, percent_encode,
 };
 use base64::Engine;
 use std::path::PathBuf;
@@ -391,51 +391,76 @@ impl ObjectStore for GcsStore {
         }
     }
 
-    /// One page of objects directly under `prefix`, one level deep.
-    fn list(&self, prefix: &ObjectPath) -> Result<Vec<ListedObject>> {
-        let header = self.auth.header()?;
+    /// Objects directly under `prefix`, one level deep.
+    fn list(&self, prefix: &ObjectPath) -> Result<DirectoryListing> {
         let object_prefix = object_key(&self.prefix, prefix);
-        let url = format!(
-            "{}/storage/v1/b/{}/o?prefix={}%2F&delimiter=%2F",
-            self.endpoint,
-            self.bucket,
-            percent_encode(&object_prefix)
+        let encoded_prefix = if object_prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}%2F", percent_encode(&object_prefix))
+        };
+        let base_url = format!(
+            "{}/storage/v1/b/{}/o?prefix={encoded_prefix}&delimiter=%2F",
+            self.endpoint, self.bucket
         );
-        let response = self
-            .auth
-            .agent
-            .get(&url)
-            .set("Authorization", &header)
-            .call()
-            .map_err(|e| StoreError::Http(format!("GCS LIST {object_prefix}: {e}")))?;
-        let body: ListResponse = response
-            .into_json()
-            .map_err(|e| StoreError::Http(format!("GCS LIST parse: {e}")))?;
+        let mut page_token: Option<String> = None;
+        let mut objects = Vec::new();
+        let mut prefixes = Vec::new();
+        loop {
+            let url = match &page_token {
+                Some(token) => format!("{base_url}&pageToken={}", percent_encode(token)),
+                None => base_url.clone(),
+            };
+            let header = self.auth.header()?;
+            let response = self
+                .auth
+                .agent
+                .get(&url)
+                .set("Authorization", &header)
+                .call()
+                .map_err(|error| StoreError::Http(format!("GCS LIST {object_prefix}: {error}")))?;
+            let body: ListResponse = response
+                .into_json()
+                .map_err(|error| StoreError::Http(format!("GCS LIST parse: {error}")))?;
 
-        body.items
-            .into_iter()
-            .map(|item| {
-                let size = item.size.parse().map_err(|_| {
-                    StoreError::Http(format!(
-                        "GCS LIST: bad size `{}` for {}",
-                        item.size, item.name
-                    ))
-                })?;
-                let modified_unix_ms = parse_iso8601_millis(&item.updated).ok_or_else(|| {
-                    StoreError::Http(format!(
-                        "GCS LIST object `{}` has an unparseable updated `{}`",
-                        item.name, item.updated
-                    ))
-                })?;
-                Ok(ListedObject {
-                    file: FileRef {
-                        path: ObjectPath::new(super::key_name(&item.name)),
-                        size,
-                    },
-                    modified_unix_ms,
-                })
-            })
-            .collect()
+            prefixes.extend(body.prefixes.into_iter().filter_map(|prefix| {
+                let relative = super::relative_key(&object_prefix, &prefix);
+                let relative = relative.trim_end_matches('/');
+                (!relative.is_empty()).then(|| ObjectPath::new(relative))
+            }));
+            objects.extend(
+                body.items
+                    .into_iter()
+                    .map(|item| {
+                        let size = item.size.parse().map_err(|_| {
+                            StoreError::Http(format!(
+                                "GCS LIST: bad size `{}` for {}",
+                                item.size, item.name
+                            ))
+                        })?;
+                        let modified_unix_ms =
+                            parse_iso8601_millis(&item.updated).ok_or_else(|| {
+                                StoreError::Http(format!(
+                                    "GCS LIST object `{}` has an unparseable updated `{}`",
+                                    item.name, item.updated
+                                ))
+                            })?;
+                        Ok(ListedObject {
+                            file: FileRef {
+                                path: ObjectPath::new(super::key_name(&item.name)),
+                                size,
+                            },
+                            modified_unix_ms,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            );
+            page_token = body.next_page_token;
+            if page_token.is_none() {
+                break;
+            }
+        }
+        Ok(DirectoryListing { objects, prefixes })
     }
 
     fn absolute_key(&self, key: &ObjectPath) -> Result<ObjectPath> {
@@ -578,6 +603,10 @@ impl GcsStore {
 struct ListResponse {
     #[serde(default)]
     items: Vec<ObjectItem>,
+    #[serde(default)]
+    prefixes: Vec<String>,
+    #[serde(rename = "nextPageToken")]
+    next_page_token: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -696,7 +725,7 @@ mod tests {
         let json = r#"{"items":[
             {"name":"db/events/a.parquet","size":"123","updated":"2026-01-02T03:04:05.678Z"},
             {"name":"db/events/b.parquet","size":"4096","updated":"2026-01-02T03:04:06Z"}
-        ]}"#;
+        ],"prefixes":["db/events/2026/"],"nextPageToken":"next-page"}"#;
 
         let parsed: ListResponse = serde_json::from_str(json).unwrap();
 
@@ -718,6 +747,8 @@ mod tests {
                 ("db/events/b.parquet".to_string(), 4096, 1767323046000),
             ]
         );
+        assert_eq!(parsed.next_page_token.as_deref(), Some("next-page"));
+        assert_eq!(parsed.prefixes, ["db/events/2026/"]);
     }
 
     fn auth(emulated: bool, token: Option<CachedToken>) -> GcsAuth {

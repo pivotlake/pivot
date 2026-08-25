@@ -6,9 +6,9 @@
 //! and knows how to compile itself into a dispatch scan spec.
 //!
 //! Because DuckDB owns SQL binding, the catalog and tables also need to be
-//! visible to it: the adapters [`DuckDBScalarFunctionBinder`] and
-//! [`DuckDBTableAdapter`] implement DuckDB's [`DuckDBBind`] /
-//! [`DuckDBTable`] traits over our Pivot types. They exist as
+//! visible to it: [`DuckDBTransactionAdapter`] and [`DuckDBTableAdapter`]
+//! implement DuckDB's [`DuckDBTransaction`] / [`DuckDBTable`] traits over our
+//! Pivot types. They exist as
 //! standalone wrapper structs (rather than blanket impls) because the orphan
 //! rule prevents implementing a foreign trait for `Box<dyn BoundTable>` directly.
 
@@ -17,14 +17,14 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 
 use crate::expression::{CompareType, TableFilter};
+use crate::operator::built_in_table_function;
 use crate::types::{Type, logical_from_type};
 use arrow_array::{ArrayRef, Scalar};
 use dispatch::{DataFlowDispatcher, DynamicFilterSlot, Projection, RecordBatchOperatorSpec};
 use duckdb_planner::DuckDBColumn;
 use duckdb_planner::Expr;
-use duckdb_planner::catalog_provider::{
-    DuckDBBind, DuckDBTable, DuckDBTransaction, ScalarFunctionDef,
-};
+use duckdb_planner::ScalarValue;
+use duckdb_planner::catalog_provider::{DuckDBTable, DuckDBTransaction, ScalarFunctionDef};
 use std::fmt::Debug;
 use std::sync::Arc;
 use thiserror::Error;
@@ -248,6 +248,16 @@ pub trait CatalogTransaction: Debug + Send + Sync {
     /// Resolve `reference` to a fresh, independently-mutable [`BoundTable`], or
     /// `None` if its datastore holds no such table in that schema.
     fn bind_table(&self, reference: &TableReference) -> Option<Box<dyn BoundTable>>;
+
+    /// Bind the planner-owned `read_parquet(path)` function using this
+    /// catalog's external-file policy. The composite catalog implements this
+    /// as a global capability rather than routing it to a named datastore.
+    fn bind_read_parquet(&self, _location: &str) -> Result<Box<dyn BoundTable>> {
+        Err(Box::<dyn std::error::Error + Send + Sync>::from(
+            "read_parquet is not supported by this catalog",
+        )
+        .into())
+    }
 
     /// The identity and version of `reference` in this transaction's frozen
     /// snapshot of its datastore, or `None` if no such table exists. This must
@@ -579,13 +589,6 @@ impl DuckDBTable for DuckDBTableAdapter {
     }
 }
 
-/// The DuckDB [`DuckDBBind`] provider: resolves the static
-/// (transaction-independent) names during SQL binding, today only the planner's
-/// built-in scalar functions, which are generic across datastores. It holds no
-/// catalog: tables resolve through a per-query [`DuckDBTransactionAdapter`]
-/// instead, since they are answered from the transaction's snapshot.
-pub struct DuckDBScalarFunctionBinder;
-
 /// Adapts a Pivot [`CatalogTransaction`] to DuckDB's [`DuckDBTransaction`]
 /// trait: table lookups during one plan's binding resolve against this
 /// transaction's snapshot.
@@ -594,6 +597,19 @@ pub struct DuckDBTransactionAdapter {
 }
 
 impl DuckDBTransaction for DuckDBTransactionAdapter {
+    fn scalar_function(&self, name: &str) -> Option<ScalarFunctionDef> {
+        let signature = crate::expression::builtin_scalar_function(name)?;
+        Some(ScalarFunctionDef {
+            arg_type_ids: signature
+                .arguments
+                .iter()
+                .map(|arg_type| logical_from_type(arg_type).id as u8)
+                .collect(),
+            return_type_id: logical_from_type(&signature.return_type).id as u8,
+            is_volatile: signature.volatile,
+        })
+    }
+
     fn does_schema_exist(&self, datastore: &str, schema: &str) -> bool {
         self.transaction.does_schema_exist(datastore, schema)
     }
@@ -612,22 +628,15 @@ impl DuckDBTransaction for DuckDBTransactionAdapter {
         let table = self.transaction.bind_table(&reference)?;
         Some(Box::new(DuckDBTableAdapter { table }))
     }
-}
 
-impl DuckDBBind for DuckDBScalarFunctionBinder {
-    fn scalar_function(&self, name: &str) -> Option<ScalarFunctionDef> {
-        // Pivot's own scalar functions (e.g. drop_cache) are generic, not
-        // catalog-specific, so their signatures live in the planner rather than
-        // on the catalog.
-        let signature = crate::expression::builtin_scalar_function(name)?;
-        Some(ScalarFunctionDef {
-            arg_type_ids: signature
-                .arguments
-                .iter()
-                .map(|arg_type| logical_from_type(arg_type).id as u8)
-                .collect(),
-            return_type_id: logical_from_type(&signature.return_type).id as u8,
-            is_volatile: signature.volatile,
-        })
+    fn bind_table_function(
+        &self,
+        name: &str,
+        arguments: Vec<ScalarValue>,
+    ) -> duckdb_planner::catalog_provider::Result<Box<dyn DuckDBTable>> {
+        let function = built_in_table_function(name)
+            .ok_or_else(|| format!("no registered table function named `{name}`"))?;
+        let table = function.bind(&arguments, self.transaction.as_ref())?;
+        Ok(Box::new(DuckDBTableAdapter { table }))
     }
 }

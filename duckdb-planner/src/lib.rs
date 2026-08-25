@@ -13,7 +13,7 @@
 //! ```no_run
 //! use std::sync::Arc;
 //! use duckdb_planner::{
-//!     DuckDBBind, DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, PlannerContext,
+//!     DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, PlannerContext,
 //! };
 //! use duckdb_planner::duckdb_bridge::duckdb_types::LogicalOperatorType;
 //!
@@ -31,12 +31,8 @@
 //!     }
 //! }
 //!
-//! struct MyCatalog;
-//!
-//! impl DuckDBBind for MyCatalog {}
-//!
 //! // BoundTable names resolve through a per-plan transaction (a snapshot of the
-//! // catalog), not through the provider itself.
+//! // catalog).
 //! struct MyTransaction;
 //!
 //! impl DuckDBTransaction for MyTransaction {
@@ -51,7 +47,7 @@
 //!     }
 //! }
 //!
-//! let mut ctx = PlannerContext::new(Arc::new(MyCatalog), vec!["db".to_string()], "db".to_string())
+//! let mut ctx = PlannerContext::new(Vec::new(), vec!["db".to_string()], "db".to_string())
 //!     .unwrap();
 //!
 //! // Plan a query inside a transaction; walk the root handle.
@@ -72,7 +68,7 @@ use std::sync::Arc;
 use duckdb_bridge::ffi;
 use thiserror::Error;
 
-pub use catalog_provider::{DuckDBBind, DuckDBTable, DuckDBTransaction};
+pub use catalog_provider::{DuckDBTable, DuckDBTransaction};
 pub use duckdb_bridge::duckdb_types::LogicalTypeId;
 pub use duckdb_bridge::ffi::DuckDBColumn;
 pub use handle::{BridgeError, Expr, LogicalOp, Plan};
@@ -139,22 +135,21 @@ pub struct PlannerContext {
 }
 
 impl PlannerContext {
-    /// Create a planner context backed by the given static provider, attaching
-    /// one DuckDB database per name in `database_names` and making `default_name`
-    /// the current database. The provider resolves only the transaction-
-    /// independent names (scalar functions), which are generic across datastores;
-    /// per-query table lookups are routed by database name through the
-    /// transaction handed to [`plan`](Self::plan).
+    /// Create a planner context with the given static table-function overloads,
+    /// attaching one DuckDB database per name in `database_names` and making
+    /// `default_name` the current database. Function invocations and per-query
+    /// catalog lookups are routed through the transaction handed to
+    /// [`plan`](Self::plan).
     /// Creating the context attaches every datastore as a DuckDB database, and
     /// any of those steps can fail inside DuckDB; the C++ exception comes back
     /// as [`Error::Bridge`].
     pub fn new(
-        provider: Arc<dyn DuckDBBind>,
+        table_functions: Vec<catalog_provider::TableFunctionDef>,
         database_names: Vec<String>,
         default_name: String,
     ) -> Result<Self, Error> {
         let ctx = Box::new(catalog_provider::CatalogContext::new(
-            provider,
+            table_functions,
             database_names,
             default_name,
         ));

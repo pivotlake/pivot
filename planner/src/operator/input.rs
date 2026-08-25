@@ -176,7 +176,7 @@ pub(crate) fn describe_scan_columns(table: &dyn BoundTable, columns: &[Expressio
 /// table can use for pruning. Each carries the column, comparison, and the
 /// shared slot the Top-N fills with its live boundary; turning that into actual
 /// (e.g. row-group) elimination is the storage backend's job.
-fn build_dynamic_scan_predicates(
+pub(crate) fn build_dynamic_scan_predicates(
     filters: &[DynamicFilter],
     slots: &mut DynamicFilterSlots,
 ) -> Vec<DynamicScanPredicate> {

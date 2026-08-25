@@ -14,9 +14,9 @@
 //! without resolving credentials again.
 
 use super::{
-    DataFileLocation, FileRef, ListedObject, ObjectPath, ObjectStore, ObjectVersion, Result,
-    StoreConnection, StoreError, absolute_object_key, object_key, parse_iso8601_millis,
-    percent_encode,
+    DataFileLocation, DirectoryListing, FileRef, ListedObject, ObjectPath, ObjectStore,
+    ObjectVersion, Result, StoreConnection, StoreError, absolute_object_key, object_key,
+    parse_iso8601_millis, percent_encode,
 };
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
@@ -249,45 +249,71 @@ impl ObjectStore for S3Store {
         }
     }
 
-    fn list(&self, prefix: &ObjectPath) -> Result<Vec<ListedObject>> {
+    fn list(&self, prefix: &ObjectPath) -> Result<DirectoryListing> {
         let object_prefix = object_key(&self.prefix, prefix);
-        // ListObjectsV2, one level (delimiter=/), under the object prefix.
-        let query = format!(
-            "list-type=2&prefix={}%2F&delimiter=%2F",
-            percent_encode(&object_prefix)
-        );
-        let url = format!("{}/?{}", self.base, query);
-        let signed = self.sign("GET", &url, &[], &[])?;
-        let req = Self::apply(self.agent.get(&url), &signed);
-        let body = match req.call() {
-            Ok(resp) => resp
-                .into_string()
-                .map_err(|e| StoreError::Http(format!("LIST body: {e}")))?,
-            Err(e) => return Err(StoreError::Http(format!("LIST {object_prefix}: {e}"))),
+        let encoded_prefix = if object_prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}%2F", percent_encode(&object_prefix))
         };
+        let mut continuation: Option<String> = None;
+        let mut objects = Vec::new();
+        let mut prefixes = Vec::new();
+        loop {
+            let mut query = format!("list-type=2&prefix={encoded_prefix}&delimiter=%2F");
+            if let Some(token) = &continuation {
+                query.push_str("&continuation-token=");
+                query.push_str(&percent_encode(token));
+            }
+            let url = format!("{}/?{}", self.base, query);
+            let signed = self.sign("GET", &url, &[], &[])?;
+            let req = Self::apply(self.agent.get(&url), &signed);
+            let body = match req.call() {
+                Ok(response) => response
+                    .into_string()
+                    .map_err(|error| StoreError::Http(format!("LIST body: {error}")))?,
+                Err(error) => {
+                    return Err(StoreError::Http(format!("LIST {object_prefix}: {error}")));
+                }
+            };
+            let parsed: ListBucketResult = quick_xml::de::from_str(&body)
+                .map_err(|error| StoreError::Http(format!("LIST parse: {error}")))?;
 
-        let parsed: ListBucketResult = quick_xml::de::from_str(&body)
-            .map_err(|e| StoreError::Http(format!("LIST parse: {e}")))?;
-
-        parsed
-            .contents
-            .into_iter()
-            .map(|c| {
-                let modified_unix_ms = parse_iso8601_millis(&c.last_modified).ok_or_else(|| {
-                    StoreError::Http(format!(
-                        "LIST object `{}` has an unparseable LastModified `{}`",
-                        c.key, c.last_modified
-                    ))
-                })?;
-                Ok(ListedObject {
-                    file: FileRef {
-                        path: ObjectPath::new(super::key_name(&c.key)),
-                        size: c.size,
-                    },
-                    modified_unix_ms,
-                })
-            })
-            .collect()
+            objects.extend(
+                parsed
+                    .contents
+                    .into_iter()
+                    .map(|contents| {
+                        let modified_unix_ms = parse_iso8601_millis(&contents.last_modified)
+                            .ok_or_else(|| {
+                                StoreError::Http(format!(
+                                    "LIST object `{}` has an unparseable LastModified `{}`",
+                                    contents.key, contents.last_modified
+                                ))
+                            })?;
+                        Ok(ListedObject {
+                            file: FileRef {
+                                path: ObjectPath::new(super::key_name(&contents.key)),
+                                size: contents.size,
+                            },
+                            modified_unix_ms,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            );
+            prefixes.extend(parsed.common_prefixes.into_iter().filter_map(|common| {
+                let relative = super::relative_key(&object_prefix, &common.prefix);
+                let relative = relative.trim_end_matches('/');
+                (!relative.is_empty()).then(|| ObjectPath::new(relative))
+            }));
+            if !parsed.is_truncated {
+                break;
+            }
+            continuation = Some(parsed.next_continuation_token.ok_or_else(|| {
+                StoreError::Http("LIST response is truncated without a continuation token".into())
+            })?);
+        }
+        Ok(DirectoryListing { objects, prefixes })
     }
 
     fn absolute_key(&self, key: &ObjectPath) -> Result<ObjectPath> {
@@ -429,12 +455,23 @@ impl S3Store {
     }
 }
 
-/// ListObjectsV2 XML response (only the keys are needed).
+/// The object keys and immediate child prefixes from ListObjectsV2.
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 struct ListBucketResult {
     #[serde(default, rename = "Contents")]
     contents: Vec<Contents>,
+    #[serde(default, rename = "CommonPrefixes")]
+    common_prefixes: Vec<CommonPrefix>,
+    #[serde(default)]
+    is_truncated: bool,
+    next_continuation_token: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct CommonPrefix {
+    prefix: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -480,6 +517,9 @@ mod tests {
             <ListBucketResult>
               <Contents><Key>db/events/a.parquet</Key><Size>123</Size></Contents>
               <Contents><Key>db/events/b.parquet</Key><Size>4096</Size></Contents>
+              <CommonPrefixes><Prefix>db/events/2026/</Prefix></CommonPrefixes>
+              <IsTruncated>true</IsTruncated>
+              <NextContinuationToken>next-page</NextContinuationToken>
             </ListBucketResult>"#;
         let parsed: ListBucketResult = quick_xml::de::from_str(xml).unwrap();
         let objects: Vec<_> = parsed.contents.iter().map(|c| (&c.key, c.size)).collect();
@@ -490,5 +530,8 @@ mod tests {
                 (&"db/events/b.parquet".to_string(), 4096),
             ]
         );
+        assert_eq!(parsed.common_prefixes[0].prefix, "db/events/2026/");
+        assert!(parsed.is_truncated);
+        assert_eq!(parsed.next_continuation_token.as_deref(), Some("next-page"));
     }
 }

@@ -112,18 +112,20 @@ async fn queries_bind_tables_by_datastore_name() {
 
     let port = start_server(64, move |dispatch| {
         let config = Config::open(&config_path).unwrap();
-        let metastore = DiskMetastore::open(
-            config.metastore,
-            Some(&metastore_path),
-            config.server.refresh_interval.as_duration(),
-        )
-        .unwrap();
+        let metastore = Arc::new(
+            DiskMetastore::open(
+                config.metastore,
+                Some(&metastore_path),
+                config.server.refresh_interval.as_duration(),
+            )
+            .unwrap(),
+        );
         let datastores = metastore.open_datastores(dispatch.dispatcher()).unwrap();
         CatalogFixture::new(Arc::new(
             PivotCatalog::new(
                 datastores,
                 DEFAULT_DATASTORE_NAME.to_string(),
-                Arc::new(metastore),
+                metastore.clone(),
             )
             .unwrap(),
         ))

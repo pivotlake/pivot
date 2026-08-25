@@ -13,8 +13,8 @@ use arrow_schema::DataType;
 use crossbeam_deque::{Injector, Steal};
 use datastore::{DatastoreColumnMetadata, DatastoreFileMetadata, DatastoreTableMetadata};
 use dispatch::{DataFlowDispatcher, Projection};
-use parquet_engine::{ParquetTable, RowGroupMetadata};
 use object_storage::{self, DataFile, FileRef, ObjectPath, ObjectStore};
+use parquet_engine::{ParquetTable, RowGroupMetadata};
 use planner::catalog::{Column, SchemaQualifiedTableName};
 
 /// One data file of a table, materialized: its Delta log entry
@@ -63,15 +63,14 @@ impl TableFile {
 }
 
 /// The catalog's master record of one table: its declared schema, partitioning,
-/// version, and active [`TableFile`]s, each pairing a Delta log entry with its
+/// version, and active `TableFile`s, each pairing a Delta log entry with its
 /// materialized row groups.
 ///
 /// This is a cloneable snapshot value. Copies handed out are read views and may
 /// drift as commits land; [`refresh`](Self::refresh) reconciles one to the latest
 /// version. Writers instead go through
-/// [`DeltaDatastore::commit_to_table`](crate::DeltaDatastore::commit_to_table),
-/// following the table's
-/// [commit-lock protocol](field@Self::commit_lock). `store` and `location`
+/// `DeltaDatastore::commit_to_table`, following the table's commit-lock
+/// protocol. `store` and `location`
 /// let any copy persist and reload itself.
 #[derive(Clone)]
 pub struct CatalogTable {
@@ -646,7 +645,7 @@ impl CatalogTable {
     /// (evaluated against `now_ms`). The checkpoints themselves are written inline
     /// on the commit path; this is the periodic cleanup the vacuum sweep drives.
     /// The `_delta_log` naming convention lives with the rest of the Delta-format
-    /// code in [`crate::delta`]; returns how many files were deleted.
+    /// code in the Delta-format module; returns how many files were deleted.
     pub fn cleanup_log(&self, now_ms: u64) -> crate::Result<usize> {
         Ok(crate::delta::cleanup_log(
             self.store.as_ref(),
@@ -668,6 +667,7 @@ impl CatalogTable {
         Ok(self
             .store
             .list(&self.location)?
+            .objects
             .into_iter()
             .filter(|object| object.file.path.as_str().ends_with(".parquet"))
             .map(|object| (object.file.path, object.modified_unix_ms))

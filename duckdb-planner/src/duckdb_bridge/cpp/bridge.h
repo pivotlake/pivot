@@ -162,6 +162,8 @@ rust::String lo_get_function_name(const LogicalOperator &op);
 bool lo_get_has_named_params(const LogicalOperator &op);
 size_t lo_get_param_count(const LogicalOperator &op);
 const Value &lo_get_param(const LogicalOperator &op, size_t index);
+bool lo_get_has_bound_table_function(const LogicalOperator &op);
+rust::Box<OptionalTableWrapper> lo_get_clone_bound_table_function(const LogicalOperator &op);
 
 // ---- CreateTable ----
 rust::String lo_create_table_name(const LogicalOperator &op);

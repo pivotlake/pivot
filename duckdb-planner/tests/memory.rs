@@ -1,7 +1,5 @@
 use duckdb_planner::duckdb_bridge::duckdb_types::LogicalOperatorType;
-use duckdb_planner::{
-    DuckDBBind, DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, PlannerContext,
-};
+use duckdb_planner::{DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, PlannerContext};
 use std::sync::Arc;
 
 struct UsersTable;
@@ -34,10 +32,6 @@ impl DuckDBTable for UsersTable {
         ]
     }
 }
-
-struct TestCatalog;
-
-impl DuckDBBind for TestCatalog {}
 
 struct TestTransaction;
 
@@ -83,12 +77,9 @@ fn no_memory_leak_across_repeated_plans() {
     std::thread::scope(|s| {
         for thread_id in 0..num_threads {
             s.spawn(move || {
-                let mut ctx = PlannerContext::new(
-                    Arc::new(TestCatalog),
-                    vec!["db".to_string()],
-                    "db".to_string(),
-                )
-                .unwrap();
+                let mut ctx =
+                    PlannerContext::new(Vec::new(), vec!["db".to_string()], "db".to_string())
+                        .unwrap();
 
                 for i in 0..per_thread {
                     let plan = ctx

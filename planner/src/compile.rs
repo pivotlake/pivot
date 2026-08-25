@@ -147,17 +147,16 @@ pub enum Error {
 impl Plan {
     /// Lower this plan into an executable
     /// [`dispatch::RecordBatchOperatorSpec`] on the given dispatcher. Base-table
-    /// scans use the self-contained bindings captured while planning; backend
-    /// table functions and DDL resolve through `transaction`.
+    /// scans and table functions use self-contained bindings captured while
+    /// planning; DDL resolves through `transaction`.
     pub fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
         transaction: &dyn CatalogTransaction,
     ) -> Result<RecordBatchOperatorSpec, Error> {
-        // Backend table functions and DDL resolve through `transaction`.
-        // Base-table scans carry their planning snapshot and may reach this
-        // compile through the plan cache only after the server verifies that
-        // every recorded table revision matches this transaction.
+        // DDL resolves through `transaction`. Scans carry their planning
+        // snapshot. A cached plan reaches this compile only after the server
+        // verifies that every recorded table revision matches this transaction.
         let mut slots = DynamicFilterSlots::new();
         let compiled = self.root.compile(dispatcher, transaction, &mut slots)?;
         Ok(stamp_output_names(compiled, &self.output_names))
@@ -260,7 +259,7 @@ impl PlanNode {
         match &self.operator {
             crate::Operator::Input(o) => o.compile(dispatcher, slots),
             crate::Operator::Values(o) => o.compile(dispatcher),
-            crate::Operator::TableFunctionScan(o) => o.compile(dispatcher),
+            crate::Operator::TableFunctionScan(o) => o.compile(dispatcher, slots),
             crate::Operator::Projection(o) => o.compile(inputs.remove(0)),
             crate::Operator::Filter(o) => o.compile(inputs.remove(0)),
             crate::Operator::Aggregate(o) => {

@@ -150,13 +150,15 @@ use std::sync::Arc;
 
 pub use operator::{
     Compact, CopyFormat, CopyFromStdin, CreateUser, Operator, SetVariable, TableFunction,
+    TableFunctionSignature,
 };
 pub use plan::{Plan, PlanNode};
 use thiserror::Error;
 
-use crate::catalog::{CatalogTransaction, DuckDBScalarFunctionBinder, DuckDBTransactionAdapter};
+use crate::catalog::{CatalogTransaction, DuckDBTransactionAdapter};
+use crate::operator::built_in_table_function_defs;
 pub use duckdb_planner::{
-    DuckDBBind, DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, ScalarValue,
+    DuckDBColumn, DuckDBTable, DuckDBTransaction, LogicalTypeId, ScalarValue,
 };
 
 /// Errors surfaced by [`Planner::plan`].
@@ -166,6 +168,8 @@ pub enum Error {
     Planning(#[from] duckdb_planner::Error),
     #[error("Error converting plan: {0}")]
     PlanConversion(#[from] plan::Error),
+    #[error("Invalid table-function registry: {0}")]
+    TableFunctionRegistry(String),
 }
 
 impl From<duckdb_planner::BridgeError> for Error {
@@ -209,11 +213,11 @@ impl Planner {
         database_names: Vec<String>,
         default_name: String,
     ) -> Result<Self, Error> {
+        let table_function_defs =
+            built_in_table_function_defs().map_err(Error::TableFunctionRegistry)?;
         Ok(Self {
-            // The static provider only answers generic scalar functions, shared
-            // across every attached datastore.
             planner_context: duckdb_planner::PlannerContext::new(
-                Arc::new(DuckDBScalarFunctionBinder),
+                table_function_defs,
                 database_names,
                 default_name,
             )?,

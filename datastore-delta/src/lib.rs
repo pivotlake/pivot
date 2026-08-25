@@ -2,6 +2,7 @@
 //!
 //! - [`DeltaDatastore`], the tables: a durable Pivot table index,
 //!   per-table Delta Lake snapshots, and live row-group state in memory.
+//!
 //! The reusable object-store and Parquet engines live in `object-storage` and
 //! `parquet-engine`; this crate owns only Delta catalog and transaction policy.
 

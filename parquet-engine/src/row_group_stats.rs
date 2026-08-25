@@ -2,8 +2,8 @@
 //!
 //! Given a single-column predicate `col <op> constant`, decide whether a row
 //! group is guaranteed to contain no matching row from its min/max statistics.
-//! Shared by static filter pushdown (in `TableBinding`) and by
-//! dynamic-filter pruning at scan time, so both reason about stats identically.
+//! Shared by static filter pushdown and dynamic-filter pruning at scan time, so
+//! every path reasons about statistics identically.
 
 use std::sync::Arc;
 

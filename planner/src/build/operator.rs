@@ -250,8 +250,9 @@ impl Input {
 }
 
 impl TableFunctionScan {
-    pub(crate) fn from_handle(
+    pub(super) fn from_handle(
         view: TableFunctionScanView<'_>,
+        ctx: &mut BuildCtx,
     ) -> Result<TableFunctionScan, OperatorError> {
         // Only positional parameters are supported; reject named parameters rather
         // than silently drop a bound argument.
@@ -261,10 +262,22 @@ impl TableFunctionScan {
                 view.function_name()?
             )));
         }
+        if !view.has_bound_table()? {
+            return Err(OperatorError::Unsupported(format!(
+                "table function {} was not registered by Pivot",
+                view.function_name()?
+            )));
+        }
+        let bound_table = bind_table(*view.bound_table()?);
         Ok(TableFunctionScan::new(
             view.function_name()?,
             view.params()?,
             build_scan_columns(view.output_columns()?)?,
+            bound_table,
+            view.dynamic_filters()?
+                .into_iter()
+                .map(|df| ctx.dynamic_filter(df))
+                .collect::<Result<Vec<_>, _>>()?,
         ))
     }
 }

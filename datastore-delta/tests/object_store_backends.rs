@@ -31,8 +31,8 @@ use datastore::DatastoreTransaction;
 use datastore_delta::DeltaDatastore;
 use dispatch::Projection;
 use harness::Backend;
-use parquet_engine::table_input;
 use object_storage::ObjectPath;
+use parquet_engine::table_input;
 use planner::catalog::{Column, CreateTableRequest, SchemaQualifiedTableName};
 use planner::types::Type;
 
@@ -284,20 +284,29 @@ mod bodies {
         );
     }
 
-    /// `list` is one level only: a nested object is not returned.
-    pub fn list_is_one_level(b: &Backend) {
+    /// A one-level listing returns direct objects and immediate child prefixes,
+    /// without returning objects nested below those prefixes.
+    pub fn list_returns_objects_and_child_prefixes(b: &Backend) {
         b.store.put(&ObjectPath::new("d/x.bin"), b"abc").unwrap();
         b.store.put(&ObjectPath::new("d/sub/y.bin"), b"z").unwrap();
+        b.store
+            .put(&ObjectPath::new("d/sub/deep/z.bin"), b"pq")
+            .unwrap();
 
-        let names: Vec<String> = b
-            .store
-            .list(&ObjectPath::new("d"))
-            .unwrap()
+        let listing = b.store.list(&ObjectPath::new("d")).unwrap();
+        let names: Vec<String> = listing
+            .objects
             .into_iter()
             .map(|o| o.file.path.as_str().to_string())
             .collect();
+        let prefixes: Vec<String> = listing
+            .prefixes
+            .into_iter()
+            .map(|prefix| prefix.to_string())
+            .collect();
 
         assert_eq!(names, vec!["x.bin".to_string()]);
+        assert_eq!(prefixes, vec!["sub".to_string()]);
     }
 }
 
@@ -338,4 +347,4 @@ backend_tests!(compaction_replaces_files);
 backend_tests!(source_reads_object_back);
 backend_tests!(sink_writes_object_back);
 backend_tests!(update_never_loses_a_write);
-backend_tests!(list_is_one_level);
+backend_tests!(list_returns_objects_and_child_prefixes);

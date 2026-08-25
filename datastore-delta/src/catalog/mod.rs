@@ -47,8 +47,8 @@ use crossbeam_deque::{Injector, Steal};
 use datastore::{Datastore, DatastoreTableMetadata, DatastoreTransaction};
 use dispatch::{DataFlowDispatcher, DataFlowError, OneShotNullaryFactory, RecordBatchOperatorSpec};
 use local_lock::LocalDatastoreLock;
-use parquet_engine::ParquetTableError;
 use object_storage::{self, DataFile, FileRef, ObjectPath, ObjectStore, open_store};
+use parquet_engine::ParquetTableError;
 use planner::catalog::{
     BoundTable, CreateSchemaRequest, CreateTableRequest, DropTableRequest, Error as CatalogError,
     Result as CatalogResult, SchemaCreation, SchemaQualifiedTableName, TableCreation, TableDrop,
@@ -248,7 +248,7 @@ impl DatastoreIndex {
 /// on its transaction. The transaction's blocking commit initializes the table,
 /// records it in the database index, and publishes the entry in this shared map.
 /// After that, a table evolves by log commits through
-/// [`commit_to_table`](Self::commit_to_table): a writer (INSERT, compaction)
+/// `commit_to_table`: a writer (INSERT, compaction)
 /// hands its files to the datastore, which appends them to, or swaps them into,
 /// the live copy it holds here and publishes the result. Copies handed out for
 /// reading drift; every query resolve refreshes its copy to the latest committed
@@ -750,7 +750,7 @@ impl DeltaDatastore {
         );
         let log_dir = location.join("_delta_log");
         for directory in [location, &log_dir] {
-            for object in self.store.list(directory)? {
+            for object in self.store.list(directory)?.objects {
                 self.store
                     .delete(&directory.join(object.file.path.as_str()))?;
             }
@@ -818,7 +818,7 @@ impl DeltaDatastore {
     /// (a compaction candidate scan, introspection) or refreshes it to the
     /// latest committed version. A copy drifts as soon as anything commits, and
     /// it is never a commit base: writes go through
-    /// [`commit_to_table`](Self::commit_to_table). `None` if no such table
+    /// `commit_to_table`. `None` if no such table
     /// exists.
     pub fn table_handle(&self, name: &SchemaQualifiedTableName) -> Option<CatalogTable> {
         self.tables_index
@@ -1114,6 +1114,7 @@ impl DeltaTransaction {
             .datastore
             .store
             .list(directory)?
+            .objects
             .into_iter()
             .map(|object| object.file)
             .filter(|file| file.path.as_str().ends_with(".parquet"))

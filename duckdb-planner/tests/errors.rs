@@ -1,5 +1,6 @@
+use duckdb_planner::catalog_provider::ScalarFunctionDef;
 use duckdb_planner::{
-    DuckDBBind, DuckDBColumn, DuckDBTable, DuckDBTransaction, Error, LogicalTypeId, PlannerContext,
+    DuckDBColumn, DuckDBTable, DuckDBTransaction, Error, LogicalTypeId, PlannerContext,
 };
 use std::sync::Arc;
 
@@ -28,10 +29,6 @@ impl DuckDBTable for TTable {
     }
 }
 
-struct TestCatalog;
-
-impl DuckDBBind for TestCatalog {}
-
 struct TestTransaction;
 
 impl DuckDBTransaction for TestTransaction {
@@ -52,17 +49,61 @@ impl DuckDBTransaction for TestTransaction {
     }
 }
 
+struct ScalarTransaction {
+    defines_function: bool,
+}
+
+impl DuckDBTransaction for ScalarTransaction {
+    fn scalar_function(&self, name: &str) -> Option<ScalarFunctionDef> {
+        (self.defines_function && name == "transaction_scalar").then(|| ScalarFunctionDef {
+            arg_type_ids: Vec::new(),
+            return_type_id: LogicalTypeId::BIGINT as u8,
+            is_volatile: false,
+        })
+    }
+
+    fn does_schema_exist(&self, _datastore: &str, schema: &str) -> bool {
+        schema == "main"
+    }
+
+    fn bind_table(
+        &self,
+        _datastore: &str,
+        _schema: &str,
+        _table_name: &str,
+    ) -> Option<Box<dyn DuckDBTable>> {
+        None
+    }
+}
+
 fn create_simple_context() -> PlannerContext {
-    PlannerContext::new(
-        Arc::new(TestCatalog),
-        vec!["db".to_string()],
-        "db".to_string(),
-    )
-    .unwrap()
+    PlannerContext::new(Vec::new(), vec!["db".to_string()], "db".to_string()).unwrap()
 }
 
 fn plan(p: &mut PlannerContext, query: &str) -> Result<duckdb_planner::Plan, Error> {
     p.plan(query, Arc::new(TestTransaction))
+}
+
+#[test]
+fn scalar_functions_resolve_through_the_current_transaction() {
+    let mut planner = create_simple_context();
+
+    planner
+        .plan(
+            "SELECT transaction_scalar()",
+            Arc::new(ScalarTransaction {
+                defines_function: true,
+            }),
+        )
+        .unwrap();
+
+    let result = planner.plan(
+        "SELECT transaction_scalar()",
+        Arc::new(ScalarTransaction {
+            defines_function: false,
+        }),
+    );
+    assert!(matches!(result, Err(Error::DuckDBPlanning(_))));
 }
 
 #[test]

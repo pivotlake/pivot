@@ -7,7 +7,6 @@
 #include "duckdb-planner/src/duckdb_bridge/mod.rs.h"
 
 struct PivotStorageInfo : public duckdb::StorageExtensionInfo {
-	const CatalogContext *catalog_ctx;
 	// The pivot transaction of the plan currently being extracted. Set by
 	// `extract_plan` for the duration of one call (planning is single-threaded
 	// per context) and stamped onto each `PivotTransaction` the transaction
@@ -17,8 +16,6 @@ struct PivotStorageInfo : public duckdb::StorageExtensionInfo {
 	// Scalar-function catalog entries synthesized on lookup; kept alive for the
 	// duration of one plan alongside the table entries.
 	std::vector<duckdb::unique_ptr<duckdb::ScalarFunctionCatalogEntry>> scalar_function_entries;
-
-	explicit PivotStorageInfo(const CatalogContext *ctx) : catalog_ctx(ctx) {}
 
 	PivotTableCatalogEntry *AddTableEntry(duckdb::unique_ptr<PivotTableCatalogEntry> entry);
 	duckdb::ScalarFunctionCatalogEntry *AddScalarFunctionEntry(
