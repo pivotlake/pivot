@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# build-ab-servers.sh - build one PGO pivotdb-server per side, for bench-ab.sh.
+# build-ab-servers.sh - build one PGO pivot binary per side, for bench-ab.sh.
 #
 # bench-ab.sh measures prebuilt binaries and no longer builds anything; this is
 # what builds them. Each side gets its own profile directory, so neither has to
@@ -77,7 +77,7 @@ build_side() {
         rm -rf "$pgo"
         mkdir -p "$pgo"
         PGO_DIR="$pgo" PGO_GEN_TARGET_DIR=target-pgogen \
-            just pgo-gen-build build --release -p server --bin pivotdb-server
+            just pgo-gen-build build --release -p bin --bin pivot
         # The client is a plain build in its own target dir: it takes no
         # profile flags, and sharing a flagged dir would rebuild it for
         # nothing on every flavor switch.
@@ -93,11 +93,11 @@ build_side() {
         # drawing a timing-dependent mix per build.
         LLVM_PROFILE_FILE="$pgo/%m-%p.profraw" PIVOT_SPIN_LIMIT=0 \
             "target-client/release/pivot-bench" \
-            --server-bin "target-pgogen/$host_target/release/pivotdb-server" \
+            --server-bin "target-pgogen/$host_target/release/pivot" \
             --source "$pgo_subset" --iterations 2 --skip-check >/dev/null
         "$llvm_profdata" merge -o "$pgo/merged.profdata" "$pgo"/*.profraw
         PGO_USE_TARGET_DIR=target-pgouse \
-            just pgo-use-with "$pgo/merged.profdata" build --release -p server --bin pivotdb-server
+            just pgo-use-with "$pgo/merged.profdata" build --release -p bin --bin pivot
     ) >&2; then
         # Without this the subshell's failure is swallowed by the printf below,
         # and the run only trips at the final existence check, which then names
@@ -105,7 +105,7 @@ build_side() {
         echo "error: building the $side server from $tree failed" >&2
         return 1
     fi
-    local server="$tree/benchmarks/target-pgouse/$host_target/release/pivotdb-server"
+    local server="$tree/benchmarks/target-pgouse/$host_target/release/pivot"
     # Tripwire for the profile applying at all: the decode family's
     # monomorphization hashes in the built server must appear in the profile
     # it was compiled against. Zero overlap means the server was built outside

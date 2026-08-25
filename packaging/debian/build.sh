@@ -30,7 +30,7 @@ case "$output_directory" in
     *) output_directory=$invocation_directory/$output_directory ;;
 esac
 
-package_id=$(cd "$repository_root" && cargo pkgid -p cli)
+package_id=$(cd "$repository_root" && cargo pkgid -p bin)
 case "$package_id" in
     *@*) cargo_version=${package_id##*@} ;;
     *#*) cargo_version=${package_id##*#} ;;
@@ -67,7 +67,7 @@ esac
 binary=${PIVOT_BINARY:-$repository_root/target/release/pivot}
 if [ -z "${PIVOT_BINARY:-}" ]; then
     printf 'Building Pivot %s for Debian %s...\n' "$cargo_version" "$architecture"
-    (cd "$repository_root" && cargo build --release -p cli --bin pivot)
+    (cd "$repository_root" && cargo build --release -p bin --bin pivot)
 fi
 [ -f "$binary" ] || fail "Pivot binary '$binary' was not found"
 [ -x "$binary" ] || fail "Pivot binary '$binary' is not executable"

@@ -44,7 +44,7 @@ npm --prefix docs run preview  # serve the built bundle
 ```
 
 `dist/` is a plain static directory. It can be uploaded to any static host, or
-served by `pivotdb-server` the same way `web/frontend/dist/` is embedded today.
+served by `pivot server` the same way `web/frontend/dist/` is embedded today.
 
 ## After changing `astro.config.mjs`
 

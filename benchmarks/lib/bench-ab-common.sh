@@ -215,7 +215,7 @@ save_cache() {
 # explicit --target so build scripts stay unflagged and cached) and a second
 # copy of them drifts from the recipe silently, changing what is measured
 # without changing anything that looks like a measurement.
-# Every build produces both binaries the harnesses need: the pivotdb-server
+# Every build produces both binaries the harnesses need: the pivot binary
 # being measured, and the pivot-bench that launches it (--server-bin) and
 # drives it over pgwire. Only the server takes profile flags, mirroring
 # build-ab-servers.sh: the client links no engine code, so instrumenting it
@@ -226,7 +226,7 @@ build_gen() {
     mkdir -p "$pgo_dir"
     (cd "$dir/benchmarks" && \
         PGO_DIR="$pgo_dir" PGO_GEN_TARGET_DIR=target-pgogen \
-        just pgo-gen-build build --release -p server --bin pivotdb-server && \
+        just pgo-gen-build build --release -p bin --bin pivot && \
         CARGO_TARGET_DIR=target-client \
         cargo build --release -p benchmarks --bin pivot-bench)
 }
@@ -248,7 +248,7 @@ profile_side() {
     LLVM_PROFILE_FILE="$prof_dir/%m-%p.profraw" PIVOT_SPIN_LIMIT=0 \
         "$dir/benchmarks/target-client/release/pivot-bench" \
         --suite "$suite" --suite-dir "$dir/benchmarks/$suite" \
-        --server-bin "$dir/benchmarks/target-pgogen/$host_target/release/pivotdb-server" \
+        --server-bin "$dir/benchmarks/target-pgogen/$host_target/release/pivot" \
         --source "$source" --iterations 2 --skip-check >/dev/null
     "$(dirname "$(rustc --print target-libdir)")/bin/llvm-profdata" \
         merge -o "$work_dir/$side-$run_id.profdata" "$prof_dir"
@@ -258,9 +258,9 @@ build_use() {
     local dir="$1" side="$2"
     (cd "$dir/benchmarks" && \
         PGO_USE_TARGET_DIR=target-pgouse \
-        just pgo-use-with "$work_dir/$side-$run_id.profdata" build --release -p server --bin pivotdb-server)
+        just pgo-use-with "$work_dir/$side-$run_id.profdata" build --release -p bin --bin pivot)
     verify_pgo_applied \
-        "$dir/benchmarks/target-pgouse/$host_target/release/pivotdb-server" \
+        "$dir/benchmarks/target-pgouse/$host_target/release/pivot" \
         "$work_dir/$side-$run_id.profdata" "$side"
 }
 
@@ -297,7 +297,7 @@ verify_pgo_applied() {
 build_release() {
     local dir="$1"
     (cd "$dir/benchmarks" && \
-        cargo build --release -p server --bin pivotdb-server -p benchmarks --bin pivot-bench)
+        cargo build --release -p bin --bin pivot -p benchmarks --bin pivot-bench)
 }
 
 # Drop the OS page cache (and sync first) so the next read is cold. Needs
