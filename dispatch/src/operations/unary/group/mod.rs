@@ -557,14 +557,15 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         let (num_partitions, partition_capacity) = if !any_switched {
             // How many entries we want in each table for a partition job
             const TARGET_SCANNED_ENTRIES_PER_JOB: usize = 16 * 1024;
-            const MINIMUM_SCANNED_ENTRIES_PER_JOB: usize = 1024;
+            const MINIMUM_SCANNED_ENTRIES_PER_JOB: usize = 8 * 1024;
 
             let input_slots: usize = tables_by_node.iter().flatten().map(|t| t.capacity()).sum();
             let maximum_allowed_jobs = input_slots / MINIMUM_SCANNED_ENTRIES_PER_JOB;
             let partitions = (input_slots / TARGET_SCANNED_ENTRIES_PER_JOB)
-                // We never want to have less jobs than the worker count, to ensure no cores are idle
-                // we do (and ideally more to prevent one worker from holding up the rest)
-                .max(worker_count * 4)
+                // Never fewer jobs than workers, so no core idles, but a job still has
+                // to scan at least MINIMUM_SCANNED_ENTRIES_PER_JOB slots to be worth its
+                // setup, so small inputs stay below that floor.
+                .max(worker_count)
                 .min(maximum_allowed_jobs)
                 .max(2)
                 .next_power_of_two();
