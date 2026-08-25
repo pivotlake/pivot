@@ -9,10 +9,11 @@ use crate::thrift::footer::{FileMetaData, PageEncodingStats, Statistics};
 use crate::thrift::general::{Encoding, PageType};
 use crate::thrift::parquet_thrift::{ReadThrift, ThriftSliceInputProtocol};
 use crate::types::metadata::{ColumnChunkMeta, ColumnStatistics, RowGroupMetadata};
+use arrow_array::builder::{BinaryViewBuilder, StringViewBuilder};
 use arrow_array::{
-    ArrayRef, BinaryViewArray, BooleanArray, Date32Array, Decimal64Array, Decimal128Array,
-    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Scalar,
-    StringViewArray, TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    ArrayRef, BooleanArray, Date32Array, Decimal64Array, Decimal128Array, Float32Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Scalar, TimestampMicrosecondArray,
+    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use dispatch::DataFlowDispatcher;
@@ -307,6 +308,18 @@ fn decode_scalar(
         Scalar::new(Arc::new(s.into_inner()))
     }
 
+    /// Data-block width for a one-value view array: the value's own length.
+    ///
+    /// A view builder left on its default sizing reserves its first block by doubling
+    /// from 8 KiB, and the finished buffer keeps that capacity rather than shrinking to
+    /// the bytes written. A statistic is a single value held for as long as its row
+    /// group's metadata, so sizing the block to the value keeps the cost proportional to
+    /// what it stores. Values of 12 bytes or fewer are packed into the view itself and
+    /// never touch a block, but the width still has to be non-zero.
+    fn pick_block_size(value_len: usize) -> u32 {
+        u32::try_from(value_len).unwrap_or(u32::MAX).max(1)
+    }
+
     match data_type {
         DataType::Boolean => bytes
             .first()
@@ -345,10 +358,18 @@ fn decode_scalar(
         DataType::Float64 => read_le::<8>(bytes)
             .map(f64::from_le_bytes)
             .map(|v| erase_type(Float64Array::new_scalar(v))),
-        DataType::Utf8View => std::str::from_utf8(bytes)
-            .ok()
-            .map(|s| erase_type(StringViewArray::new_scalar(s))),
-        DataType::BinaryView => Some(erase_type(BinaryViewArray::new_scalar(bytes))),
+        DataType::Utf8View => std::str::from_utf8(bytes).ok().map(|s| {
+            let mut builder =
+                StringViewBuilder::with_capacity(1).with_fixed_block_size(pick_block_size(s.len()));
+            builder.append_value(s);
+            erase_type(Scalar::new(builder.finish()))
+        }),
+        DataType::BinaryView => {
+            let mut builder = BinaryViewBuilder::with_capacity(1)
+                .with_fixed_block_size(pick_block_size(bytes.len()));
+            builder.append_value(bytes);
+            Some(erase_type(Scalar::new(builder.finish())))
+        }
         // Temporal stats share their physical int's encoding (Date32 the i32
         // days, Timestamp(Microsecond) the i64 count).
         DataType::Date32 => read_le::<4>(bytes)
