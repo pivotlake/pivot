@@ -26,7 +26,7 @@ use crate::io::backend::IOBackend;
 use crate::io::disk_cache::{DiskCache, Object, Segment};
 use crate::io::http::{HttpEngine, RemoteRead, RemoteUpload, default_client_config};
 use crate::io::{
-    Completion, DataFlowRequest, FailedRead, HttpGetRequest, HttpUploadRequest, RemoteReadTime,
+    Completion, DataFlowRequest, FailedIO, HttpGetRequest, HttpUploadRequest, RemoteReadTime,
     RemoteSplit,
 };
 use crate::memory::compressed_cache::MissingExtent;
@@ -37,7 +37,7 @@ type Result<T> = std::result::Result<T, Error>;
 
 /// One drained read result: a completion or a terminal failure, matching
 /// [`IORequester::completions`](super::IORequester::completions)'s element type.
-type ReadResult = std::result::Result<Completion, FailedRead>;
+type ReadResult = std::result::Result<Completion, FailedIO>;
 
 /// HTTP range reads with an optional disk cache in front of the network.
 pub(crate) struct CachedHttpEngine {
@@ -356,14 +356,14 @@ impl CachedHttpEngine {
                     .remove_from_cache(&crate::io::OpenFile::Remote(
                         request.request.remote.clone(),
                     ));
-                out.push(Err(FailedRead {
+                out.push(Err(FailedIO {
                     data_flow_id: request.data_flow_id,
                     operator_idx: request.operator_idx,
                     tracked_read_id: request.tracked_read_id,
                     error: error.into(),
                 }));
             } else if let Some(upload) = self.http_uploads.remove(&id) {
-                out.push(Err(FailedRead {
+                out.push(Err(FailedIO {
                     data_flow_id: upload.data_flow_id,
                     operator_idx: upload.operator_idx,
                     tracked_read_id: upload.tracked_read_id,
@@ -437,7 +437,7 @@ impl CachedHttpEngine {
                         "short read from disk cache",
                     )
                 };
-                out.push(Err(FailedRead {
+                out.push(Err(FailedIO {
                     data_flow_id: request.data_flow_id,
                     operator_idx: request.operator_idx,
                     tracked_read_id: request.tracked_read_id,

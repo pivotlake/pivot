@@ -4,7 +4,7 @@ use crate::io::cached_http::CachedHttpEngine;
 use crate::io::disk_cache::DiskCache;
 use crate::io::hardware_queues::{InFlightPermit, WorkerHardwareQueues};
 use crate::io::{
-    Completion, DataFlowRequest, FailedRead, FsRequest, FsWriteRequest, HttpRequest,
+    Completion, DataFlowRequest, FailedIO, FsRequest, FsWriteRequest, HttpRequest,
     HttpUploadRequest, OpenFile, PendingReadRequest, PendingWriteRequest, RemoteSplit,
 };
 use crate::memory::compressed_cache::MissingExtent;
@@ -491,7 +491,7 @@ impl IORequester {
     /// a failed read, so the caller fails its logical read and the worker
     /// cancels the affected dataflow exactly as for a read this requester
     /// submitted itself.
-    fn resolve_piggybacked(&mut self, out: &mut Vec<std::result::Result<Completion, FailedRead>>) {
+    fn resolve_piggybacked(&mut self, out: &mut Vec<std::result::Result<Completion, FailedIO>>) {
         let mut index = 0;
         while index < self.piggybacked_reads.len() {
             let request = &self.piggybacked_reads[index];
@@ -501,7 +501,7 @@ impl IORequester {
                     RegisteredRead::Fs(request) => (request.data_flow_id, request.operator_idx),
                     RegisteredRead::Http(request) => (request.data_flow_id, request.operator_idx),
                 };
-                out.push(Err(FailedRead {
+                out.push(Err(FailedIO {
                     data_flow_id,
                     operator_idx,
                     tracked_read_id: Some(request.tracked_read_id()),
@@ -521,14 +521,14 @@ impl IORequester {
     /// genuine ring-machinery failures; each inner result is `Ok` for a read
     /// whose bytes landed (block committed, request yielded as a [`Completion`]
     /// with the transport kind preserved) or `Err` for one that failed terminally
-    /// (a [`FailedRead`] carrying the issuing dataflow and the error). A single
+    /// (a [`FailedIO`] carrying the issuing dataflow and the error). A single
     /// failed read therefore never aborts the drain or tears down the worker —
     /// the worker cancels just the owning dataflow.
     ///
     /// The single per-core ring carries everything: this requester's fs reads,
     /// the [`CachedHttpEngine`]'s cache-file reads / write-backs, and its HTTP
     /// sockets. We drain it once and route each completion to its owner.
-    pub fn completions(&mut self) -> Result<Vec<std::result::Result<Completion, FailedRead>>> {
+    pub fn completions(&mut self) -> Result<Vec<std::result::Result<Completion, FailedIO>>> {
         let raw = self.backend.completions()?;
 
         // HTTP socket CQEs drive the engine first: they may submit follow-up SQEs
@@ -611,7 +611,7 @@ impl IORequester {
                     }
                     let data_flow_id = request.data_flow_id;
                     let operator_idx = request.operator_idx;
-                    out.push(Err(FailedRead {
+                    out.push(Err(FailedIO {
                         data_flow_id,
                         operator_idx,
                         tracked_read_id: request.tracked_read_id,
@@ -1040,7 +1040,7 @@ mod tests {
         let follower_failure = follower.completions().unwrap().pop().unwrap();
         let follower_failed_from_owner = matches!(
             follower_failure,
-            Err(FailedRead {
+            Err(FailedIO {
                 error: Error::PiggybackedReadFailed,
                 ..
             })
@@ -1475,7 +1475,7 @@ mod tests {
         loc: &OpenFile,
         offset: usize,
         len: usize,
-    ) -> Vec<std::result::Result<Completion, FailedRead>> {
+    ) -> Vec<std::result::Result<Completion, FailedIO>> {
         let OpenFile::Remote(remote) = loc else {
             panic!("test fetches over http")
         };
@@ -1505,7 +1505,7 @@ mod tests {
         results
     }
 
-    /// A terminal transport failure surfaces as a `FailedRead`, never a committed
+    /// A terminal transport failure surfaces as a `FailedIO`, never a committed
     /// block or a hang. Exercises the async failure path: a pool thread reports an
     /// error, `take_failed` buckets it, and the drain maps it to the dataflow.
     #[test]

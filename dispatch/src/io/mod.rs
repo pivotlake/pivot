@@ -522,10 +522,10 @@ pub enum Completion {
 /// came back negative.
 /// Carries the dataflow/operator that issued it so the worker can cancel just
 /// that dataflow, plus the error to report. Surfaced as the `Err` arm of a
-/// per-read result from [`IORequester::completions`], so one failed read never
+/// per-operation result from [`IORequester::completions`], so one failed operation never
 /// aborts the whole completion drain or tears down the worker. The block is
 /// left uncommitted.
-pub struct FailedRead {
+pub struct FailedIO {
     pub data_flow_id: Identifier,
     pub operator_idx: Identifier,
     pub(crate) tracked_read_id: Option<Identifier>,
