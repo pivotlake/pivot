@@ -12,7 +12,7 @@ Sizes accept whole bytes or base-1024 `k`, `m`, `g`, and `t` suffixes, such as
 `512m` or `32g`. Durations require a `ms`, `s`, `m`, or `h` suffix, such as
 `500ms` or `30s`.
 
-## `server`
+### `server`
 
 Every server setting is optional.
 
@@ -32,7 +32,7 @@ Every server setting is optional.
 Adding `server.tls` makes TLS available but does not require clients to use it.
 Both `cert` and `key` are required.
 
-## `metastore.datastores`
+### `metastore.datastores`
 
 Exactly one datastore must set `default: true`.
 
@@ -47,7 +47,7 @@ Exactly one datastore must set `default: true`.
 | `compact_min_files` | `100` | File count at which the small-file balance fallback may merge. |
 | `vacuum` | `true` | Deletes expired unreferenced files and old log entries. Enable it in only one process per shared datastore. |
 
-## `metastore.secrets`
+### `metastore.secrets`
 
 Secret names are user-defined. `scope` is an optional URI prefix; the most
 specific secret covering a datastore location is selected.
@@ -59,7 +59,7 @@ specific secret covering a datastore location is selected.
 
 Two secrets cannot claim the same scope.
 
-## `metastore.users`
+### `metastore.users`
 
 | Authentication method | Configuration |
 | --- | --- |
@@ -69,7 +69,7 @@ Two secrets cannot claim the same scope.
 The built-in `pivot` user uses trust authentication unless it is configured
 explicitly.
 
-## Environment variables
+### Environment variables
 
 | Variable | Default | Effect |
 | --- | --- | --- |

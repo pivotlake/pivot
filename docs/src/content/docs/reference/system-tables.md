@@ -17,7 +17,7 @@ running server. Its tables are queried with two-part names such as
 | `system.table_files` | Live parquet data file. |
 | `system.memory_blocks` | Block in the server's memory ring. |
 
-## `system.datastores`
+### `system.datastores`
 
 | Column | Type | Description |
 | --- | --- | --- |
@@ -26,7 +26,7 @@ running server. Its tables are queried with two-part names such as
 | `type` | `VARCHAR` | `delta` for stored datastores or `system` for the virtual datastore. |
 | `data_path` | `VARCHAR` | Local path or object-store URI. Empty for `system`. |
 
-## `system.tables`
+### `system.tables`
 
 | Column | Type | Description |
 | --- | --- | --- |
@@ -40,7 +40,7 @@ running server. Its tables are queried with two-part names such as
 | `bytes` | `BIGINT` | Compressed bytes. |
 | `bytes_uncompressed` | `BIGINT` | Uncompressed bytes. |
 
-## `system.columns`
+### `system.columns`
 
 | Column | Type | Description |
 | --- | --- | --- |
@@ -54,7 +54,7 @@ running server. Its tables are queried with two-part names such as
 | `is_partition_key` | `BOOLEAN` | Whether the column participates in partitioning. |
 | `is_sort_key` | `BOOLEAN` | Whether the column participates in sorting. |
 
-## `system.table_files`
+### `system.table_files`
 
 | Column | Type | Description |
 | --- | --- | --- |
@@ -69,7 +69,7 @@ Bounds retain their value types and can be addressed as variant fields, for
 example `min_max_stats.event_time.min`. Columns without recorded bounds are
 omitted.
 
-## `system.memory_blocks`
+### `system.memory_blocks`
 
 | Column | Type | Description |
 | --- | --- | --- |
