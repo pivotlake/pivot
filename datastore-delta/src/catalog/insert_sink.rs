@@ -330,7 +330,7 @@ impl Unary<AssembledFile, RecordBatch> for Upload {
                 OpenFile::Remote(remote)
             }
         };
-        io.write(open_file, data.clone());
+        io.write(open_file, data.clone())?;
         self.in_flight.insert(
             id,
             PendingUpload {

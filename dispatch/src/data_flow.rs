@@ -527,9 +527,6 @@ impl DataFlow {
             if let Some(operator) = node.operator.as_deref_mut() {
                 let mut io = OperatorIO::new(requester, data_flow_id, node.id, stats, next_read_id);
                 operator.process_read_response(&mut io, response)?;
-                if let Some(error) = io.take_error() {
-                    return Err(error.into());
-                }
             }
             Ok(())
         });
@@ -572,9 +569,6 @@ impl DataFlow {
                 .traverse_backwards(|node_id, operator| {
                     io.set_operator_idx(node_id);
                     let status = operator.run_cpu_work(&mut io)?;
-                    if let Some(error) = io.take_error() {
-                        return Err(error.into());
-                    }
                     match status {
                         WorkStatus::Pending => Ok(ControlFlow::Continue(())),
                         WorkStatus::Ran => Ok(ControlFlow::Break(())),
@@ -596,9 +590,6 @@ impl DataFlow {
                 .traverse_forwards(|node_id, operator| {
                     io.set_operator_idx(node_id);
                     let status = operator.try_steal_work(&mut io)?;
-                    if let Some(error) = io.take_error() {
-                        return Err(error.into());
-                    }
                     match status {
                         WorkStatus::Pending => Ok(ControlFlow::Continue(())),
                         WorkStatus::Ran => Ok(ControlFlow::Break(())),
