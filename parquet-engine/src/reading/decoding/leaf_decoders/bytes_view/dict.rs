@@ -7,7 +7,7 @@
 //! resolved to a view in O(1).
 
 use crate::reading::decoding::leaf_decoders::bytes_view::plain_page_decoder::{
-    read_u32_le_at, view_at,
+    WALK_PREFETCH_BYTES, prefetch_line, read_u32_le_at, view_at,
 };
 use crate::reading::decoding::leaf_decoders::bytes_view::views_builder::ViewsBuilder;
 use crate::reading::decoding::leaf_decoders::{Dict, DictFromBytes, DictFromVecBytes};
@@ -61,6 +61,9 @@ impl DictFactory {
             if offset + 4 > end {
                 self.position.offset = offset;
                 return Err(Error::Len);
+            }
+            if offset + WALK_PREFETCH_BYTES < end {
+                prefetch_line(unsafe { buffer.as_ptr().add(offset + WALK_PREFETCH_BYTES) });
             }
             // SAFETY: `offset + 4 <= end` was just checked.
             let len = unsafe { read_u32_le_at(buffer, offset) };
