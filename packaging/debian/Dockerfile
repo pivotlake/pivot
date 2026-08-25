@@ -28,7 +28,7 @@ COPY . .
 # which corrupts the registry.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
-    cargo build --release -p cli --bin pivot \
+    cargo build --release -p bin --bin pivot \
     && install -D -m 0755 /src/target/release/pivot /out/pivot \
     && PIVOT_BINARY=/out/pivot PIVOT_DEB_VERSION="$PIVOT_DEB_VERSION" \
         packaging/debian/build.sh /packages \

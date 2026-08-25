@@ -1,0 +1,81 @@
+[package]
+name = "bin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The `pivot` executable: the statement executor, the PostgreSQL-wire and HTTP server (`pivot server`), and the interactive shell (`pivot open`)."
+
+[[bin]]
+name = "pivot"
+path = "src/main.rs"
+
+[dependencies]
+catalog = { workspace = true }
+dispatch = { workspace = true }
+metastore-disk = { workspace = true }
+object-storage = { workspace = true }
+planner = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-schema = { workspace = true }
+
+# The executor's plan cache.
+lru = { workspace = true }
+# COPY frames arrive as refcounted protocol bytes and decode without copying.
+bytes = { workspace = true }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "net", "macros", "sync", "signal", "time"] }
+axum = "0.8"
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+include_dir = "0.7"
+pgwire = { workspace = true }
+# Generates per-process secrets for mock authentication of unknown users.
+rand = { workspace = true }
+# Derives the stand-in verifier answered for an unknown user (see `server::auth`).
+sha2 = { workspace = true }
+async-trait = "0.1"
+futures = "0.3"
+clap = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+sysinfo = { workspace = true }
+# The shell's line editor and column layout.
+rustyline = { version = "18", default-features = false }
+unicode-width = { workspace = true }
+# Only pulled in by the `perf` feature, for SIGINT-ing the `perf record` child
+# so it flushes its report (a plain `Child::kill` would SIGKILL and lose it).
+libc = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# Reads and raises the process's open-file limit at startup (see `server::limits`).
+nix = { version = "0.31.2", features = ["resource"] }
+
+[features]
+# Staging-only per-query `perf record` profiling: when on, a session that runs
+# `SET perf = 1` profiles each of its queries (one report per query) into the
+# directory named by `PIVOT_PERF_DIR`. Without this feature every profiling path
+# is compiled out and `SET perf = 1` is an accepted no-op, so there is no
+# overhead in a normal build.
+perf = ["dep:libc", "dispatch/perf"]
+
+[dev-dependencies]
+tokio-postgres = { workspace = true }
+tempfile = { workspace = true }
+parquet = { workspace = true }
+# The variant end-to-end test builds the documents it loads.
+parquet-variant-compute = { workspace = true }
+core_affinity = { workspace = true }
+rstest = { workspace = true }
+# The SSL end-to-end test issues its own throwaway certificate and then connects
+# through it, so it needs a certificate generator and TLS for `tokio-postgres`.
+rcgen = { workspace = true }
+tokio-postgres-rustls = "0.14"
+# The process-level CLI test signals the spawned server.
+libc = { workspace = true }
+# Pull catalog's `test_support` (MinIO / fake-gcs object-store harness) in for
+# the bucket-backed end-to-end tests; the bin build keeps the plain catalog dep.
+catalog = { workspace = true, features = ["test-support"] }
+object-storage = { workspace = true, features = ["test-support"] }

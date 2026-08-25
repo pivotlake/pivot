@@ -2,17 +2,14 @@
 resolver = "3"
 members = [
     "benchmarks",
+    "bin",
     "catalog",
-    "cli",
-    "shell",
     "dispatch",
     "duckdb-planner",
-    "engine",
     "metastore-disk",
     "parquet-engine",
     "planner",
     "object-storage",
-    "server",
 ]
 # arrow-rs (vendored submodule) and perfy are workspaces of their own; they
 # resolve and lock independently.
@@ -26,16 +23,12 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 # Sibling crates.
 catalog = { path = "catalog" }
-cli = { path = "cli" }
-engine = { path = "engine" }
 dispatch = { path = "dispatch" }
 duckdb-planner = { path = "duckdb-planner" }
 metastore-disk = { path = "metastore-disk" }
 parquet-engine = { path = "parquet-engine" }
 planner = { path = "planner" }
 object-storage = { path = "object-storage" }
-server = { path = "server" }
-shell = { path = "shell" }
 
 # The vendored arrow-rs fork (git submodule). `parquet` is the strict,
 # spec-compliant reader used only as a test oracle by crates with their own

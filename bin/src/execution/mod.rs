@@ -1,0 +1,247 @@
+//! Transport-neutral SQL execution for Pivot.
+//!
+//! [`Executor`] owns the planner cache and coordinates one statement
+//! transaction across planning, dataflow execution, cancellation, and commit
+//! or rollback. Frontends choose how query batches are converted before they
+//! leave a dispatch worker. The PostgreSQL frontend turns them into wire rows,
+//! while a local frontend can copy Arrow batches or turn cells into terminal
+//! text.
+
+mod copy;
+mod dataflow;
+mod planning;
+mod types;
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use arrow_array::RecordBatch;
+use dispatch::OutputBatch;
+
+use dataflow::{
+    StatementHandle, StatementKind, StatementResults, affected_rows,
+    affected_rows_from_record_batch, collect_handle, execute_compact, result_columns,
+};
+use planning::{PlanCache, plan_query};
+
+pub use copy::CopyIngest;
+pub use types::{
+    Command, Error, ExecuteOptions, Execution, ExecutionStats, Result, ResultColumn,
+    StatementOutput,
+};
+
+/// Shared SQL execution state for every frontend of one Pivot instance.
+#[derive(Clone)]
+pub struct Executor {
+    catalog: Arc<catalog::PivotCatalog>,
+    dispatcher: dispatch::DataFlowDispatcher,
+    plan_cache: Arc<PlanCache>,
+}
+
+impl Executor {
+    pub fn new(
+        catalog: Arc<catalog::PivotCatalog>,
+        dispatcher: dispatch::DataFlowDispatcher,
+    ) -> Self {
+        Self {
+            catalog,
+            dispatcher,
+            plan_cache: Arc::new(PlanCache::default()),
+        }
+    }
+
+    /// Execute a statement and copy its Arrow batches out of dispatch memory.
+    pub async fn execute(
+        &self,
+        sql: String,
+        options: ExecuteOptions,
+    ) -> Result<Execution<RecordBatch>> {
+        self.execute_with_output::<RecordBatch>(sql, options).await
+    }
+
+    /// Execute a statement with a frontend-selected output batch type.
+    ///
+    /// [`OutputBatch::from_record_batch`] runs on each dispatch worker before
+    /// the result leaves dispatch memory.
+    pub async fn execute_with_output<T>(
+        &self,
+        sql: String,
+        options: ExecuteOptions,
+    ) -> Result<Execution<T>>
+    where
+        T: OutputBatch,
+    {
+        let transaction = self.catalog.begin_transaction();
+        let result = self
+            .execute_in_transaction::<T>(sql, options, transaction.clone())
+            .await;
+        match result {
+            // A COPY FROM STDIN hands the transaction to whoever drives the
+            // ingest instead of resolving it here.
+            Ok(execution) if matches!(execution.output, StatementOutput::CopyFromStdin(_)) => {
+                Ok(execution)
+            }
+            Ok(execution) => {
+                transaction.commit().await?;
+                Ok(execution)
+            }
+            Err(error) => {
+                transaction.rollback();
+                Err(error)
+            }
+        }
+    }
+
+    /// Plan a statement without executing it and report its result shape:
+    /// `Some` with the row description for statements that return rows,
+    /// `None` for those that do not (commands, SET, COMPACT, COPY FROM
+    /// STDIN). Planning runs in its own transaction, rolled back before
+    /// returning.
+    pub async fn describe(&self, sql: &str) -> Result<Option<Vec<ResultColumn>>> {
+        let transaction = self.catalog.begin_transaction();
+        let plan = plan_query(
+            &self.catalog,
+            transaction.clone(),
+            self.plan_cache.as_ref(),
+            sql,
+        )
+        .await;
+        transaction.rollback();
+        let plan = plan?;
+
+        if plan.as_set_variable().is_some()
+            || plan.as_compact().is_some()
+            || plan.as_copy_from_stdin().is_some()
+        {
+            return Ok(None);
+        }
+        match StatementKind::from_plan(&plan) {
+            StatementKind::Query => Ok(Some(result_columns(&plan)?)),
+            _ => Ok(None),
+        }
+    }
+
+    async fn execute_in_transaction<T>(
+        &self,
+        sql: String,
+        options: ExecuteOptions,
+        transaction: Arc<dyn planner::catalog::CatalogTransaction>,
+    ) -> Result<Execution<T>>
+    where
+        T: OutputBatch,
+    {
+        let started = Instant::now();
+        let plan = plan_query(
+            &self.catalog,
+            transaction.clone(),
+            self.plan_cache.as_ref(),
+            &sql,
+        )
+        .await?;
+        let plan_time = started.elapsed();
+
+        if let Some(set) = plan.as_set_variable() {
+            return Ok(Execution {
+                output: StatementOutput::Set {
+                    name: set.name.clone(),
+                    value: set.value.clone(),
+                },
+                stats: ExecutionStats {
+                    plan: plan_time,
+                    ..ExecutionStats::default()
+                },
+            });
+        }
+
+        if let Some(request) = plan.as_compact() {
+            let started = Instant::now();
+            execute_compact(&self.catalog, transaction.as_ref(), request).await?;
+            return Ok(Execution {
+                output: StatementOutput::Command(Command::Compact),
+                stats: ExecutionStats {
+                    plan: plan_time,
+                    execute: started.elapsed(),
+                    ..ExecutionStats::default()
+                },
+            });
+        }
+
+        // A COPY FROM STDIN never compiles through the plan: its rows arrive
+        // later over the frontend's protocol. Launch its ingest dataflow here
+        // and hand the running exchange back; the frontend feeds it and
+        // resolves it (or drops it, which aborts).
+        if let Some(statement) = plan.as_copy_from_stdin() {
+            let ingest = self
+                .launch_copy_ingest(statement.clone(), transaction)
+                .await?;
+            return Ok(Execution {
+                output: StatementOutput::CopyFromStdin(Box::new(ingest)),
+                stats: ExecutionStats {
+                    plan: plan_time,
+                    ..ExecutionStats::default()
+                },
+            });
+        }
+
+        let statement_kind = StatementKind::from_plan(&plan);
+        let columns = result_columns(&plan)?;
+        let dispatcher = self.dispatcher.clone();
+        #[cfg(feature = "perf")]
+        let dispatcher = dispatcher.with_profiling(options.profile);
+
+        let started = Instant::now();
+        let compile_transaction = transaction;
+        let handle = tokio::task::spawn_blocking(move || -> Result<StatementHandle<T>> {
+            let spec = plan.compile(&dispatcher, compile_transaction.as_ref())?;
+            Ok(match (statement_kind, options.collect_stats) {
+                (StatementKind::Insert, true) => {
+                    let output = spec.map(|| affected_rows_from_record_batch);
+                    StatementHandle::Insert(output.execute_with_stats())
+                }
+                (StatementKind::Insert, false) => {
+                    let output = spec.map(|| affected_rows_from_record_batch);
+                    StatementHandle::Insert(output.execute())
+                }
+                (_, true) => StatementHandle::Batches(spec.execute_with_stats_as::<T>()),
+                (_, false) => StatementHandle::Batches(spec.execute_as::<T>()),
+            })
+        })
+        .await
+        .map_err(Error::PlannerPanic)??;
+        let compile_time = started.elapsed();
+
+        let (results, flow, execute_time) = collect_handle(handle).await?;
+        let output = match (statement_kind, results) {
+            (StatementKind::Query, StatementResults::Batches(batches)) => {
+                StatementOutput::Rows { columns, batches }
+            }
+            (StatementKind::Insert, StatementResults::Insert(outputs)) => {
+                StatementOutput::Command(Command::Insert {
+                    rows: affected_rows(outputs)?,
+                })
+            }
+            (StatementKind::CreateTable, StatementResults::Batches(_)) => {
+                StatementOutput::Command(Command::CreateTable)
+            }
+            (StatementKind::CreateSchema, StatementResults::Batches(_)) => {
+                StatementOutput::Command(Command::CreateSchema)
+            }
+            (StatementKind::CreateUser, StatementResults::Batches(_)) => {
+                StatementOutput::Command(Command::CreateUser)
+            }
+            (StatementKind::DropTable, StatementResults::Batches(_)) => {
+                StatementOutput::Command(Command::DropTable)
+            }
+            _ => unreachable!("statement kind and worker output must agree"),
+        };
+        Ok(Execution {
+            output,
+            stats: ExecutionStats {
+                plan: plan_time,
+                compile: compile_time,
+                execute: execute_time,
+                flow,
+            },
+        })
+    }
+}

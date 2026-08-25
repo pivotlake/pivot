@@ -3,7 +3,7 @@
 # bench-ab.sh — A/B performance comparison of two pivotdb source trees, measured
 # through the ClickBench pivot-parquet harness.
 #
-# Runs entirely on the benchmark box. It takes one prebuilt pivotdb-server per
+# Runs entirely on the benchmark box. It takes one prebuilt pivot binary per
 # side ("before" and "after") and hands each to the ClickBench harness (via
 # PIVOT_SERVER_BIN), which times the query set the
 # faithful ClickBench way: for every query it restarts the server and drops the
@@ -16,7 +16,7 @@
 #
 # Usage:
 #   bench-ab.sh \
-#     --before-bin <pivotdb-server> --after-bin <pivotdb-server> \
+#     --before-bin <pivot> --after-bin <pivot> \
 #     --clickbench-dir ~/perf-ab/ClickBench \
 #     --source ~/hits --pgo-subset ~/hits-pgo-subset \
 #     --iterations 3 --regression-pct 5 --report /tmp/ab-report.txt \
@@ -49,7 +49,7 @@ server_env=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        # Prebuilt pivotdb-server binaries, one per side. This script does not
+        # Prebuilt pivot binaries, one per side. This script does not
         # build: it used to run `just pgo-clean` + `just pgo-gen` + `just
         # pgo-use` per tree, which meant two full PGO builds per comparison and
         # a shared PGO dir that had to be wiped between them. Build with
@@ -175,9 +175,9 @@ run_harness() {
     # kernel OOM-kills the booting server. Memory is released before the pid
     # leaves the process table, so an empty table means teardown is done.
     local teardown_waited=0
-    while ps -C pivotdb-server >/dev/null 2>&1; do
+    while ps -C pivot >/dev/null 2>&1; do
         if (( teardown_waited >= 120 )); then
-            echo "warning: pivotdb-server still in the process table after ${teardown_waited}s; starting the next side anyway" >&2
+            echo "warning: pivot still in the process table after ${teardown_waited}s; starting the next side anyway" >&2
             break
         fi
         sleep 1

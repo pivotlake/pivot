@@ -115,11 +115,11 @@ one batch is ever resident.
 ```sh
 # one statement per size: 1k, then 5k, then 10k
 cargo run --release -- --suite clickbench-insert --source ~/hits \
-    --server-bin ~/bin/pivotdb-server
+    --server-bin ~/bin/pivot
 
 # five statements per size, and just the 10k size
 cargo run --release -- --suite clickbench-insert --source ~/hits \
-    --server-bin ~/bin/pivotdb-server --iterations 5 --query insert-10k
+    --server-bin ~/bin/pivot --iterations 5 --query insert-10k
 ```
 
 `--iterations` is how many statements each size sends. Every size's timings are

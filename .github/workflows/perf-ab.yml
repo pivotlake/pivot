@@ -1,7 +1,7 @@
 name: Perf A/B
 
 # Compare pivotdb performance across two commits ("before" vs "after") on a
-# dedicated AWS perf box. Builds a PGO pivotdb-server per commit and times each
+# dedicated AWS perf box. Builds a PGO pivot binary per commit and times each
 # through the ClickBench pivot-parquet harness (per-query server restart + OS
 # page-cache drop, the faithful ClickBench methodology) on the single-hit
 # dataset. Prints a per-query cold/hot diff and fails the run if any query's hot

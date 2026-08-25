@@ -162,16 +162,16 @@ if [[ "$mode" == "pgo" ]]; then
     wait "$b1"; wait "$b2"
 
     client_bin="$after_dir/benchmarks/target-client/release/pivot-bench"
-    before_server="$before_dir/benchmarks/target-pgouse/$host_target/release/pivotdb-server"
-    after_server="$after_dir/benchmarks/target-pgouse/$host_target/release/pivotdb-server"
+    before_server="$before_dir/benchmarks/target-pgouse/$host_target/release/pivot"
+    after_server="$after_dir/benchmarks/target-pgouse/$host_target/release/pivot"
 else
     echo ">>> release builds (A and B in parallel)"
     build_release "$before_dir" & b1=$!
     build_release "$after_dir" & b2=$!
     wait "$b1"; wait "$b2"
     client_bin="$after_dir/target/release/pivot-bench"
-    before_server="$before_dir/target/release/pivotdb-server"
-    after_server="$after_dir/target/release/pivotdb-server"
+    before_server="$before_dir/target/release/pivot"
+    after_server="$after_dir/target/release/pivot"
 fi
 for built in "$client_bin" "$before_server" "$after_server"; do
     [[ -x "$built" ]] || { echo "error: build produced no $built" >&2; exit 1; }
