@@ -3,7 +3,7 @@ title: Quickstart
 description: Start a server, create a table, run a query.
 ---
 
-## Install on Debian or Ubuntu
+### Install on Debian or Ubuntu
 
 ```sh
 sudo apt-get update
@@ -25,7 +25,7 @@ candidates. Then inspect the packaged service:
 sudo systemctl status pivot
 ```
 
-## Build from source
+### Build from source
 
 ```sh
 cargo build --release -p cli --bin pivot
@@ -39,7 +39,7 @@ works:
 psql -h 127.0.0.1 -p 5432 -U pivot
 ```
 
-## Load data
+### Load data
 
 ```sql
 CREATE TABLE events (id BIGINT, name TEXT, ts TIMESTAMP) WITH (
@@ -49,7 +49,7 @@ CREATE TABLE events (id BIGINT, name TEXT, ts TIMESTAMP) WITH (
 
 The directory can contain one or more parquet files with the declared schema.
 
-## Query
+### Query
 
 ```sql
 SELECT name, count(*)
