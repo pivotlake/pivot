@@ -26,6 +26,7 @@ use duckdb_planner::handle::{
 };
 
 use crate::catalog::BoundTable;
+use crate::dynamic_filter::{DynamicFilter, JoinProducedFilter};
 use crate::expression::{
     Cast, Compare, CompareType, Error as ExpressionError, Expression, Function, Ref, VariantGet,
 };
@@ -220,7 +221,7 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
             Operator::Explain(Explain)
         }
         DuckOperator::ComparisonJoin(join) => {
-            return build_join(op, join, inputs);
+            return build_join(op, join, inputs, ctx);
         }
         DuckOperator::CteRef(cte_ref) => {
             Operator::CteScan(ctx.create_cte_scan(cte_ref.cte_index()?)?)
@@ -398,6 +399,7 @@ fn build_join(
     op: LogicalOp<'_>,
     join: ComparisonJoinView<'_>,
     mut inputs: Vec<PlanNode>,
+    ctx: &mut BuildCtx,
 ) -> Result<PlanNode, OperatorError> {
     let probe_types = inputs[0].output_types()?;
     let build_types = inputs[1].output_types()?;
@@ -408,18 +410,24 @@ fn build_join(
     let mut computed_build_keys = Vec::new();
     let mut residual_predicates = Vec::new();
     let mut inequalities = Vec::new();
+    // The equality-key position of each DuckDB condition index, for resolving
+    // join-filter-pushdown targets (which name conditions by that index).
+    let mut key_position_of_condition = Vec::new();
     for entry in join.conditions()? {
         let condition = match entry {
             JoinConditionEntry::Comparison(condition) => condition,
             JoinConditionEntry::Expression(predicate) => {
                 residual_predicates.push(predicate);
+                key_position_of_condition.push(None);
                 continue;
             }
         };
         if condition.comparison != ExpressionType::COMPARE_EQUAL {
             inequalities.push(condition);
+            key_position_of_condition.push(None);
             continue;
         }
+        key_position_of_condition.push(Some(key_types.len()));
         let (probe_key, probe_key_type) = join_key_expression(
             Expression::from_handle(condition.left)?,
             probe_types.len(),
@@ -560,6 +568,54 @@ fn build_join(
         .iter()
         .map(|&i| (build_types[i].clone(), build_nullability[i]))
         .collect();
+
+    // Join-filter pushdown: wire each target the optimizer recorded to its
+    // probe-side scan. The scan gets a `>= min` / `<= max` consumer pair on
+    // the probed column, and the join records the matching producer entry so
+    // its build publishes the key bounds into the slots when it seals. The
+    // optimizer only records targets on join types where a non-matching probe
+    // row produces no output, so pruning such rows early is safe.
+    let mut produced_filters = Vec::new();
+    for target in join.pushdown_targets()? {
+        for column in &target.columns {
+            let Some(&Some(key_position)) = key_position_of_condition.get(column.condition_index)
+            else {
+                continue;
+            };
+            let Some(scan) = find_join_filter_scan(
+                &mut inputs[0],
+                target.filter_set_id,
+                column.probe_table_index,
+            ) else {
+                continue;
+            };
+            let info = scan
+                .join_filter_info
+                .as_ref()
+                .expect("a matched scan carries its join-filter wiring");
+            let Some(&storage_column) = info.proj_to_storage.get(column.probe_column) else {
+                continue;
+            };
+            let min_slot_id = ctx.allocate_join_filter_slot();
+            let max_slot_id = ctx.allocate_join_filter_slot();
+            scan.dynamic_filters.push(DynamicFilter {
+                slot_id: min_slot_id,
+                column_idx: storage_column,
+                compare_type: CompareType::GreaterEqual,
+            });
+            scan.dynamic_filters.push(DynamicFilter {
+                slot_id: max_slot_id,
+                column_idx: storage_column,
+                compare_type: CompareType::LessEqual,
+            });
+            produced_filters.push(JoinProducedFilter {
+                key_position,
+                min_slot_id,
+                max_slot_id,
+            });
+        }
+    }
+
     Ok(PlanNode {
         name: op.name()?,
         inputs,
@@ -575,8 +631,32 @@ fn build_join(
             residual_probe_columns,
             residual_build_columns,
             kind,
+            produced_filters,
         }),
     })
+}
+
+/// Find the probe-subtree scan a join-filter target names, by the shared-set
+/// identity and table index its wiring carries. Anything can sit between the
+/// join and its scan (filters, projections, other joins), so the whole
+/// subtree is searched.
+fn find_join_filter_scan(
+    node: &mut PlanNode,
+    filter_set_id: usize,
+    table_index: usize,
+) -> Option<&mut Input> {
+    match &mut node.operator {
+        Operator::Input(input) => (input.duckdb_table_binding_index == Some(table_index)
+            && input
+                .join_filter_info
+                .as_ref()
+                .is_some_and(|info| info.filter_set_id == filter_set_id))
+        .then_some(input),
+        _ => node
+            .inputs
+            .iter_mut()
+            .find_map(|child| find_join_filter_scan(child, filter_set_id, table_index)),
+    }
 }
 
 /// Narrow residual evaluation from the join's full `[probe, build]` input to
@@ -750,6 +830,7 @@ fn build_range_join(
             residual_probe_columns: Vec::new(),
             residual_build_columns: Vec::new(),
             kind: JoinKind::Range(compare),
+            produced_filters: Vec::new(),
         }),
     })
 }
@@ -1286,6 +1367,7 @@ fn build_delim_join(
                 residual_probe_columns: Vec::new(),
                 residual_build_columns: Vec::new(),
                 kind,
+                produced_filters: Vec::new(),
             },
         )
     } else {
@@ -1318,6 +1400,7 @@ fn build_delim_join(
                 residual_probe_columns: Vec::new(),
                 residual_build_columns: Vec::new(),
                 kind,
+                produced_filters: Vec::new(),
             },
         )
     };

@@ -22,6 +22,36 @@ pub struct DynamicFilter {
     pub compare_type: CompareType,
 }
 
+/// A pair of dynamic filters a hash join's build side produces: once the
+/// build seals, the minimum and maximum of one build key column are published
+/// into the two slots, and consumer scans of the probe side prune row groups
+/// whose key range falls entirely outside `[min, max]`.
+#[derive(Debug)]
+pub struct JoinProducedFilter {
+    /// Position of the key among the join's equality conditions (indexes
+    /// `build_keys`/`key_types`).
+    pub key_position: usize,
+    /// Slot the build key minimum is published into; its consumers compare
+    /// with `>=`.
+    pub min_slot_id: usize,
+    /// Slot the build key maximum is published into; its consumers compare
+    /// with `<=`.
+    pub max_slot_id: usize,
+}
+
+/// Join-filter-pushdown wiring read off a scan's DuckDB get at plan-build
+/// time, consumed by the ancestor join's builder: it appends the consumer
+/// [`DynamicFilter`]s to the scan and records the producing side on itself.
+#[derive(Debug)]
+pub struct JoinFilterScanInfo {
+    /// Pointer identity of the shared filter set pairing this scan with the
+    /// joins that push into it.
+    pub filter_set_id: usize,
+    /// The get's `column_ids` index -> storage column mapping, the space the
+    /// join's probe column indexes arrive in.
+    pub proj_to_storage: Vec<usize>,
+}
+
 impl fmt::Display for DynamicFilter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(

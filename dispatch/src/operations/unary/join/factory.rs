@@ -210,6 +210,7 @@ pub fn create_for_workers<
                 remaining_jobs.clone(),
                 gather.clone(),
                 spec.build_output_indices.clone(),
+                spec.build_filters.clone(),
             );
             JoinBuildFactory {
                 key_columns: spec.build_key_indices.clone(),

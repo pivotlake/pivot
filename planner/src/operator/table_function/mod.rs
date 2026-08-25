@@ -9,7 +9,7 @@ mod read_parquet;
 mod series;
 
 use crate::catalog::{BoundTable, CatalogTransaction};
-use crate::compile::{DynamicFilterSlots, Error};
+use crate::compile::{Error, RuntimeFilterSlots};
 use crate::dynamic_filter::DynamicFilter;
 use crate::expression::Expression;
 use crate::operator::input::{build_dynamic_scan_predicates, plan_scan_projection};
@@ -131,7 +131,7 @@ impl TableFunctionScan {
     pub(crate) fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
-        slots: &mut DynamicFilterSlots,
+        slots: &mut RuntimeFilterSlots,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let (projection, extract_projection) =
             plan_scan_projection(&self.columns, self.table.as_ref())?;

@@ -312,6 +312,7 @@ fn single_key_spec(probe_out: Vec<usize>, build_out: Vec<usize>, kind: JoinKind)
         build_output_indices: build_out,
         kind,
         residual_filters: None,
+        build_filters: Vec::new(),
     }
 }
 
@@ -479,6 +480,7 @@ fn bench_joins(c: &mut Criterion, d: &DataFlowDispatcher) {
                 build_output_indices: vec![2],
                 kind: JoinKind::Inner,
                 residual_filters: None,
+                build_filters: Vec::new(),
             },
         );
     }
@@ -712,6 +714,7 @@ fn bench_joins(c: &mut Criterion, d: &DataFlowDispatcher) {
                 build_output_indices: vec![1],
                 kind: JoinKind::Inner,
                 residual_filters: None,
+                build_filters: Vec::new(),
             },
         );
     }
@@ -833,6 +836,7 @@ fn bench_joins(c: &mut Criterion, d: &DataFlowDispatcher) {
                 build_output_indices: vec![1],
                 kind: JoinKind::Inner,
                 residual_filters: None,
+                build_filters: Vec::new(),
             },
         );
     }

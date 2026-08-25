@@ -10,8 +10,8 @@ use arrow_schema::{DataType, Field, Schema};
 
 use common::*;
 use dispatch::{
-    AggregationKind, AggregationSlot, JoinKind, JoinResidualFn, JoinResidualSpec, JoinSpec,
-    values_input,
+    AggregationKind, AggregationSlot, DynamicFilterSlot, JoinBuildFilter, JoinKind, JoinResidualFn,
+    JoinResidualSpec, JoinSpec, values_input,
 };
 
 /// Non-nullable `Int64` output fields, which is what every column of these
@@ -33,6 +33,7 @@ fn inner_join(probe_output_indices: Vec<usize>, build_output_indices: Vec<usize>
         build_output_indices,
         kind: JoinKind::Inner,
         residual_filters: None,
+        build_filters: Vec::new(),
     }
 }
 
@@ -224,6 +225,7 @@ fn join_on_int32_keys() {
                 build_fields: int32_field("build_id"),
                 kind: JoinKind::Inner,
                 residual_filters: None,
+                build_filters: Vec::new(),
             },
         )
         .collect()
@@ -360,6 +362,7 @@ fn join_keeps_only_listed_columns() {
                 build_fields: vec![Field::new("b_payload", DataType::Int64, false)],
                 kind: JoinKind::Inner,
                 residual_filters: None,
+                build_filters: Vec::new(),
             },
         )
         .collect()
@@ -389,6 +392,7 @@ fn build_outer_join(
         probe_fields: vec![Field::new("id", DataType::Int64, true)],
         kind: JoinKind::BuildOuter,
         residual_filters: None,
+        build_filters: Vec::new(),
     }
 }
 
@@ -464,6 +468,7 @@ fn probe_semi_join(probe_columns: Vec<usize>) -> JoinSpec {
         build_fields: Vec::new(),
         kind: JoinKind::ProbeSemi,
         residual_filters: None,
+        build_filters: Vec::new(),
     }
 }
 
@@ -588,6 +593,7 @@ fn probe_anti_join(probe_columns: Vec<usize>) -> JoinSpec {
         build_fields: Vec::new(),
         kind: JoinKind::ProbeAnti,
         residual_filters: None,
+        build_filters: Vec::new(),
     }
 }
 
@@ -708,6 +714,7 @@ fn build_anti_join(build_columns: Vec<usize>) -> JoinSpec {
         build_fields,
         kind: JoinKind::BuildAnti,
         residual_filters: None,
+        build_filters: Vec::new(),
     }
 }
 
@@ -762,6 +769,7 @@ fn build_semi_join(build_columns: Vec<usize>) -> JoinSpec {
         build_fields,
         kind: JoinKind::BuildSemi,
         residual_filters: None,
+        build_filters: Vec::new(),
     }
 }
 
@@ -835,6 +843,7 @@ fn probe_mark_join(probe_columns: Vec<usize>) -> JoinSpec {
         build_fields: Vec::new(),
         kind: JoinKind::ProbeMark,
         residual_filters: None,
+        build_filters: Vec::new(),
     }
 }
 
@@ -1113,6 +1122,7 @@ fn join_on_two_key_columns_needs_both_to_match() {
                 build_fields: int64_fields(2),
                 kind: JoinKind::Inner,
                 residual_filters: None,
+                build_filters: Vec::new(),
             },
         )
         .collect()
@@ -1125,4 +1135,40 @@ fn join_on_two_key_columns_needs_both_to_match() {
         .collect();
     pairs.sort();
     assert_eq!(pairs, vec![(1, 20), (2, 30)]);
+}
+
+#[test]
+fn a_build_filter_publishes_the_key_bounds() {
+    let probe = int64_batch("key", &[1, 2, 3]);
+    let build = int64_batch("key", &[42, 7, 19]);
+    let min_slot = Arc::new(DynamicFilterSlot::new());
+    let max_slot = Arc::new(DynamicFilterSlot::new());
+    let mut spec = inner_join(vec![0], vec![0]);
+    spec.build_filters = vec![JoinBuildFilter {
+        build_column: 0,
+        min_slot: min_slot.clone(),
+        max_slot: max_slot.clone(),
+    }];
+
+    let d = dispatch(2);
+    let probe_input = values_input(&d, vec![probe]).record_batches();
+    let build_input = values_input(&d, vec![build]).record_batches();
+    probe_input
+        .join(build_input, &[DataType::Int64], spec)
+        .collect()
+        .unwrap();
+
+    assert_eq!(boundary_i64(&min_slot), 7);
+    assert_eq!(boundary_i64(&max_slot), 42);
+}
+
+fn boundary_i64(slot: &DynamicFilterSlot) -> i64 {
+    use arrow_array::Datum;
+    let boundary = slot.boundary().expect("the sealed build published a bound");
+    let (array, _) = boundary.get();
+    array
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("an Int64 key publishes an Int64 bound")
+        .value(0)
 }
