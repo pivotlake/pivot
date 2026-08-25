@@ -14,10 +14,10 @@ use std::time::{Duration, Instant};
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use catalog::delta::DeltaDatastore;
+use catalog::metastore::{DEFAULT_USER_NAME, Metastore, UserAuth};
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
-use datastore_delta::DeltaDatastore;
 use dispatch::{DataFlowDispatcher, Dispatch};
-use metastore::{DEFAULT_USER_NAME, Metastore, UserAuth};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -121,7 +121,7 @@ pub fn pivot_metastore() -> Arc<dyn Metastore> {
         fn open_datastores(
             &self,
             _dispatcher: &DataFlowDispatcher,
-        ) -> metastore::Result<HashMap<String, Arc<dyn Datastore>>> {
+        ) -> catalog::metastore::Result<HashMap<String, Arc<dyn Datastore>>> {
             Ok(HashMap::new())
         }
 

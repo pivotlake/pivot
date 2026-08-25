@@ -29,7 +29,7 @@
 //!
 //! use catalog::PivotCatalog;
 //! use dispatch::Dispatch;
-//! use metastore::Metastore;
+//! use catalog::metastore::Metastore;
 //! use metastore_disk::DiskMetastore;
 //! use server::{Config, Server};
 //!

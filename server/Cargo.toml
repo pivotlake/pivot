@@ -9,8 +9,6 @@ dispatch = { workspace = true }
 engine = { workspace = true }
 planner = { workspace = true }
 catalog = { workspace = true }
-datastore-delta = { workspace = true }
-metastore = { workspace = true }
 metastore-disk = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
@@ -70,5 +68,5 @@ rcgen = { workspace = true }
 tokio-postgres-rustls = "0.14"
 # Pull catalog's `test_support` (MinIO / fake-gcs object-store harness) in for
 # the bucket-backed end-to-end tests; the bin build keeps the plain catalog dep.
-datastore-delta = { workspace = true, features = ["test-support"] }
+catalog = { workspace = true, features = ["test-support"] }
 object-storage = { workspace = true, features = ["test-support"] }

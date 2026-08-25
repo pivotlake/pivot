@@ -4,7 +4,7 @@
 //! Docker is unreachable, so the suite stays green offline.
 
 use arrow_array::{Array, Int64Array};
-use datastore_delta::test_support;
+use catalog::test_support;
 use engine::{ExecuteOptions, StatementOutput};
 use shell::ShellInstance;
 

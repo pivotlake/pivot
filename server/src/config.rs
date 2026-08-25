@@ -39,7 +39,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-use datastore_delta::DEFAULT_REFRESH_INTERVAL;
+use catalog::delta::DEFAULT_REFRESH_INTERVAL;
 use metastore_disk::{ByteSize, Interval, MetastoreConfig};
 use serde::Deserialize;
 
@@ -206,7 +206,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use metastore::Metastore;
+    use catalog::metastore::Metastore;
     use metastore_disk::DiskMetastore;
 
     const METASTORE_SECTION: &str = "metastore:\n  datastores:\n    hot:\n      kind: delta\n      \

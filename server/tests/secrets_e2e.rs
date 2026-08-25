@@ -19,12 +19,12 @@ use std::sync::Arc;
 use std::thread;
 
 use catalog::PivotCatalog;
+use catalog::metastore::Metastore;
+use catalog::test_support::{self, Backend};
 use common::{
     connect_client, parquet_name_value_rows, pick_free_port, select_rows, wait_until_listening,
 };
-use datastore_delta::test_support::{self, Backend};
 use dispatch::Dispatch;
-use metastore::Metastore;
 use metastore_disk::DiskMetastore;
 use object_storage::ObjectPath;
 use server::{Config, Server};

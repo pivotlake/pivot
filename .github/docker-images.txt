@@ -4,7 +4,7 @@
 # actually request, or a stale entry just causes a one-time miss (testcontainers
 # pulls the real tag itself):
 #   - MinIO: testcontainers-modules `MinIO` default tag (bump with that crate)
-#   - fake-gcs-server: the tag in datastore-delta/src/test_support.rs. This is
+#   - fake-gcs-server: the tag in catalog/src/test_support.rs. This is
 #     the fork `object_store` tests its own GCS client against; the upstream
 #     image serves no XML API, which is what Delta Kernel's client speaks.
 minio/minio:RELEASE.2025-02-28T09-55-16Z

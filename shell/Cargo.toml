@@ -6,11 +6,9 @@ license.workspace = true
 
 [dependencies]
 catalog = { workspace = true }
-datastore-delta = { workspace = true }
 object-storage = { workspace = true }
 dispatch = { workspace = true }
 engine = { workspace = true }
-metastore = { workspace = true }
 planner = { workspace = true }
 arrow = { workspace = true }
 arrow-array = { workspace = true }
@@ -24,6 +22,6 @@ unicode-width = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-# Pull datastore-delta's `test_support` (MinIO / fake-gcs object-store harness)
+# Pull catalog's `test_support` (MinIO / fake-gcs object-store harness)
 # in for the bucket-backed session test; the library build keeps the plain dep.
-datastore-delta = { workspace = true, features = ["test-support"] }
+catalog = { workspace = true, features = ["test-support"] }

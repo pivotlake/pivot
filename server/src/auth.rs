@@ -17,8 +17,8 @@ use std::fmt::Debug;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
+use catalog::metastore::{Metastore, SCRAM_ITERATIONS, SCRAM_SALT_LEN, ScramVerifier, UserAuth};
 use futures::Sink;
-use metastore::{Metastore, SCRAM_ITERATIONS, SCRAM_SALT_LEN, ScramVerifier, UserAuth};
 use pgwire::api::auth::sasl::SASLAuthStartupHandler;
 use pgwire::api::auth::sasl::scram::ScramAuth;
 use pgwire::api::auth::{AuthSource, DefaultServerParameterProvider, LoginInfo, Password};

@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use catalog::metastore::Metastore;
 use catalog::{DEFAULT_DATASTORE_NAME, PivotCatalog};
 use common::{CatalogFixture, connect_client, select_rows, start_server};
-use metastore::Metastore;
 use metastore_disk::DiskMetastore;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;

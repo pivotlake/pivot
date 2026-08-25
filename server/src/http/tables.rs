@@ -7,7 +7,7 @@
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use datastore_delta::DeltaDatastore;
+use catalog::delta::DeltaDatastore;
 use planner::catalog::SchemaQualifiedTableName;
 use serde::{Deserialize, Serialize};
 
