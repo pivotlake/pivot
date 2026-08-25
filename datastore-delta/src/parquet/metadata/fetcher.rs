@@ -47,9 +47,15 @@ impl FileRowGroupsFetcher {
         }
     }
 
-    fn request_region(&mut self, request: FooterRead, range: FileRange, io: &mut OperatorIO) {
-        let id = io.read(request.open_file.clone(), [range]);
+    fn request_region(
+        &mut self,
+        request: FooterRead,
+        range: FileRange,
+        io: &mut OperatorIO,
+    ) -> dispatch::UnaryResult<()> {
+        let id = io.read(request.open_file.clone(), [range])?;
         self.in_flight.insert(id, request);
+        Ok(())
     }
 }
 
@@ -79,8 +85,7 @@ impl Unary<DataFile, FileRowGroups> for FileRowGroupsFetcher {
 
         let request = FooterRead::new(file_ref, open_file, size);
         let range = request.probe_range();
-        self.request_region(request, range, io);
-        Ok(())
+        self.request_region(request, range, io)
     }
 
     fn ready_for_more_work(&mut self) -> bool {
@@ -109,7 +114,7 @@ impl Unary<DataFile, FileRowGroups> for FileRowGroupsFetcher {
             .parse_region(&bytes, &self.declared_columns)
             .map_err(crate::parquet::op_err)?
         {
-            FooterProgress::ReadExact(range) => self.request_region(request, range, io),
+            FooterProgress::ReadExact(range) => self.request_region(request, range, io)?,
             FooterProgress::Done(row_groups) => sender.send(FileRowGroups {
                 file: request.file,
                 row_groups: row_groups.into_iter().map(Arc::new).collect(),

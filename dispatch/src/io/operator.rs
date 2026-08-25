@@ -135,11 +135,6 @@ pub struct OperatorIO<'a> {
     /// The dataflow's logical read-id counter, owned by the flow so
     /// identifiers stay unique across this handle's short lifetimes.
     next_read_id: &'a mut usize,
-    /// The first submission failure, surfaced by dispatch after the operator
-    /// returns. Operators cannot act on transport errors, so `read`/`write`
-    /// stay infallible for them; the failed request itself is already
-    /// withdrawn by the requester.
-    error: Option<crate::io::IORequesterError>,
 }
 
 impl<'a> OperatorIO<'a> {
@@ -156,7 +151,6 @@ impl<'a> OperatorIO<'a> {
             operator_idx,
             stats,
             next_read_id,
-            error: None,
         }
     }
 
@@ -165,7 +159,7 @@ impl<'a> OperatorIO<'a> {
         &mut self,
         open_file: OpenFile,
         locations: impl IntoIterator<Item = FileRange>,
-    ) -> ReadRequestId {
+    ) -> Result<ReadRequestId, crate::io::IORequesterError> {
         let id = ReadRequestId(*self.next_read_id);
         *self.next_read_id += 1;
         let request = PendingReadRequest {
@@ -173,24 +167,20 @@ impl<'a> OperatorIO<'a> {
             open_file,
             locations: locations.into_iter().collect(),
         };
-        if let Err(error) =
-            self.requester
-                .request_read(self.data_flow_id, self.operator_idx, request, self.stats)
-        {
-            self.error.get_or_insert(error);
-        }
-        id
+        self.requester
+            .request_read(self.data_flow_id, self.operator_idx, request, self.stats)?;
+        Ok(id)
     }
 
     /// Write `data` to a local file or remote object.
-    pub fn write(&mut self, open_file: OpenFile, data: Arc<FileBytes>) {
+    pub fn write(
+        &mut self,
+        open_file: OpenFile,
+        data: Arc<FileBytes>,
+    ) -> Result<(), crate::io::IORequesterError> {
         let request = PendingWriteRequest { open_file, data };
-        if let Err(error) =
-            self.requester
-                .request_write(self.data_flow_id, self.operator_idx, request, self.stats)
-        {
-            self.error.get_or_insert(error);
-        }
+        self.requester
+            .request_write(self.data_flow_id, self.operator_idx, request, self.stats)
     }
 
     /// Point this handle at another operator of the same dataflow. A traversal
@@ -199,13 +189,6 @@ impl<'a> OperatorIO<'a> {
     #[inline]
     pub(crate) fn set_operator_idx(&mut self, operator_idx: crate::Identifier) {
         self.operator_idx = operator_idx;
-    }
-
-    /// The first submission failure this handle absorbed, if any. Dispatch
-    /// checks it after each operator call and fails the dataflow.
-    #[inline]
-    pub(crate) fn take_error(&mut self) -> Option<crate::io::IORequesterError> {
-        self.error.take()
     }
 }
 

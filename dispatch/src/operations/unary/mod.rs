@@ -119,6 +119,8 @@ pub enum Error {
     OrderByLimit(#[from] order_by_limit::Error),
     #[error("{0}")]
     Group(#[from] group::Error),
+    #[error("{0}")]
+    Io(#[from] crate::io::IORequesterError),
     /// An error from an operator defined outside this crate (e.g. the Parquet
     /// reader, now in `catalog`). Such operators map their own error into this.
     #[error("{0}")]
