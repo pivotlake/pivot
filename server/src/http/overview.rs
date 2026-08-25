@@ -4,7 +4,7 @@
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use axum::Json;
 use axum::extract::State;
-use datastore_delta::DeltaDatastore;
+use catalog::delta::DeltaDatastore;
 use planner::catalog::SchemaQualifiedTableName;
 use serde::Serialize;
 

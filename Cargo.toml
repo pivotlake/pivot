@@ -5,13 +5,9 @@ members = [
     "catalog",
     "cli",
     "shell",
-    "datastore",
-    "datastore-delta",
-    "datastore-system",
     "dispatch",
     "duckdb-planner",
     "engine",
-    "metastore",
     "metastore-disk",
     "parquet-engine",
     "planner",
@@ -33,12 +29,8 @@ license = "MIT OR Apache-2.0"
 catalog = { path = "catalog" }
 cli = { path = "cli" }
 engine = { path = "engine" }
-datastore = { path = "datastore" }
-datastore-delta = { path = "datastore-delta" }
-datastore-system = { path = "datastore-system" }
 dispatch = { path = "dispatch" }
 duckdb-planner = { path = "duckdb-planner" }
-metastore = { path = "metastore" }
 metastore-disk = { path = "metastore-disk" }
 parquet-engine = { path = "parquet-engine" }
 planner = { path = "planner" }

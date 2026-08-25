@@ -11,13 +11,13 @@ mod common;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
+use catalog::delta::DEFAULT_REFRESH_INTERVAL;
+use catalog::metastore::{Metastore, SCRAM_ITERATIONS, ScramVerifier, UserAuth};
 use catalog::{Datastore, PivotCatalog};
 use common::{
     CatalogFixture, login, login_without_password, select_rows, start_server_with_metastore,
 };
-use datastore_delta::DEFAULT_REFRESH_INTERVAL;
 use dispatch::DataFlowDispatcher;
-use metastore::{Metastore, SCRAM_ITERATIONS, ScramVerifier, UserAuth};
 use metastore_disk::{DiskMetastore, MetastoreConfig};
 use pgwire::api::auth::sasl::scram::gen_salted_password;
 use tempfile::TempDir;
@@ -55,7 +55,7 @@ impl Metastore for MutableMetastore {
     fn open_datastores(
         &self,
         dispatcher: &DataFlowDispatcher,
-    ) -> metastore::Result<HashMap<String, Arc<dyn Datastore>>> {
+    ) -> catalog::metastore::Result<HashMap<String, Arc<dyn Datastore>>> {
         self.inner.open_datastores(dispatcher)
     }
 

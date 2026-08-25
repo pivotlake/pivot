@@ -3,10 +3,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use catalog::delta::DeltaDatastore;
+use catalog::metastore::{Metastore, UserAuth};
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
-use datastore_delta::DeltaDatastore;
 use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
-use metastore::{Metastore, UserAuth};
 use object_storage::AmbientExternalStoreFactory;
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
@@ -17,7 +17,7 @@ impl Metastore for EphemeralMetastore {
     fn open_datastores(
         &self,
         _dispatcher: &DataFlowDispatcher,
-    ) -> metastore::Result<HashMap<String, Arc<dyn Datastore>>> {
+    ) -> catalog::metastore::Result<HashMap<String, Arc<dyn Datastore>>> {
         Ok(HashMap::new())
     }
 

@@ -22,10 +22,10 @@
 
 use crate::query_handler::PivotHandlers;
 use catalog::PivotCatalog;
+use catalog::metastore::Metastore;
 #[cfg(test)]
 use dispatch::DataFlowDispatcher;
 use dispatch::{Dispatch, Shutdown};
-use metastore::Metastore;
 use pgwire::tokio::{TlsAcceptor, process_socket};
 use std::io;
 use std::net::SocketAddr;
@@ -56,7 +56,7 @@ pub enum Error {
     OpenDatastores {
         path: PathBuf,
         #[source]
-        source: metastore::Error,
+        source: catalog::metastore::Error,
     },
     #[error("invalid metastore configuration: {0}")]
     InvalidCatalog(#[from] catalog::Error),
@@ -299,8 +299,8 @@ fn format_panic_payload(payload: &Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use catalog::delta::DeltaDatastore;
     use catalog::{DEFAULT_DATASTORE_NAME, Datastore};
-    use datastore_delta::DeltaDatastore;
     use std::collections::HashMap;
     use tokio::sync::oneshot;
 
@@ -332,7 +332,7 @@ mod tests {
             fn open_datastores(
                 &self,
                 _dispatcher: &DataFlowDispatcher,
-            ) -> metastore::Result<HashMap<String, Arc<dyn Datastore>>> {
+            ) -> catalog::metastore::Result<HashMap<String, Arc<dyn Datastore>>> {
                 Ok(HashMap::new())
             }
 
@@ -340,8 +340,9 @@ mod tests {
                 DEFAULT_DATASTORE_NAME
             }
 
-            fn user_auth(&self, username: &str) -> Option<metastore::UserAuth> {
-                (username == metastore::DEFAULT_USER_NAME).then_some(metastore::UserAuth::Trust)
+            fn user_auth(&self, username: &str) -> Option<catalog::metastore::UserAuth> {
+                (username == catalog::metastore::DEFAULT_USER_NAME)
+                    .then_some(catalog::metastore::UserAuth::Trust)
             }
         }
 

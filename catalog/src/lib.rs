@@ -1,5 +1,14 @@
-//! The **cross-datastore catalog**: the layer that presents the set of named
-//! datastores a server serves to the planner.
+//! PivotDB's catalog: everything between the planner and the stored data.
+//!
+//! - [`datastore`]: the [`Datastore`] and [`DatastoreTransaction`] traits, one
+//!   named data source and the per-query snapshot it opens.
+//! - [`metastore`]: the [`Metastore`] trait, the server's source of which
+//!   datastores it serves and which users may log in.
+//! - [`delta`]: the Delta Lake datastore backend, backed by Parquet data files.
+//! - [`system`]: the read-only `system` datastore describing the server's own
+//!   catalog.
+//! - this root, the **cross-datastore catalog**: the layer that presents the set
+//!   of named datastores a server serves to the planner.
 //!
 //! [`PivotCatalog`] holds the datastores keyed by name as `Arc<dyn Datastore>`.
 //! Its `begin_transaction` returns a
@@ -14,13 +23,22 @@
 //! one's own commit; a datastore decides for itself whether that commit does
 //! blocking store I/O or is an in-memory no-op.
 
+pub mod datastore;
+pub mod delta;
+pub mod metastore;
+pub mod system;
+/// A Docker-backed object-store test harness (MinIO) plus Delta test helpers.
+/// Gated behind the `test-support` feature so it, and its heavy testcontainers
+/// deps, never enter a normal build.
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use crossbeam_deque::{Injector, Steal};
 use datastore::DatastoreTransaction;
-use datastore_system::{DatastoreEntry, SystemTransaction};
 use dispatch::{DataFlowDispatcher, OneShotNullaryFactory, RecordBatchOperatorSpec};
 use metastore::Metastore;
 use object_storage::ExternalStoreFactory;
@@ -29,9 +47,10 @@ use planner::catalog::{
     DropTableRequest, Error as CatalogError, Result as CatalogResult, SchemaCreation,
     TableCreation, TableDrop, TableReference, TableRevision, UserCreation,
 };
+use system::{DatastoreEntry, SystemTransaction};
 
-/// One named data source served by pivotdb. Re-exported from `datastore`, where
-/// the trait lives; concrete backends (e.g. `datastore_delta::DeltaDatastore`)
+/// One named data source served by pivotdb. Re-exported from [`datastore`],
+/// where the trait lives; concrete backends (e.g. [`delta::DeltaDatastore`])
 /// implement it and are held here behind `Arc<dyn Datastore>`.
 pub use datastore::Datastore;
 
@@ -143,7 +162,7 @@ impl PivotCatalog {
 
     pub fn datastore_names(&self) -> Vec<String> {
         let mut names: Vec<_> = self.datastores.keys().cloned().collect();
-        names.push(datastore_system::DATASTORE_NAME.to_string());
+        names.push(system::DATASTORE_NAME.to_string());
         names
     }
 
@@ -214,7 +233,7 @@ impl PivotTransaction {
         &self,
         datastore: &str,
     ) -> Option<Arc<dyn DatastoreTransaction>> {
-        if datastore == datastore_system::DATASTORE_NAME {
+        if datastore == system::DATASTORE_NAME {
             return Some(self.find_or_create_system_transaction());
         }
         let mut sub_transactions = self.sub_transactions.lock().unwrap();
@@ -234,7 +253,7 @@ impl PivotTransaction {
             .sub_transactions
             .lock()
             .unwrap()
-            .get(datastore_system::DATASTORE_NAME)
+            .get(system::DATASTORE_NAME)
         {
             return existing.clone();
         }
@@ -257,7 +276,7 @@ impl PivotTransaction {
         self.sub_transactions
             .lock()
             .unwrap()
-            .entry(datastore_system::DATASTORE_NAME.to_string())
+            .entry(system::DATASTORE_NAME.to_string())
             .or_insert_with(|| Arc::new(SystemTransaction::new(datastores)))
             .clone()
     }
@@ -460,9 +479,9 @@ impl UserCreation for PivotUserCreation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datastore_delta::DeltaDatastore;
+    use crate::delta::DeltaDatastore;
+    use crate::metastore::{DEFAULT_USER_NAME, UserAuth};
     use dispatch::Dispatch;
-    use metastore::{DEFAULT_USER_NAME, UserAuth};
 
     /// A metastore serving no datastores and only the built-in trusted user:
     /// the catalogs here get their datastores handed in directly.

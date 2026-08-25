@@ -1,4 +1,4 @@
-//! A disk-backed [`metastore::Metastore`] provider.
+//! A disk-backed [`catalog::metastore::Metastore`] provider.
 //!
 //! This crate owns the `metastore` section of PivotDB's config file: the
 //! datastores to serve, the secrets they are opened with, and the users that
@@ -112,16 +112,16 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use catalog::Datastore;
-use datastore_delta::{
+use catalog::delta::{
     CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL, DEFAULT_MIN_FILES_TO_MERGE,
     DEFAULT_VACUUM_POLL, DeltaDatastore, MaintenanceConfig, VacuumConfig,
     default_merge_target_bytes,
 };
-use dispatch::DataFlowDispatcher;
-use metastore::{
+use catalog::metastore::{
     DEFAULT_USER_NAME, Metastore, SCRAM_ITERATIONS, SCRAM_SALT_LEN, ScramVerifier, UserAuth,
     format_scram_verifier, parse_scram_verifier,
 };
+use dispatch::DataFlowDispatcher;
 use object_storage::{
     ExternalStoreFactory, GcsStore, LocalStore, ObjectStore, S3Store, StoreError, StoreScheme,
     local_path,
@@ -342,9 +342,9 @@ impl Metastore for DiskMetastore {
     fn open_datastores(
         &self,
         dispatcher: &DataFlowDispatcher,
-    ) -> metastore::Result<HashMap<String, Arc<dyn Datastore>>> {
+    ) -> catalog::metastore::Result<HashMap<String, Arc<dyn Datastore>>> {
         self.build_datastores(dispatcher)
-            .map_err(|error| Box::new(error) as metastore::Error)
+            .map_err(|error| Box::new(error) as catalog::metastore::Error)
     }
 
     fn default_datastore_name(&self) -> &str {
@@ -363,9 +363,13 @@ impl Metastore for DiskMetastore {
         (username == DEFAULT_USER_NAME).then_some(UserAuth::Trust)
     }
 
-    fn create_user(&self, username: &str, password: Option<&str>) -> metastore::Result<()> {
+    fn create_user(
+        &self,
+        username: &str,
+        password: Option<&str>,
+    ) -> catalog::metastore::Result<()> {
         DiskMetastore::create_user(self, username, password)
-            .map_err(|error| Box::new(error) as metastore::Error)
+            .map_err(|error| Box::new(error) as catalog::metastore::Error)
     }
 }
 
@@ -464,7 +468,7 @@ pub enum Error {
     #[error(transparent)]
     Store(#[from] object_storage::StoreError),
     #[error(transparent)]
-    Delta(#[from] datastore_delta::Error),
+    Delta(#[from] catalog::delta::Error),
 }
 
 /// The datastores and users of a metastore, as written: the config file's
@@ -707,7 +711,7 @@ impl DatastoreConfig {
 mod tests {
     use super::*;
     use catalog::DEFAULT_DATASTORE_NAME;
-    use datastore_delta::DEFAULT_REFRESH_INTERVAL;
+    use catalog::delta::DEFAULT_REFRESH_INTERVAL;
     use std::io::Write;
     use std::time::Duration;
 
