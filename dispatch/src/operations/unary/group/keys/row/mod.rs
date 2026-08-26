@@ -91,7 +91,6 @@ use arrow_array::RecordBatch;
 pub struct RowKeyExtractor;
 
 impl KeyExtractor for RowKeyExtractor {
-    const RADIX_DEDUP_BEFORE_SCATTER: bool = true;
     type Config = RowKeySchema;
     type Persisted = ArenaKey;
     type LiveKey<'a, 'b> = RowKey<'a, 'b>;

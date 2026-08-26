@@ -698,6 +698,52 @@ mod tests {
         agg.flush()
     }
 
+    /// Rows the worker holds after consuming: scatter rows plus in-place
+    /// entries.
+    fn rows_after_consume(out: &AggregatedTableOutput<IntExtractor, CountValue>) -> usize {
+        let scattered: usize = out
+            .buffers
+            .iter()
+            .flat_map(|buffers| buffers.0.iter())
+            .map(|bucket| bucket.len())
+            .sum();
+        scattered + out.tables.iter().map(|table| table.len()).sum::<usize>()
+    }
+
+    /// Keys that repeat within a window are folded before they scatter, so
+    /// the worker holds one row per key.
+    #[test]
+    fn repeating_keys_deduplicate_before_scatter() {
+        init_test_free_pool(64);
+        let arena = SharedArena::new(64);
+        let state = RandomState::new();
+        let values: Vec<i32> = (0..40_000).flat_map(|key| [key, key]).collect();
+
+        let out = make_worker_output(&state, &arena, &values);
+
+        assert!(out.buffers.is_some(), "40000 keys switch to radix");
+        // A key whose two rows straddle a table growth or a window flush is
+        // held twice; there are a handful of those boundaries.
+        let rows = rows_after_consume(&out);
+        assert!((40_000..40_010).contains(&rows), "{rows} rows held");
+    }
+
+    /// Once enough windows show the keys barely repeat, rows scatter raw:
+    /// adjacent repeats arriving after that are held twice instead of folded.
+    #[test]
+    fn barely_repeating_keys_fall_back_to_raw_scatter() {
+        init_test_free_pool(64);
+        let arena = SharedArena::new(64);
+        let state = RandomState::new();
+        let repeats = (100_000..108_000).flat_map(|key| [key, key]);
+        let values: Vec<i32> = (0..100_000).chain(repeats).collect();
+
+        let out = make_worker_output(&state, &arena, &values);
+
+        assert!(out.buffers.is_some(), "100000 keys switch to radix");
+        assert_eq!(rows_after_consume(&out), 116_000);
+    }
+
     /// A worker with enough distinct keys to switch to radix produces scatter
     /// buffers *and* a pre-switch in-place stack. The radix merge must combine
     /// both at RADIX_PARTITIONS granularity, landing every key in exactly one

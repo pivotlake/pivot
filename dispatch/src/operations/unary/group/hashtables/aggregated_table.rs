@@ -34,6 +34,17 @@ use std::sync::Arc;
 /// Table capacity at which eligible keys switch to radix scatter.
 const SWITCH_THRESHOLD: usize = 32768;
 
+/// Rows the deduplication windows must have folded per distinct key, over
+/// all windows so far, to keep deduplicating: three rows per two keys. Below
+/// that, the probe each row pays in the window table saves too little
+/// scatter and merge work, and the remaining rows scatter raw.
+const KEEP_DEDUP_ROWS_PER_KEYS: (usize, usize) = (3, 2);
+
+/// Windows flushed before the fold ratio is judged. Keys often repeat in
+/// bursts, so one window says little; the probes spent on these windows
+/// are negligible even for keys that never repeat.
+const WINDOWS_BEFORE_RAW_SCATTER: usize = 4;
+
 /// Configuration for the in-place to radix transition.
 #[derive(Copy, Clone)]
 pub struct RadixConfig {
@@ -102,6 +113,17 @@ pub struct AggregatedTable<K: KeyExtractor, V: AggregationValue + ?Sized> {
     hll: Hll,
     /// Whether this worker has entered radix mode.
     switched_to_radix: bool,
+    /// Rows folded into the active table so far, compared against the
+    /// distinct keys flushed from it to judge how much the windows
+    /// deduplicated.
+    rows_folded: usize,
+    /// Distinct keys flushed from the active table to the radix partitions.
+    keys_flushed: usize,
+    /// Windows flushed so far.
+    windows_flushed: usize,
+    /// Whether rows now scatter raw, without deduplicating in the active
+    /// table first. Set once the windows have barely deduplicated.
+    scatter_raw: bool,
     /// Radix threshold and partition count.
     radix_config: RadixConfig,
     /// Scratch buffer for the per-row hashes computed once per batch.
@@ -137,6 +159,10 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             buffers: None,
             hll: Hll::new(),
             switched_to_radix: false,
+            rows_folded: 0,
+            keys_flushed: 0,
+            windows_flushed: 0,
+            scatter_raw: false,
             radix_config,
             hashes: vec![0u64; RECORD_BATCH_SIZE]
                 .into_boxed_slice()
@@ -199,9 +225,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
                 &mut self.hashes[..length],
             );
 
-            // Fixed-width keys scatter directly after the transition. Keys on
-            // the abandon route continue through the in-place table.
-            if self.switched_to_radix && !K::RADIX_DEDUP_BEFORE_SCATTER {
+            // Rows deduplicate in the active table until a window shows the
+            // keys barely repeat; from then on they scatter directly.
+            if self.scatter_raw {
                 self.scatter_range(0, length, &key_reader, &value_reader);
             } else {
                 self.consume_in_place(length, &key_reader, &value_reader, shared_context);
@@ -222,6 +248,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         let metadata = V::storage_metadata(shared_context);
         let mut i = 0;
         while i < length {
+            let window_start = i;
             let overflowed = {
                 let Self {
                     tables,
@@ -247,6 +274,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
                     },
                 )
             };
+            self.rows_folded += i - window_start;
             // The row that crossed the limit has already been folded. Scatter
             // starts at the following row.
             if overflowed && self.grow_or_radix() {
@@ -256,11 +284,13 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         }
     }
 
-    /// Grows the in-place stack or enters radix mode.
+    /// Grows the in-place stack, or flushes the full active table's distinct
+    /// keys to the radix partitions and clears it for the next window.
     ///
-    /// Returns `true` when the caller should scatter the remaining raw rows.
-    /// Abandon-route keys instead drain the deduplicated table and return
-    /// `false`, allowing the caller to continue probing with the cleared table.
+    /// Returns `true` when the caller should scatter the remaining rows raw:
+    /// the windows so far barely deduplicated, so probing further windows
+    /// would not pay for itself. Returns `false` when the caller should keep
+    /// folding rows into the cleared table.
     #[inline(always)]
     fn grow_or_radix(&mut self) -> bool {
         let next_size = self.tables.last().unwrap().capacity() * 4;
@@ -282,12 +312,17 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             );
         }
         self.switched_to_radix = true;
-        if K::RADIX_DEDUP_BEFORE_SCATTER {
-            self.scatter_active_table_to_radix_partitions();
-            false
-        } else {
-            true
+        self.keys_flushed += self.tables.last().unwrap().len();
+        self.windows_flushed += 1;
+        self.scatter_active_table_to_radix_partitions();
+        let (rows, keys) = KEEP_DEDUP_ROWS_PER_KEYS;
+        if self.windows_flushed >= WINDOWS_BEFORE_RAW_SCATTER
+            && self.rows_folded * keys < self.keys_flushed * rows
+        {
+            self.scatter_raw = true;
+            return true;
         }
+        false
     }
 
     /// Scatters rows into radix partitions without deduplicating them.
