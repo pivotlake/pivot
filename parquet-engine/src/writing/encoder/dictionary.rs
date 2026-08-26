@@ -23,8 +23,8 @@ use arrow_schema::{DataType, TimeUnit};
 use dispatch::memory::SlabAllocator;
 
 use super::super::error::WriteResult;
+use super::super::leaves::Leaf;
 use super::super::types::EncodedPage;
-use super::leaves::Leaf;
 use super::pages::{self, PageKind};
 use super::{plain, rle};
 
