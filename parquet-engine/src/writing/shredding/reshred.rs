@@ -29,16 +29,21 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, BinaryViewArray, StructArray};
+use arrow_array::types::{BinaryViewType, Float64Type, Int64Type};
+use arrow_array::{Array, ArrayRef, BinaryViewArray, PrimitiveArray, StringViewArray, StructArray};
 use arrow_buffer::{BooleanBuffer, NullBuffer};
-use arrow_schema::{DataType, Field, FieldRef, Fields};
+use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields};
 use dispatch::arrays::take::{concat_chunks, take_chunked};
 use dispatch::memory::SlabAllocator;
+use parquet_variant::{
+    ObjectBuilder, ParentState, ReadOnlyMetadataBuilder, ValueBuilder, Variant, VariantMetadata,
+};
 use parquet_variant_compute::{VariantArray, unshred_variant};
 
 use super::super::error::{WriteError, WriteResult};
 use super::shred::{
-    self, SharedNullColumn, column_fields, object_fields, pair_fields, typed_value_type,
+    self, ByteViewColumn, SharedNullColumn, column_fields, object_fields, pair_fields,
+    typed_value_type,
 };
 
 /// Bring `array`, a variant column in one file's layout, to the `union`
@@ -190,11 +195,7 @@ fn widen_node(
         _ => node.value_or_null(allocator, shared),
     };
     if let Some(object) = object {
-        for (field, column) in object.fields().iter().zip(object.columns()) {
-            if !is_kept(field, column, target_fields) {
-                value = fold_back_child(metadata, &value, field, column, allocator, shared)?;
-            }
-        }
+        value = fold_back_dropped(metadata, value, object, target_fields, allocator, shared)?;
     }
 
     let mut children: Vec<ArrayRef> = Vec::with_capacity(target_fields.len());
@@ -272,11 +273,7 @@ fn reshred_node(
         _ => node.value_or_null(allocator, shared),
     };
     if let Some(object) = object {
-        for (field, column) in object.fields().iter().zip(object.columns()) {
-            if !is_kept(field, column, target_fields) {
-                value = fold_back_child(metadata, &value, field, column, allocator, shared)?;
-            }
-        }
+        value = fold_back_dropped(metadata, value, object, target_fields, allocator, shared)?;
     }
 
     // The rows that carry a kept child in this leftover give it up now.
@@ -403,6 +400,169 @@ fn same_kind(existing: &DataType, target: &DataType) -> bool {
         (DataType::Struct(_), DataType::Struct(_)) => true,
         _ => existing == target,
     }
+}
+
+/// Fold the children of `object` that `target_fields` does not keep back
+/// into `value`, the object's leftover. Scalar children fold together, one
+/// pass over the rows that hold any of them; an object child, whose values
+/// are a subtree, folds through the unshred kernel on its own.
+fn fold_back_dropped(
+    metadata: &BinaryViewArray,
+    mut value: BinaryViewArray,
+    object: &StructArray,
+    target_fields: &Fields,
+    allocator: &mut SlabAllocator,
+    shared: &mut SharedNullColumn,
+) -> WriteResult<BinaryViewArray> {
+    let mut scalars: Vec<FoldedScalar<'_>> = Vec::new();
+    for (field, column) in object.fields().iter().zip(object.columns()) {
+        if is_kept(field, column, target_fields) {
+            continue;
+        }
+        match FoldedScalar::of(field, column) {
+            Some(scalar) => scalars.push(scalar),
+            None => value = fold_back_child(metadata, &value, field, column, allocator, shared)?,
+        }
+    }
+    if scalars.is_empty() {
+        return Ok(value);
+    }
+    fold_back_scalars(metadata, &value, &scalars, allocator)
+}
+
+/// A dropped scalar child as the fold reads it: its name, its typed leaf,
+/// and its fallback.
+struct FoldedScalar<'a> {
+    name: &'a [u8],
+    typed: ScalarLeaf<'a>,
+    fallback: Option<&'a BinaryViewArray>,
+    held: BooleanBuffer,
+}
+
+enum ScalarLeaf<'a> {
+    Int64(&'a PrimitiveArray<Int64Type>),
+    Float64(&'a PrimitiveArray<Float64Type>),
+    Utf8View(&'a StringViewArray),
+}
+
+impl<'a> FoldedScalar<'a> {
+    /// The child `pair` named `field` as a scalar, or `None` when it is an
+    /// object or a leaf of a type the fold does not rebuild.
+    fn of(field: &'a FieldRef, pair: &'a ArrayRef) -> Option<Self> {
+        let pair_struct = pair.as_any().downcast_ref::<StructArray>()?;
+        let typed = pair_struct.column_by_name("typed_value")?;
+        let typed = match typed.data_type() {
+            DataType::Int64 => ScalarLeaf::Int64(typed.as_any().downcast_ref()?),
+            DataType::Float64 => ScalarLeaf::Float64(typed.as_any().downcast_ref()?),
+            DataType::Utf8View => ScalarLeaf::Utf8View(typed.as_any().downcast_ref()?),
+            _ => return None,
+        };
+        let fallback = pair_struct
+            .column_by_name("value")
+            .and_then(|value| value.as_any().downcast_ref::<BinaryViewArray>());
+        Some(Self {
+            name: field.name().as_bytes(),
+            typed,
+            fallback,
+            held: pair_present(pair),
+        })
+    }
+
+    /// The value this child holds on `row`, if any: its typed value, else
+    /// its fallback's bytes.
+    fn value_on(&self, row: usize, metadata: VariantMetadata<'a>) -> Option<Variant<'a, 'a>> {
+        if !self.held.value(row) {
+            return None;
+        }
+        let typed = match self.typed {
+            ScalarLeaf::Int64(leaf) => leaf.is_valid(row).then(|| Variant::from(leaf.value(row))),
+            ScalarLeaf::Float64(leaf) => leaf.is_valid(row).then(|| Variant::from(leaf.value(row))),
+            ScalarLeaf::Utf8View(leaf) => {
+                leaf.is_valid(row).then(|| Variant::from(leaf.value(row)))
+            }
+        };
+        typed.or_else(|| {
+            self.fallback
+                .filter(|fallback| fallback.is_valid(row))
+                .map(|fallback| Variant::new_with_metadata(metadata, fallback.value(row)))
+        })
+    }
+}
+
+/// Rebuild the leftover of every row that holds any of `scalars`: the old
+/// leftover's fields and the folded values, each under its id in the row's
+/// dictionary. Other rows keep their leftover as it was.
+fn fold_back_scalars(
+    metadata: &BinaryViewArray,
+    value: &BinaryViewArray,
+    scalars: &[FoldedScalar<'_>],
+    allocator: &mut SlabAllocator,
+) -> WriteResult<BinaryViewArray> {
+    let rows = value.len();
+    let mut held = BooleanBuffer::new_unset(rows);
+    for scalar in scalars {
+        held = &held | &scalar.held;
+    }
+    if held.count_set_bits() == 0 {
+        return Ok(value.clone());
+    }
+    let mut column = ByteViewColumn::<BinaryViewType>::with_capacity(allocator, rows);
+    let mut bytes = Vec::new();
+    for row in 0..rows {
+        if !held.value(row) {
+            if value.is_valid(row) {
+                column.append_value(value.value(row), allocator);
+            } else {
+                column.append_null();
+            }
+            continue;
+        }
+        let dictionary = VariantMetadata::new(metadata.value(row));
+        let mut value_builder = ValueBuilder::new();
+        let mut metadata_builder = ReadOnlyMetadataBuilder::new(&dictionary);
+        let state = ParentState::variant(&mut value_builder, &mut metadata_builder);
+        let mut object = ObjectBuilder::new(state, false);
+        if value.is_valid(row) {
+            let leftover = Variant::new_with_metadata(dictionary.clone(), value.value(row));
+            let Some(fields) = leftover.as_object() else {
+                return Err(WriteError::Arrow(ArrowError::InvalidArgumentError(
+                    "a position holding typed fields has a leftover that is not an object"
+                        .to_string(),
+                )));
+            };
+            for (field_id, field_value) in fields.iter_with_field_ids() {
+                object.insert_bytes_by_field_id(field_id, field_value);
+            }
+        }
+        for scalar in scalars {
+            let Some(folded) = scalar.value_on(row, dictionary.clone()) else {
+                continue;
+            };
+            let field_id = field_id_of(&dictionary, scalar.name)?;
+            object.insert_bytes_by_field_id(field_id, folded);
+        }
+        object.finish();
+        bytes.clear();
+        bytes.extend_from_slice(&value_builder.into_inner());
+        column.append_value(&bytes, allocator);
+    }
+    Ok(column.finish())
+}
+
+/// The id `name` has in `dictionary`. The row's document had the field, so
+/// its dictionary names it.
+fn field_id_of(dictionary: &VariantMetadata<'_>, name: &[u8]) -> WriteResult<u32> {
+    for id in 0..dictionary.len() {
+        if dictionary.name_bytes(id)? == name {
+            return Ok(id as u32);
+        }
+    }
+    Err(WriteError::Arrow(ArrowError::InvalidArgumentError(
+        format!(
+            "a folded field is missing from its row's {}-entry dictionary",
+            dictionary.len()
+        ),
+    )))
 }
 
 /// Fold the child `pair` (the shredded position `field` of an object) back
@@ -806,6 +966,39 @@ mod tests {
         let widened = widen(
             &shredded(&rows, &both, &mut allocator),
             &both,
+            &mut allocator,
+        )
+        .unwrap();
+        let reshredded = reshred(&widened, &only_id, &mut allocator).unwrap();
+
+        assert_matches_shredding_whole(&reshredded, &rows, &only_id, &mut allocator);
+    }
+
+    /// Several dropped children fold together, with each row keeping only
+    /// what it held, beside leftover fields and non-conforming values.
+    #[test]
+    fn several_dropped_paths_fold_back_together() {
+        init_test_free_pool(16);
+        let mut allocator = SlabAllocator::new(false);
+        let wide = object(vec![
+            ("id", DataType::Int64),
+            ("n", DataType::Int64),
+            ("s", DataType::Utf8View),
+            ("f", DataType::Float64),
+        ]);
+        let only_id = object(vec![("id", DataType::Int64)]);
+        let rows = [
+            Some(r#"{"id": 1, "n": 10, "s": "a", "f": 1.5}"#),
+            Some(r#"{"id": 2, "n": 20, "z": [1]}"#),
+            Some(r#"{"id": 3, "s": "c", "f": "not a float"}"#),
+            Some(r#"{"id": 4}"#),
+            None,
+            Some(r#"{"n": {"nested": true}, "q": null}"#),
+        ];
+
+        let widened = widen(
+            &shredded(&rows, &wide, &mut allocator),
+            &wide,
             &mut allocator,
         )
         .unwrap();

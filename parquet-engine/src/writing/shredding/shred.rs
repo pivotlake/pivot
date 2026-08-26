@@ -643,7 +643,7 @@ impl<T: ArrowPrimitiveType> PrimitiveLeaf<T> {
 
 /// A byte-view column built value by value: the 16-byte views on one slab,
 /// out-of-line bytes copied into slab blocks of their own.
-struct ByteViewColumn<V: ByteViewType> {
+pub(super) struct ByteViewColumn<V: ByteViewType> {
     views: SlabColumn<u128>,
     validity: Validity,
     /// Sealed blocks, in the order the views number them.
@@ -655,7 +655,7 @@ struct ByteViewColumn<V: ByteViewType> {
 }
 
 impl<V: ByteViewType> ByteViewColumn<V> {
-    fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self {
+    pub(super) fn with_capacity(allocator: &mut SlabAllocator, rows: usize) -> Self {
         Self {
             views: SlabColumn::with_capacity(allocator, rows),
             validity: Validity::with_capacity(allocator, rows),
@@ -665,12 +665,12 @@ impl<V: ByteViewType> ByteViewColumn<V> {
         }
     }
 
-    fn append_null(&mut self) {
+    pub(super) fn append_null(&mut self) {
         self.views.push(0);
         self.validity.append(false);
     }
 
-    fn append_value(&mut self, bytes: &[u8], allocator: &mut SlabAllocator) {
+    pub(super) fn append_value(&mut self, bytes: &[u8], allocator: &mut SlabAllocator) {
         let view = if bytes.len() <= 12 {
             make_view(bytes, 0, 0)
         } else {
@@ -711,7 +711,7 @@ impl<V: ByteViewType> ByteViewColumn<V> {
         }
     }
 
-    fn finish(mut self) -> GenericByteViewArray<V> {
+    pub(super) fn finish(mut self) -> GenericByteViewArray<V> {
         self.seal_open_block();
         let rows = self.views.len();
         let views = ScalarBuffer::new(self.views.into_buffer(), 0, rows);
