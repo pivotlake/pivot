@@ -36,8 +36,10 @@ mod infer;
 
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, RecordBatch, StructArray};
 use arrow_schema::{FieldRef, Schema};
+use dispatch::arrays::take::concat_chunks;
+use dispatch::memory::SlabAllocator;
 use parquet_variant_compute::{VariantArray, shred_variant, unshred_variant};
 
 use super::error::WriteResult;
@@ -45,15 +47,50 @@ use super::error::WriteResult;
 /// Fold every variant column of `batch` back to the plain `{metadata, value}`
 /// pair, dropping any typed leaves it arrived with. A batch whose variants are
 /// already unshredded (or which has none) is returned untouched.
-pub(crate) fn unshred_batch(batch: RecordBatch) -> WriteResult<RecordBatch> {
+pub(crate) fn unshred_batch(
+    batch: RecordBatch,
+    allocator: &mut SlabAllocator,
+) -> WriteResult<RecordBatch> {
     map_variant_columns(batch, |array| {
         // Already the plain pair: nothing to fold, and rebuilding it would copy
         // every document for nothing. This is the ingest path.
         if array.typed_value_field().is_none() {
             return Ok(None);
         }
-        Ok(Some(unshred_variant(array)?))
+        let unshredded = unshred_variant(array)?;
+        Ok(Some(copy_value_field_to_slabs(unshredded, allocator)?))
     })
+}
+
+/// Rebuilds an unshredded column's `value` field over slab memory.
+///
+/// [`unshred_variant`] reassembles each row's document with `parquet_variant`'s
+/// own builders, which write into a `Vec<u8>` on the global allocator. That
+/// buffer becomes the emitted array's data buffer and lives as long as the
+/// batch does, and a write holds every batch it has gathered so far, so a whole
+/// compaction's worth accumulates beside the buffer pool instead of inside it.
+/// Copying the finished column into slabs puts it on the same accounted,
+/// pre-faulted memory the rest of the dataflow runs on, and frees the `Vec` as
+/// soon as this returns, leaving only the batch in flight on the heap.
+///
+/// Only `value` is rebuilt. `metadata` is carried over from the input array,
+/// which the decoder already built in slab memory, so copying it would spend a
+/// second slab on bytes that are already accounted for.
+fn copy_value_field_to_slabs(
+    array: VariantArray,
+    allocator: &mut SlabAllocator,
+) -> WriteResult<VariantArray> {
+    let (fields, mut columns, nulls) = array.into_inner().into_parts();
+    let value_index = fields
+        .iter()
+        .position(|field| field.name() == "value")
+        .expect("an unshredded variant column has a value field");
+
+    let value = columns[value_index].clone();
+    columns[value_index] = concat_chunks(allocator, std::slice::from_ref(&value))?;
+
+    let rebuilt = StructArray::try_new(fields, columns, nulls)?;
+    Ok(VariantArray::try_new(&rebuilt)?)
 }
 
 /// One file's shredding decision: the widened schema its footer will
@@ -120,7 +157,7 @@ pub(super) fn shred_gathered_column(
 /// pay for this.
 fn map_variant_columns(
     batch: RecordBatch,
-    f: impl Fn(&VariantArray) -> WriteResult<Option<VariantArray>>,
+    mut f: impl FnMut(&VariantArray) -> WriteResult<Option<VariantArray>>,
 ) -> WriteResult<RecordBatch> {
     let schema = batch.schema();
     let variant_columns: Vec<usize> = (0..schema.fields().len())

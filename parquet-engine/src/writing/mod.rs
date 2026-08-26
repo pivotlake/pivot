@@ -66,6 +66,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
+use dispatch::memory::SlabAllocator;
 use dispatch::{
     DefaultUnaryFactory, OperatorFactory, OperatorSpec, OrderBy, RecordBatchOperatorSpec,
     node_work_queue, return_to_worker_mpsc, shared_work_queue, stealable, to_single_worker_mpsc,
@@ -176,7 +177,17 @@ pub fn encode_compaction_batches_spec(
 }
 
 pub fn unshred_batches_spec(spec: RecordBatchOperatorSpec) -> RecordBatchOperatorSpec {
-    spec.project(|| |batch| shredding::unshred_batch(batch).expect("a variant column reassembles"))
+    spec.project(|| {
+        // Built on the first batch rather than here: `SlabAllocator::new` takes
+        // a write buffer from the worker's memory context, which exists only
+        // once the worker is running. One allocator per worker, reused across
+        // batches so its part-filled slab carries over.
+        let mut allocator: Option<SlabAllocator> = None;
+        move |batch| {
+            let allocator = allocator.get_or_insert_with(|| SlabAllocator::new(false));
+            shredding::unshred_batch(batch, allocator).expect("a variant column reassembles")
+        }
+    })
 }
 
 fn sort_order(schema: &SchemaRef, sort_column_names: &[String]) -> Vec<OrderBy> {
