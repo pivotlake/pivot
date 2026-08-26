@@ -54,7 +54,9 @@ mod build;
 mod build_rows;
 mod directory;
 mod factory;
+mod key_bitset;
 pub use factory::JoinRecordBatchOperatorFactory;
+pub use key_bitset::{KeyBitset, MembershipFilterSlot};
 mod keys;
 pub use keys::{DynamicRowKey, JoinKey, PackedKey, SingleColumnKey};
 mod match_outputter;
@@ -162,7 +164,8 @@ pub struct JoinSpec {
 }
 
 /// One filter a join build publishes when it seals: the bounds of one build
-/// key column, into a pair of [`DynamicFilterSlot`]s consumer scans read.
+/// key column into a pair of [`DynamicFilterSlot`]s, and the key set itself
+/// as a [`KeyBitset`] when its shape allows one, all read by consumer scans.
 #[derive(Debug, Clone)]
 pub struct JoinBuildFilter {
     /// The build input column whose values are bounded (a join key column).
@@ -171,6 +174,9 @@ pub struct JoinBuildFilter {
     pub min_slot: Arc<DynamicFilterSlot>,
     /// Receives the largest non-null build key; consumers compare with `<=`.
     pub max_slot: Arc<DynamicFilterSlot>,
+    /// Receives the sealed key set as an exact membership filter; consumers
+    /// drop rows whose key it does not hold.
+    pub membership_slot: Arc<MembershipFilterSlot>,
 }
 
 /// One evaluation instance of a join's residual predicate: batch of paired

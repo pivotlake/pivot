@@ -11,7 +11,7 @@ use arrow_schema::{DataType, Field, Schema};
 use common::*;
 use dispatch::{
     AggregationKind, AggregationSlot, DynamicFilterSlot, JoinBuildFilter, JoinKind, JoinResidualFn,
-    JoinResidualSpec, JoinSpec, values_input,
+    JoinResidualSpec, JoinSpec, MembershipFilterSlot, values_input,
 };
 
 /// Non-nullable `Int64` output fields, which is what every column of these
@@ -1143,11 +1143,13 @@ fn a_build_filter_publishes_the_key_bounds() {
     let build = int64_batch("key", &[42, 7, 19]);
     let min_slot = Arc::new(DynamicFilterSlot::new());
     let max_slot = Arc::new(DynamicFilterSlot::new());
+    let membership_slot = Arc::new(MembershipFilterSlot::new());
     let mut spec = inner_join(vec![0], vec![0]);
     spec.build_filters = vec![JoinBuildFilter {
         build_column: 0,
         min_slot: min_slot.clone(),
         max_slot: max_slot.clone(),
+        membership_slot: membership_slot.clone(),
     }];
 
     let d = dispatch(2);
@@ -1160,6 +1162,11 @@ fn a_build_filter_publishes_the_key_bounds() {
 
     assert_eq!(boundary_i64(&min_slot), 7);
     assert_eq!(boundary_i64(&max_slot), 42);
+    let bitset = membership_slot.get().expect("sparse keys seal a bitset");
+    let mut survivors = Vec::new();
+    let probe_keys: ArrayRef = Arc::new(Int64Array::from(vec![6, 7, 19, 42, 43]));
+    bitset.select(&probe_keys, &mut survivors);
+    assert_eq!(survivors, vec![1, 2, 3]);
 }
 
 fn boundary_i64(slot: &DynamicFilterSlot) -> i64 {
@@ -1171,4 +1178,55 @@ fn boundary_i64(slot: &DynamicFilterSlot) -> i64 {
         .downcast_ref::<Int64Array>()
         .expect("an Int64 key publishes an Int64 bound")
         .value(0)
+}
+
+#[test]
+fn sparse_build_keys_join_exactly() {
+    // Sparse keys over a wide domain seal the probe's key bitset; only rows
+    // whose key the build side holds may come out.
+    let probe = int64_batch("key", &[3, 10_000, 42, 777, 5]);
+    let build = two_int64_batch(("key", "payload"), &[5, 10_000, 9_999], &[50, 100, 99]);
+
+    let d = dispatch(2);
+    let results = values_input(&d, vec![probe])
+        .record_batches()
+        .join(
+            values_input(&d, vec![build]).record_batches(),
+            &[DataType::Int64],
+            inner_join(vec![0], vec![1]),
+        )
+        .collect()
+        .unwrap();
+
+    let mut pairs: Vec<(i64, i64)> = collect_i64s(&results, 0)
+        .into_iter()
+        .zip(collect_i64s(&results, 1))
+        .collect();
+    pairs.sort();
+    assert_eq!(pairs, vec![(5, 50), (10_000, 100)]);
+}
+
+#[test]
+fn a_probe_anti_join_keeps_rows_a_key_filter_would_drop() {
+    // An anti join owes every non-matching probe row an output, so no key
+    // bitset is sealed for it even over sparse build keys.
+    let probe = int64_batch("key", &[1, 5_000, 9_999]);
+    let build = int64_batch("key", &[5_000]);
+    let mut spec = inner_join(vec![0], vec![]);
+    spec.kind = JoinKind::ProbeAnti;
+
+    let d = dispatch(2);
+    let results = values_input(&d, vec![probe])
+        .record_batches()
+        .join(
+            values_input(&d, vec![build]).record_batches(),
+            &[DataType::Int64],
+            spec,
+        )
+        .collect()
+        .unwrap();
+
+    let mut kept = collect_i64s(&results, 0);
+    kept.sort();
+    assert_eq!(kept, vec![1, 9_999]);
 }

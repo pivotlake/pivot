@@ -25,7 +25,9 @@ use crate::expression::Expression;
 use crate::types::Type;
 use crate::{Plan, PlanNode};
 use arrow_array::{ArrayRef, Datum, RecordBatch, Scalar, UInt32Array};
-use dispatch::{DataFlowDispatcher, DynamicFilterSlot, RecordBatchOperatorSpec};
+use dispatch::{
+    DataFlowDispatcher, DynamicFilterSlot, MembershipFilterSlot, RecordBatchOperatorSpec,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
@@ -39,7 +41,14 @@ use thiserror::Error;
 /// slots is minted on every compile, so a re-compiled plan never carries a stale
 /// boundary (or a slice of a previous run's pooled scan buffers) across
 /// executions.
-pub(crate) type DynamicFilterSlots = HashMap<usize, Arc<DynamicFilterSlot>>;
+#[derive(Default)]
+pub(crate) struct DynamicFilterSlots {
+    /// Boundary-value slots (Top-N limits, join key bounds), by slot id.
+    pub(crate) boundary: HashMap<usize, Arc<DynamicFilterSlot>>,
+    /// Membership slots (join key bitsets), by slot id — a separate id space
+    /// from `boundary`.
+    pub(crate) membership: HashMap<usize, Arc<MembershipFilterSlot>>,
+}
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -157,7 +166,7 @@ impl Plan {
         // DDL resolves through `transaction`. Scans carry their planning
         // snapshot. A cached plan reaches this compile only after the server
         // verifies that every recorded table revision matches this transaction.
-        let mut slots = DynamicFilterSlots::new();
+        let mut slots = DynamicFilterSlots::default();
         let compiled = self.root.compile(dispatcher, transaction, &mut slots)?;
         Ok(stamp_output_names(compiled, &self.output_names))
     }

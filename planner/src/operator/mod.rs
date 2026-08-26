@@ -65,7 +65,7 @@ pub use values::Values;
 use crate::compile::{self, DynamicFilterSlots};
 use crate::expression::{self, Expression};
 use crate::types::Type;
-use dispatch::DynamicFilterSlot;
+use dispatch::{DynamicFilterSlot, MembershipFilterSlot};
 use std::fmt;
 use std::sync::Arc;
 use thiserror::Error;
@@ -101,8 +101,22 @@ pub enum Error {
 pub(super) fn slot_for(slots: &mut DynamicFilterSlots, slot_id: usize) -> Arc<DynamicFilterSlot> {
     Arc::clone(
         slots
+            .boundary
             .entry(slot_id)
             .or_insert_with(|| Arc::new(DynamicFilterSlot::new())),
+    )
+}
+
+/// The membership twin of [`slot_for`], over its own id space.
+pub(super) fn membership_slot_for(
+    slots: &mut DynamicFilterSlots,
+    slot_id: usize,
+) -> Arc<MembershipFilterSlot> {
+    Arc::clone(
+        slots
+            .membership
+            .entry(slot_id)
+            .or_insert_with(|| Arc::new(MembershipFilterSlot::new())),
     )
 }
 

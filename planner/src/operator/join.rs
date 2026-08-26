@@ -17,7 +17,7 @@
 //! always keeps rows of its left child, the probe, because its cost model
 //! wants the subquery it came from, being the smaller side, on the build side.
 
-use super::slot_for;
+use super::{membership_slot_for, slot_for};
 use crate::compile::{DynamicFilterSlots, Error, ExprEvalFn};
 use crate::dynamic_filter::JoinProducedFilter;
 use crate::expression::Expression;
@@ -238,6 +238,7 @@ impl Join {
                 build_column: self.build_keys[filter.key_position],
                 min_slot: slot_for(slots, filter.min_slot_id),
                 max_slot: slot_for(slots, filter.max_slot_id),
+                membership_slot: membership_slot_for(slots, filter.membership_slot_id),
             })
             .collect();
         let spec = JoinSpec {
