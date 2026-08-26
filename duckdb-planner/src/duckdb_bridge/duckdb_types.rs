@@ -13,6 +13,7 @@ include_cpp! {
     #include "duckdb/common/enums/join_type.hpp"
     #include "duckdb/planner/table_filter.hpp"
     #include "duckdb/planner/bound_result_modifier.hpp"
+    #include "duckdb/parser/parsed_data/transaction_info.hpp"
     safety!(unsafe)
     generate!("duckdb::LogicalOperatorType")
     generate!("duckdb::LogicalTypeId")
@@ -22,6 +23,7 @@ include_cpp! {
     generate!("duckdb::TableFilterType")
     generate!("duckdb::LimitNodeType")
     generate!("duckdb::JoinType")
+    generate!("duckdb::TransactionType")
 }
 
 pub use ffi::duckdb::ExpressionType;
@@ -31,6 +33,7 @@ pub use ffi::duckdb::LogicalOperatorType;
 pub use ffi::duckdb::LogicalTypeId;
 pub use ffi::duckdb::OrderType;
 pub use ffi::duckdb::TableFilterType;
+pub use ffi::duckdb::TransactionType;
 
 use std::fmt;
 
@@ -87,6 +90,7 @@ impl_from_u8!(
     LimitNodeType,
     LogicalTypeId,
     OrderType,
+    TransactionType,
 );
 
 impl_named_format!(

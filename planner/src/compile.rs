@@ -134,6 +134,8 @@ pub enum Error {
         "COPY FROM STDIN compiles to no dataflow; the server drives the ingest from the protocol"
     )]
     CopyFromStdinNotCompilable,
+    #[error("BEGIN/COMMIT/ROLLBACK is a session command, not a compilable query")]
+    TransactionNotCompilable,
     #[error("CREATE USER does not take inputs")]
     UnexpectedCreateUserInputs,
     #[error("create user: {0}")]
@@ -322,6 +324,9 @@ impl PlanNode {
             // server runs them on the coordinator, never inside a dataflow.
             crate::Operator::Compact(_) => Err(Error::CompactNotCompilable),
             crate::Operator::CopyFromStdin(_) => Err(Error::CopyFromStdinNotCompilable),
+            // And BEGIN/COMMIT/ROLLBACK: the server answers them directly
+            // without compiling anything.
+            crate::Operator::Transaction(_) => Err(Error::TransactionNotCompilable),
             crate::Operator::CreateUser(o) => {
                 if !inputs.is_empty() {
                     return Err(Error::UnexpectedCreateUserInputs);

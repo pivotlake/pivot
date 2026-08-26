@@ -11,7 +11,9 @@
 use crate::catalog::CatalogTransaction;
 use crate::compile;
 use crate::expression::Expression;
-use crate::operator::{self, Compact, CopyFromStdin, Operator, OrderByDirection, SetVariable};
+use crate::operator::{
+    self, Compact, CopyFromStdin, Operator, OrderByDirection, SetVariable, TransactionStatement,
+};
 use crate::types::Type;
 use dispatch::{GroupLimit, RowDelivery};
 use std::fmt;
@@ -75,6 +77,7 @@ impl PlanNode {
             | Operator::SetVariable(_)
             | Operator::Compact(_)
             | Operator::CopyFromStdin(_)
+            | Operator::Transaction(_)
             | Operator::TableFunctionScan(_) => false,
             _ => true,
         };
@@ -383,6 +386,18 @@ impl Plan {
     pub fn as_copy_from_stdin(&self) -> Option<&CopyFromStdin> {
         match &self.root.operator {
             Operator::CopyFromStdin(copy) => Some(copy),
+            _ => None,
+        }
+    }
+
+    /// This plan as a `BEGIN`/`COMMIT`/`ROLLBACK` statement, if that's what it
+    /// is. Like a `SET`, the server checks this before compiling. Pivot
+    /// commits every statement individually, so the server answers these
+    /// without doing anything: they exist for PostgreSQL drivers that wrap
+    /// statements in a transaction by default.
+    pub fn as_transaction_stmt(&self) -> Option<TransactionStatement> {
+        match &self.root.operator {
+            Operator::Transaction(statement) => Some(*statement),
             _ => None,
         }
     }

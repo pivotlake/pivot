@@ -19,7 +19,7 @@ use dispatch::RowDelivery;
 use duckdb_planner::BoundLogicalType;
 use duckdb_planner::Expr;
 use duckdb_planner::LogicalOp;
-use duckdb_planner::duckdb_bridge::duckdb_types::{ExpressionType, JoinType};
+use duckdb_planner::duckdb_bridge::duckdb_types::{ExpressionType, JoinType, TransactionType};
 use duckdb_planner::handle::{
     ComparisonJoin as ComparisonJoinView, DelimGet as DelimGetView, DelimJoin as DelimJoinView,
     JoinCondition, JoinConditionEntry, Operator as DuckOperator, PushedConditions,
@@ -33,7 +33,7 @@ use crate::operator::{
     Aggregate, Compact, CopyFromStdin, CreateSchema, CreateTable, CreateUser, Cte, CteScan,
     Distinct, DropTable, DummyScan, Error as OperatorError, Explain, Filter, Input, Insert, Join,
     JoinKind, Limit, Materialize, Operator, OrderBy, Projection, SetVariable, TableFunctionScan,
-    TopN, Values,
+    TopN, TransactionStatement, Values,
 };
 use crate::plan::{self, PlanNode};
 use crate::types::{Type, physical_arrow_type, type_from_logical};
@@ -189,6 +189,17 @@ fn build_node(op: LogicalOp<'_>, ctx: &mut BuildCtx) -> Result<PlanNode, Operato
         }
         DuckOperator::Set(s) => Operator::SetVariable(SetVariable::from_set(s)?),
         DuckOperator::Reset(r) => Operator::SetVariable(SetVariable::from_reset(r)?),
+        DuckOperator::Transaction(t) => Operator::Transaction(match t.transaction_type()? {
+            TransactionType::BEGIN_TRANSACTION => TransactionStatement::Begin,
+            TransactionType::COMMIT => TransactionStatement::Commit,
+            TransactionType::ROLLBACK => TransactionStatement::Rollback,
+            other => {
+                return Err(OperatorError::Unsupported(format!(
+                    "unsupported transaction statement type {}",
+                    other as u8
+                )));
+            }
+        }),
         DuckOperator::Compact(c) => Operator::Compact(Compact::from_handle(c)?),
         DuckOperator::CopyFromStdin(c) => Operator::CopyFromStdin(CopyFromStdin::from_handle(c)?),
         DuckOperator::CreateUser(c) => Operator::CreateUser(CreateUser::from_handle(c)?),

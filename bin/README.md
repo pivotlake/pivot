@@ -254,6 +254,11 @@ The server speaks the PostgreSQL v3 wire protocol. Any Postgres client works, fo
 psql -h 127.0.0.1 -p 5432 -U analytics
 ```
 
+Every statement commits individually. `BEGIN`, `COMMIT`, and `ROLLBACK` are
+accepted with their usual tags so drivers that wrap statements in a
+transaction by default can work, but they group nothing: statements between
+`BEGIN` and `ROLLBACK` are already committed and stay.
+
 SCRAM users prove their password without sending it over the wire. Trusted users
 connect without a password. The built-in configuration therefore connects as:
 

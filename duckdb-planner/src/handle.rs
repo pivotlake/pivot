@@ -26,6 +26,7 @@ use cxx::UniquePtr;
 use crate::catalog_provider::OptionalTableWrapper;
 use crate::duckdb_bridge::duckdb_types::{
     ExpressionType, JoinType, LimitNodeType, LogicalOperatorType, LogicalTypeId, OrderType,
+    TransactionType,
 };
 use crate::duckdb_bridge::ffi;
 use crate::types::{BoundLogicalType, ScalarValue};
@@ -220,6 +221,7 @@ impl<'plan> LogicalOp<'plan> {
             L::LOGICAL_DROP => Operator::Drop(Drop { raw: self.raw }),
             L::LOGICAL_SET => Operator::Set(Set { raw: self.raw }),
             L::LOGICAL_RESET => Operator::Reset(Reset { raw: self.raw }),
+            L::LOGICAL_TRANSACTION => Operator::Transaction(Transaction { raw: self.raw }),
             L::LOGICAL_COMPACT => Operator::Compact(Compact { raw: self.raw }),
             L::LOGICAL_COPY_FROM_STDIN => Operator::CopyFromStdin(CopyFromStdin { raw: self.raw }),
             L::LOGICAL_CREATE_USER => Operator::CreateUser(CreateUser { raw: self.raw }),
@@ -268,6 +270,8 @@ pub enum Operator<'plan> {
     Set(Set<'plan>),
     /// `RESET name`.
     Reset(Reset<'plan>),
+    /// `BEGIN`, `COMMIT` or `ROLLBACK`.
+    Transaction(Transaction<'plan>),
     /// `COMPACT <table> [FINAL]`.
     Compact(Compact<'plan>),
     /// `COPY <table> [(columns)] FROM STDIN [WITH (...)]`.
@@ -347,6 +351,9 @@ define_handles! { ffi::LogicalOperator;
     Set,
     /// A `LogicalReset`: `RESET name`.
     Reset,
+    /// A `LogicalSimple` for `BEGIN`/`COMMIT`/`ROLLBACK` carrying DuckDB's
+    /// `TransactionInfo`.
+    Transaction,
     /// A `LogicalCompact`: `COMPACT <table> [FINAL]`.
     Compact,
     /// A `LogicalCopyFromStdin`: `COPY <table> [(columns)] FROM STDIN [WITH (...)]`.
@@ -826,6 +833,15 @@ impl<'plan> Set<'plan> {
 impl<'plan> Reset<'plan> {
     pub fn name(self) -> Result<String> {
         Ok(ffi::lo_reset_name(self.raw)?)
+    }
+}
+
+impl<'plan> Transaction<'plan> {
+    /// Which transaction statement this is.
+    pub fn transaction_type(self) -> Result<TransactionType> {
+        Ok(TransactionType::from_u8(ffi::lo_transaction_type(
+            self.raw,
+        )?))
     }
 }
 
