@@ -31,12 +31,21 @@ pub struct ResultColumn {
 /// A statement that completed without returning a row set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
-    Insert { rows: usize },
+    Insert {
+        rows: usize,
+    },
     CreateTable,
     CreateSchema,
     CreateUser,
     DropTable,
     Compact,
+    /// `BEGIN`, `COMMIT` or `ROLLBACK`, answered without doing anything:
+    /// every statement commits individually, so there is no transaction to
+    /// open or resolve. Accepted so PostgreSQL drivers that wrap statements
+    /// in a transaction by default can work.
+    Begin,
+    Commit,
+    Rollback,
 }
 
 impl Command {
@@ -49,6 +58,9 @@ impl Command {
             Self::CreateUser => "CREATE USER".to_string(),
             Self::DropTable => "DROP TABLE".to_string(),
             Self::Compact => "COMPACT".to_string(),
+            Self::Begin => "BEGIN".to_string(),
+            Self::Commit => "COMMIT".to_string(),
+            Self::Rollback => "ROLLBACK".to_string(),
         }
     }
 }

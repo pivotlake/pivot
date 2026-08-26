@@ -25,6 +25,7 @@
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/planner/operator/logical_simple.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/parser/parsed_data/transaction_info.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_delim_get.hpp"
 #include "duckdb/planner/operator/logical_materialized_cte.hpp"
@@ -900,6 +901,12 @@ rust::String lo_set_value(const LogicalOperator &op) {
 
 rust::String lo_reset_name(const LogicalOperator &op) {
 	return rust::String::lossy(as<duckdb::LogicalReset>(op).name);
+}
+
+// ---- Transaction ----
+
+uint8_t lo_transaction_type(const LogicalOperator &op) {
+	return static_cast<uint8_t>(as<duckdb::LogicalSimple>(op).info->Cast<duckdb::TransactionInfo>().type);
 }
 
 // ---- Compact ----

@@ -22,6 +22,7 @@ use dataflow::{
     StatementHandle, StatementKind, StatementResults, affected_rows,
     affected_rows_from_record_batch, collect_handle, execute_compact, result_columns,
 };
+use planner::operator::TransactionStatement;
 use planning::{PlanCache, plan_query};
 
 pub use copy::CopyIngest;
@@ -112,6 +113,7 @@ impl Executor {
         if plan.as_set_variable().is_some()
             || plan.as_compact().is_some()
             || plan.as_copy_from_stdin().is_some()
+            || plan.as_transaction_stmt().is_some()
         {
             return Ok(None);
         }
@@ -146,6 +148,25 @@ impl Executor {
                     name: set.name.clone(),
                     value: set.value.clone(),
                 },
+                stats: ExecutionStats {
+                    plan: plan_time,
+                    ..ExecutionStats::default()
+                },
+            });
+        }
+
+        // BEGIN/COMMIT/ROLLBACK are answered without doing anything: every
+        // statement commits individually, so there is no transaction to open
+        // or resolve. PostgreSQL drivers that wrap statements in a transaction
+        // by default get their expected tags, but no statement grouping: work
+        // done between a BEGIN and a ROLLBACK is already committed and stays.
+        if let Some(statement) = plan.as_transaction_stmt() {
+            return Ok(Execution {
+                output: StatementOutput::Command(match statement {
+                    TransactionStatement::Begin => Command::Begin,
+                    TransactionStatement::Commit => Command::Commit,
+                    TransactionStatement::Rollback => Command::Rollback,
+                }),
                 stats: ExecutionStats {
                     plan: plan_time,
                     ..ExecutionStats::default()

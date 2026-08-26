@@ -1670,3 +1670,39 @@ async fn compact_accepts_a_fully_qualified_table_name(#[future] conn: Conn) {
     let rows = select_rows(&conn, "SELECT COUNT(*) FROM compact_qualified").await;
     assert_eq!(rows, vec![vec![Some("100".into())]]);
 }
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn transaction_statements_are_accepted(#[future] conn: Conn) {
+    conn.simple_query("BEGIN").await.unwrap();
+    conn.simple_query("COMMIT").await.unwrap();
+    conn.simple_query("ROLLBACK").await.unwrap();
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn transaction_statements_work_over_the_extended_protocol(#[future] conn: Conn) {
+    let affected = conn.execute("BEGIN", &[]).await.unwrap();
+
+    assert_eq!(affected, 0);
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn statements_between_begin_and_rollback_stay_committed(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE transaction_noop (id BIGINT)")
+        .await
+        .unwrap();
+
+    conn.simple_query("BEGIN").await.unwrap();
+    conn.simple_query("INSERT INTO transaction_noop VALUES (1)")
+        .await
+        .unwrap();
+    conn.simple_query("ROLLBACK").await.unwrap();
+
+    let count = single_value(&conn, "SELECT COUNT(*) FROM transaction_noop").await;
+    assert_eq!(count, "1");
+}

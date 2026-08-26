@@ -11,6 +11,7 @@ statement. The table below is the SQL surface implemented by pivotdb today.
 
 | Statement | Purpose | Supported form and notes |
 | --- | --- | --- |
+| `BEGIN` / `COMMIT` / `ROLLBACK` | Accepted for driver compatibility; they do nothing. | Every statement commits individually. These answer with their usual tags so Postgres drivers that wrap statements in a transaction by default can work, but they provide no grouping: statements between `BEGIN` and `ROLLBACK` are already committed and stay. |
 | `COMPACT` | Merge a table's small parquet files. | `COMPACT [datastore.][schema.]table [FINAL]`. Without `FINAL`, pivotdb runs one sweep. `FINAL` repeats until a sweep finds nothing else to merge. |
 | `COPY` | Stream rows from a client into a table. | `COPY table [(columns)] FROM STDIN WITH (FORMAT arrow)`. Arrow IPC is the only supported format. Columns omitted from an explicit target list are filled with `NULL`. |
 | `CREATE SCHEMA` | Create a namespace for tables. | `CREATE SCHEMA [IF NOT EXISTS] [datastore.]schema`. `OR REPLACE` is not supported. |

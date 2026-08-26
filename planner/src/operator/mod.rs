@@ -35,6 +35,7 @@ mod projection;
 mod set_variable;
 mod table_function;
 mod top_n;
+mod transaction;
 mod values;
 
 pub use aggregate::Aggregate;
@@ -60,6 +61,7 @@ pub use set_variable::SetVariable;
 pub use table_function::{TableFunction, TableFunctionScan, TableFunctionSignature};
 pub(crate) use table_function::{built_in_table_function, built_in_table_function_defs};
 pub use top_n::TopN;
+pub use transaction::TransactionStatement;
 pub use values::Values;
 
 use crate::compile::{self, DynamicFilterSlots};
@@ -137,6 +139,8 @@ pub enum Operator {
     Compact(Compact),
     /// `COPY <table> FROM STDIN` — handled by the server, not compiled.
     CopyFromStdin(CopyFromStdin),
+    /// `BEGIN`/`COMMIT`/`ROLLBACK`, answered by the server, not compiled.
+    Transaction(TransactionStatement),
     /// Late-materialization fetch (synthesized by the rewrite, see [`Materialize`]).
     Materialize(Materialize),
     /// `EXPLAIN <query>`: renders its child plan as text (see [`Explain`]).
@@ -220,7 +224,8 @@ impl Operator {
             | Operator::CreateUser(_)
             | Operator::SetVariable(_)
             | Operator::Compact(_)
-            | Operator::CopyFromStdin(_) => Ok(Vec::new()),
+            | Operator::CopyFromStdin(_)
+            | Operator::Transaction(_) => Ok(Vec::new()),
         }
     }
 
@@ -314,7 +319,8 @@ impl Operator {
             | Operator::CreateUser(_)
             | Operator::SetVariable(_)
             | Operator::Compact(_)
-            | Operator::CopyFromStdin(_) => Vec::new(),
+            | Operator::CopyFromStdin(_)
+            | Operator::Transaction(_) => Vec::new(),
         }
     }
 }
@@ -346,6 +352,7 @@ impl fmt::Display for Operator {
             Operator::SetVariable(s) => write!(f, "{s}"),
             Operator::Compact(c) => write!(f, "{c}"),
             Operator::CopyFromStdin(c) => write!(f, "{c}"),
+            Operator::Transaction(t) => write!(f, "{t}"),
             Operator::Materialize(m) => write!(f, "{m}"),
             Operator::Explain(e) => write!(f, "{e}"),
             Operator::Cte(c) => write!(f, "{c}"),

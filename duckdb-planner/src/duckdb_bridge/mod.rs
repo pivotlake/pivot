@@ -386,6 +386,12 @@ pub mod ffi {
         fn lo_set_value(op: &LogicalOperator) -> Result<String>;
         fn lo_reset_name(op: &LogicalOperator) -> Result<String>;
 
+        // ---- Transaction ----
+        /// The `TransactionType` discriminant carried by the
+        /// `LOGICAL_TRANSACTION`'s `TransactionInfo` (BEGIN, COMMIT or
+        /// ROLLBACK).
+        fn lo_transaction_type(op: &LogicalOperator) -> Result<u8>;
+
         // ---- Compact ----
         /// The datastore `COMPACT db.s.t` named, or empty when unqualified.
         fn lo_compact_datastore(op: &LogicalOperator) -> Result<String>;
