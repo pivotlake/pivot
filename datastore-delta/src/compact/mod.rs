@@ -54,8 +54,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
-use crate::delta::manifest::DeltaFileEntry;
-use crate::delta::{CatalogTable, DeltaDatastore, FileRef, scalar_values_equal};
+use crate::manifest::DeltaFileEntry;
+use crate::{CatalogTable, DeltaDatastore, FileRef, scalar_values_equal};
 use object_storage::ObjectPath;
 use planner::catalog::SchemaQualifiedTableName;
 
@@ -113,7 +113,7 @@ pub struct MaintenanceConfig {
     /// remote-store deployment where another process owns physical cleanup).
     /// Deletes tombstoned data files and superseded commit JSONs past their
     /// retention.
-    pub vacuum: Option<crate::delta::vacuum::VacuumConfig>,
+    pub vacuum: Option<crate::vacuum::VacuumConfig>,
 }
 
 /// Tuning for a datastore's self-managed compaction loop.
@@ -143,7 +143,7 @@ struct CompactionCommand {
     name: SchemaQualifiedTableName,
     table: CatalogTable,
     final_sweep: bool,
-    result: oneshot::Sender<crate::delta::Result<u64>>,
+    result: oneshot::Sender<crate::Result<u64>>,
 }
 
 pub(crate) struct CompacterActor {
@@ -189,7 +189,7 @@ impl CompacterHandle {
         name: SchemaQualifiedTableName,
         table: CatalogTable,
         final_sweep: bool,
-    ) -> crate::delta::Result<u64> {
+    ) -> crate::Result<u64> {
         let (result, answer) = oneshot::channel();
         self.commands
             .send(CompactionCommand {
@@ -198,10 +198,8 @@ impl CompacterHandle {
                 final_sweep,
                 result,
             })
-            .map_err(|_| crate::delta::Error::CompacterStopped)?;
-        answer
-            .await
-            .map_err(|_| crate::delta::Error::CompacterStopped)?
+            .map_err(|_| crate::Error::CompacterStopped)?;
+        answer.await.map_err(|_| crate::Error::CompacterStopped)?
     }
 }
 
@@ -256,7 +254,7 @@ impl CompacterActor {
         name: &SchemaQualifiedTableName,
         mut table: CatalogTable,
         final_sweep: bool,
-    ) -> crate::delta::Result<(CatalogTable, u64)> {
+    ) -> crate::Result<(CatalogTable, u64)> {
         let mut sweeps = 0;
         let apply_guards = !final_sweep;
         loop {
@@ -290,7 +288,7 @@ impl CompacterActor {
         id: uuid::Uuid,
         inputs: Vec<FileRef>,
         kind: MergeKind,
-    ) -> crate::delta::Result<CatalogTable> {
+    ) -> crate::Result<CatalogTable> {
         let input_sizes: Vec<u64> = inputs.iter().map(|file| file.size).collect();
         // `spawn_blocking` needs a `'static` closure, so it gets its own
         // datastore handle rather than a borrow of `self`.
@@ -307,11 +305,11 @@ impl CompacterActor {
             )?;
             let committed = datastore
                 .table_handle_by_id(&id)
-                .ok_or_else(|| crate::delta::Error::TableNotFound(id.to_string()))?;
-            Ok::<_, crate::delta::Error>((merged, committed))
+                .ok_or_else(|| crate::Error::TableNotFound(id.to_string()))?;
+            Ok::<_, crate::Error>((merged, committed))
         })
         .await
-        .map_err(|error| crate::delta::Error::CompactionJobPanicked(error.to_string()))??;
+        .map_err(|error| crate::Error::CompactionJobPanicked(error.to_string()))??;
         let output_sizes: Vec<u64> = merged.iter().map(|file| file.size).collect();
         info!(
             table = %name,
@@ -333,7 +331,7 @@ impl CompacterActor {
     /// uses the balance test, repeatedly discarding its largest file until the
     /// remainder is balanced enough to merge or no useful group remains.
     fn next_small_batch(&self, table: &CatalogTable, apply_guards: bool) -> Option<Vec<FileRef>> {
-        let mut by_partition: Vec<(Option<crate::delta::PartitionValues>, Vec<&DeltaFileEntry>)> =
+        let mut by_partition: Vec<(Option<crate::PartitionValues>, Vec<&DeltaFileEntry>)> =
             Vec::new();
         for entry in table.file_entries() {
             if !is_small_file(entry.file.size, self.target_bytes) {
@@ -374,7 +372,7 @@ impl CompacterActor {
             return None;
         }
 
-        let mut by_partition: Vec<(Option<crate::delta::PartitionValues>, Vec<&DeltaFileEntry>)> =
+        let mut by_partition: Vec<(Option<crate::PartitionValues>, Vec<&DeltaFileEntry>)> =
             Vec::new();
         for entry in table.file_entries() {
             if is_small_file(entry.file.size, self.target_bytes) {
@@ -491,7 +489,7 @@ pub fn compact_table_files(
     id: uuid::Uuid,
     inputs: &[FileRef],
     target_rows_per_group: usize,
-) -> Result<Vec<FileRef>, crate::delta::Error> {
+) -> Result<Vec<FileRef>, crate::Error> {
     compact_table_files_with_max_output_size(datastore, id, inputs, target_rows_per_group, None)
 }
 
@@ -501,10 +499,10 @@ fn compact_table_files_with_max_output_size(
     inputs: &[FileRef],
     target_rows_per_group: usize,
     max_output_file_size: Option<u64>,
-) -> Result<Vec<FileRef>, crate::delta::Error> {
+) -> Result<Vec<FileRef>, crate::Error> {
     let table = datastore
         .table_handle_by_id(&id)
-        .ok_or_else(|| crate::delta::Error::TableNotFound(id.to_string()))?;
+        .ok_or_else(|| crate::Error::TableNotFound(id.to_string()))?;
     let merged = table.merge_files(inputs, target_rows_per_group, max_output_file_size)?;
 
     let files: Vec<FileRef> = merged.iter().map(|file| file.file_ref().clone()).collect();
@@ -526,8 +524,8 @@ fn compact_table_files_with_max_output_size(
 }
 
 fn partition_values_equal(
-    left: &Option<crate::delta::PartitionValues>,
-    right: &Option<crate::delta::PartitionValues>,
+    left: &Option<crate::PartitionValues>,
+    right: &Option<crate::PartitionValues>,
 ) -> bool {
     match (left, right) {
         (None, None) => true,
@@ -539,7 +537,7 @@ fn partition_values_equal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::delta::DeltaDatastore;
+    use crate::DeltaDatastore;
     use arrow_array::{ArrayRef, Int64Array, RecordBatch, Scalar};
     use arrow_schema::{DataType, Field, Schema};
     use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
@@ -703,7 +701,7 @@ mod tests {
         dir: Option<&Path>,
         sorted: bool,
     ) {
-        use crate::datastore::DatastoreTransaction as _;
+        use catalog::datastore::DatastoreTransaction as _;
         use planner::catalog::{Column, CreateTableRequest};
         let mut options = match dir {
             Some(dir) => std::collections::HashMap::from([(
@@ -748,7 +746,7 @@ mod tests {
         name: &str,
         dir: &Path,
     ) {
-        use crate::datastore::DatastoreTransaction as _;
+        use catalog::datastore::DatastoreTransaction as _;
         use planner::catalog::{Column, CreateTableRequest};
         let request = CreateTableRequest {
             datastore_name: None,
@@ -807,7 +805,7 @@ mod tests {
         dispatcher: &DataFlowDispatcher,
         name: &str,
     ) {
-        use crate::datastore::DatastoreTransaction as _;
+        use catalog::datastore::DatastoreTransaction as _;
         use planner::catalog::{Column, CreateTableRequest};
         let request = CreateTableRequest {
             datastore_name: None,
@@ -845,7 +843,7 @@ mod tests {
             .unwrap();
     }
 
-    fn partition_value(value: i64) -> crate::delta::PartitionValues {
+    fn partition_value(value: i64) -> crate::PartitionValues {
         std::collections::HashMap::from([(
             "Partition".to_string(),
             Scalar::new(Arc::new(Int64Array::from(vec![value])) as ArrayRef),

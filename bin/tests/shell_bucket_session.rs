@@ -6,7 +6,7 @@
 use arrow_array::{Array, Int64Array};
 use bin::execution::{ExecuteOptions, StatementOutput};
 use bin::shell::ShellInstance;
-use catalog::test_support;
+use datastore_delta::test_support;
 
 #[test]
 fn a_datastore_is_opened_on_an_s3_uri() {

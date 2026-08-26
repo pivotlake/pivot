@@ -18,8 +18,8 @@ use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
 use catalog::datastore::DatastoreTransaction as _;
-use catalog::delta::{DEFAULT_VACUUM_POLL, DeltaDatastore, Vacuumer};
 use common::{DispatchGuard, commit_datastore_transaction, dispatch, table_dir};
+use datastore_delta::{DEFAULT_VACUUM_POLL, DeltaDatastore, Vacuumer};
 use planner::catalog::{Column, CreateTableRequest, SchemaQualifiedTableName};
 
 const EIGHT_DAYS_MS: u64 = 8 * 24 * 60 * 60 * 1000;
@@ -173,7 +173,7 @@ fn compaction_merges_adopted_files_without_deleting_them() {
     assert_eq!(inputs.len(), 2, "both adopted files are live");
 
     let id = datastore.table_handle(&name).unwrap().id();
-    catalog::delta::compact_table_files(&datastore, id, &inputs, 128 * 1024).unwrap();
+    datastore_delta::compact_table_files(&datastore, id, &inputs, 128 * 1024).unwrap();
     Arc::new(Vacuumer::new(DEFAULT_VACUUM_POLL, datastore.clone()))
         .vacuum_all(now_ms() + EIGHT_DAYS_MS);
 

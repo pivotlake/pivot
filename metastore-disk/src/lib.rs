@@ -112,14 +112,14 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use catalog::Datastore;
-use catalog::delta::{
-    CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL, DEFAULT_MIN_FILES_TO_MERGE,
-    DEFAULT_VACUUM_POLL, DeltaDatastore, MaintenanceConfig, VacuumConfig,
-    default_merge_target_bytes,
-};
 use catalog::metastore::{
     DEFAULT_USER_NAME, Metastore, SCRAM_ITERATIONS, SCRAM_SALT_LEN, ScramVerifier, UserAuth,
     format_scram_verifier, parse_scram_verifier,
+};
+use datastore_delta::{
+    CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL, DEFAULT_MIN_FILES_TO_MERGE,
+    DEFAULT_VACUUM_POLL, DeltaDatastore, MaintenanceConfig, VacuumConfig,
+    default_merge_target_bytes,
 };
 use dispatch::DataFlowDispatcher;
 use object_storage::{
@@ -468,7 +468,7 @@ pub enum Error {
     #[error(transparent)]
     Store(#[from] object_storage::StoreError),
     #[error(transparent)]
-    Delta(#[from] catalog::delta::Error),
+    Delta(#[from] datastore_delta::Error),
 }
 
 /// The datastores and users of a metastore, as written: the config file's
@@ -711,7 +711,7 @@ impl DatastoreConfig {
 mod tests {
     use super::*;
     use catalog::DEFAULT_DATASTORE_NAME;
-    use catalog::delta::DEFAULT_REFRESH_INTERVAL;
+    use datastore_delta::DEFAULT_REFRESH_INTERVAL;
     use std::io::Write;
     use std::time::Duration;
 

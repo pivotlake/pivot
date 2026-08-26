@@ -18,8 +18,8 @@ use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
 use catalog::datastore::DatastoreTransaction as _;
-use catalog::delta::{DEFAULT_VACUUM_POLL, DeltaDatastore, Vacuumer};
 use common::{DispatchGuard, commit_datastore_transaction, dispatch, table_dir};
+use datastore_delta::{DEFAULT_VACUUM_POLL, DeltaDatastore, Vacuumer};
 use planner::catalog::{
     Column, CreateTableRequest, DropTableRequest, Result as CatalogResult, SchemaQualifiedTableName,
 };

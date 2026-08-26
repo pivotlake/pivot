@@ -302,8 +302,8 @@ fn format_panic_payload(payload: &Box<dyn std::any::Any + Send>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use catalog::delta::DeltaDatastore;
     use catalog::{DEFAULT_DATASTORE_NAME, Datastore};
+    use datastore_delta::DeltaDatastore;
     use std::collections::HashMap;
     use tokio::sync::oneshot;
 

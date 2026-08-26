@@ -3,9 +3,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use catalog::delta::DeltaDatastore;
 use catalog::metastore::{Metastore, UserAuth};
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
+use datastore_delta::DeltaDatastore;
 use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
 use object_storage::AmbientExternalStoreFactory;
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};

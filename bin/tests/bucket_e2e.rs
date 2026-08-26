@@ -15,12 +15,12 @@ use std::sync::Arc;
 use std::thread;
 
 use bin::server::Server;
-use catalog::delta::DeltaDatastore;
-use catalog::test_support::{self, Backend};
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
 use common::{
     connect_client, parquet_name_value_rows, pick_free_port, pivot_metastore, wait_until_listening,
 };
+use datastore_delta::DeltaDatastore;
+use datastore_delta::test_support::{self, Backend};
 use dispatch::Dispatch;
 use object_storage::ObjectPath;
 use tokio_postgres::{Client, SimpleQueryMessage};

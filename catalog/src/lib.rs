@@ -4,7 +4,6 @@
 //!   named data source and the per-query snapshot it opens.
 //! - [`metastore`]: the [`Metastore`] trait, the server's source of which
 //!   datastores it serves and which users may log in.
-//! - [`delta`]: the Delta Lake datastore backend, backed by Parquet data files.
 //! - [`system`]: the read-only `system` datastore describing the server's own
 //!   catalog.
 //! - this root, the **cross-datastore catalog**: the layer that presents the set
@@ -24,14 +23,8 @@
 //! blocking store I/O or is an in-memory no-op.
 
 pub mod datastore;
-pub mod delta;
 pub mod metastore;
 pub mod system;
-/// A Docker-backed object-store test harness (MinIO) plus Delta test helpers.
-/// Gated behind the `test-support` feature so it, and its heavy testcontainers
-/// deps, never enter a normal build.
-#[cfg(feature = "test-support")]
-pub mod test_support;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -50,7 +43,7 @@ use planner::catalog::{
 use system::{DatastoreEntry, SystemTransaction};
 
 /// One named data source served by pivotdb. Re-exported from [`datastore`],
-/// where the trait lives; concrete backends (e.g. [`delta::DeltaDatastore`])
+/// where the trait lives; concrete backends (e.g. `datastore_delta::DeltaDatastore`)
 /// implement it and are held here behind `Arc<dyn Datastore>`.
 pub use datastore::Datastore;
 
@@ -478,10 +471,62 @@ impl UserCreation for PivotUserCreation {
 
 #[cfg(test)]
 mod tests {
+    use std::any::Any;
+
     use super::*;
-    use crate::delta::DeltaDatastore;
+    use crate::datastore::DatastoreTableMetadata;
     use crate::metastore::{DEFAULT_USER_NAME, UserAuth};
-    use dispatch::Dispatch;
+    use planner::catalog::SchemaQualifiedTableName;
+
+    /// A datastore holding no tables: enough for the composite to register it
+    /// and hand it back by name.
+    #[derive(Debug)]
+    struct EmptyDatastore;
+
+    #[derive(Debug)]
+    struct EmptyTransaction;
+
+    #[async_trait]
+    impl DatastoreTransaction for EmptyTransaction {
+        fn does_schema_exist(&self, schema: &str) -> bool {
+            schema == planner::DEFAULT_SCHEMA_NAME
+        }
+
+        fn bind_table(
+            &self,
+            _datastore: &str,
+            _name: &SchemaQualifiedTableName,
+        ) -> Option<Box<dyn BoundTable>> {
+            None
+        }
+
+        fn table_revision(&self, _name: &SchemaQualifiedTableName) -> Option<TableRevision> {
+            None
+        }
+
+        fn tables(&self) -> Vec<DatastoreTableMetadata> {
+            Vec::new()
+        }
+    }
+
+    #[async_trait]
+    impl Datastore for EmptyDatastore {
+        fn begin_transaction(self: Arc<Self>) -> Arc<dyn DatastoreTransaction> {
+            Arc::new(EmptyTransaction)
+        }
+
+        fn kind(&self) -> &'static str {
+            "empty"
+        }
+
+        fn data_path(&self) -> String {
+            "memory://".to_string()
+        }
+
+        fn into_any_arc(self: Arc<Self>) -> Arc<dyn Any + Send + Sync> {
+            self
+        }
+    }
 
     /// A metastore serving no datastores and only the built-in trusted user:
     /// the catalogs here get their datastores handed in directly.
@@ -521,11 +566,7 @@ mod tests {
 
     #[test]
     fn one_datastore_catalog_exposes_the_datastore() {
-        let dispatch = Dispatch::spin_up(1, 32, None);
-        let directory = tempfile::tempdir().unwrap();
-        let datastore: Arc<dyn Datastore> =
-            DeltaDatastore::open(&directory.path().to_string_lossy(), dispatch.dispatcher())
-                .unwrap();
+        let datastore: Arc<dyn Datastore> = Arc::new(EmptyDatastore);
 
         let catalog = PivotCatalog::new(
             HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),
@@ -536,6 +577,5 @@ mod tests {
 
         assert_eq!(catalog.default_datastore_name(), DEFAULT_DATASTORE_NAME);
         assert!(catalog.get_datastore(DEFAULT_DATASTORE_NAME).is_some());
-        dispatch.exit();
     }
 }

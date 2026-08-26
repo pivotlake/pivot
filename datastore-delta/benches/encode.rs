@@ -61,9 +61,9 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use criterion::{BatchSize, Criterion, Throughput, black_box};
 use parquet_variant_compute::{VariantArray, json_to_variant};
 
-use catalog::delta::DeltaDatastore;
 use catalog::metastore::{DEFAULT_USER_NAME, Metastore, UserAuth};
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
+use datastore_delta::DeltaDatastore;
 use dispatch::{Dispatch, RECORD_BATCH_SIZE, values_input};
 use planner::catalog::{Column, CreateTableRequest, SchemaQualifiedTableName, TableReference};
 use planner::types::{Type, physical_arrow_type};

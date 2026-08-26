@@ -16,7 +16,7 @@ use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
 use catalog::datastore::DatastoreTransaction;
-use catalog::delta::DeltaDatastore;
+use datastore_delta::DeltaDatastore;
 use dispatch::Projection;
 use parquet_engine::table_input;
 use planner::DEFAULT_DATASTORE_NAME;
