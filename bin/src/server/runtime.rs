@@ -191,6 +191,8 @@ pub fn run(options: ServerOptions) -> Result<(), Error> {
         });
     }
     let dispatch = Dispatch::spin_up(workers, pool_bytes / BUFFER_SIZE, disk_cache);
+    #[cfg(feature = "memwatch")]
+    crate::server::memwatch::spawn();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)

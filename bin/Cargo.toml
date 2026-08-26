@@ -46,6 +46,9 @@ sysinfo = { workspace = true }
 # The shell's line editor and column layout.
 rustyline = { version = "18", default-features = false }
 unicode-width = { workspace = true }
+# Only pulled in by the `memwatch` feature: reads jemalloc's statistics and
+# dumps its heap profiles (see `memwatch`).
+tikv-jemalloc-ctl = { version = "0.6", optional = true }
 # Only pulled in by the `perf` feature, for SIGINT-ing the `perf record` child
 # so it flushes its report (a plain `Child::kill` would SIGKILL and lose it).
 libc = { workspace = true, optional = true }
@@ -61,6 +64,12 @@ nix = { version = "0.31.2", features = ["resource"] }
 # is compiled out and `SET perf = 1` is an accepted no-op, so there is no
 # overhead in a normal build.
 perf = ["dep:libc", "dispatch/perf"]
+# Diagnostics-only memory watch: when on, setting `PIVOT_MEMWATCH_DIR` makes
+# the server log its resident size and jemalloc counters periodically and dump
+# a jemalloc heap profile whenever live heap sets a new high-water mark (see
+# `memwatch`). Builds jemalloc with statistics and profiling support, which a
+# normal build leaves out.
+memwatch = ["dep:tikv-jemalloc-ctl", "dispatch/heap-profiling"]
 
 [dev-dependencies]
 tokio-postgres = { workspace = true }

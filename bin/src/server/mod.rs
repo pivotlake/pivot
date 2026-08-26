@@ -67,6 +67,8 @@ mod copy_session;
 mod http;
 mod limits;
 mod listener;
+#[cfg(feature = "memwatch")]
+mod memwatch;
 #[cfg(feature = "perf")]
 mod perf;
 mod query_handler;
