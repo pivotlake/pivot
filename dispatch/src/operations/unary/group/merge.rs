@@ -29,6 +29,9 @@ type TablesByCapacity<'a, S, V> = Vec<(
     Vec<&'a MultiSlabTable<<S as StoredKey>::Persisted, V>>,
 )>;
 
+/// Receives each merged table of a partition as soon as it is complete.
+type MergedTableSink<'a, S, V> = &'a mut dyn FnMut(&MultiSlabTable<<S as StoredKey>::Persisted, V>);
+
 /// Collision-to-entry ratio at which we double the target table.
 ///
 /// For linear probing, the cumulative collision ratio is
@@ -40,6 +43,8 @@ const RESIZE_COLLISION_RATIO: f64 = 2.0;
 const SCAN_BATCH_SIZE: usize = 100;
 
 const PREFETCH_DISTANCE: usize = 8;
+/// Scatter rows read ahead of the row being merged, for prefetching.
+const SCATTER_PREFETCH_AHEAD: usize = 16;
 
 /// Try to resize the target if cumulative collision pressure is too high.
 #[inline]
@@ -274,7 +279,6 @@ fn merge_combined_rows<const N: usize, S: StoredKey, V: AggregationValue + ?Size
 
         // Scatter rows were not aggregated during consume, so each is inserted
         // once here.
-        const SCATTER_PREFETCH_AHEAD: usize = 16;
         // Prefetch strings unconditionally and fixed-width keys only when the
         // target is large enough for probes to be cold.
         const TARGET_PREFETCH_MIN_SLOTS: usize = 16384;
@@ -347,6 +351,338 @@ fn merge_combined_rows<const N: usize, S: StoredKey, V: AggregationValue + ?Size
         result
     }
 }
+/// Largest merge target the sub-partition path lets one probe loop touch.
+///
+/// A merge probe stalls on the target entry it loads, so the target has to
+/// stay in the core's first-level cache. A partition whose target would be
+/// larger is merged in sub-partitions, each into a reused table of at most
+/// this size.
+const SUB_PARTITION_TARGET_BYTES: usize = 32 * 1024;
+
+/// Upper bound on sub-partitions per merge job. Every sub-partition costs a
+/// table clear and an output scan, so a partition is not split finer than
+/// this even when its target is very large.
+const MAX_SUB_PARTITIONS: usize = 64;
+
+/// Largest merge target that still sits in a core's second-level cache.
+///
+/// Splitting a partition costs one copy of every merged row. Against a
+/// target that misses the second-level cache the copy always pays for
+/// itself; against one that fits, it only does when most rows insert a
+/// group, since a merge that mostly updates existing groups already reuses
+/// the entries it touches.
+const SECOND_LEVEL_TARGET_BYTES: usize = 1024 * 1024;
+
+/// Rows per group above which a merge counts as update-dominated.
+const UPDATE_DOMINATED_ROWS_PER_GROUP: usize = 2;
+
+/// Number of sub-partitions a merge job with this target splits into, or 1
+/// when the target already fits [`SUB_PARTITION_TARGET_BYTES`] or the split
+/// would not pay for its row copy.
+pub(super) fn sub_partition_count(
+    partition_capacity: usize,
+    entry_stride: usize,
+    merged_rows: usize,
+    estimated_groups: usize,
+) -> usize {
+    let target_bytes = partition_capacity * entry_stride;
+    if target_bytes <= SUB_PARTITION_TARGET_BYTES {
+        return 1;
+    }
+    let update_dominated = merged_rows > UPDATE_DOMINATED_ROWS_PER_GROUP * estimated_groups.max(1);
+    if target_bytes <= SECOND_LEVEL_TARGET_BYTES && update_dominated {
+        return 1;
+    }
+    target_bytes
+        .div_ceil(SUB_PARTITION_TARGET_BYTES)
+        .next_power_of_two()
+        .min(MAX_SUB_PARTITIONS)
+}
+
+/// Per-worker memory the sub-partition merge refills job after job: the
+/// sub-partition row buffers and the small target table. Reusing them keeps
+/// the row copy inside memory that is already cached instead of streaming it
+/// into fresh slabs.
+pub(crate) struct SubPartitionScratch<KP: PersistedKey, V: AggregationValue + ?Sized> {
+    allocator: SlabAllocator,
+    sub_buffers: Vec<StridedScatterRows<KP, V>>,
+    /// The target table with the capacity and hash shift it was built for.
+    table: Option<(usize, u32, MultiSlabTable<KP, V>)>,
+}
+
+impl<KP: PersistedKey, V: AggregationValue + ?Sized> SubPartitionScratch<KP, V> {
+    pub(crate) fn new() -> Self {
+        Self {
+            allocator: SlabAllocator::new(false),
+            sub_buffers: Vec::new(),
+            table: None,
+        }
+    }
+
+    /// An empty target table of `capacity` slots hashing after `hash_left_shift`
+    /// bits, reused when the previous job needed the same one.
+    fn table(
+        &mut self,
+        capacity: usize,
+        hash_left_shift: u32,
+        context: &V::SharedContext,
+    ) -> &mut MultiSlabTable<KP, V> {
+        let matches = self
+            .table
+            .as_ref()
+            .is_some_and(|(built_capacity, built_shift, _)| {
+                *built_capacity == capacity && *built_shift == hash_left_shift
+            });
+        if !matches {
+            let table = <MultiSlabTable<KP, V>>::new(
+                &mut self.allocator,
+                capacity,
+                hash_left_shift,
+                context,
+            );
+            self.table = Some((capacity, hash_left_shift, table));
+        }
+        &mut self.table.as_mut().unwrap().2
+    }
+}
+
+/// Merges one partition and hands every merged table to `sink`.
+///
+/// A partition whose target fits [`SUB_PARTITION_TARGET_BYTES`] is merged
+/// into one table. A larger partition is first split, by the hash bits that
+/// follow the partition bits, into `sub_partitions` row buffers; each buffer
+/// is then merged into one small table that is reused from sub-partition to
+/// sub-partition. The table reaches `sink` once per sub-partition, so its
+/// rows are still in cache when the sink reads them out.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn merge_combined_into<S: StoredKey, V: AggregationValue + ?Sized>(
+    partition: usize,
+    buffers: &[PartitionBuffers<S::Persisted, V>],
+    tables: &[MultiSlabTable<S::Persisted, V>],
+    partition_capacity: usize,
+    num_partitions: usize,
+    sub_partitions: usize,
+    key_arena: &SharedArena,
+    context: &V::SharedContext,
+    scratch: &mut SubPartitionScratch<S::Persisted, V>,
+    sink: MergedTableSink<'_, S, V>,
+) {
+    if sub_partitions <= 1 {
+        let table = merge_combined::<S, V>(
+            partition,
+            buffers,
+            tables,
+            partition_capacity,
+            num_partitions,
+            key_arena,
+            context,
+        );
+        sink(&table);
+        return;
+    }
+    V::dispatch_arity(
+        V::storage_metadata(context),
+        MergeSubPartitions::<S, V> {
+            partition,
+            buffers,
+            tables,
+            partition_capacity,
+            num_partitions,
+            sub_partitions,
+            key_arena,
+            context,
+            scratch,
+            sink,
+        },
+    )
+}
+
+/// State passed through arity dispatch for one sub-partitioned merge.
+struct MergeSubPartitions<'a, S: StoredKey, V: AggregationValue + ?Sized> {
+    partition: usize,
+    buffers: &'a [PartitionBuffers<S::Persisted, V>],
+    tables: &'a [MultiSlabTable<S::Persisted, V>],
+    partition_capacity: usize,
+    num_partitions: usize,
+    sub_partitions: usize,
+    key_arena: &'a SharedArena,
+    context: &'a V::SharedContext,
+    scratch: &'a mut SubPartitionScratch<S::Persisted, V>,
+    sink: MergedTableSink<'a, S, V>,
+}
+
+impl<S: StoredKey, V: AggregationValue + ?Sized> ArityBody<()> for MergeSubPartitions<'_, S, V> {
+    #[inline(always)]
+    fn run<const N: usize>(self) {
+        let MergeSubPartitions {
+            partition,
+            buffers,
+            tables,
+            partition_capacity,
+            num_partitions,
+            sub_partitions,
+            key_arena,
+            context,
+            scratch,
+            sink,
+        } = self;
+        merge_sub_partitions::<N, S, V>(
+            partition,
+            buffers,
+            tables,
+            partition_capacity,
+            num_partitions,
+            sub_partitions,
+            key_arena,
+            context,
+            scratch,
+            sink,
+        )
+    }
+}
+
+/// Merges one partition in cache-resident sub-partitions after arity dispatch.
+#[allow(clippy::too_many_arguments)]
+fn merge_sub_partitions<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
+    partition: usize,
+    buffers: &[PartitionBuffers<S::Persisted, V>],
+    tables: &[MultiSlabTable<S::Persisted, V>],
+    partition_capacity: usize,
+    num_partitions: usize,
+    sub_partitions: usize,
+    key_arena: &SharedArena,
+    context: &V::SharedContext,
+    scratch: &mut SubPartitionScratch<S::Persisted, V>,
+    sink: MergedTableSink<'_, S, V>,
+) {
+    let partition_bits = num_partitions.trailing_zeros();
+    let sub_bits = sub_partitions.trailing_zeros();
+    let sub_shift = u64::BITS - sub_bits;
+    let layout = StridedScatterRows::<S::Persisted, V>::layout::<N>(context);
+    let requested_capacity = (partition_capacity / sub_partitions).max(DEFAULT_CAPACITY);
+    // Build the table first so the row buffers can borrow the allocator.
+    scratch.table(requested_capacity, partition_bits + sub_bits, context);
+    let SubPartitionScratch {
+        allocator,
+        sub_buffers,
+        table,
+    } = scratch;
+    let table = &mut table.as_mut().unwrap().2;
+    while sub_buffers.len() < sub_partitions {
+        sub_buffers.push(StridedScatterRows::new());
+    }
+    let sub_buffers = &mut sub_buffers[..sub_partitions];
+    for sub_buffer in sub_buffers.iter_mut() {
+        sub_buffer.reset();
+    }
+
+    // First pass: route every row of the partition to its sub-partition by
+    // the hash bits that follow the partition bits.
+    for_each_partition_row::<N, S, V>(
+        partition,
+        buffers,
+        tables,
+        num_partitions,
+        context,
+        |hash, key, stored| {
+            let sub_partition = ((hash << partition_bits) >> sub_shift) as usize;
+            sub_buffers[sub_partition]
+                .push_with(layout, allocator, hash, *key, |row| row.copy_from(stored));
+        },
+    );
+
+    // Second pass: merge each sub-partition into the one reused table. The
+    // table hashes on the bits after the sub-partition bits, which are the
+    // first bits that differ within a sub-partition.
+    let mut capacity = table.capacity();
+    for sub_buffer in sub_buffers.iter() {
+        if sub_buffer.len() == 0 {
+            continue;
+        }
+        {
+            let mut target = if N == 0 {
+                table.prober()
+            } else {
+                table.prober_with_metadata(V::metadata_for_arity::<N>())
+            };
+            // The target stays in cache; only string blobs are worth prefetching.
+            if <S::Persisted as PersistedKey>::HAS_BLOB {
+                sub_buffer.for_each_prefetched::<SCATTER_PREFETCH_AHEAD>(
+                    layout,
+                    |hash, key, stored, ahead| {
+                        if let Some((_, ahead_key)) = ahead {
+                            ahead_key.prefetch_blob(key_arena);
+                        }
+                        target.grow_if_full(allocator, &mut capacity);
+                        let live_key = S::resolve_persisted(key_arena, *key);
+                        target.merge_from::<false, _>(hash, live_key, stored, context);
+                    },
+                );
+            } else {
+                sub_buffer.for_each(layout, |hash, key, stored| {
+                    target.grow_if_full(allocator, &mut capacity);
+                    let live_key = S::resolve_persisted(key_arena, *key);
+                    target.merge_from::<false, _>(hash, live_key, stored, context);
+                });
+            }
+        }
+        sink(table);
+        table.clear();
+    }
+}
+
+/// Visits every row that belongs to `partition`: the scatter rows of its
+/// buckets from every worker, then the in-place table entries whose hash
+/// routes to it.
+fn for_each_partition_row<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
+    partition: usize,
+    buffers: &[PartitionBuffers<S::Persisted, V>],
+    tables: &[MultiSlabTable<S::Persisted, V>],
+    num_partitions: usize,
+    context: &V::SharedContext,
+    mut visit: impl FnMut(u64, &S::Persisted, &V),
+) {
+    let partition_bits = num_partitions.trailing_zeros();
+    let partition_shift = u64::BITS - partition_bits;
+    let scatter_layout = StridedScatterRows::<S::Persisted, V>::layout::<N>(context);
+    let scatter_bucket_count = buffers
+        .first()
+        .map_or(num_partitions, |buffer| buffer.0.len());
+    let buckets_per_partition = (scatter_bucket_count / num_partitions).max(1);
+    let first_bucket = partition * buckets_per_partition;
+    for worker_buffers in buffers {
+        for bucket in first_bucket..first_bucket + buckets_per_partition {
+            worker_buffers.0[bucket]
+                .for_each(scatter_layout, |hash, key, stored| visit(hash, key, stored));
+        }
+    }
+    for table in tables {
+        let slot_count = table.capacity();
+        let reader = table.reader::<N>();
+        let start = (partition * slot_count) >> partition_bits;
+        let end = ((partition + 1) * slot_count) >> partition_bits;
+        for slot in start..end {
+            let entry = reader.view_at(slot);
+            if entry.hash != 0 && (entry.hash >> partition_shift) as usize == partition {
+                visit(entry.hash, entry.key, entry.stored);
+            }
+        }
+        // Linear probing can push a partition's entries past its slot range.
+        let mask = slot_count - 1;
+        let mut slot = end & mask;
+        loop {
+            let entry = reader.view_at(slot);
+            if entry.hash == 0 {
+                break;
+            }
+            if (entry.hash >> partition_shift) as usize == partition {
+                visit(entry.hash, entry.key, entry.stored);
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+}
+
 /// Merges one partition's node-local results.
 ///
 /// The largest input is reused when it can hold the combined upper bound.
@@ -696,6 +1032,71 @@ mod tests {
             );
         }
         agg.flush()
+    }
+
+    /// A partition split into sub-partitions yields the same groups with the
+    /// same counts as the whole-partition merge, from scatter rows and the
+    /// pre-switch in-place stack alike.
+    #[test]
+    fn sub_partition_merge_matches_whole_partition_merge() {
+        init_test_free_pool(64);
+        let arena = SharedArena::new(64);
+        let state = RandomState::new();
+        let values: Vec<i32> = (0..40_000).chain(0..20_000).collect();
+        let out = make_worker_output(&state, &arena, &values);
+        assert!(out.buffers.is_some(), "40000 keys switch to radix");
+        let buffers: Vec<_> = out.buffers.into_iter().collect();
+        let num_partitions = 256;
+        let mut scratch = SubPartitionScratch::new();
+
+        for partition in 0..num_partitions {
+            let whole = merge_combined::<IntStored, CountValue>(
+                partition,
+                &buffers,
+                &out.tables,
+                DEFAULT_CAPACITY,
+                num_partitions,
+                &arena,
+                &COUNT_CFG,
+            );
+            let mut expected: Vec<(i32, i128)> = whole
+                .iter(0)
+                .map(|entry| (*entry.key, entry.stored.sort_key(0)))
+                .collect();
+            let mut actual = Vec::new();
+            merge_combined_into::<IntStored, CountValue>(
+                partition,
+                &buffers,
+                &out.tables,
+                DEFAULT_CAPACITY,
+                num_partitions,
+                4,
+                &arena,
+                &COUNT_CFG,
+                &mut scratch,
+                &mut |table| {
+                    actual.extend(
+                        table
+                            .iter(0)
+                            .map(|entry| (*entry.key, entry.stored.sort_key(0))),
+                    )
+                },
+            );
+
+            expected.sort_unstable();
+            actual.sort_unstable();
+            assert_eq!(actual, expected, "partition {partition}");
+        }
+    }
+
+    #[test]
+    fn sub_partition_count_follows_target_size_and_merge_shape() {
+        assert_eq!(sub_partition_count(128, 32, 100, 100), 1);
+        assert_eq!(sub_partition_count(1024, 32, 100, 100), 1);
+        assert_eq!(sub_partition_count(8192, 32, 100, 100), 8);
+        assert_eq!(sub_partition_count(8192, 32, 1000, 100), 1);
+        assert_eq!(sub_partition_count(65536, 48, 1000, 100), 64);
+        assert_eq!(sub_partition_count(1 << 20, 64, 100, 100), 64);
     }
 
     /// A worker with enough distinct keys to switch to radix produces scatter
