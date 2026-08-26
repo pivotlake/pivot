@@ -11,8 +11,8 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use catalog::datastore::DatastoreTransaction;
-use catalog::delta::DeltaDatastore;
-use catalog::test_support as harness;
+use datastore_delta::DeltaDatastore;
+use datastore_delta::test_support as harness;
 use planner::DEFAULT_DATASTORE_NAME;
 use planner::catalog::{
     Column, CreateSchemaRequest, CreateTableRequest, Result as CatalogResult,

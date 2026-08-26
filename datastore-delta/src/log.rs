@@ -41,7 +41,7 @@ use planner::catalog::Column;
 use planner::types::Type;
 use url::Url;
 
-use crate::delta::manifest::DeltaFileEntry;
+use crate::manifest::DeltaFileEntry;
 use object_storage::{FileRef, ObjectPath, ObjectStore, StoreConnection};
 
 #[derive(Debug, thiserror::Error)]
@@ -744,7 +744,7 @@ fn read_state(snapshot: Arc<Snapshot>, engine: &DeltaEngine) -> Result<DeltaTabl
         .with_stats(StatsOptions::all_struct())
         .build()?;
     let mut files = Vec::new();
-    let mut stats_by_path: HashMap<String, crate::delta::manifest::FileStats> = HashMap::new();
+    let mut stats_by_path: HashMap<String, crate::manifest::FileStats> = HashMap::new();
     for metadata in scan.scan_metadata(engine.kernel())? {
         let scan_metadata = metadata?;
         files = scan_metadata.visit_scan_files(files, collect_scan_file)?;
@@ -932,7 +932,7 @@ fn scan_file_entry(
 }
 
 /// Read each scan file's `stats_parsed` struct out of one metadata batch and
-/// record its [`FileStats`](crate::delta::manifest::FileStats) by path, for the loader to
+/// record its [`FileStats`](crate::manifest::FileStats) by path, for the loader to
 /// join onto the file entries. Kernel emits `stats_parsed` typed to the table's
 /// schema (min/max as the column's own type, null counts and row count as longs),
 /// so the bounds are ready to prune against a query's typed constants with no
@@ -942,7 +942,7 @@ fn scan_file_entry(
 fn collect_file_stats(
     data: Box<dyn EngineData>,
     live: &[bool],
-    stats_by_path: &mut HashMap<String, crate::delta::manifest::FileStats>,
+    stats_by_path: &mut HashMap<String, crate::manifest::FileStats>,
 ) -> Result<(), Error> {
     let data: Arc<dyn EngineData> = Arc::from(data);
     let arrow = data.as_any().downcast::<ArrowEngineData>().map_err(|_| {
@@ -975,7 +975,7 @@ fn collect_file_stats(
         };
         stats_by_path.insert(
             path,
-            crate::delta::manifest::FileStats {
+            crate::manifest::FileStats {
                 // Left `None` when the log recorded no `numRecords` for this file,
                 // so an unknown count is not mistaken for an empty file.
                 num_records: num_records
@@ -1407,7 +1407,7 @@ mod tests {
                 size: 123,
             },
             partition: None,
-            stats: Some(Arc::new(crate::delta::manifest::FileStats {
+            stats: Some(Arc::new(crate::manifest::FileStats {
                 num_records: Some(5),
                 min_values: HashMap::from([(
                     "value".to_string(),

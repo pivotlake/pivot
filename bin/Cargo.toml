@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 catalog = { workspace = true }
+datastore-delta = { workspace = true }
 dispatch = { workspace = true }
 metastore-disk = { workspace = true }
 object-storage = { workspace = true }
@@ -75,7 +76,7 @@ rcgen = { workspace = true }
 tokio-postgres-rustls = "0.14"
 # The process-level CLI test signals the spawned server.
 libc = { workspace = true }
-# Pull catalog's `test_support` (MinIO / fake-gcs object-store harness) in for
+# Pull datastore-delta's `test_support` (MinIO / fake-gcs object-store harness) in for
 # the bucket-backed end-to-end tests; the bin build keeps the plain catalog dep.
-catalog = { workspace = true, features = ["test-support"] }
+datastore-delta = { workspace = true, features = ["test-support"] }
 object-storage = { workspace = true, features = ["test-support"] }

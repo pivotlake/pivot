@@ -1,4 +1,4 @@
-//! A concrete [`crate::datastore::Datastore`] implementation backed by Parquet.
+//! A concrete [`catalog::datastore::Datastore`] implementation backed by Parquet.
 //!
 //! The datastore stores tables in a `RwLock<HashMap>` keyed by name, so multiple
 //! threads can resolve and create tables concurrently: many readers (lookups)
@@ -34,6 +34,11 @@ mod local_lock;
 mod log;
 mod manifest;
 mod table;
+/// A Docker-backed object-store test harness (MinIO) plus Delta test helpers.
+/// Gated behind the `test-support` feature so it, and its heavy testcontainers
+/// deps, never enter a normal build.
+#[cfg(feature = "test-support")]
+pub mod test_support;
 mod vacuum;
 
 pub use binding::TableBinding;
@@ -56,8 +61,8 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use uuid::Uuid;
 
-use crate::datastore::{Datastore, DatastoreTableMetadata, DatastoreTransaction};
 use async_trait::async_trait;
+use catalog::datastore::{Datastore, DatastoreTableMetadata, DatastoreTransaction};
 use crossbeam_deque::{Injector, Steal};
 use dispatch::{DataFlowDispatcher, DataFlowError, OneShotNullaryFactory, RecordBatchOperatorSpec};
 use local_lock::LocalDatastoreLock;
@@ -131,7 +136,7 @@ pub enum Error {
     #[error(transparent)]
     Manifest(#[from] manifest::Error),
     #[error(transparent)]
-    Delta(#[from] crate::delta::log::Error),
+    Delta(#[from] crate::log::Error),
     #[error("loading table footers: {0}")]
     Load(#[from] DataFlowError),
     #[error(
@@ -293,7 +298,7 @@ pub struct DeltaDatastore {
     /// Built once for the store, so a refresh, a commit, or a vacuum sweep reuses
     /// the one object-store client and task executor instead of standing up its
     /// own; each table holds a clone.
-    engine: crate::delta::log::DeltaEngine,
+    engine: crate::log::DeltaEngine,
 
     /// The worker pool every footer fetch runs on. Held by the datastore because
     /// refreshes drive their own dataflows, with no dispatcher passed in.
@@ -302,7 +307,7 @@ pub struct DeltaDatastore {
     /// The background maintenance this datastore runs once [`start`](Datastore::start)
     /// is called: a periodic refresh sweep and optional compaction. `None` for a
     /// datastore opened without maintenance (embedded / test use).
-    maintenance: Option<crate::delta::MaintenanceConfig>,
+    maintenance: Option<crate::MaintenanceConfig>,
     /// Abort handles for the maintenance tasks [`start`](Datastore::start)
     /// spawned, so [`abort`](Datastore::abort) can stop them on shutdown before
     /// the worker pool is torn down. Behind an `Arc<Mutex<..>>` so the datastore
@@ -310,7 +315,7 @@ pub struct DeltaDatastore {
     maintenance_tasks: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
     /// Handle to the one compaction actor serving both timer ticks and explicit
     /// commands. Created lazily by maintenance startup or the first command.
-    compacter: Arc<Mutex<Option<crate::delta::compact::CompacterHandle>>>,
+    compacter: Arc<Mutex<Option<crate::compact::CompacterHandle>>>,
 }
 
 impl std::fmt::Debug for DeltaDatastore {
@@ -341,7 +346,7 @@ impl DeltaDatastore {
     pub fn from_store(
         store: Arc<dyn ObjectStore>,
         dispatcher: &DataFlowDispatcher,
-        maintenance: Option<crate::delta::MaintenanceConfig>,
+        maintenance: Option<crate::MaintenanceConfig>,
     ) -> Result<Arc<Self>> {
         // Only local Delta datastores take a process lock; remote stores have
         // no local root and skip this.
@@ -351,7 +356,7 @@ impl DeltaDatastore {
             .transpose()?
             .map(Arc::new);
         let manifest = CatalogManifest::load(store.as_ref())?;
-        let engine = crate::delta::log::DeltaEngine::new(store.as_ref())?;
+        let engine = crate::log::DeltaEngine::new(store.as_ref())?;
 
         let mut index = DatastoreIndex::default();
         for schema in &manifest.schemas {
@@ -375,7 +380,7 @@ impl DeltaDatastore {
         }))
     }
 
-    fn compacter(self: &Arc<Self>) -> crate::delta::compact::CompacterHandle {
+    fn compacter(self: &Arc<Self>) -> crate::compact::CompacterHandle {
         let mut compacter = self.compacter.lock().unwrap();
         if let Some(compacter) = compacter.as_ref() {
             return compacter.clone();
@@ -392,15 +397,13 @@ impl DeltaDatastore {
                 Some(config.poll_interval),
             ),
             None => (
-                crate::delta::compact::DEFAULT_COMPACT_BYTES,
-                crate::delta::compact::default_merge_target_bytes(
-                    crate::delta::compact::DEFAULT_COMPACT_BYTES,
-                ),
-                crate::delta::compact::DEFAULT_MIN_FILES_TO_MERGE,
+                crate::compact::DEFAULT_COMPACT_BYTES,
+                crate::compact::default_merge_target_bytes(crate::compact::DEFAULT_COMPACT_BYTES),
+                crate::compact::DEFAULT_MIN_FILES_TO_MERGE,
                 None,
             ),
         };
-        let (handle, actor) = crate::delta::compact::CompacterHandle::new(
+        let (handle, actor) = crate::compact::CompacterHandle::new(
             target_bytes,
             merge_target_bytes,
             min_files,
@@ -423,12 +426,12 @@ impl DeltaDatastore {
     fn load_table(
         dispatcher: &DataFlowDispatcher,
         store: &Arc<dyn ObjectStore>,
-        engine: &crate::delta::log::DeltaEngine,
+        engine: &crate::log::DeltaEngine,
         id: Uuid,
         location: &ObjectPath,
     ) -> Result<CatalogTable> {
-        let delta_uri = crate::delta::log::table_uri(&store.location_uri(), location)?;
-        let state = crate::delta::log::load_table(&delta_uri, engine)?;
+        let delta_uri = crate::log::table_uri(&store.location_uri(), location)?;
+        let state = crate::log::load_table(&delta_uri, engine)?;
         let data_files = state
             .file_entries
             .iter()
@@ -719,7 +722,7 @@ impl DeltaDatastore {
             .get_table_by_id(&id)
             .expect("the name index resolved the id, so the table is held")
             .deleted_file_retention();
-        let dropped_at_ms = crate::delta::vacuum::now_unix_ms();
+        let dropped_at_ms = crate::vacuum::now_unix_ms();
         CatalogManifest::update(self.store.as_ref(), |manifest| {
             manifest.remove_table(&name, dropped_at_ms, retention.as_millis() as u64)
         })?;
@@ -1292,7 +1295,7 @@ impl Datastore for DeltaDatastore {
         tasks.push(refresh.abort_handle());
 
         if let Some(vacuum) = maintenance.vacuum {
-            let vacuumer = Arc::new(crate::delta::vacuum::Vacuumer::new(
+            let vacuumer = Arc::new(crate::vacuum::Vacuumer::new(
                 vacuum.poll_interval,
                 Arc::clone(&self),
             ));
@@ -1336,7 +1339,7 @@ impl DeltaSnapshot {
     /// A clone of the table named `name`, or `None` if this snapshot has no such
     /// table. The frozen copy a [`TableBinding`] captures at bind time, so its
     /// compile resolves the table's file set without any transaction handle.
-    pub(super) fn catalog_table_by_name(
+    pub(crate) fn catalog_table_by_name(
         &self,
         name: &SchemaQualifiedTableName,
     ) -> Option<CatalogTable> {
@@ -1370,7 +1373,7 @@ impl DeltaSnapshot {
 
     /// Whether this snapshot holds a table named `name`; the up-front duplicate
     /// check for `CREATE TABLE`.
-    pub(super) fn contains_table(&self, name: &SchemaQualifiedTableName) -> bool {
+    pub(crate) fn contains_table(&self, name: &SchemaQualifiedTableName) -> bool {
         self.index.contains_table(name)
     }
 }
@@ -1413,8 +1416,8 @@ struct PendingTableCreation {
 /// [`DeltaSnapshot`] plus injectors of uploaded files and completed table
 /// creations awaiting commit.
 pub struct DeltaTransaction {
-    pub(super) snapshot: Arc<DeltaSnapshot>,
-    pub(super) uploaded_files: Arc<Injector<insert_sink::UploadedFile>>,
+    pub(crate) snapshot: Arc<DeltaSnapshot>,
+    pub(crate) uploaded_files: Arc<Injector<insert_sink::UploadedFile>>,
     pending_table_creations: Arc<Injector<PendingTableCreation>>,
     pending_schema_creations: Arc<Injector<PendingSchemaCreation>>,
     pending_table_drops: Arc<Injector<PendingTableDrop>>,

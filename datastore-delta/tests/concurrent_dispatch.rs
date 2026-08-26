@@ -19,9 +19,9 @@ use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
 use catalog::datastore::{Datastore, DatastoreTransaction};
-use catalog::delta::DeltaDatastore;
 use catalog::{DEFAULT_DATASTORE_NAME, PivotCatalog};
 use common::commit_datastore_transaction;
+use datastore_delta::DeltaDatastore;
 use planner::Planner;
 use planner::catalog::{Column, CreateTableRequest};
 use planner::types::Type;

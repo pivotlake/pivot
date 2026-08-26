@@ -16,7 +16,7 @@ pub use parquet_engine::{
     scalar_values_from_row,
 };
 
-use crate::delta::FileRef;
+use crate::FileRef;
 use object_storage::{ObjectPath, ObjectStore};
 
 /// Key of the [`CatalogManifest`] document within the database's object store.
