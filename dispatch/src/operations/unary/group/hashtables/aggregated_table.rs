@@ -43,6 +43,10 @@ const KEEP_DEDUP_ROWS_PER_KEYS: (usize, usize) = (3, 2);
 /// Windows flushed before the fold ratio is judged. Keys often repeat in
 /// bursts, so one window says little; the probes spent on these windows
 /// are negligible even for keys that never repeat.
+///
+/// Keys that carry a blob are never judged: scattering such a row raw
+/// copies its blob again, so folding stays cheaper for them however rarely
+/// the keys repeat.
 const WINDOWS_BEFORE_RAW_SCATTER: usize = 4;
 
 /// Configuration for the in-place to radix transition.
@@ -316,7 +320,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         self.windows_flushed += 1;
         self.scatter_active_table_to_radix_partitions();
         let (rows, keys) = KEEP_DEDUP_ROWS_PER_KEYS;
-        if self.windows_flushed >= WINDOWS_BEFORE_RAW_SCATTER
+        if !<K::Persisted as PersistedKey>::HAS_BLOB
+            && self.windows_flushed >= WINDOWS_BEFORE_RAW_SCATTER
             && self.rows_folded * keys < self.keys_flushed * rows
         {
             self.scatter_raw = true;
