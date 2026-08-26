@@ -294,8 +294,8 @@ if [[ "$mode" == "pgo" ]]; then
 
     before_bin="$before_dir/benchmarks/target-client/release/pivot-bench"
     after_bin="$after_dir/benchmarks/target-client/release/pivot-bench"
-    before_server="$before_dir/benchmarks/target-pgouse/$host_target/release/pivot"
-    after_server="$after_dir/benchmarks/target-pgouse/$host_target/release/pivot"
+    before_server="$(pgo_server_path "$before_dir")"
+    after_server="$(pgo_server_path "$after_dir")"
 else
     echo ">>> release builds (A and B in parallel)"
     build_release "$before_dir" & b1=$!
@@ -303,8 +303,8 @@ else
     wait "$b1"; wait "$b2"
     before_bin="$before_dir/target/release/pivot-bench"
     after_bin="$after_dir/target/release/pivot-bench"
-    before_server="$before_dir/target/release/pivot"
-    after_server="$after_dir/target/release/pivot"
+    before_server="$(release_server_path "$before_dir")"
+    after_server="$(release_server_path "$after_dir")"
 fi
 for built in "$before_bin" "$after_bin" "$before_server" "$after_server"; do
     [[ -x "$built" ]] || { echo "error: build produced no $built" >&2; exit 1; }

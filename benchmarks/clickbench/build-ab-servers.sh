@@ -61,28 +61,62 @@ command -v ld.lld >/dev/null || {
 host_target="$(rustc -vV | sed -n 's/^host: //p')"
 llvm_profdata="$(dirname "$(rustc --print target-libdir)")/bin/llvm-profdata"
 
+# Which package and binary carry the server in this tree. Older trees ship it
+# as its own `pivotdb-server` executable in the `server` package; newer trees
+# fold it into the `pivot` CLI (run as `pivot server`) in the `bin` package. An
+# A/B can straddle that move, so ask cargo what each tree has instead of
+# assuming one layout, and prefer the bare server where both exist since that
+# is what those trees were measured with. Prints "<package> <binary>".
+find_server_target() {
+    local tree="$1"
+    (cd "$tree" && cargo metadata --no-deps --format-version 1) | python3 -c "
+import json, sys
+package_of = {
+    target['name']: package['name']
+    for package in json.load(sys.stdin)['packages']
+    for target in package['targets']
+    if 'bin' in target['kind'] and target['name'] in ('pivotdb-server', 'pivot')
+}
+for binary in ('pivotdb-server', 'pivot'):
+    if binary in package_of:
+        print(package_of[binary], binary)
+        break
+else:
+    sys.exit('error: no package in this workspace builds pivotdb-server or pivot')
+" || {
+        echo "error: could not tell which server $tree builds" >&2
+        return 1
+    }
+}
+
 # Instrument the server itself, drive it through pivot-bench (a pure pgwire
 # client carrying no engine code and no instrumentation), and build the
 # optimized server from the profile the server process wrote. Profiling the artifact being measured is what makes
 # the profile's symbol names match by construction; PGO matches records to
 # functions by exact mangled name, and a mismatch silently disables it.
 build_side() {
-    local tree="$1" side="$2"
+    local tree="$1" side="$2" server_target package binary
+    server_target="$(find_server_target "$tree")" || return 1
+    read -r package binary <<<"$server_target"
     # Beside the tree, never inside it: the launcher rsyncs each tree with
     # --delete and only excludes the target dirs, so a profile directory in
     # there would be deleted out from under the build.
     local pgo="$(dirname "$tree")/pgo-$side"
+    # The steps are chained with && because bash ignores set -e inside a
+    # subshell that sits in an if condition: without the chain a failed build
+    # would run on through the profiling and the final build, and report
+    # whichever error came last.
     if ! (
-        cd "$tree/benchmarks"
-        rm -rf "$pgo"
-        mkdir -p "$pgo"
+        cd "$tree/benchmarks" &&
+        rm -rf "$pgo" &&
+        mkdir -p "$pgo" &&
         PGO_DIR="$pgo" PGO_GEN_TARGET_DIR=target-pgogen \
-            just pgo-gen-build build --release -p bin --bin pivot
+            just pgo-gen-build build --release -p "$package" --bin "$binary" &&
         # The client is a plain build in its own target dir: it takes no
         # profile flags, and sharing a flagged dir would rebuild it for
         # nothing on every flavor switch.
         CARGO_TARGET_DIR=target-client \
-            cargo build --release -p benchmarks --bin pivot-bench
+            cargo build --release -p benchmarks --bin pivot-bench &&
         # LLVM_PROFILE_FILE reaches the instrumented server through the
         # environment pivot-bench spawns it with; the client itself is not
         # instrumented and writes nothing.
@@ -93,11 +127,11 @@ build_side() {
         # drawing a timing-dependent mix per build.
         LLVM_PROFILE_FILE="$pgo/%m-%p.profraw" PIVOT_SPIN_LIMIT=0 \
             "target-client/release/pivot-bench" \
-            --server-bin "target-pgogen/$host_target/release/pivot" \
-            --source "$pgo_subset" --iterations 2 --skip-check >/dev/null
-        "$llvm_profdata" merge -o "$pgo/merged.profdata" "$pgo"/*.profraw
+            --server-bin "target-pgogen/$host_target/release/$binary" \
+            --source "$pgo_subset" --iterations 2 --skip-check >/dev/null &&
+        "$llvm_profdata" merge -o "$pgo/merged.profdata" "$pgo"/*.profraw &&
         PGO_USE_TARGET_DIR=target-pgouse \
-            just pgo-use-with "$pgo/merged.profdata" build --release -p bin --bin pivot
+            just pgo-use-with "$pgo/merged.profdata" build --release -p "$package" --bin "$binary"
     ) >&2; then
         # Without this the subshell's failure is swallowed by the printf below,
         # and the run only trips at the final existence check, which then names
@@ -105,7 +139,7 @@ build_side() {
         echo "error: building the $side server from $tree failed" >&2
         return 1
     fi
-    local server="$tree/benchmarks/target-pgouse/$host_target/release/pivot"
+    local server="$tree/benchmarks/target-pgouse/$host_target/release/$binary"
     # Tripwire for the profile applying at all: the decode family's
     # monomorphization hashes in the built server must appear in the profile
     # it was compiled against. Zero overlap means the server was built outside

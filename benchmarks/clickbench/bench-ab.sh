@@ -175,9 +175,9 @@ run_harness() {
     # kernel OOM-kills the booting server. Memory is released before the pid
     # leaves the process table, so an empty table means teardown is done.
     local teardown_waited=0
-    while ps -C pivot >/dev/null 2>&1; do
+    while ps -C pivot,pivotdb-server >/dev/null 2>&1; do
         if (( teardown_waited >= 120 )); then
-            echo "warning: pivot still in the process table after ${teardown_waited}s; starting the next side anyway" >&2
+            echo "warning: the server is still in the process table after ${teardown_waited}s; starting the next side anyway" >&2
             break
         fi
         sleep 1

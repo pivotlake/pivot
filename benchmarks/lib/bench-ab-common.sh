@@ -215,18 +215,61 @@ save_cache() {
 # explicit --target so build scripts stay unflagged and cached) and a second
 # copy of them drifts from the recipe silently, changing what is measured
 # without changing anything that looks like a measurement.
-# Every build produces both binaries the harnesses need: the pivot binary
+
+# Which package and binary carry the server in this tree. Older trees ship it
+# as its own `pivotdb-server` executable in the `server` package; newer trees
+# fold it into the `pivot` CLI (run as `pivot server`) in the `bin` package. An
+# A/B can straddle that move, so ask cargo what each tree has instead of
+# assuming one layout, and prefer the bare server where both exist since that
+# is what those trees were measured with. Prints "<package> <binary>".
+find_server_target() {
+    local tree="$1"
+    (cd "$tree" && cargo metadata --no-deps --format-version 1) | python3 -c "
+import json, sys
+package_of = {
+    target['name']: package['name']
+    for package in json.load(sys.stdin)['packages']
+    for target in package['targets']
+    if 'bin' in target['kind'] and target['name'] in ('pivotdb-server', 'pivot')
+}
+for binary in ('pivotdb-server', 'pivot'):
+    if binary in package_of:
+        print(package_of[binary], binary)
+        break
+else:
+    sys.exit('error: no package in this workspace builds pivotdb-server or pivot')
+" || {
+        echo "error: could not tell which server $tree builds" >&2
+        return 1
+    }
+}
+
+server_binary_name() {
+    find_server_target "$1" | cut -d' ' -f2
+}
+
+# Where build_use and build_release leave the server for `dir`.
+pgo_server_path() {
+    echo "$1/benchmarks/target-pgouse/$host_target/release/$(server_binary_name "$1")"
+}
+release_server_path() {
+    echo "$1/target/release/$(server_binary_name "$1")"
+}
+
+# Every build produces both binaries the harnesses need: the server binary
 # being measured, and the pivot-bench that launches it (--server-bin) and
 # drives it over pgwire. Only the server takes profile flags, mirroring
 # build-ab-servers.sh: the client links no engine code, so instrumenting it
 # would grow the build and rebuild it under every fresh profile for nothing.
 # It gets a plain build in its own target-client dir instead.
 build_gen() {
-    local dir="$1"
+    local dir="$1" server_target package binary
+    server_target="$(find_server_target "$dir")" || return 1
+    read -r package binary <<<"$server_target"
     mkdir -p "$pgo_dir"
     (cd "$dir/benchmarks" && \
         PGO_DIR="$pgo_dir" PGO_GEN_TARGET_DIR=target-pgogen \
-        just pgo-gen-build build --release -p bin --bin pivot && \
+        just pgo-gen-build build --release -p "$package" --bin "$binary" && \
         CARGO_TARGET_DIR=target-client \
         cargo build --release -p benchmarks --bin pivot-bench)
 }
@@ -248,20 +291,20 @@ profile_side() {
     LLVM_PROFILE_FILE="$prof_dir/%m-%p.profraw" PIVOT_SPIN_LIMIT=0 \
         "$dir/benchmarks/target-client/release/pivot-bench" \
         --suite "$suite" --suite-dir "$dir/benchmarks/$suite" \
-        --server-bin "$dir/benchmarks/target-pgogen/$host_target/release/pivot" \
+        --server-bin "$dir/benchmarks/target-pgogen/$host_target/release/$(server_binary_name "$dir")" \
         --source "$source" --iterations 2 --skip-check >/dev/null
     "$(dirname "$(rustc --print target-libdir)")/bin/llvm-profdata" \
         merge -o "$work_dir/$side-$run_id.profdata" "$prof_dir"
 }
 
 build_use() {
-    local dir="$1" side="$2"
+    local dir="$1" side="$2" server_target package binary
+    server_target="$(find_server_target "$dir")" || return 1
+    read -r package binary <<<"$server_target"
     (cd "$dir/benchmarks" && \
         PGO_USE_TARGET_DIR=target-pgouse \
-        just pgo-use-with "$work_dir/$side-$run_id.profdata" build --release -p bin --bin pivot)
-    verify_pgo_applied \
-        "$dir/benchmarks/target-pgouse/$host_target/release/pivot" \
-        "$work_dir/$side-$run_id.profdata" "$side"
+        just pgo-use-with "$work_dir/$side-$run_id.profdata" build --release -p "$package" --bin "$binary")
+    verify_pgo_applied "$(pgo_server_path "$dir")" "$work_dir/$side-$run_id.profdata" "$side"
 }
 
 # Tripwire for the profile applying at all, same as build-ab-servers.sh: the
@@ -295,9 +338,11 @@ verify_pgo_applied() {
 }
 
 build_release() {
-    local dir="$1"
+    local dir="$1" server_target package binary
+    server_target="$(find_server_target "$dir")" || return 1
+    read -r package binary <<<"$server_target"
     (cd "$dir/benchmarks" && \
-        cargo build --release -p bin --bin pivot -p benchmarks --bin pivot-bench)
+        cargo build --release -p "$package" --bin "$binary" -p benchmarks --bin pivot-bench)
 }
 
 # Drop the OS page cache (and sync first) so the next read is cold. Needs
