@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 
 use arrow_arith::numeric::sub;
 use arrow_array::{Array, ArrayRef, Datum, Float64Array};
@@ -8,6 +9,7 @@ use arrow_schema::DataType;
 
 use crate::TableFile;
 use crate::manifest::DeltaFileEntry;
+use object_storage::ObjectPath;
 
 /// Overlap score for string ranges that genuinely intersect. String values
 /// carry no meaningful width, so no uniform-distribution fraction can be
@@ -103,6 +105,10 @@ fn is_string_type(array: &ArrayRef) -> bool {
 /// shadows a mergeable pair behind it, and so is a pair without enough
 /// contested row groups on each side to make the rewrite restructure real
 /// data.
+///
+/// The reference the remembered scores of [`LayoutScores`] are held to; a
+/// round itself no longer sweeps.
+#[cfg(test)]
 pub(super) fn highest_scoring_pair<'a>(
     candidates: &[LayoutCandidate<'a>],
     sort_by: &[String],
@@ -127,19 +133,9 @@ pub(super) fn highest_scoring_pair<'a>(
         for partner in &active {
             let left = partner.candidate.entry;
             let right = range.candidate.entry;
-            let combined_size = left.file.size.saturating_add(right.file.size);
-            if combined_size > target_bytes && is_irreducible_pair(left, right, sort_by) {
-                continue;
-            }
-            if !enough_contested_row_groups(partner, range) {
-                continue;
-            }
-            let Some(score) = file_overlap(left, right, sort_by) else {
+            let Some(score) = gated_pair_score(partner, range, sort_by, target_bytes) else {
                 continue;
             };
-            if score <= 0.0 {
-                continue;
-            }
             if best
                 .as_ref()
                 .is_none_or(|(best_score, _, _)| score > *best_score)
@@ -154,6 +150,162 @@ pub(super) fn highest_scoring_pair<'a>(
         active.push(range);
     }
     best
+}
+
+/// The score a pair earns once it clears every gate: its combined size must
+/// fit the output ceiling unless a rewrite can separate it, both files must
+/// have enough contested row groups, and the overlap must be positive. `None`
+/// is a pair no round should merge.
+fn gated_pair_score(
+    left: &SortColumnRange,
+    right: &SortColumnRange,
+    sort_by: &[String],
+    target_bytes: u64,
+) -> Option<f64> {
+    let left_entry = left.candidate.entry;
+    let right_entry = right.candidate.entry;
+    let combined_size = left_entry.file.size.saturating_add(right_entry.file.size);
+    if combined_size > target_bytes && is_irreducible_pair(left_entry, right_entry, sort_by) {
+        return None;
+    }
+    if !enough_contested_row_groups(left, right) {
+        return None;
+    }
+    let score = file_overlap(left_entry, right_entry, sort_by)?;
+    (score > 0.0).then_some(score)
+}
+
+/// Whether two files' ranges on the sweep column share any value. Stats are
+/// inclusive, and an incomparable pair is kept rather than dropped, which is
+/// what the sweep in [`highest_scoring_pair`] does too.
+fn ranges_intersect(left: &SortColumnRange, right: &SortColumnRange) -> bool {
+    compare(left.max, right.min) != Some(Ordering::Less)
+        && compare(right.max, left.min) != Some(Ordering::Less)
+}
+
+/// The pair scores of one table, remembered between compaction rounds.
+///
+/// A pair's score depends only on the two files' footers and manifest stats,
+/// which never change while the files exist, so a round need not score every
+/// intersecting pair again: [`highest_scoring_pair`] does, and on a table of
+/// two thousand heavily overlapping files that is over a million pairs of
+/// Arrow comparisons every few seconds. Here a round scores only the files it
+/// has not seen before (normally the two outputs of the last merge) against
+/// the rest of their partition, forgets the pairs of files that are gone, and
+/// takes the best of what it remembers. Only pairs that cleared the gates
+/// with a positive score are kept: files are numbered as they appear, so a
+/// remembered pair is two small ids and its score.
+pub(super) struct LayoutScores {
+    ids: HashMap<ObjectPath, u32>,
+    next_id: u32,
+    /// Files scored against every other file of their partition.
+    scored: HashSet<u32>,
+    /// Positive gated scores, keyed by the pair's ids as `low << 32 | high`.
+    /// Single precision is plenty for ranking pairs, and it is what keeps a
+    /// million remembered pairs small.
+    pairs: HashMap<u64, f32>,
+}
+
+impl LayoutScores {
+    pub(super) fn new() -> Self {
+        Self {
+            ids: HashMap::new(),
+            next_id: 0,
+            scored: HashSet::new(),
+            pairs: HashMap::new(),
+        }
+    }
+
+    /// The highest-scoring pair among `partitions`, each one partition's
+    /// large-file candidates, on the same terms as [`highest_scoring_pair`].
+    pub(super) fn best_pair<'a>(
+        &mut self,
+        partitions: &[Vec<LayoutCandidate<'a>>],
+        sort_by: &[String],
+        target_bytes: u64,
+    ) -> Option<(f64, &'a DeltaFileEntry, &'a DeltaFileEntry)> {
+        let first_column = sort_by.first()?;
+
+        let mut entries: HashMap<u32, &'a DeltaFileEntry> = HashMap::new();
+        for candidate in partitions.iter().flatten() {
+            let id = self.id_of(&candidate.entry.file.path);
+            entries.insert(id, candidate.entry);
+        }
+        self.forget_missing(&entries);
+
+        for partition in partitions {
+            let ranges: Vec<(u32, SortColumnRange<'a, '_>)> = partition
+                .iter()
+                .filter_map(|candidate| {
+                    let range = extract_column_range(candidate, first_column)?;
+                    Some((self.ids[&candidate.entry.file.path], range))
+                })
+                .collect();
+            // A pair of two new files is scored from the first one's side
+            // only.
+            let mut scored_this_round: HashSet<u32> = HashSet::new();
+            for (id, range) in &ranges {
+                if self.scored.contains(id) {
+                    continue;
+                }
+                for (partner_id, partner) in &ranges {
+                    if partner_id == id || scored_this_round.contains(partner_id) {
+                        continue;
+                    }
+                    if !ranges_intersect(range, partner) {
+                        continue;
+                    }
+                    if let Some(score) = gated_pair_score(range, partner, sort_by, target_bytes) {
+                        self.pairs.insert(pair_key(*id, *partner_id), score as f32);
+                    }
+                }
+                scored_this_round.insert(*id);
+            }
+            self.scored.extend(scored_this_round);
+        }
+
+        // Ties go to the pair numbered first, so the choice is stable across
+        // rounds.
+        let (&key, &score) = self
+            .pairs
+            .iter()
+            .max_by(|(left_key, left), (right_key, right)| {
+                left.total_cmp(right).then_with(|| right_key.cmp(left_key))
+            })?;
+        let (low, high) = pair_ids(key);
+        Some((f64::from(score), entries[&low], entries[&high]))
+    }
+
+    fn id_of(&mut self, path: &ObjectPath) -> u32 {
+        *self.ids.entry(path.clone()).or_insert_with(|| {
+            let id = self.next_id;
+            self.next_id += 1;
+            id
+        })
+    }
+
+    /// Drop every file not among `live`, and every pair one of them was in.
+    fn forget_missing(&mut self, live: &HashMap<u32, &DeltaFileEntry>) {
+        self.ids.retain(|_, id| live.contains_key(id));
+        self.scored.retain(|id| live.contains_key(id));
+        self.pairs.retain(|&key, _| {
+            let (low, high) = pair_ids(key);
+            live.contains_key(&low) && live.contains_key(&high)
+        });
+    }
+}
+
+fn pair_key(left: u32, right: u32) -> u64 {
+    let (low, high) = if left < right {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    (u64::from(low) << 32) | u64::from(high)
+}
+
+fn pair_ids(key: u64) -> (u32, u32) {
+    ((key >> 32) as u32, key as u32)
 }
 
 /// A file's min/max on one sort column, kept beside its candidate so sweep
@@ -600,6 +752,72 @@ mod tests {
         assert!((score - 0.5).abs() < 1e-12);
         assert_eq!(left.file.path.as_str(), "range");
         assert_eq!(right.file.path.as_str(), "contained");
+    }
+
+    /// Remembered scores pick what the sweep picks.
+    #[test]
+    fn remembered_scores_agree_with_the_sweep() {
+        let wide = stats_entry("wide", &[("id", int_stat(0), int_stat(100))]);
+        let contained = stats_entry("contained", &[("id", int_stat(40), int_stat(45))]);
+        let shifted = stats_entry("shifted", &[("id", int_stat(90), int_stat(190))]);
+        let disjoint = stats_entry("disjoint", &[("id", int_stat(500), int_stat(600))]);
+        let files = vec![
+            candidate(&shifted, "id"),
+            candidate(&disjoint, "id"),
+            candidate(&wide, "id"),
+            candidate(&contained, "id"),
+        ];
+        let mut scores = LayoutScores::new();
+
+        let (score, left, right) = scores
+            .best_pair(std::slice::from_ref(&files), &["id".into()], u64::MAX)
+            .unwrap();
+
+        let (sweep_score, sweep_left, sweep_right) =
+            highest_scoring_pair(&files, &["id".into()], u64::MAX).unwrap();
+        assert!((score - sweep_score).abs() < 1e-6);
+        let mut pair = [left.file.path.as_str(), right.file.path.as_str()];
+        pair.sort();
+        let mut sweep_pair = [
+            sweep_left.file.path.as_str(),
+            sweep_right.file.path.as_str(),
+        ];
+        sweep_pair.sort();
+        assert_eq!(pair, sweep_pair);
+    }
+
+    /// After a merge, the next round scores the merge's output against the
+    /// survivors and no longer knows the pairs of the files it replaced.
+    #[test]
+    fn a_merge_output_is_scored_against_the_survivors() {
+        let wide = stats_entry("wide", &[("id", int_stat(0), int_stat(100))]);
+        let shifted = stats_entry("shifted", &[("id", int_stat(90), int_stat(190))]);
+        let far = stats_entry("far", &[("id", int_stat(150), int_stat(250))]);
+        let mut scores = LayoutScores::new();
+        let before = vec![
+            candidate(&wide, "id"),
+            candidate(&shifted, "id"),
+            candidate(&far, "id"),
+        ];
+        scores.best_pair(std::slice::from_ref(&before), &["id".into()], u64::MAX);
+        let merged = stats_entry("merged", &[("id", int_stat(140), int_stat(200))]);
+        let after = vec![candidate(&far, "id"), candidate(&merged, "id")];
+
+        let (score, left, right) = scores
+            .best_pair(std::slice::from_ref(&after), &["id".into()], u64::MAX)
+            .unwrap();
+
+        // [150, 200] contests half of merged's [140, 200] and half of far's
+        // [150, 250].
+        assert!((score - 0.5).abs() < 1e-6);
+        let mut pair = [left.file.path.as_str(), right.file.path.as_str()];
+        pair.sort();
+        assert_eq!(pair, ["far", "merged"]);
+        assert_eq!(
+            scores.pairs.len(),
+            1,
+            "the merged-away files' pairs are forgotten"
+        );
     }
 
     #[test]

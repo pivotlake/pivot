@@ -47,6 +47,7 @@
 //! commands carry the table snapshot captured by their query transaction. The
 //! actor stops before the datastore's dispatch pool shuts down.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -156,6 +157,9 @@ pub(crate) struct CompacterActor {
     poll_interval: Option<Duration>,
     datastore: Arc<DeltaDatastore>,
     commands: mpsc::UnboundedReceiver<CompactionCommand>,
+    /// Each table's layout pair scores, carried from round to round (see
+    /// [`overlap::LayoutScores`]).
+    layout_scores: HashMap<uuid::Uuid, overlap::LayoutScores>,
 }
 
 impl CompacterHandle {
@@ -176,6 +180,7 @@ impl CompacterHandle {
                 poll_interval,
                 datastore,
                 commands: receiver,
+                layout_scores: HashMap::new(),
             },
         )
     }
@@ -243,8 +248,11 @@ impl CompacterActor {
         }
     }
 
-    async fn compact_all(&self) {
-        for (name, table) in self.datastore.tables() {
+    async fn compact_all(&mut self) {
+        let tables = self.datastore.tables();
+        let live: HashSet<uuid::Uuid> = tables.iter().map(|(_, table)| table.id()).collect();
+        self.layout_scores.retain(|id, _| live.contains(id));
+        for (name, table) in tables {
             if let Err(error) = self.compact_table(&name, table, false).await {
                 error!(table = %name, error = %error, "compaction round failed");
             }
@@ -258,7 +266,7 @@ impl CompacterActor {
     /// large-file pair. A pass that finds nothing ends the round. Returns the
     /// table as it stands and the number of passes.
     async fn compact_table(
-        &self,
+        &mut self,
         name: &SchemaQualifiedTableName,
         mut table: CatalogTable,
         final_sweep: bool,
@@ -375,7 +383,7 @@ impl CompacterActor {
     /// yields positive-overlap pairs, so guardless sweeps never rewrite
     /// disjoint ranges.
     fn next_layout_optimization(
-        &self,
+        &mut self,
         table: &CatalogTable,
         apply_guards: bool,
     ) -> Option<Vec<FileRef>> {
@@ -399,24 +407,16 @@ impl CompacterActor {
             }
         }
 
-        let mut best: Option<(f64, Vec<FileRef>)> = None;
-        for (_, files) in by_partition {
-            let Some((score, left, right)) =
-                overlap::highest_scoring_pair(&files, table.sort_by(), self.target_bytes)
-            else {
-                continue;
-            };
-            if (!apply_guards || score >= LAYOUT_OVERLAP_THRESHOLD)
-                && best.as_ref().is_none_or(|(best, _)| score > *best)
-            {
-                best = Some((score, vec![left.file.clone(), right.file.clone()]));
-                // The score ceiling; no other partition can displace this pair.
-                if score >= 1.0 {
-                    break;
-                }
-            }
-        }
-        best.map(|(_, files)| files)
+        let partitions: Vec<Vec<overlap::LayoutCandidate<'_>>> =
+            by_partition.into_iter().map(|(_, files)| files).collect();
+        let scores = self
+            .layout_scores
+            .entry(table.id())
+            .or_insert_with(overlap::LayoutScores::new);
+        let (score, left, right) =
+            scores.best_pair(&partitions, table.sort_by(), self.target_bytes)?;
+        (!apply_guards || score >= LAYOUT_OVERLAP_THRESHOLD)
+            .then(|| vec![left.file.clone(), right.file.clone()])
     }
 }
 
