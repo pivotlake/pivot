@@ -222,8 +222,6 @@ struct ObjectShredder {
     /// Where each entry of the row's dictionary routes, by field id; rebuilt
     /// for every row that merges, reused so no row allocates.
     child_by_field_id: Vec<Option<usize>>,
-    /// The entries of an unsorted dictionary in byte order, for the merge.
-    dictionary_order: Vec<u32>,
     typed_nulls: Validity,
 }
 
@@ -261,7 +259,6 @@ impl ObjectShredder {
         Ok(Self {
             seen: vec![false; children.len()],
             child_by_field_id: Vec::new(),
-            dictionary_order: Vec::new(),
             children,
             sorted_names,
             by_name,
@@ -343,25 +340,17 @@ impl ObjectShredder {
 
     /// Fill `child_by_field_id` for `metadata`: one merge of its entries, in
     /// byte order, against the sorted column names. An unsorted dictionary
-    /// (the format allows one) is walked through a sorted permutation of its
-    /// entries, so the ids the table is indexed by stay the dictionary's own.
+    /// (the format allows one) is walked in the order its names sort into,
+    /// so the ids the table is indexed by stay the dictionary's own.
     fn route_dictionary(&mut self, metadata: &VariantMetadata<'_>) -> WriteResult<()> {
         let entries = metadata.len();
         self.child_by_field_id.clear();
         self.child_by_field_id.resize(entries, None);
-        self.dictionary_order.clear();
-        self.dictionary_order.extend(0..entries as u32);
-        if !metadata.is_sorted() {
-            self.dictionary_order.sort_unstable_by(|&left, &right| {
-                let left = metadata.name_bytes(left as usize).unwrap_or_default();
-                let right = metadata.name_bytes(right as usize).unwrap_or_default();
-                left.cmp(right)
-            });
-        }
+        let order = metadata.dictionary_order()?;
 
         let mut column = 0;
-        for &field_id in &self.dictionary_order {
-            let name = metadata.name_bytes(field_id as usize)?;
+        for &field_id in order.ids_by_name() {
+            let name = order.name(field_id);
             while column < self.sorted_names.len() && self.sorted_names[column].0.as_slice() < name
             {
                 column += 1;
