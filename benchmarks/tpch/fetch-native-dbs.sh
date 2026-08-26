@@ -3,10 +3,10 @@
 # from S3 into place, so a fresh box (or a wiped instance store) can rerun the
 # DuckDB and ClickHouse side-by-side comparisons without rebuilding them.
 #
-# The archives (zstd tars, built from SF100 loads of the s3://epsio-tpch/sf100/
+# The archives (zstd tars, built from SF100 loads of the s3://pivot-benchmarks/tpch/sf100/
 # parquet dataset):
-#   s3://epsio-tpch/native/tpch-native-duckdb.tar.zst   -> <root>/tpch-native.duckdb
-#   s3://epsio-tpch/native/clickhouse-tpch.tar.zst      -> <root>/clickhouse/
+#   s3://pivot-benchmarks/tpch/native/tpch-native-duckdb.tar.zst   -> <root>/tpch-native.duckdb
+#   s3://pivot-benchmarks/tpch/native/clickhouse-tpch.tar.zst      -> <root>/clickhouse/
 #
 # Usage:
 #   ./fetch-native-dbs.sh                      # both, into /mnt/nvme
@@ -31,7 +31,7 @@ done
 
 fetch() {
     local archive="$1"
-    aws s3 cp "s3://epsio-tpch/native/$archive" - --only-show-errors \
+    aws s3 cp "s3://pivot-benchmarks/tpch/native/$archive" - --only-show-errors \
         | tar -I "zstd -T0" -xf - -C "$root"
     echo "restored: $root ($archive)"
 }
