@@ -599,10 +599,30 @@ impl SharedNullColumn {
                 ))
             }
             DataType::Struct(fields) => {
-                let children = fields
-                    .iter()
-                    .map(|field| self.all_null_of(field.data_type(), allocator))
-                    .collect::<WriteResult<Vec<_>>>()?;
+                let mut children: Vec<ArrayRef> = Vec::with_capacity(fields.len());
+                for field in fields {
+                    let child = self.all_null_of(field.data_type(), allocator)?;
+                    // A field of an object is never null itself, only absent
+                    // through its parent, so its pair holds no nulls of its
+                    // own: the columns under it carry them.
+                    children.push(match field.is_nullable() {
+                        true => child,
+                        false => {
+                            let pair =
+                                child
+                                    .as_any()
+                                    .downcast_ref::<StructArray>()
+                                    .ok_or_else(|| {
+                                        WriteError::UnsupportedType(field.data_type().clone())
+                                    })?;
+                            Arc::new(StructArray::try_new(
+                                pair.fields().clone(),
+                                pair.columns().to_vec(),
+                                None,
+                            )?)
+                        }
+                    });
+                }
                 let (_, nulls) = self.parts(allocator);
                 Arc::new(StructArray::try_new(fields.clone(), children, Some(nulls))?)
             }

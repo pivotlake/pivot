@@ -10,10 +10,12 @@
 //!
 //! [`widen`] brings a batch from its file's layout to the union of the input
 //! files' layouts, so batches of every file share one Arrow type and can be
-//! gathered together. A path the file did not shred becomes an all-null leaf;
-//! its values stay in the row's leftover `value` until the output layout is
-//! decided. A path the file shredded as another kind than the union settled
-//! on is folded back into the leftover.
+//! gathered together. A leaf the union adds is filled from the leftover of
+//! the rows that carry its path there, and a path the file shredded as
+//! another kind than the union settled on goes back to the leftover to be
+//! filled in from there: a leaf never stands beside a leftover that still
+//! names its field, which is not a shredded column and is not something the
+//! folds below can read.
 //!
 //! [`reshred`] brings a run of rows from the union layout to the output
 //! layout. A leaf the output keeps is passed through as it is. A leaf the
@@ -33,7 +35,7 @@ use arrow_array::types::{BinaryViewType, Float64Type, Int64Type};
 use arrow_array::{Array, ArrayRef, BinaryViewArray, PrimitiveArray, StringViewArray, StructArray};
 use arrow_buffer::{BooleanBuffer, NullBuffer};
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Fields};
-use dispatch::arrays::take::{concat_chunks, take_chunked};
+use dispatch::arrays::take::{concat_chunks, take, take_chunked};
 use dispatch::memory::SlabAllocator;
 use parquet_variant::{
     ObjectBuilder, ParentState, ReadOnlyMetadataBuilder, ValueBuilder, Variant, VariantMetadata,
@@ -47,9 +49,9 @@ use super::shred::{
 };
 
 /// Bring `array`, a variant column in one file's layout, to the `union`
-/// layout (a `typed_value` type). Leaves the union keeps are shared with the
-/// input; leaves the file lacks are all null; leaves of another kind fold
-/// back into their position's leftover.
+/// layout (a `typed_value` type). Leaves the union keeps as the file has
+/// them are shared with the input; the rest are filled from the rows'
+/// leftovers.
 pub(super) fn widen(
     array: &VariantArray,
     union: &DataType,
@@ -198,9 +200,38 @@ fn widen_node(
         value = fold_back_dropped(metadata, value, object, target_fields, allocator, shared)?;
     }
 
+    let kept: Vec<Option<&StructArray>> = target_fields
+        .iter()
+        .map(|target_field| object.and_then(|object| kept_child(object, target_field)))
+        .collect();
+    // A leaf beside a leftover that still names its field is not a shredded
+    // column, so the paths the union keeps that this file did not shred as
+    // that kind are pulled out of the leftover here, into the leaves the
+    // union gives them. The paths the file did shred as that kind are left
+    // where they are, so a file already in the union layout is not shredded
+    // again.
+    let added: Fields = target_fields
+        .iter()
+        .zip(&kept)
+        .filter(|(_, kept)| kept.is_none())
+        .map(|(target_field, _)| target_field.clone())
+        .collect();
+    let pulled = if added.is_empty() || value.null_count() == value.len() {
+        None
+    } else {
+        let (leftover, typed) = pull(metadata, value, &DataType::Struct(added), allocator, shared)?;
+        value = leftover;
+        Some(
+            typed
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .expect("an object shredding type yields a struct")
+                .clone(),
+        )
+    };
+
     let mut children: Vec<ArrayRef> = Vec::with_capacity(target_fields.len());
-    for target_field in target_fields {
-        let kept = object.and_then(|object| kept_child(object, target_field));
+    for (target_field, kept) in target_fields.iter().zip(&kept) {
         let pair = match kept {
             Some(pair) => {
                 let (value, typed) = widen_node(
@@ -212,19 +243,31 @@ fn widen_node(
                 )?;
                 assemble_pair(value, typed)?
             }
-            None => all_null_pair(target_field.data_type(), allocator, shared)?,
+            None => match pulled
+                .as_ref()
+                .and_then(|pulled| pulled.column_by_name(target_field.name()))
+            {
+                Some(pair) => pair
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .expect("a shredded child is a struct")
+                    .clone(),
+                None => all_null_pair(target_field.data_type(), allocator, shared)?,
+            },
         };
         children.push(Arc::new(pair));
     }
-    let nulls = match object {
-        Some(object) => object.nulls().cloned(),
-        None => Some(
+    let nulls = match (object, &pulled) {
+        (None, None) => Some(
             shared
                 .all_null(allocator)
                 .nulls()
                 .cloned()
                 .expect("all rows null"),
         ),
+        (Some(object), None) => object.nulls().cloned(),
+        (None, Some(pulled)) => pulled.nulls().cloned(),
+        (Some(object), Some(pulled)) => Some(NullBuffer::new(&present(object) | &present(pulled))),
     };
     let typed = StructArray::try_new(object_fields(target_fields), children, nulls)?;
     Ok((value, Arc::new(typed)))
@@ -261,7 +304,7 @@ fn reshred_node(
         if value.null_count() == value.len() {
             return Ok((value, Some(shared.all_null_of(target, allocator)?)));
         }
-        let (value, typed) = pull(metadata, value, target, allocator)?;
+        let (value, typed) = pull(metadata, value, target, allocator, shared)?;
         return Ok((value, Some(typed)));
     };
 
@@ -278,7 +321,7 @@ fn reshred_node(
 
     // The rows that carry a kept child in this leftover give it up now.
     let pulled = if value.null_count() < value.len() {
-        let (leftover, typed) = pull(metadata, value, target, allocator)?;
+        let (leftover, typed) = pull(metadata, value, target, allocator, shared)?;
         value = leftover;
         Some(
             typed
@@ -345,25 +388,137 @@ fn reshred_node(
 /// Shred `value`, a leftover column, into `target`: the rows that hold
 /// something the target types give it up, and keep the rest as their
 /// leftover.
+///
+/// Only the rows with a leftover are shredded, packed together, and the
+/// result is spread back over all rows: a child no row gave anything to
+/// comes out as the shared all-null column, so the pass costs the rows that
+/// hold a leftover times the children they fill, never the rows of the run
+/// times the children of the layout.
 fn pull(
     metadata: &BinaryViewArray,
     value: BinaryViewArray,
     target: &DataType,
     allocator: &mut SlabAllocator,
+    shared: &mut SharedNullColumn,
 ) -> WriteResult<(BinaryViewArray, ArrayRef)> {
-    let nulls = value.nulls().cloned();
-    let leftover = assemble_column(metadata, value, None, nulls)?;
+    let rows = value.len();
+    let held = present(&value);
+    let indices: Vec<u32> = held.set_indices().map(|row| row as u32).collect();
+    let (packed_metadata, packed_value) = if indices.len() == rows {
+        (metadata.clone(), value)
+    } else {
+        let metadata: ArrayRef = Arc::new(metadata.clone());
+        let value: ArrayRef = Arc::new(value);
+        (
+            as_binary_view(take(allocator, &metadata, &indices)?),
+            as_binary_view(take(allocator, &value, &indices)?),
+        )
+    };
+    let leftover = assemble_column(&packed_metadata, packed_value, None, None)?;
     let shredded = shred::shred_into_slabs(&leftover, target, allocator)?;
-    Ok((
+    let packed_leftover: ArrayRef = Arc::new(
         shredded
             .value_field()
             .expect("the shredder keeps a value column")
             .clone(),
-        shredded
-            .typed_value_field()
-            .expect("the shredder builds the typed column")
-            .clone(),
-    ))
+    );
+    let packed_typed = shredded
+        .typed_value_field()
+        .expect("the shredder builds the typed column");
+    if indices.len() == rows {
+        return Ok((as_binary_view(packed_leftover), packed_typed.clone()));
+    }
+
+    // Row `row` of the run is packed row `k` when it held a leftover, and
+    // the filler's own row otherwise.
+    let mut mapping = Vec::with_capacity(rows);
+    let mut packed_row = 0;
+    for row in 0..rows {
+        if held.value(row) {
+            mapping.push((0, packed_row));
+            packed_row += 1;
+        } else {
+            mapping.push((1, row as u32));
+        }
+    }
+    let leftover = as_binary_view(spread_leaf(&packed_leftover, &mapping, allocator, shared)?);
+    let typed = spread_typed(packed_typed, &mapping, allocator, shared)?;
+    Ok((leftover, typed))
+}
+
+/// `packed`, a `typed_value` column over the rows that held a leftover,
+/// spread over the run by `mapping`. An object's validity spreads with it;
+/// a child's pair stays all-valid, as a pair is.
+fn spread_typed(
+    packed: &ArrayRef,
+    mapping: &[(u32, u32)],
+    allocator: &mut SlabAllocator,
+    shared: &mut SharedNullColumn,
+) -> WriteResult<ArrayRef> {
+    let Some(object) = packed.as_any().downcast_ref::<StructArray>() else {
+        return spread_leaf(packed, mapping, allocator, shared);
+    };
+    if object.null_count() == object.len() {
+        return shared.all_null_of(packed.data_type(), allocator);
+    }
+    let mut children: Vec<ArrayRef> = Vec::with_capacity(object.num_columns());
+    for column in object.columns() {
+        let pair = column
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("a shredded child is a pair");
+        let value = spread_leaf(
+            pair.column_by_name("value").expect("a pair has a value"),
+            mapping,
+            allocator,
+            shared,
+        )?;
+        let typed = spread_typed(
+            pair.column_by_name("typed_value")
+                .expect("a pair has a typed_value"),
+            mapping,
+            allocator,
+            shared,
+        )?;
+        children.push(Arc::new(StructArray::try_new(
+            pair.fields().clone(),
+            vec![value, typed],
+            None,
+        )?));
+    }
+    let packed_validity = present(object);
+    let nulls = BooleanBuffer::collect_bool(mapping.len(), |row| match mapping[row] {
+        (0, packed_row) => packed_validity.value(packed_row as usize),
+        _ => false,
+    });
+    Ok(Arc::new(StructArray::try_new(
+        object.fields().clone(),
+        children,
+        Some(NullBuffer::new(nulls)),
+    )?))
+}
+
+/// `packed`, a leaf over the rows that held a leftover, spread over the run
+/// by `mapping`: the shared all-null column when no row gave it anything.
+fn spread_leaf(
+    packed: &ArrayRef,
+    mapping: &[(u32, u32)],
+    allocator: &mut SlabAllocator,
+    shared: &mut SharedNullColumn,
+) -> WriteResult<ArrayRef> {
+    let filler = shared.all_null_of(packed.data_type(), allocator)?;
+    if packed.null_count() == packed.len() {
+        return Ok(filler);
+    }
+    Ok(take_chunked(allocator, &[packed.clone(), filler], mapping)?)
+}
+
+fn as_binary_view(array: ArrayRef) -> BinaryViewArray {
+    array
+        .as_any()
+        .downcast_ref::<BinaryViewArray>()
+        .expect("a binary view column")
+        .clone()
 }
 
 /// Whether the child `field` of an object is one `target_fields` keeps as the
@@ -818,6 +973,25 @@ mod tests {
             .collect()
     }
 
+    /// Every row's document with the kind of every value, so that a value
+    /// read back as another kind is a difference. An integer's width and a
+    /// string's encoding are not: a value re-encodes at the width of the leaf
+    /// it passed through.
+    fn typed_documents(array: &VariantArray) -> Vec<Option<String>> {
+        let whole = unshred_variant(array).unwrap();
+        (0..whole.len())
+            .map(|row| {
+                whole.is_valid(row).then(|| {
+                    let mut text = format!("{:?}", whole.value(row));
+                    for width in ["Int8(", "Int16(", "Int32(", "Int64("] {
+                        text = text.replace(width, "Int(");
+                    }
+                    text.replace("ShortString(ShortString(", "String((")
+                })
+            })
+            .collect()
+    }
+
     fn rendered(array: &VariantArray) -> Vec<Option<String>> {
         let whole = unshred_variant(array).unwrap();
         (0..whole.len())
@@ -875,6 +1049,141 @@ mod tests {
                 ),
                 _ => assert_eq!(our_column, reference_column, "{} leaf", field.name()),
             }
+        }
+    }
+
+    /// Layouts and documents at random: two files of their own layouts,
+    /// widened to a union, gathered together and reshredded into an output
+    /// layout. Every step comes out as taking its input's documents apart
+    /// and shredding them whole would, leaf for leaf.
+    #[test]
+    fn a_run_of_any_layouts_comes_out_as_shredding_it_whole_would() {
+        init_test_free_pool(64);
+        let mut allocator = SlabAllocator::new(false);
+        let mut seed: u64 = 0x2545F4914F6CDD1D;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let scalar = |pick: u64| match pick % 3 {
+            0 => DataType::Int64,
+            1 => DataType::Float64,
+            _ => DataType::Utf8View,
+        };
+        let docs_of = |rand: &mut dyn FnMut() -> u64| {
+            let mut docs: Vec<Option<String>> = Vec::new();
+            for _ in 0..2 + rand() % 5 {
+                if rand() % 11 == 0 {
+                    docs.push(None);
+                    continue;
+                }
+                let mut fields: Vec<String> = Vec::new();
+                for name in ["a", "b", "c"] {
+                    match rand() % 6 {
+                        0 => continue,
+                        1 => fields.push(format!("\"{name}\": {}", rand() % 100)),
+                        2 => fields.push(format!("\"{name}\": {}.5", rand() % 100)),
+                        3 => fields.push(format!("\"{name}\": \"s{}\"", rand() % 100)),
+                        4 => fields.push(format!("\"{name}\": true")),
+                        _ => {
+                            let mut inner: Vec<String> = Vec::new();
+                            for child in ["x", "y"] {
+                                match rand() % 4 {
+                                    0 => continue,
+                                    1 => inner.push(format!("\"{child}\": {}", rand() % 100)),
+                                    2 => inner.push(format!("\"{child}\": \"t{}\"", rand() % 100)),
+                                    _ => inner.push(format!("\"{child}\": {}.25", rand() % 100)),
+                                }
+                            }
+                            fields.push(format!("\"{name}\": {{{}}}", inner.join(", ")));
+                        }
+                    }
+                }
+                docs.push(Some(format!("{{{}}}", fields.join(", "))));
+            }
+            docs
+        };
+        let layout_of = |rand: &mut dyn FnMut() -> u64| {
+            let mut fields: Vec<(&str, DataType)> = Vec::new();
+            for name in ["a", "b", "c"] {
+                match rand() % 5 {
+                    0 => continue,
+                    1 => {
+                        let mut inner: Vec<(&str, DataType)> = Vec::new();
+                        for child in ["x", "y"] {
+                            if rand() % 3 != 0 {
+                                inner.push((child, scalar(rand())));
+                            }
+                        }
+                        if !inner.is_empty() {
+                            fields.push((name, object(inner)));
+                        }
+                    }
+                    _ => fields.push((name, scalar(rand()))),
+                }
+            }
+            (!fields.is_empty()).then(|| object(fields))
+        };
+
+        for case in 0..500u64 {
+            let mut rand = || next();
+            let first = docs_of(&mut rand);
+            let second = docs_of(&mut rand);
+            let (Some(first_layout), Some(second_layout), Some(union), Some(output)) = (
+                layout_of(&mut rand),
+                layout_of(&mut rand),
+                layout_of(&mut rand),
+                layout_of(&mut rand),
+            ) else {
+                continue;
+            };
+            fn text(docs: &[Option<String>]) -> Vec<Option<&str>> {
+                docs.iter().map(|doc| doc.as_deref()).collect()
+            }
+            let (first_rows, second_rows) = (text(&first), text(&second));
+            let case = format!(
+                "case {case}: {first_layout:?} + {second_layout:?} -> {union:?} -> {output:?} \
+                 over {first_rows:?} and {second_rows:?}"
+            );
+
+            println!("{case}");
+            let mut widened = Vec::new();
+            for (rows, layout) in [(&first_rows, &first_layout), (&second_rows, &second_layout)] {
+                let file = shredded(rows, layout, &mut allocator);
+                let wide = match widen(&file, &union, &mut allocator) {
+                    Ok(wide) => wide,
+                    Err(error) => panic!("{case}: widen: {error}"),
+                };
+                let whole = unshred_variant(&file).unwrap();
+                let rebuilt = shred::shred_into_slabs(&whole, &union, &mut allocator).unwrap();
+                assert_eq!(
+                    typed_documents(&wide),
+                    typed_documents(&rebuilt),
+                    "{case}: widen"
+                );
+                assert_same_leaves(wide.inner(), rebuilt.inner());
+                widened.push(wide);
+            }
+            let merged = interleaved(&widened, &mut allocator);
+            let reshredded = match reshred(&merged, &output, &mut allocator) {
+                Ok(reshredded) => reshredded,
+                Err(error) => panic!("{case}: reshred: {error}"),
+            };
+
+            // What the merge would have come out with had it taken the run's
+            // documents apart and shredded them whole: the same column, leaf
+            // for leaf.
+            let whole = unshred_variant(&merged).unwrap();
+            let rebuilt = shred::shred_into_slabs(&whole, &output, &mut allocator).unwrap();
+            assert_eq!(reshredded.data_type(), rebuilt.data_type(), "{case}: type");
+            assert_eq!(
+                typed_documents(&reshredded),
+                typed_documents(&rebuilt),
+                "{case}: documents"
+            );
+            assert_same_leaves(reshredded.inner(), rebuilt.inner());
         }
     }
 
