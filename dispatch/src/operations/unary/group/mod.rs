@@ -299,6 +299,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
                 zero_hash_pending: false,
                 output_allocator: None,
                 output_accumulator: None,
+                merge_scratch: None,
             },
             gather,
             aggregated_table,
@@ -384,6 +385,8 @@ pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// worker only learns them from the first job it steals. A worker running only
     /// count-only `COUNT(DISTINCT)` jobs never builds one.
     output_accumulator: Option<output::OutputAccumulator<K, V>>,
+    /// Per-worker buffers the sub-partition merge refills job after job.
+    merge_scratch: Option<merge::SubPartitionScratch<K::Persisted, V>>,
 }
 
 /// One (NUMA node, partition) merge work unit.
@@ -417,6 +420,8 @@ pub struct PartitionJob<K: KeyExtractor, V: AggregationValue + ?Sized> {
     partition_capacity: usize,
     /// [`PARTITIONS`] when nobody switched, else [`RADIX_PARTITIONS`].
     num_partitions: usize,
+    /// Sub-partitions each job merges in; 1 merges the partition whole.
+    sub_partitions: usize,
     key_config: K::Config,
     /// The value's shared context, for the partition merge's entry fold + output.
     shared_context: V::SharedContext,
@@ -487,9 +492,35 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
     pub fn run_into(
         self,
         acc: &mut Option<output::OutputAccumulator<K, V>>,
+        scratch: &mut Option<merge::SubPartitionScratch<K::Persisted, V>>,
         sender: &mut dyn Sender<RecordBatch>,
         allocator: &mut SlabAllocator,
     ) -> Result<()> {
+        let Some(cross_node) = &self.cross_node_merge else {
+            // Merge in cache-resident sub-partitions when the partition's
+            // target would not fit; every merged table is emitted as soon
+            // as it is complete.
+            let mut outcome = Ok(());
+            merge::merge_combined_into::<K::Stored, V>(
+                self.index,
+                &self.buffers,
+                &self.tables,
+                self.partition_capacity,
+                self.num_partitions,
+                self.sub_partitions,
+                &self.key_arena,
+                &self.shared_context,
+                scratch.get_or_insert_with(merge::SubPartitionScratch::new),
+                &mut |table| {
+                    if outcome.is_ok() {
+                        outcome = self.emit_table(table, acc, sender, allocator);
+                    }
+                },
+            );
+            return outcome;
+        };
+        // A cross-node merge exchanges whole partition tables between nodes,
+        // so this partition is merged into one table.
         let result_map = merge::merge_combined::<K::Stored, V>(
             self.index,
             &self.buffers,
@@ -499,28 +530,36 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
             &self.key_arena,
             &self.shared_context,
         );
-        let result_map = match &self.cross_node_merge {
-            None => result_map,
-            Some(cross_node) => match cross_node.send(result_map) {
-                // Another node's job for this partition is still running; it
-                // will receive the tables and run the final merge.
-                None => return Ok(()),
-                Some(node_tables) => merge::merge_node_aggregated_tables::<K::Stored, V>(
-                    node_tables,
-                    self.partition_capacity,
-                    self.num_partitions.trailing_zeros(),
-                    &self.key_arena,
-                    &self.shared_context,
-                ),
-            },
+        let result_map = match cross_node.send(result_map) {
+            // Another node's job for this partition is still running; it
+            // will receive the tables and run the final merge.
+            None => return Ok(()),
+            Some(node_tables) => merge::merge_node_aggregated_tables::<K::Stored, V>(
+                node_tables,
+                self.partition_capacity,
+                self.num_partitions.trailing_zeros(),
+                &self.key_arena,
+                &self.shared_context,
+            ),
         };
-        if result_map.len() == 0 {
+        self.emit_table(&result_map, acc, sender, allocator)
+    }
+
+    /// Feeds one merged table's groups into the worker's output.
+    fn emit_table(
+        &self,
+        table: &MultiSlabTable<K::Persisted, V>,
+        acc: &mut Option<output::OutputAccumulator<K, V>>,
+        sender: &mut dyn Sender<RecordBatch>,
+        allocator: &mut SlabAllocator,
+    ) -> Result<()> {
+        if table.len() == 0 {
             return Ok(());
         }
-        // Global COUNT(DISTINCT) needs only each partition's distinct-key count,
+        // Global COUNT(DISTINCT) needs only each table's distinct-key count,
         // not the keys, so it bypasses the accumulator and emits a single row.
         if self.count_only {
-            return output::emit_count(result_map.len(), sender);
+            return output::emit_count(table.len(), sender);
         }
         let acc = acc.get_or_insert_with(|| {
             output::OutputAccumulator::new(
@@ -533,7 +572,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
                 self.value_output_types.clone(),
             )
         });
-        acc.extend_from_table(result_map, allocator, &mut *sender)
+        acc.extend_from_table(table, allocator, &mut *sender)
     }
 }
 
@@ -654,17 +693,17 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // so merge every node's sources directly and pay the remote reads
         // once. An all-in-place merge is always direct: its tables are
         // per-worker aggregated already and their estimate equals their
-        // total, so the test is never met. Counting the scattered rows walks
-        // every switched worker's every bucket, so only pay for it when a
-        // second node exists at all.
-        let hierarchical = node_count > 1 && {
-            let scatter_rows: usize = buffers_by_node
-                .iter()
-                .flatten()
-                .map(|b| b.0.iter().map(|bucket| bucket.len()).sum::<usize>())
-                .sum();
-            total_in_place + scatter_rows > 2 * estimate
-        };
+        // total, so the test is never met. The scattered row count also
+        // decides whether merge jobs split into sub-partitions.
+        let scatter_rows: usize = buffers_by_node
+            .iter()
+            .flatten()
+            .map(|b| b.0.iter().map(|bucket| bucket.len()).sum::<usize>())
+            .sum();
+        let merged_rows = total_in_place + scatter_rows;
+        let hierarchical = node_count > 1 && merged_rows > 2 * estimate;
+        let sub_partitions =
+            merge::sub_partition_count(partition_capacity, entry_bytes, merged_rows, estimate);
         // Wrap the arena's ring buffers once for the whole output phase (consume
         // is done, so `next_idx` is final). Every partition job shares this one
         // `Arc<[Buffer]>` for zero-copy string output, so a batch attaches it with
@@ -688,6 +727,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
                 output_buffers: output_buffers.clone(),
                 partition_capacity,
                 num_partitions,
+                sub_partitions,
                 key_config: self.key_config.clone(),
                 shared_context: self.shared_context.clone(),
                 value_output_types: self.value_output_types.clone(),
@@ -778,8 +818,13 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Outputter<RecordBatch>
                 let allocator = self
                     .output_allocator
                     .get_or_insert_with(|| SlabAllocator::new(false));
-                job.run_into(&mut self.output_accumulator, sender, allocator)
-                    .map_err(unary::Error::from)?;
+                job.run_into(
+                    &mut self.output_accumulator,
+                    &mut self.merge_scratch,
+                    sender,
+                    allocator,
+                )
+                .map_err(unary::Error::from)?;
             }
             Steal::Empty => {
                 if self.partition_jobs_injected.load(Ordering::Acquire) {
