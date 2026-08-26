@@ -22,10 +22,17 @@ use arrow_schema::DataType;
 /// of bits, small enough to stay cache-resident under probing.
 const MAX_DOMAIN: u64 = 1 << 26;
 
-/// Build-key density (`distinct values present / domain width`) above which
-/// the filter is not built: it would pass nearly every row the build key
-/// range admits, so the per-row test is pure overhead.
+/// Build-key density (`build rows / domain width`) at or above which the
+/// filter is not built. A set that dense passes nearly every row the build
+/// key range admits, so the per-row test is pure overhead. Row count bounds
+/// distinct values from above, so the gate needs no pass over the keys.
 const MAX_DENSITY: f64 = 0.9;
+
+/// Most build rows the filter is built from. The set pass runs serially at
+/// the build's final gather arrival while every other worker waits, so a
+/// huge build side would stall the whole flow for longer than the filter
+/// could ever save.
+const MAX_BUILD_ROWS: usize = 1 << 24;
 
 /// One bit per value of `[min, min + domain)`; a set bit means some build row
 /// carries that key.
@@ -38,41 +45,36 @@ pub struct KeyBitset {
 
 impl KeyBitset {
     /// Build the filter from the build side's key arrays, or `None` when the
-    /// key type is not a supported integer, the domain is too wide, or the
-    /// key set is too dense to be worth testing. `arrays` must hold every
-    /// build key column array; a partial set would reject matching probe rows.
+    /// key type is not a supported integer or the domain, row count, or
+    /// density gates say a filter is not worth its cost. `arrays` must hold
+    /// every build key column array and `bounds` the column's non-null
+    /// (min, max); a partial set would reject matching probe rows.
+    ///
+    /// Every gate reads only `bounds` and `total_rows`, so a build side that
+    /// seals no filter pays nothing beyond them; the single pass over the
+    /// keys happens only for a build the gates admit.
     pub(crate) fn try_build<'arrays>(
-        arrays: impl Iterator<Item = &'arrays ArrayRef> + Clone,
+        arrays: impl Iterator<Item = &'arrays ArrayRef>,
+        bounds: Option<(i64, i64)>,
+        total_rows: usize,
     ) -> Option<KeyBitset> {
-        let data_type = arrays.clone().next()?.data_type().clone();
-        let mut bounds: Option<(i64, i64)> = None;
-        for array in arrays.clone() {
-            for value in integer_values(array, &data_type)?.flatten() {
-                bounds = Some(match bounds {
-                    None => (value, value),
-                    Some((min, max)) => (min.min(value), max.max(value)),
-                });
-            }
-        }
         let (min, max) = bounds?;
         let domain = max.abs_diff(min) + 1;
-        if domain > MAX_DOMAIN {
+        if domain > MAX_DOMAIN || total_rows > MAX_BUILD_ROWS {
+            return None;
+        }
+        if total_rows as f64 >= MAX_DENSITY * domain as f64 {
             return None;
         }
 
+        let mut arrays = arrays.peekable();
+        let data_type = arrays.peek()?.data_type().clone();
         let mut words = vec![0u64; domain.div_ceil(64) as usize];
-        let mut ones = 0u64;
         for array in arrays {
             for value in integer_values(array, &data_type)?.flatten() {
                 let bit = value.abs_diff(min);
-                let word = &mut words[(bit / 64) as usize];
-                let mask = 1u64 << (bit % 64);
-                ones += u64::from(*word & mask == 0);
-                *word |= mask;
+                words[(bit / 64) as usize] |= 1 << (bit % 64);
             }
-        }
-        if ones as f64 / domain as f64 > MAX_DENSITY {
-            return None;
         }
         Some(KeyBitset { min, domain, words })
     }
@@ -129,6 +131,12 @@ impl KeyBitset {
         let bit = (value as u64).wrapping_sub(self.min as u64);
         bit < self.domain && self.words[(bit / 64) as usize] & (1 << (bit % 64)) != 0
     }
+}
+
+/// The single value of a one-element array widened to `i64`, or `None` when
+/// the type is not a supported integer or the value is null.
+pub(crate) fn integer_scalar(array: &ArrayRef) -> Option<i64> {
+    integer_values(array, array.data_type())?.next().flatten()
 }
 
 /// The array's values widened to `i64`, or `None` for a non-integer key type.

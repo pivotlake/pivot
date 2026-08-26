@@ -26,6 +26,7 @@ use crate::operations::unary::{BatchesOutputter, CollectorFactory, Normalizer, U
 /// Creates one [`JoinBuildConsumer`] per worker, with shared state wired up.
 pub struct JoinBuildFactory<K: JoinKey, const BUILD_OUTER: bool, O> {
     key_columns: Vec<usize>,
+    filter_columns: Vec<usize>,
     hash_state: RandomState,
     outputter: O,
     _key: PhantomData<fn() -> K>,
@@ -214,6 +215,11 @@ pub fn create_for_workers<
             );
             JoinBuildFactory {
                 key_columns: spec.build_key_indices.clone(),
+                filter_columns: spec
+                    .build_filters
+                    .iter()
+                    .map(|filter| filter.build_column)
+                    .collect(),
                 hash_state: hash_state.clone(),
                 outputter,
                 _key: PhantomData,
@@ -271,12 +277,14 @@ pub(crate) fn create_normalizing_for_workers<
     for (worker, (build, normalizer)) in build_factories.into_iter().zip(normalizers).enumerate() {
         let JoinBuildFactory {
             key_columns,
+            filter_columns,
             hash_state,
             outputter,
             _key,
         } = build;
         normalized_builds.push(JoinBuildFactory {
             key_columns,
+            filter_columns,
             hash_state,
             outputter: normalizer,
             _key,
@@ -297,6 +305,7 @@ where
     fn build_unary(self) -> Self::Unary {
         PipelineBreaker::Consuming(JoinBuildConsumer::new(
             self.key_columns,
+            self.filter_columns,
             self.hash_state,
             self.outputter,
         ))
