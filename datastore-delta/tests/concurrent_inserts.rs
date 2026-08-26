@@ -13,8 +13,8 @@ use dispatch::DataFlowDispatcher;
 use tempfile::TempDir;
 
 use catalog::datastore::DatastoreTransaction;
-use catalog::delta::DeltaDatastore;
 use common::{commit_datastore_transaction, insert_batches, shared_dispatcher};
+use datastore_delta::DeltaDatastore;
 use planner::catalog::{Column, CreateTableRequest, SchemaQualifiedTableName};
 use planner::types::Type;
 

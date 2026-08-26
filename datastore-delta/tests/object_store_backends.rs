@@ -14,7 +14,7 @@
 
 mod common;
 
-use catalog::test_support as harness;
+use datastore_delta::test_support as harness;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,11 +24,11 @@ use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
 use catalog::datastore::DatastoreTransaction;
-use catalog::delta::DeltaDatastore;
 use common::{
     DispatchGuard, collect_i64s, commit_datastore_transaction, current_parquet,
     dispatch_with_buffers, strings_and_ints,
 };
+use datastore_delta::DeltaDatastore;
 use dispatch::Projection;
 use harness::Backend;
 use object_storage::ObjectPath;
@@ -213,13 +213,13 @@ mod bodies {
                 &merged_bytes,
             )
             .unwrap();
-        let merged = catalog::delta::FileRef {
+        let merged = datastore_delta::FileRef {
             path: merged_path,
             size: merged_bytes.len() as u64,
         };
 
         table
-            .replace_data_files(&inputs, &[catalog::delta::DeltaFileEntry::new(merged)])
+            .replace_data_files(&inputs, &[datastore_delta::DeltaFileEntry::new(merged)])
             .unwrap();
 
         assert_eq!(scan(&d, &datastore, "events"), vec![1, 2, 3, 4]);

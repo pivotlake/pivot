@@ -171,7 +171,7 @@ pub fn parquet_table(
 /// groups for inspection. The background refresh does the same sweep; here we
 /// drive it on a cloned-out table handle.
 pub fn current_parquet(
-    datastore: &catalog::delta::DeltaDatastore,
+    datastore: &datastore_delta::DeltaDatastore,
     name: &str,
 ) -> Arc<ParquetTable> {
     let mut table = datastore
@@ -187,7 +187,7 @@ pub fn current_parquet(
 /// engine wrote asks the table rather than guessing the path.
 pub fn table_dir(
     database_root: &std::path::Path,
-    datastore: &catalog::delta::DeltaDatastore,
+    datastore: &datastore_delta::DeltaDatastore,
     name: &str,
 ) -> std::path::PathBuf {
     database_root.join(
@@ -318,7 +318,7 @@ pub fn write_parquet_files(
         .collect();
 
     let datastore =
-        catalog::delta::DeltaDatastore::open(&database_root.to_string_lossy(), dispatch).unwrap();
+        datastore_delta::DeltaDatastore::open(&database_root.to_string_lossy(), dispatch).unwrap();
     let creation = datastore.clone().begin_transaction();
     creation
         .bind_create_table(CreateTableRequest {

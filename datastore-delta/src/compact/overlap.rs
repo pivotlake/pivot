@@ -6,7 +6,7 @@ use arrow_cast::cast;
 use arrow_ord::cmp;
 use arrow_schema::DataType;
 
-use crate::delta::manifest::DeltaFileEntry;
+use crate::manifest::DeltaFileEntry;
 
 /// Overlap score for string ranges that genuinely intersect. String values
 /// carry no meaningful width, so no uniform-distribution fraction can be
@@ -342,7 +342,7 @@ mod tests {
     use arrow_array::{ArrayRef, Int64Array, StringViewArray};
 
     use super::*;
-    use crate::delta::manifest::FileStats;
+    use crate::manifest::FileStats;
     use object_storage::{FileRef, ObjectPath};
 
     fn int_stat(value: i64) -> ArrayRef {

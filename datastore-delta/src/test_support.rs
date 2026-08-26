@@ -2,8 +2,8 @@
 
 pub use object_storage::test_support::*;
 
-use crate::delta::DeltaFileEntry;
-use crate::delta::{CatalogTable, PartitionValues};
+use crate::DeltaFileEntry;
+use crate::{CatalogTable, PartitionValues};
 use object_storage::{FileRef, ObjectPath};
 
 impl CatalogTable {
@@ -13,7 +13,7 @@ impl CatalogTable {
         path: ObjectPath,
         bytes: &[u8],
         partition: Option<PartitionValues>,
-    ) -> crate::delta::Result<()> {
+    ) -> crate::Result<()> {
         if self.file_refs().iter().any(|file| file.path == path) {
             return Ok(());
         }
@@ -36,7 +36,7 @@ impl CatalogTable {
         &mut self,
         removed: &[ObjectPath],
         added: &[DeltaFileEntry],
-    ) -> crate::delta::Result<()> {
+    ) -> crate::Result<()> {
         self.commit_entries(removed, added, false)
     }
 }

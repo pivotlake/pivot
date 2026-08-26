@@ -10,7 +10,7 @@
 //! that object's storage mtime is older than the table's
 //! `deletedFileRetentionDuration`. In the same sweep it also deletes the commit
 //! JSONs a checkpoint has folded in that are past the log-retention window (the
-//! checkpoints are written inline on the commit path, in [`crate::delta::log`], not
+//! checkpoints are written inline on the commit path, in [`crate::log`], not
 //! here), so the `_delta_log` does not grow unbounded either. A dropped table
 //! follows the same shape one level up: `DROP TABLE` removes only the catalog
 //! entries and leaves a manifest tombstone, and the sweep deletes the whole
@@ -32,7 +32,7 @@ use tracing::{info, warn};
 
 use planner::catalog::SchemaQualifiedTableName;
 
-use crate::delta::{CatalogTable, DeltaDatastore};
+use crate::{CatalogTable, DeltaDatastore};
 use object_storage::ObjectPath;
 
 /// Default cadence for re-scanning the tables for newly-expired files and

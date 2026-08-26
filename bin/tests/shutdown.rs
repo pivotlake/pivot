@@ -13,9 +13,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bin::server::Server;
-use catalog::delta::DeltaDatastore;
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
 use common::{pick_free_port, pivot_metastore, wait_until_listening};
+use datastore_delta::DeltaDatastore;
 use dispatch::Dispatch;
 use tokio::sync::oneshot;
 

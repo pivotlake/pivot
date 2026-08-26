@@ -760,6 +760,7 @@ dependencies = [
  "catalog",
  "clap",
  "core_affinity",
+ "datastore-delta",
  "dispatch",
  "futures",
  "include_dir",
@@ -1017,39 +1018,16 @@ checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
 name = "catalog"
 version = "0.1.0"
 dependencies = [
- "arrow",
- "arrow-arith",
  "arrow-array",
- "arrow-cast",
- "arrow-ord",
  "arrow-schema",
- "arrow-select",
  "async-trait",
  "base64",
- "bytes",
- "catalog",
- "core_affinity",
- "criterion",
  "crossbeam-deque",
- "delta_kernel",
- "delta_kernel_default_engine",
  "dispatch",
  "object-storage",
- "parquet",
  "parquet-engine",
- "parquet-variant",
- "parquet-variant-compute",
- "parquet-variant-json",
  "planner",
- "serde",
- "serde_json",
- "tempfile",
  "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
 ]
 
 [[package]]
@@ -1618,6 +1596,45 @@ dependencies = [
  "darling_core",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "datastore-delta"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-arith",
+ "arrow-array",
+ "arrow-cast",
+ "arrow-ord",
+ "arrow-schema",
+ "arrow-select",
+ "async-trait",
+ "bytes",
+ "catalog",
+ "core_affinity",
+ "criterion",
+ "crossbeam-deque",
+ "datastore-delta",
+ "delta_kernel",
+ "delta_kernel_default_engine",
+ "dispatch",
+ "object-storage",
+ "parquet",
+ "parquet-engine",
+ "parquet-variant",
+ "parquet-variant-compute",
+ "parquet-variant-json",
+ "planner",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
 ]
 
 [[package]]
@@ -2989,6 +3006,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "catalog",
+ "datastore-delta",
  "dispatch",
  "object-storage",
  "pgwire",

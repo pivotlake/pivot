@@ -39,7 +39,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-use catalog::delta::DEFAULT_REFRESH_INTERVAL;
+use datastore_delta::DEFAULT_REFRESH_INTERVAL;
 use metastore_disk::{ByteSize, Interval, MetastoreConfig};
 use serde::Deserialize;
 

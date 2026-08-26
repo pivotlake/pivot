@@ -3,14 +3,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::datastore::{DatastoreColumnMetadata, DatastoreFileMetadata, DatastoreTableMetadata};
-use crate::delta::Error;
-use crate::delta::manifest::{
+use crate::Error;
+use crate::manifest::{
     ColumnStatFilter, DeltaFileEntry, FileStats, PartitionEqFilter, PartitionValues, scalar_equal,
 };
 use arrow_array::{Array, ArrayRef, Datum, Scalar};
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
 use arrow_schema::DataType;
+use catalog::datastore::{DatastoreColumnMetadata, DatastoreFileMetadata, DatastoreTableMetadata};
 use crossbeam_deque::{Injector, Steal};
 use dispatch::{DataFlowDispatcher, Projection};
 use object_storage::{self, DataFile, FileRef, ObjectPath, ObjectStore};
@@ -100,7 +100,7 @@ pub struct CatalogTable {
     dispatcher: DataFlowDispatcher,
     /// The Kernel engine this table's log is read and written through, shared
     /// with every other table of the datastore that opened it.
-    engine: crate::delta::log::DeltaEngine,
+    engine: crate::log::DeltaEngine,
     /// This exists only for throughput: Delta log compare-and-swap already ensures
     /// correctness, but concurrent in-process writers can all start at `V` and race
     /// for `V + 1`, forcing every loser to replay the log and fetch the winner's
@@ -123,7 +123,7 @@ impl CatalogTable {
         files: Vec<TableFile>,
         store: Arc<dyn ObjectStore>,
         dispatcher: DataFlowDispatcher,
-        engine: crate::delta::log::DeltaEngine,
+        engine: crate::log::DeltaEngine,
     ) -> Self {
         Self {
             id,
@@ -155,8 +155,8 @@ impl CatalogTable {
         sort_by: Vec<String>,
         store: Arc<dyn ObjectStore>,
         dispatcher: DataFlowDispatcher,
-        engine: crate::delta::log::DeltaEngine,
-    ) -> crate::delta::Result<Self> {
+        engine: crate::log::DeltaEngine,
+    ) -> crate::Result<Self> {
         // Pair each discovered file with a bare log entry; `TableFile::new`
         // derives its stats from the footers.
         let mut files: Vec<TableFile> = loaded
@@ -179,7 +179,7 @@ impl CatalogTable {
         let entries: Vec<DeltaFileEntry> = files.iter().map(|file| file.entry.clone()).collect();
         // Version 0's commit yields the snapshot the new table starts at, so the
         // log it just wrote is not read back to open it.
-        let snapshot = crate::delta::log::initialize_table(
+        let snapshot = crate::log::initialize_table(
             &engine,
             store.as_ref(),
             &location,
@@ -213,11 +213,11 @@ impl CatalogTable {
     /// to it. Returns whether it advanced; `Ok(false)` means this copy was
     /// already current, which costs one log listing and no file reads (Kernel
     /// updates the snapshot in hand rather than rebuilding it).
-    pub fn refresh(&mut self) -> crate::delta::Result<bool> {
-        let Some(state) = crate::delta::log::refresh_table(&self.snapshot, &self.engine)? else {
+    pub fn refresh(&mut self) -> crate::Result<bool> {
+        let Some(state) = crate::log::refresh_table(&self.snapshot, &self.engine)? else {
             return Ok(false);
         };
-        let crate::delta::log::DeltaTableState {
+        let crate::log::DeltaTableState {
             snapshot,
             columns,
             partition_by,
@@ -254,7 +254,7 @@ impl CatalogTable {
         removed: &[ObjectPath],
         added: Vec<TableFile>,
         data_change: bool,
-    ) -> crate::delta::Result<()> {
+    ) -> crate::Result<()> {
         loop {
             if let Some(missing) = removed.iter().find(|path| {
                 !self
@@ -279,7 +279,7 @@ impl CatalogTable {
                 })
                 .collect();
             let entries: Vec<DeltaFileEntry> = added.iter().map(|f| f.entry.clone()).collect();
-            if let Some(committed) = crate::delta::log::commit_file_changes(
+            if let Some(committed) = crate::log::commit_file_changes(
                 &self.engine,
                 &self.snapshot,
                 &removed_entries,
@@ -308,7 +308,7 @@ impl CatalogTable {
         removed: &[ObjectPath],
         added: &[DeltaFileEntry],
         data_change: bool,
-    ) -> crate::delta::Result<()> {
+    ) -> crate::Result<()> {
         loop {
             if let Some(missing) = removed.iter().find(|path| {
                 !self
@@ -332,7 +332,7 @@ impl CatalogTable {
                         .clone()
                 })
                 .collect();
-            if let Some(committed) = crate::delta::log::commit_file_changes(
+            if let Some(committed) = crate::log::commit_file_changes(
                 &self.engine,
                 &self.snapshot,
                 &removed_entries,
@@ -381,7 +381,7 @@ impl CatalogTable {
         &mut self,
         entries: Vec<DeltaFileEntry>,
         columns: &[Column],
-    ) -> crate::delta::Result<()> {
+    ) -> crate::Result<()> {
         let held: HashMap<&ObjectPath, &TableFile> = self
             .files
             .iter()
@@ -423,7 +423,7 @@ impl CatalogTable {
         &self,
         entries: &[DeltaFileEntry],
         columns: &[Column],
-    ) -> crate::delta::Result<Vec<parquet_engine::FileRowGroups>> {
+    ) -> crate::Result<Vec<parquet_engine::FileRowGroups>> {
         let to_fetch: Vec<DataFile> = entries
             .iter()
             .map(|e| {
@@ -608,10 +608,10 @@ impl CatalogTable {
     /// itself stays. The test is where the file lands rather than how the path is
     /// spelled, so a path that names the table's own directory outright is still
     /// the table's to delete.
-    pub fn delete_data_file(&self, path: &ObjectPath) -> crate::delta::Result<()> {
+    pub fn delete_data_file(&self, path: &ObjectPath) -> crate::Result<()> {
         let resolved = self.location.resolve(path);
         if !self.is_in_own_storage(&resolved)? {
-            return Err(crate::delta::Error::DeletingOutsideStorage {
+            return Err(crate::Error::DeletingOutsideStorage {
                 location: self.location.as_str().to_string(),
                 file: path.as_str().to_string(),
             });
@@ -623,7 +623,7 @@ impl CatalogTable {
     /// Whether `key` names an object under the table's own location. Both sides
     /// are taken to their store-root-absolute form first, so a key that resolves
     /// into the table's directory counts however it was written.
-    fn is_in_own_storage(&self, key: &ObjectPath) -> crate::delta::Result<bool> {
+    fn is_in_own_storage(&self, key: &ObjectPath) -> crate::Result<bool> {
         let owned = self.store.absolute_key(&self.location)?;
         let owned = format!("{}/", owned.as_str().trim_end_matches('/'));
         Ok(self
@@ -637,7 +637,7 @@ impl CatalogTable {
     /// delete it: the table's `delta.deletedFileRetentionDuration`, or Delta's
     /// default when unset. Vacuum ages unreferenced files against this window.
     pub fn deleted_file_retention(&self) -> std::time::Duration {
-        crate::delta::log::deleted_file_retention(&self.snapshot)
+        crate::log::deleted_file_retention(&self.snapshot)
     }
 
     /// Delete commit JSONs from this table's `_delta_log` that a checkpoint has
@@ -646,8 +646,8 @@ impl CatalogTable {
     /// on the commit path; this is the periodic cleanup the vacuum sweep drives.
     /// The `_delta_log` naming convention lives with the rest of the Delta-format
     /// code in the Delta-format module; returns how many files were deleted.
-    pub fn cleanup_log(&self, now_ms: u64) -> crate::delta::Result<usize> {
-        Ok(crate::delta::log::cleanup_log(
+    pub fn cleanup_log(&self, now_ms: u64) -> crate::Result<usize> {
+        Ok(crate::log::cleanup_log(
             self.store.as_ref(),
             &self.location,
             &self.snapshot,
@@ -663,7 +663,7 @@ impl CatalogTable {
     /// `_delta_log`) are excluded. Paths are relative to the location, matching
     /// [`file_refs`](Self::file_refs) and what [`delete_data_file`](Self::delete_data_file)
     /// expects.
-    pub fn list_data_files(&self) -> crate::delta::Result<Vec<(ObjectPath, u64)>> {
+    pub fn list_data_files(&self) -> crate::Result<Vec<(ObjectPath, u64)>> {
         Ok(self
             .store
             .list(&self.location)?
@@ -700,7 +700,7 @@ impl CatalogTable {
         &self,
         partition_filters: &[PartitionEqFilter],
         stat_filters: &[ColumnStatFilter],
-    ) -> crate::delta::Result<Arc<ParquetTable>> {
+    ) -> crate::Result<Arc<ParquetTable>> {
         let mut row_groups = Vec::new();
         for file in self
             .files
@@ -771,7 +771,7 @@ impl CatalogTable {
 
     /// Where the table's data lives, relative to the database root (an absolute
     /// path escapes to the store root). Combine with the store's own root
-    /// (see [`DeltaDatastore::store_description`](crate::delta::DeltaDatastore::store_description))
+    /// (see [`DeltaDatastore::store_description`](crate::DeltaDatastore::store_description))
     /// to know the physical location.
     pub fn location(&self) -> &str {
         self.location.as_str()
@@ -787,7 +787,7 @@ impl CatalogTable {
 
     /// Re-encode `inputs`' rows into fresh target-sized files and return them,
     /// uploaded but not yet part of the table: the read half of a compaction,
-    /// which [`compact_table_files`](crate::delta::compact_table_files) then swaps in
+    /// which [`compact_table_files`](crate::compact_table_files) then swaps in
     /// for the inputs. The merged files are written over the
     /// shared io_uring ring by the same upload operators an INSERT uses, and
     /// their row groups come straight from the writer's own footer metadata, so
@@ -801,7 +801,7 @@ impl CatalogTable {
         inputs: &[FileRef],
         target_rows_per_group: usize,
         max_output_file_size: Option<u64>,
-    ) -> crate::delta::Result<Vec<TableFile>> {
+    ) -> crate::Result<Vec<TableFile>> {
         // The selector guarantees that all inputs share one partition, so its
         // recorded tuple can key every decoded batch without repartitioning it.
         let parquet = self.parquet_table_for(inputs);

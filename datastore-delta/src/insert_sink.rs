@@ -18,7 +18,7 @@ use dispatch::{
 use planner::catalog::Column;
 use uuid::Uuid;
 
-use crate::delta::CatalogTable;
+use crate::CatalogTable;
 use object_storage::{DataFileLocation, FileRef, ObjectPath, ObjectStore};
 use parquet_engine::RowGroupMetadata;
 use parquet_engine::writing::{AssembledFile, encode_record_batches_spec, unshred_batches_spec};
@@ -34,7 +34,7 @@ pub(super) fn build_insert_spec(
     table: &CatalogTable,
     uploaded_files: Arc<Injector<UploadedFile>>,
     input: RecordBatchOperatorSpec,
-) -> crate::delta::Result<RecordBatchOperatorSpec> {
+) -> crate::Result<RecordBatchOperatorSpec> {
     let store = table.store();
     store.prepare_write()?;
 
@@ -161,7 +161,7 @@ where
 pub(crate) struct UploadedFile {
     pub table_id: Uuid,
     pub file: FileRef,
-    pub partition: Option<crate::delta::PartitionValues>,
+    pub partition: Option<crate::PartitionValues>,
     pub row_groups: Vec<Arc<RowGroupMetadata>>,
 }
 
@@ -224,7 +224,7 @@ impl UnaryFactory<AssembledFile, RecordBatch> for UploadFactory {
 struct PendingUpload {
     file: object_storage::FileRef,
     key: ObjectPath,
-    partition: Option<crate::delta::PartitionValues>,
+    partition: Option<crate::PartitionValues>,
     /// The footer metadata the writer produced for this file, used to record its
     /// row groups once the upload lands (no re-parsing the file we just wrote).
     metadata: parquet_engine::thrift::footer::FileMetaData,

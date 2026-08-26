@@ -19,9 +19,9 @@ use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use tempfile::TempDir;
 
 use catalog::datastore::{Datastore, DatastoreTransaction};
-use catalog::delta::{ColumnStatFilter, DeltaDatastore, PartitionEqFilter, TableBinding};
 use catalog::{DEFAULT_DATASTORE_NAME, PivotCatalog};
 use common::{commit_datastore_transaction, current_parquet};
+use datastore_delta::{ColumnStatFilter, DeltaDatastore, PartitionEqFilter, TableBinding};
 use object_storage::ObjectPath;
 use planner::PlanNode;
 use planner::Planner;
@@ -1312,8 +1312,8 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
 
     let merged = write_ids(dir.path(), "merged.parquet", &[10, 20, 30, 40]);
     let merged_size = std::fs::metadata(&merged).unwrap().len();
-    let added = vec![catalog::delta::DeltaFileEntry::new(
-        catalog::delta::FileRef {
+    let added = vec![datastore_delta::DeltaFileEntry::new(
+        datastore_delta::FileRef {
             path: ObjectPath::new(merged.to_str().unwrap()),
             size: merged_size,
         },
@@ -1334,8 +1334,8 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     winner.replace_data_files(&removed, &added).unwrap();
     // The loser only discovers the inputs are gone after its CAS conflict +
     // refresh and returns a typed commit-conflict error.
-    let loser_added = vec![catalog::delta::DeltaFileEntry::new(
-        catalog::delta::FileRef {
+    let loser_added = vec![datastore_delta::DeltaFileEntry::new(
+        datastore_delta::FileRef {
             path: ObjectPath::new("merged-loser.parquet"),
             size: merged_size,
         },
@@ -1344,7 +1344,7 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     assert!(
         matches!(
             &loser_result,
-            Err(catalog::delta::Error::CommitConflict { .. })
+            Err(datastore_delta::Error::CommitConflict { .. })
         ),
         "unexpected losing compaction result: {loser_result:?}"
     );
@@ -1437,8 +1437,8 @@ fn a_refresh_that_cannot_read_the_new_files_leaves_the_copy_untouched() {
     let mut writer = datastore
         .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
         .unwrap();
-    let absent = vec![catalog::delta::DeltaFileEntry::new(
-        catalog::delta::FileRef {
+    let absent = vec![datastore_delta::DeltaFileEntry::new(
+        datastore_delta::FileRef {
             path: ObjectPath::new("absent.parquet"),
             size: 1,
         },
@@ -1479,7 +1479,7 @@ fn compact_table_files_merges_small_files_into_one() {
     let inputs = table.file_refs();
     assert_eq!(inputs.len(), 2, "two inserts wrote two files");
     let merged =
-        catalog::delta::compact_table_files(&datastore, table.id(), &inputs, 128 * 1024).unwrap();
+        datastore_delta::compact_table_files(&datastore, table.id(), &inputs, 128 * 1024).unwrap();
 
     assert_eq!(merged.len(), 1, "the two inputs merge into one file");
     let parquet = current_parquet(&datastore, "t");
@@ -1509,7 +1509,7 @@ fn compact_table_files_deletes_uploaded_outputs_when_delta_commit_fails() {
     let saved_delta_log = table_dir.join("_delta_log.saved");
     std::fs::rename(&delta_log, &saved_delta_log).unwrap();
     File::create(&delta_log).unwrap();
-    let result = catalog::delta::compact_table_files(&datastore, table.id(), &inputs, 128 * 1024);
+    let result = datastore_delta::compact_table_files(&datastore, table.id(), &inputs, 128 * 1024);
     std::fs::remove_file(&delta_log).unwrap();
     std::fs::rename(&saved_delta_log, &delta_log).unwrap();
 
@@ -1612,8 +1612,8 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
         .unwrap();
     let inputs: Vec<ObjectPath> = table.file_refs().into_iter().map(|f| f.path).collect();
     let merged = write_ids(data_dir.path(), "merged.parquet", &[10, 20, 30]);
-    let added = vec![catalog::delta::DeltaFileEntry::new(
-        catalog::delta::FileRef {
+    let added = vec![datastore_delta::DeltaFileEntry::new(
+        datastore_delta::FileRef {
             path: ObjectPath::new(merged.to_str().unwrap()),
             size: std::fs::metadata(&merged).unwrap().len(),
         },

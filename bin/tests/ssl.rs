@@ -13,9 +13,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use bin::server::config::TlsConfig;
-use catalog::delta::DeltaDatastore;
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
 use common::{CatalogFixture, pivot_metastore, select_rows, start_server_with_tls};
+use datastore_delta::DeltaDatastore;
 use pgwire::tokio::tokio_rustls::rustls::crypto::aws_lc_rs;
 use pgwire::tokio::tokio_rustls::rustls::pki_types::CertificateDer;
 use pgwire::tokio::tokio_rustls::rustls::pki_types::pem::PemObject;
