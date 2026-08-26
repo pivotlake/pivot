@@ -20,7 +20,7 @@ use crate::expression::{CompareType, TableFilter};
 use crate::operator::built_in_table_function;
 use crate::types::{Type, logical_from_type};
 use arrow_array::{ArrayRef, Scalar};
-use dispatch::{DataFlowDispatcher, DynamicFilterSlot, Projection, RecordBatchOperatorSpec};
+use dispatch::{BoundarySlot, DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use duckdb_planner::DuckDBColumn;
 use duckdb_planner::Expr;
 use duckdb_planner::ScalarValue;
@@ -38,7 +38,7 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A single-column predicate whose constant is supplied at runtime from a shared
-/// [`DynamicFilterSlot`] (filled by a Top-N as it tightens its boundary).
+/// [`BoundarySlot`] (filled by a Top-N as it tightens its boundary).
 ///
 /// It is a purely logical predicate: "column `column_idx` `compare_type` the
 /// current slot value". A storage backend may use it to skip data that cannot
@@ -47,7 +47,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct DynamicScanPredicate {
     pub column_idx: usize,
     pub compare_type: CompareType,
-    pub slot: Arc<DynamicFilterSlot>,
+    pub slot: Arc<BoundarySlot>,
 }
 
 /// A single column in a [`BoundTable`]'s schema: name plus Pivot [`Type`].

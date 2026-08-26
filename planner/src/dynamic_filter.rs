@@ -3,7 +3,7 @@
 //! These structures describe connections, not live filter state. A producer
 //! and its consumer scans carry the same `slot_id`; [`Plan::compile`] resolves
 //! that ID through its runtime-slot registry so both ends receive the same
-//! shared [`DynamicFilterSlot`](dispatch::DynamicFilterSlot) or key-bitset slot.
+//! shared [`BoundarySlot`](dispatch::BoundarySlot) or key-bitset slot.
 //!
 //! Keeping only IDs in the plan matters for plan caching: every execution gets
 //! newly allocated, unarmed slots, so no boundary or build-key set can leak

@@ -108,7 +108,7 @@ pub use order_by::{
     KWayMergePlan, KWayMergeTask, LocatedBatch, MergeRun, MergedOutput, OrderByFactory,
     batch_sort_indices,
 };
-pub use order_by_limit::{DynamicFilterSlot, OrderBy, OrderByLimitFactory};
+pub use order_by_limit::{OrderBy, OrderByLimitFactory};
 
 #[derive(Debug, Error)]
 pub enum Error {

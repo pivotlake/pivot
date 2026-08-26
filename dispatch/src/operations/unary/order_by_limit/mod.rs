@@ -19,8 +19,8 @@
 //!
 //! Once a full window has been witnessed we test each new batch against its
 //! fetch-th-best *leading* key, so rows that can't reach the global top-k are
-//! never sorted. The boundary comes from the shared [`DynamicFilterSlot`]'s
-//! arming window when one is wired (it pools all workers' rows, so it is always
+//! never sorted. The boundary comes from the shared key window when a
+//! [`BoundarySlot`] is wired (it pools all workers' rows, so it is always
 //! at least as tight as this worker's own), otherwise from the locally cached
 //! [`reject_boundary`](OrderByLimit::reject_boundary). Requires nulls-last
 //! ordering on the leading key (a null can't beat a full window). With a single
@@ -51,6 +51,7 @@
 //! of the two already-sorted runs would make that O(fetch + survivors); deferred
 //! until a large-`fetch` workload needs it.
 
+use crate::boundary_slot::BoundarySlot;
 use crate::gather_barrier::GatherBarrier;
 use crate::operations::channels::Sender;
 use crate::operations::unary;
@@ -59,7 +60,7 @@ use arrow::compute::kernels::cmp;
 use arrow::compute::{SortColumn, lexsort_to_indices, take};
 use arrow_array::{Array, ArrayRef, Datum, RecordBatch, Scalar};
 use arrow_schema::{ArrowError, SortOptions};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use thiserror::Error;
 use tracing::debug;
@@ -68,127 +69,54 @@ mod factory;
 pub use factory::OrderByLimitFactory;
 
 /// Largest `limit + offset` for which a Top-N pools per-batch keys into the
-/// shared arming window. Beyond this, merging that many keys under the window
+/// shared key window. Beyond this, merging that many keys under the window
 /// mutex would cost more than boundary pruning is worth (a huge window prunes
 /// little anyway), so larger fetches publish only from a full per-worker window.
 const SHARED_WINDOW_MAX_FETCH: usize = 1024;
 
-/// The shared boundary a Top-N operator publishes its current Nth-best leading
-/// sort key into, for sibling scans to prune row groups against. One producer
-/// (the Top-N's workers) writes; any number of consumer scans read. Empty until
-/// `fetch = limit + offset` rows have been witnessed; the value only ever
-/// tightens, so a stale read prunes less, never more.
-///
-/// The boundary arms from a single *global* window: workers pool the leading
-/// keys of each batch's surviving rows here, so it fills as soon as `fetch`
-/// rows exist *anywhere*. With N workers each seeing ~1/N of a filtered
-/// stream, waiting for one worker's private window to fill takes ~N times
-/// longer (and on a selective filter may never happen before the scan ends) -
-/// pooling makes arming near-immediate, which is what makes boundary pruning
-/// reliable.
-///
-/// The comparison *direction* lives with the consumer (which carries the
-/// comparison operator DuckDB chose); this slot holds only the boundary value.
-#[derive(Debug)]
-pub struct DynamicFilterSlot {
-    /// The published boundary, i.e. the `fetch`-th best leading key witnessed
-    /// so far across all workers. Consumer scans read it for every row group
-    /// they pull, so it lives in its own lock apart from the window mutex.
-    boundary: RwLock<Option<Scalar<ArrayRef>>>,
-    /// The arming window holds the up-to-`fetch` best non-null leading keys
-    /// offered so far, sorted best-first in the sort's direction. `None`
-    /// until the first offer.
-    window: Mutex<Option<ArrayRef>>,
-}
-
-impl DynamicFilterSlot {
-    pub fn new() -> Self {
-        Self {
-            boundary: RwLock::new(None),
-            window: Mutex::new(None),
-        }
-    }
-
-    /// The current boundary, or `None` while the window hasn't armed yet.
-    pub fn boundary(&self) -> Option<Scalar<ArrayRef>> {
-        self.boundary
-            .read()
-            .expect("dynamic filter slot poisoned")
-            .clone()
-    }
-
-    /// Offer one batch's surviving rows' leading sort keys to the arming
-    /// window. `keys` must be non-empty, sorted best-first in the sort's
-    /// direction, and contain no nulls, and every source row may be offered at
-    /// most once - a row counted twice would fake a fuller window and
-    /// over-tighten the boundary (wrong results, not just weaker pruning).
-    /// `boundary` is the caller's already-read [`Self::boundary`] (a stale
-    /// read only weakens the prefix filter below, never the window). Once
-    /// `fetch` keys have pooled, the worst of them is published as the
-    /// boundary; each later offer that improves the window tightens it.
-    fn offer(
-        &self,
-        keys: ArrayRef,
-        fetch: usize,
-        descending: bool,
-        boundary: Option<&Scalar<ArrayRef>>,
-    ) -> Result<()> {
-        debug_assert!(fetch > 0 && !keys.is_empty());
-        // Only keys beating the current boundary can change a full window, and
-        // being best-first they are a prefix of the offer. This keeps the
-        // common armed-and-nothing-to-add case off the window mutex entirely.
-        let keys = match boundary {
-            None => keys,
-            Some(current) => {
-                let kernel = if descending { cmp::gt } else { cmp::lt };
-                let better = kernel(&keys as &dyn Datum, current as &dyn Datum)?;
-                match better.true_count() {
-                    0 => return Ok(()),
-                    n => keys.slice(0, n),
-                }
+/// Offer one batch's surviving rows' leading sort keys to a Top-N's shared
+/// key window, publishing into `slot` once the window fills. `keys` must be
+/// non-empty, sorted best-first in the sort's direction, and contain no nulls,
+/// and every source row may be offered at most once - a row counted twice
+/// would fake a fuller window and over-tighten the boundary (wrong results,
+/// not just weaker pruning). `boundary` is the caller's already-read
+/// [`BoundarySlot::boundary`] (a stale read only weakens the prefix filter
+/// below, never the window). Once `fetch` keys have pooled, the worst of them
+/// is published as the boundary; each later offer that improves the window
+/// tightens it.
+fn offer_to_window(
+    window: &Mutex<Option<ArrayRef>>,
+    slot: &BoundarySlot,
+    keys: ArrayRef,
+    fetch: usize,
+    descending: bool,
+    boundary: Option<&Scalar<ArrayRef>>,
+) -> Result<()> {
+    debug_assert!(fetch > 0 && !keys.is_empty());
+    // Only keys beating the current boundary can change a full window, and
+    // being best-first they are a prefix of the offer. This keeps the
+    // common armed-and-nothing-to-add case off the window mutex entirely.
+    let keys = match boundary {
+        None => keys,
+        Some(current) => {
+            let kernel = if descending { cmp::gt } else { cmp::lt };
+            let better = kernel(&keys as &dyn Datum, current as &dyn Datum)?;
+            match better.true_count() {
+                0 => return Ok(()),
+                n => keys.slice(0, n),
             }
-        };
-        let mut window = self.window.lock().expect("dynamic filter window poisoned");
-        let merged = match window.as_ref() {
-            None => keys.slice(0, keys.len().min(fetch)),
-            Some(pooled) => merge_top_keys(pooled, &keys, fetch, descending)?,
-        };
-        if merged.len() >= fetch {
-            self.publish(Scalar::new(merged.slice(merged.len() - 1, 1)), descending);
         }
-        *window = Some(merged);
-        Ok(())
+    };
+    let mut window = window.lock().expect("top-n key window poisoned");
+    let merged = match window.as_ref() {
+        None => keys.slice(0, keys.len().min(fetch)),
+        Some(pooled) => merge_top_keys(pooled, &keys, fetch, descending)?,
+    };
+    if merged.len() >= fetch {
+        slot.publish_if_tighter(Scalar::new(merged.slice(merged.len() - 1, 1)), descending);
     }
-
-    /// Set the boundary to `boundary` (a one-element array) unconditionally.
-    /// For a producer that computes its exact bound once over complete data,
-    /// like a hash join build publishing a key extreme when it seals; the
-    /// arming window is not involved.
-    pub fn publish_value(&self, boundary: ArrayRef) {
-        debug_assert_eq!(boundary.len(), 1);
-        *self.boundary.write().expect("dynamic filter slot poisoned") = Some(Scalar::new(boundary));
-    }
-
-    /// Publish `new_boundary` if it is strictly tighter than the current one.
-    /// [`Self::offer`] publishes through here as its window arms and tightens;
-    /// operators whose fetch is too large for the shared window call it
-    /// directly when their own window fills.
-    fn publish(&self, new_boundary: Scalar<ArrayRef>, descending: bool) {
-        let mut guard = self.boundary.write().expect("dynamic filter slot poisoned");
-        let tighter = match guard.as_ref() {
-            None => true,
-            Some(current) => is_tighter(&new_boundary, current, descending),
-        };
-        if tighter {
-            *guard = Some(new_boundary);
-        }
-    }
-}
-
-impl Default for DynamicFilterSlot {
-    fn default() -> Self {
-        Self::new()
-    }
+    *window = Some(merged);
+    Ok(())
 }
 
 /// Merge two best-first sorted key runs into the best `fetch` of their union.
@@ -324,17 +252,25 @@ pub struct OrderByLimit {
     offset: usize,
     order_by: Vec<OrderBy>,
     gather: Arc<GatherBarrier<Option<RecordBatch>>>,
-    /// When set, this worker is a dynamic-filter producer that pools each
-    /// batch's keys into the slot's shared arming window (see
-    /// [`DynamicFilterSlot`]): the leading key orders nulls last and the fetch
+    /// When set, this worker is a boundary producer that pools each batch's
+    /// keys into `key_window`, shared by every worker of this Top-N (see
+    /// [`offer_to_window`]): the leading key orders nulls last and the fetch
     /// is small enough for window merges to stay cheap. Mutually exclusive
     /// with `publish_slot`.
-    pooled_slot: Option<Arc<DynamicFilterSlot>>,
-    /// When set, this worker is a dynamic-filter producer whose fetch is too
-    /// large for the shared window (or whose leading key orders nulls first):
-    /// it publishes directly from its own full window instead (see
+    pooled_slot: Option<Arc<BoundarySlot>>,
+    /// The key window the pooled workers merge their keys into: the
+    /// up-to-`fetch` best non-null leading keys offered so far, sorted
+    /// best-first in the sort's direction. Shared across this Top-N's workers
+    /// because each sees only ~1/N of the stream: a per-worker window arms ~N
+    /// times slower (on a selective filter maybe never), and near-immediate
+    /// arming is what makes boundary pruning reliable. Unused without a
+    /// `pooled_slot`.
+    key_window: Arc<Mutex<Option<ArrayRef>>>,
+    /// When set, this worker is a boundary producer whose fetch is too large
+    /// for the shared window (or whose leading key orders nulls first): it
+    /// publishes directly from its own full window instead (see
     /// [`Self::publish_boundary`]).
-    publish_slot: Option<Arc<DynamicFilterSlot>>,
+    publish_slot: Option<Arc<BoundarySlot>>,
     /// The worker's running top-k: every batch is merged into this single
     /// `limit + offset`-row batch, so the worker holds one top-k at a time.
     running_top_k: Option<RecordBatch>,
@@ -352,11 +288,12 @@ impl OrderByLimit {
         limit: usize,
         offset: usize,
         gather: Arc<GatherBarrier<Option<RecordBatch>>>,
-        dynamic_filter: Option<Arc<DynamicFilterSlot>>,
+        boundary_slot: Option<Arc<BoundarySlot>>,
+        key_window: Arc<Mutex<Option<ArrayRef>>>,
     ) -> Self {
         let nulls_last_leading = order_by.first().is_some_and(|leading| !leading.nulls_first);
         let pool = nulls_last_leading && (1..=SHARED_WINDOW_MAX_FETCH).contains(&(limit + offset));
-        let (pooled_slot, publish_slot) = match dynamic_filter {
+        let (pooled_slot, publish_slot) = match boundary_slot {
             Some(slot) if pool => (Some(slot), None),
             other => (None, other),
         };
@@ -365,6 +302,7 @@ impl OrderByLimit {
             offset,
             gather,
             pooled_slot,
+            key_window,
             publish_slot,
             running_top_k: None,
             reject_boundary: None,
@@ -441,7 +379,7 @@ impl OrderByLimit {
     /// the `publish_slot`, once the window is full. This is the non-pooling
     /// path (a fetch too large for cheap window merges, or a nulls-first
     /// leading key); small fetches pool per-batch keys through the slot's
-    /// arming window in `consume` instead.
+    /// key window in `consume` instead.
     ///
     /// The window keeps `limit + offset` rows, so the last (worst) of them is a
     /// valid bound on the *global* boundary: this worker alone already witnesses
@@ -465,24 +403,7 @@ impl OrderByLimit {
         if !last_row.is_valid(0) {
             return;
         }
-        slot.publish(Scalar::new(last_row), leading.descending);
-    }
-}
-
-/// Whether `new` is a strictly tighter boundary than `current` for a sort in
-/// this direction:
-/// * ascending — we keep the smallest N, the filter is `col < boundary`, so a
-///   *smaller* boundary prunes more;
-/// * descending — we keep the largest N, the filter is `col > boundary`, so a
-///   *larger* boundary prunes more.
-///
-/// Returns `false` (don't overwrite) when the comparison kernel errors — e.g. a
-/// type mismatch — so a slot can't get wedged on a value it can never improve.
-fn is_tighter(new: &Scalar<ArrayRef>, current: &Scalar<ArrayRef>, descending: bool) -> bool {
-    let kernel = if descending { cmp::gt } else { cmp::lt };
-    match kernel(new as &dyn Datum, current as &dyn Datum) {
-        Ok(arr) => arr.is_valid(0) && arr.value(0),
-        Err(_) => false,
+        slot.publish_if_tighter(Scalar::new(last_row), leading.descending);
     }
 }
 
@@ -522,17 +443,19 @@ impl Unary<RecordBatch, RecordBatch> for OrderByLimit {
             return Ok(());
         };
 
-        // Pool this batch's keys into the shared arming window. Only the fresh
+        // Pool this batch's keys into the shared key window. Only the fresh
         // `candidates` are offered - never the running top-k, whose rows were
         // already offered once and would be double-counted (see
-        // [`DynamicFilterSlot::offer`]).
+        // [`offer_to_window`]).
         if let Some(slot) = &self.pooled_slot {
             let leading = candidates.column(self.order_by[0].column_idx);
             // The leading key orders nulls last here (a `pooled_slot`
             // precondition), so the non-null keys are a best-first prefix.
             let valid = leading.len() - leading.null_count();
             if valid > 0 {
-                slot.offer(
+                offer_to_window(
+                    &self.key_window,
+                    slot,
                     leading.slice(0, valid),
                     fetch,
                     self.order_by[0].descending,
@@ -612,7 +535,7 @@ mod tests {
         Scalar::new(Arc::new(Int32Array::from(vec![v])) as ArrayRef)
     }
 
-    fn slot_value(slot: &DynamicFilterSlot) -> Option<i32> {
+    fn slot_value(slot: &BoundarySlot) -> Option<i32> {
         slot.boundary().map(|s| {
             s.get()
                 .0
@@ -627,14 +550,15 @@ mod tests {
         order_by: Vec<OrderBy>,
         limit: usize,
         offset: usize,
-        dynamic_filter: Option<Arc<DynamicFilterSlot>>,
+        boundary_slot: Option<Arc<BoundarySlot>>,
     ) -> OrderByLimit {
         OrderByLimit::new(
             order_by,
             limit,
             offset,
             Arc::new(GatherBarrier::new(1)),
-            dynamic_filter,
+            boundary_slot,
+            Arc::new(Mutex::new(None)),
         )
     }
 
@@ -668,17 +592,8 @@ mod tests {
     }
 
     #[test]
-    fn is_tighter_respects_direction() {
-        // Descending keeps the larger boundary (prunes more); ascending the smaller.
-        assert!(is_tighter(&scalar32(50), &scalar32(20), true));
-        assert!(!is_tighter(&scalar32(20), &scalar32(50), true));
-        assert!(is_tighter(&scalar32(20), &scalar32(50), false));
-        assert!(!is_tighter(&scalar32(50), &scalar32(20), false));
-    }
-
-    #[test]
     fn publishes_running_boundary() {
-        let slot = Arc::new(DynamicFilterSlot::new());
+        let slot = Arc::new(BoundarySlot::new());
         // ORDER BY v DESC LIMIT 2 takes the single-key fast path: each batch is
         // merged into a running top-2, and the boundary published is that
         // running top-2's 2nd-largest — i.e. the true global 2nd-largest so
@@ -713,7 +628,7 @@ mod tests {
 
     #[test]
     fn does_not_publish_before_window_is_full() {
-        let slot = Arc::new(DynamicFilterSlot::new());
+        let slot = Arc::new(BoundarySlot::new());
         let mut op = order_by_limit(vec![OrderBy::new(0, true, false)], 3, 0, Some(slot.clone()));
         let mut sink = CollectSender::new();
 
@@ -730,11 +645,20 @@ mod tests {
 
     #[test]
     fn partial_windows_from_different_workers_arm_the_boundary() {
-        let slot = Arc::new(DynamicFilterSlot::new());
+        let slot = Arc::new(BoundarySlot::new());
         let gather = Arc::new(GatherBarrier::new(2));
         let order_by = || vec![OrderBy::new(0, false, false)];
-        let mut first = OrderByLimit::new(order_by(), 3, 0, gather.clone(), Some(slot.clone()));
-        let mut second = OrderByLimit::new(order_by(), 3, 0, gather, Some(slot.clone()));
+        // The window must be one shared pool for cross-worker arming to work.
+        let window = Arc::new(Mutex::new(None));
+        let mut first = OrderByLimit::new(
+            order_by(),
+            3,
+            0,
+            gather.clone(),
+            Some(slot.clone()),
+            window.clone(),
+        );
+        let mut second = OrderByLimit::new(order_by(), 3, 0, gather, Some(slot.clone()), window);
         let mut sink = CollectSender::new();
 
         // Neither worker alone sees 3 rows, but the pooled window does.
@@ -760,7 +684,7 @@ mod tests {
 
     #[test]
     fn null_keys_are_not_pooled() {
-        let slot = Arc::new(DynamicFilterSlot::new());
+        let slot = Arc::new(BoundarySlot::new());
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, true)]));
         let col: ArrayRef = Arc::new(Int32Array::from(vec![Some(5), None, None]));
         let nullable = RecordBatch::try_new(schema, vec![col]).unwrap();
@@ -794,7 +718,7 @@ mod tests {
 
     #[test]
     fn large_fetch_publishes_from_a_full_worker_window() {
-        let slot = Arc::new(DynamicFilterSlot::new());
+        let slot = Arc::new(BoundarySlot::new());
         let fetch = SHARED_WINDOW_MAX_FETCH + 1;
         let mut op = order_by_limit(
             vec![OrderBy::new(0, false, false)],
@@ -833,7 +757,7 @@ mod tests {
 
     #[test]
     fn multi_key_sort_publishes_leading_key_boundary() {
-        let slot = Arc::new(DynamicFilterSlot::new());
+        let slot = Arc::new(BoundarySlot::new());
         let order_by = vec![OrderBy::new(0, false, false), OrderBy::new(1, false, false)];
         let mut op = order_by_limit(order_by, 2, 0, Some(slot.clone()));
         let mut sink = CollectSender::new();
@@ -851,7 +775,7 @@ mod tests {
 
     #[test]
     fn multi_key_keeps_rows_tied_on_the_leading_key() {
-        let slot = Arc::new(DynamicFilterSlot::new());
+        let slot = Arc::new(BoundarySlot::new());
         let order_by = vec![OrderBy::new(0, false, false), OrderBy::new(1, false, false)];
         let op = order_by_limit(order_by, 2, 0, Some(slot.clone()));
 
@@ -887,6 +811,7 @@ mod tests {
                     0,
                     gather.clone(),
                     None,
+                    Arc::new(Mutex::new(None)),
                 )
             })
             .collect();
@@ -988,6 +913,7 @@ mod tests {
             0,
             Arc::new(GatherBarrier::new(1)),
             None,
+            Arc::new(Mutex::new(None)),
         );
         let mut sender = CollectSender::new();
 

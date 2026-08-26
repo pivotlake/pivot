@@ -52,15 +52,16 @@ use arrow_array::RecordBatch;
 use arrow_schema::DataType;
 
 use crate::api::operator_spec::{OperatorFactory, OperatorSpec};
+use crate::boundary_slot::BoundarySlot;
 use crate::operations::channels::{
     SingleWorkerMpscFactory, StealableChannelFactory, stealable, to_single_worker_mpsc,
 };
 use crate::operations::{
     AggregateFactory, AggregationSlot, AggregationValue, CteFactory, CteScanFactory, Distinct,
-    DynamicFilterSlot, DynamicRowKey, F64Cell, FilterFactory, GroupFactory, GroupLimit, IntCell,
-    JoinKey, JoinKind, JoinRecordBatchOperatorFactory, JoinSpec, KeyExtractor, LimitFactory,
-    MapFactory, NoOpNullaryFactory, NullaryFactory, NullaryOperatorFactory, OrderBy,
-    OrderByFactory, OrderByLimitFactory, PackedKey, RangeJoinSpec, SingleColumnKey, UnaryFactory,
+    DynamicRowKey, F64Cell, FilterFactory, GroupFactory, GroupLimit, IntCell, JoinKey, JoinKind,
+    JoinRecordBatchOperatorFactory, JoinSpec, KeyExtractor, LimitFactory, MapFactory,
+    NoOpNullaryFactory, NullaryFactory, NullaryOperatorFactory, OrderBy, OrderByFactory,
+    OrderByLimitFactory, PackedKey, RangeJoinSpec, SingleColumnKey, UnaryFactory,
     UnaryOperatorFactory, WideCell, copy_out, create_join_factories,
     create_normalizing_join_factories, create_normalizing_order_by_factories,
     create_range_join_factories,
@@ -571,13 +572,13 @@ impl RecordBatchOperatorSpec {
     /// Like [`order_by_limit`](Self::order_by_limit) but skips the first
     /// `offset` rows of the globally sorted result (SQL `LIMIT … OFFSET`), and
     /// optionally publishes the running boundary into a shared
-    /// [`DynamicFilterSlot`] so sibling scans can prune row groups.
+    /// [`BoundarySlot`] so sibling scans can prune row groups.
     pub fn order_by_limit_offset(
         self,
         order_by: Vec<OrderBy>,
         limit: usize,
         offset: usize,
-        dynamic_filter: Option<Arc<DynamicFilterSlot>>,
+        dynamic_filter: Option<Arc<BoundarySlot>>,
     ) -> Self {
         let worker_count = self.worker_count();
         let mut result = self.unary(OrderByLimitFactory::create_for_workers(
