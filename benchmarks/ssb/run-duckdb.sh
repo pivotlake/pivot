@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+#
+# run-duckdb.sh — run the SSB suite through DuckDB for a side-by-side
+# comparison with pivot-bench, either over the SAME parquet directories pivot
+# reads (see setup.sql / prep-ssb-data.sh; each base table is exposed as a
+# view, so the unmodified qNN.sql files run as-is), or over a native DuckDB
+# database of the same data.
+#
+# Usage:
+#   ./run-duckdb.sh --source ~/ssb-sf100                    # all queries, 1 run
+#   ./run-duckdb.sh --source ~/ssb-sf100 --query 21         # just q21 (Q2.1)
+#   ./run-duckdb.sh --source ~/ssb-sf100 --iterations 3     # 3 timed runs each
+#   ./run-duckdb.sh --source ~/ssb-sf100 --no-drop-caches   # skip the cache drop
+#   ./run-duckdb.sh --source ~/ssb-sf100 --query 21 --write-expected  # write q21.tsv
+#   ./run-duckdb.sh --source ~/ssb-sf100 --sleep 500        # quiet gap between queries
+#   ./run-duckdb.sh --data native --source /mnt/nvme/ssb-native.duckdb --query 21
+#
+# We always report DuckDB's own `.timer` "Run Time" (query execution only).
+#
+# --data parquet|native  (default parquet)
+#   parquet: --source is the dataset root directory; each table is a view over
+#     its parquet files.
+#   native:  --source is a .duckdb database file holding the base tables (see
+#     prep-native-duckdb.sh); opened read-only.
+#
+# --duckdb-process per-run|per-query|per-iteration  (default per-run)
+#   per-run: ONE duckdb process executes the whole query list, so every query
+#     after the first reuses DuckDB's warm buffer pool - symmetric with
+#     pivot's one server streaming the same list. Gaps (and cache drops,
+#     unless --no-drop-caches) are issued from inside the process via .shell.
+#   per-query: a fresh duckdb process per query, all of that query's
+#     iterations inside it ("single" is accepted as an alias).
+#   per-iteration: a FRESH duckdb process per timed iteration (engine-cold,
+#     page cache warm after iteration 1).
+#
+# The OS page cache is dropped once before each query (needs root, via sudo),
+# so iteration 1 is a true cold read; --no-drop-caches skips that.
+#
+# --sleep MS leaves a quiet gap before each query but the first (and, in
+# per-iteration mode, between a query's iterations), matching pivot-bench's
+# --sleep.
+#
+# --warmup SQL runs the given statement once, untimed, before the first timed
+# query (in the per-process modes: once per process), so the first
+# measurement isn't charged for one-time process costs (buffer pool faults,
+# allocator arenas), matching pivot-bench's --warmup.
+#
+# --suite-dir overrides where qNN.sql / qNN.tsv live (default: this script's
+# own directory), so a shipped copy of this script can run a checkout's suite.
+#
+# --write-expected runs each query once and writes its rows to the suite's
+# qNN.tsv in pivot-bench's exact wire format (tab-separated, no header, NULL as
+# empty), so the expected file is an independent oracle rather than pivot
+# grading its own output. Queries must carry a total ORDER BY.
+
+set -euo pipefail
+
+suite_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+source_path=""
+queries=""
+iterations=1
+drop_caches=1
+write_expected=0
+sleep_ms=0
+duckdb_process="per-run"
+data="parquet"
+warmup=""
+
+usage() {
+    sed -n '3,57p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    exit "${1:-0}"
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --source)     source_path="$2"; shift 2 ;;
+        --suite-dir)  suite_dir="$2"; shift 2 ;;
+        --query)      queries="$2"; shift 2 ;;
+        --iterations) iterations="$2"; shift 2 ;;
+        --sleep)      sleep_ms="$2"; shift 2 ;;
+        --data)       data="$2"; shift 2 ;;
+        --warmup)     warmup="$2"; shift 2 ;;
+        --duckdb-process) duckdb_process="$2"; shift 2 ;;
+        --no-drop-caches) drop_caches=0; shift ;;
+        --write-expected) write_expected=1; shift ;;
+        -h|--help)    usage 0 ;;
+        *) echo "unknown argument: $1" >&2; usage 1 ;;
+    esac
+done
+
+case "$duckdb_process" in
+    per-run|per-query|per-iteration) ;;
+    single) duckdb_process="per-query" ;;
+    *) echo "error: --duckdb-process must be per-run|per-query|per-iteration (got '$duckdb_process')" >&2; usage 1 ;;
+esac
+
+case "$data" in
+    parquet|native) ;;
+    *) echo "error: --data must be parquet|native (got '$data')" >&2; usage 1 ;;
+esac
+
+[[ -n "$source_path" ]] || { echo "error: --source is required" >&2; usage 1; }
+if [[ "$data" == "parquet" ]]; then
+    [[ -d "$source_path" ]] || { echo "error: --source must be the dataset root directory" >&2; exit 1; }
+else
+    [[ -f "$source_path" ]] || { echo "error: --source must be a .duckdb database file" >&2; exit 1; }
+fi
+
+command -v duckdb >/dev/null 2>&1 || {
+    echo "error: duckdb not found on PATH" >&2
+    exit 1
+}
+
+flush_page_cache() {
+    [[ "$drop_caches" == "1" ]] || return 0
+    sync
+    echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+}
+
+# One view per base table over its parquet directory; a native database
+# already holds the base tables and needs no setup.
+setup=""
+if [[ "$data" == "parquet" ]]; then
+    tables=(lineorder customer supplier part date)
+    for t in "${tables[@]}"; do
+        setup+="CREATE VIEW $t AS SELECT * FROM read_parquet('${source_path%/}/$t/*.parquet');"$'\n'
+    done
+fi
+
+# Build the list of qNN.sql files to run.
+declare -a query_files=()
+if [[ -n "$queries" ]]; then
+    IFS=',' read -ra ids <<< "$queries"
+    for id in "${ids[@]}"; do
+        id="${id#q}"
+        printf -v stem 'q%02d' "$((10#$id))"
+        f="$suite_dir/$stem.sql"
+        [[ -f "$f" ]] || { echo "error: no query file $f" >&2; exit 1; }
+        query_files+=("$f")
+    done
+else
+    for f in "$suite_dir"/q*.sql; do
+        [[ "$f" == *-duckdb.sql ]] && continue
+        query_files+=("$f")
+    done
+fi
+
+echo "duckdb $(duckdb --version)"
+echo "source: $source_path"
+if [[ "$write_expected" == "1" ]]; then
+    echo "queries: ${#query_files[@]}, writing expected .tsv (no timing)"
+else
+    echo "queries: ${#query_files[@]}, iterations: $iterations"
+fi
+echo
+
+# Parquet mode persists the views into a throwaway .db once, then opens it
+# fresh each iteration with parquet metadata caching on, so a timed run
+# doesn't pay the view re-creation. Native mode opens the database itself,
+# read-only so a run can never dirty it.
+if [[ "$write_expected" != "1" && "$duckdb_process" != "per-run" ]]; then
+    if [[ "$data" == "parquet" ]]; then
+        query_db="$(mktemp -u)-ssb.db"
+        trap 'rm -f "$query_db" "$query_db".wal' EXIT
+        duckdb "$query_db" -c "$setup" >/dev/null 2>&1
+        iter_cmd=(duckdb "$query_db" -c "SET parquet_metadata_cache=true")
+    else
+        iter_cmd=(duckdb -readonly "$source_path")
+    fi
+    # The warmup runs before `.timer on`, so it never prints a Run Time.
+    [[ -n "$warmup" ]] && iter_cmd+=(-c "$warmup")
+    iter_cmd+=(-c ".timer on")
+fi
+
+# The whole run in one duckdb process: a dot-command script carries the
+# markers, gaps, and optional per-query cache drops, so the process (and its
+# buffer pool) lives across the list the way pivot's one server does. The
+# stdout markers match the per-process modes', so consumers parse all three
+# the same way.
+if [[ "$write_expected" != "1" && "$duckdb_process" == "per-run" ]]; then
+    script="$(mktemp)"
+    flush_helper="$(mktemp)"
+    trap 'rm -f "$script" "$flush_helper"' EXIT
+    printf 'sync\necho 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null\n' >"$flush_helper"
+    {
+        if [[ "$data" == "parquet" ]]; then
+            printf '%s' "$setup"
+            echo "SET parquet_metadata_cache=true;"
+        fi
+        # Before `.timer on`, so the warmup never prints a Run Time.
+        [[ -n "$warmup" ]] && echo "${warmup%;};"
+        echo ".timer on"
+        first=1
+        for f in "${query_files[@]}"; do
+            stem="$(basename "$f" .sql)"
+            [[ -f "$suite_dir/$stem-duckdb.sql" ]] && f="$suite_dir/$stem-duckdb.sql"
+            if [[ "$first" != "1" && "${sleep_ms:-0}" -gt 0 ]]; then
+                echo ".shell sleep $(awk "BEGIN{print $sleep_ms/1000}")"
+            fi
+            first=0
+            [[ "$drop_caches" == "1" ]] && echo ".shell bash $flush_helper"
+            echo ".print === $stem ==="
+            for ((i = 1; i <= iterations; i++)); do
+                cat "$f"
+                echo
+            done
+        done
+    } >"$script"
+    run_cmd=(duckdb)
+    [[ "$data" == "native" ]] && run_cmd=(duckdb -readonly "$source_path")
+    "${run_cmd[@]}" <"$script" 2>&1 | grep -E '=== q|Run Time|Error' || true
+    exit 0
+fi
+
+queries_timed=0
+for f in "${query_files[@]}"; do
+    stem="$(basename "$f" .sql)"
+    [[ -f "$suite_dir/$stem-duckdb.sql" ]] && f="$suite_dir/$stem-duckdb.sql"
+    sql="$(cat "$f")"
+    echo "=== $stem ==="
+
+    if [[ "$write_expected" == "1" ]]; then
+        out_file="$suite_dir/$stem.tsv"
+        expected_cmd=(duckdb)
+        [[ "$data" == "native" ]] && expected_cmd=(duckdb -readonly "$source_path")
+        printf '%s\n.headers off\n.nullvalue '\'''\''\n.mode tabs\n.output %s\n%s\n' \
+            "$setup" "$out_file" "$sql" \
+            | "${expected_cmd[@]}"
+        echo "  wrote $out_file ($(wc -l < "$out_file" | tr -d ' ') rows)"
+        echo
+        continue
+    fi
+
+    if [[ "$queries_timed" -gt 0 && "${sleep_ms:-0}" -gt 0 ]]; then
+        sleep "$(awk "BEGIN{print $sleep_ms/1000}")"
+    fi
+    queries_timed=$((queries_timed + 1))
+
+    flush_page_cache
+    if [[ "$duckdb_process" == "single" ]]; then
+        cmd=("${iter_cmd[@]}")
+        for ((i = 1; i <= iterations; i++)); do cmd+=(-c "$sql"); done
+        "${cmd[@]}" 2>&1 | grep -E 'Run Time|Error' || true
+    else
+        for ((i = 1; i <= iterations; i++)); do
+            "${iter_cmd[@]}" -c "$sql" 2>&1 | grep -E 'Run Time|Error' || true
+            if [[ "${sleep_ms:-0}" -gt 0 && $i -lt $iterations ]]; then
+                sleep "$(awk "BEGIN{print $sleep_ms/1000}")"
+            fi
+        done
+    fi
+    echo
+done

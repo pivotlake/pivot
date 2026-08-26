@@ -59,6 +59,10 @@ benchmarks/
 │   └── duckdb-official/ clickhouse-official/      # vendored native schemas
 ├── clickbench-insert/
 │   └── setup.sql                 # the hits schema per table: source + a target per batch size
+├── ssb/
+│   ├── setup.sql                 # the 5 Star Schema Benchmark tables
+│   ├── qNN.sql  qNN.tsv          # the 13 official SSB queries (q11 = Q1.1)
+│   └── prep-ssb-data.sh          # sync the parquet dataset from S3
 ├── tpch/
 │   ├── setup.sql                 # the 8 normalized TPC-H tables
 │   ├── qNN.sql  qNN.tsv          # official TPC-H query texts
