@@ -4,14 +4,14 @@
 #
 # The canonical datasets (generated with tpchgen-cli, see the schema comment in
 # setup.sql):
-#   s3://epsio-tpch/sf1/                       SF1,   ~0.4 GB (PGO profiling)
-#   s3://epsio-tpch/sf10/                      SF10,  ~3.9 GB
-#   s3://epsio-tpch/sf100/                     SF100, ~41.5 GB, 7 MiB row groups
-#   s3://epsio-tpch/sf100-large-row-groups/    SF100, ~35.8 GB, 128 MiB row groups
+#   s3://epsio-benchmarks/tpch/sf1/                       SF1,   ~0.4 GB (PGO profiling)
+#   s3://epsio-benchmarks/tpch/sf10/                      SF10,  ~3.9 GB
+#   s3://epsio-benchmarks/tpch/sf100/                     SF100, ~41.5 GB, 7 MiB row groups
+#   s3://epsio-benchmarks/tpch/sf100-large-row-groups/    SF100, ~35.8 GB, 128 MiB row groups
 #
 # And the same data as pivot's own writer produces it, which is what a table
 # looks like after an INSERT rather than what another tool wrote:
-#   s3://epsio-tpch/sf100-pivot/               SF100, ~26 GB, 100k-row row groups
+#   s3://epsio-benchmarks/tpch/sf100-pivot/               SF100, ~26 GB, 100k-row row groups
 #
 # Every dataset is one directory per table, so the suite reads them all the same
 # way and so does any other engine. `sf100-pivot` also carries a `_delta_log`
@@ -42,5 +42,5 @@ done
 root="${root:-$HOME/tpch-$dataset}"
 
 mkdir -p "$root"
-aws s3 sync "s3://epsio-tpch/$dataset/" "$root/"
+aws s3 sync "s3://epsio-benchmarks/tpch/$dataset/" "$root/"
 echo "ready: --suite tpch --source $root"

@@ -37,7 +37,7 @@ name: TPC-H A/B
 #   TPCH_AB_KEY_NAME      (maorgkeypair)  - EC2 key pair matching PERF_SSH_KEY
 #   TPCH_AB_SUBNET_ID / TPCH_AB_SECURITY_GROUP  (account defaults) - the
 #                         security group must allow ssh from the runner
-#   TPCH_AB_DATA_BUCKET_NORM (s3://epsio-tpch) - the normalized dataset, one
+#   TPCH_AB_DATA_BUCKET_NORM (s3://epsio-benchmarks/tpch) - the normalized dataset, one
 #                         directory per table under each scale prefix
 #   TPCH_AB_CACHE_PREFIX  (s3://epsio-tpch-flat/tpch-ab-cache) - empty string
 #                         disables warm caches entirely; shared with the flat
@@ -90,7 +90,7 @@ jobs:
       AWS_ACCESS_KEY_ID: ${{ secrets.PERF_AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.PERF_AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ${{ vars.TPCH_AB_REGION || 'eu-central-1' }}
-      DATA_BUCKET: ${{ vars.TPCH_AB_DATA_BUCKET_NORM || 's3://epsio-tpch' }}
+      DATA_BUCKET: ${{ vars.TPCH_AB_DATA_BUCKET_NORM || 's3://epsio-benchmarks/tpch' }}
       CACHE_PREFIX: ${{ vars.TPCH_AB_CACHE_PREFIX || 's3://epsio-tpch-flat/tpch-ab-cache' }}
 
     steps:

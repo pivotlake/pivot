@@ -19,7 +19,7 @@ name: Concurrency A/B
 #
 # Shares the TPC-H A/B infrastructure: the same baked AMI (TPCH_AB_AMI_ID),
 # secrets, instance profile and cache prefix. The dataset lives beside the
-# TPC-H scales as s3://epsio-tpch/clickbench-quarter/ (the first quarter of
+# TPC-H scales as s3://epsio-benchmarks/clickbench-quarter/ (the first quarter of
 # ClickBench hits.parquet, 24,999,374 rows).
 
 on:
@@ -69,7 +69,7 @@ jobs:
       AWS_ACCESS_KEY_ID: ${{ secrets.PERF_AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.PERF_AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ${{ vars.TPCH_AB_REGION || 'eu-central-1' }}
-      DATA_BUCKET: ${{ vars.CONCURRENT_AB_DATA_BUCKET || 's3://epsio-tpch' }}
+      DATA_BUCKET: ${{ vars.CONCURRENT_AB_DATA_BUCKET || 's3://epsio-benchmarks' }}
       CACHE_PREFIX: ${{ vars.TPCH_AB_CACHE_PREFIX || 's3://epsio-tpch-flat/tpch-ab-cache' }}
 
     steps:
