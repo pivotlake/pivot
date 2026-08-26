@@ -17,15 +17,28 @@
 //! path's type keeps its bytes in the fallback column, exactly as the
 //! reference implementation does; the differential tests below hold the two
 //! to array equality.
+//!
+//! Routing a row's fields to their columns never decodes a field name as a
+//! string. A document refers to its fields by their ids in its metadata
+//! dictionary, and the dictionary's names are compared as bytes: a row whose
+//! dictionary is about the size of the document (the common case, since a
+//! dictionary is normally built from the document's own keys) gets one merge
+//! of the dictionary against the sorted column names, after which every field
+//! routes by indexing a table with its id; a sparse document over an oversized
+//! dictionary instead looks each of its fields up in a byte-keyed map. See
+//! [`merge_routes_cheaper`].
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use ahash::RandomState;
+
 use arrow_array::builder::make_view;
 use arrow_array::types::{BinaryViewType, ByteViewType, Float64Type, Int64Type, StringViewType};
 use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, GenericByteViewArray, StructArray};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
+use arrow_schema::ArrowError;
 use arrow_schema::{DataType, Field, Fields};
 use dispatch::arrays::{ArrayBuilder, PrimitiveBuilder, SlabColumn, ValidityBuilder};
 use dispatch::memory::{BUFFER_SIZE, SlabAllocator};
@@ -197,11 +210,36 @@ impl FieldShredder {
 /// something other than an object.
 struct ObjectShredder {
     children: Vec<(String, FieldShredder)>,
-    index: HashMap<String, usize>,
+    /// The children's names as bytes in byte order, each with its position in
+    /// `children`: one side of the per-row merge against a dictionary.
+    sorted_names: Vec<(Vec<u8>, usize)>,
+    /// Name bytes to position in `children`, for the rows that route field by
+    /// field.
+    by_name: HashMap<Vec<u8>, usize, RandomState>,
     /// Which children the row being appended has provided, so the rest can be
     /// marked absent; reused across rows.
     seen: Vec<bool>,
+    /// Where each entry of the row's dictionary routes, by field id; rebuilt
+    /// for every row that merges, reused so no row allocates.
+    child_by_field_id: Vec<Option<usize>>,
+    /// The entries of an unsorted dictionary in byte order, for the merge.
+    dictionary_order: Vec<u32>,
     typed_nulls: Validity,
+}
+
+/// Whether a row is cheaper to route by merging its whole dictionary against
+/// the column names than by looking its fields up one by one.
+///
+/// The merge costs one comparison per dictionary entry plus one per column;
+/// the lookups cost a hash and a compare per field the document has. When a
+/// dictionary is built from the document's own keys, which is how variant
+/// builders write one, the two counts are the same and the merge wins by
+/// touching nothing per field afterwards. A writer that shares one large
+/// dictionary across many sparse documents inverts that, so beyond this ratio
+/// of entries to fields the row falls back to lookups.
+fn merge_routes_cheaper(dictionary_entries: usize, fields: usize) -> bool {
+    const ENTRIES_PER_FIELD_LIMIT: usize = 4;
+    dictionary_entries <= fields.saturating_mul(ENTRIES_PER_FIELD_LIMIT)
 }
 
 impl ObjectShredder {
@@ -213,15 +251,20 @@ impl ObjectShredder {
                 Ok((field.name().clone(), child))
             })
             .collect::<WriteResult<Vec<_>>>()?;
-        let index = children
+        let mut sorted_names: Vec<(Vec<u8>, usize)> = children
             .iter()
             .enumerate()
-            .map(|(position, (name, _))| (name.clone(), position))
+            .map(|(position, (name, _))| (name.as_bytes().to_vec(), position))
             .collect();
+        sorted_names.sort();
+        let by_name = sorted_names.iter().cloned().collect();
         Ok(Self {
             seen: vec![false; children.len()],
+            child_by_field_id: Vec::new(),
+            dictionary_order: Vec::new(),
             children,
-            index,
+            sorted_names,
+            by_name,
             typed_nulls: Validity::with_capacity(allocator, rows),
         })
     }
@@ -248,17 +291,39 @@ impl ObjectShredder {
             return Ok(());
         };
 
+        let metadata = value.metadata();
         self.seen.fill(false);
-        let mut leftovers: Vec<(&str, Variant<'_, '_>)> = Vec::new();
-        for (name, field_value) in object.iter() {
-            match self.index.get(name) {
-                Some(&position) => {
-                    self.children[position]
-                        .1
-                        .append_value(field_value, allocator)?;
-                    self.seen[position] = true;
+        let mut leftovers: Vec<(u32, Variant<'_, '_>)> = Vec::new();
+        if merge_routes_cheaper(metadata.len(), object.len()) {
+            self.route_dictionary(metadata)?;
+            for (field_id, field_value) in object.iter_with_field_ids() {
+                let route = self
+                    .child_by_field_id
+                    .get(field_id as usize)
+                    .copied()
+                    .ok_or_else(|| field_id_out_of_dictionary(field_id, metadata))?;
+                match route {
+                    Some(position) => {
+                        self.children[position]
+                            .1
+                            .append_value(field_value, allocator)?;
+                        self.seen[position] = true;
+                    }
+                    None => leftovers.push((field_id, field_value)),
                 }
-                None => leftovers.push((name, field_value)),
+            }
+        } else {
+            for (field_id, field_value) in object.iter_with_field_ids() {
+                let name = metadata.name_bytes(field_id as usize)?;
+                match self.by_name.get(name) {
+                    Some(&position) => {
+                        self.children[position]
+                            .1
+                            .append_value(field_value, allocator)?;
+                        self.seen[position] = true;
+                    }
+                    None => leftovers.push((field_id, field_value)),
+                }
             }
         }
         for (position, seen) in self.seen.iter().enumerate() {
@@ -269,10 +334,42 @@ impl ObjectShredder {
         if leftovers.is_empty() {
             fallback.append_null();
         } else {
-            let bytes = leftover_object(value.metadata(), &leftovers);
+            let bytes = leftover_object(metadata, &leftovers)?;
             fallback.append_bytes(&bytes, allocator);
         }
         self.typed_nulls.append(true);
+        Ok(())
+    }
+
+    /// Fill `child_by_field_id` for `metadata`: one merge of its entries, in
+    /// byte order, against the sorted column names. An unsorted dictionary
+    /// (the format allows one) is walked through a sorted permutation of its
+    /// entries, so the ids the table is indexed by stay the dictionary's own.
+    fn route_dictionary(&mut self, metadata: &VariantMetadata<'_>) -> WriteResult<()> {
+        let entries = metadata.len();
+        self.child_by_field_id.clear();
+        self.child_by_field_id.resize(entries, None);
+        self.dictionary_order.clear();
+        self.dictionary_order.extend(0..entries as u32);
+        if !metadata.is_sorted() {
+            self.dictionary_order.sort_unstable_by(|&left, &right| {
+                let left = metadata.name_bytes(left as usize).unwrap_or_default();
+                let right = metadata.name_bytes(right as usize).unwrap_or_default();
+                left.cmp(right)
+            });
+        }
+
+        let mut column = 0;
+        for &field_id in &self.dictionary_order {
+            let name = metadata.name_bytes(field_id as usize)?;
+            while column < self.sorted_names.len() && self.sorted_names[column].0.as_slice() < name
+            {
+                column += 1;
+            }
+            if column < self.sorted_names.len() && self.sorted_names[column].0 == name {
+                self.child_by_field_id[field_id as usize] = Some(self.sorted_names[column].1);
+            }
+        }
         Ok(())
     }
 
@@ -301,20 +398,29 @@ impl ObjectShredder {
     }
 }
 
-/// The variant bytes of an object holding just `fields`, whose names all come
-/// from `metadata` (they are fields of the document being shredded). Nested
-/// values are copied byte for byte, so they keep referring to that same
-/// dictionary.
-fn leftover_object(metadata: &VariantMetadata<'_>, fields: &[(&str, Variant<'_, '_>)]) -> Vec<u8> {
+/// The variant bytes of an object holding just `fields`, named by their ids in
+/// `metadata` (they are fields of the document being shredded). Nested values
+/// are copied byte for byte, so they keep referring to that same dictionary.
+fn leftover_object(
+    metadata: &VariantMetadata<'_>,
+    fields: &[(u32, Variant<'_, '_>)],
+) -> WriteResult<Vec<u8>> {
     let mut value_builder = ValueBuilder::new();
     let mut metadata_builder = ReadOnlyMetadataBuilder::new(metadata);
     let state = ParentState::variant(&mut value_builder, &mut metadata_builder);
     let mut object = ObjectBuilder::new(state, false);
-    for (name, value) in fields {
-        object.insert_bytes(name, value.clone());
+    for (field_id, value) in fields {
+        object.insert_bytes(metadata.get(*field_id as usize)?, value.clone());
     }
     object.finish();
-    value_builder.into_inner()
+    Ok(value_builder.into_inner())
+}
+
+fn field_id_out_of_dictionary(field_id: u32, metadata: &VariantMetadata<'_>) -> WriteError {
+    WriteError::Arrow(ArrowError::InvalidArgumentError(format!(
+        "variant field id {field_id} is outside its {}-entry metadata dictionary",
+        metadata.len()
+    )))
 }
 
 /// The fallback `value` column of one position. Most positions never fall
@@ -577,6 +683,39 @@ mod tests {
         json_to_variant(&json).unwrap()
     }
 
+    /// A variant column whose rows are built with `VariantBuilder`, so a test
+    /// controls each row's dictionary: the names it holds and their order.
+    fn rows_with_dictionaries(rows: Vec<(Vec<u8>, Vec<u8>)>) -> VariantArray {
+        use arrow_array::BinaryViewArray;
+
+        let metadata: ArrayRef = Arc::new(BinaryViewArray::from_iter_values(
+            rows.iter().map(|(metadata, _)| metadata.as_slice()),
+        ));
+        let value: ArrayRef = Arc::new(BinaryViewArray::from_iter_values(
+            rows.iter().map(|(_, value)| value.as_slice()),
+        ));
+        let fields = Fields::from(vec![
+            Field::new("metadata", DataType::BinaryView, false),
+            Field::new("value", DataType::BinaryView, true),
+        ]);
+        VariantArray::try_new(&StructArray::try_new(fields, vec![metadata, value], None).unwrap())
+            .unwrap()
+    }
+
+    /// One document `{a: 1, b: "two", zz: 3}` whose dictionary is pre-seeded
+    /// with `seeded` names in the order given.
+    fn document_with_seeded_dictionary(seeded: &[&str]) -> (Vec<u8>, Vec<u8>) {
+        use parquet_variant::VariantBuilder;
+
+        let mut builder = VariantBuilder::new().with_field_names(seeded.iter().copied());
+        let mut object = builder.new_object();
+        object.insert("a", 1i64);
+        object.insert("b", "two");
+        object.insert("zz", 3i64);
+        object.finish();
+        builder.finish()
+    }
+
     fn object(fields: Vec<(&str, DataType)>) -> DataType {
         DataType::Struct(
             fields
@@ -643,6 +782,46 @@ mod tests {
 
         assert_eq!(ours.data_type(), reference.data_type());
         assert_eq!(ours, reference);
+    }
+
+    /// A dictionary far larger than the document routes field by field, and
+    /// gets the same answer as the reference.
+    #[test]
+    fn a_sparse_document_over_an_oversized_dictionary_shreds_like_the_reference() {
+        let seeded: Vec<String> = (0..64).map(|i| format!("unused_{i:02}")).collect();
+        let seeded: Vec<&str> = seeded.iter().map(String::as_str).collect();
+        let array = rows_with_dictionaries(vec![
+            document_with_seeded_dictionary(&seeded),
+            document_with_seeded_dictionary(&seeded),
+        ]);
+        assert!(!merge_routes_cheaper(array.value(0).metadata().len(), 3));
+        let shredding = object(vec![("a", DataType::Int64), ("b", DataType::Utf8View)]);
+
+        let (ours, reference) = both(&array, &shredding);
+
+        assert_eq!(ours, reference);
+    }
+
+    /// A dictionary whose entries are not in byte order is merged through a
+    /// sorted permutation, and gets the same answer as the reference.
+    #[test]
+    fn an_unsorted_dictionary_shreds_like_the_reference() {
+        let array = rows_with_dictionaries(vec![document_with_seeded_dictionary(&["zz", "b"])]);
+        assert!(!array.value(0).metadata().is_sorted());
+        assert!(merge_routes_cheaper(array.value(0).metadata().len(), 3));
+        let shredding = object(vec![("a", DataType::Int64), ("b", DataType::Utf8View)]);
+
+        let (ours, reference) = both(&array, &shredding);
+
+        assert_eq!(ours, reference);
+    }
+
+    #[test]
+    fn a_dictionary_built_from_the_document_merges() {
+        assert!(merge_routes_cheaper(50, 50));
+        assert!(merge_routes_cheaper(200, 50));
+        assert!(!merge_routes_cheaper(201, 50));
+        assert!(!merge_routes_cheaper(1, 0));
     }
 
     /// Paths that never fall back cost one shared all-null column, not one
