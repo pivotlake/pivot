@@ -140,7 +140,10 @@ pub trait Unary<I, O> {
     -> Result<()>;
 
     /// Whether this unary is ready to accept another input. Returns `false` when
-    /// backpressured (e.g. waiting for IO to complete before consuming more).
+    /// backpressured (e.g. waiting for IO to complete before consuming more) or
+    /// while it holds a job it is still stepping through. A unary that is not
+    /// ready is neither fed nor steals, but still gets [`run`](Self::run) each
+    /// turn.
     fn ready_for_more_work(&mut self) -> bool {
         true
     }
@@ -173,8 +176,10 @@ pub trait Unary<I, O> {
         unreachable!()
     }
 
-    /// Called each iteration even when no input is available. Useful for operators
-    /// that generate work independently of input (e.g. emitting buffered results).
+    /// Called on every turn that consumes no input: the input channel is empty,
+    /// or the unary is not [ready](Self::ready_for_more_work) for more. Useful
+    /// for operators that generate work independently of input (e.g. emitting
+    /// buffered results, or advancing a held job by one step).
     fn run(&mut self, _sender: &mut dyn Sender<O>) -> Result<WorkStatus> {
         Ok(WorkStatus::Pending)
     }
@@ -259,8 +264,10 @@ impl<I, O, U: Unary<I, O>, R: Receiver<I>> UnaryOperator<I, O, U, R> {
 
 impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, IN> {
     fn run_cpu_work(&mut self, io: &mut OperatorIO) -> super::Result<WorkStatus> {
+        // A transform that is not taking input may still have work of its own
+        // to advance, e.g. a job it steps through one batch per turn.
         if !self.unary.ready_for_more_work() {
-            return Ok(WorkStatus::Pending);
+            return Ok(self.unary.run(&mut *self.sender)?);
         }
 
         let item = match self.receiver.try_recv() {
@@ -369,5 +376,55 @@ impl<I, O, U: Unary<I, O>, IN: Receiver<I>> Operator for UnaryOperator<I, O, U, 
 
     fn upstream_cancel_flag(&self) -> Option<Arc<AtomicBool>> {
         self.unary.upstream_cancel_flag()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::TestOperatorIO;
+    use crate::operations::channels::mpsc_channel;
+    use test_utils::CollectSender;
+
+    /// A transform holding a job it steps through: it takes no input, and each
+    /// `run` is one step.
+    struct HeldJob {
+        steps: usize,
+    }
+
+    impl Unary<(), ()> for HeldJob {
+        fn consume(&mut self, _: (), _: &mut dyn Sender<()>, _: &mut OperatorIO) -> Result<()> {
+            unreachable!("a transform that is not ready is never fed")
+        }
+
+        fn ready_for_more_work(&mut self) -> bool {
+            false
+        }
+
+        fn run(&mut self, _: &mut dyn Sender<()>) -> Result<WorkStatus> {
+            self.steps += 1;
+            Ok(WorkStatus::Ran)
+        }
+    }
+
+    /// A transform that is not ready for input still gets its turn through
+    /// `run`, and the input it declined stays queued.
+    #[test]
+    fn a_transform_not_ready_for_input_is_still_run() {
+        let (mut input, receiver) = mpsc_channel::<()>();
+        input.send(()).unwrap();
+        let mut operator = UnaryOperator::new(
+            HeldJob { steps: 0 },
+            receiver,
+            Box::new(CollectSender::<()>::new()),
+            Arc::new(AtomicUsize::new(1)),
+        );
+        let mut test_io = TestOperatorIO::default();
+
+        let status = operator.run_cpu_work(&mut test_io.io()).unwrap();
+
+        assert!(matches!(status, WorkStatus::Ran));
+        assert_eq!(operator.unary.steps, 1);
+        assert!(!operator.receiver.is_empty());
     }
 }

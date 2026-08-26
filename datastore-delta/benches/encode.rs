@@ -2,9 +2,10 @@
 //!
 //! The mirror of `decode.rs`, which measures the read pipeline the same way.
 //! Each case runs an INSERT, which is the whole thing: rows are split by
-//! partition and accumulated into row groups, each column chunk is flattened
-//! into leaves and dictionary, delta or plain encoded, its pages are
-//! compressed, and the assembler lays the file out and writes the footer.
+//! partition and accumulated into row groups, the shredder splits each column
+//! chunk into leaves, each leaf is dictionary, delta or plain encoded, its
+//! pages are compressed, and the assembler lays the file out and writes the
+//! footer.
 //!
 //! What a change inside an encoder is worth is what it is worth to a write, so
 //! that is what these measure. The shapes that lean on one encoder are named for

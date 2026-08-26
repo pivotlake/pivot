@@ -19,8 +19,8 @@ use dispatch::memory::SlabAllocator;
 use crate::DecimalWriteStorage;
 
 use super::super::error::{WriteError, WriteResult};
+use super::super::leaves::Leaf;
 use super::super::types::EncodedPage;
-use super::leaves::Leaf;
 use super::pages::{self, PageKind, PageRange};
 
 /// PLAIN-encode a leaf: cut it into pages and encode each.
@@ -66,7 +66,7 @@ fn encode_data_page(
 ///
 /// Parquet stores only the values that are present, so a leaf's absent rows are
 /// already dropped by the time they reach here (see
-/// [`leaves`](super::leaves)) — a null left in the array would mean a field
+/// [`leaves`](super::super::leaves)) — a null left in the array would mean a field
 /// nullable in the data but required in the schema, which would silently write
 /// the wrong values, so it errors instead.
 pub(super) fn encode_into(array: &dyn Array, out: &mut Vec<u8>) -> WriteResult<()> {

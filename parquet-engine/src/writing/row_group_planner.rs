@@ -1,4 +1,4 @@
-//! Divides ordered files into row groups and column-encoding jobs.
+//! Divides ordered files into row groups and column jobs.
 //!
 //! Row-group boundaries can cross merge output batches. Batch slicing remains
 //! zero-copy, and each column job is routed to the NUMA node that contributes
@@ -9,6 +9,7 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, RecordBatch};
 use dispatch::{Sender, Topology, Unary, UnaryFactory, UnaryResult};
 
+use super::leaves;
 use super::shredding;
 use super::types::{ColumnChunkJob, FileAssemblyInfo, ReadyFile, RowGroupContext};
 
@@ -64,8 +65,17 @@ fn emit_column_chunk_jobs(
     let record_batches: Vec<RecordBatch> =
         batches.iter().map(|batch| batch.batch().clone()).collect();
     let shredding_plan = shredding::plan_file_shredding(&record_batches)?;
+    // The file's leaves are numbered depth-first across its columns, so each
+    // column's leaves start where the previous column's ended.
+    let leaf_counts: Vec<usize> = shredding_plan
+        .schema
+        .fields()
+        .iter()
+        .map(|field| leaves::count_leaves(field))
+        .collect();
+    let leaf_count = leaf_counts.iter().sum();
 
-    // A fixed-width column is materialized into one ring slab by the encoder.
+    // A fixed-width leaf is materialized into one ring slab by the encoder.
     debug_assert!(
         plan.target_rows_per_group <= dispatch::BUFFER_SIZE / 16,
         "a row group's widest column must fit one slab"
@@ -112,9 +122,11 @@ fn emit_column_chunk_jobs(
             row_group_id: plan.base_row_group_id + row_group_index as u64,
             assembly_worker: plan.assembly_worker,
             schema: shredding_plan.schema.clone(),
+            leaf_count,
             file_info: file_info.clone(),
         });
-        for column_index in 0..shredding_plan.schema.fields().len() {
+        let mut first_leaf_index = 0;
+        for (column_index, &column_leaf_count) in leaf_counts.iter().enumerate() {
             let column_batches: Arc<[ArrayRef]> = row_group_batches
                 .iter()
                 .map(|batch| batch.column(column_index).clone())
@@ -122,10 +134,12 @@ fn emit_column_chunk_jobs(
             sender.send(ColumnChunkJob {
                 context: context.clone(),
                 column_index,
+                first_leaf_index,
                 batches: column_batches,
                 shredding: shredding_plan.column_shredding[column_index].clone(),
                 target_node,
             })?;
+            first_leaf_index += column_leaf_count;
         }
     }
     Ok(())
