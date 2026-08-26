@@ -23,8 +23,10 @@ use parquet_variant_compute::{
 };
 use parquet_variant_json::VariantToJson;
 
+use super::shredding::plan_shredding_union_of_batches;
 use super::{
-    AssembledFile, encode_compaction_batches_spec, encode_record_batches_spec, unshred_batches_spec,
+    AssembledFile, CompactionInputs, encode_compaction_batches_spec, encode_record_batches_spec,
+    unshred_batches_spec,
 };
 
 /// A 64 MiB file-cache ring, as the other in-crate write tests use.
@@ -58,6 +60,26 @@ struct ShreddedItem {
 impl IntoBatch for ShreddedItem {
     fn into_batch(self) -> Result<RecordBatch, ArrowError> {
         variant_batch(&self.rows, Some(&self.paths))
+    }
+}
+
+/// Documents already shredded on `paths` as strings, for inputs that typed a
+/// path as text where another typed it as an integer.
+struct TextShreddedItem {
+    rows: Vec<String>,
+    paths: Vec<&'static str>,
+}
+
+impl IntoBatch for TextShreddedItem {
+    fn into_batch(self) -> Result<RecordBatch, ArrowError> {
+        let json: ArrayRef = Arc::new(StringArray::from(self.rows));
+        let mut builder = ShreddedSchemaBuilder::new();
+        for path in self.paths {
+            builder = builder.with_path(path, &DataType::Utf8View)?;
+        }
+        let variants = shred_variant(&json_to_variant(&json)?, &builder.build())?;
+        let schema = Schema::new(vec![variants.field(COLUMN)]);
+        RecordBatch::try_new(Arc::new(schema), vec![Arc::new(variants.into_inner())])
     }
 }
 
@@ -147,6 +169,34 @@ fn write_grouped<T: IntoBatch>(
         sort_column_names,
         rows_per_group,
         usize::MAX,
+    )
+    .map_each(|file: AssembledFile| file.bytes.runs().flatten().copied().collect::<Vec<u8>>())
+    .execute()
+    .collect()
+    .unwrap();
+    dispatch.exit();
+    files
+}
+
+/// Run the compaction pipeline over `batches`, each as read out of one input
+/// file, widened to the union of their layouts as compaction widens them, and
+/// return the finished files' bytes.
+fn compact(batches: Vec<RecordBatch>, rows_per_group: usize) -> Vec<Vec<u8>> {
+    let dispatch = Dispatch::spin_up(2, RING_BUFFERS, None);
+    let schema = batches[0].schema();
+    let shredding_union = plan_shredding_union_of_batches(&batches);
+    let spec = values_input(dispatch.dispatcher(), batches).record_batches();
+    let files: Vec<Vec<u8>> = encode_compaction_batches_spec(
+        spec,
+        CompactionInputs {
+            schema,
+            shredding_union,
+        },
+        None,
+        Arc::from([]),
+        Arc::from([]),
+        rows_per_group,
+        None,
     )
     .map_each(|file: AssembledFile| file.bytes.runs().flatten().copied().collect::<Vec<u8>>())
     .execute()
@@ -422,6 +472,153 @@ fn already_shredded_input_re_shreds_to_the_merged_rows() {
             r#"{"id":2,"n":20}"#,
             r#"{"id":3,"n":30}"#,
             r#"{"id":4,"n":40}"#,
+        ]
+    );
+}
+
+/// Compaction of files that shredded differently: the output types every path
+/// the rows justify, whether a file typed it or left it in its leftover, and
+/// every document survives whole without being rebuilt on the way.
+#[test]
+fn compaction_reshreds_files_that_shredded_differently() {
+    let files = compact(
+        vec![
+            ShreddedItem {
+                rows: rows(&[r#"{"id": 1, "n": 10}"#, r#"{"id": 2, "n": 20, "z": "q"}"#]),
+                paths: vec!["id"],
+            }
+            .into_batch()
+            .unwrap(),
+            ShreddedItem {
+                rows: rows(&[r#"{"id": 3, "n": 30}"#, r#"{"id": 4}"#]),
+                paths: vec!["n"],
+            }
+            .into_batch()
+            .unwrap(),
+        ],
+        128 * 1024,
+    );
+
+    assert_eq!(files.len(), 1);
+    assert_eq!(
+        leaf_paths(&files[0]),
+        vec![
+            "attrs.metadata",
+            "attrs.value",
+            "attrs.typed_value.id.value",
+            "attrs.typed_value.id.typed_value",
+            "attrs.typed_value.n.value",
+            "attrs.typed_value.n.typed_value",
+            "attrs.typed_value.z.value",
+            "attrs.typed_value.z.typed_value",
+        ],
+        "z is in a quarter of the rows, enough for a leaf, though no input typed it"
+    );
+    let mut got = documents(&read_back(&files[0]));
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            r#"{"id":1,"n":10}"#,
+            r#"{"id":2,"n":20,"z":"q"}"#,
+            r#"{"id":3,"n":30}"#,
+            r#"{"id":4}"#,
+        ]
+    );
+}
+
+/// A path one input typed loses its leaf when the merged rows no longer
+/// carry it often enough: its values go back into those rows' leftovers.
+#[test]
+fn compaction_untypes_a_path_the_merged_rows_do_not_justify() {
+    let mut common: Vec<String> = (0..60).map(|i| format!(r#"{{"id": {i}}}"#)).collect();
+    let rare = rows(&[r#"{"id": 100, "rare": 1}"#, r#"{"id": 101, "rare": 2}"#]);
+
+    let files = compact(
+        vec![
+            ShreddedItem {
+                rows: rare.clone(),
+                paths: vec!["id", "rare"],
+            }
+            .into_batch()
+            .unwrap(),
+            ShreddedItem {
+                rows: common.clone(),
+                paths: vec!["id"],
+            }
+            .into_batch()
+            .unwrap(),
+        ],
+        128 * 1024,
+    );
+
+    assert_eq!(files.len(), 1);
+    assert_eq!(
+        leaf_paths(&files[0]),
+        vec![
+            "attrs.metadata",
+            "attrs.value",
+            "attrs.typed_value.id.value",
+            "attrs.typed_value.id.typed_value",
+        ],
+        "two rows in sixty-two are under the presence bar"
+    );
+    let mut got = documents(&read_back(&files[0]));
+    got.sort();
+    common.extend(rows(&[r#"{"id":100,"rare":1}"#, r#"{"id":101,"rare":2}"#]));
+    let mut expected: Vec<String> = common.iter().map(|d| d.replace(": ", ":")).collect();
+    expected.sort();
+    assert_eq!(got, expected);
+}
+
+/// Inputs that typed one path as different types: the output types it once
+/// and keeps the other rows' values in the fallback beside the leaf.
+#[test]
+fn compaction_settles_a_path_typed_two_ways() {
+    let files = compact(
+        vec![
+            ShreddedItem {
+                rows: rows(&[r#"{"x": 1}"#, r#"{"x": 2}"#]),
+                paths: vec!["x"],
+            }
+            .into_batch()
+            .unwrap(),
+            TextShreddedItem {
+                rows: rows(&[r#"{"x": "one"}"#, r#"{"x": "two"}"#, r#"{"x": "three"}"#]),
+                paths: vec!["x"],
+            }
+            .into_batch()
+            .unwrap(),
+        ],
+        128 * 1024,
+    );
+
+    assert_eq!(files.len(), 1);
+    assert_eq!(
+        leaf_paths(&files[0]),
+        vec![
+            "attrs.metadata",
+            "attrs.value",
+            "attrs.typed_value.x.value",
+            "attrs.typed_value.x.typed_value",
+        ]
+    );
+    let stats = leaf_stats(&files[0]);
+    let fallback = stats
+        .iter()
+        .find(|(path, ..)| path == "attrs.typed_value.x.value")
+        .unwrap();
+    assert_eq!(fallback.1, Some(3), "the two integers sit in the fallback");
+    let mut got = documents(&read_back(&files[0]));
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            r#"{"x":"one"}"#,
+            r#"{"x":"three"}"#,
+            r#"{"x":"two"}"#,
+            r#"{"x":1}"#,
+            r#"{"x":2}"#
         ]
     );
 }
@@ -738,7 +935,10 @@ fn compaction_merges_presorted_source_runs_into_one_sorted_file() {
 
     let files: Vec<Vec<u8>> = encode_compaction_batches_spec(
         input,
-        schema,
+        CompactionInputs {
+            schema,
+            shredding_union: Arc::from([None]),
+        },
         None,
         Arc::from([]),
         Arc::from(["key".to_string()]),

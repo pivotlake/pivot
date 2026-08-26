@@ -826,7 +826,7 @@ impl CatalogTable {
         let uploaded_files = Arc::new(Injector::new());
         let encoded = parquet_engine::writing::encode_compaction_batches_spec(
             scan,
-            parquet.schema().clone(),
+            parquet_engine::writing::CompactionInputs::of_table(&parquet),
             partition,
             Arc::from(self.partition_by()),
             Arc::from(self.sort_by()),

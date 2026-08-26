@@ -69,7 +69,7 @@ pub use types::AssembledFile;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_schema::{DataType, SchemaRef};
 use dispatch::memory::SlabAllocator;
 use dispatch::{
     DefaultUnaryFactory, OperatorFactory, OperatorSpec, OrderBy, RecordBatchOperatorSpec,
@@ -141,16 +141,24 @@ pub fn encode_record_batches_spec(
 /// file, so the INSERT-only partition/sort/copy stage is skipped. All batches
 /// form one output file; sorted tables still use the downstream k-way merge to
 /// combine overlapping source-file runs.
+///
+/// Every batch is first widened to the union of the input files' variant
+/// layouts, so files that shredded differently share one schema without any
+/// document being rebuilt.
 pub fn encode_compaction_batches_spec(
     spec: RecordBatchOperatorSpec,
-    schema: SchemaRef,
+    inputs: CompactionInputs,
     partition: Option<crate::PartitionValues>,
     partition_column_names: Arc<[String]>,
     sort_column_names: Arc<[String]>,
     target_rows_per_group: usize,
     max_file_size: Option<usize>,
 ) -> OperatorSpec<AssembledFile, impl OperatorFactory<AssembledFile> + 'static> {
-    let spec = unshred_batches_spec(spec);
+    let CompactionInputs {
+        schema,
+        shredding_union,
+    } = inputs;
+    let spec = widen_batches_spec(spec, shredding_union);
     let order_by = sort_order(&schema, &sort_column_names);
     let (dispatcher, heads) = spec.into_parts();
     let worker_count = heads.len();
@@ -178,6 +186,45 @@ pub fn encode_compaction_batches_spec(
             ),
         );
     encode_files_spec(files)
+}
+
+/// What a compaction reads: the files' schema, and the union of the layouts
+/// they gave each variant column, which every batch is widened to.
+pub struct CompactionInputs {
+    pub schema: SchemaRef,
+    /// By column: `None` for a plain column, and for a variant column no
+    /// input shredded.
+    pub shredding_union: Arc<[Option<Arc<DataType>>]>,
+}
+
+impl CompactionInputs {
+    /// The inputs of a compaction over `table`'s row groups.
+    pub fn of_table(table: &crate::ParquetTable) -> Self {
+        Self {
+            schema: table.schema().clone(),
+            shredding_union: shredding::plan_shredding_union(table.row_groups()),
+        }
+    }
+}
+
+/// Widen every batch's variant columns to `shredding_union`, the layouts a
+/// compaction's inputs are brought together on (see
+/// [`encode_compaction_batches_spec`]).
+pub fn widen_batches_spec(
+    spec: RecordBatchOperatorSpec,
+    shredding_union: Arc<[Option<Arc<DataType>>]>,
+) -> RecordBatchOperatorSpec {
+    spec.project(move || {
+        // As in `unshred_batches_spec`: one allocator per worker, made on the
+        // first batch, once the worker's memory context exists.
+        let mut allocator: Option<SlabAllocator> = None;
+        let shredding_union = shredding_union.clone();
+        move |batch| {
+            let allocator = allocator.get_or_insert_with(|| SlabAllocator::new(false));
+            shredding::widen_batch(batch, &shredding_union, allocator)
+                .expect("a variant column widens to the union layout")
+        }
+    })
 }
 
 pub fn unshred_batches_spec(spec: RecordBatchOperatorSpec) -> RecordBatchOperatorSpec {

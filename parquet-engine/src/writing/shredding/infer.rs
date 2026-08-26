@@ -18,11 +18,19 @@
 //! documents, which is also the shape of the answer — a `typed_value` type is a
 //! tree of fields. So nothing here builds or splits a path string: the field
 //! names are the tree's edges.
+//!
+//! Rows that arrive already shredded (a compaction's, widened to the union of
+//! its inputs' layouts) are counted from two sources. What a typed leaf holds
+//! is its non-null row count, exact and for every row. What the leftover
+//! `value` beside it holds is sampled like a document is, each sampled row
+//! standing for the rows the sample strides over. The two add up on the same
+//! tree, so a path counts the same whether a file typed it or not.
 
 use std::collections::BTreeMap;
 
+use arrow_array::{Array, ArrayRef, BinaryViewArray, StructArray};
 use arrow_schema::{DataType, Field, Fields};
-use parquet_variant::Variant;
+use parquet_variant::{Variant, VariantMetadata, VariantObject};
 use parquet_variant_compute::VariantArray;
 
 /// Rows read to decide a file's shredding schema. The decision only has to be
@@ -74,6 +82,16 @@ fn shred_data_type(value: &Variant) -> Option<DataType> {
     }
 }
 
+/// The type a typed leaf of `data_type` counts as, or `None` for a leaf of a
+/// type the writer does not shred into, which counts for nothing.
+fn shred_leaf_type(data_type: &DataType) -> Option<DataType> {
+    matches!(
+        data_type,
+        DataType::Int64 | DataType::Float64 | DataType::Utf8View
+    )
+    .then(|| data_type.clone())
+}
+
 /// One position inside the sampled documents: what turned up there, and — where
 /// it held an object — the same again for each of its fields.
 ///
@@ -108,13 +126,13 @@ enum Shape<'a> {
 
 impl Candidate {
     /// Count everything shreddable in `value`, which sits at `depth` (the
-    /// document itself is at 0).
+    /// document itself is at 0), as `weight` rows.
     ///
     /// Only objects are descended into: a bare scalar column has no paths to
     /// name, and a list's elements have no stable path either.
-    fn observe(&mut self, value: &Variant, depth: usize) {
+    fn observe(&mut self, value: &Variant, weight: usize, depth: usize) {
         if let Some(data_type) = shred_data_type(value) {
-            *self.scalars.entry(data_type).or_default() += 1;
+            *self.scalars.entry(data_type).or_default() += weight;
             return;
         }
         let Some(object) = value.as_object() else {
@@ -123,18 +141,98 @@ impl Candidate {
         if depth == MAX_DEPTH {
             return;
         }
-        self.objects += 1;
+        self.objects += weight;
+        self.observe_fields(object, weight, depth);
+    }
+
+    /// Count the fields of `object`, which sits at `depth` and is counted
+    /// already, as `weight` rows each.
+    fn observe_fields(&mut self, object: &VariantObject<'_, '_>, weight: usize, depth: usize) {
         for (name, field) in object.iter() {
-            // `entry` would allocate the name on every row; only a field never
-            // seen before needs one.
-            if !self.fields.contains_key(name) {
-                self.fields.insert(name.to_string(), Candidate::default());
+            self.child(name).observe(&field, weight, depth + 1);
+        }
+    }
+
+    /// The candidate for the field `name` under this position.
+    fn child(&mut self, name: &str) -> &mut Candidate {
+        // `entry` would allocate the name on every row; only a field never
+        // seen before needs one.
+        if !self.fields.contains_key(name) {
+            self.fields.insert(name.to_string(), Candidate::default());
+        }
+        self.fields
+            .get_mut(name)
+            .expect("the field was present or just inserted")
+    }
+
+    /// Count the rows every typed leaf under `typed`, the `typed_value` at
+    /// this position, holds: exact, and for every row.
+    fn count_typed(&mut self, typed: &ArrayRef, depth: usize) {
+        let Some(object) = typed.as_any().downcast_ref::<StructArray>() else {
+            if let Some(data_type) = shred_leaf_type(typed.data_type()) {
+                *self.scalars.entry(data_type).or_default() += typed.len() - typed.null_count();
             }
-            let child = self
-                .fields
-                .get_mut(name)
-                .expect("the field was present or just inserted");
-            child.observe(&field, depth + 1);
+            return;
+        };
+        self.objects += object.len() - object.null_count();
+        if depth == MAX_DEPTH {
+            return;
+        }
+        for (field, column) in object.fields().iter().zip(object.columns()) {
+            let Some((_, child_typed)) = split_pair(column) else {
+                continue;
+            };
+            self.child(field.name()).count_typed(child_typed, depth + 1);
+        }
+    }
+
+    /// Count what row `row` holds in the leftovers at and under this position,
+    /// as `weight` rows. At a position typed as an object, the leftover holds
+    /// the fields the layout did not type, and the object itself is counted
+    /// through its typed column; anywhere else the leftover is a whole value.
+    fn observe_leftovers(
+        &mut self,
+        metadata: &VariantMetadata<'_>,
+        value: Option<&BinaryViewArray>,
+        typed: Option<&ArrayRef>,
+        row: usize,
+        weight: usize,
+        depth: usize,
+    ) {
+        let object = typed
+            .and_then(|typed| typed.as_any().downcast_ref::<StructArray>())
+            .filter(|object| object.is_valid(row));
+        if let Some(value) = value
+            && value.is_valid(row)
+        {
+            let leftover = Variant::new_with_metadata(metadata.clone(), value.value(row));
+            match (object, leftover.as_object()) {
+                (Some(_), Some(fields)) => {
+                    if depth < MAX_DEPTH {
+                        self.observe_fields(fields, weight, depth);
+                    }
+                }
+                _ => self.observe(&leftover, weight, depth),
+            }
+        }
+        let Some(object) = object else {
+            return;
+        };
+        if depth == MAX_DEPTH {
+            return;
+        }
+        for (field, column) in object.fields().iter().zip(object.columns()) {
+            let Some((child_value, child_typed)) = split_pair(column) else {
+                continue;
+            };
+            self.child(field.name()).observe_leftovers(
+                metadata,
+                child_value,
+                Some(child_typed),
+                row,
+                weight,
+                depth + 1,
+            );
         }
     }
 
@@ -180,34 +278,65 @@ fn resolve_fields(fields: &BTreeMap<String, Candidate>, min_count: usize) -> Opt
 /// The `typed_value` type to shred `array` into, or `None` when no path is worth
 /// it (the column then stays unshredded, which is a legal variant column).
 pub(super) fn infer_shredding_type(arrays: &[VariantArray]) -> Option<DataType> {
-    let mut root = Candidate::default();
-    let mut sampled = 0usize;
     let rows: usize = arrays.iter().map(|array| array.len()).sum();
+    let present: usize = arrays
+        .iter()
+        .map(|array| array.len() - array.nulls().map_or(0, |nulls| nulls.null_count()))
+        .sum();
+    if present == 0 {
+        return None;
+    }
+
+    let mut root = Candidate::default();
+    for array in arrays {
+        if let Some(typed) = array.typed_value_field() {
+            root.count_typed(typed, 0);
+        }
+    }
+    let stride = sample_stride(rows);
     for row in sample_rows(rows) {
         let (array, row) = locate(arrays, row);
         if array.is_null(row) {
             continue;
         }
-        sampled += 1;
-        root.observe(&array.value(row), 0);
-    }
-    if sampled == 0 {
-        return None;
+        let metadata = VariantMetadata::new(array.metadata_field().value(row));
+        root.observe_leftovers(
+            &metadata,
+            array.value_field(),
+            array.typed_value_field(),
+            row,
+            stride,
+            0,
+        );
     }
 
     // A document is shredded by its fields and never as a whole, so `root`'s own
     // shape is the one never consulted: its fields are resolved directly, where
     // every node below them goes through `resolve_data_type`. A bare scalar
     // document has no fields, so a column of them stays unshredded.
-    let min_count = (sampled as f64 * MIN_PRESENCE).ceil() as usize;
+    let min_count = (present as f64 * MIN_PRESENCE).ceil() as usize;
     Some(DataType::Struct(resolve_fields(&root.fields, min_count)?))
+}
+
+/// The leftover `value` and the `typed_value` of a shredded position, when
+/// `pair` has the latter.
+fn split_pair(pair: &ArrayRef) -> Option<(Option<&BinaryViewArray>, &ArrayRef)> {
+    let pair = pair.as_any().downcast_ref::<StructArray>()?;
+    let value = pair
+        .column_by_name("value")
+        .and_then(|value| value.as_any().downcast_ref::<BinaryViewArray>());
+    Some((value, pair.column_by_name("typed_value")?))
 }
 
 /// The rows to sample: every row of a small column, else [`SAMPLE_ROWS`] spread
 /// evenly across the whole of a large one.
 fn sample_rows(rows: usize) -> impl Iterator<Item = usize> {
-    let stride = rows.div_ceil(SAMPLE_ROWS).max(1);
-    (0..rows).step_by(stride)
+    (0..rows).step_by(sample_stride(rows))
+}
+
+/// How many rows each sampled row stands for.
+fn sample_stride(rows: usize) -> usize {
+    rows.div_ceil(SAMPLE_ROWS).max(1)
 }
 
 /// The array holding row `row` of the file, and that row's index within it. A

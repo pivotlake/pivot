@@ -36,7 +36,9 @@ use ahash::RandomState;
 
 use arrow_array::builder::make_view;
 use arrow_array::types::{BinaryViewType, ByteViewType, Float64Type, Int64Type, StringViewType};
-use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, GenericByteViewArray, StructArray};
+use arrow_array::{
+    Array, ArrayRef, ArrowPrimitiveType, GenericByteViewArray, PrimitiveArray, StructArray,
+};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use arrow_schema::ArrowError;
 use arrow_schema::{DataType, Field, Fields};
@@ -73,13 +75,59 @@ pub(super) fn shred_into_slabs(
     let (value, typed_value, nulls) = root.finish(allocator, &mut shared)?;
 
     let metadata: ArrayRef = Arc::new(array.metadata_field().clone());
-    let fields = Fields::from(vec![
-        Field::new("metadata", DataType::BinaryView, false),
-        Field::new("value", DataType::BinaryView, true),
-        Field::new("typed_value", typed_value.data_type().clone(), true),
-    ]);
+    let fields = column_fields(Some(typed_value.data_type()));
     let inner = StructArray::try_new(fields, vec![metadata, Arc::new(value), typed_value], nulls)?;
     Ok(VariantArray::try_new(&inner)?)
+}
+
+/// The fields of a variant column holding `typed_value`, or of a plain
+/// `{metadata, value}` column without one. Every shredded column this module
+/// builds, and every layout it rewrites one into, uses exactly these, so
+/// columns of one layout share one Arrow type wherever they were built.
+pub(super) fn column_fields(typed_value: Option<&DataType>) -> Fields {
+    let mut fields = vec![
+        Field::new("metadata", DataType::BinaryView, false),
+        Field::new("value", DataType::BinaryView, true),
+    ];
+    if let Some(typed_value) = typed_value {
+        fields.push(Field::new("typed_value", typed_value.clone(), true));
+    }
+    Fields::from(fields)
+}
+
+/// The fields of one shredded position below the top level: its fallback
+/// `value` beside its `typed_value`.
+pub(super) fn pair_fields(typed_value: &DataType) -> Fields {
+    Fields::from(vec![
+        Field::new("value", DataType::BinaryView, true),
+        Field::new("typed_value", typed_value.clone(), true),
+    ])
+}
+
+/// The field an object's `typed_value` struct holds for the child `name`
+/// shredded into `typed_value`. A field of an object is never null itself,
+/// only absent through its parent, so the pair is not nullable.
+pub(super) fn child_field(name: &str, typed_value: &DataType) -> Field {
+    Field::new(name, DataType::Struct(pair_fields(typed_value)), false)
+}
+
+/// The fields of an object's `typed_value` struct for the children `fields`
+/// of a shredding type.
+pub(super) fn object_fields(fields: &Fields) -> Fields {
+    fields
+        .iter()
+        .map(|field| child_field(field.name(), &typed_value_type(field.data_type())))
+        .collect()
+}
+
+/// The Arrow type of the `typed_value` column a position shredded into
+/// `shredding` holds: a scalar as it is, an object as the struct of its
+/// children's pairs.
+pub(super) fn typed_value_type(shredding: &DataType) -> DataType {
+    match shredding {
+        DataType::Struct(fields) => DataType::Struct(object_fields(fields)),
+        scalar => scalar.clone(),
+    }
 }
 
 /// One shredded position: its fallback `value` column, its `typed_value`, and
@@ -371,12 +419,9 @@ impl ObjectShredder {
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(self.children.len());
         for (name, child) in self.children {
             let (value, typed_value, nulls) = child.finish(allocator, shared)?;
-            let pair = Fields::from(vec![
-                Field::new("value", DataType::BinaryView, true),
-                Field::new("typed_value", typed_value.data_type().clone(), true),
-            ]);
+            let pair = pair_fields(typed_value.data_type());
+            fields.push(child_field(&name, typed_value.data_type()));
             let field = StructArray::try_new(pair, vec![Arc::new(value), typed_value], nulls)?;
-            fields.push(Field::new(name, field.data_type().clone(), false));
             arrays.push(Arc::new(field));
         }
         Ok(StructArray::try_new(
@@ -468,41 +513,101 @@ impl FallbackColumn {
     }
 }
 
-/// The one all-null fallback array every position without fallbacks shares:
-/// a zeroed views buffer and an all-null bitmap, built on first use.
-struct SharedNullColumn {
+/// The one all-null array every position without values shares: a zeroed
+/// buffer wide enough for any leaf and an all-null bitmap, built on first
+/// use. A zeroed 16-byte view is a valid empty inline value, and a zeroed
+/// 8-byte integer or float is a valid placeholder, so one buffer serves every
+/// leaf type under the bitmap that marks every row null.
+pub(super) struct SharedNullColumn {
     rows: usize,
     parts: Option<(Buffer, NullBuffer)>,
 }
 
 impl SharedNullColumn {
-    fn new(rows: usize) -> Self {
+    pub(super) fn new(rows: usize) -> Self {
         Self { rows, parts: None }
     }
 
-    fn all_null(&mut self, allocator: &mut SlabAllocator) -> GenericByteViewArray<BinaryViewType> {
+    fn parts(&mut self, allocator: &mut SlabAllocator) -> (Buffer, NullBuffer) {
         let rows = self.rows;
-        let (views, nulls) = self.parts.get_or_insert_with(|| {
-            let views = SlabColumn::<u128> {
-                values: allocator.create_slab_buffer(rows, true),
-                len: rows,
-            };
-            let mut nulls = ValidityBuilder::with_capacity(allocator, rows);
-            nulls.append_n(rows, false);
-            (
-                views.into_buffer(),
-                NullBuffer::new(BooleanBuffer::new(nulls.into_buffer(), 0, rows)),
-            )
-        });
+        self.parts
+            .get_or_insert_with(|| {
+                let views = SlabColumn::<u128> {
+                    values: allocator.create_slab_buffer(rows, true),
+                    len: rows,
+                };
+                let mut nulls = ValidityBuilder::with_capacity(allocator, rows);
+                nulls.append_n(rows, false);
+                (
+                    views.into_buffer(),
+                    NullBuffer::new(BooleanBuffer::new(nulls.into_buffer(), 0, rows)),
+                )
+            })
+            .clone()
+    }
+
+    pub(super) fn all_null(
+        &mut self,
+        allocator: &mut SlabAllocator,
+    ) -> GenericByteViewArray<BinaryViewType> {
+        let rows = self.rows;
+        let (views, nulls) = self.parts(allocator);
         // SAFETY: every view is the zeroed view, a valid empty inline value,
         // and the bitmap marks every row null.
         unsafe {
             GenericByteViewArray::new_unchecked(
-                ScalarBuffer::new(views.clone(), 0, rows),
+                ScalarBuffer::new(views, 0, rows),
                 Vec::new(),
-                Some(nulls.clone()),
+                Some(nulls),
             )
         }
+    }
+
+    /// An all-null array of `data_type`: a leaf over the shared parts, or an
+    /// object whose children are all null too under the shared bitmap.
+    pub(super) fn all_null_of(
+        &mut self,
+        data_type: &DataType,
+        allocator: &mut SlabAllocator,
+    ) -> WriteResult<ArrayRef> {
+        let rows = self.rows;
+        Ok(match data_type {
+            DataType::BinaryView => Arc::new(self.all_null(allocator)),
+            DataType::Utf8View => {
+                let (views, nulls) = self.parts(allocator);
+                // SAFETY: as in `all_null`; an empty string is valid UTF-8.
+                Arc::new(unsafe {
+                    GenericByteViewArray::<StringViewType>::new_unchecked(
+                        ScalarBuffer::new(views, 0, rows),
+                        Vec::new(),
+                        Some(nulls),
+                    )
+                })
+            }
+            DataType::Int64 => {
+                let (values, nulls) = self.parts(allocator);
+                Arc::new(PrimitiveArray::<Int64Type>::new(
+                    ScalarBuffer::new(values, 0, rows),
+                    Some(nulls),
+                ))
+            }
+            DataType::Float64 => {
+                let (values, nulls) = self.parts(allocator);
+                Arc::new(PrimitiveArray::<Float64Type>::new(
+                    ScalarBuffer::new(values, 0, rows),
+                    Some(nulls),
+                ))
+            }
+            DataType::Struct(fields) => {
+                let children = fields
+                    .iter()
+                    .map(|field| self.all_null_of(field.data_type(), allocator))
+                    .collect::<WriteResult<Vec<_>>>()?;
+                let (_, nulls) = self.parts(allocator);
+                Arc::new(StructArray::try_new(fields.clone(), children, Some(nulls))?)
+            }
+            other => return Err(WriteError::UnsupportedType(other.clone())),
+        })
     }
 }
 

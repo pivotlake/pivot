@@ -17,32 +17,47 @@
 //!
 //! The entry points:
 //!
-//! - [`unshred_batch`] folds a variant column back to `{metadata, value}` at
-//!   the head of the write pipeline. Ingest's batches are already that shape
-//!   and pass straight through; compaction's come from files that each
-//!   shredded differently, and this is what makes them one schema again so
-//!   they can be regrouped into fresh files.
+//! - [`widen_batch`] brings a compaction input's variant columns to the union
+//!   of the input files' layouts ([`plan_shredding_union`]) at the head of the
+//!   write pipeline, so batches of files that each shredded differently share
+//!   one schema and can be regrouped into fresh files. Every typed value stays
+//!   where it is; only a path some file typed as a kind the union did not
+//!   keep is folded back into its leftover.
+//! - [`unshred_batch`] folds a variant column back to `{metadata, value}`, for
+//!   a pipeline that wants whole documents. Ingest's batches are already that
+//!   shape and pass straight through.
 //! - [`plan_file_shredding`] runs in the
 //!   [`row_group_planner`](super::row_group_planner) once a file's rows are
-//!   known. It picks the file's layout without rewriting the rows.
+//!   known. It picks the file's layout without rewriting the rows: from the
+//!   documents, or from the typed leaves and leftovers of rows that came in
+//!   shredded.
 //! - [`shred_column`] applies the plan in the [`shredder`](super::shredder)
-//!   stage, one slice of a row group's variant column at a time. The rewrite
-//!   is the heavy half: it parallelizes across workers there, and slicing it
-//!   keeps any one worker turn short.
+//!   stage, one slice of a row group's variant column at a time. Documents are
+//!   shredded; rows in the union layout are brought to the plan by moving only
+//!   the values whose leaf changed ([`reshred`]). The rewrite is the heavy
+//!   half: it parallelizes across workers there, and slicing it keeps any one
+//!   worker turn short.
 //!
-//! Between them, compaction re-shreds: every input file's layout is folded away
-//! and each output file decides afresh from the rows it actually got.
+//! So compaction re-shreds without rebuilding a document: each output file
+//! decides afresh from the rows it actually got, and pays only for the paths
+//! its inputs disagreed on.
 
 mod infer;
+mod reshred;
 mod shred;
+mod union;
 
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, RecordBatch, StructArray};
-use arrow_schema::{FieldRef, Schema};
+use arrow_schema::{DataType, Field, FieldRef, Fields, Schema};
 use dispatch::arrays::take::concat_chunks;
 use dispatch::memory::SlabAllocator;
-use parquet_variant_compute::{VariantArray, shred_variant, unshred_variant};
+use parquet_variant_compute::{VariantArray, unshred_variant};
+
+use crate::types::leaves::leaf_range;
+use crate::types::metadata::RowGroupMetadata;
+use union::InputLayout;
 
 use super::error::WriteResult;
 
@@ -53,7 +68,7 @@ pub(crate) fn unshred_batch(
     batch: RecordBatch,
     allocator: &mut SlabAllocator,
 ) -> WriteResult<RecordBatch> {
-    map_variant_columns(batch, |array| {
+    map_variant_columns(batch, |_, array| {
         // Already the plain pair: nothing to fold, and rebuilding it would copy
         // every document for nothing. This is the ingest path.
         if array.typed_value_field().is_none() {
@@ -95,6 +110,121 @@ fn copy_value_field_to_slabs(
     Ok(VariantArray::try_new(&rebuilt)?)
 }
 
+/// The union of the layouts `row_groups`, a compaction's inputs, give each
+/// variant column, by column: the layout [`widen_batch`] brings every input
+/// batch to. `None` for a plain column, and for a variant column no input
+/// shredded. Where inputs typed one path as different kinds, the union keeps
+/// the kind holding the most rows by the footers' null counts.
+pub(super) fn plan_shredding_union(
+    row_groups: &[Arc<RowGroupMetadata>],
+) -> Arc<[Option<Arc<DataType>>]> {
+    let Some(first) = row_groups.first() else {
+        return Arc::from(Vec::new());
+    };
+    (0..first.schema.fields().len())
+        .map(|column| {
+            if !crate::is_variant_field(first.schema.field(column)) {
+                return None;
+            }
+            let inputs: Vec<(DataType, Vec<u64>)> = row_groups
+                .iter()
+                .map(|row_group| {
+                    let fields = row_group.schema.fields();
+                    let rows_per_leaf = leaf_range(fields, column)
+                        .map(|leaf| {
+                            let nulls = row_group
+                                .leaf_statistics(leaf)
+                                .and_then(|statistics| statistics.null_count)
+                                .unwrap_or(0);
+                            (row_group.num_rows - nulls).max(0) as u64
+                        })
+                        .collect();
+                    (fields[column].data_type().clone(), rows_per_leaf)
+                })
+                .collect();
+            let layouts: Vec<InputLayout<'_>> = inputs
+                .iter()
+                .map(|(column, rows_per_leaf)| InputLayout {
+                    column,
+                    rows_per_leaf,
+                })
+                .collect();
+            union::union_layout(&layouts).map(Arc::new)
+        })
+        .collect()
+}
+
+/// The union of the layouts `batches` give each variant column, as
+/// [`plan_shredding_union`] would find from their files' footers: each
+/// batch votes with its leaves' non-null counts.
+#[cfg(test)]
+pub(crate) fn plan_shredding_union_of_batches(
+    batches: &[RecordBatch],
+) -> Arc<[Option<Arc<DataType>>]> {
+    let Some(first) = batches.first() else {
+        return Arc::from(Vec::new());
+    };
+    (0..first.schema().fields().len())
+        .map(|column| {
+            if !crate::is_variant_field(first.schema().field(column)) {
+                return None;
+            }
+            let inputs: Vec<(DataType, Vec<u64>)> = batches
+                .iter()
+                .map(|batch| {
+                    let mut rows_per_leaf = Vec::new();
+                    push_leaf_rows(batch.column(column), &mut rows_per_leaf);
+                    (
+                        batch.schema().field(column).data_type().clone(),
+                        rows_per_leaf,
+                    )
+                })
+                .collect();
+            let layouts: Vec<InputLayout<'_>> = inputs
+                .iter()
+                .map(|(column, rows_per_leaf)| InputLayout {
+                    column,
+                    rows_per_leaf,
+                })
+                .collect();
+            union::union_layout(&layouts).map(Arc::new)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+fn push_leaf_rows(array: &ArrayRef, rows_per_leaf: &mut Vec<u64>) {
+    use arrow_array::Array;
+    match array.as_any().downcast_ref::<StructArray>() {
+        Some(object) => object
+            .columns()
+            .iter()
+            .for_each(|child| push_leaf_rows(child, rows_per_leaf)),
+        None => rows_per_leaf.push((array.len() - array.null_count()) as u64),
+    }
+}
+
+/// Bring every variant column of `batch`, a compaction input's, to its
+/// layout in `union` (see [`plan_shredding_union`]). A column already in that
+/// layout, or one whose inputs typed nothing, passes through untouched.
+pub(crate) fn widen_batch(
+    batch: RecordBatch,
+    union: &[Option<Arc<DataType>>],
+    allocator: &mut SlabAllocator,
+) -> WriteResult<RecordBatch> {
+    map_variant_columns(batch, |column, array| {
+        let Some(target) = &union[column] else {
+            return Ok(None);
+        };
+        let widened =
+            DataType::Struct(shred::column_fields(Some(&shred::typed_value_type(target))));
+        if array.data_type() == &widened {
+            return Ok(None);
+        }
+        Ok(Some(reshred::widen(array, target, allocator)?))
+    })
+}
+
 /// One file's shredding decision: the widened schema its footer will
 /// describe, and each variant column's inferred layout for the encode workers
 /// to apply. Plain columns, and variants with nothing worth shredding, carry
@@ -124,15 +254,20 @@ pub(super) fn plan_file_shredding(chunks: &[RecordBatch]) -> WriteResult<FileShr
             .iter()
             .map(|chunk| VariantArray::try_new(chunk.column(column).as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
-        let Some(shredding_type) = infer::infer_shredding_type(&arrays) else {
-            continue;
+        let arrived_shredded = arrays
+            .iter()
+            .any(|array| array.typed_value_field().is_some());
+        let shredding_type = match infer::infer_shredding_type(&arrays) {
+            Some(shredding_type) => shredding_type,
+            // Rows that came in shredded still have to be brought to the plain
+            // pair: an empty layout is that plan.
+            None if arrived_shredded => DataType::Struct(Fields::empty()),
+            None => continue,
         };
-        let no_rows = VariantArray::try_new(chunks[0].column(column).slice(0, 0).as_ref())?;
-        let widened = shred_variant(&no_rows, &shredding_type)?;
-        // `VariantArray::field` re-applies the variant extension tag, so the
-        // widened column is still recognized as a variant by the footer's
-        // VARIANT annotation the assembler writes.
-        fields[column] = Arc::new(widened.field(fields[column].name()));
+        fields[column] = Arc::new(shredded_column_field(
+            fields[column].name(),
+            &shredding_type,
+        )?);
         column_shredding[column] = Some(Arc::new(shredding_type));
     }
     Ok(FileShredding {
@@ -141,18 +276,37 @@ pub(super) fn plan_file_shredding(chunks: &[RecordBatch]) -> WriteResult<FileShr
     })
 }
 
+/// The field a variant column named `name` has once shredded into
+/// `shredding`: the layout's struct under the variant extension tag, which is
+/// what keeps the column recognized as a variant by the footer's VARIANT
+/// annotation the assembler writes. An empty layout is the plain pair.
+fn shredded_column_field(name: &str, shredding: &DataType) -> WriteResult<Field> {
+    let typed_value = match shredding {
+        DataType::Struct(fields) if fields.is_empty() => None,
+        shredding => Some(shred::typed_value_type(shredding)),
+    };
+    let column = DataType::Struct(shred::column_fields(typed_value.as_ref()));
+    let no_rows = arrow_array::new_empty_array(&column);
+    Ok(VariantArray::try_new(no_rows.as_ref())?.field(name))
+}
+
 /// Apply one column's planned `shredding` to a run of its rows: the heavy half
 /// of shredding, run on a slice of a row group at a time by the shredder stage.
-/// The shredded columns are built on slabs from `allocator`.
+/// Documents are shredded; rows in the union layout are brought to the plan
+/// by moving only the values whose leaf changed. The columns are built on
+/// slabs from `allocator`.
 pub(super) fn shred_column(
     values: &ArrayRef,
-    shredding: &arrow_schema::DataType,
+    shredding: &DataType,
     allocator: &mut SlabAllocator,
 ) -> WriteResult<ArrayRef> {
     let variant = VariantArray::try_new(values.as_ref())?;
-    Ok(Arc::new(
-        shred::shred_into_slabs(&variant, shredding, allocator)?.into_inner(),
-    ))
+    let shredded = if variant.typed_value_field().is_some() {
+        reshred::reshred(&variant, shredding, allocator)?
+    } else {
+        shred::shred_into_slabs(&variant, shredding, allocator)?
+    };
+    Ok(Arc::new(shredded.into_inner()))
 }
 
 /// Rebuild `batch` with `f` applied to each of its variant columns, widening or
@@ -162,7 +316,7 @@ pub(super) fn shred_column(
 /// pay for this.
 fn map_variant_columns(
     batch: RecordBatch,
-    mut f: impl FnMut(&VariantArray) -> WriteResult<Option<VariantArray>>,
+    mut f: impl FnMut(usize, &VariantArray) -> WriteResult<Option<VariantArray>>,
 ) -> WriteResult<RecordBatch> {
     let schema = batch.schema();
     let variant_columns: Vec<usize> = (0..schema.fields().len())
@@ -177,7 +331,7 @@ fn map_variant_columns(
     let mut changed = false;
     for column in variant_columns {
         let array = VariantArray::try_new(columns[column].as_ref())?;
-        let Some(mapped) = f(&array)? else {
+        let Some(mapped) = f(column, &array)? else {
             continue;
         };
         // `VariantArray::field` re-applies the variant extension tag, so the
