@@ -23,10 +23,13 @@ mod int_bits;
 mod slab_column;
 pub mod variant;
 
+use std::sync::Arc;
+
 use arrow::array::ArrayData;
 use arrow::compute::kernels::interleave::interleave;
 use arrow::compute::take as arrow_take;
-use arrow_array::{Array, ArrayRef, UInt32Array, make_array};
+use arrow_array::cast::AsArray;
+use arrow_array::{Array, ArrayRef, StructArray, UInt32Array, make_array};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
 use arrow_schema::{ArrowError, DataType};
 
@@ -138,9 +141,11 @@ fn take_via_arrow(column: &ArrayRef, indices: &[u32]) -> Result<ArrayRef, ArrowE
 /// the output shares nothing with the chunks, so their memory is free to drop
 /// and a consumer walking the rows reads the bytes sequentially however
 /// scattered the mapping was. A nullable column's validity gathers into a
-/// slab-backed bitmap alongside. Anything else (dictionaries, nested types)
-/// goes through Arrow's interleave kernel instead. The chunks must share one
-/// data type.
+/// slab-backed bitmap alongside. A struct column gathers each of its children
+/// this same way and its own validity alongside, so a nested column costs no
+/// more heap than its leaves would as flat columns. Anything else
+/// (dictionaries, lists) goes through Arrow's interleave kernel instead. The
+/// chunks must share one data type.
 pub fn take_chunked(
     allocator: &mut SlabAllocator,
     chunks: &[ArrayRef],
@@ -160,6 +165,19 @@ pub fn take_chunked(
             // value's bytes were just copied into, or the empty view of a row
             // the bitmap marks null.
             Ok(make_array(unsafe { out.build_unchecked() }))
+        }
+        DataType::Struct(fields) => {
+            let children = struct_children(chunks, fields.len());
+            let gathered = children
+                .iter()
+                .map(|child_chunks| take_chunked(allocator, child_chunks, mapping))
+                .collect::<Result<Vec<_>, _>>()?;
+            let nulls = taken_validity_chunked(allocator, &data, mapping);
+            Ok(Arc::new(StructArray::try_new(
+                fields.clone(),
+                gathered,
+                nulls,
+            )?))
         }
         dt => {
             let values = match dt.primitive_width() {
@@ -186,8 +204,9 @@ pub fn take_chunked(
 /// right, without its per-row indirection: fixed-width values copy in one run
 /// per chunk, and a view chunk's structs are walked without any mapping (each
 /// out-of-line value's bytes still copy one value at a time, into blocks of
-/// the output's own, so nothing of the chunks stays pinned). Anything without
-/// a fast path (dictionaries, nested types) goes through Arrow's concat
+/// the output's own, so nothing of the chunks stays pinned). A struct column
+/// concatenates each child this way and its own validity alongside. Anything
+/// without a fast path (dictionaries, lists) goes through Arrow's concat
 /// kernel instead. The chunks must share one data type.
 pub fn concat_chunks(
     allocator: &mut SlabAllocator,
@@ -209,6 +228,19 @@ pub fn concat_chunks(
             // the bitmap marks null.
             Ok(make_array(unsafe { out.build_unchecked() }))
         }
+        DataType::Struct(fields) => {
+            let children = struct_children(chunks, fields.len());
+            let concatenated = children
+                .iter()
+                .map(|child_chunks| concat_chunks(allocator, child_chunks))
+                .collect::<Result<Vec<_>, _>>()?;
+            let nulls = concatenated_validity(allocator, &data, rows);
+            Ok(Arc::new(StructArray::try_new(
+                fields.clone(),
+                concatenated,
+                nulls,
+            )?))
+        }
         dt => {
             let values = match dt.primitive_width() {
                 Some(1) => concat_fixed_width_chunks::<u8>(allocator, &data, rows),
@@ -227,6 +259,21 @@ pub fn concat_chunks(
             Ok(make_array(unsafe { out.build_unchecked() }))
         }
     }
+}
+
+/// The chunks of each child column of a struct column's `chunks`, child by
+/// child: `children[i]` holds child `i` of every chunk, in chunk order. A
+/// sliced struct chunk hands out children already sliced with it, so a row
+/// number of the chunk is the same row of each child.
+fn struct_children(chunks: &[ArrayRef], field_count: usize) -> Vec<Vec<ArrayRef>> {
+    (0..field_count)
+        .map(|child| {
+            chunks
+                .iter()
+                .map(|chunk| chunk.as_struct().column(child).clone())
+                .collect()
+        })
+        .collect()
 }
 
 fn concat_fixed_width_chunks<T: Copy>(
@@ -595,6 +642,81 @@ mod tests {
                 .iter()
                 .all(|buffer| !source_buffers.contains(&buffer.as_ptr()))
         );
+    }
+
+    /// Two struct chunks with a long view in one child, a null in the other,
+    /// and a null struct row, so every part of a struct gather is exercised.
+    fn struct_chunks() -> Vec<ArrayRef> {
+        use arrow_array::BinaryViewArray;
+        use arrow_schema::Fields;
+
+        let fields = Fields::from(vec![
+            Field::new("metadata", DataType::BinaryView, false),
+            Field::new("value", DataType::Int64, true),
+        ]);
+        vec![
+            Arc::new(StructArray::new(
+                fields.clone(),
+                vec![
+                    Arc::new(BinaryViewArray::from(vec![
+                        b"m0".as_slice(),
+                        b"a metadata value longer than twelve bytes",
+                    ])),
+                    Arc::new(Int64Array::from(vec![Some(10), None])),
+                ],
+                None,
+            )),
+            Arc::new(StructArray::new(
+                fields,
+                vec![
+                    Arc::new(BinaryViewArray::from(vec![b"m2".as_slice()])),
+                    Arc::new(Int64Array::from(vec![Some(20)])),
+                ],
+                Some(NullBuffer::from(vec![false])),
+            )),
+        ]
+    }
+
+    #[test]
+    fn take_chunked_gathers_a_struct_child_by_child() {
+        init_test_free_pool(4);
+        let chunks = struct_chunks();
+        let mapping = [(1u32, 0u32), (0, 1), (0, 0)];
+        let mut allocator = SlabAllocator::new(false);
+
+        let taken = take_chunked(&mut allocator, &chunks, &mapping).unwrap();
+
+        let sources: Vec<&dyn Array> = chunks.iter().map(|chunk| chunk.as_ref()).collect();
+        let expected = interleave(&sources, &[(1, 0), (0, 1), (0, 0)]).unwrap();
+        assert_eq!(&taken, &expected);
+        let source_buffers: Vec<*const u8> = chunks
+            .iter()
+            .flat_map(|chunk| chunk.as_struct().column(0).as_binary_view().data_buffers())
+            .map(|buffer| buffer.as_ptr())
+            .collect();
+        assert!(
+            taken
+                .as_struct()
+                .column(0)
+                .as_binary_view()
+                .data_buffers()
+                .iter()
+                .all(|buffer| !source_buffers.contains(&buffer.as_ptr())),
+            "a struct gather must not hold a source data buffer either"
+        );
+    }
+
+    #[test]
+    fn concat_chunks_concatenates_a_struct_child_by_child() {
+        init_test_free_pool(4);
+        let chunks = struct_chunks();
+        let mut allocator = SlabAllocator::new(false);
+
+        let concatenated = concat_chunks(&mut allocator, &chunks).unwrap();
+
+        let sources: Vec<&dyn Array> = chunks.iter().map(|chunk| chunk.as_ref()).collect();
+        let expected = arrow::compute::concat(&sources).unwrap();
+        assert_eq!(&concatenated, &expected);
     }
 
     /// Chunk concatenation matches Arrow's concat, nulls and out-of-line
