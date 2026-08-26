@@ -392,7 +392,6 @@ pub(super) fn merge_node_aggregated_tables<S: StoredKey, V: AggregationValue + ?
 
 #[cfg(test)]
 mod tests {
-    use super::super::PARTITIONS;
     use super::*;
     use crate::RECORD_BATCH_SIZE;
     use crate::memory::init_test_free_pool;
@@ -409,6 +408,10 @@ mod tests {
     use arrow_array::{ArrayRef, Int32Array, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
+
+    /// The fan-out these tests merge at. Production sizes its partition count
+    /// per query; the merge itself only needs a power of two.
+    const PARTITIONS: usize = 64;
 
     type IntExtractor = IntKeyExtractor<Int32Type>;
     // How `IntExtractor` stores its keys. The merge is generic over this rather

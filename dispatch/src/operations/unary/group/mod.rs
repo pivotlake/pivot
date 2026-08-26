@@ -31,10 +31,12 @@
 //! ## Phase 2: Output / Merge (parallel via work-stealing)
 //!
 //! The final worker to reach the gather barrier collects every worker's tables
-//! and publishes [`PARTITIONS`] independent
-//! [`PartitionJob`]s to a shared [`Injector`]. Each partition covers a
-//! disjoint range of hash values (determined by the top `log2(PARTITIONS)`
-//! bits), so the jobs are embarrassingly parallel.
+//! and publishes a power-of-two number of independent [`PartitionJob`]s to a
+//! shared [`Injector`]. The count is chosen per query in
+//! `GroupOutputter::create_partition_jobs` from the input volume and the
+//! worker count. Each partition covers a disjoint range of hash values
+//! (determined by the top `log2(num_partitions)` bits), so the jobs are
+//! embarrassingly parallel.
 //!
 //! All workers then steal and execute jobs. Each [`PartitionJob`]:
 //!
@@ -165,9 +167,15 @@ impl GroupLimit {
 }
 
 /// Number of radix partitions for the scatter + merge of high-cardinality
-/// (switched) workers. Larger than [`PARTITIONS`] so each radix target stays
-/// cache-resident at high group counts.
+/// (switched) workers. Far finer than the in-place merge's job count so each
+/// radix target stays cache-resident at high group counts.
 const RADIX_PARTITIONS: usize = 4096;
+
+/// The fewest partitions the merge phase ever runs with. The merge routes each
+/// row by the top `log2(partitions)` bits of its hash, and a single partition
+/// has zero such bits, which leaves no valid shift. Two near-empty jobs cost
+/// nothing extra over one.
+const MIN_MERGE_PARTITIONS: usize = 2;
 
 /// How many scatter streams the whole pool should aim to stay under. This is
 /// a target, not a hard cap: the one-bucket-per-worker floor below may exceed
@@ -315,7 +323,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Consumer<RecordBatch, Record
 /// Handles the output (merge) phase of a GROUP BY.
 ///
 /// The last worker to reach the gather barrier collects all per-worker tables
-/// and publishes [`PARTITIONS`] [`PartitionJob`]s to the shared
+/// and publishes one [`PartitionJob`] per hash partition to the shared
 /// work-stealing [`Injector`]. All workers (including the one that injected)
 /// then steal and execute jobs until the injector is empty.
 pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue + ?Sized> {
@@ -392,7 +400,10 @@ pub struct PartitionJob<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// emits zero-copy views into this; cloning the `Arc` is a single bump.
     output_buffers: Arc<[Buffer]>,
     partition_capacity: usize,
-    /// [`PARTITIONS`] when nobody switched, else [`RADIX_PARTITIONS`].
+    /// Power-of-two count of hash partitions the merge runs at, chosen in
+    /// `create_partition_jobs` from the input volume and the worker count.
+    /// When a worker switched to radix it never exceeds the scatter bucket
+    /// count (at most [`RADIX_PARTITIONS`]).
     num_partitions: usize,
     key_config: K::Config,
     /// The value's shared context, for the partition merge's entry fold + output.
@@ -567,7 +578,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
                 // setup, so small inputs stay below that floor.
                 .max(worker_count)
                 .min(maximum_allowed_jobs)
-                .max(2)
+                .max(MIN_MERGE_PARTITIONS)
                 .next_power_of_two();
             (
                 partitions,
@@ -611,9 +622,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
                 .0
                 .len();
             let merge_partitions = (estimate / target_groups_per_partition)
-                // We never want to have less jobs than the worker count, to ensure no cores are idle
-                // we also can't ha
                 .clamp(worker_count, scatter_buckets)
+                .max(MIN_MERGE_PARTITIONS)
                 .next_power_of_two();
             // Start each target big enough to hold its share at MAX_LOAD_FACTOR (the
             // merge's resize threshold), so it fills without resizing mid-merge.
