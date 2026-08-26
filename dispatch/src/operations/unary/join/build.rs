@@ -5,7 +5,7 @@ use crate::operations::unary::join::JoinBuildFilter;
 use crate::operations::unary::join::JoinTable;
 use crate::operations::unary::join::build_rows::{self, BuildRows};
 use crate::operations::unary::join::directory::JoinDirectory;
-use crate::operations::unary::join::key_bitset::KeyBitset;
+use crate::operations::unary::join::key_bitset::{KeyBitset, integer_scalar};
 use crate::operations::unary::join::keys::{JoinKey, combined_key_validity};
 use crate::operations::unary::{BatchesOutputter, InitializableOutputter, NormalizationBatches};
 use crate::operations::{Consumer, Outputter, unary};
@@ -37,11 +37,23 @@ pub(crate) type PartitionBuffers<K> = Vec<SlabVec<BuildTuple<K>>>;
 
 /// Everything one build worker publishes at the gather barrier: its
 /// partitioned tuples, the stored build rows those tuples' ids point into,
-/// and whether any build key was null.
+/// whether any build key was null, and its filter-column extremes.
 pub(crate) struct BuildWorkerOutput<K: Copy> {
     tuples: PartitionBuffers<K>,
     build_row_batches: Vec<RecordBatch>,
     saw_null_key: bool,
+    /// One entry per build filter: this worker's key extremes over its own
+    /// batches, computed at seal time on the worker that held them. The final
+    /// gather arrival merges one candidate per worker instead of rescanning
+    /// every build row serially while the other workers sit idle.
+    filter_extremes: Vec<ColumnExtremes>,
+}
+
+/// One worker's smallest and largest non-null value of a filter column;
+/// `None` when the worker held no non-null value.
+pub(crate) struct ColumnExtremes {
+    min: Option<ArrayRef>,
+    max: Option<ArrayRef>,
 }
 
 impl<K: Copy + Send + 'static> NormalizationBatches for BuildWorkerOutput<K> {
@@ -58,6 +70,9 @@ pub struct JoinBuildConsumer<
     O = JoinBuilder<<K as JoinKey>::Stored, BUILD_OUTER>,
 > {
     key_columns: Vec<usize>,
+    /// The build columns whose extremes this worker computes at seal time,
+    /// one per build filter of the join.
+    filter_columns: Vec<usize>,
     hash_state: RandomState,
     values: PartitionBuffers<K::Stored>,
     /// This worker's build rows, stored as the batches they arrived in. No
@@ -77,9 +92,15 @@ unsafe impl<K: JoinKey, const BUILD_OUTER: bool, O: Send> Send
 }
 
 impl<K: JoinKey, const BUILD_OUTER: bool, O> JoinBuildConsumer<K, BUILD_OUTER, O> {
-    pub(crate) fn new(key_columns: Vec<usize>, hash_state: RandomState, outputter: O) -> Self {
+    pub(crate) fn new(
+        key_columns: Vec<usize>,
+        filter_columns: Vec<usize>,
+        hash_state: RandomState,
+        outputter: O,
+    ) -> Self {
         Self {
             key_columns,
+            filter_columns,
             hash_state,
             values: (0..NUM_PARTITIONS).map(|_| SlabVec::new()).collect(),
             build_row_batches: Vec::new(),
@@ -91,22 +112,17 @@ impl<K: JoinKey, const BUILD_OUTER: bool, O> JoinBuildConsumer<K, BUILD_OUTER, O
 }
 
 /// The smallest (`largest` false) or largest (`largest` true) non-null value
-/// of `column` across the workers' build row batches, as a one-element array.
-/// `None` when every value is null or there are no rows.
-fn key_column_extreme<K: Copy>(
-    worker_outputs: &[BuildWorkerOutput<K>],
-    column: usize,
-    largest: bool,
-) -> Option<ArrayRef> {
+/// of `column` across `batches`, as a one-element array. `None` when every
+/// value is null or there are no rows.
+fn column_extreme(batches: &[RecordBatch], column: usize, largest: bool) -> Option<ArrayRef> {
     let options = SortOptions {
         descending: largest,
         nulls_first: false,
     };
     // A partial sort of one index selects each batch's extreme in one pass;
     // the small per-batch winners are then combined the same way.
-    let per_batch: Vec<ArrayRef> = worker_outputs
+    let per_batch: Vec<ArrayRef> = batches
         .iter()
-        .flat_map(|output| output.build_row_batches.iter())
         .filter_map(|batch| {
             let values = batch.column(column);
             if values.len() == values.null_count() {
@@ -117,11 +133,21 @@ fn key_column_extreme<K: Copy>(
             Some(take(values, &indices, None).expect("a sort index is in bounds"))
         })
         .collect();
-    if per_batch.is_empty() {
+    combine_extremes(per_batch, largest)
+}
+
+/// The extreme among one-element candidate arrays, itself a one-element
+/// array. `None` when there are no candidates.
+fn combine_extremes(candidates: Vec<ArrayRef>, largest: bool) -> Option<ArrayRef> {
+    if candidates.is_empty() {
         return None;
     }
-    let candidates: Vec<&dyn Array> = per_batch.iter().map(|array| array.as_ref()).collect();
-    let combined = concat(&candidates).expect("per-batch extremes share one type");
+    let options = SortOptions {
+        descending: largest,
+        nulls_first: false,
+    };
+    let refs: Vec<&dyn Array> = candidates.iter().map(|array| array.as_ref()).collect();
+    let combined = concat(&refs).expect("extreme candidates share one type");
     let indices = sort_to_indices(&combined, Some(options), Some(1))
         .expect("join key columns support ordering");
     Some(take(&combined, &indices, None).expect("a sort index is in bounds"))
@@ -197,10 +223,19 @@ where
 
     fn into_outputter(mut self) -> unary::Result<Option<Self::Outputter>> {
         debug!("Running into outputter!");
+        let filter_extremes = self
+            .filter_columns
+            .iter()
+            .map(|&column| ColumnExtremes {
+                min: column_extreme(&self.build_row_batches, column, false),
+                max: column_extreme(&self.build_row_batches, column, true),
+            })
+            .collect();
         let output = BuildWorkerOutput {
             tuples: self.values,
             build_row_batches: self.build_row_batches,
             saw_null_key: self.saw_null_key,
+            filter_extremes,
         };
         self.outputter.accept(output)?;
         Ok(Some(self.outputter))
@@ -336,22 +371,49 @@ impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> JoinBuilder<K, OUTER_JOI
         unsafe { *self.table.build_saw_null_key.get() = build_saw_null_key };
 
         // Every build row is present here, so each filter's key bounds are
-        // final: publish them for the probe-side scans. A column with no
-        // non-null value publishes nothing, leaving those scans unpruned.
-        for filter in &self.build_filters {
-            if let Some(min) = key_column_extreme(&worker_outputs, filter.build_column, false) {
-                filter.min_slot.publish_value(min);
+        // final: merge the per-worker extremes and publish them for the
+        // probe-side scans. A column with no non-null value publishes
+        // nothing, leaving those scans unpruned.
+        let total_rows: usize = worker_outputs
+            .iter()
+            .flat_map(|output| output.build_row_batches.iter())
+            .map(|batch| batch.num_rows())
+            .sum();
+        for (filter_index, filter) in self.build_filters.iter().enumerate() {
+            let worker_extreme = |largest: bool| {
+                let candidates = worker_outputs
+                    .iter()
+                    .map(|output| &output.filter_extremes[filter_index])
+                    .filter_map(|extremes| {
+                        if largest {
+                            &extremes.max
+                        } else {
+                            &extremes.min
+                        }
+                        .clone()
+                    })
+                    .collect();
+                combine_extremes(candidates, largest)
+            };
+            let min = worker_extreme(false);
+            let max = worker_extreme(true);
+            if let Some(min) = &min {
+                filter.min_slot.publish_value(min.clone());
             }
-            if let Some(max) = key_column_extreme(&worker_outputs, filter.build_column, true) {
-                filter.max_slot.publish_value(max);
+            if let Some(max) = &max {
+                filter.max_slot.publish_value(max.clone());
             }
+            let bounds = min
+                .as_ref()
+                .zip(max.as_ref())
+                .and_then(|(min, max)| Some((integer_scalar(min)?, integer_scalar(max)?)));
             let key_arrays = worker_outputs
                 .iter()
                 .flat_map(|output| output.build_row_batches.iter())
                 .map(|batch| batch.column(filter.build_column));
             filter
                 .key_bitset_slot
-                .publish(KeyBitset::try_build(key_arrays));
+                .publish(KeyBitset::try_build(key_arrays, bounds, total_rows));
         }
 
         let sizes: Vec<usize> = (0..NUM_PARTITIONS)
