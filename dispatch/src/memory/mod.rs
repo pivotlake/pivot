@@ -67,5 +67,29 @@ pub use reader::{MultiBufferReader, ReaderPosition};
 mod context;
 pub use context::{MemoryContextFactory, has_memory_context, init_memory_context, memory_ctx};
 
+/// Return the heap's freed pages to the operating system now rather than at
+/// the end of jemalloc's decay period.
+///
+/// A burst of heap work that has just finished, such as a compaction merge,
+/// otherwise keeps its peak resident for the seconds the decay takes. On a
+/// machine whose buffer pool already holds most of the memory, that lingering
+/// peak is what the next burst runs out of.
+pub fn purge_heap() {
+    // jemalloc's index for "every arena".
+    const MALLCTL_ARENAS_ALL: usize = 4096;
+    let name = format!("arena.{MALLCTL_ARENAS_ALL}.purge\0");
+    // SAFETY: the name is NUL-terminated, and the purge reads and writes no
+    // mallctl value, so the null pointers and zero length are what it expects.
+    unsafe {
+        tikv_jemalloc_sys::mallctl(
+            name.as_ptr().cast(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        );
+    }
+}
+
 #[cfg(any(test, feature = "test-util"))]
 pub use context::init_test_free_pool;

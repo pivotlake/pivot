@@ -24,6 +24,9 @@ memchr = "2.7"
 ahash = { workspace = true }
 
 tikv-jemallocator = "0.6.0"
+# Direct `mallctl` access, for returning freed heap pages early (see
+# `memory::purge_heap`).
+tikv-jemalloc-sys = "0.6"
 
 bytes = { workspace = true }
 libc = { workspace = true }
@@ -58,6 +61,10 @@ test-util = []
 # loop. Off by default: no per-dataflow state, zero hot-loop overhead. Pulls
 # nix's `process` feature for `gettid`.
 perf = ["nix/process"]
+# Builds jemalloc with statistics and heap-profiling support, for the server's
+# diagnostics-only `memwatch` feature. Off by default: a normal build carries
+# neither the counters nor the sampling hooks.
+heap-profiling = ["tikv-jemallocator/profiling", "tikv-jemallocator/stats"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"

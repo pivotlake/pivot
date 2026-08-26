@@ -316,6 +316,10 @@ impl CompacterActor {
         })
         .await
         .map_err(|error| crate::Error::CompactionJobPanicked(error.to_string()))??;
+        // A merge is the heaviest heap user in the process and the next one
+        // follows within seconds, so hand its freed pages back now rather than
+        // letting them sit resident for the allocator's decay period.
+        dispatch::memory::purge_heap();
         let output_sizes: Vec<u64> = merged.iter().map(|file| file.size).collect();
         info!(
             table = %name,

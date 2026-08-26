@@ -1791,6 +1791,7 @@ dependencies = [
  "rustls",
  "tempfile",
  "thiserror 2.0.18",
+ "tikv-jemalloc-sys",
  "tikv-jemallocator",
  "tracing",
  "tracing-subscriber",
