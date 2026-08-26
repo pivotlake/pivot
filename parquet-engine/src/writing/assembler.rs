@@ -1,4 +1,4 @@
-//! Assembles encoded column chunks into complete Parquet files.
+//! Assembles encoded leaf chunks into complete Parquet files.
 //!
 //! Every encoded chunk carries an assembly-worker id. Routing all chunks for a
 //! file to that worker lets [`FileAssembler`] gather them without shared state.
@@ -6,8 +6,8 @@
 //! writes the file footer. A file is emitted from `consume` as soon as its last
 //! expected row group arrives.
 //!
-//! An [`EncodedColumnChunk`] represents one top-level schema column and may
-//! contain several primitive leaves. Leaves are written in schema order, with
+//! An [`EncodedLeafChunk`] is one primitive leaf of one row group, numbered in
+//! the schema's depth-first leaf order. Leaves are written in that order, with
 //! dictionary pages before data pages, and their offsets and statistics are
 //! recorded in the footer.
 
@@ -27,7 +27,7 @@ use dispatch::memory::{FileBytes, Slab, SlabAllocator};
 
 use super::error::{WriteError, WriteResult};
 use super::types::{
-    AssembledFile, EncodedColumnChunk, EncodedLeaf, FileId, RowGroupContext, RowGroupId,
+    AssembledFile, EncodedLeaf, EncodedLeafChunk, FileId, RowGroupContext, RowGroupId,
 };
 
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
@@ -46,7 +46,7 @@ pub(super) fn factories(worker_count: usize) -> Vec<FileAssemblerFactory> {
 }
 
 /// Items accumulated until an expected count is reached. The same helper is
-/// used for columns within a row group and row groups within a file.
+/// used for leaves within a row group and row groups within a file.
 struct Gathering<V> {
     remaining: usize,
     context: Arc<RowGroupContext>,
@@ -73,26 +73,26 @@ impl<V> Gathering<V> {
 /// Per-worker state for row groups and files that are still being assembled.
 #[derive(Default)]
 pub(super) struct FileAssembler {
-    chunks_by_row_group: HashMap<RowGroupId, Gathering<EncodedColumnChunk>>,
+    chunks_by_row_group: HashMap<RowGroupId, Gathering<EncodedLeafChunk>>,
     row_groups_by_file: HashMap<FileId, Gathering<AssembledRowGroup>>,
 }
 
-impl Unary<EncodedColumnChunk, AssembledFile> for FileAssembler {
+impl Unary<EncodedLeafChunk, AssembledFile> for FileAssembler {
     fn consume(
         &mut self,
-        chunk: EncodedColumnChunk,
+        chunk: EncodedLeafChunk,
         sender: &mut dyn Sender<AssembledFile>,
         _io: &mut dispatch::OperatorIO,
     ) -> UnaryResult<()> {
         // A row group is ready once one encoded chunk has arrived for every
-        // top-level schema column.
+        // primitive leaf of the schema.
         let row_group_id = chunk.context.row_group_id;
-        let column_count = chunk.context.schema.fields().len();
+        let leaf_count = chunk.context.leaf_count;
         let context = chunk.context.clone();
         if !self
             .chunks_by_row_group
             .entry(row_group_id)
-            .or_insert_with(|| Gathering::new(column_count, context))
+            .or_insert_with(|| Gathering::new(leaf_count, context))
             .push(chunk)
         {
             return Ok(());
@@ -144,18 +144,15 @@ struct AssembledRowGroup {
 }
 
 impl AssembledRowGroup {
-    /// Writes a row group's encoded columns in schema order.
-    fn new(row_group_id: RowGroupId, mut chunks: Vec<EncodedColumnChunk>) -> WriteResult<Self> {
-        // Workers may return columns in any order. Leaves within each column
-        // are already ordered by the encoder.
-        chunks.sort_by_key(|chunk| chunk.column_index);
+    /// Writes a row group's encoded leaves in schema order.
+    fn new(row_group_id: RowGroupId, mut chunks: Vec<EncodedLeafChunk>) -> WriteResult<Self> {
+        // Workers may return leaves in any order.
+        chunks.sort_by_key(|chunk| chunk.leaf_index);
 
         let mut bytes = FileBytes::new();
         let mut columns = Vec::with_capacity(chunks.len());
         for chunk in chunks {
-            for leaf in chunk.leaves {
-                columns.push(write_leaf_chunk(&mut bytes, leaf)?);
-            }
+            columns.push(write_leaf_chunk(&mut bytes, chunk.leaf)?);
         }
         Ok(Self {
             row_group_id,
@@ -488,8 +485,9 @@ mod tests {
     use super::*;
     use crate::ParquetTable;
     use crate::types::arrow_map::CONVERTED_DECIMAL;
-    use crate::writing::encoder::encode_column_chunk;
-    use crate::writing::types::{EncodedColumnChunk, FileAssemblyInfo};
+    use crate::writing::encoder::encode_leaf;
+    use crate::writing::leaves;
+    use crate::writing::types::{EncodedLeafChunk, FileAssemblyInfo};
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Decimal64Type, Int64Type};
     use arrow_array::{Array, ArrayRef, Decimal64Array, Int64Array, RecordBatch, StructArray};
@@ -504,6 +502,11 @@ mod tests {
             row_group_id: 0,
             assembly_worker: 0,
             schema: schema.clone(),
+            leaf_count: schema
+                .fields()
+                .iter()
+                .map(|field| leaves::count_leaves(field))
+                .sum(),
             file_info: Arc::new(FileAssemblyInfo {
                 file_id: 0,
                 row_group_count: 1,
@@ -551,10 +554,10 @@ mod tests {
         assert!(ranges.iter().all(|range| !range.is_empty()));
     }
 
-    /// Encode a batch the way the pipeline does — flatten each column into leaves
-    /// and encode them (dictionary or PLAIN, the encoder's choice) →
-    /// `assemble_row_group` → `build_file` — and return the bytes (a
-    /// single-row-group file, no stats).
+    /// Encode a batch the way the pipeline does: convert each column to Parquet
+    /// leaves and encode them (dictionary or PLAIN, the encoder's choice), then
+    /// `AssembledRowGroup::new` and `build_file`. Returns the bytes of a
+    /// single-row-group file.
     fn encode(batch: &RecordBatch) -> Vec<u8> {
         // Pages are written into ring memory, so this needs a memory context of
         // its own: a thread can hold only one, and a test may also spin up a
@@ -567,20 +570,17 @@ mod tests {
                     let mut allocator = SlabAllocator::new(false);
                     let schema = batch.schema();
                     let context = context(&schema);
-                    let chunks: Vec<EncodedColumnChunk> = (0..batch.num_columns())
-                        .map(|column| {
-                            Ok(EncodedColumnChunk {
+                    let mut chunks = Vec::new();
+                    for (column, field) in schema.fields().iter().enumerate() {
+                        for leaf in leaves::to_parquet_leaves(field, batch.column(column)).unwrap()
+                        {
+                            chunks.push(EncodedLeafChunk {
                                 context: context.clone(),
-                                column_index: column,
-                                leaves: encode_column_chunk(
-                                    schema.field(column),
-                                    batch.column(column),
-                                    &mut allocator,
-                                )?,
-                            })
-                        })
-                        .collect::<WriteResult<_>>()
-                        .unwrap();
+                                leaf_index: chunks.len(),
+                                leaf: encode_leaf(leaf, &mut allocator).unwrap(),
+                            });
+                        }
+                    }
                     let group = AssembledRowGroup::new(0, chunks).unwrap();
                     build_file(&schema, vec![group])
                         .unwrap()
