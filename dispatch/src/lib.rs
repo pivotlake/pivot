@@ -103,10 +103,11 @@ pub use memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 pub use numa::{Topology, default_worker_count, dominant_node};
 pub use operations::channels::{MpscSender, Sender};
 pub use operations::nullary::Result as NullaryResult;
+pub use operations::unary::DynamicFilterSlot;
 pub use operations::unary::filter::{RowDelivery, RowSelection, collect_selected_indices};
 pub use operations::{
-    JoinBuildFilter, JoinKind, JoinResidualFn, JoinResidualSpec, JoinSpec, RangeCompare,
-    RangeJoinSpec,
+    JoinBuildFilter, JoinKind, JoinResidualFn, JoinResidualSpec, JoinSpec, KeyBitset,
+    KeyBitsetSlot, RangeCompare, RangeJoinSpec,
 };
 #[cfg(feature = "perf")]
 pub use profiler::worker_tids;
@@ -131,12 +132,11 @@ pub use operations::unary::{
 };
 pub use operations::{
     AggregationKind, AggregationSlot, AggregationValue, Cell, Compiled, Count, CountSlot,
-    CountValidSlot, Distinct, Dynamic, DynamicFilterSlot, Fold, GroupLimit,
-    HashOnlyIntKeyExtractor, IntCell, IntKeyExtractor, IntPairKeyExtractor, IntRead,
-    IntStrKeyExtractor, Max, MaxSlot, Min, MinSlot, NoRead, Nullary, NullaryFactory,
-    NullaryOperatorFactory, OneShotNullaryFactory, OpTuple, Operator, OrderBy, Read,
-    Result as OperatorResult, RowKeyExtractor, RowKeySchema, StrMax, StrMin, StrRead,
-    StringKeyExtractor, Sum, SumSlot, WideSum,
+    CountValidSlot, Distinct, Dynamic, Fold, GroupLimit, HashOnlyIntKeyExtractor, IntCell,
+    IntKeyExtractor, IntPairKeyExtractor, IntRead, IntStrKeyExtractor, Max, MaxSlot, Min, MinSlot,
+    NoRead, Nullary, NullaryFactory, NullaryOperatorFactory, OneShotNullaryFactory, OpTuple,
+    Operator, OrderBy, Read, Result as OperatorResult, RowKeyExtractor, RowKeySchema, StrMax,
+    StrMin, StrRead, StringKeyExtractor, Sum, SumSlot, WideSum,
 };
 pub use operations::{
     ChannelInputFull, ChannelInputSender, Consumer, DefaultUnaryFactory, MapFactory, Outputter,

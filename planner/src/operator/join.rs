@@ -237,6 +237,7 @@ impl Join {
                 build_column: self.build_keys[filter.key_position],
                 min_slot: slots.boundary_slot(filter.min_slot_id),
                 max_slot: slots.boundary_slot(filter.max_slot_id),
+                key_bitset_slot: slots.key_bitset_slot(filter.key_bitset_slot_id),
             })
             .collect();
         let spec = JoinSpec {

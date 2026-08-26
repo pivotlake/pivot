@@ -2,7 +2,7 @@
 
 use crate::catalog::{BoundTable, DynamicScanPredicate};
 use crate::compile::{Error, RuntimeFilterSlots};
-use crate::dynamic_filter::{DynamicFilter, JoinFilterScanInfo};
+use crate::dynamic_filter::{DynamicFilter, JoinFilterScanInfo, KeyBitsetFilter};
 use crate::expression::{Expression, Function, Ref, VariantGet};
 use crate::operator::Projection;
 use crate::types::{Type, physical_arrow_type};
@@ -22,6 +22,9 @@ pub struct Input {
     /// by a Top-N or a hash join elsewhere in the plan. Each prunes row groups
     /// against the producer's live boundary value.
     pub dynamic_filters: Vec<DynamicFilter>,
+    /// Key-bitset filters installed by the build sides of the hash joins above this input. This
+    /// allows early filtering of probe rows
+    pub key_bitset_filters: Vec<KeyBitsetFilter>,
     /// The DuckDB binding table index of the get this scan was built from,
     /// which plan-level references (e.g. a join's filter-pushdown targets)
     /// name the scan by. `None` for a scan that has no DuckDB origin (built
@@ -53,6 +56,15 @@ impl fmt::Display for Input {
                 .join(", ");
             write!(f, ", dynamic: [{filters}]")?;
         }
+        if !self.key_bitset_filters.is_empty() {
+            let filters = self
+                .key_bitset_filters
+                .iter()
+                .map(|filter| format!("#{} in build keys", filter.column_idx))
+                .collect::<Vec<_>>()
+                .join(", ");
+            write!(f, ", key bitsets: [{filters}]")?;
+        }
         write!(f, ")")
     }
 }
@@ -75,10 +87,65 @@ impl Input {
                 self.emit_row_group_metadata,
             )
             .map_err(Error::TableScan)?;
+        let scan = self.attach_key_bitset_filters(scan, slots);
         match extract_projection {
             Some(extract_projection) => extract_projection.compile(scan),
             None => Ok(scan),
         }
+    }
+
+    /// Chain each key-bitset filter directly above the scan: a row whose key
+    /// the sealed build set does not hold dies here, before any other operator
+    /// sees it. Until the producing join's build seals, the slot is unarmed
+    /// and every row passes, so the filter is never a correctness event.
+    fn attach_key_bitset_filters(
+        &self,
+        mut scan: RecordBatchOperatorSpec,
+        slots: &mut RuntimeFilterSlots,
+    ) -> RecordBatchOperatorSpec {
+        for filter in &self.key_bitset_filters {
+            // The filter reads the scan's output positionally; find where the
+            // storage column landed, counting only entries that emit an
+            // output (the COUNT(*) sentinel refs emit none). A plan naming a
+            // column the scan does not emit as a plain read has nothing to
+            // test against.
+            let mut output_position = 0;
+            let mut position = None;
+            for column in &self.columns {
+                match column {
+                    Expression::Ref(r) if r.column_idx == usize::MAX => {}
+                    Expression::Ref(r) if r.column_idx == filter.column_idx => {
+                        position = Some(output_position);
+                        break;
+                    }
+                    _ => output_position += 1,
+                }
+            }
+            let Some(position) = position else {
+                continue;
+            };
+            let slot = slots.key_bitset_slot(filter.slot_id);
+            scan = scan.filter(move || {
+                let slot = std::sync::Arc::clone(&slot);
+                move |batch: &arrow_array::RecordBatch,
+                      _slab: &mut dispatch::memory::SlabAllocator,
+                      survivors: &mut Vec<u32>| {
+                    match slot.get() {
+                        None => dispatch::RowSelection::All,
+                        Some(bitset) => {
+                            survivors.clear();
+                            bitset.select(batch.column(position), survivors);
+                            if survivors.len() == batch.num_rows() {
+                                dispatch::RowSelection::All
+                            } else {
+                                dispatch::RowSelection::Indices
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        scan
     }
 }
 

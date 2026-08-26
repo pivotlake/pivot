@@ -25,7 +25,7 @@ use crate::expression::Expression;
 use crate::types::Type;
 use crate::{Plan, PlanNode};
 use arrow_array::{ArrayRef, Datum, RecordBatch, Scalar, UInt32Array};
-use dispatch::{DataFlowDispatcher, DynamicFilterSlot, RecordBatchOperatorSpec};
+use dispatch::{DataFlowDispatcher, DynamicFilterSlot, KeyBitsetSlot, RecordBatchOperatorSpec};
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
@@ -47,13 +47,20 @@ use thiserror::Error;
 ///     Input(slot_id = 4) ────┘             consumer ─────┘
 /// ```
 ///
+/// Boundary slots and key-bitset slots have separate ID spaces because they
+/// hold different concrete types; boundary slot `0` and key-bitset slot `0`
+/// are unrelated cells.
+///
 /// The registry belongs to compilation, not to [`Plan`]. Compiling a cached
 /// plan therefore creates fresh, unarmed slots for every execution instead of
-/// retaining a prior query's boundary.
+/// retaining a prior query's boundary or build-key bitset.
 #[derive(Default)]
 pub(crate) struct RuntimeFilterSlots {
     /// Boundary-value slots (Top-N limits, join key bounds), by slot id.
     boundary: HashMap<usize, Arc<DynamicFilterSlot>>,
+    /// Key-bitset slots, by slot id — a separate id space
+    /// from `boundary`.
+    key_bitset: HashMap<usize, Arc<KeyBitsetSlot>>,
 }
 
 impl RuntimeFilterSlots {
@@ -64,6 +71,16 @@ impl RuntimeFilterSlots {
             self.boundary
                 .entry(slot_id)
                 .or_insert_with(|| Arc::new(DynamicFilterSlot::new())),
+        )
+    }
+
+    /// Return the key-bitset cell named by `slot_id`, creating it if this is the
+    /// first producer or consumer for that ID to compile.
+    pub(crate) fn key_bitset_slot(&mut self, slot_id: usize) -> Arc<KeyBitsetSlot> {
+        Arc::clone(
+            self.key_bitset
+                .entry(slot_id)
+                .or_insert_with(|| Arc::new(KeyBitsetSlot::new())),
         )
     }
 }
