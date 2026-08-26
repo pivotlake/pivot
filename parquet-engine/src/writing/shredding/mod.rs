@@ -25,9 +25,10 @@
 //! - [`plan_file_shredding`] runs in the
 //!   [`row_group_planner`](super::row_group_planner) once a file's rows are
 //!   known. It picks the file's layout without rewriting the rows.
-//! - [`shred_gathered_column`] applies the plan, on the encode workers, to
-//!   each materialized row group's variant column — the rewrite is the heavy
-//!   half, and it parallelizes there.
+//! - [`shred_column`] applies the plan in the [`shredder`](super::shredder)
+//!   stage, one slice of a row group's variant column at a time. The rewrite
+//!   is the heavy half: it parallelizes across workers there, and slicing it
+//!   keeps any one worker turn short.
 //!
 //! Between them, compaction re-shreds: every input file's layout is folded away
 //! and each output file decides afresh from the rows it actually got.
@@ -71,8 +72,8 @@ pub(super) struct FileShredding {
 /// same code that later shreds the values.
 ///
 /// `chunks` must hold a whole output file's rows, since the layout is chosen
-/// from all of them together; the rewrite itself happens per row group on the
-/// encode workers ([`shred_gathered_column`]).
+/// from all of them together; the rewrite itself happens slice by slice in the
+/// shredder stage ([`shred_column`]).
 pub(super) fn plan_file_shredding(chunks: &[RecordBatch]) -> WriteResult<FileShredding> {
     let schema = chunks[0].schema();
     let mut fields: Vec<FieldRef> = schema.fields().to_vec();
@@ -102,10 +103,9 @@ pub(super) fn plan_file_shredding(chunks: &[RecordBatch]) -> WriteResult<FileShr
     })
 }
 
-/// Apply one column's planned `shredding` to a materialized row group's
-/// values: the heavy half of shredding, run per column chunk on the encode
-/// workers.
-pub(super) fn shred_gathered_column(
+/// Apply one column's planned `shredding` to a run of its rows: the heavy half
+/// of shredding, run on a slice of a row group at a time by the shredder stage.
+pub(super) fn shred_column(
     values: &ArrayRef,
     shredding: &arrow_schema::DataType,
 ) -> WriteResult<ArrayRef> {

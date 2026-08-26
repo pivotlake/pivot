@@ -28,9 +28,11 @@
 //! 6. The global executors materialize those slices on their selected NUMA
 //!    nodes. Together, in slice order, they are the fully sorted file input.
 //! 7. [`row_group_planner`] divides the ordered file into column jobs.
-//! 8. [`encoder`] materializes and encodes those jobs as Parquet pages.
-//! 9. [`assembler`] returns encoded column chunks to one worker per file and
-//!    produces the final file bytes and footer metadata.
+//! 8. [`shredder`] splits each column job into its primitive leaves, shredding
+//!    a variant column a record batch of rows per worker turn.
+//! 9. [`encoder`] materializes and encodes each leaf as Parquet pages.
+//! 10. [`assembler`] returns encoded leaf chunks to one worker per file and
+//!     produces the final file bytes and footer metadata.
 //!
 //! In outline, the two merge levels are:
 //!
@@ -52,9 +54,11 @@ pub(crate) mod encoder;
 pub(crate) mod error;
 mod file_collector;
 mod file_merge;
+mod leaves;
 mod partition_sorter;
 mod presorted_run;
 mod row_group_planner;
+mod shredder;
 mod shredding;
 mod stats;
 pub use stats::aggregate_file_stats;
@@ -74,7 +78,7 @@ use dispatch::{
 use partition_sorter::{PartitionSorterFactory, SortedPartitionRun};
 use presorted_run::PresortedRun;
 use types::{
-    ColumnChunkJob, EncodedColumnChunk, FileOrderInput, GlobalMergeJob, LocalMergeJob,
+    ColumnChunkJob, EncodedLeafChunk, FileOrderInput, GlobalMergeJob, LeafChunkJob, LocalMergeJob,
     LocalMergeResult, ReadyFile,
 };
 
@@ -237,10 +241,16 @@ where
             node_work_queue::<ColumnChunkJob>(topology)
                 .into_iter()
                 .collect(),
+            shredder::factories(worker_count),
+        )
+        .chain(
+            node_work_queue::<LeafChunkJob>(topology)
+                .into_iter()
+                .collect(),
             encoder::factories(worker_count),
         )
         .chain(
-            return_to_worker_mpsc::<EncodedColumnChunk>(worker_count)
+            return_to_worker_mpsc::<EncodedLeafChunk>(worker_count)
                 .into_iter()
                 .collect(),
             assembler::factories(worker_count),

@@ -21,8 +21,8 @@ use snap::raw::Encoder;
 use dispatch::memory::SlabAllocator;
 
 use super::super::error::{WriteError, WriteResult};
+use super::super::leaves::Leaf;
 use super::super::types::EncodedPage;
-use super::leaves::Leaf;
 use super::rle;
 
 /// Target uncompressed size of one data page. Matches Parquet's usual ~1 MiB
@@ -237,8 +237,8 @@ pub(super) fn assemble_page(
 
 #[cfg(test)]
 mod tests {
-    use super::super::leaves;
     use super::*;
+    use crate::writing::leaves;
     use arrow_array::{Array, Int64Array};
     use arrow_schema::Field;
     use std::sync::Arc;
@@ -255,7 +255,10 @@ mod tests {
 
     fn leaf(values: ArrayRef, nullable: bool) -> Leaf {
         let field = Field::new("n", values.data_type().clone(), nullable);
-        leaves::flatten(&field, &values).unwrap().pop().unwrap()
+        leaves::to_parquet_leaves(&field, &values)
+            .unwrap()
+            .pop()
+            .unwrap()
     }
 
     fn ranges(leaf: &Leaf, target: usize) -> Vec<(Range<usize>, Range<usize>)> {

@@ -1,4 +1,4 @@
-//! Flattens a column into the primitive leaves Parquet actually stores.
+//! Converts a column into the primitive leaves Parquet actually stores.
 //!
 //! Parquet has no nested storage: a column chunk holds one *leaf*, and a struct
 //! exists only as a group in the footer schema. A flat column is its own single
@@ -10,6 +10,12 @@
 //! chunks in, and the same order the reader's `leaf_fields` expands a schema
 //! into. The two must agree, or every chunk after the first variant would line
 //! up against the wrong decoder.
+//!
+//! The leaves a field has, their paths and their level depths are all fixed by
+//! the field alone, so converting a column one slice of rows at a time yields
+//! the same leaf list every time, and the [`shredder`](super::shredder) can
+//! line the slices' leaves up index by index. [`count_leaves`] is that count
+//! without any rows.
 //!
 //! ## Definition levels
 //!
@@ -26,7 +32,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, BooleanArray};
 use arrow_schema::{DataType, Field};
 
-use super::super::error::WriteResult;
+use super::error::WriteResult;
 
 /// One primitive leaf of a column, ready to encode.
 pub(super) struct Leaf {
@@ -66,8 +72,17 @@ impl Leaf {
     }
 }
 
-/// Flatten `field` into its primitive leaves, depth-first.
-pub(super) fn flatten(field: &Field, values: &ArrayRef) -> WriteResult<Vec<Leaf>> {
+/// How many primitive Parquet leaves `field` contains: one for a flat column,
+/// one per primitive under a struct.
+pub(super) fn count_leaves(field: &Field) -> usize {
+    match field.data_type() {
+        DataType::Struct(fields) => fields.iter().map(|child| count_leaves(child)).sum(),
+        _ => 1,
+    }
+}
+
+/// Convert `field` and its values into Parquet leaves, depth-first.
+pub(super) fn to_parquet_leaves(field: &Field, values: &ArrayRef) -> WriteResult<Vec<Leaf>> {
     let mut leaves = Vec::new();
     // A top-level column starts defined at level 0 on every row: it has no
     // ancestor that could be absent.
@@ -197,7 +212,7 @@ mod tests {
     fn a_flat_required_column_is_one_leaf_without_levels() {
         let values: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3]));
 
-        let leaves = flatten(&field("n", DataType::Int64, false), &values).unwrap();
+        let leaves = to_parquet_leaves(&field("n", DataType::Int64, false), &values).unwrap();
 
         assert_eq!(leaves.len(), 1);
         assert_eq!(leaves[0].path, vec!["n"]);
@@ -212,7 +227,7 @@ mod tests {
     fn a_nullable_leaf_drops_its_null_values() {
         let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None, Some(3)]));
 
-        let leaves = flatten(&field("n", DataType::Int64, true), &values).unwrap();
+        let leaves = to_parquet_leaves(&field("n", DataType::Int64, true), &values).unwrap();
 
         assert_eq!(leaves[0].max_def_level, 1);
         assert_eq!(leaves[0].def_levels.as_deref(), Some([1, 0, 1].as_slice()));
@@ -240,7 +255,8 @@ mod tests {
             None,
         ));
 
-        let leaves = flatten(&field("s", DataType::Struct(inner), false), &values).unwrap();
+        let leaves =
+            to_parquet_leaves(&field("s", DataType::Struct(inner), false), &values).unwrap();
 
         assert_eq!(leaves.len(), 2);
         assert_eq!(leaves[0].path, vec!["s", "a"]);
@@ -260,7 +276,8 @@ mod tests {
             Some(NullBuffer::from(vec![true, false, true])),
         ));
 
-        let leaves = flatten(&field("s", DataType::Struct(inner), true), &values).unwrap();
+        let leaves =
+            to_parquet_leaves(&field("s", DataType::Struct(inner), true), &values).unwrap();
 
         // max_def 2: 2 = value present, 1 = struct present but field null,
         // 0 = the struct itself absent.
@@ -278,7 +295,7 @@ mod tests {
     fn a_fully_present_nullable_leaf_stores_every_row() {
         let values: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), Some(2)]));
 
-        let leaves = flatten(&field("n", DataType::Int64, true), &values).unwrap();
+        let leaves = to_parquet_leaves(&field("n", DataType::Int64, true), &values).unwrap();
 
         assert_eq!(leaves[0].def_levels.as_deref(), Some([1, 1].as_slice()));
         assert_eq!(leaves[0].values.len(), 2);

@@ -29,8 +29,8 @@ use crate::{DecimalWriteStorage, decimal_write_storage};
 use dispatch::memory::SlabAllocator;
 
 use super::super::error::WriteResult;
+use super::super::leaves::Leaf;
 use super::super::types::EncodedPage;
-use super::leaves::Leaf;
 use super::pages::{self, PageKind, PageRange};
 
 /// Values a block holds, and how many miniblocks it is cut into.

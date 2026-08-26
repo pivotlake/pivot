@@ -1,88 +1,72 @@
-//! Encodes one row-group column at a time as Parquet pages.
+//! Encodes one row-group leaf at a time as Parquet pages.
 //!
-//! Each [`ColumnChunkJob`] becomes one [`EncodedColumnChunk`]. Jobs run in
+//! Each [`LeafChunkJob`] becomes one [`EncodedLeafChunk`]. Jobs run in
 //! parallel, then the output channel routes each result to its file's assembly
 //! worker.
 //!
-//! Parquet encodes primitive leaves rather than top-level Arrow columns. The
-//! encoder therefore applies any selected variant shredding, flattens the
-//! resulting value into leaves, and encodes each leaf independently.
+//! The [`shredder`](super::shredder) has already split every column into its
+//! primitive leaves, so the encoder's input is one leaf's values in row-ordered
+//! chunks. It materializes them into ring memory and encodes the result.
 //!
 //! Encoding prefers a dictionary when it is beneficial, then a supported delta
 //! encoding, and finally PLAIN. [`pages`] frames and compresses the output.
 
 pub(crate) mod delta;
 mod dictionary;
-mod leaves;
 mod pages;
 mod plain;
 mod rle;
 
+use std::sync::Arc;
+
 use crate::thrift::footer::Statistics;
 use crate::thrift::general::Encoding;
-use arrow_array::ArrayRef;
-use arrow_schema::Field;
 use dispatch::memory::SlabAllocator;
 use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult};
 
 use super::error::{WriteError, WriteResult};
+use super::leaves::Leaf;
 use super::stats;
-use super::types::{ColumnChunkJob, EncodedColumnChunk, EncodedLeaf};
+use super::types::{EncodedLeaf, EncodedLeafChunk, LeafChunkJob};
 use dispatch::arrays::take::concat_chunks;
-use leaves::Leaf;
 
-pub(super) type ColumnEncoderFactory = DefaultUnaryFactory<ColumnEncoder>;
+pub(super) type LeafEncoderFactory = DefaultUnaryFactory<LeafEncoder>;
 
-pub(super) fn factories(worker_count: usize) -> Vec<ColumnEncoderFactory> {
+pub(super) fn factories(worker_count: usize) -> Vec<LeafEncoderFactory> {
     DefaultUnaryFactory::create_for_workers(worker_count)
 }
 
 #[derive(Default)]
-pub(super) struct ColumnEncoder {
+pub(super) struct LeafEncoder {
     /// Initialized on first use so an inactive encoder holds no ring buffer.
     allocator: Option<SlabAllocator>,
 }
 
-impl Unary<ColumnChunkJob, EncodedColumnChunk> for ColumnEncoder {
+impl Unary<LeafChunkJob, EncodedLeafChunk> for LeafEncoder {
     fn consume(
         &mut self,
-        job: ColumnChunkJob,
-        sender: &mut dyn Sender<EncodedColumnChunk>,
+        job: LeafChunkJob,
+        sender: &mut dyn Sender<EncodedLeafChunk>,
         _io: &mut dispatch::OperatorIO,
     ) -> UnaryResult<()> {
-        let field = job.context.schema.field(job.column_index);
         let allocator = self
             .allocator
             .get_or_insert_with(|| SlabAllocator::new(false));
-        let materialized_values =
-            concat_chunks(allocator, &job.batches).map_err(WriteError::from)?;
-        let physical_values = match &job.shredding {
-            Some(shredding) => {
-                super::shredding::shred_gathered_column(&materialized_values, shredding)?
-            }
-            None => materialized_values,
+        let values = concat_chunks(allocator, &job.value_chunks).map_err(WriteError::from)?;
+        let leaf = Leaf {
+            path: job.path,
+            values,
+            def_levels: job.def_levels.map(Arc::from),
+            max_def_level: job.max_def_level,
         };
-        let leaves = encode_column_chunk(field, &physical_values, allocator)?;
-        sender.send(EncodedColumnChunk {
+        let encoded = encode_leaf(leaf, allocator)?;
+        sender.send(EncodedLeafChunk {
             context: job.context,
-            column_index: job.column_index,
-            leaves,
+            leaf_index: job.leaf_index,
+            leaf: encoded,
         })?;
         Ok(())
     }
-}
-
-/// Encode one column's values for a row group: flatten it into leaves and encode
-/// each, in the depth-first order Parquet numbers them.
-pub(in crate::writing) fn encode_column_chunk(
-    field: &Field,
-    values: &ArrayRef,
-    allocator: &mut SlabAllocator,
-) -> WriteResult<Vec<EncodedLeaf>> {
-    leaves::flatten(field, values)?
-        .into_iter()
-        .map(|leaf| encode_leaf(leaf, allocator))
-        .collect()
 }
 
 /// Encode one leaf, preferring a dictionary, then a delta form, then PLAIN.
@@ -95,7 +79,10 @@ pub(in crate::writing) fn encode_column_chunk(
 /// the width they need, which is most of the size of a key column. Floats, and
 /// decimals too wide to store as an integer, have no delta form and still take
 /// PLAIN.
-fn encode_leaf(leaf: Leaf, allocator: &mut SlabAllocator) -> WriteResult<EncodedLeaf> {
+pub(in crate::writing) fn encode_leaf(
+    leaf: Leaf,
+    allocator: &mut SlabAllocator,
+) -> WriteResult<EncodedLeaf> {
     let physical_type = crate::arrow_to_parquet_physical(leaf.values.data_type())?;
     let statistics = leaf_statistics(&leaf);
     let (dictionary_page, data_page_encoding, data_pages) =
@@ -129,8 +116,8 @@ fn encode_leaf(leaf: Leaf, allocator: &mut SlabAllocator) -> WriteResult<Encoded
 ///
 /// Every leaf gets them, which is what lets a reader prune row groups by any
 /// column instead of only by the sort key. The null count is recorded even for a
-/// leaf with no range to give — a leaf absent on every row has no values to take
-/// one from — because it prunes on its own account: a shredded path's typed leaf
+/// leaf with no range to give (a leaf absent on every row has no values to take
+/// one from), because it prunes on its own account: a shredded path's typed leaf
 /// may only be trusted when every `value` fallback beside it is all-null, and the
 /// null count is how a reader establishes that.
 fn leaf_statistics(leaf: &Leaf) -> Statistics {
