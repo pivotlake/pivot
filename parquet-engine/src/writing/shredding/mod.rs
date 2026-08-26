@@ -33,6 +33,7 @@
 //! and each output file decides afresh from the rows it actually got.
 
 mod infer;
+mod shred;
 
 use std::sync::Arc;
 
@@ -141,13 +142,16 @@ pub(super) fn plan_file_shredding(chunks: &[RecordBatch]) -> WriteResult<FileShr
 
 /// Apply one column's planned `shredding` to a materialized row group's
 /// values: the heavy half of shredding, run per column chunk on the encode
-/// workers.
+/// workers. The shredded columns are built on slabs from `allocator`.
 pub(super) fn shred_gathered_column(
     values: &ArrayRef,
     shredding: &arrow_schema::DataType,
+    allocator: &mut SlabAllocator,
 ) -> WriteResult<ArrayRef> {
     let variant = VariantArray::try_new(values.as_ref())?;
-    Ok(Arc::new(shred_variant(&variant, shredding)?.into_inner()))
+    Ok(Arc::new(
+        shred::shred_into_slabs(&variant, shredding, allocator)?.into_inner(),
+    ))
 }
 
 /// Rebuild `batch` with `f` applied to each of its variant columns, widening or
