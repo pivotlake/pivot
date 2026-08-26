@@ -58,7 +58,7 @@ impl Unary<ColumnChunkJob, EncodedColumnChunk> for ColumnEncoder {
             concat_chunks(allocator, &job.batches).map_err(WriteError::from)?;
         let physical_values = match &job.shredding {
             Some(shredding) => {
-                super::shredding::shred_gathered_column(&materialized_values, shredding)?
+                super::shredding::shred_gathered_column(&materialized_values, shredding, allocator)?
             }
             None => materialized_values,
         };
