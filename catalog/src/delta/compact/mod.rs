@@ -362,30 +362,32 @@ impl CompacterActor {
     /// partitions. Sort columns are considered in table order; a column only
     /// defers to the next one when both files are the same singleton on it.
     /// Selection itself skips pairs whose rewrite cannot separate their overlap,
-    /// so an irreducible pair never hides a mergeable one behind it. Guardless
-    /// selection still requires positive overlap: rewriting disjoint ranges
-    /// cannot improve their layout.
+    /// so an irreducible pair never hides a mergeable one behind it, and pairs
+    /// without enough contested row groups on both sides. Selection only ever
+    /// yields positive-overlap pairs, so guardless sweeps never rewrite
+    /// disjoint ranges.
     fn next_layout_optimization(
         &self,
         table: &CatalogTable,
         apply_guards: bool,
     ) -> Option<Vec<FileRef>> {
-        if table.sort_by().is_empty() {
-            return None;
-        }
+        let sweep_column = table.sort_by().first()?;
 
-        let mut by_partition: Vec<(Option<crate::delta::PartitionValues>, Vec<&DeltaFileEntry>)> =
-            Vec::new();
-        for entry in table.file_entries() {
-            if is_small_file(entry.file.size, self.target_bytes) {
+        let mut by_partition: Vec<(
+            Option<crate::delta::PartitionValues>,
+            Vec<overlap::LayoutCandidate<'_>>,
+        )> = Vec::new();
+        for file in table.files() {
+            if is_small_file(file.entry.file.size, self.target_bytes) {
                 continue;
             }
+            let candidate = overlap::LayoutCandidate::from_table_file(file, sweep_column);
             match by_partition
                 .iter_mut()
-                .find(|(partition, _)| partition_values_equal(partition, &entry.partition))
+                .find(|(partition, _)| partition_values_equal(partition, &file.entry.partition))
             {
-                Some((_, files)) => files.push(entry),
-                None => by_partition.push((entry.partition.clone(), vec![entry])),
+                Some((_, files)) => files.push(candidate),
+                None => by_partition.push((file.entry.partition.clone(), vec![candidate])),
             }
         }
 
@@ -396,8 +398,7 @@ impl CompacterActor {
             else {
                 continue;
             };
-            if score > 0.0
-                && (!apply_guards || score >= LAYOUT_OVERLAP_THRESHOLD)
+            if (!apply_guards || score >= LAYOUT_OVERLAP_THRESHOLD)
                 && best.as_ref().is_none_or(|(best, _)| score > *best)
             {
                 best = Some((score, vec![left.file.clone(), right.file.clone()]));
