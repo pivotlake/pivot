@@ -334,7 +334,7 @@ impl ObjectShredder {
         if leftovers.is_empty() {
             fallback.append_null();
         } else {
-            let bytes = leftover_object(metadata, &leftovers)?;
+            let bytes = leftover_object(metadata, &leftovers);
             fallback.append_bytes(&bytes, allocator);
         }
         self.typed_nulls.append(true);
@@ -401,19 +401,16 @@ impl ObjectShredder {
 /// The variant bytes of an object holding just `fields`, named by their ids in
 /// `metadata` (they are fields of the document being shredded). Nested values
 /// are copied byte for byte, so they keep referring to that same dictionary.
-fn leftover_object(
-    metadata: &VariantMetadata<'_>,
-    fields: &[(u32, Variant<'_, '_>)],
-) -> WriteResult<Vec<u8>> {
+fn leftover_object(metadata: &VariantMetadata<'_>, fields: &[(u32, Variant<'_, '_>)]) -> Vec<u8> {
     let mut value_builder = ValueBuilder::new();
     let mut metadata_builder = ReadOnlyMetadataBuilder::new(metadata);
     let state = ParentState::variant(&mut value_builder, &mut metadata_builder);
     let mut object = ObjectBuilder::new(state, false);
     for (field_id, value) in fields {
-        object.insert_bytes(metadata.get(*field_id as usize)?, value.clone());
+        object.insert_bytes_by_field_id(*field_id, value.clone());
     }
     object.finish();
-    Ok(value_builder.into_inner())
+    value_builder.into_inner()
 }
 
 fn field_id_out_of_dictionary(field_id: u32, metadata: &VariantMetadata<'_>) -> WriteError {
