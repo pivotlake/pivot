@@ -2,7 +2,8 @@
 //!
 //! Merge jobs carry file-ordering work between the node-local and global
 //! stages. [`ColumnChunkJob`] then describes one top-level column of one row
-//! group. The encoder turns it into [`EncodedColumnChunk`], and the assembler
+//! group. The shredder splits it into one [`LeafChunkJob`] per primitive leaf,
+//! the encoder turns each into an [`EncodedLeafChunk`], and the assembler
 //! combines those results into a Parquet file.
 
 use std::sync::atomic::AtomicUsize;
@@ -52,6 +53,9 @@ pub(crate) struct RowGroupContext {
     pub(crate) row_group_id: RowGroupId,
     pub(crate) assembly_worker: usize,
     pub(crate) schema: SchemaRef,
+    /// Primitive leaves across every column of `schema`: the number of encoded
+    /// chunks that complete the row group.
+    pub(crate) leaf_count: usize,
     pub(crate) file_info: Arc<FileAssemblyInfo>,
 }
 
@@ -169,19 +173,47 @@ impl NodeIdOutput for GlobalMergeJob {
     }
 }
 
-/// One top-level column of one row group, ready for materialization and Parquet
-/// encoding.
+/// One top-level column of one row group, ready to be split into its primitive
+/// leaves.
 pub(crate) struct ColumnChunkJob {
     pub(crate) context: Arc<RowGroupContext>,
     pub(crate) column_index: usize,
-    /// Array slices in row order. The encoder concatenates them before
-    /// encoding the column chunk.
+    /// Where this column's leaves start in the row group's depth-first leaf
+    /// numbering.
+    pub(crate) first_leaf_index: usize,
+    /// Array slices in row order. The shredder walks them a bounded number of
+    /// rows per step.
     pub(crate) batches: Arc<[ArrayRef]>,
     pub(crate) shredding: Option<Arc<arrow_schema::DataType>>,
     pub(crate) target_node: usize,
 }
 
 impl NodeIdOutput for ColumnChunkJob {
+    fn node_id(&self) -> usize {
+        self.target_node
+    }
+}
+
+/// One primitive leaf of one row group, split out by the shredder and ready for
+/// materialization and Parquet encoding.
+pub(crate) struct LeafChunkJob {
+    pub(crate) context: Arc<RowGroupContext>,
+    /// The leaf's position in the row group's depth-first leaf numbering, which
+    /// is the order the assembler lays column chunks out in.
+    pub(crate) leaf_index: usize,
+    /// The leaf's `path_in_schema`, from the top-level column down.
+    pub(crate) path: Vec<String>,
+    /// The present rows' values in row order, one chunk per shredder step. The
+    /// encoder concatenates them before encoding the leaf.
+    pub(crate) value_chunks: Vec<ArrayRef>,
+    /// One level per row of the row group; `None` when nothing on the path is
+    /// nullable.
+    pub(crate) def_levels: Option<Vec<i16>>,
+    pub(crate) max_def_level: i16,
+    pub(crate) target_node: usize,
+}
+
+impl NodeIdOutput for LeafChunkJob {
     fn node_id(&self) -> usize {
         self.target_node
     }
@@ -205,15 +237,16 @@ pub(crate) struct EncodedLeaf {
     pub(crate) data_pages: Vec<EncodedPage>,
 }
 
-/// One fully encoded top-level column, containing its primitive leaves in
-/// schema order.
-pub(crate) struct EncodedColumnChunk {
+/// One fully encoded primitive leaf of one row group, on its way to the file's
+/// assembly worker.
+pub(crate) struct EncodedLeafChunk {
     pub(crate) context: Arc<RowGroupContext>,
-    pub(crate) column_index: usize,
-    pub(crate) leaves: Vec<EncodedLeaf>,
+    /// See [`LeafChunkJob::leaf_index`].
+    pub(crate) leaf_index: usize,
+    pub(crate) leaf: EncodedLeaf,
 }
 
-impl WorkerIdOutput for EncodedColumnChunk {
+impl WorkerIdOutput for EncodedLeafChunk {
     fn worker_id(&self) -> Identifier {
         self.context.assembly_worker
     }
