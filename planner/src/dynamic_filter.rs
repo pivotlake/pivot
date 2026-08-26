@@ -1,20 +1,23 @@
-//! Planner-side view of a dynamic-filter reference.
+//! Logical runtime-filter wiring stored in a query plan.
 //!
-//! Carries the comparison translated into the planner's [`CompareType`]. This is
-//! pure plan data: it carries the `slot_id` that correlates a producer (`TopN`)
-//! with its consumer scans, but *not* the shared slot itself. The
-//! [`DynamicFilterSlot`](dispatch::DynamicFilterSlot) is allocated fresh on each
-//! [`Plan::compile`](crate::Plan::compile) and handed to the operators by
-//! `slot_id`, so a cached `Plan` holds no runtime state.
+//! These structures describe connections, not live filter state. A producer
+//! and its consumer scans carry the same `slot_id`; [`Plan::compile`] resolves
+//! that ID through its runtime-slot registry so both ends receive the same
+//! shared [`DynamicFilterSlot`](dispatch::DynamicFilterSlot) or key-bitset slot.
+//!
+//! Keeping only IDs in the plan matters for plan caching: every execution gets
+//! newly allocated, unarmed slots, so no boundary or build-key set can leak
+//! from an earlier execution.
 
 use std::fmt;
 
 use crate::expression::CompareType;
 
-/// A dynamic-filter reference on an operator: which column it tests, the
-/// comparison, and the `slot_id` correlating it with the other end of the
-/// producer↔consumer pair. The shared slot is resolved at compile time (see
-/// [`Plan::compile`](crate::Plan::compile)).
+/// One boundary-filter endpoint in the logical plan.
+///
+/// On a consumer scan, `column_idx` and `compare_type` say how to compare scan
+/// data with the current boundary. On a producer, `slot_id` identifies the same
+/// runtime cell. The cell itself is allocated only when the plan is compiled.
 #[derive(Debug)]
 pub struct DynamicFilter {
     pub slot_id: usize,
@@ -37,6 +40,19 @@ pub struct JoinProducedFilter {
     /// Slot the build key maximum is published into; its consumers compare
     /// with `<=`.
     pub max_slot_id: usize,
+    /// Slot the build key set is published into as an exact key bitset, when
+    /// its shape allows one; consumer scans drop rows whose key
+    /// it does not hold. Its own id space, separate from the boundary slots.
+    pub key_bitset_slot_id: usize,
+}
+
+/// A key-bitset consumer on a scan: rows whose `column_idx` value the
+/// slot's sealed key set does not hold are dropped directly above the scan,
+/// before any other operator sees them.
+#[derive(Debug)]
+pub struct KeyBitsetFilter {
+    pub slot_id: usize,
+    pub column_idx: usize,
 }
 
 /// Join-filter-pushdown wiring read off a scan's DuckDB get at plan-build

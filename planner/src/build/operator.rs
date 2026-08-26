@@ -291,6 +291,7 @@ impl Input {
                 .into_iter()
                 .map(|df| ctx.dynamic_filter(df))
                 .collect::<Result<Vec<_>, _>>()?,
+            key_bitset_filters: Vec::new(),
             duckdb_table_binding_index: Some(scan.table_index()?),
             join_filter_info,
             emit_row_group_metadata: false,
