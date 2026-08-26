@@ -64,12 +64,10 @@ pub use top_n::TopN;
 pub use transaction::TransactionStatement;
 pub use values::Values;
 
-use crate::compile::{self, RuntimeFilterSlots};
+use crate::compile;
 use crate::expression::{self, Expression};
 use crate::types::Type;
-use dispatch::DynamicFilterSlot;
 use std::fmt;
-use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Error, Debug)]

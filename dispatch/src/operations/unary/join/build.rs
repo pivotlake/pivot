@@ -5,6 +5,7 @@ use crate::operations::unary::join::JoinBuildFilter;
 use crate::operations::unary::join::JoinTable;
 use crate::operations::unary::join::build_rows::{self, BuildRows};
 use crate::operations::unary::join::directory::JoinDirectory;
+use crate::operations::unary::join::key_bitset::KeyBitset;
 use crate::operations::unary::join::keys::{JoinKey, combined_key_validity};
 use crate::operations::unary::{BatchesOutputter, InitializableOutputter, NormalizationBatches};
 use crate::operations::{Consumer, Outputter, unary};
@@ -214,10 +215,10 @@ pub struct JoinBuilder<K: Copy + Send, const BUILD_OUTER: bool> {
     remaining_jobs: Arc<AtomicUsize>,
     gather: Arc<GatherBarrier<BuildWorkerOutput<K>>>,
     build_output_indices: Vec<usize>,
-    /// Key-bound filters to publish for sibling probe scans once every build
-    /// row is present (the final gather arrival) — publishing any earlier
-    /// would expose bounds tighter than the complete build side and prune
-    /// probe rows that do match.
+    /// Key filters to publish for sibling probe scans once every build row
+    /// is present (the final gather arrival) — publishing any earlier would
+    /// expose bounds or a key set tighter than the complete build side and
+    /// prune probe rows that do match.
     build_filters: Vec<JoinBuildFilter>,
 }
 
@@ -344,6 +345,13 @@ impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> JoinBuilder<K, OUTER_JOI
             if let Some(max) = key_column_extreme(&worker_outputs, filter.build_column, true) {
                 filter.max_slot.publish_value(max);
             }
+            let key_arrays = worker_outputs
+                .iter()
+                .flat_map(|output| output.build_row_batches.iter())
+                .map(|batch| batch.column(filter.build_column));
+            filter
+                .key_bitset_slot
+                .publish(KeyBitset::try_build(key_arrays));
         }
 
         let sizes: Vec<usize> = (0..NUM_PARTITIONS)
