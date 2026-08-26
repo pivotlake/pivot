@@ -10,7 +10,7 @@ use arrow_schema::{DataType, Field, Schema};
 
 use common::*;
 use dispatch::{
-    AggregationKind, AggregationSlot, DynamicFilterSlot, JoinBuildFilter, JoinKind, JoinResidualFn,
+    AggregationKind, AggregationSlot, BoundarySlot, JoinBuildFilter, JoinKind, JoinResidualFn,
     JoinResidualSpec, JoinSpec, KeyBitsetSlot, values_input,
 };
 
@@ -1141,8 +1141,8 @@ fn join_on_two_key_columns_needs_both_to_match() {
 fn a_build_filter_publishes_the_key_bounds() {
     let probe = int64_batch("key", &[1, 2, 3]);
     let build = int64_batch("key", &[42, 7, 19]);
-    let min_slot = Arc::new(DynamicFilterSlot::new());
-    let max_slot = Arc::new(DynamicFilterSlot::new());
+    let min_slot = Arc::new(BoundarySlot::new());
+    let max_slot = Arc::new(BoundarySlot::new());
     let key_bitset_slot = Arc::new(KeyBitsetSlot::new());
     let mut spec = inner_join(vec![0], vec![0]);
     spec.build_filters = vec![JoinBuildFilter {
@@ -1169,7 +1169,7 @@ fn a_build_filter_publishes_the_key_bounds() {
     assert_eq!(survivors, vec![1, 2, 3]);
 }
 
-fn boundary_i64(slot: &DynamicFilterSlot) -> i64 {
+fn boundary_i64(slot: &BoundarySlot) -> i64 {
     use arrow_array::Datum;
     let boundary = slot.boundary().expect("the sealed build published a bound");
     let (array, _) = boundary.get();

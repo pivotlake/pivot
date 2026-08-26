@@ -25,7 +25,7 @@ use crate::expression::Expression;
 use crate::types::Type;
 use crate::{Plan, PlanNode};
 use arrow_array::{ArrayRef, Datum, RecordBatch, Scalar, UInt32Array};
-use dispatch::{DataFlowDispatcher, DynamicFilterSlot, KeyBitsetSlot, RecordBatchOperatorSpec};
+use dispatch::{BoundarySlot, DataFlowDispatcher, KeyBitsetSlot, RecordBatchOperatorSpec};
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
@@ -43,7 +43,7 @@ use thiserror::Error;
 ///     logical plan                         compiled execution
 ///
 ///     TopN(slot_id = 4) ─────┐             producer ─────┐
-///                             ├─ compile ─►                ├─ Arc<DynamicFilterSlot>
+///                             ├─ compile ─►                ├─ Arc<BoundarySlot>
 ///     Input(slot_id = 4) ────┘             consumer ─────┘
 /// ```
 ///
@@ -57,7 +57,7 @@ use thiserror::Error;
 #[derive(Default)]
 pub(crate) struct RuntimeFilterSlots {
     /// Boundary-value slots (Top-N limits, join key bounds), by slot id.
-    boundary: HashMap<usize, Arc<DynamicFilterSlot>>,
+    boundary: HashMap<usize, Arc<BoundarySlot>>,
     /// Key-bitset slots, by slot id — a separate id space
     /// from `boundary`.
     key_bitset: HashMap<usize, Arc<KeyBitsetSlot>>,
@@ -66,11 +66,11 @@ pub(crate) struct RuntimeFilterSlots {
 impl RuntimeFilterSlots {
     /// Return the boundary cell named by `slot_id`, creating it if this is the
     /// first producer or consumer for that ID to compile.
-    pub(crate) fn boundary_slot(&mut self, slot_id: usize) -> Arc<DynamicFilterSlot> {
+    pub(crate) fn boundary_slot(&mut self, slot_id: usize) -> Arc<BoundarySlot> {
         Arc::clone(
             self.boundary
                 .entry(slot_id)
-                .or_insert_with(|| Arc::new(DynamicFilterSlot::new())),
+                .or_insert_with(|| Arc::new(BoundarySlot::new())),
         )
     }
 

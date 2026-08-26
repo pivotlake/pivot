@@ -74,8 +74,8 @@ use std::sync::atomic::AtomicUsize;
 use arrow_array::{BooleanArray, RecordBatch};
 use arrow_schema::Field;
 
+use crate::boundary_slot::BoundarySlot;
 use crate::memory::MultiSlabBuffer;
-use crate::operations::unary::DynamicFilterSlot;
 use crate::operations::unary::join::build_rows::BuildRows;
 use crate::operations::unary::join::directory::JoinDirectory;
 pub(crate) use factory::create_for_workers as create_join_factories;
@@ -164,16 +164,16 @@ pub struct JoinSpec {
 }
 
 /// One filter a join build publishes when it seals: the bounds of one build
-/// key column into a pair of [`DynamicFilterSlot`]s, and the key set itself
+/// key column into a pair of [`BoundarySlot`]s, and the key set itself
 /// as a [`KeyBitset`] when its shape allows one, all read by consumer scans.
 #[derive(Debug, Clone)]
 pub struct JoinBuildFilter {
     /// The build input column whose values are bounded (a join key column).
     pub build_column: usize,
     /// Receives the smallest non-null build key; consumers compare with `>=`.
-    pub min_slot: Arc<DynamicFilterSlot>,
+    pub min_slot: Arc<BoundarySlot>,
     /// Receives the largest non-null build key; consumers compare with `<=`.
-    pub max_slot: Arc<DynamicFilterSlot>,
+    pub max_slot: Arc<BoundarySlot>,
     /// Receives the sealed key set as an exact key bitset; consumers
     /// drop rows whose key it does not hold.
     pub key_bitset_slot: Arc<KeyBitsetSlot>,

@@ -74,6 +74,7 @@ pub mod waker;
 pub mod worker;
 
 mod api;
+mod boundary_slot;
 mod data_flow;
 mod functions;
 mod numa;
@@ -87,6 +88,7 @@ mod stats;
 use crate::waker::{WakerSet, WorkerWaker};
 use crate::worker::Worker;
 pub use api::*;
+pub use boundary_slot::BoundarySlot;
 pub use cpu_features::missing_cpu_features;
 pub use data_flow::{Error as DataFlowError, WorkStatus};
 pub use functions::*;
@@ -103,7 +105,6 @@ pub use memory::{MemoryContextFactory, init_memory_context, memory_ctx};
 pub use numa::{Topology, default_worker_count, dominant_node};
 pub use operations::channels::{MpscSender, Sender};
 pub use operations::nullary::Result as NullaryResult;
-pub use operations::unary::DynamicFilterSlot;
 pub use operations::unary::filter::{RowDelivery, RowSelection, collect_selected_indices};
 pub use operations::{
     JoinBuildFilter, JoinKind, JoinResidualFn, JoinResidualSpec, JoinSpec, KeyBitset,
