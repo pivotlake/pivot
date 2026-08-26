@@ -350,7 +350,7 @@ impl<K: Copy + Send, const OUTER_JOIN_BUILD_SIDE: bool> JoinBuilder<K, OUTER_JOI
                 .flat_map(|output| output.build_row_batches.iter())
                 .map(|batch| batch.column(filter.build_column));
             filter
-                .membership_slot
+                .key_bitset_slot
                 .publish(KeyBitset::try_build(key_arrays));
         }
 

@@ -1,4 +1,4 @@
-//! Exact membership filter over a hash join's build keys.
+//! Exact key bitset over a hash join's build keys.
 //!
 //! When an integer-keyed build seals, its key set is complete, and a scan
 //! feeding the probe side can drop rows whose key the build side does not
@@ -6,7 +6,7 @@
 //! into a cache-resident array. The filter is exact (one bit per value of the
 //! build key domain, offset by the minimum), so it never rejects a row that
 //! would have matched and correctness never depends on it — a consumer that
-//! finds its [`MembershipFilterSlot`] unarmed simply filters nothing.
+//! finds its [`KeyBitsetSlot`] unarmed simply filters nothing.
 
 use std::sync::{Arc, RwLock};
 
@@ -167,11 +167,11 @@ fn integer_values<'array>(
 /// consumers that read `None` filter nothing, so arming is an optimization
 /// and never a correctness event.
 #[derive(Debug, Default)]
-pub struct MembershipFilterSlot {
+pub struct KeyBitsetSlot {
     filter: RwLock<Option<Arc<KeyBitset>>>,
 }
 
-impl MembershipFilterSlot {
+impl KeyBitsetSlot {
     pub fn new() -> Self {
         Self::default()
     }
@@ -180,17 +180,14 @@ impl MembershipFilterSlot {
     /// shape or distribution made a filter not worth having) leaves it
     /// unarmed.
     pub fn publish(&self, filter: Option<KeyBitset>) {
-        *self
-            .filter
-            .write()
-            .expect("membership filter slot poisoned") = filter.map(Arc::new);
+        *self.filter.write().expect("key bitset slot poisoned") = filter.map(Arc::new);
     }
 
     /// The armed filter, or `None` while the build has not sealed one.
     pub fn get(&self) -> Option<Arc<KeyBitset>> {
         self.filter
             .read()
-            .expect("membership filter slot poisoned")
+            .expect("key bitset slot poisoned")
             .clone()
     }
 }

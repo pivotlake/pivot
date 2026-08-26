@@ -106,7 +106,7 @@ pub use operations::nullary::Result as NullaryResult;
 pub use operations::unary::filter::{RowDelivery, RowSelection, collect_selected_indices};
 pub use operations::{
     JoinBuildFilter, JoinKind, JoinResidualFn, JoinResidualSpec, JoinSpec, KeyBitset,
-    MembershipFilterSlot, RangeCompare, RangeJoinSpec,
+    KeyBitsetSlot, RangeCompare, RangeJoinSpec,
 };
 #[cfg(feature = "perf")]
 pub use profiler::worker_tids;

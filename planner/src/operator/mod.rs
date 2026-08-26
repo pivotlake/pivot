@@ -62,12 +62,10 @@ pub(crate) use table_function::{built_in_table_function, built_in_table_function
 pub use top_n::TopN;
 pub use values::Values;
 
-use crate::compile::{self, DynamicFilterSlots};
+use crate::compile;
 use crate::expression::{self, Expression};
 use crate::types::Type;
-use dispatch::{DynamicFilterSlot, MembershipFilterSlot};
 use std::fmt;
-use std::sync::Arc;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -91,33 +89,6 @@ pub enum Error {
     /// A DuckDB exception surfaced while reading the plan across the bridge.
     #[error("{0}")]
     Bridge(#[from] duckdb_planner::BridgeError),
-}
-
-/// Get-or-create the shared [`DynamicFilterSlot`] for `slot_id` within this
-/// compile. A producer ([`TopN`]) and the consumer scans ([`Input`])
-/// referencing the same id resolve to one `Arc`; a later compile of the same
-/// (cached) plan mints fresh, empty slots — so no stale boundary or pooled scan
-/// memory is reused.
-pub(super) fn slot_for(slots: &mut DynamicFilterSlots, slot_id: usize) -> Arc<DynamicFilterSlot> {
-    Arc::clone(
-        slots
-            .boundary
-            .entry(slot_id)
-            .or_insert_with(|| Arc::new(DynamicFilterSlot::new())),
-    )
-}
-
-/// The membership twin of [`slot_for`], over its own id space.
-pub(super) fn membership_slot_for(
-    slots: &mut DynamicFilterSlots,
-    slot_id: usize,
-) -> Arc<MembershipFilterSlot> {
-    Arc::clone(
-        slots
-            .membership
-            .entry(slot_id)
-            .or_insert_with(|| Arc::new(MembershipFilterSlot::new())),
-    )
 }
 
 /// An operator in the query plan.

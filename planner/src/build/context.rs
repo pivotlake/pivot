@@ -25,9 +25,9 @@ pub(super) struct BuildCtx {
     /// need no keyed lookup (each is wired to its producer and consumer at one
     /// site), only IDs disjoint from `dynamic_filter_slots`.
     join_filter_slot_count: usize,
-    /// How many membership-filter slots have been allocated. Their own id
-    /// space: membership slots live in a separate compile-time registry.
-    membership_filter_slot_count: usize,
+    /// How many key-bitset slots have been allocated. Their own id space:
+    /// key-bitset slots live in a separate compile-time registry.
+    key_bitset_slot_count: usize,
     /// The output shape of every CTE definition walked so far, keyed by its CTE
     /// index. A CTE scan has no child from which to obtain this information.
     cte_outputs: HashMap<usize, (Vec<Type>, Vec<bool>)>,
@@ -67,11 +67,10 @@ impl BuildCtx {
         slot_id
     }
 
-    /// Allocate a fresh membership-filter slot ID, in that registry's own id
-    /// space.
-    pub(super) fn allocate_membership_filter_slot(&mut self) -> usize {
-        let slot_id = self.membership_filter_slot_count;
-        self.membership_filter_slot_count += 1;
+    /// Allocate a fresh key-bitset slot ID, in that registry's own id space.
+    pub(super) fn allocate_key_bitset_slot(&mut self) -> usize {
+        let slot_id = self.key_bitset_slot_count;
+        self.key_bitset_slot_count += 1;
         slot_id
     }
 

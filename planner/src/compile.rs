@@ -13,7 +13,7 @@
 //!
 //! This module holds the cross-cutting compile infrastructure: the compile
 //! [`enum@Error`], the [`ExprResult`]/[`ExprFn`] closure types, the
-//! `DynamicFilterSlots` registry, and the recursive [`Plan`]/[`PlanNode`]
+//! [`RuntimeFilterSlots`] registry, and the recursive [`Plan`]/[`PlanNode`]
 //! walk. The per-operator `compile` impls live alongside their AST types in the
 //! [`operator`](crate::operator) submodules, and the per-expression `compile`
 //! impls producing [`ExprFn`]s live in the [`expression`](crate::expression)
@@ -25,14 +25,12 @@ use crate::expression::Expression;
 use crate::types::Type;
 use crate::{Plan, PlanNode};
 use arrow_array::{ArrayRef, Datum, RecordBatch, Scalar, UInt32Array};
-use dispatch::{
-    DataFlowDispatcher, DynamicFilterSlot, MembershipFilterSlot, RecordBatchOperatorSpec,
-};
+use dispatch::{DataFlowDispatcher, DynamicFilterSlot, KeyBitsetSlot, RecordBatchOperatorSpec};
 use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 
-/// Per-`compile` registry of dynamic-filter slots, keyed by `slot_id`.
+/// Per-`compile` registry of runtime-filter slots, keyed by `slot_id`.
 ///
 /// Each [`Plan::compile`] starts with an empty registry; the producer (`TopN`)
 /// and consumer (`Input`) for a given `slot_id` lazily get-or-create one shared
@@ -42,12 +40,32 @@ use thiserror::Error;
 /// boundary (or a slice of a previous run's pooled scan buffers) across
 /// executions.
 #[derive(Default)]
-pub(crate) struct DynamicFilterSlots {
+pub(crate) struct RuntimeFilterSlots {
     /// Boundary-value slots (Top-N limits, join key bounds), by slot id.
-    pub(crate) boundary: HashMap<usize, Arc<DynamicFilterSlot>>,
-    /// Membership slots (join key bitsets), by slot id — a separate id space
+    boundary: HashMap<usize, Arc<DynamicFilterSlot>>,
+    /// Key-bitset slots, by slot id — a separate id space
     /// from `boundary`.
-    pub(crate) membership: HashMap<usize, Arc<MembershipFilterSlot>>,
+    key_bitset: HashMap<usize, Arc<KeyBitsetSlot>>,
+}
+
+impl RuntimeFilterSlots {
+    /// Get or create the shared boundary slot for `slot_id` within this compile.
+    pub(crate) fn boundary_slot(&mut self, slot_id: usize) -> Arc<DynamicFilterSlot> {
+        Arc::clone(
+            self.boundary
+                .entry(slot_id)
+                .or_insert_with(|| Arc::new(DynamicFilterSlot::new())),
+        )
+    }
+
+    /// Get or create the shared key-bitset slot in its separate ID space.
+    pub(crate) fn key_bitset_slot(&mut self, slot_id: usize) -> Arc<KeyBitsetSlot> {
+        Arc::clone(
+            self.key_bitset
+                .entry(slot_id)
+                .or_insert_with(|| Arc::new(KeyBitsetSlot::new())),
+        )
+    }
 }
 
 #[derive(Debug, Error)]
@@ -166,7 +184,7 @@ impl Plan {
         // DDL resolves through `transaction`. Scans carry their planning
         // snapshot. A cached plan reaches this compile only after the server
         // verifies that every recorded table revision matches this transaction.
-        let mut slots = DynamicFilterSlots::default();
+        let mut slots = RuntimeFilterSlots::default();
         let compiled = self.root.compile(dispatcher, transaction, &mut slots)?;
         Ok(stamp_output_names(compiled, &self.output_names))
     }
@@ -235,7 +253,7 @@ impl PlanNode {
         &self,
         dispatcher: &DataFlowDispatcher,
         transaction: &dyn CatalogTransaction,
-        slots: &mut DynamicFilterSlots,
+        slots: &mut RuntimeFilterSlots,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         // Peephole: an unfiltered global MIN/MAX or COUNT(*) over a bare scan is
         // fully determined by table metadata (e.g. parquet row-group

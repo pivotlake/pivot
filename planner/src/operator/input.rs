@@ -1,9 +1,8 @@
 //! [`Input`] — scans a [`BoundTable`] from the catalog.
 
-use super::{membership_slot_for, slot_for};
 use crate::catalog::{BoundTable, DynamicScanPredicate};
-use crate::compile::{DynamicFilterSlots, Error};
-use crate::dynamic_filter::{DynamicFilter, JoinFilterScanInfo, MembershipFilter};
+use crate::compile::{Error, RuntimeFilterSlots};
+use crate::dynamic_filter::{DynamicFilter, JoinFilterScanInfo, KeyBitsetFilter};
 use crate::expression::{Expression, Function, Ref, VariantGet};
 use crate::operator::Projection;
 use crate::types::{Type, physical_arrow_type};
@@ -23,11 +22,9 @@ pub struct Input {
     /// by a Top-N or a hash join elsewhere in the plan. Each prunes row groups
     /// against the producer's live boundary value.
     pub dynamic_filters: Vec<DynamicFilter>,
-    /// Membership filters installed by hash joins above: each drops rows whose
-    /// key column value the producing build's sealed key set does not hold, in
-    /// a filter stage directly above the scan — below every join, so the join
-    /// order never delays them.
-    pub membership_filters: Vec<MembershipFilter>,
+    /// Key-bitset filters installed by the build sides of the hash joins above this input. This
+    /// allows early filtering of probe rows
+    pub key_bitset_filters: Vec<KeyBitsetFilter>,
     /// The DuckDB binding table index of the get this scan was built from,
     /// which plan-level references (e.g. a join's filter-pushdown targets)
     /// name the scan by. `None` for a scan that has no DuckDB origin (built
@@ -59,14 +56,14 @@ impl fmt::Display for Input {
                 .join(", ");
             write!(f, ", dynamic: [{filters}]")?;
         }
-        if !self.membership_filters.is_empty() {
+        if !self.key_bitset_filters.is_empty() {
             let filters = self
-                .membership_filters
+                .key_bitset_filters
                 .iter()
                 .map(|filter| format!("#{} in build keys", filter.column_idx))
                 .collect::<Vec<_>>()
                 .join(", ");
-            write!(f, ", membership: [{filters}]")?;
+            write!(f, ", key bitsets: [{filters}]")?;
         }
         write!(f, ")")
     }
@@ -76,7 +73,7 @@ impl Input {
     pub(crate) fn compile(
         &self,
         dispatcher: &DataFlowDispatcher,
-        slots: &mut DynamicFilterSlots,
+        slots: &mut RuntimeFilterSlots,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         let (projection, extract_projection) =
             plan_scan_projection(&self.columns, self.table.as_ref())?;
@@ -90,23 +87,23 @@ impl Input {
                 self.emit_row_group_metadata,
             )
             .map_err(Error::TableScan)?;
-        let scan = self.attach_membership_filters(scan, slots);
+        let scan = self.attach_key_bitset_filters(scan, slots);
         match extract_projection {
             Some(extract_projection) => extract_projection.compile(scan),
             None => Ok(scan),
         }
     }
 
-    /// Chain each membership filter directly above the scan: a row whose key
+    /// Chain each key-bitset filter directly above the scan: a row whose key
     /// the sealed build set does not hold dies here, before any other operator
     /// sees it. Until the producing join's build seals, the slot is unarmed
     /// and every row passes, so the filter is never a correctness event.
-    fn attach_membership_filters(
+    fn attach_key_bitset_filters(
         &self,
         mut scan: RecordBatchOperatorSpec,
-        slots: &mut DynamicFilterSlots,
+        slots: &mut RuntimeFilterSlots,
     ) -> RecordBatchOperatorSpec {
-        for filter in &self.membership_filters {
+        for filter in &self.key_bitset_filters {
             // The filter reads the scan's output positionally; find where the
             // storage column landed, counting only entries that emit an
             // output (the COUNT(*) sentinel refs emit none). A plan naming a
@@ -127,7 +124,7 @@ impl Input {
             let Some(position) = position else {
                 continue;
             };
-            let slot = membership_slot_for(slots, filter.slot_id);
+            let slot = slots.key_bitset_slot(filter.slot_id);
             scan = scan.filter(move || {
                 let slot = std::sync::Arc::clone(&slot);
                 move |batch: &arrow_array::RecordBatch,
@@ -266,14 +263,14 @@ pub(crate) fn describe_scan_columns(table: &dyn BoundTable, columns: &[Expressio
 /// (e.g. row-group) elimination is the storage backend's job.
 pub(crate) fn build_dynamic_scan_predicates(
     filters: &[DynamicFilter],
-    slots: &mut DynamicFilterSlots,
+    slots: &mut RuntimeFilterSlots,
 ) -> Vec<DynamicScanPredicate> {
     filters
         .iter()
         .map(|df| DynamicScanPredicate {
             column_idx: df.column_idx,
             compare_type: df.compare_type,
-            slot: slot_for(slots, df.slot_id),
+            slot: slots.boundary_slot(df.slot_id),
         })
         .collect()
 }

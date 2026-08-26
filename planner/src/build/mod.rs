@@ -26,7 +26,7 @@ use duckdb_planner::handle::{
 };
 
 use crate::catalog::BoundTable;
-use crate::dynamic_filter::{DynamicFilter, JoinProducedFilter, MembershipFilter};
+use crate::dynamic_filter::{DynamicFilter, JoinProducedFilter, KeyBitsetFilter};
 use crate::expression::{
     Cast, Compare, CompareType, Error as ExpressionError, Expression, Function, Ref, VariantGet,
 };
@@ -583,7 +583,7 @@ fn build_join(
             };
             let min_slot_id = ctx.allocate_join_filter_slot();
             let max_slot_id = ctx.allocate_join_filter_slot();
-            let membership_slot_id = ctx.allocate_membership_filter_slot();
+            let key_bitset_slot_id = ctx.allocate_key_bitset_slot();
             scan.dynamic_filters.push(DynamicFilter {
                 slot_id: min_slot_id,
                 column_idx: storage_column,
@@ -594,15 +594,15 @@ fn build_join(
                 column_idx: storage_column,
                 compare_type: CompareType::LessEqual,
             });
-            scan.membership_filters.push(MembershipFilter {
-                slot_id: membership_slot_id,
+            scan.key_bitset_filters.push(KeyBitsetFilter {
+                slot_id: key_bitset_slot_id,
                 column_idx: storage_column,
             });
             produced_filters.push(JoinProducedFilter {
                 key_position,
                 min_slot_id,
                 max_slot_id,
-                membership_slot_id,
+                key_bitset_slot_id,
             });
         }
     }

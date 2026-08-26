@@ -37,17 +37,17 @@ pub struct JoinProducedFilter {
     /// Slot the build key maximum is published into; its consumers compare
     /// with `<=`.
     pub max_slot_id: usize,
-    /// Slot the build key set is published into as an exact membership
-    /// filter, when its shape allows one; consumer scans drop rows whose key
+    /// Slot the build key set is published into as an exact key bitset, when
+    /// its shape allows one; consumer scans drop rows whose key
     /// it does not hold. Its own id space, separate from the boundary slots.
-    pub membership_slot_id: usize,
+    pub key_bitset_slot_id: usize,
 }
 
-/// A membership-filter consumer on a scan: rows whose `column_idx` value the
+/// A key-bitset consumer on a scan: rows whose `column_idx` value the
 /// slot's sealed key set does not hold are dropped directly above the scan,
 /// before any other operator sees them.
 #[derive(Debug)]
-pub struct MembershipFilter {
+pub struct KeyBitsetFilter {
     pub slot_id: usize,
     pub column_idx: usize,
 }

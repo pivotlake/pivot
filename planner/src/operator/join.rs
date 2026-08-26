@@ -17,8 +17,7 @@
 //! always keeps rows of its left child, the probe, because its cost model
 //! wants the subquery it came from, being the smaller side, on the build side.
 
-use super::{membership_slot_for, slot_for};
-use crate::compile::{DynamicFilterSlots, Error, ExprEvalFn};
+use crate::compile::{Error, ExprEvalFn, RuntimeFilterSlots};
 use crate::dynamic_filter::JoinProducedFilter;
 use crate::expression::Expression;
 use crate::types::{Type, physical_arrow_type};
@@ -169,7 +168,7 @@ impl Join {
         probe: RecordBatchOperatorSpec,
         build: RecordBatchOperatorSpec,
         normalize_build_variants: bool,
-        slots: &mut DynamicFilterSlots,
+        slots: &mut RuntimeFilterSlots,
     ) -> Result<RecordBatchOperatorSpec, Error> {
         // Both sides' output fields, named by position: an outer join
         // synthesizes NULL values for its non-preserved side, so field names
@@ -236,9 +235,9 @@ impl Join {
             .iter()
             .map(|filter| JoinBuildFilter {
                 build_column: self.build_keys[filter.key_position],
-                min_slot: slot_for(slots, filter.min_slot_id),
-                max_slot: slot_for(slots, filter.max_slot_id),
-                membership_slot: membership_slot_for(slots, filter.membership_slot_id),
+                min_slot: slots.boundary_slot(filter.min_slot_id),
+                max_slot: slots.boundary_slot(filter.max_slot_id),
+                key_bitset_slot: slots.key_bitset_slot(filter.key_bitset_slot_id),
             })
             .collect();
         let spec = JoinSpec {

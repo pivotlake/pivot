@@ -11,7 +11,7 @@ use arrow_schema::{DataType, Field, Schema};
 use common::*;
 use dispatch::{
     AggregationKind, AggregationSlot, DynamicFilterSlot, JoinBuildFilter, JoinKind, JoinResidualFn,
-    JoinResidualSpec, JoinSpec, MembershipFilterSlot, values_input,
+    JoinResidualSpec, JoinSpec, KeyBitsetSlot, values_input,
 };
 
 /// Non-nullable `Int64` output fields, which is what every column of these
@@ -1143,13 +1143,13 @@ fn a_build_filter_publishes_the_key_bounds() {
     let build = int64_batch("key", &[42, 7, 19]);
     let min_slot = Arc::new(DynamicFilterSlot::new());
     let max_slot = Arc::new(DynamicFilterSlot::new());
-    let membership_slot = Arc::new(MembershipFilterSlot::new());
+    let key_bitset_slot = Arc::new(KeyBitsetSlot::new());
     let mut spec = inner_join(vec![0], vec![0]);
     spec.build_filters = vec![JoinBuildFilter {
         build_column: 0,
         min_slot: min_slot.clone(),
         max_slot: max_slot.clone(),
-        membership_slot: membership_slot.clone(),
+        key_bitset_slot: key_bitset_slot.clone(),
     }];
 
     let d = dispatch(2);
@@ -1162,7 +1162,7 @@ fn a_build_filter_publishes_the_key_bounds() {
 
     assert_eq!(boundary_i64(&min_slot), 7);
     assert_eq!(boundary_i64(&max_slot), 42);
-    let bitset = membership_slot.get().expect("sparse keys seal a bitset");
+    let bitset = key_bitset_slot.get().expect("sparse keys seal a bitset");
     let mut survivors = Vec::new();
     let probe_keys: ArrayRef = Arc::new(Int64Array::from(vec![6, 7, 19, 42, 43]));
     bitset.select(&probe_keys, &mut survivors);

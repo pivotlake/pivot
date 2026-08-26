@@ -56,7 +56,7 @@ mod directory;
 mod factory;
 mod key_bitset;
 pub use factory::JoinRecordBatchOperatorFactory;
-pub use key_bitset::{KeyBitset, MembershipFilterSlot};
+pub use key_bitset::{KeyBitset, KeyBitsetSlot};
 mod keys;
 pub use keys::{DynamicRowKey, JoinKey, PackedKey, SingleColumnKey};
 mod match_outputter;
@@ -174,9 +174,9 @@ pub struct JoinBuildFilter {
     pub min_slot: Arc<DynamicFilterSlot>,
     /// Receives the largest non-null build key; consumers compare with `<=`.
     pub max_slot: Arc<DynamicFilterSlot>,
-    /// Receives the sealed key set as an exact membership filter; consumers
+    /// Receives the sealed key set as an exact key bitset; consumers
     /// drop rows whose key it does not hold.
-    pub membership_slot: Arc<MembershipFilterSlot>,
+    pub key_bitset_slot: Arc<KeyBitsetSlot>,
 }
 
 /// One evaluation instance of a join's residual predicate: batch of paired
