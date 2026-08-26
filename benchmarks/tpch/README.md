@@ -6,13 +6,13 @@ pivot's join executor lives in `../tpch-flat`.)
 
 ## Data
 
-The datasets are pre-generated (tpchgen-cli) and hosted at `s3://epsio-tpch/`:
+The datasets are pre-generated (tpchgen-cli) and hosted at `s3://pivot-benchmarks/tpch/`:
 
 | Dataset | Path | Size |
 |---|---|---|
-| SF10 | `s3://epsio-tpch/sf10/` | ~3.9 GB |
-| SF100, 7 MiB row groups | `s3://epsio-tpch/sf100/` | ~41.5 GB |
-| SF100, 128 MiB row groups | `s3://epsio-tpch/sf100-large-row-groups/` | ~35.8 GB |
+| SF10 | `s3://pivot-benchmarks/tpch/sf10/` | ~3.9 GB |
+| SF100, 7 MiB row groups | `s3://pivot-benchmarks/tpch/sf100/` | ~41.5 GB |
+| SF100, 128 MiB row groups | `s3://pivot-benchmarks/tpch/sf100-large-row-groups/` | ~35.8 GB |
 
 ```sh
 ./prep-tpch-data.sh --dataset sf100        # → ~/tpch-sf100
