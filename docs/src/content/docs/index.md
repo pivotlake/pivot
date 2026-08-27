@@ -131,14 +131,14 @@ Pivot is a high-performance analytics engine that runs on open data formats. It 
 
 #### Key features
 - **Fast** - Written in Rust and built on state-of-the-art columnar execution techniques, including morsel-driven parallelism, SIMD, NUMA-aware execution, and cache-conscious aggregation and joins, with a few novel optimizations (#Why-is-pivot-fast?).
+- **Open** - Pivot is open source and built on open data formats (Delta Lake, with Iceberg coming soon). This means you can use Pivot with data already stored in your data warehouse, while data ingested by Pivot remains accessible to other query engines.
 - **Scalable** - With object storage as its backing store, Pivot can be scaled up, down, or to zero almost instantly.
 - **Portable** -     Pivot can run both as a server serving backends and clients, or as a local engine where users and agents query the source of truth directly—allowing local ad-hoc and agentic analytics to share the same engine and architecture as traditional dashboards and in-app analytics
-- **Open** - Pivot is open source and built on open data formats (Delta Lake, with Iceberg coming soon). This means you can use Pivot with data already stored in your data warehouse, while data ingested by Pivot remains accessible to other query engines.
 
 ### Project status
 
-Pivot is in early development and is not production ready. It is meant for
-evaluation, experiments and local analysis today.
+Pivot is in early development and is not production ready. It is currently meant for
+evaluation, experiments and local analysis.
 
 - **Breaking changes.** SQL surface, configuration keys, wire behaviour and
   the on-disk layout change between releases, with no migration path and no
@@ -150,7 +150,7 @@ evaluation, experiments and local analysis today.
 ### Where to start
 
 - [Quickstart](/docs/quickstart/) runs a server and issues a first query.
-- [Architecture](/docs/database/architecture/) explains how a query becomes
-  work across the dispatch pool.
+- [Architecture](/docs/database/architecture/) compares standalone, server,
+  and replicated-server deployments.
 - [Reference](/docs/reference/) lists supported SQL, functions, data types,
   system tables, and configuration.

@@ -15,9 +15,22 @@
   --sl-content-width: 48rem;
   --sl-sidebar-width: 18.5rem;
   --sl-nav-height: 3.75rem;
-  --sl-text-body: 0.9375rem;
-  --sl-text-code: 0.8125rem;
+  --sl-text-body: 0.875rem;
+  --sl-text-body-sm: 0.8125rem;
+  --sl-text-code: 0.78125rem;
+  --sl-text-code-sm: 0.75rem;
   --sl-line-height: 1.7;
+
+  /* A tighter heading scale than Starlight's. Its default runs to 42px against
+     a 14px body, and at that ratio a monospace page reads as a stack of
+     titles. These sizes hold for every breakpoint: Starlight's own responsive
+     overrides sit in a cascade layer, so an unlayered `:root` outranks them. */
+  --sl-text-h1: 1.75rem;
+  --sl-text-h2: 1.375rem;
+  --sl-text-h3: 1.125rem;
+  --sl-text-h4: 1rem;
+  --sl-text-h5: 0.9375rem;
+  --sl-line-height-headings: 1.3;
 }
 
 /* Dark theme, the default for a reader who has not used the toggle. */
