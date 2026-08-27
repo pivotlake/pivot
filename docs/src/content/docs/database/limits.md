@@ -2,7 +2,7 @@
 title: Limits
 description: Sizes and counts the engine enforces.
 sidebar:
-  order: 2
+  order: 3
 ---
 
 | Limit | Value |

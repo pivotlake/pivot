@@ -73,6 +73,10 @@ export default defineConfig({
         { label: "Introduction", slug: "index" },
         { label: "Quickstart", slug: "quickstart" },
         {
+          label: "Use cases",
+          items: [{ autogenerate: { directory: "use-cases" } }],
+        },
+        {
           label: "Database",
           items: [{ autogenerate: { directory: "database" } }],
         },

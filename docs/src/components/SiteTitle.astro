@@ -1,20 +1,21 @@
 ---
-// The wordmark and its cursor are separate: the cursor is a plain rectangle in
-// the source artwork, so redrawing it as an element keeps it crisp at any size.
-// Its size and offset are expressed as fractions of the wordmark's height,
-// taken from the artwork, so the two stay locked together at any rendered
-// size.
+// The supplied logo includes transparent canvas around the artwork. It is
+// clipped at render time so the visible wordmark retains the header's original
+// size without modifying the source asset.
 import wordmark from "../assets/pivot-wordmark.png";
-import wordmarkDark from "../assets/pivot-wordmark-dark.png";
 
 const { siteTitleHref } = Astro.locals.starlightRoute;
 ---
 
 <a href={siteTitleHref} class="site-title sl-flex" aria-label="pivotdb">
   <span class="wordmark">
-    <img class="light:sl-hidden print:hidden" alt="" src={wordmarkDark.src} />
-    <img class="dark:sl-hidden print:block" alt="" src={wordmark.src} />
-    <span class="cursor" aria-hidden="true"></span>
+    <span class="logo-crop">
+      <img class="dark-logo light:sl-hidden print:hidden" alt="" src={wordmark.src} />
+      <img class="dark:sl-hidden print:block" alt="" src={wordmark.src} />
+      <span class="dark-accents light:sl-hidden print:hidden" aria-hidden="true">
+        <span class="accent-cursor"></span>
+      </span>
+    </span>
   </span>
 </a>
 
@@ -27,21 +28,44 @@ const { siteTitleHref } = Astro.locals.starlightRoute;
 
   .wordmark {
     --logo-height: 1.375rem;
-    display: flex;
-    align-items: flex-end;
-    /* Fractions of the wordmark height, measured off the source artwork. */
-    gap: calc(var(--logo-height) * 0.248);
+    display: block;
   }
 
-  .wordmark img {
+  .logo-crop {
+    position: relative;
+    display: block;
     height: var(--logo-height);
+    width: calc(var(--logo-height) * 3.644);
+    overflow: hidden;
+  }
+
+  .logo-crop img {
+    position: absolute;
+    top: calc(var(--logo-height) * -0.238);
+    left: calc(var(--logo-height) * -0.079);
+    height: calc(var(--logo-height) * 1.366);
     width: auto;
   }
 
-  .cursor {
-    width: calc(var(--logo-height) * 0.594);
-    height: calc(var(--logo-height) * 0.178);
-    margin-bottom: calc(var(--logo-height) * 0.089);
+  .dark-logo {
+    filter: invert(1);
+  }
+
+  .dark-accents,
+  .accent-cursor {
+    position: absolute;
+    display: block;
+  }
+
+  .dark-accents {
+    inset: 0;
+  }
+
+  .accent-cursor {
+    top: calc(var(--logo-height) * 0.832);
+    left: calc(var(--logo-height) * 3.089);
+    width: calc(var(--logo-height) * 0.554);
+    height: calc(var(--logo-height) * 0.099);
     background-color: #3b4fe0;
   }
 </style>
