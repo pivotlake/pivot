@@ -106,25 +106,17 @@ build_side() {
         return 1
     fi
     local server="$tree/benchmarks/target-pgouse/$host_target/release/pivot"
-    # Tripwire for the profile applying at all: the decode family's
-    # monomorphization hashes in the built server must appear in the profile
-    # it was compiled against. Zero overlap means the server was built outside
-    # the profiled symbol universe and is effectively un-PGOed, which is
-    # silent at compile time and shows up only as a mystery regression.
-    local family="RleDecoder4read"
-    local binary_hashes profile_hashes covered
-    binary_hashes=$(nm "$server" | grep "$family" | grep -oE '17h[0-9a-f]+E' | sort -u)
-    if [[ -n "$binary_hashes" ]]; then
-        profile_hashes=$("$llvm_profdata" show -all-functions "$pgo/merged.profdata" \
-            2>/dev/null | grep "$family" | grep -oE '17h[0-9a-f]+E' | sort -u)
-        covered=$(comm -12 <(printf '%s\n' "$binary_hashes") \
-                           <(printf '%s\n' "$profile_hashes") | wc -l)
-        if [[ "$covered" -eq 0 ]]; then
-            echo "error: the $side server shares no $family symbols with its profile;" >&2
-            echo "       the profile did not apply and the binary is effectively un-PGOed" >&2
-            return 1
-        fi
-        echo "$side server: $covered $family monomorphizations carry profile records" >&2
+    # Tripwire for the profile applying at all: the shared pgo-verify recipe
+    # (pgo.just), taken from the tree that built this side. This script is
+    # shipped standalone to the box's /tmp, so it cannot address a justfile
+    # relative to itself; the tree can, and a tree that predates the recipe
+    # is skipped with a note rather than failed on a recipe it never had.
+    local justfile="$tree/benchmarks/justfile"
+    if ! just --justfile "$justfile" --show pgo-verify >/dev/null 2>&1; then
+        echo "$side server: its tree has no pgo-verify recipe, skipping the profile-overlap check" >&2
+    elif ! just --justfile "$justfile" pgo-verify "$server" "$pgo/merged.profdata" >&2; then
+        echo "error: the $side server failed the profile-overlap check" >&2
+        return 1
     fi
     printf '%s' "$server"
 }

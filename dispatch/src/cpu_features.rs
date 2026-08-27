@@ -1,8 +1,8 @@
 //! Startup check for CPU features enabled at compile time.
 //!
 //! Linux aarch64 and x86_64 builds set an instruction floor above the target
-//! default, while PGO may add `-Ctarget-cpu=native`. Unsupported instructions
-//! would otherwise cause a late `SIGILL` in hot code.
+//! default, and a local build may raise it further (`-Ctarget-cpu=native`).
+//! Unsupported instructions would otherwise cause a late `SIGILL` in hot code.
 //! [`Dispatch::spin_up`](crate::Dispatch::spin_up) checks first and reports
 //! the missing feature before workers start.
 //!
@@ -69,9 +69,8 @@ pub fn missing_cpu_features() -> Vec<&'static str> {
     require!("rcpc", hwcap, libc::HWCAP_LRCPC);
     require!("bf16", hwcap2, HWCAP2_BF16);
 
-    // Above the floor: what `-Ctarget-cpu=native` adds on the Neoverse cores the
-    // benchmark and PGO builds are tuned for. Unset in a floor build, so these
-    // arms cost nothing there.
+    // Above the floor: what a `-Ctarget-cpu=native` build picks up on Neoverse
+    // cores. Unset in a floor build, so these arms cost nothing there.
     require!("lse2", hwcap, libc::HWCAP_USCAT);
     require!("rcpc2", hwcap, libc::HWCAP_ILRCPC);
     require!("fp16", hwcap, libc::HWCAP_ASIMDHP);

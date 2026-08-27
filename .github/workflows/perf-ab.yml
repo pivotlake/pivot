@@ -291,33 +291,10 @@ jobs:
             --exclude='clickbench-src')
           ssh perf 'mkdir -p ~/perf-ab'
 
-          # The PGO recipes build with -Ctarget-cpu=native, and cargo
-          # fingerprints that literal string, not the CPU it resolves to. The
-          # x86 box serves several instance types (Zen 4, Milan, Cascade Lake,
-          # Ice Lake, Sapphire Rapids), so warm target dirs from a previous
-          # run can hold instructions this run's CPU does not have; reusing
-          # them makes the server SIGILL at startup. Stamp the CPU model next
-          # to the caches and wipe them whenever it changes.
-          ssh perf '
-            cpu=$(grep -m1 "model name" /proc/cpuinfo)
-            prev=$(cat ~/perf-ab/.built-on-cpu 2>/dev/null || true)
-            if [ "$cpu" != "$prev" ]; then
-              echo "CPU changed since last build; dropping warm target dirs."
-              echo "  was: ${prev:-<none>}"
-              echo "  now: $cpu"
-              rm -rf ~/perf-ab/before/target-pgogen ~/perf-ab/before/target-pgouse \
-                     ~/perf-ab/before/target-client ~/perf-ab/after/target-pgogen \
-                     ~/perf-ab/after/target-pgouse ~/perf-ab/after/target-client \
-                     ~/perf-ab/before/benchmarks/target-pgogen \
-                     ~/perf-ab/before/benchmarks/target-pgouse \
-                     ~/perf-ab/before/benchmarks/target-client \
-                     ~/perf-ab/after/benchmarks/target-pgogen \
-                     ~/perf-ab/after/benchmarks/target-pgouse \
-                     ~/perf-ab/after/benchmarks/target-client \
-                     ~/perf-ab/pgo-before ~/perf-ab/pgo-after
-              printf "%s" "$cpu" > ~/perf-ab/.built-on-cpu
-            fi
-          '
+          # The PGO recipes build at the shipped instruction floor
+          # (x86-64-v3 / the aarch64 feature list, see pgo.just), so warm
+          # target dirs are valid on every instance type the box serves and
+          # survive a CPU change.
 
           # AFTER first (already checked out at the run's commit), then BEFORE.
           git checkout --quiet --force "$AFTER_SHA"

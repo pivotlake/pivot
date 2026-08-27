@@ -12,7 +12,8 @@
 # step (dispatch/src/cpu_features.rs).
 #
 # An explicit `RUSTFLAGS` REPLACES this list rather than adding to it, which is
-# what lets the PGO recipes build with `-Ctarget-cpu=native` (pgo.just).
+# why the PGO recipes (pgo.just) restate this floor next to their profile
+# flags - keep the two in step.
 [target.aarch64-unknown-linux-gnu]
 rustflags = [
     "-Ctarget-feature=+lse,+crc,+rdm,+dpb,+neon,+aes,+sha2,+dotprod,+ssbs,+rcpc,+bf16",
@@ -34,8 +35,8 @@ rustflags = [
 # `dispatch::missing_cpu_features` refuses to start on one - keep the level in
 # step (dispatch/src/cpu_features.rs).
 #
-# As above, an explicit `RUSTFLAGS` REPLACES this, which is what lets the PGO
-# recipes build with `-Ctarget-cpu=native` (pgo.just).
+# As above, an explicit `RUSTFLAGS` REPLACES this, which is why the PGO
+# recipes (pgo.just) restate it - keep the two in step.
 [target.x86_64-unknown-linux-gnu]
 rustflags = [
     "-Ctarget-cpu=x86-64-v3",
