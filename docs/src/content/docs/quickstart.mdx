@@ -8,24 +8,6 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 ### 1. Start Pivot
 
 <Tabs>
-  <TabItem label="Docker">
-    **Best for:** starting a pivot server quickly.
-
-    ```sh
-    docker run --rm --name pivot \
-      -p 5432:5432 \
-      -v pivot-data:/var/lib/pivot \
-      pivotlake/pivot:latest
-    ```
-
-    The named volume keeps your data between runs. In a second terminal,
-    connect with any Postgres client:
-
-    ```sh
-    psql -h 127.0.0.1 -p 5432 -U pivot
-    ```
-  </TabItem>
-
   <TabItem label="Local shell">
     **Best for:** querying an S3 datastore directly without running a server or
     installing `psql`.
@@ -51,8 +33,35 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
     exit with `\q`.
   </TabItem>
 
-  <TabItem label="Linux service">
-    **Best for:** a persistent database endpoint for applications, BI tools,
+  <TabItem label="Docker">
+    **Best for:** launching a server with minimal setup.
+
+    Start the server with the S3 location, AWS credentials, and region:
+
+    ```sh
+    docker run --rm --name pivot \
+      -p 5432:5432 \
+      -e PIVOT_DATASTORE=s3://my-bucket/pivot-data \
+      -e AWS_ACCESS_KEY_ID=your-access-key-id \
+      -e AWS_SECRET_ACCESS_KEY=your-secret-access-key \
+      -e AWS_REGION=us-east-1 \
+      pivotlake/pivot:latest
+    ```
+
+    The image generates a metastore for the S3 location on startup, while the
+    datastore itself remains in S3 after the container exits. In a second
+    terminal, connect with any Postgres client:
+
+    ```sh
+    psql -h 127.0.0.1 -p 5432 -U pivot
+    ```
+
+    For MinIO or another S3-compatible service, add
+    `-e AWS_ENDPOINT_URL=http://minio:9000`.
+  </TabItem>
+
+  <TabItem label="Linux server">
+    **Best for:** a persistent production database endpoint for applications, BI tools,
     and other Postgres clients.
 
     Install Pivot from the Debian or Ubuntu package repository:

@@ -5,32 +5,20 @@ sidebar:
   order: 1
 ---
 
-Pivot separates the metadata needed to operate a server from the data and table
-metadata needed to run queries. The distinction makes the same execution engine
-usable for a local database, object storage, or multiple servers sharing one
-storage layer.
+Pivot separates the metadata required to operate a server from the data and table metadata required to execute queries. This allows a local CLI session to access the same data and tables as a cluster serving clients, while maintaining separate authentication and server configurations.
 
 <figure class="arch-figure">
-<svg viewBox="0 0 920 648" role="img" aria-labelledby="map-title map-desc">
-<title id="map-title">Pivot server architecture</title>
-<desc id="map-desc">SQL clients reach the Pivot server over the Postgres wire. Inside the server, the catalog holds a snapshot per query, the planner binds and prunes against it, and the dispatch pool runs the scan on worker threads. The metastore supplies configuration and identity to the server; the datastore is the transactional data source the server scans and commits to, layered as a Pivot manifest, a Delta log, and Parquet files.</desc>
+<svg viewBox="0 0 920 492" role="img" aria-labelledby="map-title map-desc">
+<title id="map-title">Pivot architecture</title>
+<desc id="map-desc">Inside Pivot, the catalog holds a snapshot per query, the planner binds and prunes against it, and the dispatch pool runs the scan on worker threads. The metastore supplies configuration and identity to Pivot; the datastore is the transactional data source Pivot scans and commits to, layered as a Pivot manifest, a Delta log, and Parquet files.</desc>
 <defs>
 <marker id="map-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
 <path d="M0,0 L10,5 L0,10 z" class="arch-arrowhead" />
 </marker>
 </defs>
-<rect x="280" y="24" width="360" height="84" rx="3" class="arch-panel" />
-<text x="304" y="54" class="arch-title">SQL clients</text>
-<rect x="304" y="62" width="56" height="26" rx="2" class="arch-inner" />
-<text x="332" y="79" text-anchor="middle" class="arch-muted">psql</text>
-<rect x="370" y="62" width="110" height="26" rx="2" class="arch-inner" />
-<text x="425" y="79" text-anchor="middle" class="arch-muted">backends</text>
-<rect x="490" y="62" width="80" height="26" rx="2" class="arch-inner" />
-<text x="530" y="79" text-anchor="middle" class="arch-muted">BI tools</text>
-<line x1="460" y1="108" x2="460" y2="176" class="arch-line" marker-end="url(#map-head)" />
-<text x="474" y="146" class="arch-muted">Postgres wire</text>
+<g transform="translate(0 -156)">
 <rect x="40" y="180" width="840" height="200" rx="3" class="arch-panel" />
-<text x="64" y="210" class="arch-title">Pivot server</text>
+<text x="64" y="210" class="arch-title">Pivot</text>
 <text x="856" y="210" text-anchor="end" class="arch-muted">one process · one worker pool</text>
 <rect x="64" y="224" width="240" height="104" rx="2" class="arch-inner" />
 <rect x="65" y="225" width="238" height="23" class="arch-strip" />
@@ -104,6 +92,7 @@ storage layer.
 <rect x="500" y="578" width="356" height="26" rx="2" class="arch-inner" />
 <text x="512" y="595" class="arch-tiny">parquet files</text>
 <text x="844" y="595" text-anchor="end" class="arch-tiny">columns + statistics</text>
+</g>
 </svg>
 </figure>
 

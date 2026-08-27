@@ -11,6 +11,7 @@ export default defineConfig({
     starlight({
       title: "pivotdb",
       description: "Documentation for pivotdb, a columnar analytics engine.",
+      favicon: "/pivot-favicon.png",
       customCss: ["./src/styles/theme.css"],
       tableOfContents: { minHeadingLevel: 3, maxHeadingLevel: 4 },
       // Puts the pre-release banner on every page. Starlight has no site-wide
@@ -86,12 +87,12 @@ export default defineConfig({
         { label: "Introduction", slug: "index" },
         { label: "Quickstart", slug: "quickstart" },
         {
-          label: "Use cases",
-          items: [{ autogenerate: { directory: "use-cases" } }],
-        },
-        {
           label: "Database",
           items: [{ autogenerate: { directory: "database" } }],
+        },
+        {
+          label: "Use cases",
+          items: [{ autogenerate: { directory: "use-cases" } }],
         },
         {
           label: "Reference",

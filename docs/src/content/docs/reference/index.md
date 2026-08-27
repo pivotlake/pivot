@@ -2,6 +2,7 @@
 title: Reference overview
 description: Entry points for pivotdb SQL, functions, types, metadata, and configuration.
 sidebar:
+  hidden: true
   order: 0
 ---
 

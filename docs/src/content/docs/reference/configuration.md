@@ -90,6 +90,26 @@ The config's entries and the file's are served together. A name defined in
 both is a startup error, and `CREATE USER` refuses a name the config defines,
 because the server never rewrites the config.
 
+### Docker image bootstrap
+
+On the first server start, the `pivotlake/pivot` image creates
+`/var/lib/pivot/metastore.yaml` from environment variables when that file does
+not exist.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `PIVOT_DATASTORE` | `/var/lib/pivot/datastores/default` | Location of the generated default datastore. Accepts a local path, `s3://` URI, or `gs://` URI. |
+| `AWS_ACCESS_KEY_ID` | Required for S3 | Access key stored in the generated S3 secret. |
+| `AWS_SECRET_ACCESS_KEY` | Required for S3 | Secret key stored in the generated S3 secret. |
+| `AWS_REGION` | `AWS_DEFAULT_REGION`, then `us-east-1` | Region stored in the generated S3 secret. |
+| `AWS_ENDPOINT_URL` | Unset | S3-compatible endpoint, such as MinIO. |
+
+These variables are bootstrap settings, not live overrides. If
+`/var/lib/pivot` is mounted as a persistent volume and already contains
+`metastore.yaml`, the image uses that file and ignores the bootstrap variables.
+To change an initialized volume, edit its metastore file or start with a fresh
+volume.
+
 ### Environment variables
 
 | Variable | Default | Effect |
