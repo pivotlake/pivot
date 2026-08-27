@@ -11,111 +11,99 @@ usable for a local database, object storage, or multiple servers sharing one
 storage layer.
 
 <figure class="arch-figure">
-<svg viewBox="0 0 920 532" role="img" aria-labelledby="detail-arch-title detail-arch-desc">
-<title id="detail-arch-title">Pivot server architecture</title>
-<desc id="detail-arch-desc">SQL clients connect to a Pivot server. The server resolves queries through its catalog and planner, then executes them on the dispatch pool against a datastore. A separate metastore supplies datastore definitions, users, and credentials when the server starts.</desc>
+<svg viewBox="0 0 920 648" role="img" aria-labelledby="map-title map-desc">
+<title id="map-title">Pivot server architecture</title>
+<desc id="map-desc">SQL clients reach the Pivot server over the Postgres wire. Inside the server, the catalog holds a snapshot per query, the planner binds and prunes against it, and the dispatch pool runs the scan on worker threads. The metastore supplies configuration and identity to the server; the datastore is the transactional data source the server scans and commits to, layered as a Pivot manifest, a Delta log, and Parquet files.</desc>
 <defs>
-<marker id="detail-arch-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+<marker id="map-head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
 <path d="M0,0 L10,5 L0,10 z" class="arch-arrowhead" />
 </marker>
 </defs>
-
-<rect x="40" y="24" width="190" height="108" rx="3" class="arch-panel" />
-<text x="64" y="54" class="arch-title">SQL clients</text>
-<rect x="64" y="72" width="42" height="32" rx="2" class="arch-inner" />
-<text x="85" y="92" text-anchor="middle" class="arch-tiny">psql</text>
-<rect x="116" y="72" width="38" height="32" rx="2" class="arch-inner" />
-<text x="135" y="92" text-anchor="middle" class="arch-tiny">BI</text>
-<rect x="164" y="72" width="42" height="32" rx="2" class="arch-inner" />
-<text x="185" y="92" text-anchor="middle" class="arch-tiny">apps</text>
-
-<line x1="232" y1="78" x2="278" y2="78" class="arch-line" marker-end="url(#detail-arch-head)" />
-<text x="255" y="66" text-anchor="middle" class="arch-tiny">SQL</text>
-
-<rect x="280" y="24" width="600" height="238" rx="3" class="arch-panel" />
-<text x="304" y="54" class="arch-title">Pivot server</text>
-<text x="856" y="54" text-anchor="end" class="arch-muted">one process · one worker pool</text>
-
-<rect x="304" y="70" width="552" height="38" rx="2" class="arch-inner" />
-<text x="320" y="94" class="arch-label">Postgres wire</text>
-<text x="840" y="94" text-anchor="end" class="arch-tiny">authentication · sessions · results</text>
-<line x1="580" y1="110" x2="580" y2="130" class="arch-line" marker-end="url(#detail-arch-head)" />
-
-<rect x="304" y="132" width="160" height="94" rx="2" class="arch-inner" />
-<rect x="305" y="133" width="158" height="24" class="arch-strip" />
-<line x1="305" y1="157" x2="463" y2="157" class="arch-rule" />
-<text x="320" y="150" class="arch-label">Catalog</text>
-<text x="320" y="180" class="arch-tiny">named datastores</text>
-<text x="320" y="198" class="arch-tiny">query snapshots</text>
-<text x="320" y="216" class="arch-tiny">table bindings</text>
-
-<line x1="466" y1="179" x2="486" y2="179" class="arch-line" marker-end="url(#detail-arch-head)" />
-
-<rect x="488" y="132" width="160" height="94" rx="2" class="arch-inner" />
-<rect x="489" y="133" width="158" height="24" class="arch-strip" />
-<line x1="489" y1="157" x2="647" y2="157" class="arch-rule" />
-<text x="504" y="150" class="arch-label">Planner</text>
-<text x="504" y="180" class="arch-tiny">resolve + optimize</text>
-<text x="504" y="198" class="arch-tiny">filter pushdown</text>
-<text x="504" y="216" class="arch-tiny">projection pruning</text>
-
-<line x1="650" y1="179" x2="670" y2="179" class="arch-line" marker-end="url(#detail-arch-head)" />
-
-<rect x="672" y="132" width="184" height="94" rx="2" class="arch-inner" />
-<rect x="673" y="133" width="182" height="24" class="arch-strip" />
-<line x1="673" y1="157" x2="855" y2="157" class="arch-rule" />
-<text x="688" y="150" class="arch-label">Dispatch pool</text>
-<rect x="688" y="172" width="22" height="16" rx="1" class="arch-cell" />
-<rect x="716" y="172" width="22" height="16" rx="1" class="arch-cell" />
-<rect x="744" y="172" width="22" height="16" rx="1" class="arch-cell" />
-<rect x="772" y="172" width="22" height="16" rx="1" class="arch-cell" />
-<rect x="800" y="172" width="22" height="16" rx="1" class="arch-cell" />
-<rect x="828" y="172" width="12" height="16" rx="1" class="arch-cell" />
-<text x="688" y="211" class="arch-tiny">scan · filter · group · sort</text>
-
-<path d="M384 226 V286 H175 V320" class="arch-line" marker-start="url(#detail-arch-head)" />
-<text x="196" y="278" class="arch-muted">opens + configures</text>
-
-<path d="M764 226 V320" class="arch-line" marker-end="url(#detail-arch-head)" />
-<text x="778" y="278" class="arch-muted">scan + commit</text>
-
-<rect x="40" y="322" width="270" height="174" rx="3" class="arch-panel" />
-<text x="64" y="352" class="arch-title">Metastore</text>
-<text x="286" y="352" text-anchor="end" class="arch-muted">Disk · PostgreSQL upcoming</text>
-<rect x="64" y="370" width="222" height="30" rx="2" class="arch-inner" />
-<text x="78" y="390" class="arch-tiny">datastores + default</text>
-<rect x="64" y="408" width="222" height="30" rx="2" class="arch-inner" />
-<text x="78" y="428" class="arch-tiny">users + authentication</text>
-<rect x="64" y="446" width="222" height="30" rx="2" class="arch-inner" />
-<text x="78" y="466" class="arch-tiny">storage credentials</text>
-
-<rect x="360" y="322" width="520" height="174" rx="3" class="arch-panel" />
-<text x="384" y="352" class="arch-title">Datastore: analytics</text>
-<text x="856" y="352" text-anchor="end" class="arch-muted">file:// · s3:// · gs://</text>
-
-<rect x="384" y="370" width="136" height="106" rx="2" class="arch-inner" />
-<rect x="385" y="371" width="134" height="24" class="arch-strip" />
-<line x1="385" y1="395" x2="519" y2="395" class="arch-rule" />
-<text x="400" y="388" class="arch-label">Pivot manifest</text>
-<text x="400" y="420" class="arch-tiny">schemas</text>
-<text x="400" y="438" class="arch-tiny">tables</text>
-<text x="400" y="456" class="arch-tiny">locations</text>
-
-<rect x="536" y="370" width="136" height="106" rx="2" class="arch-inner" />
-<rect x="537" y="371" width="134" height="24" class="arch-strip" />
-<line x1="537" y1="395" x2="671" y2="395" class="arch-rule" />
-<text x="552" y="388" class="arch-label">Delta log</text>
-<text x="552" y="420" class="arch-tiny">schema</text>
-<text x="552" y="438" class="arch-tiny">versions</text>
-<text x="552" y="456" class="arch-tiny">active files</text>
-
-<rect x="688" y="370" width="168" height="106" rx="2" class="arch-inner" />
-<rect x="689" y="371" width="166" height="24" class="arch-strip" />
-<line x1="689" y1="395" x2="855" y2="395" class="arch-rule" />
-<text x="704" y="388" class="arch-label">Parquet</text>
-<text x="704" y="420" class="arch-tiny">column data</text>
-<text x="704" y="438" class="arch-tiny">row groups</text>
-<text x="704" y="456" class="arch-tiny">statistics</text>
+<rect x="280" y="24" width="360" height="84" rx="3" class="arch-panel" />
+<text x="304" y="54" class="arch-title">SQL clients</text>
+<rect x="304" y="62" width="56" height="26" rx="2" class="arch-inner" />
+<text x="332" y="79" text-anchor="middle" class="arch-muted">psql</text>
+<rect x="370" y="62" width="110" height="26" rx="2" class="arch-inner" />
+<text x="425" y="79" text-anchor="middle" class="arch-muted">backends</text>
+<rect x="490" y="62" width="80" height="26" rx="2" class="arch-inner" />
+<text x="530" y="79" text-anchor="middle" class="arch-muted">BI tools</text>
+<line x1="460" y1="108" x2="460" y2="176" class="arch-line" marker-end="url(#map-head)" />
+<text x="474" y="146" class="arch-muted">Postgres wire</text>
+<rect x="40" y="180" width="840" height="200" rx="3" class="arch-panel" />
+<text x="64" y="210" class="arch-title">Pivot server</text>
+<text x="856" y="210" text-anchor="end" class="arch-muted">one process · one worker pool</text>
+<rect x="64" y="224" width="240" height="104" rx="2" class="arch-inner" />
+<rect x="65" y="225" width="238" height="23" class="arch-strip" />
+<line x1="65" y1="248" x2="303" y2="248" class="arch-rule" />
+<text x="76" y="241" class="arch-label">Catalog</text>
+<text x="292" y="241" text-anchor="end" class="arch-tiny">in memory</text>
+<text x="76" y="270" class="arch-tiny">datastores by name</text>
+<text x="76" y="288" class="arch-tiny">snapshot per query</text>
+<line x1="306" y1="276" x2="337" y2="276" class="arch-line" marker-end="url(#map-head)" />
+<rect x="340" y="224" width="240" height="104" rx="2" class="arch-inner" />
+<rect x="341" y="225" width="238" height="23" class="arch-strip" />
+<line x1="341" y1="248" x2="579" y2="248" class="arch-rule" />
+<text x="352" y="241" class="arch-label">Planner</text>
+<text x="568" y="241" text-anchor="end" class="arch-tiny">per query</text>
+<text x="352" y="270" class="arch-tiny">bind tables from snapshot</text>
+<text x="352" y="288" class="arch-tiny">prune + push down</text>
+<line x1="582" y1="276" x2="613" y2="276" class="arch-line" marker-end="url(#map-head)" />
+<rect x="616" y="224" width="240" height="104" rx="2" class="arch-inner" />
+<rect x="617" y="225" width="238" height="23" class="arch-strip" />
+<line x1="617" y1="248" x2="855" y2="248" class="arch-rule" />
+<text x="628" y="241" class="arch-label">Dispatch pool</text>
+<text x="844" y="241" text-anchor="end" class="arch-tiny">worker threads</text>
+<rect x="628" y="262" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="650" y="262" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="672" y="262" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="694" y="262" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="716" y="262" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="738" y="262" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="760" y="262" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="782" y="262" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="804" y="262" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="826" y="262" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="628" y="284" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="650" y="284" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="672" y="284" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="694" y="284" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="716" y="284" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="738" y="284" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="760" y="284" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="782" y="284" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="804" y="284" width="16" height="16" rx="1" class="arch-cell" />
+<rect x="826" y="284" width="16" height="16" rx="1" class="arch-cell" />
+<text x="628" y="316" class="arch-tiny">parallel scan + compute</text>
+<line x1="242" y1="452" x2="242" y2="384" stroke-dasharray="4 5" class="arch-line" marker-end="url(#map-head)" />
+<text x="256" y="422" class="arch-muted">configuration + identity</text>
+<line x1="678" y1="452" x2="678" y2="384" class="arch-line" marker-start="url(#map-head)" marker-end="url(#map-head)" />
+<text x="692" y="422" class="arch-muted">scan + commit</text>
+<rect x="40" y="452" width="404" height="172" rx="3" class="arch-panel" />
+<text x="64" y="482" class="arch-title">Metastore</text>
+<text x="420" y="482" text-anchor="end" class="arch-muted">control plane</text>
+<text x="64" y="502" class="arch-muted">YAML · PostgreSQL upcoming</text>
+<rect x="64" y="514" width="356" height="26" rx="2" class="arch-inner" />
+<text x="76" y="531" class="arch-tiny">datastores</text>
+<text x="408" y="531" text-anchor="end" class="arch-tiny">locations + default</text>
+<rect x="64" y="546" width="356" height="26" rx="2" class="arch-inner" />
+<text x="76" y="563" class="arch-tiny">users</text>
+<text x="408" y="563" text-anchor="end" class="arch-tiny">trust · scram-sha-256</text>
+<rect x="64" y="578" width="356" height="26" rx="2" class="arch-inner" />
+<text x="76" y="595" class="arch-tiny">credentials</text>
+<text x="408" y="595" text-anchor="end" class="arch-tiny">object storage keys</text>
+<rect x="476" y="452" width="404" height="172" rx="3" class="arch-panel" />
+<text x="500" y="482" class="arch-title">Datastore</text>
+<text x="856" y="482" text-anchor="end" class="arch-muted">data plane</text>
+<text x="500" y="502" class="arch-muted">delta · file:// · s3:// · gs://</text>
+<rect x="500" y="514" width="356" height="26" rx="2" class="arch-inner" />
+<text x="512" y="531" class="arch-tiny">pivot manifest</text>
+<text x="844" y="531" text-anchor="end" class="arch-tiny">schemas + tables</text>
+<rect x="500" y="546" width="356" height="26" rx="2" class="arch-inner" />
+<text x="512" y="563" class="arch-tiny">delta log</text>
+<text x="844" y="563" text-anchor="end" class="arch-tiny">versions + active files</text>
+<rect x="500" y="578" width="356" height="26" rx="2" class="arch-inner" />
+<text x="512" y="595" class="arch-tiny">parquet files</text>
+<text x="844" y="595" text-anchor="end" class="arch-tiny">columns + statistics</text>
 </svg>
 </figure>
 
