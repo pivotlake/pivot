@@ -32,7 +32,12 @@ use crate::waker::{WakerSet, WorkerWaker, init_waker_set, init_worker_waker};
 use core_affinity::CoreId;
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+/// Live per-worker dataflows across the pool.
+///
+/// Dirty-buffer cleanup waits for zero to avoid competing with a running query.
+static LIVE_DATAFLOWS: AtomicUsize = AtomicUsize::new(0);
 
 /// Spin budget while a **dataflow is in flight** but this worker momentarily has
 /// nothing to do (waiting on a pipeline-stage barrier / for a sibling to produce
@@ -367,7 +372,24 @@ impl Worker {
             debug!("Finished data flow {:?}", id);
             if let Some(mut flow) = self.data_flows.remove(&id) {
                 flow.stats().report();
+                drop(flow);
+                self.release_live_dataflow();
             }
+        }
+    }
+
+    /// Decrements the pool-wide count after a dataflow instance is dropped.
+    ///
+    /// When the count reaches zero, wake parked workers so they can zero the
+    /// query's returned buffers before the next query. Returning a buffer does
+    /// not wake its home worker, which may already be parked.
+    ///
+    /// The dataflow must be dropped before this call so all of its buffers are
+    /// in the free pools when workers wake. See
+    /// [`Self::clear_dirty_buffer_or_park`].
+    fn release_live_dataflow(&self) {
+        if LIVE_DATAFLOWS.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.waker.notify();
         }
     }
 
@@ -393,13 +415,15 @@ impl Worker {
     /// atomically with the wait and stored back into `last_seen_wake_count` for the
     /// next park.
     fn clear_dirty_buffer_or_park(&mut self) {
-        // Only clean dirty buffers between queries — while a dataflow is
-        // running we don't want to spend filler-time on buffer cleanup that
-        // could otherwise be CPU available for stealing work from sibling workers.
+        // Only clean dirty buffers while the whole pool is between queries —
+        // while any dataflow is running, anywhere, we don't want to spend
+        // memory bandwidth and filler-time on buffer cleanup that could
+        // otherwise serve the query's own tail (a worker whose share finished
+        // early would steal bandwidth from the stragglers).
         //
         // Ideally, we would do cleanup also when you have dataflows above a certain
         // threshold of dirty buffers - but we don't have that implemented yet.
-        if self.data_flows.is_empty()
+        if LIVE_DATAFLOWS.load(Ordering::Relaxed) == 0
             && let Some(b) = memory_ctx().pop_dirty_buffer()
         {
             b.zero_out();
@@ -452,6 +476,7 @@ impl Worker {
         });
         for id in cancelled {
             self.io.cancel_dataflow(id);
+            self.release_live_dataflow();
         }
     }
 
@@ -478,6 +503,7 @@ impl Worker {
             debug!("Received data flow...");
             match builder.build() {
                 Ok(data_flow) => {
+                    LIVE_DATAFLOWS.fetch_add(1, Ordering::Relaxed);
                     self.data_flows.insert(data_flow.id(), data_flow);
                 }
                 Err(e) => {
