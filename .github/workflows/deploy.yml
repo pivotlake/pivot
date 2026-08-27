@@ -48,6 +48,10 @@ on:
 #                 attached service account (starting a stopped VM requires it).
 # Required repository variables (unless overridden via the `bucket` input):
 #   DEPLOY_GCS_BUCKET  — gs://bucket/optional/prefix to upload the binary under.
+#   PIVOT_PGO_TRAINING_GCS — gs://bucket/prefix holding the PGO training data
+#                            (clickbench-hits-subset/ and tpch-sf1/, see
+#                            packaging/pgo/train.sh). GCP_SA_KEY needs read
+#                            access on it.
 # For the Docker Hub push (push_docker), the org-level DOCKERHUB_USERNAME /
 # DOCKERHUB_TOKEN secrets are used; that account must have push access to
 # pivotlake/pivot.
@@ -200,12 +204,59 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      # Auth happens before the build now: the PGO training data is pulled
+      # from GCS, and the upload at the end reuses the same credentials.
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Download the PGO training data
+        env:
+          TRAINING_BUCKET: ${{ vars.PIVOT_PGO_TRAINING_GCS }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TRAINING_BUCKET" ]; then
+            echo "::error::No PGO training data location. Set the PIVOT_PGO_TRAINING_GCS repo variable (e.g. gs://bucket/pgo-training)."
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/pgo-training"
+          gcloud storage rsync -r "${TRAINING_BUCKET%/}" "$RUNNER_TEMP/pgo-training"
+
+      # First PGO pass: an instrumented server plus the pivot-bench client
+      # that drives it. Its own cache scope, so the instrumented layers and
+      # the release layers below stay warm independently.
+      - name: Build instrumented binaries (${{ matrix.arch }})
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: packaging/debian/Dockerfile
+          target: instrumented
+          outputs: type=local,dest=dist-pgo
+          cache-from: type=gha,scope=debian-${{ matrix.deb_arch }}-pgogen
+          cache-to: type=gha,scope=debian-${{ matrix.deb_arch }}-pgogen,mode=max,ignore-error=true
+
+      # The training run executes on the runner host: the binaries link
+      # against Bullseye's glibc 2.31, which any newer host glibc runs.
+      # pivot-bench boots the server itself over a scratch datastore.
+      - name: Run the PGO training workload
+        run: |
+          set -euo pipefail
+          chmod +x dist-pgo/pivot dist-pgo/pivot-bench
+          packaging/pgo/train.sh \
+            --server-bin dist-pgo/pivot --bench-bin dist-pgo/pivot-bench \
+            --data-dir "$RUNNER_TEMP/pgo-training" --out-dir pgo-profiles
+
       # One build produces both shipped artifacts: `dist/pivot` is the binary
       # uploaded to GCS, and `dist/pivot_*.deb` wraps that exact binary, so the
       # package can never drift from the released server. It runs in the
       # packaging image's Debian Bullseye environment (glibc 2.31), which keeps
       # both artifacts usable on Debian 11+ and Ubuntu 20.04+ and sidesteps
       # ci-runner-x86's gcc 9.4, which aws-lc-sys rejects (GCC bug 95189).
+      # The profile-use build reads pgo-profiles/ from the context and fails
+      # without it, so a release can never silently ship un-PGOed.
       - name: Build release binary + Debian package (${{ matrix.arch }})
         uses: docker/build-push-action@v6
         with:
@@ -227,13 +278,6 @@ jobs:
       # self-hosted boxes too.
       - name: Test package installation
         run: packaging/debian/test-install.sh dist/pivot_*_${{ matrix.deb_arch }}.deb
-
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - uses: google-github-actions/setup-gcloud@v2
 
       - name: Upload binary and package to GCS
         env:

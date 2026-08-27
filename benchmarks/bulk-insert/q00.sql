@@ -1,0 +1,1 @@
+INSERT INTO hits_bulk SELECT * FROM hits LIMIT 1000000;

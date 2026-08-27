@@ -13,18 +13,39 @@
 pgogen_target_dir := env_var_or_default("PGO_GEN_TARGET_DIR", "target-pgogen")
 pgouse_target_dir := env_var_or_default("PGO_USE_TARGET_DIR", "target-pgouse")
 
+# Host triple. Passing an explicit --target (even the host's own triple) makes
+# cargo stop applying RUSTFLAGS to host units (build scripts, proc macros):
+# instrumentation never reaches them, and a profile-use flag change no longer
+# invalidates their outputs, chiefly the DuckDB C++ cmake build, which no
+# profile flag affects anyway.
+host_target := `rustc -vV | sed -n 's/^host: //p'`
+
+# Every recipe builds at the shipped instruction floor, so perf boxes measure
+# exactly the codegen that releases ship. The floor is restated here because a
+# set RUSTFLAGS REPLACES the .cargo/config.toml lists; keep the two in step
+# (and with dispatch/src/cpu_features.rs). Empty on an arch without a defined
+# floor; the recipes refuse to build then rather than silently dropping it.
+floor_rustflags := if host_target =~ "x86_64" {
+    "-Ctarget-cpu=x86-64-v3"
+} else if host_target =~ "aarch64" {
+    "-Ctarget-feature=+lse,+crc,+rdm,+dpb,+neon,+aes,+sha2,+dotprod,+ssbs,+rcpc,+bf16"
+} else {
+    ""
+}
+
 # Run a cargo command instrumented for PGO profile generation, then merge the profiles.
 #
 #   just pgo-gen bench --bench clickbench
 #   just pgo-gen test --test integration
 alias pgo-generate := pgo-gen
 pgo-gen *args:
+    @[ -n "{{floor_rustflags}}" ] || { echo "no instruction floor defined for {{host_target}}" >&2; exit 1; }
     mkdir -p {{pgo_dir}}
     # PIVOT_SPIN_LIMIT=0 parks idle workers immediately during the profiled
     # workload, so the profile records the wait-heavy control-flow mix that
     # cold runs on the full dataset execute, deterministically rather than
     # as a timing-dependent draw per build.
-    RUSTFLAGS="-Cprofile-generate={{pgo_dir}} -Ctarget-cpu=native" \
+    RUSTFLAGS="-Cprofile-generate={{pgo_dir}} {{floor_rustflags}}" \
         PIVOT_SPIN_LIMIT=0 \
         CARGO_TARGET_DIR={{pgogen_target_dir}} cargo {{args}}
     $(dirname "$(rustc --print target-libdir)")/bin/llvm-profdata merge -o {{pgo_dir}}/merged.profdata {{pgo_dir}}
@@ -33,26 +54,20 @@ pgo-gen *args:
 #
 #   just pgo-use bench --bench clickbench
 pgo-use *args:
-    RUSTFLAGS="-Cprofile-use={{pgo_dir}}/merged.profdata -Ctarget-cpu=native" \
+    @[ -n "{{floor_rustflags}}" ] || { echo "no instruction floor defined for {{host_target}}" >&2; exit 1; }
+    RUSTFLAGS="-Cprofile-use={{pgo_dir}}/merged.profdata {{floor_rustflags}}" \
         CARGO_TARGET_DIR={{pgouse_target_dir}} cargo {{args}}
 
-
-# Host triple, for the A/B recipes below. Passing an explicit --target (even
-# the host's own triple) makes cargo stop applying RUSTFLAGS to host units
-# (build scripts, proc macros): instrumentation never reaches them, and a
-# profile-use flag change no longer invalidates their outputs, chiefly the
-# DuckDB C++ cmake build, which no profile flag affects anyway.
-host_target := `rustc -vV | sed -n 's/^host: //p'`
-
 # Build instrumented for profile generation, without running or merging:
-# for A/B automation that runs the workload itself, redirects each side's
-# profiles via LLVM_PROFILE_FILE, and merges per side. Binaries land under
-# target-pgogen/{{host_target}}/.
+# for automation (A/B harnesses, the release build) that runs the workload
+# itself, redirects the profiles via LLVM_PROFILE_FILE, and merges per side.
+# Binaries land under target-pgogen/{{host_target}}/.
 # lld because instrumentation can grow the text past the 128MB aarch64
 # branch range, which GNU ld fails with relocation overflows.
 pgo-gen-build subcmd *args:
+    @[ -n "{{floor_rustflags}}" ] || { echo "no instruction floor defined for {{host_target}}" >&2; exit 1; }
     mkdir -p {{pgo_dir}}
-    RUSTFLAGS="-Cprofile-generate={{pgo_dir}} -Ctarget-cpu=native -Clink-arg=-fuse-ld=lld" \
+    RUSTFLAGS="-Cprofile-generate={{pgo_dir}} {{floor_rustflags}} -Clink-arg=-fuse-ld=lld" \
         CARGO_TARGET_DIR={{pgogen_target_dir}} cargo {{subcmd}} --target {{host_target}} {{args}}
 
 # Like pgo-use but with a caller-supplied profdata path. rustc records the
@@ -62,9 +77,51 @@ pgo-gen-build subcmd *args:
 # artifacts restored from another machine. Build-script outputs (unflagged
 # thanks to the explicit --target) stay cached either way. Binaries land
 # under target-pgouse/{{host_target}}/.
+# The path is absolutized because cargo invokes rustc from each crate's own
+# directory, so a relative one resolves only for workspace crates.
 pgo-use-with profdata subcmd *args:
-    RUSTFLAGS="-Cprofile-use={{profdata}} -Ctarget-cpu=native" \
+    @[ -n "{{floor_rustflags}}" ] || { echo "no instruction floor defined for {{host_target}}" >&2; exit 1; }
+    @[ -f "{{profdata}}" ] || { echo "profile '{{profdata}}' does not exist" >&2; exit 1; }
+    RUSTFLAGS="-Cprofile-use=$(readlink -f "{{profdata}}") {{floor_rustflags}}" \
         CARGO_TARGET_DIR={{pgouse_target_dir}} cargo {{subcmd}} --target {{host_target}} {{args}}
+
+# Merge a training run's raw profiles into the indexed file -Cprofile-use
+# reads. Fails loudly when the run produced none, so a build can never
+# quietly proceed un-PGOed.
+pgo-merge out dir:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    raw_count="$(find "{{dir}}" -name '*.profraw' | wc -l)"
+    [[ "$raw_count" -gt 0 ]] || { echo "no .profraw files under {{dir}}; the training run produced no profile" >&2; exit 1; }
+    "$(dirname "$(rustc --print target-libdir)")/bin/llvm-profdata" merge -o "{{out}}" "{{dir}}"/*.profraw
+    echo "merged $raw_count profraw files into {{out}}"
+
+# Tripwire for the profile applying at all: the decode family's
+# monomorphizations in the built binary must appear in the profile it was
+# compiled against. Zero overlap means the binary is effectively un-PGOed,
+# which is silent at compile time and shows up only as a mystery regression.
+# Whole mangled names, so the check holds under both legacy and v0 mangling.
+pgo-verify binary profdata:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Absolutized so callers can pass paths relative to their own working
+    # directory (recipes run from the justfile's directory).
+    binary="$(readlink -f "{{binary}}")"
+    profdata="$(readlink -f "{{profdata}}")"
+    family="RleDecoder"
+    # The greps legitimately match nothing when the family is fully inlined;
+    # the zero-overlap case below is the loud failure.
+    binary_symbols="$(nm "$binary" | awk '{print $NF}' | grep "$family" | sort -u || true)"
+    if [[ -z "$binary_symbols" ]]; then
+        echo "warning: no $family symbols visible to nm, skipping the profile-overlap check" >&2
+        exit 0
+    fi
+    profile_symbols="$("$(dirname "$(rustc --print target-libdir)")/bin/llvm-profdata" \
+        show -all-functions "$profdata" 2>/dev/null \
+        | grep -oE '[[:alnum:]_.$]*'"$family"'[[:alnum:]_.$]*' | sort -u || true)"
+    covered="$(comm -12 <(printf '%s\n' "$binary_symbols") <(printf '%s\n' "$profile_symbols") | wc -l)"
+    [[ "$covered" -gt 0 ]] || { echo "the binary shares no $family symbols with its profile; the profile did not apply" >&2; exit 1; }
+    echo "verified: $covered $family monomorphizations carry profile records"
 
 # Remove all PGO profiles and merged data.
 pgo-clean:

@@ -27,7 +27,7 @@ name: TPC-H flat A/B
 # Optional repository variables (defaults in parentheses):
 #   TPCH_AB_REGION        (eu-central-1)
 #   TPCH_AB_INSTANCE_TYPE (c8gd.4xlarge) - instance-store NVMe required; keep
-#                         one type so target-cpu=native caches stay valid
+#                         one type so timings stay comparable across runs
 #   TPCH_AB_KEY_NAME      (ec2-key-pair)  - EC2 key pair matching PERF_SSH_KEY
 #   TPCH_AB_SUBNET_ID / TPCH_AB_SECURITY_GROUP  (account defaults) - the
 #                         security group must allow ssh from the runner

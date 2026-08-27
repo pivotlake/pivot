@@ -85,7 +85,13 @@ packaging/debian/test-install.sh dist/pivot_*.deb
 
 The Deploy Binaries workflow builds the released server with this same
 Dockerfile, so the `.deb` it publishes contains exactly the binary the release
-uploads. The `package` stage exports both: `dist/pivot` is the binary, and
+uploads. The released binary is PGO-built: the workflow first builds the
+`instrumented` stage, runs the training workload against it on the runner
+(query suites plus a bulk insert, driven by `packaging/pgo/train.sh` over
+data from the deploy bucket), and the `package` stage then compiles with the
+collected profile, refusing to build without one. A locally built package
+(`build.sh` above) skips PGO and is not what releases ship. The `package`
+stage exports both: `dist/pivot` is the binary, and
 `dist/pivot_<version>_<arch>.deb` wraps it. Each release leg still uploads
 
 ```text

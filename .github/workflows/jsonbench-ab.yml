@@ -28,8 +28,8 @@ name: JSONBench A/B
 # Optional repository variables (defaults in parentheses):
 #   JSONBENCH_AB_REGION        (TPCH_AB_REGION | eu-central-1)
 #   JSONBENCH_AB_INSTANCE_TYPE (TPCH_AB_INSTANCE_TYPE | c8gd.4xlarge) -
-#       instance-store NVMe required; keep one type so target-cpu=native caches
-#       stay valid.
+#       instance-store NVMe required; keep one type so timings stay comparable
+#       across runs.
 #   JSONBENCH_AB_KEY_NAME      (TPCH_AB_KEY_NAME | ec2-key-pair)
 #   JSONBENCH_AB_SUBNET_ID / JSONBENCH_AB_SECURITY_GROUP  (TPCH_AB_* | account
 #       defaults) - the security group must allow ssh from the runner.

@@ -1,4 +1,8 @@
 target/
+target-pgogen/
+target-pgouse/
+target-client/
+pgo-profiles/
 .idea/
 .tmp/
 .DS_Store

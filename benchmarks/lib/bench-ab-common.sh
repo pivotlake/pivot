@@ -34,10 +34,9 @@ ab_common_init() {
     fi
     run_id="$(date +%s)-$$"
     host_target="$(rustc -vV | sed -n 's/^host: //p')"
-    # Cache entries are only valid for the exact compiler (fingerprints) and
-    # this instance family's target-cpu=native output; the toolchain string
-    # covers both since the AMI pins the toolchain and the workflow pins the
-    # instance type.
+    # Cache entries are only valid for the exact compiler (fingerprints); the
+    # builds target the shipped instruction floor, so they carry no
+    # CPU-specific codegen beyond it.
     cache_key="$(rustc -V | tr ' ()' '__.')"
     # Fixed profile-generate path, matching benchmarks/justfile's pgo_dir: the
     # path sits inside RUSTFLAGS, and identical flags are what keep the restored
@@ -259,39 +258,25 @@ build_use() {
     (cd "$dir/benchmarks" && \
         PGO_USE_TARGET_DIR=target-pgouse \
         just pgo-use-with "$work_dir/$side-$run_id.profdata" build --release -p bin --bin pivot)
-    verify_pgo_applied \
+    verify_pgo_applied "$dir" \
         "$dir/benchmarks/target-pgouse/$host_target/release/pivot" \
         "$work_dir/$side-$run_id.profdata" "$side"
 }
 
-# Tripwire for the profile applying at all, same as build-ab-servers.sh: the
-# decode family's monomorphization hashes in the built server must appear in
-# the profile it was compiled against. Zero overlap means the server was built
-# outside the profiled symbol universe and is effectively un-PGOed, which is
-# silent at compile time and shows up only as a mystery regression.
+# Tripwire for the profile applying at all: delegates to the shared
+# pgo-verify recipe (pgo.just), taken from the tree that built this side.
+# This library is shipped standalone to the box's /tmp, so it cannot address
+# a justfile relative to itself; the tree can, and a tree that predates the
+# recipe is skipped with a note rather than failed on a recipe it never had.
 verify_pgo_applied() {
-    local server="$1" profdata="$2" side="$3"
-    local family="RleDecoder4read"
-    local binary_hashes profile_hashes covered
-    # The greps legitimately match nothing when the family is fully inlined,
-    # and an empty match must not kill the harness through set -e; the
-    # zero-overlap case below is the loud failure.
-    binary_hashes=$(nm "$server" | grep "$family" | grep -oE '17h[0-9a-f]+E' | sort -u || true)
-    if [[ -z "$binary_hashes" ]]; then
-        echo ">>> $side server: no $family symbols visible to nm, skipping the profile-overlap check"
+    local tree="$1" server="$2" profdata="$3" side="$4"
+    local justfile="$tree/benchmarks/justfile"
+    if ! just --justfile "$justfile" --show pgo-verify >/dev/null 2>&1; then
+        echo ">>> $side server: its tree has no pgo-verify recipe, skipping the profile-overlap check"
         return 0
     fi
-    profile_hashes=$("$(dirname "$(rustc --print target-libdir)")/bin/llvm-profdata" \
-        show -all-functions "$profdata" 2>/dev/null \
-        | grep "$family" | grep -oE '17h[0-9a-f]+E' | sort -u || true)
-    covered=$(comm -12 <(printf '%s\n' "$binary_hashes") \
-                       <(printf '%s\n' "$profile_hashes") | wc -l)
-    if [[ "$covered" -eq 0 ]]; then
-        echo "error: the $side server shares no $family symbols with its profile;" >&2
-        echo "       the profile did not apply and the binary is effectively un-PGOed" >&2
-        return 1
-    fi
-    echo ">>> $side server: $covered $family monomorphizations carry profile records"
+    echo ">>> $side server: checking the profile applied"
+    just --justfile "$justfile" pgo-verify "$server" "$profdata"
 }
 
 build_release() {
