@@ -1,0 +1,142 @@
+---
+title: Quickstart
+description: Run Pivot with Docker, in a local SQL shell, or as a server.
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+### 1. Start Pivot
+
+<Tabs>
+  <TabItem label="Docker">
+    **Best for:** starting a pivot server quickly.
+
+    ```sh
+    docker run --rm --name pivot \
+      -p 5432:5432 \
+      -v pivot-data:/var/lib/pivot \
+      pivotlake/pivot:latest
+    ```
+
+    The named volume keeps your data between runs. In a second terminal,
+    connect with any Postgres client:
+
+    ```sh
+    psql -h 127.0.0.1 -p 5432 -U pivot
+    ```
+  </TabItem>
+
+  <TabItem label="Local shell">
+    **Best for:** querying an S3 datastore directly without running a server or
+    installing `psql`.
+
+    Install the Pivot CLI on Linux:
+
+    ```sh
+    curl https://pivotlake.io | sh
+    ```
+
+    Export your AWS credentials and region, then open the datastore from its
+    S3 location:
+
+    ```sh
+    export AWS_ACCESS_KEY_ID=your-access-key-id
+    export AWS_SECRET_ACCESS_KEY=your-secret-access-key
+    export AWS_REGION=us-east-1
+
+    pivot open s3://my-bucket/pivot-data
+    ```
+
+    Pivot opens an interactive SQL prompt. The data remains in S3 after you
+    exit with `\q`.
+  </TabItem>
+
+  <TabItem label="Linux service">
+    **Best for:** a persistent database endpoint for applications, BI tools,
+    and other Postgres clients.
+
+    Install Pivot from the Debian or Ubuntu package repository:
+
+    ```sh
+    sudo apt-get update
+    sudo apt-get install -y ca-certificates curl gnupg
+    curl -fsSL https://packages.pivotlake.io/keys/pivotlake-archive-key.asc |
+      sudo gpg --dearmor --yes -o /usr/share/keyrings/pivotlake-archive-keyring.gpg
+
+    ARCH=$(dpkg --print-architecture)
+    echo "deb [signed-by=/usr/share/keyrings/pivotlake-archive-keyring.gpg arch=${ARCH}] https://packages.pivotlake.io/deb stable main" |
+      sudo tee /etc/apt/sources.list.d/pivotlake.list
+    sudo apt-get update
+    sudo apt-get install -y pivot
+    ```
+
+    Use `testing` instead of `stable` in the repository line to receive release
+    candidates. The package starts Pivot immediately and enables it at boot.
+    Check the service:
+
+    ```sh
+    sudo systemctl status pivot
+    ```
+
+    Then connect with any Postgres client:
+
+    ```sh
+    psql -h 127.0.0.1 -p 5432 -U pivot
+    ```
+  </TabItem>
+</Tabs>
+
+### 2. Load data
+
+Run the following SQL in the local shell or connected Postgres client:
+
+```sql
+CREATE TABLE events (
+  id BIGINT,
+  name TEXT,
+  ts TIMESTAMP
+);
+
+INSERT INTO events VALUES
+  (1, 'signup', now() - interval '2 hours'),
+  (2, 'purchase', now() - interval '1 hour'),
+  (3, 'signup', now());
+```
+
+To start from existing Parquet files instead, use
+[`with_pre_existing_parquets`](/docs/reference/table-options/#adopt-existing-parquet-files).
+
+### 3. Query
+
+```sql
+SELECT name, count(*)
+FROM events
+WHERE ts >= now() - interval '1 day'
+GROUP BY name
+ORDER BY 2 DESC
+LIMIT 10;
+```
+
+You should see two `signup` events and one `purchase` event.
+
+### Build from source
+
+To build the same executable from the repository:
+
+```sh
+cargo build --release -p bin --bin pivot
+```
+
+Run the local shell directly from the build output:
+
+```sh
+./target/release/pivot open ./pivot-data
+```
+
+To run a server from the build output, copy
+[`bin/config.example.yaml`](https://github.com/Epsio-Labs/pivotdb/blob/main/bin/config.example.yaml),
+adjust its datastore locations, and start Pivot with:
+
+```sh
+./target/release/pivot server --config pivot.yaml
+```
