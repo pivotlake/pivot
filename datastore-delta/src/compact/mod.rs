@@ -546,10 +546,31 @@ impl CompacterActor {
             .layout_scores
             .entry(table.id())
             .or_insert_with(overlap::LayoutScores::new);
-        let (score, left, right) =
+        let selected =
             scores.best_pair(&partitions, table.sort_by(), self.target_bytes, reserved)?;
-        (!apply_guards || score >= LAYOUT_OVERLAP_THRESHOLD)
-            .then(|| vec![left.file.clone(), right.file.clone()])
+        if apply_guards && selected.score < LAYOUT_OVERLAP_THRESHOLD {
+            return None;
+        }
+        // Only the pair that is about to be rewritten is reported, so the log
+        // says what each merge restructures: how many of its two files' row
+        // groups sit in the contested range, how many sit outside it, and how
+        // many other overlapping pairs were waiting behind this one.
+        let row_groups = &selected.row_groups;
+        info!(
+            score = selected.score,
+            left = %selected.left.file.path,
+            right = %selected.right.file.path,
+            left_intersecting_row_groups = row_groups.left_intersecting,
+            left_disjoint_row_groups = row_groups.left_disjoint,
+            right_intersecting_row_groups = row_groups.right_intersecting,
+            right_disjoint_row_groups = row_groups.right_disjoint,
+            candidate_pairs = selected.selectable_pairs,
+            "layout compaction pair selected"
+        );
+        Some(vec![
+            selected.left.file.clone(),
+            selected.right.file.clone(),
+        ])
     }
 }
 

@@ -206,6 +206,43 @@ pub(super) struct LayoutScores {
     pairs: HashMap<u64, f32>,
 }
 
+/// The pair a round picked, beside what it was picked out of.
+pub(super) struct SelectedPair<'a> {
+    pub(super) score: f64,
+    pub(super) left: &'a DeltaFileEntry,
+    pub(super) right: &'a DeltaFileEntry,
+    pub(super) row_groups: SplitRowGroups,
+    /// Overlapping pairs the round could have picked from, this one included.
+    /// The pairs holding a file that a merge in flight is rewriting are not
+    /// among them: this round cannot merge those.
+    pub(super) selectable_pairs: usize,
+}
+
+/// A pair's row groups split by whether they intersect the other file's range
+/// on the sweep column. Intersecting groups are the ones a rewrite can
+/// restructure; the rest already sit outside the contested range. A row group
+/// whose footer recorded no bounds counts as intersecting, the same way the
+/// selection gate counts it.
+pub(super) struct SplitRowGroups {
+    pub(super) left_intersecting: usize,
+    pub(super) left_disjoint: usize,
+    pub(super) right_intersecting: usize,
+    pub(super) right_disjoint: usize,
+}
+
+fn split_row_groups(left: &SortColumnRange, right: &SortColumnRange) -> SplitRowGroups {
+    let left_total = left.candidate.row_group_ranges.len();
+    let right_total = right.candidate.row_group_ranges.len();
+    let left_intersecting = count_contested_row_groups(left, right);
+    let right_intersecting = count_contested_row_groups(right, left);
+    SplitRowGroups {
+        left_intersecting,
+        left_disjoint: left_total - left_intersecting,
+        right_intersecting,
+        right_disjoint: right_total - right_intersecting,
+    }
+}
+
 impl LayoutScores {
     pub(super) fn new() -> Self {
         Self {
@@ -225,7 +262,7 @@ impl LayoutScores {
         sort_by: &[String],
         target_bytes: u64,
         reserved: &HashSet<ObjectPath>,
-    ) -> Option<(f64, &'a DeltaFileEntry, &'a DeltaFileEntry)> {
+    ) -> Option<SelectedPair<'a>> {
         let first_column = sort_by.first()?;
 
         let mut entries: HashMap<u32, &'a DeltaFileEntry> = HashMap::new();
@@ -235,25 +272,39 @@ impl LayoutScores {
         }
         self.forget_missing(&entries);
 
+        // The ranges outlive the scoring so the pair that wins can report how
+        // its row groups sit against each other. A file without a range on the
+        // sweep column is in no pair, here or in what earlier rounds
+        // remembered, so every remembered id has one.
+        let mut ranges: HashMap<u32, SortColumnRange<'a, '_>> = HashMap::new();
+        let mut partition_ids: Vec<Vec<u32>> = Vec::new();
         for partition in partitions {
-            let ranges: Vec<(u32, SortColumnRange<'a, '_>)> = partition
-                .iter()
-                .filter_map(|candidate| {
-                    let range = extract_column_range(candidate, first_column)?;
-                    Some((self.ids[&candidate.entry.file.path], range))
-                })
-                .collect();
+            let mut ids: Vec<u32> = Vec::new();
+            for candidate in partition {
+                let Some(range) = extract_column_range(candidate, first_column) else {
+                    continue;
+                };
+                let id = self.ids[&candidate.entry.file.path];
+                ranges.insert(id, range);
+                ids.push(id);
+            }
+            partition_ids.push(ids);
+        }
+
+        for ids in &partition_ids {
             // A pair of two new files is scored from the first one's side
             // only.
             let mut scored_this_round: HashSet<u32> = HashSet::new();
-            for (id, range) in &ranges {
+            for id in ids {
                 if self.scored.contains(id) {
                     continue;
                 }
-                for (partner_id, partner) in &ranges {
+                let range = &ranges[id];
+                for partner_id in ids {
                     if partner_id == id || scored_this_round.contains(partner_id) {
                         continue;
                     }
+                    let partner = &ranges[partner_id];
                     if !ranges_intersect(range, partner) {
                         continue;
                     }
@@ -273,21 +324,28 @@ impl LayoutScores {
             .iter()
             .filter_map(|path| self.ids.get(path).copied())
             .collect();
+        let is_selectable = |key: u64| {
+            let (low, high) = pair_ids(key);
+            !held.contains(&low) && !held.contains(&high)
+        };
 
         // Ties go to the pair numbered first, so the choice is stable across
         // rounds.
         let (&key, &score) = self
             .pairs
             .iter()
-            .filter(|(key, _)| {
-                let (low, high) = pair_ids(**key);
-                !held.contains(&low) && !held.contains(&high)
-            })
+            .filter(|(key, _)| is_selectable(**key))
             .max_by(|(left_key, left), (right_key, right)| {
                 left.total_cmp(right).then_with(|| right_key.cmp(left_key))
             })?;
         let (low, high) = pair_ids(key);
-        Some((f64::from(score), entries[&low], entries[&high]))
+        Some(SelectedPair {
+            score: f64::from(score),
+            left: entries[&low],
+            right: entries[&high],
+            row_groups: split_row_groups(&ranges[&low], &ranges[&high]),
+            selectable_pairs: self.pairs.keys().filter(|key| is_selectable(**key)).count(),
+        })
     }
 
     fn id_of(&mut self, path: &ObjectPath) -> u32 {
@@ -370,8 +428,14 @@ fn enough_contested_row_groups(left: &SortColumnRange, right: &SortColumnRange) 
 }
 
 fn meets_row_group_requirement(file: &SortColumnRange, partner: &SortColumnRange) -> bool {
-    let contested = file
-        .candidate
+    count_contested_row_groups(file, partner)
+        >= required_contested_row_groups(file.candidate.row_group_ranges.len())
+}
+
+/// How many of `file`'s row groups intersect `partner`'s range on the sweep
+/// column.
+fn count_contested_row_groups(file: &SortColumnRange, partner: &SortColumnRange) -> usize {
+    file.candidate
         .row_group_ranges
         .iter()
         .filter(|bounds| {
@@ -383,8 +447,7 @@ fn meets_row_group_requirement(file: &SortColumnRange, partner: &SortColumnRange
             compare(max, partner.min) != Some(Ordering::Less)
                 && compare(min, partner.max) != Some(Ordering::Greater)
         })
-        .count();
-    contested >= required_contested_row_groups(file.candidate.row_group_ranges.len())
+        .count()
 }
 
 /// Whether no range rewrite can separate these files' overlapping rows. On
@@ -783,7 +846,7 @@ mod tests {
         ];
         let mut scores = LayoutScores::new();
 
-        let (score, left, right) = scores
+        let selected = scores
             .best_pair(
                 std::slice::from_ref(&files),
                 &["id".into()],
@@ -792,6 +855,7 @@ mod tests {
             )
             .unwrap();
 
+        let (score, left, right) = (selected.score, selected.left, selected.right);
         let (sweep_score, sweep_left, sweep_right) =
             highest_scoring_pair(&files, &["id".into()], u64::MAX).unwrap();
         assert!((score - sweep_score).abs() < 1e-6);
@@ -821,7 +885,7 @@ mod tests {
             candidate(&far_overlapping, "id"),
         ];
         let mut scores = LayoutScores::new();
-        let (_, left, right) = scores
+        let selected = scores
             .best_pair(
                 std::slice::from_ref(&files),
                 &["id".into()],
@@ -829,9 +893,12 @@ mod tests {
                 &HashSet::new(),
             )
             .unwrap();
-        let reserved = HashSet::from([left.file.path.clone(), right.file.path.clone()]);
+        let reserved = HashSet::from([
+            selected.left.file.path.clone(),
+            selected.right.file.path.clone(),
+        ]);
 
-        let (_, next_left, next_right) = scores
+        let next = scores
             .best_pair(
                 std::slice::from_ref(&files),
                 &["id".into()],
@@ -840,8 +907,8 @@ mod tests {
             )
             .unwrap();
 
-        assert!(!reserved.contains(&next_left.file.path));
-        assert!(!reserved.contains(&next_right.file.path));
+        assert!(!reserved.contains(&next.left.file.path));
+        assert!(!reserved.contains(&next.right.file.path));
     }
 
     /// After a merge, the next round scores the merge's output against the
@@ -866,7 +933,7 @@ mod tests {
         let merged = stats_entry("merged", &[("id", int_stat(140), int_stat(200))]);
         let after = vec![candidate(&far, "id"), candidate(&merged, "id")];
 
-        let (score, left, right) = scores
+        let selected = scores
             .best_pair(
                 std::slice::from_ref(&after),
                 &["id".into()],
@@ -877,8 +944,11 @@ mod tests {
 
         // [150, 200] contests half of merged's [140, 200] and half of far's
         // [150, 250].
-        assert!((score - 0.5).abs() < 1e-6);
-        let mut pair = [left.file.path.as_str(), right.file.path.as_str()];
+        assert!((selected.score - 0.5).abs() < 1e-6);
+        let mut pair = [
+            selected.left.file.path.as_str(),
+            selected.right.file.path.as_str(),
+        ];
         pair.sort();
         assert_eq!(pair, ["far", "merged"]);
         assert_eq!(
