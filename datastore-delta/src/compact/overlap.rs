@@ -1,52 +1,44 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-use arrow_arith::numeric::sub;
-use arrow_array::{Array, ArrayRef, Datum, Float64Array};
+use arrow_array::{Array, ArrayRef, Datum};
 use arrow_cast::cast;
 use arrow_ord::cmp;
-use arrow_schema::DataType;
 
 use crate::TableFile;
 use crate::manifest::DeltaFileEntry;
 use object_storage::ObjectPath;
 
-/// Overlap score for string ranges that genuinely intersect. String values
-/// carry no meaningful width, so no uniform-distribution fraction can be
-/// estimated for them; any real overlap counts the same, above the selection
-/// threshold so overlapping string layouts still get rewritten.
-const STRING_OVERLAP_SCORE: f64 = 0.5;
-
-/// A file's min/max on one sort column, over which its rows are assumed to be
-/// uniformly distributed.
-#[derive(Clone, Copy)]
-struct UniformRange<'a> {
-    min: &'a ArrayRef,
-    max: &'a ArrayRef,
-}
-
 /// A layout-optimization candidate: a file's manifest entry beside its row
-/// groups' min/max on the sweep (first sort) column. `None` marks a row group
-/// whose footer recorded no bounds for that column; its rows can lie anywhere
-/// in the file's range, so the contested-group count includes it.
+/// groups' min/max on every sort column, in the table's sort order. A pair is
+/// measured on the column that tells the two files apart, which is not always
+/// the first: files holding one identical value on the leading keys are
+/// ordered by the next one, and that is where their row groups have to be
+/// compared. `None` marks a row group whose footer recorded no bounds for a
+/// column; its rows can lie anywhere in the file's range, so the
+/// contested-group count includes it.
 pub(super) struct LayoutCandidate<'a> {
     pub(super) entry: &'a DeltaFileEntry,
-    pub(super) row_group_ranges: Vec<Option<(ArrayRef, ArrayRef)>>,
+    pub(super) row_group_ranges: Vec<Vec<Option<(ArrayRef, ArrayRef)>>>,
 }
 
 impl<'a> LayoutCandidate<'a> {
-    /// Extract each of the file's row groups' min/max on `sweep_column` from
-    /// its footer metadata.
-    pub(super) fn from_table_file(file: &'a TableFile, sweep_column: &str) -> Self {
-        let row_group_ranges = file
-            .row_groups
+    /// Extract each of the file's row groups' min/max on each of `sort_by`
+    /// from its footer metadata.
+    pub(super) fn from_table_file(file: &'a TableFile, sort_by: &[String]) -> Self {
+        let row_group_ranges = sort_by
             .iter()
-            .map(|row_group| {
-                let column = row_group.schema.index_of(sweep_column).ok()?;
-                let statistics = row_group.column_statistics(column)?;
-                let min = statistics.min.as_ref()?.get().0.slice(0, 1);
-                let max = statistics.max.as_ref()?.get().0.slice(0, 1);
-                Some((min, max))
+            .map(|sort_column| {
+                file.row_groups
+                    .iter()
+                    .map(|row_group| {
+                        let column = row_group.schema.index_of(sort_column).ok()?;
+                        let statistics = row_group.column_statistics(column)?;
+                        let min = statistics.min.as_ref()?.get().0.slice(0, 1);
+                        let max = statistics.max.as_ref()?.get().0.slice(0, 1);
+                        Some((min, max))
+                    })
+                    .collect()
             })
             .collect();
         Self {
@@ -54,17 +46,33 @@ impl<'a> LayoutCandidate<'a> {
             row_group_ranges,
         }
     }
+
+    /// The file's row group count, which every sort column's bounds share.
+    fn row_group_count(&self) -> usize {
+        self.row_group_ranges
+            .first()
+            .map_or(0, |per_column| per_column.len())
+    }
 }
 
 fn compare(left: &ArrayRef, right: &ArrayRef) -> Option<Ordering> {
-    if left.len() != 1
-        || right.len() != 1
-        || left.is_null(0)
-        || right.is_null(0)
-        || left.data_type() != right.data_type()
-    {
+    if left.len() != 1 || right.len() != 1 || left.is_null(0) || right.is_null(0) {
         return None;
     }
+    // One column's bounds reach selection from two places that need not decode
+    // them alike: a file's own statistics come from the table log, its row
+    // groups' from its footer, and the same logical type can arrive as `Utf8`
+    // from one and `Utf8View` from the other. Cast the pair together rather
+    // than calling it incomparable, which would leave every comparison
+    // undecided.
+    if left.data_type() != right.data_type() {
+        let right = cast(right.as_ref(), left.data_type()).ok()?;
+        return compare_same_type(left, &right);
+    }
+    compare_same_type(left, right)
+}
+
+fn compare_same_type(left: &ArrayRef, right: &ArrayRef) -> Option<Ordering> {
     if cmp::eq(left, right).ok()?.value(0) {
         return Some(Ordering::Equal);
     }
@@ -75,24 +83,7 @@ fn compare(left: &ArrayRef, right: &ArrayRef) -> Option<Ordering> {
     })
 }
 
-/// Width between two ordered numeric values, used to calculate what fraction
-/// of one file's uniform distribution lies in an interval.
-fn numeric_width(lower: &ArrayRef, upper: &ArrayRef) -> Option<f64> {
-    let lower = cast(lower.as_ref(), &DataType::Float64).ok()?;
-    let upper = cast(upper.as_ref(), &DataType::Float64).ok()?;
-    let width = sub(&upper, &lower).ok()?;
-    let width = width.as_any().downcast_ref::<Float64Array>()?.value(0);
-    (width > 0.0 && width.is_finite()).then_some(width)
-}
-
-fn is_string_type(array: &ArrayRef) -> bool {
-    matches!(
-        array.data_type(),
-        DataType::Utf8 | DataType::Utf8View | DataType::BinaryView
-    )
-}
-
-/// Find the highest-overlap pair among `candidates`. The caller has already
+/// Find the most contested pair among `candidates`. The caller has already
 /// grouped these large-file candidates by partition. Only pairs with a
 /// positive score are candidates, so `None` means no rewrite is worthwhile. A
 /// sweep over the files sorted by their minimum on the first sort column
@@ -127,8 +118,8 @@ pub(super) fn highest_scoring_pair<'a>(
     let mut active: Vec<&SortColumnRange<'a, '_>> = Vec::new();
     for range in &ranges {
         // Stats are inclusive, so a partner whose maximum equals this minimum
-        // still shares rows with it: wide ranges score zero there, but equal
-        // singletons defer to the next sort column and must stay paired.
+        // still shares rows with it: the row groups meeting at that value are
+        // contested, and equal singletons defer to the next sort column.
         active.retain(|partner| compare(partner.max, range.min) != Some(Ordering::Less));
         for partner in &active {
             let left = partner.candidate.entry;
@@ -153,9 +144,17 @@ pub(super) fn highest_scoring_pair<'a>(
 }
 
 /// The score a pair earns once it clears every gate: its combined size must
-/// fit the output ceiling unless a rewrite can separate it, both files must
-/// have enough contested row groups, and the overlap must be positive. `None`
-/// is a pair no round should merge.
+/// fit the output ceiling unless a rewrite can separate it, its rows must
+/// interleave in sort order, and both files must have enough contested row
+/// groups. `None` is a pair no round should merge.
+///
+/// The score itself is the pair's contested row-group fraction, which is
+/// counted from the footers rather than estimated: a file's own fraction is
+/// the share of its row groups whose bounds meet the other file's range, and
+/// the pair takes the smaller of the two. That is the share of each file a
+/// rewrite can restructure, and taking the smaller keeps a narrow file nested
+/// inside a much wider one from outranking a pair that restructures both
+/// sides.
 fn gated_pair_score(
     left: &SortColumnRange,
     right: &SortColumnRange,
@@ -168,11 +167,70 @@ fn gated_pair_score(
     if combined_size > target_bytes && is_irreducible_pair(left_entry, right_entry, sort_by) {
         return None;
     }
-    if !enough_contested_row_groups(left, right) {
+    let decision = decide_pair(left_entry, right_entry, sort_by)?;
+    let split = split_row_groups(left.candidate, right.candidate, &decision);
+    if !split.meets_row_group_requirement() {
         return None;
     }
-    let score = file_overlap(left_entry, right_entry, sort_by)?;
-    (score > 0.0).then_some(score)
+    Some(split.contested_fraction())
+}
+
+/// Which sort column tells a pair's two files apart, and their bounds on it.
+enum PairDecision<'a> {
+    /// Both files hold the same single value on every sort column: their
+    /// layouts are the same one throughout.
+    Identical,
+    /// The first sort column on which the files are not that same single
+    /// value, by its position in the sort order, with each file's range on it.
+    Column {
+        index: usize,
+        left: (&'a ArrayRef, &'a ArrayRef),
+        right: (&'a ArrayRef, &'a ArrayRef),
+    },
+}
+
+/// Where a pair is decided, or `None` for a pair no round should merge: one
+/// whose rows do not interleave, or one whose statistics do not carry a sort
+/// column. Files are sorted by the whole key, so a column decides the pair
+/// only once the two files are not the same single value on it: while both
+/// hold one identical value there, their rows are ordered by the next key.
+/// Statistics are inclusive, so ranges touching at a boundary value still
+/// interleave.
+fn decide_pair<'a>(
+    left: &'a DeltaFileEntry,
+    right: &'a DeltaFileEntry,
+    sort_by: &[String],
+) -> Option<PairDecision<'a>> {
+    let (Some(left_stats), Some(right_stats)) = (&left.stats, &right.stats) else {
+        return None;
+    };
+    for (index, column) in sort_by.iter().enumerate() {
+        let (Some(left_min), Some(left_max), Some(right_min), Some(right_max)) = (
+            left_stats.min_values.get(column),
+            left_stats.max_values.get(column),
+            right_stats.min_values.get(column),
+            right_stats.max_values.get(column),
+        ) else {
+            return None;
+        };
+        let same_value = compare(left_min, left_max) == Some(Ordering::Equal)
+            && compare(right_min, right_max) == Some(Ordering::Equal)
+            && compare(left_min, right_min) == Some(Ordering::Equal);
+        if same_value {
+            continue;
+        }
+        if compare(left_max, right_min) == Some(Ordering::Less)
+            || compare(right_max, left_min) == Some(Ordering::Less)
+        {
+            return None;
+        }
+        return Some(PairDecision::Column {
+            index,
+            left: (left_min, left_max),
+            right: (right_min, right_max),
+        });
+    }
+    Some(PairDecision::Identical)
 }
 
 /// Whether two files' ranges on the sweep column share any value. Stats are
@@ -218,28 +276,66 @@ pub(super) struct SelectedPair<'a> {
     pub(super) selectable_pairs: usize,
 }
 
-/// A pair's row groups split by whether they intersect the other file's range
-/// on the sweep column. Intersecting groups are the ones a rewrite can
-/// restructure; the rest already sit outside the contested range. A row group
-/// whose footer recorded no bounds counts as intersecting, the same way the
-/// selection gate counts it.
+/// A pair's row groups split by whether they overlap the other file's range on
+/// the sweep column. Overlapping groups are the ones a rewrite can
+/// restructure; the rest already sit outside the contested range, as do the
+/// groups that only reach the other range's boundary value. A row group whose
+/// footer recorded no bounds counts as overlapping, the same way the selection
+/// gate counts it.
 pub(super) struct SplitRowGroups {
-    pub(super) left_intersecting: usize,
+    pub(super) left_overlapping: usize,
     pub(super) left_disjoint: usize,
-    pub(super) right_intersecting: usize,
+    pub(super) right_overlapping: usize,
     pub(super) right_disjoint: usize,
 }
 
-fn split_row_groups(left: &SortColumnRange, right: &SortColumnRange) -> SplitRowGroups {
-    let left_total = left.candidate.row_group_ranges.len();
-    let right_total = right.candidate.row_group_ranges.len();
-    let left_intersecting = count_contested_row_groups(left, right);
-    let right_intersecting = count_contested_row_groups(right, left);
+impl SplitRowGroups {
+    /// The share of the less contested file's row groups that a rewrite can
+    /// restructure. A pair only reaches this once the gate has found contested
+    /// groups on both sides, so neither file is without row groups here.
+    fn contested_fraction(&self) -> f64 {
+        let left = self.left_overlapping as f64
+            / (self.left_overlapping + self.left_disjoint).max(1) as f64;
+        let right = self.right_overlapping as f64
+            / (self.right_overlapping + self.right_disjoint).max(1) as f64;
+        left.min(right)
+    }
+
+    /// Whether both files have more than a fifth of their row groups
+    /// overlapping the other, which is what makes a rewrite worthwhile.
+    fn meets_row_group_requirement(&self) -> bool {
+        let left_total = self.left_overlapping + self.left_disjoint;
+        let right_total = self.right_overlapping + self.right_disjoint;
+        self.left_overlapping >= required_contested_row_groups(left_total)
+            && self.right_overlapping >= required_contested_row_groups(right_total)
+    }
+}
+
+/// Count each file's row groups against the other file's range on the column
+/// that decides the pair. Two files that are the same single value on every
+/// sort column hold one another's rows throughout, so all of their groups are
+/// contested.
+fn split_row_groups(
+    left: &LayoutCandidate,
+    right: &LayoutCandidate,
+    decision: &PairDecision,
+) -> SplitRowGroups {
+    let (left_overlapping, right_overlapping) = match decision {
+        PairDecision::Identical => (left.row_group_count(), right.row_group_count()),
+        PairDecision::Column {
+            index,
+            left: left_range,
+            right: right_range,
+        } => (
+            count_contested_row_groups(left, *index, *right_range),
+            count_contested_row_groups(right, *index, *left_range),
+        ),
+    };
     SplitRowGroups {
-        left_intersecting,
-        left_disjoint: left_total - left_intersecting,
-        right_intersecting,
-        right_disjoint: right_total - right_intersecting,
+        left_overlapping,
+        left_disjoint: left.row_group_count() - left_overlapping,
+        right_overlapping,
+        right_disjoint: right.row_group_count() - right_overlapping,
     }
 }
 
@@ -339,11 +435,19 @@ impl LayoutScores {
                 left.total_cmp(right).then_with(|| right_key.cmp(left_key))
             })?;
         let (low, high) = pair_ids(key);
+        // A remembered pair was decided once already, on statistics that do
+        // not change while the two files exist, so this repeats that verdict
+        // rather than reaching a new one.
+        let decision = decide_pair(entries[&low], entries[&high], sort_by)?;
         Some(SelectedPair {
             score: f64::from(score),
             left: entries[&low],
             right: entries[&high],
-            row_groups: split_row_groups(&ranges[&low], &ranges[&high]),
+            row_groups: split_row_groups(
+                ranges[&low].candidate,
+                ranges[&high].candidate,
+                &decision,
+            ),
             selectable_pairs: self.pairs.keys().filter(|key| is_selectable(**key)).count(),
         })
     }
@@ -410,33 +514,23 @@ fn extract_column_range<'a, 'c>(
 
 /// Contested row groups a file with `total` row groups must have before a
 /// merge is worthwhile: strictly more than a fifth of them. Five groups need
-/// two, fifty need eleven. One contested group is the irreducible overlap of
-/// sorted files that touch at a boundary value, and is also all a single
-/// outlier row can fabricate, so the requirement climbs past it once a file
-/// has five groups; scaling with the count keeps a many-group file from
-/// qualifying on a sliver of itself.
+/// two, fifty need eleven. One contested group is all a single outlier row can
+/// fabricate, so the requirement climbs past it once a file has five groups;
+/// scaling with the count keeps a many-group file from qualifying on a sliver
+/// of itself. This is the only bar a pair has to clear: a round merges every
+/// pair that clears it, most contested first.
 fn required_contested_row_groups(total: usize) -> usize {
     total / 5 + 1
 }
 
-/// Whether enough of each file's row groups intersect the other file's range
-/// on the sweep column for a merge to restructure real data on both sides.
-/// This is what stops one wide file from being merged, sliver by sliver,
-/// against a run of narrow neighbors it barely shares rows with.
-fn enough_contested_row_groups(left: &SortColumnRange, right: &SortColumnRange) -> bool {
-    meets_row_group_requirement(left, right) && meets_row_group_requirement(right, left)
-}
-
-fn meets_row_group_requirement(file: &SortColumnRange, partner: &SortColumnRange) -> bool {
-    count_contested_row_groups(file, partner)
-        >= required_contested_row_groups(file.candidate.row_group_ranges.len())
-}
-
-/// How many of `file`'s row groups intersect `partner`'s range on the sweep
-/// column.
-fn count_contested_row_groups(file: &SortColumnRange, partner: &SortColumnRange) -> usize {
-    file.candidate
-        .row_group_ranges
+/// How many of `file`'s row groups overlap `partner`'s range on the sort
+/// column at `column`.
+fn count_contested_row_groups(
+    file: &LayoutCandidate,
+    column: usize,
+    partner: (&ArrayRef, &ArrayRef),
+) -> usize {
+    file.row_group_ranges[column]
         .iter()
         .filter(|bounds| {
             // A row group without recorded bounds can hold rows anywhere in
@@ -444,10 +538,27 @@ fn count_contested_row_groups(file: &SortColumnRange, partner: &SortColumnRange)
             let Some((min, max)) = bounds else {
                 return true;
             };
-            compare(max, partner.min) != Some(Ordering::Less)
-                && compare(min, partner.max) != Some(Ordering::Greater)
+            overlaps_range(min, max, partner)
         })
         .count()
+}
+
+/// Whether a row group's bounds overlap `partner`'s range rather than merely
+/// reach it. Statistics are inclusive, so two ranges that meet at one value
+/// touch without sharing a stretch of the key, and a rewrite that splits them
+/// there has nothing to separate: only a shared stretch counts. Two files that
+/// hold nothing but the same single value are the exception, having no width
+/// to share and yet the same rows throughout.
+fn overlaps_range(min: &ArrayRef, max: &ArrayRef, partner: (&ArrayRef, &ArrayRef)) -> bool {
+    let (partner_min, partner_max) = partner;
+    if compare(max, partner_min) == Some(Ordering::Greater)
+        && compare(min, partner_max) == Some(Ordering::Less)
+    {
+        return true;
+    }
+    compare(min, max) == Some(Ordering::Equal)
+        && compare(partner_min, partner_max) == Some(Ordering::Equal)
+        && compare(min, partner_min) == Some(Ordering::Equal)
 }
 
 /// Whether no range rewrite can separate these files' overlapping rows. On
@@ -502,95 +613,11 @@ pub(super) fn is_irreducible_pair(
     true
 }
 
-fn uniform_range<'a>(entry: &'a DeltaFileEntry, column: &str) -> Option<UniformRange<'a>> {
-    let stats = entry.stats.as_ref()?;
-    if stats.num_records? <= 0 {
-        return None;
-    }
-    let min = stats.min_values.get(column)?;
-    let max = stats.max_values.get(column)?;
-    if compare(min, max)? == Ordering::Greater {
-        return None;
-    }
-    Some(UniformRange { min, max })
-}
-
-enum ColumnOverlap {
-    /// Both files contain exactly the same value on this key, so the next key
-    /// is the first one that can distinguish their layout.
-    NextSortColumn,
-    Score(f64),
-}
-
-/// Overlap of the pair on one sort column: the smaller of the two files' own
-/// contested fractions, where a file's contested fraction is the share of its
-/// rows, assumed uniform across its min/max range, that fall inside the
-/// intersection. Requiring both files to be meaningfully contested keeps a
-/// narrow file nested inside a much wider one from forcing a rewrite the wide
-/// file barely benefits from; two files only merge when the rewrite
-/// re-partitions a real share of each of them.
-fn column_overlap(left: &UniformRange<'_>, right: &UniformRange<'_>) -> Option<ColumnOverlap> {
-    let left_singleton = compare(left.min, left.max)? == Ordering::Equal;
-    let right_singleton = compare(right.min, right.max)? == Ordering::Equal;
-    if left_singleton && right_singleton {
-        return Some(if compare(left.min, right.min)? == Ordering::Equal {
-            ColumnOverlap::NextSortColumn
-        } else {
-            ColumnOverlap::Score(0.0)
-        });
-    }
-    // A singleton spans no width, so its partner's contested fraction is zero
-    // and so is the pair's minimum.
-    if left_singleton || right_singleton {
-        return Some(ColumnOverlap::Score(0.0));
-    }
-
-    let intersection_min = if compare(left.min, right.min)? == Ordering::Less {
-        right.min
-    } else {
-        left.min
-    };
-    let intersection_max = if compare(left.max, right.max)? == Ordering::Greater {
-        right.max
-    } else {
-        left.max
-    };
-    if compare(intersection_min, intersection_max)? != Ordering::Less {
-        return Some(ColumnOverlap::Score(0.0));
-    }
-
-    if is_string_type(intersection_min) {
-        return Some(ColumnOverlap::Score(STRING_OVERLAP_SCORE));
-    }
-
-    let covered_width = numeric_width(intersection_min, intersection_max)?;
-    let left_fraction = covered_width / numeric_width(left.min, left.max)?;
-    let right_fraction = covered_width / numeric_width(right.min, right.max)?;
-    Some(ColumnOverlap::Score(
-        left_fraction.min(right_fraction).min(1.0),
-    ))
-}
-
-fn file_overlap(left: &DeltaFileEntry, right: &DeltaFileEntry, sort_by: &[String]) -> Option<f64> {
-    for column in sort_by {
-        match column_overlap(
-            &uniform_range(left, column)?,
-            &uniform_range(right, column)?,
-        )? {
-            ColumnOverlap::NextSortColumn => continue,
-            ColumnOverlap::Score(score) => return Some(score),
-        }
-    }
-    // Every sort key is the same singleton in both files: their layouts overlap
-    // completely even though no key has a non-zero range width.
-    Some(1.0)
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, Int64Array, StringViewArray};
+    use arrow_array::{ArrayRef, Int64Array, StringArray, StringViewArray};
 
     use super::*;
     use crate::manifest::FileStats;
@@ -624,117 +651,87 @@ mod tests {
         entry
     }
 
-    fn score(overlap: Option<ColumnOverlap>) -> Option<f64> {
-        match overlap? {
-            ColumnOverlap::NextSortColumn => None,
-            ColumnOverlap::Score(score) => Some(score),
-        }
-    }
-
     /// A candidate whose file has one row group spanning its whole range on
-    /// `sweep_column`, the layout a small single-group parquet has.
-    fn candidate<'a>(entry: &'a DeltaFileEntry, sweep_column: &str) -> LayoutCandidate<'a> {
+    /// each of `sort_by`, the layout a small single-group parquet has.
+    fn candidate<'a>(entry: &'a DeltaFileEntry, sort_by: &[&str]) -> LayoutCandidate<'a> {
         let stats = entry.stats.as_ref().unwrap();
         LayoutCandidate {
             entry,
-            row_group_ranges: vec![Some((
-                stats.min_values[sweep_column].clone(),
-                stats.max_values[sweep_column].clone(),
-            ))],
+            row_group_ranges: sort_by
+                .iter()
+                .map(|column| {
+                    vec![Some((
+                        stats.min_values[*column].clone(),
+                        stats.max_values[*column].clone(),
+                    ))]
+                })
+                .collect(),
         }
     }
 
+    /// A candidate of a singly sorted table, whose row groups span `groups` on
+    /// its one sort column.
     fn candidate_with_row_groups<'a>(
         entry: &'a DeltaFileEntry,
         groups: &[(i64, i64)],
     ) -> LayoutCandidate<'a> {
         LayoutCandidate {
             entry,
-            row_group_ranges: groups
-                .iter()
-                .map(|(min, max)| Some((int_stat(*min), int_stat(*max))))
-                .collect(),
+            row_group_ranges: vec![
+                groups
+                    .iter()
+                    .map(|(min, max)| Some((int_stat(*min), int_stat(*max))))
+                    .collect(),
+            ],
         }
     }
 
-    fn column_overlap_between(
-        left_min: &ArrayRef,
-        left_max: &ArrayRef,
-        right_min: &ArrayRef,
-        right_max: &ArrayRef,
-    ) -> Option<ColumnOverlap> {
-        column_overlap(
-            &UniformRange {
-                min: left_min,
-                max: left_max,
-            },
-            &UniformRange {
-                min: right_min,
-                max: right_max,
-            },
-        )
+    /// A candidate of a table sorted by `leading_keys` string columns and one
+    /// integer column last, `leading` giving each leading key's row-group
+    /// bounds and `trailing` the last key's.
+    fn keyed_candidate<'a>(
+        entry: &'a DeltaFileEntry,
+        leading_keys: usize,
+        leading: &[(&str, &str)],
+        trailing: &[(i64, i64)],
+    ) -> LayoutCandidate<'a> {
+        let leading: Vec<Option<(ArrayRef, ArrayRef)>> = leading
+            .iter()
+            .map(|(min, max)| Some((string_stat(min), string_stat(max))))
+            .collect();
+        let mut row_group_ranges = vec![leading; leading_keys];
+        row_group_ranges.push(
+            trailing
+                .iter()
+                .map(|(min, max)| Some((int_stat(*min), int_stat(*max))))
+                .collect(),
+        );
+        LayoutCandidate {
+            entry,
+            row_group_ranges,
+        }
     }
 
-    #[test]
-    fn numeric_overlap_is_the_smaller_contested_fraction() {
-        let mutual = score(column_overlap_between(
-            &int_stat(0),
-            &int_stat(100),
-            &int_stat(50),
-            &int_stat(150),
-        ))
-        .unwrap();
-        let contained = score(column_overlap_between(
-            &int_stat(0),
-            &int_stat(100),
-            &int_stat(40),
-            &int_stat(45),
-        ))
-        .unwrap();
-
-        // [50, 100] is half of each range; [40, 45] is all of the narrow file
-        // but only 5% of the wide one, and the wide file's side decides.
-        assert!((mutual - 0.5).abs() < 1e-12);
-        assert!((contained - 0.05).abs() < 1e-12);
+    fn candidate_with_string_row_groups<'a>(
+        entry: &'a DeltaFileEntry,
+        groups: &[(&str, &str)],
+    ) -> LayoutCandidate<'a> {
+        LayoutCandidate {
+            entry,
+            row_group_ranges: vec![
+                groups
+                    .iter()
+                    .map(|(min, max)| Some((string_stat(min), string_stat(max))))
+                    .collect(),
+            ],
+        }
     }
 
+    /// Files holding one identical value on the leading keys are told apart
+    /// by the next one, and it is that key's row groups that are counted.
     #[test]
-    fn singleton_overlap_follows_sort_key_rules() {
-        assert!(matches!(
-            column_overlap_between(&int_stat(7), &int_stat(7), &int_stat(7), &int_stat(7)),
-            Some(ColumnOverlap::NextSortColumn)
-        ));
-        assert_eq!(
-            score(column_overlap_between(
-                &int_stat(7),
-                &int_stat(7),
-                &int_stat(8),
-                &int_stat(8),
-            )),
-            Some(0.0)
-        );
-        assert_eq!(
-            score(column_overlap_between(
-                &int_stat(7),
-                &int_stat(7),
-                &int_stat(0),
-                &int_stat(10),
-            )),
-            Some(0.0)
-        );
-        assert_eq!(
-            score(column_overlap_between(
-                &int_stat(11),
-                &int_stat(11),
-                &int_stat(0),
-                &int_stat(10),
-            )),
-            Some(0.0)
-        );
-    }
-
-    #[test]
-    fn equal_singleton_prefix_advances_to_next_sort_column() {
+    fn equal_singleton_prefix_measures_the_next_sort_column() {
+        let sort_by = ["region".into(), "id".into()];
         let left = stats_entry(
             "left",
             &[
@@ -749,13 +746,70 @@ mod tests {
                 ("id", int_stat(50), int_stat(150)),
             ],
         );
-        let files = [candidate(&left, "region"), candidate(&right, "region")];
-        let (overlap, _, _) =
-            highest_scoring_pair(&files, &["region".into(), "id".into()], u64::MAX).unwrap();
-        assert!((overlap - 0.5).abs() < 1e-12);
+        let files = [
+            keyed_candidate(
+                &left,
+                1,
+                &[("us", "us"); 5],
+                &[(0, 20), (20, 40), (40, 60), (60, 80), (80, 100)],
+            ),
+            keyed_candidate(
+                &right,
+                1,
+                &[("us", "us"); 5],
+                &[(50, 70), (70, 90), (90, 110), (110, 130), (130, 150)],
+            ),
+        ];
+
+        let (overlap, _, _) = highest_scoring_pair(&files, &sort_by, u64::MAX).unwrap();
+
+        // Three of each file's five groups reach into the other's id range,
+        // which the shared region says nothing about.
+        assert!((overlap - 0.6).abs() < 1e-12);
         assert!(
             highest_scoring_pair(&files, &["region".into(), "missing".into()], u64::MAX).is_none()
         );
+    }
+
+    /// Two files of one deployment and one service, holding different stretches
+    /// of time, are ordered apart by that time: nothing to merge.
+    #[test]
+    fn identical_leading_keys_with_disjoint_next_key_is_no_pair() {
+        let sort_by = ["deployment".into(), "service".into(), "time".into()];
+        let early = stats_entry(
+            "early",
+            &[
+                ("deployment", string_stat("a"), string_stat("a")),
+                ("service", string_stat("a"), string_stat("a")),
+                ("time", int_stat(1), int_stat(10)),
+            ],
+        );
+        let late = stats_entry(
+            "late",
+            &[
+                ("deployment", string_stat("a"), string_stat("a")),
+                ("service", string_stat("a"), string_stat("a")),
+                ("time", int_stat(20), int_stat(30)),
+            ],
+        );
+        let files = [
+            keyed_candidate(
+                &early,
+                2,
+                &[("a", "a"); 5],
+                &[(1, 2), (3, 4), (5, 6), (7, 8), (9, 10)],
+            ),
+            keyed_candidate(
+                &late,
+                2,
+                &[("a", "a"); 5],
+                &[(20, 22), (23, 24), (25, 26), (27, 28), (29, 30)],
+            ),
+        ];
+
+        let best = highest_scoring_pair(&files, &sort_by, u64::MAX);
+
+        assert!(best.is_none());
     }
 
     #[test]
@@ -819,14 +873,16 @@ mod tests {
         let pinned = sized_entry("pinned", 100, 100, 60);
         let contained = sized_entry("contained", 0, 50, 10);
         let files = [
-            candidate(&range, "id"),
-            candidate(&pinned, "id"),
-            candidate(&contained, "id"),
+            candidate(&range, &["id"]),
+            candidate(&pinned, &["id"]),
+            candidate(&contained, &["id"]),
         ];
 
         let (score, left, right) = highest_scoring_pair(&files, &["id".into()], 100).unwrap();
 
-        assert!((score - 0.5).abs() < 1e-12);
+        // The oversized pair is skipped, leaving one whose single row groups
+        // are contested in whole.
+        assert!((score - 1.0).abs() < 1e-12);
         assert_eq!(left.file.path.as_str(), "range");
         assert_eq!(right.file.path.as_str(), "contained");
     }
@@ -834,16 +890,7 @@ mod tests {
     /// Remembered scores pick what the sweep picks.
     #[test]
     fn remembered_scores_agree_with_the_sweep() {
-        let wide = stats_entry("wide", &[("id", int_stat(0), int_stat(100))]);
-        let contained = stats_entry("contained", &[("id", int_stat(40), int_stat(45))]);
-        let shifted = stats_entry("shifted", &[("id", int_stat(90), int_stat(190))]);
-        let disjoint = stats_entry("disjoint", &[("id", int_stat(500), int_stat(600))]);
-        let files = vec![
-            candidate(&shifted, "id"),
-            candidate(&disjoint, "id"),
-            candidate(&wide, "id"),
-            candidate(&contained, "id"),
-        ];
+        let files = layered_candidates();
         let mut scores = LayoutScores::new();
 
         let selected = scores
@@ -879,10 +926,10 @@ mod tests {
         let far_overlapping =
             stats_entry("far-overlapping", &[("id", int_stat(510), int_stat(590))]);
         let files = vec![
-            candidate(&wide, "id"),
-            candidate(&overlapping, "id"),
-            candidate(&far, "id"),
-            candidate(&far_overlapping, "id"),
+            candidate(&wide, &["id"]),
+            candidate(&overlapping, &["id"]),
+            candidate(&far, &["id"]),
+            candidate(&far_overlapping, &["id"]),
         ];
         let mut scores = LayoutScores::new();
         let selected = scores
@@ -920,9 +967,9 @@ mod tests {
         let far = stats_entry("far", &[("id", int_stat(150), int_stat(250))]);
         let mut scores = LayoutScores::new();
         let before = vec![
-            candidate(&wide, "id"),
-            candidate(&shifted, "id"),
-            candidate(&far, "id"),
+            candidate(&wide, &["id"]),
+            candidate(&shifted, &["id"]),
+            candidate(&far, &["id"]),
         ];
         scores.best_pair(
             std::slice::from_ref(&before),
@@ -931,7 +978,7 @@ mod tests {
             &HashSet::new(),
         );
         let merged = stats_entry("merged", &[("id", int_stat(140), int_stat(200))]);
-        let after = vec![candidate(&far, "id"), candidate(&merged, "id")];
+        let after = vec![candidate(&far, &["id"]), candidate(&merged, &["id"])];
 
         let selected = scores
             .best_pair(
@@ -942,9 +989,8 @@ mod tests {
             )
             .unwrap();
 
-        // [150, 200] contests half of merged's [140, 200] and half of far's
-        // [150, 250].
-        assert!((selected.score - 0.5).abs() < 1e-6);
+        // One row group each, both reaching into the other's range.
+        assert!((selected.score - 1.0).abs() < 1e-6);
         let mut pair = [
             selected.left.file.path.as_str(),
             selected.right.file.path.as_str(),
@@ -958,26 +1004,50 @@ mod tests {
         );
     }
 
+    /// Four files of five row groups each: a wide file, a file shifted half a
+    /// range past it, a narrow file inside it, and one nowhere near the rest.
+    fn layered_candidates() -> Vec<LayoutCandidate<'static>> {
+        static WIDE: std::sync::OnceLock<DeltaFileEntry> = std::sync::OnceLock::new();
+        static SHIFTED: std::sync::OnceLock<DeltaFileEntry> = std::sync::OnceLock::new();
+        static CONTAINED: std::sync::OnceLock<DeltaFileEntry> = std::sync::OnceLock::new();
+        static DISJOINT: std::sync::OnceLock<DeltaFileEntry> = std::sync::OnceLock::new();
+        let wide = WIDE.get_or_init(|| stats_entry("wide", &[("id", int_stat(0), int_stat(100))]));
+        let shifted =
+            SHIFTED.get_or_init(|| stats_entry("shifted", &[("id", int_stat(50), int_stat(150))]));
+        let contained = CONTAINED
+            .get_or_init(|| stats_entry("contained", &[("id", int_stat(40), int_stat(45))]));
+        let disjoint = DISJOINT
+            .get_or_init(|| stats_entry("disjoint", &[("id", int_stat(500), int_stat(600))]));
+        vec![
+            candidate_with_row_groups(
+                shifted,
+                &[(50, 70), (70, 90), (90, 110), (110, 130), (130, 150)],
+            ),
+            candidate_with_row_groups(
+                disjoint,
+                &[(500, 520), (520, 540), (540, 560), (560, 580), (580, 600)],
+            ),
+            candidate_with_row_groups(wide, &[(0, 20), (20, 40), (40, 60), (60, 80), (80, 100)]),
+            candidate_with_row_groups(
+                contained,
+                &[(40, 41), (41, 42), (42, 43), (43, 44), (44, 45)],
+            ),
+        ]
+    }
+
     #[test]
     fn sweep_selects_the_highest_overlap_pair_among_many_files() {
-        let wide = stats_entry("wide", &[("id", int_stat(0), int_stat(100))]);
-        let contained = stats_entry("contained", &[("id", int_stat(40), int_stat(45))]);
-        let shifted = stats_entry("shifted", &[("id", int_stat(90), int_stat(190))]);
-        let disjoint = stats_entry("disjoint", &[("id", int_stat(500), int_stat(600))]);
-        let files = [
-            candidate(&shifted, "id"),
-            candidate(&disjoint, "id"),
-            candidate(&wide, "id"),
-            candidate(&contained, "id"),
-        ];
+        let files = layered_candidates();
 
         let (score, left, right) = highest_scoring_pair(&files, &["id".into()], u64::MAX).unwrap();
 
-        // [90, 100] contests 10% of both wide and shifted, beating the
-        // contained file, which contests only 5% of wide.
-        assert!((score - 0.1).abs() < 1e-12);
-        assert_eq!(left.file.path.as_str(), "wide");
-        assert_eq!(right.file.path.as_str(), "shifted");
+        // Three of wide's five groups reach into shifted and three of
+        // shifted's reach back, against the two of wide's that the contained
+        // file touches.
+        assert!((score - 0.6).abs() < 1e-12);
+        let mut pair = [left.file.path.as_str(), right.file.path.as_str()];
+        pair.sort();
+        assert_eq!(pair, ["shifted", "wide"]);
     }
 
     #[test]
@@ -986,7 +1056,7 @@ mod tests {
         let high = stats_entry("high", &[("id", int_stat(20), int_stat(30))]);
 
         let best = highest_scoring_pair(
-            &[candidate(&low, "id"), candidate(&high, "id")],
+            &[candidate(&low, &["id"]), candidate(&high, &["id"])],
             &["id".into()],
             u64::MAX,
         );
@@ -998,26 +1068,33 @@ mod tests {
     fn contained_singleton_never_attracts_a_merge() {
         let wide = stats_entry("wide", &[("id", int_stat(0), int_stat(100))]);
         let singleton = stats_entry("singleton", &[("id", int_stat(50), int_stat(50))]);
-        let partner = stats_entry("partner", &[("id", int_stat(80), int_stat(180))]);
+        let partner = stats_entry("partner", &[("id", int_stat(70), int_stat(170))]);
+        let wide_groups = [(0, 20), (20, 40), (40, 60), (60, 80), (80, 100)];
+        let singleton_groups = [(50, 50), (50, 50), (50, 50), (50, 50), (50, 50)];
+        let partner_groups = [(70, 90), (90, 110), (110, 130), (130, 150), (150, 170)];
 
         let alone = highest_scoring_pair(
-            &[candidate(&wide, "id"), candidate(&singleton, "id")],
+            &[
+                candidate_with_row_groups(&wide, &wide_groups),
+                candidate_with_row_groups(&singleton, &singleton_groups),
+            ],
             &["id".into()],
             u64::MAX,
         );
         let (score, left, right) = highest_scoring_pair(
             &[
-                candidate(&wide, "id"),
-                candidate(&singleton, "id"),
-                candidate(&partner, "id"),
+                candidate_with_row_groups(&wide, &wide_groups),
+                candidate_with_row_groups(&singleton, &singleton_groups),
+                candidate_with_row_groups(&partner, &partner_groups),
             ],
             &["id".into()],
             u64::MAX,
         )
         .unwrap();
 
+        // The singleton sits in one of wide's five groups, too few to rewrite.
         assert!(alone.is_none());
-        assert!((score - 0.2).abs() < 1e-12);
+        assert!((score - 0.4).abs() < 1e-12);
         assert_eq!(left.file.path.as_str(), "wide");
         assert_eq!(right.file.path.as_str(), "partner");
     }
@@ -1057,7 +1134,8 @@ mod tests {
 
         let (score, _, _) = highest_scoring_pair(&files, &["id".into()], u64::MAX).unwrap();
 
-        assert!((score - 0.5).abs() < 1e-12);
+        // Three of each file's five groups reach into the other's range.
+        assert!((score - 0.6).abs() < 1e-12);
     }
 
     #[test]
@@ -1067,14 +1145,14 @@ mod tests {
         let files = [
             LayoutCandidate {
                 entry: &wide,
-                row_group_ranges: vec![None; 5],
+                row_group_ranges: vec![vec![None; 5]],
             },
             candidate_with_row_groups(&narrow, &[(3, 3), (3, 4), (4, 4), (4, 4), (4, 4)]),
         ];
 
         let (score, _, _) = highest_scoring_pair(&files, &["id".into()], u64::MAX).unwrap();
 
-        assert!((score - 1.0 / 99.0).abs() < 1e-12);
+        assert!((score - 1.0).abs() < 1e-12);
     }
 
     #[test]
@@ -1088,9 +1166,9 @@ mod tests {
         let second = sized_entry("second", 60);
         let small = sized_entry("small", 30);
         let files = [
-            candidate(&first, "id"),
-            candidate(&second, "id"),
-            candidate(&small, "id"),
+            candidate(&first, &["id"]),
+            candidate(&second, &["id"]),
+            candidate(&small, &["id"]),
         ];
 
         let (score, left, right) = highest_scoring_pair(&files, &["id".into()], 100).unwrap();
@@ -1100,7 +1178,7 @@ mod tests {
         assert_eq!(right.file.path.as_str(), "small");
         assert!(
             highest_scoring_pair(
-                &[candidate(&first, "id"), candidate(&second, "id")],
+                &[candidate(&first, &["id"]), candidate(&second, &["id"])],
                 &["id".into()],
                 100
             )
@@ -1108,34 +1186,64 @@ mod tests {
         );
     }
 
+    /// A file's statistics come from the table log and its row groups' from
+    /// its footer, which decode a string column to `Utf8` and `Utf8View`. The
+    /// two still have to compare.
     #[test]
-    fn intersecting_string_ranges_score_a_flat_half_overlap() {
-        assert_eq!(
-            score(column_overlap_between(
-                &string_stat("customer-aaaaaaaa"),
-                &string_stat("customer-zzzzzzzz"),
-                &string_stat("customer-mmmmmmmm"),
-                &string_stat("customer-tttttttt"),
-            )),
-            Some(STRING_OVERLAP_SCORE)
-        );
-        assert_eq!(
-            score(column_overlap_between(
-                &string_stat("a"),
-                &string_stat("f"),
-                &string_stat("m"),
-                &string_stat("z"),
-            )),
-            Some(0.0)
-        );
-        assert_eq!(
-            score(column_overlap_between(
-                &string_stat("g"),
-                &string_stat("g"),
-                &string_stat("a"),
-                &string_stat("z"),
-            )),
-            Some(0.0)
-        );
+    fn row_groups_are_counted_against_differently_encoded_file_stats() {
+        let utf8_stat = |value: &str| Arc::new(StringArray::from(vec![value])) as ArrayRef;
+        let mut left = stats_entry("left", &[("id", utf8_stat("a"), utf8_stat("m"))]);
+        left.file.size = 1;
+        let right = stats_entry("right", &[("id", utf8_stat("g"), utf8_stat("z"))]);
+        let files = [
+            candidate_with_string_row_groups(
+                &left,
+                &[("a", "c"), ("d", "f"), ("g", "i"), ("j", "l"), ("l", "m")],
+            ),
+            candidate_with_string_row_groups(
+                &right,
+                &[("g", "k"), ("k", "o"), ("o", "s"), ("s", "w"), ("w", "z")],
+            ),
+        ];
+
+        let (score, _, _) = highest_scoring_pair(&files, &["id".into()], u64::MAX).unwrap();
+
+        // Three of left's groups reach past "g" and two of right's stay below
+        // "m", none of which is visible while the two encodings are held
+        // apart.
+        assert!((score - 0.4).abs() < 1e-12);
+    }
+
+    /// A string sweep column is ranked by the same contested row groups as
+    /// any other type: the pair sharing more of its groups wins.
+    #[test]
+    fn string_ranges_rank_by_contested_row_groups() {
+        let left = stats_entry("left", &[("customer", string_stat("a"), string_stat("m"))]);
+        let heavy = stats_entry("heavy", &[("customer", string_stat("c"), string_stat("z"))]);
+        let light = stats_entry("light", &[("customer", string_stat("k"), string_stat("z"))]);
+        let files = [
+            candidate_with_string_row_groups(
+                &left,
+                &[("a", "c"), ("d", "f"), ("g", "i"), ("j", "l"), ("l", "m")],
+            ),
+            candidate_with_string_row_groups(
+                &heavy,
+                &[("c", "e"), ("f", "j"), ("k", "o"), ("p", "t"), ("u", "z")],
+            ),
+            candidate_with_string_row_groups(
+                &light,
+                &[("k", "m"), ("m", "p"), ("q", "s"), ("t", "v"), ("w", "z")],
+            ),
+        ];
+
+        let (score, first, second) =
+            highest_scoring_pair(&files, &["customer".into()], u64::MAX).unwrap();
+
+        // Three of heavy's five groups reach into left, against two of
+        // light's.
+        assert!((score - 0.6).abs() < 1e-12);
+        let mut pair = [first.file.path.as_str(), second.file.path.as_str()];
+        pair.sort();
+        assert_eq!(pair, ["heavy", "left"]);
     }
 }

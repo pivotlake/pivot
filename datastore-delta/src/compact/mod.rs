@@ -90,8 +90,6 @@ pub const DEFAULT_MIN_FILES_TO_MERGE: usize = 100;
 const FIXED_FILE_COST_BYTES: f64 = (5 * 1024 * 1024) as f64;
 const MIN_BALANCE_RATIO: f64 = 5.0;
 
-const LAYOUT_OVERLAP_THRESHOLD: f64 = 0.3;
-
 /// Default cadence for re-checking the tables' logs. Candidates only change
 /// when a flush commits a new version, so seconds-scale is plenty.
 pub const DEFAULT_COMPACT_POLL: Duration = Duration::from_secs(10);
@@ -359,7 +357,7 @@ impl CompacterActor {
         if let Some(inputs) = self.next_small_batch(table, apply_guards, reserved) {
             return Some((inputs, MergeKind::SmallFiles));
         }
-        let inputs = self.next_layout_optimization(table, apply_guards, reserved)?;
+        let inputs = self.next_layout_optimization(table, reserved)?;
         Some((inputs, MergeKind::LayoutOptimization))
     }
 }
@@ -506,21 +504,22 @@ impl CompacterActor {
         })
     }
 
-    /// Find the highest-overlap pair of already-half-full files. Pairs never cross
-    /// partitions. Sort columns are considered in table order; a column only
-    /// defers to the next one when both files are the same singleton on it.
-    /// Selection itself skips pairs whose rewrite cannot separate their overlap,
-    /// so an irreducible pair never hides a mergeable one behind it, and pairs
-    /// without enough contested row groups on both sides. Selection only ever
-    /// yields positive-overlap pairs, so guardless sweeps never rewrite
-    /// disjoint ranges.
+    /// Find the most contested pair of already-half-full files: the one whose
+    /// files overlap on the largest share of their row groups. Pairs never
+    /// cross partitions. Sort columns are considered in table order; a column
+    /// only defers to the next one when both files are the same singleton on
+    /// it. Selection itself skips pairs whose rewrite cannot separate their
+    /// overlap, so an irreducible pair never hides a mergeable one behind it,
+    /// pairs whose rows do not interleave, and pairs without more than a fifth
+    /// of each file's row groups overlapping the other file. That last one is
+    /// the whole bar: a sweep merges every pair that clears it, whether or not
+    /// the round applies the small-file guards.
     fn next_layout_optimization(
         &mut self,
         table: &CatalogTable,
-        apply_guards: bool,
         reserved: &HashSet<ObjectPath>,
     ) -> Option<Vec<FileRef>> {
-        let sweep_column = table.sort_by().first()?;
+        table.sort_by().first()?;
 
         let mut by_partition: Vec<(
             Option<crate::PartitionValues>,
@@ -530,7 +529,7 @@ impl CompacterActor {
             if is_small_file(file.entry.file.size, self.target_bytes) {
                 continue;
             }
-            let candidate = overlap::LayoutCandidate::from_table_file(file, sweep_column);
+            let candidate = overlap::LayoutCandidate::from_table_file(file, table.sort_by());
             match by_partition
                 .iter_mut()
                 .find(|(partition, _)| partition_values_equal(partition, &file.entry.partition))
@@ -548,21 +547,18 @@ impl CompacterActor {
             .or_insert_with(overlap::LayoutScores::new);
         let selected =
             scores.best_pair(&partitions, table.sort_by(), self.target_bytes, reserved)?;
-        if apply_guards && selected.score < LAYOUT_OVERLAP_THRESHOLD {
-            return None;
-        }
         // Only the pair that is about to be rewritten is reported, so the log
         // says what each merge restructures: how many of its two files' row
-        // groups sit in the contested range, how many sit outside it, and how
-        // many other overlapping pairs were waiting behind this one.
+        // groups overlap the other file, how many sit outside it, and how many
+        // other overlapping pairs were waiting behind this one.
         let row_groups = &selected.row_groups;
         info!(
             score = selected.score,
             left = %selected.left.file.path,
             right = %selected.right.file.path,
-            left_intersecting_row_groups = row_groups.left_intersecting,
+            left_overlapping_row_groups = row_groups.left_overlapping,
             left_disjoint_row_groups = row_groups.left_disjoint,
-            right_intersecting_row_groups = row_groups.right_intersecting,
+            right_overlapping_row_groups = row_groups.right_overlapping,
             right_disjoint_row_groups = row_groups.right_disjoint,
             candidate_pairs = selected.selectable_pairs,
             "layout compaction pair selected"
@@ -771,6 +767,19 @@ mod tests {
     /// column) into `dir` under `file_name`. A table created over `dir` picks it
     /// up as a small input for the compacter to merge.
     fn write_parquet_file(dir: &Path, file_name: &str, values: Vec<i64>) {
+        let rows = values.len().max(1);
+        write_parquet_file_with_row_group_size(dir, file_name, values, rows);
+    }
+
+    /// A file whose rows are cut into row groups of `max_row_group_size`, so a
+    /// test file of a few rows still carries the many row groups that layout
+    /// selection counts.
+    fn write_parquet_file_with_row_group_size(
+        dir: &Path,
+        file_name: &str,
+        values: Vec<i64>,
+        max_row_group_size: usize,
+    ) {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "Timestamp",
             DataType::Int64,
@@ -785,6 +794,7 @@ mod tests {
         // SNAPPY, like every pivot-written file -- the decompressor expects it.
         let props = parquet::file::properties::WriterProperties::builder()
             .set_compression(parquet::basic::Compression::SNAPPY)
+            .set_max_row_group_row_count(Some(max_row_group_size))
             .build();
         let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
         writer.write(&batch).unwrap();
@@ -1281,15 +1291,22 @@ mod tests {
         dispatch.exit();
     }
 
+    /// The row-group rule is the whole layout bar: a pair merges when more
+    /// than a fifth of each file's row groups overlaps the other file, and
+    /// files that only reach each other's boundary value never merge, not even
+    /// under the final command.
     #[test]
-    fn final_command_accepts_only_positive_layout_overlap() {
+    fn layout_merges_need_overlapping_row_groups_on_both_sides() {
         let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
         let db = tempfile::tempdir().unwrap();
         let adopted = db.path().join("events");
         std::fs::create_dir_all(&adopted).unwrap();
-        write_parquet_file(&adopted, "a.parquet", vec![0, 17]);
-        write_parquet_file(&adopted, "b.parquet", vec![15, 32]);
-        write_parquet_file(&adopted, "c.parquet", vec![100, 110]);
+        // One row per row group. The first two files share seven of their
+        // twenty groups; the last two meet at 119 and share nothing.
+        write_parquet_file_with_row_group_size(&adopted, "a.parquet", (0..20).collect(), 1);
+        write_parquet_file_with_row_group_size(&adopted, "b.parquet", (12..32).collect(), 1);
+        write_parquet_file_with_row_group_size(&adopted, "c.parquet", (100..120).collect(), 1);
+        write_parquet_file_with_row_group_size(&adopted, "d.parquet", (119..139).collect(), 1);
         let datastore =
             DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_table(
@@ -1301,9 +1318,7 @@ mod tests {
         );
         let name = SchemaQualifiedTableName::in_default_schema("events");
         let table = datastore.table_handle(&name).unwrap();
-        // Exact-half files belong to layout optimization. Keep all three
-        // inputs out of the small-file path while leaving enough room for the
-        // positively-overlapping pair to produce one replacement.
+        // Keep every input out of the small-file path.
         let target = table
             .file_refs()
             .iter()
@@ -1312,32 +1327,39 @@ mod tests {
             .unwrap()
             .saturating_mul(2);
 
-        let guarded_sweeps = run_command(
-            target,
-            u64::MAX,
-            usize::MAX,
-            datastore.clone(),
-            name.clone(),
-            table.clone(),
-            false,
-        );
-        let guarded_files = datastore.table_handle(&name).unwrap().file_refs().len();
-        let final_sweeps = run_command(
+        run_command(
             target,
             u64::MAX,
             usize::MAX,
             datastore.clone(),
             name.clone(),
             table,
+            false,
+        );
+        let after_guarded = datastore.table_handle(&name).unwrap();
+        let guarded_files: Vec<String> = after_guarded
+            .file_refs()
+            .iter()
+            .map(|file| file.path.name().to_string())
+            .collect();
+        let final_sweeps = run_command(
+            target,
+            u64::MAX,
+            usize::MAX,
+            datastore.clone(),
+            name.clone(),
+            after_guarded,
             true,
         );
 
-        assert_eq!(guarded_sweeps, 1);
-        assert_eq!(guarded_files, 3);
-        assert_eq!(final_sweeps, 2);
-        let files = datastore.table_handle(&name).unwrap().file_refs();
-        assert_eq!(files.len(), 2);
-        assert!(files.iter().any(|file| file.path.name() == "c.parquet"));
+        assert_eq!(guarded_files.len(), 3);
+        assert!(guarded_files.contains(&"c.parquet".to_string()));
+        assert!(guarded_files.contains(&"d.parquet".to_string()));
+        assert_eq!(
+            final_sweeps, 1,
+            "the final command finds nothing the guarded round left behind"
+        );
+        assert_eq!(datastore.table_handle(&name).unwrap().file_refs().len(), 3);
         dispatch.exit();
     }
 
