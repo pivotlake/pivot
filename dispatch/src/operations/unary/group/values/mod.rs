@@ -14,6 +14,7 @@
 
 use crate::memory::SlabAllocator;
 use crate::operations::unary::group::arena::{SharedArena, WorkerArena};
+use crate::operations::unary::group::output::topk_pruning::TopKWeight;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Decimal64Type, Decimal128Type, Int64Type};
 use arrow_array::{Array, ArrayRef, PrimitiveArray, RecordBatch};
@@ -256,7 +257,7 @@ pub trait AggregationValue: Send + Sync + 'static {
     /// Builders for the result's aggregation columns.
     type ColumnBuilder: ValueColumnBuilder<Value = Self, Context = Self::SharedContext>;
     /// Scalar used by pushed-down ORDER BY and LIMIT.
-    type SortKey: Ord + Copy;
+    type SortKey: Ord + Copy + TopKWeight;
     /// Per-worker consume state.
     type WorkerContext: WorkerContext;
 

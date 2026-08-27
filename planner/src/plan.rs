@@ -134,23 +134,22 @@ impl PlanNode {
     /// decodes, and fully sorts every group only to keep `k` — the dominant cost
     /// on such queries.
     ///
-    /// Only fires for a *single* order key (a DESC ref to an aggregate column,
-    /// traced through column-ref-only projections). A multi-key sort falls back to
-    /// the full `TopN`: a per-partition prune by the primary key alone can't honour
-    /// the secondary tiebreakers, so among groups tied on the primary key at the
-    /// limit boundary it would keep arbitrary ones and drop the rows the secondary
-    /// keys actually select, returning the wrong rows. A single key has no such hazard:
-    /// ties under one DESC key are order-ambiguous in SQL, so keeping any of the
-    /// tied boundary groups is a valid answer.
+    /// Fires when the first order key is a DESC ref to an aggregate column
+    /// (traced through column-ref-only projections). With that single key, ties
+    /// at the limit boundary are order-ambiguous in SQL, so the operator may
+    /// keep any `limit` groups per partition. With further order keys the
+    /// pushdown keeps ties (`with_ties`): a per-partition heap would drop
+    /// boundary-tied groups arbitrarily, which are exactly the rows the
+    /// secondary keys select, so every merged group is emitted for the full
+    /// `TopN` above and only groups strictly dominated on the primary key by
+    /// `limit` others are skipped.
     pub(crate) fn annotate_group_topn(&mut self) {
         for child in &mut self.inputs {
             child.annotate_group_topn();
         }
 
-        let (mut col, limit) = match &self.operator {
-            // Single order key only (see the doc comment); multi-key sorts fall
-            // back to the full TopN above.
-            Operator::TopN(t) if t.order_bys.len() == 1 => {
+        let (mut col, limit, single_key) = match &self.operator {
+            Operator::TopN(t) if !t.order_bys.is_empty() => {
                 let ob = &t.order_bys[0];
                 match (&ob.direction, &ob.expression) {
                     // Keep `limit + offset` rows per partition: the downstream
@@ -158,7 +157,7 @@ impl PlanNode {
                     // to only `k` per partition would leave nothing past the
                     // offset (e.g. `LIMIT 10 OFFSET 1000`).
                     (OrderByDirection::Desc, Expression::Ref(r)) => {
-                        (r.column_idx, t.limit + t.offset)
+                        (r.column_idx, t.limit + t.offset, t.order_bys.len() == 1)
                     }
                     _ => return,
                 }
@@ -219,7 +218,13 @@ impl PlanNode {
                             _ => false,
                         };
                         if !unordered_sort_key {
-                            a.output_limit = Some(GroupLimit::TopK { slot, limit });
+                            // Secondary order keys decide among groups tied
+                            // on the primary one, so those ties must be kept.
+                            a.output_limit = Some(GroupLimit::TopK {
+                                slot,
+                                limit,
+                                with_ties: !single_key,
+                            });
                         }
                     }
                     return;
