@@ -6,7 +6,8 @@
 # file (/var/lib/pivot/metastore.yaml), which the entrypoint generates on
 # first boot (from PIVOT_DATASTORE and the AWS_* variables) and the server
 # then owns and rewrites, so statements like CREATE USER can persist
-# alongside them.
+# alongside them. With PIVOT_DISK_CACHE_SIZE set, the entrypoint writes a
+# disk_cache section into the server section below.
 server:
   # Beyond loopback, so published container ports reach the server and the
   # dashboard. Loopback inside a container is reachable from nowhere.
