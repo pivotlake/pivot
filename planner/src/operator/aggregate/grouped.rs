@@ -282,9 +282,14 @@ pub(super) fn build_group_by_operator(
     // (identity when nothing coalesced). The sorted expression may itself be a
     // coalesced duplicate, which folds to the same value, so the order is unchanged.
     let output_limit = match output_limit {
-        Some(GroupLimit::TopK { slot, limit }) => Some(GroupLimit::TopK {
+        Some(GroupLimit::TopK {
+            slot,
+            limit,
+            with_ties,
+        }) => Some(GroupLimit::TopK {
             slot: to_unique[slot],
             limit,
+            with_ties,
         }),
         other => other,
     };

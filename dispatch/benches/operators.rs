@@ -677,7 +677,11 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                 s.group_by_aggregate::<IntPairKeyExtractor<Int64Type, Int32Type>, Value>(
                     vec![0, 1],
                     slots.clone(),
-                    Some(GroupLimit::TopK { slot: 0, limit: 10 }),
+                    Some(GroupLimit::TopK {
+                        slot: 0,
+                        limit: 10,
+                        with_ties: false,
+                    }),
                     (),
                 )
             },
@@ -740,7 +744,7 @@ fn bench_group_by(c: &mut Criterion, d: &DataFlowDispatcher) {
                     .group_by_aggregate::<IntPairKeyExtractor<Int16Type, Int32Type>, Dynamic<i64, true>>(
                         vec![0, 1],
                         slots.clone(),
-                        Some(GroupLimit::TopK { slot: 0, limit: 10 }),
+                        Some(GroupLimit::TopK { slot: 0, limit: 10, with_ties: false }),
                         (),
                     )
             },
