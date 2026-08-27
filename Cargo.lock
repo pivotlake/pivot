@@ -1785,6 +1785,7 @@ dependencies = [
  "memchr",
  "nix",
  "parquet-variant-compute",
+ "paste",
  "rand 0.10.2",
  "rcgen",
  "rustls",

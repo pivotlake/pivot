@@ -22,6 +22,7 @@
 //! `AVG(x)` to `sum(x) / count(x)`, so an average arrives as a `Sum` slot and a
 //! `Count` slot.
 
+use crate::cpu_features::multitarget_kernel;
 use crate::operations::channels::Sender;
 use crate::operations::unary::group::{
     AggregationKind, AggregationSlot, F64Cell, F64Max, F64Min, F64Sum, Fold, IntCell, Max, Min,
@@ -182,33 +183,30 @@ impl NumOp {
     }
 }
 
-/// The hot reduce loop: seed an accumulator `A` from the first value (each native
-/// element converted to the op's value type `V`), then fold the rest in by `update`,
-/// or `None` if the column is empty. `seed`/`update` are an op's own methods passed as
-/// function *items* (not pointers), so each `(width, op)` monomorphises into its own
-/// loop with no indirect call and no per-row op branch. The integer ops pass their
-/// [`Fold`] methods (`V = i64`, a loop the autovectoriser lifts); the float ops their
-/// [`F64Sum`]/[`F64Min`]/[`F64Max`] methods (`V = f64`, a serial `fadd`/select chain -
-/// FP arithmetic is not reassociated without fast-math - so branch-free and inlined,
-/// but not SIMD).
-fn fold_primitive_column<A, V, T: ArrowPrimitiveType>(
-    arr: &PrimitiveArray<T>,
-    seed: impl Fn(V) -> A,
-    update: impl Fn(A, V) -> A,
-) -> Option<A>
-where
-    T::Native: Into<V>,
-{
-    if arr.null_count() == 0 {
-        let mut values = arr.values().iter().map(|&v| v.into());
-        let first = values.next()?;
-        Some(values.fold(seed(first), update))
-    } else {
-        // NULLs contribute nothing to a SUM/MIN/MAX; a column with only NULLs
-        // reduces to `None`, exactly like an empty column.
-        let mut values = arr.iter().flatten().map(|v| v.into());
-        let first = values.next()?;
-        Some(values.fold(seed(first), update))
+multitarget_kernel! {
+    /// Hot primitive reduction loop, runtime-dispatched to the baseline or Ice
+    /// Lake clone. Function-item callbacks make each width and operation
+    /// monomorphic, with no indirect call or per-row branch. Integer folds can
+    /// vectorize; floating folds remain scalar without fast-math. Returns `None`
+    /// when no values remain.
+    fn fold_primitive_column[A, V, T](
+        arr: &PrimitiveArray<T>,
+        seed: impl Fn(V) -> A,
+        update: impl Fn(A, V) -> A,
+    ) -> Option<A>
+    where [T: ArrowPrimitiveType, T::Native: Into<V>]
+    {
+        if arr.null_count() == 0 {
+            let mut values = arr.values().iter().map(|&v| v.into());
+            let first = values.next()?;
+            Some(values.fold(seed(first), update))
+        } else {
+            // NULLs contribute nothing to a SUM/MIN/MAX; a column with only NULLs
+            // reduces to `None`, exactly like an empty column.
+            let mut values = arr.iter().flatten().map(|v| v.into());
+            let first = values.next()?;
+            Some(values.fold(seed(first), update))
+        }
     }
 }
 

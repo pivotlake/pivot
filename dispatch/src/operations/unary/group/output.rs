@@ -11,6 +11,7 @@ use arrow_array::{Int64Array, RecordBatch};
 use arrow_buffer::Buffer;
 use arrow_schema::{DataType, Field as ArrowField, Schema};
 
+use crate::cpu_features::multitarget_kernel;
 use crate::memory::{
     BUFFER_SIZE, HeapBuffer, MultiTopK, Ranked, SingleTopK, SlabAllocator, SlabTopK, slots_per_slab,
 };
@@ -179,13 +180,15 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
         self.len += 1;
     }
 
-    /// Appends one partition table, applying worker-wide pruning when enabled.
-    pub(crate) fn extend_from_table(
-        &mut self,
-        table: Table<K::Persisted, V>,
-        allocator: &mut SlabAllocator,
-        sender: &mut dyn Sender<RecordBatch>,
-    ) -> Result<()> {
+    multitarget_kernel! {
+        /// Appends a partition table with optional worker-wide pruning. x86
+        /// selects the CPU tier at runtime.
+        pub(crate) fn extend_from_table(
+            &mut self,
+            table: Table<K::Persisted, V>,
+            allocator: &mut SlabAllocator,
+            sender: &mut dyn Sender<RecordBatch>,
+        ) -> Result<()> {
         // Match the top-k backing once per table, not once per row.
         {
             let Self {
@@ -244,6 +247,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
             OutputMode::TopK(_) => unreachable!("top-k handled above"),
         }
         Ok(())
+        }
     }
 
     #[inline]

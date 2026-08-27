@@ -2,6 +2,7 @@
 //! contiguous blob buffer the probe slices.
 
 use super::schema::RowKeySchema;
+use crate::cpu_features::multitarget_kernel;
 use ahash::RandomState;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
@@ -161,19 +162,21 @@ impl<'b> RowReader<'b> {
         }
     }
 
-    /// Encode every row's key tuple into the scratch buffer and write its hash
-    /// into `hashes` (sized to the batch length by the caller). The row loop is
-    /// instantiated per schema nullability: a NULL-free schema takes the
-    /// `ANY_NULLABLE = false` copy, whose per-field validity checks const-fold
-    /// away, so it pays nothing for the nullable machinery.
-    pub(super) fn encode_and_hash(&mut self, state: &RandomState, hashes: &mut [u64]) {
-        if self.nullable.contains(&true) {
-            self.encode_rows::<true>(state, hashes);
-        } else {
-            self.encode_rows::<false>(state, hashes);
+    multitarget_kernel! {
+        /// Encodes and hashes every key row. Schema nullability selects a
+        /// specialized loop, so non-nullable schemas compile out validity checks.
+        pub(super) fn encode_and_hash(&mut self, state: &RandomState, hashes: &mut [u64]) {
+            if self.nullable.contains(&true) {
+                self.encode_rows::<true>(state, hashes);
+            } else {
+                self.encode_rows::<false>(state, hashes);
+            }
         }
     }
 
+    // Must stay `inline(always)` so each target-feature clone compiles the row
+    // loop for its own CPU tier. Otherwise the shared body stays at the floor.
+    #[inline(always)]
     fn encode_rows<const ANY_NULLABLE: bool>(&mut self, state: &RandomState, hashes: &mut [u64]) {
         let encoders: Vec<ColumnEncoder> = self.casted.iter().map(ColumnEncoder::new).collect();
         let scratch = &mut *self.scratch;
