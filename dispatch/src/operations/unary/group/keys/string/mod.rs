@@ -23,8 +23,6 @@ use std::sync::Arc;
 pub struct StringKeyExtractor;
 
 impl KeyExtractor for StringKeyExtractor {
-    // Dedup before scatter since strings cost more to write
-    const RADIX_DEDUP_BEFORE_SCATTER: bool = true;
     type Config = ();
     type Persisted = ArenaKey;
     type LiveKey<'a, 'b> = StringKey<'a, 'b>;

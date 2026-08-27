@@ -51,23 +51,6 @@ pub use row::{RowKeyExtractor, RowKeySchema};
 /// Defines how to extract, compare, and output group keys for a particular key
 /// shape.
 pub trait KeyExtractor: Send + 'static {
-    /// Whether radix mode deduplicates keys before scattering them to partitions.
-    ///
-    /// `true`: keep deduplicating in the bounded, cache-sized table. When it fills,
-    /// flush that window's distinct keys to the radix partitions, clear the table,
-    /// and continue.
-    ///
-    /// `false`: scatter every row directly to its radix partition and deduplicate
-    /// only during the merge.
-    ///
-    /// Deduplicating before scatter can avoid repeated out-of-line copies for long
-    /// string keys. For fixed-width keys, raw scattering is cheaper, so this is
-    /// `false`.
-    ///
-    /// Keys using [`DEDUP_BY_HASH`](Self::DEDUP_BY_HASH) have no key bytes to
-    /// scatter and remain fully in-place regardless of this setting.
-    const RADIX_DEDUP_BEFORE_SCATTER: bool = false;
-
     /// When `true`, the persisted key is a zero-sized `()` and dedup is purely by
     /// the (bijective) hash, so a hash of 0 — which the table reserves as its
     /// empty-slot sentinel — cannot be remapped without aliasing a real key.
