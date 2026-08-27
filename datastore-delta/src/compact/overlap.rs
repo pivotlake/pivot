@@ -217,12 +217,14 @@ impl LayoutScores {
     }
 
     /// The highest-scoring pair among `partitions`, each one partition's
-    /// large-file candidates, on the same terms as [`highest_scoring_pair`].
+    /// large-file candidates, on the same terms as [`highest_scoring_pair`],
+    /// skipping the pairs that hold a file some merge in flight is rewriting.
     pub(super) fn best_pair<'a>(
         &mut self,
         partitions: &[Vec<LayoutCandidate<'a>>],
         sort_by: &[String],
         target_bytes: u64,
+        reserved: &HashSet<ObjectPath>,
     ) -> Option<(f64, &'a DeltaFileEntry, &'a DeltaFileEntry)> {
         let first_column = sort_by.first()?;
 
@@ -264,11 +266,23 @@ impl LayoutScores {
             self.scored.extend(scored_this_round);
         }
 
+        // A reserved file keeps its scores: the merge holding it can fail, and
+        // the pairs it is in are as good then as they are now. It is the
+        // selection that has to pass them over.
+        let held: HashSet<u32> = reserved
+            .iter()
+            .filter_map(|path| self.ids.get(path).copied())
+            .collect();
+
         // Ties go to the pair numbered first, so the choice is stable across
         // rounds.
         let (&key, &score) = self
             .pairs
             .iter()
+            .filter(|(key, _)| {
+                let (low, high) = pair_ids(**key);
+                !held.contains(&low) && !held.contains(&high)
+            })
             .max_by(|(left_key, left), (right_key, right)| {
                 left.total_cmp(right).then_with(|| right_key.cmp(left_key))
             })?;
@@ -770,7 +784,12 @@ mod tests {
         let mut scores = LayoutScores::new();
 
         let (score, left, right) = scores
-            .best_pair(std::slice::from_ref(&files), &["id".into()], u64::MAX)
+            .best_pair(
+                std::slice::from_ref(&files),
+                &["id".into()],
+                u64::MAX,
+                &HashSet::new(),
+            )
             .unwrap();
 
         let (sweep_score, sweep_left, sweep_right) =
@@ -786,6 +805,45 @@ mod tests {
         assert_eq!(pair, sweep_pair);
     }
 
+    /// A file some merge is already rewriting keeps its remembered scores but
+    /// is passed over while it is reserved, so the round picks another pair.
+    #[test]
+    fn a_reserved_file_is_passed_over() {
+        let wide = stats_entry("wide", &[("id", int_stat(0), int_stat(100))]);
+        let overlapping = stats_entry("overlapping", &[("id", int_stat(10), int_stat(90))]);
+        let far = stats_entry("far", &[("id", int_stat(500), int_stat(600))]);
+        let far_overlapping =
+            stats_entry("far-overlapping", &[("id", int_stat(510), int_stat(590))]);
+        let files = vec![
+            candidate(&wide, "id"),
+            candidate(&overlapping, "id"),
+            candidate(&far, "id"),
+            candidate(&far_overlapping, "id"),
+        ];
+        let mut scores = LayoutScores::new();
+        let (_, left, right) = scores
+            .best_pair(
+                std::slice::from_ref(&files),
+                &["id".into()],
+                u64::MAX,
+                &HashSet::new(),
+            )
+            .unwrap();
+        let reserved = HashSet::from([left.file.path.clone(), right.file.path.clone()]);
+
+        let (_, next_left, next_right) = scores
+            .best_pair(
+                std::slice::from_ref(&files),
+                &["id".into()],
+                u64::MAX,
+                &reserved,
+            )
+            .unwrap();
+
+        assert!(!reserved.contains(&next_left.file.path));
+        assert!(!reserved.contains(&next_right.file.path));
+    }
+
     /// After a merge, the next round scores the merge's output against the
     /// survivors and no longer knows the pairs of the files it replaced.
     #[test]
@@ -799,12 +857,22 @@ mod tests {
             candidate(&shifted, "id"),
             candidate(&far, "id"),
         ];
-        scores.best_pair(std::slice::from_ref(&before), &["id".into()], u64::MAX);
+        scores.best_pair(
+            std::slice::from_ref(&before),
+            &["id".into()],
+            u64::MAX,
+            &HashSet::new(),
+        );
         let merged = stats_entry("merged", &[("id", int_stat(140), int_stat(200))]);
         let after = vec![candidate(&far, "id"), candidate(&merged, "id")];
 
         let (score, left, right) = scores
-            .best_pair(std::slice::from_ref(&after), &["id".into()], u64::MAX)
+            .best_pair(
+                std::slice::from_ref(&after),
+                &["id".into()],
+                u64::MAX,
+                &HashSet::new(),
+            )
             .unwrap();
 
         // [150, 200] contests half of merged's [140, 200] and half of far's

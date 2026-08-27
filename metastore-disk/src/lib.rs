@@ -117,9 +117,9 @@ use catalog::metastore::{
     format_scram_verifier, parse_scram_verifier,
 };
 use datastore_delta::{
-    CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_POLL, DEFAULT_MIN_FILES_TO_MERGE,
-    DEFAULT_VACUUM_POLL, DeltaDatastore, MaintenanceConfig, VacuumConfig,
-    default_merge_target_bytes,
+    CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_PARALLELISM, DEFAULT_COMPACT_POLL,
+    DEFAULT_MIN_FILES_TO_MERGE, DEFAULT_VACUUM_POLL, DeltaDatastore, MaintenanceConfig,
+    VacuumConfig, default_merge_target_bytes,
 };
 use dispatch::DataFlowDispatcher;
 use object_storage::{
@@ -610,6 +610,12 @@ struct DatastoreConfig {
     /// Defaults to [`DEFAULT_MIN_FILES_TO_MERGE`].
     #[serde(skip_serializing_if = "Option::is_none")]
     compact_min_files: Option<usize>,
+    /// How many merges this datastore rewrites at once (such as `2`). Which
+    /// files merge is decided serially whatever this is, so no two merges ever
+    /// share an input; only the rewrites overlap, and each one in flight holds
+    /// its inputs' rows in memory. Defaults to [`DEFAULT_COMPACT_PARALLELISM`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compact_parallelism: Option<usize>,
     /// Run this datastore's own background vacuum. On by default: the vacuumer
     /// deletes unreferenced data files and superseded commit JSONs past their
     /// retention. Set `vacuum: false` on a read-only server, or where another
@@ -642,6 +648,9 @@ impl DatastoreConfig {
                 .map(ByteSize::as_bytes)
                 .unwrap_or_else(|| default_merge_target_bytes(target_bytes)),
             min_files: self.compact_min_files.unwrap_or(DEFAULT_MIN_FILES_TO_MERGE),
+            max_concurrent_merges: self
+                .compact_parallelism
+                .unwrap_or(DEFAULT_COMPACT_PARALLELISM),
             poll_interval: DEFAULT_COMPACT_POLL,
         })
     }
