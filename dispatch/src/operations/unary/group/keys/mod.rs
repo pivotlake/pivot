@@ -60,9 +60,9 @@ pub trait KeyExtractor: Send + 'static {
     /// `false`: scatter every row directly to its radix partition and deduplicate
     /// only during the merge.
     ///
-    /// Deduplicating before scatter can avoid repeated out-of-line copies for long
-    /// string keys. For fixed-width keys, raw scattering is cheaper, so this is
-    /// `false`.
+    /// Deduplicating before scatter bounds the scattered volume by the distinct
+    /// count per table fill rather than the raw row count, and for out-of-line
+    /// keys (strings) also persists each key once instead of per occurrence.
     ///
     /// Keys using [`DEDUP_BY_HASH`](Self::DEDUP_BY_HASH) have no key bytes to
     /// scatter and remain fully in-place regardless of this setting.

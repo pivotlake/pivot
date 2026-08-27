@@ -20,6 +20,7 @@ use crate::operations::unary::group::hashtables::{
     StridedScatterRows,
 };
 use crate::operations::unary::group::keys::StoredKey;
+use crate::operations::unary::group::sketch::SketchBounds;
 use crate::operations::unary::group::values::ArityBody;
 
 /// Tables grouped by the slot count they were built at. Equal-sized tables share
@@ -28,6 +29,20 @@ type TablesByCapacity<'a, S, V> = Vec<(
     usize,
     Vec<&'a MultiSlabTable<<S as StoredKey>::Persisted, V>>,
 )>;
+
+/// Per-slot sketch bounds and the k-th best threshold entries are filtered
+/// against: a source entry whose slot bound cannot reach the threshold belongs
+/// to a group that cannot enter the top-k, so it is not merged at all.
+type EntryFilter<'a> = Option<(&'a SketchBounds, u64)>;
+
+/// Whether `hash`'s group could still reach the pushed top-k.
+#[inline(always)]
+fn passes_filter(entry_filter: EntryFilter<'_>, hash: u64) -> bool {
+    match entry_filter {
+        Some((bounds, threshold)) => bounds.could_reach(hash, threshold),
+        None => true,
+    }
+}
 
 /// Collision-to-entry ratio at which we double the target table.
 ///
@@ -66,6 +81,7 @@ fn merge_within_partition_bounds<const N: usize, S: StoredKey, V: AggregationVal
     target: &mut Prober<'_, S::Persisted, V>,
     partition_bits: u32,
     context: &V::SharedContext,
+    entry_filter: EntryFilter<'_>,
 ) {
     let partition_shift = u64::BITS - partition_bits;
     let start = (partition * slot_count) >> partition_bits;
@@ -87,7 +103,7 @@ fn merge_within_partition_bounds<const N: usize, S: StoredKey, V: AggregationVal
                 let hash = entry.hash;
                 // A non-short-circuiting AND combines both data-dependent tests.
                 let take = (hash != 0) & ((hash >> partition_shift) as usize == partition);
-                if take {
+                if take && passes_filter(entry_filter, hash) {
                     target.merge_from::<true, _>(
                         hash,
                         S::resolve_persisted(arena, *entry.key),
@@ -114,6 +130,7 @@ fn merge_past_partition_bounds<const N: usize, S: StoredKey, V: AggregationValue
     target: &mut Prober<'_, S::Persisted, V>,
     partition_bits: u32,
     context: &V::SharedContext,
+    entry_filter: EntryFilter<'_>,
 ) {
     let partition_shift = u64::BITS - partition_bits;
     let end = ((partition + 1) * slot_count) >> partition_bits;
@@ -128,7 +145,8 @@ fn merge_past_partition_bounds<const N: usize, S: StoredKey, V: AggregationValue
             if hash == 0 {
                 break;
             }
-            if (hash >> partition_shift) as usize == partition {
+            if (hash >> partition_shift) as usize == partition && passes_filter(entry_filter, hash)
+            {
                 target.merge_from::<true, _>(
                     hash,
                     S::resolve_persisted(arena, *entry.key),
@@ -153,6 +171,7 @@ fn merge_into_partition<const N: usize, S: StoredKey, V: AggregationValue + ?Siz
     target: &mut Prober<'_, S::Persisted, V>,
     partition_bits: u32,
     context: &V::SharedContext,
+    entry_filter: EntryFilter<'_>,
 ) {
     merge_within_partition_bounds::<N, S, V>(
         allocator,
@@ -163,6 +182,7 @@ fn merge_into_partition<const N: usize, S: StoredKey, V: AggregationValue + ?Siz
         target,
         partition_bits,
         context,
+        entry_filter,
     );
     merge_past_partition_bounds::<N, S, V>(
         allocator,
@@ -173,6 +193,7 @@ fn merge_into_partition<const N: usize, S: StoredKey, V: AggregationValue + ?Siz
         target,
         partition_bits,
         context,
+        entry_filter,
     );
 }
 
@@ -180,6 +201,7 @@ fn merge_into_partition<const N: usize, S: StoredKey, V: AggregationValue + ?Siz
 ///
 /// Both sources use the same high hash bits, so no preliminary repartitioning
 /// is required.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn merge_combined<S: StoredKey, V: AggregationValue + ?Sized>(
     partition: usize,
     buffers: &[PartitionBuffers<S::Persisted, V>],
@@ -188,6 +210,7 @@ pub(super) fn merge_combined<S: StoredKey, V: AggregationValue + ?Sized>(
     num_partitions: usize,
     key_arena: &SharedArena,
     context: &V::SharedContext,
+    entry_filter: EntryFilter<'_>,
 ) -> MultiSlabTable<S::Persisted, V> {
     // Dispatch once so every loop in this job shares the specialized arity.
     V::dispatch_arity(
@@ -200,6 +223,7 @@ pub(super) fn merge_combined<S: StoredKey, V: AggregationValue + ?Sized>(
             num_partitions,
             key_arena,
             context,
+            entry_filter,
         },
     )
 }
@@ -213,6 +237,7 @@ struct MergeCombined<'a, S: StoredKey, V: AggregationValue + ?Sized> {
     num_partitions: usize,
     key_arena: &'a SharedArena,
     context: &'a V::SharedContext,
+    entry_filter: EntryFilter<'a>,
 }
 
 impl<S: StoredKey, V: AggregationValue + ?Sized> ArityBody<MultiSlabTable<S::Persisted, V>>
@@ -228,6 +253,7 @@ impl<S: StoredKey, V: AggregationValue + ?Sized> ArityBody<MultiSlabTable<S::Per
             num_partitions,
             key_arena,
             context,
+            entry_filter,
         } = self;
         merge_combined_rows::<N, S, V>(
             partition,
@@ -237,6 +263,7 @@ impl<S: StoredKey, V: AggregationValue + ?Sized> ArityBody<MultiSlabTable<S::Per
             num_partitions,
             key_arena,
             context,
+            entry_filter,
         )
     }
 }
@@ -255,6 +282,7 @@ fn merge_combined_rows<const N: usize, S: StoredKey, V: AggregationValue + ?Size
     num_partitions: usize,
     key_arena: &SharedArena,
     context: &V::SharedContext,
+    entry_filter: EntryFilter<'_>,
 ) -> MultiSlabTable<S::Persisted, V> {
     #[cfg(target_arch = "x86_64")]
     {
@@ -269,6 +297,7 @@ fn merge_combined_rows<const N: usize, S: StoredKey, V: AggregationValue + ?Size
                     num_partitions,
                     key_arena,
                     context,
+                    entry_filter,
                 )
             };
         }
@@ -282,6 +311,7 @@ fn merge_combined_rows<const N: usize, S: StoredKey, V: AggregationValue + ?Size
                     num_partitions,
                     key_arena,
                     context,
+                    entry_filter,
                 )
             };
         }
@@ -294,6 +324,7 @@ fn merge_combined_rows<const N: usize, S: StoredKey, V: AggregationValue + ?Size
         num_partitions,
         key_arena,
         context,
+        entry_filter,
     )
 }
 
@@ -311,6 +342,7 @@ fn merge_combined_rows_icelake<const N: usize, S: StoredKey, V: AggregationValue
     num_partitions: usize,
     key_arena: &SharedArena,
     context: &V::SharedContext,
+    entry_filter: EntryFilter<'_>,
 ) -> MultiSlabTable<S::Persisted, V> {
     merge_combined_rows_body::<N, S, V>(
         partition,
@@ -320,6 +352,7 @@ fn merge_combined_rows_icelake<const N: usize, S: StoredKey, V: AggregationValue
         num_partitions,
         key_arena,
         context,
+        entry_filter,
     )
 }
 
@@ -336,6 +369,7 @@ fn merge_combined_rows_v4<const N: usize, S: StoredKey, V: AggregationValue + ?S
     num_partitions: usize,
     key_arena: &SharedArena,
     context: &V::SharedContext,
+    entry_filter: EntryFilter<'_>,
 ) -> MultiSlabTable<S::Persisted, V> {
     merge_combined_rows_body::<N, S, V>(
         partition,
@@ -345,6 +379,7 @@ fn merge_combined_rows_v4<const N: usize, S: StoredKey, V: AggregationValue + ?S
         num_partitions,
         key_arena,
         context,
+        entry_filter,
     )
 }
 
@@ -360,6 +395,7 @@ fn merge_combined_rows_body<const N: usize, S: StoredKey, V: AggregationValue + 
     num_partitions: usize,
     key_arena: &SharedArena,
     context: &V::SharedContext,
+    entry_filter: EntryFilter<'_>,
 ) -> MultiSlabTable<S::Persisted, V> {
     {
         let partition_bits = num_partitions.trailing_zeros();
@@ -406,6 +442,9 @@ fn merge_combined_rows_body<const N: usize, S: StoredKey, V: AggregationValue + 
                     worker_buffers.0[bucket].for_each_prefetched::<SCATTER_PREFETCH_AHEAD>(
                         scatter_layout,
                         |hash, key, stored, ahead| {
+                            if !passes_filter(entry_filter, hash) {
+                                return;
+                            }
                             if let Some((ahead_hash, ahead_key)) = ahead {
                                 ahead_key.prefetch_blob(key_arena);
                                 target.prefetch(ahead_hash);
@@ -417,6 +456,9 @@ fn merge_combined_rows_body<const N: usize, S: StoredKey, V: AggregationValue + 
                     );
                 } else {
                     worker_buffers.0[bucket].for_each(scatter_layout, |hash, key, stored| {
+                        if !passes_filter(entry_filter, hash) {
+                            return;
+                        }
                         target.grow_if_full(&mut allocator, &mut capacity);
                         let live_key = S::resolve_persisted(key_arena, *key);
                         target.merge_from::<false, _>(hash, live_key, stored, context);
@@ -448,6 +490,7 @@ fn merge_combined_rows_body<const N: usize, S: StoredKey, V: AggregationValue + 
                 &mut target,
                 partition_bits,
                 context,
+                entry_filter,
             );
         }
         result
@@ -539,6 +582,7 @@ mod tests {
             (),
             (),
             RadixConfig::DEFAULT,
+            None,
         );
         let array: ArrayRef = Arc::new(Int32Array::from(values.to_vec()));
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
@@ -556,7 +600,7 @@ mod tests {
         );
         // The test data is low-cardinality, so the worker never switches to radix:
         // `buffers` is None and the full result is in the in-place stack.
-        let out = agg.flush();
+        let out = agg.flush().0;
         assert!(out.buffers.is_none(), "low-cardinality test stays in-place");
         out.tables
     }
@@ -578,6 +622,7 @@ mod tests {
                 PARTITIONS,
                 arena,
                 &COUNT_CFG,
+                None,
             );
             for entry in result.iter(0) {
                 all_entries.push((*entry.key, entry.stored.sort_key(0) as usize));
@@ -683,6 +728,7 @@ mod tests {
                 PARTITIONS,
                 &arena,
                 &COUNT_CFG,
+                None,
             );
             total += result.iter(0).count();
         }
@@ -746,6 +792,7 @@ mod tests {
                     PARTITIONS,
                     &arena,
                     &COUNT_CFG,
+                    None,
                 ),
                 merge_combined::<IntStored, CountValue>(
                     p,
@@ -755,6 +802,7 @@ mod tests {
                     PARTITIONS,
                     &arena,
                     &COUNT_CFG,
+                    None,
                 ),
             ];
             let folded = merge_node_aggregated_tables::<IntStored, CountValue>(
@@ -786,6 +834,7 @@ mod tests {
             (),
             (),
             RadixConfig::DEFAULT,
+            None,
         );
         let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, false)]));
         // Consume one batch at a time because hash scratch has a fixed size.
@@ -804,7 +853,7 @@ mod tests {
                 &COUNT_CFG,
             );
         }
-        agg.flush()
+        agg.flush().0
     }
 
     /// A worker with enough distinct keys to switch to radix produces scatter
@@ -840,6 +889,7 @@ mod tests {
                 num_partitions,
                 &arena,
                 &COUNT_CFG,
+                None,
             );
             for entry in result.iter(0) {
                 occurrences[*entry.key as usize] += 1;

@@ -19,6 +19,7 @@ use crate::operations::channels::Sender;
 use crate::operations::unary::group::arena::SharedArena;
 use crate::operations::unary::group::hashtables::Table;
 use crate::operations::unary::group::keys::{KeyColumnBuilder, KeyExtractor};
+use crate::operations::unary::group::sketch::{SketchWeight, TopKThreshold};
 use crate::operations::unary::group::values::{
     AggregationValue, ValueColumnBuilder, WorkerContext, cast_value_column,
 };
@@ -61,7 +62,9 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> TopKHeap<K, V> {
     }
 }
 
-/// Offers every group in a table to a top-k heap.
+/// Offers every group in a table to a top-k heap, and its weight to the
+/// shared k-th best threshold when the merge is pruning by sketch bound.
+/// These groups are fully merged, so each weight is a group's exact value.
 ///
 /// The retention check precedes [`AggregationValue::to_owned`], so dynamic
 /// cells are copied only for candidates the heap can keep.
@@ -72,6 +75,7 @@ fn offer_all<K, V, A>(
     allocator: &mut SlabAllocator,
     context: &V::SharedContext,
     owned_context: &mut Option<V::WorkerContext>,
+    topk_threshold: Option<&TopKThreshold>,
 ) where
     K: KeyExtractor,
     V: AggregationValue + ?Sized,
@@ -79,6 +83,9 @@ fn offer_all<K, V, A>(
 {
     for entry in table.iter(0) {
         let sort_key = entry.stored.sort_key(slot);
+        if let Some(threshold) = topk_threshold {
+            threshold.offer(sort_key.saturating_weight());
+        }
         if heap.would_retain(sort_key) {
             let value = entry.stored.to_owned(context, owned_context);
             heap.offer(allocator, sort_key, (*entry.key, value));
@@ -90,6 +97,10 @@ fn offer_all<K, V, A>(
 enum OutputMode<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// Keeps the worker's best rows for ORDER BY and LIMIT.
     TopK(TopKHeap<K, V>),
+    /// Prune-only pushdown: stream every merged group (the downstream sort
+    /// applies the tiebreaks a per-worker heap would violate), feeding each
+    /// group's weight to the shared k-th best so the merge can prune.
+    TopKPrune { slot: usize },
     /// Remaining row budget for an unordered LIMIT.
     First { remaining: usize },
     /// No pushdown: stream every group.
@@ -102,6 +113,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputMode<K, V> {
             Some(GroupLimit::TopK { slot, limit }) => {
                 Self::TopK(TopKHeap::new(allocator, slot, limit))
             }
+            Some(GroupLimit::TopKPrune { slot, .. }) => Self::TopKPrune { slot },
             Some(GroupLimit::First { limit }) => Self::First { remaining: limit },
             None => Self::Unlimited,
         }
@@ -129,9 +141,17 @@ pub(crate) struct OutputAccumulator<K: KeyExtractor, V: AggregationValue + ?Size
     value_output_types: Arc<[DataType]>,
     /// Lazily created arena context for dynamic values retained by top-k.
     owned_copy_context: Option<V::WorkerContext>,
+    /// Shared pushed-limit progress: the k-th best tracker merged group
+    /// weights are offered to, and the emitted-group count a plain LIMIT
+    /// skips against.
+    limit_progress: Arc<TopKThreshold>,
+    /// Whether merged group weights feed the k-th best tracker (only when the
+    /// merge phase is pruning by sketch bound; offers are useless otherwise).
+    offer_weights: bool,
 }
 
 impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         allocator: &mut SlabAllocator,
         output_limit: Option<GroupLimit>,
@@ -140,6 +160,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
         key_config: K::Config,
         shared_context: V::SharedContext,
         value_output_types: Arc<[DataType]>,
+        limit_progress: Arc<TopKThreshold>,
+        offer_weights: bool,
     ) -> Self {
         // A pushed LIMIT can reduce the required builder capacity.
         let builder_capacity = output_limit.map_or(OUTPUT_CHUNK_ROWS, |limit| {
@@ -161,6 +183,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
             shared_context,
             value_output_types,
             owned_copy_context: None,
+            limit_progress,
+            offer_weights,
         }
     }
 
@@ -195,8 +219,11 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
                 mode,
                 shared_context,
                 owned_copy_context,
+                limit_progress,
+                offer_weights,
                 ..
             } = self;
+            let threshold = offer_weights.then_some(&**limit_progress);
             match mode {
                 OutputMode::TopK(TopKHeap::Single { slot, heap }) => {
                     offer_all::<K, V, _>(
@@ -206,6 +233,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
                         allocator,
                         shared_context,
                         owned_copy_context,
+                        threshold,
                     );
                     return Ok(());
                 }
@@ -217,24 +245,45 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> OutputAccumulator<K, V> {
                         allocator,
                         shared_context,
                         owned_copy_context,
+                        threshold,
                     );
                     return Ok(());
                 }
-                OutputMode::First { .. } | OutputMode::Unlimited => {}
+                OutputMode::TopKPrune { .. } | OutputMode::First { .. } | OutputMode::Unlimited => {
+                }
             }
         }
         match &mut self.mode {
+            // Stream every group, feeding the shared k-th best so the merge
+            // prunes what the downstream tiebreaking sort could never keep.
+            OutputMode::TopKPrune { slot } => {
+                let slot = *slot;
+                let offer = self.offer_weights;
+                for entry in table.iter(0) {
+                    if offer {
+                        self.limit_progress
+                            .offer(entry.stored.sort_key(slot).saturating_weight());
+                    }
+                    self.push_entry(entry.key, entry.stored);
+                    self.flush_if_full(allocator, sender)?;
+                }
+            }
             // Preserve the remaining budget for later partitions.
             OutputMode::First { remaining } => {
                 let mut remaining = *remaining;
+                let mut pushed = 0usize;
                 for entry in table.iter(0) {
                     if remaining == 0 {
                         break;
                     }
                     remaining -= 1;
+                    pushed += 1;
                     self.push_entry(entry.key, entry.stored);
                     self.flush_if_full(allocator, sender)?;
                 }
+                // Publish progress so merge jobs stop once any `limit` groups
+                // exist pool-wide.
+                self.limit_progress.add_emitted_groups(pushed);
                 self.mode = OutputMode::First { remaining };
             }
             // Without pushdown, stream every group.

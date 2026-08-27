@@ -13,6 +13,7 @@ use crate::operations::unary::group::hashtables::RadixConfig;
 use crate::operations::unary::group::hashtables::{
     AggregatedTableOutput, AggregationValue, KeyExtractor,
 };
+use crate::operations::unary::group::sketch::{SketchAccumulators, TopKThreshold};
 use crate::operations::unary::group::{AggregationSlot, Group, GroupLimit, PartitionJob};
 use crate::operations::unary::pipeline_breaker::PipelineBreaker;
 use ahash::RandomState;
@@ -44,6 +45,11 @@ pub struct GroupFactory<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// Radix scatter config with the per-worker bucket count sized for the pool
     /// (see [`get_scatter_bucket_count_for_worker`](super::get_scatter_bucket_count_for_worker)).
     radix: RadixConfig,
+    /// Shared lower bound on a pushed top-k's k-th best group value, used by
+    /// the merge phase to skip partitions that cannot reach it.
+    topk_threshold: Arc<TopKThreshold>,
+    /// Per-node sketch accumulators workers fold into at the gather barrier.
+    sketch_accumulators: Arc<SketchAccumulators>,
 }
 
 impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupFactory<K, V> {
@@ -70,6 +76,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupFactory<K, V> {
         );
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));
         let gather = Arc::new(GatherBarrier::new(topology.total_workers()));
+        let topk_threshold = Arc::new(TopKThreshold::for_limit(output_limit));
+        let sketch_accumulators = Arc::new(SketchAccumulators::new(topology.node_count));
         let radix = RadixConfig {
             partitions: crate::operations::unary::group::get_scatter_bucket_count_for_worker(
                 topology.total_workers(),
@@ -90,6 +98,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupFactory<K, V> {
             partition_jobs_injected: partition_jobs_injected.clone(),
             gather: gather.clone(),
             radix,
+            topk_threshold: topk_threshold.clone(),
+            sketch_accumulators: sketch_accumulators.clone(),
         })
     }
 }
@@ -113,6 +123,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> UnaryFactory<RecordBatch, Re
             self.gather,
             self.partition_jobs_injected,
             self.radix,
+            self.topk_threshold,
+            self.sketch_accumulators,
         ))
     }
 }

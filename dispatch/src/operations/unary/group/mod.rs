@@ -94,7 +94,10 @@ mod factory;
 mod keys;
 mod merge;
 mod output;
+mod sketch;
 mod values;
+
+use sketch::{SketchAccumulators, SketchBounds, TopKThreshold};
 
 pub use factory::GroupFactory;
 mod hashtables;
@@ -126,8 +129,8 @@ use arrow_array::RecordBatch;
 use arrow_buffer::Buffer;
 use arrow_schema::{ArrowError, DataType};
 use crossbeam_deque::{Injector, Steal};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use thiserror::Error;
 use unary::pipeline_breaker::{Consumer, Outputter};
 
@@ -151,6 +154,12 @@ pub enum GroupLimit {
     /// `ORDER BY <slot> DESC LIMIT n`: keep this partition's top-`n` groups by
     /// `V::sort_key(value, slot)`.
     TopK { slot: usize, limit: usize },
+    /// `ORDER BY <slot> DESC, <tiebreaks...> LIMIT n`: emit every merged group
+    /// (the downstream sort applies the tiebreaks), but let the merge prune
+    /// partitions and entries that are strictly dominated on `slot` by `n`
+    /// groups. No per-worker heap: a heap's arbitrary boundary-tie drops would
+    /// take exactly the rows the tiebreaks select.
+    TopKPrune { slot: usize, limit: usize },
     /// Plain `LIMIT n` with no ORDER BY: keep any `n` groups from this partition
     /// (SQL leaves which rows arbitrary, so the first `n` encountered suffice).
     First { limit: usize },
@@ -162,6 +171,8 @@ impl GroupLimit {
     pub(crate) fn row_limit(self) -> usize {
         match self {
             GroupLimit::TopK { limit, .. } | GroupLimit::First { limit } => limit,
+            // Prune-only: every surviving group is emitted.
+            GroupLimit::TopKPrune { .. } => usize::MAX,
         }
     }
 }
@@ -176,6 +187,12 @@ const RADIX_PARTITIONS: usize = 4096;
 /// has zero such bits, which leaves no valid shift. Two near-empty jobs cost
 /// nothing extra over one.
 const MIN_MERGE_PARTITIONS: usize = 2;
+
+/// Minimum merged distinct estimate for sketch-driven top-k partition pruning.
+/// Turning the per-worker sketches into partition bounds costs a sum over
+/// `workers x SKETCH_SLOTS` counters; below this many groups the whole merge
+/// costs about the same, so pruning could only add overhead.
+const MIN_TOPK_PRUNE_ESTIMATE: usize = 1 << 19;
 
 /// How many scatter streams the whole pool should aim to stay under. This is
 /// a target, not a hard cap: the one-bucket-per-worker floor below may exceed
@@ -244,6 +261,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
         gather: Arc<GatherBarrier<AggregatedTableOutput<K, V>>>,
         partition_jobs_injected: Arc<AtomicBool>,
         radix: RadixConfig,
+        topk_threshold: Arc<TopKThreshold>,
+        sketch_accumulators: Arc<SketchAccumulators>,
     ) -> Self {
         let shared_context = <V::SharedContext as SharedContext>::build(&value_slots, &value_arena);
         let value_output_types: Arc<[DataType]> =
@@ -265,6 +284,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
             shared_context.clone(),
             shared_context.worker(),
             radix,
+            sketch::sketchable_slot(output_limit, &value_slots),
         );
         Self {
             key_cols,
@@ -281,6 +301,8 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Group<K, V> {
                 value_output_types,
                 output_limit,
                 count_only,
+                topk_threshold,
+                sketch_accumulators,
                 zero_hash_pending: false,
                 output_allocator: None,
                 output_accumulator: None,
@@ -312,7 +334,13 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> Consumer<RecordBatch, Record
     }
 
     fn into_outputter(mut self) -> unary::Result<Option<Self::Outputter>> {
-        let tables = self.aggregated_table.flush();
+        let (tables, topk_sketch) = self.aggregated_table.flush();
+        if let Some(sketch) = topk_sketch {
+            let worker = crate::worker::WORKER_IDX.with(|idx| idx.get());
+            self.outputter
+                .sketch_accumulators
+                .fold(self.outputter.node, worker, sketch);
+        }
         self.gather.arrive(tables, |values| {
             self.outputter.create_partition_jobs(values)
         });
@@ -351,6 +379,13 @@ pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue + ?Sized> {
     /// Global `COUNT(DISTINCT)`: emit each partition's distinct-key count instead
     /// of its keys (a downstream `SUM` totals them).
     count_only: bool,
+    /// Shared lower bound on the pushed top-k's k-th best exact group value,
+    /// fed by every merged group and read by partition jobs to skip
+    /// partitions whose sketch bound cannot reach it.
+    topk_threshold: Arc<TopKThreshold>,
+    /// Per-node sketch accumulators the workers fold into on arrival, so the
+    /// final gather merges one sketch per node instead of one per worker.
+    sketch_accumulators: Arc<SketchAccumulators>,
     /// The final gather arrival saw the hash-only extractor's out-of-band zero
     /// hash and must emit its extra count row once.
     zero_hash_pending: bool,
@@ -382,22 +417,33 @@ pub struct GroupOutputter<K: KeyExtractor, V: AggregationValue + ?Sized> {
 /// the shared [`CrossNodeMerge`]; the last job to finish receives every node's
 /// table and merges them into the final one. That last merge is the only step
 /// that reads another node's memory.
-pub struct PartitionJob<K: KeyExtractor, V: AggregationValue + ?Sized> {
-    /// This node's switched workers' scatter buffers (empty Vec when none switched).
-    buffers: Arc<Vec<PartitionBuffers<K::Persisted, V>>>,
-    /// Holds the in-place stacks of this node's workers: switched workers'
-    /// pre-switch tables and non-switched workers' full stacks. Jobs merge
-    /// them by slot range at `num_partitions` granularity.
-    tables: Arc<Vec<MultiSlabTable<K::Persisted, V>>>,
-    index: usize,
-    /// One shared instance per partition on a multi-node hierarchical merge;
-    /// `None` when this job's merge result is already final (single-node pool
-    /// or direct merge).
-    cross_node_merge: Option<Arc<CrossNodeMerge<K, V>>>,
+/// One node's merge sources: its switched workers' scatter buffers and its
+/// workers' in-place stacks.
+type NodeSources<K, V> = (
+    Vec<PartitionBuffers<<K as KeyExtractor>::Persisted, V>>,
+    Vec<MultiSlabTable<<K as KeyExtractor>::Persisted, V>>,
+);
+
+/// State shared by every partition job of one merge phase, built once by
+/// `create_partition_jobs`.
+///
+/// Jobs go through work queues every worker drains, so each job carries one
+/// `Arc` to this instead of cloning every shared field: thousands of jobs
+/// each bumping and dropping many refcounts is cross-node cache-line traffic,
+/// and under a pruned top-k most jobs are popped only to skip themselves.
+struct MergePhase<K: KeyExtractor, V: AggregationValue + ?Sized> {
+    /// Per node: that node's switched workers' scatter buffers and the
+    /// in-place stacks of its workers (switched workers' pre-switch tables
+    /// and non-switched workers' full stacks). A direct merge holds a single
+    /// entry with every node's sources.
+    sources: Vec<NodeSources<K, V>>,
+    /// Hierarchical merge only: each partition's cross-node rendezvous,
+    /// created by the first of its jobs to survive pruning (a fully pruned
+    /// partition never allocates one).
+    cross_node: Option<Vec<OnceLock<CrossNodeMerge<K, V>>>>,
     key_arena: Arc<SharedArena>,
     /// The arena's ring buffers wrapped as Arrow `Buffer`s, built once for the
-    /// whole output phase and shared by every partition job. String-key output
-    /// emits zero-copy views into this; cloning the `Arc` is a single bump.
+    /// whole output phase. String-key output emits zero-copy views into this.
     output_buffers: Arc<[Buffer]>,
     partition_capacity: usize,
     /// Power-of-two count of hash partitions the merge runs at, chosen in
@@ -413,6 +459,32 @@ pub struct PartitionJob<K: KeyExtractor, V: AggregationValue + ?Sized> {
     value_output_types: Arc<[DataType]>,
     output_limit: Option<GroupLimit>,
     count_only: bool,
+    /// Sketch-driven top-k pruning, present only when a sketchable top-k was
+    /// pushed: each partition's upper bound on any single group's final value,
+    /// and the per-slot bounds the merge filters individual entries with.
+    partition_bounds: Option<Vec<u64>>,
+    sketch_bounds: Option<SketchBounds>,
+    /// Shared pushed-limit progress: the k-th best weight the sketch bounds
+    /// are checked against, and the emitted-group count a plain LIMIT skips
+    /// against.
+    limit_progress: Arc<TopKThreshold>,
+}
+
+// The sources are read-only for the whole merge phase and every other field
+// is either immutable or internally synchronized, so sharing the phase across
+// worker threads is sound (jobs previously shared the same data via per-job
+// `Arc`s under the same reasoning).
+unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Send for MergePhase<K, V> {}
+unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Sync for MergePhase<K, V> {}
+
+/// One partition's merge work: an index into the shared [`MergePhase`], plus
+/// which node's sources to read on a hierarchical merge.
+pub struct PartitionJob<K: KeyExtractor, V: AggregationValue + ?Sized> {
+    phase: Arc<MergePhase<K, V>>,
+    index: usize,
+    /// Which entry of [`MergePhase::sources`] this job merges (its node on a
+    /// hierarchical merge; 0 on a direct merge).
+    node: usize,
 }
 
 unsafe impl<K: KeyExtractor, V: AggregationValue + ?Sized> Send for PartitionJob<K, V> {}
@@ -478,47 +550,90 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> PartitionJob<K, V> {
         sender: &mut dyn Sender<RecordBatch>,
         allocator: &mut SlabAllocator,
     ) -> Result<()> {
+        let phase = &*self.phase;
+        // Any `limit` groups satisfy a plain (unordered) pushed LIMIT, so once
+        // that many are emitted the remaining partitions are unnecessary.
+        if let Some(GroupLimit::First { limit }) = phase.output_limit
+            && phase.limit_progress.emitted_groups() >= limit
+        {
+            return Ok(());
+        }
+        // No group in this partition can beat the k-th best exact group some
+        // worker already holds, so merging it could not change the top-k.
+        let mut entry_filter = None;
+        if let Some(bounds) = &phase.partition_bounds {
+            let kth_best = phase.limit_progress.kth_best();
+            if bounds[self.index] < kth_best {
+                return Ok(());
+            }
+            // Within a surviving partition, individual entries of slots that
+            // cannot reach the k-th best are skipped the same way; a group's
+            // partials all share a hash and thus a slot, so a group is
+            // dropped in full or merged in full. When even the partition's
+            // smallest slot bound reaches the k-th best the filter cannot
+            // reject anything, so skip its per-entry lookups entirely.
+            let slot_bounds = phase
+                .sketch_bounds
+                .as_ref()
+                .expect("partition bounds only exist beside slot bounds");
+            if kth_best > 0
+                && slot_bounds.partition_min_bound(self.index, phase.num_partitions) < kth_best
+            {
+                entry_filter = Some((slot_bounds, kth_best));
+            }
+        }
+        let (buffers, tables) = &phase.sources[self.node];
         let result_map = merge::merge_combined::<K::Stored, V>(
             self.index,
-            &self.buffers,
-            &self.tables,
-            self.partition_capacity,
-            self.num_partitions,
-            &self.key_arena,
-            &self.shared_context,
+            buffers,
+            tables,
+            phase.partition_capacity,
+            phase.num_partitions,
+            &phase.key_arena,
+            &phase.shared_context,
+            entry_filter,
         );
-        let result_map = match &self.cross_node_merge {
+        let result_map = match &phase.cross_node {
             None => result_map,
-            Some(cross_node) => match cross_node.send(result_map) {
-                // Another node's job for this partition is still running; it
-                // will receive the tables and run the final merge.
-                None => return Ok(()),
-                Some(node_tables) => merge::merge_node_aggregated_tables::<K::Stored, V>(
-                    node_tables,
-                    self.partition_capacity,
-                    self.num_partitions.trailing_zeros(),
-                    &self.key_arena,
-                    &self.shared_context,
-                ),
-            },
+            Some(cells) => {
+                // The rendezvous is created on demand by whichever of the
+                // partition's jobs gets here first, so pruned partitions
+                // never pay for one.
+                let cross_node =
+                    cells[self.index].get_or_init(|| CrossNodeMerge::new(phase.sources.len()));
+                match cross_node.send(result_map) {
+                    // Another node's job for this partition is still running;
+                    // it will receive the tables and run the final merge.
+                    None => return Ok(()),
+                    Some(node_tables) => merge::merge_node_aggregated_tables::<K::Stored, V>(
+                        node_tables,
+                        phase.partition_capacity,
+                        phase.num_partitions.trailing_zeros(),
+                        &phase.key_arena,
+                        &phase.shared_context,
+                    ),
+                }
+            }
         };
         if result_map.len() == 0 {
             return Ok(());
         }
         // Global COUNT(DISTINCT) needs only each partition's distinct-key count,
         // not the keys, so it bypasses the accumulator and emits a single row.
-        if self.count_only {
+        if phase.count_only {
             return output::emit_count(result_map.len(), sender);
         }
         let acc = acc.get_or_insert_with(|| {
             output::OutputAccumulator::new(
                 allocator,
-                self.output_limit,
-                self.key_arena.clone(),
-                self.output_buffers.clone(),
-                self.key_config.clone(),
-                self.shared_context.clone(),
-                self.value_output_types.clone(),
+                phase.output_limit,
+                phase.key_arena.clone(),
+                phase.output_buffers.clone(),
+                phase.key_config.clone(),
+                phase.shared_context.clone(),
+                phase.value_output_types.clone(),
+                phase.limit_progress.clone(),
+                phase.partition_bounds.is_some(),
             )
         });
         acc.extend_from_table(result_map, allocator, &mut *sender)
@@ -547,13 +662,33 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // switched worker also holds over-counts, which only over-sizes the
         // merge targets (safe); under-counting is what forces mid-merge resizes.
         let mut non_switched_groups = 0usize;
+        // Bounds are only valid if every worker holding groups folded its
+        // sketch; a worker that skipped (too small, see the flush) makes them
+        // undercount and disables pruning.
+        let mut every_group_sketched = true;
+        // Raw scatter rows per bucket, summed across workers; absent from the
+        // sketch, so partition bounds must assume one group absorbed a whole
+        // bucket of them.
+        let mut raw_scatter_rows: Option<Vec<u64>> = None;
         for out in outputs {
+            let table_entries: usize = out.tables.iter().map(|t| t.len()).sum();
             if out.buffers.is_none() {
-                non_switched_groups += out.tables.iter().map(|t| t.len()).sum::<usize>();
+                non_switched_groups += table_entries;
             }
+            every_group_sketched &= out.sketched || (table_entries == 0 && out.buffers.is_none());
             tables_by_node[out.node].extend(out.tables);
             if let Some(b) = out.buffers {
                 buffers_by_node[out.node].push(b);
+            }
+            if let Some(worker_rows) = out.raw_scatter_rows {
+                match &mut raw_scatter_rows {
+                    Some(total) => {
+                        for (total_rows, rows) in total.iter_mut().zip(worker_rows) {
+                            *total_rows += rows;
+                        }
+                    }
+                    total @ None => *total = Some(worker_rows),
+                }
             }
             hll.merge(&out.hll);
             self.zero_hash_pending |= out.zero_hash_seen;
@@ -604,16 +739,14 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
             let target_groups_per_partition =
                 (TARGET_MERGE_PARTITION_BYTES / entry_bytes.max(1)).max(1);
             // A worker switched and scattered its groups into `scatter_buckets`
-            // (at most RADIX_PARTITIONS) buckets. One merge job per bucket would be thousands
-            // of near-empty jobs at moderate cardinality, so size the job count to the
-            // now-exact distinct estimate instead: enough jobs that each target holds
-            // ~target_groups_per_partition groups. Then bound it - at least worker_count
-            // so every core has work, and never more than the bucket count, since the
-            // merge can't be finer than the scatter (each job folds a contiguous range
-            // of buckets, reaching one-bucket-per-job only at very high cardinality).
-
-            // We get the amount of partitions from the first scatterrows, since we don't have
-            // access the topology (should be at most RADIX_PARTITIONS, and can be less)
+            // (at most RADIX_PARTITIONS) buckets. One merge job per bucket would be
+            // thousands of near-empty jobs at moderate cardinality, so size the job
+            // count to the now-exact distinct estimate instead: enough jobs that each
+            // target holds ~target_groups_per_partition groups. Then bound it - at
+            // least worker_count so every core has work, and never more than the
+            // bucket count, since the merge can't be finer than the scatter (each job
+            // folds a contiguous range of buckets, reaching one-bucket-per-job only
+            // at very high cardinality).
             let scatter_buckets = buffers_by_node
                 .iter()
                 .flatten()
@@ -662,66 +795,98 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> GroupOutputter<K, V> {
         // Held by the jobs (and the batches they emit), never by the arena, so
         // there is no `arena -> Buffer -> arena` cycle.
         let output_buffers: Arc<[Buffer]> = self.key_arena.to_arrow_buffers();
+        // With a sketch and enough groups to make pruning pay, order the jobs
+        // by their upper bound, best first: the heaviest partitions merge
+        // first, fill the workers' top-k heaps, and raise the shared threshold
+        // that lets later jobs skip themselves.
+        // Tests prune unconditionally so the skip path stays exercised at
+        // test-sized group counts.
+        let sketch_bounds = (every_group_sketched
+            && (cfg!(test) || estimate >= MIN_TOPK_PRUNE_ESTIMATE))
+            .then(|| {
+                self.sketch_accumulators
+                    .take_merged()
+                    .map(|merged| SketchBounds::build(merged, raw_scatter_rows.as_deref()))
+            })
+            .flatten();
+        let partition_bounds = sketch_bounds
+            .as_ref()
+            .map(|bounds| bounds.partition_bounds(num_partitions));
+        // With bounds, lead with the heaviest partitions: the first wave fills
+        // the top-k heaps and raises the threshold later jobs skip against.
+        // Only the head is sorted; the tail keeps ascending partition order,
+        // because consecutive partitions read consecutive memory in every
+        // source, and on a query whose bounds are flat (nothing prunable) a
+        // fully sorted order is a random permutation that costs the whole
+        // merge its locality.
+        const SORTED_HEAD_PARTITIONS: usize = 128;
+        let partition_order: Vec<usize> = {
+            let mut order: Vec<usize> = (0..num_partitions).collect();
+            if let Some(bounds) = &partition_bounds {
+                let head = SORTED_HEAD_PARTITIONS.min(num_partitions - 1);
+                order.select_nth_unstable_by_key(head, |&i| std::cmp::Reverse(bounds[i]));
+                order[..head].sort_unstable_by_key(|&i| std::cmp::Reverse(bounds[i]));
+                order[head..].sort_unstable();
+            }
+            order
+        };
+        // Hierarchical keeps one sources entry per node (one job per node and
+        // partition, queued on the owning node so the bulk of every merge
+        // reads node-local memory); direct flattens every node's sources into
+        // a single entry.
+        let sources = if hierarchical {
+            buffers_by_node.into_iter().zip(tables_by_node).collect()
+        } else {
+            vec![(
+                buffers_by_node.into_iter().flatten().collect(),
+                tables_by_node.into_iter().flatten().collect(),
+            )]
+        };
+        let phase = Arc::new(MergePhase {
+            sources,
+            cross_node: hierarchical
+                .then(|| (0..num_partitions).map(|_| OnceLock::new()).collect()),
+            key_arena: self.key_arena.clone(),
+            output_buffers,
+            partition_capacity,
+            num_partitions,
+            key_config: self.key_config.clone(),
+            shared_context: self.shared_context.clone(),
+            value_output_types: self.value_output_types.clone(),
+            output_limit: self.output_limit,
+            count_only: self.count_only,
+            partition_bounds,
+            sketch_bounds,
+            limit_progress: self.topk_threshold.clone(),
+        });
         // All jobs are pushed before the injected flag flips, so a drained
         // queue means a finished phase.
-        let push_job = |injector: &Injector<PartitionJob<K, V>>,
-                        index: usize,
-                        cross_node_merge: Option<Arc<CrossNodeMerge<K, V>>>,
-                        buffers: Arc<Vec<PartitionBuffers<K::Persisted, V>>>,
-                        tables: Arc<Vec<MultiSlabTable<K::Persisted, V>>>| {
-            injector.push(PartitionJob {
-                buffers,
-                tables,
-                index,
-                cross_node_merge,
-                key_arena: self.key_arena.clone(),
-                output_buffers: output_buffers.clone(),
-                partition_capacity,
-                num_partitions,
-                key_config: self.key_config.clone(),
-                shared_context: self.shared_context.clone(),
-                value_output_types: self.value_output_types.clone(),
-                output_limit: self.output_limit,
-                count_only: self.count_only,
-            });
-        };
         if hierarchical {
-            // One job per (node, partition), queued on the owning node so the
-            // bulk of every merge reads node-local memory. Each node table
-            // starts at the full `partition_capacity`, not a per-node share:
-            // this path is chosen exactly when keys repeat across workers,
-            // and row groups are hash-assigned to nodes, so a repeating key
-            // reaches every node and each node's table converges toward the
-            // partition's full distinct count. A per-node share would
-            // guarantee a mid-merge resize; the full size only costs
+            // Each node table starts at the full `partition_capacity`, not a
+            // per-node share: this path is chosen exactly when keys repeat
+            // across workers, and row groups are hash-assigned to nodes, so a
+            // repeating key reaches every node and each node's table converges
+            // toward the partition's full distinct count. A per-node share
+            // would guarantee a mid-merge resize; the full size only costs
             // transient memory the final cross-node merge frees.
-            let buffers_by_node: Vec<_> = buffers_by_node.into_iter().map(Arc::new).collect();
-            let tables_by_node: Vec<_> = tables_by_node.into_iter().map(Arc::new).collect();
-            for i in 0..num_partitions {
-                let cross_node_merge = Arc::new(CrossNodeMerge::new(node_count));
+            for &i in &partition_order {
                 for (node, injector) in self.injectors.iter().enumerate() {
-                    push_job(
-                        injector,
-                        i,
-                        Some(cross_node_merge.clone()),
-                        buffers_by_node[node].clone(),
-                        tables_by_node[node].clone(),
-                    );
+                    injector.push(PartitionJob {
+                        phase: phase.clone(),
+                        index: i,
+                        node,
+                    });
                 }
             }
         } else {
             // One job per partition over every node's sources, spread across
             // the node queues so all workers share the load.
-            let buffers = Arc::new(buffers_by_node.into_iter().flatten().collect::<Vec<_>>());
-            let tables = Arc::new(tables_by_node.into_iter().flatten().collect::<Vec<_>>());
-            for i in 0..num_partitions {
-                push_job(
-                    &self.injectors[i % node_count],
-                    i,
-                    None,
-                    buffers.clone(),
-                    tables.clone(),
-                );
+            for (position, &i) in partition_order.iter().enumerate() {
+                self.injectors[position % node_count].push(PartitionJob {
+                    phase: phase.clone(),
+                    index: i,
+                    node: 0,
+                });
             }
         }
 
@@ -909,6 +1074,8 @@ mod tests {
         let injector = Arc::new(vec![Injector::new()]);
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));
         let gather = Arc::new(GatherBarrier::new(worker_count));
+        let topk_threshold = Arc::new(TopKThreshold::for_limit(output_limit));
+        let sketch_accumulators = Arc::new(SketchAccumulators::new(1));
 
         let groups: Vec<_> = (0..worker_count)
             .map(|_| {
@@ -925,6 +1092,8 @@ mod tests {
                     gather.clone(),
                     partition_jobs_injected.clone(),
                     radix,
+                    topk_threshold.clone(),
+                    sketch_accumulators.clone(),
                 )
             })
             .collect();
@@ -1053,6 +1222,7 @@ mod tests {
         let radix = RadixConfig {
             switch_threshold: 256,
             partitions: 16,
+            ..RadixConfig::DEFAULT
         };
         let mut values: Vec<i32> = (0..500).collect();
         values.extend(0..500);
@@ -1072,6 +1242,7 @@ mod tests {
         let radix = RadixConfig {
             switch_threshold: 256,
             partitions: 16,
+            ..RadixConfig::DEFAULT
         };
         let worker = || vec![batch_with_column(&(0..500).collect::<Vec<_>>())];
 
@@ -1237,6 +1408,8 @@ mod tests {
         let injector = Arc::new(vec![Injector::new()]);
         let partition_jobs_injected = Arc::new(AtomicBool::new(false));
         let gather = Arc::new(GatherBarrier::new(worker_count));
+        let topk_threshold = Arc::new(TopKThreshold::for_limit(None));
+        let sketch_accumulators = Arc::new(SketchAccumulators::new(1));
         let groups: Vec<_> = (0..worker_count)
             .map(|_| {
                 Group::<RowKeyExtractor, V>::new(
@@ -1252,6 +1425,8 @@ mod tests {
                     gather.clone(),
                     partition_jobs_injected.clone(),
                     radix,
+                    topk_threshold.clone(),
+                    sketch_accumulators.clone(),
                 )
             })
             .collect();
@@ -1634,6 +1809,7 @@ mod tests {
         let radix = RadixConfig {
             switch_threshold: 256,
             partitions: 16,
+            ..RadixConfig::DEFAULT
         };
         let sender = run_group_full::<IntKeyExtractor<arrow_array::types::Int64Type>, Mix>(
             vec![vec![batch]],
@@ -1736,6 +1912,114 @@ mod tests {
         assert!(pairs.iter().all(|&(_, c)| c >= 1), "every survivor is real");
     }
 
+    #[test]
+    fn top_k_sketch_pruned_merge_keeps_exact_top_counts() {
+        // Two workers cross the radix threshold with a pushed top-k, so the
+        // merge runs in sketch-bound order and skips dominated partitions.
+        // The two dominant groups must still come out with exact totals.
+        let radix = RadixConfig {
+            switch_threshold: 256,
+            partitions: 16,
+            ..RadixConfig::DEFAULT
+        };
+        let mut values: Vec<i32> = (0..600).collect();
+        values.extend(std::iter::repeat_n(7, 500));
+        values.extend(std::iter::repeat_n(11, 300));
+        let worker = || vec![batch_with_column(&values)];
+
+        let sender = run_group_full::<IntExtractor, CountValue>(
+            vec![worker(), worker()],
+            vec![0],
+            count_slots(),
+            Some(GroupLimit::TopK { slot: 0, limit: 2 }),
+            radix,
+        );
+
+        let pairs = group_counts(&sender);
+        assert!(pairs.contains(&(7, 1002)), "top group exact: {pairs:?}");
+        assert!(pairs.contains(&(11, 602)), "second group exact: {pairs:?}");
+    }
+
+    #[test]
+    fn string_top_k_sketch_keeps_dominant_group() {
+        // String keys stay on the in-place stacks; the sketch still orders and
+        // prunes their merge partitions under a pushed top-k.
+        let owned: Vec<String> = (0..300).map(|k| format!("phrase{k:04}")).collect();
+        let mut names: Vec<&str> = owned.iter().map(String::as_str).collect();
+        names.extend(std::iter::repeat_n("dominant", 400));
+        let worker = || vec![string_key_batch(&names)];
+
+        let sender = run_group_full::<StringKeyExtractor, CountValue>(
+            vec![worker(), worker()],
+            vec![0],
+            count_slots(),
+            Some(GroupLimit::TopK { slot: 0, limit: 1 }),
+            RadixConfig::DEFAULT,
+        );
+
+        let pairs = string_group_pairs(&sender);
+        assert!(pairs.contains(&("dominant".to_string(), 800)), "{pairs:?}");
+    }
+
+    #[test]
+    fn top_k_prune_emits_exact_groups_containing_the_top() {
+        // A multi-key sort's prune-only pushdown: no per-worker heap, so more
+        // than `limit` groups may come out, but every emitted group is exact
+        // and the true top groups must be among them for the downstream sort.
+        let radix = RadixConfig {
+            switch_threshold: 256,
+            partitions: 16,
+            ..RadixConfig::DEFAULT
+        };
+        let mut values: Vec<i32> = (0..600).collect();
+        values.extend(std::iter::repeat_n(7, 500));
+        values.extend(std::iter::repeat_n(11, 300));
+        let worker = || vec![batch_with_column(&values)];
+
+        let sender = run_group_full::<IntExtractor, CountValue>(
+            vec![worker(), worker()],
+            vec![0],
+            count_slots(),
+            Some(GroupLimit::TopKPrune { slot: 0, limit: 2 }),
+            radix,
+        );
+
+        let pairs = group_counts(&sender);
+        assert!(pairs.contains(&(7, 1002)), "top group exact: {pairs:?}");
+        assert!(pairs.contains(&(11, 602)), "second group exact: {pairs:?}");
+        for &(key, count) in &pairs {
+            let expected = match key {
+                7 => 1002,
+                11 => 602,
+                _ => 2,
+            };
+            assert_eq!(count, expected, "group {key} must be exact");
+        }
+    }
+
+    #[test]
+    fn first_limit_skips_remaining_partitions_once_satisfied() {
+        // A plain LIMIT stops the merge pool-wide once any `limit` groups have
+        // been emitted; whatever comes out must still be real groups.
+        let values: Vec<i32> = (0..2000).collect();
+        let worker = || vec![batch_with_column(&values)];
+
+        let sender = run_group_full::<IntExtractor, CountValue>(
+            vec![worker(), worker()],
+            vec![0],
+            count_slots(),
+            Some(GroupLimit::First { limit: 3 }),
+            RadixConfig::DEFAULT,
+        );
+
+        let pairs = group_counts(&sender);
+        assert!(pairs.len() >= 3, "at least the limit survives: {pairs:?}");
+        assert!(
+            pairs.iter().all(|&(k, c)| (0..2000).contains(&k) && c == 2),
+            "every survivor is a real, exact group"
+        );
+    }
+
     // ---- Radix abandon route for blob (string / row) keys ----
 
     #[test]
@@ -1752,6 +2036,7 @@ mod tests {
         let radix = RadixConfig {
             switch_threshold: 256,
             partitions: 16,
+            ..RadixConfig::DEFAULT
         };
 
         let sender = run_group_full::<StringKeyExtractor, CountValue>(
@@ -1776,6 +2061,7 @@ mod tests {
         let radix = RadixConfig {
             switch_threshold: 256,
             partitions: 16,
+            ..RadixConfig::DEFAULT
         };
         let worker = || vec![string_key_batch(&names)];
 
@@ -1812,6 +2098,7 @@ mod tests {
         let radix = RadixConfig {
             switch_threshold: 256,
             partitions: 16,
+            ..RadixConfig::DEFAULT
         };
 
         let sender = run_row_key_group_radix::<CountValue>(
@@ -1838,6 +2125,7 @@ mod tests {
         let radix = RadixConfig {
             switch_threshold: 256,
             partitions: 16,
+            ..RadixConfig::DEFAULT
         };
 
         let sender = run_group_full::<IntExtractor, CountValue>(

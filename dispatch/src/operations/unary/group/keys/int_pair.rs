@@ -56,6 +56,10 @@ where
     A::Native: IntBits,
     B::Native: IntBits,
 {
+    // Keep deduplicating in the bounded table after the radix transition so
+    // repeated keys fold in place instead of scattering one raw row each.
+    const RADIX_DEDUP_BEFORE_SCATTER: bool = true;
+
     type Config = ();
     type Persisted = u128;
     type LiveKey<'a, 'b> = u128;
