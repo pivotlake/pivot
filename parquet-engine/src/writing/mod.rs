@@ -220,6 +220,7 @@ pub fn widen_batches_spec(
         let mut allocator: Option<SlabAllocator> = None;
         let shredding_union = shredding_union.clone();
         move |batch| {
+            let _tagged = dispatch::memory::tagged(dispatch::memory::MemoryTag::Widen);
             let allocator = allocator.get_or_insert_with(|| SlabAllocator::new(false));
             shredding::widen_batch(batch, &shredding_union, allocator)
                 .expect("a variant column widens to the union layout")
@@ -235,6 +236,7 @@ pub fn unshred_batches_spec(spec: RecordBatchOperatorSpec) -> RecordBatchOperato
         // batches so its part-filled slab carries over.
         let mut allocator: Option<SlabAllocator> = None;
         move |batch| {
+            let _tagged = dispatch::memory::tagged(dispatch::memory::MemoryTag::Unshred);
             let allocator = allocator.get_or_insert_with(|| SlabAllocator::new(false));
             shredding::unshred_batch(batch, allocator).expect("a variant column reassembles")
         }

@@ -86,6 +86,7 @@ impl Unary<EncodedLeafChunk, AssembledFile> for FileAssembler {
         sender: &mut dyn Sender<AssembledFile>,
         _io: &mut dispatch::OperatorIO,
     ) -> UnaryResult<()> {
+        let _tagged = dispatch::memory::tagged(dispatch::memory::MemoryTag::Assemble);
         // A row group is ready once one encoded chunk has arrived for every
         // primitive leaf of the schema.
         let row_group_id = chunk.context.row_group_id;

@@ -405,6 +405,20 @@ async fn run_merge(
     let input_sizes: Vec<u64> = inputs.iter().map(|file| file.size).collect();
     let max_output_file_size =
         matches!(kind, MergeKind::LayoutOptimization).then_some(target_bytes);
+    // A merge holds its inputs' decoded rows from here until it commits, so
+    // the pool's pressure follows how many of these are open at once and how
+    // long each stays open: both are logged, one line at each end.
+    let started = std::time::Instant::now();
+    let in_flight = MERGES_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let _open = MergeInFlight;
+    info!(
+        table = %name,
+        kind = kind.label(),
+        inputs = input_sizes.len(),
+        input_bytes = input_sizes.iter().sum::<u64>(),
+        in_flight,
+        "compaction merge started"
+    );
     // `spawn_blocking` needs a `'static` closure, so the merge takes the
     // datastore handle rather than a borrow of it.
     let merged = tokio::task::spawn_blocking(move || {
@@ -432,9 +446,25 @@ async fn run_merge(
         outputs = output_sizes.len(),
         output_sizes = ?output_sizes,
         output_bytes = output_sizes.iter().sum::<u64>(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        in_flight = MERGES_IN_FLIGHT.load(std::sync::atomic::Ordering::Relaxed),
         "compacted batch"
     );
     Ok(())
+}
+
+/// Merges whose inputs are decoded and resident right now. Counted so the log
+/// says how much of the pool one merge is worth when several overlap.
+static MERGES_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Drops the count back however the merge ended, the early returns of its `?`
+/// included.
+struct MergeInFlight;
+
+impl Drop for MergeInFlight {
+    fn drop(&mut self) {
+        MERGES_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 impl CompacterActor {

@@ -46,6 +46,7 @@ impl Unary<ReadyFile, ColumnChunkJob> for RowGroupPlanner {
         sender: &mut dyn Sender<ColumnChunkJob>,
         _io: &mut dispatch::OperatorIO,
     ) -> UnaryResult<()> {
+        let _tagged = dispatch::memory::tagged(dispatch::memory::MemoryTag::Collect);
         emit_column_chunk_jobs(file, self.node_count, sender)
     }
 }

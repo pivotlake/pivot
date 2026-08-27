@@ -28,8 +28,11 @@
 mod ring;
 pub use ring::{BUFFER_SIZE, Ring, SlotUsage};
 
+mod tag;
+pub use tag::{MemoryTag, TAG_COUNT, TagGuard, tagged};
+
 mod status;
-pub use status::{MemoryBlockState, MemoryBlockStatus, block_size_bytes};
+pub use status::{MemoryBlockState, MemoryBlockStatus, RingCensus, block_size_bytes};
 
 mod layout;
 pub use layout::RingLayout;

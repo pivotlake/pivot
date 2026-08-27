@@ -6,6 +6,7 @@ use crate::memory::BUFFER_SIZE;
 use crate::memory::clock::{Clock, Owner};
 use crate::memory::layout::RingLayout;
 use crate::memory::ring::{Ring, SlotUsage};
+use crate::memory::tag::{MemoryTag, TAG_COUNT};
 
 /// What one block of the ring is being used for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -33,6 +34,9 @@ pub struct MemoryBlockStatus {
     /// that may allocate or evict it, so pressure is a per-node property.
     pub node: usize,
     pub state: MemoryBlockState,
+    /// What the block was last taken for. Meaningful for a block a writer
+    /// holds; a free block's is whatever last used it.
+    pub tag: MemoryTag,
     /// Live holds on the block's bytes, counting a cache's own hold on what it
     /// has filled, so a cached block at rest commonly reports one. Zero is what
     /// eviction needs: a block anyone is holding cannot be taken back yet. A
@@ -78,6 +82,92 @@ pub(crate) fn read_block_status(
             SlotUsage::Reading(readers) => readers,
             SlotUsage::Idle | SlotUsage::Writing => 0,
         },
+        tag: MemoryTag::from_raw(ring.tag(slot)),
+    }
+}
+
+/// What the ring holds, counted by state: the one line a worker prints when it
+/// cannot find anything to evict, so a run that ran out of memory says where
+/// the memory went rather than only that it was gone.
+///
+/// A pinned block with no readers is one a [`WriteBuffer`](crate::memory::WriteBuffer)
+/// holds exclusively - working memory an operator is filling, slab memory
+/// included. A pinned block with readers is one live [`ReadBuffer`](crate::memory::ReadBuffer)s
+/// share outside any cache. A cached block with readers cannot be evicted at
+/// this instant even though its cache would give it up, so the two counts
+/// separate a working set that is too large from a cache the readers are
+/// sitting on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RingCensus {
+    pub total: usize,
+    pub free: usize,
+    pub pinned_writing: usize,
+    pub pinned_reading: usize,
+    pub compressed: usize,
+    pub compressed_held: usize,
+    pub decompressed: usize,
+    pub decompressed_held: usize,
+    /// The most readers any one block has, cached or not.
+    pub max_readers: u32,
+    /// Blocks a writer holds, by what it took them for.
+    pub writers_by_tag: [usize; TAG_COUNT],
+}
+
+impl RingCensus {
+    pub fn of(blocks: &[MemoryBlockStatus]) -> Self {
+        let mut census = Self {
+            total: blocks.len(),
+            ..Self::default()
+        };
+        for block in blocks {
+            let held = block.readers > 0;
+            census.max_readers = census.max_readers.max(block.readers);
+            match block.state {
+                MemoryBlockState::Free => census.free += 1,
+                MemoryBlockState::Pinned if held => census.pinned_reading += 1,
+                MemoryBlockState::Pinned => {
+                    census.pinned_writing += 1;
+                    census.writers_by_tag[block.tag as usize] += 1;
+                }
+                MemoryBlockState::CompressedCache => {
+                    census.compressed += 1;
+                    census.compressed_held += usize::from(held);
+                }
+                MemoryBlockState::DecompressedCache => {
+                    census.decompressed += 1;
+                    census.decompressed_held += usize::from(held);
+                }
+            }
+        }
+        census
+    }
+
+    /// The blocks a sweep could take right now: cached, and nobody reading.
+    pub fn evictable(&self) -> usize {
+        (self.compressed - self.compressed_held) + (self.decompressed - self.decompressed_held)
+    }
+
+    /// The stages holding blocks, biggest first, as `shred=1200 widen=300`.
+    /// Only what is actually held is named, so a healthy ring says little and
+    /// an exhausted one says where it went.
+    pub fn writers(&self) -> String {
+        let mut stages: Vec<(usize, MemoryTag)> = self
+            .writers_by_tag
+            .iter()
+            .enumerate()
+            .filter(|&(_, &blocks)| blocks > 0)
+            .map(|(tag, &blocks)| (blocks, MemoryTag::from_raw(tag as u8)))
+            .collect();
+        stages.sort_by(|a, b| b.0.cmp(&a.0));
+        stages
+            .iter()
+            .map(|(blocks, tag)| format!("{}={blocks}", tag.name()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    pub fn gigabytes(&self, blocks: usize) -> f64 {
+        (blocks * block_size_bytes()) as f64 / (1024.0 * 1024.0 * 1024.0)
     }
 }
 

@@ -61,6 +61,7 @@ impl Unary<ColumnChunkJob, LeafChunkJob> for Shredder {
     }
 
     fn run(&mut self, sender: &mut dyn Sender<LeafChunkJob>) -> UnaryResult<WorkStatus> {
+        let _tagged = dispatch::memory::tagged(dispatch::memory::MemoryTag::Shred);
         let Some(column) = self.held.take() else {
             return Ok(WorkStatus::Pending);
         };
@@ -144,6 +145,7 @@ impl HeldColumn {
         row_cap: usize,
         allocator: &mut Option<SlabAllocator>,
     ) -> WriteResult<()> {
+        let _tagged = dispatch::memory::tagged(dispatch::memory::MemoryTag::Shred);
         let slice = self.next_slice(row_cap);
         let values = match &self.job.shredding {
             Some(shredding) => {

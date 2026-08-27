@@ -223,6 +223,7 @@ impl Unary<DecompressedPage, RecordBatch> for Decoder {
         output: &mut dyn Sender<RecordBatch>,
         _io: &mut dispatch::OperatorIO,
     ) -> dispatch::UnaryResult<()> {
+        let _tagged = dispatch::memory::tagged(dispatch::memory::MemoryTag::Decode);
         if self
             .closed_row_groups
             .contains(&page.query_row_group_metadata.index())
@@ -264,6 +265,7 @@ impl Unary<DecompressedPage, RecordBatch> for Decoder {
     }
 
     fn run(&mut self, sender: &mut dyn Sender<RecordBatch>) -> dispatch::UnaryResult<WorkStatus> {
+        let _tagged = dispatch::memory::tagged(dispatch::memory::MemoryTag::Decode);
         if self.try_produce_batch(sender)? {
             Ok(WorkStatus::Ran)
         } else {

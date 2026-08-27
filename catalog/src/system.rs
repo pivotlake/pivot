@@ -179,6 +179,7 @@ const RELATIONS: [SystemRelation; 5] = [
             ("slot", Type::Int64),
             ("node", Type::Int64),
             ("state", Type::Utf8),
+            ("stage", Type::Utf8),
             ("readers", Type::Int64),
             ("bytes", Type::Int64),
         ],
@@ -544,6 +545,9 @@ fn memory_block_arrays(blocks: &[MemoryBlockStatus]) -> Vec<ArrayRef> {
                 .iter()
                 .map(|block| state_name(block.state).to_string()),
         ),
+        // What took the block. Meaningful for a pinned block: a cached or free
+        // one names whatever last held it.
+        string_array(blocks.iter().map(|block| block.tag.name().to_string())),
         int_array(blocks.iter().map(|block| block.readers as i64)),
         int_array(std::iter::repeat_n(bytes, blocks.len())),
     ]

@@ -197,6 +197,7 @@ impl Unary<SortedPartitionRun, FileOrderInput> for FileCollector {
         sender: &mut dyn Sender<FileOrderInput>,
         _io: &mut dispatch::OperatorIO,
     ) -> UnaryResult<()> {
+        let _tagged = dispatch::memory::tagged(dispatch::memory::MemoryTag::Collect);
         let run_row_count: usize = partition_run
             .batches
             .iter()
@@ -223,6 +224,7 @@ impl Unary<SortedPartitionRun, FileOrderInput> for FileCollector {
     }
 
     fn finish(&mut self, sender: &mut dyn Sender<FileOrderInput>) -> UnaryResult<bool> {
+        let _tagged = dispatch::memory::tagged(dispatch::memory::MemoryTag::Collect);
         for (partition_key, pending_file) in std::mem::take(&mut self.pending_files_by_partition) {
             self.emit_pending_file(partition_key, pending_file, sender)?;
         }

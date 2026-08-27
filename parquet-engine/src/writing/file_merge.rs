@@ -91,6 +91,7 @@ impl Unary<LocalMergeJob, LocalMergeResult> for LocalMergeExecutor {
                 node_id,
                 task,
             } => {
+                let _tagged = dispatch::memory::tagged(dispatch::memory::MemoryTag::LocalMerge);
                 let allocator = self
                     .allocator
                     .get_or_insert_with(|| SlabAllocator::new(false));
@@ -193,6 +194,7 @@ impl Unary<GlobalMergeJob, ReadyFile> for GlobalMergeExecutor {
                 context, output, ..
             } => sender.send(ready_file(&context, output))?,
             GlobalMergeJob::Task { context, task } => {
+                let _tagged = dispatch::memory::tagged(dispatch::memory::MemoryTag::GlobalMerge);
                 let allocator = self
                     .allocator
                     .get_or_insert_with(|| SlabAllocator::new(false));

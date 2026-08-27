@@ -69,6 +69,7 @@ impl Unary<RecordBatch, SortedPartitionRun> for PresortedRun {
         sender: &mut dyn Sender<SortedPartitionRun>,
         _io: &mut dispatch::OperatorIO,
     ) -> UnaryResult<()> {
+        let _tagged = dispatch::memory::tagged(dispatch::memory::MemoryTag::Collect);
         if batch.num_rows() > 0 {
             let in_memory_bytes = batch.get_array_memory_size();
             sender.send(SortedPartitionRun {

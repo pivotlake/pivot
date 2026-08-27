@@ -19,7 +19,7 @@
 use crate::memory::read_buffer::ReadBuffer;
 use crate::memory::write_buffer::WriteBuffer;
 use std::fmt::{Debug, Formatter};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::{io, ptr};
 
 /// Size of each slot in the ring (2 MB).
@@ -71,6 +71,10 @@ pub enum SlotUsage {
 /// dropped.
 pub struct Ring {
     pub slots: Vec<BufferSlot>,
+    /// What each slot was last taken for, for the diagnostics in
+    /// [`crate::memory::RingCensus`]. Written when a writer takes the slot and
+    /// read only while one holds it.
+    tags: Vec<AtomicU8>,
 }
 
 impl Debug for Ring {
@@ -134,12 +138,23 @@ impl Ring {
             })
             .collect();
 
-        Ok(Self { slots })
+        let tags = (0..buffers).map(|_| AtomicU8::new(0)).collect();
+        Ok(Self { slots, tags })
     }
 
     /// Returns the total number of slots in the ring.
     pub fn len(&self) -> usize {
         self.slots.len()
+    }
+
+    /// Record what slot `idx` was taken for.
+    pub fn set_tag(&self, idx: usize, tag: u8) {
+        self.tags[idx].store(tag, Ordering::Relaxed);
+    }
+
+    /// What slot `idx` was last taken for.
+    pub fn tag(&self, idx: usize) -> u8 {
+        self.tags[idx].load(Ordering::Relaxed)
     }
 
     /// Whether the ring has no slots.

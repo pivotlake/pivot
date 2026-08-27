@@ -49,6 +49,7 @@ impl Unary<LeafChunkJob, EncodedLeafChunk> for LeafEncoder {
         sender: &mut dyn Sender<EncodedLeafChunk>,
         _io: &mut dispatch::OperatorIO,
     ) -> UnaryResult<()> {
+        let _tagged = dispatch::memory::tagged(dispatch::memory::MemoryTag::Encode);
         let allocator = self
             .allocator
             .get_or_insert_with(|| SlabAllocator::new(false));

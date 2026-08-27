@@ -3,7 +3,8 @@ use crate::memory::compressed_cache::CompressedCache;
 use crate::memory::decompressed_cache::DecompressedCache;
 use crate::memory::fill_cursor::FillCursor;
 use crate::memory::free_pool::{FreePool, PoolFactory};
-use crate::memory::status::{MemoryBlockStatus, read_block_status};
+use crate::memory::status::{MemoryBlockStatus, RingCensus, read_block_status};
+use crate::memory::tag::current_tag;
 use crate::memory::{BUFFER_SIZE, Ring, RingLayout, WriteBuffer};
 use crate::worker::WORKER_IDX;
 use std::cell::{Cell, RefCell, UnsafeCell};
@@ -281,7 +282,10 @@ impl MemoryContext {
                     "pooled slot {idx} still owned by a cache",
                 );
                 match memory_ctx().ring().try_write(idx) {
-                    Some(buffer) => return buffer,
+                    Some(buffer) => {
+                        self.ring.set_tag(buffer.slot_idx, current_tag());
+                        return buffer;
+                    }
                     None => {
                         // Try again with a fresh idx, we don't want to start
                         // evicting yet.
@@ -295,6 +299,7 @@ impl MemoryContext {
             // contenders hold slots only transiently), then hand the rest back
             // so peers can pop them while this worker is busy evicting.
             if let Some(buffer) = contended.pop_writable() {
+                self.ring.set_tag(buffer.slot_idx, current_tag());
                 return buffer;
             }
             contended.release();
@@ -302,7 +307,9 @@ impl MemoryContext {
             // Evict via the shared clock, which takes from whichever tier is
             // over its target share (decompressed, in the common case of a
             // large decompressed working set).
-            return self.evict();
+            let buffer = self.evict();
+            self.ring.set_tag(buffer.slot_idx, current_tag());
+            return buffer;
         }
     }
 
@@ -338,14 +345,44 @@ impl MemoryContext {
         loop {
             iterations += 1;
             if panic_at.is_none() && iterations == warn_at {
-                tracing::warn!(iterations, "evict: no memory left to evict, sleeping");
+                let census = RingCensus::of(&self.read_all_blocks());
+                tracing::warn!(
+                    iterations,
+                    total = census.total,
+                    free = census.free,
+                    pinned_writing = census.pinned_writing,
+                    pinned_reading = census.pinned_reading,
+                    compressed = census.compressed,
+                    compressed_held = census.compressed_held,
+                    decompressed = census.decompressed,
+                    decompressed_held = census.decompressed_held,
+                    evictable = census.evictable(),
+                    max_readers = census.max_readers,
+                    writers = census.writers(),
+                    "evict: no memory left to evict, sleeping"
+                );
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 panic_at = Some(iterations + ring_len);
             } else if panic_at.is_some_and(|limit| iterations >= limit) {
+                let census = RingCensus::of(&self.read_all_blocks());
                 panic!(
                     "evict: still no evictable memory after sleeping ({iterations} \
                      iterations) — aborting query (cache exhausted by an oversized \
-                     working set)"
+                     working set). Ring: {total} blocks, {free} free, \
+                     {pinned_writing} pinned by a writer, {pinned_reading} pinned by \
+                     readers, {compressed} compressed ({compressed_held} being read), \
+                     {decompressed} decompressed ({decompressed_held} being read), \
+                     {evictable} evictable now. Writers hold: {writers}",
+                    total = census.total,
+                    free = census.free,
+                    pinned_writing = census.pinned_writing,
+                    pinned_reading = census.pinned_reading,
+                    compressed = census.compressed,
+                    compressed_held = census.compressed_held,
+                    decompressed = census.decompressed,
+                    decompressed_held = census.decompressed_held,
+                    evictable = census.evictable(),
+                    writers = census.writers(),
                 );
             }
 
