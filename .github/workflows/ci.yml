@@ -11,9 +11,11 @@ on:
         type: boolean
         default: true
 
+# RUSTFLAGS is deliberately NOT set here: an env RUSTFLAGS replaces the
+# [target.*] rustflags in .cargo/config.toml (the instruction-set floor), so
+# ci.sh owns the default, which restates the floor alongside -D warnings.
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"
   RUSTDOCFLAGS: "-D warnings"
 
 # The self-hosted runners live on the suspended `ci-runner2` GCP VM

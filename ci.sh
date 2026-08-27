@@ -20,7 +20,18 @@ CRATES=(dispatch planner duckdb-planner catalog datastore-delta metastore-disk b
 CHECKS=(fmt clippy test doc)
 
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}"
-export RUSTFLAGS="${RUSTFLAGS:--D warnings}"
+
+# An env RUSTFLAGS REPLACES the [target.*] rustflags in .cargo/config.toml, so
+# the -D warnings default must restate the host's instruction-set floor or CI
+# would silently build (and test) below what we ship. Keep these in step with
+# .cargo/config.toml.
+floor=""
+case "$(uname -m)" in
+    x86_64) floor=" -Ctarget-cpu=x86-64-v3" ;;
+    aarch64) [[ "$(uname -s)" == "Linux" ]] &&
+        floor=" -Ctarget-feature=+lse,+crc,+rdm,+dpb,+neon,+aes,+sha2,+dotprod,+ssbs,+rcpc,+bf16" ;;
+esac
+export RUSTFLAGS="${RUSTFLAGS:--D warnings$floor}"
 export RUSTDOCFLAGS="${RUSTDOCFLAGS:--D warnings}"
 
 # Run a single check against a single crate. Exit status is the check's status.

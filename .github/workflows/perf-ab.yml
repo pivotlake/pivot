@@ -10,7 +10,12 @@ name: Perf A/B
 #
 # The perf box is a normally-STOPPED EC2 instance: this workflow starts it, runs
 # on it, and stops it again (even on failure). Manual trigger only, so the box
-# only ever wakes on demand.
+# only ever wakes on demand. The instance_type input picks the fleet: c8g*
+# types run on the Graviton boxes (perf-1..5); every other offered type
+# retypes the x86 box (perf-x86-1) to that microarchitecture (Zen 4, Milan,
+# Cascade Lake, Ice Lake, Sapphire Rapids) - the architecture is baked into
+# each box's AMI, so a type can never be switched across fleets, but any x86
+# type is a legal retype of the x86 box.
 #
 # Required secrets:
 #   PERF_AWS_ACCESS_KEY_ID / PERF_AWS_SECRET_ACCESS_KEY
@@ -70,11 +75,16 @@ on:
         required: false
         default: ""
       instance_type:
-        description: "EC2 instance type to run the perf box as; it is switched before starting if it differs, and the box is always restored to c8g.4xlarge after the run."
+        description: "EC2 instance type to run the perf box as. c8g* runs on the Graviton fleet (perf-1..5); every other type retypes the x86 box (perf-x86-1) to that microarchitecture: c7a = Zen 4, m6a = Milan (x86-64-v3), m5 = Cascade Lake (x86-64-v4), m6i = Ice Lake, m7i = Sapphire Rapids. Switched before starting if it differs; the box is restored to its family's default after the run."
         type: choice
         options:
           - c8g.4xlarge
           - c8g.metal-48xl
+          - c7a.4xlarge
+          - m6a.4xlarge
+          - m5.4xlarge
+          - m6i.4xlarge
+          - m7i.4xlarge
         default: c8g.4xlarge
 
 jobs:
@@ -140,17 +150,34 @@ jobs:
           INSTANCE_TYPE: ${{ inputs.instance_type }}
         run: |
           set -euo pipefail
+          # The CPU architecture is baked into a box's AMI, so the requested
+          # type decides which box can serve the run: c8g* needs the arm64
+          # fleet, every other offered type is an x86_64 retype of the x86 box.
+          case "$INSTANCE_TYPE" in
+            c8g*) ARCH=arm64 ;;
+            *)    ARCH=x86_64 ;;
+          esac
+
           id="$INSTANCE_ID"
+          if [ -n "$id" ]; then
+            pinned_arch=$(aws ec2 describe-instances --instance-ids "$id" \
+              --query 'Reservations[0].Instances[0].Architecture' --output text)
+            if [ "$pinned_arch" != "$ARCH" ]; then
+              echo "PERF_AWS_INSTANCE_ID pins a $pinned_arch box but $INSTANCE_TYPE needs $ARCH; discovering by name instead."
+              id=""
+            fi
+          fi
           if [ -z "$id" ]; then
-            # No explicit id: pick a box whose Name tag matches, preferring a
-            # stopped one (never commandeer a running box unless it is the only
-            # match and was named for perf).
+            # No usable explicit id: pick a box whose Name tag and architecture
+            # match, preferring a stopped one (never commandeer a running box
+            # unless it is the only match and was named for perf).
             id=$(aws ec2 describe-instances \
               --filters "Name=tag:Name,Values=$NAME_FILTER" \
+                        "Name=architecture,Values=$ARCH" \
                         "Name=instance-state-name,Values=stopped" \
               --query 'Reservations[0].Instances[0].InstanceId' --output text)
             if [ "$id" = "None" ] || [ -z "$id" ]; then
-              echo "::error::no stopped instance matching Name=$NAME_FILTER; set the PERF_AWS_INSTANCE_ID variable."
+              echo "::error::no stopped $ARCH instance matching Name=$NAME_FILTER; set the PERF_AWS_INSTANCE_ID variable."
               exit 1
             fi
           fi
@@ -263,6 +290,34 @@ jobs:
             --exclude='target-pgogen' --exclude='target-pgouse' \
             --exclude='clickbench-src')
           ssh perf 'mkdir -p ~/perf-ab'
+
+          # The PGO recipes build with -Ctarget-cpu=native, and cargo
+          # fingerprints that literal string, not the CPU it resolves to. The
+          # x86 box serves several instance types (Zen 4, Milan, Cascade Lake,
+          # Ice Lake, Sapphire Rapids), so warm target dirs from a previous
+          # run can hold instructions this run's CPU does not have; reusing
+          # them makes the server SIGILL at startup. Stamp the CPU model next
+          # to the caches and wipe them whenever it changes.
+          ssh perf '
+            cpu=$(grep -m1 "model name" /proc/cpuinfo)
+            prev=$(cat ~/perf-ab/.built-on-cpu 2>/dev/null || true)
+            if [ "$cpu" != "$prev" ]; then
+              echo "CPU changed since last build; dropping warm target dirs."
+              echo "  was: ${prev:-<none>}"
+              echo "  now: $cpu"
+              rm -rf ~/perf-ab/before/target-pgogen ~/perf-ab/before/target-pgouse \
+                     ~/perf-ab/before/target-client ~/perf-ab/after/target-pgogen \
+                     ~/perf-ab/after/target-pgouse ~/perf-ab/after/target-client \
+                     ~/perf-ab/before/benchmarks/target-pgogen \
+                     ~/perf-ab/before/benchmarks/target-pgouse \
+                     ~/perf-ab/before/benchmarks/target-client \
+                     ~/perf-ab/after/benchmarks/target-pgogen \
+                     ~/perf-ab/after/benchmarks/target-pgouse \
+                     ~/perf-ab/after/benchmarks/target-client \
+                     ~/perf-ab/pgo-before ~/perf-ab/pgo-after
+              printf "%s" "$cpu" > ~/perf-ab/.built-on-cpu
+            fi
+          '
 
           # AFTER first (already checked out at the run's commit), then BEFORE.
           git checkout --quiet --force "$AFTER_SHA"
@@ -438,16 +493,21 @@ jobs:
 
       - name: Stop the perf box
         if: ${{ always() && env.INSTANCE_ID != '' }}
-        env:
-          RESTORE_TYPE: c8g.4xlarge
         run: |
           set -euo pipefail
           echo "Stopping ${INSTANCE_ID}"
           aws ec2 stop-instances --instance-ids "$INSTANCE_ID" >/dev/null || true
 
-          # Always park the box as RESTORE_TYPE, so a run on a bigger type never
-          # leaves it behind for whoever starts the box next. The type can only
-          # be changed once the instance has fully stopped.
+          # Always park the box as its family's 4xlarge, so a run on a bigger
+          # type never leaves it behind for whoever starts the box next. The
+          # family follows the box's architecture. The type can only be changed
+          # once the instance has fully stopped.
+          arch=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].Architecture' --output text)
+          case "$arch" in
+            x86_64) RESTORE_TYPE=c7a.4xlarge ;;
+            *)      RESTORE_TYPE=c8g.4xlarge ;;
+          esac
           current_type=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
             --query 'Reservations[0].Instances[0].InstanceType' --output text)
           if [ "$current_type" != "$RESTORE_TYPE" ]; then

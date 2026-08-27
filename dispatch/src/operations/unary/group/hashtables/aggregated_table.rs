@@ -183,6 +183,101 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
         key_config: &K::Config,
         shared_context: &V::SharedContext,
     ) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: each feature check covers every feature on its clone.
+            if crate::cpu_features::supports_icelake_kernels() {
+                return unsafe {
+                    self.consume_window_icelake(
+                        batch,
+                        key_columns,
+                        value_slots,
+                        key_config,
+                        shared_context,
+                    )
+                };
+            }
+            if crate::cpu_features::supports_v4_kernels() {
+                return unsafe {
+                    self.consume_window_v4(
+                        batch,
+                        key_columns,
+                        value_slots,
+                        key_config,
+                        shared_context,
+                    )
+                };
+            }
+        }
+        self.consume_window_body::<false>(
+            batch,
+            key_columns,
+            value_slots,
+            key_config,
+            shared_context,
+        );
+    }
+
+    /// Ice Lake target-feature clone of `consume_window`. Its inlined hash,
+    /// probe, and fold loops compile above the floor. Keep the attribute and
+    /// runtime feature check aligned.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(
+        enable = "avx512f,avx512bw,avx512cd,avx512dq,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,avx512bitalg,avx512vpopcntdq,bmi1,bmi2,lzcnt,movbe,fma"
+    )]
+    fn consume_window_icelake(
+        &mut self,
+        batch: &RecordBatch,
+        key_columns: &[usize],
+        value_slots: &[AggregationSlot],
+        key_config: &K::Config,
+        shared_context: &V::SharedContext,
+    ) {
+        self.consume_window_body::<true>(
+            batch,
+            key_columns,
+            value_slots,
+            key_config,
+            shared_context,
+        );
+    }
+
+    /// x86-64-v4 clone of `consume_window` (Skylake-SP / Cascade Lake). Also
+    /// inlines probing: the AVX-512 register file that justifies it is part of
+    /// this tier too.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(
+        enable = "avx512f,avx512bw,avx512cd,avx512dq,avx512vl,bmi1,bmi2,lzcnt,movbe,fma"
+    )]
+    fn consume_window_v4(
+        &mut self,
+        batch: &RecordBatch,
+        key_columns: &[usize],
+        value_slots: &[AggregationSlot],
+        key_config: &K::Config,
+        shared_context: &V::SharedContext,
+    ) {
+        self.consume_window_body::<true>(
+            batch,
+            key_columns,
+            value_slots,
+            key_config,
+            shared_context,
+        );
+    }
+
+    // Must stay `inline(always)` so the target-tier clones' features reach
+    // these loops. Only the AVX-512 tiers inline probing; the floor keeps each
+    // arity outlined for its own stack frame and register allocation.
+    #[inline(always)]
+    fn consume_window_body<const INLINE_PROBE: bool>(
+        &mut self,
+        batch: &RecordBatch,
+        key_columns: &[usize],
+        value_slots: &[AggregationSlot],
+        key_config: &K::Config,
+        shared_context: &V::SharedContext,
+    ) {
         let length = batch.num_rows();
 
         // Move scratch out temporarily so the key reader does not borrow `self`
@@ -204,7 +299,12 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
             if self.switched_to_radix && !K::RADIX_DEDUP_BEFORE_SCATTER {
                 self.scatter_range(0, length, &key_reader, &value_reader);
             } else {
-                self.consume_in_place(length, &key_reader, &value_reader, shared_context);
+                self.consume_in_place::<INLINE_PROBE>(
+                    length,
+                    &key_reader,
+                    &value_reader,
+                    shared_context,
+                );
             }
         }
         self.scratch = scratch;
@@ -212,7 +312,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
 
     /// Probes rows until the batch ends or the active table crosses its limit.
     #[inline(always)]
-    fn consume_in_place<'b>(
+    fn consume_in_place<'b, const INLINE_PROBE: bool>(
         &mut self,
         length: usize,
         key_reader: &K::Reader<'b>,
@@ -233,7 +333,7 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
                 } = self;
                 V::dispatch_arity(
                     metadata,
-                    ProbeWindow::<K, V> {
+                    ProbeWindow::<K, V, INLINE_PROBE> {
                         table: tables.last_mut().unwrap(),
                         key_arena,
                         worker_context,
@@ -379,11 +479,13 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> AggregatedTable<K, V> {
     }
 }
 
-/// State passed through arity dispatch for one in-place consume window.
+/// Arity-dispatched state for one consume window. `N == 0` uses runtime
+/// metadata; other values specialize the layout and loops.
 ///
-/// A nonzero `N` specializes the entry layout and slot loops. `N == 0` uses
-/// runtime metadata.
-struct ProbeWindow<'a, 'b, K: KeyExtractor, V: AggregationValue + ?Sized> {
+/// `INLINE_PROBE` is true only for the AVX-512 tiers. The floor keeps probing outlined
+/// for separate stack frames and register allocation.
+struct ProbeWindow<'a, 'b, K: KeyExtractor, V: AggregationValue + ?Sized, const INLINE_PROBE: bool>
+{
     table: &'a mut MultiSlabTable<K::Persisted, V>,
     key_arena: &'a mut WorkerArena,
     worker_context: &'a mut V::WorkerContext,
@@ -396,7 +498,9 @@ struct ProbeWindow<'a, 'b, K: KeyExtractor, V: AggregationValue + ?Sized> {
     shared_context: &'a V::SharedContext,
 }
 
-impl<K: KeyExtractor, V: AggregationValue + ?Sized> ArityBody<bool> for ProbeWindow<'_, '_, K, V> {
+impl<K: KeyExtractor, V: AggregationValue + ?Sized, const INLINE_PROBE: bool> ArityBody<bool>
+    for ProbeWindow<'_, '_, K, V, INLINE_PROBE>
+{
     #[inline(always)]
     fn run<const N: usize>(self) -> bool {
         let ProbeWindow {
@@ -411,31 +515,78 @@ impl<K: KeyExtractor, V: AggregationValue + ?Sized> ArityBody<bool> for ProbeWin
             value_reader,
             shared_context,
         } = self;
-        probe_rows::<N, K, V>(
-            table,
-            key_arena,
-            worker_context,
-            hashes,
-            zero_hash_seen,
-            next_row,
-            length,
-            key_reader,
-            value_reader,
-            shared_context,
-        )
+        if INLINE_PROBE {
+            // The AVX-512 tiers' larger register file makes inlining worthwhile.
+            probe_rows_body::<N, K, V>(
+                table,
+                key_arena,
+                worker_context,
+                hashes,
+                zero_hash_seen,
+                next_row,
+                length,
+                key_reader,
+                value_reader,
+                shared_context,
+            )
+        } else {
+            probe_rows_outlined::<N, K, V>(
+                table,
+                key_arena,
+                worker_context,
+                hashes,
+                zero_hash_seen,
+                next_row,
+                length,
+                key_reader,
+                value_reader,
+                shared_context,
+            )
+        }
     }
 }
 
-/// Probes and folds one consume window.
+/// Floor-tier probe loop for one consume window.
 ///
-/// This function remains outlined so each specialized arity has its own stack
-/// frame and register allocation. The call occurs once per window, not per row.
+/// Each arity stays outlined for its own stack frame and register allocation.
+/// This costs one call per window, not per row. The AVX-512 tiers instead inline
+/// [`probe_rows_body`] because its larger register file handles the pressure.
 ///
 /// Separate reference parameters also preserve alias information across raw
 /// table writes, allowing bound column pointers to remain outside the row loop.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
-fn probe_rows<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized>(
+fn probe_rows_outlined<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized>(
+    table: &mut MultiSlabTable<K::Persisted, V>,
+    key_arena: &mut WorkerArena,
+    worker_context: &mut V::WorkerContext,
+    hashes: &[u64; RECORD_BATCH_SIZE],
+    zero_hash_seen: &mut bool,
+    next_row: &mut usize,
+    length: usize,
+    key_reader: &K::Reader<'_>,
+    value_reader: &V::Reader<'_>,
+    shared_context: &V::SharedContext,
+) -> bool {
+    probe_rows_body::<N, K, V>(
+        table,
+        key_arena,
+        worker_context,
+        hashes,
+        zero_hash_seen,
+        next_row,
+        length,
+        key_reader,
+        value_reader,
+        shared_context,
+    )
+}
+
+// Must stay `inline(always)` so each caller compiles the loop for its feature
+// tier. The floor wrapper itself stays outlined.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn probe_rows_body<const N: usize, K: KeyExtractor, V: AggregationValue + ?Sized>(
     table: &mut MultiSlabTable<K::Persisted, V>,
     key_arena: &mut WorkerArena,
     worker_context: &mut V::WorkerContext,

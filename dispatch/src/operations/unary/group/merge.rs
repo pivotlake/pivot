@@ -241,12 +241,118 @@ impl<S: StoredKey, V: AggregationValue + ?Sized> ArityBody<MultiSlabTable<S::Per
     }
 }
 
-/// Merges one partition after arity dispatch.
+/// Merges one partition after arity and runtime CPU dispatch.
 ///
 /// Separate reference parameters preserve alias information across raw target
 /// writes, keeping shared state outside the inner loops.
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn merge_combined_rows<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
+    partition: usize,
+    buffers: &[PartitionBuffers<S::Persisted, V>],
+    tables: &[MultiSlabTable<S::Persisted, V>],
+    partition_capacity: usize,
+    num_partitions: usize,
+    key_arena: &SharedArena,
+    context: &V::SharedContext,
+) -> MultiSlabTable<S::Persisted, V> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: each feature check covers every feature on its clone.
+        if crate::cpu_features::supports_icelake_kernels() {
+            return unsafe {
+                merge_combined_rows_icelake::<N, S, V>(
+                    partition,
+                    buffers,
+                    tables,
+                    partition_capacity,
+                    num_partitions,
+                    key_arena,
+                    context,
+                )
+            };
+        }
+        if crate::cpu_features::supports_v4_kernels() {
+            return unsafe {
+                merge_combined_rows_v4::<N, S, V>(
+                    partition,
+                    buffers,
+                    tables,
+                    partition_capacity,
+                    num_partitions,
+                    key_arena,
+                    context,
+                )
+            };
+        }
+    }
+    merge_combined_rows_body::<N, S, V>(
+        partition,
+        buffers,
+        tables,
+        partition_capacity,
+        num_partitions,
+        key_arena,
+        context,
+    )
+}
+
+/// Ice Lake target-feature clone. Keep the attribute and runtime check aligned.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+#[target_feature(
+    enable = "avx512f,avx512bw,avx512cd,avx512dq,avx512vl,avx512vbmi,avx512vbmi2,avx512vnni,avx512bitalg,avx512vpopcntdq,bmi1,bmi2,lzcnt,movbe,fma"
+)]
+fn merge_combined_rows_icelake<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
+    partition: usize,
+    buffers: &[PartitionBuffers<S::Persisted, V>],
+    tables: &[MultiSlabTable<S::Persisted, V>],
+    partition_capacity: usize,
+    num_partitions: usize,
+    key_arena: &SharedArena,
+    context: &V::SharedContext,
+) -> MultiSlabTable<S::Persisted, V> {
+    merge_combined_rows_body::<N, S, V>(
+        partition,
+        buffers,
+        tables,
+        partition_capacity,
+        num_partitions,
+        key_arena,
+        context,
+    )
+}
+
+/// x86-64-v4 target-feature clone (Skylake-SP / Cascade Lake). Keep the
+/// attribute and runtime check aligned.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx512f,avx512bw,avx512cd,avx512dq,avx512vl,bmi1,bmi2,lzcnt,movbe,fma")]
+fn merge_combined_rows_v4<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
+    partition: usize,
+    buffers: &[PartitionBuffers<S::Persisted, V>],
+    tables: &[MultiSlabTable<S::Persisted, V>],
+    partition_capacity: usize,
+    num_partitions: usize,
+    key_arena: &SharedArena,
+    context: &V::SharedContext,
+) -> MultiSlabTable<S::Persisted, V> {
+    merge_combined_rows_body::<N, S, V>(
+        partition,
+        buffers,
+        tables,
+        partition_capacity,
+        num_partitions,
+        key_arena,
+        context,
+    )
+}
+
+// Must stay `inline(always)` so each CPU tier compiles the merge loops with
+// its own target features.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn merge_combined_rows_body<const N: usize, S: StoredKey, V: AggregationValue + ?Sized>(
     partition: usize,
     buffers: &[PartitionBuffers<S::Persisted, V>],
     tables: &[MultiSlabTable<S::Persisted, V>],

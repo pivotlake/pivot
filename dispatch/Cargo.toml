@@ -27,6 +27,8 @@ tikv-jemallocator = "0.6.0"
 
 bytes = { workspace = true }
 libc = { workspace = true }
+# Identifier concatenation for the icelake_kernel! macro's generated twins.
+paste = "1"
 rand = { workspace = true }
 
 # Cryptographic hash for the disk cache's content-addressed filenames: a stable

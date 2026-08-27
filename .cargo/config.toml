@@ -17,3 +17,26 @@
 rustflags = [
     "-Ctarget-feature=+lse,+crc,+rdm,+dpb,+neon,+aes,+sha2,+dotprod,+ssbs,+rcpc,+bf16",
 ]
+
+# Instruction-set floor for x86_64: the x86-64-v3 microarchitecture level
+# (v2 plus AVX2, FMA, BMI1/2, F16C, LZCNT, MOVBE - Intel Haswell 2013 and
+# AMD Zen 2017 onward, every current cloud x86 instance). The bare target
+# assumes only the original x86-64 (SSE2), which costs the engine's vectorised
+# loops the wider shuffles, blends and hardware popcount.
+#
+# Below-floor hardware that still turns up: pre-2013 Core CPUs, and Intel's
+# Pentium/Celeron Atom-lineage chips (AVX2 fused off) sold into 2022.
+#
+# Codegen stays at v3 so one binary runs on that whole fleet; anything wider
+# (AVX-512) belongs in runtime-dispatched kernels, not the floor.
+#
+# A CPU below this floor faults with SIGILL and no message, so
+# `dispatch::missing_cpu_features` refuses to start on one - keep the level in
+# step (dispatch/src/cpu_features.rs).
+#
+# As above, an explicit `RUSTFLAGS` REPLACES this, which is what lets the PGO
+# recipes build with `-Ctarget-cpu=native` (pgo.just).
+[target.x86_64-unknown-linux-gnu]
+rustflags = [
+    "-Ctarget-cpu=x86-64-v3",
+]
