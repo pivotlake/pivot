@@ -18,8 +18,15 @@ pivot open ./pivot-data
 ```
 
 The CLI uses every available dispatch worker and assigns 50% of physical
-memory to the dispatch buffer pool. There are no connection or resource
-options.
+memory to the dispatch buffer pool. Override either resource independently:
+
+```sh
+pivot open ./pivot-data --memory 8g --workers 4
+```
+
+`--memory` accepts base-1024 `k`, `m`, `g`, and `t` suffixes. Pivot checks the
+budget against memory currently available before faulting in the pool, and
+exits with an error instead of risking an OOM kill when it does not fit.
 
 ## Datastore directory
 
