@@ -180,10 +180,10 @@ impl CompacterHandle {
         )
     }
 
-    /// Enqueue one table from the caller's transaction snapshot. `FINAL` keeps
-    /// selecting from each committed result until a round can do no more work,
-    /// without applying the normal merge-size, file-count, balance, or 30%
-    /// overlap guards.
+    /// Enqueue one table from the caller's transaction snapshot; the round
+    /// refreshes it to the latest version before each selection and keeps
+    /// merging until nothing qualifies. `FINAL` drops the normal merge-size,
+    /// file-count, balance, or 30% overlap guards.
     pub(crate) async fn compact(
         &self,
         name: SchemaQualifiedTableName,
@@ -205,7 +205,10 @@ impl CompacterHandle {
 
 impl CompacterActor {
     /// Run timer ticks and commands serially. The first configured tick fires
-    /// immediately, preserving the background compacter's startup sweep.
+    /// immediately, preserving the background compacter's startup sweep, and
+    /// each later one fires the poll interval after the previous round
+    /// finished: a round runs until its tables have no candidate left, however
+    /// long that takes, and the interval is the pause between rounds.
     pub(crate) async fn run(mut self) {
         let mut tick = self.poll_interval.map(|d| {
             let mut t = tokio::time::interval(d);
@@ -230,55 +233,58 @@ impl CompacterActor {
                         Some(t) => t.tick().await,
                         None => std::future::pending().await,
                     }
-                } => self.compact_all().await,
+                } => {
+                    self.compact_all().await;
+                    if let Some(t) = tick.as_mut() {
+                        t.reset();
+                    }
+                },
             }
         }
     }
 
     async fn compact_all(&self) {
-        for (name, mut table) in self.datastore.tables() {
-            if let Err(error) = table.refresh() {
-                warn!(table = %name, error = %error, "compaction: table refresh failed");
-                continue;
-            }
+        for (name, table) in self.datastore.tables() {
             if let Err(error) = self.compact_table(&name, table, false).await {
                 error!(table = %name, error = %error, "compaction round failed");
             }
         }
     }
 
-    /// Compact at most one small-file group and then at most one overlapping
-    /// large-file pair, choosing the second batch from the first batch's commit.
+    /// Compact `table` until it has no candidate left: each pass refreshes the
+    /// table to the latest committed version, so files landing meanwhile (an
+    /// INSERT in this process, or another writer) join the selection, then
+    /// merges a small-file group if one qualifies, else the best overlapping
+    /// large-file pair. A pass that finds nothing ends the round. Returns the
+    /// table as it stands and the number of passes.
     async fn compact_table(
         &self,
         name: &SchemaQualifiedTableName,
         mut table: CatalogTable,
         final_sweep: bool,
     ) -> crate::Result<(CatalogTable, u64)> {
-        let mut sweeps = 0;
+        let mut passes = 0;
         let apply_guards = !final_sweep;
         loop {
+            table.refresh()?;
+            passes += 1;
             let id = table.id();
-            let mut compacted = false;
 
             if let Some(inputs) = self.next_small_batch(&table, apply_guards) {
                 table = self
                     .merge_batch(name, id, inputs, MergeKind::SmallFiles)
                     .await?;
-                compacted = true;
+                continue;
             }
 
             if let Some(inputs) = self.next_layout_optimization(&table, apply_guards) {
                 table = self
                     .merge_batch(name, id, inputs, MergeKind::LayoutOptimization)
                     .await?;
-                compacted = true;
+                continue;
             }
 
-            sweeps += 1;
-            if !final_sweep || !compacted {
-                return Ok((table, sweeps));
-            }
+            return Ok((table, passes));
         }
     }
 
@@ -912,8 +918,10 @@ mod tests {
             })
     }
 
+    /// The command's snapshot is refreshed before selecting, so a file
+    /// committed after it was captured still joins the merge.
     #[test]
-    fn command_uses_the_supplied_table_snapshot() {
+    fn command_refreshes_the_supplied_table_snapshot() {
         let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
         let db = tempfile::tempdir().unwrap();
         let adopted = db.path().join("events");
@@ -931,7 +939,10 @@ mod tests {
         );
         let name = SchemaQualifiedTableName::in_default_schema("events");
         let captured = datastore.table_handle(&name).unwrap();
-        let target = captured.file_refs().iter().map(|file| file.size).sum();
+        // Each file is small (under half the target), two of them stay under
+        // the merge target (1.3 times it), three of them reach it: the merge
+        // only happens once the refresh brings `c.parquet` in.
+        let target = captured.file_refs()[0].size * 22 / 10;
         write_parquet_file(&adopted, "c.parquet", vec![3]);
         let mut latest = captured.clone();
         latest
@@ -953,8 +964,46 @@ mod tests {
             false,
         );
 
-        assert_eq!(sweeps, 1);
-        assert_eq!(datastore.table_handle(&name).unwrap().file_refs().len(), 3);
+        assert_eq!(sweeps, 2, "one merging pass and one that finds nothing");
+        assert_eq!(datastore.table_handle(&name).unwrap().file_refs().len(), 1);
+        dispatch.exit();
+    }
+
+    /// A round does not stop at one pair: it keeps merging, on a refreshed
+    /// view each time, until no large pair overlaps any more.
+    #[test]
+    fn a_round_keeps_merging_until_no_pair_overlaps() {
+        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
+        let db = tempfile::tempdir().unwrap();
+        let adopted_dir = db.path().join("events");
+        std::fs::create_dir_all(&adopted_dir).unwrap();
+        write_parquet_file(&adopted_dir, "a.parquet", vec![0, 100]);
+        write_parquet_file(&adopted_dir, "b.parquet", vec![50, 150]);
+        write_parquet_file(&adopted_dir, "c.parquet", vec![1_000, 1_100]);
+        write_parquet_file(&adopted_dir, "d.parquet", vec![1_050, 1_150]);
+        let datastore =
+            DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        create_table(
+            &datastore,
+            dispatch.dispatcher(),
+            "events",
+            Some(Path::new("events")),
+            true,
+        );
+        let name = SchemaQualifiedTableName::in_default_schema("events");
+        let files = datastore.table_files(&name).unwrap();
+        let target = files.iter().map(|file| file.size).min().unwrap();
+
+        run_one_sweep(target, datastore.clone());
+
+        let files = datastore.table_files(&name).unwrap();
+        assert!(
+            files.iter().all(|file| !matches!(
+                file.path.name(),
+                "a.parquet" | "b.parquet" | "c.parquet" | "d.parquet"
+            )),
+            "both overlapping pairs were rewritten in one round: {files:?}"
+        );
         dispatch.exit();
     }
 
@@ -1424,9 +1473,9 @@ mod tests {
             false,
         );
 
-        // A table round performs only one small-file merge. The next round
-        // handles the other partition.
-        assert_eq!(datastore.table_handle(&name).unwrap().file_refs().len(), 3);
+        // One round merges each partition's small files in turn; a second round
+        // then finds nothing left to do.
+        assert_eq!(datastore.table_handle(&name).unwrap().file_refs().len(), 2);
         run_command(
             target,
             0,
