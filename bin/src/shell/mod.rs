@@ -5,13 +5,16 @@ mod parser;
 mod render;
 mod repl;
 
-pub use instance::ShellInstance;
+pub use instance::{DiskCacheOptions, OpenOptions, ShellInstance};
 
 /// Open an interactive SQL shell over one datastore, named by a local directory
-/// or an object-store URI.
-pub fn run(datastore_location: String) -> Result<(), Box<dyn std::error::Error>> {
+/// or an object-store URI, with the given resource budgets.
+pub fn run(
+    datastore_location: String,
+    options: OpenOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(repl::run_shell(datastore_location))
+    runtime.block_on(repl::run_shell(datastore_location, options))
 }

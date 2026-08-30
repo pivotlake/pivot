@@ -43,15 +43,11 @@ use datastore_delta::DEFAULT_REFRESH_INTERVAL;
 use metastore_disk::{ByteSize, Interval, MetastoreConfig};
 use serde::Deserialize;
 
+use crate::resources::{DEFAULT_DISK_CACHE_MAX_OBJECTS, DEFAULT_DISK_CACHE_SIZE};
+
 /// The address the PostgreSQL endpoint binds to when `bind` is not set. Loopback
 /// so an unconfigured server is not exposed to the network.
 const DEFAULT_BIND: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5432);
-
-/// The disk cache's byte budget when only `dir` is given.
-const DEFAULT_DISK_CACHE_SIZE: ByteSize = ByteSize::from_bytes(64 * 1024 * 1024 * 1024);
-
-/// The disk cache's object-count limit when only `dir` is given.
-const DEFAULT_DISK_CACHE_MAX_OBJECTS: usize = 65536;
 
 /// A parsed config file.
 ///

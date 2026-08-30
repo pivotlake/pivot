@@ -11,5 +11,6 @@
 //! or a [`shell::ShellInstance`] in-process; `src/main.rs` is the only binary.
 
 pub mod execution;
+pub(crate) mod resources;
 pub mod server;
 pub mod shell;

@@ -20,12 +20,13 @@ Shell commands:
 
 pub(crate) async fn run_shell(
     datastore_location: String,
+    options: crate::shell::OpenOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !io::stdin().is_terminal() {
         return Err("an interactive terminal is required".into());
     }
 
-    let instance = ShellInstance::open(&datastore_location)?;
+    let instance = ShellInstance::open(&datastore_location, options)?;
     let editor = DefaultEditor::new()?;
 
     println!("pivot shell ({})", env!("CARGO_PKG_VERSION"));

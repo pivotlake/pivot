@@ -77,47 +77,6 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
-/// Return the machine's total physical memory in bytes.
-fn get_total_memory() -> usize {
-    read_memory().total_memory() as usize
-}
-
-/// Return how many bytes a new allocation on this machine can actually get hold
-/// of: free pages plus what the kernel can reclaim without swapping.
-fn get_available_memory() -> usize {
-    read_memory().available_memory() as usize
-}
-
-/// One reading of the machine's memory, as the OS reports it now.
-fn read_memory() -> sysinfo::System {
-    sysinfo::System::new_with_specifics(
-        sysinfo::RefreshKind::nothing().with_memory(sysinfo::MemoryRefreshKind::everything()),
-    )
-}
-
-fn build_disk_cache(config: Option<DiskCacheConfig>) -> Option<Arc<dispatch::io::DiskCache>> {
-    let DiskCacheConfig {
-        dir,
-        size,
-        max_objects,
-    } = config?;
-    match dispatch::io::DiskCache::open(dir.clone(), size.as_bytes(), max_objects) {
-        Ok(cache) => {
-            info!(
-                dir = %dir.display(),
-                bytes = size.as_bytes(),
-                max_objects,
-                "disk cache enabled"
-            );
-            Some(Arc::new(cache))
-        }
-        Err(error) => {
-            error!(dir = %dir.display(), "failed to open disk cache, continuing without it: {error}");
-            None
-        }
-    }
-}
-
 fn build_metastore(
     config: MetastoreConfig,
     path: &Path,
@@ -170,26 +129,27 @@ pub fn run(options: ServerOptions) -> Result<(), Error> {
         .workers
         .unwrap_or_else(dispatch::default_worker_count);
     info!(workers, "initialising dispatch");
-    let disk_cache = build_disk_cache(server_config.disk_cache);
+    let disk_cache = match server_config.disk_cache {
+        Some(DiskCacheConfig {
+            dir,
+            size,
+            max_objects,
+        }) => Some(crate::resources::open_disk_cache(
+            dir,
+            size.as_bytes(),
+            max_objects,
+        )?),
+        None => None,
+    };
     let pool_bytes = match server_config.memory {
         Some(size) => size.as_bytes() as usize,
         None => {
             let memory_pct: usize = get_env_var_with_default("PIVOT_MEMORY_PCT", 80);
-            get_total_memory() * memory_pct / 100
+            crate::resources::total_memory_bytes() * memory_pct / 100
         }
     };
-    // The pool is a share of *total* memory, but every one of its slots is
-    // faulted in while the workers start, so what it has to fit into is what the
-    // machine has free. Asking for more than that is not a slower server: it is
-    // an OOM kill part way through boot, which leaves nobody around to say why.
-    let available_bytes = get_available_memory();
+    let available_bytes = crate::resources::check_pool_fits(pool_bytes)?;
     info!(pool_bytes, available_bytes, "buffer pool memory budget");
-    if pool_bytes > available_bytes {
-        return Err(Error::InsufficientMemory {
-            requested_bytes: pool_bytes,
-            available_bytes,
-        });
-    }
     let dispatch = Dispatch::spin_up(workers, pool_bytes / BUFFER_SIZE, disk_cache);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()

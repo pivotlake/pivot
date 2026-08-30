@@ -1,14 +1,43 @@
 //! Lifecycle for one embedded, in-process Pivot instance.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use catalog::metastore::{Metastore, UserAuth};
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
 use datastore_delta::DeltaDatastore;
+use dispatch::io::DiskCache;
 use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
 use object_storage::AmbientExternalStoreFactory;
-use sysinfo::{MemoryRefreshKind, RefreshKind, System};
+
+use crate::resources::{DEFAULT_DISK_CACHE_MAX_OBJECTS, DEFAULT_DISK_CACHE_SIZE};
+
+/// Resource budgets for [`ShellInstance::open`]. Every unset field falls back
+/// to a machine-derived default, so `OpenOptions::default()` opens the instance
+/// a plain `pivot open` does.
+#[derive(Debug, Default)]
+pub struct OpenOptions {
+    /// Buffer pool budget in bytes. Unset assigns half of physical memory. The
+    /// budget is checked against the memory actually available, since every
+    /// pool slot is faulted in while the workers start.
+    pub memory_bytes: Option<u64>,
+    /// Number of dispatch worker threads. Unset uses every available core.
+    pub workers: Option<usize>,
+    /// On-disk cache for remote (object store) reads. Unset disables it; local
+    /// datastores are read from the filesystem directly and never cached.
+    pub disk_cache: Option<DiskCacheOptions>,
+}
+
+/// The disk cache named by [`OpenOptions::disk_cache`].
+#[derive(Debug)]
+pub struct DiskCacheOptions {
+    /// Directory the cached byte ranges are stored in. The contents persist
+    /// across sessions.
+    pub dir: PathBuf,
+    /// Size budget for the cached bytes. Unset uses the server's default.
+    pub size_bytes: Option<u64>,
+}
 
 #[derive(Debug)]
 struct EphemeralMetastore;
@@ -90,15 +119,31 @@ pub struct ShellInstance {
 }
 
 impl ShellInstance {
-    /// Open the production CLI instance on all available workers with half of
-    /// physical memory assigned to dispatch. `location` is a local directory, or
-    /// an object-store URI (`s3://bucket/prefix`, `gs://bucket/prefix`) whose
-    /// credentials come from the environment.
-    pub fn open(location: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let workers = dispatch::default_worker_count();
-        let memory_bytes = total_memory_bytes() / 2;
+    /// Open the production CLI instance with the given resource budgets.
+    /// `location` is a local directory, or an object-store URI
+    /// (`s3://bucket/prefix`, `gs://bucket/prefix`) whose credentials come from
+    /// the environment.
+    pub fn open(location: &str, options: OpenOptions) -> Result<Self, Box<dyn std::error::Error>> {
+        let workers = options
+            .workers
+            .unwrap_or_else(dispatch::default_worker_count);
+        let memory_bytes = match options.memory_bytes {
+            Some(bytes) => usize::try_from(bytes).unwrap_or(usize::MAX),
+            None => crate::resources::total_memory_bytes() / 2,
+        };
+        crate::resources::check_pool_fits(memory_bytes)?;
         let buffers = (memory_bytes / BUFFER_SIZE).max(1);
-        Self::open_with_resources(location, workers, buffers)
+        let disk_cache = match options.disk_cache {
+            Some(cache) => Some(crate::resources::open_disk_cache(
+                cache.dir,
+                cache
+                    .size_bytes
+                    .unwrap_or(DEFAULT_DISK_CACHE_SIZE.as_bytes()),
+                DEFAULT_DISK_CACHE_MAX_OBJECTS,
+            )?),
+            None => None,
+        };
+        Self::open_with_dispatch(location, workers, buffers, disk_cache)
     }
 
     /// Open with an explicit dispatch shape. This is useful for embedding and
@@ -108,7 +153,16 @@ impl ShellInstance {
         workers: usize,
         buffers: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let dispatch = DispatchOwner::new(Dispatch::spin_up(workers, buffers, None));
+        Self::open_with_dispatch(location, workers, buffers, None)
+    }
+
+    fn open_with_dispatch(
+        location: &str,
+        workers: usize,
+        buffers: usize,
+        disk_cache: Option<Arc<DiskCache>>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let dispatch = DispatchOwner::new(Dispatch::spin_up(workers, buffers, disk_cache));
         let datastore = DeltaDatastore::open(location, dispatch.dispatcher())?;
         let metastore: Arc<dyn Metastore> = Arc::new(EphemeralMetastore);
         let catalog = Arc::new(
@@ -163,12 +217,4 @@ impl Drop for ShellInstance {
     fn drop(&mut self) {
         self.shutdown();
     }
-}
-
-fn total_memory_bytes() -> usize {
-    let bytes = System::new_with_specifics(
-        RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
-    )
-    .total_memory();
-    usize::try_from(bytes).unwrap_or(usize::MAX)
 }

@@ -17,9 +17,23 @@ cargo install --path bin
 pivot open ./pivot-data
 ```
 
-The CLI uses every available dispatch worker and assigns 50% of physical
-memory to the dispatch buffer pool. There are no connection or resource
-options.
+By default the CLI uses every available dispatch worker and assigns 50% of
+physical memory to the dispatch buffer pool. Both budgets can be set
+explicitly, and remote (object store) reads can be cached on local disk:
+
+```sh
+pivot open --memory 8g --workers 4 ./pivot-data
+pivot open --disk-cache /var/cache/pivot --disk-cache-size 32g s3://bucket/prefix
+```
+
+`--memory` and `--disk-cache-size` take a byte count with an optional
+base-1024 suffix (`512m`, `8g`). The memory budget, default included, must
+fit in the machine's currently available memory: the buffer pool is faulted
+in whole while the workers start, so the shell refuses to open instead of
+being OOM-killed part way through. `--disk-cache` names the cache directory
+(contents persist across sessions, default size 64g); local datastores are
+never cached, they are read from the filesystem directly. There are no
+connection options.
 
 ## Datastore directory
 

@@ -68,22 +68,11 @@ pub enum Error {
     DispatchWorkerFailed(String),
     #[error("dispatch worker died unexpectedly")]
     DispatchWorkerDied,
-    #[error(
-        "the buffer pool needs {} GiB but the machine only has {} GiB available right now; \
-         every pool slot is faulted in at startup, so booting would be killed by the OOM \
-         killer part way through. Free memory on the machine, or lower the budget with the \
-         `server.memory` config key (or the PIVOT_MEMORY_PCT environment variable)",
-        .requested_bytes / GIB,
-        .available_bytes / GIB,
-    )]
-    InsufficientMemory {
-        requested_bytes: usize,
-        available_bytes: usize,
-    },
+    #[error(transparent)]
+    InsufficientMemory(#[from] crate::resources::InsufficientMemory),
+    #[error(transparent)]
+    DiskCacheUnavailable(#[from] crate::resources::DiskCacheUnavailable),
 }
-
-/// Bytes in a gibibyte, the unit memory budgets are reported in.
-const GIB: usize = 1024 * 1024 * 1024;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
