@@ -7,8 +7,8 @@ use std::fmt;
 ///
 /// A statement, not a query: it produces no rows and isn't compiled into a
 /// dataflow. The server inspects it after planning (see
-/// [`Plan::as_compact`](crate::Plan::as_compact)) and runs the sweeps on the
-/// coordinator, because a sweep drives dataflows of its own and would deadlock
+/// [`Plan::as_compact`](crate::Plan::as_compact)) and runs the round on the
+/// coordinator, because a round drives dataflows of its own and would deadlock
 /// the pool if it ran on a worker.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Compact {
@@ -17,7 +17,8 @@ pub struct Compact {
     /// The schema the statement named, or `None` for the default.
     pub schema: Option<String>,
     pub table: String,
-    /// `COMPACT ... FINAL`: keep sweeping until a sweep merges nothing.
+    /// `COMPACT ... FINAL`: also merge candidates that do not meet the normal
+    /// size, file-count, balance, or overlap guards.
     pub final_sweep: bool,
 }
 
