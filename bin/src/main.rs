@@ -1,8 +1,10 @@
 //! Pivot command-line entry point.
 
+use std::num::NonZeroUsize;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use metastore_disk::ByteSize;
 
 #[derive(Parser, Debug)]
 #[command(name = "pivot", about = "Pivot command-line tools", version)]
@@ -30,6 +32,15 @@ enum PivotCommand {
         /// Local directory or object-store URI holding the datastore.
         #[arg(value_name = "DATASTORE_LOCATION")]
         datastore_location: String,
+
+        /// Buffer-pool memory budget (suffixes k/m/g/t, base-1024).
+        /// Defaults to half of the machine's physical memory.
+        #[arg(long, value_name = "SIZE")]
+        memory: Option<ByteSize>,
+
+        /// Number of dispatch worker threads. Defaults to all available cores.
+        #[arg(long, value_name = "COUNT")]
+        workers: Option<NonZeroUsize>,
     },
     /// Run the Pivot database server in the foreground.
     Server(bin::server::ServerOptions),
@@ -37,7 +48,17 @@ enum PivotCommand {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     match Args::parse().command {
-        PivotCommand::Open { datastore_location } => bin::shell::run(datastore_location),
+        PivotCommand::Open {
+            datastore_location,
+            memory,
+            workers,
+        } => bin::shell::run_with_limits(
+            datastore_location,
+            bin::shell::ShellLimits {
+                memory_bytes: memory.map(ByteSize::as_bytes),
+                workers: workers.map(NonZeroUsize::get),
+            },
+        ),
         PivotCommand::Server(options) => bin::server::run(options).map_err(Into::into),
     }
 }
@@ -60,7 +81,10 @@ mod tests {
 
     fn open_location(argument: &str) -> String {
         let args = Args::try_parse_from(["pivot", "open", argument]).unwrap();
-        let PivotCommand::Open { datastore_location } = args.command else {
+        let PivotCommand::Open {
+            datastore_location, ..
+        } = args.command
+        else {
             panic!("open did not parse as the open command");
         };
         datastore_location

@@ -7,6 +7,31 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[test]
+fn open_help_lists_resource_limits() {
+    let output = Command::new(env!("CARGO_BIN_EXE_pivot"))
+        .args(["open", "--help"])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}");
+    assert!(stdout.contains("--memory <SIZE>"), "{stdout}");
+    assert!(stdout.contains("--workers <COUNT>"), "{stdout}");
+}
+
+#[test]
+fn open_rejects_zero_workers() {
+    let output = Command::new(env!("CARGO_BIN_EXE_pivot"))
+        .args(["open", "/tmp/pivot", "--workers", "0"])
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "pivot accepted zero workers");
+    assert!(stderr.contains("--workers"), "{stderr}");
+}
+
+#[test]
 fn server_command_runs_until_terminated() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();

@@ -5,9 +5,9 @@ use crate::execution::{ExecuteOptions, StatementOutput};
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
-use crate::shell::ShellInstance;
 use crate::shell::parser::split_complete;
 use crate::shell::render::{TextBatch, render_table};
+use crate::shell::{ShellInstance, ShellLimits};
 
 const HELP: &str = "\
 Shell commands:
@@ -20,12 +20,13 @@ Shell commands:
 
 pub(crate) async fn run_shell(
     datastore_location: String,
+    limits: ShellLimits,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !io::stdin().is_terminal() {
         return Err("an interactive terminal is required".into());
     }
 
-    let instance = ShellInstance::open(&datastore_location)?;
+    let instance = ShellInstance::open_with_limits(&datastore_location, limits)?;
     let editor = DefaultEditor::new()?;
 
     println!("pivot shell ({})", env!("CARGO_PKG_VERSION"));
