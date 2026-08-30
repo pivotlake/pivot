@@ -261,6 +261,10 @@ fi
 for built in "$before_bin" "$after_bin" "$before_server" "$after_server"; do
     [[ -x "$built" ]] || { echo "error: build produced no $built" >&2; exit 1; }
 done
+# Identical-source A/Bs still build distinct binaries when the profiles differ;
+# the hashes make that visible in the log.
+echo ">>> server binary identity"
+sha256sum "$before_server" "$after_server"
 
 echo ">>> saving warm caches"
 save_cache "cargo-home" "$HOME/.cargo" registry git &
@@ -402,6 +406,9 @@ END {
     echo "=== failures: cold regressions (>= ${regression_pct}%) or missing timings ==="
     if [[ "$correctness" != "ok" ]]; then echo "output mismatch between sides"; fi
     if [[ -n "$failures" ]]; then echo "$failures"; else echo "none"; fi
+    echo
+    echo "=== raw per-pass cold times (query<TAB>side<TAB>ms, in run order) ==="
+    cat "$rows"
 } >>"$report"
 
 cat "$report"
