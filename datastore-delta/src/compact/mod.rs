@@ -47,7 +47,7 @@
 //! commands carry the table snapshot captured by their query transaction. The
 //! actor stops before the datastore's dispatch pool shuts down.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -167,6 +167,10 @@ pub(crate) struct CompacterActor {
     poll_interval: Option<Duration>,
     datastore: Arc<DeltaDatastore>,
     commands: mpsc::UnboundedReceiver<CompactionCommand>,
+    /// Each table's layout pair scores, remembered from round to round so a
+    /// pass only measures the files it has not seen before (see
+    /// [`overlap::LayoutScoreCache`]).
+    layout_score_caches: HashMap<uuid::Uuid, overlap::LayoutScoreCache>,
 }
 
 impl CompacterHandle {
@@ -189,6 +193,7 @@ impl CompacterHandle {
                 poll_interval,
                 datastore,
                 commands: receiver,
+                layout_score_caches: HashMap::new(),
             },
         )
     }
@@ -256,8 +261,11 @@ impl CompacterActor {
         }
     }
 
-    async fn compact_all(&self) {
-        for (name, table) in self.datastore.tables() {
+    async fn compact_all(&mut self) {
+        let tables = self.datastore.tables();
+        let live: HashSet<uuid::Uuid> = tables.iter().map(|(_, table)| table.id()).collect();
+        self.layout_score_caches.retain(|id, _| live.contains(id));
+        for (name, table) in tables {
             if let Err(error) = self.compact_table(&name, table, false).await {
                 error!(table = %name, error = %error, "compaction round failed");
             }
@@ -274,7 +282,7 @@ impl CompacterActor {
     /// and nothing in flight ends the round. Returns the table as it stands and
     /// the number of passes.
     async fn compact_table(
-        &self,
+        &mut self,
         name: &SchemaQualifiedTableName,
         mut table: CatalogTable,
         final_sweep: bool,
@@ -335,7 +343,7 @@ impl CompacterActor {
     /// the merges already in flight are rewriting, which no second merge may
     /// claim.
     fn next_batch(
-        &self,
+        &mut self,
         table: &CatalogTable,
         apply_guards: bool,
         reserved: &HashSet<ObjectPath>,
@@ -392,24 +400,25 @@ impl CompacterActor {
     /// are the same singleton on it. Selection itself skips pairs whose ranges
     /// merely touch at one value, pairs of one identical key value throughout
     /// that exceed the output ceiling, and pairs without more than a fifth of
-    /// each file's row groups contested. That last one is the whole bar: a
-    /// sweep merges every pair that clears it, whether or not the round
-    /// applies the small-file guards.
+    /// each file's row groups contested. That last one is the whole bar:
+    /// layout optimization merges every pair that clears it, whether or not
+    /// the round applies the small-file guards.
     fn next_layout_optimization(
-        &self,
+        &mut self,
         table: &CatalogTable,
         reserved: &HashSet<ObjectPath>,
     ) -> Option<Vec<FileRef>> {
         table.sort_by().first()?;
 
+        // Reserved files stay in the selection's view: a merge holding them
+        // can fail, so their remembered scores must survive, and it is the
+        // selection that passes their pairs over.
         let mut by_partition: Vec<(
             Option<crate::PartitionValues>,
             Vec<overlap::LayoutCandidate<'_>>,
         )> = Vec::new();
         for file in table.files() {
-            if is_small_file(file.entry.file.size, self.target_bytes)
-                || reserved.contains(&file.entry.file.path)
-            {
+            if is_small_file(file.entry.file.size, self.target_bytes) {
                 continue;
             }
             let candidate = overlap::LayoutCandidate::from_table_file(file, table.sort_by());
@@ -422,9 +431,13 @@ impl CompacterActor {
             }
         }
 
-        let partitions: Vec<Vec<overlap::LayoutCandidate<'_>>> =
-            by_partition.into_iter().map(|(_, files)| files).collect();
-        let (left, right) = overlap::select_pair(&partitions, table.sort_by(), self.target_bytes)?;
+        let partitions: Vec<&[overlap::LayoutCandidate<'_>]> = by_partition
+            .iter()
+            .map(|(_, files)| files.as_slice())
+            .collect();
+        let cache = self.layout_score_caches.entry(table.id()).or_default();
+        let (_, left, right) =
+            cache.select_pair(&partitions, table.sort_by(), self.target_bytes, reserved)?;
         Some(vec![left.file.clone(), right.file.clone()])
     }
 }
