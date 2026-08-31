@@ -596,10 +596,10 @@ struct DatastoreConfig {
     /// per datastore (set `compact: false` on the others).
     #[serde(default = "default_true")]
     compact: bool,
-    /// Layout-compaction output target (such as `128m` or `1g`). Files strictly
-    /// below half this size are small-file candidates; files at least half full
-    /// are layout candidates. A single row group may exceed the target. Defaults
-    /// to [`DEFAULT_COMPACT_BYTES`].
+    /// Compaction output target (such as `128m` or `1g`). Files strictly below
+    /// half this size are small-file candidates; files at least half full are
+    /// layout candidates. A single row group may exceed the target. Defaults to
+    /// [`DEFAULT_COMPACT_BYTES`].
     #[serde(skip_serializing_if = "Option::is_none")]
     compact_bytes: Option<ByteSize>,
     /// Accumulated small-file bytes that immediately trigger a merge. Defaults

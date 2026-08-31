@@ -800,7 +800,7 @@ impl CatalogTable {
         &self,
         inputs: &[FileRef],
         target_rows_per_group: usize,
-        max_output_file_size: Option<u64>,
+        max_output_file_size: u64,
     ) -> crate::Result<Vec<TableFile>> {
         // The selector guarantees that all inputs share one partition, so its
         // recorded tuple can key every decoded batch without repartitioning it.
@@ -821,8 +821,7 @@ impl CatalogTable {
                 .partition
                 .clone()
         });
-        let max_output_file_size =
-            max_output_file_size.map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX));
+        let max_output_file_size = usize::try_from(max_output_file_size).unwrap_or(usize::MAX);
         let uploaded_files = Arc::new(Injector::new());
         let encoded = parquet_engine::writing::encode_compaction_batches_spec(
             scan,

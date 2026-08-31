@@ -135,8 +135,9 @@ pub fn encode_record_batches_spec(
 /// Appends Parquet construction to a compaction scan. Every input batch already
 /// belongs to the selected partition and is ordered as it was in its source
 /// file, so the INSERT-only partition/sort/copy stage is skipped. All batches
-/// form one output file; sorted tables still use the downstream k-way merge to
-/// combine overlapping source-file runs.
+/// form one ordered output stream, split at target-sized row-group boundaries;
+/// sorted tables still use the downstream k-way merge to combine
+/// overlapping source-file runs.
 pub fn encode_compaction_batches_spec(
     spec: RecordBatchOperatorSpec,
     schema: SchemaRef,
@@ -144,7 +145,7 @@ pub fn encode_compaction_batches_spec(
     partition_column_names: Arc<[String]>,
     sort_column_names: Arc<[String]>,
     target_rows_per_group: usize,
-    max_file_size: Option<usize>,
+    max_file_size: usize,
 ) -> OperatorSpec<AssembledFile, impl OperatorFactory<AssembledFile> + 'static> {
     let spec = unshred_batches_spec(spec);
     let order_by = sort_order(&schema, &sort_column_names);
@@ -169,7 +170,7 @@ pub fn encode_compaction_batches_spec(
                 order_by.into(),
                 target_rows_per_group,
                 usize::MAX,
-                max_file_size,
+                Some(max_file_size),
                 topology,
             ),
         );
