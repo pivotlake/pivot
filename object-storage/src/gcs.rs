@@ -76,6 +76,9 @@ struct GcsAuth {
     /// An explicitly configured credentials file, which takes precedence over
     /// the rest of the Application Default Credentials chain.
     credentials_file: Option<String>,
+    /// A catalog-vended bearer token. When present it is used as-is instead of
+    /// consulting the Application Default Credentials chain.
+    access_token: Option<String>,
     /// Whether the endpoint is an emulator: it ignores credentials, so we never
     /// mint a token and reads need no `Authorization` header.
     emulated: bool,
@@ -85,8 +88,9 @@ struct GcsAuth {
 struct CachedToken {
     /// The full header value (`Bearer <token>`), ready to send as-is.
     header: Arc<str>,
-    /// Unix seconds after which the token must be re-minted.
-    expires_at: u64,
+    /// Unix seconds after which the token must be re-minted. Explicit bearer
+    /// tokens have no refresh schedule, so their expiry is unknown here.
+    expires_at: Option<u64>,
 }
 
 impl GcsStore {
@@ -97,7 +101,7 @@ impl GcsStore {
     /// to target a `fake-gcs-server` emulator instead of the real service: the
     /// scheme is optional and defaults to `http`.
     pub fn with_default_credentials(uri: &str) -> Result<Self> {
-        Self::build(uri, None)
+        Self::build(uri, None, None)
     }
 
     /// Parse `gs://bucket/prefix` but mint tokens from the service-account (or
@@ -105,10 +109,20 @@ impl GcsStore {
     /// environment, the path a metastore uses to open a datastore with its own
     /// configured credentials.
     pub fn with_credentials_file(uri: &str, credentials_file: &str) -> Result<Self> {
-        Self::build(uri, Some(credentials_file.to_string()))
+        Self::build(uri, Some(credentials_file.to_string()), None)
     }
 
-    fn build(uri: &str, credentials_file: Option<String>) -> Result<Self> {
+    /// Parse `gs://bucket/prefix` and authenticate with a bearer token vended by
+    /// an Iceberg REST catalog.
+    pub fn with_access_token(uri: &str, access_token: &str) -> Result<Self> {
+        Self::build(uri, None, Some(access_token.to_string()))
+    }
+
+    fn build(
+        uri: &str,
+        credentials_file: Option<String>,
+        access_token: Option<String>,
+    ) -> Result<Self> {
         let rest = uri
             .strip_prefix("gs://")
             .ok_or_else(|| StoreError::UnsupportedUri(uri.to_string()))?;
@@ -134,6 +148,7 @@ impl GcsStore {
                 agent: ureq::AgentBuilder::new().build(),
                 token: RwLock::new(None),
                 credentials_file,
+                access_token,
                 emulated,
             }),
         })
@@ -179,7 +194,9 @@ impl GcsAuth {
         }
         let now = unix_now();
         if let Some(token) = self.token.read().unwrap().as_ref()
-            && token.expires_at > now + TOKEN_REFRESH_MARGIN
+            && token
+                .expires_at
+                .is_none_or(|expires_at| expires_at > now + TOKEN_REFRESH_MARGIN)
         {
             return Ok(token.header.clone());
         }
@@ -190,7 +207,7 @@ impl GcsAuth {
         let header: Arc<str> = Arc::from(format!("Bearer {value}"));
         *self.token.write().unwrap() = Some(CachedToken {
             header: header.clone(),
-            expires_at: now + expires_in,
+            expires_at: expires_in.map(|expires_in| now.saturating_add(expires_in)),
         });
         Ok(header)
     }
@@ -208,20 +225,24 @@ impl GcsAuth {
     /// Mint a fresh access token, returning `(token, lifetime_seconds)`, walking
     /// the Application Default Credentials chain: the configured credentials
     /// file, else an explicit `GOOGLE_APPLICATION_CREDENTIALS` file, else the
-    /// gcloud-written well-known file, else the metadata server.
-    fn mint_token(&self) -> Result<(String, u64)> {
-        if let Some(path) = &self.credentials_file {
-            return self.token_from_credentials_file(path);
+    /// gcloud-written well-known file, else the metadata server. A token
+    /// supplied directly has no lifetime information.
+    fn mint_token(&self) -> Result<(String, Option<u64>)> {
+        if let Some(access_token) = &self.access_token {
+            return Ok((access_token.clone(), None));
         }
-        if let Ok(path) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
-            return self.token_from_credentials_file(&path);
-        }
-        if let Some(path) = well_known_credentials_path()
+        let minted = if let Some(path) = &self.credentials_file {
+            self.token_from_credentials_file(path)
+        } else if let Ok(path) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS") {
+            self.token_from_credentials_file(&path)
+        } else if let Some(path) = well_known_credentials_path()
             && path.is_file()
         {
-            return self.token_from_credentials_file(&path.to_string_lossy());
-        }
-        self.metadata_token()
+            self.token_from_credentials_file(&path.to_string_lossy())
+        } else {
+            self.metadata_token()
+        };
+        minted.map(|(value, expires_in)| (value, Some(expires_in)))
     }
 
     /// Mint a token from a credentials file (a service-account key or an
@@ -329,6 +350,7 @@ impl ObjectStore for GcsStore {
         StoreConnection::Gcs {
             uri: self.uri.clone(),
             credentials_file: self.auth.credentials_file.clone(),
+            access_token: self.auth.access_token.clone(),
             emulator_endpoint: self.auth.emulated.then(|| self.endpoint.clone()),
         }
     }
@@ -766,6 +788,7 @@ mod tests {
             agent: ureq::AgentBuilder::new().build(),
             token: RwLock::new(token),
             credentials_file: None,
+            access_token: None,
             emulated,
         }
     }
@@ -784,7 +807,7 @@ mod tests {
     fn current_reads_cached_header_without_minting() {
         let cached = CachedToken {
             header: Arc::from("Bearer abc"),
-            expires_at: u64::MAX,
+            expires_at: Some(u64::MAX),
         };
         let auth = auth(false, Some(cached));
 
@@ -799,6 +822,25 @@ mod tests {
         let auth = auth(false, None);
 
         assert!(auth.current().is_none());
+    }
+
+    #[test]
+    fn vended_access_token_is_used_without_minting_ambient_credentials() {
+        let store = GcsStore::with_access_token("gs://bucket", "vended-token").unwrap();
+
+        assert_eq!(&*store.auth.header().unwrap(), "Bearer vended-token");
+        assert_eq!(store.auth.current().as_deref(), Some("Bearer vended-token"));
+        assert!(
+            store
+                .auth
+                .token
+                .read()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .expires_at
+                .is_none()
+        );
     }
 
     #[test]

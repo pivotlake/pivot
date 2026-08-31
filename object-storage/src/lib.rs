@@ -312,6 +312,7 @@ pub enum StoreConnection {
     Gcs {
         uri: String,
         credentials_file: Option<String>,
+        access_token: Option<String>,
         emulator_endpoint: Option<String>,
     },
 }

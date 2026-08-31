@@ -5,8 +5,9 @@
 //! endpoints that do not require authentication.
 //!
 //! Credentials come from one of two places. [`S3Store::with_env_credentials`]
-//! reads them from the environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`;
-//! optional region from `AWS_REGION`/`AWS_DEFAULT_REGION`; an optional
+//! reads them from the environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+//! and optional `AWS_SESSION_TOKEN`;
+//! region from `AWS_REGION`/`AWS_DEFAULT_REGION`; an optional
 //! `AWS_ENDPOINT_URL` selects a path-style S3-compatible endpoint like MinIO).
 //! [`S3Store::with_credentials`] takes them explicitly, so a metastore can supply
 //! a datastore's own key/secret/region/endpoint rather than relying on whatever
@@ -45,6 +46,7 @@ pub struct S3Store {
     /// anonymous access. Constructors preserve that invariant.
     access_key: Option<String>,
     secret_key: Option<String>,
+    session_token: Option<String>,
     /// The path-style endpoint override this store was opened with, if any.
     endpoint: Option<String>,
     /// Base origin, e.g. `https://bucket.s3.us-east-1.amazonaws.com` (virtual
@@ -64,6 +66,8 @@ pub struct S3Credentials {
     pub region: Option<String>,
     pub access_key: String,
     pub secret_key: String,
+    /// The security token paired with temporary STS credentials.
+    pub session_token: Option<String>,
     /// A path-style S3-compatible endpoint (e.g. MinIO). `None` uses AWS
     /// virtual-hosted style.
     pub endpoint: Option<String>,
@@ -78,6 +82,9 @@ impl S3Store {
 
         let region = env_any(&["AWS_REGION", "AWS_DEFAULT_REGION"]);
         let (access_key, secret_key) = env_credentials()?;
+        let session_token = access_key
+            .as_ref()
+            .and_then(|_| std::env::var("AWS_SESSION_TOKEN").ok());
         Self::build(
             uri,
             bucket,
@@ -85,6 +92,7 @@ impl S3Store {
             region,
             access_key,
             secret_key,
+            session_token,
             std::env::var("AWS_ENDPOINT_URL").ok(),
         )
     }
@@ -95,7 +103,7 @@ impl S3Store {
     /// location to be read.
     pub fn anonymous(uri: &str) -> Result<Self> {
         let (bucket, prefix) = parse_s3_uri(uri)?;
-        Self::build(uri, bucket, prefix, None, None, None, None)
+        Self::build(uri, bucket, prefix, None, None, None, None, None)
     }
 
     /// Open anonymously with explicit connection parameters. Useful for an
@@ -111,6 +119,7 @@ impl S3Store {
             bucket,
             prefix,
             Some(region.into()),
+            None,
             None,
             None,
             endpoint,
@@ -134,6 +143,7 @@ impl S3Store {
             credentials.region,
             Some(credentials.access_key),
             Some(credentials.secret_key),
+            credentials.session_token,
             credentials.endpoint,
         )
     }
@@ -148,6 +158,7 @@ impl S3Store {
         region: Option<String>,
         access_key: Option<String>,
         secret_key: Option<String>,
+        session_token: Option<String>,
         endpoint: Option<String>,
     ) -> Result<Self> {
         let agent = ureq::AgentBuilder::new().build();
@@ -182,6 +193,7 @@ impl S3Store {
             region,
             access_key,
             secret_key,
+            session_token,
             endpoint,
             base,
             host,
@@ -209,10 +221,13 @@ impl S3Store {
             (None, None) => return Ok(Vec::new()),
             _ => unreachable!("S3 credentials are either both present or both absent"),
         };
-        // Long-lived keys only, so neither a session token nor an expiry.
-        // `Static` is the SDK's own name for keys handed over directly rather
-        // than resolved by a credentials provider.
-        let creds = Credentials::new(access_key, secret_key, None, None, "Static");
+        let creds = Credentials::new(
+            access_key,
+            secret_key,
+            self.session_token.clone(),
+            None,
+            "Static",
+        );
         let identity = creds.into();
 
         let mut settings = SigningSettings::default();
@@ -287,6 +302,7 @@ impl ObjectStore for S3Store {
                     .secret_key
                     .clone()
                     .expect("an access key always has a matching secret key"),
+                session_token: self.session_token.clone(),
                 endpoint: self.endpoint.clone(),
             }),
             endpoint: self.endpoint.clone(),
@@ -514,10 +530,13 @@ impl S3Store {
             _ => unreachable!("S3 credentials are either both present or both absent"),
         };
 
-        // Long-lived keys only, so neither a session token nor an expiry.
-        // `Static` is the SDK's own name for keys handed over directly rather
-        // than resolved by a credentials provider.
-        let creds = Credentials::new(access_key, secret_key, None, None, "Static");
+        let creds = Credentials::new(
+            access_key,
+            secret_key,
+            self.session_token.clone(),
+            None,
+            "Static",
+        );
         let identity = creds.into();
 
         let mut settings = SigningSettings::default();
@@ -723,6 +742,7 @@ mod tests {
                 region: None,
                 access_key: "access".to_string(),
                 secret_key: "secret".to_string(),
+                session_token: None,
                 endpoint: Some(endpoint),
             },
         )
@@ -760,6 +780,7 @@ mod tests {
                 region: Some("us-east-1".to_string()),
                 access_key: "access".to_string(),
                 secret_key: "secret".to_string(),
+                session_token: None,
                 endpoint: Some("http://objects.example".to_string()),
             },
         )
@@ -817,5 +838,28 @@ mod tests {
         assert_eq!(parsed.common_prefixes[0].prefix, "db/events/2026/");
         assert!(parsed.is_truncated);
         assert_eq!(parsed.next_continuation_token.as_deref(), Some("next-page"));
+    }
+
+    #[test]
+    fn temporary_credentials_put_the_session_token_in_presigned_urls() {
+        let store = S3Store::with_credentials(
+            "s3://warehouse",
+            S3Credentials {
+                region: Some("us-east-1".to_string()),
+                access_key: "access-key".to_string(),
+                secret_key: "secret-key".to_string(),
+                session_token: Some("temporary-token".to_string()),
+                endpoint: None,
+            },
+        )
+        .unwrap();
+
+        let url = store.presign_get(&ObjectPath::new("data.parquet")).unwrap();
+        let token = url
+            .query_pairs()
+            .find(|(name, _)| name.eq_ignore_ascii_case("X-Amz-Security-Token"))
+            .map(|(_, value)| value.into_owned());
+
+        assert_eq!(token.as_deref(), Some("temporary-token"));
     }
 }

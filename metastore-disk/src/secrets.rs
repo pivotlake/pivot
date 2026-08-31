@@ -258,6 +258,7 @@ impl Secrets {
             region: secret.region.clone(),
             access_key: secret.access_key_id.clone(),
             secret_key: secret.secret_access_key.clone(),
+            session_token: None,
             endpoint: secret.endpoint.clone(),
         })
     }

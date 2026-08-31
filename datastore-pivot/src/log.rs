@@ -30,6 +30,7 @@ use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::object_store::aws::AmazonS3Builder;
 use delta_kernel::object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
 use delta_kernel::object_store::local::LocalFileSystem;
+use delta_kernel::object_store::{StaticCredentialProvider, gcp::GcpCredential};
 use delta_kernel::scan::StatsOptions;
 use delta_kernel::scan::state::ScanFile;
 use delta_kernel::schema::{
@@ -984,6 +985,9 @@ fn build_delta_object_store(connection: StoreConnection) -> Result<Arc<DynObject
                 builder = builder
                     .with_access_key_id(credentials.access_key)
                     .with_secret_access_key(credentials.secret_key);
+                if let Some(token) = credentials.session_token {
+                    builder = builder.with_token(token);
+                }
             } else {
                 builder = builder.with_skip_signature(true);
             }
@@ -998,6 +1002,7 @@ fn build_delta_object_store(connection: StoreConnection) -> Result<Arc<DynObject
         StoreConnection::Gcs {
             uri,
             credentials_file,
+            access_token,
             emulator_endpoint,
         } => {
             let mut builder = GoogleCloudStorageBuilder::from_env().with_url(uri);
@@ -1007,6 +1012,11 @@ fn build_delta_object_store(connection: StoreConnection) -> Result<Arc<DynObject
                     .with_config(GoogleConfigKey::SkipSignature, "true");
             } else if let Some(path) = credentials_file {
                 builder = builder.with_service_account_path(path);
+            }
+            if let Some(token) = access_token {
+                builder = builder.with_credentials(Arc::new(StaticCredentialProvider::new(
+                    GcpCredential { bearer: token },
+                )));
             }
             Arc::new(builder.build()?)
         }
