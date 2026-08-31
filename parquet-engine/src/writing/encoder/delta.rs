@@ -16,7 +16,7 @@
 //! count per miniblock has to stay a multiple of 32, which is what keeps each
 //! one starting on a byte boundary.
 
-use crate::thrift::general::Encoding;
+use crate::thrift::general::{CompressionCodec, Encoding};
 use arrow_array::{
     Array, BinaryViewArray, Date32Array, Decimal64Array, Decimal128Array, Int8Array, Int16Array,
     Int32Array, Int64Array, StringArray, StringViewArray, TimestampMicrosecondArray,
@@ -53,6 +53,7 @@ const VALUES_PER_MINIBLOCK: usize = VALUES_PER_BLOCK / MINIBLOCKS_PER_BLOCK;
 /// gets it back rather than having to ask again.
 pub(super) fn try_encode_chunk(
     leaf: &Leaf,
+    codec: CompressionCodec,
     allocator: &mut SlabAllocator,
 ) -> WriteResult<Option<(Encoding, Vec<EncodedPage>)>> {
     let Some(encoding) = encoding_for(leaf.values.data_type()) else {
@@ -60,7 +61,7 @@ pub(super) fn try_encode_chunk(
     };
     let pages = pages::page_ranges(leaf)?
         .into_iter()
-        .map(|range| encode_data_page(leaf, range, encoding, allocator))
+        .map(|range| encode_data_page(leaf, range, encoding, codec, allocator))
         .collect::<WriteResult<Vec<_>>>()?;
     Ok(Some((encoding, pages)))
 }
@@ -102,6 +103,7 @@ fn encode_data_page(
     leaf: &Leaf,
     range: PageRange,
     encoding: Encoding,
+    codec: CompressionCodec,
     allocator: &mut SlabAllocator,
 ) -> WriteResult<EncodedPage> {
     let num_rows = range.rows.len();
@@ -123,6 +125,7 @@ fn encode_data_page(
             num_values: num_rows,
             encoding,
         },
+        codec,
         allocator,
     )
 }

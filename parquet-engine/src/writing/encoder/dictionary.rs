@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use crate::thrift::general::Encoding;
+use crate::thrift::general::{CompressionCodec, Encoding};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Date32Type, Int32Type, TimestampMicrosecondType};
 use arrow_array::{Array, ArrayRef, Int32Array, Int64Array};
@@ -66,6 +66,7 @@ const MAX_DISTINCT_SHARE: usize = 5;
 /// dictionary-cast.
 pub(super) fn try_encode(
     leaf: &Leaf,
+    codec: CompressionCodec,
     allocator: &mut SlabAllocator,
 ) -> WriteResult<Option<(EncodedPage, EncodedPage)>> {
     let values = &leaf.values;
@@ -103,8 +104,14 @@ pub(super) fn try_encode(
         .map(|&k| k as u32)
         .collect();
     Ok(Some((
-        dictionary_page(dict_raw, distinct.len(), allocator)?,
-        index_page(leaf, &indices, index_bit_width(distinct.len()), allocator)?,
+        dictionary_page(dict_raw, distinct.len(), codec, allocator)?,
+        index_page(
+            leaf,
+            &indices,
+            index_bit_width(distinct.len()),
+            codec,
+            allocator,
+        )?,
     )))
 }
 
@@ -119,9 +126,16 @@ fn index_bit_width(len: usize) -> u8 {
 fn dictionary_page(
     raw: Vec<u8>,
     num_values: usize,
+    codec: CompressionCodec,
     allocator: &mut SlabAllocator,
 ) -> WriteResult<EncodedPage> {
-    pages::assemble_page(0, raw, PageKind::Dictionary { num_values }, allocator)
+    pages::assemble_page(
+        0,
+        raw,
+        PageKind::Dictionary { num_values },
+        codec,
+        allocator,
+    )
 }
 
 /// Encode the index data page: the leaf's definition levels, then a one-byte
@@ -132,6 +146,7 @@ fn index_page(
     leaf: &Leaf,
     indices: &[u32],
     bit_width: u8,
+    codec: CompressionCodec,
     allocator: &mut SlabAllocator,
 ) -> WriteResult<EncodedPage> {
     let mut encoded = Vec::with_capacity(1 + indices.len());
@@ -147,6 +162,7 @@ fn index_page(
             num_values: num_rows,
             encoding: Encoding::RLE_DICTIONARY,
         },
+        codec,
         allocator,
     )
 }
