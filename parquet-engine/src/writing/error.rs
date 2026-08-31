@@ -19,6 +19,9 @@ pub(crate) enum WriteError {
     /// Snappy-compressing a page body.
     #[error("snappy-compressing a page: {0}")]
     Snappy(#[from] snap::Error),
+    /// Zstd-compressing a page body (the zstd crate reports through io::Error).
+    #[error("zstd-compressing a page: {0}")]
+    Zstd(#[from] std::io::Error),
     /// A column whose Arrow type the encoder doesn't handle.
     #[error("unsupported column type for Parquet encoding: {0:?}")]
     UnsupportedType(DataType),

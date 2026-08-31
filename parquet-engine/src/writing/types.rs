@@ -18,6 +18,8 @@ use dispatch::{
     WorkerIdOutput,
 };
 
+use crate::thrift::general::CompressionCodec;
+
 /// Unique identity of a row group within one write pipeline.
 pub(crate) type RowGroupId = u64;
 
@@ -203,6 +205,9 @@ pub(crate) struct EncodedLeaf {
     pub(crate) dictionary_page: Option<EncodedPage>,
     pub(crate) data_page_encoding: Encoding,
     pub(crate) data_pages: Vec<EncodedPage>,
+    /// The codec this leaf's pages were compressed with, which the footer
+    /// records per column chunk.
+    pub(crate) codec: CompressionCodec,
 }
 
 /// One fully encoded top-level column, containing its primitive leaves in

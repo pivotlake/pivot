@@ -33,7 +33,9 @@ zstd = { workspace = true }
 
 [dev-dependencies]
 dispatch = { workspace = true, features = ["test-util"] }
-parquet = { workspace = true, features = ["variant_experimental"] }
+# `lz4` and `zstd` so the round-trip tests' reference reader can decode files
+# written under every PIVOT_PAGE_CODEC value, not only the snappy default.
+parquet = { workspace = true, features = ["variant_experimental", "lz4", "zstd"] }
 arrow-schema = { workspace = true }
 arrow = { workspace = true, features = ["prettyprint"] }
 parquet-variant = { workspace = true }
