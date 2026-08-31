@@ -235,6 +235,17 @@ impl CatalogTable {
         Ok(true)
     }
 
+    /// Fold a file swap this process already committed through the datastore
+    /// into this read copy without a log read: drop `removed` and adopt
+    /// `added`, whose footers the writer holds. The copy's snapshot stays at
+    /// its version; a later [`refresh`](Self::refresh) reconciles it to the
+    /// log and keeps the adopted footers.
+    pub(crate) fn apply_file_swap(&mut self, removed: &[ObjectPath], added: Vec<TableFile>) {
+        self.files
+            .retain(|file| !removed.contains(&file.entry.file.path));
+        self.files.extend(added);
+    }
+
     /// Commit file changes against this copy's snapshot. Each attempt first
     /// verifies that every `removed` path is still active, returning
     /// [`Error::CommitConflict`] if another commit removed one. After a successful
