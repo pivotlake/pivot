@@ -484,9 +484,7 @@ mod tests {
     use crate::writing::types::{EncodedColumnChunk, FileAssemblyInfo};
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Decimal64Type, Int64Type};
-    use arrow_array::{
-        Array, ArrayRef, Datum, Decimal64Array, Int64Array, RecordBatch, StructArray,
-    };
+    use arrow_array::{Array, ArrayRef, Decimal64Array, Int64Array, RecordBatch, StructArray};
     use arrow_buffer::NullBuffer;
     use arrow_schema::{Field, Fields, Schema};
     use dispatch::Dispatch;
@@ -705,8 +703,8 @@ mod tests {
             Arc::new(ParquetTable::from_files(dispatch.dispatcher(), &[path], &[]).unwrap());
 
         let stats = table.row_groups()[0].column_statistics(0).unwrap();
-        let (min, _) = stats.min.as_ref().unwrap().get();
-        let (max, _) = stats.max.as_ref().unwrap().get();
+        let min = stats.min().unwrap().into_inner();
+        let max = stats.max().unwrap().into_inner();
         assert_eq!(min.as_primitive::<Decimal64Type>().value(0), -67890);
         assert_eq!(max.as_primitive::<Decimal64Type>().value(0), 12345);
         dispatch.exit();

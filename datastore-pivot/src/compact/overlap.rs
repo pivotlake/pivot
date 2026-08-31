@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, Datum};
+use arrow_array::{Array, ArrayRef};
 use arrow_cast::cast;
 use arrow_ord::cmp;
 
@@ -35,8 +35,8 @@ impl<'a> LayoutCandidate<'a> {
                     .map(|row_group| {
                         let column = row_group.schema.index_of(sort_column).ok()?;
                         let statistics = row_group.column_statistics(column)?;
-                        let min = statistics.min.as_ref()?.get().0.slice(0, 1);
-                        let max = statistics.max.as_ref()?.get().0.slice(0, 1);
+                        let min = statistics.min()?.into_inner();
+                        let max = statistics.max()?.into_inner();
                         Some((min, max))
                     })
                     .collect()

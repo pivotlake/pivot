@@ -8,12 +8,15 @@
 use crate::thrift::footer::{FileMetaData, PageEncodingStats, Statistics};
 use crate::thrift::general::{Encoding, PageType};
 use crate::thrift::parquet_thrift::{ReadThrift, ThriftSliceInputProtocol};
-use crate::types::metadata::{ColumnChunkMeta, ColumnStatistics, RowGroupMetadata};
+use crate::types::metadata::{ColumnChunkMeta, FileLeafStatistics, RowGroupMetadata};
 use arrow_array::builder::{BinaryViewBuilder, StringViewBuilder};
+use arrow_array::types::{
+    ArrowPrimitiveType, Date32Type, Float32Type, Float64Type, Int8Type, Int16Type, Int32Type,
+    Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+};
 use arrow_array::{
-    ArrayRef, BooleanArray, Date32Array, Decimal64Array, Decimal128Array, Float32Array,
-    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, Scalar, TimestampMicrosecondArray,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    ArrayRef, BooleanArray, Decimal64Array, Decimal128Array, PrimitiveArray,
+    TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use dispatch::DataFlowDispatcher;
@@ -183,31 +186,36 @@ pub(crate) fn row_groups_from_metadata(
     // Statistics belong to leaf chunks, not top-level columns.
     let leaves = super::leaves::leaf_fields(schema.fields());
 
-    let row_groups = file_meta
-        .row_groups
-        .into_iter()
-        .enumerate()
-        .map(|(i, rg)| {
-            // Chunks are per leaf; a row group with a different count is a
-            // malformed footer and would index out of bounds below.
-            if rg.columns.len() != leaves.len() {
-                return Err(Error::InvalidFooter(format!(
-                    "row group {i} has {} column chunks but the schema has {} leaves",
-                    rg.columns.len(),
-                    leaves.len()
-                )));
-            }
-            let num_rows = rg.num_rows;
-            let columns = rg
-                .columns
+    let row_group_count = file_meta.row_groups.len();
+    // Statistics are gathered per leaf rather than per row group, so each leaf's
+    // bounds decode into one array covering the whole file. See
+    // [`FileStatistics`].
+    let mut leaf_stats: Vec<Vec<Option<Statistics>>> = (0..leaves.len())
+        .map(|_| Vec::with_capacity(row_group_count))
+        .collect();
+    let mut leaf_physical_types = vec![0_i32; leaves.len()];
+    let mut row_groups = Vec::with_capacity(row_group_count);
+
+    for (i, rg) in file_meta.row_groups.into_iter().enumerate() {
+        // Chunks are per leaf; a row group with a different count is a
+        // malformed footer and would index out of bounds below.
+        if rg.columns.len() != leaves.len() {
+            return Err(Error::InvalidFooter(format!(
+                "row group {i} has {} column chunks but the schema has {} leaves",
+                rg.columns.len(),
+                leaves.len()
+            )));
+        }
+        row_groups.push((
+            rg.num_rows,
+            rg.columns
                 .into_iter()
                 .enumerate()
                 .map(|(j, cc)| {
                     let meta = cc.meta_data.expect("missing column metadata");
                     let physical_type = meta.physical_type;
-                    let statistics = meta
-                        .statistics
-                        .and_then(|s| decode_statistics(s, leaves[j].data_type(), physical_type));
+                    leaf_physical_types[j] = physical_type;
+                    leaf_stats[j].push(meta.statistics);
                     let data_pages_all_dictionary = meta.dictionary_page_offset.is_some()
                         && data_pages_all_dictionary(meta.encoding_stats.as_deref());
                     ColumnChunkMeta {
@@ -219,23 +227,36 @@ pub(crate) fn row_groups_from_metadata(
                         max_def_level: leaf_infos[j].def_level,
                         physical_type,
                         fixed_len_byte_width: leaf_infos[j].type_length,
-                        statistics,
                         data_pages_all_dictionary,
                     }
                 })
-                .collect();
-            Ok(RowGroupMetadata {
-                open_file: open_file.clone(),
-                schema: schema.clone(),
-                columns,
-                num_rows,
-                file_row_group_idx: i,
-                live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
-            })
-        })
-        .collect::<Result<_>>()?;
+                .collect(),
+        ));
+    }
 
-    Ok(row_groups)
+    let statistics = Arc::new(
+        leaf_stats
+            .into_iter()
+            .enumerate()
+            .map(|(j, chunks)| {
+                decode_leaf_statistics(chunks, leaves[j].data_type(), leaf_physical_types[j])
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    Ok(row_groups
+        .into_iter()
+        .enumerate()
+        .map(|(i, (num_rows, columns))| RowGroupMetadata {
+            open_file: open_file.clone(),
+            schema: schema.clone(),
+            columns,
+            statistics: statistics.clone(),
+            num_rows,
+            file_row_group_idx: i,
+            live_decompressed_pages: Arc::new(AtomicUsize::new(0)),
+        })
+        .collect())
 }
 
 /// Returns `true` when `encoding_stats` proves every *data* page in the chunk
@@ -263,148 +284,216 @@ fn data_pages_all_dictionary(encoding_stats: Option<&[PageEncodingStats]>) -> bo
     saw_data_page
 }
 
-/// Decode a Parquet `Statistics` blob into our [`ColumnStatistics`], using
-/// `data_type` to choose the right physical-bytes -> Arrow scalar conversion.
-/// `physical_type` disambiguates a decimal's byte encoding, which follows the
-/// column's physical storage rather than its arrow type.
+/// Decode one leaf's Parquet `Statistics` across a file's row groups into the
+/// column-wise [`FileLeafStatistics`], using `data_type` to choose the physical-bytes
+/// to Arrow conversion. `physical_type` disambiguates a decimal's byte encoding,
+/// which follows the column's physical storage rather than its arrow type.
 ///
 /// Prefer the modern `min_value` / `max_value` fields and fall back to the
-/// legacy `min` / `max` only when those aren't populated. Unsupported types
-/// (or stats whose bytes don't match the expected width) yield `None` for
-/// that side rather than failing the parse.
-fn decode_statistics(
-    stats: Statistics,
+/// legacy `min` / `max` only when those aren't populated. Returns `None` when no
+/// row group recorded anything for the leaf.
+fn decode_leaf_statistics(
+    chunks: Vec<Option<Statistics>>,
     data_type: &DataType,
     physical_type: i32,
-) -> Option<ColumnStatistics> {
-    let max_bytes = stats.max_value.or(stats.max);
-    let min_bytes = stats.min_value.or(stats.min);
-    if max_bytes.is_none()
-        && min_bytes.is_none()
-        && stats.null_count.is_none()
-        && stats.distinct_count.is_none()
-    {
+) -> Option<FileLeafStatistics> {
+    let mut min_bytes = Vec::with_capacity(chunks.len());
+    let mut max_bytes = Vec::with_capacity(chunks.len());
+    let mut null_counts = Vec::with_capacity(chunks.len());
+    let mut distinct_counts = Vec::with_capacity(chunks.len());
+    let mut recorded = false;
+    for chunk in chunks {
+        let (min, max, null_count, distinct_count) = match chunk {
+            Some(stats) => (
+                stats.min_value.or(stats.min),
+                stats.max_value.or(stats.max),
+                stats.null_count,
+                stats.distinct_count,
+            ),
+            None => (None, None, None, None),
+        };
+        recorded |=
+            min.is_some() || max.is_some() || null_count.is_some() || distinct_count.is_some();
+        min_bytes.push(min);
+        max_bytes.push(max);
+        null_counts.push(null_count);
+        distinct_counts.push(distinct_count);
+    }
+    if !recorded {
         return None;
     }
-    Some(ColumnStatistics {
-        min: min_bytes.and_then(|bytes| decode_scalar(&bytes, data_type, physical_type)),
-        max: max_bytes.and_then(|bytes| decode_scalar(&bytes, data_type, physical_type)),
-        null_count: stats.null_count,
-        distinct_count: stats.distinct_count,
+    Some(FileLeafStatistics {
+        min: decode_bounds(&min_bytes, data_type, physical_type),
+        max: decode_bounds(&max_bytes, data_type, physical_type),
+        null_counts,
+        distinct_counts,
     })
 }
 
-fn decode_scalar(
-    bytes: &[u8],
+/// One leaf's bound for every row group as a single array, in file order, null
+/// where a row group recorded none or its bytes don't match the expected width.
+/// `None` for a type this doesn't decode, or when no row group recorded the
+/// bound at all, which leaves the leaf out of range pruning.
+fn decode_bounds(
+    values: &[Option<Vec<u8>>],
     data_type: &DataType,
     physical_type: i32,
-) -> Option<Scalar<ArrayRef>> {
-    /// Read `N` bytes as a little-endian fixed-width primitive. Returns `None`
-    /// if the byte slice doesn't have exactly `N` bytes.
-    fn read_le<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {
-        bytes.try_into().ok()
-    }
-
-    fn erase_type<T: arrow_array::Array + 'static>(s: Scalar<T>) -> Scalar<ArrayRef> {
-        Scalar::new(Arc::new(s.into_inner()))
-    }
-
-    /// Data-block width for a one-value view array: the value's own length.
-    ///
-    /// A view builder left on its default sizing reserves its first block by doubling
-    /// from 8 KiB, and the finished buffer keeps that capacity rather than shrinking to
-    /// the bytes written. A statistic is a single value held for as long as its row
-    /// group's metadata, so sizing the block to the value keeps the cost proportional to
-    /// what it stores. Values of 12 bytes or fewer are packed into the view itself and
-    /// never touch a block, but the width still has to be non-zero.
-    fn pick_block_size(value_len: usize) -> u32 {
-        u32::try_from(value_len).unwrap_or(u32::MAX).max(1)
+) -> Option<ArrayRef> {
+    if values.iter().all(Option::is_none) {
+        return None;
     }
 
     match data_type {
-        DataType::Boolean => bytes
-            .first()
-            .map(|b| erase_type(BooleanArray::new_scalar(*b != 0))),
-        DataType::Int8 => read_le::<4>(bytes)
-            .map(i32::from_le_bytes)
-            .and_then(|v| i8::try_from(v).ok())
-            .map(|v| erase_type(Int8Array::new_scalar(v))),
-        DataType::UInt8 => read_le::<4>(bytes)
-            .map(u32::from_le_bytes)
-            .and_then(|v| u8::try_from(v).ok())
-            .map(|v| erase_type(UInt8Array::new_scalar(v))),
-        DataType::Int16 => read_le::<4>(bytes)
-            .map(i32::from_le_bytes)
-            .and_then(|v| i16::try_from(v).ok())
-            .map(|v| erase_type(Int16Array::new_scalar(v))),
-        DataType::UInt16 => read_le::<4>(bytes)
-            .map(u32::from_le_bytes)
-            .and_then(|v| u16::try_from(v).ok())
-            .map(|v| erase_type(UInt16Array::new_scalar(v))),
-        DataType::Int32 => read_le::<4>(bytes)
-            .map(i32::from_le_bytes)
-            .map(|v| erase_type(Int32Array::new_scalar(v))),
-        DataType::UInt32 => read_le::<4>(bytes)
-            .map(u32::from_le_bytes)
-            .map(|v| erase_type(UInt32Array::new_scalar(v))),
-        DataType::Int64 => read_le::<8>(bytes)
-            .map(i64::from_le_bytes)
-            .map(|v| erase_type(Int64Array::new_scalar(v))),
-        DataType::UInt64 => read_le::<8>(bytes)
-            .map(u64::from_le_bytes)
-            .map(|v| erase_type(UInt64Array::new_scalar(v))),
-        DataType::Float32 => read_le::<4>(bytes)
-            .map(f32::from_le_bytes)
-            .map(|v| erase_type(Float32Array::new_scalar(v))),
-        DataType::Float64 => read_le::<8>(bytes)
-            .map(f64::from_le_bytes)
-            .map(|v| erase_type(Float64Array::new_scalar(v))),
-        DataType::Utf8View => std::str::from_utf8(bytes).ok().map(|s| {
-            let mut builder =
-                StringViewBuilder::with_capacity(1).with_fixed_block_size(pick_block_size(s.len()));
-            builder.append_value(s);
-            erase_type(Scalar::new(builder.finish()))
-        }),
+        DataType::Boolean => Some(Arc::new(
+            values
+                .iter()
+                .map(|bytes| bytes.as_deref().and_then(|b| b.first().map(|v| *v != 0)))
+                .collect::<BooleanArray>(),
+        )),
+        DataType::Int8 => Some(primitive_bounds::<Int8Type>(values, |bytes| {
+            read_le::<4>(bytes)
+                .map(i32::from_le_bytes)
+                .and_then(|v| i8::try_from(v).ok())
+        })),
+        DataType::UInt8 => Some(primitive_bounds::<UInt8Type>(values, |bytes| {
+            read_le::<4>(bytes)
+                .map(u32::from_le_bytes)
+                .and_then(|v| u8::try_from(v).ok())
+        })),
+        DataType::Int16 => Some(primitive_bounds::<Int16Type>(values, |bytes| {
+            read_le::<4>(bytes)
+                .map(i32::from_le_bytes)
+                .and_then(|v| i16::try_from(v).ok())
+        })),
+        DataType::UInt16 => Some(primitive_bounds::<UInt16Type>(values, |bytes| {
+            read_le::<4>(bytes)
+                .map(u32::from_le_bytes)
+                .and_then(|v| u16::try_from(v).ok())
+        })),
+        DataType::Int32 => Some(primitive_bounds::<Int32Type>(values, |bytes| {
+            read_le::<4>(bytes).map(i32::from_le_bytes)
+        })),
+        DataType::UInt32 => Some(primitive_bounds::<UInt32Type>(values, |bytes| {
+            read_le::<4>(bytes).map(u32::from_le_bytes)
+        })),
+        DataType::Int64 => Some(primitive_bounds::<Int64Type>(values, |bytes| {
+            read_le::<8>(bytes).map(i64::from_le_bytes)
+        })),
+        DataType::UInt64 => Some(primitive_bounds::<UInt64Type>(values, |bytes| {
+            read_le::<8>(bytes).map(u64::from_le_bytes)
+        })),
+        DataType::Float32 => Some(primitive_bounds::<Float32Type>(values, |bytes| {
+            read_le::<4>(bytes).map(f32::from_le_bytes)
+        })),
+        DataType::Float64 => Some(primitive_bounds::<Float64Type>(values, |bytes| {
+            read_le::<8>(bytes).map(f64::from_le_bytes)
+        })),
+        DataType::Utf8View => {
+            let mut builder = StringViewBuilder::with_capacity(values.len())
+                .with_fixed_block_size(bounds_block_size(values));
+            for bytes in values {
+                match bytes.as_deref().and_then(|b| std::str::from_utf8(b).ok()) {
+                    Some(value) => builder.append_value(value),
+                    None => builder.append_null(),
+                }
+            }
+            Some(Arc::new(builder.finish()))
+        }
         DataType::BinaryView => {
-            let mut builder = BinaryViewBuilder::with_capacity(1)
-                .with_fixed_block_size(pick_block_size(bytes.len()));
-            builder.append_value(bytes);
-            Some(erase_type(Scalar::new(builder.finish())))
+            let mut builder = BinaryViewBuilder::with_capacity(values.len())
+                .with_fixed_block_size(bounds_block_size(values));
+            for bytes in values {
+                match bytes.as_deref() {
+                    Some(value) => builder.append_value(value),
+                    None => builder.append_null(),
+                }
+            }
+            Some(Arc::new(builder.finish()))
         }
         // Temporal stats share their physical int's encoding (Date32 the i32
         // days, Timestamp(Microsecond) the i64 count).
-        DataType::Date32 => read_le::<4>(bytes)
-            .map(i32::from_le_bytes)
-            .map(|v| erase_type(Date32Array::new_scalar(v))),
+        DataType::Date32 => Some(primitive_bounds::<Date32Type>(values, |bytes| {
+            read_le::<4>(bytes).map(i32::from_le_bytes)
+        })),
         DataType::Timestamp(TimeUnit::Microsecond, zone) => {
-            read_le::<8>(bytes).map(i64::from_le_bytes).map(|v| {
-                erase_type(Scalar::new(
-                    TimestampMicrosecondArray::new_scalar(v)
-                        .into_inner()
-                        .with_timezone_opt(zone.clone()),
-                ))
-            })
+            let array = values
+                .iter()
+                .map(|bytes| {
+                    bytes
+                        .as_deref()
+                        .and_then(|b| read_le::<8>(b).map(i64::from_le_bytes))
+                })
+                .collect::<TimestampMicrosecondArray>()
+                .with_timezone_opt(zone.clone());
+            Some(Arc::new(array))
         }
         // A decimal's unscaled integer follows the column's physical storage;
-        // the scalar's carrier follows the column's arrow type.
+        // the array's carrier follows the column's arrow type.
         DataType::Decimal64(precision, scale) => {
-            let value = decimal_stat_value(bytes, physical_type)?;
-            let array = Decimal64Array::new_scalar(i64::try_from(value).ok()?)
-                .into_inner()
+            let array = values
+                .iter()
+                .map(|bytes| {
+                    bytes
+                        .as_deref()
+                        .and_then(|b| decimal_stat_value(b, physical_type))
+                        .and_then(|value| i64::try_from(value).ok())
+                })
+                .collect::<Decimal64Array>()
                 .with_precision_and_scale(*precision, *scale)
                 .ok()?;
-            Some(Scalar::new(Arc::new(array) as ArrayRef))
+            Some(Arc::new(array))
         }
         DataType::Decimal128(precision, scale) => {
-            let value = decimal_stat_value(bytes, physical_type)?;
-            let array = Decimal128Array::new_scalar(value)
-                .into_inner()
+            let array = values
+                .iter()
+                .map(|bytes| {
+                    bytes
+                        .as_deref()
+                        .and_then(|b| decimal_stat_value(b, physical_type))
+                })
+                .collect::<Decimal128Array>()
                 .with_precision_and_scale(*precision, *scale)
                 .ok()?;
-            Some(Scalar::new(Arc::new(array) as ArrayRef))
+            Some(Arc::new(array))
         }
         _ => None,
     }
+}
+
+/// Read `N` bytes as a little-endian fixed-width primitive. Returns `None` if
+/// the byte slice doesn't have exactly `N` bytes.
+fn read_le<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {
+    bytes.try_into().ok()
+}
+
+/// One leaf's bounds as a primitive column: `decode` reads a single row group's
+/// statistic bytes, and a row group with no bytes, or bytes the decoder rejects,
+/// becomes a null.
+fn primitive_bounds<T: ArrowPrimitiveType>(
+    values: &[Option<Vec<u8>>],
+    decode: impl Fn(&[u8]) -> Option<T::Native>,
+) -> ArrayRef {
+    Arc::new(
+        values
+            .iter()
+            .map(|bytes| bytes.as_deref().and_then(&decode))
+            .collect::<PrimitiveArray<T>>(),
+    )
+}
+
+/// Data-block width for a leaf's column of view bounds: the bytes they hold
+/// between them.
+///
+/// A view builder left on its default sizing reserves its first block by
+/// doubling from 8 KiB, and the finished buffer keeps that capacity rather than
+/// shrinking to the bytes written. One leaf's bounds are a handful of short
+/// values held for as long as the file's metadata, so sizing the block to them
+/// keeps the cost proportional to what it stores. Values of 12 bytes or fewer
+/// are packed into the view itself and never touch a block, but the width still
+/// has to be non-zero.
+fn bounds_block_size(values: &[Option<Vec<u8>>]) -> u32 {
+    let total: usize = values.iter().flatten().map(Vec::len).sum();
+    u32::try_from(total).unwrap_or(u32::MAX).max(1)
 }
 
 /// A decimal statistic's unscaled integer, decoded per the column's physical
@@ -672,8 +761,9 @@ pub fn is_variant_field(field: &Field) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::metadata::ColumnStatistics;
     use arrow_array::{
-        BinaryViewArray, BooleanArray, Datum, Float64Array, Int32Array, Int64Array, RecordBatch,
+        BinaryViewArray, BooleanArray, Float64Array, Int32Array, Int64Array, RecordBatch, Scalar,
         StringViewArray,
     };
     use arrow_schema::Field;
@@ -708,11 +798,15 @@ mod tests {
         (dir, table)
     }
 
-    fn col_stats(table: &ParquetTable, col: usize) -> ColumnStatistics {
-        table.row_groups[0].columns[col]
-            .statistics
-            .clone()
+    fn col_stats(table: &ParquetTable, col: usize) -> ColumnStatistics<'_> {
+        table.row_groups[0]
+            .leaf_statistics(col)
             .expect("stats should be present")
+    }
+
+    /// The single-value array behind one of a row group's bounds.
+    fn bound(bound: Option<Scalar<ArrayRef>>) -> ArrayRef {
+        bound.expect("bound should be present").into_inner()
     }
 
     #[test]
@@ -730,10 +824,8 @@ mod tests {
         let stats = col_stats(&table, 0);
 
         // Assert
-        let min = stats.min.unwrap();
-        let max = stats.max.unwrap();
-        let (min, _) = min.get();
-        let (max, _) = max.get();
+        let min = bound(stats.min());
+        let max = bound(stats.max());
         assert_eq!(
             min.as_any()
                 .downcast_ref::<BinaryViewArray>()
@@ -1034,8 +1126,8 @@ mod tests {
         let (_dir, table) = write_parquet(&batch, EnabledStatistics::Chunk);
 
         let i32_stats = col_stats(&table, 0);
-        let i32_min = i32_stats.min.as_ref().unwrap().get().0;
-        let i32_max = i32_stats.max.as_ref().unwrap().get().0;
+        let i32_min = bound(i32_stats.min());
+        let i32_max = bound(i32_stats.max());
         assert_eq!(
             i32_min
                 .as_any()
@@ -1054,8 +1146,8 @@ mod tests {
         );
 
         let i64_stats = col_stats(&table, 1);
-        let i64_min = i64_stats.min.as_ref().unwrap().get().0;
-        let i64_max = i64_stats.max.as_ref().unwrap().get().0;
+        let i64_min = bound(i64_stats.min());
+        let i64_max = bound(i64_stats.max());
         assert_eq!(
             i64_min
                 .as_any()
@@ -1074,8 +1166,8 @@ mod tests {
         );
 
         let f64_stats = col_stats(&table, 2);
-        let f64_min = f64_stats.min.as_ref().unwrap().get().0;
-        let f64_max = f64_stats.max.as_ref().unwrap().get().0;
+        let f64_min = bound(f64_stats.min());
+        let f64_max = bound(f64_stats.max());
         assert_eq!(
             f64_min
                 .as_any()
@@ -1094,8 +1186,8 @@ mod tests {
         );
 
         let name_stats = col_stats(&table, 3);
-        let name_min = name_stats.min.as_ref().unwrap().get().0;
-        let name_max = name_stats.max.as_ref().unwrap().get().0;
+        let name_min = bound(name_stats.min());
+        let name_max = bound(name_stats.max());
         assert_eq!(
             name_min
                 .as_any()
@@ -1114,8 +1206,8 @@ mod tests {
         );
 
         let bool_stats = col_stats(&table, 4);
-        let bool_min = bool_stats.min.as_ref().unwrap().get().0;
-        let bool_max = bool_stats.max.as_ref().unwrap().get().0;
+        let bool_min = bound(bool_stats.min());
+        let bool_max = bound(bool_stats.max());
         assert!(
             !bool_min
                 .as_any()
@@ -1133,6 +1225,55 @@ mod tests {
     }
 
     #[test]
+    fn row_groups_share_file_wide_bound_arrays() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 10, 20, 100, 200]))],
+        )
+        .unwrap();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("groups.parquet");
+        let props = WriterProperties::builder()
+            .set_statistics_enabled(EnabledStatistics::Chunk)
+            .set_max_row_group_row_count(Some(2))
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let table = ParquetTable::from_files(test_dispatcher(), &[path], &[]).unwrap();
+
+        assert!(
+            table
+                .row_groups
+                .windows(2)
+                .all(|pair| Arc::ptr_eq(&pair[0].statistics, &pair[1].statistics))
+        );
+        let file_stats = table.row_groups[0].statistics[0].as_ref().unwrap();
+        assert_eq!(file_stats.min.as_ref().unwrap().len(), 3);
+        assert_eq!(file_stats.max.as_ref().unwrap().len(), 3);
+
+        let bounds: Vec<(i64, i64)> = table
+            .row_groups
+            .iter()
+            .map(|rg| {
+                let stats = rg.leaf_statistics(0).expect("stats should be present");
+                let read = |array: ArrayRef| {
+                    array
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .value(0)
+                };
+                (read(bound(stats.min())), read(bound(stats.max())))
+            })
+            .collect();
+        assert_eq!(bounds, vec![(1, 2), (10, 20), (100, 200)]);
+    }
+
+    #[test]
     fn no_statistics_when_writer_disables_them() {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, false)]));
         let batch =
@@ -1140,6 +1281,6 @@ mod tests {
 
         let (_dir, table) = write_parquet(&batch, EnabledStatistics::None);
 
-        assert!(table.row_groups[0].columns[0].statistics.is_none());
+        assert!(table.row_groups[0].leaf_statistics(0).is_none());
     }
 }

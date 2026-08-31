@@ -10,26 +10,59 @@
 
 use crate::thrift::general::CompressionCodec;
 use crate::types::table::ParquetTable;
-use arrow_array::{ArrayRef, Scalar};
+use arrow_array::{Array, ArrayRef, Scalar};
 use arrow_schema::SchemaRef;
 use dispatch::io::OpenFile;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// Decoded min/max (and counts) for one column of a row group. Each bound is an
-/// arrow [`Scalar<ArrayRef>`] — the same shape the planner uses for SQL
-/// constants — so a pushdown predicate can compare a query constant directly
-/// against `min` / `max` without further conversion.
-///
-/// `None` for either side means the writer didn't record that bound (e.g.
-/// all-null column, or stats omitted); a present `min`/`max` is a valid bound
-/// but may be conservative rather than the true extremum.
-#[derive(Clone, Debug)]
-pub struct ColumnStatistics {
-    pub min: Option<Scalar<ArrayRef>>,
-    pub max: Option<Scalar<ArrayRef>>,
+/// One entry per leaf in column-chunk order, shared by every row group in the
+/// file. Each leaf holds one bound array indexed by file-local row-group index.
+pub(crate) type FileStatistics = Vec<Option<FileLeafStatistics>>;
+
+/// One leaf column's statistics across a file's row groups. Every field is
+/// indexed by file-local row group position.
+pub(crate) struct FileLeafStatistics {
+    /// Lower bounds, one element per row group, null where a row group recorded
+    /// none. `None` when the leaf's Arrow type has no decodable bound, which
+    /// simply leaves it out of range pruning.
+    pub(crate) min: Option<ArrayRef>,
+    /// Upper bounds, on the same terms as `min`.
+    pub(crate) max: Option<ArrayRef>,
+    pub(crate) null_counts: Vec<Option<i64>>,
+    pub(crate) distinct_counts: Vec<Option<i64>>,
+}
+
+/// One row group's view of its file's statistics for a single leaf. Bounds come
+/// out as single-value [`Scalar<ArrayRef>`], the shape the planner uses for SQL
+/// constants, so a pushdown predicate compares a query constant against them
+/// without further conversion.
+pub struct ColumnStatistics<'a> {
+    row_group: usize,
+    min: Option<&'a ArrayRef>,
+    max: Option<&'a ArrayRef>,
     pub null_count: Option<i64>,
     pub distinct_count: Option<i64>,
+}
+
+impl<'a> ColumnStatistics<'a> {
+    /// This row group's lower bound, or `None` where the writer recorded none
+    /// (an all-null column, or statistics omitted). A present bound is valid but
+    /// may be conservative rather than the true extremum.
+    pub fn min(&self) -> Option<Scalar<ArrayRef>> {
+        self.bound(self.min)
+    }
+
+    /// This row group's upper bound, on the same terms as [`Self::min`].
+    pub fn max(&self) -> Option<Scalar<ArrayRef>> {
+        self.bound(self.max)
+    }
+
+    /// Slice this row group's own value out of a leaf's column of bounds.
+    fn bound(&self, column: Option<&'a ArrayRef>) -> Option<Scalar<ArrayRef>> {
+        let column = column?;
+        (!column.is_null(self.row_group)).then(|| Scalar::new(column.slice(self.row_group, 1)))
+    }
 }
 
 /// Byte-level layout of a single column chunk within a row group.
@@ -60,9 +93,6 @@ pub struct ColumnChunkMeta {
     /// The schema's `type_length` for a FIXED_LEN_BYTE_ARRAY leaf: the byte
     /// width of each value.
     pub fixed_len_byte_width: Option<i32>,
-    /// Decoded min/max for this chunk, when the writer recorded statistics
-    /// and the column's Arrow type is one we know how to decode.
-    pub statistics: Option<ColumnStatistics>,
     /// True when this chunk has a dictionary page and every one of its data
     /// pages is dictionary-encoded (per the footer's `encoding_stats`). Only
     /// then is it sound to prune the whole row group when the dictionary does
@@ -85,6 +115,9 @@ pub struct RowGroupMetadata {
     pub schema: SchemaRef,
     /// Per-column-chunk byte layout (offsets and sizes).
     pub columns: Vec<ColumnChunkMeta>,
+    /// The whole file's statistics, shared by every row group in it and read at
+    /// this row group's `file_row_group_idx`.
+    pub(crate) statistics: Arc<FileStatistics>,
     /// Total number of rows in this row group.
     pub num_rows: i64,
     /// Index of this row group within its Parquet file. Note that this should
@@ -101,20 +134,31 @@ pub struct RowGroupMetadata {
 }
 
 impl RowGroupMetadata {
-    /// Decoded min/max (and counts) for the top-level column `column`, if the
-    /// writer recorded statistics for it. Chunks are per leaf, so the column is
-    /// resolved to its first leaf. Callers that need a nested field's statistics
-    /// resolve that field to its own leaf instead.
-    pub fn column_statistics(&self, column: usize) -> Option<&ColumnStatistics> {
+    /// This row group's statistics for the top-level column `column`, if the
+    /// file recorded any for it. Chunks are per leaf, so the column is resolved
+    /// to its first leaf. Callers that need a nested field's statistics resolve
+    /// that field to its own leaf instead.
+    pub fn column_statistics(&self, column: usize) -> Option<ColumnStatistics<'_>> {
         self.leaf_statistics(super::leaves::first_leaf(self.schema.fields(), column))
     }
 
-    /// Decoded min/max (and counts) for the chunk at `leaf`, a raw column-chunk
+    /// This row group's statistics for the chunk at `leaf`, a raw column-chunk
     /// index. For pruning by a leaf that isn't a column's first (a shredded
     /// variant path's typed leaf); resolve the index against this row group's
     /// own schema, since leaf positions differ per file.
-    pub fn leaf_statistics(&self, leaf: usize) -> Option<&ColumnStatistics> {
-        self.columns.get(leaf).and_then(|c| c.statistics.as_ref())
+    ///
+    /// `None` means the file recorded nothing for that leaf in any of its row
+    /// groups. A leaf the file records elsewhere but not here comes back with
+    /// every field empty, which reads the same to every caller.
+    pub fn leaf_statistics(&self, leaf: usize) -> Option<ColumnStatistics<'_>> {
+        let leaf = self.statistics.get(leaf)?.as_ref()?;
+        Some(ColumnStatistics {
+            row_group: self.file_row_group_idx,
+            min: leaf.min.as_ref(),
+            max: leaf.max.as_ref(),
+            null_count: leaf.null_counts[self.file_row_group_idx],
+            distinct_count: leaf.distinct_counts[self.file_row_group_idx],
+        })
     }
 }
 
