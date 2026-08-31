@@ -217,7 +217,7 @@ impl SystemTransaction {
     /// Every datastore and every table of every datastore, this one included:
     /// what all the relations are built from. Describing itself is what lets
     /// `system.tables` list the datastore serving it.
-    fn inventory(&self) -> Inventory {
+    fn inventory(&self) -> Result<Inventory> {
         let datastores = self
             .datastores
             .iter()
@@ -235,26 +235,21 @@ impl SystemTransaction {
             }])
             .collect();
 
-        let tables = self
-            .datastores
-            .iter()
-            .flat_map(|datastore| {
-                datastore
-                    .transaction
-                    .tables()
-                    .into_iter()
-                    .map(|table| GlobalTableMetadata {
-                        datastore_name: datastore.name.clone(),
-                        table,
-                    })
-            })
-            .chain(self.tables().into_iter().map(|table| GlobalTableMetadata {
-                datastore_name: DATASTORE_NAME.to_string(),
-                table,
-            }))
-            .collect();
+        let mut tables = Vec::new();
+        for datastore in &self.datastores {
+            tables.extend(datastore.transaction.tables()?.into_iter().map(|table| {
+                GlobalTableMetadata {
+                    datastore_name: datastore.name.clone(),
+                    table,
+                }
+            }));
+        }
+        tables.extend(self.tables()?.into_iter().map(|table| GlobalTableMetadata {
+            datastore_name: DATASTORE_NAME.to_string(),
+            table,
+        }));
 
-        Inventory { datastores, tables }
+        Ok(Inventory { datastores, tables })
     }
 }
 
@@ -262,37 +257,45 @@ impl SystemTransaction {
 impl DatastoreTransaction for SystemTransaction {
     /// Every relation lives in the default schema, the one an unqualified
     /// `system.<table>` resolves to.
-    fn does_schema_exist(&self, schema: &str) -> bool {
-        schema == planner::DEFAULT_SCHEMA_NAME
+    fn does_schema_exist(&self, schema: &str) -> planner::catalog::Result<bool> {
+        Ok(schema == planner::DEFAULT_SCHEMA_NAME)
     }
 
     fn bind_table(
         &self,
         datastore: &str,
         name: &SchemaQualifiedTableName,
-    ) -> Option<Box<dyn BoundTable>> {
+    ) -> planner::catalog::Result<Option<Box<dyn BoundTable>>> {
         if name.schema != planner::DEFAULT_SCHEMA_NAME {
-            return None;
+            return Ok(None);
         }
         let reference = TableReference {
             datastore: datastore.to_string(),
             schema: name.schema.clone(),
             table: name.table.clone(),
         };
-        let relation = RELATIONS
+        let Some(relation) = RELATIONS
             .iter()
-            .find(|relation| relation.name == name.table)?;
-        Some((relation.build)(
+            .find(|relation| relation.name == name.table)
+        else {
+            return Ok(None);
+        };
+        Ok(Some((relation.build)(
             reference,
             declare_columns(relation.columns),
-            &self.inventory(),
-        ))
+            &self.inventory()?,
+        )))
     }
 
     /// Asked of the binding rather than of a second list of names, so the
     /// contract that every bindable table has a revision holds by construction.
-    fn table_revision(&self, name: &SchemaQualifiedTableName) -> Option<TableRevision> {
-        Some(self.bind_table(DATASTORE_NAME, name)?.table_revision())
+    fn table_revision(
+        &self,
+        name: &SchemaQualifiedTableName,
+    ) -> planner::catalog::Result<Option<TableRevision>> {
+        Ok(self
+            .bind_table(DATASTORE_NAME, name)?
+            .map(|table| table.table_revision()))
     }
 
     /// The relations this datastore serves. None of them is stored, so none has
@@ -301,8 +304,8 @@ impl DatastoreTransaction for SystemTransaction {
     /// it is served. The columns are the very ones binding serves, so
     /// `system.columns` describes these relations exactly as it does a stored
     /// table's.
-    fn tables(&self) -> Vec<DatastoreTableMetadata> {
-        RELATIONS
+    fn tables(&self) -> Result<Vec<DatastoreTableMetadata>> {
+        Ok(RELATIONS
             .iter()
             .map(|relation| DatastoreTableMetadata {
                 name: SchemaQualifiedTableName::new(planner::DEFAULT_SCHEMA_NAME, relation.name),
@@ -328,7 +331,7 @@ impl DatastoreTransaction for SystemTransaction {
                 bytes_uncompressed: 0,
                 files: Vec::new(),
             })
-            .collect()
+            .collect())
     }
 
     fn bind_create_table(&self, request: CreateTableRequest) -> Result<Box<dyn TableCreation>> {
@@ -590,7 +593,7 @@ impl Relation {
     fn table_revision(&self) -> TableRevision {
         TableRevision {
             identity: format!("{DATASTORE_NAME}.{}", self.reference.table),
-            version: 0,
+            version: "0".to_string(),
         }
     }
 }

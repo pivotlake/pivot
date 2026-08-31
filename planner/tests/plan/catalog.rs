@@ -45,7 +45,7 @@ impl BoundTable for RecordingTable {
     fn table_revision(&self) -> TableRevision {
         TableRevision {
             identity: format!("{DEFAULT_DATASTORE_NAME}:t"),
-            version: 0,
+            version: "0".to_string(),
         }
     }
 
@@ -85,19 +85,26 @@ struct SingleTableCatalog {
 impl CatalogTransaction for SingleTableCatalog {
     // The one table lives in the default schema, so that is the only schema
     // this catalog defines.
-    fn does_schema_exist(&self, _datastore: &str, schema: &str) -> bool {
-        schema == DEFAULT_SCHEMA_NAME
+    fn does_schema_exist(&self, _datastore: &str, schema: &str) -> planner::catalog::Result<bool> {
+        Ok(schema == DEFAULT_SCHEMA_NAME)
     }
 
-    fn bind_table(&self, reference: &TableReference) -> Option<Box<dyn BoundTable>> {
-        (reference.table == self.name).then(|| Box::new(self.table.clone()) as Box<dyn BoundTable>)
+    fn bind_table(
+        &self,
+        reference: &TableReference,
+    ) -> planner::catalog::Result<Option<Box<dyn BoundTable>>> {
+        Ok((reference.table == self.name)
+            .then(|| Box::new(self.table.clone()) as Box<dyn BoundTable>))
     }
 
-    fn table_revision(&self, reference: &TableReference) -> Option<TableRevision> {
-        (reference.table == self.name).then(|| TableRevision {
+    fn table_revision(
+        &self,
+        reference: &TableReference,
+    ) -> planner::catalog::Result<Option<TableRevision>> {
+        Ok((reference.table == self.name).then(|| TableRevision {
             identity: format!("{}:{}", reference.datastore, reference.table),
-            version: 0,
-        })
+            version: "0".to_string(),
+        }))
     }
 }
 

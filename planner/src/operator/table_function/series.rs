@@ -169,7 +169,7 @@ impl BoundTable for BoundSeries {
     fn table_revision(&self) -> TableRevision {
         TableRevision {
             identity: format!("{}({},{},{})", self.name, self.start, self.stop, self.step),
-            version: 0,
+            version: "0".to_string(),
         }
     }
 

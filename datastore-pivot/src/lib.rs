@@ -1340,7 +1340,7 @@ impl PivotSnapshot {
         let table = self.index.get_table_by_name(name)?;
         Some(TableRevision {
             identity: table.id().to_string(),
-            version: table.version(),
+            version: table.version().to_string(),
         })
     }
 
@@ -1447,24 +1447,28 @@ impl PivotTransaction {
 
 #[async_trait]
 impl DatastoreTransaction for PivotTransaction {
-    fn does_schema_exist(&self, schema: &str) -> bool {
-        self.contains_schema(schema)
+    fn does_schema_exist(&self, schema: &str) -> CatalogResult<bool> {
+        Ok(self.contains_schema(schema))
     }
 
     fn bind_table(
         &self,
         datastore: &str,
         name: &SchemaQualifiedTableName,
-    ) -> Option<Box<dyn BoundTable>> {
-        Some(Box::new(PivotTransaction::table(self, datastore, name)?))
+    ) -> CatalogResult<Option<Box<dyn BoundTable>>> {
+        Ok(PivotTransaction::table(self, datastore, name)
+            .map(|table| Box::new(table) as Box<dyn BoundTable>))
     }
 
-    fn table_revision(&self, name: &SchemaQualifiedTableName) -> Option<TableRevision> {
-        self.snapshot.table_revision(name)
+    fn table_revision(
+        &self,
+        name: &SchemaQualifiedTableName,
+    ) -> CatalogResult<Option<TableRevision>> {
+        Ok(self.snapshot.table_revision(name))
     }
 
-    fn tables(&self) -> Vec<DatastoreTableMetadata> {
-        self.snapshot.tables()
+    fn tables(&self) -> CatalogResult<Vec<DatastoreTableMetadata>> {
+        Ok(self.snapshot.tables())
     }
 
     fn bind_create_table(

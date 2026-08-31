@@ -108,7 +108,7 @@ pub trait DatastoreTransaction: Debug + Send + Sync {
     /// transaction's frozen snapshot. Every datastore defines
     /// [`planner::DEFAULT_SCHEMA_NAME`], so a table named with no schema always
     /// has a schema to resolve in.
-    fn does_schema_exist(&self, schema: &str) -> bool;
+    fn does_schema_exist(&self, schema: &str) -> Result<bool>;
 
     /// Resolve the schema-qualified `name`, in the datastore the catalog serves
     /// as `datastore`, to a fresh, independently-mutable [`BoundTable`] bound to
@@ -127,18 +127,19 @@ pub trait DatastoreTransaction: Debug + Send + Sync {
         &self,
         datastore: &str,
         name: &SchemaQualifiedTableName,
-    ) -> Option<Box<dyn BoundTable>>;
+    ) -> Result<Option<Box<dyn BoundTable>>>;
 
     /// The identity and version of `name` in this transaction's frozen
     /// snapshot, or `None` if no such table exists. This must return `Some` for
     /// every table returned by [`bind_table`](Self::bind_table).
-    fn table_revision(&self, name: &SchemaQualifiedTableName) -> Option<TableRevision>;
+    fn table_revision(&self, name: &SchemaQualifiedTableName) -> Result<Option<TableRevision>>;
 
     /// Every stored table defined by this transaction's frozen snapshot.
     ///
     /// Virtual catalog relations are not datastore objects and therefore are not
-    /// included.
-    fn tables(&self) -> Vec<DatastoreTableMetadata>;
+    /// included. Catalog-backed datastores return an error when enumeration or
+    /// loading fails rather than presenting a partial inventory.
+    fn tables(&self) -> Result<Vec<DatastoreTableMetadata>>;
 
     /// Compact `table` from this transaction's frozen catalog view. Backends
     /// that support compaction use the exact table snapshot this transaction

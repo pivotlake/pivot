@@ -145,7 +145,7 @@ pub mod ffi {
             transaction: &TransactionContext,
             datastore: &str,
             schema: &str,
-        ) -> bool;
+        ) -> Result<bool>;
         /// BoundTable lookups are routed by `datastore` (the datastore / database
         /// name) to that datastore's snapshot in the transaction; the table is then
         /// resolved within `schema` of that datastore.
@@ -154,7 +154,7 @@ pub mod ffi {
             datastore: &str,
             schema: &str,
             name: &str,
-        ) -> CatalogGetTableResult;
+        ) -> Result<CatalogGetTableResult>;
         fn catalog_bind_table_function(
             transaction: &TransactionContext,
             name: &str,

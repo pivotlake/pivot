@@ -141,7 +141,7 @@ impl BoundTable for TableBinding {
     fn table_revision(&self) -> TableRevision {
         TableRevision {
             identity: self.table.id().to_string(),
-            version: self.table.version(),
+            version: self.table.version().to_string(),
         }
     }
 

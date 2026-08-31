@@ -38,14 +38,21 @@ impl PlanCache {
         &self,
         query: &str,
         transaction: &dyn planner::catalog::CatalogTransaction,
-    ) -> Option<Arc<planner::Plan>> {
-        let mut inner = self.inner.lock().unwrap();
-        let plan = inner.get(query)?.clone();
-        if plan.has_matching_table_revisions(transaction) {
-            Some(plan)
+    ) -> Result<Option<Arc<planner::Plan>>> {
+        let Some(plan) = self.inner.lock().unwrap().get(query).cloned() else {
+            return Ok(None);
+        };
+        if plan.has_matching_table_revisions(transaction)? {
+            Ok(Some(plan))
         } else {
-            let _ = inner.pop(query);
-            None
+            let mut inner = self.inner.lock().unwrap();
+            if inner
+                .peek(query)
+                .is_some_and(|current| Arc::ptr_eq(current, &plan))
+            {
+                let _ = inner.pop(query);
+            }
+            Ok(None)
         }
     }
 
@@ -77,7 +84,7 @@ pub(super) async fn plan_query(
     plan_cache: &PlanCache,
     query: &str,
 ) -> Result<Arc<planner::Plan>> {
-    if let Some(plan) = plan_cache.get(query, transaction.as_ref()) {
+    if let Some(plan) = plan_cache.get(query, transaction.as_ref())? {
         return Ok(plan);
     }
 
@@ -145,20 +152,36 @@ mod tests {
     #[derive(Debug)]
     struct RevisionTransaction {
         revisions: HashMap<TableReference, TableRevision>,
+        fail_revision_lookup: bool,
     }
 
     #[async_trait]
     impl planner::catalog::CatalogTransaction for RevisionTransaction {
-        fn does_schema_exist(&self, _datastore: &str, schema: &str) -> bool {
-            schema == planner::DEFAULT_SCHEMA_NAME
+        fn does_schema_exist(
+            &self,
+            _datastore: &str,
+            schema: &str,
+        ) -> planner::catalog::Result<bool> {
+            Ok(schema == planner::DEFAULT_SCHEMA_NAME)
         }
 
-        fn bind_table(&self, _reference: &TableReference) -> Option<Box<dyn BoundTable>> {
-            None
+        fn bind_table(
+            &self,
+            _reference: &TableReference,
+        ) -> planner::catalog::Result<Option<Box<dyn BoundTable>>> {
+            Ok(None)
         }
 
-        fn table_revision(&self, reference: &TableReference) -> Option<TableRevision> {
-            self.revisions.get(reference).cloned()
+        fn table_revision(
+            &self,
+            reference: &TableReference,
+        ) -> planner::catalog::Result<Option<TableRevision>> {
+            if self.fail_revision_lookup {
+                return Err(planner::catalog::Error::Other(Box::new(
+                    std::io::Error::other("revision lookup failed"),
+                )));
+            }
+            Ok(self.revisions.get(reference).cloned())
         }
     }
 
@@ -173,13 +196,14 @@ mod tests {
     fn revision(identity: &str, version: u64) -> TableRevision {
         TableRevision {
             identity: identity.to_string(),
-            version,
+            version: version.to_string(),
         }
     }
 
     fn transaction(identity: &str, version: u64) -> RevisionTransaction {
         RevisionTransaction {
             revisions: HashMap::from([(table(), revision(identity, version))]),
+            fail_revision_lookup: false,
         }
     }
 
@@ -214,10 +238,15 @@ mod tests {
 
         let hit = cache
             .get("SELECT * FROM events", &transaction("table-id", 7))
+            .unwrap()
             .unwrap();
-        let changed_version = cache.get("SELECT * FROM events", &transaction("table-id", 8));
+        let changed_version = cache
+            .get("SELECT * FROM events", &transaction("table-id", 8))
+            .unwrap();
         cache.insert("SELECT * FROM events".to_string(), cached.clone());
-        let changed_identity = cache.get("SELECT * FROM events", &transaction("new-table-id", 7));
+        let changed_identity = cache
+            .get("SELECT * FROM events", &transaction("new-table-id", 7))
+            .unwrap();
 
         assert!(Arc::ptr_eq(&hit, &cached));
         assert!(changed_version.is_none());
@@ -234,9 +263,28 @@ mod tests {
         cache.insert("SELECT * FROM events".to_string(), current.clone());
         let hit = cache
             .get("SELECT * FROM events", &transaction("table-id", 8))
+            .unwrap()
             .unwrap();
 
         assert!(Arc::ptr_eq(&hit, &current));
+        assert_eq!(cache.inner.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_revision_lookup_error_is_propagated() {
+        let cache = PlanCache::new(2);
+        cache.insert("SELECT * FROM events".to_string(), plan("table-id", 7));
+        let transaction = RevisionTransaction {
+            revisions: HashMap::new(),
+            fail_revision_lookup: true,
+        };
+
+        let error = cache.get("SELECT * FROM events", &transaction).unwrap_err();
+
+        assert!(matches!(
+            error,
+            crate::execution::Error::Plan(planner::Error::Catalog(_))
+        ));
         assert_eq!(cache.inner.lock().unwrap().len(), 1);
     }
 
@@ -271,9 +319,12 @@ mod tests {
         cache.insert("SELECT * FROM analytics.events".to_string(), cached);
         let other_schema = RevisionTransaction {
             revisions: HashMap::from([(table(), revision("table-id", 7))]),
+            fail_revision_lookup: false,
         };
 
-        let hit = cache.get("SELECT * FROM analytics.events", &other_schema);
+        let hit = cache
+            .get("SELECT * FROM analytics.events", &other_schema)
+            .unwrap();
 
         assert!(hit.is_none());
     }
@@ -284,7 +335,10 @@ mod tests {
         let first = plan("first", 1);
         cache.insert("first query".to_string(), first.clone());
         cache.insert("second query".to_string(), plan("second", 1));
-        cache.get("first query", &transaction("first", 1)).unwrap();
+        cache
+            .get("first query", &transaction("first", 1))
+            .unwrap()
+            .unwrap();
 
         let third = plan("third", 1);
         cache.insert("third query".to_string(), third.clone());
@@ -292,14 +346,21 @@ mod tests {
         assert!(
             cache
                 .get("second query", &transaction("second", 1))
+                .unwrap()
                 .is_none()
         );
         assert!(Arc::ptr_eq(
-            &cache.get("first query", &transaction("first", 1)).unwrap(),
+            &cache
+                .get("first query", &transaction("first", 1))
+                .unwrap()
+                .unwrap(),
             &first
         ));
         assert!(Arc::ptr_eq(
-            &cache.get("third query", &transaction("third", 1)).unwrap(),
+            &cache
+                .get("third query", &transaction("third", 1))
+                .unwrap()
+                .unwrap(),
             &third
         ));
     }

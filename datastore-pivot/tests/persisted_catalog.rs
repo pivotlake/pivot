@@ -262,6 +262,7 @@ fn rooted_table_is_created_empty_under_the_db_root_and_persists() {
             .clone()
             .begin_transaction()
             .table_revision(&name)
+            .expect("table lookup succeeds")
             .expect("table created")
             .identity;
         assert!(current_parquet(&datastore, "t").row_groups().is_empty());

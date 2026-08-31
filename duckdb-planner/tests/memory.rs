@@ -36,8 +36,12 @@ impl DuckDBTable for UsersTable {
 struct TestTransaction;
 
 impl DuckDBTransaction for TestTransaction {
-    fn does_schema_exist(&self, _datastore: &str, schema: &str) -> bool {
-        schema == "main"
+    fn does_schema_exist(
+        &self,
+        _datastore: &str,
+        schema: &str,
+    ) -> duckdb_planner::catalog_provider::Result<bool> {
+        Ok(schema == "main")
     }
 
     fn bind_table(
@@ -45,11 +49,11 @@ impl DuckDBTransaction for TestTransaction {
         _datastore: &str,
         _schema: &str,
         table_name: &str,
-    ) -> Option<Box<dyn DuckDBTable>> {
-        match table_name {
+    ) -> duckdb_planner::catalog_provider::Result<Option<Box<dyn DuckDBTable>>> {
+        Ok(match table_name {
             "users" => Some(Box::new(UsersTable)),
             _ => None,
-        }
+        })
     }
 }
 

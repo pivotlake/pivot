@@ -372,6 +372,7 @@ pub fn insert_batches(
             planner::DEFAULT_DATASTORE_NAME,
             &SchemaQualifiedTableName::in_default_schema(name),
         )
+        .expect("table lookup succeeds")
         .expect("the table was created");
     let rows = dispatch::values_input(dispatch, batches).record_batches();
     table

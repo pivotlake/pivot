@@ -1349,6 +1349,7 @@ fn table_revision_is_frozen_with_the_transaction_snapshot() {
     let before_append = datastore.clone().begin_transaction();
     let before_revision = before_append
         .table_revision(&SchemaQualifiedTableName::in_default_schema("t"))
+        .unwrap()
         .unwrap();
 
     let new_file = write_ids(dir.path(), "later.parquet", &[40]);
@@ -1357,14 +1358,16 @@ fn table_revision_is_frozen_with_the_transaction_snapshot() {
         .clone()
         .begin_transaction()
         .table_revision(&SchemaQualifiedTableName::in_default_schema("t"))
+        .unwrap()
         .unwrap();
 
-    assert_eq!(before_revision.version, 0);
-    assert_eq!(after_revision.version, 1);
+    assert_eq!(before_revision.version, "0");
+    assert_eq!(after_revision.version, "1");
     assert_eq!(before_revision.identity, after_revision.identity);
     assert_eq!(
         before_append
             .table_revision(&SchemaQualifiedTableName::in_default_schema("t"))
+            .unwrap()
             .unwrap(),
         before_revision
     );

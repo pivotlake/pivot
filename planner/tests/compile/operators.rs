@@ -1676,22 +1676,22 @@ struct RecordingTransaction {
 }
 
 impl planner::catalog::CatalogTransaction for RecordingTransaction {
-    fn does_schema_exist(&self, _datastore: &str, schema: &str) -> bool {
-        schema == planner::DEFAULT_SCHEMA_NAME
+    fn does_schema_exist(&self, _datastore: &str, schema: &str) -> planner::catalog::Result<bool> {
+        Ok(schema == planner::DEFAULT_SCHEMA_NAME)
     }
 
     fn bind_table(
         &self,
         _reference: &planner::catalog::TableReference,
-    ) -> Option<Box<dyn BoundTable>> {
-        None
+    ) -> planner::catalog::Result<Option<Box<dyn BoundTable>>> {
+        Ok(None)
     }
 
     fn table_revision(
         &self,
         _reference: &planner::catalog::TableReference,
-    ) -> Option<planner::catalog::TableRevision> {
-        None
+    ) -> planner::catalog::Result<Option<planner::catalog::TableRevision>> {
+        Ok(None)
     }
 
     fn bind_create_table(

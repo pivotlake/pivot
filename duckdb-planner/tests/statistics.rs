@@ -36,8 +36,12 @@ struct StatsTransaction {
 }
 
 impl DuckDBTransaction for StatsTransaction {
-    fn does_schema_exist(&self, _datastore: &str, schema: &str) -> bool {
-        schema == "main"
+    fn does_schema_exist(
+        &self,
+        _datastore: &str,
+        schema: &str,
+    ) -> duckdb_planner::catalog_provider::Result<bool> {
+        Ok(schema == "main")
     }
 
     fn bind_table(
@@ -45,16 +49,16 @@ impl DuckDBTransaction for StatsTransaction {
         _datastore: &str,
         _schema: &str,
         table_name: &str,
-    ) -> Option<Box<dyn DuckDBTable>> {
+    ) -> duckdb_planner::catalog_provider::Result<Option<Box<dyn DuckDBTable>>> {
         let rows = match table_name {
             "small" => 10,
             "big" => 1_000_000,
-            _ => return None,
+            _ => return Ok(None),
         };
-        Some(Box::new(CountingTable {
+        Ok(Some(Box::new(CountingTable {
             rows,
             asked: self.asked.clone(),
-        }))
+        })))
     }
 }
 

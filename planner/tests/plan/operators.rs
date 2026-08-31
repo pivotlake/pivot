@@ -39,7 +39,10 @@ fn select_is_cacheable_when_its_table_revision_matches(mut testing_planner: Test
     let transaction = testing_planner.transaction();
 
     assert!(plan.is_cacheable());
-    assert!(plan.has_matching_table_revisions(transaction.as_ref()));
+    assert!(
+        plan.has_matching_table_revisions(transaction.as_ref())
+            .unwrap()
+    );
 }
 
 #[rstest]
@@ -48,7 +51,10 @@ fn table_free_query_is_cacheable(mut testing_planner: TestingPlanner) {
     let transaction = testing_planner.transaction();
 
     assert!(plan.is_cacheable());
-    assert!(plan.has_matching_table_revisions(transaction.as_ref()));
+    assert!(
+        plan.has_matching_table_revisions(transaction.as_ref())
+            .unwrap()
+    );
 }
 
 #[rstest]

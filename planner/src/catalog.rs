@@ -118,7 +118,8 @@ impl TableReference {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableRevision {
     pub identity: String,
-    pub version: u64,
+    /// Backend-owned opaque revision token.
+    pub version: String,
 }
 
 /// Description of a table to be created, produced by translating a
@@ -243,11 +244,11 @@ pub trait CatalogTransaction: Debug + Send + Sync {
     /// frozen snapshot. Asked before any table in that schema is resolved, so a
     /// reference to a schema that does not exist is reported as such rather than
     /// as a missing table. `false` for a datastore this transaction doesn't know.
-    fn does_schema_exist(&self, datastore: &str, schema: &str) -> bool;
+    fn does_schema_exist(&self, datastore: &str, schema: &str) -> Result<bool>;
 
     /// Resolve `reference` to a fresh, independently-mutable [`BoundTable`], or
     /// `None` if its datastore holds no such table in that schema.
-    fn bind_table(&self, reference: &TableReference) -> Option<Box<dyn BoundTable>>;
+    fn bind_table(&self, reference: &TableReference) -> Result<Option<Box<dyn BoundTable>>>;
 
     /// Bind the planner-owned `read_parquet(path)` function using this
     /// catalog's external-file policy. The composite catalog implements this
@@ -262,7 +263,7 @@ pub trait CatalogTransaction: Debug + Send + Sync {
     /// The identity and version of `reference` in this transaction's frozen
     /// snapshot of its datastore, or `None` if no such table exists. This must
     /// return `Some` for every table returned by [`bind_table`](Self::bind_table).
-    fn table_revision(&self, reference: &TableReference) -> Option<TableRevision>;
+    fn table_revision(&self, reference: &TableReference) -> Result<Option<TableRevision>>;
 
     /// Compact a table from this transaction's frozen catalog view.
     async fn compact(
@@ -610,8 +611,14 @@ impl DuckDBTransaction for DuckDBTransactionAdapter {
         })
     }
 
-    fn does_schema_exist(&self, datastore: &str, schema: &str) -> bool {
-        self.transaction.does_schema_exist(datastore, schema)
+    fn does_schema_exist(
+        &self,
+        datastore: &str,
+        schema: &str,
+    ) -> duckdb_planner::catalog_provider::Result<bool> {
+        self.transaction
+            .does_schema_exist(datastore, schema)
+            .map_err(|error| Box::new(error) as duckdb_planner::catalog_provider::Error)
     }
 
     fn bind_table(
@@ -619,14 +626,20 @@ impl DuckDBTransaction for DuckDBTransactionAdapter {
         datastore: &str,
         schema: &str,
         name: &str,
-    ) -> Option<Box<dyn DuckDBTable>> {
+    ) -> duckdb_planner::catalog_provider::Result<Option<Box<dyn DuckDBTable>>> {
         let reference = TableReference {
             datastore: datastore.to_string(),
             schema: schema.to_string(),
             table: name.to_string(),
         };
-        let table = self.transaction.bind_table(&reference)?;
-        Some(Box::new(DuckDBTableAdapter { table }))
+        let Some(table) = self
+            .transaction
+            .bind_table(&reference)
+            .map_err(|error| Box::new(error) as duckdb_planner::catalog_provider::Error)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Box::new(DuckDBTableAdapter { table })))
     }
 
     fn bind_table_function(
