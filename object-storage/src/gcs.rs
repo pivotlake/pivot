@@ -391,13 +391,23 @@ impl ObjectStore for GcsStore {
         }
     }
 
-    /// Objects directly under `prefix`, one level deep.
-    fn list(&self, prefix: &ObjectPath) -> Result<DirectoryListing> {
+    /// Objects directly under `prefix`, one level deep. The narrowing
+    /// `name_prefix` goes into the request's `prefix` parameter, so the
+    /// service never returns (or pages through) children outside it.
+    fn list_with_name_prefix(
+        &self,
+        prefix: &ObjectPath,
+        name_prefix: &str,
+    ) -> Result<DirectoryListing> {
         let object_prefix = object_key(&self.prefix, prefix);
         let encoded_prefix = if object_prefix.is_empty() {
-            String::new()
+            percent_encode(name_prefix)
         } else {
-            format!("{}%2F", percent_encode(&object_prefix))
+            format!(
+                "{}%2F{}",
+                percent_encode(&object_prefix),
+                percent_encode(name_prefix)
+            )
         };
         let base_url = format!(
             "{}/storage/v1/b/{}/o?prefix={encoded_prefix}&delimiter=%2F",

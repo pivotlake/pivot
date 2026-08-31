@@ -147,7 +147,11 @@ impl ObjectStore for LocalStore {
         }
     }
 
-    fn list(&self, prefix: &ObjectPath) -> Result<DirectoryListing> {
+    fn list_with_name_prefix(
+        &self,
+        prefix: &ObjectPath,
+        name_prefix: &str,
+    ) -> Result<DirectoryListing> {
         let dir = self.path_for(prefix);
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
@@ -172,6 +176,9 @@ impl ObjectStore for LocalStore {
             let Some(name) = entry.file_name().to_str().map(str::to_string) else {
                 continue;
             };
+            if !name.starts_with(name_prefix) {
+                continue;
+            }
             let file_type = entry.file_type().map_err(|source| StoreError::Io {
                 key: prefix.join(&name).to_string(),
                 source,
