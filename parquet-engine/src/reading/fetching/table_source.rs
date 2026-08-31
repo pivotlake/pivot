@@ -65,13 +65,7 @@ fn steal_order(table: &ParquetTable, order: &ScanOrder) -> Vec<usize> {
     for idx in 0..n {
         let stat = table.row_groups[idx]
             .column_statistics(order.column_idx)
-            .and_then(|s| {
-                if order.descending {
-                    s.max.clone()
-                } else {
-                    s.min.clone()
-                }
-            });
+            .and_then(|s| if order.descending { s.max() } else { s.min() });
         match stat {
             Some(scalar) => keyed.push((idx, scalar)),
             None => unkeyed.push(idx),
@@ -499,9 +493,9 @@ mod tests {
                 max_def_level: 0,
                 physical_type: 0,
                 fixed_len_byte_width: None,
-                statistics: None,
                 data_pages_all_dictionary: false,
             }],
+            statistics: Arc::default(),
             num_rows: 0,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(AtomicUsize::new(0)),

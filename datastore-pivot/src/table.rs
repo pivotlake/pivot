@@ -766,9 +766,7 @@ impl CatalogTable {
                 if rg.columns.len() != rg.schema.fields().len() {
                     return true;
                 }
-                rg.columns[field_idx]
-                    .statistics
-                    .as_ref()
+                rg.leaf_statistics(field_idx)
                     .and_then(|stats| stats.null_count)
                     .is_none_or(|null_count| null_count > 0)
             })

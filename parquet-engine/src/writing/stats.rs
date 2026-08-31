@@ -19,7 +19,7 @@ use arrow_schema::{DataType, TimeUnit};
 /// A column's min and max, as single-element Arrow arrays.
 ///
 /// `None` when the column is empty or all-null, or when its type is not one the
-/// write path (and so the reader's `decode_scalar`) supports. Binary variant
+/// write path (and so the reader's `decode_bounds`) supports. Binary variant
 /// values deliberately record bounds only when every value is canonical JSON
 /// null (`[0x00]`): that exact singleton is useful to classify a shredded
 /// fallback without paying to order arbitrary binary documents at write time.
@@ -102,7 +102,7 @@ pub(super) fn column_min_max(array: &ArrayRef) -> Option<(ArrayRef, ArrayRef)> {
 /// Encode a single-element stats array (a column's min or max, from
 /// [`column_min_max`]) into the Parquet `min_value`/`max_value` bytes.
 ///
-/// The encoding must match the reader's `decode_scalar` exactly — little-endian
+/// The encoding must match the reader's `decode_bounds` exactly — little-endian
 /// for primitives and for the INT32/INT64 decimal storages, raw UTF-8 for
 /// strings, and big-endian 16-byte two's-complement for wide decimals (the
 /// spec's FIXED_LEN_BYTE_ARRAY stats encoding) — or stats-based row-group
@@ -209,24 +209,24 @@ pub fn aggregate_file_stats(row_groups: &[Arc<crate::RowGroupMetadata>]) -> crat
     };
     for (column, field) in first.schema.fields().iter().enumerate() {
         // Fold the row groups' stats into the file's: the smallest group min, the
-        // largest group max, and the sum of null counts. The running min/max
-        // borrow into `row_groups` (each is a single-value stat array); a bound or
-        // count is kept only when every group carries it, so it is never claimed
-        // from partial coverage.
-        let mut min: Option<&Scalar<ArrayRef>> = None;
-        let mut max: Option<&Scalar<ArrayRef>> = None;
+        // largest group max, and the sum of null counts. Each running bound is a
+        // single-value stat array sliced out of its file's column of bounds; a
+        // bound or count is kept only when every group carries it, so it is never
+        // claimed from partial coverage.
+        let mut min: Option<Scalar<ArrayRef>> = None;
+        let mut max: Option<Scalar<ArrayRef>> = None;
         let mut every_group_has_bounds = true;
         let mut null_sum: i64 = 0;
         let mut every_group_has_null_count = true;
         for rg in row_groups {
             match rg.column_statistics(column) {
                 Some(stats) => {
-                    match (stats.min.as_ref(), stats.max.as_ref()) {
+                    match (stats.min(), stats.max()) {
                         (Some(lo), Some(hi)) => {
-                            if min.is_none_or(|current| scalar_lt(lo, current)) {
+                            if min.as_ref().is_none_or(|current| scalar_lt(&lo, current)) {
                                 min = Some(lo);
                             }
-                            if max.is_none_or(|current| scalar_lt(current, hi)) {
+                            if max.as_ref().is_none_or(|current| scalar_lt(current, &hi)) {
                                 max = Some(hi);
                             }
                         }

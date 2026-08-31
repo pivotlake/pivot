@@ -308,10 +308,10 @@ mod tests {
                     max_def_level: 0,
                     physical_type: 0,
                     fixed_len_byte_width: None,
-                    statistics: None,
                     data_pages_all_dictionary: false,
                 })
                 .collect(),
+            statistics: Arc::default(),
             num_rows,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -393,13 +393,13 @@ mod tests {
             max_def_level: 0,
             physical_type: 0,
             fixed_len_byte_width: None,
-            statistics: None,
             data_pages_all_dictionary: dict,
         };
         Arc::new(ParquetTable::new(vec![Arc::new(RowGroupMetadata {
             open_file: dispatch::io::OpenFile::Local(file),
             schema,
             columns: vec![column(all_dictionary), column(false)],
+            statistics: Arc::default(),
             num_rows,
             file_row_group_idx: 0,
             live_decompressed_pages: Arc::new(std::sync::atomic::AtomicUsize::new(0)),

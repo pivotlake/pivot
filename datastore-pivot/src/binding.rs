@@ -274,14 +274,14 @@ impl BoundTable for TableBinding {
         let mut max: Option<Scalar<ArrayRef>> = None;
         for rg in row_groups {
             let stats = rg.column_statistics(column)?;
-            let (rg_min, rg_max) = (stats.min.as_ref()?, stats.max.as_ref()?);
+            let (rg_min, rg_max) = (stats.min()?, stats.max()?);
             min = Some(match min {
-                Some(m) if scalar_lt(&m, rg_min) => m,
-                _ => rg_min.clone(),
+                Some(m) if scalar_lt(&m, &rg_min) => m,
+                _ => rg_min,
             });
             max = Some(match max {
-                Some(m) if scalar_lt(rg_max, &m) => m,
-                _ => rg_max.clone(),
+                Some(m) if scalar_lt(&rg_max, &m) => m,
+                _ => rg_max,
             });
         }
         Some((min?, max?))

@@ -53,8 +53,8 @@ fn row_group_per_three(
 
 /// Read column 0's min statistic, if present.
 fn min_i64(rg: &RowGroupMetadata, col: usize) -> Option<i64> {
-    let min = rg.column_statistics(col)?.min.as_ref()?;
-    let (arr, _) = arrow_array::Datum::get(min);
+    let min = rg.column_statistics(col)?.min()?;
+    let (arr, _) = arrow_array::Datum::get(&min);
     let arr = arr.as_any().downcast_ref::<Int64Array>()?;
     (!arr.is_null(0)).then(|| arr.value(0))
 }

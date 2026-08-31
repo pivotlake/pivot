@@ -275,8 +275,8 @@ pub fn variant_value_leaf_is_semantically_null(
         return true;
     }
     (!terminal || variant_cast_maps_json_null_to_sql_null(target))
-        && statistic_is_json_null(stats.min.as_ref())
-        && statistic_is_json_null(stats.max.as_ref())
+        && statistic_is_json_null(stats.min().as_ref())
+        && statistic_is_json_null(stats.max().as_ref())
 }
 
 fn statistic_is_json_null(statistic: Option<&arrow_array::Scalar<ArrayRef>>) -> bool {
@@ -967,18 +967,18 @@ mod tests {
     }
 
     #[test]
-    fn verifies_typed_leaf_counts_preceding_columns() {
+    fn verifies_shredded_path_is_scoped_to_its_column() {
         let fields = Fields::from(vec![
-            Field::new("id", DataType::Int64, false),
-            build_variant_field(&[("age", DataType::Int64)]),
+            Field::new("hello", DataType::Int64, false),
+            build_variant_field(&[("hello", DataType::Int64)]),
         ]);
 
-        let age = variant_shredded_leaves(&fields, 1, &build_path(&["age"])).unwrap();
+        let hello = variant_shredded_leaves(&fields, 1, &build_path(&["hello"])).unwrap();
 
-        // The layout is id=0, metadata=1, value=2, age.value=3, and
-        // age.typed_value=4.
-        assert_eq!(age.typed_leaf, 4);
-        assert_eq!(age.value_leaves, vec![2, 3]);
+        // The top-level hello=0 is outside the variant's range. The variant's
+        // layout is metadata=1, value=2, hello.value=3, hello.typed_value=4.
+        assert_eq!(hello.typed_leaf, 4);
+        assert_eq!(hello.value_leaves, vec![2, 3]);
     }
 
     #[test]

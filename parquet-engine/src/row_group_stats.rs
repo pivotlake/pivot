@@ -98,10 +98,10 @@ pub fn row_group_eliminated(
     if stats.null_count == Some(row_group.num_rows) {
         return Ok(true);
     }
-    let (Some(min), Some(max)) = (stats.min.as_ref(), stats.max.as_ref()) else {
+    let (Some(min), Some(max)) = (stats.min(), stats.max()) else {
         return Ok(false);
     };
-    bounds_eliminate(min, max, compare_type, constant)
+    bounds_eliminate(&min, &max, compare_type, constant)
 }
 
 /// Returns whether the inclusive range `[min, max]` proves that
