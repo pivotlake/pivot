@@ -57,7 +57,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
 use crate::manifest::DeltaFileEntry;
-use crate::{CatalogTable, DeltaDatastore, FileRef, scalar_values_equal};
+use crate::{CatalogTable, DeltaDatastore, FileRef, TableFile, scalar_values_equal};
 use object_storage::ObjectPath;
 use planner::catalog::SchemaQualifiedTableName;
 
@@ -199,9 +199,9 @@ impl CompacterHandle {
     }
 
     /// Enqueue one table from the caller's transaction snapshot; the round
-    /// refreshes it to the latest version before each selection and keeps
-    /// merging until nothing qualifies. `FINAL` drops the normal merge-size,
-    /// file-count, balance, or 30% overlap guards.
+    /// refreshes it to the latest version as it begins and keeps merging until
+    /// nothing qualifies. `FINAL` drops the normal merge-size, file-count,
+    /// balance, or 30% overlap guards.
     pub(crate) async fn compact(
         &self,
         name: SchemaQualifiedTableName,
@@ -272,15 +272,21 @@ impl CompacterActor {
         }
     }
 
-    /// Compact `table` until it has no candidate left: each pass refreshes the
-    /// table to the latest committed version, so files landing meanwhile (an
-    /// INSERT in this process, or another writer) join the selection, then
+    /// Compact `table` until it has no candidate left: the round refreshes the
+    /// table to the latest committed version once as it begins, then each pass
     /// starts a small-file group if one qualifies, else the best overlapping
     /// large-file pair. Up to `max_concurrent_merges` of those rewrites run at
     /// once, each holding its inputs reserved until it commits, so selection
     /// works around the merges already in flight. A pass with nothing to start
     /// and nothing in flight ends the round. Returns the table as it stands and
     /// the number of passes.
+    ///
+    /// The round works off its one refreshed copy rather than reloading the
+    /// log per pass: each of its own merges is folded in as it commits, so
+    /// files landing meanwhile (an INSERT in this process, or another writer)
+    /// wait for the next round. Only a commit conflict, another writer having
+    /// swapped a selected file out first, reloads the copy, and the round
+    /// carries on from what it finds.
     async fn compact_table(
         &mut self,
         name: &SchemaQualifiedTableName,
@@ -291,13 +297,8 @@ impl CompacterActor {
         let apply_guards = !final_sweep;
         let mut in_flight = JoinSet::new();
         let mut reserved = HashSet::new();
+        table.refresh()?;
         loop {
-            // Every exit from here on drains first: a merge body runs on the
-            // blocking pool, which a dropped handle does not stop.
-            if let Err(error) = table.refresh() {
-                drain_merges(&mut in_flight).await;
-                return Err(error);
-            }
             passes += 1;
             let id = table.id();
 
@@ -321,6 +322,8 @@ impl CompacterActor {
                 return Ok((table, passes));
             }
 
+            // Every exit from here on drains first: a merge body runs on the
+            // blocking pool, which a dropped handle does not stop.
             let (reserved_paths, outcome) = match in_flight.join_next().await {
                 Some(Ok(merge)) => merge,
                 Some(Err(error)) => {
@@ -329,12 +332,23 @@ impl CompacterActor {
                 }
                 None => unreachable!("the set is not empty"),
             };
-            for path in reserved_paths {
-                reserved.remove(&path);
+            for path in &reserved_paths {
+                reserved.remove(path);
             }
-            if let Err(error) = outcome {
-                drain_merges(&mut in_flight).await;
-                return Err(error);
+            match outcome {
+                Ok(outputs) => table.apply_file_swap(&reserved_paths, outputs),
+                Err(crate::Error::CommitConflict { .. }) => {
+                    // The merge's outputs are already deleted; reload the copy
+                    // to see what the conflicting writer left and keep going.
+                    if let Err(error) = table.refresh() {
+                        drain_merges(&mut in_flight).await;
+                        return Err(error);
+                    }
+                }
+                Err(error) => {
+                    drain_merges(&mut in_flight).await;
+                    return Err(error);
+                }
             }
         }
     }
@@ -452,7 +466,8 @@ impl CompacterActor {
 
 /// Rewrite `inputs` into target-sized outputs and swap them into the table in
 /// one commit. Returns the input paths beside the outcome so the round can
-/// release their reservations however the merge went.
+/// release their reservations however the merge went; a committed merge's
+/// outcome carries the output files for the round to fold into its table copy.
 async fn compact_batch(
     datastore: Arc<DeltaDatastore>,
     name: SchemaQualifiedTableName,
@@ -460,7 +475,7 @@ async fn compact_batch(
     inputs: Vec<FileRef>,
     kind: MergeKind,
     target_bytes: u64,
-) -> (Vec<ObjectPath>, crate::Result<()>) {
+) -> (Vec<ObjectPath>, crate::Result<Vec<TableFile>>) {
     let reserved_paths: Vec<ObjectPath> = inputs.iter().map(|file| file.path.clone()).collect();
     let input_sizes: Vec<u64> = inputs.iter().map(|file| file.size).collect();
     // `spawn_blocking` needs a `'static` closure, so the merge takes the
@@ -479,7 +494,7 @@ async fn compact_batch(
             );
         }
     };
-    let output_sizes: Vec<u64> = merged.iter().map(|file| file.size).collect();
+    let output_sizes: Vec<u64> = merged.iter().map(|file| file.file_ref().size).collect();
     info!(
         table = %name,
         kind = kind.label(),
@@ -491,19 +506,19 @@ async fn compact_batch(
         output_bytes = output_sizes.iter().sum::<u64>(),
         "compacted batch"
     );
-    (reserved_paths, Ok(()))
+    (reserved_paths, Ok(merged))
 }
 
 /// Await the merges still in flight, reporting rather than propagating what
 /// they return: a merge body runs on the blocking pool, where dropping its
 /// handle does not stop it, so a round that is giving up still waits for its
 /// own rewrites to finish before the next one selects.
-async fn drain_merges(in_flight: &mut JoinSet<(Vec<ObjectPath>, crate::Result<()>)>) {
+async fn drain_merges(in_flight: &mut JoinSet<(Vec<ObjectPath>, crate::Result<Vec<TableFile>>)>) {
     while let Some(joined) = in_flight.join_next().await {
         match joined {
             Ok((_, Err(error))) => warn!(error = %error, "compaction merge failed"),
             Err(error) => warn!(error = %error, "compaction merge panicked"),
-            Ok((_, Ok(()))) => {}
+            Ok((_, Ok(_))) => {}
         }
     }
 }
@@ -574,7 +589,8 @@ fn small_file_batch(
 /// Merge `inputs` of the table with identity `id` into fresh target-sized files
 /// and swap them in for the inputs, in one log commit labelled a rearrangement.
 /// `inputs` must share one partition tuple; the caller batches them so. Returns
-/// the merged files.
+/// the merged files with their footers in hand, so a caller holding its own
+/// table copy can fold the swap in without reloading the log.
 ///
 /// The merge itself (decode, re-encode, upload) runs off a plain read copy of
 /// the table with no commit lock held, so it never blocks a concurrent INSERT's
@@ -593,28 +609,28 @@ pub fn compact_table_files(
     inputs: &[FileRef],
     target_rows_per_group: usize,
     max_output_file_size: u64,
-) -> Result<Vec<FileRef>, crate::Error> {
+) -> Result<Vec<TableFile>, crate::Error> {
     let table = datastore
         .table_handle_by_id(&id)
         .ok_or_else(|| crate::Error::TableNotFound(id.to_string()))?;
     let merged = table.merge_files(inputs, target_rows_per_group, max_output_file_size)?;
 
-    let files: Vec<FileRef> = merged.iter().map(|file| file.file_ref().clone()).collect();
+    let outputs = merged.clone();
     let removed: Vec<ObjectPath> = inputs.iter().map(|file| file.path.clone()).collect();
     if let Err(error) = datastore.commit_to_table(id, &removed, merged, false) {
-        for file in &files {
-            if let Err(cleanup_error) = table.delete_data_file(&file.path) {
+        for file in &outputs {
+            if let Err(cleanup_error) = table.delete_data_file(&file.file_ref().path) {
                 warn!(
                     commit_error = %error,
                     cleanup_error = %cleanup_error,
-                    file = %file.path,
+                    file = %file.file_ref().path,
                     "compaction: deleting output after commit failure failed (orphan left)"
                 );
             }
         }
         return Err(error);
     }
-    Ok(files)
+    Ok(outputs)
 }
 
 fn partition_values_equal(
@@ -1083,8 +1099,8 @@ mod tests {
         dispatch.exit();
     }
 
-    /// A round does not stop at one pair: it keeps merging, on a refreshed
-    /// view each time, until no large pair overlaps any more.
+    /// A round does not stop at one pair: it keeps merging, folding each
+    /// committed merge into its view, until no large pair overlaps any more.
     #[test]
     fn a_round_keeps_merging_until_no_pair_overlaps() {
         let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
