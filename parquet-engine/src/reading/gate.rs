@@ -32,8 +32,18 @@ use std::sync::Arc;
 /// Keep the surviving-row indices on a request only when they select at most
 /// this fraction of the row group. Above it, masked decode's per-run overhead
 /// outweighs the skipped work, so the request decodes densely and the filter
-/// above drops the rest.
-const MAX_SPARSE_KEEP_FRACTION: f64 = 1.0 / 32.0;
+/// above drops the rest. `PIVOT_GATE_SPARSE_PCT` overrides the percentage for
+/// live experiments; read once per process.
+fn max_sparse_keep_fraction() -> f64 {
+    static FRACTION: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *FRACTION.get_or_init(|| {
+        std::env::var("PIVOT_GATE_SPARSE_PCT")
+            .ok()
+            .and_then(|percent| percent.parse::<f64>().ok())
+            .map(|percent| percent / 100.0)
+            .unwrap_or(1.0 / 32.0)
+    })
+}
 
 /// One pushed comparison the gate evaluates, resolved to its position in the
 /// gate scan's batches.
@@ -176,8 +186,8 @@ impl Gate {
         let total_rows = self.table.row_groups()[group as usize].num_rows as usize;
         debug_assert!(state.survivors.is_sorted());
         let indices = (state.survivors.len() as f64
-            <= total_rows as f64 * MAX_SPARSE_KEEP_FRACTION)
-            .then_some(state.survivors);
+            <= total_rows as f64 * max_sparse_keep_fraction())
+        .then_some(state.survivors);
         match indices.is_some() {
             true => self.stats.groups_sparse += 1,
             false => self.stats.groups_dense += 1,
