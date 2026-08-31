@@ -12,7 +12,7 @@ combines writes and low-latency analytical queries over Delta Lake tables.
 ### How Pivot fits
 
 1. Applications append events with `INSERT`, `INSERT ... SELECT`, or
-   `COPY ... FROM STDIN` using Arrow IPC.
+   `COPY ... FROM STDIN` using CSV or Arrow IPC.
 2. Pivot commits those rows to open Parquet and Delta Lake metadata.
 3. Applications, dashboards, and Postgres clients query the updated tables
    through the same server.
@@ -35,6 +35,6 @@ feature is supported; consult the [SQL reference](/docs/reference/sql-statements
 ### Current fit
 
 Pivot does not currently include a managed streaming connector. Use an
-application or ingestion service to send rows through the supported SQL and
-Arrow interfaces. Transactions are accepted for driver compatibility but do
+application or ingestion service to send rows through the supported SQL, CSV,
+and Arrow interfaces. Transactions are accepted for driver compatibility but do
 not group multiple statements atomically.

@@ -1,4 +1,4 @@
-//! Wire-level `COPY <table> FROM STDIN WITH (FORMAT arrow)` tests: the
+//! Wire-level `COPY <table> FROM STDIN` tests for Arrow IPC and CSV: the
 //! copy-in sub-protocol, schema conformance, and rollback on failure.
 
 mod common;
@@ -58,6 +58,148 @@ fn single_column_batch(column: arrow_array::ArrayRef, name: &str) -> arrow_array
         true,
     )]));
     arrow_array::RecordBatch::try_new(schema, vec![column]).unwrap()
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn copy_csv_loads_quotes_newlines_nulls_and_variants(#[future] conn: Conn) {
+    conn.simple_query(
+        "CREATE TABLE copy_csv (id BIGINT, name VARCHAR, note VARCHAR, document VARIANT)",
+    )
+    .await
+    .unwrap();
+    let data = b"1,\"Alice, A.\",\"\",\"{\"\"kind\"\":\"\"first\"\"}\"\r\n\
+                 2,\"two\nlines\",,\"{\"\"kind\"\":\"\"second\"\"}\"\n";
+
+    let messages = with_raw_conn(move |raw| {
+        raw.query("COPY copy_csv FROM STDIN WITH (FORMAT csv)");
+        let (kind, payload) = raw.read_message();
+        assert_eq!(kind, b'G', "expected CopyInResponse");
+        assert_eq!(payload[0], 0, "CSV copies advertise a text payload");
+        // Exercise every decoder state across pgwire frame boundaries.
+        for byte in data {
+            raw.copy_data(std::slice::from_ref(byte));
+        }
+        raw.copy_done();
+        raw.read_until_ready()
+    })
+    .await;
+
+    assert_eq!(command_tag(&messages).as_deref(), Some("COPY 2"));
+    let rows = select_rows(
+        &conn,
+        "SELECT id, name, note, CAST(document->'kind' AS VARCHAR) FROM copy_csv ORDER BY id",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![
+                Some("1".into()),
+                Some("Alice, A.".into()),
+                Some("".into()),
+                Some("first".into()),
+            ],
+            vec![
+                Some("2".into()),
+                Some("two\nlines".into()),
+                None,
+                Some("second".into()),
+            ],
+        ]
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn copy_csv_applies_header_delimiter_null_and_column_list(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE copy_csv_options (id BIGINT, name VARCHAR, note VARCHAR)")
+        .await
+        .unwrap();
+
+    let messages = with_raw_conn(|raw| {
+        raw.query(
+            "COPY copy_csv_options (name, note) FROM STDIN \
+             WITH (FORMAT csv, HEADER, DELIMITER '|', QUOTE '''', ESCAPE '\\', NULL 'NULL')",
+        );
+        let (kind, _) = raw.read_message();
+        assert_eq!(kind, b'G', "expected CopyInResponse");
+        raw.copy_data(b"name|note\r\nalice|NULL\r\n'bob|b\\'s'|'NULL'\r\n");
+        raw.copy_done();
+        raw.read_until_ready()
+    })
+    .await;
+
+    assert_eq!(command_tag(&messages).as_deref(), Some("COPY 2"));
+    let rows = select_rows(
+        &conn,
+        "SELECT id, name, note FROM copy_csv_options ORDER BY name",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            vec![None, Some("alice".into()), None],
+            vec![None, Some("bob|b's".into()), Some("NULL".into())],
+        ]
+    );
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_csv_reports_and_rolls_back(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE copy_csv_bad (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+
+    let (failed, after) = with_raw_conn(|raw| {
+        raw.query("COPY copy_csv_bad FROM STDIN WITH (FORMAT csv)");
+        let (kind, _) = raw.read_message();
+        assert_eq!(kind, b'G', "expected CopyInResponse");
+        raw.copy_data(b"1,alice\n2,\"unterminated");
+        raw.copy_done();
+        let failed = raw.read_until_ready();
+        raw.query("SELECT 1");
+        (failed, raw.read_until_ready())
+    })
+    .await;
+
+    assert!(failed.iter().any(|(kind, _)| *kind == b'E'));
+    assert!(
+        after.iter().any(|(kind, _)| *kind == b'T'),
+        "the connection stays usable after malformed CSV"
+    );
+    let rows = select_rows(&conn, "SELECT COUNT(*) FROM copy_csv_bad").await;
+    assert_eq!(rows, vec![vec![Some("0".into())]], "nothing was committed");
+}
+
+#[rstest]
+#[awt]
+#[tokio::test(flavor = "multi_thread")]
+async fn tokio_postgres_copy_in_loads_csv_over_the_extended_protocol(#[future] conn: Conn) {
+    conn.simple_query("CREATE TABLE copy_csv_extended (id BIGINT, name VARCHAR)")
+        .await
+        .unwrap();
+
+    let sink = conn
+        .copy_in("COPY copy_csv_extended FROM STDIN WITH (FORMAT csv)")
+        .await
+        .unwrap();
+    let mut sink = Box::pin(sink);
+    sink.send(bytes::Bytes::from_static(b"1,alice\n2,bob\n"))
+        .await
+        .unwrap();
+    let rows = sink.as_mut().finish().await.unwrap();
+
+    assert_eq!(rows, 2);
+    let names = select_rows(&conn, "SELECT name FROM copy_csv_extended ORDER BY id").await;
+    assert_eq!(
+        names,
+        vec![vec![Some("alice".into())], vec![Some("bob".into())]]
+    );
 }
 
 #[rstest]
@@ -400,12 +542,16 @@ async fn copy_format_rejections_name_the_supported_format(#[future] conn: Conn) 
             "text format is not supported yet",
         ),
         (
-            "COPY copy_format_errors FROM STDIN (FORMAT csv)",
-            "only arrow is",
+            "COPY copy_format_errors FROM STDIN (FORMAT parquet)",
+            "only csv and arrow are",
         ),
         (
             "COPY copy_format_errors FROM STDIN (FORMAT arrow, DELIMITER '|')",
             "not valid for FORMAT arrow",
+        ),
+        (
+            "COPY copy_format_errors FROM STDIN (FORMAT csv, COMPRESSION gzip)",
+            "not valid for FORMAT csv",
         ),
     ] {
         let messages = with_raw_conn(move |raw| {

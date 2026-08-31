@@ -8,6 +8,7 @@
 //! text.
 
 mod copy;
+mod copy_csv;
 mod dataflow;
 mod planning;
 mod types;

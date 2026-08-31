@@ -40,7 +40,7 @@ mod values;
 
 pub use aggregate::Aggregate;
 pub use compact::Compact;
-pub use copy_from_stdin::{CopyFormat, CopyFromStdin};
+pub use copy_from_stdin::{CopyCsvOptions, CopyFormat, CopyFromStdin};
 pub use create_schema::CreateSchema;
 pub use create_table::CreateTable;
 pub use create_user::CreateUser;

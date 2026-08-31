@@ -12,8 +12,8 @@ use dispatch::{
 use std::fmt;
 use std::sync::Arc;
 
-/// `COPY <table> [(columns)] FROM STDIN WITH (FORMAT arrow)`: load rows
-/// arriving over the client protocol into a table.
+/// `COPY <table> [(columns)] FROM STDIN WITH (FORMAT <format>)`: load rows
+/// arriving over the client protocol into a table as Arrow IPC or CSV.
 ///
 /// A statement, not a query: its rows arrive later over the connection's
 /// copy-in sub-protocol, so a plan never compiles it. The engine reads it off
@@ -34,13 +34,42 @@ pub struct CopyFromStdin {
     pub format: CopyFormat,
 }
 
-/// The validated data format of a COPY FROM STDIN. Only Arrow IPC is
-/// supported so far; the PostgreSQL text format (the protocol's default) and
-/// everything else are rejected at plan time.
+/// The validated data format of a COPY FROM STDIN. The PostgreSQL text format
+/// (the protocol's default) and formats other than Arrow IPC and CSV are
+/// rejected at plan time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CopyFormat {
     /// An Arrow IPC stream; batches conform to the table schema by position.
     ArrowIpc,
+    /// PostgreSQL CSV data and its validated parsing options.
+    Csv(CopyCsvOptions),
+}
+
+/// The supported options for `COPY ... WITH (FORMAT csv)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyCsvOptions {
+    /// The single-byte field separator (comma by default).
+    pub delimiter: u8,
+    /// Whether to discard the first record as a header.
+    pub header: bool,
+    /// The single-byte character surrounding quoted fields.
+    pub quote: u8,
+    /// The single-byte character escaping quote and escape within a quote.
+    pub escape: u8,
+    /// An unquoted field exactly equal to this string is NULL.
+    pub null: String,
+}
+
+impl Default for CopyCsvOptions {
+    fn default() -> Self {
+        Self {
+            delimiter: b',',
+            header: false,
+            quote: b'"',
+            escape: b'"',
+            null: String::new(),
+        }
+    }
 }
 
 impl CopyFormat {
@@ -50,27 +79,114 @@ impl CopyFormat {
         format: Option<&str>,
         options: &[(String, Vec<String>)],
     ) -> Result<Self, String> {
-        match format {
-            Some("arrow") => {}
+        let format = match format {
+            Some("arrow") => Self::ArrowIpc,
+            Some("csv") => Self::Csv(CopyCsvOptions::resolve(options)?),
             None | Some("text") => {
                 return Err(
-                    "the COPY text format is not supported yet; use WITH (FORMAT arrow)"
+                    "the COPY text format is not supported yet; use WITH (FORMAT csv) or WITH (FORMAT arrow)"
                         .to_string(),
                 );
             }
             Some(other) => {
                 return Err(format!(
-                    "COPY FORMAT {other} is not supported; only arrow is"
+                    "COPY FORMAT {other} is not supported; only csv and arrow are"
                 ));
             }
-        }
-        if let Some((name, _)) = options.first() {
+        };
+        if matches!(format, Self::ArrowIpc)
+            && let Some((name, _)) = options.first()
+        {
             return Err(format!(
                 "COPY option \"{}\" is not valid for FORMAT arrow",
                 name.to_lowercase()
             ));
         }
-        Ok(Self::ArrowIpc)
+        Ok(format)
+    }
+
+    /// The SQL name of this format.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::ArrowIpc => "arrow",
+            Self::Csv(_) => "csv",
+        }
+    }
+}
+
+impl CopyCsvOptions {
+    fn resolve(options: &[(String, Vec<String>)]) -> Result<Self, String> {
+        let mut csv = Self::default();
+        for (name, values) in options {
+            let name = name.to_ascii_lowercase();
+            match name.as_str() {
+                "delimiter" => csv.delimiter = csv_option_byte(&name, values)?,
+                "header" => csv.header = csv_header_option(values)?,
+                "quote" => csv.quote = csv_option_byte(&name, values)?,
+                "escape" => csv.escape = csv_option_byte(&name, values)?,
+                "null" => csv.null = csv_option_value(&name, values)?.to_string(),
+                _ => {
+                    return Err(format!(
+                        "COPY option \"{name}\" is not valid for FORMAT csv"
+                    ));
+                }
+            }
+        }
+
+        for (name, byte) in [
+            ("delimiter", csv.delimiter),
+            ("quote", csv.quote),
+            ("escape", csv.escape),
+        ] {
+            if matches!(byte, b'\r' | b'\n') {
+                return Err(format!("COPY CSV {name} cannot be a newline"));
+            }
+        }
+        if csv.delimiter == csv.quote {
+            return Err("COPY CSV delimiter and quote must be different".to_string());
+        }
+        if csv.null.contains('\r') || csv.null.contains('\n') {
+            return Err("COPY CSV null string cannot contain a newline".to_string());
+        }
+        if csv.null.as_bytes().contains(&csv.delimiter) {
+            return Err("COPY CSV null string cannot contain the delimiter".to_string());
+        }
+        if csv.null.as_bytes().contains(&csv.quote) {
+            return Err("COPY CSV null string cannot contain the quote character".to_string());
+        }
+        Ok(csv)
+    }
+}
+
+fn csv_option_value<'a>(name: &str, values: &'a [String]) -> Result<&'a str, String> {
+    let [value] = values else {
+        return Err(format!("COPY CSV option \"{name}\" requires one value"));
+    };
+    Ok(value)
+}
+
+fn csv_option_byte(name: &str, values: &[String]) -> Result<u8, String> {
+    let value = csv_option_value(name, values)?;
+    let [byte] = value.as_bytes() else {
+        return Err(format!(
+            "COPY CSV option \"{name}\" must be a single one-byte character"
+        ));
+    };
+    Ok(*byte)
+}
+
+fn csv_header_option(values: &[String]) -> Result<bool, String> {
+    let value = match values {
+        [] => return Ok(true),
+        [value] => value.to_ascii_lowercase(),
+        _ => return Err("COPY CSV option \"header\" accepts at most one value".to_string()),
+    };
+    match value.as_str() {
+        "true" | "t" | "1" | "on" | "yes" => Ok(true),
+        "false" | "f" | "0" | "off" | "no" => Ok(false),
+        _ => Err(format!(
+            "COPY CSV option \"header\" expects a boolean, got {value:?}"
+        )),
     }
 }
 
@@ -101,10 +217,7 @@ impl fmt::Display for CopyFromStdin {
                 .collect();
             write!(f, " ({})", names.join(", "))?;
         }
-        match &self.format {
-            CopyFormat::ArrowIpc => write!(f, " format: arrow")?,
-        }
-        write!(f, ")")
+        write!(f, " format: {})", self.format.name())
     }
 }
 
@@ -142,7 +255,6 @@ impl CopyFromStdin {
         dispatcher: &DataFlowDispatcher,
         on_claim: Box<dyn Fn() + Send + Sync>,
     ) -> Result<(ChannelInputSender<RecordBatch>, RecordBatchOperatorSpec), CatalogError> {
-        let CopyFormat::ArrowIpc = self.format;
         let layout = Arc::new(self.build_layout().map_err(|message| {
             CatalogError::Other(Box::<dyn std::error::Error + Send + Sync>::from(message))
         })?);
@@ -150,7 +262,7 @@ impl CopyFromStdin {
             channel_input::<RecordBatch>(dispatcher, CHUNK_QUEUE_CAPACITY, on_claim);
         let worker_count = dispatcher.worker_count();
         let conformers: Vec<_> = (0..worker_count)
-            .map(|_| ConformArrowBatch {
+            .map(|_| ConformCopyBatch {
                 layout: layout.clone(),
             })
             .collect();
@@ -164,6 +276,16 @@ impl CopyFromStdin {
             .record_batches();
         let insert = self.table.compile_insert(conformed, dispatcher)?;
         Ok((sender, insert))
+    }
+
+    /// Columns each incoming row or batch must carry: the explicit COPY
+    /// column list's length, or the full table width without one.
+    pub fn incoming_column_count(&self) -> usize {
+        if self.columns.is_empty() {
+            self.table.columns().len()
+        } else {
+            self.columns.len()
+        }
     }
 
     /// Resolve the column list (positions resolved and validated by the
@@ -211,6 +333,17 @@ fn cast_to_field(array: &ArrayRef, field: &Field) -> Result<ArrayRef, String> {
     if field.data_type() == array.data_type() {
         return Ok(array.clone());
     }
+    if *field.data_type() == physical_arrow_type(&crate::types::Type::Variant)
+        && matches!(
+            array.data_type(),
+            arrow_schema::DataType::Utf8
+                | arrow_schema::DataType::LargeUtf8
+                | arrow_schema::DataType::Utf8View
+        )
+    {
+        return crate::expression::json_to_canonical_variant(array)
+            .map_err(|e| format!("column \"{}\": {e}", field.name()));
+    }
     let options = arrow::compute::CastOptions {
         safe: false,
         format_options: Default::default(),
@@ -219,16 +352,16 @@ fn cast_to_field(array: &ArrayRef, field: &Field) -> Result<ArrayRef, String> {
         .map_err(|e| format!("column \"{}\": {e}", field.name()))
 }
 
-/// Conform one client-schema Arrow batch to the table's physical schema:
+/// Conform one decoded client batch to the table's physical schema:
 /// columns map to the statement's column list by position, cast to the
 /// table's physical types, and unlisted table columns fill with NULL.
-/// Variant columns are admitted as sent: clients are trusted to encode them
-/// correctly, and a malformed document surfaces wherever it is first parsed.
-fn conform_arrow_batch(batch: &RecordBatch, layout: &ColumnLayout) -> Result<RecordBatch, String> {
+/// Variant structs from Arrow IPC are admitted as sent; string values from
+/// CSV are parsed as JSON documents.
+fn conform_copy_batch(batch: &RecordBatch, layout: &ColumnLayout) -> Result<RecordBatch, String> {
     let incoming_columns = layout.incoming_columns();
     if batch.num_columns() != incoming_columns {
         return Err(format!(
-            "COPY arrow stream has {} columns, the statement targets {incoming_columns}",
+            "COPY input has {} columns, the statement targets {incoming_columns}",
             batch.num_columns(),
         ));
     }
@@ -248,18 +381,18 @@ fn conform_arrow_batch(batch: &RecordBatch, layout: &ColumnLayout) -> Result<Rec
 
 /// Worker-side transform: one decoded client batch in, one table-schema batch
 /// out.
-struct ConformArrowBatch {
+struct ConformCopyBatch {
     layout: Arc<ColumnLayout>,
 }
 
-impl Unary<RecordBatch, RecordBatch> for ConformArrowBatch {
+impl Unary<RecordBatch, RecordBatch> for ConformCopyBatch {
     fn consume(
         &mut self,
         batch: RecordBatch,
         sender: &mut dyn dispatch::Sender<RecordBatch>,
         _io: &mut dispatch::OperatorIO,
     ) -> UnaryResult<()> {
-        let batch = conform_arrow_batch(&batch, &self.layout)
+        let batch = conform_copy_batch(&batch, &self.layout)
             .map_err(|message| UnaryError::Operator(message.into()))?;
         if batch.num_rows() > 0 {
             sender.send(batch)?;
@@ -269,10 +402,62 @@ impl Unary<RecordBatch, RecordBatch> for ConformArrowBatch {
 }
 
 // Stateless per worker, so it serves as its own factory.
-impl UnaryFactory<RecordBatch, RecordBatch> for ConformArrowBatch {
+impl UnaryFactory<RecordBatch, RecordBatch> for ConformCopyBatch {
     type Unary = Self;
 
     fn build_unary(self) -> Self {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolves_csv_defaults_and_options() {
+        assert_eq!(
+            CopyFormat::resolve(Some("csv"), &[]).unwrap(),
+            CopyFormat::Csv(CopyCsvOptions::default())
+        );
+
+        let format = CopyFormat::resolve(
+            Some("csv"),
+            &[
+                ("DELIMITER".into(), vec!["|".into()]),
+                ("escape".into(), vec!["\\".into()]),
+                ("header".into(), Vec::new()),
+                ("null".into(), vec!["NULL".into()]),
+                ("quote".into(), vec!["'".into()]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            format,
+            CopyFormat::Csv(CopyCsvOptions {
+                delimiter: b'|',
+                header: true,
+                quote: b'\'',
+                escape: b'\\',
+                null: "NULL".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn validates_csv_options() {
+        let error =
+            CopyFormat::resolve(Some("csv"), &[("compression".into(), vec!["gzip".into()])])
+                .unwrap_err();
+        assert!(error.contains("not valid for FORMAT csv"), "{error}");
+
+        let error = CopyFormat::resolve(Some("csv"), &[("delimiter".into(), vec!["||".into()])])
+            .unwrap_err();
+        assert!(error.contains("single one-byte character"), "{error}");
+
+        let error =
+            CopyFormat::resolve(Some("csv"), &[("header".into(), vec!["sometimes".into()])])
+                .unwrap_err();
+        assert!(error.contains("expects a boolean"), "{error}");
     }
 }
