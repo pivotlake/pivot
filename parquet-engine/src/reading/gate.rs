@@ -82,6 +82,7 @@ impl UnaryFactory<RecordBatch, RowGroupRequest> for GateFactory {
             full_projection: self.full_projection,
             table: self.table,
             states: HashMap::default(),
+            stats: GateStats::default(),
         }
     }
 }
@@ -92,6 +93,16 @@ impl UnaryFactory<RecordBatch, RowGroupRequest> for GateFactory {
 struct GroupState {
     seen_rows: u32,
     survivors: Vec<u32>,
+}
+
+/// Per-scan tallies of the gate's decisions, reported by [`gate_debug`].
+#[derive(Default)]
+struct GateStats {
+    groups_sparse: usize,
+    groups_dense: usize,
+    groups_empty: usize,
+    rows_seen: u64,
+    rows_kept: u64,
 }
 
 /// Evaluates pushed predicates on gate-column batches and emits one
@@ -107,6 +118,7 @@ pub struct Gate {
     /// Row group ID -> progress. An entry exists only while the group is
     /// partially seen; completion removes it and emits the request.
     states: HashMap<u32, GroupState>,
+    stats: GateStats,
 }
 
 /// The Arrow kernel implementing one [`CompareType`].
@@ -150,12 +162,15 @@ impl Gate {
     /// Emit the completed group's request: sparse when the mask pays for
     /// itself, dense otherwise, nothing when no row survives.
     fn emit_request(
-        &self,
+        &mut self,
         group: u32,
         state: GroupState,
         sender: &mut dyn Sender<RowGroupRequest>,
     ) -> dispatch::UnaryResult<()> {
+        self.stats.rows_seen += state.seen_rows as u64;
+        self.stats.rows_kept += state.survivors.len() as u64;
         if state.survivors.is_empty() {
+            self.stats.groups_empty += 1;
             return Ok(());
         }
         let total_rows = self.table.row_groups()[group as usize].num_rows as usize;
@@ -163,6 +178,10 @@ impl Gate {
         let indices = (state.survivors.len() as f64
             <= total_rows as f64 * MAX_SPARSE_KEEP_FRACTION)
             .then_some(state.survivors);
+        match indices.is_some() {
+            true => self.stats.groups_sparse += 1,
+            false => self.stats.groups_dense += 1,
+        }
         sender.send(RowGroupRequest::from(
             QueryRowGroupMetadata::new(&self.table, group as usize, indices),
             &self.full_projection,
@@ -225,8 +244,25 @@ impl Unary<RecordBatch, RowGroupRequest> for Gate {
                 &self.full_projection,
             ))?;
         }
+        if gate_debug() && self.stats.rows_seen > 0 {
+            eprintln!(
+                "scan gate: sparse={} dense={} empty={} rows_seen={} rows_kept={}",
+                self.stats.groups_sparse,
+                self.stats.groups_dense,
+                self.stats.groups_empty,
+                self.stats.rows_seen,
+                self.stats.rows_kept,
+            );
+        }
         Ok(true)
     }
+}
+
+/// Whether to print a per-scan gate summary on completion, for inspecting
+/// gate decisions on a live server. Read once per process.
+fn gate_debug() -> bool {
+    static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEBUG.get_or_init(|| std::env::var_os("PIVOT_GATE_DEBUG").is_some())
 }
 
 #[cfg(test)]

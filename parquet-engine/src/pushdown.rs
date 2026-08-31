@@ -176,6 +176,14 @@ pub fn prune_parquet(parquet: &ParquetTable, predicates: &[PushedPredicate]) -> 
 /// the gate and once for the output) stays a small fraction of the saving.
 const MIN_PAYLOAD_TO_GATE_BYTE_RATIO: i64 = 4;
 
+/// Whether `PIVOT_SCAN_GATE=off` disables predicate-gated scans, an escape
+/// hatch for isolating the gate's effect on a live server. Read once per
+/// process.
+fn scan_gate_disabled() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("PIVOT_SCAN_GATE").is_some_and(|v| v == "off"))
+}
+
 /// Decide whether a scan should late-materialize behind its pushed
 /// predicates, and plan the gate if so.
 ///
@@ -191,6 +199,9 @@ pub fn plan_gated_scan(
     predicates: &[PushedPredicate],
     projection: &crate::types::projection::Projection,
 ) -> Option<crate::GatedScanPlan> {
+    if scan_gate_disabled() {
+        return None;
+    }
     let row_groups = parquet.row_groups();
     if row_groups.is_empty() {
         return None;
