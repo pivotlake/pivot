@@ -1,4 +1,5 @@
-//! Snappy-decompresses individual compressed Parquet pages.
+//! Decompresses individual compressed Parquet pages (snappy, raw LZ4, or
+//! zstd, per the page's column chunk codec).
 //!
 //! Each [`CompressedPage`] is decompressed into a [`DecompressedPage`] using the Ring buffer
 //! pool for output allocation. These pages can be backed by multiple underlying buffers, and will be
@@ -9,7 +10,7 @@
 //!
 //! [`FilterMask`]: crate::types::filter_mask::FilterMask
 
-use crate::thrift::general::PageType;
+use crate::thrift::general::{CompressionCodec, PageType};
 use crate::thrift::headers::PageHeader;
 use crate::thrift::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 use crate::types::page::{CompressedPage, DataPage, DecompressedPage, DecompressedPageType};
@@ -20,13 +21,25 @@ use dispatch::Unary;
 use dispatch::memory::{BlockKey, memory_ctx};
 use snap::raw::Decoder;
 use thiserror::Error;
+use zstd::zstd_safe::{DCtx, InBuffer, OutBuffer, ResetDirective, get_error_name};
 
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("{0}")]
     Snappy(#[from] snap::Error),
     #[error("{0}")]
+    Lz4(#[from] lz4_flex::block::DecompressError),
+    #[error("zstd: {0}")]
+    Zstd(&'static str),
+    #[error("{0}")]
     UnsupportedPageType(PageType),
+    /// A page compressed with a codec the engine cannot decompress (e.g. GZIP
+    /// in an external file). Surfaces only when such a page is actually read;
+    /// pruned or unprojected chunks never get here.
+    #[error("unsupported compression codec: {0}")]
+    UnsupportedCodec(CompressionCodec),
+    #[error("page decompressed to {written} bytes but the footer records {expected}")]
+    DecompressedLength { written: usize, expected: usize },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -34,17 +47,21 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 /// Factory for creating [`Decompressor`] instances, one per worker thread.
 pub type DecompressorFactory = DefaultUnaryFactory<Decompressor>;
 
-/// Snappy decompressor that converts [`CompressedPage`]s into [`DecompressedPage`]s.
+/// Decompressor that converts [`CompressedPage`]s into [`DecompressedPage`]s,
+/// dispatching on each page's codec.
 ///
-/// Holds a reusable [`snap::raw::Decoder`] to avoid per-page allocation of decoder state.
+/// Holds a reusable snappy decoder and zstd context to avoid per-page
+/// allocation of decoder state.
 pub struct Decompressor {
-    decoder: Decoder,
+    snappy_decoder: Decoder,
+    zstd_decoder: DCtx<'static>,
 }
 
 impl Default for Decompressor {
     fn default() -> Self {
         Self {
-            decoder: Decoder::new(),
+            snappy_decoder: Decoder::new(),
+            zstd_decoder: DCtx::create(),
         }
     }
 }
@@ -64,6 +81,17 @@ impl Decompressor {
         // and now.
         let data = if let Some(decompressed) = page.decompressed.take() {
             decompressed
+        } else if page.codec == CompressionCodec::UNCOMPRESSED {
+            // Nothing to decode: forward the page's bytes zero-copy (they stay
+            // backed by the compressed cache), skipping the reservation and the
+            // decompressed cache entirely - caching a byte-identical copy of
+            // already-resident bytes would be pure waste.
+            let written: usize = page.data.iter().map(|b| b.len()).sum();
+            let expected = page.header.uncompressed_page_size as usize;
+            if written != expected {
+                return Err(Error::DecompressedLength { written, expected });
+            }
+            std::mem::take(&mut page.data)
         } else {
             // The decompressed bytes depend only on the compressed input, not on the
             // per-query filter mask, so a cache hit reuses them across queries; the
@@ -75,8 +103,8 @@ impl Decompressor {
             };
             match memory_ctx().decompressed_cache().get(&key) {
                 Some(cached) => cached,
-                // An empty page decompresses to no bytes, and the snappy decoder
-                // panics if handed zero output buffers. This happens for the
+                // An empty page decompresses to no bytes, and the decoders
+                // reject zero input/output buffers. This happens for the
                 // dictionary page of an all-null column, e.g. the unused `value`
                 // fallback leaf of a shredded variant path (every value went to
                 // its typed leaf). Nothing to cache either.
@@ -93,8 +121,32 @@ impl Decompressor {
                         .decompressed_cache()
                         .reserve(&key, uncompressed_size);
                     let input: Vec<&[u8]> = page.data.iter().map(|b: &Bytes| b.as_ref()).collect();
-                    self.decoder
-                        .decompress_scattered(&input, reservation.as_mut_slices())?;
+                    let written = match page.codec {
+                        CompressionCodec::SNAPPY => self
+                            .snappy_decoder
+                            .decompress_scattered(&input, reservation.as_mut_slices())?,
+                        CompressionCodec::LZ4_RAW => lz4_flex::block::decompress_scattered(
+                            &input,
+                            &mut reservation.as_mut_slices(),
+                        )?,
+                        CompressionCodec::ZSTD => decompress_zstd_scattered(
+                            &mut self.zstd_decoder,
+                            &input,
+                            &mut reservation.as_mut_slices(),
+                        )?,
+                        // UNCOMPRESSED took the zero-copy passthrough above.
+                        other => return Err(Error::UnsupportedCodec(other)),
+                    };
+                    // The reservation's capacity says nothing about the true
+                    // page length (a disabled cache hands out whole pooled
+                    // slots), so verify the decoded byte count against the
+                    // footer's recorded size.
+                    if written != uncompressed_size {
+                        return Err(Error::DecompressedLength {
+                            written,
+                            expected: uncompressed_size,
+                        });
+                    }
                     memory_ctx().decompressed_cache().insert(
                         key,
                         serialize_header(&page.header),
@@ -131,6 +183,66 @@ impl Decompressor {
     }
 }
 
+/// Decompress one zstd frame (a page body) from `inputs` into `outputs`,
+/// returning the total bytes written.
+///
+/// Unlike snappy and LZ4, scattered buffers need no dedicated decoder here:
+/// libzstd's streaming API accepts arbitrary (input, output) buffer pairs and
+/// keeps its back-reference window internally, so this is just the plumbing
+/// that walks both buffer lists and feeds the stream.
+fn decompress_zstd_scattered(
+    decoder: &mut DCtx<'static>,
+    inputs: &[&[u8]],
+    outputs: &mut [&mut [u8]],
+) -> Result<usize> {
+    // A fresh session per page: the context may hold the tail of a previous
+    // page that errored partway.
+    decoder
+        .reset(ResetDirective::SessionOnly)
+        .map_err(|code| Error::Zstd(get_error_name(code)))?;
+    let mut fragments = inputs.iter().copied();
+    let mut fragment = fragments.next().unwrap_or(&[]);
+    let mut in_buffer = InBuffer::around(fragment);
+    let mut written = 0;
+    let mut frame_done = false;
+    for out_slice in outputs.iter_mut() {
+        if frame_done {
+            break;
+        }
+        let mut out_buffer = OutBuffer::around(&mut **out_slice);
+        // Fill this output slice, moving to the next input fragment whenever
+        // the current one is drained. The stream reports the frame complete
+        // and fully flushed by returning zero; stopping on exhausted input
+        // instead would drop bytes libzstd still buffers internally, and the
+        // slices' total capacity cannot serve as the end either (a disabled
+        // decompressed cache hands out whole pooled slots, larger than the
+        // page).
+        while out_buffer.pos() < out_buffer.capacity() {
+            if in_buffer.pos() == fragment.len()
+                && let Some(next) = fragments.next()
+            {
+                fragment = next;
+                in_buffer = InBuffer::around(fragment);
+            }
+            let before = (in_buffer.pos(), out_buffer.pos());
+            let remaining = decoder
+                .decompress_stream(&mut out_buffer, &mut in_buffer)
+                .map_err(|code| Error::Zstd(get_error_name(code)))?;
+            if remaining == 0 {
+                frame_done = true;
+                break;
+            }
+            if (in_buffer.pos(), out_buffer.pos()) == before {
+                // Mid-frame with output space free, yet nothing was consumed
+                // or produced: the input ran dry, i.e. a truncated page.
+                return Err(Error::Zstd("truncated frame"));
+            }
+        }
+        written += out_buffer.pos();
+    }
+    Ok(written)
+}
+
 /// Serialize a page's header back to Thrift compact bytes, to store alongside its
 /// decompressed bytes in the cache (opaque to the cache itself - see
 /// `requests::parse_page_header`, which reverses this on a hit). Cheap: a few dozen
@@ -164,7 +276,7 @@ impl Unary<CompressedPage, DecompressedPage> for Decompressor {
             return Ok(());
         }
 
-        // Skip snappy for a data page whose rows are all filtered out by a filter
+        // Skip decompression for a data page whose rows are all filtered out by a filter
         // mask: the decoder still needs the page slot for accounting, so emit a
         // SkippedData marker instead of paying decompression.
         let skip = page.header.data_page_header.is_some()
@@ -192,7 +304,7 @@ impl Unary<CompressedPage, DecompressedPage> for Decompressor {
 mod tests {
     use super::*;
     use crate::test_utils::dummy_metadata;
-    use crate::thrift::general::Encoding;
+    use crate::thrift::general::{CompressionCodec, Encoding};
     use crate::thrift::headers::{DataPageHeader, DictionaryPageHeader, PageHeader};
     use crate::types::filter_mask::FilterMask;
     use dispatch::memory::init_test_free_pool;
@@ -210,6 +322,7 @@ mod tests {
         let compressed = Encoder::new().compress_vec(data).unwrap();
         CompressedPage {
             worker_id: 0,
+            codec: CompressionCodec::SNAPPY,
             row_group: dummy_metadata(None),
             column_idx: 0,
             file_offset: 0,
@@ -237,10 +350,43 @@ mod tests {
         }
     }
 
+    /// LZ4-compress `data` and return a CompressedPage tagged LZ4_RAW, its
+    /// compressed bytes split across `fragments` buffers.
+    fn lz4_compressed_data_page(data: &[u8], num_values: i32, fragments: usize) -> CompressedPage {
+        let mut page = compressed_data_page(data, num_values, None);
+        let compressed = lz4_flex::block::compress(data);
+        page.codec = CompressionCodec::LZ4_RAW;
+        page.span = compressed.len();
+        page.header.compressed_page_size = compressed.len() as i32;
+        let chunk = compressed.len().div_ceil(fragments);
+        page.data = compressed
+            .chunks(chunk)
+            .map(|c| Bytes::from(c.to_vec()))
+            .collect();
+        page
+    }
+
+    /// Zstd-compress `data` and return a CompressedPage tagged ZSTD, its
+    /// compressed bytes split across `fragments` buffers.
+    fn zstd_compressed_data_page(data: &[u8], num_values: i32, fragments: usize) -> CompressedPage {
+        let mut page = compressed_data_page(data, num_values, None);
+        let compressed = zstd::bulk::compress(data, zstd::DEFAULT_COMPRESSION_LEVEL).unwrap();
+        page.codec = CompressionCodec::ZSTD;
+        page.span = compressed.len();
+        page.header.compressed_page_size = compressed.len() as i32;
+        let chunk = compressed.len().div_ceil(fragments);
+        page.data = compressed
+            .chunks(chunk)
+            .map(|c| Bytes::from(c.to_vec()))
+            .collect();
+        page
+    }
+
     fn compressed_dict_page(data: &[u8], num_values: i32) -> CompressedPage {
         let compressed = Encoder::new().compress_vec(data).unwrap();
         CompressedPage {
             worker_id: 0,
+            codec: CompressionCodec::SNAPPY,
             row_group: dummy_metadata(None),
             column_idx: 0,
             file_offset: 0,
@@ -348,6 +494,185 @@ mod tests {
         assert_eq!(header.num_values, 50);
         let decompressed: Vec<u8> = data.iter().flat_map(|b| b.to_vec()).collect();
         assert_eq!(decompressed, payload);
+    }
+
+    /// An LZ4_RAW data page decompresses to the original bytes.
+    #[test]
+    fn test_lz4_data_page_decompression() {
+        init_test_free_pool(4);
+        let payload: Vec<u8> = b"pivot".repeat(60);
+        let page = lz4_compressed_data_page(&payload, 100, 1);
+
+        let out = run_unary(Decompressor::default(), vec![page]);
+
+        let DecompressedPageType::Data(data_page) = &out[0].data else {
+            panic!("expected Data");
+        };
+        let decompressed: Vec<u8> = data_page.data.iter().flat_map(|b| b.to_vec()).collect();
+        assert_eq!(decompressed, payload);
+    }
+
+    /// An LZ4_RAW page whose compressed bytes are split across several input
+    /// buffers still decompresses correctly.
+    #[test]
+    fn test_lz4_scattered_input_page() {
+        init_test_free_pool(4);
+        let payload: Vec<u8> = (0..1024u32).flat_map(|v| v.to_le_bytes()).collect();
+        let page = lz4_compressed_data_page(&payload, 100, 5);
+
+        let out = run_unary(Decompressor::default(), vec![page]);
+
+        let DecompressedPageType::Data(data_page) = &out[0].data else {
+            panic!("expected Data");
+        };
+        let decompressed: Vec<u8> = data_page.data.iter().flat_map(|b| b.to_vec()).collect();
+        assert_eq!(decompressed, payload);
+    }
+
+    /// A ZSTD data page decompresses to the original bytes.
+    #[test]
+    fn test_zstd_data_page_decompression() {
+        init_test_free_pool(4);
+        let payload: Vec<u8> = b"pivot".repeat(60);
+        let page = zstd_compressed_data_page(&payload, 100, 1);
+
+        let out = run_unary(Decompressor::default(), vec![page]);
+
+        let DecompressedPageType::Data(data_page) = &out[0].data else {
+            panic!("expected Data");
+        };
+        let decompressed: Vec<u8> = data_page.data.iter().flat_map(|b| b.to_vec()).collect();
+        assert_eq!(decompressed, payload);
+    }
+
+    /// A ZSTD page whose compressed bytes are split across several input
+    /// buffers still decompresses correctly.
+    #[test]
+    fn test_zstd_scattered_input_page() {
+        init_test_free_pool(4);
+        let payload: Vec<u8> = (0..1024u32).flat_map(|v| v.to_le_bytes()).collect();
+        let page = zstd_compressed_data_page(&payload, 100, 5);
+
+        let out = run_unary(Decompressor::default(), vec![page]);
+
+        let DecompressedPageType::Data(data_page) = &out[0].data else {
+            panic!("expected Data");
+        };
+        let decompressed: Vec<u8> = data_page.data.iter().flat_map(|b| b.to_vec()).collect();
+        assert_eq!(decompressed, payload);
+    }
+
+    /// A ZSTD page larger than one ring buffer decompresses across several
+    /// output buffers, exercising the stream's walk over output slices (and
+    /// libzstd's internal flushing at each slice edge).
+    #[test]
+    fn test_zstd_page_spanning_output_buffers() {
+        init_test_free_pool(4);
+        let three_mib_of_u16s = 3 * 1024 * 1024 / 2;
+        let payload: Vec<u8> = (0..three_mib_of_u16s)
+            .flat_map(|v| ((v % 8093) as u16).to_le_bytes())
+            .collect();
+        let page = zstd_compressed_data_page(&payload, 100, 3);
+
+        let out = run_unary(Decompressor::default(), vec![page]);
+
+        let DecompressedPageType::Data(data_page) = &out[0].data else {
+            panic!("expected Data");
+        };
+        assert!(data_page.data.len() > 1, "payload must span ring buffers");
+        let decompressed: Vec<u8> = data_page.data.iter().flat_map(|b| b.to_vec()).collect();
+        assert_eq!(decompressed, payload);
+    }
+
+    /// A ZSTD page whose compressed bytes were cut short errors instead of
+    /// hanging or passing truncated output downstream.
+    #[test]
+    fn test_zstd_truncated_page_errors() {
+        init_test_free_pool(4);
+        let payload = vec![0x5Au8; 4096];
+        let mut page = zstd_compressed_data_page(&payload, 100, 1);
+        let cut: Vec<u8> = page.data[0][..page.data[0].len() / 2].to_vec();
+        page.data = vec![Bytes::from(cut)];
+
+        let mut sender = CollectSender::new();
+        let result = Decompressor::default().consume(
+            page,
+            &mut sender,
+            &mut dispatch::TestOperatorIO::default().io(),
+        );
+
+        assert!(result.is_err());
+    }
+
+    /// An UNCOMPRESSED page's bytes pass through zero-copy: the very same
+    /// backing buffers come out, with no decompression or cache involvement.
+    #[test]
+    fn test_uncompressed_page_zero_copy_passthrough() {
+        let payload: Vec<u8> = (0..512u32).flat_map(|v| v.to_le_bytes()).collect();
+        let mut page = compressed_data_page(&payload, 100, None);
+        page.codec = CompressionCodec::UNCOMPRESSED;
+        page.span = payload.len();
+        page.header.compressed_page_size = payload.len() as i32;
+        page.data = payload
+            .chunks(300)
+            .map(|c| Bytes::from(c.to_vec()))
+            .collect();
+        let input_ptrs: Vec<*const u8> = page.data.iter().map(|b| b.as_ptr()).collect();
+
+        let out = run_unary(Decompressor::default(), vec![page]);
+
+        let DecompressedPageType::Data(data_page) = &out[0].data else {
+            panic!("expected Data");
+        };
+        let bytes: Vec<u8> = data_page.data.iter().flat_map(|b| b.to_vec()).collect();
+        assert_eq!(bytes, payload);
+        let out_ptrs: Vec<*const u8> = data_page.data.iter().map(|b| b.as_ptr()).collect();
+        assert_eq!(out_ptrs, input_ptrs, "must forward the same buffers");
+    }
+
+    /// An UNCOMPRESSED page whose body size contradicts the footer's recorded
+    /// uncompressed size is rejected.
+    #[test]
+    fn test_uncompressed_page_length_mismatch_errors() {
+        let mut page = compressed_data_page(&[1u8, 2, 3, 4], 4, None);
+        page.codec = CompressionCodec::UNCOMPRESSED;
+        page.data = vec![Bytes::from(vec![1u8, 2, 3])];
+
+        let mut sender = CollectSender::new();
+        let result = Decompressor::default().consume(
+            page,
+            &mut sender,
+            &mut dispatch::TestOperatorIO::default().io(),
+        );
+
+        assert!(result.is_err());
+    }
+
+    /// Snappy, LZ4_RAW and ZSTD pages interleave through one decompressor
+    /// instance.
+    #[test]
+    fn test_mixed_codec_pages() {
+        init_test_free_pool(8);
+        let snappy_payload = vec![0xABu8; 256];
+        let lz4_payload = vec![0xCDu8; 256];
+        let zstd_payload = vec![0xEFu8; 256];
+        let pages = vec![
+            compressed_data_page(&snappy_payload, 10, None),
+            lz4_compressed_data_page(&lz4_payload, 10, 1),
+            zstd_compressed_data_page(&zstd_payload, 10, 1),
+        ];
+
+        let out = run_unary(Decompressor::default(), pages);
+
+        let bytes = |idx: usize| -> Vec<u8> {
+            let DecompressedPageType::Data(d) = &out[idx].data else {
+                panic!("expected Data");
+            };
+            d.data.iter().flat_map(|b| b.to_vec()).collect()
+        };
+        assert_eq!(bytes(0), snappy_payload);
+        assert_eq!(bytes(1), lz4_payload);
+        assert_eq!(bytes(2), zstd_payload);
     }
 
     /// Non-all-false filter mask → page is decompressed and filter mask is forwarded.
@@ -530,6 +855,7 @@ mod tests {
         let compressed = Encoder::new().compress_vec(&[0u8; 16]).unwrap();
         let page = CompressedPage {
             worker_id: 0,
+            codec: CompressionCodec::SNAPPY,
             row_group: dummy_metadata(None),
             column_idx: 0,
             file_offset: 0,

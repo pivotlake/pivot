@@ -10,7 +10,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Fields, Schema};
 use parquet::arrow::ArrowWriter;
-use parquet::basic::Compression;
+use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use tempfile::TempDir;
 
@@ -66,6 +66,128 @@ fn limit_can_abandon_parquet_reads() {
         results.iter().map(|batch| batch.num_rows()).sum::<usize>(),
         10
     );
+}
+
+#[test]
+fn scan_lz4_raw_file() {
+    let dispatch = dispatch(1);
+    let names: Vec<String> = (0..20_000).map(|i| format!("name-{}", i % 97)).collect();
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let values: Vec<i64> = (0..20_000).collect();
+    let (_dir, table) = parquet_table_compressed(
+        &dispatch,
+        &[strings_and_ints(&name_refs, &values)],
+        false,
+        Compression::LZ4_RAW,
+    );
+
+    let results = table_input(&dispatch, &table, Projection::all(2), false)
+        .collect()
+        .unwrap();
+
+    let mut got = collect_i64s(&results, 1);
+    got.sort();
+    assert_eq!(got, values);
+    assert!(collect_strings(&results, 0).contains(&"name-42".to_string()));
+}
+
+#[test]
+fn scan_lz4_raw_dictionary_file() {
+    let dispatch = dispatch(1);
+    let (_dir, table) = parquet_table_compressed(
+        &dispatch,
+        &[strings_and_ints(&["a", "b", "a", "c"], &[1, 2, 3, 4])],
+        true,
+        Compression::LZ4_RAW,
+    );
+
+    let results = table_input(&dispatch, &table, Projection::all(2), false)
+        .collect()
+        .unwrap();
+
+    let mut got = collect_strings(&results, 0);
+    got.sort();
+    assert_eq!(got, vec!["a", "a", "b", "c"]);
+}
+
+#[test]
+fn scan_zstd_file() {
+    let dispatch = dispatch(1);
+    let names: Vec<String> = (0..20_000).map(|i| format!("name-{}", i % 97)).collect();
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let values: Vec<i64> = (0..20_000).collect();
+    let (_dir, table) = parquet_table_compressed(
+        &dispatch,
+        &[strings_and_ints(&name_refs, &values)],
+        false,
+        Compression::ZSTD(ZstdLevel::default()),
+    );
+
+    let results = table_input(&dispatch, &table, Projection::all(2), false)
+        .collect()
+        .unwrap();
+
+    let mut got = collect_i64s(&results, 1);
+    got.sort();
+    assert_eq!(got, values);
+    assert!(collect_strings(&results, 0).contains(&"name-42".to_string()));
+}
+
+#[test]
+fn scan_zstd_dictionary_file() {
+    let dispatch = dispatch(1);
+    let (_dir, table) = parquet_table_compressed(
+        &dispatch,
+        &[strings_and_ints(&["a", "b", "a", "c"], &[1, 2, 3, 4])],
+        true,
+        Compression::ZSTD(ZstdLevel::default()),
+    );
+
+    let results = table_input(&dispatch, &table, Projection::all(2), false)
+        .collect()
+        .unwrap();
+
+    let mut got = collect_strings(&results, 0);
+    got.sort();
+    assert_eq!(got, vec!["a", "a", "b", "c"]);
+}
+
+#[test]
+fn scan_uncompressed_file() {
+    let dispatch = dispatch(1);
+    let (_dir, table) = parquet_table_compressed(
+        &dispatch,
+        &[strings_and_ints(&["a", "b", "c"], &[1, 2, 3])],
+        false,
+        Compression::UNCOMPRESSED,
+    );
+
+    let results = table_input(&dispatch, &table, Projection::all(2), false)
+        .collect()
+        .unwrap();
+
+    let mut got = collect_i64s(&results, 1);
+    got.sort();
+    assert_eq!(got, vec![1, 2, 3]);
+}
+
+/// The deprecated Hadoop-framed LZ4 codec opens fine (so pruning and
+/// projection can still skip its chunks) and is rejected only when one of its
+/// pages is actually scanned.
+#[test]
+fn scan_legacy_lz4_file_fails() {
+    let dispatch = dispatch(1);
+    let (_dir, table) = parquet_table_compressed(
+        &dispatch,
+        &[strings_and_ints(&["a"], &[1])],
+        false,
+        Compression::LZ4,
+    );
+
+    let result = table_input(&dispatch, &table, Projection::all(2), false).collect();
+
+    let err = result.expect_err("legacy LZ4 pages must fail to decompress");
+    assert!(err.to_string().contains("unsupported compression"));
 }
 
 #[test]

@@ -14,6 +14,7 @@
 //! Each page optionally carries a [`FilterMask`] so decoders can skip rows
 //! that were filtered out upstream.
 
+use crate::thrift::general::CompressionCodec;
 use crate::thrift::headers::{DataPageHeader, DictionaryPageHeader, PageHeader};
 use crate::types::filter_mask::FilterMask;
 use crate::types::metadata::QueryRowGroupMetadata;
@@ -24,11 +25,14 @@ use std::fmt::{Debug, Formatter};
 /// A page read from disk whose payload is still compressed.
 ///
 /// Produced by the IO reader and consumed by the decompressor. Carries the
-/// full Thrift [`PageHeader`] so the decompressor knows the codec, compressed
-/// size, and uncompressed size.
+/// full Thrift [`PageHeader`] (compressed and uncompressed sizes, encoding
+/// info) plus the column chunk's compression codec.
 pub struct CompressedPage {
     /// Worker that owns this page (for routing back through the pipeline).
     pub worker_id: usize,
+    /// Compression codec of the page body, from the column chunk's footer
+    /// metadata (page headers don't carry it).
+    pub codec: CompressionCodec,
     /// Row-group-level query metadata (includes filtered indices).
     pub row_group: QueryRowGroupMetadata,
     /// Column index within the *projected* set (the position in

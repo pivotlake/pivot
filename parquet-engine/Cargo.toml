@@ -25,6 +25,11 @@ bytes = { workspace = true }
 crossbeam-deque = { workspace = true }
 ahash = { workspace = true }
 snap = { workspace = true }
+# LZ4_RAW page decompression (the Epsio fork with scattered decode).
+lz4_flex = { workspace = true }
+# ZSTD page compression and decompression; the streaming decoder handles
+# scattered buffers natively, so the stock crate suffices.
+zstd = { workspace = true }
 
 [dev-dependencies]
 dispatch = { workspace = true, features = ["test-util"] }
