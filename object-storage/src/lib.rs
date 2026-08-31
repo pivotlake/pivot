@@ -231,7 +231,18 @@ pub trait ObjectStore: Debug + Send + Sync {
 
     /// List one level under `prefix`: direct objects and immediate child
     /// prefixes, all named relative to `prefix`.
-    fn list(&self, prefix: &ObjectPath) -> Result<DirectoryListing>;
+    fn list(&self, prefix: &ObjectPath) -> Result<DirectoryListing> {
+        self.list_with_name_prefix(prefix, "")
+    }
+
+    /// [`list`](Self::list), narrowed to children whose own name starts with
+    /// `name_prefix`. A remote backend pushes the narrowing into the request,
+    /// so a narrow listing does not page through the whole directory.
+    fn list_with_name_prefix(
+        &self,
+        prefix: &ObjectPath,
+        name_prefix: &str,
+    ) -> Result<DirectoryListing>;
 
     /// How the io_uring reader should fetch object `key`: a local backend yields
     /// a filesystem path, a remote one a GET URL — either presigned or paired

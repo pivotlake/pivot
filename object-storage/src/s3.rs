@@ -249,12 +249,20 @@ impl ObjectStore for S3Store {
         }
     }
 
-    fn list(&self, prefix: &ObjectPath) -> Result<DirectoryListing> {
+    fn list_with_name_prefix(
+        &self,
+        prefix: &ObjectPath,
+        name_prefix: &str,
+    ) -> Result<DirectoryListing> {
         let object_prefix = object_key(&self.prefix, prefix);
         let encoded_prefix = if object_prefix.is_empty() {
-            String::new()
+            percent_encode(name_prefix)
         } else {
-            format!("{}%2F", percent_encode(&object_prefix))
+            format!(
+                "{}%2F{}",
+                percent_encode(&object_prefix),
+                percent_encode(name_prefix)
+            )
         };
         let mut continuation: Option<String> = None;
         let mut objects = Vec::new();

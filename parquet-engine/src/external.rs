@@ -308,7 +308,10 @@ impl ParquetLocationPattern {
             }
             let mut matched = Vec::new();
             for directory in directories {
-                for prefix in store.list(&directory)?.prefixes {
+                for prefix in store
+                    .list_with_name_prefix(&directory, literal_prefix(segment))?
+                    .prefixes
+                {
                     if wildcard_segment_matches(segment, prefix.as_str()) {
                         matched.push(directory.join(prefix.as_str()));
                     }
@@ -319,7 +322,10 @@ impl ParquetLocationPattern {
 
         let mut files = Vec::new();
         for directory in directories {
-            for object in store.list(&directory)?.objects {
+            for object in store
+                .list_with_name_prefix(&directory, literal_prefix(filename_pattern))?
+                .objects
+            {
                 if !wildcard_segment_matches(filename_pattern, object.file.path.as_str()) {
                     continue;
                 }
@@ -411,6 +417,13 @@ fn columns_from_schema(schema: &arrow_schema::Schema) -> Result<Vec<Column>, Err
         .collect()
 }
 
+/// The literal head of a segment pattern, up to its first `*`. Listing with
+/// this as the name prefix lets the store narrow the listing server-side; a
+/// literal segment (no `*`) narrows it to exactly the named child.
+fn literal_prefix(pattern: &str) -> &str {
+    &pattern[..pattern.find('*').unwrap_or(pattern.len())]
+}
+
 /// Match one path segment. `*` consumes any number of bytes; every other
 /// byte is literal. UTF-8 remains safe because successful literal comparisons
 /// advance both strings over the same encoded bytes.
@@ -468,6 +481,13 @@ mod tests {
             assert_eq!(pattern.store_root, store_root);
             assert_eq!(pattern.path_pattern, path_pattern);
         }
+    }
+
+    #[test]
+    fn literal_prefix_stops_at_the_first_star() {
+        assert_eq!(literal_prefix("part-*.parquet"), "part-");
+        assert_eq!(literal_prefix("*.parquet"), "");
+        assert_eq!(literal_prefix("data.parquet"), "data.parquet");
     }
 
     #[test]

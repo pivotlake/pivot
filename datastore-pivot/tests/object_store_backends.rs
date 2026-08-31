@@ -308,6 +308,37 @@ mod bodies {
         assert_eq!(names, vec!["x.bin".to_string()]);
         assert_eq!(prefixes, vec!["sub".to_string()]);
     }
+
+    /// A name prefix narrows a listing to children whose own name starts with
+    /// it, for direct objects and child prefixes alike.
+    pub fn list_narrows_to_a_name_prefix(b: &Backend) {
+        b.store.put(&ObjectPath::new("n/part-1.bin"), b"a").unwrap();
+        b.store.put(&ObjectPath::new("n/other.bin"), b"b").unwrap();
+        b.store
+            .put(&ObjectPath::new("n/part-sub/x.bin"), b"c")
+            .unwrap();
+        b.store
+            .put(&ObjectPath::new("n/misc-sub/y.bin"), b"d")
+            .unwrap();
+
+        let listing = b
+            .store
+            .list_with_name_prefix(&ObjectPath::new("n"), "part-")
+            .unwrap();
+
+        let names: Vec<String> = listing
+            .objects
+            .into_iter()
+            .map(|o| o.file.path.as_str().to_string())
+            .collect();
+        let prefixes: Vec<String> = listing
+            .prefixes
+            .into_iter()
+            .map(|prefix| prefix.to_string())
+            .collect();
+        assert_eq!(names, vec!["part-1.bin".to_string()]);
+        assert_eq!(prefixes, vec!["part-sub".to_string()]);
+    }
 }
 
 // --- backend matrix --------------------------------------------------------
@@ -348,3 +379,4 @@ backend_tests!(source_reads_object_back);
 backend_tests!(sink_writes_object_back);
 backend_tests!(update_never_loses_a_write);
 backend_tests!(list_returns_objects_and_child_prefixes);
+backend_tests!(list_narrows_to_a_name_prefix);
