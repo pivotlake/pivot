@@ -403,6 +403,7 @@ fn build_schema_elements(schema: &SchemaRef) -> WriteResult<Vec<SchemaElement>> 
         converted_type: None,
         scale: None,
         precision: None,
+        field_id: None,
         logical_type: None,
     }];
     for field in schema.fields() {
@@ -431,6 +432,7 @@ fn push_schema_element(field: &FieldRef, elements: &mut Vec<SchemaElement>) -> W
                 converted_type: None,
                 scale: None,
                 precision: None,
+                field_id: parquet_field_id(field),
                 // The VARIANT annotation is the whole difference between a
                 // variant column and a plain struct of binary leaves: it is what
                 // a reader keys off to treat the group as semi-structured.
@@ -454,11 +456,19 @@ fn push_schema_element(field: &FieldRef, elements: &mut Vec<SchemaElement>) -> W
                 converted_type: annotation.converted_type,
                 scale: annotation.scale,
                 precision: annotation.precision,
+                field_id: parquet_field_id(field),
                 logical_type: annotation.logical_type,
             })
         }
     }
     Ok(())
+}
+
+fn parquet_field_id(field: &FieldRef) -> Option<i32> {
+    field
+        .metadata()
+        .get(crate::types::table::PARQUET_FIELD_ID_META_KEY)
+        .and_then(|field_id| field_id.parse().ok())
 }
 
 /// Write the trailing footer: `[FileMetaData][u32 LE footer length][PAR1]`. It

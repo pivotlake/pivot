@@ -53,6 +53,9 @@ pub use operator::{
 
 mod cached_http;
 
+mod dispatch_reader;
+pub use dispatch_reader::DispatchReader;
+
 pub mod disk_cache;
 pub use disk_cache::{DiskCache, clear_disk_cache};
 
@@ -108,8 +111,8 @@ impl AsRawFd for LocalFile {
 /// cache's pin re-check runs on every hit. `Local` compares the raw fd (an
 /// `i32`; stable while the `LocalFile` is held, and holding it in the key means
 /// a cached file's fd can never be closed and reused under the cache); `Remote`
-/// carries an [`Arc<RemoteFile>`] whose `Hash`/`Eq` delegate to a single
-/// interned id (never the URL string).
+/// carries an [`Arc<RemoteFile>`] whose `Hash`/`Eq` delegate to a compact id
+/// (never the URL string on the cache hot path).
 #[derive(Clone)]
 pub enum OpenFile {
     Local(LocalFile),
@@ -120,7 +123,7 @@ impl PartialEq for OpenFile {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (OpenFile::Local(a), OpenFile::Local(b)) => a.as_raw_fd() == b.as_raw_fd(),
-            // RemoteFile's Eq compares the interned id, not the URL.
+            // RemoteFile's Eq compares its compact id, not the URL.
             (OpenFile::Remote(a), OpenFile::Remote(b)) => a == b,
             _ => false,
         }
@@ -167,15 +170,17 @@ pub type AuthHeader = Arc<dyn Fn() -> Option<Arc<str>> + Send + Sync>;
 /// A remote HTTP(S) object, resolved once and reused for every range request
 /// against it.
 ///
-/// `Hash`/`Eq` delegate solely to the interned `id`, so using a `RemoteFile` as
-/// (part of) a cache key is as cheap as comparing a `u32` — the host/addr are
-/// only read by the HTTP transport when actually issuing a request.
+/// `Hash`/`Eq` delegate solely to the compact `id`: a `u32` for an ordinary
+/// handle or a 128-bit digest for a deliberately immutable object. The
+/// host/address are only read by the HTTP transport when issuing a request.
 ///
 /// The fields are pre-parsed from the URL at [`open`](Self::open) so the request
 /// hot path never re-parses it; the `Url` itself isn't kept.
 pub struct RemoteFile {
-    /// Process-unique id; the only thing `Hash`/`Eq` look at.
-    id: u32,
+    /// Cheap identity used by the in-memory cache. Ordinary files receive a
+    /// process-unique id; immutable objects use a stable content-addressed id so
+    /// reopening the same object with refreshed transport credentials still hits.
+    id: RemoteFileId,
     /// `IP:port`, resolved once at construction (the port lives here too).
     addr: SocketAddr,
     /// Bare hostname for TLS SNI — `addr` only carries the IP, and SNI must not
@@ -216,6 +221,22 @@ impl RemoteFile {
     /// length (from the store listing), carried so the disk cache can size its
     /// bitmap exactly.
     pub fn open(url: Url, auth: Option<AuthHeader>, size: u64) -> std::io::Result<Self> {
+        Self::open_inner(url, auth, size, false)
+    }
+
+    /// Open an immutable remote object. Unlike [`open`](Self::open), equivalent
+    /// authority/path/size tuples share an in-memory cache identity even when the
+    /// URL query (for example an S3 presign) or bearer-token supplier changes.
+    pub fn open_immutable(url: Url, auth: Option<AuthHeader>, size: u64) -> std::io::Result<Self> {
+        Self::open_inner(url, auth, size, true)
+    }
+
+    fn open_inner(
+        url: Url,
+        auth: Option<AuthHeader>,
+        size: u64,
+        immutable: bool,
+    ) -> std::io::Result<Self> {
         let host = url
             .host_str()
             .ok_or_else(|| {
@@ -265,8 +286,20 @@ impl RemoteFile {
         // collide onto one cache file.
         let cache_identity = format!("{host_header}\0{path}");
 
+        let id = if immutable {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&[u8::from(is_https)]);
+            hasher.update(cache_identity.as_bytes());
+            hasher.update(&size.to_le_bytes());
+            let mut digest = [0; 16];
+            digest.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+            RemoteFileId::Immutable(digest)
+        } else {
+            RemoteFileId::Ephemeral(NEXT_REMOTE_FILE_ID.fetch_add(1, Ordering::Relaxed))
+        };
+
         Ok(Self {
-            id: NEXT_REMOTE_FILE_ID.fetch_add(1, Ordering::Relaxed),
+            id,
             addr,
             host,
             host_header,
@@ -293,6 +326,11 @@ impl RemoteFile {
     /// See [`cache_identity`](Self::cache_identity) field docs.
     pub fn cache_identity(&self) -> &str {
         &self.cache_identity
+    }
+
+    /// Whether reopening this object preserves its in-memory cache identity.
+    pub fn is_immutable(&self) -> bool {
+        matches!(self.id, RemoteFileId::Immutable(_))
     }
 
     pub fn host(&self) -> &str {
@@ -343,6 +381,12 @@ impl Hash for RemoteFile {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.id.hash(state);
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum RemoteFileId {
+    Ephemeral(u32),
+    Immutable([u8; 16]),
 }
 
 /// A filesystem read: read `block` from `file` into its pinned cache slot.
@@ -576,5 +620,44 @@ pub fn open_direct_read(path: &Path) -> std::io::Result<LocalFile> {
     {
         let file = OpenOptions::new().read(true).open(path)?;
         return LocalFile::new(file);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn immutable_remote_identity_ignores_refreshed_query_credentials() {
+        let first = RemoteFile::open_immutable(
+            Url::parse("http://127.0.0.1:8080/bucket/manifest.avro?signature=first").unwrap(),
+            None,
+            42,
+        )
+        .unwrap();
+        let second = RemoteFile::open_immutable(
+            Url::parse("http://127.0.0.1:8080/bucket/manifest.avro?signature=second").unwrap(),
+            None,
+            42,
+        )
+        .unwrap();
+        let different_size = RemoteFile::open_immutable(
+            Url::parse("http://127.0.0.1:8080/bucket/manifest.avro?signature=third").unwrap(),
+            None,
+            43,
+        )
+        .unwrap();
+
+        assert!(first == second);
+        assert!(first != different_size);
+    }
+
+    #[test]
+    fn ordinary_remote_handles_remain_distinct() {
+        let url = Url::parse("http://127.0.0.1:8080/bucket/mutable.json").unwrap();
+        let first = RemoteFile::open(url.clone(), None, 42).unwrap();
+        let second = RemoteFile::open(url, None, 42).unwrap();
+
+        assert!(first != second);
     }
 }

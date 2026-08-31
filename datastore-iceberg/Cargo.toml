@@ -1,0 +1,28 @@
+[package]
+name = "datastore-iceberg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Read-only Apache Iceberg datastore for PivotDB."
+
+[dependencies]
+catalog = { workspace = true }
+dispatch = { workspace = true }
+iceberg = { workspace = true }
+iceberg-catalog-rest = { workspace = true }
+object-storage = { workspace = true }
+parquet-engine = { workspace = true }
+planner = { workspace = true }
+
+async-trait = "0.1"
+bytes = { workspace = true }
+futures = "0.3"
+serde = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+typetag = "0.2"
+url = { workspace = true }
+
+[dev-dependencies]
+mockito = "1"
+serde_json = { workspace = true }

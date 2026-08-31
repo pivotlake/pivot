@@ -38,7 +38,7 @@ metastore:
   # Exactly one datastore must set `default: true`. It is the current database, so
   # unqualified names such as `main.events` resolve against it.
   datastores:
-    # `kind` selects the datastore implementation (only `pivot` today). The storage backend is
+    # `kind` selects the datastore implementation. The Pivot storage backend is
     # inferred from `location`: a local path here, an S3 URI for `warm` below.
     default:
       kind: pivot
@@ -61,6 +61,18 @@ metastore:
     cold:
       kind: pivot
       location: gs://example-bucket/cold/
+
+    # Read-only Iceberg uses a REST catalog. Its one-level namespaces become
+    # Pivot schemas. The catalog is checked on every query; unchanged Apache
+    # tables and immutable object bytes remain reusable in capacity caches.
+    # `auth.method` may also be `none` or `oauth2_client_credentials`.
+    lakehouse:
+      kind: iceberg
+      location: https://catalog.example.com
+      warehouse: analytics
+      auth:
+        method: bearer
+        token: replace-me
 
   # The credentials a remote location is opened with, kept apart from the
   # datastores so a bucket's keys are written once however many datastores sit

@@ -171,6 +171,17 @@ impl GcsStore {
         )
     }
 
+    /// JSON API object metadata URL. Unlike `media_url`, this returns the small
+    /// metadata document containing `size` rather than the object's bytes.
+    fn metadata_url(&self, key: &ObjectPath) -> String {
+        format!(
+            "{}/storage/v1/b/{}/o/{}",
+            self.endpoint,
+            self.bucket,
+            self.object_segment(key)
+        )
+    }
+
     /// The XML API object URL an upload PUTs. Each key component is escaped
     /// separately so the key's `/`s stay path separators.
     fn upload_url(&self, key: &ObjectPath) -> String {
@@ -357,6 +368,31 @@ impl ObjectStore for GcsStore {
 
     fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>> {
         Ok(self.fetch(key)?.map(|(bytes, _)| bytes))
+    }
+
+    fn file_size(&self, key: &ObjectPath) -> Result<Option<u64>> {
+        let header = self.auth.header()?;
+        match self
+            .auth
+            .agent
+            .get(&self.metadata_url(key))
+            .set("Authorization", &header)
+            .call()
+        {
+            Ok(response) => {
+                let metadata: ObjectMetadata = response.into_json().map_err(|error| {
+                    StoreError::Http(format!("GCS metadata parse for {key}: {error}"))
+                })?;
+                metadata.size.parse::<u64>().map(Some).map_err(|error| {
+                    StoreError::Http(format!(
+                        "GCS metadata for {key}: invalid size `{}`: {error}",
+                        metadata.size
+                    ))
+                })
+            }
+            Err(ureq::Error::Status(404, _)) => Ok(None),
+            Err(error) => Err(StoreError::Http(format!("GCS metadata GET {key}: {error}"))),
+        }
     }
 
     fn put(&self, key: &ObjectPath, data: &[u8]) -> Result<()> {
@@ -639,6 +675,11 @@ struct ListResponse {
     prefixes: Vec<String>,
     #[serde(rename = "nextPageToken")]
     next_page_token: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ObjectMetadata {
+    size: String,
 }
 
 #[derive(serde::Deserialize)]

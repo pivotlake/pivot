@@ -37,15 +37,43 @@ Exactly one datastore must set `default: true`.
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `kind` | Required | Datastore implementation. `pivot` is the only supported value. |
-| `location` | Required | Local path, `s3://` URI, or `gs://` URI. |
+| `kind` | Required | Datastore implementation: `pivot` or read-only `iceberg`. |
+| `location` | Required | Pivot storage location, or the base HTTP(S) URL of an Iceberg REST catalog. |
 | `default` | `false` | Makes this the target of unqualified SQL names. Exactly one must be true. |
-| `compact` | `true` | Runs background compaction. Enable it in only one process per shared datastore. |
-| `compact_bytes` | `64m` | Compaction output target; files strictly below half this size are small-file candidates, and an individual row group may exceed it. |
-| `compact_merge_bytes` | 1.3 times `compact_bytes` | Accumulated small-file bytes that immediately trigger a merge. |
-| `compact_min_files` | `100` | File count at which the small-file balance fallback may merge. |
-| `compact_parallelism` | `1` | Maximum number of disjoint compaction merges rewritten concurrently. Values below one run one merge at a time. Each merge in flight holds its decoded input rows in memory. |
-| `vacuum` | `true` | Deletes expired unreferenced files and old log entries. Enable it in only one process per shared datastore. |
+| `compact` | `true` | Pivot only. Runs background compaction. Enable it in only one process per shared datastore. |
+| `compact_bytes` | `64m` | Pivot only. Compaction output target; files strictly below half this size are small-file candidates, and an individual row group may exceed it. |
+| `compact_merge_bytes` | 1.3 times `compact_bytes` | Pivot only. Accumulated small-file bytes that immediately trigger a merge. |
+| `compact_min_files` | `100` | Pivot only. File count at which the small-file balance fallback may merge. |
+| `compact_parallelism` | `1` | Pivot only. Maximum number of disjoint compaction merges rewritten concurrently. Values below one run one merge at a time. Each merge in flight holds its decoded input rows in memory. |
+| `vacuum` | `true` | Pivot only. Deletes expired unreferenced files and old log entries. Enable it in only one process per shared datastore. |
+
+An Iceberg datastore accepts `warehouse` and an `auth` block. Its `location`
+is the REST catalog URL. The supported auth blocks are:
+
+```yaml
+auth: { method: none }
+auth: { method: bearer, token: "..." }
+auth:
+  method: oauth2_client_credentials
+  client_id: pivot
+  client_secret: "..."
+  scope: catalog                 # optional
+  token_endpoint: https://identity.example/token  # optional
+```
+
+Iceberg v1 reads the current snapshot from Parquet data files in one-level
+namespaces. S3 and GCS are supported. Tables with position or equality delete
+files fail at bind time rather than returning deleted rows. Storage credentials
+vended by the REST catalog take precedence for their location prefix; scoped
+metastore secrets or ambient GCS credentials are the fallback.
+
+On first access to a table in each transaction, Pivot checks the REST table
+endpoint and builds a fresh Apache Iceberg table with that response's storage
+credentials. That version remains fixed within the transaction. Parsed manifests
+are not reused across transactions, even when the metadata location is unchanged.
+Immutable object bytes use Dispatch's capacity-based RAM cache and optional disk
+cache; there is no Iceberg freshness TTL. Queries using Iceberg tables bypass the
+SQL plan cache so bindings and temporary credentials are recreated for each query.
 
 ### `metastore.secrets`
 

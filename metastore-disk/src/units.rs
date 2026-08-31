@@ -134,6 +134,24 @@ impl Serialize for ByteSize {
     }
 }
 
+impl Serialize for Interval {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let milliseconds = self.0.as_millis();
+        for (suffix, unit_milliseconds) in [
+            ("h", 60u128 * 60 * 1000),
+            ("m", 60 * 1000),
+            ("s", 1000),
+            ("ms", 1),
+        ] {
+            if milliseconds.is_multiple_of(unit_milliseconds) {
+                return serializer
+                    .serialize_str(&format!("{}{suffix}", milliseconds / unit_milliseconds));
+            }
+        }
+        unreachable!("milliseconds are always divisible by one millisecond")
+    }
+}
+
 impl<'de> Deserialize<'de> for ByteSize {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         deserializer.deserialize_any(ScalarVisitor {

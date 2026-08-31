@@ -109,6 +109,7 @@ mod tests {
                 size: 0,
             },
             source: DataFileLocation::Local(PathBuf::from(name)),
+            immutable: false,
         }
     }
 

@@ -8,8 +8,10 @@ description = "Disk-backed metastore provider for PivotDB."
 [dependencies]
 catalog = { workspace = true }
 datastore-pivot = { workspace = true }
+datastore-iceberg = { workspace = true }
 object-storage = { workspace = true }
 dispatch = { workspace = true }
+planner = { workspace = true }
 
 serde = { workspace = true }
 thiserror = { workspace = true }

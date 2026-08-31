@@ -313,6 +313,27 @@ impl ObjectStore for S3Store {
         Ok(self.fetch(key)?.map(|(bytes, _)| bytes))
     }
 
+    fn file_size(&self, key: &ObjectPath) -> Result<Option<u64>> {
+        let object = object_key(&self.prefix, key);
+        let url = self.url_for(&object);
+        let signed = self.sign("HEAD", &url, &[], &[])?;
+        let req = Self::apply(self.agent.request("HEAD", &url), &signed);
+        match req.call() {
+            Ok(response) => response
+                .header("content-length")
+                .ok_or_else(|| {
+                    StoreError::Http(format!("HEAD {object}: response has no content-length"))
+                })?
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|error| {
+                    StoreError::Http(format!("HEAD {object}: invalid content-length: {error}"))
+                }),
+            Err(ureq::Error::Status(404, _)) => Ok(None),
+            Err(error) => Err(StoreError::Http(format!("HEAD {object}: {error}"))),
+        }
+    }
+
     fn put(&self, key: &ObjectPath, data: &[u8]) -> Result<()> {
         let object = object_key(&self.prefix, key);
         let url = self.url_for(&object);

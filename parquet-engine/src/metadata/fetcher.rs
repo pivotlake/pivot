@@ -8,12 +8,13 @@
 
 use super::FileRowGroups;
 use crate::types::metadata::RowGroupMetadata;
-use crate::types::table::{Error, FOOTER_PROBE_BYTES, Result, row_groups_from_footer};
+use crate::types::table::{
+    DeclaredColumn, Error, FOOTER_PROBE_BYTES, Result, row_groups_from_footer_with_field_ids,
+};
 use dispatch::io::{FileRange, OpenFile, OperatorIO, ReadRequestId, ReadResponse};
 use dispatch::memory::memory_ctx;
 use dispatch::{Sender, Unary};
 use object_storage::{DataFile, FileRef};
-use planner::catalog::Column;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -36,11 +37,11 @@ pub(super) fn footer_len_from_tail(tail: &[u8]) -> Result<usize> {
 pub(super) struct FileRowGroupsFetcher {
     /// Footer domain state keyed by the node-local logical request id.
     in_flight: HashMap<ReadRequestId, FooterRead>,
-    declared_columns: Arc<[Column]>,
+    declared_columns: Arc<[DeclaredColumn]>,
 }
 
 impl FileRowGroupsFetcher {
-    pub(super) fn new(declared_columns: Arc<[Column]>) -> Self {
+    pub(super) fn new(declared_columns: Arc<[DeclaredColumn]>) -> Self {
         Self {
             in_flight: HashMap::new(),
             declared_columns,
@@ -69,17 +70,28 @@ impl Unary<DataFile, FileRowGroups> for FileRowGroupsFetcher {
         let DataFile {
             file: file_ref,
             source,
+            immutable,
         } = file;
         let size = file_ref.size as usize;
-        let open_file = source.open_read(file_ref.size).map_err(crate::op_err)?;
+        let open_file = if immutable {
+            source.open_immutable_read(file_ref.size)
+        } else {
+            source.open_read(file_ref.size)
+        }
+        .map_err(crate::op_err)?;
 
-        // This is the one registration point for a newly-opened descriptor.
-        // It prevents stale cache entries from an equal, reused fd serving the
-        // new file. Later logical ranges must not call `open_entry`, because it
-        // intentionally clears the file's old extent map.
-        memory_ctx()
-            .compressed_cache()
-            .open_entry(open_file.clone());
+        // Mutable handles reset any equal prior registration (notably a reused
+        // local fd). Immutable object handles preserve extents from an equivalent
+        // earlier open whose transport credentials may now differ.
+        if immutable {
+            memory_ctx()
+                .compressed_cache()
+                .open_immutable_entry(open_file.clone());
+        } else {
+            memory_ctx()
+                .compressed_cache()
+                .open_entry(open_file.clone());
+        }
 
         let request = FooterRead::new(file_ref, open_file, size);
         let range = request.probe_range();
@@ -153,7 +165,7 @@ impl FooterRead {
     fn parse_region(
         &mut self,
         bytes: &[u8],
-        declared_columns: &[Column],
+        declared_columns: &[DeclaredColumn],
     ) -> Result<FooterProgress> {
         let footer = if self.reading_exact {
             bytes
@@ -176,7 +188,7 @@ impl FooterRead {
             &bytes[start..bytes.len() - 8]
         };
 
-        Ok(FooterProgress::Done(row_groups_from_footer(
+        Ok(FooterProgress::Done(row_groups_from_footer_with_field_ids(
             footer,
             self.open_file.clone(),
             declared_columns,

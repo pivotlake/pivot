@@ -335,6 +335,7 @@ impl ParquetLocationPattern {
                         size: object.file.size,
                     },
                     source,
+                    immutable: false,
                 });
             }
         }

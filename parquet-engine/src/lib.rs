@@ -50,7 +50,9 @@ pub use writing::aggregate_file_stats;
 
 mod metadata;
 pub use metadata::{FileRowGroups, create_load_and_stage_spec};
-pub use metadata::{file_row_groups_from_metadata, load_file_row_groups};
+pub use metadata::{
+    file_row_groups_from_metadata, load_file_row_groups, load_file_row_groups_with_field_ids,
+};
 
 mod pushdown;
 pub use pushdown::{PushedPredicate, prune_parquet};
@@ -76,7 +78,8 @@ pub use types::metadata::{ColumnStatistics, RowGroupMetadata};
 pub use types::page::{CompressedPage, DecompressedPage};
 pub use types::requests::{RowGroupBuffer, RowGroupRequest};
 pub use types::table::{
-    Error as ParquetTableError, ParquetTable, is_variant_field, variant_extension_metadata,
+    DeclaredColumn, Error as ParquetTableError, ParquetTable, is_variant_field,
+    variant_extension_metadata,
 };
 
 mod values;

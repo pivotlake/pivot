@@ -25,6 +25,7 @@ mod injector;
 mod writer;
 
 use crate::types::metadata::RowGroupMetadata;
+use crate::types::table::DeclaredColumn;
 use dispatch::{
     DataFlowDispatcher, OperatorSpec, RecordBatchOperatorSpec, RootUnaryOperatorFactory,
     UnaryFactory, fan_in,
@@ -48,7 +49,7 @@ pub struct FileRowGroups {
 /// Builds each worker's [`FileRowGroupsFetcher`], carrying the table's
 /// declared column types so every parsed footer is reconciled with them.
 struct MetadataFetcherFactory {
-    declared_columns: Arc<[Column]>,
+    declared_columns: Arc<[DeclaredColumn]>,
 }
 
 impl UnaryFactory<DataFile, FileRowGroups> for MetadataFetcherFactory {
@@ -87,7 +88,7 @@ pub fn file_row_groups_from_metadata(
 fn fetch_file_row_group_factories(
     files: &[DataFile],
     workers: usize,
-    declared_columns: Arc<[Column]>,
+    declared_columns: Arc<[DeclaredColumn]>,
 ) -> Vec<
     RootUnaryOperatorFactory<DataFile, FileRowGroups, MetadataFetcherFactory, FileInjectorFactory>,
 > {
@@ -117,6 +118,22 @@ pub fn load_file_row_groups(
     files: &[DataFile],
     declared_columns: Arc<[Column]>,
 ) -> Result<Vec<FileRowGroups>, dispatch::DataFlowError> {
+    let declared_columns = declared_columns
+        .iter()
+        .cloned()
+        .map(|column| DeclaredColumn {
+            column,
+            field_id: None,
+        })
+        .collect();
+    load_file_row_groups_with_field_ids(dispatcher, files, declared_columns)
+}
+
+pub fn load_file_row_groups_with_field_ids(
+    dispatcher: &DataFlowDispatcher,
+    files: &[DataFile],
+    declared_columns: Arc<[DeclaredColumn]>,
+) -> Result<Vec<FileRowGroups>, dispatch::DataFlowError> {
     // When there is nothing to fetch, skip the dataflow round-trip entirely.
     // Every query's compile resolves its table through here, and a warm
     // catalog has no missing footers, so this is the common case.
@@ -144,6 +161,14 @@ pub fn create_load_and_stage_spec<C>(
 where
     C: FnOnce(Vec<FileRowGroups>) + Send + 'static,
 {
+    let declared_columns = declared_columns
+        .iter()
+        .cloned()
+        .map(|column| DeclaredColumn {
+            column,
+            field_id: None,
+        })
+        .collect();
     let fetch = OperatorSpec::new(
         dispatcher.clone(),
         fetch_file_row_group_factories(files, dispatcher.worker_count(), declared_columns),

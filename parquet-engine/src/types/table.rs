@@ -31,6 +31,7 @@ use std::{fs, io};
 use thiserror::Error;
 
 static EMPTY_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| SchemaRef::new(Schema::empty()));
+pub(crate) const PARQUET_FIELD_ID_META_KEY: &str = "PARQUET:field_id";
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -56,6 +57,28 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// A table-declared column plus its stable storage field ID when the table
+/// format has one. Iceberg supplies IDs; Delta and direct Parquet reads leave
+/// them absent and retain name-based reconciliation.
+#[derive(Clone, Debug)]
+pub struct DeclaredColumn {
+    pub column: Column,
+    pub field_id: Option<i32>,
+}
+
+impl DeclaredColumn {
+    fn without_ids(columns: &[Column]) -> Arc<[Self]> {
+        columns
+            .iter()
+            .cloned()
+            .map(|column| Self {
+                column,
+                field_id: None,
+            })
+            .collect()
+    }
+}
 
 /// A logical table backed by one or more Parquet files.
 ///
@@ -135,13 +158,48 @@ impl ParquetTable {
         files: Vec<DataFile>,
         declared_columns: &[Column],
     ) -> Result<Self> {
-        let loaded =
-            crate::metadata::load_file_row_groups(dispatcher, &files, declared_columns.into())
-                .map_err(|e| Error::Materialize(e.to_string()))?;
-        let row_groups = loaded
+        Self::from_locations_with_field_ids(
+            dispatcher,
+            files,
+            DeclaredColumn::without_ids(declared_columns),
+        )
+    }
+
+    /// Read file footers and reconcile their top-level primitive columns by
+    /// stable field ID. File order and names may change; a current field absent
+    /// from a file is rejected because the decoder cannot synthesize its nulls
+    /// yet.
+    pub fn from_locations_with_field_ids(
+        dispatcher: &DataFlowDispatcher,
+        files: Vec<DataFile>,
+        declared_columns: Arc<[DeclaredColumn]>,
+    ) -> Result<Self> {
+        let loaded = crate::metadata::load_file_row_groups_with_field_ids(
+            dispatcher,
+            &files,
+            declared_columns.clone(),
+        )
+        .map_err(|e| Error::Materialize(e.to_string()))?;
+        let row_groups: Vec<Arc<RowGroupMetadata>> = loaded
             .iter()
             .flat_map(|f| f.row_groups.iter().cloned())
             .collect();
+        if row_groups.is_empty() {
+            let fields = declared_columns
+                .iter()
+                .map(|declared| {
+                    Field::new(
+                        &declared.column.name,
+                        planner::types::physical_arrow_type(&declared.column.col_type),
+                        true,
+                    )
+                })
+                .collect::<Vec<_>>();
+            return Ok(Self {
+                row_groups,
+                schema: Arc::new(Schema::new(fields)),
+            });
+        }
         Ok(Self::new(row_groups))
     }
 
@@ -161,13 +219,13 @@ pub(crate) const FOOTER_PROBE_BYTES: usize = 64 * 1024;
 /// indices), tying each to `open_file` for the column-chunk reads that follow.
 /// `declared_columns` is the table's declared schema (empty when the table has
 /// none), reconciled with the file's own schema by [`apply_declared_types`].
-pub(crate) fn row_groups_from_footer(
+pub(crate) fn row_groups_from_footer_with_field_ids(
     footer: &[u8],
     open_file: dispatch::io::OpenFile,
-    declared_columns: &[Column],
+    declared_columns: &[DeclaredColumn],
 ) -> Result<Vec<RowGroupMetadata>> {
     let file_meta = parse_footer_thrift(footer)?;
-    row_groups_from_metadata(file_meta, open_file, declared_columns)
+    row_groups_from_metadata_with_field_ids(file_meta, open_file, declared_columns)
 }
 
 /// Build the per-row-group metadata from a parsed footer and the (local or
@@ -180,9 +238,23 @@ pub(crate) fn row_groups_from_metadata(
     open_file: dispatch::io::OpenFile,
     declared_columns: &[Column],
 ) -> Result<Vec<RowGroupMetadata>> {
+    let declared = DeclaredColumn::without_ids(declared_columns);
+    row_groups_from_metadata_with_field_ids(file_meta, open_file, &declared)
+}
+
+pub(crate) fn row_groups_from_metadata_with_field_ids(
+    file_meta: FileMetaData,
+    open_file: dispatch::io::OpenFile,
+    declared_columns: &[DeclaredColumn],
+) -> Result<Vec<RowGroupMetadata>> {
     let (schema, leaf_infos) = schema_elements_to_arrow(&file_meta.schema)?;
-    // Use reconciled types for statistics, decoders, and output fields.
-    let schema = Arc::new(apply_declared_types(schema, declared_columns)?);
+    let file_leaf_count = leaf_infos.len();
+    let (schema, selected_leaves) = reconcile_declared_schema(schema, declared_columns)?;
+    let leaf_infos: Vec<_> = selected_leaves
+        .iter()
+        .map(|index| leaf_infos[*index].clone())
+        .collect();
+    let schema = Arc::new(schema);
     // Statistics belong to leaf chunks, not top-level columns.
     let leaves = super::leaves::leaf_fields(schema.fields());
 
@@ -197,27 +269,31 @@ pub(crate) fn row_groups_from_metadata(
     let mut row_groups = Vec::with_capacity(row_group_count);
 
     for (i, rg) in file_meta.row_groups.into_iter().enumerate() {
-        // Chunks are per leaf; a row group with a different count is a
-        // malformed footer and would index out of bounds below.
-        if rg.columns.len() != leaves.len() {
+        // Chunks are per file leaf. A current Iceberg schema may select fewer
+        // leaves after dropping fields, but the footer itself must still agree
+        // with the schema stored in this file.
+        if rg.columns.len() != file_leaf_count {
             return Err(Error::InvalidFooter(format!(
                 "row group {i} has {} column chunks but the schema has {} leaves",
                 rg.columns.len(),
-                leaves.len()
+                file_leaf_count
             )));
         }
-        let mut columns: Vec<ColumnChunkMeta> = rg
-            .columns
-            .into_iter()
+        let file_columns = rg.columns;
+        let mut columns = selected_leaves
+            .iter()
+            .map(|index| file_columns[*index].clone())
             .enumerate()
             .map(|(j, cc)| {
-                let meta = cc.meta_data.expect("missing column metadata");
+                let meta = cc.meta_data.ok_or_else(|| {
+                    Error::InvalidFooter(format!("row group {i} column {j} has no column metadata"))
+                })?;
                 let physical_type = meta.physical_type;
                 leaf_physical_types[j] = physical_type;
                 leaf_stats[j].push(meta.statistics);
                 let data_pages_all_dictionary = meta.dictionary_page_offset.is_some()
                     && data_pages_all_dictionary(meta.encoding_stats.as_deref());
-                ColumnChunkMeta {
+                Ok(ColumnChunkMeta {
                     codec: meta.codec,
                     dictionary_page_offset: meta.dictionary_page_offset,
                     data_page_offset: meta.data_page_offset,
@@ -227,12 +303,9 @@ pub(crate) fn row_groups_from_metadata(
                     physical_type,
                     fixed_len_byte_width: leaf_infos[j].type_length,
                     data_pages_all_dictionary,
-                }
+                })
             })
-            .collect();
-        // The collect runs in place over the buffer the footer parse allocated
-        // for the chunks, which is several times wider per element than what is
-        // kept. The surplus lives as long as the table does, so release it here.
+            .collect::<Result<Vec<_>>>()?;
         columns.shrink_to_fit();
         row_groups.push((rg.num_rows, columns));
     }
@@ -544,7 +617,7 @@ fn parse_footer_thrift(buf: &[u8]) -> Result<FileMetaData> {
 
 /// Per-leaf schema facts collected while walking the footer's schema
 /// elements, in depth-first (column-chunk) order.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct LeafSchemaInfo {
     /// Maximum definition level (one per optional ancestor plus the leaf).
     def_level: i16,
@@ -582,10 +655,9 @@ fn schema_elements_to_arrow(
 /// process rather than fail the load.
 const MAX_SCHEMA_DEPTH: usize = 128;
 
-/// Reconcile a file's parsed schema with the table's declared column types,
-/// matched by column name: a file may carry more columns than the table
-/// declares (an ingest mapping can write a superset), and those pass through
-/// untouched.
+/// Reconcile a file's parsed schema with the table's declared column types.
+/// Iceberg declarations are matched and ordered by field ID; declarations
+/// without IDs retain the original name-based behavior.
 ///
 /// A declared VARCHAR may retype unannotated binary data as text. A declared
 /// VARIANT accepts any struct shape because shredding adds fields per file.
@@ -653,6 +725,95 @@ fn apply_declared_types(schema: Schema, declared_columns: &[Column]) -> Result<S
     Ok(Schema::new(fields))
 }
 
+fn reconcile_declared_schema(
+    schema: Schema,
+    declared_columns: &[DeclaredColumn],
+) -> Result<(Schema, Vec<usize>)> {
+    if !declared_columns
+        .iter()
+        .any(|column| column.field_id.is_some())
+    {
+        let columns: Vec<_> = declared_columns
+            .iter()
+            .map(|column| column.column.clone())
+            .collect();
+        let leaf_count = super::leaves::leaf_fields(schema.fields()).len();
+        return Ok((
+            apply_declared_types(schema, &columns)?,
+            (0..leaf_count).collect(),
+        ));
+    }
+
+    let mut fields = Vec::with_capacity(declared_columns.len());
+    let mut selected_leaves = Vec::with_capacity(declared_columns.len());
+    for declared in declared_columns {
+        let field_id = declared.field_id.ok_or_else(|| {
+            Error::InvalidFooter(format!(
+                "declared Iceberg column '{}' has no field ID",
+                declared.column.name
+            ))
+        })?;
+        let matching_indices: Vec<_> = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, field)| {
+                parquet_field_id(field)
+                    .is_some_and(|candidate| candidate == field_id)
+                    .then_some(index)
+            })
+            .collect();
+        let file_index = match matching_indices.as_slice() {
+            [index] => *index,
+            [] => schema
+                .fields()
+                .iter()
+                .enumerate()
+                .find(|(_, field)| {
+                    parquet_field_id(field).is_none()
+                        && field.name().eq_ignore_ascii_case(&declared.column.name)
+                })
+                .map(|(index, _)| index)
+                .ok_or_else(|| {
+                    Error::ColumnNotFound(format!(
+                        "Iceberg field ID {field_id} ('{}') is absent from this Parquet file",
+                        declared.column.name
+                    ))
+                })?,
+            _ => {
+                return Err(Error::InvalidFooter(format!(
+                    "Parquet file contains Iceberg field ID {field_id} more than once"
+                )));
+            }
+        };
+        let file_field = &schema.fields()[file_index];
+        if super::leaves::leaf_count(file_field) != 1 {
+            return Err(Error::UnsupportedType(format!(
+                "Iceberg field ID {field_id} ('{}') is nested",
+                declared.column.name
+            )));
+        }
+        let renamed = file_field
+            .as_ref()
+            .clone()
+            .with_name(declared.column.name.clone());
+        let reconciled = apply_declared_types(
+            Schema::new(vec![renamed]),
+            std::slice::from_ref(&declared.column),
+        )?;
+        fields.push(reconciled.fields()[0].clone());
+        selected_leaves.push(super::leaves::first_leaf(schema.fields(), file_index));
+    }
+    Ok((Schema::new(fields), selected_leaves))
+}
+
+fn parquet_field_id(field: &Field) -> Option<i32> {
+    field
+        .metadata()
+        .get(PARQUET_FIELD_ID_META_KEY)
+        .and_then(|field_id| field_id.parse().ok())
+}
+
 /// Parse the subtree rooted at `elements[idx]`. `parent_def` is the definition
 /// level contributed by ancestors (each optional ancestor adds one). Returns
 /// the Arrow field and the index just past this subtree, appending one entry
@@ -712,11 +873,16 @@ fn parse_schema_element(
             let field = Field::new(&elem.name, DataType::Struct(children.into()), nullable);
             // Re-mark the group so a reconstructed variant re-tags VARIANT if
             // the table is re-written (e.g. by compaction).
-            let field = if is_variant {
+            let mut field = if is_variant {
                 field.with_metadata(variant_extension_metadata())
             } else {
                 field
             };
+            if let Some(field_id) = elem.field_id {
+                field
+                    .metadata_mut()
+                    .insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
+            }
             Ok((field, cursor))
         }
         _ => {
@@ -725,7 +891,13 @@ fn parse_schema_element(
                 type_length: elem.type_length,
             });
             let data_type = super::arrow_map::parquet_to_arrow(elem)?;
-            Ok((Field::new(&elem.name, data_type, nullable), idx + 1))
+            let mut field = Field::new(&elem.name, data_type, nullable);
+            if let Some(field_id) = elem.field_id {
+                field
+                    .metadata_mut()
+                    .insert(PARQUET_FIELD_ID_META_KEY.to_string(), field_id.to_string());
+            }
+            Ok((field, idx + 1))
         }
     }
 }
@@ -874,6 +1046,153 @@ mod tests {
         }
     }
 
+    fn create_field_with_id(name: &str, data_type: DataType, field_id: i32) -> Field {
+        Field::new(name, data_type, true).with_metadata(std::collections::HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            field_id.to_string(),
+        )]))
+    }
+
+    fn create_declared_column(name: &str, col_type: Type, field_id: i32) -> DeclaredColumn {
+        DeclaredColumn {
+            column: column(name, col_type),
+            field_id: Some(field_id),
+        }
+    }
+
+    #[test]
+    fn iceberg_fields_reconcile_by_id_across_rename_and_reorder() {
+        let schema = Schema::new(vec![
+            create_field_with_id("old_name", DataType::Int64, 7),
+            create_field_with_id("label", DataType::Utf8View, 3),
+        ]);
+        let declared = [
+            create_declared_column("label", Type::Utf8, 3),
+            create_declared_column("new_name", Type::Int64, 7),
+        ];
+
+        let (reconciled, selected_leaves) = reconcile_declared_schema(schema, &declared).unwrap();
+
+        assert_eq!(reconciled.field(0).name(), "label");
+        assert_eq!(reconciled.field(1).name(), "new_name");
+        assert_eq!(selected_leaves, vec![1, 0]);
+    }
+
+    #[test]
+    fn iceberg_field_ids_reorder_real_parquet_chunks() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("iceberg.parquet");
+        let schema = Arc::new(Schema::new(vec![
+            create_field_with_id("old_name", DataType::Int64, 7),
+            create_field_with_id("label", DataType::Int64, 3),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![10])),
+                Arc::new(Int64Array::from(vec![20])),
+            ],
+        )
+        .unwrap();
+        let properties = WriterProperties::builder()
+            .set_statistics_enabled(EnabledStatistics::Chunk)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), schema, Some(properties)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let size = fs::metadata(&path).unwrap().len();
+        let declared = vec![
+            create_declared_column("label", Type::Int64, 3),
+            create_declared_column("new_name", Type::Int64, 7),
+        ]
+        .into();
+
+        let table = ParquetTable::from_locations_with_field_ids(
+            test_dispatcher(),
+            vec![DataFile::local(path, size)],
+            declared,
+        )
+        .unwrap();
+
+        assert_eq!(table.schema().field(0).name(), "label");
+        assert_eq!(table.schema().field(1).name(), "new_name");
+        let first_stats = col_stats(&table, 0);
+        let second_stats = col_stats(&table, 1);
+        let first_min = first_stats.min().unwrap().into_inner();
+        let second_min = second_stats.min().unwrap().into_inner();
+        assert_eq!(
+            first_min
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            20
+        );
+        assert_eq!(
+            second_min
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            10
+        );
+    }
+
+    #[test]
+    fn iceberg_dropped_file_fields_are_not_selected() {
+        let schema = Schema::new(vec![
+            create_field_with_id("dropped", DataType::Int32, 4),
+            create_field_with_id("kept", DataType::Int64, 8),
+        ]);
+
+        let (reconciled, selected_leaves) =
+            reconcile_declared_schema(schema, &[create_declared_column("kept", Type::Int64, 8)])
+                .unwrap();
+
+        assert_eq!(reconciled.fields().len(), 1);
+        assert_eq!(reconciled.field(0).name(), "kept");
+        assert_eq!(selected_leaves, vec![1]);
+    }
+
+    #[test]
+    fn iceberg_missing_current_field_fails_the_load() {
+        let schema = Schema::new(vec![create_field_with_id("present", DataType::Int64, 8)]);
+
+        let error =
+            reconcile_declared_schema(schema, &[create_declared_column("missing", Type::Int64, 9)])
+                .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("field ID 9 ('missing') is absent"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn iceberg_name_fallback_requires_a_file_field_without_an_id() {
+        let schema = Schema::new(vec![
+            Field::new("legacy", DataType::Int64, true),
+            create_field_with_id("assigned", DataType::Int64, 5),
+        ]);
+
+        let (_, selected_leaves) = reconcile_declared_schema(
+            schema.clone(),
+            &[create_declared_column("legacy", Type::Int64, 9)],
+        )
+        .unwrap();
+        assert_eq!(selected_leaves, vec![0]);
+
+        let error = reconcile_declared_schema(
+            schema,
+            &[create_declared_column("assigned", Type::Int64, 9)],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("field ID 9"), "{error}");
+    }
+
     /// A column the table declares VARCHAR whose file leaf is unannotated
     /// binary is retyped to text; every other pairing is left alone.
     #[test]
@@ -1000,6 +1319,7 @@ mod tests {
             converted_type: None,
             scale: None,
             precision: None,
+            field_id: None,
             logical_type: None,
         }
     }

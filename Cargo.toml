@@ -5,6 +5,7 @@ members = [
     "bin",
     "catalog",
     "datastore-pivot",
+    "datastore-iceberg",
     "dispatch",
     "duckdb-planner",
     "metastore-disk",
@@ -25,6 +26,7 @@ license = "MIT OR Apache-2.0"
 # Sibling crates.
 catalog = { path = "catalog" }
 datastore-pivot = { path = "datastore-pivot" }
+datastore-iceberg = { path = "datastore-iceberg" }
 dispatch = { path = "dispatch" }
 duckdb-planner = { path = "duckdb-planner" }
 metastore-disk = { path = "metastore-disk" }
@@ -62,6 +64,10 @@ flate2 = "1"
 insta = "1"
 libc = "0.2.184"
 lru = "0.18.1"
+# Keep Apache's catalog and table crates on the same official revision. This
+# revision accepts Arrow 58, which lets the workspace use its vendored fork.
+iceberg = { git = "https://github.com/apache/iceberg-rust.git", rev = "c915c31e495bb1ad211079a23bca9b63bae45460" }
+iceberg-catalog-rest = { git = "https://github.com/apache/iceberg-rust.git", rev = "c915c31e495bb1ad211079a23bca9b63bae45460" }
 # Declared once for the workspace: the SCRAM derivation `metastore-disk` stores
 # with must be the very pgwire the server verifies logins with.
 pgwire = "0.39"

@@ -117,6 +117,7 @@ use catalog::metastore::{
     DEFAULT_USER_NAME, Metastore, SCRAM_ITERATIONS, SCRAM_SALT_LEN, ScramVerifier, UserAuth,
     format_scram_verifier, parse_scram_verifier,
 };
+use datastore_iceberg::{IcebergAuth, IcebergConfig, IcebergDatastore, PivotStorageFactory};
 use datastore_pivot::{
     CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_PARALLELISM, DEFAULT_COMPACT_POLL,
     DEFAULT_LAYOUT_CLIQUE_SIZE, DEFAULT_MIN_FILES_TO_MERGE, DEFAULT_VACUUM_POLL, MaintenanceConfig,
@@ -274,15 +275,34 @@ impl DiskMetastore {
             .iter()
             .chain(metastore_config.datastores.iter())
             .map(|(name, config)| {
-                let store = config.open_store(name, &self.secrets)?;
-                let maintenance = MaintenanceConfig {
-                    refresh_interval: self.refresh_interval,
-                    compaction: config.compaction(),
-                    vacuum: config.vacuum(),
-                };
+                config.validate_options(name)?;
                 let datastore: Arc<dyn Datastore> = match config.kind {
                     DatastoreKind::Pivot => {
+                        let store = config.open_store(name, &self.secrets)?;
+                        let maintenance = MaintenanceConfig {
+                            refresh_interval: self.refresh_interval,
+                            compaction: config.compaction(),
+                            vacuum: config.vacuum(),
+                        };
                         PivotDatastore::from_store(store, dispatcher, Some(maintenance))?
+                    }
+                    DatastoreKind::Iceberg => {
+                        let external_stores: Arc<dyn ExternalStoreFactory> =
+                            Arc::new(SecretExternalStoreFactory {
+                                secrets: self.secrets.clone(),
+                            });
+                        let storage = Arc::new(PivotStorageFactory::new(
+                            external_stores,
+                            dispatcher.clone(),
+                        ));
+                        let mut iceberg = IcebergConfig::new(config.location.clone());
+                        iceberg.warehouse = config.warehouse.clone();
+                        iceberg.auth = config
+                            .auth
+                            .clone()
+                            .unwrap_or(IcebergAuthConfig::None {})
+                            .into();
+                        Arc::new(IcebergDatastore::new(iceberg, storage)?)
                     }
                 };
                 Ok((name.clone(), datastore))
@@ -463,6 +483,14 @@ pub enum Error {
     Store(#[from] object_storage::StoreError),
     #[error(transparent)]
     Pivot(#[from] datastore_pivot::Error),
+    #[error(transparent)]
+    Iceberg(#[from] planner::catalog::Error),
+    #[error("datastore `{name}`: option `{option}` is not valid for kind `{kind}`")]
+    InvalidDatastoreOption {
+        name: String,
+        kind: &'static str,
+        option: &'static str,
+    },
 }
 
 /// The datastores and users of a metastore, as written: the config file's
@@ -580,6 +608,13 @@ enum UserAuthConfig {
 struct DatastoreConfig {
     kind: DatastoreKind,
     location: String,
+    /// Logical warehouse identifier passed to an Iceberg REST catalog.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warehouse: Option<String>,
+    /// Authentication for an Iceberg REST catalog. Omitted means no catalog
+    /// authentication.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auth: Option<IcebergAuthConfig>,
     /// Marks this datastore as the default: the current database, the target of
     /// unqualified table names and DDL. Exactly one datastore must set it.
     #[serde(rename = "default", default)]
@@ -588,7 +623,7 @@ struct DatastoreConfig {
     /// `compact_bytes` applies only when it is on. Compaction rewrites small
     /// Parquet files and overlapping large ones, so run it in only one process
     /// per datastore (set `compact: false` on the others).
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing_if = "should_skip_true")]
     compact: bool,
     /// Compaction output target (such as `128m` or `1g`). Files strictly below
     /// half this size are small-file candidates; files at least half full are
@@ -614,7 +649,7 @@ struct DatastoreConfig {
     /// deletes unreferenced data files and superseded commit JSONs past their
     /// retention. Set `vacuum: false` on a read-only server, or where another
     /// process owns physical cleanup.
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", skip_serializing_if = "should_skip_true")]
     vacuum: bool,
 }
 
@@ -624,7 +659,44 @@ fn default_true() -> bool {
     true
 }
 
+fn should_skip_true(value: &bool) -> bool {
+    *value
+}
+
 impl DatastoreConfig {
+    fn validate_options(&self, name: &str) -> Result<()> {
+        let invalid = match self.kind {
+            DatastoreKind::Pivot => [
+                self.warehouse.as_ref().map(|_| "warehouse"),
+                self.auth.as_ref().map(|_| "auth"),
+            ]
+            .into_iter()
+            .flatten()
+            .next(),
+            DatastoreKind::Iceberg => [
+                (!self.compact).then_some("compact"),
+                self.compact_bytes.as_ref().map(|_| "compact_bytes"),
+                self.compact_merge_bytes
+                    .as_ref()
+                    .map(|_| "compact_merge_bytes"),
+                self.compact_min_files.map(|_| "compact_min_files"),
+                self.compact_parallelism.map(|_| "compact_parallelism"),
+                (!self.vacuum).then_some("vacuum"),
+            ]
+            .into_iter()
+            .flatten()
+            .next(),
+        };
+        match invalid {
+            Some(option) => Err(Error::InvalidDatastoreOption {
+                name: name.to_string(),
+                kind: self.kind.as_str(),
+                option,
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// This datastore's compaction settings, or `None` when `compact` is off.
     /// Fills the tuning fields' defaults.
     fn compaction(&self) -> Option<CompactionConfig> {
@@ -663,13 +735,84 @@ impl DatastoreConfig {
     }
 }
 
-/// The datastore implementation. Only [`Pivot`](Self::Pivot) is supported today; adding
-/// another (Iceberg, ...) is a new variant plus its arm in
+/// The datastore implementation. Each variant has its own construction arm in
 /// [`build_datastores`](DiskMetastore::build_datastores).
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum DatastoreKind {
     Pivot,
+    Iceberg,
+}
+
+impl DatastoreKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pivot => "pivot",
+            Self::Iceberg => "iceberg",
+        }
+    }
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
+enum IcebergAuthConfig {
+    None {},
+    Bearer {
+        token: String,
+    },
+    #[serde(rename = "oauth2_client_credentials")]
+    OAuth2ClientCredentials {
+        client_id: String,
+        client_secret: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        token_endpoint: Option<String>,
+    },
+}
+
+impl std::fmt::Debug for IcebergAuthConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None {} => formatter.write_str("None"),
+            Self::Bearer { .. } => formatter
+                .debug_struct("Bearer")
+                .field("token", &"redacted")
+                .finish(),
+            Self::OAuth2ClientCredentials {
+                client_id,
+                scope,
+                token_endpoint,
+                ..
+            } => formatter
+                .debug_struct("OAuth2ClientCredentials")
+                .field("client_id", client_id)
+                .field("client_secret", &"redacted")
+                .field("scope", scope)
+                .field("token_endpoint", token_endpoint)
+                .finish(),
+        }
+    }
+}
+
+impl From<IcebergAuthConfig> for IcebergAuth {
+    fn from(auth: IcebergAuthConfig) -> Self {
+        match auth {
+            IcebergAuthConfig::None {} => Self::None,
+            IcebergAuthConfig::Bearer { token } => Self::Bearer { token },
+            IcebergAuthConfig::OAuth2ClientCredentials {
+                client_id,
+                client_secret,
+                scope,
+                token_endpoint,
+            } => Self::OAuth2ClientCredentials {
+                client_id,
+                client_secret,
+                scope,
+                token_endpoint,
+            },
+        }
+    }
 }
 
 impl DatastoreConfig {
@@ -914,13 +1057,114 @@ datastores:
         let yaml = r#"
 datastores:
   default:
-    kind: iceberg
+    kind: hudi
     location: /tmp/default
 "#;
 
         let result = from_yaml(yaml);
 
         assert!(matches!(result, Err(Error::Parse { .. })));
+    }
+
+    #[test]
+    fn iceberg_rest_auth_modes_parse_and_redact_secrets() {
+        let yaml = r#"
+datastores:
+  anonymous:
+    kind: iceberg
+    location: https://catalog.example/anonymous
+    auth:
+      method: none
+    default: true
+  bearer:
+    kind: iceberg
+    location: https://catalog.example/bearer
+    auth:
+      method: bearer
+      token: bearer-secret
+  oauth:
+    kind: iceberg
+    location: https://catalog.example/oauth
+    warehouse: analytics
+    auth:
+      method: oauth2_client_credentials
+      client_id: pivot
+      client_secret: oauth-secret
+      scope: catalog
+      token_endpoint: https://identity.example/token
+"#;
+
+        let config = parse_config(yaml).unwrap();
+        let debug = format!("{config:?}");
+
+        assert!(matches!(
+            config.datastores["anonymous"].auth,
+            Some(IcebergAuthConfig::None {})
+        ));
+        assert!(matches!(
+            config.datastores["bearer"].auth,
+            Some(IcebergAuthConfig::Bearer { .. })
+        ));
+        assert!(matches!(
+            config.datastores["oauth"].auth,
+            Some(IcebergAuthConfig::OAuth2ClientCredentials { .. })
+        ));
+        assert!(!debug.contains("bearer-secret"));
+        assert!(!debug.contains("oauth-secret"));
+    }
+
+    #[test]
+    fn iceberg_metadata_ttl_is_rejected_after_freshness_became_per_query() {
+        let result = parse_config(
+            r#"
+datastores:
+  default:
+    kind: iceberg
+    location: https://catalog.example
+    metadata_ttl: 30s
+    default: true
+"#,
+        );
+
+        assert!(matches!(result, Err(Error::Parse { .. })));
+    }
+
+    #[test]
+    fn datastore_kind_specific_options_are_not_silently_ignored() {
+        let pivot = parse_config(
+            r#"
+datastores:
+  default:
+    kind: pivot
+    location: /tmp/default
+    warehouse: ignored
+    default: true
+"#,
+        )
+        .unwrap();
+        let error = pivot.datastores["default"]
+            .validate_options("default")
+            .unwrap_err();
+        assert!(error.to_string().contains("option `warehouse`"), "{error}");
+
+        let iceberg = parse_config(
+            r#"
+datastores:
+  default:
+    kind: iceberg
+    location: https://catalog.example
+    compact_bytes: 64m
+    default: true
+"#,
+        )
+        .unwrap();
+        let error = iceberg.datastores["default"]
+            .validate_options("default")
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("option `compact_bytes`"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -58,41 +58,62 @@ impl<O, OF: OperatorFactory<O>> OperatorSpec<O, OF> {
 
 impl<O: Send + 'static, OF: OperatorFactory<O> + Send + 'static> OperatorSpec<O, OF> {
     pub fn execute(self) -> DataFlowHandle<O> {
-        self.execute_inner(false)
+        self.execute_inner(false, None)
     }
 
     /// Like [`execute`](Self::execute) but with per-dataflow stats collection
     /// enabled; read the aggregated tally back via
     /// [`DataFlowHandle::collect_with_stats`](crate::DataFlowHandle::collect_with_stats).
     pub fn execute_with_stats(self) -> DataFlowHandle<O> {
-        self.execute_inner(true)
+        self.execute_inner(true, None)
     }
 
-    fn execute_inner(self, collect_stats: bool) -> DataFlowHandle<O> {
+    /// Execute a spec containing exactly one factory on `worker`.
+    ///
+    /// Used by one-shot I/O dataflows that need Dispatch's worker-local requester
+    /// and shared caches without creating no-op siblings on the rest of the pool.
+    pub(crate) fn execute_on(self, worker: usize) -> DataFlowHandle<O> {
+        assert_eq!(
+            self.factories.len(),
+            1,
+            "execute_on requires exactly one operator factory"
+        );
+        assert!(
+            worker < self.dispatcher.worker_count(),
+            "target worker is outside the dispatcher"
+        );
+        self.execute_inner(false, Some(worker))
+    }
+
+    fn execute_inner(self, collect_stats: bool, target_worker: Option<usize>) -> DataFlowHandle<O> {
         let (tx, rx) = mpsc_channel();
         let (err_tx, err_rx) = std::sync::mpsc::channel();
         let (stats_tx, stats_rx) = std::sync::mpsc::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "perf")]
         let profiled = self.dispatcher.profiled();
-        let wakers = self
-            .dispatcher
-            .push_data_flow(self.factories.into_iter().map(|f| {
-                let tx = tx.clone();
-                let build = Box::new(move |context: &mut BuildContext| {
-                    Box::new(f).build(Box::new(tx), context)
-                });
-                let builder = DataFlowBuilder::new(
-                    build,
-                    cancelled.clone(),
-                    err_tx.clone(),
-                    stats_tx.clone(),
-                    collect_stats,
-                );
-                #[cfg(feature = "perf")]
-                let builder = builder.with_profiling(profiled);
-                builder
-            }));
+        let mut builders = self.factories.into_iter().map(|f| {
+            let tx = tx.clone();
+            let build = Box::new(move |context: &mut BuildContext| {
+                Box::new(f).build(Box::new(tx), context)
+            });
+            let builder = DataFlowBuilder::new(
+                build,
+                cancelled.clone(),
+                err_tx.clone(),
+                stats_tx.clone(),
+                collect_stats,
+            );
+            #[cfg(feature = "perf")]
+            let builder = builder.with_profiling(profiled);
+            builder
+        });
+        let wakers = match target_worker {
+            Some(worker) => self
+                .dispatcher
+                .push_data_flow_on(worker, builders.next().unwrap()),
+            None => self.dispatcher.push_data_flow(builders),
+        };
         // Close our local copies of the senders so the channels close once
         // every worker drops theirs.
         drop(err_tx);

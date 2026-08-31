@@ -241,6 +241,18 @@ impl DataFlowDispatcher {
         self.waker_set.clone()
     }
 
+    /// Dispatch one dataflow to one specific worker.
+    ///
+    /// This is the sparse counterpart to [`push_data_flow`](Self::push_data_flow):
+    /// it is intended for small control-plane or metadata operations that need the
+    /// worker's normal I/O requester and caches but do not benefit from constructing
+    /// an otherwise-empty sibling graph on every worker.
+    pub(crate) fn push_data_flow_on(&self, worker: usize, builder: DataFlowBuilder) -> WakerSet {
+        self.senders[worker].send(builder).unwrap();
+        self.waker_set.notify_all_delegated();
+        self.waker_set.clone()
+    }
+
     /// The total worker count across all node groups. Every dataflow's
     /// operator chain is built at this size, since a dataflow runs on every
     /// worker.
@@ -544,6 +556,22 @@ mod tests {
         assert_eq!(first_handle.next_worker(), 2);
         assert_eq!(second_handle.next_worker(), 0);
 
+        dispatch.exit();
+    }
+
+    #[test]
+    fn sparse_dataflow_runs_only_on_its_target_worker() {
+        let dispatch = Dispatch::spin_up_groups(synthetic_groups(1, 3), 16, None);
+        let factory = NullaryOperatorFactory::new(OneShotNullaryFactory::new(|| {
+            Some(crate::worker::WORKER_IDX.get())
+        }));
+
+        let results = OperatorSpec::new(dispatch.dispatcher().clone(), [factory])
+            .execute_on(2)
+            .collect()
+            .unwrap();
+
+        assert_eq!(results, vec![2]);
         dispatch.exit();
     }
 

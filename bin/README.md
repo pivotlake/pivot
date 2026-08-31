@@ -126,8 +126,9 @@ serving one local directory. Exactly one datastore must set `default = true`; it
 becomes the current database (the target of unqualified table names). Every
 datastore is attached as a database of its own name, so a query reads any other
 one by qualifying it: `SELECT * FROM warm.main.tbl`. `kind` is the datastore
-implementation (`pivot` today); the storage backend is inferred from `location` (a plain
-path is local, an `s3://` URI is S3, a `gs://` URI is Google Cloud Storage).
+implementation (`pivot` or read-only `iceberg`). A Pivot storage backend is
+inferred from `location` (a plain path is local, an `s3://` URI is S3, a
+`gs://` URI is Google Cloud Storage).
 Compaction is configured per datastore with `compact`. `compact_bytes` targets
 the compaction output size; files strictly below half that size are small-file
 candidates, while an individual row group may exceed the target.
@@ -168,6 +169,36 @@ pivot server --config pivot.yaml
 A local datastore directory may be open in only one Pivot process at a time.
 Pivot holds `.pivot.lock` in that directory until shutdown and reports the
 owning PID if another process tries to open it.
+
+A read-only Iceberg REST catalog is configured as another datastore. One-level
+Iceberg namespaces are Pivot schemas. V1 reads the current snapshot from
+Parquet on S3 or GCS and rejects tables carrying position or equality deletes:
+
+```yaml
+metastore:
+  datastores:
+    lakehouse:
+      kind: iceberg
+      location: https://catalog.example.com
+      warehouse: analytics
+      auth:
+        method: oauth2_client_credentials
+        client_id: pivot
+        client_secret: replace-me
+        scope: catalog
+```
+
+Set `auth.method` to `none` for an unauthenticated catalog, or use `bearer`
+with a `token`. OAuth2 also accepts an optional `token_endpoint`. REST-vended
+S3 or GCS credentials take precedence for the location prefixes they cover;
+metastore secrets and ambient GCS credentials remain the fallback.
+On first access to a table in each transaction, Pivot checks the REST table
+endpoint and builds a fresh Apache Iceberg table, even if its metadata location
+is unchanged. That version remains fixed within the transaction. Parsed
+manifests are not reused across transactions; immutable object bytes use
+Dispatch's capacity-based RAM and optional disk caches. There is no Iceberg
+freshness TTL. Queries using Iceberg tables bypass the SQL plan cache so bindings
+and temporary credentials are recreated for each query.
 
 The `server` section's `refresh_interval` sets how often the background refresh
 brings the in-memory table set up to date with the store: new Delta versions,

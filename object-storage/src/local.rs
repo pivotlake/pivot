@@ -76,6 +76,17 @@ impl ObjectStore for LocalStore {
         }
     }
 
+    fn file_size(&self, key: &ObjectPath) -> Result<Option<u64>> {
+        match std::fs::metadata(self.path_for(key)) {
+            Ok(metadata) => Ok(Some(metadata.len())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(StoreError::Io {
+                key: key.to_string(),
+                source,
+            }),
+        }
+    }
+
     fn put(&self, key: &ObjectPath, data: &[u8]) -> Result<()> {
         let path = self.path_for(key);
         if let Some(parent) = path.parent() {

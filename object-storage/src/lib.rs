@@ -98,7 +98,11 @@ impl FileRef {
         location: &ObjectPath,
     ) -> Result<DataFile> {
         let source = store.source(&location.resolve(&self.path))?;
-        Ok(DataFile { file: self, source })
+        Ok(DataFile {
+            file: self,
+            source,
+            immutable: false,
+        })
     }
 }
 
@@ -111,6 +115,9 @@ impl FileRef {
 pub struct DataFile {
     pub file: FileRef,
     pub source: DataFileLocation,
+    /// Whether reopening this object's remote source may reuse cached bytes.
+    /// Set only when the surrounding format guarantees immutable object names.
+    pub immutable: bool,
 }
 
 /// Where a data file's bytes live, for reading or writing: a local filesystem
@@ -146,6 +153,19 @@ impl DataFileLocation {
             }
         })
     }
+
+    /// Open an immutable object for a cache-preserving read. Reopening the same
+    /// remote authority/path/size with refreshed credentials retains the same
+    /// Dispatch in-memory cache identity. Local descriptors retain their normal
+    /// per-open identity because fd reuse is not an immutable object identity.
+    pub fn open_immutable_read(self, size: u64) -> std::io::Result<OpenFile> {
+        Ok(match self {
+            DataFileLocation::Local(path) => OpenFile::Local(open_direct_read(&path)?),
+            DataFileLocation::Remote { url, auth } => {
+                OpenFile::Remote(Arc::new(RemoteFile::open_immutable(url, auth, size)?))
+            }
+        })
+    }
 }
 
 impl Debug for DataFileLocation {
@@ -172,6 +192,7 @@ impl DataFile {
                 size,
             },
             source: DataFileLocation::Local(path),
+            immutable: false,
         }
     }
 
@@ -184,6 +205,7 @@ impl DataFile {
                 size,
             },
             source: DataFileLocation::Remote { url, auth: None },
+            immutable: false,
         }
     }
 }
@@ -200,6 +222,10 @@ pub trait ObjectStore: Debug + Send + Sync {
 
     /// Fetch an object in full, or `None` if it does not exist.
     fn get(&self, key: &ObjectPath) -> Result<Option<Vec<u8>>>;
+
+    /// Return the object's byte length without downloading its contents, or
+    /// `None` when it does not exist.
+    fn file_size(&self, key: &ObjectPath) -> Result<Option<u64>>;
 
     /// Atomically replace `key` with `data` (overwriting any existing object).
     /// Reads see either the old or the new object whole, never a torn write.

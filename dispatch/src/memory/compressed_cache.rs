@@ -941,6 +941,21 @@ impl CompressedCache {
             .insert(open_file, Default::default());
     }
 
+    /// Register an immutable object without invalidating extents left by an
+    /// equivalent earlier handle. Transport details (presigned query strings or
+    /// token suppliers) may be refreshed independently of the object's identity.
+    pub fn open_immutable_entry(&self, open_file: OpenFile) {
+        debug_assert!(matches!(
+            &open_file,
+            OpenFile::Remote(remote) if remote.is_immutable()
+        ));
+        self.file_maps
+            .write()
+            .unwrap()
+            .entry(open_file)
+            .or_default();
+    }
+
     /// Evict every cached extent: drop all extent maps and recycle the ring slots they
     /// referenced, so subsequent reads miss and re-read from disk. Registered file
     /// descriptors stay open (their maps are just emptied). Returns the number of
