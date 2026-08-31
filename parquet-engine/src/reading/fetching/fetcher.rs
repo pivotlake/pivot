@@ -86,10 +86,7 @@ impl Unary<RowGroupRequest, RowGroupBuffer> for RowGroupFetcher {
         sender: &mut dyn Sender<RowGroupBuffer>,
         io: &mut OperatorIO,
     ) -> dispatch::UnaryResult<()> {
-        let id = io.read(
-            request.open_file().clone(),
-            request.locations().iter().copied(),
-        )?;
+        let id = io.read(request.open_file().clone(), request.file_ranges())?;
         self.pending_row_groups.fetch_add(1, Ordering::Relaxed);
         self.in_flight.insert(id, request);
         let _ = sender;

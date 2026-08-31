@@ -31,6 +31,24 @@ enum PageType {
 }
 );
 
+thrift_enum!(
+/// Compression codecs supported by the Parquet format. Every standard codec is
+/// listed so any well-formed footer parses; which of them the engine can
+/// actually decompress is decided by the reader.
+enum CompressionCodec {
+  UNCOMPRESSED = 0;
+  SNAPPY = 1;
+  GZIP = 2;
+  LZO = 3;
+  BROTLI = 4;
+  /// Deprecated Hadoop-framed LZ4 (undocumented framing, writer-dependent).
+  LZ4 = 5;
+  ZSTD = 6;
+  /// Raw LZ4 block format, one block per page.
+  LZ4_RAW = 7;
+}
+);
+
 thrift_union_all_empty!(
 /// Time unit for `Time` and `Timestamp` logical types.
 union TimeUnit {

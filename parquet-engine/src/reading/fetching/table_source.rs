@@ -491,6 +491,7 @@ mod tests {
             open_file: dummy.open_file.clone(),
             schema: dummy.schema.clone(),
             columns: vec![crate::types::metadata::ColumnChunkMeta {
+                codec: crate::thrift::general::CompressionCodec::SNAPPY,
                 dictionary_page_offset: None,
                 data_page_offset: 0,
                 total_compressed_size: compressed_size,
