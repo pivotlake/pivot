@@ -9,8 +9,9 @@ use arrow_array::{Array, ArrayRef, Scalar};
 use crossbeam_deque::Injector;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use parquet_engine::{
-    ParquetTable, PushedPredicate, ScanEqualityPredicate, materialize, prune_parquet,
-    row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
+    ParquetTable, PushedPredicate, ScanEqualityPredicate, gated_table_input, materialize,
+    plan_gated_scan, prune_parquet, row_group_filter_from, scan_order_from,
+    table_input_with_filter_and_eq_predicates,
 };
 use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Error as CatalogError, Result as CatalogResult,
@@ -185,6 +186,22 @@ impl BoundTable for TableBinding {
         // Order the scan by the Top-N's key so its boundary tightens after the
         // first row group and the rest get pruned, instead of racing file order.
         let scan_order = scan_order_from(&dynamic_filters);
+        // A row-ID scan (feeding a Materialize above) must keep every row in
+        // place, so only a plain scan may late-materialize behind its
+        // predicates.
+        if !emit_row_group_metadata {
+            if let Some(plan) = plan_gated_scan(&parquet, &self.predicates, &projection) {
+                return Ok(gated_table_input(
+                    dispatcher,
+                    &parquet,
+                    projection,
+                    plan,
+                    row_group_filter_from(dynamic_filters),
+                    scan_order,
+                    Arc::new(eq_predicates),
+                ));
+            }
+        }
         Ok(table_input_with_filter_and_eq_predicates(
             dispatcher,
             &parquet,
@@ -248,9 +265,7 @@ impl BoundTable for TableBinding {
         // equality/dictionary pruning) happens in `compile`, once the row-group
         // metadata exists. The upstream `Filter` is kept (we return `Ok(false)`),
         // so this is purely an optimization and never affects correctness.
-        if let Some(predicate) = PushedPredicate::from_filter(filter) {
-            self.predicates.push(predicate);
-        }
+        self.predicates.extend(PushedPredicate::from_filter(filter));
 
         Ok(false)
     }

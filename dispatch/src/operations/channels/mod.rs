@@ -45,11 +45,13 @@ pub use fan_in::{FanInChannelFactory, fan_in};
 
 mod return_to_worker;
 mod to_single_worker;
+mod worker_local;
 pub use return_to_worker::{
     ReturnToWorkerMpscFactory, WorkerAwareSender, WorkerIdOutput, return_to_worker_mpsc,
 };
 pub(crate) use to_single_worker::SingleWorkerMpscFactory;
 pub use to_single_worker::to_single_worker_mpsc;
+pub use worker_local::{WorkerLocalMpscFactory, worker_local_mpsc};
 
 #[derive(Debug, Error)]
 pub enum Error {

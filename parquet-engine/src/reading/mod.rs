@@ -23,6 +23,9 @@ pub use decompressor::{DecompressorFactory, Error as DecompressorError};
 pub(crate) mod decoding;
 pub use decoding::{ColumnDecoderError, DecoderFactory, ScanEqualityPredicate};
 
+mod gate;
+pub use gate::{Gate, GateFactory, GatePredicate, GatedScanPlan};
+
 mod materializer;
 pub use materializer::MaterializerFactory;
 
@@ -32,5 +35,6 @@ mod empty_projection_scan;
 
 mod scan;
 pub use scan::{
-    materialize, table_input, table_input_with_filter, table_input_with_filter_and_eq_predicates,
+    gated_table_input, materialize, table_input, table_input_with_filter,
+    table_input_with_filter_and_eq_predicates,
 };

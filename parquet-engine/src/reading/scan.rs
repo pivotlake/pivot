@@ -15,9 +15,10 @@ use arrow_array::RecordBatch;
 use dispatch::{
     DataFlowDispatcher, OperatorFactory, OperatorSpec, Projection, RECORD_BATCH_SIZE,
     RecordBatchOperatorSpec, RootUnaryOperatorFactory, UnaryOperatorFactory, return_to_worker_mpsc,
-    stealable, to_single_worker_mpsc,
+    stealable, to_single_worker_mpsc, worker_local_mpsc,
 };
 
+use crate::reading::gate::{GateFactory, GatedScanPlan};
 use crate::{
     CompressedPage, DecoderFactory, DecompressedPage, DecompressorFactory, IndexerFactory,
     MaterializerFactory, ParquetTable, RowGroupBuffer, RowGroupFetcherFactory,
@@ -174,6 +175,72 @@ pub fn table_input_with_filter_and_eq_predicates(
         eq_predicates,
         pending_row_groups,
         outstanding_row_groups,
+    )
+}
+
+/// In-scan late materialization: scan only the gate (pushed-predicate)
+/// columns, evaluate the predicates per row group as batches stream through a
+/// [`Gate`](crate::Gate), and re-enter the read pipeline with one request per
+/// surviving row group, masked to its surviving rows when that pays off.
+///
+/// Unlike [`materialize`], nothing funnels to one worker: a row group is
+/// decoded entirely by its claiming worker, so a worker-local channel lets
+/// each worker's gate see all of its row groups' batches, and requests stream
+/// out as each row group completes.
+pub fn gated_table_input(
+    dispatcher: &DataFlowDispatcher,
+    table: &Arc<ParquetTable>,
+    projection: Projection,
+    plan: GatedScanPlan,
+    filter: Option<RowGroupFilter>,
+    scan_order: Option<ScanOrder>,
+    eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+) -> RecordBatchOperatorSpec {
+    let narrow = table_input_with_filter_and_eq_predicates(
+        dispatcher,
+        table,
+        plan.gate_projection,
+        true,
+        filter,
+        scan_order,
+        eq_predicates,
+    );
+    let (dispatcher, mut heads) = narrow.into_parts();
+    let n = dispatcher.worker_count();
+    let siblings_gate = Arc::new(AtomicUsize::new(n));
+    let siblings_fetcher = Arc::new(AtomicUsize::new(n));
+
+    let pending_row_groups = pending_row_group_counters(n);
+    let claim_bound = pending_claim_bound(table);
+    let factories: Vec<_> = worker_local_mpsc::<RecordBatch>(n)
+        .into_iter()
+        .zip(stealable::<RowGroupRequest>(dispatcher.topology()))
+        .zip(pending_row_groups.iter())
+        .map(|((rb_ch, rq_ch), pending)| {
+            UnaryOperatorFactory::new(
+                UnaryOperatorFactory::new(
+                    heads.pop_front().unwrap(),
+                    GateFactory::new(plan.predicates.clone(), projection.clone(), table.clone()),
+                    rb_ch,
+                    siblings_gate.clone(),
+                ),
+                RowGroupFetcherFactory::new(pending.clone(), claim_bound),
+                rq_ch,
+                siblings_fetcher.clone(),
+            )
+        })
+        .collect();
+    let input = OperatorSpec::new(dispatcher, factories);
+    read_parquet(
+        input,
+        projection,
+        RECORD_BATCH_SIZE,
+        false,
+        Arc::new(Vec::new()),
+        pending_row_groups,
+        // The gated path claims by explicit row-group requests, not the
+        // injector, so this count is never consulted.
+        Arc::new(AtomicUsize::new(0)),
     )
 }
 

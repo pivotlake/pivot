@@ -38,9 +38,10 @@ pub use external::bind_read_parquet;
 
 pub(crate) mod reading;
 pub use reading::{
-    ColumnDecoderError, DecoderFactory, DecompressorError, DecompressorFactory, IndexerFactory,
-    MaterializerFactory, RowGroupFetcherFactory, RowGroupInjectorFactory, ScanEqualityPredicate,
-    materialize, pending_claim_bound, table_input, table_input_with_filter,
+    ColumnDecoderError, DecoderFactory, DecompressorError, DecompressorFactory, Gate, GateFactory,
+    GatePredicate, GatedScanPlan, IndexerFactory, MaterializerFactory, RowGroupFetcherFactory,
+    RowGroupInjectorFactory, ScanEqualityPredicate, gated_table_input, materialize,
+    pending_claim_bound, table_input, table_input_with_filter,
     table_input_with_filter_and_eq_predicates,
 };
 
@@ -52,7 +53,7 @@ pub use metadata::{FileRowGroups, create_load_and_stage_spec};
 pub use metadata::{file_row_groups_from_metadata, load_file_row_groups};
 
 mod pushdown;
-pub use pushdown::{PushedPredicate, prune_parquet};
+pub use pushdown::{PushedPredicate, plan_gated_scan, prune_parquet};
 
 mod row_group_stats;
 pub use row_group_stats::{

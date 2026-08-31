@@ -18,8 +18,8 @@ use planner::expression::{CompareType, TableFilter};
 use planner::types::{Type, type_from_physical};
 
 use crate::{
-    ParquetTable, PushedPredicate, ScanEqualityPredicate, is_variant_field, materialize,
-    prune_parquet, table_input_with_filter_and_eq_predicates,
+    ParquetTable, PushedPredicate, ScanEqualityPredicate, gated_table_input, is_variant_field,
+    materialize, plan_gated_scan, prune_parquet, table_input_with_filter_and_eq_predicates,
 };
 use object_storage::{
     DataFile, ExternalStoreFactory, FileRef, ObjectPath, ObjectStore, StoreScheme, local_path,
@@ -116,6 +116,22 @@ impl BoundTable for ExternalParquetTable {
             })
             .collect();
         let parquet = Arc::new(prune_parquet(&self.parquet, &self.predicates));
+        // A row-ID scan (feeding a Materialize above) must keep every row in
+        // place, so only a plain scan may late-materialize behind its
+        // predicates.
+        if !emit_row_group_metadata {
+            if let Some(plan) = plan_gated_scan(&parquet, &self.predicates, &projection) {
+                return Ok(gated_table_input(
+                    dispatcher,
+                    &parquet,
+                    projection,
+                    plan,
+                    crate::row_group_filter_from(dynamic_filters),
+                    None,
+                    Arc::new(equality_predicates),
+                ));
+            }
+        }
         Ok(table_input_with_filter_and_eq_predicates(
             dispatcher,
             &parquet,
@@ -156,9 +172,7 @@ impl BoundTable for ExternalParquetTable {
     }
 
     fn pushdown_filter(&mut self, filter: TableFilter) -> CatalogResult<bool> {
-        if let Some(predicate) = PushedPredicate::from_filter(filter) {
-            self.predicates.push(predicate);
-        }
+        self.predicates.extend(PushedPredicate::from_filter(filter));
         // Statistics and dictionaries may skip work, but the SQL filter stays
         // above the scan and remains responsible for query correctness.
         Ok(false)

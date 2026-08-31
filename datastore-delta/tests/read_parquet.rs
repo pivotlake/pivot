@@ -591,3 +591,154 @@ fn binding_captures_the_matching_file_set() {
     assert_eq!(first_int64(&batches), 1);
     assert_eq!(first_int64(&run_sql(&sql)), 2);
 }
+
+/// Rows whose `value` cycles `0..cycle`, so every row group spans the full
+/// value range and min/max stats prune nothing: a pushed comparison must gate
+/// at row level. Names are long, so the payload column dwarfs the gate column
+/// and the scan late-materializes behind the filter.
+fn write_wide_payload_cycling_values(
+    path: &std::path::Path,
+    rows: usize,
+    cycle: i64,
+    group_rows: usize,
+) {
+    let names: Vec<String> = (0..rows).map(wide_payload_name).collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let values: Vec<i64> = (0..rows as i64).map(|i| i % cycle).collect();
+    write_names_and_values_with_row_groups(path, &names, &values, Some(group_rows));
+}
+
+/// A long, poorly-compressible name, so the payload column's compressed bytes
+/// dwarf the gate column's and the scan late-materializes behind the filter.
+fn wide_payload_name(i: usize) -> String {
+    let mut state = i as u64 + 0x9E3779B97F4A7C15;
+    let suffix: String = (0..25)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            format!("{state:08x}")
+        })
+        .collect();
+    format!("row-{i:04}-{suffix}")
+}
+
+fn collect_names(batches: &[RecordBatch]) -> Vec<String> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .unwrap()
+                .iter()
+                .map(|name| name.unwrap().to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn gated_scan_returns_exact_rows_for_a_sparse_filter() {
+    let external = TempDir::new().unwrap();
+    let path = external.path().join("events.parquet");
+    write_wide_payload_cycling_values(&path, 256, 128, 128);
+    let sql = format!(
+        "SELECT name FROM read_parquet({}) WHERE value = 7 ORDER BY name",
+        quote_sql_string(&path.to_string_lossy())
+    );
+
+    let batches = run_sql(&sql);
+
+    assert_eq!(
+        collect_names(&batches),
+        [wide_payload_name(7), wide_payload_name(135)]
+    );
+}
+
+#[test]
+fn gated_scan_returns_exact_rows_for_an_unselective_filter() {
+    let external = TempDir::new().unwrap();
+    let path = external.path().join("events.parquet");
+    write_wide_payload_cycling_values(&path, 256, 128, 128);
+    let sql = format!(
+        "SELECT name FROM read_parquet({}) WHERE value >= 8 ORDER BY name",
+        quote_sql_string(&path.to_string_lossy())
+    );
+
+    let batches = run_sql(&sql);
+
+    let names = collect_names(&batches);
+    assert_eq!(names.len(), 240);
+    assert_eq!(names[0], wide_payload_name(8));
+    assert_eq!(names[239], wide_payload_name(255));
+}
+
+#[test]
+fn gated_scan_combines_multiple_pushed_comparisons() {
+    let external = TempDir::new().unwrap();
+    let path = external.path().join("events.parquet");
+    write_wide_payload_cycling_values(&path, 256, 128, 128);
+    let sql = format!(
+        "SELECT name FROM read_parquet({}) WHERE value > 5 AND value < 8 ORDER BY name",
+        quote_sql_string(&path.to_string_lossy())
+    );
+
+    let batches = run_sql(&sql);
+
+    assert_eq!(
+        collect_names(&batches),
+        [
+            wide_payload_name(6),
+            wide_payload_name(7),
+            wide_payload_name(134),
+            wide_payload_name(135),
+        ]
+    );
+}
+
+#[test]
+fn gated_scan_drops_null_gate_rows() {
+    let external = TempDir::new().unwrap();
+    let path = external.path().join("events.parquet");
+    let names: Vec<String> = (0..64).map(wide_payload_name).collect();
+    let values: Vec<Option<i64>> = (0..64)
+        .map(|i| match i {
+            5 => Some(1),
+            40 => Some(2),
+            _ => None,
+        })
+        .collect();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("name", DataType::Utf8View, false),
+        Field::new("value", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringViewArray::from(
+                names.iter().map(String::as_str).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(values)),
+        ],
+    )
+    .unwrap();
+    let properties = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+    let mut writer =
+        ArrowWriter::try_new(File::create(&path).unwrap(), schema, Some(properties)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let sql = format!(
+        "SELECT name FROM read_parquet({}) WHERE value <= 2 ORDER BY name",
+        quote_sql_string(&path.to_string_lossy())
+    );
+
+    let batches = run_sql(&sql);
+
+    assert_eq!(
+        collect_names(&batches),
+        [wide_payload_name(5), wide_payload_name(40)]
+    );
+}
