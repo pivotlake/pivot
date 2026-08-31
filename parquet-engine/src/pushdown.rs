@@ -176,6 +176,13 @@ pub fn prune_parquet(parquet: &ParquetTable, predicates: &[PushedPredicate]) -> 
 /// the gate and once for the output) stays a small fraction of the saving.
 const MIN_PAYLOAD_TO_GATE_BYTE_RATIO: i64 = 4;
 
+/// Gate only scans spanning at least this many row groups. The two waves add
+/// a fetch round trip and re-decode the gate columns per row group; across
+/// few groups that fixed cost has nothing to pipeline against and dominates,
+/// while a scan whose statistics already pruned it down that far has little
+/// left for the gate to save.
+const MIN_GATED_ROW_GROUPS: usize = 16;
+
 /// Whether `PIVOT_SCAN_GATE=off` disables predicate-gated scans, an escape
 /// hatch for isolating the gate's effect on a live server. Read once per
 /// process.
@@ -203,7 +210,7 @@ pub fn plan_gated_scan(
         return None;
     }
     let row_groups = parquet.row_groups();
-    if row_groups.is_empty() {
+    if row_groups.len() < MIN_GATED_ROW_GROUPS {
         return None;
     }
 
