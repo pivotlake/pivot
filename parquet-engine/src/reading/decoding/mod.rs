@@ -31,12 +31,30 @@ pub use column_decoder::Error as ColumnDecoderError;
 mod row_group_decoder;
 pub use row_group_decoder::RowGroupDecoder;
 
-/// A pushed-down equality predicate (`column == value`) used for dictionary
-/// pruning at scan time. When a row group's dictionary for the compared column
-/// excludes `value` (and the column chunk is fully dictionary encoded), the row
-/// group can emit no rows and is dropped without decoding its data pages.
+/// How a pushed-down constant predicate matches a column value against its
+/// constant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConstantMatch {
+    /// `column = constant`.
+    Equals,
+    /// `contains(column, constant)`: the constant appears anywhere in the
+    /// value (how `LIKE '%x%'` reaches the scan).
+    Contains,
+    /// `prefix(column, constant)`: the value starts with the constant
+    /// (`LIKE 'x%'`).
+    StartsWith,
+    /// `suffix(column, constant)`: the value ends with the constant
+    /// (`LIKE '%x'`).
+    EndsWith,
+}
+
+/// A pushed-down constant predicate (`column = value`, or a substring match
+/// against `value`) used for dictionary pruning at scan time. When no entry
+/// of a row group's dictionary for the compared column satisfies it (and the
+/// column chunk is fully dictionary encoded), the row group can emit no rows
+/// and is dropped without decoding its data pages.
 #[derive(Clone, Debug)]
-pub struct ScanEqualityPredicate {
+pub struct ScanConstantPredicate {
     /// The top-level column the comparison reads, indexing the table's full
     /// schema. For a variant path this is the variant column.
     pub column_idx: usize,
@@ -46,6 +64,7 @@ pub struct ScanEqualityPredicate {
     /// path resolves to in each file.
     pub path: Vec<String>,
     pub value: Scalar<ArrayRef>,
+    pub match_type: ConstantMatch,
 }
 
 /// Factory for creating [`Decoder`] instances, one per worker thread.
@@ -57,8 +76,8 @@ pub struct DecoderFactory {
     /// Whether to append row-group-id and row-index metadata columns to each
     /// output batch (used by the materializer path).
     pub add_row_group_metadata: bool,
-    /// Pushed-down equality predicates for dictionary pruning (may be empty).
-    pub eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+    /// Pushed-down constant predicates for dictionary pruning (may be empty).
+    pub constant_predicates: Arc<Vec<ScanConstantPredicate>>,
     /// This worker's claimed-but-not-fully-decoded row-group count, shared
     /// with its fetcher; decremented as row groups finish so the fetcher's
     /// claim backpressure releases (see `RowGroupFetcher`).
@@ -76,7 +95,7 @@ impl UnaryFactory<DecompressedPage, RecordBatch> for DecoderFactory {
             self.batch_size,
             self.projection,
             self.add_row_group_metadata,
-            self.eq_predicates,
+            self.constant_predicates,
             self.pending_row_groups,
             self.outstanding_row_groups,
         )
@@ -102,8 +121,8 @@ pub struct Decoder {
     /// are silently dropped.
     closed_row_groups: HashSet<usize>,
     add_row_group_metadata: bool,
-    /// Pushed-down equality predicates for dictionary pruning (may be empty).
-    eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+    /// Pushed-down constant predicates for dictionary pruning (may be empty).
+    constant_predicates: Arc<Vec<ScanConstantPredicate>>,
     /// How many claimed row groups this worker has not fully decoded yet.
     /// Shared with the worker's fetcher, which consults it as claim
     /// backpressure; decremented once per row group as it completes
@@ -118,7 +137,7 @@ impl Decoder {
         batch_size: usize,
         projection: Projection,
         add_row_group_metadata: bool,
-        eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+        constant_predicates: Arc<Vec<ScanConstantPredicate>>,
         pending_row_groups: Arc<AtomicUsize>,
         outstanding_row_groups: Arc<AtomicUsize>,
     ) -> Self {
@@ -129,7 +148,7 @@ impl Decoder {
             row_group_decoders: Vec::new(),
             closed_row_groups: Default::default(),
             add_row_group_metadata,
-            eq_predicates,
+            constant_predicates,
             pending_row_groups,
             outstanding_row_groups,
         }
@@ -167,7 +186,7 @@ impl Decoder {
                 &self.projection,
                 self.batch_size,
                 self.add_row_group_metadata,
-                &self.eq_predicates,
+                &self.constant_predicates,
             )
             .map_err(crate::op_err)?,
         );
@@ -234,7 +253,7 @@ impl Unary<DecompressedPage, RecordBatch> for Decoder {
         self.row_group_decoders[pos].insert_page(page, &mut self.allocator);
 
         // A just-inserted dictionary page may have pruned the row group (its
-        // dictionary excludes a pushed-down equality constant). Drop it without
+        // dictionary excludes a pushed-down constant predicate). Drop it without
         // emitting, and ignore its remaining in-flight data pages.
         if self.row_group_decoders[pos].pruned() {
             let row_group_idx = self.row_group_decoders[pos].row_group_idx();
@@ -278,7 +297,7 @@ impl Unary<DecompressedPage, RecordBatch> for Decoder {
 
 #[cfg(test)]
 mod tests {
-    use crate::reading::decoding::{Decoder, ScanEqualityPredicate};
+    use crate::reading::decoding::{ConstantMatch, Decoder, ScanConstantPredicate};
     use crate::thrift::general::Encoding;
     use crate::thrift::headers::PageHeader;
     use crate::types::metadata::{ColumnChunkMeta, QueryRowGroupMetadata, RowGroupMetadata};
@@ -454,14 +473,23 @@ mod tests {
         }
     }
 
-    fn string_eq_predicate(column_idx: usize, value: &str) -> ScanEqualityPredicate {
-        ScanEqualityPredicate {
+    fn string_predicate(
+        column_idx: usize,
+        value: &str,
+        match_type: ConstantMatch,
+    ) -> ScanConstantPredicate {
+        ScanConstantPredicate {
             column_idx,
             path: Vec::new(),
             value: Scalar::new(
                 Arc::new(arrow_array::StringViewArray::from(vec![value])) as ArrayRef
             ),
+            match_type,
         }
+    }
+
+    fn string_eq_predicate(column_idx: usize, value: &str) -> ScanConstantPredicate {
+        string_predicate(column_idx, value, ConstantMatch::Equals)
     }
 
     fn new_decoder(table: &Arc<ParquetTable>, batch_size: usize) -> Decoder {
@@ -478,7 +506,10 @@ mod tests {
         )
     }
 
-    fn decoder_with_eq(table: &Arc<ParquetTable>, predicate: ScanEqualityPredicate) -> Decoder {
+    fn decoder_with_predicate(
+        table: &Arc<ParquetTable>,
+        predicate: ScanConstantPredicate,
+    ) -> Decoder {
         Decoder::new(
             1024,
             Projection::all_from_schema(table.schema()),
@@ -509,7 +540,7 @@ mod tests {
         let dict = make_dict_page(metadata.clone(), 0, &["MAIL", "DELIVER IN PERSON", "SHIP"]);
         let strings = make_rle_data_page(metadata.clone(), 0, &[0, 1, 2, 1, 0], 0);
         let values = make_data_page(metadata, 1, encode_i32s(&[1, 2, 3, 4, 5]), 5, 0);
-        let decoder = decoder_with_eq(&table, string_eq_predicate(0, "DELIVER IN PERSON"));
+        let decoder = decoder_with_predicate(&table, string_eq_predicate(0, "DELIVER IN PERSON"));
 
         let out = run_unary_to_completion(decoder, vec![dict, strings, values]);
 
@@ -517,6 +548,61 @@ mod tests {
         assert_eq!(rows, vec![2, 4]);
         let kept: Vec<String> = out.iter().flat_map(|b| extract_strings(b, 0)).collect();
         assert_eq!(kept, vec!["DELIVER IN PERSON", "DELIVER IN PERSON"]);
+    }
+
+    /// A pushed string equality whose constant no dictionary entry holds
+    /// prunes the whole row group: nothing is decoded and nothing is emitted.
+    #[test]
+    fn string_equality_absent_from_dictionary_prunes_the_row_group() {
+        init_test_free_pool(4);
+        let table = string_and_i32_table(5, true);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, None);
+        let dict = make_dict_page(metadata.clone(), 0, &["MAIL", "DELIVER IN PERSON", "SHIP"]);
+        let strings = make_rle_data_page(metadata.clone(), 0, &[0, 1, 2, 1, 0], 0);
+        let values = make_data_page(metadata, 1, encode_i32s(&[1, 2, 3, 4, 5]), 5, 0);
+        let decoder = decoder_with_predicate(&table, string_eq_predicate(0, "TRUCK"));
+
+        let out = run_unary_to_completion(decoder, vec![dict, strings, values]);
+
+        assert_eq!(out.len(), 0);
+    }
+
+    /// A pushed contains predicate (`LIKE '%x%'`) whose needle appears in no
+    /// dictionary entry prunes the whole row group.
+    #[test]
+    fn contains_needle_absent_from_dictionary_prunes_the_row_group() {
+        init_test_free_pool(4);
+        let table = string_and_i32_table(5, true);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, None);
+        let dict = make_dict_page(metadata.clone(), 0, &["MAIL", "DELIVER IN PERSON", "SHIP"]);
+        let strings = make_rle_data_page(metadata.clone(), 0, &[0, 1, 2, 1, 0], 0);
+        let values = make_data_page(metadata, 1, encode_i32s(&[1, 2, 3, 4, 5]), 5, 0);
+        let predicate = string_predicate(0, "TRUCK", ConstantMatch::Contains);
+        let decoder = decoder_with_predicate(&table, predicate);
+
+        let out = run_unary_to_completion(decoder, vec![dict, strings, values]);
+
+        assert_eq!(out.len(), 0);
+    }
+
+    /// A contains predicate whose needle some dictionary entry holds cannot
+    /// prune, and unlike an equality it does not view-filter batches either:
+    /// every row survives for the query's `Filter` to judge.
+    #[test]
+    fn contains_needle_present_in_dictionary_keeps_every_row() {
+        init_test_free_pool(4);
+        let table = string_and_i32_table(5, true);
+        let metadata = QueryRowGroupMetadata::new(&table, 0, None);
+        let dict = make_dict_page(metadata.clone(), 0, &["MAIL", "DELIVER IN PERSON", "SHIP"]);
+        let strings = make_rle_data_page(metadata.clone(), 0, &[0, 1, 2, 1, 0], 0);
+        let values = make_data_page(metadata, 1, encode_i32s(&[1, 2, 3, 4, 5]), 5, 0);
+        let predicate = string_predicate(0, "LIVER", ConstantMatch::Contains);
+        let decoder = decoder_with_predicate(&table, predicate);
+
+        let out = run_unary_to_completion(decoder, vec![dict, strings, values]);
+
+        let rows: Vec<i32> = out.iter().flat_map(|b| extract_i32s(b, 1)).collect();
+        assert_eq!(rows, vec![1, 2, 3, 4, 5]);
     }
 
     /// A duplicated dictionary entry makes the single-view test unfaithful,
@@ -530,7 +616,7 @@ mod tests {
         let dict = make_dict_page(metadata.clone(), 0, &["AIR", "AIR", "RAIL"]);
         let strings = make_rle_data_page(metadata.clone(), 0, &[0, 1, 2], 0);
         let values = make_data_page(metadata, 1, encode_i32s(&[1, 2, 3]), 3, 0);
-        let decoder = decoder_with_eq(&table, string_eq_predicate(0, "AIR"));
+        let decoder = decoder_with_predicate(&table, string_eq_predicate(0, "AIR"));
 
         let out = run_unary_to_completion(decoder, vec![dict, strings, values]);
 
@@ -548,7 +634,7 @@ mod tests {
         let dict = make_dict_page(metadata.clone(), 0, &["MAIL", "SHIP"]);
         let strings = make_rle_data_page(metadata.clone(), 0, &[0, 1, 0], 0);
         let values = make_data_page(metadata, 1, encode_i32s(&[1, 2, 3]), 3, 0);
-        let decoder = decoder_with_eq(&table, string_eq_predicate(0, "MAIL"));
+        let decoder = decoder_with_predicate(&table, string_eq_predicate(0, "MAIL"));
 
         let out = run_unary_to_completion(decoder, vec![dict, strings, values]);
 

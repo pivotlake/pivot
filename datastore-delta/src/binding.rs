@@ -9,8 +9,9 @@ use arrow_array::{Array, ArrayRef, Scalar};
 use crossbeam_deque::Injector;
 use dispatch::{DataFlowDispatcher, Projection, RecordBatchOperatorSpec};
 use parquet_engine::{
-    ParquetTable, PushedPredicate, ScanEqualityPredicate, materialize, prune_parquet,
-    row_group_filter_from, scan_order_from, table_input_with_filter_and_eq_predicates,
+    ParquetTable, PredicateOperation, PushedPredicate, ScanConstantPredicate, materialize,
+    prune_parquet, row_group_filter_from, scan_order_from,
+    table_input_with_filter_and_constant_predicates,
 };
 use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Error as CatalogError, Result as CatalogResult,
@@ -105,7 +106,7 @@ impl TableBinding {
     fn partition_filter_candidates(&self) -> impl Iterator<Item = PartitionEqFilter> + '_ {
         self.predicates
             .iter()
-            .filter(|p| matches!(p.compare_type, CompareType::Equal))
+            .filter(|p| matches!(p.operation, PredicateOperation::Compare(CompareType::Equal)))
             .filter_map(|p| {
                 Some(PartitionEqFilter {
                     column: self.columns.get(p.column_idx)?.name.clone(),
@@ -124,9 +125,14 @@ impl TableBinding {
             .iter()
             .filter(|p| p.path.is_empty())
             .filter_map(|p| {
+                // A substring match has no min/max semantics; it prunes by
+                // dictionary at scan time instead.
+                let PredicateOperation::Compare(compare_type) = p.operation else {
+                    return None;
+                };
                 Some(ColumnStatFilter {
                     column: self.columns.get(p.column_idx)?.name.clone(),
-                    compare_type: p.compare_type,
+                    compare_type,
                     value: p.value.clone(),
                 })
             })
@@ -169,15 +175,10 @@ impl BoundTable for TableBinding {
 
         // A variant path predicate reaches its shredded typed leaf only in the
         // files that shred it, so each row group resolves the path itself.
-        let eq_predicates: Vec<ScanEqualityPredicate> = self
+        let constant_predicates: Vec<ScanConstantPredicate> = self
             .predicates
             .iter()
-            .filter(|p| matches!(p.compare_type, CompareType::Equal))
-            .map(|p| ScanEqualityPredicate {
-                column_idx: p.column_idx,
-                path: p.path.clone(),
-                value: p.value.clone(),
-            })
+            .filter_map(PushedPredicate::scan_predicate)
             .collect();
 
         // Prune the row groups by the pushed-down predicates' stats.
@@ -185,14 +186,14 @@ impl BoundTable for TableBinding {
         // Order the scan by the Top-N's key so its boundary tightens after the
         // first row group and the rest get pruned, instead of racing file order.
         let scan_order = scan_order_from(&dynamic_filters);
-        Ok(table_input_with_filter_and_eq_predicates(
+        Ok(table_input_with_filter_and_constant_predicates(
             dispatcher,
             &parquet,
             projection,
             emit_row_group_metadata,
             row_group_filter_from(dynamic_filters),
             scan_order,
-            Arc::new(eq_predicates),
+            Arc::new(constant_predicates),
         ))
     }
 

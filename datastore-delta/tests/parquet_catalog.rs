@@ -30,7 +30,7 @@ use planner::catalog::{
     SchemaQualifiedTableName,
 };
 use planner::expression::{
-    Compare, CompareType, Expression, Function, Ref, TableFilter, VariantGet,
+    Compare, CompareType, Contains, Expression, Function, Ref, TableFilter, VariantGet,
 };
 use planner::operator::{Input, Operator};
 use planner::types::Type;
@@ -720,6 +720,131 @@ fn pushdown_filter_keeps_row_groups_when_constant_outside_range() {
         .unwrap();
 
     assert_eq!(row_group_count(&datastore, "t", &table), 3);
+}
+
+/// The filter DuckDB pushes for `name LIKE '%needle%'` after its optimizer
+/// rewrites the pattern: `contains(name, needle)` over the `three_row_table`
+/// schema's string column.
+fn name_contains_filter(needle: &str) -> TableFilter {
+    TableFilter::Expression(Box::new(Expression::Function(Function::Contains(
+        Contains {
+            needle: Box::new(Expression::Constant(Scalar::new(
+                Arc::new(StringViewArray::from(vec![needle])) as ArrayRef,
+            ))),
+            haystack: Box::new(Expression::Ref(Ref {
+                column_idx: 1,
+                return_type: Type::Utf8,
+                name: None,
+            })),
+        },
+    ))))
+}
+
+/// Like [`three_row_table`] but snappy-compressed, which is what the scan
+/// pipeline's decompressor expects; use this for a test that decodes page
+/// contents rather than only counting row groups.
+fn three_row_snappy_table() -> (TempDir, Vec<Column>) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8View, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![10, 20, 30])) as ArrayRef,
+            Arc::new(StringViewArray::from(vec!["a", "b", "c"])) as ArrayRef,
+        ],
+    )
+    .unwrap();
+    let dir = TempDir::new().unwrap();
+    let props = WriterProperties::builder()
+        .set_statistics_enabled(EnabledStatistics::Chunk)
+        .set_compression(parquet::basic::Compression::SNAPPY)
+        .set_max_row_group_row_count(Some(1))
+        .build();
+    let file = File::create(dir.path().join("data.parquet")).unwrap();
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+    let columns = vec![
+        Column {
+            name: "id".to_string(),
+            col_type: Type::Int32,
+        },
+        Column {
+            name: "name".to_string(),
+            col_type: Type::Utf8,
+        },
+    ];
+    (dir, columns)
+}
+
+/// A pushed substring match has no min/max semantics, so it prunes nothing
+/// statically; at scan time every row group whose dictionary holds no entry
+/// containing the needle is dropped before its data pages are decoded.
+#[test]
+fn pushdown_filter_contains_prunes_row_groups_by_dictionary() {
+    let (dir, columns) = three_row_snappy_table();
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
+    let mut table = datastore
+        .clone()
+        .begin_transaction()
+        .table(
+            DEFAULT_DATASTORE_NAME,
+            &SchemaQualifiedTableName::in_default_schema("t"),
+        )
+        .unwrap();
+
+    table.pushdown_filter(name_contains_filter("b")).unwrap();
+
+    assert_eq!(
+        row_group_count(&datastore, "t", &table),
+        3,
+        "statistics cannot answer a substring match"
+    );
+    let batches = table
+        .compile_scan(&dispatcher(), Projection::all(2), Vec::new(), false)
+        .unwrap()
+        .collect()
+        .unwrap();
+    let names: Vec<&str> = batches
+        .iter()
+        .flat_map(|batch| batch.column(1).as_string_view().iter().flatten())
+        .collect();
+    assert_eq!(names, vec!["b"]);
+}
+
+/// The whole `LIKE` path: DuckDB's optimizer rewrites `name LIKE '%b%'` into
+/// `contains(name, 'b')` and offers it to the binding's filter pushdown, so
+/// the scan alone (compiled before the plan's own `Filter`) already drops the
+/// row groups whose dictionaries hold no entry containing the needle.
+#[test]
+fn like_filter_reaches_the_scan_and_prunes_by_dictionary() {
+    let (dir, columns) = three_row_snappy_table();
+    let (_database, datastore) = empty_datastore();
+    create_table(&datastore, create_request("t", dir.path(), columns)).unwrap();
+
+    let catalog = single_catalog(&datastore);
+    let transaction = catalog.begin_transaction();
+    let mut planner = Planner::from_datastore_names(
+        vec![DEFAULT_DATASTORE_NAME.to_string()],
+        DEFAULT_DATASTORE_NAME.to_string(),
+    )
+    .unwrap();
+    let plan = planner
+        .plan("SELECT name FROM t WHERE name LIKE '%b%'", transaction)
+        .unwrap();
+    let input = first_input(&plan.root).expect("query has a table scan");
+
+    let batches = input
+        .table
+        .compile_scan(&dispatcher(), Projection::all(2), Vec::new(), false)
+        .unwrap()
+        .collect()
+        .unwrap();
+
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
 }
 
 /// Write one Parquet file of `ids` (single row group) into `dir`, mirroring the

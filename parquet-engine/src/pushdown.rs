@@ -10,9 +10,10 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, Scalar, TimestampMicrosecondArray};
 use arrow_schema::{DataType, TimeUnit};
 
-use planner::expression::{CompareType, Expression, Function, JsonPath, TableFilter};
+use planner::expression::{Compare, CompareType, Expression, Function, JsonPath, TableFilter};
 use planner::types::{Type, UTC_TIMEZONE, physical_arrow_type};
 
+use super::reading::{ConstantMatch, ScanConstantPredicate};
 use super::row_group_stats::row_group_eliminated;
 use super::types::leaves::{
     first_leaf, leaf_fields, variant_shredded_leaves, variant_value_leaf_is_semantically_null,
@@ -20,12 +21,26 @@ use super::types::leaves::{
 use super::types::metadata::RowGroupMetadata;
 use super::types::table::ParquetTable;
 
-/// A single-column constant comparison offered by DuckDB during filter
+/// What a pushed predicate applies between its column and its constant.
+#[derive(Clone, Copy, Debug)]
+pub enum PredicateOperation {
+    /// An ordered comparison. Its min/max statistics can eliminate row groups,
+    /// and an equality additionally prunes by dictionary at scan time.
+    Compare(CompareType),
+    /// A substring-flavored string match (`contains`/`prefix`/`suffix`,
+    /// DuckDB's rewrites of the single-literal `LIKE` patterns). Statistics
+    /// cannot answer it; only dictionary pruning applies. Never
+    /// [`ConstantMatch::Equals`]: an equality arrives as
+    /// `Compare(CompareType::Equal)`.
+    Match(ConstantMatch),
+}
+
+/// A single-column constant predicate offered by DuckDB during filter
 /// pushdown. Parquet-backed bindings record it and apply it when they compile,
 /// while retaining the upstream SQL filter for correctness.
 #[derive(Clone, Debug)]
 pub struct PushedPredicate {
-    /// The top-level column the comparison reads. For a variant path this is
+    /// The top-level column the predicate reads. For a variant path this is
     /// the variant column; the predicate prunes against the path's shredded
     /// leaf.
     pub column_idx: usize,
@@ -34,20 +49,27 @@ pub struct PushedPredicate {
     /// The SQL cast's physical output type for a variant path. Pruning against
     /// the raw typed leaf is sound only when this is a semantic identity.
     as_type: Option<arrow_schema::DataType>,
-    pub compare_type: CompareType,
+    pub operation: PredicateOperation,
     pub value: Scalar<ArrayRef>,
 }
 
 impl PushedPredicate {
-    /// Recognize the predicate shapes whose Parquet statistics can safely
-    /// eliminate row groups. Unsupported shapes are left entirely upstream.
+    /// Recognize the predicate shapes the scan can prune by: constant
+    /// comparisons (whose Parquet statistics can safely eliminate row groups)
+    /// and substring-flavored string matches (which prune by dictionary).
+    /// Unsupported shapes are left entirely upstream.
     pub fn from_filter(filter: TableFilter) -> Option<Self> {
         let TableFilter::Expression(expr) = filter else {
             return None;
         };
-        let Expression::Compare(compare) = expr.as_ref() else {
-            return None;
-        };
+        match expr.as_ref() {
+            Expression::Compare(compare) => Self::from_compare(compare),
+            Expression::Function(function) => Self::from_string_match(function),
+            _ => None,
+        }
+    }
+
+    fn from_compare(compare: &Compare) -> Option<Self> {
         let (column_expr, constant) = match (compare.left.as_ref(), compare.right.as_ref()) {
             (column, Expression::Constant(value)) => (column, value),
             // DuckDB normally canonicalizes the column to the left. Keep
@@ -77,8 +99,60 @@ impl PushedPredicate {
             column_idx: column.column_idx,
             path: column.path,
             as_type: column.as_type,
-            compare_type: compare.compare_type,
+            operation: PredicateOperation::Compare(compare.compare_type),
             value,
+        })
+    }
+
+    /// Recognize `contains(column, 'x')` / `prefix(column, 'x')` /
+    /// `suffix(column, 'x')` on a plain string column. Variant paths stay
+    /// upstream: a substring match reaches the scan only through these string
+    /// functions, whose haystack is a direct column reference.
+    fn from_string_match(function: &Function) -> Option<Self> {
+        let (haystack, needle, match_type) = match function {
+            Function::Contains(contains) => (
+                &contains.haystack,
+                &contains.needle,
+                ConstantMatch::Contains,
+            ),
+            Function::Prefix(prefix) => {
+                (&prefix.haystack, &prefix.prefix, ConstantMatch::StartsWith)
+            }
+            Function::Suffix(suffix) => (&suffix.haystack, &suffix.suffix, ConstantMatch::EndsWith),
+            _ => return None,
+        };
+        let Expression::Ref(reference) = haystack.as_ref() else {
+            return None;
+        };
+        if reference.return_type != Type::Utf8 {
+            return None;
+        }
+        let Expression::Constant(value) = needle.as_ref() else {
+            return None;
+        };
+        Some(Self {
+            column_idx: reference.column_idx,
+            path: Vec::new(),
+            as_type: None,
+            operation: PredicateOperation::Match(match_type),
+            value: value.clone(),
+        })
+    }
+
+    /// This predicate as a decoder-side [`ScanConstantPredicate`] (dictionary
+    /// pruning, and batch filtering for an equality), or `None` for a
+    /// comparison a dictionary cannot answer.
+    pub fn scan_predicate(&self) -> Option<ScanConstantPredicate> {
+        let match_type = match self.operation {
+            PredicateOperation::Compare(CompareType::Equal) => ConstantMatch::Equals,
+            PredicateOperation::Match(match_type) => match_type,
+            PredicateOperation::Compare(_) => return None,
+        };
+        Some(ScanConstantPredicate {
+            column_idx: self.column_idx,
+            path: self.path.clone(),
+            value: self.value.clone(),
+            match_type,
         })
     }
 
@@ -117,16 +191,16 @@ pub fn prune_parquet(parquet: &ParquetTable, predicates: &[PushedPredicate]) -> 
     let mut parquet = parquet.clone();
     parquet.row_groups_mut().retain(|rg| {
         !predicates.iter().any(|predicate| {
+            // Only a comparison has min/max semantics; a substring match
+            // prunes by dictionary at scan time instead.
+            let PredicateOperation::Compare(compare_type) = predicate.operation else {
+                return false;
+            };
             predicate
                 .leaf_for_row_group(rg.as_ref())
                 .is_some_and(|leaf| {
-                    row_group_eliminated(
-                        rg.as_ref(),
-                        leaf,
-                        predicate.compare_type,
-                        &predicate.value,
-                    )
-                    .unwrap_or(false)
+                    row_group_eliminated(rg.as_ref(), leaf, compare_type, &predicate.value)
+                        .unwrap_or(false)
                 })
         })
     });

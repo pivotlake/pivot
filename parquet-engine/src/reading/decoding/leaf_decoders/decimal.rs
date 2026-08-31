@@ -24,6 +24,7 @@ use arrow_array::types::{Decimal64Type, Decimal128Type, DecimalType};
 use arrow_array::{ArrayRef, ArrowPrimitiveType, RecordBatch, Scalar};
 use bytes::Bytes;
 
+use crate::reading::decoding::ConstantMatch;
 use crate::reading::decoding::leaf_decoders::primitive::ElemPtr;
 use crate::reading::decoding::leaf_decoders::{
     DecimalDeltaDecoder, DecodePlain, Dict, DictFromBytes, DictFromVecBytes, Error, FromDelta,
@@ -244,13 +245,13 @@ impl<T: DecimalCarrier, S: DecimalStorage, B: Index<usize, Output = T::Native>> 
 {
     type Builder = PrimitiveBuilder<T>;
     type Item = T::Native;
-    type EqConstant = T::Native;
+    type Constant = T::Native;
 
     /// The unscaled integer of a single-element decimal scalar of the
     /// carrier's width. The pushed constant is bound by DuckDB to the
     /// column's own type, so its scale matches the column's and the raw
     /// integers compare directly.
-    fn eq_constant_from_scalar(scalar: &Scalar<ArrayRef>) -> Option<T::Native> {
+    fn constant_from_scalar(scalar: &Scalar<ArrayRef>) -> Option<T::Native> {
         let (arr, _) = arrow_array::Datum::get(scalar);
         let decimal = arr.as_primitive_opt::<T>()?;
         (decimal.len() == 1).then(|| decimal.value(0))
@@ -259,11 +260,21 @@ impl<T: DecimalCarrier, S: DecimalStorage, B: Index<usize, Output = T::Native>> 
     /// Scans the raw dictionary bytes for `needle` without building the
     /// dictionary, chunked like [`read_decimals`]: each buffer's whole values
     /// are decoded off its contiguous slice, and only a value straddling a
-    /// buffer boundary goes through a reader.
+    /// buffer boundary goes through a reader. Substring matches never install
+    /// here (their constants are strings, which [`Self::constant_from_scalar`]
+    /// rejects), so anything but an equality cannot rule the row group out.
     // `as_chunks` wants the width as a const-generic argument, which an
     // associated const of a generic parameter cannot be.
     #[allow(clippy::chunks_exact_to_as_chunks)]
-    fn maybe_contains(data: &[Bytes], size: usize, needle: &T::Native) -> bool {
+    fn maybe_matches(
+        data: &[Bytes],
+        size: usize,
+        needle: &T::Native,
+        match_type: ConstantMatch,
+    ) -> bool {
+        if match_type != ConstantMatch::Equals {
+            return true;
+        }
         let mut position = ReaderPosition::default();
         let mut remaining = size;
         while remaining > 0 {
@@ -392,12 +403,12 @@ impl<T: DecimalCarrier, S: DecimalStorage> LeafDecoder for DecimalLeafDecoder<T,
         Ok(Arc::new(restamped))
     }
 
-    fn set_eq_constant(&mut self, value: &Scalar<ArrayRef>) {
-        self.inner.set_eq_constant(value);
+    fn set_constant_predicate(&mut self, value: &Scalar<ArrayRef>, match_type: ConstantMatch) {
+        self.inner.set_constant_predicate(value, match_type);
     }
 
-    fn dict_excludes_eq_constant(&self) -> bool {
-        self.inner.dict_excludes_eq_constant()
+    fn dict_excludes_constant(&self) -> bool {
+        self.inner.dict_excludes_constant()
     }
 
     fn fast_filter_record_batch(&self, batch: RecordBatch, column: usize) -> RecordBatch {

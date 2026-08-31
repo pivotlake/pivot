@@ -37,6 +37,7 @@ mod rle;
 mod typed;
 pub use typed::TypedLeafDecoder;
 
+use crate::reading::decoding::ConstantMatch;
 use crate::thrift::general::Encoding;
 use crate::types::page::DecompressedPage;
 use arrow_array::{ArrayRef, RecordBatch, Scalar};
@@ -87,17 +88,19 @@ pub trait LeafDecoder {
     /// Decodes the next `size` rows into an Arrow array.
     fn read(&mut self, allocator: &mut SlabAllocator, size: usize) -> Result<ArrayRef>;
 
-    /// Installs a pushed-down equality constant. A constant whose type does
-    /// not match the column is ignored (the query's `Filter` still applies
-    /// the condition). Once the dictionary is built the constant decides
-    /// row-group pruning and scan-side batch filtering.
-    fn set_eq_constant(&mut self, value: &Scalar<ArrayRef>);
+    /// Installs a pushed-down constant predicate (`column = value`, or a
+    /// substring match against `value`). A constant whose type does not match
+    /// the column is ignored (the query's `Filter` still applies the
+    /// condition). Once the dictionary is built the predicate decides
+    /// row-group pruning and, for an equality, scan-side batch filtering.
+    fn set_constant_predicate(&mut self, value: &Scalar<ArrayRef>, match_type: ConstantMatch);
 
     /// Whether the loaded dictionary is known to exclude the pushed-down
-    /// equality constant, meaning no row of this column can match and the row
+    /// constant predicate, meaning no row of this column can match and the row
     /// group can be pruned. `false` until a dictionary page proves otherwise
-    /// (no constant pushed, dictionary not loaded yet, or constant present).
-    fn dict_excludes_eq_constant(&self) -> bool {
+    /// (no predicate pushed, dictionary not loaded yet, or a matching entry
+    /// present).
+    fn dict_excludes_constant(&self) -> bool {
         false
     }
 
@@ -169,24 +172,30 @@ pub trait DecodeDelta: Sized {
 pub trait Dict {
     type Builder: ArrayBuilder;
     type Item;
-    /// How a pushed-down equality constant is represented for this
-    /// dictionary flavour. Primitive dictionaries take the native value;
-    /// byte-view dictionaries take the raw bytes, because the value's Arrow
-    /// view can only be resolved against a dictionary that has been built.
-    type EqConstant;
+    /// How a pushed-down constant is represented for this dictionary flavour.
+    /// Primitive dictionaries take the native value; byte-view dictionaries
+    /// take the raw bytes, because the value's Arrow view can only be
+    /// resolved against a dictionary that has been built.
+    type Constant;
 
     /// Converts a pushed-down constant into this dictionary flavour's own
     /// representation, or `None` when the scalar's type does not match the
     /// column (which simply forgoes the pushdown; the query's `Filter` still
     /// applies the condition).
-    fn eq_constant_from_scalar(scalar: &Scalar<ArrayRef>) -> Option<Self::EqConstant>;
+    fn constant_from_scalar(scalar: &Scalar<ArrayRef>) -> Option<Self::Constant>;
 
-    /// Whether `needle` might appear among the first `size` raw entries of
-    /// `data`, checked without building the dictionary. Only a definite `no`
-    /// matters - it prunes the row group and the dictionary is never
-    /// materialized - so answering `true` is always sound. The default cannot
-    /// rule anything out; implementations override it to enable the pushdown.
-    fn maybe_contains(_data: &[Bytes], _size: usize, _needle: &Self::EqConstant) -> bool {
+    /// Whether any of the first `size` raw entries of `data` might satisfy
+    /// `match_type` against `needle`, checked without building the dictionary.
+    /// Only a definite `no` matters - it prunes the row group and the
+    /// dictionary is never materialized - so answering `true` is always
+    /// sound. The default cannot rule anything out; implementations override
+    /// it to enable the pushdown.
+    fn maybe_matches(
+        _data: &[Bytes],
+        _size: usize,
+        _needle: &Self::Constant,
+        _match_type: ConstantMatch,
+    ) -> bool {
         true
     }
 
@@ -221,7 +230,7 @@ pub trait Dict {
         &self,
         batch: RecordBatch,
         _column: usize,
-        _needle: &Self::EqConstant,
+        _needle: &Self::Constant,
     ) -> RecordBatch {
         batch
     }

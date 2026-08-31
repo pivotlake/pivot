@@ -14,12 +14,12 @@ use planner::catalog::{
     BoundTable, Column, DynamicScanPredicate, Result as CatalogResult, TableReference,
     TableRevision,
 };
-use planner::expression::{CompareType, TableFilter};
+use planner::expression::TableFilter;
 use planner::types::{Type, type_from_physical};
 
 use crate::{
-    ParquetTable, PushedPredicate, ScanEqualityPredicate, is_variant_field, materialize,
-    prune_parquet, table_input_with_filter_and_eq_predicates,
+    ParquetTable, PushedPredicate, ScanConstantPredicate, is_variant_field, materialize,
+    prune_parquet, table_input_with_filter_and_constant_predicates,
 };
 use object_storage::{
     DataFile, ExternalStoreFactory, FileRef, ObjectPath, ObjectStore, StoreScheme, local_path,
@@ -105,25 +105,20 @@ impl BoundTable for ExternalParquetTable {
         dynamic_filters: Vec<DynamicScanPredicate>,
         emit_row_group_metadata: bool,
     ) -> CatalogResult<RecordBatchOperatorSpec> {
-        let equality_predicates = self
+        let constant_predicates: Vec<ScanConstantPredicate> = self
             .predicates
             .iter()
-            .filter(|predicate| matches!(predicate.compare_type, CompareType::Equal))
-            .map(|predicate| ScanEqualityPredicate {
-                column_idx: predicate.column_idx,
-                path: predicate.path.clone(),
-                value: predicate.value.clone(),
-            })
+            .filter_map(PushedPredicate::scan_predicate)
             .collect();
         let parquet = Arc::new(prune_parquet(&self.parquet, &self.predicates));
-        Ok(table_input_with_filter_and_eq_predicates(
+        Ok(table_input_with_filter_and_constant_predicates(
             dispatcher,
             &parquet,
             projection,
             emit_row_group_metadata,
             crate::row_group_filter_from(dynamic_filters),
             None,
-            Arc::new(equality_predicates),
+            Arc::new(constant_predicates),
         ))
     }
 

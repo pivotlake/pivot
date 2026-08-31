@@ -3384,6 +3384,7 @@ dependencies = [
  "criterion",
  "crossbeam-deque",
  "dispatch",
+ "memchr",
  "object-storage",
  "parquet",
  "parquet-variant",

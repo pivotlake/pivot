@@ -27,7 +27,7 @@ use parquet_engine::writing::{AssembledFile, encode_record_batches_spec, unshred
 /// emits the inserted-row count. Each finished file is pushed onto `uploaded_files`
 /// for the statement's transaction to commit (by the table's durable id). This is
 /// the write mirror of the scan's
-/// [`table_input_with_filter_and_eq_predicates`](parquet_engine::table_input_with_filter_and_eq_predicates):
+/// [`table_input_with_filter_and_constant_predicates`](parquet_engine::table_input_with_filter_and_constant_predicates):
 /// it wires the encode pipeline into this module's upload operators. Driven by
 /// the binding's `BoundTable::compile_insert` impl (see [`super::binding::TableBinding`]).
 pub(super) fn build_insert_spec(

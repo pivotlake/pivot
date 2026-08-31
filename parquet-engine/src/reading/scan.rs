@@ -21,7 +21,7 @@ use dispatch::{
 use crate::{
     CompressedPage, DecoderFactory, DecompressedPage, DecompressorFactory, IndexerFactory,
     MaterializerFactory, ParquetTable, RowGroupBuffer, RowGroupFetcherFactory,
-    RowGroupInjectorFactory, RowGroupRequest, ScanEqualityPredicate, ScanOrder,
+    RowGroupInjectorFactory, RowGroupRequest, ScanConstantPredicate, ScanOrder,
     pending_claim_bound,
 };
 
@@ -32,7 +32,7 @@ pub(crate) fn read_parquet<OF>(
     projection: Projection,
     batch_size: usize,
     add_row_group_metadata: bool,
-    eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+    constant_predicates: Arc<Vec<ScanConstantPredicate>>,
     pending_row_groups: Vec<Arc<AtomicUsize>>,
     outstanding_row_groups: Arc<AtomicUsize>,
 ) -> RecordBatchOperatorSpec
@@ -60,7 +60,7 @@ where
                     batch_size,
                     projection: projection.clone(),
                     add_row_group_metadata,
-                    eq_predicates: eq_predicates.clone(),
+                    constant_predicates: constant_predicates.clone(),
                     pending_row_groups: pending,
                     outstanding_row_groups: outstanding_row_groups.clone(),
                 })
@@ -84,7 +84,7 @@ pub fn table_input(
     projection: Projection,
     add_row_group_metadata: bool,
 ) -> RecordBatchOperatorSpec {
-    table_input_with_filter_and_eq_predicates(
+    table_input_with_filter_and_constant_predicates(
         dispatcher,
         table,
         projection,
@@ -104,7 +104,7 @@ pub fn table_input_with_filter(
     add_row_group_metadata: bool,
     filter: Option<RowGroupFilter>,
 ) -> RecordBatchOperatorSpec {
-    table_input_with_filter_and_eq_predicates(
+    table_input_with_filter_and_constant_predicates(
         dispatcher,
         table,
         projection,
@@ -116,16 +116,16 @@ pub fn table_input_with_filter(
 }
 
 /// Like [`table_input`] but with both a dynamic [`RowGroupFilter`] and
-/// pushed-down equality predicates (the decoder pruning row groups by
+/// pushed-down constant predicates (the decoder pruning row groups by
 /// dictionary contents). Either can be inert (`None` / empty `Vec`).
-pub fn table_input_with_filter_and_eq_predicates(
+pub fn table_input_with_filter_and_constant_predicates(
     dispatcher: &DataFlowDispatcher,
     table: &Arc<ParquetTable>,
     projection: Projection,
     add_row_group_metadata: bool,
     filter: Option<RowGroupFilter>,
     scan_order: Option<ScanOrder>,
-    eq_predicates: Arc<Vec<ScanEqualityPredicate>>,
+    constant_predicates: Arc<Vec<ScanConstantPredicate>>,
 ) -> RecordBatchOperatorSpec {
     let n = dispatcher.worker_count();
     // A projection with no data columns can't go through the column-driven page
@@ -171,7 +171,7 @@ pub fn table_input_with_filter_and_eq_predicates(
         projection,
         RECORD_BATCH_SIZE,
         add_row_group_metadata,
-        eq_predicates,
+        constant_predicates,
         pending_row_groups,
         outstanding_row_groups,
     )

@@ -14,6 +14,7 @@
 //! are type aliases over `TypedLeafDecoder` with the appropriate type
 //! parameters.
 
+use crate::reading::decoding::ConstantMatch;
 use crate::reading::decoding::leaf_decoders::levels::decode_def_levels;
 use crate::reading::decoding::leaf_decoders::rle::RleDecoder;
 use crate::reading::decoding::leaf_decoders::{
@@ -235,7 +236,7 @@ impl<DC: DictFromBytes, DS: DictFromVecBytes> DictStorage<DC, DS> {
 pub struct TypedLeafDecoder<DC, DS, B, P>
 where
     DC: DictFromBytes<Builder = B, Item = B::Element>,
-    DS: DictFromVecBytes<Builder = B, Item = B::Element, EqConstant = DC::EqConstant>,
+    DS: DictFromVecBytes<Builder = B, Item = B::Element, Constant = DC::Constant>,
     B: ArrayBuilder,
     P: DecodePlain<Builder = B>,
 {
@@ -249,21 +250,22 @@ where
     read_page: Option<ReadPage<P>>,
     /// Dictionary built from a dictionary page, if one has been received.
     dict: Option<DictStorage<DC, DS>>,
-    /// The pushed-down equality constant, in this dictionary flavour's own
-    /// representation (see [`Dict::EqConstant`]). Drives row-group pruning
-    /// and scan-side batch filtering once the dictionary is built.
-    eq_const: Option<DC::EqConstant>,
-    /// Whether the dictionary was scanned and found to exclude
-    /// [`Self::eq_const`]. Stays `false` until a dictionary page proves the
-    /// constant absent.
-    dict_excludes_eq_constant: bool,
+    /// The pushed-down constant predicate: the constant in this dictionary
+    /// flavour's own representation (see [`Dict::Constant`]) and how a value
+    /// matches it. Drives row-group pruning and, for an equality, scan-side
+    /// batch filtering once the dictionary is built.
+    predicate: Option<(DC::Constant, ConstantMatch)>,
+    /// Whether the dictionary was scanned and no entry satisfied
+    /// [`Self::predicate`]. Stays `false` until a dictionary page proves the
+    /// predicate unmatchable.
+    dict_excludes_constant: bool,
     phantom_data: PhantomData<B>,
 }
 
 impl<DC, DS, B, P> TypedLeafDecoder<DC, DS, B, P>
 where
     DC: DictFromBytes<Builder = B, Item = B::Element>,
-    DS: DictFromVecBytes<Builder = B, Item = B::Element, EqConstant = DC::EqConstant>,
+    DS: DictFromVecBytes<Builder = B, Item = B::Element, Constant = DC::Constant>,
     B: ArrayBuilder,
     P: DecodePlain<Builder = B>,
 {
@@ -276,8 +278,8 @@ where
             max_def_level,
             read_page: None,
             dict: None,
-            eq_const: None,
-            dict_excludes_eq_constant: false,
+            predicate: None,
+            dict_excludes_constant: false,
             phantom_data: Default::default(),
         }
     }
@@ -370,25 +372,29 @@ where
 impl<DC, DS, B, P> LeafDecoder for TypedLeafDecoder<DC, DS, B, P>
 where
     DC: DictFromBytes<Builder = B, Item = B::Element>,
-    DS: DictFromVecBytes<Builder = B, Item = B::Element, EqConstant = DC::EqConstant>,
+    DS: DictFromVecBytes<Builder = B, Item = B::Element, Constant = DC::Constant>,
     B: ArrayBuilder,
     P: DecodePlain<Builder = B>,
     B::Element: PartialEq,
 {
-    fn set_eq_constant(&mut self, value: &Scalar<ArrayRef>) {
-        self.eq_const = DC::eq_constant_from_scalar(value);
+    fn set_constant_predicate(&mut self, value: &Scalar<ArrayRef>, match_type: ConstantMatch) {
+        self.predicate = DC::constant_from_scalar(value).map(|constant| (constant, match_type));
     }
 
-    fn dict_excludes_eq_constant(&self) -> bool {
-        self.dict_excludes_eq_constant
+    fn dict_excludes_constant(&self) -> bool {
+        self.dict_excludes_constant
     }
 
+    // Only an equality can view-filter: a substring match may hold on several
+    // dictionary entries, so no single view decides it (see
+    // [`Dict::filter_record_batch_by_const`]); those rows stay for the
+    // query's `Filter`.
     fn fast_filter_record_batch(&self, batch: RecordBatch, column: usize) -> RecordBatch {
-        match (&self.eq_const, &self.dict) {
-            (Some(needle), Some(DictStorage::Contiguous(dict))) => {
+        match (&self.predicate, &self.dict) {
+            (Some((needle, ConstantMatch::Equals)), Some(DictStorage::Contiguous(dict))) => {
                 dict.filter_record_batch_by_const(batch, column, needle)
             }
-            (Some(needle), Some(DictStorage::Scattered(dict))) => {
+            (Some((needle, ConstantMatch::Equals)), Some(DictStorage::Scattered(dict))) => {
                 dict.filter_record_batch_by_const(batch, column, needle)
             }
             _ => batch,
@@ -428,13 +434,14 @@ where
         match page.data {
             DecompressedPageType::Dict { header, data } => {
                 let size = header.num_values as usize;
-                if let Some(needle) = self.eq_const.as_ref() {
-                    // Equality pushdown: scan the raw dictionary for the constant
-                    // before materializing it. If absent, the row group is pruned
-                    // — so skip building the dictionary entirely (no allocation,
-                    // no copy of values we'd never read).
-                    let present = DC::maybe_contains(&data, size, needle);
-                    self.dict_excludes_eq_constant = !present;
+                if let Some((needle, match_type)) = self.predicate.as_ref() {
+                    // Constant pushdown: scan the raw dictionary for an entry
+                    // matching the predicate before materializing it. If none
+                    // matches, the row group is pruned — so skip building the
+                    // dictionary entirely (no allocation, no copy of values
+                    // we'd never read).
+                    let present = DC::maybe_matches(&data, size, needle, *match_type);
+                    self.dict_excludes_constant = !present;
                     if !present {
                         // Row group will be pruned. Install an *empty* dictionary
                         // instead of the real one: this skips the copy but keeps
@@ -705,16 +712,16 @@ mod tests {
         let mut dec = Dec::new(0);
         dec.insert_page(dict_page(encode_i32s(&[10, 20, 30]), 3), &mut alloc);
 
-        assert!(!dec.dict_excludes_eq_constant());
+        assert!(!dec.dict_excludes_constant());
     }
 
     /// Constant set but dictionary not yet loaded → not prunable yet.
     #[test]
     fn test_dict_excludes_false_before_dict_loaded() {
         let mut dec = Dec::new(0);
-        dec.set_eq_constant(&int_scalar(20));
+        dec.set_constant_predicate(&int_scalar(20), ConstantMatch::Equals);
 
-        assert!(!dec.dict_excludes_eq_constant());
+        assert!(!dec.dict_excludes_constant());
     }
 
     /// Constant present in the dictionary → cannot prune.
@@ -723,10 +730,10 @@ mod tests {
         init_test_free_pool(4);
         let mut alloc = SlabAllocator::new(true);
         let mut dec = Dec::new(0);
-        dec.set_eq_constant(&int_scalar(20));
+        dec.set_constant_predicate(&int_scalar(20), ConstantMatch::Equals);
         dec.insert_page(dict_page(encode_i32s(&[10, 20, 30]), 3), &mut alloc);
 
-        assert!(!dec.dict_excludes_eq_constant());
+        assert!(!dec.dict_excludes_constant());
     }
 
     /// Constant absent from the dictionary → the row group is prunable.
@@ -735,10 +742,10 @@ mod tests {
         init_test_free_pool(4);
         let mut alloc = SlabAllocator::new(true);
         let mut dec = Dec::new(0);
-        dec.set_eq_constant(&int_scalar(99));
+        dec.set_constant_predicate(&int_scalar(99), ConstantMatch::Equals);
         dec.insert_page(dict_page(encode_i32s(&[10, 20, 30]), 3), &mut alloc);
 
-        assert!(dec.dict_excludes_eq_constant());
+        assert!(dec.dict_excludes_constant());
     }
 
     // -- Page insertion order --

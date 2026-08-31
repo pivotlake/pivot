@@ -6,6 +6,7 @@
 //! and builds a `Vec<u128>` of Arrow views so that each RLE index can be
 //! resolved to a view in O(1).
 
+use crate::reading::decoding::ConstantMatch;
 use crate::reading::decoding::leaf_decoders::bytes_view::views_builder::ViewsBuilder;
 use crate::reading::decoding::leaf_decoders::{Dict, DictFromBytes, DictFromVecBytes};
 use arrow_array::builder::make_view;
@@ -16,6 +17,7 @@ use arrow_array::{
 use arrow_buffer::{BooleanBuffer, Buffer, ScalarBuffer};
 use bytes::Bytes;
 use dispatch::memory::{MultiBufferReader, ReaderPosition, SlabAllocator};
+use memchr::memmem::Finder;
 use std::marker::PhantomData;
 
 /// Internal signal for cross-buffer boundary conditions during dictionary
@@ -165,17 +167,83 @@ impl<V: ByteViewType> ViewDict<V> {
     }
 }
 
+/// Walks the plain-encoded (length-prefixed) entries of a dictionary page and
+/// returns whether any of the first `size` entries satisfies `entry_matches`.
+/// Entries are checked in place; only one straddling a buffer boundary is
+/// copied out to be checked contiguously.
+fn any_plain_entry_matches(
+    data: &[Bytes],
+    size: usize,
+    mut entry_matches: impl FnMut(&[u8]) -> bool,
+) -> bool {
+    let mut position = ReaderPosition::default();
+    for _ in 0..size {
+        // Fast path: the length prefix and the entry both lie in the current
+        // buffer.
+        let buffer = &data[position.buffer_index];
+        if let Some(prefix) = buffer.get(position.offset..position.offset + 4) {
+            let len = u32::from_le_bytes(prefix.try_into().unwrap()) as usize;
+            let body_start = position.offset + 4;
+            if let Some(entry) = buffer.get(body_start..body_start + len) {
+                if entry_matches(entry) {
+                    return true;
+                }
+                position.offset = body_start + len;
+                continue;
+            }
+        }
+        // The prefix or the entry straddles buffers (or the current buffer is
+        // exhausted); read the entry out contiguously.
+        let entry = {
+            let mut reader = MultiBufferReader::new(data, &mut position);
+            let len = reader.read_u32_le() as usize;
+            reader.read_bytes(len)
+        };
+        if entry_matches(&entry) {
+            return true;
+        }
+    }
+    false
+}
+
 impl<V: ByteViewType> Dict for ViewDict<V> {
     type Builder = ViewsBuilder<V>;
     type Item = u128;
-    type EqConstant = Vec<u8>;
+    type Constant = Vec<u8>;
 
     /// The scalar matches when its array is a single, valid `StringViewArray`
     /// element; anything else yields `None`.
-    fn eq_constant_from_scalar(scalar: &Scalar<ArrayRef>) -> Option<Vec<u8>> {
+    fn constant_from_scalar(scalar: &Scalar<ArrayRef>) -> Option<Vec<u8>> {
         let (arr, _) = arrow_array::Datum::get(scalar);
         let strings = arr.as_any().downcast_ref::<StringViewArray>()?;
         (strings.len() == 1 && strings.is_valid(0)).then(|| strings.value(0).as_bytes().to_vec())
+    }
+
+    /// Scans the raw dictionary entries for one matching the predicate
+    /// without building the dictionary, so a row group none of whose values
+    /// can equal, start with, end with, or contain the pushed constant is
+    /// pruned before its data pages are decoded.
+    fn maybe_matches(
+        data: &[Bytes],
+        size: usize,
+        needle: &Vec<u8>,
+        match_type: ConstantMatch,
+    ) -> bool {
+        match match_type {
+            ConstantMatch::Equals => {
+                any_plain_entry_matches(data, size, |entry| entry == needle.as_slice())
+            }
+            ConstantMatch::Contains => {
+                let finder = Finder::new(needle);
+                any_plain_entry_matches(data, size, |entry| finder.find(entry).is_some())
+            }
+            ConstantMatch::StartsWith => {
+                any_plain_entry_matches(data, size, |entry| entry.starts_with(needle))
+            }
+            ConstantMatch::EndsWith => {
+                any_plain_entry_matches(data, size, |entry| entry.ends_with(needle))
+            }
+        }
     }
 
     fn len(&self) -> usize {
@@ -332,6 +400,76 @@ mod tests {
         assert_eq!(dict.views.len(), 2);
         assert_eq!(dict.get_str(0), "aa");
         assert_eq!(dict.get_str(1), "bb");
+    }
+
+    fn matches(entries: &[&str], needle: &str, match_type: ConstantMatch) -> bool {
+        let data = vec![Bytes::from(encode_plain(entries))];
+        ViewDict::<StringViewType>::maybe_matches(
+            &data,
+            entries.len(),
+            &needle.as_bytes().to_vec(),
+            match_type,
+        )
+    }
+
+    #[test]
+    fn maybe_matches_equality_finds_present_and_rejects_absent() {
+        let entries = ["MAIL", "DELIVER IN PERSON", "SHIP"];
+
+        assert!(matches(&entries, "MAIL", ConstantMatch::Equals));
+        assert!(matches(&entries, "SHIP", ConstantMatch::Equals));
+        assert!(!matches(&entries, "MAI", ConstantMatch::Equals));
+        assert!(!matches(&entries, "TRUCK", ConstantMatch::Equals));
+    }
+
+    #[test]
+    fn maybe_matches_contains_finds_substring_and_rejects_absent() {
+        let entries = ["http://example.com/search", "http://example.com/home"];
+
+        assert!(matches(&entries, "example", ConstantMatch::Contains));
+        assert!(matches(&entries, "/home", ConstantMatch::Contains));
+        assert!(!matches(&entries, "google", ConstantMatch::Contains));
+    }
+
+    #[test]
+    fn maybe_matches_starts_with_anchors_at_the_front() {
+        let entries = ["alpha", "beta"];
+
+        assert!(matches(&entries, "alp", ConstantMatch::StartsWith));
+        assert!(!matches(&entries, "eta", ConstantMatch::StartsWith));
+    }
+
+    #[test]
+    fn maybe_matches_ends_with_anchors_at_the_back() {
+        let entries = ["alpha", "beta"];
+
+        assert!(matches(&entries, "eta", ConstantMatch::EndsWith));
+        assert!(!matches(&entries, "alp", ConstantMatch::EndsWith));
+    }
+
+    #[test]
+    fn maybe_matches_checks_an_entry_straddling_a_buffer_boundary() {
+        let all = encode_plain(&["aa", "hello world"]);
+        let data = vec![
+            Bytes::from(all[..12].to_vec()),
+            Bytes::from(all[12..].to_vec()),
+        ];
+
+        let straddled = ViewDict::<StringViewType>::maybe_matches(
+            &data,
+            2,
+            &b"lo wo".to_vec(),
+            ConstantMatch::Contains,
+        );
+        let absent = ViewDict::<StringViewType>::maybe_matches(
+            &data,
+            2,
+            &b"goodbye".to_vec(),
+            ConstantMatch::Contains,
+        );
+
+        assert!(straddled);
+        assert!(!absent);
     }
 
     #[test]

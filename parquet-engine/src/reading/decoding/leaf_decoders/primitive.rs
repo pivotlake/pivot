@@ -18,6 +18,7 @@ use arrow_array::types::{ArrowPrimitiveType, TimestampMicrosecondType};
 use arrow_array::{ArrayRef, RecordBatch, Scalar, TimestampMicrosecondArray};
 use arrow_buffer::ArrowNativeType;
 
+use crate::reading::decoding::ConstantMatch;
 use crate::reading::decoding::leaf_decoders::{
     DecodePlain, DeltaDecoder, Dict, DictFromBytes, DictFromVecBytes, FromDelta, LeafDecoder,
     Result, TypedLeafDecoder,
@@ -281,11 +282,11 @@ where
 {
     type Builder = PrimitiveBuilder<T>;
     type Item = T::Native;
-    type EqConstant = T::Native;
+    type Constant = T::Native;
 
     /// The scalar matches when its array is a single-element
     /// `PrimitiveArray<T>`; a logical/physical type mismatch yields `None`.
-    fn eq_constant_from_scalar(scalar: &Scalar<ArrayRef>) -> Option<T::Native> {
+    fn constant_from_scalar(scalar: &Scalar<ArrayRef>) -> Option<T::Native> {
         let (arr, _) = arrow_array::Datum::get(scalar);
         let primitive = arr.as_primitive_opt::<T>()?;
         (primitive.len() == 1).then(|| primitive.value(0))
@@ -293,7 +294,9 @@ where
 
     /// Scans the raw dictionary for `needle` without allocating or copying — so a
     /// row group whose dictionary excludes a pushed-down equality constant is
-    /// pruned without building the dictionary.
+    /// pruned without building the dictionary. Substring matches never install
+    /// here (their constants are strings, which [`Self::constant_from_scalar`]
+    /// rejects), so anything but an equality cannot rule the row group out.
     ///
     /// Fast path (the common case): a single contiguous, native-width,
     /// `T::Native`-aligned buffer is reinterpreted as `&[T::Native]` and scanned
@@ -301,7 +304,15 @@ where
     /// dictionary would get, minus the copy. Anything else (unaligned, split
     /// across buffers, or a narrowed physical type) falls back to the scalar
     /// reader.
-    fn maybe_contains(data: &[Bytes], size: usize, needle: &T::Native) -> bool {
+    fn maybe_matches(
+        data: &[Bytes],
+        size: usize,
+        needle: &T::Native,
+        match_type: ConstantMatch,
+    ) -> bool {
+        if match_type != ConstantMatch::Equals {
+            return true;
+        }
         let width = T::Native::PHYSICAL_SIZE;
         if data.len() == 1 && width == mem::size_of::<T::Native>() && data[0].len() >= size * width
         {
@@ -420,12 +431,12 @@ impl LeafDecoder for TimestampMicrosecondLeafDecoder {
         )))
     }
 
-    fn set_eq_constant(&mut self, value: &Scalar<ArrayRef>) {
-        self.inner.set_eq_constant(value);
+    fn set_constant_predicate(&mut self, value: &Scalar<ArrayRef>, match_type: ConstantMatch) {
+        self.inner.set_constant_predicate(value, match_type);
     }
 
-    fn dict_excludes_eq_constant(&self) -> bool {
-        self.inner.dict_excludes_eq_constant()
+    fn dict_excludes_constant(&self) -> bool {
+        self.inner.dict_excludes_constant()
     }
 
     fn fast_filter_record_batch(&self, batch: RecordBatch, column: usize) -> RecordBatch {
@@ -446,10 +457,12 @@ mod tests {
     };
     use bytes::Bytes;
 
-    use super::{Dict, PrimitiveDict, PrimitiveLeafDecoder, attach_timestamp_timezone};
+    use super::{
+        ConstantMatch, Dict, PrimitiveDict, PrimitiveLeafDecoder, attach_timestamp_timezone,
+    };
     use dispatch::memory::SlabBuffer;
 
-    /// `maybe_contains` scans raw page bytes, so the buffer flavour is
+    /// `maybe_matches` scans raw page bytes, so the buffer flavour is
     /// irrelevant; any instantiation works.
     type Int64Dict = PrimitiveDict<Int64Type, SlabBuffer<i64>>;
     use crate::reading::decoding::leaf_decoders::LeafDecoder;
@@ -470,19 +483,44 @@ mod tests {
     }
 
     #[test]
-    fn maybe_contains_finds_present_and_rejects_absent() {
+    fn maybe_matches_finds_present_and_rejects_absent() {
         init_test_free_pool(4);
         // A contiguous, aligned i64 dictionary (the vectorized fast path).
         let data = vec![Bytes::from(encode_i64s(&[10, 20, 30, 40, 50]))];
-        assert!(Int64Dict::maybe_contains(&data, 5, &10));
-        assert!(Int64Dict::maybe_contains(&data, 5, &50));
-        assert!(Int64Dict::maybe_contains(&data, 5, &30));
-        assert!(!Int64Dict::maybe_contains(&data, 5, &35));
-        assert!(!Int64Dict::maybe_contains(&data, 5, &0));
+        assert!(Int64Dict::maybe_matches(
+            &data,
+            5,
+            &10,
+            ConstantMatch::Equals
+        ));
+        assert!(Int64Dict::maybe_matches(
+            &data,
+            5,
+            &50,
+            ConstantMatch::Equals
+        ));
+        assert!(Int64Dict::maybe_matches(
+            &data,
+            5,
+            &30,
+            ConstantMatch::Equals
+        ));
+        assert!(!Int64Dict::maybe_matches(
+            &data,
+            5,
+            &35,
+            ConstantMatch::Equals
+        ));
+        assert!(!Int64Dict::maybe_matches(
+            &data,
+            5,
+            &0,
+            ConstantMatch::Equals
+        ));
     }
 
     #[test]
-    fn maybe_contains_finds_value_straddling_a_buffer_boundary() {
+    fn maybe_matches_finds_value_straddling_a_buffer_boundary() {
         init_test_free_pool(4);
         // Three i64 values split so the middle one straddles the seam — this
         // takes the scalar-reader fallback (data.len() != 1).
@@ -491,10 +529,30 @@ mod tests {
             Bytes::from(bytes[..12].to_vec()), // v0 + first half of v1
             Bytes::from(bytes[12..].to_vec()), // second half of v1 + v2
         ];
-        assert!(Int64Dict::maybe_contains(&data, 3, &10));
-        assert!(Int64Dict::maybe_contains(&data, 3, &20)); // straddles seam
-        assert!(Int64Dict::maybe_contains(&data, 3, &30));
-        assert!(!Int64Dict::maybe_contains(&data, 3, &99));
+        assert!(Int64Dict::maybe_matches(
+            &data,
+            3,
+            &10,
+            ConstantMatch::Equals
+        ));
+        assert!(Int64Dict::maybe_matches(
+            &data,
+            3,
+            &20,
+            ConstantMatch::Equals
+        )); // straddles seam
+        assert!(Int64Dict::maybe_matches(
+            &data,
+            3,
+            &30,
+            ConstantMatch::Equals
+        ));
+        assert!(!Int64Dict::maybe_matches(
+            &data,
+            3,
+            &99,
+            ConstantMatch::Equals
+        ));
     }
 
     fn make_data_page(

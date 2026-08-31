@@ -25,6 +25,7 @@ bytes = { workspace = true }
 crossbeam-deque = { workspace = true }
 ahash = { workspace = true }
 snap = { workspace = true }
+memchr = "2.7"
 
 [dev-dependencies]
 dispatch = { workspace = true, features = ["test-util"] }

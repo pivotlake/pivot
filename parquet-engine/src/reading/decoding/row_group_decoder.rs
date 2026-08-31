@@ -6,7 +6,7 @@
 //! decompressor. When every projected column has enough buffered rows,
 //! [`try_read`](RowGroupDecoder::try_read) decodes the next batch.
 
-use crate::reading::decoding::ScanEqualityPredicate;
+use crate::reading::decoding::ScanConstantPredicate;
 use crate::reading::decoding::column_decoder::{ColumnDecoder, Result, create_leaf_decoder};
 use crate::reading::decoding::leaf_decoders::LeafDecoder;
 use crate::reading::record_batch_metadata::with_row_group_metadata;
@@ -21,8 +21,8 @@ use std::cmp::min;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// An output column whose pushed-down equality constant can prune the row
-/// group, and the decoded leaf that constant was installed on.
+/// An output column whose pushed-down constant predicate can prune the row
+/// group, and the decoded leaf that predicate was installed on.
 #[derive(Clone, Copy)]
 struct PrunableColumn {
     /// The column's position in the emitted batch.
@@ -58,20 +58,20 @@ pub struct RowGroupDecoder {
     row_offset: usize,
     /// Whether to append row-group-id / row-index metadata columns.
     add_row_group_metadata: bool,
-    /// The output columns carrying a pushed-down equality constant whose chunk
+    /// The output columns carrying a pushed-down constant predicate whose chunk
     /// is sound to prune by (all data pages dictionary encoded), each with the
-    /// leaf holding that constant. When any such leaf's dictionary excludes it,
+    /// leaf holding that predicate. When any such leaf's dictionary excludes it,
     /// the whole row group is pruned.
     prunable: Vec<PrunableColumn>,
     /// The row group's shared pruned flag is the same `Arc` every page of this
     /// row group carries. It is set here when a prunable column's dictionary
-    /// excludes its constant: the row group cannot contain a matching row, so
+    /// excludes its predicate: the row group cannot contain a matching row, so
     /// it emits nothing and is treated as exhausted. The decompressor reads it
     /// so it can skip the row group's remaining, not-yet-decompressed pages
     /// instead of decompressing them only for this decoder to discard.
     pruned: Arc<AtomicBool>,
     /// Whether emitted batches may drop rows that fail a pushed-down
-    /// equality constant. The materializer path must not: it addresses rows
+    /// equality predicate. The materializer path must not: it addresses rows
     /// by their position inside the row group, so every row has to stay in
     /// place.
     filter_batches: bool,
@@ -83,7 +83,7 @@ impl RowGroupDecoder {
         projection: &Projection,
         batch_size: usize,
         add_row_group_metadata: bool,
-        eq_predicates: &[ScanEqualityPredicate],
+        constant_predicates: &[ScanConstantPredicate],
     ) -> Result<Self> {
         let pruned = row_group_metadata.pruned_flag();
         // Expand projected columns into this file's leaves. Variant layouts can
@@ -120,13 +120,13 @@ impl RowGroupDecoder {
             )?);
         }
 
-        let prunable = install_eq_constants(
+        let prunable = install_constant_predicates(
             &column_decoders,
             &mut leaf_decoders,
             &plan.file_leaves,
             column_chunks,
             projection,
-            eq_predicates,
+            constant_predicates,
         );
 
         let output_fields: Fields = column_decoders
@@ -158,7 +158,7 @@ impl RowGroupDecoder {
     }
 
     /// Returns `true` when the row group has been pruned (no row can match a
-    /// pushed-down equality predicate) or all its rows have been emitted.
+    /// pushed-down constant predicate) or all its rows have been emitted.
     pub fn exhausted(&self) -> bool {
         self.pruned() || self.total - self.row_offset == 0
     }
@@ -171,7 +171,7 @@ impl RowGroupDecoder {
 
     /// Routes a decompressed page to the appropriate column decoder, then
     /// re-evaluates dictionary pruning (a just-loaded dictionary page may
-    /// exclude a pushed-down constant, allowing the whole row group to be
+    /// exclude a pushed-down predicate, allowing the whole row group to be
     /// dropped before its data pages are decoded).
     pub fn insert_page(&mut self, page: DecompressedPage, allocator: &mut SlabAllocator) {
         self.leaf_decoders[page.column_idx].insert_page(page, allocator);
@@ -179,7 +179,7 @@ impl RowGroupDecoder {
             && self
                 .prunable
                 .iter()
-                .any(|p| self.leaf_decoders[p.leaf].dict_excludes_eq_constant())
+                .any(|p| self.leaf_decoders[p.leaf].dict_excludes_constant())
         {
             // Publish to the shared flag (seen by every page of this row group):
             // the decoder discards the rest, and the decompressor can skip the
@@ -222,12 +222,12 @@ impl RowGroupDecoder {
                 .map(|decoder| decoder.read(&decoded))
                 .collect::<Result<Vec<_>>>()?;
             let record_batch = RecordBatch::try_new(self.schema.clone(), columns)?;
-            // Give each column carrying a pushed-down equality constant a
+            // Give each column carrying a pushed-down constant predicate a
             // chance to drop rows that provably fail it, before the batch
-            // travels any further. Dictionary encoded string columns filter it
-            // with a cheap view comparison; the rest leave it untouched. Never
-            // done on the materializer path, which needs every row to stay in
-            // place.
+            // travels any further. Dictionary encoded string columns filter an
+            // equality with a cheap view comparison; the rest leave it
+            // untouched. Never done on the materializer path, which needs
+            // every row to stay in place.
             let record_batch = if self.filter_batches {
                 self.prunable.iter().fold(record_batch, |batch, p| {
                     self.leaf_decoders[p.leaf].fast_filter_record_batch(batch, p.output_idx)
@@ -248,10 +248,10 @@ impl RowGroupDecoder {
     }
 }
 
-/// Installs each pushed-down equality constant on the leaf that answers it, and
-/// returns the columns the row group can then be pruned by.
+/// Installs each pushed-down constant predicate on the leaf that answers it,
+/// and returns the columns the row group can then be pruned by.
 ///
-/// A constant only goes in when its output column emits exactly one decoded
+/// A predicate only goes in when its output column emits exactly one decoded
 /// leaf unchanged, because that is the only shape both uses of the constant can
 /// read: the row group is pruned from the leaf's own dictionary, and the batch
 /// filter compares the emitted array against the dictionary's view of the
@@ -259,22 +259,22 @@ impl RowGroupDecoder {
 /// something else entirely.
 ///
 /// It also goes in only when every data page of that chunk is dictionary
-/// encoded. The decoder uses the constant to skip building a dictionary that
+/// encoded. The decoder uses the predicate to skip building a dictionary that
 /// excludes it, which is sound only when an excluded dictionary prunes the whole
-/// row group. A PLAIN fallback page could hold the constant even if the
+/// row group. A PLAIN fallback page could hold a matching value even if the
 /// dictionary does not, so such a chunk is still scanned and its dictionary must
 /// be built to decode it.
 ///
 /// A constant whose type does not match the leaf is dropped by the leaf decoder,
 /// which forgoes the pushdown; the query's `Filter` still applies the
 /// comparison.
-fn install_eq_constants(
+fn install_constant_predicates(
     column_decoders: &[ColumnDecoder],
     leaf_decoders: &mut [Box<dyn LeafDecoder>],
     file_leaves: &[usize],
     column_chunks: &[ColumnChunkMeta],
     projection: &Projection,
-    eq_predicates: &[ScanEqualityPredicate],
+    constant_predicates: &[ScanConstantPredicate],
 ) -> Vec<PrunableColumn> {
     let mut prunable = Vec::new();
     for (output_idx, &column) in projection.column_indices.iter().enumerate() {
@@ -287,7 +287,7 @@ fn install_eq_constants(
             .extract_at(output_idx)
             .map(|extract| extract.path.as_slice())
             .unwrap_or_default();
-        let Some(predicate) = eq_predicates
+        let Some(predicate) = constant_predicates
             .iter()
             .find(|p| p.column_idx == column && p.path == path)
         else {
@@ -296,7 +296,7 @@ fn install_eq_constants(
         if !column_chunks[file_leaves[leaf]].data_pages_all_dictionary {
             continue;
         }
-        leaf_decoders[leaf].set_eq_constant(&predicate.value);
+        leaf_decoders[leaf].set_constant_predicate(&predicate.value, predicate.match_type);
         prunable.push(PrunableColumn { output_idx, leaf });
     }
     prunable
