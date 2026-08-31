@@ -87,10 +87,14 @@ const MIN_BALANCE_RATIO: f64 = 5.0;
 /// when a flush commits a new version, so seconds-scale is plenty.
 pub const DEFAULT_COMPACT_POLL: Duration = Duration::from_secs(10);
 
-/// Default number of merges a datastore runs at once. Concurrent merges keep
-/// the worker pool busy while another waits on object storage, but each merge
-/// in flight also holds its inputs' decoded rows in memory.
-pub const DEFAULT_COMPACT_PARALLELISM: usize = 3;
+/// Default cap on input files across the merges a datastore has in flight at
+/// once. One six-file merge decodes and re-encodes each row once, where a
+/// cascade of pairwise merges rewrites the same rows repeatedly, so the
+/// budget goes to the widest overlapping group first and falls back to
+/// concurrent smaller merges, which keep the worker pool busy while another
+/// merge waits on object storage. Each merge in flight holds its inputs'
+/// decoded rows in memory, which is what the file count bounds.
+pub const DEFAULT_COMPACT_MAX_FILES: usize = 6;
 
 /// Default cadence for reloading the tables from the store. This bounds how
 /// stale a query's view of externally committed data in a shared remote store
@@ -132,9 +136,12 @@ pub struct CompactionConfig {
     pub merge_target_bytes: u64,
     /// Count at which a sub-target pile may take the balance-check path.
     pub min_files: usize,
-    /// How many merges a round may have in flight at once. Selection stays
-    /// serial whatever this is; only the rewrites overlap.
-    pub max_concurrent_merges: usize,
+    /// How many input files a round may have compacting at once, across the
+    /// merges in flight: one wide merge, or several smaller concurrent ones,
+    /// spend the same budget. Selection stays serial whatever this is; only
+    /// the rewrites overlap. A single batch that needs more files than the
+    /// budget (a large small-file pile) still runs, alone.
+    pub max_compacting_files: usize,
     /// How often to re-check the tables' logs for newly-accumulated files.
     pub poll_interval: Duration,
 }
@@ -160,8 +167,8 @@ pub(crate) struct CompacterActor {
     target_bytes: u64,
     merge_target_bytes: u64,
     min_files: usize,
-    /// How many merges a round may have in flight at once.
-    max_concurrent_merges: usize,
+    /// How many input files a round may have compacting at once.
+    max_compacting_files: usize,
     /// How often to re-check the tables' logs, or `None` when only explicit
     /// commands drive this actor.
     poll_interval: Option<Duration>,
@@ -178,7 +185,7 @@ impl CompacterHandle {
         target_bytes: u64,
         merge_target_bytes: u64,
         min_files: usize,
-        max_concurrent_merges: usize,
+        max_compacting_files: usize,
         poll_interval: Option<Duration>,
         datastore: Arc<PivotDatastore>,
     ) -> (Self, CompacterActor) {
@@ -189,7 +196,9 @@ impl CompacterHandle {
                 target_bytes,
                 merge_target_bytes,
                 min_files: min_files.max(2),
-                max_concurrent_merges: max_concurrent_merges.max(1),
+                // A merge takes at least two inputs, so a smaller budget
+                // could start nothing at all.
+                max_compacting_files: max_compacting_files.max(2),
                 poll_interval,
                 datastore,
                 commands: receiver,
@@ -274,12 +283,13 @@ impl CompacterActor {
 
     /// Compact `table` until it has no candidate left: the round refreshes the
     /// table to the latest committed version once as it begins, then each pass
-    /// starts a small-file group if one qualifies, else the best overlapping
-    /// large-file pair. Up to `max_concurrent_merges` of those rewrites run at
-    /// once, each holding its inputs reserved until it commits, so selection
-    /// works around the merges already in flight. A pass with nothing to start
-    /// and nothing in flight ends the round. Returns the table as it stands and
-    /// the number of passes.
+    /// starts a small-file group if one qualifies, else the most overlapping
+    /// group of large files. Rewrites start while the files reserved by the
+    /// merges in flight number fewer than `max_compacting_files` (one wide
+    /// merge, or several smaller concurrent ones), each holding its inputs
+    /// reserved until it commits, so selection works around the merges already
+    /// in flight. A pass with nothing to start and nothing in flight ends the
+    /// round. Returns the table as it stands and the number of passes.
     ///
     /// The round works off its one refreshed copy rather than reloading the
     /// log per pass: each of its own merges is folded in as it commits, so
@@ -302,8 +312,15 @@ impl CompacterActor {
             passes += 1;
             let id = table.id();
 
-            while in_flight.len() < self.max_concurrent_merges {
-                let Some((inputs, kind)) = self.next_batch(name, &table, apply_guards, &reserved)
+            // `reserved` holds exactly the in-flight merges' input paths, so
+            // its size is the file budget already spent. A layout group is
+            // capped at what remains (a merge needs two files however little
+            // that is); a small-file batch sizes itself and may exceed the
+            // budget alone.
+            while reserved.len() < self.max_compacting_files {
+                let batch_cap = (self.max_compacting_files - reserved.len()).max(2);
+                let Some((inputs, kind)) =
+                    self.next_batch(name, &table, apply_guards, &reserved, batch_cap)
                 else {
                     break;
                 };
@@ -354,20 +371,21 @@ impl CompacterActor {
     }
 
     /// The next merge a pass can start: a small-file group if one qualifies,
-    /// else the best overlapping large-file pair. `reserved` holds the files
-    /// the merges already in flight are rewriting, which no second merge may
-    /// claim.
+    /// else the most overlapping group of large files, at most `max_files` of
+    /// them. `reserved` holds the files the merges already in flight are
+    /// rewriting, which no second merge may claim.
     fn next_batch(
         &mut self,
         name: &SchemaQualifiedTableName,
         table: &CatalogTable,
         apply_guards: bool,
         reserved: &HashSet<ObjectPath>,
+        max_files: usize,
     ) -> Option<(Vec<FileRef>, MergeKind)> {
         if let Some(inputs) = self.next_small_batch(table, apply_guards, reserved) {
             return Some((inputs, MergeKind::SmallFiles));
         }
-        let inputs = self.next_layout_optimization(name, table, reserved)?;
+        let inputs = self.next_layout_optimization(name, table, reserved, max_files)?;
         Some((inputs, MergeKind::LayoutOptimization))
     }
 
@@ -409,21 +427,25 @@ impl CompacterActor {
         })
     }
 
-    /// Find the most contested pair of already-half-full files: the one where
-    /// the largest share of each file's row groups lies within the other
-    /// file's range. Pairs never cross partitions. Sort columns are considered
-    /// in table order; a column only defers to the next one when both files
-    /// are the same singleton on it. Selection itself skips pairs whose ranges
-    /// merely touch at one value, pairs of one identical key value throughout
-    /// that exceed the output ceiling, and pairs without more than a fifth of
-    /// each file's row groups contested. That last one is the whole bar:
-    /// layout optimization merges every pair that clears it, whether or not
-    /// the round applies the small-file guards.
+    /// Find the most contested group of already-half-full files, up to
+    /// `max_files` of them: files are paired where a large share of each
+    /// file's row groups lies within the other file's range, and the group
+    /// grows from the most-paired file outward so every input overlaps the
+    /// rest (see [`overlap::LayoutScoreCache::select_group`]). Groups never
+    /// cross partitions. Sort columns are considered in table order; a column
+    /// only defers to the next one when both files are the same singleton on
+    /// it. Selection itself skips pairs whose ranges merely touch at one
+    /// value, pairs of one identical key value throughout that exceed the
+    /// output ceiling, and pairs without more than a fifth of each file's row
+    /// groups contested. That last one is the whole bar: layout optimization
+    /// merges every pair that clears it, whether or not the round applies the
+    /// small-file guards.
     fn next_layout_optimization(
         &mut self,
         name: &SchemaQualifiedTableName,
         table: &CatalogTable,
         reserved: &HashSet<ObjectPath>,
+        max_files: usize,
     ) -> Option<Vec<FileRef>> {
         table.sort_by().first()?;
 
@@ -453,14 +475,24 @@ impl CompacterActor {
             .map(|(_, files)| files.as_slice())
             .collect();
         let cache = self.layout_score_caches.entry(table.id()).or_default();
-        let selected = cache.select_pair(&partitions, table.sort_by(), self.target_bytes, reserved);
+        let selected = cache.select_group(
+            &partitions,
+            table.sort_by(),
+            self.target_bytes,
+            reserved,
+            max_files,
+        );
         info!(
             table = %name,
             eligible_pairs = cache.eligible_pair_count(),
             "layout pairs eligible for merging"
         );
-        let (_, left, right) = selected?;
-        Some(vec![left.file.clone(), right.file.clone()])
+        Some(
+            selected?
+                .into_iter()
+                .map(|entry| entry.file.clone())
+                .collect(),
+        )
     }
 }
 
@@ -987,14 +1019,14 @@ mod tests {
 
     /// Drive one full compaction sweep to completion on a temporary runtime.
     fn run_one_sweep(target_bytes: u64, datastore: Arc<PivotDatastore>) {
-        run_one_sweep_with_parallelism(target_bytes, DEFAULT_COMPACT_PARALLELISM, datastore)
+        run_one_sweep_with_file_budget(target_bytes, DEFAULT_COMPACT_MAX_FILES, datastore)
     }
 
-    /// [`run_one_sweep`] with the number of merges the round may have in
-    /// flight spelled out.
-    fn run_one_sweep_with_parallelism(
+    /// [`run_one_sweep`] with the number of files the round may have
+    /// compacting at once spelled out.
+    fn run_one_sweep_with_file_budget(
         target_bytes: u64,
-        max_concurrent_merges: usize,
+        max_compacting_files: usize,
         datastore: Arc<PivotDatastore>,
     ) {
         tokio::runtime::Builder::new_multi_thread()
@@ -1007,7 +1039,7 @@ mod tests {
                     target_bytes,
                     default_merge_target_bytes(target_bytes),
                     DEFAULT_MIN_FILES_TO_MERGE,
-                    max_concurrent_merges,
+                    max_compacting_files,
                     None,
                     datastore,
                 );
@@ -1037,7 +1069,7 @@ mod tests {
                     target_bytes,
                     merge_target_bytes,
                     min_files,
-                    DEFAULT_COMPACT_PARALLELISM,
+                    DEFAULT_COMPACT_MAX_FILES,
                     None,
                     datastore,
                 );
@@ -1137,9 +1169,9 @@ mod tests {
         dispatch.exit();
     }
 
-    /// Three overlapping pairs are rewritten with three merges in flight. The
-    /// reservations keep every merge off the others' inputs, so all swaps
-    /// commit and every row survives.
+    /// Three overlapping pairs of disjoint ranges spend a six-file budget as
+    /// three merges in flight. The reservations keep every merge off the
+    /// others' inputs, so all swaps commit and every row survives.
     #[test]
     fn concurrent_merges_never_share_an_input() {
         let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
@@ -1169,7 +1201,7 @@ mod tests {
         let files = datastore.table_files(&name).unwrap();
         let target = files.iter().map(|file| file.size).min().unwrap();
 
-        run_one_sweep_with_parallelism(target, 3, datastore.clone());
+        run_one_sweep_with_file_budget(target, 6, datastore.clone());
 
         let files = datastore.table_files(&name).unwrap();
         assert!(
@@ -1184,6 +1216,48 @@ mod tests {
             .map(|group| group.num_rows)
             .sum();
         assert_eq!(rows, 12, "no input was merged twice or dropped");
+        dispatch.exit();
+    }
+
+    /// Three mutually overlapping large files are rewritten by one merge in
+    /// one commit, not by a cascade of pairwise merges.
+    #[test]
+    fn overlapping_files_merge_as_one_group() {
+        let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
+        let db = tempfile::tempdir().unwrap();
+        let adopted_dir = db.path().join("events");
+        std::fs::create_dir_all(&adopted_dir).unwrap();
+        write_parquet_file(&adopted_dir, "a.parquet", vec![0, 100]);
+        write_parquet_file(&adopted_dir, "b.parquet", vec![0, 100]);
+        write_parquet_file(&adopted_dir, "c.parquet", vec![0, 100]);
+        let datastore =
+            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        create_table(
+            &datastore,
+            dispatch.dispatcher(),
+            "events",
+            Some(Path::new("events")),
+            true,
+        );
+        let name = SchemaQualifiedTableName::in_default_schema("events");
+        let before_version = datastore.table_handle(&name).unwrap().version();
+        let files = datastore.table_files(&name).unwrap();
+        let target = files.iter().map(|file| file.size).min().unwrap();
+
+        run_one_sweep(target, datastore.clone());
+
+        let compacted = datastore.table_handle(&name).unwrap();
+        assert_eq!(
+            compacted.version(),
+            before_version + 1,
+            "one commit swapped all three inputs"
+        );
+        let rows: i64 = fresh_parquet(&datastore, "events")
+            .row_groups()
+            .iter()
+            .map(|group| group.num_rows)
+            .sum();
+        assert_eq!(rows, 6, "every input row survives the group merge");
         dispatch.exit();
     }
 

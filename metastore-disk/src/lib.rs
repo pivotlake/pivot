@@ -117,7 +117,7 @@ use catalog::metastore::{
     format_scram_verifier, parse_scram_verifier,
 };
 use datastore_pivot::{
-    CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_PARALLELISM, DEFAULT_COMPACT_POLL,
+    CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_MAX_FILES, DEFAULT_COMPACT_POLL,
     DEFAULT_MIN_FILES_TO_MERGE, DEFAULT_VACUUM_POLL, MaintenanceConfig, PivotDatastore,
     VacuumConfig, default_merge_target_bytes,
 };
@@ -610,12 +610,14 @@ struct DatastoreConfig {
     /// Defaults to [`DEFAULT_MIN_FILES_TO_MERGE`].
     #[serde(skip_serializing_if = "Option::is_none")]
     compact_min_files: Option<usize>,
-    /// How many merges this datastore rewrites at once (such as `3`). Which
-    /// files merge is decided serially whatever this is, so no two merges ever
-    /// share an input; only the rewrites overlap, and each one in flight holds
-    /// its inputs' rows in memory. Defaults to [`DEFAULT_COMPACT_PARALLELISM`].
+    /// How many files this datastore may have compacting at once (such as
+    /// `6`), spent on one wide merge or several smaller concurrent ones.
+    /// Which files merge is decided serially whatever this is, so no two
+    /// merges ever share an input; only the rewrites overlap, and each one in
+    /// flight holds its inputs' rows in memory. Defaults to
+    /// [`DEFAULT_COMPACT_MAX_FILES`].
     #[serde(skip_serializing_if = "Option::is_none")]
-    compact_parallelism: Option<usize>,
+    compact_max_files: Option<usize>,
     /// Run this datastore's own background vacuum. On by default: the vacuumer
     /// deletes unreferenced data files and superseded commit JSONs past their
     /// retention. Set `vacuum: false` on a read-only server, or where another
@@ -648,9 +650,7 @@ impl DatastoreConfig {
                 .map(ByteSize::as_bytes)
                 .unwrap_or_else(|| default_merge_target_bytes(target_bytes)),
             min_files: self.compact_min_files.unwrap_or(DEFAULT_MIN_FILES_TO_MERGE),
-            max_concurrent_merges: self
-                .compact_parallelism
-                .unwrap_or(DEFAULT_COMPACT_PARALLELISM),
+            max_compacting_files: self.compact_max_files.unwrap_or(DEFAULT_COMPACT_MAX_FILES),
             poll_interval: DEFAULT_COMPACT_POLL,
         })
     }
@@ -817,7 +817,7 @@ datastores:
     compact_bytes: 128m
     compact_merge_bytes: 160m
     compact_min_files: 42
-    compact_parallelism: 7
+    compact_max_files: 7
   warm:
     kind: pivot
     location: /tmp/warm
@@ -834,7 +834,7 @@ datastores:
         assert_eq!(hot.target_bytes, 128 * 1024 * 1024);
         assert_eq!(hot.merge_target_bytes, 160 * 1024 * 1024);
         assert_eq!(hot.min_files, 42);
-        assert_eq!(hot.max_concurrent_merges, 7);
+        assert_eq!(hot.max_compacting_files, 7);
         assert!(warm.is_none());
     }
 
@@ -850,7 +850,7 @@ datastores:
             default_merge_target_bytes(DEFAULT_COMPACT_BYTES)
         );
         assert_eq!(config.min_files, DEFAULT_MIN_FILES_TO_MERGE);
-        assert_eq!(config.max_concurrent_merges, DEFAULT_COMPACT_PARALLELISM);
+        assert_eq!(config.max_compacting_files, DEFAULT_COMPACT_MAX_FILES);
     }
 
     #[test]
@@ -1658,7 +1658,7 @@ datastores:
     fn a_created_user_is_served_and_survives_reopening() {
         let disk = "datastores:\n  warm:\n    kind: pivot\n    location: /tmp/warm\n    \
                     compact: false\n    compact_bytes: 128m\n    compact_merge_bytes: 160m\n    \
-                    compact_min_files: 42\n    compact_parallelism: 7\n";
+                    compact_min_files: 42\n    compact_max_files: 7\n";
         let (store, file) = open_with_file(HOT_SECTION, disk);
 
         store.create_user("walt", Some("w")).unwrap();
@@ -1688,7 +1688,7 @@ datastores:
             160 * 1024 * 1024
         );
         assert_eq!(warm.compact_min_files, Some(42));
-        assert_eq!(warm.compact_parallelism, Some(7));
+        assert_eq!(warm.compact_max_files, Some(7));
     }
 
     #[test]

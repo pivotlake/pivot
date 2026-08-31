@@ -45,7 +45,7 @@ Exactly one datastore must set `default: true`.
 | `compact_bytes` | `64m` | Compaction output target; files strictly below half this size are small-file candidates, and an individual row group may exceed it. |
 | `compact_merge_bytes` | 1.3 times `compact_bytes` | Accumulated small-file bytes that immediately trigger a merge. |
 | `compact_min_files` | `100` | File count at which the small-file balance fallback may merge. |
-| `compact_parallelism` | `3` | Maximum number of disjoint compaction merges rewritten concurrently. Values below one run one merge at a time. Each merge in flight holds its decoded input rows in memory. |
+| `compact_max_files` | `6` | Maximum number of files compacting at once, across the merges in flight: one wide merge of heavily overlapping files, or several smaller concurrent ones, spend the same budget. Each merge in flight holds its decoded input rows in memory. |
 | `vacuum` | `true` | Deletes expired unreferenced files and old log entries. Enable it in only one process per shared datastore. |
 
 ### `metastore.secrets`

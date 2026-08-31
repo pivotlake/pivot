@@ -220,18 +220,21 @@ pub(super) struct LayoutScoreCache {
 }
 
 impl LayoutScoreCache {
-    /// The best remembered pair among `partitions`, each one partition's
-    /// large-file candidates, measuring the files no earlier round has seen.
-    /// A file some merge is rewriting keeps its scores, since the merge can
-    /// fail; `reserved` only makes selection pass its pairs over. Ties go to
-    /// the lexicographically first pair, so the choice is stable across rounds.
-    pub(super) fn select_pair<'a>(
+    /// The best remembered merge group among `partitions`, each one
+    /// partition's large-file candidates, measuring the files no earlier
+    /// round has seen. At most `max_files` files, at least two; pairs only
+    /// exist within a partition, so a group never crosses one. A file some
+    /// merge is rewriting keeps its scores, since the merge can fail;
+    /// `reserved` only makes selection pass its pairs over. Ties go to the
+    /// lexicographically first path, so the choice is stable across rounds.
+    pub(super) fn select_group<'a>(
         &mut self,
         partitions: &[&[LayoutCandidate<'a>]],
         sort_by: &[String],
         target_bytes: u64,
         reserved: &HashSet<ObjectPath>,
-    ) -> Option<(f64, &'a DeltaFileEntry, &'a DeltaFileEntry)> {
+        max_files: usize,
+    ) -> Option<Vec<&'a DeltaFileEntry>> {
         let mut entries_by_path = HashMap::new();
         let mut new_paths = HashSet::new();
         for candidate in partitions.iter().flat_map(|partition| partition.iter()) {
@@ -275,23 +278,86 @@ impl LayoutScoreCache {
             }
         }
 
-        let (pair, &score) = self
-            .pair_scores
+        let group = self.grow_group(reserved, max_files.max(2))?;
+        Some(
+            group
+                .iter()
+                .map(|path| entries_by_path[path.as_str()])
+                .collect(),
+        )
+    }
+
+    /// Build one merge group from the remembered pair scores. The seed is the
+    /// file whose eligible partners can fill the largest group, most heavily
+    /// scored ones first: merging a file with everything it overlaps decodes
+    /// and re-encodes each row once, where pairwise merges would rewrite the
+    /// same rows again and again. The group then grows greedily by the file
+    /// whose pairs into the current members sum highest, which prefers a set
+    /// of mutually overlapping files (every member counts) over a chain of
+    /// files that only touch one member each.
+    fn grow_group(
+        &self,
+        reserved: &HashSet<ObjectPath>,
+        max_files: usize,
+    ) -> Option<Vec<Arc<ObjectPath>>> {
+        let mut partners: HashMap<&Arc<ObjectPath>, Vec<(&Arc<ObjectPath>, f64)>> = HashMap::new();
+        for ((left, right), &score) in &self.pair_scores {
+            if reserved.contains(left.as_ref()) || reserved.contains(right.as_ref()) {
+                continue;
+            }
+            partners.entry(left).or_default().push((right, score));
+            partners.entry(right).or_default().push((left, score));
+        }
+        for scored in partners.values_mut() {
+            scored.sort_by(|(left_path, left_score), (right_path, right_score)| {
+                right_score
+                    .total_cmp(left_score)
+                    .then_with(|| left_path.as_str().cmp(right_path.as_str()))
+            });
+        }
+
+        let partner_value = |scored: &[(&Arc<ObjectPath>, f64)]| {
+            let filling = scored.len().min(max_files - 1);
+            let score: f64 = scored[..filling].iter().map(|(_, score)| score).sum();
+            (filling, score)
+        };
+        let (seed, _) = partners
             .iter()
-            .filter(|(pair, _)| {
-                reserved.is_empty()
-                    || (!reserved.contains(pair.0.as_ref()) && !reserved.contains(pair.1.as_ref()))
-            })
-            .max_by(|(left_pair, left_score), (right_pair, right_score)| {
-                left_score
-                    .total_cmp(right_score)
-                    .then_with(|| compare_pairs(right_pair, left_pair))
+            .max_by(|(left_path, left), (right_path, right)| {
+                let (left_count, left_score) = partner_value(left);
+                let (right_count, right_score) = partner_value(right);
+                left_count
+                    .cmp(&right_count)
+                    .then_with(|| left_score.total_cmp(&right_score))
+                    .then_with(|| right_path.as_str().cmp(left_path.as_str()))
             })?;
-        Some((
-            score,
-            entries_by_path[pair.0.as_str()],
-            entries_by_path[pair.1.as_str()],
-        ))
+
+        let mut group = vec![Arc::clone(seed)];
+        let mut member_paths = HashSet::from([seed.as_str()]);
+        while group.len() < max_files {
+            let next = partners
+                .keys()
+                .filter(|path| !member_paths.contains(path.as_str()))
+                .filter_map(|path| {
+                    let connection: f64 = partners[*path]
+                        .iter()
+                        .filter(|(partner, _)| member_paths.contains(partner.as_str()))
+                        .map(|(_, score)| score)
+                        .sum();
+                    (connection > 0.0).then_some((connection, *path))
+                })
+                .max_by(|(left_score, left_path), (right_score, right_path)| {
+                    left_score
+                        .total_cmp(right_score)
+                        .then_with(|| right_path.as_str().cmp(left_path.as_str()))
+                });
+            let Some((_, next)) = next else {
+                break;
+            };
+            group.push(Arc::clone(next));
+            member_paths.insert(next.as_str());
+        }
+        Some(group)
     }
 
     /// How many pairs cleared every merge gate at the last selection, whether
@@ -319,16 +385,6 @@ fn ordered_pair(
     } else {
         (Arc::clone(right), Arc::clone(left))
     }
-}
-
-fn compare_pairs(
-    left: &(Arc<ObjectPath>, Arc<ObjectPath>),
-    right: &(Arc<ObjectPath>, Arc<ObjectPath>),
-) -> Ordering {
-    left.0
-        .as_str()
-        .cmp(right.0.as_str())
-        .then_with(|| left.1.as_str().cmp(right.1.as_str()))
 }
 
 /// Contested row groups a file with `total` row groups must have before a
@@ -385,14 +441,35 @@ mod tests {
     use crate::manifest::FileStats;
     use object_storage::{FileRef, ObjectPath};
 
-    /// Select over one partition through the production path, with nothing
-    /// remembered.
+    /// Select a two-file group over one partition through the production
+    /// path, with nothing remembered, returning the pair beside its
+    /// remembered score.
     fn select_pair<'a>(
         files: &[LayoutCandidate<'a>],
         sort_by: &[String],
         target_bytes: u64,
     ) -> Option<(f64, &'a DeltaFileEntry, &'a DeltaFileEntry)> {
-        LayoutScoreCache::default().select_pair(&[files], sort_by, target_bytes, &HashSet::new())
+        let mut cache = LayoutScoreCache::default();
+        let group = cache.select_group(&[files], sort_by, target_bytes, &HashSet::new(), 2)?;
+        let [left, right] = group[..] else {
+            panic!("a two-file cap selects exactly a pair, got {}", group.len());
+        };
+        Some((pair_score(&cache, left, right), left, right))
+    }
+
+    /// The remembered score of the pair holding `left` and `right`.
+    fn pair_score(cache: &LayoutScoreCache, left: &DeltaFileEntry, right: &DeltaFileEntry) -> f64 {
+        let mut wanted = [left.file.path.as_str(), right.file.path.as_str()];
+        wanted.sort_unstable();
+        cache
+            .pair_scores
+            .iter()
+            .find_map(|(pair, score)| {
+                let mut paths = [pair.0.as_str(), pair.1.as_str()];
+                paths.sort_unstable();
+                (paths == wanted).then_some(*score)
+            })
+            .expect("the selected pair is remembered")
     }
 
     fn int_stat(value: i64) -> ArrayRef {
@@ -818,18 +895,19 @@ mod tests {
             candidate_with_row_groups(&second, &shape),
             candidate_with_row_groups(&survivor, &survivor_shape),
         ];
-        cache.select_pair(&[&before], &["id".into()], u64::MAX, &HashSet::new());
+        cache.select_group(&[&before], &["id".into()], u64::MAX, &HashSet::new(), 2);
         let merged = stats_entry("merged", &[("id", int_stat(500), int_stat(600))]);
         let after = vec![
             candidate_with_row_groups(&survivor, &survivor_shape),
             candidate_with_row_groups(&merged, &survivor_shape),
         ];
 
-        let (score, left, right) = cache
-            .select_pair(&[&after], &["id".into()], u64::MAX, &HashSet::new())
+        let group = cache
+            .select_group(&[&after], &["id".into()], u64::MAX, &HashSet::new(), 2)
             .unwrap();
 
-        assert!((score - 1.0).abs() < 1e-12);
+        let (left, right) = (group[0], group[1]);
+        assert!((pair_score(&cache, left, right) - 1.0).abs() < 1e-12);
         let mut pair = [left.file.path.as_str(), right.file.path.as_str()];
         pair.sort();
         assert_eq!(pair, ["merged", "survivor"]);
@@ -857,17 +935,24 @@ mod tests {
             candidate_with_row_groups(&far_second, &far_shape),
         ];
         let mut cache = LayoutScoreCache::default();
-        let (_, left, right) = cache
-            .select_pair(&[&files], &["id".into()], u64::MAX, &HashSet::new())
+        let first_group = cache
+            .select_group(&[&files], &["id".into()], u64::MAX, &HashSet::new(), 2)
             .unwrap();
-        let reserved = HashSet::from([left.file.path.clone(), right.file.path.clone()]);
+        let reserved: HashSet<ObjectPath> = first_group
+            .iter()
+            .map(|entry| entry.file.path.clone())
+            .collect();
 
-        let (_, next_left, next_right) = cache
-            .select_pair(&[&files], &["id".into()], u64::MAX, &reserved)
+        let next_group = cache
+            .select_group(&[&files], &["id".into()], u64::MAX, &reserved, 2)
             .unwrap();
 
-        assert!(!reserved.contains(&next_left.file.path));
-        assert!(!reserved.contains(&next_right.file.path));
+        assert_eq!(next_group.len(), 2);
+        assert!(
+            next_group
+                .iter()
+                .all(|entry| !reserved.contains(&entry.file.path))
+        );
     }
 
     /// Every pair that clears the gates is counted, not only the best one,
@@ -887,7 +972,7 @@ mod tests {
         ];
 
         let mut cache = LayoutScoreCache::default();
-        cache.select_pair(&[&files], &["id".into()], u64::MAX, &HashSet::new());
+        cache.select_group(&[&files], &["id".into()], u64::MAX, &HashSet::new(), 2);
 
         assert_eq!(cache.eligible_pair_count(), 3);
     }
@@ -1097,6 +1182,108 @@ mod tests {
         // within left's, none of which is visible while the two encodings are
         // held apart.
         assert!((score - 0.4).abs() < 1e-12);
+    }
+
+    /// A wide file beside the three narrower files tiling its range, none of
+    /// which overlap each other. One shape for the group-selection tests.
+    fn star_candidates<'a>(
+        hub: &'a DeltaFileEntry,
+        low: &'a DeltaFileEntry,
+        mid: &'a DeltaFileEntry,
+        high: &'a DeltaFileEntry,
+    ) -> Vec<LayoutCandidate<'a>> {
+        vec![
+            candidate_with_row_groups(
+                hub,
+                &[
+                    (0, 50),
+                    (50, 100),
+                    (100, 150),
+                    (150, 200),
+                    (200, 250),
+                    (250, 300),
+                ],
+            ),
+            candidate_with_row_groups(low, &[(0, 20), (20, 40), (40, 60), (60, 80), (80, 100)]),
+            candidate_with_row_groups(
+                mid,
+                &[(100, 120), (120, 140), (140, 160), (160, 180), (180, 200)],
+            ),
+            candidate_with_row_groups(
+                high,
+                &[(200, 220), (220, 240), (240, 260), (260, 280), (280, 300)],
+            ),
+        ]
+    }
+
+    /// A file overlapping several files that do not overlap one another pulls
+    /// all of them into one group, with itself seeding it.
+    #[test]
+    fn a_file_overlapping_many_disjoint_files_groups_with_all_of_them() {
+        let hub = stats_entry("hub", &[("id", int_stat(0), int_stat(300))]);
+        let low = stats_entry("low", &[("id", int_stat(0), int_stat(100))]);
+        let mid = stats_entry("mid", &[("id", int_stat(100), int_stat(200))]);
+        let high = stats_entry("high", &[("id", int_stat(200), int_stat(300))]);
+        let files = star_candidates(&hub, &low, &mid, &high);
+
+        let group = LayoutScoreCache::default()
+            .select_group(&[&files], &["id".into()], u64::MAX, &HashSet::new(), 6)
+            .unwrap();
+
+        assert_eq!(group[0].file.path.as_str(), "hub");
+        let mut paths: Vec<&str> = group.iter().map(|entry| entry.file.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, ["high", "hub", "low", "mid"]);
+    }
+
+    /// The file cap truncates a group rather than rejecting it.
+    #[test]
+    fn a_group_never_exceeds_the_file_cap() {
+        let hub = stats_entry("hub", &[("id", int_stat(0), int_stat(300))]);
+        let low = stats_entry("low", &[("id", int_stat(0), int_stat(100))]);
+        let mid = stats_entry("mid", &[("id", int_stat(100), int_stat(200))]);
+        let high = stats_entry("high", &[("id", int_stat(200), int_stat(300))]);
+        let files = star_candidates(&hub, &low, &mid, &high);
+
+        let group = LayoutScoreCache::default()
+            .select_group(&[&files], &["id".into()], u64::MAX, &HashSet::new(), 3)
+            .unwrap();
+
+        assert_eq!(group.len(), 3);
+        assert_eq!(group[0].file.path.as_str(), "hub");
+    }
+
+    /// Files that all overlap one another outrank a file with as many
+    /// partners that do not: every pair inside such a group is restructured
+    /// by the one rewrite.
+    #[test]
+    fn mutually_overlapping_files_outrank_an_equally_wide_star() {
+        let hub = stats_entry("hub", &[("id", int_stat(0), int_stat(200))]);
+        let low = stats_entry("low", &[("id", int_stat(0), int_stat(100))]);
+        let high = stats_entry("high", &[("id", int_stat(100), int_stat(200))]);
+        let tri_a = stats_entry("tri-a", &[("id", int_stat(1_000), int_stat(1_100))]);
+        let tri_b = stats_entry("tri-b", &[("id", int_stat(1_000), int_stat(1_100))]);
+        let tri_c = stats_entry("tri-c", &[("id", int_stat(1_000), int_stat(1_100))]);
+        let triangle_shape = [(1_000, 1_050), (1_050, 1_100)];
+        let files = vec![
+            candidate_with_row_groups(&hub, &[(0, 50), (50, 100), (100, 150), (150, 200)]),
+            candidate_with_row_groups(&low, &[(0, 20), (20, 40), (40, 60), (60, 80), (80, 100)]),
+            candidate_with_row_groups(
+                &high,
+                &[(100, 120), (120, 140), (140, 160), (160, 180), (180, 200)],
+            ),
+            candidate_with_row_groups(&tri_a, &triangle_shape),
+            candidate_with_row_groups(&tri_b, &triangle_shape),
+            candidate_with_row_groups(&tri_c, &triangle_shape),
+        ];
+
+        let group = LayoutScoreCache::default()
+            .select_group(&[&files], &["id".into()], u64::MAX, &HashSet::new(), 3)
+            .unwrap();
+
+        let mut paths: Vec<&str> = group.iter().map(|entry| entry.file.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, ["tri-a", "tri-b", "tri-c"]);
     }
 
     /// A string sort column is ranked by the same contested row groups as
