@@ -760,7 +760,7 @@ dependencies = [
  "catalog",
  "clap",
  "core_affinity",
- "datastore-delta",
+ "datastore-pivot",
  "dispatch",
  "futures",
  "include_dir",
@@ -1599,7 +1599,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "datastore-delta"
+name = "datastore-pivot"
 version = "0.1.0"
 dependencies = [
  "arrow",
@@ -1615,7 +1615,7 @@ dependencies = [
  "core_affinity",
  "criterion",
  "crossbeam-deque",
- "datastore-delta",
+ "datastore-pivot",
  "delta_kernel",
  "delta_kernel_default_engine",
  "dispatch",
@@ -3012,7 +3012,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "catalog",
- "datastore-delta",
+ "datastore-pivot",
  "dispatch",
  "object-storage",
  "pgwire",

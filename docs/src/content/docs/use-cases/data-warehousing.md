@@ -11,7 +11,7 @@ the underlying tables remain in Delta Lake and Parquet.
 
 ### How Pivot fits
 
-1. Register local, S3, or GCS-backed Delta Lake datastores in the server
+1. Register local, S3, or GCS-backed Pivot datastores in the server
    configuration.
 2. Choose one default datastore and expose others as named databases.
 3. Query tables with ordinary SQL, qualifying names when a query crosses

@@ -15,12 +15,12 @@
 //!
 //! Each table's in-memory [`table::CatalogTable`] pairs its definition with the
 //! per-file row groups at one log version. The in-memory set is kept current by
-//! **push, not pull**: a periodic [`refresh_from_store`](DeltaDatastore::refresh_from_store)
+//! **push, not pull**: a periodic [`refresh_from_store`](PivotDatastore::refresh_from_store)
 //! sweep (the server runs one on an interval) reloads every table to its latest
 //! committed version and fetches any new files' footers, and an in-process
-//! writer (INSERT, compaction) [`publish_table`](DeltaDatastore::publish_table)s
+//! writer (INSERT, compaction) [`publish_table`](PivotDatastore::publish_table)s
 //! its committed copy immediately. Queries never touch the store: a query opens
-//! a transaction ([`Datastore::begin_transaction`]) whose [`DeltaSnapshot`]
+//! a transaction ([`Datastore::begin_transaction`]) whose [`PivotSnapshot`]
 //! freezes the table set as of that moment, and every binding, scan, and late
 //! materialize of that query reads the frozen snapshot with zero I/O.
 //!
@@ -261,7 +261,7 @@ impl DatastoreIndex {
     }
 }
 
-/// A Delta datastore's concurrent table index, keyed by name.
+/// A Pivot datastore's concurrent table index, keyed by name.
 ///
 /// `CREATE TABLE` compiles to a dataflow that reads every data file's footer
 /// **once** (in parallel over the worker pool) and stages the materialized table
@@ -278,7 +278,7 @@ impl DatastoreIndex {
 /// Cloneable (every field is an `Arc`, a `String`, or the shared dispatcher
 /// handle), so a commit that writes can hand a clone to the blocking pool.
 #[derive(Clone)]
-pub struct DeltaDatastore {
+pub struct PivotDatastore {
     /// The in-memory schema and table sets. The lock guards the *index* (add on
     /// `CREATE`, swap-in on a resolve's refresh); each [`CatalogTable`] is itself
     /// a lock-free value that callers clone out and evolve independently. One
@@ -318,15 +318,15 @@ pub struct DeltaDatastore {
     compacter: Arc<Mutex<Option<crate::compact::CompacterHandle>>>,
 }
 
-impl std::fmt::Debug for DeltaDatastore {
+impl std::fmt::Debug for PivotDatastore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DeltaDatastore")
+        f.debug_struct("PivotDatastore")
             .field("store", &self.store)
             .finish_non_exhaustive()
     }
 }
 
-impl DeltaDatastore {
+impl PivotDatastore {
     /// Open a persisted database rooted at `uri`, a local directory (or
     /// `file://…`), or a remote `s3://…` object store, reloading every
     /// table the manifest records at its latest version: read each table's
@@ -348,7 +348,7 @@ impl DeltaDatastore {
         dispatcher: &DataFlowDispatcher,
         maintenance: Option<crate::MaintenanceConfig>,
     ) -> Result<Arc<Self>> {
-        // Only local Delta datastores take a process lock; remote stores have
+        // Only local Pivot datastores take a process lock; remote stores have
         // no local root and skip this.
         let local_lock = store
             .local_root()
@@ -482,15 +482,15 @@ impl DeltaDatastore {
     }
 
     /// Open a transaction, typed: freeze the current table set into a
-    /// [`DeltaSnapshot`] and create the injectors that receive completed INSERT
+    /// [`PivotSnapshot`] and create the injectors that receive completed INSERT
     /// files and table creations. Cheap: clones the map (the row-group metadata
     /// inside is `Arc`-shared), no I/O. The [`Datastore::begin_transaction`]
     /// trait impl delegates here.
-    pub fn begin_transaction(self: Arc<Self>) -> Arc<DeltaTransaction> {
-        let snapshot = Arc::new(DeltaSnapshot {
+    pub fn begin_transaction(self: Arc<Self>) -> Arc<PivotTransaction> {
+        let snapshot = Arc::new(PivotSnapshot {
             index: self.tables_index.read().unwrap().clone(),
         });
-        Arc::new(DeltaTransaction {
+        Arc::new(PivotTransaction {
             snapshot,
             uploaded_files: Arc::new(Injector::new()),
             pending_table_creations: Arc::new(Injector::new()),
@@ -658,7 +658,7 @@ impl DeltaDatastore {
     /// Persist one table creation staged by a completed footer-fetch dataflow:
     /// commit Delta version 0, record the table in the database index, and
     /// publish it into the live set so the next transaction binds it. Called
-    /// from [`DeltaTransaction::commit`] on the blocking pool, never from a
+    /// from [`PivotTransaction::commit`] on the blocking pool, never from a
     /// dispatch worker.
     ///
     /// The whole step holds the table-set write lock, which serializes
@@ -707,7 +707,7 @@ impl DeltaDatastore {
     /// storage after the retention window) and remove it from the live set, so
     /// the next transaction no longer binds it. The table's files stay in
     /// place: a query that bound the table before the drop may still be
-    /// reading them. Called from [`DeltaTransaction::commit`] on the blocking
+    /// reading them. Called from [`PivotTransaction::commit`] on the blocking
     /// pool, never from a dispatch worker.
     ///
     /// The whole step holds the index write lock, which serializes in-process
@@ -806,7 +806,7 @@ impl DeltaDatastore {
 
     /// Persist one schema creation staged by a transaction: record it in the
     /// database index and publish it into the live set so the next transaction
-    /// resolves it. Called from [`DeltaTransaction::commit`] on the blocking
+    /// resolves it. Called from [`PivotTransaction::commit`] on the blocking
     /// pool, never from a dispatch worker.
     ///
     /// The whole step holds the index write lock, which serializes in-process
@@ -939,7 +939,7 @@ pub struct DataFileInfo {
     pub size: u64,
 }
 
-impl DeltaTransaction {
+impl PivotTransaction {
     /// Whether this transaction's frozen snapshot holds `schema`. DuckDB
     /// resolves every name through a schema lookup, so this is answered from the
     /// snapshot alone and takes no lock. A schema this transaction has staged is
@@ -950,7 +950,7 @@ impl DeltaTransaction {
 
     /// Resolve a `CREATE TABLE` against this datastore: check the schema exists
     /// and the name is still free, parse the layout options, and locate the
-    /// Parquet files the table adopts. Returns a [`DeltaTableCreation`] whose
+    /// Parquet files the table adopts. Returns a [`PivotTableCreation`] whose
     /// `compile` builds the footer-fetch-and-stage dataflow. This part runs on
     /// the coordinator; compiling needs the pool.
     ///
@@ -958,7 +958,7 @@ impl DeltaTransaction {
     /// database root, named after its identity. `WITH (with_pre_existing_parquets = '…')`
     /// only points at data to adopt; nothing is written to that directory. A
     /// statement that names none yields an empty table.
-    fn bind_create(&self, request: CreateTableRequest) -> Result<DeltaTableCreation> {
+    fn bind_create(&self, request: CreateTableRequest) -> Result<PivotTableCreation> {
         let name = request.schema_qualified_name();
 
         Self::reject_unknown_options(&request)?;
@@ -989,7 +989,7 @@ impl DeltaTransaction {
         let sort_by = Self::parse_spec_columns(&request, SORT_BY_OPTION)?;
         let files = self.adopted_data_files(&request)?;
 
-        Ok(DeltaTableCreation {
+        Ok(PivotTableCreation {
             pending_table_creations: self.pending_table_creations.clone(),
             files,
             name,
@@ -1002,7 +1002,7 @@ impl DeltaTransaction {
         })
     }
 
-    fn bind_drop(&self, request: DropTableRequest) -> Result<DeltaTableDrop> {
+    fn bind_drop(&self, request: DropTableRequest) -> Result<PivotTableDrop> {
         let name = request.schema_qualified_name();
         if !request.if_exists {
             if !self.contains_schema(&name.schema) {
@@ -1012,7 +1012,7 @@ impl DeltaTransaction {
                 return Err(Error::TableNotFound(name.to_string()));
             }
         }
-        Ok(DeltaTableDrop {
+        Ok(PivotTableDrop {
             pending_table_drops: self.pending_table_drops.clone(),
             drop: PendingTableDrop {
                 name,
@@ -1031,11 +1031,11 @@ impl DeltaTransaction {
     /// schema a success. This checks the transaction's frozen snapshot; the
     /// datastore re-checks under its write lock at commit as the real race
     /// backstop, honouring `IF NOT EXISTS` there too.
-    fn bind_schema_creation(&self, request: CreateSchemaRequest) -> Result<DeltaSchemaCreation> {
+    fn bind_schema_creation(&self, request: CreateSchemaRequest) -> Result<PivotSchemaCreation> {
         if !request.if_not_exists && self.contains_schema(&request.name) {
             return Err(Error::SchemaExists(request.name));
         }
-        Ok(DeltaSchemaCreation {
+        Ok(PivotSchemaCreation {
             pending_schema_creations: self.pending_schema_creations.clone(),
             creation: PendingSchemaCreation {
                 name: request.name,
@@ -1150,10 +1150,10 @@ impl DeltaTransaction {
 
 /// Commit the schema creations drained from a transaction. Each one records
 /// itself in the database manifest and publishes into the live schema set.
-/// Blocking store I/O, so [`DeltaTransaction::commit`] runs this on the blocking
+/// Blocking store I/O, so [`PivotTransaction::commit`] runs this on the blocking
 /// pool.
 fn commit_schema_creations(
-    datastore: &DeltaDatastore,
+    datastore: &PivotDatastore,
     pending_schema_creations: Vec<PendingSchemaCreation>,
 ) -> CatalogResult<()> {
     for pending in pending_schema_creations {
@@ -1164,10 +1164,10 @@ fn commit_schema_creations(
 
 /// Commit the table creations drained from a transaction. Each one initializes
 /// its Delta log, registers itself in the database manifest, and publishes into
-/// the live table set. Blocking store I/O, so [`DeltaTransaction::commit`] runs
+/// the live table set. Blocking store I/O, so [`PivotTransaction::commit`] runs
 /// this on the blocking pool.
 fn commit_table_creations(
-    datastore: &DeltaDatastore,
+    datastore: &PivotDatastore,
     pending_table_creations: Vec<PendingTableCreation>,
 ) -> CatalogResult<()> {
     for pending in pending_table_creations {
@@ -1178,9 +1178,9 @@ fn commit_table_creations(
 
 /// Commit the table drops drained from a transaction. Each one unregisters
 /// itself from the database manifest and the live table set. Blocking store
-/// I/O, so [`DeltaTransaction::commit`] runs this on the blocking pool.
+/// I/O, so [`PivotTransaction::commit`] runs this on the blocking pool.
 fn commit_table_drops(
-    datastore: &DeltaDatastore,
+    datastore: &PivotDatastore,
     pending_table_drops: Vec<PendingTableDrop>,
 ) -> CatalogResult<()> {
     for pending in pending_table_drops {
@@ -1191,13 +1191,13 @@ fn commit_table_drops(
 
 /// Commit the files an INSERT drained from its transaction: group them by the
 /// table they were written for and append each group through
-/// [`DeltaDatastore::commit_to_table`]. The transaction's frozen snapshot is not
+/// [`PivotDatastore::commit_to_table`]. The transaction's frozen snapshot is not
 /// the commit base -- it is a read view, and a table it froze versions ago would
 /// lose the compare-and-swap against every INSERT that committed since.
-/// Blocking store I/O, so [`DeltaTransaction::commit`] runs it on the blocking
+/// Blocking store I/O, so [`PivotTransaction::commit`] runs it on the blocking
 /// pool.
 fn commit_uploaded_files(
-    datastore: &DeltaDatastore,
+    datastore: &PivotDatastore,
     drained: Vec<insert_sink::UploadedFile>,
 ) -> CatalogResult<()> {
     let mut files_by_table = HashMap::<Uuid, Vec<TableFile>>::new();
@@ -1240,22 +1240,21 @@ fn drain_injector<T>(injector: &Injector<T>) -> Vec<T> {
 }
 
 #[async_trait]
-impl Datastore for DeltaDatastore {
+impl Datastore for PivotDatastore {
     /// Open a transaction: freeze the table set as it stands right now. Every
     /// table the transaction binds resolves from that frozen
-    /// [`DeltaSnapshot`] (pure in-memory, no I/O), so one query reads one
+    /// [`PivotSnapshot`] (pure in-memory, no I/O), so one query reads one
     /// consistent version of every table regardless of concurrent refreshes or
     /// commits. [`DatastoreTransaction::commit`] persists staged table creations
     /// and files injected by INSERT; rollback or dropping the transaction
     /// discards those pending sets.
     fn begin_transaction(self: Arc<Self>) -> Arc<dyn DatastoreTransaction> {
-        DeltaDatastore::begin_transaction(self)
+        PivotDatastore::begin_transaction(self)
     }
 
-    /// The format this datastore keeps its tables in: Delta, whatever store
-    /// backs it.
+    /// The datastore implementation, independent of the object store backing it.
     fn kind(&self) -> &'static str {
-        "delta"
+        "pivot"
     }
 
     /// The URI this database is rooted at; every table location and file path
@@ -1327,21 +1326,21 @@ impl Datastore for DeltaDatastore {
 /// materialized (the background refresh keeps the master set fully fetched).
 /// Everything a query does against it (binding, scan-view construction, late
 /// materialize) is pure in-memory.
-pub struct DeltaSnapshot {
+pub struct PivotSnapshot {
     /// The datastore's schemas and tables as they stood when the transaction
     /// began, so a query resolves both from one frozen view.
     index: DatastoreIndex,
 }
 
-impl std::fmt::Debug for DeltaSnapshot {
+impl std::fmt::Debug for PivotSnapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DeltaSnapshot")
+        f.debug_struct("PivotSnapshot")
             .field("tables", &self.index.table_names().collect::<Vec<_>>())
             .finish_non_exhaustive()
     }
 }
 
-impl DeltaSnapshot {
+impl PivotSnapshot {
     /// A clone of the table named `name`, or `None` if this snapshot has no such
     /// table. The frozen copy a [`TableBinding`] captures at bind time, so its
     /// compile resolves the table's file set without any transaction handle.
@@ -1418,11 +1417,11 @@ struct PendingTableCreation {
     loaded: Vec<parquet_engine::FileRowGroups>,
 }
 
-/// The [`DatastoreTransaction`] a [`DeltaDatastore`] opens: one query's frozen
-/// [`DeltaSnapshot`] plus injectors of uploaded files and completed table
+/// The [`DatastoreTransaction`] a [`PivotDatastore`] opens: one query's frozen
+/// [`PivotSnapshot`] plus injectors of uploaded files and completed table
 /// creations awaiting commit.
-pub struct DeltaTransaction {
-    pub(crate) snapshot: Arc<DeltaSnapshot>,
+pub struct PivotTransaction {
+    pub(crate) snapshot: Arc<PivotSnapshot>,
     pub(crate) uploaded_files: Arc<Injector<insert_sink::UploadedFile>>,
     pending_table_creations: Arc<Injector<PendingTableCreation>>,
     pending_schema_creations: Arc<Injector<PendingSchemaCreation>>,
@@ -1430,7 +1429,7 @@ pub struct DeltaTransaction {
     /// The datastore this transaction reads and writes back to. CREATE commits
     /// publish through it so DDL is visible to the next transaction without
     /// waiting for a refresh.
-    datastore: Arc<DeltaDatastore>,
+    datastore: Arc<PivotDatastore>,
     /// Whether commit has run. A second commit is refused, and the drop
     /// safety net below discards the staged writes of a transaction its owner
     /// never resolved, so no code path can leak them into limbo; deliberate
@@ -1440,15 +1439,15 @@ pub struct DeltaTransaction {
     committed: std::sync::atomic::AtomicBool,
 }
 
-impl std::fmt::Debug for DeltaTransaction {
+impl std::fmt::Debug for PivotTransaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DeltaTransaction")
+        f.debug_struct("PivotTransaction")
             .field("snapshot", &self.snapshot)
             .finish_non_exhaustive()
     }
 }
 
-impl DeltaTransaction {
+impl PivotTransaction {
     /// [`DatastoreTransaction::bind_table`], typed: the concrete
     /// [`TableBinding`] instead of the trait object. This is the single
     /// resolution path; the trait impl below only boxes its result (the planner
@@ -1470,7 +1469,7 @@ impl DeltaTransaction {
 }
 
 #[async_trait]
-impl DatastoreTransaction for DeltaTransaction {
+impl DatastoreTransaction for PivotTransaction {
     fn does_schema_exist(&self, schema: &str) -> bool {
         self.contains_schema(schema)
     }
@@ -1480,7 +1479,7 @@ impl DatastoreTransaction for DeltaTransaction {
         datastore: &str,
         name: &SchemaQualifiedTableName,
     ) -> Option<Box<dyn BoundTable>> {
-        Some(Box::new(DeltaTransaction::table(self, datastore, name)?))
+        Some(Box::new(PivotTransaction::table(self, datastore, name)?))
     }
 
     fn table_revision(&self, name: &SchemaQualifiedTableName) -> Option<TableRevision> {
@@ -1575,7 +1574,7 @@ impl DatastoreTransaction for DeltaTransaction {
 /// so no owner mistake can leave them in limbo. Reaching this is a bug in the
 /// owner, hence the warning; read-only transactions drop silently (planning
 /// and pure reads resolve nothing by design).
-impl Drop for DeltaTransaction {
+impl Drop for PivotTransaction {
     fn drop(&mut self) {
         if self.committed.load(std::sync::atomic::Ordering::Acquire) {
             return;
@@ -1595,16 +1594,16 @@ impl Drop for DeltaTransaction {
     }
 }
 
-/// A resolved `CREATE SCHEMA` for a [`DeltaDatastore`]: the validated creation
+/// A resolved `CREATE SCHEMA` for a [`PivotDatastore`]: the validated creation
 /// plus the transaction-owned staging queue it will land in. Compiling it builds
 /// a dataflow that stages the creation and emits no rows, so the schema appears
 /// on the transaction only once that dataflow runs.
-struct DeltaSchemaCreation {
+struct PivotSchemaCreation {
     pending_schema_creations: Arc<Injector<PendingSchemaCreation>>,
     creation: PendingSchemaCreation,
 }
 
-impl SchemaCreation for DeltaSchemaCreation {
+impl SchemaCreation for PivotSchemaCreation {
     fn compile(&self, dispatcher: &DataFlowDispatcher) -> CatalogResult<RecordBatchOperatorSpec> {
         // One nullary per worker, but only the first carries the creation; the
         // rest no-op. Handing it out here rather than racing for it at run time
@@ -1626,16 +1625,16 @@ impl SchemaCreation for DeltaSchemaCreation {
     }
 }
 
-/// A resolved `DROP TABLE` for a [`DeltaDatastore`]: the validated drop plus
+/// A resolved `DROP TABLE` for a [`PivotDatastore`]: the validated drop plus
 /// the transaction-owned staging queue it will land in. Compiling it builds a
 /// dataflow that stages the drop and emits no rows, so the drop lands on the
 /// transaction only once that dataflow runs.
-struct DeltaTableDrop {
+struct PivotTableDrop {
     pending_table_drops: Arc<Injector<PendingTableDrop>>,
     drop: PendingTableDrop,
 }
 
-impl TableDrop for DeltaTableDrop {
+impl TableDrop for PivotTableDrop {
     fn compile(&self, dispatcher: &DataFlowDispatcher) -> CatalogResult<RecordBatchOperatorSpec> {
         // One nullary per worker, but only the first carries the drop; the
         // rest no-op, exactly as the schema-creation sink stages.
@@ -1656,12 +1655,12 @@ impl TableDrop for DeltaTableDrop {
     }
 }
 
-/// A resolved `CREATE TABLE` for a [`DeltaDatastore`]: the validated request, a
+/// A resolved `CREATE TABLE` for a [`PivotDatastore`]: the validated request, a
 /// transaction-owned staging injector, and the located data files, captured at
-/// resolution by [`DeltaTransaction::bind_create`]. Compiling it builds the
+/// resolution by [`PivotTransaction::bind_create`]. Compiling it builds the
 /// dataflow that fetches the files' footers and stages the completed creation
 /// for transaction commit.
-struct DeltaTableCreation {
+struct PivotTableCreation {
     pending_table_creations: Arc<Injector<PendingTableCreation>>,
     files: Vec<DataFile>,
     name: SchemaQualifiedTableName,
@@ -1675,7 +1674,7 @@ struct DeltaTableCreation {
     if_not_exists: bool,
 }
 
-impl TableCreation for DeltaTableCreation {
+impl TableCreation for PivotTableCreation {
     fn compile(&self, dispatcher: &DataFlowDispatcher) -> CatalogResult<RecordBatchOperatorSpec> {
         // The terminal worker only stages the completed creation. Durable writes
         // and live publication happen later in the transaction's blocking commit.

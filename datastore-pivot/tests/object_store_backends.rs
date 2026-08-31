@@ -14,7 +14,7 @@
 
 mod common;
 
-use datastore_delta::test_support as harness;
+use datastore_pivot::test_support as harness;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,7 +28,7 @@ use common::{
     DispatchGuard, collect_i64s, commit_datastore_transaction, current_parquet,
     dispatch_with_buffers, strings_and_ints,
 };
-use datastore_delta::DeltaDatastore;
+use datastore_pivot::PivotDatastore;
 use dispatch::Projection;
 use harness::Backend;
 use object_storage::ObjectPath;
@@ -80,13 +80,13 @@ fn pq(values: &[i64]) -> Vec<u8> {
 }
 
 /// Put `files` (name → values) under `events/` and `CREATE TABLE events` over them.
-fn create_events(d: &DispatchGuard, b: &Backend, files: &[(&str, &[i64])]) -> Arc<DeltaDatastore> {
+fn create_events(d: &DispatchGuard, b: &Backend, files: &[(&str, &[i64])]) -> Arc<PivotDatastore> {
     for (name, values) in files {
         b.store
             .put(&ObjectPath::new(format!("events/{name}")), &pq(values))
             .unwrap();
     }
-    let datastore = DeltaDatastore::open(&b.root, d).unwrap();
+    let datastore = PivotDatastore::open(&b.root, d).unwrap();
     let transaction = datastore.clone().begin_transaction();
     transaction
         .bind_create_table(adopting_request("events", "events"))
@@ -101,7 +101,7 @@ fn create_events(d: &DispatchGuard, b: &Backend, files: &[(&str, &[i64])]) -> Ar
 }
 
 /// Scan the table's `value` column, sorted.
-fn scan(d: &DispatchGuard, datastore: &DeltaDatastore, name: &str) -> Vec<i64> {
+fn scan(d: &DispatchGuard, datastore: &PivotDatastore, name: &str) -> Vec<i64> {
     let parquet = current_parquet(datastore, name);
     let out = table_input(d, &parquet, Projection::all(2), false)
         .collect()
@@ -111,7 +111,7 @@ fn scan(d: &DispatchGuard, datastore: &DeltaDatastore, name: &str) -> Vec<i64> {
     values
 }
 
-fn row_groups(datastore: &DeltaDatastore, name: &str) -> usize {
+fn row_groups(datastore: &PivotDatastore, name: &str) -> usize {
     current_parquet(datastore, name).row_groups().len()
 }
 
@@ -126,7 +126,7 @@ mod bodies {
         b.store
             .put(&ObjectPath::new("events/p1.parquet"), &pq(&[1, 2, 3]))
             .unwrap();
-        let datastore = DeltaDatastore::open(&b.root, &d).unwrap();
+        let datastore = PivotDatastore::open(&b.root, &d).unwrap();
 
         let transaction = datastore.clone().begin_transaction();
         transaction
@@ -153,7 +153,7 @@ mod bodies {
             .unwrap();
         let absolute = b.store.absolute_key(&ObjectPath::new("outside")).unwrap();
         assert!(absolute.is_absolute(), "the store yields an absolute key");
-        let datastore = DeltaDatastore::open(&b.root, &d).unwrap();
+        let datastore = PivotDatastore::open(&b.root, &d).unwrap();
 
         let transaction = datastore.clone().begin_transaction();
         transaction
@@ -174,7 +174,7 @@ mod bodies {
         let d = dispatch_with_buffers(2, 32);
         drop(create_events(&d, b, &[("p1.parquet", &[1, 2, 3])]));
 
-        let reopened = DeltaDatastore::open(&b.root, &d).unwrap();
+        let reopened = PivotDatastore::open(&b.root, &d).unwrap();
 
         assert_eq!(scan(&d, &reopened, "events"), vec![1, 2, 3]);
     }
@@ -213,13 +213,13 @@ mod bodies {
                 &merged_bytes,
             )
             .unwrap();
-        let merged = datastore_delta::FileRef {
+        let merged = datastore_pivot::FileRef {
             path: merged_path,
             size: merged_bytes.len() as u64,
         };
 
         table
-            .replace_data_files(&inputs, &[datastore_delta::DeltaFileEntry::new(merged)])
+            .replace_data_files(&inputs, &[datastore_pivot::DeltaFileEntry::new(merged)])
             .unwrap();
 
         assert_eq!(scan(&d, &datastore, "events"), vec![1, 2, 3, 4]);

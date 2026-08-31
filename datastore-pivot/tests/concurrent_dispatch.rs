@@ -21,7 +21,7 @@ use tempfile::TempDir;
 use catalog::datastore::{Datastore, DatastoreTransaction};
 use catalog::{DEFAULT_DATASTORE_NAME, PivotCatalog};
 use common::commit_datastore_transaction;
-use datastore_delta::DeltaDatastore;
+use datastore_pivot::PivotDatastore;
 use planner::Planner;
 use planner::catalog::{Column, CreateTableRequest};
 use planner::types::Type;
@@ -34,7 +34,7 @@ fn dispatcher() -> DataFlowDispatcher {
         .clone()
 }
 
-fn make_datastore() -> (TempDir, Arc<DeltaDatastore>) {
+fn make_datastore() -> (TempDir, Arc<PivotDatastore>) {
     let dir = TempDir::new().unwrap();
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -59,7 +59,7 @@ fn make_datastore() -> (TempDir, Arc<DeltaDatastore>) {
         .unwrap();
     writer.close().unwrap();
 
-    let datastore = DeltaDatastore::open(&dir.path().to_string_lossy(), &dispatcher()).unwrap();
+    let datastore = PivotDatastore::open(&dir.path().to_string_lossy(), &dispatcher()).unwrap();
     let mut options = HashMap::new();
     options.insert(
         "with_pre_existing_parquets".to_string(),
@@ -94,7 +94,7 @@ fn make_datastore() -> (TempDir, Arc<DeltaDatastore>) {
     (dir, datastore)
 }
 
-fn run_count(datastore: &Arc<DeltaDatastore>) -> usize {
+fn run_count(datastore: &Arc<PivotDatastore>) -> usize {
     let catalog = Arc::new(
         PivotCatalog::new(
             HashMap::from([(

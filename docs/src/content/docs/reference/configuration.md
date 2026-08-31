@@ -38,7 +38,7 @@ Exactly one datastore must set `default: true`.
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `kind` | Required | Datastore format. `delta` is the only supported value. |
+| `kind` | Required | Datastore implementation. `pivot` is the only supported value. |
 | `location` | Required | Local path, `s3://` URI, or `gs://` URI. |
 | `default` | `false` | Makes this the target of unqualified SQL names. Exactly one must be true. |
 | `compact` | `true` | Runs background compaction. Enable it in only one process per shared datastore. |

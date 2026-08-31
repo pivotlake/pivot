@@ -41,7 +41,7 @@
 //! up storing that data twice, once in the user's directory and once in its own.
 //! That is the price of never writing into a directory the user owns.
 //!
-//! A [`DeltaDatastore`] owns one [`CompacterHandle`] actor. Configured timer ticks and
+//! A [`PivotDatastore`] owns one [`CompacterHandle`] actor. Configured timer ticks and
 //! explicit `COMPACT` commands share its queue, so their rewrites never race in
 //! one process. A timed round reloads each table to its latest log version;
 //! commands carry the table snapshot captured by their query transaction. The
@@ -57,7 +57,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
 use crate::manifest::DeltaFileEntry;
-use crate::{CatalogTable, DeltaDatastore, FileRef, TableFile, scalar_values_equal};
+use crate::{CatalogTable, FileRef, PivotDatastore, TableFile, scalar_values_equal};
 use object_storage::ObjectPath;
 use planner::catalog::SchemaQualifiedTableName;
 
@@ -102,7 +102,7 @@ pub fn default_merge_target_bytes(target_bytes: u64) -> u64 {
     (target_bytes as f64 * DEFAULT_MERGE_TARGET_MULTIPLIER) as u64
 }
 
-/// What background maintenance a [`DeltaDatastore`] runs for itself once opened.
+/// What background maintenance a [`PivotDatastore`] runs for itself once opened.
 /// The datastore spawns its own tasks from this on the ambient tokio runtime;
 /// they stop when its dispatch pool begins shutting down.
 #[derive(Clone)]
@@ -165,7 +165,7 @@ pub(crate) struct CompacterActor {
     /// How often to re-check the tables' logs, or `None` when only explicit
     /// commands drive this actor.
     poll_interval: Option<Duration>,
-    datastore: Arc<DeltaDatastore>,
+    datastore: Arc<PivotDatastore>,
     commands: mpsc::UnboundedReceiver<CompactionCommand>,
     /// Each table's layout pair scores, remembered from round to round so a
     /// pass only measures the files it has not seen before (see
@@ -180,7 +180,7 @@ impl CompacterHandle {
         min_files: usize,
         max_concurrent_merges: usize,
         poll_interval: Option<Duration>,
-        datastore: Arc<DeltaDatastore>,
+        datastore: Arc<PivotDatastore>,
     ) -> (Self, CompacterActor) {
         let (sender, receiver) = mpsc::unbounded_channel();
         (
@@ -469,7 +469,7 @@ impl CompacterActor {
 /// release their reservations however the merge went; a committed merge's
 /// outcome carries the output files for the round to fold into its table copy.
 async fn compact_batch(
-    datastore: Arc<DeltaDatastore>,
+    datastore: Arc<PivotDatastore>,
     name: SchemaQualifiedTableName,
     id: uuid::Uuid,
     inputs: Vec<FileRef>,
@@ -604,7 +604,7 @@ fn small_file_batch(
 ///
 /// Blocking store I/O, so callers run it on the blocking pool.
 pub fn compact_table_files(
-    datastore: &DeltaDatastore,
+    datastore: &PivotDatastore,
     id: uuid::Uuid,
     inputs: &[FileRef],
     target_rows_per_group: usize,
@@ -647,7 +647,7 @@ fn partition_values_equal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::DeltaDatastore;
+    use crate::PivotDatastore;
     use arrow_array::{ArrayRef, Int64Array, RecordBatch, Scalar};
     use arrow_schema::{DataType, Field, Schema};
     use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
@@ -819,7 +819,7 @@ mod tests {
     /// against `datastore`, the way the server would run it -- or, when `dir` is
     /// `None`, an empty table adopting nothing.
     fn create_table(
-        datastore: &Arc<DeltaDatastore>,
+        datastore: &Arc<PivotDatastore>,
         dispatcher: &DataFlowDispatcher,
         name: &str,
         dir: Option<&Path>,
@@ -865,7 +865,7 @@ mod tests {
     }
 
     fn create_wide_sorted_table(
-        datastore: &Arc<DeltaDatastore>,
+        datastore: &Arc<PivotDatastore>,
         dispatcher: &DataFlowDispatcher,
         name: &str,
         dir: &Path,
@@ -925,7 +925,7 @@ mod tests {
 
     /// Create an empty table partitioned by its `Partition` column.
     fn create_partitioned_table(
-        datastore: &Arc<DeltaDatastore>,
+        datastore: &Arc<PivotDatastore>,
         dispatcher: &DataFlowDispatcher,
         name: &str,
     ) {
@@ -977,7 +977,7 @@ mod tests {
     /// Refresh `name` to the latest committed manifest (a writer evolves a
     /// cloned-out handle, so the datastore's own copy lags until a refresh), then
     /// return its current row groups.
-    fn fresh_parquet(datastore: &DeltaDatastore, name: &str) -> Arc<ParquetTable> {
+    fn fresh_parquet(datastore: &PivotDatastore, name: &str) -> Arc<ParquetTable> {
         let mut table = datastore
             .table_handle(&SchemaQualifiedTableName::in_default_schema(name))
             .expect("table exists");
@@ -986,7 +986,7 @@ mod tests {
     }
 
     /// Drive one full compaction sweep to completion on a temporary runtime.
-    fn run_one_sweep(target_bytes: u64, datastore: Arc<DeltaDatastore>) {
+    fn run_one_sweep(target_bytes: u64, datastore: Arc<PivotDatastore>) {
         run_one_sweep_with_parallelism(target_bytes, DEFAULT_COMPACT_PARALLELISM, datastore)
     }
 
@@ -995,7 +995,7 @@ mod tests {
     fn run_one_sweep_with_parallelism(
         target_bytes: u64,
         max_concurrent_merges: usize,
-        datastore: Arc<DeltaDatastore>,
+        datastore: Arc<PivotDatastore>,
     ) {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -1023,7 +1023,7 @@ mod tests {
         target_bytes: u64,
         merge_target_bytes: u64,
         min_files: usize,
-        datastore: Arc<DeltaDatastore>,
+        datastore: Arc<PivotDatastore>,
         name: SchemaQualifiedTableName,
         table: CatalogTable,
         final_sweep: bool,
@@ -1059,7 +1059,7 @@ mod tests {
         write_parquet_file(&adopted, "a.parquet", vec![1]);
         write_parquet_file(&adopted, "b.parquet", vec![2]);
         let datastore =
-            DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1112,7 +1112,7 @@ mod tests {
         write_parquet_file(&adopted_dir, "c.parquet", vec![1_000, 1_100]);
         write_parquet_file(&adopted_dir, "d.parquet", vec![1_000, 1_100]);
         let datastore =
-            DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1157,7 +1157,7 @@ mod tests {
             write_parquet_file(&adopted_dir, file, rows);
         }
         let datastore =
-            DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1193,7 +1193,7 @@ mod tests {
         let db = tempfile::tempdir().unwrap();
         let encoded = tempfile::tempdir().unwrap();
         let datastore =
-            DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_partitioned_table(&datastore, dispatch.dispatcher(), "events");
         let name = SchemaQualifiedTableName::in_default_schema("events");
         let mut table = datastore.table_handle(&name).unwrap();
@@ -1263,7 +1263,7 @@ mod tests {
         write_parquet_file_with_row_group_size(&adopted, "c.parquet", (100..120).collect(), 1);
         write_parquet_file_with_row_group_size(&adopted, "d.parquet", (119..139).collect(), 1);
         let datastore =
-            DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1332,7 +1332,7 @@ mod tests {
         write_parquet_file(&adopted_dir, "c.parquet", vec![6, 7, 8, 9]);
 
         let datastore =
-            DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1393,7 +1393,7 @@ mod tests {
         write_wide_parquet_file(&adopted, "c.parquet", ROWS_PER_INPUT, 47);
 
         let datastore =
-            DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_wide_sorted_table(&datastore, dispatch.dispatcher(), "events", &adopted);
         let name = SchemaQualifiedTableName::in_default_schema("events");
         let table = datastore.table_handle(&name).unwrap();
@@ -1441,7 +1441,7 @@ mod tests {
         write_parquet_file(&adopted_dir, "c.parquet", vec![1_000, 1_100]);
 
         let datastore =
-            DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_table(
             &datastore,
             dispatch.dispatcher(),
@@ -1485,7 +1485,7 @@ mod tests {
         write_wide_parquet_file(&adopted, "right.parquet", ROWS_PER_INPUT, 29);
 
         let datastore =
-            DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_wide_sorted_table(&datastore, dispatch.dispatcher(), "events", &adopted);
         let name = SchemaQualifiedTableName::in_default_schema("events");
         let table = datastore.table_handle(&name).unwrap();
@@ -1634,7 +1634,7 @@ mod tests {
         write_wide_parquet_file(&adopted, "right.parquet", ROWS_PER_INPUT, 29);
 
         let datastore =
-            DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_wide_sorted_table(&datastore, dispatch.dispatcher(), "events", &adopted);
         let table = datastore
             .table_handle(&SchemaQualifiedTableName::in_default_schema("events"))
@@ -1667,7 +1667,7 @@ mod tests {
         let db = tempfile::tempdir().unwrap();
         let encoded = tempfile::tempdir().unwrap();
         let datastore =
-            DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         create_partitioned_table(&datastore, dispatch.dispatcher(), "events");
 
         // Two inputs in each partition. If batching crossed the partition
@@ -1821,7 +1821,7 @@ mod tests {
         write_parquet_file(&adopted_dir, "b.parquet", vec![3]);
 
         let datastore =
-            DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+            PivotDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
         // A relative adoption path: the files are read at `events` under the
         // store root, rather than at an absolute path of their own.
         create_table(

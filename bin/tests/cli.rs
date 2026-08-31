@@ -44,7 +44,7 @@ fn server_command_runs_until_terminated() {
         &config,
         format!(
             "server:\n  bind: {address}\n  memory: 64m\n  workers: 1\n\
-             metastore:\n  datastores:\n    default:\n      kind: delta\n      location: {}\n      \
+             metastore:\n  datastores:\n    default:\n      kind: pivot\n      location: {}\n      \
              default: true\n  users:\n    pivot:\n      auth:\n        method: trust\n",
             datastore.display()
         ),

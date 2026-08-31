@@ -77,7 +77,7 @@ generate_metastore_file() {
   {
     echo "datastores:"
     echo "  default:"
-    echo "    kind: delta"
+    echo "    kind: pivot"
     echo "    location: \"$location\""
     echo "    default: true"
     case "$location" in

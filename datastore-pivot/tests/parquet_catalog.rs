@@ -21,7 +21,7 @@ use tempfile::TempDir;
 use catalog::datastore::{Datastore, DatastoreTransaction};
 use catalog::{DEFAULT_DATASTORE_NAME, PivotCatalog};
 use common::{commit_datastore_transaction, current_parquet};
-use datastore_delta::{ColumnStatFilter, DeltaDatastore, PartitionEqFilter, TableBinding};
+use datastore_pivot::{ColumnStatFilter, PartitionEqFilter, PivotDatastore, TableBinding};
 use object_storage::ObjectPath;
 use planner::PlanNode;
 use planner::Planner;
@@ -36,7 +36,7 @@ use planner::operator::{Input, Operator};
 use planner::types::Type;
 
 /// A shared single-worker dispatch pool for the whole test binary, handed to
-/// each `DeltaDatastore` so `create_table` can read footers once (via the
+/// each `PivotDatastore` so `create_table` can read footers once (via the
 /// metadata-fetch dataflow) when the table is defined.
 fn dispatcher() -> DataFlowDispatcher {
     static DISPATCH: OnceLock<Dispatch> = OnceLock::new();
@@ -50,10 +50,10 @@ fn dispatcher() -> DataFlowDispatcher {
 
 /// Open an empty datastore on a test-owned directory. Keeping the `TempDir`
 /// guard next to the datastore makes its storage lifetime explicit.
-fn empty_datastore() -> (TempDir, Arc<DeltaDatastore>) {
+fn empty_datastore() -> (TempDir, Arc<PivotDatastore>) {
     let database = TempDir::new().unwrap();
     let datastore =
-        DeltaDatastore::open(&database.path().to_string_lossy(), &dispatcher()).unwrap();
+        PivotDatastore::open(&database.path().to_string_lossy(), &dispatcher()).unwrap();
     (database, datastore)
 }
 
@@ -70,7 +70,7 @@ fn durable_datastore_entries(database: &Path) -> Vec<std::ffi::OsString> {
 /// footer-fetch dataflow, then commit the transaction that persists and
 /// publishes the staged table. Returns the datastore's own result so error-path
 /// tests can still assert on the `Err`.
-fn create_table(datastore: &Arc<DeltaDatastore>, request: CreateTableRequest) -> CatalogResult<()> {
+fn create_table(datastore: &Arc<PivotDatastore>, request: CreateTableRequest) -> CatalogResult<()> {
     let transaction = datastore.clone().begin_transaction();
     transaction
         .bind_create_table(request)?
@@ -82,9 +82,9 @@ fn create_table(datastore: &Arc<DeltaDatastore>, request: CreateTableRequest) ->
     commit_datastore_transaction(transaction)
 }
 
-/// Present a single `DeltaDatastore` to the planner as a one-datastore
+/// Present a single `PivotDatastore` to the planner as a one-datastore
 /// [`PivotCatalog`], the way the server wraps its datastores.
-fn single_catalog(datastore: &Arc<DeltaDatastore>) -> Arc<PivotCatalog> {
+fn single_catalog(datastore: &Arc<PivotDatastore>) -> Arc<PivotCatalog> {
     Arc::new(
         PivotCatalog::new(
             HashMap::from([(
@@ -185,7 +185,7 @@ fn empty_request(name: &str, columns: Vec<Column>) -> CreateTableRequest {
 
 /// Where a created table keeps its own storage under the database root: its
 /// Delta log and every file written into it.
-fn table_dir(database: &TempDir, datastore: &DeltaDatastore, name: &str) -> std::path::PathBuf {
+fn table_dir(database: &TempDir, datastore: &PivotDatastore, name: &str) -> std::path::PathBuf {
     common::table_dir(database.path(), datastore, name)
 }
 
@@ -223,7 +223,7 @@ fn constant_comparison(
 // Row groups that survive `table`'s pushed-down predicates over the table's
 // current files (what `compile` would scan). Pruning is a pure in-memory filter
 // — no dispatcher needed.
-fn row_group_count(datastore: &DeltaDatastore, name: &str, table: &TableBinding) -> usize {
+fn row_group_count(datastore: &PivotDatastore, name: &str, table: &TableBinding) -> usize {
     table
         .pruned_parquet(&current_parquet(datastore, name))
         .row_groups()
@@ -400,7 +400,7 @@ fn opening_an_unwritable_database_fails() {
     // Opening takes and records the datastore lock before loading catalog state,
     // so an unwritable root is rejected immediately.
     let bogus = "/definitely/not/a/real/path/for/datastore/tests";
-    let err = DeltaDatastore::open(bogus, &dispatcher())
+    let err = PivotDatastore::open(bogus, &dispatcher())
         .unwrap_err()
         .to_string();
 
@@ -755,8 +755,8 @@ fn write_ids(dir: &Path, file_name: &str, ids: &[i32]) -> std::path::PathBuf {
 /// it writes the bytes into the table's location, CAS-commits the file on a
 /// cloned-out handle, and publishes the committed copy back so the next
 /// transaction's snapshot sees it. Recorded by its location-relative name.
-/// (Production writers instead go through `DeltaDatastore::commit_to_table`.)
-fn append(datastore: &DeltaDatastore, name: &str, path: &Path) {
+/// (Production writers instead go through `PivotDatastore::commit_to_table`.)
+fn append(datastore: &PivotDatastore, name: &str, path: &Path) {
     let bytes = std::fs::read(path).unwrap();
     let relative = ObjectPath::new(path.file_name().unwrap().to_string_lossy());
     let mut handle = datastore
@@ -769,7 +769,7 @@ fn append(datastore: &DeltaDatastore, name: &str, path: &Path) {
 /// Plan and compile `sql` over `datastore` inside a fresh transaction (like
 /// the server does per query), leaving execution and commit to the caller.
 fn compile_sql(
-    datastore: &Arc<DeltaDatastore>,
+    datastore: &Arc<PivotDatastore>,
     sql: &str,
 ) -> (
     Arc<dyn CatalogTransaction>,
@@ -792,7 +792,7 @@ fn compile_sql(
 
 /// Run `sql` through a planner over `datastore` (inside a fresh transaction,
 /// like the server does per query) and return the result batches.
-fn run_sql(datastore: &Arc<DeltaDatastore>, sql: &str) -> Vec<RecordBatch> {
+fn run_sql(datastore: &Arc<PivotDatastore>, sql: &str) -> Vec<RecordBatch> {
     let (transaction, compiled) = compile_sql(datastore, sql);
     let batches = compiled.collect().unwrap();
     commit_transaction_blocking(transaction);
@@ -801,14 +801,14 @@ fn run_sql(datastore: &Arc<DeltaDatastore>, sql: &str) -> Vec<RecordBatch> {
 
 /// Run `sql` like [`run_sql`] but expect the dataflow to fail, returning the
 /// reported error. The transaction is dropped rather than committed.
-fn run_sql_err(datastore: &Arc<DeltaDatastore>, sql: &str) -> String {
+fn run_sql_err(datastore: &Arc<PivotDatastore>, sql: &str) -> String {
     let (_transaction, compiled) = compile_sql(datastore, sql);
     compiled.collect().unwrap_err().to_string()
 }
 
 /// Run `sql` like [`run_sql`], retaining the dataflow's IO/CPU tally.
 fn run_sql_with_stats(
-    datastore: &Arc<DeltaDatastore>,
+    datastore: &Arc<PivotDatastore>,
     sql: &str,
 ) -> (Vec<RecordBatch>, dispatch::DataFlowStats) {
     let (transaction, compiled) = compile_sql(datastore, sql);
@@ -1312,8 +1312,8 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
 
     let merged = write_ids(dir.path(), "merged.parquet", &[10, 20, 30, 40]);
     let merged_size = std::fs::metadata(&merged).unwrap().len();
-    let added = vec![datastore_delta::DeltaFileEntry::new(
-        datastore_delta::FileRef {
+    let added = vec![datastore_pivot::DeltaFileEntry::new(
+        datastore_pivot::FileRef {
             path: ObjectPath::new(merged.to_str().unwrap()),
             size: merged_size,
         },
@@ -1334,8 +1334,8 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     winner.replace_data_files(&removed, &added).unwrap();
     // The loser only discovers the inputs are gone after its CAS conflict +
     // refresh and returns a typed commit-conflict error.
-    let loser_added = vec![datastore_delta::DeltaFileEntry::new(
-        datastore_delta::FileRef {
+    let loser_added = vec![datastore_pivot::DeltaFileEntry::new(
+        datastore_pivot::FileRef {
             path: ObjectPath::new("merged-loser.parquet"),
             size: merged_size,
         },
@@ -1344,7 +1344,7 @@ fn replace_data_files_swaps_compacted_inputs_for_merged_output() {
     assert!(
         matches!(
             &loser_result,
-            Err(datastore_delta::Error::CommitConflict { .. })
+            Err(datastore_pivot::Error::CommitConflict { .. })
         ),
         "unexpected losing compaction result: {loser_result:?}"
     );
@@ -1437,8 +1437,8 @@ fn a_refresh_that_cannot_read_the_new_files_leaves_the_copy_untouched() {
     let mut writer = datastore
         .table_handle(&SchemaQualifiedTableName::in_default_schema("t"))
         .unwrap();
-    let absent = vec![datastore_delta::DeltaFileEntry::new(
-        datastore_delta::FileRef {
+    let absent = vec![datastore_pivot::DeltaFileEntry::new(
+        datastore_pivot::FileRef {
             path: ObjectPath::new("absent.parquet"),
             size: 1,
         },
@@ -1478,7 +1478,7 @@ fn compact_table_files_merges_small_files_into_one() {
     table.refresh().unwrap();
     let inputs = table.file_refs();
     assert_eq!(inputs.len(), 2, "two inserts wrote two files");
-    let merged = datastore_delta::compact_table_files(
+    let merged = datastore_pivot::compact_table_files(
         &datastore,
         table.id(),
         &inputs,
@@ -1515,7 +1515,7 @@ fn compact_table_files_deletes_uploaded_outputs_when_delta_commit_fails() {
     let saved_delta_log = table_dir.join("_delta_log.saved");
     std::fs::rename(&delta_log, &saved_delta_log).unwrap();
     File::create(&delta_log).unwrap();
-    let result = datastore_delta::compact_table_files(
+    let result = datastore_pivot::compact_table_files(
         &datastore,
         table.id(),
         &inputs,
@@ -1573,12 +1573,12 @@ fn reopened_database_restores_appended_files_from_manifest() {
     let (data_dir, columns) = three_row_table();
     let db = TempDir::new().unwrap();
     {
-        let datastore = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+        let datastore = PivotDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
         create_table(&datastore, create_request("t", data_dir.path(), columns)).unwrap();
         let new_file = write_ids(data_dir.path(), "later.parquet", &[40]);
         append(&datastore, "t", &new_file);
     }
-    let reopened = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+    let reopened = PivotDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
     assert_eq!(current_parquet(&reopened, "t").row_groups().len(), 4);
 }
 
@@ -1589,7 +1589,7 @@ fn reopened_database_restores_sort_by() {
     let (data_dir, columns) = three_row_table();
     let db = TempDir::new().unwrap();
     {
-        let datastore = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+        let datastore = PivotDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
         let mut request = create_request("t", data_dir.path(), columns);
         request
             .options
@@ -1597,7 +1597,7 @@ fn reopened_database_restores_sort_by() {
         create_table(&datastore, request).unwrap();
     }
 
-    let reopened = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+    let reopened = PivotDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
 
     assert_eq!(
         reopened
@@ -1614,7 +1614,7 @@ fn reopened_database_restores_sort_by() {
 fn unlogged_leftover_file_is_invisible_after_swap() {
     let (data_dir, columns) = three_row_table();
     let db = TempDir::new().unwrap();
-    let datastore = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+    let datastore = PivotDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
     create_table(&datastore, create_request("t", data_dir.path(), columns)).unwrap();
 
     // "Compact" the adopted file into merged.parquet but crash before deleting
@@ -1624,8 +1624,8 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
         .unwrap();
     let inputs: Vec<ObjectPath> = table.file_refs().into_iter().map(|f| f.path).collect();
     let merged = write_ids(data_dir.path(), "merged.parquet", &[10, 20, 30]);
-    let added = vec![datastore_delta::DeltaFileEntry::new(
-        datastore_delta::FileRef {
+    let added = vec![datastore_pivot::DeltaFileEntry::new(
+        datastore_pivot::FileRef {
             path: ObjectPath::new(merged.to_str().unwrap()),
             size: std::fs::metadata(&merged).unwrap().len(),
         },
@@ -1634,7 +1634,7 @@ fn unlogged_leftover_file_is_invisible_after_swap() {
 
     drop(table);
     drop(datastore);
-    let reopened = DeltaDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
+    let reopened = PivotDatastore::open(db.path().to_str().unwrap(), &dispatcher()).unwrap();
     let parquet = current_parquet(&reopened, "t");
     let groups = parquet.row_groups();
     assert_eq!(groups.len(), 1, "only the committed merged file is read");
@@ -1711,7 +1711,7 @@ fn filter_on_partition_column_prunes_whole_single_partition_file() {
 /// exactly which files it fetched. Files are written *after* `CREATE TABLE` (over
 /// an empty dir) so they arrive through the partition-recording append, not as
 /// untagged create-time discoveries.
-fn table_partitioned_by_name() -> (TempDir, TempDir, Arc<DeltaDatastore>) {
+fn table_partitioned_by_name() -> (TempDir, TempDir, Arc<PivotDatastore>) {
     let dir = TempDir::new().unwrap();
     let request = CreateTableRequest {
         datastore_name: None,
@@ -1984,7 +1984,7 @@ fn variant_filter(path: &[&str], cmp: CompareType, value: i64) -> TableFilter {
     })))
 }
 
-fn shredded_docs_datastore(dir: &Path) -> (TempDir, Arc<DeltaDatastore>, TableBinding) {
+fn shredded_docs_datastore(dir: &Path) -> (TempDir, Arc<PivotDatastore>, TableBinding) {
     let (database, datastore) = empty_datastore();
     let columns = vec![Column {
         name: "doc".to_string(),

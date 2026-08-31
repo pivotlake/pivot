@@ -43,7 +43,7 @@ use planner::catalog::{
 use system::{DatastoreEntry, SystemTransaction};
 
 /// One named data source served by pivotdb. Re-exported from [`datastore`],
-/// where the trait lives; concrete backends (e.g. `datastore_delta::DeltaDatastore`)
+/// where the trait lives; concrete backends (e.g. `datastore_pivot::PivotDatastore`)
 /// implement it and are held here behind `Arc<dyn Datastore>`.
 pub use datastore::Datastore;
 

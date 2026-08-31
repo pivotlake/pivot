@@ -113,7 +113,7 @@ impl TableReference {
 ///
 /// `identity` distinguishes a dropped/recreated table from its predecessor even
 /// when both are at version zero. It is deliberately opaque to the planner; a
-/// backend chooses a stable representation (Pivot's Delta datastore uses its
+/// backend chooses a stable representation (Pivot's datastore uses its
 /// manifest table ID).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableRevision {

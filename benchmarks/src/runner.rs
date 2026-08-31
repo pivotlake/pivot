@@ -541,7 +541,7 @@ async fn insert_documents(client: &Client, table: &str, documents: &[String]) ->
 /// with the data path, and ships each statement as its own `simple_query` (the
 /// server plans one statement at a time; a multi-table suite's setup holds one
 /// CREATE TABLE per table). Tables persist on
-/// the server's `DeltaDatastore` for the lifetime of the process, fine,
+/// the server's `PivotDatastore` for the lifetime of the process, fine,
 /// since we tear the server down at the end of `main`.
 pub async fn run_suite(
     server: &ServerHandle,

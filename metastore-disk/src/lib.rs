@@ -19,7 +19,7 @@
 //! is the operator's, and the metastore file is the server's own to rewrite
 //! (which is exactly serialising its section back out).
 //!
-//! `kind` is the datastore format (only `delta` today). The storage backend is
+//! `kind` selects the datastore implementation (only `pivot` today). The storage backend is
 //! chosen from `location`: a plain path (or `file://`) opens a local store, an
 //! `s3://` URI opens an S3 store, a `gs://` URI opens a Google Cloud Storage
 //! store. A datastore carries no credentials of its own; they come from the
@@ -41,15 +41,15 @@
 //! metastore:
 //!   datastores:
 //!     hot:
-//!       kind: delta
+//!       kind: pivot
 //!       location: /var/lib/pivot     # local path -> local store
 //!       default: true                # the current database
 //!     warm:
-//!       kind: delta
+//!       kind: pivot
 //!       location: s3://my-bucket/pivot/
 //!       # compact: true              # optional
 //!     cold:
-//!       kind: delta
+//!       kind: pivot
 //!       location: gs://my-bucket/pivot/
 //!   secrets:
 //!     my-bucket:
@@ -116,9 +116,9 @@ use catalog::metastore::{
     DEFAULT_USER_NAME, Metastore, SCRAM_ITERATIONS, SCRAM_SALT_LEN, ScramVerifier, UserAuth,
     format_scram_verifier, parse_scram_verifier,
 };
-use datastore_delta::{
+use datastore_pivot::{
     CompactionConfig, DEFAULT_COMPACT_BYTES, DEFAULT_COMPACT_PARALLELISM, DEFAULT_COMPACT_POLL,
-    DEFAULT_MIN_FILES_TO_MERGE, DEFAULT_VACUUM_POLL, DeltaDatastore, MaintenanceConfig,
+    DEFAULT_MIN_FILES_TO_MERGE, DEFAULT_VACUUM_POLL, MaintenanceConfig, PivotDatastore,
     VacuumConfig, default_merge_target_bytes,
 };
 use dispatch::DataFlowDispatcher;
@@ -139,7 +139,7 @@ pub use units::{ByteSize, Interval};
 /// standalone file merged into it.
 ///
 /// The configuration is structurally validated by [`open`](Self::open). Object
-/// stores and their Delta datastores are opened when
+/// stores and their Pivot datastores are opened when
 /// [`Metastore::open_datastores`] is called.
 #[derive(Debug)]
 pub struct DiskMetastore {
@@ -285,8 +285,8 @@ impl DiskMetastore {
                     vacuum: config.vacuum(),
                 };
                 let datastore: Arc<dyn Datastore> = match config.kind {
-                    DatastoreKind::Delta => {
-                        DeltaDatastore::from_store(store, dispatcher, Some(maintenance))?
+                    DatastoreKind::Pivot => {
+                        PivotDatastore::from_store(store, dispatcher, Some(maintenance))?
                     }
                 };
                 Ok((name.clone(), datastore))
@@ -468,7 +468,7 @@ pub enum Error {
     #[error(transparent)]
     Store(#[from] object_storage::StoreError),
     #[error(transparent)]
-    Delta(#[from] datastore_delta::Error),
+    Pivot(#[from] datastore_pivot::Error),
 }
 
 /// The datastores and users of a metastore, as written: the config file's
@@ -668,13 +668,13 @@ impl DatastoreConfig {
     }
 }
 
-/// The datastore format. Only [`Delta`](Self::Delta) is supported today; adding
+/// The datastore implementation. Only [`Pivot`](Self::Pivot) is supported today; adding
 /// another (Iceberg, ...) is a new variant plus its arm in
 /// [`build_datastores`](DiskMetastore::build_datastores).
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum DatastoreKind {
-    Delta,
+    Pivot,
 }
 
 impl DatastoreConfig {
@@ -720,7 +720,7 @@ impl DatastoreConfig {
 mod tests {
     use super::*;
     use catalog::DEFAULT_DATASTORE_NAME;
-    use datastore_delta::DEFAULT_REFRESH_INTERVAL;
+    use datastore_pivot::DEFAULT_REFRESH_INTERVAL;
     use std::io::Write;
     use std::time::Duration;
 
@@ -791,18 +791,18 @@ mod tests {
 
     /// A minimal config-file `metastore` section: one default datastore.
     const HOT_SECTION: &str =
-        "datastores:\n  hot:\n    kind: delta\n    location: /tmp/hot\n    default: true\n";
+        "datastores:\n  hot:\n    kind: pivot\n    location: /tmp/hot\n    default: true\n";
 
     /// A section whose `warm` datastore sits in a bucket, for the secret tests
     /// to authenticate. Its `secrets` block is whatever each test appends.
     const WARM_SECTION: &str = "\
 datastores:
   hot:
-    kind: delta
+    kind: pivot
     location: /tmp/hot
     default: true
   warm:
-    kind: delta
+    kind: pivot
     location: s3://analytics/warm/data
 ";
 
@@ -811,7 +811,7 @@ datastores:
         let yaml = r#"
 datastores:
   hot:
-    kind: delta
+    kind: pivot
     location: /tmp/hot
     default: true
     compact_bytes: 128m
@@ -819,7 +819,7 @@ datastores:
     compact_min_files: 42
     compact_parallelism: 7
   warm:
-    kind: delta
+    kind: pivot
     location: /tmp/warm
     compact: false
 "#;
@@ -858,7 +858,7 @@ datastores:
         let yaml = r#"
 datastores:
   hot:
-    kind: delta
+    kind: pivot
     location: /tmp/hot
     default: true
 "#;
@@ -879,7 +879,7 @@ datastores:
 refresh_interval: 500ms
 datastores:
   hot:
-    kind: delta
+    kind: pivot
     location: /tmp/hot
     default: true
 "#;
@@ -894,7 +894,7 @@ datastores:
         let yaml = r#"
 datastores:
   hot:
-    kind: delta
+    kind: pivot
     location: /tmp/hot
     default: true
     compact_byte: 128m
@@ -910,7 +910,7 @@ datastores:
         let yaml = r#"
 datastores:
   warm:
-    kind: delta
+    kind: pivot
     location: /tmp/warm
 "#;
 
@@ -942,11 +942,11 @@ datastores:
         let yaml = r#"
 datastores:
   hot:
-    kind: delta
+    kind: pivot
     location: /tmp/hot
     default: true
   warm:
-    kind: delta
+    kind: pivot
     location: /tmp/warm
     default: true
 "#;
@@ -961,11 +961,11 @@ datastores:
         let yaml = r#"
 datastores:
   hot:
-    kind: delta
+    kind: pivot
     location: /tmp/hot
     default: true
   warm:
-    kind: delta
+    kind: pivot
     location: /tmp/warm
 "#;
 
@@ -1000,7 +1000,7 @@ secrets:
         let yaml = "\
 datastores:
   hot:
-    kind: delta
+    kind: pivot
     location: blob://analytics/hot
     default: true
 ";
@@ -1106,14 +1106,14 @@ secrets:
         let yaml = r#"
 datastores:
   hot:
-    kind: delta
+    kind: pivot
     location: /tmp/hot
     default: true
   covered:
-    kind: delta
+    kind: pivot
     location: s3://analytics/warm/data
   adjacent:
-    kind: delta
+    kind: pivot
     location: s3://analyticsarchive/warm
 secrets:
   analytics:
@@ -1248,11 +1248,11 @@ secrets:
         let yaml = r#"
 datastores:
   hot:
-    kind: delta
+    kind: pivot
     location: /tmp/hot
     default: true
   cold:
-    kind: delta
+    kind: pivot
     location: gs://analytics/cold
 "#;
 
@@ -1387,14 +1387,14 @@ secrets:
         let yaml = r#"
 datastores:
   default:
-    kind: delta
+    kind: pivot
     location: /tmp/default
     default: true
   warm:
-    kind: delta
+    kind: pivot
     location: s3://bucket/prefix
   cold:
-    kind: delta
+    kind: pivot
     location: gs://bucket/prefix
 secrets:
   aws:
@@ -1430,7 +1430,7 @@ secrets:
         let section = r#"
 datastores:
   hot:
-    kind: delta
+    kind: pivot
     location: /tmp/hot
     default: true
 users:
@@ -1441,7 +1441,7 @@ users:
         let disk = r#"
 datastores:
   warm:
-    kind: delta
+    kind: pivot
     location: /tmp/warm
 users:
   writer:
@@ -1463,7 +1463,7 @@ users:
         let section = r#"
 datastores:
   hot:
-    kind: delta
+    kind: pivot
     location: /tmp/hot
     default: true
 users:
@@ -1474,7 +1474,7 @@ users:
         let disk = r#"
 datastores:
   warm:
-    kind: delta
+    kind: pivot
     location: /tmp/warm
 users:
   writer:
@@ -1509,13 +1509,13 @@ users:
         let section = r#"
 datastores:
   hot:
-    kind: delta
+    kind: pivot
     location: /tmp/hot
 "#;
         let disk = r#"
 datastores:
   warm:
-    kind: delta
+    kind: pivot
     location: /tmp/warm
     default: true
 "#;
@@ -1530,14 +1530,14 @@ datastores:
         let section = r#"
 datastores:
   hot:
-    kind: delta
+    kind: pivot
     location: /tmp/hot
     default: true
 "#;
         let disk = r#"
 datastores:
   warm:
-    kind: delta
+    kind: pivot
     location: /tmp/warm
     default: true
 "#;
@@ -1555,17 +1555,17 @@ datastores:
         let section = r#"
 datastores:
   hot:
-    kind: delta
+    kind: pivot
     location: /tmp/hot
     default: true
   warm:
-    kind: delta
+    kind: pivot
     location: /tmp/warm
 "#;
         let disk = r#"
 datastores:
   warm:
-    kind: delta
+    kind: pivot
     location: /tmp/elsewhere
 "#;
 
@@ -1582,7 +1582,7 @@ datastores:
         let section = r#"
 datastores:
   hot:
-    kind: delta
+    kind: pivot
     location: /tmp/hot
     default: true
 users:
@@ -1610,7 +1610,7 @@ users:
         let section = r#"
 datastores:
   hot:
-    kind: delta
+    kind: pivot
     location: /tmp/hot
     default: true
 "#;
@@ -1629,7 +1629,7 @@ datastores:
     /// A metastore with a default datastore and whatever `users` adds.
     fn from_yaml_with(users: &str) -> Result<DiskMetastore> {
         let yaml = format!(
-            "datastores:\n  default:\n    kind: delta\n    location: /tmp/default\n    \
+            "datastores:\n  default:\n    kind: pivot\n    location: /tmp/default\n    \
              default: true\n{users}"
         );
         from_yaml(&yaml)
@@ -1656,7 +1656,7 @@ datastores:
 
     #[test]
     fn a_created_user_is_served_and_survives_reopening() {
-        let disk = "datastores:\n  warm:\n    kind: delta\n    location: /tmp/warm\n    \
+        let disk = "datastores:\n  warm:\n    kind: pivot\n    location: /tmp/warm\n    \
                     compact: false\n    compact_bytes: 128m\n    compact_merge_bytes: 160m\n    \
                     compact_min_files: 42\n    compact_parallelism: 7\n";
         let (store, file) = open_with_file(HOT_SECTION, disk);
@@ -1705,7 +1705,7 @@ datastores:
 
     #[test]
     fn creating_a_second_user_keeps_the_first_and_the_datastore_in_the_file() {
-        let disk = "datastores:\n  warm:\n    kind: delta\n    location: /tmp/warm\n";
+        let disk = "datastores:\n  warm:\n    kind: pivot\n    location: /tmp/warm\n";
         let (store, file) = open_with_file(HOT_SECTION, disk);
 
         store.create_user("walt", None).unwrap();
