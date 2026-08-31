@@ -302,7 +302,8 @@ impl CompacterActor {
             let id = table.id();
 
             while in_flight.len() < self.max_concurrent_merges {
-                let Some((inputs, kind)) = self.next_batch(&table, apply_guards, &reserved) else {
+                let Some((inputs, kind)) = self.next_batch(name, &table, apply_guards, &reserved)
+                else {
                     break;
                 };
                 reserved.extend(inputs.iter().map(|file| file.path.clone()));
@@ -344,6 +345,7 @@ impl CompacterActor {
     /// claim.
     fn next_batch(
         &mut self,
+        name: &SchemaQualifiedTableName,
         table: &CatalogTable,
         apply_guards: bool,
         reserved: &HashSet<ObjectPath>,
@@ -351,7 +353,7 @@ impl CompacterActor {
         if let Some(inputs) = self.next_small_batch(table, apply_guards, reserved) {
             return Some((inputs, MergeKind::SmallFiles));
         }
-        let inputs = self.next_layout_optimization(table, reserved)?;
+        let inputs = self.next_layout_optimization(name, table, reserved)?;
         Some((inputs, MergeKind::LayoutOptimization))
     }
 
@@ -405,6 +407,7 @@ impl CompacterActor {
     /// the round applies the small-file guards.
     fn next_layout_optimization(
         &mut self,
+        name: &SchemaQualifiedTableName,
         table: &CatalogTable,
         reserved: &HashSet<ObjectPath>,
     ) -> Option<Vec<FileRef>> {
@@ -436,8 +439,13 @@ impl CompacterActor {
             .map(|(_, files)| files.as_slice())
             .collect();
         let cache = self.layout_score_caches.entry(table.id()).or_default();
-        let (_, left, right) =
-            cache.select_pair(&partitions, table.sort_by(), self.target_bytes, reserved)?;
+        let selected = cache.select_pair(&partitions, table.sort_by(), self.target_bytes, reserved);
+        info!(
+            table = %name,
+            eligible_pairs = cache.eligible_pair_count(),
+            "layout pairs eligible for merging"
+        );
+        let (_, left, right) = selected?;
         Some(vec![left.file.clone(), right.file.clone()])
     }
 }

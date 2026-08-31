@@ -294,6 +294,12 @@ impl LayoutScoreCache {
         ))
     }
 
+    /// How many pairs cleared every merge gate at the last selection, whether
+    /// or not a merge in flight holds one of their files.
+    pub(super) fn eligible_pair_count(&self) -> usize {
+        self.pair_scores.len()
+    }
+
     /// Retain only `live` files and pairs containing two live files.
     fn retain_live_files(&mut self, live: &HashMap<&str, &DeltaFileEntry>) {
         self.known_paths
@@ -862,6 +868,28 @@ mod tests {
 
         assert!(!reserved.contains(&next_left.file.path));
         assert!(!reserved.contains(&next_right.file.path));
+    }
+
+    /// Every pair that clears the gates is counted, not only the best one,
+    /// and files sharing no range add none.
+    #[test]
+    fn count_eligible_pairs_counts_every_qualifying_pair() {
+        let range = [("id", int_stat(0), int_stat(100))];
+        let first = stats_entry("first", &range);
+        let second = stats_entry("second", &range);
+        let third = stats_entry("third", &range);
+        let apart = stats_entry("apart", &[("id", int_stat(200), int_stat(300))]);
+        let files = [
+            candidate_with_row_groups(&first, &[(0, 100)]),
+            candidate_with_row_groups(&second, &[(0, 100)]),
+            candidate_with_row_groups(&third, &[(0, 100)]),
+            candidate_with_row_groups(&apart, &[(200, 300)]),
+        ];
+
+        let mut cache = LayoutScoreCache::default();
+        cache.select_pair(&[&files], &["id".into()], u64::MAX, &HashSet::new());
+
+        assert_eq!(cache.eligible_pair_count(), 3);
     }
 
     #[test]
