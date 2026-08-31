@@ -1,4 +1,6 @@
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, Datum};
 use arrow_cast::cast;
@@ -6,6 +8,7 @@ use arrow_ord::cmp;
 
 use crate::TableFile;
 use crate::manifest::DeltaFileEntry;
+use object_storage::ObjectPath;
 
 /// A layout-optimization candidate: a file's manifest entry beside its row
 /// groups' min/max on every sort column, in the table's sort order. A pair is
@@ -57,30 +60,6 @@ impl<'a> LayoutCandidate<'a> {
         let stats = self.entry.stats.as_ref()?;
         Some((stats.min_values.get(column)?, stats.max_values.get(column)?))
     }
-
-    /// Whether every row of this file orders strictly before every row of
-    /// `other`, proved from bounds: a file's per-column maximums read column
-    /// by column are an upper bound on its last row, and per-column minimums
-    /// a lower bound on the first, so once a column separates the two bounds
-    /// strictly the files cannot interleave and the sweep may part them. A
-    /// tie at a boundary value defers to the next column, the way the rows
-    /// themselves are ordered, and a missing or incomparable bound keeps the
-    /// pair together.
-    fn precedes(&self, other: &LayoutCandidate, sort_by: &[String]) -> bool {
-        for column in sort_by {
-            let (Some((_, self_max)), Some((other_min, _))) =
-                (self.column_bounds(column), other.column_bounds(column))
-            else {
-                return false;
-            };
-            match compare(self_max, other_min) {
-                Some(Ordering::Less) => return true,
-                Some(Ordering::Equal) => continue,
-                _ => return false,
-            }
-        }
-        false
-    }
 }
 
 fn compare(left: &ArrayRef, right: &ArrayRef) -> Option<Ordering> {
@@ -111,90 +90,19 @@ fn compare_same_type(left: &ArrayRef, right: &ArrayRef) -> Option<Ordering> {
     })
 }
 
-/// Find the most contested pair among `candidates`. The caller has already
-/// grouped these large-file candidates by partition. Only pairs with a
-/// positive score are candidates, so `None` means no rewrite is worthwhile. A
-/// sweep over the files, ordered by their lower bounds on the whole sort key,
-/// measures every pair whose rows might interleave, and only those: the cost
-/// is proportional to the number of such pairs, linearithmic for a
-/// well-layered table and quadratic only while heavy overlap persists, which
-/// is exactly when merges keep firing and shrinking it. The gates a pair must
-/// clear live in [`measure_pair`].
-pub(super) fn highest_scoring_pair<'a>(
-    candidates: &[LayoutCandidate<'a>],
-    sort_by: &[String],
-    target_bytes: u64,
-) -> Option<(f64, &'a DeltaFileEntry, &'a DeltaFileEntry)> {
-    if sort_by.is_empty() {
-        return None;
-    }
-    let mut ordered: Vec<&LayoutCandidate<'a>> = candidates
-        .iter()
-        .filter(|candidate| joins_sweep(candidate, sort_by))
-        .collect();
-    ordered.sort_by(|left, right| compare_lower_bounds(left, right, sort_by));
-
-    let mut best: Option<(f64, &'a DeltaFileEntry, &'a DeltaFileEntry)> = None;
-    let mut active: Vec<&LayoutCandidate<'a>> = Vec::new();
-    for candidate in ordered {
-        active.retain(|partner| !partner.precedes(candidate, sort_by));
-        for partner in &active {
-            let Some(score) = measure_pair(partner, candidate, sort_by, target_bytes) else {
-                continue;
-            };
-            if best
-                .as_ref()
-                .is_none_or(|(best_score, _, _)| score > *best_score)
-            {
-                best = Some((score, partner.entry, candidate.entry));
-                // The score ceiling; no later pair can displace this one.
-                if score >= 1.0 {
-                    return best;
-                }
-            }
-        }
-        active.push(candidate);
-    }
-    best
-}
-
-/// Whether `candidate` can be in any pair at all: a file without statistics,
-/// rows, or ordered bounds on the leading sort column is silently in none.
-fn joins_sweep(candidate: &LayoutCandidate, sort_by: &[String]) -> bool {
+/// A file without statistics, rows, or ordered leading bounds cannot
+/// participate in a layout pair.
+fn is_measurable(candidate: &LayoutCandidate, leading_column: &str) -> bool {
     let Some(stats) = candidate.entry.stats.as_ref() else {
         return false;
     };
     if !stats.num_records.is_some_and(|records| records > 0) {
         return false;
     }
-    let Some((min, max)) = candidate.column_bounds(&sort_by[0]) else {
+    let Some((min, max)) = candidate.column_bounds(leading_column) else {
         return false;
     };
     compare(min, max).is_some_and(|order| order != Ordering::Greater)
-}
-
-/// Order two files by their lower bounds, walking the sort columns until one
-/// decides, the way their rows order against each other. A missing or
-/// incomparable bound leaves the pair unordered, which only weakens the sweep
-/// order, never the scores.
-fn compare_lower_bounds(
-    left: &LayoutCandidate,
-    right: &LayoutCandidate,
-    sort_by: &[String],
-) -> Ordering {
-    for column in sort_by {
-        let (Some((left_min, _)), Some((right_min, _))) =
-            (left.column_bounds(column), right.column_bounds(column))
-        else {
-            return Ordering::Equal;
-        };
-        match compare(left_min, right_min) {
-            Some(Ordering::Equal) => continue,
-            Some(order) => return order,
-            None => return Ordering::Equal,
-        }
-    }
-    Ordering::Equal
 }
 
 /// Measure one pair against every gate, on the column that tells its two
@@ -217,6 +125,10 @@ fn measure_pair(
     sort_by: &[String],
     target_bytes: u64,
 ) -> Option<f64> {
+    let leading_column = sort_by.first()?;
+    if !is_measurable(left, leading_column) || !is_measurable(right, leading_column) {
+        return None;
+    }
     let left_stats = left.entry.stats.as_ref()?;
     let right_stats = right.entry.stats.as_ref()?;
     for (column, name) in sort_by.iter().enumerate() {
@@ -254,7 +166,7 @@ fn measure_pair(
     // which removes a file; past the ceiling the rewrite would split inside
     // the value's run and hand back the same pair forever.
     let combined_size = left.entry.file.size.saturating_add(right.entry.file.size);
-    (combined_size <= target_bytes).then(|| 1.0)
+    (combined_size <= target_bytes).then_some(1.0)
 }
 
 /// Score a pair on the column that decides it, from the two files' row
@@ -289,28 +201,128 @@ fn score_contested_row_groups(
     Some(left_share.min(right_share))
 }
 
-/// The highest-scoring pair among `partitions`, each one partition's
-/// large-file candidates. Ties keep the earlier partition's pair, so the
-/// choice is stable across rounds.
-pub(super) fn select_pair<'a>(
-    partitions: &[Vec<LayoutCandidate<'a>>],
-    sort_by: &[String],
-    target_bytes: u64,
-) -> Option<(&'a DeltaFileEntry, &'a DeltaFileEntry)> {
-    let mut best: Option<(f64, &'a DeltaFileEntry, &'a DeltaFileEntry)> = None;
-    for partition in partitions {
-        let Some((score, left, right)) = highest_scoring_pair(partition, sort_by, target_bytes)
-        else {
-            continue;
-        };
-        if best
-            .as_ref()
-            .is_none_or(|(best_score, _, _)| score > *best_score)
-        {
-            best = Some((score, left, right));
+/// One table's layout pair scores, remembered between compaction rounds.
+///
+/// A pair's score depends only on the two files' footers and manifest stats,
+/// which never change while the files exist, so a round need not measure
+/// every intersecting pair again: on a table of thousands of heavily
+/// overlapping files that is millions of pairs every few seconds. A round
+/// measures only the files it has not seen before (normally the outputs of
+/// the last merges and freshly flushed files) against the rest of their
+/// partition, forgets the pairs of files that are gone, and takes the best
+/// of what it remembers. Only pairs that cleared every gate are kept. Paths
+/// are shared, so each path string is stored once however many pairs contain
+/// it.
+#[derive(Default)]
+pub(super) struct LayoutScoreCache {
+    known_paths: HashSet<Arc<ObjectPath>>,
+    pair_scores: HashMap<(Arc<ObjectPath>, Arc<ObjectPath>), f64>,
+}
+
+impl LayoutScoreCache {
+    /// The best remembered pair among `partitions`, each one partition's
+    /// large-file candidates, measuring the files no earlier round has seen.
+    /// A file some merge is rewriting keeps its scores, since the merge can
+    /// fail; `reserved` only makes selection pass its pairs over. Ties go to
+    /// the lexicographically first pair, so the choice is stable across rounds.
+    pub(super) fn select_pair<'a>(
+        &mut self,
+        partitions: &[&[LayoutCandidate<'a>]],
+        sort_by: &[String],
+        target_bytes: u64,
+        reserved: &HashSet<ObjectPath>,
+    ) -> Option<(f64, &'a DeltaFileEntry, &'a DeltaFileEntry)> {
+        let mut entries_by_path = HashMap::new();
+        let mut new_paths = HashSet::new();
+        for candidate in partitions.iter().flat_map(|partition| partition.iter()) {
+            let path = &candidate.entry.file.path;
+            entries_by_path.insert(path.as_str(), candidate.entry);
+            if !self.known_paths.contains(path) {
+                self.known_paths.insert(Arc::new(path.clone()));
+                new_paths.insert(path.as_str());
+            }
         }
+        self.retain_live_files(&entries_by_path);
+
+        for partition in partitions {
+            for candidate in *partition {
+                let candidate_path = &candidate.entry.file.path;
+                if !new_paths.contains(candidate_path.as_str()) {
+                    continue;
+                }
+                let shared_path = Arc::clone(
+                    self.known_paths
+                        .get(candidate_path)
+                        .expect("the path was just interned"),
+                );
+                for partner in *partition {
+                    let partner_path = &partner.entry.file.path;
+                    if candidate_path == partner_path
+                        || (new_paths.contains(partner_path.as_str())
+                            && partner_path.as_str() < candidate_path.as_str())
+                    {
+                        continue;
+                    }
+                    if let Some(score) = measure_pair(candidate, partner, sort_by, target_bytes) {
+                        let shared_partner_path = self
+                            .known_paths
+                            .get(partner_path)
+                            .expect("the path was just interned");
+                        self.pair_scores
+                            .insert(ordered_pair(&shared_path, shared_partner_path), score);
+                    }
+                }
+            }
+        }
+
+        let (pair, &score) = self
+            .pair_scores
+            .iter()
+            .filter(|(pair, _)| {
+                reserved.is_empty()
+                    || (!reserved.contains(pair.0.as_ref()) && !reserved.contains(pair.1.as_ref()))
+            })
+            .max_by(|(left_pair, left_score), (right_pair, right_score)| {
+                left_score
+                    .total_cmp(right_score)
+                    .then_with(|| compare_pairs(right_pair, left_pair))
+            })?;
+        Some((
+            score,
+            entries_by_path[pair.0.as_str()],
+            entries_by_path[pair.1.as_str()],
+        ))
     }
-    best.map(|(_, left, right)| (left, right))
+
+    /// Retain only `live` files and pairs containing two live files.
+    fn retain_live_files(&mut self, live: &HashMap<&str, &DeltaFileEntry>) {
+        self.known_paths
+            .retain(|path| live.contains_key(path.as_str()));
+        self.pair_scores.retain(|(left, right), _| {
+            live.contains_key(left.as_str()) && live.contains_key(right.as_str())
+        });
+    }
+}
+
+fn ordered_pair(
+    left: &Arc<ObjectPath>,
+    right: &Arc<ObjectPath>,
+) -> (Arc<ObjectPath>, Arc<ObjectPath>) {
+    if left.as_str() < right.as_str() {
+        (Arc::clone(left), Arc::clone(right))
+    } else {
+        (Arc::clone(right), Arc::clone(left))
+    }
+}
+
+fn compare_pairs(
+    left: &(Arc<ObjectPath>, Arc<ObjectPath>),
+    right: &(Arc<ObjectPath>, Arc<ObjectPath>),
+) -> Ordering {
+    left.0
+        .as_str()
+        .cmp(right.0.as_str())
+        .then_with(|| left.1.as_str().cmp(right.1.as_str()))
 }
 
 /// Contested row groups a file with `total` row groups must have before a
@@ -366,6 +378,16 @@ mod tests {
     use super::*;
     use crate::manifest::FileStats;
     use object_storage::{FileRef, ObjectPath};
+
+    /// Select over one partition through the production path, with nothing
+    /// remembered.
+    fn select_pair<'a>(
+        files: &[LayoutCandidate<'a>],
+        sort_by: &[String],
+        target_bytes: u64,
+    ) -> Option<(f64, &'a DeltaFileEntry, &'a DeltaFileEntry)> {
+        LayoutScoreCache::default().select_pair(&[files], sort_by, target_bytes, &HashSet::new())
+    }
 
     fn int_stat(value: i64) -> ArrayRef {
         Arc::new(Int64Array::from(vec![value]))
@@ -516,14 +538,12 @@ mod tests {
             ),
         ];
 
-        let (overlap, _, _) = highest_scoring_pair(&files, &sort_by, u64::MAX).unwrap();
+        let (overlap, _, _) = select_pair(&files, &sort_by, u64::MAX).unwrap();
 
         // Two of each file's five groups lie within the other's id range,
         // which the shared region says nothing about.
         assert!((overlap - 0.4).abs() < 1e-12);
-        assert!(
-            highest_scoring_pair(&files, &["region".into(), "missing".into()], u64::MAX).is_none()
-        );
+        assert!(select_pair(&files, &["region".into(), "missing".into()], u64::MAX).is_none());
     }
 
     /// Two files of one deployment and one service, holding different stretches
@@ -562,7 +582,7 @@ mod tests {
             ),
         ];
 
-        let best = highest_scoring_pair(&files, &sort_by, u64::MAX);
+        let best = select_pair(&files, &sort_by, u64::MAX);
 
         assert!(best.is_none());
     }
@@ -592,13 +612,11 @@ mod tests {
             candidate(&right, &["region", "id"]),
         ];
 
-        let (score, _, _) = highest_scoring_pair(&files, &sort_by, u64::MAX).unwrap();
+        let (score, _, _) = select_pair(&files, &sort_by, u64::MAX).unwrap();
 
         assert!((score - 1.0).abs() < 1e-12);
-        assert!(highest_scoring_pair(&files, &sort_by, 1).is_none());
-        assert!(
-            highest_scoring_pair(&files, &["region".into(), "missing".into()], u64::MAX).is_none()
-        );
+        assert!(select_pair(&files, &sort_by, 1).is_none());
+        assert!(select_pair(&files, &["region".into(), "missing".into()], u64::MAX).is_none());
     }
 
     /// Two files spanning the same range, each a run of the low value, one
@@ -625,7 +643,7 @@ mod tests {
             candidate_with_row_groups(&right, &shape),
         ];
 
-        let (score, _, _) = highest_scoring_pair(&files, &["id".into()], u64::MAX).unwrap();
+        let (score, _, _) = select_pair(&files, &["id".into()], u64::MAX).unwrap();
 
         assert!((score - 1.0).abs() < 1e-12);
     }
@@ -657,7 +675,7 @@ mod tests {
             keyed_candidate(&right, 1, &deployments, &[(1, 1); 3]),
         ];
 
-        let (score, _, _) = highest_scoring_pair(&files, &sort_by, u64::MAX).unwrap();
+        let (score, _, _) = select_pair(&files, &sort_by, u64::MAX).unwrap();
 
         assert!((score - 1.0).abs() < 1e-12);
     }
@@ -689,7 +707,7 @@ mod tests {
             keyed_candidate(&right, 1, &deployments, &[(3, 90), (90, 200), (3, 200)]),
         ];
 
-        let (score, _, _) = highest_scoring_pair(&files, &sort_by, u64::MAX).unwrap();
+        let (score, _, _) = select_pair(&files, &sort_by, u64::MAX).unwrap();
 
         assert!((score - 1.0).abs() < 1e-12);
     }
@@ -707,7 +725,7 @@ mod tests {
             candidate_with_row_groups(&high, &[(10, 10), (10, 10), (10, 15), (15, 20)]),
         ];
 
-        assert!(highest_scoring_pair(&files, &["id".into()], u64::MAX).is_none());
+        assert!(select_pair(&files, &["id".into()], u64::MAX).is_none());
     }
 
     /// Against a narrower partner, only the groups lying within the partner's
@@ -722,7 +740,7 @@ mod tests {
             candidate_with_row_groups(&wide, &[(0, 0), (20, 20), (0, 30)]),
         ];
 
-        let (score, _, _) = highest_scoring_pair(&files, &["id".into()], u64::MAX).unwrap();
+        let (score, _, _) = select_pair(&files, &["id".into()], u64::MAX).unwrap();
 
         assert!((score - 1.0 / 3.0).abs() < 1e-12);
     }
@@ -740,7 +758,7 @@ mod tests {
             candidate(&nested, &["id"]),
         ];
 
-        let (score, left, right) = highest_scoring_pair(&files, &["id".into()], 100).unwrap();
+        let (score, left, right) = select_pair(&files, &["id".into()], 100).unwrap();
 
         let mut pair = [left.file.path.as_str(), right.file.path.as_str()];
         pair.sort();
@@ -779,11 +797,78 @@ mod tests {
         ]
     }
 
+    /// After a merge, the next round measures only the merge's output against
+    /// the survivors and no longer knows the pairs of the files it replaced.
     #[test]
-    fn sweep_selects_the_highest_overlap_pair_among_many_files() {
+    fn a_merge_output_is_measured_against_the_survivors() {
+        let shape = [(0, 50), (50, 100)];
+        let first = stats_entry("first", &[("id", int_stat(0), int_stat(100))]);
+        let second = stats_entry("second", &[("id", int_stat(0), int_stat(100))]);
+        let survivor = stats_entry("survivor", &[("id", int_stat(500), int_stat(600))]);
+        let survivor_shape = [(500, 550), (550, 600)];
+        let mut cache = LayoutScoreCache::default();
+        let before = vec![
+            candidate_with_row_groups(&first, &shape),
+            candidate_with_row_groups(&second, &shape),
+            candidate_with_row_groups(&survivor, &survivor_shape),
+        ];
+        cache.select_pair(&[&before], &["id".into()], u64::MAX, &HashSet::new());
+        let merged = stats_entry("merged", &[("id", int_stat(500), int_stat(600))]);
+        let after = vec![
+            candidate_with_row_groups(&survivor, &survivor_shape),
+            candidate_with_row_groups(&merged, &survivor_shape),
+        ];
+
+        let (score, left, right) = cache
+            .select_pair(&[&after], &["id".into()], u64::MAX, &HashSet::new())
+            .unwrap();
+
+        assert!((score - 1.0).abs() < 1e-12);
+        let mut pair = [left.file.path.as_str(), right.file.path.as_str()];
+        pair.sort();
+        assert_eq!(pair, ["merged", "survivor"]);
+        assert_eq!(
+            cache.pair_scores.len(),
+            1,
+            "the merged-away files' pairs are forgotten"
+        );
+    }
+
+    /// A file some merge is already rewriting keeps its remembered scores but
+    /// is passed over while it is reserved, so the round picks another pair.
+    #[test]
+    fn a_reserved_file_is_passed_over() {
+        let shape = [(0, 50), (50, 100)];
+        let far_shape = [(500, 550), (550, 600)];
+        let first = stats_entry("first", &[("id", int_stat(0), int_stat(100))]);
+        let second = stats_entry("second", &[("id", int_stat(0), int_stat(100))]);
+        let far_first = stats_entry("far_first", &[("id", int_stat(500), int_stat(600))]);
+        let far_second = stats_entry("far_second", &[("id", int_stat(500), int_stat(600))]);
+        let files = vec![
+            candidate_with_row_groups(&first, &shape),
+            candidate_with_row_groups(&second, &shape),
+            candidate_with_row_groups(&far_first, &far_shape),
+            candidate_with_row_groups(&far_second, &far_shape),
+        ];
+        let mut cache = LayoutScoreCache::default();
+        let (_, left, right) = cache
+            .select_pair(&[&files], &["id".into()], u64::MAX, &HashSet::new())
+            .unwrap();
+        let reserved = HashSet::from([left.file.path.clone(), right.file.path.clone()]);
+
+        let (_, next_left, next_right) = cache
+            .select_pair(&[&files], &["id".into()], u64::MAX, &reserved)
+            .unwrap();
+
+        assert!(!reserved.contains(&next_left.file.path));
+        assert!(!reserved.contains(&next_right.file.path));
+    }
+
+    #[test]
+    fn selection_picks_the_highest_overlap_pair_among_many_files() {
         let files = layered_candidates();
 
-        let (score, left, right) = highest_scoring_pair(&files, &["id".into()], u64::MAX).unwrap();
+        let (score, left, right) = select_pair(&files, &["id".into()], u64::MAX).unwrap();
 
         // Two of wide's five groups lie within shifted's range and two of
         // shifted's within wide's; no other pair qualifies at all.
@@ -798,13 +883,47 @@ mod tests {
         let low = stats_entry("low", &[("id", int_stat(0), int_stat(10))]);
         let high = stats_entry("high", &[("id", int_stat(20), int_stat(30))]);
 
-        let best = highest_scoring_pair(
+        let best = select_pair(
             &[candidate(&low, &["id"]), candidate(&high, &["id"])],
             &["id".into()],
             u64::MAX,
         );
 
         assert!(best.is_none());
+    }
+
+    #[test]
+    fn files_without_rows_are_not_selected() {
+        let mut empty = stats_entry("empty", &[("id", int_stat(0), int_stat(100))]);
+        Arc::get_mut(empty.stats.as_mut().unwrap())
+            .unwrap()
+            .num_records = Some(0);
+        let full = stats_entry("full", &[("id", int_stat(0), int_stat(100))]);
+        let shape = [(0, 50), (50, 100)];
+        let files = [
+            candidate_with_row_groups(&empty, &shape),
+            candidate_with_row_groups(&full, &shape),
+        ];
+
+        assert!(select_pair(&files, &["id".into()], u64::MAX).is_none());
+    }
+
+    #[test]
+    fn files_with_inverted_leading_bounds_are_not_selected() {
+        let inverted = stats_entry("inverted", &[("id", int_stat(100), int_stat(0))]);
+        let covering = stats_entry("covering", &[("id", int_stat(-10), int_stat(110))]);
+        let files = [
+            LayoutCandidate {
+                entry: &inverted,
+                row_group_ranges: vec![vec![None]],
+            },
+            LayoutCandidate {
+                entry: &covering,
+                row_group_ranges: vec![vec![None]],
+            },
+        ];
+
+        assert!(select_pair(&files, &["id".into()], u64::MAX).is_none());
     }
 
     #[test]
@@ -816,7 +935,7 @@ mod tests {
         let singleton_groups = [(50, 50), (50, 50), (50, 50), (50, 50), (50, 50)];
         let partner_groups = [(55, 65), (65, 85), (90, 110), (110, 140), (140, 170)];
 
-        let alone = highest_scoring_pair(
+        let alone = select_pair(
             &[
                 candidate_with_row_groups(&wide, &wide_groups),
                 candidate_with_row_groups(&singleton, &singleton_groups),
@@ -824,7 +943,7 @@ mod tests {
             &["id".into()],
             u64::MAX,
         );
-        let (score, left, right) = highest_scoring_pair(
+        let (score, left, right) = select_pair(
             &[
                 candidate_with_row_groups(&wide, &wide_groups),
                 candidate_with_row_groups(&singleton, &singleton_groups),
@@ -862,7 +981,7 @@ mod tests {
             candidate_with_row_groups(&narrow, &[(3, 3), (3, 4), (4, 4), (4, 4), (4, 4)]),
         ];
 
-        let best = highest_scoring_pair(&files, &["id".into()], u64::MAX);
+        let best = select_pair(&files, &["id".into()], u64::MAX);
 
         assert!(best.is_none());
     }
@@ -876,7 +995,7 @@ mod tests {
             candidate_with_row_groups(&right, &[(25, 35), (35, 45), (45, 55), (55, 65), (65, 75)]),
         ];
 
-        let (score, _, _) = highest_scoring_pair(&files, &["id".into()], u64::MAX).unwrap();
+        let (score, _, _) = select_pair(&files, &["id".into()], u64::MAX).unwrap();
 
         // Two of each file's five groups lie within the other's range.
         assert!((score - 0.4).abs() < 1e-12);
@@ -894,7 +1013,7 @@ mod tests {
             candidate_with_row_groups(&narrow, &[(3, 3), (3, 4), (4, 4), (4, 4), (4, 4)]),
         ];
 
-        let (score, _, _) = highest_scoring_pair(&files, &["id".into()], u64::MAX).unwrap();
+        let (score, _, _) = select_pair(&files, &["id".into()], u64::MAX).unwrap();
 
         assert!((score - 1.0).abs() < 1e-12);
     }
@@ -910,13 +1029,13 @@ mod tests {
             candidate(&small, &["id"]),
         ];
 
-        let (score, left, right) = highest_scoring_pair(&files, &["id".into()], 100).unwrap();
+        let (score, left, right) = select_pair(&files, &["id".into()], 100).unwrap();
 
         assert!((score - 1.0).abs() < 1e-12);
         assert_eq!(left.file.path.as_str(), "first");
         assert_eq!(right.file.path.as_str(), "small");
         assert!(
-            highest_scoring_pair(
+            select_pair(
                 &[candidate(&first, &["id"]), candidate(&second, &["id"])],
                 &["id".into()],
                 100
@@ -944,7 +1063,7 @@ mod tests {
             ),
         ];
 
-        let (score, _, _) = highest_scoring_pair(&files, &["id".into()], u64::MAX).unwrap();
+        let (score, _, _) = select_pair(&files, &["id".into()], u64::MAX).unwrap();
 
         // Three of left's groups lie within right's range and two of right's
         // within left's, none of which is visible while the two encodings are
@@ -952,7 +1071,7 @@ mod tests {
         assert!((score - 0.4).abs() < 1e-12);
     }
 
-    /// A string sweep column is ranked by the same contested row groups as
+    /// A string sort column is ranked by the same contested row groups as
     /// any other type: the pair sharing more of its groups wins.
     #[test]
     fn string_ranges_rank_by_contested_row_groups() {
@@ -974,8 +1093,7 @@ mod tests {
             ),
         ];
 
-        let (score, first, second) =
-            highest_scoring_pair(&files, &["customer".into()], u64::MAX).unwrap();
+        let (score, first, second) = select_pair(&files, &["customer".into()], u64::MAX).unwrap();
 
         // Three of heavy's five groups lie within light's range and all of
         // light's within heavy's, against the two of heavy's that lie within
