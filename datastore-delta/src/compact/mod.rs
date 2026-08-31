@@ -126,9 +126,9 @@ pub struct MaintenanceConfig {
 /// Tuning for a datastore's self-managed compaction loop.
 #[derive(Clone)]
 pub struct CompactionConfig {
-    /// Layout-compaction output target. Half of it is the boundary between
-    /// small-file and layout compaction; a single encoded row group may exceed
-    /// it (see [`DEFAULT_COMPACT_BYTES`]).
+    /// Compaction output target. Half of it is the boundary between small-file
+    /// and layout compaction; a single encoded row group may exceed it (see
+    /// [`DEFAULT_COMPACT_BYTES`]).
     pub target_bytes: u64,
     /// Accumulated small-file bytes that trigger a merge.
     pub merge_target_bytes: u64,
@@ -456,18 +456,10 @@ async fn compact_batch(
 ) -> (Vec<ObjectPath>, crate::Result<()>) {
     let reserved_paths: Vec<ObjectPath> = inputs.iter().map(|file| file.path.clone()).collect();
     let input_sizes: Vec<u64> = inputs.iter().map(|file| file.size).collect();
-    let max_output_file_size =
-        matches!(kind, MergeKind::LayoutOptimization).then_some(target_bytes);
     // `spawn_blocking` needs a `'static` closure, so the merge takes the
     // datastore handle rather than a borrow of it.
     let merged = match tokio::task::spawn_blocking(move || {
-        compact_table_files_with_max_output_size(
-            &datastore,
-            id,
-            &inputs,
-            ROW_GROUP_ROWS,
-            max_output_file_size,
-        )
+        compact_table_files(&datastore, id, &inputs, ROW_GROUP_ROWS, target_bytes)
     })
     .await
     {
@@ -583,22 +575,17 @@ fn small_file_batch(
 /// reason, including another writer having swapped the inputs out first, the
 /// uncommitted merge outputs are deleted before the error is returned.
 ///
+/// `max_output_file_size` is a compressed row-group body target. Parquet
+/// headers and footers are excluded, and an individually oversized row group
+/// is emitted alone.
+///
 /// Blocking store I/O, so callers run it on the blocking pool.
 pub fn compact_table_files(
     datastore: &DeltaDatastore,
     id: uuid::Uuid,
     inputs: &[FileRef],
     target_rows_per_group: usize,
-) -> Result<Vec<FileRef>, crate::Error> {
-    compact_table_files_with_max_output_size(datastore, id, inputs, target_rows_per_group, None)
-}
-
-fn compact_table_files_with_max_output_size(
-    datastore: &DeltaDatastore,
-    id: uuid::Uuid,
-    inputs: &[FileRef],
-    target_rows_per_group: usize,
-    max_output_file_size: Option<u64>,
+    max_output_file_size: u64,
 ) -> Result<Vec<FileRef>, crate::Error> {
     let table = datastore
         .table_handle_by_id(&id)
@@ -1342,6 +1329,58 @@ mod tests {
         dispatch.exit();
     }
 
+    /// Small-file compaction uses the same output target as layout work. A
+    /// three-file batch whose encoded row groups need two target-sized files is
+    /// split rather than becoming one oversized replacement.
+    #[test]
+    fn small_file_compaction_splits_outputs_at_target() {
+        const ROWS_PER_INPUT: usize = 64_000;
+        let dispatch = Dispatch::spin_up(2, 8 * RING_BUFFERS, None);
+        let db = tempfile::tempdir().unwrap();
+        let adopted = db.path().join("events");
+        std::fs::create_dir_all(&adopted).unwrap();
+        write_wide_parquet_file(&adopted, "a.parquet", ROWS_PER_INPUT, 11);
+        write_wide_parquet_file(&adopted, "b.parquet", ROWS_PER_INPUT, 29);
+        write_wide_parquet_file(&adopted, "c.parquet", ROWS_PER_INPUT, 47);
+
+        let datastore =
+            DeltaDatastore::open(db.path().to_str().unwrap(), dispatch.dispatcher()).unwrap();
+        create_wide_sorted_table(&datastore, dispatch.dispatcher(), "events", &adopted);
+        let name = SchemaQualifiedTableName::in_default_schema("events");
+        let table = datastore.table_handle(&name).unwrap();
+        let inputs = table.file_refs();
+        let target = inputs
+            .iter()
+            .map(|file| file.size)
+            .max()
+            .unwrap()
+            .saturating_mul(2)
+            .saturating_add(1);
+        assert!(inputs.iter().all(|file| is_small_file(file.size, target)));
+        let before_version = table.version();
+
+        run_one_sweep(target, datastore.clone());
+
+        let compacted = datastore.table_handle(&name).unwrap();
+        assert_eq!(compacted.version(), before_version + 1);
+        let outputs = compacted.file_refs();
+        assert_eq!(outputs.len(), 2, "target={target}, outputs={outputs:?}");
+        assert!(
+            outputs
+                .iter()
+                .all(|file| file.path.name().starts_with("pivot-"))
+        );
+        let row_count: i64 = compacted
+            .build_scan_view(&[], &[])
+            .unwrap()
+            .row_groups()
+            .iter()
+            .map(|group| group.num_rows)
+            .sum();
+        assert_eq!(row_count, (3 * ROWS_PER_INPUT) as i64);
+        dispatch.exit();
+    }
+
     #[test]
     fn layout_optimization_merges_the_highest_overlap_large_pair() {
         let dispatch = Dispatch::spin_up(2, 4 * RING_BUFFERS, None);
@@ -1415,16 +1454,18 @@ mod tests {
             );
         }
 
-        // Verify that the actual uncapped encoding, not merely the sum of the
+        // Verify that an effectively unbounded encoding, not merely the sum of the
         // input sizes, requires two files under this target.
-        let uncapped = table.merge_files(&inputs, ROW_GROUP_ROWS, None).unwrap();
-        assert_eq!(uncapped.len(), 1);
-        let uncapped_size = uncapped[0].file_ref().size;
-        for file in uncapped {
+        let unbounded = table
+            .merge_files(&inputs, ROW_GROUP_ROWS, u64::MAX)
+            .unwrap();
+        assert_eq!(unbounded.len(), 1);
+        let unbounded_size = unbounded[0].file_ref().size;
+        for file in unbounded {
             table.delete_data_file(&file.file_ref().path).unwrap();
         }
-        assert!(uncapped_size > target);
-        assert!(uncapped_size <= target * 2);
+        assert!(unbounded_size > target);
+        assert!(unbounded_size <= target * 2);
 
         let before_version = table.version();
         run_one_sweep(target, datastore.clone());
@@ -1435,7 +1476,7 @@ mod tests {
         assert_eq!(
             outputs.len(),
             2,
-            "target={target}, uncapped={uncapped_size}, outputs={outputs:?}"
+            "target={target}, unbounded={unbounded_size}, outputs={outputs:?}"
         );
         assert!(outputs.iter().all(|file| file.size <= target));
         assert!(outputs.iter().all(|file| !is_small_file(file.size, target)));
@@ -1558,9 +1599,7 @@ mod tests {
             .saturating_mul(5)
             .div_ceil(4);
 
-        let outputs = table
-            .merge_files(&inputs, ROW_GROUP_ROWS, Some(target))
-            .unwrap();
+        let outputs = table.merge_files(&inputs, ROW_GROUP_ROWS, target).unwrap();
 
         assert_eq!(outputs.len(), 1);
         assert!(outputs[0].file_ref().size > target);

@@ -130,8 +130,8 @@ one by qualifying it: `SELECT * FROM warm.main.tbl`. `kind` is the datastore
 format (`delta` today); the storage backend is inferred from `location` (a plain
 path is local, an `s3://` URI is S3, a `gs://` URI is Google Cloud Storage).
 Compaction is configured per datastore with `compact`. `compact_bytes` targets
-the layout-compaction output size; files strictly below half that size are
-small-file candidates, while an individual row group may exceed the target.
+the compaction output size; files strictly below half that size are small-file
+candidates, while an individual row group may exceed the target.
 `compact_merge_bytes` sets the accumulated small-file bytes that immediately
 trigger a merge (by default 1.3 times `compact_bytes`), and
 `compact_min_files` sets when the balance fallback is allowed (100 by default).

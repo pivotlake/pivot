@@ -30,8 +30,8 @@ pub(crate) struct FileAssemblyInfo {
     pub(crate) row_group_count: usize,
     pub(crate) partition: Option<crate::PartitionValues>,
     /// Compressed row-group body target for compaction output; Parquet headers
-    /// and footers are excluded. `None` for INSERT and untargeted rewrites. An
-    /// individually oversized row group remains one file.
+    /// and footers are excluded. `None` for INSERT. An individually oversized
+    /// row group remains one file.
     pub(crate) max_file_size: Option<usize>,
 }
 
