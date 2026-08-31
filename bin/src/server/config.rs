@@ -23,7 +23,7 @@
 //! metastore:
 //!   datastores:
 //!     hot:
-//!       kind: delta
+//!       kind: pivot
 //!       location: /var/lib/pivot
 //!       default: true
 //! ```
@@ -39,7 +39,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-use datastore_delta::DEFAULT_REFRESH_INTERVAL;
+use datastore_pivot::DEFAULT_REFRESH_INTERVAL;
 use metastore_disk::{ByteSize, Interval, MetastoreConfig};
 use serde::Deserialize;
 
@@ -209,7 +209,7 @@ mod tests {
     use catalog::metastore::Metastore;
     use metastore_disk::DiskMetastore;
 
-    const METASTORE_SECTION: &str = "metastore:\n  datastores:\n    hot:\n      kind: delta\n      \
+    const METASTORE_SECTION: &str = "metastore:\n  datastores:\n    hot:\n      kind: pivot\n      \
                                      location: /tmp/hot\n      default: true\n";
 
     /// A file whose `server` section holds `settings`, on top of a minimal

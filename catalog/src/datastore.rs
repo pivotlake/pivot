@@ -25,7 +25,7 @@ use planner::types::Type;
 /// The cross-datastore catalog uses this backend-neutral description to build
 /// virtual metadata relations without reaching into a concrete datastore's
 /// manifest or in-memory index. `id` is the datastore catalog's durable table
-/// identifier; Delta datastores return the ID recorded in their Pivot manifest,
+/// identifier; Pivot datastores return the ID recorded in their Pivot manifest,
 /// not the independent ID in the Delta log's `metaData` action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatastoreTableMetadata {
@@ -216,9 +216,8 @@ pub trait Datastore: Debug + Send + Sync {
     /// it commits can publish the new table straight back into the datastore.
     fn begin_transaction(self: Arc<Self>) -> Arc<dyn DatastoreTransaction>;
 
-    /// The format this datastore stores its data in (`delta`), as
-    /// `system.datastores` reports it. A constant of the backend: what a
-    /// configuration selects the backend by.
+    /// The datastore implementation (`pivot`), as `system.datastores` reports
+    /// it. A constant of the backend: what configuration selects the backend.
     fn kind(&self) -> &'static str;
 
     /// Where this datastore's data lives, as a URI (`file:///var/lib/pivot`,

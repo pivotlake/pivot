@@ -165,7 +165,7 @@ server:
 {workers_line}metastore:
   datastores:
     default:
-      kind: delta
+      kind: pivot
       location: {data_dir}
       default: true
       compact: false

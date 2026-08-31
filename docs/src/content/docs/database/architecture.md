@@ -131,7 +131,7 @@ several datastores, and SQL can address them as
 `datastore.schema.table`. Unqualified names use the configured default
 datastore.
 
-The Delta datastore keeps durable state alongside the data:
+The Pivot datastore keeps durable state alongside the data:
 
 - A Pivot manifest records the schemas and tables in the datastore.
 - Each table's Delta log records its schema, partitioning, versions, and active

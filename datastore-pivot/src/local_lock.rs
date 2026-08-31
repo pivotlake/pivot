@@ -1,4 +1,4 @@
-//! Exclusive process ownership for a local Delta datastore root.
+//! Exclusive process ownership for a local Pivot datastore root.
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Read, Seek, SeekFrom, Write};

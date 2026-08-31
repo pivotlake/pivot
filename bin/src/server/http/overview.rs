@@ -4,7 +4,7 @@
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use axum::Json;
 use axum::extract::State;
-use datastore_delta::DeltaDatastore;
+use datastore_pivot::PivotDatastore;
 use planner::catalog::SchemaQualifiedTableName;
 use serde::Serialize;
 
@@ -46,14 +46,14 @@ struct TableMeta {
 pub(super) async fn overview(State(state): State<IntrospectState>) -> Json<Overview> {
     // The default datastore always exists (`PivotCatalog` requires it). This
     // overview reads Parquet-level detail, so recover the concrete backend; the
-    // dashboard serves only Delta datastores.
+    // dashboard serves only Pivot datastores.
     let datastore = state
         .catalog
         .default_datastore()
         .clone()
         .into_any_arc()
-        .downcast::<DeltaDatastore>()
-        .expect("the dashboard serves only Delta datastores");
+        .downcast::<PivotDatastore>()
+        .expect("the dashboard serves only Pivot datastores");
     let store = datastore.store_description();
 
     // Catalog snapshot (manifest reads may touch object storage) off the runtime.
@@ -87,7 +87,7 @@ pub(super) async fn overview(State(state): State<IntrospectState>) -> Json<Overv
     })
 }
 
-fn collect_tables(datastore: &DeltaDatastore) -> Vec<TableMeta> {
+fn collect_tables(datastore: &PivotDatastore) -> Vec<TableMeta> {
     datastore
         .tables()
         .into_iter()

@@ -24,7 +24,7 @@ use catalog::metastore::Metastore;
 use common::{
     connect_client, parquet_name_value_rows, pick_free_port, select_rows, wait_until_listening,
 };
-use datastore_delta::test_support::{self, Backend};
+use datastore_pivot::test_support::{self, Backend};
 use dispatch::Dispatch;
 use metastore_disk::DiskMetastore;
 use object_storage::ObjectPath;
@@ -91,7 +91,7 @@ fn datastores_section(root: &str) -> String {
 metastore:
   datastores:
     warm:
-      kind: delta
+      kind: pivot
       location: {root}
       default: true
       compact: false

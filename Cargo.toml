@@ -4,7 +4,7 @@ members = [
     "benchmarks",
     "bin",
     "catalog",
-    "datastore-delta",
+    "datastore-pivot",
     "dispatch",
     "duckdb-planner",
     "metastore-disk",
@@ -24,7 +24,7 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 # Sibling crates.
 catalog = { path = "catalog" }
-datastore-delta = { path = "datastore-delta" }
+datastore-pivot = { path = "datastore-pivot" }
 dispatch = { path = "dispatch" }
 duckdb-planner = { path = "duckdb-planner" }
 metastore-disk = { path = "metastore-disk" }

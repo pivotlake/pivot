@@ -1,6 +1,6 @@
 # benchmarks
 
-Performance harness for pivotdb. Boots `dispatch` + `server` + `DeltaDatastore`
+Performance harness for pivotdb. Boots `dispatch` + `server` + `PivotDatastore`
 in-process, connects with `tokio-postgres`, runs a suite of SQL queries
 through the pgwire path, verifies output, and compares timings against a
 saved baseline.

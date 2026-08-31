@@ -7,7 +7,7 @@ description = "Disk-backed metastore provider for PivotDB."
 
 [dependencies]
 catalog = { workspace = true }
-datastore-delta = { workspace = true }
+datastore-pivot = { workspace = true }
 object-storage = { workspace = true }
 dispatch = { workspace = true }
 

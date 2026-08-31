@@ -17,7 +17,7 @@ use planner::catalog::{Result as CatalogResult, SchemaQualifiedTableName};
 use std::collections::HashMap;
 
 /// A metastore serving no datastores and only the built-in trusted user:
-/// these tests wrap an already-open `DeltaDatastore` in a `PivotCatalog`, so
+/// these tests wrap an already-open `PivotDatastore` in a `PivotCatalog`, so
 /// the catalog never asks the metastore for datastores.
 pub fn trust_metastore() -> Arc<dyn Metastore> {
     #[derive(Debug)]
@@ -180,7 +180,7 @@ pub fn parquet_table_compressed(
 /// groups for inspection. The background refresh does the same sweep; here we
 /// drive it on a cloned-out table handle.
 pub fn current_parquet(
-    datastore: &datastore_delta::DeltaDatastore,
+    datastore: &datastore_pivot::PivotDatastore,
     name: &str,
 ) -> Arc<ParquetTable> {
     let mut table = datastore
@@ -196,7 +196,7 @@ pub fn current_parquet(
 /// engine wrote asks the table rather than guessing the path.
 pub fn table_dir(
     database_root: &std::path::Path,
-    datastore: &datastore_delta::DeltaDatastore,
+    datastore: &datastore_pivot::PivotDatastore,
     name: &str,
 ) -> std::path::PathBuf {
     database_root.join(
@@ -327,7 +327,7 @@ pub fn write_parquet_files(
         .collect();
 
     let datastore =
-        datastore_delta::DeltaDatastore::open(&database_root.to_string_lossy(), dispatch).unwrap();
+        datastore_pivot::PivotDatastore::open(&database_root.to_string_lossy(), dispatch).unwrap();
     let creation = datastore.clone().begin_transaction();
     creation
         .bind_create_table(CreateTableRequest {

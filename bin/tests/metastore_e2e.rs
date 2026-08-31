@@ -96,7 +96,7 @@ async fn queries_bind_tables_by_datastore_name() {
         &config_path,
         format!(
             "server:\n  refresh_interval: 100ms\nmetastore:\n  datastores:\n    default:\n      \
-             kind: delta\n      location: \"{}\"\n      default: true\n",
+             kind: pivot\n      location: \"{}\"\n      default: true\n",
             default_dir.path().display(),
         ),
     )
@@ -104,7 +104,7 @@ async fn queries_bind_tables_by_datastore_name() {
     std::fs::write(
         &metastore_path,
         format!(
-            "datastores:\n  warm:\n    kind: delta\n    location: \"{}\"\n",
+            "datastores:\n  warm:\n    kind: pivot\n    location: \"{}\"\n",
             warm_dir.path().display(),
         ),
     )

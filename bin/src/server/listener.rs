@@ -303,7 +303,7 @@ fn format_panic_payload(payload: &Box<dyn std::any::Any + Send>) -> String {
 mod tests {
     use super::*;
     use catalog::{DEFAULT_DATASTORE_NAME, Datastore};
-    use datastore_delta::DeltaDatastore;
+    use datastore_pivot::PivotDatastore;
     use std::collections::HashMap;
     use tokio::sync::oneshot;
 
@@ -316,7 +316,7 @@ mod tests {
     fn catalog(dispatch: &Dispatch) -> (tempfile::TempDir, Arc<PivotCatalog>) {
         let directory = tempfile::tempdir().unwrap();
         let datastore: Arc<dyn Datastore> =
-            DeltaDatastore::open(&directory.path().to_string_lossy(), dispatch.dispatcher())
+            PivotDatastore::open(&directory.path().to_string_lossy(), dispatch.dispatcher())
                 .unwrap();
         let catalog = PivotCatalog::new(
             HashMap::from([(DEFAULT_DATASTORE_NAME.to_string(), datastore)]),

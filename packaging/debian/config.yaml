@@ -5,7 +5,7 @@ server:
 metastore:
   datastores:
     default:
-      kind: delta
+      kind: pivot
       location: /var/lib/pivot/datastores/default
       default: true
   users:

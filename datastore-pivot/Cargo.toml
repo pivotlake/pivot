@@ -1,9 +1,9 @@
 [package]
-name = "datastore-delta"
+name = "datastore-pivot"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "The Delta Lake datastore backend: a durable Pivot table index, per-table Delta snapshots, and live row-group state, implementing catalog's Datastore traits over Parquet data files."
+description = "Pivot's datastore backend: a durable Pivot table index, per-table Delta snapshots, and live row-group state, implementing catalog's Datastore traits over Parquet data files."
 
 [dependencies]
 planner = { workspace = true }
@@ -50,8 +50,8 @@ test-support = ["object-storage/test-support"]
 
 [dev-dependencies]
 # Self-dependency to turn on `test-support` for this crate's own integration
-# tests (so they can use `datastore_delta::test_support`).
-datastore-delta = { path = ".", features = ["test-support"] }
+# tests (so they can use `datastore_pivot::test_support`).
+datastore-pivot = { path = ".", features = ["test-support"] }
 # `PivotCatalog::commit_transaction` is async (a commit that wrote files hops to
 # the blocking pool), so the tests block on it with a current-thread runtime; the
 # compaction tests drive a full sweep on a multi-thread runtime.

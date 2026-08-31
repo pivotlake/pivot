@@ -63,7 +63,7 @@ use parquet_variant_compute::{VariantArray, json_to_variant};
 
 use catalog::metastore::{DEFAULT_USER_NAME, Metastore, UserAuth};
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
-use datastore_delta::DeltaDatastore;
+use datastore_pivot::PivotDatastore;
 use dispatch::{Dispatch, RECORD_BATCH_SIZE, values_input};
 use planner::catalog::{Column, CreateTableRequest, SchemaQualifiedTableName, TableReference};
 use planner::types::{Type, physical_arrow_type};
@@ -561,7 +561,7 @@ fn table_over(
     columns: Vec<Column>,
     sort_by: &[&str],
 ) -> (PivotCatalog, PathBuf) {
-    let datastore = DeltaDatastore::open(&dir.to_string_lossy(), dispatch.dispatcher()).unwrap();
+    let datastore = PivotDatastore::open(&dir.to_string_lossy(), dispatch.dispatcher()).unwrap();
     let catalog = PivotCatalog::new(
         HashMap::from([(
             DEFAULT_DATASTORE_NAME.to_string(),

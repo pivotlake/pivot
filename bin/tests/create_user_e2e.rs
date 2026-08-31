@@ -10,7 +10,7 @@ use std::sync::{Arc, OnceLock};
 use catalog::PivotCatalog;
 use catalog::metastore::{DEFAULT_USER_NAME, Metastore};
 use common::{CatalogFixture, login, login_without_password, start_server_with_metastore};
-use datastore_delta::DEFAULT_REFRESH_INTERVAL;
+use datastore_pivot::DEFAULT_REFRESH_INTERVAL;
 use metastore_disk::{DiskMetastore, MetastoreConfig};
 use tempfile::TempDir;
 use tokio_postgres::Client;
@@ -34,7 +34,7 @@ fn create_user_server() -> &'static CreateUserServer {
         let yaml = format!(
             r#"datastores:
   default:
-    kind: delta
+    kind: pivot
     location: "{}"
     default: true
 "#,

@@ -7,7 +7,7 @@
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use datastore_delta::DeltaDatastore;
+use datastore_pivot::PivotDatastore;
 use planner::catalog::SchemaQualifiedTableName;
 use serde::{Deserialize, Serialize};
 
@@ -73,7 +73,7 @@ async fn files_page_for(
         return Json(FilesPage::default());
     };
     // File enumeration is Parquet-specific; recover the concrete backend.
-    let Ok(datastore) = datastore.into_any_arc().downcast::<DeltaDatastore>() else {
+    let Ok(datastore) = datastore.into_any_arc().downcast::<PivotDatastore>() else {
         return Json(FilesPage::default());
     };
     let limit = page.limit.min(500);

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use catalog::metastore::{Metastore, UserAuth};
 use catalog::{DEFAULT_DATASTORE_NAME, Datastore, PivotCatalog};
-use datastore_delta::DeltaDatastore;
+use datastore_pivot::PivotDatastore;
 use dispatch::{BUFFER_SIZE, DataFlowDispatcher, Dispatch};
 use object_storage::AmbientExternalStoreFactory;
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
@@ -99,7 +99,7 @@ struct ShellState {
     catalog: Arc<PivotCatalog>,
     dispatch: DispatchOwner,
     /// Keeps the datastore lock held until every dispatch worker has joined.
-    datastore: Arc<DeltaDatastore>,
+    datastore: Arc<PivotDatastore>,
 }
 
 impl ShellState {
@@ -119,7 +119,7 @@ impl ShellState {
     }
 }
 
-/// An embedded Pivot executor over one persistent Delta datastore.
+/// An embedded Pivot executor over one persistent Pivot datastore.
 pub struct ShellInstance {
     state: Option<ShellState>,
     location: String,
@@ -179,7 +179,7 @@ impl ShellInstance {
         buffers: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let dispatch = DispatchOwner::new(Dispatch::spin_up(workers, buffers, None));
-        let datastore = DeltaDatastore::open(location, dispatch.dispatcher())?;
+        let datastore = PivotDatastore::open(location, dispatch.dispatcher())?;
         let metastore: Arc<dyn Metastore> = Arc::new(EphemeralMetastore);
         let catalog = Arc::new(
             PivotCatalog::new(

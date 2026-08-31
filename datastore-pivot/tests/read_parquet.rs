@@ -9,7 +9,7 @@ use arrow_array::{Int32Array, Int64Array, RecordBatch, StringViewArray};
 use arrow_schema::{DataType, Field, Schema};
 use catalog::datastore::{DatastoreTableMetadata, DatastoreTransaction};
 use catalog::{Datastore, PivotCatalog};
-use datastore_delta::test_support::{self, Backend};
+use datastore_pivot::test_support::{self, Backend};
 use dispatch::{DataFlowDispatcher, Dispatch};
 use object_storage::{AmbientExternalStoreFactory, ObjectPath};
 use parquet::arrow::ArrowWriter;

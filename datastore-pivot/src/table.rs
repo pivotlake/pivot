@@ -69,7 +69,7 @@ impl TableFile {
 /// This is a cloneable snapshot value. Copies handed out are read views and may
 /// drift as commits land; [`refresh`](Self::refresh) reconciles one to the latest
 /// version. Writers instead go through
-/// `DeltaDatastore::commit_to_table`, following the table's commit-lock
+/// `PivotDatastore::commit_to_table`, following the table's commit-lock
 /// protocol. `store` and `location`
 /// let any copy persist and reload itself.
 #[derive(Clone)]
@@ -782,7 +782,7 @@ impl CatalogTable {
 
     /// Where the table's data lives, relative to the database root (an absolute
     /// path escapes to the store root). Combine with the store's own root
-    /// (see [`DeltaDatastore::store_description`](crate::DeltaDatastore::store_description))
+    /// (see [`PivotDatastore::store_description`](crate::PivotDatastore::store_description))
     /// to know the physical location.
     pub fn location(&self) -> &str {
         self.location.as_str()

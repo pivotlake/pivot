@@ -42,10 +42,10 @@ metastore:
   # Exactly one datastore must set `default: true`. It is the current database, so
   # unqualified names such as `main.events` resolve against it.
   datastores:
-    # `kind` is the datastore format (only `delta` today). The storage backend is
+    # `kind` selects the datastore implementation (only `pivot` today). The storage backend is
     # inferred from `location`: a local path here, an S3 URI for `warm` below.
     default:
-      kind: delta
+      kind: pivot
       location: /var/lib/pivot/default
       default: true
 
@@ -53,7 +53,7 @@ metastore:
     # names such as `warm.main.events`. Compaction is on by default; run it in
     # only one process per datastore (set `compact: false` on the others).
     warm:
-      kind: delta
+      kind: pivot
       location: s3://example-bucket/warm/
       compact: true
       compact_bytes: 128m
@@ -63,7 +63,7 @@ metastore:
 
     # A `gs://` location opens a Google Cloud Storage store.
     cold:
-      kind: delta
+      kind: pivot
       location: gs://example-bucket/cold/
 
   # The credentials a remote location is opened with, kept apart from the
