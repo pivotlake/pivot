@@ -10,16 +10,16 @@
 
 use std::ops::Range;
 
-use crate::thrift::general::{Encoding, PageType};
+use crate::thrift::general::{CompressionCodec, Encoding, PageType};
 use crate::thrift::headers::{DataPageHeader, DictionaryPageHeader, PageHeader};
 use crate::thrift::parquet_thrift::{ThriftCompactOutputProtocol, WriteThrift};
 use arrow_array::cast::AsArray;
 use arrow_array::{ArrayRef, BinaryViewArray, StringArray, StringViewArray};
 use arrow_schema::{DataType, TimeUnit};
-use snap::raw::Encoder;
 
 use dispatch::memory::SlabAllocator;
 
+use super::super::compression;
 use super::super::error::{WriteError, WriteResult};
 use super::super::types::EncodedPage;
 use super::leaves::Leaf;
@@ -167,15 +167,16 @@ pub(super) enum PageKind {
     },
 }
 
-/// Snappy-compress `raw` (an encoded page body), prepend the page header, and
-/// tally the sizes into an [`EncodedPage`].
+/// Compress `raw` (an encoded page body), prepend the page header, and tally
+/// the sizes into an [`EncodedPage`].
 pub(super) fn assemble_page(
     num_rows: i64,
     raw: Vec<u8>,
     kind: PageKind,
+    codec: CompressionCodec,
     allocator: &mut SlabAllocator,
 ) -> WriteResult<EncodedPage> {
-    let compressed = Encoder::new().compress_vec(&raw)?;
+    let compressed = compression::compress(codec, &raw)?;
     let (page_type, data_page_header, dictionary_page_header) = match kind {
         PageKind::Data {
             num_values,

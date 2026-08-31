@@ -25,6 +25,7 @@ use arrow_schema::Field;
 use dispatch::memory::SlabAllocator;
 use dispatch::{DefaultUnaryFactory, Sender, Unary, UnaryResult};
 
+use super::compression;
 use super::error::{WriteError, WriteResult};
 use super::stats;
 use super::types::{ColumnChunkJob, EncodedColumnChunk, EncodedLeaf};
@@ -97,20 +98,21 @@ pub(in crate::writing) fn encode_column_chunk(
 /// PLAIN.
 fn encode_leaf(leaf: Leaf, allocator: &mut SlabAllocator) -> WriteResult<EncodedLeaf> {
     let physical_type = crate::arrow_to_parquet_physical(leaf.values.data_type())?;
+    let codec = compression::page_codec();
     let statistics = leaf_statistics(&leaf);
     let (dictionary_page, data_page_encoding, data_pages) =
-        match dictionary::try_encode(&leaf, allocator)? {
+        match dictionary::try_encode(&leaf, codec, allocator)? {
             Some((dictionary_page, index_page)) => (
                 Some(dictionary_page),
                 Encoding::RLE_DICTIONARY,
                 vec![index_page],
             ),
-            None => match delta::try_encode_chunk(&leaf, allocator)? {
+            None => match delta::try_encode_chunk(&leaf, codec, allocator)? {
                 Some((encoding, pages)) => (None, encoding, pages),
                 None => (
                     None,
                     Encoding::PLAIN,
-                    plain::encode_chunk(&leaf, allocator)?,
+                    plain::encode_chunk(&leaf, codec, allocator)?,
                 ),
             },
         };
@@ -121,6 +123,7 @@ fn encode_leaf(leaf: Leaf, allocator: &mut SlabAllocator) -> WriteResult<Encoded
         dictionary_page,
         data_page_encoding,
         data_pages,
+        codec,
     })
 }
 

@@ -48,6 +48,7 @@
 //! memory.
 
 mod assembler;
+mod compression;
 pub(crate) mod encoder;
 pub(crate) mod error;
 mod file_collector;

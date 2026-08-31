@@ -6,7 +6,7 @@
 //! reused by [`dictionary`](super::dictionary) to encode a dictionary page's
 //! distinct values.
 
-use crate::thrift::general::Encoding;
+use crate::thrift::general::{CompressionCodec, Encoding};
 use arrow_array::{
     Array, BinaryViewArray, Date32Array, Decimal64Array, Decimal128Array, Float32Array,
     Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, StringArray, StringViewArray,
@@ -26,11 +26,12 @@ use super::pages::{self, PageKind, PageRange};
 /// PLAIN-encode a leaf: cut it into pages and encode each.
 pub(super) fn encode_chunk(
     leaf: &Leaf,
+    codec: CompressionCodec,
     allocator: &mut SlabAllocator,
 ) -> WriteResult<Vec<EncodedPage>> {
     pages::page_ranges(leaf)?
         .into_iter()
-        .map(|range| encode_data_page(leaf, range, allocator))
+        .map(|range| encode_data_page(leaf, range, codec, allocator))
         .collect()
 }
 
@@ -40,6 +41,7 @@ pub(super) fn encode_chunk(
 fn encode_data_page(
     leaf: &Leaf,
     range: PageRange,
+    codec: CompressionCodec,
     allocator: &mut SlabAllocator,
 ) -> WriteResult<EncodedPage> {
     let num_rows = range.rows.len();
@@ -56,6 +58,7 @@ fn encode_data_page(
             num_values: num_rows,
             encoding: Encoding::PLAIN,
         },
+        codec,
         allocator,
     )
 }
